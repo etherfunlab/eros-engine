@@ -1,12 +1,12 @@
 # `engine.llm_generations` — one row per LLM generation — Design
 
 - **Date:** 2026-08-24
-- **Status:** Approved, not yet implemented
+- **Status:** Release A implemented; Release B not started
 - **Type:** New parent table + write-path change at every LLM call site;
   then foreign keys, a backfill, and column drops on eight live tables
 - **Owner:** enriquephl (sole dev)
-- **Target:** `eros-engine` 1.7.x, **two PRs and two separate releases**
-  (§8 is a hard constraint, not a preference)
+- **Target:** Release A ships in `eros-engine` 1.6.1. **Two PRs and two
+  separate releases** (§8 is a hard constraint, not a preference)
 - **Depends on:** migrations through `0058`. Production is on `0054`, so
   `0055`–`0058` ship alongside Release A.
 
