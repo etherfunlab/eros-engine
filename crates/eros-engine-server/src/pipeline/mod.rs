@@ -24,9 +24,14 @@ use crate::error::AppError;
 /// How long **any** fail-open audit write gets before it is abandoned —
 /// `llm_generations` here, `chat_images_events` and `chat_vision_events` in
 /// `stream.rs`. One constant for all three because they are one operation: a
-/// single-row INSERT into the same Postgres, whose failure costs an audit row
-/// and never a turn. Two bounds for the same operation is two facts where
-/// there is one.
+/// single-row INSERT into the same Postgres, and none of them can fail a turn.
+/// Two bounds for the same operation is two facts where there is one.
+///
+/// What a dropped write costs is not uniform, though. `chat_images_events` and
+/// `chat_vision_events` lose a telemetry row and nothing else. `llm_generations`
+/// loses that row AND degrades the child's `generation_id` to `NULL`, because
+/// the child stores this function's return value — so the reply persists with
+/// no handle back to the provider's log.
 ///
 /// It covers the pool acquisition as well as the statement, and it is
 /// deliberately far below both the pool's 5s `acquire_timeout` and any
@@ -42,11 +47,18 @@ use crate::error::AppError;
 /// `chat_output_filter`), plus the image / vision events on the paths that
 /// have them — where what waits behind the write is the image marker, the
 /// endpoint's JSON body, the pre-stream 502, or the terminal SSE frame. A
-/// bound that reads as generous per write multiplies: at 2s the
-/// worst case was 8s of a turn spent waiting on audit rows, all of it outside
-/// the LLM timeout budget, and what the user sees is a reply that hangs. A
-/// single-row insert's p99 is milliseconds, so 500ms is still a hundredfold
-/// margin while capping the turn near 2s.
+/// bound that reads as generous per write multiplies: at the old 2s, those four
+/// generation writes alone could spend 8s of a turn waiting on audit rows —
+/// more once an image or vision write joined them at 3s — all of it outside
+/// the LLM timeout budget, and what the user sees is a reply that hangs.
+///
+/// 500ms is a hundredfold margin over a single-row insert's millisecond p99,
+/// **but only over the statement.** The bound also covers pool acquisition, and
+/// there it is deliberately tight: with all 20 connections busy for longer than
+/// 500ms, a perfectly healthy insert is abandoned before it ever gets one. That
+/// is the intended trade — a saturated pool is exactly when a turn must not
+/// queue behind an audit row — and it is why the timed-out `warn!` is worth
+/// alerting on: it fires on pool pressure, not just on a sick database.
 ///
 /// What this does NOT do: dropping the future at the timeout does not
 /// guarantee Postgres receives a `CancelRequest`, so a genuinely stuck
