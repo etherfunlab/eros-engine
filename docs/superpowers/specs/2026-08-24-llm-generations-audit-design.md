@@ -15,8 +15,13 @@
   hard constraint in both directions, not a preference — the split between
   B1 and B2 exists because the original two-release plan would have broken
   production (§7 preamble).
-- **Depends on:** migrations through `0058`. Production is on `0054`, so
-  `0055`–`0058` ship alongside Release A.
+- **Depends on:** migrations through `0059`, all applied in production as of
+  1.6.1's deploy. B1 adds `0060`, B2 adds `0061`.
+- **Rollback floor:** once B2 is deployed, the oldest build that can be rolled
+  back to is **B1**. Release A and 1.6.2 name `model` and `usage` in every
+  child INSERT, and B2 has dropped those columns. This is the same constraint
+  as §8, read backwards, and it is the one a rollback under pressure is most
+  likely to violate.
 
 ## 1. Problem
 
@@ -491,7 +496,7 @@ So the work splits by which side of the rollout each half is safe on:
 
 | | contents | why its migration is safe when it runs |
 |---|---|---|
-| **B1** | code stops writing `model` / `usage` to the eight child tables (reads move to a join); migration `0060`: backfill, eight indexes, eight validated foreign keys | the build serving traffic is Release A, which already writes parent rows (§7.0) |
+| **B1** | code stops writing `model` / `usage` to the eight child tables (reads move to a join); migration `0060`: backfill, eight indexes, eight validated foreign keys | the build serving traffic is Release A **or later** (1.6.2 today), all of which write parent rows (§7.0) |
 | **B2** | migration `0061`: `DROP` the redundant columns | the build serving traffic is B1, which no longer writes them |
 
 The foreign keys ride in B1 rather than B2 because they are already safe there
@@ -595,12 +600,44 @@ dangling session ids in `companion_insights_events`, **24** in
 `companion_decision_events`, **2** in `chat_images_events`. Drop the `LEFT JOIN`
 and the migration aborts.
 
-Every insert carries `ON CONFLICT (generation_id) DO NOTHING`.
+Every insert carries `ON CONFLICT (generation_id) DO NOTHING`, which is what
+absorbs the rows 1.6.1 has already written — 474 of them at the time of
+measurement, growing until B1 ships.
+
+**Give every `DISTINCT ON (generation_id)` an explicit `ORDER BY generation_id,
+<the row's timestamp>`.** Without one Postgres may return any row of a
+duplicate group, and a migration that produces different `task` or `session_id`
+values on two runs is untestable. The measurement above says no duplicates
+exist to break the tie, which makes the `ORDER BY` free — that is the reason to
+write it, not a reason to omit it.
 
 ### 7.2 Indexes, then constraints (B1)
 
 An index on each of the eight `generation_id` columns — none has one today, and
 an unindexed child column makes the parent's `ON DELETE` seq-scan it.
+
+**These statements block writes on live tables, and the migration runs while
+the previous build is still serving them.** `sqlx::migrate!` wraps each file in
+one transaction, so every lock is held until the last statement commits;
+`CREATE INDEX CONCURRENTLY` cannot run inside a transaction and is not
+available. Migration `0058` already worked this problem and its ordering
+discipline carries over verbatim: build indexes on the cold audit tables first,
+and let the statements touching `chat_messages` sit as late as their
+dependencies allow. Row counts as of 2026-08-24 — `chat_messages` 22,573,
+`companion_insights_events` 18,918, `companion_decision_events` 10,533,
+`companion_affinity_events` 9,941, `character_insights_events` 7,316,
+`chat_images_events` 1,297, `chat_vision_events` 14, `user_insights_events` 0.
+
+**Open the migration with `SET LOCAL lock_timeout = '3s'`.** Not present in any
+migration in this repo today, and this is the one that earns it: sixteen
+lock-taking statements against tables a live turn writes on every message. The
+reasoning that makes it correct here is specific — **a failed `release_command`
+is the safe failure.** Fly runs it before traffic moves, so an aborted
+migration leaves the old machines serving on the old schema, with nothing to
+roll back. A migration that instead waits behind a long-running transaction
+holds `chat_messages` write-blocked for as long as that wait lasts, and users
+see it. Failing fast and retrying the deploy is strictly better than
+succeeding slowly.
 
 Then eight foreign keys to `engine.llm_generations(generation_id)`, each
 `ON DELETE SET NULL` (nullable reference column, audit trail outlives its
@@ -625,9 +662,41 @@ rule. The difference is where the orphans could come from:
 - Here the parent rows are produced by the same transaction, from the very
   child tables being constrained. `ADD FOREIGN KEY` takes `SHARE ROW EXCLUSIVE`
   on both sides, so nothing writes a new child row between the backfill and the
-  scan. And the deploy order (§8) guarantees the code running during the
-  migration is Release A, which already writes parents. There is no source of
-  an orphan.
+  scan. And the deploy order (§8) means the code running during the migration
+  is Release A **or later**, all of which write the parent before handing the
+  id to a child.
+
+**That argument covers concurrency, not history, and the difference matters.**
+Locking rules out an orphan appearing *during* the migration. It says nothing
+about one already sitting in a table — from a build older than Release A, or
+from any path that ever stored a raw `resp.generation_id` instead of
+`record_generation`'s return value. Production has **zero** such rows across all
+eight columns, measured 2026-08-24, and Release A's laundering invariant is what
+keeps it that way. But that is an observation with a timestamp on it, not a
+proof, and the cost of it being wrong is `ADD CONSTRAINT` failing inside
+`release_command`.
+
+So B1 asserts it rather than assuming it. Immediately before the first
+`ADD CONSTRAINT`, in the same transaction:
+
+```sql
+DO $$
+DECLARE n bigint;
+BEGIN
+  SELECT count(*) INTO n FROM engine.chat_messages c
+   WHERE c.generation_id IS NOT NULL
+     AND NOT EXISTS (SELECT 1 FROM engine.llm_generations g
+                      WHERE g.generation_id = c.generation_id);
+  IF n > 0 THEN
+    RAISE EXCEPTION 'orphaned generation_id rows in chat_messages: %', n;
+  END IF;
+END $$;
+```
+
+— repeated per child column. It fails the same deploy `ADD CONSTRAINT` would
+have failed, but it names the table and the count, which turns a generic
+constraint violation into a five-minute diagnosis. It also fails *before* any
+`ADD CONSTRAINT` has taken its locks.
 
 57,000 rows scan in milliseconds. Taking the retrospective guarantee here is
 free; skipping it would leave a permanent "someday" on the table.
@@ -756,7 +825,7 @@ have a parent row. If they shipped with Release A's write path in one release,
 the machines still serving traffic during the migration would be the build
 *before* Release A — writing `generation_id` into child rows with no parent.
 Every such insert violates the constraint, and for `chat_messages` that is a
-user's reply failing to persist. Hence A, then B.
+user's reply failing to persist. Hence A, then B1.
 
 **A schema change that removes something must ship AFTER the code that stopped
 using it.** B2 drops `model` and `usage` from the eight child tables, but every
@@ -768,9 +837,22 @@ B1, then B2.
 
 The general rule, which is what to check against any future migration here:
 **during a rollout the old code must be correct against the new schema.**
-Additive-and-permissive changes satisfy it for free. Anything that constrains
-or removes needs a release boundary, and which side it goes on depends on
-whether the code has to start doing something or stop doing it.
+Anything that constrains or removes needs a release boundary, and which side it
+goes on depends on whether the code has to start doing something or stop doing
+it.
+
+Additive changes usually satisfy the rule, but "additive is free" is a check
+that usually passes, not a law. A new column breaks old code that reads
+positionally or `SELECT *`s into a strict decoder; a `NOT NULL` with a default
+is additive to a reader and a requirement to a writer; a widened type can be
+written by new code and rejected on read by old. Ask the question of every
+migration explicitly. The reason this repo's additive changes have been safe is
+that its `sqlx` queries name their columns — not that adding things is
+inherently safe.
+
+The rule has a mirror the rollout hides: **the same compatibility must hold
+when a deploy is rolled BACK.** Rolling forward past a `DROP` puts a floor
+under how far back you can go — see the rollback floor in the header.
 
 Three releases, each with a completed rollout in between. No PR opens until its
 predecessor is live — verified for B1 by §7.0's query, and for B2 by §7's
