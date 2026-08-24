@@ -733,7 +733,7 @@ Response `200`：
 |---|---|---|
 | 不存在 | 非空 | 插入一行，`truncated = true` |
 | 不存在 | 空 | 不写 assistant 行 |
-| 已存在（竞态） | 非空 | 覆盖 `content`，`truncated = true`；保留 `model` / `usage` / `generation_id` 和 `affinity_scope` / `memory_scope` 元数据 |
+| 已存在（竞态） | 非空 | 覆盖 `content`，`truncated = true`；保留 `generation_id`（join 进 `llm_generations` 的 key）和 `affinity_scope` / `memory_scope` 元数据 |
 | 已存在（竞态） | 空 | `content` 保持不动 |
 
 同一轮次重复调用打断接口是幂等的——标记和 upsert 都以 user 行的 id 为键，重试

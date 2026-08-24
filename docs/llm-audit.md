@@ -222,38 +222,54 @@ field on the frame the client receives for that turn too, not only the row
 in the database. The frame then matches the DB (both `NULL`), which is the
 point, but it means an internal audit-write failure is visible on the wire.
 
-**What survives a degraded write depends on the task.** The five background
-sweepers (`world_director`, `world_stories_director`, `world_comment`,
-`world_reply`, `memory_extraction`) write no child row of their own — for
-them a degraded write loses the record entirely, and the tracing line above
-plus the provider's own log are what's left. Every other task's child row
-sets its own `model` and `usage` straight from the provider response,
-independent of what `record_generation` returns (e.g. `stream.rs`'s
-`AssistantInsert.model` / `.usage`) — those survive a degraded write today.
-Only the join key, `generation_id`, is lost. **After a later release drops
-the now-redundant `model` / `usage` columns from those child tables**, that
-loss becomes total for them too — see the design spec, §6.
+**A degraded write now loses the whole record, for every task.** It used to
+lose only the join key: each child row set its own `model` and `usage`
+straight from the provider response, so those survived. **Since this release
+the child tables no longer write them** — `engine.llm_generations` is the one
+place a generation's model and spend live, reached by joining on
+`generation_id`. So when the parent write degrades, the child row stores
+`NULL` and there is nothing to join to; the tracing line above and the
+provider's own log are what is left. That was already true of the five
+background sweepers (`world_director`, `world_stories_director`,
+`world_comment`, `world_reply`, `memory_extraction`), which write no child
+row at all. It is now true of everything.
 
-### No foreign keys yet
+**The same applies to a response that carries no `generation_id`.**
+`record_generation` logs the line and then short-circuits, because the id is
+the primary key — so a provider that answers without one produces a billable
+call with no row anywhere, and its model survives only in the tracing output.
+Rare in practice (OpenRouter always returns an id) but real for the
+salvaged-garble fallback and for direct providers that omit it.
+
+The columns themselves stay until the next release drops them; between the
+two they exist and hold `NULL` for anything written from here on. That is the
+intended intermediate state, not a defect — see the design spec, §7.
+
+### The foreign keys
 
 **The child tables' `generation_id` columns — `chat_messages`,
 `companion_affinity_events`, `companion_insights_events`,
 `companion_decision_events`, `chat_images_events`, `chat_vision_events`,
-`character_insights_events`, `user_insights_events` — do not reference this
-table.** They can't yet: `fly.toml` runs the migration before traffic moves
-to the new machines, so a foreign key shipped in the same release as this
-write path would reject inserts from the previous build still serving live
-traffic. A later release adds the foreign keys together with a backfill of
-the pre-existing rows. Until then the two sides line up in practice, not by
-constraint — do not read this document as saying the link is enforced today.
+`character_insights_events`, `user_insights_events` — each reference this
+table**, `ON DELETE SET NULL`, and each is indexed. Migration `0060` added
+them, together with a backfill of every pre-existing row and an index on each
+column.
 
-**`chat_messages.f_generation_id` is the exception: it never gets one, in
-that later release or any other.** It is a ninth `generation_id`-bearing
+They could not ship with the write path itself: `fly.toml` runs the migration
+before traffic moves to the new machines, so a foreign key added in the same
+release as the code that populates the parent would have rejected inserts
+from the previous build still serving live traffic. Hence two releases.
+
+The constraints are **validated**, not `NOT VALID` — the retrospective
+guarantee holds, so a row pointing at a generation that was never recorded
+cannot exist.
+
+**`chat_messages.f_generation_id` is the exception: it has no foreign key,
+and will not get one.** It is a ninth `generation_id`-bearing
 column — the filter generation, distinct from `chat_messages.generation_id`
 above — written by a separate `mark_filtered` `UPDATE` path that would need
 its own degrade branch, and production carries exactly one non-null value in
-it. This is a permanent decision (design spec §7.2), not a later-release
-item like the eight columns above.
+it. This is a permanent decision (design spec §7.2), not an oversight.
 
 ### One row per billed response, not one per turn
 
@@ -273,8 +289,7 @@ candidate before any early return that would otherwise skip it.
 One case looks like an exception and is not: when a product-QA chain is spent
 and a canned `error_handling` phrase is served instead, the generation is in
 `llm_generations` with its real usage, while the persisted `chat_messages`
-row carries `model` / `usage` / `generation_id` as `NULL`. Both are
-deliberate. The call was billed, so it is audited; the message's content came
+row carries `generation_id` as `NULL`. Both are deliberate. The call was billed, so it is audited; the message's content came
 from a phrase table, not from that call, so attributing it would poison
 reconciliation.
 
@@ -325,8 +340,9 @@ as shown above.
 - **Persist the `audit` object.** No DB column stores the caller-supplied
   `audit` (`user` / `session_id` / `metadata`) or the attribution headers —
   those are surface fields only, forwarded upstream and then dropped. The
-  OpenRouter `model` / `usage` / `generation_id` triple **is** persisted, on
-  `chat_messages.model` / `.usage` / `.generation_id` for the chat completion
+  OpenRouter `model` / `usage` / `generation_id` triple **is** persisted —
+  `model` and `usage` in `engine.llm_generations`, and `generation_id` on the
+  row that call produced: `chat_messages.generation_id` for the chat completion
   (mirrored on `companion_affinity_events` for the affinity eval, on
   `companion_insights_events` for each `insight_extraction` /
   `insight_structuring` call of the human chain, on
@@ -612,9 +628,9 @@ delegated image prompt, the standalone `POST
 | `caption` | `TEXT?` | NULL when the composer produced none, including the non-JSON fallback reply, where the whole reply becomes `subject` instead. |
 | `composed_prompt` | `TEXT?` | The assembled wire string — style preset + persona appearance + subject, i.e. exactly what the downstream consumer is handed. Stored on **every** row that produced one, including `exhausted` and `not_configured` on the chat path (the portrait fallback still assembles a wire prompt, and this column is then the only record anywhere of what was drawn). NULL only on the standalone endpoint's `exhausted` rows and the `image_edit` endpoint's `exhausted` rows — both fail without assembling anything (the edit endpoint has no portrait fallback either). |
 | `variant` | `TEXT?` | The resolved `prompt_variant` key; `"raw"` is an ordinary key, not a skip. |
-| `model` | `TEXT?` | The model that answered, on success. Also populated on `exhausted` whenever the LAST attempt got a response back at all: `empty`/`empty_prompt` on the chat path and the non-stream endpoint (both walk `run_image_prompt_compose`'s shared chain), and on the standalone endpoint's streaming mode also a candidate that streamed metadata (model/generation_id/usage) and then broke — that evidence is retained because the provider answered and may have been billed. NULL when no response ever came back on any path: a break or timeout that captured nothing at all, or `not_configured` (no call was made). **Since v1.4.0 the "did the provider answer?" test lives ENTIRELY in this trio** (`model` / `generation_id` / `usage`); `last_failure` no longer doubles as a second, coarser copy of it, which is why the two labels that used to encode it (`stream_open_failed` / `stream_died_midway`) are gone. |
-| `usage` | `JSONB?` | Full unfiltered OpenRouter usage block, `serde_json::to_value`'d — `OPENROUTER_USAGE_HIDDEN_KEYS` filters the wire copy only, never this. Travels with `model`: populated exactly where `model` is. |
-| `generation_id` | `TEXT?` | Travels with `model`. |
+| `model` | `TEXT?` | **No longer written. Dropped in the next release.** Join `engine.llm_generations` on `generation_id` for the model that answered. Existing rows keep their historical value. |
+| `usage` | `JSONB?` | **No longer written. Dropped in the next release.** Same join. |
+| `generation_id` | `TEXT?` | The join key into `engine.llm_generations`, and the whole audit trail this row keeps of its own call. Populated on success, and on `exhausted` whenever the LAST attempt got a response back at all: `empty`/`empty_prompt` on the chat path and the non-stream endpoint (both walk `run_image_prompt_compose`'s shared chain), and on the standalone endpoint's streaming mode also a candidate that streamed metadata and then broke — that evidence is retained because the provider answered and may have been billed. NULL when no response ever came back on any path: a break or timeout that captured nothing at all, or `not_configured` (no call was made). **Since v1.4.0 the "did the provider answer?" test lives here** and `last_failure` no longer doubles as a coarser copy of it, which is why the two labels that used to encode it (`stream_open_failed` / `stream_died_midway`) are gone. One caveat since the `model` column stopped being written: a provider that answers *without* an `id` now reads the same as one that never answered, because `model` used to fall back to the attempted model id and no longer does. `attempts` and `last_failure` still separate the two. |
 | `attempts` | `SMALLINT` | Models actually called off `[primary, ...fallback]`; `0` for `not_configured`. |
 | `last_failure` | `TEXT?` | Why the last attempt failed; NULL when `status = "ok"` or `"not_configured"` (no attempt was made, so there is nothing to have failed). Values: `empty` \| `empty_prompt` \| `upstream_error` \| `gateway_error`. A free column, not a CHECK — the vocabulary grows as new failure modes get labeled. The first two are **content verdicts**: the call succeeded and was billed, its output was just unusable. The last two are **pointer values** naming which of the two columns below holds the per-hop detail; since v1.4.0 they replace `model_error` / `timeout` and the streaming mode's `stream_open_failed` / `stream_died_midway` — each of those covered a provider status AND a local timeout under one label, so all four are retired and the column now reads the same whichever endpoint wrote the row (see [Failed attempts](#failed-attempts-llm_attempts--gateway_errors)). **`empty` is also reachable in streaming mode**, not just the chain-walk paths — a candidate that never opens (no content chunk) but whose stream ends normally reports `empty`, same label as the chain-walk's content-level blank-reply arm, because both mean the same thing: the provider answered and may have been billed. |
 | `llm_attempts` | `JSONB?` | Every hop where the provider answered with a failure. `task = "chat_image_prompt_compose"` on every row except `source = "image_edit"`, where it is `"chat_image_edit_compose"` — even when the edit ran on the compose task's fallback chain, see [Model config → image-EDIT composer](model-config.md#taskschat_image_edit_compose--image-edit-composer-optional). NULL when there were none — see [Failed attempts](#failed-attempts-llm_attempts--gateway_errors). |
@@ -695,9 +711,9 @@ product_qa / image-only turns will overstate coverage.
 | `status` | `TEXT` | `ok` \| `exhausted` \| `not_configured`. |
 | `image_url` | `TEXT` | |
 | `vision` | `JSONB?` | The parsed describe (`description` / `ocr_text` / `people` / `scene`). Duplicates `chat_messages.metadata.vision` on success — the accepted price of this table answering "how many describes ran, on what, at what success rate" without joining `chat_messages` to establish a denominator. |
-| `model` | `TEXT?` | The model that answered, on success. Also populated on `exhausted` when the last attempt answered but its content was unusable (`empty` / `unparseable` / `content_filter` / `blank_description` / `refusal_pattern`). NULL only when nothing ever answered — a provider status, a transport break or a timeout (`upstream_error` / `gateway_error`) — or `not_configured` (no call was made at all). |
-| `usage` | `JSONB?` | Full unfiltered usage block, same rule as `chat_images_events.usage`. |
-| `generation_id` | `TEXT?` | |
+| `model` | `TEXT?` | **No longer written. Dropped in the next release.** Join `engine.llm_generations` on `generation_id`. The rule `generation_id` now follows on its own: populated on success, and on `exhausted` when the last attempt answered but its content was unusable (`empty` / `unparseable` / `content_filter` / `blank_description` / `refusal_pattern`); NULL only when nothing ever answered — a provider status, a transport break or a timeout (`upstream_error` / `gateway_error`) — or `not_configured` (no call was made at all). |
+| `usage` | `JSONB?` | **No longer written. Dropped in the next release.** Join `engine.llm_generations` on `generation_id`. |
+| `generation_id` | `TEXT?` | The join key into `engine.llm_generations`, and this row's whole record of its own call. |
 | `attempts` | `SMALLINT` | Models actually called off `[primary, ...fallback]`; `0` when `[tasks.chat_vision]` is not configured. |
 | `last_failure` | `TEXT?` | NULL when `status = "ok"` or `"not_configured"`. Values: `upstream_error` \| `gateway_error` \| `empty` \| `unparseable` \| `content_filter` \| `blank_description` \| `refusal_pattern` — the last three are `image_vision_invalidity`'s existing reason strings, reused verbatim. The first two are the v1.4.0 **pointer values** that replaced `model_error` / `timeout`; they name which of the two columns below holds the per-hop detail (see [Failed attempts](#failed-attempts-llm_attempts--gateway_errors)). |
 | `llm_attempts` | `JSONB?` | Every hop where the provider answered with a failure, `task = "chat_vision"`. NULL when there were none. |

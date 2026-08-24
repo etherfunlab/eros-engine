@@ -139,7 +139,8 @@ unique index 保证（migration 0041）。文本路径没有这条约束——�
 `continues_from_message_id` 为同一个用户轮次写多条 assistant 行。这条索引存在
 是因为一个语音轮次有两个可能的写入方：流式生成器，以及上报客户端实际播出内容
 的 barge-in interrupt 端点。两者靠 user 行上共享的 `FOR UPDATE` 锁排序：
-`content` 归 interrupt，审计列（`model` / `usage` / `generation_id`）归生成器。
+`content` 归 interrupt，审计列（`generation_id`——join 进 `llm_generations` 的
+key，模型和花费都在那张表里）归生成器。
 user 行上带 `metadata.voice_interrupt` 表示这一轮是用户主动打断的——这也正是
 区分「重试」与「可修复的掉线」的依据。详见
 [voice barge-in](superpowers/specs/2026-08-11-voice-barge-in-interrupt-design.md)。
