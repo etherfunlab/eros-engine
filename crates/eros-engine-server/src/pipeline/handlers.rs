@@ -2186,8 +2186,6 @@ mod tests {
                         assistant_action_type: "reply".into(),
                         truncated: false,
                         continues_from_message_id: None,
-                        model: Some("test-model".into()),
-                        usage: None,
                         generation_id: None,
                         filter_audit: None,
                         metadata: None,

@@ -209,7 +209,11 @@ pub struct UserInsightEventInsert<'a> {
     pub stage: &'a str,
     pub status: &'a str,
     pub payload: Option<serde_json::Value>,
-    pub meta: crate::OpenRouterCallMeta,
+    /// `record_generation`'s return value — never `resp.generation_id`. The
+    /// model and usage for this call live in `engine.llm_generations`, reached
+    /// by joining on this column (spec §7.4). `None` when no call was made, or
+    /// when the parent write failed and the trail degraded to NULL.
+    pub generation_id: Option<String>,
 }
 
 pub struct UserInsightEventRepo<'a> {
@@ -223,8 +227,8 @@ impl UserInsightEventRepo<'_> {
         sqlx::query(
             "INSERT INTO engine.user_insights_events \
                (run_id, instance_id, session_id, message_id, stage, status, payload, \
-                model, usage, generation_id) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+                generation_id) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
         )
         .bind(ev.run_id)
         .bind(ev.instance_id)
@@ -233,9 +237,7 @@ impl UserInsightEventRepo<'_> {
         .bind(ev.stage)
         .bind(ev.status)
         .bind(ev.payload)
-        .bind(ev.meta.model)
-        .bind(ev.meta.usage)
-        .bind(ev.meta.generation_id)
+        .bind(ev.generation_id)
         .execute(self.pool)
         .await?;
         Ok(())
@@ -255,6 +257,8 @@ mod tests {
         let seeded_session = crate::testutil::seed_chat_session(&pool, Uuid::new_v4()).await;
         let seeded_message = crate::testutil::seed_chat_message(&pool, seeded_session).await;
         let instance_id = seed_persona_instance(&pool, Uuid::new_v4()).await;
+        // ...and generation_id since 0060.
+        crate::testutil::seed_generation(&pool, "g").await;
 
         sqlx::query(
             "INSERT INTO engine.user_insights \
@@ -392,7 +396,7 @@ mod tests {
                 stage: "extraction",
                 status: "ok",
                 payload: None,
-                meta: crate::OpenRouterCallMeta::default(),
+                generation_id: None,
             })
             .await
             .unwrap();
@@ -437,6 +441,8 @@ mod tests {
         // session_id / message_id are FK-referenced since 0058.
         let session_id = crate::testutil::seed_chat_session(&pool, Uuid::new_v4()).await;
         let message_id = crate::testutil::seed_chat_message(&pool, session_id).await;
+        // ...and generation_id since 0060.
+        crate::testutil::seed_generation(&pool, "gen-user").await;
 
         UserInsightEventRepo { pool: &pool }
             .record(UserInsightEventInsert {
@@ -447,11 +453,7 @@ mod tests {
                 stage: "structuring",
                 status: "ok",
                 payload: Some(serde_json::json!({"location": "深圳南山", "_existing_keys": []})),
-                meta: crate::OpenRouterCallMeta {
-                    generation_id: Some("gen-user".into()),
-                    model: Some("ins/m".into()),
-                    usage: Some(serde_json::json!({"total_tokens": 11})),
-                },
+                generation_id: Some("gen-user".into()),
             })
             .await
             .unwrap();
@@ -463,8 +465,10 @@ mod tests {
             Option<serde_json::Value>,
             Option<serde_json::Value>,
         ) = sqlx::query_as(
-            "SELECT stage, generation_id, payload, usage \
-             FROM engine.user_insights_events WHERE run_id = $1",
+            "SELECT e.stage, e.generation_id, e.payload, g.usage \
+             FROM engine.user_insights_events e \
+             LEFT JOIN engine.llm_generations g ON g.generation_id = e.generation_id \
+             WHERE e.run_id = $1",
         )
         .bind(run_id)
         .fetch_one(&pool)
@@ -477,7 +481,9 @@ mod tests {
             payload,
             Some(serde_json::json!({"location": "深圳南山", "_existing_keys": []}))
         );
-        assert_eq!(usage, Some(serde_json::json!({"total_tokens": 11})));
+        // Through the join: this is the PARENT's usage. Break the join and it
+        // comes back NULL.
+        assert_eq!(usage, Some(crate::testutil::seeded_usage()));
     }
 
     #[test]

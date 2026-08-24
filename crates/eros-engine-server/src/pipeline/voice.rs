@@ -912,8 +912,6 @@ pub fn run_voice_turn(
                     turn.user_message_id,
                     assistant_uuid,
                     &acc,
-                    served_model.as_deref(),
-                    usage_full.as_ref(),
                     last_gen_id.as_deref(),
                     truncated,
                     Some(&scope_metadata),
@@ -2474,10 +2472,14 @@ data: [DONE]\n\n";
         assert_eq!(usage["prompt_tokens"], 1);
         assert_eq!(usage["total_tokens"], 3);
 
-        // The persisted row keeps the FULL unfiltered usage, incl. `cost`.
+        // The persisted audit keeps the FULL unfiltered usage, incl. `cost`.
+        // Since B1 that lives in engine.llm_generations, reached from the
+        // assistant row's generation_id — `openrouter_usage_hidden_keys`
+        // filters the WIRE copy only, and this is what proves it.
         let persisted_usage: Option<serde_json::Value> = sqlx::query_scalar(
-            "SELECT usage FROM engine.chat_messages \
-             WHERE session_id = $1 AND role = 'assistant'",
+            "SELECT g.usage FROM engine.chat_messages m \
+             JOIN engine.llm_generations g ON g.generation_id = m.generation_id \
+             WHERE m.session_id = $1 AND m.role = 'assistant'",
         )
         .bind(session_id)
         .fetch_one(&pool)

@@ -586,8 +586,9 @@ pub struct AssistantInsert {
     pub assistant_action_type: String, // "reply"
     pub continues_from_message_id: Option<Uuid>,
     pub truncated: bool,
-    pub model: Option<String>,
-    pub usage: Option<serde_json::Value>,
+    /// `record_generation`'s return value — never `resp.generation_id`. The
+    /// model and usage for this reply's generation live in
+    /// `engine.llm_generations`, reached by joining on this column (spec §7.4).
     pub generation_id: Option<String>,
     pub filter_audit: Option<FilterAudit>,
     /// Open marker bag for assistant rows. Today carries `{"prompt_traits": [...]}`
@@ -983,13 +984,13 @@ impl<'a> ChatRepo<'a> {
             sqlx::query(
                 "INSERT INTO engine.chat_messages \
                    (id, session_id, role, content, user_message_id, \
-                    continues_from_message_id, truncated, model, usage, generation_id, \
+                    continues_from_message_id, truncated, generation_id, \
                     assistant_action_type, \
                     pre_filter_content, filter_model, filter_triggers, \
                     f_client_msg_id, f_generation_id, metadata, \
                     llm_attempts, gateway_errors) \
-                 VALUES ($1, $2, 'assistant', $3, $4, $5, $6, $7, $8, $9, $10, \
-                         $11, $12, $13, $14, $15, $16, $17, $18)",
+                 VALUES ($1, $2, 'assistant', $3, $4, $5, $6, $7, $8, \
+                         $9, $10, $11, $12, $13, $14, $15, $16)",
             )
             .bind(row.id)
             .bind(session_id)
@@ -997,8 +998,6 @@ impl<'a> ChatRepo<'a> {
             .bind(user_message_id)
             .bind(row.continues_from_message_id)
             .bind(row.truncated)
-            .bind(&row.model)
-            .bind(&row.usage)
             .bind(&row.generation_id)
             .bind(&row.assistant_action_type)
             .bind(pre_filter)
@@ -1139,8 +1138,6 @@ impl<'a> ChatRepo<'a> {
         user_message_id: Uuid,
         id: Uuid,
         content: &str,
-        model: Option<&str>,
-        usage: Option<&serde_json::Value>,
         generation_id: Option<&str>,
         truncated: bool,
         metadata: Option<&serde_json::Value>,
@@ -1157,11 +1154,11 @@ impl<'a> ChatRepo<'a> {
             .await?;
         sqlx::query(
             "INSERT INTO engine.chat_messages AS m \
-             (id, session_id, role, content, user_message_id, truncated, model, usage, \
+             (id, session_id, role, content, user_message_id, truncated, \
               generation_id, assistant_action_type, channel, metadata, \
               llm_attempts, gateway_errors) \
-             SELECT $1, $2, 'assistant', $3, $4, $5, $6, $7, $8, 'reply', 'voice', $9, \
-                    $10, $11 \
+             SELECT $1, $2, 'assistant', $3, $4, $5, $6, 'reply', 'voice', $7, \
+                    $8, $9 \
              WHERE NOT ( \
                  COALESCE((SELECT u.metadata->>'voice_interrupt' \
                              FROM engine.chat_messages u WHERE u.id = $4), 'false')::bool \
@@ -1175,8 +1172,6 @@ impl<'a> ChatRepo<'a> {
                                              THEN m.content ELSE EXCLUDED.content END, \
                            truncated = CASE WHEN m.metadata ? 'voice_interrupt' \
                                              THEN m.truncated ELSE EXCLUDED.truncated END, \
-                           model = EXCLUDED.model, \
-                           usage = COALESCE(EXCLUDED.usage, m.usage), \
                            generation_id = EXCLUDED.generation_id, \
                            llm_attempts = EXCLUDED.llm_attempts, \
                            gateway_errors = EXCLUDED.gateway_errors",
@@ -1186,8 +1181,6 @@ impl<'a> ChatRepo<'a> {
         .bind(content)
         .bind(user_message_id)
         .bind(truncated)
-        .bind(model)
-        .bind(usage)
         .bind(generation_id)
         .bind(metadata)
         .bind(llm_attempts)
@@ -1214,8 +1207,6 @@ impl<'a> ChatRepo<'a> {
         user_message_id: Uuid,
         id: Uuid,
         content: &str,
-        model: Option<&str>,
-        usage: Option<&serde_json::Value>,
         generation_id: Option<&str>,
         truncated: bool,
         llm_attempts: Option<&serde_json::Value>,
@@ -1223,17 +1214,15 @@ impl<'a> ChatRepo<'a> {
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO engine.chat_messages \
-             (id, session_id, role, content, user_message_id, truncated, model, usage, \
+             (id, session_id, role, content, user_message_id, truncated, \
               generation_id, assistant_action_type, channel, llm_attempts, gateway_errors) \
-             VALUES ($1, $2, 'assistant', $3, $4, $5, $6, $7, $8, 'reply', 'product_qa', $9, $10)",
+             VALUES ($1, $2, 'assistant', $3, $4, $5, $6, 'reply', 'product_qa', $7, $8)",
         )
         .bind(id)
         .bind(session_id)
         .bind(content)
         .bind(user_message_id)
         .bind(truncated)
-        .bind(model)
-        .bind(usage)
         .bind(generation_id)
         .bind(llm_attempts)
         .bind(gateway_errors)
@@ -1696,6 +1685,8 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn upsert_user_message_idempotent_replay_after_done(pool: PgPool) {
+        // generation_id is FK-referenced since 0060.
+        crate::testutil::seed_generation(&pool, "gen-1").await;
         let repo = ChatRepo { pool: &pool };
         let user_id = Uuid::new_v4();
         let instance_id = seed_persona_instance(&pool, user_id).await;
@@ -1727,10 +1718,6 @@ mod tests {
                 assistant_action_type: "reply".into(),
                 continues_from_message_id: None,
                 truncated: false,
-                model: Some("x-ai/grok-4-fast".into()),
-                usage: Some(
-                    serde_json::json!({"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}),
-                ),
                 generation_id: Some("gen-1".into()),
                 filter_audit: None,
                 metadata: None,
@@ -1988,6 +1975,8 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     #[allow(clippy::type_complexity)] // sqlx tuple query — type alias would add noise
     async fn assistant_batch_round_trips_filter_audit(pool: PgPool) {
+        // generation_id is FK-referenced since 0060.
+        crate::testutil::seed_generation(&pool, "gen_chat_xyz").await;
         let repo = ChatRepo { pool: &pool };
         let s = throwaway_session(&pool).await;
         let user_msg_id = match repo
@@ -2012,8 +2001,6 @@ mod tests {
             assistant_action_type: "reply".into(),
             continues_from_message_id: None,
             truncated: false,
-            model: Some("anthropic/claude-sonnet-4.6".into()),
-            usage: None,
             generation_id: Some("gen_chat_xyz".into()),
             filter_audit: Some(FilterAudit {
                 pre_filter_content: "raw reply".into(),
@@ -2054,6 +2041,8 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn assistant_batch_filter_audit_columns_default_null(pool: PgPool) {
+        // generation_id is FK-referenced since 0060.
+        crate::testutil::seed_generation(&pool, "gen_chat_xyz").await;
         let repo = ChatRepo { pool: &pool };
         let s = throwaway_session(&pool).await;
         let user_msg_id = match repo
@@ -2072,8 +2061,6 @@ mod tests {
             assistant_action_type: "reply".into(),
             continues_from_message_id: None,
             truncated: false,
-            model: Some("anthropic/claude-sonnet-4.6".into()),
-            usage: None,
             generation_id: Some("gen_chat_xyz".into()),
             filter_audit: None,
             metadata: None,
@@ -2129,6 +2116,8 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn assistant_batch_filter_audit_with_none_generation_id_writes_null(pool: PgPool) {
+        // generation_id is FK-referenced since 0060.
+        crate::testutil::seed_generation(&pool, "gen_chat_xyz").await;
         let repo = ChatRepo { pool: &pool };
         let s = throwaway_session(&pool).await;
         let user_msg_id = match repo
@@ -2147,8 +2136,6 @@ mod tests {
             assistant_action_type: "reply".into(),
             continues_from_message_id: None,
             truncated: false,
-            model: Some("anthropic/claude-sonnet-4.6".into()),
-            usage: None,
             generation_id: Some("gen_chat_xyz".into()),
             filter_audit: Some(FilterAudit {
                 pre_filter_content: "raw".into(),
@@ -2180,6 +2167,8 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn assistant_batch_filter_triggers_json_null_persists_as_sql_null(pool: PgPool) {
+        // generation_id is FK-referenced since 0060.
+        crate::testutil::seed_generation(&pool, "gen_chat_xyz").await;
         let repo = ChatRepo { pool: &pool };
         let s = throwaway_session(&pool).await;
         let user_msg_id = match repo
@@ -2200,8 +2189,6 @@ mod tests {
             assistant_action_type: "reply".into(),
             continues_from_message_id: None,
             truncated: false,
-            model: Some("anthropic/claude-sonnet-4.6".into()),
-            usage: None,
             generation_id: Some("gen_chat_xyz".into()),
             filter_audit: Some(FilterAudit {
                 pre_filter_content: "raw".into(),
@@ -2235,6 +2222,8 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn assistant_batch_persists_metadata_with_prompt_traits(pool: PgPool) {
+        // generation_id is FK-referenced since 0060.
+        crate::testutil::seed_generation(&pool, "gen_chat_xyz").await;
         let repo = ChatRepo { pool: &pool };
         let s = throwaway_session(&pool).await;
         let user_msg_id = match repo
@@ -2254,8 +2243,6 @@ mod tests {
             assistant_action_type: "reply".into(),
             continues_from_message_id: None,
             truncated: false,
-            model: Some("anthropic/claude-sonnet-4.6".into()),
-            usage: None,
             generation_id: Some("gen_chat_xyz".into()),
             filter_audit: None,
             metadata: Some(metadata.clone()),
@@ -2276,6 +2263,8 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn assistant_batch_metadata_default_null(pool: PgPool) {
+        // generation_id is FK-referenced since 0060.
+        crate::testutil::seed_generation(&pool, "gen_chat_xyz").await;
         let repo = ChatRepo { pool: &pool };
         let s = throwaway_session(&pool).await;
         let user_msg_id = match repo
@@ -2294,8 +2283,6 @@ mod tests {
             assistant_action_type: "reply".into(),
             continues_from_message_id: None,
             truncated: false,
-            model: Some("anthropic/claude-sonnet-4.6".into()),
-            usage: None,
             generation_id: Some("gen_chat_xyz".into()),
             filter_audit: None,
             metadata: None,
@@ -2316,6 +2303,8 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn assistant_batch_persists_metadata_with_tier(pool: PgPool) {
+        // generation_id is FK-referenced since 0060.
+        crate::testutil::seed_generation(&pool, "gen_chat_xyz").await;
         let repo = ChatRepo { pool: &pool };
         let s = throwaway_session(&pool).await;
         let user_msg_id = match repo
@@ -2338,8 +2327,6 @@ mod tests {
             assistant_action_type: "reply".into(),
             continues_from_message_id: None,
             truncated: false,
-            model: Some("anthropic/claude-sonnet-4.6".into()),
-            usage: None,
             generation_id: Some("gen_chat_xyz".into()),
             filter_audit: None,
             metadata: Some(metadata.clone()),
@@ -2387,8 +2374,6 @@ mod tests {
             assistant_action_type: "reply".into(),
             continues_from_message_id: None,
             truncated: false,
-            model: Some("test-model".into()),
-            usage: None,
             generation_id: None,
             filter_audit: None,
             metadata: None,
@@ -2426,8 +2411,6 @@ mod tests {
                 assistant_action_type: "reply".into(),
                 continues_from_message_id: None,
                 truncated: true,
-                model: Some("m".into()),
-                usage: None,
                 generation_id: None,
                 filter_audit: None,
                 metadata: None,
@@ -2455,8 +2438,6 @@ mod tests {
                 assistant_action_type: "reply".into(),
                 continues_from_message_id: None,
                 truncated: false,
-                model: Some("m".into()),
-                usage: None,
                 generation_id: None,
                 filter_audit: None,
                 metadata: None,
@@ -2499,8 +2480,6 @@ mod tests {
                     assistant_action_type: "reply".into(),
                     continues_from_message_id: None,
                     truncated: false,
-                    model: Some("m".into()),
-                    usage: None,
                     generation_id: None,
                     filter_audit: None,
                     metadata: None,
@@ -2545,8 +2524,6 @@ mod tests {
                 assistant_action_type: "reply".into(),
                 continues_from_message_id: None,
                 truncated: false,
-                model: Some("m".into()),
-                usage: None,
                 generation_id: None,
                 filter_audit: None,
                 metadata: None,
@@ -2596,8 +2573,6 @@ mod tests {
                 assistant_action_type: "reply".into(),
                 continues_from_message_id: None,
                 truncated: false,
-                model: Some("m".into()),
-                usage: None,
                 generation_id: None,
                 filter_audit: None,
                 metadata: None,
@@ -2645,8 +2620,6 @@ mod tests {
                 assistant_action_type: "reply".into(),
                 continues_from_message_id: None,
                 truncated: false,
-                model: Some("m".into()),
-                usage: None,
                 generation_id: None,
                 filter_audit: None,
                 metadata: None,
@@ -2779,8 +2752,6 @@ mod tests {
                 assistant_action_type: "reply".into(),
                 continues_from_message_id: None,
                 truncated: false,
-                model: Some("fallback/m".into()),
-                usage: None,
                 generation_id: None,
                 filter_audit: None,
                 metadata: None,
@@ -2869,8 +2840,6 @@ mod tests {
                 assistant_action_type: "reply".into(),
                 truncated: false,
                 continues_from_message_id: None,
-                model: Some("m".into()),
-                usage: None,
                 generation_id: None,
                 filter_audit: None,
                 metadata: None,
@@ -3088,8 +3057,6 @@ mod tests {
                 assistant_action_type: "reply".into(),
                 continues_from_message_id: None,
                 truncated: false,
-                model: None,
-                usage: None,
                 generation_id: None,
                 filter_audit: None,
                 metadata: None,
@@ -3148,8 +3115,6 @@ mod tests {
                         assistant_action_type: "reply".into(),
                         truncated: n == 1, // second one is a truncated partial
                         continues_from_message_id: None,
-                        model: Some("test-model".into()),
-                        usage: None,
                         generation_id: None,
                         filter_audit: None,
                         metadata: None,
@@ -3207,8 +3172,6 @@ mod tests {
                 assistant_action_type: "reply".into(),
                 continues_from_message_id: None,
                 truncated: false,
-                model: Some("m".into()),
-                usage: None,
                 generation_id: None,
                 filter_audit: None,
                 metadata: None,
@@ -3286,6 +3249,8 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn voice_inserts_are_marked_and_idempotent(pool: PgPool) {
+        // generation_id is FK-referenced since 0060.
+        crate::testutil::seed_generation(&pool, "gen-1").await;
         let session_id = throwaway_session(&pool).await.id;
         let repo = ChatRepo { pool: &pool };
 
@@ -3326,8 +3291,6 @@ mod tests {
             u1,
             aid,
             "hi there",
-            Some("primary"),
-            None,
             Some("gen-1"),
             false,
             Some(&serde_json::json!({"affinity_scope": "both"})),
@@ -3528,6 +3491,8 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn voice_assistant_insert_bumps_last_active_at(pool: PgPool) {
+        // generation_id is FK-referenced since 0060.
+        crate::testutil::seed_generation(&pool, "gen-1").await;
         let session_id = throwaway_session(&pool).await.id;
         let repo = ChatRepo { pool: &pool };
 
@@ -3562,8 +3527,6 @@ mod tests {
             user_message_id,
             aid,
             "hi there",
-            Some("primary"),
-            None,
             Some("gen-1"),
             false,
             None,
@@ -3618,6 +3581,10 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     #[allow(clippy::type_complexity)] // sqlx tuple query — type alias would add noise
     async fn voice_assistant_insert_is_idempotent_on_user_message(pool: PgPool) {
+        // generation_id is FK-referenced since 0060.
+        for g in ["gen-0", "gen-1"] {
+            crate::testutil::seed_generation(&pool, g).await;
+        }
         let repo = ChatRepo { pool: &pool };
         let (session_id, user_mid) = seed_voice_turn(&pool, "hello").await;
 
@@ -3627,8 +3594,6 @@ mod tests {
             user_mid,
             Uuid::new_v4(),
             "first",
-            Some("m/0"),
-            None,
             Some("gen-0"),
             true,
             None,
@@ -3642,14 +3607,11 @@ mod tests {
         // DIFFERENT generation_id. Must NOT create a second row; must be
         // last-writer-wins on every column (content included), so the
         // surviving row never pairs A's content with B's generation_id.
-        let usage = serde_json::json!({"total_tokens": 7});
         repo.insert_voice_assistant_message(
             session_id,
             user_mid,
             Uuid::new_v4(),
             "second",
-            Some("m/1"),
-            Some(&usage),
             Some("gen-1"),
             false,
             None,
@@ -3659,14 +3621,8 @@ mod tests {
         .await
         .unwrap();
 
-        let rows: Vec<(
-            String,
-            Option<String>,
-            Option<String>,
-            bool,
-            Option<serde_json::Value>,
-        )> = sqlx::query_as(
-            "SELECT content, model, generation_id, truncated, usage FROM engine.chat_messages \
+        let rows: Vec<(String, Option<String>, bool)> = sqlx::query_as(
+            "SELECT content, generation_id, truncated FROM engine.chat_messages \
              WHERE user_message_id = $1 AND role = 'assistant' AND channel = 'voice'",
         )
         .bind(user_mid)
@@ -3685,23 +3641,17 @@ mod tests {
         );
         assert_eq!(
             rows[0].1.as_deref(),
-            Some("m/1"),
-            "audit columns come from the SAME (surviving) writer as content"
-        );
-        assert_eq!(
-            rows[0].2.as_deref(),
             Some("gen-1"),
             "generation_id must match the surviving content's call, never a stale earlier generation"
         );
         assert!(
-            !rows[0].3,
+            !rows[0].2,
             "truncated must come from the same writer as content"
         );
-        assert_eq!(
-            rows[0].4,
-            Some(serde_json::json!({"total_tokens": 7})),
-            "usage must come from the same writer as content"
-        );
+        // What used to be a `usage` assertion here: since B1 the row carries
+        // no usage of its own, and the generation_id assertion above is what
+        // now pins "the audit came from the surviving writer" — it is the only
+        // thing linking this row to a call, so a stale one would be visible.
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -3728,8 +3678,6 @@ mod tests {
             user_mid,
             Uuid::new_v4(),
             "hi",
-            None,
-            None,
             None,
             false,
             None,
@@ -4015,6 +3963,8 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn insert_product_qa_assistant_message_round_trips(pool: PgPool) {
+        // generation_id is FK-referenced since 0060.
+        crate::testutil::seed_generation(&pool, "gen_pq_1").await;
         let repo = ChatRepo { pool: &pool };
         let session_id = throwaway_session(&pool).await.id;
         let user_id: Uuid = sqlx::query_scalar(
@@ -4026,14 +3976,11 @@ mod tests {
         .await
         .unwrap();
         let aid = Uuid::new_v4();
-        let usage = serde_json::json!({"total_tokens": 42});
         repo.insert_product_qa_assistant_message(
             session_id,
             user_id,
             aid,
             "产品介绍……",
-            Some("anthropic/claude-haiku-4.5"),
-            Some(&usage),
             Some("gen_pq_1"),
             false,
             Some(&serde_json::json!([{
@@ -4449,8 +4396,6 @@ mod tests {
             user_mid,
             Uuid::new_v4(),
             "generated much more",
-            Some("m/1"),
-            None,
             Some("gen-late"),
             false,
             None,
@@ -4476,17 +4421,16 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn interrupt_after_completion_overwrites_content_keeps_audit(pool: PgPool) {
+        // generation_id is FK-referenced since 0060.
+        crate::testutil::seed_generation(&pool, "gen-9").await;
         let repo = ChatRepo { pool: &pool };
         let (session_id, user_mid) = seed_voice_turn(&pool, "hello").await;
-        let usage = serde_json::json!({"total_tokens": 42});
         let scope = serde_json::json!({"affinity_scope": "both"});
         repo.insert_voice_assistant_message(
             session_id,
             user_mid,
             Uuid::new_v4(),
             "the whole sentence",
-            Some("m/1"),
-            Some(&usage),
             Some("gen-9"),
             false,
             Some(&scope),
@@ -4501,25 +4445,21 @@ mod tests {
             .unwrap()
             .expect("returns the existing row's id");
 
-        let (content, model, gen, truncated, meta): (
-            String,
-            Option<String>,
-            Option<String>,
-            bool,
-            serde_json::Value,
-        ) = sqlx::query_as(
-            "SELECT content, model, generation_id, truncated, metadata \
+        let (content, gen, truncated, meta): (String, Option<String>, bool, serde_json::Value) =
+            sqlx::query_as(
+                "SELECT content, generation_id, truncated, metadata \
                FROM engine.chat_messages \
               WHERE user_message_id = $1 AND role = 'assistant'",
-        )
-        .bind(user_mid)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+            )
+            .bind(user_mid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
 
         assert_eq!(content, "the whole", "content is what was actually heard");
-        assert_eq!(model.as_deref(), Some("m/1"), "billing audit survives");
-        assert_eq!(gen.as_deref(), Some("gen-9"));
+        // Since B1 the join key IS the billing audit: it reaches the
+        // engine.llm_generations row that holds the model and the spend.
+        assert_eq!(gen.as_deref(), Some("gen-9"), "billing audit survives");
         assert!(truncated);
         assert_eq!(
             meta["affinity_scope"], "both",
@@ -4540,8 +4480,6 @@ mod tests {
             user_mid,
             Uuid::new_v4(),
             "already said this",
-            None,
-            None,
             None,
             false,
             None,
@@ -4571,6 +4509,10 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn double_write_race_is_order_independent(pool: PgPool) {
+        // generation_id is FK-referenced since 0060.
+        for g in ["gen-a", "gen-b"] {
+            crate::testutil::seed_generation(&pool, g).await;
+        }
         let repo = ChatRepo { pool: &pool };
 
         // Order A: interrupt first, generator second.
@@ -4583,8 +4525,6 @@ mod tests {
             u1,
             Uuid::new_v4(),
             "generated much more",
-            Some("m/1"),
-            None,
             Some("gen-a"),
             false,
             None,
@@ -4601,8 +4541,6 @@ mod tests {
             u2,
             Uuid::new_v4(),
             "generated much more",
-            Some("m/1"),
-            None,
             Some("gen-b"),
             false,
             None,

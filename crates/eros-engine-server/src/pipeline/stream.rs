@@ -729,8 +729,6 @@ fn drive_chat_burst(
                     assistant_action_type: persist_action.into(),
                     continues_from_message_id: continues_from.map(Into::into),
                     truncated,
-                    model: Some(model_id.clone()),
-                    usage: usage_full.clone(),
                     generation_id: last_gen_id.clone(),
                     filter_audit,
                     metadata: if is_ghost_fallback {
@@ -1112,8 +1110,6 @@ fn drive_chat_burst(
                         assistant_action_type: persist_action.into(),
                         continues_from_message_id: None,
                         truncated: false,
-                        model: Some(model_id.clone()),
-                        usage: usage_full.clone(),
                         generation_id: last_gen_id.clone(),
                         filter_audit: None,
                         metadata: if is_ghost {
@@ -1400,8 +1396,6 @@ fn drive_chat_burst(
                 assistant_action_type: persist_action.into(),
                 continues_from_message_id: None,
                 truncated: false,
-                model: Some(model_id.clone()),
-                usage: usage_full.clone(),
                 generation_id: last_gen_id.clone(),
                 filter_audit,
                 metadata: if is_ghost {
@@ -2084,16 +2078,15 @@ impl PdeStatus {
 }
 
 /// Outcome of a PDE judge run. `verdict` is `Some` only on `Ok`; `raw` carries
-/// the model text on `ParseError` for the audit payload; the trio is the
-/// winning call's audit echo. `failures` is every failed hop of the chain walk
+/// the model text on `ParseError` for the audit payload; `generation_id` is the
+/// winning call's join key into `engine.llm_generations`, where its model and
+/// usage live. `failures` is every failed hop of the chain walk
 /// — the audit row's two columns, and the `final` frame's judge share (spec
 /// §6.1).
 pub(crate) struct PdeDecisionRun {
     pub(crate) status: PdeStatus,
     pub(crate) verdict: Option<PdeVerdict>,
     pub(crate) raw: Option<String>,
-    pub(crate) model: Option<String>,
-    pub(crate) usage: Option<serde_json::Value>,
     pub(crate) generation_id: Option<String>,
     pub(crate) failures: Vec<eros_engine_llm::failure::AttemptFailure>,
 }
@@ -2126,12 +2119,12 @@ fn pde_response_format() -> serde_json::Value {
     })
 }
 
-/// The last parse-error attempt's text + audit echo, kept so a chain-exhausted
-/// ParseError return preserves the raw model text and audit trio.
+/// The last parse-error attempt's text + join key, kept so a chain-exhausted
+/// ParseError return preserves the raw model text and can still be tied to the
+/// call that produced it. The model and usage live in
+/// `engine.llm_generations`, reached through `generation_id`.
 struct LastParseAttempt {
     raw: String,
-    model: Option<String>,
-    usage: Option<serde_json::Value>,
     generation_id: Option<String>,
 }
 
@@ -2227,8 +2220,6 @@ async fn run_pde_decision(
                     status: PdeStatus::Ok,
                     verdict: Some(verdict),
                     raw: None,
-                    model: resp.model.or_else(|| Some(model_id.clone())),
-                    usage: resp.usage,
                     generation_id,
                     failures,
                 };
@@ -2238,8 +2229,6 @@ async fn run_pde_decision(
                 last = PdeStatus::ParseError;
                 last_parse = Some(LastParseAttempt {
                     raw: text,
-                    model: resp.model.or_else(|| Some(model_id.clone())),
-                    usage: resp.usage,
                     generation_id,
                 });
                 continue;
@@ -2254,8 +2243,6 @@ async fn run_pde_decision(
                 status: PdeStatus::ParseError,
                 verdict: None,
                 raw: Some(lp.raw),
-                model: lp.model,
-                usage: lp.usage,
                 generation_id: lp.generation_id,
                 failures,
             }
@@ -2264,8 +2251,6 @@ async fn run_pde_decision(
             status: other,
             verdict: None,
             raw: None,
-            model: None,
-            usage: None,
             generation_id: None,
             failures,
         },
@@ -2609,8 +2594,6 @@ struct VisionOutcome {
     vision: serde_json::Value,
     vision_model: String,
     v_generation_id: Option<String>,
-    /// Full unfiltered usage block for the audit row.
-    usage: Option<serde_json::Value>,
 }
 
 /// What one `chat_vision` chain walk produced, plus the audit facts a bare
@@ -2625,9 +2608,7 @@ struct VisionRun {
     /// billed, but the describe itself was unusable. `None` on a provider
     /// status, transport break or timeout (`upstream_error` / `gateway_error`),
     /// where nothing ever answered.
-    last_model: Option<String>,
     last_generation_id: Option<String>,
-    last_usage: Option<serde_json::Value>,
     /// Every failed hop of the chain walk, for the audit row's two columns.
     /// Content-level failures push nothing — the call succeeded and was
     /// billed, so `last_failure` alone owns that verdict.
@@ -2659,9 +2640,7 @@ async fn run_vision(
         .collect();
     let mut attempts: i16 = 0;
     let mut last_failure: Option<&'static str> = None;
-    let mut last_model: Option<String> = None;
     let mut last_generation_id: Option<String> = None;
-    let mut last_usage: Option<serde_json::Value> = None;
     let mut failures: Vec<eros_engine_llm::failure::AttemptFailure> = Vec::new();
     for model_id in &chain {
         attempts += 1;
@@ -2691,18 +2670,14 @@ async fn run_vision(
                 // Transport failure: nothing came back, so any identity
                 // captured by an EARLIER content-level failure this chain
                 // walk must not survive to describe THIS attempt's outcome.
-                last_model = None;
                 last_generation_id = None;
-                last_usage = None;
                 continue;
             }
             Err(_) => {
                 tracing::warn!(model = %model_id, "chat_vision: timeout; next");
                 failures.push(filter_timeout_failure("chat_vision", model_id));
                 last_failure = Some(operation_failure_pointer(&failures));
-                last_model = None;
                 last_generation_id = None;
-                last_usage = None;
                 continue;
             }
         };
@@ -2724,9 +2699,7 @@ async fn run_vision(
             // Content-level failure: the provider answered and was billed
             // above by `record_generation`, even though the reply was
             // blank. Record who answered in case the whole chain exhausts.
-            last_model = Some(resp.model.clone().unwrap_or_else(|| model_id.clone()));
             last_generation_id = generation_id.clone();
-            last_usage = resp.usage.clone();
             continue;
         }
         let vision = match parse_image_vision(&text) {
@@ -2734,18 +2707,14 @@ async fn run_vision(
             None => {
                 tracing::warn!(model = %model_id, "chat_vision: unparseable describe JSON; next");
                 last_failure = Some("unparseable");
-                last_model = Some(resp.model.clone().unwrap_or_else(|| model_id.clone()));
                 last_generation_id = generation_id.clone();
-                last_usage = resp.usage.clone();
                 continue;
             }
         };
         if let Some(reason) = image_vision_invalidity(&vision, resp.finish_reason.as_deref()) {
             tracing::warn!(model = %model_id, invalidity = %reason, "chat_vision: invalid describe; next");
             last_failure = Some(reason);
-            last_model = Some(resp.model.clone().unwrap_or_else(|| model_id.clone()));
             last_generation_id = generation_id.clone();
-            last_usage = resp.usage.clone();
             continue;
         }
         let vision_model = resp.model.unwrap_or_else(|| model_id.clone());
@@ -2754,13 +2723,10 @@ async fn run_vision(
                 vision: serde_json::to_value(&vision).unwrap_or(serde_json::Value::Null),
                 vision_model,
                 v_generation_id: generation_id,
-                usage: resp.usage,
             }),
             attempts,
             last_failure: None,
-            last_model: None,
             last_generation_id: None,
-            last_usage: None,
             failures,
         };
     }
@@ -2768,9 +2734,7 @@ async fn run_vision(
         outcome: None,
         attempts,
         last_failure,
-        last_model,
         last_generation_id,
-        last_usage,
         failures,
     }
 }
@@ -3165,9 +3129,6 @@ pub(crate) struct ComposeOutcome {
     /// attempted model id (same idiom as the vision audit).
     pub(crate) model: String,
     pub(crate) generation_id: Option<String>,
-    /// Full unfiltered OpenRouter usage block for the audit row.
-    /// `openrouter_usage_hidden_keys` filters the WIRE copy only — never this.
-    pub(crate) usage: Option<serde_json::Value>,
     /// `ResolvedImagePromptCompose::variant_key`, carried so the call site
     /// doesn't need the resolved config in scope.
     pub(crate) variant: Option<String>,
@@ -3187,9 +3148,7 @@ pub(crate) struct ComposeRun {
     /// (`model_error` / `timeout`), where no response — and nothing to
     /// attribute usage to — ever came back. `outcome: Some(_)` never needs
     /// these; they exist to fill the audit row on the `None` arm.
-    pub(crate) last_model: Option<String>,
     pub(crate) last_generation_id: Option<String>,
-    pub(crate) last_usage: Option<serde_json::Value>,
     /// Every failed hop of the chain walk, for the audit row's two columns,
     /// the `final` frame's composer share (spec §6.1), and the standalone
     /// endpoint's status passthrough. Content-level failures (`empty` /
@@ -3251,9 +3210,7 @@ pub(crate) async fn run_image_prompt_compose(
         .collect();
     let mut attempts: i16 = 0;
     let mut last_failure: Option<&'static str> = None;
-    let mut last_model: Option<String> = None;
     let mut last_generation_id: Option<String> = None;
-    let mut last_usage: Option<serde_json::Value> = None;
     let mut failures: Vec<eros_engine_llm::failure::AttemptFailure> = Vec::new();
     for model_id in &chain {
         attempts += 1;
@@ -3288,18 +3245,14 @@ pub(crate) async fn run_image_prompt_compose(
                 // Transport failure: nothing came back, so any identity
                 // captured by an EARLIER content-level failure this chain
                 // walk must not survive to describe THIS attempt's outcome.
-                last_model = None;
                 last_generation_id = None;
-                last_usage = None;
                 continue;
             }
             Err(_) => {
                 tracing::warn!(model = %model_id, "image-compose: timeout; next");
                 failures.push(filter_timeout_failure(task, model_id));
                 last_failure = Some(operation_failure_pointer(&failures));
-                last_model = None;
                 last_generation_id = None;
-                last_usage = None;
                 continue;
             }
         };
@@ -3321,18 +3274,14 @@ pub(crate) async fn run_image_prompt_compose(
             // Content-level failure: the provider answered (and was billed
             // above by `record_generation`) even though the reply was
             // blank. Record who answered in case the whole chain exhausts.
-            last_model = Some(resp.model.clone().unwrap_or_else(|| model_id.clone()));
             last_generation_id = generation_id.clone();
-            last_usage = resp.usage.clone();
             continue;
         }
         let (prompt, caption) = parse_compose_reply(&text);
         if prompt.is_empty() {
             tracing::warn!(model = %model_id, "image-compose: empty prompt after parse; next");
             last_failure = Some("empty_prompt");
-            last_model = Some(resp.model.clone().unwrap_or_else(|| model_id.clone()));
             last_generation_id = generation_id.clone();
-            last_usage = resp.usage.clone();
             continue;
         }
         return ComposeRun {
@@ -3341,14 +3290,11 @@ pub(crate) async fn run_image_prompt_compose(
                 caption,
                 model: resp.model.unwrap_or_else(|| model_id.clone()),
                 generation_id,
-                usage: resp.usage,
                 variant: c.variant_key.clone(),
             }),
             attempts,
             last_failure: None,
-            last_model: None,
             last_generation_id: None,
-            last_usage: None,
             failures,
         };
     }
@@ -3356,9 +3302,7 @@ pub(crate) async fn run_image_prompt_compose(
         outcome: None,
         attempts,
         last_failure,
-        last_model,
         last_generation_id,
-        last_usage,
         failures,
     }
 }
@@ -3527,13 +3471,11 @@ async fn build_delegated_image_prompt(
             outcome: None,
             attempts: 0,
             last_failure: None,
-            last_model: None,
             last_generation_id: None,
-            last_usage: None,
             failures: Vec::new(),
         },
     };
-    let (final_subject, caption, compose_variant, compose_model, compose_generation_id, usage) =
+    let (final_subject, caption, compose_variant, compose_model, compose_generation_id) =
         match run.outcome {
             Some(o) => (
                 o.prompt,
@@ -3541,7 +3483,6 @@ async fn build_delegated_image_prompt(
                 o.variant,
                 Some(o.model),
                 o.generation_id,
-                o.usage,
             ),
             None => {
                 // Loud on purpose: this is the ONE path where the capability
@@ -3565,7 +3506,7 @@ async fn build_delegated_image_prompt(
                         "no [tasks.chat_image_prompt_compose] configured"
                     }
                 );
-                (String::new(), None, None, None, None, None)
+                (String::new(), None, None, None, None)
             }
         };
     let composed_prompt =
@@ -3583,19 +3524,22 @@ async fn build_delegated_image_prompt(
         "not_configured"
     };
     // A content-level failure (`empty` / `empty_prompt`) still means the last
-    // attempted model answered and was billed — `run.last_*` carries that
-    // response's identity so the audit row isn't wrongly blank on an
-    // `exhausted` status. `compose_model` / `compose_generation_id` / `usage`
-    // stay untouched: they gate `status` above and feed the returned
-    // `DelegatedImagePrompt`, both of which must only reflect an ACCEPTED
-    // outcome. Transport failures (`model_error` / `timeout`) never populate
-    // `run.last_*`, so this stays NULL exactly when no response ever came
-    // back — same distinction `compose_stream` already draws.
-    let audit_model = compose_model.clone().or_else(|| run.last_model.clone());
+    // attempted model answered and was billed — `run.last_generation_id`
+    // carries that response's identity so the audit row isn't wrongly blank on
+    // an `exhausted` status. `compose_generation_id` stays untouched: it gates
+    // `status` above and feeds the returned `DelegatedImagePrompt`, both of
+    // which must only reflect an ACCEPTED outcome. Transport failures
+    // (`model_error` / `timeout`) never populate `run.last_*`, so this stays
+    // NULL exactly when no response ever came back — same distinction
+    // `compose_stream` already draws.
+    //
+    // The model and usage that used to ride alongside are gone (B1): both
+    // candidates already own a row in engine.llm_generations — the accepted one
+    // from its own record_generation call, the abandoned one from the drain
+    // (spec §4.5) — so this id reaches them through the join.
     let audit_generation_id = compose_generation_id
         .clone()
         .or_else(|| run.last_generation_id.clone());
-    let audit_usage = usage.clone().or_else(|| run.last_usage.clone());
     let source = match plan.action_type {
         ActionType::ReplyImage => "chat_reply_image",
         ActionType::ReplyTextImage => "chat_reply_text_image",
@@ -3630,8 +3574,6 @@ async fn build_delegated_image_prompt(
             caption: caption.as_deref(),
             composed_prompt: Some(composed_prompt.as_str()),
             variant: compose_variant.as_deref(),
-            model: audit_model.as_deref(),
-            usage: audit_usage,
             generation_id: audit_generation_id.as_deref(),
             attempts: run.attempts,
             last_failure: run.last_failure,
@@ -3753,8 +3695,6 @@ async fn build_stream_failure_pseudo_ghost(
         // sentinel like "__fallback_phrase__" would surface differently on
         // replay than on the original stream and break idempotency.
         // metadata.fallback_reason carries the audit signal instead.
-        model: None,
-        usage: None,
         generation_id: None,
         filter_audit: None,
         metadata,
@@ -3875,8 +3815,6 @@ async fn build_garble_repaired_replacement(
         // applies display_override only to Some(...) values, so a sentinel here
         // would surface differently on replay than on the live stream. The
         // metadata.fallback_reason ("garble_repaired") carries the audit signal.
-        model: None,
-        usage: None,
         generation_id: None,
         filter_audit: None,
         metadata,
@@ -4235,8 +4173,6 @@ pub fn run_stream(
                         proposed_action: proposed,
                         payload,
                         inputs,
-                        model: run.model.as_deref(),
-                        usage: run.usage.clone(),
                         generation_id: run.generation_id.as_deref(),
                     })
                     .await
@@ -4563,17 +4499,25 @@ pub fn run_stream(
                             // A final candidate can reach here having streamed
                             // metadata (usage/model/generation_id) with zero
                             // content — e.g. a terminal SSE chunk that reports
-                            // usage but no delta. That trio belongs to a call
+                            // usage but no delta. That id belongs to a call
                             // that produced nothing; leaving it set would plant
-                            // a real generation_id/model/usage on a row whose
-                            // content is actually this canned phrase, poisoning
+                            // a real generation_id on a row whose content is
+                            // actually this canned phrase, poisoning
                             // OpenRouter-log reconciliation (audit attribution
                             // noise). Reset before persistence — this is the
                             // ONLY branch reached with `acc` non-empty despite
                             // no candidate having produced it.
+                            //
+                            // `last_usage` still resets even though the row no
+                            // longer stores usage: it feeds the wire `Done`
+                            // frame, which must not report a phantom spend.
+                            // `served_model` does NOT need resetting and no
+                            // longer is: its last read is the
+                            // `record_generation` call above this block, and
+                            // the `Done` frame carries no model. Resetting it
+                            // here would be dead.
                             last_usage = None;
                             last_gen_id = None;
-                            served_model = None;
                             yield ProtocolFrame::Delta {
                                 message_id: message_id.clone(),
                                 content: text,
@@ -4620,8 +4564,6 @@ pub fn run_stream(
                         user_msg.user_message_id,
                         assistant_uuid,
                         &acc,
-                        served_model.as_deref(),
-                        usage_full.as_ref(),
                         last_gen_id.as_deref(),
                         truncated,
                         qa_attempts.as_ref(),
@@ -4725,8 +4667,6 @@ pub fn run_stream(
                         assistant_action_type: "reply".into(),
                         continues_from_message_id: None,
                         truncated: false,
-                        model: None,
-                        usage: None,
                         generation_id: None,
                         filter_audit: None,
                         metadata: Some(serde_json::json!({ "image": marker })),
@@ -4869,9 +4809,7 @@ pub fn run_stream(
                                     outcome: None,
                                     attempts: 0,
                                     last_failure: None,
-                                    last_model: None,
                                     last_generation_id: None,
-                                    last_usage: None,
                                     failures: Vec::new(),
                                 },
                                 "not_configured",
@@ -4916,16 +4854,6 @@ pub fn run_stream(
                                 // `run.last_*` carries that identity so an
                                 // `exhausted` row isn't wrongly blank. Transport
                                 // failures never populate `run.last_*`.
-                                model: run
-                                    .outcome
-                                    .as_ref()
-                                    .map(|o| o.vision_model.as_str())
-                                    .or(run.last_model.as_deref()),
-                                usage: run
-                                    .outcome
-                                    .as_ref()
-                                    .and_then(|o| o.usage.clone())
-                                    .or_else(|| run.last_usage.clone()),
                                 generation_id: run
                                     .outcome
                                     .as_ref()
@@ -8448,9 +8376,11 @@ data: [DONE]\n\n";
             String,
             Option<serde_json::Value>,
         ) = sqlx::query_as(
-            "SELECT id, status, subject, caption, composed_prompt, variant, model, \
-                    generation_id, attempts, inputs, source, usage \
-             FROM engine.chat_images_events",
+            "SELECT e.id, e.status, e.subject, e.caption, e.composed_prompt, e.variant, g.model, \
+                    e.generation_id, e.attempts, e.inputs, e.source, g.usage \
+             FROM engine.chat_images_events e \
+             LEFT JOIN engine.llm_generations g \
+               ON g.generation_id = e.generation_id",
         )
         .fetch_one(&pool)
         .await
@@ -8540,9 +8470,11 @@ data: [DONE]\n\n";
             Option<String>,
             Option<serde_json::Value>,
         ) = sqlx::query_as(
-            "SELECT status, subject, composed_prompt, attempts, last_failure, model, \
-                    generation_id, usage \
-             FROM engine.chat_images_events",
+            "SELECT e.status, e.subject, e.composed_prompt, e.attempts, e.last_failure, g.model, \
+                    e.generation_id, g.usage \
+             FROM engine.chat_images_events e \
+             LEFT JOIN engine.llm_generations g \
+               ON g.generation_id = e.generation_id",
         )
         .fetch_one(&pool)
         .await
@@ -8674,8 +8606,10 @@ data: [DONE]\n\n";
             Option<String>,
             Option<serde_json::Value>,
         ) = sqlx::query_as(
-            "SELECT status, image_url, attempts, vision, model, generation_id, usage \
-             FROM engine.chat_vision_events WHERE message_id = $1",
+            "SELECT e.status, e.image_url, e.attempts, e.vision, g.model, e.generation_id, g.usage \
+             FROM engine.chat_vision_events e \
+             LEFT JOIN engine.llm_generations g \
+               ON g.generation_id = e.generation_id WHERE e.message_id = $1",
         )
         .bind(user_message_id)
         .fetch_one(&pool)
@@ -11952,8 +11886,10 @@ data: [DONE]\n\n";
             Option<String>,
             Option<serde_json::Value>,
         ) = sqlx::query_as(
-            "SELECT status, image_url, attempts, vision, model, generation_id, usage \
-             FROM engine.chat_vision_events WHERE message_id = $1",
+            "SELECT e.status, e.image_url, e.attempts, e.vision, g.model, e.generation_id, g.usage \
+             FROM engine.chat_vision_events e \
+             LEFT JOIN engine.llm_generations g \
+               ON g.generation_id = e.generation_id WHERE e.message_id = $1",
         )
         .bind(umid)
         .fetch_one(&pool)
@@ -12118,8 +12054,10 @@ data: [DONE]\n\n";
             Option<String>,
             Option<serde_json::Value>,
         ) = sqlx::query_as(
-            "SELECT status, attempts, last_failure, vision, model, generation_id, usage \
-             FROM engine.chat_vision_events WHERE message_id = $1",
+            "SELECT e.status, e.attempts, e.last_failure, e.vision, g.model, e.generation_id, g.usage \
+             FROM engine.chat_vision_events e \
+             LEFT JOIN engine.llm_generations g \
+               ON g.generation_id = e.generation_id WHERE e.message_id = $1",
         )
         .bind(umid)
         .fetch_one(&pool)
@@ -13868,8 +13806,10 @@ data: [DONE]\n\n";
             Option<serde_json::Value>,
             Option<String>,
         ) = sqlx::query_as(
-            "SELECT content, channel, model, usage, generation_id FROM engine.chat_messages \
-             WHERE user_message_id = $1 AND role = 'assistant'",
+            "SELECT e.content, e.channel, g.model, g.usage, e.generation_id FROM engine.chat_messages e \
+             LEFT JOIN engine.llm_generations g \
+               ON g.generation_id = e.generation_id \
+             WHERE e.user_message_id = $1 AND e.role = 'assistant'",
         )
         .bind(user_message_id)
         .fetch_one(&pool)
@@ -16390,10 +16330,27 @@ data: [DONE]\n\n";
             format!("{}/api/v1/chat/completions", mock.uri()),
         );
         let p = test_resolved_pde(vec!["model-a".into(), "model-b".into()]);
-        let run = run_pde_decision(&client, &pool, Uuid::new_v4(), &p, "ctx").await;
+        // A REAL session: since B1, llm_generations.session_id carries a
+        // validated FK, so a fabricated uuid makes record_generation's write
+        // fail and the run come back with no join key at all.
+        let (_, _, session_id) = seed_persona_and_session(&pool, Uuid::new_v4()).await;
+        let run = run_pde_decision(&client, &pool, session_id, &p, "ctx").await;
         assert_eq!(run.status, PdeStatus::Ok);
         assert_eq!(run.verdict.unwrap().action, PdeAction::ReplyText);
-        assert_eq!(run.model.as_deref(), Some("model-b"));
+        // Since B1 the winning model lives in the parent row, not on the run:
+        // the fallback answered, so that is what engine.llm_generations holds
+        // for this generation.
+        let model: Option<String> =
+            sqlx::query_scalar("SELECT model FROM engine.llm_generations WHERE generation_id = $1")
+                .bind(
+                    run.generation_id
+                        .as_deref()
+                        .expect("winning call has an id"),
+                )
+                .fetch_one(&pool)
+                .await
+                .expect("the winning call owns a parent row");
+        assert_eq!(model.as_deref(), Some("model-b"));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -16509,13 +16466,30 @@ data: [DONE]\n\n";
             format!("{}/api/v1/chat/completions", mock.uri()),
         );
         let p = test_resolved_pde(vec!["model-a".into(), "model-b".into()]);
-        let run = run_pde_decision(&client, &pool, Uuid::new_v4(), &p, "ctx").await;
+        // A REAL session: since B1, llm_generations.session_id carries a
+        // validated FK, so a fabricated uuid makes record_generation's write
+        // fail and the run come back with no join key at all.
+        let (_, _, session_id) = seed_persona_and_session(&pool, Uuid::new_v4()).await;
+        let run = run_pde_decision(&client, &pool, session_id, &p, "ctx").await;
         assert_eq!(run.status, PdeStatus::ParseError);
         assert_eq!(run.raw.as_deref(), Some("nope"));
         assert!(run.verdict.is_none());
+        // Since B1 the last attempt's model is reached through the parent row.
+        // Keeping the id is what makes that possible, so that is what this
+        // pins: a chain-exhausted ParseError still names the call it came from.
+        let model: Option<String> =
+            sqlx::query_scalar("SELECT model FROM engine.llm_generations WHERE generation_id = $1")
+                .bind(
+                    run.generation_id
+                        .as_deref()
+                        .expect("chain-exhausted ParseError must preserve the last attempt's id"),
+                )
+                .fetch_one(&pool)
+                .await
+                .expect("the last attempt owns a parent row");
         assert!(
-            run.model.is_some(),
-            "chain-exhausted ParseError must preserve the last attempt's model"
+            model.is_some(),
+            "the parent row must name the model that answered"
         );
     }
 

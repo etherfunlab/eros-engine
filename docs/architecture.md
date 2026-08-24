@@ -147,8 +147,9 @@ writes several assistant rows per user turn via `continues_from_message_id`.
 The index exists because a voice turn has two possible writers: the streaming
 generator, and the barge-in interrupt endpoint reporting what the client
 actually played. They are ordered by a shared `FOR UPDATE` lock on the user
-row, and `content` belongs to the interrupt while the audit columns
-(`model` / `usage` / `generation_id`) belong to the generator. A user row
+row, and `content` belongs to the interrupt while the audit column
+(`generation_id` — the join key into `llm_generations`, which holds the model
+and the spend) belongs to the generator. A user row
 carrying `metadata.voice_interrupt` marks a turn the user deliberately cut
 off — which is also what tells a retry apart from a repairable disconnect.
 See [voice barge-in](superpowers/specs/2026-08-11-voice-barge-in-interrupt-design.md).

@@ -318,7 +318,7 @@ mod tests {
                 stage: "extraction",
                 status: "ok",
                 payload: Some(serde_json::json!({ "facts": [] })),
-                meta: crate::OpenRouterCallMeta::default(),
+                generation_id: None,
             })
             .await
             .unwrap();

@@ -22,16 +22,6 @@ pub mod world_town;
 
 pub use sqlx::PgPool;
 
-/// OpenRouter call metadata captured for the audit columns on event tables
-/// (`companion_insights_events`, `companion_affinity_events`). All optional —
-/// a non-LLM event (e.g. a gift affinity event) carries the default (all None).
-#[derive(Debug, Clone, Default)]
-pub struct OpenRouterCallMeta {
-    pub generation_id: Option<String>,
-    pub model: Option<String>,
-    pub usage: Option<serde_json::Value>,
-}
-
 /// How many characters of an unparseable LLM reply are kept in a `parse_error`
 /// audit row. Enough to tell a refusal from a truncated object; short enough
 /// that a runaway reply cannot bloat the table.
@@ -121,6 +111,45 @@ pub(crate) mod testutil {
         .fetch_one(pool)
         .await
         .unwrap()
+    }
+
+    /// The `model` every `seed_generation` parent carries.
+    pub(crate) const SEEDED_MODEL: &str = "seeded/model";
+
+    /// The `usage` block every `seed_generation` parent carries.
+    pub(crate) fn seeded_usage() -> serde_json::Value {
+        serde_json::json!({ "total_tokens": 7 })
+    }
+
+    /// Persist one `engine.llm_generations` parent so a test may put `id` in a
+    /// child row's `generation_id`. Since 0060 all eight of those columns carry
+    /// a VALIDATED foreign key, so a fabricated id no longer inserts — same
+    /// shape as `seed_chat_session` after 0058.
+    ///
+    /// The `task` is a literal `'test'` on purpose: the column is NOT NULL and
+    /// carries no CHECK (0059 — the vocabulary is deployer-extensible config),
+    /// and a test that needed a REAL task value would be testing the backfill,
+    /// which `migration_0060_backfill_assigns_the_right_task_and_session` owns.
+    ///
+    /// `model` and `usage` are non-NULL for a reason: since B1 the child rows
+    /// no longer carry them, so tests that used to assert on a child column now
+    /// assert through a join to here. Seeding NULLs would let those tests pass
+    /// just as happily with the join deleted — `SEEDED_MODEL` / `seeded_usage`
+    /// are what gives them something only a working join can return.
+    ///
+    /// `ON CONFLICT DO NOTHING` so a test may seed the same id twice — several
+    /// exercise a replay or a double-write race on one generation.
+    pub(crate) async fn seed_generation(pool: &PgPool, id: &str) {
+        sqlx::query(
+            "INSERT INTO engine.llm_generations (generation_id, task, model, usage) \
+             VALUES ($1, 'test', $2, $3) ON CONFLICT (generation_id) DO NOTHING",
+        )
+        .bind(id)
+        .bind(SEEDED_MODEL)
+        .bind(seeded_usage())
+        .execute(pool)
+        .await
+        .expect("seed llm_generations parent");
     }
 }
 
@@ -382,6 +411,404 @@ mod migration_tests {
                 "chat_vision_events.{column} must be nullable for ON DELETE SET NULL"
             );
         }
+    }
+
+    /// 0060 makes `engine.llm_generations` the parent of every child
+    /// `generation_id`. SET NULL ('n'), not the default NO ACTION ('a'): the
+    /// model and usage a row records stay reconcilable against the provider's
+    /// own log after the parent is gone.
+    ///
+    /// `chat_messages.f_generation_id` is absent on purpose (spec §7.2) — it is
+    /// written by `mark_filtered`'s separate UPDATE path, and production holds
+    /// exactly one non-null value in it.
+    ///
+    /// Note this cannot ride on `every_reference_column_in_engine_has_a_foreign_key`:
+    /// that scan is `uuid`-typed only, and `generation_id` is TEXT (the
+    /// provider's opaque handle, stored verbatim).
+    #[sqlx::test(migrations = "./migrations")]
+    async fn migration_0060_generation_id_columns_carry_fks_to_llm_generations(pool: PgPool) {
+        for table in [
+            "chat_messages",
+            "companion_affinity_events",
+            "companion_insights_events",
+            "companion_decision_events",
+            "chat_images_events",
+            "chat_vision_events",
+            "character_insights_events",
+            "user_insights_events",
+        ] {
+            let deltype: Option<i8> = sqlx::query_scalar(
+                "SELECT c.confdeltype::text::\"char\" FROM pg_constraint c \
+                 JOIN unnest(c.conkey) k(attnum) ON true \
+                 JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum \
+                 WHERE c.contype = 'f' \
+                   AND c.conrelid = ('engine.' || $1)::regclass \
+                   AND c.confrelid = 'engine.llm_generations'::regclass \
+                   AND a.attname = 'generation_id'",
+            )
+            .bind(table)
+            .fetch_optional(&pool)
+            .await
+            .expect("query generation_id foreign key")
+            .flatten();
+            assert_eq!(
+                deltype,
+                Some(b'n' as i8),
+                "engine.{table}.generation_id must carry an ON DELETE SET NULL FK \
+                 to llm_generations"
+            );
+        }
+
+        // Validated, reversing 0058's blanket NOT VALID rule. The retrospective
+        // guarantee is the whole point (spec §7.3); this catches a later hand
+        // adding one NOT VALID for convenience.
+        let unvalidated: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_constraint \
+             WHERE contype = 'f' AND confrelid = 'engine.llm_generations'::regclass \
+               AND NOT convalidated",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            unvalidated, 0,
+            "every FK to llm_generations must be validated"
+        );
+
+        let f: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_constraint c \
+             JOIN unnest(c.conkey) k(attnum) ON true \
+             JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum \
+             WHERE c.contype = 'f' AND c.conrelid = 'engine.chat_messages'::regclass \
+               AND a.attname = 'f_generation_id'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(f, 0, "f_generation_id must stay unconstrained (spec §7.2)");
+
+        // Every FK column needs its own index or the parent's ON DELETE
+        // seq-scans the child. 0060 adds all eight; none existed before.
+        for table in [
+            "chat_messages",
+            "companion_affinity_events",
+            "companion_insights_events",
+            "companion_decision_events",
+            "chat_images_events",
+            "chat_vision_events",
+            "character_insights_events",
+            "user_insights_events",
+        ] {
+            let indexed: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_index i \
+                   JOIN pg_attribute a ON a.attrelid = i.indrelid \
+                                      AND a.attnum = i.indkey[0] \
+                  WHERE i.indrelid = ('engine.' || $1)::regclass \
+                    AND a.attname = 'generation_id')",
+            )
+            .bind(table)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert!(
+                indexed,
+                "engine.{table}.generation_id must lead an index, or every \
+                 llm_generations delete seq-scans it"
+            );
+        }
+    }
+
+    /// 0060's backfill is fifteen task literals across four different
+    /// discriminator columns, and **every existing test is blind to it**:
+    /// `sqlx::test` runs migrations against an empty database, so the backfill
+    /// selects nothing and a wrong `CASE` branch passes CI untouched. It would
+    /// then surface as a failed `release_command` in production — or worse, as
+    /// silently mislabelled rows if the orphan preflight happens to pass.
+    ///
+    /// So this test replays it: drop the constraints, plant one orphan child
+    /// row per arm, run the migration's own backfill text, and assert what came
+    /// out. The SQL is extracted from the migration file rather than copied,
+    /// because a copy that drifts passes while the migration is wrong.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn migration_0060_backfill_assigns_the_right_task_and_session(pool: PgPool) {
+        use crate::testutil;
+        use uuid::Uuid;
+
+        let user = Uuid::new_v4();
+        let instance = testutil::seed_persona_instance(&pool, user).await;
+
+        let session: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) \
+             RETURNING id",
+        )
+        .bind(user)
+        .bind(instance)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // The eight FKs 0060 just added, plus the session pointer on
+        // companion_insights_events — dropped so this test can plant the
+        // orphans and the dangling session id that only exist in the
+        // pre-0060 world the backfill was written for.
+        //
+        // The seeded child rows below deliberately still write `model` and
+        // `usage`, which B1's code no longer does. That is not a leftover:
+        // those columns are exactly what the backfill READS, and they hold
+        // pre-B1 data until 0061 drops them. When B2 lands, this test's
+        // seeding goes with them and the backfill's model/usage arms become
+        // unreachable — which is fine, because by then it has already run.
+        for stmt in [
+            "ALTER TABLE engine.chat_messages DROP CONSTRAINT chat_messages_generation_id_fkey",
+            "ALTER TABLE engine.companion_affinity_events DROP CONSTRAINT companion_affinity_events_generation_id_fkey",
+            "ALTER TABLE engine.companion_insights_events DROP CONSTRAINT companion_insights_events_generation_id_fkey",
+            "ALTER TABLE engine.companion_decision_events DROP CONSTRAINT companion_decision_events_generation_id_fkey",
+            "ALTER TABLE engine.chat_images_events DROP CONSTRAINT chat_images_events_generation_id_fkey",
+            "ALTER TABLE engine.chat_vision_events DROP CONSTRAINT chat_vision_events_generation_id_fkey",
+            "ALTER TABLE engine.character_insights_events DROP CONSTRAINT character_insights_events_generation_id_fkey",
+            "ALTER TABLE engine.user_insights_events DROP CONSTRAINT user_insights_events_generation_id_fkey",
+            "ALTER TABLE engine.companion_insights_events DROP CONSTRAINT companion_insights_events_session_id_fkey",
+        ] {
+            sqlx::query(stmt).execute(&pool).await.expect(stmt);
+        }
+
+        // ── chat_messages: three channels plus the output filter's own id.
+        for (gen, channel) in [
+            ("bf-companion", None),
+            ("bf-voice", Some("voice")),
+            ("bf-productqa", Some("product_qa")),
+        ] {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages \
+                   (session_id, role, content, channel, model, usage, generation_id) \
+                 VALUES ($1, 'assistant', 'x', $2, 'm/1', '{\"total_tokens\":1}'::jsonb, $3)",
+            )
+            .bind(session)
+            .bind(channel)
+            .bind(gen)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        // The filter rides on an existing message. filter_model is its model.
+        let user_msg: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages \
+               (session_id, role, content, filter_model, f_generation_id) \
+             VALUES ($1, 'user', 'hi', 'filter/m', 'bf-filter') RETURNING id",
+        )
+        .bind(session)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // ── companion_affinity_events: no session_id column at all. Its only
+        // route to one is user_message_id -> chat_messages.session_id, which is
+        // exactly what this row pins.
+        let affinity_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.companion_affinity (session_id, user_id, instance_id) \
+             VALUES ($1, $2, $3) RETURNING id",
+        )
+        .bind(session)
+        .bind(user)
+        .bind(instance)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.companion_affinity_events \
+               (affinity_id, event_type, model, usage, generation_id, user_message_id) \
+             VALUES ($1, 'message', 'aff/m', '{}'::jsonb, 'bf-affinity', $2)",
+        )
+        .bind(affinity_id)
+        .bind(user_msg)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // ── companion_insights_events: both stages. The 'structured' row
+        // deliberately carries a DANGLING session id -- 0058 left 26 of those
+        // in production and refused to backfill them. If the LEFT JOIN in the
+        // migration is ever dropped, this row copies a dead uuid into
+        // llm_generations.session_id, whose own FK is validated, and the
+        // migration aborts inside release_command.
+        for (gen, stage, sess) in [
+            ("bf-facts", "facts", Some(session)),
+            ("bf-structured", "structured", Some(Uuid::new_v4())),
+        ] {
+            sqlx::query(
+                "INSERT INTO engine.companion_insights_events \
+                   (run_id, user_id, session_id, stage, status, model, usage, generation_id) \
+                 VALUES ($1, $2, $3, $4, 'ok', 'ins/m', '{}'::jsonb, $5)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(user)
+            .bind(sess)
+            .bind(stage)
+            .bind(gen)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        sqlx::query(
+            "INSERT INTO engine.companion_decision_events \
+               (run_id, user_id, session_id, status, model, usage, generation_id) \
+             VALUES ($1, $2, $3, 'ok', 'pde/m', '{}'::jsonb, 'bf-decision')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(user)
+        .bind(session)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // ── chat_images_events: both sources. 'image_edit' has zero rows in
+        // production today, which is exactly why its CASE branch needs a test.
+        for (gen, source) in [
+            ("bf-image", "chat_reply_text_image"),
+            ("bf-imageedit", "image_edit"),
+        ] {
+            sqlx::query(
+                "INSERT INTO engine.chat_images_events \
+                   (source, user_id, session_id, status, inputs, attempts, \
+                    model, usage, generation_id) \
+                 VALUES ($1, $2, $3, 'ok', '{}'::jsonb, 1, 'img/m', '{}'::jsonb, $4)",
+            )
+            .bind(source)
+            .bind(user)
+            .bind(session)
+            .bind(gen)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        sqlx::query(
+            "INSERT INTO engine.chat_vision_events \
+               (user_id, session_id, status, image_url, attempts, model, usage, generation_id) \
+             VALUES ($1, $2, 'ok', 'https://x/i.png', 1, 'vis/m', '{}'::jsonb, 'bf-vision')",
+        )
+        .bind(user)
+        .bind(session)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for (table, gen, stage) in [
+            ("character_insights_events", "bf-ch-extract", "extraction"),
+            ("character_insights_events", "bf-ch-struct", "structuring"),
+            ("user_insights_events", "bf-us-extract", "extraction"),
+            ("user_insights_events", "bf-us-struct", "structuring"),
+        ] {
+            sqlx::query(&format!(
+                "INSERT INTO engine.{table} \
+                   (run_id, instance_id, session_id, stage, status, model, usage, generation_id) \
+                 VALUES ($1, $2, $3, $4, 'ok', 'ins/m', '{{}}'::jsonb, $5)"
+            ))
+            .bind(Uuid::new_v4())
+            .bind(instance)
+            .bind(session)
+            .bind(stage)
+            .bind(gen)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // ── Run the migration's own backfill, not a copy of it.
+        let migration = include_str!("../migrations/0060_llm_generations_backfill_fks.sql");
+        let backfill = migration
+            .split("-- ─── 2. Orphan preflight")
+            .next()
+            .expect("migration 0060 must keep its numbered section markers");
+        assert_eq!(
+            backfill
+                .matches("INSERT INTO engine.llm_generations")
+                .count(),
+            9,
+            "expected 9 backfill arms before the preflight marker; the section \
+             markers or the arm count changed and this test is no longer \
+             covering what it claims to"
+        );
+        sqlx::raw_sql(backfill).execute(&pool).await.unwrap();
+
+        for (gen, want_task) in [
+            ("bf-companion", "chat_companion"),
+            ("bf-voice", "chat_voice"),
+            ("bf-productqa", "chat_product_qa"),
+            ("bf-filter", "chat_output_filter"),
+            ("bf-affinity", "affinity_evaluation"),
+            ("bf-facts", "insight_extraction"),
+            ("bf-structured", "insight_structuring"),
+            ("bf-decision", "pde_decision"),
+            ("bf-image", "chat_image_prompt_compose"),
+            ("bf-imageedit", "chat_image_edit_compose"),
+            ("bf-vision", "chat_vision"),
+            ("bf-ch-extract", "character_insight_extraction"),
+            ("bf-ch-struct", "character_insight_structuring"),
+            ("bf-us-extract", "user_insight_extraction"),
+            ("bf-us-struct", "user_insight_structuring"),
+        ] {
+            let task: Option<String> = sqlx::query_scalar(
+                "SELECT task FROM engine.llm_generations WHERE generation_id = $1",
+            )
+            .bind(gen)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                task.as_deref(),
+                Some(want_task),
+                "backfill produced the wrong task for {gen}"
+            );
+        }
+
+        // The affinity row reached its session the only way it can.
+        let aff_session: Option<Uuid> = sqlx::query_scalar(
+            "SELECT session_id FROM engine.llm_generations WHERE generation_id = 'bf-affinity'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            aff_session,
+            Some(session),
+            "companion_affinity_events must reach its session through \
+             user_message_id -> chat_messages.session_id"
+        );
+
+        // The dangling one landed NULL instead of aborting the migration.
+        let dangling: Option<Uuid> = sqlx::query_scalar(
+            "SELECT session_id FROM engine.llm_generations WHERE generation_id = 'bf-structured'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            dangling, None,
+            "a dangling session id must land NULL; copying it across would \
+             violate llm_generations' own validated FK and abort the deploy"
+        );
+
+        // Model and usage carried over -- this is what B2 will read through the
+        // join once the child columns are gone.
+        let (model, usage): (Option<String>, Option<serde_json::Value>) = sqlx::query_as(
+            "SELECT model, usage FROM engine.llm_generations WHERE generation_id = 'bf-companion'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(model.as_deref(), Some("m/1"));
+        assert_eq!(usage, Some(serde_json::json!({"total_tokens": 1})));
+
+        // filter_model became the filter generation's model.
+        let filter_model: Option<String> = sqlx::query_scalar(
+            "SELECT model FROM engine.llm_generations WHERE generation_id = 'bf-filter'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(filter_model.as_deref(), Some("filter/m"));
     }
 
     #[sqlx::test(migrations = "./migrations")]

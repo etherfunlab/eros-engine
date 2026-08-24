@@ -166,7 +166,7 @@ pub async fn run(
             eval_text.trim().is_empty(),
         );
 
-        let (grades, levels, reason, affinity_meta, skip_reason, eval_failures) =
+        let (grades, levels, reason, affinity_gen_id, skip_reason, eval_failures) =
             if pre_skip.is_none() {
                 let persona_repo = PersonaRepo { pool: &state.pool };
                 let affinity_repo = AffinityRepo { pool: &state.pool };
@@ -226,7 +226,7 @@ pub async fn run(
             grades,
             rule_deltas,
             context,
-            affinity_meta,
+            affinity_gen_id,
             levels,
             &eval_failures,
             user_message_id,
@@ -297,7 +297,7 @@ async fn persist_affinity(
     grades: eros_engine_core::affinity::AxisGrades,
     rule_deltas: eros_engine_core::affinity::AffinityDeltas,
     context: serde_json::Value,
-    meta: Option<eros_engine_store::OpenRouterCallMeta>,
+    generation_id: Option<String>,
     levels: eros_engine_core::affinity::EndpointLevelReads,
     eval_failures: &[eros_engine_llm::failure::AttemptFailure],
     user_message_id: Option<Uuid>,
@@ -374,7 +374,7 @@ async fn persist_affinity(
                     &state.config.affinity_tuning,
                     event_type,
                     context,
-                    meta.as_ref(),
+                    generation_id.as_deref(),
                     levels,
                     llm_attempts,
                     gateway_errors,
@@ -703,7 +703,7 @@ fn eval_skip_reason(
     }
 }
 
-/// Marker for a *successful* eval whose `meta.generation_id` came back `None`
+/// Marker for a *successful* eval whose `generation_id` came back `None`
 /// — the join key to both the OpenRouter log and this call's
 /// `engine.llm_generations` row. Two distinct causes land here and this
 /// marker does not distinguish them: the salvaged-garble fallback in
@@ -713,10 +713,8 @@ fn eval_skip_reason(
 /// id but the parent-table write failed (llm-generations-audit spec §6).
 /// Either way "the call returned `Ok`" does not by itself guarantee an audit
 /// trail. `None` ⇒ a usable id is present.
-fn meta_skip_reason(meta: &eros_engine_store::OpenRouterCallMeta) -> Option<&'static str> {
-    meta.generation_id
-        .is_none()
-        .then_some("eval_no_generation_id")
+fn missing_generation_skip_reason(generation_id: Option<&str>) -> Option<&'static str> {
+    generation_id.is_none().then_some("eval_no_generation_id")
 }
 
 /// Build the affinity event `context` JSON: the model's `affinity_reason` when a
@@ -776,7 +774,7 @@ type AffinityEvalOutcome = (
     eros_engine_core::affinity::AxisGrades,
     eros_engine_core::affinity::EndpointLevelReads,
     String,
-    Option<eros_engine_store::OpenRouterCallMeta>,
+    Option<String>,
     Option<&'static str>,
     Vec<eros_engine_llm::failure::AttemptFailure>,
 );
@@ -824,7 +822,7 @@ async fn evaluate_affinity(
         ..Default::default()
     };
 
-    let (raw, meta, recovered) =
+    let (raw, generation_id, recovered) =
         match tokio::time::timeout(AFFINITY_EVAL_TIMEOUT, state.openrouter.execute(req)).await {
             Ok(Ok(resp)) => {
                 let generation_id = super::record_generation(
@@ -838,17 +836,12 @@ async fn evaluate_affinity(
                     },
                 )
                 .await;
-                let meta = eros_engine_store::OpenRouterCallMeta {
-                    generation_id,
-                    model: resp.model.clone(),
-                    usage: resp.usage.clone(),
-                };
                 // Spec §5.4: `failures` is populated on success too. This is
                 // the ONLY call site that hands `execute` a real
                 // `[primary] + fallback` chain, so it is the only place a hop
                 // a fallback recovered from can be recorded at all — drop it
                 // here and a 529-then-success turn persists nothing.
-                (resp.reply, Some(meta), resp.failures)
+                (resp.reply, generation_id, resp.failures)
             }
             Ok(Err(e)) => {
                 tracing::warn!("affinity eval LLM call failed: {e}");
@@ -907,8 +900,8 @@ async fn evaluate_affinity(
     tracing::debug!(affinity_reason = %reason, "affinity eval parsed");
     // Eval ran, but a salvaged response can still lack a generation_id — mark it
     // so a NULL audit join key is never left unexplained.
-    let skip = meta.as_ref().and_then(meta_skip_reason);
-    (grades, levels, reason, meta, skip, recovered)
+    let skip = missing_generation_skip_reason(generation_id.as_deref());
+    (grades, levels, reason, generation_id, skip, recovered)
 }
 
 const INSIGHT_TASK: &str = "insight_extraction";
@@ -930,21 +923,11 @@ const INSIGHT_STRUCTURING_TASK: &str = "insight_structuring";
 struct CallAudit {
     status: &'static str,
     payload: Option<serde_json::Value>,
-    meta: eros_engine_store::OpenRouterCallMeta,
-}
-
-/// `generation_id` must be `record_generation`'s return value, never
-/// `resp.generation_id` — a caller passing the raw field would compile and
-/// silently reopen the unlaundered path this table exists to close.
-fn call_meta(
-    resp: &eros_engine_llm::openrouter::ChatResponse,
+    /// `record_generation`'s return value, never `resp.generation_id` — a
+    /// caller passing the raw field would compile and silently reopen the
+    /// unlaundered path `engine.llm_generations` exists to close. The model
+    /// and usage for this call live in that table, not in the event row.
     generation_id: Option<String>,
-) -> eros_engine_store::OpenRouterCallMeta {
-    eros_engine_store::OpenRouterCallMeta {
-        generation_id,
-        model: resp.model.clone(),
-        usage: resp.usage.clone(),
-    }
 }
 
 /// Top-level entry: extract facts → structured insights → incremental human_insights apply.
@@ -1048,7 +1031,7 @@ async fn write_insight_event(
         stage,
         status: audit.status,
         payload: audit.payload,
-        meta: audit.meta,
+        generation_id: audit.generation_id,
     };
     if let Err(e) = repo.record(ev).await {
         tracing::warn!("insight event ({stage}) persist failed: {e}");
@@ -1096,7 +1079,7 @@ async fn extract_facts(
         ..Default::default()
     };
 
-    let (raw, meta) = match llm.execute(req).await {
+    let (raw, generation_id) = match llm.execute(req).await {
         Ok(resp) => {
             let generation_id = super::record_generation(
                 pool,
@@ -1109,10 +1092,7 @@ async fn extract_facts(
                 },
             )
             .await;
-            (
-                resp.reply.trim().to_string(),
-                call_meta(&resp, generation_id),
-            )
+            (resp.reply.trim().to_string(), generation_id)
         }
         Err(e) => {
             tracing::warn!("fact extraction LLM call failed: {e}");
@@ -1134,7 +1114,7 @@ async fn extract_facts(
             let audit = CallAudit {
                 status,
                 payload: Some(serde_json::json!({ "facts": facts, "details": details })),
-                meta,
+                generation_id,
             };
             (facts, Some(audit))
         }
@@ -1143,7 +1123,7 @@ async fn extract_facts(
             Some(CallAudit {
                 status: "parse_error",
                 payload: None,
-                meta,
+                generation_id,
             }),
         ),
     }
@@ -1201,7 +1181,7 @@ async fn extract_structured_insights(
         ..Default::default()
     };
 
-    let (raw, meta) = match llm.execute(req).await {
+    let (raw, generation_id) = match llm.execute(req).await {
         Ok(r) => {
             let generation_id = super::record_generation(
                 pool,
@@ -1214,7 +1194,7 @@ async fn extract_structured_insights(
                 },
             )
             .await;
-            (r.reply.trim().to_string(), call_meta(&r, generation_id))
+            (r.reply.trim().to_string(), generation_id)
         }
         Err(_) => return (empty(), None),
     };
@@ -1249,7 +1229,7 @@ async fn extract_structured_insights(
                 Some(CallAudit {
                     status,
                     payload: Some(audited),
-                    meta,
+                    generation_id,
                 }),
             )
         }
@@ -1261,7 +1241,7 @@ async fn extract_structured_insights(
             Some(CallAudit {
                 status: "parse_error",
                 payload: Some(parse_error_payload(&raw)),
-                meta,
+                generation_id,
             }),
         ),
     }
@@ -1379,7 +1359,7 @@ async fn write_character_event(
         stage,
         status: audit.status,
         payload: audit.payload,
-        meta: audit.meta,
+        generation_id: audit.generation_id,
     };
     if let Err(e) = repo.record(ev).await {
         tracing::warn!("character insight event ({stage}) persist failed: {e}");
@@ -1424,7 +1404,7 @@ async fn extract_character_facts(
         ..Default::default()
     };
 
-    let (raw, meta) = match state.openrouter.execute(req).await {
+    let (raw, generation_id) = match state.openrouter.execute(req).await {
         Ok(resp) => {
             let generation_id = super::record_generation(
                 &state.pool,
@@ -1437,10 +1417,7 @@ async fn extract_character_facts(
                 },
             )
             .await;
-            (
-                resp.reply.trim().to_string(),
-                call_meta(&resp, generation_id),
-            )
+            (resp.reply.trim().to_string(), generation_id)
         }
         Err(e) => {
             tracing::warn!("character fact extraction LLM call failed: {e}");
@@ -1462,7 +1439,7 @@ async fn extract_character_facts(
                 Some(CallAudit {
                     status,
                     payload: Some(payload),
-                    meta,
+                    generation_id,
                 }),
             )
         }
@@ -1476,7 +1453,7 @@ async fn extract_character_facts(
             Some(CallAudit {
                 status: "parse_error",
                 payload: Some(parse_error_payload(&raw)),
-                meta,
+                generation_id,
             }),
         ),
     }
@@ -1517,7 +1494,7 @@ async fn structure_character_insights(
         ..Default::default()
     };
 
-    let (raw, meta) = match state.openrouter.execute(req).await {
+    let (raw, generation_id) = match state.openrouter.execute(req).await {
         Ok(r) => {
             let generation_id = super::record_generation(
                 &state.pool,
@@ -1530,7 +1507,7 @@ async fn structure_character_insights(
                 },
             )
             .await;
-            (r.reply.trim().to_string(), call_meta(&r, generation_id))
+            (r.reply.trim().to_string(), generation_id)
         }
         Err(e) => {
             tracing::warn!("character structuring LLM call failed: {e}");
@@ -1569,7 +1546,7 @@ async fn structure_character_insights(
                 Some(CallAudit {
                     status,
                     payload: Some(audited),
-                    meta,
+                    generation_id,
                 }),
             )
         }
@@ -1578,7 +1555,7 @@ async fn structure_character_insights(
             Some(CallAudit {
                 status: "parse_error",
                 payload: Some(parse_error_payload(&raw)),
-                meta,
+                generation_id,
             }),
         ),
     }
@@ -1692,7 +1669,7 @@ async fn write_user_event(
         stage,
         status: audit.status,
         payload: audit.payload,
-        meta: audit.meta,
+        generation_id: audit.generation_id,
     };
     if let Err(e) = repo.record(ev).await {
         tracing::warn!("user insight event ({stage}) persist failed: {e}");
@@ -1745,7 +1722,7 @@ async fn extract_user_facts(
         ..Default::default()
     };
 
-    let (raw, meta) = match state.openrouter.execute(req).await {
+    let (raw, generation_id) = match state.openrouter.execute(req).await {
         Ok(resp) => {
             let generation_id = super::record_generation(
                 &state.pool,
@@ -1758,10 +1735,7 @@ async fn extract_user_facts(
                 },
             )
             .await;
-            (
-                resp.reply.trim().to_string(),
-                call_meta(&resp, generation_id),
-            )
+            (resp.reply.trim().to_string(), generation_id)
         }
         Err(e) => {
             tracing::warn!("user fact extraction LLM call failed: {e}");
@@ -1782,7 +1756,7 @@ async fn extract_user_facts(
                 Some(CallAudit {
                     status,
                     payload: Some(payload),
-                    meta,
+                    generation_id,
                 }),
             )
         }
@@ -1791,7 +1765,7 @@ async fn extract_user_facts(
             Some(CallAudit {
                 status: "parse_error",
                 payload: Some(parse_error_payload(&raw)),
-                meta,
+                generation_id,
             }),
         ),
     }
@@ -1832,7 +1806,7 @@ async fn structure_user_insights(
         ..Default::default()
     };
 
-    let (raw, meta) = match state.openrouter.execute(req).await {
+    let (raw, generation_id) = match state.openrouter.execute(req).await {
         Ok(r) => {
             let generation_id = super::record_generation(
                 &state.pool,
@@ -1845,7 +1819,7 @@ async fn structure_user_insights(
                 },
             )
             .await;
-            (r.reply.trim().to_string(), call_meta(&r, generation_id))
+            (r.reply.trim().to_string(), generation_id)
         }
         Err(e) => {
             tracing::warn!("user structuring LLM call failed: {e}");
@@ -1875,7 +1849,7 @@ async fn structure_user_insights(
                 Some(CallAudit {
                     status,
                     payload: Some(audited),
-                    meta,
+                    generation_id,
                 }),
             )
         }
@@ -1884,7 +1858,7 @@ async fn structure_user_insights(
             Some(CallAudit {
                 status: "parse_error",
                 payload: Some(parse_error_payload(&raw)),
-                meta,
+                generation_id,
             }),
         ),
     }
@@ -2329,22 +2303,17 @@ mod tests {
     }
 
     #[test]
-    fn meta_skip_reason_flags_missing_generation_id() {
-        // Salvaged-garble fallback: Ok response, but no generation_id ⇒ marked,
-        // even though model is present.
-        let salvaged = eros_engine_store::OpenRouterCallMeta {
-            generation_id: None,
-            model: Some("m".into()),
-            usage: None,
-        };
-        assert_eq!(meta_skip_reason(&salvaged), Some("eval_no_generation_id"));
-        // Clean response with a join key ⇒ no marker.
-        let clean = eros_engine_store::OpenRouterCallMeta {
-            generation_id: Some("gen-1".into()),
-            model: Some("m".into()),
-            usage: Some(serde_json::json!({"total_tokens": 9})),
-        };
-        assert_eq!(meta_skip_reason(&clean), None);
+    fn missing_generation_skip_reason_flags_a_missing_join_key() {
+        // Two causes land on None and this marker does not distinguish them:
+        // the salvaged-garble fallback returns Ok with no generation_id, and
+        // record_generation returns None when the provider DID give an id but
+        // the parent-table write failed. Either way the audit row's join key
+        // is NULL and must be explained.
+        assert_eq!(
+            missing_generation_skip_reason(None),
+            Some("eval_no_generation_id")
+        );
+        assert_eq!(missing_generation_skip_reason(Some("gen-1")), None);
     }
 
     #[test]
@@ -3834,8 +3803,10 @@ mod tests {
 
         #[allow(clippy::type_complexity)]
         let rows: Vec<(uuid::Uuid, String, String, Option<String>)> = sqlx::query_as(
-            "SELECT run_id, stage, status, model FROM engine.character_insights_events \
-             WHERE instance_id = $1 ORDER BY stage",
+            "SELECT e.run_id, e.stage, e.status, g.model FROM engine.character_insights_events e \
+             LEFT JOIN engine.llm_generations g \
+               ON g.generation_id = e.generation_id \
+             WHERE e.instance_id = $1 ORDER BY e.stage",
         )
         .bind(instance_id)
         .fetch_all(&pool)

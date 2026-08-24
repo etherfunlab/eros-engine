@@ -223,7 +223,11 @@ pub struct CharacterInsightEventInsert<'a> {
     pub stage: &'a str,
     pub status: &'a str,
     pub payload: Option<serde_json::Value>,
-    pub meta: crate::OpenRouterCallMeta,
+    /// `record_generation`'s return value — never `resp.generation_id`. The
+    /// model and usage for this call live in `engine.llm_generations`, reached
+    /// by joining on this column (spec §7.4). `None` when no call was made, or
+    /// when the parent write failed and the trail degraded to NULL.
+    pub generation_id: Option<String>,
 }
 
 pub struct CharacterInsightEventRepo<'a> {
@@ -237,8 +241,8 @@ impl CharacterInsightEventRepo<'_> {
         sqlx::query(
             "INSERT INTO engine.character_insights_events \
                (run_id, instance_id, session_id, message_id, stage, status, payload, \
-                model, usage, generation_id) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+                generation_id) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
         )
         .bind(ev.run_id)
         .bind(ev.instance_id)
@@ -247,9 +251,7 @@ impl CharacterInsightEventRepo<'_> {
         .bind(ev.stage)
         .bind(ev.status)
         .bind(ev.payload)
-        .bind(ev.meta.model)
-        .bind(ev.meta.usage)
-        .bind(ev.meta.generation_id)
+        .bind(ev.generation_id)
         .execute(self.pool)
         .await?;
         Ok(())
@@ -298,6 +300,8 @@ mod tests {
         // FK-referenced since 0058, so they have to name real rows.
         let session_id = crate::testutil::seed_chat_session(&pool, Uuid::new_v4()).await;
         let message_id = crate::testutil::seed_chat_message(&pool, session_id).await;
+        // ...and generation_id since 0060.
+        crate::testutil::seed_generation(&pool, "g").await;
         sqlx::query(
             "INSERT INTO engine.character_insights_events \
                (run_id, instance_id, session_id, message_id, stage, status, payload, \
@@ -713,6 +717,8 @@ mod tests {
         // session_id / message_id are FK-referenced since 0058.
         let session_id = crate::testutil::seed_chat_session(&pool, Uuid::new_v4()).await;
         let message_id = crate::testutil::seed_chat_message(&pool, session_id).await;
+        // ...and generation_id since 0060.
+        crate::testutil::seed_generation(&pool, "gen-x").await;
 
         repo.record(CharacterInsightEventInsert {
             run_id,
@@ -725,11 +731,7 @@ mod tests {
                 "facts": ["角色说她今天在公司加班到十点"],
                 "details": []
             })),
-            meta: crate::OpenRouterCallMeta {
-                generation_id: Some("gen-x".into()),
-                model: Some("ch/m".into()),
-                usage: Some(serde_json::json!({ "total_tokens": 11 })),
-            },
+            generation_id: Some("gen-x".into()),
         })
         .await
         .unwrap();
@@ -742,7 +744,7 @@ mod tests {
             stage: "structuring",
             status: "parse_error",
             payload: Some(parse_error_payload("I can't help with that.")),
-            meta: crate::OpenRouterCallMeta::default(),
+            generation_id: None,
         })
         .await
         .unwrap();
@@ -755,9 +757,10 @@ mod tests {
             Option<serde_json::Value>,
             Option<serde_json::Value>,
         )> = sqlx::query_as(
-            "SELECT stage, status, generation_id, payload, usage \
-             FROM engine.character_insights_events \
-             WHERE run_id = $1 ORDER BY stage",
+            "SELECT e.stage, e.status, e.generation_id, e.payload, g.usage \
+             FROM engine.character_insights_events e \
+             LEFT JOIN engine.llm_generations g ON g.generation_id = e.generation_id \
+             WHERE e.run_id = $1 ORDER BY e.stage",
         )
         .bind(run_id)
         .fetch_all(&pool)
@@ -769,7 +772,9 @@ mod tests {
         assert_eq!(rows[0].0, "extraction");
         assert_eq!(rows[0].1, "ok");
         assert_eq!(rows[0].2.as_deref(), Some("gen-x"));
-        assert_eq!(rows[0].4, Some(serde_json::json!({ "total_tokens": 11 })));
+        // Through the join: this is the PARENT's usage. Break the join and it
+        // comes back NULL.
+        assert_eq!(rows[0].4, Some(crate::testutil::seeded_usage()));
         assert_eq!(rows[1].0, "structuring");
         assert_eq!(rows[1].1, "parse_error");
         // The refusal text survives instead of the human chain's NULL.

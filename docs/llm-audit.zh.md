@@ -203,33 +203,42 @@ provider 响应——所以一次降级的父行写入，连同这一轮客户�
 被清空，不只是数据库里的那一行。这样帧和数据库对得上（都是 `NULL`），这正是
 目的所在，但代价是：一次内部审计写入失败，客户端在 wire 上是看得见的。
 
-**写入降级之后，剩下什么取决于任务。** 五个后台 sweeper（`world_director`、
-`world_stories_director`、`world_comment`、`world_reply`、
-`memory_extraction`）没有自己的子表行——对它们而言，一次降级写入就是彻底丢掉
-这条记录，剩下的只有上面那行 tracing 和 provider 自己的日志。其余任务的子表
-行，`model` 和 `usage` 是直接从 provider 响应里取的，跟 `record_generation`
-返回什么无关（比如 `stream.rs` 的 `AssistantInsert.model` / `.usage`）——
-它们在一次降级写入之后照样保得住。丢掉的只是 join key `generation_id`。
-**等以后某个 release 把这些子表上已经冗余的 `model` / `usage` 列也删掉之后**，
-对它们而言才会变成彻底丢失——见设计 spec §6。
+**现在只要降级，整条记录就没了，所有任务一视同仁。** 以前丢的只是 join key：
+每个子表行的 `model` 和 `usage` 都直接取自 provider 响应，所以照样保得住。
+**从这个 release 起子表不再写这两列**——一次 generation 的模型和花费只有
+`engine.llm_generations` 一份，靠 `generation_id` join 过去取。父行写入降级时，
+子行存 `NULL`，也就没有东西可 join，剩下的只有上面那行 tracing 和 provider
+自己的日志。五个后台 sweeper（`world_director`、`world_stories_director`、
+`world_comment`、`world_reply`、`memory_extraction`）本来就没有子表行，一直
+是这样；现在所有任务都一样。
 
-### 还没有外键
+**响应里没有 `generation_id` 时同理。** `record_generation` 打完日志就短路，
+因为这个 id 就是主键——所以一个不回 id 的 provider，会产生一次计过费、却在
+任何表里都没有行的调用，它的模型只活在 tracing 输出里。实际中很少见
+（OpenRouter 一定会回 id），但 salvaged-garble 兜底和某些直连 provider 会。
+
+这两列本身要等下一个 release 才删；两个 release 之间它们还在，只是从现在起
+写进来的行一律是 `NULL`。这是设计上的中间状态，不是缺陷——见设计 spec §7。
+
+### 外键
 
 **子表的 `generation_id` 列——`chat_messages`、`companion_affinity_events`、
 `companion_insights_events`、`companion_decision_events`、
 `chat_images_events`、`chat_vision_events`、`character_insights_events`、
-`user_insights_events`——目前都不引用这张表。** 现在还不能加：`fly.toml` 在
-流量切到新机器之前就跑 `migrate`，如果外键跟这条写入路径同一个 release 上线，
-仍在服务真实流量的旧机器写子行时就会撞上约束。之后的 release 会连同一次历史
-数据回填一起把外键补上。在那之前，两边在实践中对得上，但没有约束保证——不要
-从这份文档读出「这个关联今天已经强制生效」的结论。
+`user_insights_events`——每一列都引用这张表**，一律 `ON DELETE SET NULL`，
+每一列都有索引。迁移 `0060` 加的，同一个文件里还做了历史数据回填。
 
-**`chat_messages.f_generation_id` 是例外：不管是那个后续 release 还是以后
-任何一次，它都不会加外键。** 这是第九个带 `generation_id` 的列——过滤生成
+外键没法跟写入路径同一个 release 上线：`fly.toml` 在流量切到新机器之前就跑
+`migrate`，约束一加，仍在服务真实流量的旧机器写子行时就会撞上它。所以拆成了
+两个 release。
+
+这些约束是 **validated** 的，不是 `NOT VALID`——回溯保证成立，指向一次从未被
+记录过的 generation 的行不可能存在。
+
+**`chat_messages.f_generation_id` 是例外：它没有外键，以后也不会加。** 这是第九个带 `generation_id` 的列——过滤生成
 id，跟上面的 `chat_messages.generation_id` 是两回事——由另一条 `mark_filtered`
 `UPDATE` 路径写入，加约束就得给这条路径单独配一条降级分支，而生产环境里这一列
-非空值只有一个。这是一个永久性决定（设计 spec §7.2），不是像上面八列那样等
-下一个 release 补上的待办。
+非空值只有一个。这是一个永久性决定（设计 spec §7.2），不是疏漏。
 
 ### 记的单位是「每一次计过费的响应」，不是「每一轮」
 
@@ -245,7 +254,7 @@ id，跟上面的 `chat_messages.generation_id` 是两回事——由另一条 `
 
 有一种情形看着像例外，其实不是：product-QA 链路耗尽、改发 `error_handling`
 里的兜底话术时，那次 generation 带着真实 usage 在 `llm_generations` 里，而落库
-的 `chat_messages` 行的 `model` / `usage` / `generation_id` 全是 `NULL`。两边都
+的 `chat_messages` 行的 `generation_id` 是 `NULL`。两边都
 是有意的——那次调用计过费，所以要审计；而那行消息的内容来自话术表、不是那次
 调用产出的，把它归到那次调用头上会污染对帐。
 
@@ -292,8 +301,9 @@ material 会直接拒绝加载，而不是像以前那样在构造时 warn-and-d
 - **不持久化 `audit` 对象。**没有任何 DB 列保存 caller 传来的 `audit`
   （`user` / `session_id` / `metadata`）或 attribution 头——它们只是 surface
   字段，转发上游之后就丢弃。但 OpenRouter 的 `model` / `usage` /
-  `generation_id` 三元组**是**会落库的：聊天补全落在
-  `chat_messages.model` / `.usage` / `.generation_id`（好感度评估镜像在
+  `generation_id` 三元组**是**会落库的——`model` 和 `usage` 落在
+  `engine.llm_generations`，`generation_id` 落在那次调用产出的那一行：聊天
+  补全落在 `chat_messages.generation_id`（好感度评估镜像在
   `companion_affinity_events`，人类链每次 `insight_extraction` /
   `insight_structuring` 调用落在
   `companion_insights_events`，实验性角色链的每次调用落在
@@ -541,9 +551,9 @@ prompt、独立端点 `POST /persona/{instance_id}/image/compose` 的任一种
 | `caption` | `TEXT?` | 合成器没写 caption 时为 NULL，包括非 JSON 回退的情形——此时整段回复变成 `subject`。 |
 | `composed_prompt` | `TEXT?` | 拼装出的线上 wire 字符串——style 预设 + 角色外观 + subject，也就是下游消费方实际拿到的那个字符串。**每一行只要产出过它就会保存**，包括聊天路径上的 `exhausted` 和 `not_configured`（肖像回退仍会拼出一个 wire prompt，这一列就是唯一记录了当时画的到底是什么的地方）；只有独立端点的 `exhausted` 行和 `image_edit` 端点的 `exhausted` 行是 NULL——两者失败时都没拼装任何东西（编辑端点同样没有肖像回退）。 |
 | `variant` | `TEXT?` | 解析出的 `prompt_variant` key；`"raw"` 是普通 key，不是跳过标记。 |
-| `model` | `TEXT?` | 成功时是应答的模型。`exhausted` 时也可能有值——只要最后一次尝试确实拿到过应答：聊天路径和非流式端点共用的 `empty`/`empty_prompt`（都走 `run_image_prompt_compose` 那一套共享的链路遍历），以及独立端点流式模式下先流出 metadata（model/generation_id/usage）、之后才断掉的候选——那份证据会被保留，因为 provider 应答了，可能已经计费。只有在任意路径上完全没有应答回来时才是 NULL：什么都没捕获到就断掉或超时，或者 `not_configured`（压根没发起调用）。**自 v1.4.0 起，「provider 到底有没有应答」这条判据完全由这三列**（`model` / `generation_id` / `usage`）承担；`last_failure` 不再兼任它的粗粒度副本，这也正是当初用来编码它的两个标签（`stream_open_failed` / `stream_died_midway`）被取消的原因。 |
-| `usage` | `JSONB?` | 完整未过滤的 OpenRouter usage 块，`serde_json::to_value` 出来的——`OPENROUTER_USAGE_HIDDEN_KEYS` 只过滤 wire 上那份回显，从不影响这里。与 `model` 同步：`model` 有值的地方它才有值。 |
-| `generation_id` | `TEXT?` | 与 `model` 同步。 |
+| `model` | `TEXT?` | **不再写入，下一个 release 删除。** 应答的模型请拿 `generation_id` join `engine.llm_generations`。历史行保留原值。 |
+| `usage` | `JSONB?` | **不再写入，下一个 release 删除。** 同上，走 join。 |
+| `generation_id` | `TEXT?` | join 进 `engine.llm_generations` 的 key，也是这一行为自己那次调用留下的全部审计线索。成功时有值；`exhausted` 时只要最后一次尝试确实拿到过应答也有值：聊天路径和非流式端点共用的 `empty`/`empty_prompt`（都走 `run_image_prompt_compose` 那一套共享的链路遍历），以及独立端点流式模式下先流出 metadata、之后才断掉的候选——那份证据会被保留，因为 provider 应答了，可能已经计费。只有在任意路径上完全没有应答回来时才是 NULL：什么都没捕获到就断掉或超时，或者 `not_configured`（压根没发起调用）。**自 v1.4.0 起，「provider 到底有没有应答」这条判据落在这一列上**，`last_failure` 不再兼任它的粗粒度副本，这也正是当初用来编码它的两个标签（`stream_open_failed` / `stream_died_midway`）被取消的原因。有一处要留意：`model` 停写之后，一个应答了但不回 `id` 的 provider，读起来跟压根没应答一样——以前 `model` 会退回到那次尝试的模型 id，现在不会了。区分这两种情况要看 `attempts` 和 `last_failure`。 |
 | `attempts` | `SMALLINT` | 实际调用了 `[primary, ...fallback]` 里多少个模型；`not_configured` 时为 `0`。 |
 | `last_failure` | `TEXT?` | 最后一次尝试为什么失败；`status = "ok"` 或 `"not_configured"`（压根没发起尝试，也就无所谓失败）时为 NULL。取值：`empty` \| `empty_prompt` \| `upstream_error` \| `gateway_error`。自由文本列，不是 CHECK——这个词表会随新失败模式的出现而增长。前两个是**内容裁决**：调用成功了也计费了，只是产出不可用。后两个是**指针值**，指明下面两列中哪一列存着逐 hop 的细节；自 v1.4.0 起它们取代了 `model_error` / `timeout` 以及流式模式的 `stream_open_failed` / `stream_died_midway`——那四个标签里每一个都同时覆盖了 provider 状态和本地超时，所以一并退役，这一列现在无论由哪个端点写入读起来都一样（见[失败的尝试](#失败的尝试llm_attempts--gateway_errors)）。**`empty` 在流式模式下也能出现**，不止链路遍历那两条路径——一个候选压根没开流（没有内容块），但流本身正常结束，也记 `empty`，跟链路遍历里内容层面「空回复」那一支同名，因为两者说的是同一件事：provider 应答了，可能已经计费。 |
 | `llm_attempts` | `JSONB?` | provider 应答了但报了失败的每一个 hop。除 `source = "image_edit"` 外都是 `task = "chat_image_prompt_compose"`；`image_edit` 行恒为 `"chat_image_edit_compose"`——即便这次编辑实际走的是合成任务的回退链，见[模型配置 → 图片-EDIT 合成器](model-config.zh.md#taskschat_image_edit_compose--图片-edit-合成器可选)。一个都没有时为 NULL——见[失败的尝试](#失败的尝试llm_attempts--gateway_errors)。 |
@@ -611,9 +621,9 @@ CHECK 里——事后收窄 CHECK 要过一次 migration，而这个仓库的一
 | `status` | `TEXT` | `ok` \| `exhausted` \| `not_configured`。 |
 | `image_url` | `TEXT` | |
 | `vision` | `JSONB?` | 解析出的 describe 结果（`description` / `ocr_text` / `people` / `scene`）。成功时与 `chat_messages.metadata.vision` 重复——这份冗余的代价是可以接受的：不用 join `chat_messages` 建立分母，这张表就能直接回答「跑了多少次 describe、describe 的是什么、成功率多少」。 |
-| `model` | `TEXT?` | 成功时是应答的模型。`exhausted` 时也可能有值——只要最后一次尝试确实有应答，只是内容不可用（`empty` / `unparseable` / `content_filter` / `blank_description` / `refusal_pattern`）。只有压根没有应答回来时才是 NULL——provider 状态、传输断开或超时（`upstream_error` / `gateway_error`）——或者 `not_configured`（压根没发起调用）。 |
-| `usage` | `JSONB?` | 完整未过滤的 usage 块，规则同 `chat_images_events.usage`。 |
-| `generation_id` | `TEXT?` | |
+| `model` | `TEXT?` | **不再写入，下一个 release 删除。** 拿 `generation_id` join `engine.llm_generations`。`generation_id` 自己现在遵循的规则：成功时有值；`exhausted` 时只要最后一次尝试有应答、只是内容不可用（`empty` / `unparseable` / `content_filter` / `blank_description` / `refusal_pattern`）也有值。只有压根没有应答回来时才是 NULL——provider 状态、传输断开或超时（`upstream_error` / `gateway_error`）——或者 `not_configured`（压根没发起调用）。 |
+| `usage` | `JSONB?` | **不再写入，下一个 release 删除。** 拿 `generation_id` join `engine.llm_generations`。 |
+| `generation_id` | `TEXT?` | join 进 `engine.llm_generations` 的 key，也是这一行为自己那次调用留下的全部记录。 |
 | `attempts` | `SMALLINT` | 实际调用了 `[primary, ...fallback]` 里多少个模型；`[tasks.chat_vision]` 未配置时为 `0`。 |
 | `last_failure` | `TEXT?` | `status = "ok"` 或 `"not_configured"` 时为 NULL。取值：`upstream_error` \| `gateway_error` \| `empty` \| `unparseable` \| `content_filter` \| `blank_description` \| `refusal_pattern`——最后三个直接复用 `image_vision_invalidity` 现成的 reason 字符串。前两个是 v1.4.0 取代 `model_error` / `timeout` 的**指针值**，指明下面两列中哪一列存着逐 hop 的细节（见[失败的尝试](#失败的尝试llm_attempts--gateway_errors)）。 |
 | `llm_attempts` | `JSONB?` | provider 应答了但报了失败的每一个 hop，`task = "chat_vision"`。一个都没有时为 NULL。 |

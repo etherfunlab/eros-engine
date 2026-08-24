@@ -882,8 +882,6 @@ mod tests {
                 Uuid::new_v4(),
                 "hello back",
                 None,
-                None,
-                None,
                 false,
                 None,
                 None,

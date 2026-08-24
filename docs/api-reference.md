@@ -860,7 +860,7 @@ and its `content` always ends up as the interrupt's report:
 |---|---|---|
 | absent | non-empty | inserted, `truncated = true` |
 | absent | empty | no assistant row written |
-| already exists (race) | non-empty | `content` overwritten, `truncated = true`; `model` / `usage` / `generation_id` and `affinity_scope` / `memory_scope` metadata preserved |
+| already exists (race) | non-empty | `content` overwritten, `truncated = true`; `generation_id` (the join key into `llm_generations`) and `affinity_scope` / `memory_scope` metadata preserved |
 | already exists (race) | empty | `content` left untouched |
 
 Repeated interrupt calls for the same turn are idempotent — the marker and
