@@ -1696,6 +1696,8 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn upsert_user_message_idempotent_replay_after_done(pool: PgPool) {
+        // generation_id is FK-referenced since 0060.
+        crate::testutil::seed_generation(&pool, "gen-1").await;
         let repo = ChatRepo { pool: &pool };
         let user_id = Uuid::new_v4();
         let instance_id = seed_persona_instance(&pool, user_id).await;
@@ -1988,6 +1990,8 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     #[allow(clippy::type_complexity)] // sqlx tuple query — type alias would add noise
     async fn assistant_batch_round_trips_filter_audit(pool: PgPool) {
+        // generation_id is FK-referenced since 0060.
+        crate::testutil::seed_generation(&pool, "gen_chat_xyz").await;
         let repo = ChatRepo { pool: &pool };
         let s = throwaway_session(&pool).await;
         let user_msg_id = match repo
@@ -2054,6 +2058,8 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn assistant_batch_filter_audit_columns_default_null(pool: PgPool) {
+        // generation_id is FK-referenced since 0060.
+        crate::testutil::seed_generation(&pool, "gen_chat_xyz").await;
         let repo = ChatRepo { pool: &pool };
         let s = throwaway_session(&pool).await;
         let user_msg_id = match repo
@@ -2129,6 +2135,8 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn assistant_batch_filter_audit_with_none_generation_id_writes_null(pool: PgPool) {
+        // generation_id is FK-referenced since 0060.
+        crate::testutil::seed_generation(&pool, "gen_chat_xyz").await;
         let repo = ChatRepo { pool: &pool };
         let s = throwaway_session(&pool).await;
         let user_msg_id = match repo
@@ -2180,6 +2188,8 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn assistant_batch_filter_triggers_json_null_persists_as_sql_null(pool: PgPool) {
+        // generation_id is FK-referenced since 0060.
+        crate::testutil::seed_generation(&pool, "gen_chat_xyz").await;
         let repo = ChatRepo { pool: &pool };
         let s = throwaway_session(&pool).await;
         let user_msg_id = match repo
@@ -2235,6 +2245,8 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn assistant_batch_persists_metadata_with_prompt_traits(pool: PgPool) {
+        // generation_id is FK-referenced since 0060.
+        crate::testutil::seed_generation(&pool, "gen_chat_xyz").await;
         let repo = ChatRepo { pool: &pool };
         let s = throwaway_session(&pool).await;
         let user_msg_id = match repo
@@ -2276,6 +2288,8 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn assistant_batch_metadata_default_null(pool: PgPool) {
+        // generation_id is FK-referenced since 0060.
+        crate::testutil::seed_generation(&pool, "gen_chat_xyz").await;
         let repo = ChatRepo { pool: &pool };
         let s = throwaway_session(&pool).await;
         let user_msg_id = match repo
@@ -2316,6 +2330,8 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn assistant_batch_persists_metadata_with_tier(pool: PgPool) {
+        // generation_id is FK-referenced since 0060.
+        crate::testutil::seed_generation(&pool, "gen_chat_xyz").await;
         let repo = ChatRepo { pool: &pool };
         let s = throwaway_session(&pool).await;
         let user_msg_id = match repo
@@ -3286,6 +3302,8 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn voice_inserts_are_marked_and_idempotent(pool: PgPool) {
+        // generation_id is FK-referenced since 0060.
+        crate::testutil::seed_generation(&pool, "gen-1").await;
         let session_id = throwaway_session(&pool).await.id;
         let repo = ChatRepo { pool: &pool };
 
@@ -3528,6 +3546,8 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn voice_assistant_insert_bumps_last_active_at(pool: PgPool) {
+        // generation_id is FK-referenced since 0060.
+        crate::testutil::seed_generation(&pool, "gen-1").await;
         let session_id = throwaway_session(&pool).await.id;
         let repo = ChatRepo { pool: &pool };
 
@@ -3618,6 +3638,10 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     #[allow(clippy::type_complexity)] // sqlx tuple query — type alias would add noise
     async fn voice_assistant_insert_is_idempotent_on_user_message(pool: PgPool) {
+        // generation_id is FK-referenced since 0060.
+        for g in ["gen-0", "gen-1"] {
+            crate::testutil::seed_generation(&pool, g).await;
+        }
         let repo = ChatRepo { pool: &pool };
         let (session_id, user_mid) = seed_voice_turn(&pool, "hello").await;
 
@@ -4015,6 +4039,8 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn insert_product_qa_assistant_message_round_trips(pool: PgPool) {
+        // generation_id is FK-referenced since 0060.
+        crate::testutil::seed_generation(&pool, "gen_pq_1").await;
         let repo = ChatRepo { pool: &pool };
         let session_id = throwaway_session(&pool).await.id;
         let user_id: Uuid = sqlx::query_scalar(
@@ -4476,6 +4502,8 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn interrupt_after_completion_overwrites_content_keeps_audit(pool: PgPool) {
+        // generation_id is FK-referenced since 0060.
+        crate::testutil::seed_generation(&pool, "gen-9").await;
         let repo = ChatRepo { pool: &pool };
         let (session_id, user_mid) = seed_voice_turn(&pool, "hello").await;
         let usage = serde_json::json!({"total_tokens": 42});
@@ -4571,6 +4599,10 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn double_write_race_is_order_independent(pool: PgPool) {
+        // generation_id is FK-referenced since 0060.
+        for g in ["gen-a", "gen-b"] {
+            crate::testutil::seed_generation(&pool, g).await;
+        }
         let repo = ChatRepo { pool: &pool };
 
         // Order A: interrupt first, generator second.

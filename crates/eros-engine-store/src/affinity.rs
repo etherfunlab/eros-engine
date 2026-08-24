@@ -2326,6 +2326,8 @@ mod tests {
             .await
             .unwrap();
 
+        // FK-referenced since 0060.
+        crate::testutil::seed_generation(&pool, "gen-aff").await;
         let meta = crate::OpenRouterCallMeta {
             generation_id: Some("gen-aff".into()),
             model: Some("aff/m".into()),

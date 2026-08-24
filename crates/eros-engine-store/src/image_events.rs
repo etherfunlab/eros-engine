@@ -183,7 +183,9 @@ impl ChatVisionEventRepo<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{seed_chat_message, seed_chat_session, seed_persona_instance};
+    use crate::testutil::{
+        seed_chat_message, seed_chat_session, seed_generation, seed_persona_instance,
+    };
     use sqlx::PgPool;
 
     #[sqlx::test(migrations = "./migrations")]
@@ -193,6 +195,8 @@ mod tests {
         // instance_id and session_id are FK-referenced since 0058.
         let instance = seed_persona_instance(&pool, user).await;
         let session = seed_chat_session(&pool, user).await;
+        // ...and generation_id since 0060.
+        seed_generation(&pool, "gen_compose_1").await;
 
         let ok_id = repo
             .record(ImageComposeEventInsert {
@@ -301,6 +305,8 @@ mod tests {
         // session_id and message_id are FK-referenced since 0058.
         let session = seed_chat_session(&pool, user).await;
         let msg_ok = seed_chat_message(&pool, session).await;
+        // ...and generation_id since 0060.
+        seed_generation(&pool, "gen_vision_1").await;
 
         repo.record(ChatVisionEventInsert {
             user_id: user,
@@ -380,6 +386,7 @@ mod tests {
         let user = Uuid::new_v4();
         let instance = seed_persona_instance(&pool, user).await;
         let session = seed_chat_session(&pool, user).await;
+        seed_generation(&pool, "g").await;
         let id = repo
             .record(ImageComposeEventInsert {
                 llm_attempts: None,

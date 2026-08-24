@@ -255,6 +255,8 @@ mod tests {
         let seeded_session = crate::testutil::seed_chat_session(&pool, Uuid::new_v4()).await;
         let seeded_message = crate::testutil::seed_chat_message(&pool, seeded_session).await;
         let instance_id = seed_persona_instance(&pool, Uuid::new_v4()).await;
+        // ...and generation_id since 0060.
+        crate::testutil::seed_generation(&pool, "g").await;
 
         sqlx::query(
             "INSERT INTO engine.user_insights \
@@ -437,6 +439,8 @@ mod tests {
         // session_id / message_id are FK-referenced since 0058.
         let session_id = crate::testutil::seed_chat_session(&pool, Uuid::new_v4()).await;
         let message_id = crate::testutil::seed_chat_message(&pool, session_id).await;
+        // ...and generation_id since 0060.
+        crate::testutil::seed_generation(&pool, "gen-user").await;
 
         UserInsightEventRepo { pool: &pool }
             .record(UserInsightEventInsert {

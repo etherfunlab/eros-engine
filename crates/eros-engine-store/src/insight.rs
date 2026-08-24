@@ -61,6 +61,8 @@ mod tests {
         // Both are FK-referenced since 0058; a fabricated id no longer inserts.
         let session_id = crate::testutil::seed_chat_session(&pool, user_id).await;
         let message_id = crate::testutil::seed_chat_message(&pool, session_id).await;
+        // ...and generation_id since 0060.
+        crate::testutil::seed_generation(&pool, "gen-facts").await;
 
         repo.record(InsightEventInsert {
             run_id,
@@ -133,6 +135,8 @@ mod tests {
         let user_id = Uuid::new_v4();
         let session_id = crate::testutil::seed_chat_session(&pool, user_id).await;
         let message_id = crate::testutil::seed_chat_message(&pool, session_id).await;
+        // ...and generation_id since 0060.
+        crate::testutil::seed_generation(&pool, "g").await;
         sqlx::query(
             "INSERT INTO engine.companion_insights_events \
                (run_id, user_id, session_id, message_id, stage, status, payload, model, usage, generation_id) \

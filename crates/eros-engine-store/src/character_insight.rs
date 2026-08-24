@@ -298,6 +298,8 @@ mod tests {
         // FK-referenced since 0058, so they have to name real rows.
         let session_id = crate::testutil::seed_chat_session(&pool, Uuid::new_v4()).await;
         let message_id = crate::testutil::seed_chat_message(&pool, session_id).await;
+        // ...and generation_id since 0060.
+        crate::testutil::seed_generation(&pool, "g").await;
         sqlx::query(
             "INSERT INTO engine.character_insights_events \
                (run_id, instance_id, session_id, message_id, stage, status, payload, \
@@ -713,6 +715,8 @@ mod tests {
         // session_id / message_id are FK-referenced since 0058.
         let session_id = crate::testutil::seed_chat_session(&pool, Uuid::new_v4()).await;
         let message_id = crate::testutil::seed_chat_message(&pool, session_id).await;
+        // ...and generation_id since 0060.
+        crate::testutil::seed_generation(&pool, "gen-x").await;
 
         repo.record(CharacterInsightEventInsert {
             run_id,

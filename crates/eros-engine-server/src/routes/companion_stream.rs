@@ -1585,6 +1585,16 @@ data: [DONE]\n\n";
             UpsertUserOutcome::Inserted { message_id } => message_id,
             _ => unreachable!(),
         };
+        // Since 0060 chat_messages.generation_id FK-references
+        // engine.llm_generations. Release A's write path creates the parent;
+        // this test writes the child row directly, so it seeds one itself.
+        sqlx::query(
+            "INSERT INTO engine.llm_generations (generation_id, task) \
+             VALUES ('gen-1', 'chat_companion')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         let assistant_uuid: Uuid = ulid::Ulid::new().into();
         chat_repo
             .insert_assistant_batch(
