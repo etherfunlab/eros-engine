@@ -560,16 +560,28 @@ so backfilled rows keep their real position in time.
 
 **`companion_affinity_events` has no `session_id` column.** It carries
 `affinity_id` and a nullable `user_message_id`, and nothing else that reaches a
-session. Its only route is `user_message_id → chat_messages.session_id`, and
-that route is mostly empty: of its 8,119 rows carrying a `generation_id`, **211
-have a `user_message_id`** (2.6%), all of which resolve. So this source
-contributes 211 rows with a session and 7,908 with `NULL`.
+session. Its only route is `user_message_id → chat_messages.session_id`.
 
-That is not a defect to fix in the backfill. `session_id` is nullable precisely
-because some generations have no conversation to attribute to, and an affinity
-evaluation predating the `user_message_id` column has no surviving link to one.
-Inventing it — by joining on timestamps, or on the affinity row's own owner —
-would put a guess in a column whose whole value is that it is not one.
+**That route's coverage is a backlog problem, not a property of the table** —
+the two eras have to be read separately or the number misleads:
+
+| era | rows with a `generation_id` | with a `user_message_id` |
+|---|---|---|
+| before 1.6.1 was deployed | 8,054 | 146 (1.8%) |
+| since | 65 | **65 (100%)** |
+
+So the backfill contributes ~211 rows with a session and ~7,908 with `NULL`,
+and that `NULL` count **stops growing**. Every affinity row written from here on
+resolves. A reader who takes the blended 2.6% away from this section would
+conclude affinity generations are permanently unattributable, which is the
+opposite of what the data says.
+
+The historical `NULL`s are not a defect to fix in the backfill. `session_id` is
+nullable precisely because some generations have no conversation to attribute
+to, and an affinity evaluation predating the `user_message_id` column has no
+surviving link to one. Inventing it — by joining on timestamps, or on the
+affinity row's own owner — would put a guess in a column whose whole value is
+that it is not one.
 
 **Every `session_id` goes through `LEFT JOIN engine.chat_sessions` and lands as
 `NULL` when it does not resolve.** Migration 0058 recorded that
