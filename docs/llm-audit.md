@@ -158,20 +158,39 @@ call now writes here: `chat_companion`, `chat_voice`, `chat_product_qa`,
 
 ### Reading it
 
-`usage` is stored **unfiltered**, `cost` included.
-`OPENROUTER_USAGE_HIDDEN_KEYS` strips keys only on the way out to clients
-(see above); the database has always kept the whole object and continues to.
+`usage` is stored **unfiltered** — whatever the provider sent, `cost`
+included when the provider sent one. `OPENROUTER_USAGE_HIDDEN_KEYS` strips
+keys only on the way out to clients (see above); the database has always kept
+the whole object and continues to.
 
-Cost per task for a window:
+Cost per task for a window. **Never sum `cost` without also counting how many
+rows carried one:**
 
 ```sql
 SELECT task,
-       count(*)                       AS calls,
-       sum((usage->>'cost')::numeric) AS cost
+       count(*)                                AS calls,
+       count(*) FILTER (WHERE usage ? 'cost')  AS priced,
+       sum((usage->>'cost')::numeric)          AS cost_of_priced
 FROM engine.llm_generations
 WHERE created_at >= now() - interval '7 days'
-GROUP BY task ORDER BY cost DESC;
+GROUP BY task ORDER BY cost_of_priced DESC NULLS LAST;
 ```
+
+**`cost` is a provider-dependent key.** OpenRouter returns it inside `usage`;
+Venice direct does not emit it at all. A deployment that mixes the two — as
+the reference one does — gets `cost` on only part of its rows.
+
+`priced` is what makes the sum readable. A task served entirely by an
+unpriced provider sums to `NULL`, which is honest and obvious. The trap is a
+**mixed** task: one `[tasks.*]` whose primary is priced and whose fallback is
+not returns a plausible-looking total that silently covers a fraction of its
+calls. Read `priced / calls` before believing `cost_of_priced`.
+
+The engine does not derive the missing cost from tokens and a price table.
+That would make it a second authority on what a call cost, drifting against
+the provider's real pricing with nothing to signal the drift. For unpriced
+rows the provider's dashboard is the authority, and `generation_id` is the
+join key to it — which is what this table exists to give you.
 
 ### Failure semantics: fail-open
 
