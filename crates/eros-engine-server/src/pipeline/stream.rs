@@ -4365,6 +4365,26 @@ pub fn run_stream(
                 // the chain-exhausted record.
                 let candidate_count = candidates.len();
                 'candidates: for model_id in candidates {
+                    // The PREVIOUS candidate answered and was billed before the
+                    // chain moved on. Record it before the reset below erases
+                    // it: no child row will ever point at it, but the spend is
+                    // real and this table is its only trace (design spec §4.5).
+                    // No-op on the first iteration.
+                    if let Some(id) = last_gen_id.take() {
+                        let abandoned_usage =
+                            last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
+                        let _ = super::record_generation(
+                            &state.pool,
+                            super::GenerationRecord {
+                                task: PRODUCT_QA_TASK,
+                                session_id: Some(user_msg.session_id),
+                                generation_id: Some(&id),
+                                model: served_model.as_deref(),
+                                usage: abandoned_usage.as_ref(),
+                            },
+                        )
+                        .await;
+                    }
                     last_usage = None;
                     last_gen_id = None;
                     served_model = None;
@@ -4466,6 +4486,44 @@ pub fn run_stream(
                     }
                 }
 
+                // Parent row BEFORE the chain-exhausted handling below rather
+                // than after it: that block has a branch which returns without
+                // ever reaching the old call site, and a last candidate that
+                // streamed metadata and then produced nothing was billed just
+                // like a superseded one (design spec §4.5).
+                //
+                // `audit_usage` is deliberately its own value and NOT the
+                // `usage_full` the persist uses further down. The canned-phrase
+                // branch below clears `last_usage` on purpose so the row whose
+                // content is a canned phrase carries no real usage; reusing one
+                // hoisted value here would plant it right back. The audit row
+                // wants the billed truth, the message row wants the reset — two
+                // questions, two values.
+                //
+                // Guarded on `is_some()`, and the guard is not an optimisation:
+                // `record_generation` emits `openrouter: call completed` BEFORE
+                // it short-circuits on a missing id. The old position was only
+                // reachable once a candidate had answered; this one is reachable
+                // when the whole chain failed without any provider ever
+                // responding, and an unguarded call would log a completed call
+                // that never happened. The assignment is a no-op in that case
+                // anyway — `record_generation(None)` returns `None`.
+                if last_gen_id.is_some() {
+                    let audit_usage =
+                        last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
+                    last_gen_id = super::record_generation(
+                        &state.pool,
+                        super::GenerationRecord {
+                            task: PRODUCT_QA_TASK,
+                            session_id: Some(user_msg.session_id),
+                            generation_id: last_gen_id.as_deref(),
+                            model: served_model.as_deref(),
+                            usage: audit_usage.as_ref(),
+                        },
+                    )
+                    .await;
+                }
+
                 // Chain exhausted with nothing streamed: error_handling fallback
                 // phrase, persisted WITH the channel marker so replay/idempotency
                 // hold (spec §4). Never degrade to the companion reply path — the
@@ -4546,22 +4604,12 @@ pub fn run_stream(
                     }
                 }
 
+                // Read AFTER the chain-exhausted block, not before: that block's
+                // canned-phrase branch clears `last_usage` (and `last_gen_id` /
+                // `served_model` with it) so the persisted row carries no
+                // attribution for content no candidate produced. The audit row
+                // was already written above, off the pre-reset values.
                 let usage_full = last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
-                // Parent row BEFORE the persist below: the child stores what
-                // comes back, so it can never point at a row that does not
-                // exist yet. The chain-exhausted branch above already cleared
-                // the trio, so a canned fallback phrase records nothing.
-                last_gen_id = super::record_generation(
-                    &state.pool,
-                    super::GenerationRecord {
-                        task: PRODUCT_QA_TASK,
-                        session_id: Some(user_msg.session_id),
-                        generation_id: last_gen_id.as_deref(),
-                        model: served_model.as_deref(),
-                        usage: usage_full.as_ref(),
-                    },
-                )
-                .await;
                 // This executor persists exactly ONE row per turn — it has no
                 // superseded-bubble concept — so this row is always the
                 // concluding row and always owns the whole list.
@@ -13308,6 +13356,299 @@ data: [DONE]\n\n";
         assert_eq!(stored.as_deref(), Some("gen-qa-1"));
     }
 
+    /// Design spec §4.5, Loss 1. The primary product-QA candidate streams a
+    /// metadata chunk carrying an id and usage but no content, so the chain
+    /// moves on and the fallback serves the answer. Both calls were billed;
+    /// before the drain at the top of the candidate loop, only the fallback's
+    /// left a row and the primary's spend was invisible to every table.
+    ///
+    /// The `chat_messages` assertion is the other half: recording the abandoned
+    /// candidate must not attribute it to the reply the user actually got.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn product_qa_abandoned_candidate_records_its_own_generation(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        let verdict = serde_json::json!({ "action": "product_qa", "inner_state": "" }).to_string();
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("pde/judge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gj", "model": "pde/judge",
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "choices": [{"message": {"content": verdict}}],
+            })))
+            .mount(&mock)
+            .await;
+
+        // Primary: opens 200, streams ONE metadata-only chunk (id + usage, empty
+        // delta) and ends. `acc` stays empty ⇒ `continue 'candidates`, and the
+        // loop-top reset on the next iteration is what used to erase this.
+        let abandoned = "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":0,\"total_tokens\":7},\"id\":\"gen-qa-abandoned\",\"model\":\"qa/exec-a\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("qa/exec-a"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(abandoned, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        // Fallback: real content, its own id. This is the served answer.
+        let served = "data: {\"choices\":[{\"delta\":{\"content\":\"可以用五年\"}}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":6,\"total_tokens\":10},\"id\":\"gen-qa-served\",\"model\":\"qa/exec-b\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("qa/exec-b"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(served, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide the action and inner_state.\"\n\
+                 [tasks.chat_product_qa]\nmodel=\"qa/exec-a\"\nfallback=[\"qa/exec-b\"]\nretry_depth=1\n\
+                 filter_prompt=\"Answer using the product docs below.\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "这个产品能用几年",
+                "01JPDEQAABANDONED00000001",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "这个产品能用几年".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: None,
+                quote: Default::default(),
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        let text: String = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            text, "可以用五年",
+            "the fallback's answer is what is served"
+        );
+
+        // BOTH generations have a row: two provider responses, two bills.
+        let rows: Vec<(String, String, Option<Uuid>)> = sqlx::query_as(
+            "SELECT generation_id, task, session_id FROM engine.llm_generations \
+             WHERE generation_id IN ('gen-qa-abandoned', 'gen-qa-served') \
+             ORDER BY generation_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "the abandoned candidate was billed too and needs its own row: {rows:?}"
+        );
+        for (_, task, sid) in &rows {
+            assert_eq!(task, "chat_product_qa");
+            assert_eq!(*sid, Some(session_id));
+        }
+
+        // The persisted reply points at the SERVED generation, never the one
+        // the chain walked away from.
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT generation_id FROM engine.chat_messages \
+             WHERE user_message_id = $1 AND role = 'assistant'",
+        )
+        .bind(user_message_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored.as_deref(), Some("gen-qa-served"));
+    }
+
+    /// Design spec §4.5, Loss 2. Every product-QA candidate is spent AND no
+    /// fallback phrase is configured, so the arm emits an Error frame and
+    /// returns — the branch that used to leave the last candidate's billed
+    /// generation unrecorded, because the old call site sat below it.
+    ///
+    /// Asserting on `usage` rather than mere existence is deliberate: the fix
+    /// moves a `let` as well as a call, and a move that leaves the usage value
+    /// behind still compiles and still writes a row — just an empty one.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn product_qa_records_its_generation_before_the_no_phrase_return(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        let verdict = serde_json::json!({ "action": "product_qa", "inner_state": "" }).to_string();
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("pde/judge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gj", "model": "pde/judge",
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "choices": [{"message": {"content": verdict}}],
+            })))
+            .mount(&mock)
+            .await;
+
+        // The only candidate: metadata-only, so `acc` stays empty and the chain
+        // is spent with real usage still in hand.
+        let spent = "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":0,\"total_tokens\":11},\"id\":\"gen-qa-nophrase\",\"model\":\"qa/exec\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("qa/exec"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(spent, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        // Empty the seeded phrase list so `pick_chat_stream_fallback_phrase`
+        // yields None and the arm takes its Error-frame return.
+        sqlx::query(
+            "UPDATE engine.error_handling_config \
+             SET payload = '[]'::jsonb \
+             WHERE kind = 'chat_stream_failure_fallback_phrases'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide the action and inner_state.\"\n\
+                 [tasks.chat_product_qa]\nmodel=\"qa/exec\"\nfilter_prompt=\"Answer using the product docs below.\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "还有货吗",
+                "01JPDEQANOPHRASE000000001",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "还有货吗".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: None,
+                quote: Default::default(),
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        assert!(
+            frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Error { .. })),
+            "no phrase configured ⇒ Error frame, got {frames:?}"
+        );
+
+        let (task, sid, usage): (String, Option<Uuid>, Option<serde_json::Value>) = sqlx::query_as(
+            "SELECT task, session_id, usage FROM engine.llm_generations \
+             WHERE generation_id = 'gen-qa-nophrase'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("the spent candidate answered and was billed; the return must not skip its row");
+        assert_eq!(task, "chat_product_qa");
+        assert_eq!(sid, Some(session_id));
+        assert_eq!(
+            usage
+                .as_ref()
+                .and_then(|u| u.get("prompt_tokens"))
+                .and_then(|v| v.as_u64()),
+            Some(11),
+            "the usage must travel with the call, not be left behind by the move"
+        );
+    }
+
     /// Spec §6 failure path: "executor exhausted → fallback text emitted AND
     /// persisted with the channel marker." Both product_qa candidates fail to
     /// produce usable content — the primary 500s outright, the fallback opens
@@ -13547,6 +13888,31 @@ data: [DONE]\n\n";
         assert_eq!(
             generation_id, None,
             "the fallback row must not carry the exhausted candidate's generation_id"
+        );
+
+        // Design spec §4.5: the two halves of the canned-phrase invariant pull
+        // in opposite directions and BOTH must hold. The message row above
+        // carries no attribution, because its content is a canned phrase no
+        // candidate produced. This row must exist anyway, with the real usage,
+        // because that candidate answered and was billed. Recording the
+        // generation above the exhausted block buys the second without
+        // spending the first — the branch's own reset still runs afterwards.
+        let (task, sid, usage): (String, Option<Uuid>, Option<serde_json::Value>) = sqlx::query_as(
+            "SELECT task, session_id, usage FROM engine.llm_generations \
+             WHERE generation_id = 'gen-exhausted'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("the exhausted candidate answered and was billed; it must record a row");
+        assert_eq!(task, "chat_product_qa");
+        assert_eq!(sid, Some(session_id));
+        assert_eq!(
+            usage
+                .as_ref()
+                .and_then(|u| u.get("prompt_tokens"))
+                .and_then(|v| v.as_u64()),
+            Some(3),
+            "the audit row keeps the billed usage the message row deliberately drops"
         );
     }
 

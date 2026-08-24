@@ -224,21 +224,28 @@ its own degrade branch, and production carries exactly one non-null value in
 it. This is a permanent decision (design spec §7.2), not a later-release
 item like the eight columns above.
 
-### Two known limits
+### One row per billed response, not one per turn
 
-**A chain that walks several fallback models can write several rows for one
+**A chain that walks several fallback models writes several rows for one
 turn.** Every candidate response that carried a `generation_id` gets its own
 row, whether or not its content is the one ultimately served — each was
-separately billed, so each is the intended unit.
+separately billed, so each is the intended unit. A row nothing points at is
+normal and is often the most useful row in the table: it is spend that
+appears nowhere else.
 
-**The voice arm, the product-QA arm, and the standalone compose endpoint's
-streaming mode record only the served attempt.** All three reset their
-working `generation_id` at the start of every candidate and call
-`record_generation` once, after the candidate loop ends, with whatever the
-served attempt left behind. A candidate that streamed a response — and was
-billed for it — before the chain moved on to another model leaves no row.
-The main chat arms record inside the per-candidate loop itself and do not
-have this gap.
+That holds on every arm. The voice arm, the product-QA arm and the standalone
+compose endpoint's streaming mode each keep a working `generation_id` that
+only ever holds one candidate's metadata, so they record an abandoned
+candidate at the point the next one would overwrite it, and record the last
+candidate before any early return that would otherwise skip it.
+
+One case looks like an exception and is not: when a product-QA chain is spent
+and a canned `error_handling` phrase is served instead, the generation is in
+`llm_generations` with its real usage, while the persisted `chat_messages`
+row carries `model` / `usage` / `generation_id` as `NULL`. Both are
+deliberate. The call was billed, so it is audited; the message's content came
+from a phrase table, not from that call, so attributing it would poison
+reconciliation.
 
 ## App-attribution headers
 

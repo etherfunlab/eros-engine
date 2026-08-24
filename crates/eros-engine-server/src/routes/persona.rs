@@ -551,6 +551,30 @@ async fn compose_stream(
     // actually broke rather than from which arm it landed in.
     let mut chain_failures: Vec<eros_engine_llm::failure::AttemptFailure> = Vec::new();
     for model_id in chain {
+        // The PREVIOUS candidate answered, was billed, and its evidence is
+        // about to be overwritten by this iteration — every failure arm below
+        // assigns `last_generation_id`, so nothing else preserves it. Record it
+        // first: no child row will ever point at it, but this table is the only
+        // trace of that spend (design spec §4.5). One drain here dominates all
+        // four assignment sites because the per-candidate evidence is a `let`
+        // inside the loop; only the chain-level carry survives an iteration.
+        // No-op on the first pass.
+        if let Some(id) = last_generation_id.take() {
+            let abandoned_usage = last_usage
+                .as_ref()
+                .and_then(|u| serde_json::to_value(u).ok());
+            let _ = crate::pipeline::record_generation(
+                &state.pool,
+                crate::pipeline::GenerationRecord {
+                    task: "chat_image_prompt_compose",
+                    session_id: None,
+                    generation_id: Some(&id),
+                    model: last_model.as_deref(),
+                    usage: abandoned_usage.as_ref(),
+                },
+            )
+            .await;
+        }
         attempts += 1;
         // One budget per candidate, covering both the open and the whole
         // consumption — the composer writes a short JSON reply, so the
@@ -1132,6 +1156,108 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    /// Design spec §4.5, Loss 1, streaming compose. The primary candidate opens
+    /// a 200 stream, emits a metadata chunk (id + model + usage) and ends with
+    /// no content — `last_failure = "empty"`, evidence deliberately retained
+    /// because the provider answered and billed — and the chain moves on.
+    ///
+    /// This arm's shape differs from the two chat arms: the per-candidate
+    /// evidence is a `let` inside the loop, so what the next iteration destroys
+    /// is the chain-level carry. One drain at the top of the loop covers all
+    /// four of the branches that assign it.
+    ///
+    /// `session_id` is NULL here and that is correct, not a degraded write: the
+    /// standalone compose endpoint has no conversation behind it.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn compose_stream_abandoned_candidate_records_its_own_generation(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+        let mock = MockServer::start().await;
+
+        // Primary: metadata only, then a clean end. No content ⇒ this candidate
+        // never opens, and the chain walks to the fallback.
+        let abandoned = "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":0,\"total_tokens\":5},\"id\":\"gen-compose-abandoned\",\"model\":\"comp-a\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("comp-a"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(abandoned, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        // Fallback: streams the composer's JSON reply and carries its own id.
+        let served = "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"prompt\\\":\\\"SERVED SUBJECT\\\",\\\"caption\\\":\\\"一张图\\\"}\"}}],\"id\":\"gen-compose-served\",\"model\":\"comp-b\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("comp-b"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(served, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = Arc::new(
+            ModelConfig::from_toml_str(
+                "[tasks.chat_image_prompt_compose]\nmodel = \"comp-a\"\nfallback = [\"comp-b\"]\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let mut app = build_router(state);
+        let jwt = mint_jwt(user_id);
+        let resp = post_compose(
+            &mut app,
+            instance_id,
+            &jwt,
+            json!({"content": "在海边", "stream": true}),
+        )
+        .await;
+        // Drain the SSE body so the handler runs to completion before asserting.
+        let _ = axum::body::to_bytes(resp.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+
+        let (task, sid, usage): (String, Option<Uuid>, Option<serde_json::Value>) = sqlx::query_as(
+            "SELECT task, session_id, usage FROM engine.llm_generations \
+             WHERE generation_id = 'gen-compose-abandoned'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("the superseded compose candidate answered and was billed; it must record a row");
+        assert_eq!(task, "chat_image_prompt_compose");
+        assert_eq!(
+            sid, None,
+            "the standalone compose endpoint has no session; NULL here is the design, not a degrade"
+        );
+        assert_eq!(
+            usage
+                .as_ref()
+                .and_then(|u| u.get("prompt_tokens"))
+                .and_then(|v| v.as_u64()),
+            Some(5)
+        );
+
+        // The served candidate has its own row — two responses, two bills.
+        let served_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.llm_generations \
+             WHERE generation_id = 'gen-compose-served'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(served_rows, 1);
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
