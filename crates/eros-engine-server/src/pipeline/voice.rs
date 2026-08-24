@@ -708,6 +708,24 @@ pub fn run_voice_turn(
         // earlier candidate said.
         let mut chain_failures: Vec<eros_engine_llm::failure::AttemptFailure> = Vec::new();
         'candidates: for model_id in candidates {
+            // The PREVIOUS candidate answered, was billed, and the chain moved
+            // on. Record it before the reset below erases it: no child row will
+            // ever point at it, but the spend is real and this table is its only
+            // trace (design spec §4.5). Returns `None` on the first iteration
+            // and does nothing.
+            if let Some(id) = last_gen_id.take() {
+                let abandoned_usage = last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
+                let _ = crate::pipeline::record_generation(
+                    &state.pool,
+                    crate::pipeline::GenerationRecord {
+                        task: "chat_voice",
+                        session_id: Some(turn.session_id),
+                        generation_id: Some(&id),
+                        model: served_model.as_deref(),
+                        usage: abandoned_usage.as_ref(),
+                    },
+                ).await;
+            }
             // Per-attempt metadata: reset so an abandoned candidate's usage / gen_id /
             // model / truncated never leaks onto a later fallback's reply.
             last_usage = None;
@@ -833,6 +851,26 @@ pub fn run_voice_turn(
             }
         }
 
+        // Parent row BEFORE anything reads `last_gen_id`, and — the reason this
+        // sits ABOVE the empty-accumulation return rather than after it — before
+        // the only branch that leaves this function without recording. A last
+        // candidate that streamed metadata and then died was billed just like a
+        // superseded one (design spec §4.5). The DB always gets the FULL
+        // unfiltered usage; the wire `Done` frame below gets a separate,
+        // hidden-keys-filtered copy (mirrors the text/replay paths).
+        let usage_full = last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
+        last_gen_id = crate::pipeline::record_generation(
+            &state.pool,
+            crate::pipeline::GenerationRecord {
+                task: "chat_voice",
+                session_id: Some(turn.session_id),
+                generation_id: last_gen_id.as_deref(),
+                model: served_model.as_deref(),
+                usage: usage_full.as_ref(),
+            },
+        )
+        .await;
+
         // Any empty accumulation — no successful open, or a stream that sent
         // only metadata (id/model) and then errored or ended without content
         // — is an upstream failure. Never emit an empty `done`.
@@ -850,24 +888,6 @@ pub fn run_voice_turn(
             return;
         }
 
-        // Persist the assistant turn only when it carries text. The DB always
-        // gets the FULL unfiltered usage; the wire `Done` frame below gets a
-        // separate, hidden-keys-filtered copy (mirrors the text/replay paths).
-        let usage_full = last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
-        // Parent row BEFORE the persist below: the chain has ended and nothing
-        // has read `last_gen_id` yet, so the assistant row and the Done frame
-        // both store what came back rather than an id with no parent.
-        last_gen_id = crate::pipeline::record_generation(
-            &state.pool,
-            crate::pipeline::GenerationRecord {
-                task: "chat_voice",
-                session_id: Some(turn.session_id),
-                generation_id: last_gen_id.as_deref(),
-                model: served_model.as_deref(),
-                usage: usage_full.as_ref(),
-            },
-        )
-        .await;
         // Symmetric with the chat stream's assistant row: the resolved 6-bool
         // scope, not a back-projected label (spec 2026-08-14; the legacy
         // `relationship_scope` key shipped for one release in v1.2.0).
@@ -2032,6 +2052,21 @@ data: [DONE]\n\n";
             n, 0,
             "no assistant row should be persisted on empty completion"
         );
+
+        // Design spec §4.5, Loss 2: the provider answered — it sent an id and a
+        // model — so the call was billed even though it produced no content and
+        // this arm returns without persisting anything. The audit row is the
+        // ONLY record of that spend, which is why `record_generation` sits above
+        // the empty-accumulation return rather than after it.
+        let (task, sid): (String, Option<Uuid>) = sqlx::query_as(
+            "SELECT task, session_id FROM engine.llm_generations \
+             WHERE generation_id = 'gen-e'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("a metadata-only candidate was still billed and must record a row");
+        assert_eq!(task, "chat_voice");
+        assert_eq!(sid, Some(session_id));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -2692,6 +2727,35 @@ data: [DONE]\n\n";
         .await
         .unwrap();
         assert_eq!(content, "recovered");
+
+        // Design spec §4.5, Loss 1: the abandoned primary streamed usage AND an
+        // id, so it was billed. The drain at the top of the candidate loop gives
+        // it a row of its own — nothing points at that row, and that is the
+        // point: this table is the only trace the spend has.
+        let (task, sid): (String, Option<Uuid>) = sqlx::query_as(
+            "SELECT task, session_id FROM engine.llm_generations \
+             WHERE generation_id = 'gen-primary'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("the superseded primary candidate must still record its generation");
+        assert_eq!(task, "chat_voice");
+        assert_eq!(sid, Some(session_id));
+
+        // ...and the served fallback must not have borrowed it. It carried no
+        // id of its own, so the persisted row stores NULL.
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT generation_id FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            stored, None,
+            "recording the abandoned candidate must not attribute it to the served reply"
+        );
     }
 
     /// Spec §3 lists `chat_voice` as a `chat_messages` call site, and the
