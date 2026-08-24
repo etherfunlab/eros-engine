@@ -703,13 +703,16 @@ fn eval_skip_reason(
     }
 }
 
-/// Marker for a *successful* eval whose response still carried no OpenRouter
-/// `generation_id` — the join key to the OpenRouter log. The salvaged-garble
-/// fallback in `OpenRouterClient::execute` returns `Ok` with `generation_id:
-/// None` (and `usage: None`), so "the call returned `Ok`" does not by itself
-/// guarantee an audit trail. Without the id the row can't be tied to an
-/// OpenRouter record, so it still needs an explanation. `None` ⇒ a usable id is
-/// present.
+/// Marker for a *successful* eval whose `meta.generation_id` came back `None`
+/// — the join key to both the OpenRouter log and this call's
+/// `engine.llm_generations` row. Two distinct causes land here and this
+/// marker does not distinguish them: the salvaged-garble fallback in
+/// `OpenRouterClient::execute` can return `Ok` with `generation_id: None`
+/// (and `usage: None`) even though the call succeeded, and separately
+/// `record_generation` itself returns `None` when the provider DID give an
+/// id but the parent-table write failed (llm-generations-audit spec §6).
+/// Either way "the call returned `Ok`" does not by itself guarantee an audit
+/// trail. `None` ⇒ a usable id is present.
 fn meta_skip_reason(meta: &eros_engine_store::OpenRouterCallMeta) -> Option<&'static str> {
     meta.generation_id
         .is_none()
@@ -930,6 +933,9 @@ struct CallAudit {
     meta: eros_engine_store::OpenRouterCallMeta,
 }
 
+/// `generation_id` must be `record_generation`'s return value, never
+/// `resp.generation_id` — a caller passing the raw field would compile and
+/// silently reopen the unlaundered path this table exists to close.
 fn call_meta(
     resp: &eros_engine_llm::openrouter::ChatResponse,
     generation_id: Option<String>,

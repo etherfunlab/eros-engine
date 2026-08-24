@@ -361,6 +361,16 @@ its migration `018`, and no web RPC references `model` or `usage` on any
 them. The work is deleting `.bind()` calls and rewriting the tests that assert
 on them.
 
+**Known property, not a Release-B surprise: `llm_generations.model` is
+heterogeneous across tasks.** The two `chat_companion` streaming arms
+(`stream.rs`'s live and filtered arms) record `model: Some(model_id.as_str())`
+— the *requested* config slug, which may carry an `@provider` suffix — while
+every non-streaming call site records `resp.model`, the model the provider
+actually served. This already matches what `AssistantInsert.model` stores
+today, so nothing regresses, but once the child `model` columns are dropped,
+`llm_generations.model` is the only copy left and a reader joining across
+tasks needs to know the two are not the same kind of value.
+
 ### 7.5 Documentation
 
 `docs/llm-audit.md` and `docs/llm-audit.zh.md` describe the current split

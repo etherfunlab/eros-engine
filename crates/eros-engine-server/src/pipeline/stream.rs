@@ -698,7 +698,7 @@ fn drive_chat_burst(
                 last_gen_id = super::record_generation(
                     &state.pool,
                     super::GenerationRecord {
-                        task: "chat_companion",
+                        task: task_name,
                         session_id: Some(session_id),
                         generation_id: last_gen_id.as_deref(),
                         model: Some(model_id.as_str()),
@@ -1077,7 +1077,7 @@ fn drive_chat_burst(
             last_gen_id = super::record_generation(
                 &state.pool,
                 super::GenerationRecord {
-                    task: "chat_companion",
+                    task: task_name,
                     session_id: Some(session_id),
                     generation_id: last_gen_id.as_deref(),
                     model: Some(model_id.as_str()),
@@ -13184,6 +13184,139 @@ data: [DONE]\n\n";
             decision_row.expect("companion_decision_events row must land within timeout");
         assert_eq!(proposed.as_deref(), Some("product_qa"));
         assert_eq!(acted.as_deref(), Some("product_qa"));
+    }
+
+    /// The product_qa reply's generation lands in the parent table under the
+    /// turn's session, and `chat_messages.generation_id` points at the same
+    /// row. product_qa rebinds `last_gen_id` after its candidate loop, like
+    /// voice and unlike the two main chat arms (the bespoke-arm pattern spec
+    /// §4.3 calls out), so this checks the rebind actually wires up both
+    /// halves of the link — same guarantee as the chat-companion arm's
+    /// `chat_companion_generation_is_recorded_and_linked`.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn chat_product_qa_generation_is_recorded_and_linked(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        // Judge ("pde/judge"): a `product_qa` verdict, empty inner_state.
+        let verdict = serde_json::json!({ "action": "product_qa", "inner_state": "" }).to_string();
+        let judge_body = serde_json::json!({
+            "id": "gj", "model": "pde/judge",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": verdict}}],
+        });
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("pde/judge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(judge_body))
+            .mount(&mock)
+            .await;
+
+        // Product-QA executor ("qa/exec"): the terminal SSE chunk carries the
+        // generation id — without one, record_generation short-circuits on
+        // `generation_id: None` and there is nothing to assert.
+        let qa_body = "data: {\"choices\":[{\"delta\":{\"content\":\"这是产品说明\"}}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":5,\"total_tokens\":8},\"id\":\"gen-qa-1\",\"model\":\"qa/exec\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("qa/exec"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(qa_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide the action and inner_state.\"\n\
+                 [tasks.chat_product_qa]\nmodel=\"qa/exec\"\nfilter_prompt=\"Answer using the product docs below.\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "这个产品支持退货吗",
+                "01JPDEQALINK000000000000A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "这个产品支持退货吗".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: None,
+                quote: Default::default(),
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Error { .. })),
+            "unexpected error frame: {frames:?}"
+        );
+
+        let (task, sid): (String, Option<Uuid>) = sqlx::query_as(
+            "SELECT task, session_id FROM engine.llm_generations \
+             WHERE generation_id = 'gen-qa-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("the product_qa reply must record its generation");
+        assert_eq!(task, "chat_product_qa");
+        assert_eq!(
+            sid,
+            Some(session_id),
+            "the product_qa turn's session, not NULL"
+        );
+
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT generation_id FROM engine.chat_messages \
+             WHERE user_message_id = $1 AND role = 'assistant'",
+        )
+        .bind(user_message_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored.as_deref(), Some("gen-qa-1"));
     }
 
     /// Spec §6 failure path: "executor exhausted → fallback text emitted AND

@@ -172,6 +172,12 @@ GROUP BY task ORDER BY cost DESC;
 失败；调用方把这个 `None` 存进自己那个子表的 `generation_id` 列，值为
 `NULL`，回复照常送达，跟审计写入成功时一模一样。
 
+**客户端看到的是同一种降级。** 每条流式链路 wire 上的 `done` 帧，
+`generation_id` 都是从 `record_generation` 的返回值取的，不是直接取自
+provider 响应——所以一次降级的父行写入，连同这一轮客户端收到的那个字段一起
+被清空，不只是数据库里的那一行。这样帧和数据库对得上（都是 `NULL`），这正是
+目的所在，但代价是：一次内部审计写入失败，客户端在 wire 上是看得见的。
+
 **写入降级之后，剩下什么取决于任务。** 五个后台 sweeper（`world_director`、
 `world_stories_director`、`world_comment`、`world_reply`、
 `memory_extraction`）没有自己的子表行——对它们而言，一次降级写入就是彻底丢掉
@@ -193,17 +199,24 @@ GROUP BY task ORDER BY cost DESC;
 数据回填一起把外键补上。在那之前，两边在实践中对得上，但没有约束保证——不要
 从这份文档读出「这个关联今天已经强制生效」的结论。
 
+**`chat_messages.f_generation_id` 是例外：不管是那个后续 release 还是以后
+任何一次，它都不会加外键。** 这是第九个带 `generation_id` 的列——过滤生成
+id，跟上面的 `chat_messages.generation_id` 是两回事——由另一条 `mark_filtered`
+`UPDATE` 路径写入，加约束就得给这条路径单独配一条降级分支，而生产环境里这一列
+非空值只有一个。这是一个永久性决定（设计 spec §7.2），不是像上面八列那样等
+下一个 release 补上的待办。
+
 ### 两个已知的局限
 
 **一条走了好几个 fallback 模型的链路，一轮可能写出好几行。** 每一个拿到过
 `generation_id` 的候选响应都单独落一行，不管它的内容最终有没有被采用——
 每一个都单独计过费，所以每一个都是这张表要记的单位。
 
-**语音和 product-QA 这两条链只记被采用的那次尝试。** 两者都在每个候选开始时
-把手上的 `generation_id` 清空，等候选循环结束后才调用一次
-`record_generation`，用的是被采用的那次尝试留下的值。一个已经流式返回、
-已经计费的候选，如果链路随后换到了下一个模型，就不会留下任何一行。主聊天链路
-是在逐候选循环内部记录的，没有这个缺口。
+**语音链、product-QA 链，以及独立 compose 端点的流式模式，都只记被采用的那次
+尝试。** 三者都在每个候选开始时把手上的 `generation_id` 清空，等候选循环
+结束后才调用一次 `record_generation`，用的是被采用的那次尝试留下的值。一个
+已经流式返回、已经计费的候选，如果链路随后换到了下一个模型，就不会留下任何
+一行。主聊天链路是在逐候选循环内部记录的，没有这个缺口。
 
 ## App-attribution headers
 

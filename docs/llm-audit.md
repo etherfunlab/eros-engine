@@ -184,6 +184,13 @@ failing the turn; the caller stores that `None` as `NULL` in its own child
 `generation_id` column, and the reply is served exactly as it would have
 been.
 
+**The client sees the same degradation.** Every streaming arm's wire `done`
+frame sources its `generation_id` from what `record_generation` returned, not
+from the provider response directly — so a degraded parent write blanks that
+field on the frame the client receives for that turn too, not only the row
+in the database. The frame then matches the DB (both `NULL`), which is the
+point, but it means an internal audit-write failure is visible on the wire.
+
 **What survives a degraded write depends on the task.** The five background
 sweepers (`world_director`, `world_stories_director`, `world_comment`,
 `world_reply`, `memory_extraction`) write no child row of their own — for
@@ -209,6 +216,14 @@ traffic. A later release adds the foreign keys together with a backfill of
 the pre-existing rows. Until then the two sides line up in practice, not by
 constraint — do not read this document as saying the link is enforced today.
 
+**`chat_messages.f_generation_id` is the exception: it never gets one, in
+that later release or any other.** It is a ninth `generation_id`-bearing
+column — the filter generation, distinct from `chat_messages.generation_id`
+above — written by a separate `mark_filtered` `UPDATE` path that would need
+its own degrade branch, and production carries exactly one non-null value in
+it. This is a permanent decision (design spec §7.2), not a later-release
+item like the eight columns above.
+
 ### Two known limits
 
 **A chain that walks several fallback models can write several rows for one
@@ -216,8 +231,9 @@ turn.** Every candidate response that carried a `generation_id` gets its own
 row, whether or not its content is the one ultimately served — each was
 separately billed, so each is the intended unit.
 
-**The voice and product-QA arms record only the served attempt.** Both reset
-their working `generation_id` at the start of every candidate and call
+**The voice arm, the product-QA arm, and the standalone compose endpoint's
+streaming mode record only the served attempt.** All three reset their
+working `generation_id` at the start of every candidate and call
 `record_generation` once, after the candidate loop ends, with whatever the
 served attempt left behind. A candidate that streamed a response — and was
 billed for it — before the chain moved on to another model leaves no row.
