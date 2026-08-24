@@ -29,6 +29,15 @@ use crate::error::AppError;
 /// client-side statement timeout, so an insert that HANGS — as opposed to one
 /// that is refused — stalls the turn indefinitely. This function runs 2-5
 /// times per chat turn, so that exposure is not hypothetical.
+///
+/// What this does NOT do: dropping the future at the timeout does not
+/// guarantee Postgres receives a `CancelRequest`, so a genuinely stuck
+/// statement can keep running server-side and its connection is churned rather
+/// than reused. That residual wants a server-side `statement_timeout`, which no
+/// query in this codebase sets and which is a pool-wide decision — a pgvector
+/// recall is legitimately slower than an audit insert, so one bound cannot
+/// serve both. Bounding the caller is still strictly better than the
+/// alternative: without this, the turn stalls AND the connection is stuck.
 const AUDIT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// One LLM generation, as the call site knows it. Five loose fields rather
