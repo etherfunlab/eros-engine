@@ -1608,8 +1608,6 @@ data: [DONE]\n\n";
                     assistant_action_type: "reply".into(),
                     continues_from_message_id: None,
                     truncated: false,
-                    model: Some("primary".into()),
-                    usage: Some(serde_json::json!({"prompt_tokens":1,"completion_tokens":2,"total_tokens":3})),
                     generation_id: Some("gen-1".into()),
                     filter_audit: None,
                     metadata: None,

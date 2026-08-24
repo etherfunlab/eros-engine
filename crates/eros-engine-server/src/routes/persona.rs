@@ -382,8 +382,6 @@ pub async fn compose_image(
                 caption: None,
                 composed_prompt: None,
                 variant: resolved.variant_key.as_deref(),
-                model: run.last_model.as_deref(),
-                usage: run.last_usage.clone(),
                 generation_id: run.last_generation_id.as_deref(),
                 attempts: run.attempts,
                 last_failure: run.last_failure,
@@ -413,8 +411,6 @@ pub async fn compose_image(
             caption: outcome.caption.as_deref(),
             composed_prompt: Some(composed_prompt.as_str()),
             variant: outcome.variant.as_deref(),
-            model: Some(outcome.model.as_str()),
-            usage: outcome.usage.clone(),
             generation_id: outcome.generation_id.as_deref(),
             attempts: run.attempts,
             last_failure: None,
@@ -773,10 +769,6 @@ async fn compose_stream(
                 caption: None,
                 composed_prompt: None,
                 variant: variant_key.as_deref(),
-                model: last_model.as_deref(),
-                usage: last_usage
-                    .as_ref()
-                    .and_then(|u| serde_json::to_value(u).ok()),
                 generation_id: last_generation_id.as_deref(),
                 attempts,
                 last_failure: Some(last_failure),
@@ -907,8 +899,6 @@ async fn compose_stream(
                         caption: None,
                         composed_prompt: None,
                         variant: variant_key.as_deref(),
-                        model: Some(served_model.as_deref().unwrap_or(attempted_model.as_str())),
-                        usage: usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
                         generation_id: generation_id.as_deref(),
                         attempts,
                         last_failure: Some(died_marker),
@@ -954,8 +944,6 @@ async fn compose_stream(
                         caption: None,
                         composed_prompt: None,
                         variant: variant_key.as_deref(),
-                        model: Some(served_model.as_deref().unwrap_or(attempted_model.as_str())),
-                        usage: usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
                         generation_id: generation_id.as_deref(),
                         attempts,
                         last_failure: Some(last_failure),
@@ -1006,8 +994,6 @@ async fn compose_stream(
                         caption: caption.as_deref(),
                         composed_prompt: Some(composed_prompt.as_str()),
                         variant: variant_key.as_deref(),
-                        model: Some(model.as_str()),
-                        usage: usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
                         generation_id: generation_id.as_deref(),
                         attempts,
                         last_failure: None,
@@ -1554,8 +1540,10 @@ mod tests {
             i16,
             Option<String>,
         ) = sqlx::query_as(
-            "SELECT source, status, subject, composed_prompt, model, attempts, last_failure \
-             FROM engine.chat_images_events",
+            "SELECT e.source, e.status, e.subject, e.composed_prompt, g.model, e.attempts, e.last_failure \
+             FROM engine.chat_images_events e \
+             LEFT JOIN engine.llm_generations g \
+               ON g.generation_id = e.generation_id",
         )
         .fetch_one(&pool)
         .await
@@ -1634,8 +1622,10 @@ mod tests {
             i16,
             Option<String>,
         ) = sqlx::query_as(
-            "SELECT source, status, subject, composed_prompt, session_id, inputs, model, \
-             generation_id, usage, attempts, last_failure FROM engine.chat_images_events",
+            "SELECT e.source, e.status, e.subject, e.composed_prompt, e.session_id, e.inputs, g.model, \
+             e.generation_id, g.usage, e.attempts, e.last_failure FROM engine.chat_images_events e \
+             LEFT JOIN engine.llm_generations g \
+               ON g.generation_id = e.generation_id",
         )
         .fetch_one(&pool)
         .await
@@ -2111,8 +2101,10 @@ mod tests {
             i16,
             Option<String>,
         ) = sqlx::query_as(
-            "SELECT source, status, composed_prompt, model, generation_id, usage, attempts, \
-             last_failure FROM engine.chat_images_events",
+            "SELECT e.source, e.status, e.composed_prompt, g.model, e.generation_id, g.usage, e.attempts, \
+             e.last_failure FROM engine.chat_images_events e \
+             LEFT JOIN engine.llm_generations g \
+               ON g.generation_id = e.generation_id",
         )
         .fetch_one(&pool)
         .await
@@ -2199,8 +2191,10 @@ mod tests {
             i16,
             Option<String>,
         ) = sqlx::query_as(
-            "SELECT source, status, subject, composed_prompt, model, generation_id, \
-             session_id, usage, attempts, last_failure FROM engine.chat_images_events",
+            "SELECT e.source, e.status, e.subject, e.composed_prompt, g.model, e.generation_id, \
+             e.session_id, g.usage, e.attempts, e.last_failure FROM engine.chat_images_events e \
+             LEFT JOIN engine.llm_generations g \
+               ON g.generation_id = e.generation_id",
         )
         .fetch_one(&pool)
         .await
@@ -2285,8 +2279,10 @@ mod tests {
             i16,
             Option<String>,
         ) = sqlx::query_as(
-            "SELECT source, status, subject, composed_prompt, model, generation_id, attempts, \
-             last_failure FROM engine.chat_images_events",
+            "SELECT e.source, e.status, e.subject, e.composed_prompt, g.model, e.generation_id, e.attempts, \
+             e.last_failure FROM engine.chat_images_events e \
+             LEFT JOIN engine.llm_generations g \
+               ON g.generation_id = e.generation_id",
         )
         .fetch_one(&pool)
         .await
@@ -2362,8 +2358,10 @@ mod tests {
             i16,
             Option<String>,
         ) = sqlx::query_as(
-            "SELECT source, status, subject, composed_prompt, model, generation_id, attempts, \
-             last_failure FROM engine.chat_images_events",
+            "SELECT e.source, e.status, e.subject, e.composed_prompt, g.model, e.generation_id, e.attempts, \
+             e.last_failure FROM engine.chat_images_events e \
+             LEFT JOIN engine.llm_generations g \
+               ON g.generation_id = e.generation_id",
         )
         .fetch_one(&pool)
         .await
@@ -2372,11 +2370,18 @@ mod tests {
         assert_eq!(status, "exhausted");
         assert_eq!(subject, None);
         assert_eq!(composed, None);
-        // Neither mocked chunk ever carries a `model`/`id` field, so this
-        // proves the OTHER half of the fix: falling back to the attempted
-        // model id rather than to `None` when the provider never echoes one.
-        assert_eq!(model.as_deref(), Some("composer"));
+        // Neither mocked chunk ever carries a `model` or an `id`. With no id
+        // there is no join key, so since B1 there is no parent row either and
+        // the model is unrecoverable from the database — `record_generation`
+        // short-circuits on a missing id, having already emitted the
+        // `openrouter: call completed` line that names the model. That line is
+        // the only surviving record of this call. Deliberate, not a
+        // regression: the alternative is a second copy of `model` on every
+        // child table to serve a case only a non-conforming provider produces.
+        assert_eq!(model, None, "no generation id ⇒ no parent row to join to");
         assert_eq!(generation_id, None);
+        // What the child row still owns is what it alone knows.
+        assert_eq!(attempts, 1);
         assert_eq!(attempts, 1);
         assert_eq!(last_failure.as_deref(), Some("empty"));
     }
@@ -2434,8 +2439,10 @@ mod tests {
             i16,
             Option<String>,
         ) = sqlx::query_as(
-            "SELECT source, status, subject, composed_prompt, model, generation_id, attempts, \
-             last_failure FROM engine.chat_images_events",
+            "SELECT e.source, e.status, e.subject, e.composed_prompt, g.model, e.generation_id, e.attempts, \
+             e.last_failure FROM engine.chat_images_events e \
+             LEFT JOIN engine.llm_generations g \
+               ON g.generation_id = e.generation_id",
         )
         .fetch_one(&pool)
         .await

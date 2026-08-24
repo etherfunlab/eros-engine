@@ -22,16 +22,6 @@ pub mod world_town;
 
 pub use sqlx::PgPool;
 
-/// OpenRouter call metadata captured for the audit columns on event tables
-/// (`companion_insights_events`, `companion_affinity_events`). All optional —
-/// a non-LLM event (e.g. a gift affinity event) carries the default (all None).
-#[derive(Debug, Clone, Default)]
-pub struct OpenRouterCallMeta {
-    pub generation_id: Option<String>,
-    pub model: Option<String>,
-    pub usage: Option<serde_json::Value>,
-}
-
 /// How many characters of an unparseable LLM reply are kept in a `parse_error`
 /// audit row. Enough to tell a refusal from a truncated object; short enough
 /// that a runaway reply cannot bloat the table.
@@ -545,6 +535,13 @@ mod migration_tests {
         // companion_insights_events — dropped so this test can plant the
         // orphans and the dangling session id that only exist in the
         // pre-0060 world the backfill was written for.
+        //
+        // The seeded child rows below deliberately still write `model` and
+        // `usage`, which B1's code no longer does. That is not a leftover:
+        // those columns are exactly what the backfill READS, and they hold
+        // pre-B1 data until 0061 drops them. When B2 lands, this test's
+        // seeding goes with them and the backfill's model/usage arms become
+        // unreachable — which is fine, because by then it has already run.
         for stmt in [
             "ALTER TABLE engine.chat_messages DROP CONSTRAINT chat_messages_generation_id_fkey",
             "ALTER TABLE engine.companion_affinity_events DROP CONSTRAINT companion_affinity_events_generation_id_fkey",

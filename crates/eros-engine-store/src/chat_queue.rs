@@ -548,8 +548,6 @@ mod tests {
                 assistant_action_type: "reply".into(),
                 continues_from_message_id: None,
                 truncated: false,
-                model: None,
-                usage: None,
                 generation_id: None,
                 filter_audit: None,
                 metadata: None,

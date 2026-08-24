@@ -19,8 +19,8 @@ pub struct DecisionEventInsert<'a> {
     pub proposed_action: Option<&'a str>,
     pub payload: Option<serde_json::Value>,
     pub inputs: Option<serde_json::Value>,
-    pub model: Option<&'a str>,
-    pub usage: Option<serde_json::Value>,
+    /// `record_generation`'s return value. The model and usage for this call
+    /// live in `engine.llm_generations`, reached by joining on this column.
     pub generation_id: Option<&'a str>,
     /// Provider-layer failures for the chains behind this call, as a JSON
     /// array. `None` when nothing failed; an empty array is never written.
@@ -39,9 +39,9 @@ impl DecisionEventRepo<'_> {
         sqlx::query(
             "INSERT INTO engine.companion_decision_events \
                (run_id, user_id, session_id, message_id, status, action, \
-                proposed_action, payload, inputs, model, usage, generation_id, \
+                proposed_action, payload, inputs, generation_id, \
                 llm_attempts, gateway_errors) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
         )
         .bind(ev.run_id)
         .bind(ev.user_id)
@@ -52,8 +52,6 @@ impl DecisionEventRepo<'_> {
         .bind(ev.proposed_action)
         .bind(ev.payload)
         .bind(ev.inputs)
-        .bind(ev.model)
-        .bind(ev.usage)
         .bind(ev.generation_id)
         .bind(ev.llm_attempts)
         .bind(ev.gateway_errors)
@@ -93,8 +91,6 @@ mod tests {
                 "v": 1, "intimacy_rung": 2, "patience_band": "mid",
                 "bond": 0.41, "chemistry": 0.27,
             })),
-            model: Some("x-ai/grok-4-mini"),
-            usage: Some(serde_json::json!({"total_tokens": 12})),
             generation_id: Some("gen_1"),
             llm_attempts: None,
             gateway_errors: None,
@@ -114,8 +110,6 @@ mod tests {
             proposed_action: None,
             payload: Some(serde_json::Value::String("garbage from model".into())),
             inputs: None,
-            model: Some("x-ai/grok-4-mini"),
-            usage: None,
             generation_id: None,
             llm_attempts: None,
             gateway_errors: None,
@@ -175,8 +169,6 @@ mod tests {
                 proposed_action: None,
                 payload: None,
                 inputs: None,
-                model: None,
-                usage: None,
                 generation_id: None,
                 llm_attempts: None,
                 gateway_errors: None,

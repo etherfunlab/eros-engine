@@ -28,8 +28,8 @@ pub struct ImageComposeEventInsert<'a> {
     pub caption: Option<&'a str>,
     pub composed_prompt: Option<&'a str>,
     pub variant: Option<&'a str>,
-    pub model: Option<&'a str>,
-    pub usage: Option<serde_json::Value>,
+    /// `record_generation`'s return value. The model and usage for this call
+    /// live in `engine.llm_generations`, reached by joining on this column.
     pub generation_id: Option<&'a str>,
     /// Models actually called off `[primary, ...fallback]`; 0 when the task is
     /// not configured.
@@ -78,9 +78,9 @@ impl ImageComposeEventRepo<'_> {
         sqlx::query_scalar(
             "INSERT INTO engine.chat_images_events \
                (source, user_id, instance_id, session_id, status, inputs, subject, \
-                caption, composed_prompt, variant, model, usage, generation_id, \
+                caption, composed_prompt, variant, generation_id, \
                 attempts, last_failure, llm_attempts, gateway_errors) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) \
              RETURNING id",
         )
         .bind(ev.source)
@@ -93,8 +93,6 @@ impl ImageComposeEventRepo<'_> {
         .bind(ev.caption)
         .bind(ev.composed_prompt)
         .bind(ev.variant)
-        .bind(ev.model)
-        .bind(ev.usage)
         .bind(ev.generation_id)
         .bind(ev.attempts)
         .bind(ev.last_failure)
@@ -131,8 +129,8 @@ pub struct ChatVisionEventInsert<'a> {
     pub status: &'a str,
     pub image_url: &'a str,
     pub vision: Option<serde_json::Value>,
-    pub model: Option<&'a str>,
-    pub usage: Option<serde_json::Value>,
+    /// `record_generation`'s return value. The model and usage for this call
+    /// live in `engine.llm_generations`, reached by joining on this column.
     pub generation_id: Option<&'a str>,
     /// Models actually called off `[primary, ...fallback]`; 0 when
     /// `[tasks.chat_vision]` is not configured.
@@ -157,9 +155,9 @@ impl ChatVisionEventRepo<'_> {
     pub async fn record(&self, ev: ChatVisionEventInsert<'_>) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO engine.chat_vision_events \
-               (user_id, session_id, message_id, status, image_url, vision, model, \
-                usage, generation_id, attempts, last_failure, llm_attempts, gateway_errors) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+               (user_id, session_id, message_id, status, image_url, vision, \
+                generation_id, attempts, last_failure, llm_attempts, gateway_errors) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
         )
         .bind(ev.user_id)
         .bind(ev.session_id)
@@ -167,8 +165,6 @@ impl ChatVisionEventRepo<'_> {
         .bind(ev.status)
         .bind(ev.image_url)
         .bind(ev.vision)
-        .bind(ev.model)
-        .bind(ev.usage)
         .bind(ev.generation_id)
         .bind(ev.attempts)
         .bind(ev.last_failure)
@@ -216,8 +212,6 @@ mod tests {
                 caption: Some("厨房里的她"),
                 composed_prompt: Some("photorealistic, long black hair, she leans on the counter"),
                 variant: Some("raw"),
-                model: Some("x-ai/grok-4-mini"),
-                usage: Some(serde_json::json!({"total_tokens": 88})),
                 generation_id: Some("gen_compose_1"),
                 attempts: 1,
                 last_failure: None,
@@ -246,8 +240,6 @@ mod tests {
             caption: None,
             composed_prompt: Some("photorealistic portrait"),
             variant: None,
-            model: None,
-            usage: None,
             generation_id: None,
             attempts: 2,
             last_failure: Some("timeout"),
@@ -315,8 +307,6 @@ mod tests {
             status: "ok",
             image_url: "https://example.invalid/a.jpg",
             vision: Some(serde_json::json!({"description": "a cat on a sofa"})),
-            model: Some("vendor/vision-1"),
-            usage: Some(serde_json::json!({"total_tokens": 41})),
             generation_id: Some("gen_vision_1"),
             attempts: 1,
             last_failure: None,
@@ -334,8 +324,6 @@ mod tests {
             status: "not_configured",
             image_url: "https://example.invalid/b.jpg",
             vision: None,
-            model: None,
-            usage: None,
             generation_id: None,
             attempts: 0,
             last_failure: None,
@@ -401,8 +389,6 @@ mod tests {
                 caption: Some("换了条裙子"),
                 composed_prompt: Some("STYLE\n银发红瞳\nSUBJECT"),
                 variant: None,
-                model: Some("m"),
-                usage: None,
                 generation_id: Some("g"),
                 attempts: 1,
                 last_failure: None,
@@ -439,8 +425,6 @@ mod tests {
                 caption: None,
                 composed_prompt: None,
                 variant: None,
-                model: None,
-                usage: None,
                 generation_id: None,
                 attempts: 0,
                 last_failure: None,

@@ -399,7 +399,11 @@ impl<'a> AffinityRepo<'a> {
         tuning: &AffinityTuning,
         event_type: &str,
         context: serde_json::Value,
-        meta: Option<&crate::OpenRouterCallMeta>,
+        // `record_generation`'s return value for the eval call behind this
+        // event, or None when no call was made (a gift event, a gated turn) or
+        // the parent write failed. The model and usage live in
+        // engine.llm_generations, reached by joining on it.
+        generation_id: Option<&str>,
         levels: EndpointLevelReads,
         llm_attempts: Option<serde_json::Value>,
         gateway_errors: Option<serde_json::Value>,
@@ -584,9 +588,9 @@ impl<'a> AffinityRepo<'a> {
         sqlx::query(
             "INSERT INTO engine.companion_affinity_events \
                (affinity_id, event_type, deltas, effective_deltas, label_changes, effective_line_deltas, context, \
-                state_before, state_after, model, usage, generation_id, \
+                state_before, state_after, generation_id, \
                 llm_attempts, gateway_errors, user_message_id) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
         )
         .bind(current.id)
         .bind(event_type)
@@ -597,9 +601,7 @@ impl<'a> AffinityRepo<'a> {
         .bind(context)
         .bind(state_snapshot(&before_affinity))
         .bind(state_snapshot(&current))
-        .bind(meta.and_then(|m| m.model.clone()))
-        .bind(meta.and_then(|m| m.usage.clone()))
-        .bind(meta.and_then(|m| m.generation_id.clone()))
+        .bind(generation_id)
         .bind(llm_attempts)
         .bind(gateway_errors)
         .bind(user_message_id)
@@ -2328,11 +2330,7 @@ mod tests {
 
         // FK-referenced since 0060.
         crate::testutil::seed_generation(&pool, "gen-aff").await;
-        let meta = crate::OpenRouterCallMeta {
-            generation_id: Some("gen-aff".into()),
-            model: Some("aff/m".into()),
-            usage: Some(serde_json::json!({"total_tokens": 9})),
-        };
+
         repo.persist_with_event(
             &mut a,
             &AxisGrades {
@@ -2344,7 +2342,7 @@ mod tests {
             &AffinityTuning::default(),
             "message",
             serde_json::json!({}),
-            Some(&meta),
+            Some("gen-aff"),
             EndpointLevelReads::default(),
             None,
             None,
@@ -2353,17 +2351,28 @@ mod tests {
         .await
         .unwrap();
 
-        let row: (Option<String>, Option<String>, Option<serde_json::Value>) = sqlx::query_as(
-            "SELECT generation_id, model, usage FROM engine.companion_affinity_events \
-             WHERE affinity_id = $1",
+        // Since B1 the event row keeps ONE audit column: the join key. Model
+        // and usage live in engine.llm_generations, keyed on it.
+        let (generation_id, model, usage): (
+            Option<String>,
+            Option<String>,
+            Option<serde_json::Value>,
+        ) = sqlx::query_as(
+            "SELECT e.generation_id, g.model, g.usage \
+               FROM engine.companion_affinity_events e \
+               LEFT JOIN engine.llm_generations g ON g.generation_id = e.generation_id \
+              WHERE e.affinity_id = $1",
         )
         .bind(a.id)
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(row.0.as_deref(), Some("gen-aff"));
-        assert_eq!(row.1.as_deref(), Some("aff/m"));
-        assert_eq!(row.2, Some(serde_json::json!({"total_tokens": 9})));
+        assert_eq!(generation_id.as_deref(), Some("gen-aff"));
+        // `seed_generation` writes the parent with task='test' and no model or
+        // usage; what this pins is that the join reaches it at all, which is
+        // the whole mechanism B2 leaves behind.
+        assert_eq!(model, None);
+        assert_eq!(usage, None);
     }
 
     #[sqlx::test(migrations = "./migrations")]

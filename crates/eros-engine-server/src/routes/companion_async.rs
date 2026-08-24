@@ -390,8 +390,6 @@ mod tests {
                     assistant_action_type: "reply".into(),
                     continues_from_message_id: None,
                     truncated: false,
-                    model: Some("primary".into()),
-                    usage: None,
                     generation_id: Some("gen-1".into()),
                     filter_audit: None,
                     metadata: None,
