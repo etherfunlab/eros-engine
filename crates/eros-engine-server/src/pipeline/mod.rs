@@ -21,14 +21,32 @@ use eros_engine_core::types::ConversationSignals;
 
 use crate::error::AppError;
 
-/// How long the audit write gets before it is abandoned. It covers the pool
-/// acquisition as well as the statement, and it is deliberately shorter than
-/// the pool's own 5s `acquire_timeout`: a turn waiting several seconds on an
-/// audit row is a worse outcome than a missing audit row, which is the same
-/// trade the fail-open contract already makes. Without it, `sqlx` has no
-/// client-side statement timeout, so an insert that HANGS — as opposed to one
-/// that is refused — stalls the turn indefinitely. This function runs 2-5
-/// times per chat turn, so that exposure is not hypothetical.
+/// How long **any** fail-open audit write gets before it is abandoned —
+/// `llm_generations` here, `chat_images_events` and `chat_vision_events` in
+/// `stream.rs`. One constant for all three because they are one operation: a
+/// single-row INSERT into the same Postgres, whose failure costs an audit row
+/// and never a turn. Two bounds for the same operation is two facts where
+/// there is one.
+///
+/// It covers the pool acquisition as well as the statement, and it is
+/// deliberately far below both the pool's 5s `acquire_timeout` and any
+/// LLM-sized budget (`FILTER_TIMEOUT` and its siblings). This is one local
+/// round trip, not a network call to a provider, so an LLM-sized bound would
+/// hide exactly the stall it exists to catch. With no bound at all, `sqlx` has
+/// no client-side statement timeout, so an insert that HANGS — as opposed to
+/// one that is refused — stalls the turn indefinitely.
+///
+/// **The number is chosen against the per-TURN cost, not the per-write one.**
+/// A chat turn makes up to four of these serially on its critical path
+/// (`chat_input_filter`, `pde_decision`, `chat_companion`,
+/// `chat_output_filter`), plus the image / vision events on the paths that
+/// have them — where what waits behind the write is the image marker, the
+/// endpoint's JSON body, the pre-stream 502, or the terminal SSE frame. A
+/// bound that reads as generous per write multiplies: at 2s the
+/// worst case was 8s of a turn spent waiting on audit rows, all of it outside
+/// the LLM timeout budget, and what the user sees is a reply that hangs. A
+/// single-row insert's p99 is milliseconds, so 500ms is still a hundredfold
+/// margin while capping the turn near 2s.
 ///
 /// What this does NOT do: dropping the future at the timeout does not
 /// guarantee Postgres receives a `CancelRequest`, so a genuinely stuck
@@ -38,7 +56,7 @@ use crate::error::AppError;
 /// recall is legitimately slower than an audit insert, so one bound cannot
 /// serve both. Bounding the caller is still strictly better than the
 /// alternative: without this, the turn stalls AND the connection is stuck.
-const AUDIT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const AUDIT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// One LLM generation, as the call site knows it. Five loose fields rather
 /// than a `&ChatResponse`: four streaming arms never own one, and two of them
@@ -128,7 +146,7 @@ pub(super) async fn record_generation(
             tracing::warn!(
                 task = rec.task,
                 generation_id = generation_id,
-                timeout_secs = AUDIT_WRITE_TIMEOUT.as_secs(),
+                timeout_ms = AUDIT_WRITE_TIMEOUT.as_millis(),
                 "llm_generations: audit write timed out; child row will store NULL"
             );
             None
