@@ -165,11 +165,22 @@ GROUP BY task ORDER BY cost DESC;
 
 ### 失败语义：fail-open
 
-父行写入失败时——最常见的原因是 `session_id` 已经解析不出来了——helper 打一条
-`warn!`，返回 `None`，而不是让这一轮失败。调用方把这个 `None` 存进自己那个子表
-的 `generation_id` 列，值为 `NULL`，回复照常送达，跟审计写入成功时一模一样。
-**对那一次调用而言，上面那行 tracing 和 provider 自己的日志，就是仅剩的
-记录**——审计行就这么没了。
+父行写入失败时，schema 本身能造成的结构性原因只有一个：`session_id` 没能通过
+外键校验——`task`、`model`、`usage` 都没有能失败的约束，`generation_id`
+撞车则由 `ON CONFLICT DO NOTHING` 吸收掉了。除此之外的失败都是数据库层面的
+瞬时错误。不管是哪种，helper 都打一条 `warn!`，返回 `None`，而不是让这一轮
+失败；调用方把这个 `None` 存进自己那个子表的 `generation_id` 列，值为
+`NULL`，回复照常送达，跟审计写入成功时一模一样。
+
+**写入降级之后，剩下什么取决于任务。** 五个后台 sweeper（`world_director`、
+`world_stories_director`、`world_comment`、`world_reply`、
+`memory_extraction`）没有自己的子表行——对它们而言，一次降级写入就是彻底丢掉
+这条记录，剩下的只有上面那行 tracing 和 provider 自己的日志。其余任务的子表
+行，`model` 和 `usage` 是直接从 provider 响应里取的，跟 `record_generation`
+返回什么无关（比如 `stream.rs` 的 `AssistantInsert.model` / `.usage`）——
+它们在一次降级写入之后照样保得住。丢掉的只是 join key `generation_id`。
+**等以后某个 release 把这些子表上已经冗余的 `model` / `usage` 列也删掉之后**，
+对它们而言才会变成彻底丢失——见设计 spec §6。
 
 ### 还没有外键
 
@@ -580,11 +591,11 @@ CHECK 里——事后收窄 CHECK 要过一次 migration，而这个仓库的一
 `record_generation`——引擎里每一个 LLM 调用点都会走它——会打一条 info 级别的
 `openrouter: call completed` 日志，带 `generation_id` / `model` 以及
 best-effort 解析出来的 token / cost，并把同样的事实落成一行（见上面的
-[LLM 生成记录表](#llm-生成记录表)）。`chat_companion` 和 `chat_voice`
-这两个调用量最大的任务，额外还有一条 per-attempt 的 `stream_metrics` 事件
-（`model` / `attempt` / `ttft_ms` / `total_ms` / `outcome`），是其它任务没有
-的——那条日志说的是单次尝试的流式耗时，不是生成身份，比这张表出现得更早。
-`audit` 对象本身不写入日志——它只转发给上游，从不回写进引擎日志。
+[LLM 生成记录表](#llm-生成记录表)）。`chat_companion` 额外还有一条
+per-attempt 的 `stream_metrics` 事件（`model` / `attempt` / `ttft_ms` /
+`total_ms` / `outcome`），是其它任务——包括 `chat_voice`——都没有的：那条
+日志说的是单次尝试的流式耗时，不是生成身份，比这张表出现得更早。`audit`
+对象本身不写入日志——它只转发给上游，从不回写进引擎日志。
 
 ## 为什么不持久化？
 

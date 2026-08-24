@@ -175,12 +175,26 @@ GROUP BY task ORDER BY cost DESC;
 
 ### Failure semantics: fail-open
 
-A parent write that fails to land — most likely a `session_id` that no
-longer resolves — logs a `warn!` and returns `None` rather than failing the
-turn. The caller stores that `None` as `NULL` in its own child
+The only structural cause the schema itself can produce for a parent write
+failing is `session_id` failing its foreign key: `task`, `model`, and
+`usage` carry no constraint that can fail, and a `generation_id` collision is
+absorbed by `ON CONFLICT DO NOTHING`. Anything else is a transient database
+error. Either way, the helper logs a `warn!` and returns `None` rather than
+failing the turn; the caller stores that `None` as `NULL` in its own child
 `generation_id` column, and the reply is served exactly as it would have
-been. **For that one call, the tracing line above and the provider's own log
-are the only remaining record** — the audit row is simply gone.
+been.
+
+**What survives a degraded write depends on the task.** The five background
+sweepers (`world_director`, `world_stories_director`, `world_comment`,
+`world_reply`, `memory_extraction`) write no child row of their own — for
+them a degraded write loses the record entirely, and the tracing line above
+plus the provider's own log are what's left. Every other task's child row
+sets its own `model` and `usage` straight from the provider response,
+independent of what `record_generation` returns (e.g. `stream.rs`'s
+`AssistantInsert.model` / `.usage`) — those survive a degraded write today.
+Only the join key, `generation_id`, is lost. **After a later release drops
+the now-redundant `model` / `usage` columns from those child tables**, that
+loss becomes total for them too — see the design spec, §6.
 
 ### No foreign keys yet
 
@@ -654,12 +668,12 @@ describe ran and failed on every chain model" (`exhausted`).
 an `info`-level `openrouter: call completed` event carrying `generation_id`,
 `model`, and best-effort parsed token/cost fields from `usage`, and persists
 the same facts as a row (see [LLM generations
-ledger](#llm-generations-ledger) above). `chat_companion` and `chat_voice`,
-the two highest-volume tasks, additionally log a `stream_metrics` event per
-attempt (`model` / `attempt` / `ttft_ms` / `total_ms` / `outcome`) that the
-other tasks don't emit — that log is about per-attempt stream timing, not
-generation identity, and predates this table. The `audit` object itself is
-not logged — it is forwarded upstream and never echoed into engine logs.
+ledger](#llm-generations-ledger) above). `chat_companion` additionally logs a
+`stream_metrics` event per attempt (`model` / `attempt` / `ttft_ms` /
+`total_ms` / `outcome`) that no other task — including `chat_voice` — emits;
+that log is about per-attempt stream timing, not generation identity, and
+predates this table. The `audit` object itself is not logged — it is
+forwarded upstream and never echoed into engine logs.
 
 ## Why not persist?
 
