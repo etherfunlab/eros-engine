@@ -765,6 +765,24 @@ wrote. That is the intended intermediate state, not a defect to paper over:
 the same generation's model and usage are already in the parent table, reached
 by a join.
 
+**What B1 costs, stated rather than discovered later: a response with no
+`generation_id` now leaves no record in any table.** `record_generation` logs
+the `openrouter: call completed` line and then short-circuits, because the id
+is the primary key — so a provider that answers without one produces a
+billable call whose model exists only in the tracing output. Before B1 the
+child row's own `model` column caught that case, and on the image-composer
+paths it went further: `model` fell back to the *attempted* model id when the
+provider echoed none, which made `model IS NOT NULL` a usable "did the
+provider answer?" test. After B1, `generation_id IS NULL` conflates "nothing
+answered" with "answered without an id"; `attempts` and `last_failure` still
+separate them.
+
+Rare in practice — OpenRouter always returns an id — but real for the
+salvaged-garble fallback in `OpenRouterClient::execute` and for direct
+providers that omit it. Accepted deliberately: the alternative is keeping a
+`model` column on eight tables to serve a case only a non-conforming provider
+produces, which is the exact duplication this table exists to remove.
+
 **Known property, not a Release-B surprise: `llm_generations.model` is
 heterogeneous across tasks.** The two `chat_companion` streaming arms
 (`stream.rs`'s live and filtered arms) record `model: Some(model_id.as_str())`
