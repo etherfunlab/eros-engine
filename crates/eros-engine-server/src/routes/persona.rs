@@ -331,6 +331,7 @@ pub async fn compose_image(
     // the whole chain ⇒ 502 — no portrait fallback on this endpoint (§3.6).
     let run = run_image_prompt_compose(
         &state,
+        None,
         &resolved,
         &render_compose_payload(
             &persona,
@@ -715,6 +716,24 @@ async fn compose_stream(
         // the provider even though it never opened — see the per-arm decisions
         // above.
         let (exhausted_attempts, exhausted_gateways) = split_failures(&chain_failures);
+        // A candidate that streamed metadata and then ended with no content did
+        // get a response from the provider even though it never opened — that
+        // response was billed, so it gets an audit row. No session: standalone
+        // compose endpoint, same rationale as the streamed-through-open site.
+        let usage_json = last_usage
+            .as_ref()
+            .and_then(|u| serde_json::to_value(u).ok());
+        let last_generation_id = crate::pipeline::record_generation(
+            &state.pool,
+            crate::pipeline::GenerationRecord {
+                task: "chat_image_prompt_compose",
+                session_id: None,
+                generation_id: last_generation_id.as_deref(),
+                model: last_model.as_deref(),
+                usage: usage_json.as_ref(),
+            },
+        )
+        .await;
         record_compose_event(
             &state.pool,
             ImageComposeEventInsert {
@@ -809,22 +828,23 @@ async fn compose_stream(
                 }
             }
         }
-        // Usage is logged on EVERY terminal path, failures included: a stream
-        // that died mid-flight may still have been billed, and reconciling
-        // that is this endpoint's job. Same synthesis as the chat path's
-        // streaming arms.
-        crate::pipeline::log_openrouter_usage(
-            "chat_image_prompt_compose",
-            None,
-            &eros_engine_llm::openrouter::ChatResponse {
-                reply: String::new(), // usage log only — never echo content
-                generation_id: generation_id.clone(),
-                model: served_model.clone(),
-                usage: usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
-                finish_reason: None,
-                failures: Vec::new(),
+        // Usage is recorded on EVERY terminal path, failures included: a stream that
+        // died mid-flight may still have been billed, and reconciling that is this
+        // endpoint's job.
+        let usage_json = usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
+        // No session: this is the standalone compose endpoint, which has no
+        // conversation to attach a session id to.
+        let generation_id = crate::pipeline::record_generation(
+            &state.pool,
+            crate::pipeline::GenerationRecord {
+                task: "chat_image_prompt_compose",
+                session_id: None,
+                generation_id: generation_id.as_deref(),
+                model: served_model.as_deref(),
+                usage: usage_json.as_ref(),
             },
-        );
+        )
+        .await;
         let (subject, caption) = parse_compose_reply(acc.trim());
         // Whatever this request's chain lost: the candidates that failed before
         // one opened, plus this one's own death if it died. Whichever arm below

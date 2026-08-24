@@ -854,6 +854,20 @@ pub fn run_voice_turn(
         // gets the FULL unfiltered usage; the wire `Done` frame below gets a
         // separate, hidden-keys-filtered copy (mirrors the text/replay paths).
         let usage_full = last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
+        // Parent row BEFORE the persist below: the chain has ended and nothing
+        // has read `last_gen_id` yet, so the assistant row and the Done frame
+        // both store what came back rather than an id with no parent.
+        last_gen_id = crate::pipeline::record_generation(
+            &state.pool,
+            crate::pipeline::GenerationRecord {
+                task: "chat_voice",
+                session_id: Some(turn.session_id),
+                generation_id: last_gen_id.as_deref(),
+                model: served_model.as_deref(),
+                usage: usage_full.as_ref(),
+            },
+        )
+        .await;
         // Symmetric with the chat stream's assistant row: the resolved 6-bool
         // scope, not a back-projected label (spec 2026-08-14; the legacy
         // `relationship_scope` key shipped for one release in v1.2.0).
@@ -1636,6 +1650,125 @@ data: [DONE]\n\n";
             Some("neutral_and_relationship"),
             "voice assistant rows now audit the resolved memory_scope"
         );
+    }
+
+    /// The voice reply's generation lands in the parent table under the
+    /// turn's own session, and `chat_messages.generation_id` points at that
+    /// same row. Voice rebinds `last_gen_id` after the candidate loop rather
+    /// than inside it (the bespoke-arm pattern spec §4.3 calls out), so this
+    /// checks the rebind actually wires up both halves of the link.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn chat_voice_generation_is_recorded_and_linked(pool: sqlx::PgPool) {
+        use eros_engine_llm::model_config::ModelConfig;
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        // The terminal chunk must carry an `id` — without one, record_generation
+        // short-circuits on `generation_id: None` and there is nothing to assert.
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3},\"id\":\"gen-voice-1\",\"model\":\"primary\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        // Seed persona + instance + session.
+        let user_id = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('V', 'You are V.', '{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let instance_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(genome_id).bind(user_id).fetch_one(&pool).await.unwrap();
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // Persist the user turn as the route would.
+        let repo = ChatRepo { pool: &pool };
+        let umid = match repo
+            .insert_voice_user_message(session_id, "hello", "01J9000000000000000000VOIC2", None)
+            .await
+            .unwrap()
+        {
+            eros_engine_store::chat::VoiceUserInsert::Inserted(id) => id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+
+        // State with a chat_voice task + mock OpenRouter.
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = Arc::new(
+            ModelConfig::from_toml_str(
+                "[tasks.chat_voice]\nmodel = \"primary\"\nmax_tokens = 100\nrecall = false\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let resolved = state.model_config.resolve_voice().unwrap();
+        let frames: Vec<ProtocolFrame> = run_voice_turn(
+            Arc::new(state),
+            VoiceTurn {
+                session_id,
+                instance_id,
+                user_id,
+                user_message_id: umid,
+                content: "hello".into(),
+                affinity_scope: AffinityScope::full(),
+                memory_scope: MemoryScope::default(),
+                session_metadata: serde_json::json!({}),
+            },
+            resolved,
+        )
+        .collect()
+        .await;
+
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Error { .. })),
+            "unexpected error frame: {frames:?}"
+        );
+
+        let (task, sid): (String, Option<Uuid>) = sqlx::query_as(
+            "SELECT task, session_id FROM engine.llm_generations \
+             WHERE generation_id = 'gen-voice-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("the voice reply must record its generation");
+        assert_eq!(task, "chat_voice");
+        assert_eq!(sid, Some(session_id), "the voice turn's session, not NULL");
+
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT generation_id FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored.as_deref(), Some("gen-voice-1"));
     }
 
     /// Task 0 (affinity dead-row fix): `companion_affinity` is session-keyed

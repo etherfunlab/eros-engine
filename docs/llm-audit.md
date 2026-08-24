@@ -90,8 +90,12 @@ Behaviour:
 - Unset or empty → today's pass-through behaviour.
 
 Background paths (`pipeline::dreaming`, `pipeline::post_process`,
-`pipeline::world`, `pipeline::story`) emit usage only as `tracing::info!`
-fields:
+`pipeline::world`, `pipeline::story`) never surface these three fields on a
+client frame — there is no client connected to them. What they do produce,
+via `pipeline::record_generation`, is the same `tracing::info!` line every
+other call site emits, plus — since migration `0059` — one row in
+`engine.llm_generations`; see [LLM generations
+ledger](#llm-generations-ledger) below.
 
 ```
 openrouter: call completed session=… generation_id=… model=…
@@ -101,28 +105,140 @@ prompt_tokens=… completion_tokens=… total_tokens=… cost=…
 - `world_director` — World Memories director sweeper (background). One call
   per enrolled owner per `interval_hours`. `user` =
   `11111111-1111-1111-1111-111111111112` (world subsystem sentinel, distinct
-  from dreaming's `11111111-1111-1111-1111-111111111111`). Usage/cost emitted
-  as tracing fields via `log_openrouter_usage("world_director", None, …)`;
-  nothing on any client frame.
+  from dreaming's `11111111-1111-1111-1111-111111111111`). Recorded as
+  `task = "world_director"`; nothing on any client frame.
 - `world_comment` — World Town hourly comment round (background). One
   batched call per owner with new feed activity. `user` =
   `11111111-1111-1111-1111-111111111112` (shared world-subsystem sentinel).
-  Usage/cost emitted as tracing fields via
-  `log_openrouter_usage("world_comment", None, …)`; nothing on any client
-  frame.
+  Recorded as `task = "world_comment"`; nothing on any client frame.
 - `world_reply` — World Town reply responder (background). One call per
   debounced user comment, capped per owner per UTC day. Same sentinel user;
-  usage/cost emitted as tracing fields via
-  `log_openrouter_usage("world_reply", None, …)`; nothing on any client
-  frame.
+  recorded as `task = "world_reply"`; nothing on any client frame.
 - `world_stories_director` — World Stories director (background), module
   `pipeline::story`. Runs as the second phase of the same sweeper tick as
   `world_director`; one call per claimed persona instance per its own
   `interval_hours`. `user` = `11111111-1111-1111-1111-111111111113` (story
-  subsystem sentinel, continuing the dreaming/world sequence). Usage/cost
-  emitted as tracing fields via
-  `log_openrouter_usage("world_stories_director", None, …)`; nothing on any
-  client frame.
+  subsystem sentinel, continuing the dreaming/world sequence). Recorded as
+  `task = "world_stories_director"`; nothing on any client frame.
+
+## LLM generations ledger
+
+Migration `0059` adds `engine.llm_generations`, one row per **billable LLM
+generation** — a provider response that carried a `generation_id`, which is
+the unit the provider bills and the unit its own log exposes:
+
+```sql
+CREATE TABLE engine.llm_generations (
+    generation_id TEXT PRIMARY KEY,
+    session_id    UUID REFERENCES engine.chat_sessions(id) ON DELETE SET NULL,
+    task          TEXT NOT NULL,
+    model         TEXT,
+    usage         JSONB,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+`pipeline::record_generation` writes this row from every LLM call site in the
+engine, replacing the old `log_openrouter_usage`. It still emits the
+identical `openrouter: call completed` tracing line shown above — the row is
+in addition to that line, not instead of it.
+
+**Full task vocabulary.** Every `[tasks.*]` key that makes a chat-completion
+call now writes here: `chat_companion`, `chat_voice`, `chat_product_qa`,
+`chat_input_filter`, `chat_output_filter`, `chat_vision`,
+`chat_image_prompt_compose`, `chat_image_edit_compose`, `pde_decision`,
+`affinity_evaluation`, `insight_extraction`, `insight_structuring`,
+`character_insight_extraction`, `character_insight_structuring`,
+`user_insight_extraction`, `user_insight_structuring`, `memory_extraction`,
+`world_director`, `world_stories_director`, `world_comment`, `world_reply`.
+
+**Five of those previously wrote nothing to the database at all** —
+`world_director`, `world_stories_director`, `world_comment`, `world_reply`,
+`memory_extraction`. `engine.llm_generations` is now their only record.
+
+### Reading it
+
+`usage` is stored **unfiltered**, `cost` included.
+`OPENROUTER_USAGE_HIDDEN_KEYS` strips keys only on the way out to clients
+(see above); the database has always kept the whole object and continues to.
+
+Cost per task for a window:
+
+```sql
+SELECT task,
+       count(*)                       AS calls,
+       sum((usage->>'cost')::numeric) AS cost
+FROM engine.llm_generations
+WHERE created_at >= now() - interval '7 days'
+GROUP BY task ORDER BY cost DESC;
+```
+
+### Failure semantics: fail-open
+
+The only structural cause the schema itself can produce for a parent write
+failing is `session_id` failing its foreign key: `task`, `model`, and
+`usage` carry no constraint that can fail, and a `generation_id` collision is
+absorbed by `ON CONFLICT DO NOTHING`. Anything else is a transient database
+error. Either way, the helper logs a `warn!` and returns `None` rather than
+failing the turn; the caller stores that `None` as `NULL` in its own child
+`generation_id` column, and the reply is served exactly as it would have
+been.
+
+**The client sees the same degradation.** Every streaming arm's wire `done`
+frame sources its `generation_id` from what `record_generation` returned, not
+from the provider response directly — so a degraded parent write blanks that
+field on the frame the client receives for that turn too, not only the row
+in the database. The frame then matches the DB (both `NULL`), which is the
+point, but it means an internal audit-write failure is visible on the wire.
+
+**What survives a degraded write depends on the task.** The five background
+sweepers (`world_director`, `world_stories_director`, `world_comment`,
+`world_reply`, `memory_extraction`) write no child row of their own — for
+them a degraded write loses the record entirely, and the tracing line above
+plus the provider's own log are what's left. Every other task's child row
+sets its own `model` and `usage` straight from the provider response,
+independent of what `record_generation` returns (e.g. `stream.rs`'s
+`AssistantInsert.model` / `.usage`) — those survive a degraded write today.
+Only the join key, `generation_id`, is lost. **After a later release drops
+the now-redundant `model` / `usage` columns from those child tables**, that
+loss becomes total for them too — see the design spec, §6.
+
+### No foreign keys yet
+
+**The child tables' `generation_id` columns — `chat_messages`,
+`companion_affinity_events`, `companion_insights_events`,
+`companion_decision_events`, `chat_images_events`, `chat_vision_events`,
+`character_insights_events`, `user_insights_events` — do not reference this
+table.** They can't yet: `fly.toml` runs the migration before traffic moves
+to the new machines, so a foreign key shipped in the same release as this
+write path would reject inserts from the previous build still serving live
+traffic. A later release adds the foreign keys together with a backfill of
+the pre-existing rows. Until then the two sides line up in practice, not by
+constraint — do not read this document as saying the link is enforced today.
+
+**`chat_messages.f_generation_id` is the exception: it never gets one, in
+that later release or any other.** It is a ninth `generation_id`-bearing
+column — the filter generation, distinct from `chat_messages.generation_id`
+above — written by a separate `mark_filtered` `UPDATE` path that would need
+its own degrade branch, and production carries exactly one non-null value in
+it. This is a permanent decision (design spec §7.2), not a later-release
+item like the eight columns above.
+
+### Two known limits
+
+**A chain that walks several fallback models can write several rows for one
+turn.** Every candidate response that carried a `generation_id` gets its own
+row, whether or not its content is the one ultimately served — each was
+separately billed, so each is the intended unit.
+
+**The voice arm, the product-QA arm, and the standalone compose endpoint's
+streaming mode record only the served attempt.** All three reset their
+working `generation_id` at the start of every candidate and call
+`record_generation` once, after the candidate loop ends, with whatever the
+served attempt left behind. A candidate that streamed a response — and was
+billed for it — before the chain moved on to another model leaves no row.
+The main chat arms record inside the per-candidate loop itself and do not
+have this gap.
 
 ## App-attribution headers
 
@@ -192,7 +308,11 @@ as shown above.
   (not the retired JSONB blob), and any off-schema key the LLM emits still
   lands in the event payload but nowhere else — a future events↔store
   reconciliation has to compare on payload keys ∩ `human_insights` column
-  set, not full equality.
+  set, not full equality. Since migration `0059`, every one of the calls
+  above — plus `chat_voice`, `chat_product_qa`, `chat_input_filter`,
+  `chat_output_filter`, and the five background sweepers that wrote none of
+  the above — also lands one row in `engine.llm_generations`; see [LLM
+  generations ledger](#llm-generations-ledger) above.
 - **Hash.** The engine does not transform `user` — callers are
   responsible for sending a hash.
 - **Sanitise.** `metadata` keys and values are size / shape-checked,
@@ -560,14 +680,16 @@ describe ran and failed on every chain model" (`exhausted`).
 
 ## Observability
 
-On every successful OpenRouter call *other than* the primary chat reply
-(`chat_companion`) and the voice turn (`chat_voice`), the engine logs an
-`info`-level event carrying `generation_id`, `model`, and best-effort parsed
-token/cost fields from `usage`. Those two highest-volume tasks never call
-that logging helper — their own per-attempt log is a `stream_metrics` event
-(`model` / `attempt` / `ttft_ms` / `total_ms` / `outcome`) with no
-`generation_id` or cost breakdown. The `audit` object itself is not logged —
-it is forwarded upstream and never echoed into engine logs.
+`record_generation` — called from every LLM call site in the engine — logs
+an `info`-level `openrouter: call completed` event carrying `generation_id`,
+`model`, and best-effort parsed token/cost fields from `usage`, and persists
+the same facts as a row (see [LLM generations
+ledger](#llm-generations-ledger) above). `chat_companion` additionally logs a
+`stream_metrics` event per attempt (`model` / `attempt` / `ttft_ms` /
+`total_ms` / `outcome`) that no other task — including `chat_voice` — emits;
+that log is about per-attempt stream timing, not generation identity, and
+predates this table. The `audit` object itself is not logged — it is
+forwarded upstream and never echoed into engine logs.
 
 ## Why not persist?
 

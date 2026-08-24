@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Pipeline module — shared helpers (`compute_signals_for_session`,
-//! `log_openrouter_usage`) plus the chat / post-process / dreaming
+//! `record_generation`) plus the chat / post-process / dreaming
 //! submodules. The streaming chat entry point is `stream::run_stream`.
 
 pub mod chat_queue;
@@ -21,18 +21,62 @@ use eros_engine_core::types::ConversationSignals;
 
 use crate::error::AppError;
 
-/// Emit one structured `openrouter: call completed` log line per call.
-/// Token / cost fields are best-effort parses off the opaque `usage`
-/// JSON — missing fields silently drop out of the line. Called from
-/// every codepath that owns the result of `OpenRouterClient::execute`
-/// (chat, dreaming, post_process), keeping `docs/llm-audit.md`'s
-/// "background paths emit usage only as tracing fields" claim honest.
-pub(super) fn log_openrouter_usage(
-    task: &str,
-    session_id: Option<Uuid>,
-    resp: &eros_engine_llm::openrouter::ChatResponse,
-) {
-    let usage_ref = resp.usage.as_ref();
+/// How long the audit write gets before it is abandoned. It covers the pool
+/// acquisition as well as the statement, and it is deliberately shorter than
+/// the pool's own 5s `acquire_timeout`: a turn waiting several seconds on an
+/// audit row is a worse outcome than a missing audit row, which is the same
+/// trade the fail-open contract already makes. Without it, `sqlx` has no
+/// client-side statement timeout, so an insert that HANGS — as opposed to one
+/// that is refused — stalls the turn indefinitely. This function runs 2-5
+/// times per chat turn, so that exposure is not hypothetical.
+///
+/// What this does NOT do: dropping the future at the timeout does not
+/// guarantee Postgres receives a `CancelRequest`, so a genuinely stuck
+/// statement can keep running server-side and its connection is churned rather
+/// than reused. That residual wants a server-side `statement_timeout`, which no
+/// query in this codebase sets and which is a pool-wide decision — a pgvector
+/// recall is legitimately slower than an audit insert, so one bound cannot
+/// serve both. Bounding the caller is still strictly better than the
+/// alternative: without this, the turn stalls AND the connection is stuck.
+const AUDIT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// One LLM generation, as the call site knows it. Five loose fields rather
+/// than a `&ChatResponse`: four streaming arms never own one, and two of them
+/// used to synthesise a fake with an empty `reply` purely to satisfy this
+/// function's parameter.
+pub(super) struct GenerationRecord<'a> {
+    pub task: &'a str,
+    pub session_id: Option<Uuid>,
+    pub generation_id: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub usage: Option<&'a serde_json::Value>,
+}
+
+/// Record one billable generation to `engine.llm_generations` and emit the
+/// structured `openrouter: call completed` log line. Called from EVERY
+/// codepath that owns an LLM response — including the world, story and
+/// dreaming sweepers, for which this table is the only database record there
+/// is.
+///
+/// **The return value is the contract.** Callers must store what comes back in
+/// their own `generation_id` column, never `resp.generation_id`:
+///
+/// - `Some(id)` — the parent row is committed and may be referenced.
+/// - `None` — upstream gave no id, or the write failed. Store `NULL`.
+///
+/// Fail-open by design: an audit row is recoverable from the tracing line and
+/// from the provider's log, a user's reply is not. Nothing here can fail a
+/// turn, and — see `AUDIT_WRITE_TIMEOUT` — nothing here can stall one either.
+///
+/// Token / cost fields in the log line are best-effort parses off the opaque
+/// `usage` JSON — missing fields silently drop out. The row stores `usage`
+/// whole and unfiltered; `OPENROUTER_USAGE_HIDDEN_KEYS` applies only on the
+/// way out to clients.
+pub(super) async fn record_generation(
+    pool: &sqlx::PgPool,
+    rec: GenerationRecord<'_>,
+) -> Option<String> {
+    let usage_ref = rec.usage;
     let prompt_tokens = usage_ref
         .and_then(|u| u.get("prompt_tokens"))
         .and_then(|v| v.as_u64());
@@ -46,16 +90,50 @@ pub(super) fn log_openrouter_usage(
         .and_then(|u| u.get("cost"))
         .and_then(|v| v.as_f64());
     tracing::info!(
-        task = task,
-        session = ?session_id,
-        generation_id = ?resp.generation_id,
-        model = ?resp.model,
+        task = rec.task,
+        session = ?rec.session_id,
+        generation_id = ?rec.generation_id,
+        model = ?rec.model,
         prompt_tokens = ?prompt_tokens,
         completion_tokens = ?completion_tokens,
         total_tokens = ?total_tokens,
         cost = ?cost,
         "openrouter: call completed"
     );
+
+    let generation_id = rec.generation_id?;
+    let repo = eros_engine_store::generation::LlmGenerationRepo { pool };
+    let write = repo.record(eros_engine_store::generation::LlmGenerationInsert {
+        generation_id,
+        session_id: rec.session_id,
+        task: rec.task,
+        model: rec.model,
+        usage: rec.usage,
+    });
+    match tokio::time::timeout(AUDIT_WRITE_TIMEOUT, write).await {
+        Ok(Ok(())) => Some(generation_id.to_string()),
+        Ok(Err(e)) => {
+            tracing::warn!(
+                task = rec.task,
+                generation_id = generation_id,
+                error = %e,
+                "llm_generations: audit write failed; child row will store NULL"
+            );
+            None
+        }
+        // Distinct message from the error arm: this one means the database (or
+        // the pool) is slow rather than refusing, which is an operational
+        // signal, not a schema one.
+        Err(_) => {
+            tracing::warn!(
+                task = rec.task,
+                generation_id = generation_id,
+                timeout_secs = AUDIT_WRITE_TIMEOUT.as_secs(),
+                "llm_generations: audit write timed out; child row will store NULL"
+            );
+            None
+        }
+    }
 }
 
 /// Walk forward from the first `{` and return the substring up to its
@@ -393,5 +471,88 @@ mod tests {
     fn parse_llm_json_none_when_shape_mismatch() {
         // Valid JSON block, wrong shape: the fallback must also fail typed.
         assert!(super::parse_llm_json::<ParseProbe>(r#"prose {"other": 1} prose"#).is_none());
+    }
+}
+
+#[cfg(test)]
+mod generation_record_tests {
+    use super::*;
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn records_the_row_and_returns_the_id(pool: PgPool) {
+        let usage = serde_json::json!({ "cost": 0.002 });
+        let out = record_generation(
+            &pool,
+            GenerationRecord {
+                task: "pde_decision",
+                session_id: None,
+                generation_id: Some("gen-1"),
+                model: Some("m"),
+                usage: Some(&usage),
+            },
+        )
+        .await;
+        assert_eq!(out.as_deref(), Some("gen-1"));
+
+        let task: String = sqlx::query_scalar(
+            "SELECT task FROM engine.llm_generations WHERE generation_id = 'gen-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(task, "pde_decision");
+    }
+
+    /// No id from upstream ⇒ no row, no query, and the caller stores NULL.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn returns_none_and_writes_nothing_when_upstream_gave_no_id(pool: PgPool) {
+        let out = record_generation(
+            &pool,
+            GenerationRecord {
+                task: "chat_vision",
+                session_id: None,
+                generation_id: None,
+                model: Some("m"),
+                usage: None,
+            },
+        )
+        .await;
+        assert!(out.is_none());
+
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM engine.llm_generations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    /// Fail-open: a parent write that cannot land degrades to `None` so the
+    /// child row stores NULL and the turn survives. Forced here by pointing at
+    /// a session id that does not exist, which the table's own FK rejects.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn degrades_to_none_when_the_write_fails(pool: PgPool) {
+        let out = record_generation(
+            &pool,
+            GenerationRecord {
+                task: "chat_companion",
+                session_id: Some(Uuid::new_v4()), // no such session
+                generation_id: Some("gen-doomed"),
+                model: None,
+                usage: None,
+            },
+        )
+        .await;
+        assert!(
+            out.is_none(),
+            "a failed parent write must degrade, not panic"
+        );
+
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM engine.llm_generations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
     }
 }

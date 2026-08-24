@@ -218,7 +218,17 @@ async fn run_comment_round(
         .execute(req)
         .await
         .map_err(|e| format!("world_comment LLM call failed: {e}"))?;
-    super::log_openrouter_usage("world_comment", None, &raw);
+    super::record_generation(
+        &state.pool,
+        super::GenerationRecord {
+            task: "world_comment",
+            session_id: None,
+            generation_id: raw.generation_id.as_deref(),
+            model: raw.model.as_deref(),
+            usage: raw.usage.as_ref(),
+        },
+    )
+    .await;
 
     let output = parse_comment_output(&raw.reply)
         .ok_or_else(|| "world_comment output did not parse".to_string())?;
@@ -330,7 +340,17 @@ async fn run_reply(
         .execute(req)
         .await
         .map_err(|e| format!("world_reply LLM call failed: {e}"))?;
-    super::log_openrouter_usage("world_reply", None, &raw);
+    super::record_generation(
+        &state.pool,
+        super::GenerationRecord {
+            task: "world_reply",
+            session_id: None,
+            generation_id: raw.generation_id.as_deref(),
+            model: raw.model.as_deref(),
+            usage: raw.usage.as_ref(),
+        },
+    )
+    .await;
 
     let content = raw.reply.trim();
     if content.is_empty() {
@@ -641,6 +661,14 @@ mod tests {
         run_comment_round(&state, &resolved, owner)
             .await
             .expect("noop ok");
+
+        let model: Option<String> = sqlx::query_scalar(
+            "SELECT model FROM engine.llm_generations WHERE task = 'world_comment'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("the sweeper must record its generation");
+        assert!(model.is_some());
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -736,6 +764,14 @@ mod tests {
             last_reply_at, None,
             "cap skip should not burn cooldown on fresh post"
         );
+
+        let model: Option<String> = sqlx::query_scalar(
+            "SELECT model FROM engine.llm_generations WHERE task = 'world_reply'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("the sweeper must record its generation");
+        assert!(model.is_some());
     }
 
     #[test]

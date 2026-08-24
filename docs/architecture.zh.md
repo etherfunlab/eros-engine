@@ -106,8 +106,8 @@ eros-engine-server :8080
     │              │
     │              ▼
     ├─► routes::persona（/persona/{instance_id}/image/compose）
-    │       └─► 出图 prompt 合成器 LLM——落一行到 chat_images_events，
-    │           其余不落任何表（无聊天状态、无好感度、无记忆）
+    │       └─► 出图 prompt 合成器 LLM——落一行到 chat_images_events 和
+    │           llm_generations；无聊天状态、无好感度、无记忆
     │
     └────────────► Postgres（`engine` schema）
                        chat_sessions / chat_messages
@@ -117,6 +117,7 @@ eros-engine-server :8080
                        human_insights
                        companion_decision_events
                        chat_images_events / chat_vision_events
+                       llm_generations（每次 LLM 调用，审计）
 ```
 
 post-process spawn 返回 `()` 是 fire-and-forget 設計——用戶面前的響應不會被 affinity / memory / insight 寫入阻塞。它們任何一個失敗，對話回覆還是會落地；失敗會記日誌但不會冒給用戶。

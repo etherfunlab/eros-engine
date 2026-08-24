@@ -378,6 +378,7 @@ async fn edit_image(
         .expect("has_task checked above");
     let run = run_image_prompt_compose(
         &state,
+        Some(session_id),
         &resolved,
         &render_edit_payload(
             &persona,

@@ -703,13 +703,16 @@ fn eval_skip_reason(
     }
 }
 
-/// Marker for a *successful* eval whose response still carried no OpenRouter
-/// `generation_id` — the join key to the OpenRouter log. The salvaged-garble
-/// fallback in `OpenRouterClient::execute` returns `Ok` with `generation_id:
-/// None` (and `usage: None`), so "the call returned `Ok`" does not by itself
-/// guarantee an audit trail. Without the id the row can't be tied to an
-/// OpenRouter record, so it still needs an explanation. `None` ⇒ a usable id is
-/// present.
+/// Marker for a *successful* eval whose `meta.generation_id` came back `None`
+/// — the join key to both the OpenRouter log and this call's
+/// `engine.llm_generations` row. Two distinct causes land here and this
+/// marker does not distinguish them: the salvaged-garble fallback in
+/// `OpenRouterClient::execute` can return `Ok` with `generation_id: None`
+/// (and `usage: None`) even though the call succeeded, and separately
+/// `record_generation` itself returns `None` when the provider DID give an
+/// id but the parent-table write failed (llm-generations-audit spec §6).
+/// Either way "the call returned `Ok`" does not by itself guarantee an audit
+/// trail. `None` ⇒ a usable id is present.
 fn meta_skip_reason(meta: &eros_engine_store::OpenRouterCallMeta) -> Option<&'static str> {
     meta.generation_id
         .is_none()
@@ -824,9 +827,19 @@ async fn evaluate_affinity(
     let (raw, meta, recovered) =
         match tokio::time::timeout(AFFINITY_EVAL_TIMEOUT, state.openrouter.execute(req)).await {
             Ok(Ok(resp)) => {
-                super::log_openrouter_usage(AFFINITY_TASK, Some(session_id), &resp);
+                let generation_id = super::record_generation(
+                    &state.pool,
+                    super::GenerationRecord {
+                        task: AFFINITY_TASK,
+                        session_id: Some(session_id),
+                        generation_id: resp.generation_id.as_deref(),
+                        model: resp.model.as_deref(),
+                        usage: resp.usage.as_ref(),
+                    },
+                )
+                .await;
                 let meta = eros_engine_store::OpenRouterCallMeta {
-                    generation_id: resp.generation_id.clone(),
+                    generation_id,
                     model: resp.model.clone(),
                     usage: resp.usage.clone(),
                 };
@@ -901,7 +914,7 @@ async fn evaluate_affinity(
 const INSIGHT_TASK: &str = "insight_extraction";
 
 /// Stage 2 of the human chain. Split out from `INSIGHT_TASK` so the engine's
-/// own `log_openrouter_usage` line and `[[providers.*.body]]` rules can tell
+/// own `record_generation` call and `[[providers.*.body]]` rules can tell
 /// the two stages apart, and so `max_tokens` stops being one number covering
 /// two very different outputs. This does NOT help OpenRouter-side accounting:
 /// `task` is config routing only and is never serialized to the wire (see
@@ -920,11 +933,15 @@ struct CallAudit {
     meta: eros_engine_store::OpenRouterCallMeta,
 }
 
+/// `generation_id` must be `record_generation`'s return value, never
+/// `resp.generation_id` — a caller passing the raw field would compile and
+/// silently reopen the unlaundered path this table exists to close.
 fn call_meta(
     resp: &eros_engine_llm::openrouter::ChatResponse,
+    generation_id: Option<String>,
 ) -> eros_engine_store::OpenRouterCallMeta {
     eros_engine_store::OpenRouterCallMeta {
-        generation_id: resp.generation_id.clone(),
+        generation_id,
         model: resp.model.clone(),
         usage: resp.usage.clone(),
     }
@@ -948,6 +965,7 @@ async fn extract_insights(
     let (facts, facts_audit) = extract_facts(
         &state.openrouter,
         &state.model_config,
+        &state.pool,
         session_id,
         user_msg,
         assistant_msg,
@@ -982,6 +1000,7 @@ async fn extract_insights(
     let (new_insights, struct_audit) = extract_structured_insights(
         &state.openrouter,
         &state.model_config,
+        &state.pool,
         session_id,
         &facts,
         existing.as_ref(),
@@ -1039,6 +1058,7 @@ async fn write_insight_event(
 async fn extract_facts(
     llm: &OpenRouterClient,
     model_config: &ModelConfig,
+    pool: &sqlx::PgPool,
     session_id: Uuid,
     user_msg: &str,
     assistant_msg: &str,
@@ -1078,8 +1098,21 @@ async fn extract_facts(
 
     let (raw, meta) = match llm.execute(req).await {
         Ok(resp) => {
-            super::log_openrouter_usage(INSIGHT_TASK, Some(session_id), &resp);
-            (resp.reply.trim().to_string(), call_meta(&resp))
+            let generation_id = super::record_generation(
+                pool,
+                super::GenerationRecord {
+                    task: INSIGHT_TASK,
+                    session_id: Some(session_id),
+                    generation_id: resp.generation_id.as_deref(),
+                    model: resp.model.as_deref(),
+                    usage: resp.usage.as_ref(),
+                },
+            )
+            .await;
+            (
+                resp.reply.trim().to_string(),
+                call_meta(&resp, generation_id),
+            )
         }
         Err(e) => {
             tracing::warn!("fact extraction LLM call failed: {e}");
@@ -1138,6 +1171,7 @@ fn extract_details_array(v: &serde_json::Value) -> Vec<serde_json::Value> {
 async fn extract_structured_insights(
     llm: &OpenRouterClient,
     model_config: &ModelConfig,
+    pool: &sqlx::PgPool,
     session_id: Uuid,
     facts: &[String],
     existing_insights: Option<&serde_json::Value>,
@@ -1169,8 +1203,18 @@ async fn extract_structured_insights(
 
     let (raw, meta) = match llm.execute(req).await {
         Ok(r) => {
-            super::log_openrouter_usage(INSIGHT_STRUCTURING_TASK, Some(session_id), &r);
-            (r.reply.trim().to_string(), call_meta(&r))
+            let generation_id = super::record_generation(
+                pool,
+                super::GenerationRecord {
+                    task: INSIGHT_STRUCTURING_TASK,
+                    session_id: Some(session_id),
+                    generation_id: r.generation_id.as_deref(),
+                    model: r.model.as_deref(),
+                    usage: r.usage.as_ref(),
+                },
+            )
+            .await;
+            (r.reply.trim().to_string(), call_meta(&r, generation_id))
         }
         Err(_) => return (empty(), None),
     };
@@ -1382,8 +1426,21 @@ async fn extract_character_facts(
 
     let (raw, meta) = match state.openrouter.execute(req).await {
         Ok(resp) => {
-            super::log_openrouter_usage(CHARACTER_EXTRACTION_TASK, Some(session_id), &resp);
-            (resp.reply.trim().to_string(), call_meta(&resp))
+            let generation_id = super::record_generation(
+                &state.pool,
+                super::GenerationRecord {
+                    task: CHARACTER_EXTRACTION_TASK,
+                    session_id: Some(session_id),
+                    generation_id: resp.generation_id.as_deref(),
+                    model: resp.model.as_deref(),
+                    usage: resp.usage.as_ref(),
+                },
+            )
+            .await;
+            (
+                resp.reply.trim().to_string(),
+                call_meta(&resp, generation_id),
+            )
         }
         Err(e) => {
             tracing::warn!("character fact extraction LLM call failed: {e}");
@@ -1462,8 +1519,18 @@ async fn structure_character_insights(
 
     let (raw, meta) = match state.openrouter.execute(req).await {
         Ok(r) => {
-            super::log_openrouter_usage(CHARACTER_STRUCTURING_TASK, Some(session_id), &r);
-            (r.reply.trim().to_string(), call_meta(&r))
+            let generation_id = super::record_generation(
+                &state.pool,
+                super::GenerationRecord {
+                    task: CHARACTER_STRUCTURING_TASK,
+                    session_id: Some(session_id),
+                    generation_id: r.generation_id.as_deref(),
+                    model: r.model.as_deref(),
+                    usage: r.usage.as_ref(),
+                },
+            )
+            .await;
+            (r.reply.trim().to_string(), call_meta(&r, generation_id))
         }
         Err(e) => {
             tracing::warn!("character structuring LLM call failed: {e}");
@@ -1680,8 +1747,21 @@ async fn extract_user_facts(
 
     let (raw, meta) = match state.openrouter.execute(req).await {
         Ok(resp) => {
-            super::log_openrouter_usage(USER_EXTRACTION_TASK, Some(session_id), &resp);
-            (resp.reply.trim().to_string(), call_meta(&resp))
+            let generation_id = super::record_generation(
+                &state.pool,
+                super::GenerationRecord {
+                    task: USER_EXTRACTION_TASK,
+                    session_id: Some(session_id),
+                    generation_id: resp.generation_id.as_deref(),
+                    model: resp.model.as_deref(),
+                    usage: resp.usage.as_ref(),
+                },
+            )
+            .await;
+            (
+                resp.reply.trim().to_string(),
+                call_meta(&resp, generation_id),
+            )
         }
         Err(e) => {
             tracing::warn!("user fact extraction LLM call failed: {e}");
@@ -1754,8 +1834,18 @@ async fn structure_user_insights(
 
     let (raw, meta) = match state.openrouter.execute(req).await {
         Ok(r) => {
-            super::log_openrouter_usage(USER_STRUCTURING_TASK, Some(session_id), &r);
-            (r.reply.trim().to_string(), call_meta(&r))
+            let generation_id = super::record_generation(
+                &state.pool,
+                super::GenerationRecord {
+                    task: USER_STRUCTURING_TASK,
+                    session_id: Some(session_id),
+                    generation_id: r.generation_id.as_deref(),
+                    model: r.model.as_deref(),
+                    usage: r.usage.as_ref(),
+                },
+            )
+            .await;
+            (r.reply.trim().to_string(), call_meta(&r, generation_id))
         }
         Err(e) => {
             tracing::warn!("user structuring LLM call failed: {e}");
