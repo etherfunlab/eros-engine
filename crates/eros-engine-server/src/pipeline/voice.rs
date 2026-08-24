@@ -859,17 +859,26 @@ pub fn run_voice_turn(
         // unfiltered usage; the wire `Done` frame below gets a separate,
         // hidden-keys-filtered copy (mirrors the text/replay paths).
         let usage_full = last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
-        last_gen_id = crate::pipeline::record_generation(
-            &state.pool,
-            crate::pipeline::GenerationRecord {
-                task: "chat_voice",
-                session_id: Some(turn.session_id),
-                generation_id: last_gen_id.as_deref(),
-                model: served_model.as_deref(),
-                usage: usage_full.as_ref(),
-            },
-        )
-        .await;
+        // Guarded on `is_some()`, and the guard is not an optimisation:
+        // `record_generation` emits `openrouter: call completed` BEFORE it
+        // short-circuits on a missing id. The old position was only reachable
+        // once a candidate had answered; this one is reachable when the whole
+        // chain failed without any provider ever responding, and an unguarded
+        // call would log a completed call that never happened. The assignment is
+        // a no-op in that case anyway — `record_generation(None)` returns `None`.
+        if last_gen_id.is_some() {
+            last_gen_id = crate::pipeline::record_generation(
+                &state.pool,
+                crate::pipeline::GenerationRecord {
+                    task: "chat_voice",
+                    session_id: Some(turn.session_id),
+                    generation_id: last_gen_id.as_deref(),
+                    model: served_model.as_deref(),
+                    usage: usage_full.as_ref(),
+                },
+            )
+            .await;
+        }
 
         // Any empty accumulation — no successful open, or a stream that sent
         // only metadata (id/model) and then errored or ended without content
@@ -1948,7 +1957,7 @@ data: [DONE]\n\n";
         // Metadata-only frame (no content delta) then a clean [DONE] — the
         // stream ends without ever producing text.
         let body = "\
-data: {\"choices\":[{\"delta\":{}}],\"id\":\"gen-e\",\"model\":\"primary\"}\n\n\
+data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":13,\"completion_tokens\":0,\"total_tokens\":13},\"id\":\"gen-e\",\"model\":\"primary\"}\n\n\
 data: [DONE]\n\n";
         Mock::given(wm_path("/api/v1/chat/completions"))
             .respond_with(
@@ -2053,13 +2062,17 @@ data: [DONE]\n\n";
             "no assistant row should be persisted on empty completion"
         );
 
-        // Design spec §4.5, Loss 2: the provider answered — it sent an id and a
-        // model — so the call was billed even though it produced no content and
-        // this arm returns without persisting anything. The audit row is the
-        // ONLY record of that spend, which is why `record_generation` sits above
-        // the empty-accumulation return rather than after it.
-        let (task, sid): (String, Option<Uuid>) = sqlx::query_as(
-            "SELECT task, session_id FROM engine.llm_generations \
+        // Design spec §4.5, Loss 2: the provider answered — it sent an id, a
+        // model and usage — so the call was billed even though it produced no
+        // content and this arm returns without persisting anything. The audit
+        // row is the ONLY record of that spend, which is why `record_generation`
+        // sits above the empty-accumulation return rather than after it.
+        //
+        // `usage` is asserted, not just the row's existence: the fix moves a
+        // `let` as well as a call, and a move that leaves `usage_full` behind
+        // still compiles and still writes a row — just an empty one.
+        let (task, sid, usage): (String, Option<Uuid>, Option<serde_json::Value>) = sqlx::query_as(
+            "SELECT task, session_id, usage FROM engine.llm_generations \
              WHERE generation_id = 'gen-e'",
         )
         .fetch_one(&pool)
@@ -2067,6 +2080,14 @@ data: [DONE]\n\n";
         .expect("a metadata-only candidate was still billed and must record a row");
         assert_eq!(task, "chat_voice");
         assert_eq!(sid, Some(session_id));
+        assert_eq!(
+            usage
+                .as_ref()
+                .and_then(|u| u.get("prompt_tokens"))
+                .and_then(|v| v.as_u64()),
+            Some(13),
+            "the usage must travel with the call, not be left behind by the move"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

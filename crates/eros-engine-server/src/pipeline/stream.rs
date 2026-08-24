@@ -4499,18 +4499,30 @@ pub fn run_stream(
                 // hoisted value here would plant it right back. The audit row
                 // wants the billed truth, the message row wants the reset — two
                 // questions, two values.
-                let audit_usage = last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
-                last_gen_id = super::record_generation(
-                    &state.pool,
-                    super::GenerationRecord {
-                        task: PRODUCT_QA_TASK,
-                        session_id: Some(user_msg.session_id),
-                        generation_id: last_gen_id.as_deref(),
-                        model: served_model.as_deref(),
-                        usage: audit_usage.as_ref(),
-                    },
-                )
-                .await;
+                //
+                // Guarded on `is_some()`, and the guard is not an optimisation:
+                // `record_generation` emits `openrouter: call completed` BEFORE
+                // it short-circuits on a missing id. The old position was only
+                // reachable once a candidate had answered; this one is reachable
+                // when the whole chain failed without any provider ever
+                // responding, and an unguarded call would log a completed call
+                // that never happened. The assignment is a no-op in that case
+                // anyway — `record_generation(None)` returns `None`.
+                if last_gen_id.is_some() {
+                    let audit_usage =
+                        last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
+                    last_gen_id = super::record_generation(
+                        &state.pool,
+                        super::GenerationRecord {
+                            task: PRODUCT_QA_TASK,
+                            session_id: Some(user_msg.session_id),
+                            generation_id: last_gen_id.as_deref(),
+                            model: served_model.as_deref(),
+                            usage: audit_usage.as_ref(),
+                        },
+                    )
+                    .await;
+                }
 
                 // Chain exhausted with nothing streamed: error_handling fallback
                 // phrase, persisted WITH the channel marker so replay/idempotency
