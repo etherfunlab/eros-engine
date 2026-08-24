@@ -21,6 +21,16 @@ use eros_engine_core::types::ConversationSignals;
 
 use crate::error::AppError;
 
+/// How long the audit write gets before it is abandoned. It covers the pool
+/// acquisition as well as the statement, and it is deliberately shorter than
+/// the pool's own 5s `acquire_timeout`: a turn waiting several seconds on an
+/// audit row is a worse outcome than a missing audit row, which is the same
+/// trade the fail-open contract already makes. Without it, `sqlx` has no
+/// client-side statement timeout, so an insert that HANGS — as opposed to one
+/// that is refused — stalls the turn indefinitely. This function runs 2-5
+/// times per chat turn, so that exposure is not hypothetical.
+const AUDIT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// One LLM generation, as the call site knows it. Five loose fields rather
 /// than a `&ChatResponse`: four streaming arms never own one, and two of them
 /// used to synthesise a fake with an empty `reply` purely to satisfy this
@@ -47,7 +57,7 @@ pub(super) struct GenerationRecord<'a> {
 ///
 /// Fail-open by design: an audit row is recoverable from the tracing line and
 /// from the provider's log, a user's reply is not. Nothing here can fail a
-/// turn.
+/// turn, and — see `AUDIT_WRITE_TIMEOUT` — nothing here can stall one either.
 ///
 /// Token / cost fields in the log line are best-effort parses off the opaque
 /// `usage` JSON — missing fields silently drop out. The row stores `usage`
@@ -84,23 +94,33 @@ pub(super) async fn record_generation(
 
     let generation_id = rec.generation_id?;
     let repo = eros_engine_store::generation::LlmGenerationRepo { pool };
-    match repo
-        .record(eros_engine_store::generation::LlmGenerationInsert {
-            generation_id,
-            session_id: rec.session_id,
-            task: rec.task,
-            model: rec.model,
-            usage: rec.usage,
-        })
-        .await
-    {
-        Ok(()) => Some(generation_id.to_string()),
-        Err(e) => {
+    let write = repo.record(eros_engine_store::generation::LlmGenerationInsert {
+        generation_id,
+        session_id: rec.session_id,
+        task: rec.task,
+        model: rec.model,
+        usage: rec.usage,
+    });
+    match tokio::time::timeout(AUDIT_WRITE_TIMEOUT, write).await {
+        Ok(Ok(())) => Some(generation_id.to_string()),
+        Ok(Err(e)) => {
             tracing::warn!(
                 task = rec.task,
                 generation_id = generation_id,
                 error = %e,
                 "llm_generations: audit write failed; child row will store NULL"
+            );
+            None
+        }
+        // Distinct message from the error arm: this one means the database (or
+        // the pool) is slow rather than refusing, which is an operational
+        // signal, not a schema one.
+        Err(_) => {
+            tracing::warn!(
+                task = rec.task,
+                generation_id = generation_id,
+                timeout_secs = AUDIT_WRITE_TIMEOUT.as_secs(),
+                "llm_generations: audit write timed out; child row will store NULL"
             );
             None
         }
