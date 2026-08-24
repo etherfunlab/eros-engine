@@ -357,25 +357,39 @@ rows carried one** — the reason is below the query, and it is not a detail:
 
 ```sql
 SELECT task,
-       count(*)                                  AS calls,
-       count(*) FILTER (WHERE usage ? 'cost')    AS priced,
-       sum((usage->>'cost')::numeric)            AS cost_of_priced
+       count(*)                                                       AS calls,
+       count(*) FILTER (WHERE jsonb_typeof(usage->'cost') = 'number') AS priced,
+       sum((usage->>'cost')::numeric)
+         FILTER (WHERE jsonb_typeof(usage->'cost') = 'number')        AS cost_of_priced
 FROM engine.llm_generations
 WHERE created_at >= now() - interval '7 days'
 GROUP BY task ORDER BY cost_of_priced DESC NULLS LAST;
 ```
 
-`usage` is stored **unfiltered**, including `cost`. `OPENROUTER_USAGE_HIDDEN_KEYS`
-strips keys on the way out to clients only; the database has always kept the
-whole object and continues to.
+**The filter tests the value's type, not the key's presence, and both halves
+need it.** `usage ? 'cost'` is the obvious spelling and is wrong twice over:
+a `"cost": null` counts as priced while contributing nothing to the sum, so
+`priced` overstates coverage; and a non-numeric value — `"cost": "unknown"`,
+or an object — makes `::numeric` **raise** and abort the whole query rather
+than yielding `NULL`. `jsonb_typeof(usage->'cost') = 'number'` is false for
+both, and for a missing key and a `NULL` `usage`, so no unparseable value ever
+reaches the cast. `usage` is written verbatim from a provider's response; the
+engine does not validate its shape and should not have to.
+
+`usage` is stored **unfiltered** — whatever the provider sent, `cost` included
+when the provider sent one. `OPENROUTER_USAGE_HIDDEN_KEYS` strips keys on the
+way out to clients only; the database has always kept the whole object and
+continues to.
 
 **`cost` is a provider-dependent key, not a guaranteed one.** OpenRouter
 returns it; Venice direct does not put it in `usage` at all. Measured on
 production 22 minutes after 1.6.1 went live: 44 of 204 rows carried a `cost`
 (21.6%), with 160 rows served by Venice direct.
 
-`priced` is what makes the number readable. A task served entirely by Venice
-sums to `NULL`, which is honest. **The dangerous case is a mixed task**: at
+`priced` is what makes the number readable: it is the count of rows carrying a
+**numeric** cost, which is exactly the set the sum is over. A task served
+entirely by Venice sums to `NULL`, which is honest. **The dangerous case is a
+mixed task**: at
 that measurement `chat_companion` ran on both `deepseek/deepseek-v4-flash-0731`
 (OpenRouter, priced) and `gemma-4-uncensored@venice` (unpriced), so a bare
 `sum(cost)` returned a plausible figure covering 18 of its 27 calls. A number

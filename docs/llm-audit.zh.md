@@ -157,20 +157,29 @@ completed` tracing——落库是额外加的，不是取代那行日志。
 
 ```sql
 SELECT task,
-       count(*)                                AS calls,
-       count(*) FILTER (WHERE usage ? 'cost')  AS priced,
-       sum((usage->>'cost')::numeric)          AS cost_of_priced
+       count(*)                                                       AS calls,
+       count(*) FILTER (WHERE jsonb_typeof(usage->'cost') = 'number') AS priced,
+       sum((usage->>'cost')::numeric)
+         FILTER (WHERE jsonb_typeof(usage->'cost') = 'number')        AS cost_of_priced
 FROM engine.llm_generations
 WHERE created_at >= now() - interval '7 days'
 GROUP BY task ORDER BY cost_of_priced DESC NULLS LAST;
 ```
 
+**两处过滤判的都是值的类型，不是键在不在。** `usage ? 'cost'` 是最顺手的写法，
+但它错两次：`"cost": null` 会被算成 priced，却一分钱也不进那个 sum；而一个非数字
+的值——`"cost": "unknown"`，或者一个对象——会让 `::numeric` **直接抛错**，整条
+查询中断，而不是返回 `NULL`。`usage` 是供应商响应的原样落库，engine 不校验它的
+形状，所以只能由查询来判。`jsonb_typeof(usage->'cost') = 'number'` 对 JSON null、
+非数字、键不存在、`usage` 整个为 `NULL` 这四种情况一律为假。
+
 **`cost` 是取决于供应商的键，不是保证有的。** OpenRouter 会在 `usage` 里返回
 它，Venice 直连则完全不发这个键。同时用了两者的部署——参考部署就是——只有一部分
 行带 `cost`。
 
-`priced` 是让这个和能读的那一列。整条链路都跑在不带价的供应商上的 task，和是
-`NULL`，这很诚实、也一眼看得出。有坑的是**混合**的 task：一个 `[tasks.*]` 的主
+`priced` 是让这个和能读的那一列：它数的是带着**数值型** cost 的行，也正是那个
+sum 求和的范围。整条链路都跑在不带价的供应商上的 task，和是 `NULL`，这很诚实、
+也一眼看得出。有坑的是**混合**的 task：一个 `[tasks.*]` 的主
 模型带价、fallback 不带价，那么它会给出一个看着挺像样的总额，实际只覆盖了一部分
 调用。先看 `priced / calls`，再决定信不信 `cost_of_priced`。
 

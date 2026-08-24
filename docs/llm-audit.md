@@ -168,20 +168,32 @@ rows carried one:**
 
 ```sql
 SELECT task,
-       count(*)                                AS calls,
-       count(*) FILTER (WHERE usage ? 'cost')  AS priced,
-       sum((usage->>'cost')::numeric)          AS cost_of_priced
+       count(*)                                                       AS calls,
+       count(*) FILTER (WHERE jsonb_typeof(usage->'cost') = 'number') AS priced,
+       sum((usage->>'cost')::numeric)
+         FILTER (WHERE jsonb_typeof(usage->'cost') = 'number')        AS cost_of_priced
 FROM engine.llm_generations
 WHERE created_at >= now() - interval '7 days'
 GROUP BY task ORDER BY cost_of_priced DESC NULLS LAST;
 ```
 
+**Both halves filter on the value's type, not on the key's presence.**
+`usage ? 'cost'` is the obvious spelling and is wrong twice: a `"cost": null`
+counts as priced while adding nothing to the sum, and a non-numeric value —
+`"cost": "unknown"`, or an object — makes `::numeric` **raise** and abort the
+query instead of yielding `NULL`. `usage` is stored verbatim from the
+provider's response and the engine does not validate its shape, so the query
+has to. `jsonb_typeof(usage->'cost') = 'number'` is false for a JSON null, a
+non-number, a missing key, and a `NULL` `usage` alike.
+
 **`cost` is a provider-dependent key.** OpenRouter returns it inside `usage`;
 Venice direct does not emit it at all. A deployment that mixes the two — as
 the reference one does — gets `cost` on only part of its rows.
 
-`priced` is what makes the sum readable. A task served entirely by an
-unpriced provider sums to `NULL`, which is honest and obvious. The trap is a
+`priced` is what makes the sum readable: it counts the rows carrying a
+**numeric** cost, which is exactly the set the sum is taken over. A task
+served entirely by an unpriced provider sums to `NULL`, which is honest and
+obvious. The trap is a
 **mixed** task: one `[tasks.*]` whose primary is priced and whose fallback is
 not returns a plausible-looking total that silently covers a fraction of its
 calls. Read `priced / calls` before believing `cost_of_priced`.
