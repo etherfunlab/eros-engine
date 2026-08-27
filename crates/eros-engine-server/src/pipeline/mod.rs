@@ -41,24 +41,23 @@ use crate::error::AppError;
 /// no client-side statement timeout, so an insert that HANGS — as opposed to
 /// one that is refused — stalls the turn indefinitely.
 ///
-/// **The number is chosen against the per-TURN cost, not the per-write one.**
-/// A chat turn makes up to four of these serially on its critical path
+/// **The number is what production meets, not what the arithmetic wants.**
+/// 1.6.2 set it to 500ms on the reasoning that a single-row insert's p99 is
+/// milliseconds, so four serial writes on a turn's critical path
 /// (`chat_input_filter`, `pde_decision`, `chat_companion`,
-/// `chat_output_filter`), plus the image / vision events on the paths that
-/// have them — where what waits behind the write is the image marker, the
-/// endpoint's JSON body, the pre-stream 502, or the terminal SSE frame. A
-/// bound that reads as generous per write multiplies: at the old 2s, those four
-/// generation writes alone could spend 8s of a turn waiting on audit rows —
-/// more once an image or vision write joined them at 3s — all of it outside
-/// the LLM timeout budget, and what the user sees is a reply that hangs.
+/// `chat_output_filter`) would cost 2s rather than the 8s that 2s per write
+/// allows. The per-turn arithmetic was right and the p99 was wrong: 1.6.1 at
+/// 2s dropped 0 of 588 generation writes, and 1.6.2 at 500ms dropped ~9% of
+/// 12,744 across every task. So this is deliberately loose. What a tight bound
+/// buys is turn latency in a degraded database, which is hypothetical here;
+/// what it costs is the audit row, which is measured. Raise the LOWER of the
+/// two only against a reading, never against a p99 someone expects.
 ///
-/// 500ms is a hundredfold margin over a single-row insert's millisecond p99,
-/// **but only over the statement.** The bound also covers pool acquisition, and
-/// there it is deliberately tight: with all 20 connections busy for longer than
-/// 500ms, a perfectly healthy insert is abandoned before it ever gets one. That
-/// is the intended trade — a saturated pool is exactly when a turn must not
-/// queue behind an audit row — and it is why the timed-out `warn!` is worth
-/// alerting on: it fires on pool pressure, not just on a sick database.
+/// The failures were turn-correlated, not time-clustered — a turn that lost
+/// one generation usually lost the rest of its sequence, while the affected
+/// turns were scattered a minute apart. Whatever the underlying stall is
+/// (pool acquisition, or the task not being polled on a shared vCPU), it is
+/// per-turn and it lives above 500ms, which is all this constant needs to know.
 ///
 /// What this does NOT do: dropping the future at the timeout does not
 /// guarantee Postgres receives a `CancelRequest`, so a genuinely stuck
@@ -68,7 +67,7 @@ use crate::error::AppError;
 /// recall is legitimately slower than an audit insert, so one bound cannot
 /// serve both. Bounding the caller is still strictly better than the
 /// alternative: without this, the turn stalls AND the connection is stuck.
-const AUDIT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+const AUDIT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// One LLM generation, as the call site knows it. Five loose fields rather
 /// than a `&ChatResponse`: four streaming arms never own one, and two of them
