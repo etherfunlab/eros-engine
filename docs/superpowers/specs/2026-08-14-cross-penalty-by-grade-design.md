@@ -71,9 +71,9 @@ Neither bracket contains `g`. Three consequences:
 - **The break-even is a property of the position, not of the grade.** It solves
   to `φ(y*) = 4·D_k·u/κ`, which at defaults exceeds 1 for tiers 1–4 — those tiers
   can never be out-taxed at any grade. Only own tier 5 has a real break-even, at
-  `y* ≈ 0.761`.
+  `y* ≈ 0.800`.
 - **The double-high lock survives exactly where it was aimed.** At own tier 5
-  against a counterpart past `0.761` every grade nets negative, uniformly. "You
+  against a counterpart past `0.800` every grade nets negative, uniformly. "You
   cannot be both a confidant and a lover" still holds at the apex; it simply
   stopped firing on ordinary mid-relationship turns.
 
