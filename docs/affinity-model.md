@@ -317,7 +317,7 @@ between grades at a fixed position, and the break-even position
 `φ(y*) = 4·D_k/ratio` is identical for both lines regardless of their units —
 tying κ to the unit is what keeps per-line units from silently moving the
 double-high wall. At defaults only own tier 5 has a real break-even
-(counterpart ≈ `0.761`); past it every grade nets negative, uniformly.
+(counterpart ≈ `0.800`); past it every grade nets negative, uniformly.
 
 **4. Threshold gate.** Each line axis keeps a signed accumulator. The turn's
 real score joins it, and the whole balance commits only once

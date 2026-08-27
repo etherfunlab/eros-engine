@@ -3,7 +3,8 @@
 - **Date:** 2026-08-24
 - **Status:** Release A **deployed**, and 1.6.2 (§4.5's drains and moves, the
   timeout unification) **deployed** on 2026-08-25. §7.0's precondition passes.
-  B1 and B2 not started.
+  B1 is merged and ships in 1.7.0, carrying §6.2's timeout reversal with it.
+  B2 not started.
   "Released" and "deployed" are not interchangeable anywhere in this document:
   §7.3's argument for validated foreign keys rests on the code *serving
   traffic* already writing parent rows, and a git tag does not establish that.
@@ -475,6 +476,45 @@ Two numbers to watch once Release A is deployed, both already emitted:
   means the pool or the database is degrading, and it is the earliest signal
   either produces;
 - pool `acquire_timeout` errors.
+
+### 6.2 Reading back: 500 ms was wrong, it is 2 s again (measured 2026-08-27)
+
+The watch list above was answered from the database instead of the logs, and
+the answer reverses §6.1's number. Split on the 1.6.2 deploy, counting only
+rows whose task actually made a call:
+
+| table | 1.6.1 @ 2 s | 1.6.2 @ 500 ms |
+|---|---|---|
+| `chat_messages` (assistant, untruncated) | 0 / 3,519 | 187 / 2,190 · 8.5% |
+| `companion_decision_events` | 0 / 3,359 | 194 / 1,932 · 10.0% |
+| `companion_insights_events` | 1 / 6,171 | 304 / 3,470 · 8.8% |
+| `character_insights_events` | 4 / 6,129 | 312 / 3,551 · 8.8% |
+| `companion_affinity_events` | 1 / 2,648 | 163 / 1,601 · 10.2% |
+
+§6.1's per-turn arithmetic holds; its p99 does not. A single-row insert against
+same-region Supabase is 1–3 ms *as a statement*, and this bound covers the
+whole `acquire`-plus-execute, which on this deployment exceeds 500 ms often
+enough to drop roughly one generation in eleven. 1.6.1 ran the same write path
+at 2 s for eleven hours and dropped none of 588.
+
+The failures were **turn-correlated and time-scattered**: when a turn's
+`chat_companion` write was dropped, 79% of the time its `pde_decision` sibling
+was dropped too (4.6% when it was not), while the affected turns sat about a
+minute apart with never more than four in one minute. That shape rules out a
+window where the database was unwell and points at something per-turn — pool
+acquisition, or the turn's task not being polled on a shared vCPU. Which of
+those it is does not change the constant.
+
+So the bound goes back to 2 s, and the two halves of #307 are separated: one
+constant for all three writes was right and stays; 500 ms was a guess dressed
+as a margin. **Do not re-tighten this against an expected p99.** The tight
+bound buys turn latency in a degraded database, which has never been observed;
+it costs audit rows, which has been measured twice.
+
+The stakes also moved between B and B1. Under 1.6.2 a dropped write cost the
+*link* — `model` and `usage` were still on the child row. B1 stops writing
+them, so from 1.7.0 a dropped write costs the record itself, and nothing can
+backfill it. That is why this ships in the same release as B1 and not after.
 
 ## 7. Release B — and why it is two releases, not one
 

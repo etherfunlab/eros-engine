@@ -1069,7 +1069,7 @@ mod tests {
 
     /// The double-high lock survives where it is meant to. At own tier 5 the
     /// bracket `D₅·u − κ·φ(y)/4` is genuinely negative once the counterpart
-    /// passes ≈0.761, so every grade nets negative — uniformly, not just the
+    /// passes ≈0.800, so every grade nets negative — uniformly, not just the
     /// cheap ones. "You cannot be both" still holds at the apex; it just stopped
     /// firing on ordinary mid-relationship turns.
     #[test]
