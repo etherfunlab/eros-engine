@@ -5341,7 +5341,7 @@ pub fn replay_stream(
     _session_id: Uuid,
     _user_id: Uuid,
     ghost: bool,
-    rows: Vec<eros_engine_store::chat::ChatMessage>,
+    rows: Vec<eros_engine_store::chat::ReplayMessage>,
 ) -> impl futures_util::Stream<Item = ProtocolFrame> + Send + 'static {
     async_stream::stream! {
         let display_override = state.model_config.display_override("chat_companion");
@@ -5362,9 +5362,9 @@ pub fn replay_stream(
             };
         } else {
             for row in &rows {
-                let msg_ulid = Ulid::from(row.id);
-                let prev_ulid = row.continues_from_message_id.map(Ulid::from);
-                let action = if row.channel.as_deref() == Some("product_qa") {
+                let msg_ulid = Ulid::from(row.msg.id);
+                let prev_ulid = row.msg.continues_from_message_id.map(Ulid::from);
+                let action = if row.msg.channel.as_deref() == Some("product_qa") {
                     FrameActionType::ProductQa
                 } else {
                     FrameActionType::Reply
@@ -5384,10 +5384,10 @@ pub fn replay_stream(
                     }),
                     continues_from: prev_ulid.map(ulid_string),
                 };
-                if !row.content.is_empty() {
+                if !row.msg.content.is_empty() {
                     yield ProtocolFrame::Delta {
                         message_id: ulid_string(msg_ulid),
-                        content: row.content.clone(),
+                        content: row.msg.content.clone(),
                     };
                 }
                 // Replay the persisted (full) usage, then strip
@@ -5397,9 +5397,9 @@ pub fn replay_stream(
                 filter_usage_keys(&mut usage, &state.config.openrouter_usage_hidden_keys);
                 yield ProtocolFrame::Done {
                     message_id: ulid_string(msg_ulid),
-                    truncated: row.truncated,
+                    truncated: row.msg.truncated,
                     usage,
-                    generation_id: row.generation_id.clone(),
+                    generation_id: row.msg.generation_id.clone(),
                     // Re-emit the ghost-fallback flag so an idempotent replay of an
                     // empty-reply fallback turn is wire-identical to the original
                     // live stream (a real ghost likewise re-emits its ghost frames
@@ -5408,7 +5408,7 @@ pub fn replay_stream(
                     // ("garble_repaired") rows also carry a fallback_reason but are
                     // non-empty canned/ salvaged replies, not ghosts.
                     ghost_fallback: matches!(
-                        row.metadata
+                        row.msg.metadata
                             .as_ref()
                             .and_then(|m| m.get("fallback_reason"))
                             .and_then(|v| v.as_str()),
@@ -5428,8 +5428,8 @@ pub fn replay_stream(
             // user_message_id).
             let product_qa_chain = rows
                 .iter()
-                .any(|r| r.channel.as_deref() == Some("product_qa"));
-            if !rows.is_empty() && !product_qa_chain && rows.iter().all(|r| r.truncated) {
+                .any(|r| r.msg.channel.as_deref() == Some("product_qa"));
+            if !rows.is_empty() && !product_qa_chain && rows.iter().all(|r| r.msg.truncated) {
                 // `ChatMessage` does not carry the persisted `llm_attempts` /
                 // `gateway_errors` columns back out (they were never selected
                 // for replay), so there is no typed failure in hand here —
@@ -6762,17 +6762,7 @@ mod tests {
         let state = std::sync::Arc::new(state);
 
         // A persisted assistant row carrying full usage incl. `cost`.
-        let row = eros_engine_store::chat::ChatMessage {
-            id: Uuid::new_v4(),
-            session_id,
-            role: "assistant".into(),
-            content: "hello".into(),
-            sent_at: chrono::Utc::now(),
-            client_msg_id: None,
-            ghost_decision: false,
-            user_message_id: None,
-            continues_from_message_id: None,
-            truncated: false,
+        let row = eros_engine_store::chat::ReplayMessage {
             model: Some("x-ai/grok-4-fast".into()),
             usage: Some(serde_json::json!({
                 "prompt_tokens": 1290,
@@ -6780,12 +6770,24 @@ mod tests {
                 "total_tokens": 1307,
                 "cost": 0.0015878
             })),
-            generation_id: Some("gen-1".into()),
-            assistant_action_type: Some("reply".into()),
-            channel: None,
-            pre_filter_content: None,
-            metadata: None,
-            read_at: None,
+            msg: eros_engine_store::chat::ChatMessage {
+                id: Uuid::new_v4(),
+                session_id,
+                role: "assistant".into(),
+                content: "hello".into(),
+                sent_at: chrono::Utc::now(),
+                client_msg_id: None,
+                ghost_decision: false,
+                user_message_id: None,
+                continues_from_message_id: None,
+                truncated: false,
+                generation_id: Some("gen-1".into()),
+                assistant_action_type: Some("reply".into()),
+                channel: None,
+                pre_filter_content: None,
+                metadata: None,
+                read_at: None,
+            },
         };
 
         let frames: Vec<ProtocolFrame> =
@@ -6824,25 +6826,27 @@ mod tests {
         let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
         let state = std::sync::Arc::new(crate::routes::companion::test_state(pool.clone()));
 
-        let mk = |content: &str, reason: &str| eros_engine_store::chat::ChatMessage {
-            id: Uuid::new_v4(),
-            session_id,
-            role: "assistant".into(),
-            content: content.into(),
-            sent_at: chrono::Utc::now(),
-            client_msg_id: None,
-            ghost_decision: false,
-            user_message_id: None,
-            continues_from_message_id: None,
-            truncated: false,
+        let mk = |content: &str, reason: &str| eros_engine_store::chat::ReplayMessage {
             model: Some("m/x".into()),
             usage: None,
-            generation_id: Some("gen-x".into()),
-            assistant_action_type: Some("reply".into()),
-            channel: None,
-            pre_filter_content: None,
-            metadata: Some(serde_json::json!({ "fallback_reason": reason })),
-            read_at: None,
+            msg: eros_engine_store::chat::ChatMessage {
+                id: Uuid::new_v4(),
+                session_id,
+                role: "assistant".into(),
+                content: content.into(),
+                sent_at: chrono::Utc::now(),
+                client_msg_id: None,
+                ghost_decision: false,
+                user_message_id: None,
+                continues_from_message_id: None,
+                truncated: false,
+                generation_id: Some("gen-x".into()),
+                assistant_action_type: Some("reply".into()),
+                channel: None,
+                pre_filter_content: None,
+                metadata: Some(serde_json::json!({ "fallback_reason": reason })),
+                read_at: None,
+            },
         };
 
         let done_flag = |frames: &[ProtocolFrame]| -> bool {
@@ -6899,25 +6903,27 @@ mod tests {
         let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
         let state = std::sync::Arc::new(crate::routes::companion::test_state(pool.clone()));
 
-        let mk = |content: &str, channel: Option<&str>| eros_engine_store::chat::ChatMessage {
-            id: Uuid::new_v4(),
-            session_id,
-            role: "assistant".into(),
-            content: content.into(),
-            sent_at: chrono::Utc::now(),
-            client_msg_id: None,
-            ghost_decision: false,
-            user_message_id: None,
-            continues_from_message_id: None,
-            truncated: false,
+        let mk = |content: &str, channel: Option<&str>| eros_engine_store::chat::ReplayMessage {
             model: Some("m/x".into()),
             usage: None,
-            generation_id: Some("gen-x".into()),
-            assistant_action_type: Some("reply".into()),
-            channel: channel.map(String::from),
-            pre_filter_content: None,
-            metadata: None,
-            read_at: None,
+            msg: eros_engine_store::chat::ChatMessage {
+                id: Uuid::new_v4(),
+                session_id,
+                role: "assistant".into(),
+                content: content.into(),
+                sent_at: chrono::Utc::now(),
+                client_msg_id: None,
+                ghost_decision: false,
+                user_message_id: None,
+                continues_from_message_id: None,
+                truncated: false,
+                generation_id: Some("gen-x".into()),
+                assistant_action_type: Some("reply".into()),
+                channel: channel.map(String::from),
+                pre_filter_content: None,
+                metadata: None,
+                read_at: None,
+            },
         };
 
         let rows = vec![
@@ -6971,25 +6977,27 @@ mod tests {
         let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
         let state = std::sync::Arc::new(crate::routes::companion::test_state(pool.clone()));
 
-        let row = eros_engine_store::chat::ChatMessage {
-            id: Uuid::new_v4(),
-            session_id,
-            role: "assistant".into(),
-            content: "product answer, cut off mid-".into(),
-            sent_at: chrono::Utc::now(),
-            client_msg_id: None,
-            ghost_decision: false,
-            user_message_id: None,
-            continues_from_message_id: None,
-            truncated: true,
+        let row = eros_engine_store::chat::ReplayMessage {
             model: Some("qa/exec".into()),
             usage: None,
-            generation_id: Some("gen-qa".into()),
-            assistant_action_type: Some("product_qa".into()),
-            channel: Some("product_qa".into()),
-            pre_filter_content: None,
-            metadata: None,
-            read_at: None,
+            msg: eros_engine_store::chat::ChatMessage {
+                id: Uuid::new_v4(),
+                session_id,
+                role: "assistant".into(),
+                content: "product answer, cut off mid-".into(),
+                sent_at: chrono::Utc::now(),
+                client_msg_id: None,
+                ghost_decision: false,
+                user_message_id: None,
+                continues_from_message_id: None,
+                truncated: true,
+                generation_id: Some("gen-qa".into()),
+                assistant_action_type: Some("product_qa".into()),
+                channel: Some("product_qa".into()),
+                pre_filter_content: None,
+                metadata: None,
+                read_at: None,
+            },
         };
 
         let frames: Vec<ProtocolFrame> =
@@ -9702,25 +9710,27 @@ data: [DONE]\n\n";
         let user_id = Uuid::new_v4();
         let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
 
-        let row = eros_engine_store::chat::ChatMessage {
-            id: Uuid::new_v4(),
-            session_id,
-            role: "assistant".into(),
-            content: "hello".into(),
-            sent_at: chrono::Utc::now(),
-            client_msg_id: None,
-            ghost_decision: false,
-            user_message_id: None,
-            continues_from_message_id: None,
-            truncated: false,
+        let row = eros_engine_store::chat::ReplayMessage {
             model: Some("deepseek/x".into()),
             usage: None,
-            generation_id: None,
-            assistant_action_type: Some("reply".into()),
-            channel: None,
-            pre_filter_content: None,
-            metadata: None,
-            read_at: None,
+            msg: eros_engine_store::chat::ChatMessage {
+                id: Uuid::new_v4(),
+                session_id,
+                role: "assistant".into(),
+                content: "hello".into(),
+                sent_at: chrono::Utc::now(),
+                client_msg_id: None,
+                ghost_decision: false,
+                user_message_id: None,
+                continues_from_message_id: None,
+                truncated: false,
+                generation_id: Some("gen-display".into()),
+                assistant_action_type: Some("reply".into()),
+                channel: None,
+                pre_filter_content: None,
+                metadata: None,
+                read_at: None,
+            },
         };
 
         let meta_model = |frames: &[ProtocolFrame]| -> Option<String> {

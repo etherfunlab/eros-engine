@@ -140,8 +140,8 @@ mod tests {
         crate::testutil::seed_generation(&pool, "g").await;
         sqlx::query(
             "INSERT INTO engine.companion_insights_events \
-               (run_id, user_id, session_id, message_id, stage, status, payload, model, usage, generation_id) \
-             VALUES ($1,$2,$3,$4,'facts','ok','[]'::jsonb,'m','{}'::jsonb,'g')",
+               (run_id, user_id, session_id, message_id, stage, status, payload, generation_id) \
+             VALUES ($1,$2,$3,$4,'facts','ok','[]'::jsonb,'g')",
         )
         .bind(Uuid::new_v4())
         .bind(user_id)
@@ -157,11 +157,13 @@ mod tests {
             .unwrap();
         assert_eq!(n, 1);
 
-        // companion_affinity_events now has the audit trio (select compiles ⇒ columns exist).
-        let _ =
-            sqlx::query("SELECT model, usage, generation_id FROM engine.companion_affinity_events")
-                .fetch_all(&pool)
-                .await
-                .expect("affinity audit columns exist");
+        // companion_affinity_events keeps its audit pointer (select compiles ⇒
+        // column exists). model and usage were the rest of 0025's audit trio;
+        // the facts live in llm_generations now, and 0061 (B2-drop) removes
+        // the columns — this test must not depend on them either way.
+        let _ = sqlx::query("SELECT generation_id FROM engine.companion_affinity_events")
+            .fetch_all(&pool)
+            .await
+            .expect("affinity audit column exists");
     }
 }

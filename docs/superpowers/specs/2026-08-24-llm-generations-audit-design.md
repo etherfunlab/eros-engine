@@ -11,18 +11,21 @@
 - **Type:** New parent table + write-path change at every LLM call site;
   then foreign keys, a backfill, and column drops on eight live tables
 - **Owner:** enriquephl (sole dev)
-- **Target:** **Three releases, not two.** Release A shipped in 1.6.1;
-  B1 and B2 follow, each after its predecessor's rollout completes. §8 is a
+- **Target:** **Four releases, not two.** Release A shipped in 1.6.1; B1
+  (v1.7.0) followed; B2 splits again into a code release (v1.7.1) and the
+  DROP (v1.7.2), each after its predecessor's rollout completes. §8 is a
   hard constraint in both directions, not a preference — the split between
   B1 and B2 exists because the original two-release plan would have broken
-  production (§7 preamble).
+  production (§7 preamble), and B2's own split exists because the DROP broke
+  B1's `SELECT *` hydration the same way (§7.4).
 - **Depends on:** migrations through `0059`, all applied in production as of
-  1.6.1's deploy. B1 adds `0060`, B2 adds `0061`.
-- **Rollback floor:** once B2 is deployed, the oldest build that can be rolled
-  back to is **B1**. Release A and 1.6.2 name `model` and `usage` in every
-  child INSERT, and B2 has dropped those columns. This is the same constraint
-  as §8, read backwards, and it is the one a rollback under pressure is most
-  likely to violate.
+  1.6.1's deploy. B1 adds `0060`, B2-drop adds `0061`; B2-code adds none.
+- **Rollback floor:** once `0061` is deployed (v1.7.2), the oldest build that
+  can be rolled back to is **v1.7.1**. v1.7.0 hydrates `ChatMessage` from
+  `SELECT *` with `model` / `usage` fields and fails `ColumnNotFound` on the
+  post-drop schema; Release A and 1.6.2 additionally name both columns in
+  every child INSERT. This is the same constraint as §8, read backwards, and
+  it is the one a rollback under pressure is most likely to violate.
 
 ## 1. Problem
 
@@ -557,18 +560,67 @@ So the work splits by which side of the rollout each half is safe on:
 
 | | contents | why its migration is safe when it runs |
 |---|---|---|
-| **B1** | code stops writing `model` / `usage` to the eight child tables (reads move to a join); migration `0060`: backfill, eight indexes, eight validated foreign keys | the build serving traffic is Release A **or later** (1.6.2 today), all of which write parent rows (§7.0) |
-| **B2** | migration `0061`: `DROP` the redundant columns | the build serving traffic is B1, which no longer writes them |
+| **B1** (v1.7.0) | code stops writing `model` / `usage` to the eight child tables; migration `0060`: backfill, eight indexes, eight validated foreign keys | the build serving traffic is Release A **or later** (1.6.2 today), all of which write parent rows (§7.0) |
+| **B2-code** (v1.7.1) | code stops **reading** the columns: `ChatMessage` loses its `model` / `usage` fields, replay joins `llm_generations` instead (§7.4) — no migration | nothing to run; the build tolerates both sides of `0061` |
+| **B2-drop** (v1.7.2) | migration `0061`: `DROP` the redundant columns | the build serving traffic is B2-code, which neither writes nor reads them |
 
 The foreign keys ride in B1 rather than B2 because they are already safe there
 — gating them behind the drop would delay the guarantee for no reason.
 
-**B2 has its own precondition, symmetric to §7.0:** do not run `0061` until B1
-is deployed. There is no equivalent one-query check, because the evidence is an
-absence — the running code no longer writing two columns. Check
-`fly image show -a eros-engine` shows B1's version on **every** machine, and
-that no INSERT in `eros-engine-store` still names `model` or `usage` on those
-tables.
+An earlier revision of this table shipped B1 with "(reads move to a join)" in
+its row. It did not: B1 moved the *asserting* reads (tests joining the
+parent), but the replay path's `SELECT *` hydration kept reading both columns
+by name, invisibly to a name-based scan (§7.4). That read is what forces
+B2-code to exist as its own release.
+
+**B2-drop has its own precondition, symmetric to §7.0:** do not run `0061`
+until B2-code is deployed. There is no equivalent one-query check, because
+the evidence is an absence — the running code neither naming the columns in
+any INSERT nor carrying struct fields that sqlx hydrates from them. Check
+`fly image show -a eros-engine` shows v1.7.1 (or later) on **every** machine,
+and that `eros-engine-store` has no INSERT naming `model` / `usage` on those
+tables and no `FromRow` struct expecting them.
+
+**The upgrade order, written out.** An operator on v1.6.x — the last releases
+whose child tables still take `model` / `usage` writes — reaches the end
+state through three deploys that cannot be collapsed, and an operator on
+anything older reaches it through four. Each hop must be deployed **and
+serving** before the next one's migration runs, because every migration here
+is safe only against the code that shipped one hop earlier:
+
+1. **≤ v1.6.0 → v1.6.x (Release A).** Release A is what makes `0060` safe:
+   every call site writes the parent row before handing the id to a child.
+   Verify it is *serving* with §7.0's one-query check — a recent
+   `llm_generations` row is the only evidence the running build writes
+   parents.
+2. **v1.6.x → v1.7.0 (B1).** `release_command` runs `0060` — backfill,
+   indexes, eight validated foreign keys — while machines still running
+   v1.6.x serve traffic, which is safe precisely because v1.6.x writes
+   parent-first. B1's own code then stops writing `model` / `usage` to the
+   child tables.
+3. **v1.7.0 → v1.7.1 (B2-code).** No migration. The build stops *reading*
+   the columns: `ChatMessage` drops its `model` / `usage` fields, and replay
+   reaches both facts through the `llm_generations` join (§7.4). This build
+   is valid on either side of `0061`, which is the whole point of the hop.
+4. **v1.7.1 → v1.7.2 (B2-drop).** `release_command` runs `0061` — the DROP
+   — while machines still running v1.7.1 serve traffic, which is safe
+   precisely because v1.7.1 neither writes nor reads the columns. Verify
+   with the absence check above before deploying.
+
+Collapsing 2 and 4 — v1.6.x straight to the DROP — runs `0060` + `0061` in
+one `release_command` while v1.6.x still serves: for the length of the
+rollout every child INSERT names columns that no longer exist, and for
+`chat_messages` that is a user's reply failing to persist. Collapsing 3 and
+4 — shipping the DROP with the code that stops reading — fails on the same
+rollout window one layer down: v1.7.0 machines still serving hydrate
+`ChatMessage` via `SELECT *`, and every history read errors `ColumnNotFound`
+— not just replays, every turn that loads context. Skipping 1 —
+pre-Release-A straight to v1.7.0 — fails differently but as hard: the moment
+`0060`'s foreign keys commit, the old build's child writes reference parents
+it never wrote.
+
+Rollback floors follow the same line read backwards: from v1.7.2 no further
+back than v1.7.1 (the header note), from v1.7.0 no further back than v1.6.1.
 
 ### 7.0 Precondition — Release A must be *deployed*, and this is how you check
 
@@ -791,6 +843,27 @@ columns (`SELECT` on `engine.chat_messages` was revoked from `service_role` in
 its migration `018`, and no web RPC references `model` or `usage` on any
 `engine.*` table), and no engine read path outside test assertions selects
 them.
+
+**That verification missed one, and the DROP found it.** The idempotent
+replay path read both columns without ever naming them: the assistant chain
+is fetched with `SELECT *` into a struct whose `model` / `usage` fields sqlx
+hydrates by column name, and `replay_stream` echoes them onto the wire so a
+retried turn is frame-identical to the live stream. A name-based scan cannot
+see a `SELECT *`. B2-code keeps the wire contract and moves the read to the
+join: the chain query selects `m.*, g.model AS g_model, g.usage AS g_usage`
+through `LEFT JOIN engine.llm_generations` into a `ReplayMessage` wrapper
+around the now-fieldless `ChatMessage` (the aliases keep hydration
+unambiguous while the child columns still exist). A row whose parent write
+degraded (or that never had a generation) joins to `NULL` — which is exactly
+what the live stream emitted for that turn since B1, so replay stays
+wire-identical there too.
+
+**And it is why B2 is itself two releases.** The struct fields are not just
+dead weight — `SELECT *` hydration makes them a schema dependency: run the
+DROP while a build carrying them still serves and every `chat_messages` read
+in that build errors `ColumnNotFound`. So the fieldless build (B2-code,
+v1.7.1) must be serving on every machine before `0061` (B2-drop, v1.7.2)
+runs. The same §8 argument, third application.
 
 **The code change belongs to B1; only the `DROP` is B2.** Every child INSERT
 that names both columns is enumerated in the §7 preamble — ten statements,

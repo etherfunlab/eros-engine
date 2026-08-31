@@ -49,10 +49,6 @@ pub struct ChatMessage {
     #[serde(default)]
     pub truncated: bool,
     #[serde(default)]
-    pub model: Option<String>,
-    #[serde(default)]
-    pub usage: Option<serde_json::Value>,
-    #[serde(default)]
     pub generation_id: Option<String>,
     #[serde(default)]
     pub assistant_action_type: Option<String>,
@@ -81,6 +77,37 @@ pub struct ChatMessage {
     /// tips and for `user` rows on the voice channel.
     #[serde(default)]
     pub read_at: Option<DateTime<Utc>>,
+}
+
+/// A persisted assistant row plus the generation facts an idempotent replay
+/// must echo on the wire. `model` and `usage` are authoritative in
+/// `engine.llm_generations` — B1 stopped writing the child copies and 0061
+/// (B2) drops them — and replay is the one read path that needs them
+/// row-by-row: the live stream emitted them in its `meta` / `done` frames,
+/// and a retry must be wire-identical. So the chain query joins them in.
+///
+/// The `g_` aliases are what make this struct valid on BOTH sides of 0061:
+/// hydrating a bare `model` from `SELECT m.*, g.model` would be ambiguous
+/// while `chat_messages.model` still exists, and this build must serve
+/// against the pre-drop schema during its own rollout and as 0061's rollback
+/// floor. Reading the parent's side is also the faithful one — the live
+/// frames carried the response's values, which for B1-era rows the child
+/// column never held.
+///
+/// A row whose `generation_id` is NULL (degraded parent write, or the
+/// canned-phrase fallback that clears the trio on purpose) joins to NULL,
+/// which is what its live stream emitted since B1. Pre-B1 fallback rows may
+/// once have streamed a model their replay now lacks; a replay is a
+/// seconds-later retry contract, not an archive, so that historical edge is
+/// accepted.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ReplayMessage {
+    #[sqlx(flatten)]
+    pub msg: ChatMessage,
+    #[sqlx(rename = "g_model")]
+    pub model: Option<String>,
+    #[sqlx(rename = "g_usage")]
+    pub usage: Option<serde_json::Value>,
 }
 
 /// Projection-narrowed `ChatMessage` for BFF / UI-rendering paths that
@@ -615,7 +642,7 @@ pub enum UpsertUserOutcome {
     Replay {
         user_message_id: Uuid,
         ghost: bool,
-        assistant_chain: Vec<ChatMessage>,
+        assistant_chain: Vec<ReplayMessage>,
     },
     /// Same key seen, but no assistant row and no ghost flag — the original
     /// request is still in flight. Caller should return HTTP 409.
@@ -657,10 +684,12 @@ pub(crate) async fn upsert_user_message_in_tx(
     .await?;
 
     if let Some(row) = existing {
-        let assistant_chain: Vec<ChatMessage> = sqlx::query_as::<_, ChatMessage>(
-            "SELECT * FROM engine.chat_messages \
-             WHERE user_message_id = $1 AND role = 'assistant' \
-             ORDER BY sent_at ASC",
+        let assistant_chain: Vec<ReplayMessage> = sqlx::query_as::<_, ReplayMessage>(
+            "SELECT m.*, g.model AS g_model, g.usage AS g_usage \
+             FROM engine.chat_messages m \
+             LEFT JOIN engine.llm_generations g ON g.generation_id = m.generation_id \
+             WHERE m.user_message_id = $1 AND m.role = 'assistant' \
+             ORDER BY m.sent_at ASC",
         )
         .bind(row.id)
         .fetch_all(&mut **tx)
@@ -1745,7 +1774,7 @@ mod tests {
                 assert_eq!(user_message_id, first);
                 assert!(!ghost);
                 assert_eq!(assistant_chain.len(), 1);
-                assert_eq!(assistant_chain[0].content, "hi back");
+                assert_eq!(assistant_chain[0].msg.content, "hi back");
             }
             other => panic!("expected Replay, got {other:?}"),
         }
