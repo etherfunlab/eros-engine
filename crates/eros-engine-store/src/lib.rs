@@ -129,8 +129,8 @@ pub(crate) mod testutil {
     /// The `task` is a literal `'test'` on purpose: the column is NOT NULL and
     /// carries no CHECK (0059 — the vocabulary is deployer-extensible config),
     /// and a test that needed a REAL task value would be testing 0060's
-    /// backfill — which ran in production before 0061 dropped the child
-    /// columns it read, so its replay test retired with them (B2).
+    /// backfill — spent: it ran in production, and its replay test retired
+    /// with B2 (0061 drops the columns it seeded and read).
     ///
     /// `model` and `usage` are non-NULL for a reason: since B1 the child rows
     /// no longer carry them, so tests that used to assert on a child column now
@@ -517,76 +517,6 @@ mod migration_tests {
                  llm_generations delete seq-scans it"
             );
         }
-    }
-
-    /// 0061 (B2) drops `model` and `usage` from the eight child tables — the
-    /// same generation's model and usage now live in exactly one place,
-    /// `engine.llm_generations`, reached by the join on `generation_id`.
-    ///
-    /// 0060's backfill replay test retired with the columns it seeded (its own
-    /// comment said it would): the backfill ran in production before this
-    /// migration and cannot execute against the post-0061 schema.
-    #[sqlx::test(migrations = "./migrations")]
-    async fn migration_0061_child_model_and_usage_columns_are_gone(pool: PgPool) {
-        for table in [
-            "chat_messages",
-            "companion_affinity_events",
-            "companion_insights_events",
-            "companion_decision_events",
-            "chat_images_events",
-            "chat_vision_events",
-            "character_insights_events",
-            "user_insights_events",
-        ] {
-            for column in ["model", "usage"] {
-                let exists: bool = sqlx::query_scalar(
-                    "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
-                     WHERE table_schema = 'engine' AND table_name = $1 \
-                       AND column_name = $2)",
-                )
-                .bind(table)
-                .bind(column)
-                .fetch_one(&pool)
-                .await
-                .expect("query information_schema for a dropped column");
-                assert!(
-                    !exists,
-                    "engine.{table}.{column} must be dropped by 0061; the only \
-                     copy lives in llm_generations, reached by the join"
-                );
-            }
-        }
-
-        // The one place they still live.
-        for column in ["model", "usage"] {
-            let exists: bool = sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
-                 WHERE table_schema = 'engine' AND table_name = 'llm_generations' \
-                   AND column_name = $1)",
-            )
-            .bind(column)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-            assert!(exists, "llm_generations.{column} is the surviving copy");
-        }
-
-        // filter_model survives on purpose (spec §7.4): 2,024 rows hold the
-        // regex arm's '<regex>' sentinel with no f_generation_id at all — a
-        // discriminator that happens to be spelled like a model name, not a
-        // redundant copy of anything in the parent table.
-        let filter_model: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
-             WHERE table_schema = 'engine' AND table_name = 'chat_messages' \
-               AND column_name = 'filter_model')",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert!(
-            filter_model,
-            "filter_model is a discriminator, not a copy — it survives B2"
-        );
     }
 
     #[sqlx::test(migrations = "./migrations")]

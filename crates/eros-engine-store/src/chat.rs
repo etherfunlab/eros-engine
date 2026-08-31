@@ -80,18 +80,33 @@ pub struct ChatMessage {
 }
 
 /// A persisted assistant row plus the generation facts an idempotent replay
-/// must echo on the wire. `model` and `usage` live only in
-/// `engine.llm_generations` since 0061 dropped the child copies; replay is
-/// the one read path that needs them row-by-row — the live stream emitted
-/// them in its `meta` / `done` frames, and a retry must be wire-identical —
-/// so the chain query joins them back in. Rows whose parent write degraded
-/// (or that never had a generation) join to NULL, which replays exactly what
-/// the live stream emitted for them.
+/// must echo on the wire. `model` and `usage` are authoritative in
+/// `engine.llm_generations` — B1 stopped writing the child copies and 0061
+/// (B2) drops them — and replay is the one read path that needs them
+/// row-by-row: the live stream emitted them in its `meta` / `done` frames,
+/// and a retry must be wire-identical. So the chain query joins them in.
+///
+/// The `g_` aliases are what make this struct valid on BOTH sides of 0061:
+/// hydrating a bare `model` from `SELECT m.*, g.model` would be ambiguous
+/// while `chat_messages.model` still exists, and this build must serve
+/// against the pre-drop schema during its own rollout and as 0061's rollback
+/// floor. Reading the parent's side is also the faithful one — the live
+/// frames carried the response's values, which for B1-era rows the child
+/// column never held.
+///
+/// A row whose `generation_id` is NULL (degraded parent write, or the
+/// canned-phrase fallback that clears the trio on purpose) joins to NULL,
+/// which is what its live stream emitted since B1. Pre-B1 fallback rows may
+/// once have streamed a model their replay now lacks; a replay is a
+/// seconds-later retry contract, not an archive, so that historical edge is
+/// accepted.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ReplayMessage {
     #[sqlx(flatten)]
     pub msg: ChatMessage,
+    #[sqlx(rename = "g_model")]
     pub model: Option<String>,
+    #[sqlx(rename = "g_usage")]
     pub usage: Option<serde_json::Value>,
 }
 
@@ -670,7 +685,8 @@ pub(crate) async fn upsert_user_message_in_tx(
 
     if let Some(row) = existing {
         let assistant_chain: Vec<ReplayMessage> = sqlx::query_as::<_, ReplayMessage>(
-            "SELECT m.*, g.model, g.usage FROM engine.chat_messages m \
+            "SELECT m.*, g.model AS g_model, g.usage AS g_usage \
+             FROM engine.chat_messages m \
              LEFT JOIN engine.llm_generations g ON g.generation_id = m.generation_id \
              WHERE m.user_message_id = $1 AND m.role = 'assistant' \
              ORDER BY m.sent_at ASC",

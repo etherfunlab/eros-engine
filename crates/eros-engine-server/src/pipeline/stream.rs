@@ -9724,7 +9724,7 @@ data: [DONE]\n\n";
                 user_message_id: None,
                 continues_from_message_id: None,
                 truncated: false,
-                generation_id: None,
+                generation_id: Some("gen-display".into()),
                 assistant_action_type: Some("reply".into()),
                 channel: None,
                 pre_filter_content: None,
