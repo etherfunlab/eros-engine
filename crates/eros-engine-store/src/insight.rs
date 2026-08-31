@@ -158,8 +158,9 @@ mod tests {
         assert_eq!(n, 1);
 
         // companion_affinity_events keeps its audit pointer (select compiles ⇒
-        // column exists). model and usage were the rest of 0025's audit trio
-        // until 0061 dropped them — they live in llm_generations now.
+        // column exists). model and usage were the rest of 0025's audit trio;
+        // the facts live in llm_generations now, and 0061 (B2-drop) removes
+        // the columns — this test must not depend on them either way.
         let _ = sqlx::query("SELECT generation_id FROM engine.companion_affinity_events")
             .fetch_all(&pool)
             .await

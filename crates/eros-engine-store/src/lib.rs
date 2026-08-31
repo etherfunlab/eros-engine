@@ -130,7 +130,7 @@ pub(crate) mod testutil {
     /// carries no CHECK (0059 — the vocabulary is deployer-extensible config),
     /// and a test that needed a REAL task value would be testing 0060's
     /// backfill — spent: it ran in production, and its replay test retired
-    /// with B2 (0061 drops the columns it seeded and read).
+    /// in B2-code, ahead of 0061 dropping the columns it seeded and read.
     ///
     /// `model` and `usage` are non-NULL for a reason: since B1 the child rows
     /// no longer carry them, so tests that used to assert on a child column now
