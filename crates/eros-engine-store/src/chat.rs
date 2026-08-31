@@ -122,12 +122,17 @@ pub struct ChatMessageSlim {
     /// Client-supplied message id forwarded during streaming (idempotency
     /// key). NULL for rows that never carried one (e.g. assistant turns).
     pub client_msg_id: Option<String>,
-    /// Structured tip amount extracted from `metadata->>'tips_amount_usd'`.
-    /// Present on `role='gift_user'` rows that carry tip metadata; NULL on
-    /// all other rows. Lets BFF / FE render tips as a structured field
-    /// instead of parsing the `(打赏 $X)` content marker.
+    /// Tip amount extracted from `metadata->>'tips_amount_usd'`. Present on
+    /// `role='gift_user'` rows that carry tip metadata; NULL on all other
+    /// rows. Lets BFF / FE render tips as a structured field instead of
+    /// parsing the `(打赏 $X)` content marker.
+    ///
+    /// Carried as raw text, not `::float8`, for the same reason as
+    /// `reply_to_message_id` below: `metadata` is unconstrained JSONB, and a
+    /// cast that meets one malformed value fails the whole page rather than
+    /// the one row. The caller parses and drops what does not parse.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tips_amount_usd: Option<f64>,
+    pub tips_amount_usd: Option<String>,
     /// Conversation-flavor marker: `"product_qa"` = out-of-character product
     /// answer (excluded from companion context). NULL for normal turns.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -353,7 +358,7 @@ impl<'a> ChatRepo<'a> {
     ) -> Result<Vec<ChatMessageSlim>, sqlx::Error> {
         let mut rows = sqlx::query_as::<_, ChatMessageSlim>(
             "SELECT id, role, content, sent_at, client_msg_id, \
-                    (metadata->>'tips_amount_usd')::float8 AS tips_amount_usd, \
+                    metadata->>'tips_amount_usd' AS tips_amount_usd, \
                     channel, read_at, \
                     (metadata->'image' IS NOT NULL) AS image, \
                     metadata->>'reply_to_message_id' AS reply_to_message_id, \

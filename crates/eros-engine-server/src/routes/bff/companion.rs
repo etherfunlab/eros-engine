@@ -89,6 +89,14 @@ fn parse_anchor(raw: Option<String>) -> Option<Uuid> {
     raw.and_then(|s| Uuid::parse_str(&s).ok())
 }
 
+/// Parse the raw `metadata->>'tips_amount_usd'` text the slim projection
+/// carries. Same contract as `parse_anchor`: the column is unconstrained
+/// JSONB, and one bad row must not fail the page — what does not parse is
+/// dropped rather than surfaced (#302).
+fn parse_tip(raw: Option<String>) -> Option<f64> {
+    raw.and_then(|s| s.parse().ok())
+}
+
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct BffHistoryResponse {
     pub session_id: Uuid,
@@ -187,7 +195,7 @@ async fn bff_get_history(
             role: r.role,
             content: r.content,
             sent_at: r.sent_at,
-            tips_amount_usd: r.tips_amount_usd,
+            tips_amount_usd: parse_tip(r.tips_amount_usd),
             channel: r.channel,
             read_at: r.read_at,
             image: r.image,
@@ -248,7 +256,7 @@ async fn bff_start_chat(
                 role: r.role,
                 content: r.content,
                 sent_at: r.sent_at,
-                tips_amount_usd: r.tips_amount_usd,
+                tips_amount_usd: parse_tip(r.tips_amount_usd),
                 channel: r.channel,
                 read_at: r.read_at,
                 image: r.image,
@@ -1000,6 +1008,61 @@ mod tests {
                 "an unparseable anchor is dropped, not surfaced; got {m}"
             );
         }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_history_survives_a_malformed_tip(pool: PgPool) {
+        // Same failure mode as the reply anchor above, last cast standing
+        // (#302): a `::float8` in the projection would fail the WHOLE page on
+        // one bad `tips_amount_usd`. The tip is carried as text and parsed per
+        // row, so a junk value costs its own key and nothing else.
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+
+        sqlx::query(
+            "INSERT INTO engine.chat_messages \
+                 (session_id, role, content, metadata, sent_at) \
+             VALUES ($1, 'gift_user', 'junk string', \
+                     '{\"tips_amount_usd\": \"twenty\"}'::jsonb, \
+                     now() - interval '4 seconds'),
+                    ($1, 'gift_user', 'json object', \
+                     '{\"tips_amount_usd\": {\"usd\": 20}}'::jsonb, \
+                     now() - interval '3 seconds'),
+                    ($1, 'gift_user', 'json null', \
+                     '{\"tips_amount_usd\": null}'::jsonb, \
+                     now() - interval '2 seconds'),
+                    ($1, 'gift_user', '(打赏 $20)', \
+                     '{\"tips_amount_usd\": 20.0}'::jsonb, \
+                     now() - interval '1 second')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let (status, body) =
+            send_request(&mut app, bff_history_request(&token, session_id, "")).await;
+        assert_eq!(status, StatusCode::OK, "the page still renders: {body}");
+
+        let messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 4, "every row survives: {body}");
+        for m in &messages[..3] {
+            assert!(
+                m.get("tips_amount_usd").is_none(),
+                "an unparseable tip is dropped, not surfaced; got {m}"
+            );
+        }
+        assert_eq!(
+            messages[3]["tips_amount_usd"],
+            json!(20.0),
+            "the well-formed tip still parses: {body}"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
