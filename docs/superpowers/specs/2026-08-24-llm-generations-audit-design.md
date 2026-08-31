@@ -570,6 +570,39 @@ absence — the running code no longer writing two columns. Check
 that no INSERT in `eros-engine-store` still names `model` or `usage` on those
 tables.
 
+**The upgrade order, written out.** An operator on v1.6.x — the last releases
+whose child tables still take `model` / `usage` writes — reaches the end state
+through two deploys that cannot be collapsed into one, and an operator on
+anything older reaches it through three. Each hop must be deployed **and
+serving** before the next one's migration runs, because every migration here
+is safe only against the code that shipped one hop earlier:
+
+1. **≤ v1.6.0 → v1.6.x (Release A).** Release A is what makes `0060` safe:
+   every call site writes the parent row before handing the id to a child.
+   Verify it is *serving* with §7.0's one-query check — a recent
+   `llm_generations` row is the only evidence the running build writes
+   parents.
+2. **v1.6.x → v1.7.0 (B1).** `release_command` runs `0060` — backfill,
+   indexes, eight validated foreign keys — while machines still running
+   v1.6.x serve traffic, which is safe precisely because v1.6.x writes
+   parent-first. B1's own code then stops writing `model` / `usage` to the
+   child tables.
+3. **v1.7.0 → v1.7.2 (B2).** `release_command` runs `0061` — the DROP —
+   while machines still running v1.7.0 serve traffic, which is safe precisely
+   because v1.7.0 no longer names those columns in any INSERT. Verify with
+   the absence check above before deploying.
+
+Collapsing 2 and 3 — v1.6.x straight to v1.7.2 — runs `0060` + `0061` in one
+`release_command` while v1.6.x still serves: for the length of the rollout
+every child INSERT names columns that no longer exist, and for
+`chat_messages` that is a user's reply failing to persist. Skipping 1 —
+pre-Release-A straight to v1.7.0 — fails differently but as hard: the moment
+`0060`'s foreign keys commit, the old build's child writes reference parents
+it never wrote.
+
+Rollback floors follow the same line read backwards: from v1.7.2 no further
+back than v1.7.0 (the header note), from v1.7.0 no further back than v1.6.1.
+
 ### 7.0 Precondition — Release A must be *deployed*, and this is how you check
 
 Do not run `0060` until this returns true:
@@ -791,6 +824,18 @@ columns (`SELECT` on `engine.chat_messages` was revoked from `service_role` in
 its migration `018`, and no web RPC references `model` or `usage` on any
 `engine.*` table), and no engine read path outside test assertions selects
 them.
+
+**That verification missed one, and the DROP found it.** The idempotent
+replay path read both columns without ever naming them: the assistant chain
+is fetched with `SELECT *` into a struct whose `model` / `usage` fields sqlx
+hydrates by column name, and `replay_stream` echoes them onto the wire so a
+retried turn is frame-identical to the live stream. A name-based scan cannot
+see a `SELECT *`. B2 keeps the wire contract and moves the read to the join:
+the chain query selects `m.*, g.model, g.usage` through
+`LEFT JOIN engine.llm_generations` into a `ReplayMessage` wrapper around the
+now-columnless `ChatMessage`. A row whose parent write degraded (or that
+never had a generation) joins to `NULL` — which is exactly what the live
+stream emitted for that turn, so replay stays wire-identical there too.
 
 **The code change belongs to B1; only the `DROP` is B2.** Every child INSERT
 that names both columns is enumerated in the §7 preamble — ten statements,

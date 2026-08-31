@@ -49,10 +49,6 @@ pub struct ChatMessage {
     #[serde(default)]
     pub truncated: bool,
     #[serde(default)]
-    pub model: Option<String>,
-    #[serde(default)]
-    pub usage: Option<serde_json::Value>,
-    #[serde(default)]
     pub generation_id: Option<String>,
     #[serde(default)]
     pub assistant_action_type: Option<String>,
@@ -81,6 +77,22 @@ pub struct ChatMessage {
     /// tips and for `user` rows on the voice channel.
     #[serde(default)]
     pub read_at: Option<DateTime<Utc>>,
+}
+
+/// A persisted assistant row plus the generation facts an idempotent replay
+/// must echo on the wire. `model` and `usage` live only in
+/// `engine.llm_generations` since 0061 dropped the child copies; replay is
+/// the one read path that needs them row-by-row — the live stream emitted
+/// them in its `meta` / `done` frames, and a retry must be wire-identical —
+/// so the chain query joins them back in. Rows whose parent write degraded
+/// (or that never had a generation) join to NULL, which replays exactly what
+/// the live stream emitted for them.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ReplayMessage {
+    #[sqlx(flatten)]
+    pub msg: ChatMessage,
+    pub model: Option<String>,
+    pub usage: Option<serde_json::Value>,
 }
 
 /// Projection-narrowed `ChatMessage` for BFF / UI-rendering paths that
@@ -615,7 +627,7 @@ pub enum UpsertUserOutcome {
     Replay {
         user_message_id: Uuid,
         ghost: bool,
-        assistant_chain: Vec<ChatMessage>,
+        assistant_chain: Vec<ReplayMessage>,
     },
     /// Same key seen, but no assistant row and no ghost flag — the original
     /// request is still in flight. Caller should return HTTP 409.
@@ -657,10 +669,11 @@ pub(crate) async fn upsert_user_message_in_tx(
     .await?;
 
     if let Some(row) = existing {
-        let assistant_chain: Vec<ChatMessage> = sqlx::query_as::<_, ChatMessage>(
-            "SELECT * FROM engine.chat_messages \
-             WHERE user_message_id = $1 AND role = 'assistant' \
-             ORDER BY sent_at ASC",
+        let assistant_chain: Vec<ReplayMessage> = sqlx::query_as::<_, ReplayMessage>(
+            "SELECT m.*, g.model, g.usage FROM engine.chat_messages m \
+             LEFT JOIN engine.llm_generations g ON g.generation_id = m.generation_id \
+             WHERE m.user_message_id = $1 AND m.role = 'assistant' \
+             ORDER BY m.sent_at ASC",
         )
         .bind(row.id)
         .fetch_all(&mut **tx)
@@ -1745,7 +1758,7 @@ mod tests {
                 assert_eq!(user_message_id, first);
                 assert!(!ghost);
                 assert_eq!(assistant_chain.len(), 1);
-                assert_eq!(assistant_chain[0].content, "hi back");
+                assert_eq!(assistant_chain[0].msg.content, "hi back");
             }
             other => panic!("expected Replay, got {other:?}"),
         }

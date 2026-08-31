@@ -278,8 +278,8 @@ mod tests {
         sqlx::query(
             "INSERT INTO engine.user_insights_events \
                (run_id, instance_id, session_id, message_id, stage, status, payload, \
-                model, usage, generation_id) \
-             VALUES ($1,$2,$3,$4,'extraction','ok','{}'::jsonb,'m','{}'::jsonb,'g')",
+                generation_id) \
+             VALUES ($1,$2,$3,$4,'extraction','ok','{}'::jsonb,'g')",
         )
         .bind(Uuid::new_v4())
         .bind(instance_id)

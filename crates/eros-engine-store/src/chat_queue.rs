@@ -7,7 +7,7 @@ use std::time::Duration;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::chat::{upsert_user_message_in_tx, ChatMessage, UpsertUserOutcome};
+use crate::chat::{upsert_user_message_in_tx, ReplayMessage, UpsertUserOutcome};
 
 pub struct ChatQueueRepo<'a> {
     pub pool: &'a PgPool,
@@ -45,7 +45,7 @@ pub enum ClaimedEnqueueOutcome {
     Replay {
         user_message_id: Uuid,
         ghost: bool,
-        assistant_chain: Vec<ChatMessage>,
+        assistant_chain: Vec<ReplayMessage>,
     },
     DuplicateInProgress {
         user_message_id: Uuid,
