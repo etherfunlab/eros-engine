@@ -1,10 +1,10 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
--- Release B2 of three. 0059 created engine.llm_generations, Release A made
--- every call site write to it, and 0060 (B1) gave it its history and its
--- constraints while the code stopped writing model and usage to the child
--- tables. This migration drops what nothing writes any more: the same
--- generation's model and usage now live in exactly one place, reached by the
--- join on generation_id.
+-- The last of four releases. 0059 created engine.llm_generations and Release
+-- A made every call site write to it; 0060 (B1, v1.7.0) gave it its history
+-- and its constraints while the code stopped WRITING model and usage to the
+-- child tables; B2-code (v1.7.1) stopped READING them. This migration drops
+-- what nothing touches any more: the same generation's model and usage now
+-- live in exactly one place, reached by the join on generation_id.
 --
 -- Spec: docs/superpowers/specs/2026-08-24-llm-generations-audit-design.md §7.4
 --
