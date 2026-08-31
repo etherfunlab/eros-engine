@@ -92,9 +92,13 @@ fn parse_anchor(raw: Option<String>) -> Option<Uuid> {
 /// Parse the raw `metadata->>'tips_amount_usd'` text the slim projection
 /// carries. Same contract as `parse_anchor`: the column is unconstrained
 /// JSONB, and one bad row must not fail the page — what does not parse is
-/// dropped rather than surfaced (#302).
+/// dropped rather than surfaced (#302). Non-finite values ("NaN", "inf",
+/// overflow) are dropped too: `f64::parse` accepts them but serde_json
+/// serializes them as `null`, which would put the key on the wire instead
+/// of omitting it.
 fn parse_tip(raw: Option<String>) -> Option<f64> {
-    raw.and_then(|s| s.parse().ok())
+    raw.and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| v.is_finite())
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -1026,12 +1030,15 @@ mod tests {
                  (session_id, role, content, metadata, sent_at) \
              VALUES ($1, 'gift_user', 'junk string', \
                      '{\"tips_amount_usd\": \"twenty\"}'::jsonb, \
-                     now() - interval '4 seconds'),
+                     now() - interval '5 seconds'),
                     ($1, 'gift_user', 'json object', \
                      '{\"tips_amount_usd\": {\"usd\": 20}}'::jsonb, \
-                     now() - interval '3 seconds'),
+                     now() - interval '4 seconds'),
                     ($1, 'gift_user', 'json null', \
                      '{\"tips_amount_usd\": null}'::jsonb, \
+                     now() - interval '3 seconds'),
+                    ($1, 'gift_user', 'non-finite', \
+                     '{\"tips_amount_usd\": \"NaN\"}'::jsonb, \
                      now() - interval '2 seconds'),
                     ($1, 'gift_user', '(打赏 $20)', \
                      '{\"tips_amount_usd\": 20.0}'::jsonb, \
@@ -1051,15 +1058,16 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "the page still renders: {body}");
 
         let messages = body["messages"].as_array().expect("messages array");
-        assert_eq!(messages.len(), 4, "every row survives: {body}");
-        for m in &messages[..3] {
+        assert_eq!(messages.len(), 5, "every row survives: {body}");
+        for m in &messages[..4] {
             assert!(
                 m.get("tips_amount_usd").is_none(),
-                "an unparseable tip is dropped, not surfaced; got {m}"
+                "an unparseable or non-finite tip is dropped, not surfaced \
+                 (serde_json would render NaN as null); got {m}"
             );
         }
         assert_eq!(
-            messages[3]["tips_amount_usd"],
+            messages[4]["tips_amount_usd"],
             json!(20.0),
             "the well-formed tip still parses: {body}"
         );
