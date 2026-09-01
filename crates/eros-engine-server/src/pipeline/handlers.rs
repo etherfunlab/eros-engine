@@ -227,9 +227,12 @@ pub(crate) fn recall_query_text(msg: &eros_engine_store::chat::ChatMessage) -> S
 /// fold to the "user" role: a tip turn IS a user turn to the model
 /// (OpenRouter only knows system/user/assistant), and gift_user is tip-only
 /// now (the legacy in-app Gift Event endpoint was removed), so no tip/legacy
-/// gate is needed. Assistant rows always feed `content` (their
-/// `pre_filter_content` is the pre-output-filter original and must never
-/// re-enter the prompt).
+/// gate is needed. Assistant rows feed `content` (their `pre_filter_content`
+/// is the pre-output-filter original and must never re-enter the prompt),
+/// then have their leading sentence stripped (spec §4.3 — the noise carrier,
+/// e.g. `唔`/`啊`); a row with nothing left after stripping is omitted rather
+/// than injected as empty content, which some providers reject. User rows are
+/// never stripped.
 ///
 /// Split out of `assemble_chat_request` so echo cancellation can key on the
 /// exact string the provider receives — no other layer can compute it.
@@ -243,7 +246,17 @@ pub(crate) fn model_facing_history(
         }
         let (role, text) = match msg.role.as_str() {
             "user" | "gift_user" => ("user", model_facing_user_text(&msg)),
-            "assistant" => ("assistant", model_facing_assistant_text(&msg)),
+            "assistant" => {
+                // Spec §4.3: the leading sentence is the noise carrier. Strip
+                // it; a row with nothing left is dropped rather than injected
+                // as empty content, which some providers reject.
+                let stripped =
+                    crate::repetition::strip_leading_sentence(&model_facing_assistant_text(&msg));
+                if stripped.trim().is_empty() {
+                    continue;
+                }
+                ("assistant", stripped)
+            }
             _ => continue,
         };
         out.push(crate::repetition::Injected {
@@ -2137,6 +2150,80 @@ mod tests {
             uuid::Uuid::new_v4(),
         );
         assert_eq!(kept.len(), 3, "no row may be dropped: {kept:?}");
+    }
+
+    // ─── model_facing_history leading-sentence strip (spec §4.3) ─────────
+
+    fn chat_row(role: &str, content: &str) -> eros_engine_store::chat::ChatMessage {
+        eros_engine_store::chat::ChatMessage {
+            id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            role: role.to_string(),
+            content: content.to_string(),
+            sent_at: chrono::Utc::now(),
+            client_msg_id: None,
+            ghost_decision: false,
+            user_message_id: None,
+            continues_from_message_id: None,
+            truncated: false,
+            generation_id: None,
+            assistant_action_type: None,
+            channel: None,
+            pre_filter_content: None,
+            metadata: None,
+            read_at: None,
+        }
+    }
+
+    #[test]
+    fn injected_assistant_rows_lose_their_leading_sentence() {
+        let rows = vec![
+            chat_row("user", "在吗"),
+            chat_row("assistant", "唔。我在呢，刚洗完澡。"),
+        ];
+        let out = model_facing_history(rows);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].text, "在吗", "user rows are untouched");
+        assert_eq!(out[1].text, "我在呢，刚洗完澡。");
+    }
+
+    #[test]
+    fn assistant_rows_that_strip_to_empty_are_dropped() {
+        let rows = vec![
+            chat_row("user", "在吗"),
+            chat_row("assistant", "唔。"),
+            chat_row("user", "怎么了"),
+        ];
+        let out = model_facing_history(rows);
+        let texts: Vec<&str> = out.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(texts, vec!["在吗", "怎么了"]);
+    }
+
+    #[test]
+    fn no_injected_row_is_ever_empty() {
+        // The invariant assemble_chat_request depends on: an empty `content`
+        // is rejected by some providers.
+        let rows = vec![
+            chat_row("assistant", "唔。"),
+            chat_row("assistant", "   "),
+            chat_row("assistant", "。。。"),
+            chat_row("user", "hi"),
+        ];
+        for m in model_facing_history(rows) {
+            assert!(
+                !m.text.trim().is_empty(),
+                "empty injected row: role={}",
+                m.role
+            );
+        }
+    }
+
+    #[test]
+    fn user_rows_are_never_stripped_even_when_single_sentence() {
+        let rows = vec![chat_row("user", "在吗？")];
+        let out = model_facing_history(rows);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, "在吗？");
     }
 
     /// End-to-end check of the cutoff semantics that `fetch_recent_turn_pairs`
