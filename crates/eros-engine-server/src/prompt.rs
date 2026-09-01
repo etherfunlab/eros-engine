@@ -521,7 +521,6 @@ pub fn build_prompt(
     reply_tone: Option<&str>,
     prompt_traits: &[PromptTrait],
     affinity_scope: AffinityScope,
-    recent_turns: &[(String, String)],
     // Recent affinity-evaluation reasons, oldest→newest. Empty ⇒ the
     // `[emotional_context]` block is omitted.
     emotional_context: &[String],
@@ -745,20 +744,6 @@ pub fn build_prompt(
         String::new()
     };
 
-    // Empty path emits "\n" (one extra newline) so the gap between [now] and
-    // --- stays at two newlines = one blank line, byte-identical to the
-    // pre-this-PR layout. Non-empty path's trailing "\n\n" continues to add
-    // the same blank line after the block.
-    let recent_section = if recent_turns.is_empty() {
-        "\n".to_string()
-    } else {
-        let pairs: Vec<String> = recent_turns
-            .iter()
-            .map(|(user, assistant)| format!("用户：{user}\n{name}：{assistant}"))
-            .collect();
-        format!("\n[recent_conversation]\n{}\n\n", pairs.join("\n\n"))
-    };
-
     format!(
         "{head}{guard}{identity}{tz_clause}\n\
          \n\
@@ -776,7 +761,7 @@ pub fn build_prompt(
          {attitude}{state}{hints_section}{tone_section}{emotional_section}{quote_section}\n\
          \n\
          [now]\n{tc}\n\
-         {recent_section}\
+         \n\
          ---\n\
          [iron_rules — 违反即失效]\n\
          ⓪ You are a real person. You have your own life, feelings, and quirks; you live, feel, and react as a human would.\n\
@@ -1112,7 +1097,6 @@ mod tests {
             &[],
             AffinityScope::full(),
             &[],
-            &[],
             None,
             None,
             None,
@@ -1151,7 +1135,6 @@ mod tests {
             &traits,
             AffinityScope::full(),
             &[],
-            &[],
             None,
             None,
             None,
@@ -1185,7 +1168,6 @@ mod tests {
             &traits,
             AffinityScope::full(),
             &[],
-            &[],
             None,
             None,
             None,
@@ -1211,7 +1193,6 @@ mod tests {
             Some("语气敷衍一点，句子短一点"),
             &[],
             AffinityScope::default(),
-            &[],
             &[],
             None,
             None,
@@ -1244,7 +1225,6 @@ mod tests {
                 tone,
                 &[],
                 AffinityScope::default(),
-                &[],
                 &[],
                 None,
                 None,
@@ -1280,7 +1260,6 @@ mod tests {
             &[],
             AffinityScope::default(),
             &[],
-            &[],
             None,
             None,
             Some(&mine),
@@ -1308,7 +1287,6 @@ mod tests {
             &[],
             AffinityScope::default(),
             &[],
-            &[],
             None,
             None,
             Some(&theirs),
@@ -1331,7 +1309,6 @@ mod tests {
             None,
             &[],
             AffinityScope::default(),
-            &[],
             &[],
             None,
             None,
@@ -1373,7 +1350,6 @@ mod tests {
             None,
             &[],
             AffinityScope::full(),
-            &[],
             &[],
             None,
             None,
@@ -1423,7 +1399,6 @@ mod tests {
             &[],
             AffinityScope::full(),
             &[],
-            &[],
             None,
             None,
             None,
@@ -1456,7 +1431,6 @@ mod tests {
             &[],
             AffinityScope::full(),
             &[],
-            &[],
             None,
             None,
             None,
@@ -1485,7 +1459,6 @@ mod tests {
             None,
             &[],
             AffinityScope::full(),
-            &[],
             &[],
             None,
             None,
@@ -1521,7 +1494,6 @@ mod tests {
             None,
             &[],
             AffinityScope::full(),
-            &[],
             &[],
             None,
             None,
@@ -1565,7 +1537,6 @@ mod tests {
             &[],
             AffinityScope::full(),
             &[],
-            &[],
             None,
             None,
             None,
@@ -1588,7 +1559,6 @@ mod tests {
             None,
             &[],
             AffinityScope::full(),
-            &[],
             &[],
             None,
             None,
@@ -1618,7 +1588,6 @@ mod tests {
             &[],
             AffinityScope::full(),
             &[],
-            &[],
             None,
             None,
             None,
@@ -1641,7 +1610,6 @@ mod tests {
             None,
             &[],
             AffinityScope::full(),
-            &[],
             &[],
             None,
             None,
@@ -1671,72 +1639,11 @@ mod tests {
             &[],
             AffinityScope::full(),
             &[],
-            &[],
             None,
             None,
             None,
         );
         assert!(s.contains("你所在时区：Asia/Tokyo。"), "{s}");
-    }
-
-    #[test]
-    fn build_prompt_renders_recent_conversation_block_when_pairs_present() {
-        let pairs = vec![
-            ("你今天好吗？".to_string(), "还行，你呢".to_string()),
-            ("我也还行".to_string(), "嗯嗯".to_string()),
-            ("晚安".to_string(), "晚安".to_string()),
-        ];
-        let s = build_prompt(
-            &fixture_persona(),
-            &[],
-            &[],
-            None,
-            ReplyStyle::Neutral,
-            &[],
-            None,
-            &[],
-            AffinityScope::full(),
-            &pairs,
-            &[],
-            None,
-            None,
-            None,
-        );
-        let header = s.find("[recent_conversation]").expect("header present");
-        let iron = s.find("[iron_rules").expect("iron-rules header present");
-        assert!(
-            header < iron,
-            "[recent_conversation] must sit before [iron_rules]"
-        );
-        let now = s.find("[now]").expect("[now] present");
-        assert!(now < header, "[recent_conversation] must sit after [now]");
-        assert!(s.contains("用户：你今天好吗？"));
-        assert!(s.contains("Aria：还行，你呢"));
-        assert!(s.contains("用户：晚安"));
-        assert!(s.contains("Aria：晚安"));
-
-        // Block-level ordering with [recent_conversation] inserted between [now] and [iron_rules].
-        let pos = |h: &str| s.find(h).unwrap_or_else(|| panic!("missing {h} in:\n{s}"));
-        let order = [
-            "你是 ",
-            "[backstory]",
-            "[speech_style]",
-            "[quirks]",
-            "[topics]",
-            "[turn_style]",
-            "[user_profile]",
-            "[shared_memories",
-            "[now]",
-            "[recent_conversation]",
-            "[iron_rules",
-            "[output]",
-        ];
-        let mut last = 0usize;
-        for h in order {
-            let cur = pos(h);
-            assert!(cur >= last, "header {h} out of order in:\n{s}");
-            last = cur;
-        }
     }
 
     #[test]
@@ -1751,7 +1658,6 @@ mod tests {
             None,
             &[],
             AffinityScope::full(),
-            &[],
             &[],
             None,
             None,
@@ -1775,7 +1681,6 @@ mod tests {
             None,
             &[],
             AffinityScope::full(),
-            &[],
             &[],
             None,
             None,
@@ -1807,7 +1712,6 @@ mod tests {
             &[],
             AffinityScope::full(),
             &[],
-            &[],
             None,
             None,
             None,
@@ -1823,7 +1727,6 @@ mod tests {
             None,
             &[],
             AffinityScope::full(),
-            &[],
             &["最近聊得不错".to_string()],
             None,
             None,
@@ -1861,7 +1764,6 @@ mod tests {
             &t1,
             AffinityScope::full(),
             &[],
-            &[],
             None,
             None,
             None,
@@ -1876,7 +1778,6 @@ mod tests {
             None,
             &t2,
             AffinityScope::full(),
-            &[],
             &[],
             None,
             None,
@@ -1906,7 +1807,6 @@ mod tests {
             &[],
             AffinityScope::full(),
             &[],
-            &[],
             None,
             None,
             None,
@@ -1931,7 +1831,6 @@ mod tests {
             None,
             &[],
             AffinityScope::full(),
-            &[],
             &reasons,
             None,
             None,
@@ -1969,7 +1868,6 @@ mod tests {
             &[],
             AffinityScope::full(),
             &[],
-            &[],
             None,
             None,
             None,
@@ -1993,7 +1891,6 @@ mod tests {
             None,
             &[],
             AffinityScope::default(),
-            &[],
             &[],
             Some(&world),
             None,
@@ -2021,7 +1918,6 @@ mod tests {
             &[],
             AffinityScope::default(),
             &[],
-            &[],
             None,
             None,
             None,
@@ -2039,7 +1935,6 @@ mod tests {
             None,
             &[],
             AffinityScope::default(),
-            &[],
             &[],
             Some(&empty),
             None,
@@ -2064,7 +1959,6 @@ mod tests {
             None,
             &[],
             AffinityScope::default(),
-            &[],
             &[],
             None,
             Some(&stories),
@@ -2091,7 +1985,6 @@ mod tests {
             &[],
             AffinityScope::default(),
             &[],
-            &[],
             None,
             None,
             None,
@@ -2107,7 +2000,6 @@ mod tests {
             None,
             &[],
             AffinityScope::default(),
-            &[],
             &[],
             None,
             Some(&StoriesContext::default()),
@@ -2409,7 +2301,6 @@ mod tests {
             &[],
             AffinityScope::bond(),
             &[],
-            &[],
             None,
             None,
             None,
@@ -2435,7 +2326,6 @@ mod tests {
             None,
             &[],
             AffinityScope::none(),
-            &[],
             &[],
             None,
             None,
@@ -2505,7 +2395,6 @@ mod tests {
             &[],
             AffinityScope::full(),
             &[],
-            &[],
             None,
             None,
             None,
@@ -2570,7 +2459,6 @@ mod tests {
             None,
             &[],
             AffinityScope::full(),
-            &[],
             &[],
             None,
             None,

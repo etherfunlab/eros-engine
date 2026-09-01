@@ -817,8 +817,6 @@ pub(super) async fn build_reply_request(
         );
     }
 
-    let recent_turns = fetch_recent_turn_pairs(&state.pool, session_id, user_message_id).await;
-
     // Recent affinity reasons for the emotional trajectory. The store returns
     // newest-first; reverse to oldest→newest for a readable [emotional_context].
     let mut emotional_context = AffinityRepo { pool: &state.pool }
@@ -853,7 +851,6 @@ pub(super) async fn build_reply_request(
         plan.reply_tone.as_deref(),
         &kept_traits,
         affinity_scope,
-        &recent_turns,
         &emotional_context,
         world.as_ref(),
         stories.as_ref(),
@@ -887,37 +884,6 @@ pub(super) async fn build_reply_request(
         ),
         injected_tags,
     ))
-}
-
-/// Fetch the last `limit` complete (user|gift_user, assistant) pairs for the
-/// session, used to render the `[recent_conversation]` short-term memory block.
-///
-/// Cutoff = the current turn's persisted user row's `sent_at` (looked up by
-/// `user_message_id` via subquery). Using `Utc::now()` instead would be racy:
-/// under concurrent streams on the same session, a later already-completed
-/// turn could insert a row between wall-clock-now and the read of recent
-/// rows, leaking "future" conversation into the current turn's prompt. The
-/// SQL filter is strict `<`, so the current-turn row itself is excluded.
-///
-/// Non-fatal: a DB hiccup degrades to an empty Vec with a warn-level log so
-/// short-term memory is omitted but prompt assembly still succeeds.
-async fn fetch_recent_turn_pairs(
-    pool: &PgPool,
-    session_id: Uuid,
-    user_message_id: Uuid,
-) -> Vec<(String, String)> {
-    ChatRepo { pool }
-        .recent_turn_pairs_before_message(session_id, user_message_id, 3)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(
-                error = %e,
-                session_id = %session_id,
-                user_message_id = %user_message_id,
-                "recent_turn_pairs fetch failed; [recent_conversation] omitted"
-            );
-            Vec::new()
-        })
 }
 
 #[cfg(test)]
@@ -2208,116 +2174,6 @@ mod tests {
         let out = model_facing_history(rows);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].text, "在吗？");
-    }
-
-    /// End-to-end check of the cutoff semantics that `fetch_recent_turn_pairs`
-    /// relies on. We exercise the repo path the handler actually calls (via
-    /// `ChatRepo::recent_turn_pairs_before_message` keyed on the current
-    /// turn's user message id) rather than the full handler tree, because
-    /// `build_reply_request` pulls in persona / model_config / voyage /
-    /// openrouter wiring that isn't trivially mockable. The handler itself is
-    /// verifiable by inspection — both call sites go through
-    /// `fetch_recent_turn_pairs(&state.pool, session_id, user_message_id)`.
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn handlers_inject_recent_conversation_into_system_prompt(pool: PgPool) {
-        use eros_engine_store::chat::{AssistantInsert, ChatRepo, UpsertUserOutcome};
-
-        let chat_repo = ChatRepo { pool: &pool };
-        let user_id = Uuid::new_v4();
-        let instance_id = seed_persona_instance(&pool, user_id).await;
-        let session = chat_repo
-            .create_session(user_id, instance_id)
-            .await
-            .unwrap();
-
-        // Insert 2 prior complete (user, assistant) pairs.
-        for n in 0..2u8 {
-            let u_ulid = format!("01J000000000000000008{n}001A");
-            let uid = match chat_repo
-                .upsert_user_message_idempotent(session.id, &format!("u{n}"), &u_ulid, "user", None)
-                .await
-                .unwrap()
-            {
-                UpsertUserOutcome::Inserted { message_id } => message_id,
-                other => panic!("expected Inserted, got {other:?}"),
-            };
-            chat_repo
-                .insert_assistant_batch(
-                    session.id,
-                    uid,
-                    &[AssistantInsert {
-                        llm_attempts: None,
-                        gateway_errors: None,
-                        id: Uuid::new_v4(),
-                        content: format!("a{n}"),
-                        assistant_action_type: "reply".into(),
-                        truncated: false,
-                        continues_from_message_id: None,
-                        generation_id: None,
-                        filter_audit: None,
-                        metadata: None,
-                    }],
-                )
-                .await
-                .unwrap();
-        }
-
-        // Insert the "current" user row that the handler would pass to
-        // `fetch_recent_turn_pairs` as `user_message_id`.
-        let current_msg_id = match chat_repo
-            .upsert_user_message_idempotent(
-                session.id,
-                "u_current",
-                "01J0000000000000000080900A",
-                "user",
-                None,
-            )
-            .await
-            .unwrap()
-        {
-            UpsertUserOutcome::Inserted { message_id } => message_id,
-            other => panic!("expected Inserted, got {other:?}"),
-        };
-
-        // What the handler's fetch will see when assembling the current turn.
-        // Cutoff = current_msg_id's sent_at, so its own row is excluded and
-        // only the 2 prior complete pairs come back.
-        let pairs = chat_repo
-            .recent_turn_pairs_before_message(session.id, current_msg_id, 3)
-            .await
-            .unwrap();
-        assert_eq!(pairs.len(), 2);
-        assert_eq!(pairs[0], ("u0".to_string(), "a0".to_string()));
-        assert_eq!(pairs[1], ("u1".to_string(), "a1".to_string()));
-
-        // Concurrent-stream isolation: a LATER user row inserted after the
-        // current turn (simulating another stream completing between this
-        // turn's user-insert and the recent-turn fetch) must NOT appear.
-        // Wall-clock `Utc::now()` would include it; cutoff-by-message-id
-        // doesn't, because the subquery resolves to `current_msg_id`'s
-        // sent_at — which is before the later row.
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        let _ = chat_repo
-            .upsert_user_message_idempotent(
-                session.id,
-                "u_later",
-                "01J0000000000000000080999A",
-                "user",
-                None,
-            )
-            .await
-            .unwrap();
-        let pairs_after = chat_repo
-            .recent_turn_pairs_before_message(session.id, current_msg_id, 3)
-            .await
-            .unwrap();
-        assert_eq!(
-            pairs_after.len(),
-            2,
-            "later concurrent-stream row must not appear in [recent_conversation]"
-        );
-        assert_eq!(pairs_after[0], ("u0".to_string(), "a0".to_string()));
-        assert_eq!(pairs_after[1], ("u1".to_string(), "a1".to_string()));
     }
 
     // ─── fetch_world_context ────────────────────────────────────────────

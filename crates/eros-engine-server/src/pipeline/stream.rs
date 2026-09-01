@@ -14354,8 +14354,12 @@ data: [DONE]\n\n";
             .append_message(session_id, "user", "AFTERWARDS-ONE")
             .await
             .unwrap();
+        // Two sentences: strip_leading_sentence (spec §4.3, unrelated to what
+        // this test checks) eats the first and keeps the rest, so a
+        // single-sentence fixture would vanish from the injected history for
+        // a reason that has nothing to do with quote/rewind semantics.
         chat_repo
-            .append_message(session_id, "assistant", "AFTERWARDS-TWO")
+            .append_message(session_id, "assistant", "唔。AFTERWARDS-TWO")
             .await
             .unwrap();
 

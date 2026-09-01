@@ -454,70 +454,13 @@ impl<'a> ChatRepo<'a> {
         Ok(pairs)
     }
 
-    /// Same as `recent_turn_pairs` but cuts off at the sent_at of a specific
-    /// message (typically the current turn's user row), not a caller-supplied
-    /// timestamp. Looking up the cutoff via subquery avoids a race with
-    /// concurrent streams that could insert a row between wall-clock-now and
-    /// the read of recent rows.
-    /// Channel-marked rows ('voice'/'product_qa') are out of companion context and excluded.
-    ///
-    /// Equivalent to `recent_turn_pairs(session_id, msg.sent_at, limit)` but
-    /// in a single round-trip. If `message_id` doesn't exist in the session
-    /// the subquery returns NULL and `sent_at < NULL` matches nothing →
-    /// returns an empty Vec.
-    pub async fn recent_turn_pairs_before_message(
-        &self,
-        session_id: Uuid,
-        message_id: Uuid,
-        limit: u8,
-    ) -> Result<Vec<(String, String)>, sqlx::Error> {
-        let fetch_n: i64 = (limit as i64) * 2 + 2;
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT role, content \
-             FROM engine.chat_messages \
-             WHERE session_id = $1 \
-               AND sent_at < (SELECT sent_at FROM engine.chat_messages WHERE id = $2) \
-               AND truncated = FALSE \
-               AND channel IS NULL \
-               AND role IN ('user', 'gift_user', 'assistant') \
-             ORDER BY sent_at DESC \
-             LIMIT $3",
-        )
-        .bind(session_id)
-        .bind(message_id)
-        .bind(fetch_n)
-        .fetch_all(self.pool)
-        .await?;
-
-        // Same pair-walking algorithm as recent_turn_pairs (reverse → walk
-        // user|gift_user → assistant pairs → keep last `limit`).
-        let mut chrono = rows;
-        chrono.reverse();
-        let mut pairs: Vec<(String, String)> = Vec::new();
-        let mut i = 0;
-        while i + 1 < chrono.len() {
-            let (role_a, content_a) = &chrono[i];
-            let (role_b, content_b) = &chrono[i + 1];
-            if (role_a == "user" || role_a == "gift_user") && role_b == "assistant" {
-                pairs.push((content_a.clone(), content_b.clone()));
-                i += 2;
-            } else {
-                i += 1;
-            }
-        }
-        let want = limit as usize;
-        if pairs.len() > want {
-            let drop = pairs.len() - want;
-            pairs.drain(..drop);
-        }
-        Ok(pairs)
-    }
-
     /// Up to `limit` recent (question, answer) pairs on the product-QA channel,
-    /// strictly before `message_id`'s sent_at, chronological. Mirrors
-    /// `recent_turn_pairs_before_message` but scoped to `channel='product_qa'`
-    /// rows (both sides of a product-QA exchange carry the marker). Feeds the
-    /// judge's `[最近产品咨询]` block and the executor's follow-up context.
+    /// strictly before `message_id`'s sent_at, chronological. Uses the same
+    /// subquery-cutoff pattern as `recent_turn_pairs` (looks up `message_id`'s
+    /// `sent_at` rather than trusting a caller-supplied timestamp) but scoped
+    /// to `channel='product_qa'` rows (both sides of a product-QA exchange
+    /// carry the marker). Feeds the judge's `[最近产品咨询]` block and the
+    /// executor's follow-up context.
     pub async fn recent_product_qa_pairs(
         &self,
         session_id: Uuid,
@@ -2872,79 +2815,6 @@ mod tests {
                 .unwrap();
         assert_eq!(content, "hello", "content must be untouched");
         assert_eq!(got.unwrap()[0]["task"], "chat_input_filter");
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    async fn recent_turn_pairs_before_message_uses_msg_sent_at_not_now(pool: PgPool) {
-        let repo = ChatRepo { pool: &pool };
-        let s = throwaway_session(&pool).await;
-
-        // Insert 1 prior complete pair.
-        let u1 = match repo
-            .upsert_user_message_idempotent(s.id, "u1", "01J0000000000000000090001A", "user", None)
-            .await
-            .unwrap()
-        {
-            UpsertUserOutcome::Inserted { message_id } => message_id,
-            other => panic!("expected Inserted, got {other:?}"),
-        };
-        repo.insert_assistant_batch(
-            s.id,
-            u1,
-            &[AssistantInsert {
-                llm_attempts: None,
-                gateway_errors: None,
-                id: Uuid::new_v4(),
-                content: "a1".into(),
-                assistant_action_type: "reply".into(),
-                truncated: false,
-                continues_from_message_id: None,
-                generation_id: None,
-                filter_audit: None,
-                metadata: None,
-            }],
-        )
-        .await
-        .unwrap();
-
-        // Insert the "current" user row that the chat handler will pass.
-        let current = match repo
-            .upsert_user_message_idempotent(
-                s.id,
-                "current",
-                "01J0000000000000000090002A",
-                "user",
-                None,
-            )
-            .await
-            .unwrap()
-        {
-            UpsertUserOutcome::Inserted { message_id } => message_id,
-            other => panic!("expected Inserted, got {other:?}"),
-        };
-
-        // Sleep, then insert a LATER user row — simulating a concurrent stream
-        // that completed between this turn's user-insert and the recent-turn fetch.
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        let _ = repo
-            .upsert_user_message_idempotent(
-                s.id,
-                "later",
-                "01J0000000000000000090003A",
-                "user",
-                None,
-            )
-            .await
-            .unwrap();
-
-        // The cutoff must come from `current`'s sent_at — NOT the wall clock,
-        // because wall-clock-now happens AFTER the `later` insert and would
-        // include it. With the proper cutoff, `later` is excluded.
-        let pairs = repo
-            .recent_turn_pairs_before_message(s.id, current, 3)
-            .await
-            .unwrap();
-        assert_eq!(pairs, vec![("u1".to_string(), "a1".to_string())]);
     }
 
     #[sqlx::test(migrations = "./migrations")]

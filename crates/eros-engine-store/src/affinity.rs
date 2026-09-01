@@ -331,7 +331,7 @@ impl<'a> AffinityRepo<'a> {
     /// row (`before_message_id`), skipping rows whose `context` has no non-empty
     /// `affinity_reason`. The `e.created_at < (sent_at of before_message_id)`
     /// cutoff is resolved via subquery — same race-safety pattern as
-    /// `ChatRepo::recent_turn_pairs_before_message`: under concurrent
+    /// `ChatRepo::recent_product_qa_pairs`: under concurrent
     /// same-session streams, a later turn's affinity event (written after
     /// this message arrived) cannot leak into this turn's prompt as a
     /// "future" reason.
