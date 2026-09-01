@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Anti-repetition. `strip_leading_sentence` removes a turn's leading
-//! sentence — the noise carrier, per production measurement — before it is
-//! stored. `Injected` and `cancel_echo` work on the other side: what the
-//! model is allowed to condition on, dropping duplicated turns from the
-//! injected history. Pure + unit-testable (no I/O).
+//! Anti-repetition on what the model conditions on. `Injected` is one
+//! history row as `model_facing_history` formats it for injection;
+//! `strip_leading_sentence` is called there to remove a turn's leading
+//! sentence — the noise carrier, per production measurement — from that
+//! formatted row only. `chat_messages.content` keeps the full original text;
+//! nothing here touches storage. `cancel_echo` then drops duplicated rows
+//! from a window of `Injected`s before they reach the model. Pure +
+//! unit-testable (no I/O).
 
 use std::collections::HashMap;
 
