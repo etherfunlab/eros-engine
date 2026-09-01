@@ -657,7 +657,7 @@ pub fn build_prompt(
             .map(|r| format!("- {r}"))
             .collect::<Vec<_>>()
             .join("\n");
-        format!("\n[emotional_context]（最近几轮的情感走向，仅供参考，别照搬）\n{bullets}")
+        format!("\n[emotional_context]（上一轮的情感变化，仅供参考，别照搬）\n{bullets}")
     };
 
     // World-memories injection (spec §3.3): the persona's resident digest plus
@@ -1812,47 +1812,6 @@ mod tests {
             None,
         );
         assert!(!s.contains("[avoid_repetition]"), "{s}");
-    }
-
-    #[test]
-    fn build_prompt_renders_emotional_context_in_order_when_present() {
-        let reasons = vec![
-            "刚认识有点拘谨".to_string(),
-            "聊开了气氛变好".to_string(),
-            "他主动示好".to_string(),
-        ];
-        let s = build_prompt(
-            &fixture_persona(),
-            &[],
-            &[],
-            None,
-            ReplyStyle::Neutral,
-            &[],
-            None,
-            &[],
-            AffinityScope::full(),
-            &reasons,
-            None,
-            None,
-            None,
-        );
-        assert!(s.contains("[emotional_context]"), "{s}");
-        let oldest = s.find("刚认识有点拘谨").expect("oldest present");
-        let newest = s.find("他主动示好").expect("newest present");
-        assert!(
-            oldest < newest,
-            "emotional_context must render in slice order"
-        );
-        let turn = s
-            .find("[turn_style]")
-            .expect("[turn_style] must be present");
-        let emo = s
-            .find("[emotional_context]")
-            .expect("[emotional_context] must be present");
-        assert!(
-            turn < emo,
-            "[emotional_context] must appear after [turn_style]"
-        );
     }
 
     #[test]

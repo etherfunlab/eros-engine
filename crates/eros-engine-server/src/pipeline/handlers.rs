@@ -817,10 +817,9 @@ pub(super) async fn build_reply_request(
         );
     }
 
-    // Recent affinity reasons for the emotional trajectory. The store returns
-    // newest-first; reverse to oldest→newest for a readable [emotional_context].
-    let mut emotional_context = AffinityRepo { pool: &state.pool }
-        .recent_emotional_reasons(session_id, user_message_id, 5)
+    // Most recent affinity reason for [emotional_context] (single row, not a trajectory).
+    let emotional_context = AffinityRepo { pool: &state.pool }
+        .recent_emotional_reasons(session_id, user_message_id, 1)
         .await
         .unwrap_or_else(|e| {
             tracing::warn!(
@@ -830,7 +829,6 @@ pub(super) async fn build_reply_request(
             );
             Vec::new()
         });
-    emotional_context.reverse();
 
     // #113: dedup recalled memories (mainly the cross-layer 用户：{u} / {u}
     // overlap) before they enter the prompt. Pure; no new DB calls.

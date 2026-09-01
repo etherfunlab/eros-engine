@@ -338,8 +338,7 @@ impl<'a> AffinityRepo<'a> {
     /// Session-scoped via the same affinity join as `list_events`
     /// (companion_affinity.session_id is UNIQUE — no cross-session leakage).
     /// A nonexistent `before_message_id` → NULL cutoff → empty Vec. Used to
-    /// inject the `[emotional_context]` block; the caller reverses to
-    /// oldest→newest for the prompt.
+    /// inject the `[emotional_context]` block.
     pub async fn recent_emotional_reasons(
         &self,
         session_id: Uuid,
