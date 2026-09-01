@@ -647,8 +647,8 @@ pub fn build_prompt(
         _ => String::new(),
     };
 
-    // Volatile (per-turn) emotional trajectory — recent affinity reasons,
-    // rendered oldest→newest as passed. Empty ⇒ omitted.
+    // Volatile (per-turn) emotional context — the single most recent affinity
+    // reason, as passed. Empty ⇒ omitted.
     let emotional_section = if emotional_context.is_empty() {
         String::new()
     } else {
@@ -1350,7 +1350,7 @@ mod tests {
             None,
             &[],
             AffinityScope::full(),
-            &[],
+            &["刚聊开了心情不错".to_string()],
             None,
             None,
             None,
@@ -1365,6 +1365,7 @@ mod tests {
             "[turn_style]",
             "[user_profile]",
             "[shared_memories]",
+            "[emotional_context]",
             "[now]",
             "[iron_rules",
             "[output]",
