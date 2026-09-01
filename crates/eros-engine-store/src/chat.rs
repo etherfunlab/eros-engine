@@ -455,10 +455,12 @@ impl<'a> ChatRepo<'a> {
     }
 
     /// Up to `limit` recent (question, answer) pairs on the product-QA channel,
-    /// strictly before `message_id`'s sent_at, chronological. Uses the same
-    /// subquery-cutoff pattern as `recent_turn_pairs` (looks up `message_id`'s
-    /// `sent_at` rather than trusting a caller-supplied timestamp) but scoped
-    /// to `channel='product_qa'` rows (both sides of a product-QA exchange
+    /// strictly before `message_id`'s sent_at, chronological. The cutoff is
+    /// resolved via subquery — `message_id`'s own `sent_at`, looked up inside
+    /// the query — rather than a caller-supplied timestamp, which avoids a
+    /// race with concurrent streams on the same session inserting a row
+    /// between wall-clock-now and the read of recent rows. Scoped to
+    /// `channel='product_qa'` rows (both sides of a product-QA exchange
     /// carry the marker). Feeds the judge's `[最近产品咨询]` block and the
     /// executor's follow-up context.
     pub async fn recent_product_qa_pairs(
