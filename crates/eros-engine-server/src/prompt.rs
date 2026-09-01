@@ -522,9 +522,6 @@ pub fn build_prompt(
     prompt_traits: &[PromptTrait],
     affinity_scope: AffinityScope,
     recent_turns: &[(String, String)],
-    // Over-used openings to discourage this turn (from `repetition::
-    // overused_openings`). Empty ⇒ the `[avoid_repetition]` block is omitted.
-    avoid_patterns: &[String],
     // Recent affinity-evaluation reasons, oldest→newest. Empty ⇒ the
     // `[emotional_context]` block is omitted.
     emotional_context: &[String],
@@ -649,18 +646,6 @@ pub fn build_prompt(
             "\n[reply_tone]\n这一轮回复的语气：{t}。语气随对话自然流动，不要为了贴合语气而显得刻意。"
         ),
         _ => String::new(),
-    };
-
-    // Volatile (per-turn) anti-repetition directive — rendered after the stable
-    // cache prefix so prefix caching is unaffected. Empty ⇒ omitted.
-    let avoid_section = if avoid_patterns.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\n[avoid_repetition]\n最近你的开头/句式：{}。这一轮换个角度开场，\
-             别重复这些套路——要的是换角度，不是换同义词。",
-            avoid_patterns.join("、")
-        )
     };
 
     // Volatile (per-turn) emotional trajectory — recent affinity reasons,
@@ -788,7 +773,7 @@ pub fn build_prompt(
          [user_profile]\n{profile_str}\n\
          \n\
          [shared_memories]\n{rel_str}{world_section}{stories_section}\
-         {attitude}{state}{hints_section}{tone_section}{avoid_section}{emotional_section}{quote_section}\n\
+         {attitude}{state}{hints_section}{tone_section}{emotional_section}{quote_section}\n\
          \n\
          [now]\n{tc}\n\
          {recent_section}\
@@ -1128,7 +1113,6 @@ mod tests {
             AffinityScope::full(),
             &[],
             &[],
-            &[],
             None,
             None,
             None,
@@ -1168,7 +1152,6 @@ mod tests {
             AffinityScope::full(),
             &[],
             &[],
-            &[],
             None,
             None,
             None,
@@ -1203,7 +1186,6 @@ mod tests {
             AffinityScope::full(),
             &[],
             &[],
-            &[],
             None,
             None,
             None,
@@ -1229,7 +1211,6 @@ mod tests {
             Some("语气敷衍一点，句子短一点"),
             &[],
             AffinityScope::default(),
-            &[],
             &[],
             &[],
             None,
@@ -1263,7 +1244,6 @@ mod tests {
                 tone,
                 &[],
                 AffinityScope::default(),
-                &[],
                 &[],
                 &[],
                 None,
@@ -1301,7 +1281,6 @@ mod tests {
             AffinityScope::default(),
             &[],
             &[],
-            &[],
             None,
             None,
             Some(&mine),
@@ -1330,7 +1309,6 @@ mod tests {
             AffinityScope::default(),
             &[],
             &[],
-            &[],
             None,
             None,
             Some(&theirs),
@@ -1353,7 +1331,6 @@ mod tests {
             None,
             &[],
             AffinityScope::default(),
-            &[],
             &[],
             &[],
             None,
@@ -1396,7 +1373,6 @@ mod tests {
             None,
             &[],
             AffinityScope::full(),
-            &[],
             &[],
             &[],
             None,
@@ -1448,7 +1424,6 @@ mod tests {
             AffinityScope::full(),
             &[],
             &[],
-            &[],
             None,
             None,
             None,
@@ -1482,7 +1457,6 @@ mod tests {
             AffinityScope::full(),
             &[],
             &[],
-            &[],
             None,
             None,
             None,
@@ -1511,7 +1485,6 @@ mod tests {
             None,
             &[],
             AffinityScope::full(),
-            &[],
             &[],
             &[],
             None,
@@ -1548,7 +1521,6 @@ mod tests {
             None,
             &[],
             AffinityScope::full(),
-            &[],
             &[],
             &[],
             None,
@@ -1594,7 +1566,6 @@ mod tests {
             AffinityScope::full(),
             &[],
             &[],
-            &[],
             None,
             None,
             None,
@@ -1617,7 +1588,6 @@ mod tests {
             None,
             &[],
             AffinityScope::full(),
-            &[],
             &[],
             &[],
             None,
@@ -1649,7 +1619,6 @@ mod tests {
             AffinityScope::full(),
             &[],
             &[],
-            &[],
             None,
             None,
             None,
@@ -1672,7 +1641,6 @@ mod tests {
             None,
             &[],
             AffinityScope::full(),
-            &[],
             &[],
             &[],
             None,
@@ -1704,7 +1672,6 @@ mod tests {
             AffinityScope::full(),
             &[],
             &[],
-            &[],
             None,
             None,
             None,
@@ -1730,7 +1697,6 @@ mod tests {
             &[],
             AffinityScope::full(),
             &pairs,
-            &[],
             &[],
             None,
             None,
@@ -1787,7 +1753,6 @@ mod tests {
             AffinityScope::full(),
             &[],
             &[],
-            &[],
             None,
             None,
             None,
@@ -1810,7 +1775,6 @@ mod tests {
             None,
             &[],
             AffinityScope::full(),
-            &[],
             &[],
             &[],
             None,
@@ -1844,7 +1808,6 @@ mod tests {
             AffinityScope::full(),
             &[],
             &[],
-            &[],
             None,
             None,
             None,
@@ -1861,7 +1824,6 @@ mod tests {
             &[],
             AffinityScope::full(),
             &[],
-            &["我看着你".to_string()],
             &["最近聊得不错".to_string()],
             None,
             None,
@@ -1900,7 +1862,6 @@ mod tests {
             AffinityScope::full(),
             &[],
             &[],
-            &[],
             None,
             None,
             None,
@@ -1915,7 +1876,6 @@ mod tests {
             None,
             &t2,
             AffinityScope::full(),
-            &[],
             &[],
             &[],
             None,
@@ -1934,40 +1894,6 @@ mod tests {
     }
 
     #[test]
-    fn build_prompt_renders_avoid_repetition_when_present() {
-        let s = build_prompt(
-            &fixture_persona(),
-            &[],
-            &[],
-            None,
-            ReplyStyle::Neutral,
-            &[],
-            None,
-            &[],
-            AffinityScope::full(),
-            &[],
-            &["我看着你".to_string(), "我盯着你".to_string()],
-            &[],
-            None,
-            None,
-            None,
-        );
-        assert!(s.contains("[avoid_repetition]"), "{s}");
-        assert!(s.contains("我看着你"), "{s}");
-        assert!(s.contains("我盯着你"), "{s}");
-        let turn = s
-            .find("[turn_style]")
-            .expect("[turn_style] must be present");
-        let avoid = s
-            .find("[avoid_repetition]")
-            .expect("[avoid_repetition] must be present");
-        assert!(
-            turn < avoid,
-            "[avoid_repetition] must appear after [turn_style]"
-        );
-    }
-
-    #[test]
     fn build_prompt_omits_avoid_repetition_when_empty() {
         let s = build_prompt(
             &fixture_persona(),
@@ -1979,7 +1905,6 @@ mod tests {
             None,
             &[],
             AffinityScope::full(),
-            &[],
             &[],
             &[],
             None,
@@ -2006,7 +1931,6 @@ mod tests {
             None,
             &[],
             AffinityScope::full(),
-            &[],
             &[],
             &reasons,
             None,
@@ -2046,7 +1970,6 @@ mod tests {
             AffinityScope::full(),
             &[],
             &[],
-            &[],
             None,
             None,
             None,
@@ -2070,7 +1993,6 @@ mod tests {
             None,
             &[],
             AffinityScope::default(),
-            &[],
             &[],
             &[],
             Some(&world),
@@ -2100,7 +2022,6 @@ mod tests {
             AffinityScope::default(),
             &[],
             &[],
-            &[],
             None,
             None,
             None,
@@ -2118,7 +2039,6 @@ mod tests {
             None,
             &[],
             AffinityScope::default(),
-            &[],
             &[],
             &[],
             Some(&empty),
@@ -2144,7 +2064,6 @@ mod tests {
             None,
             &[],
             AffinityScope::default(),
-            &[],
             &[],
             &[],
             None,
@@ -2173,7 +2092,6 @@ mod tests {
             AffinityScope::default(),
             &[],
             &[],
-            &[],
             None,
             None,
             None,
@@ -2189,7 +2107,6 @@ mod tests {
             None,
             &[],
             AffinityScope::default(),
-            &[],
             &[],
             &[],
             None,
@@ -2493,7 +2410,6 @@ mod tests {
             AffinityScope::bond(),
             &[],
             &[],
-            &[],
             None,
             None,
             None,
@@ -2519,7 +2435,6 @@ mod tests {
             None,
             &[],
             AffinityScope::none(),
-            &[],
             &[],
             &[],
             None,
@@ -2591,7 +2506,6 @@ mod tests {
             AffinityScope::full(),
             &[],
             &[],
-            &[],
             None,
             None,
             None,
@@ -2656,7 +2570,6 @@ mod tests {
             None,
             &[],
             AffinityScope::full(),
-            &[],
             &[],
             &[],
             None,

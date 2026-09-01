@@ -330,10 +330,11 @@ impl<'a> AffinityRepo<'a> {
     /// `gift` events for this session, strictly before the current turn's user
     /// row (`before_message_id`), skipping rows whose `context` has no non-empty
     /// `affinity_reason`. The `e.created_at < (sent_at of before_message_id)`
-    /// cutoff is resolved via subquery — same race-safety as
-    /// `ChatRepo::recent_assistant_contents`: under concurrent same-session
-    /// streams, a later turn's affinity event (written after this message
-    /// arrived) cannot leak into this turn's prompt as a "future" reason.
+    /// cutoff is resolved via subquery — same race-safety pattern as
+    /// `ChatRepo::recent_turn_pairs_before_message`: under concurrent
+    /// same-session streams, a later turn's affinity event (written after
+    /// this message arrived) cannot leak into this turn's prompt as a
+    /// "future" reason.
     /// Session-scoped via the same affinity join as `list_events`
     /// (companion_affinity.session_id is UNIQUE — no cross-session leakage).
     /// A nonexistent `before_message_id` → NULL cutoff → empty Vec. Used to

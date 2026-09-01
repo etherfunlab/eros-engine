@@ -563,38 +563,6 @@ impl<'a> ChatRepo<'a> {
         }
         Ok(pairs)
     }
-
-    /// Up to `limit` recent assistant `content` rows for the session, with
-    /// `truncated = FALSE`, strictly before the current turn's user row
-    /// (`before_message_id`). Returned newest-first. The cutoff is resolved
-    /// via subquery on the message id — same race-safety as
-    /// `recent_turn_pairs_before_message` (a concurrent stream can't leak a
-    /// "future" row into this turn). Channel-marked rows ('voice'/'product_qa') are out of companion context and excluded.
-    /// Used by the chat pipeline to mine over-used reply openings for the `[avoid_repetition]` block.
-    pub async fn recent_assistant_contents(
-        &self,
-        session_id: Uuid,
-        before_message_id: Uuid,
-        limit: i64,
-    ) -> Result<Vec<String>, sqlx::Error> {
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT content \
-             FROM engine.chat_messages \
-             WHERE session_id = $1 \
-               AND sent_at < (SELECT sent_at FROM engine.chat_messages WHERE id = $2) \
-               AND truncated = FALSE \
-               AND channel IS NULL \
-               AND role = 'assistant' \
-             ORDER BY sent_at DESC \
-             LIMIT $3",
-        )
-        .bind(session_id)
-        .bind(before_message_id)
-        .bind(limit)
-        .fetch_all(self.pool)
-        .await?;
-        Ok(rows.into_iter().map(|(c,)| c).collect())
-    }
 }
 
 /// Audit metadata for a filtered-success assistant row. Threaded through
@@ -3171,75 +3139,6 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn recent_assistant_contents_excludes_current_and_truncated(pool: PgPool) {
-        // `AssistantInsert` / `ChatRepo` / `UpsertUserOutcome` are already in
-        // scope via the test module's `use super::*;`.
-        let chat_repo = ChatRepo { pool: &pool };
-        let user_id = Uuid::new_v4();
-        let instance_id = seed_persona_instance(&pool, user_id).await;
-        let session = chat_repo
-            .create_session(user_id, instance_id)
-            .await
-            .unwrap();
-
-        // Two prior complete (user, assistant) pairs; the 2nd assistant row is
-        // a TRUNCATED partial that must be excluded.
-        for n in 0..2u8 {
-            let ulid = format!("01J000000000000000008{n}001A");
-            let uid = match chat_repo
-                .upsert_user_message_idempotent(session.id, &format!("u{n}"), &ulid, "user", None)
-                .await
-                .unwrap()
-            {
-                UpsertUserOutcome::Inserted { message_id } => message_id,
-                other => panic!("expected Inserted, got {other:?}"),
-            };
-            chat_repo
-                .insert_assistant_batch(
-                    session.id,
-                    uid,
-                    &[AssistantInsert {
-                        llm_attempts: None,
-                        gateway_errors: None,
-                        id: Uuid::new_v4(),
-                        content: format!("assistant-{n}"),
-                        assistant_action_type: "reply".into(),
-                        truncated: n == 1, // second one is a truncated partial
-                        continues_from_message_id: None,
-                        generation_id: None,
-                        filter_audit: None,
-                        metadata: None,
-                    }],
-                )
-                .await
-                .unwrap();
-        }
-
-        // The "current" user row — its sent_at is the cutoff.
-        let current = match chat_repo
-            .upsert_user_message_idempotent(
-                session.id,
-                "u_current",
-                "01J0000000000000000080900A",
-                "user",
-                None,
-            )
-            .await
-            .unwrap()
-        {
-            UpsertUserOutcome::Inserted { message_id } => message_id,
-            other => panic!("expected Inserted, got {other:?}"),
-        };
-
-        let got = chat_repo
-            .recent_assistant_contents(session.id, current, 6)
-            .await
-            .unwrap();
-        // Only the non-truncated assistant row, newest-first.
-        assert_eq!(got, vec!["assistant-0".to_string()]);
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
     async fn merge_assistant_metadata_key_writes_under_named_key(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
         let s = throwaway_session(&pool).await;
@@ -4155,62 +4054,6 @@ mod tests {
             pairs,
             vec![("这产品是什么".to_string(), "这是……".to_string())]
         );
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    async fn context_readers_exclude_channel_marked_rows(pool: PgPool) {
-        let repo = ChatRepo { pool: &pool };
-        let session_id = throwaway_session(&pool).await.id;
-        // one normal pair, one product_qa pair, then cutoff row
-        for (role, content, channel) in [
-            ("user", "嗨", None::<&str>),
-            ("assistant", "嗨呀", None),
-            ("user", "这产品是什么", Some("product_qa")),
-            ("assistant", "这是官方说明……", Some("product_qa")),
-        ] {
-            sqlx::query(
-                "INSERT INTO engine.chat_messages (session_id, role, content, channel) \
-                 VALUES ($1,$2,$3,$4)",
-            )
-            .bind(session_id)
-            .bind(role)
-            .bind(content)
-            .bind(channel)
-            .execute(&pool)
-            .await
-            .unwrap();
-        }
-        let cur: Uuid = sqlx::query_scalar(
-            "INSERT INTO engine.chat_messages (session_id, role, content) \
-             VALUES ($1, 'user', '在吗') RETURNING id",
-        )
-        .bind(session_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-
-        let pairs = repo
-            .recent_turn_pairs_before_message(session_id, cur, 5)
-            .await
-            .unwrap();
-        assert_eq!(pairs, vec![("嗨".to_string(), "嗨呀".to_string())]);
-
-        let pairs2 = repo
-            .recent_turn_pairs(
-                session_id,
-                chrono::Utc::now() + chrono::Duration::seconds(60),
-                5,
-            )
-            .await
-            .unwrap();
-        assert_eq!(pairs2, vec![("嗨".to_string(), "嗨呀".to_string())]);
-
-        let openings = repo
-            .recent_assistant_contents(session_id, cur, 6)
-            .await
-            .unwrap();
-        assert!(openings.iter().all(|c| c != "这是官方说明……"));
-        assert!(openings.contains(&"嗨呀".to_string()));
     }
 
     #[sqlx::test(migrations = "./migrations")]

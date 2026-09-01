@@ -819,21 +819,6 @@ pub(super) async fn build_reply_request(
 
     let recent_turns = fetch_recent_turn_pairs(&state.pool, session_id, user_message_id).await;
 
-    // Mine over-used openings from the persona's own recent assistant turns
-    // (non-fatal: a DB hiccup just omits the [avoid_repetition] block).
-    let recent_assistant = ChatRepo { pool: &state.pool }
-        .recent_assistant_contents(session_id, user_message_id, 6)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(
-                error = %e,
-                session_id = %session_id,
-                "recent_assistant_contents fetch failed; [avoid_repetition] omitted"
-            );
-            Vec::new()
-        });
-    let avoid_patterns = crate::repetition::overused_openings(&recent_assistant);
-
     // Recent affinity reasons for the emotional trajectory. The store returns
     // newest-first; reverse to oldest→newest for a readable [emotional_context].
     let mut emotional_context = AffinityRepo { pool: &state.pool }
@@ -869,7 +854,6 @@ pub(super) async fn build_reply_request(
         &kept_traits,
         affinity_scope,
         &recent_turns,
-        &avoid_patterns,
         &emotional_context,
         world.as_ref(),
         stories.as_ref(),
