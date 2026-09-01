@@ -47,6 +47,44 @@ fn opening_of(turn: &str) -> Option<String> {
     }
 }
 
+/// Remove a turn's leading sentence — the noise carrier. Splits on
+/// [`SENTENCE_DELIMS`], drops everything up to and including the terminator of
+/// the first non-empty trimmed segment, and returns the trimmed remainder.
+///
+/// Returns an empty string when the text has no second sentence, which is the
+/// signal for the caller to drop the row entirely (spec §4.3). This function
+/// does not decide that; it only reports the remainder.
+///
+/// Production measurement: turns whose first sentence is one character are
+/// 23.5% of turns and carry 58.2% of all opening repetition, so what this
+/// removes is overwhelmingly `唔` / `啊` / `嗯啊`. The median first sentence is
+/// 17.6% of the message.
+pub fn strip_leading_sentence(text: &str) -> String {
+    let mut rest = text;
+    loop {
+        // Position of the next delimiter, in bytes.
+        let end = rest.find(SENTENCE_DELIMS);
+        let (segment, after) = match end {
+            Some(i) => {
+                // Split AFTER the delimiter: `i` is its start, and delimiters
+                // here are multi-byte, so step by the char's own length.
+                let delim_len = rest[i..].chars().next().map_or(1, char::len_utf8);
+                (&rest[..i], &rest[i + delim_len..])
+            }
+            // No delimiter left: the whole remainder is one segment and there
+            // is nothing after it.
+            None => (rest, ""),
+        };
+        if !segment.trim().is_empty() {
+            return after.trim().to_string();
+        }
+        if after.is_empty() {
+            return String::new();
+        }
+        rest = after;
+    }
+}
+
 /// Mine over-used sentence-openings from the persona's recent assistant turns.
 /// Returns openings that recur in **≥2** of the turns, deduped, in first-seen
 /// order, capped at [`MAX_OUTPUT`]. Empty when nothing recurs or there is too
@@ -374,5 +412,71 @@ mod tests {
         assert_eq!(stats.kept, 1);
         assert_eq!(stats.groups, 2);
         assert_eq!(stats.max_occ, 3);
+    }
+
+    #[test]
+    fn strip_removes_only_the_first_sentence() {
+        assert_eq!(
+            strip_leading_sentence("我看着你，轻轻笑了。然后靠近了一点。"),
+            "然后靠近了一点。"
+        );
+    }
+
+    #[test]
+    fn strip_splits_on_question_and_exclamation() {
+        // ！？~ are in SENTENCE_DELIMS, so a short interjection opening ends there.
+        assert_eq!(strip_leading_sentence("怎么了？我在呢。"), "我在呢。");
+        assert_eq!(strip_leading_sentence("好呀~那我们走吧。"), "那我们走吧。");
+        assert_eq!(strip_leading_sentence("唔！你回来了。"), "你回来了。");
+    }
+
+    #[test]
+    fn strip_of_a_single_sentence_is_empty() {
+        assert_eq!(strip_leading_sentence("我在呢。"), "");
+        assert_eq!(strip_leading_sentence("唔"), "");
+    }
+
+    #[test]
+    fn strip_skips_leading_delimiters_and_whitespace() {
+        // Leading delimiters produce empty segments; the first NON-empty one is
+        // the sentence that gets removed.
+        assert_eq!(
+            strip_leading_sentence("。。。我在呢。还有事吗？"),
+            "还有事吗？"
+        );
+        assert_eq!(
+            strip_leading_sentence("   我在呢。好久不见。"),
+            "好久不见。"
+        );
+    }
+
+    #[test]
+    fn strip_of_blank_or_delimiter_only_is_empty() {
+        assert_eq!(strip_leading_sentence(""), "");
+        assert_eq!(strip_leading_sentence("   "), "");
+        assert_eq!(strip_leading_sentence("。。。！"), "");
+    }
+
+    #[test]
+    fn strip_splits_on_newline() {
+        assert_eq!(strip_leading_sentence("我看着你\n你也看着我"), "你也看着我");
+    }
+
+    #[test]
+    fn strip_is_char_boundary_safe_on_long_delimiterless_text() {
+        // One long segment with no delimiter ⇒ the whole thing is the first
+        // sentence ⇒ empty. Must not panic on a byte slice into CJK.
+        let long = "我看着你".repeat(500);
+        assert_eq!(strip_leading_sentence(&long), "");
+    }
+
+    #[test]
+    fn strip_keeps_the_photo_marker_when_it_follows_a_sentence() {
+        // model_facing_assistant_text appends "\n\n[你的照片：…]"; the marker
+        // must survive when there is a sentence before it.
+        assert_eq!(
+            strip_leading_sentence("给你看这个。\n\n[你的照片：海边]"),
+            "[你的照片：海边]"
+        );
     }
 }
