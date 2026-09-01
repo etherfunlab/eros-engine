@@ -8,8 +8,15 @@
 //! v0.7.1 is unchanged, and the persisted row is an ordinary image turn, so
 //! history discovery and the v1 recovery endpoint work on it unmodified.
 //!
+//! With `persist_instruction` the instruction additionally lands as an
+//! ordinary `role='user'` row quoting the source turn, and the new image row
+//! hangs off it — after which the whole turn is shape-identical to a chat-path
+//! image turn.
+//!
 //! Nothing else about a turn runs here: no PDE verdict, no affinity, no
-//! insight or memory extraction, no queue.
+//! insight or memory extraction, no queue. A persisted instruction row is
+//! visible to later turns' pipelines like any user message; this call
+//! triggers none of them.
 
 use axum::extract::{Extension, Path, State};
 use axum::Json;
@@ -59,6 +66,14 @@ pub struct ImageEditRequest {
     /// selection rules as the chat path's `image.prompt_variant`.
     #[serde(default)]
     pub prompt_variant: Option<String>,
+    /// Persist the instruction as a `role='user'` chat message quoting the
+    /// source image turn (`metadata.reply_to_message_id`), and hang the new
+    /// image row off it. The persisted row is an ordinary user message —
+    /// visible to companion context, memory extraction and later affinity
+    /// evaluation like anything else the user said. Default false: the
+    /// audit-only contract, byte-for-byte.
+    #[serde(default)]
+    pub persist_instruction: bool,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -80,6 +95,10 @@ pub struct ImageEditResponse {
     /// The composer's caption for the new picture.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub caption: Option<String>,
+    /// The persisted instruction message, when `persist_instruction` was set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub instruction_message_id: Option<Uuid>,
 }
 
 /// The edit composer's payload. Mirrors `compose_user_payload`'s five slots,
@@ -276,10 +295,13 @@ mod payload_tests {
 
 /// Revise an existing image turn.
 ///
-/// The instruction is an input to a picture, not something the user said to
-/// the character: it is recorded on the audit row, never as a chat message.
-/// The new assistant row inherits the source's `user_message_id`, so the edit
-/// belongs to the turn the original picture answered.
+/// By default the instruction is an input to a picture: it is recorded on the
+/// audit row, never as a chat message, and the new assistant row inherits the
+/// source's `user_message_id` — the edit belongs to the turn the original
+/// picture answered. With `persist_instruction` the instruction is persisted
+/// as a `role='user'` message quoting the source turn, and the new row hangs
+/// off it — the user asked the character for a revision, and history replays
+/// the exchange.
 #[utoipa::path(
     post,
     path = "/v2/comp/session/{session_id}/message/{message_id}/image/edit",
@@ -323,11 +345,17 @@ async fn edit_image(
         .and_then(|m| m.get("image"))
         .cloned()
         .ok_or_else(|| AppError::Conflict("not an image turn".into()))?;
-    // The edit belongs to the turn the source answered; a source with no turn
-    // has nothing to attach to. No engine path produces one.
-    let source_user_message_id = source.user_message_id.ok_or_else(|| {
-        AppError::Conflict("source image turn has no originating user message".into())
-    })?;
+    // Without `persist_instruction` the edit belongs to the turn the source
+    // answered, and a source with no turn has nothing to attach to (no engine
+    // path produces one). With it, the new user row is the anchor and the
+    // source's is never read — `None` here means exactly that branch.
+    let source_user_message_id = if req.persist_instruction {
+        None
+    } else {
+        Some(source.user_message_id.ok_or_else(|| {
+            AppError::Conflict("source image turn has no originating user message".into())
+        })?)
+    };
     let instance_id = session
         .instance_id
         .ok_or_else(|| AppError::Conflict("session has no persona instance".into()))?;
@@ -470,24 +498,31 @@ async fn edit_image(
         eros_engine_core::types::ImageRef::Previous,
         Some(message_id),
     );
-    chat_repo
-        .insert_assistant_batch(
-            session_id,
-            source_user_message_id,
-            &[AssistantInsert {
-                id: new_id,
-                content: String::new(),
-                assistant_action_type: "reply".into(),
-                continues_from_message_id: None,
-                truncated: false,
-                generation_id: None,
-                filter_audit: None,
-                metadata: Some(serde_json::json!({ "image": image_marker })),
-                llm_attempts: None,
-                gateway_errors: None,
-            }],
-        )
-        .await?;
+    let insert = AssistantInsert {
+        id: new_id,
+        content: String::new(),
+        assistant_action_type: "reply".into(),
+        continues_from_message_id: None,
+        truncated: false,
+        generation_id: None,
+        filter_audit: None,
+        metadata: Some(serde_json::json!({ "image": image_marker })),
+        llm_attempts: None,
+        gateway_errors: None,
+    };
+    let instruction_message_id = match source_user_message_id {
+        Some(umid) => {
+            chat_repo
+                .insert_assistant_batch(session_id, umid, &[insert])
+                .await?;
+            None
+        }
+        None => Some(
+            chat_repo
+                .insert_instruction_turn(session_id, &instruction, message_id, &insert)
+                .await?,
+        ),
+    };
 
     Ok(Json(ImageEditResponse {
         message_id: new_id,
@@ -497,6 +532,7 @@ async fn edit_image(
         image_ref: "previous".into(),
         aspect_ratio,
         caption: outcome.caption,
+        instruction_message_id,
     }))
 }
 
@@ -786,9 +822,16 @@ mod tests {
         let state = with_composer(test_state(pool.clone()), &mock.uri(), EDIT_TASK_TOML);
         let mut app = build_router(state);
         let token = mint_test_jwt(user_id);
+        // `persist_instruction` on the failing call: an exhausted composer
+        // must persist neither the instruction row nor a message.
         let (status, _) = send_request(
             &mut app,
-            edit_req(session_id, mid, &token, json!({"instruction": "换套衣服"})),
+            edit_req(
+                session_id,
+                mid,
+                &token,
+                json!({"instruction": "换套衣服", "persist_instruction": true}),
+            ),
         )
         .await;
         assert!(status.is_server_error(), "got {status}");
@@ -829,7 +872,12 @@ mod tests {
 
         let (status, body) = send_request(
             &mut app,
-            edit_req(session_id, mid, &token, json!({"instruction": "换套衣服"})),
+            edit_req(
+                session_id,
+                mid,
+                &token,
+                json!({"instruction": "换套衣服", "persist_instruction": false}),
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "body={body}");
@@ -838,6 +886,8 @@ mod tests {
         assert_eq!(body["caption"], json!("换了条裙子"));
         // Inherited from the source marker when the request omits it.
         assert_eq!(body["aspect_ratio"], json!("3:4"));
+        // An explicit false is the v1 contract: no instruction row, no key.
+        assert!(body.get("instruction_message_id").is_none(), "got {body}");
 
         use base64::Engine as _;
         let decoded = String::from_utf8(
@@ -1009,6 +1059,100 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn persist_instruction_lands_a_user_row_and_anchors_the_image_to_it(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let (_, mid) = seed_image_turn(&pool, session_id).await;
+
+        let mock = MockServer::start().await;
+        mount_editor(&mock).await;
+        let state = with_composer(test_state(pool.clone()), &mock.uri(), EDIT_TASK_TOML);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let (status, body) = send_request(
+            &mut app,
+            edit_req(
+                session_id,
+                mid,
+                &token,
+                json!({"instruction": "  换套衣服  ", "persist_instruction": true}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+
+        let instruction_id =
+            Uuid::parse_str(body["instruction_message_id"].as_str().unwrap()).unwrap();
+        let new_id = Uuid::parse_str(body["message_id"].as_str().unwrap()).unwrap();
+
+        // The instruction row is an ordinary user message quoting the source
+        // turn — the same metadata key the chat stream path writes.
+        let (role, content, quote): (String, String, Option<String>) = sqlx::query_as(
+            "SELECT role, content, metadata->>'reply_to_message_id' \
+             FROM engine.chat_messages WHERE id = $1",
+        )
+        .bind(instruction_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(role, "user");
+        assert_eq!(content, "换套衣服", "stored trimmed");
+        assert_eq!(quote, Some(mid.to_string()));
+
+        // The image row hangs off the instruction, not the source's turn.
+        let row_umid: Option<Uuid> =
+            sqlx::query_scalar("SELECT user_message_id FROM engine.chat_messages WHERE id = $1")
+                .bind(new_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row_umid, Some(instruction_id));
+
+        // History replays the whole exchange: instruction (quote handed back)
+        // directly followed by the new picture.
+        let (status, hist) = send_request(
+            &mut app,
+            Request::builder()
+                .method("GET")
+                .uri(format!("/comp/chat/{session_id}/history"))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let entries = hist
+            .as_array()
+            .or_else(|| hist["messages"].as_array())
+            .expect("history array");
+        let i_user = entries
+            .iter()
+            .position(|e| e["id"] == json!(instruction_id.to_string()))
+            .expect("instruction row in history");
+        let i_image = entries
+            .iter()
+            .position(|e| e["id"] == json!(new_id.to_string()))
+            .expect("image row in history");
+        assert_eq!(
+            i_image,
+            i_user + 1,
+            "instruction directly precedes the picture"
+        );
+        assert_eq!(
+            entries[i_user]["reply_to_message_id"],
+            json!(mid.to_string())
+        );
+        assert_eq!(entries[i_image]["image"], json!(true));
+        assert_eq!(
+            entries[i_image]["user_message_id"],
+            json!(instruction_id.to_string())
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn an_edit_can_itself_be_edited(pool: PgPool) {
         let user_id = Uuid::new_v4();
         let genome_id = seed_genome(&pool, "Aria").await;
@@ -1041,6 +1185,30 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "body={second}");
         assert_eq!(second["edit_of"], json!(first_id.to_string()));
+
+        // With the switch on, an edit of an edit anchors to its own new
+        // instruction row — not to the chain it descends from.
+        let (status, third) = send_request(
+            &mut app,
+            edit_req(
+                session_id,
+                first_id,
+                &token,
+                json!({"instruction": "背景换成海边", "persist_instruction": true}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={third}");
+        let instruction_id =
+            Uuid::parse_str(third["instruction_message_id"].as_str().unwrap()).unwrap();
+        let third_id = Uuid::parse_str(third["message_id"].as_str().unwrap()).unwrap();
+        let row_umid: Option<Uuid> =
+            sqlx::query_scalar("SELECT user_message_id FROM engine.chat_messages WHERE id = $1")
+                .bind(third_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row_umid, Some(instruction_id));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

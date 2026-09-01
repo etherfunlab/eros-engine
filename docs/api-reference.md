@@ -529,19 +529,28 @@ consumer draws it, exactly as for a chat image turn.
   "instruction": "换套衣服",
   "style": "realistic",
   "aspect_ratio": "3:4",
-  "prompt_variant": "a"
+  "prompt_variant": "a",
+  "persist_instruction": true
 }
 ```
 
 - `instruction` — required, non-blank, ≤4096 chars. What to change, in the
-  user's words. It is an input to a picture, not a chat message: it is recorded
-  on the audit row and never persisted as conversation.
+  user's words. Without `persist_instruction` it is an input to a picture, not
+  a chat message: recorded on the audit row and never persisted as
+  conversation.
 - `style` — `realistic` (default) | `semi_realistic` | `anime`. Pass the style
   the source was drawn with; the engine does not record it on the message.
 - `aspect_ratio` — `1:1` | `3:4` | `4:3` | `9:16` | `16:9`. Defaults to the
   source turn's.
 - `prompt_variant` — selects a `[tasks.chat_image_edit_compose].filter_prompt`
   variant, with the same rules as the chat path's `image.prompt_variant`.
+- `persist_instruction` — default `false`. When set, the instruction is
+  persisted as an ordinary `role='user'` message quoting the source turn
+  (`metadata.reply_to_message_id`, the same key the chat path writes), and the
+  new image row hangs off it instead of inheriting the source's turn. History
+  then replays the exchange: user instruction → assistant picture. The row is
+  a real user message — visible to companion context, memory extraction and
+  later affinity evaluation like anything else the user said.
 
 ```json
 {
@@ -550,9 +559,14 @@ consumer draws it, exactly as for a chat image turn.
   "composed_prompt": "<base64>",
   "image_ref": "previous",
   "aspect_ratio": "3:4",
-  "caption": "换了条裙子"
+  "caption": "换了条裙子",
+  "instruction_message_id": "…"
 }
 ```
+
+`instruction_message_id` is present only when `persist_instruction` was set:
+the persisted instruction message, so a client can render the user bubble
+without refetching history.
 
 `composed_prompt` is base64(STANDARD) of the UTF-8 wire prompt — the same
 encoding as the SSE `image_request` frame and the recovery endpoint, so an
@@ -565,9 +579,11 @@ The new message is an ordinary image turn: it appears in history with
 `GET /comp/chat/{session_id}/messages/{message_id}/image-request`. Its
 `metadata.image` additionally carries `edit_of`. An edit can itself be edited.
 
-Nothing else about a turn runs: no PDE decision, no affinity movement, no
-insight or memory extraction. The new row inherits the source's
-`user_message_id` — the edit belongs to the turn the original picture answered.
+Nothing else about a turn runs on this call: no PDE decision, no affinity
+movement, no insight or memory extraction. Without `persist_instruction` the
+new row inherits the source's `user_message_id` — the edit belongs to the turn
+the original picture answered; with it, the new row's `user_message_id` is the
+persisted instruction message.
 
 | Status | Meaning |
 |---|---|
