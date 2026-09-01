@@ -1396,7 +1396,7 @@
           "companion"
         ],
         "summary": "Revise an existing image turn.",
-        "description": "The instruction is an input to a picture, not something the user said to\nthe character: it is recorded on the audit row, never as a chat message.\nThe new assistant row inherits the source's `user_message_id`, so the edit\nbelongs to the turn the original picture answered.",
+        "description": "By default the instruction is an input to a picture: it is recorded on the\naudit row, never as a chat message, and the new assistant row inherits the\nsource's `user_message_id` — the edit belongs to the turn the original\npicture answered. With `persist_instruction` the instruction is persisted\nas a `role='user'` message quoting the source turn, and the new row hangs\noff it — the user asked the character for a revision, and history replays\nthe exchange.",
         "operationId": "edit_image",
         "parameters": [
           {
@@ -2629,6 +2629,10 @@
             "type": "string",
             "description": "What to change, in the user's words (\"换套衣服\"). Required, non-blank."
           },
+          "persist_instruction": {
+            "type": "boolean",
+            "description": "Persist the instruction as a `role='user'` chat message quoting the\nsource image turn (`metadata.reply_to_message_id`), and hang the new\nimage row off it. The persisted row is an ordinary user message —\nvisible to companion context, memory extraction and later affinity\nevaluation like anything else the user said. Default false: the\naudit-only contract, byte-for-byte."
+          },
           "prompt_variant": {
             "type": [
               "string",
@@ -2678,6 +2682,13 @@
           "image_ref": {
             "type": "string",
             "description": "Always `\"previous\"`: on an edit turn that means the `edit_of` picture."
+          },
+          "instruction_message_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The persisted instruction message, when `persist_instruction` was set."
           },
           "message_id": {
             "type": "string",

@@ -666,6 +666,61 @@ pub enum VoiceUserInsert {
 /// Core of `upsert_user_message_idempotent`, callable inside a caller-owned
 /// transaction so the async enqueue path can add a queue row atomically.
 /// Does NOT begin or commit — the caller owns the transaction boundary.
+/// One assistant row, inside the caller's transaction. The single INSERT both
+/// `insert_assistant_batch` and `insert_instruction_turn` go through.
+async fn insert_assistant_row_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    session_id: Uuid,
+    user_message_id: Uuid,
+    row: &AssistantInsert,
+) -> Result<(), sqlx::Error> {
+    let (pre_filter, filter_model, filter_triggers, f_client_msg_id, f_generation_id) =
+        match &row.filter_audit {
+            Some(a) => (
+                Some(a.pre_filter_content.as_str()),
+                Some(a.filter_model.as_str()),
+                // JSON null and SQL NULL are equivalent "no predicate data"
+                // for this audit column; normalize JSON null to SQL NULL so
+                // `filter_triggers IS NULL` is a clean "no predicates fired"
+                // probe. (Binding Value::Null would otherwise write JSONB 'null'.)
+                (!a.filter_triggers.is_null()).then_some(&a.filter_triggers),
+                Some(a.f_client_msg_id.as_str()),
+                a.f_generation_id.as_deref(),
+            ),
+            None => (None, None, None, None, None),
+        };
+    sqlx::query(
+        "INSERT INTO engine.chat_messages \
+           (id, session_id, role, content, user_message_id, \
+            continues_from_message_id, truncated, generation_id, \
+            assistant_action_type, \
+            pre_filter_content, filter_model, filter_triggers, \
+            f_client_msg_id, f_generation_id, metadata, \
+            llm_attempts, gateway_errors) \
+         VALUES ($1, $2, 'assistant', $3, $4, $5, $6, $7, $8, \
+                 $9, $10, $11, $12, $13, $14, $15, $16)",
+    )
+    .bind(row.id)
+    .bind(session_id)
+    .bind(&row.content)
+    .bind(user_message_id)
+    .bind(row.continues_from_message_id)
+    .bind(row.truncated)
+    .bind(&row.generation_id)
+    .bind(&row.assistant_action_type)
+    .bind(pre_filter)
+    .bind(filter_model)
+    .bind(filter_triggers)
+    .bind(f_client_msg_id)
+    .bind(f_generation_id)
+    .bind(&row.metadata)
+    .bind(&row.llm_attempts)
+    .bind(&row.gateway_errors)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 pub(crate) async fn upsert_user_message_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     session_id: Uuid,
@@ -1000,50 +1055,7 @@ impl<'a> ChatRepo<'a> {
         }
         let mut tx = self.pool.begin().await?;
         for row in rows {
-            let (pre_filter, filter_model, filter_triggers, f_client_msg_id, f_generation_id) =
-                match &row.filter_audit {
-                    Some(a) => (
-                        Some(a.pre_filter_content.as_str()),
-                        Some(a.filter_model.as_str()),
-                        // JSON null and SQL NULL are equivalent "no predicate data"
-                        // for this audit column; normalize JSON null to SQL NULL so
-                        // `filter_triggers IS NULL` is a clean "no predicates fired"
-                        // probe. (Binding Value::Null would otherwise write JSONB 'null'.)
-                        (!a.filter_triggers.is_null()).then_some(&a.filter_triggers),
-                        Some(a.f_client_msg_id.as_str()),
-                        a.f_generation_id.as_deref(),
-                    ),
-                    None => (None, None, None, None, None),
-                };
-            sqlx::query(
-                "INSERT INTO engine.chat_messages \
-                   (id, session_id, role, content, user_message_id, \
-                    continues_from_message_id, truncated, generation_id, \
-                    assistant_action_type, \
-                    pre_filter_content, filter_model, filter_triggers, \
-                    f_client_msg_id, f_generation_id, metadata, \
-                    llm_attempts, gateway_errors) \
-                 VALUES ($1, $2, 'assistant', $3, $4, $5, $6, $7, $8, \
-                         $9, $10, $11, $12, $13, $14, $15, $16)",
-            )
-            .bind(row.id)
-            .bind(session_id)
-            .bind(&row.content)
-            .bind(user_message_id)
-            .bind(row.continues_from_message_id)
-            .bind(row.truncated)
-            .bind(&row.generation_id)
-            .bind(&row.assistant_action_type)
-            .bind(pre_filter)
-            .bind(filter_model)
-            .bind(filter_triggers)
-            .bind(f_client_msg_id)
-            .bind(f_generation_id)
-            .bind(&row.metadata)
-            .bind(&row.llm_attempts)
-            .bind(&row.gateway_errors)
-            .execute(&mut *tx)
-            .await?;
+            insert_assistant_row_in_tx(&mut tx, session_id, user_message_id, row).await?;
         }
         sqlx::query("UPDATE engine.chat_sessions SET last_active_at = now() WHERE id = $1")
             .bind(session_id)
@@ -1051,6 +1063,45 @@ impl<'a> ChatRepo<'a> {
             .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Persist an image-edit instruction as a `role='user'` row quoting the
+    /// source image turn, plus the assistant image row hanging off it — one
+    /// transaction, so an instruction with no picture never exists. The quote
+    /// key is the same `metadata.reply_to_message_id` the chat stream path
+    /// writes, so history hands it back unchanged. Returns the user row's id.
+    /// Bumps `last_active_at` once.
+    pub async fn insert_instruction_turn(
+        &self,
+        session_id: Uuid,
+        instruction: &str,
+        source_message_id: Uuid,
+        row: &AssistantInsert,
+    ) -> Result<Uuid, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let user_message_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata) \
+             VALUES ($1, 'user', $2, $3) RETURNING id",
+        )
+        .bind(session_id)
+        .bind(instruction)
+        .bind(serde_json::json!({ "reply_to_message_id": source_message_id }))
+        .fetch_one(&mut *tx)
+        .await?;
+        insert_assistant_row_in_tx(&mut tx, session_id, user_message_id, row).await?;
+        // One transaction has one `now()`, so both rows' `sent_at` would tie —
+        // and history orders by `sent_at` alone. Stamp the picture with real
+        // statement time so it always replays after its instruction.
+        sqlx::query("UPDATE engine.chat_messages SET sent_at = clock_timestamp() WHERE id = $1")
+            .bind(row.id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE engine.chat_sessions SET last_active_at = now() WHERE id = $1")
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(user_message_id)
     }
 
     /// Idempotently persist a user turn on the voice channel. Mirrors the

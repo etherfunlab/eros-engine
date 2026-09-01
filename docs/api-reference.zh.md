@@ -457,17 +457,24 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
   "instruction": "换套衣服",
   "style": "realistic",
   "aspect_ratio": "3:4",
-  "prompt_variant": "a"
+  "prompt_variant": "a",
+  "persist_instruction": true
 }
 ```
 
 - `instruction` —— 必填，非空白，≤4096 字。要改什么，用用户自己的话写。
-  它是画图的输入，不是一条聊天消息：只记在审计行上，不落成对话。
+  不带 `persist_instruction` 时它是画图的输入，不是一条聊天消息：
+  只记在审计行上，不落成对话。
 - `style` —— `realistic`（缺省）| `semi_realistic` | `anime`。传原图用的风格；
   引擎不会把风格记在消息上。
 - `aspect_ratio` —— `1:1` | `3:4` | `4:3` | `9:16` | `16:9`。缺省沿用原图回合的。
 - `prompt_variant` —— 选 `[tasks.chat_image_edit_compose].filter_prompt` 的变体，
   规则与聊天路径的 `image.prompt_variant` 相同。
+- `persist_instruction` —— 缺省 `false`。设上时，指令落成一条普通的
+  `role='user'` 消息，引用原图回合（`metadata.reply_to_message_id`，
+  与聊天路径写的是同一个键），新图片行挂在它上面，不再沿用原图的回合。
+  历史自然回放整轮：用户指令 → 角色新图。这条 user row 是真实的用户消息 ——
+  和用户说的其他话一样，进 companion context、记忆抽取和之后的好感度评估。
 
 ```json
 {
@@ -476,9 +483,13 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
   "composed_prompt": "<base64>",
   "image_ref": "previous",
   "aspect_ratio": "3:4",
-  "caption": "换了条裙子"
+  "caption": "换了条裙子",
+  "instruction_message_id": "…"
 }
 ```
+
+`instruction_message_id` 只在设了 `persist_instruction` 时出现：
+落库的那条指令消息，客户端不用重拉历史就能渲染用户气泡。
 
 `composed_prompt` 是 UTF-8 提示词的 base64（STANDARD）—— 与 SSE `image_request`
 帧、恢复端点的编码一致，现成的画图链路可直接消费。`image_ref` 恒为 `previous`，
@@ -488,8 +499,10 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 `GET /comp/chat/{session_id}/messages/{message_id}/image-request` 恢复。它的
 `metadata.image` 另外带一个 `edit_of`。编辑出来的图还可以再编辑。
 
-回合的其余部分一概不跑：不做 PDE 判定、不动好感度、不抽 insight 与记忆。
-新行沿用原图行的 `user_message_id` —— 这次编辑属于原图所回应的那个回合。
+这次调用里回合的其余部分一概不跑：不做 PDE 判定、不动好感度、不抽 insight
+与记忆。不带 `persist_instruction` 时新行沿用原图行的 `user_message_id` ——
+这次编辑属于原图所回应的那个回合；带上时，新行的 `user_message_id`
+就是落库的那条指令消息。
 
 | 状态码 | 含义 |
 |---|---|
