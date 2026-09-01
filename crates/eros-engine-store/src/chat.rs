@@ -1091,11 +1091,17 @@ impl<'a> ChatRepo<'a> {
         insert_assistant_row_in_tx(&mut tx, session_id, user_message_id, row).await?;
         // One transaction has one `now()`, so both rows' `sent_at` would tie —
         // and history orders by `sent_at` alone. Stamp the picture with real
-        // statement time so it always replays after its instruction.
-        sqlx::query("UPDATE engine.chat_messages SET sent_at = clock_timestamp() WHERE id = $1")
-            .bind(row.id)
-            .execute(&mut *tx)
-            .await?;
+        // statement time, floored one microsecond (the column's precision)
+        // above the instruction row's `now()`: `clock_timestamp()` alone could
+        // land on the same microsecond or, on a clock step, before it.
+        sqlx::query(
+            "UPDATE engine.chat_messages \
+             SET sent_at = GREATEST(clock_timestamp(), now() + interval '1 microsecond') \
+             WHERE id = $1",
+        )
+        .bind(row.id)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query("UPDATE engine.chat_sessions SET last_active_at = now() WHERE id = $1")
             .bind(session_id)
             .execute(&mut *tx)
