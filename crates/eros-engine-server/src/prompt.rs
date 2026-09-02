@@ -224,20 +224,25 @@ fn length_rule(affinity: Option<&Affinity>, scope: AffinityScope) -> &'static st
     }
 }
 
-/// Attitude directives derived from the affinity state.
+/// Cold-side bans and behavior unlocks derived from the affinity state
+/// (spec 2026-09-03 §6.2). Gates only — deterministic thresholds the
+/// LLM-written `[feelings]` clause cannot be trusted to carry. Warm-side
+/// texture (友善/平淡/温暖/有耐心/好奇) moved to the clause; the
+/// intrigue>0.7 "ask questions" directive is left for TurnNudges' die
+/// (#332 — a standing instruction fights the 5% cadence the engine owns).
 pub fn affinity_to_attitude_prompt(a: &Affinity, scope: AffinityScope) -> String {
     let mut directives: Vec<&str> = Vec::new();
 
-    // Cuts follow the shared 0.35/0.65 band scale (4.0); ≤0.2 is the
-    // level-1 floor region (φ·x), i.e. a judged-cold turn.
+    // Cold-side bans and behavior unlocks only (spec 2026-09-03 §6.2):
+    // deterministic gates the clause cannot be trusted to carry. Warm-side
+    // texture (友善/平淡/温暖/有耐心/好奇) moved to the LLM-written
+    // [feelings] clause; the intrigue>0.7 "ask questions" directive left
+    // for TurnNudges' die (#332 — a standing instruction fights the 5%
+    // cadence the engine owns).
     if scope.warmth {
         if a.warmth > 0.65 {
-            directives.push("语气温暖，可以用一些亲昵的称呼");
-        } else if a.warmth > 0.35 {
-            directives.push("语气友善自然");
-        } else if a.warmth > WARMTH_COLD_FLOOR {
-            directives.push("语气平淡，保持礼貌但不热络");
-        } else {
+            directives.push("可以用一些亲昵的称呼");
+        } else if a.warmth <= WARMTH_COLD_FLOOR {
             // Tone only — the length band is [reply_length]'s fact (the cold
             // warmth already depresses it through length_score).
             directives.push("语气冷淡，不主动延伸话题");
@@ -252,26 +257,18 @@ pub fn affinity_to_attitude_prompt(a: &Affinity, scope: AffinityScope) -> String
         }
     }
 
-    if scope.intrigue {
-        if a.intrigue > 0.7 {
-            directives.push("你对他很好奇，主动问问题，想了解更多");
-        } else if a.intrigue < INTRIGUE_COLD_FLOOR {
-            directives.push("你对他兴趣不大，不会主动找话题");
-        }
+    if scope.intrigue && a.intrigue < INTRIGUE_COLD_FLOOR {
+        directives.push("你对他兴趣不大，不会主动找话题");
     }
 
     if scope.intimacy && a.intimacy > 0.5 {
         directives.push("可以引用之前聊过的事情，有默契感，用你们之间的梗");
     }
 
-    if scope.patience {
-        if a.patience < 0.35 {
-            // Tone only — length is [reply_length]'s fact, and low patience
-            // already depresses the band through length_score.
-            directives.push("你有点不耐烦了，回复可以更敷衍");
-        } else if a.patience > 0.65 {
-            directives.push("你很有耐心，愿意陪他聊");
-        }
+    if scope.patience && a.patience < 0.35 {
+        // Tone only — length is [reply_length]'s fact, and low patience
+        // already depresses the band through length_score.
+        directives.push("你有点不耐烦了，回复可以更敷衍");
     }
 
     if scope.tension && a.tension > 0.5 {
@@ -719,35 +716,20 @@ pub fn build_prompt(
     let attitude = affinity
         .map(|a| affinity_to_attitude_prompt(a, affinity_scope))
         .unwrap_or_default();
+    // [feelings] (spec 2026-09-03 §6.1): the session's LLM-written feeling
+    // clause, verbatim. Raw axis floats are gone with no fallback — models
+    // don't read calibrated numbers, and every tier-shaped rendering
+    // already lives in [mood]/[reply_length]. No clause yet (feature off /
+    // fresh session), or a zero-axis scope ⇒ block absent, byte-identical
+    // to the old empty case. The clause changes only on movement turns, so
+    // this section is more cache-stable than the floats it replaces.
     let state = affinity
-        .map(|a| {
-            let mut parts: Vec<String> = Vec::new();
-            if affinity_scope.warmth {
-                parts.push(format!("warmth={:.2}", a.warmth));
-            }
-            if affinity_scope.trust {
-                parts.push(format!("trust={:.2}", a.trust));
-            }
-            if affinity_scope.intrigue {
-                parts.push(format!("intrigue={:.2}", a.intrigue));
-            }
-            if affinity_scope.intimacy {
-                parts.push(format!("intimacy={:.2}", a.intimacy));
-            }
-            if affinity_scope.patience {
-                parts.push(format!("patience={:.2}", a.patience));
-            }
-            if affinity_scope.tension {
-                parts.push(format!("tension={:.2}", a.tension));
-            }
-            if parts.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "\n[feelings]（绝对不要在回复中提及这些数值，这是隐藏参数）\n{}",
-                    parts.join(", ")
-                )
-            }
+        .filter(|_| affinity_scope.active_count() > 0)
+        .and_then(|a| a.feeling_clause.as_deref())
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(|clause| {
+            format!("\n[feelings]（你此刻对他的真实感觉，这是内心状态，绝对不要复述）\n{clause}")
         })
         .unwrap_or_default();
     let style_text = style_directive(style);
@@ -2752,12 +2734,13 @@ mod tests {
             None,
             TurnNudges::default(),
         );
-        assert!(p.contains("warmth=") && p.contains("intimacy=") && p.contains("tension="));
-        assert!(!p.contains("trust=") && !p.contains("intrigue=") && !p.contains("patience="));
         // attitude directives are gated by the same axis set: bond-axis directives
         // present, chemistry-axis directives (trust/intrigue/patience) suppressed.
-        assert!(p.contains("语气温暖"));
-        assert!(!p.contains("私密") && !p.contains("好奇") && !p.contains("有耐心"));
+        assert!(p.contains("可以用一些亲昵的称呼"));
+        assert!(p.contains("可以引用之前聊过的事情"));
+        assert!(p.contains("带点小傲娇"));
+        assert!(!p.contains("私密") && !p.contains("兴趣不大") && !p.contains("不耐烦"));
+        assert!(!p.contains("warmth="));
     }
 
     #[test]
@@ -2782,6 +2765,118 @@ mod tests {
         );
         assert!(!p.contains("[feelings]"));
         assert!(!p.contains("[mood]"));
+    }
+
+    #[test]
+    fn feelings_renders_clause_never_numbers() {
+        let mut a = make_affinity(0.8, 0.8, 0.8, 0.8, 0.8, 0.8);
+        a.feeling_clause = Some("我现在很想跟他多聊几句。".into());
+        let p = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            Some(&a),
+            ReplyStyle::Neutral,
+            &[],
+            None,
+            &[],
+            AffinityScope::bond(),
+            &[],
+            None,
+            None,
+            None,
+            None,
+            TurnNudges::default(),
+        );
+        assert!(
+            p.contains("[feelings]（你此刻对他的真实感觉，这是内心状态，绝对不要复述）"),
+            "{p}"
+        );
+        assert!(p.contains("我现在很想跟他多聊几句。"), "{p}");
+        // Raw floats are gone with no fallback — spec §6.1.
+        assert!(!p.contains("warmth=") && !p.contains("intimacy="), "{p}");
+    }
+
+    #[test]
+    fn feelings_absent_without_clause_or_scope() {
+        // No clause yet ⇒ block absent (numbers do NOT come back).
+        let a = make_affinity(0.8, 0.8, 0.8, 0.8, 0.8, 0.8);
+        let p = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            Some(&a),
+            ReplyStyle::Neutral,
+            &[],
+            None,
+            &[],
+            AffinityScope::bond(),
+            &[],
+            None,
+            None,
+            None,
+            None,
+            TurnNudges::default(),
+        );
+        assert!(!p.contains("[feelings]"), "{p}");
+
+        // Clause present but zero-axis scope ⇒ still absent.
+        let mut b = make_affinity(0.8, 0.8, 0.8, 0.8, 0.8, 0.8);
+        b.feeling_clause = Some("我现在很想跟他多聊几句。".into());
+        let p = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            Some(&b),
+            ReplyStyle::Neutral,
+            &[],
+            None,
+            &[],
+            AffinityScope::none(),
+            &[],
+            None,
+            None,
+            None,
+            None,
+            TurnNudges::default(),
+        );
+        assert!(!p.contains("[feelings]") && !p.contains("[mood]"), "{p}");
+    }
+
+    #[test]
+    fn mood_keeps_gates_drops_texture() {
+        // spec §6.2 table. High everything: unlocks survive, warm texture doesn't.
+        let hot = make_affinity(0.8, 0.8, 0.8, 0.8, 0.8, 0.8);
+        let m = affinity_to_attitude_prompt(&hot, AffinityScope::full());
+        assert!(
+            m.contains("可以用一些亲昵的称呼"),
+            "warmth unlock stays: {m}"
+        );
+        assert!(!m.contains("语气温暖"), "warm texture dropped: {m}");
+        assert!(m.contains("可以分享更私密的想法和小秘密"), "{m}");
+        assert!(m.contains("可以引用之前聊过的事情"), "{m}");
+        assert!(m.contains("带点小傲娇，不要太好说话，适度推拉"), "{m}");
+        assert!(
+            !m.contains("主动问问题"),
+            "question rhythm is TurnNudges' fact: {m}"
+        );
+        assert!(!m.contains("你很有耐心"), "patience texture dropped: {m}");
+
+        // Cold everything: every cold gate survives.
+        let cold = make_affinity(0.1, 0.1, 0.1, 0.1, 0.1, 0.1);
+        let m = affinity_to_attitude_prompt(&cold, AffinityScope::full());
+        assert!(m.contains("语气冷淡，不主动延伸话题"), "{m}");
+        assert!(m.contains("保持一定距离感，不轻易透露内心想法"), "{m}");
+        assert!(m.contains("你对他兴趣不大，不会主动找话题"), "{m}");
+        assert!(m.contains("你有点不耐烦了，回复可以更敷衍"), "{m}");
+
+        // Mid-band warmth (0.5): no warmth directive at all any more.
+        let mid = make_affinity(0.5, 0.5, 0.5, 0.5, 0.5, 0.5);
+        let m = affinity_to_attitude_prompt(&mid, AffinityScope::full());
+        assert!(
+            !m.contains("语气友善自然") && !m.contains("语气平淡"),
+            "{m}"
+        );
     }
 
     #[test]
