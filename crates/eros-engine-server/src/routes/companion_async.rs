@@ -4,7 +4,7 @@
 //! Spec: docs/superpowers/specs/2026-08-20-async-chat-endpoint-design.md
 //! Renamed from /v2/comp/chat/{session_id}/message/async by the v2 convention
 //! (docs/superpowers/specs/2026-08-22-user-insights-and-api-v2-design.md §4.6);
-//! the old path was removed in 1.6.0 (see docs/migrating/async-chat-v1-6-0.md).
+//! the old path was removed in 1.6.0 (see docs/migrating/v1-6-0-async-chat.md).
 //! The /v2 prefix exists to avoid any confusion with the long-removed
 //! /comp/chat/{id}/message_async endpoint (deleted in v0.2.0, a3f86ea).
 

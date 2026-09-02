@@ -1051,7 +1051,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 ### `GET /comp/chat/{user_id}/sessions`
 
-All chat sessions for `user_id`. The path's `user_id` MUST match the JWT's user_id; otherwise 403.
+All chat sessions for `user_id`. The path's `user_id` MUST match the JWT's user_id; otherwise 403. Returns `{ "sessions": [...] }`, each entry carrying `session_id`, `instance_id`, `is_converted`, `last_active_at`, and `channel`.
 
 ### `GET /comp/user/{user_id}/profile`
 
@@ -1250,7 +1250,7 @@ A frontend-shaped mirror of selected `/comp/*` routes for first-party
 clients. Same Supabase JWT auth and the same per-user ownership checks as
 the canonical routes — only the **response shape** differs (slimmer DTOs,
 bundled payloads). Canonical `/comp/*` routes are never reshaped to fit a
-frontend; a BFF route is added alongside instead. Four routes exist today.
+frontend; a BFF route is added alongside instead. Five routes exist today.
 
 ### `POST /bff/v1/comp/chat/start`
 

@@ -90,7 +90,7 @@ gates.
 
 ## Auth
 
-Middleware (`auth::middleware::require_auth`) protects everything except `/healthz` (merged outside the layer) and `/docs` (merged in `main.rs`) — today that means `/comp/*`, `/bff/v1/*`, `/world/*`, and `/persona/*`. The layer attaches to the merged sub-router in `routes/mod.rs`, not to a path prefix, which is why a new namespace (e.g. `/persona/*`) needs no extra auth wiring. It pulls the `Authorization: Bearer …` header, calls `state.auth.validate(token)`, and inserts an `AuthUser(user_id)` extension into the request. Every protected handler reads `Extension(AuthUser(user_id))`; `user_id` from request bodies is never trusted.
+Middleware (`auth::middleware::require_auth`) protects everything except `/healthz` (merged outside the layer) and `/docs` (merged in `main.rs`) — today that means `/comp/*`, `/v2/comp/*`, `/bff/v1/*`, `/world/*`, and `/persona/*`. The layer attaches to the merged sub-router in `routes/mod.rs`, not to a path prefix, which is why a new namespace (e.g. `/persona/*`) needs no extra auth wiring. It pulls the `Authorization: Bearer …` header, calls `state.auth.validate(token)`, and inserts an `AuthUser(user_id)` extension into the request. Every protected handler reads `Extension(AuthUser(user_id))`; `user_id` from request bodies is never trusted.
 
 The default validator is `SupabaseJwtValidator`; it dispatches per-token on the JWT `alg` header, preferring JWKS-based asymmetric verification (ES256/RS256/EdDSA) — the default since Supabase's 2025 JWT Signing Keys rollout — sourced from `SUPABASE_JWKS_URL` or derived from `SUPABASE_URL`, and falling back to legacy HS256 against `SUPABASE_JWT_SECRET` for projects that haven't migrated. Self-hosters with a different IdP implement the `AuthValidator` trait and inject their impl into `AppState.auth`.
 
@@ -179,7 +179,7 @@ crates/
 │       ├── voyage.rs         # 512-dim embeddings, fail-loud on empty key
 │       └── model_config.rs   # TOML loader
 ├── eros-engine-store/
-│   ├── migrations/           # 0000_schema → 0049_affinity_tiers_and_event_state
+│   ├── migrations/           # 0000_schema → 0061_drop_child_model_usage
 │   └── src/
 │       ├── pool.rs           # PgPoolOptions builder
 │       ├── chat.rs           # ChatRepo
@@ -198,7 +198,7 @@ crates/
         ├── auth/             # AuthValidator trait + Supabase impl + middleware
         ├── pipeline/         # stream (run_stream) / handlers / post_process / dreaming / …
         ├── prompt.rs         # system-prompt builder (affinity → directives)
-        ├── routes/           # health / companion / companion_stream / voice / persona / world_town / bff / dto / mod
+        ├── routes/           # health / companion / companion_stream / companion_async / insight / image_edit / voice / persona / world_town / bff / dto / mod
         └── openapi.rs        # utoipa ApiDoc spec metadata
 ```
 
