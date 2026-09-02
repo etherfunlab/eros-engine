@@ -1894,7 +1894,7 @@ mod tests {
             "verbatim render: {s}"
         );
         assert!(
-            !s.contains("⑧"),
+            !s.contains("严格遵守自己的性别"),
             "non-binary must not get the binary anatomy rule: {s}"
         );
     }
@@ -1920,7 +1920,10 @@ mod tests {
             TurnNudges::default(),
         );
         assert!(s.contains("你是 Aria，24 岁，INFP 性格。"), "{s}");
-        assert!(!s.contains("⑧"), "no gender → no ⑧: {s}");
+        assert!(
+            !s.contains("严格遵守自己的性别"),
+            "no gender → no gender rule: {s}"
+        );
     }
 
     #[test]
@@ -1944,13 +1947,13 @@ mod tests {
             None,
             TurnNudges::default(),
         );
-        // blank gender must not produce a double comma or a ⑧ rule
+        // blank gender must not produce a double comma or the gender rule
         assert!(s.contains("你是 Aria，24 岁，INFP 性格。"), "{s}");
         assert!(
             !s.contains("，，"),
             "blank gender must not double-comma: {s}"
         );
-        assert!(!s.contains("⑧"), "{s}");
+        assert!(!s.contains("严格遵守自己的性别"), "{s}");
     }
 
     #[test]
