@@ -422,7 +422,7 @@ stream 客户端——事后可通过
 Realtime 读取。
 
 改名前的路径 `POST /v2/comp/chat/{session_id}/message/async` 已在 1.6.0 移除，现在返回 404（带有效 bearer 时；`require_auth`
-仍先于路由匹配返回 401）——见 [`docs/migrating/async-chat-v1-6-0.md`](migrating/async-chat-v1-6-0.md)。
+仍先于路由匹配返回 401）——见 [`docs/migrating/v1-6-0-async-chat.md`](migrating/v1-6-0-async-chat.md)。
 
 ```bash
 curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
