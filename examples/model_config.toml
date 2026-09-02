@@ -501,9 +501,10 @@ max_tokens = 1200
 
 # ─── Character insights (EXPERIMENTAL, v1.3.0) ──────────────────────────────
 # Builds a profile of the AI CHARACTER from the conversation, the mirror of
-# insight_extraction's profile of the human. Results are database-only: nothing
-# reads character_insights back into any prompt. Downstream reads it at
-# GET /comp/instance/{instance_id}/profile.
+# insight_extraction's profile of the human. Four of its fields render the chat
+# prompt's [character_state] block, and how completely the row is filled sizes
+# the injected history window (docs/deploying.md -> Operational notes).
+# Downstream also reads the row at GET /comp/instance/{instance_id}/profile.
 #
 # COST: two extra OpenRouter calls per produced message per turn — roughly
 # doubles insight-side spend. It also grows engine.character_insights_snapshot

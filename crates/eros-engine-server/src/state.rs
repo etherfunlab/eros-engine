@@ -383,6 +383,13 @@ pub struct ServerConfig {
     /// does not feed model repetition back into its own context. A permanent
     /// flag, not a rollout switch.
     pub chat_echo_cancellation_disabled: bool,
+    /// Operator opt-out for the noise-cancellation half of the text turn
+    /// (`CHAT_NOISE_CANCELLATION_DISABLED`). Default `false`: injected
+    /// assistant rows lose their leading sentence and the window length
+    /// follows `character_insights` fill. Setting it restores the fixed
+    /// 20-row, unstripped injection. Independent of
+    /// `CHAT_ECHO_CANCELLATION_DISABLED`, which governs duplicate dropping.
+    pub chat_noise_cancellation_disabled: bool,
     /// World memories subsystem configuration.
     pub world: WorldConfig,
     /// Async chat-turn queue worker configuration (`CHAT_QUEUE_*` env vars).
@@ -437,6 +444,11 @@ impl ServerConfig {
             prompt_log_dir: parse_prompt_log_dir(std::env::var("PROMPT_LOG_DIR").ok().as_deref()),
             chat_echo_cancellation_disabled: parse_bool_flag(
                 std::env::var("CHAT_ECHO_CANCELLATION_DISABLED")
+                    .ok()
+                    .as_deref(),
+            ),
+            chat_noise_cancellation_disabled: parse_bool_flag(
+                std::env::var("CHAT_NOISE_CANCELLATION_DISABLED")
                     .ok()
                     .as_deref(),
             ),

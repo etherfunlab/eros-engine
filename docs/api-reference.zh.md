@@ -962,7 +962,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 }
 ```
 
-`updated_at` 为 `null` 表示这个 instance 还没有 `character_insights` 行——角色抽取链还没跑出结果——这时其余字段也都是 `null`/`[]`，和上面人类画像同一套约定。结果只落库：这里的任何内容都不会被读回任何 chat prompt。
+`updated_at` 为 `null` 表示这个 instance 还没有 `character_insights` 行——角色抽取链还没跑出结果——这时其余字段也都是 `null`/`[]`，和上面人类画像同一套约定。其中四个字段——`current_situation`、`occupation`、`location`、`relationships`——会作为 `[character_state]` 块读回 chat prompt，十个字段的填充程度还决定注入的历史窗口大小（见[部署 → 運維注意事項](deploying.zh.md#運維注意事項)）；其余六个只落库。
 
 这条路由是 v1，冻结不动——它会继续可用，不会被移除。v2 的对应端点、同一套
 字段、v2 路径形状，是下面的 `GET /v2/comp/instance/{instance_id}/insight/character`。

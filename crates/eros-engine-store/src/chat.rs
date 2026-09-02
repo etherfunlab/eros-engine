@@ -396,8 +396,8 @@ impl<'a> ChatRepo<'a> {
     /// `assistant` row produces one pair; orphan rows are dropped.
     /// Channel-marked rows ('voice'/'product_qa') are out of companion context and excluded.
     ///
-    /// Used by the chat pipeline to inject the `[recent_conversation]` short-
-    /// term memory block into the system prompt. Uses the existing
+    /// Has no production caller: the chat pipeline no longer renders a
+    /// short-term-memory block from turn pairs. Uses the existing
     /// `idx_chat_messages_session(session_id, sent_at DESC)` index — no
     /// migration needed.
     pub async fn recent_turn_pairs(
@@ -454,70 +454,15 @@ impl<'a> ChatRepo<'a> {
         Ok(pairs)
     }
 
-    /// Same as `recent_turn_pairs` but cuts off at the sent_at of a specific
-    /// message (typically the current turn's user row), not a caller-supplied
-    /// timestamp. Looking up the cutoff via subquery avoids a race with
-    /// concurrent streams that could insert a row between wall-clock-now and
-    /// the read of recent rows.
-    /// Channel-marked rows ('voice'/'product_qa') are out of companion context and excluded.
-    ///
-    /// Equivalent to `recent_turn_pairs(session_id, msg.sent_at, limit)` but
-    /// in a single round-trip. If `message_id` doesn't exist in the session
-    /// the subquery returns NULL and `sent_at < NULL` matches nothing →
-    /// returns an empty Vec.
-    pub async fn recent_turn_pairs_before_message(
-        &self,
-        session_id: Uuid,
-        message_id: Uuid,
-        limit: u8,
-    ) -> Result<Vec<(String, String)>, sqlx::Error> {
-        let fetch_n: i64 = (limit as i64) * 2 + 2;
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT role, content \
-             FROM engine.chat_messages \
-             WHERE session_id = $1 \
-               AND sent_at < (SELECT sent_at FROM engine.chat_messages WHERE id = $2) \
-               AND truncated = FALSE \
-               AND channel IS NULL \
-               AND role IN ('user', 'gift_user', 'assistant') \
-             ORDER BY sent_at DESC \
-             LIMIT $3",
-        )
-        .bind(session_id)
-        .bind(message_id)
-        .bind(fetch_n)
-        .fetch_all(self.pool)
-        .await?;
-
-        // Same pair-walking algorithm as recent_turn_pairs (reverse → walk
-        // user|gift_user → assistant pairs → keep last `limit`).
-        let mut chrono = rows;
-        chrono.reverse();
-        let mut pairs: Vec<(String, String)> = Vec::new();
-        let mut i = 0;
-        while i + 1 < chrono.len() {
-            let (role_a, content_a) = &chrono[i];
-            let (role_b, content_b) = &chrono[i + 1];
-            if (role_a == "user" || role_a == "gift_user") && role_b == "assistant" {
-                pairs.push((content_a.clone(), content_b.clone()));
-                i += 2;
-            } else {
-                i += 1;
-            }
-        }
-        let want = limit as usize;
-        if pairs.len() > want {
-            let drop = pairs.len() - want;
-            pairs.drain(..drop);
-        }
-        Ok(pairs)
-    }
-
     /// Up to `limit` recent (question, answer) pairs on the product-QA channel,
-    /// strictly before `message_id`'s sent_at, chronological. Mirrors
-    /// `recent_turn_pairs_before_message` but scoped to `channel='product_qa'`
-    /// rows (both sides of a product-QA exchange carry the marker). Feeds the
-    /// judge's `[最近产品咨询]` block and the executor's follow-up context.
+    /// strictly before `message_id`'s sent_at, chronological. The cutoff is
+    /// resolved via subquery — `message_id`'s own `sent_at`, looked up inside
+    /// the query — rather than a caller-supplied timestamp, which avoids a
+    /// race with concurrent streams on the same session inserting a row
+    /// between wall-clock-now and the read of recent rows. Scoped to
+    /// `channel='product_qa'` rows (both sides of a product-QA exchange
+    /// carry the marker). Feeds the judge's `[最近产品咨询]` block and the
+    /// executor's follow-up context.
     pub async fn recent_product_qa_pairs(
         &self,
         session_id: Uuid,
@@ -562,38 +507,6 @@ impl<'a> ChatRepo<'a> {
             pairs.drain(..drop);
         }
         Ok(pairs)
-    }
-
-    /// Up to `limit` recent assistant `content` rows for the session, with
-    /// `truncated = FALSE`, strictly before the current turn's user row
-    /// (`before_message_id`). Returned newest-first. The cutoff is resolved
-    /// via subquery on the message id — same race-safety as
-    /// `recent_turn_pairs_before_message` (a concurrent stream can't leak a
-    /// "future" row into this turn). Channel-marked rows ('voice'/'product_qa') are out of companion context and excluded.
-    /// Used by the chat pipeline to mine over-used reply openings for the `[avoid_repetition]` block.
-    pub async fn recent_assistant_contents(
-        &self,
-        session_id: Uuid,
-        before_message_id: Uuid,
-        limit: i64,
-    ) -> Result<Vec<String>, sqlx::Error> {
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT content \
-             FROM engine.chat_messages \
-             WHERE session_id = $1 \
-               AND sent_at < (SELECT sent_at FROM engine.chat_messages WHERE id = $2) \
-               AND truncated = FALSE \
-               AND channel IS NULL \
-               AND role = 'assistant' \
-             ORDER BY sent_at DESC \
-             LIMIT $3",
-        )
-        .bind(session_id)
-        .bind(before_message_id)
-        .bind(limit)
-        .fetch_all(self.pool)
-        .await?;
-        Ok(rows.into_iter().map(|(c,)| c).collect())
     }
 }
 
@@ -2907,79 +2820,6 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn recent_turn_pairs_before_message_uses_msg_sent_at_not_now(pool: PgPool) {
-        let repo = ChatRepo { pool: &pool };
-        let s = throwaway_session(&pool).await;
-
-        // Insert 1 prior complete pair.
-        let u1 = match repo
-            .upsert_user_message_idempotent(s.id, "u1", "01J0000000000000000090001A", "user", None)
-            .await
-            .unwrap()
-        {
-            UpsertUserOutcome::Inserted { message_id } => message_id,
-            other => panic!("expected Inserted, got {other:?}"),
-        };
-        repo.insert_assistant_batch(
-            s.id,
-            u1,
-            &[AssistantInsert {
-                llm_attempts: None,
-                gateway_errors: None,
-                id: Uuid::new_v4(),
-                content: "a1".into(),
-                assistant_action_type: "reply".into(),
-                truncated: false,
-                continues_from_message_id: None,
-                generation_id: None,
-                filter_audit: None,
-                metadata: None,
-            }],
-        )
-        .await
-        .unwrap();
-
-        // Insert the "current" user row that the chat handler will pass.
-        let current = match repo
-            .upsert_user_message_idempotent(
-                s.id,
-                "current",
-                "01J0000000000000000090002A",
-                "user",
-                None,
-            )
-            .await
-            .unwrap()
-        {
-            UpsertUserOutcome::Inserted { message_id } => message_id,
-            other => panic!("expected Inserted, got {other:?}"),
-        };
-
-        // Sleep, then insert a LATER user row — simulating a concurrent stream
-        // that completed between this turn's user-insert and the recent-turn fetch.
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        let _ = repo
-            .upsert_user_message_idempotent(
-                s.id,
-                "later",
-                "01J0000000000000000090003A",
-                "user",
-                None,
-            )
-            .await
-            .unwrap();
-
-        // The cutoff must come from `current`'s sent_at — NOT the wall clock,
-        // because wall-clock-now happens AFTER the `later` insert and would
-        // include it. With the proper cutoff, `later` is excluded.
-        let pairs = repo
-            .recent_turn_pairs_before_message(s.id, current, 3)
-            .await
-            .unwrap();
-        assert_eq!(pairs, vec![("u1".to_string(), "a1".to_string())]);
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
     async fn history_row_exposes_metadata_column(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
         let user_id = Uuid::new_v4();
@@ -3168,75 +3008,6 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(meta["image"]["prompt"], "a cat");
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    async fn recent_assistant_contents_excludes_current_and_truncated(pool: PgPool) {
-        // `AssistantInsert` / `ChatRepo` / `UpsertUserOutcome` are already in
-        // scope via the test module's `use super::*;`.
-        let chat_repo = ChatRepo { pool: &pool };
-        let user_id = Uuid::new_v4();
-        let instance_id = seed_persona_instance(&pool, user_id).await;
-        let session = chat_repo
-            .create_session(user_id, instance_id)
-            .await
-            .unwrap();
-
-        // Two prior complete (user, assistant) pairs; the 2nd assistant row is
-        // a TRUNCATED partial that must be excluded.
-        for n in 0..2u8 {
-            let ulid = format!("01J000000000000000008{n}001A");
-            let uid = match chat_repo
-                .upsert_user_message_idempotent(session.id, &format!("u{n}"), &ulid, "user", None)
-                .await
-                .unwrap()
-            {
-                UpsertUserOutcome::Inserted { message_id } => message_id,
-                other => panic!("expected Inserted, got {other:?}"),
-            };
-            chat_repo
-                .insert_assistant_batch(
-                    session.id,
-                    uid,
-                    &[AssistantInsert {
-                        llm_attempts: None,
-                        gateway_errors: None,
-                        id: Uuid::new_v4(),
-                        content: format!("assistant-{n}"),
-                        assistant_action_type: "reply".into(),
-                        truncated: n == 1, // second one is a truncated partial
-                        continues_from_message_id: None,
-                        generation_id: None,
-                        filter_audit: None,
-                        metadata: None,
-                    }],
-                )
-                .await
-                .unwrap();
-        }
-
-        // The "current" user row — its sent_at is the cutoff.
-        let current = match chat_repo
-            .upsert_user_message_idempotent(
-                session.id,
-                "u_current",
-                "01J0000000000000000080900A",
-                "user",
-                None,
-            )
-            .await
-            .unwrap()
-        {
-            UpsertUserOutcome::Inserted { message_id } => message_id,
-            other => panic!("expected Inserted, got {other:?}"),
-        };
-
-        let got = chat_repo
-            .recent_assistant_contents(session.id, current, 6)
-            .await
-            .unwrap();
-        // Only the non-truncated assistant row, newest-first.
-        assert_eq!(got, vec!["assistant-0".to_string()]);
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -4155,62 +3926,6 @@ mod tests {
             pairs,
             vec![("这产品是什么".to_string(), "这是……".to_string())]
         );
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    async fn context_readers_exclude_channel_marked_rows(pool: PgPool) {
-        let repo = ChatRepo { pool: &pool };
-        let session_id = throwaway_session(&pool).await.id;
-        // one normal pair, one product_qa pair, then cutoff row
-        for (role, content, channel) in [
-            ("user", "嗨", None::<&str>),
-            ("assistant", "嗨呀", None),
-            ("user", "这产品是什么", Some("product_qa")),
-            ("assistant", "这是官方说明……", Some("product_qa")),
-        ] {
-            sqlx::query(
-                "INSERT INTO engine.chat_messages (session_id, role, content, channel) \
-                 VALUES ($1,$2,$3,$4)",
-            )
-            .bind(session_id)
-            .bind(role)
-            .bind(content)
-            .bind(channel)
-            .execute(&pool)
-            .await
-            .unwrap();
-        }
-        let cur: Uuid = sqlx::query_scalar(
-            "INSERT INTO engine.chat_messages (session_id, role, content) \
-             VALUES ($1, 'user', '在吗') RETURNING id",
-        )
-        .bind(session_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-
-        let pairs = repo
-            .recent_turn_pairs_before_message(session_id, cur, 5)
-            .await
-            .unwrap();
-        assert_eq!(pairs, vec![("嗨".to_string(), "嗨呀".to_string())]);
-
-        let pairs2 = repo
-            .recent_turn_pairs(
-                session_id,
-                chrono::Utc::now() + chrono::Duration::seconds(60),
-                5,
-            )
-            .await
-            .unwrap();
-        assert_eq!(pairs2, vec![("嗨".to_string(), "嗨呀".to_string())]);
-
-        let openings = repo
-            .recent_assistant_contents(session_id, cur, 6)
-            .await
-            .unwrap();
-        assert!(openings.iter().all(|c| c != "这是官方说明……"));
-        assert!(openings.contains(&"嗨呀".to_string()));
     }
 
     #[sqlx::test(migrations = "./migrations")]

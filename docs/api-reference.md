@@ -1108,7 +1108,7 @@ The flat, typed `character_insights` row for one relationship (`persona_instance
 }
 ```
 
-`updated_at: null` means this instance has no `character_insights` row yet — the character extraction chain has not produced a result — and every other field is `null`/`[]` in that response, same convention as the human profile above. Results are database-only: nothing here is read back into any chat prompt.
+`updated_at: null` means this instance has no `character_insights` row yet — the character extraction chain has not produced a result — and every other field is `null`/`[]` in that response, same convention as the human profile above. Four of these fields — `current_situation`, `occupation`, `location`, `relationships` — are read back into the chat prompt as the `[character_state]` block, and the fill level of all ten sizes the injected history window (see [Deploying → Operational notes](deploying.md#operational-notes)); the other six are database-only.
 
 This route is v1 and frozen — it keeps working and is not going away. The v2
 equivalent, with the same fields under the v2 path convention, is

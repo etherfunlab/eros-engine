@@ -1260,8 +1260,12 @@ const CHARACTER_STRUCTURING_TASK: &str = "character_insight_structuring";
 /// Fail-open throughout: an audit insert, a load, or an apply that fails only
 /// warns. Nothing here may break the turn.
 ///
-/// The result is DB-only by design — nothing reads `character_insights` back
-/// into a prompt (spec §7).
+/// Four of the ten fields this writes — `current_situation`, `occupation`,
+/// `location`, `relationships` — are read back into the chat prompt as
+/// `[character_state]` (spec 2026-09-02-echo-cancellation-plus §4.5). The
+/// rest (`habits`, `personal_values`, `desires`, `vulnerabilities`, `likes`,
+/// `dislikes`) stay DB-only, and voice, PDE, and the world system still read
+/// none of it.
 #[allow(clippy::too_many_arguments)] // each arg is a distinct audit/context key
 async fn extract_character_insights(
     state: &AppState,
