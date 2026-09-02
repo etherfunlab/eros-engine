@@ -77,7 +77,7 @@ docker compose run --rm engine seed-personas /etc/eros-engine/personas  # 可选
 docker compose up -d engine
 ```
 
-**已有部署要跨 v1.6.x–v1.7.2 升级？** 这段是一条四个版本的链，每个迁移只对前一跳的代码安全——跳过任何一跳，rollout 期间可能丢用户写入。跨版本前先读 [migrating/v1-7-2-llm-generations.md](migrating/v1-7-2-llm-generations.md)（英文；全新安装不受影响）。
+**已有部署要跨 v1.6.x–v1.7.2 升级？** 这段是一条四个版本的链，每个迁移只对前一跳的代码安全——跳过任何一跳，rollout 期间线上流量就会出问题——有的路径丢写入，有的路径读全挂。跨版本前先读 [migrating/v1-7-2-llm-generations.md](migrating/v1-7-2-llm-generations.md)（英文；全新安装不受影响）。
 
 至少要接一个 auth 来源——非对称 JWKS 校验用 `SUPABASE_URL`（或 `SUPABASE_JWKS_URL`），或者一个非空的旧版 `SUPABASE_JWT_SECRET`。两者都没有时引擎会拒绝启动——这是刻意设计，让配错的部署直接报错，而不是默默拒掉每一个请求。
 

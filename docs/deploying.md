@@ -77,7 +77,7 @@ docker compose run --rm engine seed-personas /etc/eros-engine/personas  # option
 docker compose up -d engine
 ```
 
-**Upgrading an existing deployment across v1.6.x–v1.7.2?** That range is a four-release chain whose migrations are each safe only against the code one hop earlier — skipping a hop can lose user writes for the length of the rollout. Read [migrating/v1-7-2-llm-generations.md](migrating/v1-7-2-llm-generations.md) before jumping versions. (Fresh installs are exempt.)
+**Upgrading an existing deployment across v1.6.x–v1.7.2?** That range is a four-release chain whose migrations are each safe only against the code one hop earlier — skipping a hop breaks live traffic for the length of the rollout (lost writes on some paths, failed reads on others). Read [migrating/v1-7-2-llm-generations.md](migrating/v1-7-2-llm-generations.md) before jumping versions. (Fresh installs are exempt.)
 
 At least one auth source must be wired — `SUPABASE_URL` (or `SUPABASE_JWKS_URL`) for asymmetric JWKS validation, or a non-empty legacy `SUPABASE_JWT_SECRET`. With neither, the engine refuses to boot — by design, so a misconfigured deploy fails loudly instead of silently rejecting every request.
 
