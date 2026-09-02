@@ -2770,7 +2770,8 @@ mod tests {
         let user_message_id = *user_message_ids.last().unwrap();
 
         // character_insights: all ten fields populated ⇒ filled_field_count=10
-        // ⇒ window_extra=0 ⇒ budget = PROTECTED_PRIOR (2).
+        // ⇒ window_extra=0 ⇒ select_window keeps just the previous exchange
+        // (found by identity, not a flat budget) plus the current turn.
         eros_engine_store::character_insight::CharacterInsightRepo { pool: &pool }
             .apply_extraction(
                 instance_id,

@@ -14,10 +14,12 @@ use crate::repetition::Injected;
 use eros_engine_store::character_insight::CharacterInsightsRow;
 use uuid::Uuid;
 
-/// Rows before the current turn that are never subject to the ladder: the
-/// previous turn's user message and its assistant reply. `character_insights`
-/// is a snapshot lagging one turn, so it can say what is true of the character
-/// but never what was just said; reference resolution has no other carrier.
+/// Fallback cap for [`select_window`] when no user row precedes the current
+/// one, so there is no previous exchange to find: keep at most this many of
+/// the newest remaining rows, spent newest-first. This is the degenerate
+/// shape the async worker path produces when a burst buries the driving row
+/// past the fetch window — it lands pinned at index 0, older than every
+/// other row.
 pub const PROTECTED_PRIOR: usize = 2;
 
 /// Field count at or above which no extra rows are injected.
@@ -54,33 +56,58 @@ pub fn filled_field_count(row: Option<&CharacterInsightsRow>) -> usize {
     text + arrays
 }
 
-/// Rows to inject beyond the protected pair, from the ladder in spec §4.6.
+/// Rows to inject beyond the previous exchange, from the ladder in spec §4.6.
 /// Saturates at 0 for a fully-described character and at 14 for one the engine
 /// knows nothing about — 17 injected rows in total, near the pre-change 20.
 pub fn window_extra(filled: usize) -> usize {
     FULL_ENOUGH.saturating_sub(filled) * ROWS_PER_MISSING_FIELD
 }
 
-/// Keep the current turn plus the newest `PROTECTED_PRIOR + extra` of the
-/// remaining rows, order-preserving.
+/// Keep the current turn, its previous exchange, and `extra` more rows spent
+/// newest-first on anything not already kept. Order-preserving.
+///
+/// The previous exchange is the newest row with `role == "user"` strictly
+/// older than the current row, plus every row between it and the current
+/// row. In the common case that is exactly two rows — the previous turn's
+/// user message and the assistant's one reply to it — but it stretches to
+/// cover shapes like `[U_prev, A_text, A_image, U_cur]`, where one turn
+/// produced two assistant rows (e.g. a text reply and a separate image row).
+/// `character_insights` is a snapshot lagging one turn, so it can say what is
+/// true of the character but never what was just said; reference resolution
+/// has no other carrier (spec §4.6, decision D1).
+///
+/// If no user row precedes the current one, there is no previous exchange to
+/// find, and [`PROTECTED_PRIOR`] is the fallback.
 ///
 /// The current row is kept by identity, not by position: on the async worker
 /// path the driving row is pinned at index 0, older than everything else, and
 /// must survive even the thinnest rung. An absent `current_id` (no driving row
 /// in the window at all) degrades to keeping the newest rows.
 pub fn select_window(msgs: Vec<Injected>, current_id: Uuid, extra: usize) -> Vec<Injected> {
-    let budget = PROTECTED_PRIOR + extra;
-    // Walk newest-first, spending the budget on everything that is not the
-    // current row; the current row is free.
-    let mut spent = 0usize;
-    let mut keep: Vec<bool> = vec![false; msgs.len()];
-    for (i, m) in msgs.iter().enumerate().rev() {
-        if m.id == current_id {
-            keep[i] = true;
-        } else if spent < budget {
-            keep[i] = true;
-            spent += 1;
+    let cur = msgs.iter().position(|m| m.id == current_id);
+    let mut keep = vec![false; msgs.len()];
+    if let Some(c) = cur {
+        keep[c] = true;
+    }
+    let search_end = cur.unwrap_or(msgs.len());
+    let prev_user = msgs[..search_end].iter().rposition(|m| m.role == "user");
+    if let Some(u) = prev_user {
+        for k in keep.iter_mut().take(search_end).skip(u) {
+            *k = true;
         }
+    }
+    let mut budget = extra
+        + if prev_user.is_none() {
+            PROTECTED_PRIOR
+        } else {
+            0
+        };
+    for k in keep.iter_mut().rev() {
+        if *k || budget == 0 {
+            continue;
+        }
+        *k = true;
+        budget -= 1;
     }
     msgs.into_iter()
         .zip(keep)
@@ -153,37 +180,82 @@ mod tests {
         }
     }
 
+    /// The shape a real conversation actually produces: alternating turns.
+    /// Even indices are `user`, odd are `assistant`.
+    fn alt(i: usize) -> Injected {
+        inj(
+            if i % 2 == 0 { "user" } else { "assistant" },
+            &i.to_string(),
+        )
+    }
+
     #[test]
     fn thinnest_rung_keeps_the_current_turn_and_the_one_before() {
-        let msgs: Vec<Injected> = (0..10).map(|i| inj("user", &i.to_string())).collect();
+        // 10 alternating rows, current = row 9 (assistant). Row 8 (user) is
+        // the newest user row older than current, and nothing lies between
+        // them, so the previous exchange collapses to that single row.
+        let msgs: Vec<Injected> = (0..10).map(alt).collect();
         let current = msgs[9].id;
         let kept = select_window(msgs, current, 0);
         let texts: Vec<&str> = kept.iter().map(|m| m.text.as_str()).collect();
-        assert_eq!(texts, vec!["7", "8", "9"], "current + PROTECTED_PRIOR");
+        assert_eq!(
+            texts,
+            vec!["8", "9"],
+            "current + the one row directly before it"
+        );
     }
 
     #[test]
     fn extra_rows_are_taken_from_the_newest_end() {
-        let msgs: Vec<Injected> = (0..10).map(|i| inj("user", &i.to_string())).collect();
+        // Same 10-row fixture as above: previous exchange is just row 8, so
+        // extra=4 spends on rows 4-7, for 6 rows total (not 7 — there was
+        // never a second protected row to spend a budget slot on here).
+        let msgs: Vec<Injected> = (0..10).map(alt).collect();
         let current = msgs[9].id;
         let kept = select_window(msgs, current, 4);
         let texts: Vec<&str> = kept.iter().map(|m| m.text.as_str()).collect();
-        assert_eq!(texts, vec!["3", "4", "5", "6", "7", "8", "9"]);
+        assert_eq!(texts, vec!["4", "5", "6", "7", "8", "9"]);
     }
 
     #[test]
     fn chronological_order_is_preserved() {
-        let msgs: Vec<Injected> = (0..6).map(|i| inj("user", &i.to_string())).collect();
+        // Previous exchange is row 4 (user); extra=1 reaches back to row 3.
+        let msgs: Vec<Injected> = (0..6).map(alt).collect();
         let current = msgs[5].id;
         let kept = select_window(msgs, current, 1);
         let texts: Vec<&str> = kept.iter().map(|m| m.text.as_str()).collect();
-        assert_eq!(texts, vec!["2", "3", "4", "5"]);
+        assert_eq!(texts, vec!["3", "4", "5"]);
+    }
+
+    #[test]
+    fn two_assistant_rows_from_one_turn_keep_the_previous_user_row() {
+        // The real shape that motivated this fix: `image_edit.rs` can write
+        // an empty-content assistant row carrying image metadata alongside
+        // a text reply, so one turn can leave two adjacent assistant rows.
+        // The previous exchange is "the newest prior user row plus
+        // everything between it and current" — here that is all three rows
+        // before current, not just the newest two.
+        let msgs = vec![
+            inj("user", "u_prev"),
+            inj("assistant", "a_text"),
+            inj("assistant", "a_image"),
+            inj("user", "u_cur"),
+        ];
+        let current = msgs[3].id;
+        let kept = select_window(msgs, current, 0);
+        let texts: Vec<&str> = kept.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["u_prev", "a_text", "a_image", "u_cur"],
+            "u_prev must survive alongside both assistant rows"
+        );
     }
 
     #[test]
     fn a_pinned_driving_row_at_the_front_always_survives() {
         // The async worker path inserts the driving row at index 0, older than
-        // everything else. It must survive the thinnest rung.
+        // everything else. No user row precedes it, so the PROTECTED_PRIOR
+        // fallback applies and it must survive the thinnest rung.
         let mut msgs: Vec<Injected> = (0..10).map(|i| inj("user", &i.to_string())).collect();
         let driving = inj("user", "driving");
         let current = driving.id;
@@ -203,7 +275,11 @@ mod tests {
 
     #[test]
     fn an_absent_current_id_still_keeps_the_newest_rows() {
-        let msgs: Vec<Injected> = (0..6).map(|i| inj("user", &i.to_string())).collect();
+        // No current row to anchor on, so the search for a previous user row
+        // runs over the whole list: row 4 (user) plus row 5 (assistant)
+        // between it and the end. Same result as before this fix, since
+        // these two rows happen to be adjacent either way.
+        let msgs: Vec<Injected> = (0..6).map(alt).collect();
         let kept = select_window(msgs, Uuid::new_v4(), 0);
         let texts: Vec<&str> = kept.iter().map(|m| m.text.as_str()).collect();
         assert_eq!(texts, vec!["4", "5"]);
