@@ -14,12 +14,13 @@ use crate::repetition::Injected;
 use eros_engine_store::character_insight::CharacterInsightsRow;
 use uuid::Uuid;
 
-/// Fallback cap for [`select_window`] when no user row precedes the current
-/// one, so there is no previous exchange to find: keep at most this many of
-/// the newest remaining rows, spent newest-first. This is the degenerate
-/// shape the async worker path produces when a burst buries the driving row
-/// past the fetch window — it lands pinned at index 0, older than every
-/// other row.
+/// Floor on how many prior rows [`select_window`] protects, regardless of
+/// how short the found previous exchange is. Two adjacent `user` rows —
+/// a double-text, a ghosted turn, or an assistant row that §4.3's strip
+/// emptied and `model_facing_history` dropped — collapse the exchange
+/// search to a single row and would otherwise evict the character's actual
+/// last reply. It is also what a fixture with no prior `user` row at all
+/// (the async worker's pinned-driving-row shape) falls back to entirely.
 pub const PROTECTED_PRIOR: usize = 2;
 
 /// Field count at or above which no extra rows are injected.
@@ -76,8 +77,13 @@ pub fn window_extra(filled: usize) -> usize {
 /// true of the character but never what was just said; reference resolution
 /// has no other carrier (spec §4.6, decision D1).
 ///
-/// If no user row precedes the current one, there is no previous exchange to
-/// find, and [`PROTECTED_PRIOR`] is the fallback.
+/// The found exchange is then topped up to [`PROTECTED_PRIOR`] prior rows if
+/// it came up short — most commonly because the row directly before current
+/// is *also* `user` (a double-text, a ghosted turn, or a stripped-empty
+/// assistant row dropped upstream), which otherwise collapses the exchange
+/// to that single row and evicts the character's actual last reply. If no
+/// user row precedes the current one at all, this floor is the entire
+/// protected span.
 ///
 /// The current row is kept by identity, not by position: on the async worker
 /// path the driving row is pinned at index 0, older than everything else, and
@@ -96,14 +102,13 @@ pub fn select_window(msgs: Vec<Injected>, current_id: Uuid, extra: usize) -> Vec
             *k = true;
         }
     }
-    let mut budget = extra
-        + if prev_user.is_none() {
-            PROTECTED_PRIOR
-        } else {
-            0
-        };
+    let protected_prior = keep.iter().filter(|&&k| k).count() - usize::from(cur.is_some());
+    let mut budget = extra + PROTECTED_PRIOR.saturating_sub(protected_prior);
     for k in keep.iter_mut().rev() {
-        if *k || budget == 0 {
+        if budget == 0 {
+            break;
+        }
+        if *k {
             continue;
         }
         *k = true;
@@ -189,42 +194,84 @@ mod tests {
         )
     }
 
+    /// Same alternating shape as [`alt`], but with the parity flipped: odd
+    /// indices are `user`, even are `assistant`. `select_window`'s only
+    /// caller always passes a *user* row's id as `current_id`
+    /// (`handlers.rs`'s `user_message_id`), so a fixture whose `current` is
+    /// its last (odd) index needs this parity to land current on `user` —
+    /// `alt` would put an odd index on `assistant`, a shape that never
+    /// occurs in production.
+    fn alt_odd_is_user(i: usize) -> Injected {
+        inj(
+            if i % 2 == 1 { "user" } else { "assistant" },
+            &i.to_string(),
+        )
+    }
+
     #[test]
     fn thinnest_rung_keeps_the_current_turn_and_the_one_before() {
-        // 10 alternating rows, current = row 9 (assistant). Row 8 (user) is
-        // the newest user row older than current, and nothing lies between
-        // them, so the previous exchange collapses to that single row.
-        let msgs: Vec<Injected> = (0..10).map(alt).collect();
+        // 10 rows alternating assistant/user, current = row 9 (user, as
+        // every real current row is). Row 8 (assistant) is its immediate
+        // reply-to-be-answered and row 7 (user) is the newest user row
+        // older than current: the classic 3-row steady state.
+        let msgs: Vec<Injected> = (0..10).map(alt_odd_is_user).collect();
         let current = msgs[9].id;
         let kept = select_window(msgs, current, 0);
         let texts: Vec<&str> = kept.iter().map(|m| m.text.as_str()).collect();
         assert_eq!(
             texts,
-            vec!["8", "9"],
-            "current + the one row directly before it"
+            vec!["7", "8", "9"],
+            "current + the previous exchange (user row 7, assistant row 8)"
         );
     }
 
     #[test]
     fn extra_rows_are_taken_from_the_newest_end() {
-        // Same 10-row fixture as above: previous exchange is just row 8, so
-        // extra=4 spends on rows 4-7, for 6 rows total (not 7 — there was
-        // never a second protected row to spend a budget slot on here).
-        let msgs: Vec<Injected> = (0..10).map(alt).collect();
+        // Same 10-row fixture as above: previous exchange is rows 7-8, so
+        // extra=4 spends on rows 3-6, for 7 rows total.
+        let msgs: Vec<Injected> = (0..10).map(alt_odd_is_user).collect();
         let current = msgs[9].id;
         let kept = select_window(msgs, current, 4);
         let texts: Vec<&str> = kept.iter().map(|m| m.text.as_str()).collect();
-        assert_eq!(texts, vec!["4", "5", "6", "7", "8", "9"]);
+        assert_eq!(texts, vec!["3", "4", "5", "6", "7", "8", "9"]);
     }
 
     #[test]
     fn chronological_order_is_preserved() {
-        // Previous exchange is row 4 (user); extra=1 reaches back to row 3.
-        let msgs: Vec<Injected> = (0..6).map(alt).collect();
+        // Previous exchange is rows 3-4 (user, assistant); extra=1 reaches
+        // back to row 2.
+        let msgs: Vec<Injected> = (0..6).map(alt_odd_is_user).collect();
         let current = msgs[5].id;
         let kept = select_window(msgs, current, 1);
         let texts: Vec<&str> = kept.iter().map(|m| m.text.as_str()).collect();
-        assert_eq!(texts, vec!["3", "4", "5"]);
+        assert_eq!(texts, vec!["2", "3", "4", "5"]);
+    }
+
+    #[test]
+    fn double_texting_keeps_the_actual_last_reply_not_just_the_ghosted_user_row() {
+        // Two adjacent user rows before current -- a double-text, a
+        // ghosted turn left unanswered, or an assistant row §4.3 stripped
+        // to empty and `model_facing_history` dropped. The newest-user
+        // anchor alone finds only u_a (nothing lies between it and
+        // current), which would evict a_x -- exactly the non-sequitur D1
+        // exists to prevent, since the character's last actual reply is
+        // the only thing that answers whatever u_x said. PROTECTED_PRIOR
+        // is a floor, not an either/or: it tops the span back up to 2
+        // prior rows, pulling a_x back in.
+        let msgs = vec![
+            inj("user", "u_x"),
+            inj("assistant", "a_x"),
+            inj("user", "u_a"),
+            inj("user", "u_cur"),
+        ];
+        let current = msgs[3].id;
+        let kept = select_window(msgs, current, 0);
+        let texts: Vec<&str> = kept.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["a_x", "u_a", "u_cur"],
+            "a_x must survive: the floor tops up past the single-row collapse"
+        );
     }
 
     #[test]

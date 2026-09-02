@@ -2721,10 +2721,11 @@ mod tests {
 
     /// A fully-populated `character_insights` row narrows the injected window
     /// to the current turn plus the previous exchange (spec §4.6: filled=10 ⇒
-    /// extra=0 ⇒ budget=2). Twelve rows are seeded — six strictly alternating
-    /// assistant/user exchanges — so the pre-ladder window (17-ish under the
-    /// old fixed-20 behaviour, here capped by the 12 actually seeded) is
-    /// provably wider than what survives selection.
+    /// extra=0; the seeded shape below alternates strictly, so that previous
+    /// exchange is exactly its usual 2 rows). Twelve rows are seeded — six
+    /// alternating assistant/user exchanges — so the pre-ladder window
+    /// (17-ish under the old fixed-20 behaviour, here capped by the 12
+    /// actually seeded) is provably wider than what survives selection.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn a_full_insight_row_thins_the_injected_window(pool: sqlx::PgPool) {
         let owner = Uuid::new_v4();
@@ -2780,7 +2781,8 @@ mod tests {
 
         // character_insights: all ten fields populated ⇒ filled_field_count=10
         // ⇒ window_extra=0 ⇒ select_window keeps just the previous exchange
-        // (found by identity, not a flat budget) plus the current turn.
+        // (found by role/structure, not a flat budget) plus the current
+        // turn (found by identity).
         eros_engine_store::character_insight::CharacterInsightRepo { pool: &pool }
             .apply_extraction(
                 instance_id,
