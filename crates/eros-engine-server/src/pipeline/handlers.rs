@@ -880,6 +880,15 @@ pub(super) async fn build_reply_request(
                 None
             });
 
+    // CHAT_NOISE_CANCELLATION_DISABLED restores the pre-change prompt shape in
+    // full: [character_state] was the one addition in that change, so the flag
+    // must suppress it too, not just the strip and the ladder below.
+    let character_state_for_prompt = if state.config.chat_noise_cancellation_disabled {
+        None
+    } else {
+        character_state.as_ref()
+    };
+
     let mut system_prompt = build_prompt(
         &input.persona,
         &profile_groups,
@@ -894,7 +903,7 @@ pub(super) async fn build_reply_request(
         world.as_ref(),
         stories.as_ref(),
         quote,
-        character_state.as_ref(),
+        character_state_for_prompt,
     );
 
     if let Event::UserMessage {
@@ -2712,10 +2721,11 @@ mod tests {
 
     /// A fully-populated `character_insights` row narrows the injected window
     /// to the current turn plus the previous exchange (spec §4.6: filled=10 ⇒
-    /// extra=0 ⇒ budget=2). Twelve rows are seeded — six strictly alternating
-    /// assistant/user exchanges — so the pre-ladder window (17-ish under the
-    /// old fixed-20 behaviour, here capped by the 12 actually seeded) is
-    /// provably wider than what survives selection.
+    /// extra=0; the seeded shape below alternates strictly, so that previous
+    /// exchange is exactly its usual 2 rows). Twelve rows are seeded — six
+    /// alternating assistant/user exchanges — so the pre-ladder window
+    /// (17-ish under the old fixed-20 behaviour, here capped by the 12
+    /// actually seeded) is provably wider than what survives selection.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn a_full_insight_row_thins_the_injected_window(pool: sqlx::PgPool) {
         let owner = Uuid::new_v4();
@@ -2770,7 +2780,9 @@ mod tests {
         let user_message_id = *user_message_ids.last().unwrap();
 
         // character_insights: all ten fields populated ⇒ filled_field_count=10
-        // ⇒ window_extra=0 ⇒ budget = PROTECTED_PRIOR (2).
+        // ⇒ window_extra=0 ⇒ select_window keeps just the previous exchange
+        // (found by role/structure, not a flat budget) plus the current
+        // turn (found by identity).
         eros_engine_store::character_insight::CharacterInsightRepo { pool: &pool }
             .apply_extraction(
                 instance_id,
@@ -3023,6 +3035,18 @@ mod tests {
             "CHAT_NOISE_CANCELLATION_DISABLED must skip the leading-sentence \
              strip: {:?}",
             req.messages
+        );
+
+        // The flag restores the pre-[character_state] prompt shape in full,
+        // not just the strip and the ladder: with a fully-populated
+        // character_insights row present (seeded above via apply_extraction),
+        // the block must still be omitted from the system prompt.
+        assert_eq!(req.messages[0].role, "system");
+        assert!(
+            !req.messages[0].content.contains("[character_state]"),
+            "CHAT_NOISE_CANCELLATION_DISABLED must also suppress \
+             [character_state], the one addition in that change: {:?}",
+            req.messages[0].content
         );
     }
 }
