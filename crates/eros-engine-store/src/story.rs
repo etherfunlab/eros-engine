@@ -291,9 +291,10 @@ impl<'a> StoryRepo<'a> {
     /// itself is session-scoped: a user turn only pairs with an assistant
     /// reply in the SAME `session_id`, so two overlapping sessions with the
     /// same persona can never produce a fabricated cross-session pair. Same
-    /// role/channel/truncation filters and single-session pairing semantics
-    /// (consecutive users collapse to the latest, lone assistants drop) as
-    /// `ChatRepo::recent_turn_pairs`.
+    /// role/channel/truncation filters as elsewhere in this crate. Pairing
+    /// walks chronologically and collapses consecutive user rows to the
+    /// latest before pairing with the next assistant reply; a lone assistant
+    /// with no preceding user row is dropped.
     pub async fn chat_evidence(
         &self,
         owner_uid: Uuid,
@@ -327,7 +328,7 @@ impl<'a> StoryRepo<'a> {
         let mut pairs: Vec<(String, String)> = Vec::new();
         for (session_id, role, content) in chrono_rows {
             if role == "user" || role == "gift_user" {
-                pending.insert(session_id, content); // consecutive users collapse to the latest, matching recent_turn_pairs
+                pending.insert(session_id, content); // consecutive users collapse to the latest unpaired one
             } else {
                 // role == "assistant"
                 if let Some(user_content) = pending.remove(&session_id) {
