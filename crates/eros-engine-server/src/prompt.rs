@@ -1453,6 +1453,23 @@ mod tests {
     }
 
     #[test]
+    fn character_state_empty_row_is_byte_identical_to_none() {
+        // Same idiom as build_prompt_omits_world_block_when_none_or_empty /
+        // build_prompt_omits_stories_block_when_none_or_empty: the doc
+        // comment on `build_prompt`'s `character_state` parameter promises
+        // "byte-identical to the pre-change layout" when omitted, which
+        // covers both `None` and a row with none of the four injected
+        // fields — pin both, not just the `.contains` check.
+        let without = build_prompt_with_character_state(None);
+        let empty = character_row();
+        let with_empty = build_prompt_with_character_state(Some(&empty));
+        assert_eq!(
+            without, with_empty,
+            "empty character_state ⇒ byte-identical prompt"
+        );
+    }
+
+    #[test]
     fn character_state_renders_the_subset_that_is_present() {
         let mut row = character_row();
         row.current_situation = Some("在赶一个案子".into());
@@ -1474,6 +1491,44 @@ mod tests {
         assert!(
             header.contains("这段关系"),
             "header must frame it as relationship history: {header}"
+        );
+    }
+
+    #[test]
+    fn character_state_blank_and_whitespace_values_render_no_empty_bullets() {
+        // Failure mode: an extraction writes e.g. location = "   " and the
+        // trim+filter is dropped ⇒ the block renders "- 人在哪：" with nothing
+        // after the colon, which the model then fills in by inventing a value.
+        let mut row = character_row();
+        row.current_situation = Some("在忙".into()); // keeps the block rendering
+        row.occupation = Some("   ".into());
+        row.location = Some("".into());
+        row.relationships = vec!["   ".into(), "".into()];
+        let p = build_prompt_with_character_state(Some(&row));
+        assert!(p.contains("[character_state]"));
+        assert!(p.contains("在忙"));
+        assert!(
+            !p.contains("在做的工作"),
+            "whitespace-only occupation must not render a bullet: {p}"
+        );
+        assert!(
+            !p.contains("人在哪"),
+            "empty-string location must not render a bullet: {p}"
+        );
+        assert!(
+            !p.contains("提过的人"),
+            "all-blank relationships must not render a bullet: {p}"
+        );
+    }
+
+    #[test]
+    fn character_state_renders_multiple_relationships_joined_by_dun_hao() {
+        let mut row = character_row();
+        row.relationships = vec!["妹妹 小雨".into(), "室友 阿凯".into()];
+        let p = build_prompt_with_character_state(Some(&row));
+        assert!(
+            p.contains("- 提过的人：妹妹 小雨、室友 阿凯"),
+            "multi-element relationships must join with 、: {p}"
         );
     }
 
