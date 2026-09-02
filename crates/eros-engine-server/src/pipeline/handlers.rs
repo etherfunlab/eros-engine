@@ -905,17 +905,29 @@ pub(super) async fn build_reply_request(
     } else {
         let filled = crate::history_window::filled_field_count(character_state.as_ref());
         let extra = crate::history_window::window_extra(filled);
+        // Counted before `history` moves into the call. Spec §8 wants both
+        // causes of a shortened injection readable per turn, and the strip's
+        // drop rate is only recoverable here — `faced` no longer knows which
+        // rows it swallowed.
+        let assistant_before = history
+            .iter()
+            .filter(|m| m.channel.is_none() && m.role == "assistant")
+            .count();
         let faced = model_facing_history(history, true);
+        let assistant_after = faced.iter().filter(|m| m.role == "assistant").count();
+        let stripped_empty = assistant_before - assistant_after;
         let before = faced.len();
         let selected = crate::history_window::select_window(faced, user_message_id, extra);
-        if selected.len() < before {
+        if stripped_empty > 0 || selected.len() < before {
             tracing::info!(
                 insight_fields = filled,
                 extra,
+                stripped_empty,
                 before,
                 after = selected.len(),
                 session_id = %session_id,
-                "history window narrowed by character_insights fill"
+                "injected history shortened by the leading-sentence strip \
+                 and/or the character_insights window ladder"
             );
         }
         apply_echo_cancellation(
@@ -2243,6 +2255,52 @@ mod tests {
             out[1].text, "唔。我在呢，刚洗完澡。",
             "strip=false must not remove the leading sentence"
         );
+    }
+
+    #[test]
+    fn stripped_empty_counts_only_the_assistant_rows_the_strip_dropped() {
+        // Spec §8's drop read-out, computed exactly as build_reply_request
+        // computes it. Channel rows are outside both counts, and user rows
+        // must never move it — otherwise the 4.0%-of-turns prediction is
+        // measured against the wrong denominator.
+        let mut qa = chat_row("assistant", "唔。");
+        qa.channel = Some("product_qa".to_string());
+        let rows = vec![
+            chat_row("user", "在吗"),
+            chat_row("assistant", "唔。"),
+            chat_row("assistant", "唔。我在呢。"),
+            qa,
+            chat_row("gift_user", "谢谢"),
+        ];
+        let assistant_before = rows
+            .iter()
+            .filter(|m| m.channel.is_none() && m.role == "assistant")
+            .count();
+        let faced = model_facing_history(rows, true);
+        let assistant_after = faced.iter().filter(|m| m.role == "assistant").count();
+        assert_eq!(assistant_before, 2, "the product_qa row is out of scope");
+        assert_eq!(assistant_after, 1);
+        assert_eq!(
+            assistant_before - assistant_after,
+            1,
+            "exactly the row that stripped to empty"
+        );
+    }
+
+    #[test]
+    fn stripped_empty_is_zero_when_every_assistant_row_survives() {
+        let rows = vec![
+            chat_row("user", "在吗"),
+            chat_row("assistant", "唔。我在呢。"),
+            chat_row("assistant", "嗯？怎么了。"),
+        ];
+        let assistant_before = rows
+            .iter()
+            .filter(|m| m.channel.is_none() && m.role == "assistant")
+            .count();
+        let faced = model_facing_history(rows, true);
+        let assistant_after = faced.iter().filter(|m| m.role == "assistant").count();
+        assert_eq!(assistant_before - assistant_after, 0);
     }
 
     // ─── fetch_world_context ────────────────────────────────────────────
