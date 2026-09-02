@@ -99,7 +99,7 @@ Every constant is anchored, not invented:
 - **Decay** (`AFFINITY_TIME_DECAY_RATE` `0.02`/day,
   `AFFINITY_TIME_DECAY_FLOOR` `0.5`): 7 days → ×0.86, 25+ days → ×0.5.
   Absence cools but never zeroes — and an old relationship keeps a floor
-  through the boost (bond `0.9` at full decay still yields patience ≈ `0.48`).
+  through the boost (bond `0.9` at full decay still yields patience ≈ `0.47`).
 
 Reachable values at `decay = 1`: level 1 → `[0.0, 0.2]` (continuous in the
 counterpart), level 2 → `[0.244, 0.5]`, level 3 → `[0.487, 1.0]`. The level
@@ -118,7 +118,9 @@ absorbed by decay.
 
 **Ghost is a separate path.** A Ghost turn never reaches
 `persist_with_event` — it only bumps `ghost_streak` / `total_ghosts` /
-`last_ghost_at`. The PDE's ghost deltas touch `tension` only.
+`last_ghost_at`. No axis moves at all: `record_ghost` takes no deltas and
+writes an all-zero `effective_deltas`, so the before/after snapshots agree
+on every axis.
 
 ## The two derived lines
 

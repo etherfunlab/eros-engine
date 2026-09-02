@@ -112,7 +112,7 @@ cargo run -p eros-engine-server -- serve
 
 ## API 一览
 
-核心流程很简单：创建人设会话，然后向 SSE 流式端点发送对话。另有一个只入队的备选端点（`POST /v2/comp/session/{session_id}/message/async`），面向无法保持流式连接的 bot 式调用方——回复由后台 worker 生成，落库后从历史记录 / Realtime 读取，而不是走流式帧。引擎还提供历史记录、会话、画像及好感度路由。默认使用 Supabase JWT 鉴权，也可通过 `AuthValidator` 替换。具体路径、payload 与流式帧详见 [API 参考](docs/api-reference.zh.md)。
+核心流程很简单：创建人设会话，然后向 SSE 流式端点发送对话。语音走独立通道——用 `channel: "voice"` 创建会话并调用语音回合端点（prompt 更精简，另带一个打断调用）；两个通道不会写进彼此的会话。另有一个只入队的备选端点（`POST /v2/comp/session/{session_id}/message/async`），面向无法保持流式连接的 bot 式调用方——回复由后台 worker 生成，落库后从历史记录 / Realtime 读取，而不是走流式帧。引擎还提供历史记录、会话、画像及好感度路由。默认使用 Supabase JWT 鉴权，也可通过 `AuthValidator` 替换。具体路径、payload 与流式帧详见 [API 参考](docs/api-reference.zh.md)。
 
 ## 配置
 
@@ -122,7 +122,7 @@ cargo run -p eros-engine-server -- serve
 
 ## 路线图
 
-- [ ] **语音消息**与**原生音频 I/O**——低延迟的语音回合 API 已经就位，STT/TTS 目前由调用方负责。
+- [ ] **原生音频 I/O**——低延迟的语音回合 API 与打断已经就位，STT/TTS 目前由调用方负责。
 - [ ] **视频生成**——由伴侣发送短视频片段。
 
 ## 非目标
