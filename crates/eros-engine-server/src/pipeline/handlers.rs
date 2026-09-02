@@ -2585,14 +2585,30 @@ mod tests {
         // history ends on the "user" current turn: a0,u0,a1,u1,...,a5,u5.
         // Each assistant row carries two sentences so the leading-sentence
         // strip never empties it out.
+        //
+        // a4's content is deliberately made byte-identical to a5's (the
+        // OUTSIDE-window copy vs. the INSIDE-window copy — a5 is the
+        // assistant reply kept by the ladder, a4 is not). This pins the
+        // ordering requirement: under the correct order (select, then
+        // cancel) a4 is never selected, so cancellation never sees the
+        // duplicate and a5 survives untouched. Under the wrong order
+        // (cancel, then select) both a4 and a5 would be dropped as a
+        // duplicate pair before selection ever runs, and an older row
+        // would fill the freed budget slot instead — different content at
+        // the same position, caught by the assertion below.
         let mut user_message_ids = Vec::with_capacity(6);
         for i in 0..6i64 {
+            let assistant_content = if i == 4 {
+                "唔。这是第5轮回复，够长不会被吃空。".to_string()
+            } else {
+                format!("唔。这是第{i}轮回复，够长不会被吃空。")
+            };
             sqlx::query(
                 "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
                  VALUES ($1, 'assistant', $2, now() + make_interval(secs => $3::float8))",
             )
             .bind(session_id)
-            .bind(format!("唔。这是第{i}轮回复，够长不会被吃空。"))
+            .bind(assistant_content)
             .bind((2 * i) as f64)
             .execute(&pool)
             .await
@@ -2684,6 +2700,17 @@ mod tests {
         // system + 3: the current turn plus the previous exchange (its user
         // message and the assistant's reply to it). Without the ladder this
         // would carry all 12 seeded rows plus system.
+        //
+        // NOTE: this length assertion alone does NOT discriminate the
+        // select/cancel ordering — cancel_echo drops every occurrence of a
+        // duplicate group when neither copy is the current turn, so the
+        // wrong order still ends up selecting exactly 3 rows (just a
+        // different 3, reaching one row further back to fill the budget
+        // freed by dropping a4+a5 before selection ever runs). It stays
+        // here as a sanity check; the assertion on req.messages[2] below is
+        // the one that actually pins the order (verified by temporarily
+        // swapping select_window and apply_echo_cancellation and watching
+        // this test fail — see the fix report).
         assert_eq!(
             req.messages.len(),
             4,
@@ -2693,9 +2720,168 @@ mod tests {
         );
         assert_eq!(req.messages[0].role, "system");
         assert_eq!(
+            req.messages[1].content, "第4轮用户消息",
+            "the previous exchange's user message"
+        );
+        // This is the load-bearing assertion for the ordering requirement
+        // (spec §4.6: select_window, then apply_echo_cancellation) AND for
+        // the leading-sentence strip (spec §4.3):
+        // - Correct order: select_window picks a5 by identity (it is
+        //   "inside" the surviving window); a4 — the byte-identical
+        //   "outside" copy — was never selected, so cancellation sees no
+        //   duplicate and a5's STRIPPED text survives untouched.
+        // - Wrong order: cancellation would see both a4 and a5 as one
+        //   duplicate group with neither being the current turn, drop BOTH,
+        //   and selection would then reach one row further back (to the
+        //   earlier user row "第3轮用户消息") to fill the freed slot —
+        //   different content at this position.
+        // - strip=false (the leading-sentence strip skipped): this position
+        //   would carry the "唔。" prefix instead of the stripped text.
+        assert_eq!(
+            req.messages[2].content, "这是第5轮回复，够长不会被吃空。",
+            "the previous exchange's assistant reply, selected by identity \
+             (not dropped as a duplicate) and stripped of its leading \
+             sentence: {:?}",
+            req.messages
+        );
+        assert_eq!(
             req.messages.last().unwrap().content,
             "第5轮用户消息",
             "the current turn must be the newest injected message"
+        );
+    }
+
+    /// `CHAT_NOISE_CANCELLATION_DISABLED` must reach the actual wiring, not
+    /// just `model_facing_history`'s `strip` parameter in isolation
+    /// (`strip_false_leaves_assistant_rows_whole` already pins that in
+    /// unit): with the flag on, `build_reply_request` must skip BOTH the
+    /// leading-sentence strip and the character_insights-driven ladder, even
+    /// against a fully-populated character_insights row that would
+    /// otherwise narrow the window to 3. This is the rollback path that
+    /// does not need a rebuild, so it has to be known-working, not just
+    /// assumed from the unit-level test.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn chat_noise_cancellation_disabled_bypasses_strip_and_ladder(pool: sqlx::PgPool) {
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, owner).await;
+        let session_id = make_session(&pool, owner, Some(instance_id)).await;
+
+        // Same twelve-row shape as the ladder test, but with no duplicate
+        // content — this test is about the flag bypassing strip + ladder,
+        // not about echo cancellation.
+        let mut user_message_ids = Vec::with_capacity(6);
+        for i in 0..6i64 {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+                 VALUES ($1, 'assistant', $2, now() + make_interval(secs => $3::float8))",
+            )
+            .bind(session_id)
+            .bind(format!("唔。这是第{i}轮回复，够长不会被吃空。"))
+            .bind((2 * i) as f64)
+            .execute(&pool)
+            .await
+            .unwrap();
+            let uid = sqlx::query_scalar::<_, Uuid>(
+                "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+                 VALUES ($1, 'user', $2, now() + make_interval(secs => $3::float8)) \
+                 RETURNING id",
+            )
+            .bind(session_id)
+            .bind(format!("第{i}轮用户消息"))
+            .bind((2 * i + 1) as f64)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            user_message_ids.push(uid);
+        }
+        let user_message_id = *user_message_ids.last().unwrap();
+
+        // Same fully-populated character_insights row as the ladder test —
+        // if the flag failed to bypass the ladder, this would narrow the
+        // window to system + 3, exactly like that test.
+        eros_engine_store::character_insight::CharacterInsightRepo { pool: &pool }
+            .apply_extraction(
+                instance_id,
+                &serde_json::json!({
+                    "location": "公司",
+                    "occupation": "策展人",
+                    "current_situation": "连轴转了两周",
+                    "desires": "想去海边",
+                    "vulnerabilities": "怕被丢下",
+                    "habits": "凌晨才睡",
+                    "personal_values": "看重守约",
+                    "likes": ["下雨天"],
+                    "dislikes": ["被当小孩哄"],
+                    "relationships": ["妹妹在读高三"]
+                }),
+            )
+            .await
+            .unwrap();
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.config.chat_noise_cancellation_disabled = true;
+        let plan = ActionPlan {
+            action_type: eros_engine_core::types::ActionType::ReplyText,
+            reply_style: eros_engine_core::types::ReplyStyle::Neutral,
+            affinity_deltas: Default::default(),
+            energy_cost: 0.0,
+            context_hints: vec![],
+            reply_tone: None,
+            image_caption: None,
+            image_ref: eros_engine_core::types::ImageRef::Face,
+            aspect_ratio: None,
+        };
+        let input = DecisionInput {
+            event: Event::UserMessage {
+                content: "第5轮用户消息".into(),
+                message_id: user_message_id,
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: MemoryScope::None,
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                quote: Default::default(),
+            },
+            affinity: ladder_test_affinity(session_id, owner, instance_id),
+            persona: ladder_test_persona(instance_id, owner),
+            signals: eros_engine_core::types::ConversationSignals {
+                message_count: 12,
+                hours_since_last_message: 0.1,
+                ghost_streak: 0,
+                hours_since_last_ghost: None,
+            },
+        };
+
+        let (req, _tags) = build_reply_request(
+            &state,
+            &input,
+            &plan,
+            session_id,
+            owner,
+            instance_id,
+            user_message_id,
+        )
+        .await
+        .expect("build_reply_request succeeds");
+
+        // system + all 12 seeded rows — the ladder never ran, so the fully-
+        // populated character_insights row (which would otherwise narrow
+        // this to system + 3) has no effect.
+        assert_eq!(
+            req.messages.len(),
+            13,
+            "CHAT_NOISE_CANCELLATION_DISABLED must skip the ladder entirely: {:?}",
+            req.messages
+        );
+        // The first injected row (a0, chronologically oldest) must still
+        // carry its leading sentence — the strip must not have run either.
+        assert_eq!(req.messages[1].role, "assistant");
+        assert_eq!(
+            req.messages[1].content, "唔。这是第0轮回复，够长不会被吃空。",
+            "CHAT_NOISE_CANCELLATION_DISABLED must skip the leading-sentence \
+             strip: {:?}",
+            req.messages
         );
     }
 }
