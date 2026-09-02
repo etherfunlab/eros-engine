@@ -2543,36 +2543,47 @@ impl ModelConfig {
         Ok(())
     }
 
-    /// Boot gate for `[tasks.affinity_evaluation].filter_prompt` — a key that
-    /// parses but is never read.
+    /// Boot gate for `[tasks.affinity_evaluation].filter_prompt` and
+    /// `[tasks.affinity_summary].filter_prompt` — keys that parse but are
+    /// never read.
     ///
-    /// The affinity evaluator's prompt is engine-owned by design (issue #210):
-    /// it interpolates per-turn context the config layer cannot express, and
-    /// affinity is what PDE thresholds, scope gating, and `[emotional_context]`
-    /// all consume — so a downstream rewrite of the evaluator's contract breaks
-    /// behaviour the operator cannot see. Rather than add a resolver, refuse to
-    /// boot, consistent with `validate_prompt_variants`: dead config must never
+    /// Both affinity tasks' prompts are engine-owned by design: the evaluator
+    /// (issue #210) interpolates per-turn context the config layer cannot
+    /// express, and affinity is what PDE thresholds, scope gating, and
+    /// `[emotional_context]` all consume; the feeling-clause summarizer
+    /// (spec 2026-09-03) is the same story one level downstream — its
+    /// first-person voice and reason hygiene are load-bearing, since the
+    /// clause it writes is re-injected into later system prompts. Either
+    /// way a downstream rewrite of the contract breaks behaviour the
+    /// operator cannot see. Rather than add a resolver, refuse to boot,
+    /// consistent with `validate_prompt_variants`: dead config must never
     /// silently no-op.
     ///
     /// Rejects the key in EVERY shape, blank included. Blank leniency
     /// ("commented out" ⇒ built-in default) exists for keys that are actually
     /// read; here it would reproduce the exact silence this gate removes.
-    /// Every other `[tasks.affinity_evaluation]` field (model, fallback,
-    /// temperature, max_tokens, reasoning) stays configurable.
+    /// Every other field on these blocks (model, fallback, temperature,
+    /// max_tokens, reasoning) stays configurable.
     pub fn validate_affinity_prompt_unset(&self) -> Result<(), String> {
-        const AFFINITY_TASK: &str = "affinity_evaluation";
-        let has_prompt = self
-            .tasks
-            .get(AFFINITY_TASK)
-            .is_some_and(|t| t.filter_prompt.is_some());
-        if has_prompt {
-            return Err(format!(
-                "[tasks.{AFFINITY_TASK}].filter_prompt is set, but the affinity evaluator's \
-                 prompt is engine-owned and deliberately not configurable — it was never read, \
-                 and eros-engine refuses to boot rather than let it silently no-op. Remove the \
-                 key; model/fallback/temperature/max_tokens/reasoning remain configurable. \
-                 Rationale: https://github.com/etherfunlab/eros-engine/issues/210"
-            ));
+        // Both affinity tasks' prompts are engine-owned: the evaluator
+        // (issue #210) and the feeling-clause summarizer (spec 2026-09-03),
+        // whose first-person voice + reason hygiene are load-bearing — the
+        // clause is re-injected into later system prompts.
+        const ENGINE_OWNED_AFFINITY_TASKS: [&str; 2] = ["affinity_evaluation", "affinity_summary"];
+        for task in ENGINE_OWNED_AFFINITY_TASKS {
+            let has_prompt = self
+                .tasks
+                .get(task)
+                .is_some_and(|t| t.filter_prompt.is_some());
+            if has_prompt {
+                return Err(format!(
+                    "[tasks.{task}].filter_prompt is set, but this task's prompt is \
+                     engine-owned and deliberately not configurable — it was never read, \
+                     and eros-engine refuses to boot rather than let it silently no-op. Remove the \
+                     key; model/fallback/temperature/max_tokens/reasoning remain configurable. \
+                     Rationale: https://github.com/etherfunlab/eros-engine/issues/210"
+                ));
+            }
         }
         Ok(())
     }
@@ -2789,6 +2800,7 @@ pub const KNOWN_CHAT_TASKS: &[&str] = &[
     "user_insight_extraction",
     "user_insight_structuring",
     "affinity_evaluation",
+    "affinity_summary",
     "world_director",
     "world_stories_director",
     "world_comment",
@@ -7139,6 +7151,21 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
             .validate_affinity_prompt_unset()
             .expect_err("must refuse");
         assert!(err.contains("engine-owned"), "{err}");
+    }
+
+    #[test]
+    fn affinity_summary_filter_prompt_refuses_boot() {
+        // Mirror the affinity_evaluation gate test's config-construction
+        // shape exactly; only the section name differs.
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.affinity_summary]\nmodel = \"m\"\nfilter_prompt = \"x\"\n",
+        )
+        .unwrap();
+        let err = cfg.validate_affinity_prompt_unset().unwrap_err();
+        assert!(
+            err.contains("[tasks.affinity_summary].filter_prompt"),
+            "{err}"
+        );
     }
 
     // ─── validate_tier_blocks ────────────────────────────────────────────

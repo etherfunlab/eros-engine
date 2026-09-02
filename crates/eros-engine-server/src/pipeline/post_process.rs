@@ -107,8 +107,14 @@ pub async fn run(
         } => (content.clone(), Some(*message_id)),
         _ => (String::new(), None),
     };
-    // As of 4.0 the request's affinity scope is read-side only (prompt
-    // injection gating); nothing in the write path consumes it any more.
+    // As of 4.0 the request's affinity scope is read-side (prompt injection
+    // gating) AND consumed here by the feeling-clause summarizer, which only
+    // narrates axes the request actually asked for.
+    let affinity_scope = match &event {
+        Event::UserMessage { affinity_scope, .. } => *affinity_scope,
+        _ => eros_engine_core::scope::AffinityScope::default(),
+    };
+    let scope_has_axes = affinity_scope.active_count() > 0;
     let client_id = client_id_from_event(&event);
 
     let fut_insight = async {
@@ -232,6 +238,25 @@ pub async fn run(
             user_message_id,
         )
         .await;
+
+        // Feeling-clause summarizer (spec 2026-09-03): movement turns only,
+        // gated on the [tasks.affinity_summary] section being present at
+        // all (absent = feature off, clause stays NULL) and on the request
+        // actually injecting affinity (zero-axis scope ⇒ nothing would
+        // render the clause).
+        if movement_turn(plan.action_type, &grades, &levels)
+            && scope_has_axes
+            && state.model_config.tasks.contains_key(SUMMARY_TASK)
+        {
+            summarize_feeling(
+                &state,
+                session_id,
+                instance_id,
+                affinity_scope,
+                client_id.as_deref(),
+            )
+            .await;
+        }
     };
 
     let fut_character_insight = async {
@@ -971,6 +996,81 @@ async fn evaluate_affinity(
     // so a NULL audit join key is never left unexplained.
     let skip = missing_generation_skip_reason(generation_id.as_deref());
     (grades, levels, reason, generation_id, skip, recovered)
+}
+
+/// Rewrite the session's feeling clause (spec 2026-09-03 §5). Runs on
+/// movement turns only, after the affinity write, request-scoped (billed
+/// to the turn's user — not a sweeper, so no SYSTEM_AUDIT_USER). Reads the
+/// POST-persist affinity row so the bands reflect this turn's movement.
+/// Fail-open everywhere: any error warns and keeps the old clause; the
+/// next movement turn rewrites anyway.
+async fn summarize_feeling(
+    state: &AppState,
+    session_id: Uuid,
+    instance_id: Uuid,
+    scope: eros_engine_core::scope::AffinityScope,
+    audit_user: Option<&str>,
+) {
+    let persona_repo = PersonaRepo { pool: &state.pool };
+    let persona_name = match persona_repo.load_companion(instance_id).await {
+        Ok(Some(p)) => p.genome.name,
+        _ => return, // no persona to voice the clause as
+    };
+    let repo = AffinityRepo { pool: &state.pool };
+    let affinity = match repo.load(session_id).await {
+        Ok(Some(a)) => a,
+        _ => return, // archived mid-flight, or read error — keep old clause
+    };
+    let reasons = repo
+        .recent_reasons(session_id, SUMMARY_REASONS_LIMIT)
+        .await
+        .unwrap_or_default();
+
+    let resolved = state.model_config.resolve(SUMMARY_TASK, None);
+    let req = ChatRequest {
+        model: resolved.model,
+        fallback_model: resolved.fallback_model,
+        messages: affinity_summary_messages(&persona_name, &affinity, scope, &reasons),
+        temperature: resolved.temperature as f32,
+        max_tokens: resolved.max_tokens,
+        sampling: resolved.sampling,
+        user: audit_user.map(String::from),
+        reasoning: resolved.reasoning,
+        task: Some(SUMMARY_TASK.into()),
+        ..Default::default()
+    };
+    let resp =
+        match tokio::time::timeout(AFFINITY_SUMMARY_TIMEOUT, state.openrouter.execute(req)).await {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => {
+                tracing::warn!("affinity summary LLM call failed: {e}");
+                return;
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                "affinity summary timed out after {AFFINITY_SUMMARY_TIMEOUT:?}; keeping old clause"
+            );
+                return;
+            }
+        };
+    super::record_generation(
+        &state.pool,
+        super::GenerationRecord {
+            task: SUMMARY_TASK,
+            session_id: Some(session_id),
+            generation_id: resp.generation_id.as_deref(),
+            model: resp.model.as_deref(),
+            usage: resp.usage.as_ref(),
+        },
+    )
+    .await;
+    let Some(clause) = parse_affinity_summary(&resp.reply) else {
+        tracing::warn!("affinity summary output unparseable; keeping old clause");
+        return;
+    };
+    if let Err(e) = repo.set_feeling_clause(session_id, &clause).await {
+        tracing::warn!("feeling_clause write failed: {e}");
+    }
 }
 
 const INSIGHT_TASK: &str = "insight_extraction";
