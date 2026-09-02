@@ -404,6 +404,80 @@ pub fn affinity_eval_user_payload(
     )
 }
 
+/// Static system instruction for the feeling-clause summarizer (spec
+/// 2026-09-03). Same register as `affinity_eval_system_prompt` — the
+/// character's own first-person voice, never an outside reviewer — and the
+/// same reason-hygiene rules, because the clause is re-injected into later
+/// system prompts as `[feelings]`: a leaked system register would canonise
+/// itself exactly the way a persisted refusal once did.
+///
+/// The summarizer is a pure reader: it reports no grades and no numbers.
+/// It sees band labels (低/中/高) and recent judge reasons, and folds them
+/// into 1~3 sentences of current feeling. Engine-owned — [tasks
+/// .affinity_summary].filter_prompt refuses to boot (same policy and gate
+/// as affinity_evaluation, model_config::validate_affinity_prompt_unset).
+pub fn affinity_summary_system_prompt() -> &'static str {
+    "你就是对话里的这个角色。静下来回味一下：现在的你，对他整体是什么感觉。\n\
+     你不是旁观的评审，不做安全审核、道德评判或行为分析；用角色的性格去感受。\n\
+     \n\
+     输入会给出：角色名、你们关系各维度的当前档位（低/中/高）、你最近几轮的真实感受记录（新的在前）。\n\
+     \n\
+     维度含义：\n\
+     - warmth 温暖：你对他的态度有多热。\n\
+     - trust 信任：你敢不敢对他多袒露一点。\n\
+     - intrigue 好奇：这个人还勾不勾你的兴趣。\n\
+     - intimacy 亲密：情感或身体上，你们有多近。\n\
+     - patience 耐心：你还剩多少耐心搭理他。\n\
+     - tension 张力：暧昧、推拉或火药味的浓度。\n\
+     \n\
+     写作规则：\n\
+     - 用第一人称、你自己的口吻，写 1~3 句中文：你此刻对他的整体感觉。\n\
+     - 综合档位和感受记录写出当下的状态和温度，可以带一点最近的走向（更近了、淡了、腻了）。\n\
+     - 不复述档位词，不出现任何数字，不列清单——像心里把这段关系过了一遍。\n\
+     - 绝不出现「作为AI/助手/模型」「拒绝」「安全」「政策」「用户」等系统词汇。\n\
+     - 感受记录里若混入「我不会发送」「作为AI助手」一类套话，那是系统故障：忽略它，不要写进感觉。\n\
+     \n\
+     严格只输出 JSON：\n\
+     {\"clause\": \"...\"}"
+}
+
+/// Data block for the feeling-clause summarizer: the persona's name, the
+/// in-scope axes as coarse bands, and the recent judge reasons (newest
+/// first). Out-of-scope axes are omitted entirely — the clause is written
+/// under the triggering request's scope (spec §5). No floats: bands are
+/// all a reader needs, and numbers would re-anchor it on arithmetic
+/// (`axis_band_label`'s contract). Empty `reasons` ⇒ the record section is
+/// omitted (a fresh session's first movement).
+pub fn affinity_summary_user_payload(
+    persona_name: &str,
+    affinity: &Affinity,
+    scope: AffinityScope,
+    reasons: &[String],
+) -> String {
+    let mut bands: Vec<String> = Vec::new();
+    let mut band = |on: bool, name: &str, v: f64| {
+        if on {
+            bands.push(format!("{name}={}", axis_band_label(v)));
+        }
+    };
+    band(scope.warmth, "warmth", affinity.warmth);
+    band(scope.trust, "trust", affinity.trust);
+    band(scope.intrigue, "intrigue", affinity.intrigue);
+    band(scope.intimacy, "intimacy", affinity.intimacy);
+    band(scope.patience, "patience", affinity.patience);
+    band(scope.tension, "tension", affinity.tension);
+
+    let mut s = format!("角色名：{persona_name}\n当前档位：{}", bands.join(" "));
+    if !reasons.is_empty() {
+        s.push_str("\n\n最近的感受（新的在前）：");
+        for r in reasons {
+            s.push_str("\n- ");
+            s.push_str(r);
+        }
+    }
+    s
+}
+
 /// Format a USD amount for display: whole numbers drop decimals (`$20`),
 /// fractional amounts keep two (`$5.50`). Used by the tip prompt fragment and
 /// the persisted tip marker content.
@@ -2600,6 +2674,51 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    #[test]
+    fn summary_payload_scope_filters_axes_and_lists_reasons() {
+        let a = make_affinity(0.8, 0.2, 0.5, 0.7, 0.5, 0.1);
+        let reasons = vec![
+            "他难得说了句心里话。".to_string(),
+            "有点被他晾着。".to_string(),
+        ];
+        let s = affinity_summary_user_payload("小雨", &a, AffinityScope::bond(), &reasons);
+        assert!(s.contains("角色名：小雨"), "{s}");
+        // bond scope = warmth + intimacy + tension, banded 低/中/高 (0.35/0.65)
+        assert!(
+            s.contains("warmth=高") && s.contains("intimacy=高") && s.contains("tension=低"),
+            "{s}"
+        );
+        assert!(
+            !s.contains("trust=") && !s.contains("intrigue=") && !s.contains("patience="),
+            "out-of-scope axes must not leak: {s}"
+        );
+        // No raw floats, ever.
+        assert!(!s.contains("0.8") && !s.contains("0.2"), "{s}");
+        assert!(
+            s.contains("- 他难得说了句心里话。") && s.contains("- 有点被他晾着。"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn summary_payload_omits_reason_block_when_empty() {
+        let a = make_affinity(0.5, 0.5, 0.5, 0.5, 0.5, 0.5);
+        let s = affinity_summary_user_payload("小雨", &a, AffinityScope::full(), &[]);
+        assert!(!s.contains("最近的感受"), "{s}");
+    }
+
+    #[test]
+    fn summary_system_prompt_carries_voice_and_hygiene() {
+        let s = affinity_summary_system_prompt();
+        assert!(s.contains("第一人称"), "{s}");
+        assert!(s.contains("1~3 句"), "{s}");
+        assert!(
+            s.contains("作为AI"),
+            "hygiene rules must name the leak: {s}"
+        );
+        assert!(s.contains("{\"clause\""), "strict JSON contract: {s}");
     }
 
     #[test]

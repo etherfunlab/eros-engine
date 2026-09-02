@@ -768,6 +768,75 @@ fn affinity_eval_messages(
     ]
 }
 
+const SUMMARY_TASK: &str = "affinity_summary";
+const AFFINITY_SUMMARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Judge reasons fed to the summarizer, newest-first (spec §5).
+const SUMMARY_REASONS_LIMIT: i64 = 5;
+
+/// Movement predicate (spec §4): rewrite the feeling clause only on turns
+/// with real affinity movement. Purely ordinal — reads the judge's grades
+/// and levels, never compares floats against band edges. In-turn band
+/// crossings always come with a grade ≥ 1, so nothing is missed; silent
+/// decay drift between sessions does not re-trigger (accepted lag — the
+/// clause is narrative state, [mood]'s gates keep reading live floats).
+fn movement_turn(
+    action: ActionType,
+    grades: &eros_engine_core::affinity::AxisGrades,
+    levels: &eros_engine_core::affinity::EndpointLevelReads,
+) -> bool {
+    action == ActionType::Ghost
+        || grades.trust != 0
+        || grades.intrigue != 0
+        || grades.intimacy != 0
+        || grades.tension != 0
+        || levels.warmth.is_some_and(|l| l != 2)
+        || levels.patience.is_some_and(|l| l != 2)
+}
+
+/// Raw shape of the summarizer's JSON output.
+#[derive(Debug, serde::Deserialize)]
+struct LlmAffinitySummary {
+    clause: String,
+}
+
+/// Parse the summarizer output. Any failure — non-JSON, missing/blank
+/// clause — is `None`: the caller keeps the old clause (spec §5 failure
+/// handling), same fail-open posture as `parse_affinity_eval`.
+fn parse_affinity_summary(raw: &str) -> Option<String> {
+    let parsed: LlmAffinitySummary = super::parse_llm_json(raw)?;
+    let clause = parsed.clause.trim();
+    if clause.is_empty() {
+        None
+    } else {
+        Some(clause.to_string())
+    }
+}
+
+/// Build the summarizer's two-message request; pure, unit-testable without
+/// an `AppState` — same split as `affinity_eval_messages`.
+fn affinity_summary_messages(
+    persona_name: &str,
+    affinity: &eros_engine_core::affinity::Affinity,
+    scope: eros_engine_core::scope::AffinityScope,
+    reasons: &[String],
+) -> Vec<ChatMessage> {
+    vec![
+        ChatMessage {
+            role: "system".into(),
+            content: crate::prompt::affinity_summary_system_prompt().to_string(),
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: crate::prompt::affinity_summary_user_payload(
+                persona_name,
+                affinity,
+                scope,
+                reasons,
+            ),
+        },
+    ]
+}
+
 /// Grades, endpoint level reads, the model's reason, the audit trio, the skip
 /// marker, and every failed attempt — what one eval hands back to the caller.
 type AffinityEvalOutcome = (
@@ -3670,6 +3739,61 @@ mod tests {
             !msgs[0].content.contains("我今天好累"),
             "system message must stay static across turns"
         );
+    }
+
+    #[test]
+    fn movement_turn_quiet_and_moving() {
+        use eros_engine_core::affinity::{AxisGrades, EndpointLevelReads};
+        let quiet = (AxisGrades::default(), EndpointLevelReads::default());
+        // White-water turn: all-zero grades, no endpoint reads, plain reply.
+        assert!(!movement_turn(ActionType::ReplyText, &quiet.0, &quiet.1));
+        // Endpoint level 2 is the baseline — still quiet.
+        let baseline = EndpointLevelReads {
+            warmth: Some(2),
+            patience: Some(2),
+        };
+        assert!(!movement_turn(ActionType::ReplyText, &quiet.0, &baseline));
+        // Any non-zero grade moves, either direction.
+        let down = AxisGrades {
+            trust: -1,
+            ..Default::default()
+        };
+        assert!(movement_turn(ActionType::ReplyText, &down, &quiet.1));
+        // Endpoint level off baseline moves.
+        let cold = EndpointLevelReads {
+            warmth: Some(1),
+            patience: None,
+        };
+        assert!(movement_turn(ActionType::ReplyText, &quiet.0, &cold));
+        // Ghost always moves, even with default grades (eval was skipped).
+        assert!(movement_turn(ActionType::Ghost, &quiet.0, &quiet.1));
+    }
+
+    #[test]
+    fn parse_affinity_summary_good_fenced_garbage_empty() {
+        assert_eq!(
+            parse_affinity_summary(r#"{"clause": "我现在挺想他的。"}"#).as_deref(),
+            Some("我现在挺想他的。")
+        );
+        // parse_llm_json already salvages fenced blocks — same behavior here.
+        assert_eq!(
+            parse_affinity_summary("```json\n{\"clause\": \"还行。\"}\n```").as_deref(),
+            Some("还行。")
+        );
+        assert_eq!(parse_affinity_summary("not json at all"), None);
+        assert_eq!(parse_affinity_summary(r#"{"clause": "   "}"#), None);
+        assert_eq!(parse_affinity_summary(r#"{"other": "x"}"#), None);
+    }
+
+    #[test]
+    fn affinity_summary_messages_is_system_then_user() {
+        use eros_engine_core::scope::AffinityScope;
+        let a = fixture_eval_affinity();
+        let msgs = affinity_summary_messages("小雨", &a, AffinityScope::full(), &[]);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, "system");
+        assert_eq!(msgs[1].role, "user");
+        assert!(msgs[1].content.contains("角色名：小雨"));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
