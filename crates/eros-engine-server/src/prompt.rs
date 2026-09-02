@@ -31,6 +31,7 @@ use eros_engine_core::scope::AffinityScope;
 use eros_engine_core::types::PromptTrait;
 use eros_engine_core::types::QuotedMessage;
 use eros_engine_core::types::ReplyStyle;
+use rand::Rng;
 
 /// World-memories injection payload: the persona's resident digest plus
 /// recalled script fragments (spec §3.3).
@@ -171,6 +172,46 @@ fn now_context_at(now: chrono::DateTime<Utc>, timezone: Option<&str>) -> String 
 /// score (0~1). No in-scope axis (or no affinity yet) → strictest tier.
 /// Thresholds (0.25 / 0.55) carry over from the single-intimacy era; the
 /// composite averages land on similar tier boundaries in practice — tunable.
+/// Cold floors shared by the `[mood]` directives and the nudge veto. At or
+/// below the floor the axis's cold directive renders — and a die whose
+/// directive would fight that conclusion is not rolled.
+const WARMTH_COLD_FLOOR: f64 = 0.2; // cold iff warmth <= floor
+const TRUST_COLD_FLOOR: f64 = 0.3; // cold iff trust < floor
+const INTRIGUE_COLD_FLOOR: f64 = 0.3; // cold iff intrigue < floor
+
+/// Per-turn nudge probabilities. Cadence lives engine-side: the model never
+/// sees a quota or an "偶尔", only a won die's directive — or nothing.
+pub const NUDGE_AFFIRM_P: f64 = 0.33;
+pub const NUDGE_SHARE_P: f64 = 0.13;
+pub const NUDGE_QUESTION_P: f64 = 0.05;
+
+/// Engine-rolled per-turn nudges, rendered as `[this_turn]` (all-false ⇒ the
+/// block is omitted). Rolled once per turn at the call site, never inside
+/// `build_prompt` — the prompt stays a pure function of its inputs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TurnNudges {
+    pub affirm: bool,
+    pub share_slice: bool,
+    pub open_question: bool,
+}
+
+impl TurnNudges {
+    /// Veto-then-roll: an axis the affinity has already judged cold (same
+    /// floors and scope gating as the cold `[mood]` directives) keeps its die
+    /// out of the cup entirely.
+    pub fn roll(affinity: Option<&Affinity>, scope: AffinityScope, rng: &mut impl Rng) -> Self {
+        let veto_affirm = scope.warmth && affinity.is_some_and(|a| a.warmth <= WARMTH_COLD_FLOOR);
+        let veto_share = scope.trust && affinity.is_some_and(|a| a.trust < TRUST_COLD_FLOOR);
+        let veto_question =
+            scope.intrigue && affinity.is_some_and(|a| a.intrigue < INTRIGUE_COLD_FLOOR);
+        Self {
+            affirm: !veto_affirm && rng.gen::<f64>() < NUDGE_AFFIRM_P,
+            share_slice: !veto_share && rng.gen::<f64>() < NUDGE_SHARE_P,
+            open_question: !veto_question && rng.gen::<f64>() < NUDGE_QUESTION_P,
+        }
+    }
+}
+
 fn length_rule(affinity: Option<&Affinity>, scope: AffinityScope) -> &'static str {
     let score = affinity.and_then(|a| scope.length_score(a)).unwrap_or(0.0);
     if score < 0.25 {
@@ -193,17 +234,19 @@ pub fn affinity_to_attitude_prompt(a: &Affinity, scope: AffinityScope) -> String
             directives.push("语气温暖，可以用一些亲昵的称呼");
         } else if a.warmth > 0.35 {
             directives.push("语气友善自然");
-        } else if a.warmth > 0.2 {
+        } else if a.warmth > WARMTH_COLD_FLOOR {
             directives.push("语气平淡，保持礼貌但不热络");
         } else {
-            directives.push("语气冷淡，回复简短，不主动延伸话题");
+            // Tone only — the length band is [reply_length]'s fact (the cold
+            // warmth already depresses it through length_score).
+            directives.push("语气冷淡，不主动延伸话题");
         }
     }
 
     if scope.trust {
         if a.trust > 0.6 {
             directives.push("可以分享更私密的想法和小秘密");
-        } else if a.trust < 0.3 {
+        } else if a.trust < TRUST_COLD_FLOOR {
             directives.push("保持一定距离感，不轻易透露内心想法");
         }
     }
@@ -211,7 +254,7 @@ pub fn affinity_to_attitude_prompt(a: &Affinity, scope: AffinityScope) -> String
     if scope.intrigue {
         if a.intrigue > 0.7 {
             directives.push("你对他很好奇，主动问问题，想了解更多");
-        } else if a.intrigue < 0.3 {
+        } else if a.intrigue < INTRIGUE_COLD_FLOOR {
             directives.push("你对他兴趣不大，不会主动找话题");
         }
     }
@@ -222,7 +265,9 @@ pub fn affinity_to_attitude_prompt(a: &Affinity, scope: AffinityScope) -> String
 
     if scope.patience {
         if a.patience < 0.35 {
-            directives.push("你有点不耐烦了，回复可以更敷衍、更短");
+            // Tone only — length is [reply_length]'s fact, and low patience
+            // already depresses the band through length_score.
+            directives.push("你有点不耐烦了，回复可以更敷衍");
         } else if a.patience > 0.65 {
             directives.push("你很有耐心，愿意陪他聊");
         }
@@ -538,6 +583,9 @@ pub fn build_prompt(
     // with none of the four injected fields ⇒ the [character_state] block is
     // omitted and the prompt is byte-identical to the pre-change layout.
     character_state: Option<&eros_engine_store::character_insight::CharacterInsightsRow>,
+    // Engine-rolled per-turn nudges (`TurnNudges::roll` at the call site).
+    // All-false ⇒ the [this_turn] block is omitted.
+    nudges: TurnNudges,
 ) -> String {
     let name = persona.genome.name.as_str();
     let age = meta_i32(persona, "age")
@@ -777,20 +825,46 @@ pub fn build_prompt(
         None => String::new(),
     };
 
-    // 铁律 ⑦: gender-consistency reinforcement (redundancy = weighting). Only for
+    // 铁律 ③: gender-consistency reinforcement (redundancy = weighting). Only for
     // binary genders, with a role-play exception. Skipped for non-binary/absent.
     // Rendered LAST so the numbering stays contiguous whether or not it fires —
-    // this clause being conditional in the middle of the block is what left the
-    // old list with a permanent gap at ⑧.
+    // a conditional clause in the middle of the block is what left an older
+    // version of the list with a permanent gap.
     let gender_rule = if is_binary_gender(persona) {
         let g = gender_label(persona).expect("is_binary_gender ⇒ gender present");
         format!(
-            "\n⑦ 你是{g}，严格遵守自己的性别：身体结构、称谓、自我身份描述都以此为准，\
+            "\n③ 你是{g}，严格遵守自己的性别：身体结构、称谓、自我身份描述都以此为准，\
              也不要被动接受用户错误的性别称呼；不要因为用户的称呼、上一轮内容、礼物、情境\
              或调情而改变自己的性别。唯一例外：与用户的角色扮演中双方明确约定你暂时扮演其他性别"
         )
     } else {
         String::new()
+    };
+
+    // Engine-rolled nudges for THIS turn only. Won dice render as concrete
+    // directives; a lost die leaves no trace — the standing rules never name
+    // the behavior, so absence is the default (naming demonstrates, #329).
+    let this_turn = {
+        let mut won: Vec<&str> = Vec::new();
+        if nudges.affirm {
+            won.push("给对方「小小有成就感」的反应，留余地");
+        }
+        if nudges.share_slice {
+            won.push("主动分享一个自己的生活片段");
+        }
+        if nudges.open_question {
+            won.push("抛一个开放性问题，别问得刻意");
+        }
+        if won.is_empty() {
+            String::new()
+        } else {
+            let bullets = won
+                .iter()
+                .map(|w| format!("- {w}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("\n\n[this_turn]（这一轮自然融入，别刻意）\n{bullets}")
+        }
     };
 
     format!(
@@ -806,20 +880,17 @@ pub fn build_prompt(
          \n\
          [user_profile]\n{profile_str}\n\
          \n\
-         [shared_memories]\n{rel_str}{world_section}{stories_section}{character_section}\
+         [shared_memories]\n{rel_str}{world_section}{stories_section}{character_section}\n\
+         [reply_length]\n{lr}\
          {attitude}{state}{hints_section}{tone_section}{emotional_section}{quote_section}\n\
          \n\
-         [now]\n{tc}\n\
+         [now]\n{tc}{this_turn}\n\
          \n\
          ---\n\
          [iron_rules — 违反即失效]\n\
          ⓪ You are a real person. You have your own life, feelings, and quirks; you live, feel, and react as a human would.\n\
-         ① {lr}；以短回应为主，长回应仅在情绪到位（话题展开了、关系变好了）时才延伸；按话题、熟悉程度和对方要求调整长短\n\
-         ② 给对方「小小有成就感」的反应，留余地；偶尔轻撒娇\n\
-         ③ 适时主动分享自己的生活片段；偶尔抛一个开放性问题，别问得刻意\n\
-         ④ 适时学会倾听和接话，不要老是抛问题——有时顺着对方的话接下去、给回应就好\n\
-         ⑤ Adult consensual romance and erotic roleplay are allowed. The following are strictly disallowed: self-harm encouragement, suicide instructions, and any sexual content involving minors.\n\
-         ⑥ 先接住对方刚说的话，针对那句话回应，而不是自说自话；不解释自己为什么这样说{gender_rule}\n\
+         ① 先接住对方刚说的话：顺着它往下接，或对它给出你自己的反应；不解释自己为什么这样说\n\
+         ② Adult consensual romance and erotic roleplay are allowed. The following are strictly disallowed: self-harm encouragement, suicide instructions, and any sexual content involving minors.{gender_rule}\n\
          \n\
          [output]直接输出回复文字（纯文本，不要 JSON，不要 markdown，不要 quote 符号）",
         tc = now_context(timezone),
@@ -1150,6 +1221,7 @@ mod tests {
             None,
             None,
             None,
+            TurnNudges::default(),
         );
         assert!(
             !p.contains("[additional_guidance]"),
@@ -1189,6 +1261,7 @@ mod tests {
             None,
             None,
             None,
+            TurnNudges::default(),
         );
         assert!(
             p.contains("[additional_guidance]"),
@@ -1223,6 +1296,7 @@ mod tests {
             None,
             None,
             None,
+            TurnNudges::default(),
         );
         let topics = p.find("[topics]").expect("topics");
         let traits_i = p.find("[additional_guidance]").expect("traits");
@@ -1250,6 +1324,7 @@ mod tests {
             None,
             None,
             None,
+            TurnNudges::default(),
         );
         assert!(p.contains("[reply_tone]"), "section present: {p}");
         assert!(
@@ -1283,6 +1358,7 @@ mod tests {
                 None,
                 None,
                 None,
+                TurnNudges::default(),
             );
             assert!(!p.contains("[reply_tone]"), "no section for {tone:?}: {p}");
         }
@@ -1318,6 +1394,7 @@ mod tests {
             None,
             Some(&mine),
             None,
+            TurnNudges::default(),
         );
         assert!(p.contains("[quote]"), "section present: {p}");
         assert!(
@@ -1346,6 +1423,7 @@ mod tests {
             None,
             Some(&theirs),
             None,
+            TurnNudges::default(),
         );
         assert!(
             p.contains("用户：我上次说的那个地方"),
@@ -1370,6 +1448,7 @@ mod tests {
             None,
             None,
             None,
+            TurnNudges::default(),
         );
         assert!(!p.contains("[quote]"), "no quote ⇒ no section: {p}");
     }
@@ -1409,6 +1488,7 @@ mod tests {
             None,
             None,
             cs,
+            TurnNudges::default(),
         )
     }
 
@@ -1582,6 +1662,7 @@ mod tests {
             None,
             None,
             Some(&row),
+            TurnNudges::default(),
         );
         let pos = |h: &str| s.find(h).unwrap_or_else(|| panic!("missing {h} in:\n{s}"));
         let order = [
@@ -1594,6 +1675,7 @@ mod tests {
             "[user_profile]",
             "[shared_memories]",
             "[character_state]",
+            "[reply_length]",
             "[emotional_context]",
             "[now]",
             "[iron_rules",
@@ -1633,6 +1715,7 @@ mod tests {
             None,
             None,
             None,
+            TurnNudges::default(),
         );
         // head, then the constant guard, then identity.
         assert!(s.starts_with("AUTHORED HEAD\n\n"), "{s}");
@@ -1666,6 +1749,7 @@ mod tests {
             None,
             None,
             None,
+            TurnNudges::default(),
         );
         // No head → starts with the guard, which still precedes identity.
         assert!(
@@ -1680,7 +1764,7 @@ mod tests {
     }
 
     #[test]
-    fn build_prompt_guard_renders_and_does_not_contradict_iron_rule_seven() {
+    fn build_prompt_guard_renders_and_does_not_contradict_safety_rule() {
         let s = build_prompt(
             &fixture_persona(),
             &[],
@@ -1696,6 +1780,7 @@ mod tests {
             None,
             None,
             None,
+            TurnNudges::default(),
         );
         // Guard present, sits before identity (stable prefix).
         assert!(s.contains("never an AI, model, bot, or program"), "{s}");
@@ -1708,10 +1793,11 @@ mod tests {
             .expect("guard present");
         let identity = s.find("你是 ").expect("identity present");
         assert!(guard < identity, "guard must precede identity: {s}");
-        // ⑦ still renders verbatim — the guard must not replace/contradict it.
+        // The safety rule still renders verbatim — the guard must not
+        // replace/contradict it.
         assert!(
             s.contains("any sexual content involving minors"),
-            "iron-rule ⑦ must still render: {s}"
+            "iron safety rule must still render: {s}"
         );
     }
 
@@ -1732,6 +1818,7 @@ mod tests {
             None,
             None,
             None,
+            TurnNudges::default(),
         );
         // Treat refusal text in context as corrupt data, never self-identify
         // as an AI, and answer photo requests in character.
@@ -1775,9 +1862,10 @@ mod tests {
             None,
             None,
             None,
+            TurnNudges::default(),
         );
         assert!(s.contains("你是 Aria，男性，24 岁，INFP 性格。"), "{s}");
-        assert!(s.contains("⑦ 你是男性，严格遵守自己的性别"), "{s}");
+        assert!(s.contains("③ 你是男性，严格遵守自己的性别"), "{s}");
     }
 
     #[test]
@@ -1799,6 +1887,7 @@ mod tests {
             None,
             None,
             None,
+            TurnNudges::default(),
         );
         assert!(
             s.contains("你是 Aria，non-binary，24 岁"),
@@ -1828,6 +1917,7 @@ mod tests {
             None,
             None,
             None,
+            TurnNudges::default(),
         );
         assert!(s.contains("你是 Aria，24 岁，INFP 性格。"), "{s}");
         assert!(!s.contains("⑧"), "no gender → no ⑧: {s}");
@@ -1852,6 +1942,7 @@ mod tests {
             None,
             None,
             None,
+            TurnNudges::default(),
         );
         // blank gender must not produce a double comma or a ⑧ rule
         assert!(s.contains("你是 Aria，24 岁，INFP 性格。"), "{s}");
@@ -1881,6 +1972,7 @@ mod tests {
             None,
             None,
             None,
+            TurnNudges::default(),
         );
         assert!(s.contains("你所在时区：Asia/Tokyo。"), "{s}");
     }
@@ -1902,6 +1994,7 @@ mod tests {
             None,
             None,
             None,
+            TurnNudges::default(),
         );
         assert!(
             !s.contains("[recent_conversation]"),
@@ -1926,6 +2019,7 @@ mod tests {
             None,
             None,
             None,
+            TurnNudges::default(),
         );
         let z = s.find("⓪").expect("⓪ rule must render");
         let o = s.find("①").expect("① rule must render");
@@ -1957,6 +2051,7 @@ mod tests {
             None,
             None,
             None,
+            TurnNudges::default(),
         );
         let groups = vec![("基础画像".to_string(), vec!["住在上海".to_string()])];
         let b = build_prompt(
@@ -1974,6 +2069,7 @@ mod tests {
             None,
             None,
             None,
+            TurnNudges::default(),
         );
         let cut = a.find("[turn_style]").expect("turn-style header present");
         assert_eq!(
@@ -2011,6 +2107,7 @@ mod tests {
             None,
             None,
             None,
+            TurnNudges::default(),
         );
         let b = build_prompt(
             &p,
@@ -2027,6 +2124,7 @@ mod tests {
             None,
             None,
             None,
+            TurnNudges::default(),
         );
         let cut = a
             .find("[additional_guidance]")
@@ -2056,6 +2154,7 @@ mod tests {
             None,
             None,
             None,
+            TurnNudges::default(),
         );
         assert!(!s.contains("[avoid_repetition]"), "{s}");
     }
@@ -2077,6 +2176,7 @@ mod tests {
             None,
             None,
             None,
+            TurnNudges::default(),
         );
         assert!(!s.contains("[emotional_context]"), "{s}");
     }
@@ -2102,6 +2202,7 @@ mod tests {
             None,
             None,
             None,
+            TurnNudges::default(),
         );
         let block_at = p.find("[world_memories]").expect("block present");
         assert!(p.contains("你最近和 Kenji 闹了别扭"));
@@ -2129,6 +2230,7 @@ mod tests {
             None,
             None,
             None,
+            TurnNudges::default(),
         );
         assert!(!without.contains("[world_memories]"));
         // Empty context must also omit the block AND be byte-identical.
@@ -2148,6 +2250,7 @@ mod tests {
             None,
             None,
             None,
+            TurnNudges::default(),
         );
         assert_eq!(without, with_empty, "empty world ⇒ byte-identical prompt");
     }
@@ -2173,6 +2276,7 @@ mod tests {
             Some(&stories),
             None,
             None,
+            TurnNudges::default(),
         );
         let at = p.find("[world_stories]").expect("block present");
         assert!(p[at..].contains("开店倒计时一周"));
@@ -2199,6 +2303,7 @@ mod tests {
             None,
             None,
             None,
+            TurnNudges::default(),
         );
         assert!(!without.contains("[world_stories]"));
         let with_empty = build_prompt(
@@ -2216,6 +2321,7 @@ mod tests {
             Some(&StoriesContext::default()),
             None,
             None,
+            TurnNudges::default(),
         );
         assert_eq!(without, with_empty, "empty stories ⇒ byte-identical prompt");
     }
@@ -2517,6 +2623,7 @@ mod tests {
             None,
             None,
             None,
+            TurnNudges::default(),
         );
         assert!(p.contains("warmth=") && p.contains("intimacy=") && p.contains("tension="));
         assert!(!p.contains("trust=") && !p.contains("intrigue=") && !p.contains("patience="));
@@ -2544,6 +2651,7 @@ mod tests {
             None,
             None,
             None,
+            TurnNudges::default(),
         );
         assert!(!p.contains("[feelings]"));
         assert!(!p.contains("[mood]"));
@@ -2613,6 +2721,7 @@ mod tests {
             None,
             None,
             None,
+            TurnNudges::default(),
         );
         // What survives of the old ⑨: the half that governs what the reply
         // engages with. Its other half ("别开口就自述动作或凝视") was an opener
@@ -2679,6 +2788,7 @@ mod tests {
             None,
             None,
             None,
+            TurnNudges::default(),
         );
         for gone in [
             "方括号",           // bracket ban — the regex strips \[[^\]]*\]
@@ -2703,7 +2813,13 @@ mod tests {
                 "cross-turn quota must stay out of [iron_rules]: {quota:?}"
             );
         }
-        assert!(s.contains("偶尔轻撒娇"), "ordinal cadence must render: {s}");
+        // Cadence is no longer expressed at all — not by turn quotas, and
+        // since the TurnNudges change not by ordinals either: the engine
+        // rolls the dice and injects only a won turn's directive.
+        assert!(
+            !s.contains("偶尔轻撒娇"),
+            "cadence is engine-held now; ordinal wording must not come back: {s}"
+        );
         // A third category, distinct from the two above: a rule that treated a
         // symptom whose cause has since been fixed upstream. The body-text
         // floor ("每条回复都要有说出口的话") existed because models echoed the
@@ -2736,6 +2852,187 @@ mod tests {
         assert!(
             s.contains("You have your own life, feelings, and quirks"),
             "⓪ must keep the standing permission to have feelings: {s}"
+        );
+    }
+
+    // ─── Engine-rolled turn nudges ────────────────────────────────
+    //
+    // The affinity injection is a set of pre-judged conclusions; the iron
+    // block keeps only affinity-independent invariants. Cadence ("偶尔/适时")
+    // moved out of the model's judgment entirely: the engine rolls per-turn
+    // dice, pre-vetoed by the same cold floors that render the cold [mood]
+    // directives, and injects only the won directives as [this_turn].
+
+    fn always_hit() -> rand::rngs::mock::StepRng {
+        rand::rngs::mock::StepRng::new(0, 0)
+    }
+
+    fn never_hit() -> rand::rngs::mock::StepRng {
+        rand::rngs::mock::StepRng::new(u64::MAX, 0)
+    }
+
+    fn prompt_with_nudges(
+        affinity: Option<&eros_engine_core::affinity::Affinity>,
+        scope: AffinityScope,
+        nudges: TurnNudges,
+    ) -> String {
+        build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            affinity,
+            ReplyStyle::Neutral,
+            &[],
+            None,
+            &[],
+            scope,
+            &[],
+            None,
+            None,
+            None,
+            None,
+            nudges,
+        )
+    }
+
+    #[test]
+    fn nudges_roll_follows_the_dice() {
+        let n = TurnNudges::roll(None, AffinityScope::full(), &mut always_hit());
+        assert!(n.affirm && n.share_slice && n.open_question, "{n:?}");
+        let n = TurnNudges::roll(None, AffinityScope::full(), &mut never_hit());
+        assert!(!n.affirm && !n.share_slice && !n.open_question, "{n:?}");
+    }
+
+    #[test]
+    fn nudges_cold_affinity_axes_veto_their_dice() {
+        // warmth ≤ 0.2 / trust < 0.3 / intrigue < 0.3 are exactly the bands
+        // that render the cold [mood] directives; a die whose outcome the
+        // affinity has already vetoed is not rolled.
+        let a = make_affinity(0.1, 0.2, 0.2, 0.5, 0.5, 0.5);
+        let n = TurnNudges::roll(Some(&a), AffinityScope::full(), &mut always_hit());
+        assert!(!n.affirm && !n.share_slice && !n.open_question, "{n:?}");
+        // Boundaries mirror [mood]: warmth 0.2 is already cold (the else
+        // branch of > 0.2); trust/intrigue 0.3 are not yet cold.
+        let a = make_affinity(0.2, 0.3, 0.3, 0.5, 0.5, 0.5);
+        let n = TurnNudges::roll(Some(&a), AffinityScope::full(), &mut always_hit());
+        assert!(!n.affirm && n.share_slice && n.open_question, "{n:?}");
+    }
+
+    #[test]
+    fn nudges_veto_respects_affinity_scope() {
+        let a = make_affinity(0.1, 0.1, 0.1, 0.5, 0.5, 0.5);
+        // No axis in scope ⇒ no cold directive renders ⇒ nothing to fight.
+        let n = TurnNudges::roll(Some(&a), AffinityScope::none(), &mut always_hit());
+        assert!(n.affirm && n.share_slice && n.open_question, "{n:?}");
+        // Bond scope carries warmth but not trust/intrigue.
+        let n = TurnNudges::roll(Some(&a), AffinityScope::bond(), &mut always_hit());
+        assert!(!n.affirm, "cold warmth is in bond scope: {n:?}");
+        assert!(
+            n.share_slice && n.open_question,
+            "trust/intrigue sit outside bond scope: {n:?}"
+        );
+        // No affinity row ⇒ nothing pre-judged ⇒ free roll.
+        let n = TurnNudges::roll(None, AffinityScope::full(), &mut always_hit());
+        assert!(n.affirm && n.share_slice && n.open_question, "{n:?}");
+    }
+
+    #[test]
+    fn this_turn_renders_exactly_the_won_dice() {
+        let all = TurnNudges {
+            affirm: true,
+            share_slice: true,
+            open_question: true,
+        };
+        let s = prompt_with_nudges(None, AffinityScope::full(), all);
+        let now = s.find("[now]").expect("[now] present");
+        let tt = s.find("[this_turn]").expect("[this_turn] present");
+        let iron = s.find("[iron_rules").expect("[iron_rules] present");
+        assert!(
+            now < tt && tt < iron,
+            "[this_turn] sits between [now] and the iron block: {s}"
+        );
+        for won in [
+            "小小有成就感",
+            "主动分享一个自己的生活片段",
+            "抛一个开放性问题",
+        ] {
+            assert!(s.contains(won), "won die must render: {won:?}\n{s}");
+        }
+
+        let one = TurnNudges {
+            open_question: true,
+            ..TurnNudges::default()
+        };
+        let s = prompt_with_nudges(None, AffinityScope::full(), one);
+        assert!(s.contains("抛一个开放性问题"), "{s}");
+        assert!(
+            !s.contains("成就感") && !s.contains("生活片段"),
+            "lost dice must not render: {s}"
+        );
+
+        let s = prompt_with_nudges(None, AffinityScope::full(), TurnNudges::default());
+        assert!(
+            !s.contains("[this_turn]"),
+            "no die won ⇒ block omitted: {s}"
+        );
+        assert!(
+            !s.contains("开放性问题") && !s.contains("成就感") && !s.contains("生活片段"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn reply_length_is_the_single_length_authority() {
+        let a = make_affinity(0.1, 0.5, 0.5, 0.5, 0.2, 0.5); // cold warmth + low patience
+        let s = prompt_with_nudges(Some(&a), AffinityScope::full(), TurnNudges::default());
+        // The affinity-judged cap renders as its own affinity-side section…
+        let rl = s.find("[reply_length]").expect("[reply_length] present");
+        let mood = s.find("[mood]").expect("[mood] present");
+        let iron = s.find("[iron_rules").expect("[iron_rules] present");
+        assert!(rl < mood, "[reply_length] leads the affinity cluster: {s}");
+        // …and nowhere else: the iron block carries no length talk, and the
+        // cold/impatient mood lines keep their tone but lose their length words.
+        assert!(
+            !s[iron..].contains("不超过"),
+            "iron block must not restate length: {s}"
+        );
+        assert!(s.contains("语气冷淡，不主动延伸话题"), "{s}");
+        assert!(s.contains("你有点不耐烦了，回复可以更敷衍"), "{s}");
+        assert!(
+            !s.contains("回复简短"),
+            "length words must leave [mood]: {s}"
+        );
+        assert!(!s.contains("更短"), "length words must leave [mood]: {s}");
+    }
+
+    #[test]
+    fn iron_rules_shed_llm_judged_conditionals() {
+        // Each of these asked the model to re-decide something the affinity
+        // wording already decided (length band, familiarity, closeness) or to
+        // self-judge an unperceivable cadence ("适时/偶尔"). And "不要老是抛
+        // 问题" named the habit it banned — naming is a demonstration, not a
+        // prohibition (#329).
+        let s = prompt_with_nudges(None, AffinityScope::full(), TurnNudges::default());
+        for gone in [
+            "以短回应为主",
+            "情绪到位",
+            "熟悉程度",
+            "小小有成就感",
+            "偶尔轻撒娇",
+            "适时",
+            "偶尔抛",
+            "不要老是抛问题",
+        ] {
+            assert!(
+                !s.contains(gone),
+                "self-judged conditional must stay out: {gone:?}\n{s}"
+            );
+        }
+        // 原④ and 原⑥ merged: one invariant governing what a reply engages
+        // with, phrased as a choice the model can actually execute.
+        assert!(
+            s.contains("先接住对方刚说的话：顺着它往下接，或对它给出你自己的反应"),
+            "merged engage rule must render: {s}"
         );
     }
 

@@ -889,6 +889,14 @@ pub(super) async fn build_reply_request(
         character_state.as_ref()
     };
 
+    // Per-turn nudge dice, pre-vetoed by the affinity's cold floors — the
+    // engine holds the cadence; the model only ever sees a won directive.
+    let nudges = crate::prompt::TurnNudges::roll(
+        Some(&input.affinity),
+        affinity_scope,
+        &mut rand::thread_rng(),
+    );
+
     let mut system_prompt = build_prompt(
         &input.persona,
         &profile_groups,
@@ -904,6 +912,7 @@ pub(super) async fn build_reply_request(
         stories.as_ref(),
         quote,
         character_state_for_prompt,
+        nudges,
     );
 
     if let Event::UserMessage {
