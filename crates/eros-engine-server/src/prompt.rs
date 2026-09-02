@@ -168,19 +168,15 @@ fn now_context_at(now: chrono::DateTime<Utc>, timezone: Option<&str>) -> String 
     )
 }
 
-/// Reply-length rule for 铁律①, graduated by the affinity-scope composite
-/// score (0~1). No in-scope axis (or no affinity yet) → strictest tier.
-/// Thresholds (0.25 / 0.55) carry over from the single-intimacy era; the
-/// composite averages land on similar tier boundaries in practice — tunable.
-/// Cold floors shared by the `[mood]` directives and the nudge veto. At or
-/// below the floor the axis's cold directive renders — and a die whose
-/// directive would fight that conclusion is not rolled.
+// Cold floors shared by the `[mood]` directives and the nudge veto. At or
+// below the floor the axis's cold directive renders — and a die whose
+// directive would fight that conclusion is not rolled.
 const WARMTH_COLD_FLOOR: f64 = 0.2; // cold iff warmth <= floor
 const TRUST_COLD_FLOOR: f64 = 0.3; // cold iff trust < floor
 const INTRIGUE_COLD_FLOOR: f64 = 0.3; // cold iff intrigue < floor
 
-/// Per-turn nudge probabilities. Cadence lives engine-side: the model never
-/// sees a quota or an "偶尔", only a won die's directive — or nothing.
+// Per-turn nudge probabilities. Cadence lives engine-side: the model never
+// sees a quota or an "偶尔", only a won die's directive — or nothing.
 pub const NUDGE_AFFIRM_P: f64 = 0.33;
 pub const NUDGE_SHARE_P: f64 = 0.13;
 pub const NUDGE_QUESTION_P: f64 = 0.05;
@@ -212,6 +208,11 @@ impl TurnNudges {
     }
 }
 
+/// Reply-length rule, rendered as the `[reply_length]` section — graduated by
+/// the affinity-scope composite score (0~1). No in-scope axis (or no affinity
+/// yet) → strictest tier. Thresholds (0.25 / 0.55) carry over from the
+/// single-intimacy era; the composite averages land on similar tier
+/// boundaries in practice — tunable.
 fn length_rule(affinity: Option<&Affinity>, scope: AffinityScope) -> &'static str {
     let score = affinity.and_then(|a| scope.length_score(a)).unwrap_or(0.0);
     if score < 0.25 {
