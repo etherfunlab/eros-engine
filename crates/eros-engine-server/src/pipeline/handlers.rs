@@ -880,6 +880,15 @@ pub(super) async fn build_reply_request(
                 None
             });
 
+    // CHAT_NOISE_CANCELLATION_DISABLED restores the pre-change prompt shape in
+    // full: [character_state] was the one addition in that change, so the flag
+    // must suppress it too, not just the strip and the ladder below.
+    let character_state_for_prompt = if state.config.chat_noise_cancellation_disabled {
+        None
+    } else {
+        character_state.as_ref()
+    };
+
     let mut system_prompt = build_prompt(
         &input.persona,
         &profile_groups,
@@ -894,7 +903,7 @@ pub(super) async fn build_reply_request(
         world.as_ref(),
         stories.as_ref(),
         quote,
-        character_state.as_ref(),
+        character_state_for_prompt,
     );
 
     if let Event::UserMessage {
@@ -3024,6 +3033,18 @@ mod tests {
             "CHAT_NOISE_CANCELLATION_DISABLED must skip the leading-sentence \
              strip: {:?}",
             req.messages
+        );
+
+        // The flag restores the pre-[character_state] prompt shape in full,
+        // not just the strip and the ladder: with a fully-populated
+        // character_insights row present (seeded above via apply_extraction),
+        // the block must still be omitted from the system prompt.
+        assert_eq!(req.messages[0].role, "system");
+        assert!(
+            !req.messages[0].content.contains("[character_state]"),
+            "CHAT_NOISE_CANCELLATION_DISABLED must also suppress \
+             [character_state], the one addition in that change: {:?}",
+            req.messages[0].content
         );
     }
 }
