@@ -1153,6 +1153,8 @@ pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
             prompt_log_dir: None,
             // Echo cancellation ON in tests — matches the production default.
             chat_echo_cancellation_disabled: false,
+            // Noise cancellation ON in tests — matches the production default.
+            chat_noise_cancellation_disabled: false,
             world: crate::state::parse_world_config(None, None, None, None, None, None),
             chat_queue: crate::state::parse_chat_queue_config(
                 None, None, None, None, None, None, None,
