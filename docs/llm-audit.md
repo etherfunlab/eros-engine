@@ -390,7 +390,7 @@ record"** — an empty array is never written, so there is exactly one way to
 say "no failure". Design:
 [LLM error audit spec](superpowers/specs/2026-08-18-llm-error-audit-design.md);
 consumer-facing changes:
-[migrating/llm-error-audit-v1-4-0.md](migrating/llm-error-audit-v1-4-0.md).
+[migrating/v1-4-0-llm-error-audit.md](migrating/v1-4-0-llm-error-audit.md).
 
 ### Three homes, split by who authored the fact
 

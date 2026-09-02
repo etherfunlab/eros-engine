@@ -7,18 +7,20 @@ happen in a particular order. If an upgrade is drop-in, it gets no file here.
 **This directory starts at `v1.3.1`.** Breaking changes in earlier releases are
 not backfilled — for those, read `docs/` and the release notes.
 
-Guides are named `<subsystem>-v<engine release>.md`, with dots written as
-hyphens: `affinity-v1-3-1.md`.
+Guides are named `v<engine release>-<subsystem>.md`, with dots written as
+hyphens: `v1-3-1-affinity.md`. The release comes first so a plain directory
+listing sorts in upgrade order — these guides are read in sequence by someone
+walking releases, and the release is the axis they walk.
 
 When the subsystem carries its own model version that moves independently of
-the engine release, put that between the two — `affinity-4-0-v1-3-1.md` reads
-"the Affinity 4.0 surface, as it changes in `v1.3.1`". This matters exactly
-when the two numbers can disagree: the same model version can be reshaped by
-several releases, and a release can ship without touching the model at all, so
-the name has to say which pair it means.
+the engine release, append it after the subsystem — `v1-3-1-affinity-4-0.md`
+reads "the Affinity 4.0 surface, as it changes in `v1.3.1`". This matters
+exactly when the two numbers can disagree: the same model version can be
+reshaped by several releases, and a release can ship without touching the model
+at all, so the name has to say which pair it means.
 
 Do not invent a model code name for a subsystem that has none. If the change is
-to a subsystem with a single version — its own — `<subsystem>-v<release>` is
+to a subsystem with a single version — its own — `v<release>-<subsystem>` is
 the whole name.
 
 **English only, by design.** These files are written to be handed to a coding

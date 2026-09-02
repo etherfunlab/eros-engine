@@ -77,6 +77,8 @@ docker compose run --rm engine seed-personas /etc/eros-engine/personas  # 可选
 docker compose up -d engine
 ```
 
+**已有部署要跨 v1.6.x–v1.7.2 升级？** 这段是一条四个版本的链，每个迁移只对前一跳的代码安全——跳过任何一跳，rollout 期间线上流量就会出问题——有的路径丢写入，有的路径读全挂。跨版本前先读 [migrating/v1-7-2-llm-generations.md](migrating/v1-7-2-llm-generations.md)（英文；全新安装不受影响）。
+
 至少要接一个 auth 来源——非对称 JWKS 校验用 `SUPABASE_URL`（或 `SUPABASE_JWKS_URL`），或者一个非空的旧版 `SUPABASE_JWT_SECRET`。两者都没有时引擎会拒绝启动——这是刻意设计，让配错的部署直接报错，而不是默默拒掉每一个请求。
 
 **模型配置：**镜像把脱敏过的 `examples/model_config.toml` 烧在 `/etc/eros-engine/model_config.toml`，并预设了 `MODEL_CONFIG_PATH` 指向它，所以容器开箱即可启动。注意烧进去的示例带有生效的 `[tasks.world_*]` section——零注册时无害（不会有 LLM 调用），但世界 sweeper 会跑起来；想让[世界系统](world-system.zh.md)完全不动就设 `WORLD_DISABLED=true`。
@@ -264,7 +266,7 @@ World Stories 按实例生活模拟）默认完全关闭：模型配置里没有
 - **OpenRouter 归因（可选）：**在模型配置的 `[providers.openrouter]` 下声明一个 `headers` 表——`HTTP-Referer` / `X-OpenRouter-Title` / `X-OpenRouter-Categories`——给每个出站 OpenRouter 调用加归因头，让部署出现在 OpenRouter 的应用面板上；不写这个条目（或不写它的 `headers` key）就保持匿名。见 [model-config.zh.md → 通过 `[providers].openrouter` 覆盖内置端点](model-config.zh.md#通过-providersopenrouter-覆盖内置端点)。旧的 `OPENROUTER_APP_REFERER` / `OPENROUTER_APP_TITLE` / `OPENROUTER_APP_CATEGORIES` 环境变量已软废弃：仍然设置也只会被静默忽略，不是启动报错；`OPENROUTER_BASE_URL` 则彻底移除——改用 `[providers].openrouter.chat` / `.embeddings` 覆盖端点 URL。
 - **健康探針：** `GET /healthz` 返 200，響應 `{ status: "ok", service, version, timestamp }`。把這個接到平台的健康檢查上。
 - **OpenAPI / Scalar：** `GET /docs` 提供實時的 Scalar 參考。原始 OpenAPI JSON 不走 HTTP——用 `print-openapi` 子命令导出。
-- **给前端的好感度：** `GET /bff/v1/comp/affinity/{session_id}` 返回读时刷新过的绝对向量，`.../event` 返回逐轮 delta 加该轮结束时的状态；`GET /bff/v1/comp/affinities/{user_id}` 是第一条的列表形态 —— 一次分页往返拿到该用户所有伴侣刷新后的值，给渲染会话列表的客户端用。三条都做 JWT + ownership 检查、都常驻——`v1.3.1` 起 `EXPOSE_AFFINITY_DEBUG` 开关和它挡着的 debug 路由都已删除。见 [migrating/affinity-4-0-v1-3-1.md](migrating/affinity-4-0-v1-3-1.md)。
+- **给前端的好感度：** `GET /bff/v1/comp/affinity/{session_id}` 返回读时刷新过的绝对向量，`.../event` 返回逐轮 delta 加该轮结束时的状态；`GET /bff/v1/comp/affinities/{user_id}` 是第一条的列表形态 —— 一次分页往返拿到该用户所有伴侣刷新后的值，给渲染会话列表的客户端用。三条都做 JWT + ownership 检查、都常驻——`v1.3.1` 起 `EXPOSE_AFFINITY_DEBUG` 开关和它挡着的 debug 路由都已删除。见 [migrating/v1-3-1-affinity-4-0.md](migrating/v1-3-1-affinity-4-0.md)。
 - **日誌：** `RUST_LOG=info` 是默認。`RUST_LOG=debug,sqlx=warn` 看到除 SQLx 查詢噪音以外的一切。
 - **成本：** OSS 部署默认 chat 使用一个快速廉价的模型、insight 抽取使用一个高质量抽取模型（当前默认值见 `examples/model_config.toml`）。一轮典型对话花费 ≪ $0.001 美元 token 成本，加上一个 Voyage embedding 调用（每个值得记住的事实约 $0.000003）。10000 轮对话花个位数美元。
 
