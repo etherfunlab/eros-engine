@@ -932,8 +932,7 @@ filter_prompt = """
 **Isolation semantics.** The answer persists as a normal assistant row
 (`role='assistant'`, `assistant_action_type='reply'`) marked
 `channel='product_qa'`. That marker makes the row invisible to the companion
-brain: short-term recall (`recent_turn_pairs` / `recent_turn_pairs_before_message`
-/ `recent_assistant_contents`), conversation signals
+brain: conversation signals
 (`compute_signals_for_session`), the judge's own shared companion transcript
 (`build_input_filter_transcript`), and the companion's live message window
 (`model_facing_history`) all filter `channel IS NOT NULL` rows out. The

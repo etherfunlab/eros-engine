@@ -69,14 +69,14 @@ eros-engine-llm   = "1.0"   # optional: model and embedding clients
 各 `v*` タグについて、複数アーキテクチャ対応のイメージを GitHub Container Registry へ公開しています。
 
 ```bash
-docker pull ghcr.io/etherfunlab/eros-engine:1.7.3
+docker pull ghcr.io/etherfunlab/eros-engine:1.8.0
 # Or follow the latest tagged release
 docker pull ghcr.io/etherfunlab/eros-engine:latest
 ```
 
 ```bash
 docker run --rm -p 8080:8080 --env-file .env \
-  ghcr.io/etherfunlab/eros-engine:1.7.3 serve
+  ghcr.io/etherfunlab/eros-engine:1.8.0 serve
 ```
 
 Postgres と `.env` は利用者側で用意してください。同じ `docker/Dockerfile` を任意のコンテナ環境へ配備できます。詳細は [Deploying](docs/deploying.md) を参照してください。
@@ -112,7 +112,7 @@ cargo run -p eros-engine-server -- serve
 
 ## API 概要
 
-基本の流れは、ペルソナとのセッションを作り、SSE ストリーミングのエンドポイントへ会話を送るだけです。履歴、セッション、プロフィール、任意の親密度デバッグ用ルートもあります。標準認証は Supabase JWT で、`AuthValidator` により差し替えられます。パス、ペイロード、ストリームの各 frame は [API reference](docs/api-reference.md) を参照してください。
+基本の流れは、ペルソナとのセッションを作り、SSE ストリーミングのエンドポイントへ会話を送るだけです。音声は独立したチャンネルで動きます——`channel: "voice"` でセッションを作り、音声ターン用エンドポイント（より軽いプロンプトとバージイン呼び出し付き）を使います。二つのチャンネルが互いのセッションへ書き込むことはありません。ストリームを保持できない bot 型クライアント向けには、キュー投入専用のエンドポイント（`POST /v2/comp/session/{session_id}/message/async`）もあります——返信はバックグラウンドワーカーが生成し、ストリームの frame ではなく履歴 / Realtime に届きます。ほかに履歴、セッション、プロフィール、親密度のルートもあります。標準認証は Supabase JWT で、`AuthValidator` により差し替えられます。パス、ペイロード、ストリームの各 frame は [API reference](docs/api-reference.md) を参照してください。
 
 ## 設定
 
@@ -122,7 +122,7 @@ cargo run -p eros-engine-server -- serve
 
 ## ロードマップ
 
-- [ ] **音声メッセージ**と**ネイティブ音声 I/O** — 低遅延の音声ターン API は提供済みで、STT/TTS は現在呼び出し側の担当です。
+- [ ] **ネイティブ音声 I/O** — 低遅延の音声ターン API とバージインは提供済みで、STT/TTS は現在呼び出し側の担当です。
 - [ ] **動画生成** — コンパニオンから短い動画を送信。
 
 ## スコープ外

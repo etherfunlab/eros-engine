@@ -81,7 +81,7 @@ chemistry 给出老友形态（有耐心但冷静）——不需要提示词特�
   永远不会改写非冷淡裁定。
 - **衰减**（`AFFINITY_TIME_DECAY_RATE` `0.02`/天，`AFFINITY_TIME_DECAY_FLOOR`
   `0.5`）：7 天 → ×0.86，25 天以上 → ×0.5。久别冷却但不清零——老关系的韧性
-  由加成托住（bond `0.9` 满衰减后 patience 仍 ≈ `0.48`）。
+  由加成托住（bond `0.9` 满衰减后 patience 仍 ≈ `0.47`）。
 
 `decay = 1` 时的可达域：档 1 → `[0.0, 0.2]`（随对线连续），档 2 →
 `[0.244, 0.5]`，档 3 → `[0.487, 1.0]`。档位决定大区间，对线值决定区间内位置。
@@ -95,8 +95,8 @@ chemistry 给出老友形态（有耐心但冷静）——不需要提示词特�
 微调、超时 −0.05）已退役——停滞规则被衰减吸收。
 
 **Ghost 是独立路径。**Ghost 回合不进 `persist_with_event`，只更新
-`ghost_streak` / `total_ghosts` / `last_ghost_at`。PDE 的 ghost 增量只碰
-`tension`。
+`ghost_streak` / `total_ghosts` / `last_ghost_at`。任何轴都不动：
+`record_ghost` 不收增量、写全零 `effective_deltas`，前后快照在每条轴上一致。
 
 ## 两条派生线
 

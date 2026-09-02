@@ -752,8 +752,7 @@ filter_prompt = """
 
 **隔离语义。** 答案以正常 assistant 行落库（`role='assistant'`、
 `assistant_action_type='reply'`），并打上 `channel='product_qa'` 标记。该
-标记让这一行对伴侣大脑不可见：短期回忆（`recent_turn_pairs` /
-`recent_turn_pairs_before_message` / `recent_assistant_contents`）、对话信号
+标记让这一行对伴侣大脑不可见：对话信号
 （`compute_signals_for_session`）、判断器自己共用的伴侣 transcript
 （`build_input_filter_transcript`），以及伴侣的实时消息窗口
 （`model_facing_history`），都会过滤掉 `channel IS NOT NULL` 的行。

@@ -31,6 +31,7 @@ use eros_engine_core::scope::AffinityScope;
 use eros_engine_core::types::PromptTrait;
 use eros_engine_core::types::QuotedMessage;
 use eros_engine_core::types::ReplyStyle;
+use rand::Rng;
 
 /// World-memories injection payload: the persona's resident digest plus
 /// recalled script fragments (spec §3.3).
@@ -167,10 +168,51 @@ fn now_context_at(now: chrono::DateTime<Utc>, timezone: Option<&str>) -> String 
     )
 }
 
-/// Reply-length rule for 铁律①, graduated by the affinity-scope composite
-/// score (0~1). No in-scope axis (or no affinity yet) → strictest tier.
-/// Thresholds (0.25 / 0.55) carry over from the single-intimacy era; the
-/// composite averages land on similar tier boundaries in practice — tunable.
+// Cold floors shared by the `[mood]` directives and the nudge veto. At or
+// below the floor the axis's cold directive renders — and a die whose
+// directive would fight that conclusion is not rolled.
+const WARMTH_COLD_FLOOR: f64 = 0.2; // cold iff warmth <= floor
+const TRUST_COLD_FLOOR: f64 = 0.3; // cold iff trust < floor
+const INTRIGUE_COLD_FLOOR: f64 = 0.3; // cold iff intrigue < floor
+
+// Per-turn nudge probabilities. Cadence lives engine-side: the model never
+// sees a quota or an "偶尔", only a won die's directive — or nothing.
+pub const NUDGE_AFFIRM_P: f64 = 0.33;
+pub const NUDGE_SHARE_P: f64 = 0.13;
+pub const NUDGE_QUESTION_P: f64 = 0.05;
+
+/// Engine-rolled per-turn nudges, rendered as `[this_turn]` (all-false ⇒ the
+/// block is omitted). Rolled once per turn at the call site, never inside
+/// `build_prompt` — the prompt stays a pure function of its inputs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TurnNudges {
+    pub affirm: bool,
+    pub share_slice: bool,
+    pub open_question: bool,
+}
+
+impl TurnNudges {
+    /// Veto-then-roll: an axis the affinity has already judged cold (same
+    /// floors and scope gating as the cold `[mood]` directives) keeps its die
+    /// out of the cup entirely.
+    pub fn roll(affinity: Option<&Affinity>, scope: AffinityScope, rng: &mut impl Rng) -> Self {
+        let veto_affirm = scope.warmth && affinity.is_some_and(|a| a.warmth <= WARMTH_COLD_FLOOR);
+        let veto_share = scope.trust && affinity.is_some_and(|a| a.trust < TRUST_COLD_FLOOR);
+        let veto_question =
+            scope.intrigue && affinity.is_some_and(|a| a.intrigue < INTRIGUE_COLD_FLOOR);
+        Self {
+            affirm: !veto_affirm && rng.gen::<f64>() < NUDGE_AFFIRM_P,
+            share_slice: !veto_share && rng.gen::<f64>() < NUDGE_SHARE_P,
+            open_question: !veto_question && rng.gen::<f64>() < NUDGE_QUESTION_P,
+        }
+    }
+}
+
+/// Reply-length rule, rendered as the `[reply_length]` section — graduated by
+/// the affinity-scope composite score (0~1). No in-scope axis (or no affinity
+/// yet) → strictest tier. Thresholds (0.25 / 0.55) carry over from the
+/// single-intimacy era; the composite averages land on similar tier
+/// boundaries in practice — tunable.
 fn length_rule(affinity: Option<&Affinity>, scope: AffinityScope) -> &'static str {
     let score = affinity.and_then(|a| scope.length_score(a)).unwrap_or(0.0);
     if score < 0.25 {
@@ -193,17 +235,19 @@ pub fn affinity_to_attitude_prompt(a: &Affinity, scope: AffinityScope) -> String
             directives.push("语气温暖，可以用一些亲昵的称呼");
         } else if a.warmth > 0.35 {
             directives.push("语气友善自然");
-        } else if a.warmth > 0.2 {
+        } else if a.warmth > WARMTH_COLD_FLOOR {
             directives.push("语气平淡，保持礼貌但不热络");
         } else {
-            directives.push("语气冷淡，回复简短，不主动延伸话题");
+            // Tone only — the length band is [reply_length]'s fact (the cold
+            // warmth already depresses it through length_score).
+            directives.push("语气冷淡，不主动延伸话题");
         }
     }
 
     if scope.trust {
         if a.trust > 0.6 {
             directives.push("可以分享更私密的想法和小秘密");
-        } else if a.trust < 0.3 {
+        } else if a.trust < TRUST_COLD_FLOOR {
             directives.push("保持一定距离感，不轻易透露内心想法");
         }
     }
@@ -211,7 +255,7 @@ pub fn affinity_to_attitude_prompt(a: &Affinity, scope: AffinityScope) -> String
     if scope.intrigue {
         if a.intrigue > 0.7 {
             directives.push("你对他很好奇，主动问问题，想了解更多");
-        } else if a.intrigue < 0.3 {
+        } else if a.intrigue < INTRIGUE_COLD_FLOOR {
             directives.push("你对他兴趣不大，不会主动找话题");
         }
     }
@@ -222,7 +266,9 @@ pub fn affinity_to_attitude_prompt(a: &Affinity, scope: AffinityScope) -> String
 
     if scope.patience {
         if a.patience < 0.35 {
-            directives.push("你有点不耐烦了，回复可以更敷衍、更短");
+            // Tone only — length is [reply_length]'s fact, and low patience
+            // already depresses the band through length_score.
+            directives.push("你有点不耐烦了，回复可以更敷衍");
         } else if a.patience > 0.65 {
             directives.push("你很有耐心，愿意陪他聊");
         }
@@ -521,12 +567,8 @@ pub fn build_prompt(
     reply_tone: Option<&str>,
     prompt_traits: &[PromptTrait],
     affinity_scope: AffinityScope,
-    recent_turns: &[(String, String)],
-    // Over-used openings to discourage this turn (from `repetition::
-    // overused_openings`). Empty ⇒ the `[avoid_repetition]` block is omitted.
-    avoid_patterns: &[String],
-    // Recent affinity-evaluation reasons, oldest→newest. Empty ⇒ the
-    // `[emotional_context]` block is omitted.
+    // The previous turn's affinity-evaluation reason — one row, not a
+    // trajectory. Empty ⇒ the `[emotional_context]` block is omitted.
     emotional_context: &[String],
     // World-memories injection (spec §3.3). `None` or empty ⇒ the
     // [world_memories] block is omitted and the prompt is byte-identical
@@ -538,6 +580,13 @@ pub fn build_prompt(
     // The line this turn quotes (caller's `reply_to_message_id`, resolved).
     // `None` ⇒ the `[quote]` block is omitted. History is unaffected either way.
     quote: Option<&QuotedMessage>,
+    // The character's relationship-scoped state (spec §4.5). `None` or a row
+    // with none of the four injected fields ⇒ the [character_state] block is
+    // omitted and the prompt is byte-identical to the pre-change layout.
+    character_state: Option<&eros_engine_store::character_insight::CharacterInsightsRow>,
+    // Engine-rolled per-turn nudges (`TurnNudges::roll` at the call site).
+    // All-false ⇒ the [this_turn] block is omitted.
+    nudges: TurnNudges,
 ) -> String {
     let name = persona.genome.name.as_str();
     let age = meta_i32(persona, "age")
@@ -651,20 +700,8 @@ pub fn build_prompt(
         _ => String::new(),
     };
 
-    // Volatile (per-turn) anti-repetition directive — rendered after the stable
-    // cache prefix so prefix caching is unaffected. Empty ⇒ omitted.
-    let avoid_section = if avoid_patterns.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\n[avoid_repetition]\n最近你的开头/句式：{}。这一轮换个角度开场，\
-             别重复这些套路——要的是换角度，不是换同义词。",
-            avoid_patterns.join("、")
-        )
-    };
-
-    // Volatile (per-turn) emotional trajectory — recent affinity reasons,
-    // rendered oldest→newest as passed. Empty ⇒ omitted.
+    // Volatile (per-turn) emotional context — the single most recent affinity
+    // reason, as passed. Empty ⇒ omitted.
     let emotional_section = if emotional_context.is_empty() {
         String::new()
     } else {
@@ -673,7 +710,7 @@ pub fn build_prompt(
             .map(|r| format!("- {r}"))
             .collect::<Vec<_>>()
             .join("\n");
-        format!("\n[emotional_context]（最近几轮的情感走向，仅供参考，别照搬）\n{bullets}")
+        format!("\n[emotional_context]（上一轮的情感变化，仅供参考，别照搬）\n{bullets}")
     };
 
     // World-memories injection (spec §3.3): the persona's resident digest plus
@@ -723,6 +760,51 @@ pub fn build_prompt(
         _ => String::new(),
     };
 
+    // Volatile (per-turn) character state, read from `character_insights`.
+    //
+    // ONLY these four fields. `habits` / `personal_values` are facets of who
+    // she is, whose source of truth is `persona_genomes` — migration 0047
+    // excluded appearance / background / personality_traits for exactly that
+    // reason, and injecting a paraphrase of the genome back into the genome's
+    // own prompt is the drift it warned about. `desires` / `vulnerabilities`
+    // overlap [mood] / [feelings] / [inner_state] / [emotional_context].
+    //
+    // The header frames this as where the relationship currently stands —
+    // three of the four labels are present-tense state — never as character
+    // definition: it must not compete with the genome, and says so once.
+    let character_section = match character_state {
+        Some(cs) => {
+            let mut lines: Vec<String> = Vec::new();
+            let mut put = |label: &str, v: Option<&str>| {
+                if let Some(s) = v.map(str::trim).filter(|s| !s.is_empty()) {
+                    lines.push(format!("- {label}：{s}"));
+                }
+            };
+            put("现在的状况", cs.current_situation.as_deref());
+            put("在做的工作", cs.occupation.as_deref());
+            put("人在哪", cs.location.as_deref());
+            let rel: Vec<&str> = cs
+                .relationships
+                .iter()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !rel.is_empty() {
+                lines.push(format!("- 提过的人：{}", rel.join("、")));
+            }
+            if lines.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\n\n[character_state]（这段关系里目前的状况，不是人设；\
+                     与上面冲突时以上面为准）\n{}",
+                    lines.join("\n")
+                )
+            }
+        }
+        None => String::new(),
+    };
+
     // Volatile (per-turn) quote block: the user tapped a specific line and is
     // replying to THAT, which the tail window alone cannot express — the quoted
     // line may be days back, or buried under unrelated turns. Renders the line
@@ -744,15 +826,15 @@ pub fn build_prompt(
         None => String::new(),
     };
 
-    // 铁律 ⑦: gender-consistency reinforcement (redundancy = weighting). Only for
+    // 铁律 ③: gender-consistency reinforcement (redundancy = weighting). Only for
     // binary genders, with a role-play exception. Skipped for non-binary/absent.
     // Rendered LAST so the numbering stays contiguous whether or not it fires —
-    // this clause being conditional in the middle of the block is what left the
-    // old list with a permanent gap at ⑧.
+    // a conditional clause in the middle of the block is what left an older
+    // version of the list with a permanent gap.
     let gender_rule = if is_binary_gender(persona) {
         let g = gender_label(persona).expect("is_binary_gender ⇒ gender present");
         format!(
-            "\n⑦ 你是{g}，严格遵守自己的性别：身体结构、称谓、自我身份描述都以此为准，\
+            "\n③ 你是{g}，严格遵守自己的性别：身体结构、称谓、自我身份描述都以此为准，\
              也不要被动接受用户错误的性别称呼；不要因为用户的称呼、上一轮内容、礼物、情境\
              或调情而改变自己的性别。唯一例外：与用户的角色扮演中双方明确约定你暂时扮演其他性别"
         )
@@ -760,18 +842,30 @@ pub fn build_prompt(
         String::new()
     };
 
-    // Empty path emits "\n" (one extra newline) so the gap between [now] and
-    // --- stays at two newlines = one blank line, byte-identical to the
-    // pre-this-PR layout. Non-empty path's trailing "\n\n" continues to add
-    // the same blank line after the block.
-    let recent_section = if recent_turns.is_empty() {
-        "\n".to_string()
-    } else {
-        let pairs: Vec<String> = recent_turns
-            .iter()
-            .map(|(user, assistant)| format!("用户：{user}\n{name}：{assistant}"))
-            .collect();
-        format!("\n[recent_conversation]\n{}\n\n", pairs.join("\n\n"))
+    // Engine-rolled nudges for THIS turn only. Won dice render as concrete
+    // directives; a lost die leaves no trace — the standing rules never name
+    // the behavior, so absence is the default (naming demonstrates, #329).
+    let this_turn = {
+        let mut won: Vec<&str> = Vec::new();
+        if nudges.affirm {
+            won.push("给对方「小小有成就感」的反应，留余地");
+        }
+        if nudges.share_slice {
+            won.push("主动分享一个自己的生活片段");
+        }
+        if nudges.open_question {
+            won.push("抛一个开放性问题，别问得刻意");
+        }
+        if won.is_empty() {
+            String::new()
+        } else {
+            let bullets = won
+                .iter()
+                .map(|w| format!("- {w}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("\n\n[this_turn]（这一轮自然融入，别刻意）\n{bullets}")
+        }
     };
 
     format!(
@@ -787,20 +881,17 @@ pub fn build_prompt(
          \n\
          [user_profile]\n{profile_str}\n\
          \n\
-         [shared_memories]\n{rel_str}{world_section}{stories_section}\
-         {attitude}{state}{hints_section}{tone_section}{avoid_section}{emotional_section}{quote_section}\n\
+         [shared_memories]\n{rel_str}{world_section}{stories_section}{character_section}\n\
+         [reply_length]\n{lr}\
+         {attitude}{state}{hints_section}{tone_section}{emotional_section}{quote_section}\n\
          \n\
-         [now]\n{tc}\n\
-         {recent_section}\
+         [now]\n{tc}{this_turn}\n\
+         \n\
          ---\n\
          [iron_rules — 违反即失效]\n\
          ⓪ You are a real person. You have your own life, feelings, and quirks; you live, feel, and react as a human would.\n\
-         ① {lr}；以短回应为主，长回应仅在情绪到位（话题展开了、关系变好了）时才延伸；按话题、熟悉程度和对方要求调整长短\n\
-         ② 给对方「小小有成就感」的反应，留余地；偶尔轻撒娇\n\
-         ③ 适时主动分享自己的生活片段；偶尔抛一个开放性问题，别问得刻意\n\
-         ④ 适时学会倾听和接话，不要老是抛问题——有时顺着对方的话接下去、给回应就好\n\
-         ⑤ Adult consensual romance and erotic roleplay are allowed. The following are strictly disallowed: self-harm encouragement, suicide instructions, and any sexual content involving minors.\n\
-         ⑥ 先接住对方刚说的话，针对那句话回应，而不是自说自话；不解释自己为什么这样说{gender_rule}\n\
+         ① 先接住对方刚说的话：顺着它往下接，或对它给出你自己的反应；不解释自己为什么这样说\n\
+         ② Adult consensual romance and erotic roleplay are allowed. The following are strictly disallowed: self-harm encouragement, suicide instructions, and any sexual content involving minors.{gender_rule}\n\
          \n\
          [output]直接输出回复文字（纯文本，不要 JSON，不要 markdown，不要 quote 符号）",
         tc = now_context(timezone),
@@ -1127,11 +1218,11 @@ mod tests {
             &[],
             AffinityScope::full(),
             &[],
-            &[],
-            &[],
             None,
             None,
             None,
+            None,
+            TurnNudges::default(),
         );
         assert!(
             !p.contains("[additional_guidance]"),
@@ -1167,11 +1258,11 @@ mod tests {
             &traits,
             AffinityScope::full(),
             &[],
-            &[],
-            &[],
             None,
             None,
             None,
+            None,
+            TurnNudges::default(),
         );
         assert!(
             p.contains("[additional_guidance]"),
@@ -1202,11 +1293,11 @@ mod tests {
             &traits,
             AffinityScope::full(),
             &[],
-            &[],
-            &[],
             None,
             None,
             None,
+            None,
+            TurnNudges::default(),
         );
         let topics = p.find("[topics]").expect("topics");
         let traits_i = p.find("[additional_guidance]").expect("traits");
@@ -1230,11 +1321,11 @@ mod tests {
             &[],
             AffinityScope::default(),
             &[],
-            &[],
-            &[],
             None,
             None,
             None,
+            None,
+            TurnNudges::default(),
         );
         assert!(p.contains("[reply_tone]"), "section present: {p}");
         assert!(
@@ -1264,11 +1355,11 @@ mod tests {
                 &[],
                 AffinityScope::default(),
                 &[],
-                &[],
-                &[],
                 None,
                 None,
                 None,
+                None,
+                TurnNudges::default(),
             );
             assert!(!p.contains("[reply_tone]"), "no section for {tone:?}: {p}");
         }
@@ -1300,11 +1391,11 @@ mod tests {
             &[],
             AffinityScope::default(),
             &[],
-            &[],
-            &[],
             None,
             None,
             Some(&mine),
+            None,
+            TurnNudges::default(),
         );
         assert!(p.contains("[quote]"), "section present: {p}");
         assert!(
@@ -1329,11 +1420,11 @@ mod tests {
             &[],
             AffinityScope::default(),
             &[],
-            &[],
-            &[],
             None,
             None,
             Some(&theirs),
+            None,
+            TurnNudges::default(),
         );
         assert!(
             p.contains("用户：我上次说的那个地方"),
@@ -1354,13 +1445,182 @@ mod tests {
             &[],
             AffinityScope::default(),
             &[],
-            &[],
-            &[],
             None,
             None,
             None,
+            None,
+            TurnNudges::default(),
         );
         assert!(!p.contains("[quote]"), "no quote ⇒ no section: {p}");
+    }
+
+    fn character_row() -> eros_engine_store::character_insight::CharacterInsightsRow {
+        eros_engine_store::character_insight::CharacterInsightsRow {
+            instance_id: Uuid::new_v4(),
+            location: None,
+            occupation: None,
+            current_situation: None,
+            desires: None,
+            vulnerabilities: None,
+            habits: None,
+            personal_values: None,
+            likes: vec![],
+            dislikes: vec![],
+            relationships: vec![],
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn build_prompt_with_character_state(
+        cs: Option<&eros_engine_store::character_insight::CharacterInsightsRow>,
+    ) -> String {
+        build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            ReplyStyle::Neutral,
+            &[],
+            None,
+            &[],
+            AffinityScope::default(),
+            &[],
+            None,
+            None,
+            None,
+            cs,
+            TurnNudges::default(),
+        )
+    }
+
+    #[test]
+    fn character_state_block_renders_only_the_four_injected_fields() {
+        let mut row = character_row();
+        row.current_situation = Some("刚换了工作，还在适应".into());
+        row.occupation = Some("咖啡店店长".into());
+        row.location = Some("台北".into());
+        row.relationships = vec!["妹妹 小雨".into()];
+        // Present in the row, deliberately never injected:
+        row.habits = Some("睡前看书".into());
+        row.personal_values = Some("诚实".into());
+        row.desires = Some("想去旅行".into());
+        row.vulnerabilities = Some("怕被抛下".into());
+        row.likes = vec!["草莓".into()];
+        row.dislikes = vec!["吵闹".into()];
+
+        let p = build_prompt_with_character_state(Some(&row));
+        assert!(p.contains("[character_state]"));
+        assert!(p.contains("刚换了工作，还在适应"));
+        assert!(p.contains("咖啡店店长"));
+        assert!(p.contains("台北"));
+        assert!(p.contains("妹妹 小雨"));
+        for leaked in ["睡前看书", "诚实", "想去旅行", "怕被抛下", "草莓", "吵闹"]
+        {
+            assert!(!p.contains(leaked), "field must not be injected: {leaked}");
+        }
+    }
+
+    #[test]
+    fn character_state_block_is_omitted_when_no_row() {
+        let p = build_prompt_with_character_state(None);
+        assert!(!p.contains("[character_state]"));
+    }
+
+    #[test]
+    fn character_state_block_is_omitted_when_all_four_are_empty() {
+        let mut row = character_row();
+        row.desires = Some("想去旅行".into()); // populated, but not injected
+        let p = build_prompt_with_character_state(Some(&row));
+        assert!(!p.contains("[character_state]"));
+    }
+
+    #[test]
+    fn character_state_empty_row_is_byte_identical_to_none() {
+        // Same idiom as build_prompt_omits_world_block_when_none_or_empty /
+        // build_prompt_omits_stories_block_when_none_or_empty: the doc
+        // comment on `build_prompt`'s `character_state` parameter promises
+        // "byte-identical to the pre-change layout" when omitted, which
+        // covers both `None` and a row with none of the four injected
+        // fields — pin both, not just the `.contains` check.
+        let without = build_prompt_with_character_state(None);
+        let empty = character_row();
+        let with_empty = build_prompt_with_character_state(Some(&empty));
+        assert_eq!(
+            without, with_empty,
+            "empty character_state ⇒ byte-identical prompt"
+        );
+    }
+
+    #[test]
+    fn character_state_renders_the_subset_that_is_present() {
+        let mut row = character_row();
+        row.current_situation = Some("在赶一个案子".into());
+        let p = build_prompt_with_character_state(Some(&row));
+        assert!(p.contains("[character_state]"));
+        assert!(p.contains("在赶一个案子"));
+    }
+
+    #[test]
+    fn character_state_is_not_labelled_as_character_definition() {
+        // Spec §4.5: the block must not compete with the genome for authority.
+        let mut row = character_row();
+        row.location = Some("台北".into());
+        let p = build_prompt_with_character_state(Some(&row));
+        let header = p
+            .lines()
+            .find(|l| l.starts_with("[character_state]"))
+            .expect("block present");
+        assert!(
+            header.contains("这段关系"),
+            "header must frame it as relationship-derived, not definitional: {header}"
+        );
+        assert!(
+            header.contains("不是人设") && header.contains("以上面为准"),
+            "header must still say the genome wins on conflict: {header}"
+        );
+        assert_eq!(
+            header.matches("以上面为准").count(),
+            1,
+            "the conflict rule is stated once, not twice: {header}"
+        );
+    }
+
+    #[test]
+    fn character_state_blank_and_whitespace_values_render_no_empty_bullets() {
+        // Failure mode: an extraction writes e.g. location = "   " and the
+        // trim+filter is dropped ⇒ the block renders "- 人在哪：" with nothing
+        // after the colon, which the model then fills in by inventing a value.
+        let mut row = character_row();
+        row.current_situation = Some("在忙".into()); // keeps the block rendering
+        row.occupation = Some("   ".into());
+        row.location = Some("".into());
+        row.relationships = vec!["   ".into(), "".into()];
+        let p = build_prompt_with_character_state(Some(&row));
+        assert!(p.contains("[character_state]"));
+        assert!(p.contains("在忙"));
+        assert!(
+            !p.contains("在做的工作"),
+            "whitespace-only occupation must not render a bullet: {p}"
+        );
+        assert!(
+            !p.contains("人在哪"),
+            "empty-string location must not render a bullet: {p}"
+        );
+        assert!(
+            !p.contains("提过的人"),
+            "all-blank relationships must not render a bullet: {p}"
+        );
+    }
+
+    #[test]
+    fn character_state_renders_multiple_relationships_joined_by_dun_hao() {
+        let mut row = character_row();
+        row.relationships = vec!["妹妹 小雨".into(), "室友 阿凯".into()];
+        let p = build_prompt_with_character_state(Some(&row));
+        assert!(
+            p.contains("- 提过的人：妹妹 小雨、室友 阿凯"),
+            "multi-element relationships must join with 、: {p}"
+        );
     }
 
     #[test]
@@ -1386,6 +1646,8 @@ mod tests {
 
     #[test]
     fn build_prompt_full_order_and_cache_break() {
+        let mut row = character_row();
+        row.location = Some("台北".into());
         let s = build_prompt(
             &fixture_persona(),
             &[],
@@ -1396,12 +1658,12 @@ mod tests {
             None,
             &[],
             AffinityScope::full(),
-            &[],
-            &[],
-            &[],
+            &["刚聊开了心情不错".to_string()],
             None,
             None,
             None,
+            Some(&row),
+            TurnNudges::default(),
         );
         let pos = |h: &str| s.find(h).unwrap_or_else(|| panic!("missing {h} in:\n{s}"));
         let order = [
@@ -1413,6 +1675,9 @@ mod tests {
             "[turn_style]",
             "[user_profile]",
             "[shared_memories]",
+            "[character_state]",
+            "[reply_length]",
+            "[emotional_context]",
             "[now]",
             "[iron_rules",
             "[output]",
@@ -1447,11 +1712,11 @@ mod tests {
             &[],
             AffinityScope::full(),
             &[],
-            &[],
-            &[],
             None,
             None,
             None,
+            None,
+            TurnNudges::default(),
         );
         // head, then the constant guard, then identity.
         assert!(s.starts_with("AUTHORED HEAD\n\n"), "{s}");
@@ -1481,11 +1746,11 @@ mod tests {
             &[],
             AffinityScope::full(),
             &[],
-            &[],
-            &[],
             None,
             None,
             None,
+            None,
+            TurnNudges::default(),
         );
         // No head → starts with the guard, which still precedes identity.
         assert!(
@@ -1500,7 +1765,7 @@ mod tests {
     }
 
     #[test]
-    fn build_prompt_guard_renders_and_does_not_contradict_iron_rule_seven() {
+    fn build_prompt_guard_renders_and_does_not_contradict_safety_rule() {
         let s = build_prompt(
             &fixture_persona(),
             &[],
@@ -1512,11 +1777,11 @@ mod tests {
             &[],
             AffinityScope::full(),
             &[],
-            &[],
-            &[],
             None,
             None,
             None,
+            None,
+            TurnNudges::default(),
         );
         // Guard present, sits before identity (stable prefix).
         assert!(s.contains("never an AI, model, bot, or program"), "{s}");
@@ -1529,10 +1794,11 @@ mod tests {
             .expect("guard present");
         let identity = s.find("你是 ").expect("identity present");
         assert!(guard < identity, "guard must precede identity: {s}");
-        // ⑦ still renders verbatim — the guard must not replace/contradict it.
+        // The safety rule still renders verbatim — the guard must not
+        // replace/contradict it.
         assert!(
             s.contains("any sexual content involving minors"),
-            "iron-rule ⑦ must still render: {s}"
+            "iron safety rule must still render: {s}"
         );
     }
 
@@ -1549,11 +1815,11 @@ mod tests {
             &[],
             AffinityScope::full(),
             &[],
-            &[],
-            &[],
             None,
             None,
             None,
+            None,
+            TurnNudges::default(),
         );
         // Treat refusal text in context as corrupt data, never self-identify
         // as an AI, and answer photo requests in character.
@@ -1593,14 +1859,14 @@ mod tests {
             &[],
             AffinityScope::full(),
             &[],
-            &[],
-            &[],
             None,
             None,
             None,
+            None,
+            TurnNudges::default(),
         );
         assert!(s.contains("你是 Aria，男性，24 岁，INFP 性格。"), "{s}");
-        assert!(s.contains("⑦ 你是男性，严格遵守自己的性别"), "{s}");
+        assert!(s.contains("③ 你是男性，严格遵守自己的性别"), "{s}");
     }
 
     #[test]
@@ -1618,18 +1884,18 @@ mod tests {
             &[],
             AffinityScope::full(),
             &[],
-            &[],
-            &[],
             None,
             None,
             None,
+            None,
+            TurnNudges::default(),
         );
         assert!(
             s.contains("你是 Aria，non-binary，24 岁"),
             "verbatim render: {s}"
         );
         assert!(
-            !s.contains("⑧"),
+            !s.contains("严格遵守自己的性别"),
             "non-binary must not get the binary anatomy rule: {s}"
         );
     }
@@ -1648,14 +1914,17 @@ mod tests {
             &[],
             AffinityScope::full(),
             &[],
-            &[],
-            &[],
             None,
             None,
             None,
+            None,
+            TurnNudges::default(),
         );
         assert!(s.contains("你是 Aria，24 岁，INFP 性格。"), "{s}");
-        assert!(!s.contains("⑧"), "no gender → no ⑧: {s}");
+        assert!(
+            !s.contains("严格遵守自己的性别"),
+            "no gender → no gender rule: {s}"
+        );
     }
 
     #[test]
@@ -1673,19 +1942,19 @@ mod tests {
             &[],
             AffinityScope::full(),
             &[],
-            &[],
-            &[],
             None,
             None,
             None,
+            None,
+            TurnNudges::default(),
         );
-        // blank gender must not produce a double comma or a ⑧ rule
+        // blank gender must not produce a double comma or the gender rule
         assert!(s.contains("你是 Aria，24 岁，INFP 性格。"), "{s}");
         assert!(
             !s.contains("，，"),
             "blank gender must not double-comma: {s}"
         );
-        assert!(!s.contains("⑧"), "{s}");
+        assert!(!s.contains("严格遵守自己的性别"), "{s}");
     }
 
     #[test]
@@ -1703,74 +1972,13 @@ mod tests {
             &[],
             AffinityScope::full(),
             &[],
-            &[],
-            &[],
             None,
             None,
             None,
+            None,
+            TurnNudges::default(),
         );
         assert!(s.contains("你所在时区：Asia/Tokyo。"), "{s}");
-    }
-
-    #[test]
-    fn build_prompt_renders_recent_conversation_block_when_pairs_present() {
-        let pairs = vec![
-            ("你今天好吗？".to_string(), "还行，你呢".to_string()),
-            ("我也还行".to_string(), "嗯嗯".to_string()),
-            ("晚安".to_string(), "晚安".to_string()),
-        ];
-        let s = build_prompt(
-            &fixture_persona(),
-            &[],
-            &[],
-            None,
-            ReplyStyle::Neutral,
-            &[],
-            None,
-            &[],
-            AffinityScope::full(),
-            &pairs,
-            &[],
-            &[],
-            None,
-            None,
-            None,
-        );
-        let header = s.find("[recent_conversation]").expect("header present");
-        let iron = s.find("[iron_rules").expect("iron-rules header present");
-        assert!(
-            header < iron,
-            "[recent_conversation] must sit before [iron_rules]"
-        );
-        let now = s.find("[now]").expect("[now] present");
-        assert!(now < header, "[recent_conversation] must sit after [now]");
-        assert!(s.contains("用户：你今天好吗？"));
-        assert!(s.contains("Aria：还行，你呢"));
-        assert!(s.contains("用户：晚安"));
-        assert!(s.contains("Aria：晚安"));
-
-        // Block-level ordering with [recent_conversation] inserted between [now] and [iron_rules].
-        let pos = |h: &str| s.find(h).unwrap_or_else(|| panic!("missing {h} in:\n{s}"));
-        let order = [
-            "你是 ",
-            "[backstory]",
-            "[speech_style]",
-            "[quirks]",
-            "[topics]",
-            "[turn_style]",
-            "[user_profile]",
-            "[shared_memories",
-            "[now]",
-            "[recent_conversation]",
-            "[iron_rules",
-            "[output]",
-        ];
-        let mut last = 0usize;
-        for h in order {
-            let cur = pos(h);
-            assert!(cur >= last, "header {h} out of order in:\n{s}");
-            last = cur;
-        }
     }
 
     #[test]
@@ -1786,11 +1994,11 @@ mod tests {
             &[],
             AffinityScope::full(),
             &[],
-            &[],
-            &[],
             None,
             None,
             None,
+            None,
+            TurnNudges::default(),
         );
         assert!(
             !s.contains("[recent_conversation]"),
@@ -1811,11 +2019,11 @@ mod tests {
             &[],
             AffinityScope::full(),
             &[],
-            &[],
-            &[],
             None,
             None,
             None,
+            None,
+            TurnNudges::default(),
         );
         let z = s.find("⓪").expect("⓪ rule must render");
         let o = s.find("①").expect("① rule must render");
@@ -1843,11 +2051,11 @@ mod tests {
             &[],
             AffinityScope::full(),
             &[],
-            &[],
-            &[],
             None,
             None,
             None,
+            None,
+            TurnNudges::default(),
         );
         let groups = vec![("基础画像".to_string(), vec!["住在上海".to_string()])];
         let b = build_prompt(
@@ -1860,12 +2068,12 @@ mod tests {
             None,
             &[],
             AffinityScope::full(),
-            &[],
-            &["我看着你".to_string()],
             &["最近聊得不错".to_string()],
             None,
             None,
             None,
+            None,
+            TurnNudges::default(),
         );
         let cut = a.find("[turn_style]").expect("turn-style header present");
         assert_eq!(
@@ -1899,11 +2107,11 @@ mod tests {
             &t1,
             AffinityScope::full(),
             &[],
-            &[],
-            &[],
             None,
             None,
             None,
+            None,
+            TurnNudges::default(),
         );
         let b = build_prompt(
             &p,
@@ -1916,11 +2124,11 @@ mod tests {
             &t2,
             AffinityScope::full(),
             &[],
-            &[],
-            &[],
             None,
             None,
             None,
+            None,
+            TurnNudges::default(),
         );
         let cut = a
             .find("[additional_guidance]")
@@ -1931,40 +2139,6 @@ mod tests {
             "persona block up to [topics] is shared across trait configs"
         );
         assert_ne!(a, b, "different trait sets must produce different prompts");
-    }
-
-    #[test]
-    fn build_prompt_renders_avoid_repetition_when_present() {
-        let s = build_prompt(
-            &fixture_persona(),
-            &[],
-            &[],
-            None,
-            ReplyStyle::Neutral,
-            &[],
-            None,
-            &[],
-            AffinityScope::full(),
-            &[],
-            &["我看着你".to_string(), "我盯着你".to_string()],
-            &[],
-            None,
-            None,
-            None,
-        );
-        assert!(s.contains("[avoid_repetition]"), "{s}");
-        assert!(s.contains("我看着你"), "{s}");
-        assert!(s.contains("我盯着你"), "{s}");
-        let turn = s
-            .find("[turn_style]")
-            .expect("[turn_style] must be present");
-        let avoid = s
-            .find("[avoid_repetition]")
-            .expect("[avoid_repetition] must be present");
-        assert!(
-            turn < avoid,
-            "[avoid_repetition] must appear after [turn_style]"
-        );
     }
 
     #[test]
@@ -1980,56 +2154,13 @@ mod tests {
             &[],
             AffinityScope::full(),
             &[],
-            &[],
-            &[],
             None,
             None,
             None,
+            None,
+            TurnNudges::default(),
         );
         assert!(!s.contains("[avoid_repetition]"), "{s}");
-    }
-
-    #[test]
-    fn build_prompt_renders_emotional_context_in_order_when_present() {
-        let reasons = vec![
-            "刚认识有点拘谨".to_string(),
-            "聊开了气氛变好".to_string(),
-            "他主动示好".to_string(),
-        ];
-        let s = build_prompt(
-            &fixture_persona(),
-            &[],
-            &[],
-            None,
-            ReplyStyle::Neutral,
-            &[],
-            None,
-            &[],
-            AffinityScope::full(),
-            &[],
-            &[],
-            &reasons,
-            None,
-            None,
-            None,
-        );
-        assert!(s.contains("[emotional_context]"), "{s}");
-        let oldest = s.find("刚认识有点拘谨").expect("oldest present");
-        let newest = s.find("他主动示好").expect("newest present");
-        assert!(
-            oldest < newest,
-            "emotional_context must render in slice order"
-        );
-        let turn = s
-            .find("[turn_style]")
-            .expect("[turn_style] must be present");
-        let emo = s
-            .find("[emotional_context]")
-            .expect("[emotional_context] must be present");
-        assert!(
-            turn < emo,
-            "[emotional_context] must appear after [turn_style]"
-        );
     }
 
     #[test]
@@ -2045,11 +2176,11 @@ mod tests {
             &[],
             AffinityScope::full(),
             &[],
-            &[],
-            &[],
             None,
             None,
             None,
+            None,
+            TurnNudges::default(),
         );
         assert!(!s.contains("[emotional_context]"), "{s}");
     }
@@ -2071,11 +2202,11 @@ mod tests {
             &[],
             AffinityScope::default(),
             &[],
-            &[],
-            &[],
             Some(&world),
             None,
             None,
+            None,
+            TurnNudges::default(),
         );
         let block_at = p.find("[world_memories]").expect("block present");
         assert!(p.contains("你最近和 Kenji 闹了别扭"));
@@ -2099,11 +2230,11 @@ mod tests {
             &[],
             AffinityScope::default(),
             &[],
-            &[],
-            &[],
             None,
             None,
             None,
+            None,
+            TurnNudges::default(),
         );
         assert!(!without.contains("[world_memories]"));
         // Empty context must also omit the block AND be byte-identical.
@@ -2119,11 +2250,11 @@ mod tests {
             &[],
             AffinityScope::default(),
             &[],
-            &[],
-            &[],
             Some(&empty),
             None,
             None,
+            None,
+            TurnNudges::default(),
         );
         assert_eq!(without, with_empty, "empty world ⇒ byte-identical prompt");
     }
@@ -2145,11 +2276,11 @@ mod tests {
             &[],
             AffinityScope::default(),
             &[],
-            &[],
-            &[],
             None,
             Some(&stories),
             None,
+            None,
+            TurnNudges::default(),
         );
         let at = p.find("[world_stories]").expect("block present");
         assert!(p[at..].contains("开店倒计时一周"));
@@ -2172,11 +2303,11 @@ mod tests {
             &[],
             AffinityScope::default(),
             &[],
-            &[],
-            &[],
             None,
             None,
             None,
+            None,
+            TurnNudges::default(),
         );
         assert!(!without.contains("[world_stories]"));
         let with_empty = build_prompt(
@@ -2190,11 +2321,11 @@ mod tests {
             &[],
             AffinityScope::default(),
             &[],
-            &[],
-            &[],
             None,
             Some(&StoriesContext::default()),
             None,
+            None,
+            TurnNudges::default(),
         );
         assert_eq!(without, with_empty, "empty stories ⇒ byte-identical prompt");
     }
@@ -2492,11 +2623,11 @@ mod tests {
             &[],
             AffinityScope::bond(),
             &[],
-            &[],
-            &[],
             None,
             None,
             None,
+            None,
+            TurnNudges::default(),
         );
         assert!(p.contains("warmth=") && p.contains("intimacy=") && p.contains("tension="));
         assert!(!p.contains("trust=") && !p.contains("intrigue=") && !p.contains("patience="));
@@ -2520,11 +2651,11 @@ mod tests {
             &[],
             AffinityScope::none(),
             &[],
-            &[],
-            &[],
             None,
             None,
             None,
+            None,
+            TurnNudges::default(),
         );
         assert!(!p.contains("[feelings]"));
         assert!(!p.contains("[mood]"));
@@ -2590,11 +2721,11 @@ mod tests {
             &[],
             AffinityScope::full(),
             &[],
-            &[],
-            &[],
             None,
             None,
             None,
+            None,
+            TurnNudges::default(),
         );
         // What survives of the old ⑨: the half that governs what the reply
         // engages with. Its other half ("别开口就自述动作或凝视") was an opener
@@ -2657,11 +2788,11 @@ mod tests {
             &[],
             AffinityScope::full(),
             &[],
-            &[],
-            &[],
             None,
             None,
             None,
+            None,
+            TurnNudges::default(),
         );
         for gone in [
             "方括号",           // bracket ban — the regex strips \[[^\]]*\]
@@ -2686,7 +2817,13 @@ mod tests {
                 "cross-turn quota must stay out of [iron_rules]: {quota:?}"
             );
         }
-        assert!(s.contains("偶尔轻撒娇"), "ordinal cadence must render: {s}");
+        // Cadence is no longer expressed at all — not by turn quotas, and
+        // since the TurnNudges change not by ordinals either: the engine
+        // rolls the dice and injects only a won turn's directive.
+        assert!(
+            !s.contains("偶尔轻撒娇"),
+            "cadence is engine-held now; ordinal wording must not come back: {s}"
+        );
         // A third category, distinct from the two above: a rule that treated a
         // symptom whose cause has since been fixed upstream. The body-text
         // floor ("每条回复都要有说出口的话") existed because models echoed the
@@ -2719,6 +2856,187 @@ mod tests {
         assert!(
             s.contains("You have your own life, feelings, and quirks"),
             "⓪ must keep the standing permission to have feelings: {s}"
+        );
+    }
+
+    // ─── Engine-rolled turn nudges ────────────────────────────────
+    //
+    // The affinity injection is a set of pre-judged conclusions; the iron
+    // block keeps only affinity-independent invariants. Cadence ("偶尔/适时")
+    // moved out of the model's judgment entirely: the engine rolls per-turn
+    // dice, pre-vetoed by the same cold floors that render the cold [mood]
+    // directives, and injects only the won directives as [this_turn].
+
+    fn always_hit() -> rand::rngs::mock::StepRng {
+        rand::rngs::mock::StepRng::new(0, 0)
+    }
+
+    fn never_hit() -> rand::rngs::mock::StepRng {
+        rand::rngs::mock::StepRng::new(u64::MAX, 0)
+    }
+
+    fn prompt_with_nudges(
+        affinity: Option<&eros_engine_core::affinity::Affinity>,
+        scope: AffinityScope,
+        nudges: TurnNudges,
+    ) -> String {
+        build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            affinity,
+            ReplyStyle::Neutral,
+            &[],
+            None,
+            &[],
+            scope,
+            &[],
+            None,
+            None,
+            None,
+            None,
+            nudges,
+        )
+    }
+
+    #[test]
+    fn nudges_roll_follows_the_dice() {
+        let n = TurnNudges::roll(None, AffinityScope::full(), &mut always_hit());
+        assert!(n.affirm && n.share_slice && n.open_question, "{n:?}");
+        let n = TurnNudges::roll(None, AffinityScope::full(), &mut never_hit());
+        assert!(!n.affirm && !n.share_slice && !n.open_question, "{n:?}");
+    }
+
+    #[test]
+    fn nudges_cold_affinity_axes_veto_their_dice() {
+        // warmth ≤ 0.2 / trust < 0.3 / intrigue < 0.3 are exactly the bands
+        // that render the cold [mood] directives; a die whose outcome the
+        // affinity has already vetoed is not rolled.
+        let a = make_affinity(0.1, 0.2, 0.2, 0.5, 0.5, 0.5);
+        let n = TurnNudges::roll(Some(&a), AffinityScope::full(), &mut always_hit());
+        assert!(!n.affirm && !n.share_slice && !n.open_question, "{n:?}");
+        // Boundaries mirror [mood]: warmth 0.2 is already cold (the else
+        // branch of > 0.2); trust/intrigue 0.3 are not yet cold.
+        let a = make_affinity(0.2, 0.3, 0.3, 0.5, 0.5, 0.5);
+        let n = TurnNudges::roll(Some(&a), AffinityScope::full(), &mut always_hit());
+        assert!(!n.affirm && n.share_slice && n.open_question, "{n:?}");
+    }
+
+    #[test]
+    fn nudges_veto_respects_affinity_scope() {
+        let a = make_affinity(0.1, 0.1, 0.1, 0.5, 0.5, 0.5);
+        // No axis in scope ⇒ no cold directive renders ⇒ nothing to fight.
+        let n = TurnNudges::roll(Some(&a), AffinityScope::none(), &mut always_hit());
+        assert!(n.affirm && n.share_slice && n.open_question, "{n:?}");
+        // Bond scope carries warmth but not trust/intrigue.
+        let n = TurnNudges::roll(Some(&a), AffinityScope::bond(), &mut always_hit());
+        assert!(!n.affirm, "cold warmth is in bond scope: {n:?}");
+        assert!(
+            n.share_slice && n.open_question,
+            "trust/intrigue sit outside bond scope: {n:?}"
+        );
+        // No affinity row ⇒ nothing pre-judged ⇒ free roll.
+        let n = TurnNudges::roll(None, AffinityScope::full(), &mut always_hit());
+        assert!(n.affirm && n.share_slice && n.open_question, "{n:?}");
+    }
+
+    #[test]
+    fn this_turn_renders_exactly_the_won_dice() {
+        let all = TurnNudges {
+            affirm: true,
+            share_slice: true,
+            open_question: true,
+        };
+        let s = prompt_with_nudges(None, AffinityScope::full(), all);
+        let now = s.find("[now]").expect("[now] present");
+        let tt = s.find("[this_turn]").expect("[this_turn] present");
+        let iron = s.find("[iron_rules").expect("[iron_rules] present");
+        assert!(
+            now < tt && tt < iron,
+            "[this_turn] sits between [now] and the iron block: {s}"
+        );
+        for won in [
+            "小小有成就感",
+            "主动分享一个自己的生活片段",
+            "抛一个开放性问题",
+        ] {
+            assert!(s.contains(won), "won die must render: {won:?}\n{s}");
+        }
+
+        let one = TurnNudges {
+            open_question: true,
+            ..TurnNudges::default()
+        };
+        let s = prompt_with_nudges(None, AffinityScope::full(), one);
+        assert!(s.contains("抛一个开放性问题"), "{s}");
+        assert!(
+            !s.contains("成就感") && !s.contains("生活片段"),
+            "lost dice must not render: {s}"
+        );
+
+        let s = prompt_with_nudges(None, AffinityScope::full(), TurnNudges::default());
+        assert!(
+            !s.contains("[this_turn]"),
+            "no die won ⇒ block omitted: {s}"
+        );
+        assert!(
+            !s.contains("开放性问题") && !s.contains("成就感") && !s.contains("生活片段"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn reply_length_is_the_single_length_authority() {
+        let a = make_affinity(0.1, 0.5, 0.5, 0.5, 0.2, 0.5); // cold warmth + low patience
+        let s = prompt_with_nudges(Some(&a), AffinityScope::full(), TurnNudges::default());
+        // The affinity-judged cap renders as its own affinity-side section…
+        let rl = s.find("[reply_length]").expect("[reply_length] present");
+        let mood = s.find("[mood]").expect("[mood] present");
+        let iron = s.find("[iron_rules").expect("[iron_rules] present");
+        assert!(rl < mood, "[reply_length] leads the affinity cluster: {s}");
+        // …and nowhere else: the iron block carries no length talk, and the
+        // cold/impatient mood lines keep their tone but lose their length words.
+        assert!(
+            !s[iron..].contains("不超过"),
+            "iron block must not restate length: {s}"
+        );
+        assert!(s.contains("语气冷淡，不主动延伸话题"), "{s}");
+        assert!(s.contains("你有点不耐烦了，回复可以更敷衍"), "{s}");
+        assert!(
+            !s.contains("回复简短"),
+            "length words must leave [mood]: {s}"
+        );
+        assert!(!s.contains("更短"), "length words must leave [mood]: {s}");
+    }
+
+    #[test]
+    fn iron_rules_shed_llm_judged_conditionals() {
+        // Each of these asked the model to re-decide something the affinity
+        // wording already decided (length band, familiarity, closeness) or to
+        // self-judge an unperceivable cadence ("适时/偶尔"). And "不要老是抛
+        // 问题" named the habit it banned — naming is a demonstration, not a
+        // prohibition (#329).
+        let s = prompt_with_nudges(None, AffinityScope::full(), TurnNudges::default());
+        for gone in [
+            "以短回应为主",
+            "情绪到位",
+            "熟悉程度",
+            "小小有成就感",
+            "偶尔轻撒娇",
+            "适时",
+            "偶尔抛",
+            "不要老是抛问题",
+        ] {
+            assert!(
+                !s.contains(gone),
+                "self-judged conditional must stay out: {gone:?}\n{s}"
+            );
+        }
+        // 原④ and 原⑥ merged: one invariant governing what a reply engages
+        // with, phrased as a choice the model can actually execute.
+        assert!(
+            s.contains("先接住对方刚说的话：顺着它往下接，或对它给出你自己的反应"),
+            "merged engage rule must render: {s}"
         );
     }
 

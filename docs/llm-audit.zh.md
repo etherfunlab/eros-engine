@@ -344,7 +344,7 @@ material 会直接拒绝加载，而不是像以前那样在构造时 warn-and-d
 所以「没有失败」只有一种表达。设计见
 [LLM error audit spec](superpowers/specs/2026-08-18-llm-error-audit-design.md)；
 面向消费方的变化见
-[migrating/llm-error-audit-v1-4-0.md](migrating/llm-error-audit-v1-4-0.md)。
+[migrating/v1-4-0-llm-error-audit.md](migrating/v1-4-0-llm-error-audit.md)。
 
 ### 三个归属，按「这个事实是谁说的」划分
 

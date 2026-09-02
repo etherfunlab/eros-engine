@@ -492,7 +492,7 @@ drives the same generation pipeline and the reply lands in
 `engine.chat_messages`, picked up via the history route or Supabase
 Realtime.
 
-The pre-rename path `POST /v2/comp/chat/{session_id}/message/async` was removed in 1.6.0 and now 404s (for an authenticated request; `require_auth` still 401s first) — see [`docs/migrating/async-chat-v1-6-0.md`](migrating/async-chat-v1-6-0.md).
+The pre-rename path `POST /v2/comp/chat/{session_id}/message/async` was removed in 1.6.0 and now 404s (for an authenticated request; `require_auth` still 401s first) — see [`docs/migrating/v1-6-0-async-chat.md`](migrating/v1-6-0-async-chat.md).
 
 ```bash
 curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
@@ -1051,7 +1051,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 ### `GET /comp/chat/{user_id}/sessions`
 
-All chat sessions for `user_id`. The path's `user_id` MUST match the JWT's user_id; otherwise 403.
+All chat sessions for `user_id`. The path's `user_id` MUST match the JWT's user_id; otherwise 403. Returns `{ "sessions": [...] }`, each entry carrying `session_id`, `instance_id`, `is_converted`, `last_active_at`, and `channel`.
 
 ### `GET /comp/user/{user_id}/profile`
 
@@ -1108,7 +1108,7 @@ The flat, typed `character_insights` row for one relationship (`persona_instance
 }
 ```
 
-`updated_at: null` means this instance has no `character_insights` row yet — the character extraction chain has not produced a result — and every other field is `null`/`[]` in that response, same convention as the human profile above. Results are database-only: nothing here is read back into any chat prompt.
+`updated_at: null` means this instance has no `character_insights` row yet — the character extraction chain has not produced a result — and every other field is `null`/`[]` in that response, same convention as the human profile above. Four of these fields — `current_situation`, `occupation`, `location`, `relationships` — are read back into the chat prompt as the `[character_state]` block, and the fill level of all ten sizes the injected history window (see [Deploying → Operational notes](deploying.md#operational-notes)); the other six are database-only.
 
 This route is v1 and frozen — it keeps working and is not going away. The v2
 equivalent, with the same fields under the v2 path convention, is
@@ -1250,7 +1250,7 @@ A frontend-shaped mirror of selected `/comp/*` routes for first-party
 clients. Same Supabase JWT auth and the same per-user ownership checks as
 the canonical routes — only the **response shape** differs (slimmer DTOs,
 bundled payloads). Canonical `/comp/*` routes are never reshaped to fit a
-frontend; a BFF route is added alongside instead. Four routes exist today.
+frontend; a BFF route is added alongside instead. Five routes exist today.
 
 ### `POST /bff/v1/comp/chat/start`
 

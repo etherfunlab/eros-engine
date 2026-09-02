@@ -422,7 +422,7 @@ stream 客户端——事后可通过
 Realtime 读取。
 
 改名前的路径 `POST /v2/comp/chat/{session_id}/message/async` 已在 1.6.0 移除，现在返回 404（带有效 bearer 时；`require_auth`
-仍先于路由匹配返回 401）——见 [`docs/migrating/async-chat-v1-6-0.md`](migrating/async-chat-v1-6-0.md)。
+仍先于路由匹配返回 401）——见 [`docs/migrating/v1-6-0-async-chat.md`](migrating/v1-6-0-async-chat.md)。
 
 ```bash
 curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
@@ -905,7 +905,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 ### `GET /comp/chat/{user_id}/sessions`
 
-該 `user_id` 名下的所有 chat sessions。路徑裡的 `user_id` **必須** 等於 JWT 裡的 user_id；否則 403。
+該 `user_id` 名下的所有 chat sessions。路徑裡的 `user_id` **必須** 等於 JWT 裡的 user_id；否則 403。返回 `{ "sessions": [...] }`，每條帶 `session_id`、`instance_id`、`is_converted`、`last_active_at`、`channel`。
 
 ### `GET /comp/user/{user_id}/profile`
 
@@ -962,7 +962,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 }
 ```
 
-`updated_at` 为 `null` 表示这个 instance 还没有 `character_insights` 行——角色抽取链还没跑出结果——这时其余字段也都是 `null`/`[]`，和上面人类画像同一套约定。结果只落库：这里的任何内容都不会被读回任何 chat prompt。
+`updated_at` 为 `null` 表示这个 instance 还没有 `character_insights` 行——角色抽取链还没跑出结果——这时其余字段也都是 `null`/`[]`，和上面人类画像同一套约定。其中四个字段——`current_situation`、`occupation`、`location`、`relationships`——会作为 `[character_state]` 块读回 chat prompt，十个字段的填充程度还决定注入的历史窗口大小（见[部署 → 運維注意事項](deploying.zh.md#運維注意事項)）；其余六个只落库。
 
 这条路由是 v1，冻结不动——它会继续可用，不会被移除。v2 的对应端点、同一套
 字段、v2 路径形状，是下面的 `GET /v2/comp/instance/{instance_id}/insight/character`。
@@ -1096,7 +1096,7 @@ JWT 的 `sub`，否则 `403`。渲染完全是下游的事，这两条端点只�
 canonical 路由完全相同（同樣的 Supabase JWT、同樣的 per-user ownership
 檢查），只有 **響應形狀** 不同（更精簡的 DTO、打包好的 payload）。
 canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而是在旁邊
-新增一條 BFF 路由。目前有四條。
+新增一條 BFF 路由。目前有五條。
 
 ### `POST /bff/v1/comp/chat/start`
 
@@ -1120,8 +1120,8 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
   "persona_name": "Aria",
   "is_new": false,
   "history": [
-    { "id": "3cc06c53-…", "client_msg_id": "c_abc", "role": "user",      "content": "hello",   "sent_at": "…", "read_at": "…" },
-    { "id": "9f2e7a10-…", "client_msg_id": null,    "role": "assistant", "content": "hi back", "sent_at": "…", "read_at": "…" }
+    { "id": "3cc06c53-…", "client_msg_id": "c_abc", "role": "user",      "content": "hello",   "sent_at": "…" },
+    { "id": "9f2e7a10-…", "client_msg_id": null,    "role": "assistant", "content": "hi back", "sent_at": "…" }
   ]
 }
 ```
@@ -1157,8 +1157,8 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
 {
   "session_id": "…",
   "messages": [
-    { "id": "3cc06c53-…", "client_msg_id": "c_abc", "role": "user",      "content": "alpha", "sent_at": "…" },
-    { "id": "9f2e7a10-…", "client_msg_id": null,    "role": "assistant", "content": "beta",  "sent_at": "…" },
+    { "id": "3cc06c53-…", "client_msg_id": "c_abc", "role": "user",      "content": "alpha", "sent_at": "…", "read_at": "…" },
+    { "id": "9f2e7a10-…", "client_msg_id": null,    "role": "assistant", "content": "beta",  "sent_at": "…", "read_at": "…" },
     { "id": "a1b2c3d4-…", "client_msg_id": null,    "role": "assistant", "content": "gamma", "sent_at": "…", "channel": "product_qa" },
     { "id": "b5c6d7e8-…", "client_msg_id": null,    "role": "assistant", "content": "",      "sent_at": "…", "image": true },
     { "id": "c9d0e1f2-…", "client_msg_id": "c_def", "role": "user",      "content": "wait, about that", "sent_at": "…", "reply_to_message_id": "3cc06c53-…" }
