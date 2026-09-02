@@ -521,8 +521,8 @@ pub fn build_prompt(
     reply_tone: Option<&str>,
     prompt_traits: &[PromptTrait],
     affinity_scope: AffinityScope,
-    // Recent affinity-evaluation reasons, oldest→newest. Empty ⇒ the
-    // `[emotional_context]` block is omitted.
+    // The previous turn's affinity-evaluation reason — one row, not a
+    // trajectory. Empty ⇒ the `[emotional_context]` block is omitted.
     emotional_context: &[String],
     // World-memories injection (spec §3.3). `None` or empty ⇒ the
     // [world_memories] block is omitted and the prompt is byte-identical

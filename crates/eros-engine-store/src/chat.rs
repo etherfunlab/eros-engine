@@ -396,8 +396,8 @@ impl<'a> ChatRepo<'a> {
     /// `assistant` row produces one pair; orphan rows are dropped.
     /// Channel-marked rows ('voice'/'product_qa') are out of companion context and excluded.
     ///
-    /// Used by the chat pipeline to inject the `[recent_conversation]` short-
-    /// term memory block into the system prompt. Uses the existing
+    /// Has no production caller: the chat pipeline no longer renders a
+    /// short-term-memory block from turn pairs. Uses the existing
     /// `idx_chat_messages_session(session_id, sent_at DESC)` index — no
     /// migration needed.
     pub async fn recent_turn_pairs(

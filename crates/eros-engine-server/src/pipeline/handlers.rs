@@ -58,7 +58,9 @@ const STORY_RECALL_K: i32 = 3;
 /// Task key used by all chat handlers. Matches the gateway's task router.
 const CHAT_TASK: &str = "chat_companion";
 
-/// Maximum number of recent messages pulled into the prompt.
+/// Maximum number of recent messages fetched per turn. This is the fetch size
+/// only: `history_window`'s ladder selects the injected subset from what this
+/// returned and never widens the query.
 const HISTORY_WINDOW: i64 = 20;
 
 /// Partition caller traits by a tier's resolved allow-list.
