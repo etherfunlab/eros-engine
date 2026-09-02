@@ -229,15 +229,18 @@ pub(crate) fn recall_query_text(msg: &eros_engine_store::chat::ChatMessage) -> S
 /// now (the legacy in-app Gift Event endpoint was removed), so no tip/legacy
 /// gate is needed. Assistant rows feed `content` (their `pre_filter_content`
 /// is the pre-output-filter original and must never re-enter the prompt),
-/// then have their leading sentence stripped (spec §4.3 — the noise carrier,
-/// e.g. `唔`/`啊`); a row with nothing left after stripping is omitted rather
-/// than injected as empty content, which some providers reject. User rows are
-/// never stripped.
+/// then, when `strip` is true, have their leading sentence stripped (spec
+/// §4.3 — the noise carrier, e.g. `唔`/`啊`); a row with nothing left after
+/// stripping is omitted rather than injected as empty content, which some
+/// providers reject. User rows are never stripped. `strip = false` is the
+/// operator opt-out (`CHAT_NOISE_CANCELLATION_DISABLED`): assistant rows are
+/// injected whole.
 ///
 /// Split out of `assemble_chat_request` so echo cancellation can key on the
 /// exact string the provider receives — no other layer can compute it.
 pub(crate) fn model_facing_history(
     history: Vec<eros_engine_store::chat::ChatMessage>,
+    strip: bool,
 ) -> Vec<crate::repetition::Injected> {
     let mut out = Vec::with_capacity(history.len());
     for msg in history {
@@ -247,15 +250,20 @@ pub(crate) fn model_facing_history(
         let (role, text) = match msg.role.as_str() {
             "user" | "gift_user" => ("user", model_facing_user_text(&msg)),
             "assistant" => {
-                // Spec §4.3: the leading sentence is the noise carrier. Strip
-                // it; a row with nothing left is dropped rather than injected
-                // as empty content, which some providers reject.
-                let stripped =
-                    crate::repetition::strip_leading_sentence(&model_facing_assistant_text(&msg));
-                if stripped.trim().is_empty() {
-                    continue;
+                let full = model_facing_assistant_text(&msg);
+                if !strip {
+                    ("assistant", full)
+                } else {
+                    // Spec §4.3: the leading sentence is the noise carrier.
+                    // Strip it; a row with nothing left is dropped rather
+                    // than injected as empty content, which some providers
+                    // reject.
+                    let stripped = crate::repetition::strip_leading_sentence(&full);
+                    if stripped.trim().is_empty() {
+                        continue;
+                    }
+                    ("assistant", stripped)
                 }
-                ("assistant", stripped)
             }
             _ => continue,
         };
@@ -882,12 +890,39 @@ pub(super) async fn build_reply_request(
         system_prompt.push_str(&crate::prompt::tips_reaction_context(*amount, tp));
     }
 
-    let injected_history = apply_echo_cancellation(
-        model_facing_history(history),
-        user_message_id,
-        state.config.chat_echo_cancellation_disabled,
-        session_id,
-    );
+    // Spec §4.6. Order is load-bearing: model_facing_history strips and drops,
+    // the ladder selects from what survived, and echo cancellation runs last so
+    // it keys on exactly the strings the provider receives.
+    let injected_history = if state.config.chat_noise_cancellation_disabled {
+        apply_echo_cancellation(
+            model_facing_history(history, false),
+            user_message_id,
+            state.config.chat_echo_cancellation_disabled,
+            session_id,
+        )
+    } else {
+        let filled = crate::history_window::filled_field_count(character_state.as_ref());
+        let extra = crate::history_window::window_extra(filled);
+        let faced = model_facing_history(history, true);
+        let before = faced.len();
+        let selected = crate::history_window::select_window(faced, user_message_id, extra);
+        if selected.len() < before {
+            tracing::info!(
+                insight_fields = filled,
+                extra,
+                before,
+                after = selected.len(),
+                session_id = %session_id,
+                "history window narrowed by character_insights fill"
+            );
+        }
+        apply_echo_cancellation(
+            selected,
+            user_message_id,
+            state.config.chat_echo_cancellation_disabled,
+            session_id,
+        )
+    };
     let injected_tags: Vec<String> = kept_traits.iter().map(|t| t.tag.clone()).collect();
     Ok((
         assemble_chat_request(
@@ -1792,7 +1827,7 @@ mod tests {
         let req = assemble_chat_request(
             resolved,
             "SYS".into(),
-            model_facing_history(vec![tip, plain, assistant]),
+            model_facing_history(vec![tip, plain, assistant], true),
             None,
         );
 
@@ -1848,7 +1883,7 @@ mod tests {
         let req = assemble_chat_request(
             resolved,
             "SYS".into(),
-            model_facing_history(vec![product_qa_user, product_qa_assistant, plain]),
+            model_facing_history(vec![product_qa_user, product_qa_assistant, plain], true),
             None,
         );
 
@@ -2033,7 +2068,7 @@ mod tests {
         b.role = "assistant".into();
         b.metadata = Some(serde_json::json!({ "image": { "caption": "厨房里的猫" } }));
 
-        let out = model_facing_history(vec![a, b]);
+        let out = model_facing_history(vec![a, b], true);
         assert_eq!(out.len(), 2);
         assert_ne!(
             out[0].text, out[1].text,
@@ -2054,7 +2089,7 @@ mod tests {
         tip.role = "gift_user".into();
         let plain = user_row("普通消息", None);
 
-        let out = model_facing_history(vec![qa, tip, plain]);
+        let out = model_facing_history(vec![qa, tip, plain], true);
         let texts: Vec<&str> = out.iter().map(|m| m.text.as_str()).collect();
         assert_eq!(texts, vec!["(打赏 $5)", "普通消息"]);
         assert!(out.iter().all(|m| m.role == "user"));
@@ -2108,7 +2143,7 @@ mod tests {
         let current_id = current.id;
 
         let kept = apply_echo_cancellation(
-            model_facing_history(vec![a, b, current]),
+            model_facing_history(vec![a, b, current], true),
             current_id,
             false,
             uuid::Uuid::new_v4(),
@@ -2145,7 +2180,7 @@ mod tests {
             chat_row("user", "在吗"),
             chat_row("assistant", "唔。我在呢，刚洗完澡。"),
         ];
-        let out = model_facing_history(rows);
+        let out = model_facing_history(rows, true);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].text, "在吗", "user rows are untouched");
         assert_eq!(out[1].text, "我在呢，刚洗完澡。");
@@ -2158,7 +2193,7 @@ mod tests {
             chat_row("assistant", "唔。"),
             chat_row("user", "怎么了"),
         ];
-        let out = model_facing_history(rows);
+        let out = model_facing_history(rows, true);
         let texts: Vec<&str> = out.iter().map(|m| m.text.as_str()).collect();
         assert_eq!(texts, vec!["在吗", "怎么了"]);
     }
@@ -2173,7 +2208,7 @@ mod tests {
             chat_row("assistant", "。。。"),
             chat_row("user", "hi"),
         ];
-        for m in model_facing_history(rows) {
+        for m in model_facing_history(rows, true) {
             assert!(
                 !m.text.trim().is_empty(),
                 "empty injected row: role={}",
@@ -2185,9 +2220,27 @@ mod tests {
     #[test]
     fn user_rows_are_never_stripped_even_when_single_sentence() {
         let rows = vec![chat_row("user", "在吗？")];
-        let out = model_facing_history(rows);
+        let out = model_facing_history(rows, true);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].text, "在吗？");
+    }
+
+    #[test]
+    fn strip_false_leaves_assistant_rows_whole() {
+        // The flag's actual rollback promise: CHAT_NOISE_CANCELLATION_DISABLED
+        // must restore assistant rows byte-identical to their model-facing
+        // text, leading sentence and all.
+        let rows = vec![
+            chat_row("user", "在吗"),
+            chat_row("assistant", "唔。我在呢，刚洗完澡。"),
+        ];
+        let out = model_facing_history(rows, false);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].text, "在吗");
+        assert_eq!(
+            out[1].text, "唔。我在呢，刚洗完澡。",
+            "strip=false must not remove the leading sentence"
+        );
     }
 
     // ─── fetch_world_context ────────────────────────────────────────────
@@ -2462,5 +2515,187 @@ mod tests {
         assert!(fetch_stories_context(&state, owner, instance, None)
             .await
             .is_none());
+    }
+
+    // ─── build_reply_request: history window ladder (spec §4.6) ─────────
+
+    fn ladder_test_persona(
+        instance_id: Uuid,
+        owner: Uuid,
+    ) -> eros_engine_core::persona::CompanionPersona {
+        use eros_engine_core::persona::{PersonaGenome, PersonaInstance};
+        eros_engine_core::persona::CompanionPersona {
+            instance_id,
+            genome: PersonaGenome {
+                id: Uuid::new_v4(),
+                name: "Mia".into(),
+                system_prompt: "You are Mia.".into(),
+                tip_personality: None,
+                art_metadata: serde_json::json!({}),
+            },
+            instance: PersonaInstance {
+                id: instance_id,
+                genome_id: Uuid::new_v4(),
+                owner_uid: owner,
+                status: "active".into(),
+            },
+        }
+    }
+
+    fn ladder_test_affinity(
+        session_id: Uuid,
+        user_id: Uuid,
+        instance_id: Uuid,
+    ) -> eros_engine_core::affinity::Affinity {
+        let now = chrono::Utc::now();
+        eros_engine_core::affinity::Affinity {
+            id: Uuid::new_v4(),
+            session_id,
+            user_id,
+            instance_id,
+            warmth: 0.4,
+            trust: 0.3,
+            intrigue: 0.2,
+            intimacy: 0.2,
+            patience: 0.2,
+            tension: 0.3,
+            warmth_grade: 2,
+            patience_grade: 2,
+            ghost_streak: 0,
+            last_ghost_at: None,
+            total_ghosts: 0,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// A fully-populated `character_insights` row narrows the injected window
+    /// to the current turn plus the previous exchange (spec §4.6: filled=10 ⇒
+    /// extra=0 ⇒ budget=2). Twelve rows are seeded — six strictly alternating
+    /// assistant/user exchanges — so the pre-ladder window (17-ish under the
+    /// old fixed-20 behaviour, here capped by the 12 actually seeded) is
+    /// provably wider than what survives selection.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_full_insight_row_thins_the_injected_window(pool: sqlx::PgPool) {
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, owner).await;
+        let session_id = make_session(&pool, owner, Some(instance_id)).await;
+
+        // Twelve rows, strictly alternating starting on "assistant" so the
+        // history ends on the "user" current turn: a0,u0,a1,u1,...,a5,u5.
+        // Each assistant row carries two sentences so the leading-sentence
+        // strip never empties it out.
+        let mut user_message_ids = Vec::with_capacity(6);
+        for i in 0..6i64 {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+                 VALUES ($1, 'assistant', $2, now() + make_interval(secs => $3::float8))",
+            )
+            .bind(session_id)
+            .bind(format!("唔。这是第{i}轮回复，够长不会被吃空。"))
+            .bind((2 * i) as f64)
+            .execute(&pool)
+            .await
+            .unwrap();
+            let uid = sqlx::query_scalar::<_, Uuid>(
+                "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+                 VALUES ($1, 'user', $2, now() + make_interval(secs => $3::float8)) \
+                 RETURNING id",
+            )
+            .bind(session_id)
+            .bind(format!("第{i}轮用户消息"))
+            .bind((2 * i + 1) as f64)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            user_message_ids.push(uid);
+        }
+        let user_message_id = *user_message_ids.last().unwrap();
+
+        // character_insights: all ten fields populated ⇒ filled_field_count=10
+        // ⇒ window_extra=0 ⇒ budget = PROTECTED_PRIOR (2).
+        eros_engine_store::character_insight::CharacterInsightRepo { pool: &pool }
+            .apply_extraction(
+                instance_id,
+                &serde_json::json!({
+                    "location": "公司",
+                    "occupation": "策展人",
+                    "current_situation": "连轴转了两周",
+                    "desires": "想去海边",
+                    "vulnerabilities": "怕被丢下",
+                    "habits": "凌晨才睡",
+                    "personal_values": "看重守约",
+                    "likes": ["下雨天"],
+                    "dislikes": ["被当小孩哄"],
+                    "relationships": ["妹妹在读高三"]
+                }),
+            )
+            .await
+            .unwrap();
+
+        let state = crate::routes::companion::test_state(pool.clone());
+        let plan = ActionPlan {
+            action_type: eros_engine_core::types::ActionType::ReplyText,
+            reply_style: eros_engine_core::types::ReplyStyle::Neutral,
+            affinity_deltas: Default::default(),
+            energy_cost: 0.0,
+            context_hints: vec![],
+            reply_tone: None,
+            image_caption: None,
+            image_ref: eros_engine_core::types::ImageRef::Face,
+            aspect_ratio: None,
+        };
+        let input = DecisionInput {
+            event: Event::UserMessage {
+                content: "第5轮用户消息".into(),
+                message_id: user_message_id,
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                // MemoryScope::None ⇒ no Voyage call: this test is about the
+                // history-window ladder, not memory recall.
+                memory_scope: MemoryScope::None,
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                quote: Default::default(),
+            },
+            affinity: ladder_test_affinity(session_id, owner, instance_id),
+            persona: ladder_test_persona(instance_id, owner),
+            signals: eros_engine_core::types::ConversationSignals {
+                message_count: 12,
+                hours_since_last_message: 0.1,
+                ghost_streak: 0,
+                hours_since_last_ghost: None,
+            },
+        };
+
+        let (req, _tags) = build_reply_request(
+            &state,
+            &input,
+            &plan,
+            session_id,
+            owner,
+            instance_id,
+            user_message_id,
+        )
+        .await
+        .expect("build_reply_request succeeds");
+
+        // system + 3: the current turn plus the previous exchange (its user
+        // message and the assistant's reply to it). Without the ladder this
+        // would carry all 12 seeded rows plus system.
+        assert_eq!(
+            req.messages.len(),
+            4,
+            "a fully-populated character_insights row must narrow the window \
+             to system + current turn + previous exchange: {:?}",
+            req.messages
+        );
+        assert_eq!(req.messages[0].role, "system");
+        assert_eq!(
+            req.messages.last().unwrap().content,
+            "第5轮用户消息",
+            "the current turn must be the newest injected message"
+        );
     }
 }
