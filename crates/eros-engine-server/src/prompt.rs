@@ -720,8 +720,9 @@ pub fn build_prompt(
     // own prompt is the drift it warned about. `desires` / `vulnerabilities`
     // overlap [mood] / [feelings] / [inner_state] / [emotional_context].
     //
-    // The header frames this as what has happened in the relationship, never
-    // as character definition: it must not compete with the genome.
+    // The header frames this as where the relationship currently stands —
+    // three of the four labels are present-tense state — never as character
+    // definition: it must not compete with the genome, and says so once.
     let character_section = match character_state {
         Some(cs) => {
             let mut lines: Vec<String> = Vec::new();
@@ -746,8 +747,8 @@ pub fn build_prompt(
                 String::new()
             } else {
                 format!(
-                    "\n\n[character_state]（这段关系里已经发生过的事，不是人设；\
-                     人设以上面为准，冲突时以上面为准）\n{}",
+                    "\n\n[character_state]（这段关系里目前的状况，不是人设；\
+                     与上面冲突时以上面为准）\n{}",
                     lines.join("\n")
                 )
             }
@@ -1490,7 +1491,16 @@ mod tests {
             .expect("block present");
         assert!(
             header.contains("这段关系"),
-            "header must frame it as relationship history: {header}"
+            "header must frame it as relationship-derived, not definitional: {header}"
+        );
+        assert!(
+            header.contains("不是人设") && header.contains("以上面为准"),
+            "header must still say the genome wins on conflict: {header}"
+        );
+        assert_eq!(
+            header.matches("以上面为准").count(),
+            1,
+            "the conflict rule is stated once, not twice: {header}"
         );
     }
 

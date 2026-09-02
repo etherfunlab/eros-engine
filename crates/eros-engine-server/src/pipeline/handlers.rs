@@ -117,8 +117,25 @@ pub(crate) fn effective_user_text(msg: &eros_engine_store::chat::ChatMessage) ->
 /// image in that turn. The marker is a possessive noun phrase, not a sentence
 /// about sending: a verb here reads as an example of the persona doing it, and
 /// models take it as one.
-pub(crate) fn model_facing_assistant_text(msg: &eros_engine_store::chat::ChatMessage) -> String {
-    let mut text = msg.content.clone();
+///
+/// `strip` applies the leading-sentence strip (spec §4.3) to the **prose**,
+/// before the marker is folded in. It must never run over the marker: the
+/// marker rarely carries a `SENTENCE_DELIMS` character, so stripping the folded
+/// string erases a caption-less photo row outright, and a caption containing
+/// `！` or `~` leaves a fragment like `夕阳下的海边]`. Ordering it this way
+/// makes a pure-image row (`content` empty) strip to nothing and then take the
+/// marker as its whole text — preserved intact, exactly what
+/// `model_config.rs`'s caption contract ("read back into the conversation
+/// history") promises. Callers rendering the persisted transcript pass `false`.
+pub(crate) fn model_facing_assistant_text(
+    msg: &eros_engine_store::chat::ChatMessage,
+    strip: bool,
+) -> String {
+    let mut text = if strip {
+        crate::repetition::strip_leading_sentence(&msg.content)
+    } else {
+        msg.content.clone()
+    };
     if let Some(img) = msg.metadata.as_ref().and_then(|md| md.get("image")) {
         let caption = img
             .get("caption")
@@ -232,11 +249,13 @@ pub(crate) fn recall_query_text(msg: &eros_engine_store::chat::ChatMessage) -> S
 /// gate is needed. Assistant rows feed `content` (their `pre_filter_content`
 /// is the pre-output-filter original and must never re-enter the prompt),
 /// then, when `strip` is true, have their leading sentence stripped (spec
-/// §4.3 — the noise carrier, e.g. `唔`/`啊`); a row with nothing left after
-/// stripping is omitted rather than injected as empty content, which some
-/// providers reject. User rows are never stripped. `strip = false` is the
-/// operator opt-out (`CHAT_NOISE_CANCELLATION_DISABLED`): assistant rows are
-/// injected whole.
+/// §4.3 — the noise carrier, e.g. `唔`/`啊`) by
+/// `model_facing_assistant_text`, which strips the prose only and folds any
+/// photo marker in afterwards; a row with nothing left after stripping — no
+/// prose AND no marker — is omitted rather than injected as empty content,
+/// which some providers reject. User rows are never stripped. `strip = false`
+/// is the operator opt-out (`CHAT_NOISE_CANCELLATION_DISABLED`): assistant
+/// rows are injected whole.
 ///
 /// Split out of `assemble_chat_request` so echo cancellation can key on the
 /// exact string the provider receives — no other layer can compute it.
@@ -252,20 +271,17 @@ pub(crate) fn model_facing_history(
         let (role, text) = match msg.role.as_str() {
             "user" | "gift_user" => ("user", model_facing_user_text(&msg)),
             "assistant" => {
-                let full = model_facing_assistant_text(&msg);
-                if !strip {
-                    ("assistant", full)
-                } else {
-                    // Spec §4.3: the leading sentence is the noise carrier.
-                    // Strip it; a row with nothing left is dropped rather
-                    // than injected as empty content, which some providers
-                    // reject.
-                    let stripped = crate::repetition::strip_leading_sentence(&full);
-                    if stripped.trim().is_empty() {
-                        continue;
-                    }
-                    ("assistant", stripped)
+                // Spec §4.3: the leading sentence is the noise carrier, and
+                // `model_facing_assistant_text` removes it from the prose
+                // before folding in the photo marker — so a photo row keeps
+                // its marker whole. A row with nothing left at all is dropped
+                // rather than injected as empty content, which some providers
+                // reject.
+                let text = model_facing_assistant_text(&msg, strip);
+                if strip && text.trim().is_empty() {
+                    continue;
                 }
+                ("assistant", text)
             }
             _ => continue,
         };
@@ -2030,7 +2046,7 @@ mod tests {
                 "caption": "在咖啡店笑着"
             }})),
         );
-        let out = model_facing_assistant_text(&row);
+        let out = model_facing_assistant_text(&row, false);
         assert!(out.contains("这是我的回复"));
         assert!(out.contains("[你的照片：在咖啡店笑着]"));
         assert!(
@@ -2046,14 +2062,14 @@ mod tests {
             "",
             Some(serde_json::json!({ "image": { "prompt": "a long english image prompt" } })),
         );
-        let out = model_facing_assistant_text(&row);
+        let out = model_facing_assistant_text(&row, false);
         assert_eq!(out, "[你的照片]");
     }
 
     #[test]
     fn assistant_row_without_image_metadata_unchanged() {
         let row = assistant_row("普通回复", None);
-        assert_eq!(model_facing_assistant_text(&row), "普通回复");
+        assert_eq!(model_facing_assistant_text(&row, false), "普通回复");
     }
 
     /// Even when `image` carries neither `prompt` nor `caption` (e.g. an older
@@ -2067,7 +2083,10 @@ mod tests {
             "普通回复",
             Some(serde_json::json!({ "image": { "url": "https://x/y.png" } })),
         );
-        assert_eq!(model_facing_assistant_text(&row), "普通回复\n\n[你的照片]");
+        assert_eq!(
+            model_facing_assistant_text(&row, false),
+            "普通回复\n\n[你的照片]"
+        );
     }
 
     #[test]
@@ -2285,6 +2304,68 @@ mod tests {
             1,
             "exactly the row that stripped to empty"
         );
+    }
+
+    // ─── the strip must never eat a photo marker (spec §4.3 + §9) ────────
+
+    /// Assistant row carrying a photo, with optional caption. `None` mirrors a
+    /// composer that produced no caption — the bare-marker shape.
+    fn photo_row(content: &str, caption: Option<&str>) -> eros_engine_store::chat::ChatMessage {
+        let image = match caption {
+            Some(c) => serde_json::json!({ "image": { "caption": c } }),
+            None => serde_json::json!({ "image": {} }),
+        };
+        assistant_row(content, Some(image))
+    }
+
+    #[test]
+    fn a_pure_image_row_keeps_its_whole_marker() {
+        // The character sent a photo and nothing else. `SENTENCE_DELIMS` has
+        // no member inside the marker, so stripping the folded string erased
+        // the row — and 68.7% of turns inject only three rows, of which this
+        // is one.
+        let out = model_facing_history(vec![photo_row("", Some("海边的黄昏"))], true);
+        assert_eq!(out.len(), 1, "the photo row must not be dropped: {out:?}");
+        assert_eq!(out[0].text, "[你的照片：海边的黄昏]");
+        assert_eq!(out[0].role, "assistant");
+    }
+
+    #[test]
+    fn a_pure_image_row_without_a_caption_keeps_the_bare_marker() {
+        let out = model_facing_history(vec![photo_row("", None)], true);
+        assert_eq!(out.len(), 1, "the photo row must not be dropped: {out:?}");
+        assert_eq!(out[0].text, "[你的照片]");
+    }
+
+    #[test]
+    fn a_caption_carrying_a_sentence_delimiter_does_not_fragment_the_marker() {
+        // Worse than the drop: stripping the folded string split inside the
+        // caption and injected `夕阳下的海边]` / `]` — malformed output
+        // demonstrated to the model in its own context window.
+        let rows = vec![
+            photo_row("", Some("好美啊！夕阳下的海边")),
+            photo_row("", Some("在沙滩上~")),
+        ];
+        let out = model_facing_history(rows, true);
+        assert_eq!(out.len(), 2, "neither photo row may be dropped: {out:?}");
+        assert_eq!(out[0].text, "[你的照片：好美啊！夕阳下的海边]");
+        assert_eq!(out[1].text, "[你的照片：在沙滩上~]");
+    }
+
+    #[test]
+    fn prose_before_a_marker_loses_only_its_first_sentence() {
+        let out = model_facing_history(vec![photo_row("唔。你看这个。", Some("海边"))], true);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, "你看这个。\n\n[你的照片：海边]");
+    }
+
+    #[test]
+    fn prose_that_strips_to_empty_still_leaves_the_photo() {
+        // One sentence of prose ⇒ the strip empties it. The row still survives
+        // because the photo IS the content.
+        let out = model_facing_history(vec![photo_row("给你看~", Some("海边"))], true);
+        assert_eq!(out.len(), 1, "the photo must survive: {out:?}");
+        assert_eq!(out[0].text, "[你的照片：海边]");
     }
 
     #[test]

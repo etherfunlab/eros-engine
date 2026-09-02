@@ -8327,7 +8327,7 @@ data: [DONE]\n\n";
             "the prompt must never reach the judge transcript: {transcript_line}"
         );
 
-        let model_text = crate::pipeline::handlers::model_facing_assistant_text(&row);
+        let model_text = crate::pipeline::handlers::model_facing_assistant_text(&row, false);
         assert!(
             model_text.contains("在天台看夕阳"),
             "chat history surfaces the caption: {model_text}"
