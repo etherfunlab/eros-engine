@@ -137,10 +137,11 @@ completed` tracing——落库是额外加的，不是取代那行日志。
 现在都会写这张表：`chat_companion`、`chat_voice`、`chat_product_qa`、
 `chat_input_filter`、`chat_output_filter`、`chat_vision`、
 `chat_image_prompt_compose`、`chat_image_edit_compose`、`pde_decision`、
-`affinity_evaluation`、`insight_extraction`、`insight_structuring`、
-`character_insight_extraction`、`character_insight_structuring`、
-`user_insight_extraction`、`user_insight_structuring`、`memory_extraction`、
-`world_director`、`world_stories_director`、`world_comment`、`world_reply`。
+`affinity_evaluation`、`affinity_summary`、`insight_extraction`、
+`insight_structuring`、`character_insight_extraction`、
+`character_insight_structuring`、`user_insight_extraction`、
+`user_insight_structuring`、`memory_extraction`、`world_director`、
+`world_stories_director`、`world_comment`、`world_reply`。
 
 **其中五个此前在数据库里完全没有留下任何痕迹**——`world_director`、
 `world_stories_director`、`world_comment`、`world_reply`、

@@ -494,6 +494,7 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
 | `chat_vision` | `pipeline::stream`，通过 `resolve_vision()`（视觉预处理阶段：在 reply prompt 前将 `image_url` 附件描述为 JSON；任务块缺失或 `filter_prompt` 为空白时关闭） | live（opt-in） |
 | `chat_product_qa` | `pipeline::stream`，通过 `resolve_product_qa()`（PDE `product_qa` 动作的出戏产品问答执行器；任务块缺失或 `filter_prompt` 为空白时关闭；还需要 LLM PDE 已启用） | live（opt-in） |
 | `affinity_evaluation` | `pipeline::post_process`（每轮好感度裁决——四个档位线轴加 warmth/patience 两个 1..3 绝对档，由引擎侧换算；每个 Reply 轮次后以 fire-and-forget 方式运行；**不接受 `filter_prompt`** —— 该 prompt 由引擎持有，设置该键会拒绝启动——**任何写法都算，包括显式留空**。与这里其它任务不同，空白在这里不等于"关闭"，请直接不写这个键。见 issue #210） | live |
+| `affinity_summary` | `pipeline::post_process::summarize_feeling`（改写 `companion_affinity.feeling_clause`——即 `[feelings]` 块的第一人称叙述——依据档位标签与近期判官理由；仅在好感度写入之后、"移动回合"上运行（任意判官档位有变化、端点档位偏离基线，或 ghost），且仅当本次请求确实注入了好感度轴；按当轮请求计费给当前用户，不是 sweeper。**不接受 `filter_prompt`**——该 prompt 由引擎持有，与 `affinity_evaluation` 同样处理，设置该键会拒绝启动。块缺失 ⇒ `feeling_clause` 保持 `NULL`，`[feelings]` 永不渲染） | live（opt-in） |
 | `character_insight_extraction` | `pipeline::post_process`（角色链 stage 1 —— 实验特性 —— 针对 AI **角色**的逐轮事实挖掘，是 `insight_extraction` 人类侧挖掘的镜像。持有 prompt，与 `insight_extraction` / `memory_extraction` 共用同一个必填-`filter_prompt` 闸门。这个块是整条链（两个 stage）的总开关——任务块缺失即关闭） | experimental（opt-in） |
 | `character_insight_structuring` | `pipeline::post_process`（角色链 stage 2 —— 实验特性 —— 把 stage 1 挖掘出的事实加上已有的 `character_insights` 行，转成类型化的十列对象。**仅参数，不接受 `filter_prompt`** —— 它的 prompt 写在 `prompt.rs` 里，必须与它要填的 `character_insights` 列保持同步，所以设置该键会拒绝启动，**任何写法都算，包括显式留空**——与 `affinity_evaluation` 同样处理。块缺失时 stage 2 会退回到 stage 1 的模型/预算，绝不退到全局默认） | experimental（opt-in） |
 | `user_insight_extraction` | `pipeline::post_process`（用户链 stage 1 —— 实验特性 —— 针对真人**用户**的逐轮事实挖掘，但按关系分开，而不是全局的 `insight_extraction`。持有 prompt，与 `insight_extraction` / `character_insight_extraction` / `memory_extraction` 共用同一个必填-`filter_prompt` 闸门。这个块是整条链的总开关——任务块缺失即关闭） | experimental（opt-in） |
@@ -510,7 +511,7 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
 只有当引擎确实在某处调用 `model_config.resolve("<name>", ...)` 时，`[tasks.<name>]` 条目才有意义。当前调用点如下：
 
 - `crates/eros-engine-server/src/pipeline/handlers.rs` → `chat_companion`、`chat_output_filter`
-- `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`、`insight_structuring`、`affinity_evaluation`、`character_insight_extraction`、`character_insight_structuring`、`user_insight_extraction`、`user_insight_structuring`
+- `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`、`insight_structuring`、`affinity_evaluation`、`affinity_summary`、`character_insight_extraction`、`character_insight_structuring`、`user_insight_extraction`、`user_insight_structuring`
 - `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision`，通过 `run_stream` 内的 `run_pde_decision`（仅当设置了 `filter_prompt`）；`chat_image_prompt_compose`，通过 `resolve_image_prompt_compose()`（出图 prompt 合成器，图片轮次必需，仅在图片轮次按需解析）；`chat_vision`，通过 `resolve_vision()`（视觉预处理阶段，opt-in）；`chat_product_qa`，通过 `resolve_product_qa()`（产品问答执行器，opt-in）；`chat_input_filter`，通过 `resolve_input_filter()`（输入改写，opt-in）；`memory_extraction`，通过 dreaming sweeper
 - `crates/eros-engine-server/src/routes/image_edit.rs` → `chat_image_edit_compose`，通过 `resolve_image_edit_compose()`（图片-EDIT 合成器，编辑端点每次请求都会解析；编辑块缺失时回退到 `[tasks.chat_image_prompt_compose]` 的模型链——详见下文）
 

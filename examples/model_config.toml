@@ -780,6 +780,23 @@ fallback = ["deepseek/deepseek-v4-flash", "google/gemini-3.1-flash-lite"]
 temperature = 0.3
 max_tokens = 400
 
+# Affinity feeling summarizer (spec 2026-09-03-affinity-feeling-clause-design.md).
+# Absent section = feature off: companion_affinity.feeling_clause stays NULL and
+# the [feelings] prompt block never renders. When present, runs after the
+# post-process affinity write on movement turns only (any judge grade ≥ 1, an
+# endpoint level ≠ 2, or a ghost) and rewrites the session's first-person
+# feeling clause from band labels + recent judge reasons.
+#
+# NOTE: this task takes NO filter_prompt. The summarizer's prompt is
+# engine-owned (first-person voice + reason hygiene are load-bearing — the
+# clause is re-injected into later system prompts), same policy as
+# affinity_evaluation; setting the key refuses to boot.
+[tasks.affinity_summary]
+model = "anthropic/claude-haiku-4.5"
+fallback = ["deepseek/deepseek-v4-flash", "google/gemini-3.1-flash-lite"]
+temperature = 0.6
+max_tokens = 200
+
 # World Memories director (experimental). Absent section = subsystem off.
 # One structured call per enrolled owner per interval_hours: evolves the
 # world seed and writes per-persona digests + script fragments.

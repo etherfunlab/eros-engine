@@ -147,10 +147,11 @@ in addition to that line, not instead of it.
 call now writes here: `chat_companion`, `chat_voice`, `chat_product_qa`,
 `chat_input_filter`, `chat_output_filter`, `chat_vision`,
 `chat_image_prompt_compose`, `chat_image_edit_compose`, `pde_decision`,
-`affinity_evaluation`, `insight_extraction`, `insight_structuring`,
-`character_insight_extraction`, `character_insight_structuring`,
-`user_insight_extraction`, `user_insight_structuring`, `memory_extraction`,
-`world_director`, `world_stories_director`, `world_comment`, `world_reply`.
+`affinity_evaluation`, `affinity_summary`, `insight_extraction`,
+`insight_structuring`, `character_insight_extraction`,
+`character_insight_structuring`, `user_insight_extraction`,
+`user_insight_structuring`, `memory_extraction`, `world_director`,
+`world_stories_director`, `world_comment`, `world_reply`.
 
 **Five of those previously wrote nothing to the database at all** —
 `world_director`, `world_stories_director`, `world_comment`, `world_reply`,
