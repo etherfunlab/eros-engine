@@ -23,6 +23,11 @@ pub struct Affinity {
     pub ghost_streak: i32,
     pub last_ghost_at: Option<DateTime<Utc>>,
     pub total_ghosts: i32,
+    /// LLM-written [feelings] narrative (spec 2026-09-03). One clause per
+    /// session, rewritten by the affinity_summary task on movement turns;
+    /// `None` = never summarized ⇒ the prompt block is omitted.
+    pub feeling_clause: Option<String>,
+    pub feeling_clause_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -722,6 +727,8 @@ mod tests {
             ghost_streak: 0,
             last_ghost_at: None,
             total_ghosts: 0,
+            feeling_clause: None,
+            feeling_clause_at: None,
             created_at: now,
             updated_at: now,
         }

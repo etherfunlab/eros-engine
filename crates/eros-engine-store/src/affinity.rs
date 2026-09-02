@@ -33,6 +33,9 @@ pub struct AffinityRow {
     pub ghost_streak: i32,
     pub last_ghost_at: Option<DateTime<Utc>>,
     pub total_ghosts: i32,
+    /// LLM-written [feelings] clause (migration 0062). NULL = never summarized.
+    pub feeling_clause: Option<String>,
+    pub feeling_clause_at: Option<DateTime<Utc>>,
     // `bond_tier` / `chem_tier` (migration 0049) are deliberately absent: this
     // struct is populated by `SELECT *`, and sqlx's derived FromRow ignores
     // columns it has no field for. Engine code always holds the score and
@@ -64,6 +67,8 @@ impl AffinityRow {
             ghost_streak: self.ghost_streak,
             last_ghost_at: self.last_ghost_at,
             total_ghosts: self.total_ghosts,
+            feeling_clause: self.feeling_clause,
+            feeling_clause_at: self.feeling_clause_at,
             created_at: self.created_at,
             updated_at: self.updated_at,
         }
@@ -359,6 +364,56 @@ impl<'a> AffinityRepo<'a> {
         )
         .bind(session_id)
         .bind(before_message_id)
+        .bind(limit)
+        .fetch_all(self.pool)
+        .await?;
+        Ok(rows.into_iter().filter_map(|(r,)| r).collect())
+    }
+
+    /// Overwrite the session's feeling clause (spec 2026-09-03 §3). One
+    /// authoritative clause per session; the summarizer calls this after a
+    /// successful parse, so a failed run leaves the old clause standing.
+    /// 0 rows updated (session archived mid-flight) is benign — Ok(()).
+    pub async fn set_feeling_clause(
+        &self,
+        session_id: Uuid,
+        clause: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE engine.companion_affinity \
+             SET feeling_clause = $2, feeling_clause_at = now() \
+             WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .bind(clause)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Most-recent `affinity_reason` strings (newest-first) for the feeling
+    /// summarizer. Same filtering as `recent_emotional_reasons` but WITHOUT
+    /// the before-message cutoff: the summarizer runs post-persist and wants
+    /// the current turn's reason — the movement that triggered the rewrite —
+    /// included. Session-scoped via the same affinity join (session_id is
+    /// UNIQUE on companion_affinity — no cross-session leakage).
+    pub async fn recent_reasons(
+        &self,
+        session_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        let rows: Vec<(Option<String>,)> = sqlx::query_as(
+            "SELECT e.context->>'affinity_reason' \
+             FROM engine.companion_affinity_events e \
+             JOIN engine.companion_affinity a ON a.id = e.affinity_id \
+             WHERE a.session_id = $1 \
+               AND e.event_type IN ('message', 'gift') \
+               AND e.context->>'affinity_reason' IS NOT NULL \
+               AND length(trim(e.context->>'affinity_reason')) > 0 \
+             ORDER BY e.created_at DESC, e.id DESC \
+             LIMIT $2",
+        )
+        .bind(session_id)
         .bind(limit)
         .fetch_all(self.pool)
         .await?;
@@ -2622,5 +2677,107 @@ mod tests {
         .unwrap();
         assert_eq!(n, 1, "event row must survive the message delete");
         assert_eq!(newest_event_user_message_id(&pool, session_id).await, None);
+    }
+
+    /// persist_rule with a caller-chosen context payload, for reason-history
+    /// tests. Same rule-only shape as `persist_rule`.
+    async fn persist_with_context(
+        repo: &AffinityRepo<'_>,
+        a: &mut Affinity,
+        context: serde_json::Value,
+    ) {
+        repo.persist_with_event(
+            a,
+            &AxisGrades::default(),
+            &AffinityDeltas::default(),
+            1.0,
+            &AffinityTuning::default(),
+            "message",
+            context,
+            None,
+            EndpointLevelReads::default(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn feeling_clause_roundtrip(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = make_session(&pool, user_id, instance_id).await;
+
+        let a = repo
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+        assert_eq!(a.feeling_clause, None);
+        assert_eq!(a.feeling_clause_at, None);
+
+        repo.set_feeling_clause(session_id, "他最近有点让我心软。")
+            .await
+            .unwrap();
+        let b = repo.load(session_id).await.unwrap().unwrap();
+        assert_eq!(b.feeling_clause.as_deref(), Some("他最近有点让我心软。"));
+        assert!(b.feeling_clause_at.is_some());
+
+        // Overwrite wins — one authoritative clause per session.
+        repo.set_feeling_clause(session_id, "现在只觉得他烦。")
+            .await
+            .unwrap();
+        let c = repo.load(session_id).await.unwrap().unwrap();
+        assert_eq!(c.feeling_clause.as_deref(), Some("现在只觉得他烦。"));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn recent_reasons_newest_first_skips_reasonless(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = make_session(&pool, user_id, instance_id).await;
+        let mut a = repo
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+
+        persist_with_context(
+            &repo,
+            &mut a,
+            serde_json::json!({"affinity_reason": "第一条"}),
+        )
+        .await;
+        // Reason-less event (skip-reason-only row) must be passed over.
+        persist_with_context(
+            &repo,
+            &mut a,
+            serde_json::json!({"eval_skip_reason": "short_user_msg"}),
+        )
+        .await;
+        persist_with_context(
+            &repo,
+            &mut a,
+            serde_json::json!({"affinity_reason": "第二条"}),
+        )
+        .await;
+
+        // Deterministic ordering: created_at ties are possible under same-now();
+        // the query orders by (created_at DESC, id DESC), so spread them out.
+        sqlx::query(
+            "UPDATE engine.companion_affinity_events e SET created_at = created_at - interval '1 minute' \
+             WHERE e.context->>'affinity_reason' = '第一条'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let rs = repo.recent_reasons(session_id, 5).await.unwrap();
+        assert_eq!(rs, vec!["第二条".to_string(), "第一条".to_string()]);
+
+        let capped = repo.recent_reasons(session_id, 1).await.unwrap();
+        assert_eq!(capped, vec!["第二条".to_string()]);
     }
 }

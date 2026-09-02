@@ -116,6 +116,8 @@ mod tests {
             ghost_streak: 0,
             last_ghost_at: None,
             total_ghosts: 0,
+            feeling_clause: None,
+            feeling_clause_at: None,
             created_at: now,
             updated_at: now,
         }
