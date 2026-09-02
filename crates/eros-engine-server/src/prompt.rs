@@ -534,6 +534,10 @@ pub fn build_prompt(
     // The line this turn quotes (caller's `reply_to_message_id`, resolved).
     // `None` ⇒ the `[quote]` block is omitted. History is unaffected either way.
     quote: Option<&QuotedMessage>,
+    // The character's relationship-scoped state (spec §4.5). `None` or a row
+    // with none of the four injected fields ⇒ the [character_state] block is
+    // omitted and the prompt is byte-identical to the pre-change layout.
+    character_state: Option<&eros_engine_store::character_insight::CharacterInsightsRow>,
 ) -> String {
     let name = persona.genome.name.as_str();
     let age = meta_i32(persona, "age")
@@ -707,6 +711,50 @@ pub fn build_prompt(
         _ => String::new(),
     };
 
+    // Volatile (per-turn) character state, read from `character_insights`.
+    //
+    // ONLY these four fields. `habits` / `personal_values` are facets of who
+    // she is, whose source of truth is `persona_genomes` — migration 0047
+    // excluded appearance / background / personality_traits for exactly that
+    // reason, and injecting a paraphrase of the genome back into the genome's
+    // own prompt is the drift it warned about. `desires` / `vulnerabilities`
+    // overlap [mood] / [feelings] / [inner_state] / [emotional_context].
+    //
+    // The header frames this as what has happened in the relationship, never
+    // as character definition: it must not compete with the genome.
+    let character_section = match character_state {
+        Some(cs) => {
+            let mut lines: Vec<String> = Vec::new();
+            let mut put = |label: &str, v: Option<&str>| {
+                if let Some(s) = v.map(str::trim).filter(|s| !s.is_empty()) {
+                    lines.push(format!("- {label}：{s}"));
+                }
+            };
+            put("现在的状况", cs.current_situation.as_deref());
+            put("在做的工作", cs.occupation.as_deref());
+            put("人在哪", cs.location.as_deref());
+            let rel: Vec<&str> = cs
+                .relationships
+                .iter()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !rel.is_empty() {
+                lines.push(format!("- 提过的人：{}", rel.join("、")));
+            }
+            if lines.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\n\n[character_state]（这段关系里已经发生过的事，不是人设；\
+                     人设以上面为准，冲突时以上面为准）\n{}",
+                    lines.join("\n")
+                )
+            }
+        }
+        None => String::new(),
+    };
+
     // Volatile (per-turn) quote block: the user tapped a specific line and is
     // replying to THAT, which the tail window alone cannot express — the quoted
     // line may be days back, or buried under unrelated turns. Renders the line
@@ -757,7 +805,7 @@ pub fn build_prompt(
          \n\
          [user_profile]\n{profile_str}\n\
          \n\
-         [shared_memories]\n{rel_str}{world_section}{stories_section}\
+         [shared_memories]\n{rel_str}{world_section}{stories_section}{character_section}\
          {attitude}{state}{hints_section}{tone_section}{emotional_section}{quote_section}\n\
          \n\
          [now]\n{tc}\n\
@@ -1100,6 +1148,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(
             !p.contains("[additional_guidance]"),
@@ -1138,6 +1187,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(
             p.contains("[additional_guidance]"),
@@ -1171,6 +1221,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let topics = p.find("[topics]").expect("topics");
         let traits_i = p.find("[additional_guidance]").expect("traits");
@@ -1194,6 +1245,7 @@ mod tests {
             &[],
             AffinityScope::default(),
             &[],
+            None,
             None,
             None,
             None,
@@ -1226,6 +1278,7 @@ mod tests {
                 &[],
                 AffinityScope::default(),
                 &[],
+                None,
                 None,
                 None,
                 None,
@@ -1263,6 +1316,7 @@ mod tests {
             None,
             None,
             Some(&mine),
+            None,
         );
         assert!(p.contains("[quote]"), "section present: {p}");
         assert!(
@@ -1290,6 +1344,7 @@ mod tests {
             None,
             None,
             Some(&theirs),
+            None,
         );
         assert!(
             p.contains("用户：我上次说的那个地方"),
@@ -1313,8 +1368,113 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(!p.contains("[quote]"), "no quote ⇒ no section: {p}");
+    }
+
+    fn character_row() -> eros_engine_store::character_insight::CharacterInsightsRow {
+        eros_engine_store::character_insight::CharacterInsightsRow {
+            instance_id: Uuid::new_v4(),
+            location: None,
+            occupation: None,
+            current_situation: None,
+            desires: None,
+            vulnerabilities: None,
+            habits: None,
+            personal_values: None,
+            likes: vec![],
+            dislikes: vec![],
+            relationships: vec![],
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn build_prompt_with_character_state(
+        cs: Option<&eros_engine_store::character_insight::CharacterInsightsRow>,
+    ) -> String {
+        build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            ReplyStyle::Neutral,
+            &[],
+            None,
+            &[],
+            AffinityScope::default(),
+            &[],
+            None,
+            None,
+            None,
+            cs,
+        )
+    }
+
+    #[test]
+    fn character_state_block_renders_only_the_four_injected_fields() {
+        let mut row = character_row();
+        row.current_situation = Some("刚换了工作，还在适应".into());
+        row.occupation = Some("咖啡店店长".into());
+        row.location = Some("台北".into());
+        row.relationships = vec!["妹妹 小雨".into()];
+        // Present in the row, deliberately never injected:
+        row.habits = Some("睡前看书".into());
+        row.personal_values = Some("诚实".into());
+        row.desires = Some("想去旅行".into());
+        row.vulnerabilities = Some("怕被抛下".into());
+        row.likes = vec!["草莓".into()];
+        row.dislikes = vec!["吵闹".into()];
+
+        let p = build_prompt_with_character_state(Some(&row));
+        assert!(p.contains("[character_state]"));
+        assert!(p.contains("刚换了工作，还在适应"));
+        assert!(p.contains("咖啡店店长"));
+        assert!(p.contains("台北"));
+        assert!(p.contains("妹妹 小雨"));
+        for leaked in ["睡前看书", "诚实", "想去旅行", "怕被抛下", "草莓", "吵闹"]
+        {
+            assert!(!p.contains(leaked), "field must not be injected: {leaked}");
+        }
+    }
+
+    #[test]
+    fn character_state_block_is_omitted_when_no_row() {
+        let p = build_prompt_with_character_state(None);
+        assert!(!p.contains("[character_state]"));
+    }
+
+    #[test]
+    fn character_state_block_is_omitted_when_all_four_are_empty() {
+        let mut row = character_row();
+        row.desires = Some("想去旅行".into()); // populated, but not injected
+        let p = build_prompt_with_character_state(Some(&row));
+        assert!(!p.contains("[character_state]"));
+    }
+
+    #[test]
+    fn character_state_renders_the_subset_that_is_present() {
+        let mut row = character_row();
+        row.current_situation = Some("在赶一个案子".into());
+        let p = build_prompt_with_character_state(Some(&row));
+        assert!(p.contains("[character_state]"));
+        assert!(p.contains("在赶一个案子"));
+    }
+
+    #[test]
+    fn character_state_is_not_labelled_as_character_definition() {
+        // Spec §4.5: the block must not compete with the genome for authority.
+        let mut row = character_row();
+        row.location = Some("台北".into());
+        let p = build_prompt_with_character_state(Some(&row));
+        let header = p
+            .lines()
+            .find(|l| l.starts_with("[character_state]"))
+            .expect("block present");
+        assert!(
+            header.contains("这段关系"),
+            "header must frame it as relationship history: {header}"
+        );
     }
 
     #[test]
@@ -1340,6 +1500,8 @@ mod tests {
 
     #[test]
     fn build_prompt_full_order_and_cache_break() {
+        let mut row = character_row();
+        row.location = Some("台北".into());
         let s = build_prompt(
             &fixture_persona(),
             &[],
@@ -1354,6 +1516,7 @@ mod tests {
             None,
             None,
             None,
+            Some(&row),
         );
         let pos = |h: &str| s.find(h).unwrap_or_else(|| panic!("missing {h} in:\n{s}"));
         let order = [
@@ -1365,6 +1528,7 @@ mod tests {
             "[turn_style]",
             "[user_profile]",
             "[shared_memories]",
+            "[character_state]",
             "[emotional_context]",
             "[now]",
             "[iron_rules",
@@ -1403,6 +1567,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         // head, then the constant guard, then identity.
         assert!(s.starts_with("AUTHORED HEAD\n\n"), "{s}");
@@ -1435,6 +1600,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         // No head → starts with the guard, which still precedes identity.
         assert!(
@@ -1461,6 +1627,7 @@ mod tests {
             &[],
             AffinityScope::full(),
             &[],
+            None,
             None,
             None,
             None,
@@ -1496,6 +1663,7 @@ mod tests {
             &[],
             AffinityScope::full(),
             &[],
+            None,
             None,
             None,
             None,
@@ -1541,6 +1709,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(s.contains("你是 Aria，男性，24 岁，INFP 性格。"), "{s}");
         assert!(s.contains("⑦ 你是男性，严格遵守自己的性别"), "{s}");
@@ -1561,6 +1730,7 @@ mod tests {
             &[],
             AffinityScope::full(),
             &[],
+            None,
             None,
             None,
             None,
@@ -1592,6 +1762,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(s.contains("你是 Aria，24 岁，INFP 性格。"), "{s}");
         assert!(!s.contains("⑧"), "no gender → no ⑧: {s}");
@@ -1612,6 +1783,7 @@ mod tests {
             &[],
             AffinityScope::full(),
             &[],
+            None,
             None,
             None,
             None,
@@ -1643,6 +1815,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(s.contains("你所在时区：Asia/Tokyo。"), "{s}");
     }
@@ -1660,6 +1833,7 @@ mod tests {
             &[],
             AffinityScope::full(),
             &[],
+            None,
             None,
             None,
             None,
@@ -1683,6 +1857,7 @@ mod tests {
             &[],
             AffinityScope::full(),
             &[],
+            None,
             None,
             None,
             None,
@@ -1716,6 +1891,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let groups = vec![("基础画像".to_string(), vec!["住在上海".to_string()])];
         let b = build_prompt(
@@ -1729,6 +1905,7 @@ mod tests {
             &[],
             AffinityScope::full(),
             &["最近聊得不错".to_string()],
+            None,
             None,
             None,
             None,
@@ -1768,6 +1945,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let b = build_prompt(
             &p,
@@ -1780,6 +1958,7 @@ mod tests {
             &t2,
             AffinityScope::full(),
             &[],
+            None,
             None,
             None,
             None,
@@ -1811,6 +1990,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(!s.contains("[avoid_repetition]"), "{s}");
     }
@@ -1828,6 +2008,7 @@ mod tests {
             &[],
             AffinityScope::full(),
             &[],
+            None,
             None,
             None,
             None,
@@ -1853,6 +2034,7 @@ mod tests {
             AffinityScope::default(),
             &[],
             Some(&world),
+            None,
             None,
             None,
         );
@@ -1881,6 +2063,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(!without.contains("[world_memories]"));
         // Empty context must also omit the block AND be byte-identical.
@@ -1897,6 +2080,7 @@ mod tests {
             AffinityScope::default(),
             &[],
             Some(&empty),
+            None,
             None,
             None,
         );
@@ -1923,6 +2107,7 @@ mod tests {
             None,
             Some(&stories),
             None,
+            None,
         );
         let at = p.find("[world_stories]").expect("block present");
         assert!(p[at..].contains("开店倒计时一周"));
@@ -1948,6 +2133,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(!without.contains("[world_stories]"));
         let with_empty = build_prompt(
@@ -1963,6 +2149,7 @@ mod tests {
             &[],
             None,
             Some(&StoriesContext::default()),
+            None,
             None,
         );
         assert_eq!(without, with_empty, "empty stories ⇒ byte-identical prompt");
@@ -2264,6 +2451,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(p.contains("warmth=") && p.contains("intimacy=") && p.contains("tension="));
         assert!(!p.contains("trust=") && !p.contains("intrigue=") && !p.contains("patience="));
@@ -2287,6 +2475,7 @@ mod tests {
             &[],
             AffinityScope::none(),
             &[],
+            None,
             None,
             None,
             None,
@@ -2358,6 +2547,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         // What survives of the old ⑨: the half that governs what the reply
         // engages with. Its other half ("别开口就自述动作或凝视") was an opener
@@ -2420,6 +2610,7 @@ mod tests {
             &[],
             AffinityScope::full(),
             &[],
+            None,
             None,
             None,
             None,

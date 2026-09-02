@@ -4,9 +4,14 @@
 //! extractor; read by the audit path, the profile route, and — via
 //! `existing_as_extraction_json` — the extractor's own structuring stage.
 //!
-//! Deliberately NEVER injected into the character's chat prompt (nor voice,
-//! PDE, or the world system): feeding her own recorded behaviour back into
-//! her next turn is an echo loop.
+//! Four fields — `current_situation`, `occupation`, `location`,
+//! `relationships` — are injected into the text chat prompt as
+//! `[character_state]` (spec 2026-09-02-echo-cancellation-plus §4.5). The rest
+//! are not, and `appearance` / `background` / `personality_traits` are not even
+//! columns (migration 0047): their source of truth is
+//! `persona_genomes.system_prompt`, and an extractor that only sees turn text
+//! can produce nothing but paraphrase-with-embellishment. Voice, PDE and the
+//! world system still inject none of it.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

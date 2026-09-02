@@ -839,6 +839,21 @@ pub(super) async fn build_reply_request(
     let stories =
         fetch_stories_context(state, user_id, instance_id, query_embedding.as_deref()).await;
 
+    // Spec §4.5 / §4.6: one PK read. Non-fatal — a DB hiccup omits the block
+    // and falls back to the widest window, which is the safe direction.
+    let character_state =
+        eros_engine_store::character_insight::CharacterInsightRepo { pool: &state.pool }
+            .load(instance_id)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    error = %e,
+                    instance_id = %instance_id,
+                    "character_insights load failed; [character_state] omitted"
+                );
+                None
+            });
+
     let mut system_prompt = build_prompt(
         &input.persona,
         &profile_groups,
@@ -853,6 +868,7 @@ pub(super) async fn build_reply_request(
         world.as_ref(),
         stories.as_ref(),
         quote,
+        character_state.as_ref(),
     );
 
     if let Event::UserMessage {
