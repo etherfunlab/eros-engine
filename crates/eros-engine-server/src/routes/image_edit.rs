@@ -708,29 +708,30 @@ async fn edit_image(
     let marker_metadata = serde_json::json!({ "image": image_marker });
 
     // `reply_with_text` present + `persist_instruction` ⇒ the edit is a full
-    // chat turn: the instruction row lands first (it is the chat model's
-    // driving row), the dice decide the text half, and the whole post-turn
+    // chat turn: the dice decide the text half, and the whole post-turn
     // pipeline runs afterward. `text_half` is `Some` exactly in this mode.
+    // Only a ROLLED text half takes the two-step persistence path — the
+    // instruction row must land first to drive the chat prompt, and the text
+    // call between the two inserts keeps their `sent_at` apart. A turn with
+    // no text call stays on the atomic insert, whose explicit +1µs nudge
+    // already owns that ordering.
     let full_turn = req.persist_instruction && req.reply_with_text.is_some();
-    let (instruction_message_id, text_half) = if full_turn {
+    // The dice stand in for the PDE: p=0 never rolls, p=1 always does.
+    let rolled_text = full_turn && rand::random::<f64>() < req.reply_with_text.unwrap_or(0.0);
+    let (instruction_message_id, text_half) = if rolled_text {
         let umid = chat_repo
             .insert_instruction_row(session_id, &instruction, message_id)
             .await?;
-        // The dice stand in for the PDE: p=0 never rolls, p=1 always does.
-        let text = if rand::random::<f64>() < req.reply_with_text.unwrap_or(0.0) {
-            generate_reply_text(
-                &state,
-                &persona,
-                session_id,
-                user_id,
-                instance_id,
-                umid,
-                &instruction,
-            )
-            .await
-        } else {
-            TextOutcome::default()
-        };
+        let text = generate_reply_text(
+            &state,
+            &persona,
+            session_id,
+            user_id,
+            instance_id,
+            umid,
+            &instruction,
+        )
+        .await;
         let insert = AssistantInsert {
             id: new_id,
             content: text.reply.clone().unwrap_or_default(),
@@ -773,7 +774,9 @@ async fn edit_image(
                         .insert_instruction_turn(session_id, &instruction, message_id, &insert)
                         .await?,
                 ),
-                None,
+                // A full turn whose dice missed still runs the pipeline —
+                // a text-less outcome, exactly like a failed text half.
+                full_turn.then(TextOutcome::default),
             ),
         }
     };
