@@ -1405,7 +1405,17 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
 
         // Best-effort negative: give a wrongly spawned task time to land.
+        // A wrongly spawned judge must hit the mock BEFORE it can write, so
+        // checking both narrows the false-pass window to "spawned but never
+        // even issued its HTTP call within the sleep".
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let judged = mock
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| String::from_utf8_lossy(&r.body).contains("当前档位"));
+        assert!(!judged, "no affinity judge call may be made by default");
         let n: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM engine.companion_affinity WHERE session_id = $1",
         )
