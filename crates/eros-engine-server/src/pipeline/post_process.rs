@@ -114,7 +114,6 @@ pub async fn run(
         Event::UserMessage { affinity_scope, .. } => *affinity_scope,
         _ => eros_engine_core::scope::AffinityScope::default(),
     };
-    let scope_has_axes = affinity_scope.active_count() > 0;
     let client_id = client_id_from_event(&event);
 
     let fut_insight = async {
@@ -160,107 +159,20 @@ pub async fn run(
             plan.image_caption.as_deref(),
         );
 
-        // Semantic eval gate: Reply turns only, with a non-trivial user message
-        // and a non-empty produced assistant message (or image_caption proxy for
-        // reply_image). Other actions (Proactive / Ghost) keep rule-only deltas
-        // in v1. `pre_skip == None` ⇒ the gate passes and an eval call is
-        // attempted; otherwise it carries the reason the trio will be NULL
-        // (stamped into `context`).
-        let pre_skip = eval_skip_reason(
-            plan.action_type,
-            user_msg.chars().count(),
-            eval_text.trim().is_empty(),
-        );
-
-        let (persona_name, (grades, levels, reason, affinity_gen_id, skip_reason, eval_failures)) =
-            if pre_skip.is_none() {
-                let persona_repo = PersonaRepo { pool: &state.pool };
-                let affinity_repo = AffinityRepo { pool: &state.pool };
-                let persona_name = match persona_repo.load_companion(instance_id).await {
-                    Ok(Some(p)) => p.genome.name,
-                    _ => String::new(),
-                };
-                // Snapshot the current vector for prompt context only; the
-                // authoritative value is re-read under lock in persist_with_event.
-                let outcome = match affinity_repo.load(session_id).await {
-                    Ok(Some(current)) if !persona_name.is_empty() => {
-                        evaluate_affinity(
-                            &state,
-                            session_id,
-                            &persona_name,
-                            &current,
-                            &user_msg,
-                            &eval_text,
-                            client_id.as_deref(),
-                        )
-                        .await
-                    }
-                    _ => (
-                        eros_engine_core::affinity::AxisGrades::default(),
-                        eros_engine_core::affinity::EndpointLevelReads::default(),
-                        String::new(),
-                        None,
-                        Some("no_persona_or_affinity"),
-                        Vec::new(),
-                    ),
-                };
-                (persona_name, outcome)
-            } else {
-                (
-                    String::new(),
-                    (
-                        eros_engine_core::affinity::AxisGrades::default(),
-                        eros_engine_core::affinity::EndpointLevelReads::default(),
-                        String::new(),
-                        None,
-                        pre_skip,
-                        Vec::new(),
-                    ),
-                )
-            };
-
-        // Grades, rule deltas and endpoint levels travel separately into the
-        // store, which runs the 4.0 pipeline (convert → decay → penalty →
-        // gate, then the endpoint derivation) under the row lock so the tier
-        // lookups always read committed state. On a skipped/failed eval the
-        // levels are `None` and the stored levels hold.
-        let rule_deltas = plan.affinity_deltas.clone();
-        let context = build_affinity_context(&reason, skip_reason);
-
-        persist_affinity(
+        run_affinity_turn(
             &state,
             session_id,
             user_id,
             instance_id,
             plan.action_type,
-            grades,
-            rule_deltas,
-            context,
-            affinity_gen_id,
-            levels,
-            &eval_failures,
+            &user_msg,
+            &eval_text,
+            plan.affinity_deltas.clone(),
+            affinity_scope,
             user_message_id,
+            client_id.as_deref(),
         )
         .await;
-
-        // Feeling-clause summarizer (spec 2026-09-03): movement turns only,
-        // gated on the [tasks.affinity_summary] section being present at
-        // all (absent = feature off, clause stays NULL) and on the request
-        // actually injecting affinity (zero-axis scope ⇒ nothing would
-        // render the clause).
-        if movement_turn(&grades, &levels)
-            && scope_has_axes
-            && state.model_config.tasks.contains_key(SUMMARY_TASK)
-        {
-            summarize_feeling(
-                &state,
-                session_id,
-                &persona_name,
-                affinity_scope,
-                client_id.as_deref(),
-            )
-            .await;
-        }
     };
 
     let fut_character_insight = async {
@@ -307,6 +219,120 @@ pub async fn run(
 }
 
 // ─── Affinity persistence ──────────────────────────────────────────
+
+/// One turn's whole affinity pass: eval gate, judge call, persist, and — on
+/// movement turns whose scope actually injects affinity — the feeling-clause
+/// rewrite. Shared by the chat pipeline's `run` above and the image-edit
+/// endpoint's opt-in `evaluate_affinity`; the caller owns building
+/// `eval_text` (see `affinity_eval_text`) and choosing the scope.
+#[allow(clippy::too_many_arguments)] // each arg is a distinct per-turn concern
+pub(crate) async fn run_affinity_turn(
+    state: &AppState,
+    session_id: Uuid,
+    user_id: Uuid,
+    instance_id: Uuid,
+    action: ActionType,
+    user_msg: &str,
+    eval_text: &str,
+    rule_deltas: eros_engine_core::affinity::AffinityDeltas,
+    affinity_scope: eros_engine_core::scope::AffinityScope,
+    user_message_id: Option<Uuid>,
+    client_id: Option<&str>,
+) {
+    // Semantic eval gate: Reply turns only, with a non-trivial user message
+    // and a non-empty produced assistant message (or image_caption proxy for
+    // reply_image). Other actions (Proactive / Ghost) keep rule-only deltas
+    // in v1. `pre_skip == None` ⇒ the gate passes and an eval call is
+    // attempted; otherwise it carries the reason the trio will be NULL
+    // (stamped into `context`).
+    let pre_skip = eval_skip_reason(
+        action,
+        user_msg.chars().count(),
+        eval_text.trim().is_empty(),
+    );
+
+    let (persona_name, (grades, levels, reason, affinity_gen_id, skip_reason, eval_failures)) =
+        if pre_skip.is_none() {
+            let persona_repo = PersonaRepo { pool: &state.pool };
+            let affinity_repo = AffinityRepo { pool: &state.pool };
+            let persona_name = match persona_repo.load_companion(instance_id).await {
+                Ok(Some(p)) => p.genome.name,
+                _ => String::new(),
+            };
+            // Snapshot the current vector for prompt context only; the
+            // authoritative value is re-read under lock in persist_with_event.
+            let outcome = match affinity_repo.load(session_id).await {
+                Ok(Some(current)) if !persona_name.is_empty() => {
+                    evaluate_affinity(
+                        state,
+                        session_id,
+                        &persona_name,
+                        &current,
+                        user_msg,
+                        eval_text,
+                        client_id,
+                    )
+                    .await
+                }
+                _ => (
+                    eros_engine_core::affinity::AxisGrades::default(),
+                    eros_engine_core::affinity::EndpointLevelReads::default(),
+                    String::new(),
+                    None,
+                    Some("no_persona_or_affinity"),
+                    Vec::new(),
+                ),
+            };
+            (persona_name, outcome)
+        } else {
+            (
+                String::new(),
+                (
+                    eros_engine_core::affinity::AxisGrades::default(),
+                    eros_engine_core::affinity::EndpointLevelReads::default(),
+                    String::new(),
+                    None,
+                    pre_skip,
+                    Vec::new(),
+                ),
+            )
+        };
+
+    // Grades, rule deltas and endpoint levels travel separately into the
+    // store, which runs the 4.0 pipeline (convert → decay → penalty →
+    // gate, then the endpoint derivation) under the row lock so the tier
+    // lookups always read committed state. On a skipped/failed eval the
+    // levels are `None` and the stored levels hold.
+    let context = build_affinity_context(&reason, skip_reason);
+
+    persist_affinity(
+        state,
+        session_id,
+        user_id,
+        instance_id,
+        action,
+        grades,
+        rule_deltas,
+        context,
+        affinity_gen_id,
+        levels,
+        &eval_failures,
+        user_message_id,
+    )
+    .await;
+
+    // Feeling-clause summarizer (spec 2026-09-03): movement turns only,
+    // gated on the [tasks.affinity_summary] section being present at
+    // all (absent = feature off, clause stays NULL) and on the request
+    // actually injecting affinity (zero-axis scope ⇒ nothing would
+    // render the clause).
+    if movement_turn(&grades, &levels)
+        && affinity_scope.active_count() > 0
+        && state.model_config.tasks.contains_key(SUMMARY_TASK)
+    {
+        summarize_feeling(state, session_id, &persona_name, affinity_scope, client_id).await;
+    }
+}
 
 /// Run the graded turn through the 4.0 pipeline (or ghost counters) and write
 /// to DB.
@@ -670,7 +696,7 @@ const AFFINITY_EVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// language, which is exactly the register the first-person evaluator reads.
 /// Captionless image turns (legacy rows, `raw` variant, failed compose) fall
 /// back to a generic photo marker so they are still evaluated.
-fn affinity_eval_text(
+pub(crate) fn affinity_eval_text(
     action: ActionType,
     assistant_msg: &str,
     image_caption: Option<&str>,

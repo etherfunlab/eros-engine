@@ -458,7 +458,8 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
   "style": "realistic",
   "aspect_ratio": "3:4",
   "prompt_variant": "a",
-  "persist_instruction": true
+  "persist_instruction": true,
+  "evaluate_affinity": true
 }
 ```
 
@@ -475,6 +476,10 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
   与聊天路径写的是同一个键），新图片行挂在它上面，不再沿用原图的回合。
   历史自然回放整轮：用户指令 → 角色新图。这条 user row 是真实的用户消息 ——
   和用户说的其他话一样，进 companion context、记忆抽取和之后的好感度评估。
+- `evaluate_affinity` —— 缺省 `false`。设上时，这一轮走标准的逐轮好感度判官：
+  用户说的是这条指令，角色答的是新图的 caption。判官是脱管跑的 —— 响应不等它。
+  与 `persist_instruction` 正交（判官读的都是指令本身）；落了指令行时，
+  好感度事件的 `user_message_id` 锚到那条指令消息。
 
 ```json
 {
@@ -499,8 +504,9 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 `GET /comp/chat/{session_id}/messages/{message_id}/image-request` 恢复。它的
 `metadata.image` 另外带一个 `edit_of`。编辑出来的图还可以再编辑。
 
-这次调用里回合的其余部分一概不跑：不做 PDE 判定、不动好感度、不抽 insight
-与记忆。不带 `persist_instruction` 时新行沿用原图行的 `user_message_id` ——
+这次调用里回合的其余部分默认一概不跑：不做 PDE 判定、不动好感度、不抽 insight
+与记忆。唯一的可选例外是 `evaluate_affinity` —— 它也只跑好感度这一段，
+别的照旧不跑。不带 `persist_instruction` 时新行沿用原图行的 `user_message_id` ——
 这次编辑属于原图所回应的那个回合；带上时，新行的 `user_message_id`
 就是落库的那条指令消息。
 

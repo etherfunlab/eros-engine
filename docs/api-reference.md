@@ -530,7 +530,8 @@ consumer draws it, exactly as for a chat image turn.
   "style": "realistic",
   "aspect_ratio": "3:4",
   "prompt_variant": "a",
-  "persist_instruction": true
+  "persist_instruction": true,
+  "evaluate_affinity": true
 }
 ```
 
@@ -551,6 +552,12 @@ consumer draws it, exactly as for a chat image turn.
   then replays the exchange: user instruction → assistant picture. The row is
   a real user message — visible to companion context, memory extraction and
   later affinity evaluation like anything else the user said.
+- `evaluate_affinity` — default `false`. When set, the turn goes through the
+  standard per-turn affinity judge: the instruction is what the user said, the
+  new picture's caption is what the character answered. Detached — the response
+  never waits on the judge. Orthogonal to `persist_instruction` (the judge
+  reads the instruction either way); when an instruction row was persisted it
+  anchors the affinity event's `user_message_id`.
 
 ```json
 {
@@ -579,8 +586,10 @@ The new message is an ordinary image turn: it appears in history with
 `GET /comp/chat/{session_id}/messages/{message_id}/image-request`. Its
 `metadata.image` additionally carries `edit_of`. An edit can itself be edited.
 
-Nothing else about a turn runs on this call: no PDE decision, no affinity
-movement, no insight or memory extraction. Without `persist_instruction` the
+Nothing else about a turn runs on this call by default: no PDE decision, no
+affinity movement, no insight or memory extraction. The one opt-in exception
+is `evaluate_affinity` — and it runs the affinity pass alone, nothing else.
+Without `persist_instruction` the
 new row inherits the source's `user_message_id` — the edit belongs to the turn
 the original picture answered; with it, the new row's `user_message_id` is the
 persisted instruction message.
