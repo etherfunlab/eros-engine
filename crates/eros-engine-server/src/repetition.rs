@@ -65,6 +65,49 @@ pub fn strip_leading_sentence(text: &str) -> String {
     }
 }
 
+/// Remove parenthesized action blocks — `（凑近）`-style stage directions —
+/// from a formatted history row: every `[(（][^)）]{1,120}[)）]` match is
+/// dropped, then whitespace runs are collapsed per line and lines left empty
+/// are dropped. Blocks in history are the contagion carrier (audit 54): an
+/// instruction alone cannot stop the model copying blocks it sees in its own
+/// prior turns, so the prompt must stop showing them — the `[output]` line
+/// handles the spontaneous remainder. Like [`strip_leading_sentence`], this
+/// transforms the injected row only; storage keeps the original.
+///
+/// An empty result is the caller's signal to drop the row entirely, same as
+/// [`strip_leading_sentence`].
+pub fn strip_action_blocks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find(['(', '（']) {
+        let open_len = rest[open..].chars().next().map_or(1, char::len_utf8);
+        let after_open = &rest[open + open_len..];
+        match after_open.find([')', '）']) {
+            // 1..=120 chars of content, none a closing paren (the find
+            // guarantees that) — the regex's match window.
+            Some(close) if close > 0 && after_open[..close].chars().count() <= 120 => {
+                let close_len = after_open[close..].chars().next().map_or(1, char::len_utf8);
+                out.push_str(&rest[..open]);
+                rest = &after_open[close + close_len..];
+            }
+            // Empty `()`, unclosed, or oversized: not an action block — keep
+            // the paren literally and keep scanning after it.
+            _ => {
+                out.push_str(&rest[..open + open_len]);
+                rest = after_open;
+            }
+        }
+    }
+    out.push_str(rest);
+    out.split('\n')
+        .filter_map(|line| {
+            let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
+            (!collapsed.is_empty()).then_some(collapsed)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// What one turn's echo cancellation removed. All zero when the window held
 /// no duplicates. Logged, never stored — the same counts are recomputable
 /// from `chat_messages` with a window query.
@@ -353,5 +396,43 @@ mod tests {
             strip_leading_sentence("给你看这个。\n\n[你的照片：海边]"),
             "[你的照片：海边]"
         );
+    }
+
+    #[test]
+    fn action_block_strip_removes_half_and_full_width_blocks() {
+        assert_eq!(
+            strip_action_blocks("她笑了（凑近你）真的吗？"),
+            "她笑了真的吗？"
+        );
+        assert_eq!(strip_action_blocks("ok (leans in) sure"), "ok sure");
+        // Mixed-width pairs match too — the pattern is [(（]…[)）].
+        assert_eq!(strip_action_blocks("嗯（笑)好"), "嗯好");
+    }
+
+    #[test]
+    fn action_block_strip_removes_every_block() {
+        assert_eq!(strip_action_blocks("（脸红）嗯（低头不语）好"), "嗯好");
+    }
+
+    #[test]
+    fn action_block_strip_keeps_empty_unclosed_and_oversized_parens() {
+        assert_eq!(strip_action_blocks("a()b"), "a()b");
+        assert_eq!(strip_action_blocks("a（b"), "a（b");
+        // 121 content chars exceeds the {1,120} window: not an action block.
+        let long = format!("头（{}）尾", "x".repeat(121));
+        assert_eq!(strip_action_blocks(&long), long);
+        let fits = format!("头（{}）尾", "x".repeat(120));
+        assert_eq!(strip_action_blocks(&fits), "头尾");
+    }
+
+    #[test]
+    fn action_block_strip_collapses_leftover_whitespace() {
+        assert_eq!(strip_action_blocks("ok （笑） sure"), "ok sure");
+    }
+
+    #[test]
+    fn action_block_strip_drops_lines_left_empty() {
+        assert_eq!(strip_action_blocks("（转身离开）\n你来了。"), "你来了。");
+        assert_eq!(strip_action_blocks("（转身离开）"), "");
     }
 }
