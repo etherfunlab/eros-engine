@@ -711,6 +711,17 @@ pub async fn send_message_stream(
                     original_user_message_id: Some(user_message_id),
                 }));
             }
+            ClaimedEnqueueOutcome::DuplicateFailed { user_message_id } => {
+                return Err(AppError::StreamPre(StreamPreError {
+                    status: StatusCode::CONFLICT,
+                    code: "duplicate_failed",
+                    message: "same (session_id, client_msg_id) terminally failed; \
+                              a same-id retry can never succeed"
+                        .into(),
+                    user_message: "这条消息发送失败，请重新发送".into(),
+                    original_user_message_id: Some(user_message_id),
+                }));
+            }
             ClaimedEnqueueOutcome::Replay {
                 ghost,
                 assistant_chain,
