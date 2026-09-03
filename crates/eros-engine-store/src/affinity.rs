@@ -2727,7 +2727,11 @@ mod tests {
         assert_eq!(a.feeling_clause, None);
         assert_eq!(a.feeling_clause_at, None);
 
-        let t1 = Utc::now();
+        // Fixed, microsecond-aligned instants: TIMESTAMPTZ stores micros, so
+        // a nanosecond-bearing Utc::now() round-trips truncated on platforms
+        // whose clock has nanosecond resolution (CI Linux; macOS happens to
+        // tick in micros and hides it).
+        let t1 = DateTime::from_timestamp(1_756_000_000, 0).unwrap();
         repo.set_feeling_clause(session_id, "他最近有点让我心软。", t1)
             .await
             .unwrap();
