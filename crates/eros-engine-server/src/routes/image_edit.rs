@@ -16,10 +16,17 @@
 //! Nothing else about a turn runs here by default: no PDE verdict, no
 //! affinity, no insight or memory extraction, no queue. A persisted
 //! instruction row is visible to later turns' pipelines like any user
-//! message; this call triggers none of them. The one opt-in exception is
-//! `evaluate_affinity`: the turn (instruction vs. the new picture's caption)
-//! goes through the standard per-turn affinity judge, detached — and nothing
-//! else.
+//! message; this call triggers none of them. Two opt-ins widen that:
+//!
+//! - `evaluate_affinity`: the turn (instruction vs. the new picture's
+//!   caption) goes through the standard per-turn affinity judge, detached —
+//!   and nothing else.
+//! - `reply_with_text` (requires `persist_instruction`; overrides
+//!   `evaluate_affinity`): the edit becomes a full chat turn. The value is
+//!   the probability that the character also says something with the picture
+//!   — the dice stand in for the PDE, which this endpoint never consults —
+//!   and the whole post-turn pipeline (affinity, memory, insights) runs
+//!   afterward, exactly as after a chat turn.
 
 use axum::extract::{Extension, Path, State};
 use axum::Json;
@@ -29,17 +36,22 @@ use ulid::Ulid;
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
+use eros_engine_core::persona::CompanionPersona;
+use eros_engine_core::types::{ActionPlan, ActionType, DecisionInput, Event, ImageRef, ReplyStyle};
 use eros_engine_llm::model_config::StyleKey;
+use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::{AssistantInsert, ChatRepo};
 use eros_engine_store::image_events::ImageComposeEventInsert;
 use eros_engine_store::persona::PersonaRepo;
 
 use crate::auth::middleware::AuthUser;
 use crate::error::AppError;
-use crate::pipeline::handlers::compose_image_prompt;
+use crate::pipeline::handlers::{build_reply_request, compose_image_prompt, CHAT_TASK};
+use crate::pipeline::post_process::ProducedMessage;
 use crate::pipeline::stream::{
     build_delegated_image_marker, record_compose_event, run_image_prompt_compose, split_failures,
 };
+use crate::pipeline::{record_generation, GenerationRecord};
 use crate::routes::companion::require_session_for_user;
 use crate::routes::companion_stream::aspect_ratio_supported;
 use crate::routes::persona::compose_chain_exhausted;
@@ -82,9 +94,22 @@ pub struct ImageEditRequest {
     /// answered. Detached — the response never waits on the judge. Orthogonal
     /// to `persist_instruction`; when an instruction row was persisted it
     /// anchors the affinity event. Default false: an edit does not move
-    /// affinity unless the consumer says so.
+    /// affinity unless the consumer says so. Overridden by `reply_with_text`
+    /// (present + `persist_instruction`): the full pipeline it starts already
+    /// includes the affinity judge.
     #[serde(default)]
     pub evaluate_affinity: bool,
+    /// Treat this edit as a full chat turn. Requires `persist_instruction`
+    /// (ignored without it). When present, the whole post-turn pipeline runs —
+    /// affinity, memory, insights, exactly as after a chat turn — and the
+    /// value is the probability that the character also says something with
+    /// the picture: `0` = `reply_image` every time, `1` = `reply_text_image`
+    /// every time, in between the engine rolls (the dice stand in for the PDE,
+    /// which this endpoint never consults). The text half is a real
+    /// companion-model reply driven by the persisted instruction row. Absent =
+    /// none of this: the endpoint's classic contract.
+    #[serde(default)]
+    pub reply_with_text: Option<f64>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -110,6 +135,13 @@ pub struct ImageEditResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>)]
     pub instruction_message_id: Option<Uuid>,
+    /// What this turn is: `reply_text_image` when the `reply_with_text` dice
+    /// rolled a text half and it landed, `reply_image` otherwise (including
+    /// every call without `reply_with_text`).
+    pub action_type: String,
+    /// The character's text half, when the turn is `reply_text_image`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_text: Option<String>,
 }
 
 /// The edit composer's payload. Mirrors `compose_user_payload`'s five slots,
@@ -203,7 +235,171 @@ fn validate(req: &ImageEditRequest) -> Result<(), AppError> {
             return Err(AppError::Unprocessable("unsupported aspect_ratio".into()));
         }
     }
+    if let Some(p) = req.reply_with_text {
+        // NaN fails the range test too — refused, never rolled.
+        if !(0.0..=1.0).contains(&p) {
+            return Err(AppError::Unprocessable(
+                "reply_with_text must be within [0, 1]".into(),
+            ));
+        }
+    }
     Ok(())
+}
+
+/// The text half of a rolled full turn — everything the assistant row and the
+/// response need from the chat-model call. `reply: None` with populated
+/// failure columns = the call was made and failed (or came back blank); the
+/// turn degrades to `reply_image` and the columns keep the evidence.
+#[derive(Default)]
+struct TextOutcome {
+    reply: Option<String>,
+    generation_id: Option<String>,
+    llm_attempts: Option<serde_json::Value>,
+    gateway_errors: Option<serde_json::Value>,
+}
+
+/// The full-turn Event: the persisted instruction row is the driving user
+/// message; everything else is what an ordinary chat request defaults to.
+fn edit_turn_event(instruction: String, instruction_row_id: Uuid) -> Event {
+    Event::UserMessage {
+        content: instruction,
+        message_id: instruction_row_id,
+        prompt_traits: vec![],
+        audit: None,
+        tier: None,
+        memory_scope: Default::default(),
+        affinity_scope: Default::default(),
+        tips_amount_usd: None,
+        quote: None,
+    }
+}
+
+/// A minimal ActionPlan for a turn no PDE decided: neutral delivery, zero
+/// rule deltas.
+fn edit_turn_plan(action: ActionType) -> ActionPlan {
+    ActionPlan {
+        action_type: action,
+        reply_style: ReplyStyle::Neutral,
+        affinity_deltas: Default::default(),
+        energy_cost: 0.0,
+        context_hints: vec![],
+        reply_tone: None,
+        image_caption: None,
+        image_ref: ImageRef::Previous,
+        aspect_ratio: None,
+    }
+}
+
+/// Run the companion chain once, non-streaming, off the persisted instruction
+/// row — the rolled text half of a full-turn edit. Fail-open everywhere: any
+/// failure (affinity load, request build, LLM error, blank reply) returns a
+/// text-less outcome and the turn degrades to `reply_image` — the picture is
+/// the turn's substance.
+async fn generate_reply_text(
+    state: &AppState,
+    persona: &CompanionPersona,
+    session_id: Uuid,
+    user_id: Uuid,
+    instance_id: Uuid,
+    instruction_row_id: Uuid,
+    instruction: &str,
+) -> TextOutcome {
+    let affinity = match (AffinityRepo { pool: &state.pool })
+        .load_or_create(session_id, user_id, instance_id)
+        .await
+    {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!("image_edit text half: affinity load_or_create failed: {e}");
+            return TextOutcome::default();
+        }
+    };
+    let signals = match crate::pipeline::compute_signals_for_session(
+        &state.pool,
+        session_id,
+        &affinity,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("image_edit text half: compute_signals failed: {e}");
+            return TextOutcome::default();
+        }
+    };
+    let input = DecisionInput {
+        event: edit_turn_event(instruction.to_string(), instruction_row_id),
+        affinity,
+        persona: persona.clone(),
+        signals,
+    };
+    let plan = edit_turn_plan(ActionType::ReplyTextImage);
+    let (chat_req, _tags) = match build_reply_request(
+        state,
+        &input,
+        &plan,
+        session_id,
+        user_id,
+        instance_id,
+        instruction_row_id,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("image_edit text half: build_reply_request failed: {e}");
+            return TextOutcome::default();
+        }
+    };
+    let model_for_audit = chat_req.model.clone();
+    match state.openrouter.execute(chat_req).await {
+        Ok(resp) => {
+            let generation_id = record_generation(
+                &state.pool,
+                GenerationRecord {
+                    task: CHAT_TASK,
+                    session_id: Some(session_id),
+                    generation_id: resp.generation_id.as_deref(),
+                    model: resp.model.as_deref(),
+                    usage: resp.usage.as_ref(),
+                },
+            )
+            .await;
+            let (llm_attempts, gateway_errors) = split_failures(&resp.failures);
+            // An empty text half is an image-only reply, not silence — same
+            // rule as the chat path's reply_text_image contract.
+            let trimmed = resp.reply.trim();
+            let reply = (!trimmed.is_empty()).then(|| trimmed.to_string());
+            TextOutcome {
+                reply,
+                generation_id,
+                llm_attempts,
+                gateway_errors,
+            }
+        }
+        Err(e) => {
+            tracing::warn!("image_edit text half: companion call failed: {e}");
+            // A chain error already carries every hop; anything else becomes
+            // one recorded attempt — same salvage as the affinity evaluator.
+            let failures = match &e {
+                eros_engine_llm::LlmError::Chain { failures } if !failures.is_empty() => {
+                    failures.clone()
+                }
+                other => vec![eros_engine_llm::failure::AttemptFailure::from_llm_error(
+                    CHAT_TASK,
+                    &model_for_audit,
+                    other,
+                )],
+            };
+            let (llm_attempts, gateway_errors) = split_failures(&failures);
+            TextOutcome {
+                reply: None,
+                generation_id: None,
+                llm_attempts,
+                gateway_errors,
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -509,39 +705,131 @@ async fn edit_image(
         eros_engine_core::types::ImageRef::Previous,
         Some(message_id),
     );
-    let insert = AssistantInsert {
-        id: new_id,
-        content: String::new(),
-        assistant_action_type: "reply".into(),
-        continues_from_message_id: None,
-        truncated: false,
-        generation_id: None,
-        filter_audit: None,
-        metadata: Some(serde_json::json!({ "image": image_marker })),
-        llm_attempts: None,
-        gateway_errors: None,
-    };
-    let instruction_message_id = match source_user_message_id {
-        Some(umid) => {
-            chat_repo
-                .insert_assistant_batch(session_id, umid, &[insert])
-                .await?;
-            None
+    let marker_metadata = serde_json::json!({ "image": image_marker });
+
+    // `reply_with_text` present + `persist_instruction` ⇒ the edit is a full
+    // chat turn: the instruction row lands first (it is the chat model's
+    // driving row), the dice decide the text half, and the whole post-turn
+    // pipeline runs afterward. `text_half` is `Some` exactly in this mode.
+    let full_turn = req.persist_instruction && req.reply_with_text.is_some();
+    let (instruction_message_id, text_half) = if full_turn {
+        let umid = chat_repo
+            .insert_instruction_row(session_id, &instruction, message_id)
+            .await?;
+        // The dice stand in for the PDE: p=0 never rolls, p=1 always does.
+        let text = if rand::random::<f64>() < req.reply_with_text.unwrap_or(0.0) {
+            generate_reply_text(
+                &state,
+                &persona,
+                session_id,
+                user_id,
+                instance_id,
+                umid,
+                &instruction,
+            )
+            .await
+        } else {
+            TextOutcome::default()
+        };
+        let insert = AssistantInsert {
+            id: new_id,
+            content: text.reply.clone().unwrap_or_default(),
+            assistant_action_type: "reply".into(),
+            continues_from_message_id: None,
+            truncated: false,
+            generation_id: text.generation_id.clone(),
+            filter_audit: None,
+            metadata: Some(marker_metadata),
+            llm_attempts: text.llm_attempts.clone(),
+            gateway_errors: text.gateway_errors.clone(),
+        };
+        chat_repo
+            .insert_assistant_batch(session_id, umid, &[insert])
+            .await?;
+        (Some(umid), Some(text))
+    } else {
+        let insert = AssistantInsert {
+            id: new_id,
+            content: String::new(),
+            assistant_action_type: "reply".into(),
+            continues_from_message_id: None,
+            truncated: false,
+            generation_id: None,
+            filter_audit: None,
+            metadata: Some(marker_metadata),
+            llm_attempts: None,
+            gateway_errors: None,
+        };
+        match source_user_message_id {
+            Some(umid) => {
+                chat_repo
+                    .insert_assistant_batch(session_id, umid, &[insert])
+                    .await?;
+                (None, None)
+            }
+            None => (
+                Some(
+                    chat_repo
+                        .insert_instruction_turn(session_id, &instruction, message_id, &insert)
+                        .await?,
+                ),
+                None,
+            ),
         }
-        None => Some(
-            chat_repo
-                .insert_instruction_turn(session_id, &instruction, message_id, &insert)
-                .await?,
-        ),
     };
 
-    // Opt-in affinity: judge (instruction, new caption) as one turn, detached
-    // like post_process — the response never waits on the judge. Zero rule
-    // deltas (no PDE ran) and a zero-axis scope (this request injects no
-    // affinity, so no feeling-clause rewrite).
-    if req.evaluate_affinity {
+    if let Some(text) = &text_half {
+        // Full turn: spawn the same post-turn pipeline a chat turn gets —
+        // affinity (this overrides `evaluate_affinity`; the pipeline judges on
+        // its own), memory and insights, each behind its own existing gate.
+        let action = if text.reply.is_some() {
+            ActionType::ReplyTextImage
+        } else {
+            ActionType::ReplyImage
+        };
+        let produced = vec![ProducedMessage {
+            message_id: new_id,
+            full_text: text.reply.clone().unwrap_or_default(),
+            action,
+        }];
+        let state_bg = state.clone();
+        let instruction_bg = instruction.clone();
+        let caption_bg = outcome.caption.clone();
+        let umid_bg = instruction_message_id.expect("full turn persisted the instruction");
+        tokio::spawn(async move {
+            // A full turn counts as contact: reset the ghost streak the way
+            // the chat stream does before spawning post_process.
+            if let Err(e) = sqlx::query(
+                "UPDATE engine.companion_affinity SET ghost_streak = 0, updated_at = now() \
+                 WHERE session_id = $1 AND ghost_streak <> 0",
+            )
+            .bind(session_id)
+            .execute(&state_bg.pool)
+            .await
+            {
+                tracing::warn!("image_edit: ghost streak reset failed: {e}");
+            }
+            let mut plan = edit_turn_plan(action);
+            plan.image_caption = caption_bg;
+            crate::pipeline::post_process::run(
+                state_bg,
+                session_id,
+                user_id,
+                instance_id,
+                edit_turn_event(instruction_bg, umid_bg),
+                plan,
+                produced,
+            )
+            .await;
+        });
+    } else if req.evaluate_affinity {
+        // Opt-in affinity slice: judge (instruction, new caption) as one turn,
+        // detached like post_process — the response never waits on the judge.
+        // Zero rule deltas (no PDE ran) and a zero-axis scope (this request
+        // injects no affinity, so no feeling-clause rewrite). Unreachable in
+        // full-turn mode, whose pipeline already includes the judge.
         let eval_text = crate::pipeline::post_process::affinity_eval_text(
-            eros_engine_core::types::ActionType::ReplyImage,
+            ActionType::ReplyImage,
             "",
             outcome.caption.as_deref(),
         );
@@ -553,7 +841,7 @@ async fn edit_image(
                 session_id,
                 user_id,
                 instance_id,
-                eros_engine_core::types::ActionType::ReplyImage,
+                ActionType::ReplyImage,
                 &instruction,
                 &eval_text,
                 eros_engine_core::affinity::AffinityDeltas::default(),
@@ -565,6 +853,7 @@ async fn edit_image(
         });
     }
 
+    let reply_text = text_half.and_then(|t| t.reply);
     Ok(Json(ImageEditResponse {
         message_id: new_id,
         edit_of: message_id,
@@ -574,6 +863,12 @@ async fn edit_image(
         aspect_ratio,
         caption: outcome.caption,
         instruction_message_id,
+        action_type: if reply_text.is_some() {
+            "reply_text_image".into()
+        } else {
+            "reply_image".into()
+        },
+        reply_text,
     }))
 }
 
@@ -1467,6 +1762,325 @@ mod tests {
             Some(instruction_id),
             "the event anchors to the instruction row when one exists"
         );
+    }
+
+    /// Everything the full-turn (`reply_with_text`) tests need: the edit
+    /// composer, the chat companion, and the affinity judge.
+    const FULL_TURN_TOML: &str = "[tasks.chat_image_edit_compose]\nmodel = \"editor\"\n\
+         [tasks.chat_companion]\nmodel = \"companion\"\n\
+         [tasks.affinity_evaluation]\nmodel = \"affinity-judge\"\n";
+
+    /// Companion mock keyed on the seeded genome's system prompt — disjoint
+    /// from the editor's `[修改要求]` and the judge's `当前档位`.
+    async fn mount_companion(mock: &MockServer) {
+        use wiremock::matchers::body_string_contains;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("you are a companion"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "gen-chat",
+                "model": "served/companion",
+                "choices": [{"message": {"content": "新造型来啦，你看看喜欢吗"}}],
+            })))
+            .mount(mock)
+            .await;
+    }
+
+    /// Companion mock that always fails, for the degrade path.
+    async fn mount_companion_failure(mock: &MockServer) {
+        use wiremock::matchers::body_string_contains;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("you are a companion"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(mock)
+            .await;
+    }
+
+    /// True when any request the mock received carries the companion system
+    /// prompt — i.e. a chat-model call was made.
+    async fn companion_was_called(mock: &MockServer) -> bool {
+        mock.received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| String::from_utf8_lossy(&r.body).contains("you are a companion"))
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn reply_with_text_1_generates_the_text_half(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let (_, mid) = seed_image_turn(&pool, session_id).await;
+
+        let mock = MockServer::start().await;
+        mount_editor_and_judge(&mock).await;
+        mount_companion(&mock).await;
+        let state = with_composer(test_state(pool.clone()), &mock.uri(), FULL_TURN_TOML);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let (status, body) = send_request(
+            &mut app,
+            edit_req(
+                session_id,
+                mid,
+                &token,
+                json!({"instruction": "换套衣服",
+                       "persist_instruction": true,
+                       "reply_with_text": 1.0}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["action_type"], json!("reply_text_image"));
+        assert_eq!(body["reply_text"], json!("新造型来啦，你看看喜欢吗"));
+        let instruction_id =
+            Uuid::parse_str(body["instruction_message_id"].as_str().unwrap()).unwrap();
+        let new_id = Uuid::parse_str(body["message_id"].as_str().unwrap()).unwrap();
+
+        // The persisted turn is a chat-shaped text+image row hanging off the
+        // instruction.
+        let (content, row_umid, metadata): (String, Option<Uuid>, serde_json::Value) =
+            sqlx::query_as(
+                "SELECT content, user_message_id, metadata \
+                 FROM engine.chat_messages WHERE id = $1",
+            )
+            .bind(new_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(content, "新造型来啦，你看看喜欢吗");
+        assert_eq!(row_umid, Some(instruction_id));
+        assert_eq!(metadata["image"]["prompt"], json!("EDITED SUBJECT"));
+
+        // The chat model saw the instruction (it drives the reply).
+        let reqs = mock.received_requests().await.unwrap();
+        let chat = reqs
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .find(|b| b.contains("you are a companion"))
+            .expect("a chat companion call was made");
+        assert!(chat.contains("换套衣服"), "got {chat}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn reply_with_text_0_runs_the_full_pipeline_without_text(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let (_, mid) = seed_image_turn(&pool, session_id).await;
+        seed_affinity(&pool, session_id, user_id, instance_id).await;
+
+        let mock = MockServer::start().await;
+        mount_editor_and_judge(&mock).await;
+        mount_companion(&mock).await;
+        let state = with_composer(test_state(pool.clone()), &mock.uri(), FULL_TURN_TOML);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        // `evaluate_affinity: false` is explicitly overridden by the
+        // full-pipeline mode: the pipeline includes affinity on its own.
+        let (status, body) = send_request(
+            &mut app,
+            edit_req(
+                session_id,
+                mid,
+                &token,
+                json!({"instruction": "换套衣服",
+                       "persist_instruction": true,
+                       "reply_with_text": 0.0,
+                       "evaluate_affinity": false}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["action_type"], json!("reply_image"));
+        assert!(body.get("reply_text").is_none(), "got {body}");
+        let instruction_id =
+            Uuid::parse_str(body["instruction_message_id"].as_str().unwrap()).unwrap();
+
+        // p=0 never rolls text: no chat call, empty content.
+        assert!(!companion_was_called(&mock).await);
+        let new_id = Uuid::parse_str(body["message_id"].as_str().unwrap()).unwrap();
+        let content: String =
+            sqlx::query_scalar("SELECT content FROM engine.chat_messages WHERE id = $1")
+                .bind(new_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(content, "");
+
+        // But the pipeline still ran: the affinity event lands, anchored to
+        // the instruction row.
+        let (event_type, event_umid, _) = wait_for_affinity_event(&pool, session_id).await;
+        assert_eq!(event_type, "message");
+        assert_eq!(event_umid, Some(instruction_id));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn reply_with_text_is_inert_without_persist_instruction(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let (_, mid) = seed_image_turn(&pool, session_id).await;
+
+        let mock = MockServer::start().await;
+        mount_editor_and_judge(&mock).await;
+        mount_companion(&mock).await;
+        let state = with_composer(test_state(pool.clone()), &mock.uri(), FULL_TURN_TOML);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let (status, body) = send_request(
+            &mut app,
+            edit_req(
+                session_id,
+                mid,
+                &token,
+                json!({"instruction": "换套衣服", "reply_with_text": 1.0}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["action_type"], json!("reply_image"));
+        assert!(body.get("reply_text").is_none(), "got {body}");
+        assert!(body.get("instruction_message_id").is_none(), "got {body}");
+        assert!(!companion_was_called(&mock).await);
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.companion_affinity WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 0, "inert flag must not start any pipeline");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn reply_with_text_degrades_to_reply_image_when_the_text_model_fails(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let (_, mid) = seed_image_turn(&pool, session_id).await;
+
+        let mock = MockServer::start().await;
+        mount_editor_and_judge(&mock).await;
+        mount_companion_failure(&mock).await;
+        let state = with_composer(test_state(pool.clone()), &mock.uri(), FULL_TURN_TOML);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let (status, body) = send_request(
+            &mut app,
+            edit_req(
+                session_id,
+                mid,
+                &token,
+                json!({"instruction": "换套衣服",
+                       "persist_instruction": true,
+                       "reply_with_text": 1.0}),
+            ),
+        )
+        .await;
+        // The picture is the turn's substance; a dead text model must not
+        // fail the edit.
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["action_type"], json!("reply_image"));
+        assert!(body.get("reply_text").is_none(), "got {body}");
+        let instruction_id =
+            Uuid::parse_str(body["instruction_message_id"].as_str().unwrap()).unwrap();
+        let new_id = Uuid::parse_str(body["message_id"].as_str().unwrap()).unwrap();
+
+        let (content, row_umid, metadata): (String, Option<Uuid>, serde_json::Value) =
+            sqlx::query_as(
+                "SELECT content, user_message_id, metadata \
+                 FROM engine.chat_messages WHERE id = $1",
+            )
+            .bind(new_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(content, "", "degraded turn is an ordinary image-only row");
+        assert_eq!(row_umid, Some(instruction_id));
+        assert_eq!(metadata["image"]["prompt"], json!("EDITED SUBJECT"));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn reply_with_text_out_of_range_is_422(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let (_, mid) = seed_image_turn(&pool, session_id).await;
+
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        for bad in [json!(1.5), json!(-0.1)] {
+            let (status, _) = send_request(
+                &mut app,
+                edit_req(
+                    session_id,
+                    mid,
+                    &token,
+                    json!({"instruction": "换套衣服",
+                           "persist_instruction": true,
+                           "reply_with_text": bad}),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "value={bad}");
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn reply_with_text_feeds_the_judge_the_text(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let (_, mid) = seed_image_turn(&pool, session_id).await;
+        seed_affinity(&pool, session_id, user_id, instance_id).await;
+
+        let mock = MockServer::start().await;
+        mount_editor_and_judge(&mock).await;
+        mount_companion(&mock).await;
+        let state = with_composer(test_state(pool.clone()), &mock.uri(), FULL_TURN_TOML);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        // No `evaluate_affinity` at all: the full pipeline judges on its own.
+        let (status, body) = send_request(
+            &mut app,
+            edit_req(
+                session_id,
+                mid,
+                &token,
+                json!({"instruction": "换套衣服",
+                       "persist_instruction": true,
+                       "reply_with_text": 1.0}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+
+        let _ = wait_for_affinity_event(&pool, session_id).await;
+        let reqs = mock.received_requests().await.unwrap();
+        let eval = reqs
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .find(|b| b.contains("当前档位"))
+            .expect("an affinity eval call was made");
+        // The judge scores the generated text (not the caption proxy).
+        assert!(eval.contains("对方：换套衣服"), "got {eval}");
+        assert!(eval.contains("新造型来啦"), "got {eval}");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

@@ -919,6 +919,29 @@ impl<'a> ChatRepo<'a> {
     /// key is the same `metadata.reply_to_message_id` the chat stream path
     /// writes, so history hands it back unchanged. Returns the user row's id.
     /// Bumps `last_active_at` once.
+    /// The instruction half of `insert_instruction_turn`, alone — for the
+    /// full-turn edit path, where a chat-model call runs between the
+    /// instruction row and the assistant row. The assistant row follows via
+    /// `insert_assistant_batch` (which bumps `last_active_at`); its own
+    /// `now()` lands after the LLM call, so the two rows' `sent_at` ordering
+    /// needs no manual nudge here.
+    pub async fn insert_instruction_row(
+        &self,
+        session_id: Uuid,
+        instruction: &str,
+        source_message_id: Uuid,
+    ) -> Result<Uuid, sqlx::Error> {
+        sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata) \
+             VALUES ($1, 'user', $2, $3) RETURNING id",
+        )
+        .bind(session_id)
+        .bind(instruction)
+        .bind(serde_json::json!({ "reply_to_message_id": source_message_id }))
+        .fetch_one(self.pool)
+        .await
+    }
+
     pub async fn insert_instruction_turn(
         &self,
         session_id: Uuid,
