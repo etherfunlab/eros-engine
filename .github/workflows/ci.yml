@@ -1,7 +1,7 @@
 name: CI
+# Pull requests are the only gate: promotes to main are fast-forwards of
+# commits already tested on their PR, so no push trigger is needed.
 on:
-  push:
-    branches: [main]
   pull_request:
 
 # All jobs here are read-only checks (fmt / clippy / test / openapi snapshot).
