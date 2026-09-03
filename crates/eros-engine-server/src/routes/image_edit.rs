@@ -13,10 +13,13 @@
 //! hangs off it — after which the whole turn is shape-identical to a chat-path
 //! image turn.
 //!
-//! Nothing else about a turn runs here: no PDE verdict, no affinity, no
-//! insight or memory extraction, no queue. A persisted instruction row is
-//! visible to later turns' pipelines like any user message; this call
-//! triggers none of them.
+//! Nothing else about a turn runs here by default: no PDE verdict, no
+//! affinity, no insight or memory extraction, no queue. A persisted
+//! instruction row is visible to later turns' pipelines like any user
+//! message; this call triggers none of them. The one opt-in exception is
+//! `evaluate_affinity`: the turn (instruction vs. the new picture's caption)
+//! goes through the standard per-turn affinity judge, detached — and nothing
+//! else.
 
 use axum::extract::{Extension, Path, State};
 use axum::Json;
@@ -74,6 +77,14 @@ pub struct ImageEditRequest {
     /// audit-only contract, byte-for-byte.
     #[serde(default)]
     pub persist_instruction: bool,
+    /// Run this edit through the per-turn affinity judge: the instruction is
+    /// what the user said, the new picture's caption is what the character
+    /// answered. Detached — the response never waits on the judge. Orthogonal
+    /// to `persist_instruction`; when an instruction row was persisted it
+    /// anchors the affinity event. Default false: an edit does not move
+    /// affinity unless the consumer says so.
+    #[serde(default)]
+    pub evaluate_affinity: bool,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -523,6 +534,36 @@ async fn edit_image(
                 .await?,
         ),
     };
+
+    // Opt-in affinity: judge (instruction, new caption) as one turn, detached
+    // like post_process — the response never waits on the judge. Zero rule
+    // deltas (no PDE ran) and a zero-axis scope (this request injects no
+    // affinity, so no feeling-clause rewrite).
+    if req.evaluate_affinity {
+        let eval_text = crate::pipeline::post_process::affinity_eval_text(
+            eros_engine_core::types::ActionType::ReplyImage,
+            "",
+            outcome.caption.as_deref(),
+        );
+        let task_state = state.clone();
+        let instruction = instruction.clone();
+        tokio::spawn(async move {
+            crate::pipeline::post_process::run_affinity_turn(
+                &task_state,
+                session_id,
+                user_id,
+                instance_id,
+                eros_engine_core::types::ActionType::ReplyImage,
+                &instruction,
+                &eval_text,
+                eros_engine_core::affinity::AffinityDeltas::default(),
+                eros_engine_core::scope::AffinityScope::none(),
+                instruction_message_id,
+                None,
+            )
+            .await;
+        });
+    }
 
     Ok(Json(ImageEditResponse {
         message_id: new_id,
@@ -1209,6 +1250,223 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(row_umid, Some(instruction_id));
+    }
+
+    /// Edit-composer config plus an affinity judge, for the
+    /// `evaluate_affinity` tests.
+    const EDIT_PLUS_AFFINITY_TOML: &str = "[tasks.chat_image_edit_compose]\nmodel = \"editor\"\n\
+         [tasks.affinity_evaluation]\nmodel = \"affinity-judge\"\n";
+
+    /// Editor + affinity-judge mocks with disjoint body matchers, so the two
+    /// LLM calls this endpoint can now make never swallow each other's
+    /// canned response.
+    async fn mount_editor_and_judge(mock: &MockServer) {
+        use wiremock::matchers::body_string_contains;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("[修改要求]"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "gen-edit",
+                "model": "served/editor",
+                "choices": [{"message": {"content":
+                    r#"{"prompt":"EDITED SUBJECT","caption":"换了条裙子"}"#}}],
+            })))
+            .mount(mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("当前档位"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "gen-affinity",
+                "model": "served/affinity-judge",
+                "choices": [{"message": {"content":
+                    r#"{"warmth": 2, "trust": {"grade": 1, "direction": "up"}, "intrigue": {"grade": 0, "direction": "up"}, "intimacy": {"grade": 0, "direction": "up"}, "tension": {"grade": 0, "direction": "up"}, "patience": 2, "reason": "他想再看一张，我有点得意"}"#}}],
+            })))
+            .mount(mock)
+            .await;
+    }
+
+    /// The judge needs an existing `companion_affinity` row — in real usage it
+    /// exists after the first chat turn.
+    async fn seed_affinity(pool: &PgPool, session_id: Uuid, user_id: Uuid, instance_id: Uuid) {
+        sqlx::query(
+            "INSERT INTO engine.companion_affinity (session_id, user_id, instance_id) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .bind(instance_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Poll for the detached affinity task's event row (the handler returns
+    /// before it finishes). Panics after ~5s.
+    async fn wait_for_affinity_event(
+        pool: &PgPool,
+        session_id: Uuid,
+    ) -> (String, Option<Uuid>, serde_json::Value) {
+        for _ in 0..100 {
+            if let Some(row) = sqlx::query_as::<_, (String, Option<Uuid>, serde_json::Value)>(
+                "SELECT e.event_type, e.user_message_id, e.context \
+                 FROM engine.companion_affinity_events e \
+                 JOIN engine.companion_affinity a ON a.id = e.affinity_id \
+                 WHERE a.session_id = $1",
+            )
+            .bind(session_id)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+            {
+                return row;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("no affinity event appeared within 5s");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn evaluate_affinity_judges_the_instruction_against_the_new_caption(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let (_, mid) = seed_image_turn(&pool, session_id).await;
+        seed_affinity(&pool, session_id, user_id, instance_id).await;
+
+        let mock = MockServer::start().await;
+        mount_editor_and_judge(&mock).await;
+        let state = with_composer(
+            test_state(pool.clone()),
+            &mock.uri(),
+            EDIT_PLUS_AFFINITY_TOML,
+        );
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let (status, _) = send_request(
+            &mut app,
+            edit_req(
+                session_id,
+                mid,
+                &token,
+                json!({"instruction": "换套衣服", "evaluate_affinity": true}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (event_type, event_umid, context) = wait_for_affinity_event(&pool, session_id).await;
+        assert_eq!(event_type, "message");
+        assert_eq!(
+            event_umid, None,
+            "no instruction row was persisted, so the event has no user message"
+        );
+        assert_eq!(
+            context["affinity_reason"],
+            json!("他想再看一张，我有点得意"),
+            "got {context}"
+        );
+
+        // The judge scored (instruction, new caption) — user side is the
+        // instruction whether or not it was persisted.
+        let reqs = mock.received_requests().await.unwrap();
+        let eval = reqs
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .find(|b| b.contains("当前档位"))
+            .expect("an affinity eval call was made");
+        assert!(eval.contains("对方：换套衣服"), "got {eval}");
+        assert!(eval.contains("换了条裙子"), "got {eval}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn image_edit_default_still_leaves_affinity_untouched(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let (_, mid) = seed_image_turn(&pool, session_id).await;
+
+        let mock = MockServer::start().await;
+        mount_editor_and_judge(&mock).await;
+        let state = with_composer(
+            test_state(pool.clone()),
+            &mock.uri(),
+            EDIT_PLUS_AFFINITY_TOML,
+        );
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let (status, _) = send_request(
+            &mut app,
+            edit_req(session_id, mid, &token, json!({"instruction": "换套衣服"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Best-effort negative: give a wrongly spawned task time to land.
+        // A wrongly spawned judge must hit the mock BEFORE it can write, so
+        // checking both narrows the false-pass window to "spawned but never
+        // even issued its HTTP call within the sleep".
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let judged = mock
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| String::from_utf8_lossy(&r.body).contains("当前档位"));
+        assert!(!judged, "no affinity judge call may be made by default");
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.companion_affinity WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 0, "the default contract stays affinity-free");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn evaluate_affinity_links_the_event_to_the_persisted_instruction(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let (_, mid) = seed_image_turn(&pool, session_id).await;
+        seed_affinity(&pool, session_id, user_id, instance_id).await;
+
+        let mock = MockServer::start().await;
+        mount_editor_and_judge(&mock).await;
+        let state = with_composer(
+            test_state(pool.clone()),
+            &mock.uri(),
+            EDIT_PLUS_AFFINITY_TOML,
+        );
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let (status, body) = send_request(
+            &mut app,
+            edit_req(
+                session_id,
+                mid,
+                &token,
+                json!({"instruction": "换套衣服",
+                       "persist_instruction": true,
+                       "evaluate_affinity": true}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        let instruction_id =
+            Uuid::parse_str(body["instruction_message_id"].as_str().unwrap()).unwrap();
+
+        let (_, event_umid, _) = wait_for_affinity_event(&pool, session_id).await;
+        assert_eq!(
+            event_umid,
+            Some(instruction_id),
+            "the event anchors to the instruction row when one exists"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
