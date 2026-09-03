@@ -1074,7 +1074,13 @@ async fn summarize_feeling(
         tracing::warn!("affinity summary output unparseable; keeping old clause");
         return;
     };
-    if let Err(e) = repo.set_feeling_clause(session_id, &clause).await {
+    // `affinity.updated_at` is the persisted state this clause summarizes;
+    // the store's as-of guard drops the write if a summary derived from a
+    // newer state already landed (overlapping movement turns).
+    if let Err(e) = repo
+        .set_feeling_clause(session_id, &clause, affinity.updated_at)
+        .await
+    {
         tracing::warn!("feeling_clause write failed: {e}");
     }
 }

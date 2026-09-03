@@ -63,8 +63,11 @@ ALTER TABLE engine.companion_affinity
   authoritative carrier. No new table, no history — the trajectory already
   lives in `companion_affinity_events`, and every injected clause is
   replayable from the prompt log.
-- `feeling_clause_at` is the observability read (when the clause was last
-  rewritten); it is not used for staleness scheduling.
+- `feeling_clause_at` carries the `updated_at` of the affinity state the
+  clause was derived from, and the write is guarded on it (`<=`), so two
+  overlapping summaries resolve to the one derived from the newer state
+  regardless of write order. Observability only — not used for staleness
+  scheduling.
 - No new FKs, no new external-identity columns. Both columns are nullable:
   NULL means "never summarized", and the prompt renders nothing.
 

@@ -373,19 +373,28 @@ impl<'a> AffinityRepo<'a> {
     /// Overwrite the session's feeling clause (spec 2026-09-03 §3). One
     /// authoritative clause per session; the summarizer calls this after a
     /// successful parse, so a failed run leaves the old clause standing.
-    /// 0 rows updated (session archived mid-flight) is benign — Ok(()).
+    ///
+    /// `as_of` is the `updated_at` of the affinity state the clause was
+    /// derived from (the summarizer's post-persist read), stored as
+    /// `feeling_clause_at`. The guard makes the write monotonic in state
+    /// time: two overlapping summaries can finish in either order, and the
+    /// one derived from the newer state wins regardless — a stale writer
+    /// hits 0 rows, which is benign, same as a session archived mid-flight.
     pub async fn set_feeling_clause(
         &self,
         session_id: Uuid,
         clause: &str,
+        as_of: DateTime<Utc>,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE engine.companion_affinity \
-             SET feeling_clause = $2, feeling_clause_at = now() \
-             WHERE session_id = $1",
+             SET feeling_clause = $2, feeling_clause_at = $3 \
+             WHERE session_id = $1 \
+               AND (feeling_clause_at IS NULL OR feeling_clause_at <= $3)",
         )
         .bind(session_id)
         .bind(clause)
+        .bind(as_of)
         .execute(self.pool)
         .await?;
         Ok(())
@@ -2718,19 +2727,31 @@ mod tests {
         assert_eq!(a.feeling_clause, None);
         assert_eq!(a.feeling_clause_at, None);
 
-        repo.set_feeling_clause(session_id, "他最近有点让我心软。")
+        let t1 = Utc::now();
+        repo.set_feeling_clause(session_id, "他最近有点让我心软。", t1)
             .await
             .unwrap();
         let b = repo.load(session_id).await.unwrap().unwrap();
         assert_eq!(b.feeling_clause.as_deref(), Some("他最近有点让我心软。"));
-        assert!(b.feeling_clause_at.is_some());
+        assert_eq!(b.feeling_clause_at, Some(t1));
 
-        // Overwrite wins — one authoritative clause per session.
-        repo.set_feeling_clause(session_id, "现在只觉得他烦。")
+        // Newer-state overwrite wins — one authoritative clause per session.
+        let t2 = t1 + chrono::Duration::seconds(5);
+        repo.set_feeling_clause(session_id, "现在只觉得他烦。", t2)
             .await
             .unwrap();
         let c = repo.load(session_id).await.unwrap().unwrap();
         assert_eq!(c.feeling_clause.as_deref(), Some("现在只觉得他烦。"));
+
+        // A summary derived from OLDER state loses the race: the as-of guard
+        // drops the write instead of regressing the clause.
+        let t0 = t1 - chrono::Duration::seconds(5);
+        repo.set_feeling_clause(session_id, "过期的旧总结。", t0)
+            .await
+            .unwrap();
+        let d = repo.load(session_id).await.unwrap().unwrap();
+        assert_eq!(d.feeling_clause.as_deref(), Some("现在只觉得他烦。"));
+        assert_eq!(d.feeling_clause_at, Some(t2));
     }
 
     #[sqlx::test(migrations = "./migrations")]
