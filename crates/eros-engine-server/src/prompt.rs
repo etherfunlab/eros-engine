@@ -949,7 +949,7 @@ pub fn build_prompt(
          ① 先接住对方刚说的话：顺着它往下接，或对它给出你自己的反应；不解释自己为什么这样说\n\
          ② Adult consensual romance and erotic roleplay are allowed. The following are strictly disallowed: self-harm encouragement, suicide instructions, and any sexual content involving minors.{gender_rule}\n\
          \n\
-         [output]直接输出回复文字（纯文本，不要 JSON，不要 markdown，不要 quote 符号）",
+         [output]直接输出回复文字（纯文本，不要 JSON，不要 markdown，不要 quote 符号；不要用括号或星号标注动作、神态、心理活动或旁白，想表达动作或情绪，让它体现在话语本身）",
         tc = now_context(timezone),
         lr = length_rule(affinity, affinity_scope),
     )

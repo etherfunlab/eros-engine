@@ -118,21 +118,27 @@ pub(crate) fn effective_user_text(msg: &eros_engine_store::chat::ChatMessage) ->
 /// about sending: a verb here reads as an example of the persona doing it, and
 /// models take it as one.
 ///
-/// `strip` applies the leading-sentence strip (spec §4.3) to the **prose**,
-/// before the marker is folded in. It must never run over the marker: the
-/// marker rarely carries a `SENTENCE_DELIMS` character, so stripping the folded
-/// string erases a caption-less photo row outright, and a caption containing
-/// `！` or `~` leaves a fragment like `夕阳下的海边]`. Ordering it this way
+/// `strip` applies the leading-sentence strip (spec §4.3) and then the
+/// action-block strip (audit 54: parenthesized stage directions in history
+/// are the contagion carrier) to the **prose**, before the marker is folded
+/// in. Neither must ever run over the marker: the marker rarely carries a
+/// `SENTENCE_DELIMS` character, so stripping the folded string erases a
+/// caption-less photo row outright, and a caption containing `！` or `~` (or
+/// parentheses) leaves a fragment like `夕阳下的海边]`. Ordering it this way
 /// makes a pure-image row (`content` empty) strip to nothing and then take the
 /// marker as its whole text — preserved intact, exactly what
 /// `model_config.rs`'s caption contract ("read back into the conversation
-/// history") promises. Callers rendering the persisted transcript pass `false`.
+/// history") promises. The leading-sentence strip runs first so §4.3 keeps
+/// operating on the original reply — this is also the shape audit 54's replay
+/// measured. Callers rendering the persisted transcript pass `false`.
 pub(crate) fn model_facing_assistant_text(
     msg: &eros_engine_store::chat::ChatMessage,
     strip: bool,
 ) -> String {
     let mut text = if strip {
-        crate::repetition::strip_leading_sentence(&msg.content)
+        crate::repetition::strip_action_blocks(&crate::repetition::strip_leading_sentence(
+            &msg.content,
+        ))
     } else {
         msg.content.clone()
     };
@@ -249,7 +255,8 @@ pub(crate) fn recall_query_text(msg: &eros_engine_store::chat::ChatMessage) -> S
 /// gate is needed. Assistant rows feed `content` (their `pre_filter_content`
 /// is the pre-output-filter original and must never re-enter the prompt),
 /// then, when `strip` is true, have their leading sentence stripped (spec
-/// §4.3 — the noise carrier, e.g. `唔`/`啊`) by
+/// §4.3 — the noise carrier, e.g. `唔`/`啊`) and their parenthesized action
+/// blocks removed (audit 54 — the contagion carrier, e.g. `（凑近）`) by
 /// `model_facing_assistant_text`, which strips the prose only and folds any
 /// photo marker in afterwards; a row with nothing left after stripping — no
 /// prose AND no marker — is omitted rather than injected as empty content,
@@ -2128,6 +2135,43 @@ mod tests {
         assert!(out[0].text.contains("海边的黄昏"));
         assert!(out[1].text.contains("厨房里的猫"));
         assert_eq!(out[0].role, "assistant");
+    }
+
+    #[test]
+    fn injected_assistant_prose_loses_its_action_blocks() {
+        // Audit 54: parenthesized stage directions in injected history are the
+        // contagion carrier. The leading-sentence strip (§4.3) runs first, then
+        // the action-block strip cleans the remainder.
+        let row = assistant_row("好呀。我等你（凑近你耳边）别迟到哦。", None);
+        let out = model_facing_history(vec![row], true);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, "我等你别迟到哦。");
+    }
+
+    #[test]
+    fn action_block_only_remainder_drops_the_row_but_never_the_marker() {
+        // Prose that strips to nothing (leading sentence gone, remainder all
+        // action block) rides the existing stripped-empty drop path…
+        let bare = assistant_row("嗯。（转身离开）", None);
+        assert!(model_facing_history(vec![bare], true).is_empty());
+        // …unless a photo marker exists: it is folded in AFTER the strip, so
+        // parentheses inside a caption are never touched.
+        let photo = assistant_row(
+            "嗯。（转身离开）",
+            Some(serde_json::json!({ "image": { "caption": "海边（自拍）" } })),
+        );
+        let out = model_facing_history(vec![photo], true);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, "[你的照片：海边（自拍）]");
+    }
+
+    #[test]
+    fn action_blocks_survive_when_noise_cancellation_is_disabled() {
+        // strip=false is the operator opt-out AND the persisted-transcript
+        // rendering path — both must see the row whole.
+        let row = assistant_row("好呀。我等你（凑近你耳边）别迟到哦。", None);
+        let out = model_facing_history(vec![row], false);
+        assert_eq!(out[0].text, "好呀。我等你（凑近你耳边）别迟到哦。");
     }
 
     #[test]
