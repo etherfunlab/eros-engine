@@ -172,7 +172,7 @@ pub async fn run(
             eval_text.trim().is_empty(),
         );
 
-        let (grades, levels, reason, affinity_gen_id, skip_reason, eval_failures) =
+        let (persona_name, (grades, levels, reason, affinity_gen_id, skip_reason, eval_failures)) =
             if pre_skip.is_none() {
                 let persona_repo = PersonaRepo { pool: &state.pool };
                 let affinity_repo = AffinityRepo { pool: &state.pool };
@@ -182,7 +182,7 @@ pub async fn run(
                 };
                 // Snapshot the current vector for prompt context only; the
                 // authoritative value is re-read under lock in persist_with_event.
-                match affinity_repo.load(session_id).await {
+                let outcome = match affinity_repo.load(session_id).await {
                     Ok(Some(current)) if !persona_name.is_empty() => {
                         evaluate_affinity(
                             &state,
@@ -203,15 +203,19 @@ pub async fn run(
                         Some("no_persona_or_affinity"),
                         Vec::new(),
                     ),
-                }
+                };
+                (persona_name, outcome)
             } else {
                 (
-                    eros_engine_core::affinity::AxisGrades::default(),
-                    eros_engine_core::affinity::EndpointLevelReads::default(),
                     String::new(),
-                    None,
-                    pre_skip,
-                    Vec::new(),
+                    (
+                        eros_engine_core::affinity::AxisGrades::default(),
+                        eros_engine_core::affinity::EndpointLevelReads::default(),
+                        String::new(),
+                        None,
+                        pre_skip,
+                        Vec::new(),
+                    ),
                 )
             };
 
@@ -244,14 +248,14 @@ pub async fn run(
         // all (absent = feature off, clause stays NULL) and on the request
         // actually injecting affinity (zero-axis scope ⇒ nothing would
         // render the clause).
-        if movement_turn(plan.action_type, &grades, &levels)
+        if movement_turn(&grades, &levels)
             && scope_has_axes
             && state.model_config.tasks.contains_key(SUMMARY_TASK)
         {
             summarize_feeling(
                 &state,
                 session_id,
-                instance_id,
+                &persona_name,
                 affinity_scope,
                 client_id.as_deref(),
             )
@@ -804,13 +808,14 @@ const SUMMARY_REASONS_LIMIT: i64 = 5;
 /// crossings always come with a grade ≥ 1, so nothing is missed; silent
 /// decay drift between sessions does not re-trigger (accepted lag — the
 /// clause is narrative state, [mood]'s gates keep reading live floats).
+/// Ghost turns never reach `post_process`, and the summarizer's inputs
+/// carry no ghost signal — a ghost's fallout enters the clause via the
+/// next evaluated turn.
 fn movement_turn(
-    action: ActionType,
     grades: &eros_engine_core::affinity::AxisGrades,
     levels: &eros_engine_core::affinity::EndpointLevelReads,
 ) -> bool {
-    action == ActionType::Ghost
-        || grades.trust != 0
+    grades.trust != 0
         || grades.intrigue != 0
         || grades.intimacy != 0
         || grades.tension != 0
@@ -1003,19 +1008,20 @@ async fn evaluate_affinity(
 /// to the turn's user — not a sweeper, so no SYSTEM_AUDIT_USER). Reads the
 /// POST-persist affinity row so the bands reflect this turn's movement.
 /// Fail-open everywhere: any error warns and keeps the old clause; the
-/// next movement turn rewrites anyway.
+/// next movement turn rewrites anyway. `persona_name` is the one the eval
+/// branch already loaded this turn — every reachable movement turn had a
+/// successful eval, so it is non-empty exactly when it matters; a second
+/// `PersonaRepo` load here would be redundant.
 async fn summarize_feeling(
     state: &AppState,
     session_id: Uuid,
-    instance_id: Uuid,
+    persona_name: &str,
     scope: eros_engine_core::scope::AffinityScope,
     audit_user: Option<&str>,
 ) {
-    let persona_repo = PersonaRepo { pool: &state.pool };
-    let persona_name = match persona_repo.load_companion(instance_id).await {
-        Ok(Some(p)) => p.genome.name,
-        _ => return, // no persona to voice the clause as
-    };
+    if persona_name.is_empty() {
+        return; // no persona to voice the clause as
+    }
     let repo = AffinityRepo { pool: &state.pool };
     let affinity = match repo.load(session_id).await {
         Ok(Some(a)) => a,
@@ -1030,7 +1036,7 @@ async fn summarize_feeling(
     let req = ChatRequest {
         model: resolved.model,
         fallback_model: resolved.fallback_model,
-        messages: affinity_summary_messages(&persona_name, &affinity, scope, &reasons),
+        messages: affinity_summary_messages(persona_name, &affinity, scope, &reasons),
         temperature: resolved.temperature as f32,
         max_tokens: resolved.max_tokens,
         sampling: resolved.sampling,
@@ -3846,27 +3852,25 @@ mod tests {
         use eros_engine_core::affinity::{AxisGrades, EndpointLevelReads};
         let quiet = (AxisGrades::default(), EndpointLevelReads::default());
         // White-water turn: all-zero grades, no endpoint reads, plain reply.
-        assert!(!movement_turn(ActionType::ReplyText, &quiet.0, &quiet.1));
+        assert!(!movement_turn(&quiet.0, &quiet.1));
         // Endpoint level 2 is the baseline — still quiet.
         let baseline = EndpointLevelReads {
             warmth: Some(2),
             patience: Some(2),
         };
-        assert!(!movement_turn(ActionType::ReplyText, &quiet.0, &baseline));
+        assert!(!movement_turn(&quiet.0, &baseline));
         // Any non-zero grade moves, either direction.
         let down = AxisGrades {
             trust: -1,
             ..Default::default()
         };
-        assert!(movement_turn(ActionType::ReplyText, &down, &quiet.1));
+        assert!(movement_turn(&down, &quiet.1));
         // Endpoint level off baseline moves.
         let cold = EndpointLevelReads {
             warmth: Some(1),
             patience: None,
         };
-        assert!(movement_turn(ActionType::ReplyText, &quiet.0, &cold));
-        // Ghost always moves, even with default grades (eval was skipped).
-        assert!(movement_turn(ActionType::Ghost, &quiet.0, &quiet.1));
+        assert!(movement_turn(&quiet.0, &cold));
     }
 
     #[test]

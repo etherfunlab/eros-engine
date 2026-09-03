@@ -2569,8 +2569,17 @@ impl ModelConfig {
         // (issue #210) and the feeling-clause summarizer (spec 2026-09-03),
         // whose first-person voice + reason hygiene are load-bearing — the
         // clause is re-injected into later system prompts.
-        const ENGINE_OWNED_AFFINITY_TASKS: [&str; 2] = ["affinity_evaluation", "affinity_summary"];
-        for task in ENGINE_OWNED_AFFINITY_TASKS {
+        const ENGINE_OWNED_AFFINITY_TASKS: [(&str, &str); 2] = [
+            (
+                "affinity_evaluation",
+                "https://github.com/etherfunlab/eros-engine/issues/210",
+            ),
+            (
+                "affinity_summary",
+                "docs/superpowers/specs/2026-09-03-affinity-feeling-clause-design.md",
+            ),
+        ];
+        for (task, rationale) in ENGINE_OWNED_AFFINITY_TASKS {
             let has_prompt = self
                 .tasks
                 .get(task)
@@ -2581,7 +2590,7 @@ impl ModelConfig {
                      engine-owned and deliberately not configurable — it was never read, \
                      and eros-engine refuses to boot rather than let it silently no-op. Remove the \
                      key; model/fallback/temperature/max_tokens/reasoning remain configurable. \
-                     Rationale: https://github.com/etherfunlab/eros-engine/issues/210"
+                     Rationale: {rationale}"
                 ));
             }
         }
@@ -7155,8 +7164,8 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
 
     #[test]
     fn affinity_summary_filter_prompt_refuses_boot() {
-        // Mirror the affinity_evaluation gate test's config-construction
-        // shape exactly; only the section name differs.
+        // Exercises the plain-string filter_prompt shape for this task; the
+        // affinity_evaluation tests above cover the table shape.
         let cfg = ModelConfig::from_toml_str(
             "[tasks.affinity_summary]\nmodel = \"m\"\nfilter_prompt = \"x\"\n",
         )

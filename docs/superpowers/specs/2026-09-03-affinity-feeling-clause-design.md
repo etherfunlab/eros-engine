@@ -74,12 +74,9 @@ row mapping follows.
 ## 4. Trigger
 
 After `persist_affinity` commits in `post_process`, the turn is a
-**movement turn** iff any of:
-
-- any line axis (trust / intrigue / intimacy / tension) got `grade >= 1`
-  from the judge, in either direction;
-- either endpoint (warmth / patience) got an absolute level read `!= 2`;
-- the turn recorded a ghost (`record_ghost` path).
+**movement turn** iff any line-axis grade (trust / intrigue / intimacy /
+tension) is `>= 1` in either direction, or an endpoint (warmth / patience)
+level read is `!= 2`.
 
 Only movement turns invoke the summarizer. The predicate is purely ordinal —
 it reads the judge's already-produced grades and levels, never compares
@@ -88,6 +85,10 @@ floats against band edges. In-turn band crossings always come with a
 not re-trigger, and the clause lags until the next real movement — accepted,
 the clause is narrative state, and `[mood]`'s live gates keep reading current
 floats.
+
+Ghost turns are not a trigger: they never reach `post_process`, and the
+summarizer's inputs carry no ghost signal — a ghost's fallout enters the
+clause via the next evaluated turn (its grades, and the decayed bands).
 
 The summarizer runs after the affinity write, inside the same post-process
 task, attributed to the turn's real user (it is request-scoped work, not a
@@ -186,8 +187,8 @@ Per-directive disposition of `affinity_to_attitude_prompt`:
   raw-number output are updated to the new spec — this is the feature's own
   expectation change, not assertion weakening.
 - **`post_process`:** unit tests for the movement predicate — any
-  `grade >= 1` triggers, endpoint level `!= 2` triggers, ghost triggers,
-  all-zero white-water turn does not.
+  `grade >= 1` triggers, endpoint level `!= 2` triggers, all-zero
+  white-water turn does not.
 - **store:** round-trip of the two new columns.
 - **summarizer:** payload builder (scope filtering, band labels, reason
   selection) and output parsing (good JSON / garbage / empty).
