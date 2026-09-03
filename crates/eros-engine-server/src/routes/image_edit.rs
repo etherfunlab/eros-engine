@@ -747,6 +747,9 @@ async fn edit_image(
         chat_repo
             .insert_assistant_batch(session_id, umid, &[insert])
             .await?;
+        // Separate transactions have separate `now()`s; make the ordering a
+        // guarantee rather than a timing fact.
+        chat_repo.nudge_sent_at_after(new_id, umid).await?;
         (Some(umid), Some(text))
     } else {
         let insert = AssistantInsert {
@@ -1857,6 +1860,20 @@ mod tests {
         assert_eq!(row_umid, Some(instruction_id));
         assert_eq!(metadata["image"]["prompt"], json!("EDITED SUBJECT"));
 
+        // History orders by sent_at alone, and the split path commits the two
+        // rows in separate transactions — the picture must still be pinned
+        // strictly after the instruction.
+        let ordered: bool = sqlx::query_scalar(
+            "SELECT (SELECT sent_at FROM engine.chat_messages WHERE id = $1) \
+                  > (SELECT sent_at FROM engine.chat_messages WHERE id = $2)",
+        )
+        .bind(new_id)
+        .bind(instruction_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(ordered, "the picture must sort after the instruction");
+
         // The chat model saw the instruction (it drives the reply).
         let reqs = mock.received_requests().await.unwrap();
         let chat = reqs
@@ -1953,7 +1970,16 @@ mod tests {
         assert!(body.get("instruction_message_id").is_none(), "got {body}");
         assert!(!companion_was_called(&mock).await);
 
+        // A wrongly spawned pipeline must hit the judge mock before it can
+        // write — checking both narrows the false-pass window.
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let judged = mock
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| String::from_utf8_lossy(&r.body).contains("当前档位"));
+        assert!(!judged, "inert flag must not reach the affinity judge");
         let n: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM engine.companion_affinity WHERE session_id = $1",
         )

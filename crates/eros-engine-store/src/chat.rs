@@ -942,6 +942,30 @@ impl<'a> ChatRepo<'a> {
         .await
     }
 
+    /// Pin `row_id`'s `sent_at` at least 1µs after `after_id`'s — the split
+    /// (rolled-text) edit path's counterpart of `insert_instruction_turn`'s
+    /// in-transaction nudge, since history orders by `sent_at` alone.
+    /// Usually a no-op GREATEST: the LLM call between the two inserts keeps
+    /// the stamps naturally apart.
+    pub async fn nudge_sent_at_after(
+        &self,
+        row_id: Uuid,
+        after_id: Uuid,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE engine.chat_messages \
+             SET sent_at = GREATEST(sent_at, \
+                 (SELECT sent_at + interval '1 microsecond' \
+                    FROM engine.chat_messages WHERE id = $2)) \
+             WHERE id = $1",
+        )
+        .bind(row_id)
+        .bind(after_id)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn insert_instruction_turn(
         &self,
         session_id: Uuid,
