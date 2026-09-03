@@ -107,8 +107,14 @@ pub async fn run(
         } => (content.clone(), Some(*message_id)),
         _ => (String::new(), None),
     };
-    // As of 4.0 the request's affinity scope is read-side only (prompt
-    // injection gating); nothing in the write path consumes it any more.
+    // As of 4.0 the request's affinity scope is read-side (prompt injection
+    // gating) AND consumed here by the feeling-clause summarizer, which only
+    // narrates axes the request actually asked for.
+    let affinity_scope = match &event {
+        Event::UserMessage { affinity_scope, .. } => *affinity_scope,
+        _ => eros_engine_core::scope::AffinityScope::default(),
+    };
+    let scope_has_axes = affinity_scope.active_count() > 0;
     let client_id = client_id_from_event(&event);
 
     let fut_insight = async {
@@ -166,7 +172,7 @@ pub async fn run(
             eval_text.trim().is_empty(),
         );
 
-        let (grades, levels, reason, affinity_gen_id, skip_reason, eval_failures) =
+        let (persona_name, (grades, levels, reason, affinity_gen_id, skip_reason, eval_failures)) =
             if pre_skip.is_none() {
                 let persona_repo = PersonaRepo { pool: &state.pool };
                 let affinity_repo = AffinityRepo { pool: &state.pool };
@@ -176,7 +182,7 @@ pub async fn run(
                 };
                 // Snapshot the current vector for prompt context only; the
                 // authoritative value is re-read under lock in persist_with_event.
-                match affinity_repo.load(session_id).await {
+                let outcome = match affinity_repo.load(session_id).await {
                     Ok(Some(current)) if !persona_name.is_empty() => {
                         evaluate_affinity(
                             &state,
@@ -197,15 +203,19 @@ pub async fn run(
                         Some("no_persona_or_affinity"),
                         Vec::new(),
                     ),
-                }
+                };
+                (persona_name, outcome)
             } else {
                 (
-                    eros_engine_core::affinity::AxisGrades::default(),
-                    eros_engine_core::affinity::EndpointLevelReads::default(),
                     String::new(),
-                    None,
-                    pre_skip,
-                    Vec::new(),
+                    (
+                        eros_engine_core::affinity::AxisGrades::default(),
+                        eros_engine_core::affinity::EndpointLevelReads::default(),
+                        String::new(),
+                        None,
+                        pre_skip,
+                        Vec::new(),
+                    ),
                 )
             };
 
@@ -232,6 +242,25 @@ pub async fn run(
             user_message_id,
         )
         .await;
+
+        // Feeling-clause summarizer (spec 2026-09-03): movement turns only,
+        // gated on the [tasks.affinity_summary] section being present at
+        // all (absent = feature off, clause stays NULL) and on the request
+        // actually injecting affinity (zero-axis scope ⇒ nothing would
+        // render the clause).
+        if movement_turn(&grades, &levels)
+            && scope_has_axes
+            && state.model_config.tasks.contains_key(SUMMARY_TASK)
+        {
+            summarize_feeling(
+                &state,
+                session_id,
+                &persona_name,
+                affinity_scope,
+                client_id.as_deref(),
+            )
+            .await;
+        }
     };
 
     let fut_character_insight = async {
@@ -768,6 +797,76 @@ fn affinity_eval_messages(
     ]
 }
 
+const SUMMARY_TASK: &str = "affinity_summary";
+const AFFINITY_SUMMARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Judge reasons fed to the summarizer, newest-first (spec §5).
+const SUMMARY_REASONS_LIMIT: i64 = 5;
+
+/// Movement predicate (spec §4): rewrite the feeling clause only on turns
+/// with real affinity movement. Purely ordinal — reads the judge's grades
+/// and levels, never compares floats against band edges. In-turn band
+/// crossings always come with a grade ≥ 1, so nothing is missed; silent
+/// decay drift between sessions does not re-trigger (accepted lag — the
+/// clause is narrative state, [mood]'s gates keep reading live floats).
+/// Ghost turns never reach `post_process`, and the summarizer's inputs
+/// carry no ghost signal — a ghost's fallout enters the clause via the
+/// next evaluated turn.
+fn movement_turn(
+    grades: &eros_engine_core::affinity::AxisGrades,
+    levels: &eros_engine_core::affinity::EndpointLevelReads,
+) -> bool {
+    grades.trust != 0
+        || grades.intrigue != 0
+        || grades.intimacy != 0
+        || grades.tension != 0
+        || levels.warmth.is_some_and(|l| l != 2)
+        || levels.patience.is_some_and(|l| l != 2)
+}
+
+/// Raw shape of the summarizer's JSON output.
+#[derive(Debug, serde::Deserialize)]
+struct LlmAffinitySummary {
+    clause: String,
+}
+
+/// Parse the summarizer output. Any failure — non-JSON, missing/blank
+/// clause — is `None`: the caller keeps the old clause (spec §5 failure
+/// handling), same fail-open posture as `parse_affinity_eval`.
+fn parse_affinity_summary(raw: &str) -> Option<String> {
+    let parsed: LlmAffinitySummary = super::parse_llm_json(raw)?;
+    let clause = parsed.clause.trim();
+    if clause.is_empty() {
+        None
+    } else {
+        Some(clause.to_string())
+    }
+}
+
+/// Build the summarizer's two-message request; pure, unit-testable without
+/// an `AppState` — same split as `affinity_eval_messages`.
+fn affinity_summary_messages(
+    persona_name: &str,
+    affinity: &eros_engine_core::affinity::Affinity,
+    scope: eros_engine_core::scope::AffinityScope,
+    reasons: &[String],
+) -> Vec<ChatMessage> {
+    vec![
+        ChatMessage {
+            role: "system".into(),
+            content: crate::prompt::affinity_summary_system_prompt().to_string(),
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: crate::prompt::affinity_summary_user_payload(
+                persona_name,
+                affinity,
+                scope,
+                reasons,
+            ),
+        },
+    ]
+}
+
 /// Grades, endpoint level reads, the model's reason, the audit trio, the skip
 /// marker, and every failed attempt — what one eval hands back to the caller.
 type AffinityEvalOutcome = (
@@ -902,6 +1001,88 @@ async fn evaluate_affinity(
     // so a NULL audit join key is never left unexplained.
     let skip = missing_generation_skip_reason(generation_id.as_deref());
     (grades, levels, reason, generation_id, skip, recovered)
+}
+
+/// Rewrite the session's feeling clause (spec 2026-09-03 §5). Runs on
+/// movement turns only, after the affinity write, request-scoped (billed
+/// to the turn's user — not a sweeper, so no SYSTEM_AUDIT_USER). Reads the
+/// POST-persist affinity row so the bands reflect this turn's movement.
+/// Fail-open everywhere: any error warns and keeps the old clause; the
+/// next movement turn rewrites anyway. `persona_name` is the one the eval
+/// branch already loaded this turn — every reachable movement turn had a
+/// successful eval, so it is non-empty exactly when it matters; a second
+/// `PersonaRepo` load here would be redundant.
+async fn summarize_feeling(
+    state: &AppState,
+    session_id: Uuid,
+    persona_name: &str,
+    scope: eros_engine_core::scope::AffinityScope,
+    audit_user: Option<&str>,
+) {
+    if persona_name.is_empty() {
+        return; // no persona to voice the clause as
+    }
+    let repo = AffinityRepo { pool: &state.pool };
+    let affinity = match repo.load(session_id).await {
+        Ok(Some(a)) => a,
+        _ => return, // archived mid-flight, or read error — keep old clause
+    };
+    let reasons = repo
+        .recent_reasons(session_id, SUMMARY_REASONS_LIMIT)
+        .await
+        .unwrap_or_default();
+
+    let resolved = state.model_config.resolve(SUMMARY_TASK, None);
+    let req = ChatRequest {
+        model: resolved.model,
+        fallback_model: resolved.fallback_model,
+        messages: affinity_summary_messages(persona_name, &affinity, scope, &reasons),
+        temperature: resolved.temperature as f32,
+        max_tokens: resolved.max_tokens,
+        sampling: resolved.sampling,
+        user: audit_user.map(String::from),
+        reasoning: resolved.reasoning,
+        task: Some(SUMMARY_TASK.into()),
+        ..Default::default()
+    };
+    let resp =
+        match tokio::time::timeout(AFFINITY_SUMMARY_TIMEOUT, state.openrouter.execute(req)).await {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => {
+                tracing::warn!("affinity summary LLM call failed: {e}");
+                return;
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                "affinity summary timed out after {AFFINITY_SUMMARY_TIMEOUT:?}; keeping old clause"
+            );
+                return;
+            }
+        };
+    super::record_generation(
+        &state.pool,
+        super::GenerationRecord {
+            task: SUMMARY_TASK,
+            session_id: Some(session_id),
+            generation_id: resp.generation_id.as_deref(),
+            model: resp.model.as_deref(),
+            usage: resp.usage.as_ref(),
+        },
+    )
+    .await;
+    let Some(clause) = parse_affinity_summary(&resp.reply) else {
+        tracing::warn!("affinity summary output unparseable; keeping old clause");
+        return;
+    };
+    // `affinity.updated_at` is the persisted state this clause summarizes;
+    // the store's as-of guard drops the write if a summary derived from a
+    // newer state already landed (overlapping movement turns).
+    if let Err(e) = repo
+        .set_feeling_clause(session_id, &clause, affinity.updated_at)
+        .await
+    {
+        tracing::warn!("feeling_clause write failed: {e}");
+    }
 }
 
 const INSIGHT_TASK: &str = "insight_extraction";
@@ -3642,6 +3823,8 @@ mod tests {
             ghost_streak: 0,
             last_ghost_at: None,
             total_ghosts: 0,
+            feeling_clause: None,
+            feeling_clause_at: None,
             created_at: now,
             updated_at: now,
         }
@@ -3668,6 +3851,59 @@ mod tests {
             !msgs[0].content.contains("我今天好累"),
             "system message must stay static across turns"
         );
+    }
+
+    #[test]
+    fn movement_turn_quiet_and_moving() {
+        use eros_engine_core::affinity::{AxisGrades, EndpointLevelReads};
+        let quiet = (AxisGrades::default(), EndpointLevelReads::default());
+        // White-water turn: all-zero grades, no endpoint reads, plain reply.
+        assert!(!movement_turn(&quiet.0, &quiet.1));
+        // Endpoint level 2 is the baseline — still quiet.
+        let baseline = EndpointLevelReads {
+            warmth: Some(2),
+            patience: Some(2),
+        };
+        assert!(!movement_turn(&quiet.0, &baseline));
+        // Any non-zero grade moves, either direction.
+        let down = AxisGrades {
+            trust: -1,
+            ..Default::default()
+        };
+        assert!(movement_turn(&down, &quiet.1));
+        // Endpoint level off baseline moves.
+        let cold = EndpointLevelReads {
+            warmth: Some(1),
+            patience: None,
+        };
+        assert!(movement_turn(&quiet.0, &cold));
+    }
+
+    #[test]
+    fn parse_affinity_summary_good_fenced_garbage_empty() {
+        assert_eq!(
+            parse_affinity_summary(r#"{"clause": "我现在挺想他的。"}"#).as_deref(),
+            Some("我现在挺想他的。")
+        );
+        // parse_llm_json already salvages fenced blocks — same behavior here.
+        assert_eq!(
+            parse_affinity_summary("```json\n{\"clause\": \"还行。\"}\n```").as_deref(),
+            Some("还行。")
+        );
+        assert_eq!(parse_affinity_summary("not json at all"), None);
+        assert_eq!(parse_affinity_summary(r#"{"clause": "   "}"#), None);
+        assert_eq!(parse_affinity_summary(r#"{"other": "x"}"#), None);
+    }
+
+    #[test]
+    fn affinity_summary_messages_is_system_then_user() {
+        use eros_engine_core::scope::AffinityScope;
+        let a = fixture_eval_affinity();
+        let msgs = affinity_summary_messages("小雨", &a, AffinityScope::full(), &[]);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, "system");
+        assert_eq!(msgs[1].role, "user");
+        assert!(msgs[1].content.contains("角色名：小雨"));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
