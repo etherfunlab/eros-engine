@@ -34,8 +34,9 @@ pub enum EnqueueOutcome {
 }
 
 /// Outcome of a born-claimed (stream-path) enqueue. Mirrors
-/// `UpsertUserOutcome` so the stream handler keeps its existing replay /
-/// duplicate responses; only `Inserted` grows a queue row (spec §4).
+/// `UpsertUserOutcome` — with the duplicate case split by the queue row's
+/// status, like `EnqueueOutcome` — so the stream handler keeps its existing
+/// replay / duplicate responses; only `Inserted` grows a queue row (spec §4).
 #[derive(Debug)]
 pub enum ClaimedEnqueueOutcome {
     Claimed {
@@ -48,6 +49,13 @@ pub enum ClaimedEnqueueOutcome {
         assistant_chain: Vec<ReplayMessage>,
     },
     DuplicateInProgress {
+        user_message_id: Uuid,
+    },
+    /// The duplicate's queue row is terminally `failed` — nothing re-opens it,
+    /// so a same-id retry can never succeed. Distinct from
+    /// `DuplicateInProgress` so the client can mint a fresh `client_msg_id`
+    /// instead of backing off forever.
+    DuplicateFailed {
         user_message_id: Uuid,
     },
 }
@@ -181,8 +189,21 @@ impl<'a> ChatQueueRepo<'a> {
                 })
             }
             UpsertUserOutcome::DuplicateInProgress { user_message_id } => {
+                let status: Option<String> = sqlx::query_scalar(
+                    "SELECT status FROM engine.chat_turn_queue WHERE user_message_id = $1",
+                )
+                .bind(user_message_id)
+                .fetch_optional(&mut *tx)
+                .await?;
                 tx.commit().await?;
-                Ok(ClaimedEnqueueOutcome::DuplicateInProgress { user_message_id })
+                Ok(match status.as_deref() {
+                    Some("failed") => ClaimedEnqueueOutcome::DuplicateFailed { user_message_id },
+                    // pending / claimed → still generating. A missing queue row
+                    // is a turn persisted before stream turns rode the queue
+                    // (legacy rows) — same "being handled" answer is still the
+                    // safe reply.
+                    _ => ClaimedEnqueueOutcome::DuplicateInProgress { user_message_id },
+                })
             }
         }
     }
@@ -1114,5 +1135,70 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(rows, 0);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn enqueue_claimed_splits_duplicate_by_queue_status(pool: PgPool) {
+        let (user_id, session_id) = seed_session(&pool).await;
+        let repo = ChatQueueRepo { pool: &pool };
+        let ClaimedEnqueueOutcome::Claimed {
+            user_message_id: mid,
+            queue_id,
+        } = repo
+            .enqueue_user_message_claimed(
+                session_id,
+                "hello",
+                "01JW00000000000000000000DF",
+                "user",
+                None,
+                user_id,
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected Claimed");
+        };
+
+        // Still claimed → the duplicate is genuinely in progress.
+        let out = repo
+            .enqueue_user_message_claimed(
+                session_id,
+                "hello",
+                "01JW00000000000000000000DF",
+                "user",
+                None,
+                user_id,
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            out,
+            ClaimedEnqueueOutcome::DuplicateInProgress { user_message_id } if user_message_id == mid
+        ));
+
+        // Terminally failed → the duplicate must surface as dead, not busy.
+        sqlx::query("UPDATE engine.chat_turn_queue SET status = 'failed' WHERE id = $1")
+            .bind(queue_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let out = repo
+            .enqueue_user_message_claimed(
+                session_id,
+                "hello",
+                "01JW00000000000000000000DF",
+                "user",
+                None,
+                user_id,
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            out,
+            ClaimedEnqueueOutcome::DuplicateFailed { user_message_id } if user_message_id == mid
+        ));
     }
 }

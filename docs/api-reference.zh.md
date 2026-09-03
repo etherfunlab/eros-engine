@@ -141,8 +141,11 @@ data: {"type":"final","filtered":false,"prompt_injected":null,"tier":null,"retri
 防止反向代理因空闲超时断开连接。
 
 流前错误（第一个 SSE 字节写出之前的 HTTP 4xx/5xx）携带含 `code`、
-`message`、`user_message` 字段的 JSON 响应体；`409 duplicate_in_progress`
-时还会带 `original_user_message_id`。完整错误码表见
+`message`、`user_message` 字段的 JSON 响应体；`409 duplicate_in_progress` /
+`409 duplicate_failed` 时还会带 `original_user_message_id`。
+`duplicate_in_progress` 表示同一 `(session_id, client_msg_id)` 仍在生成中
+（稍候重发即可）；`duplicate_failed` 表示那一轮已终态失败，同 id 重试永远
+不会成功——换一个新的 `client_msg_id` 再发。完整错误码表见
 [设计文档](superpowers/specs/2026-05-19-sse-streaming-chat-0.2-design.md#13-pre-stream-errors-http-status-json-body)。
 
 **该端点仅限文本频道。** 传入语音频道 session 的 `session_id` 会在落库任何

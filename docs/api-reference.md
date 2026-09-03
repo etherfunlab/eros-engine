@@ -157,7 +157,11 @@ idle connection.
 
 Pre-stream errors (HTTP 4xx/5xx before the first SSE byte) carry a JSON
 body with `code`, `message`, `user_message` and — for
-`409 duplicate_in_progress` — an `original_user_message_id`. See the
+`409 duplicate_in_progress` / `409 duplicate_failed` — an
+`original_user_message_id`. `duplicate_in_progress` means the same
+`(session_id, client_msg_id)` is still generating (back off and re-POST);
+`duplicate_failed` means that turn terminally failed and a same-id retry can
+never succeed — send a fresh `client_msg_id`. See the
 [spec](superpowers/specs/2026-05-19-sse-streaming-chat-0.2-design.md#13-pre-stream-errors-http-status-json-body)
 for the full code table.
 

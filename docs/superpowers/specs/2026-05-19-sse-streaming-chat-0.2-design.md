@@ -68,6 +68,7 @@ Before the first SSE byte is written, these errors return a normal HTTP error re
 |    403 | `session_forbidden`     | JWT user does not own the `session_id`                             |
 |    404 | `session_not_found`     | `session_id` does not exist                                        |
 |    409 | `duplicate_in_progress` | Same `(session_id, client_msg_id)` is still generating. Response body carries `original_user_message_id`. |
+|    409 | `duplicate_failed`      | Same `(session_id, client_msg_id)` terminally failed; a same-id retry can never succeed — send a fresh `client_msg_id`. Response body carries `original_user_message_id`. |
 |    422 | `unprocessable`         | content length 0 or > 4096, content-policy violation               |
 |    429 | `rate_limited`          | Per-user concurrent stream cap (3) or per-minute cap hit           |
 |    500 | `internal`              | Unexpected server error                                            |
@@ -227,6 +228,7 @@ The dedup key is `(session_id, client_msg_id)` within a 24 h window.
 | Replay: original request finished (all assistant messages persisted)                      | `200 text/event-stream`, **replay** from DB. For each persisted assistant message (in original order), synthesize: `meta` (with original `action_type`, `model`, and `continues_from` chain) + a single `delta` carrying the full text + `done` (with original `truncated` flag, persisted `usage`, persisted `generation_id`). Conclude with one `final` computed from **current** session state (not snapshotted). No OpenRouter call is made. |
 | Replay: original was a **ghost** (no assistant rows persisted)                            | `200 text/event-stream`. Synthesize `meta(action_type="ghost", message_id=<new ULID, not persisted>)` + `done(truncated:false, usage:null, generation_id:null)` + one `final`. To distinguish ghost-replay from "duplicate user_msg row exists but has no linked assistant yet" (= 409 race), the persistence layer MUST mark the user message row with a `ghost_decision` flag when ghost was chosen — see §2.5. |
 | Race: original request still generating                                                   | `409 duplicate_in_progress` pre-stream JSON with `original_user_message_id`. Client should poll history.                                                                                                                                                                     |
+| Duplicate of a terminally **failed** turn (queue row `failed`, no assistant rows)         | `409 duplicate_failed` pre-stream JSON with `original_user_message_id`. The turn is dead — nothing re-opens the failed row; the client must send a fresh `client_msg_id` to retry.                                                                                            |
 
 The persistence layer must support this — see §2.5.
 
