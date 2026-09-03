@@ -531,7 +531,8 @@ consumer draws it, exactly as for a chat image turn.
   "aspect_ratio": "3:4",
   "prompt_variant": "a",
   "persist_instruction": true,
-  "evaluate_affinity": true
+  "evaluate_affinity": true,
+  "reply_with_text": 0.4
 }
 ```
 
@@ -557,7 +558,21 @@ consumer draws it, exactly as for a chat image turn.
   new picture's caption is what the character answered. Detached — the response
   never waits on the judge. Orthogonal to `persist_instruction` (the judge
   reads the instruction either way); when an instruction row was persisted it
-  anchors the affinity event's `user_message_id`.
+  anchors the affinity event's `user_message_id`. Overridden by
+  `reply_with_text` — the full pipeline it starts already includes the judge.
+- `reply_with_text` — absent by default; `0.0`–`1.0`, else 422. Requires
+  `persist_instruction` (silently inert without it). When present, the edit is
+  a **full chat turn**: the whole post-turn pipeline runs afterward — affinity,
+  memory, insights, exactly as after a chat turn — and the value is the
+  probability that the character also says something with the picture. `0`
+  never (`reply_image` every time), `1` always (`reply_text_image` every
+  time), in between the engine rolls — the dice stand in for the PDE, which
+  this endpoint never consults. The text half is a real companion-model reply
+  driven by the persisted instruction row (history, memory recall and
+  relationship context included) and lands in the same assistant row as the
+  picture, chat-shaped. A failed or blank text half degrades the turn to
+  `reply_image` — the picture is the turn's substance — and the row's failure
+  columns keep the evidence.
 
 ```json
 {
@@ -567,13 +582,20 @@ consumer draws it, exactly as for a chat image turn.
   "image_ref": "previous",
   "aspect_ratio": "3:4",
   "caption": "换了条裙子",
-  "instruction_message_id": "…"
+  "instruction_message_id": "…",
+  "action_type": "reply_text_image",
+  "reply_text": "新造型来啦，你看看喜欢吗"
 }
 ```
 
 `instruction_message_id` is present only when `persist_instruction` was set:
 the persisted instruction message, so a client can render the user bubble
 without refetching history.
+
+`action_type` says what the turn is: `reply_text_image` when the
+`reply_with_text` dice rolled a text half and it landed, `reply_image`
+otherwise — including every call without `reply_with_text`. `reply_text` is
+present exactly on `reply_text_image` turns.
 
 `composed_prompt` is base64(STANDARD) of the UTF-8 wire prompt — the same
 encoding as the SSE `image_request` frame and the recovery endpoint, so an
@@ -587,8 +609,9 @@ The new message is an ordinary image turn: it appears in history with
 `metadata.image` additionally carries `edit_of`. An edit can itself be edited.
 
 Nothing else about a turn runs on this call by default: no PDE decision, no
-affinity movement, no insight or memory extraction. The one opt-in exception
-is `evaluate_affinity` — and it runs the affinity pass alone, nothing else.
+affinity movement, no insight or memory extraction. Two opt-ins widen that:
+`evaluate_affinity` runs the affinity pass alone, nothing else; and
+`reply_with_text` turns the whole call into a full chat turn (see above).
 Without `persist_instruction` the
 new row inherits the source's `user_message_id` — the edit belongs to the turn
 the original picture answered; with it, the new row's `user_message_id` is the

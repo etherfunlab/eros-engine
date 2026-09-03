@@ -2627,7 +2627,7 @@
           },
           "evaluate_affinity": {
             "type": "boolean",
-            "description": "Run this edit through the per-turn affinity judge: the instruction is\nwhat the user said, the new picture's caption is what the character\nanswered. Detached — the response never waits on the judge. Orthogonal\nto `persist_instruction`; when an instruction row was persisted it\nanchors the affinity event. Default false: an edit does not move\naffinity unless the consumer says so."
+            "description": "Run this edit through the per-turn affinity judge: the instruction is\nwhat the user said, the new picture's caption is what the character\nanswered. Detached — the response never waits on the judge. Orthogonal\nto `persist_instruction`; when an instruction row was persisted it\nanchors the affinity event. Default false: an edit does not move\naffinity unless the consumer says so. Overridden by `reply_with_text`\n(present + `persist_instruction`): the full pipeline it starts already\nincludes the affinity judge."
           },
           "instruction": {
             "type": "string",
@@ -2644,6 +2644,14 @@
             ],
             "description": "`[tasks.chat_image_edit_compose].filter_prompt` variant, with the same\nselection rules as the chat path's `image.prompt_variant`."
           },
+          "reply_with_text": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Treat this edit as a full chat turn. Requires `persist_instruction`\n(ignored without it). When present, the whole post-turn pipeline runs —\naffinity, memory, insights, exactly as after a chat turn — and the\nvalue is the probability that the character also says something with\nthe picture: `0` = `reply_image` every time, `1` = `reply_text_image`\nevery time, in between the engine rolls (the dice stand in for the PDE,\nwhich this endpoint never consults). The text half is a real\ncompanion-model reply driven by the persisted instruction row. Absent =\nnone of this: the endpoint's classic contract."
+          },
           "style": {
             "type": [
               "string",
@@ -2659,9 +2667,14 @@
           "message_id",
           "edit_of",
           "composed_prompt",
-          "image_ref"
+          "image_ref",
+          "action_type"
         ],
         "properties": {
+          "action_type": {
+            "type": "string",
+            "description": "What this turn is: `reply_text_image` when the `reply_with_text` dice\nrolled a text half and it landed, `reply_image` otherwise (including\nevery call without `reply_with_text`)."
+          },
           "aspect_ratio": {
             "type": [
               "string",
@@ -2697,6 +2710,13 @@
           "message_id": {
             "type": "string",
             "description": "The new assistant message."
+          },
+          "reply_text": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The character's text half, when the turn is `reply_text_image`."
           }
         }
       },

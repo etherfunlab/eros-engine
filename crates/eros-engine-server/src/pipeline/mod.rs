@@ -73,7 +73,7 @@ const AUDIT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// than a `&ChatResponse`: four streaming arms never own one, and two of them
 /// used to synthesise a fake with an empty `reply` purely to satisfy this
 /// function's parameter.
-pub(super) struct GenerationRecord<'a> {
+pub(crate) struct GenerationRecord<'a> {
     pub task: &'a str,
     pub session_id: Option<Uuid>,
     pub generation_id: Option<&'a str>,
@@ -101,7 +101,7 @@ pub(super) struct GenerationRecord<'a> {
 /// `usage` JSON — missing fields silently drop out. The row stores `usage`
 /// whole and unfiltered; `OPENROUTER_USAGE_HIDDEN_KEYS` applies only on the
 /// way out to clients.
-pub(super) async fn record_generation(
+pub(crate) async fn record_generation(
     pool: &sqlx::PgPool,
     rec: GenerationRecord<'_>,
 ) -> Option<String> {

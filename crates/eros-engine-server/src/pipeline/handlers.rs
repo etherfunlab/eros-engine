@@ -56,7 +56,7 @@ const WORLD_RECALL_K: i32 = 3;
 const STORY_RECALL_K: i32 = 3;
 
 /// Task key used by all chat handlers. Matches the gateway's task router.
-const CHAT_TASK: &str = "chat_companion";
+pub(crate) const CHAT_TASK: &str = "chat_companion";
 
 /// Maximum number of recent messages fetched per turn. This is the fetch size
 /// only: `history_window`'s ladder selects the injected subset from what this
@@ -728,7 +728,7 @@ async fn fetch_stories_context(
 
 /// Build a ChatRequest for the Reply action. Called by the streaming
 /// pipeline (`pipeline::stream::run_stream`).
-pub(super) async fn build_reply_request(
+pub(crate) async fn build_reply_request(
     state: &AppState,
     input: &DecisionInput,
     plan: &ActionPlan,

@@ -459,7 +459,8 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
   "aspect_ratio": "3:4",
   "prompt_variant": "a",
   "persist_instruction": true,
-  "evaluate_affinity": true
+  "evaluate_affinity": true,
+  "reply_with_text": 0.4
 }
 ```
 
@@ -479,7 +480,18 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 - `evaluate_affinity` —— 缺省 `false`。设上时，这一轮走标准的逐轮好感度判官：
   用户说的是这条指令，角色答的是新图的 caption。判官是脱管跑的 —— 响应不等它。
   与 `persist_instruction` 正交（判官读的都是指令本身）；落了指令行时，
-  好感度事件的 `user_message_id` 锚到那条指令消息。
+  好感度事件的 `user_message_id` 锚到那条指令消息。会被 `reply_with_text`
+  覆盖 —— 它启动的完整管线本来就带判官。
+- `reply_with_text` —— 缺省不带；取值 `0.0`–`1.0`，越界 422。需要
+  `persist_instruction`（没带时静默不起作用）。带上时这次编辑就是一个
+  **完整聊天回合**：事后整条 post-turn 管线照跑 —— 好感度、记忆、insight，
+  和聊天回合一模一样 —— 而这个值是角色随图说话的概率。`0` 永不
+  （每次 `reply_image`）、`1` 必说（每次 `reply_text_image`），中间由引擎掷骰
+  —— 骰子在这里顶替 PDE，本端点从不请判官定 action。文本半边是一次真实的
+  companion 模型回复，由落库的指令行驱动（带历史、记忆召回与关系上下文），
+  和图片落在同一条 assistant 行里，与聊天路径同形。文本调用失败或回了空文本
+  就降级成 `reply_image` —— 图才是这一轮的主体 —— 失败证据留在该行的
+  失败列里。
 
 ```json
 {
@@ -489,12 +501,18 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
   "image_ref": "previous",
   "aspect_ratio": "3:4",
   "caption": "换了条裙子",
-  "instruction_message_id": "…"
+  "instruction_message_id": "…",
+  "action_type": "reply_text_image",
+  "reply_text": "新造型来啦，你看看喜欢吗"
 }
 ```
 
 `instruction_message_id` 只在设了 `persist_instruction` 时出现：
 落库的那条指令消息，客户端不用重拉历史就能渲染用户气泡。
+
+`action_type` 报这一轮是什么：`reply_with_text` 的骰子掷中且文本落地时是
+`reply_text_image`，其余一律 `reply_image` —— 包括所有没带 `reply_with_text`
+的调用。`reply_text` 恰好只在 `reply_text_image` 回合出现。
 
 `composed_prompt` 是 UTF-8 提示词的 base64（STANDARD）—— 与 SSE `image_request`
 帧、恢复端点的编码一致，现成的画图链路可直接消费。`image_ref` 恒为 `previous`，
@@ -505,8 +523,9 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 `metadata.image` 另外带一个 `edit_of`。编辑出来的图还可以再编辑。
 
 这次调用里回合的其余部分默认一概不跑：不做 PDE 判定、不动好感度、不抽 insight
-与记忆。唯一的可选例外是 `evaluate_affinity` —— 它也只跑好感度这一段，
-别的照旧不跑。不带 `persist_instruction` 时新行沿用原图行的 `user_message_id` ——
+与记忆。两个可选项往外放：`evaluate_affinity` 只跑好感度这一段，别的照旧不跑；
+`reply_with_text` 则把整次调用变成一个完整聊天回合（见上）。
+不带 `persist_instruction` 时新行沿用原图行的 `user_message_id` ——
 这次编辑属于原图所回应的那个回合；带上时，新行的 `user_message_id`
 就是落库的那条指令消息。
 
