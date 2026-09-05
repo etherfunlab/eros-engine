@@ -283,6 +283,19 @@ fn edit_turn_event(
     }
 }
 
+/// Edit-turn tier→style mapping (#349 gap 3): no judge runs on this endpoint,
+/// so the affinity's warmth grade picks the `[turn_style]` line — cold floor
+/// at grade 1, warm at grade 3. Chosen over pinning Neutral after an A/B
+/// reading of prod-model candidates; the chat path keeps its own channel
+/// (judge-written free-text tone) and stays pinned.
+fn tier_reply_style(warmth_grade: i16) -> ReplyStyle {
+    match warmth_grade {
+        ..=1 => ReplyStyle::Cold,
+        2 => ReplyStyle::Neutral,
+        3.. => ReplyStyle::Warm,
+    }
+}
+
 /// A minimal ActionPlan for a turn no PDE decided: neutral delivery, zero
 /// rule deltas.
 fn edit_turn_plan(action: ActionType) -> ActionPlan {
@@ -349,11 +362,16 @@ async fn generate_reply_text(
         signals,
     };
     let mut plan = edit_turn_plan(ActionType::ReplyTextImage);
+    plan.reply_style = tier_reply_style(input.affinity.warmth_grade);
     if let Some(c) = caption.map(str::trim).filter(|s| !s.is_empty()) {
         // The new picture rides along as an inner-state hint so the words
-        // match what the picture now shows.
+        // match what the picture now shows. Prose-woven on purpose: a labeled
+        // "新照片：…" shape reads as a marker format and the model echoes it
+        // into the reply as a bracket block; weaving the caption into a
+        // sentence leaves nothing to echo. Present tense "already sent" —
+        // otherwise the reply narrates going off to make the edit.
         plan.context_hints = vec![format!(
-            "你刚按对方的要求把照片改了一版，随这条回复一起发出（新照片：{c}）；说的话要贴合这张新照片"
+            "你已经按对方的要求把照片改好，随这条回复一起发出——新照片里{c}。照片已经在对方眼前，直接说贴着它的话"
         )];
     }
     let (chat_req, _tags) = match build_reply_request(
@@ -426,7 +444,15 @@ async fn generate_reply_text(
 
 #[cfg(test)]
 mod payload_tests {
-    use super::compose_edit_payload;
+    use super::{compose_edit_payload, tier_reply_style};
+    use eros_engine_core::types::ReplyStyle;
+
+    #[test]
+    fn tier_reply_style_maps_cold_neutral_warm() {
+        assert_eq!(tier_reply_style(1), ReplyStyle::Cold);
+        assert_eq!(tier_reply_style(2), ReplyStyle::Neutral);
+        assert_eq!(tier_reply_style(3), ReplyStyle::Warm);
+    }
 
     #[test]
     fn edit_payload_renders_every_slot() {
@@ -1944,8 +1970,8 @@ mod tests {
             "the source picture is the quoted line: {chat}"
         );
         assert!(
-            chat.contains("新照片：换了条裙子"),
-            "the new caption is hinted: {chat}"
+            chat.contains("新照片里换了条裙子"),
+            "the new caption is hinted, prose-woven: {chat}"
         );
     }
 
