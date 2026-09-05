@@ -94,6 +94,12 @@ pub struct QuotedMessage {
     /// When the quoted line was sent. Renders as a relative age ("3 天前") so
     /// the model can tell a callback to an old message from a same-breath one.
     pub sent_at: DateTime<Utc>,
+    /// The user line the quoted message answered, when the quote should carry
+    /// the exchange that produced it — a quoted picture on an image-edit full
+    /// turn arrives with the message that asked for it. Rendered as a `用户：`
+    /// line above the quoted one; `None` leaves the block a single line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
 }
 
 /// Which reference image an image turn should build on. `Face` = the static
@@ -368,8 +374,12 @@ mod tests {
             role: "assistant".into(),
             content: "那我们礼拜六去看展".into(),
             sent_at: chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap(),
+            trigger: None,
         };
         let s = serde_json::to_string(&q).unwrap();
+        // `trigger: None` serializes without the key, so this also proves a
+        // pre-`trigger` payload (the queue may hold old events) still parses.
+        assert!(!s.contains("trigger"), "got {s}");
         assert_eq!(serde_json::from_str::<QuotedMessage>(&s).unwrap(), q);
     }
 }

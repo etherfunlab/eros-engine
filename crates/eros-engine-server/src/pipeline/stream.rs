@@ -14401,6 +14401,7 @@ data: [DONE]\n\n";
                     role: "assistant".into(),
                     content: "那我们礼拜六去看展".into(),
                     sent_at: chrono::Utc::now(),
+                    trigger: None,
                 }),
             },
             None,

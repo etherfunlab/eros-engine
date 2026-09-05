@@ -872,12 +872,28 @@ pub fn build_prompt(
             } else {
                 "用户"
             };
-            format!(
-                "\n[quote]（用户这一轮回复的是下面这句话，{age}的，不是最后一条消息；\
-                 先接住它，再往下说）\n{speaker}：{}",
-                q.content.trim(),
-                age = relative_age(q.sent_at),
-            )
+            // A quote with a `trigger` carries the exchange that produced the
+            // quoted line — the trigger is always the user's side, so the
+            // quoted line is rendered as the answer to it.
+            match q
+                .trigger
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                Some(t) => format!(
+                    "\n[quote]（用户这一轮回复的是下面这段对话，{age}的，不是最后一条消息；\
+                     先接住它，再往下说）\n用户：{t}\n{speaker}：{}",
+                    q.content.trim(),
+                    age = relative_age(q.sent_at),
+                ),
+                None => format!(
+                    "\n[quote]（用户这一轮回复的是下面这句话，{age}的，不是最后一条消息；\
+                     先接住它，再往下说）\n{speaker}：{}",
+                    q.content.trim(),
+                    age = relative_age(q.sent_at),
+                ),
+            }
         }
         None => String::new(),
     };
@@ -1427,6 +1443,7 @@ mod tests {
             role: role.into(),
             content: content.into(),
             sent_at: Utc::now() - chrono::Duration::minutes(minutes_ago),
+            trigger: None,
         }
     }
 
@@ -1486,6 +1503,61 @@ mod tests {
             p.contains("用户：我上次说的那个地方"),
             "a user row is attributed to the user: {p}"
         );
+    }
+
+    #[test]
+    fn build_prompt_renders_quote_trigger_as_the_exchange() {
+        // A quote carrying its trigger renders as the two-line exchange —
+        // user line first, quoted line as the answer — under the dialogue
+        // intro. A blank trigger falls back to the single-line form.
+        let mut q = quoted("assistant", "[你的照片：在天台看夕阳]", 60);
+        q.trigger = Some("拍张照".into());
+        let p = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            ReplyStyle::Neutral,
+            &[],
+            None,
+            &[],
+            AffinityScope::default(),
+            &[],
+            None,
+            None,
+            Some(&q),
+            None,
+            TurnNudges::default(),
+        );
+        assert!(p.contains("下面这段对话"), "dialogue intro: {p}");
+        assert!(
+            p.contains("用户：拍张照\nAria：[你的照片：在天台看夕阳]"),
+            "trigger line renders above the quoted line: {p}"
+        );
+
+        q.trigger = Some("  ".into());
+        let p = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            ReplyStyle::Neutral,
+            &[],
+            None,
+            &[],
+            AffinityScope::default(),
+            &[],
+            None,
+            None,
+            Some(&q),
+            None,
+            TurnNudges::default(),
+        );
+        assert!(
+            p.contains("下面这句话"),
+            "blank trigger ⇒ single-line form: {p}"
+        );
+        assert!(!p.contains("用户："), "no trigger line: {p}");
     }
 
     #[test]

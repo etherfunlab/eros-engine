@@ -405,9 +405,12 @@ pub(crate) async fn resolve_quote(
         .await?
         .map(|m| QuotedMessage {
             message_id: m.id,
+            // Model-facing text, not raw content: a quoted image turn reads as
+            // its `[你的照片：…]` marker instead of an empty line.
+            content: crate::pipeline::handlers::model_facing_assistant_text(&m, false),
             role: m.role,
-            content: m.content,
             sent_at: m.sent_at,
+            trigger: None,
         }))
 }
 
@@ -1760,6 +1763,25 @@ data: [DONE]\n\n";
         assert_eq!(q.message_id, msg);
         assert_eq!(q.role, "assistant");
         assert_eq!(q.content, "那我们礼拜六去看展");
+
+        // A quoted image turn resolves to its model-facing marker, not the
+        // row's empty content.
+        let img: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages \
+               (session_id, role, content, assistant_action_type, metadata) \
+             VALUES ($1, 'assistant', '', 'reply', \
+                     '{\"image\": {\"prompt\": \"p\", \"caption\": \"在天台看夕阳\"}}'::jsonb) \
+             RETURNING id",
+        )
+        .bind(sessions[0])
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let q = resolve_quote(&chat_repo, sessions[0], Some(img))
+            .await
+            .unwrap()
+            .expect("image turn resolves");
+        assert_eq!(q.content, "[你的照片：在天台看夕阳]");
 
         // Real id, wrong session → None (never leaks another session's text).
         assert!(resolve_quote(&chat_repo, sessions[1], Some(msg))
