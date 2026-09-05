@@ -37,7 +37,9 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use eros_engine_core::persona::CompanionPersona;
-use eros_engine_core::types::{ActionPlan, ActionType, DecisionInput, Event, ImageRef, ReplyStyle};
+use eros_engine_core::types::{
+    ActionPlan, ActionType, DecisionInput, Event, ImageRef, QuotedMessage, ReplyStyle,
+};
 use eros_engine_llm::model_config::StyleKey;
 use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::{AssistantInsert, ChatRepo};
@@ -46,7 +48,9 @@ use eros_engine_store::persona::PersonaRepo;
 
 use crate::auth::middleware::AuthUser;
 use crate::error::AppError;
-use crate::pipeline::handlers::{build_reply_request, compose_image_prompt, CHAT_TASK};
+use crate::pipeline::handlers::{
+    build_reply_request, compose_image_prompt, model_facing_assistant_text, CHAT_TASK,
+};
 use crate::pipeline::post_process::ProducedMessage;
 use crate::pipeline::stream::{
     build_delegated_image_marker, record_compose_event, run_image_prompt_compose, split_failures,
@@ -259,8 +263,13 @@ struct TextOutcome {
 }
 
 /// The full-turn Event: the persisted instruction row is the driving user
-/// message; everything else is what an ordinary chat request defaults to.
-fn edit_turn_event(instruction: String, instruction_row_id: Uuid) -> Event {
+/// message and the quote is the picture being revised (with the exchange that
+/// produced it); everything else is what an ordinary chat request defaults to.
+fn edit_turn_event(
+    instruction: String,
+    instruction_row_id: Uuid,
+    quote: Option<QuotedMessage>,
+) -> Event {
     Event::UserMessage {
         content: instruction,
         message_id: instruction_row_id,
@@ -270,7 +279,7 @@ fn edit_turn_event(instruction: String, instruction_row_id: Uuid) -> Event {
         memory_scope: Default::default(),
         affinity_scope: Default::default(),
         tips_amount_usd: None,
-        quote: None,
+        quote,
     }
 }
 
@@ -291,10 +300,14 @@ fn edit_turn_plan(action: ActionType) -> ActionPlan {
 }
 
 /// Run the companion chain once, non-streaming, off the persisted instruction
-/// row — the rolled text half of a full-turn edit. Fail-open everywhere: any
-/// failure (affinity load, request build, LLM error, blank reply) returns a
-/// text-less outcome and the turn degrades to `reply_image` — the picture is
-/// the turn's substance.
+/// row — the rolled text half of a full-turn edit. `quote` is the picture
+/// being revised (the prompt's `[quote]` block) and `caption` the new
+/// picture's, folded in as a context hint — the text half is generated before
+/// the image row lands, so this is the only way it sees either side of the
+/// revision. Fail-open everywhere: any failure (affinity load, request build,
+/// LLM error, blank reply) returns a text-less outcome and the turn degrades
+/// to `reply_image` — the picture is the turn's substance.
+#[allow(clippy::too_many_arguments)]
 async fn generate_reply_text(
     state: &AppState,
     persona: &CompanionPersona,
@@ -303,6 +316,8 @@ async fn generate_reply_text(
     instance_id: Uuid,
     instruction_row_id: Uuid,
     instruction: &str,
+    quote: Option<QuotedMessage>,
+    caption: Option<&str>,
 ) -> TextOutcome {
     let affinity = match (AffinityRepo { pool: &state.pool })
         .load_or_create(session_id, user_id, instance_id)
@@ -328,12 +343,19 @@ async fn generate_reply_text(
         }
     };
     let input = DecisionInput {
-        event: edit_turn_event(instruction.to_string(), instruction_row_id),
+        event: edit_turn_event(instruction.to_string(), instruction_row_id, quote),
         affinity,
         persona: persona.clone(),
         signals,
     };
-    let plan = edit_turn_plan(ActionType::ReplyTextImage);
+    let mut plan = edit_turn_plan(ActionType::ReplyTextImage);
+    if let Some(c) = caption.map(str::trim).filter(|s| !s.is_empty()) {
+        // The new picture rides along as an inner-state hint so the words
+        // match what the picture now shows.
+        plan.context_hints = vec![format!(
+            "你刚按对方的要求把照片改了一版，随这条回复一起发出（新照片：{c}）；说的话要贴合这张新照片"
+        )];
+    }
     let (chat_req, _tags) = match build_reply_request(
         state,
         &input,
@@ -722,6 +744,30 @@ async fn edit_image(
         let umid = chat_repo
             .insert_instruction_row(session_id, &instruction, message_id)
             .await?;
+        // The [quote] block: the picture being revised, carrying the user
+        // message that asked for it so the exchange arrives whole. Trigger
+        // fetch failure degrades to quoting the picture alone — the quote is
+        // context, never worth failing the turn over.
+        let trigger = match source.user_message_id {
+            Some(trigger_id) => match chat_repo
+                .message_by_id_in_session(session_id, trigger_id)
+                .await
+            {
+                Ok(row) => row.map(|m| m.content),
+                Err(e) => {
+                    tracing::warn!("image_edit text half: quote trigger fetch failed: {e}");
+                    None
+                }
+            },
+            None => None,
+        };
+        let quote = QuotedMessage {
+            message_id: source.id,
+            role: source.role.clone(),
+            content: model_facing_assistant_text(&source, false),
+            sent_at: source.sent_at,
+            trigger,
+        };
         let text = generate_reply_text(
             &state,
             &persona,
@@ -730,6 +776,8 @@ async fn edit_image(
             instance_id,
             umid,
             &instruction,
+            Some(quote),
+            outcome.caption.as_deref(),
         )
         .await;
         let insert = AssistantInsert {
@@ -822,7 +870,8 @@ async fn edit_image(
                 session_id,
                 user_id,
                 instance_id,
-                edit_turn_event(instruction_bg, umid_bg),
+                // post_process never reads the quote; skip rebuilding it.
+                edit_turn_event(instruction_bg, umid_bg, None),
                 plan,
                 produced,
             )
@@ -1882,6 +1931,22 @@ mod tests {
             .find(|b| b.contains("you are a companion"))
             .expect("a chat companion call was made");
         assert!(chat.contains("换套衣服"), "got {chat}");
+        // …and the revision context (#349): the [quote] block carries the
+        // source picture plus the message that asked for it, and the new
+        // picture's caption rides in as a hint.
+        assert!(chat.contains("[quote]"), "quote block present: {chat}");
+        assert!(
+            chat.contains("用户：拍张照"),
+            "the quoted exchange opens with its trigger: {chat}"
+        );
+        assert!(
+            chat.contains("[你的照片：在天台看夕阳]"),
+            "the source picture is the quoted line: {chat}"
+        );
+        assert!(
+            chat.contains("新照片：换了条裙子"),
+            "the new caption is hinted: {chat}"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

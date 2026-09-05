@@ -306,20 +306,15 @@ async fn drive_turn(
     // Spec §9: an older-than-latest driving message must see everything that
     // landed after it, so history is always the most recent window. A quote
     // only adds the [quote] block on top of it.
-    let quote = match params.reply_to_message_id {
-        None => None,
-        Some(id) => match chat_repo
-            .message_by_id_in_session(turn.session_id, id)
-            .await
-        {
-            Ok(row) => row.map(|m| eros_engine_core::types::QuotedMessage {
-                message_id: m.id,
-                role: m.role,
-                content: m.content,
-                sent_at: m.sent_at,
-            }),
-            Err(e) => return TurnOutcome::Failure(format!("quote resolve failed: {e}")),
-        },
+    let quote = match crate::routes::companion_stream::resolve_quote(
+        &chat_repo,
+        turn.session_id,
+        params.reply_to_message_id,
+    )
+    .await
+    {
+        Ok(q) => q,
+        Err(e) => return TurnOutcome::Failure(format!("quote resolve failed: {e}")),
     };
 
     let user_msg = PersistedUserMessage {
