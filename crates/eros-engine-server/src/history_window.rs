@@ -20,7 +20,7 @@ use uuid::Uuid;
 /// emptied and `model_facing_history` dropped — collapse the exchange
 /// search to a single row and would otherwise evict the character's actual
 /// last reply. It is also what a fixture with no prior `user` row at all
-/// (the async worker's pinned-driving-row shape) falls back to entirely.
+/// (a session-opening current row) falls back to entirely.
 pub const PROTECTED_PRIOR: usize = 2;
 
 /// Field count at or above which no extra rows are injected.
@@ -85,10 +85,11 @@ pub fn window_extra(filled: usize) -> usize {
 /// user row precedes the current one at all, this floor is the entire
 /// protected span.
 ///
-/// The current row is kept by identity, not by position: on the async worker
-/// path the driving row is pinned at index 0, older than everything else, and
-/// must survive even the thinnest rung. An absent `current_id` (no driving row
-/// in the window at all) degrades to keeping the newest rows.
+/// The current row is kept by identity, not by position. The caller's fetch
+/// is anchored at the driving row (`ChatRepo::history_up_to`), so in
+/// production it is also the newest row — identity is still the honest key,
+/// independent of what the fetch guarantees. An absent `current_id` (no
+/// driving row in the window at all) degrades to keeping the newest rows.
 pub fn select_window(msgs: Vec<Injected>, current_id: Uuid, extra: usize) -> Vec<Injected> {
     let cur = msgs.iter().position(|m| m.id == current_id);
     let mut keep = vec![false; msgs.len()];
@@ -299,10 +300,12 @@ mod tests {
     }
 
     #[test]
-    fn a_pinned_driving_row_at_the_front_always_survives() {
-        // The async worker path inserts the driving row at index 0, older than
-        // everything else. No user row precedes it, so the PROTECTED_PRIOR
-        // fallback applies and it must survive the thinnest rung.
+    fn a_current_row_at_the_front_survives_by_identity() {
+        // No production path puts the current row first any more (the fetch
+        // is anchored at it), but keep-by-identity is the contract that makes
+        // that a non-event: even a front-most current row survives the
+        // thinnest rung. No user row precedes it, so the PROTECTED_PRIOR
+        // fallback applies.
         let mut msgs: Vec<Injected> = (0..10).map(|i| inj("user", &i.to_string())).collect();
         let driving = inj("user", "driving");
         let current = driving.id;
