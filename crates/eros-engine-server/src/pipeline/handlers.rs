@@ -746,8 +746,8 @@ pub(crate) async fn build_reply_request(
 ) -> Result<(ChatRequest, Vec<String>), AppError> {
     let chat_repo = ChatRepo { pool: &state.pool };
     // A quote points at one line; it never narrows the window. Every turn gets
-    // the same newest-N history, so quoting something from last week does not
-    // cost the model everything said since.
+    // the same driving-row-anchored history, so quoting something from last
+    // week does not cost the model everything said since.
     let quote = match &input.event {
         eros_engine_core::types::Event::UserMessage { quote, .. } => quote.as_ref(),
         _ => None,
