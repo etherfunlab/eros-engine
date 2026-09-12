@@ -501,8 +501,21 @@ pub fn run_voice_turn(
             // the same pair (e.g. a prior text session) instead. Never creates a
             // row on the voice path.
             affinity_repo.load_latest_for_pair(turn.user_id, turn.instance_id),
-            // Chronological history, includes the just-persisted user turn.
-            chat_repo.history(turn.session_id, VOICE_HISTORY_WINDOW, 0),
+            // Chronological history anchored at the just-persisted user turn,
+            // so it is the newest wire message even when another row lands
+            // between persist and fetch. An anchor missing from the session
+            // degrades to the newest-N fetch — the pre-anchor behavior.
+            async {
+                match chat_repo
+                    .history_up_to(turn.session_id, turn.user_message_id, VOICE_HISTORY_WINDOW)
+                    .await
+                {
+                    Ok(rows) if rows.is_empty() => {
+                        chat_repo.history(turn.session_id, VOICE_HISTORY_WINDOW, 0).await
+                    }
+                    r => r,
+                }
+            },
             async {
                 if assemble_bootstrap_now {
                     Some(assemble_bootstrap(
@@ -3528,6 +3541,51 @@ data: [DONE]\n\n";
         assert_eq!(
             wire,
             vec!["m3", "m4", "m5", "m6", "m7", "m8", "m9", "hello"]
+        );
+    }
+
+    /// The wire history must be anchored at the turn's own user row: a row
+    /// landing between persist and fetch (here seeded with a future
+    /// timestamp) must not trail the driving row in the prompt — the model
+    /// answers whatever comes last.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_voice_turn_anchors_history_at_the_driving_row(pool: sqlx::PgPool) {
+        let mock = bootstrap_mock().await;
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id, "voice").await;
+
+        seed_message(&pool, session_id, "user", "m0", 20).await;
+        seed_message(&pool, session_id, "assistant", "m1", 19).await;
+        // Newer than the driving row run_bootstrap_turn is about to persist.
+        seed_message(&pool, session_id, "user", "插队消息", -1).await;
+
+        let frames = run_bootstrap_turn(
+            &pool,
+            &mock,
+            session_id,
+            instance_id,
+            user_id,
+            "01J9BOOT0000000000000002",
+            MemoryScope::default(),
+        )
+        .await;
+        assert_no_error_frame(&frames);
+
+        let body = last_request_body(&mock).await;
+        let msgs = body["messages"].as_array().expect("messages array");
+        let wire: Vec<&str> = msgs[1..]
+            .iter()
+            .map(|m| m["content"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            wire.last().copied(),
+            Some("hello"),
+            "the turn's own user row must be the newest wire message: {wire:?}"
+        );
+        assert!(
+            !wire.contains(&"插队消息"),
+            "rows newer than the driving row must not enter the wire history: {wire:?}"
         );
     }
 

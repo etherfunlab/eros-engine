@@ -2875,12 +2875,24 @@ async fn build_input_filter_transcript(
     session_id: Uuid,
     current_user_message_id: Uuid,
 ) -> JudgeTranscript {
-    // +1: the turn being processed is already persisted, so it always occupies
-    // the newest fetched slot and is then excluded below. Fetching exactly the
-    // window size would leave 7 prior messages while `[近期图片]` tells the
-    // judge it counted 8 — an every-turn off-by-one on the anti-spam facts.
+    // Anchored at the driving row: on the queue path a burst can land AFTER
+    // it, and a newest-N fetch would show the judge rows from this turn's
+    // future (with the row itself buried past the fetch, the exclusion below
+    // is vacuous and the transcript is ENTIRELY future rows). An anchor
+    // missing from the session yields an empty transcript — the same
+    // best-effort degradation as a DB error.
+    //
+    // +1: the driving row always occupies the newest fetched slot (the
+    // anchor is last by contract) and is then excluded below. Fetching
+    // exactly the window size would leave 7 prior messages while `[近期图片]`
+    // tells the judge it counted 8 — an every-turn off-by-one on the
+    // anti-spam facts.
     let rows = chat_repo
-        .history(session_id, INPUT_FILTER_CONTEXT_TURNS + 1, 0)
+        .history_up_to(
+            session_id,
+            current_user_message_id,
+            INPUT_FILTER_CONTEXT_TURNS + 1,
+        )
         .await
         .unwrap_or_default();
     let mut acc = JudgeTranscriptAcc::default();
@@ -6371,6 +6383,109 @@ mod tests {
             t.transcript
         );
         assert!(t.transcript.contains("普通消息"), "{}", t.transcript);
+    }
+
+    /// The #330 shape on the judge/input-filter transcript: on the queue path
+    /// a burst can land AFTER the driving row, and a newest-N fetch then
+    /// shows the judge rows from the driving row's future — with the row
+    /// itself buried past the fetch, its exclusion is vacuous and the
+    /// transcript is entirely future turns. The transcript must be anchored
+    /// at the driving row: prior rows only, images counted as of that moment.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn transcript_is_anchored_at_the_driving_row(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        let user_id = Uuid::new_v4();
+        let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        // Two prior rows: a user line and an image turn.
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+             VALUES ($1, 'user', '早前的用户消息', now() - interval '5 minutes')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata, sent_at) \
+             VALUES ($1, 'assistant', '', '{\"image\":{\"prompt\":\"x\",\"caption\":\"在沙滩\"}}', \
+                     now() - interval '4 minutes')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let current = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J9000000000000000000000E",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        // A burst of INPUT_FILTER_CONTEXT_TURNS+1 rows newer than the driving
+        // row — enough to push it out of a newest-N fetch entirely. One of
+        // them is an image turn, the newest is assistant text: both counting
+        // facts would flip if any future row leaked in.
+        for i in 0..9i32 {
+            let (role, content, meta) = if i == 4 {
+                (
+                    "assistant",
+                    "",
+                    Some(serde_json::json!({"image":{"prompt":"b","caption":"burst图"}})),
+                )
+            } else if i % 2 == 0 {
+                ("user", "burst用户消息", None)
+            } else {
+                ("assistant", "burst回复", None)
+            };
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content, metadata, sent_at) \
+                 VALUES ($1, $2, $3, $4, now() + make_interval(mins => $5))",
+            )
+            .bind(session_id)
+            .bind(role)
+            .bind(content)
+            .bind(meta)
+            .bind(i + 1)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let t = build_input_filter_transcript(&chat_repo, session_id, current).await;
+        assert!(
+            !t.transcript.contains("burst"),
+            "rows newer than the driving row must not render: {}",
+            t.transcript
+        );
+        assert!(
+            t.transcript.contains("早前的用户消息"),
+            "prior rows must survive the anchoring: {}",
+            t.transcript
+        );
+        assert!(
+            !t.transcript.contains("hi"),
+            "the driving row itself is still excluded: {}",
+            t.transcript
+        );
+        assert_eq!(
+            t.images_in_window, 1,
+            "only images at-or-before the driving row count: {t:?}"
+        );
+        assert!(
+            t.last_assistant_is_image,
+            "as of the driving row, the newest assistant turn is the image: {t:?}"
+        );
     }
 
     /// Build a `JudgeTranscript` from (role, content, metadata) triples,
