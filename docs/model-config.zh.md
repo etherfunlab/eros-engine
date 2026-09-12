@@ -551,6 +551,7 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
   - `action`：`"reply_text"` \| `"ghost"` \| `"reply_image"` \| `"reply_text_image"` \| `"product_qa"`（图片变体需要同时满足两个条件——请求包含 `image` 块，且 `[tasks.chat_image_prompt_compose]` 已配置，因为判断器本身不写图片 prompt；否则降级为 `reply_text`。聊天流从不绘图——只发出 `image_request` 帧，由调用方自行调用图像供应商。`product_qa` 仅当 `[tasks.chat_product_qa]` 完全启用时才可用——见下文；不可用时降级为 `reply_text`，绝不升级。）
   - `inner_state`：融入 reply prompt 的简短情绪/语气描述
   - `tone`（选填）：这一轮回复该用的语气/口吻，一句话——在文本类动作上注入 reply prompt 的 `[reply_tone]` 区块；缺省则不注入
+  - `clothing`（选填）：角色此刻的穿着，一句话——在文本类动作上注入 reply prompt 的 `[clothing]` 区块；缺省则不注入
   - `reason`：可选
 - **Fail-open：**任何 LLM 超时或错误都会回退到规则引擎——LLM 判断器绝不会阻塞 chat 响应。
 - **硬安全 guardrail**（在 LLM verdict 之后、规则引擎 fallback 之前强制执行）：前 10 条消息绝不 ghost，绝不连续 ghost 第三次（`ghost_streak ≥ 2` 否决；连两次是允许的），ghost cooldown 为一小时。

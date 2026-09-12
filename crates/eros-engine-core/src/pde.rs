@@ -45,6 +45,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
             energy_cost: ENERGY_COST_REPLY,
             context_hints: vec![],
             reply_tone: None,
+            clothing: None,
             image_caption: None,
             image_ref: ImageRef::Face,
             aspect_ratio: None,
@@ -64,6 +65,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
             energy_cost: ENERGY_COST_GHOST,
             context_hints: vec![],
             reply_tone: None,
+            clothing: None,
             image_caption: None,
             image_ref: ImageRef::Face,
             aspect_ratio: None,
@@ -79,6 +81,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
             energy_cost: ENERGY_COST_PROACTIVE,
             context_hints: vec![],
             reply_tone: None,
+            clothing: None,
             image_caption: None,
             image_ref: ImageRef::Face,
             aspect_ratio: None,
@@ -95,6 +98,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
             energy_cost: ENERGY_COST_APP_OPEN,
             context_hints: vec![],
             reply_tone: None,
+            clothing: None,
             image_caption: None,
             image_ref: ImageRef::Face,
             aspect_ratio: None,
@@ -109,6 +113,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
         energy_cost: ENERGY_COST_REPLY,
         context_hints: vec![],
         reply_tone: None,
+        clothing: None,
         image_caption: None,
         image_ref: ImageRef::Face,
         aspect_ratio: None,
@@ -119,7 +124,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
 /// and energy constants internally. Per action:
 ///   ReplyText / ReplyImage / ReplyTextImage → Neutral, predict_reply_deltas,
 ///                                              ENERGY_COST_REPLY, context_hints = hints,
-///                                              reply_tone kept (ReplyImage drops it)
+///                                              reply_tone / clothing kept (ReplyImage drops both)
 ///   Ghost                                   → Cold, ghost_affinity_deltas,
 ///                                              ENERGY_COST_GHOST, hints discarded, tone discarded
 ///   ProductQa                               → Neutral, all-zero deltas, zero energy,
@@ -130,6 +135,7 @@ pub fn plan_for(
     action: ActionType,
     hints: Vec<String>,
     reply_tone: Option<String>,
+    clothing: Option<String>,
     image_ref: ImageRef,
     aspect_ratio: Option<String>,
 ) -> ActionPlan {
@@ -140,12 +146,17 @@ pub fn plan_for(
             affinity_deltas: predict_reply_deltas(input),
             energy_cost: ENERGY_COST_REPLY,
             context_hints: hints,
-            // Delivery directive only makes sense where there is text to
-            // deliver; a bare image turn drops it.
+            // Delivery directives only make sense where there is text to
+            // deliver; a bare image turn drops them.
             reply_tone: if matches!(action, ActionType::ReplyImage) {
                 None
             } else {
                 reply_tone
+            },
+            clothing: if matches!(action, ActionType::ReplyImage) {
+                None
+            } else {
+                clothing
             },
             image_caption: None,
             image_ref,
@@ -158,6 +169,7 @@ pub fn plan_for(
             energy_cost: ENERGY_COST_GHOST,
             context_hints: vec![],
             reply_tone: None,
+            clothing: None,
             image_caption: None,
             image_ref: ImageRef::Face,
             aspect_ratio: None,
@@ -172,6 +184,7 @@ pub fn plan_for(
             energy_cost: 0.0,
             context_hints: vec![],
             reply_tone: None,
+            clothing: None,
             image_caption: None,
             image_ref: ImageRef::Face,
             aspect_ratio: None,
@@ -473,6 +486,7 @@ mod tests {
             ActionType::ReplyText,
             vec!["有点开心".into()],
             None,
+            None,
             ImageRef::Face,
             None,
         );
@@ -489,6 +503,7 @@ mod tests {
             &input,
             ActionType::Ghost,
             vec!["想躲".into()],
+            None,
             None,
             ImageRef::Face,
             None,
@@ -507,6 +522,7 @@ mod tests {
             ActionType::ReplyTextImage,
             vec![],
             None,
+            None,
             ImageRef::Face,
             None,
         );
@@ -520,6 +536,7 @@ mod tests {
             &input,
             ActionType::Ghost,
             vec![],
+            None,
             None,
             ImageRef::Face,
             None,
@@ -535,6 +552,7 @@ mod tests {
             ActionType::ReplyImage,
             vec![],
             None,
+            None,
             ImageRef::Previous,
             Some("9:16".into()),
         );
@@ -546,6 +564,7 @@ mod tests {
             &input,
             ActionType::Ghost,
             vec![],
+            None,
             None,
             ImageRef::Previous,
             Some("9:16".into()),
@@ -564,6 +583,7 @@ mod tests {
             ActionType::ReplyText,
             vec![],
             tone.clone(),
+            None,
             ImageRef::Face,
             None,
         );
@@ -574,6 +594,7 @@ mod tests {
             ActionType::ReplyTextImage,
             vec![],
             tone.clone(),
+            None,
             ImageRef::Face,
             None,
         );
@@ -584,6 +605,7 @@ mod tests {
             ActionType::ReplyImage,
             vec![],
             tone.clone(),
+            None,
             ImageRef::Face,
             None,
         );
@@ -597,6 +619,7 @@ mod tests {
             ActionType::Ghost,
             vec![],
             tone,
+            None,
             ImageRef::Face,
             None,
         );
@@ -610,6 +633,73 @@ mod tests {
     }
 
     #[test]
+    fn plan_for_keeps_clothing_for_text_bearing_drops_elsewhere() {
+        let input = test_decision_input(); // the module's existing DecisionInput helper
+        let clothing = Some("米色针织开衫和短裤".to_string());
+
+        let text = plan_for(
+            &input,
+            ActionType::ReplyText,
+            vec![],
+            None,
+            clothing.clone(),
+            ImageRef::Face,
+            None,
+        );
+        assert_eq!(text.clothing.as_deref(), Some("米色针织开衫和短裤"));
+
+        let text_image = plan_for(
+            &input,
+            ActionType::ReplyTextImage,
+            vec![],
+            None,
+            clothing.clone(),
+            ImageRef::Face,
+            None,
+        );
+        assert_eq!(text_image.clothing.as_deref(), Some("米色针织开衫和短裤"));
+
+        let image_only = plan_for(
+            &input,
+            ActionType::ReplyImage,
+            vec![],
+            None,
+            clothing.clone(),
+            ImageRef::Face,
+            None,
+        );
+        assert_eq!(
+            image_only.clothing, None,
+            "image-only turn has no text prompt to dress"
+        );
+
+        let ghost = plan_for(
+            &input,
+            ActionType::Ghost,
+            vec![],
+            None,
+            clothing.clone(),
+            ImageRef::Face,
+            None,
+        );
+        assert_eq!(ghost.clothing, None, "ghost discards clothing like tone");
+
+        let qa = plan_for(
+            &input,
+            ActionType::ProductQa,
+            vec![],
+            None,
+            clothing,
+            ImageRef::Face,
+            None,
+        );
+        assert_eq!(qa.clothing, None, "product_qa is an out-of-character aside");
+
+        // Rule engine never dresses the character.
+        assert_eq!(decide(&input).clothing, None);
+    }
+
+    #[test]
     fn plan_for_product_qa_is_inert_out_of_character_plan() {
         let input = test_decision_input(); // the module's existing DecisionInput helper
         let plan = plan_for(
@@ -617,6 +707,7 @@ mod tests {
             ActionType::ProductQa,
             vec!["ignored".into()],
             Some("ignored".into()),
+            None,
             ImageRef::Face,
             None,
         );
