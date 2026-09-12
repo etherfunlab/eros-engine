@@ -306,6 +306,7 @@ fn edit_turn_plan(action: ActionType) -> ActionPlan {
         energy_cost: 0.0,
         context_hints: vec![],
         reply_tone: None,
+        clothing: None,
         image_caption: None,
         image_ref: ImageRef::Previous,
         aspect_ratio: None,

@@ -617,6 +617,7 @@ By default the engine uses the built-in rule engine (`eros-engine-core/src/pde.r
   - `action`: `"reply_text"` | `"ghost"` | `"reply_image"` | `"reply_text_image"` | `"product_qa"` (image variants are available when the request includes an `image` block AND `[tasks.chat_image_prompt_compose]` is configured — both must hold, since the judge itself writes no image prompt; otherwise they degrade to `reply_text`. The chat stream never draws — it emits an `image_request` frame and the consumer calls its own image vendor. `product_qa` is available only when `[tasks.chat_product_qa]` is fully enabled — see below; unavailable proposals degrade to `reply_text`, never upgrade.)
   - `inner_state`: a short mood/tone description folded into the reply prompt
   - `tone` (optional): a short delivery directive for this turn's reply — injected into the reply prompt as a `[reply_tone]` section on text-bearing actions; omitted when absent
+  - `clothing` (optional): a short free-text description of the character's outfit this turn — injected into the reply prompt as a `[clothing]` section on text-bearing actions; omitted when absent
   - `reason`: optional
 - **Fail-open:** any LLM timeout or error falls back to the rule engine — the LLM judge never blocks a chat response.
 - **Hard-safety guardrails** (enforced after the LLM verdict, before the rule-engine fallback): never ghost in the first 10 messages, never ghost a third time in a row (`ghost_streak ≥ 2` vetoes; two consecutive are allowed), one-hour ghost cooldown.

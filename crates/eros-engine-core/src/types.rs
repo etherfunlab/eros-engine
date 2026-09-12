@@ -173,6 +173,10 @@ pub struct ActionPlan {
     /// turns (reply_text / reply_text_image); `None` everywhere else — rule
     /// PDE, fail-open, tips, ghost, reply_image.
     pub reply_tone: Option<String>,
+    /// Judge-decided outfit for this turn (free text, sanitized by the server
+    /// before it gets here). Same carriage rule as `reply_tone`: `Some` only
+    /// on LLM-judge, text-bearing turns; `None` everywhere else.
+    pub clothing: Option<String>,
     /// What the picture showed, for post-process affinity on image turns.
     /// Written by the stream AFTER the composer resolves — always `None` at
     /// decision time, since the composer has not run yet. `None` also on the

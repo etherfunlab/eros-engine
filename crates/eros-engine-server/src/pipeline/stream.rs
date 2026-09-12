@@ -2001,6 +2001,10 @@ pub(crate) struct PdeVerdict {
     image_ref: eros_engine_core::types::ImageRef,
     #[serde(default)]
     aspect_ratio: Option<String>,
+    /// Judge-decided outfit for this turn (free text; sanitized like
+    /// inner_state before injection). `None` on old prompts / null verdicts.
+    #[serde(default)]
+    clothing: Option<String>,
 }
 
 /// Parse the judge reply: direct JSON first, then a balanced JSON block in prose
@@ -2103,7 +2107,7 @@ fn pde_response_format() -> serde_json::Value {
             "schema": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["action", "inner_state", "tone", "reason", "image_ref", "aspect_ratio"],
+                "required": ["action", "inner_state", "tone", "reason", "image_ref", "aspect_ratio", "clothing"],
                 "properties": {
                     "action": { "type": "string",
                         "enum": ["reply_text", "ghost", "reply_image", "reply_text_image", "product_qa"] },
@@ -2112,7 +2116,8 @@ fn pde_response_format() -> serde_json::Value {
                     "reason": { "type": ["string", "null"] },
                     "image_ref": { "type": "string", "enum": ["face", "previous"] },
                     "aspect_ratio": { "type": ["string", "null"],
-                        "enum": ["1:1", "3:4", "4:3", "9:16", "16:9", null] }
+                        "enum": ["1:1", "3:4", "4:3", "9:16", "16:9", null] },
+                    "clothing": { "type": ["string", "null"] }
                 }
             }
         }
@@ -2329,6 +2334,7 @@ fn apply_ghosting_killswitch(
             ActionType::ReplyText,
             hints,
             None,
+            None,
             eros_engine_core::types::ImageRef::Face,
             None,
         )
@@ -2524,6 +2530,8 @@ struct VerdictAudit<'a> {
     image_ref: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     aspect_ratio: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    clothing: Option<&'a str>,
 }
 
 impl<'a> From<&'a PdeVerdict> for VerdictAudit<'a> {
@@ -2538,6 +2546,7 @@ impl<'a> From<&'a PdeVerdict> for VerdictAudit<'a> {
                 eros_engine_core::types::ImageRef::Previous => "previous",
             },
             aspect_ratio: v.aspect_ratio.as_deref(),
+            clothing: v.clothing.as_deref(),
         }
     }
 }
@@ -4084,6 +4093,11 @@ pub fn run_stream(
                                 .as_deref()
                                 .map(sanitize_inner_state)
                                 .filter(|s| !s.is_empty());
+                            let clothing = v
+                                .clothing
+                                .as_deref()
+                                .map(sanitize_inner_state)
+                                .filter(|s| !s.is_empty());
                             // Only image actions carry the judge's image_ref /
                             // aspect_ratio; `v` is still borrowed here (the
                             // run/verdict is moved into the audit task below).
@@ -4097,7 +4111,7 @@ pub fn run_stream(
                                 eros_engine_core::types::ImageRef::Face
                             };
                             let img_aspect = if is_image { v.aspect_ratio.clone() } else { None };
-                            pde::plan_for(&input, action, hints, tone, img_ref, img_aspect)
+                            pde::plan_for(&input, action, hints, tone, clothing, img_ref, img_aspect)
                         }
                         _ => pde::decide(&input), // fail-open
                     };
@@ -4128,6 +4142,7 @@ pub fn run_stream(
                 ActionType::ReplyImage,
                 plan.context_hints.clone(),
                 plan.reply_tone.clone(),
+                plan.clothing.clone(),
                 eros_engine_core::types::ImageRef::Face,
                 None,
             );
@@ -5760,6 +5775,7 @@ mod tests {
             energy_cost: 0.0,
             context_hints: vec![],
             reply_tone: None,
+            clothing: None,
             image_caption: None,
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: aspect.map(str::to_string),
@@ -6125,6 +6141,42 @@ mod tests {
         assert!(
             j.get("tone").is_none(),
             "absent tone is omitted from audit: {j}"
+        );
+    }
+
+    #[test]
+    fn parse_pde_verdict_clothing_roundtrip() {
+        // With clothing.
+        let v = parse_pde_verdict(
+            r#"{"action":"reply_text","inner_state":"ok","clothing":"米色开衫"}"#,
+        )
+        .unwrap();
+        assert_eq!(v.clothing.as_deref(), Some("米色开衫"));
+        // Without clothing (old prompts) and explicit null (strict providers).
+        let v = parse_pde_verdict(r#"{"action":"reply_text","inner_state":"ok"}"#).unwrap();
+        assert_eq!(v.clothing, None);
+        let v = parse_pde_verdict(r#"{"action":"reply_text","inner_state":"ok","clothing":null}"#)
+            .unwrap();
+        assert_eq!(v.clothing, None);
+    }
+
+    #[test]
+    fn verdict_audit_serializes_clothing_when_present() {
+        let with: PdeVerdict = serde_json::from_str(
+            r#"{"action":"reply_image","inner_state":"想拍照","clothing":"运动背心"}"#,
+        )
+        .unwrap();
+        let j = serde_json::to_value(VerdictAudit::from(&with)).unwrap();
+        assert_eq!(
+            j["clothing"], "运动背心",
+            "audit records what the judge said even when the plan drops it (reply_image)"
+        );
+        let without: PdeVerdict =
+            serde_json::from_str(r#"{"action":"reply_text","inner_state":"ok"}"#).unwrap();
+        let j = serde_json::to_value(VerdictAudit::from(&without)).unwrap();
+        assert!(
+            j.get("clothing").is_none(),
+            "absent clothing is omitted from audit: {j}"
         );
     }
 
@@ -6623,6 +6675,7 @@ mod tests {
             ActionType::Ghost,
             vec![],
             None,
+            None,
             eros_engine_core::types::ImageRef::Face,
             None,
         );
@@ -6652,6 +6705,7 @@ mod tests {
             &input,
             acted,
             hints.clone(),
+            None,
             None,
             eros_engine_core::types::ImageRef::Face,
             None,
@@ -16248,12 +16302,21 @@ data: [DONE]\n\n";
         assert_eq!(v["json_schema"]["name"], "pde_verdict");
         assert_eq!(v["json_schema"]["strict"], true);
         let req = v["json_schema"]["schema"]["required"].as_array().unwrap();
-        assert_eq!(req.len(), 6, "all six properties required: {v}");
+        assert_eq!(req.len(), 7, "all seven properties required: {v}");
         assert!(
             req.iter().any(|x| x == "image_ref"),
             "image_ref required: {v}"
         );
         assert!(req.iter().any(|x| x == "tone"), "tone required: {v}");
+        assert!(
+            req.iter().any(|x| x == "clothing"),
+            "clothing required: {v}"
+        );
+        assert_eq!(
+            v["json_schema"]["schema"]["properties"]["clothing"]["type"],
+            serde_json::json!(["string", "null"]),
+            "clothing is nullable for strict providers: {v}"
+        );
         assert_eq!(
             v["json_schema"]["schema"]["properties"]["tone"]["type"],
             serde_json::json!(["string", "null"]),
