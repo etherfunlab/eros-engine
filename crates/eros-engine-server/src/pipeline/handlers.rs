@@ -746,30 +746,30 @@ pub(crate) async fn build_reply_request(
 ) -> Result<(ChatRequest, Vec<String>), AppError> {
     let chat_repo = ChatRepo { pool: &state.pool };
     // A quote points at one line; it never narrows the window. Every turn gets
-    // the same newest-N history, so quoting something from last week does not
-    // cost the model everything said since.
+    // the same driving-row-anchored history, so quoting something from last
+    // week does not cost the model everything said since.
     let quote = match &input.event {
         eros_engine_core::types::Event::UserMessage { quote, .. } => quote.as_ref(),
         _ => None,
     };
     let history = {
-        let mut rows = chat_repo.history(session_id, HISTORY_WINDOW, 0).await?;
-        // The prompt's model-facing messages come ONLY from this vector, so
-        // a driving row missing from it means the model answers a message
-        // it never sees. On the stream path the driving row is always the
-        // newest row and this is a no-op; on the async worker path a LIFO
-        // burst (or anything that landed while the turn waited) can bury it
-        // past HISTORY_WINDOW. Pin it back at its chronological position —
-        // older than everything in the window, so it goes first.
-        if !rows.iter().any(|m| m.id == user_message_id) {
-            if let Some(driving) = chat_repo
-                .message_by_id_in_session(session_id, user_message_id)
-                .await?
-            {
-                rows.insert(0, driving);
-            }
+        // The window is anchored at the driving row, not at "now": it is the
+        // last row, with nothing newer around it. On the stream path the
+        // driving row IS the newest row, so this equals a newest-N fetch; on
+        // the async worker path a LIFO burst that landed while the turn sat
+        // queued would otherwise trail the driving row in the prompt, and
+        // the model answers whatever comes last (#330). Rows the burst's own
+        // turns will see are simply not this turn's context yet.
+        let rows = chat_repo
+            .history_up_to(session_id, user_message_id, HISTORY_WINDOW)
+            .await?;
+        if rows.is_empty() {
+            // Driving row not in this session at all — degrade to newest-N,
+            // matching the pre-anchor behavior for an absent driving row.
+            chat_repo.history(session_id, HISTORY_WINDOW, 0).await?
+        } else {
+            rows
         }
-        rows
     };
 
     // Recall query for the current user turn: the effective caption, or — for an
@@ -3105,6 +3105,263 @@ mod tests {
             "CHAT_NOISE_CANCELLATION_DISABLED must also suppress \
              [character_state], the one addition in that change: {:?}",
             req.messages[0].content
+        );
+    }
+
+    // ─── build_reply_request: window anchored at the driving row (#330) ──
+
+    /// Shared plan/input shape for the two anchored-window tests below.
+    fn anchored_window_input(
+        session_id: Uuid,
+        owner: Uuid,
+        instance_id: Uuid,
+        user_message_id: Uuid,
+        content: &str,
+    ) -> (ActionPlan, DecisionInput) {
+        let plan = ActionPlan {
+            action_type: eros_engine_core::types::ActionType::ReplyText,
+            reply_style: eros_engine_core::types::ReplyStyle::Neutral,
+            affinity_deltas: Default::default(),
+            energy_cost: 0.0,
+            context_hints: vec![],
+            reply_tone: None,
+            clothing: None,
+            image_caption: None,
+            image_ref: eros_engine_core::types::ImageRef::Face,
+            aspect_ratio: None,
+        };
+        let input = DecisionInput {
+            event: Event::UserMessage {
+                content: content.into(),
+                message_id: user_message_id,
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: MemoryScope::None,
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                quote: Default::default(),
+            },
+            affinity: ladder_test_affinity(session_id, owner, instance_id),
+            persona: ladder_test_persona(instance_id, owner),
+            signals: eros_engine_core::types::ConversationSignals {
+                message_count: 12,
+                hours_since_last_message: 0.1,
+                ghost_streak: 0,
+                hours_since_last_ghost: None,
+            },
+        };
+        (plan, input)
+    }
+
+    /// The #330 shape: on the async worker path (strict per-session LIFO), a
+    /// burst that landed while a turn sat queued can push the driving row out
+    /// of the newest-N fetch entirely. The window must be anchored at the
+    /// driving row — it comes LAST, with nothing newer around it — or the
+    /// model answers the newest burst message while the reply persists
+    /// against the older driving row.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_buried_driving_row_anchors_the_window_at_itself(pool: sqlx::PgPool) {
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, owner).await;
+        let session_id = make_session(&pool, owner, Some(instance_id)).await;
+
+        // Six alternating exchanges, ending on the driving user row (u5).
+        let mut user_message_ids = Vec::with_capacity(6);
+        for i in 0..6i64 {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+                 VALUES ($1, 'assistant', $2, now() + make_interval(secs => $3::float8))",
+            )
+            .bind(session_id)
+            .bind(format!("唔。这是第{i}轮回复，够长不会被吃空。"))
+            .bind((2 * i) as f64)
+            .execute(&pool)
+            .await
+            .unwrap();
+            let uid = sqlx::query_scalar::<_, Uuid>(
+                "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+                 VALUES ($1, 'user', $2, now() + make_interval(secs => $3::float8)) \
+                 RETURNING id",
+            )
+            .bind(session_id)
+            .bind(format!("第{i}轮用户消息"))
+            .bind((2 * i + 1) as f64)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            user_message_ids.push(uid);
+        }
+        let user_message_id = *user_message_ids.last().unwrap();
+
+        // A burst of 22 newer rows — more than HISTORY_WINDOW — so the
+        // newest-N fetch misses the driving row entirely (the shape the old
+        // pin logic handled by inserting it at index 0, oldest-first).
+        for j in 0..11i64 {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) VALUES \
+                 ($1, 'user', $2, now() + make_interval(secs => $3::float8)), \
+                 ($1, 'assistant', $4, now() + make_interval(secs => $5::float8))",
+            )
+            .bind(session_id)
+            .bind(format!("burst用户消息{j}"))
+            .bind((12 + 2 * j) as f64)
+            .bind(format!("唔。burst回复{j}，够长不会被吃空。"))
+            .bind((13 + 2 * j) as f64)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // Fully-populated character_insights ⇒ extra=0 ⇒ the thinnest rung:
+        // even here, everything injected must be at-or-before the driving row.
+        eros_engine_store::character_insight::CharacterInsightRepo { pool: &pool }
+            .apply_extraction(
+                instance_id,
+                &serde_json::json!({
+                    "location": "公司",
+                    "occupation": "策展人",
+                    "current_situation": "连轴转了两周",
+                    "desires": "想去海边",
+                    "vulnerabilities": "怕被丢下",
+                    "habits": "凌晨才睡",
+                    "personal_values": "看重守约",
+                    "likes": ["下雨天"],
+                    "dislikes": ["被当小孩哄"],
+                    "relationships": ["妹妹在读高三"]
+                }),
+            )
+            .await
+            .unwrap();
+
+        let state = crate::routes::companion::test_state(pool.clone());
+        let (plan, input) = anchored_window_input(
+            session_id,
+            owner,
+            instance_id,
+            user_message_id,
+            "第5轮用户消息",
+        );
+
+        let (req, _tags) = build_reply_request(
+            &state,
+            &input,
+            &plan,
+            session_id,
+            owner,
+            instance_id,
+            user_message_id,
+        )
+        .await
+        .expect("build_reply_request succeeds");
+
+        assert_eq!(
+            req.messages.last().unwrap().content,
+            "第5轮用户消息",
+            "the driving row must be the LAST injected message — the model \
+             answers whatever comes last: {:?}",
+            req.messages
+        );
+        assert!(
+            req.messages.iter().all(|m| !m.content.contains("burst")),
+            "rows newer than the driving row must not enter its window: {:?}",
+            req.messages
+        );
+        // Anchored fetch + the thinnest rung: system + previous exchange +
+        // driving row, exactly as if the burst never happened.
+        assert_eq!(req.messages.len(), 4, "{:?}", req.messages);
+        assert_eq!(req.messages[1].content, "第4轮用户消息");
+    }
+
+    /// Same inversion inside the newest-N fetch: the driving row is still in
+    /// the window, but newer burst rows follow it and a sparse
+    /// character_insights row (extra>0) would spend budget on them from the
+    /// newest end. Causal consistency must hold here too, not only in the
+    /// buried-past-N shape.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn newer_in_window_rows_never_trail_the_driving_row(pool: sqlx::PgPool) {
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, owner).await;
+        let session_id = make_session(&pool, owner, Some(instance_id)).await;
+
+        // Three exchanges ending on the driving row (u2), then two newer
+        // exchanges — well inside HISTORY_WINDOW, so no fetch miss occurs.
+        let mut user_message_ids = Vec::with_capacity(3);
+        for i in 0..3i64 {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+                 VALUES ($1, 'assistant', $2, now() + make_interval(secs => $3::float8))",
+            )
+            .bind(session_id)
+            .bind(format!("唔。这是第{i}轮回复，够长不会被吃空。"))
+            .bind((2 * i) as f64)
+            .execute(&pool)
+            .await
+            .unwrap();
+            let uid = sqlx::query_scalar::<_, Uuid>(
+                "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+                 VALUES ($1, 'user', $2, now() + make_interval(secs => $3::float8)) \
+                 RETURNING id",
+            )
+            .bind(session_id)
+            .bind(format!("第{i}轮用户消息"))
+            .bind((2 * i + 1) as f64)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            user_message_ids.push(uid);
+        }
+        let user_message_id = *user_message_ids.last().unwrap();
+        for j in 0..2i64 {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) VALUES \
+                 ($1, 'user', $2, now() + make_interval(secs => $3::float8)), \
+                 ($1, 'assistant', $4, now() + make_interval(secs => $5::float8))",
+            )
+            .bind(session_id)
+            .bind(format!("burst用户消息{j}"))
+            .bind((6 + 2 * j) as f64)
+            .bind(format!("唔。burst回复{j}，够长不会被吃空。"))
+            .bind((7 + 2 * j) as f64)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // NO character_insights row: filled=0 ⇒ extra=14, the widest rung —
+        // the budget would otherwise pull the burst rows in from the newest
+        // end.
+        let state = crate::routes::companion::test_state(pool.clone());
+        let (plan, input) = anchored_window_input(
+            session_id,
+            owner,
+            instance_id,
+            user_message_id,
+            "第2轮用户消息",
+        );
+
+        let (req, _tags) = build_reply_request(
+            &state,
+            &input,
+            &plan,
+            session_id,
+            owner,
+            instance_id,
+            user_message_id,
+        )
+        .await
+        .expect("build_reply_request succeeds");
+
+        assert_eq!(
+            req.messages.last().unwrap().content,
+            "第2轮用户消息",
+            "the driving row must be the LAST injected message: {:?}",
+            req.messages
+        );
+        assert!(
+            req.messages.iter().all(|m| !m.content.contains("burst")),
+            "rows newer than the driving row must not enter its window: {:?}",
+            req.messages
         );
     }
 }

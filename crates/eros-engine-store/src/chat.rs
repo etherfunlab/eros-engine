@@ -327,10 +327,46 @@ impl<'a> ChatRepo<'a> {
         Ok(rows)
     }
 
+    /// Chat history in chronological (ascending) order, ending at the anchor
+    /// message: the newest `limit` rows at-or-before it, so the anchor is
+    /// always the LAST element of a non-empty result. On the async worker
+    /// path the driving row can be older than newer burst traffic (strict
+    /// per-session LIFO answers the newest message first), and a window
+    /// anchored at "now" would end on a message the reply is not for.
+    ///
+    /// `sent_at` ties break by `id` in both the filter and the sort, so the
+    /// anchor's last position survives same-timestamp siblings. An anchor
+    /// not in this session yields an empty result — the caller decides how
+    /// to degrade.
+    pub async fn history_up_to(
+        &self,
+        session_id: Uuid,
+        anchor_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<ChatMessage>, sqlx::Error> {
+        // Same DESC+reverse trick as `history()`. The anchor subquery is
+        // session-scoped so a foreign anchor cannot leak another session's
+        // clock into this one.
+        let mut rows = sqlx::query_as::<_, ChatMessage>(
+            "SELECT m.* FROM engine.chat_messages m, \
+                  (SELECT sent_at, id FROM engine.chat_messages \
+                   WHERE id = $2 AND session_id = $1) a \
+             WHERE m.session_id = $1 \
+               AND (m.sent_at, m.id) <= (a.sent_at, a.id) \
+             ORDER BY m.sent_at DESC, m.id DESC \
+             LIMIT $3",
+        )
+        .bind(session_id)
+        .bind(anchor_id)
+        .bind(limit)
+        .fetch_all(self.pool)
+        .await?;
+        rows.reverse();
+        Ok(rows)
+    }
+
     /// Full row for message `id` within `session_id`; `None` if the id is not
-    /// in this session (or does not exist). Used to pin a driving message back
-    /// into the prompt when a burst of newer traffic pushed it out of the
-    /// newest-N `history()` window, and to resolve a caller's
+    /// in this session (or does not exist). Used to resolve a caller's
     /// `reply_to_message_id` into the quote the prompt renders.
     pub async fn message_by_id_in_session(
         &self,
@@ -1521,6 +1557,107 @@ mod tests {
         assert_eq!(history[0].content, "hello");
         assert_eq!(history[1].role, "assistant");
         assert_eq!(history[2].content, "how are you?");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn history_up_to_returns_the_window_ending_at_the_anchor(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = throwaway_session(&pool).await;
+        // Explicit sent_at offsets: ordering is the behavior under test, so
+        // it must not ride on now() monotonicity across transactions.
+        let mut ids = Vec::with_capacity(5);
+        for i in 0..5i64 {
+            let id = sqlx::query_scalar::<_, Uuid>(
+                "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+                 VALUES ($1, 'user', $2, now() + make_interval(secs => $3::float8)) \
+                 RETURNING id",
+            )
+            .bind(s.id)
+            .bind(format!("m{i}"))
+            .bind(i as f64)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            ids.push(id);
+        }
+
+        // Anchor mid-history: rows newer than the anchor are excluded and
+        // the anchor comes last.
+        let rows = repo.history_up_to(s.id, ids[2], 50).await.unwrap();
+        assert_eq!(
+            rows.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+            vec!["m0", "m1", "m2"]
+        );
+
+        // The limit counts backwards from the anchor, not from "now".
+        let rows = repo.history_up_to(s.id, ids[2], 2).await.unwrap();
+        assert_eq!(
+            rows.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+            vec!["m1", "m2"]
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn history_up_to_breaks_sent_at_ties_by_id_keeping_the_anchor_last(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = throwaway_session(&pool).await;
+        // Fixed microsecond-aligned timestamp: PG truncates to micros, so a
+        // sub-microsecond component would make the tie itself flaky.
+        let tie = "2026-01-01T00:00:00.123456Z";
+        let lo = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let hi = Uuid::parse_str("00000000-0000-4000-8000-000000000002").unwrap();
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (id, session_id, role, content, sent_at) VALUES \
+             (gen_random_uuid(), $1, 'user', 'older', $2::timestamptz - interval '1 second'), \
+             ($3, $1, 'user', 'tie_lo', $2::timestamptz), \
+             ($4, $1, 'user', 'tie_hi', $2::timestamptz)",
+        )
+        .bind(s.id)
+        .bind(tie)
+        .bind(lo)
+        .bind(hi)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Anchoring on the lower id excludes its same-timestamp sibling —
+        // otherwise the sibling could sort after the anchor and the model
+        // would answer it instead.
+        let rows = repo.history_up_to(s.id, lo, 50).await.unwrap();
+        assert_eq!(
+            rows.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+            vec!["older", "tie_lo"]
+        );
+
+        // Anchoring on the higher id keeps both, sibling before anchor.
+        let rows = repo.history_up_to(s.id, hi, 50).await.unwrap();
+        assert_eq!(
+            rows.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+            vec!["older", "tie_lo", "tie_hi"]
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn history_up_to_with_a_foreign_anchor_returns_empty(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = throwaway_session(&pool).await;
+        repo.append_message(s.id, "user", "hello").await.unwrap();
+        let other = throwaway_session(&pool).await;
+        let foreign = repo
+            .append_message(other.id, "user", "elsewhere")
+            .await
+            .unwrap();
+
+        assert!(repo
+            .history_up_to(s.id, foreign, 50)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(repo
+            .history_up_to(s.id, Uuid::new_v4(), 50)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[sqlx::test(migrations = "./migrations")]
