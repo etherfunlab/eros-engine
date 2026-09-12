@@ -774,7 +774,8 @@ The prompt is lean but not memoryless: persona + voice directive + a
 first-turn **bootstrap snapshot** (frozen once per session, then re-injected
 verbatim every turn) + one relationship line derived from the session's
 affinity (bond/chemistry tiers) + this turn's **recall block**. History is
-the last 8 messages (4 exchanges) — shorter than the chat path's window,
+the 8 messages (4 exchanges) ending at this turn's own user row — shorter
+than the chat path's window,
 since the bootstrap and recall carry the longer-range memory instead. A
 voice **turn** writes no memories (no insight extraction, no vector
 writes), but a finished **call** does: once the session goes idle, the
