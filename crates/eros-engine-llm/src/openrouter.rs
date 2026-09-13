@@ -1236,6 +1236,10 @@ impl OpenRouterClient {
         // rejects (400 "expected string, received null"). Sharing WireRequest
         // keeps the skip-None behaviour and stops the two paths from drifting.
         let (bare_model, ep) = self.resolve_endpoint(model)?;
+        // Owned copy for the `filter_map` closure below (§6 parity with the
+        // sync path's model_out): the closure is `async move` and outlives
+        // `ep`'s borrow of `self.providers`.
+        let ep_name: Option<String> = ep.name.map(str::to_string);
         let wire = WireRequest {
             model: &bare_model,
             messages: &req.messages,
@@ -1325,53 +1329,72 @@ impl OpenRouterClient {
 
         let stream = idle_bounded(resp.bytes_stream(), STREAM_IDLE_TIMEOUT)
             .eventsource()
-            .filter_map(|ev| async move {
-                match ev {
-                    Ok(e) => {
-                        if e.data == "[DONE]" {
-                            return None;
-                        }
-                        match serde_json::from_str::<WireStreamFrame>(&e.data) {
-                            Ok(frame) => {
-                                // A mid-stream provider failure arrives as a
-                                // normal-looking 200 SSE frame with a top-level
-                                // `error` (and/or finish_reason:"error"). It
-                                // must fail the attempt so the pipeline's
-                                // fallback chain runs — NOT parse as an
-                                // all-None chunk that lets a partial reply
-                                // persist as a clean success.
-                                if let Some(err) = frame.error {
-                                    // The provider spoke inside a 200 stream.
-                                    // Keep the code structured — this used to
-                                    // be format!("code={:?}") into a String,
-                                    // which destroyed it.
-                                    return Some(Err(LlmError::Provider(mid_stream_error_body(
-                                        err.code.as_ref(),
-                                        &err.message,
-                                    ))));
-                                }
-                                let choice = frame.choices.into_iter().next().unwrap_or_default();
-                                if choice.finish_reason.as_deref() == Some("error") {
-                                    return Some(Err(LlmError::Provider(
+            .filter_map(move |ev| {
+                // Per-invocation clone: `filter_map`'s closure is `FnMut`,
+                // called once per frame, and each call's `async move` block
+                // needs its own owned copy of `ep_name`.
+                let ep_name = ep_name.clone();
+                async move {
+                    match ev {
+                        Ok(e) => {
+                            if e.data == "[DONE]" {
+                                return None;
+                            }
+                            match serde_json::from_str::<WireStreamFrame>(&e.data) {
+                                Ok(frame) => {
+                                    // A mid-stream provider failure arrives as a
+                                    // normal-looking 200 SSE frame with a top-level
+                                    // `error` (and/or finish_reason:"error"). It
+                                    // must fail the attempt so the pipeline's
+                                    // fallback chain runs — NOT parse as an
+                                    // all-None chunk that lets a partial reply
+                                    // persist as a clean success.
+                                    if let Some(err) = frame.error {
+                                        // The provider spoke inside a 200 stream.
+                                        // Keep the code structured — this used to
+                                        // be format!("code={:?}") into a String,
+                                        // which destroyed it.
+                                        return Some(Err(LlmError::Provider(
+                                            mid_stream_error_body(err.code.as_ref(), &err.message),
+                                        )));
+                                    }
+                                    let choice =
+                                        frame.choices.into_iter().next().unwrap_or_default();
+                                    if choice.finish_reason.as_deref() == Some("error") {
+                                        return Some(Err(LlmError::Provider(
                                         ParsedErrorBody::message_only(
                                             "openrouter stream terminated with finish_reason=error",
                                         ),
                                     )));
+                                    }
+                                    Some(Ok(DeltaChunk {
+                                        content: choice.delta.content.filter(|s| !s.is_empty()),
+                                        finish_reason: choice.finish_reason,
+                                        usage: frame.usage,
+                                        generation_id: frame.id,
+                                        // §6 parity with the sync path (see
+                                        // model_out above `execute`'s
+                                        // ChatResponse): a direct-endpoint echo
+                                        // self-identifies as <echo>@<provider>,
+                                        // escaped so a literal `@` in the echo
+                                        // can't fake a second provider suffix.
+                                        // OpenRouter chunks stay byte-identical.
+                                        model: frame.model.map(|echo| match ep_name.as_deref() {
+                                            None => echo,
+                                            Some(p) => format!(
+                                                "{}@{p}",
+                                                crate::provider::escape_model_id(&echo)
+                                            ),
+                                        }),
+                                    }))
                                 }
-                                Some(Ok(DeltaChunk {
-                                    content: choice.delta.content.filter(|s| !s.is_empty()),
-                                    finish_reason: choice.finish_reason,
-                                    usage: frame.usage,
-                                    generation_id: frame.id,
-                                    model: frame.model,
-                                }))
+                                Err(_) => Some(Err(LlmError::StreamParse(
+                                    e.data.chars().take(256).collect(),
+                                ))),
                             }
-                            Err(_) => Some(Err(LlmError::StreamParse(
-                                e.data.chars().take(256).collect(),
-                            ))),
                         }
+                        Err(e) => Some(Err(LlmError::Stream(e.to_string()))),
                     }
-                    Err(e) => Some(Err(LlmError::Stream(e.to_string()))),
                 }
             });
 
@@ -3027,6 +3050,107 @@ data: [DONE]\n\n";
                 "body field {k} leaked into the stream wire"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn execute_stream_as_escapes_model_echo_for_direct_endpoints() {
+        use futures_util::StreamExt as _;
+        // Direct-endpoint stream whose frames echo `model`: the chunk must
+        // carry `<escaped echo>@<provider>`, matching the batch
+        // ChatResponse.model shape, so audit joins don't depend on which
+        // path served the call.
+        let server_b = MockServer::start().await;
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"id\":\"g1\",\"model\":\"venice-uncensored\"}\n\ndata: [DONE]\n\n";
+        Mock::given(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server_b)
+            .await;
+        let mut openrouter_headers = reqwest::header::HeaderMap::new();
+        openrouter_headers.insert("HTTP-Referer", "https://eros.example".parse().unwrap());
+        let client =
+            OpenRouterClient::with_base_url("or-key".into(), "https://unused.test/v1".into())
+                .with_openrouter_headers(openrouter_headers)
+                .with_providers(std::collections::HashMap::from([(
+                    "venice".to_string(),
+                    crate::provider::ProviderEndpoint {
+                        base_url: format!("{}/v1/chat/completions", server_b.uri()),
+                        api_key: "v-key".into(),
+                        headers: reqwest::header::HeaderMap::new(),
+                        body_rules: Vec::new(),
+                    },
+                )]));
+        let req = ChatRequest {
+            model: String::new(), // placeholder; execute_stream_as takes the model separately
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            temperature: 0.0,
+            max_tokens: 16,
+            ..Default::default()
+        };
+        let mut stream = client
+            .execute_stream_as(&req, "venice-uncensored@venice")
+            .await
+            .expect("stream opens");
+        let mut captured_model = None;
+        while let Some(item) = stream.next().await {
+            let chunk = item.expect("ok chunk");
+            if chunk.model.is_some() {
+                captured_model = chunk.model;
+            }
+        }
+        assert_eq!(captured_model.as_deref(), Some("venice-uncensored@venice"));
+    }
+
+    #[tokio::test]
+    async fn execute_stream_as_leaves_openrouter_model_echo_raw() {
+        use futures_util::StreamExt as _;
+        // Same SSE body served from the plain OpenRouter base URL: the
+        // chunk's model must be exactly "venice-uncensored" (no suffix, no
+        // escaping) — there is no provider endpoint to self-identify against.
+        let server = MockServer::start().await;
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"id\":\"g1\",\"model\":\"venice-uncensored\"}\n\ndata: [DONE]\n\n";
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let req = ChatRequest {
+            model: String::new(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            temperature: 0.0,
+            max_tokens: 16,
+            ..Default::default()
+        };
+        let mut stream = client
+            .execute_stream_as(&req, "venice-uncensored")
+            .await
+            .expect("stream opens");
+        let mut captured_model = None;
+        while let Some(item) = stream.next().await {
+            let chunk = item.expect("ok chunk");
+            if chunk.model.is_some() {
+                captured_model = chunk.model;
+            }
+        }
+        assert_eq!(captured_model.as_deref(), Some("venice-uncensored"));
     }
 
     // ─── B1: X-Generation-Id header capture ─────────────────────────────────
