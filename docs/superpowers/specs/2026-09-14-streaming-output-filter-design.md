@@ -240,6 +240,10 @@ surface.
 - **Clean-EOF-as-completion** (see Stream-end semantics) follows the engine's
   streaming discipline rather than the batch framing's implicit
   truncation-detection.
+- **No byte-BPE repair on the filter stream.** The batch client's internal
+  byte-BPE garble repair does not run on streamed output; garbled filter output
+  (unobserved in production for filter-class models) streams as-is, matching LIVE
+  mode's raw-delta discipline.
 
 ## Testing
 
