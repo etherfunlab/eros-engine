@@ -14506,6 +14506,35 @@ data: [DONE]\n\n";
             chat_sent.contains("[inner_state]") && chat_sent.contains("有点开心"),
             "inner_state still injected alongside reply_mode; got {chat_sent}",
         );
+
+        // The decision-event write is fire-and-forget (`tokio::spawn`), so poll
+        // for it rather than asserting immediately.
+        let mut payload: Option<Option<serde_json::Value>> = None;
+        for _ in 0..50 {
+            if let Ok(r) = sqlx::query_as::<_, (Option<serde_json::Value>,)>(
+                "SELECT payload FROM engine.companion_decision_events \
+                     WHERE session_id = $1 ORDER BY created_at DESC LIMIT 1",
+            )
+            .bind(session_id)
+            .fetch_one(&pool)
+            .await
+            {
+                payload = Some(r.0);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let payload = payload
+            .expect("companion_decision_events row must land within timeout")
+            .expect("payload must be recorded for a reply_text verdict");
+        assert_eq!(
+            payload["reply_mode"], "judge",
+            "the audit must record the in-effect mode; got {payload}",
+        );
+        assert!(
+            payload["nudges"].is_null(),
+            "the verdict carried a definite reply_mode, so the dice must not roll; got {payload}",
+        );
     }
 
     /// Quoting an old line adds the `[quote]` block and changes nothing else.

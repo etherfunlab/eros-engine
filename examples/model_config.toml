@@ -719,7 +719,7 @@ max_tokens  = 400
 #reasoning   = { enabled = false }
 #ghosting    = false   # uncomment to hard-disable ghosting for this deployment
 #structured_output = true   # send response_format=json_schema on the judge (default true); set false if your provider 400s on it
-# Uncomment filter_prompt to enable the LLM judge. inner_state / tone MUST be
+# Uncomment filter_prompt to enable the LLM judge. inner_state / clothing MUST be
 # short prose — NEVER instructions or formatting (they are sanitized, but keep
 # the model honest). Output JSON only, no code fences.
 #filter_prompt = """
