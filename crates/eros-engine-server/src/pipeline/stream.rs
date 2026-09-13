@@ -1991,10 +1991,10 @@ pub(crate) struct PdeVerdict {
     action: PdeAction,
     #[serde(default)]
     inner_state: String,
-    /// Prescriptive delivery for this turn's reply (free text; sanitized like
-    /// inner_state before injection). `None` on old prompts / null verdicts.
+    /// Judge-decided reply mode (spec 2026-09-13 §3.1). `None` = unsure →
+    /// the engine's dice take over. Old filter_prompts never emit it.
     #[serde(default)]
-    tone: Option<String>,
+    reply_mode: Option<eros_engine_core::types::ReplyMode>,
     #[serde(default)]
     reason: Option<String>,
     #[serde(default)]
@@ -2015,9 +2015,9 @@ fn parse_pde_verdict(text: &str) -> Option<PdeVerdict> {
 
 const INNER_STATE_MAX_CHARS: usize = 200;
 
-/// Sanitize judge-authored prose (`inner_state` / `tone`) before folding it into
-/// the system prompt's `[inner_state]` / `[reply_tone]` sections. Drops lines
-/// that look like prompt section
+/// Sanitize judge-authored prose (`inner_state` / `clothing`) before folding it
+/// into the system prompt's `[inner_state]` / `[character_state]` sections.
+/// Drops lines that look like prompt section
 /// headers / structural markers, strips `[`/`]` tokens and control characters,
 /// collapses whitespace, and caps length. Returns plain single-line prose
 /// (`""` ⇒ caller treats as no hint).
@@ -2107,12 +2107,13 @@ fn pde_response_format() -> serde_json::Value {
             "schema": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["action", "inner_state", "tone", "reason", "image_ref", "aspect_ratio", "clothing"],
+                "required": ["action", "inner_state", "reply_mode", "reason", "image_ref", "aspect_ratio", "clothing"],
                 "properties": {
                     "action": { "type": "string",
                         "enum": ["reply_text", "ghost", "reply_image", "reply_text_image", "product_qa"] },
                     "inner_state": { "type": "string" },
-                    "tone": { "type": ["string", "null"] },
+                    "reply_mode": { "type": ["string", "null"],
+                        "enum": ["listen", "follow", "ask", "judge", null] },
                     "reason": { "type": ["string", "null"] },
                     "image_ref": { "type": "string", "enum": ["face", "previous"] },
                     "aspect_ratio": { "type": ["string", "null"],
@@ -2524,7 +2525,10 @@ struct VerdictAudit<'a> {
     action: &'a str,
     inner_state: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tone: Option<&'a str>,
+    reply_mode: Option<&'static str>,
+    /// Always serialised: `null` = the dice were not rolled this turn
+    /// (definite mode, or a non-text action); an object = rolled, as shown.
+    nudges: Option<eros_engine_core::types::TurnNudges>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<&'a str>,
     image_ref: &'a str,
@@ -2534,12 +2538,20 @@ struct VerdictAudit<'a> {
     clothing: Option<&'a str>,
 }
 
-impl<'a> From<&'a PdeVerdict> for VerdictAudit<'a> {
-    fn from(v: &'a PdeVerdict) -> Self {
+impl<'a> VerdictAudit<'a> {
+    /// `reply_mode` / `nudges` come from the FINALISED plan — the values in
+    /// effect after carriage and the roll — while the free-text fields come
+    /// from the verdict (what the judge said, even where the plan drops it).
+    fn new(
+        v: &'a PdeVerdict,
+        reply_mode: Option<eros_engine_core::types::ReplyMode>,
+        nudges: Option<eros_engine_core::types::TurnNudges>,
+    ) -> Self {
         VerdictAudit {
             action: v.action.as_str(),
             inner_state: &v.inner_state,
-            tone: v.tone.as_deref(),
+            reply_mode: reply_mode.map(|m| m.as_str()),
+            nudges,
             reason: v.reason.as_deref(),
             image_ref: match v.image_ref {
                 eros_engine_core::types::ImageRef::Face => "face",
@@ -4098,13 +4110,6 @@ pub fn run_stream(
                                 if s.is_empty() { Vec::new() } else { vec![s] }
                             };
                             killswitch_hints = hints.clone();
-                            // Same sanitizer, same discipline: judge-authored
-                            // prose never carries section markers into the prompt.
-                            let tone = v
-                                .tone
-                                .as_deref()
-                                .map(sanitize_inner_state)
-                                .filter(|s| !s.is_empty());
                             let clothing = v
                                 .clothing
                                 .as_deref()
@@ -4123,7 +4128,7 @@ pub fn run_stream(
                                 eros_engine_core::types::ImageRef::Face
                             };
                             let img_aspect = if is_image { v.aspect_ratio.clone() } else { None };
-                            pde::plan_for(&input, action, hints, tone, clothing, img_ref, img_aspect)
+                            pde::plan_for(&input, action, hints, v.reply_mode, clothing, img_ref, img_aspect)
                         }
                         _ => pde::decide(&input), // fail-open
                     };
@@ -4153,12 +4158,31 @@ pub fn run_stream(
                 &input,
                 ActionType::ReplyImage,
                 plan.context_hints.clone(),
-                plan.reply_tone.clone(),
+                plan.reply_mode,
                 plan.clothing.clone(),
                 eros_engine_core::types::ImageRef::Face,
                 None,
             );
         }
+
+        // Dice roll at plan finalisation (spec 2026-09-13 §3.2): a definite
+        // judge mode owns [this_turn], so the dice stay in the cup; a bare
+        // image / ghost / product_qa turn has no text for them to steer.
+        // Rolled here — not in build_reply_request — so the audit row below
+        // records what the engine decided.
+        let affinity_scope = match &input.event {
+            Event::UserMessage { affinity_scope, .. } => *affinity_scope,
+            _ => eros_engine_core::scope::AffinityScope::default(),
+        };
+        if plan.reply_mode.is_none() && plan.action_type.bears_text() {
+            plan.nudges = crate::prompt::roll_nudges(
+                Some(&input.affinity),
+                affinity_scope,
+                &mut rand::thread_rng(),
+            );
+        }
+        let audited_nudges = (plan.reply_mode.is_none() && plan.action_type.bears_text())
+            .then_some(plan.nudges);
 
         // The judge is one of spec §6.1's five chains, so its failed hops must
         // reach this turn's `final` frame as well as its own audit row. Hoisted
@@ -4175,6 +4199,7 @@ pub fn run_stream(
             let ev_msg = user_msg.user_message_id;
             let status = run.status.as_str();
             let acted = plan.action_type;
+            let audited_mode = plan.reply_mode;
             // Snapshot of the affinity state the judge's payload was built
             // from (issue #254). The prompt carries only the buckets; this row
             // keeps the numbers.
@@ -4182,7 +4207,9 @@ pub fn run_stream(
             tokio::spawn(async move {
                 let proposed = run.verdict.as_ref().map(|v| v.action.as_str());
                 let payload: Option<serde_json::Value> = match &run.verdict {
-                    Some(v) => serde_json::to_value(VerdictAudit::from(v)).ok(),
+                    Some(v) => {
+                        serde_json::to_value(VerdictAudit::new(v, audited_mode, audited_nudges)).ok()
+                    }
                     None => run.raw.clone().map(serde_json::Value::String),
                 };
                 let action_str = action_type_audit_str(acted);
@@ -5786,7 +5813,8 @@ mod tests {
             affinity_deltas: Default::default(),
             energy_cost: 0.0,
             context_hints: vec![],
-            reply_tone: None,
+            reply_mode: None,
+            nudges: Default::default(),
             clothing: None,
             image_caption: None,
             image_ref: eros_engine_core::types::ImageRef::Face,
@@ -6123,37 +6151,52 @@ mod tests {
     }
 
     #[test]
-    fn parse_pde_verdict_tone_roundtrip() {
-        // With tone.
+    fn parse_pde_verdict_reply_mode_roundtrip() {
         let v =
-            parse_pde_verdict(r#"{"action":"reply_text","inner_state":"ok","tone":"敷衍一点"}"#)
+            parse_pde_verdict(r#"{"action":"reply_text","inner_state":"ok","reply_mode":"judge"}"#)
                 .unwrap();
-        assert_eq!(v.tone.as_deref(), Some("敷衍一点"));
-        // Without tone (old prompts) and explicit null (strict providers).
+        assert_eq!(
+            v.reply_mode,
+            Some(eros_engine_core::types::ReplyMode::Judge)
+        );
         let v = parse_pde_verdict(r#"{"action":"reply_text","inner_state":"ok"}"#).unwrap();
-        assert_eq!(v.tone, None);
+        assert_eq!(v.reply_mode, None, "old prompts never emit the field");
         let v =
-            parse_pde_verdict(r#"{"action":"reply_text","inner_state":"ok","tone":null}"#).unwrap();
-        assert_eq!(v.tone, None);
+            parse_pde_verdict(r#"{"action":"reply_text","inner_state":"ok","reply_mode":null}"#)
+                .unwrap();
+        assert_eq!(v.reply_mode, None, "strict providers send explicit null");
     }
 
     #[test]
-    fn verdict_audit_serializes_tone_when_present() {
-        let with: PdeVerdict =
-            serde_json::from_str(r#"{"action":"ghost","inner_state":"想躲","tone":"冷淡"}"#)
-                .unwrap();
-        let j = serde_json::to_value(VerdictAudit::from(&with)).unwrap();
-        assert_eq!(
-            j["tone"], "冷淡",
-            "audit records what the judge said even when the plan drops it (ghost)"
-        );
-        let without: PdeVerdict =
-            serde_json::from_str(r#"{"action":"ghost","inner_state":"想躲"}"#).unwrap();
-        let j = serde_json::to_value(VerdictAudit::from(&without)).unwrap();
+    fn verdict_audit_nudges_null_when_not_rolled_object_when_rolled() {
+        let v: PdeVerdict =
+            serde_json::from_str(r#"{"action":"reply_text","inner_state":"ok"}"#).unwrap();
+        let j = serde_json::to_value(VerdictAudit::new(
+            &v,
+            Some(eros_engine_core::types::ReplyMode::Listen),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(j["reply_mode"], "listen");
         assert!(
-            j.get("tone").is_none(),
-            "absent tone is omitted from audit: {j}"
+            j["nudges"].is_null(),
+            "definite mode ⇒ dice not rolled: {j}"
         );
+        assert!(j.get("tone").is_none(), "tone retired from the audit: {j}");
+
+        let rolled = eros_engine_core::types::TurnNudges {
+            affirm: true,
+            share_slice: false,
+            open_question: false,
+        };
+        let j = serde_json::to_value(VerdictAudit::new(&v, None, Some(rolled))).unwrap();
+        assert!(
+            j.get("reply_mode").is_none(),
+            "no mode ⇒ field omitted: {j}"
+        );
+        assert_eq!(j["nudges"]["affirm"], true);
+        assert_eq!(j["nudges"]["share_slice"], false);
+        assert_eq!(j["nudges"]["open_question"], false);
     }
 
     #[test]
@@ -6178,14 +6221,14 @@ mod tests {
             r#"{"action":"reply_image","inner_state":"想拍照","clothing":"运动背心"}"#,
         )
         .unwrap();
-        let j = serde_json::to_value(VerdictAudit::from(&with)).unwrap();
+        let j = serde_json::to_value(VerdictAudit::new(&with, None, None)).unwrap();
         assert_eq!(
             j["clothing"], "运动背心",
             "audit records what the judge said even when the plan drops it (reply_image)"
         );
         let without: PdeVerdict =
             serde_json::from_str(r#"{"action":"reply_text","inner_state":"ok"}"#).unwrap();
-        let j = serde_json::to_value(VerdictAudit::from(&without)).unwrap();
+        let j = serde_json::to_value(VerdictAudit::new(&without, None, None)).unwrap();
         assert!(
             j.get("clothing").is_none(),
             "absent clothing is omitted from audit: {j}"
@@ -6196,7 +6239,7 @@ mod tests {
     fn verdict_audit_includes_image_ref_and_aspect() {
         let j = "{\"action\":\"reply_image\",\"inner_state\":\"x\",\"image_ref\":\"previous\",\"aspect_ratio\":\"3:4\"}";
         let v = parse_pde_verdict(j).unwrap();
-        let payload = serde_json::to_value(VerdictAudit::from(&v)).unwrap();
+        let payload = serde_json::to_value(VerdictAudit::new(&v, None, None)).unwrap();
         assert_eq!(payload["image_ref"], "previous");
         assert_eq!(payload["aspect_ratio"], "3:4");
     }
@@ -12860,7 +12903,7 @@ data: [DONE]\n\n";
         );
         assert!(
             !chat_sent.contains("[reply_tone]"),
-            "a verdict without tone must not render a [reply_tone] section; got {chat_sent}",
+            "the retired [reply_tone] section must never render; got {chat_sent}",
         );
     }
 
@@ -14331,7 +14374,7 @@ data: [DONE]\n\n";
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn run_stream_pde_judge_reply_injects_reply_tone(pool: PgPool) {
+    async fn run_stream_pde_judge_reply_injects_reply_mode(pool: PgPool) {
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
         use futures_util::StreamExt;
         use wiremock::matchers::{body_string_contains, path as wm_path};
@@ -14340,14 +14383,16 @@ data: [DONE]\n\n";
         let mock = MockServer::start().await;
 
         // Judge ("pde/judge"): a `reply_text` verdict carrying BOTH an
-        // inner_state and a tone. Both are plain prose (no headers/brackets)
-        // so they survive `sanitize_inner_state` unchanged and land in the
-        // prompt's `[inner_state]` / `[reply_tone]` sections via
-        // `pde::plan_for` → `build_prompt`.
+        // inner_state and a reply_mode. inner_state is plain prose (no
+        // headers/brackets) so it survives `sanitize_inner_state` unchanged
+        // and lands in the prompt's `[inner_state]` section; reply_mode
+        // carries through `pde::plan_for` → `build_prompt` into iron rule ①
+        // (spec 2026-09-13 §3.4) — there is no separate `[reply_tone]`
+        // section any more.
         let verdict = serde_json::json!({
             "action": "reply_text",
             "inner_state": "有点开心",
-            "tone": "撒娇一点，句子短一点"
+            "reply_mode": "judge"
         })
         .to_string();
         let judge_body = serde_json::json!({
@@ -14362,7 +14407,7 @@ data: [DONE]\n\n";
             .await;
 
         // Chat ("deepseek/x"): normal SSE reply. The mock matches the chat call;
-        // we capture its request body afterward to assert the injected tone.
+        // we capture its request body afterward to assert the injected mode.
         let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"REPLY\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"deepseek/x\"}\n\ndata: [DONE]\n\n";
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("deepseek/x"))
@@ -14454,13 +14499,12 @@ data: [DONE]\n\n";
             .expect("the chat call must have fired");
         let chat_sent = String::from_utf8_lossy(&chat_req.body);
         assert!(
-            chat_sent.contains("[reply_tone]")
-                && chat_sent.contains("这一轮回复的语气：撒娇一点，句子短一点。"),
-            "the judge's tone must be injected as [reply_tone] in the chat system prompt; got {chat_sent}",
+            chat_sent.contains("对方刚说的话你不全买账：挑出你不认同的那一点，反问回去"),
+            "the judge's reply_mode=judge must drive iron rule ① in the chat system prompt; got {chat_sent}",
         );
         assert!(
             chat_sent.contains("[inner_state]") && chat_sent.contains("有点开心"),
-            "inner_state still injected alongside tone; got {chat_sent}",
+            "inner_state still injected alongside reply_mode; got {chat_sent}",
         );
     }
 
@@ -16422,7 +16466,10 @@ data: [DONE]\n\n";
             req.iter().any(|x| x == "image_ref"),
             "image_ref required: {v}"
         );
-        assert!(req.iter().any(|x| x == "tone"), "tone required: {v}");
+        assert!(
+            req.iter().any(|x| x == "reply_mode"),
+            "reply_mode required: {v}"
+        );
         assert!(
             req.iter().any(|x| x == "clothing"),
             "clothing required: {v}"
@@ -16433,9 +16480,9 @@ data: [DONE]\n\n";
             "clothing is nullable for strict providers: {v}"
         );
         assert_eq!(
-            v["json_schema"]["schema"]["properties"]["tone"]["type"],
+            v["json_schema"]["schema"]["properties"]["reply_mode"]["type"],
             serde_json::json!(["string", "null"]),
-            "tone is nullable for strict providers: {v}"
+            "reply_mode is nullable for strict providers: {v}"
         );
         assert!(
             req.iter().any(|x| x == "aspect_ratio"),
