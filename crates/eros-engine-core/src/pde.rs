@@ -6,7 +6,7 @@
 
 use crate::affinity::AffinityDeltas;
 use crate::ghost::{self, GhostDecision, GhostSignals};
-use crate::types::{ActionPlan, ActionType, DecisionInput, Event, ImageRef, ReplyStyle};
+use crate::types::{ActionPlan, ActionType, DecisionInput, Event, ImageRef, ReplyMode, ReplyStyle, TurnNudges};
 
 // Decision thresholds — tune here rather than at call sites.
 const LONG_MSG_CHARS: usize = 30;
@@ -44,7 +44,8 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
             affinity_deltas: predict_reply_deltas(input),
             energy_cost: ENERGY_COST_REPLY,
             context_hints: vec![],
-            reply_tone: None,
+            reply_mode: None,
+            nudges: TurnNudges::default(),
             clothing: None,
             image_caption: None,
             image_ref: ImageRef::Face,
@@ -64,7 +65,8 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
             affinity_deltas: ghost_affinity_deltas(),
             energy_cost: ENERGY_COST_GHOST,
             context_hints: vec![],
-            reply_tone: None,
+            reply_mode: None,
+            nudges: TurnNudges::default(),
             clothing: None,
             image_caption: None,
             image_ref: ImageRef::Face,
@@ -80,7 +82,8 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
             affinity_deltas: AffinityDeltas::default(),
             energy_cost: ENERGY_COST_PROACTIVE,
             context_hints: vec![],
-            reply_tone: None,
+            reply_mode: None,
+            nudges: TurnNudges::default(),
             clothing: None,
             image_caption: None,
             image_ref: ImageRef::Face,
@@ -97,7 +100,8 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
             affinity_deltas: AffinityDeltas::default(),
             energy_cost: ENERGY_COST_APP_OPEN,
             context_hints: vec![],
-            reply_tone: None,
+            reply_mode: None,
+            nudges: TurnNudges::default(),
             clothing: None,
             image_caption: None,
             image_ref: ImageRef::Face,
@@ -112,7 +116,8 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
         affinity_deltas: predict_reply_deltas(input),
         energy_cost: ENERGY_COST_REPLY,
         context_hints: vec![],
-        reply_tone: None,
+        reply_mode: None,
+        nudges: TurnNudges::default(),
         clothing: None,
         image_caption: None,
         image_ref: ImageRef::Face,
@@ -124,17 +129,17 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
 /// and energy constants internally. Per action:
 ///   ReplyText / ReplyImage / ReplyTextImage → Neutral, predict_reply_deltas,
 ///                                              ENERGY_COST_REPLY, context_hints = hints,
-///                                              reply_tone / clothing kept (ReplyImage drops both)
+///                                              reply_mode / clothing kept (ReplyImage drops both)
 ///   Ghost                                   → Cold, ghost_affinity_deltas,
-///                                              ENERGY_COST_GHOST, hints discarded, tone discarded
+///                                              ENERGY_COST_GHOST, hints discarded, mode discarded
 ///   ProductQa                               → Neutral, all-zero deltas, zero energy,
-///                                              hints/tone dropped (out-of-character aside)
+///                                              hints/mode dropped (out-of-character aside)
 ///   Proactive                               → unreachable! (comes only from decide)
 pub fn plan_for(
     input: &DecisionInput,
     action: ActionType,
     hints: Vec<String>,
-    reply_tone: Option<String>,
+    reply_mode: Option<ReplyMode>,
     clothing: Option<String>,
     image_ref: ImageRef,
     aspect_ratio: Option<String>,
@@ -146,13 +151,14 @@ pub fn plan_for(
             affinity_deltas: predict_reply_deltas(input),
             energy_cost: ENERGY_COST_REPLY,
             context_hints: hints,
-            // Delivery directives only make sense where there is text to
-            // deliver; a bare image turn drops them.
-            reply_tone: if matches!(action, ActionType::ReplyImage) {
+            // Mode only makes sense where there is text to deliver; a bare
+            // image turn drops it (same carriage rule as clothing).
+            reply_mode: if matches!(action, ActionType::ReplyImage) {
                 None
             } else {
-                reply_tone
+                reply_mode
             },
+            nudges: TurnNudges::default(),
             clothing: if matches!(action, ActionType::ReplyImage) {
                 None
             } else {
@@ -168,7 +174,8 @@ pub fn plan_for(
             affinity_deltas: ghost_affinity_deltas(),
             energy_cost: ENERGY_COST_GHOST,
             context_hints: vec![],
-            reply_tone: None,
+            reply_mode: None,
+            nudges: TurnNudges::default(),
             clothing: None,
             image_caption: None,
             image_ref: ImageRef::Face,
@@ -178,12 +185,13 @@ pub fn plan_for(
             action_type: ActionType::ProductQa,
             reply_style: ReplyStyle::Neutral,
             // Out-of-character aside: no relationship movement, no energy,
-            // no persona-prompt inputs (hints/tone are dropped — there is no
+            // no persona-prompt inputs (hints/mode are dropped — there is no
             // companion prompt to fold them into).
             affinity_deltas: AffinityDeltas::default(),
             energy_cost: 0.0,
             context_hints: vec![],
-            reply_tone: None,
+            reply_mode: None,
+            nudges: TurnNudges::default(),
             clothing: None,
             image_caption: None,
             image_ref: ImageRef::Face,
@@ -574,62 +582,43 @@ mod tests {
     }
 
     #[test]
-    fn plan_for_keeps_tone_for_text_bearing_drops_for_image_and_ghost() {
-        let input = test_decision_input(); // the existing fixture at pde.rs:431
-        let tone = Some("语气敷衍一点".to_string());
+    fn plan_for_keeps_mode_for_text_bearing_drops_for_image_and_ghost() {
+        let input = test_decision_input();
+        let mode = Some(ReplyMode::Listen);
 
-        let text = plan_for(
+        let text = plan_for(&input, ActionType::ReplyText, vec![], mode, None, ImageRef::Face, None);
+        assert_eq!(text.reply_mode, Some(ReplyMode::Listen));
+
+        let text_image =
+            plan_for(&input, ActionType::ReplyTextImage, vec![], mode, None, ImageRef::Face, None);
+        assert_eq!(text_image.reply_mode, Some(ReplyMode::Listen));
+
+        let image_only =
+            plan_for(&input, ActionType::ReplyImage, vec![], mode, None, ImageRef::Face, None);
+        assert_eq!(image_only.reply_mode, None, "bare image turn drops the mode");
+
+        let ghost = plan_for(&input, ActionType::Ghost, vec![], mode, None, ImageRef::Face, None);
+        assert_eq!(ghost.reply_mode, None, "ghost carries no mode");
+
+        let qa = plan_for(&input, ActionType::ProductQa, vec![], mode, None, ImageRef::Face, None);
+        assert_eq!(qa.reply_mode, None, "product_qa carries no mode");
+    }
+
+    #[test]
+    fn plans_start_with_default_nudges() {
+        let input = test_decision_input();
+        let plan = plan_for(
             &input,
             ActionType::ReplyText,
             vec![],
-            tone.clone(),
+            None,
             None,
             ImageRef::Face,
             None,
         );
-        assert_eq!(text.reply_tone.as_deref(), Some("语气敷衍一点"));
-
-        let text_image = plan_for(
-            &input,
-            ActionType::ReplyTextImage,
-            vec![],
-            tone.clone(),
-            None,
-            ImageRef::Face,
-            None,
-        );
-        assert_eq!(text_image.reply_tone.as_deref(), Some("语气敷衍一点"));
-
-        let image_only = plan_for(
-            &input,
-            ActionType::ReplyImage,
-            vec![],
-            tone.clone(),
-            None,
-            ImageRef::Face,
-            None,
-        );
-        assert_eq!(
-            image_only.reply_tone, None,
-            "reply_image has no text to tone"
-        );
-
-        let ghost = plan_for(
-            &input,
-            ActionType::Ghost,
-            vec![],
-            tone,
-            None,
-            ImageRef::Face,
-            None,
-        );
-        assert_eq!(
-            ghost.reply_tone, None,
-            "ghost discards tone like it discards hints"
-        );
-
-        // Rule engine never tones.
-        assert_eq!(decide(&input).reply_tone, None);
+        assert_eq!(plan.nudges, TurnNudges::default(), "roll happens in the stream, not here");
+        assert_eq!(decide(&input).nudges, TurnNudges::default());
+        assert_eq!(decide(&input).reply_mode, None);
     }
 
     #[test]
@@ -706,7 +695,7 @@ mod tests {
             &input,
             ActionType::ProductQa,
             vec!["ignored".into()],
-            Some("ignored".into()),
+            None,
             None,
             ImageRef::Face,
             None,
@@ -721,8 +710,8 @@ mod tests {
         assert_eq!(plan.affinity_deltas.patience, 0.0);
         assert_eq!(plan.affinity_deltas.tension, 0.0);
         assert_eq!(plan.energy_cost, 0.0);
-        assert!(plan.context_hints.is_empty()); // hints/tone dropped — no persona prompt
-        assert!(plan.reply_tone.is_none());
+        assert!(plan.context_hints.is_empty()); // hints/mode dropped — no persona prompt
+        assert!(plan.reply_mode.is_none());
         assert!(!ActionType::ProductQa.is_text_reply());
     }
 }

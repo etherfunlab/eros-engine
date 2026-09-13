@@ -148,6 +148,13 @@ impl ActionType {
     pub fn promises_image(self) -> bool {
         matches!(self, ActionType::ReplyImage | ActionType::ReplyTextImage)
     }
+
+    /// True for actions whose turn carries a text reply the persona speaks.
+    /// Narrower than `is_text_reply`: a bare `ReplyImage` routes through the
+    /// reply path but bears no text, so mode/dice/tone-like inputs drop.
+    pub fn bears_text(self) -> bool {
+        matches!(self, ActionType::ReplyText | ActionType::ReplyTextImage)
+    }
 }
 
 /// Tone directive for the reply generation.
@@ -160,6 +167,40 @@ pub enum ReplyStyle {
     Excited,
 }
 
+/// How this turn's reply relates to the user's message — the judge's call
+/// (spec 2026-09-13 §3.1). `None` on the wire means the judge is unsure and
+/// the engine's dice take over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplyMode {
+    Listen,
+    Follow,
+    Ask,
+    Judge,
+}
+
+impl ReplyMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReplyMode::Listen => "listen",
+            ReplyMode::Follow => "follow",
+            ReplyMode::Ask => "ask",
+            ReplyMode::Judge => "judge",
+        }
+    }
+}
+
+/// Engine-rolled per-turn nudges, rendered as the prompt's `[this_turn]`
+/// block (all-false ⇒ block omitted). Rolled at plan finalisation in the
+/// stream — never inside `build_prompt` — and serialised into the decision
+/// audit payload (spec 2026-09-13 §3.2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct TurnNudges {
+    pub affirm: bool,
+    pub share_slice: bool,
+    pub open_question: bool,
+}
+
 /// Output of the PDE.
 #[derive(Debug, Clone)]
 pub struct ActionPlan {
@@ -168,13 +209,17 @@ pub struct ActionPlan {
     pub affinity_deltas: AffinityDeltas,
     pub energy_cost: f64,
     pub context_hints: Vec<String>,
-    /// Judge-directed delivery for this turn's reply (free text, sanitized by
-    /// the server before it gets here). `Some` only on LLM-judge, text-bearing
-    /// turns (reply_text / reply_text_image); `None` everywhere else — rule
-    /// PDE, fail-open, tips, ghost, reply_image.
-    pub reply_tone: Option<String>,
+    /// Judge-decided reply mode for this turn. `Some` only on LLM-judge,
+    /// text-bearing turns (reply_text / reply_text_image); `None` everywhere
+    /// else — rule PDE, fail-open, tips, ghost, reply_image — and `None`
+    /// means the dice own the turn's cadence.
+    pub reply_mode: Option<ReplyMode>,
+    /// The dice as rolled at plan finalisation. All-false when a definite
+    /// reply_mode suppressed the roll, when the action bears no text, or on
+    /// paths that never roll (proactive, edit turns).
+    pub nudges: TurnNudges,
     /// Judge-decided outfit for this turn (free text, sanitized by the server
-    /// before it gets here). Same carriage rule as `reply_tone`: `Some` only
+    /// before it gets here). Same carriage rule as `reply_mode`: `Some` only
     /// on LLM-judge, text-bearing turns; `None` everywhere else.
     pub clothing: Option<String>,
     /// What the picture showed, for post-process affinity on image turns.
