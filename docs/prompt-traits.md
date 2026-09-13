@@ -23,7 +23,7 @@ queue and are re-validated in the worker.
 
 For each turn, the validated `text` of every trait is rendered as a
 bullet under a `[additional_guidance]` section inside the persona system
-prompt, positioned between `[topics]` and `[turn_style]`. Empty list →
+prompt, positioned between `[topics]` and `[user_profile]`. Empty list →
 the section is omitted and the prompt is byte-for-byte identical to
 the legacy output.
 

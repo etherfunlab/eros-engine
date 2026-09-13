@@ -6,7 +6,9 @@
 
 use crate::affinity::AffinityDeltas;
 use crate::ghost::{self, GhostDecision, GhostSignals};
-use crate::types::{ActionPlan, ActionType, DecisionInput, Event, ImageRef, ReplyMode, ReplyStyle, TurnNudges};
+use crate::types::{
+    ActionPlan, ActionType, DecisionInput, Event, ImageRef, ReplyMode, ReplyStyle, TurnNudges,
+};
 
 // Decision thresholds — tune here rather than at call sites.
 const LONG_MSG_CHARS: usize = 30;
@@ -586,21 +588,62 @@ mod tests {
         let input = test_decision_input();
         let mode = Some(ReplyMode::Listen);
 
-        let text = plan_for(&input, ActionType::ReplyText, vec![], mode, None, ImageRef::Face, None);
+        let text = plan_for(
+            &input,
+            ActionType::ReplyText,
+            vec![],
+            mode,
+            None,
+            ImageRef::Face,
+            None,
+        );
         assert_eq!(text.reply_mode, Some(ReplyMode::Listen));
 
-        let text_image =
-            plan_for(&input, ActionType::ReplyTextImage, vec![], mode, None, ImageRef::Face, None);
+        let text_image = plan_for(
+            &input,
+            ActionType::ReplyTextImage,
+            vec![],
+            mode,
+            None,
+            ImageRef::Face,
+            None,
+        );
         assert_eq!(text_image.reply_mode, Some(ReplyMode::Listen));
 
-        let image_only =
-            plan_for(&input, ActionType::ReplyImage, vec![], mode, None, ImageRef::Face, None);
-        assert_eq!(image_only.reply_mode, None, "bare image turn drops the mode");
+        let image_only = plan_for(
+            &input,
+            ActionType::ReplyImage,
+            vec![],
+            mode,
+            None,
+            ImageRef::Face,
+            None,
+        );
+        assert_eq!(
+            image_only.reply_mode, None,
+            "bare image turn drops the mode"
+        );
 
-        let ghost = plan_for(&input, ActionType::Ghost, vec![], mode, None, ImageRef::Face, None);
+        let ghost = plan_for(
+            &input,
+            ActionType::Ghost,
+            vec![],
+            mode,
+            None,
+            ImageRef::Face,
+            None,
+        );
         assert_eq!(ghost.reply_mode, None, "ghost carries no mode");
 
-        let qa = plan_for(&input, ActionType::ProductQa, vec![], mode, None, ImageRef::Face, None);
+        let qa = plan_for(
+            &input,
+            ActionType::ProductQa,
+            vec![],
+            mode,
+            None,
+            ImageRef::Face,
+            None,
+        );
         assert_eq!(qa.reply_mode, None, "product_qa carries no mode");
     }
 
@@ -616,7 +659,11 @@ mod tests {
             ImageRef::Face,
             None,
         );
-        assert_eq!(plan.nudges, TurnNudges::default(), "roll happens in the stream, not here");
+        assert_eq!(
+            plan.nudges,
+            TurnNudges::default(),
+            "roll happens in the stream, not here"
+        );
         assert_eq!(decide(&input).nudges, TurnNudges::default());
         assert_eq!(decide(&input).reply_mode, None);
     }

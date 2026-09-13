@@ -214,7 +214,7 @@ fn length_rule(
     scope: AffinityScope,
     reply_mode: Option<ReplyMode>,
 ) -> &'static str {
-    const TIERS: [&'static str; 3] = [
+    const TIERS: [&str; 3] = [
         "最多 1 句，不超过 40 字",
         "最多 2 句，不超过 80 字",
         "最多 3 句，不超过 120 字",

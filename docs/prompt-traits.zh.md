@@ -23,7 +23,7 @@ trait 随队列传递，由 worker 重新校验。
 
 每轮请求中，所有 trait 的 `text` 会被渲染为 bullet 列表，放在 persona
 system prompt 的 `[additional_guidance]` 段落下，位置在 `[topics]` 与
-`[turn_style]` 之间。空列表 → 该段落整个不渲染，输出与旧 prompt
+`[user_profile]` 之间。空列表 → 该段落整个不渲染，输出与旧 prompt
 逐字节一致。
 
 ## 引擎不会做什么

@@ -185,6 +185,15 @@ values. A relationship that has not started anywhere reads as
 `acquaintance` + `spark`, both tier 1 — there is no separate "stranger"
 state, and as of 4.1 no separate legacy label carrying one.
 
+## Relationship ground
+
+The reply prompt states who the user currently is to the character in one
+sentence (the `[relationship]` section), derived per turn from two base axes
+with a 0.5 split: warmth × patience → 好朋友 / 快被磨光耐心的朋友 /
+没什么交情的人 / 死对头. It is independent of the bond/chemistry projections
+and of the tier system, and is omitted when either axis is outside the
+request's affinity scope or no affinity row exists yet.
+
 ## Tier numbers are stored
 
 Every write persists `tier_index`'s own result to
