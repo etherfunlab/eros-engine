@@ -283,19 +283,6 @@ fn edit_turn_event(
     }
 }
 
-/// Edit-turn tier→style mapping (#349 gap 3): no judge runs on this endpoint,
-/// so the affinity's warmth grade picks the `[turn_style]` line — cold floor
-/// at grade 1, warm at grade 3. Chosen over pinning Neutral after an A/B
-/// reading of prod-model candidates; the chat path keeps its own channel
-/// (judge-written free-text tone) and stays pinned.
-fn tier_reply_style(warmth_grade: i16) -> ReplyStyle {
-    match warmth_grade {
-        ..=1 => ReplyStyle::Cold,
-        2 => ReplyStyle::Neutral,
-        3.. => ReplyStyle::Warm,
-    }
-}
-
 /// A minimal ActionPlan for a turn no PDE decided: neutral delivery, zero
 /// rule deltas.
 fn edit_turn_plan(action: ActionType) -> ActionPlan {
@@ -305,7 +292,8 @@ fn edit_turn_plan(action: ActionType) -> ActionPlan {
         affinity_deltas: Default::default(),
         energy_cost: 0.0,
         context_hints: vec![],
-        reply_tone: None,
+        reply_mode: None,
+        nudges: eros_engine_core::types::TurnNudges::default(),
         clothing: None,
         image_caption: None,
         image_ref: ImageRef::Previous,
@@ -363,7 +351,6 @@ async fn generate_reply_text(
         signals,
     };
     let mut plan = edit_turn_plan(ActionType::ReplyTextImage);
-    plan.reply_style = tier_reply_style(input.affinity.warmth_grade);
     if let Some(c) = caption.map(str::trim).filter(|s| !s.is_empty()) {
         // The new picture rides along as an inner-state hint so the words
         // match what the picture now shows. Prose-woven on purpose: a labeled
@@ -445,15 +432,7 @@ async fn generate_reply_text(
 
 #[cfg(test)]
 mod payload_tests {
-    use super::{compose_edit_payload, tier_reply_style};
-    use eros_engine_core::types::ReplyStyle;
-
-    #[test]
-    fn tier_reply_style_maps_cold_neutral_warm() {
-        assert_eq!(tier_reply_style(1), ReplyStyle::Cold);
-        assert_eq!(tier_reply_style(2), ReplyStyle::Neutral);
-        assert_eq!(tier_reply_style(3), ReplyStyle::Warm);
-    }
+    use super::compose_edit_payload;
 
     #[test]
     fn edit_payload_renders_every_slot() {

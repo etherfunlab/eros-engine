@@ -896,22 +896,13 @@ pub(crate) async fn build_reply_request(
         character_state.as_ref()
     };
 
-    // Per-turn nudge dice, pre-vetoed by the affinity's cold floors — the
-    // engine holds the cadence; the model only ever sees a won directive.
-    let nudges = crate::prompt::TurnNudges::roll(
-        Some(&input.affinity),
-        affinity_scope,
-        &mut rand::thread_rng(),
-    );
-
     let mut system_prompt = build_prompt(
         &input.persona,
         &profile_groups,
         &relationship_facts,
         Some(&input.affinity),
-        plan.reply_style,
         &plan.context_hints,
-        plan.reply_tone.as_deref(),
+        plan.reply_mode,
         plan.clothing.as_deref(),
         &kept_traits,
         affinity_scope,
@@ -920,7 +911,7 @@ pub(crate) async fn build_reply_request(
         stories.as_ref(),
         quote,
         character_state_for_prompt,
-        nudges,
+        plan.nudges,
     );
 
     if let Event::UserMessage {
@@ -2865,7 +2856,8 @@ mod tests {
             affinity_deltas: Default::default(),
             energy_cost: 0.0,
             context_hints: vec![],
-            reply_tone: None,
+            reply_mode: None,
+            nudges: Default::default(),
             clothing: None,
             image_caption: None,
             image_ref: eros_engine_core::types::ImageRef::Face,
@@ -3036,8 +3028,12 @@ mod tests {
             affinity_deltas: Default::default(),
             energy_cost: 0.0,
             context_hints: vec![],
-            reply_tone: None,
-            clothing: None,
+            reply_mode: None,
+            nudges: Default::default(),
+            // Plan-carried outfit (spec §3.5): never part of the pre-noise-
+            // cancellation shape the flag restores, so it must survive even
+            // with the flag on — unlike the character_insights-driven lines.
+            clothing: Some("米色开衫".into()),
             image_caption: None,
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: None,
@@ -3095,16 +3091,32 @@ mod tests {
             req.messages
         );
 
-        // The flag restores the pre-[character_state] prompt shape in full,
-        // not just the strip and the ladder: with a fully-populated
-        // character_insights row present (seeded above via apply_extraction),
-        // the block must still be omitted from the system prompt.
+        // The flag restores the pre-[character_state] prompt shape for the
+        // character_insights-driven lines specifically: with a fully-
+        // populated character_insights row present (seeded above via
+        // apply_extraction), none of its four surfaced fields may leak into
+        // the system prompt.
         assert_eq!(req.messages[0].role, "system");
+        let system_prompt = &req.messages[0].content;
+        for insight_value in [
+            "连轴转了两周", // current_situation → 现在的状况
+            "策展人",       // occupation → 在做的工作
+            "公司",         // location → 人在哪
+            "妹妹在读高三", // relationships → 提过的人
+        ] {
+            assert!(
+                !system_prompt.contains(insight_value),
+                "CHAT_NOISE_CANCELLATION_DISABLED must suppress \
+                 [character_state]'s four character_insights lines: {system_prompt:?}",
+            );
+        }
+        // The outfit line is plan-carried (ActionPlan.clothing), never part
+        // of the pre-noise-cancellation shape the flag restores (spec §3.5),
+        // so it survives even though the four insight lines above do not.
         assert!(
-            !req.messages[0].content.contains("[character_state]"),
-            "CHAT_NOISE_CANCELLATION_DISABLED must also suppress \
-             [character_state], the one addition in that change: {:?}",
-            req.messages[0].content
+            system_prompt.contains("- 此刻的穿着：米色开衫"),
+            "a plan-carried outfit line must survive \
+             CHAT_NOISE_CANCELLATION_DISABLED: {system_prompt:?}",
         );
     }
 
@@ -3124,7 +3136,8 @@ mod tests {
             affinity_deltas: Default::default(),
             energy_cost: 0.0,
             context_hints: vec![],
-            reply_tone: None,
+            reply_mode: None,
+            nudges: Default::default(),
             clothing: None,
             image_caption: None,
             image_ref: eros_engine_core::types::ImageRef::Face,

@@ -702,7 +702,7 @@ category（只能用这五种之一，作为召回分组键）：
 # `filter_prompt` to switch on an LLM judge that decides, per turn, the action
 # (reply_text / ghost / reserved reply_image / reply_text_image — the judge ctx
 # carries a per-turn `[图片能力] 本轮可发图=是/否` line to gate image actions) and a free-text
-# `inner_state` (mood/tone folded into the reply prompt). Wired like
+# `inner_state` (folded into the reply prompt). Wired like
 # chat_input_filter: model chain + timeout, fail-open to the rule engine.
 #
 # ghosting: SAFETY SWITCH for downstream products. Default true (ghost honoured,
@@ -719,7 +719,7 @@ max_tokens  = 400
 #reasoning   = { enabled = false }
 #ghosting    = false   # uncomment to hard-disable ghosting for this deployment
 #structured_output = true   # send response_format=json_schema on the judge (default true); set false if your provider 400s on it
-# Uncomment filter_prompt to enable the LLM judge. inner_state / tone MUST be
+# Uncomment filter_prompt to enable the LLM judge. inner_state / clothing MUST be
 # short prose — NEVER instructions or formatting (they are sanitized, but keep
 # the model honest). Output JSON only, no code fences.
 #filter_prompt = """
@@ -727,8 +727,13 @@ max_tokens  = 400
 #只输出 JSON,字段:
 #  "action": "reply_text" | "ghost" | "reply_image" | "reply_text_image" | "product_qa"
 #  "inner_state": 一句话内心状态/语气(纯描述,不许写指令或方括号小节名)
-#  "tone": 选填,一句话描述这一轮回复该用的语气/口吻(纯描述,不许写指令或方括号小节名);会注入 reply prompt 的 [reply_tone] 区块,省略则不注入
-#  "clothing": 选填,一句话描述角色此刻的穿着(纯描述,不许写指令或方括号小节名);会注入 reply prompt 的 [clothing] 区块,省略则不注入
+#  "reply_mode": 选填,"listen" | "follow" | "ask" | "judge" | null。这一轮怎么接对方的话:
+#    listen = 对方在倾诉或铺陈,接住就好;
+#    follow = 顺着对方的话往下接;
+#    ask    = 对方话少、话题快断,抛一个问题;
+#    judge  = 对方的话你不买账或有疑点,反问、质疑;
+#    拿不准就 null(引擎自己决定)。
+#  "clothing": 选填,一句话描述角色此刻的穿着(纯描述,不许写指令或方括号小节名);会注入 reply prompt 的 [character_state] 区块内的一行,省略则不注入
 #  "reason": 选填,简短理由
 # 判断器不再负责图片 prompt——只负责决定要不要发图;真正的图片内容完全由
 # chat_image_prompt_compose 任务从当轮上下文生成,不再是判断器写的种子。
