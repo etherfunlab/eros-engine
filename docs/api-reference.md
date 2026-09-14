@@ -120,6 +120,29 @@ Frame fields worth noting:
 - **`done`** — `truncated`, `usage` (after `OPENROUTER_USAGE_HIDDEN_KEYS` filtering; always present — `null` when not applicable), `generation_id` (OpenRouter id; always present — `null` when not applicable), and `ghost_fallback` (bool; omitted when `false`). `ghost_fallback: true` marks a reply that resolved empty and was delivered as a silent fallback — this is **not** an `action_type=ghost` turn, and it leaves the ghost counters untouched. The cause is recorded on the persisted row's `metadata.fallback_reason`. A turn that promises a photo (`action_type=reply_text_image`) is exempt: an empty text half is an image-only reply, not silence, so it reports `ghost_fallback: false`, carries no `fallback_reason`, and the trailing `image_request` still fires.
 - **`final`** — turn summary: `filtered` (bool — was the reply output-filtered), `prompt_injected` (array of the trait tags that injected this turn, or `null`), `tier` (echo of the request `tier`, or `null`), `retries_chat` (zero-based index of the chat attempt that succeeded), `retries_filter` (index of the filter-model attempt that served), and — since v1.4.0 — `llm_attempts` / `gateway_errors` (both **omitted when empty**; see below). No profile/lead signal rides this frame — `lead_score`, `should_show_cta`, and `agent_training_level` were removed (companion_insights teardown, spec 2026-08-11); read profile state from `GET /comp/user/{user_id}/profile` instead.
 
+**Filtered turns stream too.** When the resolved LLM `output_filter` arms for
+a turn (see [model-config.md](model-config.md)), the rewrite reaches the
+client as ordinary `delta` frames, not as one block at the end — the engine
+holds back the first 120 characters of the filter model's output long enough
+to validate them, then streams the rest as it arrives. If an attempt fails
+after it has already emitted text, the turn supersedes that bubble instead of
+continuing it:
+
+```text
+data: {"type":"done","message_id":"01J...","truncated":true,"usage":null,"generation_id":null}
+
+data: {"type":"meta","message_id":"01K...","action_type":"reply","continues_from":null}
+```
+
+— followed by a fresh `delta*` → `done` for the next attempt: either the next
+filter model, or, if the chain exhausts, the fail-open original. `continues_from`
+is `null` here — unlike the retry-chain case above, the superseded partial was
+never persisted, so there is no row to continue from. The superseded bubble
+itself never appears in history on reload; only the reply that finally serves
+does. `final.filtered` is `true` whenever the client received any rewritten
+text this turn, including a bubble that was later superseded and fell open to
+the original.
+
 **`final.llm_attempts` / `final.gateway_errors` — the non-fatal failure
 channel.** Every LLM attempt that failed this turn, across the five chains
 whose failure changes what you received: the chat model chain, the input

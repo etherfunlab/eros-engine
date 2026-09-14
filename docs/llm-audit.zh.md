@@ -435,6 +435,32 @@ Venice 用 `429 MODEL_OVERLOADED` 和 `503 MODEL_AT_CAPACITY`，下一家又会�
 `data:` 帧是 provider 的原始输出，可能含有回复正文，所以帧本身只留在日志里，
 落库的 message 只说明哪里坏了。需要看字节就去翻日志。
 
+### `filter_attempts` 元素
+
+只要 LLM `output_filter` 有任何一次尝试没能通过校验、传输失败或超时，就会写进
+`chat_messages.metadata.filter_attempts[]`——不只是 fail-open 才写，所以一条
+最终恢复成功的链路也能看出前面某个模型是为什么被跳过的。
+
+```jsonc
+{
+  "model": "google/gemini-3.1-flash",
+  "reason": "content_filter",
+  "emitted": true
+}
+```
+
+`model` 和 `reason` 恒存在；`emitted` 只在为 `true` 时才会出现在 JSON 里。
+`reason` 要么是输出校验闸门共用的四个内容判定之一（`content_filter`、
+`refusal_pattern`、`too_short`、`empty`），要么是两个指针值之一
+（`upstream_error`、`gateway_error`），指明细节分别落在 `llm_attempts` 还是
+`gateway_errors`。
+
+`emitted: true` 表示这次尝试在失败之前，已经把至少一段非空 delta 交给了本轮的
+帧通道——这个通道是脱钩且无界的，所以这只能说明确实发送过，不能证明客户端
+真的收到或渲染了。落到实际体验上，通常就是用户看到过一个改写气泡，随后被
+顶替掉了。没有这个键则说明该次尝试在展示任何文本之前就失败了。两次 `reason`
+相同的尝试，有没有这个键是实质性的区别。
+
 ### `task` 判别符
 
 `engine.chat_messages` 用同一对列承载三个调用点，靠每个元素的 `task` 区分。

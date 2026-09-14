@@ -306,9 +306,9 @@ pub struct BurstOutcome {
 /// state.
 ///
 /// Two modes: when the resolved output filter's turn-level predicates pass
-/// (live=false), the burst buffers each attempt, runs the filter LLM, and
-/// only emits the filtered text (never the original). Otherwise it streams
-/// live per-chunk exactly as before.
+/// (live=false), the burst buffers the chat-generation attempt whole, then
+/// streams the filter LLM's rewrite and emits its deltas (never the original).
+/// Otherwise it streams live per-chunk exactly as before.
 #[allow(clippy::too_many_arguments)]
 fn drive_chat_burst(
     state: Arc<AppState>,
@@ -352,9 +352,11 @@ fn drive_chat_burst(
         let task_name: &str = req.task.as_deref().unwrap_or("chat_companion");
 
         let tag_refs: Vec<&str> = trait_tags.iter().map(String::as_str).collect();
-        // A turn buffers (no live deltas) ONLY when the LLM output_filter's
-        // turn-level predicates pass — an LLM rewrite is inherently un-streamable
-        // (the filtered text must be produced before any of it is safe to send).
+        // A turn buffers the CHAT GENERATION (no live deltas of the raw reply)
+        // ONLY when the LLM output_filter's turn-level predicates pass — the
+        // filter needs the complete original as input, so that half is
+        // inherently un-streamable. The filter's own rewrite streams to the
+        // client instead of buffering whole (see run_output_filter).
         // `output_regex` no longer forces buffering: the live burst streams
         // through the rules incrementally with a bounded holdback
         // (`StreamScrubber`), so a regex-only chain (the common production case)
@@ -912,11 +914,12 @@ fn drive_chat_burst(
         }
 
         // ===== FILTERED MODE =====
-        // The turn's trait/random predicates pass: buffer each attempt, run the
-        // filter LLM, and emit ONLY the filtered text (the original reply must
-        // never reach the client). Per-attempt the model predicate decides
-        // whether that specific served model is actually filtered; on filter
-        // error we fail open and emit the original.
+        // The turn's trait/random predicates pass: buffer the chat-generation
+        // attempt whole, then stream the filter LLM's rewrite and emit ONLY its
+        // deltas (the original reply must never reach the client). Per-attempt
+        // the model predicate decides whether that specific served model is
+        // actually filtered; on filter error we fail open and emit the
+        // original.
         // `filter` is None when the turn buffers solely because of output_regex.
         let f_opt = filter.as_ref();
         // Same accumulator contract as live mode: transport/status failures and
@@ -935,10 +938,11 @@ fn drive_chat_burst(
             let mut truncated = false;
             let mut empty_completion = false;
 
-            // Per-attempt observability (spec §4.2). In filtered mode the client
-            // sees nothing until the whole reply is rewritten, so ttft_ms here is
-            // time-to-first-UPSTREAM-token (still useful to compare model speed),
-            // not time-to-client.
+            // Per-attempt observability (spec §4.2). This times the CHAT
+            // generation, which the client never sees directly — only the
+            // filter's rewrite reaches it, once that clears its own validity
+            // holdback — so ttft_ms here is time-to-first-UPSTREAM-token (still
+            // useful to compare model speed), not time-to-client.
             let attempt_started = std::time::Instant::now();
             let mut ttft_ms: Option<u64> = None;
             let mut attempt_outcome: &'static str = "served";

@@ -112,6 +112,25 @@ data: {"type":"final","filtered":false,"prompt_injected":null,"tier":null,"retri
 - **`done`** —— `truncated`、`usage`（经 `OPENROUTER_USAGE_HIDDEN_KEYS` 过滤后；总是存在——不适用时为 `null`）、`generation_id`（OpenRouter id；总是存在——不适用时为 `null`），以及 `ghost_fallback`（bool；为 `false` 时整个字段省略）。`ghost_fallback: true` 标记一条最终解析为空、以静默回退形式交付的回复——它**不是** `action_type=ghost` 轮次，也不会动 ghost 计数。原因记录在落库行的 `metadata.fallback_reason` 上。承诺出图的轮次（`action_type=reply_text_image`）例外：文本半边为空是一条纯图片回复而不是沉默，因此它上报 `ghost_fallback: false`、不带 `fallback_reason`，尾随的 `image_request` 照常发出。
 - **`final`** —— 本轮汇总：`filtered`（bool，回复是否被输出过滤）、`prompt_injected`（本轮注入的 trait tag 数组，无则为 `null`）、`tier`（回显请求的 `tier`，未传为 `null`）、`retries_chat`（命中的对话尝试下标，从 0 起）、`retries_filter`（实际服务的过滤模型尝试下标），以及自 v1.4.0 起的 `llm_attempts` / `gateway_errors`（**为空时整个字段省略**，见下）。这一帧不再带任何画像/lead 信号——`lead_score`、`should_show_cta`、`agent_training_level` 已随 companion_insights 拆除（spec 2026-08-11）移除；画像状态改从 `GET /comp/user/{user_id}/profile` 读取。
 
+**过滤轮次也是流式的。** 当本轮的 LLM `output_filter` 生效时（见
+[model-config.zh.md](model-config.zh.md)），改写结果会以普通的 `delta` 帧
+陆续送到客户端，不是最后一次性给一整块——引擎会把过滤模型输出的前 120 个
+字符先攒住做校验，通过之后再把后续内容边生成边推给客户端。如果某次尝试
+已经吐出文本之后才失败，本轮会用一个新气泡顶替它，而不是接着写：
+
+```text
+data: {"type":"done","message_id":"01J...","truncated":true,"usage":null,"generation_id":null}
+
+data: {"type":"meta","message_id":"01K...","action_type":"reply","continues_from":null}
+```
+
+——紧接着是下一次尝试自己的 `delta*` → `done`：可能是下一个过滤模型，也可能
+在链路耗尽时是 fail-open 的原文。这里的 `continues_from` 是 `null`——跟上面
+重试链的情形不同，被顶替的半截文本从未落库，也就没有行可续。被顶替的气泡
+本身在刷新历史时不会出现；只有最终生效的那条回复会留下来。只要客户端这一轮
+收到过任何改写文本——哪怕后来被顶替、最终 fail-open 成了原文——`final.filtered`
+都会是 `true`。
+
 **`final.llm_attempts` / `final.gateway_errors` —— 非致命的失败通道。**
 记录本轮所有失败的 LLM 尝试，覆盖五条「失败会改变你收到什么」的链：对话模型链、
 输入过滤器、输出过滤器、PDE 判官、图片 prompt 合成器。一个都没有时两个字段
