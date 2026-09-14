@@ -2637,6 +2637,16 @@
             "type": "boolean",
             "description": "Persist the instruction as a `role='user'` chat message quoting the\nsource image turn (`metadata.reply_to_message_id`), and hang the new\nimage row off it. The persisted row is an ordinary user message —\nvisible to companion context, memory extraction and later affinity\nevaluation like anything else the user said. Default false: the\naudit-only contract, byte-for-byte."
           },
+          "prompt_traits": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/PromptTraitDto"
+            },
+            "description": "Prompt traits for the text half — same shape, limits and tier gating\nas the chat path (see docs/prompt-traits.md). Validated on every call;\ninjected only into a rolled text half."
+          },
           "prompt_variant": {
             "type": [
               "string",
@@ -2658,6 +2668,13 @@
               "null"
             ],
             "description": "Style preset for the new picture. Default `realistic`; pass the style\nthe source was drawn with — the engine does not record it."
+          },
+          "tier": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Tier for the text half — selects the `[tasks.chat_companion.tiers.<tier>]`\nmodel and `allow_traits`, exactly as on the chat path. Inert unless\n`reply_with_text` rolls a text half."
           }
         }
       },

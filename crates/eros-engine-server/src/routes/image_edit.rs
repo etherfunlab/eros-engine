@@ -26,7 +26,9 @@
 //!   the probability that the character also says something with the picture
 //!   — the dice stand in for the PDE, which this endpoint never consults —
 //!   and the whole post-turn pipeline (affinity, memory, insights) runs
-//!   afterward, exactly as after a chat turn.
+//!   afterward, exactly as after a chat turn. The text half takes `tier` and
+//!   `prompt_traits` with the chat path's meaning: the tier picks the
+//!   companion model and gates the traits.
 
 use axum::extract::{Extension, Path, State};
 use axum::Json;
@@ -38,7 +40,7 @@ use uuid::Uuid;
 
 use eros_engine_core::persona::CompanionPersona;
 use eros_engine_core::types::{
-    ActionPlan, ActionType, DecisionInput, Event, ImageRef, QuotedMessage, ReplyStyle,
+    ActionPlan, ActionType, DecisionInput, Event, ImageRef, PromptTrait, QuotedMessage, ReplyStyle,
 };
 use eros_engine_llm::model_config::StyleKey;
 use eros_engine_store::affinity::AffinityRepo;
@@ -56,7 +58,7 @@ use crate::pipeline::stream::{
     build_delegated_image_marker, record_compose_event, run_image_prompt_compose, split_failures,
 };
 use crate::pipeline::{record_generation, GenerationRecord};
-use crate::routes::companion::require_session_for_user;
+use crate::routes::companion::{require_session_for_user, validate_prompt_traits, PromptTraitDto};
 use crate::routes::companion_stream::aspect_ratio_supported;
 use crate::routes::persona::compose_chain_exhausted;
 use crate::state::AppState;
@@ -114,6 +116,16 @@ pub struct ImageEditRequest {
     /// none of this: the endpoint's classic contract.
     #[serde(default)]
     pub reply_with_text: Option<f64>,
+    /// Tier for the text half — selects the `[tasks.chat_companion.tiers.<tier>]`
+    /// model and `allow_traits`, exactly as on the chat path. Inert unless
+    /// `reply_with_text` rolls a text half.
+    #[serde(default)]
+    pub tier: Option<String>,
+    /// Prompt traits for the text half — same shape, limits and tier gating
+    /// as the chat path (see docs/prompt-traits.md). Validated on every call;
+    /// injected only into a rolled text half.
+    #[serde(default)]
+    pub prompt_traits: Option<Vec<PromptTraitDto>>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -260,22 +272,28 @@ struct TextOutcome {
     generation_id: Option<String>,
     llm_attempts: Option<serde_json::Value>,
     gateway_errors: Option<serde_json::Value>,
+    /// Trait tags that survived tier gating — the chat path's audit copy on
+    /// the assistant row. Empty when no text call was made.
+    injected_tags: Vec<String>,
 }
 
 /// The full-turn Event: the persisted instruction row is the driving user
-/// message and the quote is the picture being revised (with the exchange that
-/// produced it); everything else is what an ordinary chat request defaults to.
+/// message, the quote is the picture being revised (with the exchange that
+/// produced it), and `tier` / `prompt_traits` are the caller's, as on a chat
+/// request; everything else is what an ordinary chat request defaults to.
 fn edit_turn_event(
     instruction: String,
     instruction_row_id: Uuid,
     quote: Option<QuotedMessage>,
+    tier: Option<String>,
+    prompt_traits: Vec<PromptTrait>,
 ) -> Event {
     Event::UserMessage {
         content: instruction,
         message_id: instruction_row_id,
-        prompt_traits: vec![],
+        prompt_traits,
         audit: None,
-        tier: None,
+        tier,
         memory_scope: Default::default(),
         affinity_scope: Default::default(),
         tips_amount_usd: None,
@@ -306,7 +324,9 @@ fn edit_turn_plan(action: ActionType) -> ActionPlan {
 /// being revised (the prompt's `[quote]` block) and `caption` the new
 /// picture's, folded in as a context hint — the text half is generated before
 /// the image row lands, so this is the only way it sees either side of the
-/// revision. Fail-open everywhere: any failure (affinity load, request build,
+/// revision. `tier` and `prompt_traits` reach the prompt builder the way a
+/// chat request's do: the tier picks the companion model and gates the
+/// traits. Fail-open everywhere: any failure (affinity load, request build,
 /// LLM error, blank reply) returns a text-less outcome and the turn degrades
 /// to `reply_image` — the picture is the turn's substance.
 #[allow(clippy::too_many_arguments)]
@@ -320,6 +340,8 @@ async fn generate_reply_text(
     instruction: &str,
     quote: Option<QuotedMessage>,
     caption: Option<&str>,
+    tier: Option<String>,
+    prompt_traits: Vec<PromptTrait>,
 ) -> TextOutcome {
     let affinity = match (AffinityRepo { pool: &state.pool })
         .load_or_create(session_id, user_id, instance_id)
@@ -345,7 +367,13 @@ async fn generate_reply_text(
         }
     };
     let input = DecisionInput {
-        event: edit_turn_event(instruction.to_string(), instruction_row_id, quote),
+        event: edit_turn_event(
+            instruction.to_string(),
+            instruction_row_id,
+            quote,
+            tier,
+            prompt_traits,
+        ),
         affinity,
         persona: persona.clone(),
         signals,
@@ -362,7 +390,7 @@ async fn generate_reply_text(
             "你已经按对方的要求把照片改好，随这条回复一起发出——新照片里{c}。照片已经在对方眼前，直接说贴着它的话"
         )];
     }
-    let (chat_req, _tags) = match build_reply_request(
+    let (chat_req, injected_tags) = match build_reply_request(
         state,
         &input,
         &plan,
@@ -403,6 +431,7 @@ async fn generate_reply_text(
                 generation_id,
                 llm_attempts,
                 gateway_errors,
+                injected_tags,
             }
         }
         Err(e) => {
@@ -425,6 +454,7 @@ async fn generate_reply_text(
                 generation_id: None,
                 llm_attempts,
                 gateway_errors,
+                injected_tags,
             }
         }
     }
@@ -596,6 +626,7 @@ async fn edit_image(
         .ok_or_else(|| AppError::Conflict("session has no persona instance".into()))?;
 
     validate(&req)?;
+    let prompt_traits = validate_prompt_traits(req.prompt_traits.as_deref().unwrap_or(&[]))?;
 
     if !state.model_config.has_task(EDIT_TASK)
         && !state.model_config.has_task("chat_image_prompt_compose")
@@ -784,8 +815,17 @@ async fn edit_image(
             &instruction,
             Some(quote),
             outcome.caption.as_deref(),
+            req.tier.clone(),
+            prompt_traits.clone(),
         )
         .await;
+        // The chat path's audit copy next to the image marker: the tags that
+        // actually injected, and the tier only when the request carried one.
+        let mut metadata = marker_metadata;
+        metadata["prompt_traits"] = serde_json::json!(text.injected_tags);
+        if let Some(t) = req.tier.as_deref() {
+            metadata["tier"] = serde_json::json!(t);
+        }
         let insert = AssistantInsert {
             id: new_id,
             content: text.reply.clone().unwrap_or_default(),
@@ -794,7 +834,7 @@ async fn edit_image(
             truncated: false,
             generation_id: text.generation_id.clone(),
             filter_audit: None,
-            metadata: Some(marker_metadata),
+            metadata: Some(metadata),
             llm_attempts: text.llm_attempts.clone(),
             gateway_errors: text.gateway_errors.clone(),
         };
@@ -855,6 +895,7 @@ async fn edit_image(
         let state_bg = state.clone();
         let instruction_bg = instruction.clone();
         let caption_bg = outcome.caption.clone();
+        let tier_bg = req.tier.clone();
         let umid_bg = instruction_message_id.expect("full turn persisted the instruction");
         tokio::spawn(async move {
             // A full turn counts as contact: reset the ghost streak the way
@@ -877,7 +918,7 @@ async fn edit_image(
                 user_id,
                 instance_id,
                 // post_process never reads the quote; skip rebuilding it.
-                edit_turn_event(instruction_bg, umid_bg, None),
+                edit_turn_event(instruction_bg, umid_bg, None, tier_bg, prompt_traits),
                 plan,
                 produced,
             )
@@ -2181,6 +2222,103 @@ mod tests {
         // The judge scores the generated text (not the caption proxy).
         assert!(eval.contains("对方：换套衣服"), "got {eval}");
         assert!(eval.contains("新造型来啦"), "got {eval}");
+    }
+
+    /// The full-turn config plus a `gold` tier on the companion: its own
+    /// model and an allow-list that keeps `allow_nsfw` only.
+    const TIERED_FULL_TURN_TOML: &str = "[tasks.chat_image_edit_compose]\nmodel = \"editor\"\n\
+         [tasks.chat_companion]\nmodel = \"companion\"\n\
+         [tasks.chat_companion.tiers.gold]\nmodel = \"gold-companion\"\n\
+         allow_traits = [\"allow_nsfw\"]\n\
+         [tasks.affinity_evaluation]\nmodel = \"affinity-judge\"\n";
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn reply_with_text_resolves_tier_and_injects_gated_prompt_traits(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let (_, mid) = seed_image_turn(&pool, session_id).await;
+
+        let mock = MockServer::start().await;
+        mount_editor_and_judge(&mock).await;
+        mount_companion(&mock).await;
+        let state = with_composer(test_state(pool.clone()), &mock.uri(), TIERED_FULL_TURN_TOML);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let (status, body) = send_request(
+            &mut app,
+            edit_req(
+                session_id,
+                mid,
+                &token,
+                json!({"instruction": "换套衣服",
+                "persist_instruction": true,
+                "reply_with_text": 1.0,
+                "tier": "gold",
+                "prompt_traits": [
+                    {"tag": "allow_nsfw", "text": "TRAIT KEPT"},
+                    {"tag": "allow_politics", "text": "TRAIT DROPPED"}
+                ]}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["action_type"], json!("reply_text_image"));
+
+        // The text half is a chat turn: the tier picks the companion model and
+        // gates which traits reach the prompt, exactly as on the chat path.
+        let reqs = mock.received_requests().await.unwrap();
+        let chat: serde_json::Value = reqs
+            .iter()
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .find(|b: &serde_json::Value| b.to_string().contains("you are a companion"))
+            .expect("a chat companion call was made");
+        assert_eq!(chat["model"], json!("gold-companion"));
+        let system = chat["messages"][0]["content"].as_str().unwrap();
+        assert!(system.contains("[additional_guidance]"), "got {system}");
+        assert!(system.contains("TRAIT KEPT"), "got {system}");
+        assert!(!system.contains("TRAIT DROPPED"), "got {system}");
+
+        // The assistant row carries the same audit copy the chat path writes:
+        // the kept tags and the tier, next to the image marker.
+        let new_id = Uuid::parse_str(body["message_id"].as_str().unwrap()).unwrap();
+        let metadata: serde_json::Value =
+            sqlx::query_scalar("SELECT metadata FROM engine.chat_messages WHERE id = $1")
+                .bind(new_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(metadata["prompt_traits"], json!(["allow_nsfw"]));
+        assert_eq!(metadata["tier"], json!("gold"));
+        assert_eq!(metadata["image"]["prompt"], json!("EDITED SUBJECT"));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn image_edit_400_on_malformed_prompt_traits(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let (_, mid) = seed_image_turn(&pool, session_id).await;
+
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let (status, _) = send_request(
+            &mut app,
+            edit_req(
+                session_id,
+                mid,
+                &token,
+                json!({"instruction": "换套衣服",
+                       "prompt_traits": [{"tag": "BAD TAG", "text": "x"}]}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

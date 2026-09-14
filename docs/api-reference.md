@@ -559,7 +559,9 @@ consumer draws it, exactly as for a chat image turn.
   "prompt_variant": "a",
   "persist_instruction": true,
   "evaluate_affinity": true,
-  "reply_with_text": 0.4
+  "reply_with_text": 0.4,
+  "tier": "gold",
+  "prompt_traits": [{ "tag": "allow_nsfw", "text": "…" }]
 }
 ```
 
@@ -600,6 +602,13 @@ consumer draws it, exactly as for a chat image turn.
   picture, chat-shaped. A failed or blank text half degrades the turn to
   `reply_image` — the picture is the turn's substance — and the row's failure
   columns keep the evidence.
+- `tier` / `prompt_traits` — the text half's, with the chat path's meaning
+  exactly: `tier` selects the `[tasks.chat_companion.tiers.<tier>]` model and
+  `allow_traits`, and `prompt_traits` are injected after that gating (see
+  [prompt-traits.md](prompt-traits.md)). `prompt_traits` are validated on every
+  call (400 when malformed); both are inert unless `reply_with_text` rolls a
+  text half. The assistant row's `metadata.prompt_traits` / `metadata.tier`
+  carry the same audit copy as a chat turn.
 
 ```json
 {
@@ -646,6 +655,7 @@ persisted instruction message.
 
 | Status | Meaning |
 |---|---|
+| 400 | malformed `prompt_traits` |
 | 401 | missing or invalid bearer |
 | 403 | not your session |
 | 404 | unknown session, or no such message in it |

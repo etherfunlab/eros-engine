@@ -482,7 +482,9 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
   "prompt_variant": "a",
   "persist_instruction": true,
   "evaluate_affinity": true,
-  "reply_with_text": 0.4
+  "reply_with_text": 0.4,
+  "tier": "gold",
+  "prompt_traits": [{ "tag": "allow_nsfw", "text": "…" }]
 }
 ```
 
@@ -514,6 +516,12 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
   和图片落在同一条 assistant 行里，与聊天路径同形。文本调用失败或回了空文本
   就降级成 `reply_image` —— 图才是这一轮的主体 —— 失败证据留在该行的
   失败列里。
+- `tier` / `prompt_traits` —— 给文本半边用，语义与聊天路径完全一致：`tier` 选
+  `[tasks.chat_companion.tiers.<tier>]` 的模型和 `allow_traits`，`prompt_traits`
+  过了这层门才注入（见 [prompt-traits.zh.md](prompt-traits.zh.md)）。
+  `prompt_traits` 每次调用都校验（格式不对 400）；两者只在 `reply_with_text`
+  掷出文本半边时起作用。assistant 行的 `metadata.prompt_traits` / `metadata.tier`
+  留的审计副本与聊天回合相同。
 
 ```json
 {
@@ -553,6 +561,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 
 | 状态码 | 含义 |
 |---|---|
+| 400 | `prompt_traits` 格式不对 |
 | 401 | bearer 缺失或无效 |
 | 403 | 不是你的 session |
 | 404 | session 不存在，或该 session 里没有这条消息 |
