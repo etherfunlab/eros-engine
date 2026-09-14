@@ -207,11 +207,16 @@ surface.
    `clean_response(trim(full filter output))` for every served filtered turn
    (the old batch path applied one further outer `trim()` on top of this value,
    which diverges only on a quote-wrapped, padded tail — e.g. `"say "` served
-   as `say` there vs `say ` here).
+   as `say` there vs `say ` here; on such tails the extra trim also shifted the
+   `too_short` count, so an output within padding-width of the 80-char floor
+   could walk there and serve here).
 2. No pre-emission disposition differs from batch: for any complete filter output,
    the walk/serve/reason decision made before the first delta is identical to
    `filter_output_invalidity` on the batch-processed text. (`length` is served in
-   both, `content_filter` rejected in both.)
+   both, `content_filter` rejected in both. When several invalidities coexist —
+   an empty or refusal-headed stream that also carries `content_filter` — the
+   recorded `reason` follows arrival order here vs gate order there; the walk
+   itself is identical either way.)
 3. An emitting attempt can only fail by late `content_filter`, transport error, or
    deadline expiry; each lands in the supersede sequence, and the turn still
    terminates in today's outcome set (served filtered / fail-open original) within
