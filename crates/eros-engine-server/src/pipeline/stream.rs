@@ -10753,6 +10753,61 @@ data: [DONE]\n\n";
             assert_eq!(out.filtered_text, text);
             assert_eq!(out.retries_filter, 0);
         }
+
+        // 10 — the in-loop `Err(e)` arm: a mid-stream transport/parse failure
+        // after emission has already started.
+        #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+        async fn mid_stream_parse_error_after_emit_aborts_with_had_emitted(pool: PgPool) {
+            let mock = wiremock::MockServer::start().await;
+            // Hand-built body: a valid first frame (crosses the emission
+            // threshold), then a line the client's SSE/JSON parser rejects —
+            // no `[DONE]` after it, so the rejection surfaces as an `Err`
+            // item, not a clean EOS.
+            let malformed_body = format!(
+                "data: {}\n\ndata: {{not-json\n\n",
+                serde_json::json!({"choices":[{"delta":{"content": LONG_CLEAN}}]})
+            );
+            mount_filter(&mock, "fast/m", malformed_body).await;
+            mount_filter(
+                &mock,
+                "filt2/m",
+                filter_sse("filt2/m", &[(LONG_CLEAN2, None)]),
+            )
+            .await;
+
+            let events = collect_filter_events(pool, CHAIN, &mock).await;
+            let at = abort_index(&events);
+            assert!(
+                events[..at]
+                    .iter()
+                    .any(|e| matches!(e, FilterEvent::Delta(_))),
+                "the aborted attempt must have emitted first: {events:?}"
+            );
+            assert!(
+                matches!(
+                    events[at],
+                    FilterEvent::AttemptAborted { had_emitted: true }
+                ),
+                "{events:?}"
+            );
+            assert_eq!(
+                joined(&events[at + 1..]),
+                LONG_CLEAN2,
+                "the next model re-runs from scratch and its deltas rebuild its text"
+            );
+            let out = served(&events);
+            assert_eq!(out.retries_filter, 1);
+            assert_eq!(out.attempts.len(), 1, "{:?}", out.attempts);
+            assert_eq!(out.attempts[0].model, "fast/m");
+            // LlmError::StreamParse classifies as AttemptFailure::Gateway
+            // (failure.rs `from_llm_error`), so `failure_pointer` yields
+            // "gateway_error" here, not "upstream_error" — observed empirically.
+            assert_eq!(out.attempts[0].reason, "gateway_error");
+            assert!(
+                out.attempts[0].emitted,
+                "a post-emit failure is recorded as emitted"
+            );
+        }
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
