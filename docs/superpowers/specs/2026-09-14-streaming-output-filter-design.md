@@ -204,8 +204,10 @@ surface.
 ## Invariants (the testable claims)
 
 1. Concatenation of emitted filter deltas == persisted `content` ==
-   `clean_response(trim(full filter output))` — the batch path's exact served text —
-   for every served filtered turn.
+   `clean_response(trim(full filter output))` for every served filtered turn
+   (the old batch path applied one further outer `trim()` on top of this value,
+   which diverges only on a quote-wrapped, padded tail — e.g. `"say "` served
+   as `say` there vs `say ` here).
 2. No pre-emission disposition differs from batch: for any complete filter output,
    the walk/serve/reason decision made before the first delta is identical to
    `filter_output_invalidity` on the batch-processed text. (`length` is served in
