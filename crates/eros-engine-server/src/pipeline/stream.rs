@@ -10329,7 +10329,11 @@ data: [DONE]\n\n";
             if last {
                 v["usage"] =
                     serde_json::json!({"prompt_tokens":1,"completion_tokens":1,"total_tokens":2});
-                v["id"] = serde_json::json!("gf");
+                // Derived per model so multi-model chains produce DISTINCT
+                // generation ids: the llm_generations insert is ON CONFLICT
+                // DO NOTHING, and a shared id would let a failed attempt's row
+                // swallow the served attempt's insert unexercised.
+                v["id"] = serde_json::json!(format!("gf-{model}"));
                 v["model"] = serde_json::json!(model);
             }
             out.push_str(&format!("data: {v}\n\n"));
