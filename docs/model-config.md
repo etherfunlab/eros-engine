@@ -421,6 +421,21 @@ tier that omits one falls back to the default `[tasks.chat_output_filter]` block
 | `"after_extract"` *(default)* | Original (pre-filter) text | Memory/insight/affinity see the unmodified reply; only the rewritten text is delivered to the client and persisted in `chat_messages`. |
 | `"before_extract"` | Filtered text | Extract also reads the rewritten text. Use this when the filter normalizes content that the extract pipeline should reflect. |
 
+#### Delivery
+
+The filtered reply streams to the client incrementally, not as one block
+delivered at the end. The engine holds the filter model's output back until
+it has 120 characters (or the stream ends, if sooner), checks that head for a
+refusal exactly as it would for a complete response, and only then starts
+emitting `delta` frames — so nothing reaches the client before that check
+passes. If an attempt fails after it has already started streaming, the turn
+supersedes that partial bubble with a fresh one from the next attempt (or the
+fail-open original) instead of continuing it — see the SSE frame sequence in
+[api-reference.md](api-reference.md#post-compchatsession_idmessagestream). The
+holdback and any superseded text are internal; a client's user-facing
+experience does not distinguish a filtered turn from an ordinary streamed
+reply.
+
 **Fail-open:** if the filter LLM call times out or returns an error the engine delivers the **original** reply unchanged (the filter never blocks the chat response).
 
 #### What is stored / shown

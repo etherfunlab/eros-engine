@@ -306,9 +306,9 @@ pub struct BurstOutcome {
 /// state.
 ///
 /// Two modes: when the resolved output filter's turn-level predicates pass
-/// (live=false), the burst buffers each attempt, runs the filter LLM, and
-/// only emits the filtered text (never the original). Otherwise it streams
-/// live per-chunk exactly as before.
+/// (live=false), the burst buffers the chat-generation attempt whole, then
+/// streams the filter LLM's rewrite and emits its deltas (never the original).
+/// Otherwise it streams live per-chunk exactly as before.
 #[allow(clippy::too_many_arguments)]
 fn drive_chat_burst(
     state: Arc<AppState>,
@@ -352,9 +352,11 @@ fn drive_chat_burst(
         let task_name: &str = req.task.as_deref().unwrap_or("chat_companion");
 
         let tag_refs: Vec<&str> = trait_tags.iter().map(String::as_str).collect();
-        // A turn buffers (no live deltas) ONLY when the LLM output_filter's
-        // turn-level predicates pass — an LLM rewrite is inherently un-streamable
-        // (the filtered text must be produced before any of it is safe to send).
+        // A turn buffers the CHAT GENERATION (no live deltas of the raw reply)
+        // ONLY when the LLM output_filter's turn-level predicates pass — the
+        // filter needs the complete original as input, so that half is
+        // inherently un-streamable. The filter's own rewrite streams to the
+        // client instead of buffering whole (see run_output_filter).
         // `output_regex` no longer forces buffering: the live burst streams
         // through the rules incrementally with a bounded holdback
         // (`StreamScrubber`), so a regex-only chain (the common production case)
@@ -912,11 +914,12 @@ fn drive_chat_burst(
         }
 
         // ===== FILTERED MODE =====
-        // The turn's trait/random predicates pass: buffer each attempt, run the
-        // filter LLM, and emit ONLY the filtered text (the original reply must
-        // never reach the client). Per-attempt the model predicate decides
-        // whether that specific served model is actually filtered; on filter
-        // error we fail open and emit the original.
+        // The turn's trait/random predicates pass: buffer the chat-generation
+        // attempt whole, then stream the filter LLM's rewrite and emit ONLY its
+        // deltas (the original reply must never reach the client). Per-attempt
+        // the model predicate decides whether that specific served model is
+        // actually filtered; on filter error we fail open and emit the
+        // original.
         // `filter` is None when the turn buffers solely because of output_regex.
         let f_opt = filter.as_ref();
         // Same accumulator contract as live mode: transport/status failures and
@@ -935,10 +938,11 @@ fn drive_chat_burst(
             let mut truncated = false;
             let mut empty_completion = false;
 
-            // Per-attempt observability (spec §4.2). In filtered mode the client
-            // sees nothing until the whole reply is rewritten, so ttft_ms here is
-            // time-to-first-UPSTREAM-token (still useful to compare model speed),
-            // not time-to-client.
+            // Per-attempt observability (spec §4.2). This times the CHAT
+            // generation, which the client never sees directly — only the
+            // filter's rewrite reaches it, once that clears its own validity
+            // holdback — so ttft_ms here is time-to-first-UPSTREAM-token (still
+            // useful to compare model speed), not time-to-client.
             let attempt_started = std::time::Instant::now();
             let mut ttft_ms: Option<u64> = None;
             let mut attempt_outcome: &'static str = "served";
@@ -1290,6 +1294,17 @@ fn drive_chat_burst(
                 })
             };
 
+            // The supersede path mints fresh ids, so the bubble identity is
+            // rebindable from here on: persist / produced / the closing Done all
+            // follow the LAST meta (spec invariant 5).
+            let mut cur_ulid = msg_ulid;
+            let mut cur_uuid = msg_uuid;
+            // True when the CURRENT bubble already carries its text as live
+            // filter deltas — the visible-Delta yield below must then be
+            // skipped. A supersede opens an empty bubble, so it clears this:
+            // the fail-open original still needs emitting there.
+            let mut already_streamed = false;
+
             let (visible, filter_audit, filter_failure, filter_attempts): (
                 String,
                 Option<eros_engine_store::chat::FilterAudit>,
@@ -1307,12 +1322,68 @@ fn drive_chat_burst(
                     Some(f) => {
                     let hits = f.trigger.should_filter(&bare_model_id, &tag_refs, random_draw);
                     match hits {
-                        Some(h) => match run_output_filter(&state, session_id, f, &cleaned).await {
-                            Ok(out) => {
-                                let mut o = outcome.lock().unwrap();
-                                o.filtered = true;
-                                o.retries_filter = out.retries_filter;
-                                drop(o);
+                        Some(h) => {
+                            // The filter's rewrite reaches the client as it is
+                            // produced; wire framing and id minting stay here.
+                            use futures_util::StreamExt as _;
+                            let mut events = std::pin::pin!(run_output_filter(
+                                state.clone(),
+                                session_id,
+                                (*f).clone(),
+                                cleaned.clone(),
+                            ));
+                            let mut served: Option<RunFilterOutcome> = None;
+                            let mut failed: Option<FilterFailOpen> = None;
+                            while let Some(ev) = events.next().await {
+                                match ev {
+                                    FilterEvent::Delta(text) => {
+                                        // First rewrite delta = the client has
+                                        // received non-raw output; final.filtered
+                                        // reports exactly that fact, so it flips
+                                        // here and NOT on chain success (a
+                                        // post-emit fail-open turn showed
+                                        // rewritten text too — spec §final frame).
+                                        outcome.lock().unwrap().filtered = true;
+                                        already_streamed = true;
+                                        yield ProtocolFrame::Delta {
+                                            message_id: ulid_string(cur_ulid),
+                                            content: text,
+                                        };
+                                    }
+                                    FilterEvent::AttemptAborted { had_emitted: true } => {
+                                        // Supersede (spec §Message lifecycle):
+                                        // close the bubble the dead attempt
+                                        // streamed into (meta↔done stays 1:1),
+                                        // open a fresh one for whatever serves
+                                        // next. The superseded partial is never
+                                        // persisted, so continues_from has
+                                        // nothing to reference and stays None.
+                                        yield ProtocolFrame::Done {
+                                            message_id: ulid_string(cur_ulid),
+                                            truncated: true,
+                                            usage: None,
+                                            generation_id: None,
+                                            ghost_fallback: false,
+                                        };
+                                        let fresh = Ulid::new();
+                                        cur_ulid = fresh;
+                                        cur_uuid = fresh.into();
+                                        already_streamed = false;
+                                        yield ProtocolFrame::Meta {
+                                            message_id: ulid_string(cur_ulid),
+                                            action_type: frame_action,
+                                            model: display_override.as_ref().and_then(|d| d.display(&bare_model_id)),
+                                            continues_from: None,
+                                        };
+                                    }
+                                    FilterEvent::AttemptAborted { had_emitted: false } => {}
+                                    FilterEvent::Served(out) => { served = Some(out); }
+                                    FilterEvent::FailOpen(fail) => { failed = Some(fail); }
+                                }
+                            }
+                            match (served, failed) {
+                            (Some(out), _) => {
+                                outcome.lock().unwrap().retries_filter = out.retries_filter;
                                 // Fold the regex hit into the LLM filter's triggers.
                                 let mut triggers = if h.is_empty() {
                                     serde_json::Map::new()
@@ -1350,7 +1421,7 @@ fn drive_chat_burst(
                                 chain_failures.extend(out.failures);
                                 (out.filtered_text, Some(audit), None, out.attempts)
                             }
-                            Err(fail) => {
+                            (None, Some(fail)) => {
                                 tracing::warn!(
                                     f_client_msg_id = %fail.f_client_msg_id,
                                     attempts = ?fail.attempts,
@@ -1361,7 +1432,11 @@ fn drive_chat_burst(
                                 // Fail open to the regex-cleaned text (strip still applies).
                                 (cleaned.clone(), regex_audit(&acc), Some(fail), attempts)
                             }
-                        },
+                            (None, None) => {
+                                unreachable!("filter stream ends in Served or FailOpen")
+                            }
+                            }
+                        }
                         None => (cleaned.clone(), regex_audit(&acc), None, Vec::new()), // LLM models-miss
                     }
                 }
@@ -1380,9 +1455,12 @@ fn drive_chat_burst(
             // text+image turn is an image-only reply, not a silent one.
             let is_ghost = visible.is_empty() && !plan_action.promises_image();
 
-            if !visible.is_empty() {
+            // Only for text the filter did NOT already stream: fail-open,
+            // models-miss, regex-only and no-filter turns. After a post-emit
+            // abort the current bubble is the fresh one the supersede opened.
+            if !visible.is_empty() && !already_streamed {
                 yield ProtocolFrame::Delta {
-                    message_id: ulid_string(msg_ulid),
+                    message_id: ulid_string(cur_ulid),
                     content: visible.clone(),
                 };
             }
@@ -1391,7 +1469,7 @@ fn drive_chat_burst(
             let row = eros_engine_store::chat::AssistantInsert {
                 llm_attempts,
                 gateway_errors,
-                id: msg_uuid,
+                id: cur_uuid,
                 content: visible.clone(),
                 assistant_action_type: persist_action.into(),
                 continues_from_message_id: None,
@@ -1415,7 +1493,7 @@ fn drive_chat_burst(
                 .unwrap_or(eros_engine_llm::model_config::FilterTiming::AfterExtract);
             let extracted = extract_text(timing, &cleaned, &visible);
             outcome.lock().unwrap().produced.push(crate::pipeline::post_process::ProducedMessage {
-                message_id: msg_uuid,
+                message_id: cur_uuid,
                 full_text: extracted,
                 action: plan_action,
             });
@@ -1434,7 +1512,7 @@ fn drive_chat_burst(
                 o.failures = chain_failures.clone();
             }
             yield ProtocolFrame::Done {
-                message_id: ulid_string(msg_ulid),
+                message_id: ulid_string(cur_ulid),
                 truncated: false,
                 usage: wire_usage,
                 generation_id: last_gen_id,
@@ -1478,6 +1556,7 @@ fn extract_text(
 /// nature of `ChatResponse.generation_id` so SQL NULL propagates cleanly.
 /// `attempts` / `failures` cover the models the chain walked PAST before
 /// landing this success — a recovered chain still reports what broke.
+#[derive(Debug)]
 struct RunFilterOutcome {
     filtered_text: String,
     retries_filter: u32,
@@ -1486,6 +1565,21 @@ struct RunFilterOutcome {
     f_generation_id: Option<String>,
     attempts: Vec<FilterAttemptFailure>,
     failures: Vec<eros_engine_llm::failure::AttemptFailure>,
+}
+
+/// Events yielded by the streaming output filter. Wire framing and message-id
+/// minting stay in the burst; the generator only reports what happened.
+#[derive(Debug)]
+enum FilterEvent {
+    /// Client-visible rewrite text (parity-cleaned, holdback-released).
+    Delta(String),
+    /// The current attempt is abandoned. `had_emitted` drives the supersede
+    /// frames; audit accumulation is internal (terminal events carry it).
+    AttemptAborted { had_emitted: bool },
+    /// Chain success. `0.filtered_text` == concat of the LAST attempt's Deltas.
+    Served(RunFilterOutcome),
+    /// Chain exhausted; caller fails open to the regex-cleaned original.
+    FailOpen(FilterFailOpen),
 }
 
 /// One filter-chain attempt that did NOT produce a valid filtered reply.
@@ -1502,6 +1596,11 @@ struct FilterAttemptFailure {
     /// `"upstream_error"` / `"gateway_error"` — naming which audit column
     /// (`llm_attempts` / `gateway_errors`) holds the transport detail.
     reason: &'static str,
+    /// True when this attempt yielded at least one client-visible delta before
+    /// failing — the user saw a bubble that was then superseded. Absent (false)
+    /// for attempts that walked with zero wire artifacts.
+    #[serde(default, skip_serializing_if = "is_false")]
+    emitted: bool,
 }
 
 /// Returned by `run_output_filter` when the whole chain failed validity /
@@ -1691,8 +1790,9 @@ pub(crate) fn operation_failure_pointer(
 
 /// The gateway record for a local `FILTER_TIMEOUT` expiry. No `LlmError` ever
 /// existed to classify — the future was dropped before the client could
-/// produce one — so it is built by hand. `FILTER_TIMEOUT` wraps a whole
-/// non-streaming `execute`, so the kind is `TotalTimeout`, not `OpenTimeout`.
+/// produce one — so it is built by hand. `FILTER_TIMEOUT` is one deadline over
+/// a whole filter attempt — open through finish — so the kind is
+/// `TotalTimeout`, not `OpenTimeout`.
 fn filter_timeout_failure(task: &str, model: &str) -> eros_engine_llm::failure::AttemptFailure {
     eros_engine_llm::failure::AttemptFailure::Gateway(eros_engine_llm::failure::GatewayError {
         task: task.to_string(),
@@ -1800,126 +1900,203 @@ pub(crate) fn error_frame_fields_from_last(
 }
 
 /// Run the output-filter LLM over `original`, walking the (already
-/// depth-capped) fallback chain one model at a time.  After each successful
-/// HTTP 200 response, `filter_output_invalidity` is applied; on failure the
-/// next model is tried.  Returns `Err(FilterFailOpen)` when the whole chain
+/// depth-capped) fallback chain one model at a time, and report what happens as
+/// it happens: client-visible deltas, per-attempt aborts, and exactly one
+/// terminal event — `Served` on success, `FailOpen` when the whole chain
 /// exhausts (callers fall open and emit the original reply, and write the
 /// per-attempt audit log into `chat_messages.metadata`).
-async fn run_output_filter(
-    state: &AppState,
+///
+/// Nothing is emitted until the parity-cleaned text clears
+/// `REFUSAL_HEAD_SCAN_CHARS` and the refusal head-scan passes, so every
+/// pre-emission verdict is the batch gate's verdict; a stream that ends under
+/// the threshold runs the whole batch gate on the complete text. Arguments are
+/// owned so the returned stream is `'static` and the burst can hold it across
+/// its own yields.
+fn run_output_filter(
+    state: std::sync::Arc<AppState>,
     session_id: Uuid,
-    f: &eros_engine_llm::model_config::ResolvedOutputFilter,
-    original: &str,
-) -> Result<RunFilterOutcome, FilterFailOpen> {
-    use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
-    let f_client_msg_id = format!("f_{}", Ulid::new());
-    let chain: Vec<String> = std::iter::once(f.model.clone())
-        .chain(f.fallback_model.iter().cloned())
-        .collect();
-    let mut attempts: Vec<FilterAttemptFailure> = Vec::with_capacity(chain.len());
-    let mut failures: Vec<eros_engine_llm::failure::AttemptFailure> = Vec::new();
-    for (idx, model_id) in chain.iter().enumerate() {
-        let req = ChatRequest {
-            model: model_id.clone(),
-            fallback_model: vec![],
-            messages: vec![
-                ChatMessage {
-                    role: "system".into(),
-                    content: f.filter_prompt.clone(),
+    f: eros_engine_llm::model_config::ResolvedOutputFilter,
+    original: String,
+) -> impl futures_util::Stream<Item = FilterEvent> + Send + 'static {
+    async_stream::stream! {
+        use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
+        use eros_engine_llm::stream_clean::StreamCleaner;
+        let f_client_msg_id = format!("f_{}", Ulid::new());
+        let chain: Vec<String> = std::iter::once(f.model.clone())
+            .chain(f.fallback_model.iter().cloned())
+            .collect();
+        let mut attempts: Vec<FilterAttemptFailure> = Vec::with_capacity(chain.len());
+        let mut failures: Vec<eros_engine_llm::failure::AttemptFailure> = Vec::new();
+        for (idx, model_id) in chain.iter().enumerate() {
+            let req = ChatRequest {
+                model: model_id.clone(),
+                fallback_model: vec![],
+                messages: vec![
+                    ChatMessage { role: "system".into(), content: f.filter_prompt.clone() },
+                    ChatMessage { role: "user".into(), content: original.clone() },
+                ],
+                temperature: f.temperature as f32,
+                max_tokens: f.max_tokens,
+                sampling: f.sampling,
+                reasoning: f.reasoning.clone(),
+                task: Some("chat_output_filter".into()),
+                ..Default::default()
+            };
+            // One deadline covers open through finish — the same 15s wall the
+            // batch call had, so chain-walk budgets are unchanged and the
+            // filter phase can never stretch toward the whole-turn
+            // generation_timeout (spec §Deadline).
+            let deadline = tokio::time::Instant::now() + FILTER_TIMEOUT;
+            let mut cleaner = StreamCleaner::new();
+            let mut emitted_len = 0usize; // byte len of stable() already yielded
+            let mut go = false;           // holdback cleared, deltas flowing
+            let mut last_usage: Option<eros_engine_llm::openrouter::UsageBlock> = None;
+            let mut last_gen_id: Option<String> = None;
+            let mut model_echo: Option<String> = None;
+            let mut finish: Option<String> = None;
+            let mut abort_reason: Option<&'static str> = None;
+
+            match tokio::time::timeout_at(deadline, state.openrouter.execute_stream_as(&req, model_id)).await {
+                Ok(Ok(mut s)) => {
+                    use futures_util::StreamExt as _;
+                    loop {
+                        let item = match tokio::time::timeout_at(deadline, s.next()).await {
+                            Ok(Some(item)) => item,
+                            Ok(None) => break, // clean EOS = completion (spec §Stream-end)
+                            Err(_) => {
+                                failures.push(filter_timeout_failure("chat_output_filter", model_id));
+                                abort_reason = Some("gateway_error");
+                                break;
+                            }
+                        };
+                        match item {
+                            Ok(c) => {
+                                // Bookkeeping first: the terminating frame often
+                                // carries the usage and id the audit row needs,
+                                // and an aborted attempt records too.
+                                if c.usage.is_some() { last_usage = c.usage; }
+                                if c.generation_id.is_some() { last_gen_id = c.generation_id; }
+                                if c.model.is_some() { model_echo = c.model; }
+                                if c.finish_reason.is_some() { finish = c.finish_reason; }
+                                // Judged BEFORE this chunk's content is pushed: a
+                                // safety-blocked generation usually terminates with
+                                // content and finish_reason in the SAME frame, and
+                                // batch — holding the whole output — walked silently.
+                                // Pushing first would show text batch never showed
+                                // (spec invariant 2). "length" is NOT a failure here:
+                                // the batch gate never rejected a length-cut rewrite
+                                // (spec table).
+                                if finish.as_deref() == Some("content_filter") {
+                                    abort_reason = Some("content_filter");
+                                    break;
+                                }
+                                if let Some(content) = c.content {
+                                    cleaner.push(&content);
+                                    let stable = cleaner.stable();
+                                    if !go && stable.chars().count() >= REFUSAL_HEAD_SCAN_CHARS {
+                                        if refusal_in_head(&stable) {
+                                            abort_reason = Some("refusal_pattern");
+                                            break;
+                                        }
+                                        go = true;
+                                    }
+                                    if go && stable.len() > emitted_len {
+                                        yield FilterEvent::Delta(stable[emitted_len..].to_string());
+                                        emitted_len = stable.len();
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let fail = eros_engine_llm::failure::AttemptFailure::from_llm_error(
+                                    "chat_output_filter", model_id, &e,
+                                );
+                                abort_reason = Some(failure_pointer(&fail));
+                                failures.push(fail);
+                                break;
+                            }
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    let fail = eros_engine_llm::failure::AttemptFailure::from_llm_error(
+                        "chat_output_filter", model_id, &e,
+                    );
+                    abort_reason = Some(failure_pointer(&fail));
+                    failures.push(fail);
+                }
+                Err(_) => {
+                    failures.push(filter_timeout_failure("chat_output_filter", model_id));
+                    abort_reason = Some("gateway_error");
+                }
+            }
+
+            // Exactly one generation record per attempt, at termination — the
+            // insert is ON CONFLICT DO NOTHING, so an earlier defensive write
+            // would freeze a usage-less row. Failed attempts now record too
+            // (the header-sourced id arrives as a synthetic first chunk).
+            let usage_full = last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
+            let recorded_gen_id = super::record_generation(
+                &state.pool,
+                super::GenerationRecord {
+                    task: "chat_output_filter",
+                    session_id: Some(session_id),
+                    generation_id: last_gen_id.as_deref(),
+                    model: Some(model_id.as_str()),
+                    usage: usage_full.as_ref(),
                 },
-                ChatMessage {
-                    role: "user".into(),
-                    content: original.to_string(),
-                },
-            ],
-            temperature: f.temperature as f32,
-            max_tokens: f.max_tokens,
-            sampling: f.sampling,
-            reasoning: f.reasoning.clone(),
-            task: Some("chat_output_filter".into()),
-            ..Default::default()
-        };
-        let resp = match tokio::time::timeout(FILTER_TIMEOUT, state.openrouter.execute(req)).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                tracing::warn!(model = %model_id, error = %e, "filter: model error; walking to next");
-                let f = eros_engine_llm::failure::AttemptFailure::from_llm_error(
-                    "chat_output_filter",
-                    model_id,
-                    &e,
+            )
+            .await;
+
+            if let Some(reason) = abort_reason {
+                tracing::warn!(
+                    model = %model_id,
+                    invalidity = %reason,
+                    emitted = go,
+                    "filter: attempt aborted; walking to next model"
                 );
-                let reason = failure_pointer(&f);
-                failures.push(f);
-                attempts.push(FilterAttemptFailure {
-                    model: model_id.clone(),
-                    reason,
-                });
+                attempts.push(FilterAttemptFailure { model: model_id.clone(), reason, emitted: go });
+                yield FilterEvent::AttemptAborted { had_emitted: go };
                 continue;
             }
-            Err(_) => {
-                tracing::warn!(model = %model_id, "filter: model timeout; walking to next");
-                failures.push(filter_timeout_failure("chat_output_filter", model_id));
-                attempts.push(FilterAttemptFailure {
-                    model: model_id.clone(),
-                    reason: "gateway_error",
-                });
-                continue;
+
+            let full = cleaner.full_clean();
+            if !go {
+                // Sub-threshold stream (or empty): full text in hand, batch
+                // gate verbatim — reasons byte-identical to the sync path.
+                let reason = if full.is_empty() {
+                    Some("empty")
+                } else {
+                    filter_output_invalidity(&full, finish.as_deref())
+                };
+                if let Some(reason) = reason {
+                    tracing::warn!(
+                        model = %model_id,
+                        invalidity = %reason,
+                        "filter: output failed validity gate; walking to next model"
+                    );
+                    attempts.push(FilterAttemptFailure { model: model_id.clone(), reason, emitted: false });
+                    yield FilterEvent::AttemptAborted { had_emitted: false };
+                    continue;
+                }
+                yield FilterEvent::Delta(full.clone());
+            } else if full.len() > emitted_len {
+                yield FilterEvent::Delta(full[emitted_len..].to_string());
             }
-        };
-        let generation_id = super::record_generation(
-            &state.pool,
-            super::GenerationRecord {
-                task: "chat_output_filter",
-                session_id: Some(session_id),
-                generation_id: resp.generation_id.as_deref(),
-                model: resp.model.as_deref(),
-                usage: resp.usage.as_ref(),
-            },
-        )
-        .await;
-        let text = resp.reply.trim().to_string();
-        // Empty reply check before the validity gate: "model returned literally
-        // nothing" is distinguished from "model returned a short non-empty
-        // response" so ops can see the difference in filter_attempts.
-        if text.is_empty() {
-            tracing::warn!(model = %model_id, "filter: empty reply; walking to next");
-            attempts.push(FilterAttemptFailure {
-                model: model_id.clone(),
-                reason: "empty",
+
+            let filter_model = model_echo.unwrap_or_else(|| model_id.clone());
+            yield FilterEvent::Served(RunFilterOutcome {
+                filtered_text: full,
+                retries_filter: idx as u32,
+                filter_model,
+                f_client_msg_id: f_client_msg_id.clone(),
+                f_generation_id: recorded_gen_id,
+                attempts: std::mem::take(&mut attempts),
+                failures: std::mem::take(&mut failures),
             });
-            continue;
+            return;
         }
-        if let Some(reason) = filter_output_invalidity(&text, resp.finish_reason.as_deref()) {
-            tracing::warn!(
-                model = %model_id,
-                invalidity = %reason,
-                "filter: output failed validity gate; walking to next model"
-            );
-            attempts.push(FilterAttemptFailure {
-                model: model_id.clone(),
-                reason,
-            });
-            continue;
-        }
-        // Falling back to model_id when the response omits the served model is
-        // safe: that is the model we requested, and OpenRouter only omits it
-        // on error paths (which we have already excluded via the validity gate).
-        let filter_model = resp.model.unwrap_or_else(|| model_id.clone());
-        return Ok(RunFilterOutcome {
-            filtered_text: text,
-            retries_filter: idx as u32,
-            filter_model,
-            f_client_msg_id,
-            f_generation_id: generation_id,
-            attempts,
-            failures,
-        });
+        yield FilterEvent::FailOpen(FilterFailOpen { f_client_msg_id, attempts, failures });
     }
-    Err(FilterFailOpen {
-        f_client_msg_id,
-        attempts,
-        failures,
-    })
 }
 
 /// The `filter_attempts[].reason` vocabulary, in one place so the retirement is
@@ -10137,6 +10314,506 @@ data: [DONE]\n\n";
         );
     }
 
+    // ── run_output_filter: the streaming generator ───────────────────────────
+
+    /// SSE completion body for a filter-model mock. `frames` are (content,
+    /// finish_reason) pairs; usage+id+model ride the last frame.
+    fn filter_sse(model: &str, frames: &[(&str, Option<&str>)]) -> String {
+        let mut out = String::new();
+        for (i, (content, fin)) in frames.iter().enumerate() {
+            let last = i + 1 == frames.len();
+            let mut v = serde_json::json!({"choices":[{"delta":{"content":content}}]});
+            if let Some(f) = fin {
+                v["choices"][0]["finish_reason"] = serde_json::json!(f);
+            }
+            if last {
+                v["usage"] =
+                    serde_json::json!({"prompt_tokens":1,"completion_tokens":1,"total_tokens":2});
+                // Derived per model so multi-model chains produce DISTINCT
+                // generation ids: the llm_generations insert is ON CONFLICT
+                // DO NOTHING, and a shared id would let a failed attempt's row
+                // swallow the served attempt's insert unexercised.
+                v["id"] = serde_json::json!(format!("gf-{model}"));
+                v["model"] = serde_json::json!(model);
+            }
+            out.push_str(&format!("data: {v}\n\n"));
+        }
+        out.push_str("data: [DONE]\n\n");
+        out
+    }
+
+    /// ~200 chars of clean Chinese prose — comfortably past REFUSAL_HEAD_SCAN_CHARS.
+    const LONG_CLEAN: &str = "她轻轻地望向窗外，思绪飘向了远方。阳光洒在她的脸上，温柔而明亮。\
+她记得那个夏天的每一天，岁月如流水般逝去，带走了所有的悲欢离合。风吹过树梢，\
+带来远处花园的芬芳，也带来一段旧日的旋律。她想起初次见面的那个傍晚，霞光温柔，\
+言语稀少，心跳却清晰可闻。后来的一切都像水面的光，晃动着，却始终不肯散去。\
+她在心里默默记下了这一刻的温度。";
+
+    /// A second ≥120-char text, distinguishable from LONG_CLEAN in assertions.
+    const LONG_CLEAN2: &str = "夜色渐深，城市的灯一盏一盏亮起来，像是有人在黑绒布上撒了一把碎金。\
+她沿着河边慢慢走，风把她的发梢吹得微乱，也把白天积攒的疲惫一点点吹散。桥洞下有人拉琴，\
+调子旧旧的，却意外地合这一刻的心境。她停下来听了很久，直到琴声停了，才想起该回家了。\
+路过便利店时，她买了一罐热咖啡，握在手里，暖意顺着指尖漫上来。";
+
+    /// Mount one filter-model mock, routed by the model id in the request
+    /// body so a chain's models are mutually exclusive.
+    async fn mount_filter(mock: &wiremock::MockServer, model: &str, body: String) {
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains(model))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(mock)
+            .await;
+    }
+
+    async fn collect_filter_events(
+        pool: sqlx::PgPool,
+        config_toml: &str,
+        mock: &wiremock::MockServer,
+    ) -> Vec<FilterEvent> {
+        let mut state = crate::routes::companion::test_state(pool);
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(config_toml).unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let f = state
+            .model_config
+            .resolve_output_filter(None)
+            .expect("filter");
+        use futures_util::StreamExt;
+        run_output_filter(
+            std::sync::Arc::new(state),
+            Uuid::new_v4(),
+            f,
+            "ORIGINAL".into(),
+        )
+        .collect()
+        .await
+    }
+
+    /// Generator-level tests: they drive `run_output_filter` directly (no burst,
+    /// no wire frames) so the event sequence itself is the assertion surface.
+    mod run_output_filter_stream {
+        use super::*;
+
+        /// One filter model, no fallback.
+        const ONE: &str = "[tasks.chat_companion]\nmodel=\"deepseek/x\"\noutput_filter=true\n\
+             [tasks.chat_output_filter]\nmodel=\"fast/m\"\nfilter_prompt=\"REWRITE\"\n";
+
+        /// `fast/m` then `filt2/m`.
+        const CHAIN: &str = "[tasks.chat_companion]\nmodel=\"deepseek/x\"\noutput_filter=true\n\
+             [tasks.chat_output_filter]\nmodel=\"fast/m\"\nfallback=[\"filt2/m\"]\n\
+             filter_prompt=\"REWRITE\"\n";
+
+        fn joined(events: &[FilterEvent]) -> String {
+            events
+                .iter()
+                .filter_map(|e| match e {
+                    FilterEvent::Delta(d) => Some(d.as_str()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn served(events: &[FilterEvent]) -> &RunFilterOutcome {
+            match events.last() {
+                Some(FilterEvent::Served(o)) => o,
+                other => panic!("last event must be Served, got {other:?}"),
+            }
+        }
+
+        fn abort_index(events: &[FilterEvent]) -> usize {
+            events
+                .iter()
+                .position(|e| matches!(e, FilterEvent::AttemptAborted { .. }))
+                .unwrap_or_else(|| panic!("expected an AttemptAborted in {events:?}"))
+        }
+
+        // 1
+        #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+        async fn served_stream_yields_deltas_then_served(pool: PgPool) {
+            let mock = wiremock::MockServer::start().await;
+            mount_filter(&mock, "fast/m", filter_sse("fast/m", &[(LONG_CLEAN, None)])).await;
+
+            let events = collect_filter_events(pool, ONE, &mock).await;
+            let deltas = joined(&events);
+            assert!(
+                events.iter().any(|e| matches!(e, FilterEvent::Delta(_))),
+                "a served attempt must emit at least one delta: {events:?}"
+            );
+            let out = served(&events);
+            assert_eq!(
+                deltas, out.filtered_text,
+                "deltas must rebuild the served text"
+            );
+            assert_eq!(
+                deltas, LONG_CLEAN,
+                "served text is clean_response(trim(raw))"
+            );
+            assert_eq!(out.retries_filter, 0, "the primary filter model served");
+            assert_eq!(out.filter_model, "fast/m");
+        }
+
+        // 2
+        #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+        async fn sub_120_too_short_walks_with_no_delta(pool: PgPool) {
+            let mock = wiremock::MockServer::start().await;
+            mount_filter(&mock, "fast/m", filter_sse("fast/m", &[("太短了", None)])).await;
+            mount_filter(
+                &mock,
+                "filt2/m",
+                filter_sse("filt2/m", &[(LONG_CLEAN, None)]),
+            )
+            .await;
+
+            let events = collect_filter_events(pool, CHAIN, &mock).await;
+            let at = abort_index(&events);
+            assert!(
+                !events[..at]
+                    .iter()
+                    .any(|e| matches!(e, FilterEvent::Delta(_))),
+                "a sub-threshold attempt must walk with zero client artifacts: {events:?}"
+            );
+            assert!(
+                matches!(
+                    events[at],
+                    FilterEvent::AttemptAborted { had_emitted: false }
+                ),
+                "{events:?}"
+            );
+            let out = served(&events);
+            assert_eq!(out.retries_filter, 1, "the fallback filter model served");
+            assert_eq!(out.attempts.len(), 1, "{:?}", out.attempts);
+            assert_eq!(out.attempts[0].model, "fast/m");
+            assert_eq!(out.attempts[0].reason, "too_short");
+            assert!(!out.attempts[0].emitted);
+        }
+
+        // 3
+        #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+        async fn head_refusal_split_across_chunks_walks_silently(pool: PgPool) {
+            let mock = wiremock::MockServer::start().await;
+            let tail = format!("无法{LONG_CLEAN}");
+            mount_filter(
+                &mock,
+                "fast/m",
+                filter_sse("fast/m", &[("抱歉，我", None), (&tail, None)]),
+            )
+            .await;
+            mount_filter(
+                &mock,
+                "filt2/m",
+                filter_sse("filt2/m", &[(LONG_CLEAN, None)]),
+            )
+            .await;
+
+            let events = collect_filter_events(pool, CHAIN, &mock).await;
+            let at = abort_index(&events);
+            assert!(
+                !events[..at]
+                    .iter()
+                    .any(|e| matches!(e, FilterEvent::Delta(_))),
+                "a refusal completed across a chunk boundary must still be caught \
+                 before the first delta: {events:?}"
+            );
+            assert!(
+                matches!(
+                    events[at],
+                    FilterEvent::AttemptAborted { had_emitted: false }
+                ),
+                "{events:?}"
+            );
+            let out = served(&events);
+            assert_eq!(out.attempts[0].reason, "refusal_pattern");
+        }
+
+        // 4
+        #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+        async fn late_content_filter_after_emit_aborts_with_had_emitted(pool: PgPool) {
+            let mock = wiremock::MockServer::start().await;
+            mount_filter(
+                &mock,
+                "fast/m",
+                filter_sse(
+                    "fast/m",
+                    &[(LONG_CLEAN, None), ("", Some("content_filter"))],
+                ),
+            )
+            .await;
+            mount_filter(
+                &mock,
+                "filt2/m",
+                filter_sse("filt2/m", &[(LONG_CLEAN2, None)]),
+            )
+            .await;
+
+            let events = collect_filter_events(pool, CHAIN, &mock).await;
+            let at = abort_index(&events);
+            assert!(
+                events[..at]
+                    .iter()
+                    .any(|e| matches!(e, FilterEvent::Delta(_))),
+                "the aborted attempt must have emitted first: {events:?}"
+            );
+            assert!(
+                matches!(
+                    events[at],
+                    FilterEvent::AttemptAborted { had_emitted: true }
+                ),
+                "{events:?}"
+            );
+            assert_eq!(
+                joined(&events[at + 1..]),
+                LONG_CLEAN2,
+                "the next model re-runs from scratch and its deltas rebuild its text"
+            );
+            let out = served(&events);
+            assert_eq!(out.retries_filter, 1);
+            assert_eq!(out.attempts.len(), 1, "{:?}", out.attempts);
+            assert_eq!(out.attempts[0].model, "fast/m");
+            assert_eq!(out.attempts[0].reason, "content_filter");
+            assert!(
+                out.attempts[0].emitted,
+                "a post-emit failure is recorded as emitted"
+            );
+        }
+
+        // 4b
+        #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+        async fn same_chunk_content_filter_walks_without_emitting(pool: PgPool) {
+            // Gemini / OpenAI-compat endpoints usually terminate a safety-blocked
+            // generation with content and finish_reason in ONE frame. Batch held
+            // the whole output and walked silently; so must this (invariant 2),
+            // even though the text alone would clear the emission threshold.
+            let mock = wiremock::MockServer::start().await;
+            mount_filter(
+                &mock,
+                "fast/m",
+                filter_sse("fast/m", &[(LONG_CLEAN, Some("content_filter"))]),
+            )
+            .await;
+            mount_filter(
+                &mock,
+                "filt2/m",
+                filter_sse("filt2/m", &[(LONG_CLEAN2, None)]),
+            )
+            .await;
+
+            let events = collect_filter_events(pool, CHAIN, &mock).await;
+            let at = abort_index(&events);
+            assert!(
+                !events[..at]
+                    .iter()
+                    .any(|e| matches!(e, FilterEvent::Delta(_))),
+                "a content_filter frame must abort before its own content is \
+                 emitted: {events:?}"
+            );
+            assert!(
+                matches!(
+                    events[at],
+                    FilterEvent::AttemptAborted { had_emitted: false }
+                ),
+                "{events:?}"
+            );
+            let out = served(&events);
+            assert_eq!(out.retries_filter, 1);
+            assert_eq!(out.attempts.len(), 1, "{:?}", out.attempts);
+            assert_eq!(out.attempts[0].model, "fast/m");
+            assert_eq!(out.attempts[0].reason, "content_filter");
+            assert!(!out.attempts[0].emitted);
+            assert_eq!(
+                serde_json::to_value(&out.attempts[0]).unwrap(),
+                serde_json::json!({"model": "fast/m", "reason": "content_filter"}),
+                "a silent walk carries no `emitted` key"
+            );
+        }
+
+        // 5
+        #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+        async fn length_finish_reason_is_served_not_walked(pool: PgPool) {
+            let mock = wiremock::MockServer::start().await;
+            mount_filter(
+                &mock,
+                "fast/m",
+                filter_sse("fast/m", &[(LONG_CLEAN, Some("length"))]),
+            )
+            .await;
+
+            let events = collect_filter_events(pool, ONE, &mock).await;
+            let out = served(&events);
+            assert_eq!(out.retries_filter, 0, "length is never a walk");
+            assert!(out.attempts.is_empty(), "{:?}", out.attempts);
+            assert_eq!(joined(&events), LONG_CLEAN);
+        }
+
+        // 6
+        #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+        async fn chain_exhausted_fail_open(pool: PgPool) {
+            use wiremock::matchers::{body_string_contains, path as wm_path};
+            use wiremock::{Mock, ResponseTemplate};
+            let mock = wiremock::MockServer::start().await;
+            Mock::given(wm_path("/api/v1/chat/completions"))
+                .and(body_string_contains("fast/m"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&mock)
+                .await;
+
+            let events = collect_filter_events(pool, ONE, &mock).await;
+            let fail = match events.last() {
+                Some(FilterEvent::FailOpen(f)) => f,
+                other => panic!("last event must be FailOpen, got {other:?}"),
+            };
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| matches!(e, FilterEvent::Served(_) | FilterEvent::FailOpen(_)))
+                    .count(),
+                1,
+                "exactly one terminal event: {events:?}"
+            );
+            assert!(fail.f_client_msg_id.starts_with("f_"), "{fail:?}");
+            assert!(!fail.failures.is_empty(), "{fail:?}");
+        }
+
+        // 7 — the S1 regression lock
+        #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+        async fn fenced_78_char_rewrite_walks_as_too_short(pool: PgPool) {
+            let inner: String = LONG_CLEAN.chars().take(78).collect();
+            assert_eq!(inner.chars().count(), 78, "the premise of this test");
+            let fenced = format!("```\n{inner}\n```");
+            let mock = wiremock::MockServer::start().await;
+            mount_filter(&mock, "fast/m", filter_sse("fast/m", &[(&fenced, None)])).await;
+            mount_filter(
+                &mock,
+                "filt2/m",
+                filter_sse("filt2/m", &[(LONG_CLEAN, None)]),
+            )
+            .await;
+
+            let events = collect_filter_events(pool, CHAIN, &mock).await;
+            let at = abort_index(&events);
+            assert!(
+                !events[..at]
+                    .iter()
+                    .any(|e| matches!(e, FilterEvent::Delta(_))),
+                "fences are invisible to the client; 78 chars never crosses the \
+                 emission threshold: {events:?}"
+            );
+            let out = served(&events);
+            assert_eq!(
+                out.attempts[0].reason, "too_short",
+                "the batch gate's disposition, on the de-fenced text"
+            );
+            assert!(!out.attempts[0].emitted);
+        }
+
+        // 8 — invariant 1 at generator level
+        #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+        async fn served_text_is_clean_response_of_raw(pool: PgPool) {
+            let mock = wiremock::MockServer::start().await;
+            mount_filter(
+                &mock,
+                "fast/m",
+                filter_sse("fast/m", &[("「", None), (LONG_CLEAN, None), ("」", None)]),
+            )
+            .await;
+
+            let events = collect_filter_events(pool, ONE, &mock).await;
+            let out = served(&events);
+            assert_eq!(joined(&events), out.filtered_text);
+            assert_eq!(
+                out.filtered_text, LONG_CLEAN,
+                "surrounding 「」 are stripped exactly as clean_response(trim(raw)) does"
+            );
+        }
+
+        // 9 — the 119/120 equivalence lock
+        #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+        async fn boundary_119_chars_serves_via_eos_gate(pool: PgPool) {
+            let text: String = LONG_CLEAN.chars().take(119).collect();
+            assert_eq!(text.chars().count(), 119, "the premise of this test");
+            let mock = wiremock::MockServer::start().await;
+            mount_filter(&mock, "fast/m", filter_sse("fast/m", &[(&text, None)])).await;
+
+            let events = collect_filter_events(pool, ONE, &mock).await;
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, FilterEvent::AttemptAborted { .. })),
+                "a valid 119-char rewrite serves, same as its 120-char sibling: {events:?}"
+            );
+            let out = served(&events);
+            assert_eq!(joined(&events), text, "one flush at end-of-stream");
+            assert_eq!(out.filtered_text, text);
+            assert_eq!(out.retries_filter, 0);
+        }
+
+        // 10 — the in-loop `Err(e)` arm: a mid-stream transport/parse failure
+        // after emission has already started.
+        #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+        async fn mid_stream_parse_error_after_emit_aborts_with_had_emitted(pool: PgPool) {
+            let mock = wiremock::MockServer::start().await;
+            // Hand-built body: a valid first frame (crosses the emission
+            // threshold), then a line the client's SSE/JSON parser rejects —
+            // no `[DONE]` after it, so the rejection surfaces as an `Err`
+            // item, not a clean EOS.
+            let malformed_body = format!(
+                "data: {}\n\ndata: {{not-json\n\n",
+                serde_json::json!({"choices":[{"delta":{"content": LONG_CLEAN}}]})
+            );
+            mount_filter(&mock, "fast/m", malformed_body).await;
+            mount_filter(
+                &mock,
+                "filt2/m",
+                filter_sse("filt2/m", &[(LONG_CLEAN2, None)]),
+            )
+            .await;
+
+            let events = collect_filter_events(pool, CHAIN, &mock).await;
+            let at = abort_index(&events);
+            assert!(
+                events[..at]
+                    .iter()
+                    .any(|e| matches!(e, FilterEvent::Delta(_))),
+                "the aborted attempt must have emitted first: {events:?}"
+            );
+            assert!(
+                matches!(
+                    events[at],
+                    FilterEvent::AttemptAborted { had_emitted: true }
+                ),
+                "{events:?}"
+            );
+            assert_eq!(
+                joined(&events[at + 1..]),
+                LONG_CLEAN2,
+                "the next model re-runs from scratch and its deltas rebuild its text"
+            );
+            let out = served(&events);
+            assert_eq!(out.retries_filter, 1);
+            assert_eq!(out.attempts.len(), 1, "{:?}", out.attempts);
+            assert_eq!(out.attempts[0].model, "fast/m");
+            // LlmError::StreamParse classifies as AttemptFailure::Gateway
+            // (failure.rs `from_llm_error`), so `failure_pointer` yields
+            // "gateway_error" here, not "upstream_error" — observed empirically.
+            assert_eq!(out.attempts[0].reason, "gateway_error");
+            assert!(
+                out.attempts[0].emitted,
+                "a post-emit failure is recorded as emitted"
+            );
+        }
+    }
+
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn filtered_turn_emits_filtered_and_persists_filtered(pool: PgPool) {
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
@@ -10146,23 +10823,23 @@ data: [DONE]\n\n";
 
         let mock = MockServer::start().await;
         let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"ORIG\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"primary\"}\n\ndata: [DONE]\n\n";
-        // The output filter uses the NON-streaming `execute()` path, so its mock
-        // must return a JSON completion object (choices[].message.content), not
-        // SSE. `model:"fast/m"` makes retries_filter resolve to the primary (0).
+        // `model:"fast/m"` makes retries_filter resolve to the primary (0).
         // The filtered content must be >= MIN_FILTERED_OUTPUT_CHARS (80) chars to
         // pass the validity gate (a real rewrite is always that long).
         let filt_text = "FILT_START 她轻轻地望向窗外，思绪飘向了远方。阳光洒在她的脸上，温柔而明亮。她记得那个夏天的每一天，岁月如流水般逝去，带走了所有的悲欢离合。 FILT_END";
-        let filt_body = serde_json::json!({
-            "id": "gf", "model": "fast/m",
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-            "choices": [{"message": {"content": filt_text}}],
-        });
         // Route the two calls by the MODEL ID present in the request body so the two
         // mocks are MUTUALLY EXCLUSIVE (mount order / precedence cannot matter):
         //   chat call body contains "deepseek/x"; filter call body contains "fast/m".
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("fast/m"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(filt_body))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(
+                        filter_sse("fast/m", &[(filt_text, None)]),
+                        "text/event-stream",
+                    ),
+            )
             .mount(&mock)
             .await;
         Mock::given(wm_path("/api/v1/chat/completions"))
@@ -10238,41 +10915,558 @@ data: [DONE]\n\n";
                 _ => None,
             })
             .collect();
-        if frames
-            .iter()
-            .any(|f| matches!(f, ProtocolFrame::Delta { .. }))
-        {
-            assert!(
-                deltas.contains("FILT_START"),
-                "client must see filtered text, got {deltas:?}"
-            );
-            assert!(
-                !deltas.contains("ORIG"),
-                "original must never reach client, got {deltas:?}"
-            );
-            let (filtered, rc, rf) = frames
+        assert!(
+            frames
                 .iter()
-                .find_map(|f| match f {
-                    ProtocolFrame::Final {
-                        filtered,
-                        retries_chat,
-                        retries_filter,
-                        ..
-                    } => Some((*filtered, *retries_chat, *retries_filter)),
-                    _ => None,
-                })
-                .unwrap();
-            assert!(filtered, "final.filtered must be true");
-            assert_eq!(rc, 0, "primary chat model served");
-            assert_eq!(rf, 0, "primary filter model served");
-            let row = sqlx::query_scalar::<_, String>(
-                "SELECT content FROM engine.chat_messages WHERE session_id=$1 AND role='assistant' ORDER BY sent_at DESC LIMIT 1")
-                .bind(session_id).fetch_one(&pool).await.unwrap();
-            assert!(
-                row.contains("FILT_START"),
-                "persisted content must be the filtered text, got {row:?}"
-            );
+                .any(|f| matches!(f, ProtocolFrame::Delta { .. })),
+            "a filtered-mode turn must emit deltas"
+        );
+        assert!(
+            deltas.contains("FILT_START"),
+            "client must see filtered text, got {deltas:?}"
+        );
+        assert!(
+            !deltas.contains("ORIG"),
+            "original must never reach client, got {deltas:?}"
+        );
+        let (filtered, rc, rf) = frames
+            .iter()
+            .find_map(|f| match f {
+                ProtocolFrame::Final {
+                    filtered,
+                    retries_chat,
+                    retries_filter,
+                    ..
+                } => Some((*filtered, *retries_chat, *retries_filter)),
+                _ => None,
+            })
+            .unwrap();
+        assert!(filtered, "final.filtered must be true");
+        assert_eq!(rc, 0, "primary chat model served");
+        assert_eq!(rf, 0, "primary filter model served");
+        let row = sqlx::query_scalar::<_, String>(
+            "SELECT content FROM engine.chat_messages WHERE session_id=$1 AND role='assistant' ORDER BY sent_at DESC LIMIT 1")
+            .bind(session_id).fetch_one(&pool).await.unwrap();
+        assert!(
+            row.contains("FILT_START"),
+            "persisted content must be the filtered text, got {row:?}"
+        );
+    }
+
+    // ── Burst-level filtered wiring: streamed deltas + supersede frames ──────
+    // These drive a whole `run_stream` burst (not the generator) so the WIRE is
+    // the assertion surface: which bubble each delta rides, the supersede
+    // sequence, `final.filtered` timing, and which id the row lands under.
+
+    /// One filtered-mode burst against `mock`: mounts the chat model (a single
+    /// `ORIG` delta), builds state from `config_toml`, persists a user message
+    /// and collects the frames. Callers mount their own filter-model mocks —
+    /// routed by model id in the body, so mount order cannot matter.
+    async fn filtered_burst(
+        pool: &PgPool,
+        mock: &wiremock::MockServer,
+        config_toml: &str,
+        client_msg_id: &str,
+    ) -> (Vec<ProtocolFrame>, Uuid) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"ORIG\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"deepseek/x\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(config_toml).unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hello there friend",
+                client_msg_id,
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hello there friend".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: None,
+                quote: Default::default(),
+            },
+            None,
+        )
+        .collect()
+        .await;
+        (frames, session_id)
+    }
+
+    /// `fast/m` then `filt2/m`, both filtering every turn.
+    const BURST_CHAIN: &str = "[tasks.chat_companion]\nmodel=\"deepseek/x\"\noutput_filter=true\n\
+         [tasks.chat_output_filter]\nmodel=\"fast/m\"\nfallback=[\"filt2/m\"]\n\
+         filter_prompt=\"REWRITE\"\n";
+
+    /// `fast/m` alone — a one-model chain exhausts into fail-open.
+    const BURST_ONE: &str = "[tasks.chat_companion]\nmodel=\"deepseek/x\"\noutput_filter=true\n\
+         [tasks.chat_output_filter]\nmodel=\"fast/m\"\nfilter_prompt=\"REWRITE\"\n";
+
+    /// Every `Meta` message id, in frame order.
+    fn meta_ids(frames: &[ProtocolFrame]) -> Vec<String> {
+        frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Meta { message_id, .. } => Some(message_id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Concatenated `Delta` content carried by `message_id`.
+    fn deltas_for(frames: &[ProtocolFrame], message_id: &str) -> String {
+        frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta {
+                    message_id: m,
+                    content,
+                } if m == message_id => Some(content.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The frame sequence as kind names, consecutive runs collapsed — the shape
+    /// the spec pins, with delta counts (a streaming detail) factored out.
+    fn frame_shape(frames: &[ProtocolFrame]) -> Vec<&'static str> {
+        let mut out: Vec<&'static str> = Vec::new();
+        for f in frames {
+            let kind = match f {
+                ProtocolFrame::Meta { .. } => "meta",
+                ProtocolFrame::Delta { .. } => "delta",
+                ProtocolFrame::Done { .. } => "done",
+                ProtocolFrame::Final { .. } => "final",
+                ProtocolFrame::Error { .. } => "error",
+                ProtocolFrame::ImageRequest { .. } => "image_request",
+            };
+            if out.last() != Some(&kind) {
+                out.push(kind);
+            }
         }
+        out
+    }
+
+    /// All `Delta` content, whichever bubble it rode.
+    fn all_deltas(frames: &[ProtocolFrame]) -> String {
+        frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `(filtered, retries_filter)` off the `final` frame.
+    fn final_filtered(frames: &[ProtocolFrame]) -> (bool, u32) {
+        frames
+            .iter()
+            .find_map(|f| match f {
+                ProtocolFrame::Final {
+                    filtered,
+                    retries_filter,
+                    ..
+                } => Some((*filtered, *retries_filter)),
+                _ => None,
+            })
+            .expect("a final frame")
+    }
+
+    /// A wire message id (ULID string) as the row id it maps to.
+    fn row_id_of(message_id: &str) -> Uuid {
+        Ulid::from_string(message_id)
+            .unwrap_or_else(|e| panic!("message_id {message_id:?} must be a ULID: {e}"))
+            .into()
+    }
+
+    /// Every assistant row of the session, oldest first.
+    async fn assistant_rows(
+        pool: &PgPool,
+        session_id: Uuid,
+    ) -> Vec<(
+        Uuid,
+        String,
+        Option<serde_json::Value>,
+        Option<serde_json::Value>,
+    )> {
+        sqlx::query_as(
+            "SELECT id, content, metadata, gateway_errors FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant' ORDER BY sent_at ASC",
+        )
+        .bind(session_id)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    // A
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn filtered_supersede_frame_sequence_and_audit(pool: PgPool) {
+        let mock = wiremock::MockServer::start().await;
+        // fast/m streams a full clean rewrite, THEN a content_filter frame —
+        // the post-emit failure the supersede path exists for.
+        mount_filter(
+            &mock,
+            "fast/m",
+            filter_sse(
+                "fast/m",
+                &[(LONG_CLEAN, None), ("", Some("content_filter"))],
+            ),
+        )
+        .await;
+        mount_filter(
+            &mock,
+            "filt2/m",
+            filter_sse("filt2/m", &[(LONG_CLEAN2, None)]),
+        )
+        .await;
+
+        let (frames, session_id) =
+            filtered_burst(&pool, &mock, BURST_CHAIN, "01JSUPERSEDEFRAMESEQ000001").await;
+
+        assert_eq!(
+            frame_shape(&frames),
+            vec!["meta", "delta", "done", "meta", "delta", "done", "final"],
+            "spec §Message lifecycle: the dead bubble's done precedes the fresh meta: {frames:?}"
+        );
+        let metas = meta_ids(&frames);
+        assert_eq!(metas.len(), 2, "one meta per bubble: {frames:?}");
+        let dones: Vec<&ProtocolFrame> = frames
+            .iter()
+            .filter(|f| matches!(f, ProtocolFrame::Done { .. }))
+            .collect();
+        assert_eq!(dones.len(), 2, "meta↔done stays 1:1: {frames:?}");
+
+        match dones[0] {
+            ProtocolFrame::Done {
+                message_id,
+                truncated,
+                usage,
+                generation_id,
+                ..
+            } => {
+                assert_eq!(message_id, &metas[0], "the superseded bubble closes first");
+                assert!(truncated, "a superseded bubble is truncated");
+                assert!(usage.is_none(), "superseded done carries no usage");
+                assert!(
+                    generation_id.is_none(),
+                    "superseded done carries no generation id"
+                );
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+        match dones[1] {
+            ProtocolFrame::Done {
+                message_id,
+                truncated,
+                ..
+            } => {
+                assert_eq!(message_id, &metas[1], "the served bubble closes last");
+                assert!(!truncated, "the served bubble is not truncated");
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+
+        assert_ne!(metas[0], metas[1], "the supersede mints a fresh bubble id");
+        let second_continues = frames
+            .iter()
+            .find_map(|f| match f {
+                ProtocolFrame::Meta {
+                    message_id,
+                    continues_from,
+                    ..
+                } if message_id == &metas[1] => Some(continues_from.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            second_continues.is_none(),
+            "the superseded partial never persisted, so there is nothing to continue from"
+        );
+
+        assert_eq!(
+            deltas_for(&frames, &metas[1]),
+            LONG_CLEAN2,
+            "the second bubble carries the serving model's whole rewrite"
+        );
+        assert!(
+            !deltas_for(&frames, &metas[0]).is_empty(),
+            "the first bubble streamed before it failed"
+        );
+
+        let (filtered, retries_filter) = final_filtered(&frames);
+        assert!(filtered, "a filter delta reached the client");
+        assert_eq!(retries_filter, 1, "the fallback filter model served");
+
+        let rows = assistant_rows(&pool, session_id).await;
+        assert_eq!(rows.len(), 1, "no partial filter text is ever persisted");
+        assert_eq!(rows[0].0, row_id_of(&metas[1]), "the row is the LAST meta");
+        assert_eq!(rows[0].1, LONG_CLEAN2);
+        assert_eq!(
+            rows[0].2.as_ref().unwrap()["filter_attempts"][0],
+            serde_json::json!({
+                "model": "fast/m",
+                "reason": "content_filter",
+                "emitted": true,
+            }),
+        );
+    }
+
+    // B
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn filtered_post_emit_fail_open_replaces_with_original(pool: PgPool) {
+        let mock = wiremock::MockServer::start().await;
+        mount_filter(
+            &mock,
+            "fast/m",
+            filter_sse(
+                "fast/m",
+                &[(LONG_CLEAN, None), ("", Some("content_filter"))],
+            ),
+        )
+        .await;
+
+        let (frames, session_id) =
+            filtered_burst(&pool, &mock, BURST_ONE, "01JPOSTEMITFAILOPEN00001").await;
+
+        assert_eq!(
+            frame_shape(&frames),
+            vec!["meta", "delta", "done", "meta", "delta", "done", "final"],
+            "the fail-open original lands in the fresh bubble: {frames:?}"
+        );
+        let metas = meta_ids(&frames);
+        assert_eq!(metas.len(), 2, "the supersede opens a fail-open bubble");
+        let dones: Vec<&ProtocolFrame> = frames
+            .iter()
+            .filter(|f| matches!(f, ProtocolFrame::Done { .. }))
+            .collect();
+        assert_eq!(dones.len(), 2, "meta↔done stays 1:1: {frames:?}");
+        match dones[0] {
+            ProtocolFrame::Done {
+                message_id,
+                truncated,
+                usage,
+                generation_id,
+                ..
+            } => {
+                assert_eq!(message_id, &metas[0]);
+                assert!(truncated);
+                assert!(usage.is_none());
+                assert!(generation_id.is_none());
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+        match dones[1] {
+            ProtocolFrame::Done {
+                message_id,
+                truncated,
+                ..
+            } => {
+                assert_eq!(message_id, &metas[1]);
+                assert!(!truncated);
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+
+        assert_eq!(
+            deltas_for(&frames, &metas[1]),
+            "ORIG",
+            "chain exhausted after emitting ⇒ the original lands in the FRESH bubble"
+        );
+
+        let (filtered, _) = final_filtered(&frames);
+        assert!(
+            filtered,
+            "the user saw rewritten text before the supersede, so the turn is filtered"
+        );
+
+        let rows = assistant_rows(&pool, session_id).await;
+        assert_eq!(rows.len(), 1, "only the fail-open bubble persists");
+        assert_eq!(rows[0].0, row_id_of(&metas[1]));
+        assert_eq!(rows[0].1, "ORIG");
+        let meta = rows[0].2.as_ref().unwrap();
+        assert_eq!(meta["filter_outcome"], "fail_open");
+        assert_eq!(meta["filter_attempts"][0]["emitted"], true);
+        assert!(
+            !rows.iter().any(|r| r.0 == row_id_of(&metas[0])),
+            "the superseded bubble is absent from history"
+        );
+    }
+
+    // C
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn filtered_pre_emit_walk_has_no_wire_artifacts(pool: PgPool) {
+        let mock = wiremock::MockServer::start().await;
+        // Sub-holdback output: the whole batch gate runs at EOS and walks with
+        // nothing on the wire.
+        mount_filter(&mock, "fast/m", filter_sse("fast/m", &[("太短了", None)])).await;
+        mount_filter(
+            &mock,
+            "filt2/m",
+            filter_sse("filt2/m", &[(LONG_CLEAN, None)]),
+        )
+        .await;
+
+        let (frames, session_id) =
+            filtered_burst(&pool, &mock, BURST_CHAIN, "01JPREEMITWALKNOARTIF001").await;
+
+        let metas = meta_ids(&frames);
+        assert_eq!(metas.len(), 1, "a pre-emit walk leaves no wire trace");
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|f| matches!(f, ProtocolFrame::Done { .. }))
+                .count(),
+            1,
+        );
+        assert_eq!(all_deltas(&frames), LONG_CLEAN);
+
+        let (filtered, retries_filter) = final_filtered(&frames);
+        assert!(filtered);
+        assert_eq!(retries_filter, 1);
+
+        let rows = assistant_rows(&pool, session_id).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].2.as_ref().unwrap()["filter_attempts"][0],
+            serde_json::json!({ "model": "fast/m", "reason": "too_short" }),
+            "`emitted` serializes only when true",
+        );
+    }
+
+    // D
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn filtered_length_finish_is_served(pool: PgPool) {
+        let mock = wiremock::MockServer::start().await;
+        mount_filter(
+            &mock,
+            "fast/m",
+            filter_sse("fast/m", &[(LONG_CLEAN, Some("length"))]),
+        )
+        .await;
+
+        let (frames, _session_id) =
+            filtered_burst(&pool, &mock, BURST_ONE, "01JLENGTHFINISHSERVED001").await;
+
+        assert_eq!(meta_ids(&frames).len(), 1, "a length cut is not a failure");
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|f| matches!(f, ProtocolFrame::Done { .. }))
+                .count(),
+            1,
+        );
+        assert_eq!(all_deltas(&frames), LONG_CLEAN);
+        let (filtered, retries_filter) = final_filtered(&frames);
+        assert!(filtered);
+        assert_eq!(retries_filter, 0, "the primary filter model served");
+    }
+
+    // E — real wall-clock test (~16s): the filter deadline is a live timer.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn filtered_pre_emit_timeout_walks(pool: PgPool) {
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let mock = wiremock::MockServer::start().await;
+        // Headers never arrive inside FILTER_TIMEOUT, so the attempt dies before
+        // a single byte could be emitted.
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("fast/m"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(FILTER_TIMEOUT + std::time::Duration::from_secs(1)),
+            )
+            .mount(&mock)
+            .await;
+        mount_filter(
+            &mock,
+            "filt2/m",
+            filter_sse("filt2/m", &[(LONG_CLEAN, None)]),
+        )
+        .await;
+
+        let (frames, session_id) =
+            filtered_burst(&pool, &mock, BURST_CHAIN, "01JPREEMITTIMEOUTWALK001").await;
+
+        assert_eq!(
+            meta_ids(&frames).len(),
+            1,
+            "a pre-emit expiry shows nothing"
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|f| matches!(f, ProtocolFrame::Done { .. }))
+                .count(),
+            1,
+        );
+        assert_eq!(all_deltas(&frames), LONG_CLEAN);
+
+        let rows = assistant_rows(&pool, session_id).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].2.as_ref().unwrap()["filter_attempts"][0],
+            serde_json::json!({ "model": "fast/m", "reason": "gateway_error" }),
+        );
+        let gateways = rows[0]
+            .3
+            .as_ref()
+            .expect("the expiry must reach the gateway_errors column");
+        assert!(
+            gateways
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|g| g["kind"] == "total_timeout" && g["model"] == "fast/m"),
+            "the filter deadline records as TotalTimeout: {gateways}",
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -10363,31 +11557,32 @@ data: [DONE]\n\n";
                 _ => None,
             })
             .collect();
-        if frames
-            .iter()
-            .any(|f| matches!(f, ProtocolFrame::Delta { .. }))
-        {
-            assert!(
-                deltas.contains("ORIG"),
-                "fail-open must emit original, got {deltas:?}"
-            );
-            assert!(
-                !deltas.contains("FILT"),
-                "no filtered text on fail-open, got {deltas:?}"
-            );
-            let filtered = frames
+        assert!(
+            frames
                 .iter()
-                .find_map(|f| match f {
-                    ProtocolFrame::Final { filtered, .. } => Some(*filtered),
-                    _ => None,
-                })
-                .unwrap();
-            assert!(!filtered, "final.filtered must be false on fail-open");
-            let row = sqlx::query_scalar::<_, String>(
-                "SELECT content FROM engine.chat_messages WHERE session_id=$1 AND role='assistant' ORDER BY sent_at DESC LIMIT 1")
-                .bind(session_id).fetch_one(&pool).await.unwrap();
-            assert_eq!(row, "ORIG");
-        }
+                .any(|f| matches!(f, ProtocolFrame::Delta { .. })),
+            "a filtered-mode turn must emit deltas"
+        );
+        assert!(
+            deltas.contains("ORIG"),
+            "fail-open must emit original, got {deltas:?}"
+        );
+        assert!(
+            !deltas.contains("FILT"),
+            "no filtered text on fail-open, got {deltas:?}"
+        );
+        let filtered = frames
+            .iter()
+            .find_map(|f| match f {
+                ProtocolFrame::Final { filtered, .. } => Some(*filtered),
+                _ => None,
+            })
+            .unwrap();
+        assert!(!filtered, "final.filtered must be false on fail-open");
+        let row = sqlx::query_scalar::<_, String>(
+            "SELECT content FROM engine.chat_messages WHERE session_id=$1 AND role='assistant' ORDER BY sent_at DESC LIMIT 1")
+            .bind(session_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(row, "ORIG");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -10406,25 +11601,30 @@ data: [DONE]\n\n";
 
         // Both filter models return a refusal — Chinese phrase caught by the
         // head-pattern gate.
-        let refusal_body_1 = serde_json::json!({
-            "id": "gf1", "model": "filter-1",
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-            "choices": [{"message": {"content": "抱歉，我无法协助完成您的请求。"}}],
-        });
-        let refusal_body_2 = serde_json::json!({
-            "id": "gf2", "model": "filter-2",
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-            "choices": [{"message": {"content": "抱歉，我无法协助完成您的请求。"}}],
-        });
+        let refusal = "抱歉，我无法协助完成您的请求。";
 
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("filter-1"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(refusal_body_1))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(
+                        filter_sse("filter-1", &[(refusal, None)]),
+                        "text/event-stream",
+                    ),
+            )
             .mount(&mock)
             .await;
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("filter-2"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(refusal_body_2))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(
+                        filter_sse("filter-2", &[(refusal, None)]),
+                        "text/event-stream",
+                    ),
+            )
             .mount(&mock)
             .await;
         Mock::given(wm_path("/api/v1/chat/completions"))
@@ -10494,68 +11694,68 @@ data: [DONE]\n\n";
         .collect()
         .await;
 
-        // Only run assertions when PDE chose Reply (not Ghost).
-        if frames
+        assert!(
+            frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Delta { .. })),
+            "a filtered-mode turn must emit deltas"
+        );
+        // Client must see the original, not the refusals.
+        let deltas: String = frames
             .iter()
-            .any(|f| matches!(f, ProtocolFrame::Delta { .. }))
-        {
-            // Client must see the original, not the refusals.
-            let deltas: String = frames
-                .iter()
-                .filter_map(|f| match f {
-                    ProtocolFrame::Delta { content, .. } => Some(content.clone()),
-                    _ => None,
-                })
-                .collect();
-            assert!(
-                deltas.contains("ORIG"),
-                "fail-open must emit original, got {deltas:?}"
-            );
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            deltas.contains("ORIG"),
+            "fail-open must emit original, got {deltas:?}"
+        );
 
-            // final.filtered must be false (we failed open).
-            let filtered = frames
-                .iter()
-                .find_map(|f| match f {
-                    ProtocolFrame::Final { filtered, .. } => Some(*filtered),
-                    _ => None,
-                })
-                .unwrap();
-            assert!(!filtered, "final.filtered must be false on fail-open");
-
-            // The persisted row must carry the fail-open audit in metadata.
-            let metadata: serde_json::Value = sqlx::query_scalar(
-                "SELECT metadata FROM engine.chat_messages \
-                 WHERE session_id=$1 AND role='assistant' ORDER BY sent_at DESC LIMIT 1",
-            )
-            .bind(session_id)
-            .fetch_one(&pool)
-            .await
+        // final.filtered must be false (we failed open).
+        let filtered = frames
+            .iter()
+            .find_map(|f| match f {
+                ProtocolFrame::Final { filtered, .. } => Some(*filtered),
+                _ => None,
+            })
             .unwrap();
+        assert!(!filtered, "final.filtered must be false on fail-open");
 
+        // The persisted row must carry the fail-open audit in metadata.
+        let metadata: serde_json::Value = sqlx::query_scalar(
+            "SELECT metadata FROM engine.chat_messages \
+             WHERE session_id=$1 AND role='assistant' ORDER BY sent_at DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            metadata["filter_outcome"], "fail_open",
+            "metadata.filter_outcome must be 'fail_open', got {metadata}"
+        );
+        let attempts = metadata["filter_attempts"].as_array().unwrap();
+        assert_eq!(
+            attempts.len(),
+            2,
+            "both filter models must be recorded in filter_attempts, got {attempts:?}"
+        );
+        // Both should have reason=refusal_pattern.
+        for attempt in attempts {
             assert_eq!(
-                metadata["filter_outcome"], "fail_open",
-                "metadata.filter_outcome must be 'fail_open', got {metadata}"
-            );
-            let attempts = metadata["filter_attempts"].as_array().unwrap();
-            assert_eq!(
-                attempts.len(),
-                2,
-                "both filter models must be recorded in filter_attempts, got {attempts:?}"
-            );
-            // Both should have reason=refusal_pattern.
-            for attempt in attempts {
-                assert_eq!(
-                    attempt["reason"], "refusal_pattern",
-                    "expected refusal_pattern reason, got {attempt}"
-                );
-            }
-            // f_client_msg_id must be present and start with "f_".
-            let fid = metadata["f_client_msg_id"].as_str().unwrap();
-            assert!(
-                fid.starts_with("f_"),
-                "f_client_msg_id must start with 'f_', got {fid}"
+                attempt["reason"], "refusal_pattern",
+                "expected refusal_pattern reason, got {attempt}"
             );
         }
+        // f_client_msg_id must be present and start with "f_".
+        let fid = metadata["f_client_msg_id"].as_str().unwrap();
+        assert!(
+            fid.starts_with("f_"),
+            "f_client_msg_id must start with 'f_', got {fid}"
+        );
     }
 
     /// Today `filter_attempts` appears only on fail-open, so a filter chain
@@ -10588,14 +11788,19 @@ data: [DONE]\n\n";
             )
             .mount(&mock)
             .await;
-        // The output filter uses the non-streaming `execute()` path; its text
-        // must clear MIN_FILTERED_OUTPUT_CHARS to pass the validity gate.
+        // The output filter's text must clear MIN_FILTERED_OUTPUT_CHARS to pass
+        // the validity gate.
         let filt_text = "clean text 她轻轻地望向窗外，思绪飘向了远方。阳光洒在她的脸上，温柔而明亮。她记得那个夏天的每一天，岁月如流水般逝去，带走了所有的悲欢离合。多说几句话让它足够长。";
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("filt/fallback"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
-                r#"{{"choices":[{{"message":{{"content":"{filt_text}"}}}}]}}"#
-            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(
+                        filter_sse("filt/fallback", &[(filt_text, None)]),
+                        "text/event-stream",
+                    ),
+            )
             .mount(&mock)
             .await;
 
@@ -10694,15 +11899,17 @@ data: [DONE]\n\n";
         let mock = MockServer::start().await;
         let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"ORIG\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"primary\"}\n\ndata: [DONE]\n\n";
         let filt_text = "FILT_OK 她轻轻地望向窗外，思绪飘向了远方。阳光洒在她的脸上，温柔而明亮。她记得那个夏天的每一天，岁月如流水般逝去，带走了所有的悲欢离合。 FILT_OK_END";
-        let filt_body = serde_json::json!({
-            "id": "gf", "model": "fast/m",
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-            "choices": [{"message": {"content": filt_text}}],
-        });
 
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("fast/m"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(filt_body))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(
+                        filter_sse("fast/m", &[(filt_text, None)]),
+                        "text/event-stream",
+                    ),
+            )
             .mount(&mock)
             .await;
         Mock::given(wm_path("/api/v1/chat/completions"))
@@ -10771,34 +11978,35 @@ data: [DONE]\n\n";
         .collect()
         .await;
 
-        if frames
-            .iter()
-            .any(|f| matches!(f, ProtocolFrame::Delta { .. }))
-        {
-            // Filter succeeded — no fail-open audit keys must appear.
-            let metadata: serde_json::Value = sqlx::query_scalar(
-                "SELECT metadata FROM engine.chat_messages \
-                 WHERE session_id=$1 AND role='assistant' ORDER BY sent_at DESC LIMIT 1",
-            )
-            .bind(session_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        assert!(
+            frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Delta { .. })),
+            "a filtered-mode turn must emit deltas"
+        );
+        // Filter succeeded — no fail-open audit keys must appear.
+        let metadata: serde_json::Value = sqlx::query_scalar(
+            "SELECT metadata FROM engine.chat_messages \
+             WHERE session_id=$1 AND role='assistant' ORDER BY sent_at DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
 
-            assert!(
-                metadata.get("filter_outcome").is_none(),
-                "successful filter must not write filter_outcome, got {metadata}"
-            );
-            assert!(
-                metadata.get("filter_attempts").is_none(),
-                "successful filter must not write filter_attempts, got {metadata}"
-            );
-            // prompt_traits must still be present.
-            assert!(
-                metadata.get("prompt_traits").is_some(),
-                "prompt_traits must still be present, got {metadata}"
-            );
-        }
+        assert!(
+            metadata.get("filter_outcome").is_none(),
+            "successful filter must not write filter_outcome, got {metadata}"
+        );
+        assert!(
+            metadata.get("filter_attempts").is_none(),
+            "successful filter must not write filter_attempts, got {metadata}"
+        );
+        // prompt_traits must still be present.
+        assert!(
+            metadata.get("prompt_traits").is_some(),
+            "prompt_traits must still be present, got {metadata}"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -11097,36 +12305,37 @@ data: [DONE]\n\n";
                 _ => None,
             })
             .collect();
-        if frames
+        assert!(
+            frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Delta { .. })),
+            "a filtered-mode turn must emit deltas"
+        );
+        assert_eq!(
+            deltas, "ORIG",
+            "models-miss must emit only the original, got {deltas:?}"
+        );
+        let filtered = frames
             .iter()
-            .any(|f| matches!(f, ProtocolFrame::Delta { .. }))
-        {
-            assert_eq!(
-                deltas, "ORIG",
-                "models-miss must emit only the original, got {deltas:?}"
-            );
-            let filtered = frames
-                .iter()
-                .find_map(|f| match f {
-                    ProtocolFrame::Final { filtered, .. } => Some(*filtered),
-                    _ => None,
-                })
-                .unwrap();
-            assert!(
-                !filtered,
-                "final.filtered must be false when models predicate misses"
-            );
-            let meta_count = frames
-                .iter()
-                .filter(|f| matches!(f, ProtocolFrame::Meta { .. }))
-                .count();
-            let done_count = frames
-                .iter()
-                .filter(|f| matches!(f, ProtocolFrame::Done { .. }))
-                .count();
-            assert_eq!(meta_count, 1, "exactly one Meta frame");
-            assert_eq!(done_count, 1, "exactly one Done frame");
-        }
+            .find_map(|f| match f {
+                ProtocolFrame::Final { filtered, .. } => Some(*filtered),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            !filtered,
+            "final.filtered must be false when models predicate misses"
+        );
+        let meta_count = frames
+            .iter()
+            .filter(|f| matches!(f, ProtocolFrame::Meta { .. }))
+            .count();
+        let done_count = frames
+            .iter()
+            .filter(|f| matches!(f, ProtocolFrame::Done { .. }))
+            .count();
+        assert_eq!(meta_count, 1, "exactly one Meta frame");
+        assert_eq!(done_count, 1, "exactly one Done frame");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -15480,16 +16689,19 @@ data: [DONE]\n\n";
             )
             .mount(&mock)
             .await;
-        // The output filter uses the non-streaming `execute()` path; its text
-        // must clear MIN_FILTERED_OUTPUT_CHARS to pass the validity gate.
+        // The output filter's text must clear MIN_FILTERED_OUTPUT_CHARS to pass
+        // the validity gate.
         let filt_text = "FILT_START 她轻轻地望向窗外，思绪飘向了远方。阳光洒在她的脸上，温柔而明亮。她记得那个夏天的每一天，岁月如流水般逝去，带走了所有的悲欢离合。 FILT_END";
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("fast/m"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "gf", "model": "fast/m",
-                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-                "choices": [{"message": {"content": filt_text}}],
-            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(
+                        filter_sse("fast/m", &[(filt_text, None)]),
+                        "text/event-stream",
+                    ),
+            )
             .mount(&mock)
             .await;
 
@@ -17723,7 +18935,7 @@ data: [DONE]\n\n";
         let cleaned_reply = "晚安宝贝";
         let artifact = "你的照片"; // the bracket payload, never in cleaned
 
-        // ── 1. Dual mock: chat model (SSE) + filter model (JSON). ──────────────
+        // ── 1. Dual mock: chat model + filter model, both SSE. ─────────────────
         let mock = MockServer::start().await;
         // Chat model "mock/euryale" streams the artifact-carrying reply.
         let chat_body = format!(
@@ -17735,15 +18947,17 @@ data: [DONE]\n\n"
         // Filter model "fast/m" returns a >= MIN_FILTERED_OUTPUT_CHARS (80) rewrite
         // (a real rewrite is always that long) so it passes the validity gate.
         let filt_text = "FILT_START 她轻轻地望向窗外，思绪飘向了远方。阳光洒在她的脸上，温柔而明亮。她记得那个夏天的每一天，岁月如流水般逝去，带走了所有的悲欢离合。 FILT_END";
-        let filt_body = serde_json::json!({
-            "id": "gf", "model": "fast/m",
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-            "choices": [{"message": {"content": filt_text}}],
-        });
         // Mutually-exclusive routing by model id in the request body.
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("fast/m"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(filt_body))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(
+                        filter_sse("fast/m", &[(filt_text, None)]),
+                        "text/event-stream",
+                    ),
+            )
             .mount(&mock)
             .await;
         Mock::given(wm_path("/api/v1/chat/completions"))
@@ -17971,7 +19185,7 @@ data: [DONE]\n\n"
 
         let raw_reply = "[你的照片：海边自拍]"; // artifact-only
 
-        // ── 1. Dual mock: chat model (SSE, artifact-only) + filter model (JSON). ─
+        // ── 1. Dual mock: chat model (artifact-only) + filter model, both SSE. ──
         let mock = MockServer::start().await;
         let chat_body = format!(
             "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{raw_reply}\"}}}}],\
@@ -17982,14 +19196,16 @@ data: [DONE]\n\n"
         // The filter model WOULD return a valid (>=80 char) rewrite if called —
         // proving that, absent the skip, an empty reply resurrects a bubble.
         let filt_text = "FILT_START 她轻轻地望向窗外，思绪飘向了远方。阳光洒在她的脸上，温柔而明亮。她记得那个夏天的每一天，岁月如流水般逝去，带走了所有的悲欢离合。 FILT_END";
-        let filt_body = serde_json::json!({
-            "id": "gf", "model": "fast/m",
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-            "choices": [{"message": {"content": filt_text}}],
-        });
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("fast/m"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(filt_body))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(
+                        filter_sse("fast/m", &[(filt_text, None)]),
+                        "text/event-stream",
+                    ),
+            )
             .mount(&mock)
             .await;
         Mock::given(wm_path("/api/v1/chat/completions"))

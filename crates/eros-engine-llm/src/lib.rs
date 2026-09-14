@@ -8,6 +8,7 @@ pub mod failure;
 pub mod model_config;
 pub mod openrouter;
 pub mod provider;
+pub mod stream_clean;
 pub mod stream_scrub;
 pub mod voyage;
 

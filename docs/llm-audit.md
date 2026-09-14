@@ -494,6 +494,35 @@ a `data:` frame that fails to parse is raw provider output and may hold reply
 text, so the frame stays in the log line and the recorded message names only
 what broke. Read the log when you need the bytes.
 
+### `filter_attempts` element
+
+Written to `chat_messages.metadata.filter_attempts[]` whenever any LLM
+`output_filter` attempt failed validity, transport, or timeout — not only on
+fail-open — so a chain that ultimately recovered still shows why an earlier
+model was walked past.
+
+```jsonc
+{
+  "model": "google/gemini-3.1-flash",
+  "reason": "content_filter",
+  "emitted": true
+}
+```
+
+`model` and `reason` are always present; `emitted` is serialized only when
+`true`. `reason` is one of the four content verdicts shared with the output
+validity gate (`content_filter`, `refusal_pattern`, `too_short`, `empty`) or
+one of the two pointer values (`upstream_error`, `gateway_error`) naming
+which of `llm_attempts` / `gateway_errors` holds the transport detail.
+
+`emitted: true` marks an attempt that handed at least one non-empty delta to
+the turn's frame channel before it failed — the channel is detached and
+unbounded, so this shows an emission was attempted, not that the client
+received or rendered it. In practice it means the user saw a rewritten bubble
+that was then superseded by the next attempt (or by the fail-open original).
+Its absence means the attempt failed before emitting anything client-visible.
+Two attempts sharing the same `reason` differ materially on this key.
+
 ### The `task` discriminator
 
 `engine.chat_messages` hosts three call sites in one pair of columns; each

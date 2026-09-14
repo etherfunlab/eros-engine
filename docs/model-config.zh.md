@@ -389,6 +389,16 @@ Per-tier 子表（`[tasks.chat_output_filter.tiers.<tier>]`）可以覆盖 `mode
 | `"after_extract"` *（默认）* | 原始（filter 前）文本 | Memory/insight/affinity 读取未修改的回复；仅改写后的文本会交付客户端并持久化到 `chat_messages`。 |
 | `"before_extract"` | 过滤后文本 | Extract 也会读取改写后的文本。当 filter 对内容进行规范化且 extract pipeline 应反映该变化时使用。 |
 
+#### 交付方式
+
+过滤后的回复是逐步流给客户端的，不是最后一次性给一整块。引擎会先把 filter
+模型输出的前 120 个字符攒住（如果流提前结束就用整段），像对一段完整回复那样
+检查这段开头有没有拒答，通过之后才开始发 `delta` 帧——检查通过之前客户端
+什么都收不到。如果某次尝试已经吐出文本之后才失败，本轮会用下一次尝试（或 fail-open 的
+原文）起一个新气泡顶替它，而不是接着写旧的——具体帧序列见
+[api-reference.zh.md](api-reference.zh.md#post-compchatsession_idmessagestream)。
+这套攒字与顶替都是内部机制；客户端体验不到过滤轮次和普通流式回复有什么区别。
+
 **Fail-open：**如果 filter LLM 调用超时或返回错误，引擎会原样交付**原始**回复（filter 绝不会阻塞 chat 响应）。
 
 #### 存储和显示的内容
