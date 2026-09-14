@@ -15,9 +15,11 @@ prompt 里塞入自定义段落。
 }
 ```
 
-接受于 `POST /comp/chat/{session_id}/message/stream` 与
-`POST /v2/comp/session/{session_id}/message/async`；走 async 端点时，
-trait 随队列传递，由 worker 重新校验。
+接受于 `POST /comp/chat/{session_id}/message/stream`、
+`POST /v2/comp/session/{session_id}/message/async`（走 async 端点时，
+trait 随队列传递，由 worker 重新校验）与
+`POST /v2/comp/session/{session_id}/message/{message_id}/image/edit`
+（作用于 `reply_with_text` 的文本半边）。
 
 ## 引擎会做什么
 
