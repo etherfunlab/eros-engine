@@ -1924,6 +1924,25 @@ fn run_output_filter(
                         };
                         match item {
                             Ok(c) => {
+                                // Bookkeeping first: the terminating frame often
+                                // carries the usage and id the audit row needs,
+                                // and an aborted attempt records too.
+                                if c.usage.is_some() { last_usage = c.usage; }
+                                if c.generation_id.is_some() { last_gen_id = c.generation_id; }
+                                if c.model.is_some() { model_echo = c.model; }
+                                if c.finish_reason.is_some() { finish = c.finish_reason; }
+                                // Judged BEFORE this chunk's content is pushed: a
+                                // safety-blocked generation usually terminates with
+                                // content and finish_reason in the SAME frame, and
+                                // batch — holding the whole output — walked silently.
+                                // Pushing first would show text batch never showed
+                                // (spec invariant 2). "length" is NOT a failure here:
+                                // the batch gate never rejected a length-cut rewrite
+                                // (spec table).
+                                if finish.as_deref() == Some("content_filter") {
+                                    abort_reason = Some("content_filter");
+                                    break;
+                                }
                                 if let Some(content) = c.content {
                                     cleaner.push(&content);
                                     let stable = cleaner.stable();
@@ -1938,16 +1957,6 @@ fn run_output_filter(
                                         yield FilterEvent::Delta(stable[emitted_len..].to_string());
                                         emitted_len = stable.len();
                                     }
-                                }
-                                if c.usage.is_some() { last_usage = c.usage; }
-                                if c.generation_id.is_some() { last_gen_id = c.generation_id; }
-                                if c.model.is_some() { model_echo = c.model; }
-                                if c.finish_reason.is_some() { finish = c.finish_reason; }
-                                // "length" is NOT a failure here: the batch gate
-                                // never rejected a length-cut rewrite (spec table).
-                                if finish.as_deref() == Some("content_filter") {
-                                    abort_reason = Some("content_filter");
-                                    break;
                                 }
                             }
                             Err(e) => {
@@ -10525,6 +10534,56 @@ data: [DONE]\n\n";
             assert!(
                 out.attempts[0].emitted,
                 "a post-emit failure is recorded as emitted"
+            );
+        }
+
+        // 4b
+        #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+        async fn same_chunk_content_filter_walks_without_emitting(pool: PgPool) {
+            // Gemini / OpenAI-compat endpoints usually terminate a safety-blocked
+            // generation with content and finish_reason in ONE frame. Batch held
+            // the whole output and walked silently; so must this (invariant 2),
+            // even though the text alone would clear the emission threshold.
+            let mock = wiremock::MockServer::start().await;
+            mount_filter(
+                &mock,
+                "fast/m",
+                filter_sse("fast/m", &[(LONG_CLEAN, Some("content_filter"))]),
+            )
+            .await;
+            mount_filter(
+                &mock,
+                "filt2/m",
+                filter_sse("filt2/m", &[(LONG_CLEAN2, None)]),
+            )
+            .await;
+
+            let events = collect_filter_events(pool, CHAIN, &mock).await;
+            let at = abort_index(&events);
+            assert!(
+                !events[..at]
+                    .iter()
+                    .any(|e| matches!(e, FilterEvent::Delta(_))),
+                "a content_filter frame must abort before its own content is \
+                 emitted: {events:?}"
+            );
+            assert!(
+                matches!(
+                    events[at],
+                    FilterEvent::AttemptAborted { had_emitted: false }
+                ),
+                "{events:?}"
+            );
+            let out = served(&events);
+            assert_eq!(out.retries_filter, 1);
+            assert_eq!(out.attempts.len(), 1, "{:?}", out.attempts);
+            assert_eq!(out.attempts[0].model, "fast/m");
+            assert_eq!(out.attempts[0].reason, "content_filter");
+            assert!(!out.attempts[0].emitted);
+            assert_eq!(
+                serde_json::to_value(&out.attempts[0]).unwrap(),
+                serde_json::json!({"model": "fast/m", "reason": "content_filter"}),
+                "a silent walk carries no `emitted` key"
             );
         }
 
