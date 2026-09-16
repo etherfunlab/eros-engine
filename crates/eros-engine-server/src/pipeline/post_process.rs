@@ -942,7 +942,6 @@ async fn evaluate_affinity(
         max_tokens: resolved.max_tokens,
         sampling: resolved.sampling,
         user: audit_user.map(String::from),
-        reasoning: resolved.reasoning,
         task: Some(AFFINITY_TASK.into()),
         ..Default::default()
     };
@@ -1067,7 +1066,6 @@ async fn summarize_feeling(
         max_tokens: resolved.max_tokens,
         sampling: resolved.sampling,
         user: audit_user.map(String::from),
-        reasoning: resolved.reasoning,
         task: Some(SUMMARY_TASK.into()),
         ..Default::default()
     };
@@ -1281,7 +1279,6 @@ async fn extract_facts(
         max_tokens: resolved.max_tokens,
         sampling: resolved.sampling,
         user: audit_user.map(String::from),
-        reasoning: resolved.reasoning,
         task: Some(INSIGHT_TASK.into()),
         ..Default::default()
     };
@@ -1383,7 +1380,6 @@ async fn extract_structured_insights(
         max_tokens: resolved.max_tokens,
         sampling: resolved.sampling,
         user: audit_user.map(String::from),
-        reasoning: resolved.reasoning,
         task: Some(INSIGHT_STRUCTURING_TASK.into()),
         ..Default::default()
     };
@@ -1610,7 +1606,6 @@ async fn extract_character_facts(
         max_tokens: resolved.max_tokens,
         sampling: resolved.sampling,
         user: audit_user.map(String::from),
-        reasoning: resolved.reasoning,
         task: Some(CHARACTER_EXTRACTION_TASK.into()),
         ..Default::default()
     };
@@ -1700,7 +1695,6 @@ async fn structure_character_insights(
         max_tokens: resolved.max_tokens,
         sampling: resolved.sampling,
         user: audit_user.map(String::from),
-        reasoning: resolved.reasoning,
         task: Some(CHARACTER_STRUCTURING_TASK.into()),
         ..Default::default()
     };
@@ -1928,7 +1922,6 @@ async fn extract_user_facts(
         max_tokens: resolved.max_tokens,
         sampling: resolved.sampling,
         user: audit_user.map(String::from),
-        reasoning: resolved.reasoning,
         task: Some(USER_EXTRACTION_TASK.into()),
         ..Default::default()
     };
@@ -2012,7 +2005,6 @@ async fn structure_user_insights(
         max_tokens: resolved.max_tokens,
         sampling: resolved.sampling,
         user: audit_user.map(String::from),
-        reasoning: resolved.reasoning,
         task: Some(USER_STRUCTURING_TASK.into()),
         ..Default::default()
     };

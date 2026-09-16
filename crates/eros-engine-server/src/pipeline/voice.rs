@@ -707,7 +707,6 @@ pub fn run_voice_turn(
             temperature: resolved.temperature as f32,
             max_tokens: resolved.max_tokens,
             sampling: resolved.sampling,
-            reasoning: resolved.reasoning.clone(),
             task: Some("chat_voice".into()),
             ..Default::default()
         };

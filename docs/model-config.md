@@ -177,8 +177,7 @@ Rules, all enforced at boot (the engine refuses to boot on any violation):
   `output_regex` `models`, and `output_filter` trigger `models` match on the
   id *without* `@provider`.
 - **Wire shape**: custom providers receive a strict OpenAI-compatible
-  subset. Per-task `reasoning` is **inert** on custom providers — they
-  receive exactly this entry's own declared `headers` and any
+  subset plus exactly this entry's own declared `headers` and any
   `[[providers.<name>.body]]` rules declared on that same entry (see
   below), never the OpenRouter attribution headers.
 - **Audit**: rows served by a custom provider record
@@ -204,10 +203,10 @@ headers    = { "HTTP-Referer" = "https://eros.example", "X-OpenRouter-Title" = "
   error when referenced, because there is no built-in default to fall back
   to.
 - The override changes the URL **only**. Traffic through it remains the
-  full OpenRouter wire: per-task `reasoning` is still sent, and any
+  full OpenRouter wire (`session_id`, `metadata`), and any
   `[[providers.openrouter.body]]` rules (see below) merge into the request
   body — unlike custom providers, which keep receiving the strict OpenAI
-  subset with `reasoning` inert.
+  subset.
 - **Attribution headers now live here, and nowhere else.** No
   `[providers.openrouter]` entry, or one without `headers`, means no
   attribution headers are sent. The `OPENROUTER_APP_REFERER` /
@@ -231,11 +230,25 @@ interprets it. `tasks` scopes the rule to specific engine task names
 (exact, case-sensitive; see the task table below); omit it to apply to
 every task this provider serves. Rules apply in declaration order,
 later rules win on key conflicts, and merged params win over engine-built
-fields — declaring `reasoning` on the `openrouter` entry therefore
-overrides `[tasks.*].reasoning` for the scoped tasks. This is not special to
-`reasoning`: **every** engine-built wire field loses to a body param —
+fields: **every** engine-built wire field loses to a body param —
 `temperature`, `max_tokens`, and the four sampling knobs (`top_p`,
 `frequency_penalty`, `presence_penalty`, `repetition_penalty`) included.
+
+Reasoning control is a body rule and nothing else — there is no per-task
+`reasoning` key (a `[tasks.*].reasoning` key refuses to boot with the
+replacement spelled out). The example switches it off for `chat_companion`,
+whose replies only render `content`:
+
+```toml
+[[providers.openrouter.body]]
+tasks  = ["chat_companion"]
+params = { reasoning = { enabled = false } }
+```
+
+`params.reasoning` is OpenRouter's own `reasoning` object, passed through
+verbatim — `{ exclude = true }` keeps it generated but hidden, `{ effort =
+"low" }` and friends work the same way. Omit `tasks` to apply it to every
+task on the provider; tiers inherit whatever their task gets.
 `model`, `messages`,
 and `stream` are engine-owned and refuse to boot. A rule naming `embedding`
 warns and never applies (that call builds its own body and takes no
@@ -284,8 +297,7 @@ it with `tasks` if you want routing prefs on chat only.
 
 `chat_vision` is covered even though it is not a chat/completions task: its
 describe call builds its own body, but that body runs through the same
-merge, so a knob the `reasoning` object cannot express still reaches the
-vision pre-stage.
+merge, so a rule reaches the vision pre-stage too.
 
 ```toml
 [[providers.openrouter.body]]
@@ -294,11 +306,11 @@ params = { reasoning_effort = "none" }
 ```
 
 This matters because some models ignore `reasoning = { enabled = false }`,
-reason anyway, and bill for it — and `reasoning_effort` is a separate
-top-level field, not part of the `reasoning` object, so `[tasks.*].reasoning`
-cannot express it. Vision's `messages` is a block array (text +
-`image_url`) rather than the chat shape, but `messages` is engine-owned and
-refused at boot, so no rule can flatten it.
+reason anyway, and bill for it — `reasoning_effort` is a separate top-level
+field, not part of the `reasoning` object, and a body rule carries both.
+Vision's `messages` is a block array (text + `image_url`) rather than the
+chat shape, but `messages` is engine-owned and refused at boot, so no rule
+can flatten it.
 
 ### `model_name_display_override` (chat task only)
 
@@ -552,8 +564,7 @@ refusal leaves the original input untouched. Pick a fast, cheap model — at
 #### `[tasks.chat_input_filter]` fields
 
 Reuses the standard task shape: `model`, `fallback`, `retry_depth` (default 1),
-`temperature`, `max_tokens`, `filter_prompt`, `reasoning` (default off in the
-example). `trigger`, `timing`, `tiers`, and `allow_traits` are ignored (the
+`temperature`, `max_tokens`, `filter_prompt`. `trigger`, `timing`, `tiers`, and `allow_traits` are ignored (the
 input filter has no triggers, timing, or tiers).
 
 ## Task names
@@ -718,7 +729,6 @@ fallback     = ["google/gemini-3.1-flash-lite"]
 retry_depth  = 1
 temperature  = 0.7
 max_tokens   = 700
-# reasoning  = { enabled = false }
 # filter_prompt is OPTIONAL — omit to use the built-in default (below):
 # filter_prompt = """…override…"""
 ```
@@ -734,7 +744,6 @@ max_tokens   = 700
 | `frequency_penalty` | `f32` | absent | OpenAI-style frequency penalty, `[-2.0, 2.0]`. Omitted when unset. |
 | `presence_penalty` | `f32` | absent | OpenAI-style presence penalty, `[-2.0, 2.0]`. Omitted when unset. |
 | `repetition_penalty` | `f32` | absent | Repetition penalty, `(0.0, 2.0]` (`1.0` = no-op). Omitted when unset. |
-| `reasoning` | table | absent | Optional reasoning control forwarded to OpenRouter. |
 | `filter_prompt` | `String` \| `Array<String>` \| `Table<String, String>` | **built-in default** | **Optional** (unlike other tasks). Blank/absent ⇒ the engine's built-in `DEFAULT_COMPOSE_PROMPT`. See **variants** below for the array/table shapes. |
 
 **Built-in default prompt.** Unlike every other task (whose prompt must come from
@@ -843,7 +852,7 @@ Powers `POST
 turn and an instruction ("换套衣服"), and this task composes a new image
 prompt from that picture's subject plus the instruction. Same shape as
 `[tasks.chat_image_prompt_compose]` above (`model`, `fallback`,
-`retry_depth`, `temperature`, `max_tokens`, `reasoning`, sampling knobs), and
+`retry_depth`, `temperature`, `max_tokens`, sampling knobs), and
 `filter_prompt` is likewise **optional** and accepts the same three shapes
 (plain / array-by-index / table-by-key), selected per request via
 `prompt_variant` on the edit body.
@@ -880,9 +889,9 @@ first fallback). Pick a vision-capable model; the example uses
 `google/gemini-3.1-flash-lite`.
 
 Wire parameters beyond this block's own keys reach the describe call through
-`[[providers.<name>.body]]` rules scoped to `tasks = ["chat_vision"]` — the
-route for anything the `reasoning` object cannot express, `reasoning_effort`
-included. See "`[[providers.<name>.body]]` — custom body parameters" above.
+`[[providers.<name>.body]]` rules scoped to `tasks = ["chat_vision"]` —
+reasoning control (`reasoning`, `reasoning_effort`) included. See
+"`[[providers.<name>.body]]` — custom body parameters" above.
 
 Call site: `crates/eros-engine-server/src/pipeline/stream.rs` via
 `resolve_vision()` in `model_config.rs`.
@@ -912,7 +921,6 @@ fallback     = ["google/gemini-3.1-flash-lite"]
 retry_depth  = 1
 temperature  = 0.3
 max_tokens   = 800
-reasoning    = { enabled = false }
 filter_prompt = """
 你是 XX 产品的官方说明助手。以下是产品资料：
 …（产品定位、功能、价格、会员、退订方式等）…
@@ -931,7 +939,6 @@ filter_prompt = """
 | `frequency_penalty` | `f32` | absent | OpenAI-style frequency penalty, `[-2.0, 2.0]`. Omitted when unset. |
 | `presence_penalty` | `f32` | absent | OpenAI-style presence penalty, `[-2.0, 2.0]`. Omitted when unset. |
 | `repetition_penalty` | `f32` | absent | Repetition penalty, `(0.0, 2.0]` (`1.0` = no-op). Omitted when unset. |
-| `reasoning` | table | absent | Optional reasoning control forwarded to OpenRouter. |
 | `filter_prompt` | `String` | — | **Required.** Product docs + answering rules; blank or absent refuses to boot (see the gates table above). |
 
 **Judge-side context.** Only when all three gates pass, the judge context
@@ -1092,9 +1099,9 @@ disable the chain.
 > `examples/model_config.toml` keeps both sections, so the default — both
 > extractions on — is unchanged.
 
-`reasoning` works the same as on every task — omit it to let the model decide,
-`reasoning = { enabled = false }` to force reasoning off, `{ enabled = true }` to
-force it on.
+To force an extraction model's reasoning off, scope a
+`[[providers.<name>.body]]` rule to the task (see "custom body parameters"
+above).
 
 ## Resolution rules
 

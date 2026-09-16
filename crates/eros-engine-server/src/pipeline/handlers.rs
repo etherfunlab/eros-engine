@@ -366,7 +366,6 @@ fn assemble_chat_request(
         user: audit_user,
         session_id: audit_session,
         metadata: audit_metadata,
-        reasoning: resolved.reasoning,
         task: Some(CHAT_TASK.into()),
         ..Default::default()
     }
@@ -1868,7 +1867,6 @@ mod tests {
             },
             max_tokens: 100,
             allow_traits: None,
-            reasoning: None,
             retry_depth: 0,
         };
         let req = assemble_chat_request(
@@ -1924,7 +1922,6 @@ mod tests {
             sampling: Default::default(),
             max_tokens: 100,
             allow_traits: None,
-            reasoning: None,
             retry_depth: 0,
         };
         let req = assemble_chat_request(
