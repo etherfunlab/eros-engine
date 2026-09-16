@@ -4150,8 +4150,8 @@ data: [DONE]\n\n";
             caption: Some("a caption".into()),
             temperature: 0.5,
             max_tokens: 10,
-            // Set, so the ALLOW lock below actually exercises them — all four
-            // are standard OpenAI fields (#246).
+            // Set, so the ALLOW lock below actually exercises them — the four
+            // sampling knobs go to every endpoint as-is (#246).
             sampling: crate::model_config::Sampling {
                 top_p: Some(0.9),
                 frequency_penalty: Some(0.1),
@@ -4864,7 +4864,7 @@ data: [DONE]\n\n";
     }
 
     #[tokio::test]
-    async fn vision_custom_provider_strips_then_merges() {
+    async fn vision_custom_provider_rule_reaches_the_wire() {
         // A rule on a custom provider can send its own `reasoning` shape,
         // exactly as `custom_provider_strips_then_merges` pins for chat.
         let mock = MockServer::start().await;

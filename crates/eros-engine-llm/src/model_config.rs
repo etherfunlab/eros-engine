@@ -3183,20 +3183,29 @@ impl ModelConfig {
         // [defaults] keys) purely so an operator upgrading across the removal
         // gets this message instead of a silently dead key. Rejected in every
         // shape, blank included — the key is never read.
-        let mut removed: Vec<&String> = self
+        let mut removed: Vec<(&String, &toml::Value)> = self
             .tasks
             .iter()
-            .filter(|(_, t)| t.reasoning.is_some())
-            .map(|(n, _)| n)
+            .filter_map(|(n, t)| t.reasoning.as_ref().map(|v| (n, v)))
             .collect();
-        removed.sort();
-        if let Some(task) = removed.first() {
+        removed.sort_by_key(|(n, _)| *n);
+        if let Some((task, value)) = removed.first() {
+            // Echo the operator's own object so following the message is
+            // behaviour-preserving; a non-table value has no rule equivalent,
+            // so fall back to the common case as an example.
+            let rule_value = match value {
+                toml::Value::Table(t) if !t.is_empty() => {
+                    let fields: Vec<String> = t.iter().map(|(k, v)| format!("{k} = {v}")).collect();
+                    format!("{{ {} }}", fields.join(", "))
+                }
+                _ => "{ enabled = false }".to_string(),
+            };
             return Err(format!(
                 "[tasks.{task}].reasoning was removed: reasoning control is an ordinary \
                  body param on the provider entry —\n\
                  [[providers.openrouter.body]]\n\
                  tasks  = [\"{task}\"]\n\
-                 params = {{ reasoning = {{ enabled = false }} }}\n\
+                 params = {{ reasoning = {rule_value} }}\n\
                  (omit `tasks` to apply it to every task on that provider). Delete the \
                  [tasks.*] key."
             ));
@@ -7742,6 +7751,25 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
                 "message gives the body-rule replacement for {src:?}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn removed_task_reasoning_message_echoes_the_operators_value() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel=\"x\"\nreasoning = { exclude = true, effort = \"low\" }\n",
+        )
+        .unwrap();
+        let err = cfg.validate_removed_tasks().unwrap_err();
+        assert!(
+            err.contains("params = { reasoning = { effort = \"low\", exclude = true } }"),
+            "suggested rule must carry the same object: {err}"
+        );
+        // A value with no rule equivalent falls back to the common example.
+        let cfg =
+            ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel=\"x\"\nreasoning = \"\"\n")
+                .unwrap();
+        let err = cfg.validate_removed_tasks().unwrap_err();
+        assert!(err.contains("{ enabled = false }"), "{err}");
     }
 
     #[test]
