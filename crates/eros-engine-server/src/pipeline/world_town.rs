@@ -206,7 +206,6 @@ async fn run_comment_round(
         max_tokens: resolved.max_tokens,
         sampling: resolved.sampling,
         user: Some(WORLD_AUDIT_USER.into()),
-        reasoning: resolved.reasoning.clone(),
         response_format: resolved
             .structured_output
             .then(world_comment_response_format),
@@ -331,7 +330,6 @@ async fn run_reply(
         max_tokens: resolved.max_tokens,
         sampling: resolved.sampling,
         user: Some(WORLD_AUDIT_USER.into()),
-        reasoning: resolved.reasoning.clone(),
         task: Some("world_reply".into()),
         ..Default::default()
     };

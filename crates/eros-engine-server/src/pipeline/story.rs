@@ -327,7 +327,6 @@ async fn direct_story(
         max_tokens: resolved.max_tokens,
         sampling: resolved.sampling,
         user: Some(STORY_AUDIT_USER.into()),
-        reasoning: resolved.reasoning.clone(),
         response_format: resolved.structured_output.then(story_response_format),
         task: Some(STORY_TASK.into()),
         ..Default::default()

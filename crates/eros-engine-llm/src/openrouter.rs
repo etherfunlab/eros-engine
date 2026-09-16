@@ -10,7 +10,6 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::error::LlmError;
-use crate::model_config::ReasoningConfig;
 
 const BASE_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 
@@ -86,9 +85,6 @@ pub struct ChatRequest {
     /// (≤16 keys, key ≤64 chars, value ≤512 chars) are enforced at the
     /// HTTP boundary, not here.
     pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
-    /// Reasoning config forwarded to OpenRouter. `None` → omit the param;
-    /// `Some(cfg)` → send the `reasoning` object verbatim.
-    pub reasoning: Option<ReasoningConfig>,
     /// PDE-only: OpenRouter `response_format` (e.g. a json_schema object).
     /// `None` ⇒ omitted. Opaque passthrough; the caller builds the schema.
     pub response_format: Option<serde_json::Value>,
@@ -112,7 +108,6 @@ pub struct VisionRequest {
     pub caption: Option<String>,
     pub temperature: f32,
     pub max_tokens: u32,
-    pub reasoning: Option<ReasoningConfig>,
     /// Optional sampling knobs (issue #246). The describe call is an ordinary
     /// chat/completions request in every respect but its `messages` shape.
     pub sampling: crate::model_config::Sampling,
@@ -144,11 +139,6 @@ fn build_vision_body(req: &VisionRequest, model: &str) -> serde_json::Value {
         "max_tokens": req.max_tokens,
         "stream": false,
     });
-    if let Some(r) = &req.reasoning {
-        if let Ok(v) = serde_json::to_value(r) {
-            body["reasoning"] = v;
-        }
-    }
     // Sampling knobs are omitted entirely when unset, mirroring WireRequest's
     // `skip_serializing_if` — an untuned deployment must keep producing a
     // byte-identical body (issue #246).
@@ -162,19 +152,6 @@ fn build_vision_body(req: &VisionRequest, model: &str) -> serde_json::Value {
     put("presence_penalty", req.sampling.presence_penalty);
     put("repetition_penalty", req.sampling.repetition_penalty);
     body
-}
-
-/// Strip the OpenRouter-specific fields `build_vision_body` bakes in
-/// unconditionally, for a custom `[providers]` endpoint (spec §4). Mirrors
-/// `WireRequest::for_endpoint`'s drop list, but operates on the raw
-/// `serde_json::Value` since the vision body isn't a typed wire struct. A
-/// named helper (rather than inlining the strip at each call site) so the
-/// `execute_vision` production path and its subset-lock test can never drift
-/// apart.
-fn strip_openrouter_vision_fields(body: &mut serde_json::Value) {
-    if let Some(o) = body.as_object_mut() {
-        o.remove("reasoning");
-    }
 }
 
 /// Max chars kept from a raw provider error body in ordinary logs. Short by
@@ -435,31 +412,28 @@ struct WireRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     metadata: Option<&'a serde_json::Map<String, serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning: Option<&'a ReasoningConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<&'a serde_json::Value>,
 }
 
 impl<'a> WireRequest<'a> {
     /// Strip the OpenRouter-specific fields for a custom endpoint (spec §4):
-    /// custom providers receive a strict OpenAI chat-completions subset. All
-    /// three fields carry `skip_serializing_if`, so `None` removes them from
+    /// custom providers receive a strict OpenAI chat-completions subset. Both
+    /// fields carry `skip_serializing_if`, so `None` removes them from
     /// the wire entirely — one serialization path, no drift. NOTE: when
     /// adding a field to WireRequest, decide its fate here; the
     /// `custom_endpoint_wire_is_strict_openai_subset` test enforces it.
     ///
     /// Body rules merge AFTER this strip (spec 2026-08-02-provider-body-params
     /// §4): a custom provider's declared `[[providers.<name>.body]]` params
-    /// may deliberately reintroduce a vendor field this strip just removed
-    /// (e.g. its own `reasoning` shape) — that is the supported way to send
-    /// provider-specific params, not a leak. The strict-subset lock
+    /// may deliberately add a vendor field (e.g. its own `reasoning` shape)
+    /// — that is the supported way to send provider-specific params, not a
+    /// leak. The strict-subset lock
     /// (`custom_endpoint_wire_is_strict_openai_subset`) only covers the
     /// no-rules default.
     fn for_endpoint(mut self, ep: &Endpoint<'_>) -> Self {
         if ep.name.is_some() {
             self.session_id = None;
             self.metadata = None;
-            self.reasoning = None;
         }
         self
     }
@@ -478,8 +452,7 @@ fn rule_matches(rule: &crate::model_config::BodyRule, task: Option<&str>) -> boo
 
 /// Merge every matching rule's params into the serialized wire body:
 /// top-level shallow, declaration order, later wins — and the merged params
-/// win over engine-built fields (that ordering is what makes the
-/// `[providers.openrouter]` `reasoning` override `[tasks.*].reasoning`).
+/// win over engine-built fields.
 /// Structural keys (`model`/`messages`/`stream`) were refused at boot. Pure.
 fn apply_body_rules(
     body: &mut serde_json::Map<String, serde_json::Value>,
@@ -822,7 +795,6 @@ impl OpenRouterClient {
                     req.user.as_deref(),
                     req.session_id.as_deref(),
                     req.metadata.as_ref(),
-                    req.reasoning.as_ref(),
                     req.response_format.as_ref(),
                     req.task.as_deref(),
                 )
@@ -941,17 +913,7 @@ impl OpenRouterClient {
                 }
             };
             let mut body = build_vision_body(&req, &bare_model);
-            if ep.name.is_some() {
-                // Custom `[providers]` endpoints get a strict OpenAI subset
-                // (spec §4) — `reasoning` is an OpenRouter-specific extension
-                // that `build_vision_body` bakes in unconditionally, so strip
-                // it back out here, mirroring `WireRequest::for_endpoint`.
-                strip_openrouter_vision_fields(&mut body);
-            }
-            // Body rules reach the vision pre-stage too (issue #225). Applied
-            // AFTER the subset strip, mirroring `call_once`'s strip-then-merge
-            // order: that is what lets a rule on a custom endpoint put back an
-            // extension the strip removed. `messages` (a block array here, not
+            // Body rules reach the vision pre-stage too (issue #225). `messages` (a block array here, not
             // the chat shape) can't be clobbered — it is refused at boot along
             // with `model`/`stream`.
             let rules: &[crate::model_config::BodyRule] = match ep.name {
@@ -1087,7 +1049,6 @@ impl OpenRouterClient {
         req_user: Option<&str>,
         req_session_id: Option<&str>,
         req_metadata: Option<&serde_json::Map<String, serde_json::Value>>,
-        req_reasoning: Option<&ReasoningConfig>,
         req_response_format: Option<&serde_json::Value>,
         req_task: Option<&str>,
     ) -> Result<ChatResponse, LlmError> {
@@ -1105,7 +1066,6 @@ impl OpenRouterClient {
             user: req_user,
             session_id: req_session_id,
             metadata: req_metadata,
-            reasoning: req_reasoning,
             response_format: req_response_format,
         }
         .for_endpoint(&ep);
@@ -1253,7 +1213,6 @@ impl OpenRouterClient {
             user: req.user.as_deref(),
             session_id: req.session_id.as_deref(),
             metadata: req.metadata.as_ref(),
-            reasoning: req.reasoning.as_ref(),
             response_format: None,
         }
         .for_endpoint(&ep);
@@ -1715,7 +1674,6 @@ mod tests {
             user: req.user.as_deref(),
             session_id: req.session_id.as_deref(),
             metadata: req.metadata.as_ref(),
-            reasoning: None,
             response_format: None,
         };
         let s = serde_json::to_string(&wire).unwrap();
@@ -1760,7 +1718,6 @@ mod tests {
             user: req.user.as_deref(),
             session_id: req.session_id.as_deref(),
             metadata: req.metadata.as_ref(),
-            reasoning: None,
             response_format: None,
         };
         let s = serde_json::to_string(&wire).unwrap();
@@ -2724,63 +2681,6 @@ data: [DONE]\n\n";
         );
     }
 
-    #[test]
-    fn wire_request_serializes_reasoning_enabled_flag() {
-        let messages = vec![ChatMessage {
-            role: "user".into(),
-            content: "hi".into(),
-        }];
-        // Some(cfg) -> nested object; absent inner fields are omitted.
-        let cfg = ReasoningConfig {
-            enabled: Some(false),
-            exclude: None,
-        };
-        let wire = WireRequest {
-            model: "m",
-            messages: &messages,
-            temperature: 0.0,
-            top_p: None,
-            frequency_penalty: None,
-            presence_penalty: None,
-            repetition_penalty: None,
-            max_tokens: 16,
-            stream: false,
-            user: None,
-            session_id: None,
-            metadata: None,
-            reasoning: Some(&cfg),
-            response_format: None,
-        };
-        let s = serde_json::to_string(&wire).unwrap();
-        assert!(
-            s.contains("\"reasoning\":{\"enabled\":false}"),
-            "reasoning must serialize as a nested object: {s}"
-        );
-
-        // None -> key omitted entirely
-        let wire_none = WireRequest {
-            model: "m",
-            messages: &messages,
-            temperature: 0.0,
-            top_p: None,
-            frequency_penalty: None,
-            presence_penalty: None,
-            repetition_penalty: None,
-            max_tokens: 16,
-            stream: false,
-            user: None,
-            session_id: None,
-            metadata: None,
-            reasoning: None,
-            response_format: None,
-        };
-        let s_none = serde_json::to_string(&wire_none).unwrap();
-        assert!(
-            !s_none.contains("\"reasoning\""),
-            "absent reasoning must be omitted: {s_none}"
-        );
-    }
-
     #[tokio::test]
     async fn execute_stream_yields_parse_error_on_bad_frame() {
         use futures_util::StreamExt;
@@ -3044,7 +2944,7 @@ data: [DONE]\n\n";
         let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
         assert_eq!(body["model"], "venice-model");
         assert_eq!(body["stream"], true);
-        for k in ["session_id", "metadata", "reasoning"] {
+        for k in ["session_id", "metadata"] {
             assert!(
                 body.get(k).is_none(),
                 "body field {k} leaked into the stream wire"
@@ -3258,7 +3158,6 @@ data: [DONE]\n\n";
             user: None,
             session_id: None,
             metadata: None,
-            reasoning: None,
             response_format: Some(&rf),
         };
         let s = serde_json::to_string(&wire).unwrap();
@@ -3280,7 +3179,6 @@ data: [DONE]\n\n";
             user: None,
             session_id: None,
             metadata: None,
-            reasoning: None,
             response_format: None,
         };
         let s_none = serde_json::to_string(&wire_none).unwrap();
@@ -3758,7 +3656,6 @@ data: [DONE]\n\n";
                 caption: None,
                 temperature: 0.0,
                 max_tokens: 64,
-                reasoning: None,
                 sampling: crate::model_config::Sampling::default(),
             })
             .await
@@ -3818,7 +3715,6 @@ data: [DONE]\n\n";
                 caption: None,
                 temperature: 0.0,
                 max_tokens: 64,
-                reasoning: None,
                 sampling: crate::model_config::Sampling::default(),
             })
             .await
@@ -3863,7 +3759,6 @@ data: [DONE]\n\n";
                 caption: None,
                 temperature: 0.0,
                 max_tokens: 64,
-                reasoning: None,
                 sampling: crate::model_config::Sampling::default(),
             })
             .await
@@ -3924,7 +3819,6 @@ data: [DONE]\n\n";
                 caption: None,
                 temperature: 0.0,
                 max_tokens: 64,
-                reasoning: None,
                 sampling: crate::model_config::Sampling::default(),
             })
             .await
@@ -3978,10 +3872,6 @@ data: [DONE]\n\n";
                 caption: None,
                 temperature: 0.0,
                 max_tokens: 64,
-                reasoning: Some(ReasoningConfig {
-                    enabled: Some(false),
-                    ..Default::default()
-                }),
                 sampling: crate::model_config::Sampling::default(),
             })
             .await
@@ -3998,10 +3888,6 @@ data: [DONE]\n\n";
         assert!(
             body.get("provider").is_none(),
             "provider prefs leaked to custom vision"
-        );
-        assert!(
-            body.get("reasoning").is_none(),
-            "OpenRouter-only reasoning object leaked to custom vision"
         );
     }
 
@@ -4024,7 +3910,6 @@ data: [DONE]\n\n";
             user: None,
             session_id: None,
             metadata: None,
-            reasoning: None,
             response_format: None,
         };
         let s = serde_json::to_string(&wire).unwrap();
@@ -4057,7 +3942,6 @@ data: [DONE]\n\n";
             user: None,
             session_id: None,
             metadata: None,
-            reasoning: None,
             response_format: None,
         };
         assert_eq!(
@@ -4085,7 +3969,6 @@ data: [DONE]\n\n";
             user: None,
             session_id: None,
             metadata: None,
-            reasoning: None,
             response_format: None,
         };
         let s = serde_json::to_string(&wire).unwrap();
@@ -4114,7 +3997,6 @@ data: [DONE]\n\n";
             caption: None,
             temperature: 0.5,
             max_tokens: 10,
-            reasoning: None,
             sampling: crate::model_config::Sampling::default(),
         };
 
@@ -4185,7 +4067,6 @@ data: [DONE]\n\n";
     fn full_wire_parts() -> (
         Vec<ChatMessage>,
         serde_json::Map<String, serde_json::Value>,
-        ReasoningConfig,
         serde_json::Value,
     ) {
         let messages = vec![ChatMessage {
@@ -4194,12 +4075,8 @@ data: [DONE]\n\n";
         }];
         let mut meta = serde_json::Map::new();
         meta.insert("k".into(), serde_json::json!("v"));
-        let reasoning = ReasoningConfig {
-            enabled: Some(false),
-            ..Default::default()
-        };
         let response_format = serde_json::json!({ "type": "json_object" });
-        (messages, meta, reasoning, response_format)
+        (messages, meta, response_format)
     }
 
     #[test]
@@ -4210,7 +4087,7 @@ data: [DONE]\n\n";
         // If this test fails on a field you just added to WireRequest, add it
         // to WireRequest::for_endpoint's drop list (or the allow list, if it
         // is standard OpenAI).
-        let (messages, meta, reasoning, response_format) = full_wire_parts();
+        let (messages, meta, response_format) = full_wire_parts();
         let http = reqwest::Client::new();
         let ep = Endpoint {
             url: "https://x",
@@ -4232,7 +4109,6 @@ data: [DONE]\n\n";
             user: Some("u"),
             session_id: Some("s"),
             metadata: Some(&meta),
-            reasoning: Some(&reasoning),
             response_format: Some(&response_format),
         }
         .for_endpoint(&ep);
@@ -4262,15 +4138,10 @@ data: [DONE]\n\n";
 
     #[test]
     fn custom_endpoint_vision_body_is_strict_openai_subset() {
-        // Finding 1 (final review): the WireRequest lock above only covers
-        // the typed chat/stream path (`call_once` / `execute_stream_as`).
-        // `execute_vision` instead builds a raw `serde_json::Value` via
-        // `build_vision_body` and strips OpenRouter-only fields with
-        // `strip_openrouter_vision_fields` — the exact helper `execute_vision`
-        // calls for a custom endpoint — so it needs its own lock, driving both
-        // together the same way production does. This can't drift from
-        // `execute_vision`'s custom-endpoint path because both call the same
-        // helper.
+        // The WireRequest lock above only covers the typed chat/stream path
+        // (`call_once` / `execute_stream_as`). `execute_vision` instead builds
+        // a raw `serde_json::Value` via `build_vision_body`, which must stay a
+        // strict OpenAI subset on its own — nothing strips it afterwards.
         let req = VisionRequest {
             model: "ignored".into(),
             fallback_model: vec!["ignored-2".into()],
@@ -4279,12 +4150,8 @@ data: [DONE]\n\n";
             caption: Some("a caption".into()),
             temperature: 0.5,
             max_tokens: 10,
-            reasoning: Some(ReasoningConfig {
-                enabled: Some(false),
-                ..Default::default()
-            }),
             // Set, so the ALLOW lock below actually exercises them — all four
-            // are standard OpenAI fields and must survive the strip (#246).
+            // are standard OpenAI fields (#246).
             sampling: crate::model_config::Sampling {
                 top_p: Some(0.9),
                 frequency_penalty: Some(0.1),
@@ -4292,8 +4159,7 @@ data: [DONE]\n\n";
                 repetition_penalty: Some(1.15),
             },
         };
-        let mut body = build_vision_body(&req, "m");
-        strip_openrouter_vision_fields(&mut body);
+        let body = build_vision_body(&req, "m");
         const ALLOW: [&str; 11] = [
             "model",
             "messages",
@@ -4320,7 +4186,7 @@ data: [DONE]\n\n";
     #[test]
     fn openrouter_endpoint_wire_keeps_all_fields() {
         // Regression lock: for_endpoint on the built-in endpoint drops NOTHING.
-        let (messages, meta, reasoning, response_format) = full_wire_parts();
+        let (messages, meta, response_format) = full_wire_parts();
         let http = reqwest::Client::new();
         let ep = Endpoint {
             url: "https://x",
@@ -4342,13 +4208,12 @@ data: [DONE]\n\n";
             user: None,
             session_id: Some("s"),
             metadata: Some(&meta),
-            reasoning: Some(&reasoning),
             response_format: Some(&response_format),
         }
         .for_endpoint(&ep);
         let v = serde_json::to_value(&wire).unwrap();
         let obj = v.as_object().unwrap();
-        for k in ["session_id", "metadata", "reasoning"] {
+        for k in ["session_id", "metadata"] {
             assert!(
                 obj.contains_key(k),
                 "`{k}` must survive on the OpenRouter path"
@@ -4403,10 +4268,6 @@ data: [DONE]\n\n";
                 max_tokens: 16,
                 session_id: Some("sess".into()),
                 metadata: Some(meta),
-                reasoning: Some(ReasoningConfig {
-                    enabled: Some(false),
-                    ..Default::default()
-                }),
                 ..Default::default()
             })
             .await
@@ -4430,10 +4291,10 @@ data: [DONE]\n\n";
         ] {
             assert!(req.headers.get(h).is_none(), "header {h} leaked");
         }
-        // Bare model id + none of the three OpenRouter-only body fields.
+        // Bare model id + none of the OpenRouter-only body fields.
         let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
         assert_eq!(body["model"], "venice-model");
-        for k in ["session_id", "metadata", "reasoning"] {
+        for k in ["session_id", "metadata"] {
             assert!(body.get(k).is_none(), "body field {k} leaked");
         }
     }
@@ -4609,7 +4470,7 @@ data: [DONE]\n\n";
     // ---- [[providers.*.body]] merge (spec 2026-08-02-provider-body-params) ----
 
     #[tokio::test]
-    async fn openrouter_body_rule_applies_for_its_task_and_overrides_reasoning() {
+    async fn openrouter_body_rule_applies_for_its_task() {
         let mock = MockServer::start().await;
         Mock::given(path("/api/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(ok_response()))
@@ -4632,10 +4493,6 @@ data: [DONE]\n\n";
                     content: "hi".into(),
                 }],
                 max_tokens: 5,
-                reasoning: Some(ReasoningConfig {
-                    enabled: Some(true),
-                    ..Default::default()
-                }),
                 task: Some("chat_companion".into()),
                 ..Default::default()
             })
@@ -4646,16 +4503,14 @@ data: [DONE]\n\n";
         assert_eq!(body["transforms"][0], "middle-out");
         assert_eq!(
             body["reasoning"]["max_tokens"], 64,
-            "providers-block reasoning must beat [tasks.*] reasoning"
+            "a rule is the one way to put `reasoning` on the wire"
         );
-        assert!(body.get("enabled").is_none());
     }
 
     #[tokio::test]
     async fn body_rule_skipped_for_unlisted_task() {
         // Identical setup to the previous test, but the request serves a task
-        // the rule does not list — nothing merges, and the request's own
-        // reasoning config survives untouched.
+        // the rule does not list — nothing merges.
         let mock = MockServer::start().await;
         Mock::given(path("/api/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(ok_response()))
@@ -4678,10 +4533,6 @@ data: [DONE]\n\n";
                     content: "hi".into(),
                 }],
                 max_tokens: 5,
-                reasoning: Some(ReasoningConfig {
-                    enabled: Some(true),
-                    ..Default::default()
-                }),
                 task: Some("pde_decision".into()),
                 ..Default::default()
             })
@@ -4693,9 +4544,9 @@ data: [DONE]\n\n";
             body.get("transforms").is_none(),
             "unlisted task must not merge"
         );
-        assert_eq!(
-            body["reasoning"]["enabled"], true,
-            "request's own reasoning survives"
+        assert!(
+            body.get("reasoning").is_none(),
+            "no rule, no `reasoning` — the engine never builds one"
         );
     }
 
@@ -4737,10 +4588,6 @@ data: [DONE]\n\n";
                 max_tokens: 5,
                 session_id: Some("s".into()),
                 metadata: Some(meta),
-                reasoning: Some(ReasoningConfig {
-                    enabled: Some(true),
-                    ..Default::default()
-                }),
                 task: Some("chat_companion".into()),
                 ..Default::default()
             })
@@ -4754,7 +4601,7 @@ data: [DONE]\n\n";
         );
         assert_eq!(
             body["reasoning"]["strip_thinking_response"], true,
-            "the RULE's reasoning shape — the request's was stripped first"
+            "the RULE's reasoning shape reaches a custom endpoint"
         );
         assert!(
             body.get("session_id").is_none(),
@@ -4916,10 +4763,6 @@ data: [DONE]\n\n";
             caption: Some("a caption".into()),
             temperature: 0.0,
             max_tokens: 64,
-            reasoning: Some(ReasoningConfig {
-                enabled: Some(false),
-                ..Default::default()
-            }),
             sampling: crate::model_config::Sampling::default(),
         }
     }
@@ -4933,11 +4776,10 @@ data: [DONE]\n\n";
     }
 
     #[tokio::test]
-    async fn vision_body_rule_reaches_the_wire_and_beats_task_reasoning() {
+    async fn vision_body_rule_reaches_the_wire() {
         // The gap issue #225 closes: a deployer knob such as `reasoning_effort`
-        // (a top-level field, NOT part of the `reasoning` object) had no way to
-        // reach the vision pre-stage. It now merges, and — as on the chat path
-        // — a rule's params beat the engine-built fields.
+        // had no way to reach the vision pre-stage. It now merges, exactly as
+        // on the chat path.
         let mock = MockServer::start().await;
         Mock::given(path("/api/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(vision_ok()))
@@ -4956,10 +4798,7 @@ data: [DONE]\n\n";
         let body: serde_json::Value =
             serde_json::from_slice(&mock.received_requests().await.unwrap()[0].body).unwrap();
         assert_eq!(body["reasoning_effort"], "none");
-        assert_eq!(
-            body["reasoning"]["enabled"], true,
-            "rule params beat [tasks.chat_vision].reasoning"
-        );
+        assert_eq!(body["reasoning"]["enabled"], true);
     }
 
     #[tokio::test]
@@ -5021,16 +4860,12 @@ data: [DONE]\n\n";
             body.get("reasoning_effort").is_none(),
             "unlisted task must not merge"
         );
-        assert_eq!(
-            body["reasoning"]["enabled"], false,
-            "request's own reasoning survives"
-        );
+        assert!(body.get("reasoning").is_none());
     }
 
     #[tokio::test]
     async fn vision_custom_provider_strips_then_merges() {
-        // Custom endpoints strip OpenRouter-only fields first, then merge —
-        // so a rule on that provider can deliberately put `reasoning` back,
+        // A rule on a custom provider can send its own `reasoning` shape,
         // exactly as `custom_provider_strips_then_merges` pins for chat.
         let mock = MockServer::start().await;
         Mock::given(path("/v1/chat/completions"))
@@ -5066,14 +4901,7 @@ data: [DONE]\n\n";
             serde_json::from_slice(&mock.received_requests().await.unwrap()[0].body).unwrap();
         assert_eq!(body["model"], "vis", "bare model on a custom endpoint");
         assert_eq!(body["venice_parameters"]["x"], 1);
-        assert_eq!(
-            body["reasoning"]["strip_thinking_response"], true,
-            "a rule may put back what the subset strip removed"
-        );
-        assert!(
-            body["reasoning"].get("enabled").is_none(),
-            "the stripped [tasks.chat_vision].reasoning must not resurface"
-        );
+        assert_eq!(body["reasoning"]["strip_thinking_response"], true);
     }
 
     #[tokio::test]

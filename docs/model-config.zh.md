@@ -167,10 +167,9 @@ model = "bge-m3@local"               # 由 [providers].local.embeddings 提供�
 - **按模型匹配的表用裸 id**：`model_name_display_override`、`output_regex`
   的 `models`、`output_filter` trigger 的 `models`，匹配时都不带
   `@provider`。
-- **wire 形态**：自定义 provider 收到严格的 OpenAI 兼容子集。任务级
-  `reasoning` 对自定义 provider **不生效**——它们只收到该条目自己声明的
-  `headers`，以及该条目自己声明的 `[[providers.<name>.body]]` 规则（见
-  下文），绝不会收到 OpenRouter 归因标头。
+- **wire 形态**：自定义 provider 收到严格的 OpenAI 兼容子集，外加该条目
+  自己声明的 `headers`，以及该条目自己声明的 `[[providers.<name>.body]]`
+  规则（见下文），绝不会收到 OpenRouter 归因标头。
 - **审计**：自定义 provider 服务的行记录
   `model = "<上游回显>@<name>"`，`generation_id` 原样存 provider 返回的
   id——用 `generation_id` 去 join OpenRouter 日志时这些行会 miss，
@@ -191,10 +190,9 @@ headers    = { "HTTP-Referer" = "https://eros.example", "X-OpenRouter-Title" = "
   `https://openrouter.ai/api/v1/embeddings`）。这条“部分覆盖”规则只对
   `openrouter` 生效——普通条目缺 key 且被引用时是启动报错，因为它没有内置
   默认值可以兜底。
-- 覆盖**只**改变 URL。流量走的仍然是完整的 OpenRouter wire：任务级
-  `reasoning` 照常发送，任何 `[[providers.openrouter.body]]` 规则（见
-  下文）也会合并进请求体——和只收到严格 OpenAI 子集、`reasoning` 不生效
-  的自定义 provider 不同。
+- 覆盖**只**改变 URL。流量走的仍然是完整的 OpenRouter wire（`session_id`、
+  `metadata`），任何 `[[providers.openrouter.body]]` 规则（见下文）也会
+  合并进请求体——和只收到严格 OpenAI 子集的自定义 provider 不同。
 - **归因 header 现在只从这里来。** 没有 `[providers.openrouter]` 条目，
   或有条目但没写 `headers`，就不发任何归因 header。
   `OPENROUTER_APP_REFERER` / `OPENROUTER_APP_TITLE` /
@@ -215,11 +213,23 @@ headers    = { "HTTP-Referer" = "https://eros.example", "X-OpenRouter-Title" = "
 透传（TOML → JSON）——引擎从不解读它的内容。`tasks` 把规则限定到指定的
 引擎任务名（精确匹配，区分大小写；任务名表见下文）；省略则应用于该
 provider 服务的所有任务。规则按声明顺序生效，后面的规则在 key 冲突
-时获胜，且合并进的 params 会覆盖引擎自己构建的字段——例如在 `openrouter`
-条目上声明 `reasoning`，就会覆盖被该规则限定的任务上的
-`[tasks.*].reasoning`。这一点并非 `reasoning` 独有：**任何**引擎自建的 wire
+时获胜，且合并进的 params 会覆盖引擎自己构建的字段：**任何**引擎自建的 wire
 字段都会输给 body 参数，包括 `temperature`、`max_tokens` 以及四个采样旋钮
 （`top_p`、`frequency_penalty`、`presence_penalty`、`repetition_penalty`）。
+
+reasoning 控制只走 body 规则，没有别的入口——不存在任务级 `reasoning` 键
+（写了 `[tasks.*].reasoning` 会拒绝启动，报错里给出替代写法）。示例对
+`chat_companion` 关掉了它，因为伴侣回复只渲染 `content`：
+
+```toml
+[[providers.openrouter.body]]
+tasks  = ["chat_companion"]
+params = { reasoning = { enabled = false } }
+```
+
+`params.reasoning` 就是 OpenRouter 自己的 `reasoning` 对象，原样透传——
+`{ exclude = true }` 照常生成但不返回，`{ effort = "low" }` 之类同理。省略
+`tasks` 则作用于该 provider 上的所有任务；tier 继承所属任务的规则。
 `model`、`messages`、`stream` 是引擎自有字段，声明
 它们会拒绝启动。规则若指名 `embedding` 会记录警告且永不生效（该调用自己
 构建请求体，也不接受任何 chat 形态的参数）。自定义 provider 必须声明
@@ -263,8 +273,8 @@ body 参数（裸 OpenRouter provider slug，不带 `@openrouter` 后缀），�
 调用——若只想让路由偏好作用于 chat，请用 `tasks` 限定范围。
 
 `chat_vision` 虽然不是 chat/completions 任务，但同样被覆盖：它的 describe
-调用自己构建请求体，而该请求体也会走同一套合并，因此 `reasoning` 对象表达
-不了的参数照样能到达 vision 前置阶段。
+调用自己构建请求体，而该请求体也会走同一套合并，因此规则照样能到达
+vision 前置阶段。
 
 ```toml
 [[providers.openrouter.body]]
@@ -274,7 +284,7 @@ params = { reasoning_effort = "none" }
 
 这一点很重要：有些模型会无视 `reasoning = { enabled = false }`，照样推理并
 照样计费——而 `reasoning_effort` 是独立的顶层字段，不属于 `reasoning` 对象，
-`[tasks.*].reasoning` 表达不了它。vision 的 `messages` 是块数组（text +
+一条 body 规则可以同时带上两者。vision 的 `messages` 是块数组（text +
 `image_url`）而不是 chat 的形态，但 `messages` 属于引擎自有字段、启动时就会
 被拒绝，所以任何规则都不可能把它压平。
 
@@ -488,7 +498,7 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
 
 #### `[tasks.chat_input_filter]` 字段
 
-复用标准任务结构：`model`、`fallback`、`retry_depth`（默认 1）、`temperature`、`max_tokens`、`filter_prompt`、`reasoning`（示例中默认关闭）。`trigger`、`timing`、`tiers` 和 `allow_traits` 会被忽略（input filter 没有 trigger、timing 或 tier）。
+复用标准任务结构：`model`、`fallback`、`retry_depth`（默认 1）、`temperature`、`max_tokens`、`filter_prompt`。`trigger`、`timing`、`tiers` 和 `allow_traits` 会被忽略（input filter 没有 trigger、timing 或 tier）。
 
 ## 任务名
 
@@ -617,7 +627,6 @@ fallback     = ["google/gemini-3.1-flash-lite"]
 retry_depth  = 1
 temperature  = 0.7
 max_tokens   = 700
-# reasoning  = { enabled = false }
 # filter_prompt 可选——省略则用内置默认（见下）：
 # filter_prompt = """…覆盖…"""
 ```
@@ -633,7 +642,6 @@ max_tokens   = 700
 | `frequency_penalty` | `f32` | 缺失 | OpenAI 风格的 frequency penalty，`[-2.0, 2.0]`。未设置时省略。 |
 | `presence_penalty` | `f32` | 缺失 | OpenAI 风格的 presence penalty，`[-2.0, 2.0]`。未设置时省略。 |
 | `repetition_penalty` | `f32` | 缺失 | 重复惩罚，`(0.0, 2.0]`（`1.0` 为恒等值）。未设置时省略。 |
-| `reasoning` | 表 | 缺失 | 可选 reasoning 控制，转发给 OpenRouter。 |
 | `filter_prompt` | `String` \| `Array<String>` \| `Table<String, String>` | **内置默认** | **可选**（不同于其他任务）。空白/缺失 ⇒ 引擎内置的 `DEFAULT_COMPOSE_PROMPT`。数组/表两种形态见下方"变体"。 |
 
 **内置默认提示词。** 不同于其他每个任务（提示词必须来自配置），合成器自带一个通用、**不含产品身份**的内置默认。它**从上下文生成** prompt 和 caption——人格外观、最近场景、对方最新消息、style、宽高比——**不**软化、不降级、不审查、不拒绝，也不自带内容审核层——审核交给画图模型供应商和下游部署，不在这一步。非空 `filter_prompt` 覆盖它（且必须遵守上面的 JSON 契约）；空白/缺失则回退到它。
@@ -678,7 +686,7 @@ b = """
 图片回合和一条指令（"换套衣服"），这个任务从那张图的画面主体加上指令合成
 新的图片 prompt。结构与上面的 `[tasks.chat_image_prompt_compose]` 相同
 （`model`、`fallback`、`retry_depth`、`temperature`、`max_tokens`、
-`reasoning`、采样旋钮），`filter_prompt` 同样是**可选**的，接受同样的三种
+采样旋钮），`filter_prompt` 同样是**可选**的，接受同样的三种
 形态（纯字符串 / 按下标 / 按 key），通过编辑请求体上的 `prompt_variant`
 逐次选择。
 
@@ -703,7 +711,7 @@ prompt，而不是聊天合成器自己的 `filter_prompt`（那个是为从对�
 
 此功能**默认关闭**，仅当此任务块存在且 `filter_prompt` 非空白时激活。`retry_depth` 默认为 `1`（primary + 第一个 fallback）。请选择支持视觉的模型；示例使用 `google/gemini-3.1-flash-lite`。
 
-除本块自身的 key 外，其他 wire 参数通过限定 `tasks = ["chat_vision"]` 的 `[[providers.<name>.body]]` 规则送达 describe 调用——凡是 `reasoning` 对象表达不了的（包括 `reasoning_effort`）都走这条路。参见上文“`[[providers.<name>.body]]` — 自定义 body 参数”。
+除本块自身的 key 外，其他 wire 参数通过限定 `tasks = ["chat_vision"]` 的 `[[providers.<name>.body]]` 规则送达 describe 调用——reasoning 控制（`reasoning`、`reasoning_effort`）也走这条路。参见上文“`[[providers.<name>.body]]` — 自定义 body 参数”。
 
 调用点：`crates/eros-engine-server/src/pipeline/stream.rs`，通过 `model_config.rs` 中的 `resolve_vision()`。
 
@@ -730,7 +738,6 @@ fallback     = ["google/gemini-3.1-flash-lite"]
 retry_depth  = 1
 temperature  = 0.3
 max_tokens   = 800
-reasoning    = { enabled = false }
 filter_prompt = """
 你是 XX 产品的官方说明助手。以下是产品资料：
 …（产品定位、功能、价格、会员、退订方式等）…
@@ -749,7 +756,6 @@ filter_prompt = """
 | `frequency_penalty` | `f32` | 缺失 | OpenAI 风格的 frequency penalty，`[-2.0, 2.0]`。未设置时省略。 |
 | `presence_penalty` | `f32` | 缺失 | OpenAI 风格的 presence penalty，`[-2.0, 2.0]`。未设置时省略。 |
 | `repetition_penalty` | `f32` | 缺失 | 重复惩罚，`(0.0, 2.0]`（`1.0` 为恒等值）。未设置时省略。 |
-| `reasoning` | 表 | 缺失 | 可选 reasoning 控制，转发给 OpenRouter。 |
 | `filter_prompt` | `String` | — | **必填。** 产品资料 + 作答规则；空白或缺失会拒绝启动（见上方门槛表）。 |
 
 **判断器侧上下文。** 仅当三重门槛全部满足时，判断器上下文（`build_pde_ctx`）
@@ -887,7 +893,7 @@ write 全部路由离开 Voyage 的部署不再需要这个变量。
 
 > **行为变更（0.6.x）：**早期版本要求两个章节都必须存在（缺少章节会导致启动失败）。现在可以通过省略章节来关闭。随附的 `examples/model_config.toml` 仍然保留两个章节，因此默认行为——同时启用两种 extraction——没有变化。
 
-`reasoning` 的行为与其他所有任务相同——省略则由模型决定；`reasoning = { enabled = false }` 强制关闭 reasoning；`{ enabled = true }` 强制开启。
+要强制关闭 extraction 模型的 reasoning，写一条限定到该任务的 `[[providers.<name>.body]]` 规则（见上文"自定义 body 参数"）。
 
 ## 解析规则
 

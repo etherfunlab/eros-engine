@@ -304,7 +304,6 @@ async fn direct_world(
         max_tokens: resolved.max_tokens,
         sampling: resolved.sampling,
         user: Some(WORLD_AUDIT_USER.into()),
-        reasoning: resolved.reasoning.clone(),
         response_format: resolved
             .structured_output
             .then(|| world_director_response_format(town)),

@@ -1938,7 +1938,6 @@ fn run_output_filter(
                 temperature: f.temperature as f32,
                 max_tokens: f.max_tokens,
                 sampling: f.sampling,
-                reasoning: f.reasoning.clone(),
                 task: Some("chat_output_filter".into()),
                 ..Default::default()
             };
@@ -2356,7 +2355,6 @@ async fn run_pde_decision(
             temperature: p.temperature as f32,
             max_tokens: p.max_tokens,
             sampling: p.sampling,
-            reasoning: p.reasoning.clone(),
             response_format: response_format.clone(),
             task: Some("pde_decision".into()),
             ..Default::default()
@@ -2850,7 +2848,6 @@ async fn run_vision(
             caption: (!caption.is_empty()).then(|| caption.to_string()),
             temperature: v.temperature as f32,
             max_tokens: v.max_tokens,
-            reasoning: v.reasoning.clone(),
             sampling: v.sampling,
         };
         let resp = match tokio::time::timeout(FILTER_TIMEOUT, state.openrouter.execute_vision(req))
@@ -3156,7 +3153,6 @@ async fn run_input_filter(
             temperature: f.temperature as f32,
             max_tokens: f.max_tokens,
             sampling: f.sampling,
-            reasoning: f.reasoning.clone(),
             task: Some("chat_input_filter".into()),
             ..Default::default()
         };
@@ -3440,7 +3436,6 @@ pub(crate) async fn run_image_prompt_compose(
             temperature: c.temperature as f32,
             max_tokens: c.max_tokens,
             sampling: c.sampling,
-            reasoning: c.reasoning.clone(),
             task: Some(task.into()),
             ..Default::default()
         };
@@ -4524,7 +4519,6 @@ pub fn run_stream(
                     temperature: p.temperature as f32,
                     max_tokens: p.max_tokens,
                     sampling: p.sampling,
-                    reasoning: p.reasoning.clone(),
                     task: Some(PRODUCT_QA_TASK.into()),
                     ..Default::default()
                 };
@@ -17778,7 +17772,6 @@ data: [DONE]\n\n";
             max_tokens: 180,
             decision_prompt: "decide".into(),
             retry_depth: 2,
-            reasoning: None,
             structured_output: true,
             sampling: Default::default(),
         }
@@ -19028,7 +19021,6 @@ data: [DONE]\n\n"
             },
             timing: eros_engine_llm::model_config::FilterTiming::AfterExtract,
             retry_depth: 0,
-            reasoning: None,
             sampling: Default::default(),
         };
 
@@ -19275,7 +19267,6 @@ data: [DONE]\n\n"
             },
             timing: eros_engine_llm::model_config::FilterTiming::AfterExtract,
             retry_depth: 0,
-            reasoning: None,
             sampling: Default::default(),
         };
 

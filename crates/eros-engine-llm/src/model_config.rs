@@ -301,20 +301,6 @@ impl DisplayOverride {
     }
 }
 
-/// Mirror of OpenRouter's `reasoning` request object. Parsed from TOML and
-/// forwarded to the wire unchanged, so operators control reasoning in the
-/// same shape OpenRouter documents. Every field optional; absent fields are
-/// omitted from the wire. Common uses: `{ enabled = false }` to disable
-/// reasoning entirely, or `{ exclude = true }` to keep reasoning but drop it
-/// from the response. (Extend with `effort`/`max_tokens` here if ever needed.)
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
-pub struct ReasoningConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exclude: Option<bool>,
-}
-
 /// Per-turn filter trigger. Every field optional; the AND of all *specified*
 /// predicates decides whether a turn is filtered. None specified ⇒ filter every
 /// turn. `random` is the probability (0.0–1.0) that a turn passes the random
@@ -837,12 +823,12 @@ pub struct TaskConfig {
     /// semantics as `TierConfig::allow_traits`.
     #[serde(default)]
     pub allow_traits: Option<Vec<String>>,
-    /// Task-level reasoning config (OpenRouter `reasoning` object). Absent →
-    /// omit the param (model default); present → forwarded to the wire (e.g.
-    /// `reasoning = { enabled = false }` to disable). Task-level only — tiers
-    /// inherit, like `temperature`/`max_tokens`.
+    /// Tombstone: the former task-level `reasoning` object. Never read —
+    /// reasoning control is a `[[providers.<name>.body]]` rule now. Parsed
+    /// only so `validate_removed_tasks` can refuse to boot with a migration
+    /// message instead of letting the key silently no-op.
     #[serde(default)]
-    pub reasoning: Option<ReasoningConfig>,
+    pub reasoning: Option<toml::Value>,
     /// Client-facing display override for `meta.model` (chat task only).
     /// Task-level; tiers inherit. Absent → `None` (treated as `false` → the
     /// `model` field is omitted from chat `meta` frames). See `DisplayOverride`.
@@ -1034,9 +1020,6 @@ pub struct ResolvedModel {
     /// Resolved trait allow-list. `None` → no gating; `Some(set)` → the chat
     /// handler keeps only `prompt_traits` whose tag is in `set`.
     pub allow_traits: Option<Vec<String>>,
-    /// Resolved reasoning config (see `TaskConfig::reasoning`). `None` → omit
-    /// the wire param; `Some(cfg)` → forwarded as the `reasoning` object.
-    pub reasoning: Option<ReasoningConfig>,
     /// Number of fallback models the chat burst may try after the primary.
     /// `fallback_model` is already truncated to this length by `resolve()`.
     /// Task-level → tier override precedence, default 2 (primary + 2 fallbacks
@@ -1060,10 +1043,6 @@ pub struct ResolvedOutputFilter {
     pub trigger: OutputFilterTrigger,
     pub timing: FilterTiming,
     pub retry_depth: u32,
-    /// Reasoning config forwarded from `[tasks.chat_output_filter]`. Task-level
-    /// only (no per-tier override), consistent with `chat_companion`'s own
-    /// `reasoning` field shape.
-    pub reasoning: Option<ReasoningConfig>,
     /// Optional sampling knobs from the task block (issue #246).
     pub sampling: Sampling,
 }
@@ -1133,7 +1112,6 @@ pub struct ResolvedInputFilter {
     pub max_tokens: u32,
     pub filter_prompt: String,
     pub retry_depth: u32,
-    pub reasoning: Option<ReasoningConfig>,
     /// Per-turn fire probability in `[0.0, 1.0]` (always > 0.0 here — a 0.0
     /// trigger resolves to `None`). The stream wiring draws one coin flip per
     /// turn and runs the filter LLM only when `draw < probability`.
@@ -1153,7 +1131,6 @@ pub struct ResolvedVision {
     pub max_tokens: u32,
     pub describe_prompt: String,
     pub retry_depth: u32,
-    pub reasoning: Option<ReasoningConfig>,
     /// Optional sampling knobs from the task block (issue #246).
     pub sampling: Sampling,
 }
@@ -1185,7 +1162,6 @@ pub struct ResolvedVoice {
     pub fallback_model: Vec<String>,
     pub temperature: f64,
     pub max_tokens: u32,
-    pub reasoning: Option<ReasoningConfig>,
     pub directive: String,
     pub recall: bool,
     /// Optional sampling knobs from the task block (issue #246).
@@ -1243,7 +1219,6 @@ pub struct ResolvedImagePromptCompose {
     pub max_tokens: u32,
     pub compose_prompt: String,
     pub retry_depth: u32,
-    pub reasoning: Option<ReasoningConfig>,
     /// The Keyed key / Indexed index that selected `compose_prompt`, for the
     /// `metadata.image.compose_variant` audit key. `None` when there was no
     /// variant selection to speak of: `Plain`, no `filter_prompt`, or a miss
@@ -1265,7 +1240,6 @@ pub struct ResolvedPde {
     pub max_tokens: u32,
     pub decision_prompt: String,
     pub retry_depth: u32,
-    pub reasoning: Option<ReasoningConfig>,
     pub structured_output: bool,
     /// Optional sampling knobs from the task block (issue #246).
     pub sampling: Sampling,
@@ -1284,7 +1258,6 @@ pub struct ResolvedProductQa {
     pub max_tokens: u32,
     pub answer_prompt: String,
     pub retry_depth: u32,
-    pub reasoning: Option<ReasoningConfig>,
     /// Optional sampling knobs from the task block (issue #246).
     pub sampling: Sampling,
 }
@@ -1302,7 +1275,6 @@ pub struct ResolvedExtract {
     pub max_tokens: u32,
     pub extract_prompt: String,
     pub retry_depth: u32,
-    pub reasoning: Option<ReasoningConfig>,
     /// Optional sampling knobs from the task block (issue #246).
     pub sampling: Sampling,
 }
@@ -1318,7 +1290,6 @@ pub struct ResolvedWorldDirector {
     pub max_tokens: u32,
     pub director_prompt: String,
     pub retry_depth: u32,
-    pub reasoning: Option<ReasoningConfig>,
     pub structured_output: bool,
     pub interval_hours: u32,
     pub retention_days: u32,
@@ -1337,7 +1308,6 @@ pub struct ResolvedWorldComment {
     pub max_tokens: u32,
     pub comment_prompt: String,
     pub retry_depth: u32,
-    pub reasoning: Option<ReasoningConfig>,
     pub structured_output: bool,
     pub round_secs: u64,
     /// Optional sampling knobs from the task block (issue #246).
@@ -1354,7 +1324,6 @@ pub struct ResolvedWorldReply {
     pub max_tokens: u32,
     pub reply_prompt: String,
     pub retry_depth: u32,
-    pub reasoning: Option<ReasoningConfig>,
     pub debounce_secs: u64,
     pub thread_cooldown_secs: u64,
     pub daily_cap: u32,
@@ -1374,7 +1343,6 @@ pub struct ResolvedWorldStories {
     pub max_tokens: u32,
     pub director_prompt: String,
     pub retry_depth: u32,
-    pub reasoning: Option<ReasoningConfig>,
     pub structured_output: bool,
     pub interval_hours: u32,
     pub retention_days: u32,
@@ -1556,7 +1524,7 @@ impl ModelConfig {
 
     /// Resolve a task's model. Priority for `model`/`fallback`/`allow_traits`:
     /// matched tier block > task default block > `[defaults]` > compiled-in.
-    /// `temperature`/`max_tokens`/`reasoning` are task-level only (no per-tier
+    /// `temperature`/`max_tokens` are task-level only (no per-tier
     /// override).
     pub fn resolve(&self, task: &str, tier: Option<&str>) -> ResolvedModel {
         let task_cfg = self.tasks.get(task);
@@ -1634,9 +1602,6 @@ impl ModelConfig {
             repetition_penalty: task_cfg.and_then(|t| t.repetition_penalty),
         };
 
-        // Task-level only (tiers inherit), mirroring temperature/max_tokens.
-        let reasoning = task_cfg.and_then(|t| t.reasoning.clone());
-
         // retry_depth: tier > task > default 2. Truncate fallback_model to
         // retry_depth entries so the caller never needs to cap the chain.
         let retry_depth = tier_cfg
@@ -1652,7 +1617,6 @@ impl ModelConfig {
             sampling,
             max_tokens,
             allow_traits,
-            reasoning,
             retry_depth,
         }
     }
@@ -1723,10 +1687,6 @@ impl ModelConfig {
             .or(task_cfg.retry_depth)
             .unwrap_or(1); // default 1: primary + first fallback only
 
-        // reasoning: task-level only (no per-tier override), consistent with
-        // chat_companion's own reasoning field.
-        let reasoning = task_cfg.reasoning.clone();
-
         // model / fallback / temperature / max_tokens via the existing resolver
         // (tier → default block → [defaults] → compiled-in). Note: resolve()
         // now truncates fallback_model to its own retry_depth; we re-truncate
@@ -1743,7 +1703,6 @@ impl ModelConfig {
             trigger,
             timing,
             retry_depth,
-            reasoning,
             sampling: m.sampling,
         })
     }
@@ -1790,7 +1749,6 @@ impl ModelConfig {
             max_tokens: m.max_tokens,
             filter_prompt,
             retry_depth,
-            reasoning: task_cfg.reasoning.clone(),
             probability,
             sampling: m.sampling,
         })
@@ -1819,7 +1777,6 @@ impl ModelConfig {
             max_tokens: m.max_tokens,
             describe_prompt,
             retry_depth,
-            reasoning: task_cfg.reasoning.clone(),
             sampling: m.sampling,
         })
     }
@@ -1857,7 +1814,6 @@ impl ModelConfig {
             fallback_model: m.fallback_model,
             temperature: m.temperature,
             max_tokens: m.max_tokens,
-            reasoning: m.reasoning,
             directive,
             recall,
             sampling: m.sampling,
@@ -1905,7 +1861,6 @@ impl ModelConfig {
             max_tokens: m.max_tokens,
             decision_prompt,
             retry_depth,
-            reasoning: task_cfg.reasoning.clone(),
             structured_output: task_cfg.structured_output.unwrap_or(true),
             sampling: m.sampling,
         })
@@ -1934,7 +1889,6 @@ impl ModelConfig {
             max_tokens: m.max_tokens,
             answer_prompt,
             retry_depth,
-            reasoning: task_cfg.reasoning.clone(),
             sampling: m.sampling,
         })
     }
@@ -2063,7 +2017,6 @@ impl ModelConfig {
             max_tokens: m.max_tokens,
             compose_prompt,
             retry_depth,
-            reasoning: task_cfg.reasoning.clone(),
             variant_key,
             sampling: m.sampling,
         })
@@ -2146,7 +2099,6 @@ impl ModelConfig {
             max_tokens: m.max_tokens,
             compose_prompt,
             retry_depth,
-            reasoning: task_cfg.reasoning.clone(),
             variant_key,
             sampling: m.sampling,
         })
@@ -2280,7 +2232,7 @@ impl ModelConfig {
     }
 
     /// Shared resolver for the config-driven extraction prompts. Mirrors
-    /// `resolve_vision` but takes model/fallback/temp/max_tokens/reasoning/retry_depth
+    /// `resolve_vision` but takes model/fallback/temp/max_tokens/retry_depth
     /// straight from `resolve()` so the call site keeps today's selection semantics.
     fn resolve_extract(&self, task: &str) -> Option<ResolvedExtract> {
         let task_cfg = self.tasks.get(task)?;
@@ -2296,7 +2248,6 @@ impl ModelConfig {
             max_tokens: m.max_tokens,
             extract_prompt,
             retry_depth: m.retry_depth,
-            reasoning: m.reasoning,
             sampling: m.sampling,
         })
     }
@@ -2353,7 +2304,6 @@ impl ModelConfig {
             max_tokens: m.max_tokens,
             director_prompt,
             retry_depth: m.retry_depth,
-            reasoning: m.reasoning,
             structured_output: task_cfg.structured_output.unwrap_or(true),
             // .max(1): 0 would make the director eligible every sweeper tick
             // (~288 calls/owner/day at the default 300s tick) — a cost footgun,
@@ -2381,7 +2331,6 @@ impl ModelConfig {
             max_tokens: m.max_tokens,
             comment_prompt,
             retry_depth: m.retry_depth,
-            reasoning: m.reasoning,
             structured_output: task_cfg.structured_output.unwrap_or(true),
             round_secs: task_cfg.round_secs.unwrap_or(3600).max(60),
             sampling: m.sampling,
@@ -2426,7 +2375,6 @@ impl ModelConfig {
             max_tokens: m.max_tokens,
             reply_prompt,
             retry_depth: m.retry_depth,
-            reasoning: m.reasoning,
             debounce_secs,
             thread_cooldown_secs: task_cfg.thread_cooldown_secs.unwrap_or(600),
             daily_cap: task_cfg.daily_cap.unwrap_or(20),
@@ -2452,7 +2400,6 @@ impl ModelConfig {
             max_tokens: m.max_tokens,
             director_prompt,
             retry_depth: m.retry_depth,
-            reasoning: m.reasoning,
             structured_output: task_cfg.structured_output.unwrap_or(true),
             // .max(1) floors mirror world_director: 0 would fire every tick /
             // empty the evidence window — cost/behavior footguns, not settings.
@@ -2563,7 +2510,7 @@ impl ModelConfig {
     /// ("commented out" ⇒ built-in default) exists for keys that are actually
     /// read; here it would reproduce the exact silence this gate removes.
     /// Every other field on these blocks (model, fallback, temperature,
-    /// max_tokens, reasoning) stays configurable.
+    /// max_tokens) stays configurable.
     pub fn validate_affinity_prompt_unset(&self) -> Result<(), String> {
         // Both affinity tasks' prompts are engine-owned: the evaluator
         // (issue #210) and the feeling-clause summarizer (spec 2026-09-03),
@@ -2589,7 +2536,7 @@ impl ModelConfig {
                     "[tasks.{task}].filter_prompt is set, but this task's prompt is \
                      engine-owned and deliberately not configurable — it was never read, \
                      and eros-engine refuses to boot rather than let it silently no-op. Remove the \
-                     key; model/fallback/temperature/max_tokens/reasoning remain configurable. \
+                     key; model/fallback/temperature/max_tokens remain configurable. \
                      Rationale: {rationale}"
                 ));
             }
@@ -2614,7 +2561,7 @@ impl ModelConfig {
     /// EVERY shape, blank included — blank leniency exists for keys that are
     /// actually read, and here it would reproduce the exact silence this gate
     /// removes. Every other field on the block (model, fallback, temperature,
-    /// max_tokens, sampling, reasoning) stays configurable; those are the whole
+    /// max_tokens, sampling) stays configurable; those are the whole
     /// point of the block existing separately from stage 1.
     ///
     /// Covers all three structuring blocks. The affinity gate stays separate:
@@ -2651,9 +2598,9 @@ impl ModelConfig {
                      engine-owned and deliberately not configurable — it was never read, and \
                      eros-engine refuses to boot rather than let it silently no-op. The prompt \
                      must stay in lockstep with the {table} columns it fills. Remove the key; \
-                     model/fallback/temperature/max_tokens/sampling/reasoning remain \
-                     configurable. To change what stage 1 extracts, set \
-                     [tasks.{stage1}].filter_prompt instead."
+                     model/fallback/temperature/max_tokens/sampling remain configurable. \
+                     To change what stage 1 extracts, set [tasks.{stage1}].filter_prompt \
+                     instead."
                 ));
             }
         }
@@ -3232,6 +3179,28 @@ impl ModelConfig {
                     .to_string(),
             );
         }
+        // `[tasks.*].reasoning` still PARSES (tombstone, like the removed
+        // [defaults] keys) purely so an operator upgrading across the removal
+        // gets this message instead of a silently dead key. Rejected in every
+        // shape, blank included — the key is never read.
+        let mut removed: Vec<&String> = self
+            .tasks
+            .iter()
+            .filter(|(_, t)| t.reasoning.is_some())
+            .map(|(n, _)| n)
+            .collect();
+        removed.sort();
+        if let Some(task) = removed.first() {
+            return Err(format!(
+                "[tasks.{task}].reasoning was removed: reasoning control is an ordinary \
+                 body param on the provider entry —\n\
+                 [[providers.openrouter.body]]\n\
+                 tasks  = [\"{task}\"]\n\
+                 params = {{ reasoning = {{ enabled = false }} }}\n\
+                 (omit `tasks` to apply it to every task on that provider). Delete the \
+                 [tasks.*] key."
+            ));
+        }
         Ok(())
     }
 
@@ -3643,7 +3612,6 @@ retry_depth  = 1
 temperature  = 0.3
 max_tokens   = 400
 filter_prompt = "Rewrite per policy."
-reasoning    = { enabled = false }
 
 [tasks.chat_product_qa]
 model        = "x-ai/grok-4-mini"
@@ -3930,60 +3898,6 @@ fallback = ""
         );
     }
 
-    #[test]
-    fn resolve_reads_task_level_reasoning_and_tiers_inherit() {
-        let toml = r#"
-[tasks.chat_companion]
-model = "m"
-reasoning = { enabled = false }
-
-[tasks.chat_companion.tiers.free]
-model = "free-m"
-"#;
-        let cfg = ModelConfig::from_toml_str(toml).unwrap();
-        let expected = ReasoningConfig {
-            enabled: Some(false),
-            exclude: None,
-        };
-        // Task-level value applies with no tier...
-        assert_eq!(
-            cfg.resolve("chat_companion", None).reasoning,
-            Some(expected.clone())
-        );
-        // ...and a tier that doesn't override it inherits the task value.
-        assert_eq!(
-            cfg.resolve("chat_companion", Some("free")).reasoning,
-            Some(expected)
-        );
-    }
-
-    #[test]
-    fn resolve_reasoning_absent_is_none() {
-        let toml = r#"
-[tasks.chat_companion]
-model = "m"
-"#;
-        let cfg = ModelConfig::from_toml_str(toml).unwrap();
-        assert_eq!(cfg.resolve("chat_companion", None).reasoning, None);
-    }
-
-    #[test]
-    fn resolve_reasoning_parses_exclude_field() {
-        let toml = r#"
-[tasks.chat_companion]
-model = "m"
-reasoning = { exclude = true }
-"#;
-        let cfg = ModelConfig::from_toml_str(toml).unwrap();
-        assert_eq!(
-            cfg.resolve("chat_companion", None).reasoning,
-            Some(ReasoningConfig {
-                enabled: None,
-                exclude: Some(true),
-            })
-        );
-    }
-
     // Regression: the committed deployed config (examples/model_config.toml,
     // copied to /etc/eros-engine in the Docker image) must always parse and
     // must define the affinity_evaluation task the post-process evaluator
@@ -4038,25 +3952,25 @@ reasoning = { exclude = true }
     }
 
     #[test]
-    fn committed_example_chat_companion_disables_reasoning() {
+    fn committed_example_disables_chat_companion_reasoning_via_body_rule() {
         let text = include_str!("../../../examples/model_config.toml");
         let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml must parse");
-        let disabled = ReasoningConfig {
-            enabled: Some(false),
-            exclude: None,
-        };
-        // Disabled for the default block...
+        // No task carries the removed key, and the body-only `openrouter`
+        // entry passes the provider gate…
+        cfg.validate_removed_tasks().expect("example must boot");
+        cfg.validate_providers_with(|_| Some("k".to_string()))
+            .expect("example's [providers] must boot");
+        // …and the rule that replaced it is scoped to chat_companion.
+        let rules = cfg.openrouter_body_rules();
+        let rule = rules
+            .iter()
+            .find(|r| r.params.get("reasoning").is_some())
+            .expect("example declares a reasoning body rule");
         assert_eq!(
-            cfg.resolve("chat_companion", None).reasoning,
-            Some(disabled.clone())
+            rule.tasks.as_deref(),
+            Some(&["chat_companion".to_string()][..])
         );
-        // ...and inherited by the free tier (no per-tier override).
-        assert_eq!(
-            cfg.resolve("chat_companion", Some("free")).reasoning,
-            Some(disabled)
-        );
-        // Untouched tasks stay at model default.
-        assert_eq!(cfg.resolve("insight_extraction", None).reasoning, None);
+        assert_eq!(rule.params["reasoning"]["enabled"], false);
     }
 
     #[test]
@@ -4524,45 +4438,6 @@ trigger = { traits = { any = ["a"] } }
         assert_eq!(v, serde_json::json!({}));
     }
 
-    // ─── Item 1: reasoning threaded through resolve_output_filter ─────────
-
-    #[test]
-    fn resolve_output_filter_threads_reasoning() {
-        let cfg: ModelConfig = toml::from_str(
-            r#"
-[tasks.chat_companion]
-output_filter = true
-model = "x/y"
-
-[tasks.chat_output_filter]
-model = "filter/m"
-filter_prompt = "rewrite"
-reasoning = { enabled = false }
-"#,
-        )
-        .unwrap();
-        let resolved = cfg.resolve_output_filter(None).expect("filter resolved");
-        assert!(resolved.reasoning.is_some());
-    }
-
-    #[test]
-    fn resolve_output_filter_reasoning_absent_is_none() {
-        let cfg: ModelConfig = toml::from_str(
-            r#"
-[tasks.chat_companion]
-output_filter = true
-model = "x/y"
-
-[tasks.chat_output_filter]
-model = "filter/m"
-filter_prompt = "rewrite"
-"#,
-        )
-        .unwrap();
-        let resolved = cfg.resolve_output_filter(None).expect("filter resolved");
-        assert!(resolved.reasoning.is_none());
-    }
-
     // ─── Item 2: chat_companion retry_depth ───────────────────────────────
 
     #[test]
@@ -4762,7 +4637,6 @@ retry_depth = 1
 temperature = 0.3
 max_tokens = 400
 filter_prompt = "REWRITE"
-reasoning = { enabled = false }
 "#;
         let cfg = ModelConfig::from_toml_str(toml).unwrap();
         let f = cfg.resolve_input_filter().expect("enabled");
@@ -4774,13 +4648,6 @@ reasoning = { enabled = false }
         assert_eq!(f.temperature, 0.3);
         assert_eq!(f.max_tokens, 400);
         assert_eq!(f.probability, 1.0); // `input_filter = true` ⇒ always
-        assert_eq!(
-            f.reasoning,
-            Some(ReasoningConfig {
-                enabled: Some(false),
-                exclude: None
-            })
-        );
     }
 
     #[test]
@@ -5514,7 +5381,6 @@ fallback     = ["deepseek/deepseek-chat-v3.2", "b", "c"]
 retry_depth  = 1
 temperature  = 0.3
 max_tokens   = 800
-reasoning    = { enabled = false }
 filter_prompt = "只根据产品资料作答。"
         "#;
         let cfg = ModelConfig::from_toml_str(toml).unwrap();
@@ -7855,6 +7721,38 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
     fn validate_removed_tasks_ok_without_block() {
         let cfg = ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel=\"x\"\n").unwrap();
         assert!(cfg.validate_removed_tasks().is_ok());
+    }
+
+    #[test]
+    fn removed_task_reasoning_refuses_boot_in_every_shape() {
+        for src in [
+            "[tasks.chat_companion]\nmodel=\"x\"\nreasoning = { enabled = false }\n",
+            "[tasks.pde_decision]\nmodel=\"x\"\nreasoning = { exclude = true }\n",
+            "[tasks.chat_vision]\nmodel=\"x\"\nreasoning = {}\n",
+            "[tasks.insight_extraction]\nmodel=\"x\"\nreasoning = \"\"\n",
+        ] {
+            let cfg = ModelConfig::from_toml_str(src).unwrap();
+            let err = cfg.validate_removed_tasks().unwrap_err();
+            assert!(
+                err.contains("].reasoning was removed"),
+                "message names the removed key for {src:?}: {err}"
+            );
+            assert!(
+                err.contains("[[providers.openrouter.body]]"),
+                "message gives the body-rule replacement for {src:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn removed_task_reasoning_message_names_the_task() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel=\"x\"\n\
+             [tasks.pde_decision]\nmodel=\"y\"\nreasoning = { enabled = false }\n",
+        )
+        .unwrap();
+        let err = cfg.validate_removed_tasks().unwrap_err();
+        assert!(err.starts_with("[tasks.pde_decision].reasoning"), "{err}");
     }
 
     #[test]

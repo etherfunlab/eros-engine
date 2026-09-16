@@ -250,7 +250,6 @@ async fn classify_session(
         max_tokens: resolved.max_tokens,
         sampling: resolved.sampling,
         user: Some(SYSTEM_AUDIT_USER.into()),
-        reasoning: resolved.reasoning,
         task: Some(MEMORY_TASK.into()),
         ..Default::default()
     };

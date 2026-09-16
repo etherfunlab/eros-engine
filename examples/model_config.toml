@@ -49,9 +49,9 @@
 #   literal "@" inside a model id is escaped "\@" (in TOML: "weird\\@vendor/m").
 # - Model-keyed tables (`display`, `output_regex` models, `output_filter`
 #   trigger models) always use the BARE id, never "id@provider".
-# - Custom providers receive a strict OpenAI-compatible request: per-task
-#   `reasoning` is inert for them; they receive exactly the headers (and any
-#   [[providers.<name>.body]] rules, see below) you declare for that entry.
+# - Custom providers receive a strict OpenAI-compatible request plus exactly
+#   the headers (and any [[providers.<name>.body]] rules, see below) you
+#   declare for that entry.
 # - Under MODEL_CONFIG_DIR, [providers] merges as ONE top-level key.
 #
 # Per-provider custom body parameters. `params` is merged into the request
@@ -61,6 +61,15 @@
 #[[providers.venice.body]]
 #tasks  = ["chat_companion"]
 #params = { venice_parameters = { include_venice_system_prompt = false } }
+#
+# Reasoning control lives here too (same shape as OpenRouter's `reasoning`
+# object; `{ exclude = true }` keeps it generated but hidden). Companion
+# replies only render `content`, so the reasoning channel is wasted latency
+# and cost — off for chat_companion, and every tier inherits the rule.
+# Omit `tasks` to switch it off for every task on this provider.
+[[providers.openrouter.body]]
+tasks  = ["chat_companion"]
+params = { reasoning = { enabled = false } }
 #
 # Covers chat_vision too, even though that stage builds its own body — the
 # lever for models that ignore `reasoning = { enabled = false }`, reason
@@ -118,11 +127,6 @@ top_p = 0.9
 frequency_penalty = 0.4
 presence_penalty = 0.2
 max_tokens = 1600
-# Companion replies only render `content`; the reasoning channel is ignored,
-# so disable it to save latency/cost. Same shape as OpenRouter's `reasoning`
-# object — set `{ exclude = true }` instead if you want it generated but hidden.
-# Inherited by every tier below.
-reasoning = { enabled = false }
 # Controls the `model` value sent to clients in chat `meta` frames. Affects ONLY
 # the client display — never the OpenRouter call or the persisted row. Omit this
 # line and the field defaults to `false` (the model name is NOT sent). Four forms:
@@ -255,8 +259,6 @@ model_name_display_override = true
 #retry_depth  = 1
 #temperature  = 0.3
 #max_tokens   = 400
-# Reasoning is OFF by default here (the filter only needs a short JSON verdict).
-#reasoning    = { enabled = false }
 #filter_prompt = """
 #You are an input-cleaning filter for a companion chat. You receive the recent
 #conversation and the user's latest input. Decide whether the latest input is a
@@ -287,7 +289,6 @@ model_name_display_override = true
 #retry_depth  = 1
 #temperature  = 0.2
 #max_tokens   = 400
-#reasoning    = { enabled = false }
 #filter_prompt = """
 #你是图像识别助手。只输出 JSON，字段：
 #  "description": 画面/主体/正在发生什么（必填）
@@ -339,7 +340,6 @@ model_name_display_override = true
 #retry_depth  = 1
 #temperature  = 0.7
 #max_tokens   = 700
-#reasoning    = { enabled = false }
 #
 # This task's `filter_prompt` accepts VARIANTS. The consumer
 # picks one per chat turn via `image.prompt_variant` on the send-message body.
@@ -409,7 +409,6 @@ model_name_display_override = true
 #retry_depth  = 1
 #temperature  = 0.7
 #max_tokens   = 700
-#reasoning    = { enabled = false }
 #
 # `filter_prompt` accepts the same three shapes as the composer above (plain /
 # array-by-index / table-by-key), selected per request via `prompt_variant` on
@@ -433,8 +432,6 @@ max_tokens = 1200
 # changes nothing. See the comment above [tasks.insight_structuring] for why
 # stage 2 keeps the same number rather than shrinking to match the
 # character/user structuring blocks.
-# Optional: force the extraction model's reasoning off (default = model decides).
-#reasoning = { enabled = false }
 # Facts-stage system instruction. The server sends the turn ("用户: …\nAI: …")
 # as a separate user message. Dual-track output: `facts` (plain strings — feeds
 # the structured-insights stage and the chat path) + `details` (per-fact
@@ -656,8 +653,6 @@ max_tokens = 1200
 # Remove this entire [tasks.memory_extraction] section to disable session-end
 # memory extraction (the dreaming sweeper then stays inert). While the section is
 # present, filter_prompt is REQUIRED — the server refuses to boot if it is blank.
-# Optional: force the extraction model's reasoning off (default = model decides).
-#reasoning = { enabled = false }
 # Memory-extraction system instruction. The server sends the conversation
 # (用户：X / AI：Y lines) as a separate user message. `category` keeps the fixed
 # five-value vocabulary — it is the recall grouping key (unknown values collapse
@@ -716,7 +711,6 @@ model       = "anthropic/claude-haiku-4.5"
 #retry_depth = 1
 temperature = 0.3
 max_tokens  = 400
-#reasoning   = { enabled = false }
 #ghosting    = false   # uncomment to hard-disable ghosting for this deployment
 #structured_output = true   # send response_format=json_schema on the judge (default true); set false if your provider 400s on it
 # Uncomment filter_prompt to enable the LLM judge. inner_state / clothing MUST be
@@ -760,7 +754,6 @@ max_tokens  = 400
 #retry_depth  = 1
 #temperature  = 0.3
 #max_tokens   = 800
-#reasoning    = { enabled = false }
 #filter_prompt = """
 #你是 XX 产品的官方说明助手。以下是产品资料：
 #…（产品定位、功能、价格、会员、退订方式等）…
@@ -923,7 +916,6 @@ model = "voyage-4-lite"
 #fallback     = ["vendor/backup-model"]
 #temperature  = 0.8
 #max_tokens   = 300
-#reasoning    = { enabled = false }
 #filter_prompt = """
 #…optional override of the built-in voice directive…
 #"""
