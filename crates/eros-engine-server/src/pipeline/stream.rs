@@ -5779,7 +5779,10 @@ mod tests {
             operation_failure_pointer(&[gw.clone(), up.clone()]),
             "upstream_error"
         );
-        assert_eq!(operation_failure_pointer(&[gw.clone()]), "gateway_error");
+        assert_eq!(
+            operation_failure_pointer(std::slice::from_ref(&gw)),
+            "gateway_error"
+        );
         // Nothing recorded ⇒ the gateway default, matching the pre-walk seed
         // the compose endpoint starts from.
         assert_eq!(operation_failure_pointer(&[]), "gateway_error");
