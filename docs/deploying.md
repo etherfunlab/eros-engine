@@ -279,6 +279,6 @@ call. Details, data model, and the boot-validation rules are in
 
 ## Source
 
-- `docker/Dockerfile` — multi-stage build (Rust 1.88 builder → debian:bookworm-slim runtime); the same artifact behind `ghcr.io/etherfunlab/eros-engine`
+- `docker/Dockerfile` — multi-stage build (Rust 1.98 builder → debian:bookworm-slim runtime); the same artifact behind `ghcr.io/etherfunlab/eros-engine`
 - `crates/eros-engine-server/src/main.rs` — subcommand dispatch (the four modes above)
 - [`.env.example`](../.env.example) — operational env-var list (details in this guide)

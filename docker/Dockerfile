@@ -2,7 +2,7 @@
 # syntax=docker/dockerfile:1.6
 
 # ---- builder ----
-FROM rust:1.88-bookworm AS builder
+FROM rust:1.98-bookworm AS builder
 WORKDIR /build
 
 # Pre-fetch crates so source edits don't bust this layer.

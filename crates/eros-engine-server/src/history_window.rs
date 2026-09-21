@@ -190,7 +190,11 @@ mod tests {
     /// Even indices are `user`, odd are `assistant`.
     fn alt(i: usize) -> Injected {
         inj(
-            if i % 2 == 0 { "user" } else { "assistant" },
+            if i.is_multiple_of(2) {
+                "user"
+            } else {
+                "assistant"
+            },
             &i.to_string(),
         )
     }
