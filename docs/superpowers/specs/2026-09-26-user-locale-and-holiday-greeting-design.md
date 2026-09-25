@@ -39,11 +39,13 @@ implementation.
 2. **Locale arrives per request, never stored.** Three optional fields —
    `user_timezone`, `user_country`, `user_region` — on each text turn, each
    image-edit turn, and the `open` call.
-3. **Holiday data comes from maintained crates, not hand-written tables.**
-   `tyme4rs` for Chinese lunisolar festivals, `py-holidays-rs` for national
-   and subdivision public holidays.
+3. **Calendar data comes from maintained crates.** `tyme4rs` for Chinese
+   lunisolar festivals, `py-holidays-rs` for national and subdivision public
+   holidays. The engine's own table (§3.1) holds only the five fixed-date
+   observances neither crate carries.
 4. **Lunar festivals are not gated by country.** Every user with a valid
-   timezone gets them.
+   timezone gets them. In the engine table, only the October 9 / October 10
+   pair depends on the country.
 5. **Country falls back to the timezone.** When `user_country` is absent the
    engine derives it from `user_timezone` via `iso-rs`.
 6. **The look-ahead window is today plus six days.**
@@ -78,8 +80,20 @@ For a local date `d`, the holiday names are the union of:
     for in-lieu days off, not the holiday itself. `(estimated)` entries are
     kept: they mark the holiday day under a projected calendar.
 
+- **Fixed-date observances (engine table).** A `const` table in `holiday.rs`,
+  matched on month and day:
+
+  | Date | Name | Applies to |
+  |---|---|---|
+  | 02-14 | 情人节 | everyone |
+  | 10-09 | 辛亥革命纪念日 | resolved country `CN` |
+  | 10-10 | 双十节（中华民国国庆日） | any resolved country other than `CN`, and no country |
+  | 10-25 | 台湾光复节 | everyone |
+  | 12-24 | 平安夜 | everyone |
+
 Names are concatenated in that order with exact duplicates removed. No
-cross-language merging: 中秋节 and `Mid-Autumn Festival` both reach the model.
+cross-language merging: 中秋节 and `Mid-Autumn Festival` both reach the model,
+as do 双十节（中华民国国庆日） and TW's `National Day`.
 
 ### 3.2 Resolving country and region
 
@@ -95,8 +109,9 @@ cross-language merging: 中秋节 and `Mid-Autumn Festival` both reach the model
   digit-leading codes with `_` (`01` → `_01`). An unknown region falls back to
   the national map.
 
-With no country, only lunar festivals apply. With no valid timezone there is
-no user-local date, so no holidays at all.
+With no country, lunar festivals and the engine table apply (October 10 on
+the no-country side). With no valid timezone there is no user-local date, so no
+holidays at all.
 
 ### 3.3 Loading
 
@@ -301,8 +316,11 @@ work.
   - US + `CA`, 2026-11-26 yields `Thanksgiving Day`.
   - `(observed)` and `Day off (substituted …)` entries are dropped.
   - `Asia/Taipei` with no `user_country` resolves to TW.
-  - `user_country = "XX"` yields lunar festivals only and does not fall back to
+  - `user_country = "XX"` yields no public holidays and does not fall back to
     the timezone.
+  - Engine table: 02-14, 10-25 and 12-24 for any country and for none;
+    10-09 辛亥革命纪念日 for CN only; 10-10 双十节 for TW, for US and for no
+    country, never for CN.
   - An unknown region falls back to the national map; a digit-leading region
     resolves through the `_` prefix.
   - The window reports days-ahead correctly across a month boundary.
@@ -338,6 +356,5 @@ work.
 - Storing a user's locale in the engine.
 - Proactive messages for anything other than a holiday, and any scheduler that
   writes messages without a client call.
-- Non-public observances neither crate carries (Valentine's Day, Christmas Eve
-  and the like).
+- Observances beyond the two crates and the five-row engine table.
 - Resolving legacy timezone aliases.
