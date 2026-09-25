@@ -398,6 +398,10 @@ async fn generate_reply_text(
         user_id,
         instance_id,
         instruction_row_id,
+        &crate::prompt::NowContext::for_user(
+            &crate::holiday::UserLocale::default(),
+            chrono::Utc::now(),
+        ),
     )
     .await
     {

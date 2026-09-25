@@ -734,6 +734,7 @@ async fn fetch_stories_context(
 
 /// Build a ChatRequest for the Reply action. Called by the streaming
 /// pipeline (`pipeline::stream::run_stream`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_reply_request(
     state: &AppState,
     input: &DecisionInput,
@@ -742,6 +743,9 @@ pub(crate) async fn build_reply_request(
     user_id: Uuid,
     instance_id: Uuid,
     user_message_id: Uuid,
+    // `[now]`: the instant, the user's timezone and holiday window
+    // (spec 2026-09-26 §5). Callers build it with `NowContext::for_user`.
+    now: &crate::prompt::NowContext,
 ) -> Result<(ChatRequest, Vec<String>), AppError> {
     let chat_repo = ChatRepo { pool: &state.pool };
     // A quote points at one line; it never narrows the window. Every turn gets
@@ -911,6 +915,7 @@ pub(crate) async fn build_reply_request(
         quote,
         character_state_for_prompt,
         plan.nudges,
+        now,
     );
 
     if let Event::UserMessage {
@@ -2892,6 +2897,7 @@ mod tests {
             owner,
             instance_id,
             user_message_id,
+            &crate::prompt::NowContext::default(),
         )
         .await
         .expect("build_reply_request succeeds");
@@ -2947,6 +2953,85 @@ mod tests {
             req.messages.last().unwrap().content,
             "第5轮用户消息",
             "the current turn must be the newest injected message"
+        );
+    }
+
+    /// The user's clock and holiday window reach `[now]` through
+    /// `build_reply_request` (spec 2026-09-26 §5).
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_users_now_context_reaches_the_system_prompt(pool: sqlx::PgPool) {
+        use chrono::TimeZone;
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, owner).await;
+        let session_id = make_session(&pool, owner, Some(instance_id)).await;
+        let user_message_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content) \
+             VALUES ($1, 'user', '中秋快乐') RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let state = crate::routes::companion::test_state(pool.clone());
+        let plan = ActionPlan {
+            action_type: eros_engine_core::types::ActionType::ReplyText,
+            reply_style: eros_engine_core::types::ReplyStyle::Neutral,
+            affinity_deltas: Default::default(),
+            energy_cost: 0.0,
+            context_hints: vec![],
+            reply_mode: None,
+            nudges: Default::default(),
+            clothing: None,
+            image_caption: None,
+            image_ref: eros_engine_core::types::ImageRef::Face,
+            aspect_ratio: None,
+        };
+        let input = DecisionInput {
+            event: Event::UserMessage {
+                content: "中秋快乐".into(),
+                message_id: user_message_id,
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: MemoryScope::None,
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                quote: Default::default(),
+            },
+            affinity: ladder_test_affinity(session_id, owner, instance_id),
+            // No persona timezone ⇒ the persona clock falls back to the user's.
+            persona: ladder_test_persona(instance_id, owner),
+            signals: eros_engine_core::types::ConversationSignals {
+                message_count: 1,
+                hours_since_last_message: 0.1,
+                ghost_streak: 0,
+                hours_since_last_ghost: None,
+            },
+        };
+        let locale = crate::holiday::UserLocale::resolve(Some("Asia/Taipei"), Some("TW"), None);
+        let now = crate::prompt::NowContext::for_user(
+            &locale,
+            chrono::Utc.with_ymd_and_hms(2026, 9, 24, 20, 0, 0).unwrap(),
+        );
+
+        let (req, _tags) = build_reply_request(
+            &state,
+            &input,
+            &plan,
+            session_id,
+            owner,
+            instance_id,
+            user_message_id,
+            &now,
+        )
+        .await
+        .expect("build_reply_request succeeds");
+
+        let system = &req.messages[0].content;
+        assert!(system.contains("现在你当地时间是 2026-09-25"), "{system}");
+        assert!(
+            system.contains("对方那边今天是中秋节、Mid-Autumn Festival"),
+            "{system}"
         );
     }
 
@@ -3065,6 +3150,7 @@ mod tests {
             owner,
             instance_id,
             user_message_id,
+            &crate::prompt::NowContext::default(),
         )
         .await
         .expect("build_reply_request succeeds");
@@ -3261,6 +3347,7 @@ mod tests {
             owner,
             instance_id,
             user_message_id,
+            &crate::prompt::NowContext::default(),
         )
         .await
         .expect("build_reply_request succeeds");
@@ -3358,6 +3445,7 @@ mod tests {
             owner,
             instance_id,
             user_message_id,
+            &crate::prompt::NowContext::default(),
         )
         .await
         .expect("build_reply_request succeeds");

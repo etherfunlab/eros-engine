@@ -5233,10 +5233,14 @@ pub fn run_stream(
                     } else {
                         AbortOnDrop(None)
                     };
+                let now_ctx = crate::prompt::NowContext::for_user(
+                    &crate::holiday::UserLocale::default(),
+                    chrono::Utc::now(),
+                );
                 let req_res = crate::pipeline::handlers::build_reply_request(
                     &state, &input, &plan,
                     user_msg.session_id, user_msg.user_id, user_msg.instance_id,
-                    user_msg.user_message_id,
+                    user_msg.user_message_id, &now_ctx,
                 ).await;
                 let (req, injected_tags) = match req_res {
                     Ok(r) => r,
