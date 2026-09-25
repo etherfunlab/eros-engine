@@ -75,7 +75,9 @@ For a local date `d`, the holiday names are the union of:
   - When a region resolves (§3.2) and the country has a map for it, that map
     is used — python-holidays subdivision maps already include the national
     holidays. Otherwise the `National` map.
-  - Entries whose name contains `(observed` or starts with
+  - python-holidays joins several holidays on one date with `; `
+    (`Boxing Day; Christmas Day (observed)`), so an entry is split on `; `
+    first. Parts whose name contains `(observed` or starts with
     `Day off (substituted` are dropped. These are python-holidays' fixed labels
     for in-lieu days off, not the holiday itself. `(estimated)` entries are
     kept: they mark the holiday day under a projected calendar.
