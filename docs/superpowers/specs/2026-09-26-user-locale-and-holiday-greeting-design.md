@@ -148,9 +148,10 @@ async path snapshots the fields into `QueuedTurnParams`) and to
 | `user_country` | ISO 3166-1 alpha-2, as the client received it | unknown code → no country |
 | `user_region` | ISO 3166-2 subdivision without the country prefix | used only with `user_country`; unknown → national |
 
-The raw values are recorded on the turn's user row metadata next to
-`prompt_traits_raw` (and on the image-edit instruction row), so a replay can
-rebuild the prompt. The fields reach `build_reply_request` through the
+The raw values are recorded next to the turn's other request knobs, so a
+replay can rebuild the prompt: on the chat turn's user row metadata beside
+`prompt_traits_raw`, and on an image edit's text-half assistant row beside
+`tier` — the only image-edit row whose prompt the locale shapes. The fields reach `build_reply_request` through the
 server-side `PersistedUserMessage`; `eros_engine_core::types::Event` does not
 change.
 
@@ -188,8 +189,11 @@ seconds, one non-streaming call); clients should not block UI on it. The row
 also lands in `chat_messages`, so change feeds and the history endpoint see it,
 and it is unread (`read_at` NULL) like any assistant reply.
 
-**Errors:** session ownership and persona checks as on the chat routes. A
-generation failure returns 502 and persists nothing; the next open retries.
+**Errors:** session ownership, channel and persona checks as on the chat
+routes; the same per-user in-flight cap (429). A generation failure returns the
+upstream error the image endpoints return (the provider's status passes
+through, 502 by default) and persists nothing; a blank reply persists nothing
+and returns `null`. Either way the next open retries.
 
 ## 5. `[now]` rendering
 
@@ -338,7 +342,9 @@ work.
     no-op that returns the first row.
   - The widened CHECK accepts `'proactive'`.
 - **Request plumbing:** the three fields reach the user row metadata on the
-  stream, async and image-edit paths; an invalid timezone still produces a turn.
+  stream and async paths and the text-half assistant row on the image-edit
+  path, and they reach the prompt on all three; an invalid timezone still
+  produces a turn.
 - `openapi.json` regenerated.
 
 ## 10. Documentation
