@@ -138,6 +138,19 @@ pub struct StreamSendRequest {
     /// (recorded in metadata). History is never truncated either way.
     #[serde(default)]
     pub reply_to_message_id: Option<Uuid>,
+    /// The user's IANA timezone. The `[now]` persona clock falls back to it
+    /// when the persona has none, and it dates the user-side holiday line.
+    /// Unparseable ⇒ treated as absent; the turn proceeds.
+    #[serde(default)]
+    pub user_timezone: Option<String>,
+    /// ISO 3166-1 alpha-2 country, as the client received it. Absent ⇒ derived
+    /// from `user_timezone`; unknown ⇒ no public holidays.
+    #[serde(default)]
+    pub user_country: Option<String>,
+    /// ISO 3166-2 subdivision without the country prefix (`CA`, `ENG`). Read
+    /// only beside `user_country`; unknown ⇒ national holidays.
+    #[serde(default)]
+    pub user_region: Option<String>,
 }
 
 /// Pre-stream error body per spec §1.3. Schema-only struct for utoipa;
@@ -457,6 +470,12 @@ pub(crate) fn build_user_row_metadata(
             .collect();
         meta_map.insert("prompt_traits_raw".into(), serde_json::Value::Array(arr));
     }
+    crate::holiday::record_raw(
+        &mut meta_map,
+        req.user_timezone.as_deref(),
+        req.user_country.as_deref(),
+        req.user_region.as_deref(),
+    );
     // A quote that resolved is the anchor the history routes hand back; one the
     // caller asked for but we could not find leaves an audit-only error marker.
     match (quote, req.reply_to_message_id) {
@@ -582,6 +601,9 @@ pub async fn send_message_stream(
         image_url: req.image_url.clone(),
         image: req.image.clone(),
         reply_to_message_id: req.reply_to_message_id,
+        user_timezone: req.user_timezone.clone(),
+        user_country: req.user_country.clone(),
+        user_region: req.user_region.clone(),
     })
     .expect("QueuedTurnParams serializes");
     let queue_repo = ChatQueueRepo { pool: &state.pool };
@@ -627,6 +649,11 @@ pub async fn send_message_stream(
                     image_url: req.image_url.clone(),
                     image: req.image.clone(),
                     quote: quote.clone(),
+                    user_locale: crate::holiday::UserLocale::resolve(
+                        req.user_timezone.as_deref(),
+                        req.user_country.as_deref(),
+                        req.user_region.as_deref(),
+                    ),
                 };
                 let turn = ClaimedTurn {
                     queue_id,
@@ -795,6 +822,9 @@ mod tests {
             image_url: None,
             image: None,
             reply_to_message_id: None,
+            user_timezone: None,
+            user_country: None,
+            user_region: None,
         }
     }
 
@@ -811,6 +841,9 @@ mod tests {
             image_url: None,
             image: None,
             reply_to_message_id: None,
+            user_timezone: None,
+            user_country: None,
+            user_region: None,
         }
     }
 
@@ -1925,6 +1958,9 @@ mod validate_payload_tests {
             image_url: None,
             image: None,
             reply_to_message_id: None,
+            user_timezone: None,
+            user_country: None,
+            user_region: None,
         }
     }
 
@@ -2028,6 +2064,9 @@ mod validate_payload_tests {
             image_url: None,
             image: None,
             reply_to_message_id: None,
+            user_timezone: None,
+            user_country: None,
+            user_region: None,
         }
     }
 

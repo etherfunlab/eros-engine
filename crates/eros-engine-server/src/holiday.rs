@@ -211,9 +211,50 @@ pub fn local_midnight_utc(tz: Tz, date: NaiveDate) -> DateTime<Utc> {
         .with_timezone(&Utc)
 }
 
+/// Longest raw locale value copied into row metadata. Anything longer is not
+/// a timezone or ISO code, so it stays out of the audit copy.
+const MAX_RAW_LEN: usize = 64;
+
+/// Copy a request's raw locale fields into a row's metadata (spec §4.1) so a
+/// replay can rebuild the prompt. Absent, blank and overlong values are skipped.
+pub fn record_raw(
+    meta: &mut serde_json::Map<String, serde_json::Value>,
+    timezone: Option<&str>,
+    country: Option<&str>,
+    region: Option<&str>,
+) {
+    for (key, value) in [
+        ("user_timezone", timezone),
+        ("user_country", country),
+        ("user_region", region),
+    ] {
+        if let Some(v) = value
+            .map(str::trim)
+            .filter(|v| !v.is_empty() && v.len() <= MAX_RAW_LEN)
+        {
+            meta.insert(key.into(), serde_json::json!(v));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn record_raw_copies_present_values_and_skips_blank_or_overlong_ones() {
+        let mut m = serde_json::Map::new();
+        record_raw(&mut m, Some("Asia/Taipei"), Some(""), Some(&"x".repeat(65)));
+        assert_eq!(
+            m.get("user_timezone"),
+            Some(&serde_json::json!("Asia/Taipei"))
+        );
+        assert!(!m.contains_key("user_country"));
+        assert!(!m.contains_key("user_region"));
+        let mut empty = serde_json::Map::new();
+        record_raw(&mut empty, None, None, None);
+        assert!(empty.is_empty());
+    }
 
     fn d(y: i32, m: u32, day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, day).unwrap()

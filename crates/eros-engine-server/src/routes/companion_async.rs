@@ -54,6 +54,23 @@ pub(crate) struct QueuedTurnParams {
     pub image: Option<ImageReplyParams>,
     #[serde(default)]
     pub reply_to_message_id: Option<Uuid>,
+    #[serde(default)]
+    pub user_timezone: Option<String>,
+    #[serde(default)]
+    pub user_country: Option<String>,
+    #[serde(default)]
+    pub user_region: Option<String>,
+}
+
+impl QueuedTurnParams {
+    /// The locale the worker drives a queued turn with.
+    pub(crate) fn user_locale(&self) -> crate::holiday::UserLocale {
+        crate::holiday::UserLocale::resolve(
+            self.user_timezone.as_deref(),
+            self.user_country.as_deref(),
+            self.user_region.as_deref(),
+        )
+    }
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -144,6 +161,9 @@ pub async fn send_message_async(
         image_url: req.image_url,
         image: req.image,
         reply_to_message_id: req.reply_to_message_id,
+        user_timezone: req.user_timezone,
+        user_country: req.user_country,
+        user_region: req.user_region,
     })
     .expect("QueuedTurnParams serializes");
 
@@ -498,6 +518,65 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(rows, 0, "a rejected async turn must not persist any row");
+    }
+
+    #[test]
+    fn queued_params_resolve_the_locale_and_tolerate_old_blobs() {
+        // This test module has no `use super::*`.
+        let old: super::QueuedTurnParams = serde_json::from_value(json!({"tier": "gold"})).unwrap();
+        assert_eq!(old.user_locale(), crate::holiday::UserLocale::default());
+        let new: super::QueuedTurnParams = serde_json::from_value(
+            json!({"user_timezone": "Asia/Taipei", "user_country": "TW", "user_region": "TPE"}),
+        )
+        .unwrap();
+        assert_eq!(
+            new.user_locale(),
+            crate::holiday::UserLocale::resolve(Some("Asia/Taipei"), Some("TW"), Some("TPE"))
+        );
+    }
+
+    // The locale rides into the user row's metadata and the queue params; an
+    // unparseable timezone still enqueues (spec §4.1: never reject).
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn async_records_the_raw_locale_and_queues_it(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let mut app = build_router(test_state(pool.clone()));
+        let token = mint_test_jwt(user_id);
+
+        let (status, body) = post_json(
+            &mut app,
+            &async_uri(session_id),
+            &token,
+            json!({"content": "hi", "client_msg_id": "01JV00000000000000000LOC1A",
+                   "user_timezone": "Not/AZone", "user_country": "TW", "user_region": "TPE"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "body: {body}");
+        let umid = Uuid::parse_str(body["user_message_id"].as_str().unwrap()).unwrap();
+
+        let meta: Value =
+            sqlx::query_scalar("SELECT metadata FROM engine.chat_messages WHERE id = $1")
+                .bind(umid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(meta["user_timezone"], json!("Not/AZone"));
+        assert_eq!(meta["user_country"], json!("TW"));
+        assert_eq!(meta["user_region"], json!("TPE"));
+
+        let params: Value = sqlx::query_scalar(
+            "SELECT params FROM engine.chat_turn_queue WHERE user_message_id = $1",
+        )
+        .bind(umid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(params["user_timezone"], json!("Not/AZone"));
+        assert_eq!(params["user_country"], json!("TW"));
+        assert_eq!(params["user_region"], json!("TPE"));
     }
 
     // The pre-rename path is gone from the spec, not merely unrouted: a

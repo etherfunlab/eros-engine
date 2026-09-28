@@ -4081,6 +4081,9 @@ pub struct PersistedUserMessage {
     /// `reply_to_message_id`. `None` for ordinary turns and for an id that did
     /// not resolve; history is the normal window either way.
     pub quote: Option<eros_engine_core::types::QuotedMessage>,
+    /// The user's locale as the request carried it, resolved
+    /// (spec 2026-09-26 §4.1). Feeds `[now]`.
+    pub user_locale: crate::holiday::UserLocale,
 }
 
 /// Produce a stream of `ProtocolFrame` events for a single burst. The
@@ -5234,7 +5237,7 @@ pub fn run_stream(
                         AbortOnDrop(None)
                     };
                 let now_ctx = crate::prompt::NowContext::for_user(
-                    &crate::holiday::UserLocale::default(),
+                    &user_msg.user_locale,
                     chrono::Utc::now(),
                 );
                 let req_res = crate::pipeline::handlers::build_reply_request(
@@ -7130,6 +7133,7 @@ mod tests {
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -7500,6 +7504,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -7598,6 +7603,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -7735,6 +7741,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -7880,6 +7887,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -7991,6 +7999,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -8093,6 +8102,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -8205,6 +8215,7 @@ data: [DONE]\n\n";
                     ..Default::default()
                 }),
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -8388,6 +8399,7 @@ data: [DONE]\n\n";
                     ..Default::default()
                 }),
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -8491,6 +8503,7 @@ data: [DONE]\n\n";
                     ..Default::default()
                 }),
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -8990,6 +9003,7 @@ data: [DONE]\n\n";
                 image_url: Some("https://example.invalid/u.jpg".into()),
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -9116,6 +9130,7 @@ data: [DONE]\n\n";
                     ..Default::default()
                 }),
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -9241,6 +9256,7 @@ data: [DONE]\n\n";
                 // means reply_image (spec 2026-08-03 §1).
                 image: Some(crate::routes::companion_stream::ImageReplyParams::default()),
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -9423,6 +9439,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: Some(crate::routes::companion_stream::ImageReplyParams::default()),
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -9557,6 +9574,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: Some(crate::routes::companion_stream::ImageReplyParams::default()),
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -9726,6 +9744,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: Some(crate::routes::companion_stream::ImageReplyParams::default()),
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -9909,6 +9928,7 @@ data: [DONE]\n\n";
                 // means reply_image (spec 2026-08-03 §1).
                 image: Some(crate::routes::companion_stream::ImageReplyParams::default()),
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -10082,6 +10102,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -10903,6 +10924,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -11031,6 +11053,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -11545,6 +11568,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -11689,6 +11713,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -11856,6 +11881,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -11973,6 +11999,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -12089,6 +12116,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -12185,6 +12213,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -12293,6 +12322,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -12404,6 +12434,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -12533,6 +12564,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -12735,6 +12767,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -12861,6 +12894,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -12984,6 +13018,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -13095,6 +13130,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -13271,6 +13307,7 @@ data: [DONE]\n\n";
                 image_url: Some("https://x/y.png".into()),
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -13472,6 +13509,7 @@ data: [DONE]\n\n";
                 image_url: Some("https://x/bad.png".into()),
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -13622,6 +13660,7 @@ data: [DONE]\n\n";
                 image_url: Some("https://x/522.png".into()),
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -13759,6 +13798,7 @@ data: [DONE]\n\n";
                 image_url: Some("https://x/523.png".into()),
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -13918,6 +13958,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -14076,6 +14117,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -14209,6 +14251,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -14339,6 +14382,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -14495,6 +14539,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -14690,6 +14735,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -14835,6 +14881,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -14989,6 +15036,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -15168,6 +15216,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -15399,6 +15448,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -15547,6 +15597,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -15680,6 +15731,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -15855,6 +15907,7 @@ data: [DONE]\n\n";
                     sent_at: chrono::Utc::now(),
                     trigger: None,
                 }),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -15973,6 +16026,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -16110,6 +16164,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -16261,6 +16316,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -16497,6 +16553,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -16613,6 +16670,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -16756,6 +16814,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -16851,6 +16910,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -18090,6 +18150,7 @@ data: [DONE]\n\n";
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
@@ -19597,6 +19658,7 @@ data: [DONE]\n\n"
                 image_url: None,
                 image: None,
                 quote: Default::default(),
+                user_locale: Default::default(),
             },
             None,
         )
