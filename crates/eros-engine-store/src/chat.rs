@@ -520,6 +520,20 @@ pub struct AssistantInsert {
     pub gateway_errors: Option<serde_json::Value>,
 }
 
+/// One persona-initiated assistant row: `assistant_action_type = 'proactive'`,
+/// `user_message_id` NULL. `metadata` must carry `local_date` — the partial
+/// unique index keys on it (migration 0063).
+#[derive(Debug, Clone)]
+pub struct ProactiveInsert {
+    pub id: Uuid,
+    pub content: String,
+    /// `record_generation`'s return value, as on `AssistantInsert`.
+    pub generation_id: Option<String>,
+    pub metadata: serde_json::Value,
+    pub llm_attempts: Option<serde_json::Value>,
+    pub gateway_errors: Option<serde_json::Value>,
+}
+
 /// Outcome of `upsert_user_message_idempotent`. The application uses this
 /// to decide between normal processing, replay, and 409.
 #[derive(Debug)]
@@ -947,6 +961,76 @@ impl<'a> ChatRepo<'a> {
             .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Persist a persona-initiated assistant row. `None` when a greeting for
+    /// the same session and `metadata.local_date` already exists (a concurrent
+    /// call won the insert). Bumps `last_active_at` only when a row landed.
+    pub async fn insert_proactive_message(
+        &self,
+        session_id: Uuid,
+        row: &ProactiveInsert,
+    ) -> Result<Option<ChatMessage>, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let inserted = sqlx::query_as::<_, ChatMessage>(
+            "INSERT INTO engine.chat_messages \
+               (id, session_id, role, content, generation_id, assistant_action_type, \
+                metadata, llm_attempts, gateway_errors) \
+             VALUES ($1, $2, 'assistant', $3, $4, 'proactive', $5, $6, $7) \
+             ON CONFLICT (session_id, (metadata->>'local_date')) \
+               WHERE assistant_action_type = 'proactive' DO NOTHING \
+             RETURNING *",
+        )
+        .bind(row.id)
+        .bind(session_id)
+        .bind(&row.content)
+        .bind(&row.generation_id)
+        .bind(&row.metadata)
+        .bind(&row.llm_attempts)
+        .bind(&row.gateway_errors)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if inserted.is_some() {
+            sqlx::query("UPDATE engine.chat_sessions SET last_active_at = now() WHERE id = $1")
+                .bind(session_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(inserted)
+    }
+
+    /// The greeting already written for this session and user-local date.
+    pub async fn proactive_greeting_on(
+        &self,
+        session_id: Uuid,
+        local_date: &str,
+    ) -> Result<Option<ChatMessage>, sqlx::Error> {
+        sqlx::query_as::<_, ChatMessage>(
+            "SELECT * FROM engine.chat_messages \
+             WHERE session_id = $1 AND assistant_action_type = 'proactive' \
+               AND metadata->>'local_date' = $2",
+        )
+        .bind(session_id)
+        .bind(local_date)
+        .fetch_optional(self.pool)
+        .await
+    }
+
+    /// Whether any row landed in this session at or after `since`.
+    pub async fn has_message_since(
+        &self,
+        session_id: Uuid,
+        since: DateTime<Utc>,
+    ) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM engine.chat_messages \
+                            WHERE session_id = $1 AND sent_at >= $2)",
+        )
+        .bind(session_id)
+        .bind(since)
+        .fetch_one(self.pool)
+        .await
     }
 
     /// Persist an image-edit instruction as a `role='user'` row quoting the
@@ -4333,5 +4417,80 @@ mod tests {
             untouched.iter().all(Option::is_none),
             "role='user' is the whole of this writer's scope"
         );
+    }
+
+    fn proactive_row(local_date: &str, content: &str) -> ProactiveInsert {
+        ProactiveInsert {
+            id: Uuid::new_v4(),
+            content: content.into(),
+            generation_id: None,
+            metadata: serde_json::json!({ "proactive": "holiday", "local_date": local_date }),
+            llm_attempts: None,
+            gateway_errors: None,
+        }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn one_proactive_greeting_per_session_and_local_date(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = throwaway_session(&pool).await;
+        let other = throwaway_session(&pool).await;
+
+        let first = repo
+            .insert_proactive_message(s.id, &proactive_row("2026-09-25", "中秋快乐"))
+            .await
+            .unwrap()
+            .expect("the first greeting lands");
+        assert_eq!(first.role, "assistant");
+        assert_eq!(first.assistant_action_type.as_deref(), Some("proactive"));
+        assert_eq!(first.user_message_id, None);
+        assert!(
+            repo.insert_proactive_message(s.id, &proactive_row("2026-09-25", "again"))
+                .await
+                .unwrap()
+                .is_none(),
+            "same session and local date is a no-op"
+        );
+        assert!(repo
+            .insert_proactive_message(s.id, &proactive_row("2026-09-26", "next day"))
+            .await
+            .unwrap()
+            .is_some());
+        assert!(repo
+            .insert_proactive_message(other.id, &proactive_row("2026-09-25", "other session"))
+            .await
+            .unwrap()
+            .is_some());
+
+        let found = repo.proactive_greeting_on(s.id, "2026-09-25").await.unwrap().unwrap();
+        assert_eq!(found.id, first.id);
+        assert!(repo.proactive_greeting_on(s.id, "2026-09-24").await.unwrap().is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn assistant_action_type_check_still_rejects_unknown_values(pool: PgPool) {
+        let s = throwaway_session(&pool).await;
+        let err = sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, assistant_action_type) \
+             VALUES ($1, 'assistant', 'x', 'bogus')",
+        )
+        .bind(s.id)
+        .execute(&pool)
+        .await;
+        assert!(err.is_err());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn has_message_since_reads_sent_at(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = throwaway_session(&pool).await;
+        let hour_ago = Utc::now() - chrono::Duration::hours(1);
+        assert!(!repo.has_message_since(s.id, hour_ago).await.unwrap());
+        repo.append_message(s.id, "user", "hi").await.unwrap();
+        assert!(repo.has_message_since(s.id, hour_ago).await.unwrap());
+        assert!(!repo
+            .has_message_since(s.id, Utc::now() + chrono::Duration::hours(1))
+            .await
+            .unwrap());
     }
 }
