@@ -247,21 +247,7 @@ pub(crate) fn validate_payload(req: &StreamSendRequest) -> Result<(), AppError> 
             original_user_message_id: None,
         }));
     }
-    if let Some(tier) = req.tier.as_deref() {
-        let ok = (1..=MAX_TIER_LEN).contains(&tier.len())
-            && tier
-                .bytes()
-                .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_'));
-        if !ok {
-            return Err(AppError::StreamPre(StreamPreError {
-                status: StatusCode::BAD_REQUEST,
-                code: "invalid_payload",
-                message: format!("tier must match [a-z0-9_]{{1,{MAX_TIER_LEN}}}"),
-                user_message: "请求无效".into(),
-                original_user_message_id: None,
-            }));
-        }
-    }
+    validate_tier(req.tier.as_deref())?;
     if let Some(url) = req.image_url.as_deref() {
         if req.tips_amount_usd.is_some() {
             return Err(AppError::StreamPre(StreamPreError {
@@ -302,6 +288,26 @@ pub(crate) fn validate_payload(req: &StreamSendRequest) -> Result<(), AppError> 
                     original_user_message_id: None,
                 }));
             }
+        }
+    }
+    Ok(())
+}
+
+/// `tier` shape shared by every chat-shaped body.
+pub(crate) fn validate_tier(tier: Option<&str>) -> Result<(), AppError> {
+    if let Some(tier) = tier {
+        let ok = (1..=MAX_TIER_LEN).contains(&tier.len())
+            && tier
+                .bytes()
+                .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_'));
+        if !ok {
+            return Err(AppError::StreamPre(StreamPreError {
+                status: StatusCode::BAD_REQUEST,
+                code: "invalid_payload",
+                message: format!("tier must match [a-z0-9_]{{1,{MAX_TIER_LEN}}}"),
+                user_message: "请求无效".into(),
+                original_user_message_id: None,
+            }));
         }
     }
     Ok(())
