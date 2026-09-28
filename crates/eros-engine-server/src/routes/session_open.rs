@@ -6,6 +6,7 @@
 //! Spec: docs/superpowers/specs/2026-09-26-user-locale-and-holiday-greeting-design.md §4.2
 
 use axum::extract::{Extension, Path, State};
+use axum::http::StatusCode;
 use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -16,7 +17,7 @@ use eros_engine_core::scope::MemoryScope;
 use eros_engine_store::chat::{ChatMessage, ChatRepo};
 
 use crate::auth::middleware::AuthUser;
-use crate::error::AppError;
+use crate::error::{AppError, StreamPreError};
 use crate::holiday::{self, UserLocale};
 use crate::pipeline::proactive::{greet, Greeting};
 use crate::prompt::NowContext;
@@ -131,8 +132,25 @@ pub(crate) async fn open_at(
     now: DateTime<Utc>,
 ) -> Result<OpenSessionResponse, AppError> {
     validate_tier(req.tier.as_deref())?;
-    let prompt_traits = validate_prompt_traits(req.prompt_traits.as_deref().unwrap_or(&[]))?;
-    let audit = validate_llm_audit(req.audit.clone())?;
+    let prompt_traits = validate_prompt_traits(req.prompt_traits.as_deref().unwrap_or(&[]))
+        .map_err(|e| {
+            AppError::StreamPre(StreamPreError {
+                status: StatusCode::BAD_REQUEST,
+                code: "invalid_payload",
+                message: e.to_string(),
+                user_message: "请求无效".into(),
+                original_user_message_id: None,
+            })
+        })?;
+    let audit = validate_llm_audit(req.audit.clone()).map_err(|e| {
+        AppError::StreamPre(StreamPreError {
+            status: StatusCode::BAD_REQUEST,
+            code: "invalid_payload",
+            message: e.to_string(),
+            user_message: "请求无效".into(),
+            original_user_message_id: None,
+        })
+    })?;
     let (_session, persona, instance_id) = resolve_text_turn(state, session_id, user_id).await?;
 
     let locale = UserLocale::resolve(
@@ -161,7 +179,15 @@ pub(crate) async fn open_at(
         .has_message_since(session_id, holiday::local_midnight_utc(tz, local_date))
         .await?
     {
-        return no_greeting();
+        // A concurrent caller's greeting can land between the lookup above
+        // and this check (its own insert counts as "a message since" too):
+        // re-check for that winner's row rather than reporting a bare null.
+        return Ok(OpenSessionResponse {
+            greeting: chat_repo
+                .proactive_greeting_on(session_id, &local_date.to_string())
+                .await?
+                .map(Into::into),
+        });
     }
 
     let _guard = state
@@ -393,8 +419,12 @@ mod tests {
         assert!(out.greeting.is_none());
 
         // 2026-09-22 in Taipei: no lunar festival, no TW holiday, no fixed date.
+        // Fresh session with history well before this day's Taipei midnight, so
+        // only the holiday gate (not `has_message_since`) can produce the null.
         let plain_day = Utc.with_ymd_and_hms(2026, 9, 21, 20, 0, 0).unwrap();
-        let out = open_at(&state, session_id, user_id, taipei(), plain_day)
+        let plain_day_session =
+            session_with_history(&pool, user_id, plain_day - chrono::Duration::days(2)).await;
+        let out = open_at(&state, plain_day_session, user_id, taipei(), plain_day)
             .await
             .unwrap();
         assert!(out.greeting.is_none());
@@ -578,6 +608,30 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
         assert_eq!(body["code"], json!("wrong_channel"));
+    }
+
+    /// `prompt_traits`/`audit` validation failures render in the same shape
+    /// as the chat stream's 400s (`StreamPreErrorBody`), not the bare
+    /// `bad_request` body `validate_prompt_traits` raises on its own.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn open_400s_on_invalid_prompt_traits_in_the_chat_shape(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let mut app = build_router(test_state(pool.clone()));
+
+        let (status, body) = send_request(
+            &mut app,
+            open_req(
+                session_id,
+                &mint_test_jwt(user_id),
+                json!({"prompt_traits": [{"tag": "Bad", "text": "hi"}]}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["code"], json!("invalid_payload"));
     }
 
     #[test]
