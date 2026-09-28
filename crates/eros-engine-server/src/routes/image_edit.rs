@@ -126,6 +126,17 @@ pub struct ImageEditRequest {
     /// injected only into a rolled text half.
     #[serde(default)]
     pub prompt_traits: Option<Vec<PromptTraitDto>>,
+    /// The user's IANA timezone — same rules as the chat body. Only a rolled
+    /// text half reads it (its `[now]`), and records it on that row.
+    #[serde(default)]
+    pub user_timezone: Option<String>,
+    /// ISO 3166-1 alpha-2 country — same rules as the chat body.
+    #[serde(default)]
+    pub user_country: Option<String>,
+    /// ISO 3166-2 subdivision without the country prefix — same rules as the
+    /// chat body.
+    #[serde(default)]
+    pub user_region: Option<String>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -342,6 +353,7 @@ async fn generate_reply_text(
     caption: Option<&str>,
     tier: Option<String>,
     prompt_traits: Vec<PromptTrait>,
+    now: &crate::prompt::NowContext,
 ) -> TextOutcome {
     let affinity = match (AffinityRepo { pool: &state.pool })
         .load_or_create(session_id, user_id, instance_id)
@@ -398,10 +410,7 @@ async fn generate_reply_text(
         user_id,
         instance_id,
         instruction_row_id,
-        &crate::prompt::NowContext::for_user(
-            &crate::holiday::UserLocale::default(),
-            chrono::Utc::now(),
-        ),
+        now,
     )
     .await
     {
@@ -632,6 +641,12 @@ async fn edit_image(
     validate(&req)?;
     let prompt_traits = validate_prompt_traits(req.prompt_traits.as_deref().unwrap_or(&[]))?;
 
+    let user_locale = crate::holiday::UserLocale::resolve(
+        req.user_timezone.as_deref(),
+        req.user_country.as_deref(),
+        req.user_region.as_deref(),
+    );
+
     if !state.model_config.has_task(EDIT_TASK)
         && !state.model_config.has_task("chat_image_prompt_compose")
     {
@@ -821,6 +836,7 @@ async fn edit_image(
             outcome.caption.as_deref(),
             req.tier.clone(),
             prompt_traits.clone(),
+            &crate::prompt::NowContext::for_user(&user_locale, chrono::Utc::now()),
         )
         .await;
         // The chat path's audit copy next to the image marker: the tags that
@@ -829,6 +845,14 @@ async fn edit_image(
         metadata["prompt_traits"] = serde_json::json!(text.injected_tags);
         if let Some(t) = req.tier.as_deref() {
             metadata["tier"] = serde_json::json!(t);
+        }
+        if let Some(m) = metadata.as_object_mut() {
+            crate::holiday::record_raw(
+                m,
+                req.user_timezone.as_deref(),
+                req.user_country.as_deref(),
+                req.user_region.as_deref(),
+            );
         }
         let insert = AssistantInsert {
             id: new_id,
@@ -1997,6 +2021,72 @@ mod tests {
         assert!(
             chat.contains("新照片里换了条裙子"),
             "the new caption is hinted, prose-woven: {chat}"
+        );
+    }
+
+    /// The locale shapes the rolled text half's prompt and is recorded on its
+    /// row next to `tier` (spec 2026-09-26 §4.1).
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_text_half_takes_the_users_locale(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let (_, mid) = seed_image_turn(&pool, session_id).await;
+
+        let mock = MockServer::start().await;
+        mount_editor_and_judge(&mock).await;
+        mount_companion(&mock).await;
+        let state = with_composer(test_state(pool.clone()), &mock.uri(), FULL_TURN_TOML);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let taipei_today = || {
+            chrono::Utc::now()
+                .with_timezone(&chrono_tz::Asia::Taipei)
+                .format("%Y-%m-%d")
+                .to_string()
+        };
+        let before = taipei_today();
+        let (status, body) = send_request(
+            &mut app,
+            edit_req(
+                session_id,
+                mid,
+                &token,
+                json!({"instruction": "换套衣服", "persist_instruction": true,
+                       "reply_with_text": 1.0, "user_timezone": "Asia/Taipei",
+                       "user_country": "TW"}),
+            ),
+        )
+        .await;
+        let after = taipei_today();
+        assert_eq!(status, StatusCode::OK, "body={body}");
+
+        let new_id = Uuid::parse_str(body["message_id"].as_str().unwrap()).unwrap();
+        let metadata: serde_json::Value =
+            sqlx::query_scalar("SELECT metadata FROM engine.chat_messages WHERE id = $1")
+                .bind(new_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(metadata["user_timezone"], json!("Asia/Taipei"));
+        assert_eq!(metadata["user_country"], json!("TW"));
+        assert!(metadata.get("user_region").is_none());
+
+        // The seeded genome has no timezone ⇒ the persona clock is Taipei's.
+        let companion_body = mock
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .find(|b| b.contains("you are a companion"))
+            .expect("a companion call");
+        assert!(
+            companion_body.contains(&format!("现在你当地时间是 {before}"))
+                || companion_body.contains(&format!("现在你当地时间是 {after}")),
+            "{companion_body}"
         );
     }
 
