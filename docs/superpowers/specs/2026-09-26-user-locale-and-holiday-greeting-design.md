@@ -77,10 +77,21 @@ For a local date `d`, the holiday names are the union of:
     holidays. Otherwise the `National` map.
   - python-holidays joins several holidays on one date with `; `
     (`Boxing Day; Christmas Day (observed)`), so an entry is split on `; `
-    first. Parts whose name contains `(observed` or starts with
-    `Day off (substituted` are dropped. These are python-holidays' fixed labels
-    for in-lieu days off, not the holiday itself. `(estimated)` entries are
-    kept: they mark the holiday day under a projected calendar.
+    first. Parts carrying one of python-holidays' in-lieu labels are dropped:
+    such a day stands in for a holiday or bridges to one, and the holiday
+    itself keeps its own entry. The label families:
+    - `X (observed)` and `X (observed, estimated)` (US, AU, GB and 61 more)
+    - `Day off (substituted from …)` (CN, RU, HU and 7 more), `Day off for X`
+      (AO), `Additional day off by Presidential decree` (UZ)
+    - `Substitute Holiday` (JP), `Alternative holiday for X` (KR),
+      `Khmer New Year's Replacement Holiday` (KH)
+    - `X (in lieu)` (TH, LA), `Special In Lieu Holiday` (TH)
+    - `Bridge Public Holiday` (AR, TH)
+
+    A day whose label does not say it is in lieu passes as a holiday (MH's
+    `Christmas Day Holiday` after a Sunday Christmas, KR's
+    `Temporary Public Holiday`). `(estimated)` entries are kept: they mark the
+    holiday day under a projected calendar.
 
 - **Fixed-date observances (engine table).** A `const` table in `holiday.rs`,
   matched on month and day:
@@ -320,7 +331,7 @@ work.
   - 2026-09-25 yields 中秋节 for any country and for none; CN also yields
     `Mid-Autumn Festival`.
   - US + `CA`, 2026-11-26 yields `Thanksgiving Day`.
-  - `(observed)` and `Day off (substituted …)` entries are dropped.
+  - Every §3.1 in-lieu label family is dropped.
   - `Asia/Taipei` with no `user_country` resolves to TW.
   - `user_country = "XX"` yields no public holidays and does not fall back to
     the timezone.

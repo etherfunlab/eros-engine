@@ -133,9 +133,23 @@ fn country_map(country: CountryCode) -> Option<Arc<CountryMap>> {
     Some(loaded)
 }
 
-/// python-holidays' fixed labels for an in-lieu day off (spec §3.1).
+/// Label fragments python-holidays uses for an in-lieu day off: a day that
+/// stands in for a holiday or bridges to one, while the holiday itself keeps
+/// its own label (spec §3.1). `(estimated)` is not one of them.
+const IN_LIEU: &[&str] = &[
+    "(observed",               // "X (observed)": moved off a weekend (US, AU, GB, …)
+    "(in lieu)",               // "X (in lieu)" (TH, LA)
+    "In Lieu",                 // "Special In Lieu Holiday" (TH)
+    "Substitute Holiday",      // JP
+    "Alternative holiday for", // "Alternative holiday for X" (KR)
+    "Replacement Holiday",     // "Khmer New Year's Replacement Holiday" (KH)
+    "Bridge Public Holiday",   // AR, TH
+    "Day off",                 // "Day off (substituted from …)" (CN, RU, …); "Day off for X" (AO)
+    "day off",                 // "Additional day off by Presidential decree" (UZ)
+];
+
 fn is_in_lieu(name: &str) -> bool {
-    name.contains("(observed") || name.starts_with("Day off (substituted")
+    IN_LIEU.iter().any(|label| name.contains(label))
 }
 
 /// Holiday names on `date`, in spec §3.1 order: lunar festival, public
@@ -308,6 +322,45 @@ mod tests {
         // US: "Independence Day (observed)"; CN: "Day off (substituted from 01/04/2026)".
         assert!(holidays_on(d(2026, 7, 3), cc("US"), None).is_empty());
         assert!(holidays_on(d(2026, 1, 2), cc("CN"), None).is_empty());
+    }
+
+    #[test]
+    fn substitute_alternative_and_in_lieu_days_are_dropped() {
+        let none: Vec<String> = Vec::new();
+        // JP "Substitute Holiday".
+        assert_eq!(holidays_on(d(2026, 5, 6), cc("JP"), None), none);
+        // KR "Alternative holiday for Independence Movement Day".
+        assert_eq!(holidays_on(d(2026, 3, 2), cc("KR"), None), none);
+        // TH "Visakha Bucha (in lieu)".
+        assert_eq!(holidays_on(d(2026, 6, 1), cc("TH"), None), none);
+    }
+
+    #[test]
+    fn every_other_in_lieu_label_family_is_dropped() {
+        let none: Vec<String> = Vec::new();
+        for (code, date, label) in [
+            (
+                "TH",
+                d(2026, 12, 7),
+                "three `(in lieu)` parts joined with `; `",
+            ),
+            ("TH", d(2000, 1, 3), "Special In Lieu Holiday"),
+            ("TH", d(2026, 1, 2), "Bridge Public Holiday"),
+            ("AR", d(2025, 11, 21), "Bridge Public Holiday"),
+            ("AO", d(2026, 1, 2), "Day off for New Year's Day"),
+            (
+                "UZ",
+                d(2024, 12, 31),
+                "Additional day off by Presidential decree",
+            ),
+            ("KH", d(2020, 8, 18), "Khmer New Year's Replacement Holiday"),
+        ] {
+            assert_eq!(
+                holidays_on(date, cc(code), None),
+                none,
+                "{code} {date}: {label}"
+            );
+        }
     }
 
     #[test]
