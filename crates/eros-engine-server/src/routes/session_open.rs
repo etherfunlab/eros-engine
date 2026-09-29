@@ -243,7 +243,7 @@ mod tests {
     use serde_json::json;
     use sqlx::PgPool;
     use std::sync::Arc;
-    use wiremock::matchers::{body_string_contains, path as wm_path};
+    use wiremock::matchers::{body_partial_json, body_string_contains, path as wm_path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::routes::companion::test_state;
@@ -561,6 +561,112 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, AppError::Upstream(_)), "{err:?}");
         assert_eq!(proactive_rows(&pool, session_id).await, 0);
+    }
+
+    /// `with_companion` chained `companion` → `backup`, plus one neutral
+    /// `output_regex` rule on `rule_model` that deletes `[note: …]`.
+    fn with_note_rule(state: AppState, mock_uri: &str, rule_model: &str) -> AppState {
+        let mut state = with_companion(state, mock_uri);
+        let cfg = eros_engine_llm::model_config::ModelConfig::from_toml_str(&format!(
+            r#"
+            [tasks.chat_companion]
+            model = "companion"
+            fallback = ["backup"]
+
+            [[tasks.chat_companion.output_regex]]
+            models = ["{rule_model}"]
+            pattern = '\s*\[note:[^\]]*\]'
+            "#
+        ))
+        .unwrap();
+        state.output_regex = Arc::new(cfg.compile_output_regex().expect("rule compiles"));
+        state.model_config = Arc::new(cfg);
+        state
+    }
+
+    async fn greeting_row_content(pool: &PgPool, session_id: Uuid) -> String {
+        sqlx::query_scalar(
+            "SELECT content FROM engine.chat_messages \
+             WHERE session_id = $1 AND assistant_action_type = 'proactive'",
+        )
+        .bind(session_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_greeting_goes_through_output_regex(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = session_with_history(
+            &pool,
+            user_id,
+            mid_autumn_morning() - chrono::Duration::days(2),
+        )
+        .await;
+        let mock = MockServer::start().await;
+        // The mock reports "served/companion"; the rule is keyed on the chain
+        // hop's config id, as on the stream path.
+        mount_companion(&mock, "中秋快乐呀 [note: a marker]").await;
+        let state = with_note_rule(test_state(pool.clone()), &mock.uri(), "companion");
+
+        let out = open_at(&state, session_id, user_id, taipei(), mid_autumn_morning())
+            .await
+            .unwrap();
+        assert_eq!(out.greeting.expect("a greeting").content, "中秋快乐呀");
+        assert_eq!(greeting_row_content(&pool, session_id).await, "中秋快乐呀");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_greeting_that_strips_to_empty_writes_nothing(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = session_with_history(
+            &pool,
+            user_id,
+            mid_autumn_morning() - chrono::Duration::days(2),
+        )
+        .await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "[note: nothing else]").await;
+        let state = with_note_rule(test_state(pool.clone()), &mock.uri(), "companion");
+
+        let out = open_at(&state, session_id, user_id, taipei(), mid_autumn_morning())
+            .await
+            .unwrap();
+        assert!(out.greeting.is_none());
+        assert_eq!(proactive_rows(&pool, session_id).await, 0);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_fallback_greeting_takes_the_fallbacks_rules(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = session_with_history(
+            &pool,
+            user_id,
+            mid_autumn_morning() - chrono::Duration::days(2),
+        )
+        .await;
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_partial_json(json!({"model": "companion"})))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_partial_json(json!({"model": "backup"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "gen-backup",
+                "model": "served/backup",
+                "choices": [{"message": {"content": "中秋快乐 [note: a marker]"}}],
+            })))
+            .mount(&mock)
+            .await;
+        let state = with_note_rule(test_state(pool.clone()), &mock.uri(), "backup");
+
+        let out = open_at(&state, session_id, user_id, taipei(), mid_autumn_morning())
+            .await
+            .unwrap();
+        assert_eq!(out.greeting.expect("a greeting").content, "中秋快乐");
     }
 
     fn open_req(session_id: Uuid, jwt: &str, body: serde_json::Value) -> Request<Body> {

@@ -265,8 +265,10 @@ resolves from `chat_companion` and `tier` exactly as a chat reply.
 response id) goes to `chat_messages.generation_id`, as the FK requires. Attempt
 failures land in `llm_attempts` / `gateway_errors`.
 
-The output filter is not applied: it exists only on the streaming burst and is
-trigger-gated. The image-edit text half does the same.
+The LLM output filter is not applied: it exists only on the streaming burst and
+is trigger-gated. The Layer-0 `output_regex` is applied as on the stream path,
+under the config id of the chain hop that served. A reply it strips to empty
+counts as blank: nothing is persisted and the call returns `null`.
 
 ### 6.3 Persistence
 
