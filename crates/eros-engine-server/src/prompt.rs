@@ -117,7 +117,9 @@ fn period_cn(hour: u32) -> &'static str {
 
 /// Everything `[now]` renders (spec 2026-09-26 §5): the instant, the user's
 /// timezone (the persona clock's fallback), and the holidays in the user's
-/// local window. `Default` renders no holiday line.
+/// local window. `Default` is for tests: its `now` is the Unix epoch and it
+/// renders no holiday line. Production callers build it with
+/// `NowContext::for_user(.., Utc::now())`.
 #[derive(Debug, Clone, Default)]
 pub struct NowContext {
     pub now: DateTime<Utc>,
