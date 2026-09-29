@@ -53,8 +53,9 @@ impl UserLocale {
             .and_then(|s| match s.parse::<Tz>() {
                 Ok(tz) => Some(tz),
                 Err(_) => {
+                    let shown: String = s.chars().take(MAX_RAW_LEN).collect();
                     tracing::warn!(
-                        user_timezone = s,
+                        user_timezone = shown.as_str(),
                         "unparseable user_timezone; treated as absent"
                     );
                     None
@@ -226,7 +227,8 @@ pub fn local_midnight_utc(tz: Tz, date: NaiveDate) -> DateTime<Utc> {
 }
 
 /// Longest raw locale value copied into row metadata. Anything longer is not
-/// a timezone or ISO code, so it stays out of the audit copy.
+/// a timezone or ISO code, so it stays out of the audit copy; the unparseable
+/// timezone WARN logs at most this many characters of it.
 const MAX_RAW_LEN: usize = 64;
 
 /// Copy a request's raw locale fields into a row's metadata (spec §4.1) so a
