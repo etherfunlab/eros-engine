@@ -1081,6 +1081,96 @@ data: [DONE]\n\n";
         );
     }
 
+    /// The request's `user_timezone` sets the persona clock when the genome
+    /// has none (spec 2026-09-26 §5.1). Los Angeles, not a UTC+8 zone: the
+    /// clock's last fallback is Singapore, which would match Taipei's date.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_users_timezone_reaches_the_stream_prompt(pool: PgPool) {
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let body = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"id\":\"gen-tz\",\"model\":\"primary\"}\n\n\
+data: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = ChatRepo { pool: &pool }
+            .create_session(user_id, instance_id)
+            .await
+            .unwrap()
+            .id;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let mut app = build_router(state);
+        let token = mint_jwt(user_id);
+
+        // The clock line's date and hour in Los Angeles.
+        let la_stamp = || {
+            chrono::Utc::now()
+                .with_timezone(&chrono_tz::America::Los_Angeles)
+                .format("%Y-%m-%d %H")
+                .to_string()
+        };
+        let before = la_stamp();
+        let body = serde_json::to_vec(&json!({
+            "content": "hi",
+            "client_msg_id": "01J4444444444444444444444T",
+            "user_timezone": "America/Los_Angeles"
+        }))
+        .unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/comp/chat/{session_id}/message/stream"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let after = la_stamp();
+
+        let requests: Vec<Value> = mock
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect();
+        let companion = requests
+            .iter()
+            .find(|b| b["stream"] == json!(true))
+            .expect("a streamed companion call");
+        let system = companion["messages"][0]["content"].as_str().unwrap();
+        // "现在你当地时间是 2026-09-29（周二）07:15，…" → "2026-09-29 07".
+        let clock = system
+            .split("现在你当地时间是 ")
+            .nth(1)
+            .expect("the persona clock line");
+        let (date, rest) = clock.split_once('（').unwrap();
+        let hour = &rest.split_once('）').unwrap().1[..2];
+        let seen = format!("{date} {hour}");
+        assert!(
+            seen == before || seen == after,
+            "{seen} vs {before}/{after}"
+        );
+    }
+
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn generation_timeout_surfaces_terminal_error_frame(pool: PgPool) {
         // Proves the detached task's timeout arm no longer ends the SSE body
