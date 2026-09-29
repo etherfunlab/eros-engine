@@ -141,7 +141,7 @@ One entry point, shared by §5 and §6:
 ```rust
 /// Holidays on each of the user's local days `today ..= today + 6`,
 /// skipping days with none.
-fn upcoming_holidays(locale: &UserLocale, now: DateTime<Utc>) -> Vec<(u8 /* days ahead */, Vec<String>)>
+fn upcoming(locale: &UserLocale, now: DateTime<Utc>) -> Vec<(u8 /* days ahead */, Vec<String>)>
 ```
 
 `UserLocale` holds the parsed timezone, the resolved country and region.
@@ -217,7 +217,7 @@ and returns `null`. Either way the next open retries.
 
 ### 5.2 User-side holiday line
 
-When `upcoming_holidays` returns anything, one line follows the persona clock
+When `holiday::upcoming` returns anything, one line follows the persona clock
 inside `[now]`:
 
 ```
