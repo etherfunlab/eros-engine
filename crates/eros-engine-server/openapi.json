@@ -1473,6 +1473,104 @@
         ]
       }
     },
+    "/v2/comp/session/{session_id}/open": {
+      "post": {
+        "tags": [
+          "companion"
+        ],
+        "summary": "Tell the engine the user just entered this session.",
+        "description": "When it is a holiday in the user's timezone and nothing has been said in\nthe session since the user's local midnight, the persona speaks first: one\nassistant message is generated, persisted (unread, like any reply) and\nreturned. Otherwise `greeting` is `null`. Idempotent per session and\nuser-local date — a repeat call returns the same greeting.",
+        "operationId": "open_session",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Chat session id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OpenSessionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenSessionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "per-user in-flight cap reached"
+          },
+          "5XX": {
+            "description": "companion chain exhausted; the provider's own status passes through, same body as the image endpoints. Nothing is persisted."
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/world/town/{user_id}/feed": {
       "get": {
         "tags": [
@@ -2564,6 +2662,27 @@
           }
         }
       },
+      "GreetingDto": {
+        "type": "object",
+        "required": [
+          "message_id",
+          "content",
+          "sent_at"
+        ],
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "message_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "sent_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
       "HealthResponse": {
         "type": "object",
         "description": "Health check response.",
@@ -2675,6 +2794,27 @@
               "null"
             ],
             "description": "Tier for the text half — selects the `[tasks.chat_companion.tiers.<tier>]`\nmodel and `allow_traits`, exactly as on the chat path. Inert unless\n`reply_with_text` rolls a text half."
+          },
+          "user_country": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "ISO 3166-1 alpha-2 country — same rules as the chat body."
+          },
+          "user_region": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "ISO 3166-2 subdivision without the country prefix — same rules as the\nchat body."
+          },
+          "user_timezone": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The user's IANA timezone — same rules as the chat body. Only a rolled\ntext half reads it (its `[now]`), and records it on that row."
           }
         }
       },
@@ -2876,6 +3016,90 @@
           "session_id": {
             "type": "string",
             "format": "uuid"
+          }
+        }
+      },
+      "OpenSessionRequest": {
+        "type": "object",
+        "properties": {
+          "affinity_scope": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AffinityScopeDto"
+              }
+            ]
+          },
+          "audit": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LlmAuditDto"
+              }
+            ]
+          },
+          "memory_scope": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "prompt_traits": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/PromptTraitDto"
+            }
+          },
+          "tier": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Same as the chat body: model routing and trait gating for the greeting."
+          },
+          "user_country": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "ISO 3166-1 alpha-2 country — same rules as the chat body."
+          },
+          "user_region": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "ISO 3166-2 subdivision without the country prefix — same rules as the\nchat body."
+          },
+          "user_timezone": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The user's IANA timezone. Without a valid one there is no user-local\ndate and `greeting` is `null`."
+          }
+        }
+      },
+      "OpenSessionResponse": {
+        "type": "object",
+        "properties": {
+          "greeting": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/GreetingDto",
+                "description": "The persona's first message today, or `null` when it does not speak first."
+              }
+            ]
           }
         }
       },
@@ -3258,6 +3482,27 @@
               "null"
             ],
             "format": "double"
+          },
+          "user_country": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "ISO 3166-1 alpha-2 country, as the client received it. Absent ⇒ derived\nfrom `user_timezone`; unknown ⇒ no public holidays."
+          },
+          "user_region": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "ISO 3166-2 subdivision without the country prefix (`CA`, `ENG`). Read\nonly beside `user_country`; unknown ⇒ national holidays."
+          },
+          "user_timezone": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The user's IANA timezone. The `[now]` persona clock falls back to it\nwhen the persona has none, and it dates the user-side holiday line.\nUnparseable ⇒ treated as absent; the turn proceeds."
           }
         }
       },

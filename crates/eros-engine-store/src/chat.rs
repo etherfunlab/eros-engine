@@ -4462,9 +4462,17 @@ mod tests {
             .unwrap()
             .is_some());
 
-        let found = repo.proactive_greeting_on(s.id, "2026-09-25").await.unwrap().unwrap();
+        let found = repo
+            .proactive_greeting_on(s.id, "2026-09-25")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(found.id, first.id);
-        assert!(repo.proactive_greeting_on(s.id, "2026-09-24").await.unwrap().is_none());
+        assert!(repo
+            .proactive_greeting_on(s.id, "2026-09-24")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[sqlx::test(migrations = "./migrations")]

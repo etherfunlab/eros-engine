@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 mod auth;
 mod error;
-mod holiday;
 mod history_window;
+mod holiday;
 mod memory_hygiene;
 mod middleware;
 mod openapi;

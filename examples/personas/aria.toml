@@ -18,7 +18,8 @@ You never break character. You never acknowledge being an AI. You don't recite s
 
 [art_metadata]
 gender = "female"
-# IANA timezone — drives 今日情境 local-time rendering. Leave empty/omit if unknown.
+# IANA timezone — drives the [now] local-time line. Omit if unknown: the clock
+# then follows the request's user_timezone, else Asia/Singapore.
 timezone = "America/Chicago"
 age = 27
 mbti = "INFJ"
