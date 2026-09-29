@@ -347,7 +347,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 ```
 
 **Optional: user locale.** Three optional strings tell the engine where the
-user is. The engine stores none of them; send them on every turn.
+user is. The engine does not keep them between turns; send them on every turn.
 
 - `user_timezone` — IANA timezone (`Asia/Taipei`). The prompt's `[now]` clock
   uses the persona's own `art_metadata.timezone` first, then this, then
@@ -721,9 +721,10 @@ returned. Otherwise `greeting` is `null`.
 
 Every field is optional. The three locale fields follow the chat body's rules.
 `tier`, `prompt_traits`, `memory_scope`, `affinity_scope` and `audit` shape the
-greeting as they shape a chat reply. The engine stores none of them, so send
-the same values a chat turn would. Without a valid `user_timezone` the call
-returns `null`.
+greeting as they shape a chat reply. The engine does not keep them between
+calls (the greeting row records them as an audit copy), so send the same
+values a chat turn would. Without a valid `user_timezone` the call returns
+`null`.
 
 ```json
 { "greeting": { "message_id": "01J…", "content": "中秋快乐呀，今天有吃月饼吗", "sent_at": "…" } }

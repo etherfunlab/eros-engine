@@ -310,7 +310,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
   http://localhost:8080/comp/chat/<session_id>/message/stream
 ```
 
-**可选：用户所在地。** 三个可选字符串告诉 engine 用户在哪里。engine 一个都不存，每一轮都要带上。
+**可选：用户所在地。** 三个可选字符串告诉 engine 用户在哪里。engine 不会在两轮之间记住它们，每一轮都要带上。
 
 - `user_timezone` — IANA 时区（`Asia/Taipei`）。prompt 中 `[now]` 的时钟先取角色自己的
   `art_metadata.timezone`，没有再取它，都没有才用 `Asia/Singapore`。它也决定用户那边的节日行：
@@ -615,7 +615,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 ```
 
 所有字段都可选。三个所在地字段的规则与聊天请求体相同；`tier`、`prompt_traits`、`memory_scope`、
-`affinity_scope`、`audit` 对开场白的作用与对聊天回复相同。engine 不存这些值，请传与聊天一轮相同的值。
+`affinity_scope`、`audit` 对开场白的作用与对聊天回复相同。engine 不会在两次调用之间记住这些值（开场白那一行会记一份审计副本），请传与聊天一轮相同的值。
 没有合法的 `user_timezone` 时直接返回 `null`。
 
 ```json
