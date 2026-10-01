@@ -498,8 +498,8 @@ mod tests {
         assert_eq!(companion_calls(&mock).await.len(), 1);
     }
 
-    /// Problem 2 (codex Minor, PR #366): a greeting written for a different
-    /// user-local date must not block today's — e.g. the user's timezone
+    /// A greeting written for a different user-local date must not block
+    /// today's — e.g. the user's timezone
     /// changed between opens. 2026-10-01 12:30 UTC is 2026-10-02 in Kiritimati
     /// (UTC+14) and 2026-10-01 in Shanghai (UTC+8); both dates are CN National
     /// Day (`holiday::holidays_on` on each returns `["National Day"]`).
