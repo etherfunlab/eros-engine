@@ -192,9 +192,12 @@ Called by a client when the user enters a session.
 1. No valid `user_timezone` → `{"greeting": null}`.
 2. The user's local date has no holiday → `null`.
 3. A greeting for this session and local date already exists → that greeting.
-4. Any other message exists in the session since the user's local midnight →
-   `null`. Speaking first only makes sense when nobody has spoken today; a
+4. Any other message — a proactive greeting for a different local date does
+   not count — exists in the session since the user's local midnight → `null`.
+   Speaking first only makes sense when nobody has spoken today; a
    conversation that ran past midnight already had the holiday in `[now]`.
+   The insert re-checks this same condition atomically (§6.3), so a message
+   that lands while generation is in flight still wins.
 5. Otherwise generate (§6) and return the new greeting.
 
 Idempotent per session and local date. Generation is synchronous (a few
@@ -279,10 +282,17 @@ One assistant row via a new `ChatRepo::insert_proactive_message`:
   (today's names), `user_timezone`, `user_country`, `user_region` (those
   present), and the post-resolve keys a reply row carries (`tier`,
   `prompt_traits`, `memory_scope`, `affinity_scope`).
-- `INSERT … ON CONFLICT DO NOTHING RETURNING` against the unique index (§7).
-  On conflict the handler reads and returns the existing row. Two concurrent
-  opens can both generate; one insert wins and the loser returns the winner's
-  row. The cost is one extra call in that race.
+- `INSERT … SELECT … WHERE NOT EXISTS (…) ON CONFLICT DO NOTHING RETURNING`
+  against the unique index (§7). The `WHERE NOT EXISTS` re-checks, inside the
+  same statement, that no other (non-proactive) message has landed in the
+  session since the route's own `since` — the atomic counterpart of the §4.2
+  step 4 pre-check, so a user message arriving while generation is still in
+  flight is never overwritten by a late-arriving greeting. On conflict (or on
+  that re-check failing) the handler reads and returns the existing row for
+  the local date, which is `None` when there isn't one — the caller falls back
+  to its own re-lookup (§4.2). Two concurrent opens can both generate; one
+  insert wins and the loser returns the winner's row. The cost is one extra
+  call in that race.
 - Bumps `chat_sessions.last_active_at`, like other assistant inserts.
 
 ### 6.4 What does not run

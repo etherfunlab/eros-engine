@@ -6,7 +6,7 @@
 //!
 //! Spec: docs/superpowers/specs/2026-09-26-user-locale-and-holiday-greeting-design.md §6
 
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate, Utc};
 use eros_engine_core::persona::CompanionPersona;
 use eros_engine_core::scope::{AffinityScope, MemoryScope};
 use eros_engine_core::types::{
@@ -42,6 +42,9 @@ pub(crate) struct Greeting<'a> {
     pub persona: &'a CompanionPersona,
     pub now: &'a NowContext,
     pub local_date: NaiveDate,
+    /// The user's local midnight on `local_date`, in UTC — the inactivity
+    /// cutoff `insert_proactive_message` re-checks atomically with the write.
+    pub since: DateTime<Utc>,
     pub holidays: Vec<String>,
     pub tier: Option<String>,
     pub prompt_traits: Vec<PromptTrait>,
@@ -183,7 +186,7 @@ pub(crate) async fn greet(
         gateway_errors,
     };
     match chat_repo
-        .insert_proactive_message(g.session_id, &row)
+        .insert_proactive_message(g.session_id, g.since, &row)
         .await?
     {
         Some(written) => Ok(Some(written)),

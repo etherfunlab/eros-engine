@@ -964,11 +964,15 @@ impl<'a> ChatRepo<'a> {
     }
 
     /// Persist a persona-initiated assistant row. `None` when a greeting for
-    /// the same session and `metadata.local_date` already exists (a concurrent
-    /// call won the insert). Bumps `last_active_at` only when a row landed.
+    /// the same local date already exists OR another (non-proactive) message
+    /// landed in the session at or after `since` — the atomic counterpart of
+    /// the route's own `has_message_since` pre-check, closing the race where a
+    /// user message lands while the greeting is still generating. Bumps
+    /// `last_active_at` only when a row landed.
     pub async fn insert_proactive_message(
         &self,
         session_id: Uuid,
+        since: DateTime<Utc>,
         row: &ProactiveInsert,
     ) -> Result<Option<ChatMessage>, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
@@ -976,7 +980,12 @@ impl<'a> ChatRepo<'a> {
             "INSERT INTO engine.chat_messages \
                (id, session_id, role, content, generation_id, assistant_action_type, \
                 metadata, llm_attempts, gateway_errors) \
-             VALUES ($1, $2, 'assistant', $3, $4, 'proactive', $5, $6, $7) \
+             SELECT $1, $2, 'assistant', $3, $4, 'proactive', $5, $6, $7 \
+             WHERE NOT EXISTS ( \
+                 SELECT 1 FROM engine.chat_messages \
+                 WHERE session_id = $2 AND sent_at >= $8 \
+                   AND assistant_action_type IS DISTINCT FROM 'proactive' \
+             ) \
              ON CONFLICT (session_id, (metadata->>'local_date')) \
                WHERE assistant_action_type = 'proactive' DO NOTHING \
              RETURNING *",
@@ -988,6 +997,7 @@ impl<'a> ChatRepo<'a> {
         .bind(&row.metadata)
         .bind(&row.llm_attempts)
         .bind(&row.gateway_errors)
+        .bind(since)
         .fetch_optional(&mut *tx)
         .await?;
         if inserted.is_some() {
@@ -1017,7 +1027,10 @@ impl<'a> ChatRepo<'a> {
         .await
     }
 
-    /// Whether any row landed in this session at or after `since`.
+    /// Whether any row other than a proactive greeting landed in this session
+    /// at or after `since`. Proactive rows are excluded so a greeting already
+    /// written for a different user-local date (e.g. the user's timezone
+    /// changed between opens) never blocks today's greeting.
     pub async fn has_message_since(
         &self,
         session_id: Uuid,
@@ -1025,7 +1038,8 @@ impl<'a> ChatRepo<'a> {
     ) -> Result<bool, sqlx::Error> {
         sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM engine.chat_messages \
-                            WHERE session_id = $1 AND sent_at >= $2)",
+                            WHERE session_id = $1 AND sent_at >= $2 \
+                              AND assistant_action_type IS DISTINCT FROM 'proactive')",
         )
         .bind(session_id)
         .bind(since)
@@ -4435,9 +4449,10 @@ mod tests {
         let repo = ChatRepo { pool: &pool };
         let s = throwaway_session(&pool).await;
         let other = throwaway_session(&pool).await;
+        let since = Utc::now() - chrono::Duration::days(1);
 
         let first = repo
-            .insert_proactive_message(s.id, &proactive_row("2026-09-25", "中秋快乐"))
+            .insert_proactive_message(s.id, since, &proactive_row("2026-09-25", "中秋快乐"))
             .await
             .unwrap()
             .expect("the first greeting lands");
@@ -4445,19 +4460,23 @@ mod tests {
         assert_eq!(first.assistant_action_type.as_deref(), Some("proactive"));
         assert_eq!(first.user_message_id, None);
         assert!(
-            repo.insert_proactive_message(s.id, &proactive_row("2026-09-25", "again"))
+            repo.insert_proactive_message(s.id, since, &proactive_row("2026-09-25", "again"))
                 .await
                 .unwrap()
                 .is_none(),
             "same session and local date is a no-op"
         );
         assert!(repo
-            .insert_proactive_message(s.id, &proactive_row("2026-09-26", "next day"))
+            .insert_proactive_message(s.id, since, &proactive_row("2026-09-26", "next day"))
             .await
             .unwrap()
             .is_some());
         assert!(repo
-            .insert_proactive_message(other.id, &proactive_row("2026-09-25", "other session"))
+            .insert_proactive_message(
+                other.id,
+                since,
+                &proactive_row("2026-09-25", "other session")
+            )
             .await
             .unwrap()
             .is_some());
@@ -4500,5 +4519,70 @@ mod tests {
             .has_message_since(s.id, Utc::now() + chrono::Duration::hours(1))
             .await
             .unwrap());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn has_message_since_ignores_a_proactive_greeting(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = throwaway_session(&pool).await;
+        let since = Utc::now() - chrono::Duration::hours(1);
+        repo.insert_proactive_message(s.id, since, &proactive_row("2026-09-25", "中秋快乐"))
+            .await
+            .unwrap()
+            .expect("the greeting lands");
+        assert!(
+            !repo.has_message_since(s.id, since).await.unwrap(),
+            "a proactive greeting alone is not `a message`"
+        );
+        repo.append_message(s.id, "user", "hi").await.unwrap();
+        assert!(
+            repo.has_message_since(s.id, since).await.unwrap(),
+            "a real user message does count"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn insert_proactive_message_is_atomic_with_the_inactivity_gate(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = throwaway_session(&pool).await;
+
+        // A message strictly before `since` does not block the insert.
+        let before_id = repo
+            .append_message(s.id, "user", "yesterday")
+            .await
+            .unwrap();
+        let before_sent_at: DateTime<Utc> =
+            sqlx::query_scalar("SELECT sent_at FROM engine.chat_messages WHERE id = $1")
+                .bind(before_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let since = before_sent_at + chrono::Duration::microseconds(1);
+        assert!(
+            repo.insert_proactive_message(s.id, since, &proactive_row("2026-09-25", "中秋快乐"))
+                .await
+                .unwrap()
+                .is_some(),
+            "a message strictly before `since` does not block the greeting"
+        );
+
+        // A message landing at/after `since` blocks the insert — a different
+        // local date, so the per-date unique index is not what blocks it.
+        let since2 = Utc::now() - chrono::Duration::seconds(1);
+        repo.append_message(s.id, "user", "just now").await.unwrap();
+        let blocked = repo
+            .insert_proactive_message(s.id, since2, &proactive_row("2026-09-26", "next day"))
+            .await
+            .unwrap();
+        assert!(blocked.is_none(), "a message landed since `since`");
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_messages \
+             WHERE session_id = $1 AND metadata->>'local_date' = '2026-09-26'",
+        )
+        .bind(s.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, 0, "the blocked insert must write nothing");
     }
 }

@@ -166,6 +166,8 @@ pub(crate) async fn open_at(
         return no_greeting();
     }
 
+    let since = holiday::local_midnight_utc(tz, local_date);
+
     let chat_repo = ChatRepo { pool: &state.pool };
     if let Some(row) = chat_repo
         .proactive_greeting_on(session_id, &local_date.to_string())
@@ -175,10 +177,7 @@ pub(crate) async fn open_at(
             greeting: Some(row.into()),
         });
     }
-    if chat_repo
-        .has_message_since(session_id, holiday::local_midnight_utc(tz, local_date))
-        .await?
-    {
+    if chat_repo.has_message_since(session_id, since).await? {
         // A concurrent caller's greeting can land between the lookup above
         // and this check (its own insert counts as "a message since" too):
         // re-check for that winner's row rather than reporting a bare null.
@@ -211,6 +210,7 @@ pub(crate) async fn open_at(
             persona: &persona,
             now: &now_ctx,
             local_date,
+            since,
             holidays,
             tier: req.tier,
             prompt_traits,
@@ -496,6 +496,63 @@ mod tests {
             .unwrap();
         assert_eq!(first.message_id, second.message_id);
         assert_eq!(companion_calls(&mock).await.len(), 1);
+    }
+
+    /// Problem 2 (codex Minor, PR #366): a greeting written for a different
+    /// user-local date must not block today's — e.g. the user's timezone
+    /// changed between opens. 2026-10-01 12:30 UTC is 2026-10-02 in Kiritimati
+    /// (UTC+14) and 2026-10-01 in Shanghai (UTC+8); both dates are CN National
+    /// Day (`holiday::holidays_on` on each returns `["National Day"]`).
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_greeting_for_a_different_local_date_does_not_block_todays(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        // History well before either timezone's relevant local midnight
+        // (Shanghai's, the earlier of the two: 2026-09-30 16:00 UTC).
+        let session_id = session_with_history(
+            &pool,
+            user_id,
+            Utc.with_ymd_and_hms(2026, 9, 28, 0, 0, 0).unwrap(),
+        )
+        .await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "国庆快乐").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+
+        let at = Utc.with_ymd_and_hms(2026, 10, 1, 12, 30, 0).unwrap();
+        let kiritimati = OpenSessionRequest {
+            user_timezone: Some("Pacific/Kiritimati".into()),
+            user_country: Some("CN".into()),
+            ..Default::default()
+        };
+        let first = open_at(&state, session_id, user_id, kiritimati, at)
+            .await
+            .unwrap()
+            .greeting
+            .expect("Kiritimati's holiday greeting");
+
+        let shanghai = OpenSessionRequest {
+            user_timezone: Some("Asia/Shanghai".into()),
+            user_country: Some("CN".into()),
+            ..Default::default()
+        };
+        let second = open_at(&state, session_id, user_id, shanghai, at)
+            .await
+            .unwrap()
+            .greeting
+            .expect("Shanghai's own greeting must not be blocked by Kiritimati's");
+
+        assert_ne!(first.message_id, second.message_id);
+        assert_eq!(companion_calls(&mock).await.len(), 2);
+        let mut local_dates: Vec<String> = sqlx::query_scalar(
+            "SELECT metadata->>'local_date' FROM engine.chat_messages \
+             WHERE session_id = $1 AND assistant_action_type = 'proactive'",
+        )
+        .bind(session_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        local_dates.sort();
+        assert_eq!(local_dates, vec!["2026-10-01", "2026-10-02"]);
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
