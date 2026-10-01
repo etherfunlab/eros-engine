@@ -231,6 +231,18 @@ pub fn local_midnight_utc(tz: Tz, date: NaiveDate) -> DateTime<Utc> {
 /// timezone WARN logs at most this many characters of it.
 const MAX_RAW_LEN: usize = 64;
 
+/// Trim and bound-check a raw locale value the same way `record_raw` does:
+/// `None` when absent, blank, or longer than `MAX_RAW_LEN`. Used wherever a
+/// raw locale string is persisted outside a row's metadata — e.g. the chat
+/// queue's `QueuedTurnParams` snapshot — so an oversized value never reaches
+/// storage there either; "invalid locale ⇒ absent" applies in one place.
+pub fn bounded_raw(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && v.len() <= MAX_RAW_LEN)
+        .map(str::to_string)
+}
+
 /// Copy a request's raw locale fields into a row's metadata (spec §4.1) so a
 /// replay can rebuild the prompt. Absent, blank and overlong values are skipped.
 pub fn record_raw(
@@ -244,10 +256,7 @@ pub fn record_raw(
         ("user_country", country),
         ("user_region", region),
     ] {
-        if let Some(v) = value
-            .map(str::trim)
-            .filter(|v| !v.is_empty() && v.len() <= MAX_RAW_LEN)
-        {
+        if let Some(v) = bounded_raw(value) {
             meta.insert(key.into(), serde_json::json!(v));
         }
     }
@@ -270,6 +279,25 @@ mod tests {
         let mut empty = serde_json::Map::new();
         record_raw(&mut empty, None, None, None);
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn bounded_raw_applies_the_same_rule_as_record_raw() {
+        assert_eq!(bounded_raw(None), None);
+        assert_eq!(bounded_raw(Some("")), None);
+        assert_eq!(bounded_raw(Some("   ")), None, "blank");
+        assert_eq!(bounded_raw(Some(&"x".repeat(65))), None, "overlong (65)");
+        let sixty_four = "x".repeat(64);
+        assert_eq!(
+            bounded_raw(Some(&sixty_four)),
+            Some(sixty_four),
+            "64 chars kept"
+        );
+        assert_eq!(
+            bounded_raw(Some("  Asia/Taipei  ")),
+            Some("Asia/Taipei".to_string()),
+            "trimmed"
+        );
     }
 
     fn d(y: i32, m: u32, day: u32) -> NaiveDate {

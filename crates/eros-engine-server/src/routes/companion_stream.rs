@@ -607,9 +607,9 @@ pub async fn send_message_stream(
         image_url: req.image_url.clone(),
         image: req.image.clone(),
         reply_to_message_id: req.reply_to_message_id,
-        user_timezone: req.user_timezone.clone(),
-        user_country: req.user_country.clone(),
-        user_region: req.user_region.clone(),
+        user_timezone: crate::holiday::bounded_raw(req.user_timezone.as_deref()),
+        user_country: crate::holiday::bounded_raw(req.user_country.as_deref()),
+        user_region: crate::holiday::bounded_raw(req.user_region.as_deref()),
     })
     .expect("QueuedTurnParams serializes");
     let queue_repo = ChatQueueRepo { pool: &state.pool };
