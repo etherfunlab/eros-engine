@@ -336,6 +336,7 @@ async fn drive_turn(
         image_url: params.image_url.clone(),
         image: params.image.clone(),
         quote,
+        user_locale: params.user_locale(),
     };
 
     drive_to_exhaustion(Arc::new(state.clone()), user_msg, None, tap).await

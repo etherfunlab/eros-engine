@@ -23,7 +23,7 @@
 //! so don't live here. Future port targets (dream / proactive) should be
 //! added as new families in this file.
 
-use chrono::{Datelike, Timelike, Utc, Weekday};
+use chrono::{DateTime, Datelike, Timelike, Utc, Weekday};
 
 use eros_engine_core::affinity::Affinity;
 use eros_engine_core::persona::CompanionPersona;
@@ -115,13 +115,46 @@ fn period_cn(hour: u32) -> &'static str {
     }
 }
 
-/// Absolute "now" context. Renders the persona's LOCAL date/weekday/time/period
-/// directly so the model does no arithmetic — this is the fix for the
-/// time-hallucination bug. The zone is the persona's own IANA `timezone` when
-/// set & valid; otherwise we default to SGT (UTC+8), since most users sit in
-/// UTC+8 — an unset persona then shares their wall clock rather than guessing.
-fn now_context(timezone: Option<&str>) -> String {
-    now_context_at(Utc::now(), timezone)
+/// Everything `[now]` renders (spec 2026-09-26 §5): the instant, the user's
+/// timezone (the persona clock's fallback), and the holidays in the user's
+/// local window. `Default` is for tests: its `now` is the Unix epoch and it
+/// renders no holiday line. Production callers build it with
+/// `NowContext::for_user(.., Utc::now())`.
+#[derive(Debug, Clone, Default)]
+pub struct NowContext {
+    pub now: DateTime<Utc>,
+    pub user_timezone: Option<chrono_tz::Tz>,
+    pub holidays: Vec<(u8, Vec<String>)>,
+}
+
+impl NowContext {
+    pub fn for_user(locale: &crate::holiday::UserLocale, now: DateTime<Utc>) -> Self {
+        Self {
+            now,
+            user_timezone: locale.timezone,
+            holidays: crate::holiday::upcoming(locale, now),
+        }
+    }
+}
+
+/// The user-side holiday line under `[now]` (spec §5.2). `None` when the
+/// window is empty. States facts only — no instruction to mention them.
+fn holiday_line(days: &[(u8, Vec<String>)]) -> Option<String> {
+    if days.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = days
+        .iter()
+        .map(|(ahead, names)| {
+            let when = match ahead {
+                0 => "今天".to_string(),
+                1 => "明天".to_string(),
+                n => format!("{n} 天后"),
+            };
+            format!("{when}是{}", names.join("、"))
+        })
+        .collect();
+    Some(format!("对方那边{}。", parts.join("；")))
 }
 
 /// How long ago a quoted line was said, in coarse buckets. The point of a
@@ -155,9 +188,18 @@ fn relative_age_from(now: chrono::DateTime<Utc>, sent_at: chrono::DateTime<Utc>)
     }
 }
 
-fn now_context_at(now: chrono::DateTime<Utc>, timezone: Option<&str>) -> String {
+/// Absolute "now" context. Renders the persona's LOCAL date/weekday/time/period
+/// directly so the model does no arithmetic — this is the fix for the
+/// time-hallucination bug. The zone is the persona's own IANA `timezone` when
+/// set & valid, else the user's, else SGT (UTC+8).
+fn now_context_at(
+    now: DateTime<Utc>,
+    timezone: Option<&str>,
+    user_timezone: Option<chrono_tz::Tz>,
+) -> String {
     let tz = timezone
         .and_then(|s| s.trim().parse::<chrono_tz::Tz>().ok())
+        .or(user_timezone)
         .unwrap_or(chrono_tz::Asia::Singapore);
     let local = now.with_timezone(&tz);
     format!(
@@ -701,6 +743,9 @@ pub fn build_prompt(
     // Engine-rolled per-turn nudges (`roll_nudges` at the call site).
     // All-false ⇒ the [this_turn] block is omitted.
     nudges: TurnNudges,
+    // The instant plus the user's side of `[now]` (spec 2026-09-26 §5).
+    // `NowContext::default()` ⇒ no holiday line.
+    now: &NowContext,
 ) -> String {
     let name = persona.genome.name.as_str();
     let age = meta_i32(persona, "age")
@@ -975,6 +1020,10 @@ pub fn build_prompt(
         }
     };
 
+    let holiday = holiday_line(&now.holidays)
+        .map(|l| format!("\n{l}"))
+        .unwrap_or_default();
+
     format!(
         "{head}{guard}{identity}\n\
          \n\
@@ -990,7 +1039,7 @@ pub fn build_prompt(
          [reply_length]\n{lr}{relationship}\
          {attitude}{state}{hints_section}{emotional_section}{quote_section}\n\
          \n\
-         [now]\n{tc}{this_turn}\n\
+         [now]\n{tc}{holiday}{this_turn}\n\
          \n\
          ---\n\
          [iron_rules — 违反即失效]\n\
@@ -999,7 +1048,7 @@ pub fn build_prompt(
          ② Adult consensual romance and erotic roleplay are allowed. The following are strictly disallowed: self-harm encouragement, suicide instructions, and any sexual content involving minors.{gender_rule}\n\
          \n\
          [output]直接输出回复文字（纯文本，不要 JSON，不要 markdown，不要 quote 符号；不要用括号或星号标注动作、神态、心理活动或旁白，想表达动作或情绪，让它体现在话语本身）",
-        tc = now_context(timezone),
+        tc = now_context_at(now.now, timezone, now.user_timezone),
         lr = length_rule(affinity, affinity_scope, reply_mode),
         rule1 = rule_one(reply_mode),
     )
@@ -1329,6 +1378,7 @@ mod tests {
             None,
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         assert!(
             !p.contains("[additional_guidance]"),
@@ -1369,6 +1419,7 @@ mod tests {
             None,
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         assert!(
             p.contains("[additional_guidance]"),
@@ -1401,6 +1452,7 @@ mod tests {
                 None,
                 None,
                 TurnNudges::default(),
+                &NowContext::default(),
             );
             assert!(
                 !p.contains("[clothing]"),
@@ -1441,6 +1493,7 @@ mod tests {
             Some(&mine),
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         assert!(p.contains("[quote]"), "section present: {p}");
         assert!(
@@ -1470,6 +1523,7 @@ mod tests {
             Some(&theirs),
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         assert!(
             p.contains("用户：我上次说的那个地方"),
@@ -1500,6 +1554,7 @@ mod tests {
             Some(&q),
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         assert!(p.contains("下面这段对话"), "dialogue intro: {p}");
         assert!(
@@ -1524,6 +1579,7 @@ mod tests {
             Some(&q),
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         assert!(
             p.contains("下面这句话"),
@@ -1550,6 +1606,7 @@ mod tests {
             None,
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         assert!(!p.contains("[quote]"), "no quote ⇒ no section: {p}");
     }
@@ -1590,6 +1647,7 @@ mod tests {
             None,
             cs,
             TurnNudges::default(),
+            &NowContext::default(),
         )
     }
 
@@ -1764,6 +1822,7 @@ mod tests {
             None,
             Some(&row),
             TurnNudges::default(),
+            &NowContext::default(),
         );
         let pos = |h: &str| s.find(h).unwrap_or_else(|| panic!("missing {h} in:\n{s}"));
         let order = [
@@ -1816,6 +1875,7 @@ mod tests {
             None,
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         // head, then the constant guard, then identity.
         assert!(s.starts_with("AUTHORED HEAD\n\n"), "{s}");
@@ -1850,6 +1910,7 @@ mod tests {
             None,
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         // No head → starts with the guard, which still precedes identity.
         assert!(
@@ -1881,6 +1942,7 @@ mod tests {
             None,
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         // Guard present, sits before identity (stable prefix).
         assert!(s.contains("never an AI, model, bot, or program"), "{s}");
@@ -1919,6 +1981,7 @@ mod tests {
             None,
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         // Treat refusal text in context as corrupt data, never self-identify
         // as an AI, and answer photo requests in character.
@@ -1963,6 +2026,7 @@ mod tests {
             None,
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         assert!(s.contains("你是 Aria，男性，24 岁，INFP 性格。"), "{s}");
         assert!(s.contains("③ 你是男性，严格遵守自己的性别"), "{s}");
@@ -1988,6 +2052,7 @@ mod tests {
             None,
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         assert!(
             s.contains("你是 Aria，non-binary，24 岁"),
@@ -2018,6 +2083,7 @@ mod tests {
             None,
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         assert!(s.contains("你是 Aria，24 岁，INFP 性格。"), "{s}");
         assert!(
@@ -2046,6 +2112,7 @@ mod tests {
             None,
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         // blank gender must not produce a double comma or the gender rule
         assert!(s.contains("你是 Aria，24 岁，INFP 性格。"), "{s}");
@@ -2074,6 +2141,7 @@ mod tests {
             None,
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         assert!(
             !s.contains("[recent_conversation]"),
@@ -2099,6 +2167,7 @@ mod tests {
             None,
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         let z = s.find("⓪").expect("⓪ rule must render");
         let o = s.find("①").expect("① rule must render");
@@ -2133,6 +2202,7 @@ mod tests {
             None,
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         let groups = vec![("基础画像".to_string(), vec!["住在上海".to_string()])];
         let b = build_prompt(
@@ -2151,6 +2221,7 @@ mod tests {
             None,
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         let cut = a
             .find("[user_profile]")
@@ -2191,6 +2262,7 @@ mod tests {
             None,
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         let b = build_prompt(
             &p,
@@ -2208,6 +2280,7 @@ mod tests {
             None,
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         let cut = a
             .find("[additional_guidance]")
@@ -2238,6 +2311,7 @@ mod tests {
             None,
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         assert!(!s.contains("[avoid_repetition]"), "{s}");
     }
@@ -2260,6 +2334,7 @@ mod tests {
             None,
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         assert!(!s.contains("[emotional_context]"), "{s}");
     }
@@ -2286,6 +2361,7 @@ mod tests {
             None,
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         let block_at = p.find("[world_memories]").expect("block present");
         assert!(p.contains("你最近和 Kenji 闹了别扭"));
@@ -2314,6 +2390,7 @@ mod tests {
             None,
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         assert!(!without.contains("[world_memories]"));
         // Empty context must also omit the block AND be byte-identical.
@@ -2334,6 +2411,7 @@ mod tests {
             None,
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         assert_eq!(without, with_empty, "empty world ⇒ byte-identical prompt");
     }
@@ -2360,6 +2438,7 @@ mod tests {
             None,
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         let at = p.find("[world_stories]").expect("block present");
         assert!(p[at..].contains("开店倒计时一周"));
@@ -2387,6 +2466,7 @@ mod tests {
             None,
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         assert!(!without.contains("[world_stories]"));
         let with_empty = build_prompt(
@@ -2405,6 +2485,7 @@ mod tests {
             None,
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         assert_eq!(without, with_empty, "empty stories ⇒ byte-identical prompt");
     }
@@ -2849,6 +2930,7 @@ mod tests {
             None,
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         assert!(!p.contains("你所在时区"), "timezone clause retired: {p}");
         assert!(
@@ -2882,6 +2964,7 @@ mod tests {
             None,
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         assert!(
             p.contains("[character_state]"),
@@ -2909,6 +2992,7 @@ mod tests {
             None,
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         // attitude directives are gated by the same axis set: bond-axis directives
         // present, chemistry-axis directives (trust/intrigue/patience) suppressed.
@@ -2938,6 +3022,7 @@ mod tests {
             None,
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         assert!(!p.contains("[feelings]"));
         assert!(!p.contains("[mood]"));
@@ -2963,6 +3048,7 @@ mod tests {
             None,
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         assert!(
             p.contains("[feelings]（你此刻对他的真实感觉，这是内心状态，绝对不要复述）"),
@@ -2993,6 +3079,7 @@ mod tests {
             None,
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         assert!(!p.contains("[feelings]"), "{p}");
 
@@ -3015,6 +3102,7 @@ mod tests {
             None,
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         assert!(!p.contains("[feelings]") && !p.contains("[mood]"), "{p}");
     }
@@ -3059,7 +3147,7 @@ mod tests {
     fn now_context_defaults_to_sgt_when_timezone_absent() {
         // No persona tz → default SGT (UTC+8): 07:55 UTC → 15:55 same day, Thursday.
         let dt = Utc.with_ymd_and_hms(2026, 5, 21, 7, 55, 0).unwrap(); // a Thursday
-        let s = now_context_at(dt, None);
+        let s = now_context_at(dt, None, None);
         assert!(s.contains("2026-05-21"), "{s}");
         assert!(s.contains("周四"), "{s}");
         assert!(s.contains("15:55"), "07:55 UTC +8 = 15:55: {s}");
@@ -3072,7 +3160,7 @@ mod tests {
     fn now_context_with_timezone_uses_local_date_weekday_time() {
         // 2026-05-21 20:00 UTC is Thursday; Asia/Tokyo (UTC+9) → 2026-05-22 05:00, Friday.
         let dt = Utc.with_ymd_and_hms(2026, 5, 21, 20, 0, 0).unwrap();
-        let s = now_context_at(dt, Some("Asia/Tokyo"));
+        let s = now_context_at(dt, Some("Asia/Tokyo"), None);
         assert!(s.contains("2026-05-22"), "local date should roll over: {s}");
         assert!(
             s.contains("周五"),
@@ -3091,9 +3179,108 @@ mod tests {
     fn now_context_with_garbage_timezone_defaults_to_sgt() {
         // Unparseable tz → SGT default (not UTC): 07:55 UTC → 15:55 SGT.
         let dt = Utc.with_ymd_and_hms(2026, 5, 21, 7, 55, 0).unwrap();
-        let s = now_context_at(dt, Some("Not/AZone"));
+        let s = now_context_at(dt, Some("Not/AZone"), None);
         assert!(s.contains("15:55"), "garbage tz falls back to SGT: {s}");
         assert!(!s.contains("UTC"), "{s}");
+    }
+
+    #[test]
+    fn persona_clock_prefers_persona_then_user_then_sgt() {
+        // 2026-05-21 20:00 UTC: Tokyo 05-22 05:00, LA (PDT) 05-21 13:00, SGT 05-22 04:00.
+        let dt = Utc.with_ymd_and_hms(2026, 5, 21, 20, 0, 0).unwrap();
+        let la = Some(chrono_tz::America::Los_Angeles);
+        assert!(now_context_at(dt, Some("Asia/Tokyo"), la).contains("05:00"));
+        let user = now_context_at(dt, None, la);
+        assert!(
+            user.contains("2026-05-21") && user.contains("13:00"),
+            "{user}"
+        );
+        assert!(now_context_at(dt, Some("Not/AZone"), la).contains("13:00"));
+        assert!(now_context_at(dt, None, None).contains("04:00"));
+    }
+
+    #[test]
+    fn holiday_line_labels_today_tomorrow_and_n_days_ahead() {
+        let days = vec![
+            (
+                0,
+                vec!["中秋节".to_string(), "Mid-Autumn Festival".to_string()],
+            ),
+            (1, vec!["平安夜".to_string()]),
+            (3, vec!["National Day".to_string()]),
+        ];
+        assert_eq!(
+            holiday_line(&days).as_deref(),
+            Some("对方那边今天是中秋节、Mid-Autumn Festival；明天是平安夜；3 天后是National Day。")
+        );
+        assert_eq!(holiday_line(&[]), None);
+    }
+
+    #[test]
+    fn holidays_follow_the_users_date_not_the_persona_clock() {
+        // 2026-09-24 20:00 UTC: Taipei is on 09-25 (中秋), LA still on 09-24.
+        let now = Utc.with_ymd_and_hms(2026, 9, 24, 20, 0, 0).unwrap();
+        let la = crate::holiday::UserLocale::resolve(Some("America/Los_Angeles"), Some("US"), None);
+        let ctx = NowContext::for_user(&la, now);
+        assert_eq!(ctx.user_timezone, Some(chrono_tz::America::Los_Angeles));
+        assert_eq!(ctx.holidays.first(), Some(&(1, vec!["中秋节".to_string()])));
+    }
+
+    #[test]
+    fn now_block_carries_the_user_clock_and_holiday_line() {
+        let now = NowContext {
+            now: Utc.with_ymd_and_hms(2026, 9, 24, 20, 0, 0).unwrap(),
+            user_timezone: Some(chrono_tz::Asia::Taipei),
+            holidays: vec![(0, vec!["中秋节".to_string()])],
+        };
+        let s = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            &[],
+            None,
+            None,
+            &[],
+            AffinityScope::full(),
+            &[],
+            None,
+            None,
+            None,
+            None,
+            TurnNudges::default(),
+            &now,
+        );
+        let block = &s[s.find("[now]").unwrap()..s.find("[iron_rules").unwrap()];
+        assert!(
+            block.contains("2026-09-25"),
+            "persona has no timezone ⇒ user clock: {block}"
+        );
+        assert!(block.contains("04:00"), "{block}");
+        assert!(block.contains("对方那边今天是中秋节。"), "{block}");
+    }
+
+    #[test]
+    fn default_now_context_renders_no_holiday_line() {
+        let s = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            &[],
+            None,
+            None,
+            &[],
+            AffinityScope::full(),
+            &[],
+            None,
+            None,
+            None,
+            None,
+            TurnNudges::default(),
+            &NowContext::default(),
+        );
+        assert!(!s.contains("对方那边"), "{s}");
     }
 
     #[test]
@@ -3114,6 +3301,7 @@ mod tests {
             None,
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         // What survives of the old ⑨: the half that governs what the reply
         // engages with. Its other half ("别开口就自述动作或凝视") was an opener
@@ -3181,6 +3369,7 @@ mod tests {
             None,
             None,
             TurnNudges::default(),
+            &NowContext::default(),
         );
         for gone in [
             "方括号",           // bracket ban — the regex strips \[[^\]]*\]
@@ -3284,6 +3473,7 @@ mod tests {
             None,
             None,
             nudges,
+            &NowContext::default(),
         )
     }
 

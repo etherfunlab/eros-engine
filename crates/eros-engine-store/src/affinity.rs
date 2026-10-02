@@ -258,7 +258,9 @@ impl<'a> AffinityRepo<'a> {
             .collect())
     }
 
-    /// Load existing or insert a fresh row with default values.
+    /// Load existing or insert a fresh row with default values. Concurrent
+    /// first calls for the same session converge on one row: the loser of
+    /// the insert race reads back the winner's row instead of erroring.
     pub async fn load_or_create(
         &self,
         session_id: Uuid,
@@ -269,16 +271,25 @@ impl<'a> AffinityRepo<'a> {
             return Ok(existing);
         }
 
+        // `session_id` is UNIQUE (migration 0002): a concurrent caller may
+        // win the insert between our `load` above and here, so DO NOTHING
+        // on conflict rather than erroring, and fall back to `load` for the
+        // winner's row.
         let row = sqlx::query_as::<_, AffinityRow>(
             "INSERT INTO engine.companion_affinity (session_id, user_id, instance_id) \
-             VALUES ($1, $2, $3) RETURNING *",
+             VALUES ($1, $2, $3) \
+             ON CONFLICT (session_id) DO NOTHING \
+             RETURNING *",
         )
         .bind(session_id)
         .bind(user_id)
         .bind(instance_id)
-        .fetch_one(self.pool)
+        .fetch_optional(self.pool)
         .await?;
-        Ok(row.into_domain())
+        match row {
+            Some(row) => Ok(row.into_domain()),
+            None => self.load(session_id).await?.ok_or(sqlx::Error::RowNotFound),
+        }
     }
 
     /// Newest-first affinity events for a session, optionally filtered by
@@ -811,6 +822,34 @@ mod tests {
         assert!((a1.warmth - expect).abs() < 1e-9);
         assert!((a1.patience - expect).abs() < 1e-9);
         assert!((a1.intrigue).abs() < 1e-9);
+    }
+
+    /// Two concurrent first calls on a session with no prior affinity row
+    /// converge on one row: the `ON CONFLICT (session_id) DO NOTHING` +
+    /// re-`load` fallback means the losing insert reads back the winner's
+    /// row instead of surfacing a unique-violation.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn load_or_create_converges_under_concurrent_first_calls(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = make_session(&pool, user_id, instance_id).await;
+
+        let (a, b) = tokio::join!(
+            repo.load_or_create(session_id, user_id, instance_id),
+            repo.load_or_create(session_id, user_id, instance_id),
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_eq!(a.id, b.id);
+
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.companion_affinity WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, 1);
     }
 
     #[sqlx::test(migrations = "./migrations")]

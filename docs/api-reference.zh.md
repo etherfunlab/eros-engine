@@ -310,6 +310,23 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
   http://localhost:8080/comp/chat/<session_id>/message/stream
 ```
 
+**可选：用户所在地。** 三个可选字符串告诉 engine 用户在哪里。engine 不会在两轮之间记住它们，每一轮都要带上。
+
+- `user_timezone` — IANA 时区（`Asia/Taipei`）。prompt 中 `[now]` 的时钟先取角色自己的
+  `art_metadata.timezone`，没有再取它，都没有才用 `Asia/Singapore`。它也决定用户那边的节日行：
+  用户当地今天和之后六天的节日（`对方那边今天是中秋节；3 天后是国庆节。`），只陈述事实。
+- `user_country` — ISO 3166-1 alpha-2（`TW`），客户端拿到什么就传什么。缺省时由
+  `user_timezone` 推出；不认识就没有法定假日。
+- `user_region` — 去掉国家前缀的 ISO 3166-2 行政区（`CA`、`ENG`），只在 `user_country`
+  也传了时才读；不认识就退回全国一级。
+
+非法值不会让这一轮失败：解析不了的时区当没传。原始值记在用户消息行的 metadata 里。
+
+节日有三个来源：13 个农历传统节日（`tyme4rs`，所有用户都有），所在国家的法定假日（`py-holidays-rs`，
+补休日已去掉），以及五个固定日期：02-14 情人节、10-25 台湾光复节、12-24 平安夜对所有人；
+10-09 辛亥革命纪念日只对 `CN`；10-10 双十节（中华民国国庆日）对其余国家以及没有国家的用户。
+async 端点和图片编辑接受同样的三个字段。
+
 **可选：OpenRouter audit 透传。** 请求体可附加 `audit` 对象，
 原样作为 wire 级别的 `user` / `session_id` / `metadata` 发送给
 OpenRouter —— 详见 [llm-audit.zh.md](llm-audit.zh.md)。示例：
@@ -522,6 +539,8 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
   `prompt_traits` 每次调用都校验（格式不对 400）；两者只在 `reply_with_text`
   掷出文本半边时起作用。assistant 行的 `metadata.prompt_traits` / `metadata.tier`
   留的审计副本与聊天回合相同。
+- `user_timezone`、`user_country`、`user_region` — 与聊天请求体相同的用户所在地（见 stream 端点）。
+  只有掷出文字回复时才会读，并记在那一行的 metadata 里。
 
 ```json
 {
@@ -579,6 +598,37 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 
 需要 `[tasks.chat_image_edit_compose]` **或** `[tasks.chat_image_prompt_compose]`：
 只配后者时，编辑走聊天合成器的模型链，用引擎内置的编辑提示词。
+
+### `POST /v2/comp/session/{session_id}/open`
+
+告诉 engine 用户刚进入会话。如果用户所在时区的今天是节日（来源同聊天请求体的节日行，只看当天），
+并且用户当地零点以来这个会话里还没有人说过话，角色就先开口：生成一条 assistant 消息，落库后返回。
+否则 `greeting` 为 `null`。
+
+```json
+{
+  "user_timezone": "Asia/Taipei",
+  "user_country": "TW",
+  "tier": "gold",
+  "memory_scope": "neutral_and_relationship"
+}
+```
+
+所有字段都可选。三个所在地字段的规则与聊天请求体相同；`tier`、`prompt_traits`、`memory_scope`、
+`affinity_scope`、`audit` 对开场白的作用与对聊天回复相同。engine 不会在两次调用之间记住这些值（开场白那一行会记一份审计副本），请传与聊天一轮相同的值。
+没有合法的 `user_timezone` 时直接返回 `null`。
+
+```json
+{ "greeting": { "message_id": "01J…", "content": "中秋快乐呀，今天有吃月饼吗", "sent_at": "…" } }
+```
+
+- **同步：** 一次非流式生成，需要几秒，不要阻塞 UI。
+- **幂等：** 同一会话、同一个用户当地日期，重复调用返回同一条，不会再生成。
+- **与普通回复一样落库：** 开场白是一条普通的 assistant 行（`assistant_action_type = 'proactive'`，
+  没有 `user_message_id`），在调用 `POST /comp/chat/{session_id}/read` 之前都是未读。
+  Realtime 和两个 history 路由都能看到。
+- **错误：** 会话检查与 stream 端点相同（`403`、`404`，语音会话 `409`），达到单用户并发上限 `429`。
+  生成失败时返回与图片接口相同的上游错误，不写入任何内容，下次打开会重试。
 
 ### `GET /comp/chat/{session_id}/history?limit=20&offset=0`
 
@@ -1389,6 +1439,7 @@ session 403）。
 - `crates/eros-engine-server/src/routes/companion.rs`——对话生命周期 / 画像 handler
 - `crates/eros-engine-server/src/routes/companion_stream.rs`——流式对话轮（`message/stream`），含打赏 + `image_url` 处理
 - `crates/eros-engine-server/src/routes/companion_async.rs`——只入队的对话轮（`v2/comp/session/{session_id}/message/async`）
+- `crates/eros-engine-server/src/routes/session_open.rs`——节日开场白（`v2/comp/session/{session_id}/open`）
 - `crates/eros-engine-server/src/routes/insight.rs`——按关系分开的 v2 画像端点（`v2/comp/instance/{instance_id}/insight/character`、`.../insight/user`）
 - `crates/eros-engine-server/src/pipeline/chat_queue.rs`——异步对话轮队列 worker
 - `crates/eros-engine-server/src/routes/voice.rs`——语音频道轮（`voice/{session_id}/turn/stream`）

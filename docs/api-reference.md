@@ -346,6 +346,29 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
   http://localhost:8080/comp/chat/<session_id>/message/stream
 ```
 
+**Optional: user locale.** Three optional strings tell the engine where the
+user is. The engine does not keep them between turns; send them on every turn.
+
+- `user_timezone` — IANA timezone (`Asia/Taipei`). The prompt's `[now]` clock
+  uses the persona's own `art_metadata.timezone` first, then this, then
+  `Asia/Singapore`. It also dates the user-side holiday line: holidays on the
+  user's local date and the six days after it
+  (`对方那边今天是中秋节；3 天后是国庆节。`), stated as facts.
+- `user_country` — ISO 3166-1 alpha-2 (`TW`), as the client received it. Absent
+  ⇒ derived from `user_timezone`. Unknown ⇒ no public holidays.
+- `user_region` — ISO 3166-2 subdivision without the country prefix (`CA`,
+  `ENG`). Read only beside `user_country`. Unknown ⇒ national holidays.
+
+Invalid values never fail the turn: an unparseable timezone is treated as
+absent. The raw values are recorded on the user row's metadata.
+
+Holidays come from three sources: the thirteen Chinese lunisolar festivals
+(`tyme4rs`, every user), the country's public holidays (`py-holidays-rs`,
+in-lieu days off dropped), and five fixed dates — 02-14 情人节, 10-25 台湾光复节,
+12-24 平安夜 for everyone, 10-09 辛亥革命纪念日 for `CN`, and 10-10
+双十节（中华民国国庆日） for every other country or none. The async endpoint
+and image edit accept the same three fields.
+
 **Optional: OpenRouter audit passthrough.** The body may include an
 `audit` object that rides directly to OpenRouter as wire-level `user` /
 `session_id` / `metadata` — see [llm-audit.md](llm-audit.md). Example:
@@ -609,6 +632,9 @@ consumer draws it, exactly as for a chat image turn.
   call (400 when malformed); both are inert unless `reply_with_text` rolls a
   text half. The assistant row's `metadata.prompt_traits` / `metadata.tier`
   carry the same audit copy as a chat turn.
+- `user_timezone`, `user_country`, `user_region` — the chat body's user locale
+  (see the stream endpoint). Only a rolled text half reads them; they are
+  recorded on that row's metadata.
 
 ```json
 {
@@ -675,6 +701,46 @@ deserialized successfully into, gated after ownership and state as described.
 Requires `[tasks.chat_image_edit_compose]` **or** `[tasks.chat_image_prompt_compose]`:
 with only the latter, edits run on the chat composer's chain using the engine's
 built-in edit prompt.
+
+### `POST /v2/comp/session/{session_id}/open`
+
+Tell the engine the user just entered a session. When it is a holiday in the
+user's timezone (same sources as the chat body's holiday line, today only) and
+nothing has been said in the session since the user's local midnight, the
+persona speaks first. One assistant message is generated, persisted and
+returned. Otherwise `greeting` is `null`.
+
+```json
+{
+  "user_timezone": "Asia/Taipei",
+  "user_country": "TW",
+  "tier": "gold",
+  "memory_scope": "neutral_and_relationship"
+}
+```
+
+Every field is optional. The three locale fields follow the chat body's rules.
+`tier`, `prompt_traits`, `memory_scope`, `affinity_scope` and `audit` shape the
+greeting as they shape a chat reply. The engine does not keep them between
+calls (the greeting row records them as an audit copy), so send the same
+values a chat turn would. Without a valid `user_timezone` the call returns
+`null`.
+
+```json
+{ "greeting": { "message_id": "01J…", "content": "中秋快乐呀，今天有吃月饼吗", "sent_at": "…" } }
+```
+
+- **Synchronous:** one non-streaming generation, a few seconds. Don't block UI on it.
+- **Idempotent** per session and user-local date: a repeat call returns the
+  same greeting and does not generate again.
+- **Persisted like any reply.** The greeting is an ordinary assistant row
+  (`assistant_action_type = 'proactive'`, no `user_message_id`), unread until
+  `POST /comp/chat/{session_id}/read`. Change feeds and both history routes
+  see it.
+- **Errors:** session checks as on the stream endpoint (`403`, `404`, `409`
+  for a voice session), `429` at the per-user in-flight cap. A failed
+  generation returns the upstream error the image endpoints return and
+  persists nothing; the next open retries.
 
 ### `GET /comp/chat/{session_id}/history?limit=20&offset=0`
 
@@ -1582,6 +1648,7 @@ error type. The table below covers the plain shape:
 - `crates/eros-engine-server/src/routes/companion.rs` — chat-lifecycle / profile handlers
 - `crates/eros-engine-server/src/routes/companion_stream.rs` — streaming chat turn (`message/stream`), incl. tip + `image_url` handling
 - `crates/eros-engine-server/src/routes/companion_async.rs` — enqueue-only chat turn (`v2/comp/session/{session_id}/message/async`)
+- `crates/eros-engine-server/src/routes/session_open.rs` — the holiday greeting (`v2/comp/session/{session_id}/open`)
 - `crates/eros-engine-server/src/routes/insight.rs` — v2 relationship-scoped insight profiles (`v2/comp/instance/{instance_id}/insight/character`, `.../insight/user`)
 - `crates/eros-engine-server/src/pipeline/chat_queue.rs` — async chat-turn queue worker
 - `crates/eros-engine-server/src/routes/voice.rs` — voice-channel turn (`voice/{session_id}/turn/stream`)

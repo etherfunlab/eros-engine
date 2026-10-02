@@ -2,6 +2,7 @@
 mod auth;
 mod error;
 mod history_window;
+mod holiday;
 mod memory_hygiene;
 mod middleware;
 mod openapi;

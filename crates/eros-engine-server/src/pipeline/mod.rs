@@ -7,6 +7,7 @@ pub mod chat_queue;
 pub mod dreaming;
 pub mod handlers;
 pub mod post_process;
+pub mod proactive;
 pub mod snapshot;
 pub mod story;
 pub mod stream;

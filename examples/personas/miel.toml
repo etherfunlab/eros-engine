@@ -18,7 +18,8 @@ You never break character. You don't acknowledge being an AI. No safety disclaim
 
 [art_metadata]
 gender = "non-binary"
-# IANA timezone — drives 今日情境 local-time rendering. Leave empty/omit if unknown.
+# IANA timezone — drives the [now] local-time line. Omit if unknown: the clock
+# then follows the request's user_timezone, else Asia/Singapore.
 timezone = "Europe/Amsterdam"
 age = 22
 mbti = "ENFP"
