@@ -71,7 +71,7 @@ spawn post_process     tokio::spawn——跟返回響應並行：
                         （五个 future 经 tokio::join! 并发执行）
 ```
 
-**Ghost streak 重置** 由編排器在 spawn post-process 之前處理：Reply / Proactive 動作會在一個冪等 UPDATE 裡把 streak 清零；Ghost 動作則調 `AffinityRepo::record_ghost`。倉儲方法 `persist_with_event` 自身永遠不碰 streak。
+**Ghost streak 重置** 由編排器在 spawn post-process 之前處理：Reply 動作會在一個冪等 UPDATE 裡把 streak 清零；Ghost 動作則調 `AffinityRepo::record_ghost`。倉儲方法 `persist_with_event` 自身永遠不碰 streak。
 
 **PDE 动作列表。** 判断器（或规则引擎）每轮给出的 action 是以下之一：
 `reply_text` | `ghost` | `reply_image` | `reply_text_image` | `product_qa`。
@@ -149,7 +149,7 @@ user 行上带 `metadata.voice_interrupt` 表示这一轮是用户主动打断�
 
 兩個原因：
 
-1. **思考負擔。** 好感度數學、ghost 決策、PDE 規則——這些是承重邏輯。把它們做成無 I/O 的，意味著 0 依賴的 cargo test 0ms 跑完，不會因為網絡抖動而 flake。`core` 的 87 個測試是上層所有東西的安全網。（可选 LLM 判断器层在 `server` 里，不在 `core` 里，所以 `core` 保持零 I/O。）
+1. **思考負擔。** 好感度數學、ghost 決策、PDE 規則——這些是承重邏輯。把它們做成無 I/O 的，意味著 0 依賴的 cargo test 0ms 跑完，不會因為網絡抖動而 flake。`core` 的 89 個測試是上層所有東西的安全網。（可选 LLM 判断器层在 `server` 里，不在 `core` 里，所以 `core` 保持零 I/O。）
 2. **可嵌入性。** 任何想在這個基礎上做別的產品的人——日記式 agent、語言教練、教練類陪伴——可以只拉 `core` 進來，不用繼承 HTTP 的形狀、Postgres schema、JWT auth。六維好感度模型才是別人最想拿走的部份；我們把這件事做成輕巧的。
 
 ## 文件結構
@@ -170,7 +170,7 @@ crates/
 │       ├── voyage.rs         # 512 維 embedding，空 key 直接 fail
 │       └── model_config.rs   # TOML 加載器
 ├── eros-engine-store/
-│   ├── migrations/           # 0000_schema → 0061_drop_child_model_usage
+│   ├── migrations/           # 0000_schema → 0063_chat_messages_proactive
 │   └── src/
 │       ├── pool.rs           # PgPoolOptions 構造
 │       ├── chat.rs           # ChatRepo
@@ -189,7 +189,7 @@ crates/
         ├── auth/             # AuthValidator trait + Supabase 實現 + 中間件
         ├── pipeline/         # stream（run_stream）/ handlers / post_process / dreaming / …
         ├── prompt.rs         # system prompt 構造（affinity → 行為指令）
-        ├── routes/           # health / companion / companion_stream / companion_async / insight / image_edit / voice / persona / world_town / bff / dto / mod
+        ├── routes/           # health / companion / companion_stream / companion_async / insight / image_edit / voice / persona / session_open / world_town / bff / dto / mod
         └── openapi.rs        # utoipa ApiDoc 元數據
 ```
 

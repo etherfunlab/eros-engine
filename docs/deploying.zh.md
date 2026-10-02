@@ -129,7 +129,7 @@ match eros_engine_core::ghost::decide(&affinity, signals) {
 
 ```rust
 use async_trait::async_trait;
-use eros_engine_server::auth::{AuthError, AuthValidator};
+use crate::auth::{AuthError, AuthValidator};
 use uuid::Uuid;
 
 pub struct MyValidator { /* … */ }
@@ -258,7 +258,7 @@ World Stories 按实例生活模拟）默认完全关闭：模型配置里没有
 [世界系统](world-system.zh.md)。
 
 - **环境变量：**完整的变量清单在 [`.env.example`](../.env.example)；该文件刻意精简——细节以本指南和 [model-config.zh.md](model-config.zh.md) 为准。
-- **好感度调参：**写入管线的旋钮——`AFFINITY_GRADE_UNIT_BOND`、`AFFINITY_GRADE_UNIT_CHEM`、`AFFINITY_NEG_FACTOR`、`AFFINITY_TIER_DECAY`、`AFFINITY_CROSS_PENALTY_RATIO`、`AFFINITY_CROSS_PENALTY_START`、`AFFINITY_DELTA_THRESHOLD`、`AFFINITY_DEMO_BOOST`，以及端点派生三件套 `AFFINITY_FLOOR_RATIO` / `AFFINITY_TIME_DECAY_RATE` / `AFFINITY_TIME_DECAY_FLOOR`——全部可选，回退到 4.0 默认值。见[好感度模型 → 写入管线](affinity-model.zh.md#写入管线affinity-40)。
+- **好感度调参：**写入管线的旋钮——`AFFINITY_GRADE_UNIT_BOND`、`AFFINITY_GRADE_UNIT_CHEM`、`AFFINITY_NEG_FACTOR`、`AFFINITY_TIER_DECAY`、`AFFINITY_CROSS_PENALTY_RATIO`、`AFFINITY_CROSS_PENALTY_START`、`AFFINITY_DELTA_THRESHOLD`、`AFFINITY_DEMO_BOOST`，以及端点派生三件套 `AFFINITY_FLOOR_RATIO` / `AFFINITY_TIME_DECAY_RATE` / `AFFINITY_TIME_DECAY_FLOOR`——全部可选，回退到 4.0 默认值。见[好感度模型 → 写入管线](affinity-model.zh.md#写入管线仅线轴基础对从不进入)。
 - **回声消除：** 每个 text 轮会注入该 session 最近消息的一个窗口（窗口大小见下面的**噪声消除**），而模型会复读 —— 线上七个模型实测 0.57%–15.38% 的 assistant 轮命中，没有一个是零。留在窗口里的重复会推高下一份拷贝的概率，那份拷贝又被存下来、又被注入。因此在单轮注入的消息里，任何出现超过一次的非空字符串，其所有出现都不注入，唯一例外是当前轮自己的用户消息，它永远保留。被丢掉的位置不回补。比较是逐字节的，且不区分角色。`CHAT_ECHO_CANCELLATION_DISABLED=1` 可以关掉；voice 路径有自己的窗口，不受影响。有丢弃的轮次会打一行 `INFO`，只含计数，不含消息内容。设计文档：[回声消除](superpowers/specs/2026-08-19-chat-echo-cancellation-design.md)。
 - **噪声消除：** 一个 text 轮仍然取一个以本轮用户消息收尾的 20 条窗口（不是单纯的会话最新 20 条——异步队列路径上它上方可能已有更新的消息），但只注入其中一部分（至少 3 条，通常不超过 17 条，上限只取决于取到的行数，见下），并且会把每条注入的 assistant 行的首句剥掉 —— 首句承载的是模型模仿自己的那部分语气（`唔` / `啊` / `嗯啊`），几乎不承载信息。同时剥掉这些行里的括号动作块（`（凑近）`这类舞台指示）并折叠剩下的空白 —— 动作块会自我传染：模型在自己近几条回复里看到什么，接下来就会写更多，光靠指令压不住历史示范出来的东西，所以让历史不再展示它们；自发出现的那部分由 `[output]` 行的标注禁令兜住。落库的 `content` 保留原文，剥的只是注入的副本。剥完为空的 assistant 行整行丢弃，不会以空内容送出（部分供应商会拒绝）；user 行不剥。注入几条取决于这段关系的 `character_insights` 行填得有多满：十个字段里非空达到 7 个，稳态下只注入 3 条 —— 当前轮永远保留，再加上上一轮的问答（上一条用户消息 + 它的助手回复）—— 每少一个字段多注入 2 条，行缺失或全空时多注入 14 条（稳态下共 17 条）。保护的是上一轮问答本身，不是固定两条，但设了下限：两条相邻的 user 行（用户连发两句、一轮被鬼、或某条 assistant 行被剥空后在上游被丢弃）不会顶掉角色真正的上一句回复 —— 下限兜住 2 条。如果那一轮助手侧留了不止一条（比如文字回复之外又插了一条图片行），保护范围会跟着扩大——总数因此可能超过 17，上限只取决于剥完之后还剩多少行。`CHAT_NOISE_CANCELLATION_DISABLED=1` 完整恢复改动前的形状：固定 20 条窗口，assistant 行整条注入，且 prompt 里不再注入 `[character_state]` 块（见[接口参考](api-reference.zh.md#get-v2compinstanceinstance_idinsightcharacter)）。剥空过行或收窄过窗口的轮次会打一行 `INFO`，只含计数，不含消息内容。设计文档：[噪声消除](superpowers/specs/2026-09-02-echo-cancellation-plus-design.md)。
 - **后台 sweeper：**`serve` 还会跑 dreaming-lite（会话结束记忆分类器）和 insight 快照两个 sweeper。都可选：`DREAMING_DISABLED=1` / `SNAPSHOT_DISABLED=1` 关掉，不影响聊天路径。dreaming 每 `DREAMING_TICK_SECS`（默认 300）秒醒一次，分类空闲至少 `DREAMING_IDLE_SECS`（默认 1800）秒的会话；分类认领超过 `DREAMING_CLAIM_STALE_SECS`（默认 600）秒视为 worker 崩溃、可被重新认领。`DREAMING_VOICE_DISABLED=1` 会把清扫器收回到只扫文字 session（默认结束的语音通话也会被蒸馏成记忆——见 [memory-layers.zh.md](memory-layers.zh.md#语音轮次)）。快照 sweeper 按 6 段 cron `SNAPSHOT_CRON`（默认 `0 0 23 * * *`）在 `SNAPSHOT_TZ`（默认 `Asia/Singapore`）时区运行；cron 解析失败则 sweeper 不启动（聊天路径不受影响），时区解析失败回退默认值。

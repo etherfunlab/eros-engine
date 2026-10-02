@@ -271,7 +271,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 > **1.3.0 起该字段重新只管注入。** 3.1 的写侧调向（1.2.1）已退役：
 > `affinity_scope` 只门控提示注入与 `length_score`，对计分没有任何影响。详见
-> [好感度模型 → Scope 调向：已退役](affinity-model.zh.md#scope-调向已退役)。
+> [好感度模型 → Scope 调向：已退役](affinity-model.zh.md#affinityrs-与-scopers)。
 
 同时使用两个字段的示例：
 
@@ -1444,6 +1444,7 @@ session 403）。
 - `crates/eros-engine-server/src/pipeline/chat_queue.rs`——异步对话轮队列 worker
 - `crates/eros-engine-server/src/routes/voice.rs`——语音频道轮（`voice/{session_id}/turn/stream`）
 - `crates/eros-engine-server/src/routes/persona.rs`——独立图片提示词合成（`/persona/{instance_id}/image/compose`）
+- `crates/eros-engine-server/src/routes/world_town.rs`——World Town 信息流与评论（`/world/town/*`）
 - `crates/eros-engine-server/src/routes/bff/companion.rs`——BFF `/bff/v1/comp/chat/*`
 - `crates/eros-engine-server/src/routes/bff/affinity.rs`——BFF `/bff/v1/comp/affinity/*`
 - `crates/eros-engine-server/src/routes/health.rs`——`/healthz`
