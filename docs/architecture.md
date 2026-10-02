@@ -72,7 +72,7 @@ spawn post_process     tokio::spawn — runs concurrent with response return:
                        (the five run concurrently via tokio::join!)
 ```
 
-**Ghost-streak reset** is handled by the orchestrator before spawning post-process: on Reply / Proactive the streak is cleared in a single idempotent UPDATE; on Ghost the orchestrator calls `AffinityRepo::record_ghost` instead. The `persist_with_event` repo method itself never touches the streak.
+**Ghost-streak reset** is handled by the orchestrator before spawning post-process: on Reply the streak is cleared in a single idempotent UPDATE; on Ghost the orchestrator calls `AffinityRepo::record_ghost` instead. The `persist_with_event` repo method itself never touches the streak.
 
 **PDE action list.** The judge's (or rule engine's) per-turn action is one of
 `reply_text` | `ghost` | `reply_image` | `reply_text_image` | `product_qa`.
@@ -158,7 +158,7 @@ See [voice barge-in](superpowers/specs/2026-08-11-voice-barge-in-interrupt-desig
 
 Two reasons:
 
-1. **Reasoning load.** Affinity math, ghost decisions, and PDE rules are the load-bearing logic. Keeping them I/O-free means a 0-dep cargo test runs in 0ms and never flakes on network. The 87 tests in `core` are the safety net for everything above. (The opt-in LLM judge layer lives in `server`, not `core`, so `core` stays zero-I/O.)
+1. **Reasoning load.** Affinity math, ghost decisions, and PDE rules are the load-bearing logic. Keeping them I/O-free means a 0-dep cargo test runs in 0ms and never flakes on network. The 89 tests in `core` are the safety net for everything above. (The opt-in LLM judge layer lives in `server`, not `core`, so `core` stays zero-I/O.)
 2. **Embeddability.** Anyone wanting to build a different product on top — journaling agent, language tutor, coaching companion — can pull in `core` without inheriting the HTTP shape, the Postgres schema, or the JWT auth. The 6-dim affinity model is the part most worth lifting; we made that easy.
 
 ## File structure
@@ -179,7 +179,7 @@ crates/
 │       ├── voyage.rs         # 512-dim embeddings, fail-loud on empty key
 │       └── model_config.rs   # TOML loader
 ├── eros-engine-store/
-│   ├── migrations/           # 0000_schema → 0061_drop_child_model_usage
+│   ├── migrations/           # 0000_schema → 0063_chat_messages_proactive
 │   └── src/
 │       ├── pool.rs           # PgPoolOptions builder
 │       ├── chat.rs           # ChatRepo
@@ -198,7 +198,7 @@ crates/
         ├── auth/             # AuthValidator trait + Supabase impl + middleware
         ├── pipeline/         # stream (run_stream) / handlers / post_process / dreaming / …
         ├── prompt.rs         # system-prompt builder (affinity → directives)
-        ├── routes/           # health / companion / companion_stream / companion_async / insight / image_edit / voice / persona / world_town / bff / dto / mod
+        ├── routes/           # health / companion / companion_stream / companion_async / insight / image_edit / voice / persona / session_open / world_town / bff / dto / mod
         └── openapi.rs        # utoipa ApiDoc spec metadata
 ```
 

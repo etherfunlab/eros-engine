@@ -304,7 +304,7 @@ into the prompt. Accepted values:
 > **Since 1.3.0 the field is injection-only again.** The 3.1 write-side
 > steering (1.2.1) is retired: `affinity_scope` gates prompt injection and
 > `length_score` and has no effect on scoring. See
-> [Affinity model → Scope steering: retired](affinity-model.md#scope-steering-retired).
+> [Affinity model → Scope steering: retired](affinity-model.md#affinityrs-vs-scopers).
 
 Example using both fields:
 
