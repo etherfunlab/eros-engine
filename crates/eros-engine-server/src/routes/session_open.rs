@@ -350,17 +350,20 @@ async fn caller_occasion(
     if let Some(row) = chat_repo.open_message(session_id, &open_key).await? {
         return Ok(answer(Some(row)));
     }
+    // When a precondition fails, re-read the key: a same-key call can commit
+    // between the lookup above and the precondition read (its own row makes
+    // the session non-empty), and its row is this call's answer too.
     let last_user = chat_repo.latest_user_message(session_id).await?;
     let occasion = match occasion {
         OpenOccasion::FirstMeet => {
             if !chat_repo.history(session_id, 1, 0).await?.is_empty() {
-                return Ok(answer(None));
+                return Ok(answer(chat_repo.open_message(session_id, &open_key).await?));
             }
             Occasion::FirstMeet { open_key }
         }
         OpenOccasion::Returning => {
             let Some(last) = &last_user else {
-                return Ok(answer(None));
+                return Ok(answer(chat_repo.open_message(session_id, &open_key).await?));
             };
             Occasion::Returning {
                 open_key,
@@ -1340,6 +1343,62 @@ mod tests {
             matches!(occasion, Occasion::Returning { gap_days: 0, .. }),
             "never a negative gap"
         );
+    }
+
+    /// A same-key opener that commits between a call's key lookup and its
+    /// precondition read is that call's answer, never a bare `null`. The
+    /// checker loops across the writer's commit, so the commit lands inside
+    /// one of its lookup → precondition windows.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_same_key_opener_landing_mid_check_is_returned_not_null(pool: PgPool) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let user_id = Uuid::new_v4();
+        let session_id = empty_session(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "你好呀").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let repo = ChatRepo { pool: &pool };
+        let now = Utc::now();
+        let done = AtomicBool::new(false);
+
+        let writer = async {
+            let out = open_at(
+                &state,
+                session_id,
+                user_id,
+                opener(OpenOccasion::FirstMeet, "visit-1"),
+                now,
+            )
+            .await;
+            done.store(true, Ordering::SeqCst);
+            out
+        };
+        let checker = async {
+            let mut nulls = 0;
+            loop {
+                let writer_done = done.load(Ordering::SeqCst);
+                let next = caller_occasion(
+                    &repo,
+                    session_id,
+                    OpenOccasion::FirstMeet,
+                    "visit-1".into(),
+                    now,
+                )
+                .await
+                .unwrap();
+                match next {
+                    Next::Answer(OpenSessionResponse { greeting: Some(_) }) => break,
+                    Next::Answer(OpenSessionResponse { greeting: None }) => nulls += 1,
+                    Next::Speak { .. } if writer_done => break,
+                    Next::Speak { .. } => tokio::task::yield_now().await,
+                }
+            }
+            nulls
+        };
+        let (written, nulls) = tokio::join!(writer, checker);
+        assert!(written.unwrap().greeting.is_some(), "the writer's opener");
+        assert_eq!(nulls, 0, "the same key's opener was reported as null");
     }
 
     #[test]
