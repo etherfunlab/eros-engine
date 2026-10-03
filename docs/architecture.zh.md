@@ -170,7 +170,7 @@ crates/
 │       ├── voyage.rs         # 512 維 embedding，空 key 直接 fail
 │       └── model_config.rs   # TOML 加載器
 ├── eros-engine-store/
-│   ├── migrations/           # 0000_schema → 0063_chat_messages_proactive
+│   ├── migrations/           # 0000_schema → 0064_chat_messages_open_key
 │   └── src/
 │       ├── pool.rs           # PgPoolOptions 構造
 │       ├── chat.rs           # ChatRepo

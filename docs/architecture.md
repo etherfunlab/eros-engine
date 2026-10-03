@@ -179,7 +179,7 @@ crates/
 │       ├── voyage.rs         # 512-dim embeddings, fail-loud on empty key
 │       └── model_config.rs   # TOML loader
 ├── eros-engine-store/
-│   ├── migrations/           # 0000_schema → 0063_chat_messages_proactive
+│   ├── migrations/           # 0000_schema → 0064_chat_messages_open_key
 │   └── src/
 │       ├── pool.rs           # PgPoolOptions builder
 │       ├── chat.rs           # ChatRepo
