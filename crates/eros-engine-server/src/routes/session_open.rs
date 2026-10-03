@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! POST /v2/comp/session/{session_id}/open — the client reports that the user
 //! just entered a session. On a user-local holiday nobody has spoken on yet,
-//! the persona speaks first.
+//! or on an occasion the client names, the persona speaks first.
 //!
-//! Spec: docs/superpowers/specs/2026-09-26-user-locale-and-holiday-greeting-design.md §4.2
+//! Specs: docs/superpowers/specs/2026-09-26-user-locale-and-holiday-greeting-design.md §4.2,
+//! docs/superpowers/specs/2026-10-03-open-occasions-design.md §3–§4
 
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
@@ -19,7 +20,8 @@ use eros_engine_store::chat::{ChatMessage, ChatRepo};
 use crate::auth::middleware::AuthUser;
 use crate::error::{AppError, StreamPreError};
 use crate::holiday::{self, UserLocale};
-use crate::pipeline::proactive::{greet, Greeting};
+use crate::pipeline::handlers::recall_query_text;
+use crate::pipeline::proactive::{greet, Greeting, Occasion};
 use crate::prompt::NowContext;
 use crate::routes::companion::{
     validate_llm_audit, validate_prompt_traits, LlmAuditDto, PromptTraitDto,
@@ -31,11 +33,12 @@ use crate::state::AppState;
 
 /// Same per-user in-flight cap as every other LLM entry point.
 const CONCURRENT_STREAMS_PER_USER: u32 = 3;
+const MAX_OPEN_KEY_CHARS: usize = 128;
 
 #[derive(Debug, Default, Deserialize, utoipa::ToSchema)]
 pub struct OpenSessionRequest {
     /// The user's IANA timezone. Without a valid one there is no user-local
-    /// date and `greeting` is `null`.
+    /// date and the holiday greeting is `null`.
     #[serde(default)]
     pub user_timezone: Option<String>,
     /// ISO 3166-1 alpha-2 country — same rules as the chat body.
@@ -57,11 +60,33 @@ pub struct OpenSessionRequest {
     pub affinity_scope: Option<AffinityScopeDto>,
     #[serde(default)]
     pub audit: Option<LlmAuditDto>,
+    /// Ask the persona to speak first for this reason. Absent: the engine
+    /// decides, and speaks first only on a user-local holiday.
+    #[serde(default)]
+    pub occasion: Option<OpenOccasion>,
+    /// The caller's idempotency key for `occasion`, scoped to the session:
+    /// the same key returns the same message. Required with `occasion`;
+    /// 1–128 chars of `[A-Za-z0-9_.:-]`.
+    #[serde(default)]
+    pub open_key: Option<String>,
+}
+
+/// A caller-named reason for the persona to speak first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenOccasion {
+    /// The session has no messages yet.
+    FirstMeet,
+    /// The user has spoken in this session before; the engine tells the
+    /// persona how many days ago.
+    Returning,
+    /// No particular reason.
+    JustOpened,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct OpenSessionResponse {
-    /// The persona's first message today, or `null` when it does not speak first.
+    /// The persona's first message, or `null` when it does not speak first.
     pub greeting: Option<GreetingDto>,
 }
 
@@ -70,25 +95,48 @@ pub struct GreetingDto {
     pub message_id: Uuid,
     pub content: String,
     pub sent_at: DateTime<Utc>,
+    pub occasion: GreetingOccasion,
+}
+
+/// Why the persona spoke first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GreetingOccasion {
+    Holiday,
+    FirstMeet,
+    Returning,
+    JustOpened,
 }
 
 impl From<ChatMessage> for GreetingDto {
     fn from(m: ChatMessage) -> Self {
+        // Every proactive row records `metadata.proactive`; holiday greetings
+        // were the only kind before caller-named occasions.
+        let occasion = m
+            .metadata
+            .as_ref()
+            .and_then(|v| v.get("proactive"))
+            .and_then(|v| GreetingOccasion::deserialize(v).ok())
+            .unwrap_or(GreetingOccasion::Holiday);
         Self {
             message_id: m.id,
             content: m.content,
             sent_at: m.sent_at,
+            occasion,
         }
     }
 }
 
 /// Tell the engine the user just entered this session.
 ///
-/// When it is a holiday in the user's timezone and nothing has been said in
-/// the session since the user's local midnight, the persona speaks first: one
-/// assistant message is generated, persisted (unread, like any reply) and
-/// returned. Otherwise `greeting` is `null`. Idempotent per session and
-/// user-local date — a repeat call returns the same greeting.
+/// Without `occasion` the engine decides: when it is a holiday in the user's
+/// timezone and nobody has spoken in the session since the user's local
+/// midnight, the persona speaks first. With `occasion` the caller decides,
+/// and the persona speaks first when the occasion is true of the session.
+/// Either way one assistant message is generated, persisted (unread, like any
+/// reply) and returned; otherwise `greeting` is `null`. Idempotent per
+/// session and user-local date for the holiday, per session and `open_key`
+/// for an occasion.
 #[utoipa::path(
     post,
     path = "/v2/comp/session/{session_id}/open",
@@ -102,6 +150,7 @@ impl From<ChatMessage> for GreetingDto {
         (status = 403, body = StreamPreErrorBody),
         (status = 404, body = StreamPreErrorBody),
         (status = 409, body = StreamPreErrorBody),
+        (status = 422, description = "unknown `occasion` or another malformed body field"),
         (status = 429, description = "per-user in-flight cap reached"),
         (status = "5XX", description = "companion chain exhausted; the provider's own status \
             passes through, same body as the image endpoints. Nothing is persisted.")
@@ -119,8 +168,56 @@ async fn open_session(
         .map(Json)
 }
 
-fn no_greeting() -> Result<OpenSessionResponse, AppError> {
-    Ok(OpenSessionResponse { greeting: None })
+fn invalid_payload(message: String) -> AppError {
+    AppError::StreamPre(StreamPreError {
+        status: StatusCode::BAD_REQUEST,
+        code: "invalid_payload",
+        message,
+        user_message: "请求无效".into(),
+        original_user_message_id: None,
+    })
+}
+
+/// `occasion` and `open_key` come together or not at all.
+fn validate_opener(
+    occasion: Option<OpenOccasion>,
+    open_key: Option<String>,
+) -> Result<Option<(OpenOccasion, String)>, AppError> {
+    match (occasion, open_key) {
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(invalid_payload("occasion requires open_key".into())),
+        (None, Some(_)) => Err(invalid_payload("open_key requires occasion".into())),
+        (Some(occasion), Some(key)) => {
+            let well_formed = (1..=MAX_OPEN_KEY_CHARS).contains(&key.len())
+                && key
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'-'));
+            if !well_formed {
+                return Err(invalid_payload(format!(
+                    "open_key must be 1..={MAX_OPEN_KEY_CHARS} chars of [A-Za-z0-9_.:-]"
+                )));
+            }
+            Ok(Some((occasion, key)))
+        }
+    }
+}
+
+/// What the route does once it has decided whether the persona speaks.
+enum Next {
+    /// Answer without generating: an existing message, or `null`.
+    Answer(OpenSessionResponse),
+    /// Generate for this occasion; `since` is the cutoff the insert re-checks.
+    Speak {
+        occasion: Occasion,
+        recall_query: String,
+        since: DateTime<Utc>,
+    },
+}
+
+fn answer(row: Option<ChatMessage>) -> Next {
+    Next::Answer(OpenSessionResponse {
+        greeting: row.map(Into::into),
+    })
 }
 
 /// The handler with its clock injected, so tests can pin a holiday.
@@ -133,24 +230,10 @@ pub(crate) async fn open_at(
 ) -> Result<OpenSessionResponse, AppError> {
     validate_tier(req.tier.as_deref())?;
     let prompt_traits = validate_prompt_traits(req.prompt_traits.as_deref().unwrap_or(&[]))
-        .map_err(|e| {
-            AppError::StreamPre(StreamPreError {
-                status: StatusCode::BAD_REQUEST,
-                code: "invalid_payload",
-                message: e.to_string(),
-                user_message: "请求无效".into(),
-                original_user_message_id: None,
-            })
-        })?;
-    let audit = validate_llm_audit(req.audit.clone()).map_err(|e| {
-        AppError::StreamPre(StreamPreError {
-            status: StatusCode::BAD_REQUEST,
-            code: "invalid_payload",
-            message: e.to_string(),
-            user_message: "请求无效".into(),
-            original_user_message_id: None,
-        })
-    })?;
+        .map_err(|e| invalid_payload(e.to_string()))?;
+    let audit =
+        validate_llm_audit(req.audit.clone()).map_err(|e| invalid_payload(e.to_string()))?;
+    let opener = validate_opener(req.occasion, req.open_key.clone())?;
     let (_session, persona, instance_id) = resolve_text_turn(state, session_id, user_id).await?;
 
     let locale = UserLocale::resolve(
@@ -158,36 +241,21 @@ pub(crate) async fn open_at(
         req.user_country.as_deref(),
         req.user_region.as_deref(),
     );
-    let (Some(tz), Some(local_date)) = (locale.timezone, locale.local_date(now)) else {
-        return no_greeting();
-    };
-    let holidays = holiday::holidays_on(local_date, locale.country, locale.region);
-    if holidays.is_empty() {
-        return no_greeting();
-    }
-
-    let since = holiday::local_midnight_utc(tz, local_date);
-
     let chat_repo = ChatRepo { pool: &state.pool };
-    if let Some(row) = chat_repo
-        .proactive_greeting_on(session_id, &local_date.to_string())
-        .await?
-    {
-        return Ok(OpenSessionResponse {
-            greeting: Some(row.into()),
-        });
-    }
-    if chat_repo.has_message_since(session_id, since).await? {
-        // A concurrent caller's greeting can land between the lookup above
-        // and this check (its own insert counts as "a message since" too):
-        // re-check for that winner's row rather than reporting a bare null.
-        return Ok(OpenSessionResponse {
-            greeting: chat_repo
-                .proactive_greeting_on(session_id, &local_date.to_string())
-                .await?
-                .map(Into::into),
-        });
-    }
+    let next = match opener {
+        None => holiday_occasion(&chat_repo, session_id, locale, now).await?,
+        Some((occasion, open_key)) => {
+            caller_occasion(&chat_repo, session_id, occasion, open_key, now).await?
+        }
+    };
+    let (occasion, recall_query, since) = match next {
+        Next::Answer(resp) => return Ok(resp),
+        Next::Speak {
+            occasion,
+            recall_query,
+            since,
+        } => (occasion, recall_query, since),
+    };
 
     let _guard = state
         .stream_slots
@@ -209,9 +277,9 @@ pub(crate) async fn open_at(
             instance_id,
             persona: &persona,
             now: &now_ctx,
-            local_date,
+            occasion,
+            recall_query,
             since,
-            holidays,
             tier: req.tier,
             prompt_traits,
             memory_scope: req.memory_scope.unwrap_or_default(),
@@ -227,6 +295,87 @@ pub(crate) async fn open_at(
     .await?;
     Ok(OpenSessionResponse {
         greeting: greeting.map(Into::into),
+    })
+}
+
+/// The engine's own call: speak first on a user-local holiday nobody has
+/// spoken on yet. A caller-named opener since local midnight counts as
+/// having spoken.
+async fn holiday_occasion(
+    chat_repo: &ChatRepo<'_>,
+    session_id: Uuid,
+    locale: UserLocale,
+    now: DateTime<Utc>,
+) -> Result<Next, AppError> {
+    let (Some(tz), Some(local_date)) = (locale.timezone, locale.local_date(now)) else {
+        return Ok(answer(None));
+    };
+    let holidays = holiday::holidays_on(local_date, locale.country, locale.region);
+    if holidays.is_empty() {
+        return Ok(answer(None));
+    }
+    let since = holiday::local_midnight_utc(tz, local_date);
+    let date = local_date.to_string();
+    if let Some(row) = chat_repo.proactive_greeting_on(session_id, &date).await? {
+        return Ok(answer(Some(row)));
+    }
+    if chat_repo.has_message_since(session_id, since).await? {
+        // A concurrent caller's greeting can land between the lookup above
+        // and this check (its own insert counts as "a message since" too):
+        // re-check for that winner's row rather than reporting a bare null.
+        return Ok(answer(
+            chat_repo.proactive_greeting_on(session_id, &date).await?,
+        ));
+    }
+    Ok(Next::Speak {
+        recall_query: holidays.join("、"),
+        occasion: Occasion::Holiday {
+            local_date,
+            holidays,
+        },
+        since,
+    })
+}
+
+/// The caller's call: the key's existing message, `null` when the occasion
+/// is not true of this session, or the occasion to speak for. The insert's
+/// cutoff is the request's start, so a user who speaks meanwhile wins.
+async fn caller_occasion(
+    chat_repo: &ChatRepo<'_>,
+    session_id: Uuid,
+    occasion: OpenOccasion,
+    open_key: String,
+    now: DateTime<Utc>,
+) -> Result<Next, AppError> {
+    if let Some(row) = chat_repo.open_message(session_id, &open_key).await? {
+        return Ok(answer(Some(row)));
+    }
+    let last_user = chat_repo.latest_user_message(session_id).await?;
+    let occasion = match occasion {
+        OpenOccasion::FirstMeet => {
+            if !chat_repo.history(session_id, 1, 0).await?.is_empty() {
+                return Ok(answer(None));
+            }
+            Occasion::FirstMeet { open_key }
+        }
+        OpenOccasion::Returning => {
+            let Some(last) = &last_user else {
+                return Ok(answer(None));
+            };
+            Occasion::Returning {
+                open_key,
+                gap_days: (now - last.sent_at).num_days().max(0),
+            }
+        }
+        OpenOccasion::JustOpened => Occasion::JustOpened { open_key },
+    };
+    Ok(Next::Speak {
+        occasion,
+        recall_query: last_user
+            .as_ref()
+            .map(recall_query_text)
+            .unwrap_or_default(),
+        since: now,
     })
 }
 
@@ -357,6 +506,7 @@ mod tests {
             .unwrap();
         let g = out.greeting.expect("a greeting");
         assert_eq!(g.content, "中秋快乐呀，今天有吃月饼吗");
+        assert_eq!(g.occasion, GreetingOccasion::Holiday);
 
         let (action, umid, read_at, meta): (
             Option<String>,
@@ -726,6 +876,486 @@ mod tests {
         assert_eq!(out.greeting.expect("a greeting").content, "中秋快乐");
     }
 
+    fn opener(occasion: OpenOccasion, key: &str) -> OpenSessionRequest {
+        OpenSessionRequest {
+            occasion: Some(occasion),
+            open_key: Some(key.into()),
+            ..Default::default()
+        }
+    }
+
+    async fn empty_session(pool: &PgPool, user_id: Uuid) -> Uuid {
+        let genome_id = seed_genome(pool, "Aria").await;
+        let instance_id = seed_instance(pool, genome_id, user_id).await;
+        seed_session(pool, user_id, instance_id).await
+    }
+
+    fn last_message(call: &serde_json::Value) -> &serde_json::Value {
+        call["messages"].as_array().unwrap().last().unwrap()
+    }
+
+    async fn row_metadata(pool: &PgPool, id: Uuid) -> serde_json::Value {
+        sqlx::query_scalar("SELECT metadata FROM engine.chat_messages WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn first_meet_opens_an_empty_session(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = empty_session(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "你好呀，第一次见").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+
+        let g = open_at(
+            &state,
+            session_id,
+            user_id,
+            opener(OpenOccasion::FirstMeet, "visit-1"),
+            Utc::now(),
+        )
+        .await
+        .unwrap()
+        .greeting
+        .expect("an opener");
+        assert_eq!(g.content, "你好呀，第一次见");
+        assert_eq!(g.occasion, GreetingOccasion::FirstMeet);
+
+        let (action, umid, read_at, meta): (
+            Option<String>,
+            Option<Uuid>,
+            Option<DateTime<Utc>>,
+            serde_json::Value,
+        ) = sqlx::query_as(
+            "SELECT assistant_action_type, user_message_id, read_at, metadata \
+             FROM engine.chat_messages WHERE id = $1",
+        )
+        .bind(g.message_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(action.as_deref(), Some("proactive"));
+        assert_eq!(umid, None);
+        assert_eq!(read_at, None, "unread like any reply");
+        assert_eq!(meta["proactive"], json!("first_meet"));
+        assert_eq!(meta["open_key"], json!("visit-1"));
+        assert_eq!(meta["prompt_traits"], json!([]));
+        assert!(meta.get("memory_scope").is_some());
+        assert!(meta.get("affinity_scope").is_some());
+        assert!(
+            meta.get("local_date").is_none(),
+            "never meets the holiday index"
+        );
+        assert!(meta.get("gap_days").is_none());
+
+        let calls = companion_calls(&mock).await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            last_message(&calls[0])["content"],
+            json!("（你们还没聊过。对方刚打开和你的聊天，还没说话。）")
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn returning_states_the_gap_in_days(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let now = Utc::now();
+        let session_id =
+            session_with_history(&pool, user_id, now - chrono::Duration::hours(80)).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "好久不见").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+
+        let g = open_at(
+            &state,
+            session_id,
+            user_id,
+            opener(OpenOccasion::Returning, "visit-1"),
+            now,
+        )
+        .await
+        .unwrap()
+        .greeting
+        .expect("an opener");
+        assert_eq!(g.occasion, GreetingOccasion::Returning);
+        let meta = row_metadata(&pool, g.message_id).await;
+        assert_eq!(meta["proactive"], json!("returning"));
+        assert_eq!(meta["gap_days"], json!(3));
+        let calls = companion_calls(&mock).await;
+        assert_eq!(
+            last_message(&calls[0])["content"],
+            json!("（对方隔了 3 天又打开和你的聊天，还没说话。）")
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn returning_within_a_day_says_less_than_a_day(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let now = Utc::now();
+        let session_id =
+            session_with_history(&pool, user_id, now - chrono::Duration::hours(5)).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "又来啦").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+
+        let g = open_at(
+            &state,
+            session_id,
+            user_id,
+            opener(OpenOccasion::Returning, "visit-1"),
+            now,
+        )
+        .await
+        .unwrap()
+        .greeting
+        .expect("an opener");
+        assert_eq!(
+            row_metadata(&pool, g.message_id).await["gap_days"],
+            json!(0)
+        );
+        let calls = companion_calls(&mock).await;
+        assert_eq!(
+            last_message(&calls[0])["content"],
+            json!("（对方隔了不到一天又打开和你的聊天，还没说话。）")
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn just_opened_takes_the_plain_cue(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let now = Utc::now();
+        let session_id =
+            session_with_history(&pool, user_id, now - chrono::Duration::days(2)).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "在干嘛呢").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+
+        let g = open_at(
+            &state,
+            session_id,
+            user_id,
+            opener(OpenOccasion::JustOpened, "visit-1"),
+            now,
+        )
+        .await
+        .unwrap()
+        .greeting
+        .expect("an opener");
+        assert_eq!(g.occasion, GreetingOccasion::JustOpened);
+        let meta = row_metadata(&pool, g.message_id).await;
+        assert_eq!(meta["proactive"], json!("just_opened"));
+        assert!(meta.get("gap_days").is_none());
+        let calls = companion_calls(&mock).await;
+        assert_eq!(
+            last_message(&calls[0])["content"],
+            json!(crate::pipeline::proactive::OPEN_CUE)
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_occasion_that_is_not_true_means_no_opener_and_no_call(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let now = Utc::now();
+        let talked = session_with_history(&pool, user_id, now - chrono::Duration::days(2)).await;
+        let empty = empty_session(&pool, user_id).await;
+        // A session whose only row is a holiday greeting: the persona already
+        // spoke (not a first meeting) and the user never did (not a return).
+        let greeted_only = empty_session(&pool, user_id).await;
+        sqlx::query(
+            "INSERT INTO engine.chat_messages \
+               (session_id, role, content, assistant_action_type, metadata) \
+             VALUES ($1, 'assistant', '中秋快乐', 'proactive', \
+                     '{\"proactive\": \"holiday\", \"local_date\": \"2026-09-25\"}'::jsonb)",
+        )
+        .bind(greeted_only)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "不该被调用").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+
+        for (session_id, occasion) in [
+            (talked, OpenOccasion::FirstMeet),
+            (empty, OpenOccasion::Returning),
+            (greeted_only, OpenOccasion::FirstMeet),
+            (greeted_only, OpenOccasion::Returning),
+        ] {
+            let out = open_at(
+                &state,
+                session_id,
+                user_id,
+                opener(occasion, "visit-1"),
+                now,
+            )
+            .await
+            .unwrap();
+            assert!(out.greeting.is_none(), "{occasion:?} on {session_id}");
+        }
+        assert!(companion_calls(&mock).await.is_empty());
+        assert_eq!(proactive_rows(&pool, talked).await, 0);
+        assert_eq!(proactive_rows(&pool, empty).await, 0);
+        assert_eq!(proactive_rows(&pool, greeted_only).await, 1);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_same_key_returns_the_same_opener_and_a_new_key_speaks_again(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id =
+            session_with_history(&pool, user_id, Utc::now() - chrono::Duration::days(2)).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "在干嘛呢").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+
+        let first = open_at(
+            &state,
+            session_id,
+            user_id,
+            opener(OpenOccasion::JustOpened, "visit-1"),
+            Utc::now(),
+        )
+        .await
+        .unwrap()
+        .greeting
+        .unwrap();
+        // The key wins over the occasion this call names.
+        let again = open_at(
+            &state,
+            session_id,
+            user_id,
+            opener(OpenOccasion::Returning, "visit-1"),
+            Utc::now(),
+        )
+        .await
+        .unwrap()
+        .greeting
+        .unwrap();
+        assert_eq!(again.message_id, first.message_id);
+        assert_eq!(again.occasion, GreetingOccasion::JustOpened);
+        assert_eq!(companion_calls(&mock).await.len(), 1);
+
+        // `now` is taken after the first opener landed, so its row is before
+        // this request's cutoff.
+        let next = open_at(
+            &state,
+            session_id,
+            user_id,
+            opener(OpenOccasion::JustOpened, "visit-2"),
+            Utc::now(),
+        )
+        .await
+        .unwrap()
+        .greeting
+        .expect("a new key speaks again");
+        assert_ne!(next.message_id, first.message_id);
+        assert_eq!(companion_calls(&mock).await.len(), 2);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn concurrent_opens_with_one_key_write_one_opener(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let now = Utc::now();
+        let session_id =
+            session_with_history(&pool, user_id, now - chrono::Duration::days(2)).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "在干嘛呢").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+
+        let (a, b) = tokio::join!(
+            open_at(
+                &state,
+                session_id,
+                user_id,
+                opener(OpenOccasion::JustOpened, "visit-1"),
+                now
+            ),
+            open_at(
+                &state,
+                session_id,
+                user_id,
+                opener(OpenOccasion::JustOpened, "visit-1"),
+                now
+            ),
+        );
+        let (a, b) = (a.unwrap().greeting.unwrap(), b.unwrap().greeting.unwrap());
+        assert_eq!(a.message_id, b.message_id);
+        assert_eq!(proactive_rows(&pool, session_id).await, 1);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_failed_opener_writes_nothing_and_leaves_the_key_free(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let now = Utc::now();
+        let session_id =
+            session_with_history(&pool, user_id, now - chrono::Duration::days(2)).await;
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+
+        let err = open_at(
+            &state,
+            session_id,
+            user_id,
+            opener(OpenOccasion::JustOpened, "visit-1"),
+            now,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::Upstream(_)), "{err:?}");
+        assert_eq!(proactive_rows(&pool, session_id).await, 0);
+        let repo = ChatRepo { pool: &pool };
+        assert!(
+            repo.open_message(session_id, "visit-1")
+                .await
+                .unwrap()
+                .is_none(),
+            "the next open under this key retries"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_opener_today_blocks_the_holiday_greeting(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = session_with_history(
+            &pool,
+            user_id,
+            mid_autumn_morning() - chrono::Duration::days(2),
+        )
+        .await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "在干嘛呢").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+
+        open_at(
+            &state,
+            session_id,
+            user_id,
+            opener(OpenOccasion::JustOpened, "visit-1"),
+            mid_autumn_morning(),
+        )
+        .await
+        .unwrap()
+        .greeting
+        .expect("the opener");
+        let later = mid_autumn_morning() + chrono::Duration::hours(1);
+        let out = open_at(&state, session_id, user_id, taipei(), later)
+            .await
+            .unwrap();
+        assert!(out.greeting.is_none(), "the persona already spoke today");
+        assert_eq!(companion_calls(&mock).await.len(), 1);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_holiday_greeting_does_not_block_an_opener(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = session_with_history(
+            &pool,
+            user_id,
+            mid_autumn_morning() - chrono::Duration::days(2),
+        )
+        .await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "中秋快乐").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+
+        open_at(&state, session_id, user_id, taipei(), mid_autumn_morning())
+            .await
+            .unwrap()
+            .greeting
+            .expect("the holiday greeting");
+        // A `now` before the greeting's own sent_at: the greeting sits inside
+        // this request's cutoff, so only the holiday exclusion lets it pass.
+        let g = open_at(
+            &state,
+            session_id,
+            user_id,
+            opener(OpenOccasion::JustOpened, "visit-1"),
+            mid_autumn_morning() + chrono::Duration::hours(1),
+        )
+        .await
+        .unwrap()
+        .greeting
+        .expect("an opener under a new key");
+        assert_eq!(g.occasion, GreetingOccasion::JustOpened);
+        assert_eq!(proactive_rows(&pool, session_id).await, 2);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_recall_query_is_the_latest_user_message(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let now = Utc::now();
+        let talked = session_with_history(&pool, user_id, now - chrono::Duration::days(2)).await;
+        let empty = empty_session(&pool, user_id).await;
+        let repo = ChatRepo { pool: &pool };
+
+        let Next::Speak { recall_query, .. } = caller_occasion(
+            &repo,
+            talked,
+            OpenOccasion::JustOpened,
+            "visit-1".into(),
+            now,
+        )
+        .await
+        .unwrap() else {
+            panic!("just_opened always speaks");
+        };
+        assert_eq!(recall_query, "晚安");
+
+        let Next::Speak { recall_query, .. } =
+            caller_occasion(&repo, empty, OpenOccasion::FirstMeet, "visit-1".into(), now)
+                .await
+                .unwrap()
+        else {
+            panic!("an empty session is a first meeting");
+        };
+        assert!(recall_query.is_empty());
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_user_row_stamped_after_now_is_a_zero_day_gap(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let now = Utc::now();
+        let session_id =
+            session_with_history(&pool, user_id, now + chrono::Duration::minutes(5)).await;
+        let repo = ChatRepo { pool: &pool };
+
+        let Next::Speak { occasion, .. } = caller_occasion(
+            &repo,
+            session_id,
+            OpenOccasion::Returning,
+            "visit-1".into(),
+            now,
+        )
+        .await
+        .unwrap() else {
+            panic!("the user has spoken here");
+        };
+        assert!(
+            matches!(occasion, Occasion::Returning { gap_days: 0, .. }),
+            "never a negative gap"
+        );
+    }
+
+    #[test]
+    fn open_key_is_one_to_128_safe_chars() {
+        let ok = |key: &str| validate_opener(Some(OpenOccasion::JustOpened), Some(key.into()));
+        assert!(ok(&"k".repeat(128)).is_ok());
+        assert!(ok("visit-01J9:a.b_c").is_ok());
+        assert!(ok(&"k".repeat(129)).is_err());
+        assert!(ok("").is_err());
+        assert!(ok("visit 1").is_err());
+        assert!(ok("访问").is_err());
+        assert!(validate_opener(None, None).unwrap().is_none());
+        assert!(validate_opener(Some(OpenOccasion::JustOpened), None).is_err());
+        assert!(validate_opener(None, Some("visit-1".into())).is_err());
+    }
+
     fn open_req(session_id: Uuid, jwt: &str, body: serde_json::Value) -> Request<Body> {
         Request::builder()
             .method("POST")
@@ -795,6 +1425,39 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert_eq!(body["code"], json!("invalid_payload"));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn occasion_and_open_key_come_together(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = empty_session(&pool, user_id).await;
+        let mut app = build_router(test_state(pool.clone()));
+        let jwt = mint_test_jwt(user_id);
+
+        for body in [
+            json!({"occasion": "just_opened"}),
+            json!({"open_key": "visit-1"}),
+            json!({"occasion": "just_opened", "open_key": "visit 1"}),
+        ] {
+            let (status, resp) =
+                send_request(&mut app, open_req(session_id, &jwt, body.clone())).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(resp["code"], json!("invalid_payload"), "{body}");
+        }
+        let (status, _) = send_request(
+            &mut app,
+            open_req(
+                session_id,
+                &jwt,
+                json!({"occasion": "holiday", "open_key": "visit-1"}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "the holiday is the engine's call"
+        );
     }
 
     #[test]
