@@ -704,43 +704,75 @@ built-in edit prompt.
 
 ### `POST /v2/comp/session/{session_id}/open`
 
-Tell the engine the user just entered a session. When it is a holiday in the
-user's timezone (same sources as the chat body's holiday line, today only) and
-nothing has been said in the session since the user's local midnight, the
-persona speaks first. One assistant message is generated, persisted and
-returned. Otherwise `greeting` is `null`.
+Tell the engine the user just entered a session. The persona can speak first
+for one of two reasons:
+
+- **A holiday — the engine's call.** Without `occasion`: when it is a holiday
+  in the user's timezone (same sources as the chat body's holiday line, today
+  only) and nobody has spoken in the session since the user's local midnight,
+  the persona speaks first. An opener from an earlier `occasion` call today
+  counts as having spoken.
+- **An occasion — the caller's call.** With `occasion`, the persona speaks
+  first when the occasion is true of the session.
+
+Either way one assistant message is generated, persisted and returned.
+Otherwise `greeting` is `null`.
 
 ```json
 {
   "user_timezone": "Asia/Taipei",
   "user_country": "TW",
   "tier": "gold",
-  "memory_scope": "neutral_and_relationship"
+  "memory_scope": "neutral_and_relationship",
+  "occasion": "returning",
+  "open_key": "visit-01J9ZK3"
 }
 ```
 
 Every field is optional. The three locale fields follow the chat body's rules.
 `tier`, `prompt_traits`, `memory_scope`, `affinity_scope` and `audit` shape the
-greeting as they shape a chat reply. The engine does not keep them between
-calls (the greeting row records them as an audit copy), so send the same
-values a chat turn would. Without a valid `user_timezone` the call returns
-`null`.
+message as they shape a chat reply. The engine does not keep them between
+calls (the message row records them as an audit copy), so send the same
+values a chat turn would. Without `occasion` and without a valid
+`user_timezone` the call returns `null`.
+
+| `occasion` | The persona speaks first when | The engine tells the persona |
+|---|---|---|
+| `first_meet` | the session has no messages at all | you have not talked before |
+| `returning` | the user has sent at least one message in the session | how many days since the user's last message |
+| `just_opened` | always | the user just opened the chat |
+
+`open_key` is required with `occasion` and rejected without it: 1–128
+characters of `[A-Za-z0-9_.:-]`, scoped to the session. The same key returns
+the same message, whatever `occasion` the repeat names; a new key can produce
+a new one. How often to ask is the caller's policy — the engine sets no cap.
+An occasion that is not true of the session returns `null` without
+generating.
 
 ```json
-{ "greeting": { "message_id": "01J…", "content": "中秋快乐呀，今天有吃月饼吗", "sent_at": "…" } }
+{ "greeting": { "message_id": "01J…", "content": "好久不见，最近忙什么呢", "sent_at": "…", "occasion": "returning" } }
 ```
 
+`occasion` in the response is `holiday`, `first_meet`, `returning` or
+`just_opened`.
+
 - **Synchronous:** one non-streaming generation, a few seconds. Don't block UI on it.
-- **Idempotent** per session and user-local date: a repeat call returns the
-  same greeting and does not generate again.
-- **Persisted like any reply.** The greeting is an ordinary assistant row
+- **Idempotent:** per session and user-local date for the holiday greeting,
+  per session and `open_key` for an occasion. A repeat call returns the same
+  message and does not generate again.
+- **The user wins a race.** If any message lands in the session while an
+  occasion's message is generating, nothing is written and the call returns
+  `null`.
+- **Persisted like any reply.** The message is an ordinary assistant row
   (`assistant_action_type = 'proactive'`, no `user_message_id`), unread until
   `POST /comp/chat/{session_id}/read`. Change feeds and both history routes
   see it.
-- **Errors:** session checks as on the stream endpoint (`403`, `404`, `409`
-  for a voice session), `429` at the per-user in-flight cap. A failed
-  generation returns the upstream error the image endpoints return and
-  persists nothing; the next open retries.
+- **Errors:** `400` with `code: "invalid_payload"` for `occasion` without
+  `open_key`, `open_key` without `occasion`, or a malformed `open_key`; `422`
+  for an unknown `occasion`. Session checks as on the stream endpoint (`403`,
+  `404`, `409` for a voice session), `429` at the per-user in-flight cap. A
+  failed generation returns the upstream error the image endpoints return and
+  persists nothing; the next open (with the same key) retries.
 
 ### `GET /comp/chat/{session_id}/history?limit=20&offset=0`
 
@@ -1648,7 +1680,7 @@ error type. The table below covers the plain shape:
 - `crates/eros-engine-server/src/routes/companion.rs` — chat-lifecycle / profile handlers
 - `crates/eros-engine-server/src/routes/companion_stream.rs` — streaming chat turn (`message/stream`), incl. tip + `image_url` handling
 - `crates/eros-engine-server/src/routes/companion_async.rs` — enqueue-only chat turn (`v2/comp/session/{session_id}/message/async`)
-- `crates/eros-engine-server/src/routes/session_open.rs` — the holiday greeting (`v2/comp/session/{session_id}/open`)
+- `crates/eros-engine-server/src/routes/session_open.rs` — the persona speaking first: holiday greeting and caller-named occasions (`v2/comp/session/{session_id}/open`)
 - `crates/eros-engine-server/src/routes/insight.rs` — v2 relationship-scoped insight profiles (`v2/comp/instance/{instance_id}/insight/character`, `.../insight/user`)
 - `crates/eros-engine-server/src/pipeline/chat_queue.rs` — async chat-turn queue worker
 - `crates/eros-engine-server/src/routes/voice.rs` — voice-channel turn (`voice/{session_id}/turn/stream`)
