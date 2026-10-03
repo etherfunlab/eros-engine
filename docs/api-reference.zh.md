@@ -632,7 +632,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 
 带 `occasion` 时必须带 `open_key`，不带 `occasion` 时不能带：1–128 个 `[A-Za-z0-9_.:-]` 字符，
 只在本会话内有效。同一个 key 重复调用返回同一条消息，不论这次传的是哪个 `occasion`；换新 key 可以再生成一条。
-多久让角色开一次口由调用方决定，engine 不设上限。场合对会话不属实时返回 `null`，不生成。
+多久、什么时候让角色开口由调用方决定：engine 不设上限，也不检查用户上一条消息的回复是否还在路上。回复还没到时不要传 `occasion`，否则角色会在开场白里回那条消息，真正的回复随后又来一条。场合对会话不属实时返回 `null`，不生成。
 
 ```json
 { "greeting": { "message_id": "01J…", "content": "好久不见，最近忙什么呢", "sent_at": "…", "occasion": "returning" } }
@@ -641,8 +641,8 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 响应里的 `occasion` 取值为 `holiday`、`first_meet`、`returning` 或 `just_opened`。
 
 - **同步：** 一次非流式生成，需要几秒，不要阻塞 UI。
-- **幂等：** 节日开场白按会话加用户当地日期，场合按会话加 `open_key`。重复调用返回同一条，不会再生成。
-- **竞态时用户优先：** 场合消息生成期间会话里只要落了任何消息，就不写入，返回 `null`。
+- **幂等：** 节日开场白按会话加用户当地日期，场合按会话加 `open_key`。写入过之后，重复调用返回那一条，不会再生成；返回 `null` 的调用什么都没写，同一个 key 再调仍可能生成。
+- **竞态时用户优先：** 场合消息生成期间会话里只要落了节日开场白以外的消息，就不写入，返回 `null`；如果落的是同一个 key 的并发调用写的开场白，就返回那一条。
 - **与普通回复一样落库：** 这条消息是一条普通的 assistant 行（`assistant_action_type = 'proactive'`，
   没有 `user_message_id`），在调用 `POST /comp/chat/{session_id}/read` 之前都是未读。
   Realtime 和两个 history 路由都能看到。

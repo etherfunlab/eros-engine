@@ -745,9 +745,11 @@ values a chat turn would. Without `occasion` and without a valid
 `open_key` is required with `occasion` and rejected without it: 1–128
 characters of `[A-Za-z0-9_.:-]`, scoped to the session. The same key returns
 the same message, whatever `occasion` the repeat names; a new key can produce
-a new one. How often to ask is the caller's policy — the engine sets no cap.
-An occasion that is not true of the session returns `null` without
-generating.
+a new one. How often and when to ask is the caller's policy — the engine sets
+no cap, and it does not check whether a reply to the user's last message is
+still on its way. Don't name an occasion while one is: the persona would
+answer that message in the opener, and the real reply would follow. An
+occasion that is not true of the session returns `null` without generating.
 
 ```json
 { "greeting": { "message_id": "01J…", "content": "好久不见，最近忙什么呢", "sent_at": "…", "occasion": "returning" } }
@@ -758,11 +760,13 @@ generating.
 
 - **Synchronous:** one non-streaming generation, a few seconds. Don't block UI on it.
 - **Idempotent:** per session and user-local date for the holiday greeting,
-  per session and `open_key` for an occasion. A repeat call returns the same
-  message and does not generate again.
-- **The user wins a race.** If any message lands in the session while an
-  occasion's message is generating, nothing is written and the call returns
-  `null`.
+  per session and `open_key` for an occasion. Once a message is written, a
+  repeat call returns it and does not generate again. A call that returned
+  `null` wrote nothing, so a repeat can still generate.
+- **The user wins a race.** If a message other than a holiday greeting lands
+  in the session while an occasion's message is generating, nothing is
+  written and the call returns `null` — or, when that message is a concurrent
+  call's opener under the same key, returns it.
 - **Persisted like any reply.** The message is an ordinary assistant row
   (`assistant_action_type = 'proactive'`, no `user_message_id`), unread until
   `POST /comp/chat/{session_id}/read`. Change feeds and both history routes
