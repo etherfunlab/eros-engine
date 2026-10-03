@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The holiday greeting: one persona-initiated assistant message. The route
-//! (`routes::session_open`) decides whether the persona speaks first; this
-//! module generates and persists it. Modelled on the image-edit text half:
-//! no PDE, no streaming, no user row, no post-process.
+//! A persona-initiated assistant message: the holiday greeting and the
+//! caller-named openers. The route (`routes::session_open`) decides whether
+//! the persona speaks first; this module generates and persists it. Modelled
+//! on the image-edit text half: no PDE, no streaming, no user row, no
+//! post-process.
 //!
-//! Spec: docs/superpowers/specs/2026-09-26-user-locale-and-holiday-greeting-design.md §6
+//! Specs: docs/superpowers/specs/2026-09-26-user-locale-and-holiday-greeting-design.md §6,
+//! docs/superpowers/specs/2026-10-03-open-occasions-design.md §5–§6
 
 use chrono::{DateTime, NaiveDate, Utc};
 use eros_engine_core::persona::CompanionPersona;
@@ -32,20 +34,68 @@ use crate::state::AppState;
 /// cue after the history. A `user` turn, so the request never ends on an
 /// assistant message a provider would continue as prefill. Never persisted.
 pub(crate) const OPEN_CUE: &str = "（对方刚打开和你的聊天，还没说话。）";
+const FIRST_MEET_CUE: &str = "（你们还没聊过。对方刚打开和你的聊天，还没说话。）";
+const RETURNING_SAME_DAY_CUE: &str = "（对方隔了不到一天又打开和你的聊天，还没说话。）";
 
-/// One greeting to generate. `metadata` arrives holding the caller's audit
-/// copy of the request (the raw locale); `greet` adds the rest.
+/// Why the persona speaks first. The holiday is the engine's own call; the
+/// other occasions are named by the caller and carry its idempotency key.
+pub(crate) enum Occasion {
+    Holiday {
+        local_date: NaiveDate,
+        holidays: Vec<String>,
+    },
+    FirstMeet {
+        open_key: String,
+    },
+    /// `gap_days`: whole days since the session's latest user row.
+    Returning {
+        open_key: String,
+        gap_days: i64,
+    },
+    JustOpened {
+        open_key: String,
+    },
+}
+
+impl Occasion {
+    /// The row's `metadata.proactive`.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Holiday { .. } => "holiday",
+            Self::FirstMeet { .. } => "first_meet",
+            Self::Returning { .. } => "returning",
+            Self::JustOpened { .. } => "just_opened",
+        }
+    }
+
+    /// The stage cue: states a fact, carries no instruction.
+    fn cue(&self) -> String {
+        match self {
+            Self::Holiday { .. } | Self::JustOpened { .. } => OPEN_CUE.into(),
+            Self::FirstMeet { .. } => FIRST_MEET_CUE.into(),
+            Self::Returning { gap_days: 0, .. } => RETURNING_SAME_DAY_CUE.into(),
+            Self::Returning { gap_days, .. } => {
+                format!("（对方隔了 {gap_days} 天又打开和你的聊天，还没说话。）")
+            }
+        }
+    }
+}
+
+/// One proactive message to generate. `metadata` arrives holding the caller's
+/// audit copy of the request (the raw locale); `greet` adds the rest.
 pub(crate) struct Greeting<'a> {
     pub session_id: Uuid,
     pub user_id: Uuid,
     pub instance_id: Uuid,
     pub persona: &'a CompanionPersona,
     pub now: &'a NowContext,
-    pub local_date: NaiveDate,
-    /// The user's local midnight on `local_date`, in UTC — the inactivity
-    /// cutoff `insert_proactive_message` re-checks atomically with the write.
+    pub occasion: Occasion,
+    /// The memory-recall query: the holiday names, or the latest user row.
+    pub recall_query: String,
+    /// The cutoff `greet`'s insert re-checks atomically: no message other
+    /// than a holiday greeting may have landed at or after it. The user's
+    /// local midnight for a holiday; the request's start for an opener.
     pub since: DateTime<Utc>,
-    pub holidays: Vec<String>,
     pub tier: Option<String>,
     pub prompt_traits: Vec<PromptTrait>,
     pub memory_scope: MemoryScope,
@@ -54,9 +104,10 @@ pub(crate) struct Greeting<'a> {
     pub metadata: serde_json::Map<String, serde_json::Value>,
 }
 
-/// Generate and persist the greeting. `Ok(None)`: the model returned a blank
-/// reply and nothing was written. When a concurrent call for the same local
-/// date won the insert, returns that call's row.
+/// Generate and persist the message. `Ok(None)`: the model returned a blank
+/// reply and nothing was written, or the insert yielded to a message that
+/// landed first. When a concurrent call for the same local date or
+/// `open_key` won the insert, returns that call's row.
 pub(crate) async fn greet(
     state: &AppState,
     g: Greeting<'_>,
@@ -68,11 +119,11 @@ pub(crate) async fn greet(
     affinity.refresh_endpoints(&state.config.affinity_tuning);
     let signals = compute_signals_for_session(&state.pool, g.session_id, &affinity).await?;
 
-    // Prompt assembly only. The holiday names double as the memory-recall
-    // query; the nil driving id makes history fall back to newest-N.
+    // Prompt assembly only. The event's content is the memory-recall query;
+    // the nil driving id makes history fall back to newest-N.
     let input = DecisionInput {
         event: Event::UserMessage {
-            content: g.holidays.join("、"),
+            content: g.recall_query,
             message_id: Uuid::nil(),
             prompt_traits: g.prompt_traits,
             audit: g.audit,
@@ -112,7 +163,7 @@ pub(crate) async fn greet(
     .await?;
     chat_req.messages.push(WireMessage {
         role: "user".into(),
-        content: OPEN_CUE.into(),
+        content: g.occasion.cue(),
     });
 
     let model_for_audit = chat_req.model.clone();
@@ -124,7 +175,11 @@ pub(crate) async fn greet(
     let resp = match state.openrouter.execute(chat_req).await {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!(session_id = %g.session_id, "holiday greeting: companion call failed: {e}");
+            tracing::warn!(
+                session_id = %g.session_id,
+                occasion = g.occasion.name(),
+                "proactive message: companion call failed: {e}"
+            );
             let failure = match &e {
                 eros_engine_llm::LlmError::Chain { failures } if !failures.is_empty() => {
                     failures.last().cloned().expect("non-empty chain")
@@ -153,16 +208,33 @@ pub(crate) async fn greet(
     );
     let content = stripped.cleaned.trim();
     if content.is_empty() {
-        tracing::warn!(session_id = %g.session_id, "holiday greeting: blank reply, nothing written");
+        tracing::warn!(
+            session_id = %g.session_id,
+            occasion = g.occasion.name(),
+            "proactive message: blank reply, nothing written"
+        );
         return Ok(None);
     }
     let (llm_attempts, gateway_errors) = split_failures(&resp.failures);
 
-    let local_date = g.local_date.to_string();
     let mut metadata = g.metadata;
-    metadata.insert("proactive".into(), "holiday".into());
-    metadata.insert("local_date".into(), local_date.clone().into());
-    metadata.insert("holidays".into(), serde_json::json!(g.holidays));
+    metadata.insert("proactive".into(), g.occasion.name().into());
+    match &g.occasion {
+        Occasion::Holiday {
+            local_date,
+            holidays,
+        } => {
+            metadata.insert("local_date".into(), local_date.to_string().into());
+            metadata.insert("holidays".into(), serde_json::json!(holidays));
+        }
+        Occasion::Returning { open_key, gap_days } => {
+            metadata.insert("open_key".into(), open_key.as_str().into());
+            metadata.insert("gap_days".into(), (*gap_days).into());
+        }
+        Occasion::FirstMeet { open_key } | Occasion::JustOpened { open_key } => {
+            metadata.insert("open_key".into(), open_key.as_str().into());
+        }
+    }
     metadata.insert("prompt_traits".into(), serde_json::json!(injected_tags));
     metadata.insert(
         "memory_scope".into(),
@@ -185,14 +257,29 @@ pub(crate) async fn greet(
         llm_attempts,
         gateway_errors,
     };
-    match chat_repo
-        .insert_proactive_message(g.session_id, g.since, &row)
-        .await?
-    {
-        Some(written) => Ok(Some(written)),
-        None => Ok(chat_repo
-            .proactive_greeting_on(g.session_id, &local_date)
-            .await?),
+    match &g.occasion {
+        Occasion::Holiday { local_date, .. } => {
+            match chat_repo
+                .insert_proactive_message(g.session_id, g.since, &row)
+                .await?
+            {
+                Some(written) => Ok(Some(written)),
+                None => Ok(chat_repo
+                    .proactive_greeting_on(g.session_id, &local_date.to_string())
+                    .await?),
+            }
+        }
+        Occasion::FirstMeet { open_key }
+        | Occasion::Returning { open_key, .. }
+        | Occasion::JustOpened { open_key } => {
+            match chat_repo
+                .insert_open_message(g.session_id, g.since, &row)
+                .await?
+            {
+                Some(written) => Ok(Some(written)),
+                None => Ok(chat_repo.open_message(g.session_id, open_key).await?),
+            }
+        }
     }
 }
 

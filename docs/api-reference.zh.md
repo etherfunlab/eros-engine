@@ -601,34 +601,54 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 
 ### `POST /v2/comp/session/{session_id}/open`
 
-告诉 engine 用户刚进入会话。如果用户所在时区的今天是节日（来源同聊天请求体的节日行，只看当天），
-并且用户当地零点以来这个会话里还没有人说过话，角色就先开口：生成一条 assistant 消息，落库后返回。
-否则 `greeting` 为 `null`。
+告诉 engine 用户刚进入会话。角色先开口有两种来由：
+
+- **节日，engine 自己判断。** 不带 `occasion` 时，如果用户所在时区的今天是节日（来源同聊天请求体的节日行，只看当天），
+  并且用户当地零点以来这个会话里还没有人说过话，角色就先开口。今天早些时候由 `occasion` 触发过的开口算作说过话。
+- **场合，由调用方决定。** 带 `occasion` 时，只要这个场合对当前会话属实，角色就先开口。
+
+两种情况都是生成一条 assistant 消息，落库后返回；否则 `greeting` 为 `null`。
 
 ```json
 {
   "user_timezone": "Asia/Taipei",
   "user_country": "TW",
   "tier": "gold",
-  "memory_scope": "neutral_and_relationship"
+  "memory_scope": "neutral_and_relationship",
+  "occasion": "returning",
+  "open_key": "visit-01J9ZK3"
 }
 ```
 
 所有字段都可选。三个所在地字段的规则与聊天请求体相同；`tier`、`prompt_traits`、`memory_scope`、
-`affinity_scope`、`audit` 对开场白的作用与对聊天回复相同。engine 不会在两次调用之间记住这些值（开场白那一行会记一份审计副本），请传与聊天一轮相同的值。
-没有合法的 `user_timezone` 时直接返回 `null`。
+`affinity_scope`、`audit` 对这条消息的作用与对聊天回复相同。engine 不会在两次调用之间记住这些值（消息那一行会记一份审计副本），请传与聊天一轮相同的值。
+不带 `occasion` 又没有合法的 `user_timezone` 时直接返回 `null`。
+
+| `occasion` | 角色先开口的前提 | engine 告诉角色的事实 |
+|---|---|---|
+| `first_meet` | 会话里一条消息都没有 | 你们还没聊过 |
+| `returning` | 用户在这个会话里至少发过一条消息 | 距用户上一条消息过了几天 |
+| `just_opened` | 无 | 对方刚打开聊天 |
+
+带 `occasion` 时必须带 `open_key`，不带 `occasion` 时不能带：1–128 个 `[A-Za-z0-9_.:-]` 字符，
+只在本会话内有效。同一个 key 重复调用返回同一条消息，不论这次传的是哪个 `occasion`；换新 key 可以再生成一条。
+多久、什么时候让角色开口由调用方决定：engine 不设上限，也不检查用户上一条消息的回复是否还在路上。回复还没到时不要传 `occasion`，否则角色会在开场白里回那条消息，真正的回复随后又来一条。场合对会话不属实时返回 `null`，不生成。
 
 ```json
-{ "greeting": { "message_id": "01J…", "content": "中秋快乐呀，今天有吃月饼吗", "sent_at": "…" } }
+{ "greeting": { "message_id": "01J…", "content": "好久不见，最近忙什么呢", "sent_at": "…", "occasion": "returning" } }
 ```
 
+响应里的 `occasion` 取值为 `holiday`、`first_meet`、`returning` 或 `just_opened`。
+
 - **同步：** 一次非流式生成，需要几秒，不要阻塞 UI。
-- **幂等：** 同一会话、同一个用户当地日期，重复调用返回同一条，不会再生成。
-- **与普通回复一样落库：** 开场白是一条普通的 assistant 行（`assistant_action_type = 'proactive'`，
+- **幂等：** 节日开场白按会话加用户当地日期，场合按会话加 `open_key`。写入过之后，重复调用返回那一条，不会再生成；返回 `null` 的调用什么都没写，同一个 key 再调仍可能生成。
+- **竞态时用户优先：** 场合消息生成期间会话里只要落了节日开场白以外的消息，就不写入，返回 `null`；如果落的是同一个 key 的并发调用写的开场白，就返回那一条。
+- **与普通回复一样落库：** 这条消息是一条普通的 assistant 行（`assistant_action_type = 'proactive'`，
   没有 `user_message_id`），在调用 `POST /comp/chat/{session_id}/read` 之前都是未读。
   Realtime 和两个 history 路由都能看到。
-- **错误：** 会话检查与 stream 端点相同（`403`、`404`，语音会话 `409`），达到单用户并发上限 `429`。
-  生成失败时返回与图片接口相同的上游错误，不写入任何内容，下次打开会重试。
+- **错误：** 带 `occasion` 没带 `open_key`、带 `open_key` 没带 `occasion`、`open_key` 格式不对，返回 `400`，
+  `code: "invalid_payload"`；未知的 `occasion` 返回 `422`。会话检查与 stream 端点相同（`403`、`404`，语音会话 `409`），
+  达到单用户并发上限 `429`。生成失败时返回与图片接口相同的上游错误，不写入任何内容，下次打开（用同一个 key）会重试。
 
 ### `GET /comp/chat/{session_id}/history?limit=20&offset=0`
 
@@ -1439,7 +1459,7 @@ session 403）。
 - `crates/eros-engine-server/src/routes/companion.rs`——对话生命周期 / 画像 handler
 - `crates/eros-engine-server/src/routes/companion_stream.rs`——流式对话轮（`message/stream`），含打赏 + `image_url` 处理
 - `crates/eros-engine-server/src/routes/companion_async.rs`——只入队的对话轮（`v2/comp/session/{session_id}/message/async`）
-- `crates/eros-engine-server/src/routes/session_open.rs`——节日开场白（`v2/comp/session/{session_id}/open`）
+- `crates/eros-engine-server/src/routes/session_open.rs`——角色先开口：节日开场白与调用方指定的场合（`v2/comp/session/{session_id}/open`）
 - `crates/eros-engine-server/src/routes/insight.rs`——按关系分开的 v2 画像端点（`v2/comp/instance/{instance_id}/insight/character`、`.../insight/user`）
 - `crates/eros-engine-server/src/pipeline/chat_queue.rs`——异步对话轮队列 worker
 - `crates/eros-engine-server/src/routes/voice.rs`——语音频道轮（`voice/{session_id}/turn/stream`）

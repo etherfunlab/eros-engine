@@ -1479,7 +1479,7 @@
           "companion"
         ],
         "summary": "Tell the engine the user just entered this session.",
-        "description": "When it is a holiday in the user's timezone and nothing has been said in\nthe session since the user's local midnight, the persona speaks first: one\nassistant message is generated, persisted (unread, like any reply) and\nreturned. Otherwise `greeting` is `null`. Idempotent per session and\nuser-local date — a repeat call returns the same greeting.",
+        "description": "Without `occasion` the engine decides: when it is a holiday in the user's\ntimezone and nobody has spoken in the session since the user's local\nmidnight, the persona speaks first. With `occasion` the caller decides,\nand the persona speaks first when the occasion is true of the session.\nEither way one assistant message is generated, persisted (unread, like any\nreply) and returned; otherwise `greeting` is `null`. Idempotent per\nsession and user-local date for the holiday, per session and `open_key`\nfor an occasion.",
         "operationId": "open_session",
         "parameters": [
           {
@@ -1556,6 +1556,9 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "unknown `occasion` or another malformed body field"
           },
           "429": {
             "description": "per-user in-flight cap reached"
@@ -2667,7 +2670,8 @@
         "required": [
           "message_id",
           "content",
-          "sent_at"
+          "sent_at",
+          "occasion"
         ],
         "properties": {
           "content": {
@@ -2677,11 +2681,24 @@
             "type": "string",
             "format": "uuid"
           },
+          "occasion": {
+            "$ref": "#/components/schemas/GreetingOccasion"
+          },
           "sent_at": {
             "type": "string",
             "format": "date-time"
           }
         }
+      },
+      "GreetingOccasion": {
+        "type": "string",
+        "description": "Why the persona spoke first.",
+        "enum": [
+          "holiday",
+          "first_meet",
+          "returning",
+          "just_opened"
+        ]
       },
       "HealthResponse": {
         "type": "object",
@@ -3019,6 +3036,15 @@
           }
         }
       },
+      "OpenOccasion": {
+        "type": "string",
+        "description": "A caller-named reason for the persona to speak first.",
+        "enum": [
+          "first_meet",
+          "returning",
+          "just_opened"
+        ]
+      },
       "OpenSessionRequest": {
         "type": "object",
         "properties": {
@@ -3047,6 +3073,24 @@
               "string",
               "null"
             ]
+          },
+          "occasion": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OpenOccasion",
+                "description": "Ask the persona to speak first for this reason. Absent: the engine\ndecides, and speaks first only on a user-local holiday."
+              }
+            ]
+          },
+          "open_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The caller's idempotency key for `occasion`, scoped to the session:\nthe same key returns the same message. Required with `occasion`;\n1–128 chars of `[A-Za-z0-9_.:-]`."
           },
           "prompt_traits": {
             "type": [
@@ -3083,7 +3127,7 @@
               "string",
               "null"
             ],
-            "description": "The user's IANA timezone. Without a valid one there is no user-local\ndate and `greeting` is `null`."
+            "description": "The user's IANA timezone. Without a valid one there is no user-local\ndate and the holiday greeting is `null`."
           }
         }
       },
@@ -3097,7 +3141,7 @@
               },
               {
                 "$ref": "#/components/schemas/GreetingDto",
-                "description": "The persona's first message today, or `null` when it does not speak first."
+                "description": "The persona's first message, or `null` when it does not speak first."
               }
             ]
           }
