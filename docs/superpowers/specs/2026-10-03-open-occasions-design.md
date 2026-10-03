@@ -67,8 +67,10 @@ meaning.
 | `open_key` | string | 1–128 chars, `^[A-Za-z0-9_.:-]+$`. Required when `occasion` is present; rejected when it is absent |
 
 Validation failures — `occasion` without `open_key`, `open_key` without
-`occasion`, an `open_key` outside the rules, an unknown `occasion` — return
-400 `invalid_payload` in the `StreamPreErrorBody` shape the route already uses.
+`occasion`, an `open_key` outside the rules — return 400 `invalid_payload` in
+the `StreamPreErrorBody` shape the route already uses. An unknown `occasion`
+value fails body deserialization and returns 422, as an unknown
+`memory_scope` does.
 
 `open_key` is scoped to the session: the same key on two sessions names two
 different openers.
@@ -258,7 +260,8 @@ mocked with wiremock.
 - **Idempotency:** the same key twice → the same row, one model call; a new key
   → a new row; two concurrent calls with one key → one row.
 - **Validation:** 400 `invalid_payload` for `occasion` without `open_key`,
-  `open_key` without `occasion`, and an `open_key` with a forbidden character.
+  `open_key` without `occasion`, and an `open_key` with a forbidden character;
+  422 for `occasion: "holiday"`.
 - **Interplay:** an opener today → a later body without `occasion` on a
   holiday returns `null`; a holiday greeting today → an opener under a new key
   still generates.
