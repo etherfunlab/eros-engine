@@ -2181,6 +2181,10 @@ pub(crate) struct PdeVerdict {
     /// inner_state before injection). `None` on old prompts / null verdicts.
     #[serde(default)]
     clothing: Option<String>,
+    /// Judge-decided response to this turn's user action (spec 2026-10-05
+    /// §4.2). `None` = no action, or the judge abstained → accept.
+    #[serde(default)]
+    action_response: Option<eros_engine_core::types::ActionResponse>,
 }
 
 /// Parse the judge reply: direct JSON first, then a balanced JSON block in prose
@@ -2283,7 +2287,7 @@ fn pde_response_format() -> serde_json::Value {
             "schema": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["action", "inner_state", "reply_mode", "reason", "image_ref", "aspect_ratio", "clothing"],
+                "required": ["action", "inner_state", "reply_mode", "reason", "image_ref", "aspect_ratio", "clothing", "action_response"],
                 "properties": {
                     "action": { "type": "string",
                         "enum": ["reply_text", "ghost", "reply_image", "reply_text_image", "product_qa"] },
@@ -2294,7 +2298,9 @@ fn pde_response_format() -> serde_json::Value {
                     "image_ref": { "type": "string", "enum": ["face", "previous"] },
                     "aspect_ratio": { "type": ["string", "null"],
                         "enum": ["1:1", "3:4", "4:3", "9:16", "16:9", null] },
-                    "clothing": { "type": ["string", "null"] }
+                    "clothing": { "type": ["string", "null"] },
+                    "action_response": { "type": ["string", "null"],
+                        "enum": ["accept", "refuse", null] }
                 }
             }
         }
@@ -2469,8 +2475,13 @@ fn guard_action(
     signals: &eros_engine_core::types::ConversationSignals,
     image_executor_available: bool,
     product_qa_available: bool,
+    // An action turn always gets an in-character answer (spec 2026-10-05 §4.4):
+    // a refusal is played in the reply, never by going silent or stepping out
+    // of character.
+    action_turn: bool,
 ) -> ActionType {
     match proposed {
+        PdeAction::Ghost | PdeAction::ProductQa if action_turn => ActionType::ReplyText,
         PdeAction::Ghost => {
             let gs = eros_engine_core::ghost::GhostSignals {
                 message_count: signals.message_count,
@@ -2649,6 +2660,13 @@ fn build_pde_ctx(
             format!("[产品咨询] 本轮可答产品问题=是\n[最近产品咨询]\n{recent}\n")
         }
     };
+    // The action the judge decides on (spec 2026-10-05 §4.2); absent otherwise.
+    let action_line = match &input.event {
+        eros_engine_core::types::Event::UserMessage {
+            action: Some(a), ..
+        } => format!("[用户动作] {}\n", crate::prompt::action_subject(a)),
+        _ => String::new(),
+    };
     format!(
         "{persona_block}[最近对话]\n{transcript}\n\n\
          [亲密度] 当前档位=第 {rung} 档\n\
@@ -2656,7 +2674,7 @@ fn build_pde_ctx(
          [信号] message_count={} hours_since_last_message={:.1} ghost_streak={} hours_since_last_ghost={}\n\
          [图片能力] 本轮可发图={image_flag}\n\
          [近期图片] 最近{INPUT_FILTER_CONTEXT_TURNS}条消息内已发图={img_count} 张；上一条 AI 消息是图片={last_img}（以本行计数为准，对话记录里的图片标记仅供参考）\n\
-         {product_qa_section}\n\
+         {product_qa_section}{action_line}\n\
          [用户最新消息]\n{latest}",
         s.message_count,
         s.hours_since_last_message,
@@ -2712,6 +2730,10 @@ struct VerdictAudit<'a> {
     aspect_ratio: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     clothing: Option<&'a str>,
+    /// The judge's own answer on an action turn; absent when it abstained or
+    /// the turn had no action. The response in effect lives on the user row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action_response: Option<&'static str>,
 }
 
 impl<'a> VerdictAudit<'a> {
@@ -2735,6 +2757,7 @@ impl<'a> VerdictAudit<'a> {
             },
             aspect_ratio: v.aspect_ratio.as_deref(),
             clothing: v.clothing.as_deref(),
+            action_response: v.action_response.map(|r| r.as_str()),
         }
     }
 }
@@ -4194,6 +4217,7 @@ pub fn run_stream(
         // short-circuits all of them. Tip turns and feature-off skip the judge
         // (rule engine). Fail-open: any non-Ok status falls back to pde::decide.
         let is_tip = user_msg.tips_amount_usd.is_some();
+        let action_turn = user_msg.action.is_some();
         // Delegate-only: the chat stream never draws, so image-action
         // availability keys on the PRESENCE of the request `image` block (the
         // consumer signalling "I handle images this turn"). The engine holds
@@ -4291,6 +4315,7 @@ pub fn run_stream(
                                 &input.signals,
                                 image_executor_available,
                                 product_qa_available,
+                                action_turn,
                             );
                             let hints = {
                                 let s = sanitize_inner_state(&v.inner_state);
@@ -4315,7 +4340,7 @@ pub fn run_stream(
                                 eros_engine_core::types::ImageRef::Face
                             };
                             let img_aspect = if is_image { v.aspect_ratio.clone() } else { None };
-                            pde::plan_for(&input, action, hints, v.reply_mode, clothing, img_ref, img_aspect, None)
+                            pde::plan_for(&input, action, hints, v.reply_mode, clothing, img_ref, img_aspect, v.action_response)
                         }
                         _ => pde::decide(&input), // fail-open
                     };
@@ -4362,15 +4387,17 @@ pub fn run_stream(
             Event::UserMessage { affinity_scope, .. } => *affinity_scope,
             _ => eros_engine_core::scope::AffinityScope::default(),
         };
-        if plan.reply_mode.is_none() && plan.action_type.bears_text() {
+        // An action turn rolls no dice: the action already fixes what the turn
+        // is about (spec 2026-10-05 §5.2).
+        let roll = plan.reply_mode.is_none() && plan.action_type.bears_text() && !action_turn;
+        if roll {
             plan.nudges = crate::prompt::roll_nudges(
                 Some(&input.affinity),
                 affinity_scope,
                 &mut rand::thread_rng(),
             );
         }
-        let audited_nudges = (plan.reply_mode.is_none() && plan.action_type.bears_text())
-            .then_some(plan.nudges);
+        let audited_nudges = roll.then_some(plan.nudges);
 
         // The judge is one of spec §6.1's five chains, so its failed hops must
         // reach this turn's `final` frame as well as its own audit row. Hoisted
@@ -6914,25 +6941,53 @@ mod tests {
         };
         // ghost honoured when permitted
         assert_eq!(
-            guard_action(PdeAction::Ghost, &a, &sigs(50, Some(5.0)), false, false),
+            guard_action(
+                PdeAction::Ghost,
+                &a,
+                &sigs(50, Some(5.0)),
+                false,
+                false,
+                false
+            ),
             ActionType::Ghost
         );
         // ghost vetoed by new-relationship floor
         assert_eq!(
-            guard_action(PdeAction::Ghost, &a, &sigs(3, None), false, false),
+            guard_action(PdeAction::Ghost, &a, &sigs(3, None), false, false, false),
             ActionType::ReplyText
         );
         // image actions degrade to text when no executor chain
         assert_eq!(
-            guard_action(PdeAction::ReplyImage, &a, &sigs(50, None), false, false),
+            guard_action(
+                PdeAction::ReplyImage,
+                &a,
+                &sigs(50, None),
+                false,
+                false,
+                false
+            ),
             ActionType::ReplyText
         );
         assert_eq!(
-            guard_action(PdeAction::ReplyTextImage, &a, &sigs(50, None), false, false),
+            guard_action(
+                PdeAction::ReplyTextImage,
+                &a,
+                &sigs(50, None),
+                false,
+                false,
+                false
+            ),
             ActionType::ReplyText
         );
         assert_eq!(
-            guard_action(PdeAction::ReplyText, &a, &sigs(50, None), false, false),
+            guard_action(
+                PdeAction::ReplyText,
+                &a,
+                &sigs(50, None),
+                false,
+                false,
+                false
+            ),
             ActionType::ReplyText
         );
     }
@@ -6942,20 +6997,20 @@ mod tests {
         let aff = test_affinity();
         let sig = test_signals();
         assert_eq!(
-            guard_action(PdeAction::ReplyImage, &aff, &sig, true, false),
+            guard_action(PdeAction::ReplyImage, &aff, &sig, true, false, false),
             ActionType::ReplyImage
         );
         assert_eq!(
-            guard_action(PdeAction::ReplyTextImage, &aff, &sig, true, false),
+            guard_action(PdeAction::ReplyTextImage, &aff, &sig, true, false, false),
             ActionType::ReplyTextImage
         );
         // executor unavailable → degrade (today's behaviour)
         assert_eq!(
-            guard_action(PdeAction::ReplyImage, &aff, &sig, false, false),
+            guard_action(PdeAction::ReplyImage, &aff, &sig, false, false, false),
             ActionType::ReplyText
         );
         assert_eq!(
-            guard_action(PdeAction::ReplyTextImage, &aff, &sig, false, false),
+            guard_action(PdeAction::ReplyTextImage, &aff, &sig, false, false, false),
             ActionType::ReplyText
         );
     }
@@ -6992,11 +7047,11 @@ mod tests {
         let a = pde_test_affinity();
         let s = sigs(50, None);
         assert_eq!(
-            guard_action(PdeAction::ProductQa, &a, &s, false, true),
+            guard_action(PdeAction::ProductQa, &a, &s, false, true, false),
             ActionType::ProductQa
         );
         assert_eq!(
-            guard_action(PdeAction::ProductQa, &a, &s, false, false),
+            guard_action(PdeAction::ProductQa, &a, &s, false, false, false),
             ActionType::ReplyText
         );
     }
@@ -7030,6 +7085,7 @@ mod tests {
             PdeAction::Ghost,
             &input.affinity,
             &input.signals,
+            false,
             false,
             false,
         );
@@ -17814,13 +17870,106 @@ data: [DONE]\n\n";
     // ── Task-4 PDE schema + chain-walk tests ─────────────────────────────────
 
     #[test]
+    fn pde_verdict_parses_with_and_without_action_response() {
+        let v = parse_pde_verdict(
+            r#"{"action":"reply_text","inner_state":"x","action_response":"refuse"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            v.action_response,
+            Some(eros_engine_core::types::ActionResponse::Refuse)
+        );
+        let old = parse_pde_verdict(r#"{"action":"reply_text","inner_state":"x"}"#).unwrap();
+        assert_eq!(old.action_response, None);
+        let null = parse_pde_verdict(
+            r#"{"action":"reply_text","inner_state":"x","action_response":null}"#,
+        )
+        .unwrap();
+        assert_eq!(null.action_response, None);
+    }
+
+    #[test]
+    fn pde_response_format_requires_a_nullable_action_response() {
+        let f = pde_response_format();
+        let schema = &f["json_schema"]["schema"];
+        assert!(schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|k| k == "action_response"));
+        assert_eq!(
+            schema["properties"]["action_response"],
+            serde_json::json!({"type": ["string", "null"], "enum": ["accept", "refuse", null]})
+        );
+    }
+
+    #[test]
+    fn guard_action_on_an_action_turn_never_ghosts_or_answers_product_qa() {
+        // Same affinity and signals guard_action_degrades_and_honours uses to
+        // show a ghost being honoured.
+        let a = eros_engine_core::affinity::Affinity {
+            ghost_streak: 0,
+            ..pde_test_affinity()
+        };
+        let sig = sigs(50, Some(5.0));
+        assert_eq!(
+            guard_action(PdeAction::Ghost, &a, &sig, false, true, false),
+            ActionType::Ghost,
+            "control: the same signals do permit a ghost on a plain turn"
+        );
+        assert_eq!(
+            guard_action(PdeAction::Ghost, &a, &sig, false, true, true),
+            ActionType::ReplyText
+        );
+        assert_eq!(
+            guard_action(PdeAction::ProductQa, &a, &sig, false, true, true),
+            ActionType::ReplyText
+        );
+        assert_eq!(
+            guard_action(PdeAction::ReplyTextImage, &a, &sig, true, true, true),
+            ActionType::ReplyTextImage,
+            "images stay available on an action turn"
+        );
+    }
+
+    #[test]
+    fn build_pde_ctx_states_the_action_line_only_on_action_turns() {
+        let t = JudgeTranscript::default();
+        let mut input = fixture_decision_input();
+        let plain = build_pde_ctx(&t, &input, false, None);
+        assert!(!plain.contains("[用户动作]"), "{plain}");
+        if let Event::UserMessage { action, .. } = &mut input.event {
+            *action = Some(eros_engine_core::types::UserAction::Kiss);
+        }
+        let ctx = build_pde_ctx(&t, &input, false, None);
+        assert!(ctx.contains("[用户动作] 对方凑过来想亲你\n"), "{ctx}");
+        assert!(
+            ctx.find("[用户动作]").unwrap() < ctx.find("[用户最新消息]").unwrap(),
+            "the action line precedes the latest message: {ctx}"
+        );
+    }
+
+    #[test]
+    fn verdict_audit_records_the_raw_action_response() {
+        let v = parse_pde_verdict(
+            r#"{"action":"reply_text","inner_state":"x","action_response":"refuse"}"#,
+        )
+        .unwrap();
+        let audit = serde_json::to_value(VerdictAudit::new(&v, None, None)).unwrap();
+        assert_eq!(audit["action_response"], "refuse");
+        let abstained = parse_pde_verdict(r#"{"action":"reply_text","inner_state":"x"}"#).unwrap();
+        let audit = serde_json::to_value(VerdictAudit::new(&abstained, None, None)).unwrap();
+        assert!(audit.get("action_response").is_none(), "{audit}");
+    }
+
+    #[test]
     fn pde_response_format_schema_shape() {
         let v = pde_response_format();
         assert_eq!(v["type"], "json_schema");
         assert_eq!(v["json_schema"]["name"], "pde_verdict");
         assert_eq!(v["json_schema"]["strict"], true);
         let req = v["json_schema"]["schema"]["required"].as_array().unwrap();
-        assert_eq!(req.len(), 7, "all seven properties required: {v}");
+        assert_eq!(req.len(), 8, "all eight properties required: {v}");
         assert!(
             req.iter().any(|x| x == "image_ref"),
             "image_ref required: {v}"
