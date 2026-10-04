@@ -4085,6 +4085,27 @@ pub struct PersistedUserMessage {
     /// The user's locale as the request carried it, resolved
     /// (spec 2026-09-26 §4.1). Feeds `[now]`.
     pub user_locale: crate::holiday::UserLocale,
+    /// The action this turn carries besides the text (spec 2026-10-05).
+    pub action: Option<eros_engine_core::types::UserAction>,
+}
+
+impl PersistedUserMessage {
+    /// The turn as the decision and post-process see it. One construction for
+    /// every caller, so a field added to the turn reaches all of them.
+    pub(crate) fn to_event(&self) -> Event {
+        Event::UserMessage {
+            content: self.content.clone(),
+            message_id: self.user_message_id,
+            prompt_traits: self.prompt_traits.clone(),
+            audit: self.audit.clone(),
+            tier: self.tier.clone(),
+            memory_scope: self.memory_scope,
+            affinity_scope: self.affinity_scope,
+            tips_amount_usd: self.tips_amount_usd,
+            quote: self.quote.clone(),
+            action: self.action.clone(),
+        }
+    }
 }
 
 /// Produce a stream of `ProtocolFrame` events for a single burst. The
@@ -4163,18 +4184,7 @@ pub fn run_stream(
         };
 
         let input = DecisionInput {
-            event: Event::UserMessage {
-                content: user_msg.content.clone(),
-                message_id: user_msg.user_message_id,
-                prompt_traits: user_msg.prompt_traits.clone(),
-                audit: user_msg.audit.clone(),
-                tier: user_msg.tier.clone(),
-                memory_scope: user_msg.memory_scope,
-                affinity_scope: user_msg.affinity_scope,
-                tips_amount_usd: user_msg.tips_amount_usd,
-                quote: user_msg.quote.clone(),
-                action: None,
-            },
+            event: user_msg.to_event(),
             affinity: affinity.clone(),
             persona,
             signals,
@@ -4965,18 +4975,7 @@ pub fn run_stream(
                     let state_bg = (*state).clone();
                     let mut plan_bg = plan.clone();
                     plan_bg.image_caption = image_only_caption;
-                    let event_bg = Event::UserMessage {
-                        content: user_msg.content.clone(),
-                        message_id: user_msg.user_message_id,
-                        prompt_traits: user_msg.prompt_traits.clone(),
-                        audit: user_msg.audit.clone(),
-                        tier: user_msg.tier.clone(),
-                        memory_scope: user_msg.memory_scope,
-                        affinity_scope: user_msg.affinity_scope,
-                        tips_amount_usd: user_msg.tips_amount_usd,
-                        quote: user_msg.quote.clone(),
-                        action: None,
-                    };
+                    let event_bg = user_msg.to_event();
                     let user_id_bg = user_msg.user_id;
                     let instance_id_bg = user_msg.instance_id;
                     let session_id_bg = user_msg.session_id;
@@ -5486,18 +5485,7 @@ pub fn run_stream(
                     plan_bg.action_type = ActionType::ReplyText;
                 }
                 plan_bg.image_caption = image_caption;
-                let event_bg = Event::UserMessage {
-                    content: user_msg.content.clone(),
-                    message_id: user_msg.user_message_id,
-                    prompt_traits: user_msg.prompt_traits.clone(),
-                    audit: user_msg.audit.clone(),
-                    tier: user_msg.tier.clone(),
-                    memory_scope: user_msg.memory_scope,
-                    affinity_scope: user_msg.affinity_scope,
-                    tips_amount_usd: user_msg.tips_amount_usd,
-                    quote: user_msg.quote.clone(),
-                    action: None,
-                };
+                let event_bg = user_msg.to_event();
                 let user_id_bg = user_msg.user_id;
                 let instance_id_bg = user_msg.instance_id;
                 let session_id_bg = user_msg.session_id;
@@ -7143,6 +7131,7 @@ mod tests {
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -7514,6 +7503,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -7613,6 +7603,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -7751,6 +7742,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -7897,6 +7889,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -8009,6 +8002,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -8112,6 +8106,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -8225,6 +8220,7 @@ data: [DONE]\n\n";
                 }),
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -8409,6 +8405,7 @@ data: [DONE]\n\n";
                 }),
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -8513,6 +8510,7 @@ data: [DONE]\n\n";
                 }),
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -9013,6 +9011,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -9140,6 +9139,7 @@ data: [DONE]\n\n";
                 }),
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -9266,6 +9266,7 @@ data: [DONE]\n\n";
                 image: Some(crate::routes::companion_stream::ImageReplyParams::default()),
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -9449,6 +9450,7 @@ data: [DONE]\n\n";
                 image: Some(crate::routes::companion_stream::ImageReplyParams::default()),
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -9584,6 +9586,7 @@ data: [DONE]\n\n";
                 image: Some(crate::routes::companion_stream::ImageReplyParams::default()),
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -9754,6 +9757,7 @@ data: [DONE]\n\n";
                 image: Some(crate::routes::companion_stream::ImageReplyParams::default()),
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -9938,6 +9942,7 @@ data: [DONE]\n\n";
                 image: Some(crate::routes::companion_stream::ImageReplyParams::default()),
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -10112,6 +10117,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -10934,6 +10940,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -11063,6 +11070,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -11578,6 +11586,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -11723,6 +11732,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -11891,6 +11901,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -12009,6 +12020,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -12126,6 +12138,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -12223,6 +12236,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -12332,6 +12346,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -12444,6 +12459,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -12574,6 +12590,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -12777,6 +12794,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -12904,6 +12922,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -13028,6 +13047,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -13140,6 +13160,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -13317,6 +13338,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -13519,6 +13541,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -13670,6 +13693,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -13808,6 +13832,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -13968,6 +13993,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -14127,6 +14153,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -14261,6 +14288,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -14392,6 +14420,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -14549,6 +14578,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -14745,6 +14775,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -14891,6 +14922,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -15046,6 +15078,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -15226,6 +15259,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -15458,6 +15492,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -15607,6 +15642,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -15741,6 +15777,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -15917,6 +15954,7 @@ data: [DONE]\n\n";
                     trigger: None,
                 }),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -16036,6 +16074,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -16174,6 +16213,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -16326,6 +16366,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -16563,6 +16604,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -16680,6 +16722,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -16824,6 +16867,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -16920,6 +16964,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -18163,6 +18208,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -19671,6 +19717,7 @@ data: [DONE]\n\n"
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -19792,5 +19839,42 @@ data: [DONE]\n\n"
             None,
         );
         assert!(without.get("edit_of").is_none(), "got {without}");
+    }
+
+    #[test]
+    fn to_event_carries_the_action() {
+        let msg = PersistedUserMessage {
+            user_message_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            instance_id: Uuid::new_v4(),
+            content: "来".into(),
+            prompt_traits: vec![],
+            audit: None,
+            tier: Some("gold".into()),
+            memory_scope: Default::default(),
+            affinity_scope: Default::default(),
+            tips_amount_usd: None,
+            image_url: None,
+            image: None,
+            quote: Default::default(),
+            user_locale: Default::default(),
+            action: Some(eros_engine_core::types::UserAction::Kiss),
+        };
+        match msg.to_event() {
+            Event::UserMessage {
+                action,
+                content,
+                message_id,
+                tier,
+                ..
+            } => {
+                assert_eq!(action, Some(eros_engine_core::types::UserAction::Kiss));
+                assert_eq!(content, "来");
+                assert_eq!(message_id, msg.user_message_id);
+                assert_eq!(tier.as_deref(), Some("gold"));
+            }
+            other => panic!("expected UserMessage, got {other:?}"),
+        }
     }
 }

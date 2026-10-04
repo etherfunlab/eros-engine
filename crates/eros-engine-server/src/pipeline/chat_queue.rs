@@ -337,6 +337,9 @@ async fn drive_turn(
         image: params.image.clone(),
         quote,
         user_locale: params.user_locale(),
+        // Validated at enqueue; a params row that no longer converts runs as
+        // a plain turn rather than failing it.
+        action: params.action.as_ref().and_then(|a| a.to_core().ok()),
     };
 
     drive_to_exhaustion(Arc::new(state.clone()), user_msg, None, tap).await
