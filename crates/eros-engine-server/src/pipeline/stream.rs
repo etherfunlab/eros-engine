@@ -136,6 +136,13 @@ pub enum ProtocolFrame {
         #[serde(skip_serializing_if = "Option::is_none")]
         aspect_ratio: Option<String>,
     },
+    /// The response in effect for this turn's user action (spec
+    /// 2026-10-05-chat-user-actions-design.md §3.4). Emitted once, before the
+    /// first `meta`, on action turns only; replayed from the user row.
+    ActionResponse {
+        user_message_id: Uuid,
+        response: eros_engine_core::types::ActionResponse,
+    },
 }
 
 fn is_false(b: &bool) -> bool {
@@ -181,6 +188,20 @@ fn build_image_request_frame(
         image_ref,
         aspect_ratio: aspect_ratio.map(str::to_string),
     }
+}
+
+/// The `action_response` frame a replayed action turn re-emits, from the user
+/// row's stored response; `None` for a row without one.
+pub(crate) fn action_response_frame(
+    user_message_id: Uuid,
+    metadata: Option<&serde_json::Value>,
+) -> Option<ProtocolFrame> {
+    crate::prompt::action_response_from_metadata(metadata).map(|response| {
+        ProtocolFrame::ActionResponse {
+            user_message_id,
+            response,
+        }
+    })
 }
 
 /// `metadata.image` marker for a delegated image turn. Always stores the
@@ -3052,7 +3073,13 @@ impl JudgeTranscriptAcc {
     /// is simply overwritten and ends up reflecting the newest assistant row.
     fn push(&mut self, role: &str, content: &str, metadata: Option<&serde_json::Value>) {
         let (label, text): (&str, String) = match role {
-            "user" | "gift_user" => ("用户", content.to_string()),
+            "user" | "gift_user" => (
+                "用户",
+                crate::prompt::user_text_with_action(
+                    crate::prompt::action_from_metadata(metadata).as_ref(),
+                    content,
+                ),
+            ),
             "assistant" => {
                 let is_image = metadata.and_then(|m| m.get("image")).is_some();
                 if is_image {
@@ -4451,6 +4478,22 @@ pub fn run_stream(
             });
         }
 
+        // The response in effect for this turn's action (spec 2026-10-05
+        // §4.5): persisted first so a replay can rebuild the frame, then sent
+        // ahead of the reply. A failed write costs the replay only.
+        if let Some(response) = plan.action_response {
+            if let Err(e) = chat_repo
+                .set_action_response(user_msg.user_message_id, response)
+                .await
+            {
+                tracing::warn!("stream: action response write failed: {e}");
+            }
+            yield ProtocolFrame::ActionResponse {
+                user_message_id: user_msg.user_message_id,
+                response,
+            };
+        }
+
         match plan.action_type {
             ActionType::Ghost => {
                 let msg_id = Ulid::new();
@@ -5154,7 +5197,11 @@ pub fn run_stream(
                 // input filter is one of spec §6.1's non-fatal chains.
                 let mut input_filter_failures: Vec<eros_engine_llm::failure::AttemptFailure> =
                     Vec::new();
-                if user_msg.tips_amount_usd.is_none() {
+                // Skipped on tips, and on an action turn with no text: there is
+                // nothing to rewrite (spec 2026-10-05 §5.3).
+                if user_msg.tips_amount_usd.is_none()
+                    && !(user_msg.action.is_some() && user_msg.content.trim().is_empty())
+                {
                     // Per-turn probability gate: `input_filter = 0.8` ⇒ fire on
                     // ~80% of turns; `true` ⇒ probability 1.0 ⇒ always (gen::<f64>()
                     // is in [0,1), so `< 1.0` always fires); `false` ⇒ resolve
@@ -11181,6 +11228,7 @@ data: [DONE]\n\n";
                 ProtocolFrame::Final { .. } => "final",
                 ProtocolFrame::Error { .. } => "error",
                 ProtocolFrame::ImageRequest { .. } => "image_request",
+                ProtocolFrame::ActionResponse { .. } => "action_response",
             };
             if out.last() != Some(&kind) {
                 out.push(kind);
@@ -20025,5 +20073,247 @@ data: [DONE]\n\n"
             }
             other => panic!("expected UserMessage, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn action_response_frame_serializes_and_reads_the_stored_response() {
+        let id = Uuid::new_v4();
+        let meta = serde_json::json!({"action": {"type": "kiss", "response": "refuse"}});
+        let frame = action_response_frame(id, Some(&meta)).expect("a decided action replays");
+        assert_eq!(
+            serde_json::to_value(&frame).unwrap(),
+            serde_json::json!({"type": "action_response", "user_message_id": id.to_string(), "response": "refuse"})
+        );
+        let undecided = serde_json::json!({"action": {"type": "kiss"}});
+        assert!(action_response_frame(id, Some(&undecided)).is_none());
+        assert!(action_response_frame(id, None).is_none());
+    }
+
+    #[test]
+    fn judge_transcript_shows_a_past_action() {
+        let mut acc = JudgeTranscriptAcc::default();
+        let meta = serde_json::json!({"action": {"type": "kiss", "response": "refuse"}});
+        acc.push("user", "", Some(&meta));
+        acc.push(
+            "user",
+            "抱抱",
+            Some(&serde_json::json!({"action": {"type": "hug"}})),
+        );
+        let t = acc.finish().transcript;
+        assert!(
+            t.starts_with("用户: （凑过来想亲你）\n用户: （想抱你）抱抱"),
+            "{t}"
+        );
+    }
+
+    /// Mock judge returning `verdict` (or HTTP `judge_status` when non-200), a
+    /// chat model answering "REPLY", and an action turn (`kiss`, empty
+    /// content) persisted with `metadata.action`. Returns the frames, the
+    /// mock (for request inspection) and the user message id.
+    async fn run_action_turn(
+        pool: &PgPool,
+        verdict: serde_json::Value,
+        judge_status: u16,
+    ) -> (Vec<ProtocolFrame>, wiremock::MockServer, Uuid) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let judge_body = serde_json::json!({
+            "id": "gj", "model": "pde/judge",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": verdict.to_string()}}],
+        });
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("pde/judge"))
+            .respond_with(ResponseTemplate::new(judge_status).set_body_json(judge_body))
+            .mount(&mock)
+            .await;
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"REPLY\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"deepseek/x\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide.\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let meta = serde_json::json!({"action": {"type": "kiss"}});
+        let umid = match (ChatRepo { pool })
+            .upsert_user_message_idempotent(
+                session_id,
+                "",
+                "01JACTION00000000000000000",
+                "user",
+                Some(&meta),
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: String::new(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: None,
+                quote: Default::default(),
+                user_locale: Default::default(),
+                action: Some(eros_engine_core::types::UserAction::Kiss),
+            },
+            None,
+        )
+        .collect()
+        .await;
+        (frames, mock, umid)
+    }
+
+    fn chat_request_body(reqs: &[wiremock::Request]) -> String {
+        let r = reqs
+            .iter()
+            .find(|r| String::from_utf8_lossy(&r.body).contains("deepseek/x"))
+            .expect("the chat call must have fired");
+        String::from_utf8_lossy(&r.body).into_owned()
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn refused_action_frames_persists_and_prompts(pool: PgPool) {
+        let (frames, mock, umid) = run_action_turn(
+            &pool,
+            serde_json::json!({"action": "reply_text", "inner_state": "", "action_response": "refuse"}),
+            200,
+        )
+        .await;
+        let ar = frames
+            .iter()
+            .position(|f| matches!(f, ProtocolFrame::ActionResponse { .. }))
+            .expect("an action turn emits action_response");
+        let meta = frames
+            .iter()
+            .position(|f| matches!(f, ProtocolFrame::Meta { .. }))
+            .expect("the reply streams");
+        assert!(
+            ar < meta,
+            "action_response precedes the first meta: {frames:?}"
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|f| matches!(f, ProtocolFrame::ActionResponse { .. }))
+                .count(),
+            1
+        );
+        assert!(matches!(
+            &frames[ar],
+            ProtocolFrame::ActionResponse { response: eros_engine_core::types::ActionResponse::Refuse, user_message_id } if *user_message_id == umid
+        ));
+
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT metadata->'action'->>'response' FROM engine.chat_messages WHERE id = $1",
+        )
+        .bind(umid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored.as_deref(), Some("refuse"));
+
+        let body = chat_request_body(&mock.received_requests().await.unwrap());
+        assert!(body.contains("[user_action]"), "{body}");
+        assert!(
+            body.contains("对方凑过来想亲你，你没有接受。用你自己的话回应。"),
+            "{body}"
+        );
+        assert!(
+            body.contains("（凑过来想亲你）"),
+            "the history marker reaches the model: {body}"
+        );
+        assert!(
+            !body.contains("[this_turn]"),
+            "no dice on an action turn: {body}"
+        );
+
+        // The audit row is written by a spawned task; poll for it.
+        let mut payload = None;
+        for _ in 0..40 {
+            payload = sqlx::query_scalar::<_, serde_json::Value>(
+                "SELECT payload FROM engine.companion_decision_events WHERE message_id = $1",
+            )
+            .bind(umid)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+            if payload.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let payload = payload.expect("the decision audit row lands");
+        assert_eq!(payload["action_response"], "refuse");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn ghost_verdict_on_an_action_turn_still_replies_and_accepts(pool: PgPool) {
+        let (frames, _mock, umid) = run_action_turn(
+            &pool,
+            serde_json::json!({"action": "ghost", "inner_state": ""}),
+            200,
+        )
+        .await;
+        assert!(
+            frames.iter().any(
+                |f| matches!(f, ProtocolFrame::Delta { content, .. } if content.contains("REPLY"))
+            ),
+            "{frames:?}"
+        );
+        assert!(frames.iter().any(|f| matches!(
+            f,
+            ProtocolFrame::ActionResponse { response: eros_engine_core::types::ActionResponse::Accept, user_message_id } if *user_message_id == umid
+        )));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn failed_judge_on_an_action_turn_falls_back_to_accept(pool: PgPool) {
+        let (frames, mock, _umid) = run_action_turn(&pool, serde_json::json!({}), 500).await;
+        assert!(frames.iter().any(|f| matches!(
+            f,
+            ProtocolFrame::ActionResponse {
+                response: eros_engine_core::types::ActionResponse::Accept,
+                ..
+            }
+        )));
+        let body = chat_request_body(&mock.received_requests().await.unwrap());
+        assert!(body.contains("对方凑过来想亲你，你接受了。"), "{body}");
     }
 }

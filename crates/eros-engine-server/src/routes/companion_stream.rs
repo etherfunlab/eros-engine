@@ -897,17 +897,27 @@ pub async fn send_message_stream(
                 }));
             }
             ClaimedEnqueueOutcome::Replay {
+                user_message_id,
                 ghost,
                 assistant_chain,
-                ..
             } => {
                 let state_arc = Arc::new(state.clone());
-                Box::pin(replay_stream(
-                    state_arc,
-                    session_id,
-                    user_id,
-                    ghost,
-                    assistant_chain,
+                // An action turn replays its decided response ahead of the
+                // reply, as the live stream sent it (spec 2026-10-05 §3.4).
+                let head = chat_repo
+                    .message_by_id_in_session(session_id, user_message_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|m| {
+                        crate::pipeline::stream::action_response_frame(
+                            user_message_id,
+                            m.metadata.as_ref(),
+                        )
+                    });
+                Box::pin(futures_util::StreamExt::chain(
+                    futures_util::stream::iter(head),
+                    replay_stream(state_arc, session_id, user_id, ghost, assistant_chain),
                 ))
             }
         };

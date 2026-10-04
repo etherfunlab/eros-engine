@@ -198,9 +198,15 @@ fn build_image_preamble(vision: &serde_json::Value) -> Option<String> {
 /// preamble (from `metadata.vision`, or a neutral placeholder when an image was
 /// sent but not described) folded onto `effective_user_text(msg)`. A plain text
 /// turn (no `vision`, no `image_url`) returns the effective text unchanged.
+/// An action turn's marker (spec 2026-10-05 §5.3) sits in front of the text,
+/// after any image preamble.
 pub(crate) fn model_facing_user_text(msg: &eros_engine_store::chat::ChatMessage) -> String {
-    let base = effective_user_text(msg);
     let meta = msg.metadata.as_ref();
+    // An action turn reads with its marker in front (spec 2026-10-05 §5.3).
+    let base = crate::prompt::user_text_with_action(
+        crate::prompt::action_from_metadata(meta).as_ref(),
+        effective_user_text(msg),
+    );
     let preamble = meta
         .and_then(|m| m.get("vision"))
         .and_then(build_image_preamble)
@@ -214,11 +220,11 @@ pub(crate) fn model_facing_user_text(msg: &eros_engine_store::chat::ChatMessage)
             let body = if base.trim().is_empty() {
                 "[用户未附文字]"
             } else {
-                base
+                base.as_str()
             };
             format!("{p}\n\n{body}")
         }
-        None => base.to_string(),
+        None => base,
     }
 }
 
@@ -927,6 +933,16 @@ pub(crate) async fn build_reply_request(
         // different prose, so the distinction must survive.
         let tp = input.persona.genome.tip_personality.as_deref();
         system_prompt.push_str(&crate::prompt::tips_reaction_context(*amount, tp));
+    }
+
+    if let (
+        Event::UserMessage {
+            action: Some(a), ..
+        },
+        Some(response),
+    ) = (&input.event, plan.action_response)
+    {
+        system_prompt.push_str(&crate::prompt::user_action_context(a, response));
     }
 
     // Spec §4.6. Order is load-bearing: model_facing_history strips and drops,
@@ -3469,6 +3485,32 @@ mod tests {
             req.messages.iter().all(|m| !m.content.contains("burst")),
             "rows newer than the driving row must not enter its window: {:?}",
             req.messages
+        );
+    }
+
+    #[test]
+    fn model_facing_user_text_puts_the_action_marker_before_the_text() {
+        let row = user_row_meta(
+            "来，陪我喝点",
+            serde_json::json!({"action": {"type": "give", "item": "alcohol", "name": "威士忌", "quantity": 2, "response": "accept"}}),
+        );
+        assert_eq!(
+            model_facing_user_text(&row),
+            "（递给你 2 杯威士忌）来，陪我喝点"
+        );
+        let row = user_row_meta("", serde_json::json!({"action": {"type": "kiss"}}));
+        assert_eq!(model_facing_user_text(&row), "（凑过来想亲你）");
+    }
+
+    #[test]
+    fn model_facing_user_text_puts_the_action_marker_after_the_image_preamble() {
+        let row = user_row_meta(
+            "",
+            serde_json::json!({"action": {"type": "hug"}, "vision": {"description": "一只猫"}}),
+        );
+        assert_eq!(
+            model_facing_user_text(&row),
+            "[用户发送了一张图片]\n画面：一只猫\n\n（想抱你）"
         );
     }
 }
