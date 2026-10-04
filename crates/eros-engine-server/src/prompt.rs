@@ -31,6 +31,7 @@ use eros_engine_core::scope::AffinityScope;
 use eros_engine_core::types::PromptTrait;
 use eros_engine_core::types::QuotedMessage;
 use eros_engine_core::types::ReplyMode;
+use eros_engine_core::types::{ActionResponse, GiftItem, UserAction};
 use rand::Rng;
 
 /// Re-exported: `TurnNudges` moved to `eros_engine_core::types` (Task 1), but
@@ -597,6 +598,92 @@ pub fn tips_reaction_context(amount_usd: f64, tip_personality: Option<&str>) -> 
         fmt_amount(amount_usd),
         tip_tier_adjective(amount_usd),
         how,
+    )
+}
+
+// ── User actions (spec 2026-10-05-chat-user-actions-design.md §5) ──────────
+
+/// The event phrase for a user action, from the persona's side and without a
+/// subject: 「递给你 2 杯威士忌」「凑过来想亲你」. Physical actions say what the
+/// user wants to do, since the persona may not let it happen. `custom` is the
+/// user's own text.
+pub(crate) fn action_phrase(a: &UserAction) -> String {
+    match a {
+        UserAction::Give {
+            item,
+            name,
+            quantity,
+        } => {
+            let (unit, word) = match item {
+                GiftItem::Cigarette => ("支", "烟"),
+                GiftItem::Alcohol => ("杯", "酒"),
+                GiftItem::Medicine => ("片", "药"),
+            };
+            format!(
+                "递给你 {quantity} {unit}{}",
+                name.as_deref().unwrap_or(word)
+            )
+        }
+        UserAction::Kiss => "凑过来想亲你".into(),
+        UserAction::Hug => "想抱你".into(),
+        UserAction::Touch => "伸手想摸你".into(),
+        UserAction::Lick => "想舔你".into(),
+        UserAction::Custom { text } => text.clone(),
+    }
+}
+
+/// The action as the judge's `[用户动作]` line and `[user_action]` state it:
+/// 「对方凑过来想亲你」. `custom` reads 「对方的动作：{text}」, because the
+/// user's text is not guaranteed to read as a verb phrase.
+pub(crate) fn action_subject(a: &UserAction) -> String {
+    match a {
+        UserAction::Custom { text } => format!("对方的动作：{text}"),
+        _ => format!("对方{}", action_phrase(a)),
+    }
+}
+
+/// The history marker that precedes the user's own text: 「（想抱你）」. It
+/// carries no outcome; the persona's reply that follows is the record.
+pub(crate) fn action_marker(a: &UserAction) -> String {
+    format!("（{}）", action_phrase(a))
+}
+
+/// Parse a row's `metadata.action`. The stored object also holds the decided
+/// `response`, which is not part of the action and is removed before parsing;
+/// anything that does not parse reads as no action.
+pub(crate) fn action_from_metadata(meta: Option<&serde_json::Value>) -> Option<UserAction> {
+    let mut obj = meta?.get("action")?.as_object()?.clone();
+    obj.remove("response");
+    serde_json::from_value(serde_json::Value::Object(obj)).ok()
+}
+
+/// The decided response stored on a row's `metadata.action`, if any.
+pub(crate) fn action_response_from_metadata(
+    meta: Option<&serde_json::Value>,
+) -> Option<ActionResponse> {
+    serde_json::from_value(meta?.get("action")?.get("response")?.clone()).ok()
+}
+
+/// A user turn's text with its action marker in front; the text unchanged
+/// when the turn carried no action.
+pub(crate) fn user_text_with_action(action: Option<&UserAction>, text: &str) -> String {
+    match action {
+        Some(a) => format!("{}{text}", action_marker(a)),
+        None => text.to_string(),
+    }
+}
+
+/// The per-turn `[user_action]` fragment appended to an action turn's system
+/// prompt: the action and the judge's conclusion about it. Worded without
+/// 「拒绝」, which `ANTI_REFUSAL_GUARD` tells the model to treat as corruption.
+pub(crate) fn user_action_context(a: &UserAction, response: ActionResponse) -> String {
+    let outcome = match response {
+        ActionResponse::Accept => "你接受了",
+        ActionResponse::Refuse => "你没有接受",
+    };
+    format!(
+        "\n\n[user_action]\n{}，{outcome}。用你自己的话回应。",
+        action_subject(a)
     )
 }
 
@@ -3713,5 +3800,141 @@ mod tests {
     fn user_insights_prompt_renders_empty_existing_as_empty_object() {
         let p = extract_user_insights_prompt(&["用户想年底请长假".into()], None);
         assert!(p.contains("{}"));
+    }
+
+    fn give_test_helper(
+        item: eros_engine_core::types::GiftItem,
+        name: Option<&str>,
+        quantity: u8,
+    ) -> UserAction {
+        UserAction::Give {
+            item,
+            name: name.map(String::from),
+            quantity,
+        }
+    }
+
+    fn every_action() -> Vec<UserAction> {
+        use eros_engine_core::types::GiftItem;
+        vec![
+            give_test_helper(GiftItem::Alcohol, Some("威士忌"), 2),
+            give_test_helper(GiftItem::Cigarette, None, 1),
+            give_test_helper(GiftItem::Medicine, None, 3),
+            UserAction::Kiss,
+            UserAction::Hug,
+            UserAction::Touch,
+            UserAction::Lick,
+            UserAction::Custom {
+                text: "捏了捏你的脸".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn action_phrase_covers_every_action() {
+        let got: Vec<String> = every_action().iter().map(action_phrase).collect();
+        assert_eq!(
+            got,
+            vec![
+                "递给你 2 杯威士忌",
+                "递给你 1 支烟",
+                "递给你 3 片药",
+                "凑过来想亲你",
+                "想抱你",
+                "伸手想摸你",
+                "想舔你",
+                "捏了捏你的脸",
+            ]
+        );
+    }
+
+    #[test]
+    fn action_subject_names_the_user_and_labels_custom() {
+        assert_eq!(action_subject(&UserAction::Kiss), "对方凑过来想亲你");
+        assert_eq!(
+            action_subject(&UserAction::Custom {
+                text: "捏了捏你的脸".into()
+            }),
+            "对方的动作：捏了捏你的脸"
+        );
+    }
+
+    #[test]
+    fn user_action_context_states_both_conclusions() {
+        use eros_engine_core::types::GiftItem;
+        assert_eq!(
+            user_action_context(&UserAction::Kiss, ActionResponse::Refuse),
+            "\n\n[user_action]\n对方凑过来想亲你，你没有接受。用你自己的话回应。"
+        );
+        assert_eq!(
+            user_action_context(
+                &give_test_helper(GiftItem::Alcohol, Some("威士忌"), 2),
+                ActionResponse::Accept
+            ),
+            "\n\n[user_action]\n对方递给你 2 杯威士忌，你接受了。用你自己的话回应。"
+        );
+    }
+
+    #[test]
+    fn user_action_context_never_says_refuse() {
+        for a in every_action() {
+            for r in [ActionResponse::Accept, ActionResponse::Refuse] {
+                let s = user_action_context(&a, r);
+                assert!(!s.contains("拒绝"), "{s}");
+            }
+        }
+    }
+
+    #[test]
+    fn user_text_with_action_prefixes_the_marker() {
+        assert_eq!(
+            user_text_with_action(Some(&UserAction::Hug), "抱抱"),
+            "（想抱你）抱抱"
+        );
+        assert_eq!(
+            user_text_with_action(Some(&UserAction::Hug), ""),
+            "（想抱你）"
+        );
+        assert_eq!(
+            user_text_with_action(
+                Some(&UserAction::Custom {
+                    text: "戳你".into()
+                }),
+                ""
+            ),
+            "（戳你）"
+        );
+        assert_eq!(user_text_with_action(None, "hi"), "hi");
+    }
+
+    #[test]
+    fn action_from_metadata_ignores_the_stored_response() {
+        use eros_engine_core::types::GiftItem;
+        let kiss = serde_json::json!({"action": {"type": "kiss", "response": "refuse"}});
+        assert_eq!(action_from_metadata(Some(&kiss)), Some(UserAction::Kiss));
+        assert_eq!(
+            action_response_from_metadata(Some(&kiss)),
+            Some(ActionResponse::Refuse)
+        );
+        let g = serde_json::json!({"action": {"type": "give", "item": "alcohol", "name": "威士忌", "quantity": 2, "response": "accept"}});
+        assert_eq!(
+            action_from_metadata(Some(&g)),
+            Some(give_test_helper(GiftItem::Alcohol, Some("威士忌"), 2))
+        );
+        assert_eq!(
+            action_response_from_metadata(Some(&g)),
+            Some(ActionResponse::Accept)
+        );
+        let undecided = serde_json::json!({"action": {"type": "kiss"}});
+        assert_eq!(action_response_from_metadata(Some(&undecided)), None);
+        assert_eq!(
+            action_from_metadata(Some(&serde_json::json!({"tier": "gold"}))),
+            None
+        );
+        assert_eq!(
+            action_from_metadata(Some(&serde_json::json!({"action": {"type": "bogus"}}))),
+            None
+        );
+        assert_eq!(action_from_metadata(None), None);
     }
 }
