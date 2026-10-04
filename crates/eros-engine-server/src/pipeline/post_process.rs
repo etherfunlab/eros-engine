@@ -2244,6 +2244,7 @@ mod tests {
             affinity_scope: Default::default(),
             tips_amount_usd: None,
             quote: Default::default(),
+            action: None,
         };
         // Only `user` is taken; session_id/metadata are ignored by design.
         assert_eq!(client_id_from_event(&event).as_deref(), Some("u_abc"));
@@ -2261,6 +2262,7 @@ mod tests {
             affinity_scope: Default::default(),
             tips_amount_usd: None,
             quote: Default::default(),
+            action: None,
         };
         assert_eq!(client_id_from_event(&event), None);
     }
@@ -3406,6 +3408,7 @@ mod tests {
             affinity_scope: Default::default(),
             tips_amount_usd: None,
             quote: Default::default(),
+            action: None,
         };
 
         // Mirrors what `pde::decide` would compute for a short user message
@@ -3426,6 +3429,7 @@ mod tests {
             image_caption: None,
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: None,
+            action_response: None,
         };
 
         // EMPTY text — this is exactly what a fallback-ghost turn produces when
@@ -3569,6 +3573,7 @@ mod tests {
             affinity_scope: Default::default(),
             tips_amount_usd: None,
             quote: Default::default(),
+            action: None,
         };
         let plan = ActionPlan {
             action_type: ActionType::ReplyImage,
@@ -3582,6 +3587,7 @@ mod tests {
             image_caption: Some("在天台看夕阳".into()),
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: None,
+            action_response: None,
         };
         let produced = vec![ProducedMessage {
             message_id: Uuid::new_v4(),
@@ -3701,6 +3707,7 @@ mod tests {
             affinity_scope: Default::default(),
             tips_amount_usd: None,
             quote: Default::default(),
+            action: None,
         };
         let plan = ActionPlan {
             action_type: ActionType::ReplyImage,
@@ -3714,6 +3721,7 @@ mod tests {
             image_caption: Some("在天台看夕阳".into()),
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: None,
+            action_response: None,
         };
         let produced = vec![ProducedMessage {
             message_id: Uuid::new_v4(),
@@ -4294,6 +4302,7 @@ mod tests {
             affinity_scope: Default::default(),
             tips_amount_usd: None,
             quote: Default::default(),
+            action: None,
         };
         let plan = ActionPlan {
             action_type: ActionType::ReplyText,
@@ -4307,6 +4316,7 @@ mod tests {
             image_caption: None,
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: None,
+            action_response: None,
         };
         let produced = vec![ProducedMessage {
             message_id: Uuid::new_v4(),

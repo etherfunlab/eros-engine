@@ -2513,6 +2513,7 @@ fn apply_ghosting_killswitch(
             None,
             eros_engine_core::types::ImageRef::Face,
             None,
+            None,
         )
     } else {
         plan
@@ -4172,6 +4173,7 @@ pub fn run_stream(
                 affinity_scope: user_msg.affinity_scope,
                 tips_amount_usd: user_msg.tips_amount_usd,
                 quote: user_msg.quote.clone(),
+                action: None,
             },
             affinity: affinity.clone(),
             persona,
@@ -4303,7 +4305,7 @@ pub fn run_stream(
                                 eros_engine_core::types::ImageRef::Face
                             };
                             let img_aspect = if is_image { v.aspect_ratio.clone() } else { None };
-                            pde::plan_for(&input, action, hints, v.reply_mode, clothing, img_ref, img_aspect)
+                            pde::plan_for(&input, action, hints, v.reply_mode, clothing, img_ref, img_aspect, None)
                         }
                         _ => pde::decide(&input), // fail-open
                     };
@@ -4337,6 +4339,7 @@ pub fn run_stream(
                 plan.clothing.clone(),
                 eros_engine_core::types::ImageRef::Face,
                 None,
+                plan.action_response,
             );
         }
 
@@ -4972,6 +4975,7 @@ pub fn run_stream(
                         affinity_scope: user_msg.affinity_scope,
                         tips_amount_usd: user_msg.tips_amount_usd,
                         quote: user_msg.quote.clone(),
+                        action: None,
                     };
                     let user_id_bg = user_msg.user_id;
                     let instance_id_bg = user_msg.instance_id;
@@ -5492,6 +5496,7 @@ pub fn run_stream(
                     affinity_scope: user_msg.affinity_scope,
                     tips_amount_usd: user_msg.tips_amount_usd,
                     quote: user_msg.quote.clone(),
+                    action: None,
                 };
                 let user_id_bg = user_msg.user_id;
                 let instance_id_bg = user_msg.instance_id;
@@ -6000,6 +6005,7 @@ mod tests {
             image_caption: None,
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: aspect.map(str::to_string),
+            action_response: None,
         }
     }
 
@@ -6886,6 +6892,7 @@ mod tests {
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 quote: Default::default(),
+                action: None,
             },
             affinity: pde_test_affinity(),
             persona: pde_test_persona(),
@@ -7017,6 +7024,7 @@ mod tests {
             None,
             eros_engine_core::types::ImageRef::Face,
             None,
+            None,
         );
         // ghosting enabled → unchanged
         let kept = apply_ghosting_killswitch(ghost_plan.clone(), true, &input, vec!["想躲".into()]);
@@ -7047,6 +7055,7 @@ mod tests {
             None,
             None,
             eros_engine_core::types::ImageRef::Face,
+            None,
             None,
         );
         // ghosting disabled → suppressed to reply, hints preserved
@@ -17510,6 +17519,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 quote: Default::default(),
+                action: None,
             },
             affinity: test_affinity(),
             persona: test_persona(),
@@ -17566,6 +17576,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 quote: Default::default(),
+                action: None,
             },
             affinity: test_affinity(),
             persona: p,
@@ -17710,6 +17721,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 quote: Default::default(),
+                action: None,
             },
             affinity: test_affinity(),
             persona: p,

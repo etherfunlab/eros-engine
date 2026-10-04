@@ -309,6 +309,7 @@ fn edit_turn_event(
         affinity_scope: Default::default(),
         tips_amount_usd: None,
         quote,
+        action: None,
     }
 }
 
@@ -327,6 +328,7 @@ fn edit_turn_plan(action: ActionType) -> ActionPlan {
         image_caption: None,
         image_ref: ImageRef::Previous,
         aspect_ratio: None,
+        action_response: None,
     }
 }
 

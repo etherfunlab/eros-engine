@@ -191,6 +191,25 @@ pub fn endpoint_value(level: i16, counterpart: f64, decay: f64, floor_ratio: f64
     (boosted.max(floor_ratio * counterpart) * decay).clamp(0.0, 1.0)
 }
 
+/// The two relationship lines: Bond = trust + intrigue (friendship), Chemistry
+/// = intimacy + tension (romance). Names the line a user action touches (spec
+/// 2026-10-05-chat-user-actions-design.md §4.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AffinityLine {
+    Bond,
+    Chemistry,
+}
+
+impl AffinityLine {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AffinityLine::Bond => "bond",
+            AffinityLine::Chemistry => "chemistry",
+        }
+    }
+}
+
 /// 1..=5 tier index for a 0..1 line score. The single authority for the tier
 /// ladder: the `bond_tier`/`chem_tier` columns are this function's result
 /// projected for SQL consumers, and clients read that rather than re-deriving

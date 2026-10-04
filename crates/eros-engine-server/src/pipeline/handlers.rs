@@ -1708,6 +1708,7 @@ mod tests {
             affinity_scope: Default::default(),
             tips_amount_usd: None,
             quote: Default::default(),
+            action: None,
         };
         let extracted = audit_from_event(&ev);
         assert_eq!(extracted, Some(&audit));
@@ -2864,6 +2865,7 @@ mod tests {
             image_caption: None,
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: None,
+            action_response: None,
         };
         let input = DecisionInput {
             event: Event::UserMessage {
@@ -2878,6 +2880,7 @@ mod tests {
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 quote: Default::default(),
+                action: None,
             },
             affinity: ladder_test_affinity(session_id, owner, instance_id),
             persona: ladder_test_persona(instance_id, owner),
@@ -2985,6 +2988,7 @@ mod tests {
             image_caption: None,
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: None,
+            action_response: None,
         };
         let input = DecisionInput {
             event: Event::UserMessage {
@@ -2997,6 +3001,7 @@ mod tests {
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 quote: Default::default(),
+                action: None,
             },
             affinity: ladder_test_affinity(session_id, owner, instance_id),
             // No persona timezone ⇒ the persona clock falls back to the user's.
@@ -3119,6 +3124,7 @@ mod tests {
             image_caption: None,
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: None,
+            action_response: None,
         };
         let input = DecisionInput {
             event: Event::UserMessage {
@@ -3131,6 +3137,7 @@ mod tests {
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 quote: Default::default(),
+                action: None,
             },
             affinity: ladder_test_affinity(session_id, owner, instance_id),
             persona: ladder_test_persona(instance_id, owner),
@@ -3225,6 +3232,7 @@ mod tests {
             image_caption: None,
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: None,
+            action_response: None,
         };
         let input = DecisionInput {
             event: Event::UserMessage {
@@ -3237,6 +3245,7 @@ mod tests {
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 quote: Default::default(),
+                action: None,
             },
             affinity: ladder_test_affinity(session_id, owner, instance_id),
             persona: ladder_test_persona(instance_id, owner),
