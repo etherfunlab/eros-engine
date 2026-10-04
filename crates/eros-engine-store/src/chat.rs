@@ -159,6 +159,11 @@ pub struct ChatMessageSlim {
     /// thing the canonical history route does with its own extract.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reply_to_message_id: Option<String>,
+    /// The user row's `metadata.action` as stored, `response` included (spec
+    /// 2026-10-05 §3.5). Raw JSON for the same reason as the two text
+    /// extracts above: the caller parses it and drops what does not parse.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<serde_json::Value>,
     /// The `role='user'` row that drove the turn this row belongs to. Set on
     /// assistant rows, and on the `system_error` notices the queue worker and
     /// the stale-claim reaper write (#295) — those are written after the client
@@ -398,6 +403,7 @@ impl<'a> ChatRepo<'a> {
                     channel, read_at, \
                     (metadata->'image' IS NOT NULL) AS image, \
                     metadata->>'reply_to_message_id' AS reply_to_message_id, \
+                    metadata->'action' AS action, \
                     user_message_id \
              FROM engine.chat_messages \
              WHERE session_id = $1 \
@@ -715,6 +721,27 @@ impl<'a> ChatRepo<'a> {
                 .await?;
         tx.commit().await?;
         Ok(outcome)
+    }
+
+    /// Record the response in effect for this user row's action (spec
+    /// 2026-10-05-chat-user-actions-design.md §3.3). A row without
+    /// `metadata.action` is left alone. Last write wins: a re-driven turn
+    /// re-decides.
+    pub async fn set_action_response(
+        &self,
+        user_message_id: Uuid,
+        response: eros_engine_core::types::ActionResponse,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE engine.chat_messages \
+             SET metadata = jsonb_set(metadata, '{action,response}', to_jsonb($2::text)) \
+             WHERE id = $1 AND metadata ? 'action'",
+        )
+        .bind(user_message_id)
+        .bind(response.as_str())
+        .execute(self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Mark a user message as having received a `ghost` decision from the
@@ -4790,6 +4817,82 @@ mod tests {
         assert_eq!(
             repo.latest_user_message(s.id).await.unwrap().unwrap().id,
             second
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn set_action_response_writes_into_the_action_and_keeps_other_keys(pool: PgPool) {
+        use eros_engine_core::types::ActionResponse;
+        let s = throwaway_session(&pool).await;
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata) \
+             VALUES ($1, 'user', '', '{\"tier\":\"gold\",\"action\":{\"type\":\"kiss\"}}'::jsonb) RETURNING id",
+        )
+        .bind(s.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let repo = ChatRepo { pool: &pool };
+        repo.set_action_response(id, ActionResponse::Refuse)
+            .await
+            .unwrap();
+        let meta: serde_json::Value =
+            sqlx::query_scalar("SELECT metadata FROM engine.chat_messages WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            meta,
+            serde_json::json!({"tier": "gold", "action": {"type": "kiss", "response": "refuse"}})
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn set_action_response_leaves_a_row_without_an_action_alone(pool: PgPool) {
+        use eros_engine_core::types::ActionResponse;
+        let s = throwaway_session(&pool).await;
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata) \
+             VALUES ($1, 'user', 'hi', '{\"tier\":\"gold\"}'::jsonb) RETURNING id",
+        )
+        .bind(s.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        ChatRepo { pool: &pool }
+            .set_action_response(id, ActionResponse::Accept)
+            .await
+            .unwrap();
+        let meta: serde_json::Value =
+            sqlx::query_scalar("SELECT metadata FROM engine.chat_messages WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(meta, serde_json::json!({"tier": "gold"}));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn history_slim_projects_the_raw_action(pool: PgPool) {
+        let s = throwaway_session(&pool).await;
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata) VALUES \
+             ($1, 'user', '', '{\"action\":{\"type\":\"hug\",\"response\":\"accept\"}}'::jsonb), \
+             ($1, 'user', 'plain', NULL)",
+        )
+        .bind(s.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let rows = ChatRepo { pool: &pool }
+            .history_slim(s.id, 10, 0)
+            .await
+            .unwrap();
+        let with: Vec<_> = rows.iter().filter_map(|r| r.action.clone()).collect();
+        assert_eq!(
+            with,
+            vec![serde_json::json!({"type": "hug", "response": "accept"})]
         );
     }
 }

@@ -434,6 +434,7 @@ async fn persist_affinity(
                     llm_attempts,
                     gateway_errors,
                     user_message_id,
+                    None,
                 )
                 .await
             {
