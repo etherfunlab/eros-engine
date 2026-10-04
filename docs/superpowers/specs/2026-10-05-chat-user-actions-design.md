@@ -76,12 +76,15 @@ In `validate_payload`:
 
 - `content` may be empty when `action` is present (today: only with a tip
   or an `image_url`).
-- `action` together with `tips_amount_usd` → 400. Tip turns skip the PDE;
-  action turns need it.
+- `action` together with `tips_amount_usd` is rejected. Tip turns skip the
+  PDE; action turns need it.
 - `name` and `text` are trimmed and must be non-empty after trimming, within
   their length bounds counted in chars, and pass the `validate_prompt_traits`
   character rule (no `is_control` chars, no U+2028/U+2029).
-- `quantity` outside 1–99 → 400.
+- `quantity` outside 1–99 is rejected.
+
+Every rejection is a 422 `unprocessable`, like the existing tip and image
+checks in the same function.
 
 `image_url` and `image` are allowed alongside an action.
 
@@ -124,8 +127,10 @@ ActionResponse { user_message_id: String, response: ActionResponse }
 
 serialized as `{"type":"action_response","user_message_id":"…","response":"refuse"}`.
 It is emitted exactly once per action turn, after §4.5's write and before
-the first `meta` frame. `replay_stream` emits it in the same position when
-the user row carries `metadata.action.response`.
+the first `meta` frame. The replay path emits it in the same position when
+the user row carries `metadata.action.response`: on a `Replay` outcome the
+stream handler reads the user row by its id and puts the frame ahead of
+`replay_stream`'s output.
 
 ### 3.5 History
 
@@ -292,8 +297,8 @@ Every path that hands a user row to a model uses it:
   current turn's marker is folded there once.
 
 The affinity judge's `short_user_msg` gate (`eval_skip_reason`) never skips
-an action turn. The input filter rewrites `content` only; on an action-only
-turn `content` is empty and the filter skips as it does today. Echo
+an action turn. The input filter rewrites `content` only, and is skipped on
+an action turn whose `content` is blank: there is nothing to rewrite. Echo
 cancellation is unchanged: identical action-only rows repeated in the
 window drop out of history, as identical tip rows do.
 
