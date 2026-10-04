@@ -3003,4 +3003,82 @@ mod tests {
         .unwrap();
         assert!(context.get("tier_drop").is_none(), "{context}");
     }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn refused_action_clears_only_its_lines_pending_when_the_gate_buffers(pool: PgPool) {
+        use eros_engine_core::affinity::{tier_drop_target, AffinityLine};
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session = make_session(&pool, user_id, instance_id).await;
+        let mut a = repo
+            .load_or_create(session, user_id, instance_id)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE engine.companion_affinity SET trust=0.5, intrigue=0.4, intimacy=0.9, tension=0.7, \
+             pending_deltas='{\"trust\":0.01,\"intrigue\":0.01,\"intimacy\":0.02,\"tension\":0.02}'::jsonb \
+             WHERE id=$1",
+        )
+        .bind(a.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // A high delta threshold keeps this turn's movement buffered, so the
+        // clear of the refused line's axes is the only thing zeroing them.
+        repo.persist_with_event(
+            &mut a,
+            &AxisGrades {
+                intimacy: 3,
+                trust: 1,
+                ..Default::default()
+            },
+            &AffinityDeltas::default(),
+            1.0,
+            &AffinityTuning {
+                delta_threshold: 0.5,
+                ..Default::default()
+            },
+            "message",
+            serde_json::json!({}),
+            None,
+            EndpointLevelReads::default(),
+            None,
+            None,
+            None,
+            Some(AffinityLine::Chemistry),
+        )
+        .await
+        .unwrap();
+
+        let (intimacy, tension, chem_tier, pending): (f64, f64, i16, serde_json::Value) =
+            sqlx::query_as(
+                "SELECT intimacy, tension, chem_tier, pending_deltas \
+                 FROM engine.companion_affinity WHERE id = $1",
+            )
+            .bind(a.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let context: serde_json::Value = sqlx::query_scalar(
+            "SELECT context FROM engine.companion_affinity_events WHERE affinity_id = $1",
+        )
+        .bind(a.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let line = (intimacy + tension) / 2.0;
+        assert!((line - tier_drop_target(0.80)).abs() < 1e-3, "line {line}");
+        assert_eq!(chem_tier, 3);
+        for (where_, p) in [("row", &pending), ("event", &context["pending_after"])] {
+            assert_eq!(p["intimacy"].as_f64(), Some(0.0), "{where_}: {p}");
+            assert_eq!(p["tension"].as_f64(), Some(0.0), "{where_}: {p}");
+            assert!(
+                p["trust"].as_f64().is_some_and(|v| v != 0.0),
+                "{where_}: the other line's buffer must survive: {p}"
+            );
+        }
+    }
 }
