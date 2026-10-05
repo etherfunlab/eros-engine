@@ -147,13 +147,16 @@ pub struct UserActionDto {
     pub item: Option<GiftItemDto>,
     /// `give` only: a short name for what is handed over, 1–32 chars.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 32)]
     pub name: Option<String>,
     /// `give` only: 1–99, default 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(minimum = 1, maximum = 99)]
     pub quantity: Option<u32>,
     /// `custom` only, and required there: the action in the user's own
     /// words, 1–100 chars.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 100)]
     pub text: Option<String>,
 }
 

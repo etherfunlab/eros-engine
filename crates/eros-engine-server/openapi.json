@@ -3649,7 +3649,8 @@
               "string",
               "null"
             ],
-            "description": "`give` only: a short name for what is handed over, 1–32 chars."
+            "description": "`give` only: a short name for what is handed over, 1–32 chars.",
+            "maxLength": 32
           },
           "quantity": {
             "type": [
@@ -3658,14 +3659,16 @@
             ],
             "format": "int32",
             "description": "`give` only: 1–99, default 1.",
-            "minimum": 0
+            "maximum": 99,
+            "minimum": 1
           },
           "text": {
             "type": [
               "string",
               "null"
             ],
-            "description": "`custom` only, and required there: the action in the user's own\nwords, 1–100 chars."
+            "description": "`custom` only, and required there: the action in the user's own\nwords, 1–100 chars.",
+            "maxLength": 100
           },
           "type": {
             "$ref": "#/components/schemas/UserActionKind"

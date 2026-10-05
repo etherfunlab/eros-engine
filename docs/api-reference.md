@@ -119,7 +119,7 @@ Frame fields worth noting:
 - **`meta`** — `message_id`, `action_type`, `model` (the served model id; may be omitted), and `continues_from` (optional — the previous message id when this turn continues a retry chain). `action_type` is one of `reply` | `ghost` | `reply_image` | `reply_text_image` | `product_qa` (a plain-text reply is reported as `reply`, not `reply_text` — there is no `reply_text` on the wire). `product_qa` marks an out-of-character product answer routed by the PDE judge (see [model-config.md](model-config.md)); it is excluded from companion context/memory but reported the same way on both the live stream and replay. Clients must tolerate unknown `action_type` values (new ones may be added without a major-version bump).
 - **`done`** — `truncated`, `usage` (after `OPENROUTER_USAGE_HIDDEN_KEYS` filtering; always present — `null` when not applicable), `generation_id` (OpenRouter id; always present — `null` when not applicable), and `ghost_fallback` (bool; omitted when `false`). `ghost_fallback: true` marks a reply that resolved empty and was delivered as a silent fallback — this is **not** an `action_type=ghost` turn, and it leaves the ghost counters untouched. The cause is recorded on the persisted row's `metadata.fallback_reason`. A turn that promises a photo (`action_type=reply_text_image`) is exempt: an empty text half is an image-only reply, not silence, so it reports `ghost_fallback: false`, carries no `fallback_reason`, and the trailing `image_request` still fires.
 - **`final`** — turn summary: `filtered` (bool — was the reply output-filtered), `prompt_injected` (array of the trait tags that injected this turn, or `null`), `tier` (echo of the request `tier`, or `null`), `retries_chat` (zero-based index of the chat attempt that succeeded), `retries_filter` (index of the filter-model attempt that served), and — since v1.4.0 — `llm_attempts` / `gateway_errors` (both **omitted when empty**; see below). No profile/lead signal rides this frame — `lead_score`, `should_show_cta`, and `agent_training_level` were removed (companion_insights teardown, spec 2026-08-11); read profile state from `GET /comp/user/{user_id}/profile` instead.
-- **`action_response`** — on a turn that carries an `action` only: `user_message_id` and `response` (`"accept"` | `"refuse"`). Sent once, before the first `meta`, and re-sent on an idempotent replay. Clients must tolerate frame types they do not know.
+- **`action_response`** — on a turn that carries an `action` only: `user_message_id` and `response` (`"accept"` | `"refuse"`). Sent once, before the first `meta`, and re-sent on an idempotent replay. Clients must tolerate frame types they do not know. A turn that then ends in `error` (stream) or leaves a `system_error` row (async) did not take effect: no reply was sent and affinity did not move.
 
 **Filtered turns stream too.** When the resolved LLM `output_filter` arms for
 a turn (see [model-config.md](model-config.md)), the rewrite reaches the
@@ -426,7 +426,9 @@ type → chemistry; see [affinity-model.md](affinity-model.md#refused-actions)).
 
 With an action, `content` may be empty. `action` cannot be combined with
 `tips_amount_usd`; it can be combined with `image_url` and `image`. Every
-violation is a `422` (`code: "unprocessable"`). The action is stored on the user
+value violation (bounds, missing `item`/`text`, combined with a tip) is a `422`
+with `code: "unprocessable"`; a body whose `type` or `item` is not one of the
+listed values is rejected as unparseable JSON (also `422`). The action is stored on the user
 row and returned by both history routes as `action`, with `response` once the
 turn has been decided.
 

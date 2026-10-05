@@ -2751,8 +2751,8 @@ struct VerdictAudit<'a> {
     aspect_ratio: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     clothing: Option<&'a str>,
-    /// The judge's own answer on an action turn; absent when it abstained or
-    /// the turn had no action. The response in effect lives on the user row.
+    /// The judge's own answer; absent when it gave none. On an action turn
+    /// the response in effect lives on the user row.
     #[serde(skip_serializing_if = "Option::is_none")]
     action_response: Option<&'static str>,
 }
@@ -4945,7 +4945,7 @@ pub fn run_stream(
                         &plan,
                         req_image,
                         &pde_transcript.transcript,
-                        &user_msg.content,
+                        &crate::prompt::composer_user_text(user_msg.action.as_ref(), plan.action_response, &user_msg.content),
                         user_msg.user_id,
                         user_msg.session_id,
                     )
@@ -5294,7 +5294,11 @@ pub fn run_stream(
                         let plan_c = plan.clone();
                         let req_image_c = req_image.cloned();
                         let scene_c = pde_transcript.transcript.clone();
-                        let latest_c = effective_user_msg.clone();
+                        let latest_c = crate::prompt::composer_user_text(
+                            user_msg.action.as_ref(),
+                            plan.action_response,
+                            &effective_user_msg,
+                        );
                         let user_id_c = user_msg.user_id;
                         let session_id_c = user_msg.session_id;
                         AbortOnDrop(Some(tokio::spawn(async move {
@@ -5473,7 +5477,7 @@ pub fn run_stream(
                                     &plan,
                                     req_image,
                                     &pde_transcript.transcript,
-                                    &effective_user_msg,
+                                    &crate::prompt::composer_user_text(user_msg.action.as_ref(), plan.action_response, &effective_user_msg),
                                     user_msg.user_id,
                                     user_msg.session_id,
                                 )
@@ -5486,7 +5490,7 @@ pub fn run_stream(
                                     &plan,
                                     req_image,
                                     &pde_transcript.transcript,
-                                    &effective_user_msg,
+                                    &crate::prompt::composer_user_text(user_msg.action.as_ref(), plan.action_response, &effective_user_msg),
                                     user_msg.user_id,
                                     user_msg.session_id,
                                 )
@@ -8634,6 +8638,100 @@ data: [DONE]\n\n";
         assert!(
             !payload.contains("[最近场景]\n（无）"),
             "the scene must not be empty when history exists: {payload}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn forced_image_on_an_action_turn_tells_the_composer_the_outcome(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        // Composer configured, judge NOT — `resolve_pde()` is None, so before
+        // the fix the transcript was never fetched on this path.
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"primary\"\n\
+                 [tasks.chat_image_prompt_compose]\nmodel = \"composer\"\nfilter_prompt = \"COMPOSE\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "",
+                "01JACTION0000000000000000B",
+                "user",
+                Some(&serde_json::json!({"action": {"type": "kiss"}})),
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let _frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: String::new(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: Some(crate::routes::companion_stream::ImageReplyParams {
+                    force: true,
+                    ..Default::default()
+                }),
+                quote: Default::default(),
+                user_locale: Default::default(),
+                action: Some(eros_engine_core::types::UserAction::Kiss),
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        let reqs = mock.received_requests().await.expect("recorded requests");
+        assert_eq!(reqs.len(), 1, "the composer is the only provider call");
+        let body: serde_json::Value =
+            serde_json::from_slice(&reqs[0].body).expect("composer request body is json");
+        let payload = body["messages"][1]["content"]
+            .as_str()
+            .expect("composer user payload");
+        assert!(
+            payload.contains("（凑过来想亲你）"),
+            "the composer must see the action marker: {payload}"
+        );
+        assert!(
+            payload.contains("你接受了"),
+            "no judge means the action is accepted, and the composer must be told: {payload}"
         );
     }
 

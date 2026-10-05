@@ -336,12 +336,13 @@ pub(crate) async fn run_affinity_turn(
     )
     .await;
 
-    // Feeling-clause summarizer (spec 2026-09-03): movement turns only,
+    // Feeling-clause summarizer (spec 2026-09-03): movement turns and a
+    // refused action's tier drop only,
     // gated on the [tasks.affinity_summary] section being present at
     // all (absent = feature off, clause stays NULL) and on the request
     // actually injecting affinity (zero-axis scope ⇒ nothing would
     // render the clause).
-    if movement_turn(&grades, &levels)
+    if (movement_turn(&grades, &levels) || tier_drop.is_some())
         && affinity_scope.active_count() > 0
         && state.model_config.tasks.contains_key(SUMMARY_TASK)
     {
@@ -868,7 +869,8 @@ const SUMMARY_REASONS_LIMIT: i64 = 5;
 /// Movement predicate (spec §4): rewrite the feeling clause only on turns
 /// with real affinity movement. Purely ordinal — reads the judge's grades
 /// and levels, never compares floats against band edges. In-turn band
-/// crossings always come with a grade ≥ 1, so nothing is missed; silent
+/// crossings come with a grade ≥ 1, so nothing is missed; the exception is a
+/// refused action's tier drop, which `post_process` ORs in separately. Silent
 /// decay drift between sessions does not re-trigger (accepted lag — the
 /// clause is narrative state, [mood]'s gates keep reading live floats).
 /// Ghost turns never reach `post_process`, and the summarizer's inputs

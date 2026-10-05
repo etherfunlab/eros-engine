@@ -294,7 +294,9 @@ Every path that hands a user row to a model uses it:
   transcript (`build_input_filter_transcript`);
 - post-process: the `user_msg` that `post_process::run` derives from the
   event feeds the affinity judge, memory and insight extraction, so the
-  current turn's marker is folded there once.
+  current turn's marker is folded there once;
+- the image composer (`chat_image_prompt_compose`) on image turns: its user line is the marker-prefixed text followed by the
+  outcome sentence (「对方凑过来想亲你，你没有接受。」), so a picture never contradicts the decision;
 
 The affinity judge's `short_user_msg` gate (`eval_skip_reason`) never skips
 an action turn. The input filter rewrites `content` only, and is skipped on

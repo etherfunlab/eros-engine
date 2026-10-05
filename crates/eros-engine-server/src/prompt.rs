@@ -677,14 +677,35 @@ pub(crate) fn user_text_with_action(action: Option<&UserAction>, text: &str) -> 
 /// prompt: the action and the judge's conclusion about it. Worded without
 /// 「拒绝」, which `ANTI_REFUSAL_GUARD` tells the model to treat as corruption.
 pub(crate) fn user_action_context(a: &UserAction, response: ActionResponse) -> String {
+    format!(
+        "\n\n[user_action]\n{}用你自己的话回应。",
+        action_outcome(a, response)
+    )
+}
+
+/// The action and the decided response as one sentence:
+/// 「对方凑过来想亲你，你没有接受。」
+pub(crate) fn action_outcome(a: &UserAction, response: ActionResponse) -> String {
     let outcome = match response {
         ActionResponse::Accept => "你接受了",
         ActionResponse::Refuse => "你没有接受",
     };
-    format!(
-        "\n\n[user_action]\n{}，{outcome}。用你自己的话回应。",
-        action_subject(a)
-    )
+    format!("{}，{outcome}。", action_subject(a))
+}
+
+/// The user line the image composer reads: the marker-prefixed text, then the
+/// outcome sentence on an action turn so the picture never contradicts the
+/// decision. No action leaves the text unchanged.
+pub(crate) fn composer_user_text(
+    action: Option<&UserAction>,
+    response: Option<ActionResponse>,
+    text: &str,
+) -> String {
+    let base = user_text_with_action(action, text);
+    match (action, response) {
+        (Some(a), Some(r)) => format!("{base}\n{}", action_outcome(a, r)),
+        _ => base,
+    }
 }
 
 /// Pluck a string field out of `art_metadata`.
@@ -3883,6 +3904,54 @@ mod tests {
                 assert!(!s.contains("拒绝"), "{s}");
             }
         }
+    }
+
+    #[test]
+    fn action_outcome_states_the_decision() {
+        assert_eq!(
+            action_outcome(&UserAction::Kiss, ActionResponse::Refuse),
+            "对方凑过来想亲你，你没有接受。"
+        );
+        assert_eq!(
+            action_outcome(&UserAction::Hug, ActionResponse::Accept),
+            "对方想抱你，你接受了。"
+        );
+        assert_eq!(
+            action_outcome(
+                &UserAction::Custom {
+                    text: "捏了捏你的脸".into()
+                },
+                ActionResponse::Refuse
+            ),
+            "对方的动作：捏了捏你的脸，你没有接受。"
+        );
+    }
+
+    #[test]
+    fn action_outcome_never_says_refuse() {
+        for a in every_action() {
+            for r in [ActionResponse::Accept, ActionResponse::Refuse] {
+                let s = action_outcome(&a, r);
+                assert!(!s.contains("拒绝"), "{s}");
+            }
+        }
+    }
+
+    #[test]
+    fn composer_user_text_appends_the_outcome() {
+        assert_eq!(composer_user_text(None, None, "hi"), "hi");
+        assert_eq!(
+            composer_user_text(None, Some(ActionResponse::Refuse), "hi"),
+            "hi"
+        );
+        assert_eq!(
+            composer_user_text(Some(&UserAction::Kiss), Some(ActionResponse::Refuse), ""),
+            "（凑过来想亲你）\n对方凑过来想亲你，你没有接受。"
+        );
+        assert_eq!(
+            composer_user_text(Some(&UserAction::Hug), Some(ActionResponse::Accept), "抱抱"),
+            "（想抱你）抱抱\n对方想抱你，你接受了。"
+        );
     }
 
     #[test]
