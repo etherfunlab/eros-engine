@@ -154,6 +154,11 @@ pub struct ChatHistoryEntry {
     /// history entry carries the same field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_message_id: Option<Uuid>,
+    /// The action a `user` row carried and, once decided, the persona's
+    /// response (spec 2026-10-05). Omitted on rows without an action; the BFF
+    /// history entry carries the same field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<crate::routes::companion_stream::UserActionView>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -777,6 +782,11 @@ async fn get_history(
                 .and_then(|md| md.get("reply_to_message_id"))
                 .and_then(|v| v.as_str())
                 .and_then(|s| Uuid::parse_str(s).ok()),
+            action: m
+                .metadata
+                .as_ref()
+                .and_then(|md| md.get("action"))
+                .and_then(crate::routes::companion_stream::UserActionView::from_metadata_action),
             role: m.role,
             content: m.content,
             sent_at: m.sent_at,

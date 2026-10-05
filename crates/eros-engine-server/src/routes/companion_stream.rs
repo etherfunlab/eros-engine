@@ -209,6 +209,32 @@ impl UserActionDto {
     }
 }
 
+/// The persona's response to an action, as history reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionResponseDto {
+    Accept,
+    Refuse,
+}
+
+/// A user row's action as the history routes return it: the action fields as
+/// sent, plus the decided `response` once the turn has been decided.
+#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
+pub struct UserActionView {
+    #[serde(flatten)]
+    pub action: UserActionDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<ActionResponseDto>,
+}
+
+impl UserActionView {
+    /// Parse a stored `metadata.action`; what does not parse is dropped rather
+    /// than failing the history page.
+    pub(crate) fn from_metadata_action(raw: &serde_json::Value) -> Option<Self> {
+        serde_json::from_value(raw.clone()).ok()
+    }
+}
+
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct StreamSendRequest {
     pub content: String,
