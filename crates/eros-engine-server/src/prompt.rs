@@ -685,6 +685,44 @@ pub(crate) fn user_action_context(a: &UserAction, response: ActionResponse) -> S
     )
 }
 
+// ── Message reactions (spec 2026-10-05-message-reactions-design.md §6) ─────
+
+/// One reacted assistant message as `[reactions]` renders it.
+pub(crate) struct ReactionLine<'a> {
+    pub content: &'a str,
+    pub is_image: bool,
+    pub emoji: &'a str,
+}
+
+/// How much of the persona's own line a reaction quotes.
+const REACTION_QUOTE_CHARS: usize = 20;
+
+/// The per-turn `[reactions]` fragment: what the user reacted to since their
+/// previous message, oldest first. Empty when there is nothing to say.
+pub(crate) fn reactions_context(lines: &[ReactionLine<'_>]) -> String {
+    let body: Vec<String> = lines
+        .iter()
+        .filter_map(|l| {
+            let text = l.content.trim();
+            if text.is_empty() {
+                l.is_image
+                    .then(|| format!("对方给你发的照片回了 {}", l.emoji))
+            } else {
+                let mut quote: String = text.chars().take(REACTION_QUOTE_CHARS).collect();
+                if text.chars().count() > REACTION_QUOTE_CHARS {
+                    quote.push('…');
+                }
+                Some(format!("对方给你说的「{quote}」回了 {}", l.emoji))
+            }
+        })
+        .collect();
+    if body.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n[reactions]\n{}", body.join("\n"))
+    }
+}
+
 /// The action and the decided response as one sentence:
 /// 「对方凑过来想亲你，你没有接受。」
 pub(crate) fn action_outcome(a: &UserAction, response: ActionResponse) -> String {
@@ -3879,6 +3917,55 @@ mod tests {
                 text: "捏了捏你的脸".into()
             }),
             "对方的动作：「捏了捏你的脸」"
+        );
+    }
+
+    #[test]
+    fn reactions_context_renders_quotes_images_and_order() {
+        let long = "一二三四五六七八九十一二三四五六七八九十多出来";
+        let s = reactions_context(&[
+            ReactionLine {
+                content: "今晚想吃什么",
+                is_image: false,
+                emoji: "❤️",
+            },
+            ReactionLine {
+                content: "",
+                is_image: true,
+                emoji: "🔥",
+            },
+            ReactionLine {
+                content: long,
+                is_image: false,
+                emoji: "😂",
+            },
+        ]);
+        assert_eq!(
+            s,
+            "\n\n[reactions]\n对方给你说的「今晚想吃什么」回了 ❤️\n对方给你发的照片回了 🔥\n对方给你说的「一二三四五六七八九十一二三四五六七八九十…」回了 😂"
+        );
+    }
+
+    #[test]
+    fn reactions_context_is_empty_without_reactions_and_skips_blank_text_rows() {
+        assert_eq!(reactions_context(&[]), "");
+        assert_eq!(
+            reactions_context(&[ReactionLine {
+                content: "  ",
+                is_image: false,
+                emoji: "❤️"
+            }]),
+            ""
+        );
+        let exactly_twenty = "一二三四五六七八九十一二三四五六七八九十";
+        assert!(
+            reactions_context(&[ReactionLine {
+                content: exactly_twenty,
+                is_image: false,
+                emoji: "❤️"
+            }])
+            .contains(&format!("「{exactly_twenty}」")),
+            "no ellipsis at exactly 20 chars"
         );
     }
 

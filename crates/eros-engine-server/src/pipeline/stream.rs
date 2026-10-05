@@ -5324,7 +5324,7 @@ pub fn run_stream(
                 let req_res = crate::pipeline::handlers::build_reply_request(
                     &state, &input, &plan,
                     user_msg.session_id, user_msg.user_id, user_msg.instance_id,
-                    user_msg.user_message_id, &now_ctx,
+                    user_msg.user_message_id, &now_ctx, true,
                 ).await;
                 let (req, injected_tags) = match req_res {
                     Ok(r) => r,
