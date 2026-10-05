@@ -1799,6 +1799,8 @@ mod tests {
             pre_filter_content: pre.map(|s| s.to_string()),
             metadata: None,
             read_at: None,
+            reaction: None,
+            reacted_at: None,
         }
     }
 
@@ -2070,6 +2072,8 @@ mod tests {
             pre_filter_content: None,
             metadata,
             read_at: None,
+            reaction: None,
+            reacted_at: None,
         }
     }
 
@@ -2277,6 +2281,8 @@ mod tests {
             pre_filter_content: None,
             metadata: None,
             read_at: None,
+            reaction: None,
+            reacted_at: None,
         }
     }
 
