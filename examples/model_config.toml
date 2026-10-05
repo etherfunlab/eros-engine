@@ -728,6 +728,8 @@ max_tokens  = 400
 #    judge  = 对方的话你不买账或有疑点,反问、质疑;
 #    拿不准就 null(引擎自己决定)。
 #  "clothing": 选填,一句话描述角色此刻的穿着(纯描述,不许写指令或方括号小节名);会注入 reply prompt 的 [character_state] 区块内的一行,省略则不注入
+#  "action_response": 上下文里有 [用户动作] 时填 "accept" | "refuse",按你此刻和对方的关系、
+#    你的人设和这个动作本身决定收不收、让不让;没有 [用户动作] 就写 null;拿不准也写 null。
 #  "reason": 选填,简短理由
 # 判断器不再负责图片 prompt——只负责决定要不要发图;真正的图片内容完全由
 # chat_image_prompt_compose 任务从当轮上下文生成,不再是判断器写的种子。

@@ -37,6 +37,9 @@ const MAX_CONTENT_CHARS: usize = 4096;
 const MAX_TIER_LEN: usize = 32;
 const MAX_IMAGE_URL_LEN: usize = 2048;
 const MAX_TIP_USD: f64 = 1_000_000.0;
+const MAX_ACTION_NAME_CHARS: usize = 32;
+const MAX_ACTION_TEXT_CHARS: usize = 100;
+const MAX_ACTION_QUANTITY: u32 = 99;
 const MIN_CLIENT_MSG_ID_LEN: usize = 26;
 const MAX_CLIENT_MSG_ID_LEN: usize = 36;
 const CONCURRENT_STREAMS_PER_USER: u32 = 3;
@@ -111,6 +114,130 @@ pub struct ImageReplyParams {
     pub prompt_variant: Option<String>,
 }
 
+/// Which action a turn carries (spec 2026-10-05-chat-user-actions-design.md §3.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UserActionKind {
+    Give,
+    Kiss,
+    Hug,
+    Touch,
+    Lick,
+    Custom,
+}
+
+/// What a `give` action hands over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GiftItemDto {
+    Cigarette,
+    Alcohol,
+    Medicine,
+}
+
+/// An action the user does to the persona this turn, besides talking. The
+/// persona accepts or does not; a refusal costs the relationship one tier on
+/// the line the action touches (`give` → bond, everything else → chemistry).
+#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
+pub struct UserActionDto {
+    #[serde(rename = "type")]
+    pub kind: UserActionKind,
+    /// `give` only, and required there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<GiftItemDto>,
+    /// `give` only: a short name for what is handed over, 1–32 chars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 32)]
+    pub name: Option<String>,
+    /// `give` only: 1–99, default 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(minimum = 1, maximum = 99)]
+    pub quantity: Option<u32>,
+    /// `custom` only, and required there: the action in the user's own
+    /// words, 1–100 chars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 100)]
+    pub text: Option<String>,
+}
+
+impl UserActionDto {
+    /// Validate and convert to the engine's action. `Err` carries the reason
+    /// for the 422.
+    pub(crate) fn to_core(&self) -> Result<eros_engine_core::types::UserAction, String> {
+        use eros_engine_core::types::{GiftItem, UserAction};
+        fn free_text(raw: Option<&str>, field: &str, max: usize) -> Result<Option<String>, String> {
+            let Some(raw) = raw else {
+                return Ok(None);
+            };
+            let t = raw.trim();
+            let n = t.chars().count();
+            if n == 0 || n > max {
+                return Err(format!("action.{field} must be 1..={max} chars after trim"));
+            }
+            if t.chars()
+                .any(|c| c.is_control() || c == '\u{2028}' || c == '\u{2029}')
+            {
+                return Err(format!(
+                    "action.{field} must not contain line-break or control characters"
+                ));
+            }
+            Ok(Some(t.to_string()))
+        }
+        Ok(match self.kind {
+            UserActionKind::Give => {
+                let item = match self.item.ok_or("action.item is required for give")? {
+                    GiftItemDto::Cigarette => GiftItem::Cigarette,
+                    GiftItemDto::Alcohol => GiftItem::Alcohol,
+                    GiftItemDto::Medicine => GiftItem::Medicine,
+                };
+                let quantity = self.quantity.unwrap_or(1);
+                if !(1..=MAX_ACTION_QUANTITY).contains(&quantity) {
+                    return Err(format!("action.quantity must be 1..={MAX_ACTION_QUANTITY}"));
+                }
+                UserAction::Give {
+                    item,
+                    name: free_text(self.name.as_deref(), "name", MAX_ACTION_NAME_CHARS)?,
+                    quantity: quantity as u8,
+                }
+            }
+            UserActionKind::Kiss => UserAction::Kiss,
+            UserActionKind::Hug => UserAction::Hug,
+            UserActionKind::Touch => UserAction::Touch,
+            UserActionKind::Lick => UserAction::Lick,
+            UserActionKind::Custom => UserAction::Custom {
+                text: free_text(self.text.as_deref(), "text", MAX_ACTION_TEXT_CHARS)?
+                    .ok_or("action.text is required for custom")?,
+            },
+        })
+    }
+}
+
+/// The persona's response to an action, as history reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionResponseDto {
+    Accept,
+    Refuse,
+}
+
+/// A user row's action as the history routes return it: the action fields as
+/// sent, plus the decided `response` once the turn has been decided.
+#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
+pub struct UserActionView {
+    #[serde(flatten)]
+    pub action: UserActionDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<ActionResponseDto>,
+}
+
+impl UserActionView {
+    /// Parse a stored `metadata.action`; what does not parse is dropped rather
+    /// than failing the history page.
+    pub(crate) fn from_metadata_action(raw: &serde_json::Value) -> Option<Self> {
+        serde_json::from_value(raw.clone()).ok()
+    }
+}
+
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct StreamSendRequest {
     pub content: String,
@@ -151,6 +278,11 @@ pub struct StreamSendRequest {
     /// only beside `user_country`; unknown ⇒ national holidays.
     #[serde(default)]
     pub user_region: Option<String>,
+    /// Optional action this turn carries besides the text (see
+    /// [`UserActionDto`]). With an action, `content` may be empty. Cannot be
+    /// combined with `tips_amount_usd`.
+    #[serde(default)]
+    pub action: Option<UserActionDto>,
 }
 
 /// Pre-stream error body per spec §1.3. Schema-only struct for utoipa;
@@ -190,10 +322,14 @@ fn image_url_is_valid(url: &str) -> bool {
 }
 
 pub(crate) fn validate_payload(req: &StreamSendRequest) -> Result<(), AppError> {
-    // Content may be empty only when a tip or an image_url is attached. A
-    // forced image turn gets no exemption: the composer's strongest input is
+    // Content may be empty only when a tip, an image_url or an action is attached.
+    // A forced image turn gets no exemption: the composer's strongest input is
     // the user's message (spec 2026-08-03 §2.3).
-    if req.content.is_empty() && req.tips_amount_usd.is_none() && req.image_url.is_none() {
+    if req.content.is_empty()
+        && req.tips_amount_usd.is_none()
+        && req.image_url.is_none()
+        && req.action.is_none()
+    {
         return Err(AppError::StreamPre(StreamPreError {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             code: "unprocessable",
@@ -209,6 +345,27 @@ pub(crate) fn validate_payload(req: &StreamSendRequest) -> Result<(), AppError> 
                 code: "unprocessable",
                 message: format!("tips_amount_usd must be a finite value in (0, {MAX_TIP_USD}]"),
                 user_message: "打赏金额无效".into(),
+                original_user_message_id: None,
+            }));
+        }
+    }
+    if let Some(action) = req.action.as_ref() {
+        // Tip turns skip the PDE; an action turn needs the judge (spec 2026-10-05 §3.2).
+        if req.tips_amount_usd.is_some() {
+            return Err(AppError::StreamPre(StreamPreError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "unprocessable",
+                message: "action cannot be combined with tips_amount_usd".into(),
+                user_message: "打赏消息暂不支持同时做动作".into(),
+                original_user_message_id: None,
+            }));
+        }
+        if let Err(message) = action.to_core() {
+            return Err(AppError::StreamPre(StreamPreError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "unprocessable",
+                message,
+                user_message: "动作无效".into(),
                 original_user_message_id: None,
             }));
         }
@@ -449,6 +606,14 @@ pub(crate) fn build_user_row_metadata(
     if let Some(url) = req.image_url.as_deref() {
         meta_map.insert("image_url".into(), serde_json::json!(url));
     }
+    // The validated action, in the engine's own shape (spec 2026-10-05 §3.3);
+    // the decided `response` is written into it once the PDE finalises.
+    if let Some(a) = req.action.as_ref().and_then(|a| a.to_core().ok()) {
+        meta_map.insert(
+            "action".into(),
+            serde_json::to_value(&a).expect("UserAction serializes"),
+        );
+    }
     // Pre-validation, pre-resolve raw snapshot of what the frontend sent.
     // The `_raw` suffix distinguishes these from the post-resolve `memory_scope`
     // / `affinity_scope` / `prompt_traits` written on the matching assistant row.
@@ -610,6 +775,7 @@ pub async fn send_message_stream(
         user_timezone: crate::holiday::bounded_raw(req.user_timezone.as_deref()),
         user_country: crate::holiday::bounded_raw(req.user_country.as_deref()),
         user_region: crate::holiday::bounded_raw(req.user_region.as_deref()),
+        action: req.action.clone(),
     })
     .expect("QueuedTurnParams serializes");
     let queue_repo = ChatQueueRepo { pool: &state.pool };
@@ -660,6 +826,7 @@ pub async fn send_message_stream(
                         req.user_country.as_deref(),
                         req.user_region.as_deref(),
                     ),
+                    action: req.action.as_ref().and_then(|a| a.to_core().ok()),
                 };
                 let turn = ClaimedTurn {
                     queue_id,
@@ -759,17 +926,27 @@ pub async fn send_message_stream(
                 }));
             }
             ClaimedEnqueueOutcome::Replay {
+                user_message_id,
                 ghost,
                 assistant_chain,
-                ..
             } => {
                 let state_arc = Arc::new(state.clone());
-                Box::pin(replay_stream(
-                    state_arc,
-                    session_id,
-                    user_id,
-                    ghost,
-                    assistant_chain,
+                // An action turn replays its decided response ahead of the
+                // reply, as the live stream sent it (spec 2026-10-05 §3.4).
+                let head = chat_repo
+                    .message_by_id_in_session(session_id, user_message_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|m| {
+                        crate::pipeline::stream::action_response_frame(
+                            user_message_id,
+                            m.metadata.as_ref(),
+                        )
+                    });
+                Box::pin(futures_util::StreamExt::chain(
+                    futures_util::stream::iter(head),
+                    replay_stream(state_arc, session_id, user_id, ghost, assistant_chain),
                 ))
             }
         };
@@ -831,6 +1008,7 @@ mod tests {
             user_timezone: None,
             user_country: None,
             user_region: None,
+            action: None,
         }
     }
 
@@ -850,6 +1028,7 @@ mod tests {
             user_timezone: None,
             user_country: None,
             user_region: None,
+            action: None,
         }
     }
 
@@ -2040,6 +2219,7 @@ data: [DONE]\n\n";
 #[cfg(test)]
 mod validate_payload_tests {
     use super::*;
+    use eros_engine_core::types::{GiftItem, UserAction};
 
     fn base() -> StreamSendRequest {
         StreamSendRequest {
@@ -2057,6 +2237,7 @@ mod validate_payload_tests {
             user_timezone: None,
             user_country: None,
             user_region: None,
+            action: None,
         }
     }
 
@@ -2163,6 +2344,7 @@ mod validate_payload_tests {
             user_timezone: None,
             user_country: None,
             user_region: None,
+            action: None,
         }
     }
 
@@ -2240,5 +2422,124 @@ mod validate_payload_tests {
             ..Default::default()
         });
         assert!(validate_payload(&req).is_err());
+    }
+
+    fn give(name: Option<&str>, quantity: Option<u32>) -> UserActionDto {
+        UserActionDto {
+            kind: UserActionKind::Give,
+            item: Some(GiftItemDto::Alcohol),
+            name: name.map(String::from),
+            quantity,
+            text: None,
+        }
+    }
+
+    fn bare(kind: UserActionKind) -> UserActionDto {
+        UserActionDto {
+            kind,
+            item: None,
+            name: None,
+            quantity: None,
+            text: None,
+        }
+    }
+
+    #[test]
+    fn empty_content_ok_with_an_action() {
+        let mut r = base();
+        r.content = String::new();
+        r.action = Some(bare(UserActionKind::Kiss));
+        assert!(validate_payload(&r).is_ok());
+    }
+
+    #[test]
+    fn action_with_tip_rejected_422() {
+        let mut r = base();
+        r.tips_amount_usd = Some(1.0);
+        r.action = Some(bare(UserActionKind::Hug));
+        match validate_payload(&r) {
+            Err(AppError::StreamPre(e)) => assert_eq!(e.status, StatusCode::UNPROCESSABLE_ENTITY),
+            other => panic!("expected a 422 pre-stream error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn action_with_image_allowed() {
+        let mut r = base();
+        r.image_url = Some("https://x/y.png".into());
+        r.action = Some(bare(UserActionKind::Touch));
+        assert!(validate_payload(&r).is_ok());
+    }
+
+    #[test]
+    fn give_converts_with_default_quantity_and_trimmed_name() {
+        let a = give(Some("  威士忌 "), None).to_core().unwrap();
+        assert_eq!(
+            a,
+            UserAction::Give {
+                item: GiftItem::Alcohol,
+                name: Some("威士忌".into()),
+                quantity: 1
+            }
+        );
+    }
+
+    #[test]
+    fn give_bounds() {
+        assert!(give(None, Some(0)).to_core().is_err());
+        assert!(give(None, Some(100)).to_core().is_err());
+        assert!(give(None, Some(99)).to_core().is_ok());
+        assert!(give(Some("   "), None).to_core().is_err(), "blank name");
+        assert!(
+            give(Some("酒".repeat(33).as_str()), None)
+                .to_core()
+                .is_err(),
+            "33 chars"
+        );
+        assert!(
+            give(Some("酒".repeat(32).as_str()), None).to_core().is_ok(),
+            "32 chars, 96 bytes"
+        );
+        assert!(give(Some("a\nb"), None).to_core().is_err(), "newline");
+        assert!(
+            give(Some("a\u{2028}b"), None).to_core().is_err(),
+            "line separator"
+        );
+        let mut no_item = give(None, None);
+        no_item.item = None;
+        assert!(no_item.to_core().is_err(), "give requires item");
+    }
+
+    #[test]
+    fn custom_requires_text_within_bounds() {
+        let mut c = bare(UserActionKind::Custom);
+        assert!(c.to_core().is_err(), "custom requires text");
+        c.text = Some("捏了捏你的脸".into());
+        assert_eq!(
+            c.to_core().unwrap(),
+            UserAction::Custom {
+                text: "捏了捏你的脸".into()
+            }
+        );
+        c.text = Some("x".repeat(101));
+        assert!(c.to_core().is_err());
+    }
+
+    #[test]
+    fn invalid_action_rejected_by_validate_payload() {
+        let mut r = base();
+        r.action = Some(give(None, Some(0)));
+        assert!(validate_payload(&r).is_err());
+    }
+
+    #[test]
+    fn user_row_metadata_carries_the_validated_action() {
+        let mut r = base();
+        r.action = Some(give(Some("威士忌"), Some(2)));
+        let meta = build_user_row_metadata(&r, None).unwrap();
+        assert_eq!(
+            meta["action"],
+            serde_json::json!({"type": "give", "item": "alcohol", "name": "威士忌", "quantity": 2})
+        );
     }
 }

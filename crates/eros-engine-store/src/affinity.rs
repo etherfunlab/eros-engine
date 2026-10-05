@@ -483,6 +483,9 @@ impl<'a> AffinityRepo<'a> {
         llm_attempts: Option<serde_json::Value>,
         gateway_errors: Option<serde_json::Value>,
         user_message_id: Option<Uuid>,
+        // A refused user action's line (spec 2026-10-05-chat-user-actions-design.md
+        // §6.3); `None` on every other turn.
+        tier_drop: Option<eros_engine_core::affinity::AffinityLine>,
     ) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
 
@@ -525,6 +528,14 @@ impl<'a> AffinityRepo<'a> {
 
         let outcome = grade_turn(&current, grades, rule_deltas, &pending, boost, tuning);
         current.apply_deltas(&outcome.committed);
+        // A refused action: its line lands one tier below the pre-turn
+        // position, replacing whatever the judge's grades did to it, and
+        // keeps nothing buffered on its axes to land later.
+        let mut pending_after = outcome.pending;
+        if let Some(line) = tier_drop {
+            current.drop_line_tier(&before_affinity, line);
+            pending_after.clear_line(line);
+        }
 
         // Judge-owned absolute levels: a `Some` overwrites the stored level, a
         // `None` (omitted / skipped eval) holds it. The endpoints themselves
@@ -582,7 +593,7 @@ impl<'a> AffinityRepo<'a> {
         .bind(current.patience_grade)
         .bind(i16::from(current.bond_tier()))
         .bind(i16::from(current.chem_tier()))
-        .bind(serde_json::to_value(outcome.pending).ok())
+        .bind(serde_json::to_value(pending_after).ok())
         .fetch_one(&mut *tx)
         .await?;
         // The row's own `now()`, not `apply_deltas`' Rust-side one: the
@@ -608,8 +619,18 @@ impl<'a> AffinityRepo<'a> {
             // The 3.1 ladder is retired: no key may claim a steered grade.
             // Its absence from new events is the retirement's cleanest proof.
             obj.remove("effective_grades");
-            if let Ok(p) = serde_json::to_value(outcome.pending) {
+            if let Ok(p) = serde_json::to_value(pending_after) {
                 obj.insert("pending_after".into(), p);
+            }
+            // Which line a refused action dropped, so a reader can see why the
+            // stored `grades` and that line's movement disagree.
+            match tier_drop {
+                Some(line) => {
+                    obj.insert("tier_drop".into(), serde_json::json!(line.as_str()));
+                }
+                None => {
+                    obj.remove("tier_drop");
+                }
             }
             // 4.0 endpoint audit: judge levels (only when actually read this
             // turn), the boosts and decay in force, and the per-line units —
@@ -781,6 +802,7 @@ mod tests {
             serde_json::json!({}),
             None,
             EndpointLevelReads::default(),
+            None,
             None,
             None,
             None,
@@ -972,6 +994,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1030,6 +1053,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1080,6 +1104,7 @@ mod tests {
                 ctx,
                 None,
                 EndpointLevelReads::default(),
+                None,
                 None,
                 None,
                 None,
@@ -1158,6 +1183,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1233,6 +1259,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1291,6 +1318,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1320,6 +1348,7 @@ mod tests {
             serde_json::json!({}),
             None,
             EndpointLevelReads::default(),
+            None,
             None,
             None,
             None,
@@ -1384,6 +1413,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -1442,6 +1472,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1497,6 +1528,7 @@ mod tests {
             serde_json::json!({ "affinity_reason": "他坦白了" }),
             None,
             EndpointLevelReads::default(),
+            None,
             None,
             None,
             None,
@@ -1623,6 +1655,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1643,6 +1676,7 @@ mod tests {
                 serde_json::json!({}),
                 None,
                 EndpointLevelReads::default(),
+                None,
                 None,
                 None,
                 None,
@@ -2278,6 +2312,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2450,6 +2485,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2619,6 +2655,7 @@ mod tests {
             None,
             None,
             Some(umid),
+            None,
         )
         .await
         .unwrap();
@@ -2747,6 +2784,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap()
@@ -2843,5 +2881,204 @@ mod tests {
 
         let capped = repo.recent_reasons(session_id, 1).await.unwrap();
         assert_eq!(capped, vec!["第二条".to_string()]);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn refused_action_drops_its_line_one_tier_from_the_pre_turn_snapshot(pool: PgPool) {
+        use eros_engine_core::affinity::{tier_drop_target, AffinityLine};
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session = make_session(&pool, user_id, instance_id).await;
+        let mut a = repo
+            .load_or_create(session, user_id, instance_id)
+            .await
+            .unwrap();
+        // Chemistry 0.80 (tier 4), bond 0.45 (tier 3), something buffered on both lines.
+        sqlx::query(
+            "UPDATE engine.companion_affinity SET trust=0.5, intrigue=0.4, intimacy=0.9, tension=0.7, \
+             pending_deltas='{\"trust\":0.01,\"intrigue\":0.01,\"intimacy\":0.02,\"tension\":0.02}'::jsonb \
+             WHERE id=$1",
+        )
+        .bind(a.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        repo.persist_with_event(
+            &mut a,
+            // The judge graded the refused line UP and the other line up too.
+            &AxisGrades {
+                intimacy: 3,
+                trust: 1,
+                ..Default::default()
+            },
+            &AffinityDeltas::default(),
+            1.0,
+            &AffinityTuning::default(),
+            "message",
+            serde_json::json!({}),
+            None,
+            EndpointLevelReads::default(),
+            None,
+            None,
+            None,
+            Some(AffinityLine::Chemistry),
+        )
+        .await
+        .unwrap();
+
+        let (intimacy, tension, trust, chem_tier, pending): (
+            f64,
+            f64,
+            f64,
+            i16,
+            serde_json::Value,
+        ) = sqlx::query_as(
+            "SELECT intimacy, tension, trust, chem_tier, pending_deltas \
+                 FROM engine.companion_affinity WHERE id = $1",
+        )
+        .bind(a.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // tension decays lazily by the minutes since seeding — negligible here.
+        let line = (intimacy + tension) / 2.0;
+        assert!(
+            (line - tier_drop_target(0.80)).abs() < 1e-3,
+            "line {line} must land at the drop target, the judge's +3 discarded"
+        );
+        assert_eq!(chem_tier, 3);
+        assert!(
+            trust > 0.5,
+            "the other line still follows the judge: trust {trust}"
+        );
+        assert_eq!(pending["intimacy"].as_f64(), Some(0.0));
+        assert_eq!(pending["tension"].as_f64(), Some(0.0));
+
+        let context: serde_json::Value = sqlx::query_scalar(
+            "SELECT context FROM engine.companion_affinity_events WHERE affinity_id = $1",
+        )
+        .bind(a.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(context["tier_drop"], "chemistry");
+        assert_eq!(context["pending_after"]["intimacy"].as_f64(), Some(0.0));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn no_tier_drop_leaves_no_context_key(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session = make_session(&pool, user_id, instance_id).await;
+        let mut a = repo
+            .load_or_create(session, user_id, instance_id)
+            .await
+            .unwrap();
+        repo.persist_with_event(
+            &mut a,
+            &AxisGrades::default(),
+            &AffinityDeltas::default(),
+            1.0,
+            &AffinityTuning::default(),
+            "message",
+            serde_json::json!({}),
+            None,
+            EndpointLevelReads::default(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let context: serde_json::Value = sqlx::query_scalar(
+            "SELECT context FROM engine.companion_affinity_events WHERE affinity_id = $1",
+        )
+        .bind(a.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(context.get("tier_drop").is_none(), "{context}");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn refused_action_clears_only_its_lines_pending_when_the_gate_buffers(pool: PgPool) {
+        use eros_engine_core::affinity::{tier_drop_target, AffinityLine};
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session = make_session(&pool, user_id, instance_id).await;
+        let mut a = repo
+            .load_or_create(session, user_id, instance_id)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE engine.companion_affinity SET trust=0.5, intrigue=0.4, intimacy=0.9, tension=0.7, \
+             pending_deltas='{\"trust\":0.01,\"intrigue\":0.01,\"intimacy\":0.02,\"tension\":0.02}'::jsonb \
+             WHERE id=$1",
+        )
+        .bind(a.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // A high delta threshold keeps this turn's movement buffered, so the
+        // clear of the refused line's axes is the only thing zeroing them.
+        repo.persist_with_event(
+            &mut a,
+            &AxisGrades {
+                intimacy: 3,
+                trust: 1,
+                ..Default::default()
+            },
+            &AffinityDeltas::default(),
+            1.0,
+            &AffinityTuning {
+                delta_threshold: 0.5,
+                ..Default::default()
+            },
+            "message",
+            serde_json::json!({}),
+            None,
+            EndpointLevelReads::default(),
+            None,
+            None,
+            None,
+            Some(AffinityLine::Chemistry),
+        )
+        .await
+        .unwrap();
+
+        let (intimacy, tension, chem_tier, pending): (f64, f64, i16, serde_json::Value) =
+            sqlx::query_as(
+                "SELECT intimacy, tension, chem_tier, pending_deltas \
+                 FROM engine.companion_affinity WHERE id = $1",
+            )
+            .bind(a.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let context: serde_json::Value = sqlx::query_scalar(
+            "SELECT context FROM engine.companion_affinity_events WHERE affinity_id = $1",
+        )
+        .bind(a.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let line = (intimacy + tension) / 2.0;
+        assert!((line - tier_drop_target(0.80)).abs() < 1e-3, "line {line}");
+        assert_eq!(chem_tier, 3);
+        for (where_, p) in [("row", &pending), ("event", &context["pending_after"])] {
+            assert_eq!(p["intimacy"].as_f64(), Some(0.0), "{where_}: {p}");
+            assert_eq!(p["tension"].as_f64(), Some(0.0), "{where_}: {p}");
+            assert!(
+                p["trust"].as_f64().is_some_and(|v| v != 0.0),
+                "{where_}: the other line's buffer must survive: {p}"
+            );
+        }
     }
 }

@@ -136,6 +136,13 @@ pub enum ProtocolFrame {
         #[serde(skip_serializing_if = "Option::is_none")]
         aspect_ratio: Option<String>,
     },
+    /// The response in effect for this turn's user action (spec
+    /// 2026-10-05-chat-user-actions-design.md §3.4). Emitted once, before the
+    /// first `meta`, on action turns only; replayed from the user row.
+    ActionResponse {
+        user_message_id: Uuid,
+        response: eros_engine_core::types::ActionResponse,
+    },
 }
 
 fn is_false(b: &bool) -> bool {
@@ -181,6 +188,20 @@ fn build_image_request_frame(
         image_ref,
         aspect_ratio: aspect_ratio.map(str::to_string),
     }
+}
+
+/// The `action_response` frame a replayed action turn re-emits, from the user
+/// row's stored response; `None` for a row without one.
+pub(crate) fn action_response_frame(
+    user_message_id: Uuid,
+    metadata: Option<&serde_json::Value>,
+) -> Option<ProtocolFrame> {
+    crate::prompt::action_response_from_metadata(metadata).map(|response| {
+        ProtocolFrame::ActionResponse {
+            user_message_id,
+            response,
+        }
+    })
 }
 
 /// `metadata.image` marker for a delegated image turn. Always stores the
@@ -2181,6 +2202,10 @@ pub(crate) struct PdeVerdict {
     /// inner_state before injection). `None` on old prompts / null verdicts.
     #[serde(default)]
     clothing: Option<String>,
+    /// Judge-decided response to this turn's user action (spec 2026-10-05
+    /// §4.2). `None` = no action, or the judge abstained → accept.
+    #[serde(default)]
+    action_response: Option<eros_engine_core::types::ActionResponse>,
 }
 
 /// Parse the judge reply: direct JSON first, then a balanced JSON block in prose
@@ -2283,7 +2308,7 @@ fn pde_response_format() -> serde_json::Value {
             "schema": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["action", "inner_state", "reply_mode", "reason", "image_ref", "aspect_ratio", "clothing"],
+                "required": ["action", "inner_state", "reply_mode", "reason", "image_ref", "aspect_ratio", "clothing", "action_response"],
                 "properties": {
                     "action": { "type": "string",
                         "enum": ["reply_text", "ghost", "reply_image", "reply_text_image", "product_qa"] },
@@ -2294,7 +2319,9 @@ fn pde_response_format() -> serde_json::Value {
                     "image_ref": { "type": "string", "enum": ["face", "previous"] },
                     "aspect_ratio": { "type": ["string", "null"],
                         "enum": ["1:1", "3:4", "4:3", "9:16", "16:9", null] },
-                    "clothing": { "type": ["string", "null"] }
+                    "clothing": { "type": ["string", "null"] },
+                    "action_response": { "type": ["string", "null"],
+                        "enum": ["accept", "refuse", null] }
                 }
             }
         }
@@ -2469,8 +2496,13 @@ fn guard_action(
     signals: &eros_engine_core::types::ConversationSignals,
     image_executor_available: bool,
     product_qa_available: bool,
+    // An action turn always gets an in-character answer (spec 2026-10-05 §4.4):
+    // a refusal is played in the reply, never by going silent or stepping out
+    // of character.
+    action_turn: bool,
 ) -> ActionType {
     match proposed {
+        PdeAction::Ghost | PdeAction::ProductQa if action_turn => ActionType::ReplyText,
         PdeAction::Ghost => {
             let gs = eros_engine_core::ghost::GhostSignals {
                 message_count: signals.message_count,
@@ -2512,6 +2544,7 @@ fn apply_ghosting_killswitch(
             None,
             None,
             eros_engine_core::types::ImageRef::Face,
+            None,
             None,
         )
     } else {
@@ -2648,6 +2681,13 @@ fn build_pde_ctx(
             format!("[产品咨询] 本轮可答产品问题=是\n[最近产品咨询]\n{recent}\n")
         }
     };
+    // The action the judge decides on (spec 2026-10-05 §4.2); absent otherwise.
+    let action_line = match &input.event {
+        eros_engine_core::types::Event::UserMessage {
+            action: Some(a), ..
+        } => format!("[用户动作] {}\n", crate::prompt::action_subject(a)),
+        _ => String::new(),
+    };
     format!(
         "{persona_block}[最近对话]\n{transcript}\n\n\
          [亲密度] 当前档位=第 {rung} 档\n\
@@ -2655,7 +2695,7 @@ fn build_pde_ctx(
          [信号] message_count={} hours_since_last_message={:.1} ghost_streak={} hours_since_last_ghost={}\n\
          [图片能力] 本轮可发图={image_flag}\n\
          [近期图片] 最近{INPUT_FILTER_CONTEXT_TURNS}条消息内已发图={img_count} 张；上一条 AI 消息是图片={last_img}（以本行计数为准，对话记录里的图片标记仅供参考）\n\
-         {product_qa_section}\n\
+         {product_qa_section}{action_line}\n\
          [用户最新消息]\n{latest}",
         s.message_count,
         s.hours_since_last_message,
@@ -2711,6 +2751,10 @@ struct VerdictAudit<'a> {
     aspect_ratio: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     clothing: Option<&'a str>,
+    /// The judge's own answer; absent when it gave none. On an action turn
+    /// the response in effect lives on the user row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action_response: Option<&'static str>,
 }
 
 impl<'a> VerdictAudit<'a> {
@@ -2734,6 +2778,7 @@ impl<'a> VerdictAudit<'a> {
             },
             aspect_ratio: v.aspect_ratio.as_deref(),
             clothing: v.clothing.as_deref(),
+            action_response: v.action_response.map(|r| r.as_str()),
         }
     }
 }
@@ -3028,7 +3073,13 @@ impl JudgeTranscriptAcc {
     /// is simply overwritten and ends up reflecting the newest assistant row.
     fn push(&mut self, role: &str, content: &str, metadata: Option<&serde_json::Value>) {
         let (label, text): (&str, String) = match role {
-            "user" | "gift_user" => ("用户", content.to_string()),
+            "user" | "gift_user" => (
+                "用户",
+                crate::prompt::user_text_with_action(
+                    crate::prompt::action_from_metadata(metadata).as_ref(),
+                    content,
+                ),
+            ),
             "assistant" => {
                 let is_image = metadata.and_then(|m| m.get("image")).is_some();
                 if is_image {
@@ -4084,6 +4135,27 @@ pub struct PersistedUserMessage {
     /// The user's locale as the request carried it, resolved
     /// (spec 2026-09-26 §4.1). Feeds `[now]`.
     pub user_locale: crate::holiday::UserLocale,
+    /// The action this turn carries besides the text (spec 2026-10-05).
+    pub action: Option<eros_engine_core::types::UserAction>,
+}
+
+impl PersistedUserMessage {
+    /// The turn as the decision and post-process see it. One construction for
+    /// every caller, so a field added to the turn reaches all of them.
+    pub(crate) fn to_event(&self) -> Event {
+        Event::UserMessage {
+            content: self.content.clone(),
+            message_id: self.user_message_id,
+            prompt_traits: self.prompt_traits.clone(),
+            audit: self.audit.clone(),
+            tier: self.tier.clone(),
+            memory_scope: self.memory_scope,
+            affinity_scope: self.affinity_scope,
+            tips_amount_usd: self.tips_amount_usd,
+            quote: self.quote.clone(),
+            action: self.action.clone(),
+        }
+    }
 }
 
 /// Produce a stream of `ProtocolFrame` events for a single burst. The
@@ -4162,17 +4234,7 @@ pub fn run_stream(
         };
 
         let input = DecisionInput {
-            event: Event::UserMessage {
-                content: user_msg.content.clone(),
-                message_id: user_msg.user_message_id,
-                prompt_traits: user_msg.prompt_traits.clone(),
-                audit: user_msg.audit.clone(),
-                tier: user_msg.tier.clone(),
-                memory_scope: user_msg.memory_scope,
-                affinity_scope: user_msg.affinity_scope,
-                tips_amount_usd: user_msg.tips_amount_usd,
-                quote: user_msg.quote.clone(),
-            },
+            event: user_msg.to_event(),
             affinity: affinity.clone(),
             persona,
             signals,
@@ -4182,6 +4244,7 @@ pub fn run_stream(
         // short-circuits all of them. Tip turns and feature-off skip the judge
         // (rule engine). Fail-open: any non-Ok status falls back to pde::decide.
         let is_tip = user_msg.tips_amount_usd.is_some();
+        let action_turn = user_msg.action.is_some();
         // Delegate-only: the chat stream never draws, so image-action
         // availability keys on the PRESENCE of the request `image` block (the
         // consumer signalling "I handle images this turn"). The engine holds
@@ -4279,6 +4342,7 @@ pub fn run_stream(
                                 &input.signals,
                                 image_executor_available,
                                 product_qa_available,
+                                action_turn,
                             );
                             let hints = {
                                 let s = sanitize_inner_state(&v.inner_state);
@@ -4303,7 +4367,7 @@ pub fn run_stream(
                                 eros_engine_core::types::ImageRef::Face
                             };
                             let img_aspect = if is_image { v.aspect_ratio.clone() } else { None };
-                            pde::plan_for(&input, action, hints, v.reply_mode, clothing, img_ref, img_aspect)
+                            pde::plan_for(&input, action, hints, v.reply_mode, clothing, img_ref, img_aspect, v.action_response)
                         }
                         _ => pde::decide(&input), // fail-open
                     };
@@ -4337,6 +4401,7 @@ pub fn run_stream(
                 plan.clothing.clone(),
                 eros_engine_core::types::ImageRef::Face,
                 None,
+                plan.action_response,
             );
         }
 
@@ -4349,15 +4414,17 @@ pub fn run_stream(
             Event::UserMessage { affinity_scope, .. } => *affinity_scope,
             _ => eros_engine_core::scope::AffinityScope::default(),
         };
-        if plan.reply_mode.is_none() && plan.action_type.bears_text() {
+        // An action turn rolls no dice: the action already fixes what the turn
+        // is about (spec 2026-10-05 §5.2).
+        let roll = plan.reply_mode.is_none() && plan.action_type.bears_text() && !action_turn;
+        if roll {
             plan.nudges = crate::prompt::roll_nudges(
                 Some(&input.affinity),
                 affinity_scope,
                 &mut rand::thread_rng(),
             );
         }
-        let audited_nudges = (plan.reply_mode.is_none() && plan.action_type.bears_text())
-            .then_some(plan.nudges);
+        let audited_nudges = roll.then_some(plan.nudges);
 
         // The judge is one of spec §6.1's five chains, so its failed hops must
         // reach this turn's `final` frame as well as its own audit row. Hoisted
@@ -4409,6 +4476,22 @@ pub fn run_stream(
                     tracing::warn!("pde: decision-event audit write failed: {e}");
                 }
             });
+        }
+
+        // The response in effect for this turn's action (spec 2026-10-05
+        // §4.5): persisted first so a replay can rebuild the frame, then sent
+        // ahead of the reply. A failed write costs the replay only.
+        if let Some(response) = plan.action_response {
+            if let Err(e) = chat_repo
+                .set_action_response(user_msg.user_message_id, response)
+                .await
+            {
+                tracing::warn!("stream: action response write failed: {e}");
+            }
+            yield ProtocolFrame::ActionResponse {
+                user_message_id: user_msg.user_message_id,
+                response,
+            };
         }
 
         match plan.action_type {
@@ -4862,7 +4945,7 @@ pub fn run_stream(
                         &plan,
                         req_image,
                         &pde_transcript.transcript,
-                        &user_msg.content,
+                        &crate::prompt::composer_user_text(user_msg.action.as_ref(), plan.action_response, &user_msg.content),
                         user_msg.user_id,
                         user_msg.session_id,
                     )
@@ -4962,17 +5045,7 @@ pub fn run_stream(
                     let state_bg = (*state).clone();
                     let mut plan_bg = plan.clone();
                     plan_bg.image_caption = image_only_caption;
-                    let event_bg = Event::UserMessage {
-                        content: user_msg.content.clone(),
-                        message_id: user_msg.user_message_id,
-                        prompt_traits: user_msg.prompt_traits.clone(),
-                        audit: user_msg.audit.clone(),
-                        tier: user_msg.tier.clone(),
-                        memory_scope: user_msg.memory_scope,
-                        affinity_scope: user_msg.affinity_scope,
-                        tips_amount_usd: user_msg.tips_amount_usd,
-                        quote: user_msg.quote.clone(),
-                    };
+                    let event_bg = user_msg.to_event();
                     let user_id_bg = user_msg.user_id;
                     let instance_id_bg = user_msg.instance_id;
                     let session_id_bg = user_msg.session_id;
@@ -5124,7 +5197,11 @@ pub fn run_stream(
                 // input filter is one of spec §6.1's non-fatal chains.
                 let mut input_filter_failures: Vec<eros_engine_llm::failure::AttemptFailure> =
                     Vec::new();
-                if user_msg.tips_amount_usd.is_none() {
+                // Skipped on tips, and on an action turn with no text: there is
+                // nothing to rewrite (spec 2026-10-05 §5.3).
+                if user_msg.tips_amount_usd.is_none()
+                    && !(user_msg.action.is_some() && user_msg.content.trim().is_empty())
+                {
                     // Per-turn probability gate: `input_filter = 0.8` ⇒ fire on
                     // ~80% of turns; `true` ⇒ probability 1.0 ⇒ always (gen::<f64>()
                     // is in [0,1), so `< 1.0` always fires); `false` ⇒ resolve
@@ -5217,7 +5294,11 @@ pub fn run_stream(
                         let plan_c = plan.clone();
                         let req_image_c = req_image.cloned();
                         let scene_c = pde_transcript.transcript.clone();
-                        let latest_c = effective_user_msg.clone();
+                        let latest_c = crate::prompt::composer_user_text(
+                            user_msg.action.as_ref(),
+                            plan.action_response,
+                            &effective_user_msg,
+                        );
                         let user_id_c = user_msg.user_id;
                         let session_id_c = user_msg.session_id;
                         AbortOnDrop(Some(tokio::spawn(async move {
@@ -5396,7 +5477,7 @@ pub fn run_stream(
                                     &plan,
                                     req_image,
                                     &pde_transcript.transcript,
-                                    &effective_user_msg,
+                                    &crate::prompt::composer_user_text(user_msg.action.as_ref(), plan.action_response, &effective_user_msg),
                                     user_msg.user_id,
                                     user_msg.session_id,
                                 )
@@ -5409,7 +5490,7 @@ pub fn run_stream(
                                     &plan,
                                     req_image,
                                     &pde_transcript.transcript,
-                                    &effective_user_msg,
+                                    &crate::prompt::composer_user_text(user_msg.action.as_ref(), plan.action_response, &effective_user_msg),
                                     user_msg.user_id,
                                     user_msg.session_id,
                                 )
@@ -5482,17 +5563,7 @@ pub fn run_stream(
                     plan_bg.action_type = ActionType::ReplyText;
                 }
                 plan_bg.image_caption = image_caption;
-                let event_bg = Event::UserMessage {
-                    content: user_msg.content.clone(),
-                    message_id: user_msg.user_message_id,
-                    prompt_traits: user_msg.prompt_traits.clone(),
-                    audit: user_msg.audit.clone(),
-                    tier: user_msg.tier.clone(),
-                    memory_scope: user_msg.memory_scope,
-                    affinity_scope: user_msg.affinity_scope,
-                    tips_amount_usd: user_msg.tips_amount_usd,
-                    quote: user_msg.quote.clone(),
-                };
+                let event_bg = user_msg.to_event();
                 let user_id_bg = user_msg.user_id;
                 let instance_id_bg = user_msg.instance_id;
                 let session_id_bg = user_msg.session_id;
@@ -6000,6 +6071,7 @@ mod tests {
             image_caption: None,
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: aspect.map(str::to_string),
+            action_response: None,
         }
     }
 
@@ -6886,6 +6958,7 @@ mod tests {
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 quote: Default::default(),
+                action: None,
             },
             affinity: pde_test_affinity(),
             persona: pde_test_persona(),
@@ -6919,25 +6992,53 @@ mod tests {
         };
         // ghost honoured when permitted
         assert_eq!(
-            guard_action(PdeAction::Ghost, &a, &sigs(50, Some(5.0)), false, false),
+            guard_action(
+                PdeAction::Ghost,
+                &a,
+                &sigs(50, Some(5.0)),
+                false,
+                false,
+                false
+            ),
             ActionType::Ghost
         );
         // ghost vetoed by new-relationship floor
         assert_eq!(
-            guard_action(PdeAction::Ghost, &a, &sigs(3, None), false, false),
+            guard_action(PdeAction::Ghost, &a, &sigs(3, None), false, false, false),
             ActionType::ReplyText
         );
         // image actions degrade to text when no executor chain
         assert_eq!(
-            guard_action(PdeAction::ReplyImage, &a, &sigs(50, None), false, false),
+            guard_action(
+                PdeAction::ReplyImage,
+                &a,
+                &sigs(50, None),
+                false,
+                false,
+                false
+            ),
             ActionType::ReplyText
         );
         assert_eq!(
-            guard_action(PdeAction::ReplyTextImage, &a, &sigs(50, None), false, false),
+            guard_action(
+                PdeAction::ReplyTextImage,
+                &a,
+                &sigs(50, None),
+                false,
+                false,
+                false
+            ),
             ActionType::ReplyText
         );
         assert_eq!(
-            guard_action(PdeAction::ReplyText, &a, &sigs(50, None), false, false),
+            guard_action(
+                PdeAction::ReplyText,
+                &a,
+                &sigs(50, None),
+                false,
+                false,
+                false
+            ),
             ActionType::ReplyText
         );
     }
@@ -6947,20 +7048,20 @@ mod tests {
         let aff = test_affinity();
         let sig = test_signals();
         assert_eq!(
-            guard_action(PdeAction::ReplyImage, &aff, &sig, true, false),
+            guard_action(PdeAction::ReplyImage, &aff, &sig, true, false, false),
             ActionType::ReplyImage
         );
         assert_eq!(
-            guard_action(PdeAction::ReplyTextImage, &aff, &sig, true, false),
+            guard_action(PdeAction::ReplyTextImage, &aff, &sig, true, false, false),
             ActionType::ReplyTextImage
         );
         // executor unavailable → degrade (today's behaviour)
         assert_eq!(
-            guard_action(PdeAction::ReplyImage, &aff, &sig, false, false),
+            guard_action(PdeAction::ReplyImage, &aff, &sig, false, false, false),
             ActionType::ReplyText
         );
         assert_eq!(
-            guard_action(PdeAction::ReplyTextImage, &aff, &sig, false, false),
+            guard_action(PdeAction::ReplyTextImage, &aff, &sig, false, false, false),
             ActionType::ReplyText
         );
     }
@@ -6997,11 +7098,11 @@ mod tests {
         let a = pde_test_affinity();
         let s = sigs(50, None);
         assert_eq!(
-            guard_action(PdeAction::ProductQa, &a, &s, false, true),
+            guard_action(PdeAction::ProductQa, &a, &s, false, true, false),
             ActionType::ProductQa
         );
         assert_eq!(
-            guard_action(PdeAction::ProductQa, &a, &s, false, false),
+            guard_action(PdeAction::ProductQa, &a, &s, false, false, false),
             ActionType::ReplyText
         );
     }
@@ -7016,6 +7117,7 @@ mod tests {
             None,
             None,
             eros_engine_core::types::ImageRef::Face,
+            None,
             None,
         );
         // ghosting enabled → unchanged
@@ -7036,6 +7138,7 @@ mod tests {
             &input.signals,
             false,
             false,
+            false,
         );
         assert_eq!(acted, ActionType::Ghost); // permitted
 
@@ -7047,6 +7150,7 @@ mod tests {
             None,
             None,
             eros_engine_core::types::ImageRef::Face,
+            None,
             None,
         );
         // ghosting disabled → suppressed to reply, hints preserved
@@ -7134,6 +7238,7 @@ mod tests {
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -7505,6 +7610,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -7604,6 +7710,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -7742,6 +7849,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -7888,6 +7996,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -8000,6 +8109,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -8103,6 +8213,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -8216,6 +8327,7 @@ data: [DONE]\n\n";
                 }),
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -8400,6 +8512,7 @@ data: [DONE]\n\n";
                 }),
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -8504,6 +8617,7 @@ data: [DONE]\n\n";
                 }),
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -8524,6 +8638,100 @@ data: [DONE]\n\n";
         assert!(
             !payload.contains("[最近场景]\n（无）"),
             "the scene must not be empty when history exists: {payload}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn forced_image_on_an_action_turn_tells_the_composer_the_outcome(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        // Composer configured, judge NOT — `resolve_pde()` is None, so before
+        // the fix the transcript was never fetched on this path.
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"primary\"\n\
+                 [tasks.chat_image_prompt_compose]\nmodel = \"composer\"\nfilter_prompt = \"COMPOSE\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "",
+                "01JACTION0000000000000000B",
+                "user",
+                Some(&serde_json::json!({"action": {"type": "kiss"}})),
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let _frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: String::new(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: Some(crate::routes::companion_stream::ImageReplyParams {
+                    force: true,
+                    ..Default::default()
+                }),
+                quote: Default::default(),
+                user_locale: Default::default(),
+                action: Some(eros_engine_core::types::UserAction::Kiss),
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        let reqs = mock.received_requests().await.expect("recorded requests");
+        assert_eq!(reqs.len(), 1, "the composer is the only provider call");
+        let body: serde_json::Value =
+            serde_json::from_slice(&reqs[0].body).expect("composer request body is json");
+        let payload = body["messages"][1]["content"]
+            .as_str()
+            .expect("composer user payload");
+        assert!(
+            payload.contains("（凑过来想亲你）"),
+            "the composer must see the action marker: {payload}"
+        );
+        assert!(
+            payload.contains("你接受了"),
+            "no judge means the action is accepted, and the composer must be told: {payload}"
         );
     }
 
@@ -9004,6 +9212,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -9131,6 +9340,7 @@ data: [DONE]\n\n";
                 }),
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -9257,6 +9467,7 @@ data: [DONE]\n\n";
                 image: Some(crate::routes::companion_stream::ImageReplyParams::default()),
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -9440,6 +9651,7 @@ data: [DONE]\n\n";
                 image: Some(crate::routes::companion_stream::ImageReplyParams::default()),
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -9575,6 +9787,7 @@ data: [DONE]\n\n";
                 image: Some(crate::routes::companion_stream::ImageReplyParams::default()),
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -9745,6 +9958,7 @@ data: [DONE]\n\n";
                 image: Some(crate::routes::companion_stream::ImageReplyParams::default()),
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -9929,6 +10143,7 @@ data: [DONE]\n\n";
                 image: Some(crate::routes::companion_stream::ImageReplyParams::default()),
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -10103,6 +10318,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -10925,6 +11141,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -11054,6 +11271,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -11108,6 +11326,7 @@ data: [DONE]\n\n";
                 ProtocolFrame::Final { .. } => "final",
                 ProtocolFrame::Error { .. } => "error",
                 ProtocolFrame::ImageRequest { .. } => "image_request",
+                ProtocolFrame::ActionResponse { .. } => "action_response",
             };
             if out.last() != Some(&kind) {
                 out.push(kind);
@@ -11569,6 +11788,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -11714,6 +11934,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -11882,6 +12103,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -12000,6 +12222,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -12117,6 +12340,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -12214,6 +12438,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -12323,6 +12548,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -12435,6 +12661,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -12565,6 +12792,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -12768,6 +12996,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -12895,6 +13124,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -13019,6 +13249,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -13131,6 +13362,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -13308,6 +13540,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -13510,6 +13743,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -13661,6 +13895,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -13799,6 +14034,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -13959,6 +14195,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -14118,6 +14355,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -14252,6 +14490,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -14383,6 +14622,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -14540,6 +14780,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -14736,6 +14977,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -14882,6 +15124,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -15037,6 +15280,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -15217,6 +15461,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -15449,6 +15694,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -15598,6 +15844,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -15732,6 +15979,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -15908,6 +16156,7 @@ data: [DONE]\n\n";
                     trigger: None,
                 }),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -16027,6 +16276,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -16165,6 +16415,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -16317,6 +16568,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -16554,6 +16806,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -16671,6 +16924,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -16815,6 +17069,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -16911,6 +17166,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -17510,6 +17766,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 quote: Default::default(),
+                action: None,
             },
             affinity: test_affinity(),
             persona: test_persona(),
@@ -17566,6 +17823,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 quote: Default::default(),
+                action: None,
             },
             affinity: test_affinity(),
             persona: p,
@@ -17710,6 +17968,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 quote: Default::default(),
+                action: None,
             },
             affinity: test_affinity(),
             persona: p,
@@ -17757,13 +18016,106 @@ data: [DONE]\n\n";
     // ── Task-4 PDE schema + chain-walk tests ─────────────────────────────────
 
     #[test]
+    fn pde_verdict_parses_with_and_without_action_response() {
+        let v = parse_pde_verdict(
+            r#"{"action":"reply_text","inner_state":"x","action_response":"refuse"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            v.action_response,
+            Some(eros_engine_core::types::ActionResponse::Refuse)
+        );
+        let old = parse_pde_verdict(r#"{"action":"reply_text","inner_state":"x"}"#).unwrap();
+        assert_eq!(old.action_response, None);
+        let null = parse_pde_verdict(
+            r#"{"action":"reply_text","inner_state":"x","action_response":null}"#,
+        )
+        .unwrap();
+        assert_eq!(null.action_response, None);
+    }
+
+    #[test]
+    fn pde_response_format_requires_a_nullable_action_response() {
+        let f = pde_response_format();
+        let schema = &f["json_schema"]["schema"];
+        assert!(schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|k| k == "action_response"));
+        assert_eq!(
+            schema["properties"]["action_response"],
+            serde_json::json!({"type": ["string", "null"], "enum": ["accept", "refuse", null]})
+        );
+    }
+
+    #[test]
+    fn guard_action_on_an_action_turn_never_ghosts_or_answers_product_qa() {
+        // Same affinity and signals guard_action_degrades_and_honours uses to
+        // show a ghost being honoured.
+        let a = eros_engine_core::affinity::Affinity {
+            ghost_streak: 0,
+            ..pde_test_affinity()
+        };
+        let sig = sigs(50, Some(5.0));
+        assert_eq!(
+            guard_action(PdeAction::Ghost, &a, &sig, false, true, false),
+            ActionType::Ghost,
+            "control: the same signals do permit a ghost on a plain turn"
+        );
+        assert_eq!(
+            guard_action(PdeAction::Ghost, &a, &sig, false, true, true),
+            ActionType::ReplyText
+        );
+        assert_eq!(
+            guard_action(PdeAction::ProductQa, &a, &sig, false, true, true),
+            ActionType::ReplyText
+        );
+        assert_eq!(
+            guard_action(PdeAction::ReplyTextImage, &a, &sig, true, true, true),
+            ActionType::ReplyTextImage,
+            "images stay available on an action turn"
+        );
+    }
+
+    #[test]
+    fn build_pde_ctx_states_the_action_line_only_on_action_turns() {
+        let t = JudgeTranscript::default();
+        let mut input = fixture_decision_input();
+        let plain = build_pde_ctx(&t, &input, false, None);
+        assert!(!plain.contains("[用户动作]"), "{plain}");
+        if let Event::UserMessage { action, .. } = &mut input.event {
+            *action = Some(eros_engine_core::types::UserAction::Kiss);
+        }
+        let ctx = build_pde_ctx(&t, &input, false, None);
+        assert!(ctx.contains("[用户动作] 对方凑过来想亲你\n"), "{ctx}");
+        assert!(
+            ctx.find("[用户动作]").unwrap() < ctx.find("[用户最新消息]").unwrap(),
+            "the action line precedes the latest message: {ctx}"
+        );
+    }
+
+    #[test]
+    fn verdict_audit_records_the_raw_action_response() {
+        let v = parse_pde_verdict(
+            r#"{"action":"reply_text","inner_state":"x","action_response":"refuse"}"#,
+        )
+        .unwrap();
+        let audit = serde_json::to_value(VerdictAudit::new(&v, None, None)).unwrap();
+        assert_eq!(audit["action_response"], "refuse");
+        let abstained = parse_pde_verdict(r#"{"action":"reply_text","inner_state":"x"}"#).unwrap();
+        let audit = serde_json::to_value(VerdictAudit::new(&abstained, None, None)).unwrap();
+        assert!(audit.get("action_response").is_none(), "{audit}");
+    }
+
+    #[test]
     fn pde_response_format_schema_shape() {
         let v = pde_response_format();
         assert_eq!(v["type"], "json_schema");
         assert_eq!(v["json_schema"]["name"], "pde_verdict");
         assert_eq!(v["json_schema"]["strict"], true);
         let req = v["json_schema"]["schema"]["required"].as_array().unwrap();
-        assert_eq!(req.len(), 7, "all seven properties required: {v}");
+        assert_eq!(req.len(), 8, "all eight properties required: {v}");
         assert!(
             req.iter().any(|x| x == "image_ref"),
             "image_ref required: {v}"
@@ -18151,6 +18503,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -19659,6 +20012,7 @@ data: [DONE]\n\n"
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                action: None,
             },
             None,
         )
@@ -19780,5 +20134,284 @@ data: [DONE]\n\n"
             None,
         );
         assert!(without.get("edit_of").is_none(), "got {without}");
+    }
+
+    #[test]
+    fn to_event_carries_the_action() {
+        let msg = PersistedUserMessage {
+            user_message_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            instance_id: Uuid::new_v4(),
+            content: "来".into(),
+            prompt_traits: vec![],
+            audit: None,
+            tier: Some("gold".into()),
+            memory_scope: Default::default(),
+            affinity_scope: Default::default(),
+            tips_amount_usd: None,
+            image_url: None,
+            image: None,
+            quote: Default::default(),
+            user_locale: Default::default(),
+            action: Some(eros_engine_core::types::UserAction::Kiss),
+        };
+        match msg.to_event() {
+            Event::UserMessage {
+                action,
+                content,
+                message_id,
+                tier,
+                ..
+            } => {
+                assert_eq!(action, Some(eros_engine_core::types::UserAction::Kiss));
+                assert_eq!(content, "来");
+                assert_eq!(message_id, msg.user_message_id);
+                assert_eq!(tier.as_deref(), Some("gold"));
+            }
+            other => panic!("expected UserMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn action_response_frame_serializes_and_reads_the_stored_response() {
+        let id = Uuid::new_v4();
+        let meta = serde_json::json!({"action": {"type": "kiss", "response": "refuse"}});
+        let frame = action_response_frame(id, Some(&meta)).expect("a decided action replays");
+        assert_eq!(
+            serde_json::to_value(&frame).unwrap(),
+            serde_json::json!({"type": "action_response", "user_message_id": id.to_string(), "response": "refuse"})
+        );
+        let undecided = serde_json::json!({"action": {"type": "kiss"}});
+        assert!(action_response_frame(id, Some(&undecided)).is_none());
+        assert!(action_response_frame(id, None).is_none());
+    }
+
+    #[test]
+    fn judge_transcript_shows_a_past_action() {
+        let mut acc = JudgeTranscriptAcc::default();
+        let meta = serde_json::json!({"action": {"type": "kiss", "response": "refuse"}});
+        acc.push("user", "", Some(&meta));
+        acc.push(
+            "user",
+            "抱抱",
+            Some(&serde_json::json!({"action": {"type": "hug"}})),
+        );
+        let t = acc.finish().transcript;
+        assert!(
+            t.starts_with("用户: （凑过来想亲你）\n用户: （想抱你）抱抱"),
+            "{t}"
+        );
+    }
+
+    /// Mock judge returning `verdict` (or HTTP `judge_status` when non-200), a
+    /// chat model answering "REPLY", and an action turn (`kiss`, empty
+    /// content) persisted with `metadata.action`. Returns the frames, the
+    /// mock (for request inspection) and the user message id.
+    async fn run_action_turn(
+        pool: &PgPool,
+        verdict: serde_json::Value,
+        judge_status: u16,
+    ) -> (Vec<ProtocolFrame>, wiremock::MockServer, Uuid) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let judge_body = serde_json::json!({
+            "id": "gj", "model": "pde/judge",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": verdict.to_string()}}],
+        });
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("pde/judge"))
+            .respond_with(ResponseTemplate::new(judge_status).set_body_json(judge_body))
+            .mount(&mock)
+            .await;
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"REPLY\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"deepseek/x\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide.\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let meta = serde_json::json!({"action": {"type": "kiss"}});
+        let umid = match (ChatRepo { pool })
+            .upsert_user_message_idempotent(
+                session_id,
+                "",
+                "01JACTION00000000000000000",
+                "user",
+                Some(&meta),
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: String::new(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: None,
+                quote: Default::default(),
+                user_locale: Default::default(),
+                action: Some(eros_engine_core::types::UserAction::Kiss),
+            },
+            None,
+        )
+        .collect()
+        .await;
+        (frames, mock, umid)
+    }
+
+    fn chat_request_body(reqs: &[wiremock::Request]) -> String {
+        let r = reqs
+            .iter()
+            .find(|r| String::from_utf8_lossy(&r.body).contains("deepseek/x"))
+            .expect("the chat call must have fired");
+        String::from_utf8_lossy(&r.body).into_owned()
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn refused_action_frames_persists_and_prompts(pool: PgPool) {
+        let (frames, mock, umid) = run_action_turn(
+            &pool,
+            serde_json::json!({"action": "reply_text", "inner_state": "", "action_response": "refuse"}),
+            200,
+        )
+        .await;
+        let ar = frames
+            .iter()
+            .position(|f| matches!(f, ProtocolFrame::ActionResponse { .. }))
+            .expect("an action turn emits action_response");
+        let meta = frames
+            .iter()
+            .position(|f| matches!(f, ProtocolFrame::Meta { .. }))
+            .expect("the reply streams");
+        assert!(
+            ar < meta,
+            "action_response precedes the first meta: {frames:?}"
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|f| matches!(f, ProtocolFrame::ActionResponse { .. }))
+                .count(),
+            1
+        );
+        assert!(matches!(
+            &frames[ar],
+            ProtocolFrame::ActionResponse { response: eros_engine_core::types::ActionResponse::Refuse, user_message_id } if *user_message_id == umid
+        ));
+
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT metadata->'action'->>'response' FROM engine.chat_messages WHERE id = $1",
+        )
+        .bind(umid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored.as_deref(), Some("refuse"));
+
+        let body = chat_request_body(&mock.received_requests().await.unwrap());
+        assert!(body.contains("[user_action]"), "{body}");
+        assert!(
+            body.contains("对方凑过来想亲你，你没有接受。用你自己的话回应。"),
+            "{body}"
+        );
+        assert!(
+            body.contains("（凑过来想亲你）"),
+            "the history marker reaches the model: {body}"
+        );
+        assert!(
+            !body.contains("[this_turn]"),
+            "no dice on an action turn: {body}"
+        );
+
+        // The audit row is written by a spawned task; poll for it.
+        let mut payload = None;
+        for _ in 0..40 {
+            payload = sqlx::query_scalar::<_, serde_json::Value>(
+                "SELECT payload FROM engine.companion_decision_events WHERE message_id = $1",
+            )
+            .bind(umid)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+            if payload.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let payload = payload.expect("the decision audit row lands");
+        assert_eq!(payload["action_response"], "refuse");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn ghost_verdict_on_an_action_turn_still_replies_and_accepts(pool: PgPool) {
+        let (frames, _mock, umid) = run_action_turn(
+            &pool,
+            serde_json::json!({"action": "ghost", "inner_state": ""}),
+            200,
+        )
+        .await;
+        assert!(
+            frames.iter().any(
+                |f| matches!(f, ProtocolFrame::Delta { content, .. } if content.contains("REPLY"))
+            ),
+            "{frames:?}"
+        );
+        assert!(frames.iter().any(|f| matches!(
+            f,
+            ProtocolFrame::ActionResponse { response: eros_engine_core::types::ActionResponse::Accept, user_message_id } if *user_message_id == umid
+        )));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn failed_judge_on_an_action_turn_falls_back_to_accept(pool: PgPool) {
+        let (frames, mock, _umid) = run_action_turn(&pool, serde_json::json!({}), 500).await;
+        assert!(frames.iter().any(|f| matches!(
+            f,
+            ProtocolFrame::ActionResponse {
+                response: eros_engine_core::types::ActionResponse::Accept,
+                ..
+            }
+        )));
+        let body = chat_request_body(&mock.received_requests().await.unwrap());
+        assert!(body.contains("对方凑过来想亲你，你接受了。"), "{body}");
     }
 }

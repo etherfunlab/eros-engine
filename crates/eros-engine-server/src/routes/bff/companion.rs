@@ -80,6 +80,9 @@ pub struct BffHistoryEntry {
     /// newest user row is the one. Omitted on user rows themselves.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_message_id: Option<Uuid>,
+    /// The action a user row carried and, once decided, the persona's response. Omitted on rows without an action.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<crate::routes::companion_stream::UserActionView>,
 }
 
 /// Parse the raw `metadata->>'reply_to_message_id'` text the slim projection
@@ -191,22 +194,25 @@ async fn bff_get_history(
         .history_slim(session_id, limit, offset)
         .await?;
 
-    let messages: Vec<BffHistoryEntry> = rows
-        .into_iter()
-        .map(|r| BffHistoryEntry {
-            id: r.id,
-            client_msg_id: r.client_msg_id,
-            role: r.role,
-            content: r.content,
-            sent_at: r.sent_at,
-            tips_amount_usd: parse_tip(r.tips_amount_usd),
-            channel: r.channel,
-            read_at: r.read_at,
-            image: r.image,
-            reply_to_message_id: parse_anchor(r.reply_to_message_id),
-            user_message_id: r.user_message_id,
-        })
-        .collect();
+    let messages: Vec<BffHistoryEntry> =
+        rows.into_iter()
+            .map(|r| BffHistoryEntry {
+                id: r.id,
+                client_msg_id: r.client_msg_id,
+                role: r.role,
+                content: r.content,
+                sent_at: r.sent_at,
+                tips_amount_usd: parse_tip(r.tips_amount_usd),
+                channel: r.channel,
+                read_at: r.read_at,
+                image: r.image,
+                reply_to_message_id: parse_anchor(r.reply_to_message_id),
+                user_message_id: r.user_message_id,
+                action: r.action.as_ref().and_then(
+                    crate::routes::companion_stream::UserActionView::from_metadata_action,
+                ),
+            })
+            .collect();
     let total = messages.len();
 
     Ok(Json(BffHistoryResponse {
@@ -266,6 +272,9 @@ async fn bff_start_chat(
                 image: r.image,
                 reply_to_message_id: parse_anchor(r.reply_to_message_id),
                 user_message_id: r.user_message_id,
+                action: r.action.as_ref().and_then(
+                    crate::routes::companion_stream::UserActionView::from_metadata_action,
+                ),
             })
             .collect()
     };
@@ -1245,5 +1254,28 @@ mod tests {
             unread.get("read_at").is_none(),
             "an unread row omits the key rather than sending null; got {unread}"
         );
+    }
+
+    #[test]
+    fn user_action_view_parses_stored_actions_and_drops_garbage() {
+        use crate::routes::companion_stream::UserActionView;
+        let v = UserActionView::from_metadata_action(&serde_json::json!(
+            {"type": "give", "item": "alcohol", "name": "威士忌", "quantity": 2, "response": "refuse"}
+        ))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&v).unwrap(),
+            serde_json::json!({"type": "give", "item": "alcohol", "name": "威士忌", "quantity": 2, "response": "refuse"})
+        );
+        let undecided =
+            UserActionView::from_metadata_action(&serde_json::json!({"type": "kiss"})).unwrap();
+        assert_eq!(
+            serde_json::to_value(&undecided).unwrap(),
+            serde_json::json!({"type": "kiss"})
+        );
+        assert!(
+            UserActionView::from_metadata_action(&serde_json::json!({"type": "bogus"})).is_none()
+        );
+        assert!(UserActionView::from_metadata_action(&serde_json::json!("kiss")).is_none());
     }
 }

@@ -99,14 +99,23 @@ pub async fn run(
         return;
     }
 
-    let (user_msg, user_message_id) = match &event {
+    // The marker rides the user text into every consumer below — the affinity
+    // judge, memory, insights — so an action-only turn is never empty to them
+    // (spec 2026-10-05 §5.3).
+    let (user_msg, user_message_id, action_turn) = match &event {
         Event::UserMessage {
             content,
             message_id,
+            action,
             ..
-        } => (content.clone(), Some(*message_id)),
-        _ => (String::new(), None),
+        } => (
+            crate::prompt::user_text_with_action(action.as_ref(), content),
+            Some(*message_id),
+            action.is_some(),
+        ),
+        _ => (String::new(), None, false),
     };
+    let tier_drop = tier_drop_for(&event, &plan);
     // As of 4.0 the request's affinity scope is read-side (prompt injection
     // gating) AND consumed here by the feeling-clause summarizer, which only
     // narrates axes the request actually asked for.
@@ -171,6 +180,8 @@ pub async fn run(
             affinity_scope,
             user_message_id,
             client_id.as_deref(),
+            action_turn,
+            tier_drop,
         )
         .await;
     };
@@ -238,6 +249,8 @@ pub(crate) async fn run_affinity_turn(
     affinity_scope: eros_engine_core::scope::AffinityScope,
     user_message_id: Option<Uuid>,
     client_id: Option<&str>,
+    action_turn: bool,
+    tier_drop: Option<eros_engine_core::affinity::AffinityLine>,
 ) {
     // Semantic eval gate: Reply turns only, with a non-trivial user message
     // and a non-empty produced assistant message (or image_caption proxy for
@@ -249,6 +262,7 @@ pub(crate) async fn run_affinity_turn(
         action,
         user_msg.chars().count(),
         eval_text.trim().is_empty(),
+        action_turn,
     );
 
     let (persona_name, (grades, levels, reason, affinity_gen_id, skip_reason, eval_failures)) =
@@ -318,15 +332,17 @@ pub(crate) async fn run_affinity_turn(
         levels,
         &eval_failures,
         user_message_id,
+        tier_drop,
     )
     .await;
 
-    // Feeling-clause summarizer (spec 2026-09-03): movement turns only,
+    // Feeling-clause summarizer (spec 2026-09-03): movement turns and a
+    // refused action's tier drop only,
     // gated on the [tasks.affinity_summary] section being present at
     // all (absent = feature off, clause stays NULL) and on the request
     // actually injecting affinity (zero-axis scope ⇒ nothing would
     // render the clause).
-    if movement_turn(&grades, &levels)
+    if (movement_turn(&grades, &levels) || tier_drop.is_some())
         && affinity_scope.active_count() > 0
         && state.model_config.tasks.contains_key(SUMMARY_TASK)
     {
@@ -356,6 +372,7 @@ async fn persist_affinity(
     levels: eros_engine_core::affinity::EndpointLevelReads,
     eval_failures: &[eros_engine_llm::failure::AttemptFailure],
     user_message_id: Option<Uuid>,
+    tier_drop: Option<eros_engine_core::affinity::AffinityLine>,
 ) {
     // Recheck: the affinity evaluator's LLM call (or a sibling post_process
     // future) may have run long enough for the archive endpoint to commit
@@ -434,6 +451,7 @@ async fn persist_affinity(
                     llm_attempts,
                     gateway_errors,
                     user_message_id,
+                    tier_drop,
                 )
                 .await
             {
@@ -731,6 +749,7 @@ fn eval_skip_reason(
     action: ActionType,
     user_msg_chars: usize,
     assistant_empty: bool,
+    action_turn: bool,
 ) -> Option<&'static str> {
     match action {
         // Proactive turns keep rule-only deltas in v1 (no semantic eval).
@@ -747,7 +766,9 @@ fn eval_skip_reason(
         // image-send still moves affinity (assistant_empty=false when the caption
         // is set — and the generic photo marker keeps it false even when it isn't).
         ActionType::ReplyText | ActionType::ReplyImage | ActionType::ReplyTextImage => {
-            if user_msg_chars < AFFINITY_EVAL_MIN_CHARS {
+            // An action turn always has something to grade, however short its
+            // text (spec 2026-10-05 §5.3).
+            if user_msg_chars < AFFINITY_EVAL_MIN_CHARS && !action_turn {
                 Some("short_user_msg")
             } else if assistant_empty {
                 Some("empty_assistant")
@@ -755,6 +776,23 @@ fn eval_skip_reason(
                 None
             }
         }
+    }
+}
+
+/// The line a refused action drops this turn (spec 2026-10-05 §6.3); `None`
+/// on every other turn.
+fn tier_drop_for(
+    event: &Event,
+    plan: &ActionPlan,
+) -> Option<eros_engine_core::affinity::AffinityLine> {
+    match (event, plan.action_response) {
+        (
+            Event::UserMessage {
+                action: Some(a), ..
+            },
+            Some(eros_engine_core::types::ActionResponse::Refuse),
+        ) => Some(a.line()),
+        _ => None,
     }
 }
 
@@ -831,7 +869,8 @@ const SUMMARY_REASONS_LIMIT: i64 = 5;
 /// Movement predicate (spec §4): rewrite the feeling clause only on turns
 /// with real affinity movement. Purely ordinal — reads the judge's grades
 /// and levels, never compares floats against band edges. In-turn band
-/// crossings always come with a grade ≥ 1, so nothing is missed; silent
+/// crossings come with a grade ≥ 1, so nothing is missed; the exception is a
+/// refused action's tier drop, which `post_process` ORs in separately. Silent
 /// decay drift between sessions does not re-trigger (accepted lag — the
 /// clause is narrative state, [mood]'s gates keep reading live floats).
 /// Ghost turns never reach `post_process`, and the summarizer's inputs
@@ -2244,6 +2283,7 @@ mod tests {
             affinity_scope: Default::default(),
             tips_amount_usd: None,
             quote: Default::default(),
+            action: None,
         };
         // Only `user` is taken; session_id/metadata are ignored by design.
         assert_eq!(client_id_from_event(&event).as_deref(), Some("u_abc"));
@@ -2261,6 +2301,7 @@ mod tests {
             affinity_scope: Default::default(),
             tips_amount_usd: None,
             quote: Default::default(),
+            action: None,
         };
         assert_eq!(client_id_from_event(&event), None);
     }
@@ -2424,26 +2465,108 @@ mod tests {
     }
 
     #[test]
+    fn eval_skip_reason_never_short_gates_an_action_turn() {
+        assert_eq!(
+            eval_skip_reason(ActionType::ReplyText, 3, false, false),
+            Some("short_user_msg"),
+            "control: a 3-char plain turn is skipped"
+        );
+        assert_eq!(
+            eval_skip_reason(ActionType::ReplyText, 3, false, true),
+            None
+        );
+        assert_eq!(
+            eval_skip_reason(ActionType::ReplyText, 3, true, true),
+            Some("empty_assistant"),
+            "the empty-assistant gate still applies"
+        );
+    }
+
+    #[test]
+    fn tier_drop_for_only_on_a_refused_action() {
+        use eros_engine_core::affinity::AffinityLine;
+        use eros_engine_core::types::{ActionResponse, GiftItem, UserAction};
+        let event = |action: Option<UserAction>| Event::UserMessage {
+            content: String::new(),
+            message_id: Uuid::nil(),
+            prompt_traits: vec![],
+            audit: None,
+            tier: None,
+            memory_scope: Default::default(),
+            affinity_scope: Default::default(),
+            tips_amount_usd: None,
+            quote: None,
+            action,
+        };
+        let plan = |r: Option<ActionResponse>| ActionPlan {
+            action_type: ActionType::ReplyText,
+            reply_style: eros_engine_core::types::ReplyStyle::Neutral,
+            affinity_deltas: Default::default(),
+            energy_cost: 0.0,
+            context_hints: Vec::new(),
+            reply_mode: None,
+            nudges: Default::default(),
+            clothing: None,
+            image_caption: None,
+            image_ref: eros_engine_core::types::ImageRef::Face,
+            aspect_ratio: None,
+            action_response: r,
+        };
+        let give = UserAction::Give {
+            item: GiftItem::Alcohol,
+            name: None,
+            quantity: 1,
+        };
+        assert_eq!(
+            tier_drop_for(
+                &event(Some(give.clone())),
+                &plan(Some(ActionResponse::Refuse))
+            ),
+            Some(AffinityLine::Bond)
+        );
+        assert_eq!(
+            tier_drop_for(
+                &event(Some(UserAction::Kiss)),
+                &plan(Some(ActionResponse::Refuse))
+            ),
+            Some(AffinityLine::Chemistry)
+        );
+        assert_eq!(
+            tier_drop_for(&event(Some(give)), &plan(Some(ActionResponse::Accept))),
+            None
+        );
+        assert_eq!(tier_drop_for(&event(None), &plan(None)), None);
+    }
+
+    #[test]
     fn eval_skip_reason_none_only_for_substantive_text_reply() {
         // The one path that DOES run the eval (→ trio populated).
-        assert_eq!(eval_skip_reason(ActionType::ReplyText, 10, false), None);
+        assert_eq!(
+            eval_skip_reason(ActionType::ReplyText, 10, false, false),
+            None
+        );
     }
 
     #[test]
     fn eval_skip_reason_text_reply_gates() {
         // Short user message (< AFFINITY_EVAL_MIN_CHARS) skips the eval.
         assert_eq!(
-            eval_skip_reason(ActionType::ReplyText, AFFINITY_EVAL_MIN_CHARS - 1, false),
+            eval_skip_reason(
+                ActionType::ReplyText,
+                AFFINITY_EVAL_MIN_CHARS - 1,
+                false,
+                false
+            ),
             Some("short_user_msg")
         );
         // Boundary: exactly the threshold runs.
         assert_eq!(
-            eval_skip_reason(ActionType::ReplyText, AFFINITY_EVAL_MIN_CHARS, false),
+            eval_skip_reason(ActionType::ReplyText, AFFINITY_EVAL_MIN_CHARS, false, false),
             None
         );
         // Empty assistant text skips even with a long user message.
         assert_eq!(
-            eval_skip_reason(ActionType::ReplyText, 50, true),
+            eval_skip_reason(ActionType::ReplyText, 50, true, false),
             Some("empty_assistant")
         );
     }
@@ -2452,29 +2575,32 @@ mod tests {
     fn eval_runs_on_image_reply_with_text_or_prompt() {
         // reply_text_image with real text + adequate user msg → not skipped
         assert_eq!(
-            eval_skip_reason(ActionType::ReplyTextImage, 10, false),
+            eval_skip_reason(ActionType::ReplyTextImage, 10, false, false),
             None
         );
         // reply_image with empty assistant text but the caller supplies a non-empty
         // proxy (assistant_empty=false because image_caption is used) → not skipped
-        assert_eq!(eval_skip_reason(ActionType::ReplyImage, 10, false), None);
+        assert_eq!(
+            eval_skip_reason(ActionType::ReplyImage, 10, false, false),
+            None
+        );
         // image reply with empty proxy → empty_assistant
         assert_eq!(
-            eval_skip_reason(ActionType::ReplyImage, 10, true),
+            eval_skip_reason(ActionType::ReplyImage, 10, true, false),
             Some("empty_assistant")
         );
         // still gated by short user msg
         assert_eq!(
-            eval_skip_reason(ActionType::ReplyTextImage, 2, false),
+            eval_skip_reason(ActionType::ReplyTextImage, 2, false, false),
             Some("short_user_msg")
         );
         // Proactive and Ghost keep their dedicated skip reasons.
         assert_eq!(
-            eval_skip_reason(ActionType::Proactive, 50, false),
+            eval_skip_reason(ActionType::Proactive, 50, false, false),
             Some("proactive")
         );
         assert_eq!(
-            eval_skip_reason(ActionType::Ghost, 50, false),
+            eval_skip_reason(ActionType::Ghost, 50, false, false),
             Some("ghost")
         );
     }
@@ -3406,6 +3532,7 @@ mod tests {
             affinity_scope: Default::default(),
             tips_amount_usd: None,
             quote: Default::default(),
+            action: None,
         };
 
         // Mirrors what `pde::decide` would compute for a short user message
@@ -3426,6 +3553,7 @@ mod tests {
             image_caption: None,
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: None,
+            action_response: None,
         };
 
         // EMPTY text — this is exactly what a fallback-ghost turn produces when
@@ -3569,6 +3697,7 @@ mod tests {
             affinity_scope: Default::default(),
             tips_amount_usd: None,
             quote: Default::default(),
+            action: None,
         };
         let plan = ActionPlan {
             action_type: ActionType::ReplyImage,
@@ -3582,6 +3711,7 @@ mod tests {
             image_caption: Some("在天台看夕阳".into()),
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: None,
+            action_response: None,
         };
         let produced = vec![ProducedMessage {
             message_id: Uuid::new_v4(),
@@ -3701,6 +3831,7 @@ mod tests {
             affinity_scope: Default::default(),
             tips_amount_usd: None,
             quote: Default::default(),
+            action: None,
         };
         let plan = ActionPlan {
             action_type: ActionType::ReplyImage,
@@ -3714,6 +3845,7 @@ mod tests {
             image_caption: Some("在天台看夕阳".into()),
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: None,
+            action_response: None,
         };
         let produced = vec![ProducedMessage {
             message_id: Uuid::new_v4(),
@@ -3810,6 +3942,7 @@ mod tests {
                 patience: Some(3),
             },
             &[],
+            None,
             None,
         )
         .await;
@@ -4294,6 +4427,7 @@ mod tests {
             affinity_scope: Default::default(),
             tips_amount_usd: None,
             quote: Default::default(),
+            action: None,
         };
         let plan = ActionPlan {
             action_type: ActionType::ReplyText,
@@ -4307,6 +4441,7 @@ mod tests {
             image_caption: None,
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: None,
+            action_response: None,
         };
         let produced = vec![ProducedMessage {
             message_id: Uuid::new_v4(),
@@ -4410,6 +4545,7 @@ mod tests {
             None,
             eros_engine_core::affinity::EndpointLevelReads::default(),
             &[],
+            None,
             None,
         )
         .await;

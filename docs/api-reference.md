@@ -119,6 +119,7 @@ Frame fields worth noting:
 - **`meta`** — `message_id`, `action_type`, `model` (the served model id; may be omitted), and `continues_from` (optional — the previous message id when this turn continues a retry chain). `action_type` is one of `reply` | `ghost` | `reply_image` | `reply_text_image` | `product_qa` (a plain-text reply is reported as `reply`, not `reply_text` — there is no `reply_text` on the wire). `product_qa` marks an out-of-character product answer routed by the PDE judge (see [model-config.md](model-config.md)); it is excluded from companion context/memory but reported the same way on both the live stream and replay. Clients must tolerate unknown `action_type` values (new ones may be added without a major-version bump).
 - **`done`** — `truncated`, `usage` (after `OPENROUTER_USAGE_HIDDEN_KEYS` filtering; always present — `null` when not applicable), `generation_id` (OpenRouter id; always present — `null` when not applicable), and `ghost_fallback` (bool; omitted when `false`). `ghost_fallback: true` marks a reply that resolved empty and was delivered as a silent fallback — this is **not** an `action_type=ghost` turn, and it leaves the ghost counters untouched. The cause is recorded on the persisted row's `metadata.fallback_reason`. A turn that promises a photo (`action_type=reply_text_image`) is exempt: an empty text half is an image-only reply, not silence, so it reports `ghost_fallback: false`, carries no `fallback_reason`, and the trailing `image_request` still fires.
 - **`final`** — turn summary: `filtered` (bool — was the reply output-filtered), `prompt_injected` (array of the trait tags that injected this turn, or `null`), `tier` (echo of the request `tier`, or `null`), `retries_chat` (zero-based index of the chat attempt that succeeded), `retries_filter` (index of the filter-model attempt that served), and — since v1.4.0 — `llm_attempts` / `gateway_errors` (both **omitted when empty**; see below). No profile/lead signal rides this frame — `lead_score`, `should_show_cta`, and `agent_training_level` were removed (companion_insights teardown, spec 2026-08-11); read profile state from `GET /comp/user/{user_id}/profile` instead.
+- **`action_response`** — on a turn that carries an `action` only: `user_message_id` and `response` (`"accept"` | `"refuse"`). Sent once, before the first `meta`, and re-sent on an idempotent replay. Clients must tolerate frame types they do not know. A turn that then ends in `error` (stream) or leaves a `system_error` row (async) did not take effect: no reply was sent and affinity did not move.
 
 **Filtered turns stream too.** When the resolved LLM `output_filter` arms for
 a turn (see [model-config.md](model-config.md)), the rewrite reaches the
@@ -408,6 +409,36 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
         "content": "",
         "client_msg_id": "01J3333333333333333333333A",
         "tips_amount_usd": 9.99
+      }' \
+  http://localhost:8080/comp/chat/<session_id>/message/stream
+```
+
+**Optional: action.** The body may include `action` — something the user does to
+the persona besides talking. The persona accepts it or not; a refusal costs the
+relationship one tier on the line the action touches (`give` → bond, every other
+type → chemistry; see [affinity-model.md](affinity-model.md#refused-actions)).
+
+| `type` | fields |
+|---|---|
+| `give` | `item`: `cigarette` \| `alcohol` \| `medicine` (required); `name`: optional, 1–32 chars; `quantity`: optional, 1–99, default 1 |
+| `kiss`, `hug`, `touch`, `lick` | none |
+| `custom` | `text`: required, 1–100 chars |
+
+With an action, `content` may be empty. `action` cannot be combined with
+`tips_amount_usd`; it can be combined with `image_url` and `image`. Every
+value violation (bounds, missing `item`/`text`, combined with a tip) is a `422`
+with `code: "unprocessable"`; a body whose `type` or `item` is not one of the
+listed values is rejected as unparseable JSON (also `422`). The action is stored on the user
+row and returned by both history routes as `action`, with `response` once the
+turn has been decided.
+
+```bash
+curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{
+        "content": "来，陪我喝点",
+        "client_msg_id": "01J4444444444444444444444A",
+        "action": {"type": "give", "item": "alcohol", "name": "威士忌", "quantity": 2}
       }' \
   http://localhost:8080/comp/chat/<session_id>/message/stream
 ```
@@ -818,6 +849,9 @@ a disconnect before it fires would otherwise be undetectable from history).
 `reply_to_message_id` echoes the quote a `user` row was sent with (see
 **Optional: quote** above): the id of the row it quoted, always in this same
 session.
+
+`action` (user rows only, omitted otherwise) is the action the row was sent
+with, plus `response` (`"accept"` | `"refuse"`) once the turn was decided.
 
 `user_message_id` names the `role='user'` row whose turn produced this row. It
 is present on assistant rows and on `system_error` notices, and omitted on the
@@ -1480,7 +1514,9 @@ on `system_error` notices, omitted on user rows. `reply_to_message_id`
 echoes the quote a `user` row was sent with (see the stream route's
 **Optional: quote** section) — the id of the row it quoted, always in this same
 session; omitted on ordinary turns and on turns whose anchor failed to resolve,
-so a cold mount can re-render the quote without keeping local state. Same auth, ownership check, and
+so a cold mount can re-render the quote without keeping local state.
+`action` (user rows only, omitted otherwise) is the action the row was sent
+with, plus `response` (`"accept"` | `"refuse"`) once the turn was decided. Same auth, ownership check, and
 `limit ∈ [1, 50]` clamp as the canonical history route. **Intentional
 divergence:** the default `limit` is 50 (the canonical route defaults to 20),
 because the BFF exists for a cold mount that wants a full backscroll in one

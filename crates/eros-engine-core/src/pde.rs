@@ -7,7 +7,8 @@
 use crate::affinity::AffinityDeltas;
 use crate::ghost::{self, GhostDecision, GhostSignals};
 use crate::types::{
-    ActionPlan, ActionType, DecisionInput, Event, ImageRef, ReplyMode, ReplyStyle, TurnNudges,
+    ActionPlan, ActionResponse, ActionType, DecisionInput, Event, ImageRef, ReplyMode, ReplyStyle,
+    TurnNudges,
 };
 
 // Decision thresholds — tune here rather than at call sites.
@@ -23,6 +24,21 @@ const ENERGY_COST_GHOST: f64 = 0.0;
 const ENERGY_COST_APP_OPEN: f64 = 0.0;
 
 const GHOST_DELTA_TENSION: f64 = 0.05;
+
+/// The response in effect for this turn's user action: the judge's when it
+/// gave one, accept otherwise; `None` on a turn without an action (spec
+/// 2026-10-05-chat-user-actions-design.md §4.3).
+pub fn settle_action_response(
+    event: &Event,
+    judged: Option<ActionResponse>,
+) -> Option<ActionResponse> {
+    match event {
+        Event::UserMessage {
+            action: Some(_), ..
+        } => Some(judged.unwrap_or(ActionResponse::Accept)),
+        _ => None,
+    }
+}
 
 /// Core decision function.
 ///
@@ -52,6 +68,29 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
             image_caption: None,
             image_ref: ImageRef::Face,
             aspect_ratio: None,
+            action_response: None,
+        };
+    }
+
+    // 0b. A user action — always reply, never ghost: the persona answers an
+    //     action, and with no judge to decide, it accepts (spec 2026-10-05 §4.3–4.4).
+    if let Event::UserMessage {
+        action: Some(_), ..
+    } = &input.event
+    {
+        return ActionPlan {
+            action_type: ActionType::ReplyText,
+            reply_style: ReplyStyle::Neutral,
+            affinity_deltas: predict_reply_deltas(input),
+            energy_cost: ENERGY_COST_REPLY,
+            context_hints: vec![],
+            reply_mode: None,
+            nudges: TurnNudges::default(),
+            clothing: None,
+            image_caption: None,
+            image_ref: ImageRef::Face,
+            aspect_ratio: None,
+            action_response: Some(ActionResponse::Accept),
         };
     }
 
@@ -73,6 +112,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
             image_caption: None,
             image_ref: ImageRef::Face,
             aspect_ratio: None,
+            action_response: None,
         };
     }
 
@@ -90,6 +130,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
             image_caption: None,
             image_ref: ImageRef::Face,
             aspect_ratio: None,
+            action_response: None,
         };
     }
 
@@ -108,6 +149,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
             image_caption: None,
             image_ref: ImageRef::Face,
             aspect_ratio: None,
+            action_response: None,
         };
     }
 
@@ -124,6 +166,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
         image_caption: None,
         image_ref: ImageRef::Face,
         aspect_ratio: None,
+        action_response: None,
     }
 }
 
@@ -136,7 +179,9 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
 ///                                              ENERGY_COST_GHOST, hints discarded, mode discarded
 ///   ProductQa                               → Neutral, all-zero deltas, zero energy,
 ///                                              hints/mode dropped (out-of-character aside)
+///   action_response is settled on the reply arms (settle_action_response) and None on Ghost / ProductQa
 ///   Proactive                               → unreachable! (comes only from decide)
+#[allow(clippy::too_many_arguments)]
 pub fn plan_for(
     input: &DecisionInput,
     action: ActionType,
@@ -145,6 +190,7 @@ pub fn plan_for(
     clothing: Option<String>,
     image_ref: ImageRef,
     aspect_ratio: Option<String>,
+    action_response: Option<ActionResponse>,
 ) -> ActionPlan {
     match action {
         ActionType::ReplyText | ActionType::ReplyImage | ActionType::ReplyTextImage => ActionPlan {
@@ -169,6 +215,7 @@ pub fn plan_for(
             image_caption: None,
             image_ref,
             aspect_ratio,
+            action_response: settle_action_response(&input.event, action_response),
         },
         ActionType::Ghost => ActionPlan {
             action_type: ActionType::Ghost,
@@ -182,6 +229,7 @@ pub fn plan_for(
             image_caption: None,
             image_ref: ImageRef::Face,
             aspect_ratio: None,
+            action_response: None,
         },
         ActionType::ProductQa => ActionPlan {
             action_type: ActionType::ProductQa,
@@ -198,6 +246,7 @@ pub fn plan_for(
             image_caption: None,
             image_ref: ImageRef::Face,
             aspect_ratio: None,
+            action_response: None,
         },
         ActionType::Proactive => {
             unreachable!("plan_for is never called with Proactive; it comes only from pde::decide")
@@ -313,6 +362,7 @@ mod tests {
             affinity_scope: Default::default(),
             tips_amount_usd: None,
             quote: Default::default(),
+            action: None,
         }
     }
 
@@ -327,6 +377,7 @@ mod tests {
             affinity_scope: Default::default(),
             tips_amount_usd: Some(amount),
             quote: Default::default(),
+            action: None,
         }
     }
 
@@ -499,6 +550,7 @@ mod tests {
             None,
             ImageRef::Face,
             None,
+            None,
         );
         assert_eq!(plan.action_type, ActionType::ReplyText);
         assert_eq!(plan.reply_style, ReplyStyle::Neutral);
@@ -516,6 +568,7 @@ mod tests {
             None,
             None,
             ImageRef::Face,
+            None,
             None,
         );
         assert_eq!(plan.action_type, ActionType::Ghost);
@@ -535,6 +588,7 @@ mod tests {
             None,
             ImageRef::Face,
             None,
+            None,
         );
         assert_eq!(plan.action_type, ActionType::ReplyTextImage);
         assert_eq!(
@@ -549,6 +603,7 @@ mod tests {
             None,
             None,
             ImageRef::Face,
+            None,
             None,
         );
         assert_eq!(ghost.image_caption, None, "ghost carries no image prompt");
@@ -565,6 +620,7 @@ mod tests {
             None,
             ImageRef::Previous,
             Some("9:16".into()),
+            None,
         );
         assert_eq!(plan.image_ref, ImageRef::Previous);
         assert_eq!(plan.aspect_ratio.as_deref(), Some("9:16"));
@@ -578,6 +634,7 @@ mod tests {
             None,
             ImageRef::Previous,
             Some("9:16".into()),
+            None,
         );
         assert_eq!(ghost.image_ref, ImageRef::Face);
         assert_eq!(ghost.aspect_ratio, None);
@@ -596,6 +653,7 @@ mod tests {
             None,
             ImageRef::Face,
             None,
+            None,
         );
         assert_eq!(text.reply_mode, Some(ReplyMode::Listen));
 
@@ -607,6 +665,7 @@ mod tests {
             None,
             ImageRef::Face,
             None,
+            None,
         );
         assert_eq!(text_image.reply_mode, Some(ReplyMode::Listen));
 
@@ -617,6 +676,7 @@ mod tests {
             mode,
             None,
             ImageRef::Face,
+            None,
             None,
         );
         assert_eq!(
@@ -632,6 +692,7 @@ mod tests {
             None,
             ImageRef::Face,
             None,
+            None,
         );
         assert_eq!(ghost.reply_mode, None, "ghost carries no mode");
 
@@ -642,6 +703,7 @@ mod tests {
             mode,
             None,
             ImageRef::Face,
+            None,
             None,
         );
         assert_eq!(qa.reply_mode, None, "product_qa carries no mode");
@@ -657,6 +719,7 @@ mod tests {
             None,
             None,
             ImageRef::Face,
+            None,
             None,
         );
         assert_eq!(
@@ -681,6 +744,7 @@ mod tests {
             clothing.clone(),
             ImageRef::Face,
             None,
+            None,
         );
         assert_eq!(text.clothing.as_deref(), Some("米色针织开衫和短裤"));
 
@@ -692,6 +756,7 @@ mod tests {
             clothing.clone(),
             ImageRef::Face,
             None,
+            None,
         );
         assert_eq!(text_image.clothing.as_deref(), Some("米色针织开衫和短裤"));
 
@@ -702,6 +767,7 @@ mod tests {
             None,
             clothing.clone(),
             ImageRef::Face,
+            None,
             None,
         );
         assert_eq!(
@@ -717,6 +783,7 @@ mod tests {
             clothing.clone(),
             ImageRef::Face,
             None,
+            None,
         );
         assert_eq!(ghost.clothing, None, "ghost discards clothing like tone");
 
@@ -727,6 +794,7 @@ mod tests {
             None,
             clothing,
             ImageRef::Face,
+            None,
             None,
         );
         assert_eq!(qa.clothing, None, "product_qa is an out-of-character aside");
@@ -746,6 +814,7 @@ mod tests {
             None,
             ImageRef::Face,
             None,
+            None,
         );
         assert_eq!(plan.action_type, ActionType::ProductQa);
         assert_eq!(plan.reply_style, ReplyStyle::Neutral);
@@ -760,5 +829,103 @@ mod tests {
         assert!(plan.context_hints.is_empty()); // hints/mode dropped — no persona prompt
         assert!(plan.reply_mode.is_none());
         assert!(!ActionType::ProductQa.is_text_reply());
+    }
+
+    fn action_msg(action: crate::types::UserAction) -> Event {
+        Event::UserMessage {
+            content: String::new(),
+            message_id: Uuid::new_v4(),
+            prompt_traits: Vec::new(),
+            audit: None,
+            tier: None,
+            memory_scope: Default::default(),
+            affinity_scope: Default::default(),
+            tips_amount_usd: None,
+            quote: Default::default(),
+            action: Some(action),
+        }
+    }
+
+    #[test]
+    fn decide_on_an_action_turn_replies_and_accepts_even_when_ghost_signals_present() {
+        use crate::types::{ActionResponse, UserAction};
+        // Same affinity that drives test_ghost_threshold_triggers_ghost_action.
+        let mut affinity = base_affinity();
+        affinity.intrigue = 0.05;
+        affinity.patience = 0.05;
+        affinity.tension = 0.5;
+        let input = DecisionInput {
+            event: action_msg(UserAction::Kiss),
+            affinity,
+            persona: base_persona(),
+            signals: base_signals(),
+        };
+        let plan = decide(&input);
+        assert_eq!(plan.action_type, ActionType::ReplyText);
+        assert_eq!(plan.action_response, Some(ActionResponse::Accept));
+    }
+
+    #[test]
+    fn decide_without_an_action_carries_no_response() {
+        let input = DecisionInput {
+            event: user_msg("hi"),
+            affinity: base_affinity(),
+            persona: base_persona(),
+            signals: base_signals(),
+        };
+        assert_eq!(decide(&input).action_response, None);
+    }
+
+    #[test]
+    fn plan_for_settles_the_response_on_action_turns_only() {
+        use crate::types::{ActionResponse, UserAction};
+        let with_action = DecisionInput {
+            event: action_msg(UserAction::Hug),
+            affinity: base_affinity(),
+            persona: base_persona(),
+            signals: base_signals(),
+        };
+        let text = |input: &DecisionInput, r| {
+            plan_for(
+                input,
+                ActionType::ReplyText,
+                vec![],
+                None,
+                None,
+                ImageRef::Face,
+                None,
+                r,
+            )
+        };
+        assert_eq!(
+            text(&with_action, Some(ActionResponse::Refuse)).action_response,
+            Some(ActionResponse::Refuse)
+        );
+        assert_eq!(
+            text(&with_action, None).action_response,
+            Some(ActionResponse::Accept),
+            "a judge that abstained falls back to accept"
+        );
+        let plain = DecisionInput {
+            event: user_msg("hi"),
+            ..with_action.clone()
+        };
+        assert_eq!(
+            text(&plain, Some(ActionResponse::Refuse)).action_response,
+            None,
+            "a stray verdict on a turn without an action is ignored"
+        );
+        // A forced image-only reply still answers the action.
+        let image = plan_for(
+            &with_action,
+            ActionType::ReplyImage,
+            vec![],
+            None,
+            None,
+            ImageRef::Face,
+            None,
+            Some(ActionResponse::Refuse),
+        );
+        assert_eq!(image.action_response, Some(ActionResponse::Refuse));
     }
 }

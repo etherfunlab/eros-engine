@@ -60,6 +60,8 @@ pub(crate) struct QueuedTurnParams {
     pub user_country: Option<String>,
     #[serde(default)]
     pub user_region: Option<String>,
+    #[serde(default)]
+    pub action: Option<crate::routes::companion_stream::UserActionDto>,
 }
 
 impl QueuedTurnParams {
@@ -164,6 +166,7 @@ pub async fn send_message_async(
         user_timezone: crate::holiday::bounded_raw(req.user_timezone.as_deref()),
         user_country: crate::holiday::bounded_raw(req.user_country.as_deref()),
         user_region: crate::holiday::bounded_raw(req.user_region.as_deref()),
+        action: req.action.clone(),
     })
     .expect("QueuedTurnParams serializes");
 
@@ -593,6 +596,34 @@ mod tests {
         assert!(
             !paths.contains_key("/v2/comp/chat/{session_id}/message/async"),
             "the removed /v2/comp/chat alias must not be in the spec"
+        );
+    }
+
+    #[test]
+    fn queued_params_round_trip_the_action() {
+        use crate::routes::companion_stream::{UserActionDto, UserActionKind};
+        let params = super::QueuedTurnParams {
+            action: Some(UserActionDto {
+                kind: UserActionKind::Custom,
+                item: None,
+                name: None,
+                quantity: None,
+                text: Some("捏了捏你的脸".into()),
+            }),
+            ..Default::default()
+        };
+        let back: super::QueuedTurnParams =
+            serde_json::from_value(serde_json::to_value(&params).unwrap()).unwrap();
+        assert_eq!(
+            back.action.unwrap().to_core().unwrap(),
+            eros_engine_core::types::UserAction::Custom {
+                text: "捏了捏你的脸".into()
+            }
+        );
+        let legacy: super::QueuedTurnParams = serde_json::from_value(json!({})).unwrap();
+        assert!(
+            legacy.action.is_none(),
+            "rows queued before this field still parse"
         );
     }
 }

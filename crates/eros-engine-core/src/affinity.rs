@@ -191,6 +191,25 @@ pub fn endpoint_value(level: i16, counterpart: f64, decay: f64, floor_ratio: f64
     (boosted.max(floor_ratio * counterpart) * decay).clamp(0.0, 1.0)
 }
 
+/// The two relationship lines: Bond = trust + intrigue (friendship), Chemistry
+/// = intimacy + tension (romance). Names the line a user action touches (spec
+/// 2026-10-05-chat-user-actions-design.md §4.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AffinityLine {
+    Bond,
+    Chemistry,
+}
+
+impl AffinityLine {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AffinityLine::Bond => "bond",
+            AffinityLine::Chemistry => "chemistry",
+        }
+    }
+}
+
 /// 1..=5 tier index for a 0..1 line score. The single authority for the tier
 /// ladder: the `bond_tier`/`chem_tier` columns are this function's result
 /// projected for SQL consumers, and clients read that rather than re-deriving
@@ -208,6 +227,36 @@ pub fn tier_index(score: f64) -> u8 {
     } else {
         5
     }
+}
+
+/// Lower and upper bound of each tier, index 0 = tier 1 — the same cuts as
+/// `tier_index`, with tier 5 closed at 1.0.
+const TIER_BOUNDS: [(f64, f64); 5] = [
+    (0.0, TIER1_HI),
+    (TIER1_HI, TIER2_HI),
+    (TIER2_HI, TIER3_HI),
+    (TIER3_HI, TIER4_HI),
+    (TIER4_HI, 1.0),
+];
+
+/// Keeps a dropped line strictly inside the tier below, clear of float error
+/// at its edges: a target exactly on a lower bound can scale back to a hair
+/// under it and cost a second tier.
+const TIER_DROP_EPS: f64 = 1e-6;
+
+/// Where a refused action leaves a line scored `score`: one tier down, at the
+/// same relative position inside the tier; tier 1 goes to 0 (spec
+/// 2026-10-05-chat-user-actions-design.md §6.2).
+pub fn tier_drop_target(score: f64) -> f64 {
+    let k = usize::from(tier_index(score));
+    if k == 1 {
+        return 0.0;
+    }
+    let (lo, hi) = TIER_BOUNDS[k - 1];
+    let (lower_lo, lower_hi) = TIER_BOUNDS[k - 2];
+    let pos = ((score - lo) / (hi - lo)).clamp(0.0, 1.0);
+    (lower_lo + pos * (lower_hi - lower_lo))
+        .clamp(lower_lo + TIER_DROP_EPS, lower_hi - TIER_DROP_EPS)
 }
 
 /// Friendship-line tier (pure function of `bond_score`). Serialised snake_case
@@ -375,6 +424,33 @@ impl Affinity {
         ChemistryLabel::from_tier(self.chem_tier())
     }
 
+    /// Set `line`'s two axes from `before` so the line sits one tier below
+    /// where `before` had it, both axes scaled by the same factor (spec
+    /// 2026-10-05 §6.2–6.3). Reads only `before`: whatever this turn already
+    /// did to the line is replaced, not stacked.
+    pub fn drop_line_tier(&mut self, before: &Affinity, line: AffinityLine) {
+        let (score, a, b) = match line {
+            AffinityLine::Bond => (before.bond_score(), before.trust, before.intrigue),
+            AffinityLine::Chemistry => (before.chemistry_score(), before.intimacy, before.tension),
+        };
+        let factor = if score > 0.0 {
+            tier_drop_target(score) / score
+        } else {
+            0.0
+        };
+        let (a, b) = (clamp(a * factor, 0.0, 1.0), clamp(b * factor, 0.0, 1.0));
+        match line {
+            AffinityLine::Bond => {
+                self.trust = a;
+                self.intrigue = b;
+            }
+            AffinityLine::Chemistry => {
+                self.intimacy = a;
+                self.tension = b;
+            }
+        }
+    }
+
     /// Coarse 1..=3 intimacy rung for the PDE image gate, taken over whichever
     /// line is further along. Rung 1 = both lines still tier 1; rung 3 = at or
     /// above `INTIMACY_RUNG3_LO`; rung 2 = everything between. `max` rather than
@@ -512,6 +588,21 @@ pub struct PendingDeltas {
 impl PendingDeltas {
     pub fn is_zero(&self) -> bool {
         self.trust == 0.0 && self.intrigue == 0.0 && self.intimacy == 0.0 && self.tension == 0.0
+    }
+
+    /// Zero `line`'s two axes: a dropped line keeps nothing buffered that
+    /// could land on a later turn.
+    pub fn clear_line(&mut self, line: AffinityLine) {
+        match line {
+            AffinityLine::Bond => {
+                self.trust = 0.0;
+                self.intrigue = 0.0;
+            }
+            AffinityLine::Chemistry => {
+                self.intimacy = 0.0;
+                self.tension = 0.0;
+            }
+        }
     }
 }
 
@@ -1509,6 +1600,127 @@ mod tests {
             y_star(&t2),
             "κ tied to unit ⇒ wall does not move with the unit"
         );
+    }
+
+    fn line_affinity(trust: f64, intrigue: f64, intimacy: f64, tension: f64) -> Affinity {
+        let now = chrono::Utc::now();
+        Affinity {
+            id: uuid::Uuid::nil(),
+            session_id: uuid::Uuid::nil(),
+            user_id: uuid::Uuid::nil(),
+            instance_id: uuid::Uuid::nil(),
+            warmth: 0.3,
+            trust,
+            intrigue,
+            intimacy,
+            patience: 0.3,
+            tension,
+            warmth_grade: 2,
+            patience_grade: 2,
+            ghost_streak: 0,
+            last_ghost_at: None,
+            total_ghosts: 0,
+            feeling_clause: None,
+            feeling_clause_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn tier_drop_target_lands_exactly_one_tier_down_at_every_edge() {
+        for score in [
+            0.15, 0.349999, 0.35, 0.619999, 0.62, 0.899999, 0.9, 0.95, 1.0,
+        ] {
+            let t = tier_drop_target(score);
+            assert_eq!(
+                tier_index(t),
+                tier_index(score) - 1,
+                "score {score} → target {t}"
+            );
+        }
+    }
+
+    #[test]
+    fn tier_drop_target_keeps_the_relative_position() {
+        // 0.80 sits at 0.18/0.28 of tier 4; the same fraction of tier 3.
+        let expect = 0.35 + (0.18 / 0.28) * 0.27;
+        assert!((tier_drop_target(0.80) - expect).abs() < 1e-9);
+    }
+
+    #[test]
+    fn tier_drop_target_sends_tier_one_to_zero() {
+        for score in [0.0, 0.05, 0.149999] {
+            assert_eq!(tier_drop_target(score), 0.0, "score {score}");
+        }
+    }
+
+    #[test]
+    fn drop_line_tier_scales_both_axes_of_the_line_and_keeps_their_ratio() {
+        let before = line_affinity(0.5, 0.4, 0.9, 0.7); // chemistry 0.80, tier 4
+        let mut after = before.clone();
+        after.drop_line_tier(&before, AffinityLine::Chemistry);
+        assert!((after.chemistry_score() - tier_drop_target(0.80)).abs() < 1e-9);
+        assert!((after.intimacy / after.tension - 0.9 / 0.7).abs() < 1e-9);
+        assert_eq!(after.chem_tier(), 3);
+        assert_eq!((after.trust, after.intrigue), (0.5, 0.4), "bond untouched");
+    }
+
+    #[test]
+    fn drop_line_tier_reads_the_before_snapshot_not_self() {
+        let before = line_affinity(0.5, 0.4, 0.9, 0.7);
+        let mut after = before.clone();
+        // This turn's grades already pushed the line up; the drop replaces it.
+        after.intimacy = 1.0;
+        after.tension = 1.0;
+        after.drop_line_tier(&before, AffinityLine::Chemistry);
+        assert!((after.chemistry_score() - tier_drop_target(0.80)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn drop_line_tier_on_bond_and_from_tier_one() {
+        let before = line_affinity(0.2, 0.0, 0.0, 0.0); // bond 0.10, tier 1
+        let mut after = before.clone();
+        after.drop_line_tier(&before, AffinityLine::Bond);
+        assert_eq!((after.trust, after.intrigue), (0.0, 0.0));
+        let zero = line_affinity(0.0, 0.0, 0.0, 0.0);
+        let mut z = zero.clone();
+        z.drop_line_tier(&zero, AffinityLine::Bond);
+        assert_eq!((z.trust, z.intrigue), (0.0, 0.0));
+    }
+
+    #[test]
+    fn drop_line_tier_lands_one_tier_down_across_the_range() {
+        // Uneven axis splits, every hundredth of the line from tier 2 up.
+        let mut s: f64 = 0.16;
+        while s <= 1.0 {
+            let a: f64 = (s * 1.3).min(1.0);
+            let b: f64 = (2.0 * s - a).max(0.0);
+            let before = line_affinity(0.0, 0.0, a, b);
+            let mut after = before.clone();
+            after.drop_line_tier(&before, AffinityLine::Chemistry);
+            assert_eq!(
+                after.chem_tier(),
+                before.chem_tier() - 1,
+                "line {} → {}",
+                before.chemistry_score(),
+                after.chemistry_score()
+            );
+            s += 0.01;
+        }
+    }
+
+    #[test]
+    fn pending_clear_line_zeroes_only_that_line() {
+        let mut p = PendingDeltas {
+            trust: 0.1,
+            intrigue: 0.2,
+            intimacy: 0.3,
+            tension: 0.4,
+        };
+        p.clear_line(AffinityLine::Chemistry);
+        assert_eq!((p.intimacy, p.tension), (0.0, 0.0));
+        assert_eq!((p.trust, p.intrigue), (0.1, 0.2));
     }
 
     #[test]

@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::affinity::{Affinity, AffinityDeltas};
+use crate::affinity::{Affinity, AffinityDeltas, AffinityLine};
 use crate::persona::CompanionPersona;
 use crate::scope::{AffinityScope, MemoryScope};
 
@@ -76,6 +76,11 @@ pub enum Event {
         /// quote points at one line, it does not rewind the conversation.
         #[serde(default)]
         quote: Option<QuotedMessage>,
+        /// What the user did this turn besides talking. `None` on ordinary
+        /// turns. Mutually exclusive with `tips_amount_usd` (the HTTP layer
+        /// rejects both together).
+        #[serde(default)]
+        action: Option<UserAction>,
     },
     ProactiveTrigger,
     AppOpen,
@@ -100,6 +105,66 @@ pub struct QuotedMessage {
     /// line above the quoted one; `None` leaves the block a single line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger: Option<String>,
+}
+
+/// What a user's turn does to the persona besides talking (spec
+/// 2026-10-05-chat-user-actions-design.md). Stored verbatim as the user row's
+/// `metadata.action`, so the serde shape is a persisted contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum UserAction {
+    Give {
+        item: GiftItem,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        quantity: u8,
+    },
+    Kiss,
+    Hug,
+    Touch,
+    Lick,
+    Custom {
+        text: String,
+    },
+}
+
+impl UserAction {
+    /// The line a refusal of this action drops: handing something over is
+    /// friendship, every physical gesture is romance.
+    pub fn line(&self) -> AffinityLine {
+        match self {
+            UserAction::Give { .. } => AffinityLine::Bond,
+            _ => AffinityLine::Chemistry,
+        }
+    }
+}
+
+/// What a `give` action hands over. The category is fixed; the optional
+/// `name` on the action is free text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GiftItem {
+    Cigarette,
+    Alcohol,
+    Medicine,
+}
+
+/// Whether the persona accepts a user action. Decided by the PDE judge before
+/// the reply; accept whenever the judge did not decide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionResponse {
+    Accept,
+    Refuse,
+}
+
+impl ActionResponse {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ActionResponse::Accept => "accept",
+            ActionResponse::Refuse => "refuse",
+        }
+    }
 }
 
 /// Which reference image an image turn should build on. `Face` = the static
@@ -234,6 +299,9 @@ pub struct ActionPlan {
     /// Aspect ratio chosen by the PDE for an image turn; `None` ⇒ caller falls
     /// back (request → config default). Always `None` for non-image actions.
     pub aspect_ratio: Option<String>,
+    /// The response in effect for this turn's user action: `Some` exactly when
+    /// the event carries an action and the plan replies; `None` otherwise.
+    pub action_response: Option<ActionResponse>,
 }
 
 /// Conversation signals computed from chat history.
@@ -430,5 +498,84 @@ mod tests {
         // pre-`trigger` payload (the queue may hold old events) still parses.
         assert!(!s.contains("trigger"), "got {s}");
         assert_eq!(serde_json::from_str::<QuotedMessage>(&s).unwrap(), q);
+    }
+
+    #[test]
+    fn user_action_serializes_flat_with_type_tag() {
+        let give = UserAction::Give {
+            item: GiftItem::Alcohol,
+            name: Some("威士忌".into()),
+            quantity: 2,
+        };
+        assert_eq!(
+            serde_json::to_value(&give).unwrap(),
+            serde_json::json!({"type": "give", "item": "alcohol", "name": "威士忌", "quantity": 2})
+        );
+        let nameless = UserAction::Give {
+            item: GiftItem::Cigarette,
+            name: None,
+            quantity: 1,
+        };
+        assert_eq!(
+            serde_json::to_value(&nameless).unwrap(),
+            serde_json::json!({"type": "give", "item": "cigarette", "quantity": 1})
+        );
+        assert_eq!(
+            serde_json::to_value(&UserAction::Kiss).unwrap(),
+            serde_json::json!({"type": "kiss"})
+        );
+        assert_eq!(
+            serde_json::to_value(&UserAction::Custom {
+                text: "捏了捏你的脸".into()
+            })
+            .unwrap(),
+            serde_json::json!({"type": "custom", "text": "捏了捏你的脸"})
+        );
+        let back: UserAction = serde_json::from_value(serde_json::json!({"type": "lick"})).unwrap();
+        assert_eq!(back, UserAction::Lick);
+    }
+
+    #[test]
+    fn user_action_line_maps_give_to_bond_and_the_rest_to_chemistry() {
+        use crate::affinity::AffinityLine;
+        let give = UserAction::Give {
+            item: GiftItem::Medicine,
+            name: None,
+            quantity: 1,
+        };
+        assert_eq!(give.line(), AffinityLine::Bond);
+        for a in [
+            UserAction::Kiss,
+            UserAction::Hug,
+            UserAction::Touch,
+            UserAction::Lick,
+            UserAction::Custom { text: "x".into() },
+        ] {
+            assert_eq!(a.line(), AffinityLine::Chemistry, "{a:?}");
+        }
+    }
+
+    #[test]
+    fn action_response_wire_strings() {
+        assert_eq!(ActionResponse::Accept.as_str(), "accept");
+        assert_eq!(ActionResponse::Refuse.as_str(), "refuse");
+        assert_eq!(
+            serde_json::to_value(ActionResponse::Refuse).unwrap(),
+            "refuse"
+        );
+        assert_eq!(
+            serde_json::from_str::<ActionResponse>("\"accept\"").unwrap(),
+            ActionResponse::Accept
+        );
+    }
+
+    #[test]
+    fn event_user_message_defaults_action_to_none() {
+        let raw = r#"{"UserMessage":{"content":"hi","message_id":"00000000-0000-0000-0000-000000000001"}}"#;
+        let ev: Event = serde_json::from_str(raw).expect("legacy body deserialises");
+        match ev {
+            Event::UserMessage { action, .. } => assert!(action.is_none()),
+            _ => panic!("expected UserMessage"),
+        }
     }
 }

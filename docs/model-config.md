@@ -644,6 +644,7 @@ By default the engine uses the built-in rule engine (`eros-engine-core/src/pde.r
   - `inner_state`: a short mood/tone description folded into the reply prompt
   - `reply_mode` (optional): how this turn's reply relates to the user's message — `"listen"` / `"follow"` / `"ask"` / `"judge"`, or `null` when unsure (the engine's per-turn dice then take over). Varies the reply prompt's iron rule ①; `listen` also drops the reply-length ceiling one tier
   - `clothing` (optional): a short free-text description of the character's outfit this turn — injected into the reply prompt as a line inside the `[character_state]` section on text-bearing actions; omitted when absent
+  - `action_response` (optional): on a turn that carries a user action (the context then has a `[用户动作]` line), `"accept"` or `"refuse"`; `null` otherwise or when unsure. A `null`, a failed judge, or the rule engine all mean accept. A refusal drops the action's affinity line one tier (see [affinity-model.md](affinity-model.md#refused-actions)). On an action turn `ghost` and `product_qa` are turned into `reply_text`, and the per-turn dice are not rolled
   - `reason`: optional
 - **Fail-open:** any LLM timeout or error falls back to the rule engine — the LLM judge never blocks a chat response.
 - **Hard-safety guardrails** (enforced after the LLM verdict, before the rule-engine fallback): never ghost in the first 10 messages, never ghost a third time in a row (`ghost_streak ≥ 2` vetoes; two consecutive are allowed), one-hour ghost cooldown.

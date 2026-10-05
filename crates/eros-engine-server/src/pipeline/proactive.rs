@@ -132,6 +132,7 @@ pub(crate) async fn greet(
             affinity_scope: g.affinity_scope,
             tips_amount_usd: None,
             quote: None,
+            action: None,
         },
         affinity,
         persona: g.persona.clone(),
@@ -149,6 +150,7 @@ pub(crate) async fn greet(
         image_caption: None,
         image_ref: ImageRef::Previous,
         aspect_ratio: None,
+        action_response: None,
     };
     let (mut chat_req, injected_tags) = build_reply_request(
         state,

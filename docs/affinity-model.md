@@ -234,6 +234,26 @@ Ghost turns never reach `persist_with_event`: only `ghost_streak` /
 `total_ghosts` / `last_ghost_at` move. `record_ghost` writes an all-zero
 `effective_deltas`; no axis moves at all.
 
+### Refused actions
+
+A chat turn can carry a user action (see the `action` field in
+[api-reference.md](api-reference.md)). The PDE judge decides before the reply
+whether the persona accepts it; without a definite refusal the engine accepts.
+
+- **Accepted:** nothing special. The affinity judge sees the action in the
+  user text and grades the turn as usual.
+- **Refused:** the line the action touches (`give` → Bond, every physical
+  action → Chemistry) drops one tier, landing at the same relative position
+  inside the lower tier; a tier-1 line goes to `0`. Both axes of the line are
+  scaled by the same factor, so their ratio is kept. The drop is computed from
+  the pre-turn snapshot inside the row lock and replaces whatever the judge's
+  grades did to that line; the other line and the base-pair levels follow the
+  judge. That line's `pending_deltas` are cleared, and the event row's
+  `context.tier_drop` names the line. The drop applies even when the affinity
+  eval is skipped or fails.
+
+Example: chemistry `0.80` (64% of tier 4) lands at 64% of tier 3, `≈ 0.524`.
+
 ## Base-pair derivation details
 
 Every constant in the endpoint derivation is anchored, not invented:
@@ -528,3 +548,5 @@ env override could break.
   the line math, endpoint derivation, tiers
 - Design spec: `docs/superpowers/specs/2026-08-17-affinity-41-design.md` —
   stored tier columns, event state snapshots, the value endpoint
+- Design spec: `docs/superpowers/specs/2026-10-05-chat-user-actions-design.md` —
+  user actions, the judge's response, the tier drop
