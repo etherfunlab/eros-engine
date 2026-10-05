@@ -9,6 +9,7 @@ mod openapi;
 mod pipeline;
 mod prompt;
 mod prompt_log;
+mod reaction;
 mod repetition;
 mod routes;
 mod state;
@@ -157,7 +158,7 @@ async fn run_migrations() -> Result<()> {
 }
 
 async fn run_server() -> Result<()> {
-    let cfg = ServerConfig::from_env();
+    let cfg = ServerConfig::from_env().map_err(anyhow::Error::msg)?;
 
     if let Some(dir) = cfg.prompt_log_dir.as_ref() {
         if let Err(e) = std::fs::create_dir_all(dir) {

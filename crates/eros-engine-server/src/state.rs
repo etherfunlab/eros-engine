@@ -396,10 +396,13 @@ pub struct ServerConfig {
     pub world: WorldConfig,
     /// Async chat-turn queue worker configuration (`CHAT_QUEUE_*` env vars).
     pub chat_queue: ChatQueueConfig,
+    /// The emoji users may react with (`CHAT_REACTION_EMOJI`); `None` = every
+    /// standard emoji. Parsed at boot; an unresolvable entry refuses boot.
+    pub reaction_emoji: Option<crate::reaction::ReactionAllowlist>,
 }
 
 impl ServerConfig {
-    pub fn from_env() -> Self {
+    pub fn from_env() -> Result<Self, String> {
         let dreaming_disabled = parse_bool_flag(std::env::var("DREAMING_DISABLED").ok().as_deref());
         let dreaming_voice_disabled =
             parse_bool_flag(std::env::var("DREAMING_VOICE_DISABLED").ok().as_deref());
@@ -430,7 +433,7 @@ impl ServerConfig {
             std::env::var("SNAPSHOT_CRON").ok().as_deref(),
             std::env::var("SNAPSHOT_TZ").ok().as_deref(),
         );
-        Self {
+        Ok(Self {
             affinity_tuning: affinity_tuning_from_env(),
             bind_addr: std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into()),
             dreaming_tick,
@@ -473,7 +476,10 @@ impl ServerConfig {
                 std::env::var("CHAT_QUEUE_PENDING_CAP").ok().as_deref(),
                 std::env::var("CHAT_QUEUE_GEN_TIMEOUT_SECS").ok().as_deref(),
             ),
-        }
+            reaction_emoji: crate::reaction::ReactionAllowlist::parse(
+                std::env::var("CHAT_REACTION_EMOJI").ok().as_deref(),
+            )?,
+        })
     }
 }
 

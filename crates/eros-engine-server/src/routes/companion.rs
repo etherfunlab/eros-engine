@@ -1169,6 +1169,7 @@ pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
             chat_queue: crate::state::parse_chat_queue_config(
                 None, None, None, None, None, None, None,
             ),
+            reaction_emoji: None,
         },
         openrouter: Arc::new(eros_engine_llm::openrouter::OpenRouterClient::new(
             "stub".into(),
