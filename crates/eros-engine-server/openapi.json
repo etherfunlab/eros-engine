@@ -1713,6 +1713,14 @@
   },
   "components": {
     "schemas": {
+      "ActionResponseDto": {
+        "type": "string",
+        "description": "The persona's response to an action, as history reports it.",
+        "enum": [
+          "accept",
+          "refuse"
+        ]
+      },
       "AffinityDeltasDto": {
         "type": "object",
         "description": "Mirror of `eros_engine_core::affinity::AffinityDeltas` with `ToSchema`\nfor OpenAPI emission. Field-for-field conversion both ways.",
@@ -2052,6 +2060,17 @@
           "sent_at"
         ],
         "properties": {
+          "action": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/UserActionView",
+                "description": "The action a user row carried and, once decided, the persona's response. Omitted on rows without an action."
+              }
+            ]
+          },
           "channel": {
             "type": [
               "string",
@@ -2420,6 +2439,17 @@
           "extracted_facts"
         ],
         "properties": {
+          "action": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/UserActionView",
+                "description": "The action a `user` row carried and, once decided, the persona's\nresponse (spec 2026-10-05). Omitted on rows without an action; the BFF\nhistory entry carries the same field."
+              }
+            ]
+          },
           "channel": {
             "type": [
               "string",
@@ -2664,6 +2694,15 @@
             "format": "uuid"
           }
         }
+      },
+      "GiftItemDto": {
+        "type": "string",
+        "description": "What a `give` action hands over.",
+        "enum": [
+          "cigarette",
+          "alcohol",
+          "medicine"
+        ]
       },
       "GreetingDto": {
         "type": "object",
@@ -3449,6 +3488,17 @@
           "client_msg_id"
         ],
         "properties": {
+          "action": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/UserActionDto",
+                "description": "Optional action this turn carries besides the text (see\n[`UserActionDto`]). With an action, `content` may be empty. Cannot be\ncombined with `tips_amount_usd`."
+              }
+            ]
+          },
           "affinity_scope": {
             "oneOf": [
               {
@@ -3575,6 +3625,87 @@
             ]
           }
         }
+      },
+      "UserActionDto": {
+        "type": "object",
+        "description": "An action the user does to the persona this turn, besides talking. The\npersona accepts or does not; a refusal costs the relationship one tier on\nthe line the action touches (`give` → bond, everything else → chemistry).",
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "item": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/GiftItemDto",
+                "description": "`give` only, and required there."
+              }
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`give` only: a short name for what is handed over, 1–32 chars."
+          },
+          "quantity": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "`give` only: 1–99, default 1.",
+            "minimum": 0
+          },
+          "text": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`custom` only, and required there: the action in the user's own\nwords, 1–100 chars."
+          },
+          "type": {
+            "$ref": "#/components/schemas/UserActionKind"
+          }
+        }
+      },
+      "UserActionKind": {
+        "type": "string",
+        "description": "Which action a turn carries (spec 2026-10-05-chat-user-actions-design.md §3.1).",
+        "enum": [
+          "give",
+          "kiss",
+          "hug",
+          "touch",
+          "lick",
+          "custom"
+        ]
+      },
+      "UserActionView": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/UserActionDto"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "response": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ActionResponseDto"
+                  }
+                ]
+              }
+            }
+          }
+        ],
+        "description": "A user row's action as the history routes return it: the action fields as\nsent, plus the decided `response` once the turn has been decided."
       },
       "UserInsightResponse": {
         "type": "object",

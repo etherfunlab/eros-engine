@@ -572,6 +572,7 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
   - `inner_state`：融入 reply prompt 的简短情绪/语气描述
   - `reply_mode`（选填）：这一轮回复与用户消息的关系——`"listen"` / `"follow"` / `"ask"` / `"judge"`，拿不准就 `null`（由引擎的每轮骰子接管）。会切换 reply prompt 铁律 ① 的文案；`listen` 同时把回复长度上限降一档
   - `clothing`（选填）：角色此刻的穿着，一句话——在文本类动作上注入 reply prompt 的 [character_state] 区块内的一行；缺省则不注入
+  - `action_response`（选填）：本轮带用户动作时（上下文里会有 `[用户动作]` 一行）填 `"accept"` 或 `"refuse"`；其他回合或拿不准时填 `null`。`null`、判官调用失败、规则 PDE 一律按接受处理。拒绝会让该动作对应的亲密度线降一档（见 [affinity-model.zh.md](affinity-model.zh.md)）。动作回合里 `ghost` 和 `product_qa` 会改判为 `reply_text`，也不掷每轮骰子
   - `reason`：可选
 - **Fail-open：**任何 LLM 超时或错误都会回退到规则引擎——LLM 判断器绝不会阻塞 chat 响应。
 - **硬安全 guardrail**（在 LLM verdict 之后、规则引擎 fallback 之前强制执行）：前 10 条消息绝不 ghost，绝不连续 ghost 第三次（`ghost_streak ≥ 2` 否决；连两次是允许的），ghost cooldown 为一小时。

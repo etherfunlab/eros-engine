@@ -158,6 +158,15 @@ eval がスキップされた場合(`eval_skip_reason`)や失敗した場合(`ll
 
 ゴーストターンは `persist_with_event` に到達しない。変化するのは `ghost_streak` / `total_ghosts` / `last_ghost_at` のみであり、`record_ghost` はすべてゼロの `effective_deltas` を書き込む。
 
+### 拒否されたアクション
+
+チャットのターンにはユーザーアクションを付けられる（[api-reference.md](api-reference.md) の `action` フィールド）。PDE ジャッジが返信の前に、ペルソナが受け入れるかどうかを決める。明確な拒否がなければエンジンは受け入れとして扱う。
+
+- **受け入れ：** 特別な処理はない。affinity ジャッジはユーザーテキスト中のアクションを見て、通常どおりターンを採点する。
+- **拒否：** アクションが触れるライン（`give` は Bond、身体的なアクションは Chemistry）が 1 段階下がり、下の段階の中で同じ相対位置に着地する。段階 1 のラインは `0` になる。ラインの 2 軸は同じ係数で縮小され、比率は保たれる。着地点は行ロック内でターン前のスナップショットから計算され、そのラインに対するジャッジの採点を置き換える。もう一方のラインと warmth / patience のレベルはジャッジに従う。そのラインの `pending_deltas` はクリアされ、イベント行の `context.tier_drop` にライン名が記録される。affinity 評価がスキップまたは失敗しても降格は適用される。
+
+例：chemistry `0.80`（段階 4 の 64% の位置）は段階 3 の 64% の位置、約 `0.524` に着地する。
+
 ## 4. 基礎ペア導出の詳細(定数とその根拠)
 
 すべての定数には根拠があり、恣意的に決めたものではない。
@@ -367,3 +376,4 @@ DB が書き込みのたびに再計算するため、ライン軸の値との�
 - `crates/eros-engine-server/src/routes/bff/affinity.rs` — BFF affinity インターフェース(value + event)
 - 設計仕様書: `docs/superpowers/specs/2026-08-16-affinity-40-design.md` — ライン数式、エンドポイント導出、ティア
 - 設計仕様書: `docs/superpowers/specs/2026-08-17-affinity-41-design.md` — 永続化されたティアカラム、イベントの状態スナップショット、value エンドポイント
+- 設計仕様書: `docs/superpowers/specs/2026-10-05-chat-user-actions-design.md` — ユーザーアクション、ジャッジの応答、ティア降格

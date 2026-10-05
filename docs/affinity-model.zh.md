@@ -185,6 +185,15 @@ delta 回退已退役。
 Ghost 回合从不进入 `persist_with_event`：只有 `ghost_streak` / `total_ghosts` /
 `last_ghost_at` 移动；`record_ghost` 写全零 `effective_deltas`。
 
+### 被拒绝的动作
+
+聊天回合可以带用户动作（见 [api-reference.zh.md](api-reference.zh.md) 的 `action` 字段）。PDE 判官在生成回复之前决定角色接不接受；没有明确拒绝时，engine 按接受处理。
+
+- **接受：** 没有额外机制。affinity 判官从用户文本里看到这个动作，照常给这一轮打分。
+- **拒绝：** 动作对应的那条线（`give` 动 Bond，身体动作动 Chemistry）降一档，落在下一档内的相同相对位置；第 1 档的线直接归 `0`。这条线的两个轴按同一比例缩放，比例保持不变。落点在行锁内按本轮之前的快照计算，取代判官本轮对这条线的打分；另一条线和 warmth / patience 档照判官走。这条线的 `pending_deltas` 清零，事件行的 `context.tier_drop` 记下是哪条线。affinity 判官被跳过或调用失败时照样降档。
+
+例：chemistry `0.80`（第 4 档内 64% 处）落到第 3 档内 64% 处，约 `0.524`。
+
 ## 基础对派生细节
 
 每个常数都有锚点：
@@ -429,3 +438,4 @@ Migration `0048` 把 `bond`、`chemistry` 重定义为 Postgres
   线的数学、端点派生、档位
 - 设计 spec：`docs/superpowers/specs/2026-08-17-affinity-41-design.md`，
   档位列落库、事件状态快照、绝对值端点
+- 设计 spec：`docs/superpowers/specs/2026-10-05-chat-user-actions-design.md` —— 用户动作、判官的接受与拒绝、降档

@@ -181,6 +181,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
 ///                                              hints/mode dropped (out-of-character aside)
 ///   action_response is settled on the reply arms (settle_action_response) and None on Ghost / ProductQa
 ///   Proactive                               → unreachable! (comes only from decide)
+#[allow(clippy::too_many_arguments)]
 pub fn plan_for(
     input: &DecisionInput,
     action: ActionType,
