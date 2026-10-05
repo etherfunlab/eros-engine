@@ -673,6 +673,26 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
   `code: "invalid_payload"`；未知的 `occasion` 返回 `422`。会话检查与 stream 端点相同（`403`、`404`，语音会话 `409`），
   达到单用户并发上限 `429`。生成失败时返回与图片接口相同的上游错误，不写入任何内容，下次打开（用同一个 key）会重试。
 
+### `PUT /v2/comp/session/{session_id}/message/{message_id}/reaction`
+
+给角色的某条消息点一个 emoji。请求体 `{"emoji": "👍🏽"}`；必须恰好是一个标准 emoji（含肤色变体与 ZWJ 组合），并且在部署允许的范围内（`GET /v2/comp/reactions`）。每条消息只有一个 reaction：发另一个 emoji 会替换，重复发当前这个不做任何改动。
+
+```json
+{"message_id": "…", "emoji": "👍🏽", "reacted_at": "2026-10-05T12:00:00Z"}
+```
+
+返回的 `emoji` 是完整限定形式（`❤` 存为 `❤️`）。角色会在下一个文字回复回合看到用户上一条消息之后新点的 reaction；reaction 本身不触发回复，也不影响亲密度。
+
+错误：`400`（不是恰好一个标准 emoji，或不在允许范围内）、`403`（不是你的会话）、`404`（会话或消息不存在）、`409`（不是 assistant 消息）。
+
+### `DELETE /v2/comp/session/{session_id}/message/{message_id}/reaction`
+
+撤掉 reaction。返回 `204`，原本没有也一样。错误同上（`403` / `404` / `409`）。
+
+### `GET /v2/comp/reactions`
+
+允许的范围：全部标准 emoji 都允许时返回 `{"allowed": null}`，否则返回 `{"allowed": ["👍", "❤️", …]}`——按部署配置顺序列出的基础形 emoji，列出的 emoji 的所有肤色都允许。
+
 ### `GET /comp/chat/{session_id}/history?limit=20&offset=0`
 
 分頁讀消息歷史，最新在前。`limit` 默认 20（上限 50）。
@@ -708,6 +728,8 @@ SSE 帧是整轮最后一帧且只走线上——在它发出前断线，光看 
 它引用的那条消息的 id，一定在同一个 session 里。
 
 `action`（只出现在用户行上）是这一行发送时带的动作，判定之后附 `response`（`"accept"` | `"refuse"`）。
+
+`reaction`（只出现在 assistant 行上）为 `{emoji, reacted_at}`。
 
 `user_message_id` 指向产生这一行的那一轮的 `role='user'` 行。assistant 行和
 `system_error` 通知行上都有，user 行本身省略。通知行最要紧：队列 worker 和
@@ -1301,6 +1323,8 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
 普通轮次、以及锚点没解析成功的轮次都省略该字段，这样冷启动不必自己存状态
 就能把引用重新渲染出来。
 `action`（只出现在用户行上）是这一行发送时带的动作，判定之后附 `response`（`"accept"` | `"refuse"`）。
+
+`reaction`（只出现在 assistant 行上）为 `{emoji, reacted_at}`。
 鑒權、ownership 檢查、`limit ∈ [1, 50]` 夾取
 都與 canonical history 路由相同。**刻意差異：** 默認 `limit` 是 50
 （canonical 默認 20），因為 BFF 是為「冷啟動一次拉一整屏 backscroll」設計的。

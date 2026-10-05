@@ -87,7 +87,7 @@ A comma-separated list, read once in `ServerConfig::from_env`.
   when its base is in the set. Listing 👍 therefore allows 👍🏻 through 👍🏿;
   listing 👍🏽 means the same thing as listing 👍.
 
-`AppState` holds the parsed set as `Option<…>` (`None` = all) and its
+`ServerConfig` holds the parsed set (`ServerConfig::from_env` is fallible and boot fails on a bad entry) as `Option<…>` (`None` = all) and its
 listing order for §5.3.
 
 ## 5. API
@@ -145,7 +145,7 @@ contract as `reply_to_message_id`.
 
 ### 6.1 Which reactions
 
-On a text reply turn driven by a user message, `build_reply_request` reads
+On a text reply turn driven by a user message, `build_reply_request` reads (its callers say whether to — `/open` greetings and edit turns do not)
 the session's reactions set after the **previous** user row:
 
 ```sql
@@ -224,7 +224,7 @@ unused nullable columns; the migration is additive and needs no reverse.
   `reacted_at`; a different emoji restamps it; DELETE clears both; a
   reaction on a `user` row violates the CHECK; the since-query honours the
   bound, the order and the `product_qa` exclusion.
-- **routes.** 404 on a foreign session and on an unknown message; 409 on a
+- **routes.** 403 on someone else's session, 404 on a missing session and on an unknown message; 409 on a
   user row; 400 on invalid and on disallowed emoji; DELETE without a
   reaction is 204; `GET /v2/comp/reactions` in both shapes; history carries
   `reaction` only where set.
