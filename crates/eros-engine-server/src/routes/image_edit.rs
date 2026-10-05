@@ -980,6 +980,8 @@ async fn edit_image(
                 eros_engine_core::scope::AffinityScope::none(),
                 instruction_message_id,
                 None,
+                false,
+                None,
             )
             .await;
         });
