@@ -33,11 +33,22 @@ pub struct ReactionResponse {
 }
 
 /// An assistant row's reaction as the history routes return it.
-#[allow(dead_code)] // consumed by the history routes in the next task
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct ReactionView {
     pub emoji: String,
     pub reacted_at: DateTime<Utc>,
+}
+
+/// The history routes' view of a row's reaction; `None` unless both columns
+/// are set (the table's CHECK keeps them together).
+pub(crate) fn reaction_view(
+    emoji: Option<String>,
+    at: Option<DateTime<Utc>>,
+) -> Option<ReactionView> {
+    Some(ReactionView {
+        emoji: emoji?,
+        reacted_at: at?,
+    })
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -191,6 +202,18 @@ mod tests {
     use crate::routes::companion::test_state;
     use crate::routes::companion::testutil::{seed_genome, seed_instance, seed_session};
     use sqlx::PgPool;
+
+    #[test]
+    fn reaction_view_needs_both_halves() {
+        let at = chrono::DateTime::<Utc>::from_timestamp(1_760_000_000, 0).unwrap();
+        let v = reaction_view(Some("❤️".into()), Some(at)).unwrap();
+        assert_eq!(
+            serde_json::to_value(&v).unwrap(),
+            serde_json::json!({"emoji": "❤️", "reacted_at": at})
+        );
+        assert!(reaction_view(None, None).is_none());
+        assert!(reaction_view(Some("❤️".into()), None).is_none());
+    }
 
     async fn seeded(pool: &PgPool) -> (Uuid, Uuid, Uuid, Uuid) {
         let user_id = Uuid::new_v4();
