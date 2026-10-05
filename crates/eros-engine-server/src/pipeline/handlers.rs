@@ -131,6 +131,22 @@ pub(crate) fn effective_user_text(msg: &eros_engine_store::chat::ChatMessage) ->
 /// history") promises. The leading-sentence strip runs first so §4.3 keeps
 /// operating on the original reply — this is also the shape audit 54's replay
 /// measured. Callers rendering the persisted transcript pass `false`.
+/// The text a `[reactions]` quote is cut from: the message as injected history
+/// shows it (leading sentence and action blocks stripped when `strip`), or the
+/// raw `content` when stripping would leave nothing of a non-blank message.
+pub(crate) fn reaction_quote_source(content: &str, strip: bool) -> String {
+    if !strip {
+        return content.to_string();
+    }
+    let stripped =
+        crate::repetition::strip_action_blocks(&crate::repetition::strip_leading_sentence(content));
+    if stripped.trim().is_empty() && !content.trim().is_empty() {
+        content.to_string()
+    } else {
+        stripped
+    }
+}
+
 pub(crate) fn model_facing_assistant_text(
     msg: &eros_engine_store::chat::ChatMessage,
     strip: bool,
@@ -937,11 +953,17 @@ pub(crate) async fn build_reply_request(
                 tracing::warn!(error = %e, session_id = %session_id, "reactions read failed; [reactions] omitted");
                 Vec::new()
             });
+        let strip = !state.config.chat_noise_cancellation_disabled;
+        let sources: Vec<String> = reacted
+            .iter()
+            .map(|r| reaction_quote_source(&r.content, strip))
+            .collect();
         let lines: Vec<crate::prompt::ReactionLine<'_>> = reacted
             .iter()
-            .map(|r| crate::prompt::ReactionLine {
-                content: &r.content,
-                is_image: r.metadata.as_ref().and_then(|m| m.get("image")).is_some(),
+            .zip(&sources)
+            .map(|(r, src)| crate::prompt::ReactionLine {
+                content: src,
+                is_image: r.is_image,
                 emoji: &r.reaction,
             })
             .collect();
@@ -3641,10 +3663,25 @@ mod tests {
         };
         let with = system(true).await;
         assert!(
-            with.contains("[reactions]\n对方给你说的「今晚想吃什么」回了 ❤️"),
+            with.contains("[reactions]\n你说的「今晚想吃什么」，对方回了 ❤️"),
             "{with}"
         );
         let without = system(false).await;
         assert!(!without.contains("[reactions]"), "{without}");
+    }
+
+    #[test]
+    fn reaction_quote_source_matches_what_history_shows() {
+        assert_eq!(
+            reaction_quote_source("唔。（凑近）今晚想吃什么", true),
+            "今晚想吃什么"
+        );
+        // Stripping would empty it: the raw text still identifies the message.
+        assert_eq!(reaction_quote_source("（凑近）", true), "（凑近）");
+        assert_eq!(
+            reaction_quote_source("唔。（凑近）今晚想吃什么", false),
+            "唔。（凑近）今晚想吃什么"
+        );
+        assert_eq!(reaction_quote_source("  ", true), "");
     }
 }

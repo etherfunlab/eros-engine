@@ -698,21 +698,23 @@ pub(crate) struct ReactionLine<'a> {
 const REACTION_QUOTE_CHARS: usize = 20;
 
 /// The per-turn `[reactions]` fragment: what the user reacted to since their
-/// previous message, oldest first. Empty when there is nothing to say.
+/// previous message, oldest first. Each line names the persona's own message
+/// with 「你」 and the reactor with 「对方」. The quote has its whitespace
+/// collapsed to single spaces before the cut. Empty when there is nothing to say.
 pub(crate) fn reactions_context(lines: &[ReactionLine<'_>]) -> String {
     let body: Vec<String> = lines
         .iter()
         .filter_map(|l| {
-            let text = l.content.trim();
+            let text = l.content.split_whitespace().collect::<Vec<_>>().join(" ");
             if text.is_empty() {
                 l.is_image
-                    .then(|| format!("对方给你发的照片回了 {}", l.emoji))
+                    .then(|| format!("你发的照片，对方回了 {}", l.emoji))
             } else {
                 let mut quote: String = text.chars().take(REACTION_QUOTE_CHARS).collect();
                 if text.chars().count() > REACTION_QUOTE_CHARS {
                     quote.push('…');
                 }
-                Some(format!("对方给你说的「{quote}」回了 {}", l.emoji))
+                Some(format!("你说的「{quote}」，对方回了 {}", l.emoji))
             }
         })
         .collect();
@@ -3942,8 +3944,18 @@ mod tests {
         ]);
         assert_eq!(
             s,
-            "\n\n[reactions]\n对方给你说的「今晚想吃什么」回了 ❤️\n对方给你发的照片回了 🔥\n对方给你说的「一二三四五六七八九十一二三四五六七八九十…」回了 😂"
+            "\n\n[reactions]\n你说的「今晚想吃什么」，对方回了 ❤️\n你发的照片，对方回了 🔥\n你说的「一二三四五六七八九十一二三四五六七八九十…」，对方回了 😂"
         );
+    }
+
+    #[test]
+    fn reactions_context_collapses_whitespace_in_the_quote() {
+        let s = reactions_context(&[ReactionLine {
+            content: "第一行\n\n第二行",
+            is_image: false,
+            emoji: "❤️",
+        }]);
+        assert_eq!(s, "\n\n[reactions]\n你说的「第一行 第二行」，对方回了 ❤️");
     }
 
     #[test]

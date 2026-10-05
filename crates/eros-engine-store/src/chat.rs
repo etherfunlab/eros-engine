@@ -192,7 +192,8 @@ pub struct ChatMessageSlim {
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ReactedMessage {
     pub content: String,
-    pub metadata: Option<serde_json::Value>,
+    /// The row carries a `metadata.image` marker.
+    pub is_image: bool,
     pub reaction: String,
 }
 
@@ -446,10 +447,12 @@ impl<'a> ChatRepo<'a> {
         Ok(())
     }
 
-    /// Reactions set in `session_id` after the user row that precedes
-    /// `user_message_id` — the ones the persona has not had a turn to see
+    /// Reactions set in `session_id` after the newest user/gift_user row sent
+    /// strictly before `user_message_id`'s row, and at or before that row's
+    /// `sent_at` — the ones this turn has not seen and no later turn should
     /// (spec §6.1). Session-wide, not bounded by the history window. With no
-    /// previous user row the session's start is the bound. Oldest first;
+    /// previous user row the session's start is the lower bound; a
+    /// `user_message_id` outside the session yields nothing. Oldest first;
     /// `product_qa` rows never count.
     pub async fn reactions_since_previous_user_row(
         &self,
@@ -457,15 +460,21 @@ impl<'a> ChatRepo<'a> {
         user_message_id: Uuid,
     ) -> Result<Vec<ReactedMessage>, sqlx::Error> {
         sqlx::query_as::<_, ReactedMessage>(
-            "SELECT m.content, m.metadata, m.reaction FROM engine.chat_messages m \
-             WHERE m.session_id = $1 AND m.reaction IS NOT NULL \
+            "WITH cur AS ( \
+                 SELECT sent_at FROM engine.chat_messages WHERE id = $2 AND session_id = $1 \
+             ) \
+             SELECT m.content, COALESCE(m.metadata ? 'image', false) AS is_image, m.reaction \
+             FROM engine.chat_messages m, cur \
+             WHERE m.session_id = $1 \
+               AND m.reaction IS NOT NULL \
                AND m.channel IS DISTINCT FROM 'product_qa' \
+               AND m.reacted_at <= cur.sent_at \
                AND m.reacted_at > COALESCE( \
-                 (SELECT max(p.sent_at) FROM engine.chat_messages p \
-                    JOIN engine.chat_messages cur ON cur.id = $2 \
-                   WHERE p.session_id = $1 AND p.role IN ('user', 'gift_user') \
-                     AND p.sent_at < cur.sent_at), \
-                 '-infinity'::timestamptz) \
+                     (SELECT p.sent_at FROM engine.chat_messages p \
+                       WHERE p.session_id = $1 AND p.role IN ('user', 'gift_user') \
+                         AND p.sent_at < cur.sent_at \
+                       ORDER BY p.sent_at DESC LIMIT 1), \
+                     '-infinity'::timestamptz) \
              ORDER BY m.reacted_at",
         )
         .bind(session_id)
@@ -5024,9 +5033,11 @@ mod tests {
         assert_eq!(e1, "❤️");
         let (_, t2) = repo.set_reaction(a, "❤️").await.unwrap().unwrap();
         assert_eq!(t1, t2, "re-sending the current emoji keeps reacted_at");
+        react_at(&pool, a, "❤️", "2026-10-01T10:00:00Z").await;
+        let pinned: chrono::DateTime<chrono::Utc> = "2026-10-01T10:00:00Z".parse().unwrap();
         let (e3, t3) = repo.set_reaction(a, "🔥").await.unwrap().unwrap();
         assert_eq!(e3, "🔥");
-        assert!(t3 >= t1, "a different emoji restamps");
+        assert!(t3 > pinned, "a different emoji restamps");
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -5143,8 +5154,7 @@ mod tests {
             )
             .await;
         }
-        let prev = insert_row(&pool, s.id, "user", "上一条", "2026-10-01T10:00:00Z").await;
-        let _ = prev;
+        let _prev = insert_row(&pool, s.id, "user", "上一条", "2026-10-01T10:00:00Z").await;
         let cur = insert_row(&pool, s.id, "user", "这一条", "2026-10-01T11:00:00Z").await;
         react_at(&pool, far, "❤️", "2026-10-01T10:30:00Z").await;
         let got = ChatRepo { pool: &pool }
@@ -5153,6 +5163,64 @@ mod tests {
             .unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].content, "很久以前");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn reactions_since_previous_user_row_stops_at_the_current_row(pool: PgPool) {
+        let s = throwaway_session(&pool).await;
+        let a = insert_row(&pool, s.id, "assistant", "早", "2026-10-01T09:00:00Z").await;
+        let _prev = insert_row(&pool, s.id, "user", "上一条", "2026-10-01T10:00:00Z").await;
+        let cur = insert_row(&pool, s.id, "user", "这一条", "2026-10-01T11:00:00Z").await;
+        let b = insert_row(&pool, s.id, "assistant", "晚", "2026-10-01T10:10:00Z").await;
+        react_at(&pool, b, "❤️", "2026-10-01T10:30:00Z").await;
+        react_at(&pool, a, "🔥", "2026-10-01T11:30:00Z").await;
+        let got = ChatRepo { pool: &pool }
+            .reactions_since_previous_user_row(s.id, cur)
+            .await
+            .unwrap();
+        let seen: Vec<(&str, &str)> = got
+            .iter()
+            .map(|r| (r.content.as_str(), r.reaction.as_str()))
+            .collect();
+        assert_eq!(seen, vec![("晚", "❤️")]);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn reactions_since_previous_user_row_is_empty_for_a_foreign_message_id(pool: PgPool) {
+        let s = throwaway_session(&pool).await;
+        let a = insert_row(&pool, s.id, "assistant", "早", "2026-10-01T10:00:00Z").await;
+        react_at(&pool, a, "❤️", "2026-10-01T10:30:00Z").await;
+        let got = ChatRepo { pool: &pool }
+            .reactions_since_previous_user_row(s.id, Uuid::new_v4())
+            .await
+            .unwrap();
+        assert!(got.is_empty());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn reactions_since_previous_user_row_flags_image_rows(pool: PgPool) {
+        let s = throwaway_session(&pool).await;
+        let _prev = insert_row(&pool, s.id, "user", "上一条", "2026-10-01T10:00:00Z").await;
+        let img = insert_row(&pool, s.id, "assistant", "", "2026-10-01T10:00:05Z").await;
+        let txt = insert_row(&pool, s.id, "assistant", "文字", "2026-10-01T10:00:06Z").await;
+        let cur = insert_row(&pool, s.id, "user", "这一条", "2026-10-01T11:00:00Z").await;
+        sqlx::query("UPDATE engine.chat_messages SET metadata = $2::jsonb WHERE id = $1")
+            .bind(img)
+            .bind(r#"{"image": {"caption": "海边"}}"#)
+            .execute(&pool)
+            .await
+            .unwrap();
+        react_at(&pool, img, "🔥", "2026-10-01T10:20:00Z").await;
+        react_at(&pool, txt, "❤️", "2026-10-01T10:30:00Z").await;
+        let got = ChatRepo { pool: &pool }
+            .reactions_since_previous_user_row(s.id, cur)
+            .await
+            .unwrap();
+        let seen: Vec<(bool, &str)> = got
+            .iter()
+            .map(|r| (r.is_image, r.content.as_str()))
+            .collect();
+        assert_eq!(seen, vec![(true, ""), (false, "文字")]);
     }
 
     #[sqlx::test(migrations = "./migrations")]
