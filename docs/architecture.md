@@ -180,7 +180,7 @@ crates/
 │       ├── voyage.rs         # 512-dim embeddings, fail-loud on empty key
 │       └── model_config.rs   # TOML loader
 ├── eros-engine-store/
-│   ├── migrations/           # 0000_schema → 0064_chat_messages_open_key
+│   ├── migrations/           # 0000_schema → 0065_chat_messages_reaction
 │   └── src/
 │       ├── pool.rs           # PgPoolOptions builder
 │       ├── chat.rs           # ChatRepo
@@ -199,7 +199,7 @@ crates/
         ├── auth/             # AuthValidator trait + Supabase impl + middleware
         ├── pipeline/         # stream (run_stream) / handlers / post_process / dreaming / …
         ├── prompt.rs         # system-prompt builder (affinity → directives)
-        ├── routes/           # health / companion / companion_stream / companion_async / insight / image_edit / voice / persona / session_open / world_town / bff / dto / mod
+        ├── routes/           # health / companion / companion_stream / companion_async / insight / image_edit / voice / persona / session_open / reaction / world_town / bff / dto / mod
         └── openapi.rs        # utoipa ApiDoc spec metadata
 ```
 
