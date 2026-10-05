@@ -1268,6 +1268,34 @@
         ]
       }
     },
+    "/v2/comp/reactions": {
+      "get": {
+        "tags": [
+          "companion"
+        ],
+        "operationId": "get_reaction_allowlist",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReactionAllowlistResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v2/comp/session/{session_id}/message/async": {
       "post": {
         "tags": [
@@ -1464,6 +1492,128 @@
           },
           "5XX": {
             "description": "composer chain exhausted; the provider's own status passes through, same body as the compose endpoint"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v2/comp/session/{session_id}/message/{message_id}/reaction": {
+      "put": {
+        "tags": [
+          "companion"
+        ],
+        "operationId": "put_reaction",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Chat session id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "message_id",
+            "in": "path",
+            "description": "An assistant message in that session",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReactionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReactionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "not exactly one standard emoji, or not allowed on this deployment"
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "not your session"
+          },
+          "404": {
+            "description": "session or message not found"
+          },
+          "409": {
+            "description": "not an assistant message"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "companion"
+        ],
+        "operationId": "delete_reaction",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Chat session id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "message_id",
+            "in": "path",
+            "description": "An assistant message in that session",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "reaction cleared (or there was none)"
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "not your session"
+          },
+          "404": {
+            "description": "session or message not found"
+          },
+          "409": {
+            "description": "not an assistant message"
           }
         },
         "security": [
@@ -2097,6 +2247,17 @@
             "type": "boolean",
             "description": "Present (always `true`) only on assistant rows whose turn delegated an\nimage to the consumer (`metadata.image` marker recorded) — key-presence\ncontract like `read_at`. Recover the payload via\n`GET /comp/chat/{session_id}/messages/{message_id}/image-request`; a 404\nthere on a flagged row means the composed prompt was never recorded\n(fail-open audit) — genuinely unrecoverable. Spec:\ndocs/superpowers/specs/2026-08-21-image-turn-discovery-design.md."
           },
+          "reaction": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ReactionView",
+                "description": "The user's reaction on an assistant row: the emoji and when it was set.\nOmitted on rows without one."
+              }
+            ]
+          },
           "read_at": {
             "type": [
               "string",
@@ -2471,6 +2632,17 @@
           "image": {
             "type": "boolean",
             "description": "Present (always `true`) only on assistant rows whose turn delegated an\nimage to the consumer (`metadata.image` marker recorded) — key-presence\ncontract like `read_at`. Recover the payload via the `image-request`\nendpoint; a 404 there on a flagged row means the composed prompt was\nnever recorded (fail-open audit) — genuinely unrecoverable."
+          },
+          "reaction": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ReactionView",
+                "description": "The user's reaction on an assistant row: the emoji and when it was set.\nOmitted on rows without one."
+              }
+            ]
           },
           "read_at": {
             "type": [
@@ -3352,6 +3524,72 @@
           "text": {
             "type": "string",
             "description": "Verbatim text inserted under `[additional_guidance]` in the system prompt.\n1 ≤ chars ≤ 2000 after trim."
+          }
+        }
+      },
+      "ReactionAllowlistResponse": {
+        "type": "object",
+        "properties": {
+          "allowed": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "`null`: every standard emoji. Otherwise the allowed base emoji, in the\ndeployment's order; every skin tone of a listed emoji is allowed."
+          }
+        }
+      },
+      "ReactionRequest": {
+        "type": "object",
+        "required": [
+          "emoji"
+        ],
+        "properties": {
+          "emoji": {
+            "type": "string",
+            "description": "Exactly one standard emoji; skin-tone variants included."
+          }
+        }
+      },
+      "ReactionResponse": {
+        "type": "object",
+        "required": [
+          "message_id",
+          "emoji",
+          "reacted_at"
+        ],
+        "properties": {
+          "emoji": {
+            "type": "string",
+            "description": "The emoji as stored: fully qualified."
+          },
+          "message_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "reacted_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "ReactionView": {
+        "type": "object",
+        "description": "An assistant row's reaction as the history routes return it.",
+        "required": [
+          "emoji",
+          "reacted_at"
+        ],
+        "properties": {
+          "emoji": {
+            "type": "string"
+          },
+          "reacted_at": {
+            "type": "string",
+            "format": "date-time"
           }
         }
       },

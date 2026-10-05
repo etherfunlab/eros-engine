@@ -77,6 +77,15 @@ pub struct ChatMessage {
     /// tips and for `user` rows on the voice channel.
     #[serde(default)]
     pub read_at: Option<DateTime<Utc>>,
+    /// The emoji the user reacted to this assistant row with (migration
+    /// 0065), fully qualified; `None` when there is none.
+    #[serde(default)]
+    #[sqlx(default)]
+    pub reaction: Option<String>,
+    /// When the current reaction was set; `None` exactly when `reaction` is.
+    #[serde(default)]
+    #[sqlx(default)]
+    pub reacted_at: Option<DateTime<Utc>>,
 }
 
 /// A persisted assistant row plus the generation facts an idempotent replay
@@ -140,6 +149,12 @@ pub struct ChatMessageSlim {
     /// Read receipt (migration 0053). See `ChatMessage::read_at`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_at: Option<DateTime<Utc>>,
+    /// See `ChatMessage::reaction`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reaction: Option<String>,
+    /// See `ChatMessage::reacted_at`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reacted_at: Option<DateTime<Utc>>,
     /// `true` iff the row's `metadata.image` marker is present — the turn
     /// delegated an image to the consumer. Projected as
     /// `(metadata->'image' IS NOT NULL)` so the slim query stays slim.
@@ -170,6 +185,16 @@ pub struct ChatMessageSlim {
     /// has disconnected, so history is the only place it can read them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_message_id: Option<Uuid>,
+}
+
+/// An assistant row's reaction as the next reply turn renders it (spec
+/// 2026-10-05-message-reactions-design.md §6).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ReactedMessage {
+    pub content: String,
+    /// The row carries a `metadata.image` marker.
+    pub is_image: bool,
+    pub reaction: String,
 }
 
 pub struct ChatRepo<'a> {
@@ -387,6 +412,77 @@ impl<'a> ChatRepo<'a> {
         .await
     }
 
+    /// Set the user's reaction on an assistant row (spec 2026-10-05-message-
+    /// reactions-design.md §5.1). Re-sending the current emoji keeps its
+    /// `reacted_at`, so it is not surfaced to the persona again; a different
+    /// emoji restamps it. `None` when the row is not an assistant row.
+    pub async fn set_reaction(
+        &self,
+        message_id: Uuid,
+        emoji: &str,
+    ) -> Result<Option<(String, DateTime<Utc>)>, sqlx::Error> {
+        sqlx::query_as(
+            "UPDATE engine.chat_messages \
+             SET reaction = $2, \
+                 reacted_at = CASE WHEN reaction IS NOT DISTINCT FROM $2 \
+                                   THEN reacted_at ELSE now() END \
+             WHERE id = $1 AND role = 'assistant' \
+             RETURNING reaction, reacted_at",
+        )
+        .bind(message_id)
+        .bind(emoji)
+        .fetch_optional(self.pool)
+        .await
+    }
+
+    /// Clear the reaction on an assistant row. Idempotent.
+    pub async fn clear_reaction(&self, message_id: Uuid) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE engine.chat_messages SET reaction = NULL, reacted_at = NULL \
+             WHERE id = $1 AND role = 'assistant'",
+        )
+        .bind(message_id)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Reactions set in `session_id` after the newest user/gift_user row sent
+    /// strictly before `user_message_id`'s row, and at or before that row's
+    /// `sent_at` — the ones this turn has not seen and no later turn should
+    /// (spec §6.1). Session-wide, not bounded by the history window. With no
+    /// previous user row the session's start is the lower bound; a
+    /// `user_message_id` outside the session yields nothing. Oldest first;
+    /// `product_qa` rows never count.
+    pub async fn reactions_since_previous_user_row(
+        &self,
+        session_id: Uuid,
+        user_message_id: Uuid,
+    ) -> Result<Vec<ReactedMessage>, sqlx::Error> {
+        sqlx::query_as::<_, ReactedMessage>(
+            "WITH cur AS ( \
+                 SELECT sent_at FROM engine.chat_messages WHERE id = $2 AND session_id = $1 \
+             ) \
+             SELECT m.content, COALESCE(m.metadata ? 'image', false) AS is_image, m.reaction \
+             FROM engine.chat_messages m, cur \
+             WHERE m.session_id = $1 \
+               AND m.reaction IS NOT NULL \
+               AND m.channel IS DISTINCT FROM 'product_qa' \
+               AND m.reacted_at <= cur.sent_at \
+               AND m.reacted_at > COALESCE( \
+                     (SELECT p.sent_at FROM engine.chat_messages p \
+                       WHERE p.session_id = $1 AND p.role IN ('user', 'gift_user') \
+                         AND p.sent_at < cur.sent_at \
+                       ORDER BY p.sent_at DESC LIMIT 1), \
+                     '-infinity'::timestamptz) \
+             ORDER BY m.reacted_at",
+        )
+        .bind(session_id)
+        .bind(user_message_id)
+        .fetch_all(self.pool)
+        .await
+    }
+
     /// Projection-narrowed read used by BFF endpoints (and any caller that
     /// doesn't need `extracted_facts` / idempotency / SSE metadata). Same
     /// DESC+reverse trick as `history()` so the result is chronological.
@@ -400,7 +496,7 @@ impl<'a> ChatRepo<'a> {
         let mut rows = sqlx::query_as::<_, ChatMessageSlim>(
             "SELECT id, role, content, sent_at, client_msg_id, \
                     metadata->>'tips_amount_usd' AS tips_amount_usd, \
-                    channel, read_at, \
+                    channel, read_at, reaction, reacted_at, \
                     (metadata->'image' IS NOT NULL) AS image, \
                     metadata->>'reply_to_message_id' AS reply_to_message_id, \
                     metadata->'action' AS action, \
@@ -4894,5 +4990,249 @@ mod tests {
             with,
             vec![serde_json::json!({"type": "hug", "response": "accept"})]
         );
+    }
+
+    async fn insert_row(
+        pool: &PgPool,
+        session_id: Uuid,
+        role: &str,
+        content: &str,
+        sent_at: &str,
+    ) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+             VALUES ($1, $2, $3, $4::timestamptz) RETURNING id",
+        )
+        .bind(session_id)
+        .bind(role)
+        .bind(content)
+        .bind(sent_at)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn react_at(pool: &PgPool, id: Uuid, emoji: &str, at: &str) {
+        sqlx::query(
+            "UPDATE engine.chat_messages SET reaction = $2, reacted_at = $3::timestamptz WHERE id = $1",
+        )
+        .bind(id)
+        .bind(emoji)
+        .bind(at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn set_reaction_sets_both_and_keeps_the_time_on_the_same_emoji(pool: PgPool) {
+        let s = throwaway_session(&pool).await;
+        let a = insert_row(&pool, s.id, "assistant", "早", "2026-10-01T10:00:00Z").await;
+        let repo = ChatRepo { pool: &pool };
+        let (e1, t1) = repo.set_reaction(a, "❤️").await.unwrap().unwrap();
+        assert_eq!(e1, "❤️");
+        let (_, t2) = repo.set_reaction(a, "❤️").await.unwrap().unwrap();
+        assert_eq!(t1, t2, "re-sending the current emoji keeps reacted_at");
+        react_at(&pool, a, "❤️", "2026-10-01T10:00:00Z").await;
+        let pinned: chrono::DateTime<chrono::Utc> = "2026-10-01T10:00:00Z".parse().unwrap();
+        let (e3, t3) = repo.set_reaction(a, "🔥").await.unwrap().unwrap();
+        assert_eq!(e3, "🔥");
+        assert!(t3 > pinned, "a different emoji restamps");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn clear_reaction_clears_both_and_is_idempotent(pool: PgPool) {
+        let s = throwaway_session(&pool).await;
+        let a = insert_row(&pool, s.id, "assistant", "早", "2026-10-01T10:00:00Z").await;
+        let repo = ChatRepo { pool: &pool };
+        repo.set_reaction(a, "👍").await.unwrap();
+        repo.clear_reaction(a).await.unwrap();
+        repo.clear_reaction(a).await.unwrap();
+        let (r, t): (Option<String>, Option<chrono::DateTime<chrono::Utc>>) =
+            sqlx::query_as("SELECT reaction, reacted_at FROM engine.chat_messages WHERE id = $1")
+                .bind(a)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!((r, t), (None, None));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn reactions_live_on_assistant_rows_only(pool: PgPool) {
+        let s = throwaway_session(&pool).await;
+        let u = insert_row(&pool, s.id, "user", "hi", "2026-10-01T10:00:00Z").await;
+        let repo = ChatRepo { pool: &pool };
+        assert!(repo.set_reaction(u, "👍").await.unwrap().is_none());
+        let err = sqlx::query(
+            "UPDATE engine.chat_messages SET reaction = '👍', reacted_at = now() WHERE id = $1",
+        )
+        .bind(u)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("chat_messages_reaction_assistant_only"),
+            "{err}"
+        );
+        let half = sqlx::query("UPDATE engine.chat_messages SET reaction = '👍' WHERE id = $1")
+            .bind(u)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        assert!(
+            half.to_string().contains("chat_messages_reaction"),
+            "{half}"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn reactions_since_previous_user_row_bounds_orders_and_excludes_product_qa(pool: PgPool) {
+        let s = throwaway_session(&pool).await;
+        let old = insert_row(&pool, s.id, "assistant", "旧的那句", "2026-10-01T09:00:00Z").await;
+        let _u1 = insert_row(&pool, s.id, "user", "上一条", "2026-10-01T10:00:00Z").await;
+        let a1 = insert_row(
+            &pool,
+            s.id,
+            "assistant",
+            "今晚想吃什么",
+            "2026-10-01T10:00:05Z",
+        )
+        .await;
+        let a2 = insert_row(&pool, s.id, "assistant", "", "2026-10-01T10:00:06Z").await;
+        let qa = insert_row(&pool, s.id, "assistant", "产品说明", "2026-10-01T10:00:07Z").await;
+        sqlx::query("UPDATE engine.chat_messages SET channel = 'product_qa' WHERE id = $1")
+            .bind(qa)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let u2 = insert_row(&pool, s.id, "user", "这一条", "2026-10-01T11:00:00Z").await;
+        react_at(&pool, old, "😂", "2026-10-01T09:30:00Z").await; // before the previous user row
+        react_at(&pool, a2, "🔥", "2026-10-01T10:30:00Z").await;
+        react_at(&pool, a1, "❤️", "2026-10-01T10:20:00Z").await;
+        react_at(&pool, qa, "👍", "2026-10-01T10:40:00Z").await;
+
+        let got = ChatRepo { pool: &pool }
+            .reactions_since_previous_user_row(s.id, u2)
+            .await
+            .unwrap();
+        let seen: Vec<(&str, &str)> = got
+            .iter()
+            .map(|r| (r.content.as_str(), r.reaction.as_str()))
+            .collect();
+        assert_eq!(seen, vec![("今晚想吃什么", "❤️"), ("", "🔥")]);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn reactions_since_previous_user_row_with_no_previous_user_row(pool: PgPool) {
+        let s = throwaway_session(&pool).await;
+        let greet = insert_row(&pool, s.id, "assistant", "你好呀", "2026-10-01T09:00:00Z").await;
+        let first = insert_row(&pool, s.id, "user", "嗨", "2026-10-01T10:00:00Z").await;
+        react_at(&pool, greet, "👋", "2026-10-01T09:10:00Z").await;
+        let got = ChatRepo { pool: &pool }
+            .reactions_since_previous_user_row(s.id, first)
+            .await
+            .unwrap();
+        assert_eq!(
+            got.len(),
+            1,
+            "no previous user row: the session's start is the bound"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn reactions_since_previous_user_row_ignores_the_history_window(pool: PgPool) {
+        let s = throwaway_session(&pool).await;
+        let far = insert_row(&pool, s.id, "assistant", "很久以前", "2026-09-01T09:00:00Z").await;
+        for i in 0..30 {
+            insert_row(
+                &pool,
+                s.id,
+                "assistant",
+                &format!("填充{i}"),
+                &format!("2026-09-02T09:{i:02}:00Z"),
+            )
+            .await;
+        }
+        let _prev = insert_row(&pool, s.id, "user", "上一条", "2026-10-01T10:00:00Z").await;
+        let cur = insert_row(&pool, s.id, "user", "这一条", "2026-10-01T11:00:00Z").await;
+        react_at(&pool, far, "❤️", "2026-10-01T10:30:00Z").await;
+        let got = ChatRepo { pool: &pool }
+            .reactions_since_previous_user_row(s.id, cur)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].content, "很久以前");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn reactions_since_previous_user_row_stops_at_the_current_row(pool: PgPool) {
+        let s = throwaway_session(&pool).await;
+        let a = insert_row(&pool, s.id, "assistant", "早", "2026-10-01T09:00:00Z").await;
+        let _prev = insert_row(&pool, s.id, "user", "上一条", "2026-10-01T10:00:00Z").await;
+        let cur = insert_row(&pool, s.id, "user", "这一条", "2026-10-01T11:00:00Z").await;
+        let b = insert_row(&pool, s.id, "assistant", "晚", "2026-10-01T10:10:00Z").await;
+        react_at(&pool, b, "❤️", "2026-10-01T10:30:00Z").await;
+        react_at(&pool, a, "🔥", "2026-10-01T11:30:00Z").await;
+        let got = ChatRepo { pool: &pool }
+            .reactions_since_previous_user_row(s.id, cur)
+            .await
+            .unwrap();
+        let seen: Vec<(&str, &str)> = got
+            .iter()
+            .map(|r| (r.content.as_str(), r.reaction.as_str()))
+            .collect();
+        assert_eq!(seen, vec![("晚", "❤️")]);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn reactions_since_previous_user_row_is_empty_for_a_foreign_message_id(pool: PgPool) {
+        let s = throwaway_session(&pool).await;
+        let a = insert_row(&pool, s.id, "assistant", "早", "2026-10-01T10:00:00Z").await;
+        react_at(&pool, a, "❤️", "2026-10-01T10:30:00Z").await;
+        let got = ChatRepo { pool: &pool }
+            .reactions_since_previous_user_row(s.id, Uuid::new_v4())
+            .await
+            .unwrap();
+        assert!(got.is_empty());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn reactions_since_previous_user_row_flags_image_rows(pool: PgPool) {
+        let s = throwaway_session(&pool).await;
+        let _prev = insert_row(&pool, s.id, "user", "上一条", "2026-10-01T10:00:00Z").await;
+        let img = insert_row(&pool, s.id, "assistant", "", "2026-10-01T10:00:05Z").await;
+        let txt = insert_row(&pool, s.id, "assistant", "文字", "2026-10-01T10:00:06Z").await;
+        let cur = insert_row(&pool, s.id, "user", "这一条", "2026-10-01T11:00:00Z").await;
+        sqlx::query("UPDATE engine.chat_messages SET metadata = $2::jsonb WHERE id = $1")
+            .bind(img)
+            .bind(r#"{"image": {"caption": "海边"}}"#)
+            .execute(&pool)
+            .await
+            .unwrap();
+        react_at(&pool, img, "🔥", "2026-10-01T10:20:00Z").await;
+        react_at(&pool, txt, "❤️", "2026-10-01T10:30:00Z").await;
+        let got = ChatRepo { pool: &pool }
+            .reactions_since_previous_user_row(s.id, cur)
+            .await
+            .unwrap();
+        let seen: Vec<(bool, &str)> = got
+            .iter()
+            .map(|r| (r.is_image, r.content.as_str()))
+            .collect();
+        assert_eq!(seen, vec![(true, ""), (false, "文字")]);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn history_slim_projects_the_reaction(pool: PgPool) {
+        let s = throwaway_session(&pool).await;
+        let a = insert_row(&pool, s.id, "assistant", "早", "2026-10-01T10:00:00Z").await;
+        react_at(&pool, a, "❤️", "2026-10-01T10:30:00Z").await;
+        let rows = ChatRepo { pool: &pool }
+            .history_slim(s.id, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(rows[0].reaction.as_deref(), Some("❤️"));
+        assert!(rows[0].reacted_at.is_some());
     }
 }

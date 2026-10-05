@@ -5324,7 +5324,7 @@ pub fn run_stream(
                 let req_res = crate::pipeline::handlers::build_reply_request(
                     &state, &input, &plan,
                     user_msg.session_id, user_msg.user_id, user_msg.instance_id,
-                    user_msg.user_message_id, &now_ctx,
+                    user_msg.user_message_id, &now_ctx, true,
                 ).await;
                 let (req, injected_tags) = match req_res {
                     Ok(r) => r,
@@ -7288,6 +7288,8 @@ mod tests {
                 pre_filter_content: None,
                 metadata: None,
                 read_at: None,
+                reaction: None,
+                reacted_at: None,
             },
         };
 
@@ -7347,6 +7349,8 @@ mod tests {
                 pre_filter_content: None,
                 metadata: Some(serde_json::json!({ "fallback_reason": reason })),
                 read_at: None,
+                reaction: None,
+                reacted_at: None,
             },
         };
 
@@ -7424,6 +7428,8 @@ mod tests {
                 pre_filter_content: None,
                 metadata: None,
                 read_at: None,
+                reaction: None,
+                reacted_at: None,
             },
         };
 
@@ -7498,6 +7504,8 @@ mod tests {
                 pre_filter_content: None,
                 metadata: None,
                 read_at: None,
+                reaction: None,
+                reacted_at: None,
             },
         };
 
@@ -10359,6 +10367,8 @@ data: [DONE]\n\n";
                 pre_filter_content: None,
                 metadata: None,
                 read_at: None,
+                reaction: None,
+                reacted_at: None,
             },
         };
 

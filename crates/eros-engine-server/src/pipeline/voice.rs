@@ -1033,6 +1033,8 @@ mod tests {
             reply_to_message_id: None,
             action: None,
             user_message_id: None,
+            reaction: None,
+            reacted_at: None,
         }
     }
 

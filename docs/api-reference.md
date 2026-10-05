@@ -810,6 +810,35 @@ occasion that is not true of the session returns `null` without generating.
   failed generation returns the upstream error the image endpoints return and
   persists nothing; the next open (with the same key) retries.
 
+### `PUT /v2/comp/session/{session_id}/message/{message_id}/reaction`
+
+React to one of the persona's messages with one emoji. Body `{"emoji": "👍🏽"}`;
+the emoji must be exactly one standard emoji (skin-tone variants and ZWJ
+sequences included) and inside the deployment's allowed range
+(`GET /v2/comp/reactions`). One reaction per message: sending another emoji
+replaces it; re-sending the current one changes nothing.
+
+```json
+{"message_id": "…", "emoji": "👍🏽", "reacted_at": "2026-10-05T12:00:00Z"}
+```
+
+`emoji` comes back fully qualified (`❤` is stored as `❤️`). The persona sees
+reactions set since the user's previous message on the next text reply turn;
+a reaction never triggers a reply and never moves affinity.
+
+Errors: `400` (not exactly one standard emoji, or not allowed), `403` (not your
+session), `404` (session or message not found), `409` (not an assistant message).
+
+### `DELETE /v2/comp/session/{session_id}/message/{message_id}/reaction`
+
+Clears the reaction. `204`, also when there was none. Same `403` / `404` / `409`.
+
+### `GET /v2/comp/reactions`
+
+The allowed range: `{"allowed": null}` when every standard emoji is allowed,
+otherwise `{"allowed": ["👍", "❤️", …]}` — base emoji in the deployment's
+order; every skin tone of a listed emoji is allowed.
+
 ### `GET /comp/chat/{session_id}/history?limit=20&offset=0`
 
 Paginated message history, newest first. `limit` defaults to 20 (capped at 50).
@@ -853,6 +882,8 @@ session.
 
 `action` (user rows only, omitted otherwise) is the action the row was sent
 with, plus `response` (`"accept"` | `"refuse"`) once the turn was decided.
+
+`reaction` (assistant rows only, omitted otherwise) is `{emoji, reacted_at}`.
 
 `user_message_id` names the `role='user'` row whose turn produced this row. It
 is present on assistant rows and on `system_error` notices, and omitted on the
@@ -1517,7 +1548,7 @@ echoes the quote a `user` row was sent with (see the stream route's
 session; omitted on ordinary turns and on turns whose anchor failed to resolve,
 so a cold mount can re-render the quote without keeping local state.
 `action` (user rows only, omitted otherwise) is the action the row was sent
-with, plus `response` (`"accept"` | `"refuse"`) once the turn was decided. Same auth, ownership check, and
+with, plus `response` (`"accept"` | `"refuse"`) once the turn was decided. `reaction` (assistant rows only, omitted otherwise) is `{emoji, reacted_at}`. Same auth, ownership check, and
 `limit ∈ [1, 50]` clamp as the canonical history route. **Intentional
 divergence:** the default `limit` is 50 (the canonical route defaults to 20),
 because the BFF exists for a cold mount that wants a full backscroll in one
@@ -1722,6 +1753,7 @@ error type. The table below covers the plain shape:
 - `crates/eros-engine-server/src/routes/companion_stream.rs` — streaming chat turn (`message/stream`), incl. tip + `image_url` handling
 - `crates/eros-engine-server/src/routes/companion_async.rs` — enqueue-only chat turn (`v2/comp/session/{session_id}/message/async`)
 - `crates/eros-engine-server/src/routes/session_open.rs` — the persona speaking first: holiday greeting and caller-named occasions (`v2/comp/session/{session_id}/open`)
+- `crates/eros-engine-server/src/routes/reaction.rs` — message reactions: set, clear and the allowlist (`v2/comp/session/{session_id}/message/{message_id}/reaction`, `v2/comp/reactions`)
 - `crates/eros-engine-server/src/routes/insight.rs` — v2 relationship-scoped insight profiles (`v2/comp/instance/{instance_id}/insight/character`, `.../insight/user`)
 - `crates/eros-engine-server/src/pipeline/chat_queue.rs` — async chat-turn queue worker
 - `crates/eros-engine-server/src/routes/voice.rs` — voice-channel turn (`voice/{session_id}/turn/stream`)

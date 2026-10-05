@@ -413,6 +413,7 @@ async fn generate_reply_text(
         instance_id,
         instruction_row_id,
         now,
+        false,
     )
     .await
     {

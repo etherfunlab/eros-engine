@@ -159,6 +159,10 @@ pub struct ChatHistoryEntry {
     /// history entry carries the same field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<crate::routes::companion_stream::UserActionView>,
+    /// The user's reaction on an assistant row: the emoji and when it was set.
+    /// Omitted on rows without one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reaction: Option<crate::routes::reaction::ReactionView>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -787,6 +791,7 @@ async fn get_history(
                 .as_ref()
                 .and_then(|md| md.get("action"))
                 .and_then(crate::routes::companion_stream::UserActionView::from_metadata_action),
+            reaction: crate::routes::reaction::reaction_view(m.reaction, m.reacted_at),
             role: m.role,
             content: m.content,
             sent_at: m.sent_at,
@@ -1169,6 +1174,7 @@ pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
             chat_queue: crate::state::parse_chat_queue_config(
                 None, None, None, None, None, None, None,
             ),
+            reaction_emoji: None,
         },
         openrouter: Arc::new(eros_engine_llm::openrouter::OpenRouterClient::new(
             "stub".into(),

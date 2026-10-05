@@ -83,6 +83,10 @@ pub struct BffHistoryEntry {
     /// The action a user row carried and, once decided, the persona's response. Omitted on rows without an action.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<crate::routes::companion_stream::UserActionView>,
+    /// The user's reaction on an assistant row: the emoji and when it was set.
+    /// Omitted on rows without one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reaction: Option<crate::routes::reaction::ReactionView>,
 }
 
 /// Parse the raw `metadata->>'reply_to_message_id'` text the slim projection
@@ -211,6 +215,7 @@ async fn bff_get_history(
                 action: r.action.as_ref().and_then(
                     crate::routes::companion_stream::UserActionView::from_metadata_action,
                 ),
+                reaction: crate::routes::reaction::reaction_view(r.reaction, r.reacted_at),
             })
             .collect();
     let total = messages.len();
@@ -275,6 +280,7 @@ async fn bff_start_chat(
                 action: r.action.as_ref().and_then(
                     crate::routes::companion_stream::UserActionView::from_metadata_action,
                 ),
+                reaction: crate::routes::reaction::reaction_view(r.reaction, r.reacted_at),
             })
             .collect()
     };

@@ -161,6 +161,7 @@ pub(crate) async fn greet(
         g.instance_id,
         Uuid::nil(),
         g.now,
+        false,
     )
     .await?;
     chat_req.messages.push(WireMessage {

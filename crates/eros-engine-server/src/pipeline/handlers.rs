@@ -166,6 +166,22 @@ pub(crate) fn model_facing_assistant_text(
     text
 }
 
+/// The text a `[reactions]` quote is cut from: the message as injected history
+/// shows it (leading sentence and action blocks stripped when `strip`), or the
+/// raw `content` when stripping would leave nothing of a non-blank message.
+pub(crate) fn reaction_quote_source(content: &str, strip: bool) -> String {
+    if !strip {
+        return content.to_string();
+    }
+    let stripped =
+        crate::repetition::strip_action_blocks(&crate::repetition::strip_leading_sentence(content));
+    if stripped.trim().is_empty() && !content.trim().is_empty() {
+        content.to_string()
+    } else {
+        stripped
+    }
+}
+
 /// Build the `[用户发送了一张图片]` preamble from a stored `metadata.vision`
 /// object. Returns `None` when `description` is absent/blank (not a usable
 /// describe). Blank optional fields are omitted line-by-line.
@@ -752,6 +768,9 @@ pub(crate) async fn build_reply_request(
     // `[now]`: the instant, the user's timezone and holiday window
     // (spec 2026-09-26 §5). Callers build it with `NowContext::for_user`.
     now: &crate::prompt::NowContext,
+    // Only the user-driven text turn renders [reactions]; /open greetings and edit
+    // turns pass false (spec 2026-10-05-message-reactions §6.3).
+    render_reactions: bool,
 ) -> Result<(ChatRequest, Vec<String>), AppError> {
     let chat_repo = ChatRepo { pool: &state.pool };
     // A quote points at one line; it never narrows the window. Every turn gets
@@ -923,6 +942,33 @@ pub(crate) async fn build_reply_request(
         plan.nudges,
         now,
     );
+
+    if render_reactions {
+        // Reactions the user set since their previous message. Non-fatal: a
+        // failed read omits the block.
+        let reacted = chat_repo
+            .reactions_since_previous_user_row(session_id, user_message_id)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, session_id = %session_id, "reactions read failed; [reactions] omitted");
+                Vec::new()
+            });
+        let strip = !state.config.chat_noise_cancellation_disabled;
+        let sources: Vec<String> = reacted
+            .iter()
+            .map(|r| reaction_quote_source(&r.content, strip))
+            .collect();
+        let lines: Vec<crate::prompt::ReactionLine<'_>> = reacted
+            .iter()
+            .zip(&sources)
+            .map(|(r, src)| crate::prompt::ReactionLine {
+                content: src,
+                is_image: r.is_image,
+                emoji: &r.reaction,
+            })
+            .collect();
+        system_prompt.push_str(&crate::prompt::reactions_context(&lines));
+    }
 
     if let Event::UserMessage {
         tips_amount_usd: Some(amount),
@@ -1799,6 +1845,8 @@ mod tests {
             pre_filter_content: pre.map(|s| s.to_string()),
             metadata: None,
             read_at: None,
+            reaction: None,
+            reacted_at: None,
         }
     }
 
@@ -2070,6 +2118,8 @@ mod tests {
             pre_filter_content: None,
             metadata,
             read_at: None,
+            reaction: None,
+            reacted_at: None,
         }
     }
 
@@ -2277,6 +2327,8 @@ mod tests {
             pre_filter_content: None,
             metadata: None,
             read_at: None,
+            reaction: None,
+            reacted_at: None,
         }
     }
 
@@ -2917,6 +2969,7 @@ mod tests {
             instance_id,
             user_message_id,
             &crate::prompt::NowContext::default(),
+            false,
         )
         .await
         .expect("build_reply_request succeeds");
@@ -3044,6 +3097,7 @@ mod tests {
             instance_id,
             user_message_id,
             &now,
+            false,
         )
         .await
         .expect("build_reply_request succeeds");
@@ -3174,6 +3228,7 @@ mod tests {
             instance_id,
             user_message_id,
             &crate::prompt::NowContext::default(),
+            false,
         )
         .await
         .expect("build_reply_request succeeds");
@@ -3373,6 +3428,7 @@ mod tests {
             instance_id,
             user_message_id,
             &crate::prompt::NowContext::default(),
+            false,
         )
         .await
         .expect("build_reply_request succeeds");
@@ -3471,6 +3527,7 @@ mod tests {
             instance_id,
             user_message_id,
             &crate::prompt::NowContext::default(),
+            false,
         )
         .await
         .expect("build_reply_request succeeds");
@@ -3512,5 +3569,119 @@ mod tests {
             model_facing_user_text(&row),
             "[用户发送了一张图片]\n画面：一只猫\n\n（想抱你）"
         );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn build_reply_request_renders_reactions_only_when_asked(pool: sqlx::PgPool) {
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, owner).await;
+        let session_id = make_session(&pool, owner, Some(instance_id)).await;
+        let insert = |role: &'static str, content: &'static str, at: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Uuid>(
+                    "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+                     VALUES ($1, $2, $3, $4::timestamptz) RETURNING id",
+                )
+                .bind(session_id)
+                .bind(role)
+                .bind(content)
+                .bind(at)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        insert("user", "上一条", "2026-10-01T10:00:00Z").await;
+        let a = insert("assistant", "今晚想吃什么", "2026-10-01T10:00:05Z").await;
+        let current = insert("user", "都行", "2026-10-01T11:00:00Z").await;
+        sqlx::query(
+            "UPDATE engine.chat_messages SET reaction = '❤️', \
+             reacted_at = '2026-10-01T10:30:00Z'::timestamptz WHERE id = $1",
+        )
+        .bind(a)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = crate::routes::companion::test_state(pool.clone());
+        let plan = ActionPlan {
+            action_type: eros_engine_core::types::ActionType::ReplyText,
+            reply_style: eros_engine_core::types::ReplyStyle::Neutral,
+            affinity_deltas: Default::default(),
+            energy_cost: 0.0,
+            context_hints: vec![],
+            reply_mode: None,
+            nudges: Default::default(),
+            clothing: None,
+            image_caption: None,
+            image_ref: eros_engine_core::types::ImageRef::Face,
+            aspect_ratio: None,
+            action_response: None,
+        };
+        let input = DecisionInput {
+            event: Event::UserMessage {
+                content: "都行".into(),
+                message_id: current,
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                // No Voyage call: this test is about the [reactions] block.
+                memory_scope: MemoryScope::None,
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                quote: Default::default(),
+                action: None,
+            },
+            affinity: ladder_test_affinity(session_id, owner, instance_id),
+            persona: ladder_test_persona(instance_id, owner),
+            signals: eros_engine_core::types::ConversationSignals {
+                message_count: 3,
+                hours_since_last_message: 0.1,
+                ghost_streak: 0,
+                hours_since_last_ghost: None,
+            },
+        };
+        let system = |render: bool| {
+            let (state, input, plan) = (&state, &input, &plan);
+            async move {
+                let (req, _tags) = build_reply_request(
+                    state,
+                    input,
+                    plan,
+                    session_id,
+                    owner,
+                    instance_id,
+                    current,
+                    &crate::prompt::NowContext::default(),
+                    render,
+                )
+                .await
+                .expect("build_reply_request succeeds");
+                req.messages[0].content.clone()
+            }
+        };
+        let with = system(true).await;
+        assert!(
+            with.contains("[reactions]\n你说的「今晚想吃什么」，对方回了 ❤️"),
+            "{with}"
+        );
+        let without = system(false).await;
+        assert!(!without.contains("[reactions]"), "{without}");
+    }
+
+    #[test]
+    fn reaction_quote_source_matches_what_history_shows() {
+        assert_eq!(
+            reaction_quote_source("唔。（凑近）今晚想吃什么", true),
+            "今晚想吃什么"
+        );
+        // Stripping would empty it: the raw text still identifies the message.
+        assert_eq!(reaction_quote_source("（凑近）", true), "（凑近）");
+        assert_eq!(
+            reaction_quote_source("唔。（凑近）今晚想吃什么", false),
+            "唔。（凑近）今晚想吃什么"
+        );
+        assert_eq!(reaction_quote_source("  ", true), "");
     }
 }
