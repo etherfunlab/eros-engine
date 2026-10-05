@@ -494,7 +494,7 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
 
 用户的**原始**文本始终作为 `content` 持久化并显示给客户端。改写内容存储在 `pre_filter_content`（仅供模型使用）、`filter_model`、`f_generation_id` 和 `filter_triggers = {"reason": …}` 中。对于用户记录，模型和 memory recall 读取有效文本（`pre_filter_content ?? content`）；extraction（insight/memory/affinity）仍读取原始文本。
 
-仅当 `input_filter` 触发（值为 `true`，或当前轮次的概率抽取通过）并且 `[tasks.chat_input_filter]` 存在且 `filter_prompt` 非空白时，filter 才会运行。它采用 **fail-open**：任何错误、超时、无法解析的 verdict 或拒绝都会保留原始输入不变。请选择快速、低成本的模型——当 `input_filter = true` 时，每个用户轮次都会在生成前运行该模型。
+仅当 `input_filter` 触发（值为 `true`，或当前轮次的概率抽取通过）并且 `[tasks.chat_input_filter]` 存在且 `filter_prompt` 非空白时，filter 才会运行。它采用 **fail-open**：任何错误、超时、无法解析的 verdict 或拒绝都会保留原始输入不变。带用户动作且 `content` 为空白的轮次会跳过该 filter——没有可改写的内容。请选择快速、低成本的模型——当 `input_filter = true` 时，每个用户轮次都会在生成前运行该模型。
 
 #### `[tasks.chat_input_filter]` 字段
 
@@ -514,7 +514,7 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
 | `chat_vision` | `pipeline::stream`，通过 `resolve_vision()`（视觉预处理阶段：在 reply prompt 前将 `image_url` 附件描述为 JSON；任务块缺失或 `filter_prompt` 为空白时关闭） | live（opt-in） |
 | `chat_product_qa` | `pipeline::stream`，通过 `resolve_product_qa()`（PDE `product_qa` 动作的出戏产品问答执行器；任务块缺失或 `filter_prompt` 为空白时关闭；还需要 LLM PDE 已启用） | live（opt-in） |
 | `affinity_evaluation` | `pipeline::post_process`（每轮好感度裁决——四个档位线轴加 warmth/patience 两个 1..3 绝对档，由引擎侧换算；每个 Reply 轮次后以 fire-and-forget 方式运行；**不接受 `filter_prompt`** —— 该 prompt 由引擎持有，设置该键会拒绝启动——**任何写法都算，包括显式留空**。与这里其它任务不同，空白在这里不等于"关闭"，请直接不写这个键。见 issue #210） | live |
-| `affinity_summary` | `pipeline::post_process::summarize_feeling`（改写 `companion_affinity.feeling_clause`——即 `[feelings]` 块的第一人称叙述——依据档位标签与近期判官理由；仅在好感度写入之后、"移动回合"上运行（任意判官档位有变化、端点档位偏离基线，或 ghost），且仅当本次请求确实注入了好感度轴；按当轮请求计费给当前用户，不是 sweeper。**不接受 `filter_prompt`**——该 prompt 由引擎持有，与 `affinity_evaluation` 同样处理，设置该键会拒绝启动。块缺失 ⇒ `feeling_clause` 保持 `NULL`，`[feelings]` 永不渲染） | live（opt-in） |
+| `affinity_summary` | `pipeline::post_process::summarize_feeling`（改写 `companion_affinity.feeling_clause`——即 `[feelings]` 块的第一人称叙述——依据档位标签与近期判官理由；仅在好感度写入之后、"移动回合"上运行（任意判官档位有变化、端点档位偏离基线，ghost，或动作被拒绝而降档），且仅当本次请求确实注入了好感度轴；按当轮请求计费给当前用户，不是 sweeper。**不接受 `filter_prompt`**——该 prompt 由引擎持有，与 `affinity_evaluation` 同样处理，设置该键会拒绝启动。块缺失 ⇒ `feeling_clause` 保持 `NULL`，`[feelings]` 永不渲染） | live（opt-in） |
 | `character_insight_extraction` | `pipeline::post_process`（角色链 stage 1 —— 实验特性 —— 针对 AI **角色**的逐轮事实挖掘，是 `insight_extraction` 人类侧挖掘的镜像。持有 prompt，与 `insight_extraction` / `memory_extraction` 共用同一个必填-`filter_prompt` 闸门。这个块是整条链（两个 stage）的总开关——任务块缺失即关闭） | experimental（opt-in） |
 | `character_insight_structuring` | `pipeline::post_process`（角色链 stage 2 —— 实验特性 —— 把 stage 1 挖掘出的事实加上已有的 `character_insights` 行，转成类型化的十列对象。**仅参数，不接受 `filter_prompt`** —— 它的 prompt 写在 `prompt.rs` 里，必须与它要填的 `character_insights` 列保持同步，所以设置该键会拒绝启动，**任何写法都算，包括显式留空**——与 `affinity_evaluation` 同样处理。块缺失时 stage 2 会退回到 stage 1 的模型/预算，绝不退到全局默认） | experimental（opt-in） |
 | `user_insight_extraction` | `pipeline::post_process`（用户链 stage 1 —— 实验特性 —— 针对真人**用户**的逐轮事实挖掘，但按关系分开，而不是全局的 `insight_extraction`。持有 prompt，与 `insight_extraction` / `character_insight_extraction` / `memory_extraction` 共用同一个必填-`filter_prompt` 闸门。这个块是整条链的总开关——任务块缺失即关闭） | experimental（opt-in） |

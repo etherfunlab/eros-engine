@@ -79,7 +79,7 @@ spawn post_process     tokio::spawn——跟返回響應並行：
 `image` 块**且** `[tasks.chat_image_prompt_compose]` 已配置——判断器不再写
 image-prompt 种子之后，合成器是唯一能产出图片 prompt 的东西，缺了这个任务
 图片轮次就不可用；`product_qa` 要求 `[tasks.chat_product_qa]` 已配置（且 LLM
-PDE 已启用）。各自在不可用时降级为 `reply_text`——只降级、绝不升级。
+PDE 已启用）。各自在不可用时降级为 `reply_text`——只降级、绝不升级。带用户动作的轮次里，`ghost` 和 `product_qa` 同样降级为 `reply_text`。
 `product_qa` 会短路整条伴侣链路（不注入人格 prompt、不跑 post-process）：
 它路由到一个独立的产品问答执行器，而不是回复路径。各动作的启用门槛见
 [model-config.zh.md](model-config.zh.md)。

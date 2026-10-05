@@ -465,6 +465,7 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 - 纯图片：`meta(reply_image) → done → image_request → final`
 - 图文：`meta(reply_text_image) → delta* → done → image_request → final`
 - `ghost`：`meta(action_type=ghost) → done → final` — 无 `delta`，`meta` 中无 `model`，`done` 的 `usage` 和 `generation_id` 均为 `null`。该轮伴侣保持沉默，未调用任何 LLM。
+- 动作轮次：形状相同，只是 `action_response` 排在第一个 `meta` 之前——`action_response → meta(reply) → delta* → done → final`；不会是 `ghost` 或 `product_qa`
 - `product_qa`：`meta(action_type=product_qa) → delta* → done → final` — 形状与普通文本回复相同，由独立的模型链（`[tasks.chat_product_qa]`）流式生成，而非 `chat_companion`；落库时带 `channel='product_qa'`，重放时同样报告为 `product_qa`。
 
 引擎从不绘图，也不存在任何绘图生命周期帧：消费方收到 `image_request` 后自行调用图像供应商。

@@ -249,7 +249,8 @@ model_name_display_override = true
 # table exists with a non-blank filter_prompt; otherwise it is inert. The user's
 # ORIGINAL text is
 # always persisted (content) and shown to the client; the rewrite is stored
-# separately in pre_filter_content and seen only by the model.
+# separately in pre_filter_content and seen only by the model. A turn that
+# carries a user action with blank content skips the filter.
 #
 # Pick a fast, cheap model — this runs on every user turn before generation.
 # Recommended: google/gemini-3.1-flash-lite or deepseek/deepseek-v4-flash.
@@ -785,7 +786,7 @@ max_tokens = 400
 # Absent section = feature off: companion_affinity.feeling_clause stays NULL and
 # the [feelings] prompt block never renders. When present, runs after the
 # post-process affinity write on movement turns only (any judge grade ≥ 1, an
-# endpoint level ≠ 2, or a ghost) and rewrites the session's first-person
+# endpoint level ≠ 2, a ghost, or a refused action's tier drop) and rewrites the session's first-person
 # feeling clause from band labels + recent judge reasons.
 #
 # NOTE: this task takes NO filter_prompt. The summarizer's prompt is

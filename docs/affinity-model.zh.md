@@ -248,7 +248,7 @@ Ghost 回合从不进入 `persist_with_event`：只有 `ghost_streak` / `total_g
 - `[relationship]`：基础对四象限（见「基础对：warmth 与 patience」）。
 - `[mood]`：逐轴阈值门（冷淡禁令与热络解锁）。
 - `[feelings]`：LLM 写就的感受分句，存在好感度行上（`feeling_clause`，在有
-  移动的回合重写）。
+  移动的回合和动作被拒绝而降档的回合重写）。
 - `[reply_length]`：由 scope 复合 `length_score` 选出的三档固定上限
   （切点 `0.25` / `0.55`）。
 - 逐回合骰子（`TurnNudges`）否决：与 `[mood]` 相同的冷淡门槛
@@ -327,7 +327,8 @@ Migration `0048` 把 `bond`、`chemistry` 重定义为 Postgres
 - `context`：`affinity_reason`、`eval_skip_reason`、判官原样的有符号
   `grades`、门的 `pending_after`，以及端点审计（本轮实际读到时的
   `warmth_grade`/`patience_grade`、`boost_warmth`/`boost_patience`、
-  `decay_factor`、`units`）；被收税的回合另有 `cross_penalty_assessed`。
+  `decay_factor`、`units`）；被收税的回合另有 `cross_penalty_assessed`；动作被拒绝而降档的回合另有
+  `tier_drop`（`bond` | `chemistry`），标明被降的那条线。
 - `user_message_id`（migration `0056`）：对 `chat_messages` 的真外键，
   `ON DELETE SET NULL`；`proactive`/`time_decay` 行与迁移前写入的行为
   `NULL`，不回填。

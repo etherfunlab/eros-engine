@@ -82,7 +82,8 @@ Three of these are conditionally available: `reply_image` and
 writing image-prompt seeds the composer is the only thing that can produce an
 image prompt, so a missing composer task leaves image turns unavailable;
 `product_qa` requires `[tasks.chat_product_qa]` configured (with the LLM PDE
-enabled). Each degrades to `reply_text` when unavailable — never upgrades.
+enabled). Each degrades to `reply_text` when unavailable — never upgrades. On a turn that
+carries a user action, `ghost` and `product_qa` also degrade to `reply_text`.
 `product_qa` short-circuits the whole companion chain (no persona prompt, no
 post-process): it routes to an independent product-QA executor instead of the
 reply path. See [model-config.md](model-config.md) for the per-action
