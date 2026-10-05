@@ -570,7 +570,7 @@ prompt、独立端点 `POST /persona/{instance_id}/image/compose` 的任一种
 | `instance_id` | `UUID?` | 角色实例；caller 没有实例上下文时为 NULL。 |
 | `session_id` | `UUID?` | 聊天 session；独立端点没有 session，恒为 NULL。 |
 | `status` | `TEXT` | `ok` \| `exhausted` \| `not_configured`。 |
-| `inputs` | `JSONB` | 合成器的五个槽位，结构化保存：`{appearance, recent_scene, latest_user_msg, style, aspect_ratio}`。空槽位记为 `""`，不是 prompt 渲染时用的 `（无）` 占位符——那个替换是渲染细节，不是输入本身。`latest_user_msg` 按 `source` 不同而不同：`chat_reply_image` 传的是原始的 `user_msg.content`，而 `chat_reply_text_image` 传的是 `effective_user_msg`——input filter 改写之后的版本。两者都如实记录了合成器那一轮实际看到的内容；跨这两个 source 比对行的运维应该预期这个差异，不要当成不一致。 |
+| `inputs` | `JSONB` | 合成器的五个槽位，结构化保存：`{appearance, recent_scene, latest_user_msg, style, aspect_ratio}`。空槽位记为 `""`，不是 prompt 渲染时用的 `（无）` 占位符——那个替换是渲染细节，不是输入本身。`latest_user_msg` 按 `source` 不同而不同：`chat_reply_image` 传的是原始的 `user_msg.content`，而 `chat_reply_text_image` 传的是 `effective_user_msg`——input filter 改写之后的版本。两者都如实记录了合成器那一轮实际看到的内容；跨这两个 source 比对行的运维应该预期这个差异，不要当成不一致。带用户动作的轮次里，该槽位是动作标记加上文本，再加一句说明已作出的回应的话。 |
 | `subject` | `TEXT?` | 合成器自己的 `prompt` 字段。`status = "ok"` 之外恒为 NULL。 |
 | `caption` | `TEXT?` | 合成器没写 caption 时为 NULL，包括非 JSON 回退的情形——此时整段回复变成 `subject`。 |
 | `composed_prompt` | `TEXT?` | 拼装出的线上 wire 字符串——style 预设 + 角色外观 + subject，也就是下游消费方实际拿到的那个字符串。**每一行只要产出过它就会保存**，包括聊天路径上的 `exhausted` 和 `not_configured`（肖像回退仍会拼出一个 wire prompt，这一列就是唯一记录了当时画的到底是什么的地方）；只有独立端点的 `exhausted` 行和 `image_edit` 端点的 `exhausted` 行是 NULL——两者失败时都没拼装任何东西（编辑端点同样没有肖像回退）。 |

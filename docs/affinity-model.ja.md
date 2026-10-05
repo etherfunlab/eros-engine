@@ -213,7 +213,7 @@ Chemistry: `spark` / `flirtation` / `crush` / `lover` / `beloved`
 
 - `[mood]` — 軸ごとの閾値ゲートを使う(cold 禁止と warm 解禁)。
 
-- `[feelings]` — 親密度の行に保存された、LLM が書いた感情節を使う(`feeling_clause`、変化があったターンで書き換えられる)。
+- `[feelings]` — 親密度の行に保存された、LLM が書いた感情節を使う(`feeling_clause`、変化があったターンと、拒否された動作でティアが下がったターンで書き換えられる)。
 
 - `[reply_length]` — スコープ複合値 `length_score` によって選ばれる3段階の固定上限を使う(閾値 0.25 / 0.55)。
 
@@ -278,7 +278,7 @@ DB が書き込みのたびに再計算するため、ライン軸の値との�
 
 - `effective_deltas` = after − before の適用済み変化(基礎ペアについては、そのターンの導出デルタ)。
 
-- `context` = `affinity_reason`、`eval_skip_reason`、判定どおりの符号付き `grades`、`pending_after`、エンドポイント監査情報(読み取られた場合の `warmth_grade` / `patience_grade`、`boost_warmth` / `boost_patience`、`decay_factor`、`units`)、ペナルティが課された場合の `cross_penalty_assessed`。
+- `context` = `affinity_reason`、`eval_skip_reason`、判定どおりの符号付き `grades`、`pending_after`、エンドポイント監査情報(読み取られた場合の `warmth_grade` / `patience_grade`、`boost_warmth` / `boost_patience`、`decay_factor`、`units`)、ペナルティが課された場合の `cross_penalty_assessed`、拒否された動作でラインが下がった場合の `tier_drop`(`bond` | `chemistry`)。
 
 - `user_message_id`(マイグレーション 0056): `chat_messages` への実際の FK、`ON DELETE SET NULL`。`proactive` / `time_decay` 行および移行前の行では NULL であり、バックフィルはされない。
 

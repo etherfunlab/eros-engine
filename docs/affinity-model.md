@@ -315,7 +315,7 @@ moved (format in [Event rows](#event-rows)).
   [the base pair](#the-base-pair--warmth--patience)).
 - `[mood]` — per-axis threshold gates: cold bans and warm unlocks.
 - `[feelings]` — the LLM-written feeling clause stored on the affinity row
-  (`feeling_clause`), rewritten on movement turns.
+  (`feeling_clause`), rewritten on movement turns and on a refused action's tier drop.
 - `[reply_length]` — three fixed ceilings selected by the scope composite
   `length_score`, thresholds `0.25` / `0.55`.
 - Per-turn dice (`TurnNudges`) vetoes — the same cold floors as `[mood]`:
@@ -413,7 +413,8 @@ Each delta turn appends one row to `engine.companion_affinity_events`:
   `grades`, `pending_after`, and the endpoint audit: `warmth_grade`/
   `patience_grade` when read, `boost_warmth`/`boost_patience`,
   `decay_factor`, `units`. `cross_penalty_assessed` joins them whenever a
-  turn was taxed.
+  turn was taxed; `tier_drop` (`bond` | `chemistry`) joins them on a turn
+  whose refused action dropped that line.
 - `user_message_id` (migration `0056`) — a real FK to `chat_messages`,
   `ON DELETE SET NULL`. `NULL` on `proactive`/`time_decay` rows and on
   pre-migration rows; never backfilled. Assistant rows point at the same
