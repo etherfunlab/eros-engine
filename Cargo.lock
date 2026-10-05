@@ -588,7 +588,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "eros-engine-core"
-version = "1.9.5"
+version = "2.0.0"
 dependencies = [
  "chrono",
  "serde",
@@ -598,7 +598,7 @@ dependencies = [
 
 [[package]]
 name = "eros-engine-llm"
-version = "1.9.5"
+version = "2.0.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -622,7 +622,7 @@ dependencies = [
 
 [[package]]
 name = "eros-engine-server"
-version = "1.9.5"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -666,7 +666,7 @@ dependencies = [
 
 [[package]]
 name = "eros-engine-store"
-version = "1.9.5"
+version = "2.0.0"
 dependencies = [
  "async-trait",
  "chrono",
