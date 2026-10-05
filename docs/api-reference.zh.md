@@ -1322,9 +1322,7 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
 一节）——它引用的那条消息的 id，一定在同一个 session 里；
 普通轮次、以及锚点没解析成功的轮次都省略该字段，这样冷启动不必自己存状态
 就能把引用重新渲染出来。
-`action`（只出现在用户行上）是这一行发送时带的动作，判定之后附 `response`（`"accept"` | `"refuse"`）。
-
-`reaction`（只出现在 assistant 行上）为 `{emoji, reacted_at}`。
+`action`（只出现在用户行上）是这一行发送时带的动作，判定之后附 `response`（`"accept"` | `"refuse"`）。`reaction`（只出现在 assistant 行上）为 `{emoji, reacted_at}`。
 鑒權、ownership 檢查、`limit ∈ [1, 50]` 夾取
 都與 canonical history 路由相同。**刻意差異：** 默認 `limit` 是 50
 （canonical 默認 20），因為 BFF 是為「冷啟動一次拉一整屏 backscroll」設計的。
@@ -1510,6 +1508,7 @@ session 403）。
 - `crates/eros-engine-server/src/routes/companion_stream.rs`——流式对话轮（`message/stream`），含打赏 + `image_url` 处理
 - `crates/eros-engine-server/src/routes/companion_async.rs`——只入队的对话轮（`v2/comp/session/{session_id}/message/async`）
 - `crates/eros-engine-server/src/routes/session_open.rs`——角色先开口：节日开场白与调用方指定的场合（`v2/comp/session/{session_id}/open`）
+- `crates/eros-engine-server/src/routes/reaction.rs`——消息 reaction：设置、撤销与允许列表（`v2/comp/session/{session_id}/message/{message_id}/reaction`、`v2/comp/reactions`）
 - `crates/eros-engine-server/src/routes/insight.rs`——按关系分开的 v2 画像端点（`v2/comp/instance/{instance_id}/insight/character`、`.../insight/user`）
 - `crates/eros-engine-server/src/pipeline/chat_queue.rs`——异步对话轮队列 worker
 - `crates/eros-engine-server/src/routes/voice.rs`——语音频道轮（`voice/{session_id}/turn/stream`）

@@ -146,22 +146,33 @@ contract as `reply_to_message_id`.
 ### 6.1 Which reactions
 
 On a text reply turn driven by a user message, `build_reply_request` reads (its callers say whether to — `/open` greetings and edit turns do not)
-the session's reactions set after the **previous** user row:
+the session's reactions set after the **previous** user row and at or before the **current** one:
 
 ```sql
-SELECT id, content, metadata, reaction
-FROM engine.chat_messages
-WHERE session_id = $1
-  AND reaction IS NOT NULL
-  AND reacted_at > $2          -- previous user / gift_user row's sent_at; -infinity when none
-  AND channel IS DISTINCT FROM 'product_qa'
-ORDER BY reacted_at
+WITH cur AS (
+    SELECT sent_at FROM engine.chat_messages WHERE id = $2 AND session_id = $1
+)
+SELECT m.content, COALESCE(m.metadata ? 'image', false) AS is_image, m.reaction
+FROM engine.chat_messages m, cur
+WHERE m.session_id = $1
+  AND m.reaction IS NOT NULL
+  AND m.channel IS DISTINCT FROM 'product_qa'
+  AND m.reacted_at <= cur.sent_at
+  AND m.reacted_at > COALESCE(
+        (SELECT p.sent_at FROM engine.chat_messages p
+          WHERE p.session_id = $1 AND p.role IN ('user', 'gift_user')
+            AND p.sent_at < cur.sent_at
+          ORDER BY p.sent_at DESC LIMIT 1),
+        '-infinity'::timestamptz)
+ORDER BY m.reacted_at
 ```
 
-"Previous" is the newest `user` / `gift_user` row sent before the current
-turn's own user row. A reaction cleared before the turn is not there to be
-read; a reaction the user set and never followed with a message is never
-seen.
+"Previous" is the newest `user` / `gift_user` row sent strictly before the
+current turn's own user row. The upper bound keeps a queued turn from seeing
+reactions set after its own message, so a reaction renders on exactly one
+turn. A reaction cleared before the turn is not there to be read; a reaction
+the user set and never followed with a message is never seen. A
+`user_message_id` that is not in the session reads nothing.
 
 ### 6.2 `[reactions]`
 
@@ -171,15 +182,19 @@ cached prefix:
 
 ```
 [reactions]
-对方给你说的「今晚想吃什么…」回了 ❤️
-对方给你发的照片回了 🔥
+你说的「今晚想吃什么…」，对方回了 ❤️
+你发的照片，对方回了 🔥
 ```
 
-- One line per reaction, oldest first.
-- The quote is the first 20 chars of the row's `content`, with 「…」
+- One line per reaction, oldest first. 「你」 is the persona's own message,
+  「对方」 the reactor.
+- The quote is the message as injected history shows it — leading sentence
+  and action blocks stripped unless `CHAT_NOISE_CANCELLATION_DISABLED`, the
+  raw text when stripping would leave nothing — with every whitespace run
+  collapsed to one space, then cut to the first 20 chars, with 「…」
   appended when longer.
 - A row with empty `content` and a `metadata.image` marker reads
-  「对方给你发的照片回了 {emoji}」.
+  「你发的照片，对方回了 {emoji}」.
 
 The fragment is rendered for this turn only. Nothing about the reaction
 enters the history window on later turns; the persona's reply on this turn
