@@ -131,22 +131,6 @@ pub(crate) fn effective_user_text(msg: &eros_engine_store::chat::ChatMessage) ->
 /// history") promises. The leading-sentence strip runs first so §4.3 keeps
 /// operating on the original reply — this is also the shape audit 54's replay
 /// measured. Callers rendering the persisted transcript pass `false`.
-/// The text a `[reactions]` quote is cut from: the message as injected history
-/// shows it (leading sentence and action blocks stripped when `strip`), or the
-/// raw `content` when stripping would leave nothing of a non-blank message.
-pub(crate) fn reaction_quote_source(content: &str, strip: bool) -> String {
-    if !strip {
-        return content.to_string();
-    }
-    let stripped =
-        crate::repetition::strip_action_blocks(&crate::repetition::strip_leading_sentence(content));
-    if stripped.trim().is_empty() && !content.trim().is_empty() {
-        content.to_string()
-    } else {
-        stripped
-    }
-}
-
 pub(crate) fn model_facing_assistant_text(
     msg: &eros_engine_store::chat::ChatMessage,
     strip: bool,
@@ -180,6 +164,22 @@ pub(crate) fn model_facing_assistant_text(
         }
     }
     text
+}
+
+/// The text a `[reactions]` quote is cut from: the message as injected history
+/// shows it (leading sentence and action blocks stripped when `strip`), or the
+/// raw `content` when stripping would leave nothing of a non-blank message.
+pub(crate) fn reaction_quote_source(content: &str, strip: bool) -> String {
+    if !strip {
+        return content.to_string();
+    }
+    let stripped =
+        crate::repetition::strip_action_blocks(&crate::repetition::strip_leading_sentence(content));
+    if stripped.trim().is_empty() && !content.trim().is_empty() {
+        content.to_string()
+    } else {
+        stripped
+    }
 }
 
 /// Build the `[用户发送了一张图片]` preamble from a stored `metadata.vision`
