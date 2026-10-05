@@ -3496,7 +3496,7 @@ mod tests {
         );
         assert_eq!(
             model_facing_user_text(&row),
-            "（递给你 2 杯威士忌）来，陪我喝点"
+            "（递给你 2 杯「威士忌」）来，陪我喝点"
         );
         let row = user_row_meta("", serde_json::json!({"action": {"type": "kiss"}}));
         assert_eq!(model_facing_user_text(&row), "（凑过来想亲你）");

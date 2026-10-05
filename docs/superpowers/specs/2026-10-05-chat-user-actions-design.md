@@ -172,7 +172,7 @@ of either (stream, proactive, image edit, tests) fills the new field.
 side with the phrase table of §5.1:
 
 ```
-[用户动作] 对方递给你 2 杯威士忌
+[用户动作] 对方递给你 2 杯「威士忌」
 ```
 
 `PdeVerdict` gains `action_response: Option<ActionResponse>`
@@ -240,7 +240,7 @@ prefix:
 
 ```
 [user_action]
-对方递给你 2 杯威士忌，你接受了。用你自己的话回应。
+对方递给你 2 杯「威士忌」，你接受了。用你自己的话回应。
 ```
 
 ```
@@ -253,15 +253,17 @@ history marker (§5.3):
 
 | action | phrase |
 |---|---|
-| `give` | 递给你 {quantity}{unit}{name, else the category word} — unit 支 / 杯 / 片 and category word 烟 / 酒 / 药 for cigarette / alcohol / medicine. 「递给你 2 杯威士忌」「递给你 1 支烟」 |
+| `give` | 递给你 {quantity}{unit}{「name」, else the category word} — unit 支 / 杯 / 片 and category word 烟 / 酒 / 药 for cigarette / alcohol / medicine. 「递给你 2 杯「威士忌」」「递给你 1 支烟」 |
 | `kiss` | 凑过来想亲你 |
 | `hug` | 想抱你 |
 | `touch` | 伸手想摸你 |
 | `lick` | 想舔你 |
 | `custom` | {text} |
 
+User-supplied text (`name`, `text`) is wrapped in 「」 wherever it reaches a model, so it reads as quoted data; the user-role history marker for `custom` is the user's own words and stays unquoted.
+
 The fragment and the judge line prefix the phrase with 「对方」, except
-`custom`, which renders as 「对方的动作：{text}」 because the user's text
+`custom`, which renders as 「对方的动作：「{text}」」 because the user's text
 is not guaranteed to read as a verb phrase. Physical phrases say what the
 user *wants* to do, because the conclusion may be that it did not happen.
 The conclusion is 「你接受了」 or 「你没有接受」.
@@ -279,7 +281,7 @@ One renderer turns `metadata.action` into a marker from the user's side,
 placed before the user's own text:
 
 ```
-（递给你 2 杯威士忌）来，陪我喝点
+（递给你 2 杯「威士忌」）来，陪我喝点
 （凑过来想亲你）
 ```
 
