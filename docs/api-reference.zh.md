@@ -325,7 +325,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 节日有三个来源：13 个农历传统节日（`tyme4rs`，所有用户都有），所在国家的法定假日（`py-holidays-rs`，
 补休日和国庆、独立、建国、行宪类纪念日已去掉），以及五个固定日期：02-14 情人节、10-25 台湾光复节、
-12-24 平安夜对所有人；01-01 新年快乐和 12-25 `Season's Greetings` 只在所在国家的日历没有新年或圣诞时补上。
+12-24 平安夜对所有人；01-01 新年快乐和 12-25 `Season's Greetings` 只在当天没有任何名字含 `New Year` / `Christmas` 时补上。
 async 端点和图片编辑接受同样的三个字段。
 
 **可选：OpenRouter audit 透传。** 请求体可附加 `audit` 对象，

@@ -367,9 +367,9 @@ Holidays come from three sources: the thirteen Chinese lunisolar festivals
 (`tyme4rs`, every user), the country's public holidays (`py-holidays-rs`,
 in-lieu days off and national, independence, founding and constitution days
 dropped), and five fixed dates — 02-14 情人节, 10-25 台湾光复节, 12-24 平安夜
-for everyone, plus 01-01 新年快乐 and 12-25 `Season's Greetings` where the
-country's calendar has no New Year or Christmas. The async endpoint and image
-edit accept the same three fields.
+for everyone, plus 01-01 新年快乐 and 12-25 `Season's Greetings` when none of
+that day's names contains `New Year` / `Christmas`. The async endpoint and
+image edit accept the same three fields.
 
 **Optional: OpenRouter audit passthrough.** The body may include an
 `audit` object that rides directly to OpenRouter as wire-level `user` /
