@@ -354,7 +354,7 @@ user is. The engine does not keep them between turns; send them on every turn.
   uses the persona's own `art_metadata.timezone` first, then this, then
   `Asia/Singapore`. It also dates the user-side holiday line: holidays on the
   user's local date and the six days after it
-  (`对方那边今天是中秋节；3 天后是国庆节。`), stated as facts.
+  (`对方那边今天是平安夜；明天是Christmas Day。`), stated as facts.
 - `user_country` — ISO 3166-1 alpha-2 (`TW`), as the client received it. Absent
   ⇒ derived from `user_timezone`. Unknown ⇒ no public holidays.
 - `user_region` — ISO 3166-2 subdivision without the country prefix (`CA`,
@@ -365,10 +365,11 @@ absent. The raw values are recorded on the user row's metadata.
 
 Holidays come from three sources: the thirteen Chinese lunisolar festivals
 (`tyme4rs`, every user), the country's public holidays (`py-holidays-rs`,
-in-lieu days off dropped), and five fixed dates — 02-14 情人节, 10-25 台湾光复节,
-12-24 平安夜 for everyone, 10-09 辛亥革命纪念日 for `CN`, and 10-10
-双十节（中华民国国庆日） for every other country or none. The async endpoint
-and image edit accept the same three fields.
+in-lieu days off and political days — national, founding, war, revolution
+and remembrance days, elections — dropped), and four fixed dates — 02-14 情人节
+and 12-24 平安夜 for everyone, plus 01-01 新年快乐 and 12-25
+`Season's Greetings` when none of that day's names contains `New Year` /
+`Christmas`. The async endpoint and image edit accept the same three fields.
 
 **Optional: OpenRouter audit passthrough.** The body may include an
 `audit` object that rides directly to OpenRouter as wire-level `user` /

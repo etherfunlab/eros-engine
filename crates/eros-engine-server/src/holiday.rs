@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The user's holidays: lunar festivals (`tyme4rs`), public holidays
-//! (`py-holidays-rs`), and a five-row table of fixed-date observances neither
-//! crate carries. Feeds the `[now]` holiday line and the holiday greeting.
+//! (`py-holidays-rs`) without political days, and a four-row table of
+//! fixed-date observances neither crate carries. Feeds the `[now]` holiday
+//! line and the holiday greeting.
 //!
 //! Spec: docs/superpowers/specs/2026-09-26-user-locale-and-holiday-greeting-design.md §3
 
@@ -19,18 +20,57 @@ pub const LOOKAHEAD_DAYS: u8 = 6;
 
 enum Who {
     Everyone,
-    OnlyCn,
-    NotCn,
+    /// Only when no name already on that date contains this text.
+    Unless(&'static str),
 }
 
 /// Fixed-date observances neither crate carries (spec §3.1): month, day,
-/// name, and which resolved countries see it.
+/// name, and when it applies. The `Unless` rows fill in where the country's
+/// calendar has no New Year or Christmas of its own.
 const FIXED: &[(u32, u32, &str, Who)] = &[
+    (1, 1, "新年快乐", Who::Unless("New Year")),
     (2, 14, "情人节", Who::Everyone),
-    (10, 9, "辛亥革命纪念日", Who::OnlyCn),
-    (10, 10, "双十节（中华民国国庆日）", Who::NotCn),
-    (10, 25, "台湾光复节", Who::Everyone),
     (12, 24, "平安夜", Who::Everyone),
+    (12, 25, "Season's Greetings", Who::Unless("Christmas")),
+];
+
+/// Label fragments that mark a python-holidays day as political: national,
+/// founding, war, revolution and remembrance days, elections. A persona's
+/// holidays are everyday ones only, and a country guessed from IP or timezone
+/// must not hand the user another nation's day.
+const POLITICAL: &[&str] = &[
+    "National Day",    // CN, TW, HK, SG, FR, …; "National Day of Mourning" (IE)
+    "Independence",    // US, IN, MX, …; "Independence Movement Day" (KR)
+    "Republic",        // "Republic Day" (IN, TR); "Founding Day of the Republic of China" (TW)
+    "Founding",        // "State Founding Day" (BR)
+    "Foundation Day",  // KR, JP, IN states
+    "Constitution",    // TW 12-25, JP, NO, UA, …
+    "Unity",           // "German Unity Day" (DE), "Unity Day" (RU)
+    "Unification",     // BG, RO
+    "Statehood",       // HR, SI, RS, CZ, …
+    "Revolution",      // MX, EG, BY, IR, …
+    "Liberation",      // KR 08-15, NL, VN, …
+    "Victory",         // RU, CZ, …; the War of Resistance victory day (CN, HK)
+    "Restoration",     // "Taiwan Restoration and Guningtou Victory Memorial Day" (TW)
+    "Memorial",        // "Peace Memorial Day" (TW 02-28), "Memorial Day" (US, KR)
+    "Remembrance",     // CA, HR, PG, …
+    "Mourning",        // BD, PA, TH, …
+    "Armistice",       // FR, BE, RS
+    "Martyrs",         // TN, BF, PA, …
+    "Heroes",          // PH, JM, ZW, …
+    "Defender",        // RU, KZ, UA, KG
+    "Armed Forces",    // KR, EG, AZ, …
+    "Proclamation",    // AU, BR, LV
+    "Establishment",   // "Hong Kong S.A.R. Establishment Day" (HK)
+    "Sovereignty",     // RU, AR, TR
+    "Election",        // KR, ID, US, TH, …
+    "Flag",            // AZ, SZ, PE, …
+    "Canada Day",      // CA
+    "Australia Day",   // AU
+    "Russia Day",      // RU
+    "Waitangi Day",    // NZ
+    "Malaysia Day",    // MY
+    "Day of Portugal", // PT
 ];
 
 /// The user's locale as one request carried it, parsed (spec §3.2).
@@ -153,6 +193,10 @@ fn is_in_lieu(name: &str) -> bool {
     IN_LIEU.iter().any(|label| name.contains(label))
 }
 
+fn is_political(name: &str) -> bool {
+    POLITICAL.iter().any(|label| name.contains(label))
+}
+
 /// Holiday names on `date`, in spec §3.1 order: lunar festival, public
 /// holidays, fixed-date observances. Exact duplicates removed.
 pub fn holidays_on(
@@ -161,7 +205,7 @@ pub fn holidays_on(
     region: Option<SubDivision>,
 ) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
-    let mut push = |n: &str| {
+    let push = |names: &mut Vec<String>, n: &str| {
         if !names.iter().any(|x| x == n) {
             names.push(n.to_string());
         }
@@ -172,7 +216,7 @@ pub fn holidays_on(
         date.day() as usize,
     );
     if let Some(festival) = solar.get_lunar_day().get_festival() {
-        push(&festival.get_name());
+        push(&mut names, &festival.get_name());
     }
     if let Some(map) = country.and_then(country_map) {
         let by_date = region
@@ -180,20 +224,21 @@ pub fn holidays_on(
             .or_else(|| map.get(&SubDivision::National));
         if let Some(entry) = by_date.and_then(|m| m.get(&date)) {
             // python-holidays joins same-date holidays with "; ".
-            for part in entry.split("; ").filter(|p| !is_in_lieu(p)) {
-                push(part);
+            for part in entry
+                .split("; ")
+                .filter(|p| !is_in_lieu(p) && !is_political(p))
+            {
+                push(&mut names, part);
             }
         }
     }
-    let is_cn = country == Some(CountryCode::CN);
     for (month, day, name, who) in FIXED {
         let applies = match who {
             Who::Everyone => true,
-            Who::OnlyCn => is_cn,
-            Who::NotCn => !is_cn,
+            Who::Unless(text) => !names.iter().any(|n| n.contains(*text)),
         };
         if applies && date.month() == *month && date.day() == *day {
-            push(name);
+            push(&mut names, name);
         }
     }
     names
@@ -403,28 +448,72 @@ mod tests {
     }
 
     #[test]
-    fn fixed_observances_follow_the_country_rule() {
+    fn fixed_observances_reach_every_country() {
         let has = |date: NaiveDate, c: Option<CountryCode>, name: &str| {
             holidays_on(date, c, None).iter().any(|n| n == name)
         };
         for c in [None, cc("US"), cc("CN"), cc("TW")] {
             assert!(has(d(2027, 2, 14), c, "情人节"));
-            assert!(has(d(2026, 10, 25), c, "台湾光复节"));
             assert!(has(d(2026, 12, 24), c, "平安夜"));
         }
-        assert!(has(d(2026, 10, 9), cc("CN"), "辛亥革命纪念日"));
-        for c in [None, cc("US"), cc("TW")] {
-            assert!(!has(d(2026, 10, 9), c, "辛亥革命纪念日"));
-            assert!(has(d(2026, 10, 10), c, "双十节（中华民国国庆日）"));
-        }
-        assert!(!has(d(2026, 10, 10), cc("CN"), "双十节（中华民国国庆日）"));
     }
 
     #[test]
-    fn tw_national_day_reaches_the_model_in_both_names() {
+    fn political_days_are_dropped() {
+        let none: Vec<String> = Vec::new();
+        for (code, date, label) in [
+            ("CN", d(2026, 10, 1), "National Day"),
+            ("TW", d(2026, 10, 10), "National Day"),
+            ("US", d(2026, 7, 4), "Independence Day"),
+            ("IN", d(2027, 1, 26), "Republic Day"),
+            ("KR", d(2026, 10, 3), "National Foundation Day"),
+            ("JP", d(2026, 2, 11), "Foundation Day"),
+            ("DE", d(2026, 10, 3), "German Unity Day"),
+            ("KR", d(2026, 3, 1), "Independence Movement Day"),
+            ("KR", d(2026, 8, 15), "Liberation Day"),
+            ("TW", d(2026, 2, 28), "Peace Memorial Day"),
+            (
+                "TW",
+                d(2026, 10, 25),
+                "Taiwan Restoration and Guningtou Victory Memorial Day",
+            ),
+            ("CN", d(2015, 9, 3), "70th Anniversary of the Victory of …"),
+            ("HK", d(2026, 7, 1), "Hong Kong S.A.R. Establishment Day"),
+            ("RU", d(2026, 5, 9), "Victory Day"),
+            ("US", d(2026, 5, 25), "Memorial Day"),
+        ] {
+            assert_eq!(
+                holidays_on(date, cc(code), None),
+                none,
+                "{code} {date}: {label}"
+            );
+        }
+        for c in [None, cc("CN"), cc("TW"), cc("US")] {
+            assert_eq!(holidays_on(d(2026, 10, 9), c, None), none);
+            assert_eq!(holidays_on(d(2026, 10, 10), c, None), none);
+            assert_eq!(holidays_on(d(2026, 10, 25), c, None), none);
+        }
+    }
+
+    #[test]
+    fn new_year_and_christmas_fill_in_only_where_the_calendar_has_none() {
+        // TW's 01-01 (Founding Day of the Republic of China) and 12-25
+        // (Constitution Day) are dropped; CN has no Christmas.
+        assert_eq!(holidays_on(d(2027, 1, 1), cc("TW"), None), vec!["新年快乐"]);
+        assert_eq!(holidays_on(d(2027, 1, 1), None, None), vec!["新年快乐"]);
         assert_eq!(
-            holidays_on(d(2026, 10, 10), cc("TW"), None),
-            vec!["National Day", "双十节（中华民国国庆日）"]
+            holidays_on(d(2027, 1, 1), cc("CN"), None),
+            vec!["New Year's Day"]
+        );
+        for c in [None, cc("TW"), cc("CN")] {
+            assert_eq!(
+                holidays_on(d(2026, 12, 25), c, None),
+                vec!["Season's Greetings"]
+            );
+        }
+        assert_eq!(
+            holidays_on(d(2026, 12, 25), cc("US"), None),
+            vec!["Christmas Day"]
         );
     }
 
@@ -484,15 +573,15 @@ mod tests {
 
     #[test]
     fn upcoming_counts_days_in_the_users_zone_across_a_month_boundary() {
-        // 2026-09-30 04:00 UTC = 12:00 in Shanghai. CN National Day 10-01..03;
-        // 10-05 "(observed)" and 10-06 "Day off" drop out.
+        // 2026-04-30 04:00 UTC = 12:00 in Shanghai. CN Labor Day 05-01..02;
+        // 05-04 "(observed)" drops out.
         let l = UserLocale::resolve(Some("Asia/Shanghai"), None, None);
-        let now = Utc.with_ymd_and_hms(2026, 9, 30, 4, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 4, 30, 4, 0, 0).unwrap();
         let days: Vec<u8> = upcoming(&l, now)
             .into_iter()
             .map(|(ahead, _)| ahead)
             .collect();
-        assert_eq!(days, vec![1, 2, 3]);
+        assert_eq!(days, vec![1, 2]);
     }
 
     #[test]

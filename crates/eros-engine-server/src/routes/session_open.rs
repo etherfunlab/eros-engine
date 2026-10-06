@@ -653,25 +653,24 @@ mod tests {
 
     /// A greeting written for a different user-local date must not block
     /// today's — e.g. the user's timezone
-    /// changed between opens. 2026-10-01 12:30 UTC is 2026-10-02 in Kiritimati
-    /// (UTC+14) and 2026-10-01 in Shanghai (UTC+8); both dates are CN National
-    /// Day (`holiday::holidays_on` on each returns `["National Day"]`).
+    /// changed between opens. 2027-02-05 12:30 UTC is 2027-02-06 (春节) in
+    /// Kiritimati (UTC+14) and 2027-02-05 (除夕) in Shanghai (UTC+8).
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn a_greeting_for_a_different_local_date_does_not_block_todays(pool: PgPool) {
         let user_id = Uuid::new_v4();
         // History well before either timezone's relevant local midnight
-        // (Shanghai's, the earlier of the two: 2026-09-30 16:00 UTC).
+        // (Shanghai's, the earlier of the two: 2027-02-04 16:00 UTC).
         let session_id = session_with_history(
             &pool,
             user_id,
-            Utc.with_ymd_and_hms(2026, 9, 28, 0, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2027, 2, 2, 0, 0, 0).unwrap(),
         )
         .await;
         let mock = MockServer::start().await;
-        mount_companion(&mock, "国庆快乐").await;
+        mount_companion(&mock, "过年好").await;
         let state = with_companion(test_state(pool.clone()), &mock.uri());
 
-        let at = Utc.with_ymd_and_hms(2026, 10, 1, 12, 30, 0).unwrap();
+        let at = Utc.with_ymd_and_hms(2027, 2, 5, 12, 30, 0).unwrap();
         let kiritimati = OpenSessionRequest {
             user_timezone: Some("Pacific/Kiritimati".into()),
             user_country: Some("CN".into()),
@@ -705,7 +704,7 @@ mod tests {
         .await
         .unwrap();
         local_dates.sort();
-        assert_eq!(local_dates, vec!["2026-10-01", "2026-10-02"]);
+        assert_eq!(local_dates, vec!["2027-02-05", "2027-02-06"]);
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
