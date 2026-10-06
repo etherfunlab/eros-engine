@@ -315,7 +315,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 - `user_timezone` — IANA 时区（`Asia/Taipei`）。prompt 中 `[now]` 的时钟先取角色自己的
   `art_metadata.timezone`，没有再取它，都没有才用 `Asia/Singapore`。它也决定用户那边的节日行：
-  用户当地今天和之后六天的节日（`对方那边今天是中秋节；3 天后是国庆节。`），只陈述事实。
+  用户当地今天和之后六天的节日（`对方那边今天是平安夜；明天是Christmas Day。`），只陈述事实。
 - `user_country` — ISO 3166-1 alpha-2（`TW`），客户端拿到什么就传什么。缺省时由
   `user_timezone` 推出；不认识就没有法定假日。
 - `user_region` — 去掉国家前缀的 ISO 3166-2 行政区（`CA`、`ENG`），只在 `user_country`
@@ -324,8 +324,8 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 非法值不会让这一轮失败：解析不了的时区当没传。原始值记在用户消息行的 metadata 里。
 
 节日有三个来源：13 个农历传统节日（`tyme4rs`，所有用户都有），所在国家的法定假日（`py-holidays-rs`，
-补休日已去掉），以及五个固定日期：02-14 情人节、10-25 台湾光复节、12-24 平安夜对所有人；
-10-09 辛亥革命纪念日只对 `CN`；10-10 双十节（中华民国国庆日）对其余国家以及没有国家的用户。
+补休日和国庆、独立、建国、行宪类纪念日已去掉），以及五个固定日期：02-14 情人节、10-25 台湾光复节、
+12-24 平安夜对所有人；01-01 新年快乐和 12-25 `Season's Greetings` 只在所在国家的日历没有新年或圣诞时补上。
 async 端点和图片编辑接受同样的三个字段。
 
 **可选：OpenRouter audit 透传。** 请求体可附加 `audit` 对象，
