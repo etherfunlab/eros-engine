@@ -102,7 +102,7 @@ impl ModelSpec {
     /// Pick one concrete model id. `None` means the spec is empty (empty array,
     /// empty/all-non-positive table, or empty fixed string) — the caller should
     /// fall through to the next precedence level.
-    fn select(&self) -> Option<String> {
+    pub fn select(&self) -> Option<String> {
         match self {
             ModelSpec::Fixed(s) if !s.is_empty() => Some(s.clone()),
             ModelSpec::RoundRobin { models, cursor } if !models.is_empty() => {
@@ -545,6 +545,31 @@ const PROVIDER_ENTRY_TABLE_FORM_ERROR: &str = "[providers] values must be tables
      venice = { chat = \"https://…\" } (and/or embeddings = \"…\", headers = { … }); the \
      0.9.3 string form was removed";
 
+/// Header pairs sent verbatim to an endpoint: engine-owned names refused,
+/// every pair valid HTTP material. `scope` prefixes each message. Shared by
+/// `[providers].<name>.headers` and BYOK providers.
+pub fn check_header_pairs(scope: &str, headers: &BTreeMap<String, String>) -> Result<(), String> {
+    for (name, value) in headers {
+        let lower = name.to_ascii_lowercase();
+        if lower == "authorization" || lower == "content-type" {
+            return Err(format!(
+                "{scope}: `{name}` is engine-owned — the engine sets Authorization from \
+                 the provider's API key and Content-Type from the request body; it \
+                 cannot be overridden"
+            ));
+        }
+        if reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err() {
+            return Err(format!("{scope}: `{name}` is not a valid HTTP header name"));
+        }
+        if reqwest::header::HeaderValue::from_str(value).is_err() {
+            return Err(format!(
+                "{scope}: value for `{name}` is not a valid HTTP header value"
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl<'de> Deserialize<'de> for ProviderEntry {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -658,28 +683,7 @@ impl ProviderEntry {
         if headers.is_empty() {
             return Err(format!("[providers].{entry}.headers: table is empty"));
         }
-        for (name, value) in headers {
-            let lower = name.to_ascii_lowercase();
-            if lower == "authorization" || lower == "content-type" {
-                return Err(format!(
-                    "[providers].{entry}.headers: `{name}` is engine-owned — the \
-                     engine sets Authorization from the provider's API key and \
-                     Content-Type from the request body; it cannot be overridden"
-                ));
-            }
-            if reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err() {
-                return Err(format!(
-                    "[providers].{entry}.headers: `{name}` is not a valid HTTP header name"
-                ));
-            }
-            if reqwest::header::HeaderValue::from_str(value).is_err() {
-                return Err(format!(
-                    "[providers].{entry}.headers: value for `{name}` is not a valid \
-                     HTTP header value"
-                ));
-            }
-        }
-        Ok(())
+        check_header_pairs(&format!("[providers].{entry}.headers"), headers)
     }
 
     /// The validated `headers` table as a reqwest `HeaderMap`. Invalid pairs
@@ -7832,6 +7836,17 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         let cfg = ModelConfig::from_toml_str("[providers]\nvenice = {}\n").unwrap();
         let msg = cfg.validate_providers_with(|_| None).unwrap_err();
         assert!(msg.contains("[providers].venice"), "{msg}");
+    }
+
+    #[test]
+    fn check_header_pairs_names_the_scope() {
+        let mut h = BTreeMap::new();
+        h.insert("Authorization".to_string(), "x".to_string());
+        let err = check_header_pairs("byok.providers.mine.headers", &h).unwrap_err();
+        assert!(
+            err.starts_with("byok.providers.mine.headers: `Authorization` is engine-owned"),
+            "{err}"
+        );
     }
 
     #[test]

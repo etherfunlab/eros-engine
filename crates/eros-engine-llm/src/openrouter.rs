@@ -448,6 +448,24 @@ impl<'a> WireRequest<'a> {
 /// True when `rule` applies to a call serving `task` (spec
 /// 2026-08-02-provider-body-params): no `tasks` list ⇒ applies always;
 /// a task-scoped rule requires an exact, case-sensitive name match.
+/// BYOK hops drop the URL from transport errors: an end user's endpoint may
+/// carry its key in the query string (spec 2026-10-08 §8.2).
+fn strip_url(e: reqwest::Error, byok: bool) -> reqwest::Error {
+    if byok {
+        e.without_url()
+    } else {
+        e
+    }
+}
+
+/// Replace every verbatim occurrence of a BYOK hop's key in provider text.
+fn scrub_key(text: &str, key: Option<&str>) -> String {
+    match key {
+        Some(k) if !k.is_empty() => text.replace(k, "<redacted>"),
+        _ => text.to_string(),
+    }
+}
+
 fn rule_matches(rule: &crate::model_config::BodyRule, task: Option<&str>) -> bool {
     match (&rule.tasks, task) {
         (None, _) => true,
@@ -605,6 +623,11 @@ pub struct OpenRouterClient {
     /// instead carry their own declared headers per-request (spec §3). Same
     /// connect/pool bounds as `http`.
     plain_http: reqwest::Client,
+    /// A per-turn BYOK client (spec 2026-10-08-byok-chat §7.1, §8): the echo
+    /// is labelled `byok`, transport errors lose their URL, and the
+    /// endpoint's key is scrubbed from provider error text. Only
+    /// `execute_stream_as` serves BYOK hops.
+    byok: bool,
 }
 
 impl OpenRouterClient {
@@ -643,6 +666,7 @@ impl OpenRouterClient {
             base_url,
             providers: Arc::new(HashMap::new()),
             openrouter_body_rules: Vec::new(),
+            byok: false,
         }
     }
 
@@ -687,6 +711,26 @@ impl OpenRouterClient {
     pub fn with_openrouter_body_rules(mut self, rules: Vec<crate::model_config::BodyRule>) -> Self {
         self.openrouter_body_rules = rules;
         self
+    }
+
+    /// A per-turn client for an end user's own endpoints (spec
+    /// 2026-10-08-byok-chat §7.1). It has no built-in endpoint: a slug
+    /// without a suffix naming one of `providers` fails with
+    /// `LlmError::Config`. `http` is the guarded client from
+    /// [`crate::byok::build_http`].
+    pub fn byok(
+        http: reqwest::Client,
+        providers: HashMap<String, crate::provider::ProviderEndpoint>,
+    ) -> Self {
+        Self {
+            http: http.clone(),
+            plain_http: http,
+            api_key: String::new(),
+            base_url: String::new(),
+            providers: Arc::new(providers),
+            openrouter_body_rules: Vec::new(),
+            byok: true,
+        }
     }
 }
 
@@ -1209,7 +1253,16 @@ impl OpenRouterClient {
         // Owned copy for the `filter_map` closure below (§6 parity with the
         // sync path's model_out): the closure is `async move` and outlives
         // `ep`'s borrow of `self.providers`.
-        let ep_name: Option<String> = ep.name.map(str::to_string);
+        // A BYOK hop's echo is labelled `byok`, never the end user's own
+        // provider name (spec 2026-10-08 §8.1).
+        let ep_name: Option<String> = if self.byok {
+            Some(crate::byok::AUDIT_LABEL.to_string())
+        } else {
+            ep.name.map(str::to_string)
+        };
+        let byok = self.byok;
+        // The key to scrub from provider error text on a BYOK hop (§8.2).
+        let key_to_scrub: Option<String> = byok.then(|| ep.api_key.to_string());
         let wire = WireRequest {
             model: &bare_model,
             messages: &req.messages,
@@ -1252,15 +1305,26 @@ impl OpenRouterClient {
                 .as_object_mut()
                 .expect("WireRequest always serializes to a JSON object");
             apply_body_rules(map, rules, req_task);
-            builder.json(&v).send().await?
+            builder
+                .json(&v)
+                .send()
+                .await
+                .map_err(|e| strip_url(e, byok))?
         } else {
-            builder.json(&wire).send().await?
+            builder
+                .json(&wire)
+                .send()
+                .await
+                .map_err(|e| strip_url(e, byok))?
         };
 
         let status = resp.status();
         if !status.is_success() {
             let retry_after = retry_after_secs(resp.headers());
-            let text = resp.text().await.unwrap_or_default();
+            let text = scrub_key(
+                &resp.text().await.unwrap_or_default(),
+                key_to_scrub.as_deref(),
+            );
             return Err(LlmError::Status(
                 status,
                 parse_error_body(&text),
@@ -1296,76 +1360,81 @@ impl OpenRouterClient {
             })
         }));
 
-        let stream = idle_bounded(resp.bytes_stream(), STREAM_IDLE_TIMEOUT)
-            .eventsource()
-            .filter_map(move |ev| {
-                // Per-invocation clone: `filter_map`'s closure is `FnMut`,
-                // called once per frame, and each call's `async move` block
-                // needs its own owned copy of `ep_name`.
-                let ep_name = ep_name.clone();
-                async move {
-                    match ev {
-                        Ok(e) => {
-                            if e.data == "[DONE]" {
-                                return None;
-                            }
-                            match serde_json::from_str::<WireStreamFrame>(&e.data) {
-                                Ok(frame) => {
-                                    // A mid-stream provider failure arrives as a
-                                    // normal-looking 200 SSE frame with a top-level
-                                    // `error` (and/or finish_reason:"error"). It
-                                    // must fail the attempt so the pipeline's
-                                    // fallback chain runs — NOT parse as an
-                                    // all-None chunk that lets a partial reply
-                                    // persist as a clean success.
-                                    if let Some(err) = frame.error {
-                                        // The provider spoke inside a 200 stream.
-                                        // Keep the code structured — this used to
-                                        // be format!("code={:?}") into a String,
-                                        // which destroyed it.
-                                        return Some(Err(LlmError::Provider(
-                                            mid_stream_error_body(err.code.as_ref(), &err.message),
-                                        )));
-                                    }
-                                    let choice =
-                                        frame.choices.into_iter().next().unwrap_or_default();
-                                    if choice.finish_reason.as_deref() == Some("error") {
-                                        return Some(Err(LlmError::Provider(
+        let stream = idle_bounded(
+            futures_util::TryStreamExt::map_err(resp.bytes_stream(), move |e| strip_url(e, byok)),
+            STREAM_IDLE_TIMEOUT,
+        )
+        .eventsource()
+        .filter_map(move |ev| {
+            // Per-invocation clone: `filter_map`'s closure is `FnMut`,
+            // called once per frame, and each call's `async move` block
+            // needs its own owned copy of `ep_name`.
+            let ep_name = ep_name.clone();
+            let key_to_scrub = key_to_scrub.clone();
+            async move {
+                match ev {
+                    Ok(e) => {
+                        if e.data == "[DONE]" {
+                            return None;
+                        }
+                        match serde_json::from_str::<WireStreamFrame>(&e.data) {
+                            Ok(frame) => {
+                                // A mid-stream provider failure arrives as a
+                                // normal-looking 200 SSE frame with a top-level
+                                // `error` (and/or finish_reason:"error"). It
+                                // must fail the attempt so the pipeline's
+                                // fallback chain runs — NOT parse as an
+                                // all-None chunk that lets a partial reply
+                                // persist as a clean success.
+                                if let Some(err) = frame.error {
+                                    // The provider spoke inside a 200 stream.
+                                    // Keep the code structured — this used to
+                                    // be format!("code={:?}") into a String,
+                                    // which destroyed it.
+                                    let message = scrub_key(&err.message, key_to_scrub.as_deref());
+                                    return Some(Err(LlmError::Provider(mid_stream_error_body(
+                                        err.code.as_ref(),
+                                        &message,
+                                    ))));
+                                }
+                                let choice = frame.choices.into_iter().next().unwrap_or_default();
+                                if choice.finish_reason.as_deref() == Some("error") {
+                                    return Some(Err(LlmError::Provider(
                                         ParsedErrorBody::message_only(
                                             "openrouter stream terminated with finish_reason=error",
                                         ),
                                     )));
-                                    }
-                                    Some(Ok(DeltaChunk {
-                                        content: choice.delta.content.filter(|s| !s.is_empty()),
-                                        finish_reason: choice.finish_reason,
-                                        usage: frame.usage,
-                                        generation_id: frame.id,
-                                        // §6 parity with the sync path (see
-                                        // model_out above `execute`'s
-                                        // ChatResponse): a direct-endpoint echo
-                                        // self-identifies as <echo>@<provider>,
-                                        // escaped so a literal `@` in the echo
-                                        // can't fake a second provider suffix.
-                                        // OpenRouter chunks stay byte-identical.
-                                        model: frame.model.map(|echo| match ep_name.as_deref() {
-                                            None => echo,
-                                            Some(p) => format!(
-                                                "{}@{p}",
-                                                crate::provider::escape_model_id(&echo)
-                                            ),
-                                        }),
-                                    }))
                                 }
-                                Err(_) => Some(Err(LlmError::StreamParse(
-                                    e.data.chars().take(256).collect(),
-                                ))),
+                                Some(Ok(DeltaChunk {
+                                    content: choice.delta.content.filter(|s| !s.is_empty()),
+                                    finish_reason: choice.finish_reason,
+                                    usage: frame.usage,
+                                    generation_id: frame.id,
+                                    // §6 parity with the sync path (see
+                                    // model_out above `execute`'s
+                                    // ChatResponse): a direct-endpoint echo
+                                    // self-identifies as <echo>@<provider>,
+                                    // escaped so a literal `@` in the echo
+                                    // can't fake a second provider suffix.
+                                    // OpenRouter chunks stay byte-identical.
+                                    model: frame.model.map(|echo| match ep_name.as_deref() {
+                                        None => echo,
+                                        Some(p) => format!(
+                                            "{}@{p}",
+                                            crate::provider::escape_model_id(&echo)
+                                        ),
+                                    }),
+                                }))
                             }
+                            Err(_) => Some(Err(LlmError::StreamParse(
+                                e.data.chars().take(256).collect(),
+                            ))),
                         }
-                        Err(e) => Some(Err(LlmError::Stream(e.to_string()))),
                     }
+                    Err(e) => Some(Err(LlmError::Stream(e.to_string()))),
                 }
-            });
+            }
+        });
 
         Ok(DeltaStream(head.chain(stream).boxed()))
     }
@@ -5002,6 +5071,182 @@ data: [DONE]\n\n";
         assert!(
             body.get("reasoning_effort").is_none(),
             "openrouter-entry rules must not reach a custom provider's vision call"
+        );
+    }
+
+    fn byok_client(mock_uri: &str, key: &str) -> OpenRouterClient {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-org", reqwest::header::HeaderValue::from_static("acme"));
+        let mut providers = HashMap::new();
+        providers.insert(
+            "mine".to_string(),
+            crate::provider::ProviderEndpoint {
+                base_url: format!("{mock_uri}/byok/v1/chat/completions"),
+                api_key: key.to_string(),
+                headers,
+                body_rules: Vec::new(),
+            },
+        );
+        OpenRouterClient::byok(crate::byok::build_http(true), providers)
+    }
+
+    fn byok_req() -> ChatRequest {
+        ChatRequest {
+            model: "unused".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            temperature: 0.0,
+            max_tokens: 16,
+            task: Some("chat_companion".into()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn byok_client_posts_with_the_end_users_key_and_labels_the_echo_byok() {
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_partial_json, header, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"id\":\"gen-b\",\"model\":\"gpt-x\"}\n\ndata: [DONE]\n\n";
+        Mock::given(path("/byok/v1/chat/completions"))
+            .and(header("authorization", "Bearer sk-end-user"))
+            .and(header("x-org", "acme"))
+            .and(body_partial_json(serde_json::json!({"model": "gpt-x"})))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let client = byok_client(&mock.uri(), "sk-end-user");
+        let s = client
+            .execute_stream_as(&byok_req(), "gpt-x@mine")
+            .await
+            .expect("opens");
+        let chunks: Vec<_> = s.0.collect().await;
+        let echo = chunks
+            .iter()
+            .filter_map(|c| c.as_ref().ok())
+            .find_map(|c| c.model.clone());
+        assert_eq!(echo.as_deref(), Some("gpt-x@byok"));
+    }
+
+    #[tokio::test]
+    async fn byok_client_has_no_built_in_endpoint() {
+        let client = byok_client("http://127.0.0.1:1", "sk-end-user");
+        for slug in ["gpt-x", "gpt-x@openrouter"] {
+            let err = client
+                .execute_stream_as(&byok_req(), slug)
+                .await
+                .expect_err("must not post");
+            assert!(matches!(err, LlmError::Config(_)), "{slug}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn byok_client_scrubs_the_key_from_provider_errors() {
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_partial_json, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(path("/byok/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({"model": "status"})))
+            .respond_with(ResponseTemplate::new(401).set_body_string(
+                r#"{"error":{"message":"Incorrect API key provided: sk-end-user-123"}}"#,
+            ))
+            .mount(&mock)
+            .await;
+        let mid = "data: {\"error\":{\"code\":500,\"message\":\"upstream rejected sk-end-user-123\"}}\n\n";
+        Mock::given(path("/byok/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({"model": "mid"})))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(mid, "text/event-stream"))
+            .mount(&mock)
+            .await;
+
+        let client = byok_client(&mock.uri(), "sk-end-user-123");
+        let err = client
+            .execute_stream_as(&byok_req(), "status@mine")
+            .await
+            .expect_err("401");
+        let LlmError::Status(status, body, _) = &err else {
+            panic!("expected Status, got {err}")
+        };
+        assert_eq!(status.as_u16(), 401);
+        assert!(
+            !body.message.contains("sk-end-user-123") && body.message.contains("<redacted>"),
+            "{}",
+            body.message
+        );
+
+        let s = client
+            .execute_stream_as(&byok_req(), "mid@mine")
+            .await
+            .expect("opens");
+        let chunks: Vec<_> = s.0.collect().await;
+        let provider_err = chunks
+            .into_iter()
+            .find_map(|c| c.err())
+            .expect("mid-stream error");
+        let LlmError::Provider(body) = &provider_err else {
+            panic!("expected Provider, got {provider_err}")
+        };
+        assert!(
+            !body.message.contains("sk-end-user-123") && body.message.contains("<redacted>"),
+            "{}",
+            body.message
+        );
+    }
+
+    #[tokio::test]
+    async fn byok_transport_errors_carry_no_url() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "mine".to_string(),
+            crate::provider::ProviderEndpoint {
+                base_url: "http://127.0.0.1:1/v1/chat/completions?key=SECRETQ".into(),
+                api_key: "sk".into(),
+                headers: reqwest::header::HeaderMap::new(),
+                body_rules: Vec::new(),
+            },
+        );
+        let client = OpenRouterClient::byok(crate::byok::build_http(true), providers);
+        let err = client
+            .execute_stream_as(&byok_req(), "gpt-x@mine")
+            .await
+            .expect_err("connection refused");
+        assert!(matches!(err, LlmError::Http(_)), "{err}");
+        let display = err.to_string();
+        assert!(
+            !display.contains("SECRETQ") && !display.contains("127.0.0.1"),
+            "{display}"
+        );
+        assert!(!format!("{err:?}").contains("SECRETQ"));
+    }
+
+    #[tokio::test]
+    async fn byok_client_does_not_follow_redirects() {
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(path("/byok/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("location", "http://127.0.0.1:1/internal"),
+            )
+            .mount(&mock)
+            .await;
+        let client = byok_client(&mock.uri(), "sk-end-user");
+        let err = client
+            .execute_stream_as(&byok_req(), "gpt-x@mine")
+            .await
+            .expect_err("a 302 is a failure");
+        assert!(
+            matches!(&err, LlmError::Status(s, _, _) if s.as_u16() == 302),
+            "{err}"
         );
     }
 }
