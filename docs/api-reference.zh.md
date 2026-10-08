@@ -1344,10 +1344,18 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
 `total` 是 **本次** 響應裡 `messages` 的條數（`== messages.len()`），
 不是該 session 的總行數。
 
-往上翻更早的消息时，改用键集游标而不是 offset：`before=<message id>` 返回按
-`(sent_at, id)` 严格早于该行的最多 `limit` 行，同样从旧到新排列，此时不使用
-`offset`。传客户端手上最早那一行的 `id`；`messages` 为空就是没有更早的消息。
-不属于本 session 的 id 返回 `404`。
+请求也可以不用 offset，改带一个键集游标（某条消息的 id）；行按 `(sent_at, id)`
+排序，照旧从旧到新返回，此时不使用 `offset`：
+
+- `before=<id>` —— 严格早于该行的最多 `limit` 行。往上翻时传客户端手上最早
+  那一行；`messages` 为空就是没有更早的消息。
+- `after=<id>` —— 严格晚于该行的最多 `limit` 行。往下翻时传客户端手上最新
+  那一行；`messages` 为空就是已经追到最新。
+- `around=<id>` —— 该行本身，加上它之前最多 `(limit - 1) / 2` 行、之后最多
+  余下的行数（默认 `limit` 下是 24 + 1 + 25），用来不论多深都一次跳到某条消息。
+  一侧不够时不从另一侧补。之后从这一段的两头接着用 `before` / `after`。
+
+不属于本 session 的 id 返回 `404`；同时带多个游标返回 `400`。
 
 ### `GET /bff/v1/comp/affinity/{session_id}/event`
 
