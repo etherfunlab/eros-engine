@@ -40,6 +40,7 @@ pub fn address_allowed(ip: IpAddr) -> bool {
                 || v6.is_loopback()
                 || (s[0] & 0xfe00) == 0xfc00 // fc00::/7 unique local
                 || (s[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+                || (s[0] & 0xffc0) == 0xfec0 // fec0::/10 site-local
                 || (s[0] & 0xff00) == 0xff00) // ff00::/8 multicast
         }
     }
@@ -185,8 +186,9 @@ where
 /// What a redacted credential reads as in provider text.
 const REDACTED: &str = "<redacted>";
 
-/// Credentials shorter than this are left alone: replacing a two-letter
-/// value would mangle ordinary text.
+/// Header and query values shorter than this are left alone: replacing a
+/// two-letter value would mangle ordinary text. The key is replaced at any
+/// length.
 const MIN_REDACT_LEN: usize = 4;
 
 /// Every credential of one BYOK hop as it may appear in provider text (spec
@@ -222,6 +224,9 @@ impl Redactor {
             found.extend(parsed.query_pairs().map(|(_, v)| v.into_owned()));
         }
         found.retain(|s| s.len() >= MIN_REDACT_LEN);
+        if !api_key.is_empty() {
+            found.push(api_key.to_string());
+        }
         found.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
         found.dedup();
         Self(found)
@@ -288,6 +293,8 @@ mod tests {
             "fd00::1",
             "fdaa::2",
             "fe80::1",
+            "fec0::1",
+            "feff::1",
             "ff02::1",
             "::ffff:10.0.0.1",
             "::ffff:127.0.0.1",
@@ -376,6 +383,15 @@ mod tests {
                 "{url} sk-KEY-1 hdr-SECRET Q%2BSECRET Q+SECRET flag abc"
             )),
             "<redacted> <redacted> <redacted> <redacted> <redacted> <redacted> abc"
+        );
+    }
+
+    #[test]
+    fn redactor_replaces_a_short_key() {
+        let r = Redactor::new("k1", None, "https://api.example.com/v1/chat");
+        assert_eq!(
+            r.apply("Incorrect API key: k1"),
+            "Incorrect API key: <redacted>"
         );
     }
 

@@ -267,7 +267,7 @@ The guard refuses:
 
 | IPv4 | IPv6 |
 |---|---|
-| `0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10`, `127.0.0.0/8`, `169.254.0.0/16`, `172.16.0.0/12`, `192.0.0.0/24`, `192.168.0.0/16`, `198.18.0.0/15`, `224.0.0.0/4`, `240.0.0.0/4` | `::`, `::1`, `fc00::/7`, `fe80::/10`, `ff00::/8`; `::ffff:0:0/96` and `64:ff9b::/96` judged by their embedded IPv4 |
+| `0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10`, `127.0.0.0/8`, `169.254.0.0/16`, `172.16.0.0/12`, `192.0.0.0/24`, `192.168.0.0/16`, `198.18.0.0/15`, `224.0.0.0/4`, `240.0.0.0/4` | `::`, `::1`, `fc00::/7`, `fe80::/10`, `fec0::/10`, `ff00::/8`; `::ffff:0:0/96` and `64:ff9b::/96` judged by their embedded IPv4 |
 
 reqwest does not consult the resolver for a literal-IP host, so §4.2 applies
 the same guard to literal IPs at validation. A host refused at connect time
@@ -332,7 +332,11 @@ code:
   verbatim occurrence of the hop's `api_key`, of each of its header values,
   of its URL, and of each value in the URL's query string is replaced with
   `<redacted>` — in the raw error body, in the parsed message, and in the
-  bytes of a malformed stream frame that reach a log line.
+  bytes of a malformed stream frame that reach a log line. The key is
+  replaced at any length; header and query values shorter than 4 bytes are
+  left as they are, since replacing them would mangle ordinary text.
+- Reply text is the end user's model output and is stored as returned, as
+  any reply is.
 - Log lines name a BYOK hop by its `<id>@byok` label, never by the slug the
   end user wrote.
 

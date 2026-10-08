@@ -97,7 +97,7 @@ BYOK 请求通过专用客户端发出：不跟随重定向，不使用代理，
 - BYOK hop 的 `engine.llm_generations.generation_id` 由引擎生成，形如 `byok-<32 位十六进制>`；不保留 provider 自己的 id。
 - `usage` 按 provider 发来的原样存储，包括 `cost`。这笔花费属于终端用户，因此部署在 `engine.llm_generations` 上统计花费时要排除 `model LIKE '%@byok'`。
 - 某一轮请求过 BYOK 这件事只在它的队列行上记录一次：`engine.chat_turn_queue.params->'byok'` = `{"fallback_to_platform": …}`。
-- URL、key 和 header 值从不记录：不进表、不进队列 params、不进日志、不进 prompt log。provider 错误里回显的 key、header 值、URL 或 URL 查询串里的值，存储时都会被替换为 `<redacted>`。
+- URL、key 和 header 值从不记录：不进表、不进队列 params、不进日志、不进 prompt log。provider 错误里回显的 key、header 值、URL 或 URL 查询串里的值，存储时都会被替换为 `<redacted>`；短于 4 字节的 header 值和查询串值保持原样。回复正文是终端用户模型的输出，按原样存储。
 
 如果一次部署打断了某个 BYOK 轮次，接手恢复的 worker 已经没有该块：它会让这一轮失败（`last_error = 'byok_unavailable'`），或者在设了 `fallback_to_platform` 时，用部署自己的链路来回答。
 

@@ -154,7 +154,9 @@ not lift the byte limits.
 - URLs, keys and header values are never recorded: not in tables, queue
   params, logs or the prompt log. A provider error that echoes the key, a
   header value, the URL or a value from its query string is stored with
-  each replaced by `<redacted>`.
+  each replaced by `<redacted>`; header and query values shorter than 4
+  bytes are left as they are. Reply text is the end user's model output and
+  is stored as returned.
 
 If a deploy interrupts a BYOK turn, the worker that recovers it no longer has
 the block: it fails the turn (`last_error = 'byok_unavailable'`), or, with
