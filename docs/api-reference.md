@@ -1572,6 +1572,24 @@ round-trip.
 `total` is the count of `messages` in **this** response (`== messages.len()`),
 not the grand total of rows in the session.
 
+Instead of an offset, a request can carry one keyset cursor, a message id;
+rows are ordered by `(sent_at, id)` and returned oldest-first as above, and
+`offset` is not used:
+
+- `before=<id>` — up to `limit` rows strictly older than that row. Pass the
+  oldest row the client holds to scroll up; an empty `messages` means there is
+  nothing older.
+- `after=<id>` — up to `limit` rows strictly newer than that row. Pass the
+  newest row the client holds to scroll down; an empty `messages` means the
+  client has caught up.
+- `around=<id>` — that row plus up to `(limit - 1) / 2` rows older than it and
+  up to the rest newer (24 + 1 + 25 at the default `limit`), to jump straight
+  to a message however deep it is. A short side is not made up from the other.
+  Continue with `before` / `after` from the window's ends.
+
+An id that is not a message of this session answers `404`; more than one
+cursor answers `400`.
+
 ### `GET /bff/v1/comp/affinity/{session_id}/event`
 
 Latest user-turn affinity delta (the applied per-axis change) **plus the

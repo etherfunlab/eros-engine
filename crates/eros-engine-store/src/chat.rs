@@ -187,6 +187,15 @@ pub struct ChatMessageSlim {
     pub user_message_id: Option<Uuid>,
 }
 
+/// The `ChatMessageSlim` projection, shared by every query that decodes one.
+const SLIM_COLUMNS: &str = "id, role, content, sent_at, client_msg_id, \
+     metadata->>'tips_amount_usd' AS tips_amount_usd, \
+     channel, read_at, reaction, reacted_at, \
+     (metadata->'image' IS NOT NULL) AS image, \
+     metadata->>'reply_to_message_id' AS reply_to_message_id, \
+     metadata->'action' AS action, \
+     user_message_id";
+
 /// An assistant row's reaction as the next reply turn renders it (spec
 /// 2026-10-05-message-reactions-design.md §6).
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -487,25 +496,20 @@ impl<'a> ChatRepo<'a> {
     /// doesn't need `extracted_facts` / idempotency / SSE metadata). Same
     /// DESC+reverse trick as `history()` so the result is chronological.
     /// Uses the existing `(session_id, sent_at DESC)` index — no migration.
+    /// `sent_at` ties break by `id`, the order `history_slim_before` pages in.
     pub async fn history_slim(
         &self,
         session_id: Uuid,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<ChatMessageSlim>, sqlx::Error> {
-        let mut rows = sqlx::query_as::<_, ChatMessageSlim>(
-            "SELECT id, role, content, sent_at, client_msg_id, \
-                    metadata->>'tips_amount_usd' AS tips_amount_usd, \
-                    channel, read_at, reaction, reacted_at, \
-                    (metadata->'image' IS NOT NULL) AS image, \
-                    metadata->>'reply_to_message_id' AS reply_to_message_id, \
-                    metadata->'action' AS action, \
-                    user_message_id \
+        let mut rows = sqlx::query_as::<_, ChatMessageSlim>(&format!(
+            "SELECT {SLIM_COLUMNS} \
              FROM engine.chat_messages \
              WHERE session_id = $1 \
-             ORDER BY sent_at DESC \
-             LIMIT $2 OFFSET $3",
-        )
+             ORDER BY sent_at DESC, id DESC \
+             LIMIT $2 OFFSET $3"
+        ))
         .bind(session_id)
         .bind(limit)
         .bind(offset)
@@ -513,6 +517,130 @@ impl<'a> ChatRepo<'a> {
         .await?;
         rows.reverse();
         Ok(rows)
+    }
+
+    /// `history_slim`'s keyset page: the newest `limit` rows strictly older
+    /// than `before` by `(sent_at, id)`, chronological. `None` when `before`
+    /// is not a row of this session.
+    pub async fn history_slim_before(
+        &self,
+        session_id: Uuid,
+        before: Uuid,
+        limit: i64,
+    ) -> Result<Option<Vec<ChatMessageSlim>>, sqlx::Error> {
+        let Some(anchor) = self.slim_row_in_session(session_id, before).await? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.slim_older_than(session_id, &anchor, limit).await?,
+        ))
+    }
+
+    /// `history_slim_before`'s mirror: the oldest `limit` rows strictly newer
+    /// than `after`, chronological. `None` when `after` is not a row of this
+    /// session.
+    pub async fn history_slim_after(
+        &self,
+        session_id: Uuid,
+        after: Uuid,
+        limit: i64,
+    ) -> Result<Option<Vec<ChatMessageSlim>>, sqlx::Error> {
+        let Some(anchor) = self.slim_row_in_session(session_id, after).await? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.slim_newer_than(session_id, &anchor, limit).await?,
+        ))
+    }
+
+    /// A `limit`-row window (`limit >= 1`) on `around`, chronological: up to
+    /// `(limit - 1) / 2` rows older than it, the row itself, up to the rest
+    /// newer. A short side is not made up from the other. `None` when `around`
+    /// is not a row of this session.
+    pub async fn history_slim_around(
+        &self,
+        session_id: Uuid,
+        around: Uuid,
+        limit: i64,
+    ) -> Result<Option<Vec<ChatMessageSlim>>, sqlx::Error> {
+        let Some(anchor) = self.slim_row_in_session(session_id, around).await? else {
+            return Ok(None);
+        };
+        let older = (limit - 1) / 2;
+        let mut rows = self.slim_older_than(session_id, &anchor, older).await?;
+        let newer = self
+            .slim_newer_than(session_id, &anchor, limit - 1 - older)
+            .await?;
+        rows.push(anchor);
+        rows.extend(newer);
+        Ok(Some(rows))
+    }
+
+    async fn slim_row_in_session(
+        &self,
+        session_id: Uuid,
+        id: Uuid,
+    ) -> Result<Option<ChatMessageSlim>, sqlx::Error> {
+        sqlx::query_as::<_, ChatMessageSlim>(&format!(
+            "SELECT {SLIM_COLUMNS} FROM engine.chat_messages WHERE id = $1 AND session_id = $2"
+        ))
+        .bind(id)
+        .bind(session_id)
+        .fetch_optional(self.pool)
+        .await
+    }
+
+    /// Up to `limit` rows strictly older than `anchor` by `(sent_at, id)`,
+    /// chronological. The redundant `sent_at <=` bound starts the
+    /// `(session_id, sent_at DESC)` index scan at the anchor.
+    async fn slim_older_than(
+        &self,
+        session_id: Uuid,
+        anchor: &ChatMessageSlim,
+        limit: i64,
+    ) -> Result<Vec<ChatMessageSlim>, sqlx::Error> {
+        let mut rows = sqlx::query_as::<_, ChatMessageSlim>(&format!(
+            "SELECT {SLIM_COLUMNS} \
+             FROM engine.chat_messages \
+             WHERE session_id = $1 \
+               AND sent_at <= $2 \
+               AND (sent_at, id) < ($2, $3) \
+             ORDER BY sent_at DESC, id DESC \
+             LIMIT $4"
+        ))
+        .bind(session_id)
+        .bind(anchor.sent_at)
+        .bind(anchor.id)
+        .bind(limit)
+        .fetch_all(self.pool)
+        .await?;
+        rows.reverse();
+        Ok(rows)
+    }
+
+    /// Up to `limit` rows strictly newer than `anchor` by `(sent_at, id)`,
+    /// chronological. `sent_at >=` bounds the index scan as above.
+    async fn slim_newer_than(
+        &self,
+        session_id: Uuid,
+        anchor: &ChatMessageSlim,
+        limit: i64,
+    ) -> Result<Vec<ChatMessageSlim>, sqlx::Error> {
+        sqlx::query_as::<_, ChatMessageSlim>(&format!(
+            "SELECT {SLIM_COLUMNS} \
+             FROM engine.chat_messages \
+             WHERE session_id = $1 \
+               AND sent_at >= $2 \
+               AND (sent_at, id) > ($2, $3) \
+             ORDER BY sent_at, id \
+             LIMIT $4"
+        ))
+        .bind(session_id)
+        .bind(anchor.sent_at)
+        .bind(anchor.id)
+        .bind(limit)
+        .fetch_all(self.pool)
+        .await
     }
 
     /// All sessions belonging to a user, most-recently-active first.
@@ -2006,6 +2134,208 @@ mod tests {
             page.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
             vec!["m1", "m2"]
         );
+    }
+
+    /// `n` rows `m0..` one second apart, oldest first; their ids in that order.
+    async fn seed_spaced_rows(pool: &PgPool, session_id: Uuid, n: i64) -> Vec<Uuid> {
+        let mut ids = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            let id = sqlx::query_scalar::<_, Uuid>(
+                "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+                 VALUES ($1, 'user', $2, now() + make_interval(secs => $3::float8)) \
+                 RETURNING id",
+            )
+            .bind(session_id)
+            .bind(format!("m{i}"))
+            .bind(i as f64)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            ids.push(id);
+        }
+        ids
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn history_slim_before_pages_strictly_older_than_the_anchor(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = throwaway_session(&pool).await;
+        let ids = seed_spaced_rows(&pool, s.id, 5).await;
+
+        // The newest `limit` rows older than the anchor, oldest-first; the
+        // anchor itself is not repeated.
+        let page = repo
+            .history_slim_before(s.id, ids[3], 2)
+            .await
+            .unwrap()
+            .expect("anchor is in the session");
+        assert_eq!(
+            page.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+            vec!["m1", "m2"]
+        );
+
+        // Nothing older than the first row: an empty page, not a missing anchor.
+        let page = repo
+            .history_slim_before(s.id, ids[0], 2)
+            .await
+            .unwrap()
+            .expect("anchor is in the session");
+        assert!(page.is_empty());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn history_slim_pages_walk_a_sent_at_tie_once_each(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = throwaway_session(&pool).await;
+        // Microsecond-aligned: PG truncates to micros, so a finer timestamp
+        // would make the tie itself flaky.
+        let tie = "2026-01-01T00:00:00.123456Z";
+        let lo = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let mid = Uuid::parse_str("00000000-0000-4000-8000-000000000002").unwrap();
+        let hi = Uuid::parse_str("00000000-0000-4000-8000-000000000003").unwrap();
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (id, session_id, role, content, sent_at) VALUES \
+             (gen_random_uuid(), $1, 'user', 'older', $2::timestamptz - interval '1 second'), \
+             ($3, $1, 'assistant', 'tie_lo', $2::timestamptz), \
+             ($4, $1, 'assistant', 'tie_mid', $2::timestamptz), \
+             ($5, $1, 'assistant', 'tie_hi', $2::timestamptz), \
+             (gen_random_uuid(), $1, 'user', 'newer', $2::timestamptz + interval '1 second')",
+        )
+        .bind(s.id)
+        .bind(tie)
+        .bind(lo)
+        .bind(mid)
+        .bind(hi)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let contents = |page: &[ChatMessageSlim]| {
+            page.iter()
+                .map(|m| m.content.clone())
+                .collect::<Vec<String>>()
+        };
+
+        // The offset page and the cursor order a tie the same way, so a page
+        // boundary inside the tie neither skips nor repeats a row.
+        let first = repo.history_slim(s.id, 2, 0).await.unwrap();
+        assert_eq!(contents(&first), vec!["tie_hi", "newer"]);
+        let second = repo
+            .history_slim_before(s.id, first[0].id, 2)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(contents(&second), vec!["tie_lo", "tie_mid"]);
+        let third = repo
+            .history_slim_before(s.id, second[0].id, 2)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(contents(&third), vec!["older"]);
+
+        // Back down from the oldest row, the same tie order.
+        let down = repo
+            .history_slim_after(s.id, third[0].id, 2)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(contents(&down), vec!["tie_lo", "tie_mid"]);
+        let down = repo
+            .history_slim_after(s.id, down[1].id, 2)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(contents(&down), vec!["tie_hi", "newer"]);
+
+        // A window centred inside the tie.
+        let around = repo
+            .history_slim_around(s.id, mid, 3)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(contents(&around), vec!["tie_lo", "tie_mid", "tie_hi"]);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn history_slim_after_pages_strictly_newer_than_the_anchor(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = throwaway_session(&pool).await;
+        let ids = seed_spaced_rows(&pool, s.id, 5).await;
+
+        // The oldest `limit` rows newer than the anchor, oldest-first.
+        let page = repo
+            .history_slim_after(s.id, ids[1], 2)
+            .await
+            .unwrap()
+            .expect("anchor is in the session");
+        assert_eq!(
+            page.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+            vec!["m2", "m3"]
+        );
+
+        // Nothing newer than the newest row.
+        let page = repo
+            .history_slim_after(s.id, ids[4], 2)
+            .await
+            .unwrap()
+            .expect("anchor is in the session");
+        assert!(page.is_empty());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn history_slim_around_centres_on_the_anchor(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = throwaway_session(&pool).await;
+        let ids = seed_spaced_rows(&pool, s.id, 7).await;
+        let around = |anchor: Uuid, limit: i64| {
+            let repo = &repo;
+            async move {
+                repo.history_slim_around(s.id, anchor, limit)
+                    .await
+                    .unwrap()
+                    .expect("anchor is in the session")
+                    .into_iter()
+                    .map(|m| m.content)
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        // (limit - 1) / 2 older rows, the anchor, the rest newer.
+        assert_eq!(around(ids[3], 5).await, vec!["m1", "m2", "m3", "m4", "m5"]);
+        assert_eq!(around(ids[3], 4).await, vec!["m2", "m3", "m4", "m5"]);
+        assert_eq!(around(ids[3], 1).await, vec!["m3"]);
+        // A short side is not made up from the other one.
+        assert_eq!(around(ids[0], 5).await, vec!["m0", "m1", "m2"]);
+        assert_eq!(around(ids[6], 5).await, vec!["m4", "m5", "m6"]);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn history_slim_cursors_on_a_foreign_anchor_are_none(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = throwaway_session(&pool).await;
+        repo.append_message(s.id, "user", "hello").await.unwrap();
+        let other = throwaway_session(&pool).await;
+        let foreign = repo
+            .append_message(other.id, "user", "elsewhere")
+            .await
+            .unwrap();
+
+        for anchor in [foreign, Uuid::new_v4()] {
+            assert!(repo
+                .history_slim_before(s.id, anchor, 50)
+                .await
+                .unwrap()
+                .is_none());
+            assert!(repo
+                .history_slim_after(s.id, anchor, 50)
+                .await
+                .unwrap()
+                .is_none());
+            assert!(repo
+                .history_slim_around(s.id, anchor, 50)
+                .await
+                .unwrap()
+                .is_none());
+        }
     }
 
     #[sqlx::test(migrations = "./migrations")]

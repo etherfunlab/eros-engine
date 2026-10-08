@@ -18,12 +18,21 @@ use eros_engine_store::chat::ChatRepo;
 use crate::auth::middleware::AuthUser;
 use crate::error::AppError;
 use crate::routes::companion::resolve_or_create_session;
-use crate::routes::companion::{
-    is_false, require_session_for_user, HistoryQuery, StartChatRequest,
-};
+use crate::routes::companion::{is_false, require_session_for_user, StartChatRequest};
 use crate::state::AppState;
 
 // ─── DTOs ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct BffHistoryQuery {
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+    /// Keyset cursors, at most one per request: page older than, newer than,
+    /// or centred on this row of the session instead of by offset.
+    pub before: Option<Uuid>,
+    pub after: Option<Uuid>,
+    pub around: Option<Uuid>,
+}
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct BffHistoryEntry {
@@ -167,6 +176,12 @@ pub struct BffStartResponse {
 /// divergence:** default `limit=50` (canonical defaults to 20). Reason:
 /// BFF exists for cold-mount where the FE wants a full backscroll in one
 /// round-trip.
+///
+/// `before` / `after` / `around` page by keyset instead, on `(sent_at, id)`:
+/// a client scrolling never has to know how many rows sit above its oldest
+/// one, and `around` jumps straight to a message however deep it is. An
+/// anchor outside the session is a 404 rather than an empty page, which a
+/// client would read as the end of history.
 #[utoipa::path(
     get,
     path = "/bff/v1/comp/chat/{session_id}/history",
@@ -174,13 +189,17 @@ pub struct BffStartResponse {
     params(
         ("session_id" = Uuid, Path, description = "Chat session id"),
         ("limit" = Option<i64>, Query, description = "Max rows (default 50, capped at 50)"),
-        ("offset" = Option<i64>, Query, description = "Page offset, default 0")
+        ("offset" = Option<i64>, Query, description = "Page offset, default 0; unused with a cursor"),
+        ("before" = Option<Uuid>, Query, description = "Return rows strictly older than this message of the session"),
+        ("after" = Option<Uuid>, Query, description = "Return rows strictly newer than this message of the session"),
+        ("around" = Option<Uuid>, Query, description = "Return this message of the session with up to (limit - 1) / 2 older rows and the rest newer")
     ),
     responses(
         (status = 200, body = BffHistoryResponse),
+        (status = 400, description = "more than one of `before` / `after` / `around`"),
         (status = 401, description = "missing or invalid bearer"),
         (status = 403, description = "not your session"),
-        (status = 404, description = "session not found")
+        (status = 404, description = "session not found, or the cursor is not a message of this session")
     ),
     security(("bearer" = []))
 )]
@@ -188,15 +207,25 @@ async fn bff_get_history(
     State(state): State<AppState>,
     Path(session_id): Path<Uuid>,
     Extension(AuthUser(user_id)): Extension<AuthUser>,
-    Query(query): Query<HistoryQuery>,
+    Query(query): Query<BffHistoryQuery>,
 ) -> Result<Json<BffHistoryResponse>, AppError> {
     require_session_for_user(&state, session_id, user_id).await?;
     let limit = query.limit.unwrap_or(50).clamp(1, 50);
     let offset = query.offset.unwrap_or(0).max(0);
 
-    let rows = ChatRepo { pool: &state.pool }
-        .history_slim(session_id, limit, offset)
-        .await?;
+    let repo = ChatRepo { pool: &state.pool };
+    let page = match (query.before, query.after, query.around) {
+        (None, None, None) => Some(repo.history_slim(session_id, limit, offset).await?),
+        (Some(id), None, None) => repo.history_slim_before(session_id, id, limit).await?,
+        (None, Some(id), None) => repo.history_slim_after(session_id, id, limit).await?,
+        (None, None, Some(id)) => repo.history_slim_around(session_id, id, limit).await?,
+        _ => {
+            return Err(AppError::BadRequest(
+                "at most one of before / after / around".into(),
+            ))
+        }
+    };
+    let rows = page.ok_or_else(|| AppError::NotFound("no such message".into()))?;
 
     let messages: Vec<BffHistoryEntry> =
         rows.into_iter()
@@ -493,6 +522,168 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["messages"].as_array().unwrap().len(), 50);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_history_pages_before_an_anchor(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+             VALUES ($1, 'user', 'm0', now() - interval '3 seconds'), \
+                    ($1, 'assistant', 'm1', now() - interval '2 seconds'), \
+                    ($1, 'user', 'm2', now() - interval '1 second'), \
+                    ($1, 'assistant', 'm3', now()) \
+             RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        let mut app = build_router(test_state(pool));
+        let token = mint_test_jwt(user_id);
+        let contents = |body: &serde_json::Value| {
+            body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["content"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        let (status, body) = send_request(
+            &mut app,
+            bff_history_request(&token, session_id, &format!("?before={}&limit=2", ids[3])),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "got body: {body}");
+        assert_eq!(contents(&body), vec!["m1", "m2"]);
+        assert_eq!(body["total"], 2);
+
+        // `offset` does not shift a cursor page.
+        let (status, body) = send_request(
+            &mut app,
+            bff_history_request(
+                &token,
+                session_id,
+                &format!("?before={}&limit=2&offset=1", ids[3]),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "got body: {body}");
+        assert_eq!(contents(&body), vec!["m1", "m2"]);
+
+        // Before the oldest row: an empty page is the start of history.
+        let (status, body) = send_request(
+            &mut app,
+            bff_history_request(&token, session_id, &format!("?before={}", ids[0])),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "got body: {body}");
+        assert!(contents(&body).is_empty());
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_history_404_on_an_anchor_outside_the_session(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        // The same user's other session: ownership of the route's session does
+        // not make another session's row a valid anchor.
+        let other_session = seed_session(&pool, user_id, instance_id).await;
+        let foreign: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content) \
+             VALUES ($1, 'user', 'elsewhere') RETURNING id",
+        )
+        .bind(other_session)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let mut app = build_router(test_state(pool));
+        let token = mint_test_jwt(user_id);
+        for cursor in ["before", "after", "around"] {
+            for anchor in [foreign, Uuid::new_v4()] {
+                let (status, body) = send_request(
+                    &mut app,
+                    bff_history_request(&token, session_id, &format!("?{cursor}={anchor}")),
+                )
+                .await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{cursor}: got body: {body}");
+            }
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_history_pages_after_and_around_an_anchor(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+             VALUES ($1, 'user', 'm0', now() - interval '3 seconds'), \
+                    ($1, 'assistant', 'm1', now() - interval '2 seconds'), \
+                    ($1, 'user', 'm2', now() - interval '1 second'), \
+                    ($1, 'assistant', 'm3', now()) \
+             RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        let mut app = build_router(test_state(pool));
+        let token = mint_test_jwt(user_id);
+        for (query, expected) in [
+            (format!("?after={}&limit=2", ids[0]), vec!["m1", "m2"]),
+            // After the newest row: an empty page means caught up.
+            (format!("?after={}", ids[3]), vec![]),
+            (
+                format!("?around={}&limit=3", ids[2]),
+                vec!["m1", "m2", "m3"],
+            ),
+        ] {
+            let (status, body) =
+                send_request(&mut app, bff_history_request(&token, session_id, &query)).await;
+            assert_eq!(status, StatusCode::OK, "{query}: got body: {body}");
+            let contents: Vec<&str> = body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["content"].as_str().unwrap())
+                .collect();
+            assert_eq!(contents, expected, "{query}");
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_history_rejects_more_than_one_cursor(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content) \
+             VALUES ($1, 'user', 'm0') RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let mut app = build_router(test_state(pool));
+        let token = mint_test_jwt(user_id);
+        let (status, body) = send_request(
+            &mut app,
+            bff_history_request(&token, session_id, &format!("?before={id}&around={id}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "got body: {body}");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

@@ -266,6 +266,7 @@
           "bff-companion"
         ],
         "summary": "Slim chat history for the chat-screen mount. Same auth, same ownership\ncheck, same `limit ∈ [1, 50]` clamp as `/comp/.../history`. **Intentional\ndivergence:** default `limit=50` (canonical defaults to 20). Reason:\nBFF exists for cold-mount where the FE wants a full backscroll in one\nround-trip.",
+        "description": "`before` / `after` / `around` page by keyset instead, on `(sent_at, id)`:\na client scrolling never has to know how many rows sit above its oldest\none, and `around` jumps straight to a message however deep it is. An\nanchor outside the session is a 404 rather than an empty page, which a\nclient would read as the end of history.",
         "operationId": "bff_get_history",
         "parameters": [
           {
@@ -291,11 +292,41 @@
           {
             "name": "offset",
             "in": "query",
-            "description": "Page offset, default 0",
+            "description": "Page offset, default 0; unused with a cursor",
             "required": false,
             "schema": {
               "type": "integer",
               "format": "int64"
+            }
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "description": "Return rows strictly older than this message of the session",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "description": "Return rows strictly newer than this message of the session",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "around",
+            "in": "query",
+            "description": "Return this message of the session with up to (limit - 1) / 2 older rows and the rest newer",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
             }
           }
         ],
@@ -310,6 +341,9 @@
               }
             }
           },
+          "400": {
+            "description": "more than one of `before` / `after` / `around`"
+          },
           "401": {
             "description": "missing or invalid bearer"
           },
@@ -317,7 +351,7 @@
             "description": "not your session"
           },
           "404": {
-            "description": "session not found"
+            "description": "session not found, or the cursor is not a message of this session"
           }
         },
         "security": [
