@@ -283,6 +283,11 @@ pub struct StreamSendRequest {
     /// combined with `tips_amount_usd`.
     #[serde(default)]
     pub action: Option<UserActionDto>,
+    /// Bring-your-own-key configuration for this turn's reply (spec
+    /// 2026-10-08-byok-chat). Honoured only with the deployment's
+    /// `X-Byok-Caller-Secret` header; refused on the async route.
+    #[serde(default)]
+    pub byok: Option<crate::byok::ByokRequest>,
 }
 
 /// Pre-stream error body per spec §1.3. Schema-only struct for utoipa;
@@ -683,7 +688,11 @@ pub(crate) fn persisted_content_role(req: &StreamSendRequest) -> (String, &'stat
     post,
     path = "/comp/chat/{session_id}/message/stream",
     tag = "companion",
-    params(("session_id" = Uuid, Path, description = "Chat session id")),
+    params(
+        ("session_id" = Uuid, Path, description = "Chat session id"),
+        ("X-Byok-Caller-Secret" = Option<String>, Header,
+            description = "The deployment's BYOK_CALLER_SECRET; required when the body carries `byok`"),
+    ),
     request_body = StreamSendRequest,
     responses(
         (status = 200, description = "SSE event stream (text/event-stream). The `meta` frame's \
@@ -708,6 +717,7 @@ pub async fn send_message_stream(
     State(state): State<AppState>,
     Path(session_id): Path<Uuid>,
     Extension(AuthUser(user_id)): Extension<AuthUser>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<StreamSendRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
     // Validate payload first — before any DB call — so 422/400 never waste a roundtrip.
@@ -732,6 +742,15 @@ pub async fn send_message_stream(
             original_user_message_id: None,
         })
     })?;
+
+    // BYOK admission (403) and validation (400) run before any row is
+    // written (spec 2026-10-08 §4.2, §5).
+    let byok = match req.byok.as_ref() {
+        None => None,
+        Some(b) => Some(Arc::new(crate::byok::admit_and_prepare(
+            &state, &headers, b, user_id,
+        )?)),
+    };
 
     let (_session, persona, instance_id) = resolve_text_turn(&state, session_id, user_id).await?;
     let chat_repo = ChatRepo { pool: &state.pool };
@@ -776,6 +795,9 @@ pub async fn send_message_stream(
         user_country: crate::holiday::bounded_raw(req.user_country.as_deref()),
         user_region: crate::holiday::bounded_raw(req.user_region.as_deref()),
         action: req.action.clone(),
+        byok: req.byok.as_ref().map(|b| crate::byok::QueuedByok {
+            fallback_to_platform: b.fallback_to_platform,
+        }),
     })
     .expect("QueuedTurnParams serializes");
     let queue_repo = ChatQueueRepo { pool: &state.pool };
@@ -862,7 +884,7 @@ pub async fn send_message_stream(
                             user_msg,
                             Some(persona),
                             Some(tx),
-                            None,
+                            byok,
                         ),
                     )
                     .await
@@ -1010,6 +1032,7 @@ mod tests {
             user_country: None,
             user_region: None,
             action: None,
+            byok: None,
         }
     }
 
@@ -1030,6 +1053,7 @@ mod tests {
             user_country: None,
             user_region: None,
             action: None,
+            byok: None,
         }
     }
 
@@ -2215,6 +2239,263 @@ data: [DONE]\n\n";
             "metadata must be NULL when no fields present"
         );
     }
+
+    const BYOK_SECRET: &str = "byok-caller-secret-for-tests-0123456789";
+
+    fn byok_state(pool: PgPool, mock_uri: &str) -> AppState {
+        let mut state = crate::routes::companion::test_state(pool);
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{mock_uri}/api/v1/chat/completions"),
+            ),
+        );
+        state.config.byok = crate::state::ByokConfig {
+            caller_secret: Some(BYOK_SECRET.into()),
+            allow_private_network: true,
+        };
+        state.byok = crate::byok::ByokRuntime::new(true);
+        state
+    }
+
+    fn byok_block(mock_uri: &str) -> serde_json::Value {
+        json!({
+            "providers": {"mine": {
+                "chat": format!("{mock_uri}/byok/v1/chat/completions"),
+                "api_key": "sk-end-user-SECRET",
+                "headers": {"x-org": "acme-header-secret"},
+            }},
+            "model": "gpt-x@mine",
+        })
+    }
+
+    async fn byok_session(pool: &PgPool, user_id: Uuid) -> Uuid {
+        let instance_id = seed_persona_instance(pool, user_id).await;
+        ChatRepo { pool }
+            .create_session(user_id, instance_id)
+            .await
+            .unwrap()
+            .id
+    }
+
+    fn byok_send(
+        uri: String,
+        token: &str,
+        body: serde_json::Value,
+        secret: Option<&str>,
+    ) -> Request<Body> {
+        let mut b = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(s) = secret {
+            b = b.header("X-Byok-Caller-Secret", s);
+        }
+        b.body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    }
+
+    async fn byok_message_count(pool: &PgPool, session_id: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM engine.chat_messages WHERE session_id = $1")
+            .bind(session_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn byok_stream_turn_posts_to_the_end_users_endpoint_and_keeps_no_credential(
+        pool: PgPool,
+    ) {
+        use wiremock::matchers::{header as wm_header, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi there\"}}],\"id\":\"gen-route-byok\",\"model\":\"gpt-x\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/byok/v1/chat/completions"))
+            .and(wm_header("authorization", "Bearer sk-end-user-SECRET"))
+            .and(wm_header("x-org", "acme-header-secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let session_id = byok_session(&pool, user_id).await;
+        let mut app = build_router(byok_state(pool.clone(), &mock.uri()));
+        let resp = app
+            .call(byok_send(
+                format!("/comp/chat/{session_id}/message/stream"),
+                &mint_jwt(user_id),
+                json!({"content": "hi", "client_msg_id": "01J5555555555555555555555A", "byok": byok_block(&mock.uri())}),
+                Some(BYOK_SECRET),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        assert!(std::str::from_utf8(&body).unwrap().contains("hi there"));
+
+        let (queue_id, marker): (Uuid, serde_json::Value) = sqlx::query_as(
+            "SELECT q.id, q.params->'byok' FROM engine.chat_turn_queue q WHERE q.session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            wait_for_status(&pool, queue_id, &["done", "failed"]).await,
+            "done"
+        );
+        assert_eq!(marker, json!({"fallback_to_platform": false}));
+        let model: String = sqlx::query_scalar(
+            "SELECT model FROM engine.llm_generations WHERE generation_id = 'gen-route-byok'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(model, "gpt-x@byok");
+
+        let at_rest: String = sqlx::query_scalar(
+            "SELECT coalesce(string_agg(t, ' '), '') FROM ( \
+               SELECT row_to_json(m)::text AS t FROM engine.chat_messages m WHERE m.session_id = $1 \
+               UNION ALL SELECT row_to_json(q)::text FROM engine.chat_turn_queue q WHERE q.session_id = $1 \
+               UNION ALL SELECT row_to_json(g)::text FROM engine.llm_generations g WHERE g.session_id = $1 \
+             ) s",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        for needle in [
+            "sk-end-user-SECRET",
+            "acme-header-secret",
+            "/byok/v1/chat/completions",
+            mock.uri().as_str(),
+        ] {
+            assert!(
+                !at_rest.contains(needle),
+                "`{needle}` found at rest: {at_rest}"
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_turn_without_byok_leaves_no_marker(pool: PgPool) {
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"plain\"}}],\"id\":\"gen-plain\",\"model\":\"primary\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .mount(&mock)
+            .await;
+        let user_id = Uuid::new_v4();
+        let session_id = byok_session(&pool, user_id).await;
+        let mut app = build_router(byok_state(pool.clone(), &mock.uri()));
+        let resp = app
+            .call(byok_send(
+                format!("/comp/chat/{session_id}/message/stream"),
+                &mint_jwt(user_id),
+                json!({"content": "hi", "client_msg_id": "01J5555555555555555555555B"}),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let has_key: bool = sqlx::query_scalar(
+            "SELECT q.params ? 'byok' FROM engine.chat_turn_queue q WHERE q.session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!has_key, "a non-BYOK turn's params carry no byok key");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn byok_without_the_caller_secret_is_403_and_writes_nothing(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = byok_session(&pool, user_id).await;
+        let uri = format!("/comp/chat/{session_id}/message/stream");
+        let body = json!({"content": "hi", "client_msg_id": "01J5555555555555555555555C", "byok": byok_block("https://api.example.com")});
+
+        // BYOK on, header missing.
+        let mut app = build_router(byok_state(pool.clone(), "http://127.0.0.1:1"));
+        let resp = app
+            .call(byok_send(
+                uri.clone(),
+                &mint_jwt(user_id),
+                body.clone(),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let err: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 64 * 1024).await.unwrap()).unwrap();
+        assert_eq!(err["code"], "byok_forbidden");
+
+        // BYOK off on this deployment, header present.
+        let mut app = build_router(crate::routes::companion::test_state(pool.clone()));
+        let resp = app
+            .call(byok_send(uri, &mint_jwt(user_id), body, Some(BYOK_SECRET)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        assert_eq!(byok_message_count(&pool, session_id).await, 0);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn invalid_byok_is_400_before_any_row(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = byok_session(&pool, user_id).await;
+        let mut byok = byok_block("https://api.example.com");
+        byok["model"] = json!("gpt-x");
+        let mut app = build_router(byok_state(pool.clone(), "http://127.0.0.1:1"));
+        let resp = app
+            .call(byok_send(
+                format!("/comp/chat/{session_id}/message/stream"),
+                &mint_jwt(user_id),
+                json!({"content": "hi", "client_msg_id": "01J5555555555555555555555D", "byok": byok}),
+                Some(BYOK_SECRET),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let err: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 64 * 1024).await.unwrap()).unwrap();
+        assert_eq!(err["code"], "invalid_payload");
+        assert!(!err.to_string().contains("sk-end-user-SECRET"));
+        assert_eq!(byok_message_count(&pool, session_id).await, 0);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_async_route_refuses_byok(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = byok_session(&pool, user_id).await;
+        let mut app = build_router(byok_state(pool.clone(), "http://127.0.0.1:1"));
+        let resp = app
+            .call(byok_send(
+                format!("/v2/comp/session/{session_id}/message/async"),
+                &mint_jwt(user_id),
+                json!({"content": "hi", "client_msg_id": "01J5555555555555555555555E", "byok": byok_block("https://api.example.com")}),
+                Some(BYOK_SECRET),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(byok_message_count(&pool, session_id).await, 0);
+    }
 }
 
 #[cfg(test)]
@@ -2239,6 +2520,7 @@ mod validate_payload_tests {
             user_country: None,
             user_region: None,
             action: None,
+            byok: None,
         }
     }
 
@@ -2346,6 +2628,7 @@ mod validate_payload_tests {
             user_country: None,
             user_region: None,
             action: None,
+            byok: None,
         }
     }
 

@@ -27,6 +27,9 @@ use crate::state::AppState;
 pub(crate) enum TurnOutcome {
     Success,
     Failure(String),
+    /// The turn can never be served, so no retry is attempted: terminal in
+    /// any settle mode (spec 2026-10-08 §9.2).
+    Unservable(String),
 }
 
 /// Completion rule. `run_stream` persists each logical message BEFORE its
@@ -165,6 +168,10 @@ pub(crate) async fn settle_turn(
     let repo = ChatQueueRepo { pool: &state.pool };
     let res = match outcome {
         TurnOutcome::Success => repo.mark_done(turn.queue_id).await,
+        TurnOutcome::Unservable(msg) => {
+            repo.mark_failed_with_notice(turn.queue_id, &msg, FAILURE_NOTICE)
+                .await
+        }
         TurnOutcome::Failure(msg) => {
             let terminal =
                 mode == SettleMode::TerminalOnFailure || turn.attempts >= cfg.max_attempts;
@@ -294,6 +301,11 @@ async fn drive_turn(
         }),
         None => QueuedTurnParams::default(),
     };
+    // A BYOK turn's configuration lived only in the memory of the drive
+    // that died (spec 2026-10-08 §9.2).
+    if params.byok.is_some_and(|b| !b.fallback_to_platform) {
+        return TurnOutcome::Unservable("byok_unavailable".into());
+    }
     // Re-run the pure validators the endpoint already ran; they cannot fail
     // here on rows the endpoint accepted, and a defensive failure just means
     // empty traits / no audit.
@@ -1196,5 +1208,131 @@ data: [DONE]\n\n";
         .await
         .unwrap();
         assert_eq!(notices, 0);
+    }
+
+    async fn enqueue_with_params(
+        pool: &PgPool,
+        params: serde_json::Value,
+        client_msg_id: &str,
+    ) -> (Uuid, Uuid) {
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(pool, user_id).await;
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let EnqueueOutcome::Queued {
+            queue_id,
+            user_message_id,
+        } = (ChatQueueRepo { pool })
+            .enqueue_user_message(
+                session_id,
+                "hi",
+                client_msg_id,
+                "user",
+                None,
+                user_id,
+                &params,
+                20,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected Queued");
+        };
+        (queue_id, user_message_id)
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_recovered_byok_turn_without_platform_fallback_is_unservable(pool: PgPool) {
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock)
+            .await;
+        let (queue_id, user_message_id) = enqueue_with_params(
+            &pool,
+            serde_json::json!({"byok": {"fallback_to_platform": false}}),
+            "01JW000000000000000000009A",
+        )
+        .await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+        assert_eq!(drain_once(&state, &sem).await.unwrap(), 1);
+
+        assert_eq!(
+            wait_for_status(&pool, queue_id, &["done", "failed"]).await,
+            "failed"
+        );
+        let last_error: Option<String> =
+            sqlx::query_scalar("SELECT last_error FROM engine.chat_turn_queue WHERE id = $1")
+                .bind(queue_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(last_error.as_deref(), Some("byok_unavailable"));
+        let notices: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_messages m \
+             JOIN engine.chat_messages u ON u.session_id = m.session_id \
+             WHERE u.id = $1 AND m.role = 'system_error'",
+        )
+        .bind(user_message_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(notices, 1, "terminal at once, with the usual notice");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_recovered_byok_turn_with_platform_fallback_is_served_by_the_platform(pool: PgPool) {
+        let mock = MockServer::start().await;
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"platform reply\"}}],\"id\":\"gen-rec\",\"model\":\"primary\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+        let (queue_id, user_message_id) = enqueue_with_params(
+            &pool,
+            serde_json::json!({"byok": {"fallback_to_platform": true}}),
+            "01JW000000000000000000009B",
+        )
+        .await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+        assert_eq!(drain_once(&state, &sem).await.unwrap(), 1);
+
+        assert_eq!(
+            wait_for_status(&pool, queue_id, &["done", "failed"]).await,
+            "done"
+        );
+        let served: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_messages WHERE user_message_id = $1 AND role = 'assistant'",
+        )
+        .bind(user_message_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(served > 0, "the platform chain served the turn");
     }
 }
