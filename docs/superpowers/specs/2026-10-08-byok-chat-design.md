@@ -109,7 +109,7 @@ a key, a header value or a URL.
 
 | Item | Rule |
 |---|---|
-| `providers` | 1–4 entries; names match `^[a-z0-9_]{1,32}$` |
+| `providers` | 1–4 entries; names match `^[a-z0-9_]{1,32}$`; `openrouter` is refused (an `@openrouter` suffix routes to the built-in endpoint) |
 | `chat` | ≤ 2048 bytes; parses as a URL with a host; no userinfo; scheme `https` (`http` also allowed under `BYOK_ALLOW_PRIVATE_NETWORK`); a literal-IP host must pass the address guard (§7.2) |
 | `api_key` | 1–1024 bytes; a valid header value |
 | `headers` | ≤ 8 entries; valid header names and values, each value ≤ 1024 bytes; `Authorization` and `Content-Type` refused, case-insensitive (the `[providers]` header validator, reused) |
