@@ -2296,6 +2296,20 @@ data: [DONE]\n\n";
             .unwrap()
     }
 
+    async fn byok_at_rest_text(pool: &PgPool, session_id: Uuid) -> String {
+        sqlx::query_scalar(
+            "SELECT coalesce(string_agg(t, ' '), '') FROM ( \
+               SELECT row_to_json(m)::text AS t FROM engine.chat_messages m WHERE m.session_id = $1 \
+               UNION ALL SELECT row_to_json(q)::text FROM engine.chat_turn_queue q WHERE q.session_id = $1 \
+               UNION ALL SELECT row_to_json(g)::text FROM engine.llm_generations g WHERE g.session_id = $1 \
+             ) s",
+        )
+        .bind(session_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
     async fn byok_message_count(pool: &PgPool, session_id: Uuid) -> i64 {
         sqlx::query_scalar("SELECT count(*) FROM engine.chat_messages WHERE session_id = $1")
             .bind(session_id)
@@ -2362,21 +2376,81 @@ data: [DONE]\n\n";
         .unwrap();
         assert_eq!(model, "gpt-x@byok");
 
-        let at_rest: String = sqlx::query_scalar(
-            "SELECT coalesce(string_agg(t, ' '), '') FROM ( \
-               SELECT row_to_json(m)::text AS t FROM engine.chat_messages m WHERE m.session_id = $1 \
-               UNION ALL SELECT row_to_json(q)::text FROM engine.chat_turn_queue q WHERE q.session_id = $1 \
-               UNION ALL SELECT row_to_json(g)::text FROM engine.llm_generations g WHERE g.session_id = $1 \
-             ) s",
-        )
-        .bind(session_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let at_rest = byok_at_rest_text(&pool, session_id).await;
         for needle in [
             "sk-end-user-SECRET",
             "acme-header-secret",
             "/byok/v1/chat/completions",
+            mock.uri().as_str(),
+        ] {
+            assert!(
+                !at_rest.contains(needle),
+                "`{needle}` found at rest: {at_rest}"
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_failing_byok_turn_keeps_no_credential_at_rest(pool: PgPool) {
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/byok/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "error": {"message": "Incorrect API key provided: sk-end-user-SECRET"}
+            })))
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let session_id = byok_session(&pool, user_id).await;
+        let mut byok = byok_block(&mock.uri());
+        byok["providers"]["dead"] = json!({
+            "chat": "http://127.0.0.1:1/v1/chat/completions?key=URL-QUERY-SECRET",
+            "api_key": "sk-dead-SECRET",
+        });
+        byok["fallback"] = json!(["gpt-y@dead"]);
+        let mut app = build_router(byok_state(pool.clone(), &mock.uri()));
+        let resp = app
+            .call(byok_send(
+                format!("/comp/chat/{session_id}/message/stream"),
+                &mint_jwt(user_id),
+                json!({"content": "hi", "client_msg_id": "01J5555555555555555555555F", "byok": byok}),
+                Some(BYOK_SECRET),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let sse = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        assert!(
+            std::str::from_utf8(&sse)
+                .unwrap()
+                .contains("\"type\":\"error\""),
+            "the turn ends in an Error frame"
+        );
+
+        let queue_id: Uuid =
+            sqlx::query_scalar("SELECT q.id FROM engine.chat_turn_queue q WHERE q.session_id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        wait_for_status(&pool, queue_id, &["done", "failed"]).await;
+
+        let at_rest = byok_at_rest_text(&pool, session_id).await;
+        for needle in [
+            "sk-end-user-SECRET",
+            "sk-dead-SECRET",
+            "acme-header-secret",
+            "URL-QUERY-SECRET",
+            "/byok/v1/chat/completions",
+            "127.0.0.1:1",
             mock.uri().as_str(),
         ] {
             assert!(
