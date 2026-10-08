@@ -2539,7 +2539,7 @@
       },
       "ByokRegexRule": {
         "type": "object",
-        "description": "One `output_regex` rule; `models` absent ⇒ every model on the BYOK chain.",
+        "description": "One `output_regex` rule. A rule never lengthens a reply.",
         "required": [
           "pattern"
         ],
@@ -2551,16 +2551,19 @@
             ],
             "items": {
               "type": "string"
-            }
+            },
+            "description": "Bare model ids the rule applies to (`gpt-x`, not `gpt-x@mine`).\nAbsent ⇒ every model on the BYOK chain."
           },
           "pattern": {
-            "type": "string"
+            "type": "string",
+            "description": "Regex matched against the reply."
           },
           "replacement": {
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "Literal text put in place of each match; default empty. Contains no\n`$` and is no longer in bytes than the shortest text `pattern` can\nmatch."
           }
         },
         "additionalProperties": false

@@ -61,6 +61,7 @@ const MAX_KEY_LEN: usize = 1024;
 const MAX_HEADERS: usize = 8;
 const MAX_HEADER_VALUE_LEN: usize = 1024;
 const MAX_MODELS: usize = 8;
+const MAX_SLUG_LEN: usize = 256;
 const MAX_REGEX_RULES: usize = 16;
 const MAX_PATTERN_CHARS: usize = 512;
 const MAX_REPLACEMENT_CHARS: usize = 512;
@@ -134,13 +135,19 @@ pub enum ByokFallback {
     Many(Vec<String>),
 }
 
-/// One `output_regex` rule; `models` absent ⇒ every model on the BYOK chain.
+/// One `output_regex` rule. A rule never lengthens a reply.
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ByokRegexRule {
+    /// Regex matched against the reply.
     pub pattern: String,
+    /// Literal text put in place of each match; default empty. Contains no
+    /// `$` and is no longer in bytes than the shortest text `pattern` can
+    /// match.
     #[serde(default)]
     pub replacement: Option<String>,
+    /// Bare model ids the rule applies to (`gpt-x`, not `gpt-x@mine`).
+    /// Absent ⇒ every model on the BYOK chain.
     #[serde(default)]
     pub models: Option<Vec<String>>,
 }
@@ -474,6 +481,11 @@ fn check_slug(
     slug: &str,
     providers: &BTreeMap<String, ByokProvider>,
 ) -> Result<(), String> {
+    if slug.len() > MAX_SLUG_LEN {
+        return Err(format!(
+            "{field}: every model is at most {MAX_SLUG_LEN} bytes"
+        ));
+    }
     match split_model_slug(slug) {
         Ok((id, Some(p))) if !id.is_empty() && providers.contains_key(p) => Ok(()),
         _ => Err(format!(
@@ -501,20 +513,33 @@ fn compile_rules(
                     "{at}.pattern: 1..={MAX_PATTERN_CHARS} chars required"
                 ));
             }
-            if r.replacement
-                .as_ref()
-                .is_some_and(|s| s.chars().count() > MAX_REPLACEMENT_CHARS)
-            {
+            let replacement = r.replacement.clone().unwrap_or_default();
+            if replacement.chars().count() > MAX_REPLACEMENT_CHARS {
                 return Err(format!(
                     "{at}.replacement: at most {MAX_REPLACEMENT_CHARS} chars"
                 ));
             }
+            if let Some(models) = &r.models {
+                if models.len() > MAX_MODELS || models.iter().any(|m| m.len() > MAX_SLUG_LEN) {
+                    return Err(format!(
+                        "{at}.models: at most {MAX_MODELS} entries of at most {MAX_SLUG_LEN} bytes"
+                    ));
+                }
+            }
             let regex = eros_engine_llm::byok::compile_pattern(&r.pattern)
                 .map_err(|e| format!("{at}.pattern: {e}"))?;
+            // Rules run in sequence on each other's output, so a rule that
+            // could lengthen a reply would compound (spec §4.2).
+            if !eros_engine_llm::byok::replacement_is_non_growing(&r.pattern, &replacement) {
+                return Err(format!(
+                    "{at}.replacement: must contain no `$` and be no longer in bytes \
+                     than the shortest text the pattern can match"
+                ));
+            }
             Ok(CompiledRegexRule {
                 models: r.models.clone().unwrap_or_else(|| chain_ids.to_vec()),
                 regex,
-                replacement: r.replacement.clone().unwrap_or_default(),
+                replacement,
             })
         })
         .collect()
@@ -810,6 +835,54 @@ mod tests {
         .unwrap();
         assert_eq!(turn.rules()[0].models, vec!["gpt-x".to_string()]);
         assert_eq!(turn.rules()[1].models, vec!["other".to_string()]);
+    }
+
+    #[test]
+    fn regex_rules_cannot_lengthen_a_reply() {
+        let rule = |pattern: &str, replacement: &str| {
+            set(
+                base(),
+                &["output_regex"],
+                json!([{"pattern": pattern, "replacement": replacement}]),
+            )
+        };
+        rejects(rule("(?:)", "x"), "byok.output_regex[0].replacement");
+        rejects(rule("abcdef", "$0"), "byok.output_regex[0].replacement");
+        rejects(rule("(abcdef)", "$1"), "byok.output_regex[0].replacement");
+        rejects(rule("x", "yy"), "byok.output_regex[0].replacement");
+        assert!(try_prepare(rule("ab", "x")).is_ok());
+        assert!(try_prepare(rule("(?:)", "")).is_ok());
+        let err = try_prepare(rule("x", "ECHOED-REPLACEMENT")).expect_err("grows");
+        assert!(!err.contains("ECHOED-REPLACEMENT"), "{err}");
+    }
+
+    #[test]
+    fn regex_rule_models_are_bounded() {
+        let models = |m: serde_json::Value| {
+            set(
+                base(),
+                &["output_regex"],
+                json!([{"pattern": "x", "models": m}]),
+            )
+        };
+        let nine: Vec<String> = (0..9).map(|i| format!("m{i}")).collect();
+        rejects(models(json!(nine)), "byok.output_regex[0].models");
+        rejects(
+            models(json!(["m".repeat(257)])),
+            "byok.output_regex[0].models",
+        );
+        assert!(try_prepare(models(json!(["m".repeat(256)]))).is_ok());
+    }
+
+    #[test]
+    fn slugs_are_at_most_256_bytes() {
+        let slug = |len: usize| format!("{}@mine", "a".repeat(len - "@mine".len()));
+        assert!(try_prepare(set(base(), &["model"], json!(slug(256)))).is_ok());
+        rejects(set(base(), &["model"], json!(slug(257))), "byok.model");
+        rejects(
+            set(base(), &["fallback"], json!([slug(257)])),
+            "byok.fallback",
+        );
     }
 
     #[test]
