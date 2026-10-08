@@ -2834,6 +2834,13 @@ impl ModelConfig {
                         .to_string(),
                 );
             }
+            if name == crate::byok::AUDIT_LABEL {
+                return Err(
+                    "[providers]: `byok` is reserved — it labels bring-your-own-key \
+                     hops in audit records. Pick another name."
+                        .to_string(),
+                );
+            }
             if name.is_empty()
                 || !name
                     .chars()
@@ -7577,6 +7584,14 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         let msg = cfg.validate_providers_with(no_env).unwrap_err();
         assert!(msg.contains("reserved"));
         assert!(msg.contains("VOYAGE_API_KEY"));
+    }
+
+    #[test]
+    fn provider_name_byok_is_reserved() {
+        let cfg = ModelConfig::from_toml_str("[providers]\nbyok = { chat = \"https://x/v1\" }\n")
+            .unwrap();
+        let msg = cfg.validate_providers_with(no_env).unwrap_err();
+        assert!(msg.contains("`byok` is reserved"), "{msg}");
     }
 
     #[test]

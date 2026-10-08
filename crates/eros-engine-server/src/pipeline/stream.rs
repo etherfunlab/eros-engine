@@ -4192,6 +4192,9 @@ impl PersistedUserMessage {
 /// generator owns its `AppState` clone so it stays `'static` and survives
 /// `Sse`'s body lifetime. Task 10 implements the Ghost branch; T11/T12
 /// fill in Reply.
+///
+/// Test shorthand for `run_stream_with(.., None)`.
+#[cfg(test)]
 pub fn run_stream(
     state: Arc<AppState>,
     user_msg: PersistedUserMessage,
@@ -5728,6 +5731,14 @@ pub fn replay_stream(
                     // retries are wire-identical regardless of any
                     // display_override config.
                     model: row.model.as_deref().and_then(|m| {
+                        // A BYOK-served row always shows its real id (spec
+                        // 2026-10-08 §6.4), as the live stream did.
+                        if matches!(
+                            eros_engine_llm::provider::split_model_slug(m),
+                            Ok((_, Some(eros_engine_llm::byok::AUDIT_LABEL)))
+                        ) {
+                            return Some(eros_engine_llm::provider::bare_model_id(m));
+                        }
                         display_override
                             .as_ref()
                             .and_then(|d| d.display(&eros_engine_llm::provider::bare_model_id(m)))
@@ -10482,6 +10493,59 @@ data: [DONE]\n\n";
         .collect()
         .await;
         assert_eq!(meta_model(&f3), Some("Nova".to_string()));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn replay_shows_the_real_id_for_a_byok_served_row(pool: PgPool) {
+        use futures_util::StreamExt;
+
+        let user_id = Uuid::new_v4();
+        let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let row = eros_engine_store::chat::ReplayMessage {
+            model: Some("gpt-x@byok".into()),
+            usage: None,
+            msg: eros_engine_store::chat::ChatMessage {
+                id: Uuid::new_v4(),
+                session_id,
+                role: "assistant".into(),
+                content: "hello".into(),
+                sent_at: chrono::Utc::now(),
+                client_msg_id: None,
+                ghost_decision: false,
+                user_message_id: None,
+                continues_from_message_id: None,
+                truncated: false,
+                generation_id: Some("gen-byok-replay".into()),
+                assistant_action_type: Some("reply".into()),
+                channel: None,
+                pre_filter_content: None,
+                metadata: None,
+                read_at: None,
+                reaction: None,
+                reacted_at: None,
+            },
+        };
+        let mut s = crate::routes::companion::test_state(pool.clone());
+        s.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"deepseek/x\"\nmodel_name_display_override = \"Aria\"\n",
+            )
+            .unwrap(),
+        );
+        let frames: Vec<ProtocolFrame> = replay_stream(
+            std::sync::Arc::new(s),
+            session_id,
+            user_id,
+            false,
+            vec![row],
+        )
+        .collect()
+        .await;
+        let model = frames.iter().find_map(|f| match f {
+            ProtocolFrame::Meta { model, .. } => Some(model.clone()),
+            _ => None,
+        });
+        assert_eq!(model, Some(Some("gpt-x".to_string())));
     }
 
     #[test]
