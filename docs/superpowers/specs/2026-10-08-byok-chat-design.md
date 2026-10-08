@@ -186,12 +186,20 @@ counts hops consumed across the whole list.
 
 ### 6.3 Exhaustion
 
-- `fallback_to_platform = false`: when every BYOK hop fails, the turn ends as
-  an exhausted chain does today. The `Error` frame carries the last hop's
-  `upstream_status` and `provider_code`, `gateway_errors` gets
-  `chain_exhausted`, and the stream turn goes terminal. The downstream can
-  tell the end user that their key or endpoint failed.
-- `fallback_to_platform = true`: the walk continues into the platform hops.
+- `fallback_to_platform = false`: when every BYOK hop fails, the turn ends in
+  an `Error` frame carrying the last hop's `upstream_status` and
+  `provider_code`, and the stream turn goes terminal. The downstream can tell
+  the end user that their key or endpoint failed.
+- `fallback_to_platform = true`: the walk continues into the platform hops,
+  and an exhausted platform half ends as any platform chain does.
+
+An exhausted platform chain serves a pseudo-ghost — a fallback phrase from
+`engine.error_handling_config` that reads as an ordinary short reply — when
+one is configured, and emits the `Error` frame only when none is. A BYOK-only
+chain skips the pseudo-ghost: the phrase would hide from the end user that
+their key or endpoint failed. A complete byte-BPE garble met on the chain is
+still served repaired, as on any chain; that text came from the end user's
+model.
 
 ### 6.4 Per-hop behaviour
 
@@ -256,8 +264,7 @@ The guard refuses:
 
 reqwest does not consult the resolver for a literal-IP host, so §4.2 applies
 the same guard to literal IPs at validation. A host refused at connect time
-fails that hop as a `transport` gateway error whose message says the
-destination is not allowed, and the chain advances.
+fails that hop as a `transport` gateway error, and the chain advances.
 
 `BYOK_ALLOW_PRIVATE_NETWORK` (truthy) disables the guard and allows `http`,
 for self-hosted deployments pointing BYOK at a model on their own network.
@@ -266,16 +273,21 @@ for self-hosted deployments pointing BYOK at a model on their own network.
 
 ### 8.1 What is recorded
 
-- `chat_messages.model`: `<upstream echo>@byok`. The provider name the end
-  user chose is not recorded; it means nothing outside one request.
-- `generation_id`: the provider's own id, as for custom providers.
-  `engine.llm_generations` gets the row with `model` ending `@byok`; `usage`
-  carries no `cost` unless the provider sent one.
-- `llm_attempts[].model` and `gateway_errors[].model`: `<id>@byok`.
-- The prompt log (`PROMPT_LOG_DIR`) prints the chain as `<id>@byok`.
-- Assistant row metadata: `"byok": true` when the request carried `byok`,
-  whichever hop served. `model` says who served; `byok` says the request
-  asked for BYOK.
+Every model string recorded for a BYOK hop is `<id>@byok`. The provider
+name the end user chose is not recorded; it means nothing outside one
+request.
+
+- `engine.llm_generations.model` — written by `record_generation` with the
+  hop's slug — reads `<id>@byok`; `generation_id` is the provider's own id,
+  and `usage` carries no `cost` unless the provider sent one.
+- `llm_attempts[].model` and `gateway_errors[].model` read `<id>@byok`.
+- The prompt log (`PROMPT_LOG_DIR`) prints the chain the turn walks, BYOK
+  hops as `<id>@byok`.
+
+That a turn asked for BYOK is recorded once, on its queue row:
+`chat_turn_queue.params->'byok'` (§9.1), reached from the reply through
+`user_message_id`. Which hop served is the generation's `model`. Nothing on
+`chat_messages` repeats either fact.
 
 ### 8.2 What is never recorded
 
@@ -283,8 +295,9 @@ URLs, keys and header values, anywhere: table rows, `chat_turn_queue.params`
 and `last_error`, tracing, the prompt log, panic messages. Three spots need
 code:
 
-- `ProviderEndpoint`'s `Debug` prints `base_url`. A BYOK endpoint prints
-  `<byok>` in its place; some providers take the key in the query string.
+- `ProviderEndpoint`'s `Debug` prints `base_url`. It now prints
+  `<redacted>` for every endpoint, configured or BYOK; some providers take
+  the key in the query string.
 - `reqwest::Error`'s `Display` includes the URL. Every `reqwest::Error` from a
   BYOK hop is passed through `without_url()` before it becomes an `LlmError`,
   so the `gateway_errors` message, the warn line and `last_error` cannot
@@ -307,8 +320,9 @@ pub byok: Option<QueuedByok>,   // QueuedByok { fallback_to_platform: bool }
 
 It records that the turn asked for BYOK and nothing about the endpoints, the
 models or the key. The BYOK configuration itself is threaded from the
-handler into the drive task in memory: `drive_turn` gains a
-`byok: Option<Arc<ByokTurn>>` argument, `None` on the worker path.
+handler into the drive task in memory: `drive_to_exhaustion` gains a
+`byok: Option<Arc<ByokTurn>>` argument. The stream handler passes the
+turn's; the worker's `drive_turn` passes `None`.
 
 ### 9.2 A BYOK turn reaching the worker
 
@@ -316,14 +330,13 @@ The worker drives a stream turn only through crash recovery, after the reaper
 releases a claim older than `GEN_TIMEOUT + CLAIM_STALE`. The configuration
 died with the process. When `params.byok` is present:
 
-- `fallback_to_platform = false`: no generation. The turn settles as
-  `TurnOutcome::Failure("byok_unavailable")` under
-  `SettleMode::TerminalOnFailure`: the queue row goes `failed` with
+- `fallback_to_platform = false`: no generation. `drive_turn` returns a new
+  `TurnOutcome::Unservable("byok_unavailable")`, which `settle_turn` makes
+  terminal in any mode: the queue row goes `failed` with
   `last_error = 'byok_unavailable'` and the usual `system_error` row is
   written. A retry could not succeed, so the ladder is skipped.
 - `fallback_to_platform = true`: the turn is driven on the platform chain,
-  the outcome the request asked for when BYOK cannot serve. The reply row
-  carries `"byok": true`.
+  the outcome the request asked for when BYOK cannot serve.
 
 ### 9.3 The async route
 
@@ -336,16 +349,16 @@ worker, which never holds the configuration.
 
 | change | file |
 |---|---|
-| address guard, guarded resolver, `byok_http` builder | `crates/eros-engine-llm/src/byok.rs` (new) |
-| BYOK client constructor; `@byok` audit label; URL stripping; key scrubbing in attempt messages | `crates/eros-engine-llm/src/openrouter.rs` |
-| `Debug` redaction of a BYOK endpoint's URL | `crates/eros-engine-llm/src/provider.rs` |
-| regex compile with size limits, shared with config rules; `ModelSpec` from the DTO with an external cursor | `crates/eros-engine-llm/src/model_config.rs` |
-| `ByokDto` and friends, validation, admission, hand-written `Debug` | `crates/eros-engine-server/src/routes/byok.rs` (new) |
+| address guard, guarded resolver, guarded client builder, `@byok` audit slug, size-limited regex compile | `crates/eros-engine-llm/src/byok.rs` (new) |
+| BYOK client constructor; `@byok` echo label; URL stripping; key scrubbing in error text | `crates/eros-engine-llm/src/openrouter.rs` |
+| `Debug` redaction of every endpoint's URL | `crates/eros-engine-llm/src/provider.rs` |
+| `ModelSpec::select` made public; header-pair check shared by `[providers]` and BYOK | `crates/eros-engine-llm/src/model_config.rs` |
+| request DTOs, admission, validation, `ByokTurn`, the hop list, the per-user cursors, `QueuedByok` | `crates/eros-engine-server/src/byok.rs` (new) |
 | field on `StreamSendRequest`; admission and validation wiring; threading into the drive task | `crates/eros-engine-server/src/routes/companion_stream.rs` |
 | `QueuedTurnParams.byok`; 400 on the async route | `crates/eros-engine-server/src/routes/companion_async.rs` |
-| hop list, per-hop client / rules / display | `crates/eros-engine-server/src/pipeline/stream.rs`, `pipeline/handlers.rs` |
-| `drive_turn` argument; recovery behaviour | `crates/eros-engine-server/src/pipeline/chat_queue.rs` |
-| `BYOK_CALLER_SECRET`, `BYOK_ALLOW_PRIVATE_NETWORK`, `byok_http`, `byok_rr` | `crates/eros-engine-server/src/state.rs`, `main.rs` |
+| per-hop client / rules / display; BYOK-only exhaustion skips the pseudo-ghost | `crates/eros-engine-server/src/pipeline/stream.rs` |
+| `drive_to_exhaustion` argument; `TurnOutcome::Unservable`; recovery behaviour | `crates/eros-engine-server/src/pipeline/chat_queue.rs` |
+| `BYOK_CALLER_SECRET`, `BYOK_ALLOW_PRIVATE_NETWORK`; `AppState.byok` | `crates/eros-engine-server/src/state.rs`, `main.rs` |
 | `@byok` chain labels | `crates/eros-engine-server/src/prompt_log.rs` |
 | OpenAPI | `crates/eros-engine-server/openapi.json` (regenerated) |
 | docs | `docs/byok.md` / `.zh.md` (new); `docs/api-reference.md` / `.zh.md`; `docs/model-config.md` / `.zh.md`; `docs/llm-audit.md`; `.env.example`; README feature lists and `examples/*.toml` checked |
@@ -387,10 +400,12 @@ the queue before rolling back avoids that.
 - **routes** (`#[sqlx::test]` + wiremock, `BYOK_ALLOW_PRIVATE_NETWORK` on
   except where noted):
   - a BYOK turn: the BYOK mock sees `Authorization: Bearer <end-user key>`
-    and the declared headers; the OpenRouter mock sees nothing; the row's
-    `model` ends `@byok`; metadata has `"byok": true`; a BYOK regex rule
-    strips; with a display override configured, `meta.model` is the bare id;
-  - BYOK chain fails, no fallback: `Error` frame with the mock's status;
+    and the declared headers; the OpenRouter mock sees nothing; the
+    generation's `model` is `<id>@byok`; the queue row's `params.byok` is
+    `{"fallback_to_platform": false}`; a BYOK regex rule strips; with a
+    display override configured, `meta.model` is the bare id;
+  - BYOK chain fails, no fallback: `Error` frame with the mock's status, and
+    no pseudo-ghost although the test database seeds fallback phrases;
     terminal failure;
   - BYOK chain fails, `fallback_to_platform`: the OpenRouter mock serves; the
     configured display override and config rules apply on that hop;
@@ -441,6 +456,10 @@ the queue before rolling back avoids that.
 - **BYOK hops skip the display override** and always show the real id; the
   override is the deployment's presentation of its own models.
 - **One `@byok` audit label** regardless of the provider name.
+- **"This turn asked for BYOK" lives only on the queue row**, which every
+  stream turn already has, over a second copy in the reply row's metadata.
+- **A BYOK-only chain never serves the fallback phrase**: the end user must
+  be able to tell that their own key or endpoint failed.
 - **An in-process round-robin cursor per user**, matching config round-robin,
   over a per-session count: the session's message count moves by two per
   turn, so it cannot drive a two-model rotation.
