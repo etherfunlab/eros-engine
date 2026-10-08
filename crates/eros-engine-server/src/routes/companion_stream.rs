@@ -2368,13 +2368,19 @@ data: [DONE]\n\n";
             "done"
         );
         assert_eq!(marker, json!({"fallback_to_platform": false}));
-        let model: String = sqlx::query_scalar(
-            "SELECT model FROM engine.llm_generations WHERE generation_id = 'gen-route-byok'",
+        let (generation_id, model): (String, String) = sqlx::query_as(
+            "SELECT generation_id, model FROM engine.llm_generations \
+             WHERE session_id = $1 AND model = 'gpt-x@byok'",
         )
+        .bind(session_id)
         .fetch_one(&pool)
         .await
         .unwrap();
         assert_eq!(model, "gpt-x@byok");
+        assert!(
+            generation_id.starts_with("byok-"),
+            "the engine mints a BYOK hop's id, never the provider: {generation_id}"
+        );
 
         let at_rest = byok_at_rest_text(&pool, session_id).await;
         for needle in [
@@ -2451,6 +2457,80 @@ data: [DONE]\n\n";
             "URL-QUERY-SECRET",
             "/byok/v1/chat/completions",
             "127.0.0.1:1",
+            mock.uri().as_str(),
+        ] {
+            assert!(
+                !at_rest.contains(needle),
+                "`{needle}` found at rest: {at_rest}"
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_byok_failure_recorded_on_a_platform_reply_keeps_no_credential(pool: PgPool) {
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/byok/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "error": {"message": "key sk-end-user-SECRET is not valid for org acme-header-secret"}
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"from platform\"}}],\"id\":\"gen-route-platform\",\"model\":\"primary\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let session_id = byok_session(&pool, user_id).await;
+        let mut byok = byok_block(&mock.uri());
+        byok["fallback_to_platform"] = json!(true);
+        let mut app = build_router(byok_state(pool.clone(), &mock.uri()));
+        let resp = app
+            .call(byok_send(
+                format!("/comp/chat/{session_id}/message/stream"),
+                &mint_jwt(user_id),
+                json!({"content": "hi", "client_msg_id": "01J5555555555555555555555G", "byok": byok}),
+                Some(BYOK_SECRET),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        assert!(std::str::from_utf8(&body)
+            .unwrap()
+            .contains("from platform"));
+
+        let queue_id: Uuid =
+            sqlx::query_scalar("SELECT q.id FROM engine.chat_turn_queue q WHERE q.session_id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            wait_for_status(&pool, queue_id, &["done", "failed"]).await,
+            "done"
+        );
+        let attempts: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT llm_attempts FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant' AND NOT truncated",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(attempts.is_some(), "the BYOK hop's 401 is recorded");
+
+        let at_rest = byok_at_rest_text(&pool, session_id).await;
+        for needle in [
+            "sk-end-user-SECRET",
+            "acme-header-secret",
+            "/byok/v1/chat/completions",
             mock.uri().as_str(),
         ] {
             assert!(

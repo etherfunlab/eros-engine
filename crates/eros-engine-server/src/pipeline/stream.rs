@@ -20700,13 +20700,19 @@ data: [DONE]\n\n"
             })
             .collect();
         assert_eq!(wire, "hello", "the BYOK regex rule strips on the wire");
-        let model: String = sqlx::query_scalar(
-            "SELECT model FROM engine.llm_generations WHERE generation_id = 'gen-byok'",
+        let (generation_id, model): (String, String) = sqlx::query_as(
+            "SELECT generation_id, model FROM engine.llm_generations \
+             WHERE session_id = $1 AND model = 'gpt-x@byok'",
         )
+        .bind(session_id)
         .fetch_one(&pool)
         .await
         .unwrap();
         assert_eq!(model, "gpt-x@byok");
+        assert!(
+            generation_id.starts_with("byok-"),
+            "the engine mints a BYOK hop's id, never the provider: {generation_id}"
+        );
         let content: String = sqlx::query_scalar(
             "SELECT content FROM engine.chat_messages \
              WHERE user_message_id = $1 AND role = 'assistant' AND NOT truncated",

@@ -445,9 +445,6 @@ impl<'a> WireRequest<'a> {
     }
 }
 
-/// True when `rule` applies to a call serving `task` (spec
-/// 2026-08-02-provider-body-params): no `tasks` list ⇒ applies always;
-/// a task-scoped rule requires an exact, case-sensitive name match.
 /// BYOK hops drop the URL from transport errors: an end user's endpoint may
 /// carry its key in the query string (spec 2026-10-08 §8.2).
 fn strip_url(e: reqwest::Error, byok: bool) -> reqwest::Error {
@@ -458,14 +455,9 @@ fn strip_url(e: reqwest::Error, byok: bool) -> reqwest::Error {
     }
 }
 
-/// Replace every verbatim occurrence of a BYOK hop's key in provider text.
-fn scrub_key(text: &str, key: Option<&str>) -> String {
-    match key {
-        Some(k) if !k.is_empty() => text.replace(k, "<redacted>"),
-        _ => text.to_string(),
-    }
-}
-
+/// True when `rule` applies to a call serving `task` (spec
+/// 2026-08-02-provider-body-params): no `tasks` list ⇒ applies always;
+/// a task-scoped rule requires an exact, case-sensitive name match.
 fn rule_matches(rule: &crate::model_config::BodyRule, task: Option<&str>) -> bool {
     match (&rule.tasks, task) {
         (None, _) => true,
@@ -623,10 +615,11 @@ pub struct OpenRouterClient {
     /// instead carry their own declared headers per-request (spec §3). Same
     /// connect/pool bounds as `http`.
     plain_http: reqwest::Client,
-    /// A per-turn BYOK client (spec 2026-10-08-byok-chat §7.1, §8): the echo
-    /// is labelled `byok`, transport errors lose their URL, and the
-    /// endpoint's key is scrubbed from provider error text. Only
-    /// `execute_stream_as` serves BYOK hops.
+    /// A per-turn BYOK client (spec 2026-10-08-byok-chat §7.1, §7.3, §8): the
+    /// echo is labelled `byok`, the generation id is minted by the engine,
+    /// transport errors lose their URL, the endpoint's credentials are
+    /// scrubbed from provider error text, and the bytes read are bounded.
+    /// Only `execute_stream_as` serves BYOK hops.
     byok: bool,
 }
 
@@ -1261,8 +1254,10 @@ impl OpenRouterClient {
             ep.name.map(str::to_string)
         };
         let byok = self.byok;
-        // The key to scrub from provider error text on a BYOK hop (§8.2).
-        let key_to_scrub: Option<String> = byok.then(|| ep.api_key.to_string());
+        // The credentials to scrub from provider error text on a BYOK hop
+        // (§8.2).
+        let redactor: Option<Arc<crate::byok::Redactor>> =
+            byok.then(|| Arc::new(crate::byok::Redactor::new(ep.api_key, ep.headers, ep.url)));
         let wire = WireRequest {
             model: &bare_model,
             messages: &req.messages,
@@ -1321,23 +1316,29 @@ impl OpenRouterClient {
         let status = resp.status();
         if !status.is_success() {
             let retry_after = retry_after_secs(resp.headers());
-            let text = scrub_key(
-                &resp.text().await.unwrap_or_default(),
-                key_to_scrub.as_deref(),
-            );
-            return Err(LlmError::Status(
-                status,
-                parse_error_body(&text),
-                retry_after,
-            ));
+            let body = match &redactor {
+                // An end user's endpoint is untrusted: read a bounded prefix
+                // (§7.3) and scrub it before and after parsing (§8.2).
+                Some(r) => r.apply_body(parse_error_body(
+                    &r.apply(&crate::byok::read_capped(resp, crate::byok::ERROR_BODY_MAX).await),
+                )),
+                None => parse_error_body(&resp.text().await.unwrap_or_default()),
+            };
+            return Err(LlmError::Status(status, body, retry_after));
         }
 
         // Observability: connect+headers latency and the negotiated HTTP
         // version (should read HTTP/2.0 post-Batch-A3). Prompt content is never
-        // logged — only the model id and timing.
+        // logged — only the model id and timing. A BYOK hop is named by its
+        // `<id>@byok` label, never the end user's slug (§8.2).
+        let log_model: std::borrow::Cow<'_, str> = if byok {
+            crate::byok::audit_slug(model).into()
+        } else {
+            model.into()
+        };
         tracing::debug!(
             target: "openrouter_stream",
-            model = %model,
+            model = %log_model,
             headers_ms = started.elapsed().as_millis() as u64,
             http_version = ?resp.version(),
             "stream opened"
@@ -1348,11 +1349,19 @@ impl OpenRouterClient {
         // first id-bearing body chunk still yields an audit handle. Prepended
         // as a synthetic first chunk; the pipeline's "latest non-None wins"
         // accumulation adopts it, and a later body `id` (identical) overwrites.
-        let header_gen_id = resp
-            .headers()
-            .get("x-generation-id")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
+        //
+        // A BYOK hop's id is minted here instead, once per call, and its body
+        // frames carry none (§8.1): the id is the primary key of
+        // `engine.llm_generations`, and a provider-chosen one could collide
+        // with another session's row.
+        let header_gen_id = if byok {
+            Some(format!("byok-{:032x}", rand::random::<u128>()))
+        } else {
+            resp.headers()
+                .get("x-generation-id")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
         let head = futures_util::stream::iter(header_gen_id.map(|id| {
             Ok(DeltaChunk {
                 generation_id: Some(id),
@@ -1360,17 +1369,23 @@ impl OpenRouterClient {
             })
         }));
 
-        let stream = idle_bounded(
+        let bytes = idle_bounded(
             futures_util::TryStreamExt::map_err(resp.bytes_stream(), move |e| strip_url(e, byok)),
             STREAM_IDLE_TIMEOUT,
-        )
-        .eventsource()
-        .filter_map(move |ev| {
+        );
+        // A BYOK body is bounded in bytes as well as time (§7.3).
+        let bytes = if byok {
+            crate::byok::byte_capped(bytes, crate::byok::stream_byte_limit(req.max_tokens))
+                .left_stream()
+        } else {
+            bytes.right_stream()
+        };
+        let stream = bytes.eventsource().filter_map(move |ev| {
             // Per-invocation clone: `filter_map`'s closure is `FnMut`,
             // called once per frame, and each call's `async move` block
             // needs its own owned copy of `ep_name`.
             let ep_name = ep_name.clone();
-            let key_to_scrub = key_to_scrub.clone();
+            let redactor = redactor.clone();
             async move {
                 match ev {
                     Ok(e) => {
@@ -1391,11 +1406,17 @@ impl OpenRouterClient {
                                     // Keep the code structured — this used to
                                     // be format!("code={:?}") into a String,
                                     // which destroyed it.
-                                    let message = scrub_key(&err.message, key_to_scrub.as_deref());
-                                    return Some(Err(LlmError::Provider(mid_stream_error_body(
-                                        err.code.as_ref(),
-                                        &message,
-                                    ))));
+                                    // A BYOK hop scrubs the raw message before
+                                    // the preview cuts it, then every field.
+                                    return Some(Err(LlmError::Provider(match &redactor {
+                                        Some(r) => r.apply_body(mid_stream_error_body(
+                                            err.code.as_ref(),
+                                            &r.apply(&err.message),
+                                        )),
+                                        None => {
+                                            mid_stream_error_body(err.code.as_ref(), &err.message)
+                                        }
+                                    })));
                                 }
                                 let choice = frame.choices.into_iter().next().unwrap_or_default();
                                 if choice.finish_reason.as_deref() == Some("error") {
@@ -1409,7 +1430,8 @@ impl OpenRouterClient {
                                     content: choice.delta.content.filter(|s| !s.is_empty()),
                                     finish_reason: choice.finish_reason,
                                     usage: frame.usage,
-                                    generation_id: frame.id,
+                                    // A BYOK hop keeps the id minted above.
+                                    generation_id: if byok { None } else { frame.id },
                                     // §6 parity with the sync path (see
                                     // model_out above `execute`'s
                                     // ChatResponse): a direct-endpoint echo
@@ -1426,9 +1448,12 @@ impl OpenRouterClient {
                                     }),
                                 }))
                             }
-                            Err(_) => Some(Err(LlmError::StreamParse(
-                                e.data.chars().take(256).collect(),
-                            ))),
+                            // A BYOK hop scrubs the frame before the cut, so
+                            // no prefix of a credential survives it.
+                            Err(_) => Some(Err(LlmError::StreamParse(match &redactor {
+                                Some(r) => r.apply(&e.data).chars().take(256).collect(),
+                                None => e.data.chars().take(256).collect(),
+                            }))),
                         }
                     }
                     Err(e) => Some(Err(LlmError::Stream(e.to_string()))),
@@ -5248,5 +5273,279 @@ data: [DONE]\n\n";
             matches!(&err, LlmError::Status(s, _, _) if s.as_u16() == 302),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn byok_client_reads_at_most_64_kib_of_an_error_body() {
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A whole envelope parses into `code=401: …`; one cut at 64 KiB does
+        // not, so the parsed body shows how much was read.
+        let mock = MockServer::start().await;
+        let body = format!(
+            r#"{{"error":{{"code":401,"message":"{}"}}}}"#,
+            "a".repeat(200 * 1024)
+        );
+        Mock::given(path("/byok/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(401).set_body_string(body))
+            .mount(&mock)
+            .await;
+
+        let err = byok_client(&mock.uri(), "sk-end-user")
+            .execute_stream_as(&byok_req(), "gpt-x@mine")
+            .await
+            .expect_err("401");
+        let LlmError::Status(status, parsed, _) = &err else {
+            panic!("expected Status, got {err}")
+        };
+        assert_eq!(status.as_u16(), 401);
+        assert_eq!(
+            parsed.code, None,
+            "a body cut at 64 KiB no longer parses: {}",
+            parsed.message
+        );
+        assert!(
+            parsed.message.starts_with(r#"{"error":"#),
+            "{}",
+            parsed.message
+        );
+
+        // A platform client still reads the whole body.
+        let platform = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            format!("{}/byok/v1/chat/completions", mock.uri()),
+        );
+        let err = platform
+            .execute_stream_as(&byok_req(), "gpt-x")
+            .await
+            .expect_err("401");
+        let LlmError::Status(_, parsed, _) = &err else {
+            panic!("expected Status, got {err}")
+        };
+        assert_eq!(parsed.code.as_deref(), Some("401"));
+    }
+
+    #[tokio::test]
+    async fn byok_stream_fails_once_the_body_exceeds_its_byte_bound() {
+        use futures_util::StreamExt;
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // ~2 MiB of frames; `byok_req` asks for 16 tokens, so the bound is
+        // the 1 MiB floor.
+        let frames = 2048;
+        let frame = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"}}}}]}}\n\n",
+            "x".repeat(1000)
+        );
+        let sse = frame.repeat(frames) + "data: [DONE]\n\n";
+        let total_content = 1000 * frames;
+        let mock = MockServer::start().await;
+        Mock::given(path("/byok/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .mount(&mock)
+            .await;
+
+        let items: Vec<_> = byok_client(&mock.uri(), "sk-end-user")
+            .execute_stream_as(&byok_req(), "gpt-x@mine")
+            .await
+            .expect("opens")
+            .0
+            .collect()
+            .await;
+        let first_err = items
+            .iter()
+            .position(Result::is_err)
+            .expect("the stream fails past its bound");
+        let err = items[first_err].as_ref().unwrap_err();
+        assert!(
+            matches!(err, LlmError::Stream(m) if m.contains("byok: response exceeded 1048576 bytes")),
+            "{err}"
+        );
+        assert!(!err.to_string().contains(&mock.uri()), "{err}");
+        assert!(
+            items[first_err..]
+                .iter()
+                .all(|c| c.as_ref().map_or(true, |c| c.content.is_none())),
+            "nothing is served after the bound trips"
+        );
+        let served: usize = items
+            .iter()
+            .filter_map(|c| c.as_ref().ok()?.content.as_ref().map(String::len))
+            .sum();
+        assert!(served <= 1 << 20 && served < total_content, "{served}");
+
+        // A platform client reads the same body whole.
+        let platform = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            format!("{}/byok/v1/chat/completions", mock.uri()),
+        );
+        let items: Vec<_> = platform
+            .execute_stream_as(&byok_req(), "gpt-x")
+            .await
+            .expect("opens")
+            .0
+            .collect()
+            .await;
+        assert!(items.iter().all(Result::is_ok));
+        let served: usize = items
+            .iter()
+            .filter_map(|c| c.as_ref().ok()?.content.as_ref().map(String::len))
+            .sum();
+        assert_eq!(served, total_content);
+    }
+
+    #[tokio::test]
+    async fn byok_stream_mints_its_own_generation_id() {
+        use futures_util::StreamExt;
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"id\":\"chatcmpl-1\",\"model\":\"gpt-x\"}\n\n\
+                   data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"id\":\"chatcmpl-1\"}\n\n\
+                   data: [DONE]\n\n";
+        let mock = MockServer::start().await;
+        Mock::given(path("/byok/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-generation-id", "chatcmpl-1")
+                    .set_body_raw(sse, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let client = byok_client(&mock.uri(), "sk-end-user");
+        let mut minted = Vec::new();
+        for _ in 0..2 {
+            let ids: Vec<String> = client
+                .execute_stream_as(&byok_req(), "gpt-x@mine")
+                .await
+                .expect("opens")
+                .0
+                .filter_map(|c| async move { c.ok()?.generation_id })
+                .collect()
+                .await;
+            assert!(!ids.is_empty(), "a BYOK stream carries a generation id");
+            for id in &ids {
+                let hex = id.strip_prefix("byok-").unwrap_or_else(|| panic!("{id}"));
+                assert!(
+                    hex.len() == 32
+                        && hex
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                    "{id}"
+                );
+            }
+            assert!(ids.iter().all(|id| *id == ids[0]), "{ids:?}");
+            minted.push(ids[0].clone());
+        }
+        assert_ne!(minted[0], minted[1], "each call mints its own id");
+    }
+
+    #[tokio::test]
+    async fn byok_client_scrubs_every_credential_from_provider_errors() {
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_partial_json, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const KEY: &str = "sk/abc-123";
+        const HEADER: &str = "hdr-SECRET-value";
+        const QUERY: &str = "QUERY-SECRET-1";
+        let mock = MockServer::start().await;
+        let url = format!("{}/byok/v1/chat/completions?key={QUERY}", mock.uri());
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-org", reqwest::header::HeaderValue::from_static(HEADER));
+        let mut providers = HashMap::new();
+        providers.insert(
+            "mine".to_string(),
+            crate::provider::ProviderEndpoint {
+                base_url: url.clone(),
+                api_key: KEY.to_string(),
+                headers,
+                body_rules: Vec::new(),
+            },
+        );
+        let client = OpenRouterClient::byok(crate::byok::build_http(true), providers);
+
+        let status_bodies = [
+            (
+                "hdr",
+                format!(r#"{{"error":{{"message":"org {HEADER} is suspended"}}}}"#),
+            ),
+            (
+                "url",
+                format!(r#"{{"error":{{"message":"no route {url}"}}}}"#),
+            ),
+            ("query", format!("invalid key={QUERY}")),
+            // JSON-escaped: only the parsed message holds the key verbatim.
+            (
+                "escaped",
+                r#"{"error":{"message":"Incorrect API key provided: sk\/abc-123"}}"#.to_string(),
+            ),
+        ];
+        for (model, body) in &status_bodies {
+            Mock::given(path("/byok/v1/chat/completions"))
+                .and(body_partial_json(serde_json::json!({ "model": model })))
+                .respond_with(ResponseTemplate::new(401).set_body_string(body.clone()))
+                .mount(&mock)
+                .await;
+        }
+        let mid = format!(
+            "data: {{\"error\":{{\"code\":500,\"message\":\"upstream rejected org {HEADER}\"}}}}\n\n"
+        );
+        Mock::given(path("/byok/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({"model": "mid"})))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(mid, "text/event-stream"))
+            .mount(&mock)
+            .await;
+        let malformed = format!("data: {{\"choices\": {KEY} {HEADER}\n\n");
+        Mock::given(path("/byok/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({"model": "parse"})))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(malformed, "text/event-stream"))
+            .mount(&mock)
+            .await;
+
+        let clean = |what: &str, text: &str| {
+            for needle in [KEY, HEADER, QUERY, mock.uri().as_str()] {
+                assert!(!text.contains(needle), "{what}: `{needle}` in {text}");
+            }
+            assert!(text.contains("<redacted>"), "{what}: {text}");
+        };
+
+        for (model, _) in &status_bodies {
+            let err = client
+                .execute_stream_as(&byok_req(), &format!("{model}@mine"))
+                .await
+                .expect_err("401");
+            let LlmError::Status(_, body, _) = &err else {
+                panic!("{model}: expected Status, got {err}")
+            };
+            clean(model, &body.message);
+        }
+
+        let chunks: Vec<_> = client
+            .execute_stream_as(&byok_req(), "mid@mine")
+            .await
+            .expect("opens")
+            .0
+            .collect()
+            .await;
+        match chunks.into_iter().find_map(Result::err) {
+            Some(LlmError::Provider(body)) => clean("mid", &body.message),
+            other => panic!("expected Provider, got {other:?}"),
+        }
+
+        let chunks: Vec<_> = client
+            .execute_stream_as(&byok_req(), "parse@mine")
+            .await
+            .expect("opens")
+            .0
+            .collect()
+            .await;
+        match chunks.into_iter().find_map(Result::err) {
+            Some(LlmError::StreamParse(raw)) => clean("parse", &raw),
+            other => panic!("expected StreamParse, got {other:?}"),
+        }
     }
 }
