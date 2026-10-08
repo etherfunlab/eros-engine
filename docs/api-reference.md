@@ -1572,6 +1572,12 @@ round-trip.
 `total` is the count of `messages` in **this** response (`== messages.len()`),
 not the grand total of rows in the session.
 
+To load older rows, page by keyset instead of offset: `before=<message id>`
+returns up to `limit` rows strictly older than that row by `(sent_at, id)`, in
+the same oldest-first order, and `offset` is not used. Pass the `id` of the
+oldest row the client holds; an empty `messages` means there is nothing older.
+An id that is not a message of this session answers `404`.
+
 ### `GET /bff/v1/comp/affinity/{session_id}/event`
 
 Latest user-turn affinity delta (the applied per-axis change) **plus the

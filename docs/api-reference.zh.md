@@ -1344,6 +1344,11 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
 `total` 是 **本次** 響應裡 `messages` 的條數（`== messages.len()`），
 不是該 session 的總行數。
 
+往上翻更早的消息时，改用键集游标而不是 offset：`before=<message id>` 返回按
+`(sent_at, id)` 严格早于该行的最多 `limit` 行，同样从旧到新排列，此时不使用
+`offset`。传客户端手上最早那一行的 `id`；`messages` 为空就是没有更早的消息。
+不属于本 session 的 id 返回 `404`。
+
 ### `GET /bff/v1/comp/affinity/{session_id}/event`
 
 最近一次用户轮次的好感度 delta（实际应用的每轴变化），**外加该轮结束时的绝对

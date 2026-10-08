@@ -266,6 +266,7 @@
           "bff-companion"
         ],
         "summary": "Slim chat history for the chat-screen mount. Same auth, same ownership\ncheck, same `limit ∈ [1, 50]` clamp as `/comp/.../history`. **Intentional\ndivergence:** default `limit=50` (canonical defaults to 20). Reason:\nBFF exists for cold-mount where the FE wants a full backscroll in one\nround-trip.",
+        "description": "`before` pages by keyset instead: the rows strictly older than that row by\n`(sent_at, id)`, so a client scrolling up never has to know how many rows\nsit above its oldest one. An anchor outside the session is a 404 rather\nthan an empty page, which a client would read as the start of history.",
         "operationId": "bff_get_history",
         "parameters": [
           {
@@ -291,11 +292,21 @@
           {
             "name": "offset",
             "in": "query",
-            "description": "Page offset, default 0",
+            "description": "Page offset, default 0; unused with `before`",
             "required": false,
             "schema": {
               "type": "integer",
               "format": "int64"
+            }
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "description": "Return rows strictly older than this message of the session",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
             }
           }
         ],
@@ -317,7 +328,7 @@
             "description": "not your session"
           },
           "404": {
-            "description": "session not found"
+            "description": "session not found, or `before` is not a message of this session"
           }
         },
         "security": [
