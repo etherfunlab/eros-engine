@@ -475,6 +475,12 @@ stream 客户端——事后可通过
 [`GET /comp/chat/{session_id}/messages/{message_id}/image-request`](#get-compchatsession_idmessagesmessage_idimage-request)
 取回同一份载荷；历史里的图片轮以 assistant 行上的 `metadata.image` 为识别标志。
 
+**可选：自带密钥。** 请求体可附加 `byok`——终端用户自己的兼容 OpenAI 的端点、模型选择、fallback 链、
+`retry_depth`、`output_regex` 和 `fallback_to_platform`——使本轮回复在终端用户自己的账户上运行。
+只有请求同时带有与部署的 `BYOK_CALLER_SECRET` 相符的 `X-Byok-Caller-Secret` 时，引擎才会采纳；
+否则返回 `403 byok_forbidden`。无效的块返回 `400 invalid_payload`。两者都在写入任何行之前拒绝。
+见 [byok.zh.md](byok.zh.md)。
+
 ### `POST /v2/comp/session/{session_id}/message/async`
 
 只入队的对话轮——上面流式端点的异步替代方案，给无法保持 SSE 连接的调用方用（bot
@@ -499,6 +505,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 | 重投一个已处理的 `client_msg_id` | `200 {"status":"already_completed",...}` |
 | 重投一个终态失败的 `client_msg_id` | `200 {"status":"failed",...}`——换个新 `client_msg_id` 重试 |
 | 单会话待处理深度超过 `CHAT_QUEUE_PENDING_CAP` | `429 rate_limited` |
+| 请求体带 `byok` | `400 invalid_payload`——BYOK 仅支持 stream |
 | 其余流前失败 | 与 `message/stream` 相同的 `StreamPreError` 形状与错误码 |
 
 队列顺序是严格的单会话 LIFO——会话里最新的待处理消息最先处理——每条入队消息

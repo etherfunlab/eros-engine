@@ -145,7 +145,7 @@ model = "bge-m3@local"               # 由 [providers].local.embeddings 提供�
 
 - **名称**匹配 `[a-z0-9_]+`。`voyage` 仍为保留字——它的原生 API 不是本
   机制所讲的 OpenRouter 兼容 embeddings 格式，且 `$VOYAGE_API_KEY` 已属于
-  内置的原生 Voyage 客户端。`openrouter` 是可以声明的合法名字：它不新增
+  内置的原生 Voyage 客户端。`byok` 同样是保留字，因为 `@byok` 在审计记录里标记自带密钥的 hop（见 [byok.zh.md](byok.zh.md)）。`openrouter` 是可以声明的合法名字：它不新增
   一个独立 provider，而是**按 key 覆盖内置的 OpenRouter 端点 URL**（见下）。
 - **URL** 完整、原样 POST——引擎不做任何路径拼接。被 chat 类任务引用的
   provider 必须声明 `chat`；被 `[tasks.embedding]` 引用的必须声明
@@ -301,6 +301,8 @@ params = { reasoning_effort = "none" }
 | map | `{ "deepseek/x" = "Aria", default = "Companion" }` | 将真实 id 映射为名称；未列出时使用 `default`；没有 `default` 时省略 |
 
 由于显示名称从不持久化，**数组**形式会在历史重放时重新随机；`bool`/`string`/`map` 形式是确定性的。
+
+在 BYOK hop 上（见 [byok.zh.md](byok.zh.md)）不读取该覆盖：`meta.model` 始终是该 hop 的真实模型 id，实时流与重放都一样。该覆盖只作用于部署自己的 hop，包括 BYOK 轮次回退到的那些 hop。
 
 ### `output_filter` — 二次回复改写（仅限 chat 任务）
 
@@ -484,6 +486,8 @@ fail-safe**：客户端**收不到任何内容气泡**（不发 delta），该�
 #### `filtered` 标志
 
 SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出时为 `true`——由 **regex 过滤**、LLM `output_filter` 或两者同时触发均会置为 `true`。
+
+BYOK hop 使用其请求中 `byok` 块的 `output_regex` 规则，而不是这里的规则（见 [byok.zh.md](byok.zh.md)）；这里的规则只作用于部署自己的 hop。
 
 ### `input_filter` — 用户输入改写（仅限 chat 任务）
 

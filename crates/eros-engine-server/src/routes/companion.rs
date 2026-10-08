@@ -1175,6 +1175,7 @@ pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
                 None, None, None, None, None, None, None,
             ),
             reaction_emoji: None,
+            byok: crate::state::ByokConfig::default(),
         },
         openrouter: Arc::new(eros_engine_llm::openrouter::OpenRouterClient::new(
             "stub".into(),
@@ -1192,6 +1193,7 @@ pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
         world_configured: false,
         stories_configured: false,
         chat_queue_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+        byok: crate::byok::ByokRuntime::new(false),
     }
 }
 

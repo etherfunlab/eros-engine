@@ -62,6 +62,10 @@ pub(crate) struct QueuedTurnParams {
     pub user_region: Option<String>,
     #[serde(default)]
     pub action: Option<crate::routes::companion_stream::UserActionDto>,
+    /// That the turn asked for BYOK, and what to do when it cannot be
+    /// served (spec 2026-10-08 §9.1). Never the endpoints, models or key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byok: Option<crate::byok::QueuedByok>,
 }
 
 impl QueuedTurnParams {
@@ -122,6 +126,17 @@ pub async fn send_message_async(
     Extension(AuthUser(user_id)): Extension<AuthUser>,
     Json(req): Json<StreamSendRequest>,
 ) -> Result<(StatusCode, Json<AsyncSendResponse>), AppError> {
+    // The worker generates this turn and never holds a BYOK configuration
+    // (spec 2026-10-08 §9.3).
+    if req.byok.is_some() {
+        return Err(AppError::StreamPre(StreamPreError {
+            status: StatusCode::BAD_REQUEST,
+            code: "invalid_payload",
+            message: "byok is not accepted on the async endpoint".into(),
+            user_message: "请求无效".into(),
+            original_user_message_id: None,
+        }));
+    }
     validate_payload(&req)?;
     validate_image_capability(&req, &state.model_config)?;
     // Validate now so a bad request 400s at enqueue, not silently in the
@@ -167,6 +182,7 @@ pub async fn send_message_async(
         user_country: crate::holiday::bounded_raw(req.user_country.as_deref()),
         user_region: crate::holiday::bounded_raw(req.user_region.as_deref()),
         action: req.action.clone(),
+        byok: None,
     })
     .expect("QueuedTurnParams serializes");
 

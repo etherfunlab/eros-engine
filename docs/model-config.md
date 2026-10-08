@@ -149,7 +149,8 @@ Rules, all enforced at boot (the engine refuses to boot on any violation):
 - **Names** match `[a-z0-9_]+`. `voyage` stays reserved — its native API is
   not the OpenRouter-compatible embeddings format this mechanism speaks, and
   `$VOYAGE_API_KEY` already belongs to the built-in native Voyage client.
-  `openrouter` is a valid, declarable name: it doesn't add a separate
+  `byok` is reserved too, because `@byok` labels bring-your-own-key hops in
+  audit records (see [byok.md](byok.md)). `openrouter` is a valid, declarable name: it doesn't add a separate
   provider, it **overrides the built-in OpenRouter endpoint URLs** per key
   (see below).
 - **URLs** are complete and posted verbatim — no path joining. A provider
@@ -329,6 +330,11 @@ tier inherits it. Setting it on other tasks parses but has no effect.
 
 Because the display name is never persisted, the **array** form re-randomizes on
 history replay; `bool`/`string`/`map` are deterministic.
+
+On a BYOK hop (see [byok.md](byok.md)) the override is not read: `meta.model`
+is always the hop's real model id, on the live stream and on replay. The
+override applies to the deployment's own hops only, including the ones a BYOK
+turn falls back to.
 
 ### `output_filter` — second-pass reply rewrite (chat task only)
 
@@ -534,6 +540,10 @@ to make the user follow up (closer to chatting with a real person).
 
 The SSE `final`-frame `filtered` field is `true` when the client received non-raw
 output from **either** the regex strip **or** the LLM `output_filter` (or both).
+
+A BYOK hop applies the `output_regex` rules of its request's `byok` block
+instead of these (see [byok.md](byok.md)); these rules apply to the
+deployment's own hops.
 
 ### `input_filter` — user-input rewrite (chat task only)
 

@@ -32,10 +32,12 @@ impl fmt::Debug for ProviderEndpoint {
     /// VALUES may be sensitive too (e.g. a proxy auth token), so the whole
     /// `headers` map is redacted rather than printed key-by-key. `params`
     /// are deployer config, not secrets, so `body_rules` is kept quiet as a
-    /// count rather than redacted outright.
+    /// count rather than redacted outright. The URL is redacted too: some
+    /// providers take the key in the query string, and a BYOK endpoint's URL
+    /// belongs to an end user.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ProviderEndpoint")
-            .field("base_url", &self.base_url)
+            .field("base_url", &"<redacted>")
             .field("api_key", &"<redacted>")
             .field("headers", &"<redacted>")
             .field("body_rules", &self.body_rules.len())
@@ -322,6 +324,21 @@ mod tests {
         assert!(
             msg.contains("\\@"),
             "message should teach the escape: {msg}"
+        );
+    }
+
+    #[test]
+    fn provider_endpoint_debug_redacts_base_url() {
+        let ep = ProviderEndpoint {
+            base_url: "https://api.example.com/v1/chat/completions?key=SECRET-IN-QUERY".into(),
+            api_key: "k".into(),
+            headers: reqwest::header::HeaderMap::new(),
+            body_rules: Vec::new(),
+        };
+        let dbg = format!("{ep:?}");
+        assert!(
+            !dbg.contains("SECRET-IN-QUERY") && !dbg.contains("api.example.com"),
+            "{dbg}"
         );
     }
 }

@@ -493,6 +493,18 @@
               "type": "string",
               "format": "uuid"
             }
+          },
+          {
+            "name": "X-Byok-Caller-Secret",
+            "in": "header",
+            "description": "The deployment's BYOK_CALLER_SECRET; required when the body carries `byok`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "requestBody": {
@@ -2457,6 +2469,164 @@
           }
         }
       },
+      "ByokFallback": {
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        ]
+      },
+      "ByokModel": {
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": {
+              "type": "number",
+              "format": "double"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        ]
+      },
+      "ByokProvider": {
+        "type": "object",
+        "description": "One end-user endpoint.",
+        "required": [
+          "chat",
+          "api_key"
+        ],
+        "properties": {
+          "api_key": {
+            "type": "string",
+            "description": "Sent as `Authorization: Bearer <api_key>`."
+          },
+          "chat": {
+            "type": "string",
+            "description": "Complete chat-completions URL, posted verbatim."
+          },
+          "headers": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Sent verbatim on every request to this provider.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "ByokRegexRule": {
+        "type": "object",
+        "description": "One `output_regex` rule. A rule never lengthens a reply.",
+        "required": [
+          "pattern"
+        ],
+        "properties": {
+          "models": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Bare model ids the rule applies to (`gpt-x`, not `gpt-x@mine`).\nAbsent ⇒ every model on the BYOK chain."
+          },
+          "pattern": {
+            "type": "string",
+            "description": "Regex matched against the reply."
+          },
+          "replacement": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Literal text put in place of each match; default empty. Contains no\n`$` and is no longer in bytes than the shortest text `pattern` can\nmatch."
+          }
+        },
+        "additionalProperties": false
+      },
+      "ByokRequest": {
+        "type": "object",
+        "description": "The `byok` field of a stream send (spec §4.1). Settings BYOK does not\ntake are refused, not ignored.",
+        "required": [
+          "providers",
+          "model"
+        ],
+        "properties": {
+          "fallback": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ByokFallback",
+                "description": "Sequential fallback chain."
+              }
+            ]
+          },
+          "fallback_to_platform": {
+            "type": "boolean",
+            "description": "Continue on the deployment's own chain when every BYOK hop fails."
+          },
+          "model": {
+            "$ref": "#/components/schemas/ByokModel",
+            "description": "Primary model: one slug, an array (round-robin), or a slug → weight\nmap (weighted random). Every slug ends in `@<provider name>`."
+          },
+          "output_regex": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/ByokRegexRule"
+            },
+            "description": "Strip rules for this chain's replies."
+          },
+          "providers": {
+            "type": "object",
+            "description": "The end user's endpoints, by a name the model slugs reference.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ByokProvider"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "retry_depth": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Fallbacks tried after the primary. Default 2.",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
       "CharacterInsightResponse": {
         "type": "object",
         "description": "The AI character's side of one relationship's profile.\n\nDeliberately NOT the v1 `CharacterProfileResponse`, which carries the same\nfields: that type is the frozen response of `GET\n/comp/instance/{instance_id}/profile` and stays exactly as shipped. Two\nstructs is the price of freezing v1, and what lets this pair diverge later.",
@@ -3788,6 +3958,17 @@
               },
               {
                 "$ref": "#/components/schemas/LlmAuditDto"
+              }
+            ]
+          },
+          "byok": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ByokRequest",
+                "description": "Bring-your-own-key configuration for this turn's reply (spec\n2026-10-08-byok-chat). Honoured only with the deployment's\n`X-Byok-Caller-Secret` header; refused on the async route."
               }
             ]
           },

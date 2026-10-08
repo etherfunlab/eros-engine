@@ -21,7 +21,7 @@
 - 💞 **変化する親密度** — 6 つの関係軸が段階評価にもとづく減衰付きの書き込みで動き、時間とともに減衰します。口調や会話の深さ、返信するかどうかにも影響します。→ [Affinity model](docs/affinity-model.md) · [Ghost mechanics](docs/ghost-mechanics.md)
 - 🎭 **Persona Decision Engine（PDE）** — 生成前に、そのターンの行動と内面状態を選びます。標準はルールベースで、LLM judge も任意で使えます。→ [Model config](docs/model-config.md)
 - 🧩 **構造化されたユーザー理解** — 検索可能なプロフィールを育て、導入体験、パーソナライズ、分析などに活用できます。→ [API reference](docs/api-reference.md)
-- ⚡ **一通りそろったチャット経路** — SSE ストリーミング、画像理解と生成要求、`prompt_traits`、タスク別モデル選択、フォールバック、呼び出し監査を備えます。OpenRouter が標準ですが、`[providers]` から OpenAI 互換のチャット・embedding 提供元を追加できます。→ [API reference](docs/api-reference.md) · [Model config](docs/model-config.md)
+- ⚡ **一通りそろったチャット経路** — SSE ストリーミング、画像理解と生成要求、`prompt_traits`、タスク別モデル選択、フォールバック、呼び出し監査を備えます。OpenRouter が標準ですが、`[providers]` から OpenAI 互換のチャット・embedding 提供元を追加できます。→ [API reference](docs/api-reference.md) · [Model config](docs/model-config.md) ダウンストリームは、エンドユーザーが自分のチャットエンドポイントとキーをターン単位で持ち込めるようにもできます。→ [BYOK](docs/byok.md)
 - 🎙️ **割り込み前提の音声ターン** — 独立したチャネル上の軽量・低遅延なターンエンドポイントで、barge-in に対応します。クライアントが再生を止めて実際に読み上げられた内容を報告するため、履歴にはモデルが生成した内容ではなくユーザーが**聞いた**内容が残ります。接続断で失われたターンは、宙に浮かせず再生成できます。→ [API reference](docs/api-reference.md#post-compvoicesession_idturnstream)
 - 🌍 **シミュレートされた世界** — ペルソナには画面の外の生活があります。定期実行の「世界ディレクター」が共有の関係グラフと日々の脚本を更新し、フィード上でペルソナ同士が投稿・コメントし合い、ペルソナごとのストーリーが仕事・恋愛・日常の一貫性を保ちます。完全にオプトインで、独立したスイッチで段階的に有効化します。未設定のデプロイではクエリも定期処理も一切走りません。→ [World system](docs/world-system.md)
 
@@ -90,6 +90,7 @@ Postgres と `.env` は利用者側で用意してください。同じ `docker/
 - [World system](docs/world-system.md) — 実験的な World Memories、World Town、World Stories のシミュレーション。
 - [Model config](docs/model-config.md) — タスク、モデル選択、フォールバック、`[providers]` による複数提供元へのルーティング。
 - [Prompt traits](docs/prompt-traits.md) — リクエストごとのプロンプト調整と tier の許可リスト。
+- [Bring your own key](docs/byok.md) — エンドユーザー自身のチャットエンドポイントとキーでコンパニオンの返信を生成させる。
 - [LLM / OpenRouter audit](docs/llm-audit.md) — ユーザー・セッション単位の帰属情報。
 - [Deploying](docs/deploying.md) — Docker、Postgres、認証、運用。
 - [API reference](docs/api-reference.md) — ルート、リクエスト schema、SSE frame。

@@ -347,15 +347,10 @@ fn drive_chat_burst(
     affinity_scope: eros_engine_core::scope::AffinityScope, // post-resolve scope for assistant metadata
     random_draw: Option<f64>, // sampled once per turn by run_stream; None when trigger.random is unset
     outcome: std::sync::Arc<std::sync::Mutex<BurstOutcome>>,
+    chain: Vec<crate::byok::ChatHop>,
 ) -> impl futures_util::Stream<Item = ProtocolFrame> + Send + 'static {
     async_stream::stream! {
         let chat_repo = ChatRepo { pool: &state.pool };
-        // The fallback_model is already truncated to retry_depth entries by
-        // resolve() — no cap needed here; the chain is just [primary] + fallbacks.
-        let chain: Vec<String> = std::iter::once(req.model.clone())
-            .chain(req.fallback_model.iter().cloned())
-            .filter(|s| !s.is_empty())
-            .collect();
         if chain.is_empty() {
             yield ProtocolFrame::Error {
                 code: StreamErrorCode::Internal,
@@ -367,6 +362,9 @@ fn drive_chat_burst(
             };
             return;
         }
+        // A chain that ends on a BYOK hop is BYOK-only: its exhaustion never
+        // serves the fallback phrase (spec 2026-10-08 §6.3).
+        let byok_only = chain.last().is_some_and(|h| h.byok.is_some());
 
         // The task every hop of this burst serves — stamped on each recorded
         // failure so one audit row identifies which `[tasks.*]` chain broke.
@@ -441,11 +439,13 @@ fn drive_chat_burst(
             // Content verdicts (length / content_filter / empty / garbled) push
             // nothing: those calls succeeded at the HTTP level and were billed.
             let mut chain_failures: Vec<eros_engine_llm::failure::AttemptFailure> = Vec::new();
-            for (idx, model_id) in chain.iter().enumerate() {
-                // Model-keyed config tables (display / output_regex / trigger)
-                // are written with bare ids; model_id here is the full config
-                // slug (may carry @provider — which audit KEEPS, spec §6).
-                let bare_model_id = eros_engine_llm::provider::bare_model_id(model_id);
+            for (idx, hop) in chain.iter().enumerate() {
+                // `model_id` is what audit, logs and failure records name: the
+                // config slug (may carry @provider, which audit KEEPS, spec §6)
+                // or `<id>@byok` on a BYOK hop. Model-keyed tables (display /
+                // output_regex / trigger) match the bare id.
+                let model_id: &String = &hop.audit;
+                let bare_model_id = eros_engine_llm::provider::bare_model_id(&hop.slug);
                 let msg_ulid = Ulid::new();
                 let msg_uuid: Uuid = msg_ulid.into();
                 let mut acc = String::new();
@@ -457,14 +457,14 @@ fn drive_chat_burst(
                 // stream; `acc` still accumulates the raw text for the persist
                 // apply below. Empty rule set ⇒ pure passthrough.
                 let mut scrubber = eros_engine_llm::stream_scrub::StreamScrubber::new(
-                    &state.output_regex,
+                    hop.rules(&state.output_regex),
                     &bare_model_id,
                 );
 
                 yield ProtocolFrame::Meta {
                     message_id: ulid_string(msg_ulid),
                     action_type: frame_action,
-                    model: display_override.as_ref().and_then(|d| d.display(&bare_model_id)),
+                    model: hop_display(hop, display_override.as_ref(), &bare_model_id),
                     continues_from: continues_from.map(ulid_string),
                 };
 
@@ -478,7 +478,7 @@ fn drive_chat_burst(
                 // attempt, so no per-fallback clone of the (large) prompt.
                 match tokio::time::timeout(
                     STREAM_OPEN_TIMEOUT,
-                    state.openrouter.execute_stream_as(&req, model_id),
+                    hop.client(&state.openrouter).execute_stream_as(&req, &hop.slug),
                 )
                 .await
                 {
@@ -684,7 +684,7 @@ fn drive_chat_burst(
                     (acc.clone(), None, false)
                 } else {
                     let strip = eros_engine_llm::model_config::apply_output_regex(
-                        &state.output_regex,
+                        hop.rules(&state.output_regex),
                         &bare_model_id,
                         &acc,
                     );
@@ -870,28 +870,35 @@ fn drive_chat_burst(
                         for f in frames { yield f; }
                         return;
                     }
-                    match build_stream_failure_pseudo_ghost(
-                        &state.pool,
-                        session_id,
-                        user_message_id,
-                        frame_action,
-                        persist_action,
-                        plan_action,
-                        &trait_tags,
-                        &tier,
-                        memory_scope,
-                        affinity_scope,
-                        fallback_retries,
-                        // Live mode persisted the final truncated bubble; link
-                        // the pseudo-ghost to it so clients + replay can stitch
-                        // them as one logical conversation turn.
-                        Some(msg_ulid),
-                        task_name,
-                        chain.len(),
-                        &chain_failures,
-                    )
-                    .await
-                    {
+                    // A BYOK-only chain never serves the fallback phrase: it
+                    // would hide from the end user that their own key or
+                    // endpoint failed (spec 2026-10-08 §6.3).
+                    let pseudo_ghost = if byok_only {
+                        None
+                    } else {
+                        build_stream_failure_pseudo_ghost(
+                            &state.pool,
+                            session_id,
+                            user_message_id,
+                            frame_action,
+                            persist_action,
+                            plan_action,
+                            &trait_tags,
+                            &tier,
+                            memory_scope,
+                            affinity_scope,
+                            fallback_retries,
+                            // Live mode persisted the final truncated bubble; link
+                            // the pseudo-ghost to it so clients + replay can stitch
+                            // them as one logical conversation turn.
+                            Some(msg_ulid),
+                            task_name,
+                            chain.len(),
+                            &chain_failures,
+                        )
+                        .await
+                    };
+                    match pseudo_ghost {
                         Some((frames, produced, failures)) => {
                             // Replace any truncated-attempt entries already in
                             // outcome.produced with just the pseudo-ghost — so
@@ -946,11 +953,13 @@ fn drive_chat_burst(
         // Same accumulator contract as live mode: transport/status failures and
         // local timeouts only; content verdicts leave no entry.
         let mut chain_failures: Vec<eros_engine_llm::failure::AttemptFailure> = Vec::new();
-        for (idx, model_id) in chain.iter().enumerate() {
-            // Model-keyed config tables (display / output_regex / trigger)
-            // are written with bare ids; model_id here is the full config
-            // slug (may carry @provider — which audit KEEPS, spec §6).
-            let bare_model_id = eros_engine_llm::provider::bare_model_id(model_id);
+        for (idx, hop) in chain.iter().enumerate() {
+            // `model_id` is what audit, logs and failure records name: the
+            // config slug (may carry @provider, which audit KEEPS, spec §6)
+            // or `<id>@byok` on a BYOK hop. Model-keyed tables (display /
+            // output_regex / trigger) match the bare id.
+            let model_id: &String = &hop.audit;
+            let bare_model_id = eros_engine_llm::provider::bare_model_id(&hop.slug);
             let msg_ulid = Ulid::new();
             let msg_uuid: Uuid = msg_ulid.into();
             let mut acc = String::new();
@@ -970,7 +979,7 @@ fn drive_chat_burst(
             // Borrow the shared request; no per-fallback prompt clone.
             match tokio::time::timeout(
                 STREAM_OPEN_TIMEOUT,
-                state.openrouter.execute_stream_as(&req, model_id),
+                hop.client(&state.openrouter).execute_stream_as(&req, &hop.slug),
             )
             .await
             {
@@ -1180,7 +1189,7 @@ fn drive_chat_burst(
                     yield ProtocolFrame::Meta {
                         message_id: ulid_string(msg_ulid),
                         action_type: frame_action,
-                        model: display_override.as_ref().and_then(|d| d.display(&bare_model_id)),
+                        model: hop_display(hop, display_override.as_ref(), &bare_model_id),
                         continues_from: None,
                     };
                     // Forward the served usage (a provider can emit a usage block
@@ -1205,27 +1214,34 @@ fn drive_chat_burst(
                 if idx + 1 == chain.len() {
                     let fallback_retries = (chain.len() as u32).saturating_sub(1);
                     outcome.lock().unwrap().retries_chat = fallback_retries;
-                    match build_stream_failure_pseudo_ghost(
-                        &state.pool,
-                        session_id,
-                        user_message_id,
-                        frame_action,
-                        persist_action,
-                        plan_action,
-                        &trait_tags,
-                        &tier,
-                        memory_scope,
-                        affinity_scope,
-                        fallback_retries,
-                        // Filtered mode never persists intermediate truncated
-                        // attempts, so there is no prior bubble to continue from.
-                        None,
-                        task_name,
-                        chain.len(),
-                        &chain_failures,
-                    )
-                    .await
-                    {
+                    // A BYOK-only chain never serves the fallback phrase: it
+                    // would hide from the end user that their own key or
+                    // endpoint failed (spec 2026-10-08 §6.3).
+                    let pseudo_ghost = if byok_only {
+                        None
+                    } else {
+                        build_stream_failure_pseudo_ghost(
+                            &state.pool,
+                            session_id,
+                            user_message_id,
+                            frame_action,
+                            persist_action,
+                            plan_action,
+                            &trait_tags,
+                            &tier,
+                            memory_scope,
+                            affinity_scope,
+                            fallback_retries,
+                            // Filtered mode never persists intermediate truncated
+                            // attempts, so there is no prior bubble to continue from.
+                            None,
+                            task_name,
+                            chain.len(),
+                            &chain_failures,
+                        )
+                        .await
+                    };
+                    match pseudo_ghost {
                         Some((frames, produced, failures)) => {
                             // Replace any truncated-attempt entries already in
                             // outcome.produced with just the pseudo-ghost — so
@@ -1267,7 +1283,7 @@ fn drive_chat_burst(
             yield ProtocolFrame::Meta {
                 message_id: ulid_string(msg_ulid),
                 action_type: frame_action,
-                model: display_override.as_ref().and_then(|d| d.display(&bare_model_id)),
+                model: hop_display(hop, display_override.as_ref(), &bare_model_id),
                 continues_from: None,
             };
 
@@ -1282,7 +1298,7 @@ fn drive_chat_burst(
             // letting a later fallback serve an UNSTRIPPED reply while the final
             // frame falsely reports `filtered = true`.
             let strip = eros_engine_llm::model_config::apply_output_regex(
-                &state.output_regex,
+                hop.rules(&state.output_regex),
                 &bare_model_id,
                 &acc,
             );
@@ -1393,7 +1409,7 @@ fn drive_chat_burst(
                                         yield ProtocolFrame::Meta {
                                             message_id: ulid_string(cur_ulid),
                                             action_type: frame_action,
-                                            model: display_override.as_ref().and_then(|d| d.display(&bare_model_id)),
+                                            model: hop_display(hop, display_override.as_ref(), &bare_model_id),
                                             continues_from: None,
                                         };
                                     }
@@ -1541,6 +1557,20 @@ fn drive_chat_burst(
             };
             return;
         }
+    }
+}
+
+/// `meta.model` for one hop (spec 2026-10-08 §6.4): a BYOK hop always shows
+/// its real id; a platform hop follows `model_name_display_override`.
+fn hop_display(
+    hop: &crate::byok::ChatHop,
+    display: Option<&eros_engine_llm::model_config::DisplayOverride>,
+    bare_model_id: &str,
+) -> Option<String> {
+    if hop.byok.is_some() {
+        Some(bare_model_id.to_string())
+    } else {
+        display.and_then(|d| d.display(bare_model_id))
     }
 }
 
@@ -4162,10 +4192,24 @@ impl PersistedUserMessage {
 /// generator owns its `AppState` clone so it stays `'static` and survives
 /// `Sse`'s body lifetime. Task 10 implements the Ghost branch; T11/T12
 /// fill in Reply.
+///
+/// Test shorthand for `run_stream_with(.., None)`.
+#[cfg(test)]
 pub fn run_stream(
     state: Arc<AppState>,
     user_msg: PersistedUserMessage,
     prefetched_persona: Option<eros_engine_core::persona::CompanionPersona>,
+) -> impl futures_util::Stream<Item = ProtocolFrame> + Send + 'static {
+    run_stream_with(state, user_msg, prefetched_persona, None)
+}
+
+/// [`run_stream`] with the turn's BYOK configuration, which replaces the
+/// reply hop's model chain (spec 2026-10-08 §6).
+pub(crate) fn run_stream_with(
+    state: Arc<AppState>,
+    user_msg: PersistedUserMessage,
+    prefetched_persona: Option<eros_engine_core::persona::CompanionPersona>,
+    byok: Option<std::sync::Arc<crate::byok::ByokTurn>>,
 ) -> impl futures_util::Stream<Item = ProtocolFrame> + Send + 'static {
     async_stream::stream! {
         let chat_repo = ChatRepo { pool: &state.pool };
@@ -5350,10 +5394,15 @@ pub fn run_stream(
                 // Optional fire-and-forget raw-prompt disk log (PROMPT_LOG_DIR).
                 // Logged once here — before the fallback-model send loop — so a
                 // turn that retries across models still produces exactly one file.
+                // The reply chain, BYOK hops first when the turn carries one
+                // (spec 2026-10-08 §6.2). Selects the BYOK primary: once per reply.
+                let chain = crate::byok::reply_chain(&req, byok.as_ref());
                 if let Some(dir) = state.config.prompt_log_dir.as_ref() {
+                    let labels: Vec<String> = chain.iter().map(|h| h.audit.clone()).collect();
                     crate::prompt_log::spawn_write(
                         dir.clone(),
                         &req,
+                        &labels,
                         user_msg.session_id,
                         user_msg.user_message_id,
                     );
@@ -5409,6 +5458,7 @@ pub fn run_stream(
                     user_msg.affinity_scope,
                     random_draw,
                     outcome.clone(),
+                    chain,
                 );
                 {
                     use futures_util::StreamExt as _;
@@ -5681,6 +5731,14 @@ pub fn replay_stream(
                     // retries are wire-identical regardless of any
                     // display_override config.
                     model: row.model.as_deref().and_then(|m| {
+                        // A BYOK-served row always shows its real id (spec
+                        // 2026-10-08 §6.4), as the live stream did.
+                        if matches!(
+                            eros_engine_llm::provider::split_model_slug(m),
+                            Ok((_, Some(eros_engine_llm::byok::AUDIT_LABEL)))
+                        ) {
+                            return Some(eros_engine_llm::provider::bare_model_id(m));
+                        }
                         display_override
                             .as_ref()
                             .and_then(|d| d.display(&eros_engine_llm::provider::bare_model_id(m)))
@@ -10435,6 +10493,59 @@ data: [DONE]\n\n";
         .collect()
         .await;
         assert_eq!(meta_model(&f3), Some("Nova".to_string()));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn replay_shows_the_real_id_for_a_byok_served_row(pool: PgPool) {
+        use futures_util::StreamExt;
+
+        let user_id = Uuid::new_v4();
+        let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let row = eros_engine_store::chat::ReplayMessage {
+            model: Some("gpt-x@byok".into()),
+            usage: None,
+            msg: eros_engine_store::chat::ChatMessage {
+                id: Uuid::new_v4(),
+                session_id,
+                role: "assistant".into(),
+                content: "hello".into(),
+                sent_at: chrono::Utc::now(),
+                client_msg_id: None,
+                ghost_decision: false,
+                user_message_id: None,
+                continues_from_message_id: None,
+                truncated: false,
+                generation_id: Some("gen-byok-replay".into()),
+                assistant_action_type: Some("reply".into()),
+                channel: None,
+                pre_filter_content: None,
+                metadata: None,
+                read_at: None,
+                reaction: None,
+                reacted_at: None,
+            },
+        };
+        let mut s = crate::routes::companion::test_state(pool.clone());
+        s.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"deepseek/x\"\nmodel_name_display_override = \"Aria\"\n",
+            )
+            .unwrap(),
+        );
+        let frames: Vec<ProtocolFrame> = replay_stream(
+            std::sync::Arc::new(s),
+            session_id,
+            user_id,
+            false,
+            vec![row],
+        )
+        .collect()
+        .await;
+        let model = frames.iter().find_map(|f| match f {
+            ProtocolFrame::Meta { model, .. } => Some(model.clone()),
+            _ => None,
+        });
+        assert_eq!(model, Some(Some("gpt-x".to_string())));
     }
 
     #[test]
@@ -16701,6 +16812,7 @@ data: [DONE]\n\n";
             ..Default::default()
         };
         let outcome = std::sync::Arc::new(std::sync::Mutex::new(BurstOutcome::default()));
+        let chain = crate::byok::reply_chain(&req, None);
         let burst = drive_chat_burst(
             state.clone(),
             session_id,
@@ -16717,6 +16829,7 @@ data: [DONE]\n\n";
             Default::default(),
             None,
             outcome.clone(),
+            chain,
         );
         let _frames: Vec<ProtocolFrame> = Box::pin(burst).collect().await;
 
@@ -17291,6 +17404,7 @@ data: [DONE]\n\n";
             ..Default::default()
         };
         let outcome = std::sync::Arc::new(std::sync::Mutex::new(BurstOutcome::default()));
+        let chain = crate::byok::reply_chain(&req, None);
         let burst = drive_chat_burst(
             state.clone(),
             session_id,
@@ -17307,6 +17421,7 @@ data: [DONE]\n\n";
             Default::default(),
             None,
             outcome.clone(),
+            chain,
         );
         let frames: Vec<ProtocolFrame> = Box::pin(burst).collect().await;
 
@@ -17444,6 +17559,7 @@ data: [DONE]\n\n";
             ..Default::default()
         };
         let outcome = std::sync::Arc::new(std::sync::Mutex::new(BurstOutcome::default()));
+        let chain = crate::byok::reply_chain(&req, None);
         let burst = drive_chat_burst(
             state.clone(),
             session_id,
@@ -17460,6 +17576,7 @@ data: [DONE]\n\n";
             Default::default(),
             None,
             outcome.clone(),
+            chain,
         );
         let frames: Vec<ProtocolFrame> = Box::pin(burst).collect().await;
 
@@ -17588,6 +17705,7 @@ data: [DONE]\n\n";
             ..Default::default()
         };
         let outcome = std::sync::Arc::new(std::sync::Mutex::new(BurstOutcome::default()));
+        let chain = crate::byok::reply_chain(&req, None);
         let burst = drive_chat_burst(
             state.clone(),
             session_id,
@@ -17604,6 +17722,7 @@ data: [DONE]\n\n";
             Default::default(),
             None,
             outcome.clone(),
+            chain,
         );
         let frames: Vec<ProtocolFrame> = Box::pin(burst).collect().await;
 
@@ -17706,6 +17825,7 @@ data: [DONE]\n\n";
             ..Default::default()
         };
         let outcome = std::sync::Arc::new(std::sync::Mutex::new(BurstOutcome::default()));
+        let chain = crate::byok::reply_chain(&req, None);
         let burst = drive_chat_burst(
             state.clone(),
             session_id,
@@ -17722,6 +17842,7 @@ data: [DONE]\n\n";
             Default::default(),
             None,
             outcome.clone(),
+            chain,
         );
         let frames: Vec<ProtocolFrame> = Box::pin(burst).collect().await;
 
@@ -18671,6 +18792,7 @@ data: [DONE]\n\n";
             ..Default::default()
         };
         let outcome = std::sync::Arc::new(std::sync::Mutex::new(BurstOutcome::default()));
+        let chain = crate::byok::reply_chain(&req, None);
         let burst = drive_chat_burst(
             state.clone(),
             session_id,
@@ -18687,6 +18809,7 @@ data: [DONE]\n\n";
             Default::default(),
             None,
             outcome.clone(),
+            chain,
         );
         let frames: Vec<ProtocolFrame> = Box::pin(burst).collect().await;
 
@@ -18865,6 +18988,7 @@ data: [DONE]\n\n"
             ..Default::default()
         };
         let outcome = std::sync::Arc::new(std::sync::Mutex::new(BurstOutcome::default()));
+        let chain = crate::byok::reply_chain(&req, None);
         let burst = drive_chat_burst(
             state.clone(),
             session_id,
@@ -18881,6 +19005,7 @@ data: [DONE]\n\n"
             Default::default(),
             None,
             outcome.clone(),
+            chain,
         );
         let frames: Vec<ProtocolFrame> = Box::pin(burst).collect().await;
 
@@ -19064,6 +19189,7 @@ data: [DONE]\n\n";
             ..Default::default()
         };
         let outcome = std::sync::Arc::new(std::sync::Mutex::new(BurstOutcome::default()));
+        let chain = crate::byok::reply_chain(&req, None);
         let burst = drive_chat_burst(
             state.clone(),
             session_id,
@@ -19080,6 +19206,7 @@ data: [DONE]\n\n";
             Default::default(),
             None,
             outcome.clone(),
+            chain,
         );
         let frames: Vec<ProtocolFrame> = Box::pin(burst).collect().await;
 
@@ -19249,6 +19376,7 @@ data: [DONE]\n\n";
             ..Default::default()
         };
         let outcome = std::sync::Arc::new(std::sync::Mutex::new(BurstOutcome::default()));
+        let chain = crate::byok::reply_chain(&req, None);
         let burst = drive_chat_burst(
             state.clone(),
             session_id,
@@ -19265,6 +19393,7 @@ data: [DONE]\n\n";
             Default::default(),
             None,
             outcome.clone(),
+            chain,
         );
         let frames: Vec<ProtocolFrame> = Box::pin(burst).collect().await;
 
@@ -19467,6 +19596,7 @@ data: [DONE]\n\n"
             ..Default::default()
         };
         let outcome = std::sync::Arc::new(std::sync::Mutex::new(BurstOutcome::default()));
+        let chain = crate::byok::reply_chain(&req, None);
         let burst = drive_chat_burst(
             state.clone(),
             session_id,
@@ -19483,6 +19613,7 @@ data: [DONE]\n\n"
             Default::default(),
             None,
             outcome.clone(),
+            chain,
         );
         let frames: Vec<ProtocolFrame> = Box::pin(burst).collect().await;
 
@@ -19713,6 +19844,7 @@ data: [DONE]\n\n"
             ..Default::default()
         };
         let outcome = std::sync::Arc::new(std::sync::Mutex::new(BurstOutcome::default()));
+        let chain = crate::byok::reply_chain(&req, None);
         let burst = drive_chat_burst(
             state.clone(),
             session_id,
@@ -19729,6 +19861,7 @@ data: [DONE]\n\n"
             Default::default(),
             None,
             outcome.clone(),
+            chain,
         );
         let frames: Vec<ProtocolFrame> = Box::pin(burst).collect().await;
 
@@ -20423,5 +20556,389 @@ data: [DONE]\n\n"
         )));
         let body = chat_request_body(&mock.received_requests().await.unwrap());
         assert!(body.contains("对方凑过来想亲你，你接受了。"), "{body}");
+    }
+
+    /// A BYOK turn on provider `mine` (spec 2026-10-08).
+    fn byok_turn(
+        byok: serde_json::Value,
+        allow_private: bool,
+    ) -> std::sync::Arc<crate::byok::ByokTurn> {
+        let req: crate::byok::ByokRequest = serde_json::from_value(byok).expect("byok parses");
+        let cfg = crate::state::ByokConfig {
+            caller_secret: None,
+            allow_private_network: allow_private,
+        };
+        std::sync::Arc::new(
+            crate::byok::prepare(
+                &req,
+                &cfg,
+                &crate::byok::ByokRuntime::new(allow_private),
+                Uuid::new_v4(),
+            )
+            .expect("valid byok"),
+        )
+    }
+
+    fn byok_chat_request() -> eros_engine_llm::openrouter::ChatRequest {
+        eros_engine_llm::openrouter::ChatRequest {
+            model: "platform/x".into(),
+            messages: vec![eros_engine_llm::openrouter::ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            temperature: 0.0,
+            max_tokens: 64,
+            task: Some("chat_companion".into()),
+            ..Default::default()
+        }
+    }
+
+    async fn byok_user_message(pool: &PgPool, session_id: Uuid, client_msg_id: &str) -> Uuid {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        match (ChatRepo { pool })
+            .upsert_user_message_idempotent(session_id, "hi", client_msg_id, "user", None)
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        }
+    }
+
+    fn sse(text: &str, gen_id: &str, model: &str) -> String {
+        format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":{}}}}}],\"id\":\"{gen_id}\",\"model\":\"{model}\"}}\n\ndata: [DONE]\n\n",
+            serde_json::Value::String(text.into())
+        )
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn byok_hop_serves_with_the_end_users_key(pool: PgPool) {
+        use futures_util::StreamExt;
+        use wiremock::matchers::{header, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/byok/v1/chat/completions"))
+            .and(header("authorization", "Bearer sk-end-user"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                sse("hello [note: x]", "gen-byok", "gpt-x"),
+                "text/event-stream",
+            ))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let state = std::sync::Arc::new(state);
+        let user_message_id =
+            byok_user_message(&pool, session_id, "01JBYKA0000000000000000001").await;
+
+        let req = byok_chat_request();
+        let byok = byok_turn(
+            serde_json::json!({
+                "providers": {"mine": {"chat": format!("{}/byok/v1/chat/completions", mock.uri()), "api_key": "sk-end-user"}},
+                "model": "gpt-x@mine",
+                "output_regex": [{"pattern": r"\s*\[note:[^\]]*\]"}],
+            }),
+            true,
+        );
+        let chain = crate::byok::reply_chain(&req, Some(&byok));
+        let outcome = std::sync::Arc::new(std::sync::Mutex::new(BurstOutcome::default()));
+        let burst = drive_chat_burst(
+            state.clone(),
+            session_id,
+            user_message_id,
+            FrameActionType::Reply,
+            "reply",
+            ActionType::ReplyText,
+            req,
+            Some(eros_engine_llm::model_config::DisplayOverride::Fixed(
+                "Aria".into(),
+            )),
+            None,
+            vec![],
+            None,
+            Default::default(),
+            Default::default(),
+            None,
+            outcome.clone(),
+            chain,
+        );
+        let frames: Vec<ProtocolFrame> = Box::pin(burst).collect().await;
+
+        let meta_model = frames
+            .iter()
+            .find_map(|f| match f {
+                ProtocolFrame::Meta { model, .. } => Some(model.clone()),
+                _ => None,
+            })
+            .expect("meta");
+        assert_eq!(
+            meta_model.as_deref(),
+            Some("gpt-x"),
+            "a BYOK hop shows its real id"
+        );
+        let wire: String = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(wire, "hello", "the BYOK regex rule strips on the wire");
+        let (generation_id, model): (String, String) = sqlx::query_as(
+            "SELECT generation_id, model FROM engine.llm_generations \
+             WHERE session_id = $1 AND model = 'gpt-x@byok'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(model, "gpt-x@byok");
+        assert!(
+            generation_id.starts_with("byok-"),
+            "the engine mints a BYOK hop's id, never the provider: {generation_id}"
+        );
+        let content: String = sqlx::query_scalar(
+            "SELECT content FROM engine.chat_messages \
+             WHERE user_message_id = $1 AND role = 'assistant' AND NOT truncated",
+        )
+        .bind(user_message_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(content, "hello");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn byok_only_exhaustion_emits_error_not_the_fallback_phrase(pool: PgPool) {
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Migration 0020 seeds fallback phrases, so a platform chain would
+        // end in a pseudo-ghost here; a BYOK-only chain must not.
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/byok/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_body_string(r#"{"error":{"message":"invalid key"}}"#),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let state = std::sync::Arc::new(crate::routes::companion::test_state(pool.clone()));
+        let user_message_id =
+            byok_user_message(&pool, session_id, "01JBYKB0000000000000000001").await;
+
+        let req = byok_chat_request();
+        let byok = byok_turn(
+            serde_json::json!({
+                "providers": {"mine": {"chat": format!("{}/byok/v1/chat/completions", mock.uri()), "api_key": "sk-end-user"}},
+                "model": "gpt-x@mine",
+            }),
+            true,
+        );
+        let chain = crate::byok::reply_chain(&req, Some(&byok));
+        let outcome = std::sync::Arc::new(std::sync::Mutex::new(BurstOutcome::default()));
+        let burst = drive_chat_burst(
+            state.clone(),
+            session_id,
+            user_message_id,
+            FrameActionType::Reply,
+            "reply",
+            ActionType::ReplyText,
+            req,
+            None,
+            None,
+            vec![],
+            None,
+            Default::default(),
+            Default::default(),
+            None,
+            outcome.clone(),
+            chain,
+        );
+        let frames: Vec<ProtocolFrame> = Box::pin(burst).collect().await;
+
+        let status = frames
+            .iter()
+            .find_map(|f| match f {
+                ProtocolFrame::Error {
+                    upstream_status, ..
+                } => Some(*upstream_status),
+                _ => None,
+            })
+            .expect("an Error frame, not a pseudo-ghost");
+        assert_eq!(status, Some(401));
+        let served: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_messages \
+             WHERE user_message_id = $1 AND role = 'assistant' AND NOT truncated",
+        )
+        .bind(user_message_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(served, 0, "no fallback phrase was served");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn fallback_to_platform_walks_into_the_platform_chain(pool: PgPool) {
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/byok/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                sse("from platform", "gen-plat", "platform/x"),
+                "text/event-stream",
+            ))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let state = std::sync::Arc::new(state);
+        let user_message_id =
+            byok_user_message(&pool, session_id, "01JBYKC0000000000000000001").await;
+
+        let req = byok_chat_request();
+        let byok = byok_turn(
+            serde_json::json!({
+                "providers": {"mine": {"chat": format!("{}/byok/v1/chat/completions", mock.uri()), "api_key": "sk-end-user"}},
+                "model": "gpt-x@mine",
+                "fallback_to_platform": true,
+            }),
+            true,
+        );
+        let chain = crate::byok::reply_chain(&req, Some(&byok));
+        let outcome = std::sync::Arc::new(std::sync::Mutex::new(BurstOutcome::default()));
+        let burst = drive_chat_burst(
+            state.clone(),
+            session_id,
+            user_message_id,
+            FrameActionType::Reply,
+            "reply",
+            ActionType::ReplyText,
+            req,
+            Some(eros_engine_llm::model_config::DisplayOverride::Fixed(
+                "Aria".into(),
+            )),
+            None,
+            vec![],
+            None,
+            Default::default(),
+            Default::default(),
+            None,
+            outcome.clone(),
+            chain,
+        );
+        let frames: Vec<ProtocolFrame> = Box::pin(burst).collect().await;
+
+        let metas: Vec<Option<String>> = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Meta { model, .. } => Some(model.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            metas,
+            vec![Some("gpt-x".to_string()), Some("Aria".to_string())],
+            "BYOK hop shows its id; the platform hop follows the override"
+        );
+        assert_eq!(outcome.lock().unwrap().retries_chat, 1);
+        let content: String = sqlx::query_scalar(
+            "SELECT content FROM engine.chat_messages \
+             WHERE user_message_id = $1 AND role = 'assistant' AND NOT truncated",
+        )
+        .bind(user_message_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(content, "from platform");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_guarded_byok_hop_to_localhost_fails_as_transport(pool: PgPool) {
+        use futures_util::StreamExt;
+
+        let user_id = Uuid::new_v4();
+        let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let state = std::sync::Arc::new(crate::routes::companion::test_state(pool.clone()));
+        let user_message_id =
+            byok_user_message(&pool, session_id, "01JBYKD0000000000000000001").await;
+
+        let req = byok_chat_request();
+        let byok = byok_turn(
+            serde_json::json!({
+                "providers": {"mine": {"chat": "https://localhost:9/v1/chat/completions", "api_key": "sk-end-user"}},
+                "model": "gpt-x@mine",
+            }),
+            false,
+        );
+        let chain = crate::byok::reply_chain(&req, Some(&byok));
+        let outcome = std::sync::Arc::new(std::sync::Mutex::new(BurstOutcome::default()));
+        let burst = drive_chat_burst(
+            state.clone(),
+            session_id,
+            user_message_id,
+            FrameActionType::Reply,
+            "reply",
+            ActionType::ReplyText,
+            req,
+            None,
+            None,
+            vec![],
+            None,
+            Default::default(),
+            Default::default(),
+            None,
+            outcome.clone(),
+            chain,
+        );
+        let frames: Vec<ProtocolFrame> = Box::pin(burst).collect().await;
+        let status = frames
+            .iter()
+            .find_map(|f| match f {
+                ProtocolFrame::Error {
+                    upstream_status, ..
+                } => Some(*upstream_status),
+                _ => None,
+            })
+            .expect("the guarded hop fails the turn");
+        assert_eq!(
+            status, None,
+            "a gateway-layer failure carries no upstream status"
+        );
     }
 }

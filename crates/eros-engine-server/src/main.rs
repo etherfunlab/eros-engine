@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 mod auth;
+mod byok;
 mod error;
 mod history_window;
 mod holiday;
@@ -380,6 +381,7 @@ async fn run_server() -> Result<()> {
         world_configured,
         stories_configured,
         chat_queue_notify: Arc::new(tokio::sync::Notify::new()),
+        byok: crate::byok::ByokRuntime::new(cfg.byok.allow_private_network),
     };
 
     // Compose the OpenAPI-aware router. routes::router applies the auth

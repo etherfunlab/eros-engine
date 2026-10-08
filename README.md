@@ -21,7 +21,7 @@ The engine has seven foundations:
 - 💞 **Evolving affinity** — six relationship dimensions move on graded, damped writes and decay with time, shaping tone, depth, and even whether the companion replies. → [Affinity model](docs/affinity-model.md) · [Ghost mechanics](docs/ghost-mechanics.md)
 - 🎭 **Persona Decision Engine (PDE)** — before generation, the engine chooses an action and inner state. Rules work out of the box; an LLM judge is optional. → [Model config](docs/model-config.md)
 - 🧩 **Structured user insight** — the engine builds a queryable profile that downstream products can use for onboarding, personalization, and analysis. → [API reference](docs/api-reference.md)
-- ⚡ **A complete chat path** — SSE streaming, image understanding and generation requests, prompt traits, per-task model selection, fallbacks, and call auditing. OpenRouter is the default; additional OpenAI-compatible chat and embedding providers can be configured through `[providers]`. → [API reference](docs/api-reference.md) · [Model config](docs/model-config.md)
+- ⚡ **A complete chat path** — SSE streaming, image understanding and generation requests, prompt traits, per-task model selection, fallbacks, and call auditing. OpenRouter is the default; additional OpenAI-compatible chat and embedding providers can be configured through `[providers]`. → [API reference](docs/api-reference.md) · [Model config](docs/model-config.md) A downstream can also let its end users bring their own chat endpoint and key per turn. → [BYOK](docs/byok.md)
 - 🎙️ **A voice turn path built for interruption** — a lean, low-latency turn endpoint on its own channel, with barge-in: the client stops playback and reports what was actually spoken, so history records what the user *heard* rather than what the model produced. A turn lost to a dropped connection can be regenerated instead of stranded. → [API reference](docs/api-reference.md#post-compvoicesession_idturnstream)
 - 🌍 **A simulated world** — personas have an off-screen life. A scheduled world director evolves a shared relationship graph and daily scripts; a feed lets personas post and comment on one another; per-persona stories keep work, romance, and daily living consistent over time. Fully opt-in and layered behind independent switches — an unconfigured deployment runs zero queries and spawns zero sweepers. → [World system](docs/world-system.md)
 
@@ -90,6 +90,7 @@ Bring your own Postgres and `.env`; the same `docker/Dockerfile` can be deployed
 - [World system](docs/world-system.md) — experimental World Memories, World Town, and World Stories simulations.
 - [Model config](docs/model-config.md) — tasks, selection, fallbacks, and multi-provider routing through `[providers]`.
 - [Prompt traits](docs/prompt-traits.md) — per-request prompt behavior and tier allow-lists.
+- [Bring your own key](docs/byok.md) — let end users run the companion reply on their own chat endpoint and key.
 - [LLM / OpenRouter audit](docs/llm-audit.md) — user and session attribution.
 - [Deploying](docs/deploying.md) — Docker, Postgres, identity, and operations.
 - [API reference](docs/api-reference.md) — routes, request schemas, and SSE frames.

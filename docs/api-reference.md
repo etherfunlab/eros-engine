@@ -564,6 +564,15 @@ recover the same payload afterwards via
 an image turn is recognizable in history by `metadata.image` on the
 assistant row.
 
+**Optional: bring your own key.** The body may include `byok` — an end
+user's own OpenAI-compatible endpoints, model selection, fallback chain,
+`retry_depth`, `output_regex` and `fallback_to_platform` — so this turn's
+reply runs on the end user's account. The engine honours it only when the
+request also carries `X-Byok-Caller-Secret` matching the deployment's
+`BYOK_CALLER_SECRET`; otherwise `403 byok_forbidden`. An invalid block is
+`400 invalid_payload`. Both are refused before any row is written. See
+[byok.md](byok.md).
+
 ### `POST /v2/comp/session/{session_id}/message/async`
 
 Enqueue-only chat turn — the async alternative to the stream endpoint above,
@@ -590,6 +599,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 | Redelivery of an already-processed `client_msg_id` | `200 {"status":"already_completed",...}` |
 | Redelivery of a terminally failed `client_msg_id` | `200 {"status":"failed",...}` — retry with a fresh `client_msg_id` |
 | Per-session pending depth over `CHAT_QUEUE_PENDING_CAP` | `429 rate_limited` |
+| Body carries `byok` | `400 invalid_payload` — BYOK is stream-only |
 | Other pre-stream failures | same `StreamPreError` shape and codes as `message/stream` above |
 
 Queue order is strict per-session LIFO — the newest pending message in a
