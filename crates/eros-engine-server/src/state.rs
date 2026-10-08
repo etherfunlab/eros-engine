@@ -36,6 +36,8 @@ pub struct AppState {
     /// successful enqueue so single sends start generating immediately instead
     /// of waiting out a poll tick (spec §6 Wake-up).
     pub chat_queue_notify: Arc<tokio::sync::Notify>,
+    /// Bring-your-own-key runtime: guarded client and round-robin cursors.
+    pub byok: crate::byok::ByokRuntime,
 }
 
 /// Parse `OPENROUTER_USAGE_HIDDEN_KEYS` into a `HashSet<String>`.
@@ -334,6 +336,53 @@ impl Drop for StreamSlotGuard {
     }
 }
 
+/// Bring-your-own-key settings (spec 2026-10-08-byok-chat §5, §7.2).
+#[derive(Clone, Default)]
+pub struct ByokConfig {
+    /// `BYOK_CALLER_SECRET`. `None` turns the feature off.
+    pub caller_secret: Option<String>,
+    /// `BYOK_ALLOW_PRIVATE_NETWORK`: lifts the address guard and allows
+    /// `http` endpoints, for self-hosted networks and tests.
+    pub allow_private_network: bool,
+}
+
+impl std::fmt::Debug for ByokConfig {
+    /// The secret never reaches a log line through `ServerConfig`'s `{:?}`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ByokConfig")
+            .field(
+                "caller_secret",
+                &self.caller_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .field("allow_private_network", &self.allow_private_network)
+            .finish()
+    }
+}
+
+/// Shortest `BYOK_CALLER_SECRET` the engine boots with.
+pub const MIN_BYOK_CALLER_SECRET_LEN: usize = 32;
+
+/// Parse the two BYOK env vars. A blank secret means off; a short one
+/// refuses boot.
+pub fn parse_byok_config(
+    caller_secret: Option<&str>,
+    allow_private_network: Option<&str>,
+) -> Result<ByokConfig, String> {
+    let caller_secret = match caller_secret.map(str::trim).filter(|s| !s.is_empty()) {
+        None => None,
+        Some(s) if s.len() < MIN_BYOK_CALLER_SECRET_LEN => {
+            return Err(format!(
+                "BYOK_CALLER_SECRET must be at least {MIN_BYOK_CALLER_SECRET_LEN} bytes"
+            ))
+        }
+        Some(s) => Some(s.to_string()),
+    };
+    Ok(ByokConfig {
+        caller_secret,
+        allow_private_network: parse_bool_flag(allow_private_network),
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     /// Affinity 3.0 pipeline knobs (`AFFINITY_*` env vars). Defaults reproduce
@@ -399,6 +448,8 @@ pub struct ServerConfig {
     /// The emoji users may react with (`CHAT_REACTION_EMOJI`); `None` = every
     /// standard emoji. Parsed at boot; an unresolvable entry refuses boot.
     pub reaction_emoji: Option<crate::reaction::ReactionAllowlist>,
+    /// Bring-your-own-key admission and transport settings.
+    pub byok: ByokConfig,
 }
 
 impl ServerConfig {
@@ -478,6 +529,10 @@ impl ServerConfig {
             ),
             reaction_emoji: crate::reaction::ReactionAllowlist::parse(
                 std::env::var("CHAT_REACTION_EMOJI").ok().as_deref(),
+            )?,
+            byok: parse_byok_config(
+                std::env::var("BYOK_CALLER_SECRET").ok().as_deref(),
+                std::env::var("BYOK_ALLOW_PRIVATE_NETWORK").ok().as_deref(),
             )?,
         })
     }
@@ -842,5 +897,30 @@ mod tests {
             !parse_bool_flag(Some("TRUE")),
             "case-sensitive, like the existing flags"
         );
+    }
+
+    #[test]
+    fn byok_config_is_off_without_a_secret() {
+        let cfg = parse_byok_config(None, None).unwrap();
+        assert!(cfg.caller_secret.is_none() && !cfg.allow_private_network);
+        assert!(parse_byok_config(Some("   "), None)
+            .unwrap()
+            .caller_secret
+            .is_none());
+    }
+
+    #[test]
+    fn byok_config_refuses_a_short_secret() {
+        let err = parse_byok_config(Some(&"s".repeat(31)), None).unwrap_err();
+        assert!(err.contains("BYOK_CALLER_SECRET"), "{err}");
+        let ok = parse_byok_config(Some(&"s".repeat(32)), Some("true")).unwrap();
+        assert_eq!(ok.caller_secret.as_deref(), Some("s".repeat(32).as_str()));
+        assert!(ok.allow_private_network);
+    }
+
+    #[test]
+    fn byok_config_debug_hides_the_secret() {
+        let cfg = parse_byok_config(Some("THE-SECRET-VALUE-0123456789-abcdef"), None).unwrap();
+        assert!(!format!("{cfg:?}").contains("THE-SECRET-VALUE"));
     }
 }
