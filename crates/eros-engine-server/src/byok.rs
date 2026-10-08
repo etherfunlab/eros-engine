@@ -332,8 +332,12 @@ pub(crate) fn prepare(
         check_slug("byok.model", s, &req.providers)?;
     }
     if let ByokModel::Weighted(m) = &req.model {
-        if m.values().any(|w| !(w.is_finite() && *w > 0.0)) {
-            return Err("byok.model: weights must be finite and greater than 0".into());
+        if m.values().any(|w| !(w.is_finite() && *w > 0.0)) || !m.values().sum::<f64>().is_finite()
+        {
+            return Err(
+                "byok.model: weights must be finite, greater than 0, and sum to a finite total"
+                    .into(),
+            );
         }
     }
 
@@ -728,6 +732,16 @@ mod tests {
         rejects(set(base(), &["model"], json!(nine)), "byok.model");
         rejects(set(base(), &["model"], json!({"a@mine": 0.0})), "weights");
         rejects(set(base(), &["model"], json!({"a@mine": -1.0})), "weights");
+        rejects(
+            set(
+                base(),
+                &["model"],
+                json!({"a@mine": 1e308, "b@mine": 1e308}),
+            ),
+            "weights",
+        );
+        let ok = try_prepare(set(base(), &["model"], json!({"a@mine": 3, "b@mine": 1}))).unwrap();
+        assert_eq!(ok.select_slugs().len(), 1);
     }
 
     #[test]
