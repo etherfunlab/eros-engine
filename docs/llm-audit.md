@@ -143,6 +143,10 @@ engine, replacing the old `log_openrouter_usage`. It still emits the
 identical `openrouter: call completed` tracing line shown above — the row is
 in addition to that line, not instead of it.
 
+A BYOK hop's row records `model = '<id>@byok'` and the end user's provider's
+own `generation_id`; its `usage` carries no `cost` unless that provider sent
+one.
+
 **Full task vocabulary.** Every `[tasks.*]` key that makes a chat-completion
 call now writes here: `chat_companion`, `chat_voice`, `chat_product_qa`,
 `chat_input_filter`, `chat_output_filter`, `chat_vision`,
@@ -446,7 +450,8 @@ and neither column carries an entry for it.
 
 `task` / `model` / `http_status` / `message` are always present; the other
 four are omitted when absent, never nulled. `model` keeps the full config
-slug including any `@provider` suffix.
+slug including any `@provider` suffix. On a BYOK hop it reads `<id>@byok`
+instead; see [byok.md](byok.md#what-is-recorded).
 
 `http_status` is a raw number, **never an enum**: OpenRouter reports overload
 as `529` while Venice uses `429 MODEL_OVERLOADED` and `503 MODEL_AT_CAPACITY`,

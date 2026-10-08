@@ -21,7 +21,7 @@
 - 💞 **演变的亲密度**——六个关系维度按档位写入、经衰减落库，也会随时间回落，逐渐影响语气、深度，甚至是否回复。→ [亲密度模型](docs/affinity-model.zh.md) · [ghost 机制](docs/ghost-mechanics.zh.md)
 - 🎭 **人设决策引擎（PDE）**——生成回复前，先选择行为与内在状态。默认规则即可运行，也可启用 LLM 评判。→ [模型配置](docs/model-config.zh.md)
 - 🧩 **结构化用户洞察**——持续形成可查询的用户画像，供下游产品用于引导、个性化和分析。→ [API 参考](docs/api-reference.zh.md)
-- ⚡ **完整的聊天链路**——SSE 流式输出、图像理解与生成请求、prompt traits、按任务选模型、故障回退及调用审计。OpenRouter 是默认提供方，也可通过 `[providers]` 接入其他兼容 OpenAI 的聊天和 embedding 服务。→ [API 参考](docs/api-reference.zh.md) · [模型配置](docs/model-config.zh.md)
+- ⚡ **完整的聊天链路**——SSE 流式输出、图像理解与生成请求、prompt traits、按任务选模型、故障回退及调用审计。OpenRouter 是默认提供方，也可通过 `[providers]` 接入其他兼容 OpenAI 的聊天和 embedding 服务。→ [API 参考](docs/api-reference.zh.md) · [模型配置](docs/model-config.zh.md) 下游还可以让终端用户按轮自带聊天端点和密钥。→ [BYOK](docs/byok.zh.md)
 - 🎙️ **为打断而设计的语音回合**——独立通道上的低延迟回合端点，支持 barge-in：客户端停止播放并回报用户实际听到的内容，因此历史记录的是用户**听到**的，而不是模型生成的。因掉线而丢失的回合可以重新生成，不会卡死。→ [API 参考](docs/api-reference.zh.md#post-compvoicesession_idturnstream)
 - 🌍 **模拟世界**——人设拥有台面下的生活。定时的「世界导演」演进共享关系图谱与每日剧本；信息流让人设彼此发帖、互相评论；每个人设的故事线让工作、感情与日常保持长期一致。完全可选，且由多个独立开关分层控制——没有配置的部署不会跑任何查询，也不会启动任何扫描任务。→ [世界系统](docs/world-system.zh.md)
 
@@ -90,6 +90,7 @@ docker run --rm -p 8080:8080 --env-file .env \
 - [世界系统](docs/world-system.zh.md)——实验性的 World Memories、World Town 与 World Stories 模拟。
 - [模型配置](docs/model-config.zh.md)——任务、模型选择、故障回退及通过 `[providers]` 实现的多提供方路由。
 - [Prompt traits](docs/prompt-traits.zh.md)——按请求调整 prompt 行为及 tier 白名单。
+- [自带密钥](docs/byok.zh.md)——让终端用户用自己的聊天端点和密钥生成伴侣回复。
 - [LLM / OpenRouter 审计](docs/llm-audit.zh.md)——用户与会话归因。
 - [部署](docs/deploying.zh.md)——Docker、Postgres、身份认证和运维。
 - [API 参考](docs/api-reference.zh.md)——路由、请求结构和 SSE 帧。
