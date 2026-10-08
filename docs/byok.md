@@ -60,8 +60,15 @@ greetings, voice turns and image edits do not take one.
 | `model` | string \| array \| map | yes | Fixed, round-robin, or weighted random — the shapes of `[tasks.*].model`. |
 | `fallback` | string \| array | no | Sequential fallback chain. |
 | `retry_depth` | integer | no | Fallbacks tried after the primary. Default `2`. |
-| `output_regex` | array | no | Strip rules for this chain's replies; `models` omitted ⇒ every model on the chain. |
+| `output_regex` | array | no | Strip rules for this chain's replies, each `{ pattern, replacement?, models? }`. |
 | `fallback_to_platform` | bool | no | Default `false`. |
+
+An `output_regex` rule replaces every match of `pattern` with `replacement`
+(default empty), which is literal text. A rule can never lengthen a reply:
+`replacement` may not contain `$`, and it may be no longer in bytes than the
+shortest text `pattern` can match, so a pattern that can match the empty
+string takes only an empty replacement. `models` lists bare model ids —
+`gpt-x`, never `gpt-x@mine`; omitted ⇒ every model on the BYOK chain.
 
 Every slug in `model` and `fallback` must end in `@<name>` naming one of
 `providers`. A bare slug, an `@openrouter` suffix, or a name from the
@@ -84,7 +91,8 @@ a header value or a URL.
 | `api_key` | 1–1024 bytes of valid header text |
 | `headers` | ≤ 8 entries, values ≤ 1024 bytes; `Authorization` and `Content-Type` refused |
 | `model`, `fallback` | ≤ 8 entries each; weights finite and > 0, with a finite sum |
-| `output_regex` | ≤ 16 rules; pattern 1–512 chars; replacement ≤ 512 chars; compiled under a 1 MiB size limit |
+| every slug | ends in `@<name>` naming one of `providers`; ≤ 256 bytes |
+| `output_regex` | ≤ 16 rules; `pattern` 1–512 chars; `replacement` ≤ 512 chars, no `$`, and no longer in bytes than the shortest text `pattern` can match; `models` ≤ 8 entries, each ≤ 256 bytes; compiled under a 1 MiB size limit and a 1 MiB DFA size limit |
 
 ## How the chain runs
 
@@ -121,17 +129,32 @@ the connection goes to an address that passed. A refused host fails its hop
 as a `transport` gateway error. `BYOK_ALLOW_PRIVATE_NETWORK` lifts all of
 this.
 
+The engine also bounds how much it reads from an end user's endpoint:
+
+- a non-2xx response body is read up to 64 KiB;
+- a streamed reply body larger than `max(1 MiB, max_tokens × 1 KiB)` fails
+  its hop as a `transport` gateway error, and the chain advances.
+
+Time limits are those of every chat hop; `BYOK_ALLOW_PRIVATE_NETWORK` does
+not lift the byte limits.
+
 ## What is recorded
 
 - BYOK hops are recorded as `<id>@byok` in `engine.llm_generations.model`,
-  `llm_attempts[].model` and `gateway_errors[].model`, and in the prompt log.
-  The provider name the end user chose is not recorded. `byok` is a reserved
-  `[providers]` name, so the label always means a BYOK hop.
+  `llm_attempts[].model` and `gateway_errors[].model`, in the prompt log and
+  in log lines. The provider name the end user chose is not recorded. `byok`
+  is a reserved `[providers]` name, so the label always means a BYOK hop.
+- A BYOK hop's `engine.llm_generations.generation_id` is minted by the
+  engine as `byok-<32 hex digits>`; the provider's own id is not kept.
+- `usage` is stored as the provider sent it, `cost` included. That cost is
+  the end user's spend, so a deployment's spend query over
+  `engine.llm_generations` excludes `model LIKE '%@byok'`.
 - That a turn asked for BYOK is recorded once, on its queue row:
   `engine.chat_turn_queue.params->'byok'` = `{"fallback_to_platform": …}`.
 - URLs, keys and header values are never recorded: not in tables, queue
-  params, logs or the prompt log. A provider error that echoes the key is
-  stored with the key replaced by `<redacted>`.
+  params, logs or the prompt log. A provider error that echoes the key, a
+  header value, the URL or a value from its query string is stored with
+  each replaced by `<redacted>`.
 
 If a deploy interrupts a BYOK turn, the worker that recovers it no longer has
 the block: it fails the turn (`last_error = 'byok_unavailable'`), or, with

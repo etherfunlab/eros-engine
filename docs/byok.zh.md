@@ -49,8 +49,10 @@
 | `model` | string \| array \| map | 是 | 固定、轮询或加权随机——与 `[tasks.*].model` 的形式相同。 |
 | `fallback` | string \| array | 否 | 顺序 fallback 链。 |
 | `retry_depth` | integer | 否 | primary 之后尝试的 fallback 数。默认 `2`。 |
-| `output_regex` | array | 否 | 本链路回复的剥除规则；省略 `models` ⇒ 作用于链上所有模型。 |
+| `output_regex` | array | 否 | 本链路回复的剥除规则，每条为 `{ pattern, replacement?, models? }`。 |
 | `fallback_to_platform` | bool | 否 | 默认 `false`。 |
+
+一条 `output_regex` 规则把 `pattern` 的每处匹配替换为 `replacement`（默认为空），`replacement` 是字面文本。规则永远不会让回复变长：`replacement` 不得含 `$`，字节长度也不得超过 `pattern` 能匹配到的最短文本，因此能匹配空串的 pattern 只接受空的 replacement。`models` 列的是裸模型 id——写 `gpt-x`，不写 `gpt-x@mine`；省略 ⇒ 作用于 BYOK 链上的所有模型。
 
 `model` 和 `fallback` 里的每个 slug 都必须以 `@<name>` 结尾，且 `<name>` 是 `providers` 中的一个。裸 slug、`@openrouter` 后缀，或部署 `[providers]` 里的名字，一律拒绝，因此 BYOK 轮次永远不会花部署的 key。`allow_traits`、显示覆盖、`temperature`、`max_tokens`、采样参数、`output_filter` 和 body 参数不接受出现在该块里；它们仍然来自 `[tasks.chat_companion]` 和请求的 `tier`。
 
@@ -65,7 +67,8 @@
 | `api_key` | 1–1024 字节的合法 header 文本 |
 | `headers` | ≤ 8 项，值 ≤ 1024 字节；拒绝 `Authorization` 和 `Content-Type` |
 | `model`、`fallback` | 各 ≤ 8 项；权重为有限数且 > 0，总和也为有限数 |
-| `output_regex` | ≤ 16 条规则；pattern 1–512 字符；replacement ≤ 512 字符；编译时受 1 MiB 体积限制 |
+| 每个 slug | 以 `@<name>` 结尾且 `<name>` 是 `providers` 中的一个；≤ 256 字节 |
+| `output_regex` | ≤ 16 条规则；`pattern` 1–512 字符；`replacement` ≤ 512 字符、不含 `$`，且字节长度不超过 `pattern` 能匹配到的最短文本；`models` ≤ 8 项，每项 ≤ 256 字节；编译时受 1 MiB 体积限制和 1 MiB DFA 体积限制 |
 
 ## 链路如何运行
 
@@ -81,11 +84,20 @@
 
 BYOK 请求通过专用客户端发出：不跟随重定向，不使用代理，只允许 https。先解析主机名；loopback、私有、link-local、CGNAT、unique-local、未指定和多播地址（包括 IPv4-mapped 和 NAT64 形式）一律拒绝，连接只会发往通过检查的地址。被拒绝的主机会让该 hop 以 `transport` 网关错误失败。`BYOK_ALLOW_PRIVATE_NETWORK` 会解除以上全部限制。
 
+引擎还限制从终端用户端点读取的数据量：
+
+- 非 2xx 的响应体最多读取 64 KiB；
+- 流式回复体超过 `max(1 MiB, max_tokens × 1 KiB)` 时，该 hop 以 `transport` 网关错误失败，链路继续往下走。
+
+时间限制与所有聊天 hop 相同；`BYOK_ALLOW_PRIVATE_NETWORK` 不解除字节限制。
+
 ## 记录什么
 
-- BYOK hop 在 `engine.llm_generations.model`、`llm_attempts[].model`、`gateway_errors[].model` 以及 prompt log 里记为 `<id>@byok`。终端用户选的 provider 名称不会被记录。`byok` 是保留的 `[providers]` 名称，因此这个标签永远表示 BYOK hop。
+- BYOK hop 在 `engine.llm_generations.model`、`llm_attempts[].model`、`gateway_errors[].model`、prompt log 以及日志行里记为 `<id>@byok`。终端用户选的 provider 名称不会被记录。`byok` 是保留的 `[providers]` 名称，因此这个标签永远表示 BYOK hop。
+- BYOK hop 的 `engine.llm_generations.generation_id` 由引擎生成，形如 `byok-<32 位十六进制>`；不保留 provider 自己的 id。
+- `usage` 按 provider 发来的原样存储，包括 `cost`。这笔花费属于终端用户，因此部署在 `engine.llm_generations` 上统计花费时要排除 `model LIKE '%@byok'`。
 - 某一轮请求过 BYOK 这件事只在它的队列行上记录一次：`engine.chat_turn_queue.params->'byok'` = `{"fallback_to_platform": …}`。
-- URL、key 和 header 值从不记录：不进表、不进队列 params、不进日志、不进 prompt log。回显了 key 的 provider 错误，存储时 key 会被替换为 `<redacted>`。
+- URL、key 和 header 值从不记录：不进表、不进队列 params、不进日志、不进 prompt log。provider 错误里回显的 key、header 值、URL 或 URL 查询串里的值，存储时都会被替换为 `<redacted>`。
 
 如果一次部署打断了某个 BYOK 轮次，接手恢复的 worker 已经没有该块：它会让这一轮失败（`last_error = 'byok_unavailable'`），或者在设了 `fallback_to_platform` 时，用部署自己的链路来回答。
 
