@@ -188,8 +188,10 @@ counts hops consumed across the whole list.
 
 - `fallback_to_platform = false`: when every BYOK hop fails, the turn ends in
   an `Error` frame carrying the last hop's `upstream_status` and
-  `provider_code`, and the stream turn goes terminal. The downstream can tell
-  the end user that their key or endpoint failed.
+  `provider_code`, and the turn is not retried. The downstream can tell the
+  end user that their key or endpoint failed. Each failed hop has persisted a
+  truncated bubble, so the queue row settles `done`, as for any live chain
+  whose hops all failed.
 - `fallback_to_platform = true`: the walk continues into the platform hops,
   and an exhausted platform half ends as any platform chain does.
 
@@ -411,15 +413,17 @@ the queue before rolling back avoids that.
     `{"fallback_to_platform": false}`; a BYOK regex rule strips; with a
     display override configured, `meta.model` is the bare id;
   - BYOK chain fails, no fallback: `Error` frame with the mock's status, and
-    no pseudo-ghost although the test database seeds fallback phrases;
-    terminal failure;
+    no pseudo-ghost although the test database seeds fallback phrases; the
+    turn is not retried;
   - BYOK chain fails, `fallback_to_platform`: the OpenRouter mock serves; the
     configured display override and config rules apply on that hop;
   - 403 without the header; 400 on the async route;
   - recovery: a claimed BYOK turn released by the reaper goes `failed` with
     `byok_unavailable` (no fallback), or is served by the platform chain
     (fallback);
-  - **no credential at rest:** after the turns above, every `chat_messages`,
+  - **no credential at rest:** after a served BYOK turn and after a failing
+    one (a 401 that echoes the key, then a hop whose URL carries a secret in
+    its query and cannot connect), every `chat_messages`,
     `chat_turn_queue` and `llm_generations` row of the test session, rendered
     to text, contains neither the key nor the URL;
   - guard on: a provider at `https://localhost:<port>/…` fails its hop as a
