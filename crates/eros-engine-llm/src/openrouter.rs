@@ -14,9 +14,9 @@ use crate::error::LlmError;
 const BASE_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 
 /// Max TCP+TLS establishment time for any OpenRouter call.
-const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// How long an idle pooled connection is kept for reuse.
-const POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+pub(crate) const POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 /// Max gap between SSE *bytes* before a live stream is declared dead.
 const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
