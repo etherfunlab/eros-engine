@@ -115,8 +115,8 @@ a key, a header value or a URL.
 | `headers` | ≤ 8 entries; valid header names and values, each value ≤ 1024 bytes; `Authorization` and `Content-Type` refused, case-insensitive (the `[providers]` header validator, reused) |
 | `model` | non-empty; array and map ≤ 8 entries; map weights finite and > 0 |
 | `fallback` | ≤ 8 entries, none empty |
-| every slug | parses, and its suffix names a key of `providers` |
-| `output_regex` | ≤ 16 rules; `pattern` 1–512 chars; `replacement` ≤ 512 chars; compiles under a 1 MiB size limit and a 1 MiB DFA size limit |
+| every slug | parses, its suffix names a key of `providers`, and it is at most 256 bytes |
+| `output_regex` | ≤ 16 rules; `pattern` 1–512 chars; `replacement` ≤ 512 chars, contains no `$`, and is no longer in bytes than the shortest text `pattern` can match, so no rule lengthens a reply; `models` ≤ 8 entries, each ≤ 256 bytes; compiles under a 1 MiB size limit and a 1 MiB DFA size limit |
 
 An empty `model` is an error here, unlike in TOML, where it falls through to
 the next precedence level: a BYOK chain has nothing to fall through to.
@@ -276,6 +276,18 @@ fails that hop as a `transport` gateway error, and the chain advances.
 `BYOK_ALLOW_PRIVATE_NETWORK` (truthy) disables the guard and allows `http`,
 for self-hosted deployments pointing BYOK at a model on their own network.
 
+### 7.3 Response limits
+
+An end user's endpoint is untrusted, so the BYOK client bounds what it reads,
+not only how long it waits:
+
+- a non-2xx body is read up to 64 KiB;
+- a streamed body larger than `max(1 MiB, max_tokens × 1 KiB)` fails the hop
+  as a `transport` gateway error, and the chain advances. The bound also caps
+  the accumulated reply, the regex scrubber's held text and the persisted row.
+
+Time bounds are those of every chat hop.
+
 ## 8. Audit and secret hygiene
 
 ### 8.1 What is recorded
@@ -286,8 +298,14 @@ request. `byok` is a reserved `[providers]` name — a config entry so named
 refuses boot — so the label identifies a BYOK hop unambiguously.
 
 - `engine.llm_generations.model` — written by `record_generation` with the
-  hop's slug — reads `<id>@byok`; `generation_id` is the provider's own id,
-  and `usage` carries no `cost` unless the provider sent one.
+  hop's slug — reads `<id>@byok`.
+- `generation_id` is minted by the engine as `byok-<128-bit random hex>`,
+  never taken from the provider: it is the primary key of
+  `engine.llm_generations`, and a provider-chosen id could collide with
+  another session's row.
+- `usage` is stored as the provider sent it, `cost` included. That cost is
+  the end user's spend, so a deployment's spend query over
+  `engine.llm_generations` excludes `model LIKE '%@byok'`.
 - `llm_attempts[].model` and `gateway_errors[].model` read `<id>@byok`.
 - The prompt log (`PROMPT_LOG_DIR`) prints the chain the turn walks, BYOK
   hops as `<id>@byok`.
@@ -300,7 +318,7 @@ That a turn asked for BYOK is recorded once, on its queue row:
 ### 8.2 What is never recorded
 
 URLs, keys and header values, anywhere: table rows, `chat_turn_queue.params`
-and `last_error`, tracing, the prompt log, panic messages. Three spots need
+and `last_error`, tracing, the prompt log, panic messages. These spots need
 code:
 
 - `ProviderEndpoint`'s `Debug` prints `base_url`. It now prints
@@ -310,9 +328,13 @@ code:
   BYOK hop is passed through `without_url()` before it becomes an `LlmError`,
   so the `gateway_errors` message, the warn line and `last_error` cannot
   carry it.
-- A provider may echo the key in an error body. On a BYOK hop every verbatim
-  occurrence of the hop's `api_key` in `llm_attempts[].message` is replaced
-  with `<redacted>`.
+- A provider may echo a credential in error text. On a BYOK hop every
+  verbatim occurrence of the hop's `api_key`, of each of its header values,
+  of its URL, and of each value in the URL's query string is replaced with
+  `<redacted>` — in the raw error body, in the parsed message, and in the
+  bytes of a malformed stream frame that reach a log line.
+- Log lines name a BYOK hop by its `<id>@byok` label, never by the slug the
+  end user wrote.
 
 ## 9. Queue and recovery
 
@@ -473,3 +495,10 @@ the queue before rolling back avoids that.
 - **An in-process round-robin cursor per user**, matching config round-robin,
   over a per-session count: the session's message count moves by two per
   turn, so it cannot drive a two-model rotation.
+- **BYOK strip rules cannot lengthen a reply** (no `$`, replacement no longer
+  than the shortest match), over a cap on output size: rules run in sequence
+  on each other's output, so a growing rule compounds.
+- **The engine mints a BYOK hop's `generation_id`**, over keeping the
+  provider's: the column is a primary key shared by every session.
+- **The BYOK client bounds bytes read**, not only time: an end user's endpoint
+  is untrusted input to a shared process.
