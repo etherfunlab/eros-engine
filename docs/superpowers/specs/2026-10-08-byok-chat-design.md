@@ -157,7 +157,7 @@ cursor's sequence and nothing else.
 The BYOK primary is selected from `byok.model`:
 
 - **Fixed:** the one slug.
-- **Round-robin:** `AppState.byok_rr` is a
+- **Round-robin:** `AppState.byok` holds a
   `Mutex<HashMap<Uuid, Arc<AtomicUsize>>>` keyed by `user_id`. The DTO is
   turned into a `ModelSpec::RoundRobin` whose `cursor` is that user's entry,
   so `ModelSpec::select` runs unchanged. Same semantics as config
@@ -209,6 +209,10 @@ model.
 | `output_regex` | the BYOK rules | `state.output_regex` |
 | `meta.model` | the hop slug's bare id, always | `model_name_display_override`, as today |
 
+Replay follows the same rule: a replayed reply whose generation model carries
+the `@byok` label shows its bare id, so an idempotent retry is wire-identical
+to the live turn.
+
 BYOK rules compile once per turn into `CompiledRegexRule`s. A rule without
 `models` gets the bare ids of every BYOK hop, so `apply_output_regex` and
 `StreamScrubber` run unchanged. Execution order, the `pre_filter_content` /
@@ -238,14 +242,15 @@ A per-turn `OpenRouterClient` built from the validated `providers`:
 - its `providers` map holds one `ProviderEndpoint` per BYOK provider, with an
   empty `body_rules`;
 - its built-in endpoint has an empty key, so a bare slug cannot post;
-- it posts through `AppState.byok_http` (§7.2);
+- it posts through the guarded client held in `AppState.byok` (§7.2);
 - every model string it records for audit is `<id>@byok` (§8.1).
 
 The client is dropped with the turn.
 
 ### 7.2 Address guard
 
-`byok_http` is one `reqwest::Client` built at boot:
+The guarded client is one `reqwest::Client` built at boot and held in
+`AppState.byok` with the per-user round-robin cursors:
 
 - redirects disabled;
 - `no_proxy()` — a proxy would resolve the host itself and bypass the guard;
@@ -275,7 +280,8 @@ for self-hosted deployments pointing BYOK at a model on their own network.
 
 Every model string recorded for a BYOK hop is `<id>@byok`. The provider
 name the end user chose is not recorded; it means nothing outside one
-request.
+request. `byok` is a reserved `[providers]` name — a config entry so named
+refuses boot — so the label identifies a BYOK hop unambiguously.
 
 - `engine.llm_generations.model` — written by `record_generation` with the
   hop's slug — reads `<id>@byok`; `generation_id` is the provider's own id,
