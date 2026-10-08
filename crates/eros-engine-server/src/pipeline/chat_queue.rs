@@ -18,7 +18,7 @@ use uuid::Uuid;
 use eros_engine_store::chat::ChatRepo;
 use eros_engine_store::chat_queue::{ChatQueueRepo, ClaimedTurn};
 
-use crate::pipeline::stream::{run_stream, PersistedUserMessage, ProtocolFrame};
+use crate::pipeline::stream::{run_stream_with, PersistedUserMessage, ProtocolFrame};
 use crate::routes::companion_async::QueuedTurnParams;
 use crate::routes::companion_stream::AffinityScopeDto;
 use crate::state::AppState;
@@ -213,8 +213,9 @@ pub(crate) async fn drive_to_exhaustion(
     user_msg: PersistedUserMessage,
     persona: Option<eros_engine_core::persona::CompanionPersona>,
     tap: Option<tokio::sync::mpsc::UnboundedSender<ProtocolFrame>>,
+    byok: Option<Arc<crate::byok::ByokTurn>>,
 ) -> TurnOutcome {
-    let stream = run_stream(state, user_msg, persona);
+    let stream = run_stream_with(state, user_msg, persona, byok);
     futures_util::pin_mut!(stream);
     let mut done_frames = 0usize;
     let mut last_error: Option<String> = None;
@@ -342,7 +343,7 @@ async fn drive_turn(
         action: params.action.as_ref().and_then(|a| a.to_core().ok()),
     };
 
-    drive_to_exhaustion(Arc::new(state.clone()), user_msg, None, tap).await
+    drive_to_exhaustion(Arc::new(state.clone()), user_msg, None, tap, None).await
 }
 
 #[cfg(test)]

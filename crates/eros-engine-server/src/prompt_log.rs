@@ -27,8 +27,11 @@ struct PromptLogSnapshot {
 
 /// Build a snapshot from a borrowed request. `ts` is injected so the pure
 /// core stays deterministic for tests; `spawn_write` passes `Utc::now()`.
+/// `chain` is the reply chain as recorded (audit names), so a BYOK turn logs
+/// `<id>@byok`.
 fn snapshot(
     req: &ChatRequest,
+    chain: &[String],
     session_id: Uuid,
     user_message_id: Uuid,
     ts: DateTime<Utc>,
@@ -38,8 +41,8 @@ fn snapshot(
         session_id,
         user_message_id,
         task: "reply",
-        model: req.model.clone(),
-        fallback_model: req.fallback_model.clone(),
+        model: chain.first().cloned().unwrap_or_default(),
+        fallback_model: chain.iter().skip(1).cloned().collect(),
         temperature: req.temperature,
         sampling: req.sampling,
         max_tokens: req.max_tokens,
@@ -114,10 +117,11 @@ fn write_file(dir: &Path, snap: &PromptLogSnapshot) -> std::io::Result<()> {
 pub(crate) fn spawn_write(
     dir: std::path::PathBuf,
     req: &ChatRequest,
+    chain: &[String],
     session_id: Uuid,
     user_message_id: Uuid,
 ) {
-    let snap = snapshot(req, session_id, user_message_id, Utc::now());
+    let snap = snapshot(req, chain, session_id, user_message_id, Utc::now());
     tokio::task::spawn_blocking(move || {
         if let Err(e) = write_file(&dir, &snap) {
             tracing::warn!(error = %e, dir = %dir.display(), "prompt_log: write failed");
@@ -190,5 +194,20 @@ mod tests {
         let contents = std::fs::read_to_string(&path).expect("read back");
         assert_eq!(contents, render(&snap));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn snapshot_prints_the_chain_it_is_given() {
+        let req = ChatRequest {
+            model: "platform/x".into(),
+            ..Default::default()
+        };
+        let chain = vec!["gpt-x@byok".to_string(), "platform/x".to_string()];
+        let snap = snapshot(&req, &chain, Uuid::nil(), Uuid::nil(), Utc::now());
+        let out = render(&snap);
+        assert!(
+            out.contains("# model:    gpt-x@byok   fallbacks: platform/x"),
+            "{out}"
+        );
     }
 }

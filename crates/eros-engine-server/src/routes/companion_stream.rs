@@ -862,6 +862,7 @@ pub async fn send_message_stream(
                             user_msg,
                             Some(persona),
                             Some(tx),
+                            None,
                         ),
                     )
                     .await
