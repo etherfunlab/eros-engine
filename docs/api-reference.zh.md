@@ -553,7 +553,8 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
   （每次 `reply_image`）、`1` 必说（每次 `reply_text_image`），中间由引擎掷骰
   —— 骰子在这里顶替 PDE，本端点从不请判官定 action。文本半边是一次真实的
   companion 模型回复，由落库的指令行驱动（带历史、记忆召回与关系上下文），
-  和图片落在同一条 assistant 行里，与聊天路径同形。文本调用失败或回了空文本
+  和图片落在同一条 assistant 行里，与聊天路径同形，落库前过一遍与聊天回复相同的
+  `output_regex`（见 [model-config.zh.md](model-config.zh.md)）。文本调用失败或回了空文本
   就降级成 `reply_image` —— 图才是这一轮的主体 —— 失败证据留在该行的
   失败列里。
 - `tier` / `prompt_traits` —— 给文本半边用，语义与聊天路径完全一致：`tier` 选

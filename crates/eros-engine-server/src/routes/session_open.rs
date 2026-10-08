@@ -878,6 +878,43 @@ mod tests {
         assert_eq!(out.greeting.expect("a greeting").content, "中秋快乐");
     }
 
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_greeting_after_a_garbled_hop_takes_the_serving_hops_rules(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = session_with_history(
+            &pool,
+            user_id,
+            mid_autumn_morning() - chrono::Duration::days(2),
+        )
+        .await;
+        let mock = MockServer::start().await;
+        // A garbled completion advances the chain without recording a failure,
+        // and the backup reports the primary's id: only the hop `execute`
+        // served says whose rules apply.
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_partial_json(json!({"model": "companion"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": {"content": "Hi\u{0120}there\u{010A}bye"}}],
+            })))
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_partial_json(json!({"model": "backup"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "gen-backup",
+                "model": "companion",
+                "choices": [{"message": {"content": "中秋快乐 [note: a marker]"}}],
+            })))
+            .mount(&mock)
+            .await;
+        let state = with_note_rule(test_state(pool.clone()), &mock.uri(), "backup");
+
+        let out = open_at(&state, session_id, user_id, taipei(), mid_autumn_morning())
+            .await
+            .unwrap();
+        assert_eq!(out.greeting.expect("a greeting").content, "中秋快乐");
+    }
+
     fn opener(occasion: OpenOccasion, key: &str) -> OpenSessionRequest {
         OpenSessionRequest {
             occasion: Some(occasion),

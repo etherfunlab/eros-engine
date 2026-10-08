@@ -438,9 +438,18 @@ async fn generate_reply_text(
             )
             .await;
             let (llm_attempts, gateway_errors) = split_failures(&resp.failures);
+            // Layer 0, as on every served chat reply: keyed by the served
+            // hop's bare id, before the blank check.
+            let stripped = eros_engine_llm::model_config::apply_output_regex(
+                &state.output_regex,
+                &eros_engine_llm::provider::bare_model_id(
+                    resp.served_hop.as_deref().unwrap_or_default(),
+                ),
+                &resp.reply,
+            );
             // An empty text half is an image-only reply, not silence — same
             // rule as the chat path's reply_text_image contract.
-            let trimmed = resp.reply.trim();
+            let trimmed = stripped.cleaned.trim();
             let reply = (!trimmed.is_empty()).then(|| trimmed.to_string());
             TextOutcome {
                 reply,
@@ -1908,16 +1917,40 @@ mod tests {
     /// Companion mock keyed on the seeded genome's system prompt — disjoint
     /// from the editor's `[修改要求]` and the judge's `当前档位`.
     async fn mount_companion(mock: &MockServer) {
+        mount_companion_saying(mock, "新造型来啦，你看看喜欢吗").await;
+    }
+
+    async fn mount_companion_saying(mock: &MockServer, content: &str) {
         use wiremock::matchers::body_string_contains;
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("you are a companion"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": "gen-chat",
                 "model": "served/companion",
-                "choices": [{"message": {"content": "新造型来啦，你看看喜欢吗"}}],
+                "choices": [{"message": {"content": content}}],
             })))
             .mount(mock)
             .await;
+    }
+
+    /// `FULL_TURN_TOML` plus one `output_regex` rule on the companion hop that
+    /// deletes `[note: …]`.
+    fn with_note_rule(state: AppState, mock_uri: &str) -> AppState {
+        let toml = format!(
+            r#"{FULL_TURN_TOML}
+[[tasks.chat_companion.output_regex]]
+models = ["companion"]
+pattern = '\s*\[note:[^\]]*\]'
+"#
+        );
+        let mut state = with_composer(state, mock_uri, &toml);
+        state.output_regex = Arc::new(
+            state
+                .model_config
+                .compile_output_regex()
+                .expect("rule compiles"),
+        );
+        state
     }
 
     /// Companion mock that always fails, for the degrade path.
@@ -2029,6 +2062,74 @@ mod tests {
         );
     }
 
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_text_half_goes_through_output_regex(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let (_, mid) = seed_image_turn(&pool, session_id).await;
+
+        let mock = MockServer::start().await;
+        mount_editor_and_judge(&mock).await;
+        mount_companion_saying(&mock, "新造型来啦 [note: a marker]").await;
+        let mut app = build_router(with_note_rule(test_state(pool.clone()), &mock.uri()));
+        let token = mint_test_jwt(user_id);
+
+        let (status, body) = send_request(
+            &mut app,
+            edit_req(
+                session_id,
+                mid,
+                &token,
+                json!({"instruction": "换套衣服", "persist_instruction": true,
+                       "reply_with_text": 1.0}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["action_type"], json!("reply_text_image"));
+        assert_eq!(body["reply_text"], json!("新造型来啦"));
+        let new_id = Uuid::parse_str(body["message_id"].as_str().unwrap()).unwrap();
+        let content: String =
+            sqlx::query_scalar("SELECT content FROM engine.chat_messages WHERE id = $1")
+                .bind(new_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(content, "新造型来啦");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_text_half_the_rules_empty_degrades_to_reply_image(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let (_, mid) = seed_image_turn(&pool, session_id).await;
+
+        let mock = MockServer::start().await;
+        mount_editor_and_judge(&mock).await;
+        mount_companion_saying(&mock, "[note: nothing else]").await;
+        let mut app = build_router(with_note_rule(test_state(pool.clone()), &mock.uri()));
+        let token = mint_test_jwt(user_id);
+
+        let (status, body) = send_request(
+            &mut app,
+            edit_req(
+                session_id,
+                mid,
+                &token,
+                json!({"instruction": "换套衣服", "persist_instruction": true,
+                       "reply_with_text": 1.0}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["action_type"], json!("reply_image"));
+        assert!(body.get("reply_text").is_none(), "got {body}");
+    }
+
     /// The locale shapes the rolled text half's prompt and is recorded on its
     /// row next to `tier` (spec 2026-09-26 §4.1).
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -2046,13 +2147,16 @@ mod tests {
         let mut app = build_router(state);
         let token = mint_test_jwt(user_id);
 
-        let taipei_today = || {
+        // The clock line's date and hour in Los Angeles. The clock's last
+        // fallback, Asia/Singapore, never shares that hour, so a locale that
+        // never reached the prompt cannot pass.
+        let la_stamp = || {
             chrono::Utc::now()
-                .with_timezone(&chrono_tz::Asia::Taipei)
-                .format("%Y-%m-%d")
+                .with_timezone(&chrono_tz::America::Los_Angeles)
+                .format("%Y-%m-%d %H")
                 .to_string()
         };
-        let before = taipei_today();
+        let before = la_stamp();
         let (status, body) = send_request(
             &mut app,
             edit_req(
@@ -2060,12 +2164,12 @@ mod tests {
                 mid,
                 &token,
                 json!({"instruction": "换套衣服", "persist_instruction": true,
-                       "reply_with_text": 1.0, "user_timezone": "Asia/Taipei",
-                       "user_country": "TW"}),
+                       "reply_with_text": 1.0, "user_timezone": "America/Los_Angeles",
+                       "user_country": "US"}),
             ),
         )
         .await;
-        let after = taipei_today();
+        let after = la_stamp();
         assert_eq!(status, StatusCode::OK, "body={body}");
 
         let new_id = Uuid::parse_str(body["message_id"].as_str().unwrap()).unwrap();
@@ -2075,23 +2179,31 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(metadata["user_timezone"], json!("Asia/Taipei"));
-        assert_eq!(metadata["user_country"], json!("TW"));
+        assert_eq!(metadata["user_timezone"], json!("America/Los_Angeles"));
+        assert_eq!(metadata["user_country"], json!("US"));
         assert!(metadata.get("user_region").is_none());
 
-        // The seeded genome has no timezone ⇒ the persona clock is Taipei's.
-        let companion_body = mock
+        // The seeded genome has no timezone ⇒ the persona clock is the user's.
+        let companion_body: serde_json::Value = mock
             .received_requests()
             .await
             .unwrap()
             .into_iter()
-            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
-            .find(|b| b.contains("you are a companion"))
+            .map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).unwrap())
+            .find(|b| b.to_string().contains("you are a companion"))
             .expect("a companion call");
+        let system = companion_body["messages"][0]["content"].as_str().unwrap();
+        // "现在你当地时间是 2026-09-29（周二）07:15，…" → "2026-09-29 07".
+        let clock = system
+            .split("现在你当地时间是 ")
+            .nth(1)
+            .expect("the persona clock line");
+        let (date, rest) = clock.split_once('（').unwrap();
+        let hour = &rest.split_once('）').unwrap().1[..2];
+        let seen = format!("{date} {hour}");
         assert!(
-            companion_body.contains(&format!("现在你当地时间是 {before}"))
-                || companion_body.contains(&format!("现在你当地时间是 {after}")),
-            "{companion_body}"
+            seen == before || seen == after,
+            "{seen} vs {before}/{after}"
         );
     }
 
