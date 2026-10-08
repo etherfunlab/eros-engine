@@ -368,8 +368,14 @@ pub struct ChatResponse {
     pub reply: String,
     /// OpenRouter response `id` — opaque generation handle.
     pub generation_id: Option<String>,
-    /// Model actually served (may differ from request when fallback hit).
+    /// Model actually served, as the provider reported it (may differ from
+    /// request when fallback hit).
     pub model: Option<String>,
+    /// The chain entry that served, exactly as configured (`req.model` or one
+    /// of `req.fallback_model`, `@provider` suffix included). `model` cannot
+    /// stand in for it: a provider may report any id, including another hop's.
+    #[serde(default)]
+    pub served_hop: Option<String>,
     /// OpenRouter `usage` block — tokens / cost. Opaque to engine;
     /// caller deserialises as needed.
     pub usage: Option<serde_json::Value>,
@@ -868,6 +874,7 @@ impl OpenRouterClient {
             return Ok(ChatResponse {
                 reply: clean_response(crate::byte_bpe::repair_byte_bpe(&raw).trim()),
                 generation_id: None,
+                served_hop: Some(model.clone()),
                 model: Some(model),
                 usage: None,
                 // Preserve the upstream finish_reason (e.g. "content_filter") so
@@ -1010,6 +1017,7 @@ impl OpenRouterClient {
                 reply: clean_response(raw.trim()),
                 generation_id: parsed.id,
                 model: model_out,
+                served_hop: Some(model.to_string()),
                 usage: parsed.usage,
                 finish_reason,
                 failures,
@@ -1027,6 +1035,7 @@ impl OpenRouterClient {
             return Ok(ChatResponse {
                 reply: clean_response(crate::byte_bpe::repair_byte_bpe(&raw).trim()),
                 generation_id: None,
+                served_hop: Some(model.clone()),
                 model: Some(model),
                 usage: None,
                 // Preserve the upstream finish_reason (e.g. "content_filter") so
@@ -1156,6 +1165,7 @@ impl OpenRouterClient {
             reply: clean_response(raw.trim()),
             generation_id: parsed.id,
             model: model_out,
+            served_hop: Some(model.to_string()),
             usage: parsed.usage,
             finish_reason,
             failures: Vec::new(),
@@ -3530,6 +3540,56 @@ data: [DONE]\n\n";
         assert_eq!(resp.reply, "Hi there\nbye");
         // The repaired text comes from the FIRST (garbled) candidate "p".
         assert_eq!(resp.model.as_deref(), Some("p"));
+        assert_eq!(resp.served_hop.as_deref(), Some("p"));
+    }
+
+    #[tokio::test]
+    async fn execute_names_the_served_hop_by_its_configured_slug() {
+        let server = MockServer::start().await;
+        // The garbled primary records no failure, and the fallback reports the
+        // primary's id: neither the failure count nor the reported model can
+        // say which hop served.
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "p"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(garbled_content()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "f1"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "p",
+                "choices": [{ "message": { "content": "hi there" } }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let resp = client
+            .execute(ChatRequest {
+                model: "p".into(),
+                fallback_model: vec!["f1".into()],
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .expect("fallback serves");
+        assert!(resp.failures.is_empty());
+        assert_eq!(resp.model.as_deref(), Some("p"));
+        assert_eq!(resp.served_hop.as_deref(), Some("f1"));
     }
 
     #[tokio::test]
@@ -3670,6 +3730,7 @@ data: [DONE]\n\n";
             "no generation_id when repaired"
         );
         assert_eq!(resp.model.as_deref(), Some("vp"));
+        assert_eq!(resp.served_hop.as_deref(), Some("vp"));
     }
 
     #[tokio::test]
@@ -3721,6 +3782,7 @@ data: [DONE]\n\n";
             .expect("fallback should recover");
 
         assert_eq!(resp.reply, "{\"description\":\"a cat\"}");
+        assert_eq!(resp.served_hop.as_deref(), Some("vision-fallback/m"));
         assert_eq!(resp.failures.len(), 1, "the 502 hop must be reported");
         match &resp.failures[0] {
             crate::failure::AttemptFailure::Upstream(a) => {

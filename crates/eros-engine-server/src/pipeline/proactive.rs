@@ -16,7 +16,7 @@ use eros_engine_core::types::{
 };
 use eros_engine_llm::failure::AttemptFailure;
 use eros_engine_llm::model_config::apply_output_regex;
-use eros_engine_llm::openrouter::{ChatMessage as WireMessage, ChatResponse};
+use eros_engine_llm::openrouter::ChatMessage as WireMessage;
 use eros_engine_llm::provider::bare_model_id;
 use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::{ChatMessage, ChatRepo, ProactiveInsert};
@@ -170,11 +170,6 @@ pub(crate) async fn greet(
     });
 
     let model_for_audit = chat_req.model.clone();
-    // `execute`'s candidate list, kept to find the hop that served.
-    let chain: Vec<String> = std::iter::once(chat_req.model.clone())
-        .chain(chat_req.fallback_model.iter().cloned())
-        .filter(|m| !m.is_empty())
-        .collect();
     let resp = match state.openrouter.execute(chat_req).await {
         Ok(r) => r,
         Err(e) => {
@@ -203,10 +198,11 @@ pub(crate) async fn greet(
         },
     )
     .await;
-    // Layer 0, as on every served stream reply. A reply the rules empty is blank.
+    // Layer 0, as on every served stream reply: keyed by the served hop's bare
+    // id. A reply the rules empty is blank.
     let stripped = apply_output_regex(
         &state.output_regex,
-        &served_model_key(&chain, &resp),
+        &bare_model_id(resp.served_hop.as_deref().unwrap_or_default()),
         &resp.reply,
     );
     let content = stripped.cleaned.trim();
@@ -283,45 +279,5 @@ pub(crate) async fn greet(
                 None => Ok(chat_repo.open_message(g.session_id, open_key).await?),
             }
         }
-    }
-}
-
-/// Bare id of the chain hop that served `resp`: the key `output_regex` rules
-/// are written under, as on the stream path. `execute` does not say which hop
-/// served. A reported model that is one of the chain's ids names it; otherwise
-/// the served hop is the one after the recorded failures.
-fn served_model_key(chain: &[String], resp: &ChatResponse) -> String {
-    match resp.model.as_deref().map(bare_model_id) {
-        Some(id) if chain.iter().any(|m| bare_model_id(m) == id) => id,
-        _ => chain
-            .get(resp.failures.len())
-            .map(|m| bare_model_id(m))
-            .unwrap_or_default(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_served_hop_keys_output_regex() {
-        let chain = vec!["companion".to_string(), "backup@venice".to_string()];
-        let reported = |model: &str| ChatResponse {
-            model: Some(model.into()),
-            ..Default::default()
-        };
-        // A provider reporting an id of its own: the hop after the recorded
-        // failures (none here) served.
-        assert_eq!(
-            served_model_key(&chain, &reported("served/companion")),
-            "companion"
-        );
-        // A reported id that is one of the chain's names its hop, e.g. a
-        // repaired garble, which records no failure for the hops before it.
-        assert_eq!(
-            served_model_key(&chain, &reported("backup@venice")),
-            "backup"
-        );
     }
 }

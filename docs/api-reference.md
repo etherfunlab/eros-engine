@@ -655,7 +655,8 @@ consumer draws it, exactly as for a chat image turn.
   this endpoint never consults. The text half is a real companion-model reply
   driven by the persisted instruction row (history, memory recall and
   relationship context included) and lands in the same assistant row as the
-  picture, chat-shaped. A failed or blank text half degrades the turn to
+  picture, chat-shaped, after the same `output_regex` strip as a chat reply
+  (see [model-config.md](model-config.md)). A failed or blank text half degrades the turn to
   `reply_image` — the picture is the turn's substance — and the row's failure
   columns keep the evidence.
 - `tier` / `prompt_traits` — the text half's, with the chat path's meaning

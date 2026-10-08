@@ -189,8 +189,22 @@ const IN_LIEU: &[&str] = &[
     "day off",                 // "Additional day off by Presidential decree" (UZ)
 ];
 
-fn is_in_lieu(name: &str) -> bool {
+/// In-lieu days whose label does not say so. The same text names a real
+/// holiday elsewhere, so each matches whole and only in its own country.
+const IN_LIEU_BY_COUNTRY: &[(CountryCode, &str)] = &[
+    (CountryCode::JP, "National Holiday"), // 国民の休日: the day between two holidays
+    (CountryCode::CL, "National Holiday"), // bridge days next to Fiestas Patrias / New Year
+    (CountryCode::KR, "Temporary Public Holiday"), // 임시공휴일, declared bridge days
+    (CountryCode::MH, "Christmas Day Holiday"), // MH "X Holiday": X moved off a weekend
+    (CountryCode::MH, "New Year's Day Holiday"),
+    (CountryCode::MH, "President's Day Holiday"),
+];
+
+fn is_in_lieu(country: Option<CountryCode>, name: &str) -> bool {
     IN_LIEU.iter().any(|label| name.contains(label))
+        || IN_LIEU_BY_COUNTRY
+            .iter()
+            .any(|&(c, label)| country == Some(c) && name == label)
 }
 
 fn is_political(name: &str) -> bool {
@@ -226,7 +240,7 @@ pub fn holidays_on(
             // python-holidays joins same-date holidays with "; ".
             for part in entry
                 .split("; ")
-                .filter(|p| !is_in_lieu(p) && !is_political(p))
+                .filter(|p| !is_in_lieu(country, p) && !is_political(p))
             {
                 push(&mut names, part);
             }
@@ -429,6 +443,25 @@ mod tests {
                 "Additional day off by Presidential decree",
             ),
             ("KH", d(2020, 8, 18), "Khmer New Year's Replacement Holiday"),
+        ] {
+            assert_eq!(
+                holidays_on(date, cc(code), None),
+                none,
+                "{code} {date}: {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn in_lieu_days_whose_label_does_not_say_so_are_dropped_per_country() {
+        let none: Vec<String> = Vec::new();
+        for (code, date, label) in [
+            ("JP", d(2026, 9, 22), "National Holiday"),
+            ("CL", d(2024, 9, 20), "National Holiday"),
+            ("KR", d(2025, 1, 27), "Temporary Public Holiday"),
+            ("MH", d(2022, 12, 26), "Christmas Day Holiday"),
+            ("MH", d(2023, 1, 2), "New Year's Day Holiday"),
+            ("MH", d(2024, 11, 18), "President's Day Holiday"),
         ] {
             assert_eq!(
                 holidays_on(date, cc(code), None),
