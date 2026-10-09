@@ -1215,9 +1215,9 @@ impl<'a> ChatRepo<'a> {
         Ok(())
     }
 
-    /// Persist a holiday greeting. `None` when a greeting for the same local
-    /// date already exists OR a message other than a holiday greeting landed
-    /// in the session at or after `since` — the atomic counterpart of the
+    /// Persist a dated greeting (holiday or birthday). `None` when a greeting
+    /// for the same local date already exists OR a message other than a dated
+    /// greeting landed in the session at or after `since` — the atomic counterpart of the
     /// route's own `has_message_since` pre-check, closing the race where a
     /// user message lands while the greeting is still generating. Bumps
     /// `last_active_at` only when a row landed.
@@ -1238,7 +1238,8 @@ impl<'a> ChatRepo<'a> {
 
     /// Persist a caller-named opener. `None` when this session already holds
     /// an opener under the row's `metadata.open_key`, OR a message other than
-    /// a holiday greeting landed in the session at or after `since` — the
+    /// a dated greeting (holiday or birthday) landed in the session at or
+    /// after `since` — the
     /// request's start, so a user who spoke while the opener was generating
     /// wins. Bumps `last_active_at` only when a row landed.
     pub async fn insert_open_message(
@@ -1275,7 +1276,7 @@ impl<'a> ChatRepo<'a> {
                  SELECT 1 FROM engine.chat_messages \
                  WHERE session_id = $2 AND sent_at >= $8 \
                    AND (assistant_action_type IS DISTINCT FROM 'proactive' \
-                        OR metadata->>'proactive' IS DISTINCT FROM 'holiday') \
+                        OR COALESCE(metadata->>'proactive', '') NOT IN ('holiday', 'birthday')) \
              ) \
              ON CONFLICT {conflict_key} \
                WHERE assistant_action_type = 'proactive' DO NOTHING \
@@ -1352,11 +1353,11 @@ impl<'a> ChatRepo<'a> {
         .await
     }
 
-    /// Whether any row other than a holiday greeting landed in this session
-    /// at or after `since`. Holiday greetings are excluded so one written for
-    /// a different user-local date (e.g. the user's timezone changed between
-    /// opens) never blocks today's. An opener counts: the persona already
-    /// spoke.
+    /// Whether any row other than a dated greeting (holiday or birthday)
+    /// landed in this session at or after `since`. Dated greetings are
+    /// excluded so one written for a different local date (e.g. the user's
+    /// timezone changed between opens) never blocks today's. An opener
+    /// counts: the persona already spoke.
     pub async fn has_message_since(
         &self,
         session_id: Uuid,
@@ -1366,7 +1367,7 @@ impl<'a> ChatRepo<'a> {
             "SELECT EXISTS (SELECT 1 FROM engine.chat_messages \
                             WHERE session_id = $1 AND sent_at >= $2 \
                               AND (assistant_action_type IS DISTINCT FROM 'proactive' \
-                                   OR metadata->>'proactive' IS DISTINCT FROM 'holiday'))",
+                                   OR COALESCE(metadata->>'proactive', '') NOT IN ('holiday', 'birthday')))",
         )
         .bind(session_id)
         .bind(since)
@@ -5206,6 +5207,31 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_birthday_greeting_is_exempt_like_a_holiday_greeting(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = throwaway_session(&pool).await;
+        let since = Utc::now() - chrono::Duration::seconds(1);
+        let mut row = proactive_row("2026-09-25", "今天是我生日");
+        row.metadata = serde_json::json!({ "proactive": "birthday", "local_date": "2026-09-25" });
+        repo.insert_proactive_message(s.id, since, &row)
+            .await
+            .unwrap()
+            .expect("the birthday greeting lands");
+
+        assert!(
+            !repo.has_message_since(s.id, since).await.unwrap(),
+            "a birthday greeting is not someone speaking"
+        );
+        assert!(
+            repo.insert_open_message(s.id, since, &opener_row("visit-1", "来啦"))
+                .await
+                .unwrap()
+                .is_some(),
+            "a birthday greeting does not block an opener"
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]

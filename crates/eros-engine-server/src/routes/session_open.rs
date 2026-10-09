@@ -1,28 +1,33 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! POST /v2/comp/session/{session_id}/open — the client reports that the user
-//! just entered a session. On a user-local holiday nobody has spoken on yet,
-//! or on an occasion the client names, the persona speaks first.
+//! just entered a session. On the persona's birthday or a user-local holiday
+//! nobody has spoken on yet, or on an occasion the client names, the persona
+//! speaks first.
 //!
 //! Specs: docs/superpowers/specs/2026-09-26-user-locale-and-holiday-greeting-design.md §4.2,
-//! docs/superpowers/specs/2026-10-03-open-occasions-design.md §3–§4
+//! docs/superpowers/specs/2026-10-03-open-occasions-design.md §3–§4,
+//! docs/superpowers/specs/2026-10-10-persona-origin-and-birthday-design.md §5
 
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use axum::Json;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
+use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
+use eros_engine_core::persona::CompanionPersona;
 use eros_engine_core::scope::MemoryScope;
 use eros_engine_store::chat::{ChatMessage, ChatRepo};
 
 use crate::auth::middleware::AuthUser;
+use crate::birthday::Birthday;
 use crate::error::{AppError, StreamPreError};
 use crate::holiday::{self, UserLocale};
 use crate::pipeline::handlers::recall_query_text;
 use crate::pipeline::proactive::{greet, Greeting, Occasion};
-use crate::prompt::NowContext;
+use crate::prompt::{meta_str, persona_clock_tz, NowContext};
 use crate::routes::companion::{
     validate_llm_audit, validate_prompt_traits, LlmAuditDto, PromptTraitDto,
 };
@@ -38,7 +43,8 @@ const MAX_OPEN_KEY_CHARS: usize = 128;
 #[derive(Debug, Default, Deserialize, utoipa::ToSchema)]
 pub struct OpenSessionRequest {
     /// The user's IANA timezone. Without a valid one there is no user-local
-    /// date and the holiday greeting is `null`.
+    /// date and no holiday greeting. It is also the persona clock's fallback
+    /// when the persona has no timezone of its own.
     #[serde(default)]
     pub user_timezone: Option<String>,
     /// ISO 3166-1 alpha-2 country — same rules as the chat body.
@@ -61,7 +67,8 @@ pub struct OpenSessionRequest {
     #[serde(default)]
     pub audit: Option<LlmAuditDto>,
     /// Ask the persona to speak first for this reason. Absent: the engine
-    /// decides, and speaks first only on a user-local holiday.
+    /// decides, and speaks first only on the persona's birthday or a
+    /// user-local holiday.
     #[serde(default)]
     pub occasion: Option<OpenOccasion>,
     /// The caller's idempotency key for `occasion`, scoped to the session:
@@ -103,6 +110,7 @@ pub struct GreetingDto {
 #[serde(rename_all = "snake_case")]
 pub enum GreetingOccasion {
     Holiday,
+    Birthday,
     FirstMeet,
     Returning,
     JustOpened,
@@ -129,14 +137,14 @@ impl From<ChatMessage> for GreetingDto {
 
 /// Tell the engine the user just entered this session.
 ///
-/// Without `occasion` the engine decides: when it is a holiday in the user's
-/// timezone and nobody has spoken in the session since the user's local
-/// midnight, the persona speaks first. With `occasion` the caller decides,
-/// and the persona speaks first when the occasion is true of the session.
-/// Either way one assistant message is generated, persisted (unread, like any
-/// reply) and returned; otherwise `greeting` is `null`. Idempotent per
-/// session and user-local date for the holiday, per session and `open_key`
-/// for an occasion.
+/// Without `occasion` the engine decides: on the persona's birthday (persona
+/// clock), or else a holiday in the user's timezone, when nobody has spoken
+/// in the session since that local midnight, the persona speaks first. With
+/// `occasion` the caller decides, and the persona speaks first when the
+/// occasion is true of the session. Either way one assistant message is
+/// generated, persisted (unread, like any reply) and returned; otherwise
+/// `greeting` is `null`. Idempotent per session and local date for a
+/// birthday or holiday, per session and `open_key` for an occasion.
 #[utoipa::path(
     post,
     path = "/v2/comp/session/{session_id}/open",
@@ -243,7 +251,7 @@ pub(crate) async fn open_at(
     );
     let chat_repo = ChatRepo { pool: &state.pool };
     let next = match opener {
-        None => holiday_occasion(&chat_repo, session_id, locale, now).await?,
+        None => engine_occasion(&chat_repo, session_id, &persona, locale, now).await?,
         Some((occasion, open_key)) => {
             caller_occasion(&chat_repo, session_id, occasion, open_key, now).await?
         }
@@ -298,15 +306,35 @@ pub(crate) async fn open_at(
     })
 }
 
-/// The engine's own call: speak first on a user-local holiday nobody has
-/// spoken on yet. A caller-named opener since local midnight counts as
-/// having spoken.
-async fn holiday_occasion(
+/// The engine's own call: speak first on the persona's birthday (persona
+/// clock), else on a user-local holiday, when nobody has spoken since that
+/// local midnight. A caller-named opener since then counts as having spoken.
+async fn engine_occasion(
     chat_repo: &ChatRepo<'_>,
     session_id: Uuid,
+    persona: &CompanionPersona,
     locale: UserLocale,
     now: DateTime<Utc>,
 ) -> Result<Next, AppError> {
+    let persona_tz = persona_clock_tz(meta_str(persona, "timezone"), locale.timezone);
+    let persona_date = now.with_timezone(&persona_tz).date_naive();
+    if meta_str(persona, "birthday")
+        .and_then(Birthday::parse)
+        .is_some_and(|b| b.falls_on(persona_date))
+    {
+        return dated_occasion(
+            chat_repo,
+            session_id,
+            persona_tz,
+            persona_date,
+            Occasion::Birthday {
+                local_date: persona_date,
+            },
+            "生日".into(),
+        )
+        .await;
+    }
+
     let (Some(tz), Some(local_date)) = (locale.timezone, locale.local_date(now)) else {
         return Ok(answer(None));
     };
@@ -314,6 +342,31 @@ async fn holiday_occasion(
     if holidays.is_empty() {
         return Ok(answer(None));
     }
+    let recall_query = holidays.join("、");
+    dated_occasion(
+        chat_repo,
+        session_id,
+        tz,
+        local_date,
+        Occasion::Holiday {
+            local_date,
+            holidays,
+        },
+        recall_query,
+    )
+    .await
+}
+
+/// A dated engine greeting: the row already written for `local_date`, `null`
+/// when anyone spoke since that local midnight, else speak.
+async fn dated_occasion(
+    chat_repo: &ChatRepo<'_>,
+    session_id: Uuid,
+    tz: Tz,
+    local_date: NaiveDate,
+    occasion: Occasion,
+    recall_query: String,
+) -> Result<Next, AppError> {
     let since = holiday::local_midnight_utc(tz, local_date);
     let date = local_date.to_string();
     if let Some(row) = chat_repo.proactive_greeting_on(session_id, &date).await? {
@@ -328,11 +381,8 @@ async fn holiday_occasion(
         ));
     }
     Ok(Next::Speak {
-        recall_query: holidays.join("、"),
-        occasion: Occasion::Holiday {
-            local_date,
-            holidays,
-        },
+        occasion,
+        recall_query,
         since,
     })
 }
@@ -1321,6 +1371,235 @@ mod tests {
         .unwrap()
         .greeting
         .expect("an opener under a new key");
+        assert_eq!(g.occasion, GreetingOccasion::JustOpened);
+        assert_eq!(proactive_rows(&pool, session_id).await, 2);
+    }
+
+    /// Replace the session's genome `art_metadata`.
+    async fn set_art(pool: &PgPool, session_id: Uuid, art: serde_json::Value) {
+        sqlx::query(
+            "UPDATE engine.persona_genomes SET art_metadata = $2 WHERE id = ( \
+               SELECT pi.genome_id FROM engine.chat_sessions s \
+               JOIN engine.persona_instances pi ON pi.id = s.instance_id \
+               WHERE s.id = $1)",
+        )
+        .bind(session_id)
+        .bind(art)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Born 09-25 on Taipei's clock — the day `mid_autumn_morning` falls on there.
+    fn taipei_birthday() -> serde_json::Value {
+        json!({ "timezone": "Asia/Taipei", "birthday": "09-25" })
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn greets_on_the_personas_birthday_without_a_user_timezone(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = session_with_history(
+            &pool,
+            user_id,
+            mid_autumn_morning() - chrono::Duration::days(2),
+        )
+        .await;
+        set_art(&pool, session_id, taipei_birthday()).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "今天是我生日哦").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+
+        let g = open_at(
+            &state,
+            session_id,
+            user_id,
+            OpenSessionRequest::default(),
+            mid_autumn_morning(),
+        )
+        .await
+        .unwrap()
+        .greeting
+        .expect("a birthday greeting");
+        assert_eq!(g.occasion, GreetingOccasion::Birthday);
+        let meta = row_metadata(&pool, g.message_id).await;
+        assert_eq!(meta["proactive"], json!("birthday"));
+        assert_eq!(meta["local_date"], json!("2026-09-25"));
+
+        let calls = companion_calls(&mock).await;
+        assert_eq!(calls.len(), 1);
+        let messages = calls[0]["messages"].as_array().unwrap();
+        let system = messages[0]["content"].as_str().unwrap();
+        assert!(system.contains("今天是你的生日。"), "{system}");
+        assert_eq!(
+            messages.last().unwrap()["content"],
+            json!(crate::pipeline::proactive::OPEN_CUE)
+        );
+
+        let again = open_at(
+            &state,
+            session_id,
+            user_id,
+            OpenSessionRequest::default(),
+            mid_autumn_morning() + chrono::Duration::hours(1),
+        )
+        .await
+        .unwrap()
+        .greeting
+        .expect("the same greeting");
+        assert_eq!(again.message_id, g.message_id);
+        assert_eq!(companion_calls(&mock).await.len(), 1);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_birthday_outranks_a_holiday_on_the_same_day(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = session_with_history(
+            &pool,
+            user_id,
+            mid_autumn_morning() - chrono::Duration::days(2),
+        )
+        .await;
+        set_art(&pool, session_id, taipei_birthday()).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "今天也是我生日").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+
+        let g = open_at(&state, session_id, user_id, taipei(), mid_autumn_morning())
+            .await
+            .unwrap()
+            .greeting
+            .expect("a greeting");
+        assert_eq!(g.occasion, GreetingOccasion::Birthday);
+        assert_eq!(proactive_rows(&pool, session_id).await, 1);
+    }
+
+    /// A Los Angeles user. `OpenSessionRequest` is not `Clone`, so build anew.
+    fn la() -> OpenSessionRequest {
+        OpenSessionRequest {
+            user_timezone: Some("America/Los_Angeles".into()),
+            user_country: Some("US".into()),
+            ..Default::default()
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_birthday_is_dated_on_the_persona_clock(pool: PgPool) {
+        // Taipei is on 09-25; Los Angeles is still on 09-24, which has no
+        // holiday for a US user.
+        let user_id = Uuid::new_v4();
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "生日快乐给自己").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let past = mid_autumn_morning() - chrono::Duration::days(2);
+
+        let taipei_persona = session_with_history(&pool, user_id, past).await;
+        set_art(&pool, taipei_persona, taipei_birthday()).await;
+        let g = open_at(&state, taipei_persona, user_id, la(), mid_autumn_morning())
+            .await
+            .unwrap()
+            .greeting
+            .expect("the persona's own clock says today");
+        assert_eq!(g.occasion, GreetingOccasion::Birthday);
+
+        for art in [
+            json!({ "birthday": "09-25" }),
+            json!({ "timezone": "Not/AZone", "birthday": "09-25" }),
+        ] {
+            let s = session_with_history(&pool, user_id, past).await;
+            set_art(&pool, s, art.clone()).await;
+            let out = open_at(&state, s, user_id, la(), mid_autumn_morning())
+                .await
+                .unwrap();
+            assert!(out.greeting.is_none(), "user clock says 09-24: {art}");
+        }
+        assert_eq!(companion_calls(&mock).await.len(), 1);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn only_a_message_since_the_personas_midnight_blocks_the_birthday(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "今天是我生日").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+
+        let spoke_today = session_with_history(
+            &pool,
+            user_id,
+            taipei_midnight() + chrono::Duration::hours(1),
+        )
+        .await;
+        set_art(&pool, spoke_today, taipei_birthday()).await;
+        let out = open_at(
+            &state,
+            spoke_today,
+            user_id,
+            OpenSessionRequest::default(),
+            mid_autumn_morning(),
+        )
+        .await
+        .unwrap();
+        assert!(out.greeting.is_none());
+        assert!(companion_calls(&mock).await.is_empty());
+
+        let spoke_last_night = session_with_history(
+            &pool,
+            user_id,
+            taipei_midnight() - chrono::Duration::minutes(1),
+        )
+        .await;
+        set_art(&pool, spoke_last_night, taipei_birthday()).await;
+        let g = open_at(
+            &state,
+            spoke_last_night,
+            user_id,
+            OpenSessionRequest::default(),
+            mid_autumn_morning(),
+        )
+        .await
+        .unwrap()
+        .greeting
+        .expect("yesterday's message does not block");
+        assert_eq!(g.occasion, GreetingOccasion::Birthday);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_caller_occasion_on_the_birthday_keeps_its_own_occasion(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = session_with_history(
+            &pool,
+            user_id,
+            mid_autumn_morning() - chrono::Duration::days(2),
+        )
+        .await;
+        set_art(&pool, session_id, taipei_birthday()).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "在干嘛呢").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+
+        open_at(
+            &state,
+            session_id,
+            user_id,
+            OpenSessionRequest::default(),
+            mid_autumn_morning(),
+        )
+        .await
+        .unwrap()
+        .greeting
+        .expect("the birthday greeting");
+        // A `now` before the greeting's own sent_at: the greeting sits inside
+        // this request's cutoff, so only the birthday exemption lets it pass.
+        let g = open_at(
+            &state,
+            session_id,
+            user_id,
+            opener(OpenOccasion::JustOpened, "visit-1"),
+            mid_autumn_morning() + chrono::Duration::hours(1),
+        )
+        .await
+        .unwrap()
+        .greeting
+        .expect("an opener");
         assert_eq!(g.occasion, GreetingOccasion::JustOpened);
         assert_eq!(proactive_rows(&pool, session_id).await, 2);
     }

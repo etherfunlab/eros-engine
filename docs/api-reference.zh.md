@@ -316,6 +316,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 - `user_timezone` — IANA 时区（`Asia/Taipei`）。prompt 中 `[now]` 的时钟先取角色自己的
   `art_metadata.timezone`，没有再取它，都没有才用 `Asia/Singapore`。它也决定用户那边的节日行：
   用户当地今天和之后六天的节日（`对方那边今天是平安夜；明天是Christmas Day。`），只陈述事实。
+  角色的生日行（`3 天后是你的生日。`）也按同一个角色时钟计日。
 - `user_country` — ISO 3166-1 alpha-2（`TW`），客户端拿到什么就传什么。缺省时由
   `user_timezone` 推出；不认识就没有法定假日。
 - `user_region` — 去掉国家前缀的 ISO 3166-2 行政区（`CA`、`ENG`），只在 `user_country`
@@ -632,8 +633,11 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 
 ### `POST /v2/comp/session/{session_id}/open`
 
-告诉 engine 用户刚进入会话。角色先开口有两种来由：
+告诉 engine 用户刚进入会话。角色先开口有三种来由：
 
+- **角色生日，engine 自己判断。** 不带 `occasion` 时，如果角色的 `art_metadata.birthday`（`"MM-DD"`）
+  按角色时钟是今天，并且那个当地零点以来这个会话里还没有人说过话，角色就先开口。角色时钟先取
+  `art_metadata.timezone`，再取 `user_timezone`，都没有就用 `Asia/Singapore`。生日和节日同一天时以生日为准。
 - **节日，engine 自己判断。** 不带 `occasion` 时，如果用户所在时区的今天是节日（来源同聊天请求体的节日行，只看当天），
   并且用户当地零点以来这个会话里还没有人说过话，角色就先开口。今天早些时候由 `occasion` 触发过的开口算作说过话。
 - **场合，由调用方决定。** 带 `occasion` 时，只要这个场合对当前会话属实，角色就先开口。
@@ -653,7 +657,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 
 所有字段都可选。三个所在地字段的规则与聊天请求体相同；`tier`、`prompt_traits`、`memory_scope`、
 `affinity_scope`、`audit` 对这条消息的作用与对聊天回复相同。engine 不会在两次调用之间记住这些值（消息那一行会记一份审计副本），请传与聊天一轮相同的值。
-不带 `occasion` 又没有合法的 `user_timezone` 时直接返回 `null`。
+节日需要合法的 `user_timezone`，生日不需要。不带 `occasion`、当天既不是生日也不是节日时返回 `null`。
 
 | `occasion` | 角色先开口的前提 | engine 告诉角色的事实 |
 |---|---|---|
@@ -669,11 +673,11 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 { "greeting": { "message_id": "01J…", "content": "好久不见，最近忙什么呢", "sent_at": "…", "occasion": "returning" } }
 ```
 
-响应里的 `occasion` 取值为 `holiday`、`first_meet`、`returning` 或 `just_opened`。
+响应里的 `occasion` 取值为 `birthday`、`holiday`、`first_meet`、`returning` 或 `just_opened`。
 
 - **同步：** 一次非流式生成，需要几秒，不要阻塞 UI。
-- **幂等：** 节日开场白按会话加用户当地日期，场合按会话加 `open_key`。写入过之后，重复调用返回那一条，不会再生成；返回 `null` 的调用什么都没写，同一个 key 再调仍可能生成。
-- **竞态时用户优先：** 场合消息生成期间会话里只要落了节日开场白以外的消息，就不写入，返回 `null`；如果落的是同一个 key 的并发调用写的开场白，就返回那一条。
+- **幂等：** 生日和节日开场白按会话加当地日期（生日用角色那边的日期，节日用用户那边的日期），场合按会话加 `open_key`。写入过之后，重复调用返回那一条，不会再生成；返回 `null` 的调用什么都没写，同一个 key 再调仍可能生成。
+- **竞态时用户优先：** 场合消息生成期间会话里只要落了生日、节日开场白以外的消息，就不写入，返回 `null`；如果落的是同一个 key 的并发调用写的开场白，就返回那一条。
 - **与普通回复一样落库：** 这条消息是一条普通的 assistant 行（`assistant_action_type = 'proactive'`，
   没有 `user_message_id`），在调用 `POST /comp/chat/{session_id}/read` 之前都是未读。
   Realtime 和两个 history 路由都能看到。
@@ -1528,7 +1532,7 @@ session 403）。
 - `crates/eros-engine-server/src/routes/companion.rs`——对话生命周期 / 画像 handler
 - `crates/eros-engine-server/src/routes/companion_stream.rs`——流式对话轮（`message/stream`），含打赏 + `image_url` 处理
 - `crates/eros-engine-server/src/routes/companion_async.rs`——只入队的对话轮（`v2/comp/session/{session_id}/message/async`）
-- `crates/eros-engine-server/src/routes/session_open.rs`——角色先开口：节日开场白与调用方指定的场合（`v2/comp/session/{session_id}/open`）
+- `crates/eros-engine-server/src/routes/session_open.rs`——角色先开口：生日、节日开场白与调用方指定的场合（`v2/comp/session/{session_id}/open`）
 - `crates/eros-engine-server/src/routes/reaction.rs`——消息 reaction：设置、撤销与允许列表（`v2/comp/session/{session_id}/message/{message_id}/reaction`、`v2/comp/reactions`）
 - `crates/eros-engine-server/src/routes/insight.rs`——按关系分开的 v2 画像端点（`v2/comp/instance/{instance_id}/insight/character`、`.../insight/user`）
 - `crates/eros-engine-server/src/pipeline/chat_queue.rs`——异步对话轮队列 worker

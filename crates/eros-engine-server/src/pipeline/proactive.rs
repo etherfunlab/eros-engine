@@ -37,12 +37,17 @@ pub(crate) const OPEN_CUE: &str = "（对方刚打开和你的聊天，还没说
 const FIRST_MEET_CUE: &str = "（你们还没聊过。对方刚打开和你的聊天，还没说话。）";
 const RETURNING_SAME_DAY_CUE: &str = "（对方隔了不到一天又打开和你的聊天，还没说话。）";
 
-/// Why the persona speaks first. The holiday is the engine's own call; the
-/// other occasions are named by the caller and carry its idempotency key.
+/// Why the persona speaks first. The holiday and the birthday are the
+/// engine's own call; the other occasions are named by the caller and carry
+/// its idempotency key.
 pub(crate) enum Occasion {
     Holiday {
         local_date: NaiveDate,
         holidays: Vec<String>,
+    },
+    /// The persona's birthday on the persona clock (spec 2026-10-10 §5).
+    Birthday {
+        local_date: NaiveDate,
     },
     FirstMeet {
         open_key: String,
@@ -62,6 +67,7 @@ impl Occasion {
     fn name(&self) -> &'static str {
         match self {
             Self::Holiday { .. } => "holiday",
+            Self::Birthday { .. } => "birthday",
             Self::FirstMeet { .. } => "first_meet",
             Self::Returning { .. } => "returning",
             Self::JustOpened { .. } => "just_opened",
@@ -71,7 +77,9 @@ impl Occasion {
     /// The stage cue: states a fact, carries no instruction.
     fn cue(&self) -> String {
         match self {
-            Self::Holiday { .. } | Self::JustOpened { .. } => OPEN_CUE.into(),
+            Self::Holiday { .. } | Self::Birthday { .. } | Self::JustOpened { .. } => {
+                OPEN_CUE.into()
+            }
             Self::FirstMeet { .. } => FIRST_MEET_CUE.into(),
             Self::Returning { gap_days: 0, .. } => RETURNING_SAME_DAY_CUE.into(),
             Self::Returning { gap_days, .. } => {
@@ -90,11 +98,13 @@ pub(crate) struct Greeting<'a> {
     pub persona: &'a CompanionPersona,
     pub now: &'a NowContext,
     pub occasion: Occasion,
-    /// The memory-recall query: the holiday names, or the latest user row.
+    /// The memory-recall query: the holiday names, `生日` for a birthday, or
+    /// the latest user row.
     pub recall_query: String,
     /// The cutoff `greet`'s insert re-checks atomically: no message other
-    /// than a holiday greeting may have landed at or after it. The user's
-    /// local midnight for a holiday; the request's start for an opener.
+    /// than a dated greeting may have landed at or after it. The local
+    /// midnight for a holiday (user clock) or a birthday (persona clock); the
+    /// request's start for an opener.
     pub since: DateTime<Utc>,
     pub tier: Option<String>,
     pub prompt_traits: Vec<PromptTrait>,
@@ -226,6 +236,9 @@ pub(crate) async fn greet(
             metadata.insert("local_date".into(), local_date.to_string().into());
             metadata.insert("holidays".into(), serde_json::json!(holidays));
         }
+        Occasion::Birthday { local_date } => {
+            metadata.insert("local_date".into(), local_date.to_string().into());
+        }
         Occasion::Returning { open_key, gap_days } => {
             metadata.insert("open_key".into(), open_key.as_str().into());
             metadata.insert("gap_days".into(), (*gap_days).into());
@@ -257,17 +270,15 @@ pub(crate) async fn greet(
         gateway_errors,
     };
     match &g.occasion {
-        Occasion::Holiday { local_date, .. } => {
-            match chat_repo
-                .insert_proactive_message(g.session_id, g.since, &row)
-                .await?
-            {
-                Some(written) => Ok(Some(written)),
-                None => Ok(chat_repo
-                    .proactive_greeting_on(g.session_id, &local_date.to_string())
-                    .await?),
-            }
-        }
+        Occasion::Holiday { local_date, .. } | Occasion::Birthday { local_date } => match chat_repo
+            .insert_proactive_message(g.session_id, g.since, &row)
+            .await?
+        {
+            Some(written) => Ok(Some(written)),
+            None => Ok(chat_repo
+                .proactive_greeting_on(g.session_id, &local_date.to_string())
+                .await?),
+        },
         Occasion::FirstMeet { open_key }
         | Occasion::Returning { open_key, .. }
         | Occasion::JustOpened { open_key } => {
