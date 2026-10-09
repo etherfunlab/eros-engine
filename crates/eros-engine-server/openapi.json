@@ -3110,6 +3110,7 @@
         "description": "Why the persona spoke first.",
         "enum": [
           "holiday",
+          "birthday",
           "first_meet",
           "returning",
           "just_opened"
@@ -3496,7 +3497,7 @@
               },
               {
                 "$ref": "#/components/schemas/OpenOccasion",
-                "description": "Ask the persona to speak first for this reason. Absent: the engine\ndecides, and speaks first only on a user-local holiday."
+                "description": "Ask the persona to speak first for this reason. Absent: the engine\ndecides, and speaks first only on the persona's birthday or a\nuser-local holiday."
               }
             ]
           },
@@ -3542,7 +3543,7 @@
               "string",
               "null"
             ],
-            "description": "The user's IANA timezone. Without a valid one there is no user-local\ndate and the holiday greeting is `null`."
+            "description": "The user's IANA timezone. Without a valid one there is no user-local\ndate and no holiday greeting. It is also the persona clock's fallback\nwhen the persona has no timezone of its own."
           }
         }
       },
