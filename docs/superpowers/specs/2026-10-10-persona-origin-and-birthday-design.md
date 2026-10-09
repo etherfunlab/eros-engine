@@ -38,15 +38,15 @@ implementation.
    `appearance`, …) already lives there; `persona_genomes` has been chat-only
    since migration 0024 and stays that way. No migration.
 2. **The engine validates nothing.** As with every existing key, a missing or
-   malformed value is silently "absent". Validation is the author's (the web
-   form's) job.
+   malformed value is silently "absent". Validation is the author's (the
+   client's) job.
 3. **`species` is a slug, rendered as a label.** `human` / `alien` /
    `beastkin` / `elf` / `deity` map to Chinese labels in the identity line and
    English labels in iron rule ⓪. Any other non-blank string renders verbatim
    in both places — the same policy as `gender`. Absent or `human` renders
    nothing and leaves rule ⓪ untouched.
 4. **`earth` is the reserved planet.** `planet` is free text; absent or
-   `earth` renders no planet. Downstream maps its "Earth" choice to the slug.
+   `earth` renders no planet. A client maps its "Earth" choice to the slug.
 5. **The birthday is a month-day string, `"MM-DD"`.** No year. February 29
    counts as February 28 in a non-leap year.
 6. **The birthday follows the persona clock**: `art_metadata.timezone` →
@@ -61,9 +61,9 @@ implementation.
    date.
 10. **Voice is out of scope.** The voice prompt has no identity line and no
     `[now]`; nothing changes there.
-11. **Downstream work is not this document's.** The web form's new fields,
-    its "Earth" → `earth` mapping, and deriving its zodiac from the birthday
-    instead of storing one are follow-ups in the web repository.
+11. **Client work is not this document's.** A client's form fields for the
+    four keys, its "Earth" → `earth` mapping, and deriving a zodiac from the
+    birthday instead of storing one are follow-ups on the client side.
 
 ## 3. Data contract
 
@@ -242,4 +242,4 @@ Proactive metadata test: the written row carries `proactive: "birthday"` and
   first stays tied to `open`.
 - A persona-side holiday calendar keyed on `planet`.
 - Any validation of `art_metadata` in the engine.
-- Web-side form, overlay, or zodiac changes (Decision 11).
+- Client-side form or zodiac changes (Decision 11).
