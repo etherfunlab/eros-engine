@@ -355,6 +355,8 @@ user is. The engine does not keep them between turns; send them on every turn.
   `Asia/Singapore`. It also dates the user-side holiday line: holidays on the
   user's local date and the six days after it
   (`对方那边今天是平安夜；明天是Christmas Day。`), stated as facts.
+  The persona's birthday line (`3 天后是你的生日。`) is dated on the same
+  persona clock as `[now]`.
 - `user_country` — ISO 3166-1 alpha-2 (`TW`), as the client received it. Absent
   ⇒ derived from `user_timezone`. Unknown ⇒ no public holidays.
 - `user_region` — ISO 3166-2 subdivision without the country prefix (`CA`,
@@ -749,8 +751,14 @@ built-in edit prompt.
 ### `POST /v2/comp/session/{session_id}/open`
 
 Tell the engine the user just entered a session. The persona can speak first
-for one of two reasons:
+for one of three reasons:
 
+- **The persona's birthday — the engine's call.** Without `occasion`: when the
+  persona's `art_metadata.birthday` (`"MM-DD"`) is today on the persona clock
+  and nobody has spoken in the session since that local midnight, the persona
+  speaks first. The persona clock is `art_metadata.timezone`, then
+  `user_timezone`, then `Asia/Singapore`. A birthday outranks a holiday on the
+  same day.
 - **A holiday — the engine's call.** Without `occasion`: when it is a holiday
   in the user's timezone (same sources as the chat body's holiday line, today
   only) and nobody has spoken in the session since the user's local midnight,
@@ -777,8 +785,9 @@ Every field is optional. The three locale fields follow the chat body's rules.
 `tier`, `prompt_traits`, `memory_scope`, `affinity_scope` and `audit` shape the
 message as they shape a chat reply. The engine does not keep them between
 calls (the message row records them as an audit copy), so send the same
-values a chat turn would. Without `occasion` and without a valid
-`user_timezone` the call returns `null`.
+values a chat turn would. A holiday needs a valid `user_timezone`; a birthday
+does not. Without `occasion`, on a day that is neither, the call returns
+`null`.
 
 | `occasion` | The persona speaks first when | The engine tells the persona |
 |---|---|---|
@@ -799,8 +808,8 @@ occasion that is not true of the session returns `null` without generating.
 { "greeting": { "message_id": "01J…", "content": "好久不见，最近忙什么呢", "sent_at": "…", "occasion": "returning" } }
 ```
 
-`occasion` in the response is `holiday`, `first_meet`, `returning` or
-`just_opened`.
+`occasion` in the response is `birthday`, `holiday`, `first_meet`,
+`returning` or `just_opened`.
 
 - **Synchronous:** one non-streaming generation, a few seconds. Don't block UI on it.
 - **Idempotent:** per session and user-local date for the holiday greeting,
