@@ -802,6 +802,46 @@ fn is_binary_gender(persona: &CompanionPersona) -> bool {
     matches!(meta_str(persona, "gender"), Some("male") | Some("female"))
 }
 
+/// The persona's species as `(identity label, iron-rule label)`. `None` for
+/// `human` or absent/blank, so the identity line and rule ⓪ stay as they
+/// were. Any other value renders verbatim, like `gender`.
+fn species_labels(persona: &CompanionPersona) -> Option<(String, String)> {
+    let s = meta_str(persona, "species")?.trim();
+    let (zh, en) = match s {
+        "" | "human" => return None,
+        "alien" => ("外星人", "alien"),
+        "beastkin" => ("兽人", "beastkin"),
+        "elf" => ("精灵", "elf"),
+        "deity" => ("神明", "deity"),
+        other => (other, other),
+    };
+    Some((zh.to_string(), en.to_string()))
+}
+
+/// `来自 X 星，故乡是 Y。` from whichever of `planet` and `hometown` is set.
+/// Earth (`earth` in any case, or `地球`) is no planet; `星` is not doubled.
+fn origin_sentence(persona: &CompanionPersona) -> String {
+    let set = |key: &str| {
+        meta_str(persona, key)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+    };
+    let planet = set("planet").filter(|p| !p.eq_ignore_ascii_case("earth") && *p != "地球");
+    let from = planet.map(|p| {
+        if p.ends_with('星') {
+            format!("来自 {p}")
+        } else {
+            format!("来自 {p} 星")
+        }
+    });
+    match (from, set("hometown")) {
+        (Some(f), Some(h)) => format!("{f}，故乡是 {h}。"),
+        (Some(f), None) => format!("{f}。"),
+        (None, Some(h)) => format!("故乡是 {h}。"),
+        (None, None) => String::new(),
+    }
+}
+
 /// Render the `[user_profile]` and `[shared_memories]` recall sections shared
 /// by every prompt builder. `None` means the respective input had no content
 /// to render (for `profile_groups`, no group with a non-empty item list);
@@ -927,9 +967,25 @@ pub fn build_prompt(
     // per-genome caching holds.
     let guard = format!("{PERSONA_GUARD}\n\n{ANTI_REFUSAL_GUARD}\n\n");
 
-    let identity = match gender_label(persona) {
-        Some(g) => format!("你是 {name}，{g}，{age} 岁，{mbti} 性格。"),
-        None => format!("你是 {name}，{age} 岁，{mbti} 性格。"),
+    let species = species_labels(persona);
+    let kind: String = [
+        species.as_ref().map(|(zh, _)| zh.clone()),
+        gender_label(persona),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|label| format!("{label}，"))
+    .collect();
+    let identity = format!(
+        "你是 {name}，{kind}{age} 岁，{mbti} 性格。{origin}",
+        origin = origin_sentence(persona),
+    );
+    // Iron rule ⓪. Human (or no species) keeps the original text byte for byte.
+    let rule0 = match &species {
+        None => "You are a real person. You have your own life, feelings, and quirks; you live, feel, and react as a human would.".to_string(),
+        Some((_, en)) => format!(
+            "You are a real {en}, not an AI and not an actor. You have your own life, feelings, and quirks; you live, feel, and react as your kind would."
+        ),
     };
     let traits_section = if prompt_traits.is_empty() {
         String::new()
@@ -1193,7 +1249,7 @@ pub fn build_prompt(
          \n\
          ---\n\
          [iron_rules — 违反即失效]\n\
-         ⓪ You are a real person. You have your own life, feelings, and quirks; you live, feel, and react as a human would.\n\
+         ⓪ {rule0}\n\
          ① {rule1}\n\
          ② Adult consensual romance and erotic roleplay are allowed. The following are strictly disallowed: self-harm encouragement, suicide instructions, and any sexual content involving minors.{gender_rule}\n\
          \n\
@@ -4120,5 +4176,119 @@ mod tests {
             None
         );
         assert_eq!(action_from_metadata(None), None);
+    }
+
+    /// `build_prompt` with every optional input empty.
+    fn origin_prompt(p: &CompanionPersona, now: &NowContext) -> String {
+        build_prompt(
+            p,
+            &[],
+            &[],
+            None,
+            &[],
+            None,
+            None,
+            &[],
+            AffinityScope::full(),
+            &[],
+            None,
+            None,
+            None,
+            None,
+            TurnNudges::default(),
+            now,
+        )
+    }
+
+    const HUMAN_RULE_ZERO: &str = "⓪ You are a real person. You have your own life, feelings, and quirks; you live, feel, and react as a human would.\n";
+
+    #[test]
+    fn human_or_absent_origin_keys_leave_the_prompt_byte_identical() {
+        let base = origin_prompt(&fixture_persona(), &NowContext::default());
+        assert!(base.contains("你是 Aria，24 岁，INFP 性格。\n"), "{base}");
+        assert!(base.contains(HUMAN_RULE_ZERO), "{base}");
+
+        let mut p = fixture_persona();
+        set_meta(&mut p, "species", serde_json::json!("human"));
+        set_meta(&mut p, "planet", serde_json::json!("earth"));
+        set_meta(&mut p, "hometown", serde_json::json!("  "));
+        set_meta(&mut p, "birthday", serde_json::json!("not-a-date"));
+        assert_eq!(origin_prompt(&p, &NowContext::default()), base);
+
+        set_meta(&mut p, "species", serde_json::json!(" "));
+        set_meta(&mut p, "planet", serde_json::json!("地球"));
+        assert_eq!(origin_prompt(&p, &NowContext::default()), base);
+        set_meta(&mut p, "planet", serde_json::json!("Earth"));
+        assert_eq!(origin_prompt(&p, &NowContext::default()), base);
+    }
+
+    #[test]
+    fn species_goes_before_gender_in_the_identity_line() {
+        let mut p = fixture_persona();
+        set_meta(&mut p, "species", serde_json::json!("elf"));
+        let s = origin_prompt(&p, &NowContext::default());
+        assert!(s.contains("你是 Aria，精灵，24 岁，INFP 性格。\n"), "{s}");
+
+        set_meta(&mut p, "gender", serde_json::json!("female"));
+        let s = origin_prompt(&p, &NowContext::default());
+        assert!(
+            s.contains("你是 Aria，精灵，女性，24 岁，INFP 性格。\n"),
+            "{s}"
+        );
+
+        set_meta(&mut p, "species", serde_json::json!(" 半神 "));
+        let s = origin_prompt(&p, &NowContext::default());
+        assert!(
+            s.contains("你是 Aria，半神，女性，24 岁，INFP 性格。\n"),
+            "unknown species renders verbatim, trimmed: {s}"
+        );
+    }
+
+    #[test]
+    fn origin_sentence_renders_the_parts_that_are_set() {
+        let cases = [
+            (
+                Some("Kepler-442b"),
+                Some("北境港"),
+                "来自 Kepler-442b 星，故乡是 北境港。",
+            ),
+            (Some("火星"), None, "来自 火星。"),
+            (Some(" 织女星 "), Some(" "), "来自 织女星。"),
+            (None, Some("台南"), "故乡是 台南。"),
+            (Some("earth"), Some("台南"), "故乡是 台南。"),
+        ];
+        for (planet, hometown, want) in cases {
+            let mut p = fixture_persona();
+            if let Some(v) = planet {
+                set_meta(&mut p, "planet", serde_json::json!(v));
+            }
+            if let Some(v) = hometown {
+                set_meta(&mut p, "hometown", serde_json::json!(v));
+            }
+            let s = origin_prompt(&p, &NowContext::default());
+            assert!(
+                s.contains(&format!("你是 Aria，24 岁，INFP 性格。{want}\n")),
+                "{planet:?}/{hometown:?}: {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_human_species_swaps_iron_rule_zero() {
+        let mut p = fixture_persona();
+        set_meta(&mut p, "species", serde_json::json!("deity"));
+        let s = origin_prompt(&p, &NowContext::default());
+        assert!(
+            s.contains("⓪ You are a real deity, not an AI and not an actor. You have your own life, feelings, and quirks; you live, feel, and react as your kind would.\n"),
+            "{s}"
+        );
+        assert!(!s.contains("as a human would"), "{s}");
+
+        set_meta(&mut p, "species", serde_json::json!("半神"));
+        let s = origin_prompt(&p, &NowContext::default());
+        assert!(
+            s.contains("⓪ You are a real 半神, not an AI and not an actor."),
+            "{s}"
+        );
     }
 }
