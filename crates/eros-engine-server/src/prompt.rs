@@ -158,6 +158,20 @@ fn holiday_line(days: &[(u8, Vec<String>)]) -> Option<String> {
     Some(format!("对方那边{}。", parts.join("；")))
 }
 
+/// The persona-side birthday line under `[now]` (spec 2026-10-10 §4.4),
+/// dated on the persona clock. States a fact only.
+fn birthday_line(persona: &CompanionPersona, now: &NowContext) -> Option<String> {
+    let birthday = crate::birthday::Birthday::parse(meta_str(persona, "birthday")?)?;
+    let tz = persona_clock_tz(meta_str(persona, "timezone"), now.user_timezone);
+    let today = now.now.with_timezone(&tz).date_naive();
+    let when = match birthday.days_until(today, crate::holiday::LOOKAHEAD_DAYS)? {
+        0 => "今天".to_string(),
+        1 => "明天".to_string(),
+        n => format!("{n} 天后"),
+    };
+    Some(format!("{when}是你的生日。"))
+}
+
 /// How long ago a quoted line was said, in coarse buckets. The point of a
 /// quote is usually that the line is *not* recent, and "3 天前" is the whole
 /// difference between a callback and a same-breath correction. Deliberately
@@ -189,6 +203,18 @@ fn relative_age_from(now: chrono::DateTime<Utc>, sent_at: chrono::DateTime<Utc>)
     }
 }
 
+/// The persona clock's zone (spec 2026-09-26 §5.1): the persona's own IANA
+/// `timezone` when set and valid, else the user's, else SGT.
+pub(crate) fn persona_clock_tz(
+    timezone: Option<&str>,
+    user_timezone: Option<chrono_tz::Tz>,
+) -> chrono_tz::Tz {
+    timezone
+        .and_then(|s| s.trim().parse::<chrono_tz::Tz>().ok())
+        .or(user_timezone)
+        .unwrap_or(chrono_tz::Asia::Singapore)
+}
+
 /// Absolute "now" context. Renders the persona's LOCAL date/weekday/time/period
 /// directly so the model does no arithmetic — this is the fix for the
 /// time-hallucination bug. The zone is the persona's own IANA `timezone` when
@@ -198,10 +224,7 @@ fn now_context_at(
     timezone: Option<&str>,
     user_timezone: Option<chrono_tz::Tz>,
 ) -> String {
-    let tz = timezone
-        .and_then(|s| s.trim().parse::<chrono_tz::Tz>().ok())
-        .or(user_timezone)
-        .unwrap_or(chrono_tz::Asia::Singapore);
+    let tz = persona_clock_tz(timezone, user_timezone);
     let local = now.with_timezone(&tz);
     format!(
         "现在你当地时间是 {date}（{wd}）{hh:02}:{mm:02}，{period}。\
@@ -1229,6 +1252,9 @@ pub fn build_prompt(
     let holiday = holiday_line(&now.holidays)
         .map(|l| format!("\n{l}"))
         .unwrap_or_default();
+    let birthday = birthday_line(persona, now)
+        .map(|l| format!("\n{l}"))
+        .unwrap_or_default();
 
     format!(
         "{head}{guard}{identity}\n\
@@ -1245,7 +1271,7 @@ pub fn build_prompt(
          [reply_length]\n{lr}{relationship}\
          {attitude}{state}{hints_section}{emotional_section}{quote_section}\n\
          \n\
-         [now]\n{tc}{holiday}{this_turn}\n\
+         [now]\n{tc}{holiday}{birthday}{this_turn}\n\
          \n\
          ---\n\
          [iron_rules — 违反即失效]\n\
@@ -4288,6 +4314,62 @@ mod tests {
         let s = origin_prompt(&p, &NowContext::default());
         assert!(
             s.contains("⓪ You are a real 半神, not an AI and not an actor."),
+            "{s}"
+        );
+    }
+
+    fn now_block(s: &str) -> &str {
+        &s[s.find("[now]").unwrap()..s.find("[iron_rules").unwrap()]
+    }
+
+    #[test]
+    fn birthday_line_counts_down_on_the_persona_clock() {
+        // 2026-09-24 20:00 UTC: Taipei is on 09-25, Los Angeles still on 09-24.
+        let now = NowContext {
+            now: Utc.with_ymd_and_hms(2026, 9, 24, 20, 0, 0).unwrap(),
+            user_timezone: Some(chrono_tz::America::Los_Angeles),
+            holidays: vec![],
+        };
+        let mut p = fixture_persona();
+        set_meta(&mut p, "timezone", serde_json::json!("Asia/Taipei"));
+        for (bday, want) in [
+            ("09-25", Some("今天是你的生日。")),
+            (" 09-26 ", Some("明天是你的生日。")),
+            ("09-28", Some("3 天后是你的生日。")),
+            ("10-01", Some("6 天后是你的生日。")),
+            ("10-02", None),
+            ("09-24", None),
+        ] {
+            set_meta(&mut p, "birthday", serde_json::json!(bday));
+            let s = origin_prompt(&p, &now);
+            let block = now_block(&s);
+            match want {
+                Some(line) => assert!(block.contains(&format!("\n{line}")), "{bday}: {block}"),
+                None => assert!(!block.contains("你的生日"), "{bday}: {block}"),
+            }
+        }
+
+        // No persona timezone ⇒ the user's clock (LA, 09-24): 09-25 is tomorrow.
+        let mut q = fixture_persona();
+        set_meta(&mut q, "birthday", serde_json::json!("09-25"));
+        assert!(now_block(&origin_prompt(&q, &now)).contains("明天是你的生日。"));
+        // An unparseable persona timezone falls back the same way.
+        set_meta(&mut q, "timezone", serde_json::json!("Not/AZone"));
+        assert!(now_block(&origin_prompt(&q, &now)).contains("明天是你的生日。"));
+    }
+
+    #[test]
+    fn birthday_line_follows_the_holiday_line() {
+        let now = NowContext {
+            now: Utc.with_ymd_and_hms(2026, 9, 24, 20, 0, 0).unwrap(),
+            user_timezone: Some(chrono_tz::Asia::Taipei),
+            holidays: vec![(0, vec!["中秋节".to_string()])],
+        };
+        let mut p = fixture_persona();
+        set_meta(&mut p, "birthday", serde_json::json!("09-25"));
+        let s = origin_prompt(&p, &now);
+        assert!(
+            now_block(&s).contains("对方那边今天是中秋节。\n今天是你的生日。"),
             "{s}"
         );
     }
