@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 mod auth;
+mod birthday;
 mod byok;
 mod error;
 mod history_window;
