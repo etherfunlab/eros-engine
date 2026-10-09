@@ -782,13 +782,12 @@ pub(crate) fn meta_str<'a>(persona: &'a CompanionPersona, key: &str) -> Option<&
         .and_then(|v| v.as_str())
 }
 
-/// Pluck an i32 field out of `art_metadata`.
+/// Pluck an i32 field out of `art_metadata`: a JSON number, or a string
+/// holding one (forms that save numbers as text).
 pub(crate) fn meta_i32(persona: &CompanionPersona, key: &str) -> Option<i32> {
-    persona
-        .genome
-        .art_metadata
-        .get(key)
-        .and_then(|v| v.as_i64())
+    let v = persona.genome.art_metadata.get(key)?;
+    v.as_i64()
+        .or_else(|| v.as_str()?.trim().parse::<i64>().ok())
         .map(|n| n as i32)
 }
 
@@ -4372,5 +4371,19 @@ mod tests {
             now_block(&s).contains("对方那边今天是中秋节。\n今天是你的生日。"),
             "{s}"
         );
+    }
+
+    #[test]
+    fn a_numeric_string_age_reads_as_the_number() {
+        let mut p = fixture_persona();
+        set_meta(&mut p, "age", serde_json::json!(" 24 "));
+        assert_eq!(meta_i32(&p, "age"), Some(24));
+        let s = origin_prompt(&p, &NowContext::default());
+        assert!(s.contains("你是 Aria，24 岁，INFP 性格。\n"), "{s}");
+
+        set_meta(&mut p, "age", serde_json::json!("二十出头"));
+        assert_eq!(meta_i32(&p, "age"), None, "free text is still no age");
+        set_meta(&mut p, "age", serde_json::json!(""));
+        assert_eq!(meta_i32(&p, "age"), None);
     }
 }
