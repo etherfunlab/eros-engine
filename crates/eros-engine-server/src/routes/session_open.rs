@@ -137,14 +137,14 @@ impl From<ChatMessage> for GreetingDto {
 
 /// Tell the engine the user just entered this session.
 ///
-/// Without `occasion` the engine decides: when it is a holiday in the user's
-/// timezone and nobody has spoken in the session since the user's local
-/// midnight, the persona speaks first. With `occasion` the caller decides,
-/// and the persona speaks first when the occasion is true of the session.
-/// Either way one assistant message is generated, persisted (unread, like any
-/// reply) and returned; otherwise `greeting` is `null`. Idempotent per
-/// session and user-local date for the holiday, per session and `open_key`
-/// for an occasion.
+/// Without `occasion` the engine decides: on the persona's birthday (persona
+/// clock), or else a holiday in the user's timezone, when nobody has spoken
+/// in the session since that local midnight, the persona speaks first. With
+/// `occasion` the caller decides, and the persona speaks first when the
+/// occasion is true of the session. Either way one assistant message is
+/// generated, persisted (unread, like any reply) and returned; otherwise
+/// `greeting` is `null`. Idempotent per session and local date for a
+/// birthday or holiday, per session and `open_key` for an occasion.
 #[utoipa::path(
     post,
     path = "/v2/comp/session/{session_id}/open",

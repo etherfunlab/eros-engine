@@ -1675,7 +1675,7 @@
           "companion"
         ],
         "summary": "Tell the engine the user just entered this session.",
-        "description": "Without `occasion` the engine decides: when it is a holiday in the user's\ntimezone and nobody has spoken in the session since the user's local\nmidnight, the persona speaks first. With `occasion` the caller decides,\nand the persona speaks first when the occasion is true of the session.\nEither way one assistant message is generated, persisted (unread, like any\nreply) and returned; otherwise `greeting` is `null`. Idempotent per\nsession and user-local date for the holiday, per session and `open_key`\nfor an occasion.",
+        "description": "Without `occasion` the engine decides: on the persona's birthday (persona\nclock), or else a holiday in the user's timezone, when nobody has spoken\nin the session since that local midnight, the persona speaks first. With\n`occasion` the caller decides, and the persona speaks first when the\noccasion is true of the session. Either way one assistant message is\ngenerated, persisted (unread, like any reply) and returned; otherwise\n`greeting` is `null`. Idempotent per session and local date for a\nbirthday or holiday, per session and `open_key` for an occasion.",
         "operationId": "open_session",
         "parameters": [
           {

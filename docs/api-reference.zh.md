@@ -676,8 +676,8 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 响应里的 `occasion` 取值为 `birthday`、`holiday`、`first_meet`、`returning` 或 `just_opened`。
 
 - **同步：** 一次非流式生成，需要几秒，不要阻塞 UI。
-- **幂等：** 节日开场白按会话加用户当地日期，场合按会话加 `open_key`。写入过之后，重复调用返回那一条，不会再生成；返回 `null` 的调用什么都没写，同一个 key 再调仍可能生成。
-- **竞态时用户优先：** 场合消息生成期间会话里只要落了节日开场白以外的消息，就不写入，返回 `null`；如果落的是同一个 key 的并发调用写的开场白，就返回那一条。
+- **幂等：** 生日和节日开场白按会话加当地日期（生日用角色那边的日期，节日用用户那边的日期），场合按会话加 `open_key`。写入过之后，重复调用返回那一条，不会再生成；返回 `null` 的调用什么都没写，同一个 key 再调仍可能生成。
+- **竞态时用户优先：** 场合消息生成期间会话里只要落了生日、节日开场白以外的消息，就不写入，返回 `null`；如果落的是同一个 key 的并发调用写的开场白，就返回那一条。
 - **与普通回复一样落库：** 这条消息是一条普通的 assistant 行（`assistant_action_type = 'proactive'`，
   没有 `user_message_id`），在调用 `POST /comp/chat/{session_id}/read` 之前都是未读。
   Realtime 和两个 history 路由都能看到。
@@ -1532,7 +1532,7 @@ session 403）。
 - `crates/eros-engine-server/src/routes/companion.rs`——对话生命周期 / 画像 handler
 - `crates/eros-engine-server/src/routes/companion_stream.rs`——流式对话轮（`message/stream`），含打赏 + `image_url` 处理
 - `crates/eros-engine-server/src/routes/companion_async.rs`——只入队的对话轮（`v2/comp/session/{session_id}/message/async`）
-- `crates/eros-engine-server/src/routes/session_open.rs`——角色先开口：节日开场白与调用方指定的场合（`v2/comp/session/{session_id}/open`）
+- `crates/eros-engine-server/src/routes/session_open.rs`——角色先开口：生日、节日开场白与调用方指定的场合（`v2/comp/session/{session_id}/open`）
 - `crates/eros-engine-server/src/routes/reaction.rs`——消息 reaction：设置、撤销与允许列表（`v2/comp/session/{session_id}/message/{message_id}/reaction`、`v2/comp/reactions`）
 - `crates/eros-engine-server/src/routes/insight.rs`——按关系分开的 v2 画像端点（`v2/comp/instance/{instance_id}/insight/character`、`.../insight/user`）
 - `crates/eros-engine-server/src/pipeline/chat_queue.rs`——异步对话轮队列 worker
