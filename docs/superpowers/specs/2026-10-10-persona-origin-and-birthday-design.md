@@ -72,7 +72,7 @@ Four optional keys on `engine.persona_genomes.art_metadata`:
 | Key | Value | Absent / invalid |
 |---|---|---|
 | `species` | slug; see §4.1 for the five known ones | treated as `human` |
-| `planet` | free text; `earth` reserved | no planet rendered |
+| `planet` | free text; `earth` reserved (`地球` also counts) | no planet rendered |
 | `hometown` | free text | no hometown rendered |
 | `birthday` | `"MM-DD"`, zero-padded, a real calendar day | no birthday |
 
@@ -124,7 +124,9 @@ One sentence appended to the identity line, present only when at least one of
 ```
 
 Rendered on the same line as the identity sentence, separated by nothing more
-than the sentence-final `。`.
+than the sentence-final `。`. The `星` suffix is added only when the value does
+not already end in `星` (`火星` renders `来自 火星。`, not `来自 火星 星。`).
+`earth` (any case) and `地球` both count as Earth and render no planet.
 
 ### 4.3 Iron rule ⓪
 
@@ -185,6 +187,11 @@ year it matches February 29 only.
   birthday can surface.
 - Persistence: `insert_proactive_message` with the same `since` re-check and
   `ON CONFLICT` fallback to `proactive_greeting_on` as the holiday.
+- A birthday greeting is a dated engine greeting, exempt wherever a holiday
+  greeting is. `ChatRepo::has_message_since` and the `WHERE NOT EXISTS`
+  re-check in `insert_proactive_row` skip proactive rows whose
+  `metadata.proactive` is `holiday`; both skip `birthday` too, so a birthday
+  greeting no more blocks a caller-named opener than a holiday greeting does.
 
 Wire contract: `GreetingOccasion` gains `birthday`; `GreetingDto::from`
 deserialises it like the others. `OpenOccasion` (the caller's enum) does
