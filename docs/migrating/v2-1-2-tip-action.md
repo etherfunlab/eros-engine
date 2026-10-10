@@ -1,6 +1,6 @@
-# Migrating to the v3.0.0 tip action
+# Migrating to the v2.1.2 tip action
 
-**Applies to:** clients of `eros-engine` upgrading to `v3.0.0`.
+**Applies to:** clients of `eros-engine` upgrading to `v2.1.2`.
 **Design:** [`docs/superpowers/specs/2026-10-11-tip-as-action-design.md`](../superpowers/specs/2026-10-11-tip-as-action-design.md)
 
 **A tip is now a user action, judged like every other.** The request field
