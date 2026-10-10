@@ -44,35 +44,7 @@ pub fn settle_action_response(
 ///
 /// Phase 2: rules only. Phase 6 adds the LLM fallback path.
 pub fn decide(input: &DecisionInput) -> ActionPlan {
-    // 0. Tip on a user message — always reply, never ghost. Tone is driven by
-    //    tip_personality (injected into the prompt downstream); the ReplyStyle
-    //    here is only a baseline / fallback. Affinity deltas stay normal.
-    if let Event::UserMessage {
-        tips_amount_usd: Some(_),
-        ..
-    } = &input.event
-    {
-        let reply_style = match input.persona.genome.tip_personality.as_deref() {
-            Some(_) => ReplyStyle::Neutral,
-            None => ReplyStyle::Tsundere,
-        };
-        return ActionPlan {
-            action_type: ActionType::ReplyText,
-            reply_style,
-            affinity_deltas: predict_reply_deltas(input),
-            energy_cost: ENERGY_COST_REPLY,
-            context_hints: vec![],
-            reply_mode: None,
-            nudges: TurnNudges::default(),
-            clothing: None,
-            image_caption: None,
-            image_ref: ImageRef::Face,
-            aspect_ratio: None,
-            action_response: None,
-        };
-    }
-
-    // 0b. A user action — always reply, never ghost: the persona answers an
+    // 0. A user action — always reply, never ghost: the persona answers an
     //     action, and with no judge to decide, it accepts (spec 2026-10-05 §4.3–4.4).
     if let Event::UserMessage {
         action: Some(_), ..
@@ -360,78 +332,9 @@ mod tests {
             tier: None,
             memory_scope: Default::default(),
             affinity_scope: Default::default(),
-            tips_amount_usd: None,
             quote: Default::default(),
             action: None,
         }
-    }
-
-    fn tip_msg(amount: f64) -> Event {
-        Event::UserMessage {
-            content: String::new(),
-            message_id: Uuid::new_v4(),
-            prompt_traits: Vec::new(),
-            audit: None,
-            tier: None,
-            memory_scope: Default::default(),
-            affinity_scope: Default::default(),
-            tips_amount_usd: Some(amount),
-            quote: Default::default(),
-            action: None,
-        }
-    }
-
-    fn persona_with_tip(tip: Option<&str>) -> CompanionPersona {
-        let mut p = base_persona();
-        p.genome.tip_personality = tip.map(String::from);
-        p
-    }
-
-    #[test]
-    fn test_tip_forces_reply_even_when_ghost_signals_present() {
-        // Same affinity that drives test_ghost_threshold_triggers_ghost_action.
-        let mut affinity = base_affinity();
-        affinity.intrigue = 0.05;
-        affinity.patience = 0.05;
-        affinity.tension = 0.5;
-        let input = DecisionInput {
-            event: tip_msg(20.0),
-            affinity,
-            persona: persona_with_tip(None),
-            signals: base_signals(),
-        };
-        let plan = decide(&input);
-        assert_eq!(
-            plan.action_type,
-            ActionType::ReplyText,
-            "a tip must never be ghosted"
-        );
-    }
-
-    #[test]
-    fn test_tip_reply_style_neutral_when_personality_present() {
-        let input = DecisionInput {
-            event: tip_msg(20.0),
-            affinity: base_affinity(),
-            persona: persona_with_tip(Some("傲娇")),
-            signals: base_signals(),
-        };
-        let plan = decide(&input);
-        assert_eq!(plan.action_type, ActionType::ReplyText);
-        assert_eq!(plan.reply_style, ReplyStyle::Neutral);
-    }
-
-    #[test]
-    fn test_tip_reply_style_tsundere_when_personality_absent() {
-        let input = DecisionInput {
-            event: tip_msg(20.0),
-            affinity: base_affinity(),
-            persona: persona_with_tip(None),
-            signals: base_signals(),
-        };
-        let plan = decide(&input);
-        assert_eq!(plan.action_type, ActionType::ReplyText);
-        assert_eq!(plan.reply_style, ReplyStyle::Tsundere);
     }
 
     #[test]
@@ -840,7 +743,6 @@ mod tests {
             tier: None,
             memory_scope: Default::default(),
             affinity_scope: Default::default(),
-            tips_amount_usd: None,
             quote: Default::default(),
             action: Some(action),
         }

@@ -345,7 +345,6 @@ async fn drive_turn(
             .as_ref()
             .map(AffinityScopeDto::resolve)
             .unwrap_or_default(),
-        tips_amount_usd: params.tips_amount_usd,
         image_url: params.image_url.clone(),
         image: params.image.clone(),
         quote,

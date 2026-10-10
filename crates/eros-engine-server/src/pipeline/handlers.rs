@@ -970,17 +970,6 @@ pub(crate) async fn build_reply_request(
         system_prompt.push_str(&crate::prompt::reactions_context(&lines));
     }
 
-    if let Event::UserMessage {
-        tips_amount_usd: Some(amount),
-        ..
-    } = &input.event
-    {
-        // Raw Option from the genome: tips_reaction_context renders Some vs None as
-        // different prose, so the distinction must survive.
-        let tp = input.persona.genome.tip_personality.as_deref();
-        system_prompt.push_str(&crate::prompt::tips_reaction_context(*amount, tp));
-    }
-
     if let (
         Event::UserMessage {
             action: Some(a), ..
@@ -1772,7 +1761,6 @@ mod tests {
             tier: None,
             memory_scope: Default::default(),
             affinity_scope: Default::default(),
-            tips_amount_usd: None,
             quote: Default::default(),
             action: None,
         };
@@ -2950,7 +2938,6 @@ mod tests {
                 // history-window ladder, not memory recall.
                 memory_scope: MemoryScope::None,
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 quote: Default::default(),
                 action: None,
             },
@@ -3072,7 +3059,6 @@ mod tests {
                 tier: None,
                 memory_scope: MemoryScope::None,
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 quote: Default::default(),
                 action: None,
             },
@@ -3209,7 +3195,6 @@ mod tests {
                 tier: None,
                 memory_scope: MemoryScope::None,
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 quote: Default::default(),
                 action: None,
             },
@@ -3318,7 +3303,6 @@ mod tests {
                 tier: None,
                 memory_scope: MemoryScope::None,
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 quote: Default::default(),
                 action: None,
             },
@@ -3633,7 +3617,6 @@ mod tests {
                 // No Voyage call: this test is about the [reactions] block.
                 memory_scope: MemoryScope::None,
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 quote: Default::default(),
                 action: None,
             },

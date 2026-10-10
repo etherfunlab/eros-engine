@@ -140,7 +140,6 @@ pub(crate) async fn greet(
             tier: g.tier.clone(),
             memory_scope: g.memory_scope,
             affinity_scope: g.affinity_scope,
-            tips_amount_usd: None,
             quote: None,
             action: None,
         },

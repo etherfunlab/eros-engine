@@ -1026,7 +1026,6 @@ mod tests {
             content: content.into(),
             sent_at: Utc::now(),
             client_msg_id: None,
-            tips_amount_usd: None,
             channel: None,
             read_at: None,
             image: false,

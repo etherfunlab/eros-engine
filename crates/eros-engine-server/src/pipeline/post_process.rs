@@ -2282,7 +2282,6 @@ mod tests {
             tier: None,
             memory_scope: Default::default(),
             affinity_scope: Default::default(),
-            tips_amount_usd: None,
             quote: Default::default(),
             action: None,
         };
@@ -2300,7 +2299,6 @@ mod tests {
             tier: None,
             memory_scope: Default::default(),
             affinity_scope: Default::default(),
-            tips_amount_usd: None,
             quote: Default::default(),
             action: None,
         };
@@ -2495,7 +2493,6 @@ mod tests {
             tier: None,
             memory_scope: Default::default(),
             affinity_scope: Default::default(),
-            tips_amount_usd: None,
             quote: None,
             action,
         };
@@ -2550,7 +2547,6 @@ mod tests {
             tier: None,
             memory_scope: Default::default(),
             affinity_scope: Default::default(),
-            tips_amount_usd: None,
             quote: None,
             action: Some(UserAction::Tip { amount_usd: 20.0 }),
         };
@@ -3563,7 +3559,6 @@ mod tests {
             tier: None,
             memory_scope: Default::default(),
             affinity_scope: Default::default(),
-            tips_amount_usd: None,
             quote: Default::default(),
             action: None,
         };
@@ -3728,7 +3723,6 @@ mod tests {
             tier: None,
             memory_scope: Default::default(),
             affinity_scope: Default::default(),
-            tips_amount_usd: None,
             quote: Default::default(),
             action: None,
         };
@@ -3862,7 +3856,6 @@ mod tests {
             tier: None,
             memory_scope: Default::default(),
             affinity_scope: Default::default(),
-            tips_amount_usd: None,
             quote: Default::default(),
             action: None,
         };
@@ -4458,7 +4451,6 @@ mod tests {
             tier: None,
             memory_scope: Default::default(),
             affinity_scope: Default::default(),
-            tips_amount_usd: None,
             quote: Default::default(),
             action: None,
         };

@@ -47,19 +47,12 @@ pub struct BffHistoryEntry {
     pub role: String,
     pub content: String,
     pub sent_at: DateTime<Utc>,
-    /// Structured tip amount for `role='gift_user'` rows. Omitted from
-    /// response when None (`skip_serializing_if`). Lets clients render tips
-    /// at the right point in the timeline without parsing the `(打赏 $X)`
-    /// content marker. Spec:
-    /// docs/superpowers/specs/2026-05-26-tip-role-and-filter-audit-design.md §3.4.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tips_amount_usd: Option<f64>,
     /// When this message reached the party it was addressed to — set by
     /// `POST /comp/chat/{session_id}/read` on an `assistant` row, and by the
     /// engine itself on a `user` row (the moment the turn handed the message to
     /// its first model; delivery, not that model's acknowledgement). Omitted
-    /// while unread; permanently omitted on tips and voice `user` rows, which
-    /// have no reader. Absence means "no receipt", not "not yet read".
+    /// while unread; permanently omitted on voice `user` rows, which have no
+    /// reader. Absence means "no receipt", not "not yet read".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_at: Option<DateTime<Utc>>,
     /// Conversation-flavor marker: `"product_qa"` = out-of-character product
@@ -103,18 +96,6 @@ pub struct BffHistoryEntry {
 /// column is unconstrained JSONB, and one bad row must not fail the page.
 fn parse_anchor(raw: Option<String>) -> Option<Uuid> {
     raw.and_then(|s| Uuid::parse_str(&s).ok())
-}
-
-/// Parse the raw `metadata->>'tips_amount_usd'` text the slim projection
-/// carries. Same contract as `parse_anchor`: the column is unconstrained
-/// JSONB, and one bad row must not fail the page — what does not parse is
-/// dropped rather than surfaced (#302). Non-finite values ("NaN", "inf",
-/// overflow) are dropped too: `f64::parse` accepts them but serde_json
-/// serializes them as `null`, which would put the key on the wire instead
-/// of omitting it.
-fn parse_tip(raw: Option<String>) -> Option<f64> {
-    raw.and_then(|s| s.parse::<f64>().ok())
-        .filter(|v| v.is_finite())
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -235,7 +216,6 @@ async fn bff_get_history(
                 role: r.role,
                 content: r.content,
                 sent_at: r.sent_at,
-                tips_amount_usd: parse_tip(r.tips_amount_usd),
                 channel: r.channel,
                 read_at: r.read_at,
                 image: r.image,
@@ -300,7 +280,6 @@ async fn bff_start_chat(
                 role: r.role,
                 content: r.content,
                 sent_at: r.sent_at,
-                tips_amount_usd: parse_tip(r.tips_amount_usd),
                 channel: r.channel,
                 read_at: r.read_at,
                 image: r.image,
@@ -968,70 +947,6 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn bff_history_exposes_tips_amount_usd_on_gift_user_rows(pool: PgPool) {
-        let user_id = Uuid::new_v4();
-        let genome_id = seed_genome(&pool, "Aria").await;
-        let instance_id = seed_instance(&pool, genome_id, user_id).await;
-        let session_id = seed_session(&pool, user_id, instance_id).await;
-
-        sqlx::query(
-            "INSERT INTO engine.chat_messages \
-                 (session_id, role, content, metadata, sent_at) \
-             VALUES ($1, 'gift_user', '(打赏 $20)', \
-                     '{\"tips_amount_usd\": 20.0, \"tier\": \"gold\", \"prompt_traits\": [\"nsfw\"]}'::jsonb, \
-                     now() - interval '2 seconds'),
-                    ($1, 'user', 'hello', '{\"tier\": \"silver\"}'::jsonb, now() - interval '1 second')",
-        )
-        .bind(session_id)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let state = test_state(pool);
-        let mut app = build_router(state);
-        let token = mint_test_jwt(user_id);
-
-        let (status, body) =
-            send_request(&mut app, bff_history_request(&token, session_id, "")).await;
-        assert_eq!(status, StatusCode::OK, "got body: {body}");
-
-        let messages = body["messages"].as_array().expect("messages array");
-        assert_eq!(messages.len(), 2);
-
-        let tip = messages
-            .iter()
-            .find(|m| m["role"] == "gift_user")
-            .expect("tip row");
-        assert_eq!(tip["tips_amount_usd"], json!(20.0));
-
-        let normal = messages
-            .iter()
-            .find(|m| m["role"] == "user")
-            .expect("user row");
-        assert!(
-            normal.get("tips_amount_usd").is_none(),
-            "non-tip user row must omit tips_amount_usd; got {normal}"
-        );
-
-        // BFF MUST NOT leak any metadata key other than the typed tips_amount_usd
-        // extract. Spec §3.4: tier / prompt_traits are audit-only on the DB side.
-        for m in messages {
-            assert!(
-                m.get("metadata").is_none(),
-                "BFF must never expose raw metadata; got {m}"
-            );
-            assert!(
-                m.get("tier").is_none(),
-                "BFF must not surface tier from metadata; got {m}"
-            );
-            assert!(
-                m.get("prompt_traits").is_none(),
-                "BFF must not surface prompt_traits from metadata; got {m}"
-            );
-        }
-    }
-
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn bff_history_exposes_reply_to_message_id_on_quoted_rows(pool: PgPool) {
         // The anchor is written by the send path onto the user row's
         // `metadata.reply_to_message_id`; history must hand it back so a cold
@@ -1218,65 +1133,6 @@ mod tests {
                 "an unparseable anchor is dropped, not surfaced; got {m}"
             );
         }
-    }
-
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn bff_history_survives_a_malformed_tip(pool: PgPool) {
-        // Same failure mode as the reply anchor above, last cast standing
-        // (#302): a `::float8` in the projection would fail the WHOLE page on
-        // one bad `tips_amount_usd`. The tip is carried as text and parsed per
-        // row, so a junk value costs its own key and nothing else.
-        let user_id = Uuid::new_v4();
-        let genome_id = seed_genome(&pool, "Aria").await;
-        let instance_id = seed_instance(&pool, genome_id, user_id).await;
-        let session_id = seed_session(&pool, user_id, instance_id).await;
-
-        sqlx::query(
-            "INSERT INTO engine.chat_messages \
-                 (session_id, role, content, metadata, sent_at) \
-             VALUES ($1, 'gift_user', 'junk string', \
-                     '{\"tips_amount_usd\": \"twenty\"}'::jsonb, \
-                     now() - interval '5 seconds'),
-                    ($1, 'gift_user', 'json object', \
-                     '{\"tips_amount_usd\": {\"usd\": 20}}'::jsonb, \
-                     now() - interval '4 seconds'),
-                    ($1, 'gift_user', 'json null', \
-                     '{\"tips_amount_usd\": null}'::jsonb, \
-                     now() - interval '3 seconds'),
-                    ($1, 'gift_user', 'non-finite', \
-                     '{\"tips_amount_usd\": \"NaN\"}'::jsonb, \
-                     now() - interval '2 seconds'),
-                    ($1, 'gift_user', '(打赏 $20)', \
-                     '{\"tips_amount_usd\": 20.0}'::jsonb, \
-                     now() - interval '1 second')",
-        )
-        .bind(session_id)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let state = test_state(pool);
-        let mut app = build_router(state);
-        let token = mint_test_jwt(user_id);
-
-        let (status, body) =
-            send_request(&mut app, bff_history_request(&token, session_id, "")).await;
-        assert_eq!(status, StatusCode::OK, "the page still renders: {body}");
-
-        let messages = body["messages"].as_array().expect("messages array");
-        assert_eq!(messages.len(), 5, "every row survives: {body}");
-        for m in &messages[..4] {
-            assert!(
-                m.get("tips_amount_usd").is_none(),
-                "an unparseable or non-finite tip is dropped, not surfaced \
-                 (serde_json would render NaN as null); got {m}"
-            );
-        }
-        assert_eq!(
-            messages[4]["tips_amount_usd"],
-            json!(20.0),
-            "the well-formed tip still parses: {body}"
-        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

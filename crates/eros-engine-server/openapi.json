@@ -2310,7 +2310,7 @@
               "null"
             ],
             "format": "date-time",
-            "description": "When this message reached the party it was addressed to — set by\n`POST /comp/chat/{session_id}/read` on an `assistant` row, and by the\nengine itself on a `user` row (the moment the turn handed the message to\nits first model; delivery, not that model's acknowledgement). Omitted\nwhile unread; permanently omitted on tips and voice `user` rows, which\nhave no reader. Absence means \"no receipt\", not \"not yet read\"."
+            "description": "When this message reached the party it was addressed to — set by\n`POST /comp/chat/{session_id}/read` on an `assistant` row, and by the\nengine itself on a `user` row (the moment the turn handed the message to\nits first model; delivery, not that model's acknowledgement). Omitted\nwhile unread; permanently omitted on voice `user` rows, which have no\nreader. Absence means \"no receipt\", not \"not yet read\"."
           },
           "reply_to_message_id": {
             "type": [
@@ -2327,14 +2327,6 @@
           "sent_at": {
             "type": "string",
             "format": "date-time"
-          },
-          "tips_amount_usd": {
-            "type": [
-              "number",
-              "null"
-            ],
-            "format": "double",
-            "description": "Structured tip amount for `role='gift_user'` rows. Omitted from\nresponse when None (`skip_serializing_if`). Lets clients render tips\nat the right point in the timeline without parsing the `(打赏 $X)`\ncontent marker. Spec:\ndocs/superpowers/specs/2026-05-26-tip-role-and-filter-audit-design.md §3.4."
           },
           "user_message_id": {
             "type": [
@@ -2854,7 +2846,7 @@
               "null"
             ],
             "format": "date-time",
-            "description": "When this message reached the party it was addressed to. On an\n`assistant` row: when the client called `POST /comp/chat/{id}/read` —\nthe human read it. On a `user` row: when the engine handed the message\nto the first model of the turn (\"delivered to a model\", not that\nmodel's acknowledgement). **Omitted while unread**, so a client tests\nfor the key's presence; there is no `null` form. Omitted forever on\ntips and on voice `user` rows, which have no reader — treat absence as\n\"no receipt\", never as \"not yet read\"."
+            "description": "When this message reached the party it was addressed to. On an\n`assistant` row: when the client called `POST /comp/chat/{id}/read` —\nthe human read it. On a `user` row: when the engine handed the message\nto the first model of the turn (\"delivered to a model\", not that\nmodel's acknowledgement). **Omitted while unread**, so a client tests\nfor the key's presence; there is no `null` form. Omitted forever on\nvoice `user` rows, which have no reader — treat absence as\n\"no receipt\", never as \"not yet read\"."
           },
           "reply_to_message_id": {
             "type": [
@@ -3938,7 +3930,7 @@
               },
               {
                 "$ref": "#/components/schemas/UserActionDto",
-                "description": "Optional action this turn carries besides the text (see\n[`UserActionDto`]). With an action, `content` may be empty. Cannot be\ncombined with `tips_amount_usd`."
+                "description": "Optional action this turn carries besides the text (see\n[`UserActionDto`]). With an action, `content` may be empty."
               }
             ]
           },
@@ -4023,13 +4015,6 @@
               "string",
               "null"
             ]
-          },
-          "tips_amount_usd": {
-            "type": [
-              "number",
-              "null"
-            ],
-            "format": "double"
           },
           "user_country": {
             "type": [

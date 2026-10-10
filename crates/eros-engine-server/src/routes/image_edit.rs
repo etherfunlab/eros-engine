@@ -307,7 +307,6 @@ fn edit_turn_event(
         tier,
         memory_scope: Default::default(),
         affinity_scope: Default::default(),
-        tips_amount_usd: None,
         quote,
         action: None,
     }

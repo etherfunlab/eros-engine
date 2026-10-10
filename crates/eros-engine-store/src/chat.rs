@@ -131,17 +131,6 @@ pub struct ChatMessageSlim {
     /// Client-supplied message id forwarded during streaming (idempotency
     /// key). NULL for rows that never carried one (e.g. assistant turns).
     pub client_msg_id: Option<String>,
-    /// Tip amount extracted from `metadata->>'tips_amount_usd'`. Present on
-    /// `role='gift_user'` rows that carry tip metadata; NULL on all other
-    /// rows. Lets BFF / FE render tips as a structured field instead of
-    /// parsing the `(打赏 $X)` content marker.
-    ///
-    /// Carried as raw text, not `::float8`, for the same reason as
-    /// `reply_to_message_id` below: `metadata` is unconstrained JSONB, and a
-    /// cast that meets one malformed value fails the whole page rather than
-    /// the one row. The caller parses and drops what does not parse.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tips_amount_usd: Option<String>,
     /// Conversation-flavor marker: `"product_qa"` = out-of-character product
     /// answer (excluded from companion context). NULL for normal turns.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -175,8 +164,8 @@ pub struct ChatMessageSlim {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reply_to_message_id: Option<String>,
     /// The user row's `metadata.action` as stored, `response` included (spec
-    /// 2026-10-05 §3.5). Raw JSON for the same reason as the two text
-    /// extracts above: the caller parses it and drops what does not parse.
+    /// 2026-10-05 §3.5). Raw JSON for the same reason as the text extract
+    /// above: the caller parses it and drops what does not parse.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<serde_json::Value>,
     /// The `role='user'` row that drove the turn this row belongs to. Set on
@@ -189,7 +178,6 @@ pub struct ChatMessageSlim {
 
 /// The `ChatMessageSlim` projection, shared by every query that decodes one.
 const SLIM_COLUMNS: &str = "id, role, content, sent_at, client_msg_id, \
-     metadata->>'tips_amount_usd' AS tips_amount_usd, \
      channel, read_at, reaction, reacted_at, \
      (metadata->'image' IS NOT NULL) AS image, \
      metadata->>'reply_to_message_id' AS reply_to_message_id, \

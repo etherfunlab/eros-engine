@@ -4152,9 +4152,8 @@ pub struct PersistedUserMessage {
     pub tier: Option<String>,
     pub memory_scope: eros_engine_core::scope::MemoryScope,
     pub affinity_scope: eros_engine_core::scope::AffinityScope,
-    pub tips_amount_usd: Option<f64>,
     /// The image URL the client attached to this turn (`https`/`http`), or
-    /// `None` for a text/tip-only turn. Drives the `chat_vision` pre-stage.
+    /// `None` for a text-only turn. Drives the `chat_vision` pre-stage.
     pub image_url: Option<String>,
     /// Image reply parameters supplied by the client, forwarded from the request.
     pub image: Option<crate::routes::companion_stream::ImageReplyParams>,
@@ -4181,7 +4180,6 @@ impl PersistedUserMessage {
             tier: self.tier.clone(),
             memory_scope: self.memory_scope,
             affinity_scope: self.affinity_scope,
-            tips_amount_usd: self.tips_amount_usd,
             quote: self.quote.clone(),
             action: self.action.clone(),
         }
@@ -4285,9 +4283,8 @@ pub(crate) fn run_stream_with(
         };
         // ── PDE decision (judge-first) ────────────────────────────────────────
         // The judge runs before vision/input-filter/chat so a `ghost` verdict
-        // short-circuits all of them. Tip turns and feature-off skip the judge
-        // (rule engine). Fail-open: any non-Ok status falls back to pde::decide.
-        let is_tip = user_msg.tips_amount_usd.is_some();
+        // short-circuits all of them. Feature-off skips the judge (rule
+        // engine). Fail-open: any non-Ok status falls back to pde::decide.
         let action_turn = user_msg.action.is_some();
         // Delegate-only: the chat stream never draws, so image-action
         // availability keys on the PRESENCE of the request `image` block (the
@@ -4297,15 +4294,8 @@ pub(crate) fn run_stream_with(
         let req_image = user_msg.image.as_ref();
         let image_executor_available =
             image_capability_available(req_image.is_some(), &state.model_config);
-        let force_image = req_image.is_some_and(|i| i.force) && !is_tip;
-        // Skip resolution on tip turns: the judge won't run, and resolve_pde()
-        // advances the round-robin model cursor as a side effect — resolving on a
-        // skipped turn would skew which model later (non-tip) judge calls pick.
-        let resolved_pde = if is_tip {
-            None
-        } else {
-            state.model_config.resolve_pde()
-        };
+        let force_image = req_image.is_some_and(|i| i.force);
+        let resolved_pde = state.model_config.resolve_pde();
         // product_qa executor: hard-gated on the judge being live (spec §1.1).
         // `resolve_product_qa()` advances the chat_product_qa round-robin model
         // cursor as a side effect (like `resolve_pde()` above) — every judged
@@ -4344,8 +4334,8 @@ pub(crate) fn run_stream_with(
         };
         let mut killswitch_hints: Vec<String> = Vec::new();
         let (mut plan, pde_run): (eros_engine_core::types::ActionPlan, Option<PdeDecisionRun>) =
-            match (is_tip, resolved_pde.as_ref()) {
-                (false, Some(p)) => {
+            match resolved_pde.as_ref() {
+                Some(p) => {
                     let ctx = build_pde_ctx(
                         &pde_transcript,
                         &input,
@@ -4357,9 +4347,9 @@ pub(crate) fn run_stream_with(
                     // instant the user's row was read. Spawned, never awaited —
                     // it runs while the turn is already blocked on the judge, so
                     // it costs nothing and a failure costs only the timestamp.
-                    // The only call site: a turn that skips the judge (tip, or
-                    // no [tasks.pde_decision] configured) leaves read_at NULL by
-                    // design (design §5.1).
+                    // The only call site: a turn that skips the judge (no
+                    // [tasks.pde_decision] configured) leaves read_at NULL by design
+                    // (design §5.1).
                     {
                         let pool = state.pool.clone();
                         let id = user_msg.user_message_id;
@@ -4417,7 +4407,7 @@ pub(crate) fn run_stream_with(
                     };
                     (plan, Some(run))
                 }
-                _ => (pde::decide(&input), None), // tip OR feature off
+                None => (pde::decide(&input), None), // feature off
             };
 
         // Ghosting kill-switch (§4.1) — path-wide final gate (LLM / fallback /
@@ -5116,10 +5106,7 @@ pub(crate) fn run_stream_with(
                 // failure keeps the turn text-only (placeholder covers an
                 // undescribed image). Run-once is guaranteed by the upsert
                 // idempotency gate — run_stream only runs on a fresh Insert.
-                // Skip tipped turns (same as the input filter): a tip persists as
-                // role='gift_user' and carries no image (tip+image is rejected at
-                // validation), so describing it would waste the call.
-                // Every image-carrying, non-tipped turn that reaches THIS arm
+                // Every image-carrying turn that reaches THIS arm
                 // writes exactly one chat_vision_events row, including the
                 // not-configured case — that's the only way to tell "no
                 // [tasks.chat_vision]" apart from "the describe ran and
@@ -5129,94 +5116,92 @@ pub(crate) fn run_stream_with(
                 // row: the describe never runs on those paths either
                 // (running one on a ghost turn would waste a paid call), so
                 // there is nothing to audit. The table's denominator is
-                // "image-carrying, non-tipped turns that reach the text-reply
-                // path", not every image-carrying turn.
-                if user_msg.tips_amount_usd.is_none() {
-                    if let Some(image_url) = user_msg.image_url.as_deref() {
-                        let (run, status) = match state.model_config.resolve_vision() {
-                            Some(v) => {
-                                let run = run_vision(
-                                    &state,
-                                    user_msg.session_id,
-                                    &v,
-                                    image_url,
-                                    &user_msg.content,
-                                )
-                                .await;
-                                let status = if run.outcome.is_some() { "ok" } else { "exhausted" };
-                                (run, status)
-                            }
-                            // No [tasks.chat_vision]: nothing was called, but the
-                            // turn DID carry an image — recording that is the only
-                            // way to tell this apart from a failed describe.
-                            None => (
-                                VisionRun {
-                                    outcome: None,
-                                    attempts: 0,
-                                    last_failure: None,
-                                    last_generation_id: None,
-                                    failures: Vec::new(),
-                                },
-                                "not_configured",
-                            ),
-                        };
-                        let (vision_attempts, vision_gateways) = split_failures(&run.failures);
-                        if let Some(out) = run.outcome.as_ref() {
-                            if let Err(e) = chat_repo
-                                .set_user_image_vision(
-                                    user_msg.user_message_id,
-                                    &out.vision,
-                                    &out.vision_model,
-                                    out.v_generation_id.as_deref(),
-                                )
-                                .await
-                            {
-                                tracing::warn!("stream: chat_vision metadata persist failed: {e}");
-                            }
-                        }
-                        let repo = eros_engine_store::image_events::ChatVisionEventRepo {
-                            pool: &state.pool,
-                        };
-                        // Fail-open AND bounded (Fix 3): a stalled pool or
-                        // connection must not delay this reply turn behind
-                        // an audit write that never returns. Still awaited,
-                        // not detached, so write ordering holds — only
-                        // bounded.
-                        match tokio::time::timeout(
-                            super::AUDIT_WRITE_TIMEOUT,
-                            repo.record(eros_engine_store::image_events::ChatVisionEventInsert {
-                                llm_attempts: vision_attempts,
-                                gateway_errors: vision_gateways,
-                                user_id: user_msg.user_id,
-                                session_id: user_msg.session_id,
-                                message_id: user_msg.user_message_id,
-                                status,
+                // "image-carrying turns that reach the text-reply path", not
+                // every image-carrying turn.
+                if let Some(image_url) = user_msg.image_url.as_deref() {
+                    let (run, status) = match state.model_config.resolve_vision() {
+                        Some(v) => {
+                            let run = run_vision(
+                                &state,
+                                user_msg.session_id,
+                                &v,
                                 image_url,
-                                vision: run.outcome.as_ref().map(|o| o.vision.clone()),
-                                // A content-level failure (empty / unparseable /
-                                // any invalidity reason) still means the last
-                                // attempted model answered and was billed —
-                                // `run.last_*` carries that identity so an
-                                // `exhausted` row isn't wrongly blank. Transport
-                                // failures never populate `run.last_*`.
-                                generation_id: run
-                                    .outcome
-                                    .as_ref()
-                                    .and_then(|o| o.v_generation_id.as_deref())
-                                    .or(run.last_generation_id.as_deref()),
-                                attempts: run.attempts,
-                                last_failure: run.last_failure,
-                            }),
-                        )
-                        .await
+                                &user_msg.content,
+                            )
+                            .await;
+                            let status = if run.outcome.is_some() { "ok" } else { "exhausted" };
+                            (run, status)
+                        }
+                        // No [tasks.chat_vision]: nothing was called, but the
+                        // turn DID carry an image — recording that is the only
+                        // way to tell this apart from a failed describe.
+                        None => (
+                            VisionRun {
+                                outcome: None,
+                                attempts: 0,
+                                last_failure: None,
+                                last_generation_id: None,
+                                failures: Vec::new(),
+                            },
+                            "not_configured",
+                        ),
+                    };
+                    let (vision_attempts, vision_gateways) = split_failures(&run.failures);
+                    if let Some(out) = run.outcome.as_ref() {
+                        if let Err(e) = chat_repo
+                            .set_user_image_vision(
+                                user_msg.user_message_id,
+                                &out.vision,
+                                &out.vision_model,
+                                out.v_generation_id.as_deref(),
+                            )
+                            .await
                         {
-                            Ok(Ok(_)) => {}
-                            Ok(Err(e)) => {
-                                tracing::warn!(error = %e, "chat_vision_events: audit write failed");
-                            }
-                            Err(_) => {
-                                tracing::warn!("chat_vision_events: audit write timed out");
-                            }
+                            tracing::warn!("stream: chat_vision metadata persist failed: {e}");
+                        }
+                    }
+                    let repo = eros_engine_store::image_events::ChatVisionEventRepo {
+                        pool: &state.pool,
+                    };
+                    // Fail-open AND bounded (Fix 3): a stalled pool or
+                    // connection must not delay this reply turn behind
+                    // an audit write that never returns. Still awaited,
+                    // not detached, so write ordering holds — only
+                    // bounded.
+                    match tokio::time::timeout(
+                        super::AUDIT_WRITE_TIMEOUT,
+                        repo.record(eros_engine_store::image_events::ChatVisionEventInsert {
+                            llm_attempts: vision_attempts,
+                            gateway_errors: vision_gateways,
+                            user_id: user_msg.user_id,
+                            session_id: user_msg.session_id,
+                            message_id: user_msg.user_message_id,
+                            status,
+                            image_url,
+                            vision: run.outcome.as_ref().map(|o| o.vision.clone()),
+                            // A content-level failure (empty / unparseable /
+                            // any invalidity reason) still means the last
+                            // attempted model answered and was billed —
+                            // `run.last_*` carries that identity so an
+                            // `exhausted` row isn't wrongly blank. Transport
+                            // failures never populate `run.last_*`.
+                            generation_id: run
+                                .outcome
+                                .as_ref()
+                                .and_then(|o| o.v_generation_id.as_deref())
+                                .or(run.last_generation_id.as_deref()),
+                            attempts: run.attempts,
+                            last_failure: run.last_failure,
+                        }),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => {
+                            tracing::warn!(error = %e, "chat_vision_events: audit write failed");
+                        }
+                        Err(_) => {
+                            tracing::warn!("chat_vision_events: audit write timed out");
                         }
                     }
                 }
@@ -5225,9 +5210,6 @@ pub(crate) fn run_stream_with(
                 // rewrite is persisted on the user row's pre_filter_content;
                 // build_reply_request then feeds the EFFECTIVE text to the model
                 // and recall. Fail-open: any non-rewrite outcome is a no-op.
-                // Skip tipped turns too: a tip persists as role='gift_user' whose
-                // "(打赏 $X)" marker / typed message should reach the model as-is,
-                // not be rewritten by the filter — running it would waste the call.
                 //
                 // The text the model will actually see this turn. The input
                 // filter persists its rewrite and `build_reply_request` re-reads
@@ -5241,11 +5223,9 @@ pub(crate) fn run_stream_with(
                 // input filter is one of spec §6.1's non-fatal chains.
                 let mut input_filter_failures: Vec<eros_engine_llm::failure::AttemptFailure> =
                     Vec::new();
-                // Skipped on tips, and on an action turn with no text: there is
-                // nothing to rewrite (spec 2026-10-05 §5.3).
-                if user_msg.tips_amount_usd.is_none()
-                    && !(user_msg.action.is_some() && user_msg.content.trim().is_empty())
-                {
+                // Skipped on an action turn with no text: there is nothing to
+                // rewrite (spec 2026-10-05 §5.3).
+                if !(user_msg.action.is_some() && user_msg.content.trim().is_empty()) {
                     // Per-turn probability gate: `input_filter = 0.8` ⇒ fire on
                     // ~80% of turns; `true` ⇒ probability 1.0 ⇒ always (gen::<f64>()
                     // is in [0,1), so `< 1.0` always fires); `false` ⇒ resolve
@@ -7014,7 +6994,6 @@ mod tests {
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 quote: Default::default(),
                 action: None,
             },
@@ -7291,7 +7270,6 @@ mod tests {
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -7671,7 +7649,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -7771,7 +7748,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -7910,7 +7886,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -8057,7 +8032,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -8170,7 +8144,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -8274,7 +8247,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -8385,7 +8357,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: Some(crate::routes::companion_stream::ImageReplyParams {
                     force: true,
@@ -8569,7 +8540,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: Some(crate::routes::companion_stream::ImageReplyParams {
                     force: true,
@@ -8675,7 +8645,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: Some(crate::routes::companion_stream::ImageReplyParams {
                     force: true,
@@ -8769,7 +8738,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: Some(crate::routes::companion_stream::ImageReplyParams {
                     force: true,
@@ -9273,7 +9241,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: Some("https://example.invalid/u.jpg".into()),
                 image: None,
                 quote: Default::default(),
@@ -9398,7 +9365,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: Some(crate::routes::companion_stream::ImageReplyParams {
                     force: true,
@@ -9524,7 +9490,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 // Presence of the image block signals "consumer handles images
                 // this turn"; with the composer task configured, guard_action
@@ -9712,7 +9677,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: Some(crate::routes::companion_stream::ImageReplyParams::default()),
                 quote: Default::default(),
@@ -9848,7 +9812,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: Some(crate::routes::companion_stream::ImageReplyParams::default()),
                 quote: Default::default(),
@@ -10019,7 +9982,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: Some(crate::routes::companion_stream::ImageReplyParams::default()),
                 quote: Default::default(),
@@ -10200,7 +10162,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 // Presence of the image block signals "consumer handles images
                 // this turn"; with the composer task configured, guard_action
@@ -10379,7 +10340,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -11257,7 +11217,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -11387,7 +11346,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -11904,7 +11862,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -12050,7 +12007,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -12219,7 +12175,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -12338,7 +12293,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -12456,7 +12410,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -12492,100 +12445,6 @@ data: [DONE]\n\n";
                 .unwrap();
             assert!(!filtered, "final.filtered must be false in live mode");
         }
-    }
-
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn run_stream_tip_injects_reward_block_in_prompt(pool: PgPool) {
-        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
-        use futures_util::StreamExt;
-        use wiremock::matchers::path as wm_path;
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let mock = MockServer::start().await;
-        let body = "\
-data: {\"choices\":[{\"delta\":{\"content\":\"谢谢\"}}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":2,\"total_tokens\":4},\"id\":\"gen-r\",\"model\":\"primary\"}\n\n\
-data: [DONE]\n\n";
-        Mock::given(wm_path("/api/v1/chat/completions"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "text/event-stream")
-                    .set_body_raw(body, "text/event-stream"),
-            )
-            .mount(&mock)
-            .await;
-
-        let user_id = Uuid::new_v4();
-        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
-
-        let mut state = crate::routes::companion::test_state(pool.clone());
-        state.openrouter = std::sync::Arc::new(
-            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
-                "test-key".into(),
-                format!("{}/api/v1/chat/completions", mock.uri()),
-            ),
-        );
-
-        let chat_repo = ChatRepo { pool: &pool };
-        let user_message_id = match chat_repo
-            .upsert_user_message_idempotent(
-                session_id,
-                "(打赏 $20)",
-                "01J5555555555555555555555A",
-                "gift_user",
-                Some(&serde_json::json!({"tips_amount_usd": 20.0})),
-            )
-            .await
-            .unwrap()
-        {
-            UpsertUserOutcome::Inserted { message_id } => message_id,
-            _ => unreachable!(),
-        };
-
-        let frames: Vec<ProtocolFrame> = run_stream(
-            std::sync::Arc::new(state),
-            PersistedUserMessage {
-                user_message_id,
-                session_id,
-                user_id,
-                instance_id,
-                content: "(打赏 $20)".into(),
-                prompt_traits: vec![],
-                audit: None,
-                tier: None,
-                memory_scope: Default::default(),
-                affinity_scope: Default::default(),
-                tips_amount_usd: Some(20.0),
-                image_url: None,
-                image: None,
-                quote: Default::default(),
-                user_locale: Default::default(),
-                action: None,
-            },
-            None,
-        )
-        .collect()
-        .await;
-
-        assert!(
-            !frames
-                .iter()
-                .any(|f| matches!(f, ProtocolFrame::Error { .. })),
-            "no error frame expected, got {frames:?}",
-        );
-        assert!(matches!(frames.last(), Some(ProtocolFrame::Final { .. })));
-
-        // A tip is never ghosted ⇒ exactly one LLM call, whose system prompt
-        // carries the tip block.
-        let reqs = mock.received_requests().await.unwrap();
-        assert!(
-            !reqs.is_empty(),
-            "tip must trigger an LLM call (never ghosted)"
-        );
-        let sent = String::from_utf8_lossy(&reqs[0].body);
-        assert!(
-            sent.contains("[tip_received]") && sent.contains("$20 美元的红包"),
-            "system prompt must contain the tip block, got: {sent}",
-        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -12664,7 +12523,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -12777,7 +12635,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -12908,7 +12765,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -13112,7 +12968,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -13240,7 +13095,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -13365,7 +13219,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -13402,111 +13255,6 @@ data: [DONE]\n\n";
             "malformed primary verdict must keep original (no fallback walk); got {pre:?}"
         );
         assert!(fmodel.is_none(), "no filter model stamped; got {fmodel:?}");
-    }
-
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn tip_turn_reaches_model_not_parrot(pool: PgPool) {
-        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
-        use futures_util::StreamExt;
-        use wiremock::matchers::{body_string_contains, path as wm_path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let mock = MockServer::start().await;
-
-        // Chat model replies ONLY when the request body carries the tip turn
-        // ("(打赏"). A REPLY delta therefore proves the gift_user turn reached the
-        // model (pre-fix it is dropped, so the mock never matches → no REPLY).
-        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"REPLY\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"deepseek/x\"}\n\ndata: [DONE]\n\n";
-        Mock::given(wm_path("/api/v1/chat/completions"))
-            .and(body_string_contains("deepseek/x"))
-            .and(body_string_contains("(打赏"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "text/event-stream")
-                    .set_body_raw(chat_body, "text/event-stream"),
-            )
-            .mount(&mock)
-            .await;
-
-        let user_id = Uuid::new_v4();
-        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
-
-        let mut state = crate::routes::companion::test_state(pool.clone());
-        state.model_config = std::sync::Arc::new(
-            eros_engine_llm::model_config::ModelConfig::from_toml_str(
-                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n",
-            )
-            .unwrap(),
-        );
-        state.openrouter = std::sync::Arc::new(
-            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
-                "k".into(),
-                format!("{}/api/v1/chat/completions", mock.uri()),
-            ),
-        );
-
-        // A tip-only turn: persisted as role='gift_user' with the "(打赏 $X)" marker
-        // and tip metadata (`tips_amount_usd`) — a gift_user row is always a tip
-        // now, and production persists the tip amount in metadata.
-        let tip_meta = serde_json::json!({ "tips_amount_usd": 0.5 });
-        let chat_repo = ChatRepo { pool: &pool };
-        let umid = match chat_repo
-            .upsert_user_message_idempotent(
-                session_id,
-                "(打赏 $0.5)",
-                "01J8888888888888888888888B",
-                "gift_user",
-                Some(&tip_meta),
-            )
-            .await
-            .unwrap()
-        {
-            UpsertUserOutcome::Inserted { message_id } => message_id,
-            _ => unreachable!(),
-        };
-
-        let frames: Vec<ProtocolFrame> = run_stream(
-            std::sync::Arc::new(state),
-            PersistedUserMessage {
-                user_message_id: umid,
-                session_id,
-                user_id,
-                instance_id,
-                content: "(打赏 $0.5)".into(),
-                prompt_traits: vec![],
-                audit: None,
-                tier: None,
-                memory_scope: Default::default(),
-                affinity_scope: Default::default(),
-                tips_amount_usd: Some(0.5),
-                image_url: None,
-                image: None,
-                quote: Default::default(),
-                user_locale: Default::default(),
-                action: None,
-            },
-            None,
-        )
-        .collect()
-        .await;
-
-        let deltas: String = frames
-            .iter()
-            .filter_map(|f| match f {
-                ProtocolFrame::Delta { content, .. } => Some(content.clone()),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            deltas.contains("REPLY"),
-            "tip turn must reach the model (chat mock requires the tip text in the body); got frames {frames:?}"
-        );
-        assert!(
-            !frames
-                .iter()
-                .any(|f| matches!(f, ProtocolFrame::Error { .. })),
-            "no error frame expected on a tip turn; got frames {frames:?}"
-        );
     }
 
     #[test]
@@ -13656,7 +13404,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: Some("https://x/y.png".into()),
                 image: None,
                 quote: Default::default(),
@@ -13859,7 +13606,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: Some("https://x/bad.png".into()),
                 image: None,
                 quote: Default::default(),
@@ -14011,7 +13757,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: Some("https://x/522.png".into()),
                 image: None,
                 quote: Default::default(),
@@ -14150,7 +13895,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: Some("https://x/523.png".into()),
                 image: None,
                 quote: Default::default(),
@@ -14311,7 +14055,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -14471,7 +14214,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -14606,7 +14348,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -14738,7 +14479,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -14896,7 +14636,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -15093,7 +14832,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -15240,7 +14978,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -15396,7 +15133,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -15577,7 +15313,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -15810,7 +15545,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -15960,7 +15694,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -16095,7 +15828,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -16266,7 +15998,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Some(eros_engine_core::types::QuotedMessage {
@@ -16392,7 +16123,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -16436,7 +16166,7 @@ data: [DONE]\n\n";
     /// Issue #84 — byte-BPE garble guard: garbled completion is repaired before
     /// persist so the DB row never re-enters history as raw glyphs.
     ///
-    /// Strategy: use `tips_amount_usd: Some(1.0)` so PDE's tip-path always
+    /// Strategy: use a tip action so the rule PDE's action branch always
     /// picks `ActionType::ReplyText` (never Ghost), making the live-burst path
     /// deterministic without seeding affinity state. The mock returns an SSE
     /// body whose accumulated text is `"HiĠthereĊbye"` (~16% Ġ/Ċ density,
@@ -16529,14 +16259,13 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                // Tip turn: forces PDE to pick ReplyText unconditionally (never
-                // Ghost), so the live-burst path is guaranteed to run.
-                tips_amount_usd: Some(1.0),
                 image_url: None,
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
-                action: None,
+                // Tip action: the rule PDE's action branch always replies (never
+                // Ghost), so the live-burst path is guaranteed to run.
+                action: Some(eros_engine_core::types::UserAction::Tip { amount_usd: 1.0 }),
             },
             None,
         )
@@ -16684,12 +16413,11 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: Some(1.0),
                 image_url: None,
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
-                action: None,
+                action: Some(eros_engine_core::types::UserAction::Tip { amount_usd: 1.0 }),
             },
             None,
         )
@@ -16924,7 +16652,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -17042,7 +16769,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -17187,7 +16913,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -17284,7 +17009,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -17895,7 +17619,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 quote: Default::default(),
                 action: None,
             },
@@ -17952,7 +17675,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 quote: Default::default(),
                 action: None,
             },
@@ -18097,7 +17819,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 quote: Default::default(),
                 action: None,
             },
@@ -18629,7 +18350,6 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -20150,7 +19870,6 @@ data: [DONE]\n\n"
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -20292,7 +20011,6 @@ data: [DONE]\n\n"
             tier: Some("gold".into()),
             memory_scope: Default::default(),
             affinity_scope: Default::default(),
-            tips_amount_usd: None,
             image_url: None,
             image: None,
             quote: Default::default(),
@@ -20443,7 +20161,6 @@ data: [DONE]\n\n"
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
-                tips_amount_usd: None,
                 image_url: None,
                 image: None,
                 quote: Default::default(),
