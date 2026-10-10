@@ -4067,11 +4067,19 @@
       },
       "UserActionDto": {
         "type": "object",
-        "description": "An action the user does to the persona this turn, besides talking. The\npersona accepts or does not; a refusal costs the relationship one tier on\nthe line the action touches (`give` → bond, everything else → chemistry).",
+        "description": "An action the user does to the persona this turn, besides talking. The\npersona accepts or does not; a refusal costs the relationship one tier on\nthe line the action touches (`give` → bond, every physical or custom action →\nchemistry); a refused `tip` costs nothing.",
         "required": [
           "type"
         ],
         "properties": {
+          "amount_usd": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "`tip` only, and required there: the amount in USD, finite, in\n`(0, 1_000_000_000]`. The engine records it and never verifies it; the\ncaller is the payment authority."
+          },
           "item": {
             "oneOf": [
               {
@@ -4123,7 +4131,8 @@
           "hug",
           "touch",
           "lick",
-          "custom"
+          "custom",
+          "tip"
         ]
       },
       "UserActionView": {

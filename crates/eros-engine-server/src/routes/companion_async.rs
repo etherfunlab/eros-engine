@@ -621,6 +621,7 @@ mod tests {
                 name: None,
                 quantity: None,
                 text: Some("捏了捏你的脸".into()),
+                amount_usd: None,
             }),
             ..Default::default()
         };
@@ -636,6 +637,17 @@ mod tests {
         assert!(
             legacy.action.is_none(),
             "rows queued before this field still parse"
+        );
+    }
+
+    #[test]
+    fn queued_params_rebuild_a_tip() {
+        let params: super::QueuedTurnParams =
+            serde_json::from_value(json!({"action": {"type": "tip", "amount_usd": 20.0}}))
+                .unwrap();
+        assert_eq!(
+            params.action.unwrap().to_core().unwrap(),
+            eros_engine_core::types::UserAction::Tip { amount_usd: 20.0 }
         );
     }
 

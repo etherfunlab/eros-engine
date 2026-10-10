@@ -1136,6 +1136,90 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_history_returns_a_tip_as_an_action(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+
+        sqlx::query(
+            "INSERT INTO engine.chat_messages \
+                 (session_id, role, content, metadata, sent_at) \
+             VALUES ($1, 'user', '', \
+                     '{\"action\": {\"type\": \"tip\", \"amount_usd\": 20.0, \"response\": \"refuse\"}, \
+                       \"tier\": \"gold\", \"prompt_traits\": [\"nsfw\"]}'::jsonb, \
+                     now() - interval '2 seconds'),
+                    ($1, 'user', 'hello', '{\"tier\": \"silver\"}'::jsonb, now() - interval '1 second')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+        let (status, body) =
+            send_request(&mut app, bff_history_request(&token, session_id, "")).await;
+        assert_eq!(status, StatusCode::OK, "got body: {body}");
+
+        let messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[0]["action"],
+            json!({"type": "tip", "amount_usd": 20.0, "response": "refuse"})
+        );
+        assert!(messages[1].get("action").is_none(), "{}", messages[1]);
+        for m in messages {
+            assert!(m.get("tips_amount_usd").is_none(), "{m}");
+            assert!(m.get("metadata").is_none(), "{m}");
+            assert!(m.get("tier").is_none(), "{m}");
+            assert!(m.get("prompt_traits").is_none(), "{m}");
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_history_drops_a_malformed_tip_action(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+
+        sqlx::query(
+            "INSERT INTO engine.chat_messages \
+                 (session_id, role, content, metadata, sent_at) \
+             VALUES ($1, 'user', 'a', \
+                     '{\"action\": {\"type\": \"tip\", \"amount_usd\": \"twenty\"}}'::jsonb, \
+                     now() - interval '3 seconds'),
+                    ($1, 'user', 'b', \
+                     '{\"action\": {\"type\": \"tip\", \"amount_usd\": {\"usd\": 20}}}'::jsonb, \
+                     now() - interval '2 seconds'),
+                    ($1, 'user', 'c', \
+                     '{\"action\": {\"type\": \"tip\", \"amount_usd\": 20.0}}'::jsonb, \
+                     now() - interval '1 second')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+        let (status, body) =
+            send_request(&mut app, bff_history_request(&token, session_id, "")).await;
+        assert_eq!(status, StatusCode::OK, "the page still renders: {body}");
+        let messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 3, "every row survives: {body}");
+        assert!(messages[0].get("action").is_none(), "{}", messages[0]);
+        assert!(messages[1].get("action").is_none(), "{}", messages[1]);
+        assert_eq!(
+            messages[2]["action"],
+            json!({"type": "tip", "amount_usd": 20.0})
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn bff_start_matches_canonical_start_session_id(pool: PgPool) {
         // Same input on both endpoints should resolve to the same session for the
         // same JWT user. Confirms resolve_or_create_session is the only mover.

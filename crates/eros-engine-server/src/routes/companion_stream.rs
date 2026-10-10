@@ -36,6 +36,7 @@ use crate::state::AppState;
 const MAX_CONTENT_CHARS: usize = 4096;
 const MAX_TIER_LEN: usize = 32;
 const MAX_IMAGE_URL_LEN: usize = 2048;
+const MAX_TIP_USD: f64 = 1_000_000_000.0;
 const MAX_ACTION_NAME_CHARS: usize = 32;
 const MAX_ACTION_TEXT_CHARS: usize = 100;
 const MAX_ACTION_QUANTITY: u32 = 99;
@@ -123,6 +124,7 @@ pub enum UserActionKind {
     Touch,
     Lick,
     Custom,
+    Tip,
 }
 
 /// What a `give` action hands over.
@@ -136,7 +138,8 @@ pub enum GiftItemDto {
 
 /// An action the user does to the persona this turn, besides talking. The
 /// persona accepts or does not; a refusal costs the relationship one tier on
-/// the line the action touches (`give` → bond, everything else → chemistry).
+/// the line the action touches (`give` → bond, every physical or custom action →
+/// chemistry); a refused `tip` costs nothing.
 #[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct UserActionDto {
     #[serde(rename = "type")]
@@ -157,6 +160,11 @@ pub struct UserActionDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(max_length = 100)]
     pub text: Option<String>,
+    /// `tip` only, and required there: the amount in USD, finite, in
+    /// `(0, 1_000_000_000]`. The engine records it and never verifies it; the
+    /// caller is the payment authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amount_usd: Option<f64>,
 }
 
 impl UserActionDto {
@@ -207,6 +215,17 @@ impl UserActionDto {
                 text: free_text(self.text.as_deref(), "text", MAX_ACTION_TEXT_CHARS)?
                     .ok_or("action.text is required for custom")?,
             },
+            UserActionKind::Tip => {
+                let amount_usd = self
+                    .amount_usd
+                    .ok_or("action.amount_usd is required for tip")?;
+                if !amount_usd.is_finite() || amount_usd <= 0.0 || amount_usd > MAX_TIP_USD {
+                    return Err(format!(
+                        "action.amount_usd must be a finite value in (0, {MAX_TIP_USD}]"
+                    ));
+                }
+                UserAction::Tip { amount_usd }
+            }
         })
     }
 }
@@ -2761,6 +2780,7 @@ mod validate_payload_tests {
             name: name.map(String::from),
             quantity,
             text: None,
+            amount_usd: None,
         }
     }
 
@@ -2771,6 +2791,7 @@ mod validate_payload_tests {
             name: None,
             quantity: None,
             text: None,
+            amount_usd: None,
         }
     }
 
@@ -2859,6 +2880,83 @@ mod validate_payload_tests {
         assert_eq!(
             meta["action"],
             serde_json::json!({"type": "give", "item": "alcohol", "name": "威士忌", "quantity": 2})
+        );
+    }
+
+    fn tip(amount: Option<f64>) -> UserActionDto {
+        UserActionDto {
+            kind: UserActionKind::Tip,
+            item: None,
+            name: None,
+            quantity: None,
+            text: None,
+            amount_usd: amount,
+        }
+    }
+
+    #[test]
+    fn tip_converts_within_bounds() {
+        assert_eq!(
+            tip(Some(20.0)).to_core().unwrap(),
+            UserAction::Tip { amount_usd: 20.0 }
+        );
+        assert!(tip(None).to_core().is_err(), "tip requires amount_usd");
+        for bad in [0.0, -5.0, 1_000_000_000.01, f64::NAN, f64::INFINITY] {
+            assert!(tip(Some(bad)).to_core().is_err(), "{bad}");
+        }
+        assert!(tip(Some(0.01)).to_core().is_ok());
+        assert!(tip(Some(1_000_000_000.0)).to_core().is_ok(), "the cap itself");
+    }
+
+    #[test]
+    fn a_tip_validates_with_empty_content_and_with_images() {
+        let mut r = base();
+        r.content = String::new();
+        r.action = Some(tip(Some(20.0)));
+        assert!(validate_payload(&r).is_ok(), "empty content");
+        r.image_url = Some("https://x/y.png".into());
+        assert!(validate_payload(&r).is_ok(), "with image_url");
+        let mut forced = base();
+        forced.action = Some(tip(Some(20.0)));
+        forced.image = Some(ImageReplyParams {
+            force: true,
+            ..Default::default()
+        });
+        assert!(validate_payload(&forced).is_ok(), "with a forced image");
+    }
+
+    #[test]
+    fn a_bad_tip_is_a_422() {
+        let mut r = base();
+        r.action = Some(tip(Some(0.0)));
+        match validate_payload(&r) {
+            Err(AppError::StreamPre(e)) => assert_eq!(e.status, StatusCode::UNPROCESSABLE_ENTITY),
+            other => panic!("expected a 422 pre-stream error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_tip_body_with_an_integer_amount_parses() {
+        let req: StreamSendRequest = serde_json::from_value(serde_json::json!({
+            "content": "",
+            "client_msg_id": "01J0000000000000000000000A",
+            "action": {"type": "tip", "amount_usd": 20}
+        }))
+        .unwrap();
+        assert_eq!(
+            req.action.unwrap().to_core().unwrap(),
+            UserAction::Tip { amount_usd: 20.0 }
+        );
+    }
+
+    #[test]
+    fn user_row_metadata_carries_a_tip() {
+        let mut r = base();
+        r.action = Some(tip(Some(20.0)));
+        let meta = build_user_row_metadata(&r, None).unwrap();
+        assert_eq!(
+            meta["action"],
+            serde_json::json!({"type": "tip", "amount_usd": 20.0})
         );
     }
 }
