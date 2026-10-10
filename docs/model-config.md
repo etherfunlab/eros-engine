@@ -583,7 +583,7 @@ input filter has no triggers, timing, or tiers).
 
 | Name | Consumed by | Status |
 |---|---|---|
-| `chat_companion` | `pipeline::handlers` via `resolve()` (chat completions; tip turns ride the same reply path) | live |
+| `chat_companion` | `pipeline::handlers` via `resolve()` (chat completions) | live |
 | `insight_extraction` | `pipeline::post_process::extract_facts` (stage 1 of the human chain — per-turn fact mining. Prompt-bearing; joins the required-`filter_prompt` gate alongside `character_insight_extraction` / `user_insight_extraction` / `memory_extraction`. This block is the whole chain's on/off switch — off when the task block is absent) | live |
 | `insight_structuring` | `pipeline::post_process::extract_structured_insights` (stage 2 of the human chain — turns stage 1's mined facts plus the existing `human_insights` row into the typed profile object. **Parameters-only, takes no `filter_prompt`** — its prompt is built in `prompt.rs` and must stay in lockstep with the `human_insights` columns it fills, so setting the key refuses to boot, **in any shape, an explicit blank included** — same treatment as `affinity_evaluation`. Absent block ⇒ stage 2 resolves on stage 1's model/budget, never the global default) | live |
 | `chat_output_filter` | `pipeline::stream` via `resolve_output_filter()` (optional second-pass rewrite of the chat reply before delivery) | live |

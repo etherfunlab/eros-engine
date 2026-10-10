@@ -396,41 +396,22 @@ Caps: `audit.user` and `audit.session_id` ≤ 256 chars; `audit.metadata`
 ≤ 16 keys, key matches `[A-Za-z0-9_.-]{1,64}`, value is a string ≤ 512
 chars. Violations return `400 BadRequest` as a pre-stream error.
 
-**Optional: tip.** The body may include `tips_amount_usd` (a finite number,
-`> 0` and `≤ 1_000_000`) to mark this turn as a tip. The turn is persisted with
-`role = gift_user`: if `content` is empty the stored content becomes
-`(打赏 $<amount>)`, otherwise your `content` is kept. The tip amount rides to the
-model so the persona can react in its reply, and it is echoed back on the BFF
-history row (`tips_amount_usd`). A tip and an image cannot be sent on the same
-turn. Replaces the old `POST /comp/chat/{session_id}/event/gift` route, which has
-been removed.
-
-```bash
-curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
-  -H "Accept: text/event-stream" \
-  -d '{
-        "content": "",
-        "client_msg_id": "01J3333333333333333333333A",
-        "tips_amount_usd": 9.99
-      }' \
-  http://localhost:8080/comp/chat/<session_id>/message/stream
-```
-
 **Optional: action.** The body may include `action` — something the user does to
 the persona besides talking. The persona accepts it or not; a refusal costs the
-relationship one tier on the line the action touches (`give` → bond, every other
-type → chemistry; see [affinity-model.md](affinity-model.md#refused-actions)).
+relationship one tier on the line the action touches (`give` → bond, every
+physical or custom action → chemistry), and a refused `tip` costs nothing (see
+[affinity-model.md](affinity-model.md#refused-actions)).
 
 | `type` | fields |
 |---|---|
 | `give` | `item`: `cigarette` \| `alcohol` \| `medicine` (required); `name`: optional, 1–32 chars; `quantity`: optional, 1–99, default 1 |
 | `kiss`, `hug`, `touch`, `lick` | none |
 | `custom` | `text`: required, 1–100 chars |
+| `tip` | `amount_usd`: required, finite, `> 0` and `≤ 1_000_000_000` |
 
-With an action, `content` may be empty. `action` cannot be combined with
-`tips_amount_usd`; it can be combined with `image_url` and `image`. Every
-value violation (bounds, missing `item`/`text`, combined with a tip) is a `422`
-with `code: "unprocessable"`; a body whose `type` or `item` is not one of the
+With an action, `content` may be empty, and it can be combined with
+`image_url` and `image`. Every value violation (bounds, missing
+`item`/`text`/`amount_usd`) is a `422` with `code: "unprocessable"`; a body whose `type` or `item` is not one of the
 listed values is rejected as unparseable JSON (also `422`). The action is stored on the user
 row and returned by both history routes as `action`, with `response` once the
 turn has been decided.
@@ -446,11 +427,27 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
   http://localhost:8080/comp/chat/<session_id>/message/stream
 ```
 
+A tip never reaches a model as a number: the judge and the reply see what it
+is worth (one of seven things it would buy, from a drink to a country) and how
+much it feels like to the persona. The engine records `amount_usd` and never
+verifies payment; what happens to the money of a refused tip is the caller's
+decision.
+
+```bash
+curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{
+        "content": "",
+        "client_msg_id": "01J3333333333333333333333A",
+        "action": {"type": "tip", "amount_usd": 9.99}
+      }' \
+  http://localhost:8080/comp/chat/<session_id>/message/stream
+```
+
 **Optional: image input (vision).** The body may include `image_url` — an
 absolute `http(s)` URL with a host, no embedded whitespace, ≤ 2048 chars. When
 present, the engine runs a vision *describe* pre-stage (the `chat_vision` task)
-and feeds the description into the reply. `image_url` and `tips_amount_usd` are
-mutually exclusive on a single turn. A malformed URL returns `422 Unprocessable
+and feeds the description into the reply. A malformed URL returns `422 Unprocessable
 Entity` (`code: "unprocessable"`) as a pre-stream error. Vision is active only
 if `[tasks.chat_vision]` is configured with a non-blank `filter_prompt` (see
 [model-config.md](model-config.md)).
@@ -524,7 +521,7 @@ The marker also records `image_ref` (`"face"` | `"previous"`), so the full
 `image_request` payload stays recoverable after the fact (absent on rows
 persisted before it was added).
 
-Validation: `force` + `tips_amount_usd` on the same turn → `422`. `force`
+Validation: `force`
 while `[tasks.chat_image_prompt_compose]` is not configured → `422` (the
 composer is the only prompt source; without it a forced image could only be a
 generic portrait). An unsupported `aspect_ratio` returns `422 Unprocessable
@@ -880,8 +877,7 @@ Paginated message history, newest first. `limit` defaults to 20 (capped at 50).
 
 `id` is the stable message id (the `engine.chat_messages` row key) — it is
 what the `image-request` route below takes. `role` ∈
-`user | assistant | gift_user | system_error`. `gift_user` is a tip
-turn (sent via `tips_amount_usd` on the stream route, above). Each entry also
+`user | assistant | system_error`. Each entry also
 carries an optional `channel` field — `"product_qa"` marks an
 out-of-character product answer (excluded from companion context/memory,
 same as its live-stream `action_type`); the field is omitted for normal
@@ -958,17 +954,16 @@ a client reads `read_at` off the history entries and renders whatever it wants.
 with `0` and an existing stamp is never pushed forward. Call it on every mount
 without inventing an event.
 
-Two roles are out of reach here, and they are the two the user writes. A `user`
-row carries the engine's own stamp — set the instant the turn handed the message
-to its first model, which is the *delivered* tick and not that model's
-acknowledgement; a `gift_user` tip is never stamped by anyone, because nobody
-reads a tip on the user's behalf.
+One role is out of reach here: the one the user writes. A `user` row carries
+the engine's own stamp — set the instant the turn handed the message to its
+first model, which is the *delivered* tick and not that model's
+acknowledgement.
 
 Voice sessions are accepted, and their `assistant` rows are stamped like any
 other — only the engine's own writer is text-only, so it is voice **`user`**
 rows that stay unstamped.
 
-**Read `read_at: absent` as "no receipt", never as "not yet read."** Tips, voice
+**Read `read_at: absent` as "no receipt", never as "not yet read."** Voice
 `user` rows, and — on a deployment running without the PDE judge — every `user`
 row stay unstamped permanently.
 
@@ -1442,8 +1437,7 @@ The transcript comes back; the relationship state does not. See [2026-08-18-sess
 
 > **Tips replaced gift events.** The standalone gift routes
 > (`POST /comp/chat/{session_id}/event/gift`, `GET /comp/chat/{session_id}/gifts`)
-> were removed. A tip is now part of a normal stream turn — set
-> `tips_amount_usd` on `POST /comp/chat/{session_id}/message/stream` (see above).
+> were removed. A tip is now a `tip` action on a normal send turn (see above).
 
 ## World Town
 
@@ -1549,8 +1543,7 @@ need a relationship pays nothing for one.
 ### `GET /bff/v1/comp/chat/{session_id}/history?limit=50&offset=0`
 
 Slim history projection for the chat screen: `id` / `client_msg_id` /
-`role` / `content` / `sent_at` (no `extracted_facts`), plus `tips_amount_usd`
-on tip rows (present only when `role = gift_user`; omitted otherwise), and an
+`role` / `content` / `sent_at` (no `extracted_facts`), an
 optional `channel` field — `"product_qa"` marks an out-of-character product
 answer (excluded from companion context/memory); omitted for normal turns —
 and `read_at`, the read receipt described under `POST /comp/chat/{session_id}/read`
@@ -1790,7 +1783,7 @@ error type. The table below covers the plain shape:
 ## Source
 
 - `crates/eros-engine-server/src/routes/companion.rs` — chat-lifecycle / profile handlers
-- `crates/eros-engine-server/src/routes/companion_stream.rs` — streaming chat turn (`message/stream`), incl. tip + `image_url` handling
+- `crates/eros-engine-server/src/routes/companion_stream.rs` — streaming chat turn (`message/stream`), incl. actions + `image_url` handling
 - `crates/eros-engine-server/src/routes/companion_async.rs` — enqueue-only chat turn (`v2/comp/session/{session_id}/message/async`)
 - `crates/eros-engine-server/src/routes/session_open.rs` — the persona speaking first: birthday and holiday greetings and caller-named occasions (`v2/comp/session/{session_id}/open`)
 - `crates/eros-engine-server/src/routes/reaction.rs` — message reactions: set, clear and the allowlist (`v2/comp/session/{session_id}/message/{message_id}/reaction`, `v2/comp/reactions`)

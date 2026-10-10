@@ -20337,7 +20337,10 @@ data: [DONE]\n\n"
             chat.contains("（给你发了一个红包，相当于一个汉堡）"),
             "the history marker reaches the model: {chat}"
         );
-        assert!(!chat.contains("[this_turn]"), "no dice on a tip turn: {chat}");
+        assert!(
+            !chat.contains("[this_turn]"),
+            "no dice on a tip turn: {chat}"
+        );
         for body in [&judge, &chat] {
             assert!(
                 !body.contains("$20") && !body.contains("美元") && !body.contains("amount_usd"),

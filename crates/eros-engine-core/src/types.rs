@@ -547,8 +547,7 @@ mod tests {
             serde_json::json!({"type": "tip", "amount_usd": 20.0})
         );
         let back: UserAction =
-            serde_json::from_value(serde_json::json!({"type": "tip", "amount_usd": 9.99}))
-                .unwrap();
+            serde_json::from_value(serde_json::json!({"type": "tip", "amount_usd": 9.99})).unwrap();
         assert_eq!(back, UserAction::Tip { amount_usd: 9.99 });
     }
 

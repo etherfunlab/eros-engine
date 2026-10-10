@@ -725,7 +725,7 @@ gap.
 
 ### `engine.chat_vision_events`
 
-One row per image-carrying, non-tipped chat turn **that reaches the
+One row per image-carrying chat turn **that reaches the
 text-reply path**, recording the `chat_vision` describe call. A turn with no
 image writes nothing — "carries an image" is the denominator, and a text turn
 is not a missed describe. Neither does a turn that never reaches the

@@ -25,9 +25,8 @@ use crate::routes::companion::{
     validate_llm_audit, validate_prompt_traits, LlmAuditDto, PromptTraitDto,
 };
 use crate::routes::companion_stream::{
-    build_user_row_metadata, resolve_quote, resolve_text_turn,
-    validate_image_capability, validate_payload, AffinityScopeDto, ImageReplyParams,
-    StreamPreErrorBody, StreamSendRequest,
+    build_user_row_metadata, resolve_quote, resolve_text_turn, validate_image_capability,
+    validate_payload, AffinityScopeDto, ImageReplyParams, StreamPreErrorBody, StreamSendRequest,
 };
 use crate::state::AppState;
 
@@ -643,8 +642,7 @@ mod tests {
     #[test]
     fn queued_params_rebuild_a_tip() {
         let params: super::QueuedTurnParams =
-            serde_json::from_value(json!({"action": {"type": "tip", "amount_usd": 20.0}}))
-                .unwrap();
+            serde_json::from_value(json!({"action": {"type": "tip", "amount_usd": 20.0}})).unwrap();
         assert_eq!(
             params.action.unwrap().to_core().unwrap(),
             eros_engine_core::types::UserAction::Tip { amount_usd: 20.0 }

@@ -2905,7 +2905,10 @@ mod validate_payload_tests {
             assert!(tip(Some(bad)).to_core().is_err(), "{bad}");
         }
         assert!(tip(Some(0.01)).to_core().is_ok());
-        assert!(tip(Some(1_000_000_000.0)).to_core().is_ok(), "the cap itself");
+        assert!(
+            tip(Some(1_000_000_000.0)).to_core().is_ok(),
+            "the cap itself"
+        );
     }
 
     #[test]

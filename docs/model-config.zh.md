@@ -508,7 +508,7 @@ BYOK hop 使用其请求中 `byok` 块的 `output_regex` 规则，而不是这�
 
 | 名称 | 使用方 | 状态 |
 |---|---|---|
-| `chat_companion` | `pipeline::handlers`，通过 `resolve()`（chat completion；tip 轮次使用相同的 reply 路径） | live |
+| `chat_companion` | `pipeline::handlers`，通过 `resolve()`（chat completion） | live |
 | `insight_extraction` | `pipeline::post_process::extract_facts`（人类链 stage 1——逐轮事实挖掘。持有 prompt，与 `character_insight_extraction` / `user_insight_extraction` / `memory_extraction` 共用同一个必填-`filter_prompt` 闸门。这个块是整条链的总开关——任务块缺失即关闭） | live |
 | `insight_structuring` | `pipeline::post_process::extract_structured_insights`（人类链 stage 2——把 stage 1 挖掘出的事实加上已有的 `human_insights` 行，转成类型化的画像对象。**仅参数，不接受 `filter_prompt`**——它的 prompt 写在 `prompt.rs` 里，必须与它要填的 `human_insights` 列保持同步，所以设置该键会拒绝启动，**任何写法都算，包括显式留空**——与 `affinity_evaluation` 同样处理。块缺失时 stage 2 会退回到 stage 1 的模型/预算，绝不退到全局默认） | live |
 | `chat_output_filter` | `pipeline::stream`，通过 `resolve_output_filter()`（交付前对 chat 回复进行可选的二次改写） | live |

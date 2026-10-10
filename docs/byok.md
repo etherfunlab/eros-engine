@@ -23,8 +23,8 @@ the downstream's server and add the header there; never send it to a client.
 
 ## What BYOK covers
 
-Only the reply on `POST /comp/chat/{session_id}/message/stream`, tip turns and
-the text half of `reply_text_image` included. The PDE judge, the input and
+Only the reply on `POST /comp/chat/{session_id}/message/stream`, the text half of
+`reply_text_image` included. The PDE judge, the input and
 output filters, vision, image prompt composition, product QA, affinity,
 insight and memory extraction, and embeddings keep running on the deployment's
 own chains and keys.

@@ -2232,7 +2232,10 @@ mod tests {
 
         let out = model_facing_history(vec![qa, tip, plain], true);
         let texts: Vec<&str> = out.iter().map(|m| m.text.as_str()).collect();
-        assert_eq!(texts, vec!["（给你发了一个红包，相当于一杯饮料）", "普通消息"]);
+        assert_eq!(
+            texts,
+            vec!["（给你发了一个红包，相当于一杯饮料）", "普通消息"]
+        );
         assert!(out.iter().all(|m| m.role == "user"));
     }
 

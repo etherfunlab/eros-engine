@@ -352,33 +352,16 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 ≤ 16 个 key，key 满足 `[A-Za-z0-9_.-]{1,64}`，value 必须是 string
 且 ≤ 512 字符。违反作为 pre-stream 错误返回 `400 BadRequest`。
 
-**可选：打赏。** 请求体可附加 `tips_amount_usd`（有限数值，`> 0` 且
-`≤ 1_000_000`）把本轮标记为打赏。该轮以 `role = gift_user` 落库：`content`
-为空时存为 `(打赏 $<金额>)`，否则保留你的 `content`。打赏金额会带给模型，
-让人格在回复里作出反应，并在 BFF 历史行回显（`tips_amount_usd`）。同一轮
-不能既打赏又带图。替代了已移除的 `POST /comp/chat/{session_id}/event/gift`
-路由。
-
-```bash
-curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
-  -H "Accept: text/event-stream" \
-  -d '{
-        "content": "",
-        "client_msg_id": "01J3333333333333333333333A",
-        "tips_amount_usd": 9.99
-      }' \
-  http://localhost:8080/comp/chat/<session_id>/message/stream
-```
-
-**可选：动作。** 请求体可以带 `action`，表示用户在说话之外对角色做的事。角色可能接受，也可能不接受；不接受时，这段关系在动作对应的那条线上降一档（`give` 动 bond，其余类型动 chemistry；见 [affinity-model.zh.md](affinity-model.zh.md)）。
+**可选：动作。** 请求体可以带 `action`，表示用户在说话之外对角色做的事。角色可能接受，也可能不接受；不接受时，这段关系在动作对应的那条线上降一档（`give` 动 bond，身体动作和自定义动作动 chemistry），被拒的 `tip` 不降档（见 [affinity-model.zh.md](affinity-model.zh.md)）。
 
 | `type` | 字段 |
 |---|---|
 | `give` | `item`：`cigarette` \| `alcohol` \| `medicine`，必填；`name`：可选，1–32 字符；`quantity`：可选，1–99，默认 1 |
 | `kiss`、`hug`、`touch`、`lick` | 无 |
 | `custom` | `text`：必填，1–100 字符 |
+| `tip` | `amount_usd`：必填，有限数值，`> 0` 且 `≤ 1_000_000_000` |
 
-带动作时 `content` 可以为空。`action` 不能和 `tips_amount_usd` 同时出现，可以和 `image_url`、`image` 同时出现。取值不合规（超出范围、缺少 `item`/`text`、与打赏同时出现）一律返回 `422`，`code: "unprocessable"`；`type` 或 `item` 不在上表取值内时，请求体按无法解析的 JSON 拒绝（同样是 `422`）。动作存在用户行上，两套历史接口都以 `action` 字段返回，判定之后带 `response`。
+带动作时 `content` 可以为空，也可以和 `image_url`、`image` 同时出现。取值不合规（超出范围、缺少 `item`/`text`/`amount_usd`）一律返回 `422`，`code: "unprocessable"`；`type` 或 `item` 不在上表取值内时，请求体按无法解析的 JSON 拒绝（同样是 `422`）。动作存在用户行上，两套历史接口都以 `action` 字段返回，判定之后带 `response`。
 
 ```bash
 curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
@@ -391,10 +374,22 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
   http://localhost:8080/comp/chat/<session_id>/message/stream
 ```
 
+打赏不会以数字形式进入任何模型：判官和回复看到的是这笔钱相当于什么（从一杯饮料到一个国家，共七档）以及它在角色心里算多大一笔。engine 只记录 `amount_usd`，不核实付款；被拒的打赏怎么处理那笔钱，由调用方决定。
+
+```bash
+curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{
+        "content": "",
+        "client_msg_id": "01J3333333333333333333333A",
+        "action": {"type": "tip", "amount_usd": 9.99}
+      }' \
+  http://localhost:8080/comp/chat/<session_id>/message/stream
+```
+
 **可选：图片输入（vision）。** 请求体可附加 `image_url` —— 绝对 `http(s)`
 URL，需带 host、不含空白、≤ 2048 字符。带图时引擎先跑一段 vision *describe*
-预处理（`chat_vision` 任务），把图片描述喂给回复。`image_url` 与
-`tips_amount_usd` 同一轮互斥。URL 非法时作为 pre-stream 错误返回
+预处理（`chat_vision` 任务），把图片描述喂给回复。URL 非法时作为 pre-stream 错误返回
 `422 Unprocessable Entity`（`code: "unprocessable"`）。仅当
 `[tasks.chat_vision]` 配了非空 `filter_prompt` 时 vision 才生效（见
 [model-config.zh.md](model-config.zh.md)）。
@@ -441,7 +436,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 **参考图选择（`image_ref`）。** PDE verdict 带有 `image_ref`（`"face"` \| `"previous"`，默认 `"face"`），并附带在下方的 `image_request` 帧中——聊天流本身不会把它解析成实际 URL。`previous` 且无可用图时回退到 `face` 的规则，以及 `face_ref_url` / `prev_image_url` 参考图 URL，都属于消费方自己调用的图像供应商（引擎没有绘图端点）。持久化的 `metadata.image` 标记记录合成器决定的图片主题、画幅，以及它的 `caption`（合成器随 prompt 一起返回的一句话描述；没有则为 `None`——聊天历史和 judge transcript 只读回 caption，从不读回那段长 prompt），加上——仅当合成器 LLM 调用成功时——审计三元组 `compose_variant`（命中的 `filter_prompt` key/下标，纯字符串或内置提示词时缺省）、`compose_model` 和 `compose_generation_id`。三元组缺失意味着本轮没有成功合成（fail-open 降级，或合成器未配置）。只要审计写入本身成功，就会带一个 `compose_event_id` 指针——不管合成本身有没有成功——它是通往 `engine.chat_images_events` 的可达链接，拼装出的**线上 wire** prompt 实际存在那张表里（`metadata.image` 标记从不重复存它）；详见 [LLM audit → 图片链路事件表](llm-audit.zh.md#图片链路事件表)。标记同时记录 `image_ref`（`"face"` \| `"previous"`），让完整的 `image_request` 载荷事后仍可取回（该键加入之前落库的旧行没有）。
 
-校验：同一轮同时有 `force` 和 `tips_amount_usd` → `422`。`force` 而部署未配置
+校验：`force` 而部署未配置
 `[tasks.chat_image_prompt_compose]` → `422`（合成器是唯一的提示词来源；没有它，
 强制出图只能产出一张无视用户消息的通用肖像）。`aspect_ratio` 不在允许集时，作为
 pre-stream 错误返回 `422 Unprocessable Entity`（`code: "unprocessable"`）。以上
@@ -723,8 +718,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 ```
 
 `id` 是稳定的消息 id（`engine.chat_messages` 行主键），下面的 `image-request`
-路由收的就是它。`role` ∈ `user | assistant | gift_user | system_error`。
-`gift_user` 是打赏轮（通过上面 stream 路由的 `tips_amount_usd` 发起）。每条记录还带一个可选的
+路由收的就是它。`role` ∈ `user | assistant | system_error`。每条记录还带一个可选的
 `channel` 字段——`"product_qa"` 标记出戏产品问答（排除在伴侣上下文/记忆之
 外，与其在实时流上的 `action_type` 一致）；普通轮次省略该字段。`read_at` 是已读
 回执，**未读时整个键都不出现** —— 见下面这条路由。
@@ -785,14 +779,14 @@ session 返回 404 的行为，与上面的 history 路由完全一致。
 `marked` 只算**这一次调用**打上的行数，所以重复调用返回 `200` 加 `0`，已有的时
 间戳不会被往后推。每次挂载都调一次也不会造出假事件。
 
-有两个 role 在这里够不到，正好是用户自己写的那两个。`user` 行带的是 engine 自己
+有一个 role 在这里够不到，正是用户自己写的那个。`user` 行带的是 engine 自己
 的打点 —— 在这一轮把消息**交给**第一个模型的那一刻写入，是「已送达」那一格，不
-是模型的确认回执；`gift_user` 打赏行谁都不打，因为没有人代替用户去读一笔打赏。
+是模型的确认回执。
 
 语音 session 一样接受，它的 `assistant` 行照标不误 —— 只有 engine 自己那个写者
 是纯文字路径专用的，所以永远不打点的是语音的 **`user`** 行。
 
-**`read_at` 不出现要读作「没有回执」，不是「还没读」。** 打赏行、语音 `user` 行，
+**`read_at` 不出现要读作「没有回执」，不是「还没读」。** 语音 `user` 行，
 以及在没配 PDE 判官的部署上的每一条 `user` 行，都是永久不打点的。
 
 详见 [2026-08-19-chat-message-read-at-design.md](superpowers/specs/2026-08-19-chat-message-read-at-design.md)。
@@ -1217,8 +1211,7 @@ UPDATE engine.chat_sessions SET archived = false WHERE id = '<session-uuid>';
 
 > **打赏取代了礼物事件。** 独立的礼物路由
 > （`POST /comp/chat/{session_id}/event/gift`、`GET /comp/chat/{session_id}/gifts`）
-> 已移除。打赏现在是普通 stream 轮的一部分 —— 在
-> `POST /comp/chat/{session_id}/message/stream` 上设 `tips_amount_usd`（见上文）。
+> 已移除。打赏现在是普通发送轮上的 `tip` 动作（见上文）。
 
 ## World Town（世界小镇）
 
@@ -1317,8 +1310,7 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
 ### `GET /bff/v1/comp/chat/{session_id}/history?limit=50&offset=0`
 
 給聊天屏用的精簡歷史投影：`id` / `client_msg_id` / `role` / `content` /
-`sent_at`（不含 `extracted_facts`），打赏行另带 `tips_amount_usd`（仅在
-`role = gift_user` 时出现，否则省略），以及可选的 `channel` 字段——
+`sent_at`（不含 `extracted_facts`），以及可选的 `channel` 字段——
 `"product_qa"` 标记出戏产品问答（排除在伴侣上下文/记忆之外）；普通轮次
 省略该字段。还有 `read_at`，即 `POST /comp/chat/{session_id}/read` 那节说的
 已读回执，未读时省略。`id` 是 `chat_messages` 行的主鍵（UUID）；
@@ -1530,7 +1522,7 @@ session 403）。
 ## 源码
 
 - `crates/eros-engine-server/src/routes/companion.rs`——对话生命周期 / 画像 handler
-- `crates/eros-engine-server/src/routes/companion_stream.rs`——流式对话轮（`message/stream`），含打赏 + `image_url` 处理
+- `crates/eros-engine-server/src/routes/companion_stream.rs`——流式对话轮（`message/stream`），含动作 + `image_url` 处理
 - `crates/eros-engine-server/src/routes/companion_async.rs`——只入队的对话轮（`v2/comp/session/{session_id}/message/async`）
 - `crates/eros-engine-server/src/routes/session_open.rs`——角色先开口：生日、节日开场白与调用方指定的场合（`v2/comp/session/{session_id}/open`）
 - `crates/eros-engine-server/src/routes/reaction.rs`——消息 reaction：设置、撤销与允许列表（`v2/comp/session/{session_id}/message/{message_id}/reaction`、`v2/comp/reactions`）

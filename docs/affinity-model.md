@@ -251,6 +251,8 @@ whether the persona accepts it; without a definite refusal the engine accepts.
   judge. That line's `pending_deltas` are cleared, and the event row's
   `context.tier_drop` names the line. The drop applies even when the affinity
   eval is skipped or fails.
+- **Refused tip:** a `tip` drops no line. The persona's reply follows the
+  verdict; the turn is graded like any other.
 
 Example: chemistry `0.80` (64% of tier 4) lands at 64% of tier 3, `≈ 0.524`.
 
