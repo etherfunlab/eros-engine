@@ -311,7 +311,7 @@ impl<'a> StoryRepo<'a> {
                AND cm.sent_at > now() - make_interval(days => $3) \
                AND cm.truncated = FALSE \
                AND cm.channel IS NULL \
-               AND cm.role IN ('user', 'gift_user', 'assistant') \
+               AND cm.role IN ('user', 'assistant') \
              ORDER BY cm.sent_at DESC \
              LIMIT $4",
         )
@@ -327,7 +327,7 @@ impl<'a> StoryRepo<'a> {
         let mut pending: HashMap<Uuid, String> = HashMap::new(); // session_id -> latest unpaired user content
         let mut pairs: Vec<(String, String)> = Vec::new();
         for (session_id, role, content) in chrono_rows {
-            if role == "user" || role == "gift_user" {
+            if role == "user" {
                 pending.insert(session_id, content); // consecutive users collapse to the latest unpaired one
             } else {
                 // role == "assistant"

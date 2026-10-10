@@ -3103,7 +3103,7 @@ impl JudgeTranscriptAcc {
     /// is simply overwritten and ends up reflecting the newest assistant row.
     fn push(&mut self, role: &str, content: &str, metadata: Option<&serde_json::Value>) {
         let (label, text): (&str, String) = match role {
-            "user" | "gift_user" => (
+            "user" => (
                 "用户",
                 crate::prompt::user_text_with_action(
                     crate::prompt::action_from_metadata(metadata).as_ref(),
@@ -3172,11 +3172,11 @@ async fn build_input_filter_transcript(
         if m.channel.is_some() {
             continue;
         }
-        // User/gift rows use the EFFECTIVE text (a prior turn's own rewrite when
+        // User rows use the EFFECTIVE text (a prior turn's own rewrite when
         // present) so the filter sees the same conversation the chat model does;
         // assistant rows use content (their pre_filter_content means the opposite).
         let text = match m.role.as_str() {
-            "user" | "gift_user" => crate::pipeline::handlers::effective_user_text(&m).to_string(),
+            "user" => crate::pipeline::handlers::effective_user_text(&m).to_string(),
             _ => m.content.clone(),
         };
         acc.push(&m.role, &text, m.metadata.as_ref());

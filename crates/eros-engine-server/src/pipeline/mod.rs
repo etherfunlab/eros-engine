@@ -223,7 +223,7 @@ pub async fn compute_signals_for_session(
     // `MAX(sent_at)` is NULL for an empty session.
     let (message_count, last_time): (i64, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
         "SELECT COUNT(*), MAX(sent_at) FROM engine.chat_messages \
-             WHERE session_id = $1 AND role IN ('user', 'gift_user') \
+             WHERE session_id = $1 AND role = 'user' \
                AND channel IS NULL",
     )
     .bind(session_id)
@@ -309,18 +309,16 @@ mod tests {
         (genome_id, instance_id, session_id)
     }
 
-    /// `user` turns and tip `gift_user` rows both count toward the conversation
-    /// signal. gift_user is tip-only now (the legacy in-app Gift Event endpoint
-    /// was removed), so there is no longer a legacy `gift_user` row to exclude.
+    /// A tip is a `user` row carrying a `tip` action, and counts like any turn.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn signals_count_includes_gift_user_tip_rows(pool: PgPool) {
+    async fn signals_count_includes_tip_rows(pool: PgPool) {
         let user_id = Uuid::new_v4();
         let (_genome_id, instance_id, session_id) = seed_session(&pool, user_id).await;
 
         sqlx::query(
             "INSERT INTO engine.chat_messages (session_id, role, content, metadata) VALUES \
                  ($1, 'user', 'hi', NULL), \
-                 ($1, 'gift_user', '(打赏 $20)', '{\"tips_amount_usd\": 20.0}'::jsonb)",
+                 ($1, 'user', '', '{\"action\": {\"type\": \"tip\", \"amount_usd\": 20.0}}'::jsonb)",
         )
         .bind(session_id)
         .execute(&pool)
@@ -332,10 +330,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            signals.message_count, 2,
-            "user + gift_user (tip) both count"
-        );
+        assert_eq!(signals.message_count, 2, "a tip counts as a turn");
     }
 
     /// Pure `user` rows still count normally (baseline regression).
@@ -362,7 +357,7 @@ mod tests {
     }
 
     /// Characterization: `hours_since_last_message` derives from the MAX(sent_at)
-    /// of the user/gift_user rows. Pins the MAX half of the signal before COUNT
+    /// of the user rows. Pins the MAX half of the signal before COUNT
     /// and MAX are merged into a single aggregate query (the COUNT half is
     /// already covered by `signals_count_*`).
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

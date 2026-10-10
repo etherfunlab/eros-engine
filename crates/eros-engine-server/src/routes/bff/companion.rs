@@ -43,7 +43,7 @@ pub struct BffHistoryEntry {
     /// one, e.g. assistant turns. Lets the FE reconcile an optimistic local
     /// message with its persisted row.
     pub client_msg_id: Option<String>,
-    /// "user" | "assistant" | "gift_user" | "system_error"
+    /// "user" | "assistant" | "system_error"
     pub role: String,
     pub content: String,
     pub sent_at: DateTime<Utc>,

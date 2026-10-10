@@ -444,7 +444,7 @@ impl<'a> ChatRepo<'a> {
         Ok(())
     }
 
-    /// Reactions set in `session_id` after the newest user/gift_user row sent
+    /// Reactions set in `session_id` after the newest user row sent
     /// strictly before `user_message_id`'s row, and at or before that row's
     /// `sent_at` — the ones this turn has not seen and no later turn should
     /// (spec §6.1). Session-wide, not bounded by the history window. With no
@@ -468,7 +468,7 @@ impl<'a> ChatRepo<'a> {
                AND m.reacted_at <= cur.sent_at \
                AND m.reacted_at > COALESCE( \
                      (SELECT p.sent_at FROM engine.chat_messages p \
-                       WHERE p.session_id = $1 AND p.role IN ('user', 'gift_user') \
+                       WHERE p.session_id = $1 AND p.role = 'user' \
                          AND p.sent_at < cur.sent_at \
                        ORDER BY p.sent_at DESC LIMIT 1), \
                      '-infinity'::timestamptz) \
@@ -846,13 +846,10 @@ pub(crate) async fn upsert_user_message_in_tx(
     role: &str,
     metadata: Option<&serde_json::Value>,
 ) -> Result<UpsertUserOutcome, sqlx::Error> {
-    // Widened role filter: tip path writes 'gift_user', and idempotency is
-    // keyed on (session_id, client_msg_id) regardless of which user-side
-    // role was originally persisted.
     let existing: Option<ChatMessage> = sqlx::query_as::<_, ChatMessage>(
         "SELECT * FROM engine.chat_messages \
          WHERE session_id = $1 AND client_msg_id = $2 \
-           AND role IN ('user', 'gift_user') \
+           AND role = 'user' \
          LIMIT 1",
     )
     .bind(session_id)
@@ -996,9 +993,8 @@ impl<'a> ChatRepo<'a> {
     ///
     /// The role predicate is negative on purpose: written as `role =
     /// 'assistant'` it would skip `system_error` today and any companion role
-    /// added later. The two roles it excludes are exactly the two a user can
-    /// author — `user` belongs to `mark_user_message_consumed`, and a
-    /// `gift_user` tip has no reader at all.
+    /// added later. The role it excludes is the one a user authors — `user`
+    /// belongs to `mark_user_message_consumed`.
     ///
     /// `read_at IS NULL` is the idempotency guard: an existing stamp is never
     /// pushed forward, so a client calling this on every mount reports the
@@ -1007,7 +1003,7 @@ impl<'a> ChatRepo<'a> {
         let res = sqlx::query(
             "UPDATE engine.chat_messages SET read_at = now() \
              WHERE session_id = $1 AND read_at IS NULL \
-               AND role NOT IN ('user', 'gift_user')",
+               AND role <> 'user'",
         )
         .bind(session_id)
         .execute(self.pool)
@@ -1024,10 +1020,7 @@ impl<'a> ChatRepo<'a> {
     /// engine handed the message over, which is the half of the exchange it can
     /// witness.
     ///
-    /// Narrower than the complement of `mark_session_read`: a tip turn's
-    /// driving row is `role='gift_user'` and stays NULL, because nobody reads a
-    /// tip on the user's behalf. `read_at IS NULL` makes a replayed turn a
-    /// no-op.
+    /// `read_at IS NULL` makes a replayed turn a no-op.
     pub async fn mark_user_message_consumed(
         &self,
         user_message_id: Uuid,
@@ -1500,8 +1493,8 @@ impl<'a> ChatRepo<'a> {
             return Ok(VoiceUserInsert::Inserted(id));
         }
         // Conflict → a row with this (session_id, client_msg_id) already exists.
-        // The unique index is role-agnostic, so the conflicting row may be a
-        // `user` OR a `gift_user` (tip) row — do NOT filter by role, or a tip
+        // The unique index is channel-agnostic, so the conflicting row may be a
+        // text-channel `user` row (a tip included) — do NOT filter, or such a
         // collision would miss and surface a 500 instead of the 409 duplicate.
         let existing: Uuid = sqlx::query_scalar(
             "SELECT id FROM engine.chat_messages \
@@ -1751,11 +1744,11 @@ impl<'a> ChatRepo<'a> {
     /// persisted utterance, in one round trip. Scoped to `role = 'user' AND
     /// channel = 'voice'` — `insert_voice_user_message`'s conflict lookup
     /// that supplies `user_message_id` is deliberately role-agnostic (the
-    /// colliding row can be a `gift_user` tip row, or even a text-channel
-    /// `user` row reached via `message/stream` against the same session id,
+    /// colliding row can be a text-channel `user` row, a tip included, reached
+    /// via `message/stream` against the same session id,
     /// since that route has no channel guard). Returns `None` when the row
     /// is not an actual voice user turn, so the caller can fall back to the
-    /// ordinary unconditional 409 instead of treating a tip or text row as a
+    /// ordinary unconditional 409 instead of treating a text row as a
     /// repairable voice turn — regenerating against it would embed the
     /// wrong text as the recall query and write a `channel='voice'`
     /// assistant row pointing at a non-voice user row.
@@ -2654,64 +2647,6 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn upsert_user_message_writes_gift_user_role_and_tip_metadata(pool: PgPool) {
-        let repo = ChatRepo { pool: &pool };
-        let s = throwaway_session(&pool).await;
-        let meta = serde_json::json!({ "tips_amount_usd": 20.0, "tier": "gold" });
-        repo.upsert_user_message_idempotent(
-            s.id,
-            "(打赏 $20)",
-            "01J0000000000000000000000B",
-            "gift_user",
-            Some(&meta),
-        )
-        .await
-        .unwrap();
-        let (role, metadata): (String, serde_json::Value) =
-            sqlx::query_as("SELECT role, metadata FROM engine.chat_messages WHERE session_id = $1")
-                .bind(s.id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(role, "gift_user");
-        assert_eq!(metadata["tips_amount_usd"].as_f64(), Some(20.0));
-        assert_eq!(metadata["tier"], serde_json::json!("gold"));
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    async fn upsert_user_message_replay_finds_gift_user_row(pool: PgPool) {
-        let repo = ChatRepo { pool: &pool };
-        let s = throwaway_session(&pool).await;
-        let meta = serde_json::json!({ "tips_amount_usd": 5.0 });
-        repo.upsert_user_message_idempotent(
-            s.id,
-            "(打赏 $5)",
-            "01J0000000000000000000000C",
-            "gift_user",
-            Some(&meta),
-        )
-        .await
-        .unwrap();
-        // Second call with the same client_msg_id is a replay candidate even
-        // though the original wrote role='gift_user'. The widened role filter
-        // in the dedup lookup is what we're exercising.
-        let outcome = repo
-            .upsert_user_message_idempotent(
-                s.id,
-                "(打赏 $5)",
-                "01J0000000000000000000000C",
-                "gift_user",
-                Some(&meta),
-            )
-            .await
-            .unwrap();
-        match outcome {
-            UpsertUserOutcome::DuplicateInProgress { .. } => {}
-            other => panic!("expected DuplicateInProgress, got {other:?}"),
-        }
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
     #[allow(clippy::type_complexity)] // sqlx tuple query — type alias would add noise
     async fn assistant_batch_round_trips_filter_audit(pool: PgPool) {
         // generation_id is FK-referenced since 0060.
@@ -2839,18 +2774,18 @@ mod tests {
                 .await
                 .unwrap_or_else(|e| panic!("expected column {col} on engine.chat_messages: {e}"));
         }
-        // Indexes exist.
+        // The filter-audit index exists; 0019's tip-amount index was dropped
+        // by 0066 (covered by `migration_0066_rewrites_tips_as_actions`).
         let idx_count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM pg_indexes \
              WHERE schemaname = 'engine' \
                AND tablename = 'chat_messages' \
-               AND indexname IN ('chat_messages_tips_amount_idx',
-                                 'chat_messages_f_client_msg_id_uidx')",
+               AND indexname = 'chat_messages_f_client_msg_id_uidx'",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(idx_count, 2, "both new indexes should exist");
+        assert_eq!(idx_count, 1, "the filter-audit index should exist");
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -3328,75 +3263,108 @@ mod tests {
         assert_eq!(rows[0].content, ""); // untouched
     }
 
-    /// 0027 cleanup: legacy non-tip gift_user rows (no tips_amount_usd metadata)
-    /// are deleted; tips (gift_user with tips_amount_usd) and user rows survive.
-    /// Mirrors the 0018 backfill-test pattern: #[sqlx::test] runs 0027 on the
-    /// empty DB (a no-op), then we seed rows and re-run the embedded DELETE
-    /// (valid because DELETE is idempotent).
-    const CLEANUP_SQL_0027: &str =
-        include_str!("../migrations/0027_drop_legacy_gift_user_rows.sql");
+    const TIP_AS_ACTION_SQL_0066: &str = include_str!("../migrations/0066_tip_as_action.sql");
 
+    /// 0066: a `gift_user` tip becomes a `user` row carrying a `tip` action.
+    /// The migration has already run on the empty test DB, so the test
+    /// restores the pre-0066 schema (the wider CHECK and the amount index),
+    /// seeds tips the way the removed path wrote them, and runs it again.
     #[sqlx::test(migrations = "./migrations")]
-    async fn migration_0027_drops_legacy_non_tip_gift_user_rows(pool: PgPool) {
-        let user_id = Uuid::new_v4();
-        let instance_id = seed_persona_instance(&pool, user_id).await;
-        let session_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+    async fn migration_0066_rewrites_tips_as_actions(pool: PgPool) {
+        sqlx::raw_sql(
+            "ALTER TABLE engine.chat_messages DROP CONSTRAINT chat_messages_role_check; \
+             ALTER TABLE engine.chat_messages ADD CONSTRAINT chat_messages_role_check \
+                 CHECK (role IN ('user', 'assistant', 'gift_user', 'system_error')); \
+             CREATE INDEX chat_messages_tips_amount_idx \
+                 ON engine.chat_messages ((metadata->>'tips_amount_usd')) \
+                 WHERE metadata ? 'tips_amount_usd';",
         )
-        .bind(user_id)
-        .bind(instance_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-
-        sqlx::query(
-            "INSERT INTO engine.chat_messages (session_id, role, content, metadata) VALUES \
-                 ($1, 'user', 'hi', NULL), \
-                 ($1, 'gift_user', '(打赏 $20)', '{\"tips_amount_usd\": 20.0}'::jsonb), \
-                 ($1, 'gift_user', 'rose', NULL), \
-                 ($1, 'gift_user', 'rose', '{\"label\": \"rose\"}'::jsonb)",
-        )
-        .bind(session_id)
         .execute(&pool)
         .await
         .unwrap();
+        let session_id = throwaway_session(&pool).await.id;
+        let insert = |content: &'static str, meta: serde_json::Value| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Uuid>(
+                    "INSERT INTO engine.chat_messages (session_id, role, content, metadata) \
+                     VALUES ($1, 'gift_user', $2, $3) RETURNING id",
+                )
+                .bind(session_id)
+                .bind(content)
+                .bind(meta)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let whole = insert(
+            "(打赏 $20)",
+            serde_json::json!({"tips_amount_usd": 20.0, "tier": "gold"}),
+        )
+        .await;
+        let cents = insert("(打赏 $5.50)", serde_json::json!({"tips_amount_usd": 5.5})).await;
+        let worded = insert("谢谢你", serde_json::json!({"tips_amount_usd": 9.99})).await;
 
-        // Run the embedded cleanup migration.
-        sqlx::query(CLEANUP_SQL_0027).execute(&pool).await.unwrap();
+        sqlx::raw_sql(TIP_AS_ACTION_SQL_0066)
+            .execute(&pool)
+            .await
+            .unwrap();
 
-        // Only the tip gift_user row survives.
-        let gift_user_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM engine.chat_messages \
-             WHERE session_id = $1 AND role = 'gift_user'",
+        let row = |id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_as::<_, (String, String, serde_json::Value)>(
+                    "SELECT role, content, metadata FROM engine.chat_messages WHERE id = $1",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(
+            row(whole).await,
+            (
+                "user".to_string(),
+                String::new(),
+                serde_json::json!({"tier": "gold",
+                    "action": {"type": "tip", "amount_usd": 20.0, "response": "accept"}})
+            )
+        );
+        assert_eq!(
+            row(cents).await,
+            (
+                "user".to_string(),
+                String::new(),
+                serde_json::json!({"action": {"type": "tip", "amount_usd": 5.5, "response": "accept"}})
+            )
+        );
+        assert_eq!(
+            row(worded).await,
+            (
+                "user".to_string(),
+                "谢谢你".to_string(),
+                serde_json::json!({"action": {"type": "tip", "amount_usd": 9.99, "response": "accept"}})
+            ),
+            "a tip that carried the user's own words keeps them"
+        );
+
+        let rejected = sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content) \
+             VALUES ($1, 'gift_user', 'x')",
         )
         .bind(session_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(gift_user_count, 1, "only the tip gift_user row survives");
+        .execute(&pool)
+        .await;
+        assert!(rejected.is_err(), "the CHECK no longer admits gift_user");
 
-        // The survivor is the tip (carries tips_amount_usd).
-        let surviving_tip: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM engine.chat_messages \
-             WHERE session_id = $1 AND role = 'gift_user' \
-               AND metadata ? 'tips_amount_usd'",
-        )
-        .bind(session_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(surviving_tip, 1, "the surviving gift_user row is the tip");
-
-        // user rows are untouched.
-        let user_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM engine.chat_messages \
-             WHERE session_id = $1 AND role = 'user'",
-        )
-        .bind(session_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(user_count, 1, "user rows are untouched");
+        let index: Option<String> =
+            sqlx::query_scalar("SELECT to_regclass('engine.chat_messages_tips_amount_idx')::text")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(index, None, "the amount index is gone");
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -3671,16 +3639,16 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn voice_insert_duplicate_against_gift_user_row_is_not_500(pool: PgPool) {
-        // A voice request reusing a client_msg_id that already exists on a tip
-        // (`gift_user`) row must be classified as Duplicate (→ 409), not error
-        // out with RowNotFound (→ 500). The unique index is role-agnostic, so
-        // the conflict-recovery SELECT must not filter by role.
+    async fn voice_insert_duplicate_against_a_text_tip_row_is_not_500(pool: PgPool) {
+        // A voice request reusing a client_msg_id that already exists on a
+        // text-channel tip row must be classified as Duplicate (→ 409), not
+        // error out with RowNotFound (→ 500). The unique index is
+        // channel-agnostic, so the conflict-recovery SELECT must not filter.
         let session_id = throwaway_session(&pool).await.id;
         let cmid = "01J9000000000000000000GIFT1";
         sqlx::query(
-            "INSERT INTO engine.chat_messages (session_id, role, content, client_msg_id) \
-             VALUES ($1, 'gift_user', '(tip)', $2)",
+            "INSERT INTO engine.chat_messages (session_id, role, content, client_msg_id, metadata) \
+             VALUES ($1, 'user', '', $2, '{\"action\": {\"type\": \"tip\", \"amount_usd\": 20.0}}'::jsonb)",
         )
         .bind(session_id)
         .bind(cmid)
@@ -3696,7 +3664,7 @@ mod tests {
             .unwrap();
         assert!(
             matches!(out, VoiceUserInsert::Duplicate(_)),
-            "voice insert colliding with a gift_user row must be Duplicate, got {out:?}"
+            "voice insert colliding with a text tip row must be Duplicate, got {out:?}"
         );
     }
 
@@ -4029,31 +3997,13 @@ mod tests {
 
     /// `insert_voice_user_message`'s conflict lookup that supplies
     /// `user_message_id` is deliberately role-agnostic (the colliding row can
-    /// be a `gift_user` tip row, or a text-channel `user` row reached via
-    /// `message/stream` against the same session id, since that route has no
-    /// channel guard). The repair gate must independently refuse to treat
-    /// either as a repairable voice turn.
+    /// be a text-channel `user` row reached via `message/stream` against the
+    /// same session id, since that route has no channel guard). The repair
+    /// gate must independently refuse to treat it as a repairable voice turn.
     #[sqlx::test(migrations = "./migrations")]
     async fn repair_state_is_none_for_non_voice_user_rows(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
         let session_id = throwaway_session(&pool).await.id;
-
-        let gift_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO engine.chat_messages (session_id, role, content, client_msg_id, metadata) \
-             VALUES ($1, 'gift_user', '(打赏 $20)', 'cid-gift', '{\"tips_amount_usd\": 20.0}'::jsonb) \
-             RETURNING id",
-        )
-        .bind(session_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert!(
-            repo.voice_turn_repair_state(gift_id)
-                .await
-                .unwrap()
-                .is_none(),
-            "a gift_user row must never be reported as a repairable voice turn"
-        );
 
         let text_user_id: Uuid = sqlx::query_scalar(
             "INSERT INTO engine.chat_messages (session_id, role, content, client_msg_id) \
@@ -4831,7 +4781,7 @@ mod tests {
     async fn mark_session_read_stamps_only_companion_authored_rows(pool: PgPool) {
         let session_id = throwaway_session(&pool).await.id;
         let repo = ChatRepo { pool: &pool };
-        for role in ["user", "gift_user", "assistant", "system_error"] {
+        for role in ["user", "user", "assistant", "system_error"] {
             sqlx::query(
                 "INSERT INTO engine.chat_messages (session_id, role, content) VALUES ($1, $2, 'x')",
             )
@@ -4850,7 +4800,7 @@ mod tests {
 
         let unread: Vec<Option<DateTime<Utc>>> = sqlx::query_scalar(
             "SELECT read_at FROM engine.chat_messages \
-             WHERE session_id = $1 AND role IN ('user', 'gift_user')",
+             WHERE session_id = $1 AND role = 'user'",
         )
         .bind(session_id)
         .fetch_all(&pool)
@@ -4859,7 +4809,7 @@ mod tests {
         assert_eq!(unread.len(), 2);
         assert!(
             unread.iter().all(Option::is_none),
-            "'user' belongs to the engine's writer and a 'gift_user' tip has no reader"
+            "'user' belongs to the engine's writer"
         );
 
         let stamped = |pool: PgPool| async move {
@@ -4907,7 +4857,6 @@ mod tests {
             }
         };
         let user_id = insert("user").await;
-        let gift_id = insert("gift_user").await;
         let assistant_id = insert("assistant").await;
 
         let sent_at: DateTime<Utc> =
@@ -4936,12 +4885,11 @@ mod tests {
                 .unwrap();
         assert_eq!(read_at, again, "replay is a no-op");
 
-        // Neither the endpoint's rows nor a tip are this writer's business.
-        repo.mark_user_message_consumed(gift_id).await.unwrap();
+        // The endpoint's rows are not this writer's business.
         repo.mark_user_message_consumed(assistant_id).await.unwrap();
         let untouched: Vec<Option<DateTime<Utc>>> =
             sqlx::query_scalar("SELECT read_at FROM engine.chat_messages WHERE id = ANY($1)")
-                .bind(vec![gift_id, assistant_id])
+                .bind(vec![assistant_id])
                 .fetch_all(&pool)
                 .await
                 .unwrap();

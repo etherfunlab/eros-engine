@@ -214,7 +214,7 @@ fn render_bootstrap(b: &VoiceBootstrap) -> Option<String> {
 /// Render a sibling voice session's tail as a plain transcript, one line per
 /// message. Empty-content rows are skipped (a caption-less image turn would
 /// otherwise render as a bare speaker prefix) and so is any role outside the
-/// user/assistant pair; `gift_user` speaks as the user.
+/// user/assistant pair.
 fn render_prev_call(rows: &[ChatMessageSlim]) -> Option<String> {
     let mut lines: Vec<String> = Vec::with_capacity(rows.len());
     for m in rows {
@@ -223,7 +223,7 @@ fn render_prev_call(rows: &[ChatMessageSlim]) -> Option<String> {
             continue;
         }
         let speaker = match m.role.as_str() {
-            "user" | "gift_user" => "用户",
+            "user" => "用户",
             "assistant" => "她",
             _ => continue,
         };
@@ -676,7 +676,7 @@ pub fn run_voice_turn(
             }
             let role = match m.role.as_str() {
                 "assistant" => "assistant",
-                "user" | "gift_user" => "user",
+                "user" => "user",
                 _ => continue,
             };
             messages.push(WireMessage { role: role.into(), content: m.content });
@@ -1343,7 +1343,7 @@ mod tests {
             slim("user", "你好"),
             slim("assistant", "嗨呀"),
             slim("assistant", "   "), // empty-content row: skipped
-            slim("gift_user", "（打赏 $5）"),
+            slim("user", "（打赏 $5）"),
             slim("system", "ignored"), // unknown role: skipped
             slim("user", "晚安"),
         ];

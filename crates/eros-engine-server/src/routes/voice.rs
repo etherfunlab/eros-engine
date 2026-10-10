@@ -283,8 +283,8 @@ pub async fn voice_turn_stream(
         VoiceUserInsert::Duplicate(id) => {
             // `insert_voice_user_message`'s conflict lookup is deliberately
             // role-agnostic (see its doc comment) — the colliding row can be a
-            // `gift_user` tip row, or even a text-channel `user` row reached
-            // via `message/stream` against this same session id, since that
+            // text-channel `user` row, a tip included, reached via
+            // `message/stream` against this same session id, since that
             // route has no channel guard. `voice_turn_repair_state` is scoped
             // to `role = 'user' AND channel = 'voice'` and returns `None` for
             // anything else, so such a collision falls back to the ordinary
@@ -943,14 +943,13 @@ mod tests {
     }
 
     /// `insert_voice_user_message`'s conflict lookup is deliberately
-    /// role-agnostic (see its doc comment: "the conflicting row may be a
-    /// `user` OR a `gift_user` (tip) row"). Before the repair relaxation that
+    /// role-agnostic (see its doc comment: the conflicting row may be a
+    /// text-channel `user` row). Before the repair relaxation that
     /// only ever produced a 409, so the role-agnosticism was harmless. Now
     /// that a duplicate with no reply and no interrupt marker regenerates,
     /// a `client_msg_id` collision against a NON-voice-user row (a
-    /// `gift_user` tip row, seeded here — the realistic case per the plan;
-    /// also possible via a text-channel `user` row, since `message/stream`
-    /// has no channel guard against being pointed at this session id) must
+    /// text-channel tip row, seeded here; `message/stream` has no channel
+    /// guard against being pointed at this session id) must
     /// still fall back to the ordinary unconditional 409, never regenerate.
     /// Regenerating would embed the tip marker text as the recall query and
     /// write a `channel='voice'` assistant row whose `user_message_id`
@@ -961,14 +960,14 @@ mod tests {
         let session_id = seed(&pool, user_id).await;
         let client_msg_id = "01J9GIFTCOLLIDE00000000001";
 
-        // Seed a gift_user (tip) row directly, colliding on
+        // Seed a text-channel tip row directly, colliding on
         // (session_id, client_msg_id) — the same collision surface
         // `insert_voice_user_message`'s ON CONFLICT resolves against.
         sqlx::query(
             "INSERT INTO engine.chat_messages \
                 (session_id, role, content, client_msg_id, metadata) \
-             VALUES ($1, 'gift_user', '(打赏 $20)', $2, \
-                     '{\"tips_amount_usd\": 20.0}'::jsonb)",
+             VALUES ($1, 'user', '', $2, \
+                     '{\"action\": {\"type\": \"tip\", \"amount_usd\": 20.0}}'::jsonb)",
         )
         .bind(session_id)
         .bind(client_msg_id)

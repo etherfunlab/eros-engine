@@ -270,11 +270,8 @@ pub(crate) fn recall_query_text(msg: &eros_engine_store::chat::ChatMessage) -> S
 /// Channel-marked rows (voice / product_qa) are out of companion context —
 /// they must never re-enter the model's own conversation history, even though
 /// `history()` itself stays unfiltered for the client route and the voice
-/// window. Unknown roles are skipped. `user` and TIP `gift_user` rows both
-/// fold to the "user" role: a tip turn IS a user turn to the model
-/// (OpenRouter only knows system/user/assistant), and gift_user is tip-only
-/// now (the legacy in-app Gift Event endpoint was removed), so no tip/legacy
-/// gate is needed. Assistant rows feed `content` (their `pre_filter_content`
+/// window. Unknown roles are skipped. A tip is a `user` row like any other,
+/// its action rendered as a marker by `model_facing_user_text`. Assistant rows feed `content` (their `pre_filter_content`
 /// is the pre-output-filter original and must never re-enter the prompt),
 /// then, when `strip` is true, have their leading sentence stripped (spec
 /// §4.3 — the noise carrier, e.g. `唔`/`啊`) and their parenthesized action
@@ -298,7 +295,7 @@ pub(crate) fn model_facing_history(
             continue;
         }
         let (role, text) = match msg.role.as_str() {
-            "user" | "gift_user" => ("user", model_facing_user_text(&msg)),
+            "user" => ("user", model_facing_user_text(&msg)),
             "assistant" => {
                 // Spec §4.3: the leading sentence is the noise carrier, and
                 // `model_facing_assistant_text` removes it from the prose
@@ -1904,15 +1901,12 @@ mod tests {
     }
 
     #[test]
-    fn assemble_includes_all_gift_user_rows() {
+    fn assemble_renders_a_tip_row_with_its_marker() {
         use eros_engine_llm::model_config::ResolvedModel;
 
-        // gift_user is tip-only now — all gift_user rows are promoted to the
-        // "user" role. The legacy in-app Gift Event endpoint was removed, so
-        // there is no longer a legacy row type to gate out.
-        let mut tip = user_row("(打赏 $5)", None);
-        tip.role = "gift_user".into();
-        tip.metadata = Some(serde_json::json!({ "tips_amount_usd": 5.0 }));
+        // A tip is a user row with a `tip` action; the model sees its marker.
+        let mut tip = user_row("", None);
+        tip.metadata = Some(serde_json::json!({"action": {"type": "tip", "amount_usd": 5.0}}));
         let plain = user_row("普通消息", None);
         let mut assistant = user_row("回复", None);
         assistant.role = "assistant".into();
@@ -1951,12 +1945,11 @@ mod tests {
             .map(|m| m.content.as_str())
             .collect();
         assert!(
-            user_contents.contains(&"(打赏 $5)"),
-            "gift_user must be promoted under the user role: {user_contents:?}"
+            user_contents.contains(&"（给你发了一个红包，相当于一杯饮料）"),
+            "the tip reaches the model as its marker: {user_contents:?}"
         );
         assert!(user_contents.contains(&"普通消息"));
-        // No `gift_user` role ever reaches the wire (OpenRouter knows only
-        // system/user/assistant).
+        // Only roles OpenRouter knows reach the wire (system/user/assistant).
         assert!(req
             .messages
             .iter()
@@ -2228,18 +2221,18 @@ mod tests {
     }
 
     #[test]
-    fn model_facing_history_drops_channel_rows_and_folds_gift_user() {
+    fn model_facing_history_drops_channel_rows_and_renders_a_tip() {
         // Same contract assemble_chat_request had before the split: channel-
-        // marked rows never reach the model, gift_user is promoted to "user".
+        // marked rows never reach the model, a tip renders as its marker.
         let mut qa = user_row("这个产品是什么", None);
         qa.channel = Some("product_qa".into());
-        let mut tip = user_row("(打赏 $5)", None);
-        tip.role = "gift_user".into();
+        let mut tip = user_row("", None);
+        tip.metadata = Some(serde_json::json!({"action": {"type": "tip", "amount_usd": 5.0}}));
         let plain = user_row("普通消息", None);
 
         let out = model_facing_history(vec![qa, tip, plain], true);
         let texts: Vec<&str> = out.iter().map(|m| m.text.as_str()).collect();
-        assert_eq!(texts, vec!["(打赏 $5)", "普通消息"]);
+        assert_eq!(texts, vec!["（给你发了一个红包，相当于一杯饮料）", "普通消息"]);
         assert!(out.iter().all(|m| m.role == "user"));
     }
 
@@ -2406,7 +2399,7 @@ mod tests {
             chat_row("assistant", "唔。"),
             chat_row("assistant", "唔。我在呢。"),
             qa,
-            chat_row("gift_user", "谢谢"),
+            chat_row("user", "谢谢"),
         ];
         let assistant_before = rows
             .iter()
