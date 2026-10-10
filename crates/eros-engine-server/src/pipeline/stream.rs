@@ -4513,15 +4513,11 @@ pub(crate) fn run_stream_with(
         }
 
         // The response in effect for this turn's action (spec 2026-10-05
-        // §4.5): persisted first so a replay can rebuild the frame, then sent
-        // ahead of the reply. A failed write costs the replay only.
+        // §4.5), sent ahead of the reply. History and replay read it off the
+        // row, so it is persisted only once the turn takes effect — where
+        // post-process is spawned below: a turn that ends in `error` leaves no
+        // decision behind.
         if let Some(response) = plan.action_response {
-            if let Err(e) = chat_repo
-                .set_action_response(user_msg.user_message_id, response)
-                .await
-            {
-                tracing::warn!("stream: action response write failed: {e}");
-            }
             yield ProtocolFrame::ActionResponse {
                 user_message_id: user_msg.user_message_id,
                 response,
@@ -5050,6 +5046,15 @@ pub(crate) fn run_stream_with(
                 // message, and skip the text path entirely (returning ends the
                 // stream cleanly — there is nothing after the match arm).
                 if image_only_done {
+                    // A failed write only loses the stored copy.
+                    if let Some(response) = plan.action_response {
+                        if let Err(e) = chat_repo
+                            .set_action_response(user_msg.user_message_id, response)
+                            .await
+                        {
+                            tracing::warn!("stream: action response write failed: {e}");
+                        }
+                    }
                     if let Err(e) = sqlx::query(
                         "UPDATE engine.companion_affinity SET ghost_streak = 0, updated_at = now() \
                          WHERE session_id = $1 AND ghost_streak <> 0",
@@ -5449,6 +5454,16 @@ pub(crate) fn run_stream_with(
                             return;
                         }
                         yield frame;
+                    }
+                }
+                // The reply went out: the turn has taken effect. A failed write
+                // only loses the stored copy.
+                if let Some(response) = plan.action_response {
+                    if let Err(e) = chat_repo
+                        .set_action_response(user_msg.user_message_id, response)
+                        .await
+                    {
+                        tracing::warn!("stream: action response write failed: {e}");
                     }
                 }
                 let (produced, did_filter, retries_chat, retries_filter, ghost_fallback, burst_failures) = {
@@ -8766,6 +8781,18 @@ data: [DONE]\n\n";
         assert!(
             payload.contains("你接受了"),
             "no judge means the action is accepted, and the composer must be told: {payload}"
+        );
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT metadata->'action'->>'response' FROM engine.chat_messages WHERE id = $1",
+        )
+        .bind(user_message_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            stored.as_deref(),
+            Some("accept"),
+            "an image-only turn that took effect records the response"
         );
     }
 

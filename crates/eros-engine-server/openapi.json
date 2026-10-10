@@ -2263,7 +2263,7 @@
               },
               {
                 "$ref": "#/components/schemas/UserActionView",
-                "description": "The action a user row carried and, once decided, the persona's response. Omitted on rows without an action."
+                "description": "The action a user row carried and, once the turn took effect, the persona's response. Omitted on rows without an action."
               }
             ]
           },
@@ -2803,7 +2803,7 @@
               },
               {
                 "$ref": "#/components/schemas/UserActionView",
-                "description": "The action a `user` row carried and, once decided, the persona's\nresponse (spec 2026-10-05). Omitted on rows without an action; the BFF\nhistory entry carries the same field."
+                "description": "The action a `user` row carried and, once the turn took effect, the\npersona's response (spec 2026-10-05). Omitted on rows without an\naction; the BFF history entry carries the same field."
               }
             ]
           },
@@ -4156,7 +4156,7 @@
             }
           }
         ],
-        "description": "A user row's action as the history routes return it: the action fields as\nsent, plus the decided `response` once the turn has been decided."
+        "description": "A user row's action as the history routes return it: the action fields as\nsent, plus the decided `response` once the turn has taken effect."
       },
       "UserInsightResponse": {
         "type": "object",

@@ -153,9 +153,9 @@ pub struct ChatHistoryEntry {
     /// history entry carries the same field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_message_id: Option<Uuid>,
-    /// The action a `user` row carried and, once decided, the persona's
-    /// response (spec 2026-10-05). Omitted on rows without an action; the BFF
-    /// history entry carries the same field.
+    /// The action a `user` row carried and, once the turn took effect, the
+    /// persona's response (spec 2026-10-05). Omitted on rows without an
+    /// action; the BFF history entry carries the same field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<crate::routes::companion_stream::UserActionView>,
     /// The user's reaction on an assistant row: the emoji and when it was set.

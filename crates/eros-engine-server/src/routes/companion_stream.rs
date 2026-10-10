@@ -239,7 +239,7 @@ pub enum ActionResponseDto {
 }
 
 /// A user row's action as the history routes return it: the action fields as
-/// sent, plus the decided `response` once the turn has been decided.
+/// sent, plus the decided `response` once the turn has taken effect.
 #[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct UserActionView {
     #[serde(flatten)]
@@ -1621,6 +1621,118 @@ data: [DONE]\n\n";
         .await
         .unwrap();
         assert_eq!(notices, 1, "terminal failure leaves exactly one signal row");
+    }
+
+    /// #392: the judge's response goes out ahead of the reply, so a turn that
+    /// then ends in `error` has already sent it. History must not keep it —
+    /// the turn did not take effect. The action itself stays. A 500 from the
+    /// reply model leaves a truncated bubble behind, so the queue settles this
+    /// turn `done`: no `system_error` row marks it.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn failed_action_turn_keeps_no_response_in_history(pool: PgPool) {
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // No fallback phrase ⇒ an exhausted reply chain ends in `error`.
+        sqlx::query(
+            "UPDATE engine.error_handling_config \
+             SET payload = '[]'::jsonb \
+             WHERE kind = 'chat_stream_failure_fallback_phrases'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mock = MockServer::start().await;
+        let verdict = serde_json::json!({
+            "action": "reply_text", "inner_state": "", "action_response": "refuse"
+        })
+        .to_string();
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("pde/judge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gj", "model": "pde/judge",
+                "choices": [{"message": {"content": verdict}}],
+            })))
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("deepseek/x"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = ChatRepo { pool: &pool }
+            .create_session(user_id, instance_id)
+            .await
+            .unwrap()
+            .id;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide.\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let mut app = build_router(state);
+        let token = mint_jwt(user_id);
+        let body = serde_json::to_vec(&json!({
+            "content": "",
+            "client_msg_id": "01J4444444444444444444444K",
+            "action": {"type": "kiss"}
+        }))
+        .unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/comp/chat/{session_id}/message/stream"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body_text = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            body_text.contains("\"type\":\"action_response\""),
+            "{body_text}"
+        );
+        let last = body_text
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .next_back()
+            .unwrap();
+        assert!(last.contains("\"type\":\"error\""), "{body_text}");
+
+        // The body closes when the drive returns, so the turn's writes are in.
+        let req = Request::builder()
+            .uri(format!("/comp/chat/{session_id}/history"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let history: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        let user_row = history["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "user")
+            .expect("the user row is in history");
+        assert_eq!(user_row["action"], json!({"type": "kiss"}), "{user_row}");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

@@ -82,7 +82,7 @@ pub struct BffHistoryEntry {
     /// newest user row is the one. Omitted on user rows themselves.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_message_id: Option<Uuid>,
-    /// The action a user row carried and, once decided, the persona's response. Omitted on rows without an action.
+    /// The action a user row carried and, once the turn took effect, the persona's response. Omitted on rows without an action.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<crate::routes::companion_stream::UserActionView>,
     /// The user's reaction on an assistant row: the emoji and when it was set.
