@@ -30,19 +30,19 @@ This is not a generic agent framework. It is the stateful core for products wher
 ## Architecture
 
 ```txt
-┌─────────────────────────────────────────────────────────┐
-│ /comp/* HTTP routes  ←  Supabase JWT middleware          │
-│         │                                                │
-│         ▼                                                │
-│ pipeline orchestrator: load → PDE → handler → chat → post│
-│                                          │              │
-│  ┌───────────────────────────────────────┴────────┐     │
-│  │ post-process, spawned after reply              │     │
-│  │   • affinity: graded turn + derived endpoints           │     │
-│  │   • memory:   Voyage embed → pgvector upsert   │     │
-│  │   • insight:  extract facts → JSONB merge      │     │
-│  └────────────────────────────────────────────────┘     │
-└─────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────┐
+│ /comp/* HTTP routes  ←  Supabase JWT middleware           │
+│         │                                                 │
+│         ▼                                                 │
+│ pipeline orchestrator: load → PDE → handler → chat → post │
+│                                                       │   │
+│  ┌────────────────────────────────────────────────────┴─┐ │
+│  │ post-process, spawned after reply                    │ │
+│  │   • affinity: graded turn + derived endpoints        │ │
+│  │   • memory:   Voyage embed → pgvector upsert         │ │
+│  │   • insight:  extract facts → JSONB merge            │ │
+│  └──────────────────────────────────────────────────────┘ │
+└───────────────────────────────────────────────────────────┘
 ```
 
 Four crates keep domain logic, model access, persistence, and the HTTP service separate. Run `eros-engine-server` as an API, or embed `core + llm + store` in your own Rust service. See [Architecture](docs/architecture.md) for the boundaries and data flow.

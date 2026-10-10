@@ -30,19 +30,19 @@
 ## アーキテクチャ
 
 ```txt
-┌─────────────────────────────────────────────────────────┐
-│ /comp/* HTTP routes  ←  Supabase JWT middleware          │
-│         │                                                │
-│         ▼                                                │
-│ pipeline orchestrator: load → PDE → handler → chat → post│
-│                                          │              │
-│  ┌───────────────────────────────────────┴────────┐     │
-│  │ post-process, spawned after reply              │     │
-│  │   • affinity: graded turn + derived endpoints           │     │
-│  │   • memory:   Voyage embed → pgvector upsert   │     │
-│  │   • insight:  extract facts → JSONB merge      │     │
-│  └────────────────────────────────────────────────┘     │
-└─────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────┐
+│ /comp/* HTTP routes  ←  Supabase JWT middleware           │
+│         │                                                 │
+│         ▼                                                 │
+│ pipeline orchestrator: load → PDE → handler → chat → post │
+│                                                       │   │
+│  ┌────────────────────────────────────────────────────┴─┐ │
+│  │ post-process, spawned after reply                    │ │
+│  │   • affinity: graded turn + derived endpoints        │ │
+│  │   • memory:   Voyage embed → pgvector upsert         │ │
+│  │   • insight:  extract facts → JSONB merge            │ │
+│  └──────────────────────────────────────────────────────┘ │
+└───────────────────────────────────────────────────────────┘
 ```
 
 4 つの crate が、ドメインロジック、モデル接続、永続化、HTTP サービスを分担します。`eros-engine-server` を API として動かすことも、`core + llm + store` を独自の Rust サービスへ組み込むこともできます。境界とデータフローは [Architecture](docs/architecture.md) を参照してください。

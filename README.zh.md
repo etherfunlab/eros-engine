@@ -30,19 +30,19 @@
 ## 架构
 
 ```txt
-┌─────────────────────────────────────────────────────────┐
-│ /comp/* HTTP routes  ←  Supabase JWT middleware          │
-│         │                                                │
-│         ▼                                                │
-│ pipeline orchestrator: load → PDE → handler → chat → post│
-│                                          │              │
-│  ┌───────────────────────────────────────┴────────┐     │
-│  │ post-process, spawned after reply              │     │
-│  │   • affinity: graded turn + derived endpoints           │     │
-│  │   • memory:   Voyage embed → pgvector upsert   │     │
-│  │   • insight:  extract facts → JSONB merge      │     │
-│  └────────────────────────────────────────────────┘     │
-└─────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────┐
+│ /comp/* HTTP routes  ←  Supabase JWT middleware           │
+│         │                                                 │
+│         ▼                                                 │
+│ pipeline orchestrator: load → PDE → handler → chat → post │
+│                                                       │   │
+│  ┌────────────────────────────────────────────────────┴─┐ │
+│  │ post-process, spawned after reply                    │ │
+│  │   • affinity: graded turn + derived endpoints        │ │
+│  │   • memory:   Voyage embed → pgvector upsert         │ │
+│  │   • insight:  extract facts → JSONB merge            │ │
+│  └──────────────────────────────────────────────────────┘ │
+└───────────────────────────────────────────────────────────┘
 ```
 
 四个 crate 分别承载领域逻辑、模型访问、持久化和 HTTP 服务。你可以将 `eros-engine-server` 作为 API 运行，也可以把 `core + llm + store` 嵌入自己的 Rust 服务。边界与数据流详见[架构](docs/architecture.zh.md)。
