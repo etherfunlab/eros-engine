@@ -110,7 +110,7 @@ pub struct QuotedMessage {
 /// What a user's turn does to the persona besides talking (spec
 /// 2026-10-05-chat-user-actions-design.md). Stored verbatim as the user row's
 /// `metadata.action`, so the serde shape is a persisted contract.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum UserAction {
     Give {
@@ -126,15 +126,22 @@ pub enum UserAction {
     Custom {
         text: String,
     },
+    /// Money handed over (spec 2026-10-11-tip-as-action-design.md). The amount
+    /// is the caller's; the engine records it and never verifies it.
+    Tip {
+        amount_usd: f64,
+    },
 }
 
 impl UserAction {
     /// The line a refusal of this action drops: handing something over is
-    /// friendship, every physical gesture is romance.
-    pub fn line(&self) -> AffinityLine {
+    /// friendship, every physical gesture is romance. A refused tip drops
+    /// nothing (spec 2026-10-11 §6).
+    pub fn refusal_line(&self) -> Option<AffinityLine> {
         match self {
-            UserAction::Give { .. } => AffinityLine::Bond,
-            _ => AffinityLine::Chemistry,
+            UserAction::Give { .. } => Some(AffinityLine::Bond),
+            UserAction::Tip { .. } => None,
+            _ => Some(AffinityLine::Chemistry),
         }
     }
 }
@@ -543,7 +550,7 @@ mod tests {
             name: None,
             quantity: 1,
         };
-        assert_eq!(give.line(), AffinityLine::Bond);
+        assert_eq!(give.refusal_line().unwrap(), AffinityLine::Bond);
         for a in [
             UserAction::Kiss,
             UserAction::Hug,
@@ -551,8 +558,26 @@ mod tests {
             UserAction::Lick,
             UserAction::Custom { text: "x".into() },
         ] {
-            assert_eq!(a.line(), AffinityLine::Chemistry, "{a:?}");
+            assert_eq!(a.refusal_line().unwrap(), AffinityLine::Chemistry, "{a:?}");
         }
+    }
+
+    #[test]
+    fn tip_action_serde_shape() {
+        let tip = UserAction::Tip { amount_usd: 20.0 };
+        assert_eq!(
+            serde_json::to_value(&tip).unwrap(),
+            serde_json::json!({"type": "tip", "amount_usd": 20.0})
+        );
+        let back: UserAction =
+            serde_json::from_value(serde_json::json!({"type": "tip", "amount_usd": 9.99}))
+                .unwrap();
+        assert_eq!(back, UserAction::Tip { amount_usd: 9.99 });
+    }
+
+    #[test]
+    fn a_refused_tip_drops_no_line() {
+        assert_eq!(UserAction::Tip { amount_usd: 20.0 }.refusal_line(), None);
     }
 
     #[test]

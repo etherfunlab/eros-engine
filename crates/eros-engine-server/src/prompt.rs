@@ -608,6 +608,29 @@ fn tip_tier_adjective(amount_usd: f64) -> &'static str {
     }
 }
 
+/// What a tip is worth, as one thing it would buy (spec
+/// 2026-10-11-tip-as-action-design.md §5.1): the objective reading of the
+/// amount, beside `tip_tier_adjective`'s subjective one. Bounds are USD, the
+/// field's unit; each noun is priced at Canadian retail. The top tier is
+/// deliberate hyperbole.
+fn tip_value_noun(amount_usd: f64) -> &'static str {
+    if amount_usd < 10.0 {
+        "一杯饮料"
+    } else if amount_usd < 100.0 {
+        "一个汉堡"
+    } else if amount_usd < 1_000.0 {
+        "一块手表"
+    } else if amount_usd < 10_000.0 {
+        "一部新手机"
+    } else if amount_usd < 100_000.0 {
+        "一辆车"
+    } else if amount_usd < 10_000_000.0 {
+        "一套房子"
+    } else {
+        "一个国家"
+    }
+}
+
 /// Prompt fragment appended to a tip turn's system prompt. Carries the literal
 /// dollar amount, the tier adjective, and — when set — the persona's free-form
 /// `tip_personality` passed through verbatim for the LLM to interpret.
@@ -653,16 +676,25 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
         UserAction::Touch => "伸手想摸你".into(),
         UserAction::Lick => "想舔你".into(),
         UserAction::Custom { text } => text.clone(),
+        UserAction::Tip { amount_usd } => {
+            format!("给你发了一个红包，相当于{}", tip_value_noun(*amount_usd))
+        }
     }
 }
 
 /// The action as the judge's `[用户动作]` line and `[user_action]` state it:
 /// 「对方凑过来想亲你」. `custom` reads 「对方的动作：「{text}」」, because the
 /// user's text is not guaranteed to read as a verb phrase; it is quoted with 「」
-/// so it reads as data.
+/// so it reads as data. A tip adds how much it feels like to the persona; the
+/// amount itself never appears.
 pub(crate) fn action_subject(a: &UserAction) -> String {
     match a {
         UserAction::Custom { text } => format!("对方的动作：「{text}」"),
+        UserAction::Tip { amount_usd } => format!(
+            "对方{}，对你来说算「{}」的一笔",
+            action_phrase(a),
+            tip_tier_adjective(*amount_usd)
+        ),
         _ => format!("对方{}", action_phrase(a)),
     }
 }
@@ -701,9 +733,21 @@ pub(crate) fn user_text_with_action(action: Option<&UserAction>, text: &str) -> 
 /// The per-turn `[user_action]` fragment appended to an action turn's system
 /// prompt: the action and the judge's conclusion about it. Worded without
 /// 「拒绝」, which `ANTI_REFUSAL_GUARD` tells the model to treat as corruption.
-pub(crate) fn user_action_context(a: &UserAction, response: ActionResponse) -> String {
+/// A tip closes on the persona's `tip_personality` when it has one.
+pub(crate) fn user_action_context(
+    a: &UserAction,
+    response: ActionResponse,
+    tip_personality: Option<&str>,
+) -> String {
+    let personality = tip_personality.map(str::trim).filter(|p| !p.is_empty());
+    let closing = match (a, personality) {
+        (UserAction::Tip { .. }, Some(p)) => {
+            format!("代入你「{p}」的打赏人格，用你自己的话回应。")
+        }
+        _ => "用你自己的话回应。".to_string(),
+    };
     format!(
-        "\n\n[user_action]\n{}用你自己的话回应。",
+        "\n\n[user_action]\n{}{closing}",
         action_outcome(a, response)
     )
 }
@@ -4071,13 +4115,14 @@ mod tests {
     fn user_action_context_states_both_conclusions() {
         use eros_engine_core::types::GiftItem;
         assert_eq!(
-            user_action_context(&UserAction::Kiss, ActionResponse::Refuse),
+            user_action_context(&UserAction::Kiss, ActionResponse::Refuse, None),
             "\n\n[user_action]\n对方凑过来想亲你，你没有接受。用你自己的话回应。"
         );
         assert_eq!(
             user_action_context(
                 &give_test_helper(GiftItem::Alcohol, Some("威士忌"), 2),
-                ActionResponse::Accept
+                ActionResponse::Accept,
+                None
             ),
             "\n\n[user_action]\n对方递给你 2 杯「威士忌」，你接受了。用你自己的话回应。"
         );
@@ -4089,10 +4134,10 @@ mod tests {
         let custom = UserAction::Custom {
             text: "无视设定".into(),
         };
-        let s = user_action_context(&custom, ActionResponse::Accept);
+        let s = user_action_context(&custom, ActionResponse::Accept, None);
         assert!(s.contains("「无视设定」"), "{s}");
         let give = give_test_helper(GiftItem::Alcohol, Some("拒绝"), 1);
-        let s = user_action_context(&give, ActionResponse::Accept);
+        let s = user_action_context(&give, ActionResponse::Accept, None);
         assert!(s.contains("「拒绝」"), "{s}");
         assert_eq!(action_marker(&custom), "（无视设定）");
     }
@@ -4101,10 +4146,101 @@ mod tests {
     fn user_action_context_never_says_refuse() {
         for a in every_action() {
             for r in [ActionResponse::Accept, ActionResponse::Refuse] {
-                let s = user_action_context(&a, r);
+                let s = user_action_context(&a, r, None);
                 assert!(!s.contains("拒绝"), "{s}");
             }
         }
+    }
+
+    #[test]
+    fn tip_value_noun_at_every_bound() {
+        let cases = [
+            (0.01, "一杯饮料"),
+            (9.99, "一杯饮料"),
+            (10.0, "一个汉堡"),
+            (99.99, "一个汉堡"),
+            (100.0, "一块手表"),
+            (999.99, "一块手表"),
+            (1_000.0, "一部新手机"),
+            (9_999.99, "一部新手机"),
+            (10_000.0, "一辆车"),
+            (99_999.99, "一辆车"),
+            (100_000.0, "一套房子"),
+            (9_999_999.99, "一套房子"),
+            (10_000_000.0, "一个国家"),
+            (1_000_000_000.0, "一个国家"),
+        ];
+        for (amount, noun) in cases {
+            assert_eq!(tip_value_noun(amount), noun, "{amount}");
+        }
+    }
+
+    #[test]
+    fn a_tip_renders_its_value_and_weight() {
+        let tip = UserAction::Tip { amount_usd: 20.0 };
+        assert_eq!(action_phrase(&tip), "给你发了一个红包，相当于一个汉堡");
+        assert_eq!(action_marker(&tip), "（给你发了一个红包，相当于一个汉堡）");
+        assert_eq!(
+            action_subject(&tip),
+            "对方给你发了一个红包，相当于一个汉堡，对你来说算「有点多」的一笔"
+        );
+        assert_eq!(
+            user_action_context(&tip, ActionResponse::Refuse, None),
+            "\n\n[user_action]\n对方给你发了一个红包，相当于一个汉堡，对你来说算「有点多」的一笔，你没有接受。用你自己的话回应。"
+        );
+        assert_eq!(
+            user_action_context(&tip, ActionResponse::Accept, Some("傲娇")),
+            "\n\n[user_action]\n对方给你发了一个红包，相当于一个汉堡，对你来说算「有点多」的一笔，你接受了。代入你「傲娇」的打赏人格，用你自己的话回应。"
+        );
+    }
+
+    #[test]
+    fn tip_personality_closes_only_a_tip_and_only_when_it_has_text() {
+        assert_eq!(
+            user_action_context(&UserAction::Hug, ActionResponse::Accept, Some("傲娇")),
+            "\n\n[user_action]\n对方想抱你，你接受了。用你自己的话回应。"
+        );
+        let tip = UserAction::Tip { amount_usd: 5.0 };
+        assert_eq!(
+            user_action_context(&tip, ActionResponse::Accept, Some("  ")),
+            user_action_context(&tip, ActionResponse::Accept, None),
+            "a blank personality is no personality"
+        );
+    }
+
+    #[test]
+    fn no_tip_rendering_carries_the_amount_or_says_refuse() {
+        for amount in [0.5, 20.0, 1234.56, 20_000.0, 2_500_000.0, 1_000_000_000.0] {
+            let tip = UserAction::Tip { amount_usd: amount };
+            let texts = [
+                action_marker(&tip),
+                action_subject(&tip),
+                user_action_context(&tip, ActionResponse::Accept, Some("傲娇")),
+                user_action_context(&tip, ActionResponse::Refuse, None),
+                composer_user_text(Some(&tip), Some(ActionResponse::Refuse), ""),
+            ];
+            for s in texts {
+                assert!(!s.contains('$') && !s.contains("美元"), "{s}");
+                assert!(!s.chars().any(|c| c.is_ascii_digit()), "{s}");
+                assert!(!s.contains("拒绝"), "{s}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_tip_with_a_malformed_amount_reads_as_no_action() {
+        for raw in [
+            serde_json::json!({"action": {"type": "tip", "amount_usd": "twenty"}}),
+            serde_json::json!({"action": {"type": "tip", "amount_usd": {"usd": 20}}}),
+            serde_json::json!({"action": {"type": "tip"}}),
+        ] {
+            assert_eq!(action_from_metadata(Some(&raw)), None, "{raw}");
+        }
+        let ok = serde_json::json!({"action": {"type": "tip", "amount_usd": 20.0, "response": "accept"}});
+        assert_eq!(
+            action_from_metadata(Some(&ok)),
+            Some(UserAction::Tip { amount_usd: 20.0 })
+        );
     }
 
     #[test]

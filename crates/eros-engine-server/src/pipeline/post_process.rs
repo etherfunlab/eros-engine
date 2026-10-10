@@ -780,7 +780,8 @@ fn eval_skip_reason(
 }
 
 /// The line a refused action drops this turn (spec 2026-10-05 §6.3); `None`
-/// on every other turn.
+/// on every other turn, and on a refused tip, which drops nothing (spec
+/// 2026-10-11 §6).
 fn tier_drop_for(
     event: &Event,
     plan: &ActionPlan,
@@ -791,7 +792,7 @@ fn tier_drop_for(
                 action: Some(a), ..
             },
             Some(eros_engine_core::types::ActionResponse::Refuse),
-        ) => Some(a.line()),
+        ) => a.refusal_line(),
         _ => None,
     }
 }
@@ -2536,6 +2537,38 @@ mod tests {
             None
         );
         assert_eq!(tier_drop_for(&event(None), &plan(None)), None);
+    }
+
+    #[test]
+    fn a_refused_tip_drops_no_tier() {
+        use eros_engine_core::types::{ActionResponse, UserAction};
+        let event = Event::UserMessage {
+            content: String::new(),
+            message_id: Uuid::nil(),
+            prompt_traits: vec![],
+            audit: None,
+            tier: None,
+            memory_scope: Default::default(),
+            affinity_scope: Default::default(),
+            tips_amount_usd: None,
+            quote: None,
+            action: Some(UserAction::Tip { amount_usd: 20.0 }),
+        };
+        let plan = ActionPlan {
+            action_type: ActionType::ReplyText,
+            reply_style: eros_engine_core::types::ReplyStyle::Neutral,
+            affinity_deltas: Default::default(),
+            energy_cost: 0.0,
+            context_hints: Vec::new(),
+            reply_mode: None,
+            nudges: Default::default(),
+            clothing: None,
+            image_caption: None,
+            image_ref: eros_engine_core::types::ImageRef::Face,
+            aspect_ratio: None,
+            action_response: Some(ActionResponse::Refuse),
+        };
+        assert_eq!(tier_drop_for(&event, &plan), None);
     }
 
     #[test]

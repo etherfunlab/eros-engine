@@ -988,7 +988,11 @@ pub(crate) async fn build_reply_request(
         Some(response),
     ) = (&input.event, plan.action_response)
     {
-        system_prompt.push_str(&crate::prompt::user_action_context(a, response));
+        system_prompt.push_str(&crate::prompt::user_action_context(
+            a,
+            response,
+            input.persona.genome.tip_personality.as_deref(),
+        ));
     }
 
     // Spec §4.6. Order is load-bearing: model_facing_history strips and drops,

@@ -20347,12 +20347,28 @@ data: [DONE]\n\n"
         );
     }
 
-    /// Mock judge returning `verdict` (or HTTP `judge_status` when non-200), a
-    /// chat model answering "REPLY", and an action turn (`kiss`, empty
-    /// content) persisted with `metadata.action`. Returns the frames, the
-    /// mock (for request inspection) and the user message id.
+    /// `run_action_turn_with` on a `kiss`.
     async fn run_action_turn(
         pool: &PgPool,
+        verdict: serde_json::Value,
+        judge_status: u16,
+    ) -> (Vec<ProtocolFrame>, wiremock::MockServer, Uuid) {
+        run_action_turn_with(
+            pool,
+            eros_engine_core::types::UserAction::Kiss,
+            verdict,
+            judge_status,
+        )
+        .await
+    }
+
+    /// Mock judge returning `verdict` (or HTTP `judge_status` when non-200), a
+    /// chat model answering "REPLY", and an action turn (empty content)
+    /// persisted with `metadata.action`. Returns the frames, the mock (for
+    /// request inspection) and the user message id.
+    async fn run_action_turn_with(
+        pool: &PgPool,
+        action: eros_engine_core::types::UserAction,
         verdict: serde_json::Value,
         judge_status: u16,
     ) -> (Vec<ProtocolFrame>, wiremock::MockServer, Uuid) {
@@ -20399,7 +20415,7 @@ data: [DONE]\n\n"
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
-        let meta = serde_json::json!({"action": {"type": "kiss"}});
+        let meta = serde_json::json!({"action": serde_json::to_value(&action).unwrap()});
         let umid = match (ChatRepo { pool })
             .upsert_user_message_idempotent(
                 session_id,
@@ -20432,7 +20448,7 @@ data: [DONE]\n\n"
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
-                action: Some(eros_engine_core::types::UserAction::Kiss),
+                action: Some(action),
             },
             None,
         )
@@ -20556,6 +20572,79 @@ data: [DONE]\n\n"
         )));
         let body = chat_request_body(&mock.received_requests().await.unwrap());
         assert!(body.contains("对方凑过来想亲你，你接受了。"), "{body}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_refused_tip_is_judged_and_no_model_sees_the_amount(pool: PgPool) {
+        let (frames, mock, umid) = run_action_turn_with(
+            &pool,
+            eros_engine_core::types::UserAction::Tip { amount_usd: 20.0 },
+            serde_json::json!({"action": "reply_text", "inner_state": "", "action_response": "refuse"}),
+            200,
+        )
+        .await;
+        assert!(
+            frames.iter().any(|f| matches!(
+                f,
+                ProtocolFrame::ActionResponse { response: eros_engine_core::types::ActionResponse::Refuse, user_message_id } if *user_message_id == umid
+            )),
+            "{frames:?}"
+        );
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT metadata->'action'->>'response' FROM engine.chat_messages WHERE id = $1",
+        )
+        .bind(umid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored.as_deref(), Some("refuse"));
+
+        let reqs = mock.received_requests().await.unwrap();
+        let judge = reqs
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .find(|b| b.contains("pde/judge"))
+            .expect("the judge runs on a tip turn");
+        assert!(
+            judge.contains(
+                "[用户动作] 对方给你发了一个红包，相当于一个汉堡，对你来说算「有点多」的一笔"
+            ),
+            "{judge}"
+        );
+        let chat = chat_request_body(&reqs);
+        assert!(
+            chat.contains("对方给你发了一个红包，相当于一个汉堡，对你来说算「有点多」的一笔，你没有接受。用你自己的话回应。"),
+            "{chat}"
+        );
+        assert!(
+            chat.contains("（给你发了一个红包，相当于一个汉堡）"),
+            "the history marker reaches the model: {chat}"
+        );
+        assert!(!chat.contains("[this_turn]"), "no dice on a tip turn: {chat}");
+        for body in [&judge, &chat] {
+            assert!(
+                !body.contains("$20") && !body.contains("美元") && !body.contains("amount_usd"),
+                "{body}"
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_failed_judge_on_a_tip_falls_back_to_accept(pool: PgPool) {
+        let (frames, _mock, _umid) = run_action_turn_with(
+            &pool,
+            eros_engine_core::types::UserAction::Tip { amount_usd: 20.0 },
+            serde_json::json!({}),
+            500,
+        )
+        .await;
+        assert!(frames.iter().any(|f| matches!(
+            f,
+            ProtocolFrame::ActionResponse {
+                response: eros_engine_core::types::ActionResponse::Accept,
+                ..
+            }
+        )));
     }
 
     /// A BYOK turn on provider `mine` (spec 2026-10-08).
