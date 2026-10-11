@@ -264,11 +264,16 @@ picker is the gate.
 - `build_user_row_metadata` writes it as `metadata.outfit`. No history route
   returns it.
 - The judge sees `[指定穿着]` (§5.3).
-- `plan.clothing` is the outfit when one is named, sanitized like the judge's
-  `clothing`; the judge's own `clothing` is then not used. Without an outfit,
-  the judge's sanitized `clothing` as today.
-- The rule PDE, a judge failure and the forced-image override carry
-  `plan.clothing` as they do today, so the outfit holds on every path.
+- `pde::plan_for` and `pde::decide` read the outfit from the event. On every
+  reply plan a named outfit is `plan.clothing` and the judge's `clothing` is
+  not used; without one, `plan_for` keeps the judge's sanitized `clothing` as
+  today. Every path that builds a plan (the judge, the rule PDE, a judge
+  failure, the ghost kill-switch, the forced-image override) therefore wears
+  the named outfit.
+- `plan_for` stops dropping `clothing` on `ReplyImage`. The drop existed
+  because nothing downstream of a bare image read the outfit; the composer now
+  does (§6.3). `reply_mode` is still dropped there.
+- The outfit is not rewritten: §3.2 already keeps it to one line.
 
 ### 6.3 The picture
 
@@ -360,7 +365,7 @@ request.action {gift}   validate kind/name → metadata.action on a user row
 |---|---|
 | `Gift`, `ItemKind`, `GivenItem`, `refusal_line`, `Event` `outfit` | `core/src/types.rs` |
 | `PersonaItem`, `CompanionPersona.items` | `core/src/persona.rs` |
-| outfit on the rule plan | `core/src/pde.rs` |
+| named outfit in `decide` / `plan_for`, `clothing` kept on `ReplyImage` | `core/src/pde.rs` |
 | migration | `store/migrations/0067_persona_instance_items.sql` |
 | items in `load_companion`, item list / insert / delete | `store/src/persona.rs` |
 | `set_action_response` transaction | `store/src/chat.rs` |
@@ -412,8 +417,9 @@ core breaks listed under **Type** at the top.
 
 - **core.** `Gift`'s serde shape (`{"type":"gift","kind":"clothing","name":"…"}`);
   `GivenItem`'s wire values unchanged; `refusal_line` for `Gift` is `Bond`;
-  `decide` on a gift turn returns `ReplyText` with `Accept` and carries the
-  outfit as `clothing`.
+  `decide` on a gift turn returns `ReplyText` with `Accept`; `decide` and
+  `plan_for` put a named outfit in `clothing` over the judge's; `plan_for`
+  keeps `clothing` on `ReplyImage` and still drops `reply_mode` there.
 - **store** (`#[sqlx::test]`).
   - Migration: a `gift_reaction` row becomes `reply`; the CHECK rejects
     `gift_reaction`; deleting an instance cascades its items; deleting the
