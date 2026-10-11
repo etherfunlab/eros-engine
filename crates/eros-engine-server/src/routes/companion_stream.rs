@@ -130,7 +130,7 @@ pub enum UserActionKind {
 /// What a `give` action hands over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum GiftItemDto {
+pub enum GivenItemDto {
     Cigarette,
     Alcohol,
     Medicine,
@@ -146,7 +146,7 @@ pub struct UserActionDto {
     pub kind: UserActionKind,
     /// `give` only, and required there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub item: Option<GiftItemDto>,
+    pub item: Option<GivenItemDto>,
     /// `give` only: a short name for what is handed over, 1–32 chars.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(max_length = 32)]
@@ -171,7 +171,7 @@ impl UserActionDto {
     /// Validate and convert to the engine's action. `Err` carries the reason
     /// for the 422.
     pub(crate) fn to_core(&self) -> Result<eros_engine_core::types::UserAction, String> {
-        use eros_engine_core::types::{GiftItem, UserAction};
+        use eros_engine_core::types::{GivenItem, UserAction};
         fn free_text(raw: Option<&str>, field: &str, max: usize) -> Result<Option<String>, String> {
             let Some(raw) = raw else {
                 return Ok(None);
@@ -193,9 +193,9 @@ impl UserActionDto {
         Ok(match self.kind {
             UserActionKind::Give => {
                 let item = match self.item.ok_or("action.item is required for give")? {
-                    GiftItemDto::Cigarette => GiftItem::Cigarette,
-                    GiftItemDto::Alcohol => GiftItem::Alcohol,
-                    GiftItemDto::Medicine => GiftItem::Medicine,
+                    GivenItemDto::Cigarette => GivenItem::Cigarette,
+                    GivenItemDto::Alcohol => GivenItem::Alcohol,
+                    GivenItemDto::Medicine => GivenItem::Medicine,
                 };
                 let quantity = self.quantity.unwrap_or(1);
                 if !(1..=MAX_ACTION_QUANTITY).contains(&quantity) {
@@ -2699,7 +2699,7 @@ data: [DONE]\n\n";
 #[cfg(test)]
 mod validate_payload_tests {
     use super::*;
-    use eros_engine_core::types::{GiftItem, UserAction};
+    use eros_engine_core::types::{GivenItem, UserAction};
 
     fn base() -> StreamSendRequest {
         StreamSendRequest {
@@ -2888,7 +2888,7 @@ mod validate_payload_tests {
     fn give(name: Option<&str>, quantity: Option<u32>) -> UserActionDto {
         UserActionDto {
             kind: UserActionKind::Give,
-            item: Some(GiftItemDto::Alcohol),
+            item: Some(GivenItemDto::Alcohol),
             name: name.map(String::from),
             quantity,
             text: None,
@@ -2929,7 +2929,7 @@ mod validate_payload_tests {
         assert_eq!(
             a,
             UserAction::Give {
-                item: GiftItem::Alcohol,
+                item: GivenItem::Alcohol,
                 name: Some("威士忌".into()),
                 quantity: 1
             }

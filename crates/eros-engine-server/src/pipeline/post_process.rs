@@ -2484,7 +2484,7 @@ mod tests {
     #[test]
     fn tier_drop_for_only_on_a_refused_action() {
         use eros_engine_core::affinity::AffinityLine;
-        use eros_engine_core::types::{ActionResponse, GiftItem, UserAction};
+        use eros_engine_core::types::{ActionResponse, GivenItem, UserAction};
         let event = |action: Option<UserAction>| Event::UserMessage {
             content: String::new(),
             message_id: Uuid::nil(),
@@ -2511,7 +2511,7 @@ mod tests {
             action_response: r,
         };
         let give = UserAction::Give {
-            item: GiftItem::Alcohol,
+            item: GivenItem::Alcohol,
             name: None,
             quantity: 1,
         };

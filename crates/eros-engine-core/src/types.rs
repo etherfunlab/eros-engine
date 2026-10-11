@@ -108,7 +108,7 @@ pub struct QuotedMessage {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum UserAction {
     Give {
-        item: GiftItem,
+        item: GivenItem,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
         quantity: u8,
@@ -125,15 +125,22 @@ pub enum UserAction {
     Tip {
         amount_usd: f64,
     },
+    /// Something the persona keeps (spec
+    /// 2026-10-12-persona-items-and-gift-design.md). Accepted, it joins her
+    /// items or her wardrobe by `kind`.
+    Gift {
+        kind: ItemKind,
+        name: String,
+    },
 }
 
 impl UserAction {
-    /// The line a refusal of this action drops: handing something over is
-    /// friendship, every physical gesture is romance. A refused tip drops
-    /// nothing (spec 2026-10-11 §6).
+    /// The line a refusal of this action drops: handing something over or
+    /// giving something to keep is friendship, every physical gesture is
+    /// romance. A refused tip drops nothing (spec 2026-10-11 §6).
     pub fn refusal_line(&self) -> Option<AffinityLine> {
         match self {
-            UserAction::Give { .. } => Some(AffinityLine::Bond),
+            UserAction::Give { .. } | UserAction::Gift { .. } => Some(AffinityLine::Bond),
             UserAction::Tip { .. } => None,
             _ => Some(AffinityLine::Chemistry),
         }
@@ -144,10 +151,37 @@ impl UserAction {
 /// `name` on the action is free text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum GiftItem {
+pub enum GivenItem {
     Cigarette,
     Alcohol,
     Medicine,
+}
+
+/// Which of the persona's lists an item belongs to (spec
+/// 2026-10-12-persona-items-and-gift-design.md): `item` for what she owns,
+/// `clothing` for her wardrobe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ItemKind {
+    Item,
+    Clothing,
+}
+
+impl ItemKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ItemKind::Item => "item",
+            ItemKind::Clothing => "clothing",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "item" => Some(ItemKind::Item),
+            "clothing" => Some(ItemKind::Clothing),
+            _ => None,
+        }
+    }
 }
 
 /// Whether the persona accepts a user action. Decided by the PDE judge before
@@ -487,7 +521,7 @@ mod tests {
     #[test]
     fn user_action_serializes_flat_with_type_tag() {
         let give = UserAction::Give {
-            item: GiftItem::Alcohol,
+            item: GivenItem::Alcohol,
             name: Some("威士忌".into()),
             quantity: 2,
         };
@@ -496,7 +530,7 @@ mod tests {
             serde_json::json!({"type": "give", "item": "alcohol", "name": "威士忌", "quantity": 2})
         );
         let nameless = UserAction::Give {
-            item: GiftItem::Cigarette,
+            item: GivenItem::Cigarette,
             name: None,
             quantity: 1,
         };
@@ -523,7 +557,7 @@ mod tests {
     fn user_action_line_maps_give_to_bond_and_the_rest_to_chemistry() {
         use crate::affinity::AffinityLine;
         let give = UserAction::Give {
-            item: GiftItem::Medicine,
+            item: GivenItem::Medicine,
             name: None,
             quantity: 1,
         };
@@ -537,6 +571,64 @@ mod tests {
         ] {
             assert_eq!(a.refusal_line().unwrap(), AffinityLine::Chemistry, "{a:?}");
         }
+    }
+
+    #[test]
+    fn gift_action_serde_shape() {
+        let gift = UserAction::Gift {
+            kind: ItemKind::Clothing,
+            name: "红色旗袍".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&gift).unwrap(),
+            serde_json::json!({"type": "gift", "kind": "clothing", "name": "红色旗袍"})
+        );
+        let back: UserAction = serde_json::from_value(
+            serde_json::json!({"type": "gift", "kind": "item", "name": "摩托车"}),
+        )
+        .unwrap();
+        assert_eq!(
+            back,
+            UserAction::Gift {
+                kind: ItemKind::Item,
+                name: "摩托车".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_refused_gift_drops_bond_like_give() {
+        use crate::affinity::AffinityLine;
+        let gift = UserAction::Gift {
+            kind: ItemKind::Item,
+            name: "摩托车".into(),
+        };
+        assert_eq!(gift.refusal_line(), Some(AffinityLine::Bond));
+    }
+
+    #[test]
+    fn item_kind_round_trips_its_wire_value() {
+        for k in [ItemKind::Item, ItemKind::Clothing] {
+            assert_eq!(ItemKind::parse(k.as_str()), Some(k));
+            assert_eq!(
+                serde_json::to_value(k).unwrap(),
+                serde_json::json!(k.as_str())
+            );
+        }
+        assert_eq!(ItemKind::parse("shoes"), None);
+    }
+
+    #[test]
+    fn given_item_keeps_its_wire_values() {
+        assert_eq!(
+            serde_json::to_value(GivenItem::Cigarette).unwrap(),
+            "cigarette"
+        );
+        assert_eq!(serde_json::to_value(GivenItem::Alcohol).unwrap(), "alcohol");
+        assert_eq!(
+            serde_json::to_value(GivenItem::Medicine).unwrap(),
+            "medicine"
+        );
     }
 
     #[test]

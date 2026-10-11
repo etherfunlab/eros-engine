@@ -3063,7 +3063,7 @@
           }
         }
       },
-      "GiftItemDto": {
+      "GivenItemDto": {
         "type": "string",
         "description": "What a `give` action hands over.",
         "enum": [
@@ -4086,7 +4086,7 @@
                 "type": "null"
               },
               {
-                "$ref": "#/components/schemas/GiftItemDto",
+                "$ref": "#/components/schemas/GivenItemDto",
                 "description": "`give` only, and required there."
               }
             ]

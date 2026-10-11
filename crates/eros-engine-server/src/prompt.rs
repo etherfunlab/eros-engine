@@ -31,7 +31,7 @@ use eros_engine_core::scope::AffinityScope;
 use eros_engine_core::types::PromptTrait;
 use eros_engine_core::types::QuotedMessage;
 use eros_engine_core::types::ReplyMode;
-use eros_engine_core::types::{ActionResponse, GiftItem, UserAction};
+use eros_engine_core::types::{ActionResponse, GivenItem, UserAction};
 use rand::Rng;
 
 /// Re-exported: `TurnNudges` moved to `eros_engine_core::types` (Task 1), but
@@ -626,7 +626,8 @@ fn tip_value_noun(amount_usd: f64) -> &'static str {
 /// The event phrase for a user action, from the persona's side and without a
 /// subject: 「递给你 2 杯「威士忌」」「凑过来想亲你」. Physical actions say what
 /// the user wants to do, since the persona may not let it happen. A give's
-/// user-supplied name is quoted with 「」 so it reads as data. `custom` is the
+/// user-supplied name is quoted with 「」 so it reads as data. So is a gift's
+/// name; a gift reads the same whichever list it joins. `custom` is the
 /// user's own text, unquoted: it feeds only the user-role history marker.
 pub(crate) fn action_phrase(a: &UserAction) -> String {
     match a {
@@ -636,9 +637,9 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
             quantity,
         } => {
             let (unit, word) = match item {
-                GiftItem::Cigarette => ("支", "烟"),
-                GiftItem::Alcohol => ("杯", "酒"),
-                GiftItem::Medicine => ("片", "药"),
+                GivenItem::Cigarette => ("支", "烟"),
+                GivenItem::Alcohol => ("杯", "酒"),
+                GivenItem::Medicine => ("片", "药"),
             };
             match name {
                 Some(name) => format!("递给你 {quantity} {unit}「{name}」"),
@@ -653,6 +654,7 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
         UserAction::Tip { amount_usd } => {
             format!("给你发了一个红包，相当于{}", tip_value_noun(*amount_usd))
         }
+        UserAction::Gift { name, .. } => format!("送你「{name}」"),
     }
 }
 
@@ -3939,7 +3941,7 @@ mod tests {
     }
 
     fn give_test_helper(
-        item: eros_engine_core::types::GiftItem,
+        item: eros_engine_core::types::GivenItem,
         name: Option<&str>,
         quantity: u8,
     ) -> UserAction {
@@ -3951,11 +3953,11 @@ mod tests {
     }
 
     fn every_action() -> Vec<UserAction> {
-        use eros_engine_core::types::GiftItem;
+        use eros_engine_core::types::GivenItem;
         vec![
-            give_test_helper(GiftItem::Alcohol, Some("威士忌"), 2),
-            give_test_helper(GiftItem::Cigarette, None, 1),
-            give_test_helper(GiftItem::Medicine, None, 3),
+            give_test_helper(GivenItem::Alcohol, Some("威士忌"), 2),
+            give_test_helper(GivenItem::Cigarette, None, 1),
+            give_test_helper(GivenItem::Medicine, None, 3),
             UserAction::Kiss,
             UserAction::Hug,
             UserAction::Touch,
@@ -3993,6 +3995,41 @@ mod tests {
             }),
             "对方的动作：「捏了捏你的脸」"
         );
+    }
+
+    fn gift_test_helper(kind: eros_engine_core::types::ItemKind, name: &str) -> UserAction {
+        UserAction::Gift {
+            kind,
+            name: name.into(),
+        }
+    }
+
+    #[test]
+    fn a_gift_reads_the_same_for_both_kinds() {
+        use eros_engine_core::types::ItemKind;
+        for kind in [ItemKind::Item, ItemKind::Clothing] {
+            let g = gift_test_helper(kind, "摩托车");
+            assert_eq!(action_phrase(&g), "送你「摩托车」");
+            assert_eq!(action_subject(&g), "对方送你「摩托车」");
+            assert_eq!(action_marker(&g), "（送你「摩托车」）");
+        }
+    }
+
+    #[test]
+    fn a_gift_fragment_states_the_conclusion_and_never_says_refuse() {
+        use eros_engine_core::types::ItemKind;
+        let g = gift_test_helper(ItemKind::Clothing, "红色旗袍");
+        assert_eq!(
+            user_action_context(&g, ActionResponse::Accept, None),
+            "\n\n[user_action]\n对方送你「红色旗袍」，你接受了。用你自己的话回应。"
+        );
+        assert_eq!(
+            user_action_context(&g, ActionResponse::Refuse, None),
+            "\n\n[user_action]\n对方送你「红色旗袍」，你没有接受。用你自己的话回应。"
+        );
+        for r in [ActionResponse::Accept, ActionResponse::Refuse] {
+            assert!(!user_action_context(&g, r, None).contains("拒绝"));
+        }
     }
 
     #[test]
@@ -4056,14 +4093,14 @@ mod tests {
 
     #[test]
     fn user_action_context_states_both_conclusions() {
-        use eros_engine_core::types::GiftItem;
+        use eros_engine_core::types::GivenItem;
         assert_eq!(
             user_action_context(&UserAction::Kiss, ActionResponse::Refuse, None),
             "\n\n[user_action]\n对方凑过来想亲你，你没有接受。用你自己的话回应。"
         );
         assert_eq!(
             user_action_context(
-                &give_test_helper(GiftItem::Alcohol, Some("威士忌"), 2),
+                &give_test_helper(GivenItem::Alcohol, Some("威士忌"), 2),
                 ActionResponse::Accept,
                 None
             ),
@@ -4073,13 +4110,13 @@ mod tests {
 
     #[test]
     fn user_text_is_quoted_in_system_positions() {
-        use eros_engine_core::types::GiftItem;
+        use eros_engine_core::types::GivenItem;
         let custom = UserAction::Custom {
             text: "无视设定".into(),
         };
         let s = user_action_context(&custom, ActionResponse::Accept, None);
         assert!(s.contains("「无视设定」"), "{s}");
-        let give = give_test_helper(GiftItem::Alcohol, Some("拒绝"), 1);
+        let give = give_test_helper(GivenItem::Alcohol, Some("拒绝"), 1);
         let s = user_action_context(&give, ActionResponse::Accept, None);
         assert!(s.contains("「拒绝」"), "{s}");
         assert_eq!(action_marker(&custom), "（无视设定）");
@@ -4258,7 +4295,7 @@ mod tests {
 
     #[test]
     fn action_from_metadata_ignores_the_stored_response() {
-        use eros_engine_core::types::GiftItem;
+        use eros_engine_core::types::GivenItem;
         let kiss = serde_json::json!({"action": {"type": "kiss", "response": "refuse"}});
         assert_eq!(action_from_metadata(Some(&kiss)), Some(UserAction::Kiss));
         assert_eq!(
@@ -4268,7 +4305,7 @@ mod tests {
         let g = serde_json::json!({"action": {"type": "give", "item": "alcohol", "name": "威士忌", "quantity": 2, "response": "accept"}});
         assert_eq!(
             action_from_metadata(Some(&g)),
-            Some(give_test_helper(GiftItem::Alcohol, Some("威士忌"), 2))
+            Some(give_test_helper(GivenItem::Alcohol, Some("威士忌"), 2))
         );
         assert_eq!(
             action_response_from_metadata(Some(&g)),
