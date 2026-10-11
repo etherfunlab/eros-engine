@@ -224,11 +224,12 @@ The lines render wherever `[character_state]` renders.
 
 ### 5.3 Judge context
 
-`build_pde_ctx` adds, after the persona brief and only when non-empty:
+`build_pde_ctx` adds, after the persona brief and only when non-empty, the
+lists rendered as in §5.2:
 
 ```
-[你的物品] 「摩托车」、「吉他」
-[你的衣柜] 「红色旗袍」、「白色开衫」
+[你的物品] 「摩托车」（对方送的）、「吉他」
+[你的衣柜] 「红色旗袍」（对方送的）、「白色开衫」
 ```
 
 and, on a turn that names an outfit (§6), before `[用户最新消息]`:
@@ -444,8 +445,9 @@ core breaks listed under **Type** at the top.
 - **routes.** GET / POST / DELETE, including 403, 404, 422 and preset rows.
 - **Regression.** New fields on `CompanionPersona` and `Event::UserMessage`
   and the `GivenItem` rename change the form of existing call sites. No
-  existing assertion is weakened or changes its expected value, except
-  composer-payload assertions that now include the `[此刻穿着]` slot; each is
+  existing assertion is weakened or changes its expected value, except two
+  that this design reverses: composer-payload assertions that now include the
+  `[此刻穿着]` slot, and `plan_for` dropping `clothing` on `ReplyImage`. Each is
   listed in the PR.
 - `openapi.json` regenerated; the diff shows only the `gift` variant,
   `outfit`, the items routes and their schemas, and edited descriptions.
