@@ -31,7 +31,7 @@ use eros_engine_core::scope::AffinityScope;
 use eros_engine_core::types::PromptTrait;
 use eros_engine_core::types::QuotedMessage;
 use eros_engine_core::types::ReplyMode;
-use eros_engine_core::types::{ActionResponse, GivenItem, UserAction};
+use eros_engine_core::types::{ActionResponse, GivenItem, ItemKind, UserAction};
 use rand::Rng;
 
 /// Re-exported: `TurnNudges` moved to `eros_engine_core::types` (Task 1), but
@@ -681,6 +681,26 @@ pub(crate) fn action_marker(a: &UserAction) -> String {
     format!("（{}）", action_phrase(a))
 }
 
+/// One of the persona's lists as a model reads it (spec
+/// 2026-10-12-persona-items-and-gift-design.md §5.2): 「摩托车」（对方送的）、「吉他」.
+/// Names are quoted with 「」 so they read as data. `None` when the list is
+/// empty.
+pub(crate) fn item_list(persona: &CompanionPersona, kind: ItemKind) -> Option<String> {
+    let names: Vec<String> = persona
+        .items
+        .iter()
+        .filter(|i| i.kind == kind)
+        .map(|i| {
+            if i.gifted {
+                format!("「{}」（对方送的）", i.name)
+            } else {
+                format!("「{}」", i.name)
+            }
+        })
+        .collect();
+    (!names.is_empty()).then(|| names.join("、"))
+}
+
 /// Parse a row's `metadata.action`. The stored object also holds the decided
 /// `response`, which is not part of the action and is removed before parsing;
 /// anything that does not parse reads as no action.
@@ -1144,7 +1164,7 @@ pub fn build_prompt(
     };
 
     // Volatile (per-turn) character state, read from `character_insights`,
-    // plus the judge-decided outfit (ActionPlan.clothing) as a fifth line.
+    // plus the persona's item lists and the outfit (ActionPlan.clothing) as further lines.
     //
     // ONLY these four `character_insights` fields. `habits` / `personal_values`
     // are facets of who she is, whose source of truth is `persona_genomes` —
@@ -1176,6 +1196,16 @@ pub fn build_prompt(
                 .collect();
             if !rel.is_empty() {
                 lines.push(format!("- 提过的人：{}", rel.join("、")));
+            }
+        }
+        // The persona's items and wardrobe (spec 2026-10-12 §5.2), ahead of
+        // what she has on.
+        for (kind, label) in [
+            (ItemKind::Item, "你有的东西"),
+            (ItemKind::Clothing, "你的衣柜"),
+        ] {
+            if let Some(list) = item_list(persona, kind) {
+                lines.push(format!("- {label}：{list}"));
             }
         }
         // Judge-decided outfit (spec §3.5): a line of present-tense state,
@@ -3197,6 +3227,95 @@ mod tests {
             "block appears for the outfit alone: {p}"
         );
         assert!(p.contains("- 此刻的穿着：米色开衫"));
+    }
+
+    fn persona_with_items() -> CompanionPersona {
+        use eros_engine_core::persona::PersonaItem;
+        use eros_engine_core::types::ItemKind;
+        let mut p = fixture_persona();
+        p.items = vec![
+            PersonaItem {
+                kind: ItemKind::Item,
+                name: "摩托车".into(),
+                gifted: true,
+            },
+            PersonaItem {
+                kind: ItemKind::Item,
+                name: "吉他".into(),
+                gifted: false,
+            },
+            PersonaItem {
+                kind: ItemKind::Clothing,
+                name: "红色旗袍".into(),
+                gifted: true,
+            },
+        ];
+        p
+    }
+
+    fn prompt_for(persona: &CompanionPersona, clothing: Option<&str>) -> String {
+        build_prompt(
+            persona,
+            &[],
+            &[],
+            None,
+            &[],
+            None,
+            clothing,
+            &[],
+            AffinityScope::full(),
+            &[],
+            None,
+            None,
+            None,
+            None,
+            TurnNudges::default(),
+            &NowContext::default(),
+        )
+    }
+
+    #[test]
+    fn item_list_quotes_names_and_marks_gifts() {
+        use eros_engine_core::types::ItemKind;
+        let p = persona_with_items();
+        assert_eq!(
+            item_list(&p, ItemKind::Item).as_deref(),
+            Some("「摩托车」（对方送的）、「吉他」")
+        );
+        assert_eq!(
+            item_list(&p, ItemKind::Clothing).as_deref(),
+            Some("「红色旗袍」（对方送的）")
+        );
+        assert_eq!(item_list(&fixture_persona(), ItemKind::Item), None);
+    }
+
+    #[test]
+    fn character_state_lists_items_and_wardrobe_before_the_outfit() {
+        let p = prompt_for(&persona_with_items(), Some("红色旗袍"));
+        let items = p
+            .find("- 你有的东西：「摩托车」（对方送的）、「吉他」")
+            .expect(&p);
+        let wardrobe = p.find("- 你的衣柜：「红色旗袍」（对方送的）").expect(&p);
+        let outfit = p.find("- 此刻的穿着：红色旗袍").expect(&p);
+        assert!(p.find("[character_state]").unwrap() < items);
+        assert!(items < wardrobe && wardrobe < outfit, "{p}");
+    }
+
+    #[test]
+    fn an_empty_list_renders_no_line_and_no_block() {
+        use eros_engine_core::persona::PersonaItem;
+        use eros_engine_core::types::ItemKind;
+        let mut only_wardrobe = fixture_persona();
+        only_wardrobe.items = vec![PersonaItem {
+            kind: ItemKind::Clothing,
+            name: "白色开衫".into(),
+            gifted: false,
+        }];
+        let p = prompt_for(&only_wardrobe, None);
+        assert!(!p.contains("你有的东西"), "{p}");
+        assert!(p.contains("- 你的衣柜：「白色开衫」"), "{p}");
+        let bare = prompt_for(&fixture_persona(), None);
+        assert!(!bare.contains("[character_state]"), "{bare}");
     }
 
     #[test]

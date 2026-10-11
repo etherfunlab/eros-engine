@@ -2718,8 +2718,26 @@ fn build_pde_ctx(
         } => format!("[用户动作] {}\n", crate::prompt::action_subject(a)),
         _ => String::new(),
     };
+    // The persona's lists (spec 2026-10-12 §5.3): what she owns informs
+    // whether she takes a gift, the wardrobe is what she dresses from.
+    let items_block = {
+        use eros_engine_core::types::ItemKind;
+        let mut s = String::new();
+        for (kind, label) in [
+            (ItemKind::Item, "你的物品"),
+            (ItemKind::Clothing, "你的衣柜"),
+        ] {
+            if let Some(list) = crate::prompt::item_list(&input.persona, kind) {
+                s.push_str(&format!("[{label}] {list}\n"));
+            }
+        }
+        if !s.is_empty() {
+            s.push('\n');
+        }
+        s
+    };
     format!(
-        "{persona_block}[最近对话]\n{transcript}\n\n\
+        "{persona_block}{items_block}[最近对话]\n{transcript}\n\n\
          [亲密度] 当前档位=第 {rung} 档\n\
          [耐心] 当前档位={patience_band}\n\
          [信号] message_count={} hours_since_last_message={:.1} ghost_streak={} hours_since_last_ghost={}\n\
@@ -17688,6 +17706,35 @@ data: [DONE]\n\n";
         p.genome.art_metadata = serde_json::json!({});
         p.genome.tip_personality = None;
         assert_eq!(build_persona_brief(&p), "");
+    }
+
+    #[test]
+    fn build_pde_ctx_lists_items_and_wardrobe_only_when_present() {
+        use eros_engine_core::persona::PersonaItem;
+        use eros_engine_core::types::ItemKind;
+        let t = JudgeTranscript::default();
+        let mut input = fixture_decision_input();
+        let bare = build_pde_ctx(&t, &input, false, None);
+        assert!(
+            !bare.contains("[你的物品]") && !bare.contains("[你的衣柜]"),
+            "{bare}"
+        );
+
+        input.persona.items = vec![PersonaItem {
+            kind: ItemKind::Clothing,
+            name: "红色旗袍".into(),
+            gifted: true,
+        }];
+        let ctx = build_pde_ctx(&t, &input, false, None);
+        assert!(!ctx.contains("[你的物品]"), "{ctx}");
+        assert!(
+            ctx.contains("[你的衣柜] 「红色旗袍」（对方送的）\n"),
+            "{ctx}"
+        );
+        assert!(
+            ctx.find("[你的衣柜]").unwrap() < ctx.find("[最近对话]").unwrap(),
+            "the lists sit with the persona, before the transcript: {ctx}"
+        );
     }
 
     #[test]
