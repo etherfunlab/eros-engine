@@ -20287,6 +20287,62 @@ data: [DONE]\n\n"
         assert_eq!(payload["action_response"], "refuse");
     }
 
+    async fn instance_items(pool: &PgPool) -> Vec<(String, String, String, Option<Uuid>)> {
+        sqlx::query_as(
+            "SELECT kind, name, source, user_message_id FROM engine.persona_instance_items",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_accepted_gift_joins_the_wardrobe(pool: PgPool) {
+        let gift = eros_engine_core::types::UserAction::Gift {
+            kind: eros_engine_core::types::ItemKind::Clothing,
+            name: "红色旗袍".into(),
+        };
+        let (_frames, mock, umid) = run_action_turn_with(
+            &pool,
+            gift,
+            serde_json::json!({"action": "reply_text", "inner_state": "", "action_response": "accept"}),
+            200,
+        )
+        .await;
+        assert_eq!(
+            instance_items(&pool).await,
+            vec![(
+                "clothing".to_string(),
+                "红色旗袍".to_string(),
+                "gift".to_string(),
+                Some(umid)
+            )]
+        );
+        let reqs = mock.received_requests().await.unwrap();
+        let judge = reqs
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .find(|b| b.contains("pde/judge"))
+            .expect("the judge ran");
+        assert!(judge.contains("[用户动作] 对方送你「红色旗袍」"), "{judge}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_refused_gift_adds_nothing(pool: PgPool) {
+        let gift = eros_engine_core::types::UserAction::Gift {
+            kind: eros_engine_core::types::ItemKind::Item,
+            name: "摩托车".into(),
+        };
+        let (_frames, _mock, _umid) = run_action_turn_with(
+            &pool,
+            gift,
+            serde_json::json!({"action": "reply_text", "inner_state": "", "action_response": "refuse"}),
+            200,
+        )
+        .await;
+        assert!(instance_items(&pool).await.is_empty());
+    }
+
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn ghost_verdict_on_an_action_turn_still_replies_and_accepts(pool: PgPool) {
         let (frames, _mock, umid) = run_action_turn(

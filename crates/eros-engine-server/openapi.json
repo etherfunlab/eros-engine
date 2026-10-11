@@ -3360,6 +3360,14 @@
           }
         }
       },
+      "ItemKindDto": {
+        "type": "string",
+        "description": "Which of the persona's lists an item joins: `item` (what she owns) or\n`clothing` (her wardrobe).",
+        "enum": [
+          "item",
+          "clothing"
+        ]
+      },
       "LabelTransitionDto": {
         "type": "object",
         "description": "One line's tier transition (serialised keys). Read-side mirror of\n`eros_engine_core::affinity::LabelTransition`.",
@@ -4067,7 +4075,7 @@
       },
       "UserActionDto": {
         "type": "object",
-        "description": "An action the user does to the persona this turn, besides talking. The\npersona accepts or does not; a refusal costs the relationship one tier on\nthe line the action touches (`give` → bond, every physical or custom action →\nchemistry); a refused `tip` costs nothing.",
+        "description": "An action the user does to the persona this turn, besides talking. The\npersona accepts or does not; a refusal costs the relationship one tier on\nthe line the action touches (`give` and `gift` → bond, every physical or custom action →\nchemistry); a refused `tip` costs nothing. An accepted `gift` joins the\npersona's items or wardrobe.",
         "required": [
           "type"
         ],
@@ -4091,13 +4099,24 @@
               }
             ]
           },
+          "kind": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ItemKindDto",
+                "description": "`gift` only, and required there: which list the gift joins."
+              }
+            ]
+          },
           "name": {
             "type": [
               "string",
               "null"
             ],
-            "description": "`give` only: a short name for what is handed over, 1–32 chars.",
-            "maxLength": 32
+            "description": "`give`: optional, a short name for what is handed over, 1–32 chars.\n`gift`: required, what is given, 1–64 chars.",
+            "maxLength": 64
           },
           "quantity": {
             "type": [
@@ -4132,7 +4151,8 @@
           "touch",
           "lick",
           "custom",
-          "tip"
+          "tip",
+          "gift"
         ]
       },
       "UserActionView": {

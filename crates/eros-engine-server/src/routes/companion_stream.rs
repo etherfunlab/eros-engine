@@ -40,6 +40,28 @@ const MAX_TIP_USD: f64 = 1_000_000_000.0;
 const MAX_ACTION_NAME_CHARS: usize = 32;
 const MAX_ACTION_TEXT_CHARS: usize = 100;
 const MAX_ACTION_QUANTITY: u32 = 99;
+/// An item name or an outfit (spec 2026-10-12-persona-items-and-gift-design.md §3.2).
+pub(crate) const MAX_ITEM_NAME_CHARS: usize = 64;
+
+/// Validate an item name or an outfit: trimmed, `1..=64` chars, no line-break
+/// or control characters. `Err` carries the reason for the 422, naming `field`.
+pub(crate) fn item_name(raw: &str, field: &str) -> Result<String, String> {
+    let t = raw.trim();
+    let n = t.chars().count();
+    if n == 0 || n > MAX_ITEM_NAME_CHARS {
+        return Err(format!(
+            "{field} must be 1..={MAX_ITEM_NAME_CHARS} chars after trim"
+        ));
+    }
+    if t.chars()
+        .any(|c| c.is_control() || c == '\u{2028}' || c == '\u{2029}')
+    {
+        return Err(format!(
+            "{field} must not contain line-break or control characters"
+        ));
+    }
+    Ok(t.to_string())
+}
 const MIN_CLIENT_MSG_ID_LEN: usize = 26;
 const MAX_CLIENT_MSG_ID_LEN: usize = 36;
 const CONCURRENT_STREAMS_PER_USER: u32 = 3;
@@ -125,6 +147,7 @@ pub enum UserActionKind {
     Lick,
     Custom,
     Tip,
+    Gift,
 }
 
 /// What a `give` action hands over.
@@ -136,10 +159,38 @@ pub enum GivenItemDto {
     Medicine,
 }
 
+/// Which of the persona's lists an item joins: `item` (what she owns) or
+/// `clothing` (her wardrobe).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ItemKindDto {
+    Item,
+    Clothing,
+}
+
+impl From<ItemKindDto> for eros_engine_core::types::ItemKind {
+    fn from(k: ItemKindDto) -> Self {
+        match k {
+            ItemKindDto::Item => Self::Item,
+            ItemKindDto::Clothing => Self::Clothing,
+        }
+    }
+}
+
+impl From<eros_engine_core::types::ItemKind> for ItemKindDto {
+    fn from(k: eros_engine_core::types::ItemKind) -> Self {
+        match k {
+            eros_engine_core::types::ItemKind::Item => Self::Item,
+            eros_engine_core::types::ItemKind::Clothing => Self::Clothing,
+        }
+    }
+}
+
 /// An action the user does to the persona this turn, besides talking. The
 /// persona accepts or does not; a refusal costs the relationship one tier on
-/// the line the action touches (`give` → bond, every physical or custom action →
-/// chemistry); a refused `tip` costs nothing.
+/// the line the action touches (`give` and `gift` → bond, every physical or custom action →
+/// chemistry); a refused `tip` costs nothing. An accepted `gift` joins the
+/// persona's items or wardrobe.
 #[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct UserActionDto {
     #[serde(rename = "type")]
@@ -147,9 +198,13 @@ pub struct UserActionDto {
     /// `give` only, and required there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item: Option<GivenItemDto>,
-    /// `give` only: a short name for what is handed over, 1–32 chars.
+    /// `gift` only, and required there: which list the gift joins.
+    #[serde(rename = "kind", default, skip_serializing_if = "Option::is_none")]
+    pub item_kind: Option<ItemKindDto>,
+    /// `give`: optional, a short name for what is handed over, 1–32 chars.
+    /// `gift`: required, what is given, 1–64 chars.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schema(max_length = 32)]
+    #[schema(max_length = 64)]
     pub name: Option<String>,
     /// `give` only: 1–99, default 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -226,6 +281,18 @@ impl UserActionDto {
                 }
                 UserAction::Tip { amount_usd }
             }
+            UserActionKind::Gift => UserAction::Gift {
+                kind: self
+                    .item_kind
+                    .ok_or("action.kind is required for gift")?
+                    .into(),
+                name: item_name(
+                    self.name
+                        .as_deref()
+                        .ok_or("action.name is required for gift")?,
+                    "action.name",
+                )?,
+            },
         })
     }
 }
@@ -2889,6 +2956,7 @@ mod validate_payload_tests {
         UserActionDto {
             kind: UserActionKind::Give,
             item: Some(GivenItemDto::Alcohol),
+            item_kind: None,
             name: name.map(String::from),
             quantity,
             text: None,
@@ -2900,6 +2968,7 @@ mod validate_payload_tests {
         UserActionDto {
             kind,
             item: None,
+            item_kind: None,
             name: None,
             quantity: None,
             text: None,
@@ -2999,6 +3068,7 @@ mod validate_payload_tests {
         UserActionDto {
             kind: UserActionKind::Tip,
             item: None,
+            item_kind: None,
             name: None,
             quantity: None,
             text: None,
@@ -3020,6 +3090,95 @@ mod validate_payload_tests {
         assert!(
             tip(Some(1_000_000_000.0)).to_core().is_ok(),
             "the cap itself"
+        );
+    }
+
+    fn gift(kind: Option<ItemKindDto>, name: Option<&str>) -> UserActionDto {
+        UserActionDto {
+            kind: UserActionKind::Gift,
+            item: None,
+            item_kind: kind,
+            name: name.map(String::from),
+            quantity: None,
+            text: None,
+            amount_usd: None,
+        }
+    }
+
+    #[test]
+    fn gift_converts_and_trims_its_name() {
+        use eros_engine_core::types::ItemKind;
+        assert_eq!(
+            gift(Some(ItemKindDto::Clothing), Some("　红色旗袍　"))
+                .to_core()
+                .unwrap(),
+            UserAction::Gift {
+                kind: ItemKind::Clothing,
+                name: "红色旗袍".into()
+            }
+        );
+        assert!(
+            gift(None, Some("摩托车")).to_core().is_err(),
+            "kind required"
+        );
+        assert!(
+            gift(Some(ItemKindDto::Item), None).to_core().is_err(),
+            "name required"
+        );
+        assert!(gift(Some(ItemKindDto::Item), Some("   "))
+            .to_core()
+            .is_err());
+        assert!(gift(Some(ItemKindDto::Item), Some(&"字".repeat(64)))
+            .to_core()
+            .is_ok());
+        assert!(gift(Some(ItemKindDto::Item), Some(&"字".repeat(65)))
+            .to_core()
+            .is_err());
+        assert!(gift(Some(ItemKindDto::Item), Some("摩托\n车"))
+            .to_core()
+            .is_err());
+        assert!(gift(Some(ItemKindDto::Item), Some("摩托\u{2028}车"))
+            .to_core()
+            .is_err());
+    }
+
+    #[test]
+    fn a_gift_validates_with_empty_content() {
+        let mut r = base();
+        r.content = String::new();
+        r.action = Some(gift(Some(ItemKindDto::Item), Some("摩托车")));
+        assert!(validate_payload(&r).is_ok());
+        r.action = Some(gift(None, Some("摩托车")));
+        assert!(validate_payload(&r).is_err());
+    }
+
+    #[test]
+    fn a_gift_parses_from_the_wire_and_from_stored_metadata() {
+        let dto: UserActionDto = serde_json::from_value(
+            serde_json::json!({"type": "gift", "kind": "clothing", "name": "红色旗袍"}),
+        )
+        .unwrap();
+        assert_eq!(dto.item_kind, Some(ItemKindDto::Clothing));
+        let view = UserActionView::from_metadata_action(&serde_json::json!(
+            {"type": "gift", "kind": "item", "name": "摩托车", "response": "accept"}
+        ))
+        .unwrap();
+        assert_eq!(view.action.item_kind, Some(ItemKindDto::Item));
+        assert_eq!(view.response, Some(ActionResponseDto::Accept));
+        assert_eq!(
+            serde_json::to_value(&view).unwrap(),
+            serde_json::json!({"type": "gift", "kind": "item", "name": "摩托车", "response": "accept"})
+        );
+    }
+
+    #[test]
+    fn user_row_metadata_carries_a_gift() {
+        let mut r = base();
+        r.action = Some(gift(Some(ItemKindDto::Clothing), Some("红色旗袍")));
+        let meta = build_user_row_metadata(&r, None).unwrap();
+        assert_eq!(
+            meta["action"],
+            serde_json::json!({"type": "gift", "kind": "clothing", "name": "红色旗袍"})
         );
     }
 

@@ -617,6 +617,7 @@ mod tests {
             action: Some(UserActionDto {
                 kind: UserActionKind::Custom,
                 item: None,
+                item_kind: None,
                 name: None,
                 quantity: None,
                 text: Some("捏了捏你的脸".into()),
@@ -646,6 +647,21 @@ mod tests {
         assert_eq!(
             params.action.unwrap().to_core().unwrap(),
             eros_engine_core::types::UserAction::Tip { amount_usd: 20.0 }
+        );
+    }
+
+    #[test]
+    fn queued_params_rebuild_a_gift() {
+        let params: super::QueuedTurnParams = serde_json::from_value(
+            json!({"action": {"type": "gift", "kind": "item", "name": "摩托车"}}),
+        )
+        .unwrap();
+        assert_eq!(
+            params.action.unwrap().to_core().unwrap(),
+            eros_engine_core::types::UserAction::Gift {
+                kind: eros_engine_core::types::ItemKind::Item,
+                name: "摩托车".into()
+            }
         );
     }
 
