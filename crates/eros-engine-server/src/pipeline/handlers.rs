@@ -913,8 +913,10 @@ pub(crate) async fn build_reply_request(
             });
 
     // CHAT_NOISE_CANCELLATION_DISABLED restores the pre-change prompt shape in
-    // full: [character_state] was the one addition in that change, so the flag
-    // must suppress it too, not just the strip and the ladder below.
+    // full: the insight lines were the [character_state] addition in that
+    // change, so the flag suppresses them too, not just the strip and the
+    // ladder below. The block's other lines (items, wardrobe, outfit) still
+    // render.
     let character_state_for_prompt = if state.config.chat_noise_cancellation_disabled {
         None
     } else {

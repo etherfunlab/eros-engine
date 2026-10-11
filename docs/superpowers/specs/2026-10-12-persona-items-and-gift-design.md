@@ -399,9 +399,11 @@ core breaks listed under **Type** at the top.
 - The engine ships first; the caller adopts `gift`, `outfit` and the routes
   after. A `gift` sent to the previous engine is rejected; an `outfit` is
   silently ignored.
-- The migration is forward-only and additive. Rollback is the previous image:
-  the table stays and is ignored; a gift row reads as an unparseable action,
-  a blank user line, as a tip row did in the tip spec's rollback.
+- The migration is forward-only and additive. The previous binary's
+  `migrate` refuses a database that holds 0067, so a rollback deploys the
+  previous image without running it. That image ignores the table, and
+  reads a gift row as an unparseable action, a blank user line, as a tip
+  row did in the tip spec's rollback.
 
 ## 13. Observability
 
