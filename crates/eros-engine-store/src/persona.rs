@@ -154,13 +154,13 @@ impl<'a> PersonaRepo<'a> {
                 COALESCE(( \
                     SELECT json_agg(json_build_object( \
                                'kind', t.kind, 'name', t.name, 'gifted', t.gifted) \
-                           ORDER BY t.kind, t.last_at DESC) \
+                           ORDER BY t.kind, t.last_at DESC, t.name) \
                     FROM ( \
                         SELECT kind, name, \
                                bool_or(source = 'gift') AS gifted, \
                                max(created_at) AS last_at, \
                                row_number() OVER ( \
-                                   PARTITION BY kind ORDER BY max(created_at) DESC) AS rn \
+                                   PARTITION BY kind ORDER BY max(created_at) DESC, name) AS rn \
                         FROM engine.persona_instance_items \
                         WHERE instance_id = pi.id \
                         GROUP BY kind, name \
@@ -581,6 +581,7 @@ mod tests {
         .unwrap();
         assert_eq!(count, 1, "exactly one instance per (genome, owner)");
     }
+
     async fn add_item(
         pool: &PgPool,
         instance_id: Uuid,
