@@ -75,6 +75,11 @@ pub enum Event {
         /// turns.
         #[serde(default)]
         action: Option<UserAction>,
+        /// The outfit the caller named for this turn (spec
+        /// 2026-10-12-persona-items-and-gift-design.md §6). `None` ⇒ the judge
+        /// picks.
+        #[serde(default)]
+        outfit: Option<String>,
     },
     ProactiveTrigger,
     AppOpen,
@@ -318,9 +323,11 @@ pub struct ActionPlan {
     /// reply_mode suppressed the roll, when the action bears no text, or on
     /// paths that never roll (proactive, edit turns).
     pub nudges: TurnNudges,
-    /// Judge-decided outfit for this turn (free text, sanitized by the server
-    /// before it gets here). Same carriage rule as `reply_mode`: `Some` only
-    /// on LLM-judge, text-bearing turns; `None` everywhere else.
+    /// What the persona has on this turn: the caller's named outfit when the
+    /// event carries one, else the judge's (free text, sanitized by the
+    /// server). Carried on every reply plan, a bare image turn included,
+    /// since the composer dresses the picture with it; `None` on ghost,
+    /// product_qa and proactive plans.
     pub clothing: Option<String>,
     /// What the picture showed, for post-process affinity on image turns.
     /// Written by the stream AFTER the composer resolves — always `None` at

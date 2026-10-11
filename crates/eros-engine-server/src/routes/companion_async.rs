@@ -59,6 +59,9 @@ pub(crate) struct QueuedTurnParams {
     pub user_region: Option<String>,
     #[serde(default)]
     pub action: Option<crate::routes::companion_stream::UserActionDto>,
+    /// The validated outfit (spec 2026-10-12 §6.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outfit: Option<String>,
     /// That the turn asked for BYOK, and what to do when it cannot be
     /// served (spec 2026-10-08 §9.1). Never the endpoints, models or key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -164,6 +167,9 @@ pub async fn send_message_async(
     let quote = resolve_quote(&chat_repo, session_id, req.reply_to_message_id).await?;
     let persisted_metadata = build_user_row_metadata(&req, quote.as_ref());
 
+    let outfit = crate::routes::companion_stream::validated_outfit(req.outfit.as_deref())
+        .ok()
+        .flatten();
     let params = serde_json::to_value(QueuedTurnParams {
         tier: req.tier.clone(),
         memory_scope: req.memory_scope,
@@ -177,6 +183,7 @@ pub async fn send_message_async(
         user_country: crate::holiday::bounded_raw(req.user_country.as_deref()),
         user_region: crate::holiday::bounded_raw(req.user_region.as_deref()),
         action: req.action.clone(),
+        outfit,
         byok: None,
     })
     .expect("QueuedTurnParams serializes");
@@ -608,6 +615,15 @@ mod tests {
             !paths.contains_key("/v2/comp/chat/{session_id}/message/async"),
             "the removed /v2/comp/chat alias must not be in the spec"
         );
+    }
+
+    #[test]
+    fn queued_params_carry_the_outfit_and_old_rows_parse_without_it() {
+        let params: super::QueuedTurnParams =
+            serde_json::from_value(json!({"outfit": "红色旗袍"})).unwrap();
+        assert_eq!(params.outfit.as_deref(), Some("红色旗袍"));
+        let legacy: super::QueuedTurnParams = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(legacy.outfit, None);
     }
 
     #[test]

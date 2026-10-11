@@ -4001,6 +4001,14 @@
               "null"
             ]
           },
+          "outfit": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The outfit the persona wears this turn, typically one of her wardrobe\nentries (`GET /v2/comp/instance/{instance_id}/items`); not checked\nagainst it. 1–64 chars after trim; blank reads as absent. Absent ⇒ the\njudge picks from the wardrobe.",
+            "maxLength": 64
+          },
           "prompt_traits": {
             "type": [
               "array",

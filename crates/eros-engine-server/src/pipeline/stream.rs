@@ -2718,6 +2718,14 @@ fn build_pde_ctx(
         } => format!("[用户动作] {}\n", crate::prompt::action_subject(a)),
         _ => String::new(),
     };
+    // The outfit the caller named (spec 2026-10-12 §5.3); the plan wears it
+    // whatever the judge writes in `clothing`.
+    let outfit_line = match &input.event {
+        eros_engine_core::types::Event::UserMessage {
+            outfit: Some(o), ..
+        } => format!("[指定穿着] 「{o}」\n"),
+        _ => String::new(),
+    };
     // The persona's lists (spec 2026-10-12 §5.3): what she owns informs
     // whether she takes a gift, the wardrobe is what she dresses from.
     let items_block = {
@@ -2743,7 +2751,7 @@ fn build_pde_ctx(
          [信号] message_count={} hours_since_last_message={:.1} ghost_streak={} hours_since_last_ghost={}\n\
          [图片能力] 本轮可发图={image_flag}\n\
          [近期图片] 最近{INPUT_FILTER_CONTEXT_TURNS}条消息内已发图={img_count} 张；上一条 AI 消息是图片={last_img}（以本行计数为准，对话记录里的图片标记仅供参考）\n\
-         {product_qa_section}{action_line}\n\
+         {product_qa_section}{action_line}{outfit_line}\n\
          [用户最新消息]\n{latest}",
         s.message_count,
         s.hours_since_last_message,
@@ -4184,6 +4192,8 @@ pub struct PersistedUserMessage {
     pub user_locale: crate::holiday::UserLocale,
     /// The action this turn carries besides the text (spec 2026-10-05).
     pub action: Option<eros_engine_core::types::UserAction>,
+    /// The outfit the caller named for this turn (spec 2026-10-12 §6).
+    pub outfit: Option<String>,
 }
 
 impl PersistedUserMessage {
@@ -4200,6 +4210,7 @@ impl PersistedUserMessage {
             affinity_scope: self.affinity_scope,
             quote: self.quote.clone(),
             action: self.action.clone(),
+            outfit: self.outfit.clone(),
         }
     }
 }
@@ -7031,6 +7042,7 @@ mod tests {
                 affinity_scope: Default::default(),
                 quote: Default::default(),
                 action: None,
+                outfit: None,
             },
             affinity: pde_test_affinity(),
             persona: pde_test_persona(),
@@ -7310,6 +7322,7 @@ mod tests {
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -7689,6 +7702,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -7788,6 +7802,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -7926,6 +7941,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -8072,6 +8088,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -8184,6 +8201,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -8287,6 +8305,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -8400,6 +8419,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -8584,6 +8604,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -8688,6 +8709,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -8781,6 +8803,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: Some(eros_engine_core::types::UserAction::Kiss),
+                outfit: None,
             },
             None,
         )
@@ -9293,6 +9316,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -9420,6 +9444,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -9546,6 +9571,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -9729,6 +9755,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -9864,6 +9891,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -10034,6 +10062,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -10218,6 +10247,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -10392,6 +10422,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -11269,6 +11300,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -11398,6 +11430,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -11914,6 +11947,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -12059,6 +12093,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -12227,6 +12262,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -12345,6 +12381,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -12462,6 +12499,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -12575,6 +12613,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -12687,6 +12726,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -12817,6 +12857,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -13020,6 +13061,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -13147,6 +13189,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -13271,6 +13314,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -13456,6 +13500,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -13658,6 +13703,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -13809,6 +13855,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -13947,6 +13994,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -14107,6 +14155,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -14266,6 +14315,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -14400,6 +14450,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -14531,6 +14582,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -14688,6 +14740,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -14884,6 +14937,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -15030,6 +15084,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -15185,6 +15240,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -15365,6 +15421,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -15597,6 +15654,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -15746,6 +15804,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -15880,6 +15939,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -16056,6 +16116,7 @@ data: [DONE]\n\n";
                 }),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -16175,6 +16236,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -16313,6 +16375,7 @@ data: [DONE]\n\n";
                 // Tip action: the rule PDE's action branch always replies (never
                 // Ghost), so the live-burst path is guaranteed to run.
                 action: Some(eros_engine_core::types::UserAction::Tip { amount_usd: 1.0 }),
+                outfit: None,
             },
             None,
         )
@@ -16465,6 +16528,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: Some(eros_engine_core::types::UserAction::Tip { amount_usd: 1.0 }),
+                outfit: None,
             },
             None,
         )
@@ -16704,6 +16768,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -16821,6 +16886,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -16965,6 +17031,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -17061,6 +17128,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -17668,6 +17736,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 quote: Default::default(),
                 action: None,
+                outfit: None,
             },
             affinity: test_affinity(),
             persona: test_persona(),
@@ -17753,6 +17822,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 quote: Default::default(),
                 action: None,
+                outfit: None,
             },
             affinity: test_affinity(),
             persona: p,
@@ -17897,6 +17967,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 quote: Default::default(),
                 action: None,
+                outfit: None,
             },
             affinity: test_affinity(),
             persona: p,
@@ -18004,6 +18075,75 @@ data: [DONE]\n\n";
             ActionType::ReplyTextImage,
             "images stay available on an action turn"
         );
+    }
+
+    fn fixture_persisted_user_message() -> PersistedUserMessage {
+        PersistedUserMessage {
+            user_message_id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            user_id: Uuid::nil(),
+            instance_id: Uuid::nil(),
+            content: "hi".into(),
+            prompt_traits: vec![],
+            audit: None,
+            tier: None,
+            memory_scope: Default::default(),
+            affinity_scope: Default::default(),
+            image_url: None,
+            image: None,
+            quote: None,
+            user_locale: Default::default(),
+            action: None,
+            outfit: None,
+        }
+    }
+
+    #[test]
+    fn to_event_carries_the_outfit() {
+        let mut m = fixture_persisted_user_message();
+        m.outfit = Some("红色旗袍".into());
+        match m.to_event() {
+            Event::UserMessage { outfit, .. } => assert_eq!(outfit.as_deref(), Some("红色旗袍")),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_pde_ctx_states_a_named_outfit() {
+        let t = JudgeTranscript::default();
+        let mut input = fixture_decision_input();
+        assert!(!build_pde_ctx(&t, &input, false, None).contains("[指定穿着]"));
+        if let Event::UserMessage { outfit, .. } = &mut input.event {
+            *outfit = Some("红色旗袍".into());
+        }
+        let ctx = build_pde_ctx(&t, &input, false, None);
+        assert!(ctx.contains("[指定穿着] 「红色旗袍」\n"), "{ctx}");
+        assert!(
+            ctx.find("[指定穿着]").unwrap() < ctx.find("[用户最新消息]").unwrap(),
+            "{ctx}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_named_outfit_dresses_the_reply_over_the_judge(pool: PgPool) {
+        let (_frames, mock, _umid) = run_action_turn_full(
+            &pool,
+            eros_engine_core::types::UserAction::Hug,
+            Some("红色旗袍".into()),
+            serde_json::json!({"action": "reply_text", "inner_state": "", "clothing": "运动服"}),
+            200,
+        )
+        .await;
+        let reqs = mock.received_requests().await.unwrap();
+        let chat = chat_request_body(&reqs);
+        assert!(chat.contains("- 此刻的穿着：红色旗袍"), "{chat}");
+        assert!(!chat.contains("运动服"), "{chat}");
+        let judge = reqs
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .find(|b| b.contains("pde/judge"))
+            .expect("the judge ran");
+        assert!(judge.contains("[指定穿着] 「红色旗袍」"), "{judge}");
     }
 
     #[test]
@@ -18431,6 +18571,7 @@ data: [DONE]\n\n";
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -19951,6 +20092,7 @@ data: [DONE]\n\n"
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
+                outfit: None,
             },
             None,
         )
@@ -20093,6 +20235,7 @@ data: [DONE]\n\n"
             quote: Default::default(),
             user_locale: Default::default(),
             action: Some(eros_engine_core::types::UserAction::Kiss),
+            outfit: None,
         };
         match msg.to_event() {
             Event::UserMessage {
@@ -20164,6 +20307,16 @@ data: [DONE]\n\n"
     async fn run_action_turn_with(
         pool: &PgPool,
         action: eros_engine_core::types::UserAction,
+        verdict: serde_json::Value,
+        judge_status: u16,
+    ) -> (Vec<ProtocolFrame>, wiremock::MockServer, Uuid) {
+        run_action_turn_full(pool, action, None, verdict, judge_status).await
+    }
+
+    async fn run_action_turn_full(
+        pool: &PgPool,
+        action: eros_engine_core::types::UserAction,
+        outfit: Option<String>,
         verdict: serde_json::Value,
         judge_status: u16,
     ) -> (Vec<ProtocolFrame>, wiremock::MockServer, Uuid) {
@@ -20243,6 +20396,7 @@ data: [DONE]\n\n"
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: Some(action),
+                outfit,
             },
             None,
         )

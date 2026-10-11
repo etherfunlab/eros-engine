@@ -352,6 +352,7 @@ async fn drive_turn(
         // Validated at enqueue; a params row that no longer converts runs as
         // a plain turn rather than failing it.
         action: params.action.as_ref().and_then(|a| a.to_core().ok()),
+        outfit: params.outfit.clone(),
     };
 
     drive_to_exhaustion(Arc::new(state.clone()), user_msg, None, tap, None).await

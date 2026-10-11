@@ -309,6 +309,7 @@ fn edit_turn_event(
         affinity_scope: Default::default(),
         quote,
         action: None,
+        outfit: None,
     }
 }
 

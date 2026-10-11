@@ -1760,6 +1760,7 @@ mod tests {
             affinity_scope: Default::default(),
             quote: Default::default(),
             action: None,
+            outfit: None,
         };
         let extracted = audit_from_event(&ev);
         assert_eq!(extracted, Some(&audit));
@@ -2938,6 +2939,7 @@ mod tests {
                 affinity_scope: Default::default(),
                 quote: Default::default(),
                 action: None,
+                outfit: None,
             },
             affinity: ladder_test_affinity(session_id, owner, instance_id),
             persona: ladder_test_persona(instance_id, owner),
@@ -3059,6 +3061,7 @@ mod tests {
                 affinity_scope: Default::default(),
                 quote: Default::default(),
                 action: None,
+                outfit: None,
             },
             affinity: ladder_test_affinity(session_id, owner, instance_id),
             // No persona timezone ⇒ the persona clock falls back to the user's.
@@ -3195,6 +3198,7 @@ mod tests {
                 affinity_scope: Default::default(),
                 quote: Default::default(),
                 action: None,
+                outfit: None,
             },
             affinity: ladder_test_affinity(session_id, owner, instance_id),
             persona: ladder_test_persona(instance_id, owner),
@@ -3303,6 +3307,7 @@ mod tests {
                 affinity_scope: Default::default(),
                 quote: Default::default(),
                 action: None,
+                outfit: None,
             },
             affinity: ladder_test_affinity(session_id, owner, instance_id),
             persona: ladder_test_persona(instance_id, owner),
@@ -3617,6 +3622,7 @@ mod tests {
                 affinity_scope: Default::default(),
                 quote: Default::default(),
                 action: None,
+                outfit: None,
             },
             affinity: ladder_test_affinity(session_id, owner, instance_id),
             persona: ladder_test_persona(instance_id, owner),

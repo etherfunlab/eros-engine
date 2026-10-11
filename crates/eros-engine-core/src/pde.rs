@@ -40,6 +40,15 @@ pub fn settle_action_response(
     }
 }
 
+/// The outfit the caller named for this turn, if any (spec
+/// 2026-10-12-persona-items-and-gift-design.md §6.2).
+fn named_outfit(event: &Event) -> Option<String> {
+    match event {
+        Event::UserMessage { outfit, .. } => outfit.clone(),
+        _ => None,
+    }
+}
+
 /// Core decision function.
 ///
 /// Phase 2: rules only. Phase 6 adds the LLM fallback path.
@@ -58,7 +67,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
             context_hints: vec![],
             reply_mode: None,
             nudges: TurnNudges::default(),
-            clothing: None,
+            clothing: named_outfit(&input.event),
             image_caption: None,
             image_ref: ImageRef::Face,
             aspect_ratio: None,
@@ -134,7 +143,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
         context_hints: vec![],
         reply_mode: None,
         nudges: TurnNudges::default(),
-        clothing: None,
+        clothing: named_outfit(&input.event),
         image_caption: None,
         image_ref: ImageRef::Face,
         aspect_ratio: None,
@@ -146,7 +155,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
 /// and energy constants internally. Per action:
 ///   ReplyText / ReplyImage / ReplyTextImage → Neutral, predict_reply_deltas,
 ///                                              ENERGY_COST_REPLY, context_hints = hints,
-///                                              reply_mode / clothing kept (ReplyImage drops both)
+///                                              reply_mode kept (ReplyImage drops it); clothing kept, a named outfit wins
 ///   Ghost                                   → Cold, ghost_affinity_deltas,
 ///                                              ENERGY_COST_GHOST, hints discarded, mode discarded
 ///   ProductQa                               → Neutral, all-zero deltas, zero energy,
@@ -172,18 +181,16 @@ pub fn plan_for(
             energy_cost: ENERGY_COST_REPLY,
             context_hints: hints,
             // Mode only makes sense where there is text to deliver; a bare
-            // image turn drops it (same carriage rule as clothing).
+            // image turn drops it (clothing, unlike mode, is kept: the picture wears it).
             reply_mode: if matches!(action, ActionType::ReplyImage) {
                 None
             } else {
                 reply_mode
             },
             nudges: TurnNudges::default(),
-            clothing: if matches!(action, ActionType::ReplyImage) {
-                None
-            } else {
-                clothing
-            },
+            // A named outfit wins; a bare image turn keeps it, since the
+            // composer dresses the picture with it.
+            clothing: named_outfit(&input.event).or(clothing),
             image_caption: None,
             image_ref,
             aspect_ratio,
@@ -335,6 +342,7 @@ mod tests {
             affinity_scope: Default::default(),
             quote: Default::default(),
             action: None,
+            outfit: None,
         }
     }
 
@@ -675,8 +683,9 @@ mod tests {
             None,
         );
         assert_eq!(
-            image_only.clothing, None,
-            "image-only turn has no text prompt to dress"
+            image_only.clothing.as_deref(),
+            Some("米色针织开衫和短裤"),
+            "the composer dresses a bare image turn (spec 2026-10-12 §6.2)"
         );
 
         let ghost = plan_for(
@@ -746,7 +755,86 @@ mod tests {
             affinity_scope: Default::default(),
             quote: Default::default(),
             action: Some(action),
+            outfit: None,
         }
+    }
+
+    fn with_outfit(mut event: Event, outfit: &str) -> Event {
+        if let Event::UserMessage { outfit: o, .. } = &mut event {
+            *o = Some(outfit.into());
+        }
+        event
+    }
+
+    #[test]
+    fn a_named_outfit_wins_over_the_judge_on_every_reply_plan() {
+        let input = DecisionInput {
+            event: with_outfit(user_msg("hi"), "红色旗袍"),
+            affinity: base_affinity(),
+            persona: base_persona(),
+            signals: base_signals(),
+        };
+        for action in [
+            ActionType::ReplyText,
+            ActionType::ReplyTextImage,
+            ActionType::ReplyImage,
+        ] {
+            let plan = plan_for(
+                &input,
+                action,
+                vec![],
+                None,
+                Some("运动服".into()),
+                ImageRef::Face,
+                None,
+                None,
+            );
+            assert_eq!(plan.clothing.as_deref(), Some("红色旗袍"), "{action:?}");
+        }
+        let ghost = plan_for(
+            &input,
+            ActionType::Ghost,
+            vec![],
+            None,
+            None,
+            ImageRef::Face,
+            None,
+            None,
+        );
+        assert_eq!(ghost.clothing, None, "a ghost has nobody to dress");
+        assert_eq!(
+            decide(&input).clothing.as_deref(),
+            Some("红色旗袍"),
+            "the rule PDE wears it too"
+        );
+    }
+
+    #[test]
+    fn decide_dresses_an_action_turn_in_the_named_outfit() {
+        let input = DecisionInput {
+            event: with_outfit(action_msg(crate::types::UserAction::Hug), "红色旗袍"),
+            affinity: base_affinity(),
+            persona: base_persona(),
+            signals: base_signals(),
+        };
+        assert_eq!(decide(&input).clothing.as_deref(), Some("红色旗袍"));
+    }
+
+    #[test]
+    fn a_bare_image_turn_keeps_clothing_but_still_drops_the_reply_mode() {
+        let input = test_decision_input();
+        let plan = plan_for(
+            &input,
+            ActionType::ReplyImage,
+            vec![],
+            Some(crate::types::ReplyMode::Ask),
+            Some("运动服".into()),
+            ImageRef::Face,
+            None,
+            None,
+        );
+        assert_eq!(plan.clothing.as_deref(), Some("运动服"));
+        assert_eq!(plan.reply_mode, None);
     }
 
     #[test]

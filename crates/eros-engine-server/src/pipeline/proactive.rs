@@ -142,6 +142,7 @@ pub(crate) async fn greet(
             affinity_scope: g.affinity_scope,
             quote: None,
             action: None,
+            outfit: None,
         },
         affinity,
         persona: g.persona.clone(),

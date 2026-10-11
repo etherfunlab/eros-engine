@@ -2284,6 +2284,7 @@ mod tests {
             affinity_scope: Default::default(),
             quote: Default::default(),
             action: None,
+            outfit: None,
         };
         // Only `user` is taken; session_id/metadata are ignored by design.
         assert_eq!(client_id_from_event(&event).as_deref(), Some("u_abc"));
@@ -2301,6 +2302,7 @@ mod tests {
             affinity_scope: Default::default(),
             quote: Default::default(),
             action: None,
+            outfit: None,
         };
         assert_eq!(client_id_from_event(&event), None);
     }
@@ -2495,6 +2497,7 @@ mod tests {
             affinity_scope: Default::default(),
             quote: None,
             action,
+            outfit: None,
         };
         let plan = |r: Option<ActionResponse>| ActionPlan {
             action_type: ActionType::ReplyText,
@@ -2549,6 +2552,7 @@ mod tests {
             affinity_scope: Default::default(),
             quote: None,
             action: Some(UserAction::Tip { amount_usd: 20.0 }),
+            outfit: None,
         };
         let plan = ActionPlan {
             action_type: ActionType::ReplyText,
@@ -3561,6 +3565,7 @@ mod tests {
             affinity_scope: Default::default(),
             quote: Default::default(),
             action: None,
+            outfit: None,
         };
 
         // Mirrors what `pde::decide` would compute for a short user message
@@ -3725,6 +3730,7 @@ mod tests {
             affinity_scope: Default::default(),
             quote: Default::default(),
             action: None,
+            outfit: None,
         };
         let plan = ActionPlan {
             action_type: ActionType::ReplyImage,
@@ -3858,6 +3864,7 @@ mod tests {
             affinity_scope: Default::default(),
             quote: Default::default(),
             action: None,
+            outfit: None,
         };
         let plan = ActionPlan {
             action_type: ActionType::ReplyImage,
@@ -4453,6 +4460,7 @@ mod tests {
             affinity_scope: Default::default(),
             quote: Default::default(),
             action: None,
+            outfit: None,
         };
         let plan = ActionPlan {
             action_type: ActionType::ReplyText,

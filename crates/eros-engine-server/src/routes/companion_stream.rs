@@ -62,6 +62,14 @@ pub(crate) fn item_name(raw: &str, field: &str) -> Result<String, String> {
     }
     Ok(t.to_string())
 }
+
+/// The request's `outfit`, validated as an item name; blank reads as absent.
+pub(crate) fn validated_outfit(raw: Option<&str>) -> Result<Option<String>, String> {
+    match raw {
+        Some(o) if !o.trim().is_empty() => item_name(o, "outfit").map(Some),
+        _ => Ok(None),
+    }
+}
 const MIN_CLIENT_MSG_ID_LEN: usize = 26;
 const MAX_CLIENT_MSG_ID_LEN: usize = 36;
 const CONCURRENT_STREAMS_PER_USER: u32 = 3;
@@ -365,6 +373,13 @@ pub struct StreamSendRequest {
     /// [`UserActionDto`]). With an action, `content` may be empty.
     #[serde(default)]
     pub action: Option<UserActionDto>,
+    /// The outfit the persona wears this turn, typically one of her wardrobe
+    /// entries (`GET /v2/comp/instance/{instance_id}/items`); not checked
+    /// against it. 1–64 chars after trim; blank reads as absent. Absent ⇒ the
+    /// judge picks from the wardrobe.
+    #[serde(default)]
+    #[schema(max_length = 64)]
+    pub outfit: Option<String>,
     /// Bring-your-own-key configuration for this turn's reply (spec
     /// 2026-10-08-byok-chat). Honoured only with the deployment's
     /// `X-Byok-Caller-Secret` header; refused on the async route.
@@ -431,6 +446,15 @@ pub(crate) fn validate_payload(req: &StreamSendRequest) -> Result<(), AppError> 
                 original_user_message_id: None,
             }));
         }
+    }
+    if let Err(message) = validated_outfit(req.outfit.as_deref()) {
+        return Err(AppError::StreamPre(StreamPreError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "unprocessable",
+            message,
+            user_message: "穿着无效".into(),
+            original_user_message_id: None,
+        }));
     }
     if req.content.chars().count() > MAX_CONTENT_CHARS {
         return Err(AppError::StreamPre(StreamPreError {
@@ -655,6 +679,10 @@ pub(crate) fn build_user_row_metadata(
             serde_json::to_value(&a).expect("UserAction serializes"),
         );
     }
+    // What the caller named for her to wear (spec 2026-10-12 §6.2).
+    if let Ok(Some(o)) = validated_outfit(req.outfit.as_deref()) {
+        meta_map.insert("outfit".into(), serde_json::json!(o));
+    }
     // Pre-validation, pre-resolve raw snapshot of what the frontend sent.
     // The `_raw` suffix distinguishes these from the post-resolve `memory_scope`
     // / `affinity_scope` / `prompt_traits` written on the matching assistant row.
@@ -818,6 +846,7 @@ pub async fn send_message_stream(
         user_country: crate::holiday::bounded_raw(req.user_country.as_deref()),
         user_region: crate::holiday::bounded_raw(req.user_region.as_deref()),
         action: req.action.clone(),
+        outfit: validated_outfit(req.outfit.as_deref()).ok().flatten(),
         byok: req.byok.as_ref().map(|b| crate::byok::QueuedByok {
             fallback_to_platform: b.fallback_to_platform,
         }),
@@ -871,6 +900,7 @@ pub async fn send_message_stream(
                         req.user_region.as_deref(),
                     ),
                     action: req.action.as_ref().and_then(|a| a.to_core().ok()),
+                    outfit: validated_outfit(req.outfit.as_deref()).ok().flatten(),
                 };
                 let turn = ClaimedTurn {
                     queue_id,
@@ -1054,6 +1084,7 @@ mod tests {
             user_region: None,
             action: None,
             byok: None,
+            outfit: None,
         }
     }
 
@@ -2785,6 +2816,7 @@ mod validate_payload_tests {
             user_region: None,
             action: None,
             byok: None,
+            outfit: None,
         }
     }
 
@@ -2884,6 +2916,7 @@ mod validate_payload_tests {
             user_region: None,
             action: None,
             byok: None,
+            outfit: None,
         }
     }
 
@@ -3051,6 +3084,40 @@ mod validate_payload_tests {
         let mut r = base();
         r.action = Some(give(None, Some(0)));
         assert!(validate_payload(&r).is_err());
+    }
+
+    #[test]
+    fn outfit_validates_and_blank_reads_as_absent() {
+        assert_eq!(validated_outfit(None).unwrap(), None);
+        assert_eq!(validated_outfit(Some("   ")).unwrap(), None);
+        assert_eq!(
+            validated_outfit(Some("　红色旗袍　")).unwrap().as_deref(),
+            Some("红色旗袍")
+        );
+        assert!(validated_outfit(Some(&"字".repeat(65))).is_err());
+        assert!(validated_outfit(Some("红色\n旗袍")).is_err());
+
+        let mut r = base();
+        r.outfit = Some("字".repeat(65));
+        assert!(validate_payload(&r).is_err());
+        r.outfit = Some("红色旗袍".into());
+        assert!(validate_payload(&r).is_ok());
+    }
+
+    #[test]
+    fn user_row_metadata_carries_the_outfit_trimmed() {
+        let mut r = base();
+        r.outfit = Some(" 红色旗袍 ".into());
+        assert_eq!(
+            build_user_row_metadata(&r, None).unwrap()["outfit"],
+            "红色旗袍"
+        );
+        r.outfit = Some("  ".into());
+        let meta = build_user_row_metadata(&r, None);
+        assert!(
+            meta.as_ref().is_none_or(|m| m.get("outfit").is_none()),
+            "{meta:?}"
+        );
     }
 
     #[test]
