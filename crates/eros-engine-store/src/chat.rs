@@ -937,7 +937,7 @@ impl<'a> ChatRepo<'a> {
     /// `metadata.action` is left alone. Last write wins: a re-driven turn
     /// re-decides.
     ///
-    /// On a `gift` the same transaction keeps the persona's items in step
+    /// On a `gift` the same single statement keeps the persona's items in step
     /// (spec 2026-10-12-persona-items-and-gift-design.md §4.4): accepted, it
     /// adds one item, idempotent on the message; refused, it removes the item
     /// an earlier decision added. A stored gift whose kind or name is
@@ -947,51 +947,35 @@ impl<'a> ChatRepo<'a> {
         user_message_id: Uuid,
         response: eros_engine_core::types::ActionResponse,
     ) -> Result<(), sqlx::Error> {
-        use eros_engine_core::types::ActionResponse;
-        let mut tx = self.pool.begin().await?;
-        let action_type = sqlx::query_scalar::<_, Option<String>>(
-            "UPDATE engine.chat_messages \
-             SET metadata = jsonb_set(metadata, '{action,response}', to_jsonb($2::text)) \
-             WHERE id = $1 AND metadata ? 'action' \
-             RETURNING metadata #>> '{action,type}'",
+        sqlx::query(
+            "WITH upd AS ( \
+                 UPDATE engine.chat_messages \
+                    SET metadata = jsonb_set(metadata, '{action,response}', to_jsonb($2::text)) \
+                  WHERE id = $1 AND metadata ? 'action' \
+                 RETURNING id, session_id, metadata -> 'action' AS a \
+             ), ins AS ( \
+                 INSERT INTO engine.persona_instance_items \
+                     (instance_id, kind, name, source, user_message_id) \
+                 SELECT s.instance_id, upd.a ->> 'kind', upd.a ->> 'name', 'gift', upd.id \
+                   FROM upd JOIN engine.chat_sessions s ON s.id = upd.session_id \
+                  WHERE $2::text = 'accept' \
+                    AND upd.a ->> 'type' = 'gift' \
+                    AND s.instance_id IS NOT NULL \
+                    AND upd.a ->> 'kind' IN ('item', 'clothing') \
+                    AND COALESCE(upd.a ->> 'name', '') <> '' \
+                 ON CONFLICT (user_message_id) WHERE user_message_id IS NOT NULL DO NOTHING \
+             ) \
+             DELETE FROM engine.persona_instance_items i \
+              USING upd \
+              WHERE $2::text = 'refuse' \
+                AND upd.a ->> 'type' = 'gift' \
+                AND i.user_message_id = upd.id",
         )
         .bind(user_message_id)
         .bind(response.as_str())
-        .fetch_optional(&mut *tx)
-        .await?
-        .flatten();
-        if action_type.as_deref() == Some("gift") {
-            match response {
-                ActionResponse::Accept => {
-                    sqlx::query(
-                        "INSERT INTO engine.persona_instance_items \
-                             (instance_id, kind, name, source, user_message_id) \
-                         SELECT s.instance_id, m.metadata #>> '{action,kind}', \
-                                m.metadata #>> '{action,name}', 'gift', m.id \
-                         FROM engine.chat_messages m \
-                         JOIN engine.chat_sessions s ON s.id = m.session_id \
-                         WHERE m.id = $1 \
-                           AND s.instance_id IS NOT NULL \
-                           AND m.metadata #>> '{action,kind}' IN ('item', 'clothing') \
-                           AND COALESCE(m.metadata #>> '{action,name}', '') <> '' \
-                         ON CONFLICT (user_message_id) WHERE user_message_id IS NOT NULL \
-                         DO NOTHING",
-                    )
-                    .bind(user_message_id)
-                    .execute(&mut *tx)
-                    .await?;
-                }
-                ActionResponse::Refuse => {
-                    sqlx::query(
-                        "DELETE FROM engine.persona_instance_items WHERE user_message_id = $1",
-                    )
-                    .bind(user_message_id)
-                    .execute(&mut *tx)
-                    .await?;
-                }
-            }
-        }
-        tx.commit().await
+        .execute(self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Mark a user message as having received a `ghost` decision from the
