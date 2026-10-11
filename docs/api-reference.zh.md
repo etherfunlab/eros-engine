@@ -113,7 +113,7 @@ data: {"type":"final","filtered":false,"prompt_injected":null,"tier":null,"retri
 - **`final`** —— 本轮汇总：`filtered`（bool，回复是否被输出过滤）、`prompt_injected`（本轮注入的 trait tag 数组，无则为 `null`）、`tier`（回显请求的 `tier`，未传为 `null`）、`retries_chat`（命中的对话尝试下标，从 0 起）、`retries_filter`（实际服务的过滤模型尝试下标），以及自 v1.4.0 起的 `llm_attempts` / `gateway_errors`（**为空时整个字段省略**，见下）。这一帧不再带任何画像/lead 信号——`lead_score`、`should_show_cta`、`agent_training_level` 已随 companion_insights 拆除（spec 2026-08-11）移除；画像状态改从 `GET /comp/user/{user_id}/profile` 读取。
 - **`action_response`** —— 只在带 `action` 的回合出现：`user_message_id` 和 `response`（`"accept"` | `"refuse"`）。在第一个 `meta` 之前发一次，幂等重放时会重发。客户端必须容忍不认识的帧类型。之后若该回合以 `error` 结束，这一轮就没有生效，历史里也不带它的 `response`。
 
-**失败轮次在历史里的样子。** 以 `error` 结束的轮次没有生效：亲密度没有变化，动作轮次的用户行不带 `response`。通常还会留下一条 `system_error` 通知，它的 `user_message_id` 指向那条用户行。如果轮次失败之前已经有失败的回复尝试落库，就不留通知：回复链用尽时没有兜底话术可发（没有配置，或者整条链都是 BYOK，见 [byok.zh.md](byok.zh.md)），或者某一跳失败之后整轮超时。这时队列行按 `done` 结算，历史里保留每次失败尝试的 assistant 行，内容为空，或是它流出过的半截文本。async 端点的轮次走同一条管线，落进历史的样子也一样。
+**失败轮次在历史里的样子。** 以 `error` 结束的轮次没有生效：亲密度没有变化，动作轮次的用户行不带 `response`。通常还会留下一条 `system_error` 通知，它的 `user_message_id` 指向那条用户行。如果轮次失败之前已经有失败的回复尝试落库，就不留通知：回复链用尽时没有兜底话术可发（没有配置，或者整条链都是 BYOK，见 [byok.zh.md](byok.zh.md)），或者某一跳失败之后整轮超时。这时队列行按 `done` 结算，历史里保留每次失败尝试的 assistant 行，内容为空，或是它流出过的半截文本。async 端点的轮次走同一条管线，但最多可以尝试 `CHAT_QUEUE_MAX_ATTEMPTS` 次：还没有任何回复尝试落库就失败的会重试，只有最后一次尝试按上面的方式结算；已经有回复尝试落库之后才失败的不再重试。
 
 **过滤轮次也是流式的。** 当本轮的 LLM `output_filter` 生效时（见
 [model-config.zh.md](model-config.zh.md)），改写结果会以普通的 `delta` 帧
