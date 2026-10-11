@@ -104,14 +104,16 @@ data: {"type":"done","message_id":"01J...","truncated":false,"usage":{"prompt_to
 data: {"type":"final","filtered":false,"prompt_injected":null,"tier":null,"retries_chat":0,"retries_filter":0}
 ```
 
-生成与连接是解耦的：客户端中途断线，回复仍会完整生成并落入历史（从历史接口或 Supabase Realtime 取），断线后失败的轮次会留下一条 `system_error`。stream 轮次与异步端点共用同一张队列表（单次尝试，不做后台重试）。
+生成与连接是解耦的：客户端中途断线，回复仍会完整生成并落入历史（从历史接口或 Supabase Realtime 取），断线后失败的轮次通常会留下一条 `system_error`（例外见下文**失败轮次在历史里的样子**）。stream 轮次与异步端点共用同一张队列表（单次尝试，不做后台重试）。
 
 帧字段说明：
 
 - **`meta`** —— `message_id`、`action_type`、`model`（实际服务的模型 id，可能省略），以及 `continues_from`（可选，本轮续接重试链时为上一条消息 id）。`action_type` 是以下之一：`reply` | `ghost` | `reply_image` | `reply_text_image` | `product_qa`（纯文本回复报告为 `reply`，不是 `reply_text`——线上协议里没有 `reply_text`）。`product_qa` 标记由 PDE 判断器路由的出戏产品问答（见 [model-config.zh.md](model-config.zh.md)）；它被排除在伴侣上下文/记忆之外，但实时流与重放上报告的方式相同。客户端必须容忍未知的 `action_type` 值（新值可能在不打大版本号的情况下新增）。
 - **`done`** —— `truncated`、`usage`（经 `OPENROUTER_USAGE_HIDDEN_KEYS` 过滤后；总是存在——不适用时为 `null`）、`generation_id`（OpenRouter id；总是存在——不适用时为 `null`），以及 `ghost_fallback`（bool；为 `false` 时整个字段省略）。`ghost_fallback: true` 标记一条最终解析为空、以静默回退形式交付的回复——它**不是** `action_type=ghost` 轮次，也不会动 ghost 计数。原因记录在落库行的 `metadata.fallback_reason` 上。承诺出图的轮次（`action_type=reply_text_image`）例外：文本半边为空是一条纯图片回复而不是沉默，因此它上报 `ghost_fallback: false`、不带 `fallback_reason`，尾随的 `image_request` 照常发出。
 - **`final`** —— 本轮汇总：`filtered`（bool，回复是否被输出过滤）、`prompt_injected`（本轮注入的 trait tag 数组，无则为 `null`）、`tier`（回显请求的 `tier`，未传为 `null`）、`retries_chat`（命中的对话尝试下标，从 0 起）、`retries_filter`（实际服务的过滤模型尝试下标），以及自 v1.4.0 起的 `llm_attempts` / `gateway_errors`（**为空时整个字段省略**，见下）。这一帧不再带任何画像/lead 信号——`lead_score`、`should_show_cta`、`agent_training_level` 已随 companion_insights 拆除（spec 2026-08-11）移除；画像状态改从 `GET /comp/user/{user_id}/profile` 读取。
-- **`action_response`** —— 只在带 `action` 的回合出现：`user_message_id` 和 `response`（`"accept"` | `"refuse"`）。在第一个 `meta` 之前发一次，幂等重放时会重发。客户端必须容忍不认识的帧类型。之后若该回合以 `error` 结束（流式）或留下 `system_error` 行（async），则这一轮没有生效：没有回复，亲密度也没有变化，历史里也不带它的 `response`。
+- **`action_response`** —— 只在带 `action` 的回合出现：`user_message_id` 和 `response`（`"accept"` | `"refuse"`）。在第一个 `meta` 之前发一次，幂等重放时会重发。客户端必须容忍不认识的帧类型。之后若该回合以 `error` 结束，这一轮就没有生效，历史里也不带它的 `response`。
+
+**失败轮次在历史里的样子。** 以 `error` 结束的轮次没有生效：亲密度没有变化，动作轮次的用户行不带 `response`。通常还会留下一条 `system_error` 通知，它的 `user_message_id` 指向那条用户行。如果轮次失败之前已经有失败的回复尝试落库，就不留通知：回复链用尽时没有兜底话术可发（没有配置，或者整条链都是 BYOK，见 [byok.zh.md](byok.zh.md)），或者某一跳失败之后整轮超时。这时队列行按 `done` 结算，历史里保留每次失败尝试的 assistant 行，内容为空，或是它流出过的半截文本。async 端点的轮次走同一条管线，落进历史的样子也一样。
 
 **过滤轮次也是流式的。** 当本轮的 LLM `output_filter` 生效时（见
 [model-config.zh.md](model-config.zh.md)），改写结果会以普通的 `delta` 帧
