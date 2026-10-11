@@ -1314,6 +1314,158 @@
         ]
       }
     },
+    "/v2/comp/instance/{instance_id}/items": {
+      "get": {
+        "tags": [
+          "persona"
+        ],
+        "operationId": "list_items",
+        "parameters": [
+          {
+            "name": "instance_id",
+            "in": "path",
+            "description": "Persona instance id owned by the JWT user",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonaItemsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "instance is not owned by the JWT user"
+          },
+          "404": {
+            "description": "no such active instance"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "persona"
+        ],
+        "operationId": "add_item",
+        "parameters": [
+          {
+            "name": "instance_id",
+            "in": "path",
+            "description": "Persona instance id owned by the JWT user",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddItemRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonaItemView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "instance is not owned by the JWT user"
+          },
+          "404": {
+            "description": "no such active instance"
+          },
+          "422": {
+            "description": "name out of bounds or with control characters"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v2/comp/instance/{instance_id}/items/{item_id}": {
+      "delete": {
+        "tags": [
+          "persona"
+        ],
+        "operationId": "delete_item",
+        "parameters": [
+          {
+            "name": "instance_id",
+            "in": "path",
+            "description": "Persona instance id owned by the JWT user",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "item_id",
+            "in": "path",
+            "description": "An item row of this instance",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "deleted"
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "instance is not owned by the JWT user"
+          },
+          "404": {
+            "description": "no such active instance, or no such item on it"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v2/comp/reactions": {
       "get": {
         "tags": [
@@ -1916,6 +2068,23 @@
           "accept",
           "refuse"
         ]
+      },
+      "AddItemRequest": {
+        "type": "object",
+        "required": [
+          "kind",
+          "name"
+        ],
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/ItemKindDto"
+          },
+          "name": {
+            "type": "string",
+            "description": "1–64 chars after trim, no line-break or control characters.",
+            "maxLength": 64
+          }
+        }
       },
       "AffinityDeltasDto": {
         "type": "object",
@@ -3368,6 +3537,15 @@
           "clothing"
         ]
       },
+      "ItemSourceDto": {
+        "type": "string",
+        "description": "Where an entry came from.",
+        "enum": [
+          "preset",
+          "gift",
+          "caller"
+        ]
+      },
       "LabelTransitionDto": {
         "type": "object",
         "description": "One line's tier transition (serialised keys). Read-side mirror of\n`eros_engine_core::affinity::LabelTransition`.",
@@ -3560,6 +3738,63 @@
                 "description": "The persona's first message, or `null` when it does not speak first."
               }
             ]
+          }
+        }
+      },
+      "PersonaItemView": {
+        "type": "object",
+        "description": "One entry of the persona's lists.",
+        "required": [
+          "kind",
+          "name",
+          "source"
+        ],
+        "properties": {
+          "created_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "`null` for a preset."
+          },
+          "id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`null` for a preset."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ItemKindDto"
+          },
+          "name": {
+            "type": "string"
+          },
+          "source": {
+            "$ref": "#/components/schemas/ItemSourceDto"
+          },
+          "user_message_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The gift turn; `null` for presets, caller rows, and gifts whose\nmessage was deleted."
+          }
+        }
+      },
+      "PersonaItemsResponse": {
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PersonaItemView"
+            },
+            "description": "Presets first, then the instance's rows, newest first. Neither\ndeduplicated nor capped."
           }
         }
       },

@@ -24,6 +24,7 @@ pub mod health;
 pub mod image_edit;
 pub mod insight;
 pub mod persona;
+pub mod persona_items;
 pub mod reaction;
 pub mod session_open;
 pub mod voice;
@@ -45,6 +46,7 @@ pub fn router(state: AppState) -> OpenApiRouter<AppState> {
         .merge(bff::router())
         .merge(world_town::router())
         .merge(persona::router())
+        .merge(persona_items::router())
         .merge(insight::router())
         .merge(image_edit::router())
         .merge(session_open::router())
@@ -68,6 +70,7 @@ pub fn router_for_openapi() -> OpenApiRouter<AppState> {
         .merge(bff::router())
         .merge(world_town::router())
         .merge(persona::router())
+        .merge(persona_items::router())
         .merge(insight::router())
         .merge(image_edit::router())
         .merge(session_open::router())
