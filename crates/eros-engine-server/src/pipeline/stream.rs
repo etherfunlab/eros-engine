@@ -8746,6 +8746,110 @@ data: [DONE]\n\n";
         );
     }
 
+    /// A turn's named outfit reaches the composer's `[此刻穿着]` slot and the
+    /// event row's `inputs.clothing` on a forced image.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn forced_image_wears_the_named_outfit(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen_outfit",
+                "model": "composer",
+                "choices": [{"message": {"content":
+                    "{\"prompt\":\"she twirls\",\"caption\":\"转圈\"}"}}],
+                "usage": {"total_tokens": 10}
+            })))
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"primary\"\n\
+                 [tasks.chat_image_prompt_compose]\nmodel = \"composer\"\nfilter_prompt = \"COMPOSE\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J9000000000000000000000C",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let _frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hi".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                image_url: None,
+                image: Some(crate::routes::companion_stream::ImageReplyParams {
+                    force: true,
+                    ..Default::default()
+                }),
+                quote: Default::default(),
+                user_locale: Default::default(),
+                action: None,
+                outfit: Some("红色旗袍".into()),
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        let reqs = mock.received_requests().await.expect("recorded requests");
+        assert_eq!(reqs.len(), 1, "the composer is the only provider call");
+        let body: serde_json::Value =
+            serde_json::from_slice(&reqs[0].body).expect("composer request body is json");
+        let payload = body["messages"][1]["content"]
+            .as_str()
+            .expect("composer user payload");
+        assert!(
+            payload.contains("[此刻穿着]\n红色旗袍"),
+            "the named outfit must reach the composer: {payload}"
+        );
+        let clothing: Option<String> = sqlx::query_scalar(
+            "SELECT inputs->>'clothing' FROM engine.chat_images_events WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .expect("exactly one compose event row");
+        assert_eq!(clothing.as_deref(), Some("红色旗袍"));
+    }
+
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn forced_image_on_an_action_turn_tells_the_composer_the_outcome(pool: PgPool) {
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};

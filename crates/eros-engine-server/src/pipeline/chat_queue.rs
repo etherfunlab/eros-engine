@@ -882,6 +882,97 @@ data: [DONE]\n\n";
         );
     }
 
+    /// The `outfit` in a queued turn's params survives the worker and reaches
+    /// the chat prompt.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_queued_turns_outfit_reaches_the_prompt(pool: PgPool) {
+        use wiremock::matchers::body_string_contains;
+
+        let mock = MockServer::start().await;
+        let verdict = serde_json::json!({ "action": "reply_text", "inner_state": "" }).to_string();
+        let judge_body = serde_json::json!({
+            "id": "gj", "model": "pde/judge",
+            "choices": [{"message": {"content": verdict}}],
+        });
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("pde/judge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(judge_body))
+            .mount(&mock)
+            .await;
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"收到\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"deepseek/x\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) \
+             VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide the action and inner_state.\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let repo = ChatQueueRepo { pool: &pool };
+        let EnqueueOutcome::Queued { queue_id, .. } = repo
+            .enqueue_user_message(
+                session_id,
+                "今天穿什么",
+                "01JW000000000000000000005A",
+                "user",
+                None,
+                user_id,
+                &serde_json::json!({ "outfit": "红色旗袍" }),
+                20,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected Queued");
+        };
+
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+        assert_eq!(drain_once(&state, &sem).await.unwrap(), 1);
+        let status = wait_for_status(&pool, queue_id, &["done", "failed"]).await;
+        assert_eq!(status, "done");
+
+        let reqs = mock.received_requests().await.unwrap();
+        let chat_req = reqs
+            .iter()
+            .find(|r| String::from_utf8_lossy(&r.body).contains("deepseek/x"))
+            .expect("the chat generation call must have fired");
+        let body: serde_json::Value =
+            serde_json::from_slice(&chat_req.body).expect("chat request body is json");
+        assert!(
+            body.to_string().contains("- 此刻的穿着：红色旗袍"),
+            "the queued outfit must reach the chat prompt; got {body}",
+        );
+    }
+
     /// Seed a session + enqueued turn and claim it, returning the state and a
     /// ClaimedTurn pinned to its final attempt (so a Failure settles terminal).
     async fn seed_final_attempt_turn(pool: &PgPool) -> (crate::state::AppState, ClaimedTurn) {
