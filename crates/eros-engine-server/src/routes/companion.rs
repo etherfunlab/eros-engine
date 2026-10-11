@@ -2663,8 +2663,9 @@ mod tests {
             marker["compose_event_id"] = serde_json::Value::String(id.to_string());
         }
         // Persisted action type is 'reply' even for image turns (the wire
-        // FrameActionType is separate; CHECK in migration 0012 allows only
-        // reply/gift_reaction) — mirrors run_stream's own AssistantInsert.
+        // FrameActionType is separate; the CHECK, last rebuilt in migration
+        // 0067, allows only reply/proactive) — mirrors run_stream's own
+        // AssistantInsert.
         let message_id: Uuid = sqlx::query_scalar(
             "INSERT INTO engine.chat_messages \
                  (session_id, role, content, assistant_action_type, metadata) \

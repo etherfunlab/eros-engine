@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Persona genome + instance persistence.
 
-use eros_engine_core::persona::{CompanionPersona, PersonaGenome, PersonaInstance};
+use chrono::{DateTime, Utc};
+use eros_engine_core::persona::{
+    merge_items, CompanionPersona, PersonaGenome, PersonaInstance, PersonaItem,
+};
+use eros_engine_core::types::ItemKind;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -67,6 +71,22 @@ impl From<InstanceRow> for PersonaInstance {
     }
 }
 
+/// At most this many of an instance's own names per list reach the prompt,
+/// newest first (spec 2026-10-12-persona-items-and-gift-design.md §5.1).
+/// Genome presets come on top. The items route is uncapped.
+pub const PROMPT_ITEMS_PER_KIND: i64 = 20;
+
+/// One row of `engine.persona_instance_items`.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct InstanceItemRow {
+    pub id: Uuid,
+    pub kind: String,
+    pub name: String,
+    pub source: String,
+    pub user_message_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
+
 pub struct PersonaRepo<'a> {
     pub pool: &'a PgPool,
 }
@@ -117,6 +137,7 @@ impl<'a> PersonaRepo<'a> {
             system_prompt: String,
             tip_personality: Option<String>,
             art_metadata: serde_json::Value,
+            items: serde_json::Value,
         }
 
         let row = sqlx::query_as::<_, Joined>(
@@ -129,30 +150,52 @@ impl<'a> PersonaRepo<'a> {
                 pg.name        AS name, \
                 pg.system_prompt    AS system_prompt, \
                 pg.tip_personality  AS tip_personality, \
-                pg.art_metadata     AS art_metadata \
+                pg.art_metadata     AS art_metadata, \
+                COALESCE(( \
+                    SELECT json_agg(json_build_object( \
+                               'kind', t.kind, 'name', t.name, 'gifted', t.gifted) \
+                           ORDER BY t.kind, t.last_at DESC) \
+                    FROM ( \
+                        SELECT kind, name, \
+                               bool_or(source = 'gift') AS gifted, \
+                               max(created_at) AS last_at, \
+                               row_number() OVER ( \
+                                   PARTITION BY kind ORDER BY max(created_at) DESC) AS rn \
+                        FROM engine.persona_instance_items \
+                        WHERE instance_id = pi.id \
+                        GROUP BY kind, name \
+                    ) t \
+                    WHERE t.rn <= $2 \
+                ), '[]'::json) AS items \
              FROM engine.persona_instances pi \
              JOIN engine.persona_genomes pg ON pg.id = pi.genome_id \
              WHERE pi.id = $1 AND pi.status = 'active'",
         )
         .bind(instance_id)
+        .bind(PROMPT_ITEMS_PER_KIND)
         .fetch_optional(self.pool)
         .await?;
 
-        Ok(row.map(|r| CompanionPersona {
-            instance_id: r.instance_id,
-            genome: PersonaGenome {
-                id: r.g_id,
-                name: r.name,
-                system_prompt: r.system_prompt,
-                tip_personality: r.tip_personality,
-                art_metadata: r.art_metadata,
-            },
-            instance: PersonaInstance {
-                id: r.instance_id,
-                genome_id: r.genome_id,
-                owner_uid: r.owner_uid,
-                status: r.status,
-            },
+        Ok(row.map(|r| {
+            let rows: Vec<PersonaItem> = serde_json::from_value(r.items).unwrap_or_default();
+            let items = merge_items(&r.art_metadata, rows);
+            CompanionPersona {
+                instance_id: r.instance_id,
+                genome: PersonaGenome {
+                    id: r.g_id,
+                    name: r.name,
+                    system_prompt: r.system_prompt,
+                    tip_personality: r.tip_personality,
+                    art_metadata: r.art_metadata,
+                },
+                instance: PersonaInstance {
+                    id: r.instance_id,
+                    genome_id: r.genome_id,
+                    owner_uid: r.owner_uid,
+                    status: r.status,
+                },
+                items,
+            }
         }))
     }
 
@@ -288,6 +331,52 @@ impl<'a> PersonaRepo<'a> {
         .bind(owner_uid)
         .fetch_one(self.pool)
         .await
+    }
+
+    /// Every item row of the instance, newest first. Presets are the
+    /// genome's and are not rows.
+    pub async fn list_items(&self, instance_id: Uuid) -> Result<Vec<InstanceItemRow>, sqlx::Error> {
+        sqlx::query_as::<_, InstanceItemRow>(
+            "SELECT id, kind, name, source, user_message_id, created_at \
+             FROM engine.persona_instance_items \
+             WHERE instance_id = $1 \
+             ORDER BY created_at DESC, id",
+        )
+        .bind(instance_id)
+        .fetch_all(self.pool)
+        .await
+    }
+
+    /// A caller-written item (spec §7). The name is validated by the route.
+    pub async fn insert_item(
+        &self,
+        instance_id: Uuid,
+        kind: ItemKind,
+        name: &str,
+    ) -> Result<InstanceItemRow, sqlx::Error> {
+        sqlx::query_as::<_, InstanceItemRow>(
+            "INSERT INTO engine.persona_instance_items (instance_id, kind, name, source) \
+             VALUES ($1, $2, $3, 'caller') \
+             RETURNING id, kind, name, source, user_message_id, created_at",
+        )
+        .bind(instance_id)
+        .bind(kind.as_str())
+        .bind(name)
+        .fetch_one(self.pool)
+        .await
+    }
+
+    /// Delete one of the instance's rows, gift or caller. `false` when the id
+    /// is not a row of this instance.
+    pub async fn delete_item(&self, instance_id: Uuid, item_id: Uuid) -> Result<bool, sqlx::Error> {
+        let r = sqlx::query(
+            "DELETE FROM engine.persona_instance_items WHERE id = $1 AND instance_id = $2",
+        )
+        .bind(item_id)
+        .bind(instance_id)
+        .execute(self.pool)
+        .await?;
+        Ok(r.rows_affected() == 1)
     }
 }
 
@@ -491,5 +580,141 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count, 1, "exactly one instance per (genome, owner)");
+    }
+    async fn add_item(
+        pool: &PgPool,
+        instance_id: Uuid,
+        kind: &str,
+        name: &str,
+        source: &str,
+        minutes_ago: i32,
+    ) {
+        sqlx::query(
+            "INSERT INTO engine.persona_instance_items (instance_id, kind, name, source, created_at) \
+             VALUES ($1, $2, $3, $4, now() - make_interval(mins => $5))",
+        )
+        .bind(instance_id)
+        .bind(kind)
+        .bind(name)
+        .bind(source)
+        .bind(minutes_ago)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn load_companion_merges_presets_and_instance_items(pool: PgPool) {
+        use eros_engine_core::persona::PersonaItem;
+        use eros_engine_core::types::ItemKind;
+        let repo = PersonaRepo { pool: &pool };
+        let genome_id = insert_genome(
+            &pool,
+            "Wardrobe",
+            serde_json::json!({"possessions": ["吉他"], "wardrobe": ["白色开衫"]}),
+        )
+        .await;
+        let instance_id = repo
+            .create_instance(genome_id, Uuid::new_v4())
+            .await
+            .unwrap();
+        add_item(&pool, instance_id, "clothing", "红色旗袍", "gift", 3).await;
+        add_item(&pool, instance_id, "clothing", "白色开衫", "gift", 2).await;
+        add_item(&pool, instance_id, "item", "摩托车", "caller", 1).await;
+        add_item(&pool, instance_id, "item", "摩托车", "gift", 5).await;
+
+        let p = repo.load_companion(instance_id).await.unwrap().unwrap();
+        let item = |kind, name: &str, gifted| PersonaItem {
+            kind,
+            name: name.into(),
+            gifted,
+        };
+        assert_eq!(
+            p.items,
+            vec![
+                item(ItemKind::Item, "吉他", false),
+                item(ItemKind::Clothing, "白色开衫", true),
+                item(ItemKind::Clothing, "红色旗袍", true),
+                item(ItemKind::Item, "摩托车", true),
+            ]
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn load_companion_caps_each_list_at_the_newest_twenty_names(pool: PgPool) {
+        use eros_engine_core::types::ItemKind;
+        let repo = PersonaRepo { pool: &pool };
+        let genome_id = insert_genome(&pool, "Hoarder", serde_json::json!({})).await;
+        let instance_id = repo
+            .create_instance(genome_id, Uuid::new_v4())
+            .await
+            .unwrap();
+        for i in 0..21 {
+            add_item(&pool, instance_id, "item", &format!("物品{i}"), "caller", i).await;
+        }
+        add_item(&pool, instance_id, "clothing", "外套", "caller", 100).await;
+
+        let p = repo.load_companion(instance_id).await.unwrap().unwrap();
+        let items: Vec<&str> = p
+            .items
+            .iter()
+            .filter(|i| i.kind == ItemKind::Item)
+            .map(|i| i.name.as_str())
+            .collect();
+        assert_eq!(items.len(), 20);
+        assert_eq!(items[0], "物品0", "newest first");
+        assert!(!items.contains(&"物品20"), "the oldest falls off");
+        assert!(
+            p.items.iter().any(|i| i.name == "外套"),
+            "the cap is per list"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn item_rows_list_insert_and_delete(pool: PgPool) {
+        use eros_engine_core::types::ItemKind;
+        let repo = PersonaRepo { pool: &pool };
+        let genome_id = insert_genome(&pool, "Rows", serde_json::json!({})).await;
+        let instance_id = repo
+            .create_instance(genome_id, Uuid::new_v4())
+            .await
+            .unwrap();
+        let other = repo
+            .create_instance(genome_id, Uuid::new_v4())
+            .await
+            .unwrap();
+
+        let older = repo
+            .insert_item(instance_id, ItemKind::Clothing, "白色开衫")
+            .await
+            .unwrap();
+        assert_eq!(older.kind, "clothing");
+        assert_eq!(older.source, "caller");
+        assert_eq!(older.user_message_id, None);
+        sqlx::query(
+            "UPDATE engine.persona_instance_items SET created_at = now() - interval '1 hour' \
+             WHERE id = $1",
+        )
+        .bind(older.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let newer = repo
+            .insert_item(instance_id, ItemKind::Item, "摩托车")
+            .await
+            .unwrap();
+
+        let rows = repo.list_items(instance_id).await.unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![newer.id, older.id],
+            "newest first"
+        );
+        assert!(
+            !repo.delete_item(other, newer.id).await.unwrap(),
+            "another instance's id deletes nothing"
+        );
+        assert!(repo.delete_item(instance_id, newer.id).await.unwrap());
+        assert_eq!(repo.list_items(instance_id).await.unwrap().len(), 1);
     }
 }

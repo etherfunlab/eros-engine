@@ -286,6 +286,7 @@ mod tests {
                 owner_uid: oid,
                 status: "active".into(),
             },
+            items: vec![],
         }
     }
 

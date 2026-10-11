@@ -2060,6 +2060,7 @@ mod tests {
                 owner_uid: oid,
                 status: "active".into(),
             },
+            items: vec![],
         }
     }
 
@@ -2793,6 +2794,7 @@ mod tests {
                 owner_uid: owner,
                 status: "active".into(),
             },
+            items: vec![],
         }
     }
 

@@ -1563,6 +1563,7 @@ mod tests {
                 owner_uid: uid,
                 status: "active".into(),
             },
+            items: vec![],
         }
     }
 

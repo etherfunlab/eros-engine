@@ -549,6 +549,7 @@ mod payload_tests {
                 owner_uid: uuid::Uuid::new_v4(),
                 status: "active".into(),
             },
+            items: vec![],
         };
         let value = super::compose_edit_inputs_json(
             &persona,

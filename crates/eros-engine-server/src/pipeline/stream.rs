@@ -6996,6 +6996,7 @@ mod tests {
                 owner_uid: oid,
                 status: "active".into(),
             },
+            items: vec![],
         }
     }
 
@@ -19968,6 +19969,7 @@ data: [DONE]\n\n"
                 owner_uid: oid,
                 status: "active".into(),
             },
+            items: vec![],
         }
     }
 
