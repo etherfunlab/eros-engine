@@ -335,6 +335,7 @@ pub async fn compose_image(
         &resolved,
         &render_compose_payload(
             &persona,
+            None,
             &scene,
             &content,
             req.aspect_ratio.as_deref(),
@@ -344,10 +345,11 @@ pub async fn compose_image(
     )
     .await;
 
-    // Audit snapshot of the five composer slots — same shape whichever arm
+    // Audit snapshot of the six composer slots — same shape whichever arm
     // below fires.
     let inputs = compose_inputs_json(
         &persona,
+        None,
         &scene,
         &content,
         &style_str,
@@ -472,11 +474,12 @@ async fn compose_stream(
         .unwrap_or("（无）");
     let scene_slot = if scene.is_empty() { "（无）" } else { scene };
     let ar = aspect_ratio.unwrap_or("（未指定）");
-    let user_payload = compose_user_payload(appearance, scene_slot, content, style_str, ar);
-    // Audit snapshot of the five composer slots, captured before `persona` is
+    let user_payload =
+        compose_user_payload(appearance, "（无）", scene_slot, content, style_str, ar);
+    // Audit snapshot of the six composer slots, captured before `persona` is
     // moved into the stream generator below; `variant_key` is likewise cloned
     // out now so the generator doesn't need to borrow `resolved`.
-    let inputs = compose_inputs_json(&persona, scene, content, style_str, aspect_ratio);
+    let inputs = compose_inputs_json(&persona, None, scene, content, style_str, aspect_ratio);
     let variant_key = resolved.variant_key.clone();
     // The model on the wire comes from the per-candidate `execute_stream_as`
     // argument, not this field.
@@ -1483,7 +1486,7 @@ mod tests {
             "supplied scene lands in its slot: {second}"
         );
         assert!(
-            !second.contains("（无）"),
+            !second.contains("[最近场景]\n（无）"),
             "no empty-slot marker when scene is supplied: {second}"
         );
     }

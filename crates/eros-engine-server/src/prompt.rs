@@ -975,8 +975,9 @@ pub fn build_prompt(
     // iron rule ① and the [reply_length] listen-downgrade. `None` ⇒ the
     // pre-mode default (byte-identical rule ① text, no downgrade).
     reply_mode: Option<ReplyMode>,
-    // Judge-decided outfit for this turn (ActionPlan.clothing). `None` or
-    // blank ⇒ no outfit line renders (folded into [character_state]).
+    // The outfit for this turn (ActionPlan.clothing): the caller's named
+    // outfit, else the judge's. `None` or blank ⇒ no outfit line renders
+    // (folded into [character_state]).
     clothing: Option<&str>,
     prompt_traits: &[PromptTrait],
     affinity_scope: AffinityScope,
