@@ -575,7 +575,7 @@ BYOK hop 使用其请求中 `byok` 块的 `output_regex` 规则，而不是这�
   - `action`：`"reply_text"` \| `"ghost"` \| `"reply_image"` \| `"reply_text_image"` \| `"product_qa"`（图片变体需要同时满足两个条件——请求包含 `image` 块，且 `[tasks.chat_image_prompt_compose]` 已配置，因为判断器本身不写图片 prompt；否则降级为 `reply_text`。聊天流从不绘图——只发出 `image_request` 帧，由调用方自行调用图像供应商。`product_qa` 仅当 `[tasks.chat_product_qa]` 完全启用时才可用——见下文；不可用时降级为 `reply_text`，绝不升级。）
   - `inner_state`：融入 reply prompt 的简短情绪/语气描述
   - `reply_mode`（选填）：这一轮回复与用户消息的关系——`"listen"` / `"follow"` / `"ask"` / `"judge"`，拿不准就 `null`（由引擎的每轮骰子接管）。会切换 reply prompt 铁律 ① 的文案；`listen` 同时把回复长度上限降一档
-  - `clothing`（选填）：角色此刻的穿着，一句话——在文本类动作上注入 reply prompt 的 [character_state] 区块内的一行；缺省则不注入
+  - `clothing`（选填）：角色此刻的穿着，一句话。上下文里有 `[你的衣柜]` 时判官应从中挑选；有 `[指定穿着]` 时 engine 采用指定的穿着并忽略本字段。注入 reply prompt 的 `[character_state]` 区块内的一行，也进画图 composer 的 `[此刻穿着]` 槽；缺省则不注入
   - `action_response`（选填）：本轮带用户动作时（上下文里会有 `[用户动作]` 一行）填 `"accept"` 或 `"refuse"`；其他回合或拿不准时填 `null`。`null`、判官调用失败、规则 PDE 一律按接受处理。拒绝会让该动作对应的亲密度线降一档（见 [affinity-model.zh.md](affinity-model.zh.md)）。动作回合里 `ghost` 和 `product_qa` 会改判为 `reply_text`，也不掷每轮骰子
   - `reason`：可选
 - **Fail-open：**任何 LLM 超时或错误都会回退到规则引擎——LLM 判断器绝不会阻塞 chat 响应。
@@ -618,12 +618,14 @@ PDE judge 不再写图片 prompt 种子——它只负责决定动作、`inner_s
 
 **两个消费方，一份契约。** 除聊天流的图片轮次外，独立端点
 `POST /persona/{instance_id}/image/compose`（见
-[api-reference.zh.md](api-reference.zh.md)）跑的也是这个任务：同样的五槽位载荷
-（`[人物外观] / [最近场景] / [对方最新消息] / [风格] / [画幅]`）、同样的
+[api-reference.zh.md](api-reference.zh.md)）跑的也是这个任务：同样的六槽位载荷
+（`[人物外观] / [此刻穿着] / [最近场景] / [对方最新消息] / [风格] / [画幅]`）、同样的
 `filter_prompt` 契约——部署自定义的提示词无需任何改动即可同时服务两者。端点侧
 有两处行为差异：`[最近场景]` 槽位由请求的 `scene` 字段填充而非对话历史；并且
 **没有肖像回退**——整条链失败直接返回一个带 provider 自己状态码的 HTTP 错误
 （该端点兼作合成器的调试面，报告失败而不是掩盖失败）。
+
+`[此刻穿着]` 是本轮穿着，取自请求的 `outfit` 或判官的 `clothing`，都没有时为 `（无）`；compose 端点固定发 `（无）`。
 
 ```toml
 [tasks.chat_image_prompt_compose]

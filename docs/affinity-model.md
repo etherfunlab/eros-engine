@@ -242,7 +242,7 @@ whether the persona accepts it; without a definite refusal the engine accepts.
 
 - **Accepted:** nothing special. The affinity judge sees the action in the
   user text and grades the turn as usual.
-- **Refused:** the line the action touches (`give` → Bond, every physical
+- **Refused:** the line the action touches (`give` and `gift` → Bond, every physical
   action → Chemistry) drops one tier, landing at the same relative position
   inside the lower tier; a tier-1 line goes to `0`. Both axes of the line are
   scaled by the same factor, so their ratio is kept. The drop is computed from
@@ -253,6 +253,8 @@ whether the persona accepts it; without a definite refusal the engine accepts.
   eval is skipped or fails.
 - **Refused tip:** a `tip` drops no line. The persona's reply follows the
   verdict; the turn is graded like any other.
+- **Gift:** accepted, the gift also joins the persona's items or wardrobe;
+  refused, it joins nothing and drops Bond like a refused `give`.
 
 Example: chemistry `0.80` (64% of tier 4) lands at 64% of tier 3, `≈ 0.524`.
 

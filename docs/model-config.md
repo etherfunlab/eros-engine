@@ -655,7 +655,7 @@ By default the engine uses the built-in rule engine (`eros-engine-core/src/pde.r
   - `action`: `"reply_text"` | `"ghost"` | `"reply_image"` | `"reply_text_image"` | `"product_qa"` (image variants are available when the request includes an `image` block AND `[tasks.chat_image_prompt_compose]` is configured — both must hold, since the judge itself writes no image prompt; otherwise they degrade to `reply_text`. The chat stream never draws — it emits an `image_request` frame and the consumer calls its own image vendor. `product_qa` is available only when `[tasks.chat_product_qa]` is fully enabled — see below; unavailable proposals degrade to `reply_text`, never upgrade.)
   - `inner_state`: a short mood/tone description folded into the reply prompt
   - `reply_mode` (optional): how this turn's reply relates to the user's message — `"listen"` / `"follow"` / `"ask"` / `"judge"`, or `null` when unsure (the engine's per-turn dice then take over). Varies the reply prompt's iron rule ①; `listen` also drops the reply-length ceiling one tier
-  - `clothing` (optional): a short free-text description of the character's outfit this turn — injected into the reply prompt as a line inside the `[character_state]` section on text-bearing actions; omitted when absent
+  - `clothing` (optional): a short free-text description of the character's outfit this turn. With a `[你的衣柜]` line in the context, the judge should pick from it; with `[指定穿着]`, the engine wears the named outfit and ignores this field. Injected into the reply prompt as a line inside `[character_state]`, and into the image composer's `[此刻穿着]` slot; omitted when absent
   - `action_response` (optional): on a turn that carries a user action (the context then has a `[用户动作]` line), `"accept"` or `"refuse"`; `null` otherwise or when unsure. A `null`, a failed judge, or the rule engine all mean accept. A refusal drops the action's affinity line one tier (see [affinity-model.md](affinity-model.md#refused-actions)). On an action turn `ghost` and `product_qa` are turned into `reply_text`, and the per-turn dice are not rolled
   - `reason`: optional
 - **Fail-open:** any LLM timeout or error falls back to the rule engine — the LLM judge never blocks a chat response.
@@ -727,13 +727,15 @@ round-robin cursor on text/ghost turns.
 **Two consumers, one contract.** Besides the chat stream's image turns, the
 standalone `POST /persona/{instance_id}/image/compose` endpoint (see
 [api-reference.md](api-reference.md)) runs this same task with the same
-five-slot payload (`[人物外观] / [最近场景] / [对方最新消息] / [风格] / [画幅]`)
+six-slot payload (`[人物外观] / [此刻穿着] / [最近场景] / [对方最新消息] / [风格] / [画幅]`)
 and the same `filter_prompt` contract — a deployment's custom prompt needs no
 changes to serve both. Two behavioural differences on the endpoint side: the
 `[最近场景]` slot is filled from the request's `scene` field instead of the
 conversation history, and there is **no portrait fallback** — a fully failed
 chain is an HTTP error carrying the provider's own status (the endpoint doubles
 as the composer's test surface, so it reports failure instead of masking it).
+
+`[此刻穿着]` is the turn's outfit, from the request's `outfit` or the judge's `clothing`; `（无）` when neither. The compose endpoint always sends `（无）`.
 
 ```toml
 [tasks.chat_image_prompt_compose]

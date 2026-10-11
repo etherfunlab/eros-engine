@@ -400,7 +400,7 @@ chars. Violations return `400 BadRequest` as a pre-stream error.
 
 **Optional: action.** The body may include `action` — something the user does to
 the persona besides talking. The persona accepts it or not; a refusal costs the
-relationship one tier on the line the action touches (`give` → bond, every
+relationship one tier on the line the action touches (`give` and `gift` → bond, every
 physical or custom action → chemistry), and a refused `tip` costs nothing (see
 [affinity-model.md](affinity-model.md#refused-actions)).
 
@@ -410,10 +410,11 @@ physical or custom action → chemistry), and a refused `tip` costs nothing (see
 | `kiss`, `hug`, `touch`, `lick` | none |
 | `custom` | `text`: required, 1–100 chars |
 | `tip` | `amount_usd`: required, finite, `> 0` and `≤ 1_000_000_000` |
+| `gift` | `kind`: `item` \| `clothing` (required); `name`: required, 1–64 chars |
 
 With an action, `content` may be empty, and it can be combined with
 `image_url` and `image`. Every value violation (bounds, missing
-`item`/`text`/`amount_usd`) is a `422` with `code: "unprocessable"`; a body whose `type` or `item` is not one of the
+`item`/`text`/`amount_usd`/`kind`/`name`) is a `422` with `code: "unprocessable"`; a body whose `type` or `item` is not one of the
 listed values is rejected as unparseable JSON (also `422`). The action is stored on the user
 row and returned by both history routes as `action`, with `response` once the
 turn has taken effect.
@@ -445,6 +446,18 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
       }' \
   http://localhost:8080/comp/chat/<session_id>/message/stream
 ```
+
+An accepted `gift` joins the persona's items (`kind: "item"`) or wardrobe
+(`kind: "clothing"`), and she knows it from the next turn on; a refused one
+joins nothing. Like a tip, the engine trusts the field: a caller that sells
+gifts must strip a client-supplied `gift` and settle a refused one itself.
+
+**Optional: outfit.** `outfit` names what the persona wears this turn,
+typically an entry of her wardrobe (see the items routes below); it is not
+checked against it. 1–64 chars after trim, no line-break or control
+characters (`422` otherwise); blank reads as absent. With an outfit, the
+reply and any picture this turn wear it whatever the judge decides; without
+one, the judge dresses her, preferring her wardrobe.
 
 **Optional: image input (vision).** The body may include `image_url` — an
 absolute `http(s)` URL with a host, no embedded whitespace, ≤ 2048 chars. When
@@ -1197,7 +1210,7 @@ Body fields:
 | `prompt_variant` | `String` | no | Same variant selection as the chat path, including the unknown-key-falls-back-to-built-in rule. |
 | `stream` | `bool` | no | Default `true`. |
 
-The composer payload is identical to the chat path's five slots, so one
+The composer payload is identical to the chat path's six slots, so one
 `filter_prompt` contract serves both callers (see
 [model-config.md](model-config.md)).
 
@@ -1411,6 +1424,39 @@ as the v1 routes.
 nothing reads it back into any chat, voice, or PDE prompt. Experimental
 (v1.6.0) — see
 [2026-08-22-user-insights-and-api-v2-design.md](superpowers/specs/2026-08-22-user-insights-and-api-v2-design.md).
+
+### `GET /v2/comp/instance/{instance_id}/items`
+
+The persona's items and wardrobe for this instance. Same gate as the insight
+routes: `404` for an unknown or archived instance, `403` for another user's.
+
+```json
+{"items": [
+  {"id": null, "kind": "clothing", "name": "白色开衫", "source": "preset",
+   "user_message_id": null, "created_at": null},
+  {"id": "…", "kind": "item", "name": "摩托车", "source": "gift",
+   "user_message_id": "…", "created_at": "…"}
+]}
+```
+
+Genome presets (`art_metadata.possessions` / `art_metadata.wardrobe`) come
+first with `source: "preset"` and no `id`; then every instance row, newest
+first, neither deduplicated nor capped. `source: "gift"` is an accepted gift
+action; `user_message_id` is its turn, `null` once that message is deleted.
+The prompt shows each list deduplicated, at most 20 instance names per list.
+
+### `POST /v2/comp/instance/{instance_id}/items`
+
+Body `{"kind": "item" | "clothing", "name": "…"}`, name 1–64 chars after
+trim. `201` with the new entry (`source: "caller"`); `422` for a bad name.
+
+### `DELETE /v2/comp/instance/{instance_id}/items/{item_id}`
+
+`204`; `404` when the id is not a row of this instance. Gift and caller rows
+alike; presets are edited on the genome.
+
+The engine trusts the caller on these routes. A caller that sells items keeps
+its clients from reaching `POST` and `DELETE` directly.
 
 ### `DELETE /comp/instance/{instance_id}/sessions`
 

@@ -41,3 +41,8 @@ topics = ["literature", "slow mornings", "rainy walks", "the kinds of silence in
 # Optional. Seeded into compose_image_prompt as a visual description; omit if
 # image generation is off or you want to leave appearance entirely to the model.
 appearance = "late-20s woman, auburn hair often loosely tied back, green eyes, quiet expressive face, soft warm wardrobe"
+# Optional. Things she owns and clothes she can wear, merged with what the
+# user gives her in chat and what the caller adds through the items routes.
+# She sees both lists; the judge dresses her from the wardrobe.
+# possessions = ["a bicycle with a wicker basket"]
+# wardrobe = ["oatmeal cardigan", "green rain jacket"]

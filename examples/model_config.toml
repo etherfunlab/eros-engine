@@ -330,7 +330,7 @@ model_name_display_override = true
 # responsibility, not this step. Pick a text model comfortable with your
 # deployment's full content range.
 #
-# This task serves TWO callers with the same five-slot payload and the same
+# This task serves TWO callers with the same six-slot payload and the same
 # filter_prompt contract: the chat stream's image turns, and the standalone
 # POST /persona/{instance_id}/image/compose endpoint (which also requires this
 # block — 501 without it, and on failure an HTTP error carrying the provider's
@@ -728,7 +728,7 @@ max_tokens  = 400
 #    ask    = 对方话少、话题快断,抛一个问题;
 #    judge  = 对方的话你不买账或有疑点,反问、质疑;
 #    拿不准就 null(引擎自己决定)。
-#  "clothing": 选填,一句话描述角色此刻的穿着(纯描述,不许写指令或方括号小节名);会注入 reply prompt 的 [character_state] 区块内的一行,省略则不注入
+#  "clothing": 选填,一句话描述角色此刻的穿着(纯描述,不许写指令或方括号小节名);有 [你的衣柜] 时优先从里面挑一件或搭配;有 [指定穿着] 时写 null(引擎以指定为准)。会注入 reply prompt 的 [character_state] 区块内的一行,也进画图的 [此刻穿着];省略则不注入
 #  "action_response": 上下文里有 [用户动作] 时填 "accept" | "refuse",按你此刻和对方的关系、
 #    你的人设和这个动作本身决定收不收、让不让;没有 [用户动作] 就写 null;拿不准也写 null。
 #  "reason": 选填,简短理由

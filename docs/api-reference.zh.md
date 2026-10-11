@@ -354,7 +354,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 ≤ 16 个 key，key 满足 `[A-Za-z0-9_.-]{1,64}`，value 必须是 string
 且 ≤ 512 字符。违反作为 pre-stream 错误返回 `400 BadRequest`。
 
-**可选：动作。** 请求体可以带 `action`，表示用户在说话之外对角色做的事。角色可能接受，也可能不接受；不接受时，这段关系在动作对应的那条线上降一档（`give` 动 bond，身体动作和自定义动作动 chemistry），被拒的 `tip` 不降档（见 [affinity-model.zh.md](affinity-model.zh.md)）。
+**可选：动作。** 请求体可以带 `action`，表示用户在说话之外对角色做的事。角色可能接受，也可能不接受；不接受时，这段关系在动作对应的那条线上降一档（`give` 和 `gift` 动 bond，身体动作和自定义动作动 chemistry），被拒的 `tip` 不降档（见 [affinity-model.zh.md](affinity-model.zh.md)）。
 
 | `type` | 字段 |
 |---|---|
@@ -362,8 +362,9 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 | `kiss`、`hug`、`touch`、`lick` | 无 |
 | `custom` | `text`：必填，1–100 字符 |
 | `tip` | `amount_usd`：必填，有限数值，`> 0` 且 `≤ 1_000_000_000` |
+| `gift` | `kind`：`item` \| `clothing`（必填）；`name`：必填，1–64 字 |
 
-带动作时 `content` 可以为空，也可以和 `image_url`、`image` 同时出现。取值不合规（超出范围、缺少 `item`/`text`/`amount_usd`）一律返回 `422`，`code: "unprocessable"`；`type` 或 `item` 不在上表取值内时，请求体按无法解析的 JSON 拒绝（同样是 `422`）。动作存在用户行上，两套历史接口都以 `action` 字段返回，该回合生效之后带 `response`。
+带动作时 `content` 可以为空，也可以和 `image_url`、`image` 同时出现。取值不合规（超出范围、缺少 `item`/`text`/`amount_usd`/`kind`/`name`）一律返回 `422`，`code: "unprocessable"`；`type` 或 `item` 不在上表取值内时，请求体按无法解析的 JSON 拒绝（同样是 `422`）。动作存在用户行上，两套历史接口都以 `action` 字段返回，该回合生效之后带 `response`。
 
 ```bash
 curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
@@ -388,6 +389,15 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
       }' \
   http://localhost:8080/comp/chat/<session_id>/message/stream
 ```
+
+被接受的 `gift` 会进入角色的持有物品（`kind: "item"`）或衣柜（`kind: "clothing"`），
+从下一轮起她就知道自己有这件东西；被拒的什么也不进。与打赏一样，engine 信任这个字段：
+如果调用方把礼物做成付费商品，就要拦下 client 直接发来的 `gift`，被拒时自行结算。
+
+**可选：outfit。** `outfit` 指定角色这一轮穿什么，通常取自她的衣柜（见下方 items
+路由），engine 不检查它在不在衣柜里。trim 后 1–64 字，不能含换行或控制字符（否则
+`422`）；空白视为没带。带了 outfit，本轮回复和本轮的图都穿这件，不管判官怎么定；
+不带时由判官给她搭配，优先从衣柜里挑。
 
 **可选：图片输入（vision）。** 请求体可附加 `image_url` —— 绝对 `http(s)`
 URL，需带 host、不含空白、≤ 2048 字符。带图时引擎先跑一段 vision *describe*
@@ -987,7 +997,7 @@ Body 字段：
 | `prompt_variant` | `String` | 否 | 与聊天路径相同的变体选择规则，包括「未命中的 key 回退到内置提示词」。 |
 | `stream` | `bool` | 否 | 默认 `true`。 |
 
-合成器载荷与聊天路径的五个槽位完全一致，同一份 `filter_prompt` 契约同时服务两个
+合成器载荷与聊天路径的六个槽位完全一致，同一份 `filter_prompt` 契约同时服务两个
 调用方（见 [model-config.zh.md](model-config.zh.md)）。
 
 每一次调用——不管成功失败——都会记录进 `engine.chat_images_events`
@@ -1185,6 +1195,31 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 全局画像：`user_insights` 是按关系分开、只落库、只记录的——不会被读回任何
 chat、voice 或 PDE prompt。实验特性（v1.6.0）——详见
 [2026-08-22-user-insights-and-api-v2-design.md](superpowers/specs/2026-08-22-user-insights-and-api-v2-design.md)。
+
+### `GET /v2/comp/instance/{instance_id}/items`
+
+角色在这个 instance 上的持有物品与衣柜。鉴权与 insight 路由相同：instance 不存在或已归档返回 `404`，不是本人的返回 `403`。
+
+```json
+{"items": [
+  {"id": null, "kind": "clothing", "name": "白色开衫", "source": "preset",
+   "user_message_id": null, "created_at": null},
+  {"id": "…", "kind": "item", "name": "摩托车", "source": "gift",
+   "user_message_id": "…", "created_at": "…"}
+]}
+```
+
+genome 预设（`art_metadata.possessions` / `art_metadata.wardrobe`）排最前，`source: "preset"`，没有 `id`；之后是 instance 的每一行，按时间倒序，不去重也不封顶。`source: "gift"` 表示被接受的 gift action，`user_message_id` 指向那一轮，消息被删后为 `null`。prompt 里每张清单去重，instance 部分最多 20 个名字。
+
+### `POST /v2/comp/instance/{instance_id}/items`
+
+请求体 `{"kind": "item" | "clothing", "name": "…"}`，name trim 后 1–64 字。成功返回 `201` 和新建的条目（`source: "caller"`）；name 不合法返回 `422`。
+
+### `DELETE /v2/comp/instance/{instance_id}/items/{item_id}`
+
+返回 `204`；id 不属于这个 instance 时返回 `404`。gift 来的和调用方写入的都能删；预设要改 genome。
+
+这几条路由上 engine 信任调用方。如果调用方出售物品，就要拦住 client 直接调用 `POST` 和 `DELETE`。
 
 ### `DELETE /comp/instance/{instance_id}/sessions`
 
