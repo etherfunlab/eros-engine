@@ -5046,15 +5046,6 @@ pub(crate) fn run_stream_with(
                 // message, and skip the text path entirely (returning ends the
                 // stream cleanly — there is nothing after the match arm).
                 if image_only_done {
-                    // A failed write only loses the stored copy.
-                    if let Some(response) = plan.action_response {
-                        if let Err(e) = chat_repo
-                            .set_action_response(user_msg.user_message_id, response)
-                            .await
-                        {
-                            tracing::warn!("stream: action response write failed: {e}");
-                        }
-                    }
                     if let Err(e) = sqlx::query(
                         "UPDATE engine.companion_affinity SET ghost_streak = 0, updated_at = now() \
                          WHERE session_id = $1 AND ghost_streak <> 0",
@@ -5081,6 +5072,16 @@ pub(crate) fn run_stream_with(
                     );
                     yield final_frame;
 
+                    // Stored right before post-process is spawned, with no other
+                    // await between them. A failed write only loses the stored copy.
+                    if let Some(response) = plan.action_response {
+                        if let Err(e) = chat_repo
+                            .set_action_response(user_msg.user_message_id, response)
+                            .await
+                        {
+                            tracing::warn!("stream: action response write failed: {e}");
+                        }
+                    }
                     let state_bg = (*state).clone();
                     let mut plan_bg = plan.clone();
                     plan_bg.image_caption = image_only_caption;
@@ -5456,16 +5457,6 @@ pub(crate) fn run_stream_with(
                         yield frame;
                     }
                 }
-                // The reply went out: the turn has taken effect. A failed write
-                // only loses the stored copy.
-                if let Some(response) = plan.action_response {
-                    if let Err(e) = chat_repo
-                        .set_action_response(user_msg.user_message_id, response)
-                        .await
-                    {
-                        tracing::warn!("stream: action response write failed: {e}");
-                    }
-                }
                 let (produced, did_filter, retries_chat, retries_filter, ghost_fallback, burst_failures) = {
                     let g = outcome.lock().unwrap();
                     (
@@ -5597,6 +5588,16 @@ pub(crate) fn run_stream_with(
                 );
                 yield final_frame;
 
+                // Stored right before post-process is spawned, with no other
+                // await between them. A failed write only loses the stored copy.
+                if let Some(response) = plan.action_response {
+                    if let Err(e) = chat_repo
+                        .set_action_response(user_msg.user_message_id, response)
+                        .await
+                    {
+                        tracing::warn!("stream: action response write failed: {e}");
+                    }
+                }
                 // Spawn post-process; do not await.
                 let state_bg = (*state).clone();
                 let mut plan_bg = plan.clone();
