@@ -3370,13 +3370,14 @@ pub(crate) fn compose_user_payload(
     latest_user_msg: &str,
     style: &str,
     aspect_ratio: &str,
+    body_state: &str,
 ) -> String {
     format!(
-        "[人物外观]\n{appearance}\n\n[此刻穿着]\n{clothing}\n\n[最近场景]\n{recent_scene}\n\n[对方最新消息]\n{latest_user_msg}\n\n[风格]\n{style}\n\n[画幅]\n{aspect_ratio}"
+        "[人物外观]\n{appearance}\n\n[此刻穿着]\n{clothing}\n\n[身体状态]\n{body_state}\n\n[最近场景]\n{recent_scene}\n\n[对方最新消息]\n{latest_user_msg}\n\n[风格]\n{style}\n\n[画幅]\n{aspect_ratio}"
     )
 }
 
-/// The six composer slots as an audit snapshot. Deliberately built from the
+/// The seven composer slots as an audit snapshot. Deliberately built from the
 /// RAW values: `run_image_prompt_compose` substitutes `（无）` for empty slots
 /// when it renders the prompt, and that placeholder is a rendering detail — the
 /// audit records an absent slot as the empty string. Pure.
@@ -3387,12 +3388,14 @@ pub(crate) fn compose_inputs_json(
     latest_user_msg: &str,
     style: &str,
     aspect_ratio: Option<&str>,
+    body_state: Option<&str>,
 ) -> serde_json::Value {
     serde_json::json!({
         "appearance": crate::prompt::meta_str(persona, "appearance")
             .map(str::trim)
             .unwrap_or(""),
         "clothing": clothing.map(str::trim).unwrap_or(""),
+        "body_state": body_state.map(str::trim).unwrap_or(""),
         "recent_scene": recent_scene.trim(),
         "latest_user_msg": latest_user_msg.trim(),
         "style": style,
@@ -3497,7 +3500,7 @@ pub(crate) struct ComposeRun {
     pub(crate) failures: Vec<eros_engine_llm::failure::AttemptFailure>,
 }
 
-/// Render the chat composer's six-slot payload, substituting the placeholders
+/// Render the chat composer's seven-slot payload, substituting the placeholders
 /// the prompt expects for empty slots. Extracted from `run_image_prompt_compose`
 /// so that function is only the chain walk and can serve a second composer
 /// (the image-edit endpoint) with a different payload. Pure.
@@ -3508,12 +3511,17 @@ pub(crate) fn render_compose_payload(
     latest_user_msg: &str,
     aspect_ratio: Option<&str>,
     style: &str,
+    body_state: Option<&str>,
 ) -> String {
     let appearance = crate::prompt::meta_str(persona, "appearance")
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or("（无）");
     let clothing = clothing
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("（无）");
+    let body_state = body_state
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or("（无）");
@@ -3528,7 +3536,7 @@ pub(crate) fn render_compose_payload(
         latest_user_msg
     };
     let ar = aspect_ratio.unwrap_or("（未指定）");
-    compose_user_payload(appearance, clothing, scene, latest, style, ar)
+    compose_user_payload(appearance, clothing, scene, latest, style, ar, body_state)
 }
 
 /// Walk `[model] + fallback` for a composer task, named by `task`, on
@@ -3786,6 +3794,7 @@ async fn build_delegated_image_prompt(
     latest_user_msg: &str,
     user_id: Uuid,
     session_id: Uuid,
+    body_state: Option<&str>,
 ) -> DelegatedImagePrompt {
     let inputs = resolve_image_turn_inputs(plan, req_image);
     let style_str = serde_json::to_value(inputs.style)
@@ -3808,6 +3817,7 @@ async fn build_delegated_image_prompt(
                     latest_user_msg,
                     inputs.aspect_ratio.as_deref(),
                     &style_str,
+                    body_state,
                 ),
                 "chat_image_prompt_compose",
             )
@@ -3916,6 +3926,7 @@ async fn build_delegated_image_prompt(
                 latest_user_msg,
                 &style_str,
                 inputs.aspect_ratio.as_deref(),
+                body_state,
             ),
             subject: (!final_subject.is_empty()).then_some(final_subject.as_str()),
             caption: caption.as_deref(),
@@ -5043,6 +5054,7 @@ pub(crate) fn run_stream_with(
                         &crate::prompt::composer_user_text(user_msg.action.as_ref(), plan.action_response, &user_msg.content),
                         user_msg.user_id,
                         user_msg.session_id,
+                        None,
                     )
                     .await;
                     let subject = img.subject;
@@ -5406,6 +5418,7 @@ pub(crate) fn run_stream_with(
                                 &latest_c,
                                 user_id_c,
                                 session_id_c,
+                                None,
                             )
                             .await
                         })))
@@ -5582,6 +5595,7 @@ pub(crate) fn run_stream_with(
                                     &crate::prompt::composer_user_text(user_msg.action.as_ref(), plan.action_response, &effective_user_msg),
                                     user_msg.user_id,
                                     user_msg.session_id,
+                                    None,
                                 )
                                 .await
                             }
@@ -5595,6 +5609,7 @@ pub(crate) fn run_stream_with(
                                     &crate::prompt::composer_user_text(user_msg.action.as_ref(), plan.action_response, &effective_user_msg),
                                     user_msg.user_id,
                                     user_msg.session_id,
+                                    None,
                                 )
                                 .await
                             }
@@ -6068,6 +6083,7 @@ mod tests {
             "（无）",
             "realistic",
             "9:16",
+            "（无）",
         );
         assert!(p.contains("freckled, red hair"));
         assert!(p.contains("（无）"));
@@ -6084,6 +6100,7 @@ mod tests {
             "给我看看你现在的样子",
             "realistic",
             "9:16",
+            "（无）",
         );
         assert!(p.contains("[对方最新消息]\n给我看看你现在的样子"), "{p}");
     }
@@ -6097,6 +6114,7 @@ mod tests {
             "给我看看你现在的样子",
             "realistic",
             "9:16",
+            "（无）",
         );
         assert!(
             !p.contains("画面主题种子"),
@@ -20336,7 +20354,7 @@ data: [DONE]\n\n"
         // run_image_prompt_compose: the extraction must not change what the
         // chat path sends.
         let persona = test_persona_with_appearance("");
-        let out = render_compose_payload(&persona, None, "  ", "", None, "realistic");
+        let out = render_compose_payload(&persona, None, "  ", "", None, "realistic", None);
         assert!(out.contains("[人物外观]\n（无）"), "got {out}");
         assert!(out.contains("[最近场景]\n（无）"), "got {out}");
         assert!(out.contains("[对方最新消息]\n（无）"), "got {out}");
@@ -20347,7 +20365,15 @@ data: [DONE]\n\n"
     #[test]
     fn render_compose_payload_passes_real_values_through() {
         let persona = test_persona_with_appearance("银发红瞳");
-        let out = render_compose_payload(&persona, None, "在天台", "拍张照", Some("3:4"), "anime");
+        let out = render_compose_payload(
+            &persona,
+            None,
+            "在天台",
+            "拍张照",
+            Some("3:4"),
+            "anime",
+            None,
+        );
         assert!(out.contains("[人物外观]\n银发红瞳"), "got {out}");
         assert!(out.contains("[最近场景]\n在天台"), "got {out}");
         assert!(out.contains("[对方最新消息]\n拍张照"), "got {out}");
@@ -20364,24 +20390,84 @@ data: [DONE]\n\n"
             "拍张照",
             None,
             "anime",
+            None,
         );
         assert!(
-            dressed.contains("[人物外观]\n银发红瞳\n\n[此刻穿着]\n红色旗袍\n\n[最近场景]"),
+            dressed.contains(
+                "[人物外观]\n银发红瞳\n\n[此刻穿着]\n红色旗袍\n\n[身体状态]\n（无）\n\n[最近场景]"
+            ),
             "{dressed}"
         );
-        let bare = render_compose_payload(&persona, None, "在天台", "拍张照", None, "anime");
+        let bare = render_compose_payload(&persona, None, "在天台", "拍张照", None, "anime", None);
         assert!(bare.contains("[此刻穿着]\n（无）"), "{bare}");
-        let blank = render_compose_payload(&persona, Some("  "), "在天台", "拍张照", None, "anime");
+        let blank = render_compose_payload(
+            &persona,
+            Some("  "),
+            "在天台",
+            "拍张照",
+            None,
+            "anime",
+            None,
+        );
         assert!(blank.contains("[此刻穿着]\n（无）"), "{blank}");
     }
 
     #[test]
     fn compose_inputs_record_the_clothing() {
         let persona = test_persona_with_appearance("银发红瞳");
-        let v = compose_inputs_json(&persona, Some(" 红色旗袍 "), "s", "m", "anime", None);
+        let v = compose_inputs_json(&persona, Some(" 红色旗袍 "), "s", "m", "anime", None, None);
         assert_eq!(v["clothing"], "红色旗袍");
-        let v = compose_inputs_json(&persona, None, "s", "m", "anime", None);
+        let v = compose_inputs_json(&persona, None, "s", "m", "anime", None, None);
         assert_eq!(v["clothing"], "");
+    }
+
+    #[test]
+    fn the_composer_reads_the_body_state() {
+        let persona = test_persona_with_appearance("银发红瞳");
+        let out = render_compose_payload(
+            &persona,
+            Some("红色旗袍"),
+            "在天台",
+            "拍张照",
+            None,
+            "anime",
+            Some("1 支烟，烟劲很足，正在劲头上"),
+        );
+        assert!(
+            out.contains(
+                "[此刻穿着]\n红色旗袍\n\n[身体状态]\n1 支烟，烟劲很足，正在劲头上\n\n[最近场景]"
+            ),
+            "{out}"
+        );
+        let bare = render_compose_payload(&persona, None, "在天台", "拍张照", None, "anime", None);
+        assert!(bare.contains("[身体状态]\n（无）"), "{bare}");
+        let blank = render_compose_payload(
+            &persona,
+            None,
+            "在天台",
+            "拍张照",
+            None,
+            "anime",
+            Some("  "),
+        );
+        assert!(blank.contains("[身体状态]\n（无）"), "{blank}");
+    }
+
+    #[test]
+    fn compose_inputs_record_the_body_state() {
+        let persona = test_persona_with_appearance("银发红瞳");
+        let v = compose_inputs_json(
+            &persona,
+            None,
+            "s",
+            "m",
+            "anime",
+            None,
+            Some(" 1 支烟，烟劲很足，正在劲头上 "),
+        );
+        assert_eq!(v["body_state"], "1 支烟，烟劲很足，正在劲头上");
+        let v = compose_inputs_json(&persona, None, "s", "m", "anime", None, None);
+        assert_eq!(v["body_state"], "");
     }
 
     #[test]
