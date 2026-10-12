@@ -1255,6 +1255,26 @@ mod tests {
         assert_eq!(status, "parse_error");
     }
 
+    /// The group turn's queue status once the detached task has settled it.
+    async fn settled_status(pool: &PgPool, group: Uuid) -> String {
+        let mut status = String::new();
+        for _ in 0..100 {
+            status = sqlx::query_scalar(
+                "SELECT q.status FROM engine.chat_turn_queue q JOIN engine.chat_messages m ON m.id = q.user_message_id \
+                 WHERE m.session_id = $1",
+            )
+            .bind(group)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if status != "claimed" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        status
+    }
+
     /// No fallback phrase: an exhausted chat chain ends the speaker's burst in
     /// an error instead of serving the canned line.
     async fn clear_fallback_phrases(pool: &PgPool) {
@@ -1281,7 +1301,19 @@ mod tests {
             2,
             "{body}"
         );
-        assert!(body.contains(r#""type":"error""#), "{body}");    }
+        assert!(body.contains(r#""type":"error""#), "{body}");
+        // Each failed attempt left a truncated row, so the turn counts as
+        // served: it settles `done` and writes no notice.
+        assert_eq!(settled_status(&f.pool, f.group).await, "done");
+        let notices: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_messages WHERE session_id = $1 AND role = 'system_error'",
+        )
+        .bind(f.group)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(notices, 0);
+    }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn no_seatable_member_ends_in_error_and_a_notice(pool: PgPool) {
@@ -1366,6 +1398,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(rows, 1);
+        assert_eq!(settled_status(&f.pool, f.group).await, "done");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
