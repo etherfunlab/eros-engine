@@ -567,11 +567,22 @@ async fn send_group_message_stream(
                 })
             }
             ClaimedEnqueueOutcome::Replay {
+                user_message_id,
                 ghost,
                 assistant_chain,
-                ..
             } => {
                 drop(guard);
+                // An earlier speaker's row makes the turn look served while
+                // later speakers are still running; replay only a settled turn.
+                let status: Option<String> = sqlx::query_scalar(
+                    "SELECT status FROM engine.chat_turn_queue WHERE user_message_id = $1",
+                )
+                .bind(user_message_id)
+                .fetch_optional(&state.pool)
+                .await?;
+                if status.as_deref() == Some("claimed") {
+                    return Err(duplicate_in_progress(user_message_id));
+                }
                 Box::pin(crate::pipeline::stream::replay_stream(
                     std::sync::Arc::new(state.clone()),
                     group_id,
@@ -1581,6 +1592,72 @@ mod tests {
             .unwrap_or_else(|| panic!("{replay}"));
         assert!(a < b, "{replay}");
         assert!(replay.contains(r#""type":"final""#), "{replay}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_resend_mid_relay_is_still_in_progress(pool: PgPool) {
+        use tower::Service;
+        use wiremock::matchers::body_string_contains;
+        // No director: 小美 then 阿哲. 阿哲's request (it carries 小美's line)
+        // is held back, so the turn is still claimed once 小美's row lands.
+        let mut f = fixture(pool, None, 200, None).await;
+        wiremock::Mock::given(wiremock::matchers::path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                json!({"model": "chat-model"}),
+            ))
+            .and(body_string_contains("小美：好呀"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(
+                        sse(&[r#"{"choices":[{"delta":{"content":"我也在"}}]}"#.to_string()]),
+                        "text/event-stream",
+                    )
+                    .set_delay(std::time::Duration::from_secs(3)),
+            )
+            .with_priority(1)
+            .mount(&f._server)
+            .await;
+        let msg = json!({"content":"在吗","client_msg_id":"01JVVVVVVVVVVVVVVVVVVVVVVG"});
+        let mut app = f.app.clone();
+        let first_req = req(
+            "POST",
+            &format!("/v2/comp/group/{}/message/stream", f.group),
+            f.user,
+            Some(msg.clone()),
+        );
+        let first = tokio::spawn(async move {
+            let resp = app.call(first_req).await.unwrap();
+            let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        });
+        let mut landed = 0i64;
+        for _ in 0..100 {
+            landed = sqlx::query_scalar(
+                "SELECT count(*) FROM engine.chat_messages WHERE session_id = $1 AND role = 'assistant'",
+            )
+            .bind(f.group)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+            if landed > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(landed, 1, "小美's row landed while 阿哲 is held back");
+
+        let (s, body) = send(&mut f, msg).await;
+        assert_eq!(s, StatusCode::CONFLICT, "{body}");
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["code"], "duplicate_in_progress", "{body}");
+        assert!(body["original_user_message_id"].is_string(), "{body}");
+
+        let first = first.await.unwrap();
+        assert!(first.contains("我也在"), "{first}");
+        assert!(first.contains(r#""type":"final""#), "{first}");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
