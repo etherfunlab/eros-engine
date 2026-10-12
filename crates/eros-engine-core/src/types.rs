@@ -275,7 +275,7 @@ pub enum ReplyStyle {
 /// How this turn's reply relates to the user's message — the judge's call
 /// (spec 2026-09-13 §3.1). `None` on the wire means the judge is unsure and
 /// the engine's dice take over.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReplyMode {
     Listen,
