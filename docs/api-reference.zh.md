@@ -1213,11 +1213,11 @@ genome 预设（`art_metadata.possessions` / `art_metadata.wardrobe`）排最前
 
 ### `POST /v2/comp/instance/{instance_id}/items`
 
-请求体 `{"kind": "item" | "clothing", "name": "…"}`，name trim 后 1–64 字。成功返回 `201` 和新建的条目（`source: "caller"`）；name 不合法返回 `422`。
+请求体 `{"kind": "item" | "clothing", "name": "…"}`，name trim 后 1–64 字。成功返回 `201` 和新建的条目（`source: "caller"`）；name 不合法（长度越界，或含换行或控制字符）返回 `422`。`404` / `403` 的判定与 `GET` 相同。
 
 ### `DELETE /v2/comp/instance/{instance_id}/items/{item_id}`
 
-返回 `204`；id 不属于这个 instance 时返回 `404`。gift 来的和调用方写入的都能删；预设要改 genome。
+返回 `204`；id 不属于这个 instance 时返回 `404`；instance 的 `404` / `403` 判定与 `GET` 相同。gift 来的和调用方写入的都能删；预设要改 genome。
 
 这几条路由上 engine 信任调用方。如果调用方出售物品，就要拦住 client 直接调用 `POST` 和 `DELETE`。
 

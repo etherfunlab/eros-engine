@@ -315,7 +315,7 @@ model_name_display_override = true
 #
 # When this block is present, after an image action is decided the engine
 # generates one image prompt from turn context: it feeds the persona appearance
-# + recent scene + the partner's latest message + chosen aspect ratio + style to
+# + current outfit + recent scene + the partner's latest message + chosen aspect ratio + style to
 # this model and uses the result as the image subject. Omit the block entirely
 # and image turns stay unavailable. Fail-open: on failure / timeout / empty
 # reply it falls back to an empty subject (a plain persona-appearance

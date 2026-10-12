@@ -118,7 +118,7 @@ eros-engine-server :8080
                        chat_sessions / chat_messages
                        companion_affinity / companion_affinity_events
                        companion_memories (vector(512))
-                       persona_genomes / persona_instances
+                       persona_genomes / persona_instances / persona_instance_items
                        human_insights
                        companion_decision_events
                        chat_images_events / chat_vision_events
@@ -180,7 +180,7 @@ crates/
 │       ├── voyage.rs         # 512-dim embeddings, fail-loud on empty key
 │       └── model_config.rs   # TOML loader
 ├── eros-engine-store/
-│   ├── migrations/           # 0000_schema → 0065_chat_messages_reaction
+│   ├── migrations/           # 0000_schema → 0067_persona_instance_items
 │   └── src/
 │       ├── pool.rs           # PgPoolOptions builder
 │       ├── chat.rs           # ChatRepo
@@ -199,7 +199,7 @@ crates/
         ├── auth/             # AuthValidator trait + Supabase impl + middleware
         ├── pipeline/         # stream (run_stream) / handlers / post_process / dreaming / …
         ├── prompt.rs         # system-prompt builder (affinity → directives)
-        ├── routes/           # health / companion / companion_stream / companion_async / insight / image_edit / voice / persona / session_open / reaction / world_town / bff / dto / mod
+        ├── routes/           # health / companion / companion_stream / companion_async / insight / image_edit / voice / persona / session_open / persona_items / reaction / world_town / bff / dto / mod
         └── openapi.rs        # utoipa ApiDoc spec metadata
 ```
 

@@ -602,7 +602,7 @@ BYOK hop 使用其请求中 `byok` 块的 `output_regex` 规则，而不是这�
 
 ### `[tasks.chat_image_prompt_compose]` — 出图 prompt 合成器（图片轮次必需）
 
-PDE judge 不再写图片 prompt 种子——它只负责决定动作、`inner_state`，以及（图片动作时）参考图/宽高比这类输入。真正产出图片 prompt 完全是这个任务的工作：图片动作一旦决定，引擎会在**决定之后、生成之前**跑一次合成器，把人格外观、最近场景、对方最新消息、所选 style、目标宽高比交给它。合成器**从这份上下文生成** prompt——它不再扩写种子，因为种子已经不存在了。
+PDE judge 不再写图片 prompt 种子——它只负责决定动作、`inner_state`，以及（图片动作时）参考图/宽高比这类输入。真正产出图片 prompt 完全是这个任务的工作：图片动作一旦决定，引擎会在**决定之后、生成之前**跑一次合成器，把人格外观、此刻穿着、最近场景、对方最新消息、所选 style、目标宽高比交给它。合成器**从这份上下文生成** prompt——它不再扩写种子，因为种子已经不存在了。
 
 **这个任务现在是图片轮次的必需项。** 不配置 `[tasks.chat_image_prompt_compose]`，引擎就没有任何办法产出图片 prompt：它会向判断器报告 `本轮可发图=否`（图片能力为假），并把任何 `reply_image` / `reply_text_image` 提案降级为 `reply_text`。要让图片轮次可用，必须配置这个块。
 
@@ -651,7 +651,7 @@ max_tokens   = 700
 | `repetition_penalty` | `f32` | 缺失 | 重复惩罚，`(0.0, 2.0]`（`1.0` 为恒等值）。未设置时省略。 |
 | `filter_prompt` | `String` \| `Array<String>` \| `Table<String, String>` | **内置默认** | **可选**（不同于其他任务）。空白/缺失 ⇒ 引擎内置的 `DEFAULT_COMPOSE_PROMPT`。数组/表两种形态见下方"变体"。 |
 
-**内置默认提示词。** 不同于其他每个任务（提示词必须来自配置），合成器自带一个通用、**不含产品身份**的内置默认。它**从上下文生成** prompt 和 caption——人格外观、最近场景、对方最新消息、style、宽高比——**不**软化、不降级、不审查、不拒绝，也不自带内容审核层——审核交给画图模型供应商和下游部署，不在这一步。非空 `filter_prompt` 覆盖它（且必须遵守上面的 JSON 契约）；空白/缺失则回退到它。
+**内置默认提示词。** 不同于其他每个任务（提示词必须来自配置），合成器自带一个通用、**不含产品身份**的内置默认。它**从上下文生成** prompt 和 caption——人格外观、此刻穿着、最近场景、对方最新消息、style、宽高比——**不**软化、不降级、不审查、不拒绝，也不自带内容审核层——审核交给画图模型供应商和下游部署，不在这一步。非空 `filter_prompt` 覆盖它（且必须遵守上面的 JSON 契约）；空白/缺失则回退到它。
 
 **变体（variants）。** 这个任务的 `filter_prompt` 接受纯字符串以外的形态（`[tasks.chat_image_edit_compose]` 的也接受，见下文）。前端在每个 chat 轮次通过发消息请求体上的 `image.prompt_variant` 挑一个。三种形态：
 
@@ -684,7 +684,7 @@ b = """
 
 **审计。** 一次成功的合成器调用——包括上面提到的"非 JSON 回退路径"，它同样算作成功——会向图片轮次的 `chat_messages.metadata.image` 写入三个键：`compose_variant`（命中了 `filter_prompt` 的哪个 key/下标；纯字符串或内置提示词时缺失；按调用方传入的值记录（已 trim），不做归一化——例如索引形态里 `"01"` 命中下标 1，审计时仍记为 `"01"`）、`compose_model`（实际应答的模型），以及 `compose_generation_id`。只有当合成器调用本身失败（fail-open 降级）或该任务未配置时，三者才会缺失——语义与 affinity 审计三元组的 NULL 语义一致（`raw` 已不带特殊含义，因此不再是这里的独立情形）。合成器的 `caption` 单独持久化为 `metadata.image.caption`：只要回复解析为带非空 `caption` 字段的 JSON 就会被设置，否则为 `None`——包括"成功但非 JSON"的回复，此时整段回复变成 `prompt`，没有 caption。`metadata.image.prompt`——合成器的 `prompt` 字段，也就是真正的出图主体——**会**持久化在每个图片轮次上；它正是 `build_delegated_image_marker` 写入、与上面审计三元组同行的那个字段。
 
-**每一次合成器调用——不论成功失败、不论来自哪个调用方——都会另外落一行到 `engine.chat_images_events`**（迁移 0045）：完整的 usage 块、拼装出的 wire prompt（`composed_prompt`——style 预设 + 人格外观 + subject，也就是图像供应商实际会收到的那个字符串）、链路遍历的事实（`attempts` / `last_failure`），以及合成器当时看到的五个原始输入。`metadata.image.compose_event_id` 指向那一行——反向查找走 assistant 行 → `compose_event_id` → `chat_images_events`，绝不是反过来。用量/费用和拼装出的 wire prompt **不会**重复写进 `chat_messages.metadata.image` 本身；要对账，要么 join `compose_event_id` 去查审计表，要么拿 generation id 去供应商日志里对。详见 [LLM audit → 图片链路事件表](llm-audit.zh.md#图片链路事件表)。设计文档：`docs/superpowers/specs/2026-08-02-image-compose-audit-design.md`（上面 `metadata.image` 的键）与 `docs/superpowers/specs/2026-08-14-image-audit-events-design.md`（`chat_images_events`）。
+**每一次合成器调用——不论成功失败、不论来自哪个调用方——都会另外落一行到 `engine.chat_images_events`**（迁移 0045）：完整的 usage 块、拼装出的 wire prompt（`composed_prompt`——style 预设 + 人格外观 + subject，也就是图像供应商实际会收到的那个字符串）、链路遍历的事实（`attempts` / `last_failure`），以及合成器当时看到的六个原始输入。`metadata.image.compose_event_id` 指向那一行——反向查找走 assistant 行 → `compose_event_id` → `chat_images_events`，绝不是反过来。用量/费用和拼装出的 wire prompt **不会**重复写进 `chat_messages.metadata.image` 本身；要对账，要么 join `compose_event_id` 去查审计表，要么拿 generation id 去供应商日志里对。详见 [LLM audit → 图片链路事件表](llm-audit.zh.md#图片链路事件表)。设计文档：`docs/superpowers/specs/2026-08-02-image-compose-audit-design.md`（上面 `metadata.image` 的键）与 `docs/superpowers/specs/2026-08-14-image-audit-events-design.md`（`chat_images_events`）。
 
 ### `[tasks.chat_image_edit_compose]` — 图片-EDIT 合成器（可选）
 

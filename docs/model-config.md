@@ -688,9 +688,9 @@ The PDE judge no longer writes an image-prompt seed — it only decides the
 action, `inner_state`, and (on an image action) the reference/aspect-ratio
 inputs. Producing the actual image prompt is entirely this task's job: when an
 image action is decided, the engine runs the composer **after** the decision
-and **before** generation, feeding it the persona appearance, the recent
-scene, the partner's latest message, the chosen style, and the target aspect
-ratio. The composer **generates** the prompt from that context — it does not
+and **before** generation, feeding it the persona appearance, the current
+outfit, the recent scene, the partner's latest message, the chosen style, and
+the target aspect ratio. The composer **generates** the prompt from that context — it does not
 expand a seed, because none exists anymore.
 
 **This task is now REQUIRED for image turns.** Without
@@ -764,8 +764,8 @@ max_tokens   = 700
 **Built-in default prompt.** Unlike every other task (whose prompt must come from
 config), the composer ships a generic, **product-identity-free** built-in
 default. It **generates** the prompt and caption straight from context —
-persona appearance, recent scene, the partner's latest message, style, aspect
-ratio — and does **not** soften, downgrade, censor, or refuse, and adds no
+persona appearance, current outfit, recent scene, the partner's latest message,
+style, aspect ratio — and does **not** soften, downgrade, censor, or refuse, and adds no
 content-moderation layer of its own — moderation is delegated to the
 image-model provider and the downstream deployment, not this step. A
 non-blank `filter_prompt` overrides it (and must honor the JSON contract
@@ -846,7 +846,7 @@ trio above rides alongside.
 recorded in `engine.chat_images_events`** (migration 0045): the full usage
 block, the assembled wire prompt (`composed_prompt` — style preset + persona
 appearance + subject, exactly what an image vendor would receive), the
-chain-walk facts (`attempts` / `last_failure`), and the five raw inputs the
+chain-walk facts (`attempts` / `last_failure`), and the six raw inputs the
 composer saw. `metadata.image.compose_event_id` points at that row — reverse
 lookup runs assistant row → `compose_event_id` → `chat_images_events`, never
 the other way. Usage/cost and the composed wire prompt are *not* duplicated

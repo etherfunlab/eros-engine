@@ -1448,12 +1448,14 @@ The prompt shows each list deduplicated, at most 20 instance names per list.
 ### `POST /v2/comp/instance/{instance_id}/items`
 
 Body `{"kind": "item" | "clothing", "name": "…"}`, name 1–64 chars after
-trim. `201` with the new entry (`source: "caller"`); `422` for a bad name.
+trim. `201` with the new entry (`source: "caller"`); `422` for a bad name
+(out of bounds, or with line-break or control characters). Same `404` / `403`
+gate as `GET`.
 
 ### `DELETE /v2/comp/instance/{instance_id}/items/{item_id}`
 
-`204`; `404` when the id is not a row of this instance. Gift and caller rows
-alike; presets are edited on the genome.
+`204`; `404` when the id is not a row of this instance, with the same `404` /
+`403` instance gate as `GET`. Gift and caller rows alike; presets are edited on the genome.
 
 The engine trusts the caller on these routes. A caller that sells items keeps
 its clients from reaching `POST` and `DELETE` directly.
