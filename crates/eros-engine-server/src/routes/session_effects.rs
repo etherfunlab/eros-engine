@@ -14,7 +14,6 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use eros_engine_core::effects::{ActiveEffect, EffectPhase};
-use eros_engine_core::types::GivenItem;
 
 use crate::auth::middleware::AuthUser;
 use crate::error::AppError;
@@ -49,11 +48,7 @@ pub struct EffectView {
 impl From<&ActiveEffect> for EffectView {
     fn from(e: &ActiveEffect) -> Self {
         Self {
-            item: match e.item {
-                GivenItem::Cigarette => GivenItemDto::Cigarette,
-                GivenItem::Alcohol => GivenItemDto::Alcohol,
-                GivenItem::Medicine => GivenItemDto::Medicine,
-            },
+            item: e.item.into(),
             name: e.name.clone(),
             quantity: e.quantity,
             level: e.level,
@@ -111,6 +106,7 @@ mod tests {
     use super::*;
     use axum::body::{to_bytes, Body};
     use axum::http::{header, Request, StatusCode};
+    use eros_engine_core::types::GivenItem;
     use serde_json::json;
     use tower::ServiceExt;
 

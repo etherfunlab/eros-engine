@@ -158,13 +158,78 @@ pub enum UserActionKind {
     Gift,
 }
 
-/// What a `give` action hands over.
+/// What a `give` action hands over. Consumables (`cigarette` through `herb`)
+/// linger on the persona; valuables (`watch` through `credit_card`) do not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GivenItemDto {
     Cigarette,
     Alcohol,
     Medicine,
+    Food,
+    SoftDrink,
+    Tea,
+    Coffee,
+    Herb,
+    Watch,
+    Gem,
+    Gold,
+    Camera,
+    Cash,
+    Antique,
+    Artwork,
+    Handmade,
+    CreditCard,
+}
+
+impl From<GivenItemDto> for eros_engine_core::types::GivenItem {
+    fn from(i: GivenItemDto) -> Self {
+        use eros_engine_core::types::GivenItem;
+        match i {
+            GivenItemDto::Cigarette => GivenItem::Cigarette,
+            GivenItemDto::Alcohol => GivenItem::Alcohol,
+            GivenItemDto::Medicine => GivenItem::Medicine,
+            GivenItemDto::Food => GivenItem::Food,
+            GivenItemDto::SoftDrink => GivenItem::SoftDrink,
+            GivenItemDto::Tea => GivenItem::Tea,
+            GivenItemDto::Coffee => GivenItem::Coffee,
+            GivenItemDto::Herb => GivenItem::Herb,
+            GivenItemDto::Watch => GivenItem::Watch,
+            GivenItemDto::Gem => GivenItem::Gem,
+            GivenItemDto::Gold => GivenItem::Gold,
+            GivenItemDto::Camera => GivenItem::Camera,
+            GivenItemDto::Cash => GivenItem::Cash,
+            GivenItemDto::Antique => GivenItem::Antique,
+            GivenItemDto::Artwork => GivenItem::Artwork,
+            GivenItemDto::Handmade => GivenItem::Handmade,
+            GivenItemDto::CreditCard => GivenItem::CreditCard,
+        }
+    }
+}
+
+impl From<eros_engine_core::types::GivenItem> for GivenItemDto {
+    fn from(i: eros_engine_core::types::GivenItem) -> Self {
+        use eros_engine_core::types::GivenItem;
+        match i {
+            GivenItem::Cigarette => GivenItemDto::Cigarette,
+            GivenItem::Alcohol => GivenItemDto::Alcohol,
+            GivenItem::Medicine => GivenItemDto::Medicine,
+            GivenItem::Food => GivenItemDto::Food,
+            GivenItem::SoftDrink => GivenItemDto::SoftDrink,
+            GivenItem::Tea => GivenItemDto::Tea,
+            GivenItem::Coffee => GivenItemDto::Coffee,
+            GivenItem::Herb => GivenItemDto::Herb,
+            GivenItem::Watch => GivenItemDto::Watch,
+            GivenItem::Gem => GivenItemDto::Gem,
+            GivenItem::Gold => GivenItemDto::Gold,
+            GivenItem::Camera => GivenItemDto::Camera,
+            GivenItem::Cash => GivenItemDto::Cash,
+            GivenItem::Antique => GivenItemDto::Antique,
+            GivenItem::Artwork => GivenItemDto::Artwork,
+            GivenItem::Handmade => GivenItemDto::Handmade,
+            GivenItem::CreditCard => GivenItemDto::CreditCard,
+        }
+    }
 }
 
 /// Which of the persona's lists an item joins: `item` (what she owns) or
@@ -255,11 +320,7 @@ impl UserActionDto {
         }
         Ok(match self.kind {
             UserActionKind::Give => {
-                let item = match self.item.ok_or("action.item is required for give")? {
-                    GivenItemDto::Cigarette => GivenItem::Cigarette,
-                    GivenItemDto::Alcohol => GivenItem::Alcohol,
-                    GivenItemDto::Medicine => GivenItem::Medicine,
-                };
+                let item: GivenItem = self.item.ok_or("action.item is required for give")?.into();
                 let quantity = self.quantity.unwrap_or(1);
                 if !(1..=MAX_ACTION_QUANTITY).contains(&quantity) {
                     return Err(format!("action.quantity must be 1..={MAX_ACTION_QUANTITY}"));
@@ -3254,6 +3315,51 @@ mod validate_payload_tests {
         let mut no_item = give(None, None);
         no_item.item = None;
         assert!(no_item.to_core().is_err(), "give requires item");
+    }
+
+    #[test]
+    fn give_accepts_every_category_and_maps_it_one_to_one() {
+        for (wire, item) in [
+            ("cigarette", GivenItem::Cigarette),
+            ("alcohol", GivenItem::Alcohol),
+            ("medicine", GivenItem::Medicine),
+            ("food", GivenItem::Food),
+            ("soft_drink", GivenItem::SoftDrink),
+            ("tea", GivenItem::Tea),
+            ("coffee", GivenItem::Coffee),
+            ("herb", GivenItem::Herb),
+            ("watch", GivenItem::Watch),
+            ("gem", GivenItem::Gem),
+            ("gold", GivenItem::Gold),
+            ("camera", GivenItem::Camera),
+            ("cash", GivenItem::Cash),
+            ("antique", GivenItem::Antique),
+            ("artwork", GivenItem::Artwork),
+            ("handmade", GivenItem::Handmade),
+            ("credit_card", GivenItem::CreditCard),
+        ] {
+            let dto: UserActionDto =
+                serde_json::from_value(serde_json::json!({"type": "give", "item": wire}))
+                    .unwrap_or_else(|e| panic!("{wire}: {e}"));
+            assert_eq!(
+                dto.to_core().unwrap(),
+                UserAction::Give {
+                    item,
+                    name: None,
+                    quantity: 1
+                },
+                "{wire}"
+            );
+            assert_eq!(GivenItemDto::from(item), dto.item.unwrap(), "{wire}");
+        }
+    }
+
+    #[test]
+    fn give_rejects_an_unknown_item() {
+        assert!(serde_json::from_value::<UserActionDto>(
+            serde_json::json!({"type": "give", "item": "lighter"})
+        )
+        .is_err());
     }
 
     #[test]

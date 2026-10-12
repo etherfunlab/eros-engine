@@ -715,6 +715,20 @@ pub(crate) fn given_phrase(item: GivenItem, name: Option<&str>, quantity: u8) ->
         GivenItem::Cigarette => ("支", "烟"),
         GivenItem::Alcohol => ("杯", "酒"),
         GivenItem::Medicine => ("片", "药"),
+        GivenItem::Food => ("份", "吃的"),
+        GivenItem::SoftDrink => ("瓶", "饮料"),
+        GivenItem::Tea => ("杯", "茶"),
+        GivenItem::Coffee => ("杯", "咖啡"),
+        GivenItem::Herb => ("包", "药草"),
+        GivenItem::Watch => ("块", "手表"),
+        GivenItem::Gem => ("颗", "宝石"),
+        GivenItem::Gold => ("块", "黄金"),
+        GivenItem::Camera => ("台", "相机"),
+        GivenItem::Cash => ("张", "钞票"),
+        GivenItem::Antique => ("件", "古董"),
+        GivenItem::Artwork => ("件", "艺术品"),
+        GivenItem::Handmade => ("份", "手作礼物"),
+        GivenItem::CreditCard => ("张", "信用卡"),
     };
     match name {
         Some(name) => format!("{quantity} {unit}「{name}」"),
@@ -723,16 +737,37 @@ pub(crate) fn given_phrase(item: GivenItem, name: Option<&str>, quantity: u8) ->
 }
 
 /// How strong an effect feels, by item and level 1–4 (spec
-/// 2026-10-12-given-item-lingering-effects-design.md §6.1). Deliberately
-/// says how strong, not what it feels like.
+/// 2026-10-12-given-item-lingering-effects-design.md §6.1,
+/// 2026-10-13-give-categories-design.md §4). Deliberately says how strong,
+/// not what it feels like.
 fn effect_word(item: GivenItem, level: u8) -> &'static str {
     const CIGARETTE: [&str; 4] = ["余味还在", "还有点飘", "烟劲很足", "抽得头晕"];
     const ALCOHOL: [&str; 4] = ["有一点酒意", "微醺", "醉意上头", "醉得厉害"];
     const MEDICINE: [&str; 4] = ["药效轻微", "药效明显", "药效很强", "药劲过猛"];
+    const FOOD: [&str; 4] = ["还留着点饱", "挺饱的", "刚吃饱", "吃撑了"];
+    const SOFT_DRINK: [&str; 4] = ["嘴里还有点甜", "挺解渴", "正爽口", "喝得肚子发胀"];
+    const TEA: [&str; 4] = ["茶香还在", "心静了些", "神清气爽", "喝得有点心慌"];
+    const COFFEE: [&str; 4] = ["提了点神", "精神起来了", "精神很足", "心跳得有点快"];
+    const HERB: [&str; 4] = ["药草劲还轻", "药草见效了", "药草劲很足", "药草劲太冲"];
     let words = match item {
         GivenItem::Cigarette => &CIGARETTE,
         GivenItem::Alcohol => &ALCOHOL,
         GivenItem::Medicine => &MEDICINE,
+        GivenItem::Food => &FOOD,
+        GivenItem::SoftDrink => &SOFT_DRINK,
+        GivenItem::Tea => &TEA,
+        GivenItem::Coffee => &COFFEE,
+        GivenItem::Herb => &HERB,
+        // A valuable has an empty curve, so no effect ever names one.
+        GivenItem::Watch
+        | GivenItem::Gem
+        | GivenItem::Gold
+        | GivenItem::Camera
+        | GivenItem::Cash
+        | GivenItem::Antique
+        | GivenItem::Artwork
+        | GivenItem::Handmade
+        | GivenItem::CreditCard => return "",
     };
     words[usize::from(level.clamp(1, 4)) - 1]
 }
@@ -4863,6 +4898,48 @@ mod tests {
     }
 
     #[test]
+    fn given_phrase_covers_the_new_categories() {
+        for (item, unit, word) in [
+            (GivenItem::Food, "份", "吃的"),
+            (GivenItem::SoftDrink, "瓶", "饮料"),
+            (GivenItem::Tea, "杯", "茶"),
+            (GivenItem::Coffee, "杯", "咖啡"),
+            (GivenItem::Herb, "包", "药草"),
+            (GivenItem::Watch, "块", "手表"),
+            (GivenItem::Gem, "颗", "宝石"),
+            (GivenItem::Gold, "块", "黄金"),
+            (GivenItem::Camera, "台", "相机"),
+            (GivenItem::Cash, "张", "钞票"),
+            (GivenItem::Antique, "件", "古董"),
+            (GivenItem::Artwork, "件", "艺术品"),
+            (GivenItem::Handmade, "份", "手作礼物"),
+            (GivenItem::CreditCard, "张", "信用卡"),
+        ] {
+            assert_eq!(given_phrase(item, None, 2), format!("2 {unit}{word}"));
+            assert_eq!(
+                given_phrase(item, Some("某物"), 2),
+                format!("2 {unit}「某物」")
+            );
+        }
+        assert_eq!(
+            action_phrase(&UserAction::Give {
+                item: GivenItem::Coffee,
+                name: None,
+                quantity: 1,
+            }),
+            "递给你 1 杯咖啡"
+        );
+        assert_eq!(
+            action_subject(&UserAction::Give {
+                item: GivenItem::Watch,
+                name: Some("劳力士".into()),
+                quantity: 1,
+            }),
+            "对方递给你 1 块「劳力士」"
+        );
+    }
+
+    #[test]
     fn body_state_words_follow_item_and_level() {
         let words = [
             (
@@ -4876,6 +4953,43 @@ mod tests {
             (
                 GivenItem::Medicine,
                 ["药效轻微", "药效明显", "药效很强", "药劲过猛"],
+            ),
+        ];
+        for (item, ws) in words {
+            for (i, w) in ws.iter().enumerate() {
+                let s =
+                    body_state(&[effect(item, None, 1, i as u8 + 1, EffectPhase::Peak)]).unwrap();
+                assert!(
+                    s.contains(&format!("，{w}，")),
+                    "{item:?} level {}: {s}",
+                    i + 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn body_state_words_for_the_new_consumables() {
+        let words = [
+            (
+                GivenItem::Food,
+                ["还留着点饱", "挺饱的", "刚吃饱", "吃撑了"],
+            ),
+            (
+                GivenItem::SoftDrink,
+                ["嘴里还有点甜", "挺解渴", "正爽口", "喝得肚子发胀"],
+            ),
+            (
+                GivenItem::Tea,
+                ["茶香还在", "心静了些", "神清气爽", "喝得有点心慌"],
+            ),
+            (
+                GivenItem::Coffee,
+                ["提了点神", "精神起来了", "精神很足", "心跳得有点快"],
+            ),
+            (
+                GivenItem::Herb,
+                ["药草劲还轻", "药草见效了", "药草劲很足", "药草劲太冲"],
             ),
         ];
         for (item, ws) in words {
