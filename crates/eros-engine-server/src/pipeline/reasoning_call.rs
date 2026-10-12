@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use eros_engine_llm::failure::{AttemptFailure, GatewayError, GatewayKind};
 use eros_engine_llm::model_config::Sampling;
-use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
+use eros_engine_llm::openrouter::{clean_response, ChatMessage, ChatRequest};
+use eros_engine_llm::LlmError;
 use uuid::Uuid;
 
 use crate::pipeline::stream::PdeStatus;
@@ -101,6 +102,7 @@ where
             let mut usage = None;
             let mut gen_id: Option<String> = None;
             let mut served: Option<String> = None;
+            let mut finish: Option<String> = None;
             let mut failed = false;
             match tokio::time::timeout(open_limit, state.openrouter.execute_stream_as(&req, model_id)).await {
                 Ok(Ok(mut s)) => loop {
@@ -116,6 +118,7 @@ where
                             if c.usage.is_some() { usage = c.usage; }
                             if c.generation_id.is_some() { gen_id = c.generation_id; }
                             if c.model.is_some() { served = c.model; }
+                            if c.finish_reason.is_some() { finish = c.finish_reason; }
                         }
                         Ok(Some(Err(e))) => {
                             failures.push(AttemptFailure::from_llm_error(task, model_id, &e));
@@ -157,7 +160,25 @@ where
                 },
             )
             .await;
-            let text = content.trim().to_string();
+            // The one-shot client's cleaning, in its order: undecoded
+            // byte-level BPE is repaired, then fences and quotes are stripped.
+            // A garble cut off at `length` is incomplete and is not salvaged:
+            // the attempt fails as an exhausted one-model chain.
+            let garbled = eros_engine_llm::byte_bpe::looks_byte_garbled(&content);
+            if garbled && finish.as_deref() == Some("length") {
+                tracing::error!(task, model = %model_id, "judge call: truncated byte-BPE garble; next");
+                failures.push(AttemptFailure::from_llm_error(task, model_id,
+                    &LlmError::Chain { failures: Vec::new() }));
+                last = PdeStatus::for_operation(&failures);
+                continue;
+            }
+            let content = if garbled {
+                tracing::error!(task, model = %model_id, "judge call: byte-BPE garbled completion; repaired");
+                eros_engine_llm::byte_bpe::repair_byte_bpe(&content)
+            } else {
+                content
+            };
+            let text = clean_response(content.trim()).trim().to_string();
             if text.is_empty() {
                 last = PdeStatus::Empty;
                 continue;
@@ -399,6 +420,112 @@ mod tests {
         assert_eq!(run.raw.as_deref(), Some("nope"));
         assert_eq!(run.generation_id.as_deref(), Some("gen-b"));
         assert_eq!(run.failures.len(), 1, "the primary's 500");
+    }
+
+    fn reply_field(s: &str) -> Option<String> {
+        serde_json::from_str::<serde_json::Value>(s).ok()?["reply"]
+            .as_str()
+            .map(str::to_string)
+    }
+
+    /// Undecoded byte-level BPE: every space and newline of a JSON verdict
+    /// arrives as `Ġ` / `Ċ`, which no JSON parser accepts. Escaped for
+    /// embedding in an SSE frame's `content` string.
+    const GARBLED_VERDICT: &str = r#"{ĊĠĠĠ\"reply\":Ġ\"HelloĠthere.\"Ċ}"#;
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_garbled_verdict_is_repaired_before_parsing(pool: PgPool) {
+        let server = MockServer::start().await;
+        let frame = format!(
+            r#"{{"choices":[{{"delta":{{"content":"{GARBLED_VERDICT}"}}}}],"id":"gen-g"}}"#
+        );
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({"model": "a"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse(&[&frame]), "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+        let st = state(pool, &server).await;
+        let steps: Vec<JudgeStep<String>> =
+            reasoning_call(st, call(&["a"], Duration::from_secs(10)), reply_field)
+                .collect()
+                .await;
+        let (_, run) = split(steps);
+        assert_eq!(run.status, PdeStatus::Ok);
+        assert_eq!(run.verdict.as_deref(), Some("Hello there."));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_truncated_garble_is_not_salvaged(pool: PgPool) {
+        let server = MockServer::start().await;
+        let frame = format!(
+            r#"{{"choices":[{{"delta":{{"content":"{GARBLED_VERDICT}"}},"finish_reason":"length"}}],"id":"gen-a"}}"#
+        );
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({"model": "a"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse(&[&frame]), "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({"model": "b"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(
+                        sse(&[r#"{"choices":[{"delta":{"content":"{\"reply\":\"b\"}"}}],"id":"gen-b"}"#]),
+                        "text/event-stream",
+                    ),
+            )
+            .mount(&server)
+            .await;
+        let st = state(pool, &server).await;
+        let steps: Vec<JudgeStep<String>> =
+            reasoning_call(st, call(&["a", "b"], Duration::from_secs(10)), reply_field)
+                .collect()
+                .await;
+        let (_, run) = split(steps);
+        assert_eq!(run.verdict.as_deref(), Some("b"));
+        assert_eq!(
+            run.failures.len(),
+            1,
+            "the truncated garble fails its attempt"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn unparseable_content_keeps_its_cleaned_text_as_raw(pool: PgPool) {
+        let server = MockServer::start().await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({"model": "a"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(
+                        sse(&[r#"{"choices":[{"delta":{"content":"```text\n不是数字\n```"}}],"id":"gen-a"}"#]),
+                        "text/event-stream",
+                    ),
+            )
+            .mount(&server)
+            .await;
+        let st = state(pool, &server).await;
+        let steps: Vec<JudgeStep<i64>> =
+            reasoning_call(st, call(&["a"], Duration::from_secs(10)), number)
+                .collect()
+                .await;
+        let (_, run) = split(steps);
+        assert_eq!(run.status, PdeStatus::ParseError);
+        assert_eq!(
+            run.raw.as_deref(),
+            Some(eros_engine_llm::openrouter::clean_response("```text\n不是数字\n```").as_str())
+        );
+        assert_eq!(run.raw.as_deref(), Some("不是数字"));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
