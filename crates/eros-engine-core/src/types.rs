@@ -152,14 +152,30 @@ impl UserAction {
     }
 }
 
-/// What a `give` action hands over. The category is fixed; the optional
-/// `name` on the action is free text.
+/// What a `give` action hands over. Consumables linger on the persona
+/// (`effects::curve`); valuables do not (spec
+/// 2026-10-13-give-categories-design.md §2). The category is fixed; the
+/// optional `name` on the action is free text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GivenItem {
     Cigarette,
     Alcohol,
     Medicine,
+    Food,
+    SoftDrink,
+    Tea,
+    Coffee,
+    Herb,
+    Watch,
+    Gem,
+    Gold,
+    Camera,
+    Cash,
+    Antique,
+    Artwork,
+    Handmade,
+    CreditCard,
 }
 
 /// Which of the persona's lists an item belongs to (spec
@@ -635,6 +651,41 @@ mod tests {
         assert_eq!(
             serde_json::to_value(GivenItem::Medicine).unwrap(),
             "medicine"
+        );
+    }
+
+    #[test]
+    fn new_given_items_wire_values() {
+        for (item, wire) in [
+            (GivenItem::Food, "food"),
+            (GivenItem::SoftDrink, "soft_drink"),
+            (GivenItem::Tea, "tea"),
+            (GivenItem::Coffee, "coffee"),
+            (GivenItem::Herb, "herb"),
+            (GivenItem::Watch, "watch"),
+            (GivenItem::Gem, "gem"),
+            (GivenItem::Gold, "gold"),
+            (GivenItem::Camera, "camera"),
+            (GivenItem::Cash, "cash"),
+            (GivenItem::Antique, "antique"),
+            (GivenItem::Artwork, "artwork"),
+            (GivenItem::Handmade, "handmade"),
+            (GivenItem::CreditCard, "credit_card"),
+        ] {
+            assert_eq!(serde_json::to_value(item).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_value::<GivenItem>(serde_json::json!(wire)).unwrap(),
+                item
+            );
+        }
+        let give = UserAction::Give {
+            item: GivenItem::CreditCard,
+            name: None,
+            quantity: 1,
+        };
+        assert_eq!(
+            serde_json::to_value(&give).unwrap(),
+            serde_json::json!({"type": "give", "item": "credit_card", "quantity": 1})
         );
     }
 

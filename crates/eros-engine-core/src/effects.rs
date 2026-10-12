@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! What an accepted `give` keeps doing to the persona over the turns after it
-//! (spec 2026-10-12-given-item-lingering-effects-design.md §4).
+//! (spec 2026-10-12-given-item-lingering-effects-design.md §4; curves keyed by
+//! shape, spec 2026-10-13-give-categories-design.md §3).
 
 use serde::{Deserialize, Serialize};
 
@@ -9,14 +10,46 @@ use crate::types::{GivenItem, UserAction};
 /// Turns an effect lasts at most.
 pub const MAX_STEPS: usize = 5;
 
-/// Levels by step for quantities 1–5 (§4.1). One row per quantity.
-const CIGARETTE: [&[u8]; MAX_STEPS] = [&[3], &[3, 1], &[3, 2, 1], &[3, 2, 2, 1], &[3, 3, 2, 2, 1]];
-const ALCOHOL: [&[u8]; MAX_STEPS] = [&[1], &[1, 3], &[1, 2, 3], &[1, 2, 2, 3], &[1, 2, 2, 3, 3]];
-const MEDICINE: [&[u8]; MAX_STEPS] = [&[3], &[3, 3], &[1, 3, 1], &[1, 3, 3, 1], &[1, 2, 3, 2, 1]];
+/// Levels by step for quantities 1–5, one row per quantity, by shape.
+const FRONT: [&[u8]; MAX_STEPS] = [&[3], &[3, 1], &[3, 2, 1], &[3, 2, 2, 1], &[3, 3, 2, 2, 1]];
+const BACK: [&[u8]; MAX_STEPS] = [&[1], &[1, 3], &[1, 2, 3], &[1, 2, 2, 3], &[1, 2, 2, 3, 3]];
+const MIDDLE: [&[u8]; MAX_STEPS] = [&[3], &[3, 3], &[1, 3, 1], &[1, 3, 3, 1], &[1, 2, 3, 2, 1]];
 /// A quantity above 5: the only rows that reach level 4.
-const CIGARETTE_HEAVY: &[u8] = &[4, 3, 3, 2, 1];
-const ALCOHOL_HEAVY: &[u8] = &[1, 2, 3, 4, 4];
-const MEDICINE_HEAVY: &[u8] = &[1, 3, 4, 2, 1];
+const FRONT_HEAVY: &[u8] = &[4, 3, 3, 2, 1];
+const BACK_HEAVY: &[u8] = &[1, 2, 3, 4, 4];
+const MIDDLE_HEAVY: &[u8] = &[1, 3, 4, 2, 1];
+
+/// How an effect runs over its turns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    /// Strongest at first, then fades.
+    Front,
+    /// Builds up and ends at its peak.
+    Back,
+    /// Rises, peaks, fades.
+    Middle,
+}
+
+/// The curve shape of a consumable; `None` for a valuable, which does not
+/// linger.
+fn shape(item: GivenItem) -> Option<Shape> {
+    match item {
+        GivenItem::Cigarette | GivenItem::Food | GivenItem::SoftDrink | GivenItem::Tea => {
+            Some(Shape::Front)
+        }
+        GivenItem::Alcohol => Some(Shape::Back),
+        GivenItem::Medicine | GivenItem::Coffee | GivenItem::Herb => Some(Shape::Middle),
+        GivenItem::Watch
+        | GivenItem::Gem
+        | GivenItem::Gold
+        | GivenItem::Camera
+        | GivenItem::Cash
+        | GivenItem::Antique
+        | GivenItem::Artwork
+        | GivenItem::Handmade
+        | GivenItem::CreditCard => None,
+    }
+}
 
 /// Where a step sits on its row (§4.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,12 +77,16 @@ pub struct ActiveEffect {
     pub steps: u8,
 }
 
-/// The curve row for an item and a quantity (§4.1). Empty for quantity 0.
+/// The curve row for an item and a quantity. Empty for quantity 0 and for
+/// every valuable.
 pub fn curve(item: GivenItem, quantity: u8) -> &'static [u8] {
-    let (rows, heavy) = match item {
-        GivenItem::Cigarette => (&CIGARETTE, CIGARETTE_HEAVY),
-        GivenItem::Alcohol => (&ALCOHOL, ALCOHOL_HEAVY),
-        GivenItem::Medicine => (&MEDICINE, MEDICINE_HEAVY),
+    let Some(shape) = shape(item) else {
+        return &[];
+    };
+    let (rows, heavy) = match shape {
+        Shape::Front => (&FRONT, FRONT_HEAVY),
+        Shape::Back => (&BACK, BACK_HEAVY),
+        Shape::Middle => (&MIDDLE, MIDDLE_HEAVY),
     };
     match quantity {
         0 => &[],
@@ -264,5 +301,82 @@ mod tests {
             .unwrap()
             .get("name")
             .is_none());
+    }
+
+    /// Every valuable (spec 2026-10-13-give-categories-design.md §2).
+    const VALUABLES: [GivenItem; 9] = [
+        GivenItem::Watch,
+        GivenItem::Gem,
+        GivenItem::Gold,
+        GivenItem::Camera,
+        GivenItem::Cash,
+        GivenItem::Antique,
+        GivenItem::Artwork,
+        GivenItem::Handmade,
+        GivenItem::CreditCard,
+    ];
+
+    /// Each new consumable takes the rows of the existing item that has its
+    /// shape; those rows are pinned by `curve_rows_match_the_spec_table`.
+    #[test]
+    fn new_consumables_follow_their_shape() {
+        for (item, like) in [
+            (GivenItem::Food, GivenItem::Cigarette),
+            (GivenItem::SoftDrink, GivenItem::Cigarette),
+            (GivenItem::Tea, GivenItem::Cigarette),
+            (GivenItem::Coffee, GivenItem::Medicine),
+            (GivenItem::Herb, GivenItem::Medicine),
+        ] {
+            for q in (0..=7u8).chain([99]) {
+                assert_eq!(curve(item, q), curve(like, q), "{item:?} ×{q}");
+            }
+        }
+    }
+
+    #[test]
+    fn valuables_never_linger() {
+        for item in VALUABLES {
+            for q in (0..=7u8).chain([99]) {
+                assert!(curve(item, q).is_empty(), "{item:?} ×{q}");
+            }
+            assert!(active_effects(&[give(item, 3)]).is_empty(), "{item:?}");
+        }
+    }
+
+    #[test]
+    fn an_accepted_valuable_leaves_the_effects_around_it_alone() {
+        let prior = vec![
+            give(GivenItem::Coffee, 2),
+            give(GivenItem::Watch, 1),
+            give(GivenItem::Food, 3),
+        ];
+        let got = active_effects(&prior);
+        assert_eq!(got.len(), 2, "{got:?}");
+        // coffee ×2 is middle [3, 3]: step 1 → level 3.
+        assert_eq!(
+            (got[0].item, got[0].step, got[0].level),
+            (GivenItem::Coffee, 1, 3)
+        );
+        // food ×3 is front [3, 2, 1]: step 3 → level 1.
+        assert_eq!(
+            (got[1].item, got[1].step, got[1].level),
+            (GivenItem::Food, 3, 1)
+        );
+    }
+
+    #[test]
+    fn a_two_word_item_keeps_its_snake_case_in_the_effect() {
+        let e = ActiveEffect {
+            item: GivenItem::SoftDrink,
+            name: None,
+            quantity: 1,
+            level: 3,
+            phase: Peak,
+            step: 1,
+            steps: 1,
+        };
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["item"], "soft_drink");
+        assert_eq!(serde_json::from_value::<ActiveEffect>(v).unwrap(), e);
     }
 }
