@@ -270,6 +270,36 @@ impl<'a> HumanInsightRepo<'a> {
         Ok(())
     }
 
+    /// Rows changed strictly after the `(since, after_user)` keyset tuple, in
+    /// `(updated_at, user_id)` order, at most `limit`. Backs the insights
+    /// export endpoint; the tuple comparison (not a bare `updated_at >`) is
+    /// what keeps rows sharing one timestamp from being skipped or repeated
+    /// across a page boundary. Uses `idx_human_insights_updated_user` (0069).
+    pub async fn list_changes(
+        &self,
+        since: DateTime<Utc>,
+        after_user: Uuid,
+        limit: i64,
+    ) -> Result<Vec<HumanInsightsRow>, sqlx::Error> {
+        sqlx::query_as::<_, HumanInsightsRow>(
+            "SELECT user_id, city, location, hometown, nationality, occupation, \
+                    mbti_guess, love_values, emotional_needs, life_rhythm, \
+                    interests, personality_traits, preferred_gender, \
+                    age_min, age_max, deal_breakers, education, family, \
+                    relationship_history, social_pattern, future_plans, \
+                    finance_status, updated_at \
+             FROM engine.human_insights \
+             WHERE (updated_at, user_id) > ($1, $2) \
+             ORDER BY updated_at, user_id \
+             LIMIT $3",
+        )
+        .bind(since)
+        .bind(after_user)
+        .bind(limit)
+        .fetch_all(self.pool)
+        .await
+    }
+
     pub async fn load(&self, user_id: Uuid) -> Result<Option<HumanInsightsRow>, sqlx::Error> {
         sqlx::query_as::<_, HumanInsightsRow>(
             "SELECT * FROM engine.human_insights WHERE user_id = $1",
@@ -774,5 +804,102 @@ mod tests {
             indexdef.contains("(updated_at, user_id)"),
             "index must be on (updated_at, user_id), got: {indexdef}"
         );
+    }
+
+    async fn seed_insight_at(pool: &PgPool, user_id: Uuid, at: chrono::DateTime<chrono::Utc>) {
+        sqlx::query(
+            "INSERT INTO engine.human_insights (user_id, interests, updated_at) \
+             VALUES ($1, '{\"jazz\"}', $2)",
+        )
+        .bind(user_id)
+        .bind(at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn list_changes_walks_tied_timestamps_without_loss_or_duplicate(pool: PgPool) {
+        use chrono::{TimeZone, Utc};
+        let t = Utc.with_ymd_and_hms(2026, 10, 13, 12, 0, 0).unwrap();
+        let mut ids: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+        for id in &ids {
+            seed_insight_at(&pool, *id, t).await;
+        }
+        ids.sort(); // keyset order within one timestamp is user_id order
+
+        let repo = HumanInsightRepo { pool: &pool };
+        let page1 = repo
+            .list_changes(chrono::DateTime::<Utc>::UNIX_EPOCH, Uuid::nil(), 2)
+            .await
+            .unwrap();
+        assert_eq!(page1.len(), 2);
+        let last = page1.last().unwrap();
+        let page2 = repo
+            .list_changes(last.updated_at, last.user_id, 2)
+            .await
+            .unwrap();
+        assert_eq!(page2.len(), 1);
+
+        let walked: Vec<Uuid> = page1
+            .iter()
+            .chain(page2.iter())
+            .map(|r| r.user_id)
+            .collect();
+        assert_eq!(
+            walked, ids,
+            "every row exactly once, in (updated_at, user_id) order"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn list_changes_since_without_after_user_includes_rows_at_since(pool: PgPool) {
+        use chrono::{TimeZone, Utc};
+        let t = Utc.with_ymd_and_hms(2026, 10, 13, 12, 0, 0).unwrap();
+        let id = Uuid::new_v4();
+        seed_insight_at(&pool, id, t).await;
+
+        let repo = HumanInsightRepo { pool: &pool };
+        // since == the row's updated_at, after_user == nil: the row is *returned*
+        // (nil sorts below every real UUID). Callers that want to skip it must
+        // pass both fields of `next`. This is the contract; do not "fix" it.
+        let rows = repo.list_changes(t, Uuid::nil(), 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].user_id, id);
+
+        // Passing the row's own (updated_at, user_id) skips it.
+        let rows = repo.list_changes(t, id, 10).await.unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn list_changes_returns_all_columns(pool: PgPool) {
+        use chrono::{TimeZone, Utc};
+        let t = Utc.with_ymd_and_hms(2026, 10, 13, 12, 0, 0).unwrap();
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO engine.human_insights \
+               (user_id, city, interests, personality_traits, deal_breakers, age_min, age_max, finance_status, updated_at) \
+             VALUES ($1, 'Singapore', '{\"jazz\",\"hiking\"}', '{\"calm\"}', '{\"smoking\"}', 25, 35, 'stable', $2)",
+        )
+        .bind(id)
+        .bind(t)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let repo = HumanInsightRepo { pool: &pool };
+        let rows = repo
+            .list_changes(chrono::DateTime::<Utc>::UNIX_EPOCH, Uuid::nil(), 10)
+            .await
+            .unwrap();
+        let r = &rows[0];
+        assert_eq!(r.city.as_deref(), Some("Singapore"));
+        assert_eq!(r.interests, vec!["jazz", "hiking"]);
+        assert_eq!(r.personality_traits, vec!["calm"]);
+        assert_eq!(r.deal_breakers, vec!["smoking"]);
+        assert_eq!((r.age_min, r.age_max), (Some(25), Some(35)));
+        assert_eq!(r.finance_status.as_deref(), Some("stable"));
+        assert_eq!(r.updated_at, t);
     }
 }
