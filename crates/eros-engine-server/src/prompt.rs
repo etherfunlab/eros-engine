@@ -26,6 +26,7 @@
 use chrono::{DateTime, Datelike, Timelike, Utc, Weekday};
 
 use eros_engine_core::affinity::Affinity;
+use eros_engine_core::effects::{ActiveEffect, EffectPhase};
 use eros_engine_core::persona::CompanionPersona;
 use eros_engine_core::scope::AffinityScope;
 use eros_engine_core::types::PromptTrait;
@@ -635,17 +636,7 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
             item,
             name,
             quantity,
-        } => {
-            let (unit, word) = match item {
-                GivenItem::Cigarette => ("支", "烟"),
-                GivenItem::Alcohol => ("杯", "酒"),
-                GivenItem::Medicine => ("片", "药"),
-            };
-            match name {
-                Some(name) => format!("递给你 {quantity} {unit}「{name}」"),
-                None => format!("递给你 {quantity} {unit}{word}"),
-            }
-        }
+        } => format!("递给你 {}", given_phrase(*item, name.as_deref(), *quantity)),
         UserAction::Kiss => "凑过来想亲你".into(),
         UserAction::Hug => "想抱你".into(),
         UserAction::Touch => "伸手想摸你".into(),
@@ -715,6 +706,79 @@ pub(crate) fn action_response_from_metadata(
     meta: Option<&serde_json::Value>,
 ) -> Option<ActionResponse> {
     serde_json::from_value(meta?.get("action")?.get("response")?.clone()).ok()
+}
+
+/// What a `give` hands over, without its verb: 「3 杯「威士忌」」「1 支烟」.
+/// The user-supplied name is quoted with 「」 so it reads as data.
+pub(crate) fn given_phrase(item: GivenItem, name: Option<&str>, quantity: u8) -> String {
+    let (unit, word) = match item {
+        GivenItem::Cigarette => ("支", "烟"),
+        GivenItem::Alcohol => ("杯", "酒"),
+        GivenItem::Medicine => ("片", "药"),
+    };
+    match name {
+        Some(name) => format!("{quantity} {unit}「{name}」"),
+        None => format!("{quantity} {unit}{word}"),
+    }
+}
+
+/// How strong an effect feels, by item and level 1–4 (spec
+/// 2026-10-12-given-item-lingering-effects-design.md §6.1). Deliberately
+/// says how strong, not what it feels like.
+fn effect_word(item: GivenItem, level: u8) -> &'static str {
+    const CIGARETTE: [&str; 4] = ["余味还在", "还有点飘", "烟劲很足", "抽得头晕"];
+    const ALCOHOL: [&str; 4] = ["有一点酒意", "微醺", "醉意上头", "醉得厉害"];
+    const MEDICINE: [&str; 4] = ["药效轻微", "药效明显", "药效很强", "药劲过猛"];
+    let words = match item {
+        GivenItem::Cigarette => &CIGARETTE,
+        GivenItem::Alcohol => &ALCOHOL,
+        GivenItem::Medicine => &MEDICINE,
+    };
+    words[usize::from(level.clamp(1, 4)) - 1]
+}
+
+fn effect_direction(phase: EffectPhase) -> &'static str {
+    match phase {
+        EffectPhase::Rising => "还在往上走",
+        EffectPhase::Peak => "正在劲头上",
+        EffectPhase::Fading => "在慢慢退",
+    }
+}
+
+/// The persona's lingering state as every model reads it (spec
+/// 2026-10-12-given-item-lingering-effects-design.md §6.1):
+/// 「3 杯「威士忌」，微醺，还在往上走；1 支烟，烟劲很足，正在劲头上」.
+/// `None` when nothing is at work.
+pub(crate) fn body_state(effects: &[ActiveEffect]) -> Option<String> {
+    (!effects.is_empty()).then(|| {
+        effects
+            .iter()
+            .map(|e| {
+                format!(
+                    "{}，{}，{}",
+                    given_phrase(e.item, e.name.as_deref(), e.quantity),
+                    effect_word(e.item, e.level),
+                    effect_direction(e.phase)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("；")
+    })
+}
+
+/// Fold the last turns' `metadata` (newest first) into the active effects:
+/// a turn counts only with an accepted action; anything that does not parse
+/// counts as no action (spec 2026-10-12-given-item-lingering-effects-design.md §5).
+pub(crate) fn effects_from_metadata(rows: &[Option<serde_json::Value>]) -> Vec<ActiveEffect> {
+    let prior: Vec<Option<UserAction>> = rows
+        .iter()
+        .map(|m| {
+            (action_response_from_metadata(m.as_ref()) == Some(ActionResponse::Accept))
+                .then(|| action_from_metadata(m.as_ref()))
+                .flatten()
+        })
+        .collect();
+    eros_engine_core::effects::active_effects(&prior)
 }
 
 /// A user turn's text with its action marker in front; the text unchanged
@@ -4658,5 +4722,138 @@ mod tests {
             "{s}"
         );
         assert!(!s.contains("\n① Ignore"), "{s}");
+    }
+
+    fn effect(
+        item: GivenItem,
+        name: Option<&str>,
+        quantity: u8,
+        level: u8,
+        phase: EffectPhase,
+    ) -> ActiveEffect {
+        ActiveEffect {
+            item,
+            name: name.map(str::to_string),
+            quantity,
+            level,
+            phase,
+            step: 1,
+            steps: 1,
+        }
+    }
+
+    #[test]
+    fn given_phrase_with_and_without_a_name() {
+        assert_eq!(
+            given_phrase(GivenItem::Alcohol, Some("威士忌"), 3),
+            "3 杯「威士忌」"
+        );
+        assert_eq!(given_phrase(GivenItem::Cigarette, None, 1), "1 支烟");
+        assert_eq!(given_phrase(GivenItem::Medicine, None, 2), "2 片药");
+    }
+
+    #[test]
+    fn body_state_words_follow_item_and_level() {
+        let words = [
+            (
+                GivenItem::Cigarette,
+                ["余味还在", "还有点飘", "烟劲很足", "抽得头晕"],
+            ),
+            (
+                GivenItem::Alcohol,
+                ["有一点酒意", "微醺", "醉意上头", "醉得厉害"],
+            ),
+            (
+                GivenItem::Medicine,
+                ["药效轻微", "药效明显", "药效很强", "药劲过猛"],
+            ),
+        ];
+        for (item, ws) in words {
+            for (i, w) in ws.iter().enumerate() {
+                let s =
+                    body_state(&[effect(item, None, 1, i as u8 + 1, EffectPhase::Peak)]).unwrap();
+                assert!(
+                    s.contains(&format!("，{w}，")),
+                    "{item:?} level {}: {s}",
+                    i + 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn body_state_directions() {
+        for (phase, word) in [
+            (EffectPhase::Rising, "还在往上走"),
+            (EffectPhase::Peak, "正在劲头上"),
+            (EffectPhase::Fading, "在慢慢退"),
+        ] {
+            let s = body_state(&[effect(GivenItem::Alcohol, None, 2, 2, phase)]).unwrap();
+            assert_eq!(s, format!("2 杯酒，微醺，{word}"));
+        }
+    }
+
+    #[test]
+    fn body_state_joins_newest_first_and_is_none_when_empty() {
+        assert_eq!(body_state(&[]), None);
+        let s = body_state(&[
+            effect(
+                GivenItem::Alcohol,
+                Some("威士忌"),
+                3,
+                2,
+                EffectPhase::Rising,
+            ),
+            effect(GivenItem::Cigarette, None, 1, 3, EffectPhase::Peak),
+        ])
+        .unwrap();
+        assert_eq!(
+            s,
+            "3 杯「威士忌」，微醺，还在往上走；1 支烟，烟劲很足，正在劲头上"
+        );
+    }
+
+    #[test]
+    fn effects_from_metadata_keeps_only_accepted_gives() {
+        use serde_json::json;
+        let rows = vec![
+            Some(
+                json!({"action": {"type": "give", "item": "cigarette", "quantity": 1, "response": "accept"}}),
+            ),
+            Some(
+                json!({"action": {"type": "give", "item": "alcohol", "quantity": 5, "response": "refuse"}}),
+            ),
+            Some(json!({"action": {"type": "give", "item": "alcohol", "quantity": 5}})),
+            None,
+            Some(
+                json!({"action": {"type": "give", "item": "medicine", "quantity": 9, "response": "accept"}}),
+            ),
+        ];
+        let got = effects_from_metadata(&rows);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(
+            (got[0].item, got[0].step, got[0].level, got[0].phase),
+            (GivenItem::Cigarette, 1, 3, EffectPhase::Peak)
+        );
+        assert_eq!(
+            (got[1].item, got[1].step, got[1].level, got[1].phase),
+            (GivenItem::Medicine, 5, 1, EffectPhase::Fading)
+        );
+    }
+
+    #[test]
+    fn effects_from_metadata_ignores_malformed_actions() {
+        use serde_json::json;
+        let rows = vec![
+            Some(
+                json!({"action": {"type": "give", "item": "cigarette", "quantity": 0, "response": "accept"}}),
+            ),
+            Some(
+                json!({"action": {"type": "give", "item": "lighter", "quantity": 1, "response": "accept"}}),
+            ),
+            Some(json!({"action": "give"})),
+            Some(json!({"action": {"type": "hug", "response": "accept"}})),
+        ];
+        assert!(effects_from_metadata(&rows).is_empty());
     }
 }

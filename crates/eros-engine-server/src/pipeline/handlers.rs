@@ -646,6 +646,24 @@ pub(crate) fn human_insights_to_bullets(row: &HumanInsightsRow, mode: InsightMod
     out
 }
 
+/// The lingering effects of accepted gives on the session's last turns
+/// before `before`, or on its newest turns when `None` (spec
+/// 2026-10-12-given-item-lingering-effects-design.md §5).
+pub(crate) async fn load_effects(
+    pool: &PgPool,
+    session_id: Uuid,
+    before: Option<Uuid>,
+) -> Result<Vec<eros_engine_core::effects::ActiveEffect>, sqlx::Error> {
+    let rows = ChatRepo { pool }
+        .user_action_metadata(
+            session_id,
+            before,
+            eros_engine_core::effects::MAX_STEPS as i64,
+        )
+        .await?;
+    Ok(crate::prompt::effects_from_metadata(&rows))
+}
+
 /// Load + render 基础画像 from the flat `human_insights` mirror. `Off` → empty.
 async fn load_human_insight_bullets(
     pool: &PgPool,

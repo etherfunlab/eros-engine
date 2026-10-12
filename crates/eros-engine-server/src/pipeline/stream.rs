@@ -143,6 +143,14 @@ pub enum ProtocolFrame {
         user_message_id: Uuid,
         response: eros_engine_core::types::ActionResponse,
     },
+    /// The persona's lingering state this turn (spec
+    /// 2026-10-12-given-item-lingering-effects-design.md §9.1). Sent once,
+    /// only when non-empty: after `action_response` and before the first
+    /// `meta` on a text turn, before the first `delta` on a voice turn.
+    BodyState {
+        user_message_id: Uuid,
+        effects: Vec<eros_engine_core::effects::ActiveEffect>,
+    },
 }
 
 fn is_false(b: &bool) -> bool {
@@ -201,6 +209,17 @@ pub(crate) fn action_response_frame(
             user_message_id,
             response,
         }
+    })
+}
+
+/// The `body_state` frame for a turn; `None` when nothing is at work.
+pub(crate) fn body_state_frame(
+    user_message_id: Uuid,
+    effects: &[eros_engine_core::effects::ActiveEffect],
+) -> Option<ProtocolFrame> {
+    (!effects.is_empty()).then(|| ProtocolFrame::BodyState {
+        user_message_id,
+        effects: effects.to_vec(),
     })
 }
 
@@ -11603,6 +11622,7 @@ data: [DONE]\n\n";
                 ProtocolFrame::Error { .. } => "error",
                 ProtocolFrame::ImageRequest { .. } => "image_request",
                 ProtocolFrame::ActionResponse { .. } => "action_response",
+                ProtocolFrame::BodyState { .. } => "body_state",
             };
             if out.last() != Some(&kind) {
                 out.push(kind);
@@ -21182,6 +21202,33 @@ data: [DONE]\n\n"
         assert_eq!(
             status, None,
             "a gateway-layer failure carries no upstream status"
+        );
+    }
+
+    #[test]
+    fn body_state_frame_only_when_there_are_effects() {
+        use eros_engine_core::effects::{ActiveEffect, EffectPhase};
+        use eros_engine_core::types::GivenItem;
+        let id = Uuid::new_v4();
+        assert!(body_state_frame(id, &[]).is_none());
+        let e = ActiveEffect {
+            item: GivenItem::Cigarette,
+            name: None,
+            quantity: 1,
+            level: 3,
+            phase: EffectPhase::Peak,
+            step: 1,
+            steps: 1,
+        };
+        let f = body_state_frame(id, &[e]).expect("a frame");
+        assert_eq!(
+            serde_json::to_value(&f).unwrap(),
+            serde_json::json!({
+                "type": "body_state",
+                "user_message_id": id,
+                "effects": [{"item": "cigarette", "quantity": 1, "level": 3,
+                             "phase": "peak", "step": 1, "steps": 1}],
+            })
         );
     }
 }
