@@ -206,11 +206,21 @@ pub(crate) fn run_group_turn(
         // ── seats: persona + read-only, decayed affinity per member ──
         let mut seats: Vec<Seat> = Vec::new();
         for m in &turn.members {
-            let Ok(Some(persona)) = (PersonaRepo { pool: &state.pool })
+            let persona = match (PersonaRepo { pool: &state.pool })
                 .load_companion(m.instance_id)
                 .await
-            else {
-                continue; // inactive or missing persona: not seated this turn
+            {
+                Ok(Some(p)) => p,
+                // Inactive or missing persona: not seated this turn.
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(
+                        group_session_id = %turn.group_session_id,
+                        member_session_id = %m.member_session_id,
+                        "group: persona load failed, member not seated: {e}"
+                    );
+                    continue;
+                }
             };
             let mut affinity = match (AffinityRepo { pool: &state.pool })
                 .load(m.member_session_id)
@@ -225,10 +235,22 @@ pub(crate) fn run_group_turn(
             };
             affinity.apply_time_decay();
             affinity.refresh_endpoints(&state.config.affinity_tuning);
-            let signals =
-                super::compute_signals_for_session(&state.pool, m.member_session_id, &affinity)
-                    .await
-                    .unwrap_or_default();
+            let signals = match super::compute_signals_for_session(
+                &state.pool,
+                m.member_session_id,
+                &affinity,
+            )
+            .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        member_session_id = %m.member_session_id,
+                        "group: signals read failed, using defaults: {e}"
+                    );
+                    ConversationSignals::default()
+                }
+            };
             seats.push(Seat {
                 member_session_id: m.member_session_id,
                 instance_id: m.instance_id,
@@ -250,14 +272,23 @@ pub(crate) fn run_group_turn(
         }
 
         // ── names and the transcript the director and composer read ──
-        let window = chat_repo
+        let window = match chat_repo
             .history_up_to(
                 turn.group_session_id,
                 turn.user_message_id,
                 crate::pipeline::handlers::HISTORY_WINDOW,
             )
             .await
-            .unwrap_or_default();
+        {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!(
+                    group_session_id = %turn.group_session_id,
+                    "group: history read failed, director and composer see no transcript: {e}"
+                );
+                Vec::new()
+            }
+        };
         let mut names: HashMap<Uuid, String> = seats
             .iter()
             .map(|s| (s.member_session_id, s.persona.genome.name.clone()))
@@ -268,11 +299,15 @@ pub(crate) fn run_group_turn(
             .filter(|s| !names.contains_key(s))
             .collect();
         if !unknown.is_empty() {
-            if let Ok(more) = (GroupRepo { pool: &state.pool })
+            match (GroupRepo { pool: &state.pool })
                 .speaker_names(&unknown)
                 .await
             {
-                names.extend(more);
+                Ok(more) => names.extend(more),
+                Err(e) => tracing::warn!(
+                    group_session_id = %turn.group_session_id,
+                    "group: speaker name read failed, departed speakers read as {UNKNOWN_SPEAKER}: {e}"
+                ),
             }
         }
         let before_now: Vec<ChatMessage> = window
@@ -654,7 +689,10 @@ pub(crate) fn run_group_turn(
                 if let Some(last) = produced.last() {
                     let img = match compose.join().await {
                         Some(Ok(v)) => v,
-                        _ => {
+                        failed => {
+                            if let Some(Err(e)) = failed {
+                                tracing::warn!("image-compose task failed: {e}");
+                            }
                             build_delegated_image_prompt(
                                 &state,
                                 &seat.persona,
