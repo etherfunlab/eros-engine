@@ -759,4 +759,20 @@ mod tests {
         // The reverse projection reproduces exactly what was stored.
         assert_eq!(existing_as_extraction_json(&row), input);
     }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn human_insights_has_keyset_index_on_updated_at_user_id(pool: PgPool) {
+        let indexdef: String = sqlx::query_scalar(
+            "SELECT indexdef FROM pg_indexes \
+             WHERE schemaname = 'engine' AND tablename = 'human_insights' \
+               AND indexname = 'idx_human_insights_updated_user'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("index idx_human_insights_updated_user exists");
+        assert!(
+            indexdef.contains("(updated_at, user_id)"),
+            "index must be on (updated_at, user_id), got: {indexdef}"
+        );
+    }
 }
