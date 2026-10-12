@@ -553,8 +553,8 @@ async fn send_group_message_stream(
                             let _ = timeout_tx.send(ProtocolFrame::Error {
                                 code: crate::pipeline::stream::StreamErrorCode::GenerationTimeout,
                                 retryable: true,
-                                message: format!("generation timeout after {}s", timeout.as_secs()),
-                                user_message: "回复超时，请稍后再试".into(),
+                                message: "generation timeout".into(),
+                                user_message: "生成超时，请稍后再试".into(),
                                 upstream_status: None,
                                 provider_code: None,
                             });
