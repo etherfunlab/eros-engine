@@ -1437,11 +1437,9 @@ impl OpenRouterClient {
                                 }
                                 Some(Ok(DeltaChunk {
                                     content: choice.delta.content.filter(|s| !s.is_empty()),
-                                    reasoning: choice
-                                        .delta
-                                        .reasoning
-                                        .or(choice.delta.reasoning_content)
-                                        .filter(|s| !s.is_empty()),
+                                    reasoning: choice.delta.reasoning.filter(|s| !s.is_empty()).or(
+                                        choice.delta.reasoning_content.filter(|s| !s.is_empty()),
+                                    ),
                                     finish_reason: choice.finish_reason,
                                     usage: frame.usage,
                                     // A BYOK hop keeps the id minted above.
@@ -2676,11 +2674,13 @@ data: [DONE]\n\n";
 
         let server = MockServer::start().await;
         // reasoning, then the DeepSeek-style key, then a frame carrying both
-        // (reasoning wins), then the content.
+        // (reasoning wins), then an empty `reasoning` beside a non-empty
+        // `reasoning_content` (the empty key must not shadow it), then content.
         let body = "\
 data: {\"choices\":[{\"delta\":{\"reasoning\":\"先想\"}}]}\n\n\
 data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"再想\"}}]}\n\n\
 data: {\"choices\":[{\"delta\":{\"reasoning\":\"两个\",\"reasoning_content\":\"都在\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"reasoning\":\"\",\"reasoning_content\":\"补上\"}}]}\n\n\
 data: {\"choices\":[{\"delta\":{\"reasoning\":\"\",\"content\":\"{}\"}}]}\n\n\
 data: [DONE]\n\n";
         Mock::given(path("/api/v1/chat/completions"))
@@ -2719,7 +2719,7 @@ data: [DONE]\n\n";
                 content.push(t);
             }
         }
-        assert_eq!(reasoning, vec!["先想", "再想", "两个"]);
+        assert_eq!(reasoning, vec!["先想", "再想", "两个", "补上"]);
         assert_eq!(content, vec!["{}"]);
     }
 
