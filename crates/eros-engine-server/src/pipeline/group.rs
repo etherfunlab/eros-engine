@@ -12,7 +12,7 @@ use eros_engine_core::group::{
 };
 use eros_engine_core::persona::CompanionPersona;
 use eros_engine_core::types::{
-    ActionType, ConversationSignals, DecisionInput, Event, ImageRef, PromptTrait,
+    ActionType, ConversationSignals, DecisionInput, Event, ImageRef, LlmAudit, PromptTrait,
 };
 use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::{ChatMessage, ChatRepo};
@@ -164,6 +164,7 @@ pub(crate) struct GroupTurn {
     pub members: Vec<GroupMember>,
     pub mentions: Vec<Uuid>,
     pub prompt_traits: Vec<PromptTrait>,
+    pub audit: Option<LlmAudit>,
     pub tier: Option<String>,
     pub user_locale: UserLocale,
     pub image: Option<ImageReplyParams>,
@@ -183,7 +184,7 @@ impl GroupTurn {
             content: self.content.clone(),
             message_id: self.user_message_id,
             prompt_traits: self.prompt_traits.clone(),
-            audit: None,
+            audit: self.audit.clone(),
             tier: self.tier.clone(),
             memory_scope: Default::default(),
             affinity_scope: Default::default(),

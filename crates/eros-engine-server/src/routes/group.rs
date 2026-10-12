@@ -313,6 +313,10 @@ pub struct GroupSendRequest {
     pub client_msg_id: String,
     #[serde(default)]
     pub prompt_traits: Option<Vec<crate::routes::companion::PromptTraitDto>>,
+    /// The 1:1 OpenRouter audit passthrough, with the same caps; it rides
+    /// each speaker's reply call.
+    #[serde(default)]
+    pub audit: Option<crate::routes::companion::LlmAuditDto>,
     #[serde(default)]
     pub tier: Option<String>,
     #[serde(default)]
@@ -409,6 +413,14 @@ async fn send_group_message_stream(
             "请求无效",
         )
     })?;
+    let audit = crate::routes::companion::validate_llm_audit(req.audit.clone()).map_err(|e| {
+        pre(
+            StatusCode::BAD_REQUEST,
+            "invalid_payload",
+            &e.to_string(),
+            "请求无效",
+        )
+    })?;
 
     let session = ChatRepo { pool: &state.pool }
         .get_session(group_id)
@@ -464,6 +476,7 @@ async fn send_group_message_stream(
     let params = serde_json::to_value(crate::routes::companion_async::QueuedTurnParams {
         tier: req.tier.clone(),
         prompt_traits: req.prompt_traits.clone(),
+        audit: req.audit.clone(),
         image: req.image.clone(),
         user_timezone: crate::holiday::bounded_raw(req.user_timezone.as_deref()),
         user_country: crate::holiday::bounded_raw(req.user_country.as_deref()),
@@ -498,6 +511,7 @@ async fn send_group_message_stream(
                     members,
                     mentions: req.mentions.clone(),
                     prompt_traits,
+                    audit,
                     tier: req.tier.clone(),
                     user_locale: crate::holiday::UserLocale::resolve(
                         req.user_timezone.as_deref(),
@@ -1658,6 +1672,43 @@ mod tests {
         let first = first.await.unwrap();
         assert!(first.contains("我也在"), "{first}");
         assert!(first.contains(r#""type":"final""#), "{first}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_audit_block_rides_each_speaker_and_is_validated(pool: PgPool) {
+        let mut f = fixture(pool, None, 200, None).await;
+        wiremock::Mock::given(wiremock::matchers::path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                json!({"model": "chat-model", "user": "u_group"}),
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(
+                        sse(&[r#"{"choices":[{"delta":{"content":"嗯嗯"}}]}"#.to_string()]),
+                        "text/event-stream",
+                    ),
+            )
+            .with_priority(1)
+            .expect(2)
+            .mount(&f._server)
+            .await;
+        let (s, body) = send(
+            &mut f,
+            json!({"content":"嗨","client_msg_id":"01JWWWWWWWWWWWWWWWWWWWWWWG","audit":{"user":"u_group"}}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+        assert_eq!(body.matches("嗯嗯").count(), 2, "{body}");
+
+        let (s, body) = send(
+            &mut f,
+            json!({"content":"嗨","client_msg_id":"01JXXXXXXXXXXXXXXXXXXXXXXG","audit":{"user":"u".repeat(257)}}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["code"], "invalid_payload", "{body}");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

@@ -3993,6 +3993,17 @@
           "client_msg_id"
         ],
         "properties": {
+          "audit": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LlmAuditDto",
+                "description": "The 1:1 OpenRouter audit passthrough, with the same caps; it rides\neach speaker's reply call."
+              }
+            ]
+          },
           "byok": {
             "type": [
               "object",
