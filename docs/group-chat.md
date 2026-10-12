@@ -102,7 +102,7 @@ client-side @.
   duplicate_in_progress`. Once the turn has settled, a replay re-emits each
   persisted row's `meta` (with `speaker_session_id`), `delta` and `done`, then
   `final`, or a terminal `error` when every row is a failed attempt. A replay
-  carries no `cast`, `director_reasoning`, `speaker_error` or `image_request`.
+  carries no `cast`, `reasoning`, `speaker_error` or `image_request`.
   A turn that failed terminally without any assistant row returns
   `409 duplicate_failed`; send a fresh `client_msg_id`.
 
@@ -135,7 +135,7 @@ POST /v2/comp/group/{gid}/message/stream
   └─ persist user row + claimed queue row (group session)
        └─ detached turn
             ├─ seat members: persona + affinity (read-only, decayed) → labels, rung
-            ├─ director (streamed) ──► director_reasoning* ──► normalize | rule fallback
+            ├─ director (streamed) ──► reasoning* ──► normalize | rule fallback
             │     └─ companion_decision_events (payload + reasoning)
             ├─ cast
             ├─ for each speaker, in order:
@@ -208,7 +208,7 @@ file keyed by the group session, with the speaker's member session id on a
 ### Frames
 
 ```
-director_reasoning*                       (0..n, only with reasoning on)
+reasoning*                       (0..n, only with reasoning on)
 cast
 ( meta → delta* → done → image_request?  |  meta → done{truncated:true} → speaker_error  |  speaker_error )  × speakers
 final
@@ -222,7 +222,7 @@ after the first frame.
 
 | Frame | Payload |
 |---|---|
-| `director_reasoning` | `{content}`: a reasoning delta |
+| `reasoning` | `{content}`: a reasoning delta |
 | `cast` | `{speakers: [{member_session_id, action_type}]}`; `action_type` uses the `meta` wire values `reply` / `reply_image` / `reply_text_image`. Emitted after the rule fallback too, so a client can always show who is about to speak |
 | `meta` | gains `speaker_session_id` on group turns; omitted on 1:1 turns, whose frames are unchanged |
 | `delta` / `done` / `image_request` | unchanged, keyed by `message_id` |
@@ -275,7 +275,7 @@ tasks  = ["group_director"]
 params = { reasoning = { effort = "medium" } }
 ```
 
-Reasoning tokens stream to the client as `director_reasoning` frames, and the
+Reasoning tokens stream to the client as `reasoning` frames, and the
 full text is kept in the decision audit row. Content deltas are buffered and
 parsed when the stream ends. If the call falls back to another model, that
 model's reasoning keeps appending. Reasoning is display-only: it is not passed

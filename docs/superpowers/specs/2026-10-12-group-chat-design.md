@@ -310,7 +310,7 @@ tasks  = ["group_director"]
 params = { reasoning = { effort = "medium" } }
 ```
 
-- Reasoning tokens stream to the client as `director_reasoning` frames (§6).
+- Reasoning tokens stream to the client as `reasoning` frames (§6).
 - Content deltas are buffered and parsed when the stream ends.
 - If the call falls back to another model, that model's reasoning keeps
   appending. Reasoning is display-only and decides nothing.
@@ -430,7 +430,7 @@ applies to each speaker.
 The group route emits:
 
 ```
-director_reasoning*                       (0..n, only with reasoning on)
+reasoning*                       (0..n, only with reasoning on)
 cast
 ( meta → delta* → done → image_request?  |  meta → done{truncated:true} → speaker_error  |  speaker_error )  × speakers
 final
@@ -444,7 +444,7 @@ first frame.
 
 | Frame | Payload |
 |---|---|
-| `director_reasoning` *(new)* | `{content}` — reasoning delta |
+| `reasoning` *(new)* | `{content}` — reasoning delta |
 | `cast` *(new)* | `{speakers: [{member_session_id, action_type}]}`. `action_type` uses the `meta` wire values `reply` / `reply_image` / `reply_text_image`. Emitted after the fallback too, so a client can always show who is about to speak. |
 | `meta` | gains `speaker_session_id` on group turns. The field is omitted on 1:1 turns, so 1:1 frames are byte-identical. |
 | `delta` / `done` / `image_request` | unchanged, keyed by `message_id` |
@@ -562,7 +562,7 @@ POST /v2/comp/group/{gid}/message/stream
   └─ persist user row + claimed queue row (group session)
        └─ detached turn
             ├─ load members: persona + affinity (read-only, decayed) → labels, rung
-            ├─ director (streamed) ──► director_reasoning* ──► normalize | rule fallback
+            ├─ director (streamed) ──► reasoning* ──► normalize | rule fallback
             │     └─ companion_decision_events (payload + reasoning)
             ├─ cast
             ├─ for each speaker:
@@ -645,7 +645,7 @@ a person on the dev deployment.
 - Read-only affinity load creates no row.
 
 **server** (sqlx::test + wiremock)
-- Full turn frame order: `director_reasoning* → cast → (meta → delta* → done
+- Full turn frame order: `reasoning* → cast → (meta → delta* → done
   → image_request?)×N → final`.
 - Assistant rows carry `speaker_session_id`.
 - Affinity untouched: member `companion_affinity` row count and `updated_at`
@@ -702,5 +702,5 @@ a person on the dev deployment.
    reactions and voice are off.
 9. **Titles.** Groups have an engine-stored title that can be renamed.
 10. **Director reasoning.** It is on through a body rule. Reasoning text
-    streams to the client as `director_reasoning` and its display is the
+    streams to the client as `reasoning` and its display is the
     client's decision. The text is also kept in the decision audit row.

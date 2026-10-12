@@ -86,11 +86,18 @@ Behavior per attempt, walking the chain in order:
   (`record_generation`, task = `call.task`, `session_id = call.session_id`).
   The id that call returns is the generation id from then on.
 - **Content.**
-  - Trimmed content that is empty sets status `Empty` and moves to the next
+  - The accumulated content is repaired when it is byte-BPE garbled. A garbled
+    attempt that ended truncated (`finish_reason` = `length`) is incomplete,
+    is not repaired, and moves to the next model.
+  - The content then passes through the response cleaner. Everything after
+    this point (the empty check, `parse`, `raw`) sees the cleaned text.
+  - Cleaned content that is empty sets status `Empty` and moves to the next
     model.
   - Otherwise `parse` runs. A `Some` result finishes with `Ok`.
-  - A `None` result sets status `ParseError`, keeps the text and its
+  - A `None` result sets status `ParseError`, keeps the cleaned text and its
     generation id as `raw`, and moves to the next model.
+  - On a multi-model chain, the first model whose content parses after repair
+    wins. The chain does not try a fallback first to prefer a clean reply.
 - **Chain exhausted.** The status becomes `ParseError` (with its `raw` and
   generation id) when the last content failure was a parse error. Otherwise it
   is `PdeStatus::for_operation(&failures)`.

@@ -296,7 +296,7 @@ tasks  = ["group_director"]
 params = { reasoning = { effort = "medium" } }
 ```
 
-推理 token 计入该任务的 `max_tokens`，所以要通过这条规则（`effort` 或 `reasoning.max_tokens`）限制推理。推理文本以 `director_reasoning` 帧流给客户端；`reasoning = { exclude = true }` 表示模型照常推理但不返回文本。见 [group-chat.zh.md](group-chat.zh.md)。
+推理 token 计入该任务的 `max_tokens`，所以要通过这条规则（`effort` 或 `reasoning.max_tokens`）限制推理。推理文本以 `reasoning` 帧流给客户端；`reasoning = { exclude = true }` 表示模型照常推理但不返回文本。见 [group-chat.zh.md](group-chat.zh.md)。
 
 ### `model_name_display_override`（仅限 chat 任务）
 
@@ -591,6 +591,16 @@ BYOK hop 使用其请求中 `byok` 块的 `output_regex` 规则，而不是这�
   - `action_response`（选填）：本轮带用户动作时（上下文里会有 `[用户动作]` 一行）填 `"accept"` 或 `"refuse"`；其他回合或拿不准时填 `null`。`null`、判官调用失败、规则 PDE 一律按接受处理。拒绝会让该动作对应的亲密度线降一档（见 [affinity-model.zh.md](affinity-model.zh.md)）。动作回合里 `ghost` 和 `product_qa` 会改判为 `reply_text`，也不掷每轮骰子
   - `reason`：可选
 - **Fail-open：**任何 LLM 超时或错误都会回退到规则引擎——LLM 判断器绝不会阻塞 chat 响应。
+- **`timeout_secs`**（选填，默认 `15`）：每次尝试的时限，从发起调用到读完为止共用一个截止时间。超时的尝试算失败，调用转向链上的下一个模型。写 `0` 会拒绝启动（判官每轮都会超时）。只在 `[tasks.pde_decision]` 上读取，其他任务忽略。
+- **推理。**判官始终以流式调用。推理只走 body 规则，没有别的入口；没有 `pde_decision` 的规则时判官不返回推理，1:1 流也没有 `reasoning` 帧：
+
+  ```toml
+  [[providers.openrouter.body]]
+  tasks  = ["pde_decision"]
+  params = { reasoning = { effort = "low" } }
+  ```
+
+  规则生效后，推理以 `reasoning` 帧在回复之前流给客户端（见 [api-reference.zh.md](api-reference.zh.md)），并保存在决策审计行上。推理 token 计入该任务的 `max_tokens`，所以要和 `timeout_secs` 一起调高。回复要等判官，首个 token 的延迟会增加判官思考所花的时间。
 - **硬安全 guardrail**（在 LLM verdict 之后、规则引擎 fallback 之前强制执行）：前 10 条消息绝不 ghost，绝不连续 ghost 第三次（`ghost_streak ≥ 2` 否决；连两次是允许的），ghost cooldown 为一小时。
 - 每次判断器调用都会记录到 `companion_decision_events` 以供审计：`payload` 是模型返回的内容；`inputs`（JSONB，迁移 `0044`）冻结判断器当时看到的引擎计算状态——亲密度档位、耐心档位、bond/chemistry 与六个原始轴。fire-and-forget 写入；历史行保持 `NULL`。
 

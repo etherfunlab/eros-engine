@@ -112,7 +112,8 @@ data: {"type":"final","filtered":false,"prompt_injected":null,"tier":null,"retri
 - **`done`** —— `truncated`、`usage`（经 `OPENROUTER_USAGE_HIDDEN_KEYS` 过滤后；总是存在——不适用时为 `null`）、`generation_id`（OpenRouter id；总是存在——不适用时为 `null`），以及 `ghost_fallback`（bool；为 `false` 时整个字段省略）。`ghost_fallback: true` 标记一条最终解析为空、以静默回退形式交付的回复——它**不是** `action_type=ghost` 轮次，也不会动 ghost 计数。原因记录在落库行的 `metadata.fallback_reason` 上。承诺出图的轮次（`action_type=reply_text_image`）例外：文本半边为空是一条纯图片回复而不是沉默，因此它上报 `ghost_fallback: false`、不带 `fallback_reason`，尾随的 `image_request` 照常发出。
 - **`final`** —— 本轮汇总：`filtered`（bool，回复是否被输出过滤）、`prompt_injected`（本轮注入的 trait tag 数组，无则为 `null`）、`tier`（回显请求的 `tier`，未传为 `null`）、`retries_chat`（命中的对话尝试下标，从 0 起）、`retries_filter`（实际服务的过滤模型尝试下标），以及自 v1.4.0 起的 `llm_attempts` / `gateway_errors`（**为空时整个字段省略**，见下）。这一帧不再带任何画像/lead 信号——`lead_score`、`should_show_cta`、`agent_training_level` 已随 companion_insights 拆除（spec 2026-08-11）移除；画像状态改从 `GET /comp/user/{user_id}/profile` 读取。
 - **`speaker_session_id`**（`meta` 上，仅群聊轮次）—— 说这条消息的成员 session；1:1 轮次省略，所以 1:1 的帧不变。
-- **`cast`**、**`director_reasoning`**、**`speaker_error`** —— 仅群聊轮次，见 [group-chat.zh.md](group-chat.zh.md#一轮)。1:1 流不会发这三种帧。
+- **`cast`**、**`speaker_error`** —— 仅群聊轮次，见 [group-chat.zh.md](group-chat.zh.md#一轮)。1:1 流不会发这两种帧。
+- **`reasoning`** —— `content`：PDE 判官推理文本的一段（`{"type":"reasoning","content":"…"}`）。零条或多条，最先发出，排在 `action_response`、`body_state` 和第一个 `meta` 之前。只有 `[tasks.pde_decision]` 配了判官、它的模型返回了推理、且部署用 body 规则打开了推理时才会出现（见 [model-config.zh.md](model-config.zh.md)）；否则 1:1 的帧序列不变。内容仅供展示，不决定任何事；完整显示、折叠还是做成“思考中”提示，由客户端自行决定。判官回退到别的模型时，那个模型的推理接着往后追加，不发重置帧。群聊轮次的导演在 `cast` 之前发同样的帧。
 - **`action_response`** —— 只在带 `action` 的回合出现：`user_message_id` 和 `response`（`"accept"` | `"refuse"`）。在第一个 `meta` 之前发一次，幂等重放时会重发。客户端必须容忍不认识的帧类型。之后若该回合以 `error` 结束，这一轮就没有生效，历史里也不带它的 `response`。
 - **`body_state`** —— 有被接受的 `give` 仍在起作用的回合才有：`user_message_id` 和 `effects`，新的 give 在前，每项 `{item, name?, quantity, level, phase, step, steps}`（`level` 1–4，`phase` 为 `rising` | `peak` | `fading`，`steps` 中的第 `step` 步）。描述的是这一回合回复写成时的状态。只发一次，在 `action_response`（若有）之后、第一个 `meta` 之前，幂等重放时重发。没有余效时不发。
 
@@ -496,6 +497,7 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 - 纯图片：`meta(reply_image) → done → image_request → final`
 - 图文：`meta(reply_text_image) → delta* → done → image_request → final`
 - `ghost`：`meta(action_type=ghost) → done → final` — 无 `delta`，`meta` 中无 `model`，`done` 的 `usage` 和 `generation_id` 均为 `null`。该轮伴侣保持沉默，未调用任何 LLM。
+- 带推理的回合：判官返回了推理时，`reasoning*` 排在下面每种形状的最前面，在 `action_response` 和 `body_state` 之前：`reasoning* → meta(reply) → delta* → done → final`
 - 动作轮次：形状相同，只是 `action_response` 排在第一个 `meta` 之前——`action_response → meta(reply) → delta* → done → final`；不会是 `ghost` 或 `product_qa`
 - 带余效的回合：`body_state` 位于第一个 `meta` 之前，两者都发时排在 `action_response` 之后——例如 `action_response → body_state → meta(reply) → delta* → done → final`
 - `product_qa`：`meta(action_type=product_qa) → delta* → done → final` — 形状与普通文本回复相同，由独立的模型链（`[tasks.chat_product_qa]`）流式生成，而非 `chat_companion`；落库时带 `channel='product_qa'`，重放时同样报告为 `product_qa`。

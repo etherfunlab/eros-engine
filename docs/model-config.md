@@ -324,7 +324,7 @@ params = { reasoning = { effort = "medium" } }
 
 Reasoning tokens count against the task's `max_tokens`, so bound reasoning
 through the rule (`effort` or `reasoning.max_tokens`). Reasoning text streams
-to the client as `director_reasoning` frames; `reasoning = { exclude = true }`
+to the client as `reasoning` frames; `reasoning = { exclude = true }`
 keeps the thinking but returns no text. See [group-chat.md](group-chat.md).
 
 ### `model_name_display_override` (chat task only)
@@ -675,6 +675,16 @@ By default the engine uses the built-in rule engine (`eros-engine-core/src/pde.r
   - `action_response` (optional): on a turn that carries a user action (the context then has a `[用户动作]` line), `"accept"` or `"refuse"`; `null` otherwise or when unsure. A `null`, a failed judge, or the rule engine all mean accept. A refusal drops the action's affinity line one tier (see [affinity-model.md](affinity-model.md#refused-actions)). On an action turn `ghost` and `product_qa` are turned into `reply_text`, and the per-turn dice are not rolled
   - `reason`: optional
 - **Fail-open:** any LLM timeout or error falls back to the rule engine — the LLM judge never blocks a chat response.
+- **`timeout_secs`** (optional, default `15`): the per-attempt limit, one deadline from opening the call through the end of the read. An attempt that runs past it fails and the call moves to the next model in the chain. `0` refuses to boot (the judge would time out every turn). It is read only on `[tasks.pde_decision]` and ignored on other tasks.
+- **Reasoning.** The judge always streams. Reasoning is a body rule and nothing else; without a rule for `pde_decision` the judge returns none and the 1:1 stream carries no `reasoning` frame:
+
+  ```toml
+  [[providers.openrouter.body]]
+  tasks  = ["pde_decision"]
+  params = { reasoning = { effort = "low" } }
+  ```
+
+  With the rule on, the reasoning streams to the client as `reasoning` frames ahead of the reply (see [api-reference.md](api-reference.md)) and is kept on the decision audit row. Reasoning tokens count against the task's `max_tokens`, so raise it together with `timeout_secs`. The reply waits for the judge, so first-token latency grows by the time the judge spends thinking.
 - **Hard-safety guardrails** (enforced after the LLM verdict, before the rule-engine fallback): never ghost in the first 10 messages, never ghost a third time in a row (`ghost_streak ≥ 2` vetoes; two consecutive are allowed), one-hour ghost cooldown.
 - Every judge call is audited to `companion_decision_events`: `payload` is what the model returned; `inputs` (JSONB, migration `0044`) freezes the engine-computed state the judge was shown — intimacy rung, patience band, bond/chemistry, and the six raw axes. Written fire-and-forget; historical rows stay `NULL`.
 

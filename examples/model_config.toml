@@ -72,7 +72,7 @@ tasks  = ["chat_companion"]
 params = { reasoning = { enabled = false } }
 #
 # The group director reasons before it casts a group turn; the reasoning
-# streams to the client as `director_reasoning` frames. Reasoning tokens count
+# streams to the client as `reasoning` frames. Reasoning tokens count
 # against the task's `max_tokens`, so cap reasoning here (`effort` or
 # `reasoning.max_tokens`) rather than by lowering `max_tokens`.
 [[providers.openrouter.body]]

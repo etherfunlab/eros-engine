@@ -770,6 +770,20 @@ Written even when the describe never ran — `not_configured`, `attempts = 0`
 absent on a turn, and this is the only way to tell it apart from "the
 describe ran and failed on every chain model" (`exhausted`).
 
+### PDE judge payload
+
+`companion_decision_events.payload` of a judge run, by outcome:
+
+| Outcome | `payload` |
+|---|---|
+| Parsed verdict | The verdict object plus `"reasoning"`: the full reasoning text, or `null` when the model returned none |
+| Unparseable content, no reasoning | The raw content string |
+| Unparseable content, with reasoning | `{"raw": "…", "reasoning": "…"}` |
+| No content (failures only), with reasoning | `{"reasoning": "…"}` |
+| No content, no reasoning | NULL |
+
+When the call falls back to another model, the reasoning of every attempt is kept, concatenated. A judge that streams reasoning but no content falls back to the rule engine; its row has status `empty` and `{"reasoning": "…"}`. The reasoning is the replay corpus for tuning the judge's `filter_prompt`.
+
 ## Group director
 
 A group turn replaces the `pde_decision` judge with one `group_director` call.

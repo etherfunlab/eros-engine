@@ -664,6 +664,20 @@ CHECK 里——事后收窄 CHECK 要过一次 migration，而这个仓库的一
 因为这是 `chat_messages.metadata.vision` 缺失的三种原因之一，也是唯一能把
 它和「describe 跑了但每个 chain 模型都失败了」（`exhausted`）区分开的办法。
 
+### PDE 判官的 payload
+
+判官每次运行写入 `companion_decision_events.payload`，按结果分：
+
+| 结果 | `payload` |
+|---|---|
+| 解析出裁决 | 裁决对象，外加 `"reasoning"`：完整的推理文本；模型没返回推理时为 `null` |
+| 内容无法解析，没有推理 | 原始内容字符串 |
+| 内容无法解析，有推理 | `{"raw": "…", "reasoning": "…"}` |
+| 没有内容（只有失败），有推理 | `{"reasoning": "…"}` |
+| 没有内容，没有推理 | NULL |
+
+调用回退到别的模型时，每次尝试的推理都会保留，按顺序拼接。判官只流出推理、没有内容时，本轮回退到规则引擎；该行状态为 `empty`，payload 为 `{"reasoning": "…"}`。推理是调判官 `filter_prompt` 时的回放语料。
+
 ## 群聊导演
 
 群聊轮次用一次 `group_director` 调用取代 `pde_decision` 判官。

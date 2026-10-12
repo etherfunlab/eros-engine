@@ -82,7 +82,7 @@
 - 群的流计入每用户的并发流上限，达到上限时 `429 rate_limited`。
 - 重发同一个 `client_msg_id`：轮次还在进行时返回 `409 duplicate_in_progress`。轮次结算之后则是重放：
   按落库的每一行重发 `meta`（带 `speaker_session_id`）、`delta` 和 `done`，最后是 `final`；
-  如果每一行都是失败的尝试，最后是一个终止性的 `error`。重放不带 `cast`、`director_reasoning`、
+  如果每一行都是失败的尝试，最后是一个终止性的 `error`。重放不带 `cast`、`reasoning`、
   `speaker_error` 和 `image_request`。轮次终止性失败且没有任何 assistant 行时返回
   `409 duplicate_failed`，需要换一个新的 `client_msg_id`。
 
@@ -113,7 +113,7 @@ POST /v2/comp/group/{gid}/message/stream
   └─ 写入用户行 + 已认领的队列行（群 session）
        └─ 分离执行的轮次
             ├─ 入座：角色 + 好感度（只读、已衰减）→ 档位标签、intimacy 档
-            ├─ 导演（流式）──► director_reasoning* ──► 规整 | 规则兜底
+            ├─ 导演（流式）──► reasoning* ──► 规整 | 规则兜底
             │     └─ companion_decision_events（payload + reasoning）
             ├─ cast
             ├─ 每位发言者依次：
@@ -171,7 +171,7 @@ POST /v2/comp/group/{gid}/message/stream
 ### 帧
 
 ```
-director_reasoning*                       （0..n 条，仅在开启推理时）
+reasoning*                       （0..n 条，仅在开启推理时）
 cast
 ( meta → delta* → done → image_request?  |  meta → done{truncated:true} → speaker_error  |  speaker_error )  × 发言者
 final
@@ -183,7 +183,7 @@ final
 
 | 帧 | 载荷 |
 |---|---|
-| `director_reasoning` | `{content}`：一段推理增量 |
+| `reasoning` | `{content}`：一段推理增量 |
 | `cast` | `{speakers: [{member_session_id, action_type}]}`；`action_type` 用 `meta` 的线上取值 `reply` / `reply_image` / `reply_text_image`。规则兜底之后同样会发，客户端始终能显示谁即将发言 |
 | `meta` | 群聊轮次多一个 `speaker_session_id`；1:1 轮次省略，帧不变 |
 | `delta` / `done` / `image_request` | 不变，以 `message_id` 为键 |
@@ -229,7 +229,7 @@ tasks  = ["group_director"]
 params = { reasoning = { effort = "medium" } }
 ```
 
-推理 token 以 `director_reasoning` 帧流给客户端，完整文本保存在决策审计行里。内容增量会被缓冲，
+推理 token 以 `reasoning` 帧流给客户端，完整文本保存在决策审计行里。内容增量会被缓冲，
 流结束后再解析。调用回退到别的模型时，那个模型的推理继续追加。推理只用于展示：不会传给发言者，
 也不决定任何事。`reasoning = { exclude = true }` 表示模型照常推理但不返回文本，因此不发帧。
 推理 token 计入 `max_tokens`；用这条规则（`effort` 或 `reasoning.max_tokens`）去限制，
