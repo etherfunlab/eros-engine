@@ -1278,6 +1278,16 @@ pub(crate) mod testutil {
         .unwrap()
     }
 
+    pub(crate) async fn seed_group_session(pool: &PgPool, user_id: Uuid) -> Uuid {
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.chat_sessions (user_id, channel) VALUES ($1, 'group') RETURNING id",
+        )
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
     pub(crate) async fn seed_instance(pool: &PgPool, genome_id: Uuid, owner: Uuid) -> Uuid {
         sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO engine.persona_instances (genome_id, owner_uid) \

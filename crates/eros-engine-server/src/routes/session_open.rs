@@ -1777,6 +1777,19 @@ mod tests {
         assert_eq!(body["code"], json!("wrong_channel"));
     }
 
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn open_409_when_session_is_a_group(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let group = crate::routes::companion::testutil::seed_group_session(&pool, user_id).await;
+        let mut app = build_router(test_state(pool.clone()));
+        let (status, body) = send_request(
+            &mut app,
+            open_req(group, &mint_test_jwt(user_id), json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    }
+
     /// `prompt_traits`/`audit` validation failures render in the same shape
     /// as the chat stream's 400s (`StreamPreErrorBody`), not the bare
     /// `bad_request` body `validate_prompt_traits` raises on its own.

@@ -601,12 +601,17 @@ pub(crate) async fn resolve_text_turn(
     // (2026-08-11-voice-barge-in-interrupt-design.md). Those lookups now filter
     // `channel = 'voice'` themselves, so this is defence in depth on the
     // writing side rather than the only guard.
-    if session.channel == "voice" {
+    if session.channel != "text" {
+        let user_message = match session.channel.as_str() {
+            "voice" => "该会话是语音会话",
+            "group" => "该会话是群聊",
+            _ => "会话类型不匹配",
+        };
         return Err(AppError::StreamPre(StreamPreError {
             status: StatusCode::CONFLICT,
             code: "wrong_channel",
-            message: "session is a voice-channel session".into(),
-            user_message: "该会话是语音会话".into(),
+            message: format!("session is a {}-channel session", session.channel),
+            user_message: user_message.into(),
             original_user_message_id: None,
         }));
     }
@@ -1885,6 +1890,56 @@ data: [DONE]\n\n";
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["code"], "unprocessable");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn stream_409_when_session_is_a_group(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id =
+            crate::routes::companion::testutil::seed_group_session(&pool, user_id).await;
+        let mut app = build_router(crate::routes::companion::test_state(pool.clone()));
+        let token = mint_jwt(user_id);
+        let body = serde_json::to_vec(
+            &json!({"content":"typed","client_msg_id":"01J2222222222222222222222G"}),
+        )
+        .unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/comp/chat/{session_id}/message/stream"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["code"], "wrong_channel");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn async_409_when_session_is_a_group(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id =
+            crate::routes::companion::testutil::seed_group_session(&pool, user_id).await;
+        let mut app = build_router(crate::routes::companion::test_state(pool.clone()));
+        let token = mint_jwt(user_id);
+        let body = serde_json::to_vec(
+            &json!({"content":"hi","client_msg_id":"01J5555555555555555555555G"}),
+        )
+        .unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/v2/comp/session/{session_id}/message/async"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["code"], "wrong_channel");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

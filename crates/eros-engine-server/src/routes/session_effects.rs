@@ -161,6 +161,14 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn effects_409_when_session_is_a_group(pool: sqlx::PgPool) {
+        let owner = Uuid::new_v4();
+        let group = crate::routes::companion::testutil::seed_group_session(&pool, owner).await;
+        let (status, _) = get(pool, group, owner).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn the_newest_turn_counts_as_step_one(pool: sqlx::PgPool) {
         let owner = Uuid::new_v4();
         let instance_id = seed_persona_instance(&pool, owner).await;

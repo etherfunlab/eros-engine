@@ -626,6 +626,9 @@ async fn edit_image(
     // Ownership and state first, body second: a caller must not learn that
     // their aspect_ratio was invalid on a session they do not own.
     let session = require_session_for_user(&state, session_id, user_id).await?;
+    if session.channel == "group" {
+        return Err(AppError::Conflict("wrong_channel".into()));
+    }
     let chat_repo = ChatRepo { pool: &state.pool };
     let source = chat_repo
         .message_by_id_in_session(session_id, message_id)
@@ -1133,6 +1136,37 @@ mod tests {
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(body.to_string()))
             .unwrap()
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn edit_on_a_group_is_wrong_channel(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let group = crate::routes::companion::testutil::seed_group_session(&pool, user_id).await;
+        let msg: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata) \
+             VALUES ($1, 'assistant', '', $2) RETURNING id",
+        )
+        .bind(group)
+        .bind(json!({"image": {"prompt": "x"}}))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let mut app = build_router(test_state(pool));
+        let (status, body) = send_request(
+            &mut app,
+            edit_req(
+                group,
+                msg,
+                &mint_test_jwt(user_id),
+                json!({"instruction": "换套衣服"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(
+            body["message"].to_string().contains("wrong_channel"),
+            "{body}"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

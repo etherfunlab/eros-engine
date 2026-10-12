@@ -273,8 +273,8 @@ async fn drive_turn(
         Err(e) => return TurnOutcome::Failure(format!("replay guard failed: {e}")),
     }
 
-    let row: Option<(String, Option<Uuid>)> = match sqlx::query_as(
-        "SELECT m.content, s.instance_id \
+    let row: Option<(String, Option<Uuid>, String)> = match sqlx::query_as(
+        "SELECT m.content, s.instance_id, s.channel \
          FROM engine.chat_messages m JOIN engine.chat_sessions s ON s.id = m.session_id \
          WHERE m.id = $1",
     )
@@ -285,7 +285,12 @@ async fn drive_turn(
         Ok(r) => r,
         Err(e) => return TurnOutcome::Failure(format!("turn load failed: {e}")),
     };
-    let Some((content, Some(instance_id))) = row else {
+    // A group turn has one attempt, run by its stream handler; a released claim
+    // is settled, never re-driven as a 1:1 turn (spec 2026-10-12 group chat §5.7).
+    if matches!(&row, Some((_, _, channel)) if channel == "group") {
+        return TurnOutcome::Unservable("group_turn_not_redriven".into());
+    }
+    let Some((content, Some(instance_id), _)) = row else {
         return TurnOutcome::Failure("user message or instance_id missing".into());
     };
 
@@ -412,6 +417,58 @@ mod worker_tests {
         })
         .await
         .expect("turn should reach a terminal status")
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn worker_settles_a_group_turn_without_driving_it(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let group = crate::routes::companion::testutil::seed_group_session(&pool, user_id).await;
+        let queue = eros_engine_store::chat_queue::ChatQueueRepo { pool: &pool };
+        let outcome = queue
+            .enqueue_user_message_claimed(
+                group,
+                "hi",
+                "01J6666666666666666666666G",
+                "user",
+                None,
+                user_id,
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        let eros_engine_store::chat_queue::ClaimedEnqueueOutcome::Claimed {
+            user_message_id,
+            queue_id,
+        } = outcome
+        else {
+            panic!("claimed");
+        };
+        let turn = eros_engine_store::chat_queue::ClaimedTurn {
+            queue_id,
+            session_id: group,
+            user_message_id,
+            user_id,
+            attempts: 1,
+            params: Some(serde_json::json!({})),
+        };
+        let state = crate::routes::companion::test_state(pool.clone());
+        let outcome = drive_turn(&state, &turn, None).await;
+        assert!(
+            matches!(outcome, TurnOutcome::Unservable(ref m) if m == "group_turn_not_redriven"),
+            "{outcome:?}"
+        );
+        settle_turn(&state, &turn, outcome, SettleMode::Ladder).await;
+        let (status, notices): (String, i64) = sqlx::query_as(
+            "SELECT q.status, (SELECT count(*) FROM engine.chat_messages \
+                               WHERE session_id = $2 AND role = 'system_error') \
+             FROM engine.chat_turn_queue q WHERE q.id = $1",
+        )
+        .bind(queue_id)
+        .bind(group)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((status.as_str(), notices), ("failed", 1));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

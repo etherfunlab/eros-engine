@@ -102,7 +102,11 @@ async fn assistant_row<'a>(
     message_id: Uuid,
     user_id: Uuid,
 ) -> Result<ChatRepo<'a>, AppError> {
-    require_session_for_user(state, session_id, user_id).await?;
+    let session = require_session_for_user(state, session_id, user_id).await?;
+    // Reactions are a 1:1 feature in v1 (spec 2026-10-12 group chat §7.1).
+    if session.channel == "group" {
+        return Err(AppError::Conflict("wrong_channel".into()));
+    }
     let repo = ChatRepo { pool: &state.pool };
     let row = repo
         .message_by_id_in_session(session_id, message_id)
@@ -255,6 +259,28 @@ mod tests {
         assert_eq!(other.emoji, "👍🏽");
         clear_reaction_for(&state, session, a, user).await.unwrap();
         clear_reaction_for(&state, session, a, user).await.unwrap();
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn clearing_a_reaction_on_a_group_is_wrong_channel(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let group = crate::routes::companion::testutil::seed_group_session(&pool, user_id).await;
+        let msg: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content) \
+             VALUES ($1, 'assistant', 'x') RETURNING id",
+        )
+        .bind(group)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let state = crate::routes::companion::test_state(pool.clone());
+        let err = clear_reaction_for(&state, group, msg, user_id)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, AppError::Conflict(m) if m == "wrong_channel"),
+            "{err:?}"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
