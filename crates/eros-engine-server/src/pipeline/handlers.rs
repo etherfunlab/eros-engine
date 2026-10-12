@@ -61,7 +61,7 @@ pub(crate) const CHAT_TASK: &str = "chat_companion";
 /// Maximum number of recent messages fetched per turn. This is the fetch size
 /// only: `history_window`'s ladder selects the injected subset from what this
 /// returned and never widens the query.
-const HISTORY_WINDOW: i64 = 20;
+pub(crate) const HISTORY_WINDOW: i64 = 20;
 
 /// Partition caller traits by a tier's resolved allow-list.
 /// - `allow == None` → no gating: all kept, none dropped.
@@ -780,6 +780,38 @@ pub(crate) async fn build_reply_request(
     user_id: Uuid,
     instance_id: Uuid,
     user_message_id: Uuid,
+    now: &crate::prompt::NowContext,
+    render_reactions: bool,
+    body_state: Option<&str>,
+) -> Result<(ChatRequest, Vec<String>), AppError> {
+    build_reply_request_with(
+        state,
+        input,
+        plan,
+        session_id,
+        user_id,
+        instance_id,
+        user_message_id,
+        now,
+        render_reactions,
+        body_state,
+        None,
+    )
+    .await
+}
+
+/// [`build_reply_request`] for one group speaker: `group` swaps the 1:1
+/// history for the group transcript seen from that speaker and appends its
+/// `[群聊]` block to the system prompt. `None` is the 1:1 request.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn build_reply_request_with(
+    state: &AppState,
+    input: &DecisionInput,
+    plan: &ActionPlan,
+    session_id: Uuid,
+    user_id: Uuid,
+    instance_id: Uuid,
+    user_message_id: Uuid,
     // `[now]`: the instant, the user's timezone and holiday window
     // (spec 2026-09-26 §5). Callers build it with `NowContext::for_user`.
     now: &crate::prompt::NowContext,
@@ -790,6 +822,7 @@ pub(crate) async fn build_reply_request(
     // 2026-10-12-given-item-lingering-effects-design.md §6.2). Only the text
     // turn passes one.
     body_state: Option<&str>,
+    group: Option<&crate::pipeline::group::GroupSpeakerView>,
 ) -> Result<(ChatRequest, Vec<String>), AppError> {
     let chat_repo = ChatRepo { pool: &state.pool };
     // A quote points at one line; it never narrows the window. Every turn gets
@@ -799,23 +832,33 @@ pub(crate) async fn build_reply_request(
         eros_engine_core::types::Event::UserMessage { quote, .. } => quote.as_ref(),
         _ => None,
     };
-    let history = {
-        // The window is anchored at the driving row, not at "now": it is the
-        // last row, with nothing newer around it. On the stream path the
-        // driving row IS the newest row, so this equals a newest-N fetch; on
-        // the async worker path a LIFO burst that landed while the turn sat
-        // queued would otherwise trail the driving row in the prompt, and
-        // the model answers whatever comes last (#330). Rows the burst's own
-        // turns will see are simply not this turn's context yet.
-        let rows = chat_repo
-            .history_up_to(session_id, user_message_id, HISTORY_WINDOW)
-            .await?;
-        if rows.is_empty() {
-            // Driving row not in this session at all — degrade to newest-N,
-            // matching the pre-anchor behavior for an absent driving row.
-            chat_repo.history(session_id, HISTORY_WINDOW, 0).await?
-        } else {
-            rows
+    let history = match group {
+        // The group transcript, bounded to this turn (spec §5.5).
+        Some(g) => {
+            chat_repo
+                .group_history_for_turn(g.group_session_id, user_message_id, HISTORY_WINDOW)
+                .await?
+        }
+        None => {
+            // The window is anchored at the driving row, not at "now": it is
+            // the last row, with nothing newer around it. On the stream path
+            // the driving row IS the newest row, so this equals a newest-N
+            // fetch; on the async worker path a LIFO burst that landed while
+            // the turn sat queued would otherwise trail the driving row in the
+            // prompt, and the model answers whatever comes last (#330). Rows
+            // the burst's own turns will see are simply not this turn's
+            // context yet.
+            let rows = chat_repo
+                .history_up_to(session_id, user_message_id, HISTORY_WINDOW)
+                .await?;
+            if rows.is_empty() {
+                // Driving row not in this session at all — degrade to
+                // newest-N, matching the pre-anchor behavior for an absent
+                // driving row.
+                chat_repo.history(session_id, HISTORY_WINDOW, 0).await?
+            } else {
+                rows
+            }
         }
     };
 
@@ -1006,10 +1049,31 @@ pub(crate) async fn build_reply_request(
         ));
     }
 
+    if let Some(g) = group {
+        system_prompt.push_str(&g.block);
+    }
+
     // Spec §4.6. Order is load-bearing: model_facing_history strips and drops,
     // the ladder selects from what survived, and echo cancellation runs last so
     // it keys on exactly the strings the provider receives.
-    let injected_history = if state.config.chat_noise_cancellation_disabled {
+    let injected_history = if let Some(g) = group {
+        // Group turns skip the 1:1 window ladder: the fetch above is already
+        // the window, and select_window would drop this turn's earlier
+        // speakers. The noise strip applies to the speaker's own lines only.
+        let speakers: std::collections::HashMap<Uuid, Option<Uuid>> = history
+            .iter()
+            .map(|m| (m.id, m.speaker_session_id))
+            .collect();
+        let raw = model_facing_history(history.clone(), false);
+        let stripped =
+            model_facing_history(history, !state.config.chat_noise_cancellation_disabled);
+        apply_echo_cancellation(
+            crate::pipeline::group::speaker_view(raw, stripped, &speakers, g),
+            user_message_id,
+            state.config.chat_echo_cancellation_disabled,
+            session_id,
+        )
+    } else if state.config.chat_noise_cancellation_disabled {
         apply_echo_cancellation(
             model_facing_history(history, false),
             user_message_id,
@@ -3128,6 +3192,156 @@ mod tests {
         assert!(
             system.contains("对方那边今天是中秋节、Mid-Autumn Festival"),
             "{system}"
+        );
+    }
+
+    /// A group turn reads the group transcript (bounded to this turn), seen
+    /// from the speaker: its own lines as `assistant`, everyone else's as
+    /// labelled `user` lines, and the `[群聊]` block closing the system prompt.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn build_reply_request_with_renders_the_group_view(pool: sqlx::PgPool) {
+        use crate::pipeline::group::GroupSpeakerView;
+        use std::collections::HashMap;
+
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, owner).await;
+        let member = make_session(&pool, owner, Some(instance_id)).await;
+        let other_instance = seed_persona_instance(&pool, owner).await;
+        let other = make_session(&pool, owner, Some(other_instance)).await;
+        let group: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, channel) VALUES ($1, 'group') RETURNING id",
+        )
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        async fn row(
+            pool: &sqlx::PgPool,
+            group: Uuid,
+            role: &str,
+            content: &str,
+            secs: f64,
+            user_message_id: Option<Uuid>,
+            speaker: Option<Uuid>,
+        ) -> Uuid {
+            sqlx::query_scalar(
+                "INSERT INTO engine.chat_messages \
+                   (session_id, role, content, sent_at, user_message_id, speaker_session_id) \
+                 VALUES ($1, $2, $3, now() + make_interval(secs => $4::float8), $5, $6) \
+                 RETURNING id",
+            )
+            .bind(group)
+            .bind(role)
+            .bind(content)
+            .bind(secs)
+            .bind(user_message_id)
+            .bind(speaker)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        }
+        let u1 = row(&pool, group, "user", "早", 0.0, None, None).await;
+        row(
+            &pool,
+            group,
+            "assistant",
+            "早呀",
+            1.0,
+            Some(u1),
+            Some(member),
+        )
+        .await;
+        let u2 = row(&pool, group, "user", "去哪爬", 2.0, None, None).await;
+        row(
+            &pool,
+            group,
+            "assistant",
+            "我想去香山",
+            3.0,
+            Some(u2),
+            Some(other),
+        )
+        .await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.config.chat_noise_cancellation_disabled = true;
+        let plan = ActionPlan {
+            action_type: eros_engine_core::types::ActionType::ReplyText,
+            reply_style: eros_engine_core::types::ReplyStyle::Neutral,
+            affinity_deltas: Default::default(),
+            energy_cost: 0.0,
+            context_hints: vec![],
+            reply_mode: None,
+            nudges: Default::default(),
+            clothing: None,
+            image_caption: None,
+            image_ref: eros_engine_core::types::ImageRef::Face,
+            aspect_ratio: None,
+            action_response: None,
+        };
+        let input = DecisionInput {
+            event: Event::UserMessage {
+                content: "去哪爬".into(),
+                message_id: u2,
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: MemoryScope::None,
+                affinity_scope: Default::default(),
+                quote: Default::default(),
+                action: None,
+                outfit: None,
+            },
+            affinity: ladder_test_affinity(member, owner, instance_id),
+            persona: ladder_test_persona(instance_id, owner),
+            signals: eros_engine_core::types::ConversationSignals {
+                message_count: 2,
+                hours_since_last_message: 0.1,
+                ghost_streak: 0,
+                hours_since_last_ghost: None,
+            },
+        };
+        let view = GroupSpeakerView {
+            group_session_id: group,
+            speaker_session_id: member,
+            names: HashMap::from([(member, "小美".to_string()), (other, "阿哲".to_string())]),
+            block: "\n\n[群聊]\nTEST-BLOCK".to_string(),
+        };
+
+        let (req, _tags) = build_reply_request_with(
+            &state,
+            &input,
+            &plan,
+            member,
+            owner,
+            instance_id,
+            u2,
+            &crate::prompt::NowContext::default(),
+            false,
+            None,
+            Some(&view),
+        )
+        .await
+        .expect("build_reply_request_with succeeds");
+
+        assert!(
+            req.messages[0].content.ends_with("[群聊]\nTEST-BLOCK"),
+            "{}",
+            req.messages[0].content
+        );
+        let rest: Vec<(&str, &str)> = req.messages[1..]
+            .iter()
+            .map(|m| (m.role.as_str(), m.content.as_str()))
+            .collect();
+        assert_eq!(
+            rest,
+            vec![
+                ("user", "用户：早"),
+                ("assistant", "早呀"),
+                ("user", "用户：去哪爬"),
+                ("user", "阿哲：我想去香山"),
+            ]
         );
     }
 

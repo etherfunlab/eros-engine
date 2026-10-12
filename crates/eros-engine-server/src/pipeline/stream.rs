@@ -70,6 +70,10 @@ pub enum ProtocolFrame {
         model: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         continues_from: Option<String>,
+        /// The group member speaking this message; absent on 1:1 turns, so a
+        /// 1:1 `meta` frame is byte-identical to before.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        speaker_session_id: Option<Uuid>,
     },
     Delta {
         message_id: String,
@@ -151,6 +155,33 @@ pub enum ProtocolFrame {
         user_message_id: Uuid,
         effects: Vec<eros_engine_core::effects::ActiveEffect>,
     },
+    // The three group variants are constructed by the group turn (Task 11 of
+    // the group-chat plan).
+    /// Group turns: who is about to speak, in order (after the director, or
+    /// after the rule fallback).
+    #[allow(dead_code)]
+    Cast {
+        speakers: Vec<CastEntry>,
+    },
+    /// Group turns: one reasoning delta from the director. Display only.
+    #[allow(dead_code)]
+    DirectorReasoning {
+        content: String,
+    },
+    /// Group turns: one speaker failed; the turn continues with the next.
+    /// Non-terminal, unlike `error`.
+    #[allow(dead_code)]
+    SpeakerError {
+        speaker_session_id: Uuid,
+        code: StreamErrorCode,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CastEntry {
+    pub member_session_id: Uuid,
+    pub action_type: FrameActionType,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -168,7 +199,7 @@ pub fn ulid_string(u: Ulid) -> String {
 /// Note the asymmetry: `ReplyText` collapses to `Reply` (wire `reply`), so a plain
 /// text turn is never reported as `reply_text`; only `ReplyTextImage` keeps its
 /// full name (`reply_text_image`). See [`FrameActionType`].
-fn frame_action_for(a: eros_engine_core::types::ActionType) -> FrameActionType {
+pub(crate) fn frame_action_for(a: eros_engine_core::types::ActionType) -> FrameActionType {
     match a {
         eros_engine_core::types::ActionType::ReplyImage => FrameActionType::ReplyImage,
         eros_engine_core::types::ActionType::ReplyTextImage => FrameActionType::ReplyTextImage,
@@ -279,7 +310,7 @@ pub(crate) fn build_delegated_image_marker(
 
 /// The three ordered frames of an image-only turn: `meta → done → image_request`.
 /// No image bytes; meta carries no model (the consumer selects it). Pure.
-fn delegated_image_only_frames(
+pub(crate) fn delegated_image_only_frames(
     message_id: String,
     composed_prompt: &str,
     image_ref: eros_engine_core::types::ImageRef,
@@ -291,6 +322,7 @@ fn delegated_image_only_frames(
             action_type: FrameActionType::ReplyImage,
             model: None,
             continues_from: None,
+            speaker_session_id: None,
         },
         ProtocolFrame::Done {
             message_id: message_id.clone(),
@@ -355,6 +387,49 @@ fn drive_chat_burst(
     session_id: Uuid,
     user_message_id: Uuid,
     frame_action: FrameActionType,
+    persist_action: &'static str,
+    plan_action: ActionType,
+    req: eros_engine_llm::openrouter::ChatRequest,
+    display_override: Option<eros_engine_llm::model_config::DisplayOverride>,
+    filter: Option<eros_engine_llm::model_config::ResolvedOutputFilter>,
+    trait_tags: Vec<String>,
+    tier: Option<String>,
+    memory_scope: eros_engine_core::scope::MemoryScope,
+    affinity_scope: eros_engine_core::scope::AffinityScope,
+    random_draw: Option<f64>,
+    outcome: std::sync::Arc<std::sync::Mutex<BurstOutcome>>,
+    chain: Vec<crate::byok::ChatHop>,
+) -> impl futures_util::Stream<Item = ProtocolFrame> + Send + 'static {
+    drive_chat_burst_for(
+        state,
+        session_id,
+        user_message_id,
+        frame_action,
+        persist_action,
+        plan_action,
+        req,
+        display_override,
+        filter,
+        trait_tags,
+        tier,
+        memory_scope,
+        affinity_scope,
+        random_draw,
+        outcome,
+        chain,
+        None,
+    )
+}
+
+/// [`drive_chat_burst`] for one group speaker: `speaker_session_id` is
+/// stamped on every assistant row the burst persists and on every `meta`
+/// frame it yields. `None` is the 1:1 burst.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn drive_chat_burst_for(
+    state: Arc<AppState>,
+    session_id: Uuid,
+    user_message_id: Uuid,
+    frame_action: FrameActionType,
     persist_action: &'static str, // "reply"
     plan_action: ActionType,
     req: eros_engine_llm::openrouter::ChatRequest,
@@ -367,6 +442,7 @@ fn drive_chat_burst(
     random_draw: Option<f64>, // sampled once per turn by run_stream; None when trigger.random is unset
     outcome: std::sync::Arc<std::sync::Mutex<BurstOutcome>>,
     chain: Vec<crate::byok::ChatHop>,
+    speaker_session_id: Option<Uuid>,
 ) -> impl futures_util::Stream<Item = ProtocolFrame> + Send + 'static {
     async_stream::stream! {
         let chat_repo = ChatRepo { pool: &state.pool };
@@ -485,6 +561,7 @@ fn drive_chat_burst(
                     action_type: frame_action,
                     model: hop_display(hop, display_override.as_ref(), &bare_model_id),
                     continues_from: continues_from.map(ulid_string),
+                    speaker_session_id,
                 };
 
                 // Per-attempt latency observability (spec §4.2). ttft = call →
@@ -780,7 +857,7 @@ fn drive_chat_burst(
                     } else {
                         build_metadata(None, &[])
                     },
-                    speaker_session_id: None,
+                    speaker_session_id,
                 };
                 if let Err(e) = chat_repo
                     .insert_assistant_batch(session_id, user_message_id, &[row])
@@ -879,6 +956,7 @@ fn drive_chat_burst(
                             task_name,
                             chain.len(),
                             &chain_failures,
+                            speaker_session_id,
                         )
                         .await;
                         {
@@ -915,6 +993,7 @@ fn drive_chat_burst(
                             task_name,
                             chain.len(),
                             &chain_failures,
+                            speaker_session_id,
                         )
                         .await
                     };
@@ -1171,7 +1250,7 @@ fn drive_chat_burst(
                         } else {
                             build_metadata(None, &[])
                         },
-                        speaker_session_id: None,
+                        speaker_session_id,
                     };
                     if let Err(e) = chat_repo
                         .insert_assistant_batch(session_id, user_message_id, &[row])
@@ -1212,6 +1291,7 @@ fn drive_chat_burst(
                         action_type: frame_action,
                         model: hop_display(hop, display_override.as_ref(), &bare_model_id),
                         continues_from: None,
+                        speaker_session_id,
                     };
                     // Forward the served usage (a provider can emit a usage block
                     // on an otherwise-empty completion) — same wire contract as the
@@ -1259,6 +1339,7 @@ fn drive_chat_burst(
                             task_name,
                             chain.len(),
                             &chain_failures,
+                            speaker_session_id,
                         )
                         .await
                     };
@@ -1306,6 +1387,7 @@ fn drive_chat_burst(
                 action_type: frame_action,
                 model: hop_display(hop, display_override.as_ref(), &bare_model_id),
                 continues_from: None,
+                speaker_session_id,
             };
 
             // Layer 0: deterministic per-model strip, before client emit, the
@@ -1432,6 +1514,7 @@ fn drive_chat_burst(
                                             action_type: frame_action,
                                             model: hop_display(hop, display_override.as_ref(), &bare_model_id),
                                             continues_from: None,
+                                            speaker_session_id,
                                         };
                                     }
                                     FilterEvent::AttemptAborted { had_emitted: false } => {}
@@ -1542,7 +1625,7 @@ fn drive_chat_burst(
                 } else {
                     build_metadata(filter_failure.as_ref(), &filter_attempts)
                 },
-                speaker_session_id: None,
+                speaker_session_id,
             };
             if let Err(e) = chat_repo.insert_assistant_batch(session_id, user_message_id, &[row]).await {
                 tracing::warn!("stream(filtered): persist failed: {e}");
@@ -1893,7 +1976,7 @@ pub(crate) fn split_failures(
 /// serialises this function's output for the database, so there is a single
 /// `match` and the wire and the row can never disagree about which side a
 /// failure lands on.
-fn split_failures_typed(
+pub(crate) fn split_failures_typed(
     failures: &[eros_engine_llm::failure::AttemptFailure],
 ) -> (
     Vec<eros_engine_llm::failure::UpstreamAttempt>,
@@ -2274,7 +2357,7 @@ const INNER_STATE_MAX_CHARS: usize = 200;
 /// headers / structural markers, strips `[`/`]` tokens and control characters,
 /// collapses whitespace, and caps length. Returns plain single-line prose
 /// (`""` ⇒ caller treats as no hint).
-fn sanitize_inner_state(raw: &str) -> String {
+pub(crate) fn sanitize_inner_state(raw: &str) -> String {
     let joined = raw
         .lines()
         .map(str::trim)
@@ -2531,7 +2614,7 @@ async fn run_pde_decision(
 /// `self.resolve(COMPOSE_TASK, None)`, which advances the round-robin model
 /// cursor as a side effect, so calling it merely to answer a capability
 /// question would skew which model later image turns actually pick.
-fn image_capability_available(
+pub(crate) fn image_capability_available(
     executor_available: bool,
     model_config: &eros_engine_llm::model_config::ModelConfig,
 ) -> bool {
@@ -3707,7 +3790,7 @@ fn resolve_image_turn_inputs(
 /// Everything the two delegated-image call sites need. `style` is deliberately
 /// absent: it is consumed internally by `compose_image_prompt` and neither
 /// caller uses it afterwards.
-struct DelegatedImagePrompt {
+pub(crate) struct DelegatedImagePrompt {
     /// What described the picture — feeds `build_delegated_image_marker`'s
     /// `prompt` key. The composer's decided subject on the compose path
     /// (spec 2026-08-02: this is deliberately the SHORT subject, not the
@@ -3715,27 +3798,27 @@ struct DelegatedImagePrompt {
     /// is never persisted); empty when the composer is skipped (not
     /// configured, or `raw`) or the compose call fails — there is no seed left
     /// to fall back to, so an empty subject is the portrait fallback (#212).
-    subject: String,
+    pub(crate) subject: String,
     /// Short description of the picture, persisted as `metadata.image.caption`
     /// and read by every history-facing render. `None` on a failed compose or
     /// when the task is not configured.
-    caption: Option<String>,
+    pub(crate) caption: Option<String>,
     /// Effective aspect ratio — feeds the marker and the wire frame.
-    aspect_ratio: Option<String>,
+    pub(crate) aspect_ratio: Option<String>,
     /// Final wire prompt — feeds the wire frame.
-    composed_prompt: String,
+    pub(crate) composed_prompt: String,
     /// Audit trio — `Some` only when the composer call succeeded; feeds the
     /// marker's `compose_*` keys (spec 2026-08-02).
-    compose_variant: Option<String>,
-    compose_model: Option<String>,
-    compose_generation_id: Option<String>,
+    pub(crate) compose_variant: Option<String>,
+    pub(crate) compose_model: Option<String>,
+    pub(crate) compose_generation_id: Option<String>,
     /// The `chat_images_events` row this compose produced; `None` when the
     /// audit write failed.
-    compose_event_id: Option<Uuid>,
+    pub(crate) compose_event_id: Option<Uuid>,
     /// The composer chain's failed hops, carried out so the turn's `final`
     /// frame can report them (spec §6.1). Empty when the composer succeeded
     /// first try, or was never configured.
-    failures: Vec<eros_engine_llm::failure::AttemptFailure>,
+    pub(crate) failures: Vec<eros_engine_llm::failure::AttemptFailure>,
 }
 
 /// Guards a speculatively-spawned `tokio::task::JoinHandle` so it is aborted
@@ -3751,7 +3834,7 @@ struct DelegatedImagePrompt {
 /// letting it run to completion would just waste an LLM round trip. Wrapping
 /// the handle in this guard means every current AND future early exit aborts
 /// the task automatically, instead of requiring each one to remember to.
-struct AbortOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
+pub(crate) struct AbortOnDrop<T>(pub(crate) Option<tokio::task::JoinHandle<T>>);
 
 impl<T> AbortOnDrop<T> {
     /// Await the guarded task WITHOUT releasing the guard. `JoinHandle` is
@@ -3763,7 +3846,7 @@ impl<T> AbortOnDrop<T> {
     /// run on with no consumer. After a completed await the handle stays put;
     /// aborting a finished task is a no-op, so the drop-time abort is
     /// harmless.
-    async fn join(&mut self) -> Option<Result<T, tokio::task::JoinError>> {
+    pub(crate) async fn join(&mut self) -> Option<Result<T, tokio::task::JoinError>> {
         match self.0.as_mut() {
             Some(h) => Some(h.await),
             None => None,
@@ -3788,7 +3871,7 @@ impl<T> Drop for AbortOnDrop<T> {
 /// image turn. `compose_image_prompt` turns that empty subject into a plain
 /// persona-appearance portrait prompt (#212).
 #[allow(clippy::too_many_arguments)]
-async fn build_delegated_image_prompt(
+pub(crate) async fn build_delegated_image_prompt(
     state: &AppState,
     persona: &eros_engine_core::persona::CompanionPersona,
     plan: &eros_engine_core::types::ActionPlan,
@@ -3982,6 +4065,7 @@ async fn build_stream_failure_pseudo_ghost(
     task_name: &str,
     chain_len: usize,
     chain_failures: &[eros_engine_llm::failure::AttemptFailure],
+    speaker_session_id: Option<Uuid>,
 ) -> Option<(
     Vec<ProtocolFrame>,
     crate::pipeline::post_process::ProducedMessage,
@@ -4059,7 +4143,7 @@ async fn build_stream_failure_pseudo_ghost(
         generation_id: None,
         filter_audit: None,
         metadata,
-        speaker_session_id: None,
+        speaker_session_id,
     };
     if let Err(e) = chat_repo
         .insert_assistant_batch(session_id, user_message_id, &[row])
@@ -4075,6 +4159,7 @@ async fn build_stream_failure_pseudo_ghost(
             action_type: frame_action,
             model: None,
             continues_from: continues_from_ulid.map(ulid_string),
+            speaker_session_id,
         },
         ProtocolFrame::Delta {
             message_id: ulid_string(msg_ulid),
@@ -4123,6 +4208,7 @@ async fn build_garble_repaired_replacement(
     task_name: &str,
     chain_len: usize,
     chain_failures: &[eros_engine_llm::failure::AttemptFailure],
+    speaker_session_id: Option<Uuid>,
 ) -> (
     Vec<ProtocolFrame>,
     crate::pipeline::post_process::ProducedMessage,
@@ -4180,7 +4266,7 @@ async fn build_garble_repaired_replacement(
         generation_id: None,
         filter_audit: None,
         metadata,
-        speaker_session_id: None,
+        speaker_session_id,
     };
     if let Err(e) = chat_repo
         .insert_assistant_batch(session_id, user_message_id, &[row])
@@ -4195,6 +4281,7 @@ async fn build_garble_repaired_replacement(
             action_type: frame_action,
             model: None,
             continues_from: continues_from_ulid.map(ulid_string),
+            speaker_session_id,
         },
         ProtocolFrame::Delta {
             message_id: ulid_string(msg_ulid),
@@ -4641,6 +4728,7 @@ pub(crate) fn run_stream_with(
                     action_type: FrameActionType::Ghost,
                     model: None,
                     continues_from: None,
+                    speaker_session_id: None,
                 };
                 yield ProtocolFrame::Done {
                     message_id: ulid_string(msg_id),
@@ -4687,6 +4775,7 @@ pub(crate) fn run_stream_with(
                     action_type: FrameActionType::ProductQa,
                     model: None,
                     continues_from: None,
+                    speaker_session_id: None,
                 };
 
                 // Executor payload: recent product-QA pairs (shared fetch) + question.
@@ -5761,7 +5850,7 @@ pub(crate) fn run_stream_with(
 /// and runs after the response is out, so "no affinity judgment this turn" is
 /// a normal state a consumer cannot act on.
 #[allow(clippy::too_many_arguments)]
-fn build_final_frame(
+pub(crate) fn build_final_frame(
     filtered: bool,
     prompt_injected: Option<Vec<String>>,
     tier: Option<String>,
@@ -5806,6 +5895,7 @@ pub fn replay_stream(
                 action_type: FrameActionType::Ghost,
                 model: None,
                 continues_from: None,
+                speaker_session_id: None,
             };
             yield ProtocolFrame::Done {
                 message_id: ulid_string(msg_id),
@@ -5845,6 +5935,9 @@ pub fn replay_stream(
                             .and_then(|d| d.display(&eros_engine_llm::provider::bare_model_id(m)))
                     }),
                     continues_from: prev_ulid.map(ulid_string),
+                    // A replayed group turn keeps its speakers; 1:1 rows have
+                    // none, so their frames stay as they were.
+                    speaker_session_id: row.msg.speaker_session_id,
                 };
                 if !row.msg.content.is_empty() {
                     yield ProtocolFrame::Delta {
@@ -6059,6 +6152,7 @@ mod tests {
             action_type: FrameActionType::Reply,
             model: Some("x-ai/grok-4-fast".into()),
             continues_from: None,
+            speaker_session_id: None,
         };
         let s = serde_json::to_string(&f).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
@@ -6080,6 +6174,7 @@ mod tests {
             action_type: FrameActionType::Reply,
             model: Some("x-ai/grok-4-fast".into()),
             continues_from: Some(prev.clone()),
+            speaker_session_id: None,
         };
         let v: serde_json::Value = serde_json::to_value(&f).unwrap();
         assert_eq!(v["continues_from"], prev);
@@ -6092,10 +6187,71 @@ mod tests {
             action_type: FrameActionType::Ghost,
             model: None,
             continues_from: None,
+            speaker_session_id: None,
         };
         let v: serde_json::Value = serde_json::to_value(&f).unwrap();
         assert_eq!(v["type"], "meta");
         assert!(v.get("model").is_none(), "model must be omitted when None");
+    }
+
+    #[test]
+    fn meta_omits_the_speaker_on_1to1_and_carries_it_on_groups() {
+        let one = serde_json::to_string(&ProtocolFrame::Meta {
+            message_id: "m".into(),
+            action_type: FrameActionType::Reply,
+            model: None,
+            continues_from: None,
+            speaker_session_id: None,
+        })
+        .unwrap();
+        assert_eq!(
+            one,
+            r#"{"type":"meta","message_id":"m","action_type":"reply"}"#
+        );
+        let s = Uuid::nil();
+        let grp = serde_json::to_value(&ProtocolFrame::Meta {
+            message_id: "m".into(),
+            action_type: FrameActionType::Reply,
+            model: None,
+            continues_from: None,
+            speaker_session_id: Some(s),
+        })
+        .unwrap();
+        assert_eq!(grp["speaker_session_id"], s.to_string());
+    }
+
+    #[test]
+    fn group_frames_serialize() {
+        let s = Uuid::nil();
+        let cast = serde_json::to_value(&ProtocolFrame::Cast {
+            speakers: vec![CastEntry {
+                member_session_id: s,
+                action_type: FrameActionType::ReplyTextImage,
+            }],
+        })
+        .unwrap();
+        assert_eq!(
+            cast,
+            serde_json::json!({"type":"cast","speakers":[{"member_session_id": s.to_string(),"action_type":"reply_text_image"}]})
+        );
+        let r = serde_json::to_value(&ProtocolFrame::DirectorReasoning {
+            content: "想".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            r,
+            serde_json::json!({"type":"director_reasoning","content":"想"})
+        );
+        let e = serde_json::to_value(&ProtocolFrame::SpeakerError {
+            speaker_session_id: s,
+            code: StreamErrorCode::UpstreamUnavailable,
+            message: "x".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            e,
+            serde_json::json!({"type":"speaker_error","speaker_session_id": s.to_string(),"code":"upstream_unavailable","message":"x"})
+        );
     }
 
     #[test]
@@ -11793,6 +11949,9 @@ data: [DONE]\n\n";
                 ProtocolFrame::ImageRequest { .. } => "image_request",
                 ProtocolFrame::ActionResponse { .. } => "action_response",
                 ProtocolFrame::BodyState { .. } => "body_state",
+                ProtocolFrame::Cast { .. } => "cast",
+                ProtocolFrame::DirectorReasoning { .. } => "director_reasoning",
+                ProtocolFrame::SpeakerError { .. } => "speaker_error",
             };
             if out.last() != Some(&kind) {
                 out.push(kind);
