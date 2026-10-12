@@ -1494,6 +1494,77 @@
         ]
       }
     },
+    "/v2/comp/session/{session_id}/effects": {
+      "get": {
+        "tags": [
+          "companion"
+        ],
+        "summary": "The persona's lingering state from accepted gives, as a text turn sent now\nwould carry it.",
+        "operationId": "get_effects",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Chat session id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EffectsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v2/comp/session/{session_id}/message/async": {
       "post": {
         "tags": [
@@ -3131,6 +3202,79 @@
         "properties": {
           "content": {
             "type": "string"
+          }
+        }
+      },
+      "EffectPhaseDto": {
+        "type": "string",
+        "description": "Where an effect is on its curve.",
+        "enum": [
+          "rising",
+          "peak",
+          "fading"
+        ]
+      },
+      "EffectView": {
+        "type": "object",
+        "description": "One active effect. Also the element shape of the `body_state` stream frame.",
+        "required": [
+          "item",
+          "quantity",
+          "level",
+          "phase",
+          "step",
+          "steps"
+        ],
+        "properties": {
+          "item": {
+            "$ref": "#/components/schemas/GivenItemDto"
+          },
+          "level": {
+            "type": "integer",
+            "format": "int32",
+            "description": "1–4; 4 only for a quantity above 5.",
+            "minimum": 0
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "phase": {
+            "$ref": "#/components/schemas/EffectPhaseDto"
+          },
+          "quantity": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "step": {
+            "type": "integer",
+            "format": "int32",
+            "description": "This turn's step, 1-based.",
+            "minimum": 0
+          },
+          "steps": {
+            "type": "integer",
+            "format": "int32",
+            "description": "How many turns the effect lasts: `min(quantity, 5)`.",
+            "minimum": 0
+          }
+        }
+      },
+      "EffectsResponse": {
+        "type": "object",
+        "required": [
+          "effects"
+        ],
+        "properties": {
+          "effects": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EffectView"
+            },
+            "description": "Newest give first; empty when nothing is at work."
           }
         }
       },
