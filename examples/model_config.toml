@@ -87,6 +87,15 @@ params = { reasoning = { effort = "medium" } }
 #tasks  = ["chat_vision"]
 #params = { reasoning_effort = "none" }
 #
+# Judge reasoning (optional). The PDE judge streams; with this rule its
+# reasoning reaches the 1:1 client as `reasoning` frames ahead of the reply and
+# is kept on the decision audit row. Reasoning tokens count against the task's
+# `max_tokens`, and the reply waits for the judge — raise
+# `[tasks.pde_decision].max_tokens` and `timeout_secs` together with it.
+#[[providers.openrouter.body]]
+#tasks  = ["pde_decision"]
+#params = { reasoning = { effort = "low" } }
+#
 # OpenRouter routing prefs (the former [defaults].ignore_providers /
 # provider_sort) are now body params on the reserved openrouter entry —
 # bare provider slugs, no @openrouter suffix:
@@ -722,6 +731,7 @@ temperature = 0.3
 max_tokens  = 400
 #ghosting    = false   # uncomment to hard-disable ghosting for this deployment
 #structured_output = true   # send response_format=json_schema on the judge (default true); set false if your provider 400s on it
+#timeout_secs = 15         # per-attempt limit, opening through finishing the read; raise it when reasoning is on
 # Uncomment filter_prompt to enable the LLM judge. inner_state / clothing MUST be
 # short prose — NEVER instructions or formatting (they are sanitized, but keep
 # the model honest). Output JSON only, no code fences.

@@ -869,6 +869,11 @@ pub struct TaskConfig {
     /// (other tasks ignore it), like `input_filter`.
     #[serde(default)]
     pub ghosting: Option<bool>,
+    /// PDE-only: the judge's per-attempt time limit in seconds, from opening
+    /// the call through finishing the read. Absent ⇒ `DEFAULT_PDE_TIMEOUT_SECS`.
+    /// Read only on `[tasks.pde_decision]`, like `ghosting`.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
     /// PDE-only: send `response_format = json_schema` on the judge request to
     /// raise JSON adherence. Absent/`true` ⇒ on; `false` ⇒ off (escape hatch for
     /// a provider that rejects the param). Read only on `[tasks.pde_decision]`.
@@ -1251,7 +1256,12 @@ pub struct ResolvedPde {
     pub structured_output: bool,
     /// Optional sampling knobs from the task block (issue #246).
     pub sampling: Sampling,
+    /// Per-attempt limit for the judge call.
+    pub timeout: std::time::Duration,
 }
+
+/// The PDE judge's per-attempt limit when `timeout_secs` is absent.
+pub const DEFAULT_PDE_TIMEOUT_SECS: u64 = 15;
 
 /// Resolved group director task (`group_director`). The configured
 /// `filter_prompt` is the director's system instruction; the engine builds the
@@ -1886,6 +1896,9 @@ impl ModelConfig {
             retry_depth,
             structured_output: task_cfg.structured_output.unwrap_or(true),
             sampling: m.sampling,
+            timeout: std::time::Duration::from_secs(
+                task_cfg.timeout_secs.unwrap_or(DEFAULT_PDE_TIMEOUT_SECS),
+            ),
         })
     }
 
@@ -1924,6 +1937,19 @@ impl ModelConfig {
                 "[tasks.group_director] is present but its filter_prompt is unset — eros-engine \
                  refuses to boot. Set a filter_prompt, or remove the [tasks.group_director] \
                  section so every group member answers in join order."
+                    .to_string(),
+            ),
+            _ => Ok(()),
+        }
+    }
+
+    /// Boot check: `timeout_secs = 0` would time the judge out on every turn.
+    pub fn validate_pde_timeout(&self) -> Result<(), String> {
+        match self.tasks.get("pde_decision").and_then(|t| t.timeout_secs) {
+            Some(0) => Err(
+                "[tasks.pde_decision].timeout_secs = 0 — the judge would time out on every \
+                 turn and always fall back to the rule engine; eros-engine refuses to boot. \
+                 Remove the key (default 15) or set a positive number of seconds."
                     .to_string(),
             ),
             _ => Ok(()),
@@ -5414,6 +5440,51 @@ filter_prompt = "   "
         let p = cfg.resolve_pde().expect("resolves");
         assert_eq!(p.model, "m");
         assert_eq!(p.decision_prompt, "decide");
+    }
+
+    #[test]
+    fn resolve_pde_timeout_defaults_to_15s_else_field() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.pde_decision]\nmodel = \"m\"\nfilter_prompt = \"d\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.resolve_pde().unwrap().timeout,
+            std::time::Duration::from_secs(15)
+        );
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.pde_decision]\nmodel = \"m\"\nfilter_prompt = \"d\"\ntimeout_secs = 45\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.resolve_pde().unwrap().timeout,
+            std::time::Duration::from_secs(45)
+        );
+    }
+
+    #[test]
+    fn validate_pde_timeout_refuses_zero() {
+        assert!(ModelConfig::from_toml_str("")
+            .unwrap()
+            .validate_pde_timeout()
+            .is_ok());
+        let ok =
+            ModelConfig::from_toml_str("[tasks.pde_decision]\nmodel = \"m\"\ntimeout_secs = 1\n")
+                .unwrap();
+        assert!(ok.validate_pde_timeout().is_ok());
+        let zero =
+            ModelConfig::from_toml_str("[tasks.pde_decision]\nmodel = \"m\"\ntimeout_secs = 0\n")
+                .unwrap();
+        let err = zero.validate_pde_timeout().unwrap_err();
+        assert!(err.contains("[tasks.pde_decision].timeout_secs"), "{err}");
+    }
+
+    #[test]
+    fn timeout_secs_on_another_task_is_ignored() {
+        let cfg =
+            ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel = \"m\"\ntimeout_secs = 0\n")
+                .unwrap();
+        assert!(cfg.validate_pde_timeout().is_ok());
     }
 
     #[test]

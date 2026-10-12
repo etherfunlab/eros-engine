@@ -18746,6 +18746,7 @@ data: [DONE]\n\n";
             retry_depth: 2,
             structured_output: true,
             sampling: Default::default(),
+            timeout: std::time::Duration::from_secs(15),
         }
     }
 

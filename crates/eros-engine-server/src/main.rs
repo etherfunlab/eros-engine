@@ -340,6 +340,9 @@ async fn run_server() -> Result<()> {
     if let Err(msg) = model_config.validate_group_director_prompt() {
         anyhow::bail!(msg);
     }
+    if let Err(msg) = model_config.validate_pde_timeout() {
+        anyhow::bail!(msg);
+    }
     // Hard prerequisite (spec §1.1): product_qa is judge-routed only. With the
     // LLM PDE off the action is unreachable — warn once and stay inert rather
     // than refusing to boot ("此功能不启用").
