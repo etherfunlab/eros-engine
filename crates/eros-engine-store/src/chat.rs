@@ -188,6 +188,13 @@ pub struct ChatMessageSlim {
 }
 
 /// The `ChatMessageSlim` projection, shared by every query that decodes one.
+/// The assistant rows answering one user message, oldest first.
+const REPLAY_CHAIN_SQL: &str = "SELECT m.*, g.model AS g_model, g.usage AS g_usage \
+     FROM engine.chat_messages m \
+     LEFT JOIN engine.llm_generations g ON g.generation_id = m.generation_id \
+     WHERE m.user_message_id = $1 AND m.role = 'assistant' \
+     ORDER BY m.sent_at ASC";
+
 const SLIM_COLUMNS: &str = "id, role, content, sent_at, client_msg_id, \
      channel, read_at, reaction, reacted_at, \
      (metadata->'image' IS NOT NULL) AS image, \
@@ -243,6 +250,18 @@ impl<'a> ChatRepo<'a> {
         .bind(channel)
         .fetch_one(self.pool)
         .await
+    }
+
+    /// The assistant rows answering `user_message_id`, oldest first; the same
+    /// chain `upsert_user_message_idempotent` returns on a replay.
+    pub async fn replay_chain(
+        &self,
+        user_message_id: Uuid,
+    ) -> Result<Vec<ReplayMessage>, sqlx::Error> {
+        sqlx::query_as::<_, ReplayMessage>(REPLAY_CHAIN_SQL)
+            .bind(user_message_id)
+            .fetch_all(self.pool)
+            .await
     }
 
     /// Look up a session by id. Archived sessions do not resolve — soft-delete
@@ -933,16 +952,11 @@ pub(crate) async fn upsert_user_message_in_tx(
     .await?;
 
     if let Some(row) = existing {
-        let assistant_chain: Vec<ReplayMessage> = sqlx::query_as::<_, ReplayMessage>(
-            "SELECT m.*, g.model AS g_model, g.usage AS g_usage \
-             FROM engine.chat_messages m \
-             LEFT JOIN engine.llm_generations g ON g.generation_id = m.generation_id \
-             WHERE m.user_message_id = $1 AND m.role = 'assistant' \
-             ORDER BY m.sent_at ASC",
-        )
-        .bind(row.id)
-        .fetch_all(&mut **tx)
-        .await?;
+        let assistant_chain: Vec<ReplayMessage> =
+            sqlx::query_as::<_, ReplayMessage>(REPLAY_CHAIN_SQL)
+                .bind(row.id)
+                .fetch_all(&mut **tx)
+                .await?;
 
         return Ok(if !assistant_chain.is_empty() {
             UpsertUserOutcome::Replay {
@@ -2709,6 +2723,53 @@ mod tests {
             }
             other => panic!("expected Inserted, got {other:?}"),
         }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn replay_chain_lists_the_assistant_rows_in_order(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let s = repo.create_session(user_id, instance_id).await.unwrap();
+        let um = match repo
+            .upsert_user_message_idempotent(
+                s.id,
+                "hello",
+                "01J0000000000000000000000B",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            o => panic!("expected Inserted, got {o:?}"),
+        };
+        assert!(repo.replay_chain(um).await.unwrap().is_empty());
+        for text in ["one", "two"] {
+            repo.insert_assistant_batch(
+                s.id,
+                um,
+                &[AssistantInsert {
+                    llm_attempts: None,
+                    gateway_errors: None,
+                    id: Uuid::new_v4(),
+                    content: text.into(),
+                    assistant_action_type: "reply".into(),
+                    continues_from_message_id: None,
+                    truncated: false,
+                    generation_id: None,
+                    filter_audit: None,
+                    metadata: None,
+                    speaker_session_id: None,
+                }],
+            )
+            .await
+            .unwrap();
+        }
+        let chain = repo.replay_chain(um).await.unwrap();
+        let texts: Vec<&str> = chain.iter().map(|r| r.msg.content.as_str()).collect();
+        assert_eq!(texts, ["one", "two"]);
     }
 
     #[sqlx::test(migrations = "./migrations")]

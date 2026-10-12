@@ -600,6 +600,15 @@ async fn send_group_message_stream(
                 if status.as_deref() == Some("claimed") {
                     return Err(duplicate_in_progress(user_message_id));
                 }
+                // The chain captured above may predate later speakers; reload
+                // it now that the turn is settled.
+                let assistant_chain = if assistant_chain.is_empty() {
+                    assistant_chain
+                } else {
+                    eros_engine_store::chat::ChatRepo { pool: &state.pool }
+                        .replay_chain(user_message_id)
+                        .await?
+                };
                 Box::pin(crate::pipeline::stream::replay_stream(
                     std::sync::Arc::new(state.clone()),
                     group_id,
