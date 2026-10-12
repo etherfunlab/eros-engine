@@ -56,6 +56,41 @@ pub struct MemoryRepo<'a> {
     pub pool: &'a PgPool,
 }
 
+/// The one INSERT behind `MemoryRepo::upsert` and `upsert_if_live`.
+#[allow(clippy::too_many_arguments)] // each arg is a distinct concern
+async fn insert<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    layer: MemoryLayer,
+    session_id: Uuid,
+    user_id: Uuid,
+    instance_id: Option<Uuid>,
+    content: &str,
+    embedding: &[f32],
+    category: Option<&str>,
+    metadata: Option<&serde_json::Value>,
+) -> Result<Uuid, sqlx::Error> {
+    let resolved_instance = match layer {
+        MemoryLayer::Profile => None,
+        MemoryLayer::Relationship => instance_id,
+    };
+    let vec_text = format_vector(embedding);
+
+    sqlx::query_scalar(
+        "INSERT INTO engine.companion_memories \
+             (session_id, user_id, instance_id, content, embedding, category, metadata) \
+         VALUES ($1, $2, $3, $4, $5::vector, $6, $7) RETURNING id",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .bind(resolved_instance)
+    .bind(content)
+    .bind(vec_text)
+    .bind(category)
+    .bind(metadata)
+    .fetch_one(executor)
+    .await
+}
+
 impl<'a> MemoryRepo<'a> {
     /// Insert a memory row. For `Profile`, `instance_id` is forced to `None`.
     /// For `Relationship`, the caller MUST pass `Some(instance_id)`.
@@ -73,27 +108,60 @@ impl<'a> MemoryRepo<'a> {
         category: Option<&str>,
         metadata: Option<&serde_json::Value>,
     ) -> Result<Uuid, sqlx::Error> {
-        let resolved_instance = match layer {
-            MemoryLayer::Profile => None,
-            MemoryLayer::Relationship => instance_id,
-        };
-        let vec_text = format_vector(embedding);
-
-        let id: Uuid = sqlx::query_scalar(
-            "INSERT INTO engine.companion_memories \
-                 (session_id, user_id, instance_id, content, embedding, category, metadata) \
-             VALUES ($1, $2, $3, $4, $5::vector, $6, $7) RETURNING id",
+        insert(
+            self.pool,
+            layer,
+            session_id,
+            user_id,
+            instance_id,
+            content,
+            embedding,
+            category,
+            metadata,
         )
-        .bind(session_id)
-        .bind(user_id)
-        .bind(resolved_instance)
-        .bind(content)
-        .bind(vec_text)
-        .bind(category)
-        .bind(metadata)
-        .fetch_one(self.pool)
+        .await
+    }
+
+    /// `upsert`, but only while `live_session_id` is live, checked and written
+    /// in one transaction that holds the session row (see
+    /// `session_archive::lock_live_session`). `None` = the session is archived
+    /// or unknown and nothing was written.
+    ///
+    /// `live_session_id` is the session whose archive deletes this row, which
+    /// is not always the row's own `session_id`: a group turn files its
+    /// relationship rows under the group but they belong to each member's
+    /// relationship.
+    #[allow(clippy::too_many_arguments)] // upsert's arguments plus the session to check
+    pub async fn upsert_if_live(
+        &self,
+        live_session_id: Uuid,
+        layer: MemoryLayer,
+        session_id: Uuid,
+        user_id: Uuid,
+        instance_id: Option<Uuid>,
+        content: &str,
+        embedding: &[f32],
+        category: Option<&str>,
+        metadata: Option<&serde_json::Value>,
+    ) -> Result<Option<Uuid>, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        if !crate::session_archive::lock_live_session(&mut tx, live_session_id).await? {
+            return Ok(None);
+        }
+        let id = insert(
+            &mut *tx,
+            layer,
+            session_id,
+            user_id,
+            instance_id,
+            content,
+            embedding,
+            category,
+            metadata,
+        )
         .await?;
-        Ok(id)
+        tx.commit().await?;
+        Ok(Some(id))
     }
 
     /// Top-K profile-layer rows per category, for rows with `category` set
@@ -188,7 +256,7 @@ impl<'a> MemoryRepo<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::seed_persona_instance;
+    use crate::testutil::{seed_persona_instance, seed_session};
 
     fn unit_embedding(seed: usize) -> Vec<f32> {
         // Generate a deterministic 512-dim vector with a single hot index.
@@ -511,6 +579,95 @@ mod tests {
             .unwrap();
         assert_eq!(rel_hits.len(), 1);
         assert_eq!(rel_hits[0].content, "relationship fact");
+    }
+
+    /// The session checked is `live_session_id`, not the row's `session_id`:
+    /// a group's relationship row is filed under the group but dies with the
+    /// member's relationship, so here the row's session stays live and only
+    /// the checked one is archived.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn upsert_if_live_writes_nothing_for_an_archived_session(pool: PgPool) {
+        let repo = MemoryRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let row_session = seed_session(&pool, user_id, instance_id, false).await;
+        let archived = seed_session(&pool, user_id, instance_id, true).await;
+
+        let written = repo
+            .upsert_if_live(
+                archived,
+                MemoryLayer::Relationship,
+                row_session,
+                user_id,
+                Some(instance_id),
+                "user lives in shanghai",
+                &unit_embedding(7),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(written, None, "an archived session is skipped");
+
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM engine.companion_memories WHERE user_id = $1")
+                .bind(user_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 0, "nothing is written for an archived session");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn upsert_if_live_writes_what_upsert_writes_on_a_live_session(pool: PgPool) {
+        let repo = MemoryRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id, false).await;
+        let meta = serde_json::json!({ "confidence": "high" });
+
+        let id = repo
+            .upsert_if_live(
+                session_id,
+                MemoryLayer::Relationship,
+                session_id,
+                user_id,
+                Some(instance_id),
+                "user lives in shanghai",
+                &unit_embedding(7),
+                Some("fact"),
+                Some(&meta),
+            )
+            .await
+            .unwrap()
+            .expect("a live session is written");
+
+        let row: MemoryRow = sqlx::query_as(
+            "SELECT id, session_id, user_id, instance_id, content, category, metadata, created_at \
+             FROM engine.companion_memories WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (
+                row.session_id,
+                row.user_id,
+                row.instance_id,
+                row.content.as_str(),
+                row.category.as_deref(),
+                row.metadata,
+            ),
+            (
+                session_id,
+                user_id,
+                Some(instance_id),
+                "user lives in shanghai",
+                Some("fact"),
+                Some(meta),
+            )
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]

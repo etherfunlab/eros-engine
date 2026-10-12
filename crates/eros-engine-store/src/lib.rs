@@ -100,6 +100,27 @@ pub(crate) mod testutil {
         .unwrap()
     }
 
+    /// Persist a text session for an existing `(user_id, instance_id)` pair,
+    /// archived or not, and return its id — for the `_if_live` writers, whose
+    /// whole contract is what they do on each side of that flag.
+    pub(crate) async fn seed_session(
+        pool: &PgPool,
+        user_id: Uuid,
+        instance_id: Uuid,
+        archived: bool,
+    ) -> Uuid {
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id, archived) \
+             VALUES ($1, $2, $3) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .bind(archived)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
     /// Persist one `role='user'` message in `session_id` and return its id, for
     /// the six event tables and `chat_messages.user_message_id` itself, all of
     /// which FK-reference `chat_messages.id` since 0058.

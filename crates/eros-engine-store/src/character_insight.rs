@@ -130,6 +130,63 @@ pub struct CharacterInsightRepo<'a> {
     pub pool: &'a PgPool,
 }
 
+/// The one statement behind `CharacterInsightRepo::apply_extraction` and
+/// `apply_extraction_if_live`.
+async fn apply<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    instance_id: Uuid,
+    insights: &serde_json::Value,
+) -> Result<(), sqlx::Error> {
+    let c = project_columns(insights);
+    // A parseable reply carrying none of our keys projects to all-defaults.
+    // Writing it would stamp updated_at and append a snapshot for a row with
+    // nothing in it, so the profile route would report "we have a profile"
+    // when we have none. The audit row already records what the model said.
+    if c == CharacterColumns::default() {
+        return Ok(());
+    }
+    sqlx::query(
+        "WITH upserted AS ( \
+             INSERT INTO engine.character_insights \
+                 (instance_id, location, occupation, current_situation, desires, \
+                  vulnerabilities, habits, personal_values, likes, dislikes, relationships) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+             ON CONFLICT (instance_id) DO UPDATE SET \
+                 location          = COALESCE(EXCLUDED.location, character_insights.location), \
+                 occupation        = COALESCE(EXCLUDED.occupation, character_insights.occupation), \
+                 current_situation = COALESCE(EXCLUDED.current_situation, character_insights.current_situation), \
+                 desires           = COALESCE(EXCLUDED.desires, character_insights.desires), \
+                 vulnerabilities   = COALESCE(EXCLUDED.vulnerabilities, character_insights.vulnerabilities), \
+                 habits            = COALESCE(EXCLUDED.habits, character_insights.habits), \
+                 personal_values   = COALESCE(EXCLUDED.personal_values, character_insights.personal_values), \
+                 likes             = CASE WHEN EXCLUDED.likes = '{}' \
+                                          THEN character_insights.likes ELSE EXCLUDED.likes END, \
+                 dislikes          = CASE WHEN EXCLUDED.dislikes = '{}' \
+                                          THEN character_insights.dislikes ELSE EXCLUDED.dislikes END, \
+                 relationships     = CASE WHEN EXCLUDED.relationships = '{}' \
+                                          THEN character_insights.relationships ELSE EXCLUDED.relationships END, \
+                 updated_at        = now() \
+             RETURNING * \
+         ) \
+         INSERT INTO engine.character_insights_snapshot (instance_id, snapshot, captured_at) \
+         SELECT instance_id, to_jsonb(upserted), now() FROM upserted",
+    )
+    .bind(instance_id)
+    .bind(c.location)
+    .bind(c.occupation)
+    .bind(c.current_situation)
+    .bind(c.desires)
+    .bind(c.vulnerabilities)
+    .bind(c.habits)
+    .bind(c.personal_values)
+    .bind(c.likes)
+    .bind(c.dislikes)
+    .bind(c.relationships)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
 impl CharacterInsightRepo<'_> {
     /// Apply one extraction result incrementally, and append the post-merge
     /// state to `character_insights_snapshot` in the same statement.
@@ -152,54 +209,28 @@ impl CharacterInsightRepo<'_> {
         instance_id: Uuid,
         insights: &serde_json::Value,
     ) -> Result<(), sqlx::Error> {
-        let c = project_columns(insights);
-        // A parseable reply carrying none of our keys projects to all-defaults.
-        // Writing it would stamp updated_at and append a snapshot for a row with
-        // nothing in it, so the profile route would report "we have a profile"
-        // when we have none. The audit row already records what the model said.
-        if c == CharacterColumns::default() {
-            return Ok(());
+        apply(self.pool, instance_id, insights).await
+    }
+
+    /// `apply_extraction`, but only while `live_session_id` is live, checked
+    /// and written in one transaction that holds the session row (see
+    /// `session_archive::lock_live_session`). `Ok(false)` = the session is
+    /// archived or unknown and nothing was written; `Ok(true)` = it was live
+    /// and the extraction was applied under `apply_extraction`'s rules, which
+    /// still write nothing for a reply carrying none of this table's keys.
+    pub async fn apply_extraction_if_live(
+        &self,
+        live_session_id: Uuid,
+        instance_id: Uuid,
+        insights: &serde_json::Value,
+    ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        if !crate::session_archive::lock_live_session(&mut tx, live_session_id).await? {
+            return Ok(false);
         }
-        sqlx::query(
-            "WITH upserted AS ( \
-                 INSERT INTO engine.character_insights \
-                     (instance_id, location, occupation, current_situation, desires, \
-                      vulnerabilities, habits, personal_values, likes, dislikes, relationships) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
-                 ON CONFLICT (instance_id) DO UPDATE SET \
-                     location          = COALESCE(EXCLUDED.location, character_insights.location), \
-                     occupation        = COALESCE(EXCLUDED.occupation, character_insights.occupation), \
-                     current_situation = COALESCE(EXCLUDED.current_situation, character_insights.current_situation), \
-                     desires           = COALESCE(EXCLUDED.desires, character_insights.desires), \
-                     vulnerabilities   = COALESCE(EXCLUDED.vulnerabilities, character_insights.vulnerabilities), \
-                     habits            = COALESCE(EXCLUDED.habits, character_insights.habits), \
-                     personal_values   = COALESCE(EXCLUDED.personal_values, character_insights.personal_values), \
-                     likes             = CASE WHEN EXCLUDED.likes = '{}' \
-                                              THEN character_insights.likes ELSE EXCLUDED.likes END, \
-                     dislikes          = CASE WHEN EXCLUDED.dislikes = '{}' \
-                                              THEN character_insights.dislikes ELSE EXCLUDED.dislikes END, \
-                     relationships     = CASE WHEN EXCLUDED.relationships = '{}' \
-                                              THEN character_insights.relationships ELSE EXCLUDED.relationships END, \
-                     updated_at        = now() \
-                 RETURNING * \
-             ) \
-             INSERT INTO engine.character_insights_snapshot (instance_id, snapshot, captured_at) \
-             SELECT instance_id, to_jsonb(upserted), now() FROM upserted",
-        )
-        .bind(instance_id)
-        .bind(c.location)
-        .bind(c.occupation)
-        .bind(c.current_situation)
-        .bind(c.desires)
-        .bind(c.vulnerabilities)
-        .bind(c.habits)
-        .bind(c.personal_values)
-        .bind(c.likes)
-        .bind(c.dislikes)
-        .bind(c.relationships)
-        .execute(self.pool)
-        .await?;
-        Ok(())
+        apply(&mut *tx, instance_id, insights).await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     pub async fn load(
@@ -266,7 +297,7 @@ impl CharacterInsightEventRepo<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::seed_persona_instance;
+    use crate::testutil::{seed_persona_instance, seed_session};
     // existing_keys / parse_error_payload are already in scope via this
     // module's `pub use crate::{existing_keys, parse_error_payload}` above.
 
@@ -677,6 +708,60 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(snaps, 0, "no snapshot for a row that was never written");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn apply_extraction_if_live_writes_nothing_for_an_archived_session(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id, true).await;
+        let repo = CharacterInsightRepo { pool: &pool };
+
+        let applied = repo
+            .apply_extraction_if_live(
+                session_id,
+                instance_id,
+                &serde_json::json!({ "location": "公司" }),
+            )
+            .await
+            .unwrap();
+        assert!(!applied, "an archived session is skipped");
+
+        let snaps: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM engine.character_insights_snapshot WHERE instance_id = $1",
+        )
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (repo.load(instance_id).await.unwrap().is_none(), snaps),
+            (true, 0),
+            "neither the profile row nor its snapshot is written"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn apply_extraction_if_live_applies_on_a_live_session(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id, false).await;
+        let repo = CharacterInsightRepo { pool: &pool };
+
+        let applied = repo
+            .apply_extraction_if_live(
+                session_id,
+                instance_id,
+                &serde_json::json!({ "location": "公司" }),
+            )
+            .await
+            .unwrap();
+
+        let row = repo.load(instance_id).await.unwrap();
+        assert_eq!(
+            (applied, row.and_then(|r| r.location)),
+            (true, Some("公司".to_string()))
+        );
     }
 
     #[test]

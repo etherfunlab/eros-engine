@@ -66,14 +66,14 @@ fn client_id_from_event(event: &Event) -> Option<String> {
 
 /// True when the session is still live. `get_session` filters `NOT archived`
 /// (migration 0052), so an archived session — or a read that errors, or an id
-/// that never existed — reads back as "not live" here; all three fail closed
-/// rather than risk a write landing for a session the caller can no longer see.
+/// that never existed — reads back as "not live" here; all three fail closed.
 ///
-/// Called twice per turn: once at the top of `run`, which skips the LLM and
-/// embedding calls entirely once a session is already archived when the task
-/// starts; and again immediately before each of the three writes those calls
-/// feed, which narrows (but — see spec §9 — does not close) the window where
-/// the archive endpoint commits *during* those calls.
+/// The entry check of `run` and `run_group`: it skips the model and embedding
+/// calls for a session that is already archived when the task starts. It does
+/// not guard the writes. An archive can still commit while those calls run, so
+/// each write checks for itself — the `_if_live` store methods lock the session
+/// row in the write's own transaction, which leaves no window for an archive to
+/// land between the check and the write.
 async fn session_still_live(state: &AppState, session_id: Uuid) -> bool {
     ChatRepo { pool: &state.pool }
         .get_session(session_id)
@@ -94,7 +94,7 @@ pub async fn run(
     produced: Vec<ProducedMessage>,
 ) {
     // The archive endpoint can land between the turn and this detached task —
-    // this is the entry half of the check documented on `session_still_live`.
+    // the entry check documented on `session_still_live`.
     if !session_still_live(&state, session_id).await {
         return;
     }
@@ -376,15 +376,6 @@ async fn persist_affinity(
     user_message_id: Option<Uuid>,
     tier_drop: Option<eros_engine_core::affinity::AffinityLine>,
 ) {
-    // Recheck: the affinity evaluator's LLM call (or a sibling post_process
-    // future) may have run long enough for the archive endpoint to commit
-    // while this task was inside it. Without this, `load_or_create` below
-    // would put a `companion_affinity` row right back for a session every
-    // read route now 404s.
-    if !session_still_live(state, session_id).await {
-        return;
-    }
-
     let repo = AffinityRepo { pool: &state.pool };
 
     // Demo sessions get boosted positive raw scores so meters move within the
@@ -406,8 +397,14 @@ async fn persist_affinity(
 
     // No pre-read decay here: persist_with_event re-reads the row under a
     // lock and applies time decay from that locked row (design spec §6.2).
-    let mut affinity = match repo.load_or_create(session_id, user_id, instance_id).await {
-        Ok(a) => a,
+    // The evaluator's call above may have outlasted an archive of this
+    // session; `_if_live` creates no row for an archived one.
+    let mut affinity = match repo
+        .load_or_create_if_live(session_id, user_id, instance_id)
+        .await
+    {
+        Ok(Some(a)) => a,
+        Ok(None) => return,
         Err(e) => {
             tracing::warn!("affinity load_or_create failed: {e}");
             return;
@@ -480,8 +477,8 @@ fn group_relationship_memory_content(user_msg: &str) -> String {
 /// Post-process for a group turn: no affinity, no feeling clause, no ghost
 /// streak. The user's line is embedded once and written to the profile layer
 /// and to every seated member's relationship layer; human_insights runs once;
-/// character/user insights run per speaker, and each rechecks the speaker's
-/// member session before it writes.
+/// character/user insights run per speaker, and each writes only while the
+/// speaker's member session is live.
 pub async fn run_group(
     state: AppState,
     group_session_id: Uuid,
@@ -503,31 +500,29 @@ pub async fn run_group(
             }
         };
         let repo = MemoryRepo { pool: &state.pool };
-        if session_still_live(&state, group_session_id).await {
-            if let Err(e) = repo
-                .upsert(
-                    MemoryLayer::Profile,
-                    group_session_id,
-                    user_id,
-                    None,
-                    &user_msg,
-                    &embedding,
-                    None,
-                    None,
-                )
-                .await
-            {
-                tracing::warn!("group profile memory upsert failed: {e}");
-            }
+        if let Err(e) = repo
+            .upsert_if_live(
+                group_session_id,
+                MemoryLayer::Profile,
+                group_session_id,
+                user_id,
+                None,
+                &user_msg,
+                &embedding,
+                None,
+                None,
+            )
+            .await
+        {
+            tracing::warn!("group profile memory upsert failed: {e}");
         }
         let rel = group_relationship_memory_content(&user_msg);
         for (member_session_id, instance_id) in &members {
-            // The member's relationship may have been archived mid-turn.
-            if !session_still_live(&state, *member_session_id).await {
-                continue;
-            }
+            // Filed under the group, but it dies with the member's
+            // relationship, which may have been archived mid-turn.
             if let Err(e) = repo
-                .upsert(
+                .upsert_if_live(
+                    *member_session_id,
                     MemoryLayer::Relationship,
                     group_session_id,
                     user_id,
@@ -689,17 +684,13 @@ async fn embed_and_upsert(
         .embed_document(content)
         .await
         .map_err(|e| format!("embed failed: {e}"))?;
-    // Recheck: the embedding call above may have run long enough for the
-    // archive endpoint to commit while this task was inside it. Without this,
-    // the upsert below would put a `companion_memories` row right back for a
-    // session the archive just deleted it from. A silent no-op, not a
-    // failure — same as the entry guard.
-    if !session_still_live(state, session_id).await {
-        return Ok(());
-    }
+    // The embedding call above may have outlasted an archive of this session;
+    // `_if_live` then writes nothing — a silent no-op, not a failure, same as
+    // the entry guard.
     // category=None: this writer dumps raw turns. The classifier extraction
     // step (future) will write its own rows with category populated.
-    repo.upsert(
+    repo.upsert_if_live(
+        session_id,
         layer,
         session_id,
         user_id,
@@ -1721,18 +1712,14 @@ async fn extract_character_insights(
         return;
     }
 
-    // Recheck: the two character-chain LLM calls above (extraction, then
-    // structuring) may together have run long enough for the archive endpoint
-    // to commit while this task was inside them. Without this, the apply
-    // below would put a `character_insights` row right back for an instance
-    // the archive just deleted it from. `live_session_id` is the session whose
-    // archive deletes that row: the turn's own on 1:1, the speaker's member
-    // session on a group turn.
-    if !session_still_live(state, live_session_id).await {
-        return;
-    }
-
-    if let Err(e) = repo.apply_extraction(instance_id, &structured).await {
+    // The two calls above (extraction, then structuring) may together have
+    // outlasted an archive; `_if_live` then writes nothing. `live_session_id`
+    // is the session whose archive deletes this row: the turn's own on 1:1,
+    // the speaker's member session on a group turn.
+    if let Err(e) = repo
+        .apply_extraction_if_live(live_session_id, instance_id, &structured)
+        .await
+    {
         tracing::warn!("character_insights apply failed: {e}");
     }
 }
@@ -2033,16 +2020,13 @@ async fn extract_user_insights(
         return;
     }
 
-    // Recheck: the two calls above may together have run long enough for the
-    // archive endpoint to commit while this task was inside them. Without this,
-    // the apply below would put a `user_insights` row right back for an
-    // instance the archive just deleted it from. `live_session_id` is the
-    // session whose archive deletes that row, as on the character chain.
-    if !session_still_live(state, live_session_id).await {
-        return;
-    }
-
-    if let Err(e) = repo.apply_extraction(instance_id, &structured).await {
+    // The two calls above may together have outlasted an archive; `_if_live`
+    // then writes nothing. `live_session_id` is the session whose archive
+    // deletes this row, as on the character chain.
+    if let Err(e) = repo
+        .apply_extraction_if_live(live_session_id, instance_id, &structured)
+        .await
+    {
         tracing::warn!("user_insights apply failed: {e}");
     }
 }
@@ -2279,7 +2263,7 @@ mod tests {
     }
 
     /// Seed a live (unarchived) chat_sessions row for `instance_id`, with a
-    /// random user_id — `session_still_live`'s only requirement is that the
+    /// random user_id — the liveness check's only requirement is that the
     /// row exists and isn't archived.
     async fn seed_session(pool: &sqlx::PgPool, instance_id: Uuid) -> Uuid {
         sqlx::query_scalar::<_, Uuid>(
@@ -4347,9 +4331,9 @@ mod tests {
 
         let user_id = uuid::Uuid::new_v4();
         let instance_id = seed_persona_instance(&pool, user_id).await;
-        // A real, unarchived session — extract_character_insights' pre-write
-        // recheck (Fix 1) reads session liveness through it, same as the
-        // production caller always passes one from the live pipeline.
+        // A real, unarchived session — extract_character_insights writes only
+        // while it is live, and the production caller always passes one from
+        // the live pipeline.
         let session_id: uuid::Uuid = sqlx::query_scalar(
             "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
         )
@@ -4691,16 +4675,17 @@ mod tests {
         );
     }
 
-    // ─── Fix 1's pre-write recheck ──────────────────────────────────
+    // ─── The write-time recheck ─────────────────────────────────────
     //
     // The three tests below call `persist_affinity` / `write_turn` /
     // `extract_character_insights` DIRECTLY rather than through `run`, so
-    // `run`'s entry guard never executes at all — it is the recheck inside
-    // each of these functions, and only that recheck, that can make the
-    // assertions below pass. This is the distinction the entry-guard test
-    // above cannot make on its own: there, the session is already archived
-    // before `run` is even called, so the entry guard alone accounts for
-    // every empty table and the recheck code paths are never reached.
+    // `run`'s entry guard never executes at all — it is the recheck each of
+    // these functions makes at its write (the `_if_live` store call), and only
+    // that recheck, that can make the assertions below pass. This is the
+    // distinction the entry-guard test above cannot make on its own: there,
+    // the session is already archived before `run` is even called, so the
+    // entry guard alone accounts for every empty table and the recheck code
+    // paths are never reached.
 
     /// Pins `persist_affinity`'s recheck. No `run`, no entry guard in the call
     /// path — this proves the function's own gate, not the one at the top of

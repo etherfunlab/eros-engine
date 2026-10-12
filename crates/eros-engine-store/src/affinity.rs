@@ -152,16 +152,59 @@ pub struct AffinityRepo<'a> {
     pub pool: &'a PgPool,
 }
 
+/// The one SELECT behind `AffinityRepo::load` and `load_or_create_on`.
+async fn load_on<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    session_id: Uuid,
+) -> Result<Option<Affinity>, sqlx::Error> {
+    let row = sqlx::query_as::<_, AffinityRow>(
+        "SELECT * FROM engine.companion_affinity WHERE session_id = $1",
+    )
+    .bind(session_id)
+    .fetch_optional(executor)
+    .await?;
+    Ok(row.map(AffinityRow::into_domain))
+}
+
+/// The load-then-insert behind `AffinityRepo::load_or_create` and
+/// `load_or_create_if_live`.
+async fn load_or_create_on(
+    conn: &mut sqlx::PgConnection,
+    session_id: Uuid,
+    user_id: Uuid,
+    instance_id: Uuid,
+) -> Result<Affinity, sqlx::Error> {
+    if let Some(existing) = load_on(&mut *conn, session_id).await? {
+        return Ok(existing);
+    }
+
+    // `session_id` is UNIQUE (migration 0002): a concurrent caller may
+    // win the insert between our load above and here, so DO NOTHING
+    // on conflict rather than erroring, and fall back to a load for the
+    // winner's row.
+    let row = sqlx::query_as::<_, AffinityRow>(
+        "INSERT INTO engine.companion_affinity (session_id, user_id, instance_id) \
+         VALUES ($1, $2, $3) \
+         ON CONFLICT (session_id) DO NOTHING \
+         RETURNING *",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .bind(instance_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    match row {
+        Some(row) => Ok(row.into_domain()),
+        None => load_on(&mut *conn, session_id)
+            .await?
+            .ok_or(sqlx::Error::RowNotFound),
+    }
+}
+
 impl<'a> AffinityRepo<'a> {
     /// Load the affinity row for `session_id`, if one exists.
     pub async fn load(&self, session_id: Uuid) -> Result<Option<Affinity>, sqlx::Error> {
-        let row = sqlx::query_as::<_, AffinityRow>(
-            "SELECT * FROM engine.companion_affinity WHERE session_id = $1",
-        )
-        .bind(session_id)
-        .fetch_optional(self.pool)
-        .await?;
-        Ok(row.map(AffinityRow::into_domain))
+        load_on(self.pool, session_id).await
     }
 
     /// Load the freshest affinity row for a user × persona-instance pair,
@@ -267,29 +310,30 @@ impl<'a> AffinityRepo<'a> {
         user_id: Uuid,
         instance_id: Uuid,
     ) -> Result<Affinity, sqlx::Error> {
-        if let Some(existing) = self.load(session_id).await? {
-            return Ok(existing);
-        }
+        let mut conn = self.pool.acquire().await?;
+        load_or_create_on(&mut conn, session_id, user_id, instance_id).await
+    }
 
-        // `session_id` is UNIQUE (migration 0002): a concurrent caller may
-        // win the insert between our `load` above and here, so DO NOTHING
-        // on conflict rather than erroring, and fall back to `load` for the
-        // winner's row.
-        let row = sqlx::query_as::<_, AffinityRow>(
-            "INSERT INTO engine.companion_affinity (session_id, user_id, instance_id) \
-             VALUES ($1, $2, $3) \
-             ON CONFLICT (session_id) DO NOTHING \
-             RETURNING *",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .bind(instance_id)
-        .fetch_optional(self.pool)
-        .await?;
-        match row {
-            Some(row) => Ok(row.into_domain()),
-            None => self.load(session_id).await?.ok_or(sqlx::Error::RowNotFound),
+    /// `load_or_create`, but only while `session_id` is live, checked and
+    /// written in one transaction that holds the session row (see
+    /// `session_archive::lock_live_session`). `None` = the session is
+    /// archived or unknown and no row was created; an existing row comes back
+    /// as `load_or_create` would return it. Covers creation only:
+    /// `persist_with_event` locks the affinity row itself, so an archive that
+    /// deleted it in between fails that write rather than recreating it.
+    pub async fn load_or_create_if_live(
+        &self,
+        session_id: Uuid,
+        user_id: Uuid,
+        instance_id: Uuid,
+    ) -> Result<Option<Affinity>, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        if !crate::session_archive::lock_live_session(&mut tx, session_id).await? {
+            return Ok(None);
         }
+        let affinity = load_or_create_on(&mut tx, session_id, user_id, instance_id).await?;
+        tx.commit().await?;
+        Ok(Some(affinity))
     }
 
     /// Newest-first affinity events for a session, optionally filtered by
@@ -785,7 +829,7 @@ impl<'a> AffinityRepo<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::seed_persona_instance;
+    use crate::testutil::{seed_persona_instance, seed_session};
 
     /// Persist a rule-deltas-only "message" turn with default tuning: at a
     /// fresh seed every line sits in tier 1 (decay ×1.0) and an ungraded axis
@@ -915,6 +959,61 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(rows, 1);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn load_or_create_if_live_creates_nothing_for_an_archived_session(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id, true).await;
+
+        let affinity = repo
+            .load_or_create_if_live(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+        assert!(affinity.is_none(), "an archived session is skipped");
+
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.companion_affinity WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows, 0,
+            "no affinity row is created for an archived session"
+        );
+    }
+
+    /// Same row as `load_or_create`: created on the first call, and the
+    /// existing one returned on the next.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn load_or_create_if_live_loads_or_creates_on_a_live_session(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id, false).await;
+
+        let created = repo
+            .load_or_create_if_live(session_id, user_id, instance_id)
+            .await
+            .unwrap()
+            .expect("a live session gets a row");
+        let existing = repo
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+        let again = repo
+            .load_or_create_if_live(session_id, user_id, instance_id)
+            .await
+            .unwrap()
+            .expect("a live session returns its row");
+        assert_eq!(
+            (created.id, again.id, created.session_id),
+            (existing.id, existing.id, session_id)
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]

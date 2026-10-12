@@ -12,6 +12,26 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
+/// Whether `session_id` is live, holding its row `FOR SHARE` for the rest of
+/// `tx` when it is. The `_if_live` writers call this first and write in the
+/// same transaction, which leaves no gap for an archive to land in:
+/// `archive_relationship`'s first statement updates this row, so it waits for
+/// `tx` to commit and its deletes then take the new row with the rest; and a
+/// lock requested once the archive has updated the row waits for it and then
+/// finds the session archived. An unknown id reads back as not live too.
+pub(crate) async fn lock_live_session(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    session_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let live: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 FROM engine.chat_sessions WHERE id = $1 AND NOT archived FOR SHARE",
+    )
+    .bind(session_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(live.is_some())
+}
+
 pub struct SessionArchiveRepo<'a> {
     pub pool: &'a PgPool,
 }
@@ -140,7 +160,7 @@ impl<'a> SessionArchiveRepo<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::SessionArchiveRepo;
+    use super::{lock_live_session, SessionArchiveRepo};
     use crate::chat::ChatRepo;
     use crate::testutil::seed_persona_instance;
     use crate::user_insight::{UserInsightEventInsert, UserInsightEventRepo, UserInsightRepo};
@@ -687,6 +707,73 @@ mod tests {
         )
         .await;
         assert_eq!(memories, 1, "the story recall mirror must survive");
+    }
+
+    /// The race the `_if_live` writers close. A write holding the session row
+    /// `FOR SHARE` makes the archive wait at its first statement; once the
+    /// write commits, the archive's deletes run on a snapshot that sees the
+    /// new row and take it with the rest. The opposite order is the other
+    /// half: a lock taken after the archive commits finds the session
+    /// archived, so the write never happens.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_live_session_lock_holds_the_archive_until_the_write_commits(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = ChatRepo { pool: &pool }
+            .create_session(user_id, instance_id)
+            .await
+            .unwrap()
+            .id;
+
+        let mut tx = pool.begin().await.unwrap();
+        assert!(lock_live_session(&mut tx, session_id).await.unwrap());
+
+        let archive_pool = pool.clone();
+        let archive = tokio::spawn(async move {
+            SessionArchiveRepo {
+                pool: &archive_pool,
+            }
+            .archive_relationship(user_id, instance_id)
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !archive.is_finished(),
+            "the archive must wait on the locked session row"
+        );
+
+        let zeros = format!("[{}]", vec!["0"; 512].join(","));
+        sqlx::query(
+            "INSERT INTO engine.companion_memories \
+                 (session_id, user_id, instance_id, content, embedding) \
+             VALUES ($1, $2, $3, 'she likes jazz', $4::vector)",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .bind(instance_id)
+        .bind(&zeros)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        assert_eq!(archive.await.unwrap().unwrap(), 1, "one session flipped");
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT count(*) FROM engine.companion_memories WHERE instance_id = $1",
+                instance_id,
+            )
+            .await,
+            0,
+            "the archive must delete the row written under the lock"
+        );
+
+        let mut tx = pool.begin().await.unwrap();
+        assert!(
+            !lock_live_session(&mut tx, session_id).await.unwrap(),
+            "an archived session must read back as not live"
+        );
     }
 
     /// The session list is a read surface like any other.
