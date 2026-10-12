@@ -185,9 +185,13 @@ members' relationships, not to the group.
 `POST /v2/comp/group/{group_id}/message/stream` → SSE.
 
 - **Request body:** `content`, `client_msg_id`, `tier`, `prompt_traits`,
-  `user_locale`, and an optional `mentions: [member_session_id]` for a
-  client-side @.
+  `user_timezone` / `user_country` / `user_region`, the 1:1 `image` block,
+  and an optional `mentions: [member_session_id]` for a client-side @.
   - Mentions must name active members. An unknown id returns `422`.
+  - `image` means the same as on the 1:1 route: its presence, together with
+    a configured `[tasks.chat_image_prompt_compose]`, makes images available
+    this turn. `image.force = true` returns `400 invalid_payload`, because a
+    group turn has no single persona to force.
 - **Stream only.** The async route refuses group sessions (§7.1).
 - **Refusals:**
   - `409 group_empty` when the group has no active member.
@@ -228,9 +232,13 @@ loads:
   - **Read only.** A member with no affinity row yet gets the default
     `Affinity` in memory and no row is created. The turn never calls
     `load_or_create` and never writes a member's affinity row.
-- **Derived values:** the Bond and Chemistry tier labels, and the intimacy
-  rung, which gives the member's image availability (是/否) the same way the
-  1:1 PDE context computes it.
+- **Derived values:** the Bond and Chemistry tier labels and the intimacy
+  rung (`Affinity::intimacy_rung`). The rung is director context, as it is
+  judge context in 1:1. It is not an engine gate.
+
+Image availability is one value for the whole turn, computed as in 1:1: the
+request carries `image` and `[tasks.chat_image_prompt_compose]` is
+configured.
 
 This member snapshot is fixed for the turn. A kick that lands mid-turn can let
 the kicked member finish this turn. That window is accepted.
@@ -253,8 +261,9 @@ parses what comes back:
 
 - `[群聊]` the title, if set;
 - `[成员]` one line per member: handle (`m1`, `m2`, `m3` in `joined_at`
-  order), name, one-line personality (the same field the world-town roster
-  uses), Bond label, Chemistry label, `图片能力=是/否`;
+  order), name, one-line personality (`genome.tip_personality`, the field
+  the world-town roster uses), Bond label, Chemistry label, `亲密度=第 N 档`;
+- `[图片能力] 本轮可发图=是/否`, the turn's image availability;
 - `[最近群聊]` the last `HISTORY_WINDOW` group rows, each prefixed with its
   speaker's name or 「用户」;
 - `[用户点名]` the names from `mentions`, when present;
@@ -277,8 +286,9 @@ parses what comes back:
 
 - an unknown handle is dropped;
 - a repeated handle keeps its first occurrence;
-- an image action on a member with `图片能力=否` degrades to `reply_text`,
-  following the 1:1 `guard_action` rule that an action can only go down;
+- an image action on a turn without image availability degrades to
+  `reply_text`, following the 1:1 `guard_action` rule that an action can only
+  go down;
 - a list that is empty after normalization counts as a director failure.
 
 **Rule fallback.** Every active member speaks `reply_text`, in `joined_at`
@@ -318,10 +328,10 @@ The turn writes one `companion_decision_events` row:
 |---|---|
 | `session_id` | the group |
 | `message_id` | the user row |
-| `status` | `ok` / `empty` / `parse_error` / `timeout` / `error` |
+| `status` | the PDE's set: `ok` / `empty` / `parse_error` / `upstream_error` / `gateway_error` |
 | `action` / `proposed_action` | NULL |
 | `payload` | the parsed output, plus a `reasoning` key holding the full reasoning text (NULL when the model returned none) |
-| `inputs` | the roster as the director saw it (handles, labels, image availability) and the mentions |
+| `inputs` | the roster as the director saw it (handles, labels, rungs), the turn's image availability, and the mentions |
 | `generation_id` | the director's call |
 
 No row is written when the task is absent.
@@ -347,14 +357,16 @@ before the next one starts.
   - the other active members' names and one-line personalities;
   - a fixed rule: say only your own lines, never speak for anyone else, and
     write no name prefix.
-- **History.** The last `HISTORY_WINDOW` group rows.
+- **History.** The last `HISTORY_WINDOW` group rows at or before the user
+  row, plus the assistant rows earlier speakers persisted in this same turn
+  (`user_message_id` = this turn's user row). A newer user row that arrived
+  mid-turn is not included.
   - This speaker's own lines go in as `assistant`.
   - The user's and other personas' lines go in as `user`, prefixed
     「名字：」 or 「用户：」.
-  - The window includes the lines that earlier speakers persisted in this same
-    turn.
-  - Window selection and echo cancellation apply as in 1:1, with this
-    speaker's own lines as the assistant side.
+  - The 1:1 noise strip and echo cancellation apply. The 1:1 window ladder
+    (`select_window`) does not apply: it keeps rows around the previous user
+    turn and would drop this turn's earlier speakers.
 - **Call.** `chat_companion` with its tier routing, retry chain, fallback
   phrase, output filter and multi-bubble `continues_from` chaining, all
   unchanged. Every assistant row this speaker writes carries
@@ -401,6 +413,7 @@ Spawned once after the last speaker. Nothing in it blocks the stream.
 | `CHAT_QUEUE_GEN_TIMEOUT_SECS` expires | One budget covers director and all speakers. Speakers who finished stay persisted, the rest are skipped, and the terminal frame is `error generation_timeout`. |
 | Settle | `settle_turn` unchanged. If any speaker row landed (`turn_already_served`) the turn is `done`. Otherwise the turn is failed with a `system_error` notice, which carries no speaker. |
 | Client disconnect | The turn completes and persists; the client reads history |
+| Process dies mid-turn | The reaper releases the claim, and the chat-queue worker settles a group turn as unservable: failed with a `system_error` notice. Group turns are never re-driven in the background. |
 
 The relay does not stop at a failed speaker: the other members are
 independent people and still answer. The stream path's rule of a single
@@ -444,7 +457,9 @@ a "thinking" indicator) is the client's decision.
 - `/v2/comp/session/{id}/message/{mid}/reaction`;
 - `/v2/comp/session/{id}/message/{mid}/image/edit`.
 
-The voice routes already require `channel = 'voice'`.
+The voice routes already require `channel = 'voice'`. The chat-queue
+worker's `drive_turn` settles a group turn as unservable instead of driving
+it (§5.7).
 
 ### 7.2 Reads that exclude group sessions
 
@@ -486,7 +501,8 @@ params = { reasoning = { effort = "medium" } }
   - a quiet member can stay quiet;
   - a member the user is close to answers more readily;
   - `[用户点名]` members answer;
-  - an image only when the member's line says `图片能力=是`;
+  - an image only when `[图片能力] 本轮可发图=是`, and only from a member
+    whose relationship makes one natural;
   - JSON output only.
 - **Opt-in states:**
   - Section absent: the rule fallback runs and group chat still works.
@@ -633,6 +649,8 @@ a person on the dev deployment.
 - Speaker failure → `speaker_error`, the relay continues, queue `done`.
 - Generation timeout mid-relay.
 - Every §7.1 refusal, and the group send route refusing a text session.
+- The chat-queue worker settles a released group turn as failed with one
+  notice and drives nothing.
 
 ## 17. Documentation
 
