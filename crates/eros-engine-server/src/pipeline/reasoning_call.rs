@@ -46,7 +46,9 @@ pub(crate) struct JudgeRun<V> {
     pub raw: Option<String>,
     /// Every attempt's reasoning, concatenated.
     pub reasoning: String,
+    /// The `engine.llm_generations` join key of the serving attempt.
     pub generation_id: Option<String>,
+    /// Feeds the audit row's two failure columns and the turn's `final` frame.
     pub failures: Vec<AttemptFailure>,
 }
 
@@ -144,7 +146,7 @@ where
                 }
             }
             if failed {
-                tracing::warn!(task, model = %model_id, "judge call: attempt failed; next");
+                tracing::warn!(task, model = %model_id, error = %failures.last().map(|f| f.to_string()).unwrap_or_default(), "judge call: attempt failed; next");
                 last = PdeStatus::for_operation(&failures);
                 continue;
             }
@@ -180,6 +182,7 @@ where
             };
             let text = clean_response(content.trim()).trim().to_string();
             if text.is_empty() {
+                tracing::warn!(task, model = %model_id, "judge call: empty reply; next");
                 last = PdeStatus::Empty;
                 continue;
             }
