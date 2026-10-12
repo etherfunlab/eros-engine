@@ -271,7 +271,7 @@ async fn admit(
     let seated: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM engine.chat_session_members gm \
                         JOIN engine.chat_sessions s ON s.id = gm.member_session_id \
-                        WHERE gm.group_session_id = $1 AND s.instance_id = $2)",
+                        WHERE gm.group_session_id = $1 AND s.instance_id = $2 AND NOT s.archived)",
     )
     .bind(group_id)
     .bind(instance_id)
@@ -515,6 +515,39 @@ mod tests {
         assert!(
             names[&a].starts_with("seed-"),
             "seed_persona_instance names genomes seed-<uuid>"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn archived_seat_does_not_block_the_same_persona(pool: PgPool) {
+        let repo = GroupRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let a = text_session(&pool, user_id).await;
+        let g = repo.create(user_id, None, &[a]).await.unwrap().unwrap();
+        sqlx::query("UPDATE engine.chat_sessions SET archived = true WHERE id = $1")
+            .bind(a)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let a_instance: Uuid =
+            sqlx::query_scalar("SELECT instance_id FROM engine.chat_sessions WHERE id = $1")
+                .bind(a)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let fresh = ChatRepo { pool: &pool }
+            .create_session(user_id, a_instance)
+            .await
+            .unwrap()
+            .id;
+        assert_eq!(repo.add_member(g.id, user_id, fresh).await.unwrap(), Ok(()));
+        let active = repo.active_members(g.id).await.unwrap();
+        assert_eq!(
+            active
+                .iter()
+                .map(|m| m.member_session_id)
+                .collect::<Vec<_>>(),
+            vec![fresh]
         );
     }
 }
