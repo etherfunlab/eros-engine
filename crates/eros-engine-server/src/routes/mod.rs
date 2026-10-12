@@ -20,6 +20,7 @@ pub mod companion;
 pub mod companion_async;
 pub mod companion_stream;
 pub mod dto;
+pub mod group;
 pub mod health;
 pub mod image_edit;
 pub mod insight;
@@ -53,6 +54,7 @@ pub fn router(state: AppState) -> OpenApiRouter<AppState> {
         .merge(session_effects::router())
         .merge(session_open::router())
         .merge(reaction::router())
+        .merge(group::router())
         .layer(from_fn_with_state(state.clone(), require_auth));
 
     OpenApiRouter::new().merge(health::router()).merge(comp)
@@ -78,6 +80,7 @@ pub fn router_for_openapi() -> OpenApiRouter<AppState> {
         .merge(session_effects::router())
         .merge(session_open::router())
         .merge(reaction::router())
+        .merge(group::router())
 }
 
 /// The generated OpenAPI document as JSON, for tests that assert on the wire

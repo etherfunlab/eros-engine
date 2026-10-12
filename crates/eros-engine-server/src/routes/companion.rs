@@ -162,6 +162,9 @@ pub struct ChatHistoryEntry {
     /// Omitted on rows without one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reaction: Option<crate::routes::reaction::ReactionView>,
+    /// The member session that spoke this line (group sessions only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_session_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -791,6 +794,7 @@ async fn get_history(
                 .and_then(|md| md.get("action"))
                 .and_then(crate::routes::companion_stream::UserActionView::from_metadata_action),
             reaction: crate::routes::reaction::reaction_view(m.reaction, m.reacted_at),
+            speaker_session_id: m.speaker_session_id,
             role: m.role,
             content: m.content,
             sent_at: m.sent_at,
