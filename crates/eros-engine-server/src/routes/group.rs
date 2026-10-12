@@ -451,4 +451,45 @@ mod tests {
         let entry = &body["messages"][0];
         assert_eq!(entry["speaker_session_id"], a.to_string());
     }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_stranger_gets_404_and_changes_nothing(pool: PgPool) {
+        let owner = Uuid::new_v4();
+        let stranger = Uuid::new_v4();
+        let a = member(&pool, owner).await;
+        let mut app = build_router(crate::routes::companion::test_state(pool.clone()));
+        let (_, body) = send_request(
+            &mut app,
+            req(
+                "POST",
+                "/v2/comp/group",
+                owner,
+                Some(json!({"title": "keep", "member_session_ids": [a]})),
+            ),
+        )
+        .await;
+        let gid = body["group_id"].as_str().unwrap().to_string();
+
+        let g = format!("/v2/comp/group/{gid}");
+        let attempts = [
+            req("GET", &g, stranger, None),
+            req("PATCH", &g, stranger, Some(json!({"title": "x"}))),
+            req(
+                "POST",
+                &format!("{g}/members"),
+                stranger,
+                Some(json!({"member_session_id": a})),
+            ),
+            req("DELETE", &format!("{g}/members/{a}"), stranger, None),
+            req("DELETE", &g, stranger, None),
+        ];
+        for r in attempts {
+            let (s, _) = send_request(&mut app, r).await;
+            assert_eq!(s, StatusCode::NOT_FOUND);
+        }
+        let (s, body) = send_request(&mut app, req("GET", &g, owner, None)).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(body["title"], "keep");
+        assert_eq!(body["members"].as_array().unwrap().len(), 1);
+    }
 }

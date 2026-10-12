@@ -2861,6 +2861,14 @@
             "type": "string",
             "format": "date-time"
           },
+          "speaker_session_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "The member session that spoke this line (group sessions only)."
+          },
           "user_message_id": {
             "type": [
               "string",

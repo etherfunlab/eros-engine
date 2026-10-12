@@ -89,6 +89,9 @@ pub struct BffHistoryEntry {
     /// Omitted on rows without one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reaction: Option<crate::routes::reaction::ReactionView>,
+    /// The member session that spoke this line (group sessions only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_session_id: Option<Uuid>,
 }
 
 /// Parse the raw `metadata->>'reply_to_message_id'` text the slim projection
@@ -225,6 +228,7 @@ async fn bff_get_history(
                     crate::routes::companion_stream::UserActionView::from_metadata_action,
                 ),
                 reaction: crate::routes::reaction::reaction_view(r.reaction, r.reacted_at),
+                speaker_session_id: r.speaker_session_id,
             })
             .collect();
     let total = messages.len();
@@ -289,6 +293,7 @@ async fn bff_start_chat(
                     crate::routes::companion_stream::UserActionView::from_metadata_action,
                 ),
                 reaction: crate::routes::reaction::reaction_view(r.reaction, r.reacted_at),
+                speaker_session_id: r.speaker_session_id,
             })
             .collect()
     };
@@ -332,6 +337,37 @@ mod tests {
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .body(Body::empty())
             .unwrap()
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_history_carries_the_speaker(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let member = seed_session(&pool, user_id, instance_id).await;
+        let g = eros_engine_store::group::GroupRepo { pool: &pool }
+            .create(user_id, None, &[member])
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, speaker_session_id) \
+             VALUES ($1, 'assistant', 'hi', $2)",
+        )
+        .bind(g.id)
+        .bind(member)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut app = build_router(test_state(pool));
+        let token = mint_test_jwt(user_id);
+        let (status, body) = send_request(&mut app, bff_history_request(&token, g.id, "")).await;
+        assert_eq!(status, StatusCode::OK, "got body: {body}");
+        assert_eq!(
+            body["messages"][0]["speaker_session_id"],
+            member.to_string()
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
