@@ -430,7 +430,7 @@ applies to each speaker.
 The group route emits:
 
 ```
-reasoning*                       (0..n, only with reasoning on)
+reasoning*  (0..n, only with reasoning on)
 cast
 ( meta → delta* → done → image_request?  |  meta → done{truncated:true} → speaker_error  |  speaker_error )  × speakers
 final

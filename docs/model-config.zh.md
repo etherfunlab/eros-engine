@@ -591,8 +591,8 @@ BYOK hop 使用其请求中 `byok` 块的 `output_regex` 规则，而不是这�
   - `action_response`（选填）：本轮带用户动作时（上下文里会有 `[用户动作]` 一行）填 `"accept"` 或 `"refuse"`；其他回合或拿不准时填 `null`。`null`、判官调用失败、规则 PDE 一律按接受处理。拒绝会让该动作对应的亲密度线降一档（见 [affinity-model.zh.md](affinity-model.zh.md)）。动作回合里 `ghost` 和 `product_qa` 会改判为 `reply_text`，也不掷每轮骰子
   - `reason`：可选
 - **Fail-open：**任何 LLM 超时或错误都会回退到规则引擎——LLM 判断器绝不会阻塞 chat 响应。
-- **`timeout_secs`**（选填，默认 `15`）：每次尝试的时限，从发起调用到读完为止共用一个截止时间。超时的尝试算失败，调用转向链上的下一个模型。写 `0` 会拒绝启动（判官每轮都会超时）。只在 `[tasks.pde_decision]` 上读取，其他任务忽略。
-- **推理。**判官始终以流式调用。推理只走 body 规则，没有别的入口；没有 `pde_decision` 的规则时判官不返回推理，1:1 流也没有 `reasoning` 帧：
+- **`timeout_secs`**（选填，默认 `15`）：每次尝试的时限，从发起调用到读完为止共用一个截止时间。超时的尝试算失败，调用转向链上的下一个模型。写 `0` 会拒绝启动（判断器每轮都会超时）。只在 `[tasks.pde_decision]` 上读取，其他任务忽略。判断器的最坏耗时是 `timeout_secs × (1 + retry_depth)`；它加上回复的耗时若超过 `CHAT_QUEUE_GEN_TIMEOUT_SECS`（默认 300），这一轮会以 `generation_timeout` 结束，而不是走回退。
+- **推理。**判断器始终以流式调用。判断器的模型返回什么推理就转发什么：推理以 `reasoning` 帧进入 1:1 流，并保存在审计行上，所以默认就会推理的模型不需要任何规则也会发帧。用 body 规则可以打开推理：
 
   ```toml
   [[providers.openrouter.body]]
@@ -600,7 +600,7 @@ BYOK hop 使用其请求中 `byok` 块的 `output_regex` 规则，而不是这�
   params = { reasoning = { effort = "low" } }
   ```
 
-  规则生效后，推理以 `reasoning` 帧在回复之前流给客户端（见 [api-reference.zh.md](api-reference.zh.md)），并保存在决策审计行上。推理 token 计入该任务的 `max_tokens`，所以要和 `timeout_secs` 一起调高。回复要等判官，首个 token 的延迟会增加判官思考所花的时间。
+  `reasoning = { enabled = false }` 或 `{ exclude = true }`（非 OpenRouter 端点用供应商对应的参数）可以关闭推理。帧在回复之前发出（见 [api-reference.zh.md](api-reference.zh.md)）。推理 token 计入该任务的 `max_tokens`，所以要和 `timeout_secs` 一起调高。回复要等判断器，首个 token 的延迟会增加判断器思考所花的时间。
 - **硬安全 guardrail**（在 LLM verdict 之后、规则引擎 fallback 之前强制执行）：前 10 条消息绝不 ghost，绝不连续 ghost 第三次（`ghost_streak ≥ 2` 否决；连两次是允许的），ghost cooldown 为一小时。
 - 每次判断器调用都会记录到 `companion_decision_events` 以供审计：`payload` 是模型返回的内容；`inputs`（JSONB，迁移 `0044`）冻结判断器当时看到的引擎计算状态——亲密度档位、耐心档位、bond/chemistry 与六个原始轴。fire-and-forget 写入；历史行保持 `NULL`。
 

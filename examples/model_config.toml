@@ -87,9 +87,11 @@ params = { reasoning = { effort = "medium" } }
 #tasks  = ["chat_vision"]
 #params = { reasoning_effort = "none" }
 #
-# Judge reasoning (optional). The PDE judge streams; with this rule its
-# reasoning reaches the 1:1 client as `reasoning` frames ahead of the reply and
-# is kept on the decision audit row. Reasoning tokens count against the task's
+# Judge reasoning (optional). The PDE judge streams, and whatever reasoning its
+# model returns reaches the 1:1 client as `reasoning` frames ahead of the reply
+# and is kept on the decision audit row. This rule turns reasoning on;
+# `reasoning = { enabled = false }` or `{ exclude = true }` turns it off.
+# Reasoning tokens count against the task's
 # `max_tokens`, and the reply waits for the judge — raise
 # `[tasks.pde_decision].max_tokens` and `timeout_secs` together with it.
 #[[providers.openrouter.body]]

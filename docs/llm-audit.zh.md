@@ -152,9 +152,11 @@ completed` tracing——落库是额外加的，不是取代那行日志。
 
 ### 怎么读
 
-`usage` 落库是**未过滤**的，供应商发了什么就存什么，`cost` 在的话也一并存下。
-`OPENROUTER_USAGE_HIDDEN_KEYS` 只在返回给 client 的那份上剔除 key（见上文）；
-数据库里的这份从来就是完整的，以后也一直是。
+`usage` 落库是**未过滤**的：非流式调用里，供应商发了什么就存什么，`cost` 在的话也一并存下。
+流式任务（对话回复、群聊导演、`pde_decision`）只存解析后的 usage 块：
+prompt、completion、total 三项 token 数和 cost。
+`OPENROUTER_USAGE_HIDDEN_KEYS` 只在返回给 client 的那份上剔除 key（见上文），
+不影响数据库里存的内容。
 
 按任务统计某个时间窗口的花费。**求 `cost` 的和时，必须同时数出有多少行真的
 带了这个键：**
@@ -173,7 +175,7 @@ GROUP BY task ORDER BY cost_of_priced DESC NULLS LAST;
 **两处过滤判的都是值的类型，不是键在不在。** `usage ? 'cost'` 是最顺手的写法，
 但它错两次：`"cost": null` 会被算成 priced，却一分钱也不进那个 sum；而一个非数字
 的值——`"cost": "unknown"`，或者一个对象——会让 `::numeric` **直接抛错**，整条
-查询中断，而不是返回 `NULL`。`usage` 是供应商响应的原样落库，engine 不校验它的
+查询中断，而不是返回 `NULL`。`usage` 按供应商响应的样子落库（流式任务存解析后的 usage 块），engine 不校验它的
 形状，所以只能由查询来判。`jsonb_typeof(usage->'cost') = 'number'` 对 JSON null、
 非数字、键不存在、`usage` 整个为 `NULL` 这四种情况一律为假。
 

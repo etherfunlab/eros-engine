@@ -33,10 +33,11 @@ With this change, the judge streams through the same call the director uses:
 1. **One implementation.** The director's streamed chain walk becomes a
    generic helper. The director and the judge differ only in their task name,
    their parser and their time limits.
-2. **Nothing changes unless a deployment opts in.** Without a reasoning body
-   rule for `pde_decision`, the judge returns no reasoning, the 1:1 stream
-   carries no new frame, and the default time limit equals today's
-   `FILTER_TIMEOUT`.
+2. **Reasoning follows the model.** Whatever reasoning the judge's model
+   returns is forwarded; a body rule can turn it on, and
+   `reasoning = { enabled = false }` or `{ exclude = true }` turns it off.
+   When the model returns none, the 1:1 stream carries no new frame. The
+   default time limit equals today's `FILTER_TIMEOUT`.
 3. **The time limit is a safety net, not a cap on capability.** A judge that
    runs out of time fails open to the rule engine, as it does today, and the
    user still gets a reply.
@@ -155,9 +156,10 @@ reasoning frames are discarded, as all of its frames are.
 ```
 
 - **1:1 stream.** Zero or more `reasoning` frames come first, ahead of
-  `action_response`, `body_state` and `meta`. They appear only when the judge
-  is configured, its model returns reasoning, and the deployment has turned
-  reasoning on with a body rule. Otherwise the 1:1 frame sequence is unchanged.
+  `action_response`, `body_state` and `meta`. They appear whenever the judge's
+  model returns reasoning; a body rule can turn reasoning on, and
+  `reasoning = { enabled = false }` or `{ exclude = true }` turns it off.
+  When the judge returns none, the 1:1 frame sequence is unchanged.
 - **Group stream.** The frame keeps its place before `cast` and carries the
   director's reasoning.
 - **Display.** The content is display-only and decides nothing. How it is
@@ -178,7 +180,7 @@ reasoning frames are discarded, as all of its frames are.
 | No content (failures only), with reasoning | `{"reasoning": "…"}` |
 | No content, no reasoning | NULL, unchanged |
 
-Director rows already follow this shape.
+The director's rows differ in one case: a parse error with no reasoning is `{"raw": "…", "reasoning": null}`, where the judge writes the bare raw string.
 
 ## 7. Configuration
 

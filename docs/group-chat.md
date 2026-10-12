@@ -208,7 +208,7 @@ file keyed by the group session, with the speaker's member session id on a
 ### Frames
 
 ```
-reasoning*                       (0..n, only with reasoning on)
+reasoning*  (0..n, only with reasoning on)
 cast
 ( meta → delta* → done → image_request?  |  meta → done{truncated:true} → speaker_error  |  speaker_error )  × speakers
 final

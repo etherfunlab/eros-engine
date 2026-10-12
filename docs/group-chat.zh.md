@@ -171,7 +171,7 @@ POST /v2/comp/group/{gid}/message/stream
 ### 帧
 
 ```
-reasoning*                       （0..n 条，仅在开启推理时）
+reasoning*  （0..n 条，仅在开启推理时）
 cast
 ( meta → delta* → done → image_request?  |  meta → done{truncated:true} → speaker_error  |  speaker_error )  × 发言者
 final
