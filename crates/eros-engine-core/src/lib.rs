@@ -2,6 +2,7 @@
 //! Pure-domain logic with no I/O.
 
 pub mod affinity;
+pub mod effects;
 pub mod ghost;
 pub mod pde;
 pub mod persona;
