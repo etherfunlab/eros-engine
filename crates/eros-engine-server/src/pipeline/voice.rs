@@ -149,6 +149,13 @@ pub struct VoiceBootstrap {
     /// The sibling voice session the transcript came from (audit only).
     #[serde(default)]
     pub prev_session_id: Option<Uuid>,
+    /// The pair's text-session lingering effects at the call's first turn
+    /// (spec 2026-10-12-given-item-lingering-effects-design.md §8). Stored
+    /// structured, unlike the parts above, because the `body_state` frame
+    /// needs them so; `body_state` renders them purely, so the prefix stays
+    /// byte-stable for the call.
+    #[serde(default)]
+    pub effects: Vec<eros_engine_core::effects::ActiveEffect>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -175,9 +182,9 @@ fn plan_bootstrap(session_metadata: &serde_json::Value) -> BootstrapPlan {
     }
 }
 
-/// Render the bootstrap block: `[关于他]` bullets then the `[上次通话]`
-/// transcript. Each sub-block is omitted when its part is empty; `None` when
-/// both are — the caller then emits no block at all (no stray blank lines).
+/// Render the bootstrap block: `[关于他]` bullets, the `[上次通话]`
+/// transcript, then the `[身体状态]` line. Each sub-block is omitted when its
+/// part is empty; `None` when all are — the caller then emits no block at all (no stray blank lines).
 fn render_bootstrap(b: &VoiceBootstrap) -> Option<String> {
     let bullets: Vec<&str> = b
         .insights
@@ -190,7 +197,8 @@ fn render_bootstrap(b: &VoiceBootstrap) -> Option<String> {
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    if bullets.is_empty() && prev.is_none() {
+    let body = crate::prompt::body_state(&b.effects);
+    if bullets.is_empty() && prev.is_none() && body.is_none() {
         return None;
     }
     let mut s = String::new();
@@ -207,6 +215,13 @@ fn render_bootstrap(b: &VoiceBootstrap) -> Option<String> {
         }
         s.push_str("[上次通话]\n");
         s.push_str(t);
+    }
+    if let Some(t) = body {
+        if !s.is_empty() {
+            s.push_str("\n\n");
+        }
+        s.push_str("[身体状态]\n");
+        s.push_str(&t);
     }
     Some(s)
 }
@@ -282,8 +297,25 @@ async fn load_bootstrap_prev_call(
     Ok((render_prev_call(&rows), Some(sibling.id)))
 }
 
-/// Assemble a first-turn snapshot. The two parts degrade independently; the
-/// returned flag is `true` only when BOTH succeeded — a partial snapshot is
+/// The lingering effects of the pair's text session: the session of the
+/// affinity row this call reads its relationship line from. No such row ⇒
+/// none, still a success.
+async fn load_bootstrap_effects(
+    pool: &PgPool,
+    user_id: Uuid,
+    instance_id: Uuid,
+) -> Result<Vec<eros_engine_core::effects::ActiveEffect>, sqlx::Error> {
+    let Some(affinity) = (AffinityRepo { pool })
+        .load_latest_for_pair(user_id, instance_id)
+        .await?
+    else {
+        return Ok(Vec::new());
+    };
+    crate::pipeline::handlers::load_effects(pool, affinity.session_id, None).await
+}
+
+/// Assemble a first-turn snapshot. The three parts degrade independently; the
+/// returned flag is `true` only when every part succeeded — a partial snapshot is
 /// injected in memory for this turn but must not be frozen, so the next turn
 /// retries.
 async fn assemble_bootstrap(
@@ -293,9 +325,10 @@ async fn assemble_bootstrap(
     session_id: Uuid,
     insight_mode: InsightMode,
 ) -> (VoiceBootstrap, bool) {
-    let (insights_res, prev_res) = tokio::join!(
+    let (insights_res, prev_res, effects_res) = tokio::join!(
         load_bootstrap_insights(pool, user_id, insight_mode),
         load_bootstrap_prev_call(pool, user_id, instance_id, session_id),
+        load_bootstrap_effects(pool, user_id, instance_id),
     );
     let mut complete = true;
     let insights = match insights_res {
@@ -314,11 +347,20 @@ async fn assemble_bootstrap(
             (None, None)
         }
     };
+    let effects = match effects_res {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "voice: bootstrap effects read failed");
+            complete = false;
+            Vec::new()
+        }
+    };
     (
         VoiceBootstrap {
             insights,
             prev_call,
             prev_session_id,
+            effects,
             created_at: Utc::now(),
         },
         complete,
@@ -635,6 +677,14 @@ pub fn run_voice_turn(
             },
         };
         let bootstrap_block = bootstrap.as_ref().and_then(render_bootstrap);
+
+        // The call's frozen state for the caller (spec 2026-10-12-given-item-
+        // lingering-effects-design.md §9.1), before the first `delta`.
+        if let Some(frame) = bootstrap.as_ref().and_then(|b| {
+            crate::pipeline::stream::body_state_frame(turn.user_message_id, &b.effects)
+        }) {
+            yield frame;
+        }
 
         // Recall degrades silently in every direction: the gate closed, the
         // budget blew, or `recall_memory` swallowed an embed/search failure
@@ -1015,6 +1065,7 @@ mod tests {
             insights: insights.iter().map(|s| (*s).to_string()).collect(),
             prev_call: prev_call.map(str::to_string),
             prev_session_id: None,
+            effects: Vec::new(),
             created_at: Utc::now(),
         }
     }
@@ -1074,6 +1125,43 @@ mod tests {
              [关于他]\n- 城市：上海\n- 职业：设计师\n\n\
              [上次通话]\n用户：你好\n她：嗨呀"
         );
+    }
+
+    fn cigarette() -> eros_engine_core::effects::ActiveEffect {
+        eros_engine_core::effects::ActiveEffect {
+            item: eros_engine_core::types::GivenItem::Cigarette,
+            name: None,
+            quantity: 1,
+            level: 3,
+            phase: eros_engine_core::effects::EffectPhase::Peak,
+            step: 1,
+            steps: 1,
+        }
+    }
+
+    #[test]
+    fn bootstrap_block_renders_the_body_state_last() {
+        let mut s = snapshot(&["城市：上海"], Some("用户：你好"));
+        s.effects = vec![cigarette()];
+        assert_eq!(
+            render_bootstrap(&s).as_deref(),
+            Some("[关于他]\n- 城市：上海\n\n[上次通话]\n用户：你好\n\n[身体状态]\n1 支烟，烟劲很足，正在劲头上")
+        );
+        let mut alone = snapshot(&[], None);
+        alone.effects = vec![cigarette()];
+        assert_eq!(
+            render_bootstrap(&alone).as_deref(),
+            Some("[身体状态]\n1 支烟，烟劲很足，正在劲头上")
+        );
+    }
+
+    #[test]
+    fn a_marker_frozen_without_effects_reads_as_none() {
+        let b: VoiceBootstrap = serde_json::from_value(serde_json::json!({
+            "insights": [], "created_at": "2026-10-01T00:00:00Z"
+        }))
+        .unwrap();
+        assert!(b.effects.is_empty());
     }
 
     /// Order: persona → directive → bootstrap → relationship line.
@@ -3117,6 +3205,93 @@ data: [DONE]\n\n";
                 .any(|f| matches!(f, ProtocolFrame::Error { .. })),
             "a memory path must never emit an error frame; got {frames:?}"
         );
+    }
+
+    /// The call carries the text session's state at its first turn and
+    /// re-sends the same state on later turns: a call does not advance it.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_voice_turn_freezes_the_text_sessions_effects(pool: sqlx::PgPool) {
+        let mock = bootstrap_mock().await;
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+        let text = seed_session(&pool, user_id, instance_id, "text").await;
+        AffinityRepo { pool: &pool }
+            .load_or_create(text, user_id, instance_id)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata, sent_at) \
+             VALUES ($1, 'user', '', $2, now() - make_interval(mins => 5))",
+        )
+        .bind(text)
+        .bind(serde_json::json!({"action": {"type": "give", "item": "cigarette", "quantity": 1, "response": "accept"}}))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let session_id = seed_session(&pool, user_id, instance_id, "voice").await;
+
+        for client_msg_id in ["01J9BODY0000000000000001", "01J9BODY0000000000000002"] {
+            let frames = run_bootstrap_turn(
+                &pool,
+                &mock,
+                session_id,
+                instance_id,
+                user_id,
+                client_msg_id,
+                MemoryScope::default(),
+            )
+            .await;
+            assert_no_error_frame(&frames);
+            let bs = frames
+                .iter()
+                .position(|f| matches!(f, ProtocolFrame::BodyState { .. }))
+                .unwrap_or_else(|| panic!("{client_msg_id}: no body_state: {frames:?}"));
+            let first_delta = frames
+                .iter()
+                .position(|f| matches!(f, ProtocolFrame::Delta { .. }))
+                .expect("the reply streams");
+            assert!(bs < first_delta);
+            let ProtocolFrame::BodyState { effects, .. } = &frames[bs] else {
+                unreachable!()
+            };
+            assert_eq!(effects, &vec![cigarette()], "{client_msg_id}");
+        }
+
+        let marker = read_marker(&pool, session_id)
+            .await
+            .expect("marker written");
+        assert_eq!(marker["effects"][0]["item"], "cigarette");
+        let sys = system_prompt_of(&last_request_body(&mock).await);
+        assert!(
+            sys.contains("[身体状态]\n1 支烟，烟劲很足，正在劲头上"),
+            "{sys}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_voice_turn_without_a_text_session_freezes_no_effects(pool: sqlx::PgPool) {
+        let mock = bootstrap_mock().await;
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id, "voice").await;
+        let frames = run_bootstrap_turn(
+            &pool,
+            &mock,
+            session_id,
+            instance_id,
+            user_id,
+            "01J9BODY0000000000000003",
+            MemoryScope::default(),
+        )
+        .await;
+        assert_no_error_frame(&frames);
+        assert!(!frames
+            .iter()
+            .any(|f| matches!(f, ProtocolFrame::BodyState { .. })));
+        let marker = read_marker(&pool, session_id)
+            .await
+            .expect("snapshot still freezes");
+        assert_eq!(marker["effects"], serde_json::json!([]));
     }
 
     /// First turn freezes the snapshot into `metadata.voice_bootstrap` and
