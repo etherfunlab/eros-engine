@@ -10,6 +10,7 @@ pub mod group_director;
 pub mod handlers;
 pub mod post_process;
 pub mod proactive;
+pub mod reasoning_call;
 pub mod snapshot;
 pub mod story;
 pub mod stream;

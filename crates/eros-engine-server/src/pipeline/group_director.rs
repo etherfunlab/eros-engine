@@ -8,12 +8,11 @@ use std::sync::Arc;
 
 use eros_engine_core::affinity::{BondLabel, ChemistryLabel};
 use eros_engine_core::group::{handle, parse_verdict, DirectorVerdict};
-use eros_engine_llm::failure::{AttemptFailure, GatewayError, GatewayKind};
 use eros_engine_llm::model_config::ResolvedGroupDirector;
-use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
 use uuid::Uuid;
 
-use crate::pipeline::stream::{PdeStatus, STREAM_OPEN_TIMEOUT, STREAM_TOTAL_TIMEOUT};
+use crate::pipeline::reasoning_call::{reasoning_call, JudgeCall, JudgeRun, JudgeStep};
+use crate::pipeline::stream::{STREAM_OPEN_TIMEOUT, STREAM_TOTAL_TIMEOUT};
 use crate::state::AppState;
 
 pub(crate) const DIRECTOR_TASK: &str = "group_director";
@@ -110,30 +109,8 @@ pub(crate) fn director_response_format(seat_count: usize) -> serde_json::Value {
     })
 }
 
-pub(crate) enum DirectorStep {
-    Reasoning(String),
-    Finished(DirectorRun),
-}
-
-pub(crate) struct DirectorRun {
-    pub status: PdeStatus,
-    pub verdict: Option<DirectorVerdict>,
-    /// The last unparseable content, on `ParseError`.
-    pub raw: Option<String>,
-    /// Every reasoning delta of every attempt, concatenated.
-    pub reasoning: String,
-    pub generation_id: Option<String>,
-    pub failures: Vec<AttemptFailure>,
-}
-
-fn timeout_failure(model: &str, kind: GatewayKind, secs: u64, what: &str) -> AttemptFailure {
-    AttemptFailure::Gateway(GatewayError {
-        task: DIRECTOR_TASK.to_string(),
-        model: Some(model.to_string()),
-        kind,
-        message: format!("director {what} timeout after {secs}s"),
-    })
-}
+/// A director run is a judge-call run over the director's verdict type.
+pub(crate) type DirectorRun = JudgeRun<DirectorVerdict>;
 
 pub(crate) fn run_director(
     state: Arc<AppState>,
@@ -141,138 +118,26 @@ pub(crate) fn run_director(
     p: ResolvedGroupDirector,
     ctx: String,
     seat_count: usize,
-) -> impl futures_util::Stream<Item = DirectorStep> + Send + 'static {
-    async_stream::stream! {
-        use futures_util::StreamExt as _;
-        let chain: Vec<String> = std::iter::once(p.model.clone())
-            .chain(p.fallback_model.iter().cloned())
-            .collect();
-        let response_format = p.structured_output.then(|| director_response_format(seat_count));
-        let mut failures: Vec<AttemptFailure> = Vec::new();
-        let mut reasoning = String::new();
-        let mut last = PdeStatus::GatewayError;
-        let mut last_parse: Option<(String, Option<String>)> = None;
-        for model_id in &chain {
-            let req = ChatRequest {
-                model: model_id.clone(),
-                fallback_model: vec![],
-                messages: vec![
-                    ChatMessage { role: "system".into(), content: p.director_prompt.clone() },
-                    ChatMessage { role: "user".into(), content: ctx.clone() },
-                ],
-                temperature: p.temperature as f32,
-                max_tokens: p.max_tokens,
-                sampling: p.sampling,
-                response_format: response_format.clone(),
-                task: Some(DIRECTOR_TASK.into()),
-                ..Default::default()
-            };
-            let mut content = String::new();
-            let mut usage = None;
-            let mut gen_id: Option<String> = None;
-            let mut served: Option<String> = None;
-            let mut failed = false;
-            match tokio::time::timeout(
-                STREAM_OPEN_TIMEOUT,
-                state.openrouter.execute_stream_as(&req, model_id),
-            )
-            .await
-            {
-                Ok(Ok(mut s)) => {
-                    let deadline = tokio::time::Instant::now() + STREAM_TOTAL_TIMEOUT;
-                    loop {
-                        match tokio::time::timeout_at(deadline, s.next()).await {
-                            Ok(Some(Ok(c))) => {
-                                if let Some(r) = c.reasoning {
-                                    reasoning.push_str(&r);
-                                    yield DirectorStep::Reasoning(r);
-                                }
-                                if let Some(t) = c.content {
-                                    content.push_str(&t);
-                                }
-                                if c.usage.is_some() { usage = c.usage; }
-                                if c.generation_id.is_some() { gen_id = c.generation_id; }
-                                if c.model.is_some() { served = c.model; }
-                            }
-                            Ok(Some(Err(e))) => {
-                                failures.push(AttemptFailure::from_llm_error(DIRECTOR_TASK, model_id, &e));
-                                failed = true;
-                                break;
-                            }
-                            Ok(None) => break,
-                            Err(_) => {
-                                failures.push(timeout_failure(model_id, GatewayKind::TotalTimeout,
-                                    STREAM_TOTAL_TIMEOUT.as_secs(), "total"));
-                                failed = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-                Ok(Err(e)) => {
-                    failures.push(AttemptFailure::from_llm_error(DIRECTOR_TASK, model_id, &e));
-                    failed = true;
-                }
-                Err(_) => {
-                    failures.push(timeout_failure(model_id, GatewayKind::OpenTimeout,
-                        STREAM_OPEN_TIMEOUT.as_secs(), "open"));
-                    failed = true;
-                }
-            }
-            if failed {
-                tracing::warn!(model = %model_id, "group director: attempt failed; next");
-                last = PdeStatus::for_operation(&failures);
-                continue;
-            }
-            let usage_json = usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
-            let generation_id = super::record_generation(
-                &state.pool,
-                super::GenerationRecord {
-                    task: DIRECTOR_TASK,
-                    session_id: Some(group_session_id),
-                    generation_id: gen_id.as_deref(),
-                    model: served.as_deref(),
-                    usage: usage_json.as_ref(),
-                },
-            )
-            .await;
-            let text = content.trim().to_string();
-            if text.is_empty() {
-                last = PdeStatus::Empty;
-                continue;
-            }
-            match parse_verdict(&text) {
-                Some(v) => {
-                    yield DirectorStep::Finished(DirectorRun {
-                        status: PdeStatus::Ok,
-                        verdict: Some(v),
-                        raw: None,
-                        reasoning,
-                        generation_id,
-                        failures,
-                    });
-                    return;
-                }
-                None => {
-                    tracing::warn!(model = %model_id, "group director: unparseable verdict; next");
-                    last = PdeStatus::ParseError;
-                    last_parse = Some((text, generation_id));
-                }
-            }
-        }
-        let (raw, generation_id) = match (last, last_parse) {
-            (PdeStatus::ParseError, Some((r, g))) => (Some(r), g),
-            _ => (None, None),
-        };
-        yield DirectorStep::Finished(DirectorRun {
-            status: last,
-            verdict: None,
-            raw,
-            reasoning,
-            generation_id,
-            failures,
-        });
-    }
+) -> impl futures_util::Stream<Item = JudgeStep<DirectorVerdict>> + Send + 'static {
+    let chain: Vec<String> = std::iter::once(p.model.clone())
+        .chain(p.fallback_model.iter().cloned())
+        .collect();
+    let call = JudgeCall {
+        task: DIRECTOR_TASK,
+        session_id: Some(group_session_id),
+        chain,
+        system: p.director_prompt.clone(),
+        user: ctx,
+        temperature: p.temperature as f32,
+        max_tokens: p.max_tokens,
+        sampling: p.sampling,
+        response_format: p
+            .structured_output
+            .then(|| director_response_format(seat_count)),
+        open_cap: STREAM_OPEN_TIMEOUT,
+        attempt_budget: STREAM_OPEN_TIMEOUT + STREAM_TOTAL_TIMEOUT,
+    };
+    reasoning_call(state, call, parse_verdict)
 }
 
 /// `companion_decision_events.payload` for a director run: the verdict with a
@@ -332,6 +197,7 @@ pub(crate) async fn record_director_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::stream::PdeStatus;
     use eros_engine_core::affinity::{BondLabel, ChemistryLabel};
     use futures_util::StreamExt as _;
     use sqlx::PgPool;
@@ -461,18 +327,19 @@ mod tests {
             .await;
         let g = group(&pool).await;
         let state = state_with(pool.clone(), &server).await;
-        let steps: Vec<DirectorStep> = run_director(state, g, resolved(vec![]), "ctx".into(), 1)
-            .collect()
-            .await;
+        let steps: Vec<JudgeStep<DirectorVerdict>> =
+            run_director(state, g, resolved(vec![]), "ctx".into(), 1)
+                .collect()
+                .await;
         let reasoning: Vec<&str> = steps
             .iter()
             .filter_map(|s| match s {
-                DirectorStep::Reasoning(r) => Some(r.as_str()),
+                JudgeStep::Reasoning(r) => Some(r.as_str()),
                 _ => None,
             })
             .collect();
         assert_eq!(reasoning, vec!["小美最熟，", "让她先说"]);
-        let DirectorStep::Finished(run) = steps.last().unwrap() else {
+        let JudgeStep::Finished(run) = steps.last().unwrap() else {
             panic!("finished last")
         };
         assert_eq!(run.status, PdeStatus::Ok);
@@ -510,11 +377,11 @@ mod tests {
             .await;
         let g = group(&pool).await;
         let state = state_with(pool.clone(), &server).await;
-        let steps: Vec<DirectorStep> =
+        let steps: Vec<JudgeStep<DirectorVerdict>> =
             run_director(state, g, resolved(vec!["dir-b".into()]), "ctx".into(), 1)
                 .collect()
                 .await;
-        let DirectorStep::Finished(run) = steps.last().unwrap() else {
+        let JudgeStep::Finished(run) = steps.last().unwrap() else {
             panic!()
         };
         assert_eq!(run.status, PdeStatus::ParseError);

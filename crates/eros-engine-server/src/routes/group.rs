@@ -349,7 +349,7 @@ fn duplicate_in_progress(user_message_id: Uuid) -> AppError {
 #[utoipa::path(post, path = "/v2/comp/group/{group_id}/message/stream", tag = "group",
     params(("group_id" = Uuid, Path)), request_body = GroupSendRequest,
     responses(
-        (status = 200, description = "SSE: director_reasoning* → cast → (meta → delta* → done → image_request? | meta → done{truncated:true} → speaker_error | speaker_error)×N → final. \
+        (status = 200, description = "SSE: reasoning* → cast → (meta → delta* → done → image_request? | meta → done{truncated:true} → speaker_error | speaker_error)×N → final. \
             A failed speaker emits `meta → done{truncated:true}` for each attempt and then `speaker_error` when its chain is exhausted, \
             or a bare `speaker_error` when its request could not be built or its image row could not be persisted. \
             A terminal `error` can replace anything after the first frame.", content_type = "text/event-stream"),
@@ -1148,7 +1148,7 @@ mod tests {
             body.find(needle)
                 .unwrap_or_else(|| panic!("missing {needle}: {body}"))
         };
-        let reasoning = at(r#""type":"director_reasoning""#);
+        let reasoning = at(r#""type":"reasoning""#);
         let cast = at(r#""type":"cast""#);
         let first_meta = at(&format!(r#""speaker_session_id":"{}""#, f.b));
         let second_meta = at(&format!(r#""speaker_session_id":"{}""#, f.a));
@@ -1233,7 +1233,7 @@ mod tests {
             .find(&format!(r#""member_session_id":"{}""#, f.b))
             .unwrap();
         assert!(a < b, "cast in join order: {body}");
-        assert!(!body.contains("director_reasoning"));
+        assert!(!body.contains("reasoning"));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

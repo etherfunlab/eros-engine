@@ -25,9 +25,10 @@ use uuid::Uuid;
 use crate::holiday::UserLocale;
 use crate::pipeline::chat_queue::{classify_outcome, TurnOutcome};
 use crate::pipeline::group_director::{
-    director_context, record_director_event, run_director, DirectorSeat, DirectorStep,
+    director_context, record_director_event, run_director, DirectorSeat,
 };
 use crate::pipeline::post_process::{GroupSpoken, ProducedMessage};
+use crate::pipeline::reasoning_call::JudgeStep;
 use crate::pipeline::stream::{
     build_delegated_image_marker, build_delegated_image_prompt, build_final_frame,
     build_image_request_frame, delegated_image_only_frames, drive_chat_burst_for, frame_action_for,
@@ -363,10 +364,10 @@ pub(crate) fn run_group_turn(
                 futures_util::pin_mut!(steps);
                 while let Some(step) = steps.next().await {
                     match step {
-                        DirectorStep::Reasoning(content) => {
-                            yield ProtocolFrame::DirectorReasoning { content };
+                        JudgeStep::Reasoning(content) => {
+                            yield ProtocolFrame::Reasoning { content };
                         }
-                        DirectorStep::Finished(r) => run = Some(r),
+                        JudgeStep::Finished(r) => run = Some(r),
                     }
                 }
                 let run = run.expect("run_director always finishes");

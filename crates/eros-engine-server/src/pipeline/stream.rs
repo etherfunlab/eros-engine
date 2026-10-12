@@ -159,8 +159,8 @@ pub enum ProtocolFrame {
     Cast {
         speakers: Vec<CastEntry>,
     },
-    /// Group turns: one reasoning delta from the director. Display only.
-    DirectorReasoning {
+    /// One reasoning delta from the judge (1:1) or the director (group). Display only.
+    Reasoning {
         content: String,
     },
     /// Group turns: one speaker failed; the turn continues with the next.
@@ -6229,14 +6229,11 @@ mod tests {
             cast,
             serde_json::json!({"type":"cast","speakers":[{"member_session_id": s.to_string(),"action_type":"reply_text_image"}]})
         );
-        let r = serde_json::to_value(&ProtocolFrame::DirectorReasoning {
+        let r = serde_json::to_value(&ProtocolFrame::Reasoning {
             content: "想".into(),
         })
         .unwrap();
-        assert_eq!(
-            r,
-            serde_json::json!({"type":"director_reasoning","content":"想"})
-        );
+        assert_eq!(r, serde_json::json!({"type":"reasoning","content":"想"}));
         let e = serde_json::to_value(&ProtocolFrame::SpeakerError {
             speaker_session_id: s,
             code: StreamErrorCode::UpstreamUnavailable,
@@ -11945,7 +11942,7 @@ data: [DONE]\n\n";
                 ProtocolFrame::ActionResponse { .. } => "action_response",
                 ProtocolFrame::BodyState { .. } => "body_state",
                 ProtocolFrame::Cast { .. } => "cast",
-                ProtocolFrame::DirectorReasoning { .. } => "director_reasoning",
+                ProtocolFrame::Reasoning { .. } => "reasoning",
                 ProtocolFrame::SpeakerError { .. } => "speaker_error",
             };
             if out.last() != Some(&kind) {
