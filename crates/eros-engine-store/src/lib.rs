@@ -8,6 +8,7 @@ pub mod chat_queue;
 pub mod decision;
 pub mod error_handling;
 pub mod generation;
+pub mod group;
 pub mod human_insight;
 pub mod image_events;
 pub mod insight;
