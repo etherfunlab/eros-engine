@@ -780,6 +780,7 @@ fn drive_chat_burst(
                     } else {
                         build_metadata(None, &[])
                     },
+                    speaker_session_id: None,
                 };
                 if let Err(e) = chat_repo
                     .insert_assistant_batch(session_id, user_message_id, &[row])
@@ -1170,6 +1171,7 @@ fn drive_chat_burst(
                         } else {
                             build_metadata(None, &[])
                         },
+                        speaker_session_id: None,
                     };
                     if let Err(e) = chat_repo
                         .insert_assistant_batch(session_id, user_message_id, &[row])
@@ -1540,6 +1542,7 @@ fn drive_chat_burst(
                 } else {
                     build_metadata(filter_failure.as_ref(), &filter_attempts)
                 },
+                speaker_session_id: None,
             };
             if let Err(e) = chat_repo.insert_assistant_batch(session_id, user_message_id, &[row]).await {
                 tracing::warn!("stream(filtered): persist failed: {e}");
@@ -4056,6 +4059,7 @@ async fn build_stream_failure_pseudo_ghost(
         generation_id: None,
         filter_audit: None,
         metadata,
+        speaker_session_id: None,
     };
     if let Err(e) = chat_repo
         .insert_assistant_batch(session_id, user_message_id, &[row])
@@ -4176,6 +4180,7 @@ async fn build_garble_repaired_replacement(
         generation_id: None,
         filter_audit: None,
         metadata,
+        speaker_session_id: None,
     };
     if let Err(e) = chat_repo
         .insert_assistant_batch(session_id, user_message_id, &[row])
@@ -5105,6 +5110,7 @@ pub(crate) fn run_stream_with(
                         generation_id: None,
                         filter_audit: None,
                         metadata: Some(serde_json::json!({ "image": marker })),
+                        speaker_session_id: None,
                     };
                     if let Err(e) = chat_repo
                         .insert_assistant_batch(
@@ -7450,6 +7456,7 @@ mod tests {
                 read_at: None,
                 reaction: None,
                 reacted_at: None,
+                speaker_session_id: None,
             },
         };
 
@@ -7511,6 +7518,7 @@ mod tests {
                 read_at: None,
                 reaction: None,
                 reacted_at: None,
+                speaker_session_id: None,
             },
         };
 
@@ -7590,6 +7598,7 @@ mod tests {
                 read_at: None,
                 reaction: None,
                 reacted_at: None,
+                speaker_session_id: None,
             },
         };
 
@@ -7666,6 +7675,7 @@ mod tests {
                 read_at: None,
                 reaction: None,
                 reacted_at: None,
+                speaker_session_id: None,
             },
         };
 
@@ -10759,6 +10769,7 @@ data: [DONE]\n\n";
                 read_at: None,
                 reaction: None,
                 reacted_at: None,
+                speaker_session_id: None,
             },
         };
 
@@ -10855,6 +10866,7 @@ data: [DONE]\n\n";
                 read_at: None,
                 reaction: None,
                 reacted_at: None,
+                speaker_session_id: None,
             },
         };
         let mut s = crate::routes::companion::test_state(pool.clone());

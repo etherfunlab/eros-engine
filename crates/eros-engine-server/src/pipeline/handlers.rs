@@ -1862,6 +1862,7 @@ mod tests {
             read_at: None,
             reaction: None,
             reacted_at: None,
+            speaker_session_id: None,
         }
     }
 
@@ -2132,6 +2133,7 @@ mod tests {
             read_at: None,
             reaction: None,
             reacted_at: None,
+            speaker_session_id: None,
         }
     }
 
@@ -2344,6 +2346,7 @@ mod tests {
             read_at: None,
             reaction: None,
             reacted_at: None,
+            speaker_session_id: None,
         }
     }
 

@@ -124,6 +124,7 @@ async fn scan_and_classify(
              SELECT id FROM engine.chat_sessions \
              WHERE classified_at IS NULL \
                AND NOT archived \
+               AND channel <> 'group' \
                AND last_active_at < $1 \
                AND (classification_claimed_at IS NULL \
                     OR classification_claimed_at < $2) \

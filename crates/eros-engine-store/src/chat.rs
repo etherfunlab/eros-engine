@@ -14,8 +14,12 @@ pub struct ChatSession {
     pub is_converted: bool,
     pub last_active_at: DateTime<Utc>,
     pub metadata: serde_json::Value,
-    /// Conversation channel ('text' or 'voice'); start/resume is channel-scoped.
+    /// Conversation channel ('text', 'voice' or 'group'); start/resume is channel-scoped.
     pub channel: String,
+    /// The group's name, on `channel = 'group'` rows only.
+    #[sqlx(default)]
+    #[serde(default)]
+    pub title: Option<String>,
     /// Set by the dreaming-lite sweeper after a classification pass.
     /// `None` means the session is still eligible for the next sweep tick.
     pub classified_at: Option<DateTime<Utc>>,
@@ -77,6 +81,10 @@ pub struct ChatMessage {
     /// tips and for `user` rows on the voice channel.
     #[serde(default)]
     pub read_at: Option<DateTime<Utc>>,
+    /// The member session that spoke this group line; `None` everywhere else.
+    #[sqlx(default)]
+    #[serde(default)]
+    pub speaker_session_id: Option<Uuid>,
     /// The emoji the user reacted to this assistant row with (migration
     /// 0065), fully qualified; `None` when there is none.
     #[serde(default)]
@@ -174,6 +182,9 @@ pub struct ChatMessageSlim {
     /// has disconnected, so history is the only place it can read them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_message_id: Option<Uuid>,
+    /// The member session that spoke this group line; `None` everywhere else.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_session_id: Option<Uuid>,
 }
 
 /// The `ChatMessageSlim` projection, shared by every query that decodes one.
@@ -182,7 +193,7 @@ const SLIM_COLUMNS: &str = "id, role, content, sent_at, client_msg_id, \
      (metadata->'image' IS NOT NULL) AS image, \
      metadata->>'reply_to_message_id' AS reply_to_message_id, \
      metadata->'action' AS action, \
-     user_message_id";
+     user_message_id, speaker_session_id";
 
 /// An assistant row's reaction as the next reply turn renders it (spec
 /// 2026-10-05-message-reactions-design.md §6).
@@ -390,6 +401,39 @@ impl<'a> ChatRepo<'a> {
         .await?;
         rows.reverse();
         Ok(rows)
+    }
+
+    /// A group turn's transcript for one speaker, chronological: the newest
+    /// `limit` rows at or before the turn's user row, then the assistant rows
+    /// earlier speakers of THIS turn already persisted. A newer user row that
+    /// arrived mid-turn, and anything answering it, is not included — the
+    /// window ends at this turn.
+    pub async fn group_history_for_turn(
+        &self,
+        group_session_id: Uuid,
+        anchor_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<ChatMessage>, sqlx::Error> {
+        sqlx::query_as::<_, ChatMessage>(
+            "WITH a AS (SELECT sent_at, id FROM engine.chat_messages \
+                        WHERE id = $2 AND session_id = $1) \
+             SELECT * FROM ( \
+               (SELECT m.* FROM engine.chat_messages m, a \
+                WHERE m.session_id = $1 AND (m.sent_at, m.id) <= (a.sent_at, a.id) \
+                ORDER BY m.sent_at DESC, m.id DESC \
+                LIMIT $3) \
+               UNION ALL \
+               (SELECT m.* FROM engine.chat_messages m, a \
+                WHERE m.session_id = $1 AND m.user_message_id = $2 AND m.role = 'assistant' \
+                  AND (m.sent_at, m.id) > (a.sent_at, a.id)) \
+             ) t \
+             ORDER BY t.sent_at, t.id",
+        )
+        .bind(group_session_id)
+        .bind(anchor_id)
+        .bind(limit)
+        .fetch_all(self.pool)
+        .await
     }
 
     /// Full row for message `id` within `session_id`; `None` if the id is not
@@ -659,11 +703,11 @@ impl<'a> ChatRepo<'a> {
         .await
     }
 
-    /// All sessions belonging to a user, most-recently-active first.
+    /// A user's 1:1 sessions (text and voice), most-recently-active first. Groups are listed by GroupRepo.
     pub async fn list_sessions(&self, user_id: Uuid) -> Result<Vec<ChatSession>, sqlx::Error> {
         sqlx::query_as::<_, ChatSession>(
             "SELECT * FROM engine.chat_sessions \
-             WHERE user_id = $1 AND NOT archived \
+             WHERE user_id = $1 AND NOT archived AND channel <> 'group' \
              ORDER BY last_active_at DESC",
         )
         .bind(user_id)
@@ -764,6 +808,8 @@ pub struct AssistantInsert {
     pub llm_attempts: Option<serde_json::Value>,
     /// Gateway-layer failures for the same chains.
     pub gateway_errors: Option<serde_json::Value>,
+    /// The member session speaking this line in a group; `None` for 1:1.
+    pub speaker_session_id: Option<Uuid>,
 }
 
 /// One persona-initiated assistant row: `assistant_action_type = 'proactive'`,
@@ -841,9 +887,9 @@ async fn insert_assistant_row_in_tx(
             assistant_action_type, \
             pre_filter_content, filter_model, filter_triggers, \
             f_client_msg_id, f_generation_id, metadata, \
-            llm_attempts, gateway_errors) \
+            llm_attempts, gateway_errors, speaker_session_id) \
          VALUES ($1, $2, 'assistant', $3, $4, $5, $6, $7, $8, \
-                 $9, $10, $11, $12, $13, $14, $15, $16)",
+                 $9, $10, $11, $12, $13, $14, $15, $16, $17)",
     )
     .bind(row.id)
     .bind(session_id)
@@ -861,6 +907,7 @@ async fn insert_assistant_row_in_tx(
     .bind(&row.metadata)
     .bind(&row.llm_attempts)
     .bind(&row.gateway_errors)
+    .bind(row.speaker_session_id)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -1983,6 +2030,202 @@ mod tests {
             .unwrap()
     }
 
+    async fn seed_group(pool: &PgPool, user_id: Uuid) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, channel) VALUES ($1, 'group') RETURNING id",
+        )
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn seed_row(
+        pool: &PgPool,
+        session_id: Uuid,
+        role: &str,
+        content: &str,
+        secs: i64,
+        user_message_id: Option<Uuid>,
+        speaker: Option<Uuid>,
+    ) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages \
+               (session_id, role, content, sent_at, user_message_id, speaker_session_id) \
+             VALUES ($1, $2, $3, '2026-10-12T00:00:00Z'::timestamptz + make_interval(secs => $4), $5, $6) \
+             RETURNING id",
+        )
+        .bind(session_id)
+        .bind(role)
+        .bind(content)
+        .bind(secs as f64)
+        .bind(user_message_id)
+        .bind(speaker)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn group_constraints_hold(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let with_instance = sqlx::query(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id, channel) VALUES ($1, $2, 'group')",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .execute(&pool)
+        .await;
+        assert!(with_instance.is_err(), "a group carries no instance");
+
+        let text_titled = sqlx::query(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id, title) VALUES ($1, $2, '名字')",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .execute(&pool)
+        .await;
+        assert!(text_titled.is_err(), "title is group-only");
+
+        let blank = sqlx::query(
+            "INSERT INTO engine.chat_sessions (user_id, channel, title) VALUES ($1, 'group', '  ')",
+        )
+        .bind(user_id)
+        .execute(&pool)
+        .await;
+        assert!(blank.is_err(), "a blank title is refused");
+
+        let group = seed_group(&pool, user_id).await;
+        let speaker_on_user = sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, speaker_session_id) \
+             VALUES ($1, 'user', 'x', $1)",
+        )
+        .bind(group)
+        .execute(&pool)
+        .await;
+        assert!(
+            speaker_on_user.is_err(),
+            "only assistant rows carry a speaker"
+        );
+
+        let rls: bool = sqlx::query_scalar(
+            "SELECT relrowsecurity FROM pg_class WHERE oid = 'engine.chat_session_members'::regclass",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(rls);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn list_sessions_leaves_groups_out(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let text = repo.create_session(user_id, instance_id).await.unwrap();
+        seed_group(&pool, user_id).await;
+        let listed = repo.list_sessions(user_id).await.unwrap();
+        assert_eq!(
+            listed.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![text.id]
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn group_history_for_turn_bounds_to_this_turn(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let g = seed_group(&pool, user_id).await;
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let member = repo.create_session(user_id, instance_id).await.unwrap().id;
+        let u1 = seed_row(&pool, g, "user", "上一句", 0, None, None).await;
+        let a1 = seed_row(
+            &pool,
+            g,
+            "assistant",
+            "上一句的回复",
+            1,
+            Some(u1),
+            Some(member),
+        )
+        .await;
+        let u2 = seed_row(&pool, g, "user", "这一句", 2, None, None).await;
+        // A newer user row lands mid-turn (its reply too) …
+        let u3 = seed_row(&pool, g, "user", "更新的一句", 3, None, None).await;
+        let _c = seed_row(
+            &pool,
+            g,
+            "assistant",
+            "更新的回复",
+            4,
+            Some(u3),
+            Some(member),
+        )
+        .await;
+        // … and the earlier speaker of THIS turn is persisted after it.
+        let b1 = seed_row(
+            &pool,
+            g,
+            "assistant",
+            "这一轮第一个人",
+            5,
+            Some(u2),
+            Some(member),
+        )
+        .await;
+
+        let rows = repo.group_history_for_turn(g, u2, 20).await.unwrap();
+        assert_eq!(
+            rows.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![u1, a1, u2, b1]
+        );
+        assert_eq!(rows[3].speaker_session_id, Some(member));
+
+        let window = repo.group_history_for_turn(g, u2, 2).await.unwrap();
+        assert_eq!(
+            window.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![a1, u2, b1]
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn insert_assistant_batch_writes_the_speaker(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let member = repo.create_session(user_id, instance_id).await.unwrap().id;
+        let g = seed_group(&pool, user_id).await;
+        let u = seed_row(&pool, g, "user", "嗨", 0, None, None).await;
+        let id = Uuid::new_v4();
+        repo.insert_assistant_batch(
+            g,
+            u,
+            &[AssistantInsert {
+                id,
+                content: "嗨嗨".into(),
+                assistant_action_type: "reply".into(),
+                continues_from_message_id: None,
+                truncated: false,
+                generation_id: None,
+                filter_audit: None,
+                metadata: None,
+                llm_attempts: None,
+                gateway_errors: None,
+                speaker_session_id: Some(member),
+            }],
+        )
+        .await
+        .unwrap();
+        let got: Option<Uuid> =
+            sqlx::query_scalar("SELECT speaker_session_id FROM engine.chat_messages WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(got, Some(member));
+    }
+
     #[sqlx::test(migrations = "./migrations")]
     async fn create_then_retrieve_session(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
@@ -2506,6 +2749,7 @@ mod tests {
                 generation_id: Some("gen-1".into()),
                 filter_audit: None,
                 metadata: None,
+                speaker_session_id: None,
             }],
         )
         .await
@@ -2737,6 +2981,7 @@ mod tests {
                 f_generation_id: Some("gen_filter_abc".into()),
             }),
             metadata: None,
+            speaker_session_id: None,
         };
         repo.insert_assistant_batch(s.id, user_msg_id, &[row])
             .await
@@ -2791,6 +3036,7 @@ mod tests {
             generation_id: Some("gen_chat_xyz".into()),
             filter_audit: None,
             metadata: None,
+            speaker_session_id: None,
         };
         repo.insert_assistant_batch(s.id, user_msg_id, &[row])
             .await
@@ -2872,6 +3118,7 @@ mod tests {
                 f_generation_id: None,
             }),
             metadata: None,
+            speaker_session_id: None,
         };
         repo.insert_assistant_batch(s.id, user_msg_id, &[row])
             .await
@@ -2925,6 +3172,7 @@ mod tests {
                 f_generation_id: None,
             }),
             metadata: None,
+            speaker_session_id: None,
         };
         repo.insert_assistant_batch(s.id, user_msg_id, &[row])
             .await
@@ -2973,6 +3221,7 @@ mod tests {
             generation_id: Some("gen_chat_xyz".into()),
             filter_audit: None,
             metadata: Some(metadata.clone()),
+            speaker_session_id: None,
         };
         repo.insert_assistant_batch(s.id, user_msg_id, &[row])
             .await
@@ -3013,6 +3262,7 @@ mod tests {
             generation_id: Some("gen_chat_xyz".into()),
             filter_audit: None,
             metadata: None,
+            speaker_session_id: None,
         };
         repo.insert_assistant_batch(s.id, user_msg_id, &[row])
             .await
@@ -3057,6 +3307,7 @@ mod tests {
             generation_id: Some("gen_chat_xyz".into()),
             filter_audit: None,
             metadata: Some(metadata.clone()),
+            speaker_session_id: None,
         };
         repo.insert_assistant_batch(s.id, user_msg_id, &[row])
             .await
@@ -3193,6 +3444,7 @@ mod tests {
                 metadata: None,
                 llm_attempts: Some(attempts.clone()),
                 gateway_errors: Some(gateway.clone()),
+                speaker_session_id: None,
             }],
         )
         .await
@@ -3654,6 +3906,7 @@ mod tests {
                 generation_id: None,
                 filter_audit: None,
                 metadata: None,
+                speaker_session_id: None,
             }],
         )
         .await
@@ -3700,6 +3953,7 @@ mod tests {
                 generation_id: None,
                 filter_audit: None,
                 metadata: None,
+                speaker_session_id: None,
             }],
         )
         .await

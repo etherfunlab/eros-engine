@@ -721,6 +721,7 @@ data: [DONE]\n\n";
                     metadata: None,
                     llm_attempts: None,
                     gateway_errors: None,
+                    speaker_session_id: None,
                 }],
             )
             .await

@@ -879,6 +879,7 @@ async fn edit_image(
             metadata: Some(metadata),
             llm_attempts: text.llm_attempts.clone(),
             gateway_errors: text.gateway_errors.clone(),
+            speaker_session_id: None,
         };
         chat_repo
             .insert_assistant_batch(session_id, umid, &[insert])
@@ -899,6 +900,7 @@ async fn edit_image(
             metadata: Some(marker_metadata),
             llm_attempts: None,
             gateway_errors: None,
+            speaker_session_id: None,
         };
         match source_user_message_id {
             Some(umid) => {

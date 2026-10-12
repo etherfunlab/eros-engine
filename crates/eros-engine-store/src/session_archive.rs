@@ -76,6 +76,17 @@ impl<'a> SessionArchiveRepo<'a> {
         .await?
         .rows_affected();
 
+        // The persona leaves every group with the relationship (spec §7.3).
+        sqlx::query(
+            "DELETE FROM engine.chat_session_members \
+             WHERE member_session_id IN ( \
+                 SELECT id FROM engine.chat_sessions WHERE user_id = $1 AND instance_id = $2)",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .execute(&mut *tx)
+        .await?;
+
         sqlx::query(
             "DELETE FROM engine.companion_memories \
              WHERE user_id = $1 AND instance_id = $2",
@@ -135,6 +146,43 @@ mod tests {
     use crate::user_insight::{UserInsightEventInsert, UserInsightEventRepo, UserInsightRepo};
     use sqlx::PgPool;
     use uuid::Uuid;
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn archive_relationship_drops_memberships(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = crate::testutil::seed_persona_instance(&pool, user_id).await;
+        let chat = crate::chat::ChatRepo { pool: &pool };
+        let member = chat.create_session(user_id, instance_id).await.unwrap().id;
+        let group: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, channel) VALUES ($1, 'group') RETURNING id",
+        )
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.chat_session_members (group_session_id, member_session_id) VALUES ($1, $2)",
+        )
+        .bind(group)
+        .bind(member)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        SessionArchiveRepo { pool: &pool }
+            .archive_relationship(user_id, instance_id)
+            .await
+            .unwrap();
+
+        let left: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_session_members WHERE group_session_id = $1",
+        )
+        .bind(group)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(left, 0);
+    }
 
     /// Persist one session with one message, an affinity row, one
     /// relationship-layer memory and one profile-layer memory.

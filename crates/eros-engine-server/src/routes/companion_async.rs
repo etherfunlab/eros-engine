@@ -434,6 +434,7 @@ mod tests {
                     generation_id: Some("gen-1".into()),
                     filter_audit: None,
                     metadata: None,
+                    speaker_session_id: None,
                 }],
             )
             .await
