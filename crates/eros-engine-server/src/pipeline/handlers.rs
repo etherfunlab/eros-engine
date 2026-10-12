@@ -786,6 +786,10 @@ pub(crate) async fn build_reply_request(
     // Only the user-driven text turn renders [reactions]; /open greetings and edit
     // turns pass false (spec 2026-10-05-message-reactions §6.3).
     render_reactions: bool,
+    // The persona's lingering state, rendered once by the caller (spec
+    // 2026-10-12-given-item-lingering-effects-design.md §6.2). Only the text
+    // turn passes one.
+    body_state: Option<&str>,
 ) -> Result<(ChatRequest, Vec<String>), AppError> {
     let chat_repo = ChatRepo { pool: &state.pool };
     // A quote points at one line; it never narrows the window. Every turn gets
@@ -958,6 +962,7 @@ pub(crate) async fn build_reply_request(
         character_state_for_prompt,
         plan.nudges,
         now,
+        body_state,
     );
 
     if render_reactions {
@@ -2981,6 +2986,7 @@ mod tests {
             user_message_id,
             &crate::prompt::NowContext::default(),
             false,
+            None,
         )
         .await
         .expect("build_reply_request succeeds");
@@ -3109,6 +3115,7 @@ mod tests {
             user_message_id,
             &now,
             false,
+            None,
         )
         .await
         .expect("build_reply_request succeeds");
@@ -3240,6 +3247,7 @@ mod tests {
             user_message_id,
             &crate::prompt::NowContext::default(),
             false,
+            None,
         )
         .await
         .expect("build_reply_request succeeds");
@@ -3440,6 +3448,7 @@ mod tests {
             user_message_id,
             &crate::prompt::NowContext::default(),
             false,
+            None,
         )
         .await
         .expect("build_reply_request succeeds");
@@ -3539,6 +3548,7 @@ mod tests {
             user_message_id,
             &crate::prompt::NowContext::default(),
             false,
+            None,
         )
         .await
         .expect("build_reply_request succeeds");
@@ -3666,6 +3676,7 @@ mod tests {
                     current,
                     &crate::prompt::NowContext::default(),
                     render,
+                    None,
                 )
                 .await
                 .expect("build_reply_request succeeds");

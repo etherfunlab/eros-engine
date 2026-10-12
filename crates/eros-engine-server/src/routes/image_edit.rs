@@ -414,6 +414,7 @@ async fn generate_reply_text(
         instruction_row_id,
         now,
         false,
+        None,
     )
     .await
     {

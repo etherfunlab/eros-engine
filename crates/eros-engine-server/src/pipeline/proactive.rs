@@ -172,6 +172,7 @@ pub(crate) async fn greet(
         Uuid::nil(),
         g.now,
         false,
+        None,
     )
     .await?;
     chat_req.messages.push(WireMessage {
