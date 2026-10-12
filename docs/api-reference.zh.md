@@ -111,6 +111,8 @@ data: {"type":"final","filtered":false,"prompt_injected":null,"tier":null,"retri
 - **`meta`** —— `message_id`、`action_type`、`model`（实际服务的模型 id，可能省略），以及 `continues_from`（可选，本轮续接重试链时为上一条消息 id）。`action_type` 是以下之一：`reply` | `ghost` | `reply_image` | `reply_text_image` | `product_qa`（纯文本回复报告为 `reply`，不是 `reply_text`——线上协议里没有 `reply_text`）。`product_qa` 标记由 PDE 判断器路由的出戏产品问答（见 [model-config.zh.md](model-config.zh.md)）；它被排除在伴侣上下文/记忆之外，但实时流与重放上报告的方式相同。客户端必须容忍未知的 `action_type` 值（新值可能在不打大版本号的情况下新增）。
 - **`done`** —— `truncated`、`usage`（经 `OPENROUTER_USAGE_HIDDEN_KEYS` 过滤后；总是存在——不适用时为 `null`）、`generation_id`（OpenRouter id；总是存在——不适用时为 `null`），以及 `ghost_fallback`（bool；为 `false` 时整个字段省略）。`ghost_fallback: true` 标记一条最终解析为空、以静默回退形式交付的回复——它**不是** `action_type=ghost` 轮次，也不会动 ghost 计数。原因记录在落库行的 `metadata.fallback_reason` 上。承诺出图的轮次（`action_type=reply_text_image`）例外：文本半边为空是一条纯图片回复而不是沉默，因此它上报 `ghost_fallback: false`、不带 `fallback_reason`，尾随的 `image_request` 照常发出。
 - **`final`** —— 本轮汇总：`filtered`（bool，回复是否被输出过滤）、`prompt_injected`（本轮注入的 trait tag 数组，无则为 `null`）、`tier`（回显请求的 `tier`，未传为 `null`）、`retries_chat`（命中的对话尝试下标，从 0 起）、`retries_filter`（实际服务的过滤模型尝试下标），以及自 v1.4.0 起的 `llm_attempts` / `gateway_errors`（**为空时整个字段省略**，见下）。这一帧不再带任何画像/lead 信号——`lead_score`、`should_show_cta`、`agent_training_level` 已随 companion_insights 拆除（spec 2026-08-11）移除；画像状态改从 `GET /comp/user/{user_id}/profile` 读取。
+- **`speaker_session_id`**（`meta` 上，仅群聊轮次）—— 说这条消息的成员 session；1:1 轮次省略，所以 1:1 的帧不变。
+- **`cast`**、**`director_reasoning`**、**`speaker_error`** —— 仅群聊轮次，见 [group-chat.zh.md](group-chat.zh.md#一轮)。1:1 流不会发这三种帧。
 - **`action_response`** —— 只在带 `action` 的回合出现：`user_message_id` 和 `response`（`"accept"` | `"refuse"`）。在第一个 `meta` 之前发一次，幂等重放时会重发。客户端必须容忍不认识的帧类型。之后若该回合以 `error` 结束，这一轮就没有生效，历史里也不带它的 `response`。
 - **`body_state`** —— 有被接受的 `give` 仍在起作用的回合才有：`user_message_id` 和 `effects`，新的 give 在前，每项 `{item, name?, quantity, level, phase, step, steps}`（`level` 1–4，`phase` 为 `rising` | `peak` | `fading`，`steps` 中的第 `step` 步）。描述的是这一回合回复写成时的状态。只发一次，在 `action_response`（若有）之后、第一个 `meta` 之前，幂等重放时重发。没有余效时不发。
 
@@ -774,6 +776,8 @@ SSE 帧是整轮最后一帧且只走线上——在它发出前断线，光看 
 
 `reaction`（只出现在 assistant 行上）为 `{emoji, reacted_at}`。
 
+`speaker_session_id`（只出现在群 session 的 assistant 行上，其余省略）是说这句话的成员 session；已离群的发言者，其名字通过 session 再到 instance 解析。
+
 `user_message_id` 指向产生这一行的那一轮的 `role='user'` 行。assistant 行和
 `system_error` 通知行上都有，user 行本身省略。通知行最要紧：队列 worker 和
 陈旧认领回收器是在客户端早已断线之后才写它们的，history 是客户端唯一能读到的
@@ -827,6 +831,43 @@ session 返回 404 的行为，与上面的 history 路由完全一致。
 以及在没配 PDE 判官的部署上的每一条 `user` 行，都是永久不打点的。
 
 详见 [2026-08-19-chat-message-read-at-design.md](superpowers/specs/2026-08-19-chat-message-read-at-design.md)。
+
+## 群聊
+
+群是一条 `channel = 'group'` 的 chat session，没有角色实例，至多三位成员，
+每位成员是调用者已有的一条 1:1 文本 session。下列路由都要求 JWT 用户拥有该群，
+别人的群 id 一律 `404`。轮次、导演与帧的细节见 [group-chat.zh.md](group-chat.zh.md)。
+
+| 方法 | 路径 | 请求体 / 效果 |
+|---|---|---|
+| `POST` | `/v2/comp/group` | `{title?, member_session_ids: [1..=3]}` → 群 DTO |
+| `GET` | `/v2/comp/groups` | `{groups: [...]}`：调用者未归档的群，按 `last_active_at` 倒序 |
+| `GET` | `/v2/comp/group/{group_id}` | 群 DTO |
+| `PATCH` | `/v2/comp/group/{group_id}` | `{title}`；`null` 清空。`200` 返回群 DTO |
+| `POST` | `/v2/comp/group/{group_id}/members` | `{member_session_id}` → `200` 群 DTO |
+| `DELETE` | `/v2/comp/group/{group_id}/members/{member_session_id}` | 踢出成员；`204` |
+| `DELETE` | `/v2/comp/group/{group_id}` | 解散（`archived = true`）；`204` |
+| `POST` | `/v2/comp/group/{group_id}/message/stream` | SSE 轮次，见 [group-chat.zh.md](group-chat.zh.md#发送) |
+
+群 DTO：`group_id`、`title`（可空）、`members[]`（`member_session_id`、
+`instance_id`、`joined_at`）、`created_at`、`last_active_at`。
+
+标题会先去掉首尾空白，长度须为 1 到 64 个字符且不含控制字符，否则 `422 invalid_title`。
+
+| 状态 | 代码 | 何时 |
+|---|---|---|
+| 404 | `not_found` | 群或成员 session 不属于调用者 |
+| 409 | `group_full` | 群里已有三位成员 |
+| 409 | `wrong_channel` | 成员 session 不是文本 session；发送时，该 session 不是群 |
+| 409 | `session_archived` | 成员 session 已归档 |
+| 409 | `instance_already_member` | 另一位成员是同一个角色实例 |
+| 409 | `group_empty` | 向没有成员的群发送 |
+| 422 | `invalid_title` | 标题为空白、过长或含控制字符 |
+
+以下路由原样接受群 session id：`GET /comp/chat/{session_id}/history`、
+`GET /bff/v1/comp/chat/{session_id}/history`（含游标）、
+`POST /comp/chat/{session_id}/read`、
+`GET /comp/chat/{session_id}/messages/{message_id}/image-request`。
 
 ## 语音
 
@@ -1123,7 +1164,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 ### `GET /comp/chat/{user_id}/sessions`
 
-該 `user_id` 名下的所有 chat sessions。路徑裡的 `user_id` **必須** 等於 JWT 裡的 user_id；否則 403。返回 `{ "sessions": [...] }`，每條帶 `session_id`、`instance_id`、`is_converted`、`last_active_at`、`channel`。
+該 `user_id` 名下的所有 chat sessions。路徑裡的 `user_id` **必須** 等於 JWT 裡的 user_id；否則 403。返回 `{ "sessions": [...] }`，每條帶 `session_id`、`instance_id`、`is_converted`、`last_active_at`、`channel`。群 session 不在此列，群由 `GET /v2/comp/groups` 返回。
 
 ### `GET /comp/user/{user_id}/profile`
 
@@ -1385,7 +1426,7 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
 一节相同。`POST /bff/v1/comp/chat/start` 打包的历史走的是同一个条目形状，
 所以同样带这个标记。
 `user_message_id` 指向产生这一行的那一轮的 `role='user'` 行 —— assistant 行和
-`system_error` 通知行上都有，user 行省略。
+`system_error` 通知行上都有，user 行省略。`speaker_session_id` 标出群 session 里 assistant 行的发言者，其余行省略。
 `reply_to_message_id` 回显 `user` 行发送时带的引用（见 stream 路由的**可选：引用**
 一节）——它引用的那条消息的 id，一定在同一个 session 里；
 普通轮次、以及锚点没解析成功的轮次都省略该字段，这样冷启动不必自己存状态
@@ -1580,6 +1621,7 @@ session 403）。
 | 401 | `unauthorized` | JWT 缺失 / 格式錯 / 過期 / 密鑰不符 |
 | 403 | `forbidden` | 路徑 user 跟 JWT user 不匹配，或想讀別人的 session |
 | 404 | `not_found` | session / 人格 / 消息 id 不存在 |
+| 409 | `wrong_channel` | 把群 session 发给 1:1 路由：流式与异步发送、`/open`、`/effects`、reaction、改图都会拒绝；群路由同样拒绝非群 session |
 | 500 | `internal` | 其餘一切（DB 錯、LLM API 錯等） |
 | *provider 自己的状态码* | `upstream` | 上游供应商调用失败（目前仅 persona compose 端点——合成器链条全部失败）。自 v1.4.0 起**不再固定是 502**：provider 的状态码原样透传（`529`、`503`、`429`……），没有上游状态码的网关层失败则超时映射为 `504`、其余为 `502`。响应体带 `upstream_status` / `provider_code` / `error_type` 或 `gateway_kind`，以及 `retryable`——见 [compose 端点](#post-personainstance_idimagecompose)。请按 `"error": "upstream"` 这个 key 判断，不要按状态码。 |
 
@@ -1590,6 +1632,7 @@ session 403）。
 - `crates/eros-engine-server/src/routes/companion_async.rs`——只入队的对话轮（`v2/comp/session/{session_id}/message/async`）
 - `crates/eros-engine-server/src/routes/session_open.rs`——角色先开口：生日、节日开场白与调用方指定的场合（`v2/comp/session/{session_id}/open`）
 - `crates/eros-engine-server/src/routes/session_effects.rs`——角色因被接受的 give 而带着的余效（`v2/comp/session/{session_id}/effects`）
+- `crates/eros-engine-server/src/routes/group.rs`——群管理与群发送路由（`v2/comp/group*`）
 - `crates/eros-engine-server/src/routes/reaction.rs`——消息 reaction：设置、撤销与允许列表（`v2/comp/session/{session_id}/message/{message_id}/reaction`、`v2/comp/reactions`）
 - `crates/eros-engine-server/src/routes/insight.rs`——按关系分开的 v2 画像端点（`v2/comp/instance/{instance_id}/insight/character`、`.../insight/user`）
 - `crates/eros-engine-server/src/pipeline/chat_queue.rs`——异步对话轮队列 worker

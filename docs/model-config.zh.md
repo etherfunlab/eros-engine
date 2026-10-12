@@ -288,6 +288,16 @@ params = { reasoning_effort = "none" }
 `image_url`）而不是 chat 的形态，但 `messages` 属于引擎自有字段、启动时就会
 被拒绝，所以任何规则都不可能把它压平。
 
+群聊导演的推理同样由 body 规则打开，没有单独的 key：
+
+```toml
+[[providers.openrouter.body]]
+tasks  = ["group_director"]
+params = { reasoning = { effort = "medium" } }
+```
+
+推理 token 计入该任务的 `max_tokens`，所以要通过这条规则（`effort` 或 `reasoning.max_tokens`）限制推理。推理文本以 `director_reasoning` 帧流给客户端；`reasoning = { exclude = true }` 表示模型照常推理但不返回文本。见 [group-chat.zh.md](group-chat.zh.md)。
+
 ### `model_name_display_override`（仅限 chat 任务）
 
 控制 chat SSE `meta` frame 中发送给客户端的 `model` 值。它**只**影响客户端显示——绝不影响 OpenRouter 请求、持久化的 assistant 记录或用量日志。该字段位于 `[tasks.chat_companion]` 的任务级配置中；所有 tier 都会继承。为其他任务设置该字段可以通过解析，但不会产生效果。
@@ -516,6 +526,7 @@ BYOK hop 使用其请求中 `byok` 块的 `output_regex` 规则，而不是这�
 | `chat_image_prompt_compose` | `pipeline::stream`（出图 prompt 合成器；**图片轮次必需** —— PDE judge 不再写种子，未配置该任务时引擎报 可发图=否 并把图片动作降级为纯文本。它从当轮上下文生成 prompt，返回 JSON `{prompt, caption}`；`caption` 落到 `metadata.image.caption`，是聊天历史与 judge transcript 实际读取的字段） | live（图片必需） |
 | `chat_image_edit_compose` | `routes::image_edit`，通过 `resolve_image_edit_compose()`（`POST /v2/comp/session/{session_id}/message/{message_id}/image/edit` 的图片-EDIT 合成器；根据一条指令改写角色已发过的图。**即便对该端点本身也是可选的**——块缺失时端点走 `[tasks.chat_image_prompt_compose]` 的模型链与参数，配上引擎内置的编辑 prompt；两块都缺失时端点回 501） | live（可选） |
 | `chat_vision` | `pipeline::stream`，通过 `resolve_vision()`（视觉预处理阶段：在 reply prompt 前将 `image_url` 附件描述为 JSON；任务块缺失或 `filter_prompt` 为空白时关闭） | live（opt-in） |
+| `group_director` | `pipeline::group`，通过 `resolve_group_director()`（群聊导演：一次流式调用为群聊轮次选出发言者；缺失 ⇒ 所有成员按加入顺序依次发言；任务块存在但 `filter_prompt` 为空白则拒绝启动） | live（opt-in） |
 | `chat_product_qa` | `pipeline::stream`，通过 `resolve_product_qa()`（PDE `product_qa` 动作的出戏产品问答执行器；任务块缺失或 `filter_prompt` 为空白时关闭；还需要 LLM PDE 已启用） | live（opt-in） |
 | `affinity_evaluation` | `pipeline::post_process`（每轮好感度裁决——四个档位线轴加 warmth/patience 两个 1..3 绝对档，由引擎侧换算；每个 Reply 轮次后以 fire-and-forget 方式运行；**不接受 `filter_prompt`** —— 该 prompt 由引擎持有，设置该键会拒绝启动——**任何写法都算，包括显式留空**。与这里其它任务不同，空白在这里不等于"关闭"，请直接不写这个键。见 issue #210） | live |
 | `affinity_summary` | `pipeline::post_process::summarize_feeling`（改写 `companion_affinity.feeling_clause`——即 `[feelings]` 块的第一人称叙述——依据档位标签与近期判官理由；仅在好感度写入之后、"移动回合"上运行（任意判官档位有变化、端点档位偏离基线，ghost，或动作被拒绝而降档），且仅当本次请求确实注入了好感度轴；按当轮请求计费给当前用户，不是 sweeper。**不接受 `filter_prompt`**——该 prompt 由引擎持有，与 `affinity_evaluation` 同样处理，设置该键会拒绝启动。块缺失 ⇒ `feeling_clause` 保持 `NULL`，`[feelings]` 永不渲染） | live（opt-in） |
@@ -534,6 +545,7 @@ BYOK hop 使用其请求中 `byok` 块的 `output_regex` 规则，而不是这�
 
 只有当引擎确实在某处调用 `model_config.resolve("<name>", ...)` 时，`[tasks.<name>]` 条目才有意义。当前调用点如下：
 
+- `crates/eros-engine-server/src/pipeline/group_director.rs` → `group_director`，通过 `resolve_group_director()`（群聊导演，opt-in）
 - `crates/eros-engine-server/src/pipeline/handlers.rs` → `chat_companion`、`chat_output_filter`
 - `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`、`insight_structuring`、`affinity_evaluation`、`affinity_summary`、`character_insight_extraction`、`character_insight_structuring`、`user_insight_extraction`、`user_insight_structuring`
 - `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision`，通过 `run_stream` 内的 `run_pde_decision`（仅当设置了 `filter_prompt`）；`chat_image_prompt_compose`，通过 `resolve_image_prompt_compose()`（出图 prompt 合成器，图片轮次必需，仅在图片轮次按需解析）；`chat_vision`，通过 `resolve_vision()`（视觉预处理阶段，opt-in）；`chat_product_qa`，通过 `resolve_product_qa()`（产品问答执行器，opt-in）；`chat_input_filter`，通过 `resolve_input_filter()`（输入改写，opt-in）；`memory_extraction`，通过 dreaming sweeper

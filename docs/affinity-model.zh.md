@@ -6,7 +6,7 @@
 
 好感度是每个关系（即每个 session）一份的六轴向量，每轴限定在 `[0, 1]`，每次更新都
 clamp。它只在文本通道、非 `product_qa` 的聊天回合上移动。语音回合与 `product_qa`
-回合从不写好感度事件。判官（LLM 评估器）在任何地方都只输出 ordinal 的档位或等级；
+回合从不写好感度事件，群聊回合也不写（群只读取各成员的好感度，从不写入）。判官（LLM 评估器）在任何地方都只输出 ordinal 的档位或等级；
 引擎拥有每一个数字、每一个标签、每一次档位迁移，是唯一权威来源。
 
 六轴分三组，全文都围绕这三组组织：**基础对**（`warmth`、`patience`）、**Bond**
@@ -258,6 +258,8 @@ Ghost 回合从不进入 `persist_with_event`：只有 `ghost_streak` / `total_g
 - PDE 判官上下文：intimacy 档（`1..=3` 的画图闸门，取
   `max(bond, chemistry)`；档 3 在 `0.76` 开启，刻意落在档 4 内部而不是档 5
   的边界上）与 patience 分带。
+- 群聊导演：每位成员的 Bond 与 Chemistry 档位标签和 intimacy 档，从该成员的
+  1:1 会话里读取，从不写入。
 - Ghost 打分：`score = (1−intrigue)·0.4 + (1−patience)·0.4 + tension·0.2`，
   带硬否决（前 10 条消息、连续 ghost ≥2、1 小时冷却），阈值 `0.65`，会话已经
   ghost 过一次后升为 `0.85`。

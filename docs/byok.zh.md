@@ -19,7 +19,7 @@
 
 只覆盖 `POST /comp/chat/{session_id}/message/stream` 上的回复，包括 `reply_text_image` 的文字部分。PDE 判断器、输入与输出 filter、vision、图片 prompt 合成、产品问答、亲密度、insight 与记忆提取，以及 embedding，仍然运行在部署自己的链路和 key 上。
 
-异步路由收到 `byok` 块会返回 `400 invalid_payload`。`/open` 开场白、语音轮次和图片编辑都不接受该块。
+异步路由收到 `byok` 块会返回 `400 invalid_payload`。`/open` 开场白、语音轮次、图片编辑和群聊轮次都不接受该块（群聊发送路由返回 `400 invalid_payload`）。
 
 ## `byok` 块
 

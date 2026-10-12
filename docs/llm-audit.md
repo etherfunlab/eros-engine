@@ -153,7 +153,7 @@ exclude `model LIKE '%@byok'` (see [byok.md](byok.md#what-is-recorded)).
 call now writes here: `chat_companion`, `chat_voice`, `chat_product_qa`,
 `chat_input_filter`, `chat_output_filter`, `chat_vision`,
 `chat_image_prompt_compose`, `chat_image_edit_compose`, `pde_decision`,
-`affinity_evaluation`, `affinity_summary`, `insight_extraction`,
+`group_director`, `affinity_evaluation`, `affinity_summary`, `insight_extraction`,
 `insight_structuring`, `character_insight_extraction`,
 `character_insight_structuring`, `user_insight_extraction`,
 `user_insight_structuring`, `memory_extraction`, `world_director`,
@@ -551,6 +551,7 @@ strictly finer than one would have been: it separates `chat_companion` from
 | `chat_vision` | `chat_vision_events` | — |
 | `chat_image_prompt_compose` / `chat_image_edit_compose` | `chat_images_events` | — |
 | `pde_decision` | `companion_decision_events` | — |
+| `group_director` | `companion_decision_events` | — |
 | `affinity_evaluation` | `companion_affinity_events` | — |
 
 The input filter is the one call site that had **no failure record of any
@@ -764,6 +765,28 @@ Written even when the describe never ran — `not_configured`, `attempts = 0`
 — because that is one of three reasons `chat_messages.metadata.vision` can be
 absent on a turn, and this is the only way to tell it apart from "the
 describe ran and failed on every chain model" (`exhausted`).
+
+## Group director
+
+A group turn replaces the `pde_decision` judge with one `group_director` call.
+
+- **`companion_decision_events`** rows whose `session_id` is a group session are
+  director verdicts, one per turn. `status` takes the PDE set (`ok` / `empty` /
+  `parse_error` / `upstream_error` / `gateway_error`), so the rows give the
+  director's success and fallback rates. `action` and `proposed_action` are NULL.
+- **`payload`** is the parsed verdict plus a `reasoning` key holding the full
+  reasoning text (NULL when the model returned none). It is the replay corpus
+  for tuning the director's `filter_prompt`.
+- **`inputs`** records the roster as the director saw it (handles, member
+  session ids, Bond and Chemistry keys, rungs), the turn's image availability
+  and the mentions.
+- **`llm_generations.task = 'group_director'`** carries the director call;
+  `chat_companion` rows on a group session are the speakers. `generation_id` on
+  the decision row points at the director call.
+- No decision row is written when `[tasks.group_director]` is absent: the rule
+  fallback ran.
+- `character_insights_events` and `user_insights_events` rows from a group turn
+  carry `session_id` = the group, one set per speaker.
 
 ## Observability
 

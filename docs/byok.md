@@ -30,7 +30,7 @@ insight and memory extraction, and embeddings keep running on the deployment's
 own chains and keys.
 
 The async route refuses a `byok` block with `400 invalid_payload`. `/open`
-greetings, voice turns and image edits do not take one.
+greetings, voice turns, image edits and group turns do not take one (the group send route answers `400 invalid_payload`).
 
 ## The `byok` block
 

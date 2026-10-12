@@ -15,7 +15,7 @@
 
 多くの AI キャラクターアプリは、やがてあなたを忘れます。関係性はプロンプトに収まる文章へ戻り、会話が長くなるほど人物像もぶれていきます。`eros-engine` は、そこを持続する状態にします。コンパニオンはセッションをまたいであなたを覚え、交流とともに関係が変わり、汎用アシスタントの即興ではなく、その人物らしい判断から返信します。
 
-土台となるのは次の 7 つです。
+土台となるのは次の 8 つです。
 
 - 🧠 **2 層の記憶** — 安定したユーザー情報と、共有した出来事、過去への言及、続きのある話題をそれぞれ保持します。→ [Memory layers](docs/memory-layers.md)
 - 💞 **変化する親密度** — 6 つの関係軸が段階評価にもとづく減衰付きの書き込みで動き、時間とともに減衰します。口調や会話の深さ、返信するかどうかにも影響します。→ [Affinity model](docs/affinity-model.md) · [Ghost mechanics](docs/ghost-mechanics.md)
@@ -24,6 +24,7 @@
 - ⚡ **一通りそろったチャット経路** — SSE ストリーミング、画像理解と生成要求、`prompt_traits`、タスク別モデル選択、フォールバック、呼び出し監査を備えます。OpenRouter が標準ですが、`[providers]` から OpenAI 互換のチャット・embedding 提供元を追加できます。→ [API reference](docs/api-reference.md) · [Model config](docs/model-config.md) ダウンストリームは、エンドユーザーが自分のチャットエンドポイントとキーをターン単位で持ち込めるようにもできます。→ [BYOK](docs/byok.md)
 - 🎙️ **割り込み前提の音声ターン** — 独立したチャネル上の軽量・低遅延なターンエンドポイントで、barge-in に対応します。クライアントが再生を止めて実際に読み上げられた内容を報告するため、履歴にはモデルが生成した内容ではなくユーザーが**聞いた**内容が残ります。接続断で失われたターンは、宙に浮かせず再生成できます。→ [API reference](docs/api-reference.md#post-compvoicesession_idturnstream)
 - 🌍 **シミュレートされた世界** — ペルソナには画面の外の生活があります。定期実行の「世界ディレクター」が共有の関係グラフと日々の脚本を更新し、フィード上でペルソナ同士が投稿・コメントし合い、ペルソナごとのストーリーが仕事・恋愛・日常の一貫性を保ちます。完全にオプトインで、独立したスイッチで段階的に有効化します。未設定のデプロイではクエリも定期処理も一切走りません。→ [World system](docs/world-system.md)
+- 👥 **グループチャット** — 1 人のユーザーと最大 3 人のペルソナが 1 つの会話に参加します。ディレクターの呼び出しが、誰がどの順で答えるかを決め、各話者は自分の声と、ユーザーとの 1:1 の関係を持って返信し、後の話者は前の話者の発言を聞いています。グループは親密度を読み取るだけで、書き込みません。→ [Group chat](docs/group-chat.md)
 
 汎用エージェントフレームワークではありません。同じ人物が同じユーザーを時間をかけて知っていくプロダクトのための、状態を持つ中核です。AI コンパニオン、日記、コーチ、語学チューター、キャラクターチャットに向いています。
 
@@ -87,6 +88,7 @@ Postgres と `.env` は利用者側で用意してください。同じ `docker/
 - [Affinity model](docs/affinity-model.md) — 関係軸、段階評価によるスコアリング、減衰、関係ラベル。
 - [Ghost mechanics](docs/ghost-mechanics.md) — コンパニオンが沈黙する条件と理由。
 - [Memory layers](docs/memory-layers.md) — プロフィール記憶と関係記憶、embedding、検索。
+- [Group chat](docs/group-chat.md) — 最大 3 人のペルソナのグループ、ディレクター、話者のリレー。
 - [World system](docs/world-system.md) — 実験的な World Memories、World Town、World Stories のシミュレーション。
 - [Model config](docs/model-config.md) — タスク、モデル選択、フォールバック、`[providers]` による複数提供元へのルーティング。
 - [Prompt traits](docs/prompt-traits.md) — リクエストごとのプロンプト調整と tier の許可リスト。

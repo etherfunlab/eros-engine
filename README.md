@@ -15,7 +15,7 @@
 
 Most AI character apps eventually forget who you are. Their relationships reset to whatever fits in a prompt, and their personalities drift as the conversation grows. `eros-engine` makes those parts durable: a companion remembers you across sessions, the relationship changes through interaction, and each reply is chosen in character rather than improvised by a generic assistant.
 
-The engine has seven foundations:
+The engine has eight foundations:
 
 - 🧠 **Two-layer memory** — stable facts about the user live alongside shared moments, callbacks, and unfinished threads. → [Memory layers](docs/memory-layers.md)
 - 💞 **Evolving affinity** — six relationship dimensions move on graded, damped writes and decay with time, shaping tone, depth, and even whether the companion replies. → [Affinity model](docs/affinity-model.md) · [Ghost mechanics](docs/ghost-mechanics.md)
@@ -24,6 +24,7 @@ The engine has seven foundations:
 - ⚡ **A complete chat path** — SSE streaming, image understanding and generation requests, prompt traits, per-task model selection, fallbacks, and call auditing. OpenRouter is the default; additional OpenAI-compatible chat and embedding providers can be configured through `[providers]`. → [API reference](docs/api-reference.md) · [Model config](docs/model-config.md) A downstream can also let its end users bring their own chat endpoint and key per turn. → [BYOK](docs/byok.md)
 - 🎙️ **A voice turn path built for interruption** — a lean, low-latency turn endpoint on its own channel, with barge-in: the client stops playback and reports what was actually spoken, so history records what the user *heard* rather than what the model produced. A turn lost to a dropped connection can be regenerated instead of stranded. → [API reference](docs/api-reference.md#post-compvoicesession_idturnstream)
 - 🌍 **A simulated world** — personas have an off-screen life. A scheduled world director evolves a shared relationship graph and daily scripts; a feed lets personas post and comment on one another; per-persona stories keep work, romance, and daily living consistent over time. Fully opt-in and layered behind independent switches — an unconfigured deployment runs zero queries and spawns zero sweepers. → [World system](docs/world-system.md)
+- 👥 **Group chat** — one user and up to three personas in a single conversation. A director call picks who answers and in what order; each speaker replies in its own voice with its own 1:1 relationship, and later speakers hear the earlier ones. A group reads affinity but never writes it. → [Group chat](docs/group-chat.md)
 
 This is not a generic agent framework. It is the stateful core for products where one persona gets to know the same person over time: companions, journals, coaches, tutors, and character chat.
 
@@ -86,6 +87,7 @@ Bring your own Postgres and `.env`; the same `docker/Dockerfile` can be deployed
 - [Architecture](docs/architecture.md) — crate boundaries, pipeline phases, and data flow.
 - [Affinity model](docs/affinity-model.md) — relationship dimensions, graded scoring, decay, and labels.
 - [Ghost mechanics](docs/ghost-mechanics.md) — when and why a companion may stay silent.
+- [Group chat](docs/group-chat.md) — groups of up to three personas, the director, and the speaker relay.
 - [Memory layers](docs/memory-layers.md) — profile and relationship memory, embeddings, and retrieval.
 - [World system](docs/world-system.md) — experimental World Memories, World Town, and World Stories simulations.
 - [Model config](docs/model-config.md) — tasks, selection, fallbacks, and multi-provider routing through `[providers]`.

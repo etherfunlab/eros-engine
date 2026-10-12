@@ -224,7 +224,8 @@ The turn runs detached, and the SSE body taps it, as on the 1:1 stream route.
 ### 5.2 Load members
 
 The turn reads the active members ordered by `joined_at`. For each member it
-loads:
+loads the items below; a member whose persona instance is inactive is not
+seated that turn.
 
 - **Persona:** `PersonaRepo::load_companion(instance_id)`.
 - **Affinity:** `AffinityRepo::load(member_session_id)`, then
@@ -291,7 +292,7 @@ parses what comes back:
   go down;
 - a list that is empty after normalization counts as a director failure.
 
-**Rule fallback.** Every active member speaks `reply_text`, in `joined_at`
+**Rule fallback.** Every seated member speaks `reply_text`, in `joined_at`
 order. It applies when:
 
 - the director fails, times out, returns unparseable output, or returns an
@@ -354,7 +355,7 @@ before the next one starts.
   - `prompt_traits` filtered by the request tier.
 - **`[群聊]` block** added to the reply prompt:
   - the title;
-  - the other active members' names and one-line personalities;
+  - the other seated members' names and one-line personalities;
   - a fixed rule: say only your own lines, never speak for anyone else, and
     write no name prefix.
 - **History.** The last `HISTORY_WINDOW` group rows at or before the user
@@ -386,8 +387,9 @@ Spawned once after the last speaker. Nothing in it blocks the stream.
   written.
 - **Memory.** The user's message is embedded once.
   - Profile layer: one row, `instance_id` NULL, content raw.
-  - Relationship layer: one row for **every active member**, whether or not
-    it spoke, because every member was present.
+  - Relationship layer: one row for **every seated member**, whether or not
+    it spoke, because every member was present. A member whose persona
+    instance is inactive is not seated that turn.
   - Each relationship row starts with the fixed marker 「（群聊）」, so a 1:1
     recall knows where the line was said.
   - Each member write rechecks that the member session is not archived,
@@ -408,10 +410,10 @@ Spawned once after the last speaker. Nothing in it blocks the stream.
 | Failure | Behavior |
 |---|---|
 | Director fails / empty / absent | Rule fallback (§5.3); audit row records the status |
-| One speaker's chain exhausted | `speaker_error` frame; the relay continues with the next speaker |
+| One speaker's chain exhausted | `meta → done{truncated:true} → speaker_error`; the attempt row is persisted, as on 1:1, and the relay continues with the next speaker |
 | Composer fails | Text half lands; no `image_request` (as in 1:1) |
 | `CHAT_QUEUE_GEN_TIMEOUT_SECS` expires | One budget covers director and all speakers. Speakers who finished stay persisted, the rest are skipped, and the terminal frame is `error generation_timeout`. |
-| Settle | `settle_turn` unchanged. If any speaker row landed (`turn_already_served`) the turn is `done`. Otherwise the turn is failed with a `system_error` notice, which carries no speaker. |
+| Settle | `settle_turn` unchanged. If any assistant row landed (`turn_already_served`) the turn is `done`. A `system_error` notice, which carries no speaker, is written only when none did. |
 | Client disconnect | The turn completes and persists; the client reads history |
 | Process dies mid-turn | The reaper releases the claim, and the chat-queue worker settles a group turn as unservable: failed with a `system_error` notice. Group turns are never re-driven in the background. |
 
@@ -427,7 +429,7 @@ The group route emits:
 ```
 director_reasoning*                       (0..n, only with reasoning on)
 cast
-( meta → delta* → done → image_request? | speaker_error )  × speakers
+( meta → delta* → done → image_request?  |  meta → done{truncated:true} → speaker_error )  × speakers
 final
 ```
 
@@ -439,7 +441,7 @@ A terminal `error` can replace anything after the first frame.
 | `cast` *(new)* | `{speakers: [{member_session_id, action_type}]}`. `action_type` uses the `meta` wire values `reply` / `reply_image` / `reply_text_image`. Emitted after the fallback too, so a client can always show who is about to speak. |
 | `meta` | gains `speaker_session_id` on group turns. The field is omitted on 1:1 turns, so 1:1 frames are byte-identical. |
 | `delta` / `done` / `image_request` | unchanged, keyed by `message_id` |
-| `speaker_error` *(new)* | `{speaker_session_id, code, message}`; non-terminal. It is a new frame rather than an `error` variant, because clients treat `error` as end of turn. |
+| `speaker_error` *(new)* | `{speaker_session_id, code, message}`; non-terminal, and it follows that speaker's `meta` and truncated `done`. It is a new frame rather than an `error` variant, because clients treat `error` as end of turn. |
 | `final` | Same shape as 1:1. Counters are summed over speakers; `filtered` / `prompt_injected` are true if any speaker's was. |
 
 The engine only emits frames. How reasoning is shown (full, collapsed, or as
@@ -604,6 +606,10 @@ POST /v2/comp/group/{gid}/message/stream
   - `payload.reasoning` is the replay corpus for tuning the director prompt.
 - **Generations.** `llm_generations` rows with `task = 'group_director'`, and
   `chat_companion` rows on group sessions.
+- **Prompt logs.** With `PROMPT_LOG_DIR` set, each speaker writes its own
+  prompt file keyed by the group session. The file carries a `# speaker:`
+  header line with the speaker's member session id, and the file name ends
+  with that id.
 - **Speaker balance.** Speaker counts per turn come from `chat_messages`
   grouped by `speaker_session_id`. This is the reading behind the dice
   decision.
@@ -637,7 +643,7 @@ a person on the dev deployment.
 - Assistant rows carry `speaker_session_id`.
 - Affinity untouched: member `companion_affinity` row count and `updated_at`
   are unchanged after a turn.
-- A relationship memory row is written for every active member, including
+- A relationship memory row is written for every seated member, including
   non-speakers.
 - The decision row carries `reasoning`.
 - A later speaker's request body contains the earlier speaker's line from the

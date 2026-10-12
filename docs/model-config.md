@@ -313,6 +313,20 @@ Vision's `messages` is a block array (text + `image_url`) rather than the
 chat shape, but `messages` is engine-owned and refused at boot, so no rule
 can flatten it.
 
+The group director takes its reasoning from a body rule too; there is no
+separate key:
+
+```toml
+[[providers.openrouter.body]]
+tasks  = ["group_director"]
+params = { reasoning = { effort = "medium" } }
+```
+
+Reasoning tokens count against the task's `max_tokens`, so bound reasoning
+through the rule (`effort` or `reasoning.max_tokens`). Reasoning text streams
+to the client as `director_reasoning` frames; `reasoning = { exclude = true }`
+keeps the thinking but returns no text. See [group-chat.md](group-chat.md).
+
 ### `model_name_display_override` (chat task only)
 
 Controls the `model` value sent to clients in chat SSE `meta` frames. Affects
@@ -591,6 +605,7 @@ input filter has no triggers, timing, or tiers).
 | `chat_image_prompt_compose` | `pipeline::stream` (image-prompt composer; **required for image turns** — the PDE judge writes no seed, so without this task the engine reports 可发图=否 and downgrades image actions. Generates the prompt from turn context and returns JSON `{prompt, caption}`; `caption` is persisted to `metadata.image.caption` and is what history-facing renders read) | live (required for images) |
 | `chat_image_edit_compose` | `routes::image_edit` via `resolve_image_edit_compose()` (image-EDIT composer for `POST /v2/comp/session/{session_id}/message/{message_id}/image/edit`; revises a picture the character already sent from an instruction. **Optional even for the endpoint** — with this block absent the endpoint runs on `[tasks.chat_image_prompt_compose]`'s chain and parameters with the engine's built-in edit prompt; with both blocks absent the endpoint answers 501) | live (optional) |
 | `chat_vision` | `pipeline::stream` via `resolve_vision()` (vision pre-stage: describes an `image_url` attachment into JSON before the reply prompt; off when task block absent or `filter_prompt` blank) | live (opt-in) |
+| `group_director` | `pipeline::group` via `resolve_group_director()` (the group chat director: one streamed call casts the speakers of a group turn; absent ⇒ every member speaks in join order; a present section with a blank `filter_prompt` refuses to boot) | live (opt-in) |
 | `chat_product_qa` | `pipeline::stream` via `resolve_product_qa()` (out-of-character product-QA executor for the PDE `product_qa` action; off when task block absent or `filter_prompt` blank; also requires the LLM PDE) | live (opt-in) |
 | `affinity_evaluation` | `pipeline::post_process` (per-turn affinity verdict — four graded line axes plus two absolute 1..3 endpoint levels, converted engine-side; runs after each Reply turn, fire-and-forget; **takes no `filter_prompt`** — the prompt is engine-owned and setting the key refuses to boot — **in any form, an explicit blank included**. Unlike every other task here, blank does not mean "off", so omit the key entirely. See issue #210) | live |
 | `affinity_summary` | `pipeline::post_process::summarize_feeling` (rewrites `companion_affinity.feeling_clause` — the `[feelings]` block's first-person narrative — from band labels and recent judge reasons; runs after the affinity write, movement turns only (any judge grade, an endpoint level off baseline, a ghost, or a refused action's tier drop) and only when the request actually injects an affinity axis; request-scoped and billed to the turn's user, not a sweeper. **Takes no `filter_prompt`** — the prompt is engine-owned, same policy as `affinity_evaluation`, and setting the key refuses to boot. Block absent ⇒ `feeling_clause` stays `NULL` and `[feelings]` never renders) | live (opt-in) |
@@ -609,6 +624,7 @@ input filter has no triggers, timing, or tiers).
 
 A `[tasks.<name>]` entry is only meaningful if the engine actually calls `model_config.resolve("<name>", ...)` somewhere. The current call sites are:
 
+- `crates/eros-engine-server/src/pipeline/group_director.rs` → `group_director` via `resolve_group_director()` (group chat director, opt-in)
 - `crates/eros-engine-server/src/pipeline/handlers.rs` → `chat_companion`, `chat_output_filter`
 - `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`, `insight_structuring`, `affinity_evaluation`, `affinity_summary`, `character_insight_extraction`, `character_insight_structuring`, `user_insight_extraction`, `user_insight_structuring`
 - `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision` via `run_pde_decision` inside `run_stream` (only when `filter_prompt` is set); `chat_image_prompt_compose` via `resolve_image_prompt_compose()` (image-prompt composer, required for image turns, resolved lazily only on image turns); `chat_vision` via `resolve_vision()` (vision pre-stage, opt-in); `chat_product_qa` via `resolve_product_qa()` (product-QA executor, opt-in); `chat_input_filter` via `resolve_input_filter()` (input rewrite, opt-in); `memory_extraction` via the dreaming sweeper

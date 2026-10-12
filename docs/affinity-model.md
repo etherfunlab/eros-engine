@@ -7,7 +7,8 @@
 Affinity is a six-axis vector, one per relationship (one per session). Every
 axis is bounded to `[0, 1]` and clamped on every update. It moves only on
 text-channel, non-`product_qa` chat turns; voice turns and `product_qa`
-turns never write an affinity event.
+turns never write an affinity event, and neither do group turns (a group
+reads each member's affinity and writes none).
 
 The judge (the LLM evaluator) only ever outputs ordinal buckets: a grade
 or a level, never a continuous number. The engine owns every score, every
@@ -327,6 +328,8 @@ moved (format in [Event rows](#event-rows)).
 - PDE judge context — the intimacy rung (`1..=3`, an image gate over
   `max(bond, chemistry)`; rung 3 opens at `0.76`, inside tier 4 by design)
   and the patience band.
+- The group director — the Bond and Chemistry labels and the intimacy rung of
+  each member, read from the member's 1:1 session and never written.
 - Ghost scoring —
   `score = (1−intrigue)·0.4 + (1−patience)·0.4 + tension·0.2`, with hard
   vetoes (first 10 messages, streak ≥ 2, 1 h cooldown) and threshold `0.65`

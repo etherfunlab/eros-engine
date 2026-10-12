@@ -95,6 +95,8 @@ Relationship 层查询改为过滤 `instance_id = $2`，并多一条 `content NO
 
 所以 embedding 是每个实质轮次生成一次，不是「只有 LLM 挑出来的高光才生成」。
 
+**群聊轮次**走同一个逐轮原文写入器，用户消息只 embed 一次。Profile 层写一行（`instance_id` 为 NULL）；关系层为每一位入座成员各写一行，不论它有没有开口，因为每位成员都在场。角色实例未激活的成员这一轮不入座。群聊来源的行 `session_id` 是群（话是在那里说的），内容带 `（群聊）用户：` 前缀，之后的 1:1 召回因此知道这句话出自哪里。这些行按各成员的 `instance_id` 归属，所以 `DELETE /comp/instance/{instance_id}/sessions` 会连同该关系的其余数据一并删除它们。详见 [group-chat.zh.md](group-chat.zh.md#进入-11-的内容)。
+
 ## 甚麼不被存
 
 原始對話消息存在 `engine.chat_messages` 裡（完整逐字記錄、純文本）。它們 **不被** embed。記憶表存的是 *摘要* 跟 *事實*，不是完整消息日誌。想拿真實對話內容直接查 `chat_messages`——那才是「說了甚麼」的真相之源。

@@ -72,6 +72,8 @@ spawn post_process     tokio::spawn — runs concurrent with response return:
                        (the five run concurrently via tokio::join!)
 ```
 
+**Group turns** (`pipeline::group::run_group_turn`) cast speakers through the `[tasks.group_director]` call and relay each through the same reply path; see [group-chat.md](group-chat.md).
+
 **Ghost-streak reset** is handled by the orchestrator before spawning post-process: on Reply the streak is cleared in a single idempotent UPDATE; on Ghost the orchestrator calls `AffinityRepo::record_ghost` instead. The `persist_with_event` repo method itself never touches the streak.
 
 **PDE action list.** The judge's (or rule engine's) per-turn action is one of
@@ -115,7 +117,7 @@ eros-engine-server :8080
     │           and llm_generations; no chat state, no affinity, no memory
     │
     └────────────► Postgres (`engine` schema)
-                       chat_sessions / chat_messages
+                       chat_sessions / chat_messages / chat_session_members
                        companion_affinity / companion_affinity_events
                        companion_memories (vector(512))
                        persona_genomes / persona_instances / persona_instance_items
@@ -171,6 +173,7 @@ crates/
 │       ├── affinity.rs       # 6-dim vector + grade pipeline + time decay + labels
 │       ├── effects.rs        # lingering effects of an accepted give (curves + active_effects)
 │       ├── ghost.rs          # score formula + 4-tier protection
+│       ├── group.rs          # group director normalization, fallback cast, transcript roles
 │       ├── pde.rs            # rules-based action decision
 │       ├── persona.rs        # PersonaGenome + Instance + CompanionPersona
 │       ├── scope.rs          # per-request injection scope (InsightMode / MemoryScope)
@@ -181,10 +184,11 @@ crates/
 │       ├── voyage.rs         # 512-dim embeddings, fail-loud on empty key
 │       └── model_config.rs   # TOML loader
 ├── eros-engine-store/
-│   ├── migrations/           # 0000_schema → 0067_persona_instance_items
+│   ├── migrations/           # 0000_schema → 0068_group_chat
 │   └── src/
 │       ├── pool.rs           # PgPoolOptions builder
 │       ├── chat.rs           # ChatRepo
+│       ├── group.rs          # GroupRepo (group sessions, membership)
 │       ├── affinity.rs       # AffinityRepo (persist_with_event, record_ghost)
 │       ├── memory.rs         # MemoryRepo (Profile/Relationship layers)
 │       ├── insight.rs        # InsightEventRepo (companion_insights_events audit rows)
@@ -198,9 +202,9 @@ crates/
         ├── state.rs          # AppState (pool/auth/openrouter/embed/config)
         ├── error.rs          # AppError → axum IntoResponse
         ├── auth/             # AuthValidator trait + Supabase impl + middleware
-        ├── pipeline/         # stream (run_stream) / handlers / post_process / dreaming / …
+        ├── pipeline/         # stream (run_stream) / group + group_director / handlers / post_process / dreaming / …
         ├── prompt.rs         # system-prompt builder (affinity → directives)
-        ├── routes/           # health / companion / companion_stream / companion_async / insight / image_edit / voice / persona / session_open / session_effects / persona_items / reaction / world_town / bff / dto / mod
+        ├── routes/           # health / companion / companion_stream / companion_async / insight / image_edit / voice / persona / session_open / session_effects / persona_items / reaction / group / world_town / bff / dto / mod
         └── openapi.rs        # utoipa ApiDoc spec metadata
 ```
 
@@ -208,6 +212,7 @@ crates/
 
 - [Affinity model](affinity-model.md) — 6 dimensions, graded write pipeline, time decay, relationship labels
 - [Ghost mechanics](ghost-mechanics.md) — score formula + protection rules + worked examples
+- [Group chat](group-chat.md) — one user, up to three personas, the director, the speaker relay
 - [Memory layers](memory-layers.md) — profile vs relationship, Voyage, pgvector retrieval
 - [Deploying](deploying.md) — Docker, bring-your-own Postgres / IdP
 - [API reference](api-reference.md) — every `/comp/*` endpoint

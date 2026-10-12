@@ -71,6 +71,8 @@ spawn post_process     tokio::spawn——跟返回響應並行：
                         （五个 future 经 tokio::join! 并发执行）
 ```
 
+**群聊轮次**（`pipeline::group::run_group_turn`）通过 `[tasks.group_director]` 调用选出发言者，再让每位发言者走同一条回复路径；详见 [group-chat.zh.md](group-chat.zh.md)。
+
 **Ghost streak 重置** 由編排器在 spawn post-process 之前處理：Reply 動作會在一個冪等 UPDATE 裡把 streak 清零；Ghost 動作則調 `AffinityRepo::record_ghost`。倉儲方法 `persist_with_event` 自身永遠不碰 streak。
 
 **PDE 动作列表。** 判断器（或规则引擎）每轮给出的 action 是以下之一：
@@ -110,7 +112,7 @@ eros-engine-server :8080
     │           llm_generations；无聊天状态、无好感度、无记忆
     │
     └────────────► Postgres（`engine` schema）
-                       chat_sessions / chat_messages
+                       chat_sessions / chat_messages / chat_session_members
                        companion_affinity / companion_affinity_events
                        companion_memories（vector(512)）
                        persona_genomes / persona_instances / persona_instance_items
@@ -161,6 +163,7 @@ crates/
 │       ├── affinity.rs       # 6 維向量 + 档位写入管线 + 時間衰退 + 標籤
 │       ├── effects.rs        # 被接受的 give 的余效（曲线 + active_effects）
 │       ├── ghost.rs          # 評分公式 + 4 層保護
+│       ├── group.rs          # 群聊导演输出规整、兜底点名、转录角色映射
 │       ├── pde.rs            # 規則型動作決策
 │       ├── persona.rs        # PersonaGenome + Instance + CompanionPersona
 │       ├── scope.rs          # 逐请求注入范围（InsightMode / MemoryScope）
@@ -171,10 +174,11 @@ crates/
 │       ├── voyage.rs         # 512 維 embedding，空 key 直接 fail
 │       └── model_config.rs   # TOML 加載器
 ├── eros-engine-store/
-│   ├── migrations/           # 0000_schema → 0067_persona_instance_items
+│   ├── migrations/           # 0000_schema → 0068_group_chat
 │   └── src/
 │       ├── pool.rs           # PgPoolOptions 構造
 │       ├── chat.rs           # ChatRepo
+│       ├── group.rs          # GroupRepo（群聊会话、成员关系）
 │       ├── affinity.rs       # AffinityRepo（persist_with_event、record_ghost）
 │       ├── memory.rs         # MemoryRepo（Profile / Relationship 兩層）
 │       ├── insight.rs        # InsightEventRepo（companion_insights_events 审计行）
@@ -188,9 +192,9 @@ crates/
         ├── state.rs          # AppState（pool / auth / openrouter / embed / config）
         ├── error.rs          # AppError → axum IntoResponse
         ├── auth/             # AuthValidator trait + Supabase 實現 + 中間件
-        ├── pipeline/         # stream（run_stream）/ handlers / post_process / dreaming / …
+        ├── pipeline/         # stream（run_stream）/ group + group_director / handlers / post_process / dreaming / …
         ├── prompt.rs         # system prompt 構造（affinity → 行為指令）
-        ├── routes/           # health / companion / companion_stream / companion_async / insight / image_edit / voice / persona / session_open / session_effects / persona_items / reaction / world_town / bff / dto / mod
+        ├── routes/           # health / companion / companion_stream / companion_async / insight / image_edit / voice / persona / session_open / session_effects / persona_items / reaction / group / world_town / bff / dto / mod
         └── openapi.rs        # utoipa ApiDoc 元數據
 ```
 
@@ -198,6 +202,7 @@ crates/
 
 - [好感度模型](affinity-model.zh.md)——6 個維度、档位写入管线、時間衰退、關係標籤
 - [Ghost 機制](ghost-mechanics.zh.md)——評分公式 + 保護規則 + 實例計算
+- [群聊](group-chat.zh.md)——一位用户加至多三位角色、导演、发言者接力
 - [記憶層](memory-layers.zh.md)——profile vs relationship、Voyage、pgvector 檢索
 - [部署](deploying.zh.md)——Docker、自带 Postgres / IdP
 - [API 參考](api-reference.zh.md)——每個 `/comp/*` 端點

@@ -137,7 +137,7 @@ completed` tracing——落库是额外加的，不是取代那行日志。
 现在都会写这张表：`chat_companion`、`chat_voice`、`chat_product_qa`、
 `chat_input_filter`、`chat_output_filter`、`chat_vision`、
 `chat_image_prompt_compose`、`chat_image_edit_compose`、`pde_decision`、
-`affinity_evaluation`、`affinity_summary`、`insight_extraction`、
+`group_director`、`affinity_evaluation`、`affinity_summary`、`insight_extraction`、
 `insight_structuring`、`character_insight_extraction`、
 `character_insight_structuring`、`user_insight_extraction`、
 `user_insight_structuring`、`memory_extraction`、`world_director`、
@@ -476,6 +476,7 @@ Venice 用 `429 MODEL_OVERLOADED` 和 `503 MODEL_AT_CAPACITY`，下一家又会�
 | `chat_vision` | `chat_vision_events` | — |
 | `chat_image_prompt_compose` / `chat_image_edit_compose` | `chat_images_events` | — |
 | `pde_decision` | `companion_decision_events` | — |
+| `group_director` | `companion_decision_events` | — |
 | `affinity_evaluation` | `companion_affinity_events` | — |
 
 输入过滤器是 v1.4.0 之前**完全没有任何失败记录**的那个调用点。它的失败落在
@@ -659,6 +660,17 @@ CHECK 里——事后收窄 CHECK 要过一次 migration，而这个仓库的一
 即使 describe 根本没跑，也会写一行——`not_configured`，`attempts = 0`——
 因为这是 `chat_messages.metadata.vision` 缺失的三种原因之一，也是唯一能把
 它和「describe 跑了但每个 chain 模型都失败了」（`exhausted`）区分开的办法。
+
+## 群聊导演
+
+群聊轮次用一次 `group_director` 调用取代 `pde_decision` 判官。
+
+- **`companion_decision_events`** 里 `session_id` 是群 session 的行就是导演的裁决，每轮一行。`status` 沿用 PDE 的取值集（`ok` / `empty` / `parse_error` / `upstream_error` / `gateway_error`），因此这些行可以直接给出导演的成功率与兜底率。`action` 和 `proposed_action` 为 NULL。
+- **`payload`** 是解析后的裁决，外加一个 `reasoning` 键，存完整的推理文本（模型没返回推理时为 NULL）。它是调导演 `filter_prompt` 时的回放语料。
+- **`inputs`** 记录导演当时看到的名单（句柄、成员 session id、Bond 与 Chemistry 的 key、档位）、本轮是否可发图，以及点名。
+- **`llm_generations.task = 'group_director'`** 对应导演那次调用；群 session 上的 `chat_companion` 行是各发言者。决策行的 `generation_id` 指向导演调用。
+- `[tasks.group_director]` 缺失时不写决策行：走的是规则兜底。
+- 群聊轮次产生的 `character_insights_events` 与 `user_insights_events` 行，`session_id` 是群，每位发言者各一组。
 
 ## 可观测性
 
