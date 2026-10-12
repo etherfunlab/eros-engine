@@ -1253,6 +1253,21 @@ pub struct ResolvedPde {
     pub sampling: Sampling,
 }
 
+/// Resolved group director task (`group_director`). The configured
+/// `filter_prompt` is the director's system instruction; the engine builds the
+/// user payload (roster, image line, transcript). `fallback_model` is already
+/// truncated to `retry_depth`.
+#[derive(Debug, Clone)]
+pub struct ResolvedGroupDirector {
+    pub model: String,
+    pub fallback_model: Vec<String>,
+    pub temperature: f64,
+    pub max_tokens: u32,
+    pub director_prompt: String,
+    pub structured_output: bool,
+    pub sampling: Sampling,
+}
+
 /// Resolved product-QA executor task (`chat_product_qa`). Mirrors
 /// `ResolvedVision`: the configured `filter_prompt` (product docs + answering
 /// rules) is the executor's system instruction; the engine builds the user
@@ -1872,6 +1887,47 @@ impl ModelConfig {
             structured_output: task_cfg.structured_output.unwrap_or(true),
             sampling: m.sampling,
         })
+    }
+
+    /// Resolve the group director. `None` (every member answers, in join
+    /// order) when `[tasks.group_director]` is absent OR its `filter_prompt` is
+    /// blank. Task-level only, like `pde_decision`.
+    pub fn resolve_group_director(&self) -> Option<ResolvedGroupDirector> {
+        const TASK: &str = "group_director";
+        let task_cfg = self.tasks.get(TASK)?;
+        let director_prompt = plain_or_empty(task_cfg.filter_prompt.as_ref());
+        if director_prompt.trim().is_empty() {
+            return None;
+        }
+        let retry_depth = task_cfg.retry_depth.unwrap_or(1);
+        let m = self.resolve(TASK, None);
+        let mut fallback_model = m.fallback_model;
+        fallback_model.truncate(retry_depth as usize);
+        Some(ResolvedGroupDirector {
+            model: m.model,
+            fallback_model,
+            temperature: m.temperature,
+            max_tokens: m.max_tokens,
+            director_prompt,
+            structured_output: task_cfg.structured_output.unwrap_or(true),
+            sampling: m.sampling,
+        })
+    }
+
+    /// Boot check: a present `[tasks.group_director]` with a blank prompt is a
+    /// misconfiguration, not a quiet fallback. Reads the section directly
+    /// rather than calling `resolve_group_director`, whose `resolve()` call
+    /// advances the round-robin model cursor.
+    pub fn validate_group_director_prompt(&self) -> Result<(), String> {
+        match self.tasks.get("group_director") {
+            Some(t) if plain_or_empty(t.filter_prompt.as_ref()).trim().is_empty() => Err(
+                "[tasks.group_director] is present but its filter_prompt is unset — eros-engine \
+                 refuses to boot. Set a filter_prompt, or remove the [tasks.group_director] \
+                 section so every group member answers in join order."
+                    .to_string(),
+            ),
+            _ => Ok(()),
+        }
     }
 
     /// Resolve the product-QA executor task. `None` (feature off) when
@@ -2769,6 +2825,7 @@ pub const KNOWN_CHAT_TASKS: &[&str] = &[
     "world_stories_director",
     "world_comment",
     "world_reply",
+    "group_director",
 ];
 
 /// Tasks that make outbound calls but build their own bodies — body rules
@@ -5372,6 +5429,74 @@ filter_prompt = "   "
             "[tasks.pde_decision]\nmodel = \"m\"\nfilter_prompt = \"d\"\nstructured_output = false\n",
         ).unwrap();
         assert!(!cfg.resolve_pde().unwrap().structured_output);
+    }
+
+    #[test]
+    fn resolve_group_director_some_when_prompt_set() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.group_director]\nmodel = \"m\"\nfallback = [\"f1\", \"f2\"]\nfilter_prompt = \"direct\"\n",
+        )
+        .unwrap();
+        let p = cfg.resolve_group_director().expect("resolves");
+        assert_eq!(p.model, "m");
+        assert_eq!(p.director_prompt, "direct");
+        assert_eq!(
+            p.fallback_model,
+            vec!["f1".to_string()],
+            "retry_depth defaults to 1"
+        );
+        assert!(p.structured_output);
+    }
+
+    #[test]
+    fn resolve_group_director_none_when_absent_or_blank() {
+        assert!(ModelConfig::from_toml_str("")
+            .unwrap()
+            .resolve_group_director()
+            .is_none());
+        let blank = ModelConfig::from_toml_str(
+            "[tasks.group_director]\nmodel = \"m\"\nfilter_prompt = \"  \"\n",
+        )
+        .unwrap();
+        assert!(blank.resolve_group_director().is_none());
+    }
+
+    #[test]
+    fn validate_group_director_prompt_refuses_a_blank_section() {
+        assert!(ModelConfig::from_toml_str("")
+            .unwrap()
+            .validate_group_director_prompt()
+            .is_ok());
+        let ok = ModelConfig::from_toml_str(
+            "[tasks.group_director]\nmodel = \"m\"\nfilter_prompt = \"d\"\n",
+        )
+        .unwrap();
+        assert!(ok.validate_group_director_prompt().is_ok());
+        let blank = ModelConfig::from_toml_str("[tasks.group_director]\nmodel = \"m\"\n").unwrap();
+        let err = blank.validate_group_director_prompt().unwrap_err();
+        assert!(err.contains("[tasks.group_director]"), "{err}");
+    }
+
+    #[test]
+    fn known_chat_tasks_carries_the_group_director() {
+        assert!(KNOWN_CHAT_TASKS.contains(&"group_director"));
+    }
+
+    #[test]
+    fn committed_example_enables_the_group_director_with_reasoning() {
+        let text = include_str!("../../../examples/model_config.toml");
+        let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml must parse");
+        assert!(cfg.resolve_group_director().is_some());
+        let rules = cfg.openrouter_body_rules();
+        assert!(
+            rules.iter().any(|r| {
+                r.tasks
+                    .as_ref()
+                    .is_some_and(|t| t.iter().any(|x| x == "group_director"))
+                    && r.params.get("reasoning").is_some_and(|v| v.is_object())
+            }),
+            "example declares a group_director body rule carrying a reasoning object"
+        );
     }
 
     #[test]

@@ -71,6 +71,14 @@
 tasks  = ["chat_companion"]
 params = { reasoning = { enabled = false } }
 #
+# The group director reasons before it casts a group turn; the reasoning
+# streams to the client as `director_reasoning` frames. Reasoning tokens count
+# against the task's `max_tokens`, so cap reasoning here (`effort` or
+# `reasoning.max_tokens`) rather than by lowering `max_tokens`.
+[[providers.openrouter.body]]
+tasks  = ["group_director"]
+params = { reasoning = { effort = "medium" } }
+#
 # Covers chat_vision too, even though that stage builds its own body — the
 # lever for models that ignore `reasoning = { enabled = false }`, reason
 # anyway, and bill for it (`reasoning_effort` is a separate top-level field,
@@ -798,6 +806,33 @@ model = "anthropic/claude-haiku-4.5"
 fallback = ["deepseek/deepseek-v4-flash", "google/gemini-3.1-flash-lite"]
 temperature = 0.6
 max_tokens = 200
+
+# Group chat director (spec 2026-10-12-group-chat-design.md). One streamed call
+# per group turn picks which members answer, in what order, and with which
+# action. Absent section ⇒ every member answers with text in join order.
+# Present with a blank filter_prompt ⇒ boot refusal. The engine owns the user
+# payload ([成员] roster with bond/chemistry labels and 亲密度 rung,
+# [图片能力], [最近群聊], [用户点名], [用户最新消息]) and the JSON schema;
+# filter_prompt only sets the director's taste.
+[tasks.group_director]
+model       = "anthropic/claude-haiku-4.5"
+fallback    = ["deepseek/deepseek-v4-flash"]
+temperature = 0.5
+max_tokens  = 4000
+#structured_output = true   # json_schema on the director (default true)
+filter_prompt = """
+你是一个群聊的"导演"。群里有一位用户和几位 AI 角色（[成员] 里的 m1/m2/m3）。
+读最近的群聊和用户最新的一句话，决定这一轮谁开口、按什么顺序。
+- 只让有理由开口的人说话：被点名、被直接问到、话题和他有关、或者他自然会接前一个人的话。
+- 不是每个人每轮都要说；安静的人可以继续安静。
+- 和用户关系近的人（bond/chemistry 档位高）更愿意接话，但不必每次都是他先说。
+- [用户点名] 里的人一定开口。
+- 只在 [图片能力] 本轮可发图=是 时才考虑发图，而且只给关系到了、此刻发图自然的人。
+- inner_state 是这个人此刻的一句话心情，纯描述，不写指令。
+只输出 JSON：
+{"speakers":[{"member":"m1","action":"reply_text"|"reply_image"|"reply_text_image",
+  "inner_state":"…","reply_mode":null,"clothing":null}],"reason":"…"}
+"""
 
 # World Memories director (experimental). Absent section = subsystem off.
 # One structured call per enrolled owner per interval_hours: evolves the
