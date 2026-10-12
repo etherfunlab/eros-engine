@@ -870,7 +870,7 @@ occasion that is not true of the session returns `null` without generating.
 
 ### `GET /v2/comp/session/{session_id}/effects`
 
-The persona's lingering state from accepted gives, as a text turn sent now would carry it: for a page that opens on a conversation, and for async callers, which receive no frames. Right after the turn that accepted a give, this route already lists it at step 1, while that turn sent no `body_state` frame: the frame describes the reply just written, the route the persona as she is now.
+The persona's lingering state from accepted gives, as a text turn sent now would carry it: for a page that opens on a conversation, and for async callers, which receive no frames. Right after the turn that accepted a consumable, this route already lists it at step 1, while that turn sent no `body_state` frame: the frame describes the reply just written, the route the persona as she is now.
 
 ```json
 {"effects": [{"item": "alcohol", "name": "威士忌", "quantity": 3, "level": 2, "phase": "rising", "step": 2, "steps": 3}]}
