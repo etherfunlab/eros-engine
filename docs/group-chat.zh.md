@@ -24,7 +24,8 @@
 
 ## 路由
 
-所有路由都要求 JWT 用户拥有该群，否则 `404`。
+所有路由都要求 JWT 用户拥有该群，否则 `404 group_not_found`。这些路由的拒绝响应体都是
+`{code, message, user_message}`。
 
 ### 管理
 
@@ -51,11 +52,14 @@
 | 条件 | 响应 |
 |---|---|
 | 群里已有三位成员 | `409 group_full` |
-| 成员 session 不属于调用者 | `404` |
+| 成员 session 不存在或不属于调用者 | `404 session_not_found` |
 | 成员 session 不是 `text` session | `409 wrong_channel` |
 | 成员 session 已归档 | `409 session_archived` |
 | 另一位成员是同一个角色实例 | `409 instance_already_member` |
 | 标题为空白、过长或含控制字符 | `422 invalid_title` |
+| 创建时 `member_session_ids` 为空 | `422 unprocessable` |
+
+踢出一个不在群里的 session 返回 `404 member_not_found`。
 
 被踢出的角色过去说过的话仍通过 `speaker_session_id` 保持归属。解散群时，它产生的记忆行保留：
 它们属于成员各自的关系。
@@ -65,15 +69,22 @@
 `POST /v2/comp/group/{group_id}/message/stream` → SSE。只有流式，没有异步版本。
 
 请求体：`content`、`client_msg_id`、`tier`、`prompt_traits`、
-`user_timezone` / `user_country` / `user_region`、1:1 的 `image` 块，以及可选的
-`mentions: [member_session_id]`（客户端 @ 用）。
+`user_timezone` / `user_country` / `user_region`、1:1 的 `image` 块、1:1 的 `audit` 块，
+以及可选的 `mentions: [member_session_id]`（客户端 @ 用）。
 
-- 点名必须是群里的成员，未知 id 返回 `422`。
+- 点名必须是群里的成员，未知 id 返回 `422 unprocessable`。
+- `audit` 沿用 1:1 的上限（超限返回 `400 invalid_payload`），随每位发言者的回复调用发出；
+  见 [llm-audit.zh.md](llm-audit.zh.md)。
 - `image` 的含义与 1:1 路由相同：带了它，并且配置了 `[tasks.chat_image_prompt_compose]`，本轮就可以发图。
   `image.force = true` 返回 `400 invalid_payload`，因为群聊轮次没有可以强制的单个角色。
 - 带 `byok` 块返回 `400 invalid_payload`。
 - 群里没有成员时 `409 group_empty`；session 不是群时 `409 wrong_channel`。
-- 群的流计入每用户的并发流上限。
+- 群的流计入每用户的并发流上限，达到上限时 `429 rate_limited`。
+- 重发同一个 `client_msg_id`：轮次还在进行时返回 `409 duplicate_in_progress`。轮次结算之后则是重放：
+  按落库的每一行重发 `meta`（带 `speaker_session_id`）、`delta` 和 `done`，最后是 `final`；
+  如果每一行都是失败的尝试，最后是一个终止性的 `error`。重放不带 `cast`、`director_reasoning`、
+  `speaker_error` 和 `image_request`。轮次终止性失败且没有任何 assistant 行时返回
+  `409 duplicate_failed`，需要换一个新的 `client_msg_id`。
 
 ### 原样复用的路由
 
@@ -89,8 +100,9 @@ instance 解析已离群发言者的名字。
 
 ### 拒绝群 session 的路由
 
-把群 session 发给 1:1 路由会返回 `409 wrong_channel`：1:1 的流式与异步发送、
-`/v2/comp/session/{id}/open`、`/effects`、reaction 路由和改图。
+把群 session 发给 1:1 路由会返回 `409`。1:1 的流式与异步发送、`/v2/comp/session/{id}/open`
+和 `/effects` 的响应带 `code: wrong_channel`。reaction 路由和改图用它们的普通响应体
+`{"error": "conflict", "message": …}`，`message` 里含 `wrong_channel`。
 `GET /comp/chat/{user_id}/sessions` 不列出群，群由 `/v2/comp/groups` 返回。
 dreaming 清扫器跳过群 session。
 
@@ -114,7 +126,11 @@ POST /v2/comp/group/{gid}/message/stream
                                    character/user insight（每位发言者）；不碰好感度
 ```
 
-轮次是分离执行的：客户端断线不会取消它，之后从历史里读结果。同一个 `client_msg_id` 的重放与 1:1 一样去重。
+轮次是分离执行的：客户端断线不会取消它，之后从历史里读结果。重发同一个 `client_msg_id` 时的响应见
+[发送](#发送)。
+
+同一个群的轮次不串行。接力还在进行时发来的新消息会立刻开始第二场接力；两场接力在历史里可能交错，
+同一位角色也可能在两场里都开口。
 
 **入座。** 轮次为每位成员加载角色和它的 1:1 好感度。角色实例未激活的成员这一轮不入座。好感度只读：
 在内存里做时间衰减和端点刷新，还没有好感度行的成员在内存里取默认值，不会创建或写入任何行。
@@ -157,11 +173,13 @@ POST /v2/comp/group/{gid}/message/stream
 ```
 director_reasoning*                       （0..n 条，仅在开启推理时）
 cast
-( meta → delta* → done → image_request?  |  meta → done{truncated:true} → speaker_error )  × 发言者
+( meta → delta* → done → image_request?  |  meta → done{truncated:true} → speaker_error  |  speaker_error )  × 发言者
 final
 ```
 
-第一帧之后的任何位置都可能被一个终止性的 `error` 取代。
+失败的发言者有两种帧序列：聊天链用尽时，每次尝试发一对 `meta → done{truncated:true}`，最后发
+`speaker_error`；没有留下任何行就失败时（回复请求构建失败，或图片行落库失败），只发一个
+`speaker_error`。第一帧之后的任何位置都可能被一个终止性的 `error` 取代。
 
 | 帧 | 载荷 |
 |---|---|
@@ -180,9 +198,10 @@ final
 |---|---|
 | 导演失败、返回空或未配置 | 规则兜底；审计行记录状态 |
 | 某位发言者的链用尽 | `meta → done{truncated:true} → speaker_error`（尝试行照 1:1 的方式落库）；接力继续，轮到下一位 |
+| 某位发言者的请求构建失败，或图片行落库失败 | 只发一个 `speaker_error`；接力继续，轮到下一位 |
 | 图片合成器失败 | 文字部分照常落库，不发 `image_request` |
-| 没有任何发言者产出回复 | 流以 `error` 帧结束，不发 `final` |
-| `CHAT_QUEUE_GEN_TIMEOUT_SECS` 到期 | 导演和所有发言者共用一份预算。已经说完的发言者保留，其余跳过，终止帧是 `error generation_timeout` |
+| 没有任何发言者产出回复 | 流以 `error` 帧结束，不发 `final`，也不运行 post-process |
+| `CHAT_QUEUE_GEN_TIMEOUT_SECS` 到期 | 导演和所有发言者共用一份预算。已经说完的发言者保留，其余跳过，终止帧是 `error generation_timeout`。不运行 post-process：已说完的发言者的话留在历史里，但这一轮用户说的话不会进入任何成员的记忆和 insights |
 | 结算 | 只要有一条 assistant 行落库，这一轮就结算为 `done`；一条都没有时才写 `system_error` 通知，该通知不带发言者 |
 | 客户端断线 | 轮次照常完成并落库 |
 | 进程在轮次中途死亡 | 陈旧认领回收器释放认领，聊天队列 worker 把被释放的群聊轮次结算为无法服务：失败，附一条通知。群聊轮次不会在后台被重新驱动 |
@@ -269,14 +288,16 @@ params = { reasoning = { effort = "medium" } }
 
 ## 进入 1:1 的内容
 
-post-process 在最后一位发言者之后启动一次，从不阻塞流。
+post-process 在 `final` 之后启动一次，从不阻塞流。没有走到 `final` 就结束的轮次（没有回复，或生成超时）
+不运行 post-process。
 
 - **记忆。** 用户消息只 embed 一次。Profile 层写一行（`instance_id` 为 NULL）；关系层为**每位入座
   成员**各写一行，不论它有没有开口，内容是 `（群聊）用户：{message}`，`session_id` 是群。每次成员写入
   都会复查该成员 session 没有被归档。见 [memory-layers.zh.md](memory-layers.zh.md)。
 - **Insights。** `human_insights` 每轮运行一次，输入是用户消息加上每条产出的回复，格式
   `{name}：{full_text}`。`character_insights` 和 `user_insights` 每位发言者各运行一次，输入是用户消息和
-  该发言者的回复，以该发言者的 instance 为键。N 位发言者的一轮会发起 1 + 2N 次抽取调用。
+  该发言者的回复，以该发言者的 instance 为键。写入之前，每一次都会复查该发言者的成员 session 没有被归档。
+  N 位发言者的一轮会发起 1 + 2N 次抽取调用。
 - **不运行：**好感度评估、感受分句摘要和 ghost streak 更新。
 
 ## v1 不包含

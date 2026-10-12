@@ -32,7 +32,9 @@ A group builds no relationship of its own. Each persona's affinity lives in its
 
 ## Routes
 
-Every route requires the JWT user to own the group; anything else is `404`.
+Every route requires the JWT user to own the group; anything else is
+`404 group_not_found`. Refusals on these routes carry the body
+`{code, message, user_message}`.
 
 ### Management
 
@@ -59,11 +61,15 @@ Create and add-member refusals:
 | Condition | Response |
 |---|---|
 | The group already has three members | `409 group_full` |
-| Member session is not the caller's | `404` |
+| Member session is unknown or not the caller's | `404 session_not_found` |
 | Member session is not a `text` session | `409 wrong_channel` |
 | Member session is archived | `409 session_archived` |
 | Another member has the same persona instance | `409 instance_already_member` |
 | Blank, over-long or control-character title | `422 invalid_title` |
+| `member_session_ids` is empty (create) | `422 unprocessable` |
+
+Kicking a session that is not a member of the group returns
+`404 member_not_found`.
 
 A kicked persona's past lines stay attributed through
 `speaker_session_id`. Dissolving a group keeps the memory rows it produced:
@@ -75,10 +81,14 @@ they belong to the members' relationships.
 async variant.
 
 Request body: `content`, `client_msg_id`, `tier`, `prompt_traits`,
-`user_timezone` / `user_country` / `user_region`, the 1:1 `image` block, and an
-optional `mentions: [member_session_id]` for a client-side @.
+`user_timezone` / `user_country` / `user_region`, the 1:1 `image` block, the
+1:1 `audit` block, and an optional `mentions: [member_session_id]` for a
+client-side @.
 
-- Mentions must name members of the group; an unknown id returns `422`.
+- Mentions must name members of the group; an unknown id returns
+  `422 unprocessable`.
+- `audit` takes the 1:1 caps (a violation returns `400 invalid_payload`) and
+  rides each speaker's reply call; see [llm-audit.md](llm-audit.md).
 - `image` means what it means on the 1:1 route: its presence, together with a
   configured `[tasks.chat_image_prompt_compose]`, makes images available this
   turn. `image.force = true` returns `400 invalid_payload`, since a group turn
@@ -86,7 +96,15 @@ optional `mentions: [member_session_id]` for a client-side @.
 - A `byok` block returns `400 invalid_payload`.
 - `409 group_empty` when the group has no member; `409 wrong_channel` when the
   session is not a group.
-- A group stream counts toward the per-user in-flight stream cap.
+- A group stream counts toward the per-user in-flight stream cap;
+  `429 rate_limited` at the cap.
+- Resending a `client_msg_id`: while its turn is running, `409
+  duplicate_in_progress`. Once the turn has settled, a replay re-emits each
+  persisted row's `meta` (with `speaker_session_id`), `delta` and `done`, then
+  `final`, or a terminal `error` when every row is a failed attempt. A replay
+  carries no `cast`, `director_reasoning`, `speaker_error` or `image_request`.
+  A turn that failed terminally without any assistant row returns
+  `409 duplicate_failed`; send a fresh `client_msg_id`.
 
 ### Reused unchanged
 
@@ -103,9 +121,11 @@ session, then instance.
 
 ### Routes that refuse a group session
 
-A group session sent to a 1:1 route returns `409 wrong_channel`: the 1:1 stream
-and async send routes, `/v2/comp/session/{id}/open`, `/effects`, the reaction
-route and image edit. `GET /comp/chat/{user_id}/sessions` leaves groups out;
+A group session sent to a 1:1 route returns `409`. The 1:1 stream and async
+send routes, `/v2/comp/session/{id}/open` and `/effects` answer with
+`code: wrong_channel`. The reaction route and image edit answer with their
+plain body, `{"error": "conflict", "message": …}`, whose `message` contains
+`wrong_channel`. `GET /comp/chat/{user_id}/sessions` leaves groups out;
 `/v2/comp/groups` lists them. The dreaming sweeper skips group sessions.
 
 ## One turn
@@ -129,7 +149,12 @@ POST /v2/comp/group/{gid}/message/stream
 ```
 
 The turn runs detached: a client that disconnects does not cancel it, and reads
-the result from history. Replays of the same `client_msg_id` dedupe as on 1:1.
+the result from history. A resend of the same `client_msg_id` is answered as
+described under [Send](#send).
+
+Turns of one group are not serialized. A message sent while a relay is still
+running starts a second relay at once; the two can interleave in history, and
+a persona can speak in both.
 
 **Seating.** The turn loads each member's persona and its 1:1 affinity. A
 member whose persona instance is inactive is not seated that turn. Affinity is
@@ -185,11 +210,15 @@ file keyed by the group session, with the speaker's member session id on a
 ```
 director_reasoning*                       (0..n, only with reasoning on)
 cast
-( meta → delta* → done → image_request?  |  meta → done{truncated:true} → speaker_error )  × speakers
+( meta → delta* → done → image_request?  |  meta → done{truncated:true} → speaker_error  |  speaker_error )  × speakers
 final
 ```
 
-A terminal `error` can replace anything after the first frame.
+A failed speaker emits `meta → done{truncated:true}` for each attempt and then
+`speaker_error` when its chat chain is exhausted, or a bare `speaker_error`
+when it leaves no row: its reply request could not be built, or its image row
+could not be persisted. A terminal `error` can replace anything
+after the first frame.
 
 | Frame | Payload |
 |---|---|
@@ -209,9 +238,10 @@ as a "thinking" indicator is the client's decision.
 |---|---|
 | Director fails, is empty or is absent | Rule fallback; the audit row records the status |
 | One speaker's chain is exhausted | `meta → done{truncated:true} → speaker_error` (the attempt row is persisted, as on 1:1); the relay continues with the next speaker |
+| A speaker's request cannot be built, or its image row cannot be persisted | A bare `speaker_error`; the relay continues with the next speaker |
 | The composer fails | The text half lands; no `image_request` |
-| No speaker produced a reply | The stream ends with an `error` frame instead of `final` |
-| `CHAT_QUEUE_GEN_TIMEOUT_SECS` expires | One budget covers the director and every speaker. Speakers who finished stay persisted, the rest are skipped, and the terminal frame is `error generation_timeout` |
+| No speaker produced a reply | The stream ends with an `error` frame instead of `final`, and no post-process runs |
+| `CHAT_QUEUE_GEN_TIMEOUT_SECS` expires | One budget covers the director and every speaker. Speakers who finished stay persisted, the rest are skipped, and the terminal frame is `error generation_timeout`. No post-process runs: the finished speakers' lines stay, but the user's line reaches no member's memory or insights for that turn |
 | Settle | The turn settles `done` if any assistant row landed. A `system_error` notice, which carries no speaker, is written only when none did |
 | Client disconnect | The turn completes and persists |
 | The process dies mid-turn | The stale-claim reaper releases the claim, and the chat-queue worker settles a released group turn as unservable: failed, with one notice. A group turn is never re-driven in the background |
@@ -316,8 +346,9 @@ director's `generation_id`. See [llm-audit.md](llm-audit.md#group-director).
 
 ## What reaches 1:1
 
-Post-process is spawned once after the last speaker and never blocks the
-stream.
+Post-process is spawned once after `final` and never blocks the stream. A
+turn that ends without `final` (no reply, or the generation timeout) runs
+none.
 
 - **Memory.** The user's message is embedded once. The profile layer gets one
   row (`instance_id` NULL). The relationship layer gets one row for **every
@@ -328,8 +359,9 @@ stream.
 - **Insights.** `human_insights` runs once per turn, over the user's message and
   each produced reply as `{name}：{full_text}`. `character_insights` and
   `user_insights` run once per speaker, from the user's message and that
-  speaker's reply, keyed by that speaker's instance. A turn with N speakers makes
-  1 + 2N extraction calls.
+  speaker's reply, keyed by that speaker's instance. Before it writes, each
+  rechecks that the speaker's member session is not archived. A turn with N
+  speakers makes 1 + 2N extraction calls.
 - **Not run:** affinity evaluation, the feeling-clause summary and ghost-streak
   updates.
 

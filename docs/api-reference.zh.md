@@ -640,7 +640,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 | 401 | bearer 缺失或无效 |
 | 403 | 不是你的 session |
 | 404 | session 不存在，或该 session 里没有这条消息 |
-| **409** | 消息存在，但不是图片回合 |
+| **409** | 消息存在，但不是图片回合；或该 session 是群 session（`message` 里含 `wrong_channel`） |
 | 422 | `instruction` 空白，或 `aspect_ratio` 不支持 |
 | 501 | `[tasks.chat_image_edit_compose]` 与 `[tasks.chat_image_prompt_compose]` 都没配 |
 | 429 | 达到每用户并发上限（3，与 chat/voice/compose 共用） |
@@ -729,7 +729,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 
 返回的 `emoji` 是完整限定形式（`❤` 存为 `❤️`）。角色会在下一个文字回复回合看到用户上一条消息之后新点的 reaction；reaction 本身不触发回复，也不影响亲密度。
 
-错误：`400`（不是恰好一个标准 emoji，或不在允许范围内）、`403`（不是你的会话）、`404`（会话或消息不存在）、`409`（不是 assistant 消息）。
+错误：`400`（不是恰好一个标准 emoji，或不在允许范围内）、`403`（不是你的会话）、`404`（会话或消息不存在）、`409`（不是 assistant 消息；或是群 session，`message` 里含 `wrong_channel`）。
 
 ### `DELETE /v2/comp/session/{session_id}/message/{message_id}/reaction`
 
@@ -836,7 +836,7 @@ session 返回 404 的行为，与上面的 history 路由完全一致。
 
 群是一条 `channel = 'group'` 的 chat session，没有角色实例，至多三位成员，
 每位成员是调用者已有的一条 1:1 文本 session。下列路由都要求 JWT 用户拥有该群，
-别人的群 id 一律 `404`。轮次、导演与帧的细节见 [group-chat.zh.md](group-chat.zh.md)。
+别人的群 id 一律 `404 group_not_found`。轮次、导演与帧的细节见 [group-chat.zh.md](group-chat.zh.md)。
 
 | 方法 | 路径 | 请求体 / 效果 |
 |---|---|---|
@@ -854,15 +854,31 @@ session 返回 404 的行为，与上面的 history 路由完全一致。
 
 标题会先去掉首尾空白，长度须为 1 到 64 个字符且不含控制字符，否则 `422 invalid_title`。
 
+下表的每一种拒绝都用流前错误的响应体 `{code, message, user_message}`（两个 `duplicate_*`
+代码另带 `original_user_message_id`）。
+
 | 状态 | 代码 | 何时 |
 |---|---|---|
-| 404 | `not_found` | 群或成员 session 不属于调用者 |
+| 400 | `invalid_payload` | 发送：`client_msg_id`、`tier`、`prompt_traits` 或 `audit` 格式不对；带了 `byok` 块；`image.force = true` |
+| 404 | `group_not_found` | 群不存在、已解散或不属于调用者 |
+| 404 | `session_not_found` | 创建 / 加人：成员 session 不存在或不属于调用者 |
+| 404 | `member_not_found` | 踢人：该 session 不是群成员 |
 | 409 | `group_full` | 群里已有三位成员 |
 | 409 | `wrong_channel` | 成员 session 不是文本 session；发送时，该 session 不是群 |
 | 409 | `session_archived` | 成员 session 已归档 |
 | 409 | `instance_already_member` | 另一位成员是同一个角色实例 |
 | 409 | `group_empty` | 向没有成员的群发送 |
+| 409 | `duplicate_in_progress` | 发送：同一个 `client_msg_id` 的轮次还在进行 |
+| 409 | `duplicate_failed` | 发送：该 `client_msg_id` 的轮次已终止性失败，需换一个新的 |
 | 422 | `invalid_title` | 标题为空白、过长或含控制字符 |
+| 422 | `unprocessable` | 创建时成员列表为空；发送时 `content` 为空白或过长、`image.aspect_ratio` 不支持，或点名的不是群成员 |
+| 429 | `rate_limited` | 发送：达到每用户并发流上限 |
+
+发送的请求体接受 1:1 的 `audit` 块，它随每位发言者的回复调用发出。失败的发言者有两种帧序列：
+聊天链用尽时，每次尝试发一对 `meta → done{truncated:true}`，最后发 `speaker_error`；回复请求
+构建失败或图片行落库失败时，只发一个 `speaker_error`。触发生成超时的轮次不运行 post-process。
+轮次还在进行时重发它的 `client_msg_id` 得到 `409 duplicate_in_progress`；结算之后重发则重放已落库的行
+（见 [group-chat.zh.md](group-chat.zh.md#发送)）。
 
 以下路由原样接受群 session id：`GET /comp/chat/{session_id}/history`、
 `GET /bff/v1/comp/chat/{session_id}/history`（含游标）、
@@ -1613,7 +1629,7 @@ session 403）。
 `user_message` 形状，没有 `"error"` 字段。`POST
 /comp/voice/{session_id}/turn/interrupt` 本身不是流式接口（成功时返回的是
 普通 JSON），但复用了语音轮次的前置检查和错误类型，错误响应用的也是这同一套
-形状。下表覆盖的是普通形状：
+形状。群路由（`/v2/comp/group*`）的拒绝响应同样用带代码的形状。下表覆盖的是普通形状：
 
 | 狀態碼 | code | 何時 |
 |--------|------|------|
@@ -1621,7 +1637,7 @@ session 403）。
 | 401 | `unauthorized` | JWT 缺失 / 格式錯 / 過期 / 密鑰不符 |
 | 403 | `forbidden` | 路徑 user 跟 JWT user 不匹配，或想讀別人的 session |
 | 404 | `not_found` | session / 人格 / 消息 id 不存在 |
-| 409 | `wrong_channel` | 把群 session 发给 1:1 路由：流式与异步发送、`/open`、`/effects`、reaction、改图都会拒绝；群路由同样拒绝非群 session |
+| 409 | `conflict` | 资源当前的状态不允许这个操作。reaction 路由和改图在收到群 session 时返回它，`message` 里含 `wrong_channel`。1:1 的流式与异步发送、`/open` 和 `/effects` 拒绝群 session 时改用带代码的响应体（`code: wrong_channel`），群路由拒绝非群 session 时也一样 |
 | 500 | `internal` | 其餘一切（DB 錯、LLM API 錯等） |
 | *provider 自己的状态码* | `upstream` | 上游供应商调用失败（目前仅 persona compose 端点——合成器链条全部失败）。自 v1.4.0 起**不再固定是 502**：provider 的状态码原样透传（`529`、`503`、`429`……），没有上游状态码的网关层失败则超时映射为 `504`、其余为 `502`。响应体带 `upstream_status` / `provider_code` / `error_type` 或 `gateway_kind`，以及 `retryable`——见 [compose 端点](#post-personainstance_idimagecompose)。请按 `"error": "upstream"` 这个 key 判断，不要按状态码。 |
 

@@ -44,6 +44,10 @@ Caps enforced at the engine before forwarding:
 Violations return `400 BadRequest` as a pre-stream error, and no user
 message row is persisted.
 
+The group send route, `POST /v2/comp/group/{group_id}/message/stream`, takes
+the same object with the same caps (a violation is `400 invalid_payload`). On a
+group turn it rides each speaker's `chat_companion` call.
+
 **Privacy:** do not put raw email / wallet address / real name in
 `user` — send a hash. OpenRouter retains request metadata (token
 counts, latency) but not prompts / responses by default.

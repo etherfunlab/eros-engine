@@ -137,7 +137,7 @@ CREATE INDEX idx_chat_messages_speaker
 
 | Table | Group use |
 |---|---|
-| `chat_turn_queue` | One row per group turn, `session_id` = group. The per-session claim guard serializes a group's turns. |
+| `chat_turn_queue` | One row per group turn, `session_id` = group. The send route inserts the row already `claimed`, so the worker's per-session claim guard does not serialize a group's turns: a message sent during a relay starts a second relay at once, and the two can interleave. |
 | `llm_generations` | The director call and every speaker call carry `session_id` = group. `task` tells them apart. The speaker follows from `chat_messages.generation_id` → `speaker_session_id`. |
 | `companion_decision_events` | One row per group turn for the director verdict (§5.4). |
 | `companion_memories` | Relationship rows written from a group carry `session_id` = group (where it was said) and `instance_id` = the member's instance. `archive_relationship` deletes by `(user_id, instance_id)`, so group-sourced rows go with the relationship. |
@@ -218,7 +218,9 @@ resolves a departed speaker's name through session → instance.
 
 The route reuses `upsert_user_message_in_tx` and
 `enqueue_user_message_claimed` with the group session id. That brings
-`client_msg_id` dedupe, replay and the per-session serialization as they are.
+`client_msg_id` dedupe and replay as they are; a resend while the turn's queue
+row is still `claimed` gets `409 duplicate_in_progress`, even once an earlier
+speaker's row has landed. Turns of one group are not serialized (§3.4).
 The turn runs detached, and the SSE body taps it, as on the 1:1 stream route.
 
 ### 5.2 Load members
@@ -411,8 +413,9 @@ Spawned once after the last speaker. Nothing in it blocks the stream.
 |---|---|
 | Director fails / empty / absent | Rule fallback (§5.3); audit row records the status |
 | One speaker's chain exhausted | `meta → done{truncated:true} → speaker_error`; the attempt row is persisted, as on 1:1, and the relay continues with the next speaker |
+| A speaker's request cannot be built, or its image row cannot be persisted | A bare `speaker_error`; the relay continues with the next speaker |
 | Composer fails | Text half lands; no `image_request` (as in 1:1) |
-| `CHAT_QUEUE_GEN_TIMEOUT_SECS` expires | One budget covers director and all speakers. Speakers who finished stay persisted, the rest are skipped, and the terminal frame is `error generation_timeout`. |
+| `CHAT_QUEUE_GEN_TIMEOUT_SECS` expires | One budget covers director and all speakers. Speakers who finished stay persisted, the rest are skipped, and the terminal frame is `error generation_timeout`. No post-process runs, so the user's line reaches no member's memory for that turn. |
 | Settle | `settle_turn` unchanged. If any assistant row landed (`turn_already_served`) the turn is `done`. A `system_error` notice, which carries no speaker, is written only when none did. |
 | Client disconnect | The turn completes and persists; the client reads history |
 | Process dies mid-turn | The reaper releases the claim, and the chat-queue worker settles a group turn as unservable: failed with a `system_error` notice. Group turns are never re-driven in the background. |
@@ -429,11 +432,15 @@ The group route emits:
 ```
 director_reasoning*                       (0..n, only with reasoning on)
 cast
-( meta → delta* → done → image_request?  |  meta → done{truncated:true} → speaker_error )  × speakers
+( meta → delta* → done → image_request?  |  meta → done{truncated:true} → speaker_error  |  speaker_error )  × speakers
 final
 ```
 
-A terminal `error` can replace anything after the first frame.
+A failed speaker emits `meta → done{truncated:true}` for each attempt and then
+`speaker_error` when its chain is exhausted, or a bare `speaker_error` when it
+leaves no row (its request could not be built, or its image row could not be
+persisted). A terminal `error` can replace anything after the
+first frame.
 
 | Frame | Payload |
 |---|---|
@@ -441,7 +448,7 @@ A terminal `error` can replace anything after the first frame.
 | `cast` *(new)* | `{speakers: [{member_session_id, action_type}]}`. `action_type` uses the `meta` wire values `reply` / `reply_image` / `reply_text_image`. Emitted after the fallback too, so a client can always show who is about to speak. |
 | `meta` | gains `speaker_session_id` on group turns. The field is omitted on 1:1 turns, so 1:1 frames are byte-identical. |
 | `delta` / `done` / `image_request` | unchanged, keyed by `message_id` |
-| `speaker_error` *(new)* | `{speaker_session_id, code, message}`; non-terminal, and it follows that speaker's `meta` and truncated `done`. It is a new frame rather than an `error` variant, because clients treat `error` as end of turn. |
+| `speaker_error` *(new)* | `{speaker_session_id, code, message}`; non-terminal. After an exhausted chain it follows that speaker's `meta` and truncated `done`; a speaker that failed without leaving a row emits it alone. It is a new frame rather than an `error` variant, because clients treat `error` as end of turn. |
 | `final` | Same shape as 1:1. Counters are summed over speakers; `filtered` / `prompt_injected` are true if any speaker's was. |
 
 The engine only emits frames. How reasoning is shown (full, collapsed, or as

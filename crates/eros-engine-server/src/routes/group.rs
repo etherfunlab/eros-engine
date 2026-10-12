@@ -349,7 +349,10 @@ fn duplicate_in_progress(user_message_id: Uuid) -> AppError {
 #[utoipa::path(post, path = "/v2/comp/group/{group_id}/message/stream", tag = "group",
     params(("group_id" = Uuid, Path)), request_body = GroupSendRequest,
     responses(
-        (status = 200, description = "SSE: director_reasoning* → cast → (meta → delta* → done → image_request? | speaker_error)×N → final", content_type = "text/event-stream"),
+        (status = 200, description = "SSE: director_reasoning* → cast → (meta → delta* → done → image_request? | meta → done{truncated:true} → speaker_error | speaker_error)×N → final. \
+            A failed speaker emits `meta → done{truncated:true}` for each attempt and then `speaker_error` when its chain is exhausted, \
+            or a bare `speaker_error` when its request could not be built or its image row could not be persisted. \
+            A terminal `error` can replace anything after the first frame.", content_type = "text/event-stream"),
         (status = 400, body = crate::routes::companion_stream::StreamPreErrorBody),
         (status = 404, body = crate::routes::companion_stream::StreamPreErrorBody),
         (status = 409, body = crate::routes::companion_stream::StreamPreErrorBody),

@@ -43,6 +43,9 @@ eros-engine 在流式 chat 路由上暴露一个不透明的 OpenRouter 透传�
 违反作为 pre-stream 错误返回 `400 BadRequest`，且不会写任何 user
 message 行。
 
+群发送路由 `POST /v2/comp/group/{group_id}/message/stream` 接受同一个对象，上限相同
+（违反时返回 `400 invalid_payload`）。在群聊轮次里，它随每位发言者的 `chat_companion` 调用发出。
+
 **隐私：**不要把原始 email / 钱包地址 / 真实姓名放进 `user` ——
 要送 hash。OpenRouter 默认保留 request metadata（token 数、延迟），
 但不保留 prompt / response 内容。
