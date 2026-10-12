@@ -112,6 +112,7 @@ data: {"type":"final","filtered":false,"prompt_injected":null,"tier":null,"retri
 - **`done`** —— `truncated`、`usage`（经 `OPENROUTER_USAGE_HIDDEN_KEYS` 过滤后；总是存在——不适用时为 `null`）、`generation_id`（OpenRouter id；总是存在——不适用时为 `null`），以及 `ghost_fallback`（bool；为 `false` 时整个字段省略）。`ghost_fallback: true` 标记一条最终解析为空、以静默回退形式交付的回复——它**不是** `action_type=ghost` 轮次，也不会动 ghost 计数。原因记录在落库行的 `metadata.fallback_reason` 上。承诺出图的轮次（`action_type=reply_text_image`）例外：文本半边为空是一条纯图片回复而不是沉默，因此它上报 `ghost_fallback: false`、不带 `fallback_reason`，尾随的 `image_request` 照常发出。
 - **`final`** —— 本轮汇总：`filtered`（bool，回复是否被输出过滤）、`prompt_injected`（本轮注入的 trait tag 数组，无则为 `null`）、`tier`（回显请求的 `tier`，未传为 `null`）、`retries_chat`（命中的对话尝试下标，从 0 起）、`retries_filter`（实际服务的过滤模型尝试下标），以及自 v1.4.0 起的 `llm_attempts` / `gateway_errors`（**为空时整个字段省略**，见下）。这一帧不再带任何画像/lead 信号——`lead_score`、`should_show_cta`、`agent_training_level` 已随 companion_insights 拆除（spec 2026-08-11）移除；画像状态改从 `GET /comp/user/{user_id}/profile` 读取。
 - **`action_response`** —— 只在带 `action` 的回合出现：`user_message_id` 和 `response`（`"accept"` | `"refuse"`）。在第一个 `meta` 之前发一次，幂等重放时会重发。客户端必须容忍不认识的帧类型。之后若该回合以 `error` 结束，这一轮就没有生效，历史里也不带它的 `response`。
+- **`body_state`** —— 有被接受的 `give` 仍在起作用的回合才有：`user_message_id` 和 `effects`，新的 give 在前，每项 `{item, name?, quantity, level, phase, step, steps}`（`level` 1–4，`phase` 为 `rising` | `peak` | `fading`，`steps` 中的第 `step` 步）。描述的是这一回合回复写成时的状态。只发一次，在 `action_response`（若有）之后、第一个 `meta` 之前，幂等重放时重发。没有余效时不发。
 
 **失败轮次在历史里的样子。** 以 `error` 结束的轮次没有生效：亲密度没有变化，动作轮次的用户行不带 `response`。通常还会留下一条 `system_error` 通知，它的 `user_message_id` 指向那条用户行。如果轮次失败之前已经有失败的回复尝试落库，就不留通知：回复链用尽时没有兜底话术可发（没有配置，或者整条链都是 BYOK，见 [byok.zh.md](byok.zh.md)），或者某一跳失败之后整轮超时。这时队列行按 `done` 结算，历史里保留每次失败尝试的 assistant 行，内容为空，或是它流出过的半截文本。async 端点的轮次走同一条管线，但最多可以尝试 `CHAT_QUEUE_MAX_ATTEMPTS` 次：还没有任何回复尝试落库就失败的会重试，只有最后一次尝试按上面的方式结算；已经有回复尝试落库之后才失败的不再重试。
 
@@ -364,6 +365,19 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 | `tip` | `amount_usd`：必填，有限数值，`> 0` 且 `≤ 1_000_000_000` |
 | `gift` | `kind`：`item` \| `clothing`（必填）；`name`：必填，1–64 字 |
 
+**`give` 的余效。** 被接受的 `give` 会在这个 session 之后的 `min(quantity, 5)` 个文字回合里继续影响角色；接受它的那一回合不算在内。每个回合角色处在曲线上的某一步，档位 1–4：
+
+| 回合数 | 烟 | 酒 | 药 |
+|---|---|---|---|
+| 1 | 3 | 1 | 3 |
+| 2 | 3 1 | 1 3 | 3 3 |
+| 3 | 3 2 1 | 1 2 3 | 1 3 1 |
+| 4 | 3 2 2 1 | 1 2 2 3 | 1 3 3 1 |
+| 5 | 3 3 2 2 1 | 1 2 2 3 3 | 1 2 3 2 1 |
+| 数量 > 5 | 4 3 3 2 1 | 1 2 3 4 4 | 1 3 4 2 1 |
+
+一个回合指文字 session 里的一条用户消息；产品咨询消息和语音通话不计数，也没有时间上限。这份状态会进判官、回复 prompt 和画图 composer，并经 `body_state` 帧和 [`GET /v2/comp/session/{session_id}/effects`](#get-v2compsessionsession_ideffects) 给到调用方。被拒绝的 give 没有余效。设计文档：[余效 spec](superpowers/specs/2026-10-12-given-item-lingering-effects-design.md)。
+
 带动作时 `content` 可以为空，也可以和 `image_url`、`image` 同时出现。取值不合规（超出范围、缺少 `item`/`text`/`amount_usd`/`kind`/`name`）一律返回 `422`，`code: "unprocessable"`；`type` 或 `item` 不在上表取值内时，请求体按无法解析的 JSON 拒绝（同样是 `422`）。动作存在用户行上，两套历史接口都以 `action` 字段返回，该回合生效之后带 `response`。
 
 ```bash
@@ -474,6 +488,7 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 - 图文：`meta(reply_text_image) → delta* → done → image_request → final`
 - `ghost`：`meta(action_type=ghost) → done → final` — 无 `delta`，`meta` 中无 `model`，`done` 的 `usage` 和 `generation_id` 均为 `null`。该轮伴侣保持沉默，未调用任何 LLM。
 - 动作轮次：形状相同，只是 `action_response` 排在第一个 `meta` 之前——`action_response → meta(reply) → delta* → done → final`；不会是 `ghost` 或 `product_qa`
+- 带余效的回合：`body_state` 位于第一个 `meta` 之前，两者都发时排在 `action_response` 之后——例如 `action_response → body_state → meta(reply) → delta* → done → final`
 - `product_qa`：`meta(action_type=product_qa) → delta* → done → final` — 形状与普通文本回复相同，由独立的模型链（`[tasks.chat_product_qa]`）流式生成，而非 `chat_companion`；落库时带 `channel='product_qa'`，重放时同样报告为 `product_qa`。
 
 引擎从不绘图，也不存在任何绘图生命周期帧：消费方收到 `image_request` 后自行调用图像供应商。
@@ -692,6 +707,16 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
   `code: "invalid_payload"`；未知的 `occasion` 返回 `422`。会话检查与 stream 端点相同（`403`、`404`，语音会话 `409`），
   达到单用户并发上限 `429`。生成失败时返回与图片接口相同的上游错误，不写入任何内容，下次打开（用同一个 key）会重试。
 
+### `GET /v2/comp/session/{session_id}/effects`
+
+角色因被接受的 give 而带着的余效，即此刻发一句文字消息时会带上的状态：供打开会话的页面和收不到帧的异步调用方使用。接受 give 的那一回合刚结束，这个路由就已列出它的第 1 步，而那一回合没有发 `body_state` 帧：帧描述刚写成的那句回复，路由描述角色此刻的样子。
+
+```json
+{"effects": [{"item": "alcohol", "name": "威士忌", "quantity": 3, "level": 2, "phase": "rising", "step": 2, "steps": 3}]}
+```
+
+没有余效时为 `{"effects": []}`。错误同 `/open`：`404 session_not_found`、`403 session_forbidden`，语音 session 为 `409 wrong_channel`。
+
 ### `PUT /v2/comp/session/{session_id}/message/{message_id}/reaction`
 
 给角色的某条消息点一个 emoji。请求体 `{"emoji": "👍🏽"}`；必须恰好是一个标准 emoji（含肤色变体与 ZWJ 组合），并且在部署允许的范围内（`GET /v2/comp/reactions`）。每条消息只有一个 reaction：发另一个 emoji 会替换，重复发当前这个不做任何改动。
@@ -813,7 +838,8 @@ session 返回 404 的行为，与上面的 history 路由完全一致。
 
 返回 `text/event-stream`，帧集合更小：`delta`* 之后接一个终结的 `done`，或者
 单独一个 `error`——帧的形状与上面的聊天消息流一致，但**没有** `meta` 帧，也没有
-`action_type`。
+`action_type`。带余效的通话，每一轮都会在第一个 `delta` 之前发一个与聊天消息流形状相同的
+`body_state` 帧。
 
 session 必须是**语音频道** session（否则 `409 wrong_channel`）——通过
 `POST /comp/chat/start` 带 `"channel": "voice"` 拿到。语音是每个部署自行选择
@@ -834,7 +860,8 @@ prompt 精简但不再失忆：人格 + 语音指令 + 首轮生成、此后每�
 此后每轮原样重新注入——provider 是无状态的，线路上不存在"只注入一次"这回事）：
 一个 `[关于他]` 块（`human_insights` bullets，默认中性档，见下面的
 `memory_scope`）加一个 `[上次通话]` 块（上一通语音通话最后 8 条消息渲染出的
-文字记录）。两部分各自独立、静默降级——组装失败时标记位不落，下一轮重试。
+文字记录）加一个 `[身体状态]` 块（通话所读亲密度那条记录所属的文字 session 的余效；
+整通电话保持这份状态、不推进）。三部分各自独立、静默降级——组装失败时标记位不落，下一轮重试。
 
 **每轮召回**（每轮都跑，只读）：对聊天路径同样的 `companion_memories` 分层
 做一次更小的向量检索，受 `memory_scope` 门控，300 ms 预算内完成——超时或
@@ -997,7 +1024,7 @@ Body 字段：
 | `prompt_variant` | `String` | 否 | 与聊天路径相同的变体选择规则，包括「未命中的 key 回退到内置提示词」。 |
 | `stream` | `bool` | 否 | 默认 `true`。 |
 
-合成器载荷与聊天路径的六个槽位完全一致，同一份 `filter_prompt` 契约同时服务两个
+合成器载荷与聊天路径的七个槽位完全一致，同一份 `filter_prompt` 契约同时服务两个
 调用方（见 [model-config.zh.md](model-config.zh.md)）。
 
 每一次调用——不管成功失败——都会记录进 `engine.chat_images_events`

@@ -660,7 +660,7 @@ delegated image prompt, the standalone `POST
 | `instance_id` | `UUID?` | Persona instance; NULL when the caller has none in scope. |
 | `session_id` | `UUID?` | Chat session; NULL on the standalone endpoint (no session). |
 | `status` | `TEXT` | `ok` \| `exhausted` \| `not_configured`. |
-| `inputs` | `JSONB` | The six composer slots, structured: `{appearance, clothing, recent_scene, latest_user_msg, style, aspect_ratio}`. Empty slots are `""`, not the `（无）` placeholder the prompt renders — that substitution is a rendering detail, not an input. `latest_user_msg` differs by `source`: `chat_reply_image` passes the raw `user_msg.content`, while `chat_reply_text_image` passes `effective_user_msg` — the post-input-filter rewrite. Both faithfully record what the composer actually saw on that turn; an operator diffing rows across the two sources should expect the difference, not read it as an inconsistency. On a turn that carries a user action, the slot is the action marker followed by the text, then a sentence stating the decided response. |
+| `inputs` | `JSONB` | The seven composer slots, structured: `{appearance, clothing, body_state, recent_scene, latest_user_msg, style, aspect_ratio}`. Empty slots are `""`, not the `（无）` placeholder the prompt renders — that substitution is a rendering detail, not an input. `latest_user_msg` differs by `source`: `chat_reply_image` passes the raw `user_msg.content`, while `chat_reply_text_image` passes `effective_user_msg` — the post-input-filter rewrite. Both faithfully record what the composer actually saw on that turn; an operator diffing rows across the two sources should expect the difference, not read it as an inconsistency. On a turn that carries a user action, the slot is the action marker followed by the text, then a sentence stating the decided response. |
 | `subject` | `TEXT?` | The composer's own `prompt` field. NULL unless `status = "ok"`. |
 | `caption` | `TEXT?` | NULL when the composer produced none, including the non-JSON fallback reply, where the whole reply becomes `subject` instead. |
 | `composed_prompt` | `TEXT?` | The assembled wire string — style preset + persona appearance + subject, i.e. exactly what the downstream consumer is handed. Stored on **every** row that produced one, including `exhausted` and `not_configured` on the chat path (the portrait fallback still assembles a wire prompt, and this column is then the only record anywhere of what was drawn). NULL only on the standalone endpoint's `exhausted` rows and the `image_edit` endpoint's `exhausted` rows — both fail without assembling anything (the edit endpoint has no portrait fallback either). |
@@ -673,7 +673,7 @@ delegated image prompt, the standalone `POST
 | `created_at` | `TIMESTAMPTZ` | |
 
 - `image_edit` — `POST /v2/comp/session/{session_id}/message/{message_id}/image/edit`.
-  Its `inputs` carries seven keys rather than the chat composer's six:
+  Its `inputs` carries its own seven keys instead of the chat composer's:
   `appearance`, `source_message_id`, `source_subject`, `source_caption`,
   `instruction`, `style`, `aspect_ratio`. `source` says which shape to expect.
   `engine.chat_images_events WHERE source = 'image_edit'` grouped by `status`

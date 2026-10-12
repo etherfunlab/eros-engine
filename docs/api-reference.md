@@ -120,6 +120,7 @@ Frame fields worth noting:
 - **`done`** — `truncated`, `usage` (after `OPENROUTER_USAGE_HIDDEN_KEYS` filtering; always present — `null` when not applicable), `generation_id` (OpenRouter id; always present — `null` when not applicable), and `ghost_fallback` (bool; omitted when `false`). `ghost_fallback: true` marks a reply that resolved empty and was delivered as a silent fallback — this is **not** an `action_type=ghost` turn, and it leaves the ghost counters untouched. The cause is recorded on the persisted row's `metadata.fallback_reason`. A turn that promises a photo (`action_type=reply_text_image`) is exempt: an empty text half is an image-only reply, not silence, so it reports `ghost_fallback: false`, carries no `fallback_reason`, and the trailing `image_request` still fires.
 - **`final`** — turn summary: `filtered` (bool — was the reply output-filtered), `prompt_injected` (array of the trait tags that injected this turn, or `null`), `tier` (echo of the request `tier`, or `null`), `retries_chat` (zero-based index of the chat attempt that succeeded), `retries_filter` (index of the filter-model attempt that served), and — since v1.4.0 — `llm_attempts` / `gateway_errors` (both **omitted when empty**; see below). No profile/lead signal rides this frame — `lead_score`, `should_show_cta`, and `agent_training_level` were removed (companion_insights teardown, spec 2026-08-11); read profile state from `GET /comp/user/{user_id}/profile` instead.
 - **`action_response`** — on a turn that carries an `action` only: `user_message_id` and `response` (`"accept"` | `"refuse"`). Sent once, before the first `meta`, and re-sent on an idempotent replay. Clients must tolerate frame types they do not know. A turn that then ends in `error` did not take effect, and history carries no `response` for it.
+- **`body_state`** — on a turn where an accepted `give` is still at work: `user_message_id` and `effects`, newest give first, each `{item, name?, quantity, level, phase, step, steps}` (`level` 1–4, `phase` `rising` | `peak` | `fading`, `step` of `steps`). It describes the state this turn's reply was written with. Sent once, after `action_response` (if any) and before the first `meta`, and re-sent on an idempotent replay. Absent when nothing is at work.
 
 **A failed turn in history.** A turn that ends in `error` did not take effect: affinity did not move, and an action turn's user row carries no `response`. It usually also leaves a `system_error` notice whose `user_message_id` names that user row. It leaves none when a failed reply attempt was already saved before the turn failed: the reply chain ran out with no fallback phrase to serve (none is configured, or the chain is BYOK-only, see [byok.md](byok.md)), or the turn timed out after a hop had already failed. The queue row then settles `done`, and history keeps each failed attempt's assistant row: empty, or the partial text it streamed. An async turn runs the same pipeline but gets up to `CHAT_QUEUE_MAX_ATTEMPTS` attempts: one that fails before any reply attempt was saved is retried, and only its last attempt is settled as above. One that fails after a reply attempt was saved is not retried.
 
@@ -412,6 +413,19 @@ physical or custom action → chemistry), and a refused `tip` costs nothing (see
 | `tip` | `amount_usd`: required, finite, `> 0` and `≤ 1_000_000_000` |
 | `gift` | `kind`: `item` \| `clothing` (required); `name`: required, 1–64 chars |
 
+**Lingering effects of a `give`.** An accepted `give` keeps affecting the persona on the next `min(quantity, 5)` text turns of the session; the turn that accepts it is not one of them. Each turn the persona is at one step of a curve, at a level from 1 to 4:
+
+| turns | cigarette | alcohol | medicine |
+|---|---|---|---|
+| 1 | 3 | 1 | 3 |
+| 2 | 3 1 | 1 3 | 3 3 |
+| 3 | 3 2 1 | 1 2 3 | 1 3 1 |
+| 4 | 3 2 2 1 | 1 2 2 3 | 1 3 3 1 |
+| 5 | 3 3 2 2 1 | 1 2 2 3 3 | 1 2 3 2 1 |
+| quantity > 5 | 4 3 3 2 1 | 1 2 3 4 4 | 1 3 4 2 1 |
+
+A turn is a user message of the text session; product-QA messages and voice calls do not count, and there is no time limit. The state reaches the judge, the reply prompt and the image composer, and the caller through the `body_state` frame and [`GET /v2/comp/session/{session_id}/effects`](#get-v2compsessionsession_ideffects). A refused give has no effect. Design: [lingering effects spec](superpowers/specs/2026-10-12-given-item-lingering-effects-design.md).
+
 With an action, `content` may be empty, and it can be combined with
 `image_url` and `image`. Every value violation (bounds, missing
 `item`/`text`/`amount_usd`/`kind`/`name`) is a `422` with `code: "unprocessable"`; a body whose `type` or `item` is not one of the
@@ -566,6 +580,7 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 - text + image: `meta(reply_text_image) → delta* → done → image_request → final`
 - `ghost`: `meta(action_type=ghost) → done → final` — no `delta`, no `model` in `meta`, `usage` and `generation_id` are `null` in `done`. The companion stayed silent this turn; no LLM was called.
 - action turn: the same shapes with `action_response` ahead of the first `meta` — `action_response → meta(reply) → delta* → done → final`; never `ghost` or `product_qa`
+- a turn with lingering effects: `body_state` sits ahead of the first `meta`, after `action_response` when both are sent — e.g. `action_response → body_state → meta(reply) → delta* → done → final`
 - `product_qa`: `meta(action_type=product_qa) → delta* → done → final` — same shape as a normal text reply, streamed by an independent model chain (`[tasks.chat_product_qa]`) instead of `chat_companion`; persisted with `channel='product_qa'` and reported as `product_qa` again on replay.
 
 The engine never draws and no draw-lifecycle frames exist: the consumer
@@ -844,6 +859,16 @@ occasion that is not true of the session returns `null` without generating.
   failed generation returns the upstream error the image endpoints return and
   persists nothing; the next open (with the same key) retries.
 
+### `GET /v2/comp/session/{session_id}/effects`
+
+The persona's lingering state from accepted gives, as a text turn sent now would carry it: for a page that opens on a conversation, and for async callers, which receive no frames. Right after the turn that accepted a give, this route already lists it at step 1, while that turn sent no `body_state` frame: the frame describes the reply just written, the route the persona as she is now.
+
+```json
+{"effects": [{"item": "alcohol", "name": "威士忌", "quantity": 3, "level": 2, "phase": "rising", "step": 2, "steps": 3}]}
+```
+
+`{"effects": []}` when nothing is at work. Errors as `/open`: `404 session_not_found`, `403 session_forbidden`, `409 wrong_channel` for a voice session.
+
 ### `PUT /v2/comp/session/{session_id}/message/{message_id}/reaction`
 
 React to one of the persona's messages with one emoji. Body `{"emoji": "👍🏽"}`;
@@ -996,6 +1021,8 @@ never touches audio (see the
 Returns `text/event-stream` with a reduced frame set: `delta`* then a
 terminal `done`, or a single `error` — the same frame shapes as the chat
 message stream above, but with **no** `meta` frame and no `action_type`.
+On every turn of a call that carries lingering effects, a `body_state` frame
+of the same shape as in the chat message stream precedes the first `delta`.
 
 The session must be a **voice-channel** session (`409 wrong_channel`
 otherwise) — obtain one via `POST /comp/chat/start` with
@@ -1022,8 +1049,10 @@ so later calls and text chats can recall it. Operators opt out with
 the provider is stateless, so there is no "inject once" on the wire): a
 `[关于他]` block of `human_insights` bullets (Neutral tier by default; see
 `memory_scope` below) plus a `[上次通话]` block, the previous voice call's
-last 8 messages rendered as a transcript. The two parts degrade
-independently and silently — a failed assembly leaves the marker unwritten
+last 8 messages rendered as a transcript, plus a `[身体状态]` block, the
+lingering effects of the text session the call reads its relationship line
+from. The call keeps that state and does not advance it. The three parts
+degrade independently and silently — a failed assembly leaves the marker unwritten
 so the next turn retries.
 
 **Per-turn recall** (every turn, read-only): a small vector-search pass over
@@ -1210,7 +1239,7 @@ Body fields:
 | `prompt_variant` | `String` | no | Same variant selection as the chat path, including the unknown-key-falls-back-to-built-in rule. |
 | `stream` | `bool` | no | Default `true`. |
 
-The composer payload is identical to the chat path's six slots, so one
+The composer payload is identical to the chat path's seven slots, so one
 `filter_prompt` contract serves both callers (see
 [model-config.md](model-config.md)).
 
