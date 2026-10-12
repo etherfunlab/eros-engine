@@ -1007,8 +1007,10 @@ pub async fn send_message_stream(
             } => {
                 let state_arc = Arc::new(state.clone());
                 // An action turn replays its decided response ahead of the
-                // reply, as the live stream sent it (spec 2026-10-05 §3.4).
-                let head = chat_repo
+                // reply, as the live stream sent it (spec 2026-10-05 §3.4),
+                // then the turn's lingering state, recomputed from the rows
+                // (spec 2026-10-12-given-item-lingering-effects-design.md §9.1).
+                let action_frame = chat_repo
                     .message_by_id_in_session(session_id, user_message_id)
                     .await
                     .ok()
@@ -1019,6 +1021,15 @@ pub async fn send_message_stream(
                             m.metadata.as_ref(),
                         )
                     });
+                let body_frame = crate::pipeline::handlers::load_effects(
+                    &state.pool,
+                    session_id,
+                    Some(user_message_id),
+                )
+                .await
+                .ok()
+                .and_then(|e| crate::pipeline::stream::body_state_frame(user_message_id, &e));
+                let head: Vec<ProtocolFrame> = action_frame.into_iter().chain(body_frame).collect();
                 Box::pin(futures_util::StreamExt::chain(
                     futures_util::stream::iter(head),
                     replay_stream(state_arc, session_id, user_id, ghost, assistant_chain),
@@ -2137,6 +2148,116 @@ data: [DONE]\n\n";
             body_text.contains("\"type\":\"final\""),
             "body: {body_text}"
         );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn stream_replay_re_sends_the_body_state(pool: PgPool) {
+        use eros_engine_store::chat::{AssistantInsert, ChatRepo, UpsertUserOutcome};
+        let user_id = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('R', 'p', '{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let instance_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1, $2) RETURNING id",
+        ).bind(genome_id).bind(user_id).fetch_one(&pool).await.unwrap();
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata, sent_at) \
+             VALUES ($1, 'user', '', $2, now() - make_interval(mins => 1))",
+        )
+        .bind(session_id)
+        .bind(json!({"action": {"type": "give", "item": "cigarette", "quantity": 1, "response": "accept"}}))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Pre-seed an original-request outcome.
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_msg_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J3333333333333333333333B",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+        // Since 0060 chat_messages.generation_id FK-references
+        // engine.llm_generations. Release A's write path creates the parent;
+        // this test writes the child row directly, so it seeds one itself.
+        sqlx::query(
+            "INSERT INTO engine.llm_generations (generation_id, task) \
+             VALUES ('gen-1', 'chat_companion')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let assistant_uuid: Uuid = ulid::Ulid::new().into();
+        chat_repo
+            .insert_assistant_batch(
+                session_id,
+                user_msg_id,
+                &[AssistantInsert {
+                    llm_attempts: None,
+                    gateway_errors: None,
+                    id: assistant_uuid,
+                    content: "replayed reply".into(),
+                    assistant_action_type: "reply".into(),
+                    continues_from_message_id: None,
+                    truncated: false,
+                    generation_id: Some("gen-1".into()),
+                    filter_audit: None,
+                    metadata: None,
+                }],
+            )
+            .await
+            .unwrap();
+
+        let state = crate::routes::companion::test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_jwt(user_id);
+        let body = serde_json::to_vec(
+            &json!({"content":"hi","client_msg_id":"01J3333333333333333333333B"}),
+        )
+        .unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/comp/chat/{session_id}/message/stream"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(ct.starts_with("text/event-stream"));
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body_text = std::str::from_utf8(&bytes).unwrap();
+        let bs = body_text.find("\"type\":\"body_state\"").expect(body_text);
+        let meta = body_text.find("\"type\":\"meta\"").expect(body_text);
+        assert!(bs < meta, "body: {body_text}");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

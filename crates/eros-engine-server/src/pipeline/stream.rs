@@ -4356,6 +4356,20 @@ pub(crate) fn run_stream_with(
             persona,
             signals,
         };
+        // Lingering effects of accepted gives (spec 2026-10-12-given-item-
+        // lingering-effects-design.md §5): read once and rendered once, so the
+        // judge, the reply and the composer see the same text.
+        let given_effects = crate::pipeline::handlers::load_effects(
+            &state.pool,
+            user_msg.session_id,
+            Some(user_msg.user_message_id),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("stream: lingering effects read failed: {e}");
+            Vec::new()
+        });
+        let body_state = crate::prompt::body_state(&given_effects);
         // ── PDE decision (judge-first) ────────────────────────────────────────
         // The judge runs before vision/input-filter/chat so a `ghost` verdict
         // short-circuits all of them. Feature-off skips the judge (rule
@@ -4416,7 +4430,7 @@ pub(crate) fn run_stream_with(
                         &input,
                         image_executor_available,
                         product_qa_recent.as_deref(),
-                        None,
+                        body_state.as_deref(),
                     );
                     // Read receipt (migration 0053): the judge is the first
                     // generative model to see this message, so this is the
@@ -4598,6 +4612,9 @@ pub(crate) fn run_stream_with(
                 user_message_id: user_msg.user_message_id,
                 response,
             };
+        }
+        if let Some(frame) = body_state_frame(user_msg.user_message_id, &given_effects) {
+            yield frame;
         }
 
         match plan.action_type {
@@ -5054,7 +5071,7 @@ pub(crate) fn run_stream_with(
                         &crate::prompt::composer_user_text(user_msg.action.as_ref(), plan.action_response, &user_msg.content),
                         user_msg.user_id,
                         user_msg.session_id,
-                        None,
+                        body_state.as_deref(),
                     )
                     .await;
                     let subject = img.subject;
@@ -5408,6 +5425,7 @@ pub(crate) fn run_stream_with(
                         );
                         let user_id_c = user_msg.user_id;
                         let session_id_c = user_msg.session_id;
+                        let body_state_c = body_state.clone();
                         AbortOnDrop(Some(tokio::spawn(async move {
                             build_delegated_image_prompt(
                                 &state_c,
@@ -5418,7 +5436,7 @@ pub(crate) fn run_stream_with(
                                 &latest_c,
                                 user_id_c,
                                 session_id_c,
-                                None,
+                                body_state_c.as_deref(),
                             )
                             .await
                         })))
@@ -5433,7 +5451,7 @@ pub(crate) fn run_stream_with(
                     &state, &input, &plan,
                     user_msg.session_id, user_msg.user_id, user_msg.instance_id,
                     user_msg.user_message_id, &now_ctx, true,
-                    None,
+                    body_state.as_deref(),
                 ).await;
                 let (req, injected_tags) = match req_res {
                     Ok(r) => r,
@@ -5595,7 +5613,7 @@ pub(crate) fn run_stream_with(
                                     &crate::prompt::composer_user_text(user_msg.action.as_ref(), plan.action_response, &effective_user_msg),
                                     user_msg.user_id,
                                     user_msg.session_id,
-                                    None,
+                                    body_state.as_deref(),
                                 )
                                 .await
                             }
@@ -5609,7 +5627,7 @@ pub(crate) fn run_stream_with(
                                     &crate::prompt::composer_user_text(user_msg.action.as_ref(), plan.action_response, &effective_user_msg),
                                     user_msg.user_id,
                                     user_msg.session_id,
-                                    None,
+                                    body_state.as_deref(),
                                 )
                                 .await
                             }
@@ -8893,6 +8911,120 @@ data: [DONE]\n\n";
         .await
         .expect("exactly one compose event row");
         assert_eq!(clothing.as_deref(), Some("红色旗袍"));
+    }
+
+    /// A prior accepted give reaches the composer's `[身体状态]` slot and the
+    /// event row's `inputs.body_state` on a forced image.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn forced_image_shows_the_body_state(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen_outfit",
+                "model": "composer",
+                "choices": [{"message": {"content":
+                    "{\"prompt\":\"she twirls\",\"caption\":\"转圈\"}"}}],
+                "usage": {"total_tokens": 10}
+            })))
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"primary\"\n\
+                 [tasks.chat_image_prompt_compose]\nmodel = \"composer\"\nfilter_prompt = \"COMPOSE\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata, sent_at) \
+             VALUES ($1, 'user', '', $2, now() - make_interval(mins => 1))",
+        )
+        .bind(session_id)
+        .bind(serde_json::json!({"action": {"type": "give", "item": "cigarette", "quantity": 1, "response": "accept"}}))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J9000000000000000000000D",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let _frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hi".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                image_url: None,
+                image: Some(crate::routes::companion_stream::ImageReplyParams {
+                    force: true,
+                    ..Default::default()
+                }),
+                quote: Default::default(),
+                user_locale: Default::default(),
+                action: None,
+                outfit: None,
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        let reqs = mock.received_requests().await.expect("recorded requests");
+        assert_eq!(reqs.len(), 1, "the composer is the only provider call");
+        let body: serde_json::Value =
+            serde_json::from_slice(&reqs[0].body).expect("composer request body is json");
+        let payload = body["messages"][1]["content"]
+            .as_str()
+            .expect("composer user payload");
+        assert!(
+            payload.contains("[身体状态]\n1 支烟，烟劲很足，正在劲头上"),
+            "the body state must reach the composer: {payload}"
+        );
+        let body_state: Option<String> = sqlx::query_scalar(
+            "SELECT inputs->>'body_state' FROM engine.chat_images_events WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .expect("exactly one compose event row");
+        assert_eq!(body_state.as_deref(), Some("1 支烟，烟劲很足，正在劲头上"));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -18316,6 +18448,7 @@ data: [DONE]\n\n";
             &pool,
             eros_engine_core::types::UserAction::Hug,
             Some("红色旗袍".into()),
+            &[],
             serde_json::json!({"action": "reply_text", "inner_state": "", "clothing": "运动服"}),
             200,
         )
@@ -20594,13 +20727,14 @@ data: [DONE]\n\n"
         verdict: serde_json::Value,
         judge_status: u16,
     ) -> (Vec<ProtocolFrame>, wiremock::MockServer, Uuid) {
-        run_action_turn_full(pool, action, None, verdict, judge_status).await
+        run_action_turn_full(pool, action, None, &[], verdict, judge_status).await
     }
 
     async fn run_action_turn_full(
         pool: &PgPool,
         action: eros_engine_core::types::UserAction,
         outfit: Option<String>,
+        prior: &[serde_json::Value],
         verdict: serde_json::Value,
         judge_status: u16,
     ) -> (Vec<ProtocolFrame>, wiremock::MockServer, Uuid) {
@@ -20647,6 +20781,18 @@ data: [DONE]\n\n"
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
+        for (i, meta) in prior.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content, metadata, sent_at) \
+                 VALUES ($1, 'user', '', $2, now() - make_interval(mins => $3))",
+            )
+            .bind(session_id)
+            .bind(meta)
+            .bind((prior.len() - i) as i32)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
         let meta = serde_json::json!({"action": serde_json::to_value(&action).unwrap()});
         let umid = match (ChatRepo { pool })
             .upsert_user_message_idempotent(
@@ -20695,6 +20841,111 @@ data: [DONE]\n\n"
             .find(|r| String::from_utf8_lossy(&r.body).contains("deepseek/x"))
             .expect("the chat call must have fired");
         String::from_utf8_lossy(&r.body).into_owned()
+    }
+
+    fn accepted_give(item: &str, quantity: u8, name: Option<&str>) -> serde_json::Value {
+        let mut action = serde_json::json!({"type": "give", "item": item, "quantity": quantity, "response": "accept"});
+        if let Some(n) = name {
+            action["name"] = serde_json::json!(n);
+        }
+        serde_json::json!({"action": action})
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_turn_after_an_accepted_give_carries_the_body_state(pool: PgPool) {
+        use eros_engine_core::effects::EffectPhase;
+        let (frames, mock, umid) = run_action_turn_full(
+            &pool,
+            eros_engine_core::types::UserAction::Hug,
+            None,
+            &[accepted_give("alcohol", 3, Some("威士忌"))],
+            serde_json::json!({"action": "reply_text", "inner_state": "", "action_response": "accept"}),
+            200,
+        )
+        .await;
+        let pos = |want: &str| {
+            frame_shape(&frames)
+                .iter()
+                .position(|k| *k == want)
+                .unwrap_or_else(|| panic!("no {want}: {frames:?}"))
+        };
+        assert!(pos("action_response") < pos("body_state"));
+        assert!(pos("body_state") < pos("meta"));
+        let body: Vec<_> = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::BodyState {
+                    user_message_id,
+                    effects,
+                } => Some((*user_message_id, effects.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(body.len(), 1, "sent once");
+        assert_eq!(body[0].0, umid);
+        let e = &body[0].1[0];
+        assert_eq!(
+            (e.level, e.phase, e.step, e.steps),
+            (1, EffectPhase::Rising, 1, 3)
+        );
+
+        let reqs = mock.received_requests().await.expect("recorded requests");
+        let judge = reqs
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .find(|b| b.contains("pde/judge"))
+            .expect("the judge ran");
+        assert!(
+            judge.contains("[身体状态] 3 杯「威士忌」，有一点酒意，还在往上走"),
+            "{judge}"
+        );
+        let chat = chat_request_body(&reqs);
+        assert!(
+            chat.contains("- 身上还带着：3 杯「威士忌」，有一点酒意，还在往上走"),
+            "{chat}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_refused_give_sends_no_body_state(pool: PgPool) {
+        let mut refused = accepted_give("cigarette", 1, None);
+        refused["action"]["response"] = serde_json::json!("refuse");
+        let (frames, mock, _) = run_action_turn_full(
+            &pool,
+            eros_engine_core::types::UserAction::Hug,
+            None,
+            &[refused],
+            serde_json::json!({"action": "reply_text", "inner_state": "", "action_response": "accept"}),
+            200,
+        )
+        .await;
+        assert!(!frame_shape(&frames).contains(&"body_state"), "{frames:?}");
+        let reqs = mock.received_requests().await.expect("recorded requests");
+        assert!(reqs
+            .iter()
+            .all(|r| !String::from_utf8_lossy(&r.body).contains("[身体状态]")));
+    }
+
+    /// One harness run per test: the harness seeds a fixed genome name.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_accepting_turn_sends_no_body_state(pool: PgPool) {
+        let (frames, _, _) = run_action_turn_full(
+            &pool,
+            eros_engine_core::types::UserAction::Give {
+                item: eros_engine_core::types::GivenItem::Alcohol,
+                name: None,
+                quantity: 2,
+            },
+            None,
+            &[],
+            serde_json::json!({"action": "reply_text", "inner_state": "", "action_response": "accept"}),
+            200,
+        )
+        .await;
+        assert!(
+            !frame_shape(&frames).contains(&"body_state"),
+            "the accepting turn: {frames:?}"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
