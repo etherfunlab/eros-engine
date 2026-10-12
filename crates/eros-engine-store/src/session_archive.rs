@@ -736,7 +736,24 @@ mod tests {
             .archive_relationship(user_id, instance_id)
             .await
         });
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Wait until Postgres shows a backend queued for a lock on this session
+        // row, so the assertion below is about the lock and not about timing.
+        let mut waiting = false;
+        for _ in 0..100 {
+            waiting = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+                 WHERE datname = current_database() AND wait_event_type = 'Lock' \
+                   AND query LIKE 'UPDATE engine.chat_sessions SET archived%')",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if waiting {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(waiting, "the archive must queue on the locked session row");
         assert!(
             !archive.is_finished(),
             "the archive must wait on the locked session row"
