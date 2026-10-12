@@ -89,6 +89,37 @@ impl Affinity {
     }
 }
 
+/// A relationship with no row yet, for read-only callers that must not create
+/// one: the values a fresh `companion_affinity` row takes from its column
+/// defaults (empty lines, level-2 endpoints), with nil ids.
+impl Default for Affinity {
+    fn default() -> Self {
+        let now = Utc::now();
+        let endpoint = endpoint_value(2, 0.0, 1.0, AffinityTuning::default().floor_ratio);
+        Self {
+            id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            user_id: Uuid::nil(),
+            instance_id: Uuid::nil(),
+            warmth: endpoint,
+            trust: 0.0,
+            intrigue: 0.0,
+            intimacy: 0.0,
+            patience: endpoint,
+            tension: 0.0,
+            warmth_grade: 2,
+            patience_grade: 2,
+            ghost_streak: 0,
+            last_ghost_at: None,
+            total_ghosts: 0,
+            feeling_clause: None,
+            feeling_clause_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+}
+
 fn clamp(v: f64, lo: f64, hi: f64) -> f64 {
     if v < lo {
         lo

@@ -4,10 +4,6 @@
 //! (spec 2026-10-12-group-chat-design.md §5.3–§5.4). Reasoning deltas are
 //! yielded as they arrive; the content is parsed once the stream ends.
 
-// Every item here is consumed by the group turn handler (Task 11); until that
-// lands only the tests call them.
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 use eros_engine_core::affinity::{BondLabel, ChemistryLabel};

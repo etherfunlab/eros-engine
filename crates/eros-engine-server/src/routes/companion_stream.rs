@@ -72,7 +72,7 @@ pub(crate) fn validated_outfit(raw: Option<&str>) -> Result<Option<String>, Stri
 }
 const MIN_CLIENT_MSG_ID_LEN: usize = 26;
 const MAX_CLIENT_MSG_ID_LEN: usize = 36;
-const CONCURRENT_STREAMS_PER_USER: u32 = 3;
+pub(crate) const CONCURRENT_STREAMS_PER_USER: u32 = 3;
 const SSE_KEEPALIVE_SECS: u64 = 15;
 
 #[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
@@ -456,41 +456,7 @@ pub(crate) fn validate_payload(req: &StreamSendRequest) -> Result<(), AppError> 
             original_user_message_id: None,
         }));
     }
-    if req.content.chars().count() > MAX_CONTENT_CHARS {
-        return Err(AppError::StreamPre(StreamPreError {
-            status: StatusCode::UNPROCESSABLE_ENTITY,
-            code: "unprocessable",
-            message: format!("content exceeds {MAX_CONTENT_CHARS} chars"),
-            user_message: "消息过长，请缩短后重试".into(),
-            original_user_message_id: None,
-        }));
-    }
-    let id_len = req.client_msg_id.len();
-    if !(MIN_CLIENT_MSG_ID_LEN..=MAX_CLIENT_MSG_ID_LEN).contains(&id_len) {
-        return Err(AppError::StreamPre(StreamPreError {
-            status: StatusCode::BAD_REQUEST,
-            code: "invalid_payload",
-            message: format!(
-                "client_msg_id must be {MIN_CLIENT_MSG_ID_LEN}..={MAX_CLIENT_MSG_ID_LEN} chars"
-            ),
-            user_message: "请求无效".into(),
-            original_user_message_id: None,
-        }));
-    }
-    if req
-        .client_msg_id
-        .chars()
-        .any(|c| c.is_whitespace() || !c.is_ascii() || !c.is_ascii_graphic())
-    {
-        return Err(AppError::StreamPre(StreamPreError {
-            status: StatusCode::BAD_REQUEST,
-            code: "invalid_payload",
-            message: "client_msg_id must be ASCII printable, no whitespace".into(),
-            user_message: "请求无效".into(),
-            original_user_message_id: None,
-        }));
-    }
-    validate_tier(req.tier.as_deref())?;
+    validate_send_basics(&req.content, &req.client_msg_id, req.tier.as_deref())?;
     if let Some(url) = req.image_url.as_deref() {
         if !image_url_is_valid(url) {
             return Err(AppError::StreamPre(StreamPreError {
@@ -502,7 +468,55 @@ pub(crate) fn validate_payload(req: &StreamSendRequest) -> Result<(), AppError> 
             }));
         }
     }
-    if let Some(img) = req.image.as_ref() {
+    validate_image_params(req.image.as_ref())
+}
+
+/// The checks every chat-shaped send body shares: the content cap, the
+/// `client_msg_id` shape and `tier`.
+pub(crate) fn validate_send_basics(
+    content: &str,
+    client_msg_id: &str,
+    tier: Option<&str>,
+) -> Result<(), AppError> {
+    if content.chars().count() > MAX_CONTENT_CHARS {
+        return Err(AppError::StreamPre(StreamPreError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "unprocessable",
+            message: format!("content exceeds {MAX_CONTENT_CHARS} chars"),
+            user_message: "消息过长，请缩短后重试".into(),
+            original_user_message_id: None,
+        }));
+    }
+    let id_len = client_msg_id.len();
+    if !(MIN_CLIENT_MSG_ID_LEN..=MAX_CLIENT_MSG_ID_LEN).contains(&id_len) {
+        return Err(AppError::StreamPre(StreamPreError {
+            status: StatusCode::BAD_REQUEST,
+            code: "invalid_payload",
+            message: format!(
+                "client_msg_id must be {MIN_CLIENT_MSG_ID_LEN}..={MAX_CLIENT_MSG_ID_LEN} chars"
+            ),
+            user_message: "请求无效".into(),
+            original_user_message_id: None,
+        }));
+    }
+    if client_msg_id
+        .chars()
+        .any(|c| c.is_whitespace() || !c.is_ascii() || !c.is_ascii_graphic())
+    {
+        return Err(AppError::StreamPre(StreamPreError {
+            status: StatusCode::BAD_REQUEST,
+            code: "invalid_payload",
+            message: "client_msg_id must be ASCII printable, no whitespace".into(),
+            user_message: "请求无效".into(),
+            original_user_message_id: None,
+        }));
+    }
+    validate_tier(tier)
+}
+
+/// The `image` block's shape: a supported aspect ratio when one is given.
+pub(crate) fn validate_image_params(image: Option<&ImageReplyParams>) -> Result<(), AppError> {
+    if let Some(img) = image {
         if let Some(ar) = img.aspect_ratio.as_deref() {
             if !aspect_ratio_supported(ar) {
                 return Err(AppError::StreamPre(StreamPreError {

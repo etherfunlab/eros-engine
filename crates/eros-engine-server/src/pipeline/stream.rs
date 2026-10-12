@@ -70,8 +70,7 @@ pub enum ProtocolFrame {
         model: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         continues_from: Option<String>,
-        /// The group member speaking this message; absent on 1:1 turns, so a
-        /// 1:1 `meta` frame is byte-identical to before.
+        /// The group member speaking this message; absent on 1:1 turns.
         #[serde(skip_serializing_if = "Option::is_none")]
         speaker_session_id: Option<Uuid>,
     },
@@ -155,22 +154,17 @@ pub enum ProtocolFrame {
         user_message_id: Uuid,
         effects: Vec<eros_engine_core::effects::ActiveEffect>,
     },
-    // The three group variants are constructed by the group turn (Task 11 of
-    // the group-chat plan).
     /// Group turns: who is about to speak, in order (after the director, or
     /// after the rule fallback).
-    #[allow(dead_code)]
     Cast {
         speakers: Vec<CastEntry>,
     },
     /// Group turns: one reasoning delta from the director. Display only.
-    #[allow(dead_code)]
     DirectorReasoning {
         content: String,
     },
     /// Group turns: one speaker failed; the turn continues with the next.
     /// Non-terminal, unlike `error`.
-    #[allow(dead_code)]
     SpeakerError {
         speaker_session_id: Uuid,
         code: StreamErrorCode,
@@ -213,7 +207,7 @@ pub(crate) fn frame_action_for(a: eros_engine_core::types::ActionType) -> FrameA
 /// wire prompt (style preset + persona appearance + enriched subject) — exactly
 /// what the provider would receive. base64(STANDARD, unwrapped) of its UTF-8
 /// bytes keeps the explicit/CJK text out of SSE transport. Pure.
-fn build_image_request_frame(
+pub(crate) fn build_image_request_frame(
     message_id: String,
     composed_prompt: &str,
     image_ref: eros_engine_core::types::ImageRef,
@@ -5936,7 +5930,7 @@ pub fn replay_stream(
                     }),
                     continues_from: prev_ulid.map(ulid_string),
                     // A replayed group turn keeps its speakers; 1:1 rows have
-                    // none, so their frames stay as they were.
+                    // none, so their frames carry no speaker.
                     speaker_session_id: row.msg.speaker_session_id,
                 };
                 if !row.msg.content.is_empty() {

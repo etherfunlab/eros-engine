@@ -221,6 +221,320 @@ async fn archive_group(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct GroupSendRequest {
+    pub content: String,
+    pub client_msg_id: String,
+    #[serde(default)]
+    pub prompt_traits: Option<Vec<crate::routes::companion::PromptTraitDto>>,
+    #[serde(default)]
+    pub tier: Option<String>,
+    #[serde(default)]
+    pub image: Option<crate::routes::companion_stream::ImageReplyParams>,
+    #[serde(default)]
+    pub user_timezone: Option<String>,
+    #[serde(default)]
+    pub user_country: Option<String>,
+    #[serde(default)]
+    pub user_region: Option<String>,
+    /// Member sessions the user @-mentioned; each must be seated.
+    #[serde(default)]
+    pub mentions: Vec<Uuid>,
+    /// Refused: group turns run on the deployment's key only.
+    #[serde(default)]
+    #[schema(value_type = Option<Object>)]
+    pub byok: Option<serde_json::Value>,
+}
+
+fn pre(status: StatusCode, code: &'static str, message: &str, user_message: &str) -> AppError {
+    AppError::StreamPre(crate::error::StreamPreError {
+        status,
+        code,
+        message: message.into(),
+        user_message: user_message.into(),
+        original_user_message_id: None,
+    })
+}
+
+#[utoipa::path(post, path = "/v2/comp/group/{group_id}/message/stream", tag = "group",
+    params(("group_id" = Uuid, Path)), request_body = GroupSendRequest,
+    responses(
+        (status = 200, description = "SSE: director_reasoning* → cast → (meta → delta* → done → image_request? | speaker_error)×N → final", content_type = "text/event-stream"),
+        (status = 400, body = crate::routes::companion_stream::StreamPreErrorBody),
+        (status = 404, body = crate::routes::companion_stream::StreamPreErrorBody),
+        (status = 409, body = crate::routes::companion_stream::StreamPreErrorBody),
+        (status = 422, body = crate::routes::companion_stream::StreamPreErrorBody),
+        (status = 429, body = crate::routes::companion_stream::StreamPreErrorBody),
+    ),
+    security(("bearer" = [])))]
+async fn send_group_message_stream(
+    State(state): State<AppState>,
+    Path(group_id): Path<Uuid>,
+    Extension(AuthUser(user_id)): Extension<AuthUser>,
+    Json(req): Json<GroupSendRequest>,
+) -> Result<
+    axum::response::sse::Sse<
+        impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+    >,
+    AppError,
+> {
+    use crate::pipeline::stream::ProtocolFrame;
+    use crate::routes::companion_stream::{
+        validate_image_params, validate_send_basics, CONCURRENT_STREAMS_PER_USER,
+    };
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use eros_engine_store::chat::ChatRepo;
+    use eros_engine_store::chat_queue::{ChatQueueRepo, ClaimedEnqueueOutcome};
+
+    if req.content.trim().is_empty() {
+        return Err(pre(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unprocessable",
+            "content must not be empty",
+            "请输入一条消息",
+        ));
+    }
+    validate_send_basics(&req.content, &req.client_msg_id, req.tier.as_deref())?;
+    validate_image_params(req.image.as_ref())?;
+    if req.byok.is_some() {
+        return Err(pre(
+            StatusCode::BAD_REQUEST,
+            "invalid_payload",
+            "byok is not available on group turns",
+            "请求无效",
+        ));
+    }
+    if req.image.as_ref().is_some_and(|i| i.force) {
+        return Err(pre(
+            StatusCode::BAD_REQUEST,
+            "invalid_payload",
+            "image.force has no single persona to force on a group turn",
+            "请求无效",
+        ));
+    }
+    let prompt_traits = crate::routes::companion::validate_prompt_traits(
+        req.prompt_traits.as_deref().unwrap_or(&[]),
+    )
+    .map_err(|e| {
+        pre(
+            StatusCode::BAD_REQUEST,
+            "invalid_payload",
+            &e.to_string(),
+            "请求无效",
+        )
+    })?;
+
+    let session = ChatRepo { pool: &state.pool }
+        .get_session(group_id)
+        .await?
+        .filter(|s| s.user_id == user_id)
+        .ok_or_else(|| {
+            pre(
+                StatusCode::NOT_FOUND,
+                "session_not_found",
+                "group not found",
+                "会话不存在",
+            )
+        })?;
+    if session.channel != "group" {
+        return Err(pre(
+            StatusCode::CONFLICT,
+            "wrong_channel",
+            &format!("session is a {}-channel session", session.channel),
+            "会话类型不匹配",
+        ));
+    }
+    let members = GroupRepo { pool: &state.pool }
+        .active_members(group_id)
+        .await?;
+    if members.is_empty() {
+        return Err(pre(
+            StatusCode::CONFLICT,
+            "group_empty",
+            "the group has no members",
+            "群里还没有角色",
+        ));
+    }
+    if req
+        .mentions
+        .iter()
+        .any(|m| !members.iter().any(|x| x.member_session_id == *m))
+    {
+        return Err(pre(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unprocessable",
+            "a mention is not a seated member",
+            "点名的角色不在群里",
+        ));
+    }
+
+    let guard = state
+        .stream_slots
+        .try_acquire(user_id, CONCURRENT_STREAMS_PER_USER)
+        .ok_or_else(|| {
+            pre(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                &format!("per-user stream cap reached ({CONCURRENT_STREAMS_PER_USER})"),
+                "请求过多，请稍后再试",
+            )
+        })?;
+
+    let metadata =
+        (!req.mentions.is_empty()).then(|| serde_json::json!({ "mentions": req.mentions }));
+    let params = serde_json::to_value(crate::routes::companion_async::QueuedTurnParams {
+        tier: req.tier.clone(),
+        prompt_traits: req.prompt_traits.clone(),
+        image: req.image.clone(),
+        user_timezone: crate::holiday::bounded_raw(req.user_timezone.as_deref()),
+        user_country: crate::holiday::bounded_raw(req.user_country.as_deref()),
+        user_region: crate::holiday::bounded_raw(req.user_region.as_deref()),
+        ..Default::default()
+    })
+    .expect("QueuedTurnParams serializes");
+    let outcome = ChatQueueRepo { pool: &state.pool }
+        .enqueue_user_message_claimed(
+            group_id,
+            &req.content,
+            &req.client_msg_id,
+            "user",
+            metadata.as_ref(),
+            user_id,
+            &params,
+        )
+        .await?;
+
+    let proto: std::pin::Pin<Box<dyn futures_util::Stream<Item = ProtocolFrame> + Send>> =
+        match outcome {
+            ClaimedEnqueueOutcome::Claimed {
+                user_message_id,
+                queue_id,
+            } => {
+                let turn = crate::pipeline::group::GroupTurn {
+                    group_session_id: group_id,
+                    user_id,
+                    user_message_id,
+                    content: req.content.clone(),
+                    title: session.title.clone(),
+                    members,
+                    mentions: req.mentions.clone(),
+                    prompt_traits,
+                    tier: req.tier.clone(),
+                    user_locale: crate::holiday::UserLocale::resolve(
+                        req.user_timezone.as_deref(),
+                        req.user_country.as_deref(),
+                        req.user_region.as_deref(),
+                    ),
+                    image: req.image.clone(),
+                };
+                let claimed = eros_engine_store::chat_queue::ClaimedTurn {
+                    queue_id,
+                    session_id: group_id,
+                    user_message_id,
+                    user_id,
+                    attempts: 1,
+                    params: Some(params),
+                };
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ProtocolFrame>();
+                let st = state.clone();
+                // The detached task owns the turn and the stream slot; the SSE
+                // body is only a tap, so a disconnect never cancels the turn.
+                tokio::spawn(async move {
+                    let _guard = guard;
+                    // `tx` moves into the drive and drops with it when the
+                    // budget expires; this clone carries the timeout frame.
+                    let timeout_tx = tx.clone();
+                    let timeout = st.config.chat_queue.generation_timeout;
+                    let outcome = match tokio::time::timeout(
+                        timeout,
+                        crate::pipeline::group::drive_group_to_exhaustion(
+                            std::sync::Arc::new(st.clone()),
+                            turn,
+                            tx,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(o) => o,
+                        Err(_) => {
+                            let _ = timeout_tx.send(ProtocolFrame::Error {
+                                code: crate::pipeline::stream::StreamErrorCode::GenerationTimeout,
+                                retryable: true,
+                                message: format!("generation timeout after {}s", timeout.as_secs()),
+                                user_message: "回复超时，请稍后再试".into(),
+                                upstream_status: None,
+                                provider_code: None,
+                            });
+                            crate::pipeline::chat_queue::TurnOutcome::Failure(
+                                "generation timeout".into(),
+                            )
+                        }
+                    };
+                    // Close the SSE body before the settle write.
+                    drop(timeout_tx);
+                    crate::pipeline::chat_queue::settle_turn(
+                        &st,
+                        &claimed,
+                        outcome,
+                        crate::pipeline::chat_queue::SettleMode::TerminalOnFailure,
+                    )
+                    .await;
+                    st.chat_queue_notify.notify_one();
+                });
+                Box::pin(async_stream::stream! {
+                    while let Some(f) = rx.recv().await {
+                        yield f;
+                    }
+                })
+            }
+            ClaimedEnqueueOutcome::Replay {
+                ghost,
+                assistant_chain,
+                ..
+            } => {
+                drop(guard);
+                Box::pin(crate::pipeline::stream::replay_stream(
+                    std::sync::Arc::new(state.clone()),
+                    group_id,
+                    user_id,
+                    ghost,
+                    assistant_chain,
+                ))
+            }
+            ClaimedEnqueueOutcome::DuplicateInProgress { user_message_id } => {
+                return Err(AppError::StreamPre(crate::error::StreamPreError {
+                    status: StatusCode::CONFLICT,
+                    code: "duplicate_in_progress",
+                    message: "same (session_id, client_msg_id) is still generating".into(),
+                    user_message: "上一条消息正在处理中，请稍候".into(),
+                    original_user_message_id: Some(user_message_id),
+                }));
+            }
+            ClaimedEnqueueOutcome::DuplicateFailed { user_message_id } => {
+                return Err(AppError::StreamPre(crate::error::StreamPreError {
+                    status: StatusCode::CONFLICT,
+                    code: "duplicate_failed",
+                    message: "same (session_id, client_msg_id) terminally failed; \
+                              a same-id retry can never succeed"
+                        .into(),
+                    user_message: "这条消息发送失败，请重新发送".into(),
+                    original_user_message_id: Some(user_message_id),
+                }));
+            }
+        };
+
+    let sse = futures_util::StreamExt::map(proto, |frame: ProtocolFrame| {
+        let json =
+            serde_json::to_string(&frame).expect("ProtocolFrame serialization is infallible");
+        Ok::<_, std::convert::Infallible>(Event::default().data(json))
+    });
+    Ok(Sse::new(sse).keep_alive(
+        KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("ping"),
+    ))
+}
+
 pub fn router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(create_group))
@@ -228,6 +542,7 @@ pub fn router() -> OpenApiRouter<AppState> {
         .routes(routes!(get_group, rename_group, archive_group))
         .routes(routes!(add_member))
         .routes(routes!(remove_member))
+        .routes(routes!(send_group_message_stream))
 }
 
 #[cfg(test)]
@@ -491,5 +806,625 @@ mod tests {
         assert_eq!(s, StatusCode::OK);
         assert_eq!(body["title"], "keep");
         assert_eq!(body["members"].as_array().unwrap().len(), 1);
+    }
+
+    struct Fixture {
+        app: axum::Router,
+        pool: PgPool,
+        user: Uuid,
+        group: Uuid,
+        a: Uuid,
+        b: Uuid,
+        _server: wiremock::MockServer,
+    }
+
+    async fn name_member(pool: &PgPool, session: Uuid, name: &str) {
+        sqlx::query(
+            "UPDATE engine.persona_genomes g SET name = $2, tip_personality = '爱聊天' \
+             FROM engine.persona_instances pi, engine.chat_sessions s \
+             WHERE s.id = $1 AND pi.id = s.instance_id AND g.id = pi.genome_id",
+        )
+        .bind(session)
+        .bind(name)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    fn sse(frames: &[String]) -> String {
+        let mut s: String = frames.iter().map(|f| format!("data: {f}\n\n")).collect();
+        s.push_str("data: [DONE]\n\n");
+        s
+    }
+
+    async fn fixture(
+        pool: PgPool,
+        director_body: Option<String>,
+        chat_status: u16,
+        gen_timeout: Option<std::time::Duration>,
+    ) -> Fixture {
+        use wiremock::matchers::{body_partial_json, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let director_body_present = director_body.is_some();
+        let user = Uuid::new_v4();
+        let a = member(&pool, user).await;
+        let b = member(&pool, user).await;
+        name_member(&pool, a, "小美").await;
+        name_member(&pool, b, "阿哲").await;
+        let g = eros_engine_store::group::GroupRepo { pool: &pool }
+            .create(user, Some("周末爬山"), &[a, b])
+            .await
+            .unwrap()
+            .unwrap();
+
+        let server = MockServer::start().await;
+        if let Some(body) = director_body {
+            Mock::given(path("/api/v1/chat/completions"))
+                .and(body_partial_json(json!({"model": "dir-model"})))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_raw(body, "text/event-stream"),
+                )
+                .mount(&server)
+                .await;
+        }
+        let chat = if chat_status == 200 {
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(
+                    sse(&[
+                        r#"{"choices":[{"delta":{"content":"好呀"}}],"id":"gen-chat"}"#.to_string(),
+                    ]),
+                    "text/event-stream",
+                )
+        } else {
+            ResponseTemplate::new(chat_status)
+        };
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(body_partial_json(json!({"model": "chat-model"})))
+            .respond_with(chat)
+            .mount(&server)
+            .await;
+
+        let director_section = if director_body_present {
+            "[tasks.group_director]\nmodel = \"dir-model\"\nfallback = []\nfilter_prompt = \"direct\"\n"
+        } else {
+            ""
+        };
+        let cfg = eros_engine_llm::model_config::ModelConfig::from_toml_str(&format!(
+            "[tasks.chat_companion]\nmodel = \"chat-model\"\nfallback = []\n{director_section}"
+        ))
+        .unwrap();
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(cfg);
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", server.uri()),
+            ),
+        );
+        if let Some(t) = gen_timeout {
+            state.config.chat_queue.generation_timeout = t;
+        }
+        Fixture {
+            app: build_router(state),
+            pool,
+            user,
+            group: g.id,
+            a,
+            b,
+            _server: server,
+        }
+    }
+
+    async fn send(f: &mut Fixture, body: Value) -> (StatusCode, String) {
+        use tower::Service;
+        let req = req(
+            "POST",
+            &format!("/v2/comp/group/{}/message/stream", f.group),
+            f.user,
+            Some(body),
+        );
+        let resp = f.app.call(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    fn director_sse(verdict: &str) -> String {
+        let escaped = verdict.replace('"', "\\\"");
+        sse(&[
+            r#"{"choices":[{"delta":{"reasoning":"阿哲被点名了"}}]}"#.to_string(),
+            format!(r#"{{"choices":[{{"delta":{{"content":"{escaped}"}}}}],"id":"gen-dir"}}"#),
+        ])
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_directed_turn_streams_in_order_and_writes_no_affinity(pool: PgPool) {
+        let verdict = r#"{"speakers":[{"member":"m2","action":"reply_text","inner_state":"有点兴奋","reply_mode":null,"clothing":null},{"member":"m1","action":"reply_text","inner_state":null,"reply_mode":null,"clothing":null}],"reason":null}"#;
+        let mut f = fixture(pool, Some(director_sse(verdict)), 200, None).await;
+        let (s, body) = send(
+            &mut f,
+            json!({"content":"阿哲你去不去","client_msg_id":"01J7777777777777777777777G"}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("missing {needle}: {body}"))
+        };
+        let reasoning = at(r#""type":"director_reasoning""#);
+        let cast = at(r#""type":"cast""#);
+        let first_meta = at(&format!(r#""speaker_session_id":"{}""#, f.b));
+        let second_meta = at(&format!(r#""speaker_session_id":"{}""#, f.a));
+        let fin = at(r#""type":"final""#);
+        assert!(
+            reasoning < cast && cast < first_meta && first_meta < second_meta && second_meta < fin,
+            "{body}"
+        );
+
+        let speakers: Vec<Option<Uuid>> = sqlx::query_scalar(
+            "SELECT speaker_session_id FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant' ORDER BY sent_at, id",
+        )
+        .bind(f.group)
+        .fetch_all(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(speakers, vec![Some(f.b), Some(f.a)]);
+
+        let affinity: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM engine.companion_affinity WHERE user_id = $1")
+                .bind(f.user)
+                .fetch_one(&f.pool)
+                .await
+                .unwrap();
+        assert_eq!(affinity, 0);
+
+        let (status, has_reasoning): (String, bool) = sqlx::query_as(
+            "SELECT status, payload ? 'reasoning' FROM engine.companion_decision_events WHERE session_id = $1",
+        )
+        .bind(f.group)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!((status.as_str(), has_reasoning), ("ok", true));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_later_speaker_hears_the_earlier_one(pool: PgPool) {
+        use wiremock::matchers::body_string_contains;
+        let verdict = r#"{"speakers":[{"member":"m1","action":"reply_text","inner_state":null,"reply_mode":null,"clothing":null},{"member":"m2","action":"reply_text","inner_state":null,"reply_mode":null,"clothing":null}],"reason":null}"#;
+        let mut f = fixture(pool, Some(director_sse(verdict)), 200, None).await;
+        // The second speaker's request carries m1's persisted line, prefixed.
+        wiremock::Mock::given(wiremock::matchers::path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                json!({"model": "chat-model"}),
+            ))
+            .and(body_string_contains("小美：好呀"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(
+                        sse(&[r#"{"choices":[{"delta":{"content":"我也去"}}]}"#.to_string()]),
+                        "text/event-stream",
+                    ),
+            )
+            .with_priority(1)
+            .expect(1)
+            .mount(&f._server)
+            .await;
+        let (s, body) = send(
+            &mut f,
+            json!({"content":"去爬山吗","client_msg_id":"01J8888888888888888888888G"}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(body.contains("我也去"), "{body}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn no_director_means_everyone_answers_in_join_order(pool: PgPool) {
+        let mut f = fixture(pool, None, 200, None).await;
+        let (_, body) = send(
+            &mut f,
+            json!({"content":"大家好","client_msg_id":"01J9999999999999999999999G"}),
+        )
+        .await;
+        let a = body
+            .find(&format!(r#""member_session_id":"{}""#, f.a))
+            .unwrap();
+        let b = body
+            .find(&format!(r#""member_session_id":"{}""#, f.b))
+            .unwrap();
+        assert!(a < b, "cast in join order: {body}");
+        assert!(!body.contains("director_reasoning"));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_unparseable_director_falls_back(pool: PgPool) {
+        let mut f = fixture(
+            pool,
+            Some(sse(&[
+                r#"{"choices":[{"delta":{"content":"m2 先说"}}]}"#.to_string()
+            ])),
+            200,
+            None,
+        )
+        .await;
+        let (_, body) = send(
+            &mut f,
+            json!({"content":"嗨","client_msg_id":"01JAAAAAAAAAAAAAAAAAAAAAAG"}),
+        )
+        .await;
+        assert_eq!(
+            body.matches(r#""type":"meta""#).count(),
+            2,
+            "both members answer: {body}"
+        );
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM engine.companion_decision_events WHERE session_id = $1",
+        )
+        .bind(f.group)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "parse_error");
+    }
+
+    /// No fallback phrase: an exhausted chat chain ends the speaker's burst in
+    /// an error instead of serving the canned line.
+    async fn clear_fallback_phrases(pool: &PgPool) {
+        sqlx::query(
+            "UPDATE engine.error_handling_config SET payload = '[]'::jsonb \
+             WHERE kind = 'chat_stream_failure_fallback_phrases'",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn every_speaker_failing_ends_in_error(pool: PgPool) {
+        let mut f = fixture(pool, None, 500, None).await;
+        clear_fallback_phrases(&f.pool).await;
+        let (_, body) = send(
+            &mut f,
+            json!({"content":"嗨","client_msg_id":"01JBBBBBBBBBBBBBBBBBBBBBBG"}),
+        )
+        .await;
+        assert_eq!(
+            body.matches(r#""type":"speaker_error""#).count(),
+            2,
+            "{body}"
+        );
+        assert!(body.contains(r#""type":"error""#), "{body}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn no_seatable_member_ends_in_error_and_a_notice(pool: PgPool) {
+        let mut f = fixture(pool, None, 200, None).await;
+        sqlx::query(
+            "UPDATE engine.persona_instances SET status = 'archived' \
+             WHERE id IN (SELECT instance_id FROM engine.chat_sessions WHERE id = ANY($1))",
+        )
+        .bind(vec![f.a, f.b])
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        let (_, body) = send(
+            &mut f,
+            json!({"content":"嗨","client_msg_id":"01JBBBBBBBBBBBBBBBBBBBBBBG"}),
+        )
+        .await;
+        assert!(body.contains(r#""type":"error""#), "{body}");
+        assert!(!body.contains(r#""type":"cast""#), "{body}");
+        // settle runs on the detached task; poll for it.
+        let mut notices = 0i64;
+        for _ in 0..100 {
+            notices = sqlx::query_scalar(
+                "SELECT count(*) FROM engine.chat_messages WHERE session_id = $1 AND role = 'system_error'",
+            )
+            .bind(f.group)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+            if notices > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(notices, 1);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn one_failing_speaker_does_not_stop_the_relay(pool: PgPool) {
+        use wiremock::matchers::body_string_contains;
+        // Order is 小美 then 阿哲 (no director). Swap it so 阿哲 fails FIRST
+        // and 小美 still answers after him: kick and re-add 小美.
+        let mut f = fixture(pool, None, 200, None).await;
+        clear_fallback_phrases(&f.pool).await;
+        let repo = eros_engine_store::group::GroupRepo { pool: &f.pool };
+        repo.remove_member(f.group, f.user, f.a).await.unwrap();
+        repo.add_member(f.group, f.user, f.a)
+            .await
+            .unwrap()
+            .unwrap();
+        // 阿哲 speaks first now; his request is the one WITHOUT 小美's line.
+        // Fail every chat call whose body names 阿哲's own block line …
+        wiremock::Mock::given(wiremock::matchers::path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                json!({"model": "chat-model"}),
+            ))
+            .and(body_string_contains("在场的还有：\\n- 小美"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .with_priority(1)
+            .mount(&f._server)
+            .await;
+        let (_, body) = send(
+            &mut f,
+            json!({"content":"在吗","client_msg_id":"01JMMMMMMMMMMMMMMMMMMMMMMG"}),
+        )
+        .await;
+        let err = body
+            .find(r#""type":"speaker_error""#)
+            .unwrap_or_else(|| panic!("{body}"));
+        let later = body
+            .find(&format!(r#""speaker_session_id":"{}""#, f.a))
+            .unwrap_or_else(|| panic!("{body}"));
+        assert!(err < later, "the relay continued after the failure: {body}");
+        assert!(body.contains(r#""type":"final""#), "{body}");
+        // The failed attempt leaves a truncated bubble, as on a 1:1 turn.
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant' AND NOT truncated",
+        )
+        .bind(f.group)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn inactive_persona_is_not_seated(pool: PgPool) {
+        let mut f = fixture(pool, None, 200, None).await;
+        sqlx::query(
+            "UPDATE engine.persona_instances SET status = 'archived' \
+                     WHERE id = (SELECT instance_id FROM engine.chat_sessions WHERE id = $1)",
+        )
+        .bind(f.a)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        let (_, body) = send(
+            &mut f,
+            json!({"content":"嗨","client_msg_id":"01JCCCCCCCCCCCCCCCCCCCCCCG"}),
+        )
+        .await;
+        assert_eq!(body.matches(r#""type":"meta""#).count(), 1, "{body}");
+        assert!(!body.contains(&f.a.to_string()), "{body}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn director_reads_the_members_1to1_affinity(pool: PgPool) {
+        let verdict = r#"{"speakers":[{"member":"m1","action":"reply_text","inner_state":null,"reply_mode":null,"clothing":null}],"reason":null}"#;
+        let mut f = fixture(pool, Some(director_sse(verdict)), 200, None).await;
+        // A close 1:1 relationship for 小美 (bond score 0.95 ⇒ tier 5, clear of the 0.90 edge after drift).
+        let instance: Uuid =
+            sqlx::query_scalar("SELECT instance_id FROM engine.chat_sessions WHERE id = $1")
+                .bind(f.a)
+                .fetch_one(&f.pool)
+                .await
+                .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.companion_affinity (session_id, user_id, instance_id, trust, intrigue) \
+             VALUES ($1, $2, $3, 0.95, 0.95)",
+        )
+        .bind(f.a)
+        .bind(f.user)
+        .bind(instance)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        let before: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+            "SELECT updated_at FROM engine.companion_affinity WHERE session_id = $1",
+        )
+        .bind(f.a)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+
+        let (s, _) = send(
+            &mut f,
+            json!({"content":"嗨","client_msg_id":"01JKKKKKKKKKKKKKKKKKKKKKKG"}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let bond: String = sqlx::query_scalar(
+            "SELECT inputs->'members'->0->>'bond' FROM engine.companion_decision_events WHERE session_id = $1",
+        )
+        .bind(f.group)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(bond, "soulmate", "the director sees the member's 1:1 tier");
+        let after: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+            "SELECT updated_at FROM engine.companion_affinity WHERE session_id = $1",
+        )
+        .bind(f.a)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(before, after, "the group read it and never wrote it");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_timeout_mid_relay_keeps_the_finished_speaker(pool: PgPool) {
+        use wiremock::matchers::body_string_contains;
+        // No director: 小美 then 阿哲. 阿哲's request (it carries 小美's line)
+        // hangs past the whole-turn budget.
+        let mut f = fixture(pool, None, 200, Some(std::time::Duration::from_secs(2))).await;
+        wiremock::Mock::given(wiremock::matchers::path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                json!({"model": "chat-model"}),
+            ))
+            .and(body_string_contains("小美：好呀"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(
+                        sse(&[r#"{"choices":[{"delta":{"content":"迟到"}}]}"#.to_string()]),
+                        "text/event-stream",
+                    )
+                    .set_delay(std::time::Duration::from_secs(10)),
+            )
+            .with_priority(1)
+            .mount(&f._server)
+            .await;
+        let (_, body) = send(
+            &mut f,
+            json!({"content":"在吗","client_msg_id":"01JLLLLLLLLLLLLLLLLLLLLLLG"}),
+        )
+        .await;
+        assert!(body.contains(r#""code":"generation_timeout""#), "{body}");
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_messages WHERE session_id = $1 AND role = 'assistant'",
+        )
+        .bind(f.group)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, 1, "小美's line stays persisted");
+        // A served row makes the terminal settle `done`, with no notice.
+        let mut status = String::new();
+        for _ in 0..100 {
+            status = sqlx::query_scalar(
+                "SELECT q.status FROM engine.chat_turn_queue q JOIN engine.chat_messages m ON m.id = q.user_message_id \
+                 WHERE m.session_id = $1",
+            )
+            .bind(f.group)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+            if status != "claimed" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(status, "done");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn send_refusals(pool: PgPool) {
+        let mut f = fixture(pool, None, 200, None).await;
+        // The body checks the 1:1 route makes apply here too.
+        let (s, _) = send(&mut f, json!({"content":"嗨","client_msg_id":"short"})).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (s, _) = send(
+            &mut f,
+            json!({"content":"嗨","client_msg_id":"01JNNNNNNNNNNNNNNNNNNNNNNG","image":{"aspect_ratio":"7:5"}}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+        let (s, _) = send(
+            &mut f,
+            json!({"content":"嗨","client_msg_id":"01JDDDDDDDDDDDDDDDDDDDDDDG","mentions":[Uuid::new_v4()]}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+        let (s, _) = send(
+            &mut f,
+            json!({"content":"嗨","client_msg_id":"01JEEEEEEEEEEEEEEEEEEEEEEG","image":{"force":true}}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (s, _) = send(
+            &mut f,
+            json!({"content":"嗨","client_msg_id":"01JFFFFFFFFFFFFFFFFFFFFFFG","byok":{}}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        // A text session is the wrong channel; a stranger's group is 404.
+        use tower::Service;
+        let r = req(
+            "POST",
+            &format!("/v2/comp/group/{}/message/stream", f.a),
+            f.user,
+            Some(json!({"content":"嗨","client_msg_id":"01JGGGGGGGGGGGGGGGGGGGGGGG"})),
+        );
+        assert_eq!(f.app.call(r).await.unwrap().status(), StatusCode::CONFLICT);
+        let r = req(
+            "POST",
+            &format!("/v2/comp/group/{}/message/stream", f.group),
+            Uuid::new_v4(),
+            Some(json!({"content":"嗨","client_msg_id":"01JHHHHHHHHHHHHHHHHHHHHHHG"})),
+        );
+        assert_eq!(f.app.call(r).await.unwrap().status(), StatusCode::NOT_FOUND);
+        // Kick everyone: group_empty.
+        for m in [f.a, f.b] {
+            eros_engine_store::group::GroupRepo { pool: &f.pool }
+                .remove_member(f.group, f.user, m)
+                .await
+                .unwrap();
+        }
+        let (s, _) = send(
+            &mut f,
+            json!({"content":"嗨","client_msg_id":"01JJJJJJJJJJJJJJJJJJJJJJJG"}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CONFLICT);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_dissolved_group_is_404(pool: PgPool) {
+        let mut f = fixture(pool, None, 200, None).await;
+        eros_engine_store::group::GroupRepo { pool: &f.pool }
+            .archive(f.group, f.user)
+            .await
+            .unwrap();
+        let (s, _) = send(
+            &mut f,
+            json!({"content":"嗨","client_msg_id":"01JQQQQQQQQQQQQQQQQQQQQQQG"}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_resent_message_replays_the_speakers(pool: PgPool) {
+        let mut f = fixture(pool, None, 200, None).await;
+        let msg = json!({"content":"嗨","client_msg_id":"01JPPPPPPPPPPPPPPPPPPPPPPG"});
+        let (_, first) = send(&mut f, msg.clone()).await;
+        assert_eq!(first.matches(r#""type":"meta""#).count(), 2, "{first}");
+        // The resend replays only once the turn has settled.
+        for _ in 0..100 {
+            let status: String = sqlx::query_scalar(
+                "SELECT q.status FROM engine.chat_turn_queue q JOIN engine.chat_messages m ON m.id = q.user_message_id \
+                 WHERE m.session_id = $1",
+            )
+            .bind(f.group)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+            if status != "claimed" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let (s, replay) = send(&mut f, msg).await;
+        assert_eq!(s, StatusCode::OK, "{replay}");
+        let a = replay
+            .find(&format!(r#""speaker_session_id":"{}""#, f.a))
+            .unwrap_or_else(|| panic!("{replay}"));
+        let b = replay
+            .find(&format!(r#""speaker_session_id":"{}""#, f.b))
+            .unwrap_or_else(|| panic!("{replay}"));
+        assert!(a < b, "{replay}");
+        assert!(replay.contains(r#""type":"final""#), "{replay}");
     }
 }

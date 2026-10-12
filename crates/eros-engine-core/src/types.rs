@@ -347,7 +347,7 @@ pub struct ActionPlan {
 }
 
 /// Conversation signals computed from chat history.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ConversationSignals {
     pub message_count: i64,
     pub hours_since_last_message: f64,

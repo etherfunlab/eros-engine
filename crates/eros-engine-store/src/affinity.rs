@@ -846,6 +846,49 @@ mod tests {
         assert!((a1.intrigue).abs() < 1e-9);
     }
 
+    /// `Affinity::default()` stands in for a row that does not exist yet, so it
+    /// must hold what the column defaults would write.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn default_affinity_matches_a_fresh_row(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = make_session(&pool, user_id, instance_id).await;
+        let row = AffinityRepo { pool: &pool }
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+        let d = Affinity::default();
+        let axes = |a: &Affinity| {
+            [
+                a.warmth, a.trust, a.intrigue, a.intimacy, a.patience, a.tension,
+            ]
+        };
+        for (got, want) in axes(&d).into_iter().zip(axes(&row)) {
+            assert!(
+                (got - want).abs() < 1e-9,
+                "{:?} vs {:?}",
+                axes(&d),
+                axes(&row)
+            );
+        }
+        assert_eq!(
+            (
+                d.warmth_grade,
+                d.patience_grade,
+                d.ghost_streak,
+                d.total_ghosts
+            ),
+            (
+                row.warmth_grade,
+                row.patience_grade,
+                row.ghost_streak,
+                row.total_ghosts
+            )
+        );
+        assert_eq!(d.last_ghost_at, row.last_ghost_at);
+        assert_eq!(d.feeling_clause, row.feeling_clause);
+    }
+
     /// Two concurrent first calls on a session with no prior affinity row
     /// converge on one row: the `ON CONFLICT (session_id) DO NOTHING` +
     /// re-`load` fallback means the losing insert reads back the winner's

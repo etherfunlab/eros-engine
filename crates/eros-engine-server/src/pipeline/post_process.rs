@@ -462,9 +462,7 @@ async fn persist_affinity(
 }
 
 /// One group speaker's output for post-process.
-#[allow(dead_code)] // called by the group turn
 pub struct GroupSpoken {
-    pub speaker_session_id: Uuid,
     pub instance_id: Uuid,
     pub name: String,
     pub produced: Vec<ProducedMessage>,
@@ -478,7 +476,6 @@ fn group_relationship_memory_content(user_msg: &str) -> String {
 /// streak. The user's line is embedded once and written to the profile layer
 /// and to every seated member's relationship layer; human_insights runs once;
 /// character/user insights run per speaker.
-#[allow(dead_code)] // called by the group turn
 pub async fn run_group(
     state: AppState,
     group_session_id: Uuid,
