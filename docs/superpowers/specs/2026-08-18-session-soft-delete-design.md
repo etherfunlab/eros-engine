@@ -183,6 +183,19 @@ which point regenerating from new material is correct.
 and can start a new conversation immediately; `chat/start` will create a fresh
 session because no unarchived one remains.
 
+**Post-turn writes cannot put deleted rows back.** After a turn, `post_process`
+runs model and embedding calls, then writes `companion_affinity`,
+`companion_memories`, `character_insights` and `user_insights` — rows this
+action deletes. The check at the top of `post_process::run` skips those calls
+for a session that is already archived when the task starts. For an archive
+that commits while they run, each write checks that the session is live and
+writes in the same transaction, holding the session row `FOR SHARE`. The
+archive's first statement updates that row, so either the archive waits for
+the write to commit and its deletes then take the new row with the rest, or
+the archive updates the row first and the write, once the archive commits,
+finds the session archived and writes nothing. On a group turn the locked row is the member session of the
+relationship the write belongs to.
+
 ## 6. Read visibility
 
 An archived session does not exist as far as the API is concerned.
@@ -271,19 +284,11 @@ every session read fails until the migration runs.
 - **A `status` enum on `chat_sessions`.** There is one distinction to draw.
 - **Touching `human_insights`.** User-level, cross-persona, same reasoning as the
   profile memory layer.
-- **Closing the `post_process` race entirely.** The guard at the top of
-  `post_process::run` closes the window between an archive and a *new*
-  detached task, but the model and embedding calls that follow it — the
-  affinity evaluator, the two-stage character-insight chain, the memory
-  embedding calls — can each run long enough for the archive to commit while
-  the task is inside them. So the check runs a second time, immediately
-  before each of the three writes those calls feed
-  (`companion_affinity`, `companion_memories`, `character_insights`), right
-  after its own model call returns. That narrows the window from the whole
-  model-call phase down to the gap between the recheck and the write it
-  guards — it does not close it. Closing it fully would mean taking a lock
-  across the whole post-turn pipeline, which costs more than the defect it
-  would prevent.
+- **A lock across the whole post-turn pipeline.** Not needed: each
+  `post_process` write closes the archive race on its own, with a `FOR SHARE`
+  lock on the session row taken in the write's transaction (§5). This bullet
+  earlier said the window stayed open and that closing it would take a
+  pipeline-wide lock. That was wrong: the per-write lock closes it without one.
 
   Separately: an in-flight chat or voice turn that resolved its session
   *before* the archive committed can still append to `chat_messages` and bump
