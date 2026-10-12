@@ -1250,13 +1250,34 @@
             }
           },
           "404": {
-            "description": ""
+            "description": "`session_not_found`: a member session is unknown or not the caller's",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
           },
           "409": {
-            "description": ""
+            "description": "`group_full`, `wrong_channel`, `session_archived` or `instance_already_member`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
           },
           "422": {
-            "description": ""
+            "description": "`invalid_title`, or `unprocessable` for an empty member list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -1295,7 +1316,14 @@
             }
           },
           "404": {
-            "description": ""
+            "description": "`group_not_found`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -1325,7 +1353,14 @@
             "description": ""
           },
           "404": {
-            "description": ""
+            "description": "`group_not_found`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -1372,10 +1407,24 @@
             }
           },
           "404": {
-            "description": ""
+            "description": "`group_not_found`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
           },
           "422": {
-            "description": ""
+            "description": "`invalid_title`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -1424,10 +1473,24 @@
             }
           },
           "404": {
-            "description": ""
+            "description": "`group_not_found`, or `session_not_found` for the member session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
           },
           "409": {
-            "description": ""
+            "description": "`group_full`, `wrong_channel`, `session_archived` or `instance_already_member`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -1468,7 +1531,14 @@
             "description": ""
           },
           "404": {
-            "description": ""
+            "description": "`group_not_found`, or `member_not_found` when the session is not a member",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
           }
         },
         "security": [

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
-use eros_engine_core::group::normalize_title;
+use eros_engine_core::group::{normalize_title, GROUP_TITLE_MAX_CHARS, MAX_GROUP_MEMBERS};
 use eros_engine_store::group::{Group, GroupRepo, MemberRefusal};
 
 use crate::auth::middleware::AuthUser;
@@ -78,24 +78,77 @@ pub(crate) fn group_dto(g: &Group) -> GroupDto {
     }
 }
 
+/// Every refusal on the group routes carries the stream routes' coded body:
+/// `{code, message, user_message}`.
+fn pre(status: StatusCode, code: &'static str, message: &str, user_message: &str) -> AppError {
+    AppError::StreamPre(crate::error::StreamPreError {
+        status,
+        code,
+        message: message.into(),
+        user_message: user_message.into(),
+        original_user_message_id: None,
+    })
+}
+
+/// The group is unknown, dissolved or not the caller's.
+fn group_not_found() -> AppError {
+    pre(
+        StatusCode::NOT_FOUND,
+        "group_not_found",
+        "group not found",
+        "群聊不存在",
+    )
+}
+
 fn refusal(r: MemberRefusal) -> AppError {
     match r {
-        MemberRefusal::NotFound => AppError::NotFound("no such session".into()),
-        MemberRefusal::WrongChannel => AppError::Conflict("wrong_channel".into()),
-        MemberRefusal::Archived => AppError::Conflict("session_archived".into()),
-        MemberRefusal::InstanceAlreadyMember => {
-            AppError::Conflict("instance_already_member".into())
-        }
-        MemberRefusal::GroupFull => AppError::Conflict("group_full".into()),
+        MemberRefusal::NotFound => pre(
+            StatusCode::NOT_FOUND,
+            "session_not_found",
+            "member session not found",
+            "会话不存在",
+        ),
+        MemberRefusal::WrongChannel => pre(
+            StatusCode::CONFLICT,
+            "wrong_channel",
+            "member session is not a text session",
+            "会话类型不匹配",
+        ),
+        MemberRefusal::Archived => pre(
+            StatusCode::CONFLICT,
+            "session_archived",
+            "member session is archived",
+            "这段关系已归档",
+        ),
+        MemberRefusal::InstanceAlreadyMember => pre(
+            StatusCode::CONFLICT,
+            "instance_already_member",
+            "the persona is already in the group",
+            "这个角色已经在群里了",
+        ),
+        MemberRefusal::GroupFull => pre(
+            StatusCode::CONFLICT,
+            "group_full",
+            &format!("the group already has {MAX_GROUP_MEMBERS} members"),
+            &format!("群里最多 {MAX_GROUP_MEMBERS} 位角色"),
+        ),
     }
 }
 
 fn title_arg(raw: Option<&str>) -> Result<Option<String>, AppError> {
     match raw {
         None => Ok(None),
-        Some(t) => normalize_title(t)
-            .map(Some)
-            .ok_or_else(|| AppError::Unprocessable("invalid_title".into())),
+        Some(t) => normalize_title(t).map(Some).ok_or_else(|| {
+            pre(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_title",
+                &format!(
+                    "title must be 1 to {GROUP_TITLE_MAX_CHARS} characters after trimming, \
+                     with no control character"
+                ),
+                "群名称无效",
+            )
+        }),
     }
 }
 
@@ -103,12 +156,17 @@ async fn owned(state: &AppState, group_id: Uuid, user_id: Uuid) -> Result<Group,
     GroupRepo { pool: &state.pool }
         .get(group_id, user_id)
         .await?
-        .ok_or_else(|| AppError::NotFound("no such group".into()))
+        .ok_or_else(group_not_found)
 }
 
 #[utoipa::path(post, path = "/v2/comp/group", tag = "group",
     request_body = CreateGroupRequest,
-    responses((status = 200, body = GroupDto), (status = 404), (status = 409), (status = 422)),
+    responses(
+        (status = 200, body = GroupDto),
+        (status = 404, description = "`session_not_found`: a member session is unknown or not the caller's", body = crate::routes::companion_stream::StreamPreErrorBody),
+        (status = 409, description = "`group_full`, `wrong_channel`, `session_archived` or `instance_already_member`", body = crate::routes::companion_stream::StreamPreErrorBody),
+        (status = 422, description = "`invalid_title`, or `unprocessable` for an empty member list", body = crate::routes::companion_stream::StreamPreErrorBody),
+    ),
     security(("bearer" = [])))]
 async fn create_group(
     State(state): State<AppState>,
@@ -116,8 +174,11 @@ async fn create_group(
     Json(req): Json<CreateGroupRequest>,
 ) -> Result<Json<GroupDto>, AppError> {
     if req.member_session_ids.is_empty() {
-        return Err(AppError::Unprocessable(
-            "member_session_ids must not be empty".into(),
+        return Err(pre(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unprocessable",
+            "member_session_ids must not be empty",
+            "请至少选择一位角色",
         ));
     }
     let title = title_arg(req.title.as_deref())?;
@@ -142,7 +203,11 @@ async fn list_groups(
 
 #[utoipa::path(get, path = "/v2/comp/group/{group_id}", tag = "group",
     params(("group_id" = Uuid, Path)),
-    responses((status = 200, body = GroupDto), (status = 404)), security(("bearer" = [])))]
+    responses(
+        (status = 200, body = GroupDto),
+        (status = 404, description = "`group_not_found`", body = crate::routes::companion_stream::StreamPreErrorBody),
+    ),
+    security(("bearer" = [])))]
 async fn get_group(
     State(state): State<AppState>,
     Path(group_id): Path<Uuid>,
@@ -153,7 +218,11 @@ async fn get_group(
 
 #[utoipa::path(patch, path = "/v2/comp/group/{group_id}", tag = "group",
     params(("group_id" = Uuid, Path)), request_body = RenameGroupRequest,
-    responses((status = 200, body = GroupDto), (status = 404), (status = 422)),
+    responses(
+        (status = 200, body = GroupDto),
+        (status = 404, description = "`group_not_found`", body = crate::routes::companion_stream::StreamPreErrorBody),
+        (status = 422, description = "`invalid_title`", body = crate::routes::companion_stream::StreamPreErrorBody),
+    ),
     security(("bearer" = [])))]
 async fn rename_group(
     State(state): State<AppState>,
@@ -164,14 +233,18 @@ async fn rename_group(
     let title = title_arg(req.title.as_deref())?;
     let repo = GroupRepo { pool: &state.pool };
     if !repo.rename(group_id, user_id, title.as_deref()).await? {
-        return Err(AppError::NotFound("no such group".into()));
+        return Err(group_not_found());
     }
     Ok(Json(group_dto(&owned(&state, group_id, user_id).await?)))
 }
 
 #[utoipa::path(post, path = "/v2/comp/group/{group_id}/members", tag = "group",
     params(("group_id" = Uuid, Path)), request_body = AddMemberRequest,
-    responses((status = 200, body = GroupDto), (status = 404), (status = 409)),
+    responses(
+        (status = 200, body = GroupDto),
+        (status = 404, description = "`group_not_found`, or `session_not_found` for the member session", body = crate::routes::companion_stream::StreamPreErrorBody),
+        (status = 409, description = "`group_full`, `wrong_channel`, `session_archived` or `instance_already_member`", body = crate::routes::companion_stream::StreamPreErrorBody),
+    ),
     security(("bearer" = [])))]
 async fn add_member(
     State(state): State<AppState>,
@@ -189,7 +262,11 @@ async fn add_member(
 
 #[utoipa::path(delete, path = "/v2/comp/group/{group_id}/members/{member_session_id}", tag = "group",
     params(("group_id" = Uuid, Path), ("member_session_id" = Uuid, Path)),
-    responses((status = 204), (status = 404)), security(("bearer" = [])))]
+    responses(
+        (status = 204),
+        (status = 404, description = "`group_not_found`, or `member_not_found` when the session is not a member", body = crate::routes::companion_stream::StreamPreErrorBody),
+    ),
+    security(("bearer" = [])))]
 async fn remove_member(
     State(state): State<AppState>,
     Path((group_id, member_session_id)): Path<(Uuid, Uuid)>,
@@ -201,14 +278,23 @@ async fn remove_member(
         .remove_member(group_id, user_id, member_session_id)
         .await?
     {
-        return Err(AppError::NotFound("not a member".into()));
+        return Err(pre(
+            StatusCode::NOT_FOUND,
+            "member_not_found",
+            "the session is not a member of this group",
+            "这个角色不在群里",
+        ));
     }
     Ok(StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(delete, path = "/v2/comp/group/{group_id}", tag = "group",
     params(("group_id" = Uuid, Path)),
-    responses((status = 204), (status = 404)), security(("bearer" = [])))]
+    responses(
+        (status = 204),
+        (status = 404, description = "`group_not_found`", body = crate::routes::companion_stream::StreamPreErrorBody),
+    ),
+    security(("bearer" = [])))]
 async fn archive_group(
     State(state): State<AppState>,
     Path(group_id): Path<Uuid>,
@@ -216,7 +302,7 @@ async fn archive_group(
 ) -> Result<StatusCode, AppError> {
     let repo = GroupRepo { pool: &state.pool };
     if !repo.archive(group_id, user_id).await? {
-        return Err(AppError::NotFound("no such group".into()));
+        return Err(group_not_found());
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -246,13 +332,13 @@ pub struct GroupSendRequest {
     pub byok: Option<serde_json::Value>,
 }
 
-fn pre(status: StatusCode, code: &'static str, message: &str, user_message: &str) -> AppError {
+fn duplicate_in_progress(user_message_id: Uuid) -> AppError {
     AppError::StreamPre(crate::error::StreamPreError {
-        status,
-        code,
-        message: message.into(),
-        user_message: user_message.into(),
-        original_user_message_id: None,
+        status: StatusCode::CONFLICT,
+        code: "duplicate_in_progress",
+        message: "same (session_id, client_msg_id) is still generating".into(),
+        user_message: "上一条消息正在处理中，请稍候".into(),
+        original_user_message_id: Some(user_message_id),
     })
 }
 
@@ -328,14 +414,7 @@ async fn send_group_message_stream(
         .get_session(group_id)
         .await?
         .filter(|s| s.user_id == user_id)
-        .ok_or_else(|| {
-            pre(
-                StatusCode::NOT_FOUND,
-                "session_not_found",
-                "group not found",
-                "会话不存在",
-            )
-        })?;
+        .ok_or_else(group_not_found)?;
     if session.channel != "group" {
         return Err(pre(
             StatusCode::CONFLICT,
@@ -502,13 +581,7 @@ async fn send_group_message_stream(
                 ))
             }
             ClaimedEnqueueOutcome::DuplicateInProgress { user_message_id } => {
-                return Err(AppError::StreamPre(crate::error::StreamPreError {
-                    status: StatusCode::CONFLICT,
-                    code: "duplicate_in_progress",
-                    message: "same (session_id, client_msg_id) is still generating".into(),
-                    user_message: "上一条消息正在处理中，请稍候".into(),
-                    original_user_message_id: Some(user_message_id),
-                }));
+                return Err(duplicate_in_progress(user_message_id));
             }
             ClaimedEnqueueOutcome::DuplicateFailed { user_message_id } => {
                 return Err(AppError::StreamPre(crate::error::StreamPreError {
@@ -657,7 +730,7 @@ mod tests {
         let user = Uuid::new_v4();
         let foreign = member(&pool, Uuid::new_v4()).await;
         let mut app = build_router(crate::routes::companion::test_state(pool.clone()));
-        let (s, _) = send_request(
+        let (s, body) = send_request(
             &mut app,
             req(
                 "POST",
@@ -668,6 +741,75 @@ mod tests {
         )
         .await;
         assert_eq!(s, StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], "session_not_found", "{body}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn add_member_refusals_carry_their_codes(pool: PgPool) {
+        let user = Uuid::new_v4();
+        let a = member(&pool, user).await;
+        let mut app = build_router(crate::routes::companion::test_state(pool.clone()));
+        let (_, body) = send_request(
+            &mut app,
+            req(
+                "POST",
+                "/v2/comp/group",
+                user,
+                Some(json!({"member_session_ids": [a]})),
+            ),
+        )
+        .await;
+        let gid = body["group_id"].as_str().unwrap().to_string();
+
+        let instance = seed_persona_instance(&pool, user).await;
+        let voice = eros_engine_store::chat::ChatRepo { pool: &pool }
+            .create_session_with_metadata(user, instance, json!({}), "voice")
+            .await
+            .unwrap()
+            .id;
+        let archived = member(&pool, user).await;
+        sqlx::query("UPDATE engine.chat_sessions SET archived = true WHERE id = $1")
+            .bind(archived)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let foreign = member(&pool, Uuid::new_v4()).await;
+        let cases = [
+            (voice, StatusCode::CONFLICT, "wrong_channel"),
+            (archived, StatusCode::CONFLICT, "session_archived"),
+            (a, StatusCode::CONFLICT, "instance_already_member"),
+            (foreign, StatusCode::NOT_FOUND, "session_not_found"),
+        ];
+        for (session, status, code) in cases {
+            let (s, body) = send_request(
+                &mut app,
+                req(
+                    "POST",
+                    &format!("/v2/comp/group/{gid}/members"),
+                    user,
+                    Some(json!({"member_session_id": session})),
+                ),
+            )
+            .await;
+            assert_eq!((s, body["code"].as_str()), (status, Some(code)), "{body}");
+            assert!(body["user_message"].is_string(), "{body}");
+        }
+
+        let (s, body) = send_request(
+            &mut app,
+            req(
+                "DELETE",
+                &format!("/v2/comp/group/{gid}/members/{voice}"),
+                user,
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(
+            (s, body["code"].as_str()),
+            (StatusCode::NOT_FOUND, Some("member_not_found")),
+            "{body}"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -689,11 +831,8 @@ mod tests {
         )
         .await;
         assert_eq!(s, StatusCode::CONFLICT);
-        assert!(
-            body["message"].as_str().unwrap().contains("group_full"),
-            "{body}"
-        );
-        let (s, _) = send_request(
+        assert_eq!(body["code"], "group_full", "{body}");
+        let (s, body) = send_request(
             &mut app,
             req(
                 "POST",
@@ -704,6 +843,7 @@ mod tests {
         )
         .await;
         assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["code"], "unprocessable", "{body}");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -734,7 +874,7 @@ mod tests {
             )
             .await;
             assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{bad:?}");
-            assert!(body["message"].as_str().unwrap().contains("invalid_title"));
+            assert_eq!(body["code"], "invalid_title", "{body}");
         }
     }
 
@@ -799,8 +939,9 @@ mod tests {
             req("DELETE", &g, stranger, None),
         ];
         for r in attempts {
-            let (s, _) = send_request(&mut app, r).await;
+            let (s, body) = send_request(&mut app, r).await;
             assert_eq!(s, StatusCode::NOT_FOUND);
+            assert_eq!(body["code"], "group_not_found", "{body}");
         }
         let (s, body) = send_request(&mut app, req("GET", &g, owner, None)).await;
         assert_eq!(s, StatusCode::OK);
@@ -1115,8 +1256,7 @@ mod tests {
             2,
             "{body}"
         );
-        assert!(body.contains(r#""type":"error""#), "{body}");
-    }
+        assert!(body.contains(r#""type":"error""#), "{body}");    }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn no_seatable_member_ends_in_error_and_a_notice(pool: PgPool) {
@@ -1400,12 +1540,14 @@ mod tests {
             .archive(f.group, f.user)
             .await
             .unwrap();
-        let (s, _) = send(
+        let (s, body) = send(
             &mut f,
             json!({"content":"嗨","client_msg_id":"01JQQQQQQQQQQQQQQQQQQQQQQG"}),
         )
         .await;
         assert_eq!(s, StatusCode::NOT_FOUND);
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["code"], "group_not_found", "{body}");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
