@@ -217,10 +217,10 @@ pub(crate) fn run_group_turn(
                 .await
             {
                 Ok(Some(a)) => a,
-                Ok(None) => Affinity::default(),
+                Ok(None) => Affinity::unrecorded(),
                 Err(e) => {
                     tracing::warn!("group: affinity read failed: {e}");
-                    Affinity::default()
+                    Affinity::unrecorded()
                 }
             };
             affinity.apply_time_decay();

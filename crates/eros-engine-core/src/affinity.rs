@@ -87,13 +87,12 @@ impl Affinity {
         self.patience =
             endpoint_value(self.patience_grade, self.bond_score(), decay, t.floor_ratio);
     }
-}
 
-/// A relationship with no row yet, for read-only callers that must not create
-/// one: the values a fresh `companion_affinity` row takes from its column
-/// defaults (empty lines, level-2 endpoints), with nil ids.
-impl Default for Affinity {
-    fn default() -> Self {
+    /// A relationship with no stored row, for read-only callers that must not
+    /// create one: the values a fresh `companion_affinity` row takes from its
+    /// column defaults (empty lines, level-2 endpoints). Every id is nil, so
+    /// the value is never to be persisted.
+    pub fn unrecorded() -> Self {
         let now = Utc::now();
         let endpoint = endpoint_value(2, 0.0, 1.0, AffinityTuning::default().floor_ratio);
         Self {
