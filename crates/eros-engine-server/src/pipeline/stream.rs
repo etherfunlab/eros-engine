@@ -21174,6 +21174,10 @@ data: [DONE]\n\n"
         assert!(reqs
             .iter()
             .all(|r| !String::from_utf8_lossy(&r.body).contains("[身体状态]")));
+        // The row parsed as a give: its history marker reaches the reply, so
+        // the absences above are the valuable's, not a parse failure's.
+        let chat = chat_request_body(&reqs);
+        assert!(chat.contains("（递给你 1 块「劳力士」）"), "{chat}");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
