@@ -843,6 +843,18 @@ mod tests {
         chat_status: u16,
         gen_timeout: Option<std::time::Duration>,
     ) -> Fixture {
+        fixture_with(pool, director_body, chat_status, gen_timeout, "", |_| {}).await
+    }
+
+    /// [`fixture`] with extra `[tasks.*]` TOML and a last word on the state.
+    async fn fixture_with(
+        pool: PgPool,
+        director_body: Option<String>,
+        chat_status: u16,
+        gen_timeout: Option<std::time::Duration>,
+        extra_toml: &str,
+        tweak: impl FnOnce(&mut AppState),
+    ) -> Fixture {
         use wiremock::matchers::{body_partial_json, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let director_body_present = director_body.is_some();
@@ -893,7 +905,7 @@ mod tests {
             ""
         };
         let cfg = eros_engine_llm::model_config::ModelConfig::from_toml_str(&format!(
-            "[tasks.chat_companion]\nmodel = \"chat-model\"\nfallback = []\n{director_section}"
+            "[tasks.chat_companion]\nmodel = \"chat-model\"\nfallback = []\n{director_section}{extra_toml}"
         ))
         .unwrap();
         let mut state = crate::routes::companion::test_state(pool.clone());
@@ -907,6 +919,7 @@ mod tests {
         if let Some(t) = gen_timeout {
             state.config.chat_queue.generation_timeout = t;
         }
+        tweak(&mut state);
         Fixture {
             app: build_router(state),
             pool,
@@ -1426,5 +1439,175 @@ mod tests {
             .unwrap_or_else(|| panic!("{replay}"));
         assert!(a < b, "{replay}");
         assert!(replay.contains(r#""type":"final""#), "{replay}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn each_speaker_logs_its_own_prompt(pool: PgPool) {
+        let dir = std::env::temp_dir().join(format!("eros-group-promptlog-{}", Uuid::new_v4()));
+        let d = dir.clone();
+        let mut f = fixture_with(pool, None, 200, None, "", move |s| {
+            s.config.prompt_log_dir = Some(d);
+        })
+        .await;
+        let (s, _) = send(
+            &mut f,
+            json!({"content":"嗨","client_msg_id":"01JSSSSSSSSSSSSSSSSSSSSSSG"}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        // The writes are fire-and-forget on the blocking pool; poll for them.
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        for _ in 0..100 {
+            files = std::fs::read_dir(&dir)
+                .map(|r| r.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+                .unwrap_or_default();
+            if files.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(files.len(), 2, "one file per speaker: {files:?}");
+        let mut speakers: Vec<String> = files
+            .iter()
+            .map(|p| {
+                let text = std::fs::read_to_string(p).unwrap();
+                assert!(
+                    text.contains(&format!("# session:  {}\n", f.group)),
+                    "{text}"
+                );
+                text.lines()
+                    .find_map(|l| l.strip_prefix("# speaker:  "))
+                    .unwrap_or_else(|| panic!("no speaker line: {text}"))
+                    .to_string()
+            })
+            .collect();
+        speakers.sort();
+        let mut want = vec![f.a.to_string(), f.b.to_string()];
+        want.sort();
+        assert_eq!(speakers, want);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    const COMPOSE_TASK: &str =
+        "[tasks.chat_image_prompt_compose]\nmodel = \"composer-model\"\nfilter_prompt = \"COMPOSE\"\n";
+
+    async fn mount_composer(server: &wiremock::MockServer) {
+        wiremock::Mock::given(wiremock::matchers::path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                json!({"model": "composer-model"}),
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "id": "gen-compose",
+                "model": "composer-model",
+                "choices": [{"message": {"content":
+                    "{\"prompt\":\"she waves from the summit\",\"caption\":\"山顶挥手\"}"}}],
+                "usage": {"total_tokens": 10}
+            })))
+            .mount(server)
+            .await;
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_text_and_image_speaker_sends_the_picture_after_its_reply(pool: PgPool) {
+        let verdict = r#"{"speakers":[{"member":"m1","action":"reply_text_image","inner_state":null,"reply_mode":null,"clothing":null}],"reason":null}"#;
+        let mut f = fixture_with(
+            pool,
+            Some(director_sse(verdict)),
+            200,
+            None,
+            COMPOSE_TASK,
+            |_| {},
+        )
+        .await;
+        mount_composer(&f._server).await;
+        let (s, body) = send(
+            &mut f,
+            json!({"content":"拍张照","client_msg_id":"01JTTTTTTTTTTTTTTTTTTTTTTG","image":{}}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("missing {needle}: {body}"))
+        };
+        let meta = at(&format!(r#""speaker_session_id":"{}""#, f.a));
+        let delta = at(r#""type":"delta""#);
+        let done = at(r#""type":"done""#);
+        let image = at(r#""type":"image_request""#);
+        let fin = at(r#""type":"final""#);
+        assert!(
+            meta < delta && delta < done && done < image && image < fin,
+            "{body}"
+        );
+        let meta_line = body
+            .lines()
+            .find(|l| l.contains(r#""type":"meta""#))
+            .unwrap();
+        assert!(
+            meta_line.contains(r#""action_type":"reply_text_image""#),
+            "the meta frame is a text+image reply: {body}"
+        );
+
+        let (speaker, content, has_image): (Option<Uuid>, String, bool) = sqlx::query_as(
+            "SELECT speaker_session_id, content, metadata ? 'image' FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant' AND NOT truncated",
+        )
+        .bind(f.group)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (speaker, content.as_str(), has_image),
+            (Some(f.a), "好呀", true)
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_image_only_speaker_sends_meta_done_then_the_picture(pool: PgPool) {
+        let verdict = r#"{"speakers":[{"member":"m1","action":"reply_image","inner_state":null,"reply_mode":null,"clothing":null}],"reason":null}"#;
+        let mut f = fixture_with(
+            pool,
+            Some(director_sse(verdict)),
+            200,
+            None,
+            COMPOSE_TASK,
+            |_| {},
+        )
+        .await;
+        mount_composer(&f._server).await;
+        let (s, body) = send(
+            &mut f,
+            json!({"content":"拍张照","client_msg_id":"01JUUUUUUUUUUUUUUUUUUUUUUG","image":{}}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("missing {needle}: {body}"))
+        };
+        let meta = at(&format!(
+            r#""action_type":"reply_image","speaker_session_id":"{}""#,
+            f.a
+        ));
+        let done = at(r#""type":"done""#);
+        let image = at(r#""type":"image_request""#);
+        let fin = at(r#""type":"final""#);
+        assert!(meta < done && done < image && image < fin, "{body}");
+        assert!(!body.contains(r#""type":"delta""#), "{body}");
+
+        let (speaker, content, has_image): (Option<Uuid>, String, bool) = sqlx::query_as(
+            "SELECT speaker_session_id, content, metadata ? 'image' FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant'",
+        )
+        .bind(f.group)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (speaker, content.as_str(), has_image),
+            (Some(f.a), "", true)
+        );
     }
 }

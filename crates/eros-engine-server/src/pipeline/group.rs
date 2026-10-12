@@ -122,7 +122,9 @@ pub(crate) fn group_block(title: Option<&str>, others: &[(String, Option<String>
     s
 }
 
-/// The director's and the composer's plain-text transcript.
+/// The director's and the composer's plain-text transcript. An empty assistant
+/// row is a photo when it carries the `image` marker; any other empty row (a
+/// failed attempt's truncated bubble, an empty-reply ghost) said nothing.
 pub(crate) fn transcript_text(rows: &[ChatMessage], names: &HashMap<Uuid, String>) -> String {
     rows.iter()
         .filter(|m| m.channel.is_none())
@@ -134,10 +136,16 @@ pub(crate) fn transcript_text(rows: &[ChatMessage], names: &HashMap<Uuid, String
                     .and_then(|s| names.get(&s))
                     .map(String::as_str)
                     .unwrap_or(UNKNOWN_SPEAKER);
-                let text = if m.content.trim().is_empty() {
+                let text = if !m.content.trim().is_empty() {
+                    m.content.as_str()
+                } else if m
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|md| md.get("image").is_some())
+                {
                     "（发了一张照片）"
                 } else {
-                    m.content.as_str()
+                    return None;
                 };
                 Some(format!("{name}：{text}"))
             }
@@ -566,6 +574,17 @@ pub(crate) fn run_group_turn(
                 prompt_injected = Some(injected_tags.clone());
             }
             let chain = crate::byok::reply_chain(&req, None);
+            if let Some(dir) = state.config.prompt_log_dir.as_ref() {
+                let labels: Vec<String> = chain.iter().map(|h| h.audit.clone()).collect();
+                crate::prompt_log::spawn_write(
+                    dir.clone(),
+                    &req,
+                    &labels,
+                    turn.group_session_id,
+                    turn.user_message_id,
+                    Some(seat.member_session_id),
+                );
+            }
             let filter = state
                 .model_config
                 .resolve_output_filter(turn.tier.as_deref());
@@ -822,6 +841,46 @@ mod tests {
             block: String::new(),
         };
         assert!(speaker_view(raw, stripped, &speakers, &view).is_empty());
+    }
+
+    fn row(
+        role: &str,
+        content: &str,
+        speaker: Option<Uuid>,
+        metadata: Option<serde_json::Value>,
+    ) -> ChatMessage {
+        serde_json::from_value(serde_json::json!({
+            "id": Uuid::new_v4(),
+            "session_id": Uuid::nil(),
+            "role": role,
+            "content": content,
+            "sent_at": chrono::Utc::now(),
+            "speaker_session_id": speaker,
+            "metadata": metadata,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn transcript_marks_photos_and_skips_empty_lines() {
+        let a = Uuid::new_v4();
+        let rows = vec![
+            row("user", "早", None, None),
+            row("assistant", "", Some(a), None),
+            row(
+                "assistant",
+                "",
+                Some(a),
+                Some(serde_json::json!({"image": {"prompt": "x"}})),
+            ),
+            row("assistant", "嗨", Some(a), None),
+        ];
+        let names = HashMap::from([(a, "A".to_string())]);
+        let text = transcript_text(&rows, &names);
+        assert_eq!(
+            text.split('\n').collect::<Vec<_>>(),
+            vec!["用户：早", "A：（发了一张照片）", "A：嗨"]
+        );
     }
 
     #[test]

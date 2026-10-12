@@ -5577,6 +5577,7 @@ pub(crate) fn run_stream_with(
                         &labels,
                         user_msg.session_id,
                         user_msg.user_message_id,
+                        None,
                     );
                 }
                 // The filter trigger's `traits` predicate AND `prompt_injected`

@@ -198,7 +198,9 @@ SELECT grantee, table_name, privilege_type
 
 设置 `PROMPT_LOG_DIR` 后，引擎会把每一轮**主回复**组装好的完整 prompt 写成一个
 可读文件（头部元数据 + 按 role 分块）。默认**关闭**，**仅供运营调试**（文件含原始
-聊天内容），写入为后台 fire-and-forget，绝不阻塞或拖垮回复。把它指向你自己挂载的卷：
+聊天内容），写入为后台 fire-and-forget，绝不阻塞或拖垮回复。群聊回合里每个发言角色的
+prompt 各写一个文件，头部多一行 `# speaker:`，文件名末尾带该角色的成员会话 id。
+把它指向你自己挂载的卷：
 
 ```yaml
 # docker-compose: 挂载卷并设置 env

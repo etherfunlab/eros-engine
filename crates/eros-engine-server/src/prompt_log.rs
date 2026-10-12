@@ -15,6 +15,8 @@ struct PromptLogSnapshot {
     ts: DateTime<Utc>,
     session_id: Uuid,
     user_message_id: Uuid,
+    /// The group member this prompt was built for; `None` on 1:1 turns.
+    speaker_session_id: Option<Uuid>,
     task: &'static str,
     model: String,
     fallback_model: Vec<String>,
@@ -34,12 +36,14 @@ fn snapshot(
     chain: &[String],
     session_id: Uuid,
     user_message_id: Uuid,
+    speaker_session_id: Option<Uuid>,
     ts: DateTime<Utc>,
 ) -> PromptLogSnapshot {
     PromptLogSnapshot {
         ts,
         session_id,
         user_message_id,
+        speaker_session_id,
         task: "reply",
         model: chain.first().cloned().unwrap_or_default(),
         fallback_model: chain.iter().skip(1).cloned().collect(),
@@ -64,6 +68,9 @@ fn render(snap: &PromptLogSnapshot) -> String {
     ));
     out.push_str(&format!("# session:  {}\n", snap.session_id));
     out.push_str(&format!("# user_msg: {}\n", snap.user_message_id));
+    if let Some(speaker) = snap.speaker_session_id {
+        out.push_str(&format!("# speaker:  {speaker}\n"));
+    }
     out.push_str(&format!("# task:     {}\n", snap.task));
     let fallbacks = if snap.fallback_model.is_empty() {
         String::new()
@@ -95,12 +102,17 @@ fn render(snap: &PromptLogSnapshot) -> String {
     out
 }
 
-/// `{compactUtc}__{session}__{user_message_id}.prompt.txt` — all components
-/// are colon-free and path-safe.
+/// `{compactUtc}__{session}__{user_message_id}.prompt.txt`, with
+/// `__{speaker}` before the suffix on a group turn so each speaker's prompt
+/// is its own file. All components are colon-free and path-safe.
 fn file_name(snap: &PromptLogSnapshot) -> String {
     let ts = snap.ts.format("%Y%m%dT%H%M%S%3fZ");
+    let speaker = snap
+        .speaker_session_id
+        .map(|s| format!("__{s}"))
+        .unwrap_or_default();
     format!(
-        "{ts}__{}__{}.prompt.txt",
+        "{ts}__{}__{}{speaker}.prompt.txt",
         snap.session_id, snap.user_message_id
     )
 }
@@ -120,8 +132,16 @@ pub(crate) fn spawn_write(
     chain: &[String],
     session_id: Uuid,
     user_message_id: Uuid,
+    speaker_session_id: Option<Uuid>,
 ) {
-    let snap = snapshot(req, chain, session_id, user_message_id, Utc::now());
+    let snap = snapshot(
+        req,
+        chain,
+        session_id,
+        user_message_id,
+        speaker_session_id,
+        Utc::now(),
+    );
     tokio::task::spawn_blocking(move || {
         if let Err(e) = write_file(&dir, &snap) {
             tracing::warn!(error = %e, dir = %dir.display(), "prompt_log: write failed");
@@ -140,6 +160,7 @@ mod tests {
                 .with_timezone(&Utc),
             session_id: Uuid::nil(),
             user_message_id: Uuid::from_u128(1),
+            speaker_session_id: None,
             task: "reply",
             model: "vendor/model-a".into(),
             fallback_model: vec!["vendor/model-b".into()],
@@ -197,13 +218,39 @@ mod tests {
     }
 
     #[test]
+    fn a_group_speaker_is_named_in_the_header_and_the_file_name() {
+        let speaker = Uuid::from_u128(7);
+        let snap = snapshot(
+            &ChatRequest::default(),
+            &[],
+            Uuid::nil(),
+            Uuid::from_u128(1),
+            Some(speaker),
+            Utc::now(),
+        );
+        assert!(render(&snap).contains(&format!("# speaker:  {speaker}\n")));
+        assert!(file_name(&snap).ends_with(&format!("__{speaker}.prompt.txt")));
+        // A 1:1 entry has neither.
+        let one = fixture();
+        assert!(!render(&one).contains("# speaker:"));
+        assert_eq!(
+            file_name(&one),
+            format!(
+                "20260627T123456789Z__{}__{}.prompt.txt",
+                Uuid::nil(),
+                Uuid::from_u128(1)
+            )
+        );
+    }
+
+    #[test]
     fn snapshot_prints_the_chain_it_is_given() {
         let req = ChatRequest {
             model: "platform/x".into(),
             ..Default::default()
         };
         let chain = vec!["gpt-x@byok".to_string(), "platform/x".to_string()];
-        let snap = snapshot(&req, &chain, Uuid::nil(), Uuid::nil(), Utc::now());
+        let snap = snapshot(&req, &chain, Uuid::nil(), Uuid::nil(), None, Utc::now());
         let out = render(&snap);
         assert!(
             out.contains("# model:    gpt-x@byok   fallbacks: platform/x"),

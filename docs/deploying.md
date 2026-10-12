@@ -199,7 +199,9 @@ Both queries should return zero rows after the migration applies.
 Set `PROMPT_LOG_DIR` to capture the fully-assembled main-reply prompt for each
 turn as one human-readable file (header + per-message blocks). It is **off by
 default**, **operator-only** (files contain raw chat content), and writes
-fire-and-forget so it never blocks or fails a reply. Point it at a mounted
+fire-and-forget so it never blocks or fails a reply. On a group turn each
+speaker's prompt is its own file, with a `# speaker:` header line and the
+speaker's member session id at the end of the file name. Point it at a mounted
 volume you control:
 
 ```yaml
