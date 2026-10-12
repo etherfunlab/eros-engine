@@ -194,7 +194,6 @@ pub(crate) mod test_support {
     /// A one-shot chat completion JSON replayed as SSE with the same content:
     /// an optional reasoning frame (from `choices[0].message.reasoning`), one
     /// content frame, then a terminal frame carrying `id`, `model`, `usage`.
-    #[allow(dead_code)] // shared by the tests of the modules that run on this call
     pub(crate) fn sse_completion(body: serde_json::Value) -> wiremock::ResponseTemplate {
         let msg = &body["choices"][0]["message"];
         let mut frames: Vec<serde_json::Value> = Vec::new();

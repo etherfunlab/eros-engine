@@ -613,7 +613,7 @@ data: [DONE]\n\n";
         });
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(wiremock::matchers::body_string_contains("pde/judge"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(judge_body))
+            .respond_with(crate::pipeline::reasoning_call::test_support::sse_completion(judge_body))
             .mount(&mock)
             .await;
         // Both product_qa executor candidates fail — the chain exhausts.
@@ -825,7 +825,7 @@ data: [DONE]\n\n";
         });
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("pde/judge"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(judge_body))
+            .respond_with(crate::pipeline::reasoning_call::test_support::sse_completion(judge_body))
             .mount(&mock)
             .await;
         let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"收到\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"deepseek/x\"}\n\ndata: [DONE]\n\n";
@@ -954,7 +954,7 @@ data: [DONE]\n\n";
         });
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("pde/judge"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(judge_body))
+            .respond_with(crate::pipeline::reasoning_call::test_support::sse_completion(judge_body))
             .mount(&mock)
             .await;
         let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"收到\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"deepseek/x\"}\n\ndata: [DONE]\n\n";

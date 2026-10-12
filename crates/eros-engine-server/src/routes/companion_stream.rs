@@ -1724,7 +1724,7 @@ data: [DONE]\n\n";
         });
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(wiremock::matchers::body_string_contains("pde/judge"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(judge_body))
+            .respond_with(crate::pipeline::reasoning_call::test_support::sse_completion(judge_body))
             .mount(&mock)
             .await;
         // Both product_qa executor candidates fail — the chain exhausts.
@@ -1839,10 +1839,12 @@ data: [DONE]\n\n";
         .to_string();
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(wiremock::matchers::body_string_contains("pde/judge"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "gj", "model": "pde/judge",
-                "choices": [{"message": {"content": verdict}}],
-            })))
+            .respond_with(
+                crate::pipeline::reasoning_call::test_support::sse_completion(serde_json::json!({
+                    "id": "gj", "model": "pde/judge",
+                    "choices": [{"message": {"content": verdict}}],
+                })),
+            )
             .mount(&mock)
             .await;
         Mock::given(wm_path("/api/v1/chat/completions"))
@@ -1922,6 +1924,173 @@ data: [DONE]\n\n";
             .find(|m| m["role"] == "user")
             .expect("the user row is in history");
         assert_eq!(user_row["action"], json!({"type": "kiss"}), "{user_row}");
+    }
+
+    /// One stream turn with the judge configured: the chat model answers
+    /// "好", the judge answers `judge_body` (a one-shot completion replayed
+    /// as SSE). Returns the whole SSE body and the session.
+    async fn judged_stream_turn(pool: &PgPool, judge_body: Value) -> (String, Uuid) {
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("pde/judge"))
+            .respond_with(crate::pipeline::reasoning_call::test_support::sse_completion(judge_body))
+            .mount(&mock)
+            .await;
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"好\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"gc\",\"model\":\"deepseek/x\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(pool, user_id).await;
+        let session_id = ChatRepo { pool }
+            .create_session(user_id, instance_id)
+            .await
+            .unwrap()
+            .id;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide.\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let mut app = build_router(state);
+        let token = mint_jwt(user_id);
+        let body = serde_json::to_vec(&json!({
+            "content": "你在想什么",
+            "client_msg_id": "01J4444444444444444444444R"
+        }))
+        .unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/comp/chat/{session_id}/message/stream"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        (std::str::from_utf8(&bytes).unwrap().to_string(), session_id)
+    }
+
+    /// The decision row is written by a spawned task: poll every 50ms, up to
+    /// 5s, until it lands.
+    async fn wait_for_decision_row(pool: &PgPool, session_id: Uuid) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let n: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM engine.companion_decision_events WHERE session_id = $1",
+                )
+                .bind(session_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+                if n > 0 {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the turn writes its decision row")
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn judge_reasoning_streams_ahead_of_the_reply(pool: PgPool) {
+        let verdict = json!({ "action": "reply_text", "inner_state": "" }).to_string();
+        let (body_text, session_id) = judged_stream_turn(
+            &pool,
+            json!({
+                "id": "gj", "model": "pde/judge",
+                "choices": [{"message": {"reasoning": "她在试探我", "content": verdict}}],
+            }),
+        )
+        .await;
+        let r = body_text
+            .find(r#""type":"reasoning""#)
+            .expect("a reasoning frame");
+        let m = body_text.find(r#""type":"meta""#).expect("a meta frame");
+        assert!(r < m, "reasoning comes before meta: {body_text}");
+        assert!(body_text.contains("她在试探我"));
+
+        wait_for_decision_row(&pool, session_id).await;
+        let reasoning: Option<String> = sqlx::query_scalar(
+            "SELECT payload->>'reasoning' FROM engine.companion_decision_events WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_optional(&pool)
+        .await
+        .unwrap()
+        .flatten();
+        assert_eq!(reasoning.as_deref(), Some("她在试探我"));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn no_reasoning_no_frame(pool: PgPool) {
+        let verdict = json!({ "action": "reply_text", "inner_state": "" }).to_string();
+        let (body_text, _session_id) = judged_stream_turn(
+            &pool,
+            json!({
+                "id": "gj", "model": "pde/judge",
+                "choices": [{"message": {"content": verdict}}],
+            }),
+        )
+        .await;
+        assert!(!body_text.contains(r#""type":"reasoning""#), "{body_text}");
+        assert!(
+            body_text.contains(r#""type":"meta""#) && body_text.contains(r#""type":"final""#),
+            "{body_text}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_reasoning_only_judge_falls_back(pool: PgPool) {
+        let (body_text, session_id) = judged_stream_turn(
+            &pool,
+            json!({
+                "id": "gj", "model": "pde/judge",
+                "choices": [{"message": {"reasoning": "想了但没说"}}],
+            }),
+        )
+        .await;
+        // The rule engine still answers the turn.
+        assert!(body_text.contains(r#""type":"meta""#), "{body_text}");
+        assert!(body_text.contains(r#""type":"done""#), "{body_text}");
+        assert!(body_text.contains(r#""type":"final""#), "{body_text}");
+        // The reasoning already streamed stays sent.
+        assert!(body_text.contains(r#""type":"reasoning""#), "{body_text}");
+        assert!(body_text.contains("想了但没说"), "{body_text}");
+
+        wait_for_decision_row(&pool, session_id).await;
+        let (status, payload): (String, Option<Value>) = sqlx::query_as(
+            "SELECT status, payload FROM engine.companion_decision_events WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "empty");
+        assert_eq!(payload, Some(json!({"reasoning": "想了但没说"})));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

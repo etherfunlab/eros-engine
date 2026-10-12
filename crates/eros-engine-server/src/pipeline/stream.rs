@@ -2411,19 +2411,9 @@ impl PdeStatus {
     }
 }
 
-/// Outcome of a PDE judge run. `verdict` is `Some` only on `Ok`; `raw` carries
-/// the model text on `ParseError` for the audit payload; `generation_id` is the
-/// winning call's join key into `engine.llm_generations`, where its model and
-/// usage live. `failures` is every failed hop of the chain walk
-/// — the audit row's two columns, and the `final` frame's judge share (spec
-/// §6.1).
-pub(crate) struct PdeDecisionRun {
-    pub(crate) status: PdeStatus,
-    pub(crate) verdict: Option<PdeVerdict>,
-    pub(crate) raw: Option<String>,
-    pub(crate) generation_id: Option<String>,
-    pub(crate) failures: Vec<eros_engine_llm::failure::AttemptFailure>,
-}
+/// A PDE judge run (`verdict` is `Some` only on `Ok`; `raw` holds the last
+/// unparseable content; `reasoning` every attempt's reasoning).
+pub(crate) type PdeDecisionRun = crate::pipeline::reasoning_call::JudgeRun<PdeVerdict>;
 
 /// OpenRouter `response_format` for the PDE verdict (json_schema, strict). The
 /// optional verdict fields are nullable so a strict provider returns `null`,
@@ -2457,141 +2447,35 @@ fn pde_response_format() -> serde_json::Value {
     })
 }
 
-/// The last parse-error attempt's text + join key, kept so a chain-exhausted
-/// ParseError return preserves the raw model text and can still be tied to the
-/// call that produced it. The model and usage live in
-/// `engine.llm_generations`, reached through `generation_id`.
-struct LastParseAttempt {
-    raw: String,
-    generation_id: Option<String>,
-}
-
-/// Run the PDE judge over the assembled context. Walks `[model] + fallback`
-/// trying the next model on a transport failure (error/timeout/empty) or a
-/// parse error; a chain-exhausted ParseError preserves the last attempt's raw
-/// text + audit trio. Fail-open: any non-`Ok` status → the caller uses the
-/// rule fallback. NEVER returns an error — always a run record.
-///
-/// Unlike `run_input_filter`, a content-level reply that won't parse here walks
-/// the rest of the chain before the caller falls back to the rule engine.
-async fn run_pde_decision(
-    client: &eros_engine_llm::openrouter::OpenRouterClient,
-    pool: &sqlx::PgPool,
+/// Run the PDE judge over the assembled context on the shared streamed judge
+/// call: `[model] + fallback`, one `timeout` per attempt, the model's
+/// reasoning yielded as it arrives, exactly one `Finished` at the end.
+/// Fail-open: any non-`Ok` status → the caller uses the rule fallback.
+fn run_pde_decision(
+    state: Arc<AppState>,
     session_id: Uuid,
-    p: &eros_engine_llm::model_config::ResolvedPde,
-    ctx: &str,
-) -> PdeDecisionRun {
-    use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
+    p: eros_engine_llm::model_config::ResolvedPde,
+    ctx: String,
+) -> impl futures_util::Stream<Item = crate::pipeline::reasoning_call::JudgeStep<PdeVerdict>>
+       + Send
+       + 'static {
     let chain: Vec<String> = std::iter::once(p.model.clone())
         .chain(p.fallback_model.iter().cloned())
         .collect();
-    let mut last = PdeStatus::GatewayError; // chain-exhausted default
-                                            // On a content-level reply that won't parse, keep the LAST attempt's text +
-                                            // audit trio so the chain-exhausted ParseError return stays faithful.
-    let mut last_parse: Option<LastParseAttempt> = None;
-    // Every failed hop, for the audit row's two columns and the `final` frame.
-    // Content-level verdicts (empty / unparseable) push nothing: the call
-    // succeeded and was billed, and the coarse status already says so.
-    let mut failures: Vec<eros_engine_llm::failure::AttemptFailure> = Vec::new();
-    let response_format = p.structured_output.then(pde_response_format);
-    for model_id in &chain {
-        let req = ChatRequest {
-            model: model_id.clone(),
-            fallback_model: vec![],
-            messages: vec![
-                ChatMessage {
-                    role: "system".into(),
-                    content: p.decision_prompt.clone(),
-                },
-                ChatMessage {
-                    role: "user".into(),
-                    content: ctx.to_string(),
-                },
-            ],
-            temperature: p.temperature as f32,
-            max_tokens: p.max_tokens,
-            sampling: p.sampling,
-            response_format: response_format.clone(),
-            task: Some("pde_decision".into()),
-            ..Default::default()
-        };
-        let resp = match tokio::time::timeout(FILTER_TIMEOUT, client.execute(req)).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                tracing::warn!(model = %model_id, error = %e, "pde: model error; next");
-                failures.push(eros_engine_llm::failure::AttemptFailure::from_llm_error(
-                    "pde_decision",
-                    model_id,
-                    &e,
-                ));
-                last = PdeStatus::for_operation(&failures);
-                continue;
-            }
-            Err(_) => {
-                tracing::warn!(model = %model_id, "pde: timeout; next");
-                failures.push(filter_timeout_failure("pde_decision", model_id));
-                last = PdeStatus::for_operation(&failures);
-                continue;
-            }
-        };
-        let generation_id = super::record_generation(
-            pool,
-            super::GenerationRecord {
-                task: "pde_decision",
-                session_id: Some(session_id),
-                generation_id: resp.generation_id.as_deref(),
-                model: resp.model.as_deref(),
-                usage: resp.usage.as_ref(),
-            },
-        )
-        .await;
-        let text = resp.reply.trim().to_string();
-        if text.is_empty() {
-            tracing::warn!(model = %model_id, "pde: empty reply; next");
-            last = PdeStatus::Empty;
-            continue;
-        }
-        match parse_pde_verdict(&text) {
-            Some(verdict) => {
-                return PdeDecisionRun {
-                    status: PdeStatus::Ok,
-                    verdict: Some(verdict),
-                    raw: None,
-                    generation_id,
-                    failures,
-                };
-            }
-            None => {
-                tracing::warn!(model = %model_id, "pde: unparseable verdict; trying next model");
-                last = PdeStatus::ParseError;
-                last_parse = Some(LastParseAttempt {
-                    raw: text,
-                    generation_id,
-                });
-                continue;
-            }
-        }
-    }
-    // chain exhausted
-    match last {
-        PdeStatus::ParseError => {
-            let lp = last_parse.expect("ParseError ⇒ last_parse is set");
-            PdeDecisionRun {
-                status: PdeStatus::ParseError,
-                verdict: None,
-                raw: Some(lp.raw),
-                generation_id: lp.generation_id,
-                failures,
-            }
-        }
-        other => PdeDecisionRun {
-            status: other,
-            verdict: None,
-            raw: None,
-            generation_id: None,
-            failures,
-        },
-    }
+    let call = crate::pipeline::reasoning_call::JudgeCall {
+        task: "pde_decision",
+        session_id: Some(session_id),
+        chain,
+        system: p.decision_prompt.clone(),
+        user: ctx,
+        temperature: p.temperature as f32,
+        max_tokens: p.max_tokens,
+        sampling: p.sampling,
+        response_format: p.structured_output.then(pde_response_format),
+        open_cap: p.timeout,
+        attempt_budget: p.timeout,
+    };
+    crate::pipeline::reasoning_call::reasoning_call(state, call, parse_pde_verdict)
 }
 
 /// Whether an image action is possible this turn.
@@ -2941,6 +2825,31 @@ impl<'a> VerdictAudit<'a> {
             clothing: v.clothing.as_deref(),
             action_response: v.action_response.map(|r| r.as_str()),
         }
+    }
+}
+
+/// `companion_decision_events.payload` for a judge run (spec §6): the verdict
+/// object with a `reasoning` key; the raw string when nothing parsed and
+/// nothing was reasoned, else `{raw, reasoning}`; `{reasoning}` alone when the
+/// run produced reasoning but no content; NULL when it produced neither.
+fn pde_audit_payload(
+    run: &PdeDecisionRun,
+    mode: Option<eros_engine_core::types::ReplyMode>,
+    nudges: Option<eros_engine_core::types::TurnNudges>,
+) -> Option<serde_json::Value> {
+    let reasoning = (!run.reasoning.is_empty()).then(|| run.reasoning.clone());
+    match (&run.verdict, &run.raw, reasoning) {
+        (Some(v), _, r) => {
+            let mut p = serde_json::to_value(VerdictAudit::new(v, mode, nudges)).ok()?;
+            p["reasoning"] = r
+                .map(serde_json::Value::String)
+                .unwrap_or(serde_json::Value::Null);
+            Some(p)
+        }
+        (None, Some(raw), None) => Some(serde_json::Value::String(raw.clone())),
+        (None, Some(raw), Some(r)) => Some(serde_json::json!({ "raw": raw, "reasoning": r })),
+        (None, None, Some(r)) => Some(serde_json::json!({ "reasoning": r })),
+        (None, None, None) => None,
     }
 }
 
@@ -4536,14 +4445,21 @@ pub(crate) fn run_stream_with(
                             }
                         });
                     }
-                    let run = run_pde_decision(
-                        &state.openrouter,
-                        &state.pool,
-                        user_msg.session_id,
-                        p,
-                        &ctx,
-                    )
-                    .await;
+                    let run = {
+                        use futures_util::StreamExt as _;
+                        let steps = run_pde_decision(state.clone(), user_msg.session_id, p.clone(), ctx);
+                        futures_util::pin_mut!(steps);
+                        let mut finished = None;
+                        while let Some(step) = steps.next().await {
+                            match step {
+                                crate::pipeline::reasoning_call::JudgeStep::Reasoning(content) => {
+                                    yield ProtocolFrame::Reasoning { content };
+                                }
+                                crate::pipeline::reasoning_call::JudgeStep::Finished(r) => finished = Some(r),
+                            }
+                        }
+                        finished.expect("the judge call always finishes")
+                    };
                     let plan = match (&run.status, &run.verdict) {
                         (PdeStatus::Ok, Some(v)) => {
                             let action = guard_action(
@@ -4658,12 +4574,7 @@ pub(crate) fn run_stream_with(
             let inputs = Some(pde_inputs_snapshot(&input.affinity));
             tokio::spawn(async move {
                 let proposed = run.verdict.as_ref().map(|v| v.action.as_str());
-                let payload: Option<serde_json::Value> = match &run.verdict {
-                    Some(v) => {
-                        serde_json::to_value(VerdictAudit::new(v, audited_mode, audited_nudges)).ok()
-                    }
-                    None => run.raw.clone().map(serde_json::Value::String),
-                };
+                let payload = pde_audit_payload(&run, audited_mode, audited_nudges);
                 let action_str = action_type_audit_str(acted);
                 let repo = eros_engine_store::decision::DecisionEventRepo { pool: &pool };
                 if let Err(e) = repo
@@ -9950,10 +9861,12 @@ data: [DONE]\n\n";
             .await;
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("\"model\":\"pde/judge\""))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "choices": [{"message": {"content":
-                    "{\"action\":\"reply_text_image\",\"inner_state\":\"想给你看\"}"}}],
-            })))
+            .respond_with(
+                crate::pipeline::reasoning_call::test_support::sse_completion(serde_json::json!({
+                    "choices": [{"message": {"content":
+                        "{\"action\":\"reply_text_image\",\"inner_state\":\"想给你看\"}"}}],
+                })),
+            )
             .mount(&mock)
             .await;
         // Composer: configured (guard_action keeps the judge's image action
@@ -10134,10 +10047,12 @@ data: [DONE]\n\n";
             .await;
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("\"model\":\"pde/judge\""))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "choices": [{"message": {"content":
-                    "{\"action\":\"reply_text_image\",\"inner_state\":\"想给你看\"}"}}],
-            })))
+            .respond_with(
+                crate::pipeline::reasoning_call::test_support::sse_completion(serde_json::json!({
+                    "choices": [{"message": {"content":
+                        "{\"action\":\"reply_text_image\",\"inner_state\":\"想给你看\"}"}}],
+                })),
+            )
             .mount(&mock)
             .await;
         // Composer: configured and SUCCEEDING, unlike the sibling test above —
@@ -10278,10 +10193,12 @@ data: [DONE]\n\n";
             .await;
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("\"model\":\"pde/judge\""))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "choices": [{"message": {"content":
-                    "{\"action\":\"reply_text_image\",\"inner_state\":\"想给你看\"}"}}],
-            })))
+            .respond_with(
+                crate::pipeline::reasoning_call::test_support::sse_completion(serde_json::json!({
+                    "choices": [{"message": {"content":
+                        "{\"action\":\"reply_text_image\",\"inner_state\":\"想给你看\"}"}}],
+                })),
+            )
             .mount(&mock)
             .await;
         Mock::given(wm_path("/api/v1/chat/completions"))
@@ -10441,10 +10358,12 @@ data: [DONE]\n\n";
             .await;
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("\"model\":\"pde/judge\""))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "choices": [{"message": {"content":
-                    "{\"action\":\"reply_text_image\",\"inner_state\":\"想给你看\"}"}}],
-            })))
+            .respond_with(
+                crate::pipeline::reasoning_call::test_support::sse_completion(serde_json::json!({
+                    "choices": [{"message": {"content":
+                        "{\"action\":\"reply_text_image\",\"inner_state\":\"想给你看\"}"}}],
+                })),
+            )
             .mount(&mock)
             .await;
         Mock::given(wm_path("/api/v1/chat/completions"))
@@ -10635,10 +10554,12 @@ data: [DONE]\n\n";
         // text+image action now that `force` always means reply_image.
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("\"model\":\"pde/judge\""))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "choices": [{"message": {"content":
-                    "{\"action\":\"reply_text_image\",\"inner_state\":\"想给你看\"}"}}],
-            })))
+            .respond_with(
+                crate::pipeline::reasoning_call::test_support::sse_completion(serde_json::json!({
+                    "choices": [{"message": {"content":
+                        "{\"action\":\"reply_text_image\",\"inner_state\":\"想给你看\"}"}}],
+                })),
+            )
             .mount(&mock)
             .await;
 
@@ -14492,7 +14413,7 @@ data: [DONE]\n\n";
 
     // ── Live-judge PDE E2E (spec §12) ────────────────────────────────────────
     // These two tests exercise the opt-in LLM Persona Decision Engine wired into
-    // `run_stream`: the judge runs (NON-streaming `execute()`) BEFORE the chat
+    // `run_stream`: the judge runs (its own streamed call) BEFORE the chat
     // call. The judge call and the chat call hit the SAME `/api/v1/chat/completions`
     // path on the one mock server, so they are routed by body content — the judge
     // body carries its own model id (`pde/judge`) and the `build_pde_ctx` context
@@ -14512,8 +14433,8 @@ data: [DONE]\n\n";
 
         let mock = MockServer::start().await;
 
-        // Judge ("pde/judge"): NON-streaming JSON completion whose content is the
-        // verdict. A `ghost` verdict, with a fresh affinity (ghost_streak=0,
+        // Judge ("pde/judge"): a completion, replayed as SSE, whose content is
+        // the verdict. A `ghost` verdict, with a fresh affinity (ghost_streak=0,
         // last_ghost_at=None) and message_count >= 10, satisfies
         // `ghost::ghost_permitted`, so the guard keeps it a Ghost.
         let verdict =
@@ -14525,7 +14446,7 @@ data: [DONE]\n\n";
         });
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("pde/judge"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(judge_body))
+            .respond_with(crate::pipeline::reasoning_call::test_support::sse_completion(judge_body))
             .mount(&mock)
             .await;
 
@@ -14704,7 +14625,7 @@ data: [DONE]\n\n";
         });
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("pde/judge"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(judge_body))
+            .respond_with(crate::pipeline::reasoning_call::test_support::sse_completion(judge_body))
             .mount(&mock)
             .await;
 
@@ -14838,7 +14759,7 @@ data: [DONE]\n\n";
         });
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("pde/judge"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(judge_body))
+            .respond_with(crate::pipeline::reasoning_call::test_support::sse_completion(judge_body))
             .mount(&mock)
             .await;
 
@@ -15111,7 +15032,7 @@ data: [DONE]\n\n";
         });
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("pde/judge"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(judge_body))
+            .respond_with(crate::pipeline::reasoning_call::test_support::sse_completion(judge_body))
             .mount(&mock)
             .await;
 
@@ -15324,7 +15245,7 @@ data: [DONE]\n\n";
         });
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("pde/judge"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(judge_body))
+            .respond_with(crate::pipeline::reasoning_call::test_support::sse_completion(judge_body))
             .mount(&mock)
             .await;
 
@@ -15454,11 +15375,13 @@ data: [DONE]\n\n";
         let verdict = serde_json::json!({ "action": "product_qa", "inner_state": "" }).to_string();
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("pde/judge"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "gj", "model": "pde/judge",
-                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-                "choices": [{"message": {"content": verdict}}],
-            })))
+            .respond_with(
+                crate::pipeline::reasoning_call::test_support::sse_completion(serde_json::json!({
+                    "id": "gj", "model": "pde/judge",
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                    "choices": [{"message": {"content": verdict}}],
+                })),
+            )
             .mount(&mock)
             .await;
 
@@ -15613,11 +15536,13 @@ data: [DONE]\n\n";
         let verdict = serde_json::json!({ "action": "product_qa", "inner_state": "" }).to_string();
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("pde/judge"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "gj", "model": "pde/judge",
-                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-                "choices": [{"message": {"content": verdict}}],
-            })))
+            .respond_with(
+                crate::pipeline::reasoning_call::test_support::sse_completion(serde_json::json!({
+                    "id": "gj", "model": "pde/judge",
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                    "choices": [{"message": {"content": verdict}}],
+                })),
+            )
             .mount(&mock)
             .await;
 
@@ -15766,7 +15691,7 @@ data: [DONE]\n\n";
         });
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("pde/judge"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(judge_body))
+            .respond_with(crate::pipeline::reasoning_call::test_support::sse_completion(judge_body))
             .mount(&mock)
             .await;
 
@@ -16027,7 +15952,7 @@ data: [DONE]\n\n";
         });
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("pde/judge"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(judge_body))
+            .respond_with(crate::pipeline::reasoning_call::test_support::sse_completion(judge_body))
             .mount(&mock)
             .await;
 
@@ -16177,11 +16102,13 @@ data: [DONE]\n\n";
         let verdict = serde_json::json!({ "action": "product_qa", "inner_state": "" }).to_string();
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("pde/judge"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "gj", "model": "pde/judge",
-                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-                "choices": [{"message": {"content": verdict}}],
-            })))
+            .respond_with(
+                crate::pipeline::reasoning_call::test_support::sse_completion(serde_json::json!({
+                    "id": "gj", "model": "pde/judge",
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                    "choices": [{"message": {"content": verdict}}],
+                })),
+            )
             .mount(&mock)
             .await;
 
@@ -16328,7 +16255,7 @@ data: [DONE]\n\n";
         });
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("pde/judge"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(judge_body))
+            .respond_with(crate::pipeline::reasoning_call::test_support::sse_completion(judge_body))
             .mount(&mock)
             .await;
 
@@ -16484,7 +16411,7 @@ data: [DONE]\n\n";
         });
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("pde/judge"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(judge_body))
+            .respond_with(crate::pipeline::reasoning_call::test_support::sse_completion(judge_body))
             .mount(&mock)
             .await;
         let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"REPLY\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"deepseek/x\"}\n\ndata: [DONE]\n\n";
@@ -16626,7 +16553,7 @@ data: [DONE]\n\n";
         });
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("pde/judge"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(judge_body))
+            .respond_with(crate::pipeline::reasoning_call::test_support::sse_completion(judge_body))
             .mount(&mock)
             .await;
 
@@ -18747,16 +18674,39 @@ data: [DONE]\n\n";
         }
     }
 
+    /// Drive one judge run through an `AppState` on `client` to its
+    /// `Finished` step.
+    async fn finished_pde_run(
+        client: eros_engine_llm::openrouter::OpenRouterClient,
+        pool: &PgPool,
+        session_id: Uuid,
+        p: &eros_engine_llm::model_config::ResolvedPde,
+    ) -> PdeDecisionRun {
+        use crate::pipeline::reasoning_call::JudgeStep;
+        use futures_util::StreamExt as _;
+        let mut st = crate::routes::companion::test_state(pool.clone());
+        st.openrouter = Arc::new(client);
+        let steps: Vec<JudgeStep<PdeVerdict>> =
+            run_pde_decision(Arc::new(st), session_id, p.clone(), "ctx".into())
+                .collect()
+                .await;
+        match steps.into_iter().last() {
+            Some(JudgeStep::Finished(run)) => run,
+            _ => panic!("a judge run ends with Finished"),
+        }
+    }
+
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn pde_parse_error_walks_to_next_model(pool: PgPool) {
+        use crate::pipeline::reasoning_call::test_support::sse_completion;
         use wiremock::matchers::{body_string_contains, path as wm_path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::{Mock, MockServer};
 
         let mock = MockServer::start().await;
         // primary "model-a" → unparseable text
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("model-a"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            .respond_with(sse_completion(serde_json::json!({
                 "choices": [{"message": {"content": "totally not json"}}],
                 "id": "gen-a", "model": "model-a"
             })))
@@ -18765,7 +18715,7 @@ data: [DONE]\n\n";
         // fallback "model-b" → valid verdict
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("model-b"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            .respond_with(sse_completion(serde_json::json!({
                 "choices": [{"message": {"content": "{\"action\":\"reply_text\",\"inner_state\":\"想接话\"}"}}],
                 "id": "gen-b", "model": "model-b"
             })))
@@ -18780,7 +18730,7 @@ data: [DONE]\n\n";
         // validated FK, so a fabricated uuid makes record_generation's write
         // fail and the run come back with no join key at all.
         let (_, _, session_id) = seed_persona_and_session(&pool, Uuid::new_v4()).await;
-        let run = run_pde_decision(&client, &pool, session_id, &p, "ctx").await;
+        let run = finished_pde_run(client, &pool, session_id, &p).await;
         assert_eq!(run.status, PdeStatus::Ok);
         assert_eq!(run.verdict.unwrap().action, PdeAction::ReplyText);
         // Since B1 the winning model lives in the parent row, not on the run:
@@ -18805,12 +18755,13 @@ data: [DONE]\n\n";
         // call-site literal ends in `..Default::default()`, so a site that
         // forgets `sampling` still COMPILES and silently sends nothing — the
         // compiler cannot catch this class. Assert the outbound body instead.
+        use crate::pipeline::reasoning_call::test_support::sse_completion;
         use wiremock::matchers::path as wm_path;
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::{Mock, MockServer};
 
         let mock = MockServer::start().await;
         Mock::given(wm_path("/api/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            .respond_with(sse_completion(serde_json::json!({
                 "choices": [{"message": {"content": "{\"action\":\"reply_text\",\"inner_state\":\"x\"}"}}],
                 "id": "g", "model": "m"
             })))
@@ -18828,7 +18779,7 @@ data: [DONE]\n\n";
             presence_penalty: Some(0.15),
             repetition_penalty: Some(1.25),
         };
-        let run = run_pde_decision(&client, &pool, Uuid::new_v4(), &p, "ctx").await;
+        let run = finished_pde_run(client, &pool, Uuid::new_v4(), &p).await;
         assert_eq!(run.status, PdeStatus::Ok);
 
         let sent: serde_json::Value = mock
@@ -18849,12 +18800,13 @@ data: [DONE]\n\n";
     async fn pde_unset_sampling_stays_off_the_wire(pool: PgPool) {
         // The other half of the contract: an untuned task must produce a
         // byte-identical body to before #246 — no key, not a default value.
+        use crate::pipeline::reasoning_call::test_support::sse_completion;
         use wiremock::matchers::path as wm_path;
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::{Mock, MockServer};
 
         let mock = MockServer::start().await;
         Mock::given(wm_path("/api/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            .respond_with(sse_completion(serde_json::json!({
                 "choices": [{"message": {"content": "{\"action\":\"reply_text\",\"inner_state\":\"x\"}"}}],
                 "id": "g", "model": "m"
             })))
@@ -18867,7 +18819,7 @@ data: [DONE]\n\n";
         );
         let p = test_resolved_pde(vec!["model-a".into()]);
         assert_eq!(
-            run_pde_decision(&client, &pool, Uuid::new_v4(), &p, "ctx")
+            finished_pde_run(client, &pool, Uuid::new_v4(), &p)
                 .await
                 .status,
             PdeStatus::Ok
@@ -18896,12 +18848,13 @@ data: [DONE]\n\n";
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn pde_whole_chain_parse_error_preserves_last_raw(pool: PgPool) {
+        use crate::pipeline::reasoning_call::test_support::sse_completion;
         use wiremock::matchers::path as wm_path;
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::{Mock, MockServer};
 
         let mock = MockServer::start().await;
         Mock::given(wm_path("/api/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            .respond_with(sse_completion(serde_json::json!({
                 "choices": [{"message": {"content": "nope"}}], "id": "g", "model": "m"
             })))
             .mount(&mock)
@@ -18916,7 +18869,7 @@ data: [DONE]\n\n";
         // validated FK, so a fabricated uuid makes record_generation's write
         // fail and the run come back with no join key at all.
         let (_, _, session_id) = seed_persona_and_session(&pool, Uuid::new_v4()).await;
-        let run = run_pde_decision(&client, &pool, session_id, &p, "ctx").await;
+        let run = finished_pde_run(client, &pool, session_id, &p).await;
         assert_eq!(run.status, PdeStatus::ParseError);
         assert_eq!(run.raw.as_deref(), Some("nope"));
         assert!(run.verdict.is_none());
@@ -18936,6 +18889,58 @@ data: [DONE]\n\n";
         assert!(
             model.is_some(),
             "the parent row must name the model that answered"
+        );
+    }
+
+    fn run_with(verdict: Option<PdeVerdict>, raw: Option<&str>, reasoning: &str) -> PdeDecisionRun {
+        use crate::pipeline::reasoning_call::JudgeRun;
+        JudgeRun {
+            status: if verdict.is_some() {
+                PdeStatus::Ok
+            } else if raw.is_some() {
+                PdeStatus::ParseError
+            } else {
+                PdeStatus::Empty
+            },
+            verdict,
+            raw: raw.map(str::to_string),
+            reasoning: reasoning.to_string(),
+            generation_id: None,
+            failures: vec![],
+        }
+    }
+
+    #[test]
+    fn pde_audit_payload_adds_reasoning_to_a_verdict() {
+        let v = parse_pde_verdict(r#"{"action":"reply_text","inner_state":"x"}"#).unwrap();
+        let with = pde_audit_payload(&run_with(Some(v.clone()), None, "想过"), None, None).unwrap();
+        assert_eq!(with["reasoning"], "想过");
+        assert_eq!(with["action"], "reply_text");
+        let without = pde_audit_payload(&run_with(Some(v), None, ""), None, None).unwrap();
+        assert!(without["reasoning"].is_null());
+    }
+
+    #[test]
+    fn pde_audit_payload_keeps_the_raw_string_without_reasoning() {
+        assert_eq!(
+            pde_audit_payload(&run_with(None, Some("nope"), ""), None, None),
+            Some(serde_json::Value::String("nope".into()))
+        );
+        assert_eq!(
+            pde_audit_payload(&run_with(None, Some("nope"), "想"), None, None),
+            Some(serde_json::json!({"raw": "nope", "reasoning": "想"}))
+        );
+    }
+
+    #[test]
+    fn pde_audit_payload_reasoning_only_and_nothing() {
+        assert_eq!(
+            pde_audit_payload(&run_with(None, None, "想"), None, None),
+            Some(serde_json::json!({"reasoning": "想"}))
+        );
+        assert_eq!(
+            pde_audit_payload(&run_with(None, None, ""), None, None),
+            None
         );
     }
 
@@ -20915,7 +20920,11 @@ data: [DONE]\n\n"
         });
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("pde/judge"))
-            .respond_with(ResponseTemplate::new(judge_status).set_body_json(judge_body))
+            .respond_with(if judge_status == 200 {
+                crate::pipeline::reasoning_call::test_support::sse_completion(judge_body)
+            } else {
+                ResponseTemplate::new(judge_status).set_body_json(judge_body)
+            })
             .mount(&mock)
             .await;
         let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"REPLY\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"deepseek/x\"}\n\ndata: [DONE]\n\n";
