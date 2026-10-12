@@ -192,6 +192,7 @@ pub async fn run(
                 extract_character_insights(
                     &state,
                     session_id,
+                    session_id,
                     instance_id,
                     m.message_id,
                     &user_msg,
@@ -208,6 +209,7 @@ pub async fn run(
             if !user_msg.is_empty() && !m.full_text.is_empty() {
                 extract_user_insights(
                     &state,
+                    session_id,
                     session_id,
                     instance_id,
                     m.message_id,
@@ -463,6 +465,9 @@ async fn persist_affinity(
 
 /// One group speaker's output for post-process.
 pub struct GroupSpoken {
+    /// The speaker's member session: its archive ends this speaker's insight
+    /// writes.
+    pub speaker_session_id: Uuid,
     pub instance_id: Uuid,
     pub name: String,
     pub produced: Vec<ProducedMessage>,
@@ -475,7 +480,8 @@ fn group_relationship_memory_content(user_msg: &str) -> String {
 /// Post-process for a group turn: no affinity, no feeling clause, no ghost
 /// streak. The user's line is embedded once and written to the profile layer
 /// and to every seated member's relationship layer; human_insights runs once;
-/// character/user insights run per speaker.
+/// character/user insights run per speaker, and each rechecks the speaker's
+/// member session before it writes.
 pub async fn run_group(
     state: AppState,
     group_session_id: Uuid,
@@ -576,6 +582,7 @@ pub async fn run_group(
                 extract_character_insights(
                     &state,
                     group_session_id,
+                    s.speaker_session_id,
                     s.instance_id,
                     m.message_id,
                     &user_msg,
@@ -586,6 +593,7 @@ pub async fn run_group(
                 extract_user_insights(
                     &state,
                     group_session_id,
+                    s.speaker_session_id,
                     s.instance_id,
                     m.message_id,
                     &user_msg,
@@ -1652,6 +1660,7 @@ const CHARACTER_STRUCTURING_TASK: &str = "character_insight_structuring";
 async fn extract_character_insights(
     state: &AppState,
     session_id: Uuid,
+    live_session_id: Uuid,
     instance_id: Uuid,
     message_id: Uuid,
     user_msg: &str,
@@ -1716,8 +1725,10 @@ async fn extract_character_insights(
     // structuring) may together have run long enough for the archive endpoint
     // to commit while this task was inside them. Without this, the apply
     // below would put a `character_insights` row right back for an instance
-    // the archive just deleted it from.
-    if !session_still_live(state, session_id).await {
+    // the archive just deleted it from. `live_session_id` is the session whose
+    // archive deletes that row: the turn's own on 1:1, the speaker's member
+    // session on a group turn.
+    if !session_still_live(state, live_session_id).await {
         return;
     }
 
@@ -1962,6 +1973,7 @@ const USER_STRUCTURING_TASK: &str = "user_insight_structuring";
 async fn extract_user_insights(
     state: &AppState,
     session_id: Uuid,
+    live_session_id: Uuid,
     instance_id: Uuid,
     message_id: Uuid,
     user_msg: &str,
@@ -2024,8 +2036,9 @@ async fn extract_user_insights(
     // Recheck: the two calls above may together have run long enough for the
     // archive endpoint to commit while this task was inside them. Without this,
     // the apply below would put a `user_insights` row right back for an
-    // instance the archive just deleted it from.
-    if !session_still_live(state, session_id).await {
+    // instance the archive just deleted it from. `live_session_id` is the
+    // session whose archive deletes that row, as on the character chain.
+    if !session_still_live(state, live_session_id).await {
         return;
     }
 
@@ -3386,6 +3399,7 @@ mod tests {
         extract_user_insights(
             &state,
             session_id,
+            session_id,
             instance_id,
             message_id,
             "我在南山上班",
@@ -3446,6 +3460,7 @@ mod tests {
         extract_user_insights(
             &state,
             session_id,
+            session_id,
             instance_id,
             message_id,
             "嗯",
@@ -3499,6 +3514,7 @@ mod tests {
         extract_user_insights(
             &state,
             session_id,
+            session_id,
             instance_id,
             message_id,
             "我在南山上班",
@@ -3541,6 +3557,7 @@ mod tests {
 
         extract_user_insights(
             &state,
+            session_id,
             session_id,
             instance_id,
             message_id,
@@ -3586,6 +3603,7 @@ mod tests {
 
         extract_user_insights(
             &state,
+            session_id,
             session_id,
             instance_id,
             message_id,
@@ -4252,6 +4270,7 @@ mod tests {
         extract_character_insights(
             &state,
             session_id,
+            session_id,
             instance_id,
             message_id,
             "你今天在忙什么",
@@ -4361,6 +4380,7 @@ mod tests {
 
         extract_character_insights(
             &state,
+            session_id,
             session_id,
             instance_id,
             seed_user_message(&pool, session_id).await,
@@ -4495,6 +4515,7 @@ mod tests {
         let message_id = seed_user_message(&pool, session_id).await;
         extract_character_insights(
             &state,
+            session_id,
             session_id,
             instance_id,
             message_id,
@@ -4828,6 +4849,100 @@ mod tests {
         assert_eq!(affinity_rows, 0, "a group never creates or writes affinity");
     }
 
+    /// A speaker whose relationship is archived by the time its insight chains
+    /// finish gets no insight row back; the live speaker of the same turn
+    /// still gets its own. Both chains are served real responses, so the archived speaker's
+    /// rows are missing because of the recheck on its member session, not
+    /// because a call failed. The group session itself stays live throughout.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_group_writes_no_insights_for_an_archived_speaker(pool: sqlx::PgPool) {
+        use eros_engine_store::session_archive::SessionArchiveRepo;
+
+        let user_id = Uuid::new_v4();
+        let (ia, ib) = (
+            seed_persona_instance(&pool, user_id).await,
+            seed_persona_instance(&pool, user_id).await,
+        );
+        let chat = ChatRepo { pool: &pool };
+        let (sa, sb) = (
+            chat.create_session(user_id, ia).await.unwrap().id,
+            chat.create_session(user_id, ib).await.unwrap().id,
+        );
+        let group: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, channel) VALUES ($1, 'group') RETURNING id",
+        )
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let (ma, mb) = (
+            seed_assistant_message(&pool, group).await,
+            seed_assistant_message(&pool, group).await,
+        );
+        SessionArchiveRepo { pool: &pool }
+            .archive_relationship(user_id, ia)
+            .await
+            .unwrap();
+
+        let state = state_with_mock_openrouter(
+            pool.clone(),
+            "[tasks.character_insight_extraction]\nmodel=\"ch/m\"\n\
+             filter_prompt=\"char-facts-sentinel\"\n\n\
+             [tasks.user_insight_extraction]\nmodel=\"u/m\"\n\
+             filter_prompt=\"user-facts-sentinel\"\n",
+            vec![
+                (
+                    "char-facts-sentinel",
+                    r#"{"facts":["角色说她下周也想去爬山"],"details":[]}"#,
+                ),
+                ("character_insights schema", r#"{"location":"山脚"}"#),
+                (
+                    "user-facts-sentinel",
+                    r#"{"facts":["用户下周去爬山"],"details":[]}"#,
+                ),
+                ("user_insights schema", r#"{"location":"山脚"}"#),
+            ],
+        )
+        .await;
+        let spoke = |speaker_session_id, instance_id, name: &str, message_id| GroupSpoken {
+            speaker_session_id,
+            instance_id,
+            name: name.into(),
+            produced: vec![ProducedMessage {
+                message_id,
+                full_text: "我也想去".into(),
+                action: ActionType::ReplyText,
+            }],
+        };
+
+        run_group(
+            state,
+            group,
+            user_id,
+            "我下周去爬山".into(),
+            vec![(sb, ib)],
+            vec![spoke(sa, ia, "小美", ma), spoke(sb, ib, "阿哲", mb)],
+        )
+        .await;
+
+        for table in ["character_insights", "user_insights"] {
+            let count = |instance_id: Uuid| {
+                let pool = pool.clone();
+                async move {
+                    sqlx::query_scalar::<_, i64>(&format!(
+                        "SELECT count(*) FROM engine.{table} WHERE instance_id = $1"
+                    ))
+                    .bind(instance_id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+                }
+            };
+            assert_eq!(count(ia).await, 0, "{table}: the archived speaker");
+            assert_eq!(count(ib).await, 1, "{table}: the live speaker");
+        }
+    }
+
     /// Pins `embed_and_upsert`'s recheck (called from `write_turn`). The
     /// embed call is served a real response — if it errored instead, the
     /// write would be skipped for the wrong reason (a transport error, not
@@ -4968,6 +5083,7 @@ mod tests {
 
         extract_character_insights(
             &state,
+            session_id,
             session_id,
             instance_id,
             Uuid::new_v4(),

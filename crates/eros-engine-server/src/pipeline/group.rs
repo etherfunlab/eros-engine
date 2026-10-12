@@ -489,6 +489,7 @@ pub(crate) fn run_group_turn(
                     yield frame;
                 }
                 spoken.push(GroupSpoken {
+                    speaker_session_id: seat.member_session_id,
                     instance_id: seat.instance_id,
                     name: seat.persona.genome.name.clone(),
                     produced: vec![ProducedMessage {
@@ -696,6 +697,7 @@ pub(crate) fn run_group_turn(
             }
             if !produced.is_empty() {
                 spoken.push(GroupSpoken {
+                    speaker_session_id: seat.member_session_id,
                     instance_id: seat.instance_id,
                     name: seat.persona.genome.name.clone(),
                     produced,
