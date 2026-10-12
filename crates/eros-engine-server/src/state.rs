@@ -383,6 +383,39 @@ pub fn parse_byok_config(
     })
 }
 
+/// Insights export admission (`GET /svc/v1/insights/changes`).
+#[derive(Clone, Default)]
+pub struct InsightsExportConfig {
+    /// `INSIGHTS_EXPORT_SECRET`. `None` leaves the route unmounted.
+    pub secret: Option<String>,
+}
+
+impl std::fmt::Debug for InsightsExportConfig {
+    /// The secret never reaches a log line through `ServerConfig`'s `{:?}`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InsightsExportConfig")
+            .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// Shortest `INSIGHTS_EXPORT_SECRET` the engine boots with.
+pub const MIN_INSIGHTS_EXPORT_SECRET_LEN: usize = 32;
+
+/// A blank secret means off; a short one refuses boot.
+pub fn parse_insights_export_config(secret: Option<&str>) -> Result<InsightsExportConfig, String> {
+    let secret = match secret.map(str::trim).filter(|s| !s.is_empty()) {
+        None => None,
+        Some(s) if s.len() < MIN_INSIGHTS_EXPORT_SECRET_LEN => {
+            return Err(format!(
+                "INSIGHTS_EXPORT_SECRET must be at least {MIN_INSIGHTS_EXPORT_SECRET_LEN} bytes"
+            ));
+        }
+        Some(s) => Some(s.to_string()),
+    };
+    Ok(InsightsExportConfig { secret })
+}
+
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     /// Affinity 3.0 pipeline knobs (`AFFINITY_*` env vars). Defaults reproduce
@@ -450,6 +483,8 @@ pub struct ServerConfig {
     pub reaction_emoji: Option<crate::reaction::ReactionAllowlist>,
     /// Bring-your-own-key admission and transport settings.
     pub byok: ByokConfig,
+    /// Insights export admission (`INSIGHTS_EXPORT_SECRET`).
+    pub insights_export: InsightsExportConfig,
 }
 
 impl ServerConfig {
@@ -533,6 +568,9 @@ impl ServerConfig {
             byok: parse_byok_config(
                 std::env::var("BYOK_CALLER_SECRET").ok().as_deref(),
                 std::env::var("BYOK_ALLOW_PRIVATE_NETWORK").ok().as_deref(),
+            )?,
+            insights_export: parse_insights_export_config(
+                std::env::var("INSIGHTS_EXPORT_SECRET").ok().as_deref(),
             )?,
         })
     }
@@ -922,5 +960,24 @@ mod tests {
     fn byok_config_debug_hides_the_secret() {
         let cfg = parse_byok_config(Some("THE-SECRET-VALUE-0123456789-abcdef"), None).unwrap();
         assert!(!format!("{cfg:?}").contains("THE-SECRET-VALUE"));
+    }
+
+    #[test]
+    fn insights_export_secret_blank_is_off() {
+        assert!(parse_insights_export_config(None).unwrap().secret.is_none());
+        assert!(parse_insights_export_config(Some("   "))
+            .unwrap()
+            .secret
+            .is_none());
+    }
+
+    #[test]
+    fn insights_export_secret_short_refuses_boot() {
+        let err = parse_insights_export_config(Some("too-short")).unwrap_err();
+        assert!(err.contains("INSIGHTS_EXPORT_SECRET"));
+        assert!(parse_insights_export_config(Some(&"s".repeat(32)))
+            .unwrap()
+            .secret
+            .is_some());
     }
 }

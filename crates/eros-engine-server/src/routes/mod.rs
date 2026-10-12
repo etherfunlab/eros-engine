@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Top-level route composition.
 //!
-//! The HTTP surface is split into two independently-authed sub-trees:
+//! The HTTP surface is split into three independently-authed sub-trees:
 //!   * Public:        `/healthz` — no auth
 //!   * Bearer JWT:    `/comp/*`, `/bff/v1/*`, `/world/*`, `/persona/*` — Supabase JWT (see auth::middleware)
+//!   * Service secret: `/svc/v1/*` — `x-insights-export-secret`; mounted only when configured
 //!
 //! The auth layer is applied to the `/comp` + `/bff` merge, NOT the
 //! top-level merge, so the public `/healthz` route stays unauthenticated
@@ -29,6 +30,7 @@ pub mod persona_items;
 pub mod reaction;
 pub mod session_effects;
 pub mod session_open;
+pub mod svc;
 pub mod voice;
 pub mod world_town;
 
@@ -57,7 +59,15 @@ pub fn router(state: AppState) -> OpenApiRouter<AppState> {
         .merge(group::router())
         .layer(from_fn_with_state(state.clone(), require_auth));
 
-    OpenApiRouter::new().merge(health::router()).merge(comp)
+    let mut app = OpenApiRouter::new().merge(health::router()).merge(comp);
+    // Service sub-tree: secret-admitted, mounted only when the deployment set
+    // INSIGHTS_EXPORT_SECRET. An unconfigured deployment answers on /svc/*
+    // exactly as it does for any unknown path, so it does not confirm the
+    // feature exists.
+    if state.config.insights_export.secret.is_some() {
+        app = app.merge(svc::router());
+    }
+    app
 }
 
 /// Same shape as [`router`] for OpenAPI extraction purposes, minus the auth
@@ -81,6 +91,7 @@ pub fn router_for_openapi() -> OpenApiRouter<AppState> {
         .merge(session_open::router())
         .merge(reaction::router())
         .merge(group::router())
+        .merge(svc::router())
 }
 
 /// The generated OpenAPI document as JSON, for tests that assert on the wire

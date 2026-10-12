@@ -1178,6 +1178,7 @@ pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
             ),
             reaction_emoji: None,
             byok: crate::state::ByokConfig::default(),
+            insights_export: crate::state::InsightsExportConfig::default(),
         },
         openrouter: Arc::new(eros_engine_llm::openrouter::OpenRouterClient::new(
             "stub".into(),

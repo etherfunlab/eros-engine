@@ -1222,6 +1222,67 @@
         ]
       }
     },
+    "/svc/v1/insights/changes": {
+      "get": {
+        "tags": [
+          "svc"
+        ],
+        "summary": "`human_insights` rows changed since a keyset cursor, for a downstream\nservice that mirrors the conversation-derived profile. Reads the live table\n(not the append-only snapshot archive): `updated_at` is the signal that a\nperson's profile changed.",
+        "operationId": "insights_changes",
+        "parameters": [
+          {
+            "name": "since",
+            "in": "query",
+            "description": "RFC 3339. Default: Unix epoch (walk everything).",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "after_user",
+            "in": "query",
+            "description": "Tie-break within `since`. Default: nil UUID. Pass `next.user_id`.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Default 500, clamped to 1..=1000.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InsightChangesResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "x-insights-export-secret missing or wrong"
+          }
+        },
+        "security": [
+          {
+            "insights_export_secret": []
+          }
+        ]
+      }
+    },
     "/v2/comp/group": {
       "post": {
         "tags": [
@@ -3322,6 +3383,24 @@
         },
         "additionalProperties": false
       },
+      "ChangesCursor": {
+        "type": "object",
+        "description": "Keyset position. Pass both fields back as `since` + `after_user`.",
+        "required": [
+          "updated_at",
+          "user_id"
+        ],
+        "properties": {
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "user_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
       "CharacterInsightResponse": {
         "type": "object",
         "description": "The AI character's side of one relationship's profile.\n\nDeliberately NOT the v1 `CharacterProfileResponse`, which carries the same\nfields: that type is the frozen response of `GET\n/comp/instance/{instance_id}/profile` and stays exactly as shipped. Two\nstructs is the price of freezing v1, and what lets this pair diverge later.",
@@ -4319,6 +4398,180 @@
           },
           "message_id": {
             "type": "string"
+          }
+        }
+      },
+      "InsightChangesResponse": {
+        "type": "object",
+        "required": [
+          "profiles"
+        ],
+        "properties": {
+          "next": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ChangesCursor",
+                "description": "Present iff the page is full; `null` means the walk is complete."
+              }
+            ]
+          },
+          "profiles": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InsightExportRow"
+            }
+          }
+        }
+      },
+      "InsightExportRow": {
+        "type": "object",
+        "description": "One `human_insights` row as exported. All 21 data columns: the export does\nnot guess which ones a consumer wants.",
+        "required": [
+          "user_id",
+          "interests",
+          "personality_traits",
+          "deal_breakers",
+          "updated_at"
+        ],
+        "properties": {
+          "age_max": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "age_min": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "city": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "deal_breakers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "education": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "emotional_needs": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "family": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "finance_status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "future_plans": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "hometown": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "interests": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "life_rhythm": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "location": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "love_values": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mbti_guess": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "nationality": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "occupation": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "personality_traits": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "preferred_gender": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "relationship_history": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "social_pattern": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "user_id": {
+            "type": "string",
+            "format": "uuid"
           }
         }
       },
@@ -5379,6 +5632,12 @@
         "scheme": "bearer",
         "bearerFormat": "JWT",
         "description": "Supabase JWT bearer token"
+      },
+      "insights_export_secret": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-insights-export-secret",
+        "description": "Shared secret for the service sub-tree; INSIGHTS_EXPORT_SECRET on the deployment"
       }
     }
   },
@@ -5386,6 +5645,10 @@
     {
       "name": "health",
       "description": "Liveness probe"
+    },
+    {
+      "name": "svc",
+      "description": "Service-to-service routes, admitted by a shared secret header"
     },
     {
       "name": "companion",
