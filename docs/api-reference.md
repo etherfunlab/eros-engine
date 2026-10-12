@@ -409,15 +409,22 @@ physical or custom action → chemistry), and a refused `tip` costs nothing (see
 
 | `type` | fields |
 |---|---|
-| `give` | `item`: `cigarette` \| `alcohol` \| `medicine` (required); `name`: optional, 1–32 chars; `quantity`: optional, 1–99, default 1 |
+| `give` | `item`: one of the categories below (required); `name`: optional, 1–32 chars; `quantity`: optional, 1–99, default 1 |
 | `kiss`, `hug`, `touch`, `lick` | none |
 | `custom` | `text`: required, 1–100 chars |
 | `tip` | `amount_usd`: required, finite, `> 0` and `≤ 1_000_000_000` |
 | `gift` | `kind`: `item` \| `clothing` (required); `name`: required, 1–64 chars |
 
-**Lingering effects of a `give`.** An accepted `give` keeps affecting the persona on the next `min(quantity, 5)` text turns of the session; the turn that accepts it is not one of them. Each turn the persona is at one step of a curve, at a level from 1 to 4:
+**What `give` hands over.** Consumables linger on the persona (below). Valuables do not, and they do not join her items: `gift` is the action for something she keeps. `cash` is money handed over in person, counted in notes; `tip` is the action that carries an amount.
 
-| turns | cigarette | alcohol | medicine |
+| group | `item` (unit) |
+|---|---|
+| consumable | `cigarette` (支), `alcohol` (杯), `medicine` (片), `food` (份), `soft_drink` (瓶), `tea` (杯), `coffee` (杯), `herb` (包) |
+| valuable | `watch` (块), `gem` (颗), `gold` (块), `camera` (台), `cash` (张), `antique` (件), `artwork` (件), `handmade` (份), `credit_card` (张) |
+
+**Lingering effects of a `give`.** An accepted consumable keeps affecting the persona on the next `min(quantity, 5)` text turns of the session; the turn that accepts it is not one of them. Each turn the persona is at one step of a curve, at a level from 1 to 4:
+
+| turns | front: `cigarette`, `food`, `soft_drink`, `tea` | back: `alcohol` | middle: `medicine`, `coffee`, `herb` |
 |---|---|---|---|
 | 1 | 3 | 1 | 3 |
 | 2 | 3 1 | 1 3 | 3 3 |
@@ -426,7 +433,7 @@ physical or custom action → chemistry), and a refused `tip` costs nothing (see
 | 5 | 3 3 2 2 1 | 1 2 2 3 3 | 1 2 3 2 1 |
 | quantity > 5 | 4 3 3 2 1 | 1 2 3 4 4 | 1 3 4 2 1 |
 
-A turn is a user message of the text session; product-QA messages and voice calls do not count, and there is no time limit. The state reaches the judge, the reply prompt and the image composer, and the caller through the `body_state` frame and [`GET /v2/comp/session/{session_id}/effects`](#get-v2compsessionsession_ideffects). A refused give has no effect. Design: [lingering effects spec](superpowers/specs/2026-10-12-given-item-lingering-effects-design.md).
+A turn is a user message of the text session; product-QA messages and voice calls do not count, and there is no time limit. The state reaches the judge, the reply prompt and the image composer, and the caller through the `body_state` frame and [`GET /v2/comp/session/{session_id}/effects`](#get-v2compsessionsession_ideffects). A refused give has no effect. Design: [lingering effects spec](superpowers/specs/2026-10-12-given-item-lingering-effects-design.md), [give categories spec](superpowers/specs/2026-10-13-give-categories-design.md).
 
 With an action, `content` may be empty, and it can be combined with
 `image_url` and `image`. Every value violation (bounds, missing

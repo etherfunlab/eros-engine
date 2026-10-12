@@ -361,15 +361,22 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 | `type` | 字段 |
 |---|---|
-| `give` | `item`：`cigarette` \| `alcohol` \| `medicine`，必填；`name`：可选，1–32 字符；`quantity`：可选，1–99，默认 1 |
+| `give` | `item`：下表中的一类，必填；`name`：可选，1–32 字符；`quantity`：可选，1–99，默认 1 |
 | `kiss`、`hug`、`touch`、`lick` | 无 |
 | `custom` | `text`：必填，1–100 字符 |
 | `tip` | `amount_usd`：必填，有限数值，`> 0` 且 `≤ 1_000_000_000` |
 | `gift` | `kind`：`item` \| `clothing`（必填）；`name`：必填，1–64 字 |
 
-**`give` 的余效。** 被接受的 `give` 会在这个 session 之后的 `min(quantity, 5)` 个文字回合里继续影响角色；接受它的那一回合不算在内。每个回合角色处在曲线上的某一步，档位 1–4：
+**`give` 能递什么。** 消耗品会在角色身上留下余效（见下）。贵重物没有余效，也不会进她的物品清单；想让她收着，用 `gift`。`cash` 是当面递过去的现金，按张数计；带金额的是 `tip`。
 
-| 回合数 | 烟 | 酒 | 药 |
+| 分组 | `item`（单位） |
+|---|---|
+| 消耗品 | `cigarette`（支）、`alcohol`（杯）、`medicine`（片）、`food`（份）、`soft_drink`（瓶）、`tea`（杯）、`coffee`（杯）、`herb`（包） |
+| 贵重物 | `watch`（块）、`gem`（颗）、`gold`（块）、`camera`（台）、`cash`（张）、`antique`（件）、`artwork`（件）、`handmade`（份）、`credit_card`（张） |
+
+**`give` 的余效。** 被接受的消耗品会在这个 session 之后的 `min(quantity, 5)` 个文字回合里继续影响角色；接受它的那一回合不算在内。每个回合角色处在曲线上的某一步，档位 1–4：
+
+| 回合数 | 前强：`cigarette`、`food`、`soft_drink`、`tea` | 后强：`alcohol` | 中间强：`medicine`、`coffee`、`herb` |
 |---|---|---|---|
 | 1 | 3 | 1 | 3 |
 | 2 | 3 1 | 1 3 | 3 3 |
@@ -378,7 +385,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 | 5 | 3 3 2 2 1 | 1 2 2 3 3 | 1 2 3 2 1 |
 | 数量 > 5 | 4 3 3 2 1 | 1 2 3 4 4 | 1 3 4 2 1 |
 
-一个回合指文字 session 里的一条用户消息；产品咨询消息和语音通话不计数，也没有时间上限。这份状态会进判官、回复 prompt 和画图 composer，并经 `body_state` 帧和 [`GET /v2/comp/session/{session_id}/effects`](#get-v2compsessionsession_ideffects) 给到调用方。被拒绝的 give 没有余效。设计文档：[余效 spec](superpowers/specs/2026-10-12-given-item-lingering-effects-design.md)。
+一个回合指文字 session 里的一条用户消息；产品咨询消息和语音通话不计数，也没有时间上限。这份状态会进判官、回复 prompt 和画图 composer，并经 `body_state` 帧和 [`GET /v2/comp/session/{session_id}/effects`](#get-v2compsessionsession_ideffects) 给到调用方。被拒绝的 give 没有余效。设计文档：[余效 spec](superpowers/specs/2026-10-12-given-item-lingering-effects-design.md)、[give 品类 spec](superpowers/specs/2026-10-13-give-categories-design.md)。
 
 带动作时 `content` 可以为空，也可以和 `image_url`、`image` 同时出现。取值不合规（超出范围、缺少 `item`/`text`/`amount_usd`/`kind`/`name`）一律返回 `422`，`code: "unprocessable"`；`type` 或 `item` 不在上表取值内时，请求体按无法解析的 JSON 拒绝（同样是 `422`）。动作存在用户行上，两套历史接口都以 `action` 字段返回，该回合生效之后带 `response`。
 

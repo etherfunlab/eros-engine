@@ -21115,6 +21115,68 @@ data: [DONE]\n\n"
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_turn_after_an_accepted_coffee_carries_its_body_state(pool: PgPool) {
+        use eros_engine_core::effects::EffectPhase;
+        use eros_engine_core::types::GivenItem;
+        let (frames, mock, _) = run_action_turn_full(
+            &pool,
+            eros_engine_core::types::UserAction::Hug,
+            None,
+            &[accepted_give("coffee", 1, None)],
+            serde_json::json!({"action": "reply_text", "inner_state": "", "action_response": "accept"}),
+            200,
+        )
+        .await;
+        let effects: Vec<_> = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::BodyState { effects, .. } => Some(effects.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(effects.len(), 1, "sent once: {frames:?}");
+        let e = &effects[0][0];
+        // coffee ×1 is middle [3]: level 3, at its peak, step 1 of 1.
+        assert_eq!(
+            (e.item, e.level, e.phase, e.step, e.steps),
+            (GivenItem::Coffee, 3, EffectPhase::Peak, 1, 1)
+        );
+        let reqs = mock.received_requests().await.expect("recorded requests");
+        let judge = reqs
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .find(|b| b.contains("pde/judge"))
+            .expect("the judge ran");
+        assert!(
+            judge.contains("[身体状态] 1 杯咖啡，精神很足，正在劲头上"),
+            "{judge}"
+        );
+        let chat = chat_request_body(&reqs);
+        assert!(
+            chat.contains("- 身上还带着：1 杯咖啡，精神很足，正在劲头上"),
+            "{chat}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_turn_after_an_accepted_watch_carries_no_body_state(pool: PgPool) {
+        let (frames, mock, _) = run_action_turn_full(
+            &pool,
+            eros_engine_core::types::UserAction::Hug,
+            None,
+            &[accepted_give("watch", 1, Some("劳力士"))],
+            serde_json::json!({"action": "reply_text", "inner_state": "", "action_response": "accept"}),
+            200,
+        )
+        .await;
+        assert!(!frame_shape(&frames).contains(&"body_state"), "{frames:?}");
+        let reqs = mock.received_requests().await.expect("recorded requests");
+        assert!(reqs
+            .iter()
+            .all(|r| !String::from_utf8_lossy(&r.body).contains("[身体状态]")));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn refused_action_frames_persists_and_prompts(pool: PgPool) {
         let (frames, mock, umid) = run_action_turn(
             &pool,
