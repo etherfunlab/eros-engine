@@ -108,7 +108,15 @@ where
             let mut failed = false;
             match tokio::time::timeout(open_limit, state.openrouter.execute_stream_as(&req, model_id)).await {
                 Ok(Ok(mut s)) => loop {
-                    match tokio::time::timeout_at(deadline, s.next()).await {
+                    let next = tokio::time::timeout_at(deadline, s.next()).await;
+                    // `timeout_at` polls the stream before the clock, so an item that
+                    // is ready after a suspension past the deadline would be accepted.
+                    let next = match next {
+                        Ok(_) if tokio::time::Instant::now() >= deadline => Err(()),
+                        Ok(item) => Ok(item),
+                        Err(_) => Err(()),
+                    };
+                    match next {
                         Ok(Some(Ok(c))) => {
                             if let Some(r) = c.reasoning {
                                 reasoning.push_str(&r);

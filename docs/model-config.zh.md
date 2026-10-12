@@ -591,7 +591,7 @@ BYOK hop 使用其请求中 `byok` 块的 `output_regex` 规则，而不是这�
   - `action_response`（选填）：本轮带用户动作时（上下文里会有 `[用户动作]` 一行）填 `"accept"` 或 `"refuse"`；其他回合或拿不准时填 `null`。`null`、判官调用失败、规则 PDE 一律按接受处理。拒绝会让该动作对应的亲密度线降一档（见 [affinity-model.zh.md](affinity-model.zh.md)）。动作回合里 `ghost` 和 `product_qa` 会改判为 `reply_text`，也不掷每轮骰子
   - `reason`：可选
 - **Fail-open：**任何 LLM 超时或错误都会回退到规则引擎——LLM 判断器绝不会阻塞 chat 响应。
-- **`timeout_secs`**（选填，默认 `15`）：每次尝试的时限，从发起调用到读完为止共用一个截止时间。超时的尝试算失败，调用转向链上的下一个模型。写 `0` 会拒绝启动（判断器每轮都会超时）。只在 `[tasks.pde_decision]` 上读取，其他任务忽略。判断器的最坏耗时是 `timeout_secs × (1 + retry_depth)`；它加上回复的耗时若超过 `CHAT_QUEUE_GEN_TIMEOUT_SECS`（默认 300），这一轮会以 `generation_timeout` 结束，而不是走回退。
+- **`timeout_secs`**（选填，默认 `15`）：每次尝试的时限，从发起调用到读完为止共用一个截止时间。超时的尝试算失败，调用转向链上的下一个模型。取值范围 1–3600；写 `0` 会拒绝启动（判断器每轮都会超时），超过 3600 同样拒绝启动。只在 `[tasks.pde_decision]` 上读取，其他任务忽略。判断器的最坏耗时是 `timeout_secs × (1 + retry_depth)`；它加上回复的耗时若超过 `CHAT_QUEUE_GEN_TIMEOUT_SECS`（默认 300），这一轮会以 `generation_timeout` 结束，而不是走回退。
 - **推理。**判断器始终以流式调用。判断器的模型返回什么推理就转发什么：推理以 `reasoning` 帧进入 1:1 流，并保存在审计行上，所以默认就会推理的模型不需要任何规则也会发帧。用 body 规则可以打开推理：
 
   ```toml

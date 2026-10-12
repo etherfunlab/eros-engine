@@ -1952,6 +1952,10 @@ impl ModelConfig {
                  Remove the key (default 15) or set a positive number of seconds."
                     .to_string(),
             ),
+            Some(n) if n > 3600 => Err(format!(
+                "[tasks.pde_decision].timeout_secs = {n} is out of range 1..=3600 — it is \
+                 beyond any turn's budget (an hour is the cap); eros-engine refuses to boot."
+            )),
             _ => Ok(()),
         }
     }
@@ -5477,6 +5481,20 @@ filter_prompt = "   "
                 .unwrap();
         let err = zero.validate_pde_timeout().unwrap_err();
         assert!(err.contains("[tasks.pde_decision].timeout_secs"), "{err}");
+        let big = ModelConfig::from_toml_str(
+            "[tasks.pde_decision]\nmodel = \"m\"\ntimeout_secs = 3601\n",
+        )
+        .unwrap();
+        let err = big.validate_pde_timeout().unwrap_err();
+        assert!(
+            err.contains("[tasks.pde_decision].timeout_secs") && err.contains("1..=3600"),
+            "{err}"
+        );
+        let max = ModelConfig::from_toml_str(
+            "[tasks.pde_decision]\nmodel = \"m\"\ntimeout_secs = 3600\n",
+        )
+        .unwrap();
+        assert!(max.validate_pde_timeout().is_ok());
     }
 
     #[test]
