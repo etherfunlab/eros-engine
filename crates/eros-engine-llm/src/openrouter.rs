@@ -561,12 +561,27 @@ impl futures_util::Stream for DeltaStream {
 struct WireStreamDelta {
     #[serde(default)]
     content: Option<String>,
-    /// OpenRouter's normalised reasoning text.
+    /// OpenRouter's normalised reasoning text. Kept as raw JSON so a provider
+    /// that sends another shape here (an object, an array) cannot fail the
+    /// frame; only a string value counts as reasoning.
     #[serde(default)]
-    reasoning: Option<String>,
-    /// The same text under the DeepSeek-style key some direct endpoints use.
+    reasoning: Option<serde_json::Value>,
+    /// The same text under the DeepSeek-style key some direct endpoints use;
+    /// same string-only rule.
     #[serde(default)]
-    reasoning_content: Option<String>,
+    reasoning_content: Option<serde_json::Value>,
+}
+
+/// The reasoning text of one delta: a non-empty string `reasoning` wins, else a
+/// non-empty string `reasoning_content`. Any other shape is not reasoning.
+fn delta_reasoning(delta: &WireStreamDelta) -> Option<String> {
+    let text = |v: &Option<serde_json::Value>| {
+        v.as_ref()
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    text(&delta.reasoning).or_else(|| text(&delta.reasoning_content))
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1435,11 +1450,10 @@ impl OpenRouterClient {
                                         ),
                                     )));
                                 }
+                                let reasoning = delta_reasoning(&choice.delta);
                                 Some(Ok(DeltaChunk {
                                     content: choice.delta.content.filter(|s| !s.is_empty()),
-                                    reasoning: choice.delta.reasoning.filter(|s| !s.is_empty()).or(
-                                        choice.delta.reasoning_content.filter(|s| !s.is_empty()),
-                                    ),
+                                    reasoning,
                                     finish_reason: choice.finish_reason,
                                     usage: frame.usage,
                                     // A BYOK hop keeps the id minted above.
@@ -2721,6 +2735,50 @@ data: [DONE]\n\n";
         }
         assert_eq!(reasoning, vec!["先想", "再想", "两个", "补上"]);
         assert_eq!(content, vec!["{}"]);
+    }
+
+    #[tokio::test]
+    async fn execute_stream_ignores_non_string_reasoning() {
+        use futures_util::StreamExt;
+
+        let server = MockServer::start().await;
+        let body = "\
+data: {\"choices\":[{\"delta\":{\"reasoning\":{\"text\":\"x\"},\"content\":\"ok\"}}]}\n\n\
+data: [DONE]\n\n";
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let mut stream = client
+            .execute_stream(ChatRequest {
+                model: "m".into(),
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .expect("stream opens");
+        let mut reasoning = Vec::new();
+        let mut content = Vec::new();
+        while let Some(item) = stream.next().await {
+            let c = item.expect("an object-shaped reasoning still parses");
+            reasoning.extend(c.reasoning);
+            content.extend(c.content);
+        }
+        assert!(reasoning.is_empty(), "{reasoning:?}");
+        assert_eq!(content, vec!["ok"]);
     }
 
     #[tokio::test]
