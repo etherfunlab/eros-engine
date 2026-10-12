@@ -461,6 +461,148 @@ async fn persist_affinity(
     }
 }
 
+/// One group speaker's output for post-process.
+#[allow(dead_code)] // called by the group turn
+pub struct GroupSpoken {
+    pub speaker_session_id: Uuid,
+    pub instance_id: Uuid,
+    pub name: String,
+    pub produced: Vec<ProducedMessage>,
+}
+
+fn group_relationship_memory_content(user_msg: &str) -> String {
+    format!("（群聊）{}", relationship_memory_content(user_msg))
+}
+
+/// Post-process for a group turn: no affinity, no feeling clause, no ghost
+/// streak. The user's line is embedded once and written to the profile layer
+/// and to every seated member's relationship layer; human_insights runs once;
+/// character/user insights run per speaker.
+#[allow(dead_code)] // called by the group turn
+pub async fn run_group(
+    state: AppState,
+    group_session_id: Uuid,
+    user_id: Uuid,
+    user_msg: String,
+    members: Vec<(Uuid, Uuid)>,
+    spoken: Vec<GroupSpoken>,
+) {
+    if !session_still_live(&state, group_session_id).await || user_msg.trim().is_empty() {
+        return;
+    }
+
+    let fut_memory = async {
+        let embedding = match state.embed.embed_document(&user_msg).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("group memory: embed failed: {e}");
+                return;
+            }
+        };
+        let repo = MemoryRepo { pool: &state.pool };
+        if session_still_live(&state, group_session_id).await {
+            if let Err(e) = repo
+                .upsert(
+                    MemoryLayer::Profile,
+                    group_session_id,
+                    user_id,
+                    None,
+                    &user_msg,
+                    &embedding,
+                    None,
+                    None,
+                )
+                .await
+            {
+                tracing::warn!("group profile memory upsert failed: {e}");
+            }
+        }
+        let rel = group_relationship_memory_content(&user_msg);
+        for (member_session_id, instance_id) in &members {
+            // The member's relationship may have been archived mid-turn.
+            if !session_still_live(&state, *member_session_id).await {
+                continue;
+            }
+            if let Err(e) = repo
+                .upsert(
+                    MemoryLayer::Relationship,
+                    group_session_id,
+                    user_id,
+                    Some(*instance_id),
+                    &rel,
+                    &embedding,
+                    None,
+                    None,
+                )
+                .await
+            {
+                tracing::warn!("group relationship memory upsert failed: {e}");
+            }
+        }
+    };
+
+    let fut_human = async {
+        let replies: Vec<String> = spoken
+            .iter()
+            .flat_map(|s| {
+                s.produced
+                    .iter()
+                    .filter(|m| !m.full_text.is_empty())
+                    .map(move |m| format!("{}：{}", s.name, m.full_text))
+            })
+            .collect();
+        let last_id = spoken
+            .iter()
+            .flat_map(|s| s.produced.iter())
+            .last()
+            .map(|m| m.message_id);
+        if let (false, Some(message_id)) = (replies.is_empty(), last_id) {
+            extract_insights(
+                &state,
+                group_session_id,
+                user_id,
+                message_id,
+                &user_msg,
+                &replies.join("\n"),
+                None,
+            )
+            .await;
+        }
+    };
+
+    let fut_speakers = async {
+        for s in &spoken {
+            for m in &s.produced {
+                if m.full_text.is_empty() {
+                    continue;
+                }
+                extract_character_insights(
+                    &state,
+                    group_session_id,
+                    s.instance_id,
+                    m.message_id,
+                    &user_msg,
+                    &m.full_text,
+                    None,
+                )
+                .await;
+                extract_user_insights(
+                    &state,
+                    group_session_id,
+                    s.instance_id,
+                    m.message_id,
+                    &user_msg,
+                    &m.full_text,
+                    None,
+                )
+                .await;
+            }
+        }
+    };
+
+    tokio::join!(fut_memory, fut_human, fut_speakers);
+}
+
 // ─── Memory layer ──────────────────────────────────────────────────
 
 /// Relationship-layer memory content for a turn. Stores only the user's
@@ -4594,6 +4736,99 @@ mod tests {
             affinity, 0,
             "persist_affinity's own recheck must stop load_or_create from recreating the row"
         );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_group_writes_memory_for_every_member_and_no_affinity(pool: sqlx::PgPool) {
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let user_id = Uuid::new_v4();
+        let (ia, ib) = (
+            seed_persona_instance(&pool, user_id).await,
+            seed_persona_instance(&pool, user_id).await,
+        );
+        let chat = ChatRepo { pool: &pool };
+        let (sa, sb) = (
+            chat.create_session(user_id, ia).await.unwrap().id,
+            chat.create_session(user_id, ib).await.unwrap().id,
+        );
+        let group: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, channel) VALUES ($1, 'group') RETURNING id",
+        )
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let embed_server = MockServer::start().await;
+        Mock::given(wm_path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [ { "embedding": vec![0.1_f32; 512] } ]
+            })))
+            .expect(1) // embedded once, written three times
+            .mount(&embed_server)
+            .await;
+        let embed_cfg = eros_engine_llm::model_config::ModelConfig::from_toml_str(&format!(
+            "[providers.mockembed]\nembeddings = \"{}/v1/embeddings\"\n\
+             [tasks.embedding]\nmodel = \"mock-embed@mockembed\"\n",
+            embed_server.uri()
+        ))
+        .unwrap();
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.embed = std::sync::Arc::new(
+            eros_engine_llm::embedding::EmbeddingRouter::from_config_with(&embed_cfg, |k| {
+                (k == "MOCKEMBED_API_KEY").then(|| "test-key".to_string())
+            })
+            .unwrap(),
+        );
+
+        run_group(
+            state,
+            group,
+            user_id,
+            "我下周去爬山".into(),
+            vec![(sa, ia), (sb, ib)],
+            vec![], // nobody's insight chain runs without configured tasks anyway
+        )
+        .await;
+
+        let rel: Vec<(Uuid, String)> = sqlx::query_as(
+            "SELECT instance_id, content FROM engine.companion_memories \
+             WHERE user_id = $1 AND instance_id IS NOT NULL ORDER BY instance_id",
+        )
+        .bind(user_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rel.len(),
+            2,
+            "one relationship row per seated member, speaker or not"
+        );
+        assert!(rel.iter().all(|(_, c)| c == "（群聊）用户：我下周去爬山"));
+        let profile: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.companion_memories WHERE user_id = $1 AND instance_id IS NULL",
+        )
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(profile, 1);
+        let mem_session: Uuid = sqlx::query_scalar(
+            "SELECT DISTINCT session_id FROM engine.companion_memories WHERE user_id = $1",
+        )
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(mem_session, group, "provenance is the group");
+        let affinity_rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM engine.companion_affinity WHERE user_id = $1")
+                .bind(user_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(affinity_rows, 0, "a group never creates or writes affinity");
     }
 
     /// Pins `embed_and_upsert`'s recheck (called from `write_turn`). The
