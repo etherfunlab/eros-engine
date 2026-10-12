@@ -248,7 +248,7 @@ async fn admit(
     member: Uuid,
 ) -> Result<Result<(), MemberRefusal>, sqlx::Error> {
     let row: Option<(Uuid, String, bool, Option<Uuid>)> = sqlx::query_as(
-        "SELECT user_id, channel, archived, instance_id FROM engine.chat_sessions WHERE id = $1",
+        "SELECT user_id, channel, archived, instance_id FROM engine.chat_sessions WHERE id = $1 FOR SHARE",
     )
     .bind(member)
     .fetch_optional(&mut **tx)
