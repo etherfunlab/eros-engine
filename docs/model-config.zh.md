@@ -584,6 +584,8 @@ BYOK hop 使用其请求中 `byok` 块的 `output_regex` 规则，而不是这�
 
 **图片能力上下文行。** 判断器上下文每轮必带一行——当本轮图片动作可用（请求带有 `image` 块，且 `[tasks.chat_image_prompt_compose]` 已配置——两者缺一不可）时为 `[图片能力] 本轮可发图=是`，否则为 `[图片能力] 本轮可发图=否`。prompt 作者应把 `本轮可发图=否` 当作硬约束（绝不要选 `reply_image` / `reply_text_image`——它们会被 `guard_action` 降级，白费 token 还会污染审计），把 `本轮可发图=是` 当作*允许*发图的开关，再按人格/语境决定要不要发（引擎不会因为"能发"就强制发图）。若下游 overlay 引用了这个 token，请逐字保留 `[图片能力] 本轮可发图=是/否`。
 
+只要还有被接受的 give 在起作用，引擎还会在 `[用户动作]` 之前加一行 `[身体状态]`，写明角色身上带着的余效（例如 `[身体状态] 3 杯「威士忌」，微醺，还在往上走`；见[接口参考](api-reference.zh.md#post-compchatsession_idmessagestream)）；没有时这一行不出现。
+
 **近期图片上下文行。** 判断器上下文里同样恒定带一行
 `[近期图片] 最近8条消息内已发图=<n> 张；上一条 AI 消息是图片=<是/否>（以本行计数为准，对话记录里的图片标记仅供参考）`。
 该数量由引擎按已落库的消息行统计，判断器无需自行去对话记录里清点图片标记；括号
@@ -625,7 +627,7 @@ PDE judge 不再写图片 prompt 种子——它只负责决定动作、`inner_s
 **没有肖像回退**——整条链失败直接返回一个带 provider 自己状态码的 HTTP 错误
 （该端点兼作合成器的调试面，报告失败而不是掩盖失败）。
 
-`[此刻穿着]` 是本轮穿着，取自请求的 `outfit` 或判官的 `clothing`，都没有时为 `（无）`；compose 端点固定发 `（无）`。`[身体状态]` 是角色因被接受的 give 而带着的余效（见[接口参考](api-reference.zh.md)），没有时为 `（无）`；compose 端点固定发 `（无）`。
+`[此刻穿着]` 是本轮穿着，取自请求的 `outfit` 或判官的 `clothing`，都没有时为 `（无）`；compose 端点固定发 `（无）`。`[身体状态]` 是角色因被接受的 give 而带着的余效（见[接口参考](api-reference.zh.md#post-compchatsession_idmessagestream)），没有时为 `（无）`；compose 端点固定发 `（无）`。
 
 ```toml
 [tasks.chat_image_prompt_compose]

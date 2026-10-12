@@ -135,8 +135,10 @@ handler（`pipeline::handlers`）从两个来源拼出画像 / 关系上下文�
   `chat_sessions.metadata.voice_bootstrap`，此后每轮原样重新注入（OpenRouter
   是无状态的，线路上不存在"只注入一次"这回事——之后的轮次也改不了它）。分三
   部分：默认中性档的 `human_insights` bullets（档位可由首轮的 `memory_scope`
-  调整），加上上一通语音通话最后 8 条消息渲染出的纯文字记录，以及通话所读亲密度那条记录所属的文字 session 的余效（见[接口参考](api-reference.zh.md)）。各部分各自独立
-  降级；组装失败时标记位不落，下一轮重试。
+  调整）；上一通语音通话最后 8 条消息渲染出的纯文字记录；以及通话所读亲密度
+  那条记录所属的文字 session 的余效（见
+  [接口参考](api-reference.zh.md#get-v2compsessionsession_ideffects)）。各部分
+  各自独立降级；组装失败时标记位不落，下一轮重试。
 - **逐轮召回** —— 与聊天路径相同的 `companion_memories` 检索（受
   `memory_scope` 门控，经 `memory_hygiene` 做跨层去重），但 K 值小得多：
   分组画像 1/类别 + 原始兜底 2 + 关系记忆 2（聊天路径是 2/4/3），整体包在

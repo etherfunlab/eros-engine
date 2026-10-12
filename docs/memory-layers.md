@@ -142,9 +142,12 @@ the request shape and [model-config.md](model-config.md) for the
   on every later turn (OpenRouter is stateless, so there is no "inject once"
   on the wire — later turns cannot change it). Three parts: `human_insights`
   bullets at Neutral tier by default (tunable via that first turn's
-  `memory_scope`), and the previous voice call's last 8 messages rendered as
-  a plain transcript, and the lingering effects of the text session the call reads its relationship line from (see [API reference](api-reference.md)). Each part degrades independently; a failed assembly
-  leaves the marker unwritten so the next turn retries.
+  `memory_scope`); the previous voice call's last 8 messages rendered as a
+  plain transcript; and the lingering effects of the text session the call
+  reads its relationship line from (see
+  [API reference](api-reference.md#get-v2compsessionsession_ideffects)).
+  Each part degrades independently; a failed assembly leaves the marker
+  unwritten so the next turn retries.
 - **Per-turn recall** — the same `companion_memories` search as the chat
   path (`memory_scope`-gated, cross-layer dedup via `memory_hygiene`) but at
   a much smaller K: grouped profile 1/category + raw fallback 2 +
