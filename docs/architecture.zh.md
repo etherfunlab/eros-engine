@@ -159,6 +159,7 @@ crates/
 ├── eros-engine-core/
 │   └── src/
 │       ├── affinity.rs       # 6 維向量 + 档位写入管线 + 時間衰退 + 標籤
+│       ├── effects.rs        # 被接受的 give 的余效（曲线 + active_effects）
 │       ├── ghost.rs          # 評分公式 + 4 層保護
 │       ├── pde.rs            # 規則型動作決策
 │       ├── persona.rs        # PersonaGenome + Instance + CompanionPersona
@@ -189,7 +190,7 @@ crates/
         ├── auth/             # AuthValidator trait + Supabase 實現 + 中間件
         ├── pipeline/         # stream（run_stream）/ handlers / post_process / dreaming / …
         ├── prompt.rs         # system prompt 構造（affinity → 行為指令）
-        ├── routes/           # health / companion / companion_stream / companion_async / insight / image_edit / voice / persona / session_open / persona_items / reaction / world_town / bff / dto / mod
+        ├── routes/           # health / companion / companion_stream / companion_async / insight / image_edit / voice / persona / session_open / session_effects / persona_items / reaction / world_town / bff / dto / mod
         └── openapi.rs        # utoipa ApiDoc 元數據
 ```
 

@@ -169,6 +169,7 @@ crates/
 ├── eros-engine-core/
 │   └── src/
 │       ├── affinity.rs       # 6-dim vector + grade pipeline + time decay + labels
+│       ├── effects.rs        # lingering effects of an accepted give (curves + active_effects)
 │       ├── ghost.rs          # score formula + 4-tier protection
 │       ├── pde.rs            # rules-based action decision
 │       ├── persona.rs        # PersonaGenome + Instance + CompanionPersona
@@ -199,7 +200,7 @@ crates/
         ├── auth/             # AuthValidator trait + Supabase impl + middleware
         ├── pipeline/         # stream (run_stream) / handlers / post_process / dreaming / …
         ├── prompt.rs         # system-prompt builder (affinity → directives)
-        ├── routes/           # health / companion / companion_stream / companion_async / insight / image_edit / voice / persona / session_open / persona_items / reaction / world_town / bff / dto / mod
+        ├── routes/           # health / companion / companion_stream / companion_async / insight / image_edit / voice / persona / session_open / session_effects / persona_items / reaction / world_town / bff / dto / mod
         └── openapi.rs        # utoipa ApiDoc spec metadata
 ```
 
