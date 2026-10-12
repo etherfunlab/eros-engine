@@ -480,6 +480,34 @@ impl<'a> ChatRepo<'a> {
         .await
     }
 
+    /// `metadata` of the session's newest `limit` text-channel user rows,
+    /// newest first: the turns a given item's lingering effect counts (spec
+    /// 2026-10-12-given-item-lingering-effects-design.md §3, §5). `before`
+    /// keeps only rows strictly before that row, in `history_up_to`'s
+    /// `(sent_at, id)` order; an anchor outside the session yields nothing.
+    /// `None` reads the newest rows.
+    pub async fn user_action_metadata(
+        &self,
+        session_id: Uuid,
+        before: Option<Uuid>,
+        limit: i64,
+    ) -> Result<Vec<Option<serde_json::Value>>, sqlx::Error> {
+        sqlx::query_scalar::<_, Option<serde_json::Value>>(
+            "SELECT m.metadata FROM engine.chat_messages m \
+             WHERE m.session_id = $1 AND m.role = 'user' AND m.channel IS NULL \
+               AND ($2::uuid IS NULL OR (m.sent_at, m.id) < \
+                    (SELECT a.sent_at, a.id FROM engine.chat_messages a \
+                      WHERE a.id = $2 AND a.session_id = $1)) \
+             ORDER BY m.sent_at DESC, m.id DESC \
+             LIMIT $3",
+        )
+        .bind(session_id)
+        .bind(before)
+        .bind(limit)
+        .fetch_all(self.pool)
+        .await
+    }
+
     /// Projection-narrowed read used by BFF endpoints (and any caller that
     /// doesn't need `extracted_facts` / idempotency / SSE metadata). Same
     /// DESC+reverse trick as `history()` so the result is chronological.
@@ -5749,5 +5777,119 @@ mod tests {
             .unwrap();
         assert_eq!(rows[0].reaction.as_deref(), Some("❤️"));
         assert!(rows[0].reacted_at.is_some());
+    }
+
+    async fn insert_user_row(
+        pool: &PgPool,
+        session_id: Uuid,
+        sent_at: &str,
+        metadata: serde_json::Value,
+        channel: Option<&str>,
+    ) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, sent_at, metadata, channel) \
+             VALUES ($1, 'user', '', $2::timestamptz, $3, $4) RETURNING id",
+        )
+        .bind(session_id)
+        .bind(sent_at)
+        .bind(metadata)
+        .bind(channel)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn user_action_metadata_reads_text_user_rows_newest_first_before_the_anchor(
+        pool: PgPool,
+    ) {
+        use serde_json::json;
+        let s = throwaway_session(&pool).await;
+        insert_user_row(&pool, s.id, "2026-10-01T09:00:00Z", json!({"n": 1}), None).await;
+        insert_row(&pool, s.id, "assistant", "a", "2026-10-01T09:01:00Z").await;
+        insert_user_row(
+            &pool,
+            s.id,
+            "2026-10-01T09:02:00Z",
+            json!({"n": 2}),
+            Some("product_qa"),
+        )
+        .await;
+        insert_user_row(&pool, s.id, "2026-10-01T09:03:00Z", json!({"n": 3}), None).await;
+        let anchor =
+            insert_user_row(&pool, s.id, "2026-10-01T09:04:00Z", json!({"n": 4}), None).await;
+        insert_user_row(&pool, s.id, "2026-10-01T09:05:00Z", json!({"n": 5}), None).await;
+        let repo = ChatRepo { pool: &pool };
+
+        let before = repo
+            .user_action_metadata(s.id, Some(anchor), 5)
+            .await
+            .unwrap();
+        assert_eq!(before, vec![Some(json!({"n": 3})), Some(json!({"n": 1}))]);
+
+        let newest = repo.user_action_metadata(s.id, None, 5).await.unwrap();
+        assert_eq!(
+            newest,
+            vec![
+                Some(json!({"n": 5})),
+                Some(json!({"n": 4})),
+                Some(json!({"n": 3})),
+                Some(json!({"n": 1})),
+            ]
+        );
+
+        let two = repo.user_action_metadata(s.id, None, 2).await.unwrap();
+        assert_eq!(two, vec![Some(json!({"n": 5})), Some(json!({"n": 4}))]);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn user_action_metadata_breaks_sent_at_ties_by_id(pool: PgPool) {
+        use serde_json::json;
+        let s = throwaway_session(&pool).await;
+        let at = "2026-10-01T09:00:00Z";
+        let mut ids = Vec::new();
+        for n in 0..3 {
+            ids.push((
+                insert_user_row(&pool, s.id, at, json!({"n": n}), None).await,
+                n,
+            ));
+        }
+        ids.sort_by_key(|a| std::cmp::Reverse(a.0)); // newest first = id descending on a tie
+        let anchor = ids[0].0;
+        let got = ChatRepo { pool: &pool }
+            .user_action_metadata(s.id, Some(anchor), 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            got,
+            vec![Some(json!({"n": ids[1].1})), Some(json!({"n": ids[2].1}))]
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn user_action_metadata_with_a_foreign_anchor_reads_nothing(pool: PgPool) {
+        use serde_json::json;
+        let s = throwaway_session(&pool).await;
+        let other = throwaway_session(&pool).await;
+        insert_user_row(&pool, s.id, "2026-10-01T09:00:00Z", json!({"n": 1}), None).await;
+        let foreign = insert_user_row(
+            &pool,
+            other.id,
+            "2026-10-01T10:00:00Z",
+            json!({"n": 9}),
+            None,
+        )
+        .await;
+        let repo = ChatRepo { pool: &pool };
+        assert!(repo
+            .user_action_metadata(s.id, Some(foreign), 5)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(repo
+            .user_action_metadata(s.id, Some(Uuid::new_v4()), 5)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }
