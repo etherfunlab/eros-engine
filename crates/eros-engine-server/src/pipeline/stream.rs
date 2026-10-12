@@ -2311,7 +2311,7 @@ pub(crate) enum PdeStatus {
 }
 
 impl PdeStatus {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             PdeStatus::Ok => "ok",
             PdeStatus::Empty => "empty",
@@ -2325,7 +2325,7 @@ impl PdeStatus {
     /// operation-scoped — one row per judge run — so it follows spec §2.2's
     /// rule: any `llm_attempts` entry ⇒ `upstream_error`, upstream wins.
     /// Classified from the failures, never from the arm that produced them.
-    fn for_operation(failures: &[eros_engine_llm::failure::AttemptFailure]) -> Self {
+    pub(crate) fn for_operation(failures: &[eros_engine_llm::failure::AttemptFailure]) -> Self {
         if operation_hit_upstream(failures) {
             PdeStatus::UpstreamError
         } else {

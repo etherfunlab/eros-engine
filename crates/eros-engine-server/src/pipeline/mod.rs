@@ -5,6 +5,7 @@
 
 pub mod chat_queue;
 pub mod dreaming;
+pub mod group_director;
 pub mod handlers;
 pub mod post_process;
 pub mod proactive;
