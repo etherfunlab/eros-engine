@@ -3870,6 +3870,74 @@ data: [DONE]\n\n";
         assert!(sys.contains("[关于他]\n- 城市：上海"), "{sys}");
     }
 
+    /// A failed effects read leaves the marker unwritten so the NEXT turn
+    /// retries (spec 2026-10-12-given-item-lingering-effects-design.md §8).
+    /// Only the effects part is broken: it reads `companion_affinity` through
+    /// `load_latest_for_pair`, while the turn's own affinity read degrades to
+    /// `None` without failing the turn.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_voice_turn_failed_effects_read_leaves_the_marker_unwritten(pool: sqlx::PgPool) {
+        let mock = bootstrap_mock().await;
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+        let text = seed_session(&pool, user_id, instance_id, "text").await;
+        AffinityRepo { pool: &pool }
+            .load_or_create(text, user_id, instance_id)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata, sent_at) \
+             VALUES ($1, 'user', '', $2, now() - make_interval(mins => 5))",
+        )
+        .bind(text)
+        .bind(serde_json::json!({"action": {"type": "give", "item": "cigarette", "quantity": 1, "response": "accept"}}))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let session_id = seed_session(&pool, user_id, instance_id, "voice").await;
+
+        sqlx::query("ALTER TABLE engine.companion_affinity RENAME TO companion_affinity_hidden")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let frames = run_bootstrap_turn(
+            &pool,
+            &mock,
+            session_id,
+            instance_id,
+            user_id,
+            "01J9BODY0000000000000004",
+            MemoryScope::default(),
+        )
+        .await;
+        assert_no_error_frame(&frames);
+        assert_eq!(
+            read_marker(&pool, session_id).await,
+            None,
+            "a failed effects read must not freeze the snapshot"
+        );
+
+        sqlx::query("ALTER TABLE engine.companion_affinity_hidden RENAME TO companion_affinity")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let frames = run_bootstrap_turn(
+            &pool,
+            &mock,
+            session_id,
+            instance_id,
+            user_id,
+            "01J9BODY0000000000000005",
+            MemoryScope::default(),
+        )
+        .await;
+        assert_no_error_frame(&frames);
+        let marker = read_marker(&pool, session_id)
+            .await
+            .expect("the retry wrote the marker");
+        assert_eq!(marker["effects"][0]["item"], "cigarette");
+    }
+
     // ─── per-turn recall, end to end ────────────────────────────────────
     //
     // The embedding leg is mocked by pointing `[tasks.embedding]` at a custom
