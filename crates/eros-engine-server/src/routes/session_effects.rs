@@ -324,12 +324,18 @@ mod tests {
         let owner = Uuid::new_v4();
         let instance_id = seed_persona_instance(&pool, owner).await;
         let session_id = seed_session(&pool, owner, instance_id).await;
-        let (_, body) = get_judged(pool.clone(), session_id, owner).await;
-        assert!(body["needs"].is_null(), "{body}");
+        let (s, body) = get_judged(pool.clone(), session_id, owner).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(body.get("needs"), Some(&serde_json::Value::Null), "{body}");
         user_row(&pool, session_id, 10,
             json!({"needs": {"hunger": "high", "social": "mid", "stamina": "mid", "emotional": "mid"}})).await;
-        let (_, body) = get(pool, session_id, owner).await;
-        assert!(body["needs"].is_null(), "no judge configured: {body}");
+        let (s, body) = get(pool, session_id, owner).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(
+            body.get("needs"),
+            Some(&serde_json::Value::Null),
+            "no judge configured: {body}"
+        );
     }
 
     #[test]
