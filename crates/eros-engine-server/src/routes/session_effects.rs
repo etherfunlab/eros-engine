@@ -111,10 +111,12 @@ pub struct EffectsResponse {
     /// The persona's needs carried to now; `null` with no rating, or when the
     /// deployment runs no LLM judge.
     pub needs: Option<NeedsView>,
+    /// The persona's event under way now, or `null`.
+    pub event: Option<crate::routes::session_events::EventView>,
 }
 
-/// The persona's lingering state from accepted gives and her needs, as a text
-/// turn sent now would carry them.
+/// The persona's lingering state from accepted gives, her needs and the event
+/// under way, as a text turn sent now would carry them.
 #[utoipa::path(
     get,
     path = "/v2/comp/session/{session_id}/effects",
@@ -142,9 +144,14 @@ async fn get_effects(
     } else {
         None
     };
+    let event = eros_engine_store::chat::ChatRepo { pool: &state.pool }
+        .current_event(instance_id, None, chrono::Utc::now())
+        .await?
+        .map(|c| crate::routes::session_events::EventView::from(&c.event));
     Ok(Json(EffectsResponse {
         effects: effects.iter().map(EffectView::from).collect(),
         needs: needs.as_ref().map(NeedsView::from),
+        event,
     }))
 }
 
@@ -233,7 +240,7 @@ mod tests {
             json!({"effects": [
                 {"item": "cigarette", "quantity": 1, "level": 3, "phase": "peak", "step": 1, "steps": 1},
                 {"item": "alcohol", "name": "威士忌", "quantity": 3, "level": 3, "phase": "peak", "step": 3, "steps": 3},
-            ], "needs": null})
+            ], "needs": null, "event": null})
         );
     }
 
@@ -244,7 +251,38 @@ mod tests {
         let session_id = seed_session(&pool, owner, instance_id).await;
         let (s, body) = get(pool, session_id, owner).await;
         assert_eq!(s, StatusCode::OK);
-        assert_eq!(body, json!({"effects": [], "needs": null}));
+        assert_eq!(body, json!({"effects": [], "needs": null, "event": null}));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_event_under_way_is_listed(pool: sqlx::PgPool) {
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, owner).await;
+        let session_id = seed_session(&pool, owner, instance_id).await;
+        let started = chrono::Utc::now() - chrono::Duration::minutes(30);
+        let ends = started + chrono::Duration::hours(4);
+        let row = eros_engine_store::chat::ChatRepo { pool: &pool }
+            .insert_event_message(
+                instance_id,
+                session_id,
+                started,
+                &eros_engine_store::chat::ProactiveInsert {
+                    id: Uuid::new_v4(),
+                    content: "临时被叫去加班".into(),
+                    generation_id: None,
+                    metadata: json!({"proactive": "event", "event_key": "k1",
+                        "event": {"kind": "temp_work", "ends_at": ends.to_rfc3339()}}),
+                    llm_attempts: None,
+                    gateway_errors: None,
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let (s, body) = get(pool, session_id, owner).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(body["event"]["kind"], json!("temp_work"));
+        assert_eq!(body["event"]["message_id"], json!(row.id));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
