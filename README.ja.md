@@ -58,9 +58,9 @@ cargo add eros-engine-core eros-engine-store eros-engine-llm
 
 ```toml
 [dependencies]
-eros-engine-core  = "1.0"
-eros-engine-store = "1.0"   # optional: Postgres + pgvector persistence
-eros-engine-llm   = "1.0"   # optional: model and embedding clients
+eros-engine-core  = "2.2"
+eros-engine-store = "2.2"   # optional: Postgres + pgvector persistence
+eros-engine-llm   = "2.2"   # optional: model and embedding clients
 ```
 
 `eros-engine-server` は crates.io では公開していません。Docker イメージで実行してください。
