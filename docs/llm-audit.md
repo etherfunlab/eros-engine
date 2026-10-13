@@ -784,6 +784,8 @@ describe ran and failed on every chain model" (`exhausted`).
 | No content (failures only), with reasoning | `{"reasoning": "…"}` |
 | No content, no reasoning | NULL |
 
+A parsed verdict includes `"needs"` when the judge rated them. `inputs` carries `"needs"`: the levels the `[需求]` line showed, or `null`.
+
 When the call falls back to another model, the reasoning of every attempt is kept, concatenated. A judge that streams reasoning but no content falls back to the rule engine; its row has status `empty` and `{"reasoning": "…"}`. The reasoning is the replay corpus for tuning the judge's `filter_prompt`.
 
 ## Group director

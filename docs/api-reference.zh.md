@@ -115,7 +115,7 @@ data: {"type":"final","filtered":false,"prompt_injected":null,"tier":null,"retri
 - **`cast`**、**`speaker_error`** —— 仅群聊轮次，见 [group-chat.zh.md](group-chat.zh.md#一轮)。1:1 流不会发这两种帧。
 - **`reasoning`** —— `content`：PDE 判断器推理文本的一段（`{"type":"reasoning","content":"…"}`）。零条或多条，最先发出，排在 `action_response`、`body_state` 和第一个 `meta` 之前。只要判断器的模型返回了推理就会出现；body 规则可以打开推理，`reasoning = { enabled = false }` 或 `{ exclude = true }` 可以关闭（见 [model-config.zh.md](model-config.zh.md)）。判断器没有返回推理时，1:1 的帧序列不变。内容仅供展示，不决定任何事；完整显示、折叠还是做成“思考中”提示，由客户端自行决定。判断器回退到别的模型时，那个模型的推理接着往后追加，不发重置帧。群聊轮次的导演在 `cast` 之前发同样的帧。
 - **`action_response`** —— 只在带 `action` 的回合出现：`user_message_id` 和 `response`（`"accept"` | `"refuse"`）。在第一个 `meta` 之前发一次，幂等重放时会重发（`reasoning` 帧不落库，重放时不重发）。客户端必须容忍不认识的帧类型。之后若该回合以 `error` 结束，这一轮就没有生效，历史里也不带它的 `response`。
-- **`body_state`** —— 有被接受的 `give` 仍在起作用的回合才有：`user_message_id` 和 `effects`，新的 give 在前，每项 `{item, name?, quantity, level, phase, step, steps}`（`level` 1–4，`phase` 为 `rising` | `peak` | `fading`，`steps` 中的第 `step` 步）。描述的是这一回合回复写成时的状态。只发一次，在 `action_response`（若有）之后、第一个 `meta` 之前，幂等重放时重发。没有余效时不发。
+- **`body_state`** —— 这一回合回复写成时角色的状态：`user_message_id`；`effects`，仍在起作用的被接受的 give，新的在前，每项 `{item, name?, quantity, level, phase, step, steps}`（`level` 1–4，`phase` 为 `rising` | `peak` | `fading`，`steps` 中的第 `step` 步），没有时为 `[]`；`needs`，`{hunger, social, stamina, emotional}`，各为 `low` | `mid` | `high`，没有判定时为 `null`（只有配置了 LLM 判官才有需求，见 [model-config.zh.md](model-config.zh.md)）。有余效或已知需求时发，只发一次，在 `action_response`（若有）之后、第一个 `meta` 之前，幂等重放时重发。
 
 **失败轮次在历史里的样子。** 以 `error` 结束的轮次没有生效：亲密度没有变化，动作轮次的用户行不带 `response`。通常还会留下一条 `system_error` 通知，它的 `user_message_id` 指向那条用户行。如果轮次失败之前已经有失败的回复尝试落库，就不留通知：回复链用尽时没有兜底话术可发（没有配置，或者整条链都是 BYOK，见 [byok.zh.md](byok.zh.md)），或者某一跳失败之后整轮超时。这时队列行按 `done` 结算，历史里保留每次失败尝试的 assistant 行，内容为空，或是它流出过的半截文本。async 端点的轮次走同一条管线，但最多可以尝试 `CHAT_QUEUE_MAX_ATTEMPTS` 次：还没有任何回复尝试落库就失败的会重试，只有最后一次尝试按上面的方式结算；已经有回复尝试落库之后才失败的不再重试。
 
@@ -499,7 +499,7 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 - `ghost`：`meta(action_type=ghost) → done → final` — 无 `delta`，`meta` 中无 `model`，`done` 的 `usage` 和 `generation_id` 均为 `null`。该轮伴侣保持沉默，未调用任何 LLM。
 - 带推理的回合：判官返回了推理时，`reasoning*` 排在这份列表里每种形状的最前面，在 `action_response` 和 `body_state` 之前：`reasoning* → meta(reply) → delta* → done → final`
 - 动作轮次：形状相同，只是 `action_response` 排在第一个 `meta` 之前——`action_response → meta(reply) → delta* → done → final`；不会是 `ghost` 或 `product_qa`
-- 带余效的回合：`body_state` 位于第一个 `meta` 之前，两者都发时排在 `action_response` 之后——例如 `action_response → body_state → meta(reply) → delta* → done → final`
+- 带余效或已知需求的回合：`body_state` 位于第一个 `meta` 之前，两者都发时排在 `action_response` 之后——例如 `action_response → body_state → meta(reply) → delta* → done → final`
 - `product_qa`：`meta(action_type=product_qa) → delta* → done → final` — 形状与普通文本回复相同，由独立的模型链（`[tasks.chat_product_qa]`）流式生成，而非 `chat_companion`；落库时带 `channel='product_qa'`，重放时同样报告为 `product_qa`。
 
 引擎从不绘图，也不存在任何绘图生命周期帧：消费方收到 `image_request` 后自行调用图像供应商。
@@ -720,10 +720,11 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 
 ### `GET /v2/comp/session/{session_id}/effects`
 
-角色因被接受的 give 而带着的余效，即此刻发一句文字消息时会带上的状态：供打开会话的页面和收不到帧的异步调用方使用。接受消耗品的那一回合刚结束，这个路由就已列出它的第 1 步，而那一回合没有发 `body_state` 帧：帧描述刚写成的那句回复，路由描述角色此刻的样子。
+角色因被接受的 give 而带着的余效和她的需求，即此刻发一句文字消息时会带上的状态：供打开会话的页面和收不到帧的异步调用方使用。接受消耗品的那一回合刚结束，这个路由就已列出它的第 1 步，而那一回合没有发 `body_state` 帧：帧描述刚写成的那句回复，路由描述角色此刻的样子。`needs` 是角色带到此刻的需求（形状与 `body_state` 帧里的一致），没有判定或没有配置 LLM 判官时为 `null`。
 
 ```json
-{"effects": [{"item": "alcohol", "name": "威士忌", "quantity": 3, "level": 2, "phase": "rising", "step": 2, "steps": 3}]}
+{"effects": [{"item": "alcohol", "name": "威士忌", "quantity": 3, "level": 2, "phase": "rising", "step": 2, "steps": 3}],
+ "needs": {"hunger": "high", "social": "mid", "stamina": "low", "emotional": "mid"}}
 ```
 
 没有余效时为 `{"effects": []}`。错误同 `/open`：`404 session_not_found`、`403 session_forbidden`，语音 session 为 `409 wrong_channel`。
@@ -904,7 +905,7 @@ session 返回 404 的行为，与上面的 history 路由完全一致。
 
 返回 `text/event-stream`，帧集合更小：`delta`* 之后接一个终结的 `done`，或者
 单独一个 `error`——帧的形状与上面的聊天消息流一致，但**没有** `meta` 帧，也没有
-`action_type`。带余效的通话，每一轮都会在第一个 `delta` 之前发一个与聊天消息流形状相同的
+`action_type`。带余效或需求的通话，每一轮都会在第一个 `delta` 之前发一个与聊天消息流形状相同的
 `body_state` 帧。
 
 session 必须是**语音频道** session（否则 `409 wrong_channel`）——通过
@@ -926,8 +927,8 @@ prompt 精简但不再失忆：人格 + 语音指令 + 首轮生成、此后每�
 此后每轮原样重新注入——provider 是无状态的，线路上不存在"只注入一次"这回事）：
 一个 `[关于他]` 块（`human_insights` bullets，默认中性档，见下面的
 `memory_scope`）加一个 `[上次通话]` 块（上一通语音通话最后 8 条消息渲染出的
-文字记录）加一个 `[身体状态]` 块（通话所读亲密度那条记录所属的文字 session 的余效；
-整通电话保持这份状态、不推进）。三部分各自独立、静默降级——组装失败时标记位不落，下一轮重试。
+文字记录）加一个 `[身体状态]` 块（通话所读亲密度那条记录所属的文字 session 的余效，以及通话开始时角色的需求；
+整通电话保持这份状态、不推进）。四部分各自独立、静默降级——组装失败时标记位不落，下一轮重试。
 
 **每轮召回**（每轮都跑，只读）：对聊天路径同样的 `companion_memories` 分层
 做一次更小的向量检索，受 `memory_scope` 门控，300 ms 预算内完成——超时或
@@ -1674,7 +1675,7 @@ session 403）。
 - `crates/eros-engine-server/src/routes/companion_stream.rs`——流式对话轮（`message/stream`），含动作 + `image_url` 处理
 - `crates/eros-engine-server/src/routes/companion_async.rs`——只入队的对话轮（`v2/comp/session/{session_id}/message/async`）
 - `crates/eros-engine-server/src/routes/session_open.rs`——角色先开口：生日、节日开场白与调用方指定的场合（`v2/comp/session/{session_id}/open`）
-- `crates/eros-engine-server/src/routes/session_effects.rs`——角色因被接受的 give 而带着的余效（`v2/comp/session/{session_id}/effects`）
+- `crates/eros-engine-server/src/routes/session_effects.rs`——角色因被接受的 give 而带着的余效和她的需求（`v2/comp/session/{session_id}/effects`）
 - `crates/eros-engine-server/src/routes/group.rs`——群管理与群发送路由（`v2/comp/group*`）
 - `crates/eros-engine-server/src/routes/reaction.rs`——消息 reaction：设置、撤销与允许列表（`v2/comp/session/{session_id}/message/{message_id}/reaction`、`v2/comp/reactions`）
 - `crates/eros-engine-server/src/routes/insight.rs`——按关系分开的 v2 画像端点（`v2/comp/instance/{instance_id}/insight/character`、`.../insight/user`）

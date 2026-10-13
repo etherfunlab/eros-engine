@@ -123,7 +123,7 @@ Frame fields worth noting:
 - **`cast`**, **`speaker_error`** — group turns only; see [group-chat.md](group-chat.md#one-turn). A 1:1 stream never emits them.
 - **`reasoning`** — `content`: a piece of the PDE judge's reasoning text (`{"type":"reasoning","content":"…"}`). Zero or more, sent first, ahead of `action_response`, `body_state` and the first `meta`. They appear whenever the judge's model returns reasoning; a body rule can turn reasoning on, and `reasoning = { enabled = false }` or `{ exclude = true }` turns it off (see [model-config.md](model-config.md)). When the judge returns none, the 1:1 frame sequence is unchanged. The content is display-only and decides nothing; whether to show it in full, collapsed or as a "thinking" indicator is the client's choice. When the judge falls back to another model, that model's reasoning keeps appending; no reset frame is sent. A group turn's director streams the same frame before `cast`.
 - **`action_response`** — on a turn that carries an `action` only: `user_message_id` and `response` (`"accept"` | `"refuse"`). Sent once, before the first `meta`, and re-sent on an idempotent replay (`reasoning` frames are not persisted and are not re-sent). Clients must tolerate frame types they do not know. A turn that then ends in `error` did not take effect, and history carries no `response` for it.
-- **`body_state`** — on a turn where an accepted `give` is still at work: `user_message_id` and `effects`, newest give first, each `{item, name?, quantity, level, phase, step, steps}` (`level` 1–4, `phase` `rising` | `peak` | `fading`, `step` of `steps`). It describes the state this turn's reply was written with. Sent once, after `action_response` (if any) and before the first `meta`, and re-sent on an idempotent replay. Absent when nothing is at work.
+- **`body_state`** — the persona's state this turn's reply was written with: `user_message_id`; `effects`, the accepted gives still at work, newest first, each `{item, name?, quantity, level, phase, step, steps}` (`level` 1–4, `phase` `rising` | `peak` | `fading`, `step` of `steps`), `[]` when none; and `needs`, `{hunger, social, stamina, emotional}` each `low` | `mid` | `high`, or `null` when there is no rating (needs exist only with the LLM judge, see [model-config.md](model-config.md#taskspde_decision--opt-in-llm-pde-judge)). Sent once, when effects are at work or needs are known, after `action_response` (if any) and before the first `meta`, and re-sent on an idempotent replay.
 
 **A failed turn in history.** A turn that ends in `error` did not take effect: affinity did not move, and an action turn's user row carries no `response`. It usually also leaves a `system_error` notice whose `user_message_id` names that user row. It leaves none when a failed reply attempt was already saved before the turn failed: the reply chain ran out with no fallback phrase to serve (none is configured, or the chain is BYOK-only, see [byok.md](byok.md)), or the turn timed out after a hop had already failed. The queue row then settles `done`, and history keeps each failed attempt's assistant row: empty, or the partial text it streamed. An async turn runs the same pipeline but gets up to `CHAT_QUEUE_MAX_ATTEMPTS` attempts: one that fails before any reply attempt was saved is retried, and only its last attempt is settled as above. One that fails after a reply attempt was saved is not retried.
 
@@ -591,7 +591,7 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 - `ghost`: `meta(action_type=ghost) → done → final` — no `delta`, no `model` in `meta`, `usage` and `generation_id` are `null` in `done`. The companion stayed silent this turn; no LLM was called.
 - reasoning: when the judge returned reasoning, `reasoning*` precedes every shape in this list, ahead of `action_response` and `body_state`: `reasoning* → meta(reply) → delta* → done → final`
 - action turn: the same shapes with `action_response` ahead of the first `meta` — `action_response → meta(reply) → delta* → done → final`; never `ghost` or `product_qa`
-- a turn with lingering effects: `body_state` sits ahead of the first `meta`, after `action_response` when both are sent — e.g. `action_response → body_state → meta(reply) → delta* → done → final`
+- a turn with lingering effects or known needs: `body_state` sits ahead of the first `meta`, after `action_response` when both are sent — e.g. `action_response → body_state → meta(reply) → delta* → done → final`
 - `product_qa`: `meta(action_type=product_qa) → delta* → done → final` — same shape as a normal text reply, streamed by an independent model chain (`[tasks.chat_product_qa]`) instead of `chat_companion`; persisted with `channel='product_qa'` and reported as `product_qa` again on replay.
 
 The engine never draws and no draw-lifecycle frames exist: the consumer
@@ -872,10 +872,11 @@ occasion that is not true of the session returns `null` without generating.
 
 ### `GET /v2/comp/session/{session_id}/effects`
 
-The persona's lingering state from accepted gives, as a text turn sent now would carry it: for a page that opens on a conversation, and for async callers, which receive no frames. Right after the turn that accepted a consumable, this route already lists it at step 1, while that turn sent no `body_state` frame: the frame describes the reply just written, the route the persona as she is now.
+The persona's lingering state from accepted gives and her needs, as a text turn sent now would carry them: for a page that opens on a conversation, and for async callers, which receive no frames. Right after the turn that accepted a consumable, this route already lists it at step 1, while that turn sent no `body_state` frame: the frame describes the reply just written, the route the persona as she is now. `needs` is the persona's needs carried to now (the same shape as on the `body_state` frame), or `null` with no rating or without the LLM judge.
 
 ```json
-{"effects": [{"item": "alcohol", "name": "威士忌", "quantity": 3, "level": 2, "phase": "rising", "step": 2, "steps": 3}]}
+{"effects": [{"item": "alcohol", "name": "威士忌", "quantity": 3, "level": 2, "phase": "rising", "step": 2, "steps": 3}],
+ "needs": {"hunger": "high", "social": "mid", "stamina": "low", "emotional": "mid"}}
 ```
 
 `{"effects": []}` when nothing is at work. Errors as `/open`: `404 session_not_found`, `403 session_forbidden`, `409 wrong_channel` for a voice session.
@@ -1094,7 +1095,7 @@ never touches audio (see the
 Returns `text/event-stream` with a reduced frame set: `delta`* then a
 terminal `done`, or a single `error` — the same frame shapes as the chat
 message stream above, but with **no** `meta` frame and no `action_type`.
-On every turn of a call that carries lingering effects, a `body_state` frame
+On every turn of a call that carries lingering effects or needs, a `body_state` frame
 of the same shape as in the chat message stream precedes the first `delta`.
 
 The session must be a **voice-channel** session (`409 wrong_channel`
@@ -1124,7 +1125,7 @@ the provider is stateless, so there is no "inject once" on the wire): a
 `memory_scope` below) plus a `[上次通话]` block, the previous voice call's
 last 8 messages rendered as a transcript, plus a `[身体状态]` block, the
 lingering effects of the text session the call reads its relationship line
-from. The call keeps that state and does not advance it. The three parts
+from and the persona's needs at the call's start. The call keeps that state and does not advance it. The four parts
 degrade independently and silently — a failed assembly leaves the marker unwritten
 so the next turn retries.
 
@@ -1983,7 +1984,7 @@ refusals too. The table below covers the plain shape:
 - `crates/eros-engine-server/src/routes/companion_stream.rs` — streaming chat turn (`message/stream`), incl. actions + `image_url` handling
 - `crates/eros-engine-server/src/routes/companion_async.rs` — enqueue-only chat turn (`v2/comp/session/{session_id}/message/async`)
 - `crates/eros-engine-server/src/routes/session_open.rs` — the persona speaking first: birthday and holiday greetings and caller-named occasions (`v2/comp/session/{session_id}/open`)
-- `crates/eros-engine-server/src/routes/session_effects.rs` — the persona's lingering state from accepted gives (`v2/comp/session/{session_id}/effects`)
+- `crates/eros-engine-server/src/routes/session_effects.rs` — the persona's lingering state from accepted gives and her needs (`v2/comp/session/{session_id}/effects`)
 - `crates/eros-engine-server/src/routes/group.rs` — group management and the group send route (`v2/comp/group*`)
 - `crates/eros-engine-server/src/routes/reaction.rs` — message reactions: set, clear and the allowlist (`v2/comp/session/{session_id}/message/{message_id}/reaction`, `v2/comp/reactions`)
 - `crates/eros-engine-server/src/routes/insight.rs` — v2 relationship-scoped insight profiles (`v2/comp/instance/{instance_id}/insight/character`, `.../insight/user`)

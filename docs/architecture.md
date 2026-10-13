@@ -174,6 +174,7 @@ crates/
 │       ├── effects.rs        # lingering effects of an accepted give (curves + active_effects)
 │       ├── ghost.rs          # score formula + 4-tier protection
 │       ├── group.rs          # group director normalization, fallback cast, transcript roles
+│       ├── needs.rs          # the persona's four needs (levels + time carry-forward)
 │       ├── pde.rs            # rules-based action decision
 │       ├── persona.rs        # PersonaGenome + Instance + CompanionPersona
 │       ├── scope.rs          # per-request injection scope (InsightMode / MemoryScope)

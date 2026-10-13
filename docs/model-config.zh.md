@@ -589,6 +589,7 @@ BYOK hop 使用其请求中 `byok` 块的 `output_regex` 规则，而不是这�
   - `reply_mode`（选填）：这一轮回复与用户消息的关系——`"listen"` / `"follow"` / `"ask"` / `"judge"`，拿不准就 `null`（由引擎的每轮骰子接管）。会切换 reply prompt 铁律 ① 的文案；`listen` 同时把回复长度上限降一档
   - `clothing`（选填）：角色此刻的穿着，一句话。上下文里有 `[你的衣柜]` 时判官应从中挑选；有 `[指定穿着]` 时 engine 采用指定的穿着并忽略本字段。注入 reply prompt 的 `[character_state]` 区块内的一行，也进画图 composer 的 `[此刻穿着]` 槽；缺省则不注入
   - `action_response`（选填）：本轮带用户动作时（上下文里会有 `[用户动作]` 一行）填 `"accept"` 或 `"refuse"`；其他回合或拿不准时填 `null`。`null`、判官调用失败、规则 PDE 一律按接受处理。拒绝会让该动作对应的亲密度线降一档（见 [affinity-model.zh.md](affinity-model.zh.md)）。动作回合里 `ghost` 和 `product_qa` 会改判为 `reply_text`，也不掷每轮骰子
+  - `needs`（选填）：角色此刻的四项基本需要 `{hunger, social, stamina, emotional}`，各为 `"low"` | `"mid"` | `"high"`（`high` = 很饿 / 很想找人说话 / 精力充沛 / 很需要被在乎），写 `null` 表示沿用上次的判定。判官只评角色自己，不评两人的关系。判定存在本轮的用户消息上；两次判定之间由引擎按时间推算：饥饿每 4 小时升一档，社交欲每 12 小时升一档，体力每 8 小时向 `mid` 靠一档，情感需求每 12 小时向 `mid` 靠一档。不在 `mid` 的档位会作为 `[character_state]` 里的一行进入回复。无法解析的值会被忽略，不会让整个裁决失败。
   - `reason`：可选
 - **Fail-open：**任何 LLM 超时或错误都会回退到规则引擎——LLM 判断器绝不会阻塞 chat 响应。
 - **`timeout_secs`**（选填，默认 `15`）：每次尝试的时限，从发起调用到读完为止共用一个截止时间。超时的尝试算失败，调用转向链上的下一个模型。取值范围 1–3600；写 `0` 会拒绝启动（判断器每轮都会超时），超过 3600 同样拒绝启动。只在 `[tasks.pde_decision]` 上读取，其他任务忽略。判断器的最坏耗时是 `timeout_secs × (1 + retry_depth)`；它加上回复的耗时若超过 `CHAT_QUEUE_GEN_TIMEOUT_SECS`（默认 300），这一轮会以 `generation_timeout` 结束，而不是走回退。
@@ -602,11 +603,13 @@ BYOK hop 使用其请求中 `byok` 块的 `output_regex` 规则，而不是这�
 
   `reasoning = { enabled = false }` 或 `{ exclude = true }`（非 OpenRouter 端点用供应商对应的参数）可以关闭推理。帧在回复之前发出（见 [api-reference.zh.md](api-reference.zh.md)）。推理 token 计入该任务的 `max_tokens`，所以要和 `timeout_secs` 一起调高。回复要等判断器，首个 token 的延迟会增加判断器思考所花的时间。
 - **硬安全 guardrail**（在 LLM verdict 之后、规则引擎 fallback 之前强制执行）：前 10 条消息绝不 ghost，绝不连续 ghost 第三次（`ghost_streak ≥ 2` 否决；连两次是允许的），ghost cooldown 为一小时。
-- 每次判断器调用都会记录到 `companion_decision_events` 以供审计：`payload` 是模型返回的内容；`inputs`（JSONB，迁移 `0044`）冻结判断器当时看到的引擎计算状态——亲密度档位、耐心档位、bond/chemistry 与六个原始轴。fire-and-forget 写入；历史行保持 `NULL`。
+- 每次判断器调用都会记录到 `companion_decision_events` 以供审计：`payload` 是模型返回的内容；`inputs`（JSONB，迁移 `0044`）冻结判断器当时看到的引擎计算状态——亲密度档位、耐心档位、bond/chemistry 与六个原始轴，以及 `[需求]` 行里给判官看的需求（没有时为 `null`）。fire-and-forget 写入；历史行保持 `NULL`。
 
 **图片能力上下文行。** 判断器上下文每轮必带一行——当本轮图片动作可用（请求带有 `image` 块，且 `[tasks.chat_image_prompt_compose]` 已配置——两者缺一不可）时为 `[图片能力] 本轮可发图=是`，否则为 `[图片能力] 本轮可发图=否`。prompt 作者应把 `本轮可发图=否` 当作硬约束（绝不要选 `reply_image` / `reply_text_image`——它们会被 `guard_action` 降级，白费 token 还会污染审计），把 `本轮可发图=是` 当作*允许*发图的开关，再按人格/语境决定要不要发（引擎不会因为"能发"就强制发图）。若下游 overlay 引用了这个 token，请逐字保留 `[图片能力] 本轮可发图=是/否`。
 
 只要还有被接受的 give 在起作用，引擎还会在 `[用户动作]` 之前加一行 `[身体状态]`，写明角色身上带着的余效（例如 `[身体状态] 3 杯「威士忌」，微醺，还在往上走`；见[接口参考](api-reference.zh.md#post-compchatsession_idmessagestream)）；没有时这一行不出现。
+
+**需求上下文行。** 每个有判官的回合，上下文里都有一行 `[需求]`，位于 `[身体状态]` 之前：`[需求] 饥饿=高 社交欲=低 体力=中 情感需求=中`，即上一次判定推算到本回合的结果；第一次判定之前为 `[需求] 尚未判定`。
 
 **近期图片上下文行。** 判断器上下文里同样恒定带一行
 `[近期图片] 最近8条消息内已发图=<n> 张；上一条 AI 消息是图片=<是/否>（以本行计数为准，对话记录里的图片标记仅供参考）`。

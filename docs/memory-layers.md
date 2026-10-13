@@ -142,12 +142,13 @@ the request shape and [model-config.md](model-config.md) for the
 - **Bootstrap snapshot** — assembled once, on a session's first turn, and
   frozen into `chat_sessions.metadata.voice_bootstrap`; re-injected verbatim
   on every later turn (OpenRouter is stateless, so there is no "inject once"
-  on the wire — later turns cannot change it). Three parts: `human_insights`
+  on the wire — later turns cannot change it). Four parts: `human_insights`
   bullets at Neutral tier by default (tunable via that first turn's
   `memory_scope`); the previous voice call's last 8 messages rendered as a
-  plain transcript; and the lingering effects of the text session the call
+  plain transcript; the lingering effects of the text session the call
   reads its relationship line from (see
-  [API reference](api-reference.md#get-v2compsessionsession_ideffects)).
+  [API reference](api-reference.md#get-v2compsessionsession_ideffects));
+  and the persona's needs at the call's start.
   Each part degrades independently; a failed assembly leaves the marker
   unwritten so the next turn retries.
 - **Per-turn recall** — the same `companion_memories` search as the chat

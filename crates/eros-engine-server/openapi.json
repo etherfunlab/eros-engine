@@ -2003,7 +2003,7 @@
         "tags": [
           "companion"
         ],
-        "summary": "The persona's lingering state from accepted gives, as a text turn sent now\nwould carry it.",
+        "summary": "The persona's lingering state from accepted gives and her needs, as a text\nturn sent now would carry them.",
         "operationId": "get_effects",
         "parameters": [
           {
@@ -3848,6 +3848,17 @@
               "$ref": "#/components/schemas/EffectView"
             },
             "description": "Newest give first; empty when nothing is at work."
+          },
+          "needs": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/NeedsView",
+                "description": "The persona's needs carried to now; `null` with no rating, or when the\ndeployment runs no LLM judge."
+              }
+            ]
           }
         }
       },
@@ -4687,6 +4698,39 @@
           "session_id": {
             "type": "string",
             "format": "uuid"
+          }
+        }
+      },
+      "NeedLevelDto": {
+        "type": "string",
+        "description": "One need's level.",
+        "enum": [
+          "low",
+          "mid",
+          "high"
+        ]
+      },
+      "NeedsView": {
+        "type": "object",
+        "description": "The persona's four needs (spec 2026-10-13-persona-needs-design.md §3).\nAlso the `needs` shape of the `body_state` stream frame.",
+        "required": [
+          "hunger",
+          "social",
+          "stamina",
+          "emotional"
+        ],
+        "properties": {
+          "emotional": {
+            "$ref": "#/components/schemas/NeedLevelDto"
+          },
+          "hunger": {
+            "$ref": "#/components/schemas/NeedLevelDto"
+          },
+          "social": {
+            "$ref": "#/components/schemas/NeedLevelDto"
+          },
+          "stamina": {
+            "$ref": "#/components/schemas/NeedLevelDto"
           }
         }
       },
