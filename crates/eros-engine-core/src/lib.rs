@@ -3,6 +3,7 @@
 
 pub mod affinity;
 pub mod effects;
+pub mod events;
 pub mod ghost;
 pub mod group;
 pub mod needs;
