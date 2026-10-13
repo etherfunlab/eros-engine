@@ -10,7 +10,7 @@
 
 每個 `/comp/*` 跟 `/bff/v1/*` 端點都需要 `Authorization: Bearer <Supabase JWT>`。用 token 的 `alg` 头选校验器：非对称签名（ES256/RS256/EdDSA）走项目的 JWKS 校验，地址取自 `SUPABASE_JWKS_URL`，或由 `SUPABASE_URL` 推导——自 Supabase 2025 年 JWT Signing Keys 上线后这是默认路径。尚未迁移的部署仍可用旧的 HS256 + 共享密钥 `SUPABASE_JWT_SECRET`；两个来源至少要配一个，否则服务器拒绝启动。`sub` claim 必須是個 UUID；該 UUID 即該請求的 user_id。
 
-`/healthz` 跟 `/docs` 是公開的。
+`/healthz` 跟 `/docs` 是公開的。`/svc/v1/*` 是第三類：以共享 secret header 放行，從不認 bearer token——見[服務端點](#服務端點)。
 
 ## 公開端點
 
@@ -1618,6 +1618,22 @@ session 403）。
   session 路由报成 `affinity: null` 的那个状态。
 - 单个 session 不会有 403/404：响应里只可能出现调用者自己的行，别人的或不存在
   的 session 就是不出现。
+
+## 服務端點
+
+`/svc/v1/*` 下是服務間路由。以共享 secret header 放行而非用戶 JWT，而且除非部署配置了該 secret，整棵子樹**不會掛載**——未配置的部署對該路徑的回應與任何未知路徑一致——不會是 `403`，也不會是 `200`。
+
+### `GET /svc/v1/insights/changes`
+
+自某個 keyset 游標以來有變動的 `human_insights` 行，給維護對話推導畫像只讀鏡像的下游服務用。需要 `x-insights-export-secret: <INSIGHTS_EXPORT_SECRET>`（缺失或錯誤回 403）。讀的是活表，不是快照歸檔。
+
+| Query | 默認 | 含義 |
+|---|---|---|
+| `since` | Unix epoch | RFC 3339；嚴格晚於 `(since, after_user)` 的行 |
+| `after_user` | nil UUID | `since` 內的 tie-break——傳 `next.user_id` |
+| `limit` | 500 | 夾在 1..=1000 |
+
+行按 `(updated_at, user_id)` 排序。頁滿時才有 `next`；把它的兩個字段原樣傳回 `since` 與 `after_user` 往下走，`next` 為 `null` 即結束。只傳 `since` 會把恰好在該時刻的行再回一次（nil UUID 排在所有真實 UUID 之前）——兩個字段一起傳。
 
 ## 錯誤響應
 

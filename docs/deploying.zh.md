@@ -271,6 +271,7 @@ World Stories 按实例生活模拟）默认完全关闭：模型配置里没有
   - `BYOK_CALLER_SECRET` 开启该功能：至少 32 字节（更短会导致启动失败），保存在下游的服务器上，以 `X-Byok-Caller-Secret` 发送。未设置 ⇒ 所有 `byok` 块都返回 `403 byok_forbidden`。
   - `BYOK_ALLOW_PRIVATE_NETWORK=true` 解除地址防护并允许 `http` 端点，用于自托管网络和测试。
   - 把镜像回滚到不支持 BYOK 的版本之前，先把对话队列排空：旧引擎会忽略队列行上的 `byok` 标记，它接手恢复的 BYOK 轮次会走部署自己的链路，不管 `fallback_to_platform` 设成什么。
+- **画像增量导出（可选）：** `GET /svc/v1/insights/changes` 把自某个 keyset 游标以来有变动的 `human_insights` 行交给下游服务，让它不碰数据库就能维护一份对话推导画像的只读镜像。`INSIGHTS_EXPORT_SECRET` 开启该路由：至少 32 字节（更短会导致启动失败），保存在下游的服务器上，以 `x-insights-export-secret` 发送。未设置 ⇒ 路由根本不挂载，该路径与任何未知路径表现一致。契约见 [API 参考 → 服務端點](api-reference.zh.md#服務端點)。
 - **健康探針：** `GET /healthz` 返 200，響應 `{ status: "ok", service, version, timestamp }`。把這個接到平台的健康檢查上。
 - **OpenAPI / Scalar：** `GET /docs` 提供實時的 Scalar 參考。原始 OpenAPI JSON 不走 HTTP——用 `print-openapi` 子命令导出。
 - **给前端的好感度：** `GET /bff/v1/comp/affinity/{session_id}` 返回读时刷新过的绝对向量，`.../event` 返回逐轮 delta 加该轮结束时的状态；`GET /bff/v1/comp/affinities/{user_id}` 是第一条的列表形态 —— 一次分页往返拿到该用户所有伴侣刷新后的值，给渲染会话列表的客户端用。三条都做 JWT + ownership 检查、都常驻——`v1.3.1` 起 `EXPOSE_AFFINITY_DEBUG` 开关和它挡着的 debug 路由都已删除。见 [migrating/v1-3-1-affinity-4-0.md](migrating/v1-3-1-affinity-4-0.md)。
