@@ -59,9 +59,22 @@ pub struct CurrentEvent {
     pub at: DateTime<Utc>,
 }
 
-fn event_from_columns(
-    (id, sent_at, kind, ends_at): (Uuid, DateTime<Utc>, Option<String>, Option<String>),
-) -> Option<EventRecord> {
+/// How far back the event reads look for an event still under way. An event
+/// lasts hours; this only bounds the scan and does not depend on the rule table.
+const EVENT_SCAN_WINDOW_HOURS: i32 = 24 * 7;
+
+/// An event row's columns: id, sent_at, kind, ends_at.
+type EventColumns = (Uuid, DateTime<Utc>, Option<String>, Option<String>);
+/// Those columns plus the moment the event-under-way read was taken at.
+type EventAtColumns = (
+    Uuid,
+    DateTime<Utc>,
+    Option<String>,
+    Option<String>,
+    DateTime<Utc>,
+);
+
+fn event_from_columns((id, sent_at, kind, ends_at): EventColumns) -> Option<EventRecord> {
     Some(EventRecord {
         message_id: id,
         kind: eros_engine_core::events::EventKind::parse(kind.as_deref()?)?,
@@ -1569,7 +1582,6 @@ impl<'a> ChatRepo<'a> {
         now: DateTime<Utc>,
         row: &ProactiveInsert,
     ) -> Result<Option<ChatMessage>, sqlx::Error> {
-        let window_hours = eros_engine_core::events::longest_duration().num_hours() as i32;
         let mut tx = self.pool.begin().await?;
         let inserted = sqlx::query_as::<_, ChatMessage>(
             "INSERT INTO engine.chat_messages \
@@ -1597,7 +1609,7 @@ impl<'a> ChatRepo<'a> {
         .bind(&row.gateway_errors)
         .bind(instance_id)
         .bind(now)
-        .bind(window_hours)
+        .bind(EVENT_SCAN_WINDOW_HOURS)
         .fetch_optional(&mut *tx)
         .await?;
         if inserted.is_some() {
@@ -1634,7 +1646,7 @@ impl<'a> ChatRepo<'a> {
         instance_id: Uuid,
         since: DateTime<Utc>,
     ) -> Result<Vec<EventRecord>, sqlx::Error> {
-        let rows: Vec<(Uuid, DateTime<Utc>, Option<String>, Option<String>)> = sqlx::query_as(
+        let rows: Vec<EventColumns> = sqlx::query_as(
             "SELECT m.id, m.sent_at, m.metadata->'event'->>'kind', m.metadata->'event'->>'ends_at' \
                FROM engine.chat_messages m \
                JOIN engine.chat_sessions s ON s.id = m.session_id \
@@ -1658,14 +1670,7 @@ impl<'a> ChatRepo<'a> {
         at_message: Option<Uuid>,
         now: DateTime<Utc>,
     ) -> Result<Option<CurrentEvent>, sqlx::Error> {
-        let window_hours = eros_engine_core::events::longest_duration().num_hours() as i32;
-        let rows: Vec<(
-            Uuid,
-            DateTime<Utc>,
-            Option<String>,
-            Option<String>,
-            DateTime<Utc>,
-        )> = sqlx::query_as(
+        let rows: Vec<EventAtColumns> = sqlx::query_as(
             "WITH t AS (SELECT COALESCE( \
                      (SELECT a.sent_at FROM engine.chat_messages a WHERE a.id = $2), $3) AS at) \
                  SELECT m.id, m.sent_at, m.metadata->'event'->>'kind', \
@@ -1680,7 +1685,7 @@ impl<'a> ChatRepo<'a> {
         .bind(instance_id)
         .bind(at_message)
         .bind(now)
-        .bind(window_hours)
+        .bind(EVENT_SCAN_WINDOW_HOURS)
         .fetch_all(self.pool)
         .await?;
         Ok(rows

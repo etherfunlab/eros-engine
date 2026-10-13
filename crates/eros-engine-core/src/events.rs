@@ -115,18 +115,6 @@ pub fn longest_cooldown() -> Duration {
     )
 }
 
-/// The longest duration of any kind: how far back an event can still be
-/// under way.
-pub fn longest_duration() -> Duration {
-    Duration::hours(
-        EventKind::ALL
-            .into_iter()
-            .map(|k| rule(k).lasts_hours)
-            .max()
-            .unwrap_or(0),
-    )
-}
-
 /// An event that already happened (or is under way).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PastEvent {
@@ -325,7 +313,6 @@ mod tests {
         assert_eq!(hours(EventKind::PoliceEncounter), 1);
         assert_eq!(hours(EventKind::AnimalEncounter), 1);
         assert_eq!(longest_cooldown().num_hours(), 72);
-        assert_eq!(longest_duration().num_hours(), 4);
     }
 
     #[test]
