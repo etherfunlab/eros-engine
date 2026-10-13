@@ -1088,27 +1088,53 @@ pub async fn send_message_stream(
                 let state_arc = Arc::new(state.clone());
                 // An action turn replays its decided response ahead of the
                 // reply, as the live stream sent it (spec 2026-10-05 §3.4),
-                // then the turn's lingering state, recomputed from the rows
-                // (spec 2026-10-12-given-item-lingering-effects-design.md §9.1).
-                let action_frame = chat_repo
+                // then the turn's lingering state and its needs, recomputed
+                // from the rows (spec 2026-10-12-given-item-lingering-effects-
+                // design.md §9.1).
+                let row = chat_repo
                     .message_by_id_in_session(session_id, user_message_id)
                     .await
                     .ok()
-                    .flatten()
-                    .and_then(|m| {
-                        crate::pipeline::stream::action_response_frame(
-                            user_message_id,
-                            m.metadata.as_ref(),
+                    .flatten();
+                let action_frame = row.as_ref().and_then(|m| {
+                    crate::pipeline::stream::action_response_frame(
+                        user_message_id,
+                        m.metadata.as_ref(),
+                    )
+                });
+                // The needs the reply was written with: the row's own rating,
+                // else the levels carried to it (spec 2026-10-13-persona-
+                // needs-design.md §7.1).
+                let needs = if state.model_config.pde_enabled() {
+                    match row
+                        .as_ref()
+                        .and_then(|m| m.metadata.as_ref())
+                        .and_then(|m| m.get("needs"))
+                        .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    {
+                        Some(n) => Some(n),
+                        None => crate::pipeline::handlers::load_needs(
+                            &state.pool,
+                            instance_id,
+                            Some(user_message_id),
+                            chrono::Utc::now(),
                         )
-                    });
-                let body_frame = crate::pipeline::handlers::load_effects(
+                        .await
+                        .ok()
+                        .flatten(),
+                    }
+                } else {
+                    None
+                };
+                let effects = crate::pipeline::handlers::load_effects(
                     &state.pool,
                     session_id,
                     Some(user_message_id),
                 )
                 .await
-                .ok()
-                .and_then(|e| crate::pipeline::stream::body_state_frame(user_message_id, &e, None));
+                .unwrap_or_default();
+                let body_frame =
+                    crate::pipeline::stream::body_state_frame(user_message_id, &effects, needs);
                 let head: Vec<ProtocolFrame> = action_frame.into_iter().chain(body_frame).collect();
                 Box::pin(futures_util::StreamExt::chain(
                     futures_util::stream::iter(head),
@@ -2559,6 +2585,131 @@ data: [DONE]\n\n";
         let bs = body_text.find("\"type\":\"body_state\"").expect(body_text);
         let meta = body_text.find("\"type\":\"meta\"").expect(body_text);
         assert!(bs < meta, "body: {body_text}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn stream_replay_re_sends_the_rated_needs(pool: PgPool) {
+        use eros_engine_store::chat::{AssistantInsert, ChatRepo, UpsertUserOutcome};
+        let user_id = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('R', 'p', '{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let instance_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1, $2) RETURNING id",
+        ).bind(genome_id).bind(user_id).fetch_one(&pool).await.unwrap();
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // Pre-seed an original-request outcome.
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_msg_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J3333333333333333333333C",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+        chat_repo
+            .set_needs(
+                user_msg_id,
+                &eros_engine_core::needs::Needs {
+                    hunger: eros_engine_core::needs::NeedLevel::High,
+                    social: eros_engine_core::needs::NeedLevel::Mid,
+                    stamina: eros_engine_core::needs::NeedLevel::Mid,
+                    emotional: eros_engine_core::needs::NeedLevel::Mid,
+                },
+            )
+            .await
+            .unwrap();
+        // Since 0060 chat_messages.generation_id FK-references
+        // engine.llm_generations. Release A's write path creates the parent;
+        // this test writes the child row directly, so it seeds one itself.
+        sqlx::query(
+            "INSERT INTO engine.llm_generations (generation_id, task) \
+             VALUES ('gen-1', 'chat_companion')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let assistant_uuid: Uuid = ulid::Ulid::new().into();
+        chat_repo
+            .insert_assistant_batch(
+                session_id,
+                user_msg_id,
+                &[AssistantInsert {
+                    llm_attempts: None,
+                    gateway_errors: None,
+                    id: assistant_uuid,
+                    content: "replayed reply".into(),
+                    assistant_action_type: "reply".into(),
+                    continues_from_message_id: None,
+                    truncated: false,
+                    generation_id: Some("gen-1".into()),
+                    filter_audit: None,
+                    metadata: None,
+                    speaker_session_id: None,
+                }],
+            )
+            .await
+            .unwrap();
+
+        let mut state = crate::routes::companion::test_state(pool);
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.pde_decision]\nmodel=\"j\"\nfilter_prompt=\"Decide.\"\n",
+            )
+            .unwrap(),
+        );
+        let mut app = build_router(state);
+        let token = mint_jwt(user_id);
+        let body = serde_json::to_vec(
+            &json!({"content":"hi","client_msg_id":"01J3333333333333333333333C"}),
+        )
+        .unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/comp/chat/{session_id}/message/stream"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(ct.starts_with("text/event-stream"));
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body_text = std::str::from_utf8(&bytes).unwrap();
+        let bs = body_text.find("\"type\":\"body_state\"").expect(body_text);
+        let meta = body_text.find("\"type\":\"meta\"").expect(body_text);
+        assert!(bs < meta, "body: {body_text}");
+        assert!(
+            body_text.contains(
+                "\"needs\":{\"hunger\":\"high\",\"social\":\"mid\",\"stamina\":\"mid\",\"emotional\":\"mid\"}"
+            ),
+            "{body_text}"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

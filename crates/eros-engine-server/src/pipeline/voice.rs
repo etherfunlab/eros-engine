@@ -156,6 +156,11 @@ pub struct VoiceBootstrap {
     /// byte-stable for the call.
     #[serde(default)]
     pub effects: Vec<eros_engine_core::effects::ActiveEffect>,
+    /// The persona's needs carried to the call's first turn (spec
+    /// 2026-10-13-persona-needs-design.md §8). `None` with no rating or when
+    /// the deployment runs no LLM judge.
+    #[serde(default)]
+    pub needs: Option<eros_engine_core::needs::Needs>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -183,8 +188,9 @@ fn plan_bootstrap(session_metadata: &serde_json::Value) -> BootstrapPlan {
 }
 
 /// Render the bootstrap block: `[关于他]` bullets, the `[上次通话]`
-/// transcript, then the `[身体状态]` line. Each sub-block is omitted when its
-/// part is empty; `None` when all are — the caller then emits no block at all (no stray blank lines).
+/// transcript, then the `[身体状态]` lines (effects, then needs). Each
+/// sub-block is omitted when its part is empty; `None` when all are — the
+/// caller then emits no block at all (no stray blank lines).
 fn render_bootstrap(b: &VoiceBootstrap) -> Option<String> {
     let bullets: Vec<&str> = b
         .insights
@@ -197,8 +203,16 @@ fn render_bootstrap(b: &VoiceBootstrap) -> Option<String> {
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let body = crate::prompt::body_state(&b.effects);
-    if bullets.is_empty() && prev.is_none() && body.is_none() {
+    let body: Vec<String> = crate::prompt::body_state(&b.effects)
+        .into_iter()
+        .chain(
+            b.needs
+                .as_ref()
+                .and_then(crate::prompt::needs_line)
+                .map(|l| format!("此刻的需要：{l}")),
+        )
+        .collect();
+    if bullets.is_empty() && prev.is_none() && body.is_empty() {
         return None;
     }
     let mut s = String::new();
@@ -216,12 +230,12 @@ fn render_bootstrap(b: &VoiceBootstrap) -> Option<String> {
         s.push_str("[上次通话]\n");
         s.push_str(t);
     }
-    if let Some(t) = body {
+    if !body.is_empty() {
         if !s.is_empty() {
             s.push_str("\n\n");
         }
         s.push_str("[身体状态]\n");
-        s.push_str(&t);
+        s.push_str(&body.join("\n"));
     }
     Some(s)
 }
@@ -314,7 +328,20 @@ async fn load_bootstrap_effects(
     crate::pipeline::handlers::load_effects(pool, affinity.session_id, None).await
 }
 
-/// Assemble a first-turn snapshot. The three parts degrade independently; the
+/// The persona's needs carried to now. With no LLM judge there is nothing to
+/// read and no query runs; no rating is an empty part, still a success.
+async fn load_bootstrap_needs(
+    pool: &PgPool,
+    instance_id: Uuid,
+    enabled: bool,
+) -> Result<Option<eros_engine_core::needs::Needs>, sqlx::Error> {
+    if !enabled {
+        return Ok(None);
+    }
+    crate::pipeline::handlers::load_needs(pool, instance_id, None, Utc::now()).await
+}
+
+/// Assemble a first-turn snapshot. The four parts degrade independently; the
 /// returned flag is `true` only when every part succeeded — a partial snapshot is
 /// injected in memory for this turn but must not be frozen, so the next turn
 /// retries.
@@ -324,11 +351,13 @@ async fn assemble_bootstrap(
     instance_id: Uuid,
     session_id: Uuid,
     insight_mode: InsightMode,
+    needs_enabled: bool,
 ) -> (VoiceBootstrap, bool) {
-    let (insights_res, prev_res, effects_res) = tokio::join!(
+    let (insights_res, prev_res, effects_res, needs_res) = tokio::join!(
         load_bootstrap_insights(pool, user_id, insight_mode),
         load_bootstrap_prev_call(pool, user_id, instance_id, session_id),
         load_bootstrap_effects(pool, user_id, instance_id),
+        load_bootstrap_needs(pool, instance_id, needs_enabled),
     );
     let mut complete = true;
     let insights = match insights_res {
@@ -355,12 +384,21 @@ async fn assemble_bootstrap(
             Vec::new()
         }
     };
+    let needs = match needs_res {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "voice: bootstrap needs read failed");
+            complete = false;
+            None
+        }
+    };
     (
         VoiceBootstrap {
             insights,
             prev_call,
             prev_session_id,
             effects,
+            needs,
             created_at: Utc::now(),
         },
         complete,
@@ -566,6 +604,7 @@ pub fn run_voice_turn(
                         turn.instance_id,
                         turn.session_id,
                         insight_mode,
+                        state.model_config.pde_enabled(),
                     ).await)
                 } else {
                     None
@@ -681,7 +720,7 @@ pub fn run_voice_turn(
         // The call's frozen state for the caller (spec 2026-10-12-given-item-
         // lingering-effects-design.md §9.1), before the first `delta`.
         if let Some(frame) = bootstrap.as_ref().and_then(|b| {
-            crate::pipeline::stream::body_state_frame(turn.user_message_id, &b.effects, None)
+            crate::pipeline::stream::body_state_frame(turn.user_message_id, &b.effects, b.needs)
         }) {
             yield frame;
         }
@@ -1066,6 +1105,7 @@ mod tests {
             prev_call: prev_call.map(str::to_string),
             prev_session_id: None,
             effects: Vec::new(),
+            needs: None,
             created_at: Utc::now(),
         }
     }
@@ -1163,6 +1203,42 @@ mod tests {
         }))
         .unwrap();
         assert!(b.effects.is_empty());
+    }
+
+    fn hungry() -> eros_engine_core::needs::Needs {
+        use eros_engine_core::needs::{NeedLevel, Needs};
+        Needs {
+            hunger: NeedLevel::High,
+            social: NeedLevel::Mid,
+            stamina: NeedLevel::Low,
+            emotional: NeedLevel::Mid,
+        }
+    }
+
+    #[test]
+    fn bootstrap_block_renders_the_needs_after_the_effects() {
+        let mut s = snapshot(&[], None);
+        s.effects = vec![cigarette()];
+        s.needs = Some(hungry());
+        assert_eq!(
+            render_bootstrap(&s).as_deref(),
+            Some("[身体状态]\n1 支烟，烟劲很足，正在劲头上\n此刻的需要：饿了；很累")
+        );
+        let mut alone = snapshot(&[], None);
+        alone.needs = Some(hungry());
+        assert_eq!(
+            render_bootstrap(&alone).as_deref(),
+            Some("[身体状态]\n此刻的需要：饿了；很累")
+        );
+    }
+
+    #[test]
+    fn a_marker_frozen_without_needs_reads_as_none() {
+        let b: VoiceBootstrap = serde_json::from_value(serde_json::json!({
+            "insights": [], "created_at": "2026-10-01T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(b.needs, None);
     }
 
     /// Order: persona → directive → bootstrap → relationship line.
@@ -3293,6 +3369,30 @@ data: [DONE]\n\n";
             .await
             .expect("snapshot still freezes");
         assert_eq!(marker["effects"], serde_json::json!([]));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_bootstrap_freezes_carried_needs_only_with_the_judge(pool: sqlx::PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+        let text = seed_session(&pool, user_id, instance_id, "text").await;
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata, sent_at) \
+             VALUES ($1, 'user', '', $2, now() - make_interval(mins => 5))",
+        )
+        .bind(text)
+        .bind(serde_json::json!({"needs": {"hunger": "high", "social": "mid", "stamina": "low", "emotional": "mid"}}))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let voice = seed_session(&pool, user_id, instance_id, "voice").await;
+        let (on, complete) =
+            assemble_bootstrap(&pool, user_id, instance_id, voice, InsightMode::Off, true).await;
+        assert!(complete);
+        assert_eq!(on.needs, Some(hungry()));
+        let (off, _) =
+            assemble_bootstrap(&pool, user_id, instance_id, voice, InsightMode::Off, false).await;
+        assert_eq!(off.needs, None);
     }
 
     /// First turn freezes the snapshot into `metadata.voice_bootstrap` and

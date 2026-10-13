@@ -63,14 +63,58 @@ impl From<&ActiveEffect> for EffectView {
     }
 }
 
+/// One need's level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NeedLevelDto {
+    Low,
+    Mid,
+    High,
+}
+
+impl From<eros_engine_core::needs::NeedLevel> for NeedLevelDto {
+    fn from(l: eros_engine_core::needs::NeedLevel) -> Self {
+        use eros_engine_core::needs::NeedLevel;
+        match l {
+            NeedLevel::Low => NeedLevelDto::Low,
+            NeedLevel::Mid => NeedLevelDto::Mid,
+            NeedLevel::High => NeedLevelDto::High,
+        }
+    }
+}
+
+/// The persona's four needs (spec 2026-10-13-persona-needs-design.md §3).
+/// Also the `needs` shape of the `body_state` stream frame.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct NeedsView {
+    pub hunger: NeedLevelDto,
+    pub social: NeedLevelDto,
+    pub stamina: NeedLevelDto,
+    pub emotional: NeedLevelDto,
+}
+
+impl From<&eros_engine_core::needs::Needs> for NeedsView {
+    fn from(n: &eros_engine_core::needs::Needs) -> Self {
+        Self {
+            hunger: n.hunger.into(),
+            social: n.social.into(),
+            stamina: n.stamina.into(),
+            emotional: n.emotional.into(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct EffectsResponse {
     /// Newest give first; empty when nothing is at work.
     pub effects: Vec<EffectView>,
+    /// The persona's needs carried to now; `null` with no rating, or when the
+    /// deployment runs no LLM judge.
+    pub needs: Option<NeedsView>,
 }
 
-/// The persona's lingering state from accepted gives, as a text turn sent now
-/// would carry it.
+/// The persona's lingering state from accepted gives and her needs, as a text
+/// turn sent now would carry them.
 #[utoipa::path(
     get,
     path = "/v2/comp/session/{session_id}/effects",
@@ -90,10 +134,17 @@ async fn get_effects(
     Path(session_id): Path<Uuid>,
     Extension(AuthUser(user_id)): Extension<AuthUser>,
 ) -> Result<Json<EffectsResponse>, AppError> {
-    resolve_text_turn(&state, session_id, user_id).await?;
+    let (_session, _persona, instance_id) = resolve_text_turn(&state, session_id, user_id).await?;
     let effects = crate::pipeline::handlers::load_effects(&state.pool, session_id, None).await?;
+    let needs = if state.model_config.pde_enabled() {
+        crate::pipeline::handlers::load_needs(&state.pool, instance_id, None, chrono::Utc::now())
+            .await?
+    } else {
+        None
+    };
     Ok(Json(EffectsResponse {
         effects: effects.iter().map(EffectView::from).collect(),
+        needs: needs.as_ref().map(NeedsView::from),
     }))
 }
 
@@ -182,7 +233,7 @@ mod tests {
             json!({"effects": [
                 {"item": "cigarette", "quantity": 1, "level": 3, "phase": "peak", "step": 1, "steps": 1},
                 {"item": "alcohol", "name": "威士忌", "quantity": 3, "level": 3, "phase": "peak", "step": 3, "steps": 3},
-            ]})
+            ], "needs": null})
         );
     }
 
@@ -193,7 +244,7 @@ mod tests {
         let session_id = seed_session(&pool, owner, instance_id).await;
         let (s, body) = get(pool, session_id, owner).await;
         assert_eq!(s, StatusCode::OK);
-        assert_eq!(body, json!({"effects": []}));
+        assert_eq!(body, json!({"effects": [], "needs": null}));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -220,6 +271,80 @@ mod tests {
         let (s, body) = get(pool, voice, owner).await;
         assert_eq!(s, StatusCode::CONFLICT);
         assert_eq!(body["code"], "wrong_channel");
+    }
+
+    async fn get_judged(
+        pool: sqlx::PgPool,
+        session_id: Uuid,
+        user: Uuid,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut state = test_state(pool);
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.pde_decision]\nmodel=\"j\"\nfilter_prompt=\"Decide.\"\n",
+            )
+            .unwrap(),
+        );
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/v2/comp/session/{session_id}/effects"))
+            .header(
+                header::AUTHORIZATION,
+                format!("Bearer {}", mint_test_jwt(user)),
+            )
+            .body(Body::empty())
+            .unwrap();
+        let res = build_router(state).oneshot(req).await.unwrap();
+        let status = res.status();
+        let bytes = to_bytes(res.into_body(), 65536).await.unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn needs_are_carried_to_now(pool: sqlx::PgPool) {
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, owner).await;
+        let session_id = seed_session(&pool, owner, instance_id).await;
+        // Rated 5 hours ago: hunger low → mid (4h period); the rest unchanged.
+        user_row(&pool, session_id, 300,
+            json!({"needs": {"hunger": "low", "social": "mid", "stamina": "high", "emotional": "mid"}})).await;
+        let (s, body) = get_judged(pool, session_id, owner).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(
+            body["needs"],
+            json!({"hunger": "mid", "social": "mid", "stamina": "high", "emotional": "mid"})
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn needs_are_null_without_a_rating_or_without_the_judge(pool: sqlx::PgPool) {
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, owner).await;
+        let session_id = seed_session(&pool, owner, instance_id).await;
+        let (_, body) = get_judged(pool.clone(), session_id, owner).await;
+        assert!(body["needs"].is_null(), "{body}");
+        user_row(&pool, session_id, 10,
+            json!({"needs": {"hunger": "high", "social": "mid", "stamina": "mid", "emotional": "mid"}})).await;
+        let (_, body) = get(pool, session_id, owner).await;
+        assert!(body["needs"].is_null(), "no judge configured: {body}");
+    }
+
+    #[test]
+    fn needs_view_matches_the_frame_shape() {
+        use eros_engine_core::needs::{NeedLevel, Needs};
+        let n = Needs {
+            hunger: NeedLevel::High,
+            social: NeedLevel::Low,
+            stamina: NeedLevel::Mid,
+            emotional: NeedLevel::Mid,
+        };
+        assert_eq!(
+            serde_json::to_value(NeedsView::from(&n)).unwrap(),
+            serde_json::to_value(n).unwrap()
+        );
     }
 
     /// The route's element and the frame's element serialize identically.
