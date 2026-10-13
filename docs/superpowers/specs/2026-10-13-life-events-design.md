@@ -174,7 +174,7 @@ The row has the shape of an opener: `role = 'assistant'`,
 - `user_timezone`, `user_country`, `user_region`, `tier`, `prompt_traits`,
   `memory_scope`, `affinity_scope`, as an opener's row carries them.
 
-`ChatRepo::insert_event_message(instance_id, now, row)`:
+`ChatRepo::insert_event_message(instance_id, session_id, now, row)`:
 
 ```sql
 INSERT INTO engine.chat_messages (…)
@@ -199,7 +199,7 @@ Two concurrent draws under different keys can both pass the `NOT EXISTS`
 under READ COMMITTED and both land. This millisecond window is accepted, as
 it is for `/open`.
 
-### 5.5 Migration `0070_chat_messages_event_key.sql`
+### 5.5 Migration `0071_chat_messages_event_key.sql`
 
 ```sql
 CREATE UNIQUE INDEX chat_messages_event_key_uidx
@@ -262,7 +262,7 @@ that opens on a conversation can show it without having made the draw.
 |---|---|
 | `EventKind`, the kind table, `draw`, `duration` | `core/src/events.rs` (new), `core/src/lib.rs` |
 | `insert_event_message`, `event_message`, `recent_events`, `current_event` | `store/src/chat.rs` |
-| migration | `store/migrations/0070_chat_messages_event_key.sql` |
+| migration | `store/migrations/0071_chat_messages_event_key.sql` |
 | `Occasion::Event`, its cue and metadata | `server/src/pipeline/proactive.rs` |
 | the route, `EventView` | `server/src/routes/session_events.rs` (new), `routes/mod.rs` |
 | `[近期事件]` line | `server/src/pipeline/stream.rs` |

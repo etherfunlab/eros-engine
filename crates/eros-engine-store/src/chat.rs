@@ -16,6 +16,60 @@ pub struct NeedsRating {
     pub anchor_at: Option<DateTime<Utc>>,
 }
 
+/// A life event: the proactive message that told it (spec
+/// 2026-10-13-life-events-design.md §5.4). `started_at` is the row's
+/// `sent_at`; `ends_at` was fixed when the event was drawn.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventRecord {
+    pub message_id: Uuid,
+    pub kind: eros_engine_core::events::EventKind,
+    pub started_at: DateTime<Utc>,
+    pub ends_at: DateTime<Utc>,
+}
+
+impl EventRecord {
+    /// The event a row carries; `None` for any other row or a malformed one.
+    pub fn from_message(m: &ChatMessage) -> Option<Self> {
+        let meta = m.metadata.as_ref()?;
+        if meta.get("proactive")?.as_str()? != "event" {
+            return None;
+        }
+        let event = meta.get("event")?;
+        Some(Self {
+            message_id: m.id,
+            kind: eros_engine_core::events::EventKind::parse(event.get("kind")?.as_str()?)?,
+            started_at: m.sent_at,
+            ends_at: event.get("ends_at")?.as_str()?.parse().ok()?,
+        })
+    }
+
+    pub fn past(&self) -> eros_engine_core::events::PastEvent {
+        eros_engine_core::events::PastEvent {
+            kind: self.kind,
+            started_at: self.started_at,
+            ends_at: self.ends_at,
+        }
+    }
+}
+
+/// The event under way at a moment, and that moment.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CurrentEvent {
+    pub event: EventRecord,
+    pub at: DateTime<Utc>,
+}
+
+fn event_from_columns(
+    (id, sent_at, kind, ends_at): (Uuid, DateTime<Utc>, Option<String>, Option<String>),
+) -> Option<EventRecord> {
+    Some(EventRecord {
+        message_id: id,
+        kind: eros_engine_core::events::EventKind::parse(kind.as_deref()?)?,
+        started_at: sent_at,
+        ends_at: ends_at?.parse().ok()?,
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct ChatSession {
     pub id: Uuid,
@@ -1502,6 +1556,140 @@ impl<'a> ChatRepo<'a> {
         .bind(open_key)
         .fetch_optional(self.pool)
         .await
+    }
+
+    /// Write an event's message (spec 2026-10-13-life-events-design.md
+    /// §5.4): nothing while any session of the instance has an event under
+    /// way at `now`, nothing on a repeated `event_key` in this session. Unlike
+    /// an opener, it does not yield to other messages.
+    pub async fn insert_event_message(
+        &self,
+        instance_id: Uuid,
+        session_id: Uuid,
+        now: DateTime<Utc>,
+        row: &ProactiveInsert,
+    ) -> Result<Option<ChatMessage>, sqlx::Error> {
+        let window_hours = eros_engine_core::events::longest_duration().num_hours() as i32;
+        let mut tx = self.pool.begin().await?;
+        let inserted = sqlx::query_as::<_, ChatMessage>(
+            "INSERT INTO engine.chat_messages \
+               (id, session_id, role, content, generation_id, assistant_action_type, \
+                metadata, llm_attempts, gateway_errors, sent_at) \
+             SELECT $1, $2, 'assistant', $3, $4, 'proactive', $5, $6, $7, $9 \
+             WHERE NOT EXISTS ( \
+                 SELECT 1 FROM engine.chat_messages m \
+                   JOIN engine.chat_sessions s ON s.id = m.session_id \
+                  WHERE s.instance_id = $8 AND m.assistant_action_type = 'proactive' \
+                    AND m.metadata->>'proactive' = 'event' \
+                    AND m.sent_at > $9 - make_interval(hours => $10) \
+                    AND (m.metadata->'event'->>'ends_at')::timestamptz > $9 \
+             ) \
+             ON CONFLICT (session_id, (metadata->>'event_key')) \
+               WHERE metadata->>'proactive' = 'event' DO NOTHING \
+             RETURNING *",
+        )
+        .bind(row.id)
+        .bind(session_id)
+        .bind(&row.content)
+        .bind(&row.generation_id)
+        .bind(&row.metadata)
+        .bind(&row.llm_attempts)
+        .bind(&row.gateway_errors)
+        .bind(instance_id)
+        .bind(now)
+        .bind(window_hours)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if inserted.is_some() {
+            sqlx::query("UPDATE engine.chat_sessions SET last_active_at = now() WHERE id = $1")
+                .bind(session_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(inserted)
+    }
+
+    /// The event message written in this session under `event_key`.
+    pub async fn event_message(
+        &self,
+        session_id: Uuid,
+        event_key: &str,
+    ) -> Result<Option<ChatMessage>, sqlx::Error> {
+        sqlx::query_as::<_, ChatMessage>(
+            "SELECT * FROM engine.chat_messages \
+             WHERE session_id = $1 AND metadata->>'proactive' = 'event' \
+               AND metadata->>'event_key' = $2",
+        )
+        .bind(session_id)
+        .bind(event_key)
+        .fetch_optional(self.pool)
+        .await
+    }
+
+    /// The instance's events sent at or after `since`, across its sessions,
+    /// newest first. A malformed row is skipped.
+    pub async fn recent_events(
+        &self,
+        instance_id: Uuid,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<EventRecord>, sqlx::Error> {
+        let rows: Vec<(Uuid, DateTime<Utc>, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT m.id, m.sent_at, m.metadata->'event'->>'kind', m.metadata->'event'->>'ends_at' \
+               FROM engine.chat_messages m \
+               JOIN engine.chat_sessions s ON s.id = m.session_id \
+              WHERE s.instance_id = $1 AND m.assistant_action_type = 'proactive' \
+                AND m.metadata->>'proactive' = 'event' AND m.sent_at >= $2 \
+              ORDER BY m.sent_at DESC, m.id DESC",
+        )
+        .bind(instance_id)
+        .bind(since)
+        .fetch_all(self.pool)
+        .await?;
+        Ok(rows.into_iter().filter_map(event_from_columns).collect())
+    }
+
+    /// The instance's event under way at `at_message`'s `sent_at` (or at
+    /// `now` without one): started at or before that moment, ending after
+    /// it (spec §6).
+    pub async fn current_event(
+        &self,
+        instance_id: Uuid,
+        at_message: Option<Uuid>,
+        now: DateTime<Utc>,
+    ) -> Result<Option<CurrentEvent>, sqlx::Error> {
+        let window_hours = eros_engine_core::events::longest_duration().num_hours() as i32;
+        let rows: Vec<(
+            Uuid,
+            DateTime<Utc>,
+            Option<String>,
+            Option<String>,
+            DateTime<Utc>,
+        )> = sqlx::query_as(
+            "WITH t AS (SELECT COALESCE( \
+                     (SELECT a.sent_at FROM engine.chat_messages a WHERE a.id = $2), $3) AS at) \
+                 SELECT m.id, m.sent_at, m.metadata->'event'->>'kind', \
+                        m.metadata->'event'->>'ends_at', t.at \
+                   FROM t CROSS JOIN engine.chat_messages m \
+                   JOIN engine.chat_sessions s ON s.id = m.session_id \
+                  WHERE s.instance_id = $1 AND m.assistant_action_type = 'proactive' \
+                    AND m.metadata->>'proactive' = 'event' \
+                    AND m.sent_at <= t.at AND m.sent_at > t.at - make_interval(hours => $4) \
+                  ORDER BY m.sent_at DESC, m.id DESC",
+        )
+        .bind(instance_id)
+        .bind(at_message)
+        .bind(now)
+        .bind(window_hours)
+        .fetch_all(self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .find_map(|(id, sent_at, kind, ends_at, at)| {
+                event_from_columns((id, sent_at, kind, ends_at))
+                    .filter(|e| e.ends_at > at)
+                    .map(|event| CurrentEvent { event, at })
+            }))
     }
 
     /// The session's newest `role = 'user'` row.
@@ -6443,5 +6631,319 @@ mod tests {
         )
         .await;
         assert!(repo.latest_needs(instance, None).await.unwrap().is_none());
+    }
+
+    fn event_row(meta: serde_json::Value) -> ProactiveInsert {
+        ProactiveInsert {
+            id: Uuid::new_v4(),
+            content: "刚被叫去加班".into(),
+            generation_id: None,
+            metadata: meta,
+            llm_attempts: None,
+            gateway_errors: None,
+        }
+    }
+
+    fn event_meta(key: &str, kind: &str, ends_at: DateTime<Utc>) -> serde_json::Value {
+        serde_json::json!({"proactive": "event", "event_key": key,
+            "event": {"kind": kind, "ends_at": ends_at.to_rfc3339()}})
+    }
+
+    fn t(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn insert_event_message_writes_the_row_and_reads_back(pool: PgPool) {
+        use eros_engine_core::events::EventKind;
+        let s = throwaway_session(&pool).await;
+        let repo = ChatRepo { pool: &pool };
+        let now = t("2026-10-01T10:00:00Z");
+        let row = repo
+            .insert_event_message(
+                s.instance_id.unwrap(),
+                s.id,
+                now,
+                &event_row(event_meta("k1", "temp_work", t("2026-10-01T14:00:00Z"))),
+            )
+            .await
+            .unwrap()
+            .expect("written");
+        assert_eq!(row.sent_at, now);
+        assert_eq!(row.assistant_action_type.as_deref(), Some("proactive"));
+        let e = EventRecord::from_message(&row).expect("an event row");
+        assert_eq!(
+            (e.kind, e.started_at, e.ends_at),
+            (EventKind::TempWork, now, t("2026-10-01T14:00:00Z"))
+        );
+        assert_eq!(
+            repo.event_message(s.id, "k1").await.unwrap().map(|m| m.id),
+            Some(row.id)
+        );
+        assert!(repo.event_message(s.id, "other").await.unwrap().is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn insert_event_message_waits_for_the_instances_event_to_end(pool: PgPool) {
+        let owner = Uuid::new_v4();
+        let instance = seed_persona_instance(&pool, owner).await;
+        let repo = ChatRepo { pool: &pool };
+        let a = repo.create_session(owner, instance).await.unwrap();
+        let b = repo.create_session(owner, instance).await.unwrap();
+        let first = t("2026-10-01T10:00:00Z");
+        let ends = t("2026-10-01T11:00:00Z");
+        assert!(repo
+            .insert_event_message(
+                instance,
+                a.id,
+                first,
+                &event_row(event_meta("k1", "police_encounter", ends))
+            )
+            .await
+            .unwrap()
+            .is_some());
+        // Another session of the same persona, while the first is under way.
+        assert!(repo
+            .insert_event_message(
+                instance,
+                b.id,
+                t("2026-10-01T10:30:00Z"),
+                &event_row(event_meta(
+                    "k2",
+                    "weather_change",
+                    t("2026-10-01T14:30:00Z")
+                ))
+            )
+            .await
+            .unwrap()
+            .is_none());
+        // Once it has ended.
+        assert!(repo
+            .insert_event_message(
+                instance,
+                b.id,
+                t("2026-10-01T11:00:00Z"),
+                &event_row(event_meta(
+                    "k2",
+                    "weather_change",
+                    t("2026-10-01T15:00:00Z")
+                ))
+            )
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_event_key_is_unique_per_session(pool: PgPool) {
+        let owner = Uuid::new_v4();
+        let instance = seed_persona_instance(&pool, owner).await;
+        let repo = ChatRepo { pool: &pool };
+        let a = repo.create_session(owner, instance).await.unwrap();
+        let b = repo.create_session(owner, instance).await.unwrap();
+        let meta = |at: &str| event_meta("same", "animal_encounter", t(at));
+        assert!(repo
+            .insert_event_message(
+                instance,
+                a.id,
+                t("2026-10-01T10:00:00Z"),
+                &event_row(meta("2026-10-01T11:00:00Z"))
+            )
+            .await
+            .unwrap()
+            .is_some());
+        // Same key, same session, after the first ended: conflict.
+        assert!(repo
+            .insert_event_message(
+                instance,
+                a.id,
+                t("2026-10-01T12:00:00Z"),
+                &event_row(meta("2026-10-01T13:00:00Z"))
+            )
+            .await
+            .unwrap()
+            .is_none());
+        // Same key, another session: allowed.
+        assert!(repo
+            .insert_event_message(
+                instance,
+                b.id,
+                t("2026-10-01T12:00:00Z"),
+                &event_row(meta("2026-10-01T13:00:00Z"))
+            )
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn recent_events_reads_the_instances_sessions_since(pool: PgPool) {
+        use eros_engine_core::events::EventKind;
+        let owner = Uuid::new_v4();
+        let instance = seed_persona_instance(&pool, owner).await;
+        let other_instance = seed_persona_instance(&pool, owner).await;
+        let repo = ChatRepo { pool: &pool };
+        let a = repo.create_session(owner, instance).await.unwrap();
+        let b = repo.create_session(owner, instance).await.unwrap();
+        let c = repo.create_session(owner, other_instance).await.unwrap();
+        for (inst, sess, key, kind, at, ends) in [
+            (
+                instance,
+                a.id,
+                "old",
+                "weather_change",
+                "2026-09-20T10:00:00Z",
+                "2026-09-20T14:00:00Z",
+            ),
+            (
+                instance,
+                a.id,
+                "k1",
+                "temp_work",
+                "2026-10-01T08:00:00Z",
+                "2026-10-01T12:00:00Z",
+            ),
+            (
+                instance,
+                b.id,
+                "k2",
+                "animal_encounter",
+                "2026-10-01T13:00:00Z",
+                "2026-10-01T14:00:00Z",
+            ),
+            (
+                other_instance,
+                c.id,
+                "k3",
+                "police_encounter",
+                "2026-10-01T13:30:00Z",
+                "2026-10-01T14:30:00Z",
+            ),
+        ] {
+            repo.insert_event_message(
+                inst,
+                sess,
+                t(at),
+                &event_row(event_meta(key, kind, t(ends))),
+            )
+            .await
+            .unwrap()
+            .expect(key);
+        }
+        let got = repo
+            .recent_events(instance, t("2026-09-28T00:00:00Z"))
+            .await
+            .unwrap();
+        let kinds: Vec<_> = got.iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![EventKind::AnimalEncounter, EventKind::TempWork],
+            "newest first, this instance only"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn current_event_is_the_one_under_way_at_the_anchor(pool: PgPool) {
+        use eros_engine_core::events::EventKind;
+        let s = throwaway_session(&pool).await;
+        let instance = s.instance_id.unwrap();
+        let repo = ChatRepo { pool: &pool };
+        let before = insert_user_row(
+            &pool,
+            s.id,
+            "2026-10-01T09:59:00Z",
+            serde_json::json!({}),
+            None,
+        )
+        .await;
+        repo.insert_event_message(
+            instance,
+            s.id,
+            t("2026-10-01T10:00:00Z"),
+            &event_row(event_meta("k1", "temp_work", t("2026-10-01T14:00:00Z"))),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let during = insert_user_row(
+            &pool,
+            s.id,
+            "2026-10-01T11:00:00Z",
+            serde_json::json!({}),
+            None,
+        )
+        .await;
+        let after = insert_user_row(
+            &pool,
+            s.id,
+            "2026-10-01T14:00:00Z",
+            serde_json::json!({}),
+            None,
+        )
+        .await;
+
+        assert!(
+            repo.current_event(instance, Some(before), Utc::now())
+                .await
+                .unwrap()
+                .is_none(),
+            "an event that started after the anchor is not under way at it"
+        );
+        let c = repo
+            .current_event(instance, Some(during), Utc::now())
+            .await
+            .unwrap()
+            .expect("under way");
+        assert_eq!(
+            (c.event.kind, c.at),
+            (EventKind::TempWork, t("2026-10-01T11:00:00Z"))
+        );
+        assert!(
+            repo.current_event(instance, Some(after), Utc::now())
+                .await
+                .unwrap()
+                .is_none(),
+            "ends_at is exclusive"
+        );
+        // Without an anchor, `now` is the moment.
+        assert!(repo
+            .current_event(instance, None, t("2026-10-01T12:00:00Z"))
+            .await
+            .unwrap()
+            .is_some());
+        assert!(repo
+            .current_event(instance, None, t("2026-10-01T15:00:00Z"))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_event_counts_as_a_message_for_openers_and_holidays(pool: PgPool) {
+        let s = throwaway_session(&pool).await;
+        let repo = ChatRepo { pool: &pool };
+        let since = t("2026-10-01T09:00:00Z");
+        repo.insert_event_message(
+            s.instance_id.unwrap(),
+            s.id,
+            t("2026-10-01T10:00:00Z"),
+            &event_row(event_meta(
+                "k1",
+                "weather_change",
+                t("2026-10-01T14:00:00Z"),
+            )),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(repo.has_message_since(s.id, since).await.unwrap());
+        let opener = event_row(serde_json::json!({"proactive": "just_opened", "open_key": "o1"}));
+        assert!(
+            repo.insert_open_message(s.id, since, &opener)
+                .await
+                .unwrap()
+                .is_none(),
+            "an opener yields to an event that landed after its request began"
+        );
     }
 }
