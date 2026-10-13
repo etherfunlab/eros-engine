@@ -195,6 +195,7 @@ pub(crate) async fn greet(
         false,
         None,
         None,
+        None,
     )
     .await?;
     chat_req.messages.push(WireMessage {

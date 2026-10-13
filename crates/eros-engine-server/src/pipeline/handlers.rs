@@ -805,6 +805,7 @@ pub(crate) async fn build_reply_request(
     render_reactions: bool,
     body_state: Option<&str>,
     needs: Option<&str>,
+    event: Option<&str>,
 ) -> Result<(ChatRequest, Vec<String>), AppError> {
     build_reply_request_with(
         state,
@@ -818,6 +819,7 @@ pub(crate) async fn build_reply_request(
         render_reactions,
         body_state,
         needs,
+        event,
         None,
     )
     .await
@@ -848,6 +850,9 @@ pub(crate) async fn build_reply_request_with(
     // The persona's needs, rendered once by the caller (spec
     // 2026-10-13-persona-needs-design.md §6.2). Only the text turn passes one.
     needs: Option<&str>,
+    // The event under way, rendered once by the caller (spec
+    // 2026-10-13-life-events-design.md §6). Only the text turn passes one.
+    event: Option<&str>,
     group: Option<&crate::pipeline::group::GroupSpeakerView>,
 ) -> Result<(ChatRequest, Vec<String>), AppError> {
     let chat_repo = ChatRepo { pool: &state.pool };
@@ -1033,6 +1038,7 @@ pub(crate) async fn build_reply_request_with(
         now,
         body_state,
         needs,
+        event,
     );
 
     if render_reactions {
@@ -3082,6 +3088,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         )
         .await
         .expect("build_reply_request succeeds");
@@ -3210,6 +3217,7 @@ mod tests {
             user_message_id,
             &now,
             false,
+            None,
             None,
             None,
         )
@@ -3348,6 +3356,7 @@ mod tests {
             u2,
             &crate::prompt::NowContext::default(),
             false,
+            None,
             None,
             None,
             Some(&view),
@@ -3494,6 +3503,7 @@ mod tests {
             user_message_id,
             &crate::prompt::NowContext::default(),
             false,
+            None,
             None,
             None,
         )
@@ -3698,6 +3708,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         )
         .await
         .expect("build_reply_request succeeds");
@@ -3797,6 +3808,7 @@ mod tests {
             user_message_id,
             &crate::prompt::NowContext::default(),
             false,
+            None,
             None,
             None,
         )
@@ -3926,6 +3938,7 @@ mod tests {
                     current,
                     &crate::prompt::NowContext::default(),
                     render,
+                    None,
                     None,
                     None,
                 )

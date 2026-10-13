@@ -217,8 +217,8 @@ FK work. Building it scans `chat_messages`, as `0064` did.
 with `sent_at ≤ at < ends_at`, if any. On a text turn, `at` is the turn's
 user-row `sent_at`, so a re-driven turn sees the same event.
 
-- **Judge.** `build_pde_ctx` gains `event: Option<&EventView>` and, when
-  present, renders after `[需求]` and before `[身体状态]`:
+- **Judge.** `build_pde_ctx` gains `event: Option<&str>` (the rendered text)
+  and, when present, renders after `[需求]` and before `[身体状态]`:
 
   ```
   [近期事件] 临时接到工作（1 小时前开始，约 3 小时后结束）

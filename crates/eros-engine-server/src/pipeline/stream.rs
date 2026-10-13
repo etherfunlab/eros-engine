@@ -2673,6 +2673,7 @@ fn build_pde_ctx(
     product_qa_recent: Option<&str>,
     body_state: Option<&str>,
     needs: Option<&eros_engine_core::needs::Needs>,
+    event: Option<&str>,
 ) -> String {
     let a = &input.affinity;
     let s = &input.signals;
@@ -2748,6 +2749,11 @@ fn build_pde_ctx(
             )
         }
     };
+    // The event under way at this turn (spec 2026-10-13-life-events-design.md
+    // §6); absent otherwise.
+    let event_line = event
+        .map(|s| format!("[近期事件] {s}\n"))
+        .unwrap_or_default();
     // What accepted gives are still doing to her (spec
     // 2026-10-12-given-item-lingering-effects-design.md §6.3); absent otherwise.
     let body_line = body_state
@@ -2793,7 +2799,7 @@ fn build_pde_ctx(
          [信号] message_count={} hours_since_last_message={:.1} ghost_streak={} hours_since_last_ghost={}\n\
          [图片能力] 本轮可发图={image_flag}\n\
          [近期图片] 最近{INPUT_FILTER_CONTEXT_TURNS}条消息内已发图={img_count} 张；上一条 AI 消息是图片={last_img}（以本行计数为准，对话记录里的图片标记仅供参考）\n\
-         {product_qa_section}{needs_line}{body_line}{action_line}{outfit_line}\n\
+         {product_qa_section}{needs_line}{event_line}{body_line}{action_line}{outfit_line}\n\
          [用户最新消息]\n{latest}",
         s.message_count,
         s.hours_since_last_message,
@@ -4444,6 +4450,26 @@ pub(crate) fn run_stream_with(
         } else {
             None
         };
+        // The event under way at this turn, anchored at its own row so a
+        // re-driven turn sees the same one (spec 2026-10-13-life-events-
+        // design.md §6). Independent of the judge.
+        let current_event = chat_repo
+            .current_event(
+                user_msg.instance_id,
+                Some(user_msg.user_message_id),
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("stream: event read failed: {e}");
+                None
+            });
+        let event_judge = current_event
+            .as_ref()
+            .map(|c| crate::prompt::event_judge_text(&c.event, c.at));
+        let event_reply = current_event
+            .as_ref()
+            .map(|c| crate::prompt::event_reply_text(&c.event, c.at));
         // ── PDE decision (judge-first) ────────────────────────────────────────
         // The judge runs before vision/input-filter/chat so a `ghost` verdict
         // short-circuits all of them. Feature-off skips the judge (rule
@@ -4506,6 +4532,7 @@ pub(crate) fn run_stream_with(
                         product_qa_recent.as_deref(),
                         body_state.as_deref(),
                         prior_needs.as_ref(),
+                        event_judge.as_deref(),
                     );
                     // Read receipt (migration 0053): the judge is the first
                     // generative model to see this message, so this is the
@@ -5546,6 +5573,7 @@ pub(crate) fn run_stream_with(
                     user_msg.session_id, user_msg.user_id, user_msg.instance_id,
                     user_msg.user_message_id, &now_ctx, true,
                     body_state.as_deref(), needs_text.as_deref(),
+                    event_reply.as_deref(),
                 ).await;
                 let (req, injected_tags) = match req_res {
                     Ok(r) => r,
@@ -7166,7 +7194,7 @@ mod tests {
             images_in_window: 2,
             last_assistant_is_image: true,
         };
-        let ctx = build_pde_ctx(&t, &input, true, None, None, None);
+        let ctx = build_pde_ctx(&t, &input, true, None, None, None, None);
         assert!(
             ctx.contains("[近期图片] 最近8条消息内已发图=2 张；上一条 AI 消息是图片=是"),
             "facts line must render with a message-based unit: {ctx}"
@@ -7187,7 +7215,7 @@ mod tests {
             images_in_window: 0,
             last_assistant_is_image: false,
         };
-        let ctx = build_pde_ctx(&t, &input, false, None, None, None);
+        let ctx = build_pde_ctx(&t, &input, false, None, None, None, None);
         assert!(
             ctx.contains("[近期图片] 最近8条消息内已发图=0 张；上一条 AI 消息是图片=否"),
             "the negative case is a signal too and must always render: {ctx}"
@@ -18262,7 +18290,7 @@ data: [DONE]\n\n";
         use eros_engine_core::types::ItemKind;
         let t = JudgeTranscript::default();
         let mut input = fixture_decision_input();
-        let bare = build_pde_ctx(&t, &input, false, None, None, None);
+        let bare = build_pde_ctx(&t, &input, false, None, None, None, None);
         assert!(
             !bare.contains("[你的物品]") && !bare.contains("[你的衣柜]"),
             "{bare}"
@@ -18273,7 +18301,7 @@ data: [DONE]\n\n";
             name: "红色旗袍".into(),
             gifted: true,
         }];
-        let ctx = build_pde_ctx(&t, &input, false, None, None, None);
+        let ctx = build_pde_ctx(&t, &input, false, None, None, None, None);
         assert!(!ctx.contains("[你的物品]"), "{ctx}");
         assert!(
             ctx.contains("[你的衣柜] 「红色旗袍」（对方送的）\n"),
@@ -18311,7 +18339,7 @@ data: [DONE]\n\n";
             transcript: "用户：hi\nMia：hey".into(),
             ..Default::default()
         };
-        let ctx = build_pde_ctx(&t, &input, true, None, None, None);
+        let ctx = build_pde_ctx(&t, &input, true, None, None, None, None);
         let persona_at = ctx.find("[角色人格]").expect("persona block present");
         let rel_at = ctx.find("[亲密度]").expect("relationship bucket present");
         assert!(
@@ -18354,7 +18382,15 @@ data: [DONE]\n\n";
         input.affinity.intimacy = 0.0;
         input.affinity.tension = 0.0; // bond 0.90, chemistry 0.30
         input.affinity.patience = 0.8;
-        let ctx = build_pde_ctx(&JudgeTranscript::default(), &input, true, None, None, None);
+        let ctx = build_pde_ctx(
+            &JudgeTranscript::default(),
+            &input,
+            true,
+            None,
+            None,
+            None,
+            None,
+        );
         assert!(
             ctx.contains("[亲密度] 当前档位=第 3 档\n"),
             "intimacy line carries the rung and nothing else: {ctx}"
@@ -18389,7 +18425,15 @@ data: [DONE]\n\n";
             input.affinity.intrigue = score;
             input.affinity.intimacy = 0.0;
             input.affinity.tension = 0.0;
-            let ctx = build_pde_ctx(&JudgeTranscript::default(), &input, true, None, None, None);
+            let ctx = build_pde_ctx(
+                &JudgeTranscript::default(),
+                &input,
+                true,
+                None,
+                None,
+                None,
+                None,
+            );
             assert!(
                 ctx.contains(&format!("当前档位=第 {want} 档")),
                 "S={score} renders rung {want}: {ctx}"
@@ -18397,7 +18441,15 @@ data: [DONE]\n\n";
         }
         for (patience, want) in [(0.349, "低"), (0.35, "中"), (0.649, "中"), (0.65, "高")] {
             input.affinity.patience = patience;
-            let ctx = build_pde_ctx(&JudgeTranscript::default(), &input, true, None, None, None);
+            let ctx = build_pde_ctx(
+                &JudgeTranscript::default(),
+                &input,
+                true,
+                None,
+                None,
+                None,
+                None,
+            );
             assert!(
                 ctx.contains(&format!("[耐心] 当前档位={want}")),
                 "patience={patience} renders {want}: {ctx}"
@@ -18417,7 +18469,15 @@ data: [DONE]\n\n";
         input.affinity.intimacy = 0.033;
         input.affinity.tension = 0.033;
         input.affinity.patience = 0.5;
-        let ctx = build_pde_ctx(&JudgeTranscript::default(), &input, false, None, None, None);
+        let ctx = build_pde_ctx(
+            &JudgeTranscript::default(),
+            &input,
+            false,
+            None,
+            None,
+            None,
+            None,
+        );
         assert!(
             ctx.contains("[亲密度] 当前档位=第 1 档"),
             "fresh session renders the bottom rung: {ctx}"
@@ -18452,7 +18512,15 @@ data: [DONE]\n\n";
             persona: p,
             signals: test_signals(),
         };
-        let ctx = build_pde_ctx(&JudgeTranscript::default(), &input, false, None, None, None);
+        let ctx = build_pde_ctx(
+            &JudgeTranscript::default(),
+            &input,
+            false,
+            None,
+            None,
+            None,
+            None,
+        );
         assert!(!ctx.contains("[角色人格]"), "no persona block: {ctx}");
         assert!(
             ctx.starts_with("[最近对话]"),
@@ -18477,16 +18545,16 @@ data: [DONE]\n\n";
             ..Default::default()
         };
         // feature off → no lines at all
-        let off = build_pde_ctx(&t, &input, true, None, None, None);
+        let off = build_pde_ctx(&t, &input, true, None, None, None, None);
         assert!(!off.contains("[产品咨询]"));
         assert!(!off.contains("[最近产品咨询]"));
         // on, no history → availability line only
-        let on_empty = build_pde_ctx(&t, &input, true, Some(""), None, None);
+        let on_empty = build_pde_ctx(&t, &input, true, Some(""), None, None, None);
         assert!(on_empty.contains("[产品咨询] 本轮可答产品问题=是"));
         assert!(!on_empty.contains("[最近产品咨询]"));
         // on, with history → both blocks, before [用户最新消息]
         let recent = render_product_qa_pairs(&[("这是什么".into(), "这是……".into())]);
-        let on_recent = build_pde_ctx(&t, &input, true, Some(&recent), None, None);
+        let on_recent = build_pde_ctx(&t, &input, true, Some(&recent), None, None, None);
         assert!(on_recent.contains("[最近产品咨询]\n用户: 这是什么\n回答: 这是……"));
         assert!(on_recent.find("[产品咨询]").unwrap() < on_recent.find("[用户最新消息]").unwrap());
     }
@@ -18591,7 +18659,7 @@ data: [DONE]\n\n";
     fn build_pde_ctx_states_the_body_state_before_the_action() {
         let t = JudgeTranscript::default();
         let mut input = fixture_decision_input();
-        let bare = build_pde_ctx(&t, &input, false, None, None, None);
+        let bare = build_pde_ctx(&t, &input, false, None, None, None, None);
         assert!(!bare.contains("[身体状态]"), "{bare}");
         if let Event::UserMessage { action, .. } = &mut input.event {
             *action = Some(eros_engine_core::types::UserAction::Kiss);
@@ -18602,6 +18670,7 @@ data: [DONE]\n\n";
             false,
             None,
             Some("1 支烟，烟劲很足，正在劲头上"),
+            None,
             None,
         );
         let body = ctx
@@ -18615,11 +18684,11 @@ data: [DONE]\n\n";
     fn build_pde_ctx_states_a_named_outfit() {
         let t = JudgeTranscript::default();
         let mut input = fixture_decision_input();
-        assert!(!build_pde_ctx(&t, &input, false, None, None, None).contains("[指定穿着]"));
+        assert!(!build_pde_ctx(&t, &input, false, None, None, None, None).contains("[指定穿着]"));
         if let Event::UserMessage { outfit, .. } = &mut input.event {
             *outfit = Some("红色旗袍".into());
         }
-        let ctx = build_pde_ctx(&t, &input, false, None, None, None);
+        let ctx = build_pde_ctx(&t, &input, false, None, None, None, None);
         assert!(ctx.contains("[指定穿着] 「红色旗袍」\n"), "{ctx}");
         assert!(
             ctx.find("[指定穿着]").unwrap() < ctx.find("[用户最新消息]").unwrap(),
@@ -18654,12 +18723,12 @@ data: [DONE]\n\n";
     fn build_pde_ctx_states_the_action_line_only_on_action_turns() {
         let t = JudgeTranscript::default();
         let mut input = fixture_decision_input();
-        let plain = build_pde_ctx(&t, &input, false, None, None, None);
+        let plain = build_pde_ctx(&t, &input, false, None, None, None, None);
         assert!(!plain.contains("[用户动作]"), "{plain}");
         if let Event::UserMessage { action, .. } = &mut input.event {
             *action = Some(eros_engine_core::types::UserAction::Kiss);
         }
-        let ctx = build_pde_ctx(&t, &input, false, None, None, None);
+        let ctx = build_pde_ctx(&t, &input, false, None, None, None, None);
         assert!(ctx.contains("[用户动作] 对方凑过来想亲你\n"), "{ctx}");
         assert!(
             ctx.find("[用户动作]").unwrap() < ctx.find("[用户最新消息]").unwrap(),
@@ -18747,6 +18816,7 @@ data: [DONE]\n\n";
             None,
             Some("1 支烟，烟劲很足，正在劲头上"),
             None,
+            None,
         );
         assert!(none.contains("[需求] 尚未判定\n"), "{none}");
         let n = Needs {
@@ -18762,12 +18832,34 @@ data: [DONE]\n\n";
             None,
             Some("1 支烟，烟劲很足，正在劲头上"),
             Some(&n),
+            None,
         );
         let line = ctx
             .find("[需求] 饥饿=高 社交欲=低 体力=中 情感需求=中\n")
             .expect(&ctx);
         assert!(line < ctx.find("[身体状态]").unwrap(), "{ctx}");
         assert!(line < ctx.find("[用户最新消息]").unwrap(), "{ctx}");
+    }
+
+    #[test]
+    fn build_pde_ctx_states_the_event_between_the_needs_and_the_body_state() {
+        let input = fixture_decision_input();
+        let t = JudgeTranscript::default();
+        assert!(!build_pde_ctx(&t, &input, false, None, None, None, None).contains("[近期事件]"));
+        let ctx = build_pde_ctx(
+            &t,
+            &input,
+            false,
+            None,
+            Some("1 支烟，烟劲很足，正在劲头上"),
+            None,
+            Some("临时接到工作（1 小时前开始，约 3 小时后结束）"),
+        );
+        let line = ctx
+            .find("[近期事件] 临时接到工作（1 小时前开始，约 3 小时后结束）\n")
+            .expect(&ctx);
+        assert!(ctx.find("[需求]").unwrap() < line, "{ctx}");
+        assert!(line < ctx.find("[身体状态]").unwrap(), "{ctx}");
     }
 
     #[test]
@@ -21406,12 +21498,40 @@ data: [DONE]\n\n"
         umid: Uuid,
     }
 
+    /// One row seeded before the turn: role, `assistant_action_type`,
+    /// metadata, and minutes before now it was sent (negative = after the
+    /// turn's own row).
+    struct SeedRow {
+        role: &'static str,
+        action: Option<&'static str>,
+        metadata: serde_json::Value,
+        mins_ago: i32,
+    }
+
     /// A plain text turn ("在吗"). `prior`: earlier user rows as
     /// (metadata, minutes ago; negative = after the turn). `verdict`: the
     /// judge's reply, or `None` to run without `[tasks.pde_decision]`.
     async fn run_needs_turn(
         pool: &PgPool,
         prior: &[(serde_json::Value, i32)],
+        verdict: Option<serde_json::Value>,
+    ) -> NeedsTurn {
+        let rows: Vec<SeedRow> = prior
+            .iter()
+            .map(|(metadata, mins_ago)| SeedRow {
+                role: "user",
+                action: None,
+                metadata: metadata.clone(),
+                mins_ago: *mins_ago,
+            })
+            .collect();
+        run_seeded_turn(pool, &rows, verdict).await
+    }
+
+    /// [`run_needs_turn`] with arbitrary seeded rows.
+    async fn run_seeded_turn(
+        pool: &PgPool,
+        rows: &[SeedRow],
         verdict: Option<serde_json::Value>,
     ) -> NeedsTurn {
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
@@ -21463,14 +21583,17 @@ data: [DONE]\n\n"
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
-        for (meta, mins_ago) in prior {
+        for r in rows {
             sqlx::query(
-                "INSERT INTO engine.chat_messages (session_id, role, content, metadata, sent_at) \
-                 VALUES ($1, 'user', 'prior', $2, now() - make_interval(mins => $3))",
+                "INSERT INTO engine.chat_messages \
+                   (session_id, role, content, assistant_action_type, metadata, sent_at) \
+                 VALUES ($1, $2, 'prior', $3, $4, now() - make_interval(mins => $5))",
             )
             .bind(session_id)
-            .bind(meta)
-            .bind(*mins_ago)
+            .bind(r.role)
+            .bind(r.action)
+            .bind(&r.metadata)
+            .bind(r.mins_ago)
             .execute(pool)
             .await
             .unwrap();
@@ -21707,6 +21830,72 @@ data: [DONE]\n\n"
         );
         let chat = chat_request_body(&t.mock.received_requests().await.unwrap());
         assert!(chat.contains("- 此刻的需要：饿了"), "{chat}");
+    }
+
+    /// An event row seeded `started_mins_ago` before now, ending
+    /// `ends_in_mins` after now.
+    fn event_seed(kind: &str, started_mins_ago: i32, ends_in_mins: i64) -> SeedRow {
+        SeedRow {
+            role: "assistant",
+            action: Some("proactive"),
+            metadata: serde_json::json!({"proactive": "event", "event_key": "seed",
+                "event": {"kind": kind,
+                    "ends_at": (chrono::Utc::now() + chrono::Duration::minutes(ends_in_mins)).to_rfc3339()}}),
+            mins_ago: started_mins_ago,
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_turn_during_an_event_tells_the_judge_and_the_reply(pool: PgPool) {
+        let t = run_seeded_turn(
+            &pool,
+            &[event_seed("temp_work", 120, 120)],
+            Some(serde_json::json!({"action": "reply_text", "inner_state": ""})),
+        )
+        .await;
+        let reqs = t.mock.received_requests().await.unwrap();
+        let judge = judge_request(&reqs);
+        assert!(
+            judge.contains("[近期事件] 临时接到工作（2 小时前开始，约 2 小时后结束）\\n"),
+            "{judge}"
+        );
+        assert!(chat_request_body(&reqs).contains("- 正在经历：临时接到工作（约 2 小时后结束）"));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_turn_after_the_event_ended_hears_nothing_of_it(pool: PgPool) {
+        let t = run_seeded_turn(
+            &pool,
+            &[event_seed("animal_encounter", 70, -10)],
+            Some(serde_json::json!({"action": "reply_text", "inner_state": ""})),
+        )
+        .await;
+        let reqs = t.mock.received_requests().await.unwrap();
+        assert!(!judge_request(&reqs).contains("[近期事件]"));
+        assert!(!chat_request_body(&reqs).contains("正在经历"));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_event_that_started_after_the_turn_is_not_shown(pool: PgPool) {
+        let t = run_seeded_turn(
+            &pool,
+            &[event_seed("weather_change", -5, 240)],
+            Some(serde_json::json!({"action": "reply_text", "inner_state": ""})),
+        )
+        .await;
+        let reqs = t.mock.received_requests().await.unwrap();
+        assert!(!judge_request(&reqs).contains("[近期事件]"));
+        assert!(!chat_request_body(&reqs).contains("正在经历"));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn without_the_judge_the_reply_still_hears_of_the_event(pool: PgPool) {
+        let t = run_seeded_turn(&pool, &[event_seed("police_encounter", 10, 50)], None).await;
+        let chat = chat_request_body(&t.mock.received_requests().await.unwrap());
+        assert!(
+            chat.contains("- 正在经历：被警察拦下问话（不到 1 小时后结束）"),
+            "{chat}"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
