@@ -18,7 +18,7 @@ pub struct NeedsRating {
 
 /// A life event: the proactive message that told it (spec
 /// 2026-10-13-life-events-design.md §5.4). `started_at` is the row's
-/// `sent_at`; `ends_at` was fixed when the event was drawn.
+/// `sent_at`; `ends_at` was fixed when the event was written.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EventRecord {
     pub message_id: Uuid,

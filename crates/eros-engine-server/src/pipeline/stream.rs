@@ -21534,6 +21534,17 @@ data: [DONE]\n\n"
         rows: &[SeedRow],
         verdict: Option<serde_json::Value>,
     ) -> NeedsTurn {
+        run_seeded_turn_at(pool, rows, verdict, 0).await
+    }
+
+    /// [`run_seeded_turn`] with the turn's own row sent `turn_mins_ago`
+    /// minutes before now.
+    async fn run_seeded_turn_at(
+        pool: &PgPool,
+        rows: &[SeedRow],
+        verdict: Option<serde_json::Value>,
+        turn_mins_ago: i32,
+    ) -> NeedsTurn {
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
         use futures_util::StreamExt;
         use wiremock::matchers::{body_string_contains, path as wm_path};
@@ -21612,6 +21623,15 @@ data: [DONE]\n\n"
             UpsertUserOutcome::Inserted { message_id } => message_id,
             _ => unreachable!(),
         };
+        sqlx::query(
+            "UPDATE engine.chat_messages SET sent_at = now() - make_interval(mins => $2) \
+             WHERE id = $1",
+        )
+        .bind(umid)
+        .bind(turn_mins_ago)
+        .execute(pool)
+        .await
+        .unwrap();
         let frames: Vec<ProtocolFrame> = run_stream(
             std::sync::Arc::new(state),
             PersistedUserMessage {
@@ -21838,7 +21858,7 @@ data: [DONE]\n\n"
         SeedRow {
             role: "assistant",
             action: Some("proactive"),
-            metadata: serde_json::json!({"proactive": "event", "event_key": "seed",
+            metadata: serde_json::json!({"proactive": "event", "event_key": kind,
                 "event": {"kind": kind,
                     "ends_at": (chrono::Utc::now() + chrono::Duration::minutes(ends_in_mins)).to_rfc3339()}}),
             mins_ago: started_mins_ago,
@@ -21886,6 +21906,30 @@ data: [DONE]\n\n"
         let reqs = t.mock.received_requests().await.unwrap();
         assert!(!judge_request(&reqs).contains("[近期事件]"));
         assert!(!chat_request_body(&reqs).contains("正在经历"));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_event_is_read_at_the_turns_own_row(pool: PgPool) {
+        // The turn was sent 30 minutes ago. The police stop began 30 minutes
+        // before it and ended 25 minutes after it: under way at the turn.
+        // The weather change began after the turn and is still going now:
+        // not yet there when the turn was sent.
+        let t = run_seeded_turn_at(
+            &pool,
+            &[
+                event_seed("police_encounter", 60, -5),
+                event_seed("weather_change", 10, 230),
+            ],
+            Some(serde_json::json!({"action": "reply_text", "inner_state": ""})),
+            30,
+        )
+        .await;
+        let judge = judge_request(&t.mock.received_requests().await.unwrap());
+        assert!(
+            judge.contains("[近期事件] 被警察拦下问话（不到 1 小时前开始，不到 1 小时后结束）\\n"),
+            "{judge}"
+        );
+        assert!(!judge.contains("天气突然变了"), "{judge}");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

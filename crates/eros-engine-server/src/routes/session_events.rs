@@ -295,7 +295,6 @@ pub(crate) async fn draw_event_at(
             occasion: Occasion::Event {
                 event_key: key,
                 kind,
-                ends_at: now + events::duration(kind),
             },
             recall_query,
             since: now,
@@ -404,7 +403,7 @@ mod tests {
         let mock = MockServer::start().await;
         mount_companion(&mock, "刚被老板叫去加班，晚点聊").await;
         let state = with_companion(test_state(pool.clone()), &mock.uri());
-        let now = Utc::now();
+        let now = Utc::now() - chrono::Duration::minutes(1);
 
         let out = draw_event_at(
             &state,
@@ -426,6 +425,7 @@ mod tests {
             crate::routes::session_open::GreetingOccasion::Event
         );
         assert_eq!((e.ends_at - e.started_at).num_hours(), 4);
+        assert!(e.started_at > now, "the event's time is when it is written");
 
         let meta: serde_json::Value =
             sqlx::query_scalar("SELECT metadata FROM engine.chat_messages WHERE id = $1")
@@ -595,6 +595,29 @@ mod tests {
         .unwrap();
         assert!(out.event.is_none());
         assert!(calls(&mock).await.is_empty());
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn ex_message_needs_closeness(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "前任给我发消息了").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        // A fresh session sits on rung 1; the ex only writes from rung 2.
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            req("k1", Some(vec![EventKindDto::ExMessage])),
+            Utc::now(),
+            0.5,
+        )
+        .await
+        .unwrap();
+        assert!(out.event.is_none() && out.message.is_none());
+        assert!(calls(&mock).await.is_empty());
+        assert_eq!(event_rows(&pool, session_id).await, 0);
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

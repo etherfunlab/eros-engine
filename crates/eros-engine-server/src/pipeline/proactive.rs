@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! A persona-initiated assistant message: the holiday greeting and the
-//! caller-named openers. The route (`routes::session_open`) decides whether
-//! the persona speaks first; this module generates and persists it. Modelled
-//! on the image-edit text half: no PDE, no streaming, no user row, no
+//! A persona-initiated assistant message: the holiday and birthday greetings,
+//! the caller-named openers and the life events. The route
+//! (`routes::session_open`, `routes::session_events`) decides whether the
+//! persona speaks first; this module generates and persists it. Modelled on
+//! the image-edit text half: no PDE, no streaming, no user row, no
 //! post-process.
 //!
+//! A greeting or opener is written at its `since` cutoff and yields to any
+//! message that landed first. An event is written at the moment its message
+//! is generated, its `ends_at` counted from that instant, and it does not
+//! yield to user messages or openers; only an event already under way for the
+//! persona, or one with the same key in the session, blocks it.
+//!
 //! Specs: docs/superpowers/specs/2026-09-26-user-locale-and-holiday-greeting-design.md §6,
-//! docs/superpowers/specs/2026-10-03-open-occasions-design.md §5–§6
+//! docs/superpowers/specs/2026-10-03-open-occasions-design.md §5–§6,
+//! docs/superpowers/specs/2026-10-13-life-events-design.md §5
 
 use chrono::{DateTime, NaiveDate, Utc};
-use eros_engine_core::events::EventKind;
+use eros_engine_core::events::{self, EventKind};
 use eros_engine_core::persona::CompanionPersona;
 use eros_engine_core::scope::{AffinityScope, MemoryScope};
 use eros_engine_core::types::{
@@ -66,7 +74,6 @@ pub(crate) enum Occasion {
     Event {
         event_key: String,
         kind: EventKind,
-        ends_at: DateTime<Utc>,
     },
 }
 
@@ -125,7 +132,8 @@ pub(crate) struct Greeting<'a> {
     /// The cutoff `greet`'s insert re-checks atomically: no message other
     /// than a dated greeting may have landed at or after it. The local
     /// midnight for a holiday (user clock) or a birthday (persona clock); the
-    /// request's start for an opener.
+    /// request's start for an opener. An event does not read it: it is
+    /// written at the instant its message is generated.
     pub since: DateTime<Utc>,
     pub tier: Option<String>,
     pub prompt_traits: Vec<PromptTrait>,
@@ -136,9 +144,12 @@ pub(crate) struct Greeting<'a> {
 }
 
 /// Generate and persist the message. `Ok(None)`: the model returned a blank
-/// reply and nothing was written, or the insert yielded to a message that
-/// landed first. When a concurrent call for the same local date or
-/// `open_key` won the insert, returns that call's row.
+/// reply and nothing was written; or, for a greeting or opener, the insert
+/// yielded to a message that landed first; or, for an event, another event
+/// under way for the persona blocked the insert. When a concurrent call for
+/// the same local date, `open_key` or `event_key` won the insert, returns
+/// that call's row. An event is stamped with one instant taken after
+/// generation: its row's `sent_at` and the start of its `ends_at` span.
 pub(crate) async fn greet(
     state: &AppState,
     g: Greeting<'_>,
@@ -250,6 +261,8 @@ pub(crate) async fn greet(
     }
     let (llm_attempts, gateway_errors) = split_failures(&resp.failures);
 
+    // An event is written when its message is, not when the request began.
+    let event_at = Utc::now();
     let mut metadata = g.metadata;
     metadata.insert("proactive".into(), g.occasion.name().into());
     match &g.occasion {
@@ -270,11 +283,8 @@ pub(crate) async fn greet(
         Occasion::FirstMeet { open_key } | Occasion::JustOpened { open_key } => {
             metadata.insert("open_key".into(), open_key.as_str().into());
         }
-        Occasion::Event {
-            event_key,
-            kind,
-            ends_at,
-        } => {
+        Occasion::Event { event_key, kind } => {
+            let ends_at = event_at + events::duration(*kind);
             metadata.insert("event_key".into(), event_key.as_str().into());
             metadata.insert(
                 "event".into(),
@@ -326,7 +336,7 @@ pub(crate) async fn greet(
             }
         }
         Occasion::Event { event_key, .. } => match chat_repo
-            .insert_event_message(g.instance_id, g.session_id, g.since, &row)
+            .insert_event_message(g.instance_id, g.session_id, event_at, &row)
             .await?
         {
             Some(written) => Ok(Some(written)),

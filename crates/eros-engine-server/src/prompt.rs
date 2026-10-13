@@ -3723,7 +3723,7 @@ mod tests {
             event_reply_text(&e, at),
             "路上遇到小动物（不到 1 小时后结束）"
         );
-        // Rounded: 89 minutes → 1, 91 → 2.
+        // Rounded to whole hours: 89 minutes → 1, 151 minutes → 3.
         let (e, at) = event_at(EventKind::WeatherChange, 89, 151);
         assert_eq!(
             event_judge_text(&e, at),
