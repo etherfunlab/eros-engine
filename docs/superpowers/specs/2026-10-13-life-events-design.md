@@ -134,9 +134,11 @@ After validation and `resolve_text_turn` (`404 session_not_found`,
    sessions. `draw` with `thread_rng`. `None` → `{"event": null,
    "message": null}`, no model call.
 3. **Generate** under the per-user in-flight cap every LLM entry point uses
-   (429 when reached). `greet` with a new `Occasion::Event { event_key, kind,
-   ends_at }`: its cue is the kind's cue, and the recall query is the latest
-   user row's `recall_query_text`, as for `just_opened`. A failed generation
+   (429 when reached). `greet` with a new `Occasion::Event { event_key, kind
+   }`: its cue is the kind's cue, and the recall query is the latest
+   user row's `recall_query_text`, as for `just_opened`. The event's time is
+   one instant taken after generation: it is the row's `sent_at`, and
+   `ends_at` is that instant plus the kind's duration. A failed generation
    returns the upstream error and writes nothing. A blank reply, or one
    `output_regex` strips to empty, writes nothing and returns nulls.
 4. **Persist** atomically (§5.4).
@@ -168,7 +170,7 @@ The row has the shape of an opener: `role = 'assistant'`,
 
 - `proactive`: `"event"`;
 - `event`: `{"kind": "…", "ends_at": "…"}`. `ends_at` is stored because it is
-  fixed when the event is drawn, and a later change to a kind's duration must
+  fixed when the event is written, and a later change to a kind's duration must
   not move past events;
 - `event_key`;
 - `user_timezone`, `user_country`, `user_region`, `tier`, `prompt_traits`,

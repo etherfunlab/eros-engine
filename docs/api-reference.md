@@ -926,12 +926,14 @@ seconds:
 ```
 
 `message` has the `/open` greeting's shape, with `occasion: "event"`.
-`started_at` is the message's `sent_at`; `ends_at` is fixed when the event is
-drawn.
+`started_at` is the message's `sent_at`, the moment it is written; `ends_at` is
+that moment plus the event's duration.
 
 - **Idempotent per session and `event_key`.** A repeat call returns the same
-  event and message, with no draw and no generation. A call that returned
-  nulls wrote nothing, so a repeat can still draw.
+  event and message, with no draw and no generation. A repeat that arrives
+  while the first is still generating may generate once more, but only one
+  event is written and both calls return it. A call that returned nulls wrote
+  nothing, so a repeat can still draw.
 - **Persisted like any reply.** The message is an ordinary assistant row
   (`assistant_action_type = 'proactive'`, no `user_message_id`), unread until
   `POST /comp/chat/{session_id}/read`. Change feeds and both history routes

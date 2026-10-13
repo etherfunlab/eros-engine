@@ -763,10 +763,10 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
  "message": {"message_id": "…", "content": "刚被老板叫去加班，晚点聊", "sent_at": "2026-10-13T12:00:00Z", "occasion": "event"}}
 ```
 
-`message` 的形状与 `/open` 的开场白相同，`occasion` 为 `"event"`。`started_at` 即这条消息的 `sent_at`，
-`ends_at` 在抽到事件时就已确定。
+`message` 的形状与 `/open` 的开场白相同，`occasion` 为 `"event"`。`started_at` 即这条消息的 `sent_at`，也就是它写入的那一刻；
+`ends_at` 是那一刻加上事件的时长。
 
-- **按会话加 `event_key` 幂等。** 重复调用返回同一个事件和同一条消息，不再抽取，也不再生成。返回空值的调用什么都没写，同一个 key 再调仍可能抽到。
+- **按会话加 `event_key` 幂等。** 重复调用返回同一个事件和同一条消息，不再抽取，也不再生成。第一次调用还在生成时到达的重复调用，可能再生成一次，但只会写入一个事件，两次调用都返回它。返回空值的调用什么都没写，同一个 key 再调仍可能抽到。
 - **与普通回复一样落库：** 这条消息是一条普通的 assistant 行（`assistant_action_type = 'proactive'`，
   没有 `user_message_id`），在调用 `POST /comp/chat/{session_id}/read` 之前都是未读。
   Realtime 和两个 history 路由都能看到。
