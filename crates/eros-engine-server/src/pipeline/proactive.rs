@@ -6,8 +6,8 @@
 //! the image-edit text half: no PDE, no streaming, no user row, no
 //! post-process.
 //!
-//! A greeting or opener is written at its `since` cutoff and yields to any
-//! message that landed first. An event is written at the moment its message
+//! A greeting or opener is checked against its `since` cutoff and yields to
+//! any message that landed at or after it. An event is written at the moment its message
 //! is generated, its `ends_at` counted from that instant, and it does not
 //! yield to user messages or openers; only an event already under way for the
 //! persona, or one with the same key in the session, blocks it.
