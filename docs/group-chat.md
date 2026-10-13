@@ -227,7 +227,7 @@ after the first frame.
 | `meta` | gains `speaker_session_id` on group turns; omitted on 1:1 turns, whose frames are unchanged |
 | `delta` / `done` / `image_request` | unchanged, keyed by `message_id` |
 | `speaker_error` | `{speaker_session_id, code, message}`; non-terminal. A new frame rather than an `error` variant, because clients treat `error` as the end of the turn |
-| `final` | the 1:1 shape; counters are summed over speakers, and `filtered` / `prompt_injected` are true if any speaker's was |
+| `final` | the 1:1 shape; counters are summed over speakers, `filtered` / `prompt_injected` are true if any speaker's was, and `llm_attempts` / `gateway_errors` collect the failed attempts of the director, every speaker and any image composer |
 
 The engine only emits frames. Whether reasoning is shown in full, collapsed or
 as a "thinking" indicator is the client's decision.
@@ -369,6 +369,7 @@ none.
 
 - Async send, voice, and user image upload (vision).
 - User actions, gifts and tips.
+- The persona's lingering effects, needs and life events: a speaker's prompt and the director's context carry none of them.
 - Reactions and image edit.
 - BYOK on the group route.
 - Proactive group messages: the director only answers the user.

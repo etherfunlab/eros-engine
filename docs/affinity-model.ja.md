@@ -209,7 +209,7 @@ Chemistry: `spark` / `flirtation` / `crush` / `lover` / `beloved`
 
 ## 6. 親密度の読み取り先(利用先マップ)
 
-親密度の値を実際に読み取る先は、次の8つである。
+親密度の値を実際に読み取る先は、次の9つである。
 
 - `[relationship]` — 基礎ペアの象限を使う(§2.1参照)。
 
@@ -224,6 +224,8 @@ Chemistry: `spark` / `flirtation` / `crush` / `lover` / `beloved`
 - PDE ジャッジのコンテキスト — intimacy rung(`max(bond, chemistry)` 上の 1..=3 の画像ゲート、rung3 は 0.76 で開き、設計上ティア4の内側に収まる)と patience バンドを使う。
 
 - グループチャットのディレクター — 各メンバーの Bond と Chemistry のラベルおよび intimacy rung。メンバーの 1:1 セッションから読み取るだけで、書き込みは一切行わない。
+
+- ライフイベントの抽選 — intimacy rung が `ex_message` の可否を決める。rung 1 では抽選されない(events ルートの説明は [API reference](api-reference.md#post-v2compsessionsession_idevents) を参照)。
 
 - ゴーストスコアリング — `score = (1−intrigue)·0.4 + (1−patience)·0.4 + tension·0.2` を使い、ハード veto(最初の10メッセージ、streak ≥ 2、1時間クールダウン)と閾値 0.65(セッションが一度ゴーストした後は 0.85)を適用する。
 

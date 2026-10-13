@@ -12,6 +12,9 @@ Pure-domain types and rules for the [`eros-engine`](https://github.com/etherfunl
 - `affinity` — the six-dimensional relationship vector with its graded write pipeline and decay rules.
 - `pde` — the Persona Decision Engine: rules that decide *how* a persona responds before the LLM call.
 - `ghost` — proactive (unsolicited) message scheduling logic.
+- `group` — group chat's pure half: the director's output, how it becomes an ordered cast, and how a transcript line reads to one speaker.
+- `needs` — the persona's four basic needs and how they carry forward in time.
+- `events` — life event kinds and the draw that picks one.
 - `types` — shared IDs, timestamps, and enums.
 
 ## Use it

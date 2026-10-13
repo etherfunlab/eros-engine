@@ -260,6 +260,8 @@ Ghost 回合从不进入 `persist_with_event`：只有 `ghost_streak` / `total_g
   的边界上）与 patience 分带。
 - 群聊导演：每位成员的 Bond 与 Chemistry 档位标签和 intimacy 档，从该成员的
   1:1 会话里读取，从不写入。
+- 生活事件抽取：intimacy 档决定能否抽到 `ex_message`，档 1 时不会抽到
+  （见 [events 路由](api-reference.zh.md#post-v2compsessionsession_idevents)）。
 - Ghost 打分：`score = (1−intrigue)·0.4 + (1−patience)·0.4 + tension·0.2`，
   带硬否决（前 10 条消息、连续 ghost ≥2、1 小时冷却），阈值 `0.65`，会话已经
   ghost 过一次后升为 `0.85`。

@@ -13,6 +13,7 @@ Postgres + pgvector persistence for the [`eros-engine`](https://github.com/ether
 - `affinity` — persisted six-dimensional relationship state per session.
 - `insight` — structured JSONB user profile.
 - `persona` — persona instances per user.
+- `group` — group chat sessions and their members.
 - `pool` — `PgPool` construction helpers.
 
 SQL migrations ship inside this crate under [`migrations/`](https://github.com/etherfunlab/eros-engine/tree/main/crates/eros-engine-store/migrations) and can be applied with [`sqlx migrate run --source <path>`](https://docs.rs/sqlx).

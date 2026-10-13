@@ -330,6 +330,8 @@ moved (format in [Event rows](#event-rows)).
   and the patience band.
 - The group director — the Bond and Chemistry labels and the intimacy rung of
   each member, read from the member's 1:1 session and never written.
+- The life-event draw — the intimacy rung gates `ex_message`, which is not
+  drawn on rung 1 (see [the events route](api-reference.md#post-v2compsessionsession_idevents)).
 - Ghost scoring —
   `score = (1−intrigue)·0.4 + (1−patience)·0.4 + tension·0.2`, with hard
   vetoes (first 10 messages, streak ≥ 2, 1 h cooldown) and threshold `0.65`

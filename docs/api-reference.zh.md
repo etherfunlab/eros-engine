@@ -174,10 +174,11 @@ data: {"type":"final","filtered":false,"prompt_injected":null,"tier":null,"retri
 不会成功——换一个新的 `client_msg_id` 再发。完整错误码表见
 [设计文档](superpowers/specs/2026-05-19-sse-streaming-chat-0.2-design.md#13-pre-stream-errors-http-status-json-body)。
 
-**该端点仅限文本频道。** 传入语音频道 session 的 `session_id` 会在落库任何
+**该端点仅限文本频道。** 传入语音频道或群 session 的 `session_id` 会在落库任何
 一行之前被拒绝，返回 `409 wrong_channel` —— 它写的是文本频道消息，让这些行
 落进语音会话会使两个频道在同一份 transcript 里交错。语音轮次请改用
-[`POST /comp/voice/{session_id}/turn/stream`](#post-compvoicesession_idturnstream)。
+[`POST /comp/voice/{session_id}/turn/stream`](#post-compvoicesession_idturnstream)，
+群聊轮次请改用 [`POST /v2/comp/group/{group_id}/message/stream`](#群聊)。
 这道闸与语音端点自己的闸对称：两个端点都不会写进对方的 session。
 
 一旦第一个 SSE 字节写出，终端错误以带内 `error` 帧的形式到达并关闭流；
@@ -496,7 +497,7 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 
 - 纯图片：`meta(reply_image) → done → image_request → final`
 - 图文：`meta(reply_text_image) → delta* → done → image_request → final`
-- `ghost`：`meta(action_type=ghost) → done → final` — 无 `delta`，`meta` 中无 `model`，`done` 的 `usage` 和 `generation_id` 均为 `null`。该轮伴侣保持沉默，未调用任何 LLM。
+- `ghost`：`meta(action_type=ghost) → done → final` — 无 `delta`，`meta` 中无 `model`，`done` 的 `usage` 和 `generation_id` 均为 `null`。该轮伴侣保持沉默，未调用聊天模型。
 - 带推理的回合：判官返回了推理时，`reasoning*` 排在这份列表里每种形状的最前面，在 `action_response` 和 `body_state` 之前：`reasoning* → meta(reply) → delta* → done → final`
 - 动作轮次：形状相同，只是 `action_response` 排在第一个 `meta` 之前——`action_response → meta(reply) → delta* → done → final`；不会是 `ghost` 或 `product_qa`
 - 带余效或已知需求的回合：`body_state` 位于第一个 `meta` 之前，两者都发时排在 `action_response` 之后——例如 `action_response → body_state → meta(reply) → delta* → done → final`
@@ -715,7 +716,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
   没有 `user_message_id`），在调用 `POST /comp/chat/{session_id}/read` 之前都是未读。
   Realtime 和两个 history 路由都能看到。
 - **错误：** 带 `occasion` 没带 `open_key`、带 `open_key` 没带 `occasion`、`open_key` 格式不对，返回 `400`，
-  `code: "invalid_payload"`；未知的 `occasion` 返回 `422`。会话检查与 stream 端点相同（`403`、`404`，语音会话 `409`），
+  `code: "invalid_payload"`；未知的 `occasion` 返回 `422`。会话检查与 stream 端点相同（`403`、`404`，语音或群会话 `409`），
   达到单用户并发上限 `429`。生成失败时返回与图片接口相同的上游错误，不写入任何内容，下次打开（用同一个 key）会重试。
 
 ### `POST /v2/comp/session/{session_id}/events`
@@ -789,7 +790,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
  "event": null}
 ```
 
-没有余效时 `effects` 为 `[]`。错误同 `/open`：`404 session_not_found`、`403 session_forbidden`，语音 session 为 `409 wrong_channel`。
+没有余效时 `effects` 为 `[]`。错误同 `/open`：`404 session_not_found`、`403 session_forbidden`，语音或群 session 为 `409 wrong_channel`。
 
 ### `PUT /v2/comp/session/{session_id}/message/{message_id}/reaction`
 
@@ -1390,7 +1391,7 @@ genome 预设（`art_metadata.possessions` / `art_metadata.wardrobe`）排最前
 
 `archived_sessions` 只算**这一次调用**翻掉的 session 数，所以重复调用返回 `200` 加 `0`。所有 channel 一起归档，语音也在内 —— 单位是这段关系，不是某一个客户端看到的那部分。
 
-**会删掉的：** `companion_affinity`（连同它的 events，走 cascade）、`companion_memories` 的关系层、`character_insights` —— 这些留着会渗进下一段对话。**不会删的：** `chat_messages`。聊天记录留着，所以那些按 session id 引用的审计表（`companion_decision_events`、`character_insights_events`、`chat_vision_events`、`chat_images_events`）仍然指得到可读的东西。`companion_memories` 的画像层（`instance_id IS NULL`）也留着 —— 那是关于这个用户的跨角色事实。
+**会删掉的：** `companion_affinity`（连同它的 events，走 cascade）、`companion_memories` 的关系层、`character_insights`、`user_insights`，以及这位角色在每个[群](group-chat.zh.md)里的席位；角色的故事摘要（`persona_story_insights.digest`）会被清空 —— 这些留着会渗进下一段对话。调用落下时仍在运行的回合不会把它们写回去：它对好感度、关系层记忆以及 character 与 user insight 的写入发现 session 已归档，什么都不写。**不会删的：** `chat_messages`。聊天记录留着，所以那些按 session id 引用的审计表（`companion_decision_events`、`character_insights_events`、`chat_vision_events`、`chat_images_events`）仍然指得到可读的东西。`companion_memories` 的画像层（`instance_id IS NULL`）也留着 —— 那是关于这个用户的跨角色事实。
 
 调用之后这些 session 在各处都不可见：history、affinity、session 列表、chat 与语音 turn 路由要么 404 要么直接不返回，`POST /comp/chat/start` 会新建 session 而不是恢复已归档的那个。
 
@@ -1704,6 +1705,8 @@ session 403）。
 | `since` | Unix epoch | RFC 3339；嚴格晚於 `(since, after_user)` 的行 |
 | `after_user` | nil UUID | `since` 內的 tie-break——傳 `next.user_id` |
 | `limit` | 500 | 夾在 1..=1000 |
+
+响应是 `{"profiles": [...], "next": {"updated_at": "…", "user_id": "…"}}`；`profiles` 每一项与 [`GET /comp/user/{user_id}/profile`](#get-compuseruser_idprofile) 同形，其中 `updated_at` 一定有值。
 
 行按 `(updated_at, user_id)` 排序。頁滿時才有 `next`；同一次遍歷內，把它的兩個字段原樣傳回 `since` 與 `after_user`——保留微秒精度、URL 編碼——`next` 為 `null` 即結束。截斷時間戳的客戶端（JavaScript `Date` 只到毫秒）在 1000 行共享同一個 `now()` 時會無限重取同一頁。
 

@@ -17,7 +17,10 @@ prompt 里塞入自定义段落。
 
 接受于 `POST /comp/chat/{session_id}/message/stream`、
 `POST /v2/comp/session/{session_id}/message/async`（走 async 端点时，
-trait 随队列传递，由 worker 重新校验）与
+trait 随队列传递，由 worker 重新校验）、
+`POST /v2/comp/group/{group_id}/message/stream`（作用于每位发言者的回复）、
+`POST /v2/comp/session/{session_id}/open` 与
+`POST /v2/comp/session/{session_id}/events`（作用于该调用生成的那条消息），以及
 `POST /v2/comp/session/{session_id}/message/{message_id}/image/edit`
 （作用于 `reply_with_text` 的文本半边）。
 

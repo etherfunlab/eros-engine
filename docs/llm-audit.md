@@ -398,7 +398,7 @@ including attempts a fallback recovered from, which leave no other trace:
 | `engine.chat_messages` | the chat model chain, the output filter, the input filter |
 | `engine.chat_vision_events` | `chat_vision` describe |
 | `engine.chat_images_events` | image-prompt composer |
-| `engine.companion_decision_events` | PDE judge |
+| `engine.companion_decision_events` | PDE judge, group director |
 | `engine.companion_affinity_events` | affinity eval |
 
 Identical shape on all five, so a fleet-wide error view is one `UNION ALL`.

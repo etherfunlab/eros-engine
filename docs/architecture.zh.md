@@ -39,9 +39,10 @@
 PDE 決策                eros_engine_core::pde::decide(&input) → ActionPlan
                         （默认规则型；可通过
                          [tasks.pde_decision].filter_prompt 启用 LLM 判断器，
-                         失败时回退到规则引擎；判断结果记录到
-                         companion_decision_events——payload = 模型返回的，
-                         inputs = 引擎供给它看的状态）
+                         失败时回退到规则引擎；判断器以流式调用，模型返回的
+                         任何推理都会以 `reasoning` 帧到达客户端；判断结果
+                         记录到 companion_decision_events——payload = 模型
+                         返回的，inputs = 引擎供给它看的状态）
        │
        ▼
 action 分派             run_stream 里的 inline `match plan.action_type`：
@@ -130,8 +131,8 @@ post-process spawn 返回 `()` 是 fire-and-forget 設計——用戶面前的�
 dreaming 是例外：它默认也会读 `'voice'` 的行（通话空闲后才读；可用
 `DREAMING_VOICE_DISABLED` 关掉），但仍然排除 `'product_qa'`。
 
-**频道归属在写入侧双向强制。** `companion_stream` 拒绝语音 session，`voice`
-拒绝非语音 session，两者都在落库任何一行之前返回 `409 wrong_channel`。少了
+**频道归属在写入侧双向强制。** `companion_stream` 拒绝语音或群 session，`voice`
+拒绝非语音 session，群发送路由拒绝非群 session，都在落库任何一行之前返回 `409 wrong_channel`。少了
 这层对称性，文本轮次会落进语音会话，它的 `client_msg_id` 还会和语音轮次的
 查找撞车。
 
@@ -194,7 +195,7 @@ crates/
         ├── state.rs          # AppState（pool / auth / openrouter / embed / config）
         ├── error.rs          # AppError → axum IntoResponse
         ├── auth/             # AuthValidator trait + Supabase 實現 + 中間件
-        ├── pipeline/         # stream（run_stream）/ group + group_director / handlers / post_process / dreaming / …
+        ├── pipeline/         # stream（run_stream）/ group + group_director / reasoning_call / handlers / post_process / dreaming / …
         ├── prompt.rs         # system prompt 構造（affinity → 行為指令）
         ├── routes/           # health / companion / companion_stream / companion_async / insight / image_edit / voice / persona / session_open / session_events / session_effects / persona_items / reaction / group / world_town / svc（服务间导出，`/svc/v1/*`）/ bff / dto / mod
         └── openapi.rs        # utoipa ApiDoc 元數據

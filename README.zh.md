@@ -19,8 +19,8 @@
 
 - 🧠 **双层记忆**——稳定的用户事实与共同经历、前情呼应、未完话题各有其位。→ [记忆分层](docs/memory-layers.zh.md)
 - 💞 **演变的亲密度**——六个关系维度按档位写入、经衰减落库，也会随时间回落，逐渐影响语气、深度，甚至是否回复。→ [亲密度模型](docs/affinity-model.zh.md) · [ghost 机制](docs/ghost-mechanics.zh.md)
-- 🎭 **人设决策引擎（PDE）**——生成回复前，先选择行为与内在状态。默认规则即可运行，也可启用 LLM 评判。→ [模型配置](docs/model-config.zh.md)
-- 🧩 **结构化用户洞察**——持续形成可查询的用户画像，供下游产品用于引导、个性化和分析。→ [API 参考](docs/api-reference.zh.md)
+- 🎭 **人设决策引擎（PDE）**——生成回复前，先选择行为与内在状态。默认规则即可运行；可选的 LLM 评判还会评估角色的基本需求，并可把它的推理流式送到客户端。→ [模型配置](docs/model-config.zh.md)
+- 🧩 **结构化用户洞察**——持续形成可查询的用户画像，供下游产品用于引导、个性化和分析；可选的 keyset 导出让下游服务维护一份只读镜像。→ [API 参考](docs/api-reference.zh.md)
 - ⚡ **完整的聊天链路**——SSE 流式输出、图像理解与生成请求、prompt traits、按任务选模型、故障回退及调用审计。OpenRouter 是默认提供方，也可通过 `[providers]` 接入其他兼容 OpenAI 的聊天和 embedding 服务。→ [API 参考](docs/api-reference.zh.md) · [模型配置](docs/model-config.zh.md) 下游还可以让终端用户按轮自带聊天端点和密钥。→ [BYOK](docs/byok.zh.md)
 - 🎙️ **为打断而设计的语音回合**——独立通道上的低延迟回合端点，支持 barge-in：客户端停止播放并回报用户实际听到的内容，因此历史记录的是用户**听到**的，而不是模型生成的。因掉线而丢失的回合可以重新生成，不会卡死。→ [API 参考](docs/api-reference.zh.md#post-compvoicesession_idturnstream)
 - 🌍 **模拟世界**——人设拥有台面下的生活。定时的「世界导演」演进共享关系图谱与每日剧本；信息流让人设彼此发帖、互相评论；每个人设的故事线让工作、感情与日常保持长期一致。完全可选，且由多个独立开关分层控制——没有配置的部署不会跑任何查询，也不会启动任何扫描任务。→ [世界系统](docs/world-system.zh.md)
@@ -115,7 +115,7 @@ cargo run -p eros-engine-server -- serve
 
 ## API 一览
 
-核心流程很简单：创建人设会话，然后向 SSE 流式端点发送对话。语音走独立通道——用 `channel: "voice"` 创建会话并调用语音回合端点（prompt 更精简，另带一个打断调用）；两个通道不会写进彼此的会话。另有一个只入队的备选端点（`POST /v2/comp/session/{session_id}/message/async`），面向无法保持流式连接的 bot 式调用方——回复由后台 worker 生成，落库后从历史记录 / Realtime 读取，而不是走流式帧。引擎还提供历史记录、会话、画像及好感度路由。默认使用 Supabase JWT 鉴权，也可通过 `AuthValidator` 替换。具体路径、payload 与流式帧详见 [API 参考](docs/api-reference.zh.md)。
+核心流程很简单：创建人设会话，然后向 SSE 流式端点发送对话。语音走独立通道——用 `channel: "voice"` 创建会话并调用语音回合端点（prompt 更精简，另带一个打断调用）；两个通道不会写进彼此的会话。另有一个只入队的备选端点（`POST /v2/comp/session/{session_id}/message/async`），面向无法保持流式连接的 bot 式调用方——回复由后台 worker 生成，落库后从历史记录 / Realtime 读取，而不是走流式帧。引擎还提供历史记录、会话、画像及好感度路由，`/v2/comp/group*` 下的群管理，以及一个让角色的一天里发生点什么的生活事件路由（`POST /v2/comp/session/{session_id}/events`）。默认使用 Supabase JWT 鉴权，也可通过 `AuthValidator` 替换；可选的 `GET /svc/v1/insights/changes` 导出改用共享 secret 放行，只有设置了 `INSIGHTS_EXPORT_SECRET` 才会挂载。具体路径、payload 与流式帧详见 [API 参考](docs/api-reference.zh.md)。
 
 ## 配置
 

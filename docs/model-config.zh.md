@@ -623,7 +623,7 @@ BYOK hop 使用其请求中 `byok` 块的 `output_regex` 规则，而不是这�
 **`structured_output` 字段**（bool，默认 `true`）：判断器调用会带
 `response_format` JSON-schema 约束。如果你的供应商或模型不接受这个参数（有些会
 直接返 HTTP 400），把 `structured_output = false` 关掉——引擎会退回到只在 prompt
-里要求 JSON，解析方式不变。`[tasks.world_director]`、
+里要求 JSON，解析方式不变。`[tasks.group_director]`、`[tasks.world_director]`、
 `[tasks.world_stories_director]`、`[tasks.world_comment]` 也有这个字段，默认值
 相同。
 
@@ -996,7 +996,7 @@ model = { "x-ai/grok-4.20" = 0.8, "z-ai/glm-4.7-flash" = 0.2 }  # weighted rando
 
 去重之后，链会被截断到 `retry_depth` 条——每次调用先试 primary，再最多试 `retry_depth` 个 fallback，截断点之后的条目永远不会被尝试。`retry_depth` 可在任务级设置，在两个 tier 感知任务上还可按 tier 覆盖（tier > 任务默认块）。
 
-默认值按任务不同。通用 `resolve()` 用 `2`（primary + 2 个 fallback——所以 `chat_companion` 每轮流式聊天 burst 最多试 3 个模型）；单一用途任务（`chat_output_filter`、`chat_input_filter`、`chat_vision`、`pde_decision`、`chat_product_qa`、`chat_image_prompt_compose`、`chat_image_edit_compose`）用 `1`（primary + 第一个 fallback）。
+默认值按任务不同。通用 `resolve()` 用 `2`（primary + 2 个 fallback——所以 `chat_companion` 每轮流式聊天 burst 最多试 3 个模型）；单一用途任务（`chat_output_filter`、`chat_input_filter`、`chat_vision`、`pde_decision`、`group_director`、`chat_product_qa`、`chat_image_prompt_compose`、`chat_image_edit_compose`）用 `1`（primary + 第一个 fallback）。
 
 ## 稳定性承诺
 

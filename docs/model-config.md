@@ -673,7 +673,7 @@ By default the engine uses the built-in rule engine (`eros-engine-core/src/pde.r
   - `reply_mode` (optional): how this turn's reply relates to the user's message — `"listen"` / `"follow"` / `"ask"` / `"judge"`, or `null` when unsure (the engine's per-turn dice then take over). Varies the reply prompt's iron rule ①; `listen` also drops the reply-length ceiling one tier
   - `clothing` (optional): a short free-text description of the character's outfit this turn. With a `[你的衣柜]` line in the context, the judge should pick from it; with `[指定穿着]`, the engine wears the named outfit and ignores this field. Injected into the reply prompt as a line inside `[character_state]`, and into the image composer's `[此刻穿着]` slot; omitted when absent
   - `action_response` (optional): on a turn that carries a user action (the context then has a `[用户动作]` line), `"accept"` or `"refuse"`; `null` otherwise or when unsure. A `null`, a failed judge, or the rule engine all mean accept. A refusal drops the action's affinity line one tier (see [affinity-model.md](affinity-model.md#refused-actions)). On an action turn `ghost` and `product_qa` are turned into `reply_text`, and the per-turn dice are not rolled
-  - `needs` (optional): the persona's four basic needs this turn, `{hunger, social, stamina, emotional}`, each `"low"` | `"mid"` | `"high"` (`high` = very hungry / wants company badly / full of energy / badly wants to be cared about), or `null` to keep the previous rating. The judge rates the persona alone, never the relationship. The rating is stored on the turn's user row; between ratings the engine carries it forward: hunger rises one level every 4 h, social desire every 12 h, stamina settles toward `mid` every 8 h, emotional need every 12 h. Levels that are not `mid` reach the reply as a `[character_state]` line. A value that does not parse is ignored and never fails the verdict.
+  - `needs` (optional): the persona's four basic needs this turn, `{hunger, social, stamina, emotional}`, each `"low"` | `"mid"` | `"high"` (`high` = very hungry / wants company badly / full of energy / badly wants to be cared about), or `null` to keep the previous rating. The judge rates the persona alone, never the relationship. The rating is stored on the turn's user row; between ratings the engine carries it forward: hunger rises one level every 4 h and social desire every 12 h, while stamina settles one level toward `mid` every 8 h and emotional need every 12 h. Levels that are not `mid` reach the reply as a `[character_state]` line. A value that does not parse is ignored and never fails the verdict.
   - `reason`: optional
 - **Fail-open:** any LLM timeout or error falls back to the rule engine — the LLM judge never blocks a chat response.
 - **`timeout_secs`** (optional, default `15`): the per-attempt limit, one deadline from opening the call through the end of the read. An attempt that runs past it fails and the call moves to the next model in the chain. The range is 1–3600; `0` refuses to boot (the judge would time out every turn), and so does anything above 3600. It is read only on `[tasks.pde_decision]` and ignored on other tasks. The judge's worst case is `timeout_secs × (1 + retry_depth)`; if that plus the reply exceeds `CHAT_QUEUE_GEN_TIMEOUT_SECS` (default 300), the turn ends in `generation_timeout` instead of falling back.
@@ -710,8 +710,9 @@ overlay parses it.
 `response_format` JSON-schema constraint. Set `structured_output = false` if your
 provider or model rejects that parameter (some return HTTP 400) — the engine then
 asks for JSON in the prompt alone and parses the reply the same way. Also
-available on `[tasks.world_director]`, `[tasks.world_stories_director]`, and
-`[tasks.world_comment]`, with the same default.
+available on `[tasks.group_director]`, `[tasks.world_director]`,
+`[tasks.world_stories_director]`, and `[tasks.world_comment]`, with the same
+default.
 
 **`ghosting` field** (bool, default `true`): a safety switch for downstream products. Set `ghosting = false` to disable ghosting across the _entire_ PDE path — LLM verdict, rule fallback, and the pure rule engine — so the companion never goes silent. Useful for products where silent turns are undesirable.
 
@@ -1217,7 +1218,7 @@ After the primary is selected, any occurrence of that exact id is removed from t
 
 After deduplication the chain is truncated to `retry_depth` entries — a call tries the primary, then at most `retry_depth` fallbacks; anything past the truncation point is never tried. `retry_depth` is settable task-level, and per tier on the two tier-aware tasks (tier > task default).
 
-The default differs by task. The generic `resolve()` uses `2` (primary + 2 fallbacks — so `chat_companion` tries at most 3 models per streaming chat burst); the single-purpose tasks (`chat_output_filter`, `chat_input_filter`, `chat_vision`, `pde_decision`, `chat_product_qa`, `chat_image_prompt_compose`, `chat_image_edit_compose`) use `1` (primary + first fallback).
+The default differs by task. The generic `resolve()` uses `2` (primary + 2 fallbacks — so `chat_companion` tries at most 3 models per streaming chat burst); the single-purpose tasks (`chat_output_filter`, `chat_input_filter`, `chat_vision`, `pde_decision`, `group_director`, `chat_product_qa`, `chat_image_prompt_compose`, `chat_image_edit_compose`) use `1` (primary + first fallback).
 
 ## Stability commitments
 

@@ -188,7 +188,7 @@ final
 | `meta` | 群聊轮次多一个 `speaker_session_id`；1:1 轮次省略，帧不变 |
 | `delta` / `done` / `image_request` | 不变，以 `message_id` 为键 |
 | `speaker_error` | `{speaker_session_id, code, message}`；非终止。它是新帧而不是 `error` 的变体，因为客户端把 `error` 当作轮次结束 |
-| `final` | 与 1:1 形状相同；计数在各发言者之间求和，`filtered` / `prompt_injected` 只要有一位发言者为真就为真 |
+| `final` | 与 1:1 形状相同；计数在各发言者之间求和，`filtered` / `prompt_injected` 只要有一位发言者为真就为真，`llm_attempts` / `gateway_errors` 汇总导演、每位发言者和图片合成器失败的尝试 |
 
 引擎只负责发帧。推理是完整展示、折叠还是只显示"思考中"，由客户端决定。
 
@@ -304,6 +304,7 @@ post-process 在 `final` 之后启动一次，从不阻塞流。没有走到 `fi
 
 - 异步发送、语音，以及用户上传图片（vision）。
 - 用户动作、礼物和打赏。
+- 角色的余效、需求和生活事件：发言者的 prompt 和导演的上下文都不带这些。
 - Reaction 和改图。
 - 群路由上的 BYOK。
 - 群里的主动消息：导演只回应用户。

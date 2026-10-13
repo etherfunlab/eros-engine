@@ -39,7 +39,9 @@ load context           load persona via PersonaRepo
 PDE decide             eros_engine_core::pde::decide(&input) → ActionPlan
                        (rules-based by default; opt-in LLM judge via
                         [tasks.pde_decision].filter_prompt, fail-open to
-                        rule engine; verdict audited to
+                        rule engine; the judge streams, so any reasoning its
+                        model returns reaches the client as `reasoning`
+                        frames; verdict audited to
                         companion_decision_events — payload = what the model
                         returned, inputs = the engine-computed state it saw)
        │
@@ -138,8 +140,9 @@ replay, and client history. Dreaming is the exception: it also reads
 `DREAMING_VOICE_DISABLED`), but still excludes `'product_qa'`.
 
 **Channel ownership is enforced on writes, both ways.** `companion_stream`
-refuses a voice session and `voice` refuses a non-voice one, each with
-`409 wrong_channel` before persisting anything. Without that symmetry a text
+refuses a voice or group session, `voice` refuses a non-voice one, and the group
+send route refuses a non-group one, each with `409 wrong_channel` before
+persisting anything. Without that symmetry a text
 turn could land in a voice conversation, and its `client_msg_id` could then
 collide with the voice-turn lookups.
 
@@ -204,7 +207,7 @@ crates/
         ├── state.rs          # AppState (pool/auth/openrouter/embed/config)
         ├── error.rs          # AppError → axum IntoResponse
         ├── auth/             # AuthValidator trait + Supabase impl + middleware
-        ├── pipeline/         # stream (run_stream) / group + group_director / handlers / post_process / dreaming / …
+        ├── pipeline/         # stream (run_stream) / group + group_director / reasoning_call / handlers / post_process / dreaming / …
         ├── prompt.rs         # system-prompt builder (affinity → directives)
         ├── routes/           # health / companion / companion_stream / companion_async / insight / image_edit / voice / persona / session_open / session_events / session_effects / persona_items / reaction / group / world_town / svc (service-to-service export, `/svc/v1/*`) / bff / dto / mod
         └── openapi.rs        # utoipa ApiDoc spec metadata

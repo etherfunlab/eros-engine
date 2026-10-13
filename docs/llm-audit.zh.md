@@ -342,7 +342,7 @@ material 会直接拒绝加载，而不是像以前那样在构造时 warn-and-d
 | `engine.chat_messages` | 对话模型链、输出过滤器、输入过滤器 |
 | `engine.chat_vision_events` | `chat_vision` describe |
 | `engine.chat_images_events` | 图片 prompt 合成器 |
-| `engine.companion_decision_events` | PDE 判官 |
+| `engine.companion_decision_events` | PDE 判官、群聊导演 |
 | `engine.companion_affinity_events` | 好感度评估 |
 
 五张表形状完全一致，全量错误视图一个 `UNION ALL` 就够。列是新增的、可空的，

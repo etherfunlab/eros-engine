@@ -210,7 +210,9 @@ base by construction:
 Per `persona_instance`, every `interval_hours` (default 8), behind an
 **activity gate**: only instances chatted with inside `active_window_hours`
 (default 72) get a round. A quiet instance's life simply pauses and resumes
-the moment chat activity resumes — no catch-up rounds.
+the moment chat activity resumes — no catch-up rounds. Turns in a
+[group](group-chat.md) do not count: they leave the member sessions' activity
+untouched.
 
 | Input | Source |
 |-------|--------|

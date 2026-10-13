@@ -196,11 +196,12 @@ never succeed — send a fresh `client_msg_id`. See the
 for the full code table.
 
 **This endpoint is text-channel only.** A `session_id` belonging to a
-voice-channel session is rejected with `409 wrong_channel` before any row is
-persisted — it writes text-channel messages, and letting them land in a voice
-conversation would interleave both channels in one transcript. Voice turns go
+voice-channel or group session is rejected with `409 wrong_channel` before any
+row is persisted — it writes text-channel messages, and letting them land in a
+voice conversation would interleave both channels in one transcript. Voice turns go
 to [`POST /comp/voice/{session_id}/turn/stream`](#post-compvoicesession_idturnstream)
-instead. The gate mirrors the voice endpoint's, so the two channels are
+instead, and group turns to [`POST /v2/comp/group/{group_id}/message/stream`](#group-chat).
+The gate mirrors the voice endpoint's, so the two channels are
 symmetric: neither endpoint will write into the other's sessions.
 
 Once the first SSE byte has been written, terminal failures arrive as an
@@ -588,7 +589,7 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 
 - image-only: `meta(reply_image) → done → image_request → final`
 - text + image: `meta(reply_text_image) → delta* → done → image_request → final`
-- `ghost`: `meta(action_type=ghost) → done → final` — no `delta`, no `model` in `meta`, `usage` and `generation_id` are `null` in `done`. The companion stayed silent this turn; no LLM was called.
+- `ghost`: `meta(action_type=ghost) → done → final` — no `delta`, no `model` in `meta`, `usage` and `generation_id` are `null` in `done`. The companion stayed silent this turn; no chat model was called.
 - reasoning: when the judge returned reasoning, `reasoning*` precedes every shape in this list, ahead of `action_response` and `body_state`: `reasoning* → meta(reply) → delta* → done → final`
 - action turn: the same shapes with `action_response` ahead of the first `meta` — `action_response → meta(reply) → delta* → done → final`; never `ghost` or `product_qa`
 - a turn with lingering effects or known needs: `body_state` sits ahead of the first `meta`, after `action_response` when both are sent — e.g. `action_response → body_state → meta(reply) → delta* → done → final`
@@ -867,7 +868,7 @@ event's message (see the events route below).
 - **Errors:** `400` with `code: "invalid_payload"` for `occasion` without
   `open_key`, `open_key` without `occasion`, or a malformed `open_key`; `422`
   for an unknown `occasion`. Session checks as on the stream endpoint (`403`,
-  `404`, `409` for a voice session), `429` at the per-user in-flight cap. A
+  `404`, `409` for a voice or group session), `429` at the per-user in-flight cap. A
   failed generation returns the upstream error the image endpoints return and
   persists nothing; the next open (with the same key) retries.
 
@@ -965,7 +966,7 @@ The persona's lingering state from accepted gives, her needs and the event under
  "event": null}
 ```
 
-`effects` is `[]` when nothing is at work. Errors as `/open`: `404 session_not_found`, `403 session_forbidden`, `409 wrong_channel` for a voice session.
+`effects` is `[]` when nothing is at work. Errors as `/open`: `404 session_not_found`, `403 session_forbidden`, `409 wrong_channel` for a voice or group session.
 
 ### `PUT /v2/comp/session/{session_id}/message/{message_id}/reaction`
 
@@ -1662,7 +1663,7 @@ Soft-delete every session this user holds with one persona instance. The instanc
 
 `archived_sessions` counts the sessions flipped by *this* call, so a repeat call returns `200` with `0`. Every channel is archived, voice included — the unit is the relationship, not one client's view of it.
 
-**What is deleted:** `companion_affinity` (and its events, by cascade), the relationship layer of `companion_memories`, and `character_insights` — the state that would otherwise carry into the next conversation. **What is not:** `chat_messages`. The transcript stays, so the audit tables that reference a session by id (`companion_decision_events`, `character_insights_events`, `chat_vision_events`, `chat_images_events`) still point at something readable. The profile layer of `companion_memories` (`instance_id IS NULL`) also stays — those are cross-persona facts about the user.
+**What is deleted:** `companion_affinity` (and its events, by cascade), the relationship layer of `companion_memories`, `character_insights`, `user_insights`, and the persona's seat in every [group](group-chat.md); the persona's story digest (`persona_story_insights.digest`) is cleared — the state that would otherwise carry into the next conversation. A turn still running when the call lands writes none of it back: its affinity, relationship-memory and character and user insight writes find the session archived and write nothing. **What is not:** `chat_messages`. The transcript stays, so the audit tables that reference a session by id (`companion_decision_events`, `character_insights_events`, `chat_vision_events`, `chat_images_events`) still point at something readable. The profile layer of `companion_memories` (`instance_id IS NULL`) also stays — those are cross-persona facts about the user.
 
 Afterwards the sessions are invisible everywhere: history, affinity, the session list, the chat and voice turn routes all return 404 or omit them, and `POST /comp/chat/start` creates a new session rather than resuming an archived one.
 
