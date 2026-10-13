@@ -29,6 +29,7 @@ pub mod persona;
 pub mod persona_items;
 pub mod reaction;
 pub mod session_effects;
+pub mod session_events;
 pub mod session_open;
 pub mod svc;
 pub mod voice;
@@ -55,6 +56,7 @@ pub fn router(state: AppState) -> OpenApiRouter<AppState> {
         .merge(image_edit::router())
         .merge(session_effects::router())
         .merge(session_open::router())
+        .merge(session_events::router())
         .merge(reaction::router())
         .merge(group::router())
         .layer(from_fn_with_state(state.clone(), require_auth));
@@ -89,6 +91,7 @@ pub fn router_for_openapi() -> OpenApiRouter<AppState> {
         .merge(image_edit::router())
         .merge(session_effects::router())
         .merge(session_open::router())
+        .merge(session_events::router())
         .merge(reaction::router())
         .merge(group::router())
         .merge(svc::router())

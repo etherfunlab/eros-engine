@@ -9,6 +9,7 @@
 //! docs/superpowers/specs/2026-10-03-open-occasions-design.md §5–§6
 
 use chrono::{DateTime, NaiveDate, Utc};
+use eros_engine_core::events::EventKind;
 use eros_engine_core::persona::CompanionPersona;
 use eros_engine_core::scope::{AffinityScope, MemoryScope};
 use eros_engine_core::types::{
@@ -60,6 +61,13 @@ pub(crate) enum Occasion {
     JustOpened {
         open_key: String,
     },
+    /// A life event the persona tells about (spec
+    /// 2026-10-13-life-events-design.md §5.2); the caller's key.
+    Event {
+        event_key: String,
+        kind: EventKind,
+        ends_at: DateTime<Utc>,
+    },
 }
 
 impl Occasion {
@@ -71,6 +79,7 @@ impl Occasion {
             Self::FirstMeet { .. } => "first_meet",
             Self::Returning { .. } => "returning",
             Self::JustOpened { .. } => "just_opened",
+            Self::Event { .. } => "event",
         }
     }
 
@@ -85,7 +94,19 @@ impl Occasion {
             Self::Returning { gap_days, .. } => {
                 format!("（对方隔了 {gap_days} 天又打开和你的聊天，还没说话。）")
             }
+            Self::Event { kind, .. } => event_cue(*kind).into(),
         }
+    }
+}
+
+/// The stage cue for a life event: states a fact, carries no instruction.
+fn event_cue(kind: EventKind) -> &'static str {
+    match kind {
+        EventKind::TempWork => "（你刚临时接到一份工作，得马上去处理。）",
+        EventKind::ExMessage => "（你的前任刚给你发来消息。）",
+        EventKind::WeatherChange => "（你那边的天气刚刚突然变了。）",
+        EventKind::PoliceEncounter => "（你刚在外面被警察拦下来问话。）",
+        EventKind::AnimalEncounter => "（你刚在路上遇到了一只小动物。）",
     }
 }
 
@@ -248,6 +269,17 @@ pub(crate) async fn greet(
         Occasion::FirstMeet { open_key } | Occasion::JustOpened { open_key } => {
             metadata.insert("open_key".into(), open_key.as_str().into());
         }
+        Occasion::Event {
+            event_key,
+            kind,
+            ends_at,
+        } => {
+            metadata.insert("event_key".into(), event_key.as_str().into());
+            metadata.insert(
+                "event".into(),
+                serde_json::json!({"kind": kind.as_str(), "ends_at": ends_at.to_rfc3339()}),
+            );
+        }
     }
     metadata.insert("prompt_traits".into(), serde_json::json!(injected_tags));
     metadata.insert(
@@ -292,5 +324,12 @@ pub(crate) async fn greet(
                 None => Ok(chat_repo.open_message(g.session_id, open_key).await?),
             }
         }
+        Occasion::Event { event_key, .. } => match chat_repo
+            .insert_event_message(g.instance_id, g.session_id, g.since, &row)
+            .await?
+        {
+            Some(written) => Ok(Some(written)),
+            None => Ok(chat_repo.event_message(g.session_id, event_key).await?),
+        },
     }
 }

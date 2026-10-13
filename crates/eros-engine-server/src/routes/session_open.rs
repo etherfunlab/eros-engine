@@ -114,6 +114,8 @@ pub enum GreetingOccasion {
     FirstMeet,
     Returning,
     JustOpened,
+    /// A life event the persona tells about (`POST …/events`).
+    Event,
 }
 
 impl From<ChatMessage> for GreetingDto {
