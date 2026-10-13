@@ -727,7 +727,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
  "needs": {"hunger": "high", "social": "mid", "stamina": "low", "emotional": "mid"}}
 ```
 
-没有余效时为 `{"effects": []}`。错误同 `/open`：`404 session_not_found`、`403 session_forbidden`，语音 session 为 `409 wrong_channel`。
+没有余效时 `effects` 为 `[]`。错误同 `/open`：`404 session_not_found`、`403 session_forbidden`，语音 session 为 `409 wrong_channel`。
 
 ### `PUT /v2/comp/session/{session_id}/message/{message_id}/reaction`
 

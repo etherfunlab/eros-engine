@@ -879,7 +879,7 @@ The persona's lingering state from accepted gives and her needs, as a text turn 
  "needs": {"hunger": "high", "social": "mid", "stamina": "low", "emotional": "mid"}}
 ```
 
-`{"effects": []}` when nothing is at work. Errors as `/open`: `404 session_not_found`, `403 session_forbidden`, `409 wrong_channel` for a voice session.
+`effects` is `[]` when nothing is at work. Errors as `/open`: `404 session_not_found`, `403 session_forbidden`, `409 wrong_channel` for a voice session.
 
 ### `PUT /v2/comp/session/{session_id}/message/{message_id}/reaction`
 
