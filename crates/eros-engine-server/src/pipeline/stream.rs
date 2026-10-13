@@ -146,13 +146,16 @@ pub enum ProtocolFrame {
         user_message_id: Uuid,
         response: eros_engine_core::types::ActionResponse,
     },
-    /// The persona's lingering state this turn (spec
-    /// 2026-10-12-given-item-lingering-effects-design.md §9.1). Sent once,
-    /// only when non-empty: after `action_response` and before the first
-    /// `meta` on a text turn, before the first `delta` on a voice turn.
+    /// The persona's state this turn's reply was written with: lingering
+    /// effects (spec 2026-10-12-given-item-lingering-effects-design.md §9.1)
+    /// and needs (spec 2026-10-13-persona-needs-design.md §7.1). Sent once,
+    /// when effects are at work or needs are known: after `action_response`
+    /// and before the first `meta` on a text turn, before the first `delta`
+    /// on a voice turn.
     BodyState {
         user_message_id: Uuid,
         effects: Vec<eros_engine_core::effects::ActiveEffect>,
+        needs: Option<eros_engine_core::needs::Needs>,
     },
     /// Group turns: who is about to speak, in order (after the director, or
     /// after the rule fallback).
@@ -237,14 +240,17 @@ pub(crate) fn action_response_frame(
     })
 }
 
-/// The `body_state` frame for a turn; `None` when nothing is at work.
+/// The `body_state` frame for a turn; `None` when no effect is at work and
+/// no needs are known.
 pub(crate) fn body_state_frame(
     user_message_id: Uuid,
     effects: &[eros_engine_core::effects::ActiveEffect],
+    needs: Option<eros_engine_core::needs::Needs>,
 ) -> Option<ProtocolFrame> {
-    (!effects.is_empty()).then(|| ProtocolFrame::BodyState {
+    (!effects.is_empty() || needs.is_some()).then(|| ProtocolFrame::BodyState {
         user_message_id,
         effects: effects.to_vec(),
+        needs,
     })
 }
 
@@ -4420,6 +4426,24 @@ pub(crate) fn run_stream_with(
             Vec::new()
         });
         let body_state = crate::prompt::body_state(&given_effects);
+        // The persona's needs before this turn (spec 2026-10-13-persona-
+        // needs-design.md §5.2): the newest rating strictly before this
+        // turn's row, carried to its `sent_at`. Read only with the judge.
+        let prior_needs = if state.model_config.pde_enabled() {
+            crate::pipeline::handlers::load_needs(
+                &state.pool,
+                user_msg.instance_id,
+                Some(user_msg.user_message_id),
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("stream: needs read failed: {e}");
+                None
+            })
+        } else {
+            None
+        };
         // ── PDE decision (judge-first) ────────────────────────────────────────
         // The judge runs before vision/input-filter/chat so a `ghost` verdict
         // short-circuits all of them. Feature-off skips the judge (rule
@@ -4481,7 +4505,7 @@ pub(crate) fn run_stream_with(
                         image_executor_available,
                         product_qa_recent.as_deref(),
                         body_state.as_deref(),
-                        None,
+                        prior_needs.as_ref(),
                     );
                     // Read receipt (migration 0053): the judge is the first
                     // generative model to see this message, so this is the
@@ -4516,6 +4540,13 @@ pub(crate) fn run_stream_with(
                         }
                         finished.expect("the judge call always finishes")
                     };
+                    // The judge's rating describes the persona, not the reply,
+                    // so it is stored whatever the turn's outcome (spec §5.1).
+                    if let Some(n) = run.verdict.as_ref().and_then(|v| v.needs) {
+                        if let Err(e) = chat_repo.set_needs(user_msg.user_message_id, &n).await {
+                            tracing::warn!("stream: needs write failed: {e}");
+                        }
+                    }
                     let plan = match (&run.status, &run.verdict) {
                         (PdeStatus::Ok, Some(v)) => {
                             let action = guard_action(
@@ -4557,6 +4588,13 @@ pub(crate) fn run_stream_with(
                 }
                 None => (pde::decide(&input), None), // feature off
             };
+        // The needs this turn's reply is written with (spec §6.1).
+        let turn_needs = pde_run
+            .as_ref()
+            .and_then(|r| r.verdict.as_ref())
+            .and_then(|v| v.needs)
+            .or(prior_needs);
+        let needs_text = turn_needs.as_ref().and_then(crate::prompt::needs_line);
 
         // Ghosting kill-switch (§4.1) — path-wide final gate (LLM / fallback /
         // pure-rule / tip). Uses the in-scope sanitized hints, not plan.context_hints.
@@ -4627,7 +4665,7 @@ pub(crate) fn run_stream_with(
             // Snapshot of the affinity state the judge's payload was built
             // from (issue #254). The prompt carries only the buckets; this row
             // keeps the numbers.
-            let inputs = Some(pde_inputs_snapshot(&input.affinity, None));
+            let inputs = Some(pde_inputs_snapshot(&input.affinity, prior_needs.as_ref()));
             tokio::spawn(async move {
                 let proposed = run.verdict.as_ref().map(|v| v.action.as_str());
                 let payload = pde_audit_payload(&run, audited_mode, audited_nudges);
@@ -4666,7 +4704,7 @@ pub(crate) fn run_stream_with(
                 response,
             };
         }
-        if let Some(frame) = body_state_frame(user_msg.user_message_id, &given_effects) {
+        if let Some(frame) = body_state_frame(user_msg.user_message_id, &given_effects, turn_needs) {
             yield frame;
         }
 
@@ -5507,7 +5545,7 @@ pub(crate) fn run_stream_with(
                     &state, &input, &plan,
                     user_msg.session_id, user_msg.user_id, user_msg.instance_id,
                     user_msg.user_message_id, &now_ctx, true,
-                    body_state.as_deref(), None,
+                    body_state.as_deref(), needs_text.as_deref(),
                 ).await;
                 let (req, injected_tags) = match req_res {
                     Ok(r) => r,
@@ -21224,6 +21262,7 @@ data: [DONE]\n\n"
                 ProtocolFrame::BodyState {
                     user_message_id,
                     effects,
+                    ..
                 } => Some((*user_message_id, effects.clone())),
                 _ => None,
             })
@@ -21359,6 +21398,315 @@ data: [DONE]\n\n"
         // the absences above are the valuable's, not a parse failure's.
         let chat = chat_request_body(&reqs);
         assert!(chat.contains("（递给你 1 块「劳力士」）"), "{chat}");
+    }
+
+    struct NeedsTurn {
+        frames: Vec<ProtocolFrame>,
+        mock: wiremock::MockServer,
+        umid: Uuid,
+        instance_id: Uuid,
+    }
+
+    /// A plain text turn ("在吗"). `prior`: earlier user rows as
+    /// (metadata, minutes ago; negative = after the turn). `verdict`: the
+    /// judge's reply, or `None` to run without `[tasks.pde_decision]`.
+    async fn run_needs_turn(
+        pool: &PgPool,
+        prior: &[(serde_json::Value, i32)],
+        verdict: Option<serde_json::Value>,
+    ) -> NeedsTurn {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        if let Some(v) = &verdict {
+            let judge_body = serde_json::json!({
+                "id": "gj", "model": "pde/judge",
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "choices": [{"message": {"content": v.to_string()}}],
+            });
+            Mock::given(wm_path("/api/v1/chat/completions"))
+                .and(body_string_contains("pde/judge"))
+                .respond_with(
+                    crate::pipeline::reasoning_call::test_support::sse_completion(judge_body),
+                )
+                .mount(&mock)
+                .await;
+        }
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"REPLY\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"deepseek/x\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        let toml = if verdict.is_some() {
+            "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
+             [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide.\"\n"
+        } else {
+            "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n"
+        };
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(toml).unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        for (meta, mins_ago) in prior {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content, metadata, sent_at) \
+                 VALUES ($1, 'user', 'prior', $2, now() - make_interval(mins => $3))",
+            )
+            .bind(session_id)
+            .bind(meta)
+            .bind(*mins_ago)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        let umid = match (ChatRepo { pool })
+            .upsert_user_message_idempotent(
+                session_id,
+                "在吗",
+                "01JNEEDS000000000000000000",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "在吗".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                image_url: None,
+                image: None,
+                quote: Default::default(),
+                user_locale: Default::default(),
+                action: None,
+                outfit: None,
+            },
+            None,
+        )
+        .collect()
+        .await;
+        NeedsTurn {
+            frames,
+            mock,
+            umid,
+            instance_id,
+        }
+    }
+
+    fn needs_json(h: &str, s: &str, st: &str, e: &str) -> serde_json::Value {
+        serde_json::json!({"hunger": h, "social": s, "stamina": st, "emotional": e})
+    }
+
+    /// The judge call's raw request body: JSON, so a line break inside the
+    /// payload reads `\n` (backslash, n) — assert on `\\n`.
+    fn judge_request(reqs: &[wiremock::Request]) -> String {
+        reqs.iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .find(|b| b.contains("pde/judge"))
+            .expect("the judge ran")
+    }
+
+    fn body_state_needs(frames: &[ProtocolFrame]) -> Vec<Option<eros_engine_core::needs::Needs>> {
+        frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::BodyState { needs, .. } => Some(*needs),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn stored_needs(pool: &PgPool, id: Uuid) -> Option<serde_json::Value> {
+        sqlx::query_scalar("SELECT metadata->'needs' FROM engine.chat_messages WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_judged_turn_records_its_rating_and_replies_with_it(pool: PgPool) {
+        use eros_engine_core::needs::NeedLevel;
+        let t = run_needs_turn(
+            &pool,
+            &[],
+            Some(
+                serde_json::json!({"action": "reply_text", "inner_state": "",
+                "needs": needs_json("high", "mid", "low", "mid")}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            stored_needs(&pool, t.umid).await,
+            Some(needs_json("high", "mid", "low", "mid"))
+        );
+        let sent = body_state_needs(&t.frames);
+        assert_eq!(sent.len(), 1, "{:?}", t.frames);
+        let n = sent[0].expect("needs on the frame");
+        assert_eq!((n.hunger, n.stamina), (NeedLevel::High, NeedLevel::Low));
+        let reqs = t.mock.received_requests().await.unwrap();
+        assert!(judge_request(&reqs).contains("[需求] 尚未判定\\n"));
+        assert!(chat_request_body(&reqs).contains("- 此刻的需要：饿了；很累"));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_abstaining_judge_carries_the_previous_rating(pool: PgPool) {
+        use eros_engine_core::needs::NeedLevel;
+        let t = run_needs_turn(
+            &pool,
+            &[(
+                serde_json::json!({"needs": needs_json("mid", "mid", "mid", "mid")}),
+                540,
+            )],
+            Some(serde_json::json!({"action": "reply_text", "inner_state": "", "needs": null})),
+        )
+        .await;
+        assert_eq!(stored_needs(&pool, t.umid).await, None, "nothing written");
+        let reqs = t.mock.received_requests().await.unwrap();
+        // mid + 9h: hunger one step up (4h period), the rest unchanged.
+        assert!(
+            judge_request(&reqs).contains("[需求] 饥饿=高 社交欲=中 体力=中 情感需求=中\\n"),
+            "{}",
+            judge_request(&reqs)
+        );
+        assert_eq!(
+            body_state_needs(&t.frames)[0].unwrap().hunger,
+            NeedLevel::High
+        );
+        assert!(chat_request_body(&reqs).contains("- 此刻的需要：饿了"));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_rating_newer_than_the_turn_is_not_shown_to_the_judge(pool: PgPool) {
+        let t = run_needs_turn(
+            &pool,
+            &[
+                (
+                    serde_json::json!({"needs": needs_json("low", "mid", "mid", "mid")}),
+                    30,
+                ),
+                // A row stamped after the turn's own: a re-driven turn must not see it.
+                (
+                    serde_json::json!({"needs": needs_json("high", "high", "high", "high")}),
+                    -5,
+                ),
+            ],
+            Some(serde_json::json!({"action": "reply_text", "inner_state": ""})),
+        )
+        .await;
+        let reqs = t.mock.received_requests().await.unwrap();
+        assert!(
+            judge_request(&reqs).contains("[需求] 饥饿=低 社交欲=中 体力=中 情感需求=中\\n"),
+            "{}",
+            judge_request(&reqs)
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_ghost_turn_still_records_the_rating(pool: PgPool) {
+        let prior: Vec<(serde_json::Value, i32)> =
+            (0..12).map(|i| (serde_json::json!({}), 60 - i)).collect();
+        let t = run_needs_turn(
+            &pool,
+            &prior,
+            Some(serde_json::json!({"action": "ghost", "inner_state": "",
+                "needs": needs_json("mid", "low", "low", "mid")})),
+        )
+        .await;
+        assert!(
+            t.frames.iter().any(|f| matches!(
+                f,
+                ProtocolFrame::Meta {
+                    action_type: FrameActionType::Ghost,
+                    ..
+                }
+            )),
+            "{:?}",
+            t.frames
+        );
+        assert_eq!(
+            stored_needs(&pool, t.umid).await,
+            Some(needs_json("mid", "low", "low", "mid"))
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn without_the_judge_needs_stay_out_of_the_turn(pool: PgPool) {
+        let t = run_needs_turn(
+            &pool,
+            &[(
+                serde_json::json!({"needs": needs_json("high", "high", "high", "high")}),
+                10,
+            )],
+            None,
+        )
+        .await;
+        assert!(body_state_needs(&t.frames).is_empty(), "{:?}", t.frames);
+        let chat = chat_request_body(&t.mock.received_requests().await.unwrap());
+        assert!(!chat.contains("此刻的需要"), "{chat}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_decision_row_keeps_the_rating_and_what_the_judge_saw(pool: PgPool) {
+        let t = run_needs_turn(
+            &pool,
+            &[(
+                serde_json::json!({"needs": needs_json("low", "mid", "mid", "mid")}),
+                10,
+            )],
+            Some(
+                serde_json::json!({"action": "reply_text", "inner_state": "",
+                "needs": needs_json("high", "mid", "mid", "mid")}),
+            ),
+        )
+        .await;
+        let mut row: Option<(Option<serde_json::Value>, Option<serde_json::Value>)> = None;
+        for _ in 0..40 {
+            row = sqlx::query_as(
+                "SELECT payload, inputs FROM engine.companion_decision_events WHERE message_id = $1",
+            )
+            .bind(t.umid)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+            if row.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let (payload, inputs) = row.expect("the decision row lands");
+        assert_eq!(payload.unwrap()["needs"]["hunger"], "high");
+        assert_eq!(inputs.unwrap()["needs"]["hunger"], "low");
+        let _ = t.instance_id;
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -21991,7 +22339,7 @@ data: [DONE]\n\n"
         use eros_engine_core::effects::{ActiveEffect, EffectPhase};
         use eros_engine_core::types::GivenItem;
         let id = Uuid::new_v4();
-        assert!(body_state_frame(id, &[]).is_none());
+        assert!(body_state_frame(id, &[], None).is_none());
         let e = ActiveEffect {
             item: GivenItem::Cigarette,
             name: None,
@@ -22001,7 +22349,7 @@ data: [DONE]\n\n"
             step: 1,
             steps: 1,
         };
-        let f = body_state_frame(id, &[e]).expect("a frame");
+        let f = body_state_frame(id, &[e], None).expect("a frame");
         assert_eq!(
             serde_json::to_value(&f).unwrap(),
             serde_json::json!({
@@ -22009,6 +22357,28 @@ data: [DONE]\n\n"
                 "user_message_id": id,
                 "effects": [{"item": "cigarette", "quantity": 1, "level": 3,
                              "phase": "peak", "step": 1, "steps": 1}],
+                "needs": null,
+            })
+        );
+    }
+
+    #[test]
+    fn body_state_frame_carries_needs_alone() {
+        use eros_engine_core::needs::{NeedLevel, Needs};
+        let id = Uuid::new_v4();
+        assert!(body_state_frame(id, &[], None).is_none());
+        let n = Needs {
+            hunger: NeedLevel::High,
+            social: NeedLevel::Mid,
+            stamina: NeedLevel::Mid,
+            emotional: NeedLevel::Mid,
+        };
+        let f = body_state_frame(id, &[], Some(n)).expect("needs alone send a frame");
+        assert_eq!(
+            serde_json::to_value(&f).unwrap(),
+            serde_json::json!({
+                "type": "body_state", "user_message_id": id, "effects": [],
+                "needs": {"hunger": "high", "social": "mid", "stamina": "mid", "emotional": "mid"},
             })
         );
     }

@@ -805,7 +805,6 @@ pub(crate) fn body_state(effects: &[ActiveEffect]) -> Option<String> {
 /// 2026-10-13-persona-needs-design.md §6.2): the levels that are not `mid`,
 /// in the order hunger, social, stamina, emotional, joined by 「；」. `None`
 /// when all four are `mid`.
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn needs_line(n: &eros_engine_core::needs::Needs) -> Option<String> {
     use eros_engine_core::needs::NeedLevel;
     let words: Vec<&str> = [

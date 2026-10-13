@@ -681,7 +681,7 @@ pub fn run_voice_turn(
         // The call's frozen state for the caller (spec 2026-10-12-given-item-
         // lingering-effects-design.md §9.1), before the first `delta`.
         if let Some(frame) = bootstrap.as_ref().and_then(|b| {
-            crate::pipeline::stream::body_state_frame(turn.user_message_id, &b.effects)
+            crate::pipeline::stream::body_state_frame(turn.user_message_id, &b.effects, None)
         }) {
             yield frame;
         }

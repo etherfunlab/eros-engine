@@ -1108,7 +1108,7 @@ pub async fn send_message_stream(
                 )
                 .await
                 .ok()
-                .and_then(|e| crate::pipeline::stream::body_state_frame(user_message_id, &e));
+                .and_then(|e| crate::pipeline::stream::body_state_frame(user_message_id, &e, None));
                 let head: Vec<ProtocolFrame> = action_frame.into_iter().chain(body_frame).collect();
                 Box::pin(futures_util::StreamExt::chain(
                     futures_util::stream::iter(head),

@@ -668,7 +668,6 @@ pub(crate) async fn load_effects(
 /// 2026-10-13-persona-needs-design.md §5.2): the newest rating strictly before
 /// `before`, carried to that row's `sent_at`; with `None`, the newest rating
 /// carried to `now`. `Ok(None)` with no rating.
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) async fn load_needs(
     pool: &PgPool,
     instance_id: Uuid,
