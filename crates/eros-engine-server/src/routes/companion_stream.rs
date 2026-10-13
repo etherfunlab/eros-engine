@@ -1126,15 +1126,21 @@ pub async fn send_message_stream(
                 } else {
                     None
                 };
-                let effects = crate::pipeline::handlers::load_effects(
+                let body_frame = match crate::pipeline::handlers::load_effects(
                     &state.pool,
                     session_id,
                     Some(user_message_id),
                 )
                 .await
-                .unwrap_or_default();
-                let body_frame =
-                    crate::pipeline::stream::body_state_frame(user_message_id, &effects, needs);
+                {
+                    Ok(effects) => {
+                        crate::pipeline::stream::body_state_frame(user_message_id, &effects, needs)
+                    }
+                    Err(e) => {
+                        tracing::warn!("replay: lingering effects read failed: {e}");
+                        None
+                    }
+                };
                 let head: Vec<ProtocolFrame> = action_frame.into_iter().chain(body_frame).collect();
                 Box::pin(futures_util::StreamExt::chain(
                     futures_util::stream::iter(head),
