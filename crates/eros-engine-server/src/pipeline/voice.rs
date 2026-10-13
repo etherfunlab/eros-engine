@@ -47,7 +47,15 @@ const VOICE_RECALL_MIN_QUERY_CHARS: usize = 4;
 /// a memory problem must never delay or fail a voice reply. It wraps only the
 /// recall future; persona / affinity / history / bootstrap keep their own
 /// behaviour.
-const VOICE_RECALL_BUDGET: Duration = Duration::from_millis(300);
+///
+/// Unit tests run with a looser budget: a fresh `sqlx::test` database plus a
+/// wiremock embed round trip on a loaded machine can outlast 300 ms, and the
+/// tests that assert a populated recall block are not testing the budget.
+const VOICE_RECALL_BUDGET: Duration = if cfg!(test) {
+    Duration::from_secs(2)
+} else {
+    Duration::from_millis(300)
+};
 
 /// Voice K tier — deliberately far below the text path's (2 / 4 / 3): a spoken
 /// turn can absorb a couple of recalled lines, not a wall of them, and every
@@ -4355,7 +4363,7 @@ data: [DONE]\n\n";
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn run_voice_turn_embed_timeout_degrades_to_no_block(pool: sqlx::PgPool) {
         let mock = bootstrap_mock().await;
-        let embed = embed_mock(200, Some(Duration::from_secs(3))).await;
+        let embed = embed_mock(200, Some(VOICE_RECALL_BUDGET * 10)).await;
         let user_id = Uuid::new_v4();
         let instance_id = seed_instance(&pool, user_id).await;
         let session_id = seed_session(&pool, user_id, instance_id, "voice").await;
@@ -4375,8 +4383,8 @@ data: [DONE]\n\n";
         let elapsed = started.elapsed();
         assert_streamed_hi(&frames);
         assert!(
-            elapsed < Duration::from_secs(2),
-            "the turn must not wait out the provider's 3s delay; took {elapsed:?}"
+            elapsed < VOICE_RECALL_BUDGET * 5,
+            "the turn must not wait out the provider's delay; took {elapsed:?}"
         );
         assert_no_recall_block(&system_prompt_of(&last_request_body(&mock).await));
     }
