@@ -604,6 +604,8 @@ impl<'a> ChatRepo<'a> {
     /// The newest needs rating of `instance_id`, across its sessions (spec
     /// §5.2): strictly before `before`'s `(sent_at, id)` when given, else the
     /// newest at all. A stored value that does not parse reads as no rating.
+    /// One partial-index probe per session (spec §5.3), then the newest of
+    /// those per-session heads.
     pub async fn latest_needs(
         &self,
         instance_id: Uuid,
@@ -611,13 +613,19 @@ impl<'a> ChatRepo<'a> {
     ) -> Result<Option<NeedsRating>, sqlx::Error> {
         let row: Option<(serde_json::Value, DateTime<Utc>, Option<DateTime<Utc>>)> =
             sqlx::query_as(
-                "SELECT m.metadata -> 'needs', m.sent_at, \
+                "SELECT m.needs, m.sent_at, \
                         (SELECT a.sent_at FROM engine.chat_messages a WHERE a.id = $2) \
-                   FROM engine.chat_messages m \
-                   JOIN engine.chat_sessions s ON s.id = m.session_id \
-                  WHERE s.instance_id = $1 AND m.role = 'user' AND m.metadata ? 'needs' \
-                    AND ($2::uuid IS NULL OR (m.sent_at, m.id) < \
-                         (SELECT a.sent_at, a.id FROM engine.chat_messages a WHERE a.id = $2)) \
+                   FROM engine.chat_sessions s \
+                   CROSS JOIN LATERAL ( \
+                       SELECT c.metadata -> 'needs' AS needs, c.sent_at, c.id \
+                         FROM engine.chat_messages c \
+                        WHERE c.session_id = s.id AND c.role = 'user' AND c.metadata ? 'needs' \
+                          AND ($2::uuid IS NULL OR (c.sent_at, c.id) < \
+                               (SELECT a.sent_at, a.id FROM engine.chat_messages a WHERE a.id = $2)) \
+                        ORDER BY c.sent_at DESC, c.id DESC \
+                        LIMIT 1 \
+                   ) m \
+                  WHERE s.instance_id = $1 \
                   ORDER BY m.sent_at DESC, m.id DESC \
                   LIMIT 1",
             )
