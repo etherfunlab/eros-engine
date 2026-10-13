@@ -156,8 +156,9 @@ async fn insights_changes(
     headers: HeaderMap,
     q: Result<Query<ChangesQuery>, QueryRejection>,
 ) -> Result<Json<InsightChangesResponse>, AppError> {
-    // Admission first: a caller without the secret gets 403 even when its
-    // query string is malformed.
+    // Extraction of `q` happens before this body runs, but a rejected query is
+    // only reported after admission succeeds: a caller without the secret gets
+    // 403 even when its query string is malformed, and no DB access precedes `admit`.
     admit(&state, &headers)?;
     let Query(q) = q.map_err(|e| AppError::BadRequest(e.body_text()))?;
     let since = q.since.unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
@@ -269,13 +270,31 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["error"], "forbidden");
 
-        let (status, _) = get(
-            app_with_secret(pool, Some(SECRET)),
+        let (status, wrong_body) = get(
+            app_with_secret(pool.clone(), Some(SECRET)),
             "/svc/v1/insights/changes",
             Some("wrong"),
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(wrong_body["error"], "forbidden");
+
+        // Same length as the configured secret, last byte changed.
+        let mut same_len = SECRET.as_bytes().to_vec();
+        *same_len.last_mut().unwrap() ^= 0x01;
+        let same_len = String::from_utf8(same_len).unwrap();
+        assert_eq!(same_len.len(), SECRET.len());
+        let (status, same_len_body) = get(
+            app_with_secret(pool, Some(SECRET)),
+            "/svc/v1/insights/changes",
+            Some(&same_len),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            same_len_body, body,
+            "wrong secret body equals missing-header body"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -357,7 +376,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn admission_runs_before_query_parsing(pool: sqlx::PgPool) {
+    async fn admission_outranks_query_errors(pool: sqlx::PgPool) {
         for secret in [None, Some("wrong")] {
             let (status, body) = get(
                 app_with_secret(pool.clone(), Some(SECRET)),

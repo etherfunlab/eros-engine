@@ -822,9 +822,11 @@ mod tests {
     async fn list_changes_orders_by_updated_at_then_user_id_and_filters_since(pool: PgPool) {
         use chrono::{Duration, TimeZone, Utc};
         let t = Utc.with_ymd_and_hms(2026, 10, 13, 12, 0, 0).unwrap();
-        let before = Uuid::new_v4();
-        let after = Uuid::new_v4();
-        let mut tied: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+        // Ids chosen so user_id order contradicts timestamp order: `ORDER BY user_id`
+        // alone would yield `after` first and `before` last, failing deterministically.
+        let before = Uuid::from_u128(0xffff_ffff_ffff_ffff_ffff_ffff_ffff_fff0);
+        let after = Uuid::from_u128(0x1);
+        let mut tied: Vec<Uuid> = [0x10u128, 0x20, 0x30].map(Uuid::from_u128).to_vec();
         seed_insight_at(&pool, before, t - Duration::seconds(1)).await;
         seed_insight_at(&pool, after, t + Duration::seconds(1)).await;
         for id in &tied {

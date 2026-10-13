@@ -984,6 +984,7 @@ mod tests {
     fn insights_export_secret_short_refuses_boot() {
         let err = parse_insights_export_config(Some("too-short")).unwrap_err();
         assert!(err.contains("INSIGHTS_EXPORT_SECRET"));
+        assert!(parse_insights_export_config(Some(&"s".repeat(31))).is_err());
         assert!(parse_insights_export_config(Some(&"s".repeat(32)))
             .unwrap()
             .secret
