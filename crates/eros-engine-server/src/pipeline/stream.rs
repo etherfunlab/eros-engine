@@ -21404,7 +21404,6 @@ data: [DONE]\n\n"
         frames: Vec<ProtocolFrame>,
         mock: wiremock::MockServer,
         umid: Uuid,
-        instance_id: Uuid,
     }
 
     /// A plain text turn ("在吗"). `prior`: earlier user rows as
@@ -21514,12 +21513,7 @@ data: [DONE]\n\n"
         )
         .collect()
         .await;
-        NeedsTurn {
-            frames,
-            mock,
-            umid,
-            instance_id,
-        }
+        NeedsTurn { frames, mock, umid }
     }
 
     fn needs_json(h: &str, s: &str, st: &str, e: &str) -> serde_json::Value {
@@ -21706,7 +21700,13 @@ data: [DONE]\n\n"
         let (payload, inputs) = row.expect("the decision row lands");
         assert_eq!(payload.unwrap()["needs"]["hunger"], "high");
         assert_eq!(inputs.unwrap()["needs"]["hunger"], "low");
-        let _ = t.instance_id;
+        // The verdict's fresh rating wins over the carried one (spec §6.1).
+        assert_eq!(
+            body_state_needs(&t.frames)[0].unwrap().hunger,
+            eros_engine_core::needs::NeedLevel::High
+        );
+        let chat = chat_request_body(&t.mock.received_requests().await.unwrap());
+        assert!(chat.contains("- 此刻的需要：饿了"), "{chat}");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

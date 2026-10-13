@@ -720,7 +720,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 
 ### `GET /v2/comp/session/{session_id}/effects`
 
-角色因被接受的 give 而带着的余效和她的需求，即此刻发一句文字消息时会带上的状态：供打开会话的页面和收不到帧的异步调用方使用。接受消耗品的那一回合刚结束，这个路由就已列出它的第 1 步，而那一回合没有发 `body_state` 帧：帧描述刚写成的那句回复，路由描述角色此刻的样子。`needs` 是角色带到此刻的需求（形状与 `body_state` 帧里的一致），没有判定或没有配置 LLM 判官时为 `null`。
+角色因被接受的 give 而带着的余效和她的需求，即此刻发一句文字消息时会带上的状态：供打开会话的页面和收不到帧的异步调用方使用。接受消耗品的那一回合刚结束，这个路由就已列出它的第 1 步，而那一回合的 `body_state` 帧里还没有它：帧描述刚写成的那句回复，路由描述角色此刻的样子。`needs` 是角色带到此刻的需求（形状与 `body_state` 帧里的一致），没有判定或没有配置 LLM 判官时为 `null`。
 
 ```json
 {"effects": [{"item": "alcohol", "name": "威士忌", "quantity": 3, "level": 2, "phase": "rising", "step": 2, "steps": 3}],
