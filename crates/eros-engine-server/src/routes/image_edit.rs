@@ -415,6 +415,7 @@ async fn generate_reply_text(
         now,
         false,
         None,
+        None,
     )
     .await
     {

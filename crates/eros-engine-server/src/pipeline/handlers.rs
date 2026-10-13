@@ -664,6 +664,28 @@ pub(crate) async fn load_effects(
     Ok(crate::prompt::effects_from_metadata(&rows))
 }
 
+/// The persona's needs carried to the reader's moment (spec
+/// 2026-10-13-persona-needs-design.md §5.2): the newest rating strictly before
+/// `before`, carried to that row's `sent_at`; with `None`, the newest rating
+/// carried to `now`. `Ok(None)` with no rating.
+#[cfg_attr(not(test), expect(dead_code))]
+pub(crate) async fn load_needs(
+    pool: &PgPool,
+    instance_id: Uuid,
+    before: Option<Uuid>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<eros_engine_core::needs::Needs>, sqlx::Error> {
+    let Some(r) = (ChatRepo { pool })
+        .latest_needs(instance_id, before)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let to = r.anchor_at.unwrap_or(now);
+    let hours = (to - r.rated_at).num_milliseconds() as f64 / 3_600_000.0;
+    Ok(Some(eros_engine_core::needs::carried(r.needs, hours)))
+}
+
 /// Load + render 基础画像 from the flat `human_insights` mirror. `Off` → empty.
 async fn load_human_insight_bullets(
     pool: &PgPool,
@@ -783,6 +805,7 @@ pub(crate) async fn build_reply_request(
     now: &crate::prompt::NowContext,
     render_reactions: bool,
     body_state: Option<&str>,
+    needs: Option<&str>,
 ) -> Result<(ChatRequest, Vec<String>), AppError> {
     build_reply_request_with(
         state,
@@ -795,6 +818,7 @@ pub(crate) async fn build_reply_request(
         now,
         render_reactions,
         body_state,
+        needs,
         None,
     )
     .await
@@ -822,6 +846,9 @@ pub(crate) async fn build_reply_request_with(
     // 2026-10-12-given-item-lingering-effects-design.md §6.2). Only the text
     // turn passes one.
     body_state: Option<&str>,
+    // The persona's needs, rendered once by the caller (spec
+    // 2026-10-13-persona-needs-design.md §6.2). Only the text turn passes one.
+    needs: Option<&str>,
     group: Option<&crate::pipeline::group::GroupSpeakerView>,
 ) -> Result<(ChatRequest, Vec<String>), AppError> {
     let chat_repo = ChatRepo { pool: &state.pool };
@@ -1006,6 +1033,7 @@ pub(crate) async fn build_reply_request_with(
         plan.nudges,
         now,
         body_state,
+        needs,
     );
 
     if render_reactions {
@@ -3054,6 +3082,7 @@ mod tests {
             &crate::prompt::NowContext::default(),
             false,
             None,
+            None,
         )
         .await
         .expect("build_reply_request succeeds");
@@ -3182,6 +3211,7 @@ mod tests {
             user_message_id,
             &now,
             false,
+            None,
             None,
         )
         .await
@@ -3319,6 +3349,7 @@ mod tests {
             u2,
             &crate::prompt::NowContext::default(),
             false,
+            None,
             None,
             Some(&view),
         )
@@ -3464,6 +3495,7 @@ mod tests {
             user_message_id,
             &crate::prompt::NowContext::default(),
             false,
+            None,
             None,
         )
         .await
@@ -3666,6 +3698,7 @@ mod tests {
             &crate::prompt::NowContext::default(),
             false,
             None,
+            None,
         )
         .await
         .expect("build_reply_request succeeds");
@@ -3765,6 +3798,7 @@ mod tests {
             user_message_id,
             &crate::prompt::NowContext::default(),
             false,
+            None,
             None,
         )
         .await
@@ -3894,6 +3928,7 @@ mod tests {
                     &crate::prompt::NowContext::default(),
                     render,
                     None,
+                    None,
                 )
                 .await
                 .expect("build_reply_request succeeds");
@@ -3922,5 +3957,60 @@ mod tests {
             "唔。（凑近）今晚想吃什么"
         );
         assert_eq!(reaction_quote_source("  ", true), "");
+    }
+
+    async fn rated_row(pool: &PgPool, session_id: Uuid, at: &str, hunger: &str) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata, sent_at) \
+             VALUES ($1, 'user', '', $2, $3::timestamptz) RETURNING id",
+        )
+        .bind(session_id)
+        .bind(serde_json::json!({"needs": {"hunger": hunger, "social": "mid", "stamina": "mid", "emotional": "mid"}}))
+        .bind(at)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn load_needs_carries_the_newest_rating_to_now(pool: PgPool) {
+        use eros_engine_core::needs::NeedLevel;
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, owner).await;
+        let session_id =
+            crate::routes::companion::testutil::seed_session(&pool, owner, instance_id).await;
+        rated_row(&pool, session_id, "2026-10-01T00:00:00Z", "low").await;
+        let now: chrono::DateTime<chrono::Utc> = "2026-10-01T08:30:00Z".parse().unwrap();
+        let got = load_needs(&pool, instance_id, None, now)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.hunger, NeedLevel::High, "low + 8.5h → two steps up");
+        assert_eq!(got.social, NeedLevel::Mid);
+        assert!(load_needs(&pool, Uuid::new_v4(), None, now)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn load_needs_with_an_anchor_carries_to_the_anchor_not_to_now(pool: PgPool) {
+        use eros_engine_core::needs::NeedLevel;
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, owner).await;
+        let session_id =
+            crate::routes::companion::testutil::seed_session(&pool, owner, instance_id).await;
+        rated_row(&pool, session_id, "2026-10-01T00:00:00Z", "low").await;
+        let anchor = rated_row(&pool, session_id, "2026-10-01T04:30:00Z", "high").await;
+        let far: chrono::DateTime<chrono::Utc> = "2026-10-05T00:00:00Z".parse().unwrap();
+        let got = load_needs(&pool, instance_id, Some(anchor), far)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            got.hunger,
+            NeedLevel::Mid,
+            "low + 4.5h to the anchor → one step"
+        );
     }
 }

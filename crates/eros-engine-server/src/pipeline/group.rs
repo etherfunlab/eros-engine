@@ -594,6 +594,7 @@ pub(crate) fn run_group_turn(
                 &now_ctx,
                 false,
                 None,
+                None,
                 Some(&view),
             )
             .await
