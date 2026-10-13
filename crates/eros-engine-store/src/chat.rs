@@ -6,6 +6,16 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+/// A needs rating and when it was made; with an anchor, also the anchor's
+/// `sent_at`, the moment a turn carries the rating to (spec
+/// 2026-10-13-persona-needs-design.md §5.2).
+#[derive(Debug, Clone, PartialEq)]
+pub struct NeedsRating {
+    pub needs: eros_engine_core::needs::Needs,
+    pub rated_at: DateTime<Utc>,
+    pub anchor_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct ChatSession {
     pub id: Uuid,
@@ -569,6 +579,59 @@ impl<'a> ChatRepo<'a> {
         .bind(limit)
         .fetch_all(self.pool)
         .await
+    }
+
+    /// Store the judge's needs rating on the rated turn's user row as
+    /// `metadata.needs`, keeping every other key (spec
+    /// 2026-10-13-persona-needs-design.md §5.1).
+    pub async fn set_needs(
+        &self,
+        user_message_id: Uuid,
+        needs: &eros_engine_core::needs::Needs,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE engine.chat_messages \
+                SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{needs}', $2) \
+              WHERE id = $1 AND role = 'user'",
+        )
+        .bind(user_message_id)
+        .bind(serde_json::to_value(needs).expect("Needs serializes"))
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The newest needs rating of `instance_id`, across its sessions (spec
+    /// §5.2): strictly before `before`'s `(sent_at, id)` when given, else the
+    /// newest at all. A stored value that does not parse reads as no rating.
+    pub async fn latest_needs(
+        &self,
+        instance_id: Uuid,
+        before: Option<Uuid>,
+    ) -> Result<Option<NeedsRating>, sqlx::Error> {
+        let row: Option<(serde_json::Value, DateTime<Utc>, Option<DateTime<Utc>>)> =
+            sqlx::query_as(
+                "SELECT m.metadata -> 'needs', m.sent_at, \
+                        (SELECT a.sent_at FROM engine.chat_messages a WHERE a.id = $2) \
+                   FROM engine.chat_messages m \
+                   JOIN engine.chat_sessions s ON s.id = m.session_id \
+                  WHERE s.instance_id = $1 AND m.role = 'user' AND m.metadata ? 'needs' \
+                    AND ($2::uuid IS NULL OR (m.sent_at, m.id) < \
+                         (SELECT a.sent_at, a.id FROM engine.chat_messages a WHERE a.id = $2)) \
+                  ORDER BY m.sent_at DESC, m.id DESC \
+                  LIMIT 1",
+            )
+            .bind(instance_id)
+            .bind(before)
+            .fetch_optional(self.pool)
+            .await?;
+        Ok(row.and_then(|(v, rated_at, anchor_at)| {
+            serde_json::from_value(v).ok().map(|needs| NeedsRating {
+                needs,
+                rated_at,
+                anchor_at,
+            })
+        }))
     }
 
     /// Projection-narrowed read used by BFF endpoints (and any caller that
@@ -6206,5 +6269,171 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    fn rated(hunger: &str) -> serde_json::Value {
+        serde_json::json!({"needs": {"hunger": hunger, "social": "mid", "stamina": "mid", "emotional": "mid"}})
+    }
+
+    fn at(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn set_needs_writes_the_key_and_keeps_the_rest(pool: PgPool) {
+        use eros_engine_core::needs::{NeedLevel, Needs};
+        use serde_json::json;
+        let s = throwaway_session(&pool).await;
+        let id = insert_user_row(
+            &pool,
+            s.id,
+            "2026-10-01T09:00:00Z",
+            json!({"action": {"type": "hug"}}),
+            None,
+        )
+        .await;
+        let repo = ChatRepo { pool: &pool };
+        let n = Needs {
+            hunger: NeedLevel::High,
+            social: NeedLevel::Low,
+            stamina: NeedLevel::Mid,
+            emotional: NeedLevel::Mid,
+        };
+        repo.set_needs(id, &n).await.unwrap();
+        let meta: serde_json::Value =
+            sqlx::query_scalar("SELECT metadata FROM engine.chat_messages WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(meta["action"], json!({"type": "hug"}));
+        assert_eq!(
+            meta["needs"],
+            json!({"hunger": "high", "social": "low", "stamina": "mid", "emotional": "mid"})
+        );
+        repo.set_needs(
+            id,
+            &Needs {
+                hunger: NeedLevel::Low,
+                ..n
+            },
+        )
+        .await
+        .unwrap();
+        let hunger: String = sqlx::query_scalar(
+            "SELECT metadata->'needs'->>'hunger' FROM engine.chat_messages WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(hunger, "low", "a second rating overwrites the first");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn set_needs_on_a_row_without_metadata(pool: PgPool) {
+        use eros_engine_core::needs::{NeedLevel, Needs};
+        let s = throwaway_session(&pool).await;
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content) \
+             VALUES ($1, 'user', 'hi') RETURNING id",
+        )
+        .bind(s.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let n = Needs {
+            hunger: NeedLevel::Mid,
+            social: NeedLevel::Mid,
+            stamina: NeedLevel::Low,
+            emotional: NeedLevel::Mid,
+        };
+        ChatRepo { pool: &pool }.set_needs(id, &n).await.unwrap();
+        let stamina: Option<String> = sqlx::query_scalar(
+            "SELECT metadata->'needs'->>'stamina' FROM engine.chat_messages WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stamina.as_deref(), Some("low"));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn latest_needs_reads_the_newest_rating_across_the_instance(pool: PgPool) {
+        use eros_engine_core::needs::NeedLevel;
+        use serde_json::json;
+        let owner = Uuid::new_v4();
+        let instance = seed_persona_instance(&pool, owner).await;
+        let repo = ChatRepo { pool: &pool };
+        let a = repo.create_session(owner, instance).await.unwrap();
+        let b = repo.create_session(owner, instance).await.unwrap();
+        // Same owner, another persona: must never leak in.
+        let other_instance = seed_persona_instance(&pool, owner).await;
+        let other = repo.create_session(owner, other_instance).await.unwrap();
+        insert_user_row(&pool, a.id, "2026-10-01T09:00:00Z", rated("low"), None).await;
+        insert_user_row(&pool, b.id, "2026-10-01T10:00:00Z", rated("high"), None).await;
+        insert_user_row(&pool, a.id, "2026-10-01T11:00:00Z", json!({}), None).await;
+        insert_user_row(&pool, other.id, "2026-10-01T12:00:00Z", rated("mid"), None).await;
+
+        let got = repo.latest_needs(instance, None).await.unwrap().unwrap();
+        assert_eq!(got.needs.hunger, NeedLevel::High);
+        assert_eq!(got.rated_at, at("2026-10-01T10:00:00Z"));
+        assert_eq!(got.anchor_at, None);
+        assert!(repo
+            .latest_needs(Uuid::new_v4(), None)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn latest_needs_with_an_anchor_reads_strictly_before_it(pool: PgPool) {
+        use eros_engine_core::needs::NeedLevel;
+        let owner = Uuid::new_v4();
+        let instance = seed_persona_instance(&pool, owner).await;
+        let repo = ChatRepo { pool: &pool };
+        let s = repo.create_session(owner, instance).await.unwrap();
+        insert_user_row(&pool, s.id, "2026-10-01T09:00:00Z", rated("low"), None).await;
+        let anchor =
+            insert_user_row(&pool, s.id, "2026-10-01T10:00:00Z", rated("high"), None).await;
+        insert_user_row(&pool, s.id, "2026-10-01T11:00:00Z", rated("mid"), None).await;
+
+        let got = repo
+            .latest_needs(instance, Some(anchor))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            got.needs.hunger,
+            NeedLevel::Low,
+            "the anchor's own rating is excluded"
+        );
+        assert_eq!(got.rated_at, at("2026-10-01T09:00:00Z"));
+        assert_eq!(got.anchor_at, Some(at("2026-10-01T10:00:00Z")));
+        assert!(repo
+            .latest_needs(instance, Some(Uuid::new_v4()))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_malformed_newest_rating_reads_as_none(pool: PgPool) {
+        use serde_json::json;
+        let owner = Uuid::new_v4();
+        let instance = seed_persona_instance(&pool, owner).await;
+        let repo = ChatRepo { pool: &pool };
+        let s = repo.create_session(owner, instance).await.unwrap();
+        insert_user_row(&pool, s.id, "2026-10-01T09:00:00Z", rated("low"), None).await;
+        insert_user_row(
+            &pool,
+            s.id,
+            "2026-10-01T10:00:00Z",
+            json!({"needs": {"hunger": "starving"}}),
+            None,
+        )
+        .await;
+        assert!(repo.latest_needs(instance, None).await.unwrap().is_none());
     }
 }
