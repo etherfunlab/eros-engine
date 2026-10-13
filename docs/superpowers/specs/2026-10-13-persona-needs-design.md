@@ -174,7 +174,7 @@ Needs are per instance, not per session: every text session with the same
 persona shares one state. Only judged text turns write them; group and voice
 turns never do.
 
-### 5.3 Migration `0069_chat_messages_needs_idx.sql`
+### 5.3 Migration `0070_chat_messages_needs_idx.sql`
 
 ```sql
 CREATE INDEX chat_messages_needs_idx
@@ -262,7 +262,7 @@ when there is no rating or the judge is not configured. `NeedsView` is the
 |---|---|
 | `NeedLevel`, `Needs`, `carried`, drift table | `core/src/needs.rs` (new), `core/src/lib.rs` |
 | `set_needs`, `latest_needs` | `store/src/chat.rs` |
-| migration | `store/migrations/0069_chat_messages_needs_idx.sql` |
+| migration | `store/migrations/0070_chat_messages_needs_idx.sql` |
 | verdict field, schema, `[需求]` line, write, audit, frame | `server/src/pipeline/stream.rs` |
 | `needs_line`, `[character_state]` line | `server/src/prompt.rs` |
 | `needs` through `build_reply_request` | `server/src/pipeline/handlers.rs`, its callers |
