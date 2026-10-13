@@ -213,9 +213,10 @@ FK work. Building it scans `chat_messages`, as `0064` did.
 
 ## 6. While it lasts
 
-`ChatRepo::current_event(instance_id, at)` returns the instance's event row
-with `sent_at ≤ at < ends_at`, if any. On a text turn, `at` is the turn's
-user-row `sent_at`, so a re-driven turn sees the same event.
+`ChatRepo::current_event(instance_id, at_message, now)` returns the instance's
+event under way at `at_message`'s `sent_at`, or at `now` without one: the
+event row with `sent_at ≤ at < ends_at`, if any. On a text turn, `at_message`
+is the turn's user row, so a re-driven turn sees the same event.
 
 - **Judge.** `build_pde_ctx` gains `event: Option<&str>` (the rendered text)
   and, when present, renders after `[需求]` and before `[身体状态]`:

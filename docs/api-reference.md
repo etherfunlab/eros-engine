@@ -800,8 +800,8 @@ for one of three reasons:
 - **A holiday — the engine's call.** Without `occasion`: when it is a holiday
   in the user's timezone (same sources as the chat body's holiday line, today
   only) and nobody has spoken in the session since the user's local midnight,
-  the persona speaks first. An opener from an earlier `occasion` call today
-  counts as having spoken.
+  the persona speaks first. An opener from an earlier `occasion` call today,
+  or a life event's message, counts as having spoken.
 - **An occasion — the caller's call.** With `occasion`, the persona speaks
   first when the occasion is true of the session.
 
@@ -847,7 +847,8 @@ occasion that is not true of the session returns `null` without generating.
 ```
 
 `occasion` in the response is `birthday`, `holiday`, `first_meet`,
-`returning` or `just_opened`.
+`returning` or `just_opened`. The same message shape carries `event` on a life
+event's message (see the events route below).
 
 - **Synchronous:** one non-streaming generation, a few seconds. Don't block UI on it.
 - **Idempotent:** per session and local date for a birthday or holiday
@@ -870,13 +871,96 @@ occasion that is not true of the session returns `null` without generating.
   failed generation returns the upstream error the image endpoints return and
   persists nothing; the next open (with the same key) retries.
 
+### `POST /v2/comp/session/{session_id}/events`
+
+Ask for something to happen in the persona's day: she gets called in to work,
+her ex texts her, the weather turns, the police stop her, a stray animal
+crosses her path. The caller decides when to ask; the engine decides whether
+and what. It draws one kind of event, or none, and the persona tells the user
+in one proactive message. While the event lasts, the judge and the reply know
+she is in the middle of it (see [model-config.md](model-config.md#taskspde_decision--opt-in-llm-pde-judge)).
+
+```json
+{
+  "event_key": "day-01J9ZK3",
+  "kinds": ["weather_change", "animal_encounter"],
+  "user_timezone": "Asia/Taipei",
+  "tier": "gold"
+}
+```
+
+| Field | Rules |
+|---|---|
+| `event_key` | required: 1–128 characters of `[A-Za-z0-9_.:-]`, scoped to the session. The same key returns the same event |
+| `kinds` | optional allowlist of kinds. Absent: all five. `[]`: nothing is drawn |
+| `user_timezone`, `user_country`, `user_region`, `tier`, `prompt_traits`, `memory_scope`, `affinity_scope`, `audit` | as on `/open`, for generating the message |
+
+| `kind` | Lasts | What happens to her |
+|---|---|---|
+| `temp_work` | 4 h | she is called in to work |
+| `ex_message` | 3 h | her ex texts her |
+| `weather_change` | 4 h | the weather turns |
+| `police_encounter` | 1 h | the police stop her |
+| `animal_encounter` | 1 h | she meets a stray animal |
+
+The draw:
+
+- **One event at a time.** Nothing is drawn while any session of the persona
+  has an event under way.
+- **Cooldowns.** Each kind has a cooldown from when it started, so the same
+  kind does not come round again soon.
+- **Her needs weight the pick** among the kinds left, when the deployment runs
+  the LLM judge and the persona has a rating.
+- **`ex_message` needs some closeness first.** It is not drawn for someone she
+  barely knows.
+- **A draw yields an event whenever a kind is eligible.** How eventful her day
+  is follows from when the caller asks.
+
+When nothing is drawn, the response is `{"event": null, "message": null}` and
+no message is generated. Otherwise one non-streaming generation, a few
+seconds:
+
+```json
+{"event": {"kind": "temp_work", "started_at": "2026-10-13T12:00:00Z", "ends_at": "2026-10-13T16:00:00Z", "message_id": "…"},
+ "message": {"message_id": "…", "content": "刚被老板叫去加班，晚点聊", "sent_at": "2026-10-13T12:00:00Z", "occasion": "event"}}
+```
+
+`message` has the `/open` greeting's shape, with `occasion: "event"`.
+`started_at` is the message's `sent_at`; `ends_at` is fixed when the event is
+drawn.
+
+- **Idempotent per session and `event_key`.** A repeat call returns the same
+  event and message, with no draw and no generation. A call that returned
+  nulls wrote nothing, so a repeat can still draw.
+- **Persisted like any reply.** The message is an ordinary assistant row
+  (`assistant_action_type = 'proactive'`, no `user_message_id`), unread until
+  `POST /comp/chat/{session_id}/read`. Change feeds and both history routes
+  see it.
+- **The user does not win a race.** An event does not yield to a user message
+  that lands while it is generated: it happened whether or not the user
+  spoke.
+- **Next to the greetings.** An event message counts as a message for the
+  `/open` birthday and holiday check, so neither greeting follows an event on
+  the same local day. An opener that is generating when an event lands yields
+  and returns `null`.
+- **While it lasts.** The judge's context carries a `[近期事件]` line and the
+  reply's `[character_state]` a `- 正在经历：…` line; `GET …/effects` shows the
+  event under way.
+- **Errors:** `400` with `code: "invalid_payload"` for a malformed
+  `event_key`; `422` for an unknown `kind`. Session checks as on `/open`
+  (`403`, `404`, `409` for a voice or group session), `429` at the per-user
+  in-flight cap. A failed generation returns the upstream error the image
+  endpoints return and persists nothing. A blank reply persists nothing and
+  returns nulls.
+
 ### `GET /v2/comp/session/{session_id}/effects`
 
-The persona's lingering state from accepted gives and her needs, as a text turn sent now would carry them: for a page that opens on a conversation, and for async callers, which receive no frames. Right after the turn that accepted a consumable, this route already lists it at step 1, while that turn's `body_state` frame does not list it: the frame describes the reply just written, the route the persona as she is now. `needs` is the persona's needs carried to now (the same shape as on the `body_state` frame), or `null` with no rating or without the LLM judge.
+The persona's lingering state from accepted gives, her needs and the event under way, as a text turn sent now would carry them: for a page that opens on a conversation, and for async callers, which receive no frames. Right after the turn that accepted a consumable, this route already lists it at step 1, while that turn's `body_state` frame does not list it: the frame describes the reply just written, the route the persona as she is now. `needs` is the persona's needs carried to now (the same shape as on the `body_state` frame), or `null` with no rating or without the LLM judge. `event` is the event under way now (the same shape as on the events route), or `null`.
 
 ```json
 {"effects": [{"item": "alcohol", "name": "威士忌", "quantity": 3, "level": 2, "phase": "rising", "step": 2, "steps": 3}],
- "needs": {"hunger": "high", "social": "mid", "stamina": "low", "emotional": "mid"}}
+ "needs": {"hunger": "high", "social": "mid", "stamina": "low", "emotional": "mid"},
+ "event": null}
 ```
 
 `effects` is `[]` when nothing is at work. Errors as `/open`: `404 session_not_found`, `403 session_forbidden`, `409 wrong_channel` for a voice session.
@@ -1974,7 +2058,7 @@ refusals too. The table below covers the plain shape:
 | 401 | `unauthorized` | Missing / malformed / expired / wrong-secret JWT |
 | 403 | `forbidden` | Path-user vs JWT-user mismatch, or trying to read a session you don't own; or `x-insights-export-secret` missing or wrong on `/svc/v1/*` |
 | 404 | `not_found` | Unknown session / persona / message id |
-| 409 | `conflict` | The resource's state does not permit the action. The reaction route and image edit return it for a group session, with a `message` containing `wrong_channel`. The 1:1 stream and async send routes, `/open` and `/effects` refuse a group session with the coded body instead (`code: wrong_channel`), as the group routes refuse a non-group session |
+| 409 | `conflict` | The resource's state does not permit the action. The reaction route and image edit return it for a group session, with a `message` containing `wrong_channel`. The 1:1 stream and async send routes, `/open`, `/events` and `/effects` refuse a group session with the coded body instead (`code: wrong_channel`), as the group routes refuse a non-group session |
 | 500 | `internal` | Anything else (DB error, LLM API error, etc.) |
 | *the provider's own status* | `upstream` | The upstream provider failed the call (currently only the persona compose endpoint — its composer chain was exhausted). Since v1.4.0 this is **not always 502**: the provider's status passes through verbatim (`529`, `503`, `429`, …), and a gateway-layer failure with no upstream status maps to `504` for a timeout and `502` otherwise. The body carries `upstream_status` / `provider_code` / `error_type` or `gateway_kind`, plus `retryable` — see [the compose endpoint](#post-personainstance_idimagecompose). Branch on the `"error": "upstream"` key, not on the status. |
 
@@ -1984,7 +2068,8 @@ refusals too. The table below covers the plain shape:
 - `crates/eros-engine-server/src/routes/companion_stream.rs` — streaming chat turn (`message/stream`), incl. actions + `image_url` handling
 - `crates/eros-engine-server/src/routes/companion_async.rs` — enqueue-only chat turn (`v2/comp/session/{session_id}/message/async`)
 - `crates/eros-engine-server/src/routes/session_open.rs` — the persona speaking first: birthday and holiday greetings and caller-named occasions (`v2/comp/session/{session_id}/open`)
-- `crates/eros-engine-server/src/routes/session_effects.rs` — the persona's lingering state from accepted gives and her needs (`v2/comp/session/{session_id}/effects`)
+- `crates/eros-engine-server/src/routes/session_events.rs` — life events the persona tells: the draw, the one proactive message (`v2/comp/session/{session_id}/events`)
+- `crates/eros-engine-server/src/routes/session_effects.rs` — the persona's lingering state from accepted gives, her needs and the event under way (`v2/comp/session/{session_id}/effects`)
 - `crates/eros-engine-server/src/routes/group.rs` — group management and the group send route (`v2/comp/group*`)
 - `crates/eros-engine-server/src/routes/reaction.rs` — message reactions: set, clear and the allowlist (`v2/comp/session/{session_id}/message/{message_id}/reaction`, `v2/comp/reactions`)
 - `crates/eros-engine-server/src/routes/insight.rs` — v2 relationship-scoped insight profiles (`v2/comp/instance/{instance_id}/insight/character`, `.../insight/user`)

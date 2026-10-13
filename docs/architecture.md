@@ -172,6 +172,7 @@ crates/
 │   └── src/
 │       ├── affinity.rs       # 6-dim vector + grade pipeline + time decay + labels
 │       ├── effects.rs        # lingering effects of an accepted give (curves + active_effects)
+│       ├── events.rs         # life event kinds and the draw
 │       ├── ghost.rs          # score formula + 4-tier protection
 │       ├── group.rs          # group director normalization, fallback cast, transcript roles
 │       ├── needs.rs          # the persona's four needs (levels + time carry-forward)
@@ -185,7 +186,7 @@ crates/
 │       ├── voyage.rs         # 512-dim embeddings, fail-loud on empty key
 │       └── model_config.rs   # TOML loader
 ├── eros-engine-store/
-│   ├── migrations/           # 0000_schema → 0070_chat_messages_needs_idx
+│   ├── migrations/           # 0000_schema → 0071_chat_messages_event_key
 │   └── src/
 │       ├── pool.rs           # PgPoolOptions builder
 │       ├── chat.rs           # ChatRepo
@@ -205,7 +206,7 @@ crates/
         ├── auth/             # AuthValidator trait + Supabase impl + middleware
         ├── pipeline/         # stream (run_stream) / group + group_director / handlers / post_process / dreaming / …
         ├── prompt.rs         # system-prompt builder (affinity → directives)
-        ├── routes/           # health / companion / companion_stream / companion_async / insight / image_edit / voice / persona / session_open / session_effects / persona_items / reaction / group / world_town / svc (service-to-service export, `/svc/v1/*`) / bff / dto / mod
+        ├── routes/           # health / companion / companion_stream / companion_async / insight / image_edit / voice / persona / session_open / session_events / session_effects / persona_items / reaction / group / world_town / svc (service-to-service export, `/svc/v1/*`) / bff / dto / mod
         └── openapi.rs        # utoipa ApiDoc spec metadata
 ```
 

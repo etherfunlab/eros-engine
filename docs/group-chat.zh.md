@@ -100,8 +100,8 @@ instance 解析已离群发言者的名字。
 
 ### 拒绝群 session 的路由
 
-把群 session 发给 1:1 路由会返回 `409`。1:1 的流式与异步发送、`/v2/comp/session/{id}/open`
-和 `/effects` 的响应带 `code: wrong_channel`。reaction 路由和改图用它们的普通响应体
+把群 session 发给 1:1 路由会返回 `409`。1:1 的流式与异步发送、`/v2/comp/session/{id}/open`、
+`/events` 和 `/effects` 的响应带 `code: wrong_channel`。reaction 路由和改图用它们的普通响应体
 `{"error": "conflict", "message": …}`，`message` 里含 `wrong_channel`。
 `GET /comp/chat/{user_id}/sessions` 不列出群，群由 `/v2/comp/groups` 返回。
 dreaming 清扫器跳过群 session。

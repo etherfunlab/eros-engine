@@ -122,7 +122,7 @@ session, then instance.
 ### Routes that refuse a group session
 
 A group session sent to a 1:1 route returns `409`. The 1:1 stream and async
-send routes, `/v2/comp/session/{id}/open` and `/effects` answer with
+send routes, `/v2/comp/session/{id}/open`, `/events` and `/effects` answer with
 `code: wrong_channel`. The reaction route and image edit answer with their
 plain body, `{"error": "conflict", "message": …}`, whose `message` contains
 `wrong_channel`. `GET /comp/chat/{user_id}/sessions` leaves groups out;

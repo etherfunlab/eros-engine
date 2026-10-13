@@ -672,7 +672,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
   按角色时钟是今天，并且那个当地零点以来这个会话里还没有人说过话，角色就先开口。角色时钟先取
   `art_metadata.timezone`，再取 `user_timezone`，都没有就用 `Asia/Singapore`。生日和节日同一天时以生日为准。
 - **节日，engine 自己判断。** 不带 `occasion` 时，如果用户所在时区的今天是节日（来源同聊天请求体的节日行，只看当天），
-  并且用户当地零点以来这个会话里还没有人说过话，角色就先开口。今天早些时候由 `occasion` 触发过的开口算作说过话。
+  并且用户当地零点以来这个会话里还没有人说过话，角色就先开口。今天早些时候由 `occasion` 触发过的开口，或一条生活事件的消息，算作说过话。
 - **场合，由调用方决定。** 带 `occasion` 时，只要这个场合对当前会话属实，角色就先开口。
 
 两种情况都是生成一条 assistant 消息，落库后返回；否则 `greeting` 为 `null`。
@@ -706,7 +706,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 { "greeting": { "message_id": "01J…", "content": "好久不见，最近忙什么呢", "sent_at": "…", "occasion": "returning" } }
 ```
 
-响应里的 `occasion` 取值为 `birthday`、`holiday`、`first_meet`、`returning` 或 `just_opened`。
+响应里的 `occasion` 取值为 `birthday`、`holiday`、`first_meet`、`returning` 或 `just_opened`。同样形状的消息在生活事件的消息上带 `event`（见下面的 events 路由）。
 
 - **同步：** 一次非流式生成，需要几秒，不要阻塞 UI。
 - **幂等：** 生日和节日开场白按会话加当地日期（生日用角色那边的日期，节日用用户那边的日期），场合按会话加 `open_key`。写入过之后，重复调用返回那一条，不会再生成；返回 `null` 的调用什么都没写，同一个 key 再调仍可能生成。
@@ -718,13 +718,75 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
   `code: "invalid_payload"`；未知的 `occasion` 返回 `422`。会话检查与 stream 端点相同（`403`、`404`，语音会话 `409`），
   达到单用户并发上限 `429`。生成失败时返回与图片接口相同的上游错误，不写入任何内容，下次打开（用同一个 key）会重试。
 
+### `POST /v2/comp/session/{session_id}/events`
+
+让角色的一天里发生点什么：她被叫去加班，前任给她发消息，天气突变，被警察拦下，路上遇到一只流浪小动物。
+什么时候要，由调用方决定；发不发生、发生什么，由 engine 决定。engine 抽一种事件，或者什么都不抽，
+然后角色用一条主动消息告诉用户。事件持续期间，判官和回复都知道她正在经历它
+（见 [model-config.zh.md](model-config.zh.md#taskspde_decision--opt-in-llm-pde-判断器)）。
+
+```json
+{
+  "event_key": "day-01J9ZK3",
+  "kinds": ["weather_change", "animal_encounter"],
+  "user_timezone": "Asia/Taipei",
+  "tier": "gold"
+}
+```
+
+| 字段 | 规则 |
+|---|---|
+| `event_key` | 必填：1–128 个 `[A-Za-z0-9_.:-]` 字符，只在本会话内有效。同一个 key 返回同一个事件 |
+| `kinds` | 选填，允许抽取的种类。不带：五种全部；`[]`：什么都不抽 |
+| `user_timezone`、`user_country`、`user_region`、`tier`、`prompt_traits`、`memory_scope`、`affinity_scope`、`audit` | 与 `/open` 相同，用于生成这条消息 |
+
+| `kind` | 持续 | 她遇到的事 |
+|---|---|---|
+| `temp_work` | 4 小时 | 被叫去加班 |
+| `ex_message` | 3 小时 | 前任给她发来消息 |
+| `weather_change` | 4 小时 | 天气突然变了 |
+| `police_encounter` | 1 小时 | 被警察拦下问话 |
+| `animal_encounter` | 1 小时 | 路上遇到小动物 |
+
+抽取规则：
+
+- **同一时间只有一个事件。** 角色的任何一个 session 里有事件在进行时，不再抽取。
+- **冷却。** 每种事件从开始起有各自的冷却，同一种不会很快再来。
+- **她的需求给剩下的种类加权**，前提是部署配置了 LLM 判官，并且角色有一次判定。
+- **`ex_message` 需要先有一定的亲近度。** 她不会向不太熟的人提起前任。
+- **只要有符合条件的种类，抽取就一定得到一个事件。** 她的一天有多热闹，取决于调用方什么时候来要。
+
+什么都没抽到时，响应是 `{"event": null, "message": null}`，不生成消息。否则是一次非流式生成，需要几秒：
+
+```json
+{"event": {"kind": "temp_work", "started_at": "2026-10-13T12:00:00Z", "ends_at": "2026-10-13T16:00:00Z", "message_id": "…"},
+ "message": {"message_id": "…", "content": "刚被老板叫去加班，晚点聊", "sent_at": "2026-10-13T12:00:00Z", "occasion": "event"}}
+```
+
+`message` 的形状与 `/open` 的开场白相同，`occasion` 为 `"event"`。`started_at` 即这条消息的 `sent_at`，
+`ends_at` 在抽到事件时就已确定。
+
+- **按会话加 `event_key` 幂等。** 重复调用返回同一个事件和同一条消息，不再抽取，也不再生成。返回空值的调用什么都没写，同一个 key 再调仍可能抽到。
+- **与普通回复一样落库：** 这条消息是一条普通的 assistant 行（`assistant_action_type = 'proactive'`，
+  没有 `user_message_id`），在调用 `POST /comp/chat/{session_id}/read` 之前都是未读。
+  Realtime 和两个 history 路由都能看到。
+- **竞态时用户不优先：** 事件生成期间落进会话的用户消息不会让事件作废：不论用户有没有开口，它都已经发生。
+- **与开场白的关系：** 事件消息算作会话里有人说过话，所以同一个当地日期里，事件之后不会再有生日或节日开场白。
+  事件落库时，正在生成的开场白让路，返回 `null`。
+- **持续期间：** 判官的上下文带一行 `[近期事件]`，回复的 `[character_state]` 带一行 `- 正在经历：…`；
+  `GET …/effects` 会列出正在经历的事件。
+- **错误：** `event_key` 格式不对返回 `400`，`code: "invalid_payload"`；未知的 `kind` 返回 `422`。会话检查与 `/open` 相同
+  （`403`、`404`，语音或群会话 `409`），达到单用户并发上限 `429`。生成失败时返回与图片接口相同的上游错误，不写入任何内容。
+  回复为空时不写入任何内容，返回空值。
+
 ### `GET /v2/comp/session/{session_id}/effects`
 
-角色因被接受的 give 而带着的余效和她的需求，即此刻发一句文字消息时会带上的状态：供打开会话的页面和收不到帧的异步调用方使用。接受消耗品的那一回合刚结束，这个路由就已列出它的第 1 步，而那一回合的 `body_state` 帧里还没有它：帧描述刚写成的那句回复，路由描述角色此刻的样子。`needs` 是角色带到此刻的需求（形状与 `body_state` 帧里的一致），没有判定或没有配置 LLM 判官时为 `null`。
+角色因被接受的 give 而带着的余效、她的需求和正在经历的事件，即此刻发一句文字消息时会带上的状态：供打开会话的页面和收不到帧的异步调用方使用。接受消耗品的那一回合刚结束，这个路由就已列出它的第 1 步，而那一回合的 `body_state` 帧里还没有它：帧描述刚写成的那句回复，路由描述角色此刻的样子。`needs` 是角色带到此刻的需求（形状与 `body_state` 帧里的一致），没有判定或没有配置 LLM 判官时为 `null`。`event` 是此刻正在经历的事件（形状与 events 路由一致），没有时为 `null`。
 
 ```json
 {"effects": [{"item": "alcohol", "name": "威士忌", "quantity": 3, "level": 2, "phase": "rising", "step": 2, "steps": 3}],
- "needs": {"hunger": "high", "social": "mid", "stamina": "low", "emotional": "mid"}}
+ "needs": {"hunger": "high", "social": "mid", "stamina": "low", "emotional": "mid"},
+ "event": null}
 ```
 
 没有余效时 `effects` 为 `[]`。错误同 `/open`：`404 session_not_found`、`403 session_forbidden`，语音 session 为 `409 wrong_channel`。
@@ -1665,7 +1727,7 @@ session 403）。
 | 401 | `unauthorized` | JWT 缺失 / 格式錯 / 過期 / 密鑰不符 |
 | 403 | `forbidden` | 路徑 user 跟 JWT user 不匹配，或想讀別人的 session；或 `/svc/v1/*` 上 `x-insights-export-secret` 缺失或錯誤 |
 | 404 | `not_found` | session / 人格 / 消息 id 不存在 |
-| 409 | `conflict` | 资源当前的状态不允许这个操作。reaction 路由和改图在收到群 session 时返回它，`message` 里含 `wrong_channel`。1:1 的流式与异步发送、`/open` 和 `/effects` 拒绝群 session 时改用带代码的响应体（`code: wrong_channel`），群路由拒绝非群 session 时也一样 |
+| 409 | `conflict` | 资源当前的状态不允许这个操作。reaction 路由和改图在收到群 session 时返回它，`message` 里含 `wrong_channel`。1:1 的流式与异步发送、`/open`、`/events` 和 `/effects` 拒绝群 session 时改用带代码的响应体（`code: wrong_channel`），群路由拒绝非群 session 时也一样 |
 | 500 | `internal` | 其餘一切（DB 錯、LLM API 錯等） |
 | *provider 自己的状态码* | `upstream` | 上游供应商调用失败（目前仅 persona compose 端点——合成器链条全部失败）。自 v1.4.0 起**不再固定是 502**：provider 的状态码原样透传（`529`、`503`、`429`……），没有上游状态码的网关层失败则超时映射为 `504`、其余为 `502`。响应体带 `upstream_status` / `provider_code` / `error_type` 或 `gateway_kind`，以及 `retryable`——见 [compose 端点](#post-personainstance_idimagecompose)。请按 `"error": "upstream"` 这个 key 判断，不要按状态码。 |
 
@@ -1675,7 +1737,8 @@ session 403）。
 - `crates/eros-engine-server/src/routes/companion_stream.rs`——流式对话轮（`message/stream`），含动作 + `image_url` 处理
 - `crates/eros-engine-server/src/routes/companion_async.rs`——只入队的对话轮（`v2/comp/session/{session_id}/message/async`）
 - `crates/eros-engine-server/src/routes/session_open.rs`——角色先开口：生日、节日开场白与调用方指定的场合（`v2/comp/session/{session_id}/open`）
-- `crates/eros-engine-server/src/routes/session_effects.rs`——角色因被接受的 give 而带着的余效和她的需求（`v2/comp/session/{session_id}/effects`）
+- `crates/eros-engine-server/src/routes/session_events.rs`——角色讲述的生活事件：抽取，以及那条主动消息（`v2/comp/session/{session_id}/events`）
+- `crates/eros-engine-server/src/routes/session_effects.rs`——角色因被接受的 give 而带着的余效、她的需求和正在经历的事件（`v2/comp/session/{session_id}/effects`）
 - `crates/eros-engine-server/src/routes/group.rs`——群管理与群发送路由（`v2/comp/group*`）
 - `crates/eros-engine-server/src/routes/reaction.rs`——消息 reaction：设置、撤销与允许列表（`v2/comp/session/{session_id}/message/{message_id}/reaction`、`v2/comp/reactions`）
 - `crates/eros-engine-server/src/routes/insight.rs`——按关系分开的 v2 画像端点（`v2/comp/instance/{instance_id}/insight/character`、`.../insight/user`）

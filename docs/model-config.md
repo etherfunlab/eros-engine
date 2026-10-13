@@ -695,6 +695,8 @@ When any accepted `give` is still at work, the engine also adds a `[身体状态
 
 **Needs context line.** On every judged turn the context carries one `[需求]` line, before `[身体状态]`: `[需求] 饥饿=高 社交欲=低 体力=中 情感需求=中`, the previous rating carried to this turn, or `[需求] 尚未判定` before the first rating.
 
+**Event context line.** While an event drawn through the [events route](api-reference.md#post-v2compsessionsession_idevents) is under way, the judge context carries one `[近期事件]` line, after `[需求]` and before `[身体状态]`: `[近期事件] 临时接到工作（1 小时前开始，约 3 小时后结束）`. Hours are whole and rounded; under one hour reads `不到 1 小时前开始` / `不到 1 小时后结束`. A text chat turn's reply carries the matching line in `[character_state]`, `- 正在经历：临时接到工作（约 3 小时后结束）`, with or without the LLM judge. Both lines are absent when no event is under way. The event changes no stored need: the judge reads the line and rates the needs itself.
+
 **Recent-image context line.** The judge context also always carries exactly one
 `[近期图片] 最近8条消息内已发图=<n> 张；上一条 AI 消息是图片=<是/否>（以本行计数为准，对话记录里的图片标记仅供参考）`
 line. The engine counts these from the stored rows so the judge never has to

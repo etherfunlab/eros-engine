@@ -2003,7 +2003,7 @@
         "tags": [
           "companion"
         ],
-        "summary": "The persona's lingering state from accepted gives and her needs, as a text\nturn sent now would carry them.",
+        "summary": "The persona's lingering state from accepted gives, her needs and the event\nunder way, as a text turn sent now would carry them.",
         "operationId": "get_effects",
         "parameters": [
           {
@@ -2060,6 +2060,107 @@
                 }
               }
             }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v2/comp/session/{session_id}/events": {
+      "post": {
+        "tags": [
+          "companion"
+        ],
+        "summary": "Ask for something to happen in the persona's day.",
+        "description": "The engine draws one kind of event, or none (an event is under way, or\nevery allowed kind is cooling down). The persona then tells the user in\none proactive message, persisted like any reply and returned with the\nevent. The same `event_key` returns the same event.",
+        "operationId": "draw_event",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Chat session id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DrawEventRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DrawEventResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "unknown kind or another malformed body field"
+          },
+          "429": {
+            "description": "per-user in-flight cap reached"
+          },
+          "5XX": {
+            "description": "companion chain exhausted; the provider's own status passes through. Nothing is persisted."
           }
         },
         "security": [
@@ -3778,6 +3879,115 @@
           }
         }
       },
+      "DrawEventRequest": {
+        "type": "object",
+        "required": [
+          "event_key"
+        ],
+        "properties": {
+          "affinity_scope": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AffinityScopeDto"
+              }
+            ]
+          },
+          "audit": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LlmAuditDto"
+              }
+            ]
+          },
+          "event_key": {
+            "type": "string",
+            "description": "The caller's idempotency key, scoped to the session: the same key\nreturns the same event. 1–128 chars of `[A-Za-z0-9_.:-]`."
+          },
+          "kinds": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/EventKindDto"
+            },
+            "description": "The kinds that may be drawn. Absent: all of them."
+          },
+          "memory_scope": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "prompt_traits": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/PromptTraitDto"
+            }
+          },
+          "tier": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "user_country": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "user_region": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "user_timezone": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "As on `/open`: the user's IANA timezone, for `[now]`."
+          }
+        }
+      },
+      "DrawEventResponse": {
+        "type": "object",
+        "properties": {
+          "event": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EventView",
+                "description": "The event drawn (or the key's existing one); `null` when nothing\nhappened."
+              }
+            ]
+          },
+          "message": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/GreetingDto",
+                "description": "The persona's message telling it; `null` with `event`."
+              }
+            ]
+          }
+        }
+      },
       "EffectPhaseDto": {
         "type": "string",
         "description": "Where an effect is on its curve.",
@@ -3849,6 +4059,17 @@
             },
             "description": "Newest give first; empty when nothing is at work."
           },
+          "event": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EventView",
+                "description": "The persona's event under way now, or `null`."
+              }
+            ]
+          },
           "needs": {
             "oneOf": [
               {
@@ -3859,6 +4080,44 @@
                 "description": "The persona's needs carried to now; `null` with no rating, or when the\ndeployment runs no LLM judge."
               }
             ]
+          }
+        }
+      },
+      "EventKindDto": {
+        "type": "string",
+        "description": "A kind of life event.",
+        "enum": [
+          "temp_work",
+          "ex_message",
+          "weather_change",
+          "police_encounter",
+          "animal_encounter"
+        ]
+      },
+      "EventView": {
+        "type": "object",
+        "description": "A life event: what happened, when it started and ends, and the message\nthat told it.",
+        "required": [
+          "kind",
+          "started_at",
+          "ends_at",
+          "message_id"
+        ],
+        "properties": {
+          "ends_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/EventKindDto"
+          },
+          "message_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time"
           }
         }
       },
@@ -4016,7 +4275,8 @@
           "birthday",
           "first_meet",
           "returning",
-          "just_opened"
+          "just_opened",
+          "event"
         ]
       },
       "GroupDto": {

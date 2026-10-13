@@ -162,6 +162,7 @@ crates/
 │   └── src/
 │       ├── affinity.rs       # 6 維向量 + 档位写入管线 + 時間衰退 + 標籤
 │       ├── effects.rs        # 被接受的 give 的余效（曲线 + active_effects）
+│       ├── events.rs         # 生活事件的种类与抽取
 │       ├── ghost.rs          # 評分公式 + 4 層保護
 │       ├── group.rs          # 群聊导演输出规整、兜底点名、转录角色映射
 │       ├── needs.rs          # 角色的四项需求（档位 + 按时间推算）
@@ -175,7 +176,7 @@ crates/
 │       ├── voyage.rs         # 512 維 embedding，空 key 直接 fail
 │       └── model_config.rs   # TOML 加載器
 ├── eros-engine-store/
-│   ├── migrations/           # 0000_schema → 0070_chat_messages_needs_idx
+│   ├── migrations/           # 0000_schema → 0071_chat_messages_event_key
 │   └── src/
 │       ├── pool.rs           # PgPoolOptions 構造
 │       ├── chat.rs           # ChatRepo
@@ -195,7 +196,7 @@ crates/
         ├── auth/             # AuthValidator trait + Supabase 實現 + 中間件
         ├── pipeline/         # stream（run_stream）/ group + group_director / handlers / post_process / dreaming / …
         ├── prompt.rs         # system prompt 構造（affinity → 行為指令）
-        ├── routes/           # health / companion / companion_stream / companion_async / insight / image_edit / voice / persona / session_open / session_effects / persona_items / reaction / group / world_town / svc（服务间导出，`/svc/v1/*`）/ bff / dto / mod
+        ├── routes/           # health / companion / companion_stream / companion_async / insight / image_edit / voice / persona / session_open / session_events / session_effects / persona_items / reaction / group / world_town / svc（服务间导出，`/svc/v1/*`）/ bff / dto / mod
         └── openapi.rs        # utoipa ApiDoc 元數據
 ```
 
