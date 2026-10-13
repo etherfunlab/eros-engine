@@ -1391,7 +1391,7 @@ genome 预设（`art_metadata.possessions` / `art_metadata.wardrobe`）排最前
 
 `archived_sessions` 只算**这一次调用**翻掉的 session 数，所以重复调用返回 `200` 加 `0`。所有 channel 一起归档，语音也在内 —— 单位是这段关系，不是某一个客户端看到的那部分。
 
-**会删掉的：** `companion_affinity`（连同它的 events，走 cascade）、`companion_memories` 的关系层、`character_insights`、`user_insights`，以及这位角色在每个[群](group-chat.zh.md)里的席位；角色的故事摘要（`persona_story_insights.digest`）会被清空 —— 这些留着会渗进下一段对话。调用落下时仍在运行的回合不会把它们写回去：它对好感度、关系层记忆以及 character 与 user insight 的写入发现 session 已归档，什么都不写。**不会删的：** `chat_messages`。聊天记录留着，所以那些按 session id 引用的审计表（`companion_decision_events`、`character_insights_events`、`chat_vision_events`、`chat_images_events`）仍然指得到可读的东西。`companion_memories` 的画像层（`instance_id IS NULL`）也留着 —— 那是关于这个用户的跨角色事实。
+**会删掉的：** `companion_affinity`（连同它的 events，走 cascade）、`companion_memories` 的关系层、`character_insights`、`user_insights`，以及这位角色在每个[群](group-chat.zh.md)里的席位；角色的故事摘要（`persona_story_insights.digest`）会被清空 —— 这些留着会渗进下一段对话。归档请求到达时仍在运行的回合不会把它们写回去：它对好感度、关系层记忆以及 character 与 user insight 的写入发现 session 已归档，什么都不写。**不会删的：** `chat_messages`。聊天记录留着，所以那些按 session id 引用的审计表（`companion_decision_events`、`character_insights_events`、`chat_vision_events`、`chat_images_events`）仍然指得到可读的东西。`companion_memories` 的画像层（`instance_id IS NULL`）也留着 —— 那是关于这个用户的跨角色事实。
 
 调用之后这些 session 在各处都不可见：history、affinity、session 列表、chat 与语音 turn 路由要么 404 要么直接不返回，`POST /comp/chat/start` 会新建 session 而不是恢复已归档的那个。
 
