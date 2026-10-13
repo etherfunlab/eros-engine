@@ -1621,7 +1621,7 @@ session 403）。
 
 ## 服務端點
 
-`/svc/v1/*` 下是服務間路由。以共享 secret header 放行而非用戶 JWT，而且除非部署配置了該 secret，整棵子樹**不會掛載**——未配置的部署對該路徑的回應與任何未知路徑一致——不會是 `403`，也不會是 `200`。
+`/svc/v1/*` 下是服務間路由。以共享 secret header 放行而非用戶 JWT，而且除非部署配置了該 secret，整棵子樹**不會掛載**——未配置的部署對該路徑的回應與任何未知路徑一致：不會是 `403`，也不會是 `200`。
 
 ### `GET /svc/v1/insights/changes`
 
@@ -1633,7 +1633,9 @@ session 403）。
 | `after_user` | nil UUID | `since` 內的 tie-break——傳 `next.user_id` |
 | `limit` | 500 | 夾在 1..=1000 |
 
-行按 `(updated_at, user_id)` 排序。頁滿時才有 `next`；把它的兩個字段原樣傳回 `since` 與 `after_user` 往下走，`next` 為 `null` 即結束。只傳 `since` 會把恰好在該時刻的行再回一次（nil UUID 排在所有真實 UUID 之前）——兩個字段一起傳。
+行按 `(updated_at, user_id)` 排序。頁滿時才有 `next`；同一次遍歷內，把它的兩個字段原樣傳回 `since` 與 `after_user`——保留微秒精度、URL 編碼——`next` 為 `null` 即結束。截斷時間戳的客戶端（JavaScript `Date` 只到毫秒）在 1000 行共享同一個 `now()` 時會無限重取同一頁。
+
+**下一次輪詢從哪裡開始。** 記住收到的最後一行的 `(updated_at, user_id)` 作為續點；空頁則沿用上一個。每次新輪詢從它*往前*幾秒開始：`since = last.updated_at − 5s`，不傳 `after_user`。`updated_at` 在寫入開始時打上，但行要到提交才可見，晚提交的行可能帶著你已經走過的時間戳；重疊窗口把它撿回來。重複回來的行無害——每行都是該用戶當前的畫像，以 `user_id` 為鍵。只傳 `since` 會刻意把恰好在該時刻的行再回一次（nil UUID 排在所有真實 UUID 之前）。
 
 ## 錯誤響應
 
@@ -1651,7 +1653,7 @@ session 403）。
 |--------|------|------|
 | 400 | `bad_request` | 請求體格式錯、UUID 無效、缺必填字段 |
 | 401 | `unauthorized` | JWT 缺失 / 格式錯 / 過期 / 密鑰不符 |
-| 403 | `forbidden` | 路徑 user 跟 JWT user 不匹配，或想讀別人的 session |
+| 403 | `forbidden` | 路徑 user 跟 JWT user 不匹配，或想讀別人的 session；或 `/svc/v1/*` 上 `x-insights-export-secret` 缺失或錯誤 |
 | 404 | `not_found` | session / 人格 / 消息 id 不存在 |
 | 409 | `conflict` | 资源当前的状态不允许这个操作。reaction 路由和改图在收到群 session 时返回它，`message` 里含 `wrong_channel`。1:1 的流式与异步发送、`/open` 和 `/effects` 拒绝群 session 时改用带代码的响应体（`code: wrong_channel`），群路由拒绝非群 session 时也一样 |
 | 500 | `internal` | 其餘一切（DB 錯、LLM API 錯等） |
@@ -1673,5 +1675,6 @@ session 403）。
 - `crates/eros-engine-server/src/routes/world_town.rs`——World Town 信息流与评论（`/world/town/*`）
 - `crates/eros-engine-server/src/routes/bff/companion.rs`——BFF `/bff/v1/comp/chat/*`
 - `crates/eros-engine-server/src/routes/bff/affinity.rs`——BFF `/bff/v1/comp/affinity/*`
+- `crates/eros-engine-server/src/routes/svc.rs`——服務間導出（`/svc/v1/*`）
 - `crates/eros-engine-server/src/routes/health.rs`——`/healthz`
 - `crates/eros-engine-server/src/openapi.rs`——Scalar UI spec 元数据

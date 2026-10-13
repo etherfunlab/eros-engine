@@ -819,37 +819,53 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn list_changes_walks_tied_timestamps_without_loss_or_duplicate(pool: PgPool) {
-        use chrono::{TimeZone, Utc};
+    async fn list_changes_orders_by_updated_at_then_user_id_and_filters_since(pool: PgPool) {
+        use chrono::{Duration, TimeZone, Utc};
         let t = Utc.with_ymd_and_hms(2026, 10, 13, 12, 0, 0).unwrap();
-        let mut ids: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
-        for id in &ids {
+        let before = Uuid::new_v4();
+        let after = Uuid::new_v4();
+        let mut tied: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+        seed_insight_at(&pool, before, t - Duration::seconds(1)).await;
+        seed_insight_at(&pool, after, t + Duration::seconds(1)).await;
+        for id in &tied {
             seed_insight_at(&pool, *id, t).await;
         }
-        ids.sort(); // keyset order within one timestamp is user_id order
+        tied.sort(); // keyset order within one timestamp is user_id order
 
         let repo = HumanInsightRepo { pool: &pool };
-        let page1 = repo
-            .list_changes(chrono::DateTime::<Utc>::UNIX_EPOCH, Uuid::nil(), 2)
-            .await
-            .unwrap();
-        assert_eq!(page1.len(), 2);
-        let last = page1.last().unwrap();
-        let page2 = repo
-            .list_changes(last.updated_at, last.user_id, 2)
-            .await
-            .unwrap();
-        assert_eq!(page2.len(), 1);
 
-        let walked: Vec<Uuid> = page1
-            .iter()
-            .chain(page2.iter())
-            .map(|r| r.user_id)
-            .collect();
+        // Walk with limit 2 from the epoch until a short page.
+        let mut walked: Vec<Uuid> = Vec::new();
+        let mut cursor = (chrono::DateTime::<Utc>::UNIX_EPOCH, Uuid::nil());
+        loop {
+            let page = repo.list_changes(cursor.0, cursor.1, 2).await.unwrap();
+            walked.extend(page.iter().map(|r| r.user_id));
+            if page.len() < 2 {
+                break;
+            }
+            let last = page.last().unwrap();
+            cursor = (last.updated_at, last.user_id);
+        }
+        let mut expected = vec![before];
+        expected.extend(tied.iter().copied());
+        expected.push(after);
         assert_eq!(
-            walked, ids,
+            walked, expected,
             "every row exactly once, in (updated_at, user_id) order"
         );
+
+        // `since` drops rows strictly before it and keeps the tied and later ones.
+        let rows: Vec<Uuid> = repo
+            .list_changes(t, Uuid::nil(), 10)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.user_id)
+            .collect();
+        assert!(!rows.contains(&before), "row before `since` is excluded");
+        let mut expected = tied.clone();
+        expected.push(after);
+        assert_eq!(rows, expected, "tied rows and the later row are included");
     }
 
     #[sqlx::test(migrations = "./migrations")]

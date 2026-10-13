@@ -963,6 +963,15 @@ mod tests {
     }
 
     #[test]
+    fn insights_export_config_debug_hides_the_secret() {
+        let secret = "THE-EXPORT-SECRET-0123456789-abcdef";
+        let cfg = parse_insights_export_config(Some(secret)).unwrap();
+        let shown = format!("{cfg:?}");
+        assert!(shown.contains("<redacted>"));
+        assert!(!shown.contains(secret));
+    }
+
+    #[test]
     fn insights_export_secret_blank_is_off() {
         assert!(parse_insights_export_config(None).unwrap().secret.is_none());
         assert!(parse_insights_export_config(Some("   "))

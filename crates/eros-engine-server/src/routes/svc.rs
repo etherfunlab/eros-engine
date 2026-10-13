@@ -87,7 +87,7 @@ impl From<HumanInsightsRow> for InsightExportRow {
 }
 
 /// Keyset position. Pass both fields back as `since` + `after_user`.
-#[derive(Serialize, Deserialize, ToSchema)]
+#[derive(Serialize, ToSchema)]
 pub struct ChangesCursor {
     pub updated_at: DateTime<Utc>,
     pub user_id: Uuid,
@@ -377,6 +377,72 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"], "bad_request");
+    }
+
+    #[test]
+    fn insight_export_row_maps_fields_by_name() {
+        use eros_engine_store::human_insight::HumanInsightsRow;
+
+        use super::InsightExportRow;
+
+        let user_id = Uuid::new_v4();
+        let updated_at = Utc.with_ymd_and_hms(2026, 10, 13, 12, 0, 0).unwrap();
+        let row = HumanInsightsRow {
+            user_id,
+            city: Some("city".into()),
+            location: Some("location".into()),
+            hometown: Some("hometown".into()),
+            nationality: Some("nationality".into()),
+            occupation: Some("occupation".into()),
+            mbti_guess: Some("mbti_guess".into()),
+            love_values: Some("love_values".into()),
+            emotional_needs: Some("emotional_needs".into()),
+            life_rhythm: Some("life_rhythm".into()),
+            interests: vec!["interests_0".into(), "interests_1".into()],
+            personality_traits: vec!["personality_traits_0".into()],
+            preferred_gender: Some("preferred_gender".into()),
+            age_min: Some(21),
+            age_max: Some(35),
+            deal_breakers: vec!["deal_breakers_0".into(), "deal_breakers_1".into()],
+            education: Some("education".into()),
+            family: Some("family".into()),
+            relationship_history: Some("relationship_history".into()),
+            social_pattern: Some("social_pattern".into()),
+            future_plans: Some("future_plans".into()),
+            finance_status: Some("finance_status".into()),
+            updated_at,
+        };
+
+        let out = InsightExportRow::from(row);
+        assert_eq!(out.user_id, user_id);
+        assert_eq!(out.city.as_deref(), Some("city"));
+        assert_eq!(out.location.as_deref(), Some("location"));
+        assert_eq!(out.hometown.as_deref(), Some("hometown"));
+        assert_eq!(out.nationality.as_deref(), Some("nationality"));
+        assert_eq!(out.occupation.as_deref(), Some("occupation"));
+        assert_eq!(out.mbti_guess.as_deref(), Some("mbti_guess"));
+        assert_eq!(out.love_values.as_deref(), Some("love_values"));
+        assert_eq!(out.emotional_needs.as_deref(), Some("emotional_needs"));
+        assert_eq!(out.life_rhythm.as_deref(), Some("life_rhythm"));
+        assert_eq!(out.interests, vec!["interests_0", "interests_1"]);
+        assert_eq!(out.personality_traits, vec!["personality_traits_0"]);
+        assert_eq!(out.preferred_gender.as_deref(), Some("preferred_gender"));
+        assert_eq!(out.age_min, Some(21));
+        assert_eq!(out.age_max, Some(35));
+        assert_eq!(
+            out.deal_breakers,
+            vec!["deal_breakers_0", "deal_breakers_1"]
+        );
+        assert_eq!(out.education.as_deref(), Some("education"));
+        assert_eq!(out.family.as_deref(), Some("family"));
+        assert_eq!(
+            out.relationship_history.as_deref(),
+            Some("relationship_history")
+        );
+        assert_eq!(out.social_pattern.as_deref(), Some("social_pattern"));
+        assert_eq!(out.future_plans.as_deref(), Some("future_plans"));
+        assert_eq!(out.finance_status.as_deref(), Some("finance_status"));
+        assert_eq!(out.updated_at, updated_at);
     }
 
     #[test]

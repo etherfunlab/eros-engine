@@ -1904,7 +1904,7 @@ form of the route above, for a client rendering one row per companion. The
 
 ## Service endpoints
 
-Service-to-service routes under `/svc/v1/*`. They are admitted by a shared secret header, not a user JWT, and the whole sub-tree is **not mounted** unless the deployment configured the secret — an unconfigured deployment answers exactly as it does for any unknown path — never `403`, never `200`.
+Service-to-service routes under `/svc/v1/*`. They are admitted by a shared secret header, not a user JWT, and the whole sub-tree is **not mounted** unless the deployment configured the secret — an unconfigured deployment answers exactly as it does for any unknown path: never `403`, never `200`.
 
 ### `GET /svc/v1/insights/changes`
 
@@ -1918,7 +1918,7 @@ Service-to-service routes under `/svc/v1/*`. They are admitted by a shared secre
 
 ```bash
 curl -H "x-insights-export-secret: $INSIGHTS_EXPORT_SECRET" \
-  "http://localhost:8080/svc/v1/insights/changes?limit=2"
+  "http://localhost:8080/svc/v1/insights/changes?limit=1"
 ```
 
 ```json
@@ -1940,7 +1940,9 @@ curl -H "x-insights-export-secret: $INSIGHTS_EXPORT_SECRET" \
 }
 ```
 
-Rows are ordered by `(updated_at, user_id)`. `next` is present iff the page is full; walk by passing both of its fields back as `since` and `after_user`, and stop when `next` is `null`. Passing `since` alone re-returns rows at exactly that timestamp (the nil UUID sorts below every real one) — always pass both.
+Rows are ordered by `(updated_at, user_id)`. `next` is present iff the page is full; within one walk, pass both of its fields back verbatim as `since` and `after_user` — at full microsecond precision, URL-encoded — and stop when `next` is `null`. A client that truncates the timestamp (JavaScript `Date` keeps milliseconds) can re-fetch the same full page forever once 1000 rows share one `now()`.
+
+**Resuming the next poll.** Keep the last row you received — its `(updated_at, user_id)` — as your resume point; on an empty page keep the previous one. Start each new poll a few seconds *before* it: `since = last.updated_at − 5s`, no `after_user`. `updated_at` is stamped when the write starts, but the row is visible only when it commits, so a late-committing row can carry a timestamp you have already walked past; the overlap window picks it up. Re-returned rows are harmless — each is the user's current profile, keyed by `user_id`. Passing `since` alone deliberately re-returns rows at exactly that timestamp (the nil UUID sorts below every real one).
 
 ## Error responses
 
@@ -1960,7 +1962,7 @@ refusals too. The table below covers the plain shape:
 |--------|------|------|
 | 400 | `bad_request` | Malformed body, invalid UUID, missing required field |
 | 401 | `unauthorized` | Missing / malformed / expired / wrong-secret JWT |
-| 403 | `forbidden` | Path-user vs JWT-user mismatch, or trying to read a session you don't own |
+| 403 | `forbidden` | Path-user vs JWT-user mismatch, or trying to read a session you don't own; or `x-insights-export-secret` missing or wrong on `/svc/v1/*` |
 | 404 | `not_found` | Unknown session / persona / message id |
 | 409 | `conflict` | The resource's state does not permit the action. The reaction route and image edit return it for a group session, with a `message` containing `wrong_channel`. The 1:1 stream and async send routes, `/open` and `/effects` refuse a group session with the coded body instead (`code: wrong_channel`), as the group routes refuse a non-group session |
 | 500 | `internal` | Anything else (DB error, LLM API error, etc.) |
@@ -1982,5 +1984,6 @@ refusals too. The table below covers the plain shape:
 - `crates/eros-engine-server/src/routes/world_town.rs` — World Town feed and comments (`/world/town/*`)
 - `crates/eros-engine-server/src/routes/bff/companion.rs` — BFF `/bff/v1/comp/chat/*`
 - `crates/eros-engine-server/src/routes/bff/affinity.rs` — BFF `/bff/v1/comp/affinity/*`
+- `crates/eros-engine-server/src/routes/svc.rs` — service-to-service export (`/svc/v1/*`)
 - `crates/eros-engine-server/src/routes/health.rs` — `/healthz`
 - `crates/eros-engine-server/src/openapi.rs` — Scalar UI spec metadata

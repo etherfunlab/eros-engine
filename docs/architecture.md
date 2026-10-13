@@ -93,7 +93,7 @@ gates.
 
 ## Auth
 
-Middleware (`auth::middleware::require_auth`) protects everything except `/healthz` (merged outside the layer) and `/docs` (merged in `main.rs`) — today that means `/comp/*`, `/v2/comp/*`, `/bff/v1/*`, `/world/*`, and `/persona/*`. The layer attaches to the merged sub-router in `routes/mod.rs`, not to a path prefix, which is why a new namespace (e.g. `/persona/*`) needs no extra auth wiring. It pulls the `Authorization: Bearer …` header, calls `state.auth.validate(token)`, and inserts an `AuthUser(user_id)` extension into the request. Every protected handler reads `Extension(AuthUser(user_id))`; `user_id` from request bodies is never trusted.
+Middleware (`auth::middleware::require_auth`) protects everything except `/healthz` (merged outside the layer), `/docs` (merged in `main.rs`), and `/svc/v1/*` (admitted by a shared secret header, mounted only when `INSIGHTS_EXPORT_SECRET` is set) — today that means `/comp/*`, `/v2/comp/*`, `/bff/v1/*`, `/world/*`, and `/persona/*`. The layer attaches to the merged sub-router in `routes/mod.rs`, not to a path prefix, which is why a new namespace (e.g. `/persona/*`) needs no extra auth wiring. It pulls the `Authorization: Bearer …` header, calls `state.auth.validate(token)`, and inserts an `AuthUser(user_id)` extension into the request. Every protected handler reads `Extension(AuthUser(user_id))`; `user_id` from request bodies is never trusted.
 
 The default validator is `SupabaseJwtValidator`; it dispatches per-token on the JWT `alg` header, preferring JWKS-based asymmetric verification (ES256/RS256/EdDSA) — the default since Supabase's 2025 JWT Signing Keys rollout — sourced from `SUPABASE_JWKS_URL` or derived from `SUPABASE_URL`, and falling back to legacy HS256 against `SUPABASE_JWT_SECRET` for projects that haven't migrated. Self-hosters with a different IdP implement the `AuthValidator` trait and inject their impl into `AppState.auth`.
 
@@ -184,7 +184,7 @@ crates/
 │       ├── voyage.rs         # 512-dim embeddings, fail-loud on empty key
 │       └── model_config.rs   # TOML loader
 ├── eros-engine-store/
-│   ├── migrations/           # 0000_schema → 0068_group_chat
+│   ├── migrations/           # 0000_schema → 0069_human_insights_updated_idx
 │   └── src/
 │       ├── pool.rs           # PgPoolOptions builder
 │       ├── chat.rs           # ChatRepo
@@ -204,7 +204,7 @@ crates/
         ├── auth/             # AuthValidator trait + Supabase impl + middleware
         ├── pipeline/         # stream (run_stream) / group + group_director / handlers / post_process / dreaming / …
         ├── prompt.rs         # system-prompt builder (affinity → directives)
-        ├── routes/           # health / companion / companion_stream / companion_async / insight / image_edit / voice / persona / session_open / session_effects / persona_items / reaction / group / world_town / bff / dto / mod
+        ├── routes/           # health / companion / companion_stream / companion_async / insight / image_edit / voice / persona / session_open / session_effects / persona_items / reaction / group / world_town / svc (service-to-service export, `/svc/v1/*`) / bff / dto / mod
         └── openapi.rs        # utoipa ApiDoc spec metadata
 ```
 
