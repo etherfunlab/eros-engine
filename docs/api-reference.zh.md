@@ -374,7 +374,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 | 分组 | `item`（单位） |
 |---|---|
 | 消耗品 | `cigarette`（支）、`alcohol`（杯）、`medicine`（片）、`food`（份）、`soft_drink`（瓶）、`tea`（杯）、`coffee`（杯）、`herb`（包） |
-| 贵重物 | `watch`（块）、`gem`（颗）、`gold`（块）、`camera`（台）、`cash`（张）、`antique`（件）、`artwork`（件）、`handmade`（份）、`credit_card`（张） |
+| 贵重物 | `watch`（块）、`gem`（颗）、`gold`（块）、`camera`（台）、`cash`（张）、`antique`（件）、`artwork`（件）、`handmade`（份）、`credit_card`（张）、`flower`（朵） |
 
 **`give` 的余效。** 被接受的消耗品会在这个 session 之后的 `min(quantity, 5)` 个文字回合里继续影响角色；接受它的那一回合不算在内。每个回合角色处在曲线上的某一步，档位 1–4：
 

@@ -729,6 +729,7 @@ pub(crate) fn given_phrase(item: GivenItem, name: Option<&str>, quantity: u8) ->
         GivenItem::Artwork => ("件", "艺术品"),
         GivenItem::Handmade => ("份", "手作礼物"),
         GivenItem::CreditCard => ("张", "信用卡"),
+        GivenItem::Flower => ("朵", "花"),
     };
     match name {
         Some(name) => format!("{quantity} {unit}「{name}」"),
@@ -767,7 +768,8 @@ fn effect_word(item: GivenItem, level: u8) -> &'static str {
         | GivenItem::Antique
         | GivenItem::Artwork
         | GivenItem::Handmade
-        | GivenItem::CreditCard => return "",
+        | GivenItem::CreditCard
+        | GivenItem::Flower => return "",
     };
     words[usize::from(level.clamp(1, 4)) - 1]
 }
@@ -5265,6 +5267,7 @@ mod tests {
             (GivenItem::Artwork, "件", "艺术品"),
             (GivenItem::Handmade, "份", "手作礼物"),
             (GivenItem::CreditCard, "张", "信用卡"),
+            (GivenItem::Flower, "朵", "花"),
         ] {
             assert_eq!(given_phrase(item, None, 2), format!("2 {unit}{word}"));
             assert_eq!(

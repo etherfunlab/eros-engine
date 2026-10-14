@@ -159,7 +159,7 @@ pub enum UserActionKind {
 }
 
 /// What a `give` action hands over. Consumables (`cigarette` through `herb`)
-/// linger on the persona; valuables (`watch` through `credit_card`) do not.
+/// linger on the persona; valuables (`watch` through `flower`) do not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GivenItemDto {
@@ -180,6 +180,7 @@ pub enum GivenItemDto {
     Artwork,
     Handmade,
     CreditCard,
+    Flower,
 }
 
 impl From<GivenItemDto> for eros_engine_core::types::GivenItem {
@@ -203,6 +204,7 @@ impl From<GivenItemDto> for eros_engine_core::types::GivenItem {
             GivenItemDto::Artwork => GivenItem::Artwork,
             GivenItemDto::Handmade => GivenItem::Handmade,
             GivenItemDto::CreditCard => GivenItem::CreditCard,
+            GivenItemDto::Flower => GivenItem::Flower,
         }
     }
 }
@@ -228,6 +230,7 @@ impl From<eros_engine_core::types::GivenItem> for GivenItemDto {
             GivenItem::Artwork => GivenItemDto::Artwork,
             GivenItem::Handmade => GivenItemDto::Handmade,
             GivenItem::CreditCard => GivenItemDto::CreditCard,
+            GivenItem::Flower => GivenItemDto::Flower,
         }
     }
 }
@@ -3663,6 +3666,7 @@ mod validate_payload_tests {
             ("artwork", GivenItem::Artwork),
             ("handmade", GivenItem::Handmade),
             ("credit_card", GivenItem::CreditCard),
+            ("flower", GivenItem::Flower),
         ] {
             let dto: UserActionDto =
                 serde_json::from_value(serde_json::json!({"type": "give", "item": wire}))
