@@ -422,7 +422,7 @@ physical or custom action → chemistry), and a refused `tip` costs nothing (see
 | group | `item` (unit) |
 |---|---|
 | consumable | `cigarette` (支), `alcohol` (杯), `medicine` (片), `food` (份), `soft_drink` (瓶), `tea` (杯), `coffee` (杯), `herb` (包) |
-| valuable | `watch` (块), `gem` (颗), `gold` (块), `camera` (台), `cash` (张), `antique` (件), `artwork` (件), `handmade` (份), `credit_card` (张) |
+| valuable | `watch` (块), `gem` (颗), `gold` (块), `camera` (台), `cash` (张), `antique` (件), `artwork` (件), `handmade` (份), `credit_card` (张), `flower` (朵) |
 
 **Lingering effects of a `give`.** An accepted consumable keeps affecting the persona on the next `min(quantity, 5)` text turns of the session; the turn that accepts it is not one of them. Each turn the persona is at one step of a curve, at a level from 1 to 4:
 

@@ -176,6 +176,7 @@ pub enum GivenItem {
     Artwork,
     Handmade,
     CreditCard,
+    Flower,
 }
 
 /// Which of the persona's lists an item belongs to (spec
@@ -671,6 +672,7 @@ mod tests {
             (GivenItem::Artwork, "artwork"),
             (GivenItem::Handmade, "handmade"),
             (GivenItem::CreditCard, "credit_card"),
+            (GivenItem::Flower, "flower"),
         ] {
             assert_eq!(serde_json::to_value(item).unwrap(), wire);
             assert_eq!(

@@ -4221,7 +4221,7 @@
       },
       "GivenItemDto": {
         "type": "string",
-        "description": "What a `give` action hands over. Consumables (`cigarette` through `herb`)\nlinger on the persona; valuables (`watch` through `credit_card`) do not.",
+        "description": "What a `give` action hands over. Consumables (`cigarette` through `herb`)\nlinger on the persona; valuables (`watch` through `flower`) do not.",
         "enum": [
           "cigarette",
           "alcohol",
@@ -4239,7 +4239,8 @@
           "antique",
           "artwork",
           "handmade",
-          "credit_card"
+          "credit_card",
+          "flower"
         ]
       },
       "GreetingDto": {
