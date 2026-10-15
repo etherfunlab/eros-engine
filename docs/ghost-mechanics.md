@@ -120,6 +120,16 @@ The session has ghosted before (`last_ghost_at` is set) → threshold is `0.85`.
 If the persona ghosts too aggressively → raise base threshold (0.70+) or weight `tension` higher.
 If the persona never ghosts → check that LLM affinity-evaluation is actually moving `intrigue` and `patience` down on bad turns. The defaults assume a working evaluator pushing those metrics around.
 
+## Ghosting the engine imposes
+
+While a persona's `away_from_phone` life event is under way (see [the events route](api-reference.md#post-v2compsessionsession_idevents)), every 1:1 text turn of that persona, in any of her sessions, ghosts without the judge and without the score above. Nothing on this page applies to it: it does not count towards `ghost_streak`, does not set `last_ghost_at`, and does not raise the threshold for later turns. It ends with the same three frames as any ghost.
+
+- The user's row is marked ghosted like any other, but it gets no `read_at`: no judge read it, and it stays unread after the persona explains.
+- A turn that carries a user action is the exception. It takes the normal path and is answered, because an action is always answered.
+- The `ghosting` switch ([model-config.md](model-config.md)) does not reach it: `ghosting = false` does not turn it off. A caller that does not want it leaves `away_from_phone` out of `kinds` on the events route.
+
+When the stretch is over, the persona explains it in her next message in a session where she ghosted: a reply, an `/open` greeting or an event message. After she has written once, that is done.
+
 ## What ghosting is not
 
 - It's **not** an error response. The HTTP route still returns 200. Because the engine is SSE-streaming, a ghost turn ends with three frames and then closes the stream: `meta(action_type=ghost, model=null)` → `done(usage=null, generation_id=null)` → `final`. No `delta` frame is emitted and no chat model is called. The `reasoning` and `body_state` frames that can precede any turn's first `meta` precede this one too.
@@ -132,4 +142,6 @@ If the persona never ghosts → check that LLM affinity-evaluation is actually m
 - `crates/eros-engine-core/src/ghost.rs` — score + ghost_permitted + decide (12 unit tests)
 - `crates/eros-engine-server/src/pipeline/stream.rs::run_stream` — the `ActionType::Ghost` arm: stamps the row and records the ghost, building no chat request
 - `crates/eros-engine-store/src/affinity.rs::record_ghost` — persistence (increments streak, total_ghosts, last_ghost_at), plus a zero-delta `companion_affinity_events` row with `event_type='ghost'`
+- `crates/eros-engine-server/src/pipeline/stream.rs::run_stream` — the away branch ahead of the judge: marks the row ghosted, yields the ghost frames, and calls neither the judge nor `record_ghost`
+- `crates/eros-engine-store/src/events.rs::EventRepo` — `current` (the event under way at a turn's own row) and `unexplained_away` (whether a ghosted stretch still awaits its explanation)
 - `crates/eros-engine-store/src/chat.rs::mark_user_message_ghosted` — sets `chat_messages.ghost_decision = true` on the user row, so replay can tell a ghost outcome from a still-generating turn

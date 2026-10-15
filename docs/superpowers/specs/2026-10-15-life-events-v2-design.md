@@ -390,8 +390,9 @@ Every 1:1 text turn of the instance, in any session, whose user row's
 - the stream yields the ghost `meta`, `done` and `final` frames a judged
   ghost yields; nothing else runs.
 
-An action turn (a give or a tip) is exempt and takes the normal path, because
-an action is always answered; its `正在经历` line still lists the away stretch.
+An action turn (any user action: a give, a tip, a kiss…) is exempt and takes
+the normal path, because an action is always answered; its `正在经历` line still
+lists the away stretch.
 
 Which ghosts came from an away window is derivable from the event row and the
 ghosted rows' times, so it is not stored.

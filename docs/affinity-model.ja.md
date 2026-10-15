@@ -225,7 +225,7 @@ Chemistry: `spark` / `flirtation` / `crush` / `lover` / `beloved`
 
 - グループチャットのディレクター — 各メンバーの Bond と Chemistry のラベルおよび intimacy rung。メンバーの 1:1 セッションから読み取るだけで、書き込みは一切行わない。
 
-- ライフイベントの抽選 — intimacy rung が `ex_message` の可否を決める。rung 1 では抽選されない(events ルートの説明は [API reference](api-reference.md#post-v2compsessionsession_idevents) を参照)。
+- ライフイベントの抽選 — intimacy rung が `ex_message` と `breakup`(rung 1 では抽選されない)、`sudden_desire`(rung 3 のみ)の可否を決める(events ルートの説明は [API reference](api-reference.md#post-v2compsessionsession_idevents) を参照)。
 
 - ゴーストスコアリング — `score = (1−intrigue)·0.4 + (1−patience)·0.4 + tension·0.2` を使い、ハード veto(最初の10メッセージ、streak ≥ 2、1時間クールダウン)と閾値 0.65(セッションが一度ゴーストした後は 0.85)を適用する。
 

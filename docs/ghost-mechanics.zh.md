@@ -119,6 +119,16 @@ score = (1−0.05)×0.4 + (1−0.05)×0.4 + 0×0.2
 人格 ghost 太勤了 → 提高基礎閾值（0.70+）或加重 `tension` 權重。
 人格從不 ghost → 檢查 LLM 好感度評估有沒有真的把 `intrigue` 跟 `patience` 在差的回合往下推。默認值假設評估器在工作、把這些指標推來推去。
 
+## engine 强制的 ghost
+
+角色的 `away_from_phone` 生活事件进行期间（见 [events 路由](api-reference.zh.md#post-v2compsessionsession_idevents)），她任何一个 session 里的每一轮 1:1 文字消息都会被 ghost，不经过判官，也不经过上面的打分。本页的其他规则都不适用于它：它不计入 `ghost_streak`，不写 `last_ghost_at`，也不会抬高之后各轮的阈值。它和任何一次 ghost 一样，以同样的三帧收尾。
+
+- 用户那一行和其他被 ghost 的行一样标记为已 ghost，但没有 `read_at`：没有判官读过它，角色解释之后它依然是未读。
+- 带用户动作的轮次是例外。它走正常路径并得到回复，因为动作永远会得到回复。
+- `ghosting` 开关（见 [model-config.zh.md](model-config.zh.md)）管不到它：`ghosting = false` 不会关掉它。调用方不想要它，就在 events 路由的 `kinds` 里不写 `away_from_phone`。
+
+这段时间结束后，在被 ghost 过的会话里，角色会在她的下一条消息里解释这件事：回复、`/open` 开场白或事件消息都可以。她写过一次之后，这件事就了结了。
+
 ## Ghost 不是甚麼
 
 - **不是** 错误响应。HTTP 路由仍返 200。由于引擎采用 SSE 流式传输，ghost 轮以三帧收尾后关闭流：`meta(action_type=ghost, model=null)` → `done(usage=null, generation_id=null)` → `final`。不会发出 `delta` 帧，也不会调用聊天模型。任何回合的第一个 `meta` 之前都可能出现的 `reasoning` 和 `body_state` 帧，在这里同样排在它前面。
@@ -131,4 +141,6 @@ score = (1−0.05)×0.4 + (1−0.05)×0.4 + 0×0.2
 - `crates/eros-engine-core/src/ghost.rs`——score + ghost_permitted + decide（12 個單元測試）
 - `crates/eros-engine-server/src/pipeline/stream.rs::run_stream`——其中的 `ActionType::Ghost` 分支：标记该行并记录 ghost，不构建 chat 请求
 - `crates/eros-engine-store/src/affinity.rs::record_ghost`——持久化（增加 streak、total_ghosts、last_ghost_at），并插入一行 `event_type='ghost'`、增量全零的 `companion_affinity_events` 事件
+- `crates/eros-engine-server/src/pipeline/stream.rs::run_stream`——判官之前的 away 分支：把该行标记为已 ghost，发出 ghost 帧，既不调用判官也不调用 `record_ghost`
+- `crates/eros-engine-store/src/events.rs::EventRepo`——`current`（某一轮自己那一行当时在进行的事件）与 `unexplained_away`（被 ghost 的那段时间是否还没被解释）
 - `crates/eros-engine-store/src/chat.rs::mark_user_message_ghosted`——把用户行的 `chat_messages.ghost_decision` 置为 true，让重放能把 ghost 结局和还在生成中的回合区分开

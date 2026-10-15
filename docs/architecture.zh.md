@@ -76,6 +76,8 @@ spawn post_process     tokio::spawn——跟返回響應並行：
 
 **Ghost streak 重置** 由編排器在 spawn post-process 之前處理：Reply 動作會在一個冪等 UPDATE 裡把 streak 清零；Ghost 動作則調 `AffinityRepo::record_ghost`。倉儲方法 `persist_with_event` 自身永遠不碰 streak。
 
+**没看手机。** 角色的 `away_from_phone` 生活事件进行期间，不带用户动作的文字轮在 PDE 之前就被 ghost：该行被标记为已 ghost，发出 ghost 帧，判官和 `record_ghost` 都不运行。见 [ghost-mechanics.zh.md](ghost-mechanics.zh.md#engine-强制的-ghost)。
+
 **PDE 动作列表。** 判断器（或规则引擎）每轮给出的 action 是以下之一：
 `reply_text` | `ghost` | `reply_image` | `reply_text_image` | `product_qa`。
 其中三个是有条件可用的：`reply_image` 和 `reply_text_image` **同时**要求请求带
@@ -163,7 +165,7 @@ crates/
 │   └── src/
 │       ├── affinity.rs       # 6 維向量 + 档位写入管线 + 時間衰退 + 標籤
 │       ├── effects.rs        # 被接受的 give 的余效（曲线 + active_effects）
-│       ├── events.rs         # 生活事件的种类与抽取
+│       ├── events.rs         # 生活事件的分类、种类与两段抽取
 │       ├── ghost.rs          # 評分公式 + 4 層保護
 │       ├── group.rs          # 群聊导演输出规整、兜底点名、转录角色映射
 │       ├── needs.rs          # 角色的四项需求（档位 + 按时间推算）
@@ -177,10 +179,11 @@ crates/
 │       ├── voyage.rs         # 512 維 embedding，空 key 直接 fail
 │       └── model_config.rs   # TOML 加載器
 ├── eros-engine-store/
-│   ├── migrations/           # 0000_schema → 0071_chat_messages_event_key
+│   ├── migrations/           # 0000_schema → 0072_persona_events
 │   └── src/
 │       ├── pool.rs           # PgPoolOptions 構造
 │       ├── chat.rs           # ChatRepo
+│       ├── events.rs         # EventRepo（persona_events：进行中的事件、历史、没看手机）
 │       ├── group.rs          # GroupRepo（群聊会话、成员关系）
 │       ├── affinity.rs       # AffinityRepo（persist_with_event、record_ghost）
 │       ├── memory.rs         # MemoryRepo（Profile / Relationship 兩層）

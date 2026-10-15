@@ -78,6 +78,8 @@ spawn post_process     tokio::spawn — runs concurrent with response return:
 
 **Ghost-streak reset** is handled by the orchestrator before spawning post-process: on Reply the streak is cleared in a single idempotent UPDATE; on Ghost the orchestrator calls `AffinityRepo::record_ghost` instead. The `persist_with_event` repo method itself never touches the streak.
 
+**Away from phone.** While the persona's `away_from_phone` life event is under way, a text turn without a user action ghosts before the PDE: the row is marked ghosted and the ghost frames are yielded, and neither the judge nor `record_ghost` runs. See [ghost-mechanics.md](ghost-mechanics.md#ghosting-the-engine-imposes).
+
 **PDE action list.** The judge's (or rule engine's) per-turn action is one of
 `reply_text` | `ghost` | `reply_image` | `reply_text_image` | `product_qa`.
 Three of these are conditionally available: `reply_image` and
@@ -175,7 +177,7 @@ crates/
 │   └── src/
 │       ├── affinity.rs       # 6-dim vector + grade pipeline + time decay + labels
 │       ├── effects.rs        # lingering effects of an accepted give (curves + active_effects)
-│       ├── events.rs         # life event kinds and the draw
+│       ├── events.rs         # life event categories, kinds and the two-stage draw
 │       ├── ghost.rs          # score formula + 4-tier protection
 │       ├── group.rs          # group director normalization, fallback cast, transcript roles
 │       ├── needs.rs          # the persona's four needs (levels + time carry-forward)
@@ -189,10 +191,11 @@ crates/
 │       ├── voyage.rs         # 512-dim embeddings, fail-loud on empty key
 │       └── model_config.rs   # TOML loader
 ├── eros-engine-store/
-│   ├── migrations/           # 0000_schema → 0071_chat_messages_event_key
+│   ├── migrations/           # 0000_schema → 0072_persona_events
 │   └── src/
 │       ├── pool.rs           # PgPoolOptions builder
 │       ├── chat.rs           # ChatRepo
+│       ├── events.rs         # EventRepo (persona_events: life events under way, history, away)
 │       ├── group.rs          # GroupRepo (group sessions, membership)
 │       ├── affinity.rs       # AffinityRepo (persist_with_event, record_ghost)
 │       ├── memory.rs         # MemoryRepo (Profile/Relationship layers)

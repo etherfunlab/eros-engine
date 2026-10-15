@@ -14,7 +14,7 @@ Pure-domain types and rules for the [`eros-engine`](https://github.com/etherfunl
 - `ghost` — proactive (unsolicited) message scheduling logic.
 - `group` — group chat's pure half: the director's output, how it becomes an ordered cast, and how a transcript line reads to one speaker.
 - `needs` — the persona's four basic needs and how they carry forward in time.
-- `events` — life event kinds and the draw that picks one.
+- `events` — life event categories and kinds, and the two-stage draw that picks one.
 - `types` — shared IDs, timestamps, and enums.
 
 ## Use it
