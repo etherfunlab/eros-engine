@@ -4468,10 +4468,52 @@ pub(crate) fn run_stream_with(
                     at: chrono::Utc::now(),
                 }
             });
-        let event_judge = crate::prompt::events_judge_text(&current);
+        // While she is away from her phone (spec 2026-10-15-life-events-v2-
+        // design.md §7.2) the turn ghosts without the judge. The silence is
+        // circumstance, so the ghost accounting is left alone.
+        if current
+            .foreground
+            .as_ref()
+            .is_some_and(|e| e.kind == eros_engine_core::events::EventKind::AwayFromPhone)
+        {
+            if let Err(e) = chat_repo
+                .mark_user_message_ghosted(user_msg.user_message_id)
+                .await
+            {
+                tracing::warn!("stream: ghost mark failed: {e}");
+            }
+            let msg_id = Ulid::new();
+            yield ProtocolFrame::Meta {
+                message_id: ulid_string(msg_id),
+                action_type: FrameActionType::Ghost,
+                model: None,
+                continues_from: None,
+                speaker_session_id: None,
+            };
+            yield ProtocolFrame::Done {
+                message_id: ulid_string(msg_id),
+                truncated: false,
+                usage: None,
+                generation_id: None,
+                ghost_fallback: false,
+            };
+            let (attempts, gateways) = split_failures_typed(&[]);
+            yield build_final_frame(false, None, user_msg.tier.clone(), 0, 0, attempts, gateways);
+            return;
+        }
+        // An away stretch that ended, with a message of hers ghosted inside it
+        // and no reply since: this turn explains it.
+        let away = eros_engine_store::events::EventRepo { pool: &state.pool }
+            .unexplained_away(user_msg.session_id, user_msg.instance_id, current.at)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("stream: away read failed: {e}");
+                None
+            });
+        let event_judge = crate::prompt::events_judge_text(&current, away.as_ref());
         let event_lines = crate::prompt::EventLines {
             under_way: crate::prompt::events_reply_text(&current),
-            away_unexplained: false,
+            away_unexplained: away.is_some(),
         };
         // ── PDE decision (judge-first) ────────────────────────────────────────
         // The judge runs before vision/input-filter/chat so a `ghost` verdict
@@ -22034,6 +22076,112 @@ data: [DONE]\n\n"
         );
         assert!(chat_request_body(&reqs)
             .contains("- 正在经历：出差（约 14 小时后结束）；路上遇到小动物（不到 1 小时后结束）"));
+    }
+
+    async fn ghost_accounting(
+        pool: &PgPool,
+        umid: Uuid,
+    ) -> (bool, i32, Option<chrono::DateTime<chrono::Utc>>) {
+        sqlx::query_as(
+            "SELECT m.ghost_decision, a.ghost_streak, a.last_ghost_at \
+               FROM engine.chat_messages m \
+               JOIN engine.companion_affinity a ON a.session_id = m.session_id \
+              WHERE m.id = $1",
+        )
+        .bind(umid)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    const AWAY_LINE: &str = "- 刚才：有段时间没看手机，对方那时发来的消息你现在才看到";
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_away_stretch_ghosts_the_turn_without_the_judge(pool: PgPool) {
+        // The stretch was drawn in another session of the same persona.
+        let t = run_event_turn(
+            &pool,
+            &[],
+            &[ev("away_from_phone", 10, 50)],
+            &[],
+            Some(serde_json::json!({"action": "reply_text", "inner_state": ""})),
+            0,
+        )
+        .await;
+        assert!(
+            t.mock.received_requests().await.unwrap().is_empty(),
+            "no judge, no reply"
+        );
+        assert!(
+            t.frames.iter().any(|f| matches!(
+                f,
+                ProtocolFrame::Meta {
+                    action_type: FrameActionType::Ghost,
+                    ..
+                }
+            )),
+            "{:?}",
+            t.frames
+        );
+        assert_eq!(ghost_accounting(&pool, t.umid).await, (true, 0, None));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_first_turn_after_an_away_stretch_explains_it(pool: PgPool) {
+        let t = run_event_turn(
+            &pool,
+            &[],
+            &[ev("away_from_phone", 70, -10)],
+            &[30],
+            Some(serde_json::json!({"action": "reply_text", "inner_state": ""})),
+            0,
+        )
+        .await;
+        let reqs = t.mock.received_requests().await.unwrap();
+        let judge = judge_request(&reqs);
+        assert!(
+            judge.contains("[近期事件] 没看手机（不到 1 小时前结束，期间对方的消息你没有回）\\n"),
+            "{judge}"
+        );
+        assert!(chat_request_body(&reqs).contains(AWAY_LINE));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_reply_since_the_stretch_ends_the_explanation(pool: PgPool) {
+        let replied = SeedRow {
+            role: "assistant",
+            action: Some("reply"),
+            metadata: serde_json::json!({}),
+            mins_ago: 5,
+        };
+        let t = run_event_turn(
+            &pool,
+            &[replied],
+            &[ev("away_from_phone", 70, -10)],
+            &[30],
+            Some(serde_json::json!({"action": "reply_text", "inner_state": ""})),
+            0,
+        )
+        .await;
+        let reqs = t.mock.received_requests().await.unwrap();
+        assert!(!judge_request(&reqs).contains("没看手机"));
+        assert!(!chat_request_body(&reqs).contains("- 刚才："));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn without_a_ghosted_message_there_is_nothing_to_explain(pool: PgPool) {
+        let t = run_event_turn(
+            &pool,
+            &[],
+            &[ev("away_from_phone", 70, -10)],
+            &[],
+            Some(serde_json::json!({"action": "reply_text", "inner_state": ""})),
+            0,
+        )
+        .await;
+        let reqs = t.mock.received_requests().await.unwrap();
+        assert!(!judge_request(&reqs).contains("没看手机"));
+        assert!(!chat_request_body(&reqs).contains("- 刚才："));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

@@ -267,6 +267,17 @@ pub(crate) async fn open_at(
         } => (occasion, recall_query, since),
     };
 
+    // She is not looking at her phone (spec 2026-10-15-life-events-v2-
+    // design.md §7.2): no greeting.
+    let away = eros_engine_store::events::EventRepo { pool: &state.pool }
+        .current(instance_id, None, now)
+        .await?
+        .foreground
+        .is_some_and(|e| e.kind == eros_engine_core::events::EventKind::AwayFromPhone);
+    if away {
+        return Ok(OpenSessionResponse { greeting: None });
+    }
+
     let _guard = state
         .stream_slots
         .try_acquire(user_id, CONCURRENT_STREAMS_PER_USER)
@@ -1128,6 +1139,116 @@ mod tests {
             calls[0]
                 .to_string()
                 .contains("- 正在经历：短途旅游（约 47 小时后结束）"),
+            "{}",
+            calls[0]
+        );
+    }
+
+    async fn seed_event(
+        pool: &PgPool,
+        session_id: Uuid,
+        kind: eros_engine_core::events::EventKind,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) {
+        let instance_id: Uuid =
+            sqlx::query_scalar("SELECT instance_id FROM engine.chat_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        eros_engine_store::events::EventRepo { pool }
+            .insert(
+                &eros_engine_store::events::NewEvent {
+                    instance_id,
+                    session_id,
+                    event_key: kind.as_str(),
+                    kind,
+                    started_at: from,
+                    ends_at: to,
+                },
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("seeded");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn no_opener_while_she_is_away(pool: PgPool) {
+        use eros_engine_core::events::EventKind;
+        let user_id = Uuid::new_v4();
+        let now = Utc::now();
+        let session_id =
+            session_with_history(&pool, user_id, now - chrono::Duration::days(2)).await;
+        seed_event(
+            &pool,
+            session_id,
+            EventKind::AwayFromPhone,
+            now - chrono::Duration::minutes(10),
+            now + chrono::Duration::minutes(50),
+        )
+        .await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "在干嘛呢").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let out = open_at(
+            &state,
+            session_id,
+            user_id,
+            opener(OpenOccasion::JustOpened, "visit-1"),
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(out.greeting.is_none());
+        assert!(companion_calls(&mock).await.is_empty());
+        assert_eq!(proactive_rows(&pool, session_id).await, 0);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_opener_after_an_away_stretch_explains_it(pool: PgPool) {
+        use eros_engine_core::events::EventKind;
+        let user_id = Uuid::new_v4();
+        let now = Utc::now();
+        let session_id =
+            session_with_history(&pool, user_id, now - chrono::Duration::days(2)).await;
+        seed_event(
+            &pool,
+            session_id,
+            EventKind::AwayFromPhone,
+            now - chrono::Duration::minutes(70),
+            now - chrono::Duration::minutes(10),
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, ghost_decision, sent_at) \
+             VALUES ($1, 'user', '在吗', true, $2)",
+        )
+        .bind(session_id)
+        .bind(now - chrono::Duration::minutes(30))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "刚刚没看手机，抱歉").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        open_at(
+            &state,
+            session_id,
+            user_id,
+            opener(OpenOccasion::JustOpened, "visit-1"),
+            now,
+        )
+        .await
+        .unwrap()
+        .greeting
+        .expect("an opener");
+        let calls = companion_calls(&mock).await;
+        assert!(
+            calls[0]
+                .to_string()
+                .contains("- 刚才：有段时间没看手机，对方那时发来的消息你现在才看到"),
             "{}",
             calls[0]
         );

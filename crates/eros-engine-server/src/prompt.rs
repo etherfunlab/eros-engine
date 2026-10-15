@@ -879,10 +879,14 @@ fn ends_text(ends_in: chrono::Duration) -> String {
 }
 
 /// `[近期事件]` (spec 2026-10-15-life-events-v2-design.md §8.2): the
-/// background, then the foreground, each
-/// 「临时接到工作（1 小时前开始，约 3 小时后结束）」; `None` when neither.
-pub(crate) fn events_judge_text(c: &eros_engine_store::events::CurrentEvents) -> Option<String> {
-    let items: Vec<String> = [c.background.as_ref(), c.foreground.as_ref()]
+/// background, the foreground, then an away stretch she has not explained,
+/// each 「临时接到工作（1 小时前开始，约 3 小时后结束）」 or 「没看手机（不到 1
+/// 小时前结束，期间对方的消息你没有回）」; `None` when there is nothing.
+pub(crate) fn events_judge_text(
+    c: &eros_engine_store::events::CurrentEvents,
+    away: Option<&eros_engine_store::events::EventRecord>,
+) -> Option<String> {
+    let mut items: Vec<String> = [c.background.as_ref(), c.foreground.as_ref()]
         .into_iter()
         .flatten()
         .map(|e| {
@@ -894,6 +898,13 @@ pub(crate) fn events_judge_text(c: &eros_engine_store::events::CurrentEvents) ->
             )
         })
         .collect();
+    if let Some(a) = away {
+        items.push(format!(
+            "{}（{}前结束，期间对方的消息你没有回）",
+            event_label(a.kind),
+            span_text(c.at - a.ends_at)
+        ));
+    }
     (!items.is_empty()).then(|| items.join("；"))
 }
 
@@ -3821,7 +3832,7 @@ mod tests {
         use eros_engine_core::events::EventKind;
         let c = only(event_at(EventKind::TempWork, 120, 120));
         assert_eq!(
-            events_judge_text(&c).unwrap(),
+            events_judge_text(&c, None).unwrap(),
             "临时接到工作（2 小时前开始，约 2 小时后结束）"
         );
         assert_eq!(
@@ -3830,7 +3841,7 @@ mod tests {
         );
         let c = only(event_at(EventKind::AnimalEncounter, 20, 40));
         assert_eq!(
-            events_judge_text(&c).unwrap(),
+            events_judge_text(&c, None).unwrap(),
             "路上遇到小动物（不到 1 小时前开始，不到 1 小时后结束）"
         );
         assert_eq!(
@@ -3840,7 +3851,7 @@ mod tests {
         // Rounded to whole hours: 89 minutes → 1, 151 minutes → 3.
         let c = only(event_at(EventKind::WeatherChange, 89, 151));
         assert_eq!(
-            events_judge_text(&c).unwrap(),
+            events_judge_text(&c, None).unwrap(),
             "天气突然变了（1 小时前开始，约 3 小时后结束）"
         );
         for (kind, label) in [
@@ -3866,7 +3877,7 @@ mod tests {
             at,
         };
         assert_eq!(
-            events_judge_text(&c).unwrap(),
+            events_judge_text(&c, None).unwrap(),
             "长途旅游（2 天前开始，约 3 天后结束）；在看书（不到 1 小时前开始，约 2 小时后结束）"
         );
         assert_eq!(
@@ -3878,8 +3889,34 @@ mod tests {
             background: None,
             at,
         };
-        assert_eq!(events_judge_text(&nothing), None);
+        assert_eq!(events_judge_text(&nothing, None), None);
         assert_eq!(events_reply_text(&nothing), None);
+    }
+
+    #[test]
+    fn an_unexplained_away_stretch_is_the_last_judge_item() {
+        use eros_engine_core::events::EventKind;
+        let (trip, at) = event_at(EventKind::BusinessTrip, 600, 840);
+        let (away, _) = event_at(EventKind::AwayFromPhone, 70, -10);
+        let c = eros_engine_store::events::CurrentEvents {
+            foreground: None,
+            background: Some(trip),
+            at,
+        };
+        assert_eq!(
+            events_judge_text(&c, Some(&away)).unwrap(),
+            "出差（10 小时前开始，约 14 小时后结束）；没看手机（不到 1 小时前结束，期间对方的消息你没有回）"
+        );
+        let (long_ago, _) = event_at(EventKind::AwayFromPhone, 240, -120);
+        let nothing = eros_engine_store::events::CurrentEvents {
+            foreground: None,
+            background: None,
+            at,
+        };
+        assert_eq!(
+            events_judge_text(&nothing, Some(&long_ago)).unwrap(),
+            "没看手机（2 小时前结束，期间对方的消息你没有回）"
+        );
     }
 
     #[test]

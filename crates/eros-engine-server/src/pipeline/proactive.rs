@@ -264,7 +264,10 @@ pub(crate) async fn greet(
         .await?;
     let event_lines = crate::prompt::EventLines {
         under_way: crate::prompt::events_reply_text(&current),
-        away_unexplained: false,
+        away_unexplained: eros_engine_store::events::EventRepo { pool: &state.pool }
+            .unexplained_away(g.session_id, g.instance_id, g.now.now)
+            .await?
+            .is_some(),
     };
     let (mut chat_req, injected_tags) = build_reply_request(
         state,

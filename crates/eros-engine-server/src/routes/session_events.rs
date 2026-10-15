@@ -2,7 +2,7 @@
 //! POST /v2/comp/session/{session_id}/events — the caller asks for something
 //! to happen in the persona's day; the engine decides whether and what, and
 //! the persona tells the user (spec
-//! docs/superpowers/specs/2026-10-13-life-events-design.md §5).
+//! docs/superpowers/specs/2026-10-15-life-events-v2-design.md).
 
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
@@ -223,10 +223,12 @@ async fn respond(
 
 /// Ask for something to happen in the persona's day.
 ///
-/// The engine draws one kind of event, or none (an event is under way, or
-/// every allowed kind is cooling down). The persona then tells the user in
-/// one proactive message, persisted like any reply and returned with the
-/// event. The same `event_key` returns the same event.
+/// The engine draws one kind of event, or none (a short or mid-length
+/// incident is under way, or every allowed kind is cooling down). During a
+/// background event (a trip or a body state) only incidents are drawn. The
+/// persona then tells the user in one proactive message, persisted like any
+/// reply and returned with the event; `away_from_phone` is drawn without a
+/// message. The same `event_key` returns the same event.
 #[utoipa::path(
     post,
     path = "/v2/comp/session/{session_id}/events",
@@ -325,12 +327,10 @@ pub(crate) async fn draw_event_at(
         .iter()
         .map(|e| e.past())
         .collect();
-    let mut allowed: Vec<EventKind> = match &req.kinds {
+    let allowed: Vec<EventKind> = match &req.kinds {
         Some(kinds) => kinds.iter().map(|k| (*k).into()).collect(),
         None => EventKind::ALL.to_vec(),
     };
-    // Generation tells an event; away_from_phone has nothing to tell.
-    allowed.retain(|k| *k != EventKind::AwayFromPhone);
     let traits = crate::prompt::persona_traits(&persona);
     let Some(drawn) = events::draw(
         &DrawInput {
@@ -345,6 +345,25 @@ pub(crate) async fn draw_event_at(
     ) else {
         return Ok(DrawEventResponse::none());
     };
+
+    // Nothing to tell: the event is the silence (spec 2026-10-15-life-events-
+    // v2-design.md §7.1).
+    if drawn.kind == EventKind::AwayFromPhone {
+        event_repo
+            .insert(
+                &eros_engine_store::events::NewEvent {
+                    instance_id,
+                    session_id,
+                    event_key: &key,
+                    kind: drawn.kind,
+                    started_at: now,
+                    ends_at: now + drawn.lasts,
+                },
+                None,
+            )
+            .await?;
+        return respond(state, session_id, &key).await;
+    }
 
     let background = history
         .iter()
@@ -938,6 +957,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.event.map(|e| e.kind), Some(EventKindDto::Period));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn away_from_phone_is_drawn_without_a_message(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            req("a1", Some(vec![EventKindDto::AwayFromPhone])),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        let e = out.event.expect("an away stretch");
+        assert_eq!(e.kind, EventKindDto::AwayFromPhone);
+        assert_eq!(e.message_id, None);
+        assert!(out.message.is_none());
+        // 1–3 h, duration roll 0.5 → 1 + ⌊0.5 × 3⌋ = 2 h.
+        assert_eq!((e.ends_at - e.started_at).num_hours(), 2);
+        assert!(calls(&mock).await.is_empty(), "nothing is generated");
+        assert_eq!(event_rows(&pool, session_id).await, 0, "no message row");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_same_key_returns_the_same_away_event(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        let state = test_state(pool.clone());
+        let only = || req("a1", Some(vec![EventKindDto::AwayFromPhone]));
+        let first = draw_event_at(&state, session_id, user_id, only(), Utc::now(), rolls(0.1))
+            .await
+            .unwrap()
+            .event
+            .expect("drawn");
+        let again = draw_event_at(&state, session_id, user_id, only(), Utc::now(), rolls(0.9))
+            .await
+            .unwrap()
+            .event
+            .expect("the same");
+        assert_eq!(
+            (first.started_at, first.ends_at),
+            (again.started_at, again.ends_at)
+        );
+        let n: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM engine.persona_events WHERE session_id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(n, 1);
     }
 
     #[test]
