@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! POST /v2/comp/session/{session_id}/events — the caller asks for something
-//! to happen in the persona's day; the engine decides whether and what, and
-//! the persona tells the user (spec
-//! docs/superpowers/specs/2026-10-13-life-events-design.md §5).
+//! to happen in the persona's day; the engine decides whether and what. The
+//! persona tells the user in a message, except for `away_from_phone`, which is
+//! only her silence (spec
+//! docs/superpowers/specs/2026-10-15-life-events-v2-design.md).
 
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
@@ -16,7 +17,8 @@ use uuid::Uuid;
 use eros_engine_core::events::{self, DrawInput, EventKind};
 use eros_engine_core::scope::MemoryScope;
 use eros_engine_store::affinity::AffinityRepo;
-use eros_engine_store::chat::{ChatMessage, ChatRepo, EventRecord};
+use eros_engine_store::chat::ChatRepo;
+use eros_engine_store::events::EventRepo;
 
 use crate::auth::middleware::AuthUser;
 use crate::error::{AppError, StreamPreError};
@@ -41,21 +43,67 @@ const MAX_EVENT_KEY_CHARS: usize = 128;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKindDto {
+    PoliceEncounter,
+    AnimalEncounter,
+    HitSomeone,
+    SuddenDesire,
+    GroceryShopping,
+    Showering,
+    Bathing,
+    InClass,
+    OnTheWay,
     TempWork,
     ExMessage,
     WeatherChange,
-    PoliceEncounter,
-    AnimalEncounter,
+    GotHit,
+    Breakup,
+    WorkingOut,
+    Reading,
+    Gaming,
+    AwayFromPhone,
+    Unwell,
+    Irritable,
+    Sick,
+    Period,
+    Hospitalized,
+    PostSurgery,
+    BusinessTrip,
+    ShortTrip,
+    LongTrip,
+    HometownVisit,
 }
 
 impl From<EventKindDto> for EventKind {
     fn from(k: EventKindDto) -> Self {
         match k {
+            EventKindDto::PoliceEncounter => EventKind::PoliceEncounter,
+            EventKindDto::AnimalEncounter => EventKind::AnimalEncounter,
+            EventKindDto::HitSomeone => EventKind::HitSomeone,
+            EventKindDto::SuddenDesire => EventKind::SuddenDesire,
+            EventKindDto::GroceryShopping => EventKind::GroceryShopping,
+            EventKindDto::Showering => EventKind::Showering,
+            EventKindDto::Bathing => EventKind::Bathing,
+            EventKindDto::InClass => EventKind::InClass,
+            EventKindDto::OnTheWay => EventKind::OnTheWay,
             EventKindDto::TempWork => EventKind::TempWork,
             EventKindDto::ExMessage => EventKind::ExMessage,
             EventKindDto::WeatherChange => EventKind::WeatherChange,
-            EventKindDto::PoliceEncounter => EventKind::PoliceEncounter,
-            EventKindDto::AnimalEncounter => EventKind::AnimalEncounter,
+            EventKindDto::GotHit => EventKind::GotHit,
+            EventKindDto::Breakup => EventKind::Breakup,
+            EventKindDto::WorkingOut => EventKind::WorkingOut,
+            EventKindDto::Reading => EventKind::Reading,
+            EventKindDto::Gaming => EventKind::Gaming,
+            EventKindDto::AwayFromPhone => EventKind::AwayFromPhone,
+            EventKindDto::Unwell => EventKind::Unwell,
+            EventKindDto::Irritable => EventKind::Irritable,
+            EventKindDto::Sick => EventKind::Sick,
+            EventKindDto::Period => EventKind::Period,
+            EventKindDto::Hospitalized => EventKind::Hospitalized,
+            EventKindDto::PostSurgery => EventKind::PostSurgery,
+            EventKindDto::BusinessTrip => EventKind::BusinessTrip,
+            EventKindDto::ShortTrip => EventKind::ShortTrip,
+            EventKindDto::LongTrip => EventKind::LongTrip,
+            EventKindDto::HometownVisit => EventKind::HometownVisit,
         }
     }
 }
@@ -63,29 +111,77 @@ impl From<EventKindDto> for EventKind {
 impl From<EventKind> for EventKindDto {
     fn from(k: EventKind) -> Self {
         match k {
+            EventKind::PoliceEncounter => EventKindDto::PoliceEncounter,
+            EventKind::AnimalEncounter => EventKindDto::AnimalEncounter,
+            EventKind::HitSomeone => EventKindDto::HitSomeone,
+            EventKind::SuddenDesire => EventKindDto::SuddenDesire,
+            EventKind::GroceryShopping => EventKindDto::GroceryShopping,
+            EventKind::Showering => EventKindDto::Showering,
+            EventKind::Bathing => EventKindDto::Bathing,
+            EventKind::InClass => EventKindDto::InClass,
+            EventKind::OnTheWay => EventKindDto::OnTheWay,
             EventKind::TempWork => EventKindDto::TempWork,
             EventKind::ExMessage => EventKindDto::ExMessage,
             EventKind::WeatherChange => EventKindDto::WeatherChange,
-            EventKind::PoliceEncounter => EventKindDto::PoliceEncounter,
-            EventKind::AnimalEncounter => EventKindDto::AnimalEncounter,
+            EventKind::GotHit => EventKindDto::GotHit,
+            EventKind::Breakup => EventKindDto::Breakup,
+            EventKind::WorkingOut => EventKindDto::WorkingOut,
+            EventKind::Reading => EventKindDto::Reading,
+            EventKind::Gaming => EventKindDto::Gaming,
+            EventKind::AwayFromPhone => EventKindDto::AwayFromPhone,
+            EventKind::Unwell => EventKindDto::Unwell,
+            EventKind::Irritable => EventKindDto::Irritable,
+            EventKind::Sick => EventKindDto::Sick,
+            EventKind::Period => EventKindDto::Period,
+            EventKind::Hospitalized => EventKindDto::Hospitalized,
+            EventKind::PostSurgery => EventKindDto::PostSurgery,
+            EventKind::BusinessTrip => EventKindDto::BusinessTrip,
+            EventKind::ShortTrip => EventKindDto::ShortTrip,
+            EventKind::LongTrip => EventKindDto::LongTrip,
+            EventKind::HometownVisit => EventKindDto::HometownVisit,
+        }
+    }
+}
+
+/// A life event's category: `short` and `mid` are incidents, `body` and
+/// `trip` backgrounds that last days.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EventCategoryDto {
+    Short,
+    Mid,
+    Body,
+    Trip,
+}
+
+impl From<eros_engine_core::events::EventCategory> for EventCategoryDto {
+    fn from(c: eros_engine_core::events::EventCategory) -> Self {
+        use eros_engine_core::events::EventCategory;
+        match c {
+            EventCategory::Short => EventCategoryDto::Short,
+            EventCategory::Mid => EventCategoryDto::Mid,
+            EventCategory::Body => EventCategoryDto::Body,
+            EventCategory::Trip => EventCategoryDto::Trip,
         }
     }
 }
 
 /// A life event: what happened, when it started and ends, and the message
-/// that told it.
+/// that told it (`null` for an event that is never told).
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct EventView {
     pub kind: EventKindDto,
+    pub category: EventCategoryDto,
     pub started_at: DateTime<Utc>,
     pub ends_at: DateTime<Utc>,
-    pub message_id: Uuid,
+    pub message_id: Option<Uuid>,
 }
 
-impl From<&EventRecord> for EventView {
-    fn from(e: &EventRecord) -> Self {
+impl From<&eros_engine_store::events::EventRecord> for EventView {
+    fn from(e: &eros_engine_store::events::EventRecord) -> Self {
         Self {
             kind: e.kind.into(),
+            category: e.kind.category().into(),
             started_at: e.started_at,
             ends_at: e.ends_at,
             message_id: e.message_id,
@@ -137,24 +233,43 @@ impl DrawEventResponse {
             message: None,
         }
     }
+}
 
-    fn from_row(row: Option<ChatMessage>) -> Self {
-        match row.as_ref().and_then(EventRecord::from_message) {
-            Some(e) => Self {
-                event: Some(EventView::from(&e)),
-                message: row.map(Into::into),
-            },
-            None => Self::none(),
+/// The event written under `event_key` in this session, with the message
+/// that told it; nulls when there is none.
+async fn respond(
+    state: &AppState,
+    session_id: Uuid,
+    event_key: &str,
+) -> Result<DrawEventResponse, AppError> {
+    let Some(event) = EventRepo { pool: &state.pool }
+        .by_key(session_id, event_key)
+        .await?
+    else {
+        return Ok(DrawEventResponse::none());
+    };
+    let message = match event.message_id {
+        Some(id) => {
+            ChatRepo { pool: &state.pool }
+                .message_by_id_in_session(session_id, id)
+                .await?
         }
-    }
+        None => None,
+    };
+    Ok(DrawEventResponse {
+        event: Some(EventView::from(&event)),
+        message: message.map(Into::into),
+    })
 }
 
 /// Ask for something to happen in the persona's day.
 ///
-/// The engine draws one kind of event, or none (an event is under way, or
-/// every allowed kind is cooling down). The persona then tells the user in
-/// one proactive message, persisted like any reply and returned with the
-/// event. The same `event_key` returns the same event.
+/// The engine draws one kind of event, or none (a short or mid-length
+/// incident is under way, or every allowed kind is cooling down). During a
+/// background event (a trip or a body state) only incidents are drawn. The
+/// persona then tells the user in one proactive message, persisted like any
+/// reply and returned with the event; `away_from_phone` is drawn without a
+/// message. The same `event_key` returns the same event.
 #[utoipa::path(
     post,
     path = "/v2/comp/session/{session_id}/events",
@@ -181,8 +296,16 @@ async fn draw_event(
     Extension(AuthUser(user_id)): Extension<AuthUser>,
     Json(req): Json<DrawEventRequest>,
 ) -> Result<Json<DrawEventResponse>, AppError> {
-    let roll = rand::thread_rng().gen::<f64>();
-    draw_event_at(&state, session_id, user_id, req, Utc::now(), roll)
+    // The generator is not `Send`: it is dropped before the first await.
+    let rolls = {
+        let mut rng = rand::thread_rng();
+        events::Rolls {
+            category: rng.gen(),
+            kind: rng.gen(),
+            duration: rng.gen(),
+        }
+    };
+    draw_event_at(&state, session_id, user_id, req, Utc::now(), rolls)
         .await
         .map(Json)
 }
@@ -197,14 +320,14 @@ fn invalid_payload(message: String) -> AppError {
     })
 }
 
-/// The handler with its clock and roll injected, for tests.
+/// The handler with its clock and rolls injected, for tests.
 pub(crate) async fn draw_event_at(
     state: &AppState,
     session_id: Uuid,
     user_id: Uuid,
     req: DrawEventRequest,
     now: DateTime<Utc>,
-    roll: f64,
+    rolls: events::Rolls,
 ) -> Result<DrawEventResponse, AppError> {
     validate_tier(req.tier.as_deref())?;
     let prompt_traits = validate_prompt_traits(req.prompt_traits.as_deref().unwrap_or(&[]))
@@ -224,8 +347,9 @@ pub(crate) async fn draw_event_at(
     let (_session, persona, instance_id) = resolve_text_turn(state, session_id, user_id).await?;
 
     let chat_repo = ChatRepo { pool: &state.pool };
-    if let Some(row) = chat_repo.event_message(session_id, &key).await? {
-        return Ok(DrawEventResponse::from_row(Some(row)));
+    let event_repo = EventRepo { pool: &state.pool };
+    if event_repo.by_key(session_id, &key).await?.is_some() {
+        return respond(state, session_id, &key).await;
     }
 
     let needs = if state.model_config.pde_enabled() {
@@ -238,28 +362,63 @@ pub(crate) async fn draw_event_at(
         .await?;
     affinity.apply_time_decay();
     affinity.refresh_endpoints(&state.config.affinity_tuning);
-    let history: Vec<events::PastEvent> = chat_repo
-        .recent_events(instance_id, now - events::longest_cooldown())
+    let history: Vec<events::PastEvent> = event_repo
+        .recent(instance_id, now - events::lookback())
         .await?
         .iter()
-        .map(EventRecord::past)
+        .map(|e| e.past())
         .collect();
-    let allowed: Vec<EventKind> = match &req.kinds {
+    let mut allowed: Vec<EventKind> = match &req.kinds {
         Some(kinds) => kinds.iter().map(|k| (*k).into()).collect(),
         None => EventKind::ALL.to_vec(),
     };
-    let Some(kind) = events::draw(
+    // Away from her phone is silence: it follows the ghost protection (the
+    // deployment's ghosting switch and the session's message floor).
+    let signals =
+        crate::pipeline::compute_signals_for_session(&state.pool, session_id, &affinity).await?;
+    if !state.model_config.pde_ghosting_enabled()
+        || signals.message_count < eros_engine_core::ghost::GHOST_MIN_MESSAGES
+    {
+        allowed.retain(|k| *k != EventKind::AwayFromPhone);
+    }
+    let traits = crate::prompt::persona_traits(&persona);
+    let Some(drawn) = events::draw(
         &DrawInput {
             now,
             needs,
             intimacy_rung: affinity.intimacy_rung(),
+            persona: &traits,
             history: &history,
             allowed: &allowed,
         },
-        roll,
+        rolls,
     ) else {
         return Ok(DrawEventResponse::none());
     };
+
+    // Nothing to tell: the event is the silence (spec 2026-10-15-life-events-
+    // v2-design.md §7.1).
+    if drawn.kind == EventKind::AwayFromPhone {
+        event_repo
+            .insert(
+                &eros_engine_store::events::NewEvent {
+                    instance_id,
+                    session_id,
+                    event_key: &key,
+                    kind: drawn.kind,
+                    started_at: now,
+                    ends_at: now + drawn.lasts,
+                },
+                None,
+            )
+            .await?;
+        return respond(state, session_id, &key).await;
+    }
+
+    let background = history
+        .iter()
+        .find(|e| e.kind.is_background() && e.ends_at > now)
+        .map(|e| e.kind);
 
     let _guard = state
         .stream_slots
@@ -284,7 +443,7 @@ pub(crate) async fn draw_event_at(
         .map(recall_query_text)
         .unwrap_or_default();
     let now_ctx = NowContext::for_user(&locale, now);
-    let row = greet(
+    greet(
         state,
         Greeting {
             session_id,
@@ -293,8 +452,10 @@ pub(crate) async fn draw_event_at(
             persona: &persona,
             now: &now_ctx,
             occasion: Occasion::Event {
-                event_key: key,
-                kind,
+                event_key: key.clone(),
+                kind: drawn.kind,
+                lasts: drawn.lasts,
+                background,
             },
             recall_query,
             since: now,
@@ -311,7 +472,7 @@ pub(crate) async fn draw_event_at(
         },
     )
     .await?;
-    Ok(DrawEventResponse::from_row(row))
+    respond(state, session_id, &key).await
 }
 
 pub fn router() -> OpenApiRouter<AppState> {
@@ -411,14 +572,15 @@ mod tests {
             user_id,
             req("k1", Some(vec![EventKindDto::TempWork])),
             now,
-            0.5,
+            rolls(0.5),
         )
         .await
         .unwrap();
         let e = out.event.expect("an event");
         let m = out.message.expect("a message");
         assert_eq!(e.kind, EventKindDto::TempWork);
-        assert_eq!(e.message_id, m.message_id);
+        assert_eq!(e.category, EventCategoryDto::Mid);
+        assert_eq!(e.message_id, Some(m.message_id));
         assert_eq!(m.content, "刚被老板叫去加班，晚点聊");
         assert_eq!(
             m.occasion,
@@ -434,9 +596,15 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(meta["proactive"], json!("event"));
-        assert_eq!(meta["event_key"], json!("k1"));
-        assert_eq!(meta["event"]["kind"], json!("temp_work"));
-        assert!(meta["event"]["ends_at"].is_string());
+        assert!(meta.get("event").is_none() && meta.get("event_key").is_none());
+        let (key, kind): (String, String) = sqlx::query_as(
+            "SELECT event_key, kind FROM engine.persona_events WHERE message_id = $1",
+        )
+        .bind(m.message_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((key.as_str(), kind.as_str()), ("k1", "temp_work"));
         assert_eq!(meta["user_timezone"], json!("Asia/Taipei"));
 
         let c = calls(&mock).await;
@@ -464,7 +632,7 @@ mod tests {
             user_id,
             req("same", kinds.clone()),
             Utc::now(),
-            0.1,
+            rolls(0.1),
         )
         .await
         .unwrap();
@@ -474,7 +642,7 @@ mod tests {
             user_id,
             req("same", kinds),
             Utc::now(),
-            0.9,
+            rolls(0.9),
         )
         .await
         .unwrap();
@@ -499,7 +667,7 @@ mod tests {
             user_id,
             req("k1", Some(vec![EventKindDto::AnimalEncounter])),
             Utc::now(),
-            0.1,
+            rolls(0.1),
         )
         .await
         .unwrap();
@@ -510,7 +678,7 @@ mod tests {
             user_id,
             req("k2", None),
             Utc::now(),
-            0.1,
+            rolls(0.1),
         )
         .await
         .unwrap();
@@ -532,7 +700,7 @@ mod tests {
             user_id,
             req("k1", Some(vec![EventKindDto::PoliceEncounter])),
             Utc::now(),
-            0.1
+            rolls(0.1)
         )
         .await
         .unwrap()
@@ -544,7 +712,7 @@ mod tests {
             user_id,
             req("k2", None),
             Utc::now(),
-            0.1,
+            rolls(0.1),
         )
         .await
         .unwrap();
@@ -561,25 +729,21 @@ mod tests {
         // A weather change that started 5 hours ago and ended an hour ago:
         // over, but still inside its 8-hour cooldown.
         let started = Utc::now() - chrono::Duration::hours(5);
-        let repo = ChatRepo { pool: &pool };
-        repo.insert_event_message(
-            instance_id,
-            session_id,
-            started,
-            &eros_engine_store::chat::ProactiveInsert {
-                id: Uuid::new_v4(),
-                content: "下雨了".into(),
-                generation_id: None,
-                metadata: json!({"proactive": "event", "event_key": "old",
-                    "event": {"kind": "weather_change",
-                              "ends_at": (started + chrono::Duration::hours(4)).to_rfc3339()}}),
-                llm_attempts: None,
-                gateway_errors: None,
-            },
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        eros_engine_store::events::EventRepo { pool: &pool }
+            .insert(
+                &eros_engine_store::events::NewEvent {
+                    instance_id,
+                    session_id,
+                    event_key: "old",
+                    kind: EventKind::WeatherChange,
+                    started_at: started,
+                    ends_at: started + chrono::Duration::hours(4),
+                },
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
         let mock = MockServer::start().await;
         mount_companion(&mock, "又下雨了").await;
         let state = with_companion(test_state(pool.clone()), &mock.uri());
@@ -589,7 +753,7 @@ mod tests {
             user_id,
             req("k1", Some(vec![EventKindDto::WeatherChange])),
             Utc::now(),
-            0.1,
+            rolls(0.1),
         )
         .await
         .unwrap();
@@ -611,7 +775,7 @@ mod tests {
             user_id,
             req("k1", Some(vec![EventKindDto::ExMessage])),
             Utc::now(),
-            0.5,
+            rolls(0.5),
         )
         .await
         .unwrap();
@@ -632,7 +796,7 @@ mod tests {
             user_id,
             req("k1", Some(vec![])),
             Utc::now(),
-            0.5,
+            rolls(0.5),
         )
         .await
         .unwrap();
@@ -653,7 +817,7 @@ mod tests {
             user_id,
             req("k1", Some(vec![EventKindDto::TempWork])),
             Utc::now(),
-            0.5,
+            rolls(0.5),
         )
         .await
         .unwrap();
@@ -667,10 +831,17 @@ mod tests {
         let (_, session_id) = setup(&pool, user_id).await;
         let state = test_state(pool.clone());
         for key in ["", "has space", &"x".repeat(129)] {
-            let err = draw_event_at(&state, session_id, user_id, req(key, None), Utc::now(), 0.5)
-                .await
-                .err()
-                .unwrap_or_else(|| panic!("{key:?} accepted"));
+            let err = draw_event_at(
+                &state,
+                session_id,
+                user_id,
+                req(key, None),
+                Utc::now(),
+                rolls(0.5),
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{key:?} accepted"));
             assert!(
                 matches!(
                     err,
@@ -699,7 +870,7 @@ mod tests {
             Uuid::new_v4(),
             req("k", None),
             Utc::now(),
-            0.5,
+            rolls(0.5),
         )
         .await
         .err()
@@ -711,12 +882,326 @@ mod tests {
             user_id,
             req("k", None),
             Utc::now(),
-            0.5,
+            rolls(0.5),
         )
         .await
         .err()
         .unwrap();
         assert_eq!(status(missing), StatusCode::NOT_FOUND);
+    }
+
+    fn rolls(r: f64) -> events::Rolls {
+        events::Rolls {
+            category: r,
+            kind: r,
+            duration: r,
+        }
+    }
+
+    async fn set_art(pool: &PgPool, instance_id: Uuid, art: serde_json::Value) {
+        sqlx::query(
+            "UPDATE engine.persona_genomes SET art_metadata = $2 \
+             WHERE id = (SELECT genome_id FROM engine.persona_instances WHERE id = $1)",
+        )
+        .bind(instance_id)
+        .bind(art)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_drawn_length_sets_when_the_event_ends(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "我出发去旅行啦").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            req("k1", Some(vec![EventKindDto::LongTrip])),
+            Utc::now(),
+            events::Rolls {
+                category: 0.5,
+                kind: 0.5,
+                duration: 0.0,
+            },
+        )
+        .await
+        .unwrap();
+        let e = out.event.expect("a trip");
+        assert_eq!(e.kind, EventKindDto::LongTrip);
+        assert_eq!(e.category, EventCategoryDto::Trip);
+        assert_eq!((e.ends_at - e.started_at).num_hours(), 72);
+        let c = calls(&mock).await;
+        let last = c[0]["messages"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(
+            last["content"],
+            json!("（你刚出发去长途旅行，要去 3 天。）")
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_incident_during_a_trip_is_told_from_the_trip(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (instance_id, session_id) = setup(&pool, user_id).await;
+        let started = Utc::now() - chrono::Duration::hours(2);
+        eros_engine_store::events::EventRepo { pool: &pool }
+            .insert(
+                &eros_engine_store::events::NewEvent {
+                    instance_id,
+                    session_id,
+                    event_key: "trip",
+                    kind: EventKind::BusinessTrip,
+                    started_at: started,
+                    ends_at: started + chrono::Duration::hours(24),
+                },
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "出差路上遇到一只小猫").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            req("k1", Some(vec![EventKindDto::AnimalEncounter])),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        assert!(out.event.is_some());
+        let c = calls(&mock).await;
+        let msgs = c[0]["messages"].as_array().unwrap();
+        assert_eq!(
+            msgs.last().unwrap()["content"],
+            json!("（你正在外地出差。你刚在路上遇到了一只小动物。）")
+        );
+        assert!(
+            c[0].to_string()
+                .contains("- 正在经历：出差（约 22 小时后结束）"),
+            "{}",
+            c[0]
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn period_is_drawn_only_for_a_female_persona(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (instance_id, session_id) = setup(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "那个来了，肚子好痛").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let only = || req("k", Some(vec![EventKindDto::Period]));
+        let out = draw_event_at(&state, session_id, user_id, only(), Utc::now(), rolls(0.5))
+            .await
+            .unwrap();
+        assert!(out.event.is_none());
+        assert!(calls(&mock).await.is_empty());
+        set_art(&pool, instance_id, json!({"gender": "female"})).await;
+        let out = draw_event_at(&state, session_id, user_id, only(), Utc::now(), rolls(0.5))
+            .await
+            .unwrap();
+        assert_eq!(out.event.map(|e| e.kind), Some(EventKindDto::Period));
+    }
+
+    /// `n` user rows in the session: what the ghost protection counts.
+    async fn seed_user_messages(pool: &PgPool, session_id: Uuid, n: usize) {
+        for _ in 0..n {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content) \
+                 VALUES ($1, 'user', 'hi')",
+            )
+            .bind(session_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn event_count(pool: &PgPool, session_id: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM engine.persona_events WHERE session_id = $1")
+            .bind(session_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn away_from_phone_is_not_drawn_before_the_ghost_threshold(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        let state = test_state(pool.clone());
+        let only = |key: &str| req(key, Some(vec![EventKindDto::AwayFromPhone]));
+
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            only("a1"),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        assert!(out.event.is_none(), "a fresh session has no messages");
+        assert_eq!(event_count(&pool, session_id).await, 0);
+
+        seed_user_messages(&pool, session_id, 9).await;
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            only("a2"),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        assert!(out.event.is_none(), "nine messages are still below ten");
+        assert_eq!(event_count(&pool, session_id).await, 0);
+
+        seed_user_messages(&pool, session_id, 1).await;
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            only("a3"),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out.event.map(|e| e.kind),
+            Some(EventKindDto::AwayFromPhone),
+            "ten messages lift the veto"
+        );
+        assert_eq!(event_count(&pool, session_id).await, 1);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_ghost_threshold_leaves_other_kinds_alone(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "外面突然下大雨了").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            req("k1", Some(vec![EventKindDto::WeatherChange])),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out.event.map(|e| e.kind),
+            Some(EventKindDto::WeatherChange),
+            "a fresh session still draws the kinds that tell a message"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn away_from_phone_is_not_drawn_while_ghosting_is_off(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        seed_user_messages(&pool, session_id, 10).await;
+        let only = |key: &str| req(key, Some(vec![EventKindDto::AwayFromPhone]));
+        let mut off = test_state(pool.clone());
+        off.model_config = Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.pde_decision]\nmodel = \"judge\"\nghosting = false\n",
+            )
+            .unwrap(),
+        );
+        assert!(!off.model_config.pde_ghosting_enabled());
+
+        let out = draw_event_at(
+            &off,
+            session_id,
+            user_id,
+            only("a1"),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        assert!(out.event.is_none() && out.message.is_none());
+        assert_eq!(event_count(&pool, session_id).await, 0);
+
+        // The same session draws it once the switch is on.
+        let on = test_state(pool.clone());
+        assert!(on.model_config.pde_ghosting_enabled());
+        let out = draw_event_at(&on, session_id, user_id, only("a2"), Utc::now(), rolls(0.5))
+            .await
+            .unwrap();
+        assert_eq!(out.event.map(|e| e.kind), Some(EventKindDto::AwayFromPhone));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn away_from_phone_is_drawn_without_a_message(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        seed_user_messages(&pool, session_id, 10).await;
+        let mock = MockServer::start().await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            req("a1", Some(vec![EventKindDto::AwayFromPhone])),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        let e = out.event.expect("an away stretch");
+        assert_eq!(e.kind, EventKindDto::AwayFromPhone);
+        assert_eq!(e.message_id, None);
+        assert!(out.message.is_none());
+        // 1–3 h, duration roll 0.5 → 1 + ⌊0.5 × 3⌋ = 2 h.
+        assert_eq!((e.ends_at - e.started_at).num_hours(), 2);
+        assert!(calls(&mock).await.is_empty(), "nothing is generated");
+        assert_eq!(event_rows(&pool, session_id).await, 0, "no message row");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_same_key_returns_the_same_away_event(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        seed_user_messages(&pool, session_id, 10).await;
+        let state = test_state(pool.clone());
+        let only = || req("a1", Some(vec![EventKindDto::AwayFromPhone]));
+        let first = draw_event_at(&state, session_id, user_id, only(), Utc::now(), rolls(0.1))
+            .await
+            .unwrap()
+            .event
+            .expect("drawn");
+        let again = draw_event_at(&state, session_id, user_id, only(), Utc::now(), rolls(0.9))
+            .await
+            .unwrap()
+            .event
+            .expect("the same");
+        assert_eq!(
+            (first.started_at, first.ends_at),
+            (again.started_at, again.ends_at)
+        );
+        let n: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM engine.persona_events WHERE session_id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(n, 1);
     }
 
     #[test]

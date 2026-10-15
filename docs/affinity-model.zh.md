@@ -182,8 +182,9 @@ penalty = κ_line × ((y − y₀)⁺ / (1 − y₀))² × (|g| / 4)
 `gateway_errors`）保持存储档位不变，端点仅按当前线值与衰减重新派生。旧的规则
 delta 回退已退役。
 
-Ghost 回合从不进入 `persist_with_event`：只有 `ghost_streak` / `total_ghosts` /
-`last_ghost_at` 移动；`record_ghost` 写全零 `effective_deltas`。
+PDE 判定的 ghost 回合从不进入 `persist_with_event`：只有 `ghost_streak` / `total_ghosts` /
+`last_ghost_at` 移动；`record_ghost` 写全零 `effective_deltas`。`away_from_phone` 期间由 engine
+强制的 ghost 一个都不动（见 [ghost-mechanics.zh.md](ghost-mechanics.zh.md#engine-强制的-ghost)）。
 
 ### 被拒绝的动作
 
@@ -260,8 +261,8 @@ Ghost 回合从不进入 `persist_with_event`：只有 `ghost_streak` / `total_g
   的边界上）与 patience 分带。
 - 群聊导演：每位成员的 Bond 与 Chemistry 档位标签和 intimacy 档，从该成员的
   1:1 会话里读取，从不写入。
-- 生活事件抽取：intimacy 档决定能否抽到 `ex_message`，档 1 时不会抽到
-  （见 [events 路由](api-reference.zh.md#post-v2compsessionsession_idevents)）。
+- 生活事件抽取：intimacy 档决定能否抽到 `ex_message` 与 `breakup`（档 1 时不会抽到）
+  和 `sudden_desire`（只在档 3）（见 [events 路由](api-reference.zh.md#post-v2compsessionsession_idevents)）。
 - Ghost 打分：`score = (1−intrigue)·0.4 + (1−patience)·0.4 + tension·0.2`，
   带硬否决（前 10 条消息、连续 ghost ≥2、1 小时冷却），阈值 `0.65`，会话已经
   ghost 过一次后升为 `0.85`。

@@ -156,7 +156,7 @@ penalty = κ_line × ((y − y₀)⁺ / (1 − y₀))² × (|g| / 4)
 
 eval がスキップされた場合(`eval_skip_reason`)や失敗した場合(`llm_attempts` / `gateway_errors` が空でない場合)は、保存済みレベルを保持し、現在のライン値と減衰からエンドポイントを再導出する。旧来のルールデルタへのフォールバックは廃止された。
 
-ゴーストターンは `persist_with_event` に到達しない。変化するのは `ghost_streak` / `total_ghosts` / `last_ghost_at` のみであり、`record_ghost` はすべてゼロの `effective_deltas` を書き込む。
+PDE が決めたゴーストターンは `persist_with_event` に到達しない。変化するのは `ghost_streak` / `total_ghosts` / `last_ghost_at` のみであり、`record_ghost` はすべてゼロの `effective_deltas` を書き込む。`away_from_phone` の間にエンジンが課すゴーストは、これらのいずれも動かさない([ghost-mechanics.md](ghost-mechanics.md#ghosting-the-engine-imposes) を参照)。
 
 ### 拒否されたアクション
 
@@ -225,7 +225,7 @@ Chemistry: `spark` / `flirtation` / `crush` / `lover` / `beloved`
 
 - グループチャットのディレクター — 各メンバーの Bond と Chemistry のラベルおよび intimacy rung。メンバーの 1:1 セッションから読み取るだけで、書き込みは一切行わない。
 
-- ライフイベントの抽選 — intimacy rung が `ex_message` の可否を決める。rung 1 では抽選されない(events ルートの説明は [API reference](api-reference.md#post-v2compsessionsession_idevents) を参照)。
+- ライフイベントの抽選 — intimacy rung が `ex_message` と `breakup`(rung 1 では抽選されない)、`sudden_desire`(rung 3 のみ)の可否を決める(events ルートの説明は [API reference](api-reference.md#post-v2compsessionsession_idevents) を参照)。
 
 - ゴーストスコアリング — `score = (1−intrigue)·0.4 + (1−patience)·0.4 + tension·0.2` を使い、ハード veto(最初の10メッセージ、streak ≥ 2、1時間クールダウン)と閾値 0.65(セッションが一度ゴーストした後は 0.85)を適用する。
 

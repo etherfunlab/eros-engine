@@ -466,7 +466,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 | 字段 | 类型 | 默认值 | 备注 |
 |---|---|---|---|
-| `force` | `bool` | `false` | 强制本轮发图，覆盖 PDE 决策——该轮固定为 `reply_image`（仅图片，无文字回复）。要求部署配置了 `[tasks.chat_image_prompt_compose]`（否则 `422`），且 `content` 遵循普通的非空规则。`false` 时由 PDE 决定。1.0.1 之前旧契约遗留的 `mode` 键可以正常反序列化，但会被静默忽略。 |
+| `force` | `bool` | `false` | 强制本轮发图，覆盖 PDE 决策——该轮固定为 `reply_image`（仅图片，无文字回复），角色没看手机期间也一样。要求部署配置了 `[tasks.chat_image_prompt_compose]`（否则 `422`），且 `content` 遵循普通的非空规则。`false` 时由 PDE 决定。1.0.1 之前旧契约遗留的 `mode` 键可以正常反序列化，但会被静默忽略。 |
 | `style` | `"realistic"` \| `"semi_realistic"` \| `"anime"` | `"realistic"` | 引擎内置三种风格预设之一；`"realistic"` 是引擎内置默认值。 |
 | `aspect_ratio` | `String` | 无 | 允许值：`1:1`、`3:4`、`4:3`、`9:16`、`16:9`；省略时不存在（PDE 计划 → 请求 → 不存在）。非法时返回 `422`。 |
 | `prompt_variant` | `String` | 无 | 选择 `[tasks.chat_image_prompt_compose].filter_prompt` 的一个变体：按下标（`"0"`、`"1"`）或按 key（`"a"`、`"b"`），取决于该任务的配置形态（见 [model-config.zh.md](model-config.zh.md)）。`"raw"` 不带任何特殊含义：只有当该部署把某个变体配置在这个字面量 key 下时才会命中，和其他任意变体名一样。下标/key 没命中——包括未配置的 `"raw"`——都会回退到引擎内置的合成器提示词，绝不报 `422` 或其他错误。该任务未配置，或配置为单一纯字符串提示词时，此字段被忽略。 |
@@ -676,7 +676,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
   并且用户当地零点以来这个会话里还没有人说过话，角色就先开口。今天早些时候由 `occasion` 触发过的开口，或一条生活事件的消息，算作说过话。
 - **场合，由调用方决定。** 带 `occasion` 时，只要这个场合对当前会话属实，角色就先开口。
 
-两种情况都是生成一条 assistant 消息，落库后返回；否则 `greeting` 为 `null`。
+两种情况都是生成一条 assistant 消息，落库后返回；否则 `greeting` 为 `null`。角色的 `away_from_phone` 生活事件进行期间也返回 `null`，不生成（见 [events 路由](#post-v2compsessionsession_idevents)）。
 
 ```json
 {
@@ -721,15 +721,15 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 
 ### `POST /v2/comp/session/{session_id}/events`
 
-让角色的一天里发生点什么：她被叫去加班，前任给她发消息，天气突变，被警察拦下，路上遇到一只流浪小动物。
-什么时候要，由调用方决定；发不发生、发生什么，由 engine 决定。engine 抽一种事件，或者什么都不抽，
-然后角色用一条主动消息告诉用户。事件持续期间，判官和回复都知道她正在经历它
+让角色的一天里发生点什么。什么时候要，由调用方决定；发不发生、发生什么，由 engine 决定。
+engine 抽一种事件，或者什么都不抽，然后角色用一条主动消息告诉用户——`away_from_phone` 除外，它是沉默（见下）。
+事件持续期间，判官和回复都知道她正在经历它
 （见 [model-config.zh.md](model-config.zh.md#taskspde_decision--opt-in-llm-pde-判断器)）。
 
 ```json
 {
   "event_key": "day-01J9ZK3",
-  "kinds": ["weather_change", "animal_encounter"],
+  "kinds": ["weather_change", "animal_encounter", "business_trip"],
   "user_timezone": "Asia/Taipei",
   "tier": "gold"
 }
@@ -738,56 +738,107 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 | 字段 | 规则 |
 |---|---|
 | `event_key` | 必填：1–128 个 `[A-Za-z0-9_.:-]` 字符，只在本会话内有效。同一个 key 返回同一个事件 |
-| `kinds` | 选填，允许抽取的种类。不带：五种全部；`[]`：什么都不抽 |
+| `kinds` | 选填，允许抽取的种类。不带：全部种类；`[]`：什么都不抽 |
 | `user_timezone`、`user_country`、`user_region`、`tier`、`prompt_traits`、`memory_scope`、`affinity_scope`、`audit` | 与 `/open` 相同，用于生成这条消息 |
 
-| `kind` | 持续 | 她遇到的事 |
-|---|---|---|
-| `temp_work` | 4 小时 | 被叫去加班 |
-| `ex_message` | 3 小时 | 前任给她发来消息 |
-| `weather_change` | 4 小时 | 天气突然变了 |
-| `police_encounter` | 1 小时 | 被警察拦下问话 |
-| `animal_encounter` | 1 小时 | 路上遇到小动物 |
+种类分四个类别（`category`）。`short` 与 `mid` 是插曲；`body` 与 `trip` 是持续数天的背景，背景进行期间插曲照样会发生。
+
+| `category` | `kind` | 持续 | 她怎么了 |
+|---|---|---|---|
+| `short` | `police_encounter` | 30 分钟 | 被警察拦下问话 |
+| `short` | `animal_encounter` | 1 小时 | 路上遇到小动物 |
+| `short` | `hit_someone` | 1 小时 | 打人了 |
+| `short` | `sudden_desire` | 1 小时 | 突然很想要 |
+| `short` | `grocery_shopping` | 1 小时 | 买菜 |
+| `short` | `showering` | 30 分钟 | 洗澡中 |
+| `short` | `bathing` | 1 小时 | 泡澡中 |
+| `short` | `in_class` | 1 小时 | 上课中 |
+| `short` | `on_the_way` | 30 分钟 | 赶路中 |
+| `mid` | `temp_work` | 4 小时 | 临时接到工作 |
+| `mid` | `ex_message` | 3 小时 | 前任发来消息 |
+| `mid` | `weather_change` | 4 小时 | 天气突然变了 |
+| `mid` | `got_hit` | 4 小时 | 被打了 |
+| `mid` | `breakup` | 4 小时 | 刚分手 |
+| `mid` | `working_out` | 1–2 小时 | 在健身 |
+| `mid` | `reading` | 1–3 小时 | 在看书 |
+| `mid` | `gaming` | 2–4 小时 | 在打游戏 |
+| `mid` | `away_from_phone` | 1–3 小时 | 没看手机 |
+| `mid` | `unwell` | 1–4 小时 | 不舒服 |
+| `mid` | `irritable` | 2–4 小时 | 烦躁 |
+| `body` | `sick` | 1–3 天 | 生病中 |
+| `body` | `period` | 3–7 天 | 月经中 |
+| `body` | `hospitalized` | 2–5 天 | 住院 |
+| `body` | `post_surgery` | 3–7 天 | 刚做完手术 |
+| `trip` | `business_trip` | 24 小时 | 出差 |
+| `trip` | `short_trip` | 48 小时 | 短途旅游 |
+| `trip` | `long_trip` | 3–7 天 | 长途旅游 |
+| `trip` | `hometown_visit` | 72 小时 | 回老家 |
+
+时长写成区间的，在事件开始时从区间里抽定。
 
 抽取规则：
 
-- **同一时间只有一个事件。** 角色的任何一个 session 里有事件在进行时，不再抽取。
-- **冷却。** 每种事件从开始起有各自的冷却，同一种不会很快再来。
-- **她的需求给剩下的种类加权**，前提是部署配置了 LLM 判官，并且角色有一次判定。
-- **`ex_message` 需要先有一定的亲近度。** 她不会向不太熟的人提起前任。
+- **两段抽取。** engine 先按权重抽类别，再在类别内按权重抽种类。往一个类别里加种类，不会改变其他类别的占比。
+- **一次一件插曲，一个背景。** 角色的任何一个 session 里有插曲在进行时，不再抽取。背景进行期间只抽插曲；
+  住院和术后期间，不抽需要她出门活动的那九种（`temp_work`、`police_encounter`、`animal_encounter`、
+  `hit_someone`、`got_hit`、`working_out`、`grocery_shopping`、`in_class`、`on_the_way`）。
+- **冷却。** 每种事件从开始起有各自的冷却。trip 类每周最多开始一次，body 类每两周最多开始一次，不论具体是哪一种。
+- **她的需求给类别内的种类加权**，前提是部署配置了 LLM 判官，并且角色有一次判定。
+- **亲近度门槛。** `ex_message` 与 `breakup` 不会向不太熟的人抽出（intimacy 档 2 及以上）；
+  `sudden_desire` 只在最亲近的档（3）。`period` 只对 `art_metadata.gender` 为 `"female"` 的角色抽取。
+- **角色设置**，写在 genome 的 `art_metadata` 里，影响抽取：
+
+  | 键 | 取值 | 效果 |
+  |---|---|---|
+  | `prefer_events` | `mid` 种类的数组 | 列出的种类在 `mid` 内被抽到的概率是原来的三倍 |
+  | `health` | `"weak"`、`"normal"`（默认）、`"strong"` | body 类被抽到的概率分别是原来的两倍 / 一倍 / 一半 |
+  | `prefer_trip` | `true` / `false`（默认） | trip 类被抽到的概率是原来的三倍；仍然每周最多一次 |
+
+  取值形状不对、种类未知，或种类不在 `mid` 里，一律忽略。偏好不会绕过任何门槛。
 - **只要有符合条件的种类，抽取就一定得到一个事件。** 她的一天有多热闹，取决于调用方什么时候来要。
 
 什么都没抽到时，响应是 `{"event": null, "message": null}`，不生成消息。否则是一次非流式生成，需要几秒：
 
 ```json
-{"event": {"kind": "temp_work", "started_at": "2026-10-13T12:00:00Z", "ends_at": "2026-10-13T16:00:00Z", "message_id": "…"},
- "message": {"message_id": "…", "content": "刚被老板叫去加班，晚点聊", "sent_at": "2026-10-13T12:00:00Z", "occasion": "event"}}
+{"event": {"kind": "business_trip", "category": "trip", "started_at": "2026-10-15T12:00:00Z", "ends_at": "2026-10-16T12:00:00Z", "message_id": "…"},
+ "message": {"message_id": "…", "content": "要去外地出差一天，晚上再找你", "sent_at": "2026-10-15T12:00:00Z", "occasion": "event"}}
 ```
 
-`message` 的形状与 `/open` 的开场白相同，`occasion` 为 `"event"`。`started_at` 即这条消息的 `sent_at`，也就是它写入的那一刻；
-`ends_at` 是那一刻加上事件的时长。
+`message` 的形状与 `/open` 的开场白相同，`occasion` 为 `"event"`。`started_at` 即这条消息的 `sent_at`；
+`ends_at` 是那一刻加上抽到的时长。背景进行期间抽到的插曲，从背景里讲出来（「出差途中遇到一只小猫」）。
+
+**`away_from_phone`** 不生成任何东西：响应里带着事件，`"message": null`、`"message_id": null`。
+它持续期间，角色任何一个 session 里的每一轮文字消息都会被 ghost，不经过判官，也不计入 ghost 连续次数，
+`/open` 返回 `null`。带用户 `action` 的轮次（任何 `type`：`give`、`gift`、`tip`、`kiss`、`hug`、`touch`、`lick`、`custom`）或 `image.force = true` 是例外：
+它走正常路径并得到回复，因为动作永远会得到回复，强制出图的轮次永远是 `reply_image`。
+角色只在 ghost 保护允许的地方才会这样沉默：部署的 ghosting 开关关闭（`ghosting = false`）时不会抽到 `away_from_phone`，已经在进行的一段也不再让轮次沉默，
+用户消息不足 10 条的会话里也不会抽到；调用方完全不想要它，就在 `kinds` 里不写 `away_from_phone`。这样被 ghost 的消息没有回执（没有判官读过它），
+角色解释之后它依然没有回执。事件结束后，在用户消息被 ghost 过的会话里，角色的下一条消息——回复、`/open` 开场白或事件消息——
+会解释她刚才没看手机。她写过一次之后，这件事就了结了。机制见
+[ghost-mechanics.zh.md](ghost-mechanics.zh.md#engine-强制的-ghost)。
 
 - **按会话加 `event_key` 幂等。** 重复调用返回同一个事件和同一条消息，不再抽取，也不再生成。第一次调用还在生成时到达的重复调用，可能再生成一次，但只会写入一个事件，两次调用都返回它。返回空值的调用什么都没写，同一个 key 再调仍可能抽到。
 - **与普通回复一样落库：** 这条消息是一条普通的 assistant 行（`assistant_action_type = 'proactive'`，
   没有 `user_message_id`），在调用 `POST /comp/chat/{session_id}/read` 之前都是未读。
-  Realtime 和两个 history 路由都能看到。
+  Realtime 和两个 history 路由都能看到。事件本身是 `engine.persona_events` 的一行。
 - **竞态时用户不优先：** 事件生成期间落进会话的用户消息不会让事件作废：不论用户有没有开口，它都已经发生。
-- **与开场白的关系：** 事件消息算作会话里有人说过话，所以同一个当地日期里，事件之后不会再有生日或节日开场白。
-  事件落库时，正在生成的开场白让路，返回 `null`。
-- **持续期间：** 判官的上下文带一行 `[近期事件]`，回复的 `[character_state]` 带一行 `- 正在经历：…`；
-  `GET …/effects` 会列出正在经历的事件。
+- **与开场白的关系：** 事件消息算作会话里有人说过话，所以同一个当地日期里，事件消息之后不会再有生日或节日开场白。
+  事件消息落库时，正在生成的开场白让路，返回 `null`。
+- **持续期间：** 判官的上下文带一行 `[近期事件]`，回复的 `[character_state]` 带一行 `- 正在经历：…`，
+  各自列出正在进行的背景和插曲；`/open` 开场白同样带 `- 正在经历：…` 这一行。`GET …/effects` 两者都会列出。
 - **错误：** `event_key` 格式不对返回 `400`，`code: "invalid_payload"`；未知的 `kind` 返回 `422`。会话检查与 `/open` 相同
   （`403`、`404`，语音或群会话 `409`），达到单用户并发上限 `429`。生成失败时返回与图片接口相同的上游错误，不写入任何内容。
   回复为空时不写入任何内容，返回空值。
 
 ### `GET /v2/comp/session/{session_id}/effects`
 
-角色因被接受的 give 而带着的余效、她的需求和正在经历的事件，即此刻发一句文字消息时会带上的状态：供打开会话的页面和收不到帧的异步调用方使用。接受消耗品的那一回合刚结束，这个路由就已列出它的第 1 步，而那一回合的 `body_state` 帧里还没有它：帧描述刚写成的那句回复，路由描述角色此刻的样子。`needs` 是角色带到此刻的需求（形状与 `body_state` 帧里的一致），没有判定或没有配置 LLM 判官时为 `null`。`event` 是此刻正在经历的事件（形状与 events 路由一致），没有时为 `null`。
+角色因被接受的 give 而带着的余效、她的需求和正在经历的事件，即此刻发一句文字消息时会带上的状态：供打开会话的页面和收不到帧的异步调用方使用。接受消耗品的那一回合刚结束，这个路由就已列出它的第 1 步，而那一回合的 `body_state` 帧里还没有它：帧描述刚写成的那句回复，路由描述角色此刻的样子。`needs` 是角色带到此刻的需求（形状与 `body_state` 帧里的一致），没有判定或没有配置 LLM 判官时为 `null`。`event` 是此刻正在进行的插曲，`background_event` 是此刻正在进行的背景（形状都与 events 路由一致），没有时各为 `null`。正在进行的 `away_from_phone` 和其他插曲一样，作为 `event` 返回。
 
 ```json
 {"effects": [{"item": "alcohol", "name": "威士忌", "quantity": 3, "level": 2, "phase": "rising", "step": 2, "steps": 3}],
  "needs": {"hunger": "high", "social": "mid", "stamina": "low", "emotional": "mid"},
- "event": null}
+ "event": null,
+ "background_event": {"kind": "short_trip", "category": "trip", "started_at": "2026-10-15T08:00:00Z", "ends_at": "2026-10-17T08:00:00Z", "message_id": "…"}}
 ```
 
 没有余效时 `effects` 为 `[]`。错误同 `/open`：`404 session_not_found`、`403 session_forbidden`，语音或群 session 为 `409 wrong_channel`。
@@ -900,7 +951,8 @@ session 返回 404 的行为，与上面的 history 路由完全一致。
 语音 session 一样接受，它的 `assistant` 行照标不误 —— 只有 engine 自己那个写者
 是纯文字路径专用的，所以永远不打点的是语音的 **`user`** 行。
 
-**`read_at` 不出现要读作「没有回执」，不是「还没读」。** 语音 `user` 行，
+**`read_at` 不出现要读作「没有回执」，不是「还没读」。** 语音 `user` 行、
+在 `away_from_phone` 期间被 ghost 的 `user` 行（没有判官读过它），
 以及在没配 PDE 判官的部署上的每一条 `user` 行，都是永久不打点的。
 
 详见 [2026-08-19-chat-message-read-at-design.md](superpowers/specs/2026-08-19-chat-message-read-at-design.md)。
@@ -1740,7 +1792,7 @@ session 403）。
 - `crates/eros-engine-server/src/routes/companion_stream.rs`——流式对话轮（`message/stream`），含动作 + `image_url` 处理
 - `crates/eros-engine-server/src/routes/companion_async.rs`——只入队的对话轮（`v2/comp/session/{session_id}/message/async`）
 - `crates/eros-engine-server/src/routes/session_open.rs`——角色先开口：生日、节日开场白与调用方指定的场合（`v2/comp/session/{session_id}/open`）
-- `crates/eros-engine-server/src/routes/session_events.rs`——角色讲述的生活事件：抽取，以及那条主动消息（`v2/comp/session/{session_id}/events`）
+- `crates/eros-engine-server/src/routes/session_events.rs`——角色讲述的生活事件：抽取，以及讲述它的那条主动消息（`away_from_phone` 没有）（`v2/comp/session/{session_id}/events`）
 - `crates/eros-engine-server/src/routes/session_effects.rs`——角色因被接受的 give 而带着的余效、她的需求和正在经历的事件（`v2/comp/session/{session_id}/effects`）
 - `crates/eros-engine-server/src/routes/group.rs`——群管理与群发送路由（`v2/comp/group*`）
 - `crates/eros-engine-server/src/routes/reaction.rs`——消息 reaction：设置、撤销与允许列表（`v2/comp/session/{session_id}/message/{message_id}/reaction`、`v2/comp/reactions`）

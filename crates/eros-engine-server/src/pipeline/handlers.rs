@@ -805,7 +805,7 @@ pub(crate) async fn build_reply_request(
     render_reactions: bool,
     body_state: Option<&str>,
     needs: Option<&str>,
-    event: Option<&str>,
+    event: Option<&crate::prompt::EventLines>,
 ) -> Result<(ChatRequest, Vec<String>), AppError> {
     build_reply_request_with(
         state,
@@ -850,9 +850,9 @@ pub(crate) async fn build_reply_request_with(
     // The persona's needs, rendered once by the caller (spec
     // 2026-10-13-persona-needs-design.md §6.2). Only the text turn passes one.
     needs: Option<&str>,
-    // The event under way, rendered once by the caller (spec
-    // 2026-10-13-life-events-design.md §6). Only the text turn passes one.
-    event: Option<&str>,
+    // The persona's events, rendered once by the caller (spec
+    // 2026-10-15-life-events-v2-design.md §8.2).
+    event: Option<&crate::prompt::EventLines>,
     group: Option<&crate::pipeline::group::GroupSpeakerView>,
 ) -> Result<(ChatRequest, Vec<String>), AppError> {
     let chat_repo = ChatRepo { pool: &state.pool };

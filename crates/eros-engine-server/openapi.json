@@ -2003,7 +2003,7 @@
         "tags": [
           "companion"
         ],
-        "summary": "The persona's lingering state from accepted gives, her needs and the event\nunder way, as a text turn sent now would carry them.",
+        "summary": "The persona's lingering state from accepted gives, her needs and the\nincident and the background under way, as a text turn sent now would carry\nthem.",
         "operationId": "get_effects",
         "parameters": [
           {
@@ -2075,7 +2075,7 @@
           "companion"
         ],
         "summary": "Ask for something to happen in the persona's day.",
-        "description": "The engine draws one kind of event, or none (an event is under way, or\nevery allowed kind is cooling down). The persona then tells the user in\none proactive message, persisted like any reply and returned with the\nevent. The same `event_key` returns the same event.",
+        "description": "The engine draws one kind of event, or none (a short or mid-length\nincident is under way, or every allowed kind is cooling down). During a\nbackground event (a trip or a body state) only incidents are drawn. The\npersona then tells the user in one proactive message, persisted like any\nreply and returned with the event; `away_from_phone` is drawn without a\nmessage. The same `event_key` returns the same event.",
         "operationId": "draw_event",
         "parameters": [
           {
@@ -4052,6 +4052,17 @@
           "effects"
         ],
         "properties": {
+          "background_event": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EventView",
+                "description": "The persona's background under way now (a trip, an illness), or\n`null`."
+              }
+            ]
+          },
           "effects": {
             "type": "array",
             "items": {
@@ -4066,7 +4077,7 @@
               },
               {
                 "$ref": "#/components/schemas/EventView",
-                "description": "The persona's event under way now, or `null`."
+                "description": "The persona's foreground event under way now, or `null`."
               }
             ]
           },
@@ -4083,27 +4094,63 @@
           }
         }
       },
+      "EventCategoryDto": {
+        "type": "string",
+        "description": "A life event's category: `short` and `mid` are incidents, `body` and\n`trip` backgrounds that last days.",
+        "enum": [
+          "short",
+          "mid",
+          "body",
+          "trip"
+        ]
+      },
       "EventKindDto": {
         "type": "string",
         "description": "A kind of life event.",
         "enum": [
+          "police_encounter",
+          "animal_encounter",
+          "hit_someone",
+          "sudden_desire",
+          "grocery_shopping",
+          "showering",
+          "bathing",
+          "in_class",
+          "on_the_way",
           "temp_work",
           "ex_message",
           "weather_change",
-          "police_encounter",
-          "animal_encounter"
+          "got_hit",
+          "breakup",
+          "working_out",
+          "reading",
+          "gaming",
+          "away_from_phone",
+          "unwell",
+          "irritable",
+          "sick",
+          "period",
+          "hospitalized",
+          "post_surgery",
+          "business_trip",
+          "short_trip",
+          "long_trip",
+          "hometown_visit"
         ]
       },
       "EventView": {
         "type": "object",
-        "description": "A life event: what happened, when it started and ends, and the message\nthat told it.",
+        "description": "A life event: what happened, when it started and ends, and the message\nthat told it (`null` for an event that is never told).",
         "required": [
           "kind",
+          "category",
           "started_at",
-          "ends_at",
-          "message_id"
+          "ends_at"
         ],
         "properties": {
+          "category": {
+            "$ref": "#/components/schemas/EventCategoryDto"
+          },
           "ends_at": {
             "type": "string",
             "format": "date-time"
@@ -4112,7 +4159,10 @@
             "$ref": "#/components/schemas/EventKindDto"
           },
           "message_id": {
-            "type": "string",
+            "type": [
+              "string",
+              "null"
+            ],
             "format": "uuid"
           },
           "started_at": {

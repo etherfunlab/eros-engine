@@ -825,55 +825,118 @@ pub(crate) fn needs_line(n: &eros_engine_core::needs::Needs) -> Option<String> {
     (!words.is_empty()).then(|| words.join("；"))
 }
 
-/// What the persona calls an event (spec 2026-10-13-life-events-design.md §3).
+/// What the persona calls an event (spec 2026-10-15-life-events-v2-design.md
+/// §3.2).
 fn event_label(kind: eros_engine_core::events::EventKind) -> &'static str {
-    use eros_engine_core::events::EventKind;
+    use eros_engine_core::events::EventKind::*;
     match kind {
-        EventKind::TempWork => "临时接到工作",
-        EventKind::ExMessage => "前任发来消息",
-        EventKind::WeatherChange => "天气突然变了",
-        EventKind::PoliceEncounter => "被警察拦下问话",
-        EventKind::AnimalEncounter => "路上遇到小动物",
+        PoliceEncounter => "被警察拦下问话",
+        AnimalEncounter => "路上遇到小动物",
+        HitSomeone => "打人了",
+        SuddenDesire => "突然很想要",
+        GroceryShopping => "买菜",
+        Showering => "洗澡中",
+        Bathing => "泡澡中",
+        InClass => "上课中",
+        OnTheWay => "赶路中",
+        TempWork => "临时接到工作",
+        ExMessage => "前任发来消息",
+        WeatherChange => "天气突然变了",
+        GotHit => "被打了",
+        Breakup => "刚分手",
+        WorkingOut => "在健身",
+        Reading => "在看书",
+        Gaming => "在打游戏",
+        AwayFromPhone => "没看手机",
+        Unwell => "不舒服",
+        Irritable => "烦躁",
+        Sick => "生病中",
+        Period => "月经中",
+        Hospitalized => "住院",
+        PostSurgery => "刚做完手术",
+        BusinessTrip => "出差",
+        ShortTrip => "短途旅游",
+        LongTrip => "长途旅游",
+        HometownVisit => "回老家",
     }
 }
 
-/// Whole hours, rounded; `None` under one hour.
-fn whole_hours(d: chrono::Duration) -> Option<i64> {
+/// A span as the prompt reads it (spec §8.1): under an hour; whole hours,
+/// rounded, under 48; whole days, rounded, from 48.
+pub(crate) fn span_text(d: chrono::Duration) -> String {
     let mins = d.num_minutes();
-    (mins >= 60).then(|| (mins as f64 / 60.0).round() as i64)
-}
-
-fn ends_text(
-    e: &eros_engine_store::chat::EventRecord,
-    at: chrono::DateTime<chrono::Utc>,
-) -> String {
-    match whole_hours(e.ends_at - at) {
-        Some(h) => format!("约 {h} 小时后结束"),
-        None => "不到 1 小时后结束".into(),
+    if mins < 60 {
+        "不到 1 小时".into()
+    } else if mins < 48 * 60 {
+        format!("{} 小时", (mins as f64 / 60.0).round() as i64)
+    } else {
+        format!("{} 天", (mins as f64 / (24.0 * 60.0)).round() as i64)
     }
 }
 
-/// The event under way as the judge reads it (spec §6):
-/// 「临时接到工作（1 小时前开始，约 3 小时后结束）」.
-pub(crate) fn event_judge_text(
-    e: &eros_engine_store::chat::EventRecord,
-    at: chrono::DateTime<chrono::Utc>,
-) -> String {
-    let started = match whole_hours(at - e.started_at) {
-        Some(h) => format!("{h} 小时前开始"),
-        None => "不到 1 小时前开始".into(),
-    };
-    format!("{}（{started}，{}）", event_label(e.kind), ends_text(e, at))
+fn ends_text(ends_in: chrono::Duration) -> String {
+    let span = span_text(ends_in);
+    if ends_in.num_minutes() < 60 {
+        format!("{span}后结束")
+    } else {
+        format!("约 {span}后结束")
+    }
 }
 
-/// The event under way as the reply reads it (spec §6):
-/// 「临时接到工作（约 3 小时后结束）」.
-pub(crate) fn event_reply_text(
-    e: &eros_engine_store::chat::EventRecord,
-    at: chrono::DateTime<chrono::Utc>,
-) -> String {
-    format!("{}（{}）", event_label(e.kind), ends_text(e, at))
+/// `[近期事件]` (spec 2026-10-15-life-events-v2-design.md §8.2): the
+/// background, the foreground, then an away stretch she has not explained,
+/// each 「临时接到工作（1 小时前开始，约 3 小时后结束）」 or 「没看手机（不到 1
+/// 小时前结束，期间对方的消息你没有回）」; `None` when there is nothing.
+pub(crate) fn events_judge_text(
+    c: &eros_engine_store::events::CurrentEvents,
+    away: Option<&eros_engine_store::events::EventRecord>,
+) -> Option<String> {
+    let mut items: Vec<String> = [c.background.as_ref(), c.foreground.as_ref()]
+        .into_iter()
+        .flatten()
+        .map(|e| {
+            format!(
+                "{}（{}前开始，{}）",
+                event_label(e.kind),
+                span_text(c.at - e.started_at),
+                ends_text(e.ends_at - c.at)
+            )
+        })
+        .collect();
+    if let Some(a) = away {
+        items.push(format!(
+            "{}（{}前结束，期间对方的消息你没有回）",
+            event_label(a.kind),
+            span_text(c.at - a.ends_at)
+        ));
+    }
+    (!items.is_empty()).then(|| items.join("；"))
 }
+
+/// `正在经历` (§8.2): the background, then the foreground, each
+/// 「临时接到工作（约 3 小时后结束）」; `None` when neither.
+pub(crate) fn events_reply_text(c: &eros_engine_store::events::CurrentEvents) -> Option<String> {
+    let items: Vec<String> = [c.background.as_ref(), c.foreground.as_ref()]
+        .into_iter()
+        .flatten()
+        .map(|e| format!("{}（{}）", event_label(e.kind), ends_text(e.ends_at - c.at)))
+        .collect();
+    (!items.is_empty()).then(|| items.join("；"))
+}
+
+/// What the reply hears of the persona's events (spec
+/// 2026-10-15-life-events-v2-design.md §8.2).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EventLines {
+    /// `正在经历`: the background and the foreground under way, rendered by
+    /// `events_reply_text`.
+    pub under_way: Option<String>,
+    /// `刚才`: an away-from-phone stretch this session has not been told
+    /// about.
+    pub away_unexplained: bool,
+}
+
+const AWAY_LINE: &str = "- 刚才：有段时间没看手机，对方那时发来的消息你现在才看到";
 
 /// Fold the last turns' `metadata` (newest first) into the active effects:
 /// a turn counts only with an accepted action; anything that does not parse
@@ -993,6 +1056,37 @@ pub(crate) fn meta_str<'a>(persona: &'a CompanionPersona, key: &str) -> Option<&
         .art_metadata
         .get(key)
         .and_then(|v| v.as_str())
+}
+
+/// The persona's event settings (spec 2026-10-15-life-events-v2-design.md
+/// §4), read leniently: a value of the wrong shape reads as absent, and
+/// `prefer_events` keeps only known `mid` kinds.
+pub(crate) fn persona_traits(
+    persona: &CompanionPersona,
+) -> eros_engine_core::events::PersonaTraits {
+    use eros_engine_core::events::{EventCategory, EventKind, Health, PersonaTraits};
+    let art = &persona.genome.art_metadata;
+    PersonaTraits {
+        female: meta_str(persona, "gender") == Some("female"),
+        health: meta_str(persona, "health")
+            .and_then(Health::parse)
+            .unwrap_or_default(),
+        prefer_trip: art
+            .get("prefer_trip")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        prefer_events: art
+            .get("prefer_events")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .filter_map(EventKind::parse)
+                    .filter(|k| k.category() == EventCategory::Mid)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
 }
 
 /// Pluck an i32 field out of `art_metadata`: a JSON number, or a string
@@ -1185,9 +1279,9 @@ pub fn build_prompt(
     // (spec 2026-10-13-persona-needs-design.md §6.2). `None` or blank ⇒ no
     // line.
     needs: Option<&str>,
-    // The event under way, rendered by `event_reply_text` (spec
-    // 2026-10-13-life-events-design.md §6). `None` or blank ⇒ no line.
-    event: Option<&str>,
+    // The persona's events (spec 2026-10-15-life-events-v2-design.md §8.2).
+    // `None` ⇒ no line.
+    event: Option<&EventLines>,
 ) -> String {
     let name = persona.genome.name.as_str();
     let age = meta_i32(persona, "age")
@@ -1406,9 +1500,20 @@ pub fn build_prompt(
         if let Some(s) = needs.map(str::trim).filter(|s| !s.is_empty()) {
             lines.push(format!("- 此刻的需要：{s}"));
         }
-        // The event she is in the middle of, after her needs.
-        if let Some(s) = event.map(str::trim).filter(|s| !s.is_empty()) {
-            lines.push(format!("- 正在经历：{s}"));
+        // The events she is in, after her needs; then an away stretch she
+        // has not explained.
+        if let Some(ev) = event {
+            if let Some(s) = ev
+                .under_way
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                lines.push(format!("- 正在经历：{s}"));
+            }
+            if ev.away_unexplained {
+                lines.push(AWAY_LINE.into());
+            }
         }
         if lines.is_empty() {
             String::new()
@@ -3692,55 +3797,230 @@ mod tests {
         started_mins_ago: i64,
         ends_in_mins: i64,
     ) -> (
-        eros_engine_store::chat::EventRecord,
+        eros_engine_store::events::EventRecord,
         chrono::DateTime<chrono::Utc>,
     ) {
         let at: chrono::DateTime<chrono::Utc> = "2026-10-13T12:00:00Z".parse().unwrap();
         (
-            eros_engine_store::chat::EventRecord {
-                message_id: Uuid::new_v4(),
+            eros_engine_store::events::EventRecord {
+                id: Uuid::new_v4(),
                 kind,
+                session_id: None,
                 started_at: at - chrono::Duration::minutes(started_mins_ago),
                 ends_at: at + chrono::Duration::minutes(ends_in_mins),
+                message_id: None,
             },
             at,
         )
     }
 
+    fn only(
+        (e, at): (
+            eros_engine_store::events::EventRecord,
+            chrono::DateTime<chrono::Utc>,
+        ),
+    ) -> eros_engine_store::events::CurrentEvents {
+        let (foreground, background) = if e.kind.is_background() {
+            (None, Some(e))
+        } else {
+            (Some(e), None)
+        };
+        eros_engine_store::events::CurrentEvents {
+            foreground,
+            background,
+            at,
+        }
+    }
+
     #[test]
     fn event_texts_name_the_event_and_its_hours() {
         use eros_engine_core::events::EventKind;
-        let (e, at) = event_at(EventKind::TempWork, 120, 120);
+        let c = only(event_at(EventKind::TempWork, 120, 120));
         assert_eq!(
-            event_judge_text(&e, at),
+            events_judge_text(&c, None).unwrap(),
             "临时接到工作（2 小时前开始，约 2 小时后结束）"
         );
-        assert_eq!(event_reply_text(&e, at), "临时接到工作（约 2 小时后结束）");
-        let (e, at) = event_at(EventKind::AnimalEncounter, 20, 40);
         assert_eq!(
-            event_judge_text(&e, at),
+            events_reply_text(&c).unwrap(),
+            "临时接到工作（约 2 小时后结束）"
+        );
+        let c = only(event_at(EventKind::AnimalEncounter, 20, 40));
+        assert_eq!(
+            events_judge_text(&c, None).unwrap(),
             "路上遇到小动物（不到 1 小时前开始，不到 1 小时后结束）"
         );
         assert_eq!(
-            event_reply_text(&e, at),
+            events_reply_text(&c).unwrap(),
             "路上遇到小动物（不到 1 小时后结束）"
         );
         // Rounded to whole hours: 89 minutes → 1, 151 minutes → 3.
-        let (e, at) = event_at(EventKind::WeatherChange, 89, 151);
+        let c = only(event_at(EventKind::WeatherChange, 89, 151));
         assert_eq!(
-            event_judge_text(&e, at),
+            events_judge_text(&c, None).unwrap(),
             "天气突然变了（1 小时前开始，约 3 小时后结束）"
         );
         for (kind, label) in [
             (EventKind::ExMessage, "前任发来消息"),
             (EventKind::PoliceEncounter, "被警察拦下问话"),
         ] {
-            let (e, at) = event_at(kind, 61, 61);
-            assert!(event_reply_text(&e, at).starts_with(label), "{kind:?}");
+            let c = only(event_at(kind, 61, 61));
+            assert!(
+                events_reply_text(&c).unwrap().starts_with(label),
+                "{kind:?}"
+            );
         }
     }
 
+    #[test]
+    fn both_events_render_the_background_first() {
+        use eros_engine_core::events::EventKind;
+        let (trip, at) = event_at(EventKind::LongTrip, 2 * 24 * 60, 3 * 24 * 60);
+        let (reading, _) = event_at(EventKind::Reading, 30, 90);
+        let c = eros_engine_store::events::CurrentEvents {
+            foreground: Some(reading),
+            background: Some(trip),
+            at,
+        };
+        assert_eq!(
+            events_judge_text(&c, None).unwrap(),
+            "长途旅游（2 天前开始，约 3 天后结束）；在看书（不到 1 小时前开始，约 2 小时后结束）"
+        );
+        assert_eq!(
+            events_reply_text(&c).unwrap(),
+            "长途旅游（约 3 天后结束）；在看书（约 2 小时后结束）"
+        );
+        let nothing = eros_engine_store::events::CurrentEvents {
+            foreground: None,
+            background: None,
+            at,
+        };
+        assert_eq!(events_judge_text(&nothing, None), None);
+        assert_eq!(events_reply_text(&nothing), None);
+    }
+
+    #[test]
+    fn an_unexplained_away_stretch_is_the_last_judge_item() {
+        use eros_engine_core::events::EventKind;
+        let (trip, at) = event_at(EventKind::BusinessTrip, 600, 840);
+        let (away, _) = event_at(EventKind::AwayFromPhone, 70, -10);
+        let c = eros_engine_store::events::CurrentEvents {
+            foreground: None,
+            background: Some(trip),
+            at,
+        };
+        assert_eq!(
+            events_judge_text(&c, Some(&away)).unwrap(),
+            "出差（10 小时前开始，约 14 小时后结束）；没看手机（不到 1 小时前结束，期间对方的消息你没有回）"
+        );
+        let (long_ago, _) = event_at(EventKind::AwayFromPhone, 240, -120);
+        let nothing = eros_engine_store::events::CurrentEvents {
+            foreground: None,
+            background: None,
+            at,
+        };
+        assert_eq!(
+            events_judge_text(&nothing, Some(&long_ago)).unwrap(),
+            "没看手机（2 小时前结束，期间对方的消息你没有回）"
+        );
+    }
+
+    #[test]
+    fn span_text_reads_hours_then_days() {
+        let m = chrono::Duration::minutes;
+        assert_eq!(span_text(m(59)), "不到 1 小时");
+        assert_eq!(span_text(m(60)), "1 小时");
+        assert_eq!(span_text(m(89)), "1 小时");
+        assert_eq!(span_text(m(90)), "2 小时");
+        assert_eq!(span_text(m(47 * 60)), "47 小时");
+        assert_eq!(span_text(m(48 * 60)), "2 天");
+        assert_eq!(span_text(m(60 * 60)), "3 天");
+        assert_eq!(span_text(m(168 * 60)), "7 天");
+    }
+
+    #[test]
+    fn every_kind_has_its_label() {
+        use eros_engine_core::events::EventKind;
+        let labels: Vec<&str> = EventKind::ALL.into_iter().map(event_label).collect();
+        assert_eq!(
+            labels,
+            [
+                "被警察拦下问话",
+                "路上遇到小动物",
+                "打人了",
+                "突然很想要",
+                "买菜",
+                "洗澡中",
+                "泡澡中",
+                "上课中",
+                "赶路中",
+                "临时接到工作",
+                "前任发来消息",
+                "天气突然变了",
+                "被打了",
+                "刚分手",
+                "在健身",
+                "在看书",
+                "在打游戏",
+                "没看手机",
+                "不舒服",
+                "烦躁",
+                "生病中",
+                "月经中",
+                "住院",
+                "刚做完手术",
+                "出差",
+                "短途旅游",
+                "长途旅游",
+                "回老家",
+            ]
+        );
+    }
+
+    #[test]
+    fn persona_traits_read_art_metadata() {
+        use eros_engine_core::events::{EventKind, Health, PersonaTraits};
+        let mut p = fixture_persona();
+        p.genome.art_metadata = serde_json::json!({
+            "gender": "female", "health": "weak", "prefer_trip": true,
+            "prefer_events": ["gaming", "reading"]
+        });
+        assert_eq!(
+            persona_traits(&p),
+            PersonaTraits {
+                female: true,
+                health: Health::Weak,
+                prefer_trip: true,
+                prefer_events: vec![EventKind::Gaming, EventKind::Reading],
+            }
+        );
+        p.genome.art_metadata = serde_json::json!({});
+        assert_eq!(persona_traits(&p), PersonaTraits::default());
+    }
+
+    #[test]
+    fn persona_traits_read_leniently() {
+        use eros_engine_core::events::{EventKind, PersonaTraits};
+        let mut p = fixture_persona();
+        p.genome.art_metadata = serde_json::json!({
+            "gender": "male", "health": 3, "prefer_trip": "yes",
+            "prefer_events": ["gaming", "dragon", "sick", 7]
+        });
+        assert_eq!(
+            persona_traits(&p),
+            PersonaTraits {
+                prefer_events: vec![EventKind::Gaming],
+                ..Default::default()
+            }
+        );
+        p.genome.art_metadata = serde_json::json!({"prefer_events": "gaming", "health": "fragile"});
+        assert_eq!(persona_traits(&p), PersonaTraits::default());
+    }
+
     fn prompt_with_event(needs: Option<&str>, event: Option<&str>) -> String {
+        let lines = event.map(|s| EventLines {
+            under_way: Some(s.into()),
+            away_unexplained: false,
+        });
         build_prompt(
             &fixture_persona(),
             &[],
@@ -3760,8 +4040,69 @@ mod tests {
             &NowContext::default(),
             None,
             needs,
-            event,
+            lines.as_ref(),
         )
+    }
+
+    #[test]
+    fn the_away_line_follows_what_she_is_going_through() {
+        let lines = EventLines {
+            under_way: Some("出差（约 1 天后结束）".into()),
+            away_unexplained: true,
+        };
+        let p = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            &[],
+            None,
+            None,
+            &[],
+            AffinityScope::full(),
+            &[],
+            None,
+            None,
+            None,
+            None,
+            TurnNudges::default(),
+            &NowContext::default(),
+            None,
+            None,
+            Some(&lines),
+        );
+        assert!(
+            p.contains(
+                "- 正在经历：出差（约 1 天后结束）\n- 刚才：有段时间没看手机，对方那时发来的消息你现在才看到"
+            ),
+            "{p}"
+        );
+        let quiet = EventLines {
+            away_unexplained: false,
+            ..lines
+        };
+        let p = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            &[],
+            None,
+            None,
+            &[],
+            AffinityScope::full(),
+            &[],
+            None,
+            None,
+            None,
+            None,
+            TurnNudges::default(),
+            &NowContext::default(),
+            None,
+            None,
+            Some(&quiet),
+        );
+        assert!(!p.contains("- 刚才："), "{p}");
     }
 
     #[test]

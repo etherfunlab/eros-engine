@@ -7,17 +7,19 @@
 //! post-process.
 //!
 //! A greeting or opener is checked against its `since` cutoff and yields to
-//! any message that landed at or after it. An event is written at the moment its message
-//! is generated, its `ends_at` counted from that instant, and it does not
-//! yield to user messages or openers; only an event already under way for the
-//! persona, or one with the same key in the session, blocks it.
+//! any message that landed at or after it. An event is written at the moment
+//! its message is generated, its `ends_at` counted from that instant, and it
+//! does not yield to user messages or openers; only an event under way for the
+//! persona that it must wait for (a foreground waits for a foreground, a
+//! background for any event), or one with the same key in the session, blocks
+//! it. The event is a row of `engine.persona_events`, written with its message.
 //!
 //! Specs: docs/superpowers/specs/2026-09-26-user-locale-and-holiday-greeting-design.md §6,
 //! docs/superpowers/specs/2026-10-03-open-occasions-design.md §5–§6,
-//! docs/superpowers/specs/2026-10-13-life-events-design.md §5
+//! docs/superpowers/specs/2026-10-15-life-events-v2-design.md §6
 
 use chrono::{DateTime, NaiveDate, Utc};
-use eros_engine_core::events::{self, EventKind};
+use eros_engine_core::events::EventKind;
 use eros_engine_core::persona::CompanionPersona;
 use eros_engine_core::scope::{AffinityScope, MemoryScope};
 use eros_engine_core::types::{
@@ -70,10 +72,14 @@ pub(crate) enum Occasion {
         open_key: String,
     },
     /// A life event the persona tells about (spec
-    /// 2026-10-13-life-events-design.md §5.2); the caller's key.
+    /// 2026-10-15-life-events-v2-design.md §9.1): the caller's key, the kind
+    /// and its drawn length.
     Event {
         event_key: String,
         kind: EventKind,
+        lasts: chrono::Duration,
+        /// The background under way when it was drawn.
+        background: Option<EventKind>,
     },
 }
 
@@ -101,19 +107,81 @@ impl Occasion {
             Self::Returning { gap_days, .. } => {
                 format!("（对方隔了 {gap_days} 天又打开和你的聊天，还没说话。）")
             }
-            Self::Event { kind, .. } => event_cue(*kind).into(),
+            Self::Event {
+                kind,
+                lasts,
+                background,
+                ..
+            } => event_cue(*kind, *lasts, *background),
         }
     }
 }
 
-/// The stage cue for a life event: states a fact, carries no instruction.
-fn event_cue(kind: EventKind) -> &'static str {
+/// The stage cue for a life event (spec 2026-10-15-life-events-v2-design.md
+/// §3.4): states a fact, carries no instruction. A background's cue carries
+/// its length. `away_from_phone` is never told.
+fn kind_cue(kind: EventKind, lasts: chrono::Duration) -> String {
+    use EventKind::*;
+    let span = crate::prompt::span_text(lasts);
     match kind {
-        EventKind::TempWork => "（你刚临时接到一份工作，得马上去处理。）",
-        EventKind::ExMessage => "（你的前任刚给你发来消息。）",
-        EventKind::WeatherChange => "（你那边的天气刚刚突然变了。）",
-        EventKind::PoliceEncounter => "（你刚在外面被警察拦下来问话。）",
-        EventKind::AnimalEncounter => "（你刚在路上遇到了一只小动物。）",
+        PoliceEncounter => "（你刚在外面被警察拦下来问话。）".into(),
+        AnimalEncounter => "（你刚在路上遇到了一只小动物。）".into(),
+        HitSomeone => "（你刚动手打了人。）".into(),
+        SuddenDesire => "（你突然很想要。）".into(),
+        GroceryShopping => "（你正在外面买菜。）".into(),
+        Showering => "（你准备去洗澡了。）".into(),
+        Bathing => "（你正在泡澡。）".into(),
+        InClass => "（你正在上课。）".into(),
+        OnTheWay => "（你正在赶路。）".into(),
+        TempWork => "（你刚临时接到一份工作，得马上去处理。）".into(),
+        ExMessage => "（你的前任刚给你发来消息。）".into(),
+        WeatherChange => "（你那边的天气刚刚突然变了。）".into(),
+        GotHit => "（你刚被人打了。）".into(),
+        Breakup => "（你刚和交往的人分手了。）".into(),
+        WorkingOut => "（你正在健身。）".into(),
+        Reading => "（你正在看书。）".into(),
+        Gaming => "（你正在打游戏。）".into(),
+        AwayFromPhone => unreachable!("away_from_phone is never told"),
+        Unwell => "（你现在有点不舒服。）".into(),
+        Irritable => "（你现在心里很烦躁。）".into(),
+        Sick => format!("（你生病了，大概要 {span}才会好。）"),
+        Period => "（你的月经来了。）".into(),
+        Hospitalized => format!("（你刚住进医院，大概要住 {span}。）"),
+        PostSurgery => format!("（你刚做完一场手术，大概要恢复 {span}。）"),
+        BusinessTrip => format!("（你刚出发去外地出差，要待 {span}。）"),
+        ShortTrip => format!("（你刚出发去短途旅行，要玩 {span}。）"),
+        LongTrip => format!("（你刚出发去长途旅行，要去 {span}。）"),
+        HometownVisit => format!("（你刚动身回老家，要待 {span}。）"),
+    }
+}
+
+/// How a foreground event's cue opens during a background (spec
+/// 2026-10-15-life-events-v2-design.md §3.4); `None` for a foreground kind.
+fn background_state(kind: EventKind) -> Option<&'static str> {
+    use EventKind::*;
+    Some(match kind {
+        Sick => "你正在生病",
+        Period => "你正在经期",
+        Hospitalized => "你正在住院",
+        PostSurgery => "你刚做完手术，还在恢复",
+        BusinessTrip => "你正在外地出差",
+        ShortTrip => "你正在短途旅行",
+        LongTrip => "你正在长途旅行",
+        HometownVisit => "你正在老家",
+        _ => return None,
+    })
+}
+
+/// The kind's cue, opened with the background's state when one is under
+/// way: 「（你正在外地出差。你刚在路上遇到了一只小动物。）」.
+fn event_cue(kind: EventKind, lasts: chrono::Duration, background: Option<EventKind>) -> String {
+    let cue = kind_cue(kind, lasts);
+    match background.and_then(background_state) {
+        Some(state) => format!(
+            "（{state}。{}）",
+            cue.trim_start_matches('（').trim_end_matches('）')
+        ),
+        None => cue,
     }
 }
 
@@ -146,10 +214,12 @@ pub(crate) struct Greeting<'a> {
 /// Generate and persist the message. `Ok(None)`: the model returned a blank
 /// reply and nothing was written; or, for a greeting or opener, the insert
 /// yielded to a message that landed first; or, for an event, another event
-/// under way for the persona blocked the insert. When a concurrent call for
-/// the same local date, `open_key` or `event_key` won the insert, returns
-/// that call's row. An event is stamped with one instant taken after
-/// generation: its row's `sent_at` and the start of its `ends_at` span.
+/// under way for the persona blocked the insert, or a concurrent call with
+/// the same `event_key` won it (the caller reads the event by key). When a
+/// concurrent call for the same local date or `open_key` won the insert,
+/// returns that call's row. An event is stamped with one instant taken after
+/// generation: its message's `sent_at`, its `started_at` and the start of its
+/// `ends_at` span.
 pub(crate) async fn greet(
     state: &AppState,
     g: Greeting<'_>,
@@ -194,6 +264,16 @@ pub(crate) async fn greet(
         aspect_ratio: None,
         action_response: None,
     };
+    let current = eros_engine_store::events::EventRepo { pool: &state.pool }
+        .current(g.instance_id, None, g.now.now)
+        .await?;
+    let event_lines = crate::prompt::EventLines {
+        under_way: crate::prompt::events_reply_text(&current),
+        away_unexplained: eros_engine_store::events::EventRepo { pool: &state.pool }
+            .unexplained_away(g.session_id, g.instance_id, g.now.now)
+            .await?
+            .is_some(),
+    };
     let (mut chat_req, injected_tags) = build_reply_request(
         state,
         &input,
@@ -206,7 +286,7 @@ pub(crate) async fn greet(
         false,
         None,
         None,
-        None,
+        Some(&event_lines),
     )
     .await?;
     chat_req.messages.push(WireMessage {
@@ -283,14 +363,7 @@ pub(crate) async fn greet(
         Occasion::FirstMeet { open_key } | Occasion::JustOpened { open_key } => {
             metadata.insert("open_key".into(), open_key.as_str().into());
         }
-        Occasion::Event { event_key, kind } => {
-            let ends_at = event_at + events::duration(*kind);
-            metadata.insert("event_key".into(), event_key.as_str().into());
-            metadata.insert(
-                "event".into(),
-                serde_json::json!({"kind": kind.as_str(), "ends_at": ends_at.to_rfc3339()}),
-            );
-        }
+        Occasion::Event { .. } => {}
     }
     metadata.insert("prompt_traits".into(), serde_json::json!(injected_tags));
     metadata.insert(
@@ -335,12 +408,126 @@ pub(crate) async fn greet(
                 None => Ok(chat_repo.open_message(g.session_id, open_key).await?),
             }
         }
-        Occasion::Event { event_key, .. } => match chat_repo
-            .insert_event_message(g.instance_id, g.session_id, event_at, &row)
+        Occasion::Event {
+            event_key,
+            kind,
+            lasts,
+            ..
+        } => Ok(eros_engine_store::events::EventRepo { pool: &state.pool }
+            .insert(
+                &eros_engine_store::events::NewEvent {
+                    instance_id: g.instance_id,
+                    session_id: g.session_id,
+                    event_key,
+                    kind: *kind,
+                    started_at: event_at,
+                    ends_at: event_at + *lasts,
+                },
+                Some(&row),
+            )
             .await?
-        {
-            Some(written) => Ok(Some(written)),
-            None => Ok(chat_repo.event_message(g.session_id, event_key).await?),
-        },
+            .and_then(|i| i.message)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+
+    #[test]
+    fn every_told_kind_has_its_cue() {
+        let h = Duration::hours(1);
+        for (kind, cue) in [
+            (
+                EventKind::PoliceEncounter,
+                "（你刚在外面被警察拦下来问话。）",
+            ),
+            (
+                EventKind::AnimalEncounter,
+                "（你刚在路上遇到了一只小动物。）",
+            ),
+            (EventKind::HitSomeone, "（你刚动手打了人。）"),
+            (EventKind::SuddenDesire, "（你突然很想要。）"),
+            (EventKind::GroceryShopping, "（你正在外面买菜。）"),
+            (EventKind::Showering, "（你准备去洗澡了。）"),
+            (EventKind::Bathing, "（你正在泡澡。）"),
+            (EventKind::InClass, "（你正在上课。）"),
+            (EventKind::OnTheWay, "（你正在赶路。）"),
+            (
+                EventKind::TempWork,
+                "（你刚临时接到一份工作，得马上去处理。）",
+            ),
+            (EventKind::ExMessage, "（你的前任刚给你发来消息。）"),
+            (EventKind::WeatherChange, "（你那边的天气刚刚突然变了。）"),
+            (EventKind::GotHit, "（你刚被人打了。）"),
+            (EventKind::Breakup, "（你刚和交往的人分手了。）"),
+            (EventKind::WorkingOut, "（你正在健身。）"),
+            (EventKind::Reading, "（你正在看书。）"),
+            (EventKind::Gaming, "（你正在打游戏。）"),
+            (EventKind::Unwell, "（你现在有点不舒服。）"),
+            (EventKind::Irritable, "（你现在心里很烦躁。）"),
+            (EventKind::Period, "（你的月经来了。）"),
+        ] {
+            assert_eq!(kind_cue(kind, h), cue, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn an_incident_during_a_background_opens_with_its_state() {
+        let h = Duration::hours(1);
+        assert_eq!(
+            event_cue(EventKind::AnimalEncounter, h, Some(EventKind::BusinessTrip)),
+            "（你正在外地出差。你刚在路上遇到了一只小动物。）"
+        );
+        for (bg, state) in [
+            (EventKind::Sick, "你正在生病"),
+            (EventKind::Period, "你正在经期"),
+            (EventKind::Hospitalized, "你正在住院"),
+            (EventKind::PostSurgery, "你刚做完手术，还在恢复"),
+            (EventKind::BusinessTrip, "你正在外地出差"),
+            (EventKind::ShortTrip, "你正在短途旅行"),
+            (EventKind::LongTrip, "你正在长途旅行"),
+            (EventKind::HometownVisit, "你正在老家"),
+        ] {
+            assert_eq!(
+                event_cue(EventKind::Reading, h, Some(bg)),
+                format!("（{state}。你正在看书。）")
+            );
+        }
+        assert_eq!(event_cue(EventKind::Reading, h, None), "（你正在看书。）");
+    }
+
+    #[test]
+    fn a_background_cue_carries_its_length() {
+        let cue = |k, h| kind_cue(k, Duration::hours(h));
+        assert_eq!(
+            cue(EventKind::Sick, 30),
+            "（你生病了，大概要 30 小时才会好。）"
+        );
+        assert_eq!(
+            cue(EventKind::Hospitalized, 72),
+            "（你刚住进医院，大概要住 3 天。）"
+        );
+        assert_eq!(
+            cue(EventKind::PostSurgery, 120),
+            "（你刚做完一场手术，大概要恢复 5 天。）"
+        );
+        assert_eq!(
+            cue(EventKind::BusinessTrip, 24),
+            "（你刚出发去外地出差，要待 24 小时。）"
+        );
+        assert_eq!(
+            cue(EventKind::ShortTrip, 48),
+            "（你刚出发去短途旅行，要玩 2 天。）"
+        );
+        assert_eq!(
+            cue(EventKind::LongTrip, 168),
+            "（你刚出发去长途旅行，要去 7 天。）"
+        );
+        assert_eq!(
+            cue(EventKind::HometownVisit, 72),
+            "（你刚动身回老家，要待 3 天。）"
+        );
     }
 }
