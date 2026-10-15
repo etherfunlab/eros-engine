@@ -9,8 +9,8 @@
   is gone.
 - **Owner:** enriquephl (sole dev)
 - **Target:** `eros-engine` — events grouped into four categories, two of
-  them days-long backgrounds that other events happen inside; eighteen new
-  kinds; one kind that is silence; three persona settings that shape the
+  them days-long backgrounds that other events happen inside; twenty-three
+  new kinds; one kind that is silence; three persona settings that shape the
   draw.
 - **Builds on:** `2026-10-13-life-events-design.md` (*the v1 spec*). This
   spec replaces its kind table (§3), director (§4), persistence (§5.4–§5.5),
@@ -69,6 +69,11 @@ A range is drawn uniformly in whole hours, inclusive; a range in days,
 | short | `animal_encounter` | 路上遇到小动物 | 1 h | 3 | 12 h | — | ×2 emotional `high` |
 | short | `hit_someone` | 打人了 | 1 h | 0.5 | 14 d | — | — |
 | short | `sudden_desire` | 突然很想要 | 1 h | 2 | 24 h | rung ≥ 3 | — |
+| short | `grocery_shopping` | 买菜 | 1 h | 2 | 24 h | — | ×2 hunger `high` |
+| short | `showering` | 洗澡中 | 30 min | 2 | 12 h | — | — |
+| short | `bathing` | 泡澡中 | 1 h | 1 | 48 h | — | ×2 stamina `low` |
+| short | `in_class` | 上课中 | 1 h | 1 | 24 h | — | — |
+| short | `on_the_way` | 赶路中 | 30 min | 2 | 12 h | — | — |
 | mid | `temp_work` | 临时接到工作 | 4 h | 3 | 24 h | — | ×0.5 stamina `low` |
 | mid | `ex_message` | 前任发来消息 | 3 h | 1 | 72 h | rung ≥ 2 | ×3 emotional `high` |
 | mid | `weather_change` | 天气突然变了 | 4 h | 4 | 8 h | — | — |
@@ -102,8 +107,8 @@ A range is drawn uniformly in whole hours, inclusive; a range in days,
 
 While `hospitalized` or `post_surgery` is under way, these foreground kinds
 are not drawn: `temp_work`, `police_encounter`, `animal_encounter`,
-`hit_someone`, `got_hit`, `working_out`. Every other background rules out
-nothing.
+`hit_someone`, `got_hit`, `working_out`, `grocery_shopping`, `in_class`,
+`on_the_way`. Every other background rules out nothing.
 
 ### 3.4 Cues
 
@@ -116,6 +121,11 @@ nothing is generated when it starts.
 | `animal_encounter` | （你刚在路上遇到了一只小动物。） |
 | `hit_someone` | （你刚动手打了人。） |
 | `sudden_desire` | （你突然很想要。） |
+| `grocery_shopping` | （你正在外面买菜。） |
+| `showering` | （你准备去洗澡了。） |
+| `bathing` | （你正在泡澡。） |
+| `in_class` | （你正在上课。） |
+| `on_the_way` | （你正在赶路。） |
 | `temp_work` | （你刚临时接到一份工作，得马上去处理。） |
 | `ex_message` | （你的前任刚给你发来消息。） |
 | `weather_change` | （你那边的天气刚刚突然变了。） |
@@ -183,7 +193,7 @@ by whoever authors the persona:
 pub enum EventCategory { Short, Mid, Body, Trip }
 impl EventCategory { pub fn is_background(self) -> bool; }
 
-pub enum EventKind { /* the 23 kinds of §3.2 */ }
+pub enum EventKind { /* the 28 kinds of §3.2 */ }
 impl EventKind { pub fn category(self) -> EventCategory; }
 
 pub enum Health { Weak, Normal, Strong }
@@ -453,7 +463,7 @@ line. The first assistant row written after `E.ends_at` ends it.
 
 ### 9.1 `POST /v2/comp/session/{session_id}/events`
 
-- `kinds` accepts the 23 kinds; absent = all.
+- `kinds` accepts the 28 kinds; absent = all.
 - The draw reads `PersonaTraits` from the persona's `art_metadata`, the
   history `lookback()` back, and the under-way events at now.
 - Drawn with a message: the v1 generation path, with §3.4's cue and §8.2's

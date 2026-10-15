@@ -906,6 +906,11 @@ Kinds fall into four categories. `short` and `mid` are incidents; `body` and
 | `short` | `animal_encounter` | 1 h | she meets a stray animal |
 | `short` | `hit_someone` | 1 h | she hit someone |
 | `short` | `sudden_desire` | 1 h | she suddenly wants it |
+| `short` | `grocery_shopping` | 1 h | she is out buying groceries |
+| `short` | `showering` | 30 min | she is about to shower |
+| `short` | `bathing` | 1 h | she is in the bath |
+| `short` | `in_class` | 1 h | she is in class |
+| `short` | `on_the_way` | 30 min | she is on her way somewhere |
 | `mid` | `temp_work` | 4 h | she is called in to work |
 | `mid` | `ex_message` | 3 h | her ex texts her |
 | `mid` | `weather_change` | 4 h | the weather turns |
@@ -936,7 +941,8 @@ The draw:
   any session of the persona has an incident under way. While a background is
   under way, only incidents are drawn; in hospital or after surgery, not the
   ones that need her out and about (`temp_work`, `police_encounter`,
-  `animal_encounter`, `hit_someone`, `got_hit`, `working_out`).
+  `animal_encounter`, `hit_someone`, `got_hit`, `working_out`,
+  `grocery_shopping`, `in_class`, `on_the_way`).
 - **Cooldowns.** Each kind has a cooldown from when it started. A trip starts
   at most once a week, and a `body` state at most once a fortnight, whichever
   kind.

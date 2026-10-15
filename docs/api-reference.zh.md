@@ -749,6 +749,11 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | `short` | `animal_encounter` | 1 小时 | 路上遇到小动物 |
 | `short` | `hit_someone` | 1 小时 | 打人了 |
 | `short` | `sudden_desire` | 1 小时 | 突然很想要 |
+| `short` | `grocery_shopping` | 1 小时 | 买菜 |
+| `short` | `showering` | 30 分钟 | 洗澡中 |
+| `short` | `bathing` | 1 小时 | 泡澡中 |
+| `short` | `in_class` | 1 小时 | 上课中 |
+| `short` | `on_the_way` | 30 分钟 | 赶路中 |
 | `mid` | `temp_work` | 4 小时 | 临时接到工作 |
 | `mid` | `ex_message` | 3 小时 | 前任发来消息 |
 | `mid` | `weather_change` | 4 小时 | 天气突然变了 |
@@ -775,8 +780,8 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 
 - **两段抽取。** engine 先按权重抽类别，再在类别内按权重抽种类。往一个类别里加种类，不会改变其他类别的占比。
 - **一次一件插曲，一个背景。** 角色的任何一个 session 里有插曲在进行时，不再抽取。背景进行期间只抽插曲；
-  住院和术后期间，不抽需要她出门活动的那六种（`temp_work`、`police_encounter`、`animal_encounter`、
-  `hit_someone`、`got_hit`、`working_out`）。
+  住院和术后期间，不抽需要她出门活动的那九种（`temp_work`、`police_encounter`、`animal_encounter`、
+  `hit_someone`、`got_hit`、`working_out`、`grocery_shopping`、`in_class`、`on_the_way`）。
 - **冷却。** 每种事件从开始起有各自的冷却。trip 类每周最多开始一次，body 类每两周最多开始一次，不论具体是哪一种。
 - **她的需求给类别内的种类加权**，前提是部署配置了 LLM 判官，并且角色有一次判定。
 - **亲近度门槛。** `ex_message` 与 `breakup` 不会向不太熟的人抽出（intimacy 档 2 及以上）；

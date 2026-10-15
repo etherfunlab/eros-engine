@@ -63,6 +63,11 @@ pub enum EventKind {
     AnimalEncounter,
     HitSomeone,
     SuddenDesire,
+    GroceryShopping,
+    Showering,
+    Bathing,
+    InClass,
+    OnTheWay,
     TempWork,
     ExMessage,
     WeatherChange,
@@ -86,11 +91,16 @@ pub enum EventKind {
 
 impl EventKind {
     /// Every kind, in draw order.
-    pub const ALL: [EventKind; 23] = [
+    pub const ALL: [EventKind; 28] = [
         EventKind::PoliceEncounter,
         EventKind::AnimalEncounter,
         EventKind::HitSomeone,
         EventKind::SuddenDesire,
+        EventKind::GroceryShopping,
+        EventKind::Showering,
+        EventKind::Bathing,
+        EventKind::InClass,
+        EventKind::OnTheWay,
         EventKind::TempWork,
         EventKind::ExMessage,
         EventKind::WeatherChange,
@@ -119,6 +129,11 @@ impl EventKind {
             EventKind::AnimalEncounter => "animal_encounter",
             EventKind::HitSomeone => "hit_someone",
             EventKind::SuddenDesire => "sudden_desire",
+            EventKind::GroceryShopping => "grocery_shopping",
+            EventKind::Showering => "showering",
+            EventKind::Bathing => "bathing",
+            EventKind::InClass => "in_class",
+            EventKind::OnTheWay => "on_the_way",
             EventKind::TempWork => "temp_work",
             EventKind::ExMessage => "ex_message",
             EventKind::WeatherChange => "weather_change",
@@ -148,7 +163,8 @@ impl EventKind {
     pub fn category(self) -> EventCategory {
         use EventKind::*;
         match self {
-            PoliceEncounter | AnimalEncounter | HitSomeone | SuddenDesire => EventCategory::Short,
+            PoliceEncounter | AnimalEncounter | HitSomeone | SuddenDesire | GroceryShopping
+            | Showering | Bathing | InClass | OnTheWay => EventCategory::Short,
             TempWork | ExMessage | WeatherChange | GotHit | Breakup | WorkingOut | Reading
             | Gaming | AwayFromPhone | Unwell | Irritable => EventCategory::Mid,
             Sick | Period | Hospitalized | PostSurgery => EventCategory::Body,
@@ -185,6 +201,11 @@ fn rule(kind: EventKind) -> Rule {
         AnimalEncounter => (3.0, 12, Lasts::Hours(1, 1)),
         HitSomeone => (0.5, 14 * DAY, Lasts::Hours(1, 1)),
         SuddenDesire => (2.0, 24, Lasts::Hours(1, 1)),
+        GroceryShopping => (2.0, 24, Lasts::Hours(1, 1)),
+        Showering => (2.0, 12, Lasts::Minutes(30)),
+        Bathing => (1.0, 48, Lasts::Hours(1, 1)),
+        InClass => (1.0, 24, Lasts::Hours(1, 1)),
+        OnTheWay => (2.0, 12, Lasts::Minutes(30)),
         TempWork => (3.0, 24, Lasts::Hours(4, 4)),
         ExMessage => (1.0, 72, Lasts::Hours(3, 3)),
         WeatherChange => (4.0, 8, Lasts::Hours(4, 4)),
@@ -271,7 +292,8 @@ fn needs_factor(kind: EventKind, needs: Option<&Needs>) -> f64 {
     };
     match kind {
         TempWork | WorkingOut if n.stamina == NeedLevel::Low => 0.5,
-        Unwell | Sick if n.stamina == NeedLevel::Low => 2.0,
+        Unwell | Sick | Bathing if n.stamina == NeedLevel::Low => 2.0,
+        GroceryShopping if n.hunger == NeedLevel::High => 2.0,
         ExMessage if n.emotional == NeedLevel::High => 3.0,
         AnimalEncounter | Irritable if n.emotional == NeedLevel::High => 2.0,
         _ => 1.0,
@@ -307,7 +329,15 @@ fn rules_out(background: EventKind, kind: EventKind) -> bool {
     matches!(background, Hospitalized | PostSurgery)
         && matches!(
             kind,
-            TempWork | PoliceEncounter | AnimalEncounter | HitSomeone | GotHit | WorkingOut
+            TempWork
+                | PoliceEncounter
+                | AnimalEncounter
+                | HitSomeone
+                | GotHit
+                | WorkingOut
+                | GroceryShopping
+                | InClass
+                | OnTheWay
         )
 }
 
@@ -516,6 +546,15 @@ mod tests {
         })
     }
 
+    fn hungry() -> Option<Needs> {
+        Some(Needs {
+            hunger: NeedLevel::High,
+            social: NeedLevel::Mid,
+            stamina: NeedLevel::Mid,
+            emotional: NeedLevel::Mid,
+        })
+    }
+
     fn pick_with(
         persona: &PersonaTraits,
         needs: Option<Needs>,
@@ -570,11 +609,20 @@ mod tests {
             HitSomeone,
             GotHit,
             WorkingOut,
+            GroceryShopping,
+            InClass,
+            OnTheWay,
         ];
         for bg in [Hospitalized, PostSurgery] {
             let h = [past(bg, 1, 72)];
             assert_eq!(pick(&h, &outdoor, rolls(0.0, 0.0)), None, "{bg:?}");
             assert_eq!(pick(&h, &[Reading], rolls(0.0, 0.0)), Some(Reading));
+        }
+        for bg in [Hospitalized, PostSurgery] {
+            let h = [past(bg, 1, 72)];
+            for k in [Showering, Bathing] {
+                assert_eq!(pick(&h, &[k], rolls(0.0, 0.0)), Some(k), "{bg:?} {k:?}");
+            }
         }
         for bg in [
             Sick,
@@ -790,7 +838,7 @@ mod tests {
     #[test]
     fn needs_scale_kinds_within_their_category() {
         use NeedLevel::{High, Low, Mid};
-        let cases: [(&[EventKind], Option<Needs>, f64, EventKind); 14] = [
+        let cases: [(&[EventKind], Option<Needs>, f64, EventKind); 18] = [
             // temp_work 3 : weather 4 — 0.3 → 2.1 → temp_work.
             (&[TempWork, WeatherChange], None, 0.3, TempWork),
             // stamina low: 1.5 : 4 — 0.3 → 1.65 → weather.
@@ -839,6 +887,19 @@ mod tests {
             (&[Sick, Hospitalized], None, 0.9, Hospitalized),
             // stamina low: 6 : 0.5 — 0.9 → 5.85 → sick.
             (&[Sick, Hospitalized], needs(Low, Mid), 0.9, Sick),
+            // grocery 2 : showering 2 — 0.6 → 2.4 → showering.
+            (&[GroceryShopping, Showering], None, 0.6, Showering),
+            // hunger high: 4 : 2 — 0.6 → 3.6 → grocery.
+            (
+                &[GroceryShopping, Showering],
+                hungry(),
+                0.6,
+                GroceryShopping,
+            ),
+            // bathing 1 : in_class 1 — 0.6 → 1.2 → in_class.
+            (&[Bathing, InClass], None, 0.6, InClass),
+            // stamina low: 2 : 1 — 0.6 → 1.8 → bathing.
+            (&[Bathing, InClass], needs(Low, Mid), 0.6, Bathing),
         ];
         for (allowed, n, roll, want) in cases {
             assert_eq!(
@@ -851,7 +912,8 @@ mod tests {
 
     /// Every kind, rung 3, a female persona, no needs: categories short 5,
     /// mid 4, body 0.5, trip 0.5 (10); within short police 1, animal 3,
-    /// hit 0.5, desire 2 (6.5).
+    /// hit 0.5, desire 2, grocery 2, showering 2, bathing 1, in_class 1,
+    /// on_the_way 2 (14.5).
     #[test]
     fn the_stages_pick_by_cumulative_weight() {
         let at = |c: f64, k: f64| pick(&[], &EventKind::ALL, rolls(c, k)).unwrap();
@@ -863,14 +925,20 @@ mod tests {
         assert_eq!(at(0.95 - E, 0.0).category(), EventCategory::Body);
         assert_eq!(at(0.95 + E, 0.0), BusinessTrip);
         assert_eq!(at(1.0, 1.0), HometownVisit);
-        let b = |w: f64| w / 6.5;
+        let b = |w: f64| w / 14.5;
         assert_eq!(at(0.0, b(1.0) - E), PoliceEncounter);
         assert_eq!(at(0.0, b(1.0) + E), AnimalEncounter);
         assert_eq!(at(0.0, b(4.0) - E), AnimalEncounter);
         assert_eq!(at(0.0, b(4.0) + E), HitSomeone);
         assert_eq!(at(0.0, b(4.5) - E), HitSomeone);
         assert_eq!(at(0.0, b(4.5) + E), SuddenDesire);
-        assert_eq!(at(0.0, 1.0), SuddenDesire);
+        assert_eq!(at(0.0, b(6.5) - E), SuddenDesire);
+        assert_eq!(at(0.0, b(6.5) + E), GroceryShopping);
+        assert_eq!(at(0.0, b(8.5) + E), Showering);
+        assert_eq!(at(0.0, b(10.5) + E), Bathing);
+        assert_eq!(at(0.0, b(11.5) + E), InClass);
+        assert_eq!(at(0.0, b(12.5) + E), OnTheWay);
+        assert_eq!(at(0.0, 1.0), OnTheWay);
     }
 
     #[test]
@@ -903,6 +971,9 @@ mod tests {
         assert_eq!(lasts(LongTrip, 0.0), Duration::hours(72));
         assert_eq!(lasts(LongTrip, 1.0 - E), Duration::hours(168));
         assert_eq!(lasts(LongTrip, 1.0), Duration::hours(168));
+        assert_eq!(lasts(Showering, 0.9), Duration::minutes(30));
+        assert_eq!(lasts(OnTheWay, 0.0), Duration::minutes(30));
+        assert_eq!(lasts(GroceryShopping, 0.5), Duration::hours(1));
     }
 
     #[test]
@@ -928,7 +999,7 @@ mod tests {
         let count = |c| EventKind::ALL.iter().filter(|k| k.category() == c).count();
         assert_eq!(
             EventCategory::ALL.map(count),
-            [4, 11, 4, 4],
+            [9, 11, 4, 4],
             "short, mid, body, trip"
         );
         assert!(!EventCategory::Short.is_background());
