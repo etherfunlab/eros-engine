@@ -4474,9 +4474,12 @@ pub(crate) fn run_stream_with(
         let force_image = user_msg.image.as_ref().is_some_and(|i| i.force);
         // While she is away from her phone (spec 2026-10-15-life-events-v2-
         // design.md §7.2) a text turn ghosts without the judge. The silence is
-        // circumstance, so the ghost accounting is left alone.
+        // circumstance, so the ghost accounting is left alone. A deployment
+        // with the ghosting switch off never goes silent, a stretch under way
+        // included.
         if !action_turn
             && !force_image
+            && state.model_config.pde_ghosting_enabled()
             && current
                 .foreground
                 .as_ref()
@@ -21690,6 +21693,32 @@ data: [DONE]\n\n"
         turn_mins_ago: i32,
         image: Option<crate::routes::companion_stream::ImageReplyParams>,
     ) -> NeedsTurn {
+        run_event_turn_in(
+            pool,
+            rows,
+            events,
+            ghosted_mins_ago,
+            verdict,
+            turn_mins_ago,
+            image,
+            true,
+        )
+        .await
+    }
+
+    /// [`run_event_turn_with`] under a model config whose ghosting switch
+    /// (`[tasks.pde_decision].ghosting`) is `ghosting`.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_event_turn_in(
+        pool: &PgPool,
+        rows: &[SeedRow],
+        events: &[EventSeed],
+        ghosted_mins_ago: &[i32],
+        verdict: Option<serde_json::Value>,
+        turn_mins_ago: i32,
+        image: Option<crate::routes::companion_stream::ImageReplyParams>,
+        ghosting: bool,
+    ) -> NeedsTurn {
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
         use futures_util::StreamExt;
         use wiremock::matchers::{body_string_contains, path as wm_path};
@@ -21725,13 +21754,16 @@ data: [DONE]\n\n"
         let (_g, instance_id, session_id) = seed_persona_and_session(pool, user_id).await;
         let mut state = crate::routes::companion::test_state(pool.clone());
         let toml = if verdict.is_some() {
-            "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
-             [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide.\"\n"
+            format!(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide.\"\n\
+                 ghosting={ghosting}\n"
+            )
         } else {
-            "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n"
+            "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n".to_string()
         };
         state.model_config = std::sync::Arc::new(
-            eros_engine_llm::model_config::ModelConfig::from_toml_str(toml).unwrap(),
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(&toml).unwrap(),
         );
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
@@ -22183,6 +22215,34 @@ data: [DONE]\n\n"
             t.frames
         );
         assert_eq!(ghost_accounting(&pool, t.umid).await, (true, 0, None));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_away_stretch_does_not_ghost_while_ghosting_is_off(pool: PgPool) {
+        let t = run_event_turn_in(
+            &pool,
+            &[],
+            &[ev("away_from_phone", 10, 50)],
+            &[],
+            Some(serde_json::json!({"action": "reply_text", "inner_state": ""})),
+            0,
+            None,
+            false,
+        )
+        .await;
+        let reqs = t.mock.received_requests().await.unwrap();
+        assert!(
+            t.frames.iter().any(
+                |f| matches!(f, ProtocolFrame::Delta { content, .. } if content.contains("REPLY"))
+            ),
+            "{:?}",
+            t.frames
+        );
+        assert!(
+            chat_request_body(&reqs).contains("- 正在经历：没看手机（"),
+            "the stretch still shows while it is under way"
+        );
+        assert_eq!(ghost_accounting(&pool, t.umid).await, (false, 0, None));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

@@ -987,9 +987,10 @@ user `action` (any `type`: `give`, `gift`, `tip`, `kiss`, `hug`, `touch`,
 `lick`, `custom`) or `image.force = true` is the exception: it takes the normal
 path and is answered, because an action is always answered and a forced image
 turn is always `reply_image`. The persona goes silent this way only where the
-ghost protection allows it, so `away_from_phone` is not drawn while the
-deployment's ghosting switch is off (`ghosting = false`), nor in a session with
-fewer than 10 user messages; a caller that does not want it at all leaves it out
+ghost protection allows it, so with the deployment's ghosting switch off
+(`ghosting = false`) `away_from_phone` is not drawn and one already under way no
+longer silences turns, and it is not drawn in a session with fewer than 10 user
+messages; a caller that does not want it at all leaves it out
 of `kinds`. A message ghosted this way carries no read receipt (no judge read
 it), and it still carries none after the persona explains. Once the
 event is over, in a session where the user's messages were ghosted, the

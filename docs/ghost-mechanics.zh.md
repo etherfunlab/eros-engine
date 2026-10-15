@@ -125,7 +125,7 @@ score = (1−0.05)×0.4 + (1−0.05)×0.4 + 0×0.2
 
 - 用户那一行和其他被 ghost 的行一样标记为已 ghost，但没有回执（`read_at` 不出现）：没有判官读过它，角色解释之后它依然没有回执。
 - 带用户动作的轮次是例外。它走正常路径并得到回复，因为动作永远会得到回复。带 `image.force = true` 的轮次也一样：强制出图的轮次永远是 `reply_image`。
-- 这一段只在允许 ghost 的地方才会抽到。`ghosting` 开关（见 [model-config.zh.md](model-config.zh.md)）关闭（`ghosting = false`）时永远抽不到它，companion 不会沉默。用户消息不足 10 条的会话（`ghost_permitted` 守的就是这个下限，见上面的规则 1）里也抽不到。调用方完全不想要它，就在 events 路由的 `kinds` 里不写 `away_from_phone`。
+- 这一段只在允许 ghost 的地方才会抽到。`ghosting` 开关（见 [model-config.zh.md](model-config.zh.md)）关闭（`ghosting = false`）时永远抽不到它，已经在进行的一段也不再让轮次沉默，companion 不会沉默。用户消息不足 10 条的会话（`ghost_permitted` 守的就是这个下限，见上面的规则 1）里也抽不到。调用方完全不想要它，就在 events 路由的 `kinds` 里不写 `away_from_phone`。
 
 这段时间结束后，在被 ghost 过的会话里，角色会在她的下一条消息里解释这件事：回复、`/open` 开场白或事件消息都可以。她写过一次之后，这件事就了结了。
 

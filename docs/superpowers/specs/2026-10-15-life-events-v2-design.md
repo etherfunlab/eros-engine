@@ -415,7 +415,9 @@ Every 1:1 text turn of the instance, in any session, whose user row's
 An action turn (any user action: a give, a tip, a kiss…) and a turn with
 `image.force = true` are exempt and take the normal path, because an action is
 always answered and a forced image turn is always an image. An action turn's
-`正在经历` line still lists the away stretch.
+`正在经历` line still lists the away stretch. While the deployment's ghosting
+switch is off, a stretch under way does not ghost turns: they take the normal
+path, and the `正在经历` line still lists it.
 
 Which ghosts came from an away window is derivable from the event row and the
 ghosted rows' times, so it is not stored.

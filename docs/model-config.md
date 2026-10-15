@@ -714,7 +714,7 @@ available on `[tasks.group_director]`, `[tasks.world_director]`,
 `[tasks.world_stories_director]`, and `[tasks.world_comment]`, with the same
 default.
 
-**`ghosting` field** (bool, default `true`): a safety switch for downstream products. Set `ghosting = false` to disable ghosting across the _entire_ PDE path — LLM verdict, rule fallback, and the pure rule engine — so the companion never goes silent. Useful for products where silent turns are undesirable. With the switch off, the `away_from_phone` life event is never drawn either (see [ghost-mechanics.md](ghost-mechanics.md#ghosting-the-engine-imposes)).
+**`ghosting` field** (bool, default `true`): a safety switch for downstream products. Set `ghosting = false` to disable ghosting across the _entire_ PDE path — LLM verdict, rule fallback, and the pure rule engine — so the companion never goes silent. Useful for products where silent turns are undesirable. With the switch off, the `away_from_phone` life event is never drawn either, and one already under way no longer silences turns (see [ghost-mechanics.md](ghost-mechanics.md#ghosting-the-engine-imposes)).
 
 ### `[tasks.chat_image_prompt_compose]` — image-prompt composer (required for image turns)
 

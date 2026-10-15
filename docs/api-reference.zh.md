@@ -811,8 +811,8 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 它持续期间，角色任何一个 session 里的每一轮文字消息都会被 ghost，不经过判官，也不计入 ghost 连续次数，
 `/open` 返回 `null`。带用户 `action` 的轮次（任何 `type`：`give`、`gift`、`tip`、`kiss`、`hug`、`touch`、`lick`、`custom`）或 `image.force = true` 是例外：
 它走正常路径并得到回复，因为动作永远会得到回复，强制出图的轮次永远是 `reply_image`。
-角色只在 ghost 保护允许的地方才会这样沉默：部署的 ghosting 开关关闭（`ghosting = false`）时不会抽到 `away_from_phone`，
-用户消息不足 10 条的会话里也不会；调用方完全不想要它，就在 `kinds` 里不写 `away_from_phone`。这样被 ghost 的消息没有回执（没有判官读过它），
+角色只在 ghost 保护允许的地方才会这样沉默：部署的 ghosting 开关关闭（`ghosting = false`）时不会抽到 `away_from_phone`，已经在进行的一段也不再让轮次沉默，
+用户消息不足 10 条的会话里也不会抽到；调用方完全不想要它，就在 `kinds` 里不写 `away_from_phone`。这样被 ghost 的消息没有回执（没有判官读过它），
 角色解释之后它依然没有回执。事件结束后，在用户消息被 ghost 过的会话里，角色的下一条消息——回复、`/open` 开场白或事件消息——
 会解释她刚才没看手机。她写过一次之后，这件事就了结了。机制见
 [ghost-mechanics.zh.md](ghost-mechanics.zh.md#engine-强制的-ghost)。
