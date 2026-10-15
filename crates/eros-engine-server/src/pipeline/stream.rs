@@ -4468,12 +4468,15 @@ pub(crate) fn run_stream_with(
                     at: chrono::Utc::now(),
                 }
             });
-        // An action turn is always answered, never met with silence.
+        // An action turn and a client-forced image turn are always answered,
+        // never met with silence.
         let action_turn = user_msg.action.is_some();
+        let force_image = user_msg.image.as_ref().is_some_and(|i| i.force);
         // While she is away from her phone (spec 2026-10-15-life-events-v2-
         // design.md §7.2) a text turn ghosts without the judge. The silence is
         // circumstance, so the ghost accounting is left alone.
         if !action_turn
+            && !force_image
             && current
                 .foreground
                 .as_ref()
@@ -4530,7 +4533,6 @@ pub(crate) fn run_stream_with(
         let req_image = user_msg.image.as_ref();
         let image_executor_available =
             image_capability_available(req_image.is_some(), &state.model_config);
-        let force_image = req_image.is_some_and(|i| i.force);
         let resolved_pde = state.model_config.resolve_pde();
         // product_qa executor: hard-gated on the judge being live (spec §1.1).
         // `resolve_product_qa()` advances the chat_product_qa round-robin model
@@ -21666,6 +21668,28 @@ data: [DONE]\n\n"
         verdict: Option<serde_json::Value>,
         turn_mins_ago: i32,
     ) -> NeedsTurn {
+        run_event_turn_with(
+            pool,
+            rows,
+            events,
+            ghosted_mins_ago,
+            verdict,
+            turn_mins_ago,
+            None,
+        )
+        .await
+    }
+
+    /// [`run_event_turn`] with the request's `image` block.
+    async fn run_event_turn_with(
+        pool: &PgPool,
+        rows: &[SeedRow],
+        events: &[EventSeed],
+        ghosted_mins_ago: &[i32],
+        verdict: Option<serde_json::Value>,
+        turn_mins_ago: i32,
+        image: Option<crate::routes::companion_stream::ImageReplyParams>,
+    ) -> NeedsTurn {
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
         use futures_util::StreamExt;
         use wiremock::matchers::{body_string_contains, path as wm_path};
@@ -21779,7 +21803,7 @@ data: [DONE]\n\n"
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 image_url: None,
-                image: None,
+                image,
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: None,
@@ -22260,6 +22284,51 @@ data: [DONE]\n\n"
                 .await
                 .unwrap();
         assert!(!ghosted, "an answered action is not a ghost");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_forced_image_turn_during_an_away_stretch_is_not_ghosted(pool: PgPool) {
+        let t = run_event_turn_with(
+            &pool,
+            &[],
+            &[ev("away_from_phone", 5, 55)],
+            &[],
+            None,
+            0,
+            Some(crate::routes::companion_stream::ImageReplyParams {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+        let types: Vec<String> = t
+            .frames
+            .iter()
+            .map(|f| {
+                serde_json::to_value(f).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            types,
+            ["meta", "done", "image_request", "final"],
+            "{:?}",
+            t.frames
+        );
+        assert!(
+            t.frames.iter().any(|f| matches!(
+                f,
+                ProtocolFrame::Meta {
+                    action_type: FrameActionType::ReplyImage,
+                    ..
+                }
+            )),
+            "{:?}",
+            t.frames
+        );
+        assert_eq!(ghost_accounting(&pool, t.umid).await, (false, 0, None));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
