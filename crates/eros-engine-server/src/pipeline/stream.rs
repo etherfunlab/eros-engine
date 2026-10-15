@@ -2749,8 +2749,8 @@ fn build_pde_ctx(
             )
         }
     };
-    // The event under way at this turn (spec 2026-10-13-life-events-design.md
-    // §6); absent otherwise.
+    // The background and the foreground under way at this turn (spec
+    // 2026-10-15-life-events-v2-design.md §8.2); absent otherwise.
     let event_line = event
         .map(|s| format!("[近期事件] {s}\n"))
         .unwrap_or_default();
@@ -4469,7 +4469,10 @@ pub(crate) fn run_stream_with(
                 }
             });
         let event_judge = crate::prompt::events_judge_text(&current);
-        let event_reply = crate::prompt::events_reply_text(&current);
+        let event_lines = crate::prompt::EventLines {
+            under_way: crate::prompt::events_reply_text(&current),
+            away_unexplained: false,
+        };
         // ── PDE decision (judge-first) ────────────────────────────────────────
         // The judge runs before vision/input-filter/chat so a `ghost` verdict
         // short-circuits all of them. Feature-off skips the judge (rule
@@ -5573,7 +5576,7 @@ pub(crate) fn run_stream_with(
                     user_msg.session_id, user_msg.user_id, user_msg.instance_id,
                     user_msg.user_message_id, &now_ctx, true,
                     body_state.as_deref(), needs_text.as_deref(),
-                    event_reply.as_deref(),
+                    Some(&event_lines),
                 ).await;
                 let (req, injected_tags) = match req_res {
                     Ok(r) => r,

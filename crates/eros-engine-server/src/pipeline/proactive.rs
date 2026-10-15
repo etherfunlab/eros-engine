@@ -78,6 +78,8 @@ pub(crate) enum Occasion {
         event_key: String,
         kind: EventKind,
         lasts: chrono::Duration,
+        /// The background under way when it was drawn.
+        background: Option<EventKind>,
     },
 }
 
@@ -105,7 +107,12 @@ impl Occasion {
             Self::Returning { gap_days, .. } => {
                 format!("（对方隔了 {gap_days} 天又打开和你的聊天，还没说话。）")
             }
-            Self::Event { kind, lasts, .. } => kind_cue(*kind, *lasts),
+            Self::Event {
+                kind,
+                lasts,
+                background,
+                ..
+            } => event_cue(*kind, *lasts, *background),
         }
     }
 }
@@ -140,6 +147,36 @@ fn kind_cue(kind: EventKind, lasts: chrono::Duration) -> String {
         ShortTrip => format!("（你刚出发去短途旅行，要玩 {span}。）"),
         LongTrip => format!("（你刚出发去长途旅行，要去 {span}。）"),
         HometownVisit => format!("（你刚动身回老家，要待 {span}。）"),
+    }
+}
+
+/// How a foreground event's cue opens during a background (spec
+/// 2026-10-15-life-events-v2-design.md §3.4); `None` for a foreground kind.
+fn background_state(kind: EventKind) -> Option<&'static str> {
+    use EventKind::*;
+    Some(match kind {
+        Sick => "你正在生病",
+        Period => "你正在经期",
+        Hospitalized => "你正在住院",
+        PostSurgery => "你刚做完手术，还在恢复",
+        BusinessTrip => "你正在外地出差",
+        ShortTrip => "你正在短途旅行",
+        LongTrip => "你正在长途旅行",
+        HometownVisit => "你正在老家",
+        _ => return None,
+    })
+}
+
+/// The kind's cue, opened with the background's state when one is under
+/// way: 「（你正在外地出差。你刚在路上遇到了一只小动物。）」.
+fn event_cue(kind: EventKind, lasts: chrono::Duration, background: Option<EventKind>) -> String {
+    let cue = kind_cue(kind, lasts);
+    match background.and_then(background_state) {
+        Some(state) => format!(
+            "（{state}。{}）",
+            cue.trim_start_matches('（').trim_end_matches('）')
+        ),
+        None => cue,
     }
 }
 
@@ -222,6 +259,13 @@ pub(crate) async fn greet(
         aspect_ratio: None,
         action_response: None,
     };
+    let current = eros_engine_store::events::EventRepo { pool: &state.pool }
+        .current(g.instance_id, None, g.now.now)
+        .await?;
+    let event_lines = crate::prompt::EventLines {
+        under_way: crate::prompt::events_reply_text(&current),
+        away_unexplained: false,
+    };
     let (mut chat_req, injected_tags) = build_reply_request(
         state,
         &input,
@@ -234,7 +278,7 @@ pub(crate) async fn greet(
         false,
         None,
         None,
-        None,
+        Some(&event_lines),
     )
     .await?;
     chat_req.messages.push(WireMessage {
@@ -360,6 +404,7 @@ pub(crate) async fn greet(
             event_key,
             kind,
             lasts,
+            ..
         } => Ok(eros_engine_store::events::EventRepo { pool: &state.pool }
             .insert(
                 &eros_engine_store::events::NewEvent {
@@ -413,6 +458,31 @@ mod tests {
         ] {
             assert_eq!(kind_cue(kind, h), cue, "{kind:?}");
         }
+    }
+
+    #[test]
+    fn an_incident_during_a_background_opens_with_its_state() {
+        let h = Duration::hours(1);
+        assert_eq!(
+            event_cue(EventKind::AnimalEncounter, h, Some(EventKind::BusinessTrip)),
+            "（你正在外地出差。你刚在路上遇到了一只小动物。）"
+        );
+        for (bg, state) in [
+            (EventKind::Sick, "你正在生病"),
+            (EventKind::Period, "你正在经期"),
+            (EventKind::Hospitalized, "你正在住院"),
+            (EventKind::PostSurgery, "你刚做完手术，还在恢复"),
+            (EventKind::BusinessTrip, "你正在外地出差"),
+            (EventKind::ShortTrip, "你正在短途旅行"),
+            (EventKind::LongTrip, "你正在长途旅行"),
+            (EventKind::HometownVisit, "你正在老家"),
+        ] {
+            assert_eq!(
+                event_cue(EventKind::Reading, h, Some(bg)),
+                format!("（{state}。你正在看书。）")
+            );
+        }
+        assert_eq!(event_cue(EventKind::Reading, h, None), "（你正在看书。）");
     }
 
     #[test]

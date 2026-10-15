@@ -346,6 +346,11 @@ pub(crate) async fn draw_event_at(
         return Ok(DrawEventResponse::none());
     };
 
+    let background = history
+        .iter()
+        .find(|e| e.kind.is_background() && e.ends_at > now)
+        .map(|e| e.kind);
+
     let _guard = state
         .stream_slots
         .try_acquire(user_id, CONCURRENT_STREAMS_PER_USER)
@@ -381,6 +386,7 @@ pub(crate) async fn draw_event_at(
                 event_key: key.clone(),
                 kind: drawn.kind,
                 lasts: drawn.lasts,
+                background,
             },
             recall_query,
             since: now,
@@ -863,6 +869,54 @@ mod tests {
         assert_eq!(
             last["content"],
             json!("（你刚出发去长途旅行，要去 3 天。）")
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_incident_during_a_trip_is_told_from_the_trip(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (instance_id, session_id) = setup(&pool, user_id).await;
+        let started = Utc::now() - chrono::Duration::hours(2);
+        eros_engine_store::events::EventRepo { pool: &pool }
+            .insert(
+                &eros_engine_store::events::NewEvent {
+                    instance_id,
+                    session_id,
+                    event_key: "trip",
+                    kind: EventKind::BusinessTrip,
+                    started_at: started,
+                    ends_at: started + chrono::Duration::hours(24),
+                },
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "出差路上遇到一只小猫").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            req("k1", Some(vec![EventKindDto::AnimalEncounter])),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        assert!(out.event.is_some());
+        let c = calls(&mock).await;
+        let msgs = c[0]["messages"].as_array().unwrap();
+        assert_eq!(
+            msgs.last().unwrap()["content"],
+            json!("（你正在外地出差。你刚在路上遇到了一只小动物。）")
+        );
+        assert!(
+            c[0].to_string()
+                .contains("- 正在经历：出差（约 22 小时后结束）"),
+            "{}",
+            c[0]
         );
     }
 

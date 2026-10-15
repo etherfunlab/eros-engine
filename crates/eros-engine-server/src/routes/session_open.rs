@@ -1083,6 +1083,57 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_opener_during_a_trip_knows_of_it(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let now = Utc::now();
+        let session_id =
+            session_with_history(&pool, user_id, now - chrono::Duration::days(2)).await;
+        let instance_id: Uuid =
+            sqlx::query_scalar("SELECT instance_id FROM engine.chat_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        eros_engine_store::events::EventRepo { pool: &pool }
+            .insert(
+                &eros_engine_store::events::NewEvent {
+                    instance_id,
+                    session_id,
+                    event_key: "trip",
+                    kind: eros_engine_core::events::EventKind::ShortTrip,
+                    started_at: now - chrono::Duration::hours(1),
+                    ends_at: now + chrono::Duration::hours(47),
+                },
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "我在外面玩呢").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        open_at(
+            &state,
+            session_id,
+            user_id,
+            opener(OpenOccasion::JustOpened, "visit-1"),
+            now,
+        )
+        .await
+        .unwrap()
+        .greeting
+        .expect("an opener");
+        let calls = companion_calls(&mock).await;
+        assert!(
+            calls[0]
+                .to_string()
+                .contains("- 正在经历：短途旅游（约 47 小时后结束）"),
+            "{}",
+            calls[0]
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn returning_within_a_day_says_less_than_a_day(pool: PgPool) {
         let user_id = Uuid::new_v4();
         let now = Utc::now();

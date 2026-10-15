@@ -908,6 +908,20 @@ pub(crate) fn events_reply_text(c: &eros_engine_store::events::CurrentEvents) ->
     (!items.is_empty()).then(|| items.join("；"))
 }
 
+/// What the reply hears of the persona's events (spec
+/// 2026-10-15-life-events-v2-design.md §8.2).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EventLines {
+    /// `正在经历`: the background and the foreground under way, rendered by
+    /// `events_reply_text`.
+    pub under_way: Option<String>,
+    /// `刚才`: an away-from-phone stretch this session has not been told
+    /// about.
+    pub away_unexplained: bool,
+}
+
+const AWAY_LINE: &str = "- 刚才：有段时间没看手机，对方那时发来的消息你现在才看到";
+
 /// Fold the last turns' `metadata` (newest first) into the active effects:
 /// a turn counts only with an accepted action; anything that does not parse
 /// counts as no action (spec 2026-10-12-given-item-lingering-effects-design.md §5).
@@ -1249,9 +1263,9 @@ pub fn build_prompt(
     // (spec 2026-10-13-persona-needs-design.md §6.2). `None` or blank ⇒ no
     // line.
     needs: Option<&str>,
-    // The events under way, rendered by `events_reply_text` (spec
-    // 2026-10-15-life-events-v2-design.md §8.2). `None` or blank ⇒ no line.
-    event: Option<&str>,
+    // The persona's events (spec 2026-10-15-life-events-v2-design.md §8.2).
+    // `None` ⇒ no line.
+    event: Option<&EventLines>,
 ) -> String {
     let name = persona.genome.name.as_str();
     let age = meta_i32(persona, "age")
@@ -1470,9 +1484,20 @@ pub fn build_prompt(
         if let Some(s) = needs.map(str::trim).filter(|s| !s.is_empty()) {
             lines.push(format!("- 此刻的需要：{s}"));
         }
-        // The event she is in the middle of, after her needs.
-        if let Some(s) = event.map(str::trim).filter(|s| !s.is_empty()) {
-            lines.push(format!("- 正在经历：{s}"));
+        // The events she is in, after her needs; then an away stretch she
+        // has not explained.
+        if let Some(ev) = event {
+            if let Some(s) = ev
+                .under_way
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                lines.push(format!("- 正在经历：{s}"));
+            }
+            if ev.away_unexplained {
+                lines.push(AWAY_LINE.into());
+            }
         }
         if lines.is_empty() {
             String::new()
@@ -3945,6 +3970,10 @@ mod tests {
     }
 
     fn prompt_with_event(needs: Option<&str>, event: Option<&str>) -> String {
+        let lines = event.map(|s| EventLines {
+            under_way: Some(s.into()),
+            away_unexplained: false,
+        });
         build_prompt(
             &fixture_persona(),
             &[],
@@ -3964,8 +3993,69 @@ mod tests {
             &NowContext::default(),
             None,
             needs,
-            event,
+            lines.as_ref(),
         )
+    }
+
+    #[test]
+    fn the_away_line_follows_what_she_is_going_through() {
+        let lines = EventLines {
+            under_way: Some("出差（约 1 天后结束）".into()),
+            away_unexplained: true,
+        };
+        let p = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            &[],
+            None,
+            None,
+            &[],
+            AffinityScope::full(),
+            &[],
+            None,
+            None,
+            None,
+            None,
+            TurnNudges::default(),
+            &NowContext::default(),
+            None,
+            None,
+            Some(&lines),
+        );
+        assert!(
+            p.contains(
+                "- 正在经历：出差（约 1 天后结束）\n- 刚才：有段时间没看手机，对方那时发来的消息你现在才看到"
+            ),
+            "{p}"
+        );
+        let quiet = EventLines {
+            away_unexplained: false,
+            ..lines
+        };
+        let p = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            &[],
+            None,
+            None,
+            &[],
+            AffinityScope::full(),
+            &[],
+            None,
+            None,
+            None,
+            None,
+            TurnNudges::default(),
+            &NowContext::default(),
+            None,
+            None,
+            Some(&quiet),
+        );
+        assert!(!p.contains("- 刚才："), "{p}");
     }
 
     #[test]
