@@ -368,10 +368,19 @@ pub(crate) async fn draw_event_at(
         .iter()
         .map(|e| e.past())
         .collect();
-    let allowed: Vec<EventKind> = match &req.kinds {
+    let mut allowed: Vec<EventKind> = match &req.kinds {
         Some(kinds) => kinds.iter().map(|k| (*k).into()).collect(),
         None => EventKind::ALL.to_vec(),
     };
+    // Away from her phone is silence: it follows the ghost protection (the
+    // deployment's ghosting switch and the session's message floor).
+    let signals =
+        crate::pipeline::compute_signals_for_session(&state.pool, session_id, &affinity).await?;
+    if !state.model_config.pde_ghosting_enabled()
+        || signals.message_count < eros_engine_core::ghost::GHOST_MIN_MESSAGES
+    {
+        allowed.retain(|k| *k != EventKind::AwayFromPhone);
+    }
     let traits = crate::prompt::persona_traits(&persona);
     let Some(drawn) = events::draw(
         &DrawInput {
@@ -1002,10 +1011,147 @@ mod tests {
         assert_eq!(out.event.map(|e| e.kind), Some(EventKindDto::Period));
     }
 
+    /// `n` user rows in the session: what the ghost protection counts.
+    async fn seed_user_messages(pool: &PgPool, session_id: Uuid, n: usize) {
+        for _ in 0..n {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content) \
+                 VALUES ($1, 'user', 'hi')",
+            )
+            .bind(session_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn event_count(pool: &PgPool, session_id: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM engine.persona_events WHERE session_id = $1")
+            .bind(session_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn away_from_phone_is_not_drawn_before_the_ghost_threshold(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        let state = test_state(pool.clone());
+        let only = |key: &str| req(key, Some(vec![EventKindDto::AwayFromPhone]));
+
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            only("a1"),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        assert!(out.event.is_none(), "a fresh session has no messages");
+        assert_eq!(event_count(&pool, session_id).await, 0);
+
+        seed_user_messages(&pool, session_id, 9).await;
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            only("a2"),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        assert!(out.event.is_none(), "nine messages are still below ten");
+        assert_eq!(event_count(&pool, session_id).await, 0);
+
+        seed_user_messages(&pool, session_id, 1).await;
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            only("a3"),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out.event.map(|e| e.kind),
+            Some(EventKindDto::AwayFromPhone),
+            "ten messages lift the veto"
+        );
+        assert_eq!(event_count(&pool, session_id).await, 1);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_ghost_threshold_leaves_other_kinds_alone(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "外面突然下大雨了").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            req("k1", Some(vec![EventKindDto::WeatherChange])),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out.event.map(|e| e.kind),
+            Some(EventKindDto::WeatherChange),
+            "a fresh session still draws the kinds that tell a message"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn away_from_phone_is_not_drawn_while_ghosting_is_off(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        seed_user_messages(&pool, session_id, 10).await;
+        let only = |key: &str| req(key, Some(vec![EventKindDto::AwayFromPhone]));
+        let mut off = test_state(pool.clone());
+        off.model_config = Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.pde_decision]\nmodel = \"judge\"\nghosting = false\n",
+            )
+            .unwrap(),
+        );
+        assert!(!off.model_config.pde_ghosting_enabled());
+
+        let out = draw_event_at(
+            &off,
+            session_id,
+            user_id,
+            only("a1"),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        assert!(out.event.is_none() && out.message.is_none());
+        assert_eq!(event_count(&pool, session_id).await, 0);
+
+        // The same session draws it once the switch is on.
+        let on = test_state(pool.clone());
+        assert!(on.model_config.pde_ghosting_enabled());
+        let out = draw_event_at(&on, session_id, user_id, only("a2"), Utc::now(), rolls(0.5))
+            .await
+            .unwrap();
+        assert_eq!(out.event.map(|e| e.kind), Some(EventKindDto::AwayFromPhone));
+    }
+
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn away_from_phone_is_drawn_without_a_message(pool: PgPool) {
         let user_id = Uuid::new_v4();
         let (_, session_id) = setup(&pool, user_id).await;
+        seed_user_messages(&pool, session_id, 10).await;
         let mock = MockServer::start().await;
         let state = with_companion(test_state(pool.clone()), &mock.uri());
         let out = draw_event_at(
@@ -1032,6 +1178,7 @@ mod tests {
     async fn the_same_key_returns_the_same_away_event(pool: PgPool) {
         let user_id = Uuid::new_v4();
         let (_, session_id) = setup(&pool, user_id).await;
+        seed_user_messages(&pool, session_id, 10).await;
         let state = test_state(pool.clone());
         let only = || req("a1", Some(vec![EventKindDto::AwayFromPhone]));
         let first = draw_event_at(&state, session_id, user_id, only(), Utc::now(), rolls(0.1))

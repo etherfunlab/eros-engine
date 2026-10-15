@@ -22,13 +22,16 @@ pub fn score(a: &Affinity) -> f64 {
     (1.0 - a.intrigue) * 0.4 + (1.0 - a.patience) * 0.4 + a.tension * 0.2
 }
 
+/// The message count below which the persona never goes silent.
+pub const GHOST_MIN_MESSAGES: i64 = 10;
+
 /// True when a ghost is permitted by the HARD-SAFETY protections only
 /// (message-count floor, anti-streak, cooldown). The score-threshold layer is
 /// intentionally excluded — the LLM PDE decides ghost-worthiness, while these
 /// vetoes always hold. `ghost_streak` is read from `a`; `message_count` /
 /// `hours_since_last_ghost` from `s` (the same sources `decide` uses).
 pub fn ghost_permitted(a: &Affinity, s: GhostSignals) -> bool {
-    if s.message_count < 10 {
+    if s.message_count < GHOST_MIN_MESSAGES {
         return false;
     }
     if a.ghost_streak >= 2 {
