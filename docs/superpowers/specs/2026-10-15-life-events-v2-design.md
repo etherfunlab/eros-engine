@@ -430,7 +430,9 @@ line. The first assistant row written after `E.ends_at` ends it.
 
   Each event under way reads `{label}（{span}前开始，约 {span}后结束）`;
   under an hour reads `不到 1 小时前开始` / `不到 1 小时后结束`. An
-  unexplained away event reads `没看手机（{span}前结束，期间对方的消息她没有回）`.
+  unexplained away event reads `没看手机（{span}前结束，期间对方的消息你没有回）`;
+  under an hour reads `不到 1 小时前结束`. The judge addresses the persona as
+  `你`, as its other lines do.
 - **Reply.** `[character_state]` renders after `此刻的需要`:
 
   ```
