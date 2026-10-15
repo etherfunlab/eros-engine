@@ -981,8 +981,9 @@ user `action` (any `type`: `give`, `gift`, `tip`, `kiss`, `hug`, `touch`,
 `lick`, `custom`) is the exception: it takes the normal path and is answered,
 because an action is always answered. The ghost does not read the deployment's
 ghosting switch (`ghosting = false`); a caller that does not want it leaves
-`away_from_phone` out of `kinds`. A message ghosted this way gets no `read_at`
-(no judge read it), and it stays unread after the persona explains. Once the
+`away_from_phone` out of `kinds`. A message ghosted this way carries no read
+receipt (no judge read it), and it still carries none after the persona
+explains. Once the
 event is over, in a session where the user's messages were ghosted, the
 persona's next message — a reply, an `/open` greeting or an event message —
 explains she had not been looking at her phone. After she has written once,
@@ -1167,7 +1168,8 @@ other — only the engine's own writer is text-only, so it is voice **`user`**
 rows that stay unstamped.
 
 **Read `read_at: absent` as "no receipt", never as "not yet read."** Voice
-`user` rows, and — on a deployment running without the PDE judge — every `user`
+`user` rows, a `user` row ghosted during an `away_from_phone` stretch (no judge
+read it), and — on a deployment running without the PDE judge — every `user`
 row stay unstamped permanently.
 
 See [2026-08-19-chat-message-read-at-design.md](superpowers/specs/2026-08-19-chat-message-read-at-design.md).

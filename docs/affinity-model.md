@@ -231,9 +231,11 @@ A skipped eval (`eval_skip_reason`) or a failed one (non-empty
 simply re-derive with the current lines and decay. The old rule-delta
 fallback is retired.
 
-Ghost turns never reach `persist_with_event`: only `ghost_streak` /
-`total_ghosts` / `last_ghost_at` move. `record_ghost` writes an all-zero
-`effective_deltas`; no axis moves at all.
+A ghost the PDE decides never reaches `persist_with_event`: only
+`ghost_streak` / `total_ghosts` / `last_ghost_at` move. `record_ghost` writes an
+all-zero `effective_deltas`; no axis moves at all. The ghost the engine imposes
+during an `away_from_phone` stretch moves none of them (see
+[ghost-mechanics.md](ghost-mechanics.md#ghosting-the-engine-imposes)).
 
 ### Refused actions
 

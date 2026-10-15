@@ -182,8 +182,9 @@ penalty = κ_line × ((y − y₀)⁺ / (1 − y₀))² × (|g| / 4)
 `gateway_errors`）保持存储档位不变，端点仅按当前线值与衰减重新派生。旧的规则
 delta 回退已退役。
 
-Ghost 回合从不进入 `persist_with_event`：只有 `ghost_streak` / `total_ghosts` /
-`last_ghost_at` 移动；`record_ghost` 写全零 `effective_deltas`。
+PDE 判定的 ghost 回合从不进入 `persist_with_event`：只有 `ghost_streak` / `total_ghosts` /
+`last_ghost_at` 移动；`record_ghost` 写全零 `effective_deltas`。`away_from_phone` 期间由 engine
+强制的 ghost 一个都不动（见 [ghost-mechanics.zh.md](ghost-mechanics.zh.md#engine-强制的-ghost)）。
 
 ### 被拒绝的动作
 

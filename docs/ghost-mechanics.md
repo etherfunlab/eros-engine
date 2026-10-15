@@ -124,7 +124,7 @@ If the persona never ghosts → check that LLM affinity-evaluation is actually m
 
 While a persona's `away_from_phone` life event is under way (see [the events route](api-reference.md#post-v2compsessionsession_idevents)), every 1:1 text turn of that persona, in any of her sessions, ghosts without the judge and without the score above. Nothing on this page applies to it: it does not count towards `ghost_streak`, does not set `last_ghost_at`, and does not raise the threshold for later turns. It ends with the same three frames as any ghost.
 
-- The user's row is marked ghosted like any other, but it gets no `read_at`: no judge read it, and it stays unread after the persona explains.
+- The user's row is marked ghosted like any other, but it carries no read receipt (`read_at` stays absent): no judge read it, and it still carries none after the persona explains.
 - A turn that carries a user action is the exception. It takes the normal path and is answered, because an action is always answered.
 - The `ghosting` switch ([model-config.md](model-config.md)) does not reach it: `ghosting = false` does not turn it off. A caller that does not want it leaves `away_from_phone` out of `kinds` on the events route.
 

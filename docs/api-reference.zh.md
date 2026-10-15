@@ -806,8 +806,8 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 它持续期间，角色任何一个 session 里的每一轮文字消息都会被 ghost，不经过判官，也不计入 ghost 连续次数，
 `/open` 返回 `null`。带用户 `action` 的轮次（任何 `type`：`give`、`gift`、`tip`、`kiss`、`hug`、`touch`、`lick`、`custom`）是例外：
 它走正常路径并得到回复，因为动作永远会得到回复。这种 ghost 不读部署的 ghosting 开关（`ghosting = false`）；
-调用方不想要它，就在 `kinds` 里不写 `away_from_phone`。这样被 ghost 的消息没有 `read_at`（没有判官读过它），
-角色解释之后它依然是未读。事件结束后，在用户消息被 ghost 过的会话里，角色的下一条消息——回复、`/open` 开场白或事件消息——
+调用方不想要它，就在 `kinds` 里不写 `away_from_phone`。这样被 ghost 的消息没有回执（没有判官读过它），
+角色解释之后它依然没有回执。事件结束后，在用户消息被 ghost 过的会话里，角色的下一条消息——回复、`/open` 开场白或事件消息——
 会解释她刚才没看手机。她写过一次之后，这件事就了结了。机制见
 [ghost-mechanics.zh.md](ghost-mechanics.zh.md#engine-强制的-ghost)。
 
@@ -945,7 +945,8 @@ session 返回 404 的行为，与上面的 history 路由完全一致。
 语音 session 一样接受，它的 `assistant` 行照标不误 —— 只有 engine 自己那个写者
 是纯文字路径专用的，所以永远不打点的是语音的 **`user`** 行。
 
-**`read_at` 不出现要读作「没有回执」，不是「还没读」。** 语音 `user` 行，
+**`read_at` 不出现要读作「没有回执」，不是「还没读」。** 语音 `user` 行、
+在 `away_from_phone` 期间被 ghost 的 `user` 行（没有判官读过它），
 以及在没配 PDE 判官的部署上的每一条 `user` 行，都是永久不打点的。
 
 详见 [2026-08-19-chat-message-read-at-design.md](superpowers/specs/2026-08-19-chat-message-read-at-design.md)。

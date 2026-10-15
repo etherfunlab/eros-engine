@@ -156,7 +156,7 @@ penalty = κ_line × ((y − y₀)⁺ / (1 − y₀))² × (|g| / 4)
 
 eval がスキップされた場合(`eval_skip_reason`)や失敗した場合(`llm_attempts` / `gateway_errors` が空でない場合)は、保存済みレベルを保持し、現在のライン値と減衰からエンドポイントを再導出する。旧来のルールデルタへのフォールバックは廃止された。
 
-ゴーストターンは `persist_with_event` に到達しない。変化するのは `ghost_streak` / `total_ghosts` / `last_ghost_at` のみであり、`record_ghost` はすべてゼロの `effective_deltas` を書き込む。
+PDE が決めたゴーストターンは `persist_with_event` に到達しない。変化するのは `ghost_streak` / `total_ghosts` / `last_ghost_at` のみであり、`record_ghost` はすべてゼロの `effective_deltas` を書き込む。`away_from_phone` の間にエンジンが課すゴーストは、これらのいずれも動かさない([ghost-mechanics.md](ghost-mechanics.md#ghosting-the-engine-imposes) を参照)。
 
 ### 拒否されたアクション
 

@@ -429,7 +429,7 @@ line. The first assistant row written after `E.ends_at` ends it.
   unexplained away event, in that order, joined by `；`:
 
   ```
-  [近期事件] 出差（1 天前开始，约 1 天后结束）；路上遇到小动物（不到 1 小时前开始，不到 1 小时后结束）
+  [近期事件] 长途旅游（2 天前开始，约 3 天后结束）；在看书（不到 1 小时前开始，约 2 小时后结束）
   ```
 
   Each event under way reads `{label}（{span}前开始，约 {span}后结束）`;
@@ -440,7 +440,7 @@ line. The first assistant row written after `E.ends_at` ends it.
 - **Reply.** `[character_state]` renders after `此刻的需要`:
 
   ```
-  - 正在经历：出差（约 1 天后结束）；路上遇到小动物（不到 1 小时后结束）
+  - 正在经历：长途旅游（约 3 天后结束）；在看书（约 2 小时后结束）
   - 刚才：有段时间没看手机，对方那时发来的消息你现在才看到
   ```
 
