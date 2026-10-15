@@ -118,8 +118,9 @@ pub struct EffectsResponse {
     pub background_event: Option<crate::routes::session_events::EventView>,
 }
 
-/// The persona's lingering state from accepted gives, her needs and the event
-/// under way, as a text turn sent now would carry them.
+/// The persona's lingering state from accepted gives, her needs and the
+/// incident and the background under way, as a text turn sent now would carry
+/// them.
 #[utoipa::path(
     get,
     path = "/v2/comp/session/{session_id}/effects",

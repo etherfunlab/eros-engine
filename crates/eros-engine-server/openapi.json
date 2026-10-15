@@ -2003,7 +2003,7 @@
         "tags": [
           "companion"
         ],
-        "summary": "The persona's lingering state from accepted gives, her needs and the event\nunder way, as a text turn sent now would carry them.",
+        "summary": "The persona's lingering state from accepted gives, her needs and the\nincident and the background under way, as a text turn sent now would carry\nthem.",
         "operationId": "get_effects",
         "parameters": [
           {
