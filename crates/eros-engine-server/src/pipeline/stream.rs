@@ -4468,13 +4468,16 @@ pub(crate) fn run_stream_with(
                     at: chrono::Utc::now(),
                 }
             });
+        // An action turn is always answered, never met with silence.
+        let action_turn = user_msg.action.is_some();
         // While she is away from her phone (spec 2026-10-15-life-events-v2-
-        // design.md §7.2) the turn ghosts without the judge. The silence is
+        // design.md §7.2) a text turn ghosts without the judge. The silence is
         // circumstance, so the ghost accounting is left alone.
-        if current
-            .foreground
-            .as_ref()
-            .is_some_and(|e| e.kind == eros_engine_core::events::EventKind::AwayFromPhone)
+        if !action_turn
+            && current
+                .foreground
+                .as_ref()
+                .is_some_and(|e| e.kind == eros_engine_core::events::EventKind::AwayFromPhone)
         {
             if let Err(e) = chat_repo
                 .mark_user_message_ghosted(user_msg.user_message_id)
@@ -4501,7 +4504,7 @@ pub(crate) fn run_stream_with(
             yield build_final_frame(false, None, user_msg.tier.clone(), 0, 0, attempts, gateways);
             return;
         }
-        // An away stretch that ended, with a message of hers ghosted inside it
+        // An away stretch that ended, with a user message ghosted inside it
         // and no reply since: this turn explains it.
         let away = eros_engine_store::events::EventRepo { pool: &state.pool }
             .unexplained_away(user_msg.session_id, user_msg.instance_id, current.at)
@@ -4519,7 +4522,6 @@ pub(crate) fn run_stream_with(
         // The judge runs before vision/input-filter/chat so a `ghost` verdict
         // short-circuits all of them. Feature-off skips the judge (rule
         // engine). Fail-open: any non-Ok status falls back to pde::decide.
-        let action_turn = user_msg.action.is_some();
         // Delegate-only: the chat stream never draws, so image-action
         // availability keys on the PRESENCE of the request `image` block (the
         // consumer signalling "I handle images this turn"). The engine holds
@@ -21256,6 +21258,19 @@ data: [DONE]\n\n"
         verdict: serde_json::Value,
         judge_status: u16,
     ) -> (Vec<ProtocolFrame>, wiremock::MockServer, Uuid) {
+        run_action_turn_in(pool, action, outfit, prior, &[], verdict, judge_status).await
+    }
+
+    /// [`run_action_turn_full`] with life events seeded for the persona.
+    async fn run_action_turn_in(
+        pool: &PgPool,
+        action: eros_engine_core::types::UserAction,
+        outfit: Option<String>,
+        prior: &[serde_json::Value],
+        events: &[EventSeed],
+        verdict: serde_json::Value,
+        judge_status: u16,
+    ) -> (Vec<ProtocolFrame>, wiremock::MockServer, Uuid) {
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
         use futures_util::StreamExt;
         use wiremock::matchers::{body_string_contains, path as wm_path};
@@ -21303,6 +21318,7 @@ data: [DONE]\n\n"
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
+        seed_events(pool, user_id, instance_id, events).await;
         for (i, meta) in prior.iter().enumerate() {
             sqlx::query(
                 "INSERT INTO engine.chat_messages (session_id, role, content, metadata, sent_at) \
@@ -21609,9 +21625,38 @@ data: [DONE]\n\n"
         }
     }
 
+    /// Write `events` for the persona, in a second session of it: an event
+    /// belongs to the persona, not to the session it was drawn in.
+    async fn seed_events(pool: &PgPool, user_id: Uuid, instance_id: Uuid, events: &[EventSeed]) {
+        let elsewhere: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        for (i, e) in events.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO engine.persona_events \
+                   (instance_id, session_id, event_key, kind, started_at, ends_at) \
+                 VALUES ($1, $2, $3, $4, now() - make_interval(mins => $5), \
+                         now() + make_interval(mins => $6))",
+            )
+            .bind(instance_id)
+            .bind(elsewhere)
+            .bind(format!("seed-{i}"))
+            .bind(e.kind)
+            .bind(e.started_mins_ago)
+            .bind(e.ends_in_mins)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
     /// A turn with life events and ghosted user rows seeded. The events are
-    /// written in a second session of the same persona: an event belongs to
-    /// the persona, not to the session it was drawn in. `ghosted_mins_ago`:
+    /// written by [`seed_events`]. `ghosted_mins_ago`:
     /// user rows in the turn's session the persona ghosted, minutes before now.
     async fn run_event_turn(
         pool: &PgPool,
@@ -21685,31 +21730,7 @@ data: [DONE]\n\n"
             .await
             .unwrap();
         }
-        let elsewhere: Uuid = sqlx::query_scalar(
-            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
-        )
-        .bind(user_id)
-        .bind(instance_id)
-        .fetch_one(pool)
-        .await
-        .unwrap();
-        for (i, e) in events.iter().enumerate() {
-            sqlx::query(
-                "INSERT INTO engine.persona_events \
-                   (instance_id, session_id, event_key, kind, started_at, ends_at) \
-                 VALUES ($1, $2, $3, $4, now() - make_interval(mins => $5), \
-                         now() + make_interval(mins => $6))",
-            )
-            .bind(instance_id)
-            .bind(elsewhere)
-            .bind(format!("seed-{i}"))
-            .bind(e.kind)
-            .bind(e.started_mins_ago)
-            .bind(e.ends_in_mins)
-            .execute(pool)
-            .await
-            .unwrap();
-        }
+        seed_events(pool, user_id, instance_id, events).await;
         for m in ghosted_mins_ago {
             sqlx::query(
                 "INSERT INTO engine.chat_messages (session_id, role, content, ghost_decision, sent_at) \
@@ -22123,6 +22144,20 @@ data: [DONE]\n\n"
             "{:?}",
             t.frames
         );
+        assert_eq!(
+            t.frames
+                .iter()
+                .filter(|f| matches!(f, ProtocolFrame::Done { .. }))
+                .count(),
+            1,
+            "{:?}",
+            t.frames
+        );
+        assert!(
+            matches!(t.frames.last(), Some(ProtocolFrame::Final { .. })),
+            "{:?}",
+            t.frames
+        );
         assert_eq!(ghost_accounting(&pool, t.umid).await, (true, 0, None));
     }
 
@@ -22182,6 +22217,49 @@ data: [DONE]\n\n"
         let reqs = t.mock.received_requests().await.unwrap();
         assert!(!judge_request(&reqs).contains("没看手机"));
         assert!(!chat_request_body(&reqs).contains("- 刚才："));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_action_turn_during_an_away_stretch_is_still_answered(pool: PgPool) {
+        let (frames, mock, umid) = run_action_turn_in(
+            &pool,
+            eros_engine_core::types::UserAction::Kiss,
+            None,
+            &[],
+            &[ev("away_from_phone", 5, 55)],
+            serde_json::json!({"action": "reply_text", "inner_state": ""}),
+            200,
+        )
+        .await;
+        assert!(
+            frames.iter().any(|f| matches!(
+                f,
+                ProtocolFrame::ActionResponse {
+                    response: eros_engine_core::types::ActionResponse::Accept,
+                    user_message_id,
+                } if *user_message_id == umid
+            )),
+            "{frames:?}"
+        );
+        assert!(
+            frames.iter().any(
+                |f| matches!(f, ProtocolFrame::Delta { content, .. } if content.contains("REPLY"))
+            ),
+            "{frames:?}"
+        );
+        let reqs = mock.received_requests().await.unwrap();
+        assert!(
+            chat_request_body(&reqs).contains("- 正在经历：没看手机（"),
+            "{}",
+            chat_request_body(&reqs)
+        );
+        let ghosted: bool =
+            sqlx::query_scalar("SELECT ghost_decision FROM engine.chat_messages WHERE id = $1")
+                .bind(umid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(!ghosted, "an answered action is not a ghost");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! POST /v2/comp/session/{session_id}/events — the caller asks for something
-//! to happen in the persona's day; the engine decides whether and what, and
-//! the persona tells the user (spec
+//! to happen in the persona's day; the engine decides whether and what. The
+//! persona tells the user in a message, except for `away_from_phone`, which is
+//! only her silence (spec
 //! docs/superpowers/specs/2026-10-15-life-events-v2-design.md).
 
 use axum::extract::{Extension, Path, State};

@@ -390,6 +390,9 @@ Every 1:1 text turn of the instance, in any session, whose user row's
 - the stream yields the ghost `meta`, `done` and `final` frames a judged
   ghost yields; nothing else runs.
 
+An action turn (a give or a tip) is exempt and takes the normal path, because
+an action is always answered; its `正在经历` line still lists the away stretch.
+
 Which ghosts came from an away window is derivable from the event row and the
 ghosted rows' times, so it is not stored.
 
@@ -561,6 +564,8 @@ a client shows it is the client's call.
 - **stream.**
   - During an away event: no judge call, the row is ghosted, `ghost_streak`
     unchanged.
+  - An action turn during an away event is answered and its row is not
+    ghosted.
   - After it: the first turn renders `刚才`, the next does not.
   - `[近期事件]` and `正在经历` with a background and a foreground; spans in
     hours and days; a re-driven turn renders the same lines.
@@ -603,6 +608,8 @@ a client shows it is the client's call.
   Category and background-ness derive from the kind.
 - **`away_from_phone` ghosts outside the judge** and leaves the ghost
   accounting alone: the silence is circumstance, not her reading of the user.
+- **Action turns are exempt from the away ghost**: an action is always
+  answered.
 - **The explanation is derived**, not flagged: ghosted rows in the window and
   no assistant row since.
 - **Persona settings in `art_metadata`**, read leniently, as the other
