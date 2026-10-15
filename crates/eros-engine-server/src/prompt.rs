@@ -825,54 +825,79 @@ pub(crate) fn needs_line(n: &eros_engine_core::needs::Needs) -> Option<String> {
     (!words.is_empty()).then(|| words.join("；"))
 }
 
-/// What the persona calls an event (spec 2026-10-13-life-events-design.md §3).
+/// What the persona calls an event (spec 2026-10-15-life-events-v2-design.md
+/// §3.2).
 fn event_label(kind: eros_engine_core::events::EventKind) -> &'static str {
-    use eros_engine_core::events::EventKind;
+    use eros_engine_core::events::EventKind::*;
     match kind {
-        EventKind::TempWork => "临时接到工作",
-        EventKind::ExMessage => "前任发来消息",
-        EventKind::WeatherChange => "天气突然变了",
-        EventKind::PoliceEncounter => "被警察拦下问话",
-        EventKind::AnimalEncounter => "路上遇到小动物",
+        PoliceEncounter => "被警察拦下问话",
+        AnimalEncounter => "路上遇到小动物",
+        HitSomeone => "打人了",
+        SuddenDesire => "突然很想要",
+        TempWork => "临时接到工作",
+        ExMessage => "前任发来消息",
+        WeatherChange => "天气突然变了",
+        GotHit => "被打了",
+        Breakup => "刚分手",
+        WorkingOut => "在健身",
+        Reading => "在看书",
+        Gaming => "在打游戏",
+        AwayFromPhone => "没看手机",
+        Unwell => "不舒服",
+        Irritable => "烦躁",
+        Sick => "生病中",
+        Period => "月经中",
+        Hospitalized => "住院",
+        PostSurgery => "刚做完手术",
+        BusinessTrip => "出差",
+        ShortTrip => "短途旅游",
+        LongTrip => "长途旅游",
+        HometownVisit => "回老家",
     }
 }
 
-/// Whole hours, rounded; `None` under one hour.
-fn whole_hours(d: chrono::Duration) -> Option<i64> {
+/// A span as the prompt reads it (spec §8.1): under an hour; whole hours,
+/// rounded, under 48; whole days, rounded, from 48.
+pub(crate) fn span_text(d: chrono::Duration) -> String {
     let mins = d.num_minutes();
-    (mins >= 60).then(|| (mins as f64 / 60.0).round() as i64)
-}
-
-fn ends_text(
-    e: &eros_engine_store::chat::EventRecord,
-    at: chrono::DateTime<chrono::Utc>,
-) -> String {
-    match whole_hours(e.ends_at - at) {
-        Some(h) => format!("约 {h} 小时后结束"),
-        None => "不到 1 小时后结束".into(),
+    if mins < 60 {
+        "不到 1 小时".into()
+    } else if mins < 48 * 60 {
+        format!("{} 小时", (mins as f64 / 60.0).round() as i64)
+    } else {
+        format!("{} 天", (mins as f64 / (24.0 * 60.0)).round() as i64)
     }
 }
 
-/// The event under way as the judge reads it (spec §6):
+fn ends_text(ends_in: chrono::Duration) -> String {
+    let span = span_text(ends_in);
+    if ends_in.num_minutes() < 60 {
+        format!("{span}后结束")
+    } else {
+        format!("约 {span}后结束")
+    }
+}
+
+/// The event under way as the judge reads it:
 /// 「临时接到工作（1 小时前开始，约 3 小时后结束）」.
 pub(crate) fn event_judge_text(
     e: &eros_engine_store::chat::EventRecord,
     at: chrono::DateTime<chrono::Utc>,
 ) -> String {
-    let started = match whole_hours(at - e.started_at) {
-        Some(h) => format!("{h} 小时前开始"),
-        None => "不到 1 小时前开始".into(),
-    };
-    format!("{}（{started}，{}）", event_label(e.kind), ends_text(e, at))
+    format!(
+        "{}（{}前开始，{}）",
+        event_label(e.kind),
+        span_text(at - e.started_at),
+        ends_text(e.ends_at - at)
+    )
 }
 
-/// The event under way as the reply reads it (spec §6):
-/// 「临时接到工作（约 3 小时后结束）」.
+/// The event under way as the reply reads it: 「临时接到工作（约 3 小时后结束）」.
 pub(crate) fn event_reply_text(
     e: &eros_engine_store::chat::EventRecord,
     at: chrono::DateTime<chrono::Utc>,
 ) -> String {
-    format!("{}（{}）", event_label(e.kind), ends_text(e, at))
+    format!("{}（{}）", event_label(e.kind), ends_text(e.ends_at - at))
 }
 
 /// Fold the last turns' `metadata` (newest first) into the active effects:
@@ -993,6 +1018,37 @@ pub(crate) fn meta_str<'a>(persona: &'a CompanionPersona, key: &str) -> Option<&
         .art_metadata
         .get(key)
         .and_then(|v| v.as_str())
+}
+
+/// The persona's event settings (spec 2026-10-15-life-events-v2-design.md
+/// §4), read leniently: a value of the wrong shape reads as absent, and
+/// `prefer_events` keeps only known `mid` kinds.
+pub(crate) fn persona_traits(
+    persona: &CompanionPersona,
+) -> eros_engine_core::events::PersonaTraits {
+    use eros_engine_core::events::{EventCategory, EventKind, Health, PersonaTraits};
+    let art = &persona.genome.art_metadata;
+    PersonaTraits {
+        female: meta_str(persona, "gender") == Some("female"),
+        health: meta_str(persona, "health")
+            .and_then(Health::parse)
+            .unwrap_or_default(),
+        prefer_trip: art
+            .get("prefer_trip")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        prefer_events: art
+            .get("prefer_events")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .filter_map(EventKind::parse)
+                    .filter(|k| k.category() == EventCategory::Mid)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
 }
 
 /// Pluck an i32 field out of `art_metadata`: a JSON number, or a string
@@ -3738,6 +3794,93 @@ mod tests {
             let (e, at) = event_at(kind, 61, 61);
             assert!(event_reply_text(&e, at).starts_with(label), "{kind:?}");
         }
+    }
+
+    #[test]
+    fn span_text_reads_hours_then_days() {
+        let m = chrono::Duration::minutes;
+        assert_eq!(span_text(m(59)), "不到 1 小时");
+        assert_eq!(span_text(m(60)), "1 小时");
+        assert_eq!(span_text(m(89)), "1 小时");
+        assert_eq!(span_text(m(90)), "2 小时");
+        assert_eq!(span_text(m(47 * 60)), "47 小时");
+        assert_eq!(span_text(m(48 * 60)), "2 天");
+        assert_eq!(span_text(m(60 * 60)), "3 天");
+        assert_eq!(span_text(m(168 * 60)), "7 天");
+    }
+
+    #[test]
+    fn every_kind_has_its_label() {
+        use eros_engine_core::events::EventKind;
+        let labels: Vec<&str> = EventKind::ALL.into_iter().map(event_label).collect();
+        assert_eq!(
+            labels,
+            [
+                "被警察拦下问话",
+                "路上遇到小动物",
+                "打人了",
+                "突然很想要",
+                "临时接到工作",
+                "前任发来消息",
+                "天气突然变了",
+                "被打了",
+                "刚分手",
+                "在健身",
+                "在看书",
+                "在打游戏",
+                "没看手机",
+                "不舒服",
+                "烦躁",
+                "生病中",
+                "月经中",
+                "住院",
+                "刚做完手术",
+                "出差",
+                "短途旅游",
+                "长途旅游",
+                "回老家",
+            ]
+        );
+    }
+
+    #[test]
+    fn persona_traits_read_art_metadata() {
+        use eros_engine_core::events::{EventKind, Health, PersonaTraits};
+        let mut p = fixture_persona();
+        p.genome.art_metadata = serde_json::json!({
+            "gender": "female", "health": "weak", "prefer_trip": true,
+            "prefer_events": ["gaming", "reading"]
+        });
+        assert_eq!(
+            persona_traits(&p),
+            PersonaTraits {
+                female: true,
+                health: Health::Weak,
+                prefer_trip: true,
+                prefer_events: vec![EventKind::Gaming, EventKind::Reading],
+            }
+        );
+        p.genome.art_metadata = serde_json::json!({});
+        assert_eq!(persona_traits(&p), PersonaTraits::default());
+    }
+
+    #[test]
+    fn persona_traits_read_leniently() {
+        use eros_engine_core::events::{EventKind, PersonaTraits};
+        let mut p = fixture_persona();
+        p.genome.art_metadata = serde_json::json!({
+            "gender": "male", "health": 3, "prefer_trip": "yes",
+            "prefer_events": ["gaming", "dragon", "sick", 7]
+        });
+        assert_eq!(
+            persona_traits(&p),
+            PersonaTraits {
+                prefer_events: vec![EventKind::Gaming],
+                ..Default::default()
+            }
+        );
+        p.genome.art_metadata = serde_json::json!({"prefer_events": "gaming", "health": "fragile"});
+        assert_eq!(persona_traits(&p), PersonaTraits::default());
     }
 
     fn prompt_with_event(needs: Option<&str>, event: Option<&str>) -> String {

@@ -41,21 +41,57 @@ const MAX_EVENT_KEY_CHARS: usize = 128;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKindDto {
+    PoliceEncounter,
+    AnimalEncounter,
+    HitSomeone,
+    SuddenDesire,
     TempWork,
     ExMessage,
     WeatherChange,
-    PoliceEncounter,
-    AnimalEncounter,
+    GotHit,
+    Breakup,
+    WorkingOut,
+    Reading,
+    Gaming,
+    AwayFromPhone,
+    Unwell,
+    Irritable,
+    Sick,
+    Period,
+    Hospitalized,
+    PostSurgery,
+    BusinessTrip,
+    ShortTrip,
+    LongTrip,
+    HometownVisit,
 }
 
 impl From<EventKindDto> for EventKind {
     fn from(k: EventKindDto) -> Self {
         match k {
+            EventKindDto::PoliceEncounter => EventKind::PoliceEncounter,
+            EventKindDto::AnimalEncounter => EventKind::AnimalEncounter,
+            EventKindDto::HitSomeone => EventKind::HitSomeone,
+            EventKindDto::SuddenDesire => EventKind::SuddenDesire,
             EventKindDto::TempWork => EventKind::TempWork,
             EventKindDto::ExMessage => EventKind::ExMessage,
             EventKindDto::WeatherChange => EventKind::WeatherChange,
-            EventKindDto::PoliceEncounter => EventKind::PoliceEncounter,
-            EventKindDto::AnimalEncounter => EventKind::AnimalEncounter,
+            EventKindDto::GotHit => EventKind::GotHit,
+            EventKindDto::Breakup => EventKind::Breakup,
+            EventKindDto::WorkingOut => EventKind::WorkingOut,
+            EventKindDto::Reading => EventKind::Reading,
+            EventKindDto::Gaming => EventKind::Gaming,
+            EventKindDto::AwayFromPhone => EventKind::AwayFromPhone,
+            EventKindDto::Unwell => EventKind::Unwell,
+            EventKindDto::Irritable => EventKind::Irritable,
+            EventKindDto::Sick => EventKind::Sick,
+            EventKindDto::Period => EventKind::Period,
+            EventKindDto::Hospitalized => EventKind::Hospitalized,
+            EventKindDto::PostSurgery => EventKind::PostSurgery,
+            EventKindDto::BusinessTrip => EventKind::BusinessTrip,
+            EventKindDto::ShortTrip => EventKind::ShortTrip,
+            EventKindDto::LongTrip => EventKind::LongTrip,
+            EventKindDto::HometownVisit => EventKind::HometownVisit,
         }
     }
 }
@@ -63,11 +99,29 @@ impl From<EventKindDto> for EventKind {
 impl From<EventKind> for EventKindDto {
     fn from(k: EventKind) -> Self {
         match k {
+            EventKind::PoliceEncounter => EventKindDto::PoliceEncounter,
+            EventKind::AnimalEncounter => EventKindDto::AnimalEncounter,
+            EventKind::HitSomeone => EventKindDto::HitSomeone,
+            EventKind::SuddenDesire => EventKindDto::SuddenDesire,
             EventKind::TempWork => EventKindDto::TempWork,
             EventKind::ExMessage => EventKindDto::ExMessage,
             EventKind::WeatherChange => EventKindDto::WeatherChange,
-            EventKind::PoliceEncounter => EventKindDto::PoliceEncounter,
-            EventKind::AnimalEncounter => EventKindDto::AnimalEncounter,
+            EventKind::GotHit => EventKindDto::GotHit,
+            EventKind::Breakup => EventKindDto::Breakup,
+            EventKind::WorkingOut => EventKindDto::WorkingOut,
+            EventKind::Reading => EventKindDto::Reading,
+            EventKind::Gaming => EventKindDto::Gaming,
+            EventKind::AwayFromPhone => EventKindDto::AwayFromPhone,
+            EventKind::Unwell => EventKindDto::Unwell,
+            EventKind::Irritable => EventKindDto::Irritable,
+            EventKind::Sick => EventKindDto::Sick,
+            EventKind::Period => EventKindDto::Period,
+            EventKind::Hospitalized => EventKindDto::Hospitalized,
+            EventKind::PostSurgery => EventKindDto::PostSurgery,
+            EventKind::BusinessTrip => EventKindDto::BusinessTrip,
+            EventKind::ShortTrip => EventKindDto::ShortTrip,
+            EventKind::LongTrip => EventKindDto::LongTrip,
+            EventKind::HometownVisit => EventKindDto::HometownVisit,
         }
     }
 }
@@ -181,8 +235,16 @@ async fn draw_event(
     Extension(AuthUser(user_id)): Extension<AuthUser>,
     Json(req): Json<DrawEventRequest>,
 ) -> Result<Json<DrawEventResponse>, AppError> {
-    let roll = rand::thread_rng().gen::<f64>();
-    draw_event_at(&state, session_id, user_id, req, Utc::now(), roll)
+    // The generator is not `Send`: it is dropped before the first await.
+    let rolls = {
+        let mut rng = rand::thread_rng();
+        events::Rolls {
+            category: rng.gen(),
+            kind: rng.gen(),
+            duration: rng.gen(),
+        }
+    };
+    draw_event_at(&state, session_id, user_id, req, Utc::now(), rolls)
         .await
         .map(Json)
 }
@@ -197,14 +259,14 @@ fn invalid_payload(message: String) -> AppError {
     })
 }
 
-/// The handler with its clock and roll injected, for tests.
+/// The handler with its clock and rolls injected, for tests.
 pub(crate) async fn draw_event_at(
     state: &AppState,
     session_id: Uuid,
     user_id: Uuid,
     req: DrawEventRequest,
     now: DateTime<Utc>,
-    roll: f64,
+    rolls: events::Rolls,
 ) -> Result<DrawEventResponse, AppError> {
     validate_tier(req.tier.as_deref())?;
     let prompt_traits = validate_prompt_traits(req.prompt_traits.as_deref().unwrap_or(&[]))
@@ -239,24 +301,28 @@ pub(crate) async fn draw_event_at(
     affinity.apply_time_decay();
     affinity.refresh_endpoints(&state.config.affinity_tuning);
     let history: Vec<events::PastEvent> = chat_repo
-        .recent_events(instance_id, now - events::longest_cooldown())
+        .recent_events(instance_id, now - events::lookback())
         .await?
         .iter()
         .map(EventRecord::past)
         .collect();
-    let allowed: Vec<EventKind> = match &req.kinds {
+    let mut allowed: Vec<EventKind> = match &req.kinds {
         Some(kinds) => kinds.iter().map(|k| (*k).into()).collect(),
         None => EventKind::ALL.to_vec(),
     };
-    let Some(kind) = events::draw(
+    // Generation tells an event; away_from_phone has nothing to tell.
+    allowed.retain(|k| *k != EventKind::AwayFromPhone);
+    let traits = crate::prompt::persona_traits(&persona);
+    let Some(drawn) = events::draw(
         &DrawInput {
             now,
             needs,
             intimacy_rung: affinity.intimacy_rung(),
+            persona: &traits,
             history: &history,
             allowed: &allowed,
         },
-        roll,
+        rolls,
     ) else {
         return Ok(DrawEventResponse::none());
     };
@@ -294,7 +360,8 @@ pub(crate) async fn draw_event_at(
             now: &now_ctx,
             occasion: Occasion::Event {
                 event_key: key,
-                kind,
+                kind: drawn.kind,
+                lasts: drawn.lasts,
             },
             recall_query,
             since: now,
@@ -411,7 +478,7 @@ mod tests {
             user_id,
             req("k1", Some(vec![EventKindDto::TempWork])),
             now,
-            0.5,
+            rolls(0.5),
         )
         .await
         .unwrap();
@@ -464,7 +531,7 @@ mod tests {
             user_id,
             req("same", kinds.clone()),
             Utc::now(),
-            0.1,
+            rolls(0.1),
         )
         .await
         .unwrap();
@@ -474,7 +541,7 @@ mod tests {
             user_id,
             req("same", kinds),
             Utc::now(),
-            0.9,
+            rolls(0.9),
         )
         .await
         .unwrap();
@@ -499,7 +566,7 @@ mod tests {
             user_id,
             req("k1", Some(vec![EventKindDto::AnimalEncounter])),
             Utc::now(),
-            0.1,
+            rolls(0.1),
         )
         .await
         .unwrap();
@@ -510,7 +577,7 @@ mod tests {
             user_id,
             req("k2", None),
             Utc::now(),
-            0.1,
+            rolls(0.1),
         )
         .await
         .unwrap();
@@ -532,7 +599,7 @@ mod tests {
             user_id,
             req("k1", Some(vec![EventKindDto::PoliceEncounter])),
             Utc::now(),
-            0.1
+            rolls(0.1)
         )
         .await
         .unwrap()
@@ -544,7 +611,7 @@ mod tests {
             user_id,
             req("k2", None),
             Utc::now(),
-            0.1,
+            rolls(0.1),
         )
         .await
         .unwrap();
@@ -589,7 +656,7 @@ mod tests {
             user_id,
             req("k1", Some(vec![EventKindDto::WeatherChange])),
             Utc::now(),
-            0.1,
+            rolls(0.1),
         )
         .await
         .unwrap();
@@ -611,7 +678,7 @@ mod tests {
             user_id,
             req("k1", Some(vec![EventKindDto::ExMessage])),
             Utc::now(),
-            0.5,
+            rolls(0.5),
         )
         .await
         .unwrap();
@@ -632,7 +699,7 @@ mod tests {
             user_id,
             req("k1", Some(vec![])),
             Utc::now(),
-            0.5,
+            rolls(0.5),
         )
         .await
         .unwrap();
@@ -653,7 +720,7 @@ mod tests {
             user_id,
             req("k1", Some(vec![EventKindDto::TempWork])),
             Utc::now(),
-            0.5,
+            rolls(0.5),
         )
         .await
         .unwrap();
@@ -667,10 +734,17 @@ mod tests {
         let (_, session_id) = setup(&pool, user_id).await;
         let state = test_state(pool.clone());
         for key in ["", "has space", &"x".repeat(129)] {
-            let err = draw_event_at(&state, session_id, user_id, req(key, None), Utc::now(), 0.5)
-                .await
-                .err()
-                .unwrap_or_else(|| panic!("{key:?} accepted"));
+            let err = draw_event_at(
+                &state,
+                session_id,
+                user_id,
+                req(key, None),
+                Utc::now(),
+                rolls(0.5),
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{key:?} accepted"));
             assert!(
                 matches!(
                     err,
@@ -699,7 +773,7 @@ mod tests {
             Uuid::new_v4(),
             req("k", None),
             Utc::now(),
-            0.5,
+            rolls(0.5),
         )
         .await
         .err()
@@ -711,12 +785,84 @@ mod tests {
             user_id,
             req("k", None),
             Utc::now(),
-            0.5,
+            rolls(0.5),
         )
         .await
         .err()
         .unwrap();
         assert_eq!(status(missing), StatusCode::NOT_FOUND);
+    }
+
+    fn rolls(r: f64) -> events::Rolls {
+        events::Rolls {
+            category: r,
+            kind: r,
+            duration: r,
+        }
+    }
+
+    async fn set_art(pool: &PgPool, instance_id: Uuid, art: serde_json::Value) {
+        sqlx::query(
+            "UPDATE engine.persona_genomes SET art_metadata = $2 \
+             WHERE id = (SELECT genome_id FROM engine.persona_instances WHERE id = $1)",
+        )
+        .bind(instance_id)
+        .bind(art)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_drawn_length_sets_when_the_event_ends(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "我出发去旅行啦").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            req("k1", Some(vec![EventKindDto::LongTrip])),
+            Utc::now(),
+            events::Rolls {
+                category: 0.5,
+                kind: 0.5,
+                duration: 0.0,
+            },
+        )
+        .await
+        .unwrap();
+        let e = out.event.expect("a trip");
+        assert_eq!(e.kind, EventKindDto::LongTrip);
+        assert_eq!((e.ends_at - e.started_at).num_hours(), 72);
+        let c = calls(&mock).await;
+        let last = c[0]["messages"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(
+            last["content"],
+            json!("（你刚出发去长途旅行，要去 3 天。）")
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn period_is_drawn_only_for_a_female_persona(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (instance_id, session_id) = setup(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "那个来了，肚子好痛").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let only = || req("k", Some(vec![EventKindDto::Period]));
+        let out = draw_event_at(&state, session_id, user_id, only(), Utc::now(), rolls(0.5))
+            .await
+            .unwrap();
+        assert!(out.event.is_none());
+        assert!(calls(&mock).await.is_empty());
+        set_art(&pool, instance_id, json!({"gender": "female"})).await;
+        let out = draw_event_at(&state, session_id, user_id, only(), Utc::now(), rolls(0.5))
+            .await
+            .unwrap();
+        assert_eq!(out.event.map(|e| e.kind), Some(EventKindDto::Period));
     }
 
     #[test]
