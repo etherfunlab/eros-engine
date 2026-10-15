@@ -4450,11 +4450,11 @@ pub(crate) fn run_stream_with(
         } else {
             None
         };
-        // The event under way at this turn, anchored at its own row so a
-        // re-driven turn sees the same one (spec 2026-10-13-life-events-
-        // design.md §6). Independent of the judge.
-        let current_event = chat_repo
-            .current_event(
+        // The events under way at this turn, anchored at its own row so a
+        // re-driven turn sees the same ones (spec 2026-10-15-life-events-v2-
+        // design.md §6.4). Independent of the judge.
+        let current = eros_engine_store::events::EventRepo { pool: &state.pool }
+            .current(
                 user_msg.instance_id,
                 Some(user_msg.user_message_id),
                 chrono::Utc::now(),
@@ -4462,14 +4462,14 @@ pub(crate) fn run_stream_with(
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!("stream: event read failed: {e}");
-                None
+                eros_engine_store::events::CurrentEvents {
+                    foreground: None,
+                    background: None,
+                    at: chrono::Utc::now(),
+                }
             });
-        let event_judge = current_event
-            .as_ref()
-            .map(|c| crate::prompt::event_judge_text(&c.event, c.at));
-        let event_reply = current_event
-            .as_ref()
-            .map(|c| crate::prompt::event_reply_text(&c.event, c.at));
+        let event_judge = crate::prompt::events_judge_text(&current);
+        let event_reply = crate::prompt::events_reply_text(&current);
         // ── PDE decision (judge-first) ────────────────────────────────────────
         // The judge runs before vision/input-filter/chat so a `ghost` verdict
         // short-circuits all of them. Feature-off skips the judge (rule
@@ -21545,6 +21545,37 @@ data: [DONE]\n\n"
         verdict: Option<serde_json::Value>,
         turn_mins_ago: i32,
     ) -> NeedsTurn {
+        run_event_turn(pool, rows, &[], &[], verdict, turn_mins_ago).await
+    }
+
+    /// An event seeded for a turn: its kind, the minutes before now it
+    /// started and the minutes after now it ends (negative: it already ended).
+    struct EventSeed {
+        kind: &'static str,
+        started_mins_ago: i32,
+        ends_in_mins: i32,
+    }
+
+    fn ev(kind: &'static str, started_mins_ago: i32, ends_in_mins: i32) -> EventSeed {
+        EventSeed {
+            kind,
+            started_mins_ago,
+            ends_in_mins,
+        }
+    }
+
+    /// A turn with life events and ghosted user rows seeded. The events are
+    /// written in a second session of the same persona: an event belongs to
+    /// the persona, not to the session it was drawn in. `ghosted_mins_ago`:
+    /// user rows in the turn's session the persona ghosted, minutes before now.
+    async fn run_event_turn(
+        pool: &PgPool,
+        rows: &[SeedRow],
+        events: &[EventSeed],
+        ghosted_mins_ago: &[i32],
+        verdict: Option<serde_json::Value>,
+        turn_mins_ago: i32,
+    ) -> NeedsTurn {
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
         use futures_util::StreamExt;
         use wiremock::matchers::{body_string_contains, path as wm_path};
@@ -21605,6 +21636,42 @@ data: [DONE]\n\n"
             .bind(r.action)
             .bind(&r.metadata)
             .bind(r.mins_ago)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        let elsewhere: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        for (i, e) in events.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO engine.persona_events \
+                   (instance_id, session_id, event_key, kind, started_at, ends_at) \
+                 VALUES ($1, $2, $3, $4, now() - make_interval(mins => $5), \
+                         now() + make_interval(mins => $6))",
+            )
+            .bind(instance_id)
+            .bind(elsewhere)
+            .bind(format!("seed-{i}"))
+            .bind(e.kind)
+            .bind(e.started_mins_ago)
+            .bind(e.ends_in_mins)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        for m in ghosted_mins_ago {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content, ghost_decision, sent_at) \
+                 VALUES ($1, 'user', 'prior', true, now() - make_interval(mins => $2))",
+            )
+            .bind(session_id)
+            .bind(*m)
             .execute(pool)
             .await
             .unwrap();
@@ -21852,25 +21919,15 @@ data: [DONE]\n\n"
         assert!(chat.contains("- 此刻的需要：饿了"), "{chat}");
     }
 
-    /// An event row seeded `started_mins_ago` before now, ending
-    /// `ends_in_mins` after now.
-    fn event_seed(kind: &str, started_mins_ago: i32, ends_in_mins: i64) -> SeedRow {
-        SeedRow {
-            role: "assistant",
-            action: Some("proactive"),
-            metadata: serde_json::json!({"proactive": "event", "event_key": kind,
-                "event": {"kind": kind,
-                    "ends_at": (chrono::Utc::now() + chrono::Duration::minutes(ends_in_mins)).to_rfc3339()}}),
-            mins_ago: started_mins_ago,
-        }
-    }
-
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn a_turn_during_an_event_tells_the_judge_and_the_reply(pool: PgPool) {
-        let t = run_seeded_turn(
+        let t = run_event_turn(
             &pool,
-            &[event_seed("temp_work", 120, 120)],
+            &[],
+            &[ev("temp_work", 120, 120)],
+            &[],
             Some(serde_json::json!({"action": "reply_text", "inner_state": ""})),
+            0,
         )
         .await;
         let reqs = t.mock.received_requests().await.unwrap();
@@ -21884,10 +21941,13 @@ data: [DONE]\n\n"
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn a_turn_after_the_event_ended_hears_nothing_of_it(pool: PgPool) {
-        let t = run_seeded_turn(
+        let t = run_event_turn(
             &pool,
-            &[event_seed("animal_encounter", 70, -10)],
+            &[],
+            &[ev("animal_encounter", 70, -10)],
+            &[],
             Some(serde_json::json!({"action": "reply_text", "inner_state": ""})),
+            0,
         )
         .await;
         let reqs = t.mock.received_requests().await.unwrap();
@@ -21897,10 +21957,13 @@ data: [DONE]\n\n"
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn an_event_that_started_after_the_turn_is_not_shown(pool: PgPool) {
-        let t = run_seeded_turn(
+        let t = run_event_turn(
             &pool,
-            &[event_seed("weather_change", -5, 240)],
+            &[],
+            &[ev("weather_change", -5, 240)],
+            &[],
             Some(serde_json::json!({"action": "reply_text", "inner_state": ""})),
+            0,
         )
         .await;
         let reqs = t.mock.received_requests().await.unwrap();
@@ -21914,12 +21977,14 @@ data: [DONE]\n\n"
         // before it and ended 25 minutes after it: under way at the turn.
         // The weather change began after the turn and is still going now:
         // not yet there when the turn was sent.
-        let t = run_seeded_turn_at(
+        let t = run_event_turn(
             &pool,
+            &[],
             &[
-                event_seed("police_encounter", 60, -5),
-                event_seed("weather_change", 10, 230),
+                ev("police_encounter", 60, -5),
+                ev("weather_change", 10, 230),
             ],
+            &[],
             Some(serde_json::json!({"action": "reply_text", "inner_state": ""})),
             30,
         )
@@ -21934,12 +21999,38 @@ data: [DONE]\n\n"
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn without_the_judge_the_reply_still_hears_of_the_event(pool: PgPool) {
-        let t = run_seeded_turn(&pool, &[event_seed("police_encounter", 10, 50)], None).await;
+        let t = run_event_turn(&pool, &[], &[ev("police_encounter", 10, 50)], &[], None, 0).await;
         let chat = chat_request_body(&t.mock.received_requests().await.unwrap());
         assert!(
             chat.contains("- 正在经历：被警察拦下问话（不到 1 小时后结束）"),
             "{chat}"
         );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_turn_during_a_trip_hears_both_events(pool: PgPool) {
+        let t = run_event_turn(
+            &pool,
+            &[],
+            &[
+                ev("business_trip", 600, 840),
+                ev("animal_encounter", 20, 40),
+            ],
+            &[],
+            Some(serde_json::json!({"action": "reply_text", "inner_state": ""})),
+            0,
+        )
+        .await;
+        let reqs = t.mock.received_requests().await.unwrap();
+        let judge = judge_request(&reqs);
+        assert!(
+            judge.contains(
+                "[近期事件] 出差（10 小时前开始，约 14 小时后结束）；路上遇到小动物（不到 1 小时前开始，不到 1 小时后结束）\\n"
+            ),
+            "{judge}"
+        );
+        assert!(chat_request_body(&reqs)
+            .contains("- 正在经历：出差（约 14 小时后结束）；路上遇到小动物（不到 1 小时后结束）"));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

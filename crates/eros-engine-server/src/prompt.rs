@@ -878,26 +878,34 @@ fn ends_text(ends_in: chrono::Duration) -> String {
     }
 }
 
-/// The event under way as the judge reads it:
-/// 「临时接到工作（1 小时前开始，约 3 小时后结束）」.
-pub(crate) fn event_judge_text(
-    e: &eros_engine_store::chat::EventRecord,
-    at: chrono::DateTime<chrono::Utc>,
-) -> String {
-    format!(
-        "{}（{}前开始，{}）",
-        event_label(e.kind),
-        span_text(at - e.started_at),
-        ends_text(e.ends_at - at)
-    )
+/// `[近期事件]` (spec 2026-10-15-life-events-v2-design.md §8.2): the
+/// background, then the foreground, each
+/// 「临时接到工作（1 小时前开始，约 3 小时后结束）」; `None` when neither.
+pub(crate) fn events_judge_text(c: &eros_engine_store::events::CurrentEvents) -> Option<String> {
+    let items: Vec<String> = [c.background.as_ref(), c.foreground.as_ref()]
+        .into_iter()
+        .flatten()
+        .map(|e| {
+            format!(
+                "{}（{}前开始，{}）",
+                event_label(e.kind),
+                span_text(c.at - e.started_at),
+                ends_text(e.ends_at - c.at)
+            )
+        })
+        .collect();
+    (!items.is_empty()).then(|| items.join("；"))
 }
 
-/// The event under way as the reply reads it: 「临时接到工作（约 3 小时后结束）」.
-pub(crate) fn event_reply_text(
-    e: &eros_engine_store::chat::EventRecord,
-    at: chrono::DateTime<chrono::Utc>,
-) -> String {
-    format!("{}（{}）", event_label(e.kind), ends_text(e.ends_at - at))
+/// `正在经历` (§8.2): the background, then the foreground, each
+/// 「临时接到工作（约 3 小时后结束）」; `None` when neither.
+pub(crate) fn events_reply_text(c: &eros_engine_store::events::CurrentEvents) -> Option<String> {
+    let items: Vec<String> = [c.background.as_ref(), c.foreground.as_ref()]
+        .into_iter()
+        .flatten()
+        .map(|e| format!("{}（{}）", event_label(e.kind), ends_text(e.ends_at - c.at)))
+        .collect();
+    (!items.is_empty()).then(|| items.join("；"))
 }
 
 /// Fold the last turns' `metadata` (newest first) into the active effects:
@@ -1241,8 +1249,8 @@ pub fn build_prompt(
     // (spec 2026-10-13-persona-needs-design.md §6.2). `None` or blank ⇒ no
     // line.
     needs: Option<&str>,
-    // The event under way, rendered by `event_reply_text` (spec
-    // 2026-10-13-life-events-design.md §6). `None` or blank ⇒ no line.
+    // The events under way, rendered by `events_reply_text` (spec
+    // 2026-10-15-life-events-v2-design.md §8.2). `None` or blank ⇒ no line.
     event: Option<&str>,
 ) -> String {
     let name = persona.genome.name.as_str();
@@ -3748,52 +3756,105 @@ mod tests {
         started_mins_ago: i64,
         ends_in_mins: i64,
     ) -> (
-        eros_engine_store::chat::EventRecord,
+        eros_engine_store::events::EventRecord,
         chrono::DateTime<chrono::Utc>,
     ) {
         let at: chrono::DateTime<chrono::Utc> = "2026-10-13T12:00:00Z".parse().unwrap();
         (
-            eros_engine_store::chat::EventRecord {
-                message_id: Uuid::new_v4(),
+            eros_engine_store::events::EventRecord {
+                id: Uuid::new_v4(),
                 kind,
+                session_id: None,
                 started_at: at - chrono::Duration::minutes(started_mins_ago),
                 ends_at: at + chrono::Duration::minutes(ends_in_mins),
+                message_id: None,
             },
             at,
         )
     }
 
+    fn only(
+        (e, at): (
+            eros_engine_store::events::EventRecord,
+            chrono::DateTime<chrono::Utc>,
+        ),
+    ) -> eros_engine_store::events::CurrentEvents {
+        let (foreground, background) = if e.kind.is_background() {
+            (None, Some(e))
+        } else {
+            (Some(e), None)
+        };
+        eros_engine_store::events::CurrentEvents {
+            foreground,
+            background,
+            at,
+        }
+    }
+
     #[test]
     fn event_texts_name_the_event_and_its_hours() {
         use eros_engine_core::events::EventKind;
-        let (e, at) = event_at(EventKind::TempWork, 120, 120);
+        let c = only(event_at(EventKind::TempWork, 120, 120));
         assert_eq!(
-            event_judge_text(&e, at),
+            events_judge_text(&c).unwrap(),
             "临时接到工作（2 小时前开始，约 2 小时后结束）"
         );
-        assert_eq!(event_reply_text(&e, at), "临时接到工作（约 2 小时后结束）");
-        let (e, at) = event_at(EventKind::AnimalEncounter, 20, 40);
         assert_eq!(
-            event_judge_text(&e, at),
+            events_reply_text(&c).unwrap(),
+            "临时接到工作（约 2 小时后结束）"
+        );
+        let c = only(event_at(EventKind::AnimalEncounter, 20, 40));
+        assert_eq!(
+            events_judge_text(&c).unwrap(),
             "路上遇到小动物（不到 1 小时前开始，不到 1 小时后结束）"
         );
         assert_eq!(
-            event_reply_text(&e, at),
+            events_reply_text(&c).unwrap(),
             "路上遇到小动物（不到 1 小时后结束）"
         );
         // Rounded to whole hours: 89 minutes → 1, 151 minutes → 3.
-        let (e, at) = event_at(EventKind::WeatherChange, 89, 151);
+        let c = only(event_at(EventKind::WeatherChange, 89, 151));
         assert_eq!(
-            event_judge_text(&e, at),
+            events_judge_text(&c).unwrap(),
             "天气突然变了（1 小时前开始，约 3 小时后结束）"
         );
         for (kind, label) in [
             (EventKind::ExMessage, "前任发来消息"),
             (EventKind::PoliceEncounter, "被警察拦下问话"),
         ] {
-            let (e, at) = event_at(kind, 61, 61);
-            assert!(event_reply_text(&e, at).starts_with(label), "{kind:?}");
+            let c = only(event_at(kind, 61, 61));
+            assert!(
+                events_reply_text(&c).unwrap().starts_with(label),
+                "{kind:?}"
+            );
         }
+    }
+
+    #[test]
+    fn both_events_render_the_background_first() {
+        use eros_engine_core::events::EventKind;
+        let (trip, at) = event_at(EventKind::LongTrip, 2 * 24 * 60, 3 * 24 * 60);
+        let (reading, _) = event_at(EventKind::Reading, 30, 90);
+        let c = eros_engine_store::events::CurrentEvents {
+            foreground: Some(reading),
+            background: Some(trip),
+            at,
+        };
+        assert_eq!(
+            events_judge_text(&c).unwrap(),
+            "长途旅游（2 天前开始，约 3 天后结束）；在看书（不到 1 小时前开始，约 2 小时后结束）"
+        );
+        assert_eq!(
+            events_reply_text(&c).unwrap(),
+            "长途旅游（约 3 天后结束）；在看书（约 2 小时后结束）"
+        );
+        let nothing = eros_engine_store::events::CurrentEvents {
+            foreground: None,
+            background: None,
+            at,
+        };
+        assert_eq!(events_judge_text(&nothing), None);
+        assert_eq!(events_reply_text(&nothing), None);
     }
 
     #[test]

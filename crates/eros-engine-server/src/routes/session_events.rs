@@ -16,7 +16,8 @@ use uuid::Uuid;
 use eros_engine_core::events::{self, DrawInput, EventKind};
 use eros_engine_core::scope::MemoryScope;
 use eros_engine_store::affinity::AffinityRepo;
-use eros_engine_store::chat::{ChatMessage, ChatRepo, EventRecord};
+use eros_engine_store::chat::ChatRepo;
+use eros_engine_store::events::EventRepo;
 
 use crate::auth::middleware::AuthUser;
 use crate::error::{AppError, StreamPreError};
@@ -127,17 +128,17 @@ impl From<EventKind> for EventKindDto {
 }
 
 /// A life event: what happened, when it started and ends, and the message
-/// that told it.
+/// that told it (`null` for an event that is never told).
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct EventView {
     pub kind: EventKindDto,
     pub started_at: DateTime<Utc>,
     pub ends_at: DateTime<Utc>,
-    pub message_id: Uuid,
+    pub message_id: Option<Uuid>,
 }
 
-impl From<&EventRecord> for EventView {
-    fn from(e: &EventRecord) -> Self {
+impl From<&eros_engine_store::events::EventRecord> for EventView {
+    fn from(e: &eros_engine_store::events::EventRecord) -> Self {
         Self {
             kind: e.kind.into(),
             started_at: e.started_at,
@@ -191,16 +192,33 @@ impl DrawEventResponse {
             message: None,
         }
     }
+}
 
-    fn from_row(row: Option<ChatMessage>) -> Self {
-        match row.as_ref().and_then(EventRecord::from_message) {
-            Some(e) => Self {
-                event: Some(EventView::from(&e)),
-                message: row.map(Into::into),
-            },
-            None => Self::none(),
+/// The event written under `event_key` in this session, with the message
+/// that told it; nulls when there is none.
+async fn respond(
+    state: &AppState,
+    session_id: Uuid,
+    event_key: &str,
+) -> Result<DrawEventResponse, AppError> {
+    let Some(event) = EventRepo { pool: &state.pool }
+        .by_key(session_id, event_key)
+        .await?
+    else {
+        return Ok(DrawEventResponse::none());
+    };
+    let message = match event.message_id {
+        Some(id) => {
+            ChatRepo { pool: &state.pool }
+                .message_by_id_in_session(session_id, id)
+                .await?
         }
-    }
+        None => None,
+    };
+    Ok(DrawEventResponse {
+        event: Some(EventView::from(&event)),
+        message: message.map(Into::into),
+    })
 }
 
 /// Ask for something to happen in the persona's day.
@@ -286,8 +304,9 @@ pub(crate) async fn draw_event_at(
     let (_session, persona, instance_id) = resolve_text_turn(state, session_id, user_id).await?;
 
     let chat_repo = ChatRepo { pool: &state.pool };
-    if let Some(row) = chat_repo.event_message(session_id, &key).await? {
-        return Ok(DrawEventResponse::from_row(Some(row)));
+    let event_repo = EventRepo { pool: &state.pool };
+    if event_repo.by_key(session_id, &key).await?.is_some() {
+        return respond(state, session_id, &key).await;
     }
 
     let needs = if state.model_config.pde_enabled() {
@@ -300,11 +319,11 @@ pub(crate) async fn draw_event_at(
         .await?;
     affinity.apply_time_decay();
     affinity.refresh_endpoints(&state.config.affinity_tuning);
-    let history: Vec<events::PastEvent> = chat_repo
-        .recent_events(instance_id, now - events::lookback())
+    let history: Vec<events::PastEvent> = event_repo
+        .recent(instance_id, now - events::lookback())
         .await?
         .iter()
-        .map(EventRecord::past)
+        .map(|e| e.past())
         .collect();
     let mut allowed: Vec<EventKind> = match &req.kinds {
         Some(kinds) => kinds.iter().map(|k| (*k).into()).collect(),
@@ -350,7 +369,7 @@ pub(crate) async fn draw_event_at(
         .map(recall_query_text)
         .unwrap_or_default();
     let now_ctx = NowContext::for_user(&locale, now);
-    let row = greet(
+    greet(
         state,
         Greeting {
             session_id,
@@ -359,7 +378,7 @@ pub(crate) async fn draw_event_at(
             persona: &persona,
             now: &now_ctx,
             occasion: Occasion::Event {
-                event_key: key,
+                event_key: key.clone(),
                 kind: drawn.kind,
                 lasts: drawn.lasts,
             },
@@ -378,7 +397,7 @@ pub(crate) async fn draw_event_at(
         },
     )
     .await?;
-    Ok(DrawEventResponse::from_row(row))
+    respond(state, session_id, &key).await
 }
 
 pub fn router() -> OpenApiRouter<AppState> {
@@ -485,7 +504,7 @@ mod tests {
         let e = out.event.expect("an event");
         let m = out.message.expect("a message");
         assert_eq!(e.kind, EventKindDto::TempWork);
-        assert_eq!(e.message_id, m.message_id);
+        assert_eq!(e.message_id, Some(m.message_id));
         assert_eq!(m.content, "刚被老板叫去加班，晚点聊");
         assert_eq!(
             m.occasion,
@@ -501,9 +520,15 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(meta["proactive"], json!("event"));
-        assert_eq!(meta["event_key"], json!("k1"));
-        assert_eq!(meta["event"]["kind"], json!("temp_work"));
-        assert!(meta["event"]["ends_at"].is_string());
+        assert!(meta.get("event").is_none() && meta.get("event_key").is_none());
+        let (key, kind): (String, String) = sqlx::query_as(
+            "SELECT event_key, kind FROM engine.persona_events WHERE message_id = $1",
+        )
+        .bind(m.message_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((key.as_str(), kind.as_str()), ("k1", "temp_work"));
         assert_eq!(meta["user_timezone"], json!("Asia/Taipei"));
 
         let c = calls(&mock).await;
@@ -628,25 +653,21 @@ mod tests {
         // A weather change that started 5 hours ago and ended an hour ago:
         // over, but still inside its 8-hour cooldown.
         let started = Utc::now() - chrono::Duration::hours(5);
-        let repo = ChatRepo { pool: &pool };
-        repo.insert_event_message(
-            instance_id,
-            session_id,
-            started,
-            &eros_engine_store::chat::ProactiveInsert {
-                id: Uuid::new_v4(),
-                content: "下雨了".into(),
-                generation_id: None,
-                metadata: json!({"proactive": "event", "event_key": "old",
-                    "event": {"kind": "weather_change",
-                              "ends_at": (started + chrono::Duration::hours(4)).to_rfc3339()}}),
-                llm_attempts: None,
-                gateway_errors: None,
-            },
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        eros_engine_store::events::EventRepo { pool: &pool }
+            .insert(
+                &eros_engine_store::events::NewEvent {
+                    instance_id,
+                    session_id,
+                    event_key: "old",
+                    kind: EventKind::WeatherChange,
+                    started_at: started,
+                    ends_at: started + chrono::Duration::hours(4),
+                },
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
         let mock = MockServer::start().await;
         mount_companion(&mock, "又下雨了").await;
         let state = with_companion(test_state(pool.clone()), &mock.uri());

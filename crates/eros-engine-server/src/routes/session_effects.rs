@@ -144,10 +144,12 @@ async fn get_effects(
     } else {
         None
     };
-    let event = eros_engine_store::chat::ChatRepo { pool: &state.pool }
-        .current_event(instance_id, None, chrono::Utc::now())
+    let event = eros_engine_store::events::EventRepo { pool: &state.pool }
+        .current(instance_id, None, chrono::Utc::now())
         .await?
-        .map(|c| crate::routes::session_events::EventView::from(&c.event));
+        .foreground
+        .as_ref()
+        .map(crate::routes::session_events::EventView::from);
     Ok(Json(EffectsResponse {
         effects: effects.iter().map(EffectView::from).collect(),
         needs: needs.as_ref().map(NeedsView::from),
@@ -261,20 +263,24 @@ mod tests {
         let session_id = seed_session(&pool, owner, instance_id).await;
         let started = chrono::Utc::now() - chrono::Duration::minutes(30);
         let ends = started + chrono::Duration::hours(4);
-        let row = eros_engine_store::chat::ChatRepo { pool: &pool }
-            .insert_event_message(
-                instance_id,
-                session_id,
-                started,
-                &eros_engine_store::chat::ProactiveInsert {
+        let written = eros_engine_store::events::EventRepo { pool: &pool }
+            .insert(
+                &eros_engine_store::events::NewEvent {
+                    instance_id,
+                    session_id,
+                    event_key: "k1",
+                    kind: eros_engine_core::events::EventKind::TempWork,
+                    started_at: started,
+                    ends_at: ends,
+                },
+                Some(&eros_engine_store::chat::ProactiveInsert {
                     id: Uuid::new_v4(),
                     content: "临时被叫去加班".into(),
                     generation_id: None,
-                    metadata: json!({"proactive": "event", "event_key": "k1",
-                        "event": {"kind": "temp_work", "ends_at": ends.to_rfc3339()}}),
+                    metadata: json!({"proactive": "event"}),
                     llm_attempts: None,
                     gateway_errors: None,
-                },
+                }),
             )
             .await
             .unwrap()
@@ -282,7 +288,10 @@ mod tests {
         let (s, body) = get(pool, session_id, owner).await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(body["event"]["kind"], json!("temp_work"));
-        assert_eq!(body["event"]["message_id"], json!(row.id));
+        assert_eq!(
+            body["event"]["message_id"],
+            json!(written.message.unwrap().id)
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

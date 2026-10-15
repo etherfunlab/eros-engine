@@ -7,14 +7,16 @@
 //! post-process.
 //!
 //! A greeting or opener is checked against its `since` cutoff and yields to
-//! any message that landed at or after it. An event is written at the moment its message
-//! is generated, its `ends_at` counted from that instant, and it does not
-//! yield to user messages or openers; only an event already under way for the
-//! persona, or one with the same key in the session, blocks it.
+//! any message that landed at or after it. An event is written at the moment
+//! its message is generated, its `ends_at` counted from that instant, and it
+//! does not yield to user messages or openers; only an event under way for the
+//! persona that it must wait for (a foreground waits for a foreground, a
+//! background for any event), or one with the same key in the session, blocks
+//! it. The event is a row of `engine.persona_events`, written with its message.
 //!
 //! Specs: docs/superpowers/specs/2026-09-26-user-locale-and-holiday-greeting-design.md §6,
 //! docs/superpowers/specs/2026-10-03-open-occasions-design.md §5–§6,
-//! docs/superpowers/specs/2026-10-13-life-events-design.md §5
+//! docs/superpowers/specs/2026-10-15-life-events-v2-design.md §6
 
 use chrono::{DateTime, NaiveDate, Utc};
 use eros_engine_core::events::EventKind;
@@ -170,10 +172,12 @@ pub(crate) struct Greeting<'a> {
 /// Generate and persist the message. `Ok(None)`: the model returned a blank
 /// reply and nothing was written; or, for a greeting or opener, the insert
 /// yielded to a message that landed first; or, for an event, another event
-/// under way for the persona blocked the insert. When a concurrent call for
-/// the same local date, `open_key` or `event_key` won the insert, returns
-/// that call's row. An event is stamped with one instant taken after
-/// generation: its row's `sent_at` and the start of its `ends_at` span.
+/// under way for the persona blocked the insert, or a concurrent call with
+/// the same `event_key` won it (the caller reads the event by key). When a
+/// concurrent call for the same local date or `open_key` won the insert,
+/// returns that call's row. An event is stamped with one instant taken after
+/// generation: its message's `sent_at`, its `started_at` and the start of its
+/// `ends_at` span.
 pub(crate) async fn greet(
     state: &AppState,
     g: Greeting<'_>,
@@ -307,18 +311,7 @@ pub(crate) async fn greet(
         Occasion::FirstMeet { open_key } | Occasion::JustOpened { open_key } => {
             metadata.insert("open_key".into(), open_key.as_str().into());
         }
-        Occasion::Event {
-            event_key,
-            kind,
-            lasts,
-        } => {
-            let ends_at = event_at + *lasts;
-            metadata.insert("event_key".into(), event_key.as_str().into());
-            metadata.insert(
-                "event".into(),
-                serde_json::json!({"kind": kind.as_str(), "ends_at": ends_at.to_rfc3339()}),
-            );
-        }
+        Occasion::Event { .. } => {}
     }
     metadata.insert("prompt_traits".into(), serde_json::json!(injected_tags));
     metadata.insert(
@@ -363,13 +356,24 @@ pub(crate) async fn greet(
                 None => Ok(chat_repo.open_message(g.session_id, open_key).await?),
             }
         }
-        Occasion::Event { event_key, .. } => match chat_repo
-            .insert_event_message(g.instance_id, g.session_id, event_at, &row)
+        Occasion::Event {
+            event_key,
+            kind,
+            lasts,
+        } => Ok(eros_engine_store::events::EventRepo { pool: &state.pool }
+            .insert(
+                &eros_engine_store::events::NewEvent {
+                    instance_id: g.instance_id,
+                    session_id: g.session_id,
+                    event_key,
+                    kind: *kind,
+                    started_at: event_at,
+                    ends_at: event_at + *lasts,
+                },
+                Some(&row),
+            )
             .await?
-        {
-            Some(written) => Ok(Some(written)),
-            None => Ok(chat_repo.event_message(g.session_id, event_key).await?),
-        },
+            .and_then(|i| i.message)),
     }
 }
 
