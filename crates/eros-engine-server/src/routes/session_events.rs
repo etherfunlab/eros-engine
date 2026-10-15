@@ -128,11 +128,35 @@ impl From<EventKind> for EventKindDto {
     }
 }
 
+/// A life event's category: `short` and `mid` are incidents, `body` and
+/// `trip` backgrounds that last days.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EventCategoryDto {
+    Short,
+    Mid,
+    Body,
+    Trip,
+}
+
+impl From<eros_engine_core::events::EventCategory> for EventCategoryDto {
+    fn from(c: eros_engine_core::events::EventCategory) -> Self {
+        use eros_engine_core::events::EventCategory;
+        match c {
+            EventCategory::Short => EventCategoryDto::Short,
+            EventCategory::Mid => EventCategoryDto::Mid,
+            EventCategory::Body => EventCategoryDto::Body,
+            EventCategory::Trip => EventCategoryDto::Trip,
+        }
+    }
+}
+
 /// A life event: what happened, when it started and ends, and the message
 /// that told it (`null` for an event that is never told).
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct EventView {
     pub kind: EventKindDto,
+    pub category: EventCategoryDto,
     pub started_at: DateTime<Utc>,
     pub ends_at: DateTime<Utc>,
     pub message_id: Option<Uuid>,
@@ -142,6 +166,7 @@ impl From<&eros_engine_store::events::EventRecord> for EventView {
     fn from(e: &eros_engine_store::events::EventRecord) -> Self {
         Self {
             kind: e.kind.into(),
+            category: e.kind.category().into(),
             started_at: e.started_at,
             ends_at: e.ends_at,
             message_id: e.message_id,
@@ -530,6 +555,7 @@ mod tests {
         let e = out.event.expect("an event");
         let m = out.message.expect("a message");
         assert_eq!(e.kind, EventKindDto::TempWork);
+        assert_eq!(e.category, EventCategoryDto::Mid);
         assert_eq!(e.message_id, Some(m.message_id));
         assert_eq!(m.content, "刚被老板叫去加班，晚点聊");
         assert_eq!(
@@ -883,6 +909,7 @@ mod tests {
         .unwrap();
         let e = out.event.expect("a trip");
         assert_eq!(e.kind, EventKindDto::LongTrip);
+        assert_eq!(e.category, EventCategoryDto::Trip);
         assert_eq!((e.ends_at - e.started_at).num_hours(), 72);
         let c = calls(&mock).await;
         let last = c[0]["messages"].as_array().unwrap().last().unwrap().clone();

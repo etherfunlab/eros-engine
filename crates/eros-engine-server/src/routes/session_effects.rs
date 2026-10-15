@@ -111,8 +111,11 @@ pub struct EffectsResponse {
     /// The persona's needs carried to now; `null` with no rating, or when the
     /// deployment runs no LLM judge.
     pub needs: Option<NeedsView>,
-    /// The persona's event under way now, or `null`.
+    /// The persona's foreground event under way now, or `null`.
     pub event: Option<crate::routes::session_events::EventView>,
+    /// The persona's background under way now (a trip, an illness), or
+    /// `null`.
+    pub background_event: Option<crate::routes::session_events::EventView>,
 }
 
 /// The persona's lingering state from accepted gives, her needs and the event
@@ -144,16 +147,18 @@ async fn get_effects(
     } else {
         None
     };
-    let event = eros_engine_store::events::EventRepo { pool: &state.pool }
+    let current = eros_engine_store::events::EventRepo { pool: &state.pool }
         .current(instance_id, None, chrono::Utc::now())
-        .await?
-        .foreground
-        .as_ref()
-        .map(crate::routes::session_events::EventView::from);
+        .await?;
+    let view = |e: &Option<eros_engine_store::events::EventRecord>| {
+        e.as_ref()
+            .map(crate::routes::session_events::EventView::from)
+    };
     Ok(Json(EffectsResponse {
         effects: effects.iter().map(EffectView::from).collect(),
         needs: needs.as_ref().map(NeedsView::from),
-        event,
+        event: view(&current.foreground),
+        background_event: view(&current.background),
     }))
 }
 
@@ -242,7 +247,7 @@ mod tests {
             json!({"effects": [
                 {"item": "cigarette", "quantity": 1, "level": 3, "phase": "peak", "step": 1, "steps": 1},
                 {"item": "alcohol", "name": "威士忌", "quantity": 3, "level": 3, "phase": "peak", "step": 3, "steps": 3},
-            ], "needs": null, "event": null})
+            ], "needs": null, "event": null, "background_event": null})
         );
     }
 
@@ -253,7 +258,10 @@ mod tests {
         let session_id = seed_session(&pool, owner, instance_id).await;
         let (s, body) = get(pool, session_id, owner).await;
         assert_eq!(s, StatusCode::OK);
-        assert_eq!(body, json!({"effects": [], "needs": null, "event": null}));
+        assert_eq!(
+            body,
+            json!({"effects": [], "needs": null, "event": null, "background_event": null})
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -292,6 +300,52 @@ mod tests {
             body["event"]["message_id"],
             json!(written.message.unwrap().id)
         );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_background_and_the_foreground_are_listed(pool: sqlx::PgPool) {
+        use eros_engine_core::events::EventKind;
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, owner).await;
+        let session_id = seed_session(&pool, owner, instance_id).await;
+        let now = chrono::Utc::now();
+        let repo = eros_engine_store::events::EventRepo { pool: &pool };
+        for (key, kind, from, to) in [
+            (
+                "trip",
+                EventKind::BusinessTrip,
+                now - chrono::Duration::hours(2),
+                now + chrono::Duration::hours(22),
+            ),
+            (
+                "away",
+                EventKind::AwayFromPhone,
+                now - chrono::Duration::minutes(5),
+                now + chrono::Duration::hours(1),
+            ),
+        ] {
+            repo.insert(
+                &eros_engine_store::events::NewEvent {
+                    instance_id,
+                    session_id,
+                    event_key: key,
+                    kind,
+                    started_at: from,
+                    ends_at: to,
+                },
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        }
+        let (s, body) = get(pool, session_id, owner).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(body["event"]["kind"], json!("away_from_phone"));
+        assert_eq!(body["event"]["category"], json!("mid"));
+        assert_eq!(body["event"]["message_id"], json!(null));
+        assert_eq!(body["background_event"]["kind"], json!("business_trip"));
+        assert_eq!(body["background_event"]["category"], json!("trip"));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
