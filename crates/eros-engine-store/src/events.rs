@@ -949,6 +949,37 @@ mod tests {
             .is_none());
     }
 
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_reply_inside_the_window_does_not_end_the_unexplained_state(pool: PgPool) {
+        let (_, i, s) = instance_and_session(&pool).await;
+        let repo = EventRepo { pool: &pool };
+        let away = repo
+            .insert(
+                &ev(
+                    i,
+                    s,
+                    "away",
+                    AwayFromPhone,
+                    "2026-10-01T10:00:00Z",
+                    "2026-10-01T12:00:00Z",
+                ),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .event;
+        row(&pool, s, "user", "2026-10-01T10:30:00Z", true).await;
+        // An action turn answered mid-stretch.
+        row(&pool, s, "assistant", "2026-10-01T11:00:00Z", false).await;
+        assert_eq!(
+            repo.unexplained_away(s, i, t("2026-10-01T13:00:00Z"))
+                .await
+                .unwrap(),
+            Some(away)
+        );
+    }
+
     #[sqlx::test(migrations = false)]
     async fn the_backfill_copies_v1_events_and_leaves_them_in_place(pool: PgPool) {
         use sqlx::migrate::Migrate;
