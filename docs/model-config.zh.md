@@ -627,7 +627,7 @@ BYOK hop 使用其请求中 `byok` 块的 `output_regex` 规则，而不是这�
 `[tasks.world_stories_director]`、`[tasks.world_comment]` 也有这个字段，默认值
 相同。
 
-**`ghosting` 字段**（bool，默认 `true`）：面向下游产品的安全开关。设置 `ghosting = false` 可在*整个* PDE 路径上禁用 ghosting——包括 LLM verdict、规则 fallback 和纯规则引擎——从而确保 companion 永不沉默。适用于不希望出现静默轮次的产品。`away_from_phone` 生活事件带来的 ghost 不在 PDE 路径上，不受这个开关影响（见 [ghost-mechanics.zh.md](ghost-mechanics.zh.md#engine-强制的-ghost)）。
+**`ghosting` 字段**（bool，默认 `true`）：面向下游产品的安全开关。设置 `ghosting = false` 可在*整个* PDE 路径上禁用 ghosting——包括 LLM verdict、规则 fallback 和纯规则引擎——从而确保 companion 永不沉默。适用于不希望出现静默轮次的产品。开关关闭时，`away_from_phone` 生活事件也永远不会被抽到（见 [ghost-mechanics.zh.md](ghost-mechanics.zh.md#engine-强制的-ghost)）。
 
 ### `[tasks.chat_image_prompt_compose]` — 出图 prompt 合成器（图片轮次必需）
 

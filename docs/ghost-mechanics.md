@@ -125,8 +125,8 @@ If the persona never ghosts → check that LLM affinity-evaluation is actually m
 While a persona's `away_from_phone` life event is under way (see [the events route](api-reference.md#post-v2compsessionsession_idevents)), every 1:1 text turn of that persona, in any of her sessions, ghosts without the judge and without the score above. Nothing on this page applies to it: it does not count towards `ghost_streak`, does not set `last_ghost_at`, and does not raise the threshold for later turns. It ends with the same three frames as any ghost.
 
 - The user's row is marked ghosted like any other, but it carries no read receipt (`read_at` stays absent): no judge read it, and it still carries none after the persona explains.
-- A turn that carries a user action is the exception. It takes the normal path and is answered, because an action is always answered.
-- The `ghosting` switch ([model-config.md](model-config.md)) does not reach it: `ghosting = false` does not turn it off. A caller that does not want it leaves `away_from_phone` out of `kinds` on the events route.
+- A turn that carries a user action is the exception. It takes the normal path and is answered, because an action is always answered. So is a turn with `image.force = true`: a forced image turn is always `reply_image`.
+- The stretch is drawn only where a ghost is allowed. With the `ghosting` switch ([model-config.md](model-config.md)) off (`ghosting = false`) it is never drawn, so the companion never goes silent. In a session with fewer than 10 user messages, the floor `ghost_permitted` enforces (rule 1 above), it is never drawn either. A caller that does not want it at all leaves `away_from_phone` out of `kinds` on the events route.
 
 When the stretch is over, the persona explains it in her next message in a session where she ghosted: a reply, an `/open` greeting or an event message. After she has written once, that is done.
 

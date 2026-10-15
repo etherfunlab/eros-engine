@@ -389,6 +389,18 @@ in v1.
 No model call. The event row is written with `message_id` NULL and
 `started_at` = now. The route returns the event with `message: null`.
 
+It is drawn only where the persona may go silent, so the draw has two gates
+borrowed from the ghost protection:
+
+- not while the deployment's ghosting switch is off (`ghosting = false` on
+  `[tasks.pde_decision]`);
+- not in a session with fewer than 10 user messages: `GHOST_MIN_MESSAGES`, the
+  count below which the persona never ghosts, read from the same signals
+  `ghost_permitted` reads.
+
+A gated draw removes `away_from_phone` from the allowed kinds; the other kinds
+draw as usual.
+
 ### 7.2 While it lasts
 
 Every 1:1 text turn of the instance, in any session, whose user row's
@@ -400,9 +412,10 @@ Every 1:1 text turn of the instance, in any session, whose user row's
 - the stream yields the ghost `meta`, `done` and `final` frames a judged
   ghost yields; nothing else runs.
 
-An action turn (any user action: a give, a tip, a kiss…) is exempt and takes
-the normal path, because an action is always answered; its `正在经历` line still
-lists the away stretch.
+An action turn (any user action: a give, a tip, a kiss…) and a turn with
+`image.force = true` are exempt and take the normal path, because an action is
+always answered and a forced image turn is always an image. An action turn's
+`正在经历` line still lists the away stretch.
 
 Which ghosts came from an away window is derivable from the event row and the
 ghosted rows' times, so it is not stored.
@@ -562,12 +575,15 @@ a client shows it is the client's call.
   - A deleted session nulls `session_id`; a deleted message nulls
     `message_id`.
   - `unexplained_away` before and after the first assistant row, with and
-    without ghosted rows in the window, and per session.
+    without ghosted rows in the window, and per session; a reply inside the
+    window does not end it.
 - **route** (local Postgres, companion call mocked).
   - `away_from_phone`: no model call, `message: null`, the row written.
   - A foreground drawn during a background: the cue opens with the state.
   - A background's cue carries its span.
   - `category` on `EventView`.
+  - `away_from_phone` is not drawn in a session under 10 messages (nine
+    none, ten draws) nor while the ghosting switch is off.
   - `/open` during an away event → null, no model call; after it, in a
     session with a ghosted row, the greeting's prompt carries `刚才`.
   - effects: `event` and `background_event`.
@@ -576,7 +592,7 @@ a client shows it is the client's call.
   - During an away event: no judge call, the row is ghosted, `ghost_streak`
     unchanged.
   - An action turn during an away event is answered and its row is not
-    ghosted.
+    ghosted; so is a forced-image turn, which takes the image path.
   - After it: the first turn renders `刚才`, the next does not.
   - `[近期事件]` and `正在经历` with a background and a foreground; spans in
     hours and days; a re-driven turn renders the same lines.
@@ -621,6 +637,12 @@ a client shows it is the client's call.
   accounting alone: the silence is circumstance, not her reading of the user.
 - **Action turns are exempt from the away ghost**: an action is always
   answered.
+- **Forced-image turns are exempt from the away ghost**: a client-forced image
+  is never suppressed to silence.
+- **Two draw gates, not a new rule for the kind**: `away_from_phone` is not
+  drawn while the ghosting switch is off or in a session under 10 messages.
+  Both are thresholds on the draw; the kind stays, and the stream's ghost
+  still fires for any away event that exists.
 - **The explanation is derived**, not flagged: ghosted rows in the window and
   no assistant row since.
 - **Persona settings in `art_metadata`**, read leniently, as the other

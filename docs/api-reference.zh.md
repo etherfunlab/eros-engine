@@ -466,7 +466,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 | 字段 | 类型 | 默认值 | 备注 |
 |---|---|---|---|
-| `force` | `bool` | `false` | 强制本轮发图，覆盖 PDE 决策——该轮固定为 `reply_image`（仅图片，无文字回复）。要求部署配置了 `[tasks.chat_image_prompt_compose]`（否则 `422`），且 `content` 遵循普通的非空规则。`false` 时由 PDE 决定。1.0.1 之前旧契约遗留的 `mode` 键可以正常反序列化，但会被静默忽略。 |
+| `force` | `bool` | `false` | 强制本轮发图，覆盖 PDE 决策——该轮固定为 `reply_image`（仅图片，无文字回复），角色没看手机期间也一样。要求部署配置了 `[tasks.chat_image_prompt_compose]`（否则 `422`），且 `content` 遵循普通的非空规则。`false` 时由 PDE 决定。1.0.1 之前旧契约遗留的 `mode` 键可以正常反序列化，但会被静默忽略。 |
 | `style` | `"realistic"` \| `"semi_realistic"` \| `"anime"` | `"realistic"` | 引擎内置三种风格预设之一；`"realistic"` 是引擎内置默认值。 |
 | `aspect_ratio` | `String` | 无 | 允许值：`1:1`、`3:4`、`4:3`、`9:16`、`16:9`；省略时不存在（PDE 计划 → 请求 → 不存在）。非法时返回 `422`。 |
 | `prompt_variant` | `String` | 无 | 选择 `[tasks.chat_image_prompt_compose].filter_prompt` 的一个变体：按下标（`"0"`、`"1"`）或按 key（`"a"`、`"b"`），取决于该任务的配置形态（见 [model-config.zh.md](model-config.zh.md)）。`"raw"` 不带任何特殊含义：只有当该部署把某个变体配置在这个字面量 key 下时才会命中，和其他任意变体名一样。下标/key 没命中——包括未配置的 `"raw"`——都会回退到引擎内置的合成器提示词，绝不报 `422` 或其他错误。该任务未配置，或配置为单一纯字符串提示词时，此字段被忽略。 |
@@ -809,9 +809,10 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 
 **`away_from_phone`** 不生成任何东西：响应里带着事件，`"message": null`、`"message_id": null`。
 它持续期间，角色任何一个 session 里的每一轮文字消息都会被 ghost，不经过判官，也不计入 ghost 连续次数，
-`/open` 返回 `null`。带用户 `action` 的轮次（任何 `type`：`give`、`gift`、`tip`、`kiss`、`hug`、`touch`、`lick`、`custom`）是例外：
-它走正常路径并得到回复，因为动作永远会得到回复。这种 ghost 不读部署的 ghosting 开关（`ghosting = false`）；
-调用方不想要它，就在 `kinds` 里不写 `away_from_phone`。这样被 ghost 的消息没有回执（没有判官读过它），
+`/open` 返回 `null`。带用户 `action` 的轮次（任何 `type`：`give`、`gift`、`tip`、`kiss`、`hug`、`touch`、`lick`、`custom`）或 `image.force = true` 是例外：
+它走正常路径并得到回复，因为动作永远会得到回复，强制出图的轮次永远是 `reply_image`。
+角色只在 ghost 保护允许的地方才会这样沉默：部署的 ghosting 开关关闭（`ghosting = false`）时不会抽到 `away_from_phone`，
+用户消息不足 10 条的会话里也不会；调用方完全不想要它，就在 `kinds` 里不写 `away_from_phone`。这样被 ghost 的消息没有回执（没有判官读过它），
 角色解释之后它依然没有回执。事件结束后，在用户消息被 ghost 过的会话里，角色的下一条消息——回复、`/open` 开场白或事件消息——
 会解释她刚才没看手机。她写过一次之后，这件事就了结了。机制见
 [ghost-mechanics.zh.md](ghost-mechanics.zh.md#engine-强制的-ghost)。

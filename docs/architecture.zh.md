@@ -76,7 +76,7 @@ spawn post_process     tokio::spawn——跟返回響應並行：
 
 **Ghost streak 重置** 由編排器在 spawn post-process 之前處理：Reply 動作會在一個冪等 UPDATE 裡把 streak 清零；Ghost 動作則調 `AffinityRepo::record_ghost`。倉儲方法 `persist_with_event` 自身永遠不碰 streak。
 
-**没看手机。** 角色的 `away_from_phone` 生活事件进行期间，不带用户动作的文字轮在 PDE 之前就被 ghost：该行被标记为已 ghost，发出 ghost 帧，判官和 `record_ghost` 都不运行。见 [ghost-mechanics.zh.md](ghost-mechanics.zh.md#engine-强制的-ghost)。
+**没看手机。** 角色的 `away_from_phone` 生活事件进行期间，不带用户动作、也不带 `image.force` 的文字轮在 PDE 之前就被 ghost：该行被标记为已 ghost，发出 ghost 帧，判官和 `record_ghost` 都不运行。见 [ghost-mechanics.zh.md](ghost-mechanics.zh.md#engine-强制的-ghost)。
 
 **PDE 动作列表。** 判断器（或规则引擎）每轮给出的 action 是以下之一：
 `reply_text` | `ghost` | `reply_image` | `reply_text_image` | `product_qa`。

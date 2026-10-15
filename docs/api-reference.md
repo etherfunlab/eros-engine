@@ -533,7 +533,7 @@ draws on the chat stream).
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `force` | `bool` | `false` | Override the PDE decision for this turn — the turn is always `reply_image` (image only, no text reply). Requires `[tasks.chat_image_prompt_compose]` to be configured (`422` otherwise), and `content` follows the ordinary non-empty rule. When `false` the PDE decides. A leftover `mode` key from the pre-1.0.1 contract deserializes and is silently ignored. |
+| `force` | `bool` | `false` | Override the PDE decision for this turn — the turn is always `reply_image` (image only, no text reply), even while the persona is away from her phone. Requires `[tasks.chat_image_prompt_compose]` to be configured (`422` otherwise), and `content` follows the ordinary non-empty rule. When `false` the PDE decides. A leftover `mode` key from the pre-1.0.1 contract deserializes and is silently ignored. |
 | `style` | `"realistic"` \| `"semi_realistic"` \| `"anime"` | `"realistic"` | One of the three engine-owned style presets; `"realistic"` is the engine's built-in default. |
 | `aspect_ratio` | `String` | none | Allowed: `1:1`, `3:4`, `4:3`, `9:16`, `16:9`; absent when omitted (PDE plan → request → absent). Returns `422` if invalid. |
 | `prompt_variant` | `String` | none | Selects a `[tasks.chat_image_prompt_compose].filter_prompt` variant: an index (`"0"`, `"1"`) or a key (`"a"`, `"b"`), depending on how that task is configured (see [model-config.md](model-config.md)). `"raw"` carries no special meaning: it selects a prompt only if the deployment configures a variant under that literal key, exactly like any other name. An index/key that doesn't match — `"raw"` included — falls back to the engine's built-in composer prompt, never a `422` or other error. Ignored when the task isn't configured, or configures a single plain prompt. |
@@ -984,12 +984,14 @@ drawn length. An incident drawn during a background is told from inside it
 any session of the persona ghosts, without the judge and without counting
 towards the ghost streak, and `/open` returns `null`. A turn that carries a
 user `action` (any `type`: `give`, `gift`, `tip`, `kiss`, `hug`, `touch`,
-`lick`, `custom`) is the exception: it takes the normal path and is answered,
-because an action is always answered. The ghost does not read the deployment's
-ghosting switch (`ghosting = false`); a caller that does not want it leaves
-`away_from_phone` out of `kinds`. A message ghosted this way carries no read
-receipt (no judge read it), and it still carries none after the persona
-explains. Once the
+`lick`, `custom`) or `image.force = true` is the exception: it takes the normal
+path and is answered, because an action is always answered and a forced image
+turn is always `reply_image`. The persona goes silent this way only where the
+ghost protection allows it, so `away_from_phone` is not drawn while the
+deployment's ghosting switch is off (`ghosting = false`), nor in a session with
+fewer than 10 user messages; a caller that does not want it at all leaves it out
+of `kinds`. A message ghosted this way carries no read receipt (no judge read
+it), and it still carries none after the persona explains. Once the
 event is over, in a session where the user's messages were ghosted, the
 persona's next message — a reply, an `/open` greeting or an event message —
 explains she had not been looking at her phone. After she has written once,
