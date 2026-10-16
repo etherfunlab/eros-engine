@@ -6,8 +6,9 @@
 //!
 //! No error built here quotes the sealed string, the key or any card text.
 //!
-//! TODO(byoc routes): the items below are unused until the BYOC routes call
-//! them. Allow-dead-code lifts once every entry point has a caller.
+//! TODO(byoc routes): `open_card`, `unsupported` and what only they use stay
+//! unused until the routes that take a card call them. Allow-dead-code lifts
+//! once they have a caller.
 #![allow(dead_code)]
 
 use aes_gcm::aead::Aead;

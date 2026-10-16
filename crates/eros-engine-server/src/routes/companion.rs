@@ -1315,6 +1315,39 @@ pub(crate) mod testutil {
         let genome_id = seed_genome(pool, &format!("seed-{}", Uuid::new_v4())).await;
         seed_instance(pool, genome_id, owner).await
     }
+
+    /// The caller secret of a state built by [`enable_byoc`].
+    pub(crate) const BYOC_SECRET: &str = "byoc-caller-secret-for-tests-0123456789";
+
+    /// Turn BYOC on, as a deployment that set `BYOC_CALLER_SECRET` would.
+    pub(crate) fn enable_byoc(state: &mut AppState) {
+        state.config.byoc.caller_secret = Some(BYOC_SECRET.into());
+    }
+
+    /// A BYOC instance and the key it was created under.
+    pub(crate) async fn seed_byoc_instance_with_key(
+        pool: &PgPool,
+        owner: Uuid,
+    ) -> (Uuid, [u8; 32]) {
+        let key = crate::byoc::mint_key();
+        let id = eros_engine_store::persona::PersonaRepo { pool }
+            .create_byoc_instance(owner, &key)
+            .await
+            .unwrap();
+        (id, key)
+    }
+
+    /// A v1 card sealed under `key`, as a downstream sends it.
+    // TODO(byoc routes): first used by the routes that open a card.
+    #[allow(dead_code)]
+    pub(crate) fn sealed_card(
+        key: &[u8; 32],
+        name: &str,
+        system_prompt: &str,
+        art: Value,
+    ) -> String {
+        crate::byoc::seal(key, &crate::byoc::card_json(name, system_prompt, art))
+    }
 }
 
 #[cfg(test)]

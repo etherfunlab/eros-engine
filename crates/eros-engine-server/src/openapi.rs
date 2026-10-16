@@ -55,7 +55,9 @@ impl Modify for SecurityAddon {
         (name = "companion", description = "Chat sessions, messages, affinity, profile"),
         (name = "bff-companion", description = "Frontend-shaped mirror of /comp/* for first-party clients; \
                                                 shape may diverge from canonical without notice"),
-        (name = "group", description = "Group chat: the user and up to three personas, each an existing 1:1 session")
+        (name = "group", description = "Group chat: the user and up to three personas, each an existing 1:1 session"),
+        (name = "byoc", description = "Bring your own character: mint a key, then create an instance under it. \
+                                        Admitted by a shared secret header")
     ),
     modifiers(&SecurityAddon)
 )]

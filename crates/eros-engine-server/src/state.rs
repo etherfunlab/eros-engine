@@ -521,8 +521,6 @@ pub struct ServerConfig {
     /// Bring-your-own-key admission and transport settings.
     pub byok: ByokConfig,
     /// Bring-your-own-character admission.
-    // TODO(byoc routes): read by `byoc::admit` once the routes call it.
-    #[allow(dead_code)]
     pub byoc: ByocConfig,
     /// Insights export admission (`INSIGHTS_EXPORT_SECRET`).
     pub insights_export: InsightsExportConfig,

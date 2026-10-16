@@ -1344,6 +1344,137 @@
         ]
       }
     },
+    "/v2/comp/byoc/create": {
+      "post": {
+        "tags": [
+          "byoc"
+        ],
+        "summary": "Create the BYOC instance for a key from init.",
+        "description": "Idempotent per key: a repeat returns the same `instance_id`, and\nre-creating an archived instance reactivates it. Needs the deployment's\ncaller secret.",
+        "operationId": "byoc_create",
+        "parameters": [
+          {
+            "name": "X-Byoc-Caller-Secret",
+            "in": "header",
+            "description": "The deployment's BYOC_CALLER_SECRET; required",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ByocCreateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ByocCreateResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "malformed body"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v2/comp/byoc/init": {
+      "post": {
+        "tags": [
+          "byoc"
+        ],
+        "summary": "Draw a key for a new BYOC instance.",
+        "description": "Writes nothing: an instance exists only once `create` is called with the\nreturned key and ticket, after the downstream has stored the key. Needs\nthe deployment's caller secret.",
+        "operationId": "byoc_init",
+        "parameters": [
+          {
+            "name": "X-Byoc-Caller-Secret",
+            "in": "header",
+            "description": "The deployment's BYOC_CALLER_SECRET; required",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ByocInitResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v2/comp/group": {
       "post": {
         "tags": [
@@ -3384,6 +3515,53 @@
           "chemistry": {
             "type": "number",
             "format": "double"
+          }
+        }
+      },
+      "ByocCreateRequest": {
+        "type": "object",
+        "required": [
+          "key",
+          "ticket"
+        ],
+        "properties": {
+          "key": {
+            "type": "string",
+            "description": "The `key` from init (base64url, padding optional)."
+          },
+          "ticket": {
+            "type": "string",
+            "description": "The `ticket` from init (base64url, padding optional)."
+          }
+        },
+        "additionalProperties": false
+      },
+      "ByocCreateResponse": {
+        "type": "object",
+        "required": [
+          "instance_id"
+        ],
+        "properties": {
+          "instance_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "ByocInitResponse": {
+        "type": "object",
+        "required": [
+          "key",
+          "ticket"
+        ],
+        "properties": {
+          "key": {
+            "type": "string",
+            "description": "32 random bytes, base64url. Keep it: it opens every card sent for\nthe instance, and the engine never shows it again."
+          },
+          "ticket": {
+            "type": "string",
+            "description": "32 bytes, base64url. Proves to `create` that the engine issued `key`\nto this user."
           }
         }
       },
@@ -6182,6 +6360,10 @@
     {
       "name": "group",
       "description": "Group chat: the user and up to three personas, each an existing 1:1 session"
+    },
+    {
+      "name": "byoc",
+      "description": "Bring your own character: mint a key, then create an instance under it. Admitted by a shared secret header"
     }
   ]
 }

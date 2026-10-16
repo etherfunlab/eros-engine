@@ -17,6 +17,7 @@ use crate::auth::middleware::require_auth;
 use crate::state::AppState;
 
 pub mod bff;
+pub mod byoc;
 pub mod companion;
 pub mod companion_async;
 pub mod companion_stream;
@@ -49,6 +50,7 @@ pub fn router(state: AppState) -> OpenApiRouter<AppState> {
         .merge(companion_stream::router())
         .merge(voice::router())
         .merge(bff::router())
+        .merge(byoc::router())
         .merge(world_town::router())
         .merge(persona::router())
         .merge(persona_items::router())
@@ -84,6 +86,7 @@ pub fn router_for_openapi() -> OpenApiRouter<AppState> {
         .merge(companion_stream::router())
         .merge(voice::router())
         .merge(bff::router())
+        .merge(byoc::router())
         .merge(world_town::router())
         .merge(persona::router())
         .merge(persona_items::router())
