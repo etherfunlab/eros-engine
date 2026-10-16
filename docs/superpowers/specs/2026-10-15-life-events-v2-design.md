@@ -413,8 +413,9 @@ Every 1:1 text turn of the instance, in any session, whose user row's
   ghost yields; nothing else runs.
 
 An action turn (any user action: a give, a tip, a kiss…) and a turn with
-`image.force = true` are exempt and take the normal path, because an action is
-always answered and a forced image turn is always an image. An action turn's
+`image.force = true` are exempt and take the normal path. An action is
+interaction in person, which needs no phone, so it is answered; a forced image
+turn is always an image. An action turn's
 `正在经历` line still lists the away stretch. While the deployment's ghosting
 switch is off, a stretch under way does not ghost turns: they take the normal
 path, and the `正在经历` line still lists it.
@@ -637,8 +638,8 @@ a client shows it is the client's call.
   Category and background-ness derive from the kind.
 - **`away_from_phone` ghosts outside the judge** and leaves the ghost
   accounting alone: the silence is circumstance, not her reading of the user.
-- **Action turns are exempt from the away ghost**: an action is always
-  answered.
+- **Action turns are exempt from the away ghost**: an action is interaction
+  in person, which needs no phone, so it is answered.
 - **Forced-image turns are exempt from the away ghost**: a client-forced image
   is never suppressed to silence.
 - **Two draw gates, not a new rule for the kind**: `away_from_phone` is not
