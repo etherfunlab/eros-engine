@@ -78,7 +78,7 @@ spawn post_process     tokio::spawn — runs concurrent with response return:
 
 **Ghost-streak reset** is handled by the orchestrator before spawning post-process: on Reply the streak is cleared in a single idempotent UPDATE; on Ghost the orchestrator calls `AffinityRepo::record_ghost` instead. The `persist_with_event` repo method itself never touches the streak.
 
-**Away from phone.** While the persona's `away_from_phone` life event is under way, a text turn without a user action or `image.force` ghosts before the PDE: the row is marked ghosted and the ghost frames are yielded, and neither the judge nor `record_ghost` runs. See [ghost-mechanics.md](ghost-mechanics.md#ghosting-the-engine-imposes).
+**Offline.** While an offline life event of the persona is under way (`away_from_phone`, `busy`, `in_battle`, `asleep`), a text turn without a user action or `image.force` ghosts before the PDE: the row is marked ghosted and the ghost frames are yielded, and neither the judge nor `record_ghost` runs. See [ghost-mechanics.md](ghost-mechanics.md#ghosting-the-engine-imposes).
 
 **PDE action list.** The judge's (or rule engine's) per-turn action is one of
 `reply_text` | `ghost` | `reply_image` | `reply_text_image` | `product_qa`.
@@ -195,7 +195,7 @@ crates/
 │   └── src/
 │       ├── pool.rs           # PgPoolOptions builder
 │       ├── chat.rs           # ChatRepo
-│       ├── events.rs         # EventRepo (persona_events: life events under way, history, away)
+│       ├── events.rs         # EventRepo (persona_events: life events under way, history, offline stretches, false alarms)
 │       ├── group.rs          # GroupRepo (group sessions, membership)
 │       ├── affinity.rs       # AffinityRepo (persist_with_event, record_ghost)
 │       ├── memory.rs         # MemoryRepo (Profile/Relationship layers)
@@ -221,7 +221,7 @@ crates/
 - [Affinity model](affinity-model.md) — 6 dimensions, graded write pipeline, time decay, relationship labels
 - [Ghost mechanics](ghost-mechanics.md) — score formula + protection rules + worked examples
 - [Group chat](group-chat.md) — one user, up to three personas, the director, the speaker relay
-- [Life events and needs](life-events-needs.md) — the persona's needs and their drift, the event draw, backgrounds, away from the phone
+- [Life events and needs](life-events-needs.md) — the persona's needs and their drift, the event draw, backgrounds, offline kinds, false alarms
 - [Memory layers](memory-layers.md) — profile vs relationship, Voyage, pgvector retrieval
 - [Deploying](deploying.md) — Docker, bring-your-own Postgres / IdP
 - [API reference](api-reference.md) — every `/comp/*` endpoint

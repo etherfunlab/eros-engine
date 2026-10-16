@@ -122,13 +122,14 @@ If the persona never ghosts → check that LLM affinity-evaluation is actually m
 
 ## Ghosting the engine imposes
 
-While a persona's `away_from_phone` life event is under way (see [the events route](api-reference.md#post-v2compsessionsession_idevents)), every 1:1 text turn of that persona, in any of her sessions, ghosts without the judge and without the score above. Nothing on this page applies to it: it does not count towards `ghost_streak`, does not set `last_ghost_at`, and does not raise the threshold for later turns. It ends with the same three frames as any ghost.
+While an offline life event of the persona is under way (`away_from_phone`, `busy`, `in_battle`, `asleep`; see [the events route](api-reference.md#post-v2compsessionsession_idevents)), every 1:1 text turn of that persona, in any of her sessions, ghosts without the judge and without the score above. Nothing on this page applies to it: it does not count towards `ghost_streak`, does not set `last_ghost_at`, and does not raise the threshold for later turns. It ends with the same three frames as any ghost.
 
 - The user's row is marked ghosted like any other, but it carries no read receipt (`read_at` stays absent): no judge read it, and it still carries none after the persona explains.
 - A turn that carries a user action is the exception. An action (a give, a tip, a kiss) is interaction in person, which needs no phone, so the turn takes the normal path and is answered. So is a turn with `image.force = true`: a forced image turn is always `reply_image`.
-- The stretch is drawn only where a ghost is allowed. With the `ghosting` switch ([model-config.md](model-config.md)) off (`ghosting = false`) it is never drawn, and one already under way no longer silences turns, so the companion never goes silent. In a session with fewer than 10 user messages, the floor `ghost_permitted` enforces (rule 1 above), it is never drawn either. A caller that does not want it at all leaves `away_from_phone` out of `kinds` on the events route.
+- An offline kind is drawn only where a ghost is allowed. With the `ghosting` switch ([model-config.md](model-config.md)) off (`ghosting = false`) none is drawn, and one already under way no longer silences turns, so the companion never goes silent. In a session with fewer than 10 user messages, the floor `ghost_permitted` enforces (rule 1 above), none is drawn either. A caller that does not want them leaves them out of `kinds` on the events route.
+- `busy` and `in_battle` are announced in a message at intimacy rung 2 and up; the announcement does not end the silence, and it does not count as the explanation.
 
-When the stretch is over, the persona explains it in her next message in a session where she ghosted: a reply, an `/open` greeting or an event message. After she has written once, that is done.
+When the stretch is over, the persona explains it in her next message in a session where she ghosted: a reply, an `/open` greeting or an event message. The explanation names what kept her away: she was asleep, busy, in the thick of a hard fight, or not looking at her phone, and only now sees what was sent. After she has written a message with text there, that is done; an image-only reply does not count.
 
 ## What ghosting is not
 
@@ -142,6 +143,6 @@ When the stretch is over, the persona explains it in her next message in a sessi
 - `crates/eros-engine-core/src/ghost.rs` — score + ghost_permitted + decide (12 unit tests)
 - `crates/eros-engine-server/src/pipeline/stream.rs::run_stream` — the `ActionType::Ghost` arm: stamps the row and records the ghost, building no chat request
 - `crates/eros-engine-store/src/affinity.rs::record_ghost` — persistence (increments streak, total_ghosts, last_ghost_at), plus a zero-delta `companion_affinity_events` row with `event_type='ghost'`
-- `crates/eros-engine-server/src/pipeline/stream.rs::run_stream` — the away branch ahead of the judge: marks the row ghosted, yields the ghost frames, and calls neither the judge nor `record_ghost`
-- `crates/eros-engine-store/src/events.rs::EventRepo` — `current` (the event under way at a turn's own row) and `unexplained_away` (whether a ghosted stretch still awaits its explanation)
+- `crates/eros-engine-server/src/pipeline/stream.rs::run_stream` — the offline branch ahead of the judge: marks the row ghosted, yields the ghost frames, and calls neither the judge nor `record_ghost`
+- `crates/eros-engine-store/src/events.rs::EventRepo` — `current` (the event under way at a turn's own row), `unexplained_offline` (whether a ghosted stretch still awaits its explanation) and `unresolved_scare` (whether a false alarm told in the session still awaits its resolution)
 - `crates/eros-engine-store/src/chat.rs::mark_user_message_ghosted` — sets `chat_messages.ghost_decision = true` on the user row, so replay can tell a ghost outcome from a still-generating turn

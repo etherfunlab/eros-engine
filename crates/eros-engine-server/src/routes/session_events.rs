@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! POST /v2/comp/session/{session_id}/events — the caller asks for something
 //! to happen in the persona's day; the engine decides whether and what. The
-//! persona tells the user in a message, except for `away_from_phone`, which is
-//! only her silence (spec
-//! docs/superpowers/specs/2026-10-15-life-events-v2-design.md).
+//! persona tells the user in a message, except for an offline kind she does
+//! not announce, which is only her silence (spec
+//! docs/superpowers/specs/2026-10-16-life-events-offline-and-scares-design.md).
 
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
@@ -52,6 +52,8 @@ pub enum EventKindDto {
     Bathing,
     InClass,
     OnTheWay,
+    PeriodScare,
+    PregnancyScare,
     TempWork,
     ExMessage,
     WeatherChange,
@@ -63,6 +65,9 @@ pub enum EventKindDto {
     AwayFromPhone,
     Unwell,
     Irritable,
+    Busy,
+    InBattle,
+    Asleep,
     Sick,
     Period,
     Hospitalized,
@@ -85,6 +90,8 @@ impl From<EventKindDto> for EventKind {
             EventKindDto::Bathing => EventKind::Bathing,
             EventKindDto::InClass => EventKind::InClass,
             EventKindDto::OnTheWay => EventKind::OnTheWay,
+            EventKindDto::PeriodScare => EventKind::PeriodScare,
+            EventKindDto::PregnancyScare => EventKind::PregnancyScare,
             EventKindDto::TempWork => EventKind::TempWork,
             EventKindDto::ExMessage => EventKind::ExMessage,
             EventKindDto::WeatherChange => EventKind::WeatherChange,
@@ -96,6 +103,9 @@ impl From<EventKindDto> for EventKind {
             EventKindDto::AwayFromPhone => EventKind::AwayFromPhone,
             EventKindDto::Unwell => EventKind::Unwell,
             EventKindDto::Irritable => EventKind::Irritable,
+            EventKindDto::Busy => EventKind::Busy,
+            EventKindDto::InBattle => EventKind::InBattle,
+            EventKindDto::Asleep => EventKind::Asleep,
             EventKindDto::Sick => EventKind::Sick,
             EventKindDto::Period => EventKind::Period,
             EventKindDto::Hospitalized => EventKind::Hospitalized,
@@ -120,6 +130,8 @@ impl From<EventKind> for EventKindDto {
             EventKind::Bathing => EventKindDto::Bathing,
             EventKind::InClass => EventKindDto::InClass,
             EventKind::OnTheWay => EventKindDto::OnTheWay,
+            EventKind::PeriodScare => EventKindDto::PeriodScare,
+            EventKind::PregnancyScare => EventKindDto::PregnancyScare,
             EventKind::TempWork => EventKindDto::TempWork,
             EventKind::ExMessage => EventKindDto::ExMessage,
             EventKind::WeatherChange => EventKindDto::WeatherChange,
@@ -131,6 +143,9 @@ impl From<EventKind> for EventKindDto {
             EventKind::AwayFromPhone => EventKindDto::AwayFromPhone,
             EventKind::Unwell => EventKindDto::Unwell,
             EventKind::Irritable => EventKindDto::Irritable,
+            EventKind::Busy => EventKindDto::Busy,
+            EventKind::InBattle => EventKindDto::InBattle,
+            EventKind::Asleep => EventKindDto::Asleep,
             EventKind::Sick => EventKindDto::Sick,
             EventKind::Period => EventKindDto::Period,
             EventKind::Hospitalized => EventKindDto::Hospitalized,
@@ -166,12 +181,17 @@ impl From<eros_engine_core::events::EventCategory> for EventCategoryDto {
     }
 }
 
-/// A life event: what happened, when it started and ends, and the message
-/// that told it (`null` for an event that is never told).
+/// A life event: what happened, when it started and ends, whether it keeps
+/// the persona offline while it lasts, and the message that told it (`null`
+/// for an event that is not told).
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct EventView {
     pub kind: EventKindDto,
     pub category: EventCategoryDto,
+    /// While it lasts, her 1:1 text turns in any of her sessions ghost,
+    /// except turns carrying a user `action` or `image.force`, and except on
+    /// a deployment with ghosting off; `/open` returns no greeting.
+    pub offline: bool,
     pub started_at: DateTime<Utc>,
     pub ends_at: DateTime<Utc>,
     pub message_id: Option<Uuid>,
@@ -182,6 +202,7 @@ impl From<&eros_engine_store::events::EventRecord> for EventView {
         Self {
             kind: e.kind.into(),
             category: e.kind.category().into(),
+            offline: e.kind.is_offline(),
             started_at: e.started_at,
             ends_at: e.ends_at,
             message_id: e.message_id,
@@ -268,8 +289,12 @@ async fn respond(
 /// incident is under way, or every allowed kind is cooling down). During a
 /// background event (a trip or a body state) only incidents are drawn. The
 /// persona then tells the user in one proactive message, persisted like any
-/// reply and returned with the event; `away_from_phone` is drawn without a
-/// message. The same `event_key` returns the same event.
+/// reply and returned with the event. The offline kinds (`away_from_phone`,
+/// `busy`, `in_battle`, `asleep`) make her unreachable while they last.
+/// `busy` and `in_battle` are announced in a message at intimacy rung 2 and
+/// up; below that, and always for `away_from_phone` and `asleep`, the event
+/// comes back with `message: null`. The same `event_key` returns the same
+/// event.
 #[utoipa::path(
     post,
     path = "/v2/comp/session/{session_id}/events",
@@ -372,21 +397,22 @@ pub(crate) async fn draw_event_at(
         Some(kinds) => kinds.iter().map(|k| (*k).into()).collect(),
         None => EventKind::ALL.to_vec(),
     };
-    // Away from her phone is silence: it follows the ghost protection (the
+    // An offline kind is silence: it follows the ghost protection (the
     // deployment's ghosting switch and the session's message floor).
     let signals =
         crate::pipeline::compute_signals_for_session(&state.pool, session_id, &affinity).await?;
     if !state.model_config.pde_ghosting_enabled()
         || signals.message_count < eros_engine_core::ghost::GHOST_MIN_MESSAGES
     {
-        allowed.retain(|k| *k != EventKind::AwayFromPhone);
+        allowed.retain(|k| !k.is_offline());
     }
     let traits = crate::prompt::persona_traits(&persona);
+    let rung = affinity.intimacy_rung();
     let Some(drawn) = events::draw(
         &DrawInput {
             now,
             needs,
-            intimacy_rung: affinity.intimacy_rung(),
+            intimacy_rung: rung,
             persona: &traits,
             history: &history,
             allowed: &allowed,
@@ -396,9 +422,9 @@ pub(crate) async fn draw_event_at(
         return Ok(DrawEventResponse::none());
     };
 
-    // Nothing to tell: the event is the silence (spec 2026-10-15-life-events-
-    // v2-design.md §7.1).
-    if drawn.kind == EventKind::AwayFromPhone {
+    // A kind she does not tell is written without a message (spec
+    // 2026-10-16-life-events-offline-and-scares-design.md §4.1).
+    if !events::is_told(drawn.kind, rung) {
         event_repo
             .insert(
                 &eros_engine_store::events::NewEvent {
@@ -1202,6 +1228,165 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(n, 1);
+    }
+
+    /// Put the session's relationship on rung 2: bond (0.6 + 0.6) / 2 = 0.6.
+    async fn rung_two(pool: &PgPool, session_id: Uuid, user_id: Uuid, instance_id: Uuid) {
+        AffinityRepo { pool }
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE engine.companion_affinity SET trust = 0.6, intrigue = 0.6, updated_at = now() \
+             WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    const OFFLINE: [EventKindDto; 4] = [
+        EventKindDto::AwayFromPhone,
+        EventKindDto::Busy,
+        EventKindDto::InBattle,
+        EventKindDto::Asleep,
+    ];
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_ghost_protection_keeps_every_offline_kind_out(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        let state = test_state(pool.clone());
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            req("a1", Some(OFFLINE.to_vec())),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        assert!(out.event.is_none(), "a fresh session is below the floor");
+
+        seed_user_messages(&pool, session_id, 10).await;
+        let mut off = test_state(pool.clone());
+        off.model_config = Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.pde_decision]\nmodel = \"judge\"\nghosting = false\n",
+            )
+            .unwrap(),
+        );
+        let out = draw_event_at(
+            &off,
+            session_id,
+            user_id,
+            req("a2", Some(OFFLINE.to_vec())),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        assert!(out.event.is_none(), "ghosting is off");
+        assert_eq!(event_count(&pool, session_id).await, 0);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn busy_is_announced_only_to_someone_close(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (instance_id, session_id) = setup(&pool, user_id).await;
+        seed_user_messages(&pool, session_id, 10).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "我先去忙了，晚点找你").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+
+        // Rung 1, 13 hours ago: she goes quiet without a word.
+        let earlier = Utc::now() - chrono::Duration::hours(13);
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            req("b1", Some(vec![EventKindDto::Busy])),
+            earlier,
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        let e = out.event.expect("busy");
+        assert!(e.offline);
+        assert_eq!((e.message_id, out.message.is_none()), (None, true));
+        assert!(calls(&mock).await.is_empty());
+
+        // Rung 2, a fresh session of the same persona: she says so first.
+        let other = seed_session(&pool, user_id, instance_id).await;
+        seed_user_messages(&pool, other, 10).await;
+        rung_two(&pool, other, user_id, instance_id).await;
+        let out = draw_event_at(
+            &state,
+            other,
+            user_id,
+            req("b2", Some(vec![EventKindDto::Busy])),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        let e = out.event.expect("busy, announced");
+        assert!(e.offline && e.message_id.is_some());
+        assert_eq!(
+            out.message.expect("the announcement").content,
+            "我先去忙了，晚点找你"
+        );
+        assert!(calls(&mock).await[0]
+            .to_string()
+            .contains("（你接下来要忙一阵，这段时间顾不上看手机。）"));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn asleep_is_never_announced(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (instance_id, session_id) = setup(&pool, user_id).await;
+        seed_user_messages(&pool, session_id, 10).await;
+        rung_two(&pool, session_id, user_id, instance_id).await;
+        let mock = MockServer::start().await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            req("s1", Some(vec![EventKindDto::Asleep])),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        let e = out.event.expect("asleep");
+        assert!(e.offline && e.message_id.is_none() && out.message.is_none());
+        assert!(calls(&mock).await.is_empty());
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_blank_announcement_writes_nothing(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (instance_id, session_id) = setup(&pool, user_id).await;
+        seed_user_messages(&pool, session_id, 10).await;
+        rung_two(&pool, session_id, user_id, instance_id).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "   ").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            req("b1", Some(vec![EventKindDto::Busy])),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        assert!(out.event.is_none() && out.message.is_none());
+        assert_eq!(event_count(&pool, session_id).await, 0, "no silence either");
     }
 
     #[test]

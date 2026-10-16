@@ -695,7 +695,16 @@ When any accepted `give` is still at work, the engine also adds a `[身体状态
 
 **Needs context line.** On every judged turn the context carries one `[需求]` line, before `[身体状态]`: `[需求] 饥饿=高 社交欲=低 体力=中 情感需求=中`, the previous rating carried to this turn, or `[需求] 尚未判定` before the first rating.
 
-**Event context line.** While an event drawn through the [events route](api-reference.md#post-v2compsessionsession_idevents) is under way, the judge context carries one `[近期事件]` line, after `[需求]` and before `[身体状态]`. It lists the background, then the incident, joined by `；`: `[近期事件] 长途旅游（2 天前开始，约 3 天后结束）；在看书（不到 1 小时前开始，约 2 小时后结束）`. Spans under an hour read `不到 1 小时`, under 48 hours whole hours, from 48 hours whole days. After an `away_from_phone` stretch, in a session whose messages it ghosted and before the persona has written again, the line ends with `没看手机（{span}前结束，期间对方的消息你没有回）`. A text turn's reply carries `- 正在经历：…` in `[character_state]` (background and incident) and, after such a stretch, `- 刚才：有段时间没看手机，对方那时发来的消息你现在才看到`, with or without the LLM judge; `/open` greetings and event messages carry the same lines. The lines are absent when there is nothing to say. Events change no stored need: the judge reads the line and rates the needs itself.
+**Event context line.** While an event drawn through the [events route](api-reference.md#post-v2compsessionsession_idevents) is under way, the judge context carries one `[近期事件]` line, after `[需求]` and before `[身体状态]`. It lists the background, then the incident, joined by `；`: `[近期事件] 长途旅游（2 天前开始，约 3 天后结束）；在看书（不到 1 小时前开始，约 2 小时后结束）`. Spans under an hour read `不到 1 小时`, under 48 hours whole hours, from 48 hours whole days. After an offline stretch (`away_from_phone`, `busy`, `in_battle`, `asleep`), in a session whose messages it ghosted and before the persona has written a message with text there, the line ends with `{label}（{span}前结束，期间对方的消息你没有回）`. After a false alarm (`period_scare`, `pregnancy_scare`), in the session that told it and before the persona has written a message with text there, it ends with `{label}（{span}前结束，结果是虚惊一场）`. With both, the offline item comes first. `{label}` and `{text}` are given per kind in the table below. A text turn's reply carries `- 正在经历：…` in `[character_state]` (background and incident) and, after such a stretch or false alarm, a `- 刚才：{text}` line, with or without the LLM judge; `/open` greetings and event messages carry the same lines. With both, the two texts share the line, the offline text first, joined by `；`: `- 刚才：睡着了，对方那时发来的消息你现在才看到；以为月经没来，后来来了，是虚惊一场`. The lines are absent when there is nothing to say. Events change no stored need: the judge reads the line and rates the needs itself.
+
+| Kind | `{label}` | `{text}` |
+|---|---|---|
+| `away_from_phone` | `没看手机` | `有段时间没看手机，对方那时发来的消息你现在才看到` |
+| `busy` | `正在忙` | `一直在忙，对方那时发来的消息你现在才看到` |
+| `in_battle` | `在打一场硬仗` | `在打一场硬仗，对方那时发来的消息你现在才看到` |
+| `asleep` | `睡着了` | `睡着了，对方那时发来的消息你现在才看到` |
+| `period_scare` | `月经没来` | `以为月经没来，后来来了，是虚惊一场` |
+| `pregnancy_scare` | `验出怀孕` | `验出两条杠，后来复查是虚惊一场` |
 
 **Recent-image context line.** The judge context also always carries exactly one
 `[近期图片] 最近8条消息内已发图=<n> 张；上一条 AI 消息是图片=<是/否>（以本行计数为准，对话记录里的图片标记仅供参考）`
@@ -714,7 +723,7 @@ available on `[tasks.group_director]`, `[tasks.world_director]`,
 `[tasks.world_stories_director]`, and `[tasks.world_comment]`, with the same
 default.
 
-**`ghosting` field** (bool, default `true`): a safety switch for downstream products. Set `ghosting = false` to disable ghosting across the _entire_ PDE path — LLM verdict, rule fallback, and the pure rule engine — so the companion never goes silent. Useful for products where silent turns are undesirable. With the switch off, the `away_from_phone` life event is never drawn either, and one already under way no longer silences turns (see [ghost-mechanics.md](ghost-mechanics.md#ghosting-the-engine-imposes)).
+**`ghosting` field** (bool, default `true`): a safety switch for downstream products. Set `ghosting = false` to disable ghosting across the _entire_ PDE path — LLM verdict, rule fallback, and the pure rule engine — so the companion never goes silent. Useful for products where silent turns are undesirable. With the switch off, no offline life event (`away_from_phone`, `busy`, `in_battle`, `asleep`) is drawn either, and one already under way no longer silences turns (see [ghost-mechanics.md](ghost-mechanics.md#ghosting-the-engine-imposes)).
 
 ### `[tasks.chat_image_prompt_compose]` — image-prompt composer (required for image turns)
 

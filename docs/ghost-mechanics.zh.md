@@ -121,13 +121,14 @@ score = (1−0.05)×0.4 + (1−0.05)×0.4 + 0×0.2
 
 ## engine 强制的 ghost
 
-角色的 `away_from_phone` 生活事件进行期间（见 [events 路由](api-reference.zh.md#post-v2compsessionsession_idevents)），她任何一个 session 里的每一轮 1:1 文字消息都会被 ghost，不经过判官，也不经过上面的打分。本页的其他规则都不适用于它：它不计入 `ghost_streak`，不写 `last_ghost_at`，也不会抬高之后各轮的阈值。它和任何一次 ghost 一样，以同样的三帧收尾。
+角色的离线类生活事件进行期间（`away_from_phone`、`busy`、`in_battle`、`asleep`；见 [events 路由](api-reference.zh.md#post-v2compsessionsession_idevents)），她任何一个 session 里的每一轮 1:1 文字消息都会被 ghost，不经过判官，也不经过上面的打分。本页的其他规则都不适用于它：它不计入 `ghost_streak`，不写 `last_ghost_at`，也不会抬高之后各轮的阈值。它和任何一次 ghost 一样，以同样的三帧收尾。
 
 - 用户那一行和其他被 ghost 的行一样标记为已 ghost，但没有回执（`read_at` 不出现）：没有判官读过它，角色解释之后它依然没有回执。
 - 带用户动作的轮次是例外。动作（送礼、打赏、亲吻这类）在语义上是线下互动，用不着手机，所以这一轮走正常路径并得到回复。带 `image.force = true` 的轮次也一样：强制出图的轮次永远是 `reply_image`。
-- 这一段只在允许 ghost 的地方才会抽到。`ghosting` 开关（见 [model-config.zh.md](model-config.zh.md)）关闭（`ghosting = false`）时永远抽不到它，已经在进行的一段也不再让轮次沉默，companion 不会沉默。用户消息不足 10 条的会话（`ghost_permitted` 守的就是这个下限，见上面的规则 1）里也抽不到。调用方完全不想要它，就在 events 路由的 `kinds` 里不写 `away_from_phone`。
+- 离线类种类只在允许 ghost 的地方才会抽到。`ghosting` 开关（见 [model-config.zh.md](model-config.zh.md)）关闭（`ghosting = false`）时一个也抽不到，已经在进行的一段也不再让轮次沉默，companion 不会沉默。用户消息不足 10 条的会话（`ghost_permitted` 守的就是这个下限，见上面的规则 1）里也抽不到。调用方完全不想要它们，就在 events 路由的 `kinds` 里不写。
+- `busy` 与 `in_battle` 在 intimacy 档 2 及以上会用一条消息讲出来；这条消息不会结束沉默，也不算解释。
 
-这段时间结束后，在被 ghost 过的会话里，角色会在她的下一条消息里解释这件事：回复、`/open` 开场白或事件消息都可以。她写过一次之后，这件事就了结了。
+这段时间结束后，在被 ghost 过的会话里，角色会在她的下一条消息里解释这件事：回复、`/open` 开场白或事件消息都可以。解释会说出是什么让她联系不上：她刚才睡着了、在忙、在打一场硬仗或没看手机，对方那时发来的消息她现在才看到。她在那里写过一条带文字的消息之后，这件事就了结了；只有图的回复不算。
 
 ## Ghost 不是甚麼
 
@@ -141,6 +142,6 @@ score = (1−0.05)×0.4 + (1−0.05)×0.4 + 0×0.2
 - `crates/eros-engine-core/src/ghost.rs`——score + ghost_permitted + decide（12 個單元測試）
 - `crates/eros-engine-server/src/pipeline/stream.rs::run_stream`——其中的 `ActionType::Ghost` 分支：标记该行并记录 ghost，不构建 chat 请求
 - `crates/eros-engine-store/src/affinity.rs::record_ghost`——持久化（增加 streak、total_ghosts、last_ghost_at），并插入一行 `event_type='ghost'`、增量全零的 `companion_affinity_events` 事件
-- `crates/eros-engine-server/src/pipeline/stream.rs::run_stream`——判官之前的 away 分支：把该行标记为已 ghost，发出 ghost 帧，既不调用判官也不调用 `record_ghost`
-- `crates/eros-engine-store/src/events.rs::EventRepo`——`current`（某一轮自己那一行当时在进行的事件）与 `unexplained_away`（被 ghost 的那段时间是否还没被解释）
+- `crates/eros-engine-server/src/pipeline/stream.rs::run_stream`——判官之前的 offline 分支：把该行标记为已 ghost，发出 ghost 帧，既不调用判官也不调用 `record_ghost`
+- `crates/eros-engine-store/src/events.rs::EventRepo`——`current`（某一轮自己那一行当时在进行的事件）、`unexplained_offline`（被 ghost 的那段时间是否还没被解释）与 `unresolved_scare`（会话里讲过的一场虚惊是否还没交代结果）
 - `crates/eros-engine-store/src/chat.rs::mark_user_message_ghosted`——把用户行的 `chat_messages.ghost_decision` 置为 true，让重放能把 ghost 结局和还在生成中的回合区分开

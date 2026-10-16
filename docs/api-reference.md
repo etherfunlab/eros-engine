@@ -533,7 +533,7 @@ draws on the chat stream).
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `force` | `bool` | `false` | Override the PDE decision for this turn — the turn is always `reply_image` (image only, no text reply), even while the persona is away from her phone. Requires `[tasks.chat_image_prompt_compose]` to be configured (`422` otherwise), and `content` follows the ordinary non-empty rule. When `false` the PDE decides. A leftover `mode` key from the pre-1.0.1 contract deserializes and is silently ignored. |
+| `force` | `bool` | `false` | Override the PDE decision for this turn — the turn is always `reply_image` (image only, no text reply), even while the persona is offline. Requires `[tasks.chat_image_prompt_compose]` to be configured (`422` otherwise), and `content` follows the ordinary non-empty rule. When `false` the PDE decides. A leftover `mode` key from the pre-1.0.1 contract deserializes and is silently ignored. |
 | `style` | `"realistic"` \| `"semi_realistic"` \| `"anime"` | `"realistic"` | One of the three engine-owned style presets; `"realistic"` is the engine's built-in default. |
 | `aspect_ratio` | `String` | none | Allowed: `1:1`, `3:4`, `4:3`, `9:16`, `16:9`; absent when omitted (PDE plan → request → absent). Returns `422` if invalid. |
 | `prompt_variant` | `String` | none | Selects a `[tasks.chat_image_prompt_compose].filter_prompt` variant: an index (`"0"`, `"1"`) or a key (`"a"`, `"b"`), depending on how that task is configured (see [model-config.md](model-config.md)). `"raw"` carries no special meaning: it selects a prompt only if the deployment configures a variant under that literal key, exactly like any other name. An index/key that doesn't match — `"raw"` included — falls back to the engine's built-in composer prompt, never a `422` or other error. Ignored when the task isn't configured, or configures a single plain prompt. |
@@ -808,7 +808,7 @@ for one of three reasons:
 
 Either way one assistant message is generated, persisted and returned.
 Otherwise `greeting` is `null`. It is also `null`, without generating, while
-the persona's `away_from_phone` life event is under way (see
+an offline life event of the persona is under way (see
 [the events route](#post-v2compsessionsession_idevents)).
 
 ```json
@@ -878,9 +878,10 @@ event's message (see the events route below).
 
 Ask for something to happen in the persona's day. The caller decides when to
 ask; the engine decides whether and what. It draws one kind of event, or none,
-and the persona tells the user in one proactive message — except
-`away_from_phone`, which is silence (below). While an event lasts, the judge
-and the reply know she is in it (see [model-config.md](model-config.md#taskspde_decision--opt-in-llm-pde-judge)).
+and the persona tells the user in one proactive message — except the offline
+kinds, which make her unreachable and are announced only in part (below). While
+an event lasts, the judge and the reply know she is in it (see
+[model-config.md](model-config.md#taskspde_decision--opt-in-llm-pde-judge)).
 How the draw works and how events and the persona's needs fit together is in
 [life-events-needs.md](life-events-needs.md).
 
@@ -913,6 +914,8 @@ Kinds fall into four categories. `short` and `mid` are incidents; `body` and
 | `short` | `bathing` | 1 h | she is in the bath |
 | `short` | `in_class` | 1 h | she is in class |
 | `short` | `on_the_way` | 30 min | she is on her way somewhere |
+| `short` | `period_scare` | 1 h | she thinks her period is late — a false alarm |
+| `short` | `pregnancy_scare` | 1 h | a pregnancy test comes up positive — a false alarm |
 | `mid` | `temp_work` | 4 h | she is called in to work |
 | `mid` | `ex_message` | 3 h | her ex texts her |
 | `mid` | `weather_change` | 4 h | the weather turns |
@@ -921,9 +924,12 @@ Kinds fall into four categories. `short` and `mid` are incidents; `body` and
 | `mid` | `working_out` | 1–2 h | she is working out |
 | `mid` | `reading` | 1–3 h | she is reading |
 | `mid` | `gaming` | 2–4 h | she is gaming |
-| `mid` | `away_from_phone` | 1–3 h | she is not looking at her phone |
+| `mid` | `away_from_phone` | 1–3 h | she is not looking at her phone (offline) |
 | `mid` | `unwell` | 1–4 h | she feels unwell |
 | `mid` | `irritable` | 2–4 h | she is irritable |
+| `mid` | `busy` | 1–3 h | she is busy (offline) |
+| `mid` | `in_battle` | 2–4 h | she is in the thick of a hard fight — a business dinner, a negotiation, or a real battle, by her world (offline) |
+| `mid` | `asleep` | 1–4 h | she has fallen asleep (offline) |
 | `body` | `sick` | 1–3 d | she is ill |
 | `body` | `period` | 3–7 d | her period |
 | `body` | `hospitalized` | 2–5 d | she is in hospital |
@@ -944,16 +950,19 @@ The draw:
   under way, only incidents are drawn; in hospital or after surgery, not the
   ones that need her out and about (`temp_work`, `police_encounter`,
   `animal_encounter`, `hit_someone`, `got_hit`, `working_out`,
-  `grocery_shopping`, `in_class`, `on_the_way`).
+  `grocery_shopping`, `in_class`, `on_the_way`, `in_battle`); during `period`,
+  neither `period_scare` nor `pregnancy_scare`.
 - **Cooldowns.** Each kind has a cooldown from when it started. A trip starts
   at most once a week, and a `body` state at most once a fortnight, whichever
-  kind.
+  kind. Any offline kind starts at most once every 12 hours, whichever kind.
 - **Her needs weight the pick** within a category, when the deployment runs the
   LLM judge and the persona has a rating.
 - **Closeness gates.** `ex_message` and `breakup` are not drawn for someone she
   barely knows (intimacy rung 2 and up); `sudden_desire` only at the closest
   rung (3). `period` is drawn only for a persona whose `art_metadata.gender` is
-  `"female"`.
+  `"female"`. `period_scare` (rung 2 and up) and `pregnancy_scare` (rung 3) are
+  also drawn only for such a persona. The offline kinds follow the two ghost
+  gates (below).
 - **Persona settings** in the genome's `art_metadata` shape the draw:
 
   | Key | Value | Effect |
@@ -972,34 +981,58 @@ no message is generated. Otherwise, one non-streaming generation, a few
 seconds:
 
 ```json
-{"event": {"kind": "business_trip", "category": "trip", "started_at": "2026-10-15T12:00:00Z", "ends_at": "2026-10-16T12:00:00Z", "message_id": "…"},
+{"event": {"kind": "business_trip", "category": "trip", "offline": false, "started_at": "2026-10-15T12:00:00Z", "ends_at": "2026-10-16T12:00:00Z", "message_id": "…"},
  "message": {"message_id": "…", "content": "要去外地出差一天，晚上再找你", "sent_at": "2026-10-15T12:00:00Z", "occasion": "event"}}
 ```
 
 `message` has the `/open` greeting's shape, with `occasion: "event"`.
 `started_at` is the message's `sent_at`; `ends_at` is that moment plus the
 drawn length. An incident drawn during a background is told from inside it
-(「出差途中遇到一只小猫」).
+(「出差途中遇到一只小猫」). `offline` is `true` for the offline kinds (below)
+and `false` for every other kind.
 
-**`away_from_phone`** generates nothing: the response carries the event with
-`"message": null` and `"message_id": null`. While it lasts, every text turn in
-any session of the persona ghosts, without the judge and without counting
-towards the ghost streak, and `/open` returns `null`. A turn that carries a
+**Offline kinds.** `away_from_phone`, `busy`, `in_battle` and `asleep` make her
+unreachable while they last. `busy` and `in_battle` are announced in one
+message at intimacy rung 2 and up. Otherwise, and always for the other two,
+nothing is generated: the response carries the event with `"message": null`
+and `"message_id": null`, and `started_at` is the moment of the call.
+
+```json
+{"event": {"kind": "asleep", "category": "mid", "offline": true, "started_at": "2026-10-15T15:00:00Z", "ends_at": "2026-10-15T18:00:00Z", "message_id": null},
+ "message": null}
+```
+
+While one lasts, every text turn in any session of the persona ghosts, without
+the judge and without counting towards the ghost streak, and `/open` returns
+`null`. An announced `busy` or `in_battle` still ghosts. A turn that carries a
 user `action` (any `type`: `give`, `gift`, `tip`, `kiss`, `hug`, `touch`,
 `lick`, `custom`) or `image.force = true` is the exception: it takes the normal
 path and is answered, because an action is interaction in person, which needs
-no phone, and a forced image turn is always `reply_image`. The persona goes silent this way only where the
-ghost protection allows it, so with the deployment's ghosting switch off
-(`ghosting = false`) `away_from_phone` is not drawn and one already under way no
-longer silences turns, and it is not drawn in a session with fewer than 10 user
-messages; a caller that does not want it at all leaves it out
-of `kinds`. A message ghosted this way carries no read receipt (no judge read
-it), and it still carries none after the persona explains. Once the
-event is over, in a session where the user's messages were ghosted, the
+no phone, and a forced image turn is always `reply_image`. The persona goes
+silent this way only where the ghost protection allows it, so with the
+deployment's ghosting switch off (`ghosting = false`) no offline kind is drawn
+and one already under way no longer silences turns, and none is drawn in a
+session with fewer than 10 user messages; a caller that does not want them
+leaves them out of `kinds`. A message ghosted this way carries no read receipt
+(no judge read it), and it still carries none after the persona explains. Once
+the event is over, in a session where the user's messages were ghosted, the
 persona's next message — a reply, an `/open` greeting or an event message —
-explains she had not been looking at her phone. After she has written once,
-that is done. The mechanics are in
+explains it in the kind's words: she was asleep, busy, in the thick of a hard
+fight or not looking at her phone, and only now sees what was sent. The
+announcement of `busy` or `in_battle` does not count as the explanation: it was
+written before the event ended. After she has written a message with text there,
+that is done; an image-only reply does not count. The mechanics are in
 [ghost-mechanics.md](ghost-mechanics.md#ghosting-the-engine-imposes).
+
+**False alarms.** `period_scare` and `pregnancy_scare` are told as the scare
+itself, in the persona's own words. While one lasts, nothing in the judge's or
+the reply's context says it is false. The events and effects routes report its
+`kind` (`period_scare`, `pregnancy_scare`) all the same, and the client decides
+how to show it: showing the kind name tells the user it will turn out to be
+nothing. Once it is over, her next message in the session that told it — a
+reply, an `/open` greeting or an event message — says it was a false alarm.
+After she has written a message with text there, that is done; an image-only
+reply does not count. Her other sessions never carry it.
 
 - **Idempotent per session and `event_key`.** A repeat call returns the same
   event and message, with no draw and no generation. A repeat that arrives
@@ -1020,7 +1053,12 @@ that is done. The mechanics are in
 - **While it lasts.** The judge's context carries a `[近期事件]` line and the
   reply's `[character_state]` a `- 正在经历：…` line, each listing the
   background and the incident under way; `/open` greetings carry the
-  `- 正在经历：…` line too. `GET …/effects` shows both.
+  `- 正在经历：…` line too. `GET …/effects` shows both. After an offline kind
+  has ended, in a session where it ghosted her messages, or a false alarm has
+  ended, in the session that told it, the `[近期事件]` line adds an item for it
+  and the reply a `- 刚才：…` line until she has written there once (a message
+  with text; see
+  [model-config.md](model-config.md#taskspde_decision--opt-in-llm-pde-judge)).
 - **Errors:** `400` with `code: "invalid_payload"` for a malformed
   `event_key`; `422` for an unknown `kind`. Session checks as on `/open`
   (`403`, `404`, `409` for a voice or group session), `429` at the per-user
@@ -1030,13 +1068,13 @@ that is done. The mechanics are in
 
 ### `GET /v2/comp/session/{session_id}/effects`
 
-The persona's lingering state from accepted gives, her needs and the events under way, as a text turn sent now would carry them: for a page that opens on a conversation, and for async callers, which receive no frames. Right after the turn that accepted a consumable, this route already lists it at step 1, while that turn's `body_state` frame does not list it: the frame describes the reply just written, the route the persona as she is now. `needs` is the persona's needs carried to now (the same shape as on the `body_state` frame), or `null` with no rating or without the LLM judge. `event` is the incident under way now and `background_event` the background under way now (the same shape as on the events route), each `null` when there is none. An `away_from_phone` under way is reported as `event`, like any other incident.
+The persona's lingering state from accepted gives, her needs and the events under way, as a text turn sent now would carry them: for a page that opens on a conversation, and for async callers, which receive no frames. Right after the turn that accepted a consumable, this route already lists it at step 1, while that turn's `body_state` frame does not list it: the frame describes the reply just written, the route the persona as she is now. `needs` is the persona's needs carried to now (the same shape as on the `body_state` frame), or `null` with no rating or without the LLM judge. `event` is the incident under way now and `background_event` the background under way now (the same shape as on the events route), each `null` when there is none. An offline kind under way is reported as `event`, like any other incident, with `"offline": true`.
 
 ```json
 {"effects": [{"item": "alcohol", "name": "威士忌", "quantity": 3, "level": 2, "phase": "rising", "step": 2, "steps": 3}],
  "needs": {"hunger": "high", "social": "mid", "stamina": "low", "emotional": "mid"},
  "event": null,
- "background_event": {"kind": "short_trip", "category": "trip", "started_at": "2026-10-15T08:00:00Z", "ends_at": "2026-10-17T08:00:00Z", "message_id": "…"}}
+ "background_event": {"kind": "short_trip", "category": "trip", "offline": false, "started_at": "2026-10-15T08:00:00Z", "ends_at": "2026-10-17T08:00:00Z", "message_id": "…"}}
 ```
 
 `effects` is `[]` when nothing is at work. Errors as `/open`: `404 session_not_found`, `403 session_forbidden`, `409 wrong_channel` for a voice or group session.
@@ -1179,7 +1217,7 @@ other — only the engine's own writer is text-only, so it is voice **`user`**
 rows that stay unstamped.
 
 **Read `read_at: absent` as "no receipt", never as "not yet read."** Voice
-`user` rows, a `user` row ghosted during an `away_from_phone` stretch (no judge
+`user` rows, a `user` row ghosted during an offline stretch (no judge
 read it), and — on a deployment running without the PDE judge — every `user`
 row stay unstamped permanently.
 
@@ -2182,7 +2220,7 @@ refusals too. The table below covers the plain shape:
 - `crates/eros-engine-server/src/routes/companion_stream.rs` — streaming chat turn (`message/stream`), incl. actions + `image_url` handling
 - `crates/eros-engine-server/src/routes/companion_async.rs` — enqueue-only chat turn (`v2/comp/session/{session_id}/message/async`)
 - `crates/eros-engine-server/src/routes/session_open.rs` — the persona speaking first: birthday and holiday greetings and caller-named occasions (`v2/comp/session/{session_id}/open`)
-- `crates/eros-engine-server/src/routes/session_events.rs` — life events the persona tells: the draw, and the proactive message that tells it (none for `away_from_phone`) (`v2/comp/session/{session_id}/events`)
+- `crates/eros-engine-server/src/routes/session_events.rs` — life events the persona tells: the draw, and the proactive message that tells it (none for an offline kind she does not announce) (`v2/comp/session/{session_id}/events`)
 - `crates/eros-engine-server/src/routes/session_effects.rs` — the persona's lingering state from accepted gives, her needs and the events under way (`v2/comp/session/{session_id}/effects`)
 - `crates/eros-engine-server/src/routes/group.rs` — group management and the group send route (`v2/comp/group*`)
 - `crates/eros-engine-server/src/routes/reaction.rs` — message reactions: set, clear and the allowlist (`v2/comp/session/{session_id}/message/{message_id}/reaction`, `v2/comp/reactions`)

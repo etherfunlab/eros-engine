@@ -2136,7 +2136,7 @@
           "companion"
         ],
         "summary": "Ask for something to happen in the persona's day.",
-        "description": "The engine draws one kind of event, or none (a short or mid-length\nincident is under way, or every allowed kind is cooling down). During a\nbackground event (a trip or a body state) only incidents are drawn. The\npersona then tells the user in one proactive message, persisted like any\nreply and returned with the event; `away_from_phone` is drawn without a\nmessage. The same `event_key` returns the same event.",
+        "description": "The engine draws one kind of event, or none (a short or mid-length\nincident is under way, or every allowed kind is cooling down). During a\nbackground event (a trip or a body state) only incidents are drawn. The\npersona then tells the user in one proactive message, persisted like any\nreply and returned with the event. The offline kinds (`away_from_phone`,\n`busy`, `in_battle`, `asleep`) make her unreachable while they last.\n`busy` and `in_battle` are announced in a message at intimacy rung 2 and\nup; below that, and always for `away_from_phone` and `asleep`, the event\ncomes back with `message: null`. The same `event_key` returns the same\nevent.",
         "operationId": "draw_event",
         "parameters": [
           {
@@ -4178,6 +4178,8 @@
           "bathing",
           "in_class",
           "on_the_way",
+          "period_scare",
+          "pregnancy_scare",
           "temp_work",
           "ex_message",
           "weather_change",
@@ -4189,6 +4191,9 @@
           "away_from_phone",
           "unwell",
           "irritable",
+          "busy",
+          "in_battle",
+          "asleep",
           "sick",
           "period",
           "hospitalized",
@@ -4201,10 +4206,11 @@
       },
       "EventView": {
         "type": "object",
-        "description": "A life event: what happened, when it started and ends, and the message\nthat told it (`null` for an event that is never told).",
+        "description": "A life event: what happened, when it started and ends, whether it keeps\nthe persona offline while it lasts, and the message that told it (`null`\nfor an event that is not told).",
         "required": [
           "kind",
           "category",
+          "offline",
           "started_at",
           "ends_at"
         ],
@@ -4225,6 +4231,10 @@
               "null"
             ],
             "format": "uuid"
+          },
+          "offline": {
+            "type": "boolean",
+            "description": "While it lasts, her 1:1 text turns in any of her sessions ghost,\nexcept turns carrying a user `action` or `image.force`, and except on\na deployment with ghosting off; `/open` returns no greeting."
           },
           "started_at": {
             "type": "string",

@@ -119,7 +119,7 @@ impl Occasion {
 
 /// The stage cue for a life event (spec 2026-10-15-life-events-v2-design.md
 /// §3.4): states a fact, carries no instruction. A background's cue carries
-/// its length. `away_from_phone` is never told.
+/// its length. A kind that is never told (`events::is_told`) has no cue.
 fn kind_cue(kind: EventKind, lasts: chrono::Duration) -> String {
     use EventKind::*;
     let span = crate::prompt::span_text(lasts);
@@ -133,6 +133,8 @@ fn kind_cue(kind: EventKind, lasts: chrono::Duration) -> String {
         Bathing => "（你正在泡澡。）".into(),
         InClass => "（你正在上课。）".into(),
         OnTheWay => "（你正在赶路。）".into(),
+        PeriodScare => "（你发现月经推迟了好几天还没来，心里有点慌。）".into(),
+        PregnancyScare => "（你刚验了孕，验出两条杠，整个人都懵了。）".into(),
         TempWork => "（你刚临时接到一份工作，得马上去处理。）".into(),
         ExMessage => "（你的前任刚给你发来消息。）".into(),
         WeatherChange => "（你那边的天气刚刚突然变了。）".into(),
@@ -141,9 +143,11 @@ fn kind_cue(kind: EventKind, lasts: chrono::Duration) -> String {
         WorkingOut => "（你正在健身。）".into(),
         Reading => "（你正在看书。）".into(),
         Gaming => "（你正在打游戏。）".into(),
-        AwayFromPhone => unreachable!("away_from_phone is never told"),
         Unwell => "（你现在有点不舒服。）".into(),
         Irritable => "（你现在心里很烦躁。）".into(),
+        Busy => "（你接下来要忙一阵，这段时间顾不上看手机。）".into(),
+        InBattle => "（你接下来要去打一场硬仗，一段时间顾不上手机。）".into(),
+        AwayFromPhone | Asleep => unreachable!("{kind:?} is never told"),
         Sick => format!("（你生病了，大概要 {span}才会好。）"),
         Period => "（你的月经来了。）".into(),
         Hospitalized => format!("（你刚住进医院，大概要住 {span}。）"),
@@ -264,15 +268,17 @@ pub(crate) async fn greet(
         aspect_ratio: None,
         action_response: None,
     };
-    let current = eros_engine_store::events::EventRepo { pool: &state.pool }
-        .current(g.instance_id, None, g.now.now)
+    let repo = eros_engine_store::events::EventRepo { pool: &state.pool };
+    let current = repo.current(g.instance_id, None, g.now.now).await?;
+    let offline = repo
+        .unexplained_offline(g.session_id, g.instance_id, g.now.now)
+        .await?;
+    let scare = repo
+        .unresolved_scare(g.session_id, g.instance_id, g.now.now)
         .await?;
     let event_lines = crate::prompt::EventLines {
         under_way: crate::prompt::events_reply_text(&current),
-        away_unexplained: eros_engine_store::events::EventRepo { pool: &state.pool }
-            .unexplained_away(g.session_id, g.instance_id, g.now.now)
-            .await?
-            .is_some(),
+        just_now: crate::prompt::just_now_text(offline.as_ref(), scare.as_ref()),
     };
     let (mut chat_req, injected_tags) = build_reply_request(
         state,
@@ -435,6 +441,20 @@ mod tests {
     use super::*;
     use chrono::Duration;
 
+    /// `kind_cue` panics for a kind that is never told; it must not for any
+    /// kind `is_told` lets through at any rung.
+    #[test]
+    fn every_kind_she_tells_has_a_cue() {
+        use eros_engine_core::events::{is_told, EventKind};
+        for k in EventKind::ALL {
+            for rung in 1..=3 {
+                if is_told(k, rung) {
+                    let _ = super::kind_cue(k, chrono::Duration::hours(1));
+                }
+            }
+        }
+    }
+
     #[test]
     fn every_told_kind_has_its_cue() {
         let h = Duration::hours(1);
@@ -468,6 +488,22 @@ mod tests {
             (EventKind::Unwell, "（你现在有点不舒服。）"),
             (EventKind::Irritable, "（你现在心里很烦躁。）"),
             (EventKind::Period, "（你的月经来了。）"),
+            (
+                EventKind::PeriodScare,
+                "（你发现月经推迟了好几天还没来，心里有点慌。）",
+            ),
+            (
+                EventKind::PregnancyScare,
+                "（你刚验了孕，验出两条杠，整个人都懵了。）",
+            ),
+            (
+                EventKind::Busy,
+                "（你接下来要忙一阵，这段时间顾不上看手机。）",
+            ),
+            (
+                EventKind::InBattle,
+                "（你接下来要去打一场硬仗，一段时间顾不上手机。）",
+            ),
         ] {
             assert_eq!(kind_cue(kind, h), cue, "{kind:?}");
         }
@@ -496,6 +532,18 @@ mod tests {
             );
         }
         assert_eq!(event_cue(EventKind::Reading, h, None), "（你正在看书。）");
+    }
+
+    #[test]
+    fn a_false_alarm_during_a_trip_opens_with_the_trip() {
+        assert_eq!(
+            event_cue(
+                EventKind::PeriodScare,
+                Duration::hours(1),
+                Some(EventKind::BusinessTrip)
+            ),
+            "（你正在外地出差。你发现月经推迟了好几天还没来，心里有点慌。）"
+        );
     }
 
     #[test]

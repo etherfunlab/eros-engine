@@ -7,7 +7,7 @@ basic levels (hunger, social, stamina, emotional) that the PDE judge rates and t
 carries forward in time. **Life events** are things that happen to her, drawn when a
 caller asks: a trip, an illness, a stray cat, an hour away from her phone. Both reach the
 judge and the reply as plain facts in the present tense. Neither tells her how to behave;
-the one exception is an event that is silence (`away_from_phone`).
+the exception is an event that is silence (the offline kinds).
 
 Request and response shapes are in [api-reference.md](api-reference.md), the judge's
 context and verdict in
@@ -20,7 +20,7 @@ about how the pieces work and how they fit together.
 |---|---|---|
 | What it is | four levels: `hunger`, `social`, `stamina`, `emotional`, each `low` / `mid` / `high` | things that happen in her day, in four categories |
 | Written by | the PDE judge, on a judged text turn | a caller's `POST /v2/comp/session/{session_id}/events`; the engine picks the kind |
-| Stored in | `metadata.needs` of the rated user row | `engine.persona_events`, plus the message that tells it (none for `away_from_phone`) |
+| Stored in | `metadata.needs` of the rated user row | `engine.persona_events`, plus the message that tells it (none for an offline kind she does not announce) |
 | Scope | one state per persona instance, across all its sessions | the same |
 | Time | drifts between ratings, computed on read | `started_at` and `ends_at`; cooldowns count from the start |
 | Needs the LLM judge | yes | no |
@@ -61,7 +61,7 @@ effects route, no needs factor in the event draw, nothing in a voice call.
   before the turn goes on. A failed write is logged and the turn carries on with the verdict's
   levels in memory.
 - **What writes nothing.** A rule-engine turn (the judge is off or failed), a `needs: null`
-  verdict, a turn silenced by an `away_from_phone` stretch (it runs no judge), and every group
+  verdict, a turn silenced by an offline stretch (it runs no judge), and every group
   or voice turn.
 - **Whose state.** The persona instance's. The newest rated row is read across all the
   instance's sessions, so a second session does not reset her hunger.
@@ -140,7 +140,7 @@ the levels and decides.
 
 ### Categories
 
-An event is one of 28 kinds. Each kind belongs to a category, and the category sets its
+An event is one of 33 kinds. Each kind belongs to a category, and the category sets its
 shape:
 
 | `category` | shape | lasts | category weight | category cooldown |
@@ -166,10 +166,11 @@ The draw is a pure function of the inputs plus three random numbers (one per sta
 the length).
 
 1. **Eligibility.** A kind is eligible when all of these hold:
-   - it is in the caller's `kinds` (absent means all 28; `[]` means none);
+   - it is in the caller's `kinds` (absent means all 33; `[]` means none);
    - it passes its gate (below);
    - its own cooldown has elapsed;
    - its category's cooldown has elapsed;
+   - for an offline kind, the shared offline cooldown has elapsed (below);
    - the background rules allow it (below).
 2. **Category.** Each category with at least one eligible kind weighs its category weight
    times its persona factor. A roll picks one by cumulative weight.
@@ -193,7 +194,8 @@ eligible kind drops out of the first stage and the others share its weight.
 - While a background is under way, no second background is drawn. Incidents still are, except
   that during `hospitalized` and `post_surgery` the ones that need her out and about are not:
   `temp_work`, `police_encounter`, `animal_encounter`, `hit_someone`, `got_hit`,
-  `working_out`, `grocery_shopping`, `in_class`, `on_the_way`.
+  `working_out`, `grocery_shopping`, `in_class`, `on_the_way`, `in_battle`. During `period`,
+  `period_scare` and `pregnancy_scare` are not drawn.
 - One incident and one background can run together. An incident drawn inside a background is
   told from inside it.
 - This is per persona instance across all its sessions: she has one life. A draw reads the
@@ -210,6 +212,9 @@ is under way, and a background is not written while any event is.
   `trip` kinds have none of their own; the category cooldown covers them.
 - **Per category.** `body` cannot start more than once a fortnight and `trip` more than once
   a week, whichever kinds are involved. `short` and `mid` have none.
+- **Shared by the offline kinds.** For 12 hours after any offline kind started, no offline kind
+  is eligible, whichever kind it was; each kind's own cooldown still applies. It bounds how often
+  she goes silent, the way the category cooldowns bound trips and body states.
 - **Per key.** The same `event_key` in the same session returns the same event with no draw
   and no generation.
 - **Not capped.** The engine sets no limit on how often a caller may ask. Frequency is the
@@ -226,7 +231,9 @@ weight and never lifts a gate.
 | `ex_message`, `breakup` | intimacy rung 2 or higher |
 | `sudden_desire` | intimacy rung 3 |
 | `period` | the persona's `art_metadata.gender` is `"female"` |
-| `away_from_phone` | the ghost protections allow it (see [below](#away_from_phone)) |
+| `period_scare` | the persona's `art_metadata.gender` is `"female"`, and intimacy rung 2 or higher |
+| `pregnancy_scare` | the persona's `art_metadata.gender` is `"female"`, and intimacy rung 3 |
+| `away_from_phone`, `busy`, `in_battle`, `asleep` | the ghost protections allow it (see [below](#offline-kinds)) |
 
 The rung (1 to 3) is read from the session's affinity, time-decayed as in a chat turn; see
 [affinity-model.md](affinity-model.md).
@@ -262,7 +269,8 @@ is refused with `409 wrong_channel`.
 
 ### How she tells it
 
-Every kind except `away_from_phone` is told in one proactive message. It is generated by the
+Every kind is told in one proactive message, except `away_from_phone`, `asleep`, and `busy` and
+`in_battle` below intimacy rung 2 ([below](#offline-kinds)). It is generated by the
 same companion model path as a reply (persona, history window, memory recall, `[now]`), with
 no judge, no streaming and no user row. The engine adds a stage cue as the final `user` turn
 of the request. The cue is never persisted. It states a fact and carries no instruction:
@@ -310,7 +318,8 @@ The events under way at a moment are the background and the incident whose
   A span under one hour reads `不到 1 小时` (and the end then drops the `约`); under 48 hours it
   is whole hours, rounded; from 48 hours it is whole days, rounded. `{label}` is a fixed
   Chinese name per kind (`reading` is `在看书`, `long_trip` is `长途旅游`). The line is absent
-  when nothing is under way and no away stretch is unexplained (below).
+  when nothing is under way, no offline stretch is unexplained and no false alarm is
+  unresolved (below).
 - **The reply** gets `- 正在经历：` in `[character_state]`, after `此刻的需要`, listing the same
   two events with only the end:
 
@@ -321,31 +330,50 @@ The events under way at a moment are the background and the incident whose
   This works with or without the LLM judge. `/open` greetings and event messages carry the same
   line. Voice, group and image-edit requests read no events.
 - **The caller** gets them from `GET …/effects`: `event` is the incident under way, and
-  `background_event` the background. An `away_from_phone` under way is reported as `event`
-  like any incident; how a client shows it is its call.
+  `background_event` the background. An offline kind under way is reported as `event`
+  like any incident, with `"offline": true`; how a client shows it is its call.
 
 A text turn reads the events as of its own user row's send time, so a turn that is driven
 again sees the same ones.
 
-### `away_from_phone`
+### Offline kinds
 
-The one kind that is silence. Nothing is generated when it starts.
+Four kinds make the persona unreachable while they last: `away_from_phone`, `busy`,
+`in_battle` and `asleep`. Offline is how she behaves while the event lasts, not a category:
+`busy` is `mid` by length and offline by behaviour. The four share the same gates, the same
+silence, the same exemptions and the same explanation afterwards; they differ in wording and
+in whether she announces them. `in_battle` is worded so that her world decides what it is: a
+modern persona reads it as a hard negotiation, a business dinner or a difficult matter, a
+historical or fantasy persona as a real fight. The kinds and their durations are in
+[the events route](api-reference.md#post-v2compsessionsession_idevents).
 
-**Drawn.** No model call. The event row is written with `message_id` NULL and `started_at` at
-the moment of the call, lasting 1 to 3 hours. The response carries the event with
-`"message": null`. It is drawn only where the persona may go silent, so the draw applies two
-gates borrowed from the ghost protections. A gated draw leaves `away_from_phone` out of the
-allowed kinds and the others draw as usual:
+**Announced or silent.** At intimacy rung 2 and up, `busy` and `in_battle` are told in one
+proactive message like any other kind, with a stage cue that states the fact:
+
+```
+（你接下来要忙一阵，这段时间顾不上看手机。）
+（你接下来要去打一场硬仗，一段时间顾不上手机。）
+```
+
+Below rung 2 she goes quiet without a word. `asleep` and `away_from_phone` are never
+announced. A blank or failed announcement writes nothing, as for any told kind.
+
+**Drawn.** For a kind she does not announce there is no model call. The event row is written
+with `message_id` NULL and `started_at` at the moment of the call, and the response carries the
+event with `"message": null`. An offline kind is drawn only where the persona may go silent,
+so the draw applies two gates borrowed from the ghost protections. A gated draw leaves the
+offline kinds out of the allowed kinds and the others draw as usual:
 
 - not while the deployment's ghosting switch is off (`ghosting = false` on
   `[tasks.pde_decision]`);
 - not in a session with fewer than 10 user messages, the floor `ghost_permitted` enforces.
 
 The gates apply to the draw, in the session the caller draws in. A stretch that exists
-silences the persona's turns in every session.
+silences the persona's turns in every session. The offline kinds also share one cooldown
+(see [Cooldowns and caps](#cooldowns-and-caps)).
 
 **While it lasts.** Every 1:1 text turn of the persona, in any session, ghosts without the
-judge and without the ghost score:
+judge and without the ghost score. An announced `busy` or `in_battle` still ghosts.
 
 - The user's row is marked ghosted. It carries no read receipt, because no judge read it, and
   still carries none after she explains.
@@ -360,27 +388,75 @@ judge and without the ghost score:
 Two kinds of turn are exempt and take the normal path:
 
 - **An action turn** (a give, a tip, a kiss and the rest). An action is interaction in person,
-  which needs no phone, so it is answered. Its `正在经历` line still lists the away stretch.
+  which needs no phone, so it is answered. Its `正在经历` line still lists the offline stretch.
 - **A forced-image turn** (`image.force = true`), which is always an image.
 
 With the ghosting switch off, a stretch that is under way silences nothing; turns take the
 normal path and the `正在经历` line still lists it. The rest of the mechanics are in
 [ghost-mechanics.md](ghost-mechanics.md#ghosting-the-engine-imposes).
 
-**Afterwards.** The explanation is derived, not flagged. In a session `S`, an away event `E`
-is unexplained at a moment when:
+**Afterwards.** The explanation is derived, not flagged. In a session `S`, an offline event
+`E` is unexplained at a moment when:
 
-- `E` is the instance's newest `away_from_phone` that has ended, within the last 90 days;
+- `E` is the instance's newest offline event, of any offline kind, that has ended, within the
+  last 90 days;
 - `S` holds a user row that was ghosted inside `E`'s window;
-- `S` holds no assistant row written since `E` ended.
+- `S` holds no assistant row with text written since `E` ended (an image-only reply does not
+  count).
 
 While `E` is unexplained, every persona message generated in `S` carries the line below: a
-turn's reply, an `/open` greeting or an event message. The judge's `[近期事件]` line ends with
-`没看手机（2 小时前结束，期间对方的消息你没有回）`. The first assistant row written after `E`
-ended closes it. A reply the persona wrote inside the window (an action turn) does not.
+turn's reply, an `/open` greeting or an event message. Its text is the kind's own: what kept
+her away, and that she only now sees what was sent. The judge's `[近期事件]` line ends with
+`{label}（{span}前结束，期间对方的消息你没有回）`, such as
+`睡着了（2 小时前结束，期间对方的消息你没有回）`. The first assistant row with text written
+after `E` ended closes it; an image-only reply does not. A reply the persona wrote inside the window (an action turn) does not, and
+neither does the announcement of `busy` or `in_battle`: it was written when the event started,
+before it ended. The text of every kind is in
+[model-config.md](model-config.md#taskspde_decision--opt-in-llm-pde-judge).
 
 ```
-- 刚才：有段时间没看手机，对方那时发来的消息你现在才看到
+- 刚才：睡着了，对方那时发来的消息你现在才看到
+```
+
+### False alarms
+
+`period_scare` and `pregnancy_scare` are two `short` kinds, an hour long, that turn out to be
+nothing. They are gated on a female persona (`period_scare` from intimacy rung 2,
+`pregnancy_scare` at rung 3), and neither is drawn during `period`. She tells each as the
+scare itself, in one proactive message:
+
+```
+（你发现月经推迟了好几天还没来，心里有点慌。）
+（你刚验了孕，验出两条杠，整个人都懵了。）
+```
+
+**While it lasts.** `正在经历` and `[近期事件]` carry the label only (`月经没来`,
+`验出怀孕`). Nothing in any prompt says it is a false alarm: she does not know yet. She is not
+offline and answers as usual.
+
+**Afterwards.** The resolution is derived, not flagged. In a session `S`, a false alarm `F`
+is unresolved at a moment when:
+
+- `F` is the newest `period_scare` or `pregnancy_scare` told in `S` that has ended, within the
+  last 90 days;
+- `S` holds no assistant row with text written since `F` ended (an image-only reply does not
+  count).
+
+While `F` is unresolved, every persona message generated in `S` carries the line below, and
+the judge's `[近期事件]` line ends with `月经没来（{span}前结束，结果是虚惊一场）` (or the
+same with `验出怀孕`). The first assistant row with text written after `F` ended closes it. Her other
+sessions never carry it: she told it in one.
+
+```
+- 刚才：以为月经没来，后来来了，是虚惊一场
+```
+
+When an unexplained offline stretch and an unresolved false alarm meet in the same session,
+both texts share the one line, the offline text first, joined by `；`, and the judge gets both
+items in the same order:
+
+```
+- 刚才：睡着了，对方那时发来的消息你现在才看到；以为月经没来，后来来了，是虚惊一场
 ```
 
 ### Next to `/open`
@@ -388,15 +464,15 @@ ended closes it. A reply the persona wrote inside the window (an action turn) do
 An event's message counts as a message for the `/open` birthday and holiday check, so neither
 greeting follows it on the same local day. An opener that is being generated when an event
 message lands yields and returns `null`; an event does not yield to an opener. A greeting
-carries the `正在经历` and `刚才` lines and no needs line, and `/open` returns `null` while
-`away_from_phone` is under way.
+carries the `正在经历` and `刚才` lines and no needs line, and `/open` returns `null` while an
+offline kind is under way.
 
 ### Storage
 
 - `engine.persona_events` holds one row per event: `instance_id` (cascades with the instance),
   `session_id` (where it was drawn and told; set to NULL if the session goes), `event_key`
   (unique within the session), `kind`, `started_at`, `ends_at` and `message_id` (the message
-  that tells it; NULL for `away_from_phone`, and set to NULL if the message goes). Category and
+  that tells it; NULL for an offline kind she does not announce, and set to NULL if the message goes). Category and
   background-ness derive from the kind and are not stored. A row whose kind the build does not
   know is skipped on read.
 - The message is a row of `engine.chat_messages` with `metadata.proactive = 'event'`; the
@@ -415,7 +491,7 @@ steers which kind comes up, never whether a category does. The factors, from
 | need level | kinds | factor |
 |---|---|---|
 | `stamina` is `low` | `temp_work`, `working_out` | ×0.5 |
-| `stamina` is `low` | `unwell`, `sick`, `bathing` | ×2 |
+| `stamina` is `low` | `unwell`, `sick`, `bathing`, `asleep` | ×2 |
 | `hunger` is `high` | `grocery_shopping` | ×2 |
 | `emotional` is `high` | `ex_message` | ×3 |
 | `emotional` is `high` | `animal_encounter`, `irritable` | ×2 |
@@ -433,9 +509,9 @@ and rates the needs itself with the event in view; the reference judge prompt in
 (`needs: null`), the previous rating keeps drifting whatever happened. Needs keep one
 source: the judge.
 
-### 3. The away stretch writes no rating
+### 3. An offline stretch writes no rating
 
-A turn silenced by `away_from_phone` runs no judge, so it rates nothing. The last rating keeps
+A turn silenced by an offline kind runs no judge, so it rates nothing. The last rating keeps
 drifting through the stretch, and the first judged turn afterwards is shown it carried across
 all of it: after a long stretch she reads hungrier and lonelier than before.
 
@@ -452,7 +528,7 @@ again.
 | An event's message | generated and told as usual |
 | `正在经历` and `刚才` | reach replies, `/open` greetings and event messages |
 | `[近期事件]` | not rendered: there is no judge to read it |
-| `away_from_phone` | silences turns as with the judge, since the check runs before it: the ghosting switch and the action and forced-image exemptions apply |
+| Offline kinds | silence turns as with the judge, since the check runs before it: the ghosting switch and the action and forced-image exemptions apply |
 
 ## Code pointers
 
@@ -460,18 +536,18 @@ again.
 - `crates/eros-engine-core/src/events.rs`: categories and kinds, per-kind rules, gates, the
   needs and persona factors, `draw`, `lookback`.
 - `crates/eros-engine-server/src/routes/session_events.rs`: the events route, the draw's
-  inputs, the `away_from_phone` gates.
+  inputs, the offline gates.
 - `crates/eros-engine-server/src/pipeline/proactive.rs`: the event message, its cue and its
   write.
 - `crates/eros-engine-server/src/pipeline/stream.rs::run_stream`: the needs read and write, the
-  `[需求]` and `[近期事件]` lines (`build_pde_ctx`), the away branch ahead of the judge,
+  `[需求]` and `[近期事件]` lines (`build_pde_ctx`), the offline branch ahead of the judge,
   `body_state_frame`.
 - `crates/eros-engine-server/src/prompt.rs`: `needs_line`, `events_judge_text`,
-  `events_reply_text`, `persona_traits`, and the `[character_state]` lines.
+  `events_reply_text`, `just_now_text`, `persona_traits`, and the `[character_state]` lines.
 - `crates/eros-engine-server/src/routes/session_effects.rs`: `GET …/effects`.
 - `crates/eros-engine-server/src/pipeline/voice.rs`: the bootstrap's needs.
 - `crates/eros-engine-store/src/events.rs::EventRepo`: `insert`, `by_key`, `recent`, `current`,
-  `unexplained_away`.
+  `unexplained_offline`, `unresolved_scare`.
 - `crates/eros-engine-store/src/chat.rs::ChatRepo`: `set_needs` and `latest_needs`.
 - `crates/eros-engine-store/migrations/0070_chat_messages_needs_idx.sql` and
   `0072_persona_events.sql`: the index and the table.
