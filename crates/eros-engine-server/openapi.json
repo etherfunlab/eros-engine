@@ -3248,7 +3248,7 @@
         "type": "object",
         "required": [
           "session_id",
-          "genome_id",
+          "instance_id",
           "affinity"
         ],
         "properties": {
@@ -3257,9 +3257,17 @@
             "description": "Never null here: the list is driven by the affinity rows themselves, so\na session that has not had its first turn is absent rather than present\nwith an empty value. Treat \"missing from the response\" as \"no\nrelationship yet\" — the same state the single-session endpoint reports\nas `affinity: null`."
           },
           "genome_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "Companion this relationship is with. A client list keyed by companion\njoins on this without a second round trip to resolve the session.\nNull for a BYOC relationship; key such an item on `instance_id`."
+          },
+          "instance_id": {
             "type": "string",
             "format": "uuid",
-            "description": "Companion this relationship is with. A client list keyed by companion\njoins on this without a second round trip to resolve the session."
+            "description": "The persona instance this relationship is with. Always set, so a client\ncan key a relationship of either kind without a second round trip."
           },
           "session_id": {
             "type": "string",
@@ -3492,7 +3500,6 @@
         "required": [
           "session_id",
           "instance_id",
-          "persona_name",
           "is_new",
           "history"
         ],
@@ -3512,7 +3519,11 @@
             "type": "boolean"
           },
           "persona_name": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Null for a BYOC instance, whose name only its card holds."
           },
           "session_id": {
             "type": "string",
@@ -5559,7 +5570,7 @@
             "items": {
               "$ref": "#/components/schemas/PersonaItemView"
             },
-            "description": "Presets first, then the instance's rows, newest first. Neither\ndeduplicated nor capped."
+            "description": "Presets first, then the instance's rows, newest first. Neither\ndeduplicated nor capped. A BYOC instance has no presets here: they\nlive in its card."
           }
         }
       },
@@ -5891,7 +5902,6 @@
         "required": [
           "session_id",
           "instance_id",
-          "persona_name",
           "is_new"
         ],
         "properties": {
@@ -5903,7 +5913,11 @@
             "type": "boolean"
           },
           "persona_name": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Null for a BYOC instance, whose name only its card holds."
           },
           "session_id": {
             "type": "string",

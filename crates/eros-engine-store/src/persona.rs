@@ -27,16 +27,17 @@ pub struct GenomeGate {
     pub name: String,
 }
 
-/// Gate-fields view for the explicit-`instance_id` chat-start path: owner
-/// (403 check) and genome name (response) in one JOIN.
+/// Gate-fields view for the explicit-`instance_id` path: owner (403 check) and
+/// genome name (response) in one LEFT JOIN. A BYOC instance has no genome, so
+/// its `genome_id` and `genome_name` are `None`.
 /// Filters `status='active'` like `load_companion`, so an archived instance
 /// yields `None`. Folds the former `load_companion` read.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct InstanceGate {
     pub instance_id: Uuid,
-    pub genome_id: Uuid,
+    pub genome_id: Option<Uuid>,
     pub owner_uid: Uuid,
-    pub genome_name: String,
+    pub genome_name: Option<String>,
 }
 
 impl From<GenomeRow> for PersonaGenome {
@@ -265,7 +266,7 @@ impl<'a> PersonaRepo<'a> {
                 pi.owner_uid AS owner_uid, \
                 pg.name      AS genome_name \
              FROM engine.persona_instances pi \
-             JOIN engine.persona_genomes pg ON pg.id = pi.genome_id \
+             LEFT JOIN engine.persona_genomes pg ON pg.id = pi.genome_id \
              WHERE pi.id = $1 AND pi.status = 'active'",
         )
         .bind(instance_id)
@@ -597,9 +598,9 @@ mod tests {
             .unwrap()
             .expect("active instance gate");
         assert_eq!(gate.instance_id, iid);
-        assert_eq!(gate.genome_id, genome_id);
+        assert_eq!(gate.genome_id, Some(genome_id));
         assert_eq!(gate.owner_uid, owner);
-        assert_eq!(gate.genome_name, "Nova");
+        assert_eq!(gate.genome_name.as_deref(), Some("Nova"));
 
         // archived → None (mirrors load_companion's active filter)
         sqlx::query("UPDATE engine.persona_instances SET status = 'archived' WHERE id = $1")
@@ -887,5 +888,27 @@ mod tests {
             .await
             .unwrap();
         assert!(repo.load_byoc_instance(id).await.unwrap().is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn byoc_instance_gate_has_no_genome(pool: PgPool) {
+        let repo = PersonaRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        let id = repo.create_byoc_instance(owner, &[4u8; 32]).await.unwrap();
+        let gate = repo
+            .load_instance_gate(id)
+            .await
+            .unwrap()
+            .expect("active BYOC instance gate");
+        assert_eq!(gate.instance_id, id);
+        assert_eq!(gate.genome_id, None);
+        assert_eq!(gate.genome_name, None);
+        assert_eq!(gate.owner_uid, owner);
+        sqlx::query("UPDATE engine.persona_instances SET status = 'archived' WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(repo.load_instance_gate(id).await.unwrap().is_none());
     }
 }

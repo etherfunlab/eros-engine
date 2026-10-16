@@ -6,6 +6,9 @@
 //! instance row, gift or caller-written, can. The engine trusts the caller
 //! here as it trusts `tip` and `gift`: a caller that sells items keeps its
 //! clients from reaching POST and DELETE directly.
+//!
+//! A BYOC instance lists its own rows only; its presets belong to the card the
+//! caller holds.
 
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
@@ -20,6 +23,7 @@ use eros_engine_core::types::ItemKind;
 use eros_engine_store::persona::{InstanceItemRow, PersonaRepo};
 
 use crate::auth::middleware::AuthUser;
+use crate::byoc::{load_instance, LoadedInstance};
 use crate::error::AppError;
 use crate::routes::companion_stream::{item_name, ItemKindDto};
 use crate::state::AppState;
@@ -73,7 +77,8 @@ impl PersonaItemView {
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct PersonaItemsResponse {
     /// Presets first, then the instance's rows, newest first. Neither
-    /// deduplicated nor capped.
+    /// deduplicated nor capped. A BYOC instance has no presets here: they
+    /// live in its card.
     pub items: Vec<PersonaItemView>,
 }
 
@@ -120,26 +125,29 @@ async fn list_items(
     Path(instance_id): Path<Uuid>,
     Extension(AuthUser(jwt_user)): Extension<AuthUser>,
 ) -> Result<Json<PersonaItemsResponse>, AppError> {
-    let repo = PersonaRepo { pool: &state.pool };
-    // Same active filter as `load_instance_gate`; read whole for the presets.
-    let persona = repo
-        .load_companion(instance_id)
+    let loaded = load_instance(&state, instance_id)
         .await?
         .ok_or_else(|| AppError::NotFound("no such instance".into()))?;
-    if persona.instance.owner_uid != jwt_user {
+    if loaded.owner_uid() != jwt_user {
         return Err(AppError::Forbidden("not your data".into()));
     }
-    let mut items: Vec<PersonaItemView> = preset_items(&persona.genome.art_metadata)
-        .into_iter()
-        .map(|(kind, name)| PersonaItemView {
-            id: None,
-            kind: kind.into(),
-            name,
-            source: ItemSourceDto::Preset,
-            user_message_id: None,
-            created_at: None,
-        })
-        .collect();
+    // A BYOC persona's presets live in its card, which the caller already
+    // holds; only a genome's are listed.
+    let mut items: Vec<PersonaItemView> = match &loaded {
+        LoadedInstance::Genome(persona) => preset_items(&persona.genome.art_metadata)
+            .into_iter()
+            .map(|(kind, name)| PersonaItemView {
+                id: None,
+                kind: kind.into(),
+                name,
+                source: ItemSourceDto::Preset,
+                user_message_id: None,
+                created_at: None,
+            })
+            .collect(),
+        LoadedInstance::Byoc(_) => Vec::new(),
+    };
+    let repo = PersonaRepo { pool: &state.pool };
     items.extend(
         repo.list_items(instance_id)
             .await?
@@ -227,7 +235,9 @@ mod tests {
     use uuid::Uuid;
 
     use crate::routes::companion::test_state;
-    use crate::routes::companion::testutil::{build_router, mint_test_jwt};
+    use crate::routes::companion::testutil::{
+        build_router, mint_test_jwt, seed_byoc_instance_with_key,
+    };
 
     async fn app(pool: sqlx::PgPool) -> Router {
         build_router(test_state(pool))
@@ -380,6 +390,68 @@ mod tests {
             uri.clone(),
             Uuid::new_v4(),
             Some(serde_json::json!({"kind": "item", "name": "吉他"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+
+        sqlx::query("UPDATE engine.persona_instances SET status = 'archived' WHERE id = $1")
+            .bind(instance_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (s, _) = call(app(pool).await, "GET", uri, owner, None).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn byoc_items_list_rows_only(pool: sqlx::PgPool) {
+        let owner = Uuid::new_v4();
+        let (instance_id, _) = seed_byoc_instance_with_key(&pool, owner).await;
+        let uri = format!("/v2/comp/instance/{instance_id}/items");
+
+        let (s, posted) = call(
+            app(pool.clone()).await,
+            "POST",
+            uri.clone(),
+            owner,
+            Some(serde_json::json!({"kind": "item", "name": "摩托车"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+
+        let (s, body) = call(app(pool.clone()).await, "GET", uri.clone(), owner, None).await;
+        assert_eq!(s, StatusCode::OK);
+        let items = body["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "body={body}");
+        assert_eq!(items[0]["id"], posted["id"]);
+        assert_eq!(items[0]["source"], "caller");
+        assert!(items.iter().all(|i| i["source"] != "preset"));
+
+        let id = posted["id"].as_str().unwrap();
+        let (s, _) = call(
+            app(pool.clone()).await,
+            "DELETE",
+            format!("{uri}/{id}"),
+            owner,
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::NO_CONTENT);
+        let (_, body) = call(app(pool).await, "GET", uri, owner, None).await;
+        assert_eq!(body["items"], serde_json::json!([]));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn byoc_items_refuse_another_user_and_an_archived_instance(pool: sqlx::PgPool) {
+        let owner = Uuid::new_v4();
+        let (instance_id, _) = seed_byoc_instance_with_key(&pool, owner).await;
+        let uri = format!("/v2/comp/instance/{instance_id}/items");
+        let (s, _) = call(
+            app(pool.clone()).await,
+            "GET",
+            uri.clone(),
+            Uuid::new_v4(),
+            None,
         )
         .await;
         assert_eq!(s, StatusCode::FORBIDDEN);

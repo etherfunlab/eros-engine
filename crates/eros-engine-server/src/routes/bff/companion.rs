@@ -147,7 +147,8 @@ impl From<&BffStartRequest> for StartChatRequest {
 pub struct BffStartResponse {
     pub session_id: Uuid,
     pub instance_id: Uuid,
-    pub persona_name: String,
+    /// Null for a BYOC instance, whose name only its card holds.
+    pub persona_name: Option<String>,
     pub is_new: bool,
     /// Most-recent N messages, oldest-first. Empty for brand-new sessions.
     pub history: Vec<BffHistoryEntry>,
@@ -327,7 +328,8 @@ mod tests {
 
     use crate::routes::companion::test_state;
     use crate::routes::companion::testutil::{
-        build_router, mint_test_jwt, seed_genome, seed_instance, seed_session, send_request,
+        build_router, mint_test_jwt, seed_byoc_instance_with_key, seed_genome, seed_instance,
+        seed_session, send_request,
     };
 
     fn bff_history_request(token: &str, session_id: Uuid, query: &str) -> Request<Body> {
@@ -784,6 +786,25 @@ mod tests {
         assert!(body["history"].as_array().unwrap().is_empty());
         // Bootstrap no longer bundles affinity — the field must be absent.
         assert!(body.get("affinity").is_none());
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_start_opens_a_byoc_instance_with_a_null_name(pool: PgPool) {
+        let owner = Uuid::new_v4();
+        let (byoc, _) = seed_byoc_instance_with_key(&pool, owner).await;
+        let token = mint_test_jwt(owner);
+        let mut app = build_router(test_state(pool.clone()));
+
+        let (status, body) = send_request(
+            &mut app,
+            bff_start_request(&token, json!({ "instance_id": byoc })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert!(body["persona_name"].is_null(), "body={body}");
+        assert_eq!(body["instance_id"], byoc.to_string());
+        assert!(body["is_new"].as_bool().unwrap());
+        assert!(body["history"].as_array().unwrap().is_empty());
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
