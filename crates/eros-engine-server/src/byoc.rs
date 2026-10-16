@@ -344,7 +344,7 @@ mod tests {
             String::new(),
             "!!!not-base64!!!".to_string(),
             b64_encode(&[0u8; 27]),
-            "A".repeat(98_305),
+            "A".repeat(98_308),
         ];
         for s in &cases {
             assert_eq!(
