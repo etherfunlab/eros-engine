@@ -347,6 +347,8 @@ mod tests {
         assert_eq!(body["event"]["message_id"], json!(null));
         assert_eq!(body["background_event"]["kind"], json!("business_trip"));
         assert_eq!(body["background_event"]["category"], json!("trip"));
+        assert_eq!(body["event"]["offline"], json!(true));
+        assert_eq!(body["background_event"]["offline"], json!(false));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

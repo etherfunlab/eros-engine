@@ -4472,8 +4472,8 @@ pub(crate) fn run_stream_with(
         // never met with silence.
         let action_turn = user_msg.action.is_some();
         let force_image = user_msg.image.as_ref().is_some_and(|i| i.force);
-        // While she is away from her phone (spec 2026-10-15-life-events-v2-
-        // design.md §7.2) a text turn ghosts without the judge. The silence is
+        // While she is offline (spec 2026-10-16-life-events-offline-and-scares-
+        // design.md §4.2) a text turn ghosts without the judge. The silence is
         // circumstance, so the ghost accounting is left alone. A deployment
         // with the ghosting switch off never goes silent, a stretch under way
         // included.
@@ -4483,7 +4483,7 @@ pub(crate) fn run_stream_with(
             && current
                 .foreground
                 .as_ref()
-                .is_some_and(|e| e.kind == eros_engine_core::events::EventKind::AwayFromPhone)
+                .is_some_and(|e| e.kind.is_offline())
         {
             if let Err(e) = chat_repo
                 .mark_user_message_ghosted(user_msg.user_message_id)
@@ -22218,6 +22218,41 @@ data: [DONE]\n\n"
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn every_offline_kind_ghosts_the_turn(pool: PgPool) {
+        for kind in ["busy", "in_battle", "asleep"] {
+            let t = run_event_turn(
+                &pool,
+                &[],
+                &[ev(kind, 10, 50)],
+                &[],
+                Some(serde_json::json!({"action": "reply_text", "inner_state": ""})),
+                0,
+            )
+            .await;
+            assert!(
+                t.mock.received_requests().await.unwrap().is_empty(),
+                "{kind}"
+            );
+            assert!(
+                t.frames.iter().any(|f| matches!(
+                    f,
+                    ProtocolFrame::Meta {
+                        action_type: FrameActionType::Ghost,
+                        ..
+                    }
+                )),
+                "{kind}: {:?}",
+                t.frames
+            );
+            assert_eq!(
+                ghost_accounting(&pool, t.umid).await,
+                (true, 0, None),
+                "{kind}"
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn an_away_stretch_does_not_ghost_while_ghosting_is_off(pool: PgPool) {
         let t = run_event_turn_in(
             &pool,
@@ -22334,6 +22369,49 @@ data: [DONE]\n\n"
         let reqs = mock.received_requests().await.unwrap();
         assert!(
             chat_request_body(&reqs).contains("- 正在经历：没看手机（"),
+            "{}",
+            chat_request_body(&reqs)
+        );
+        let ghosted: bool =
+            sqlx::query_scalar("SELECT ghost_decision FROM engine.chat_messages WHERE id = $1")
+                .bind(umid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(!ghosted, "an answered action is not a ghost");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_action_turn_while_asleep_is_still_answered(pool: PgPool) {
+        let (frames, mock, umid) = run_action_turn_in(
+            &pool,
+            eros_engine_core::types::UserAction::Kiss,
+            None,
+            &[],
+            &[ev("asleep", 5, 55)],
+            serde_json::json!({"action": "reply_text", "inner_state": ""}),
+            200,
+        )
+        .await;
+        assert!(
+            frames.iter().any(|f| matches!(
+                f,
+                ProtocolFrame::ActionResponse {
+                    response: eros_engine_core::types::ActionResponse::Accept,
+                    user_message_id,
+                } if *user_message_id == umid
+            )),
+            "{frames:?}"
+        );
+        assert!(
+            frames.iter().any(
+                |f| matches!(f, ProtocolFrame::Delta { content, .. } if content.contains("REPLY"))
+            ),
+            "{frames:?}"
+        );
+        let reqs = mock.received_requests().await.unwrap();
+        assert!(
+            chat_request_body(&reqs).contains("- 正在经历：睡着了（"),
             "{}",
             chat_request_body(&reqs)
         );

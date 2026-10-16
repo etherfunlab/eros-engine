@@ -267,13 +267,13 @@ pub(crate) async fn open_at(
         } => (occasion, recall_query, since),
     };
 
-    // She is not looking at her phone (spec 2026-10-15-life-events-v2-
-    // design.md §7.2): no greeting.
+    // She is offline (spec 2026-10-16-life-events-offline-and-scares-design.md
+    // §4.2): no greeting.
     let away = eros_engine_store::events::EventRepo { pool: &state.pool }
         .current(instance_id, None, now)
         .await?
         .foreground
-        .is_some_and(|e| e.kind == eros_engine_core::events::EventKind::AwayFromPhone);
+        .is_some_and(|e| e.kind.is_offline());
     if away {
         return Ok(OpenSessionResponse { greeting: None });
     }
@@ -1185,6 +1185,38 @@ mod tests {
             &pool,
             session_id,
             EventKind::AwayFromPhone,
+            now - chrono::Duration::minutes(10),
+            now + chrono::Duration::minutes(50),
+        )
+        .await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "在干嘛呢").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let out = open_at(
+            &state,
+            session_id,
+            user_id,
+            opener(OpenOccasion::JustOpened, "visit-1"),
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(out.greeting.is_none());
+        assert!(companion_calls(&mock).await.is_empty());
+        assert_eq!(proactive_rows(&pool, session_id).await, 0);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn no_opener_while_she_is_asleep(pool: PgPool) {
+        use eros_engine_core::events::EventKind;
+        let user_id = Uuid::new_v4();
+        let now = Utc::now();
+        let session_id =
+            session_with_history(&pool, user_id, now - chrono::Duration::days(2)).await;
+        seed_event(
+            &pool,
+            session_id,
+            EventKind::Asleep,
             now - chrono::Duration::minutes(10),
             now + chrono::Duration::minutes(50),
         )
