@@ -688,19 +688,20 @@ async fn edit_image(
         ));
     }
 
+    // The persona: the genome's, or a BYOC instance's opened from the
+    // request's card. It stays in memory for the rest of the request. A
+    // refused card answers before a slot is taken, as on the stream route.
+    let persona = crate::byoc::load_instance(&state, instance_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("no such instance".into()))?
+        .into_persona(req.character.as_deref())?;
+
     // Same per-user in-flight pool as chat, voice and the compose endpoint:
     // this is one more user-triggered LLM call.
     let _guard = state
         .stream_slots
         .try_acquire(user_id, CONCURRENT_STREAMS_PER_USER)
         .ok_or_else(|| AppError::TooManyRequests("per-user in-flight cap reached".into()))?;
-
-    // The persona: the genome's, or a BYOC instance's opened from the
-    // request's card. It stays in memory for the rest of the request.
-    let persona = crate::byoc::load_instance(&state, instance_id)
-        .await?
-        .ok_or_else(|| AppError::NotFound("no such instance".into()))?
-        .into_persona(req.character.as_deref())?;
 
     let source_subject = marker
         .get("prompt")
