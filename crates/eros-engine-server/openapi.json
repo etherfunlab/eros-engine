@@ -1283,6 +1283,67 @@
         ]
       }
     },
+    "/svc/v1/memories/changes": {
+      "get": {
+        "tags": [
+          "svc"
+        ],
+        "summary": "Extracted profile-layer memories created since a keyset cursor, for a\ndownstream service that builds on the facts the engine extracted about a\nuser. Raw-turn rows and relationship-layer rows are not exported. The rows\nare insert-only; the export carries no deletions.",
+        "operationId": "memories_changes",
+        "parameters": [
+          {
+            "name": "since",
+            "in": "query",
+            "description": "RFC 3339. Default: Unix epoch (walk everything).",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "after_id",
+            "in": "query",
+            "description": "Tie-break within `since`. Default: nil UUID. Pass `next.id`.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Default 500, clamped to 1..=1000.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryChangesResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "x-insights-export-secret missing or wrong"
+          }
+        },
+        "security": [
+          {
+            "insights_export_secret": []
+          }
+        ]
+      }
+    },
     "/v2/comp/group": {
       "post": {
         "tags": [
@@ -5007,6 +5068,87 @@
             "description": "Rows this call actually stamped. `0` means everything was already read,\nso a client may call this on every mount without inventing an event."
           },
           "session_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "MemoryChangesCursor": {
+        "type": "object",
+        "description": "Keyset position. Pass both fields back as `since` + `after_id`.",
+        "required": [
+          "created_at",
+          "id"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "MemoryChangesResponse": {
+        "type": "object",
+        "required": [
+          "memories"
+        ],
+        "properties": {
+          "memories": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MemoryExportRow"
+            }
+          },
+          "next": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MemoryChangesCursor",
+                "description": "Present iff the page is full; `null` means the walk is complete."
+              }
+            ]
+          }
+        }
+      },
+      "MemoryExportRow": {
+        "type": "object",
+        "description": "One extracted profile-layer memory as exported. No embedding.",
+        "required": [
+          "id",
+          "user_id",
+          "content",
+          "category",
+          "created_at"
+        ],
+        "properties": {
+          "category": {
+            "type": "string"
+          },
+          "content": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "metadata": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "The extraction metadata, verbatim; `null` when the extraction wrote none."
+          },
+          "user_id": {
             "type": "string",
             "format": "uuid"
           }

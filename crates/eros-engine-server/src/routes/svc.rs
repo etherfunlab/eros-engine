@@ -18,6 +18,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use eros_engine_store::human_insight::{HumanInsightRepo, HumanInsightsRow};
+use eros_engine_store::memory::{MemoryRepo, ProfileMemoryChange};
 
 use crate::byok::constant_time_eq;
 use crate::error::AppError;
@@ -182,8 +183,106 @@ async fn insights_changes(
     }))
 }
 
+/// One extracted profile-layer memory as exported. No embedding.
+#[derive(Serialize, ToSchema)]
+pub struct MemoryExportRow {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub content: String,
+    pub category: String,
+    /// The extraction metadata, verbatim; `null` when the extraction wrote none.
+    #[schema(value_type = Option<Object>)]
+    pub metadata: Option<serde_json::Value>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<ProfileMemoryChange> for MemoryExportRow {
+    fn from(r: ProfileMemoryChange) -> Self {
+        Self {
+            id: r.id,
+            user_id: r.user_id,
+            content: r.content,
+            category: r.category,
+            metadata: r.metadata,
+            created_at: r.created_at,
+        }
+    }
+}
+
+/// Keyset position. Pass both fields back as `since` + `after_id`.
+#[derive(Serialize, ToSchema)]
+pub struct MemoryChangesCursor {
+    pub created_at: DateTime<Utc>,
+    pub id: Uuid,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct MemoryChangesResponse {
+    pub memories: Vec<MemoryExportRow>,
+    /// Present iff the page is full; `null` means the walk is complete.
+    pub next: Option<MemoryChangesCursor>,
+}
+
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct MemoryChangesQuery {
+    /// RFC 3339. Default: Unix epoch (walk everything).
+    pub since: Option<DateTime<Utc>>,
+    /// Tie-break within `since`. Default: nil UUID. Pass `next.id`.
+    pub after_id: Option<Uuid>,
+    /// Default 500, clamped to 1..=1000.
+    pub limit: Option<i64>,
+}
+
+/// Extracted profile-layer memories created since a keyset cursor, for a
+/// downstream service that builds on the facts the engine extracted about a
+/// user. Raw-turn rows and relationship-layer rows are not exported. The rows
+/// are insert-only; the export carries no deletions.
+#[utoipa::path(
+    get,
+    path = "/svc/v1/memories/changes",
+    tag = "svc",
+    params(MemoryChangesQuery),
+    responses(
+        (status = 200, body = MemoryChangesResponse),
+        (status = 403, description = "x-insights-export-secret missing or wrong")
+    ),
+    security(("insights_export_secret" = []))
+)]
+async fn memories_changes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    q: Result<Query<MemoryChangesQuery>, QueryRejection>,
+) -> Result<Json<MemoryChangesResponse>, AppError> {
+    // As in `insights_changes`: admission before the query error, no DB access
+    // before `admit`.
+    admit(&state, &headers)?;
+    let Query(q) = q.map_err(|e| AppError::BadRequest(e.body_text()))?;
+    let since = q.since.unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
+    let after_id = q.after_id.unwrap_or(Uuid::nil());
+    let limit = clamp_limit(q.limit);
+
+    let rows = MemoryRepo { pool: &state.pool }
+        .list_profile_changes(since, after_id, limit)
+        .await?;
+    let next = if rows.len() as i64 == limit {
+        rows.last().map(|r| MemoryChangesCursor {
+            created_at: r.created_at,
+            id: r.id,
+        })
+    } else {
+        None
+    };
+    Ok(Json(MemoryChangesResponse {
+        memories: rows.into_iter().map(MemoryExportRow::from).collect(),
+        next,
+    }))
+}
+
 pub fn router() -> OpenApiRouter<AppState> {
-    OpenApiRouter::new().routes(routes!(insights_changes))
+    OpenApiRouter::new()
+        .routes(routes!(insights_changes))
+        .routes(routes!(memories_changes))
 }
 
 #[cfg(test)]
@@ -477,5 +576,158 @@ mod tests {
     fn openapi_lists_the_export_route() {
         let api = crate::routes::openapi_for_tests();
         assert!(api["paths"]["/svc/v1/insights/changes"]["get"].is_object());
+    }
+
+    async fn seed_memory(
+        pool: &sqlx::PgPool,
+        user: Uuid,
+        instance: Option<Uuid>,
+        category: Option<&str>,
+        at: chrono::DateTime<Utc>,
+    ) -> Uuid {
+        let session = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user)
+        .bind(instance)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query_scalar(
+            "INSERT INTO engine.companion_memories \
+               (session_id, user_id, instance_id, content, embedding, category, metadata, created_at) \
+             VALUES ($1, $2, $3, '用户喜欢爵士乐', array_fill(0::real, ARRAY[512])::vector, \
+                     $4, $5, $6) \
+             RETURNING id",
+        )
+        .bind(session)
+        .bind(user)
+        .bind(instance)
+        .bind(category)
+        .bind(category.map(|_| serde_json::json!({"confidence": "high"})))
+        .bind(at)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn memories_export_only_extracted_profile_rows(pool: sqlx::PgPool) {
+        use crate::routes::companion::testutil::seed_persona_instance;
+
+        let t = Utc.with_ymd_and_hms(2026, 10, 13, 12, 0, 0).unwrap();
+        let user = Uuid::new_v4();
+        let instance = seed_persona_instance(&pool, user).await;
+        let extracted = seed_memory(&pool, user, None, Some("preference"), t).await;
+        seed_memory(&pool, user, None, None, t).await; // a raw turn
+        seed_memory(&pool, user, Some(instance), Some("preference"), t).await; // relationship
+
+        let (status, body) = get(
+            app_with_secret(pool, Some(SECRET)),
+            "/svc/v1/memories/changes",
+            Some(SECRET),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "memories": [{
+                    "id": extracted,
+                    "user_id": user,
+                    "content": "用户喜欢爵士乐",
+                    "category": "preference",
+                    "metadata": {"confidence": "high"},
+                    "created_at": "2026-10-13T12:00:00Z",
+                }],
+                "next": null,
+            })
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn memories_full_page_carries_next_and_short_page_does_not(pool: sqlx::PgPool) {
+        let t = Utc.with_ymd_and_hms(2026, 10, 13, 12, 0, 0).unwrap();
+        let user = Uuid::new_v4();
+        let mut ids = [
+            seed_memory(&pool, user, None, Some("fact"), t).await,
+            seed_memory(&pool, user, None, Some("fact"), t).await,
+            seed_memory(&pool, user, None, Some("fact"), t).await,
+        ];
+        ids.sort();
+
+        let (status, p1) = get(
+            app_with_secret(pool.clone(), Some(SECRET)),
+            "/svc/v1/memories/changes?limit=2",
+            Some(SECRET),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(p1["memories"].as_array().unwrap().len(), 2);
+        assert!(p1["next"].is_object(), "full page must carry next");
+
+        let next_ts = p1["next"]["created_at"].as_str().unwrap();
+        let next_id = p1["next"]["id"].as_str().unwrap();
+        let (status, p2) = get(
+            app_with_secret(pool, Some(SECRET)),
+            &format!("/svc/v1/memories/changes?limit=2&since={next_ts}&after_id={next_id}"),
+            Some(SECRET),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(p2["memories"].as_array().unwrap().len(), 1);
+        assert!(p2["next"].is_null(), "short page must not carry next");
+
+        let walked: Vec<String> = p1["memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(p2["memories"].as_array().unwrap())
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect();
+        let expected: Vec<String> = ids.iter().map(|u| u.to_string()).collect();
+        assert_eq!(walked, expected);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn memories_export_admits_like_the_insights_export(pool: sqlx::PgPool) {
+        for secret in [None, Some("wrong")] {
+            let (status, body) = get(
+                app_with_secret(pool.clone(), Some(SECRET)),
+                "/svc/v1/memories/changes?limit=abc",
+                secret,
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "secret={secret:?}");
+            assert_eq!(body["error"], "forbidden");
+        }
+        let (status, body) = get(
+            app_with_secret(pool.clone(), Some(SECRET)),
+            "/svc/v1/memories/changes?limit=abc",
+            Some(SECRET),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "bad_request");
+
+        let (unmounted, _) = get(
+            app_with_secret(pool.clone(), None),
+            "/svc/v1/memories/changes",
+            Some(SECRET),
+        )
+        .await;
+        let (unknown, _) = get(
+            app_with_secret(pool, None),
+            "/svc-does-not-exist/zzz",
+            Some(SECRET),
+        )
+        .await;
+        assert_eq!(unmounted, unknown);
+    }
+
+    #[test]
+    fn openapi_lists_the_memories_export_route() {
+        let api = crate::routes::openapi_for_tests();
+        assert!(api["paths"]["/svc/v1/memories/changes"]["get"].is_object());
     }
 }

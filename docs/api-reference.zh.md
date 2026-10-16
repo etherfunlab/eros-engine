@@ -1765,6 +1765,43 @@ session 403）。
 
 **下一次輪詢從哪裡開始。** 記住收到的最後一行的 `(updated_at, user_id)` 作為續點；空頁則沿用上一個。每次新輪詢從它*往前*幾秒開始：`since = last.updated_at − 5s`，不傳 `after_user`。`updated_at` 在寫入開始時打上，但行要到提交才可見，晚提交的行可能帶著你已經走過的時間戳；重疊窗口把它撿回來。重複回來的行無害——每行都是該用戶當前的畫像，以 `user_id` 為鍵。只傳 `since` 會刻意把恰好在該時刻的行再回一次（nil UUID 排在所有真實 UUID 之前）。
 
+### `GET /svc/v1/memories/changes`
+
+自某个 keyset 游标以来新写入的画像层抽取记忆，即记忆抽取写下的关于某个用户的事实，供基于这些事实构建的下游服务使用。导出的是 `companion_memories` 里没有角色实例、带 `category` 的行；原始对话行和关系层的行不导出，embedding 也不导出。密钥与画像导出相同（`x-insights-export-secret`，缺失或错误回 403）。
+
+| Query | 默认 | 含义 |
+|---|---|---|
+| `since` | Unix epoch | RFC 3339；严格晚于 `(since, after_id)` 的行 |
+| `after_id` | nil UUID | `since` 内的 tie-break——传 `next.id` |
+| `limit` | 500 | 夹在 1..=1000 |
+
+```bash
+curl -H "x-insights-export-secret: $INSIGHTS_EXPORT_SECRET" \
+  "http://localhost:8080/svc/v1/memories/changes?limit=1"
+```
+
+```json
+{
+  "memories": [
+    {
+      "id": "3c2a…",
+      "user_id": "8d1f…",
+      "content": "用户目前正在找工作",
+      "category": "fact",
+      "metadata": { "domain": "career", "confidence": "high" },
+      "created_at": "2026-10-13T12:00:00.123456Z"
+    }
+  ],
+  "next": { "created_at": "2026-10-13T12:00:00.123456Z", "id": "3c2a…" }
+}
+```
+
+`metadata` 原样是抽取写下的内容，没写时为 `null`。行按 `(created_at, id)` 排序，分页与画像导出相同：页满时才有 `next`；把它的两个字段原样传回 `since` 与 `after_id`，保留微秒精度，直到 `next` 为 `null`。
+
+**下一次轮询从哪里开始。** 记住最后一行的 `(created_at, id)`；每次新轮询从它往前几秒开始，`since = last.created_at − 5s`，不传 `after_id`。`created_at` 在插入时打上，行要到提交才可见，重叠窗口会把晚提交的行捡回来。重复回来的行无害：行写入后不再变，按 `id` 去重即可。
+
+**不导出删除。** 行只会随它的 session 一起消失（硬删除级联），导出不会报告这件事。
+
 ## 錯誤響應
 
 大多数错误是 JSON 形状 `{"error": "<code>", "message": "<人类可读>"}`。

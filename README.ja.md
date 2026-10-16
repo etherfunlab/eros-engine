@@ -116,7 +116,7 @@ cargo run -p eros-engine-server -- serve
 
 ## API 概要
 
-基本の流れは、ペルソナとのセッションを作り、SSE ストリーミングのエンドポイントへ会話を送るだけです。音声は独立したチャンネルで動きます——`channel: "voice"` でセッションを作り、音声ターン用エンドポイント（より軽いプロンプトとバージイン呼び出し付き）を使います。二つのチャンネルが互いのセッションへ書き込むことはありません。ストリームを保持できない bot 型クライアント向けには、キュー投入専用のエンドポイント（`POST /v2/comp/session/{session_id}/message/async`）もあります——返信はバックグラウンドワーカーが生成し、ストリームの frame ではなく履歴 / Realtime に届きます。ほかに履歴、セッション、プロフィール、親密度のルート、`/v2/comp/group*` のグループ管理、ペルソナの一日に出来事を起こすライフイベントのルート（`POST /v2/comp/session/{session_id}/events`）もあります。標準認証は Supabase JWT で、`AuthValidator` により差し替えられます。任意の `GET /svc/v1/insights/changes` エクスポートだけは共有シークレットで認証し、`INSIGHTS_EXPORT_SECRET` を設定したときにのみマウントされます。パス、ペイロード、ストリームの各 frame は [API reference](docs/api-reference.md) を参照してください。
+基本の流れは、ペルソナとのセッションを作り、SSE ストリーミングのエンドポイントへ会話を送るだけです。音声は独立したチャンネルで動きます——`channel: "voice"` でセッションを作り、音声ターン用エンドポイント（より軽いプロンプトとバージイン呼び出し付き）を使います。二つのチャンネルが互いのセッションへ書き込むことはありません。ストリームを保持できない bot 型クライアント向けには、キュー投入専用のエンドポイント（`POST /v2/comp/session/{session_id}/message/async`）もあります——返信はバックグラウンドワーカーが生成し、ストリームの frame ではなく履歴 / Realtime に届きます。ほかに履歴、セッション、プロフィール、親密度のルート、`/v2/comp/group*` のグループ管理、ペルソナの一日に出来事を起こすライフイベントのルート（`POST /v2/comp/session/{session_id}/events`）もあります。標準認証は Supabase JWT で、`AuthValidator` により差し替えられます。任意の `GET /svc/v1/insights/changes` と `GET /svc/v1/memories/changes` のエクスポートだけは共有シークレットで認証し、`INSIGHTS_EXPORT_SECRET` を設定したときにのみマウントされます。パス、ペイロード、ストリームの各 frame は [API reference](docs/api-reference.md) を参照してください。
 
 ## 設定
 

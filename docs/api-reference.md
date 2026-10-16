@@ -2115,6 +2115,43 @@ Rows are ordered by `(updated_at, user_id)`. `next` is present iff the page is f
 
 **Resuming the next poll.** Keep the last row you received — its `(updated_at, user_id)` — as your resume point; on an empty page keep the previous one. Start each new poll a few seconds *before* it: `since = last.updated_at − 5s`, no `after_user`. `updated_at` is stamped when the write starts, but the row is visible only when it commits, so a late-committing row can carry a timestamp you have already walked past; the overlap window picks it up. Re-returned rows are harmless — each is the user's current profile, keyed by `user_id`. Passing `since` alone deliberately re-returns rows at exactly that timestamp (the nil UUID sorts below every real one).
 
+### `GET /svc/v1/memories/changes`
+
+The extracted profile-layer memories created since a keyset cursor: the facts the memory extraction wrote about a user, for a downstream service that builds on them. These are the `companion_memories` rows with no persona instance and a `category`; raw-turn rows and relationship-layer rows are not exported, and neither are embeddings. Same secret as the insights export (`x-insights-export-secret`, 403 when missing or wrong).
+
+| Query | Default | Meaning |
+|---|---|---|
+| `since` | Unix epoch | RFC 3339 timestamp; rows strictly after `(since, after_id)` |
+| `after_id` | nil UUID | tie-break within `since` — pass `next.id` |
+| `limit` | 500 | clamped to 1..=1000 |
+
+```bash
+curl -H "x-insights-export-secret: $INSIGHTS_EXPORT_SECRET" \
+  "http://localhost:8080/svc/v1/memories/changes?limit=1"
+```
+
+```json
+{
+  "memories": [
+    {
+      "id": "3c2a…",
+      "user_id": "8d1f…",
+      "content": "用户目前正在找工作",
+      "category": "fact",
+      "metadata": { "domain": "career", "confidence": "high" },
+      "created_at": "2026-10-13T12:00:00.123456Z"
+    }
+  ],
+  "next": { "created_at": "2026-10-13T12:00:00.123456Z", "id": "3c2a…" }
+}
+```
+
+`metadata` is what the extraction wrote, verbatim, or `null` when it wrote none. Rows are ordered by `(created_at, id)`, and paging works as on the insights export: `next` is present iff the page is full; pass both of its fields back verbatim as `since` and `after_id`, at full microsecond precision, until `next` is `null`.
+
+**Resuming the next poll.** Keep the last row's `(created_at, id)`; start each new poll a few seconds before it, `since = last.created_at − 5s` with no `after_id`. `created_at` is stamped at insert and the row is visible only at commit, so the overlap picks up a late commit. Re-returned rows are harmless: a row never changes, so deduplicate by `id`.
+
+**No deletions.** A row goes away only with its session (a hard delete cascades), and the export does not report it.
+
 ## Error responses
 
 Most errors are JSON with `{"error": "<code>", "message": "<human-readable>"}`.

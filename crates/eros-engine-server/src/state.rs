@@ -383,10 +383,10 @@ pub fn parse_byok_config(
     })
 }
 
-/// Insights export admission (`GET /svc/v1/insights/changes`).
+/// Export admission for `/svc/v1/*` (`insights/changes`, `memories/changes`).
 #[derive(Clone, Default)]
 pub struct InsightsExportConfig {
-    /// `INSIGHTS_EXPORT_SECRET`. `None` leaves the route unmounted.
+    /// `INSIGHTS_EXPORT_SECRET`. `None` leaves the routes unmounted.
     pub secret: Option<String>,
 }
 
