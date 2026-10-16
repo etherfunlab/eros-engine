@@ -1151,6 +1151,18 @@
               "type": "string",
               "format": "uuid"
             }
+          },
+          {
+            "name": "X-Byoc-Caller-Secret",
+            "in": "header",
+            "description": "The deployment's BYOC_CALLER_SECRET; required when the body carries `character`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "requestBody": {
@@ -1170,6 +1182,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ComposeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
                 }
               }
             }
@@ -2544,6 +2566,18 @@
               "type": "string",
               "format": "uuid"
             }
+          },
+          {
+            "name": "X-Byoc-Caller-Secret",
+            "in": "header",
+            "description": "The deployment's BYOC_CALLER_SECRET; required when the body carries `character`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "requestBody": {
@@ -2567,11 +2601,14 @@
               }
             }
           },
+          "400": {
+            "description": "`character` missing on a BYOC instance, present on any other, or not a valid sealed card"
+          },
           "401": {
             "description": "missing or invalid bearer"
           },
           "403": {
-            "description": "not your session"
+            "description": "not your session; or `byoc_forbidden` (the caller secret is missing or wrong) / `byoc_card_rejected` (the card does not open under the instance's key)"
           },
           "404": {
             "description": "session or message not found"
@@ -4059,6 +4096,13 @@
             ],
             "description": "Same allow-list as the chat path."
           },
+          "character": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Sealed eros-character v1 card (docs/byoc.md). Required on a BYOC\ninstance; refused on any other. Accepted on this route, with the\ndeployment's `X-Byoc-Caller-Secret` header."
+          },
           "content": {
             "type": "string",
             "description": "Lands in the `[对方最新消息]` slot. Required, non-empty after trim."
@@ -4837,6 +4881,13 @@
               "null"
             ],
             "description": "Same allow-list as the chat path. Defaults to the source turn's\n`aspect_ratio`."
+          },
+          "character": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Sealed eros-character v1 card (docs/byoc.md). Required on a BYOC\ninstance; refused on any other. Accepted on this route, with the\ndeployment's `X-Byoc-Caller-Secret` header."
           },
           "evaluate_affinity": {
             "type": "boolean",

@@ -7,7 +7,7 @@
 //! Spec: docs/superpowers/specs/2026-08-03-image-force-and-compose-endpoint-design.md
 
 use axum::extract::{Extension, Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::Json;
@@ -18,7 +18,6 @@ use uuid::Uuid;
 
 use eros_engine_llm::model_config::StyleKey;
 use eros_engine_store::image_events::ImageComposeEventInsert;
-use eros_engine_store::persona::PersonaRepo;
 
 use crate::auth::middleware::AuthUser;
 use crate::error::{AppError, StreamPreError};
@@ -97,6 +96,11 @@ pub struct ComposeRequest {
     /// Default `true` (spec 2026-08-03 §1).
     #[serde(default = "default_true")]
     pub stream: bool,
+    /// Sealed eros-character v1 card (docs/byoc.md). Required on a BYOC
+    /// instance; refused on any other. Accepted on this route, with the
+    /// deployment's `X-Byoc-Caller-Secret` header.
+    #[serde(default)]
+    pub character: Option<String>,
 }
 
 /// The five fields both modes return (`stream: true` carries them on the
@@ -200,7 +204,11 @@ pub(crate) fn compose_chain_exhausted(
     post,
     path = "/persona/{instance_id}/image/compose",
     tag = "persona",
-    params(("instance_id" = Uuid, Path, description = "Persona instance id (must belong to the JWT user)")),
+    params(
+        ("instance_id" = Uuid, Path, description = "Persona instance id (must belong to the JWT user)"),
+        ("X-Byoc-Caller-Secret" = Option<String>, Header,
+            description = "The deployment's BYOC_CALLER_SECRET; required when the body carries `character`"),
+    ),
     request_body = ComposeRequest,
     responses(
         (status = 200, description = "With `stream: false`, one JSON body (ComposeResponse). \
@@ -209,6 +217,7 @@ pub(crate) fn compose_chain_exhausted(
             the `type` discriminator is byte-identical to the `stream: false` body — or a single \
             in-band `error` frame after streaming has begun.", body = ComposeResponse),
         (status = 401, description = "missing or invalid bearer"),
+        (status = 400, body = crate::routes::companion_stream::StreamPreErrorBody),
         (status = 403, body = crate::routes::companion_stream::StreamPreErrorBody),
         (status = 404, description = "instance not found"),
         (status = 422, body = crate::routes::companion_stream::StreamPreErrorBody),
@@ -246,16 +255,20 @@ pub async fn compose_image(
     State(state): State<AppState>,
     Path(instance_id): Path<Uuid>,
     Extension(AuthUser(user_id)): Extension<AuthUser>,
+    headers: HeaderMap,
     Json(req): Json<ComposeRequest>,
 ) -> Result<axum::response::Response, AppError> {
+    // A card is accepted only from the deployment's own server, checked
+    // before anything else (spec 2026-10-16-byoc §4).
+    if req.character.is_some() {
+        crate::byoc::admit(&state.config.byoc, &headers)?;
+    }
     validate(&req)?;
 
-    let persona_repo = PersonaRepo { pool: &state.pool };
-    let persona = persona_repo
-        .load_companion(instance_id)
+    let loaded = crate::byoc::load_instance(&state, instance_id)
         .await?
         .ok_or_else(|| AppError::NotFound("instance not found".into()))?;
-    if persona.instance.owner_uid != user_id {
+    if loaded.owner_uid() != user_id {
         return Err(pre(
             StatusCode::FORBIDDEN,
             "instance_forbidden",
@@ -263,6 +276,9 @@ pub async fn compose_image(
             "无权访问该角色",
         ));
     }
+    // Ownership first: the card of an instance the caller does not own is
+    // never opened (spec 2026-10-16-byoc §6.2).
+    let persona = loaded.into_persona(req.character.as_deref())?;
 
     // Opt-in: no [tasks.chat_image_prompt_compose] ⇒ 501 (mirrors the voice
     // endpoint's absent [tasks.chat_voice]). `has_task`, NOT the resolver —
@@ -2474,5 +2490,246 @@ mod tests {
         assert_eq!(generation_id.as_deref(), Some("gen-blank-prompt"));
         assert_eq!(attempts, 1);
         assert_eq!(last_failure.as_deref(), Some("empty_prompt"));
+    }
+
+    mod byoc {
+        use super::*;
+        use crate::routes::companion::testutil::{
+            enable_byoc, seed_byoc_instance_with_key, BYOC_SECRET,
+        };
+
+        const LOOKS_MARKER: &str = "BYOC-LOOKS-MARKER";
+
+        fn byoc_state(pool: PgPool, mock_uri: &str) -> AppState {
+            let mut state = with_composer(crate::routes::companion::test_state(pool), mock_uri);
+            enable_byoc(&mut state);
+            state
+        }
+
+        fn card_with_looks(key: &[u8; 32]) -> String {
+            crate::routes::companion::testutil::sealed_card(
+                key,
+                "Aria",
+                "You are Aria.",
+                json!({"appearance": LOOKS_MARKER}),
+            )
+        }
+
+        async fn post_compose_with_secret(
+            app: &mut Router,
+            instance_id: Uuid,
+            jwt: &str,
+            body: serde_json::Value,
+            secret: Option<&str>,
+        ) -> axum::http::Response<Body> {
+            let mut req = Request::builder()
+                .method("POST")
+                .uri(format!("/persona/{instance_id}/image/compose"))
+                .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(secret) = secret {
+                req = req.header("x-byoc-caller-secret", secret);
+            }
+            app.call(req.body(Body::from(body.to_string())).unwrap())
+                .await
+                .unwrap()
+        }
+
+        async fn status_and_code(resp: axum::http::Response<Body>) -> (u16, String) {
+            let status = resp.status().as_u16();
+            let code = body_json(resp).await["code"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            (status, code)
+        }
+
+        async fn compose_events(pool: &PgPool) -> i64 {
+            sqlx::query_scalar("SELECT count(*) FROM engine.chat_images_events")
+                .fetch_one(pool)
+                .await
+                .unwrap()
+        }
+
+        #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+        async fn compose_uses_the_cards_appearance(pool: PgPool) {
+            let user_id = Uuid::new_v4();
+            let (instance_id, key) = seed_byoc_instance_with_key(&pool, user_id).await;
+            let mock = MockServer::start().await;
+            mount_json_composer(&mock).await;
+            let mut app = build_router(byoc_state(pool.clone(), &mock.uri()));
+
+            let resp = post_compose_with_secret(
+                &mut app,
+                instance_id,
+                &mint_jwt(user_id),
+                json!({"content": "在海边", "stream": false, "character": card_with_looks(&key)}),
+                Some(BYOC_SECRET),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let v = body_json(resp).await;
+            let composed = v["composed_prompt"].as_str().unwrap();
+            assert!(composed.contains(LOOKS_MARKER), "{composed}");
+
+            let reqs = mock.received_requests().await.expect("recorded requests");
+            assert_eq!(reqs.len(), 1);
+            let sent: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+            let payload = sent["messages"][1]["content"].as_str().unwrap();
+            assert!(
+                payload.contains(&format!("[人物外观]\n{LOOKS_MARKER}")),
+                "{payload}"
+            );
+        }
+
+        #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+        async fn compose_streams_the_cards_appearance(pool: PgPool) {
+            let user_id = Uuid::new_v4();
+            let (instance_id, key) = seed_byoc_instance_with_key(&pool, user_id).await;
+            let mock = MockServer::start().await;
+            let chunk = json!({
+                "choices": [{"delta": {"content": r#"{"prompt":"STREAMED SUBJECT","caption":"一张图"}"#}}],
+                "model": "served/composer-model",
+                "id": "gen-byoc-stream",
+            });
+            Mock::given(wm_path("/api/v1/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(
+                    format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+                    "text/event-stream",
+                ))
+                .mount(&mock)
+                .await;
+            let mut app = build_router(byoc_state(pool.clone(), &mock.uri()));
+
+            let resp = post_compose_with_secret(
+                &mut app,
+                instance_id,
+                &mint_jwt(user_id),
+                json!({"content": "在海边", "character": card_with_looks(&key)}),
+                Some(BYOC_SECRET),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let frames = sse_frames(resp).await;
+            let done = frames
+                .iter()
+                .find(|f| f["type"] == "done")
+                .expect("a done frame");
+            assert!(
+                done["composed_prompt"]
+                    .as_str()
+                    .unwrap()
+                    .contains(LOOKS_MARKER),
+                "{done}"
+            );
+        }
+
+        #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+        async fn compose_needs_a_card_on_a_byoc_instance(pool: PgPool) {
+            let user_id = Uuid::new_v4();
+            let (instance_id, _) = seed_byoc_instance_with_key(&pool, user_id).await;
+            let mock = MockServer::start().await;
+            let mut app = build_router(byoc_state(pool.clone(), &mock.uri()));
+
+            let resp = post_compose_with_secret(
+                &mut app,
+                instance_id,
+                &mint_jwt(user_id),
+                json!({"content": "在海边", "stream": false}),
+                Some(BYOC_SECRET),
+            )
+            .await;
+            assert_eq!(
+                status_and_code(resp).await,
+                (400, "invalid_payload".to_string())
+            );
+            assert_eq!(compose_events(&pool).await, 0);
+            assert!(mock.received_requests().await.unwrap().is_empty());
+        }
+
+        #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+        async fn compose_refuses_a_card_on_a_genome_instance(pool: PgPool) {
+            let user_id = Uuid::new_v4();
+            let instance_id = seed_instance(&pool, user_id).await;
+            let (_, key) = seed_byoc_instance_with_key(&pool, user_id).await;
+            let mock = MockServer::start().await;
+            let mut app = build_router(byoc_state(pool.clone(), &mock.uri()));
+
+            let resp = post_compose_with_secret(
+                &mut app,
+                instance_id,
+                &mint_jwt(user_id),
+                json!({"content": "在海边", "stream": false, "character": card_with_looks(&key)}),
+                Some(BYOC_SECRET),
+            )
+            .await;
+            assert_eq!(
+                status_and_code(resp).await,
+                (400, "invalid_payload".to_string())
+            );
+            assert_eq!(compose_events(&pool).await, 0);
+            assert!(mock.received_requests().await.unwrap().is_empty());
+        }
+
+        #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+        async fn compose_checks_ownership_before_the_card(pool: PgPool) {
+            let owner = Uuid::new_v4();
+            let (instance_id, _) = seed_byoc_instance_with_key(&pool, owner).await;
+            let mock = MockServer::start().await;
+            let mut app = build_router(byoc_state(pool.clone(), &mock.uri()));
+
+            let resp = post_compose_with_secret(
+                &mut app,
+                instance_id,
+                &mint_jwt(Uuid::new_v4()),
+                json!({"content": "在海边", "stream": false, "character": "garbage"}),
+                Some(BYOC_SECRET),
+            )
+            .await;
+            assert_eq!(
+                status_and_code(resp).await,
+                (403, "instance_forbidden".to_string())
+            );
+            assert_eq!(compose_events(&pool).await, 0);
+        }
+
+        #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+        async fn compose_with_a_card_needs_the_secret(pool: PgPool) {
+            let user_id = Uuid::new_v4();
+            let (instance_id, key) = seed_byoc_instance_with_key(&pool, user_id).await;
+            let mock = MockServer::start().await;
+            let mut app = build_router(byoc_state(pool.clone(), &mock.uri()));
+            let jwt = mint_jwt(user_id);
+
+            for secret in [None, Some("not-the-deployment-secret-0123456789abc")] {
+                let resp = post_compose_with_secret(
+                    &mut app,
+                    instance_id,
+                    &jwt,
+                    json!({"content": "在海边", "stream": false, "character": card_with_looks(&key)}),
+                    secret,
+                )
+                .await;
+                assert_eq!(
+                    status_and_code(resp).await,
+                    (403, "byoc_forbidden".to_string())
+                );
+            }
+            // Admission is checked before the body is.
+            let resp = post_compose_with_secret(
+                &mut app,
+                instance_id,
+                &jwt,
+                json!({"content": "  ", "stream": false, "character": card_with_looks(&key)}),
+                None,
+            )
+            .await;
+            assert_eq!(
+                status_and_code(resp).await,
+                (403, "byoc_forbidden".to_string())
+            );
+            assert_eq!(compose_events(&pool).await, 0);
+            assert!(mock.received_requests().await.unwrap().is_empty());
+        }
     }
 }
