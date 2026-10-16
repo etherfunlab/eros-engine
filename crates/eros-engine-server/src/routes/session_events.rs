@@ -227,12 +227,36 @@ impl From<&eros_engine_store::events::EventRecord> for EventView {
 
 /// The kinds a draw may pick: a list of the allowed kinds, or an object of
 /// rules (spec 2026-10-17-life-events-run-ins-and-kind-filters-design.md §3).
-#[derive(Debug, Clone, PartialEq, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, PartialEq, utoipa::ToSchema)]
 #[serde(untagged)]
 pub enum KindsDto {
     /// Only these kinds; `[]` allows none.
     List(Vec<EventKindDto>),
     Rules(KindRulesDto),
+}
+
+/// An array reads as the list and an object as the rules; nothing else is
+/// accepted. A derived untagged enum would also read an array into the rules
+/// struct by position, so `[null]` would allow every kind.
+impl<'de> Deserialize<'de> for KindsDto {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Kinds;
+        impl<'de> serde::de::Visitor<'de> for Kinds {
+            type Value = KindsDto;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an array of kinds or an object of allow and disallow")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, seq: A) -> Result<KindsDto, A::Error> {
+                Vec::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))
+                    .map(KindsDto::List)
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<KindsDto, A::Error> {
+                KindRulesDto::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    .map(KindsDto::Rules)
+            }
+        }
+        d.deserialize_any(Kinds)
+    }
 }
 
 /// `allow` is what may be drawn, `disallow` what may not; a kind in both is
@@ -1553,6 +1577,10 @@ mod tests {
             json!({"allow": ["dragon"]}),
             json!({"allow": "reading"}),
             json!("reading"),
+            json!(5),
+            json!([null]),
+            json!([["reading"]]),
+            json!([{"allow": ["reading"]}]),
         ] {
             assert!(
                 serde_json::from_value::<DrawEventRequest>(
