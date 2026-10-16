@@ -52,6 +52,18 @@ pub struct MemoryRow {
     pub created_at: DateTime<Utc>,
 }
 
+/// An extracted profile-layer row (`instance_id IS NULL`, `category` set), as
+/// the memories export reads it.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct ProfileMemoryChange {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub content: String,
+    pub category: String,
+    pub metadata: Option<serde_json::Value>,
+    pub created_at: DateTime<Utc>,
+}
+
 pub struct MemoryRepo<'a> {
     pub pool: &'a PgPool,
 }
@@ -200,6 +212,32 @@ impl<'a> MemoryRepo<'a> {
         .bind(user_id)
         .bind(vec_text)
         .bind(k_per_category as i64)
+        .fetch_all(self.pool)
+        .await
+    }
+
+    /// Extracted profile-layer rows created strictly after the keyset cursor
+    /// `(since, after_id)`, in `(created_at, id)` order. The row-value
+    /// comparison is what keeps rows sharing one timestamp from being skipped
+    /// or repeated across a page boundary. Uses
+    /// `companion_memories_profile_created_idx` (0074).
+    pub async fn list_profile_changes(
+        &self,
+        since: DateTime<Utc>,
+        after_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<ProfileMemoryChange>, sqlx::Error> {
+        sqlx::query_as::<_, ProfileMemoryChange>(
+            "SELECT id, user_id, content, category, metadata, created_at \
+             FROM engine.companion_memories \
+             WHERE instance_id IS NULL AND category IS NOT NULL \
+               AND (created_at, id) > ($1, $2) \
+             ORDER BY created_at, id \
+             LIMIT $3",
+        )
+        .bind(since)
+        .bind(after_id)
+        .bind(limit)
         .fetch_all(self.pool)
         .await
     }
