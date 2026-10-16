@@ -877,11 +877,14 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 
 角色因被接受的 give 而带着的余效、她的需求和正在经历的事件，即此刻发一句文字消息时会带上的状态：供打开会话的页面和收不到帧的异步调用方使用。接受消耗品的那一回合刚结束，这个路由就已列出它的第 1 步，而那一回合的 `body_state` 帧里还没有它：帧描述刚写成的那句回复，路由描述角色此刻的样子。`needs` 是角色带到此刻的需求（形状与 `body_state` 帧里的一致），没有判定或没有配置 LLM 判官时为 `null`。`event` 是此刻正在进行的插曲，`background_event` 是此刻正在进行的背景（形状都与 events 路由一致），没有时各为 `null`。正在进行的离线类事件和其他插曲一样，作为 `event` 返回，带 `"offline": true`。
 
+`changes_at` 是在没有新回合、没有新事件的前提下，这份响应最早会变的时刻：取某项需求下一次向静息档移动的时刻，以及 `event`、`background_event` 的 `ends_at`，三者中最早的一个。不会自己变化时为 `null`。余效只随回合推进，不计入。缓存这份响应的客户端在 `changes_at`、每个回合之后和每次事件抽取之后重新读取即可。
+
 ```json
 {"effects": [{"item": "alcohol", "name": "威士忌", "quantity": 3, "level": 2, "phase": "rising", "step": 2, "steps": 3}],
  "needs": {"hunger": "high", "social": "mid", "stamina": "low", "emotional": "mid"},
  "event": null,
- "background_event": {"kind": "short_trip", "category": "trip", "offline": false, "started_at": "2026-10-15T08:00:00Z", "ends_at": "2026-10-17T08:00:00Z", "message_id": "…"}}
+ "background_event": {"kind": "short_trip", "category": "trip", "offline": false, "started_at": "2026-10-15T08:00:00Z", "ends_at": "2026-10-17T08:00:00Z", "message_id": "…"},
+ "changes_at": "2026-10-16T14:00:00Z"}
 ```
 
 没有余效时 `effects` 为 `[]`。错误同 `/open`：`404 session_not_found`、`403 session_forbidden`，语音或群 session 为 `409 wrong_channel`。

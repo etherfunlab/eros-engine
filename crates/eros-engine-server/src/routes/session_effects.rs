@@ -116,6 +116,10 @@ pub struct EffectsResponse {
     /// The persona's background under way now (a trip, an illness), or
     /// `null`.
     pub background_event: Option<crate::routes::session_events::EventView>,
+    /// The earliest time at which this response changes with no new turn and
+    /// no new event: the next drift step of a need, or the end of `event` or
+    /// `background_event`. `null` when nothing changes on its own.
+    pub changes_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// The persona's lingering state from accepted gives, her needs and the
@@ -141,25 +145,47 @@ async fn get_effects(
     Extension(AuthUser(user_id)): Extension<AuthUser>,
 ) -> Result<Json<EffectsResponse>, AppError> {
     let (_session, instance_id) = resolve_text_session(&state, session_id, user_id).await?;
+    let now = chrono::Utc::now();
     let effects = crate::pipeline::handlers::load_effects(&state.pool, session_id, None).await?;
-    let needs = if state.model_config.pde_enabled() {
-        crate::pipeline::handlers::load_needs(&state.pool, instance_id, None, chrono::Utc::now())
+    let rating = if state.model_config.pde_enabled() {
+        eros_engine_store::chat::ChatRepo { pool: &state.pool }
+            .latest_needs(instance_id, None)
             .await?
     } else {
         None
     };
+    // As `load_needs` carries them, plus when the carried levels next step.
+    let (needs, needs_change) = match &rating {
+        Some(r) => {
+            let hours = (now - r.rated_at).num_milliseconds() as f64 / 3_600_000.0;
+            let next = eros_engine_core::needs::next_change(r.needs, hours).map(|h| {
+                r.rated_at + chrono::Duration::milliseconds((h * 3_600_000.0).round() as i64)
+            });
+            (Some(eros_engine_core::needs::carried(r.needs, hours)), next)
+        }
+        None => (None, None),
+    };
     let current = eros_engine_store::events::EventRepo { pool: &state.pool }
-        .current(instance_id, None, chrono::Utc::now())
+        .current(instance_id, None, now)
         .await?;
     let view = |e: &Option<eros_engine_store::events::EventRecord>| {
         e.as_ref()
             .map(crate::routes::session_events::EventView::from)
     };
+    let changes_at = [
+        needs_change,
+        current.foreground.as_ref().map(|e| e.ends_at),
+        current.background.as_ref().map(|e| e.ends_at),
+    ]
+    .into_iter()
+    .flatten()
+    .min();
     Ok(Json(EffectsResponse {
         effects: effects.iter().map(EffectView::from).collect(),
         needs: needs.as_ref().map(NeedsView::from),
         event: view(&current.foreground),
         background_event: view(&current.background),
+        changes_at,
     }))
 }
 
@@ -209,17 +235,17 @@ mod tests {
         session_id: Uuid,
         mins_ago: i32,
         metadata: serde_json::Value,
-    ) {
-        sqlx::query(
+    ) -> chrono::DateTime<chrono::Utc> {
+        sqlx::query_scalar(
             "INSERT INTO engine.chat_messages (session_id, role, content, metadata, sent_at) \
-             VALUES ($1, 'user', '', $2, now() - make_interval(mins => $3))",
+             VALUES ($1, 'user', '', $2, now() - make_interval(mins => $3)) RETURNING sent_at",
         )
         .bind(session_id)
         .bind(metadata)
         .bind(mins_ago)
-        .execute(pool)
+        .fetch_one(pool)
         .await
-        .unwrap();
+        .unwrap()
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -238,7 +264,7 @@ mod tests {
         assert_eq!(s, StatusCode::OK, "{body}");
         assert_eq!(
             body,
-            json!({"effects": [], "needs": null, "event": null, "background_event": null})
+            json!({"effects": [], "needs": null, "event": null, "background_event": null, "changes_at": null})
         );
     }
 
@@ -260,7 +286,7 @@ mod tests {
             json!({"effects": [
                 {"item": "cigarette", "quantity": 1, "level": 3, "phase": "peak", "step": 1, "steps": 1},
                 {"item": "alcohol", "name": "威士忌", "quantity": 3, "level": 3, "phase": "peak", "step": 3, "steps": 3},
-            ], "needs": null, "event": null, "background_event": null})
+            ], "needs": null, "event": null, "background_event": null, "changes_at": null})
         );
     }
 
@@ -273,7 +299,7 @@ mod tests {
         assert_eq!(s, StatusCode::OK);
         assert_eq!(
             body,
-            json!({"effects": [], "needs": null, "event": null, "background_event": null})
+            json!({"effects": [], "needs": null, "event": null, "background_event": null, "changes_at": null})
         );
     }
 
@@ -361,6 +387,10 @@ mod tests {
         assert_eq!(body["background_event"]["category"], json!("trip"));
         assert_eq!(body["event"]["offline"], json!(true));
         assert_eq!(body["background_event"]["offline"], json!(false));
+        assert_eq!(
+            body["changes_at"], body["event"]["ends_at"],
+            "the foreground ends first"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -425,13 +455,68 @@ mod tests {
         let instance_id = seed_persona_instance(&pool, owner).await;
         let session_id = seed_session(&pool, owner, instance_id).await;
         // Rated 5 hours ago: hunger low → mid (4h period); the rest unchanged.
-        user_row(&pool, session_id, 300,
+        let rated_at = user_row(&pool, session_id, 300,
             json!({"needs": {"hunger": "low", "social": "mid", "stamina": "high", "emotional": "mid"}})).await;
         let (s, body) = get_judged(pool, session_id, owner).await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(
             body["needs"],
             json!({"hunger": "mid", "social": "mid", "stamina": "high", "emotional": "mid"})
+        );
+        // Hunger reaches high and stamina mid 8 hours after the rating.
+        assert_eq!(
+            body["changes_at"],
+            json!(rated_at + chrono::Duration::hours(8))
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_need_stepping_before_the_event_ends_sets_changes_at(pool: sqlx::PgPool) {
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, owner).await;
+        let session_id = seed_session(&pool, owner, instance_id).await;
+        // Hunger steps 4 hours after the rating, 10 minutes from now.
+        let rated_at = user_row(&pool, session_id, 230,
+            json!({"needs": {"hunger": "low", "social": "high", "stamina": "mid", "emotional": "mid"}})).await;
+        let now = chrono::Utc::now();
+        eros_engine_store::events::EventRepo { pool: &pool }
+            .insert(
+                &eros_engine_store::events::NewEvent {
+                    instance_id,
+                    session_id,
+                    event_key: "k1",
+                    kind: eros_engine_core::events::EventKind::Reading,
+                    started_at: now - chrono::Duration::minutes(5),
+                    ends_at: now + chrono::Duration::hours(2),
+                },
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let (s, body) = get_judged(pool, session_id, owner).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(body["event"]["kind"], json!("reading"));
+        assert_eq!(
+            body["changes_at"],
+            json!(rated_at + chrono::Duration::hours(4))
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn needs_at_rest_and_no_event_change_nothing(pool: sqlx::PgPool) {
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, owner).await;
+        let session_id = seed_session(&pool, owner, instance_id).await;
+        user_row(&pool, session_id, 10,
+            json!({"needs": {"hunger": "high", "social": "high", "stamina": "mid", "emotional": "mid"}})).await;
+        let (s, body) = get_judged(pool, session_id, owner).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(body["needs"].is_object(), "{body}");
+        assert_eq!(
+            body.get("changes_at"),
+            Some(&serde_json::Value::Null),
+            "{body}"
         );
     }
 

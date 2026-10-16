@@ -4391,6 +4391,14 @@
               }
             ]
           },
+          "changes_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "The earliest time at which this response changes with no new turn and\nno new event: the next drift step of a need, or the end of `event` or\n`background_event`. `null` when nothing changes on its own."
+          },
           "effects": {
             "type": "array",
             "items": {

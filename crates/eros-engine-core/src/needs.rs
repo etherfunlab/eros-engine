@@ -73,6 +73,30 @@ pub fn carried(rated: Needs, hours: f64) -> Needs {
     }
 }
 
+/// Hours after the rating at which one need, rated `hours` ago, takes its
+/// next step; `None` once it is at rest.
+fn next_step(level: NeedLevel, (rest, period): (NeedLevel, f64), hours: f64) -> Option<f64> {
+    if drift(level, (rest, period), hours) == rest {
+        return None;
+    }
+    let done = (hours.max(0.0) / period).floor();
+    Some((done + 1.0) * period)
+}
+
+/// Hours after the rating at which levels rated `hours` ago next change under
+/// `carried`, or `None` when every need is at rest.
+pub fn next_change(rated: Needs, hours: f64) -> Option<f64> {
+    [
+        next_step(rated.hunger, HUNGER_DRIFT, hours),
+        next_step(rated.social, SOCIAL_DRIFT, hours),
+        next_step(rated.stamina, STAMINA_DRIFT, hours),
+        next_step(rated.emotional, EMOTIONAL_DRIFT, hours),
+    ]
+    .into_iter()
+    .flatten()
+    .min_by(f64::total_cmp)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,6 +152,76 @@ mod tests {
                 "{name} {from:?} +{hours}h"
             );
         }
+    }
+
+    #[test]
+    fn next_change_is_none_when_every_need_is_at_rest() {
+        let rest = Needs {
+            hunger: High,
+            social: High,
+            stamina: Mid,
+            emotional: Mid,
+        };
+        for hours in [0.0, 5.0, 1000.0] {
+            assert_eq!(next_change(rest, hours), None, "+{hours}h");
+        }
+    }
+
+    /// (rated, hours since the rating, expected hours of the next change).
+    #[test]
+    fn next_change_is_the_earliest_pending_step() {
+        let at_rest = Needs {
+            hunger: High,
+            social: High,
+            stamina: Mid,
+            emotional: Mid,
+        };
+        let hunger_low = Needs {
+            hunger: Low,
+            ..at_rest
+        };
+        let stamina_high = Needs {
+            stamina: High,
+            ..at_rest
+        };
+        let hunger_and_social_low = Needs {
+            hunger: Low,
+            social: Low,
+            ..at_rest
+        };
+        let cases = [
+            (hunger_low, 0.0, Some(4.0)),
+            (hunger_low, -2.0, Some(4.0)),
+            (hunger_low, 5.0, Some(8.0)),
+            (hunger_low, 8.0, None),
+            (stamina_high, 3.0, Some(8.0)),
+            (stamina_high, 8.0, None),
+            (hunger_and_social_low, 1.0, Some(4.0)),
+            (hunger_and_social_low, 9.0, Some(12.0)),
+            (hunger_and_social_low, 13.0, Some(24.0)),
+        ];
+        for (rated, hours, want) in cases {
+            assert_eq!(next_change(rated, hours), want, "{rated:?} +{hours}h");
+        }
+    }
+
+    /// At the reported hour, `carried` returns different levels; just before
+    /// it, the same ones.
+    #[test]
+    fn next_change_agrees_with_carried() {
+        let rated = Needs {
+            hunger: Low,
+            social: Mid,
+            stamina: High,
+            emotional: Low,
+        };
+        let mut hours = 0.0;
+        while let Some(at) = next_change(rated, hours) {
+            assert_eq!(carried(rated, at - 0.001), carried(rated, hours));
+            assert_ne!(carried(rated, at), carried(rated, hours));
+            hours = at;
+        }
+        assert_eq!(carried(rated, hours), carried(rated, 1000.0));
     }
 
     #[test]
