@@ -221,6 +221,7 @@ crates/
 - [Affinity model](affinity-model.md) — 6 dimensions, graded write pipeline, time decay, relationship labels
 - [Ghost mechanics](ghost-mechanics.md) — score formula + protection rules + worked examples
 - [Group chat](group-chat.md) — one user, up to three personas, the director, the speaker relay
+- [Life events and needs](life-events-needs.md) — the persona's needs and their drift, the event draw, backgrounds, away from the phone
 - [Memory layers](memory-layers.md) — profile vs relationship, Voyage, pgvector retrieval
 - [Deploying](deploying.md) — Docker, bring-your-own Postgres / IdP
 - [API reference](api-reference.md) — every `/comp/*` endpoint

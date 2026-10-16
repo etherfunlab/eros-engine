@@ -881,6 +881,8 @@ ask; the engine decides whether and what. It draws one kind of event, or none,
 and the persona tells the user in one proactive message — except
 `away_from_phone`, which is silence (below). While an event lasts, the judge
 and the reply know she is in it (see [model-config.md](model-config.md#taskspde_decision--opt-in-llm-pde-judge)).
+How the draw works and how events and the persona's needs fit together is in
+[life-events-needs.md](life-events-needs.md).
 
 ```json
 {

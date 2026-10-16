@@ -725,6 +725,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 engine 抽一种事件，或者什么都不抽，然后角色用一条主动消息告诉用户——`away_from_phone` 除外，它是沉默（见下）。
 事件持续期间，判官和回复都知道她正在经历它
 （见 [model-config.zh.md](model-config.zh.md#taskspde_decision--opt-in-llm-pde-判断器)）。
+抽取怎么运转、事件和角色的需求怎么配合，见 [life-events-needs.zh.md](life-events-needs.zh.md)。
 
 ```json
 {
