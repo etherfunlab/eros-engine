@@ -244,7 +244,8 @@ pub(crate) async fn open_at(
     let audit =
         validate_llm_audit(req.audit.clone()).map_err(|e| invalid_payload(e.to_string()))?;
     let opener = validate_opener(req.occasion, req.open_key.clone())?;
-    let (_session, persona, instance_id) = resolve_text_turn(state, session_id, user_id).await?;
+    let (_session, persona, instance_id) =
+        resolve_text_turn(state, session_id, user_id, "session open").await?;
 
     let locale = UserLocale::resolve(
         req.user_timezone.as_deref(),
@@ -463,7 +464,8 @@ mod tests {
 
     use crate::routes::companion::test_state;
     use crate::routes::companion::testutil::{
-        build_router, mint_test_jwt, seed_genome, seed_instance, seed_session, send_request,
+        build_router, mint_test_jwt, seed_byoc_session, seed_genome, seed_instance, seed_session,
+        send_request, session_footprint,
     };
 
     /// 2026-09-25 04:00 in Taipei: 中秋节, and TW's Mid-Autumn Festival.
@@ -2020,6 +2022,28 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
         assert_eq!(body["code"], json!("wrong_channel"));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn open_refuses_a_byoc_session(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = seed_byoc_session(&pool, user_id).await;
+        let before = session_footprint(&pool, session_id).await;
+        let mut app = build_router(test_state(pool.clone()));
+
+        for body in [
+            json!({}),
+            json!({"occasion": "first_meet", "open_key": "k1"}),
+        ] {
+            let (status, resp) = send_request(
+                &mut app,
+                open_req(session_id, &mint_test_jwt(user_id), body),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+            assert_eq!(resp["code"], json!("byoc_unsupported"));
+        }
+        assert_eq!(session_footprint(&pool, session_id).await, before);
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

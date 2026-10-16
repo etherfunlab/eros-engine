@@ -271,6 +271,9 @@ World Stories 按实例生活模拟）默认完全关闭：模型配置里没有
   - `BYOK_CALLER_SECRET` 开启该功能：至少 32 字节（更短会导致启动失败），保存在下游的服务器上，以 `X-Byok-Caller-Secret` 发送。未设置 ⇒ 所有 `byok` 块都返回 `403 byok_forbidden`。
   - `BYOK_ALLOW_PRIVATE_NETWORK=true` 解除地址防护并允许 `http` 端点，用于自托管网络和测试。
   - 把镜像回滚到不支持 BYOK 的版本之前，先把对话队列排空：旧引擎会忽略队列行上的 `byok` 标记，它接手恢复的 BYOK 轮次会走部署自己的链路，不管 `fallback_to_platform` 设成什么。
+- **自带角色（可选）：** 让下游提供引擎从不存储的角色，每个请求带一张封装好的卡片；见 [byoc.zh.md](byoc.zh.md)。
+  - `BYOC_CALLER_SECRET` 开启该功能：至少 32 字节（更短会导致启动失败），保存在下游的服务器上，以 `X-Byoc-Caller-Secret` 发送。未设置 ⇒ 两个密钥路由和所有带卡片的请求都返回 `403 byoc_forbidden`。
+  - prompt log（`PROMPT_LOG_DIR`）和图片审计对 BYOC 轮次的记录与任何其他轮次一样，包括卡片文本和 `appearance`；见 [byoc.zh.md](byoc.zh.md#记录什么)。
 - **画像增量导出（可选）：** `GET /svc/v1/insights/changes` 把自某个 keyset 游标以来有变动的 `human_insights` 行交给下游服务，让它不碰数据库就能维护一份对话推导画像的只读镜像；`GET /svc/v1/memories/changes` 以同样的方式交出画像层的抽取记忆。`INSIGHTS_EXPORT_SECRET` 开启这两个路由：至少 32 字节（更短会导致启动失败），保存在下游的服务器上，以 `x-insights-export-secret` 发送。未设置 ⇒ 两个路由都不挂载，这些路径与任何未知路径表现一致。契约见 [API 参考 → 服務端點](api-reference.zh.md#服務端點)。
 - **健康探針：** `GET /healthz` 返 200，響應 `{ status: "ok", service, version, timestamp }`。把這個接到平台的健康檢查上。
 - **OpenAPI / Scalar：** `GET /docs` 提供實時的 Scalar 參考。原始 OpenAPI JSON 不走 HTTP——用 `print-openapi` 子命令导出。

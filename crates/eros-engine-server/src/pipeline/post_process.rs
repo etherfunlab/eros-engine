@@ -30,7 +30,6 @@ use eros_engine_store::chat::ChatRepo;
 use eros_engine_store::human_insight::{existing_as_extraction_json, HumanInsightRepo};
 use eros_engine_store::insight::{InsightEventInsert, InsightEventRepo};
 use eros_engine_store::memory::{MemoryLayer, MemoryRepo};
-use eros_engine_store::persona::PersonaRepo;
 use eros_engine_store::user_insight::{
     existing_as_extraction_json as user_existing_json, UserInsightEventInsert,
     UserInsightEventRepo, UserInsightRepo,
@@ -84,11 +83,16 @@ async fn session_still_live(state: &AppState, session_id: Uuid) -> bool {
 }
 
 /// Spawned by `pipeline::run`. Owned `state` so the future is `'static`.
+/// `persona_name` is the name of the persona the turn ran with. Nothing here
+/// reloads the persona by instance id: a BYOC instance's character lives only
+/// in the request's card.
+#[allow(clippy::too_many_arguments)] // each arg is a distinct per-turn concern
 pub async fn run(
     state: AppState,
     session_id: Uuid,
     user_id: Uuid,
     instance_id: Uuid,
+    persona_name: String,
     event: Event,
     plan: ActionPlan,
     produced: Vec<ProducedMessage>,
@@ -173,6 +177,7 @@ pub async fn run(
             session_id,
             user_id,
             instance_id,
+            &persona_name,
             plan.action_type,
             &user_msg,
             &eval_text,
@@ -237,13 +242,15 @@ pub async fn run(
 /// movement turns whose scope actually injects affinity — the feeling-clause
 /// rewrite. Shared by the chat pipeline's `run` above and the image-edit
 /// endpoint's opt-in `evaluate_affinity`; the caller owns building
-/// `eval_text` (see `affinity_eval_text`) and choosing the scope.
+/// `eval_text` (see `affinity_eval_text`), choosing the scope, and passing the
+/// persona's name (empty skips the eval).
 #[allow(clippy::too_many_arguments)] // each arg is a distinct per-turn concern
 pub(crate) async fn run_affinity_turn(
     state: &AppState,
     session_id: Uuid,
     user_id: Uuid,
     instance_id: Uuid,
+    persona_name: &str,
     action: ActionType,
     user_msg: &str,
     eval_text: &str,
@@ -267,14 +274,11 @@ pub(crate) async fn run_affinity_turn(
         action_turn,
     );
 
+    // The feeling clause gets the name only on a turn whose eval was
+    // attempted; a skipped turn hands it an empty name, which it declines.
     let (persona_name, (grades, levels, reason, affinity_gen_id, skip_reason, eval_failures)) =
         if pre_skip.is_none() {
-            let persona_repo = PersonaRepo { pool: &state.pool };
             let affinity_repo = AffinityRepo { pool: &state.pool };
-            let persona_name = match persona_repo.load_companion(instance_id).await {
-                Ok(Some(p)) => p.genome.name,
-                _ => String::new(),
-            };
             // Snapshot the current vector for prompt context only; the
             // authoritative value is re-read under lock in persist_with_event.
             let outcome = match affinity_repo.load(session_id).await {
@@ -282,7 +286,7 @@ pub(crate) async fn run_affinity_turn(
                     evaluate_affinity(
                         state,
                         session_id,
-                        &persona_name,
+                        persona_name,
                         &current,
                         user_msg,
                         eval_text,
@@ -302,7 +306,7 @@ pub(crate) async fn run_affinity_turn(
             (persona_name, outcome)
         } else {
             (
-                String::new(),
+                "",
                 (
                     eros_engine_core::affinity::AxisGrades::default(),
                     eros_engine_core::affinity::EndpointLevelReads::default(),
@@ -348,7 +352,7 @@ pub(crate) async fn run_affinity_turn(
         && affinity_scope.active_count() > 0
         && state.model_config.tasks.contains_key(SUMMARY_TASK)
     {
-        summarize_feeling(state, session_id, &persona_name, affinity_scope, client_id).await;
+        summarize_feeling(state, session_id, persona_name, affinity_scope, client_id).await;
     }
 }
 
@@ -1212,9 +1216,8 @@ async fn evaluate_affinity(
 /// POST-persist affinity row so the bands reflect this turn's movement.
 /// Fail-open everywhere: any error warns and keeps the old clause; the
 /// next movement turn rewrites anyway. `persona_name` is the one the eval
-/// branch already loaded this turn — every reachable movement turn had a
-/// successful eval, so it is non-empty exactly when it matters; a second
-/// `PersonaRepo` load here would be redundant.
+/// branch used this turn — every reachable movement turn had a successful
+/// eval, so it is non-empty exactly when it matters.
 async fn summarize_feeling(
     state: &AppState,
     session_id: Uuid,
@@ -3743,6 +3746,7 @@ mod tests {
             session_id,
             user_id,
             instance_id,
+            "Aria".into(),
             event,
             plan,
             produced,
@@ -3898,6 +3902,7 @@ mod tests {
             session_id,
             user_id,
             instance_id,
+            "Aria".into(),
             event,
             plan,
             produced,
@@ -4032,6 +4037,7 @@ mod tests {
             session_id,
             user_id,
             instance_id,
+            "Aria".into(),
             event,
             plan,
             produced,
@@ -4070,6 +4076,75 @@ mod tests {
         assert!(
             gateways.is_none(),
             "the provider spoke and the chain did its job: {gateways:?}"
+        );
+    }
+
+    /// The judge names the persona its caller passes, so a BYOC instance,
+    /// whose name lives only in the request's card, is still evaluated. The
+    /// mock answers only a request that carries the name and 500s any other,
+    /// so the event's generation id proves the name reached the request.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn affinity_eval_uses_the_passed_persona_name(pool: sqlx::PgPool) {
+        use crate::routes::companion::testutil::seed_byoc_instance_with_key;
+        use eros_engine_store::affinity::AffinityRepo;
+
+        let user_id = Uuid::new_v4();
+        let (instance_id, _) = seed_byoc_instance_with_key(&pool, user_id).await;
+        let session_id =
+            crate::routes::companion::testutil::seed_session(&pool, user_id, instance_id).await;
+        AffinityRepo { pool: &pool }
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+        let umid = seed_user_message(&pool, session_id).await;
+
+        let (state, recorded) = state_with_mock_openrouter_recording(
+            pool.clone(),
+            "[tasks.affinity_evaluation]\nmodel=\"aff/m\"\n\
+             [[providers.openrouter.body]]\ntasks = [\"affinity_evaluation\"]\n\
+             params = { task = \"affinity_evaluation\" }\n",
+            vec![(
+                "BYOC-NAME-MARKER",
+                r#"{"warmth":3,"trust":{"grade":1,"direction":"up"},"intimacy":{"grade":1,"direction":"up"},"intrigue":{"grade":0,"direction":"up"},"tension":{"grade":0,"direction":"up"},"patience":2,"reason":"稳"}"#,
+            )],
+        )
+        .await;
+
+        run_affinity_turn(
+            &state,
+            session_id,
+            user_id,
+            instance_id,
+            "BYOC-NAME-MARKER",
+            ActionType::ReplyText,
+            "我今天过得还不错，你呢",
+            "挺好的，刚下班",
+            Default::default(),
+            Default::default(),
+            Some(umid),
+            None,
+            false,
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            recorded.lock().unwrap().as_slice(),
+            [Some(AFFINITY_TASK.to_string())]
+        );
+        let generation_id: Option<String> = sqlx::query_scalar(
+            "SELECT e.generation_id FROM engine.companion_affinity_events e \
+             JOIN engine.companion_affinity a ON a.id = e.affinity_id \
+             WHERE a.session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            generation_id.as_deref(),
+            Some("gen-mock"),
+            "the judge's request carried the passed name"
         );
     }
 
@@ -4631,6 +4706,7 @@ mod tests {
             session_id,
             user_id,
             instance_id,
+            "Aria".into(),
             event,
             plan,
             produced,

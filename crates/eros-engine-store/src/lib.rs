@@ -83,6 +83,14 @@ pub(crate) mod testutil {
         .unwrap()
     }
 
+    /// Persist a BYOC instance (no genome, random key) and return its id.
+    pub(crate) async fn seed_byoc_instance(pool: &PgPool, owner: Uuid) -> Uuid {
+        crate::persona::PersonaRepo { pool }
+            .create_byoc_instance(owner, &rand::random())
+            .await
+            .unwrap()
+    }
+
     /// Persist a chat session (with its own instance) and return its id. Same
     /// reason as `seed_persona_instance`: since 0058 six event tables
     /// FK-reference `chat_sessions.id` — images, vision, the two companion_*

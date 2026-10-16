@@ -73,6 +73,10 @@ request-level rate limiting downstream.
 Optional `instance_id` field: an explicit `persona_instance` id. When absent,
 the server picks (or auto-creates) the user's instance for the supplied
 `genome_id`; `genome_id` is required only when `instance_id` is absent.
+`instance_id` may name a bring-your-own-character instance (see
+[byoc.md](byoc.md)): the session opens with no card and no caller secret, and
+`persona_name` is `null` because only the card holds the name. The field is
+always present in the response; it is a string for a genome instance.
 
 Optional `is_demo` field: marks the new session as a demo. Persisted to the
 session's `metadata.is_demo` and read by the affinity pipeline to multiply
@@ -614,6 +618,17 @@ request also carries `X-Byok-Caller-Secret` matching the deployment's
 `400 invalid_payload`. Both are refused before any row is written. See
 [byok.md](byok.md).
 
+**Optional: bring your own character.** The body may include `character` — a
+character card sealed under the instance's key. It is required when the
+session's instance is a BYOC instance and refused (`400 invalid_payload`) on
+any other. The engine honours it only when the request also carries
+`X-Byoc-Caller-Secret` matching the deployment's `BYOC_CALLER_SECRET`;
+otherwise `403 byoc_forbidden`. A card that does not open under the instance's
+key is `403 byoc_card_rejected`; one that is malformed or not a valid card is
+`400 invalid_payload`. All are refused before any row is written. It combines
+with `byok`: the card supplies the character, the `byok` block the reply
+model. See [byoc.md](byoc.md) and [BYOC](#bring-your-own-character-byoc).
+
 ### `POST /v2/comp/session/{session_id}/message/async`
 
 Enqueue-only chat turn — the async alternative to the stream endpoint above,
@@ -641,6 +656,8 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 | Redelivery of a terminally failed `client_msg_id` | `200 {"status":"failed",...}` — retry with a fresh `client_msg_id` |
 | Per-session pending depth over `CHAT_QUEUE_PENDING_CAP` | `429 rate_limited` |
 | Body carries `byok` | `400 invalid_payload` — BYOK is stream-only |
+| Body carries `character` | `400 invalid_payload` — BYOC is stream-only |
+| Session belongs to a BYOC instance | `400 byoc_unsupported` — its turn would run in a worker that never holds the card |
 | Other pre-stream failures | same `StreamPreError` shape and codes as `message/stream` above |
 
 Queue order is strict per-session LIFO — the newest pending message in a
@@ -720,6 +737,10 @@ consumer draws it, exactly as for a chat image turn.
 - `user_timezone`, `user_country`, `user_region` — the chat body's user locale
   (see the stream endpoint). Only a rolled text half reads them; they are
   recorded on that row's metadata.
+- `character` — a sealed character card, for a session whose instance is a
+  BYOC instance: required there, refused on any other. Needs
+  `X-Byoc-Caller-Secret`. The picture is revised from the card's `appearance`.
+  See [byoc.md](byoc.md).
 
 ```json
 {
@@ -766,9 +787,9 @@ persisted instruction message.
 
 | Status | Meaning |
 |---|---|
-| 400 | malformed `prompt_traits` |
+| 400 | malformed `prompt_traits`; `character` missing on a BYOC instance, present on any other, or not a valid sealed card (`invalid_payload`) |
 | 401 | missing or invalid bearer |
-| 403 | not your session |
+| 403 | not your session; `byoc_forbidden` (the caller secret is missing or wrong); `byoc_card_rejected` (the card does not open under the instance's key) |
 | 404 | unknown session, or no such message in it |
 | **409** | the message exists but is not an image turn; or the session is a group session (`message` contains `wrong_channel`) |
 | 422 | blank `instruction`, or unsupported `aspect_ratio` |
@@ -872,7 +893,9 @@ event's message (see the events route below).
   for an unknown `occasion`. Session checks as on the stream endpoint (`403`,
   `404`, `409` for a voice or group session), `429` at the per-user in-flight cap. A
   failed generation returns the upstream error the image endpoints return and
-  persists nothing; the next open (with the same key) retries.
+  persists nothing; the next open (with the same key) retries. A BYOC
+  instance's session is `400 byoc_unsupported`: the route needs a character
+  the request does not carry.
 
 ### `POST /v2/comp/session/{session_id}/events`
 
@@ -1062,9 +1085,9 @@ reply does not count. Her other sessions never carry it.
 - **Errors:** `400` with `code: "invalid_payload"` for a malformed
   `event_key`; `422` for an unknown `kind`. Session checks as on `/open`
   (`403`, `404`, `409` for a voice or group session), `429` at the per-user
-  in-flight cap. A failed generation returns the upstream error the image
-  endpoints return and persists nothing. A blank reply persists nothing and
-  returns nulls.
+  in-flight cap. A BYOC instance's session is `400 byoc_unsupported`. A failed
+  generation returns the upstream error the image endpoints return and
+  persists nothing. A blank reply persists nothing and returns nulls.
 
 ### `GET /v2/comp/session/{session_id}/effects`
 
@@ -1254,6 +1277,7 @@ Every refusal below carries the pre-stream body `{code, message, user_message}`
 | Status | Code | When |
 |---|---|---|
 | 400 | `invalid_payload` | send: malformed `client_msg_id`, `tier`, `prompt_traits` or `audit`; a `byok` block; `image.force = true` |
+| 400 | `byoc_unsupported` | create / add member: a member session belongs to a BYOC instance |
 | 404 | `group_not_found` | the group is unknown, dissolved or not the caller's |
 | 404 | `session_not_found` | create / add member: a member session is unknown or not the caller's |
 | 404 | `member_not_found` | kick: the session is not a member of the group |
@@ -1301,7 +1325,8 @@ The session must be a **voice-channel** session (`409 wrong_channel`
 otherwise) — obtain one via `POST /comp/chat/start` with
 `"channel": "voice"`. Voice is opt-in per deployment: without a
 `[tasks.chat_voice]` block in the model config the endpoint returns
-`501 voice_disabled`.
+`501 voice_disabled`. A session whose instance is a BYOC instance is
+`400 byoc_unsupported`.
 
 The prompt is lean but not memoryless: persona + voice directive + a
 first-turn **bootstrap snapshot** (frozen once per session, then re-injected
@@ -1483,6 +1508,78 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
   http://localhost:8080/comp/voice/{session_id}/turn/interrupt
 ```
 
+## Bring your own character (BYOC)
+
+A BYOC instance is a persona instance whose character the engine never stores.
+Two routes create one; the stream, compose and image-edit routes then take the
+character as a sealed card in their `character` field (see the stream
+endpoint's "bring your own character" paragraph above). Both routes need the
+bearer token and `X-Byoc-Caller-Secret`, which must match the deployment's
+`BYOC_CALLER_SECRET`. Their refusals use the pre-stream body
+`{code, message, user_message}`. The flow, the sealing format and what is
+stored are in [byoc.md](byoc.md); the card format is in
+[eros-character-v1.md](eros-character-v1.md).
+
+### `POST /v2/comp/byoc/init`
+
+Empty body. Draws the key for a new instance and writes nothing.
+
+```bash
+curl -X POST -H "Authorization: Bearer $JWT" \
+  -H "X-Byoc-Caller-Secret: $BYOC_CALLER_SECRET" \
+  http://localhost:8080/v2/comp/byoc/init
+```
+
+```json
+{ "key": "<base64url, 32 bytes>", "ticket": "<base64url, 32 bytes>" }
+```
+
+`key` opens every card sent for the instance; the engine never shows it again,
+so store it before calling create. `ticket` proves to create that the engine
+issued `key` to this user.
+
+| Status | Meaning |
+|---|---|
+| 200 | `{key, ticket}` |
+| 401 | missing or invalid bearer |
+| 403 | `byoc_forbidden`: BYOC is off, or the caller secret is missing or wrong |
+
+### `POST /v2/comp/byoc/create`
+
+Body `{"key": "…", "ticket": "…"}`, both from init (base64url, padding
+optional). Creates the instance and returns its id.
+
+```json
+{ "instance_id": "8a1f0c2e-4b6d-4f8a-9c31-2d5e7f0a1b3c" }
+```
+
+Create is idempotent per key: a repeat with the same `key` and `ticket`
+returns the same `instance_id`, and re-creating an archived instance
+reactivates it. Open sessions on it with `POST /comp/chat/start` and the
+`instance_id`.
+
+| Status | Meaning |
+|---|---|
+| 200 | `{instance_id}` |
+| 400 | `invalid_payload`: `key` or `ticket` is not base64url of 32 bytes |
+| 401 | missing or invalid bearer |
+| 403 | `byoc_forbidden`: BYOC is off, the caller secret is missing or wrong, or the engine did not issue this `key` to this user |
+| 422 | the body is not `{key, ticket}` |
+
+### BYOC error codes
+
+| Status | Code | When |
+|---|---|---|
+| 403 | `byoc_forbidden` | the two routes above, or any card route request carrying `character`: BYOC is off, or the caller secret is missing or wrong |
+| 403 | `byoc_card_rejected` | `character` does not open under the instance's key |
+| 400 | `invalid_payload` | a card route: `character` missing on a BYOC instance, present on any other, malformed, over its size limit, or not a valid card, with a message saying which rule failed; the async route: any `character` |
+| 400 | `byoc_unsupported` | the route cannot serve a BYOC instance: async send, `/open`, voice turns, life events, group chat |
+
+A stream turn on a BYOC instance that a deploy interrupts is settled `failed`
+with `chat_turn_queue.last_error = 'byoc_unavailable'`, plus the usual
+`system_error` row; the card died with the process, and the deployment has no
+character to fall back to.
+
 ## Persona
 
 ### `POST /persona/{instance_id}/image/compose`
@@ -1511,6 +1608,7 @@ Body fields:
 | `aspect_ratio` | `String` | no | Same allow-list as the chat path; `422` on anything else. |
 | `prompt_variant` | `String` | no | Same variant selection as the chat path, including the unknown-key-falls-back-to-built-in rule. |
 | `stream` | `bool` | no | Default `true`. |
+| `character` | `String` | BYOC only | A sealed character card. Required when the instance is a BYOC instance, refused (`400 invalid_payload`) on any other. Needs `X-Byoc-Caller-Secret`. The composer reads the card's `appearance`. See [byoc.md](byoc.md). |
 
 The composer payload is identical to the chat path's seven slots, so one
 `filter_prompt` contract serves both callers (see
@@ -1572,6 +1670,8 @@ Failure modes:
 | `[tasks.chat_image_prompt_compose]` absent | `501 compose_disabled` |
 | Instance not owned by the JWT user | `403` |
 | Instance not found | `404` |
+| `character` missing on a BYOC instance, present on any other, or not a valid sealed card | `400 invalid_payload` |
+| `character` sent without the caller secret, or a card that does not open under the instance's key | `403 byoc_forbidden` / `403 byoc_card_rejected` |
 | Blank `content`, over-cap `scene`, bad `aspect_ratio` | `422` |
 | Over the per-user in-flight cap (shared with chat/voice, ≤3) | `429` |
 | Composer chain exhausted | **The provider's own status, verbatim** (see below) — or an in-band `error` frame if streaming has begun. **No portrait fallback here**: the fallback exists to keep a chat turn moving, and this endpoint has no turn to protect. |
@@ -1743,7 +1843,9 @@ routes: `404` for an unknown or archived instance, `403` for another user's.
 
 Genome presets (`art_metadata.possessions` / `art_metadata.wardrobe`) come
 first with `source: "preset"` and no `id`; then every instance row, newest
-first, neither deduplicated nor capped. `source: "gift"` is an accepted gift
+first, neither deduplicated nor capped. A BYOC instance has no presets here:
+they live in its card, which the caller already holds, so the list is the
+instance's own rows only. `source: "gift"` is an accepted gift
 action; `user_message_id` is its turn, `null` once that message is deleted.
 The prompt shows each list deduplicated, at most 20 instance names per list.
 
@@ -1887,6 +1989,9 @@ The body is the canonical start body plus one BFF-only field:
   ]
 }
 ```
+
+`persona_name` is always present and is `null` for a BYOC instance, whose
+name only its card holds.
 
 Affinity is intentionally **not** bundled here — the frontend reads it
 separately via the two affinity routes below, so a cold mount that does not
@@ -2088,6 +2193,7 @@ form of the route above, for a client rendering one row per companion. The
     {
       "session_id": "…",
       "genome_id": "…",
+      "instance_id": "…",
       "affinity": { "…": "identical to the single-session shape above" }
     }
   ],
@@ -2098,7 +2204,10 @@ form of the route above, for a client rendering one row per companion. The
 - **Every row gets the same read-time refresh** as the single-session route. A
   row that skipped it would be no better than the stored columns.
 - `genome_id` is the companion the relationship is with — a list keyed by
-  companion joins on it without a second round trip.
+  companion joins on it without a second round trip. It is always present and
+  is `null` for a BYOC relationship, which has no genome.
+- `instance_id` is the persona instance the relationship is with, always set.
+  Key a relationship of either kind on it.
 - Ordered `updated_at DESC, session_id DESC`, so page one holds the rows a list
   actually shows first. The cursor is a keyset on that pair; `session_id`
   breaks timestamp ties, which is what keeps a page boundary landing on a tie
@@ -2202,7 +2311,9 @@ failure modes on all three routes use the `code` / `message` /
 same error body shape even though it is not itself a stream (its success
 response is plain JSON) — it reuses the voice turn's precondition checks and
 error type. The group routes (`/v2/comp/group*`) use the coded shape for their
-refusals too. The table below covers the plain shape:
+refusals too, and so does every BYOC refusal (`byoc_forbidden`,
+`byoc_card_rejected`, `byoc_unsupported` and the `invalid_payload` of a card),
+on whichever route it comes from. The table below covers the plain shape:
 
 | Status | Code | When |
 |--------|------|------|
@@ -2228,6 +2339,7 @@ refusals too. The table below covers the plain shape:
 - `crates/eros-engine-server/src/pipeline/chat_queue.rs` — async chat-turn queue worker
 - `crates/eros-engine-server/src/routes/voice.rs` — voice-channel turn (`voice/{session_id}/turn/stream`)
 - `crates/eros-engine-server/src/routes/persona.rs` — standalone image-prompt composition (`/persona/{instance_id}/image/compose`)
+- `crates/eros-engine-server/src/routes/byoc.rs` — BYOC key lifecycle (`v2/comp/byoc/init`, `v2/comp/byoc/create`); `crates/eros-engine-server/src/byoc.rs` holds admission, the ticket and card opening
 - `crates/eros-engine-server/src/routes/world_town.rs` — World Town feed and comments (`/world/town/*`)
 - `crates/eros-engine-server/src/routes/bff/companion.rs` — BFF `/bff/v1/comp/chat/*`
 - `crates/eros-engine-server/src/routes/bff/affinity.rs` — BFF `/bff/v1/comp/affinity/*`

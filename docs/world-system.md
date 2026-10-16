@@ -104,7 +104,7 @@ structured LLM call:
 | Input | Source |
 |-------|--------|
 | Previous world seed | `world_states.seed` (opaque JSONB; the engine never interprets it) |
-| Active roster (cap 8) | `persona_instances` with `status = 'active'`, earliest-created first |
+| Active roster (cap 8) | `persona_instances` with `status = 'active'` and a genome, earliest-created first — a [BYOC](byoc.md) instance has none and never joins |
 | Memory feedback (K=15) | Most recent **extracted** profile-layer `companion_memories` (dreaming-lite output — never raw chat) |
 
 | Output | Where it goes |
@@ -212,7 +212,8 @@ Per `persona_instance`, every `interval_hours` (default 8), behind an
 (default 72) get a round. A quiet instance's life simply pauses and resumes
 the moment chat activity resumes — no catch-up rounds. Turns in a
 [group](group-chat.md) do not count: they leave the member sessions' activity
-untouched.
+untouched. A [BYOC](byoc.md) instance gets no round and no story row, and
+takes no roster slot from an instance that has a genome.
 
 | Input | Source |
 |-------|--------|

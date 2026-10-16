@@ -2172,7 +2172,7 @@ mod tests {
         CompanionPersona {
             instance_id: iid,
             genome: PersonaGenome {
-                id: gid,
+                id: Some(gid),
                 name: "TestPersona".into(),
                 system_prompt: "You are TestPersona.".into(),
                 tip_personality: None,
@@ -2180,7 +2180,7 @@ mod tests {
             },
             instance: PersonaInstance {
                 id: iid,
-                genome_id: gid,
+                genome_id: Some(gid),
                 owner_uid: oid,
                 status: "active".into(),
             },
@@ -2908,7 +2908,7 @@ mod tests {
         eros_engine_core::persona::CompanionPersona {
             instance_id,
             genome: PersonaGenome {
-                id: Uuid::new_v4(),
+                id: Some(Uuid::new_v4()),
                 name: "Mia".into(),
                 system_prompt: "You are Mia.".into(),
                 tip_personality: None,
@@ -2916,7 +2916,7 @@ mod tests {
             },
             instance: PersonaInstance {
                 id: instance_id,
-                genome_id: Uuid::new_v4(),
+                genome_id: Some(Uuid::new_v4()),
                 owner_uid: owner,
                 status: "active".into(),
             },

@@ -27,22 +27,23 @@ pub struct GenomeGate {
     pub name: String,
 }
 
-/// Gate-fields view for the explicit-`instance_id` chat-start path: owner
-/// (403 check) and genome name (response) in one JOIN.
+/// Gate-fields view for the explicit-`instance_id` path: owner (403 check) and
+/// genome name (response) in one LEFT JOIN. A BYOC instance has no genome, so
+/// its `genome_id` and `genome_name` are `None`.
 /// Filters `status='active'` like `load_companion`, so an archived instance
 /// yields `None`. Folds the former `load_companion` read.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct InstanceGate {
     pub instance_id: Uuid,
-    pub genome_id: Uuid,
+    pub genome_id: Option<Uuid>,
     pub owner_uid: Uuid,
-    pub genome_name: String,
+    pub genome_name: Option<String>,
 }
 
 impl From<GenomeRow> for PersonaGenome {
     fn from(r: GenomeRow) -> Self {
         Self {
-            id: r.id,
+            id: Some(r.id),
             name: r.name,
             system_prompt: r.system_prompt,
             tip_personality: r.tip_personality,
@@ -55,7 +56,7 @@ impl From<GenomeRow> for PersonaGenome {
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct InstanceRow {
     id: Uuid,
-    genome_id: Uuid,
+    genome_id: Option<Uuid>,
     owner_uid: Uuid,
     status: String,
 }
@@ -75,6 +76,49 @@ impl From<InstanceRow> for PersonaInstance {
 /// newest first (spec 2026-10-12-persona-items-and-gift-design.md §5.1).
 /// Genome presets come on top. The items route is uncapped.
 pub const PROMPT_ITEMS_PER_KIND: i64 = 20;
+
+/// The `items` column of the instance reads: the instance's own item rows as a
+/// JSON array of `{kind, name, gifted}`, at most `$2` names per kind, newest
+/// first. Needs `pi` (the instance) in scope and `$2` bound to
+/// [`PROMPT_ITEMS_PER_KIND`].
+const INSTANCE_ITEMS_SQL: &str = "COALESCE(( \
+        SELECT json_agg(json_build_object( \
+                   'kind', t.kind, 'name', t.name, 'gifted', t.gifted) \
+               ORDER BY t.kind, t.last_at DESC, t.name) \
+        FROM ( \
+            SELECT kind, name, \
+                   bool_or(source = 'gift') AS gifted, \
+                   max(created_at) AS last_at, \
+                   row_number() OVER ( \
+                       PARTITION BY kind ORDER BY max(created_at) DESC, name) AS rn \
+            FROM engine.persona_instance_items \
+            WHERE instance_id = pi.id \
+            GROUP BY kind, name \
+        ) t \
+        WHERE t.rn <= $2 \
+    ), '[]'::json) AS items";
+
+/// What a BYOC turn needs from the database: the instance, its owner, the key
+/// that opens the card, and the instance's own item rows.
+#[derive(Clone)]
+pub struct ByocInstance {
+    pub instance_id: Uuid,
+    pub owner_uid: Uuid,
+    pub key: Vec<u8>,
+    pub items: Vec<PersonaItem>,
+}
+
+impl std::fmt::Debug for ByocInstance {
+    /// The key never reaches a log line.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ByocInstance")
+            .field("instance_id", &self.instance_id)
+            .field("owner_uid", &self.owner_uid)
+            .field("key", &"<redacted>")
+            .field("items", &self.items)
+            .finish()
+    }
+}
 
 /// One row of `engine.persona_instance_items`.
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
@@ -119,7 +163,8 @@ impl<'a> PersonaRepo<'a> {
         .await
     }
 
-    /// Joined genome+instance view used by the chat pipeline.
+    /// Joined genome+instance view used by the chat pipeline. Inner join: a
+    /// BYOC instance has no genome row and yields `None`.
     pub async fn load_companion(
         &self,
         instance_id: Uuid,
@@ -128,11 +173,11 @@ impl<'a> PersonaRepo<'a> {
         struct Joined {
             // instance side
             instance_id: Uuid,
-            genome_id: Uuid,
+            genome_id: Option<Uuid>,
             owner_uid: Uuid,
             status: String,
             // genome side
-            g_id: Uuid,
+            g_id: Option<Uuid>,
             name: String,
             system_prompt: String,
             tip_personality: Option<String>,
@@ -140,7 +185,7 @@ impl<'a> PersonaRepo<'a> {
             items: serde_json::Value,
         }
 
-        let row = sqlx::query_as::<_, Joined>(
+        let row = sqlx::query_as::<_, Joined>(&format!(
             "SELECT \
                 pi.id          AS instance_id, \
                 pi.genome_id   AS genome_id, \
@@ -151,26 +196,11 @@ impl<'a> PersonaRepo<'a> {
                 pg.system_prompt    AS system_prompt, \
                 pg.tip_personality  AS tip_personality, \
                 pg.art_metadata     AS art_metadata, \
-                COALESCE(( \
-                    SELECT json_agg(json_build_object( \
-                               'kind', t.kind, 'name', t.name, 'gifted', t.gifted) \
-                           ORDER BY t.kind, t.last_at DESC, t.name) \
-                    FROM ( \
-                        SELECT kind, name, \
-                               bool_or(source = 'gift') AS gifted, \
-                               max(created_at) AS last_at, \
-                               row_number() OVER ( \
-                                   PARTITION BY kind ORDER BY max(created_at) DESC, name) AS rn \
-                        FROM engine.persona_instance_items \
-                        WHERE instance_id = pi.id \
-                        GROUP BY kind, name \
-                    ) t \
-                    WHERE t.rn <= $2 \
-                ), '[]'::json) AS items \
+                {INSTANCE_ITEMS_SQL} \
              FROM engine.persona_instances pi \
              JOIN engine.persona_genomes pg ON pg.id = pi.genome_id \
              WHERE pi.id = $1 AND pi.status = 'active'",
-        )
+        ))
         .bind(instance_id)
         .bind(PROMPT_ITEMS_PER_KIND)
         .fetch_optional(self.pool)
@@ -199,6 +229,43 @@ impl<'a> PersonaRepo<'a> {
         }))
     }
 
+    /// An active BYOC instance with its key and its own item rows (a BYOC
+    /// persona has no genome presets). `None` for a genome instance, an
+    /// archived one, or an unknown id.
+    pub async fn load_byoc_instance(
+        &self,
+        instance_id: Uuid,
+    ) -> Result<Option<ByocInstance>, sqlx::Error> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            instance_id: Uuid,
+            owner_uid: Uuid,
+            key: Vec<u8>,
+            items: serde_json::Value,
+        }
+
+        let row = sqlx::query_as::<_, Row>(&format!(
+            "SELECT \
+                pi.id        AS instance_id, \
+                pi.owner_uid AS owner_uid, \
+                pi.byoc_key  AS key, \
+                {INSTANCE_ITEMS_SQL} \
+             FROM engine.persona_instances pi \
+             WHERE pi.id = $1 AND pi.status = 'active' AND pi.byoc_key IS NOT NULL",
+        ))
+        .bind(instance_id)
+        .bind(PROMPT_ITEMS_PER_KIND)
+        .fetch_optional(self.pool)
+        .await?;
+
+        Ok(row.map(|r| ByocInstance {
+            instance_id: r.instance_id,
+            owner_uid: r.owner_uid,
+            key: r.key,
+            items: serde_json::from_value(r.items).unwrap_or_default(),
+        }))
+    }
+
     /// One-JOIN gate read for the explicit-`instance_id` path. See [`InstanceGate`].
     pub async fn load_instance_gate(
         &self,
@@ -211,7 +278,7 @@ impl<'a> PersonaRepo<'a> {
                 pi.owner_uid AS owner_uid, \
                 pg.name      AS genome_name \
              FROM engine.persona_instances pi \
-             JOIN engine.persona_genomes pg ON pg.id = pi.genome_id \
+             LEFT JOIN engine.persona_genomes pg ON pg.id = pi.genome_id \
              WHERE pi.id = $1 AND pi.status = 'active'",
         )
         .bind(instance_id)
@@ -333,6 +400,26 @@ impl<'a> PersonaRepo<'a> {
         .await
     }
 
+    /// Create the BYOC instance for `key`, or reactivate the one that holds it
+    /// (archived or not) and return its id, so a key stored by the caller
+    /// keeps working after an archive. One owner may hold several.
+    pub async fn create_byoc_instance(
+        &self,
+        owner_uid: Uuid,
+        key: &[u8; 32],
+    ) -> Result<Uuid, sqlx::Error> {
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.persona_instances (owner_uid, byoc_key) \
+             VALUES ($1, $2) \
+             ON CONFLICT (byoc_key) WHERE byoc_key IS NOT NULL DO UPDATE SET status = 'active' \
+             RETURNING id",
+        )
+        .bind(owner_uid)
+        .bind(key.as_slice())
+        .fetch_one(self.pool)
+        .await
+    }
+
     /// Every item row of the instance, newest first. Presets are the
     /// genome's and are not rows.
     pub async fn list_items(&self, instance_id: Uuid) -> Result<Vec<InstanceItemRow>, sqlx::Error> {
@@ -424,7 +511,7 @@ mod tests {
             .unwrap()
             .expect("companion must load");
         assert_eq!(companion.instance_id, instance_id);
-        assert_eq!(companion.genome.id, genome_id);
+        assert_eq!(companion.genome.id, Some(genome_id));
         assert_eq!(companion.genome.name, "Echo");
         assert_eq!(companion.instance.owner_uid, owner);
         assert_eq!(companion.instance.status, "active");
@@ -523,9 +610,9 @@ mod tests {
             .unwrap()
             .expect("active instance gate");
         assert_eq!(gate.instance_id, iid);
-        assert_eq!(gate.genome_id, genome_id);
+        assert_eq!(gate.genome_id, Some(genome_id));
         assert_eq!(gate.owner_uid, owner);
-        assert_eq!(gate.genome_name, "Nova");
+        assert_eq!(gate.genome_name.as_deref(), Some("Nova"));
 
         // archived → None (mirrors load_companion's active filter)
         sqlx::query("UPDATE engine.persona_instances SET status = 'archived' WHERE id = $1")
@@ -717,5 +804,137 @@ mod tests {
         );
         assert!(repo.delete_item(instance_id, newer.id).await.unwrap());
         assert_eq!(repo.list_items(instance_id).await.unwrap().len(), 1);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn byoc_migration_enforces_one_instance_kind(pool: PgPool) {
+        let owner = Uuid::new_v4();
+        let g = insert_genome(&pool, "Both", serde_json::json!({})).await;
+        let ins = |sql: &'static str| sqlx::query(sql);
+        assert!(ins(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid, byoc_key) VALUES ($1,$2,$3)"
+        )
+        .bind(g)
+        .bind(owner)
+        .bind(vec![1u8; 32])
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(
+            ins("INSERT INTO engine.persona_instances (owner_uid) VALUES ($1)")
+                .bind(owner)
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+        assert!(
+            ins("INSERT INTO engine.persona_instances (owner_uid, byoc_key) VALUES ($1,$2)")
+                .bind(owner)
+                .bind(vec![1u8; 31])
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn byoc_create_is_idempotent_per_key_and_reactivates(pool: PgPool) {
+        let repo = PersonaRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        let id = repo.create_byoc_instance(owner, &[9u8; 32]).await.unwrap();
+        assert_eq!(
+            repo.create_byoc_instance(owner, &[9u8; 32]).await.unwrap(),
+            id
+        );
+        sqlx::query("UPDATE engine.persona_instances SET status = 'archived' WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.create_byoc_instance(owner, &[9u8; 32]).await.unwrap(),
+            id
+        );
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM engine.persona_instances WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "active");
+        assert_ne!(
+            repo.create_byoc_instance(owner, &[8u8; 32]).await.unwrap(),
+            id,
+            "one owner may hold several BYOC instances"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn byoc_load_reads_key_and_rows_for_active_byoc_only(pool: PgPool) {
+        use eros_engine_core::persona::PersonaItem;
+        use eros_engine_core::types::ItemKind;
+        let repo = PersonaRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        let id = repo.create_byoc_instance(owner, &[5u8; 32]).await.unwrap();
+        add_item(&pool, id, "clothing", "红色旗袍", "gift", 1).await;
+        let b = repo.load_byoc_instance(id).await.unwrap().unwrap();
+        assert_eq!(
+            (b.instance_id, b.owner_uid, b.key.clone()),
+            (id, owner, vec![5u8; 32])
+        );
+        assert_eq!(
+            b.items,
+            vec![PersonaItem {
+                kind: ItemKind::Clothing,
+                name: "红色旗袍".into(),
+                gifted: true
+            }]
+        );
+        assert!(repo.load_companion(id).await.unwrap().is_none());
+        let g = insert_genome(&pool, "Genome", serde_json::json!({})).await;
+        let gi = repo.create_instance(g, owner).await.unwrap();
+        assert!(repo.load_byoc_instance(gi).await.unwrap().is_none());
+        sqlx::query("UPDATE engine.persona_instances SET status = 'archived' WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(repo.load_byoc_instance(id).await.unwrap().is_none());
+    }
+
+    #[test]
+    fn byoc_instance_debug_hides_the_key() {
+        let b = ByocInstance {
+            instance_id: Uuid::new_v4(),
+            owner_uid: Uuid::new_v4(),
+            key: vec![170u8; 32],
+            items: vec![],
+        };
+        let shown = format!("{b:?}");
+        assert!(shown.contains("<redacted>"));
+        assert!(!shown.contains("170, 170"));
+        assert!(shown.contains(&b.instance_id.to_string()));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn byoc_instance_gate_has_no_genome(pool: PgPool) {
+        let repo = PersonaRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        let id = repo.create_byoc_instance(owner, &[4u8; 32]).await.unwrap();
+        let gate = repo
+            .load_instance_gate(id)
+            .await
+            .unwrap()
+            .expect("active BYOC instance gate");
+        assert_eq!(gate.instance_id, id);
+        assert_eq!(gate.genome_id, None);
+        assert_eq!(gate.genome_name, None);
+        assert_eq!(gate.owner_uid, owner);
+        sqlx::query("UPDATE engine.persona_instances SET status = 'archived' WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(repo.load_instance_gate(id).await.unwrap().is_none());
     }
 }

@@ -120,6 +120,7 @@ fn refusal(r: MemberRefusal) -> AppError {
             "member session is archived",
             "这段关系已归档",
         ),
+        MemberRefusal::Byoc => crate::byoc::unsupported("group chat"),
         MemberRefusal::InstanceAlreadyMember => pre(
             StatusCode::CONFLICT,
             "instance_already_member",
@@ -163,6 +164,7 @@ async fn owned(state: &AppState, group_id: Uuid, user_id: Uuid) -> Result<Group,
     request_body = CreateGroupRequest,
     responses(
         (status = 200, body = GroupDto),
+        (status = 400, description = "`byoc_unsupported`: a member session belongs to a BYOC instance", body = crate::routes::companion_stream::StreamPreErrorBody),
         (status = 404, description = "`session_not_found`: a member session is unknown or not the caller's", body = crate::routes::companion_stream::StreamPreErrorBody),
         (status = 409, description = "`group_full`, `wrong_channel`, `session_archived` or `instance_already_member`", body = crate::routes::companion_stream::StreamPreErrorBody),
         (status = 422, description = "`invalid_title`, or `unprocessable` for an empty member list", body = crate::routes::companion_stream::StreamPreErrorBody),
@@ -242,6 +244,7 @@ async fn rename_group(
     params(("group_id" = Uuid, Path)), request_body = AddMemberRequest,
     responses(
         (status = 200, body = GroupDto),
+        (status = 400, description = "`byoc_unsupported`: the member session belongs to a BYOC instance", body = crate::routes::companion_stream::StreamPreErrorBody),
         (status = 404, description = "`group_not_found`, or `session_not_found` for the member session", body = crate::routes::companion_stream::StreamPreErrorBody),
         (status = 409, description = "`group_full`, `wrong_channel`, `session_archived` or `instance_already_member`", body = crate::routes::companion_stream::StreamPreErrorBody),
     ),
@@ -659,7 +662,8 @@ pub fn router() -> OpenApiRouter<AppState> {
 mod tests {
     use super::*;
     use crate::routes::companion::testutil::{
-        build_router, mint_test_jwt, seed_persona_instance, seed_session, send_request,
+        build_router, mint_test_jwt, seed_byoc_session, seed_persona_instance, seed_session,
+        send_request,
     };
     use axum::body::Body;
     use axum::http::{header, Request, StatusCode};
@@ -779,6 +783,69 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::NOT_FOUND);
         assert_eq!(body["code"], "session_not_found", "{body}");
+    }
+
+    async fn group_session_rows(pool: &PgPool) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM engine.chat_sessions WHERE channel = 'group'")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn group_refuses_a_byoc_member(pool: PgPool) {
+        let user = Uuid::new_v4();
+        let genome_member = member(&pool, user).await;
+        let (_, byoc_member) = seed_byoc_session(&pool, user).await;
+        let mut app = build_router(crate::routes::companion::test_state(pool.clone()));
+
+        for members in [vec![byoc_member], vec![genome_member, byoc_member]] {
+            let (s, body) = send_request(
+                &mut app,
+                req(
+                    "POST",
+                    "/v2/comp/group",
+                    user,
+                    Some(json!({"member_session_ids": members})),
+                ),
+            )
+            .await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["code"], "byoc_unsupported", "{body}");
+            assert_eq!(group_session_rows(&pool).await, 0, "the group rolled back");
+        }
+
+        let (_, body) = send_request(
+            &mut app,
+            req(
+                "POST",
+                "/v2/comp/group",
+                user,
+                Some(json!({"member_session_ids": [genome_member]})),
+            ),
+        )
+        .await;
+        let gid = body["group_id"].as_str().unwrap().to_string();
+        let (s, body) = send_request(
+            &mut app,
+            req(
+                "POST",
+                &format!("/v2/comp/group/{gid}/members"),
+                user,
+                Some(json!({"member_session_id": byoc_member})),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["code"], "byoc_unsupported", "{body}");
+        let seated: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_session_members WHERE member_session_id = $1",
+        )
+        .bind(byoc_member)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(seated, 0);
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

@@ -65,6 +65,7 @@ Create and add-member refusals:
 | Member session is not a `text` session | `409 wrong_channel` |
 | Member session is archived | `409 session_archived` |
 | Another member has the same persona instance | `409 instance_already_member` |
+| Member session belongs to a [BYOC](byoc.md) instance | `400 byoc_unsupported` |
 | Blank, over-long or control-character title | `422 invalid_title` |
 | `member_session_ids` is empty (create) | `422 unprocessable` |
 

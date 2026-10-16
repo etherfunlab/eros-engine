@@ -95,7 +95,9 @@ pub struct StartChatRequest {
 pub struct StartChatResponse {
     pub session_id: Uuid,
     pub instance_id: Uuid,
-    pub persona_name: String,
+    /// Null for a BYOC instance, whose name only its card holds.
+    #[schema(required = true)]
+    pub persona_name: Option<String>,
     pub is_new: bool,
 }
 
@@ -611,7 +613,7 @@ pub(crate) fn validate_llm_audit(dto: Option<LlmAuditDto>) -> Result<Option<LlmA
 pub(crate) struct ResolvedSession {
     pub session_id: Uuid,
     pub instance_id: Uuid,
-    pub persona_name: String,
+    pub persona_name: Option<String>,
     pub is_new: bool,
 }
 
@@ -636,8 +638,9 @@ pub(crate) async fn resolve_or_create_session(
 
     let (instance_id, persona_name) = match req.instance_id {
         Some(iid) => {
-            // Explicit instance: one JOIN read gives owner + genome name
-            // (replaces the former double load_companion + asset read).
+            // Explicit instance: one LEFT JOIN read gives owner + genome name
+            // (replaces the former double load_companion + asset read). A BYOC
+            // instance has no genome, hence no name.
             let gate = persona_repo
                 .load_instance_gate(iid)
                 .await?
@@ -672,7 +675,7 @@ pub(crate) async fn resolve_or_create_session(
                         .await?
                 }
             };
-            (iid, gate.name)
+            (iid, Some(gate.name))
         }
     };
 
@@ -1178,6 +1181,7 @@ pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
             ),
             reaction_emoji: None,
             byok: crate::state::ByokConfig::default(),
+            byoc: crate::state::ByocConfig::default(),
             insights_export: crate::state::InsightsExportConfig::default(),
         },
         openrouter: Arc::new(eros_engine_llm::openrouter::OpenRouterClient::new(
@@ -1313,6 +1317,63 @@ pub(crate) mod testutil {
     pub(crate) async fn seed_persona_instance(pool: &PgPool, owner: Uuid) -> Uuid {
         let genome_id = seed_genome(pool, &format!("seed-{}", Uuid::new_v4())).await;
         seed_instance(pool, genome_id, owner).await
+    }
+
+    /// The caller secret of a state built by [`enable_byoc`].
+    pub(crate) const BYOC_SECRET: &str = "byoc-caller-secret-for-tests-0123456789";
+
+    /// Turn BYOC on, as a deployment that set `BYOC_CALLER_SECRET` would.
+    pub(crate) fn enable_byoc(state: &mut AppState) {
+        state.config.byoc.caller_secret = Some(BYOC_SECRET.into());
+    }
+
+    /// A BYOC instance and the key it was created under.
+    pub(crate) async fn seed_byoc_instance_with_key(
+        pool: &PgPool,
+        owner: Uuid,
+    ) -> (Uuid, [u8; 32]) {
+        let key = crate::byoc::mint_key();
+        let id = eros_engine_store::persona::PersonaRepo { pool }
+            .create_byoc_instance(owner, &key)
+            .await
+            .unwrap();
+        (id, key)
+    }
+
+    /// A BYOC instance with one text session; returns (instance, session).
+    pub(crate) async fn seed_byoc_session(pool: &PgPool, owner: Uuid) -> (Uuid, Uuid) {
+        let (instance_id, _) = seed_byoc_instance_with_key(pool, owner).await;
+        let session_id = seed_session(pool, owner, instance_id).await;
+        (instance_id, session_id)
+    }
+
+    /// Row counts a turn would grow: messages, queued turns and life events of
+    /// `session_id`. A refused request leaves all three unchanged.
+    pub(crate) async fn session_footprint(pool: &PgPool, session_id: Uuid) -> (i64, i64, i64) {
+        let count = |table: &'static str| async move {
+            sqlx::query_scalar::<_, i64>(&format!(
+                "SELECT count(*) FROM engine.{table} WHERE session_id = $1"
+            ))
+            .bind(session_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        };
+        (
+            count("chat_messages").await,
+            count("chat_turn_queue").await,
+            count("persona_events").await,
+        )
+    }
+
+    /// A v1 card sealed under `key`, as a downstream sends it.
+    pub(crate) fn sealed_card(
+        key: &[u8; 32],
+        name: &str,
+        system_prompt: &str,
+        art: Value,
+    ) -> String {
+        crate::byoc::seal(key, &crate::byoc::card_json(name, system_prompt, art))
     }
 }
 
@@ -1978,7 +2039,7 @@ mod tests {
             .expect("resolve_or_create_session");
 
         assert!(resolved.is_new);
-        assert_eq!(resolved.persona_name, "Vita");
+        assert_eq!(resolved.persona_name.as_deref(), Some("Vita"));
         // A second call with the same input should resume — not create a new session.
         let resumed = resolve_or_create_session(&state, user_id, &req)
             .await
@@ -2024,7 +2085,7 @@ mod tests {
                 .unwrap();
         assert_eq!(status, "active");
         assert!(resolved.is_new, "no prior session existed");
-        assert_eq!(resolved.persona_name, "Vita");
+        assert_eq!(resolved.persona_name.as_deref(), Some("Vita"));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -2877,5 +2938,89 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN, "not your session");
+    }
+
+    // ─── BYOC instances on engine-owned routes ───────────────────────
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn chat_start_opens_a_byoc_instance_with_a_null_name(pool: PgPool) {
+        let owner = Uuid::new_v4();
+        let (byoc, _) = testutil::seed_byoc_instance_with_key(&pool, owner).await;
+        let genome_id = seed_genome(&pool, "Echo").await;
+        let jwt = mint_test_jwt(owner);
+        let mut router = build_router(test_state(pool.clone()));
+        let start = |body: serde_json::Value| {
+            Request::builder()
+                .method("POST")
+                .uri("/comp/chat/start")
+                .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap()
+        };
+
+        let (status, body) = send_request(&mut router, start(json!({ "instance_id": byoc }))).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert!(body["persona_name"].is_null(), "body={body}");
+        assert_eq!(body["instance_id"], byoc.to_string());
+        assert!(body["is_new"].as_bool().unwrap());
+        let session_id = body["session_id"].as_str().unwrap().to_string();
+
+        let (status, resumed) =
+            send_request(&mut router, start(json!({ "instance_id": byoc }))).await;
+        assert_eq!(status, StatusCode::OK, "body={resumed}");
+        assert_eq!(resumed["session_id"], session_id);
+        assert!(!resumed["is_new"].as_bool().unwrap());
+
+        let (status, genome) =
+            send_request(&mut router, start(json!({ "genome_id": genome_id }))).await;
+        assert_eq!(status, StatusCode::OK, "body={genome}");
+        assert_eq!(genome["persona_name"], "Echo");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn chat_start_refuses_a_foreign_byoc_instance(pool: PgPool) {
+        let (byoc, _) = testutil::seed_byoc_instance_with_key(&pool, Uuid::new_v4()).await;
+        let mut router = build_router(test_state(pool.clone()));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/comp/chat/start")
+            .header(
+                header::AUTHORIZATION,
+                format!("Bearer {}", mint_test_jwt(Uuid::new_v4())),
+            )
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({ "instance_id": byoc })).unwrap(),
+            ))
+            .unwrap();
+        let (status, _) = send_request(&mut router, req).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn engine_owned_reads_serve_a_byoc_instance(pool: PgPool) {
+        let owner = Uuid::new_v4();
+        let (instance_id, session_id) = testutil::seed_byoc_session(&pool, owner).await;
+        let (message_id, _) = seed_image_turn(&pool, session_id, owner, Some("黄昏天台")).await;
+        let jwt = mint_test_jwt(owner);
+        let mut router = build_router(test_state(pool.clone()));
+        let get = |uri: String| {
+            Request::builder()
+                .uri(uri)
+                .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        for uri in [
+            format!("/comp/chat/{session_id}/history"),
+            format!("/comp/instance/{instance_id}/profile"),
+            format!("/v2/comp/instance/{instance_id}/insight/character"),
+            format!("/comp/chat/{session_id}/messages/{message_id}/image-request"),
+        ] {
+            let (status, body) = send_request(&mut router, get(uri.clone())).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: body={body}");
+        }
     }
 }

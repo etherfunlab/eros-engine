@@ -43,6 +43,8 @@ pub enum MemberRefusal {
     NotFound,
     WrongChannel,
     Archived,
+    /// The session's instance is a BYOC one; a group has no card to open.
+    Byoc,
     InstanceAlreadyMember,
     GroupFull,
 }
@@ -239,7 +241,7 @@ impl<'a> GroupRepo<'a> {
 }
 
 /// The member checks and the insert, inside the caller's transaction (which
-/// holds the group row). Order: existence/ownership, channel, archived,
+/// holds the group row). Order: existence/ownership, channel, archived, BYOC,
 /// instance already seated, cap.
 async fn admit(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -247,13 +249,17 @@ async fn admit(
     user_id: Uuid,
     member: Uuid,
 ) -> Result<Result<(), MemberRefusal>, sqlx::Error> {
-    let row: Option<(Uuid, String, bool, Option<Uuid>)> = sqlx::query_as(
-        "SELECT user_id, channel, archived, instance_id FROM engine.chat_sessions WHERE id = $1 FOR SHARE",
+    // FOR SHARE cannot lock the nullable side of the join, so it names the session.
+    let row: Option<(Uuid, String, bool, Option<Uuid>, bool)> = sqlx::query_as(
+        "SELECT s.user_id, s.channel, s.archived, s.instance_id, pi.byoc_key IS NOT NULL \
+         FROM engine.chat_sessions s \
+         LEFT JOIN engine.persona_instances pi ON pi.id = s.instance_id \
+         WHERE s.id = $1 FOR SHARE OF s",
     )
     .bind(member)
     .fetch_optional(&mut **tx)
     .await?;
-    let Some((owner, channel, archived, instance_id)) = row else {
+    let Some((owner, channel, archived, instance_id, byoc)) = row else {
         return Ok(Err(MemberRefusal::NotFound));
     };
     if owner != user_id {
@@ -264,6 +270,9 @@ async fn admit(
     }
     if archived {
         return Ok(Err(MemberRefusal::Archived));
+    }
+    if byoc {
+        return Ok(Err(MemberRefusal::Byoc));
     }
     let Some(instance_id) = instance_id else {
         return Ok(Err(MemberRefusal::NotFound));
@@ -309,7 +318,7 @@ async fn admit(
 mod tests {
     use super::*;
     use crate::chat::ChatRepo;
-    use crate::testutil::seed_persona_instance;
+    use crate::testutil::{seed_byoc_instance, seed_persona_instance};
 
     async fn text_session(pool: &PgPool, user_id: Uuid) -> Uuid {
         let instance_id = seed_persona_instance(pool, user_id).await;
@@ -418,6 +427,48 @@ mod tests {
         assert_eq!(
             repo.add_member(g.id, user_id, d).await.unwrap(),
             Err(MemberRefusal::GroupFull)
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_byoc_session_cannot_join_a_group(pool: PgPool) {
+        let repo = GroupRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let a = text_session(&pool, user_id).await;
+        let g = repo.create(user_id, None, &[a]).await.unwrap().unwrap();
+
+        let byoc_instance = seed_byoc_instance(&pool, user_id).await;
+        let byoc = ChatRepo { pool: &pool }
+            .create_session(user_id, byoc_instance)
+            .await
+            .unwrap()
+            .id;
+        assert_eq!(
+            repo.add_member(g.id, user_id, byoc).await.unwrap(),
+            Err(MemberRefusal::Byoc)
+        );
+        assert_eq!(
+            repo.create(user_id, None, &[a, byoc]).await.unwrap().err(),
+            Some(MemberRefusal::Byoc)
+        );
+        let groups: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM engine.chat_sessions WHERE channel = 'group'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(groups, 1, "only the first group exists");
+        assert_eq!(repo.active_members(g.id).await.unwrap().len(), 1);
+
+        // The refusals before it keep their order: an archived BYOC session
+        // is still reported as archived.
+        sqlx::query("UPDATE engine.chat_sessions SET archived = true WHERE id = $1")
+            .bind(byoc)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.add_member(g.id, user_id, byoc).await.unwrap(),
+            Err(MemberRefusal::Archived)
         );
     }
 

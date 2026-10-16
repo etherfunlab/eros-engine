@@ -54,6 +54,9 @@ async-stream = { workspace = true }
 ulid         = { workspace = true }
 base64       = { workspace = true }
 rand = "0.8"
+# Bring-your-own-character: AES-256-GCM sealed cards and the HMAC init ticket.
+aes-gcm = "0.10.3"
+hmac = "0.12"
 # 6-field cron schedule parser (sec min hr dom mon dow). Pure parser; the
 # sweeper drives ticks via tokio::time::sleep. No runtime scheduler.
 cron = "0.12"

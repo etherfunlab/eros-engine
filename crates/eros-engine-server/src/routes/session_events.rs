@@ -369,7 +369,8 @@ pub(crate) async fn draw_event_at(
             "event_key must be 1..={MAX_EVENT_KEY_CHARS} chars of [A-Za-z0-9_.:-]"
         )));
     }
-    let (_session, persona, instance_id) = resolve_text_turn(state, session_id, user_id).await?;
+    let (_session, persona, instance_id) =
+        resolve_text_turn(state, session_id, user_id, "life events").await?;
 
     let chat_repo = ChatRepo { pool: &state.pool };
     let event_repo = EventRepo { pool: &state.pool };
@@ -515,7 +516,9 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::routes::companion::test_state;
-    use crate::routes::companion::testutil::{seed_genome, seed_instance, seed_session};
+    use crate::routes::companion::testutil::{
+        seed_byoc_session, seed_genome, seed_instance, seed_session, session_footprint,
+    };
 
     fn with_companion(mut state: AppState, mock_uri: &str) -> AppState {
         state.model_config = Arc::new(
@@ -914,6 +917,32 @@ mod tests {
         .err()
         .unwrap();
         assert_eq!(status(missing), StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn events_refuse_a_byoc_session(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = seed_byoc_session(&pool, user_id).await;
+        let before = session_footprint(&pool, session_id).await;
+        let err = draw_event_at(
+            &test_state(pool.clone()),
+            session_id,
+            user_id,
+            req("k", None),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .err()
+        .unwrap();
+        let AppError::StreamPre(e) = err else {
+            panic!("expected a coded error")
+        };
+        assert_eq!(
+            (e.status, e.code),
+            (StatusCode::BAD_REQUEST, "byoc_unsupported")
+        );
+        assert_eq!(session_footprint(&pool, session_id).await, before);
     }
 
     fn rolls(r: f64) -> events::Rolls {

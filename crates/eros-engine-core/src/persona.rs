@@ -7,7 +7,8 @@ use crate::types::ItemKind;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersonaGenome {
-    pub id: Uuid,
+    /// `None` for a BYOC persona, which is built from a card and has no genome row.
+    pub id: Option<Uuid>,
     pub name: String,
     pub system_prompt: String,
     pub tip_personality: Option<String>,
@@ -17,7 +18,8 @@ pub struct PersonaGenome {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersonaInstance {
     pub id: Uuid,
-    pub genome_id: Uuid,
+    /// `None` for a BYOC instance.
+    pub genome_id: Option<Uuid>,
     pub owner_uid: Uuid,
     pub status: String,
 }

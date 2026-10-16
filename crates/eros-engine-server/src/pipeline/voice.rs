@@ -1066,7 +1066,7 @@ mod tests {
 
     fn genome() -> PersonaGenome {
         PersonaGenome {
-            id: Uuid::new_v4(),
+            id: Some(Uuid::new_v4()),
             name: "Mia".into(),
             system_prompt: "You are Mia.".into(),
             tip_personality: None,

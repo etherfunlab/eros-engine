@@ -19,9 +19,9 @@ use ulid::Ulid;
 
 use eros_engine_core::scope::MemoryScope;
 use eros_engine_store::chat::{ChatRepo, LatestTurnLookup, VoiceUserInsert};
-use eros_engine_store::persona::PersonaRepo;
 
 use crate::auth::middleware::AuthUser;
+use crate::byoc::LoadedInstance;
 use crate::error::{AppError, StreamPreError};
 use crate::pipeline::stream::{ulid_string, ProtocolFrame};
 use crate::pipeline::voice::{run_voice_turn, VoiceTurn};
@@ -220,14 +220,15 @@ pub async fn voice_turn_stream(
         )
     })?;
 
-    // Reject a session whose persona instance is missing/inactive BEFORE
-    // acquiring a slot or persisting the user turn — mirrors the text stream so
-    // a recoverable precondition failure never leaves an orphaned user row.
-    let persona_repo = PersonaRepo { pool: &state.pool };
-    persona_repo
-        .load_companion(instance_id)
-        .await?
-        .ok_or_else(|| AppError::NotFound("instance not found".into()))?;
+    // Reject a session whose persona instance is missing/inactive, or is a
+    // BYOC instance (a voice turn takes no card), BEFORE acquiring a slot or
+    // persisting the user turn — mirrors the text stream so a recoverable
+    // precondition failure never leaves an orphaned user row.
+    match crate::byoc::load_instance(&state, instance_id).await? {
+        Some(LoadedInstance::Genome(_)) => {}
+        Some(LoadedInstance::Byoc(_)) => return Err(crate::byoc::unsupported("voice turns")),
+        None => return Err(AppError::NotFound("instance not found".into())),
+    }
 
     let guard = state
         .stream_slots
@@ -479,7 +480,9 @@ pub fn router() -> OpenApiRouter<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::routes::companion::testutil::seed_persona_instance;
+    use crate::routes::companion::testutil::{
+        seed_byoc_instance_with_key, seed_persona_instance, session_footprint,
+    };
     use axum::body::Body;
     use axum::http::{header, Request};
     use axum::Router;
@@ -837,6 +840,38 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn voice_turn_refuses_a_byoc_session(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (instance_id, _) = seed_byoc_instance_with_key(&pool, user_id).await;
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id, channel) \
+             VALUES ($1, $2, 'voice') RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let before = session_footprint(&pool, session_id).await;
+
+        let mut app = build_router(with_voice(crate::routes::companion::test_state(
+            pool.clone(),
+        )));
+        let resp = post_voice(
+            &mut app,
+            session_id,
+            &mint_jwt(user_id),
+            json!({"content":"hi","client_msg_id":"01J2222222222222222222222B"}),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["code"], "byoc_unsupported");
+        assert_eq!(session_footprint(&pool, session_id).await, before);
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

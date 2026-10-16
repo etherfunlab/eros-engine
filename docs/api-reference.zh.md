@@ -68,6 +68,9 @@ session。默认 `false`/缺省保持原本的恢复优先行为。语音通话�
 可选的 `instance_id` 字段：显式指定 `persona_instance` id。缺省时服务器为
 所给 `genome_id` 挑选（或自动创建）该用户的 instance；仅当 `instance_id`
 缺省时 `genome_id` 才是必填。
+`instance_id` 可以指向一个自带角色的实例（见 [byoc.zh.md](byoc.zh.md)）：会话不需要卡片，
+也不需要 caller secret 就能打开，`persona_name` 为 `null`，因为名字只在卡片里。
+该字段在响应里始终存在；genome 实例上它是字符串。
 
 可选的 `is_demo` 字段：把新建的 session 标记为 demo。持久化到 session 的
 `metadata.is_demo`，好感度管线读它来把正向评分乘以 `AFFINITY_DEMO_BOOST`
@@ -516,6 +519,13 @@ stream 客户端——事后可通过
 否则返回 `403 byok_forbidden`。无效的块返回 `400 invalid_payload`。两者都在写入任何行之前拒绝。
 见 [byok.zh.md](byok.zh.md)。
 
+**可选：自带角色。** 请求体可附加 `character`——用实例的 key 封装的角色卡。会话的实例是 BYOC 实例时
+必填，在其他实例上则拒绝（`400 invalid_payload`）。只有请求同时带有与部署的 `BYOC_CALLER_SECRET`
+相符的 `X-Byoc-Caller-Secret` 时，引擎才会采纳；否则返回 `403 byoc_forbidden`。无法在实例的 key
+下打开的卡片返回 `403 byoc_card_rejected`；格式错误或不是合法卡片的返回 `400 invalid_payload`。
+这些都在写入任何行之前拒绝。它可以与 `byok` 叠加：卡片提供角色，`byok` 块提供回复模型。
+见 [byoc.zh.md](byoc.zh.md) 和 [BYOC](#自带角色byoc)。
+
 ### `POST /v2/comp/session/{session_id}/message/async`
 
 只入队的对话轮——上面流式端点的异步替代方案，给无法保持 SSE 连接的调用方用（bot
@@ -541,6 +551,8 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 | 重投一个终态失败的 `client_msg_id` | `200 {"status":"failed",...}`——换个新 `client_msg_id` 重试 |
 | 单会话待处理深度超过 `CHAT_QUEUE_PENDING_CAP` | `429 rate_limited` |
 | 请求体带 `byok` | `400 invalid_payload`——BYOK 仅支持 stream |
+| 请求体带 `character` | `400 invalid_payload`——BYOC 仅支持 stream |
+| 会话属于 BYOC 实例 | `400 byoc_unsupported`——它的轮次会在从不持有卡片的 worker 里运行 |
 | 其余流前失败 | 与 `message/stream` 相同的 `StreamPreError` 形状与错误码 |
 
 队列顺序是严格的单会话 LIFO——会话里最新的待处理消息最先处理——每条入队消息
@@ -607,6 +619,8 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
   留的审计副本与聊天回合相同。
 - `user_timezone`、`user_country`、`user_region` — 与聊天请求体相同的用户所在地（见 stream 端点）。
   只有掷出文字回复时才会读，并记在那一行的 metadata 里。
+- `character` —— 封装好的角色卡，用于实例是 BYOC 实例的会话：那里必填，其他实例上拒绝。
+  需要 `X-Byoc-Caller-Secret`。图片依据卡片的 `appearance` 修改。见 [byoc.zh.md](byoc.zh.md)。
 
 ```json
 {
@@ -646,9 +660,9 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 
 | 状态码 | 含义 |
 |---|---|
-| 400 | `prompt_traits` 格式不对 |
+| 400 | `prompt_traits` 格式不对；BYOC 实例缺 `character`、其他实例带了 `character`，或不是合法的封装卡片（`invalid_payload`） |
 | 401 | bearer 缺失或无效 |
-| 403 | 不是你的 session |
+| 403 | 不是你的 session；`byoc_forbidden`（caller secret 缺失或不对）；`byoc_card_rejected`（卡片无法在实例的 key 下打开） |
 | 404 | session 不存在，或该 session 里没有这条消息 |
 | **409** | 消息存在，但不是图片回合；或该 session 是群 session（`message` 里含 `wrong_channel`） |
 | 422 | `instruction` 空白，或 `aspect_ratio` 不支持 |
@@ -718,6 +732,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 - **错误：** 带 `occasion` 没带 `open_key`、带 `open_key` 没带 `occasion`、`open_key` 格式不对，返回 `400`，
   `code: "invalid_payload"`；未知的 `occasion` 返回 `422`。会话检查与 stream 端点相同（`403`、`404`，语音或群会话 `409`），
   达到单用户并发上限 `429`。生成失败时返回与图片接口相同的上游错误，不写入任何内容，下次打开（用同一个 key）会重试。
+  BYOC 实例的会话返回 `400 byoc_unsupported`：该路由需要一个请求里并不携带的角色。
 
 ### `POST /v2/comp/session/{session_id}/events`
 
@@ -854,7 +869,8 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
   一段离线类事件结束之后（在被它 ghost 过消息的会话里），或一场虚惊结束之后（在讲出它的那个会话里），`[近期事件]` 行多出一项，回复多出一行 `- 刚才：…`，直到她在那里写过一次为止（一条带文字的消息；
   见 [model-config.zh.md](model-config.zh.md#taskspde_decision--opt-in-llm-pde-判断器)）。
 - **错误：** `event_key` 格式不对返回 `400`，`code: "invalid_payload"`；未知的 `kind` 返回 `422`。会话检查与 `/open` 相同
-  （`403`、`404`，语音或群会话 `409`），达到单用户并发上限 `429`。生成失败时返回与图片接口相同的上游错误，不写入任何内容。
+  （`403`、`404`，语音或群会话 `409`），达到单用户并发上限 `429`。BYOC 实例的会话返回 `400 byoc_unsupported`。
+  生成失败时返回与图片接口相同的上游错误，不写入任何内容。
   回复为空时不写入任何内容，返回空值。
 
 ### `GET /v2/comp/session/{session_id}/effects`
@@ -1012,6 +1028,7 @@ session 返回 404 的行为，与上面的 history 路由完全一致。
 | 状态 | 代码 | 何时 |
 |---|---|---|
 | 400 | `invalid_payload` | 发送：`client_msg_id`、`tier`、`prompt_traits` 或 `audit` 格式不对；带了 `byok` 块；`image.force = true` |
+| 400 | `byoc_unsupported` | 创建 / 加人：成员 session 属于 BYOC 实例 |
 | 404 | `group_not_found` | 群不存在、已解散或不属于调用者 |
 | 404 | `session_not_found` | 创建 / 加人：成员 session 不存在或不属于调用者 |
 | 404 | `member_not_found` | 踢人：该 session 不是群成员 |
@@ -1053,7 +1070,7 @@ session 返回 404 的行为，与上面的 history 路由完全一致。
 session 必须是**语音频道** session（否则 `409 wrong_channel`）——通过
 `POST /comp/chat/start` 带 `"channel": "voice"` 拿到。语音是每个部署自行选择
 开启的：model config 里没有 `[tasks.chat_voice]` 块时，该端点返回
-`501 voice_disabled`。
+`501 voice_disabled`。实例是 BYOC 实例的 session 返回 `400 byoc_unsupported`。
 
 prompt 精简但不再失忆：人格 + 语音指令 + 首轮生成、此后每轮原样重发的
 **引导快照（bootstrap snapshot）** + 一行由该 session 好感度推导出的关系描述
@@ -1208,6 +1225,61 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
   http://localhost:8080/comp/voice/{session_id}/turn/interrupt
 ```
 
+## 自带角色（BYOC）
+
+BYOC 实例是一个角色引擎从不存储的角色实例。两个路由负责创建；之后 stream、compose 和图片编辑路由在 `character` 字段里接受封装好的角色卡（见上面 stream 端点的「自带角色」段落）。两个路由都需要 bearer token 和 `X-Byoc-Caller-Secret`，后者必须与部署的 `BYOC_CALLER_SECRET` 相符。它们的拒绝响应使用流前错误的响应体 `{code, message, user_message}`。流程、封装格式和记录的内容见 [byoc.zh.md](byoc.zh.md)；卡片格式见 [eros-character-v1.md](eros-character-v1.md)。
+
+### `POST /v2/comp/byoc/init`
+
+空请求体。为新实例生成 key，不写入任何内容。
+
+```bash
+curl -X POST -H "Authorization: Bearer $JWT" \
+  -H "X-Byoc-Caller-Secret: $BYOC_CALLER_SECRET" \
+  http://localhost:8080/v2/comp/byoc/init
+```
+
+```json
+{ "key": "<base64url, 32 bytes>", "ticket": "<base64url, 32 bytes>" }
+```
+
+`key` 能打开为该实例发送的每一张卡片，引擎不会再次展示它，所以请在调用 create 之前存好。`ticket` 向 create 证明引擎确实把 `key` 签发给了这个用户。
+
+| 状态 | 含义 |
+|---|---|
+| 200 | `{key, ticket}` |
+| 401 | bearer 缺失或无效 |
+| 403 | `byoc_forbidden`：BYOC 关闭，或 caller secret 缺失或不对 |
+
+### `POST /v2/comp/byoc/create`
+
+请求体 `{"key": "…", "ticket": "…"}`，都来自 init（base64url，padding 可有可无）。创建实例并返回它的 id。
+
+```json
+{ "instance_id": "8a1f0c2e-4b6d-4f8a-9c31-2d5e7f0a1b3c" }
+```
+
+create 对每个 key 幂等：用同一组 `key` 和 `ticket` 重复调用返回同一个 `instance_id`，重新 create 一个已归档的实例会把它重新激活。之后用 `POST /comp/chat/start` 加 `instance_id` 开会话。
+
+| 状态 | 含义 |
+|---|---|
+| 200 | `{instance_id}` |
+| 400 | `invalid_payload`：`key` 或 `ticket` 不是 32 字节的 base64url |
+| 401 | bearer 缺失或无效 |
+| 403 | `byoc_forbidden`：BYOC 关闭，caller secret 缺失或不对，或引擎没有把这个 `key` 签发给这个用户 |
+| 422 | 请求体不是 `{key, ticket}` |
+
+### BYOC 错误码
+
+| 状态 | 代码 | 何时 |
+|---|---|---|
+| 403 | `byoc_forbidden` | 上面两个路由，或任何带有 `character` 的卡片路由请求：BYOC 关闭，或 caller secret 缺失或不对 |
+| 403 | `byoc_card_rejected` | `character` 无法在实例的 key 下打开 |
+| 400 | `invalid_payload` | 卡片路由：BYOC 实例缺 `character`、其他实例带了 `character`、格式错误、超出大小限制，或不是合法卡片，message 里说明哪条规则未通过；async 路由：任何 `character` |
+| 400 | `byoc_unsupported` | 该路由无法服务 BYOC 实例：async 发送、`/open`、语音轮次、生活事件、群聊 |
+
+BYOC 实例上的 stream 轮次如果被一次部署打断，会落为 `failed`，`chat_turn_queue.last_error = 'byoc_unavailable'`，并照常写入 `system_error` 行；卡片随进程一起消失了，部署也没有可以兜底的角色。
+
 ## Persona
 
 ### `POST /persona/{instance_id}/image/compose`
@@ -1232,6 +1304,7 @@ Body 字段：
 | `aspect_ratio` | `String` | 否 | 与聊天路径相同的允许集；其他值 `422`。 |
 | `prompt_variant` | `String` | 否 | 与聊天路径相同的变体选择规则，包括「未命中的 key 回退到内置提示词」。 |
 | `stream` | `bool` | 否 | 默认 `true`。 |
+| `character` | `String` | 仅 BYOC | 封装好的角色卡。实例是 BYOC 实例时必填，其他实例上拒绝（`400 invalid_payload`）。需要 `X-Byoc-Caller-Secret`。合成器读取卡片的 `appearance`。见 [byoc.zh.md](byoc.zh.md)。 |
 
 合成器载荷与聊天路径的七个槽位完全一致，同一份 `filter_prompt` 契约同时服务两个
 调用方（见 [model-config.zh.md](model-config.zh.md)）。
@@ -1285,6 +1358,8 @@ data: {"type":"done","composed_prompt":"…","subject":"…","caption":"…","mo
 | 未配置 `[tasks.chat_image_prompt_compose]` | `501 compose_disabled` |
 | 实例不属于 JWT 用户 | `403` |
 | 实例不存在 | `404` |
+| BYOC 实例缺 `character`、其他实例带了 `character`，或不是合法的封装卡片 | `400 invalid_payload` |
+| 带了 `character` 但没有 caller secret，或卡片无法在实例的 key 下打开 | `403 byoc_forbidden` / `403 byoc_card_rejected` |
 | `content` 空白、`scene` 超长、`aspect_ratio` 非法 | `422` |
 | 超出每用户并发上限（与聊天/语音共享，≤3） | `429` |
 | 合成器链条全部失败 | **provider 自己的状态码，原样透传**（见下）——开流之后则为带内 `error` 帧。**这里没有肖像回退**：回退的存在是为了让聊天轮次继续走下去，而这个端点没有轮次要保护。 |
@@ -1445,7 +1520,7 @@ chat、voice 或 PDE prompt。实验特性（v1.6.0）——详见
 ]}
 ```
 
-genome 预设（`art_metadata.possessions` / `art_metadata.wardrobe`）排最前，`source: "preset"`，没有 `id`；之后是 instance 的每一行，按时间倒序，不去重也不封顶。`source: "gift"` 表示被接受的 gift action，`user_message_id` 指向那一轮，消息被删后为 `null`。prompt 里每张清单去重，instance 部分最多 20 个名字。
+genome 预设（`art_metadata.possessions` / `art_metadata.wardrobe`）排最前，`source: "preset"`，没有 `id`；之后是 instance 的每一行，按时间倒序，不去重也不封顶。BYOC 实例在这里没有预设：预设在它的卡片里，调用方本来就持有，所以列表只有实例自己的行。`source: "gift"` 表示被接受的 gift action，`user_message_id` 指向那一轮，消息被删后为 `null`。prompt 里每张清单去重，instance 部分最多 20 个名字。
 
 ### `POST /v2/comp/instance/{instance_id}/items`
 
@@ -1576,6 +1651,8 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
   ]
 }
 ```
+
+`persona_name` 始终存在，BYOC 实例上为 `null`，因为名字只在它的卡片里。
 
 這裡 **不會** 打包 affinity——前端單獨讀取（见下面两条 affinity 路由），
 所以不需要关系数据的冷启动不必为它付代价。
@@ -1750,6 +1827,7 @@ session 403）。
     {
       "session_id": "…",
       "genome_id": "…",
+      "instance_id": "…",
       "affinity": { "…": "与上面单 session 的形状完全一致" }
     }
   ],
@@ -1760,7 +1838,8 @@ session 403）。
 - **每一行都做与单 session 路由相同的读时刷新。** 少做这一步的行，不会比它要
   取代的存储列更准。
 - `genome_id` 是这段关系对应的伴侣 —— 按伴侣建索引的列表可以直接 join，不用为
-  解析 session 再打一次请求。
+  解析 session 再打一次请求。它始终存在，BYOC 关系没有 genome，所以为 `null`。
+- `instance_id` 是这段关系对应的角色实例，始终有值。两种关系都用它来建键。
 - 排序是 `updated_at DESC, session_id DESC`，所以第一页就是列表实际会显示的那
   几行。游标是这两列上的 keyset；`session_id` 用来打破时间戳并列，正是它保证了
   分页边界落在并列行上时既不漏行也不重复。
@@ -1838,7 +1917,7 @@ curl -H "x-insights-export-secret: $INSIGHTS_EXPORT_SECRET" \
 `user_message` 形状，没有 `"error"` 字段。`POST
 /comp/voice/{session_id}/turn/interrupt` 本身不是流式接口（成功时返回的是
 普通 JSON），但复用了语音轮次的前置检查和错误类型，错误响应用的也是这同一套
-形状。群路由（`/v2/comp/group*`）的拒绝响应同样用带代码的形状。下表覆盖的是普通形状：
+形状。群路由（`/v2/comp/group*`）的拒绝响应同样用带代码的形状，每一个 BYOC 拒绝（`byoc_forbidden`、`byoc_card_rejected`、`byoc_unsupported`，以及卡片相关的 `invalid_payload`）也是，无论来自哪条路由。下表覆盖的是普通形状：
 
 | 狀態碼 | code | 何時 |
 |--------|------|------|
@@ -1864,6 +1943,7 @@ curl -H "x-insights-export-secret: $INSIGHTS_EXPORT_SECRET" \
 - `crates/eros-engine-server/src/pipeline/chat_queue.rs`——异步对话轮队列 worker
 - `crates/eros-engine-server/src/routes/voice.rs`——语音频道轮（`voice/{session_id}/turn/stream`）
 - `crates/eros-engine-server/src/routes/persona.rs`——独立图片提示词合成（`/persona/{instance_id}/image/compose`）
+- `crates/eros-engine-server/src/routes/byoc.rs`——BYOC 密钥生命周期（`v2/comp/byoc/init`、`v2/comp/byoc/create`）；`crates/eros-engine-server/src/byoc.rs` 负责准入、ticket 和卡片打开
 - `crates/eros-engine-server/src/routes/world_town.rs`——World Town 信息流与评论（`/world/town/*`）
 - `crates/eros-engine-server/src/routes/bff/companion.rs`——BFF `/bff/v1/comp/chat/*`
 - `crates/eros-engine-server/src/routes/bff/affinity.rs`——BFF `/bff/v1/comp/affinity/*`

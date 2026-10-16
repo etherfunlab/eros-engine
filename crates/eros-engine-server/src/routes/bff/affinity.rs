@@ -250,7 +250,12 @@ pub struct BffAffinityListItem {
     pub session_id: Uuid,
     /// Companion this relationship is with. A client list keyed by companion
     /// joins on this without a second round trip to resolve the session.
-    pub genome_id: Uuid,
+    /// Null for a BYOC relationship; key such an item on `instance_id`.
+    #[schema(required = true)]
+    pub genome_id: Option<Uuid>,
+    /// The persona instance this relationship is with. Always set, so a client
+    /// can key a relationship of either kind without a second round trip.
+    pub instance_id: Uuid,
     /// Never null here: the list is driven by the affinity rows themselves, so
     /// a session that has not had its first turn is absent rather than present
     /// with an empty value. Treat "missing from the response" as "no
@@ -365,11 +370,13 @@ async fn bff_list_affinities(
         .map(|r| {
             let mut a = r.affinity;
             let session_id = a.session_id;
+            let instance_id = a.instance_id;
             a.apply_time_decay();
             a.refresh_endpoints(&state.config.affinity_tuning);
             BffAffinityListItem {
                 session_id,
                 genome_id: r.genome_id,
+                instance_id,
                 affinity: AffinitySnapshot::from(a),
             }
         })
@@ -401,7 +408,8 @@ mod tests {
 
     use crate::routes::companion::test_state;
     use crate::routes::companion::testutil::{
-        build_router, mint_test_jwt, seed_genome, seed_instance, seed_session, send_request,
+        build_router, mint_test_jwt, seed_byoc_instance_with_key, seed_genome, seed_instance,
+        seed_session, send_request,
     };
 
     async fn seed_affinity(
@@ -1067,6 +1075,40 @@ mod tests {
         assert_eq!(items[0]["affinity"]["bond_tier"], 1);
         assert_eq!(items[0]["affinity"]["bond_label"], "acquaintance");
         assert!(body["next_cursor"].is_null(), "single page → no cursor");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn affinity_list_carries_byoc_relationships(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let genome_instance = seed_instance(&pool, genome_id, user_id).await;
+        let genome_session = seed_session(&pool, user_id, genome_instance).await;
+        seed_affinity(&pool, genome_session, user_id, genome_instance).await;
+        let (byoc, _) = seed_byoc_instance_with_key(&pool, user_id).await;
+        let byoc_session = seed_session(&pool, user_id, byoc).await;
+        seed_affinity(&pool, byoc_session, user_id, byoc).await;
+        // Order the two rows: the BYOC relationship is the newer one.
+        sqlx::query(
+            "UPDATE engine.companion_affinity \
+             SET updated_at = now() - interval '10 minutes' WHERE session_id = $1",
+        )
+        .bind(genome_session)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut app = build_router(test_state(pool));
+        let token = mint_test_jwt(user_id);
+        let (status, body) = send_request(&mut app, list_req(&token, user_id, "")).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        let items = body["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2, "body={body}");
+        assert_eq!(items[0]["session_id"], byoc_session.to_string());
+        assert!(items[0]["genome_id"].is_null(), "body={body}");
+        assert_eq!(items[0]["instance_id"], byoc.to_string());
+        assert_eq!(items[1]["session_id"], genome_session.to_string());
+        assert_eq!(items[1]["genome_id"], genome_id.to_string());
+        assert_eq!(items[1]["instance_id"], genome_instance.to_string());
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

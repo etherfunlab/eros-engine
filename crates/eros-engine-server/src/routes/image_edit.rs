@@ -31,6 +31,7 @@
 //!   companion model and gates the traits.
 
 use axum::extract::{Extension, Path, State};
+use axum::http::HeaderMap;
 use axum::Json;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -46,7 +47,6 @@ use eros_engine_llm::model_config::StyleKey;
 use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::{AssistantInsert, ChatRepo};
 use eros_engine_store::image_events::ImageComposeEventInsert;
-use eros_engine_store::persona::PersonaRepo;
 
 use crate::auth::middleware::AuthUser;
 use crate::error::AppError;
@@ -137,6 +137,11 @@ pub struct ImageEditRequest {
     /// chat body.
     #[serde(default)]
     pub user_region: Option<String>,
+    /// Sealed eros-character v1 card (docs/byoc.md). Required on a BYOC
+    /// instance; refused on any other. Accepted on this route, with the
+    /// deployment's `X-Byoc-Caller-Secret` header.
+    #[serde(default)]
+    pub character: Option<String>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -541,7 +546,7 @@ mod payload_tests {
         let persona = CompanionPersona {
             instance_id: iid,
             genome: PersonaGenome {
-                id: gid,
+                id: Some(gid),
                 name: "Mia".into(),
                 system_prompt: "You are Mia.".into(),
                 tip_personality: Some("normal".into()),
@@ -549,7 +554,7 @@ mod payload_tests {
             },
             instance: PersonaInstance {
                 id: iid,
-                genome_id: gid,
+                genome_id: Some(gid),
                 owner_uid: uuid::Uuid::new_v4(),
                 status: "active".into(),
             },
@@ -602,13 +607,16 @@ mod payload_tests {
     tag = "companion",
     params(
         ("session_id" = Uuid, Path, description = "Chat session id"),
-        ("message_id" = Uuid, Path, description = "The image turn to revise")
+        ("message_id" = Uuid, Path, description = "The image turn to revise"),
+        ("X-Byoc-Caller-Secret" = Option<String>, Header,
+            description = "The deployment's BYOC_CALLER_SECRET; required when the body carries `character`")
     ),
     request_body = ImageEditRequest,
     responses(
         (status = 200, body = ImageEditResponse),
+        (status = 400, description = "`character` missing on a BYOC instance, present on any other, or not a valid sealed card"),
         (status = 401, description = "missing or invalid bearer"),
-        (status = 403, description = "not your session"),
+        (status = 403, description = "not your session; or `byoc_forbidden` (the caller secret is missing or wrong) / `byoc_card_rejected` (the card does not open under the instance's key)"),
         (status = 404, description = "session or message not found"),
         (status = 409, description = "the message is not an image turn"),
         (status = 422, description = "blank instruction or unsupported aspect_ratio"),
@@ -623,8 +631,14 @@ async fn edit_image(
     State(state): State<AppState>,
     Path((session_id, message_id)): Path<(Uuid, Uuid)>,
     Extension(AuthUser(user_id)): Extension<AuthUser>,
+    headers: HeaderMap,
     Json(req): Json<ImageEditRequest>,
 ) -> Result<Json<ImageEditResponse>, AppError> {
+    // A card is accepted only from the deployment's own server, checked
+    // before anything else (spec 2026-10-16-byoc §4).
+    if req.character.is_some() {
+        crate::byoc::admit(&state.config.byoc, &headers)?;
+    }
     // Ownership and state first, body second: a caller must not learn that
     // their aspect_ratio was invalid on a session they do not own.
     let session = require_session_for_user(&state, session_id, user_id).await?;
@@ -674,17 +688,20 @@ async fn edit_image(
         ));
     }
 
+    // The persona: the genome's, or a BYOC instance's opened from the
+    // request's card. It stays in memory for the rest of the request. A
+    // refused card answers before a slot is taken, as on the stream route.
+    let persona = crate::byoc::load_instance(&state, instance_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("no such instance".into()))?
+        .into_persona(req.character.as_deref())?;
+
     // Same per-user in-flight pool as chat, voice and the compose endpoint:
     // this is one more user-triggered LLM call.
     let _guard = state
         .stream_slots
         .try_acquire(user_id, CONCURRENT_STREAMS_PER_USER)
         .ok_or_else(|| AppError::TooManyRequests("per-user in-flight cap reached".into()))?;
-
-    let persona = PersonaRepo { pool: &state.pool }
-        .load_companion(instance_id)
-        .await?
-        .ok_or_else(|| AppError::NotFound("no such instance".into()))?;
 
     let source_subject = marker
         .get("prompt")
@@ -946,6 +963,7 @@ async fn edit_image(
         let caption_bg = outcome.caption.clone();
         let tier_bg = req.tier.clone();
         let umid_bg = instruction_message_id.expect("full turn persisted the instruction");
+        let persona_name_bg = persona.genome.name.clone();
         tokio::spawn(async move {
             // A full turn counts as contact: reset the ghost streak the way
             // the chat stream does before spawning post_process.
@@ -966,6 +984,7 @@ async fn edit_image(
                 session_id,
                 user_id,
                 instance_id,
+                persona_name_bg,
                 // post_process never reads the quote; skip rebuilding it.
                 edit_turn_event(instruction_bg, umid_bg, None, tier_bg, prompt_traits),
                 plan,
@@ -986,12 +1005,14 @@ async fn edit_image(
         );
         let task_state = state.clone();
         let instruction = instruction.clone();
+        let persona_name = persona.genome.name.clone();
         tokio::spawn(async move {
             crate::pipeline::post_process::run_affinity_turn(
                 &task_state,
                 session_id,
                 user_id,
                 instance_id,
+                &persona_name,
                 ActionType::ReplyImage,
                 &instruction,
                 &eval_text,
@@ -2600,5 +2621,245 @@ pattern = '\s*\[note:[^\]]*\]'
         )
         .await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    mod byoc {
+        use super::*;
+        use crate::routes::companion::testutil::{
+            enable_byoc, seed_byoc_instance_with_key, BYOC_SECRET,
+        };
+
+        const LOOKS_MARKER: &str = "BYOC-LOOKS-MARKER";
+
+        fn byoc_state(pool: PgPool, mock_uri: &str) -> AppState {
+            let mut state = with_composer(test_state(pool), mock_uri, EDIT_TASK_TOML);
+            enable_byoc(&mut state);
+            state
+        }
+
+        fn card_with_looks(key: &[u8; 32]) -> String {
+            crate::routes::companion::testutil::sealed_card(
+                key,
+                "Aria",
+                "You are Aria.",
+                json!({"appearance": LOOKS_MARKER}),
+            )
+        }
+
+        /// A BYOC instance with a session and a source image turn; returns
+        /// (user, session, image message, key).
+        async fn byoc_image_session(pool: &PgPool) -> (Uuid, Uuid, Uuid, [u8; 32]) {
+            let user_id = Uuid::new_v4();
+            let (instance_id, key) = seed_byoc_instance_with_key(pool, user_id).await;
+            let session_id = seed_session(pool, user_id, instance_id).await;
+            let (_, mid) = seed_image_turn(pool, session_id).await;
+            (user_id, session_id, mid, key)
+        }
+
+        fn edit_req_with_secret(
+            session_id: Uuid,
+            message_id: Uuid,
+            jwt: &str,
+            body: serde_json::Value,
+            secret: Option<&str>,
+        ) -> Request<Body> {
+            let mut req = Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v2/comp/session/{session_id}/message/{message_id}/image/edit"
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(secret) = secret {
+                req = req.header("x-byoc-caller-secret", secret);
+            }
+            req.body(Body::from(body.to_string())).unwrap()
+        }
+
+        /// Messages and image events of `session_id`.
+        async fn footprint(pool: &PgPool, session_id: Uuid) -> (i64, i64) {
+            sqlx::query_as(
+                "SELECT (SELECT count(*) FROM engine.chat_messages WHERE session_id = $1), \
+                        (SELECT count(*) FROM engine.chat_images_events WHERE session_id = $1)",
+            )
+            .bind(session_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        }
+
+        #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+        async fn image_edit_uses_the_cards_appearance(pool: PgPool) {
+            let (user_id, session_id, mid, key) = byoc_image_session(&pool).await;
+            let mock = MockServer::start().await;
+            mount_editor(&mock).await;
+            let mut app = build_router(byoc_state(pool.clone(), &mock.uri()));
+
+            let (status, body) = send_request(
+                &mut app,
+                edit_req_with_secret(
+                    session_id,
+                    mid,
+                    &mint_test_jwt(user_id),
+                    json!({"instruction": "换套衣服", "character": card_with_looks(&key)}),
+                    Some(BYOC_SECRET),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "body={body}");
+
+            let reqs = mock.received_requests().await.expect("recorded requests");
+            assert_eq!(reqs.len(), 1);
+            let sent: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+            let payload = sent["messages"][1]["content"].as_str().unwrap();
+            assert!(
+                payload.contains(&format!("[人物外观]\n{LOOKS_MARKER}")),
+                "{payload}"
+            );
+
+            let composed: String = sqlx::query_scalar(
+                "SELECT composed_prompt FROM engine.chat_images_events \
+                 WHERE session_id = $1 ORDER BY created_at DESC LIMIT 1",
+            )
+            .bind(session_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert!(composed.contains(LOOKS_MARKER), "{composed}");
+
+            // The audit row keeps the card's appearance in its inputs snapshot.
+            let appearance: Option<String> = sqlx::query_scalar(
+                "SELECT inputs->>'appearance' FROM engine.chat_images_events \
+                 WHERE session_id = $1 ORDER BY created_at DESC LIMIT 1",
+            )
+            .bind(session_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert!(
+                appearance
+                    .as_deref()
+                    .is_some_and(|a| a.contains(LOOKS_MARKER)),
+                "{appearance:?}"
+            );
+
+            // The new picture's prompt is recoverable without the card or the
+            // caller secret, and it still carries the appearance.
+            let new_id = body["message_id"].as_str().unwrap();
+            let (status, rec) = send_request(
+                &mut app,
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/comp/chat/{session_id}/messages/{new_id}/image-request"
+                    ))
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", mint_test_jwt(user_id)),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "body={rec}");
+            use base64::Engine as _;
+            let recovered = base64::engine::general_purpose::STANDARD
+                .decode(rec["composed_prompt"].as_str().unwrap())
+                .unwrap();
+            let recovered = String::from_utf8(recovered).unwrap();
+            assert!(recovered.contains(LOOKS_MARKER), "{recovered}");
+        }
+
+        #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+        async fn image_edit_needs_a_card_on_a_byoc_session(pool: PgPool) {
+            let (user_id, session_id, mid, _) = byoc_image_session(&pool).await;
+            let before = footprint(&pool, session_id).await;
+            let mock = MockServer::start().await;
+            mount_editor(&mock).await;
+            let mut app = build_router(byoc_state(pool.clone(), &mock.uri()));
+
+            let (status, body) = send_request(
+                &mut app,
+                edit_req_with_secret(
+                    session_id,
+                    mid,
+                    &mint_test_jwt(user_id),
+                    json!({"instruction": "换套衣服", "persist_instruction": true}),
+                    Some(BYOC_SECRET),
+                ),
+            )
+            .await;
+            assert_eq!(
+                (status.as_u16(), body["code"].as_str()),
+                (400, Some("invalid_payload")),
+                "{body}"
+            );
+            assert_eq!(footprint(&pool, session_id).await, before);
+            assert!(mock.received_requests().await.unwrap().is_empty());
+        }
+
+        #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+        async fn image_edit_refuses_a_card_on_a_genome_session(pool: PgPool) {
+            let user_id = Uuid::new_v4();
+            let genome_id = seed_genome(&pool, "Aria").await;
+            let instance_id = seed_instance(&pool, genome_id, user_id).await;
+            let session_id = seed_session(&pool, user_id, instance_id).await;
+            let (_, mid) = seed_image_turn(&pool, session_id).await;
+            let (_, key) = seed_byoc_instance_with_key(&pool, user_id).await;
+            let before = footprint(&pool, session_id).await;
+            let mock = MockServer::start().await;
+            mount_editor(&mock).await;
+            let mut app = build_router(byoc_state(pool.clone(), &mock.uri()));
+
+            let (status, body) = send_request(
+                &mut app,
+                edit_req_with_secret(
+                    session_id,
+                    mid,
+                    &mint_test_jwt(user_id),
+                    json!({"instruction": "换套衣服", "character": card_with_looks(&key)}),
+                    Some(BYOC_SECRET),
+                ),
+            )
+            .await;
+            assert_eq!(
+                (status.as_u16(), body["code"].as_str()),
+                (400, Some("invalid_payload")),
+                "{body}"
+            );
+            assert_eq!(footprint(&pool, session_id).await, before);
+            assert!(mock.received_requests().await.unwrap().is_empty());
+        }
+
+        #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+        async fn image_edit_with_a_card_needs_the_secret(pool: PgPool) {
+            let (user_id, session_id, mid, key) = byoc_image_session(&pool).await;
+            let before = footprint(&pool, session_id).await;
+            let mock = MockServer::start().await;
+            mount_editor(&mock).await;
+            let mut app = build_router(byoc_state(pool.clone(), &mock.uri()));
+            let jwt = mint_test_jwt(user_id);
+
+            for secret in [None, Some("not-the-deployment-secret-0123456789abc")] {
+                let (status, body) = send_request(
+                    &mut app,
+                    edit_req_with_secret(
+                        session_id,
+                        mid,
+                        &jwt,
+                        json!({"instruction": "换套衣服", "character": card_with_looks(&key)}),
+                        secret,
+                    ),
+                )
+                .await;
+                assert_eq!(
+                    (status.as_u16(), body["code"].as_str()),
+                    (403, Some("byoc_forbidden")),
+                    "{body}"
+                );
+            }
+            assert_eq!(footprint(&pool, session_id).await, before);
+            assert!(mock.received_requests().await.unwrap().is_empty());
+        }
     }
 }

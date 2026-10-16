@@ -1934,7 +1934,7 @@ mod tests {
         CompanionPersona {
             instance_id: uid,
             genome: PersonaGenome {
-                id: uid,
+                id: Some(uid),
                 name: "Aria".into(),
                 system_prompt: "p".into(),
                 tip_personality: Some("normal".into()),
@@ -1949,7 +1949,7 @@ mod tests {
             },
             instance: PersonaInstance {
                 id: uid,
-                genome_id: uid,
+                genome_id: Some(uid),
                 owner_uid: uid,
                 status: "active".into(),
             },

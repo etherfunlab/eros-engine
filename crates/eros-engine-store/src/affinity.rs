@@ -85,15 +85,16 @@ pub fn to_domain(row: AffinityRow) -> Affinity {
 struct UserAffinityRow {
     #[sqlx(flatten)]
     affinity: AffinityRow,
-    genome_id: Uuid,
+    genome_id: Option<Uuid>,
 }
 
-/// One entry of a user's affinity list: the relationship plus the companion it
-/// is with. The genome, not the instance, is what a client list is keyed on.
+/// One entry of a user's affinity list: the relationship plus the genome it is
+/// with. `genome_id` is `None` for a BYOC relationship, which a client keys on
+/// `affinity.instance_id`.
 #[derive(Debug, Clone)]
 pub struct UserAffinity {
     pub affinity: Affinity,
-    pub genome_id: Uuid,
+    pub genome_id: Option<Uuid>,
 }
 
 /// Point-in-time snapshot written to `companion_affinity_events.state_before` /

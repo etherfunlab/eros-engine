@@ -505,6 +505,18 @@
                 "null"
               ]
             }
+          },
+          {
+            "name": "X-Byoc-Caller-Secret",
+            "in": "header",
+            "description": "The deployment's BYOC_CALLER_SECRET; required when the body carries `character`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "requestBody": {
@@ -1139,6 +1151,18 @@
               "type": "string",
               "format": "uuid"
             }
+          },
+          {
+            "name": "X-Byoc-Caller-Secret",
+            "in": "header",
+            "description": "The deployment's BYOC_CALLER_SECRET; required when the body carries `character`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "requestBody": {
@@ -1158,6 +1182,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ComposeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
                 }
               }
             }
@@ -1344,6 +1378,137 @@
         ]
       }
     },
+    "/v2/comp/byoc/create": {
+      "post": {
+        "tags": [
+          "byoc"
+        ],
+        "summary": "Create the BYOC instance for a key from init.",
+        "description": "Idempotent per key: a repeat returns the same `instance_id`, and\nre-creating an archived instance reactivates it. Needs the deployment's\ncaller secret.",
+        "operationId": "byoc_create",
+        "parameters": [
+          {
+            "name": "X-Byoc-Caller-Secret",
+            "in": "header",
+            "description": "The deployment's BYOC_CALLER_SECRET; required",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ByocCreateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ByocCreateResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "malformed body"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v2/comp/byoc/init": {
+      "post": {
+        "tags": [
+          "byoc"
+        ],
+        "summary": "Draw a key for a new BYOC instance.",
+        "description": "Writes nothing: an instance exists only once `create` is called with the\nreturned key and ticket, after the downstream has stored the key. Needs\nthe deployment's caller secret.",
+        "operationId": "byoc_init",
+        "parameters": [
+          {
+            "name": "X-Byoc-Caller-Secret",
+            "in": "header",
+            "description": "The deployment's BYOC_CALLER_SECRET; required",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ByocInitResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v2/comp/group": {
       "post": {
         "tags": [
@@ -1367,6 +1532,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/GroupDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`byoc_unsupported`: a member session belongs to a BYOC instance",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
                 }
               }
             }
@@ -1590,6 +1765,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/GroupDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`byoc_unsupported`: the member session belongs to a BYOC instance",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
                 }
               }
             }
@@ -2381,6 +2566,18 @@
               "type": "string",
               "format": "uuid"
             }
+          },
+          {
+            "name": "X-Byoc-Caller-Secret",
+            "in": "header",
+            "description": "The deployment's BYOC_CALLER_SECRET; required when the body carries `character`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "requestBody": {
@@ -2404,11 +2601,14 @@
               }
             }
           },
+          "400": {
+            "description": "`character` missing on a BYOC instance, present on any other, or not a valid sealed card"
+          },
           "401": {
             "description": "missing or invalid bearer"
           },
           "403": {
-            "description": "not your session"
+            "description": "not your session; or `byoc_forbidden` (the caller secret is missing or wrong) / `byoc_card_rejected` (the card does not open under the instance's key)"
           },
           "404": {
             "description": "session or message not found"
@@ -3098,6 +3298,7 @@
         "required": [
           "session_id",
           "genome_id",
+          "instance_id",
           "affinity"
         ],
         "properties": {
@@ -3106,9 +3307,17 @@
             "description": "Never null here: the list is driven by the affinity rows themselves, so\na session that has not had its first turn is absent rather than present\nwith an empty value. Treat \"missing from the response\" as \"no\nrelationship yet\" — the same state the single-session endpoint reports\nas `affinity: null`."
           },
           "genome_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "Companion this relationship is with. A client list keyed by companion\njoins on this without a second round trip to resolve the session.\nNull for a BYOC relationship; key such an item on `instance_id`."
+          },
+          "instance_id": {
             "type": "string",
             "format": "uuid",
-            "description": "Companion this relationship is with. A client list keyed by companion\njoins on this without a second round trip to resolve the session."
+            "description": "The persona instance this relationship is with. Always set, so a client\ncan key a relationship of either kind without a second round trip."
           },
           "session_id": {
             "type": "string",
@@ -3361,7 +3570,11 @@
             "type": "boolean"
           },
           "persona_name": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Null for a BYOC instance, whose name only its card holds."
           },
           "session_id": {
             "type": "string",
@@ -3384,6 +3597,53 @@
           "chemistry": {
             "type": "number",
             "format": "double"
+          }
+        }
+      },
+      "ByocCreateRequest": {
+        "type": "object",
+        "required": [
+          "key",
+          "ticket"
+        ],
+        "properties": {
+          "key": {
+            "type": "string",
+            "description": "The `key` from init (base64url, padding optional)."
+          },
+          "ticket": {
+            "type": "string",
+            "description": "The `ticket` from init (base64url, padding optional)."
+          }
+        },
+        "additionalProperties": false
+      },
+      "ByocCreateResponse": {
+        "type": "object",
+        "required": [
+          "instance_id"
+        ],
+        "properties": {
+          "instance_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "ByocInitResponse": {
+        "type": "object",
+        "required": [
+          "key",
+          "ticket"
+        ],
+        "properties": {
+          "key": {
+            "type": "string",
+            "description": "32 random bytes, base64url. Keep it: it opens every card sent for\nthe instance, and the engine never shows it again."
+          },
+          "ticket": {
+            "type": "string",
+            "description": "32 bytes, base64url. Proves to `create` that the engine issued `key`\nto this user."
           }
         }
       },
@@ -3837,6 +4097,13 @@
               "null"
             ],
             "description": "Same allow-list as the chat path."
+          },
+          "character": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Sealed eros-character v1 card (docs/byoc.md). Required on a BYOC\ninstance; refused on any other. Accepted on this route, with the\ndeployment's `X-Byoc-Caller-Secret` header."
           },
           "content": {
             "type": "string",
@@ -4617,6 +4884,13 @@
             ],
             "description": "Same allow-list as the chat path. Defaults to the source turn's\n`aspect_ratio`."
           },
+          "character": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Sealed eros-character v1 card (docs/byoc.md). Required on a BYOC\ninstance; refused on any other. Accepted on this route, with the\ndeployment's `X-Byoc-Caller-Secret` header."
+          },
           "evaluate_affinity": {
             "type": "boolean",
             "description": "Run this edit through the per-turn affinity judge: the instruction is\nwhat the user said, the new picture's caption is what the character\nanswered. Detached — the response never waits on the judge. Orthogonal\nto `persist_instruction`; when an instruction row was persisted it\nanchors the affinity event. Default false: an edit does not move\naffinity unless the consumer says so. Overridden by `reply_with_text`\n(present + `persist_instruction`): the full pipeline it starts already\nincludes the affinity judge."
@@ -5361,7 +5635,7 @@
             "items": {
               "$ref": "#/components/schemas/PersonaItemView"
             },
-            "description": "Presets first, then the instance's rows, newest first. Neither\ndeduplicated nor capped."
+            "description": "Presets first, then the instance's rows, newest first. Neither\ndeduplicated nor capped. A BYOC instance has no presets here: they\nlive in its card."
           }
         }
       },
@@ -5705,7 +5979,11 @@
             "type": "boolean"
           },
           "persona_name": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Null for a BYOC instance, whose name only its card holds."
           },
           "session_id": {
             "type": "string",
@@ -5787,6 +6065,13 @@
                 "description": "Bring-your-own-key configuration for this turn's reply (spec\n2026-10-08-byok-chat). Honoured only with the deployment's\n`X-Byok-Caller-Secret` header; refused on the async route."
               }
             ]
+          },
+          "character": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Sealed eros-character v1 card (docs/byoc.md). Required on a BYOC\ninstance and refused on any other; honoured only with the deployment's\n`X-Byoc-Caller-Secret` header. The async route refuses it."
           },
           "client_msg_id": {
             "type": "string"
@@ -6182,6 +6467,10 @@
     {
       "name": "group",
       "description": "Group chat: the user and up to three personas, each an existing 1:1 session"
+    },
+    {
+      "name": "byoc",
+      "description": "Bring your own character: mint a key, then create an instance under it. Admitted by a shared secret header"
     }
   ]
 }
