@@ -127,7 +127,7 @@ impl<'a> StoryRepo<'a> {
                  FROM engine.persona_instances pi \
                  JOIN engine.world_enrollments we \
                    ON we.owner_uid = pi.owner_uid AND we.stories_enabled \
-                 WHERE pi.status = 'active' \
+                 WHERE pi.status = 'active' AND pi.genome_id IS NOT NULL \
              ) ranked WHERE ranked.rn <= $1 \
              ON CONFLICT (instance_id) DO NOTHING",
         )
@@ -655,6 +655,28 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(ids, vec![a]);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn stories_backfill_and_persona_skip_byoc_instances(pool: PgPool) {
+        let repo = StoryRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        enroll_stories(&pool, owner).await;
+        // Seeded first, so without the filter it would rank first and take the
+        // only roster slot.
+        let byoc = crate::testutil::seed_byoc_instance(&pool, owner).await;
+        let genome_instance = seed_instance(&pool, owner, "Nova", "active").await;
+
+        assert_eq!(repo.ensure_insight_rows(1).await.unwrap(), 1);
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT instance_id FROM engine.persona_story_insights WHERE owner_uid = $1",
+        )
+        .bind(owner)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(ids, vec![genome_instance]);
+        assert!(repo.instance_persona(byoc).await.unwrap().is_none());
     }
 
     #[sqlx::test(migrations = "./migrations")]

@@ -948,6 +948,18 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn roster_leaves_out_byoc_instances(pool: PgPool) {
+        let repo = WorldRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        let genome_instance = seed_instance(&pool, owner, "Nova", "active").await;
+        let _byoc = crate::testutil::seed_byoc_instance(&pool, owner).await;
+
+        let roster = repo.list_active_roster(owner, 10).await.unwrap();
+        let ids: Vec<Uuid> = roster.iter().map(|r| r.instance_id).collect();
+        assert_eq!(ids, vec![genome_instance]);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn recent_extracted_memories_filters_layers_and_categories(pool: PgPool) {
         let repo = WorldRepo { pool: &pool };
         let owner = Uuid::new_v4();

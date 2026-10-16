@@ -541,7 +541,7 @@ mod payload_tests {
         let persona = CompanionPersona {
             instance_id: iid,
             genome: PersonaGenome {
-                id: gid,
+                id: Some(gid),
                 name: "Mia".into(),
                 system_prompt: "You are Mia.".into(),
                 tip_personality: Some("normal".into()),
@@ -549,7 +549,7 @@ mod payload_tests {
             },
             instance: PersonaInstance {
                 id: iid,
-                genome_id: gid,
+                genome_id: Some(gid),
                 owner_uid: uuid::Uuid::new_v4(),
                 status: "active".into(),
             },
