@@ -1337,9 +1337,33 @@ pub(crate) mod testutil {
         (id, key)
     }
 
+    /// A BYOC instance with one text session; returns (instance, session).
+    pub(crate) async fn seed_byoc_session(pool: &PgPool, owner: Uuid) -> (Uuid, Uuid) {
+        let (instance_id, _) = seed_byoc_instance_with_key(pool, owner).await;
+        let session_id = seed_session(pool, owner, instance_id).await;
+        (instance_id, session_id)
+    }
+
+    /// Row counts a turn would grow: messages, queued turns and life events of
+    /// `session_id`. A refused request leaves all three unchanged.
+    pub(crate) async fn session_footprint(pool: &PgPool, session_id: Uuid) -> (i64, i64, i64) {
+        let count = |table: &'static str| async move {
+            sqlx::query_scalar::<_, i64>(&format!(
+                "SELECT count(*) FROM engine.{table} WHERE session_id = $1"
+            ))
+            .bind(session_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        };
+        (
+            count("chat_messages").await,
+            count("chat_turn_queue").await,
+            count("persona_events").await,
+        )
+    }
+
     /// A v1 card sealed under `key`, as a downstream sends it.
-    // TODO(byoc routes): first used by the routes that open a card.
-    #[allow(dead_code)]
     pub(crate) fn sealed_card(
         key: &[u8; 32],
         name: &str,

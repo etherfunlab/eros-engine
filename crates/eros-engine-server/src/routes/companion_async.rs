@@ -161,7 +161,8 @@ pub async fn send_message_async(
         })
     })?;
 
-    let (_session, _persona, _instance_id) = resolve_text_turn(&state, session_id, user_id).await?;
+    let (_session, _persona, _instance_id) =
+        resolve_text_turn(&state, session_id, user_id, "the async send route").await?;
 
     let chat_repo = ChatRepo { pool: &state.pool };
     let quote = resolve_quote(&chat_repo, session_id, req.reply_to_message_id).await?;
@@ -268,7 +269,8 @@ mod tests {
 
     use crate::routes::companion::test_state;
     use crate::routes::companion::testutil::{
-        build_router, mint_test_jwt, seed_genome, seed_instance, seed_session,
+        build_router, mint_test_jwt, seed_byoc_session, seed_genome, seed_instance, seed_session,
+        session_footprint,
     };
 
     fn async_uri(session_id: Uuid) -> String {
@@ -540,6 +542,25 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(rows, 0, "a rejected async turn must not persist any row");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn async_send_refuses_a_byoc_session(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = seed_byoc_session(&pool, user_id).await;
+        let before = session_footprint(&pool, session_id).await;
+
+        let mut app = build_router(test_state(pool.clone()));
+        let (status, body) = post_json(
+            &mut app,
+            &async_uri(session_id),
+            &mint_test_jwt(user_id),
+            json!({"content":"hi","client_msg_id":"01JV000000000000000000005A"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert_eq!(body["code"], "byoc_unsupported");
+        assert_eq!(session_footprint(&pool, session_id).await, before);
     }
 
     #[test]

@@ -6,7 +6,7 @@
 //!
 //! No error built here quotes the sealed string, the key or any card text.
 //!
-//! TODO(byoc routes): `open_card`, `unsupported` and what only they use stay
+//! TODO(byoc routes): card opening and `LoadedInstance::into_persona` stay
 //! unused until the routes that take a card call them. Allow-dead-code lifts
 //! once they have a caller.
 #![allow(dead_code)]
@@ -24,9 +24,12 @@ use serde_json::{json, Value};
 use sha2::Sha256;
 use uuid::Uuid;
 
+use eros_engine_core::persona::{merge_items, CompanionPersona, PersonaGenome, PersonaInstance};
+use eros_engine_store::persona::{ByocInstance, PersonaRepo};
+
 use crate::byok::{constant_time_eq, pre_error};
 use crate::error::AppError;
-use crate::state::ByocConfig;
+use crate::state::{AppState, ByocConfig};
 
 /// Request header carrying the deployment's caller secret (spec §4).
 pub(crate) const CALLER_SECRET_HEADER: &str = "x-byoc-caller-secret";
@@ -54,6 +57,10 @@ pub(crate) fn b64_encode(bytes: &[u8]) -> String {
 
 pub(crate) fn b64_decode(s: &str) -> Option<Vec<u8>> {
     B64.decode(s).ok()
+}
+
+fn invalid_payload(message: impl Into<String>) -> AppError {
+    pre_error(StatusCode::BAD_REQUEST, "invalid_payload", message.into())
 }
 
 fn forbidden(message: &str) -> AppError {
@@ -192,9 +199,8 @@ pub(crate) fn parse_card_v1(plaintext: &[u8]) -> Result<Card, String> {
 /// Open a sealed card (spec §6.1): `base64url(nonce[12] ‖ ciphertext ‖ tag[16])`,
 /// AES-256-GCM, no associated data.
 pub(crate) fn open_card(key: &[u8], sealed: &str) -> Result<Card, AppError> {
-    let invalid = |message: String| pre_error(StatusCode::BAD_REQUEST, "invalid_payload", message);
     let malformed =
-        || invalid("character must be a base64url sealed card of at most 96 KiB".into());
+        || invalid_payload("character must be a base64url sealed card of at most 96 KiB");
     if sealed.len() > MAX_SEALED_LEN {
         return Err(malformed());
     }
@@ -216,9 +222,78 @@ pub(crate) fn open_card(key: &[u8], sealed: &str) -> Result<Card, AppError> {
             )
         })?;
     if plaintext.len() > MAX_PLAINTEXT_LEN {
-        return Err(invalid("character plaintext exceeds 64 KiB".into()));
+        return Err(invalid_payload("character plaintext exceeds 64 KiB"));
     }
-    parse_card_v1(&plaintext).map_err(|msg| invalid(format!("character: {msg}")))
+    parse_card_v1(&plaintext).map_err(|msg| invalid_payload(format!("character: {msg}")))
+}
+
+/// What a session's `instance_id` points at: a genome persona, ready for a
+/// turn, or a BYOC instance that needs its card first.
+pub(crate) enum LoadedInstance {
+    Genome(CompanionPersona),
+    Byoc(ByocInstance),
+}
+
+impl LoadedInstance {
+    pub(crate) fn owner_uid(&self) -> Uuid {
+        match self {
+            Self::Genome(p) => p.instance.owner_uid,
+            Self::Byoc(b) => b.owner_uid,
+        }
+    }
+
+    /// The persona a turn runs with (spec §6.3). A genome instance takes no
+    /// card; a BYOC instance takes exactly one, opened under its own key.
+    pub(crate) fn into_persona(
+        self,
+        character: Option<&str>,
+    ) -> Result<CompanionPersona, AppError> {
+        match (self, character) {
+            (Self::Genome(persona), None) => Ok(persona),
+            (Self::Genome(_), Some(_)) => Err(invalid_payload(
+                "character is only accepted for a BYOC instance",
+            )),
+            (Self::Byoc(_), None) => {
+                Err(invalid_payload("character is required for a BYOC instance"))
+            }
+            (Self::Byoc(b), Some(sealed)) => {
+                let card = open_card(&b.key, sealed)?;
+                Ok(CompanionPersona {
+                    instance_id: b.instance_id,
+                    items: merge_items(&card.art_metadata, b.items),
+                    genome: PersonaGenome {
+                        id: None,
+                        name: card.name,
+                        system_prompt: card.system_prompt,
+                        tip_personality: card.tip_personality,
+                        art_metadata: card.art_metadata,
+                    },
+                    instance: PersonaInstance {
+                        id: b.instance_id,
+                        genome_id: None,
+                        owner_uid: b.owner_uid,
+                        status: "active".into(),
+                    },
+                })
+            }
+        }
+    }
+}
+
+/// The active instance `instance_id` names, of either kind; `None` when there
+/// is no such active instance.
+pub(crate) async fn load_instance(
+    state: &AppState,
+    instance_id: Uuid,
+) -> Result<Option<LoadedInstance>, AppError> {
+    let repo = PersonaRepo { pool: &state.pool };
+    if let Some(persona) = repo.load_companion(instance_id).await? {
+        return Ok(Some(LoadedInstance::Genome(persona)));
+    }
+    Ok(repo
+        .load_byoc_instance(instance_id)
+        .await?
+        .map(LoadedInstance::Byoc))
 }
 
 /// Seal `plaintext` the way a downstream does.
@@ -443,6 +518,107 @@ mod tests {
                 panic!()
             };
             assert!(!e.message.contains(marker) && !e.user_message.contains(marker));
+        }
+    }
+
+    mod instance {
+        use super::*;
+        use crate::routes::companion::test_state;
+        use crate::routes::companion::testutil::{
+            sealed_card, seed_byoc_instance_with_key, seed_persona_instance,
+        };
+        use eros_engine_core::types::ItemKind;
+        use sqlx::PgPool;
+
+        #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+        async fn into_persona_builds_the_turn_persona_from_the_card(pool: PgPool) {
+            let owner = Uuid::new_v4();
+            let (id, key) = seed_byoc_instance_with_key(&pool, owner).await;
+            PersonaRepo { pool: &pool }
+                .insert_item(id, ItemKind::Item, "摩托车")
+                .await
+                .unwrap();
+            let sealed = sealed_card(
+                &key,
+                "Aria",
+                "You are Aria.",
+                json!({"possessions": ["吉他"]}),
+            );
+
+            let loaded = load_instance(&test_state(pool), id)
+                .await
+                .unwrap()
+                .expect("an active BYOC instance loads");
+            assert_eq!(loaded.owner_uid(), owner);
+            let persona = loaded.into_persona(Some(&sealed)).unwrap();
+
+            assert_eq!(persona.genome.name, "Aria");
+            assert_eq!(persona.genome.system_prompt, "You are Aria.");
+            assert_eq!(persona.genome.id, None);
+            assert_eq!(persona.instance.genome_id, None);
+            assert_eq!(persona.instance.id, id);
+            assert_eq!(persona.instance_id, id);
+            assert_eq!(persona.instance.owner_uid, owner);
+            assert_eq!(persona.instance.status, "active");
+            let names: Vec<&str> = persona.items.iter().map(|i| i.name.as_str()).collect();
+            assert!(names.contains(&"吉他"), "{names:?}");
+            assert!(names.contains(&"摩托车"), "{names:?}");
+        }
+
+        #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+        async fn into_persona_enforces_card_presence_by_kind(pool: PgPool) {
+            let owner = Uuid::new_v4();
+            let state = test_state(pool.clone());
+            let genome = seed_persona_instance(&pool, owner).await;
+            let (byoc, key) = seed_byoc_instance_with_key(&pool, owner).await;
+            let sealed = sealed_card(&key, "A", "p", json!({}));
+
+            let loaded = load_instance(&state, genome).await.unwrap().unwrap();
+            assert!(matches!(loaded, LoadedInstance::Genome(_)));
+            assert_eq!(loaded.owner_uid(), owner);
+            assert_eq!(
+                code_of(loaded.into_persona(Some(&sealed)).unwrap_err()),
+                (400, "invalid_payload")
+            );
+            let loaded = load_instance(&state, genome).await.unwrap().unwrap();
+            assert!(loaded.into_persona(None).is_ok());
+
+            let loaded = load_instance(&state, byoc).await.unwrap().unwrap();
+            assert!(matches!(loaded, LoadedInstance::Byoc(_)));
+            assert_eq!(
+                code_of(loaded.into_persona(None).unwrap_err()),
+                (400, "invalid_payload")
+            );
+        }
+
+        #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+        async fn a_card_sealed_under_another_instances_key_is_rejected(pool: PgPool) {
+            let owner = Uuid::new_v4();
+            let (id, _) = seed_byoc_instance_with_key(&pool, owner).await;
+            let (_, other_key) = seed_byoc_instance_with_key(&pool, owner).await;
+            let sealed = sealed_card(&other_key, "A", "p", json!({}));
+            let loaded = load_instance(&test_state(pool), id).await.unwrap().unwrap();
+            assert_eq!(
+                code_of(loaded.into_persona(Some(&sealed)).unwrap_err()),
+                (403, "byoc_card_rejected")
+            );
+        }
+
+        #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+        async fn an_unknown_or_archived_instance_does_not_load(pool: PgPool) {
+            let owner = Uuid::new_v4();
+            let state = test_state(pool.clone());
+            assert!(load_instance(&state, Uuid::new_v4())
+                .await
+                .unwrap()
+                .is_none());
+            let (id, _) = seed_byoc_instance_with_key(&pool, owner).await;
+            sqlx::query("UPDATE engine.persona_instances SET status = 'archived' WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            assert!(load_instance(&state, id).await.unwrap().is_none());
         }
     }
 }

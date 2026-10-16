@@ -17,7 +17,7 @@ use eros_engine_core::effects::{ActiveEffect, EffectPhase};
 
 use crate::auth::middleware::AuthUser;
 use crate::error::AppError;
-use crate::routes::companion_stream::{resolve_text_turn, GivenItemDto, StreamPreErrorBody};
+use crate::routes::companion_stream::{resolve_text_session, GivenItemDto, StreamPreErrorBody};
 use crate::state::AppState;
 
 /// Where an effect is on its curve.
@@ -140,7 +140,7 @@ async fn get_effects(
     Path(session_id): Path<Uuid>,
     Extension(AuthUser(user_id)): Extension<AuthUser>,
 ) -> Result<Json<EffectsResponse>, AppError> {
-    let (_session, _persona, instance_id) = resolve_text_turn(&state, session_id, user_id).await?;
+    let (_session, instance_id) = resolve_text_session(&state, session_id, user_id).await?;
     let effects = crate::pipeline::handlers::load_effects(&state.pool, session_id, None).await?;
     let needs = if state.model_config.pde_enabled() {
         crate::pipeline::handlers::load_needs(&state.pool, instance_id, None, chrono::Utc::now())
@@ -178,7 +178,7 @@ mod tests {
 
     use crate::routes::companion::test_state;
     use crate::routes::companion::testutil::{
-        build_router, mint_test_jwt, seed_persona_instance, seed_session,
+        build_router, mint_test_jwt, seed_byoc_session, seed_persona_instance, seed_session,
     };
 
     async fn get(
@@ -228,6 +228,18 @@ mod tests {
         let group = crate::routes::companion::testutil::seed_group_session(&pool, owner).await;
         let (status, _) = get(pool, group, owner).await;
         assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn effects_serve_a_byoc_session(pool: sqlx::PgPool) {
+        let owner = Uuid::new_v4();
+        let (_, session_id) = seed_byoc_session(&pool, owner).await;
+        let (s, body) = get(pool, session_id, owner).await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+        assert_eq!(
+            body,
+            json!({"effects": [], "needs": null, "event": null, "background_event": null})
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

@@ -21,9 +21,9 @@ use eros_engine_core::types::QuotedMessage;
 use eros_engine_llm::model_config::StyleKey;
 use eros_engine_store::chat::{ChatRepo, ChatSession};
 use eros_engine_store::chat_queue::{ChatQueueRepo, ClaimedEnqueueOutcome, ClaimedTurn};
-use eros_engine_store::persona::PersonaRepo;
 
 use crate::auth::middleware::AuthUser;
+use crate::byoc::LoadedInstance;
 use crate::error::{AppError, StreamPreError};
 use crate::pipeline::stream::{
     replay_stream, PersistedUserMessage, ProtocolFrame, StreamErrorCode,
@@ -645,13 +645,14 @@ pub(crate) fn validate_image_capability(
     Ok(())
 }
 
-/// Session-load / ownership / voice-channel / instance_id / persona-exists
-/// pre-flight shared by the stream handler (and, in turn, its async sibling).
-pub(crate) async fn resolve_text_turn(
+/// Session-load / ownership / text-channel / instance_id pre-flight shared by
+/// every text-session route. It reads the session only; whether the instance
+/// behind it exists is up to the caller.
+pub(crate) async fn resolve_text_session(
     state: &AppState,
     session_id: Uuid,
     user_id: Uuid,
-) -> Result<(ChatSession, CompanionPersona, Uuid), AppError> {
+) -> Result<(ChatSession, Uuid), AppError> {
     let chat_repo = ChatRepo { pool: &state.pool };
     let session = chat_repo.get_session(session_id).await?.ok_or_else(|| {
         AppError::StreamPre(StreamPreError {
@@ -702,17 +703,27 @@ pub(crate) async fn resolve_text_turn(
             original_user_message_id: None,
         })
     })?;
-    // Verify the instance still exists and is active (404 otherwise) before
-    // opening the stream. (Previously this load also fed the NFT-ownership gate.)
-    // The loaded persona is threaded into the detached drive task's
-    // `run_stream` call below so the turn does not re-issue the same
-    // `load_companion` query inside the generator.
-    let persona_repo = PersonaRepo { pool: &state.pool };
-    let persona = persona_repo
-        .load_companion(instance_id)
-        .await?
-        .ok_or_else(|| AppError::NotFound("instance not found".into()))?;
-    Ok((session, persona, instance_id))
+    Ok((session, instance_id))
+}
+
+/// [`resolve_text_session`] plus the session's persona, for routes that serve
+/// a genome instance only. A BYOC instance is refused with
+/// `byoc_unsupported` naming `route`; an instance that no longer exists or is
+/// inactive is a 404. The loaded persona is threaded into the detached drive
+/// task's `run_stream` call so the turn does not re-issue the same
+/// `load_companion` query inside the generator.
+pub(crate) async fn resolve_text_turn(
+    state: &AppState,
+    session_id: Uuid,
+    user_id: Uuid,
+    route: &'static str,
+) -> Result<(ChatSession, CompanionPersona, Uuid), AppError> {
+    let (session, instance_id) = resolve_text_session(state, session_id, user_id).await?;
+    match crate::byoc::load_instance(state, instance_id).await? {
+        Some(LoadedInstance::Genome(persona)) => Ok((session, persona, instance_id)),
+        Some(LoadedInstance::Byoc(_)) => Err(crate::byoc::unsupported(route)),
+        None => Err(AppError::NotFound("instance not found".into())),
+    }
 }
 
 /// Resolve the caller's `reply_to_message_id` into the message it quotes. A
@@ -888,7 +899,8 @@ pub async fn send_message_stream(
         )?)),
     };
 
-    let (_session, persona, instance_id) = resolve_text_turn(&state, session_id, user_id).await?;
+    let (_session, persona, instance_id) =
+        resolve_text_turn(&state, session_id, user_id, "the stream route").await?;
     let chat_repo = ChatRepo { pool: &state.pool };
     // Acquire a stream slot. `StreamSlotGuard` is now `'static` (holds Arc),
     // so it can be moved into the SSE body below.

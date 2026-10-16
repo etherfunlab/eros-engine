@@ -1502,6 +1502,16 @@
               }
             }
           },
+          "400": {
+            "description": "`byoc_unsupported`: a member session belongs to a BYOC instance",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
           "404": {
             "description": "`session_not_found`: a member session is unknown or not the caller's",
             "content": {
@@ -1721,6 +1731,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/GroupDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`byoc_unsupported`: the member session belongs to a BYOC instance",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
                 }
               }
             }
