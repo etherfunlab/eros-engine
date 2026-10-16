@@ -278,7 +278,9 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
   不到一小时的跨度读作 `不到 1 小时`（结束那一半此时不带 `约`）；不满 48 小时按整小时四舍五入；
   从 48 小时起按整天四舍五入。`{label}` 是每个种类固定的中文名（`reading` 是 `在看书`，`long_trip` 是
   `长途旅游`）。没有进行中的事件、没有未解释的离线时段、也没有未交代的虚惊（见下）时，这一行不出现。
-- **回复**在 `[character_state]` 里得到 `- 正在经历：`，排在 `此刻的需要` 之后，列出同样两件事，只写结束时间：
+- **回复**在 `[now]` 块里得到 `- 正在经历：`，排在时间、节日和生日几行之后，列出同样两件事，只写结束时间；
+  下文的 `- 刚才：` 行紧跟其后。两行都不在 `[character_state]` 里：那个块的表头让位于它上面的块，
+  放在那里，事件开始之前写下的故事摘要就会盖过事件：
 
   ```
   - 正在经历：长途旅游（约 3 天后结束）；在看书（约 2 小时后结束）
@@ -456,7 +458,7 @@ ghosting 开关关闭时，已经在进行的一段不会让任何轮次沉默�
 - `crates/eros-engine-server/src/pipeline/stream.rs::run_stream`：需求的读取与写入、`[需求]` 与 `[近期事件]` 两行
   （`build_pde_ctx`）、判官之前的 offline 分支、`body_state_frame`。
 - `crates/eros-engine-server/src/prompt.rs`：`needs_line`、`events_judge_text`、`events_reply_text`、
-  `just_now_text`、`persona_traits`，以及 `[character_state]` 里的各行。
+  `just_now_text`、`persona_traits`、`[character_state]` 里的各行，以及 `[now]` 里的事件行。
 - `crates/eros-engine-server/src/routes/session_effects.rs`：`GET …/effects`。
 - `crates/eros-engine-server/src/pipeline/voice.rs`：bootstrap 里的需求。
 - `crates/eros-engine-store/src/events.rs::EventRepo`：`insert`、`by_key`、`recent`、`current`、`unexplained_offline`、`unresolved_scare`。
