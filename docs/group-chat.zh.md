@@ -56,6 +56,7 @@
 | 成员 session 不是 `text` session | `409 wrong_channel` |
 | 成员 session 已归档 | `409 session_archived` |
 | 另一位成员是同一个角色实例 | `409 instance_already_member` |
+| 成员 session 属于 [BYOC](byoc.zh.md) 实例 | `400 byoc_unsupported` |
 | 标题为空白、过长或含控制字符 | `422 invalid_title` |
 | 创建时 `member_session_ids` 为空 | `422 unprocessable` |
 

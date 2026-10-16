@@ -86,7 +86,7 @@ LOCKED` 加 30 分钟过期回收，并以认领所有权 token 守卫，卡死�
 | 输入 | 来源 |
 |------|------|
 | 上一轮世界种子 | `world_states.seed`（不透明 JSONB；引擎从不解读） |
-| 活跃角色名单（上限 8） | `persona_instances` 中 `status = 'active'`，最早创建优先 |
+| 活跃角色名单（上限 8） | `persona_instances` 中 `status = 'active'` 且有 genome 的实例，最早创建优先——[BYOC](byoc.zh.md) 实例没有 genome，从不入选 |
 | 记忆回流（K=15） | 最近的**抽取版**画像层 `companion_memories`（dreaming-lite 的产物——绝非原始聊天） |
 
 | 输出 | 去向 |
@@ -179,7 +179,8 @@ Stories 需要**全部条件**同时成立——且按构造骑在 World Memorie
 对每个 `persona_instance`，每 `interval_hours`（默认 8 小时）跑一轮，前置一道
 **活跃度闸门**：只有在 `active_window_hours`（默认 72 小时）内被聊过的角色才
 会推进。安静的角色人生会暂停，一旦聊天重新活跃就自动续上——不做补跑。[群聊](group-chat.zh.md)
-里的回合不算：它们不会动成员 session 的活跃时间。
+里的回合不算：它们不会动成员 session 的活跃时间。[BYOC](byoc.zh.md) 实例不会有一轮，也不会有 story 行，
+也不会占走有 genome 的实例的名单位置。
 
 | 输入 | 来源 |
 |------|------|
