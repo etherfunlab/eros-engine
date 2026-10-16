@@ -23,12 +23,13 @@ response is `"event": {…, "message_id": null}` with `"message": null`. Both
 `null` still means nothing was drawn. A client that took a non-null `event` to
 mean a message was written checks `message` instead.
 
-**Silence while away.** While an `away_from_phone` lasts, every 1:1 text turn
-of that persona instance ends as a ghost turn (`meta(action_type=ghost)` →
-`done` → `final`), and `/open` returns `"greeting": null`. A turn that carries
-an `action` or `image.force = true` is answered as before. The kind is never
-drawn with the deployment's `ghosting = false`, nor in a session with fewer than
-10 user messages. Afterwards the persona's next message in a session she ghosted
+**Silence while away.** While an `away_from_phone` lasts, `/open` returns
+`"greeting": null`, and every 1:1 text turn of that persona instance ends as a
+ghost turn (`meta(action_type=ghost)` → `done` → `final`). A turn that carries
+an `action` or `image.force = true` is answered as before. With the
+deployment's `ghosting = false`, the kind is never drawn and one already under
+way no longer silences turns; nor is it drawn in a session with fewer than 10
+user messages. Afterwards the persona's next message in a session she ghosted
 explains it. A client that wants to show her as away reads `event` on the
 effects route.
 
@@ -61,7 +62,9 @@ effects route.
 `CurrentEvents`, `NewEvent` and `Inserted`.
 
 **Store.** Migration `0072` creates `engine.persona_events` and backfills it
-from every v1 event message (`metadata.proactive = 'event'`). New event
+from the v1 event messages (`metadata.proactive = 'event'`); a row without
+`metadata.event_key`, `metadata.event.kind` or `metadata.event.ends_at`, or in
+a session without a persona instance, is skipped. New event
 messages keep `metadata.proactive = 'event'` and no longer carry
 `metadata.event` or `metadata.event_key`. Anything that reads events from
 `engine.chat_messages` directly reads `engine.persona_events` instead. The
@@ -74,5 +77,6 @@ events in message metadata, which `0072` leaves in place, but it does not see
 events v2.2.2 wrote: no silence for an away stretch under way, no backgrounds,
 and it may draw again inside a v2.2.2 event's window. Events it writes during
 the rollback live only in that metadata, and a later roll-forward does not see
-them. The next release removes `metadata.event` and `metadata.event_key` from
-v1 rows and drops `chat_messages_event_key_uidx`.
+them. Do not build on the v1 metadata: the next release removes
+`metadata.event` and `metadata.event_key` from v1 rows and drops
+`chat_messages_event_key_uidx`.
