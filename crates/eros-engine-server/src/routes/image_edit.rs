@@ -2725,6 +2725,48 @@ pattern = '\s*\[note:[^\]]*\]'
             .await
             .unwrap();
             assert!(composed.contains(LOOKS_MARKER), "{composed}");
+
+            // The audit row keeps the card's appearance in its inputs snapshot.
+            let appearance: Option<String> = sqlx::query_scalar(
+                "SELECT inputs->>'appearance' FROM engine.chat_images_events \
+                 WHERE session_id = $1 ORDER BY created_at DESC LIMIT 1",
+            )
+            .bind(session_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert!(
+                appearance
+                    .as_deref()
+                    .is_some_and(|a| a.contains(LOOKS_MARKER)),
+                "{appearance:?}"
+            );
+
+            // The new picture's prompt is recoverable without the card or the
+            // caller secret, and it still carries the appearance.
+            let new_id = body["message_id"].as_str().unwrap();
+            let (status, rec) = send_request(
+                &mut app,
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/comp/chat/{session_id}/messages/{new_id}/image-request"
+                    ))
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", mint_test_jwt(user_id)),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "body={rec}");
+            use base64::Engine as _;
+            let recovered = base64::engine::general_purpose::STANDARD
+                .decode(rec["composed_prompt"].as_str().unwrap())
+                .unwrap();
+            let recovered = String::from_utf8(recovered).unwrap();
+            assert!(recovered.contains(LOOKS_MARKER), "{recovered}");
         }
 
         #[sqlx::test(migrations = "../eros-engine-store/migrations")]

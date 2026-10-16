@@ -3490,6 +3490,24 @@ data: [DONE]\n\n";
         (status, code, text)
     }
 
+    /// Every row the engine reads back to drive a BYOC session, as one text.
+    async fn byoc_rows_at_rest(pool: &PgPool, session_id: Uuid, user_id: Uuid) -> String {
+        sqlx::query_scalar(
+            "SELECT coalesce(string_agg(t, ' '), '') FROM ( \
+               SELECT row_to_json(m)::text AS t FROM engine.chat_messages m WHERE m.session_id = $1 \
+               UNION ALL SELECT row_to_json(q)::text FROM engine.chat_turn_queue q WHERE q.session_id = $1 \
+               UNION ALL SELECT row_to_json(p)::text FROM engine.persona_instances p WHERE p.owner_uid = $2 \
+               UNION ALL SELECT row_to_json(i)::text FROM engine.persona_instance_items i \
+                 JOIN engine.persona_instances p ON p.id = i.instance_id WHERE p.owner_uid = $2 \
+             ) s",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn byoc_stream_turn_runs_on_the_card(pool: PgPool) {
         let mock = wiremock::MockServer::start().await;
@@ -3557,20 +3575,7 @@ data: [DONE]\n\n";
             "done"
         );
 
-        let at_rest: String = sqlx::query_scalar(
-            "SELECT coalesce(string_agg(t, ' '), '') FROM ( \
-               SELECT row_to_json(m)::text AS t FROM engine.chat_messages m WHERE m.session_id = $1 \
-               UNION ALL SELECT row_to_json(q)::text FROM engine.chat_turn_queue q WHERE q.session_id = $1 \
-               UNION ALL SELECT row_to_json(p)::text FROM engine.persona_instances p WHERE p.owner_uid = $2 \
-               UNION ALL SELECT row_to_json(i)::text FROM engine.persona_instance_items i \
-                 JOIN engine.persona_instances p ON p.id = i.instance_id WHERE p.owner_uid = $2 \
-             ) s",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let at_rest = byoc_rows_at_rest(&pool, session_id, user_id).await;
         assert!(
             at_rest.contains("hi there"),
             "the rows under test were read: {at_rest}"
@@ -3579,6 +3584,72 @@ data: [DONE]\n\n";
             assert!(
                 !at_rest.contains(marker),
                 "`{marker}` found at rest: {at_rest}"
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn byoc_failed_stream_turn_keeps_no_card_at_rest(pool: PgPool) {
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, ResponseTemplate};
+        let mock = wiremock::MockServer::start().await;
+        // The reply call outlasts the turn's time budget, so the turn ends
+        // `failed`; every other call is answered at once.
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("\"stream\":true"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw("data: [DONE]\n\n", "text/event-stream")
+                    .set_delay(std::time::Duration::from_secs(30)),
+            )
+            .mount(&mock)
+            .await;
+        mount_plain_reply(&mock).await;
+        let user_id = Uuid::new_v4();
+        let (session_id, key) = byoc_session(&pool, user_id).await;
+
+        let mut state = byoc_state(pool.clone(), &mock.uri());
+        state.config.chat_queue.generation_timeout = std::time::Duration::from_secs(2);
+        let mut app = build_router(state);
+        let resp = app
+            .call(stream_send(
+                session_id,
+                &mint_jwt(user_id),
+                json!({"content": "hi", "client_msg_id": "01J6666666666666666666666K", "character": marker_card(&key)}),
+                &WITH_BYOC_SECRET,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let queue_id: Uuid =
+            sqlx::query_scalar("SELECT q.id FROM engine.chat_turn_queue q WHERE q.session_id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            wait_for_status(&pool, queue_id, &["done", "failed"]).await,
+            "failed"
+        );
+
+        let sent_card = mock
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| String::from_utf8_lossy(&r.body).contains("BYOC-SYSTEM-MARKER"));
+        assert!(sent_card, "the card reached the call that failed");
+
+        let at_rest = byoc_rows_at_rest(&pool, session_id, user_id).await;
+        assert!(
+            at_rest.contains("01J6666666666666666666666K") && at_rest.contains("system_error"),
+            "the rows under test were read: {at_rest}"
+        );
+        for marker in BYOC_MARKERS {
+            assert!(
+                !at_rest.contains(marker),
+                "`{marker}` found at rest after a failed turn: {at_rest}"
             );
         }
     }
