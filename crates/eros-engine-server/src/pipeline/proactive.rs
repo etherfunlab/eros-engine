@@ -268,15 +268,17 @@ pub(crate) async fn greet(
         aspect_ratio: None,
         action_response: None,
     };
-    let current = eros_engine_store::events::EventRepo { pool: &state.pool }
-        .current(g.instance_id, None, g.now.now)
+    let repo = eros_engine_store::events::EventRepo { pool: &state.pool };
+    let current = repo.current(g.instance_id, None, g.now.now).await?;
+    let offline = repo
+        .unexplained_offline(g.session_id, g.instance_id, g.now.now)
+        .await?;
+    let scare = repo
+        .unresolved_scare(g.session_id, g.instance_id, g.now.now)
         .await?;
     let event_lines = crate::prompt::EventLines {
         under_way: crate::prompt::events_reply_text(&current),
-        away_unexplained: eros_engine_store::events::EventRepo { pool: &state.pool }
-            .unexplained_offline(g.session_id, g.instance_id, g.now.now)
-            .await?
-            .is_some(),
+        just_now: crate::prompt::just_now_text(offline.as_ref(), scare.as_ref()),
     };
     let (mut chat_req, injected_tags) = build_reply_request(
         state,

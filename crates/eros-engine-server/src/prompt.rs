@@ -888,13 +888,16 @@ fn ends_text(ends_in: chrono::Duration) -> String {
     }
 }
 
-/// `[近期事件]` (spec 2026-10-15-life-events-v2-design.md §8.2): the
-/// background, the foreground, then an away stretch she has not explained,
-/// each 「临时接到工作（1 小时前开始，约 3 小时后结束）」 or 「没看手机（不到 1
-/// 小时前结束，期间对方的消息你没有回）」; `None` when there is nothing.
+/// `[近期事件]` (spec 2026-10-15-life-events-v2-design.md §8.2; 2026-10-16-
+/// life-events-offline-and-scares-design.md §4.2, §5.2): the background, the
+/// foreground, an offline stretch she has not explained, then a false alarm
+/// not yet resolved, each 「临时接到工作（1 小时前开始，约 3 小时后结束）」,
+/// 「睡着了（2 小时前结束，期间对方的消息你没有回）」 or 「月经没来（1 小时前
+/// 结束，结果是虚惊一场）」; `None` when there is nothing.
 pub(crate) fn events_judge_text(
     c: &eros_engine_store::events::CurrentEvents,
-    away: Option<&eros_engine_store::events::EventRecord>,
+    offline: Option<&eros_engine_store::events::EventRecord>,
+    scare: Option<&eros_engine_store::events::EventRecord>,
 ) -> Option<String> {
     let mut items: Vec<String> = [c.background.as_ref(), c.foreground.as_ref()]
         .into_iter()
@@ -908,11 +911,18 @@ pub(crate) fn events_judge_text(
             )
         })
         .collect();
-    if let Some(a) = away {
+    if let Some(a) = offline {
         items.push(format!(
             "{}（{}前结束，期间对方的消息你没有回）",
             event_label(a.kind),
             span_text(c.at - a.ends_at)
+        ));
+    }
+    if let Some(s) = scare {
+        items.push(format!(
+            "{}（{}前结束，结果是虚惊一场）",
+            event_label(s.kind),
+            span_text(c.at - s.ends_at)
         ));
     }
     (!items.is_empty()).then(|| items.join("；"))
@@ -930,18 +940,45 @@ pub(crate) fn events_reply_text(c: &eros_engine_store::events::CurrentEvents) ->
 }
 
 /// What the reply hears of the persona's events (spec
-/// 2026-10-15-life-events-v2-design.md §8.2).
+/// 2026-10-15-life-events-v2-design.md §8.2; 2026-10-16-life-events-offline-
+/// and-scares-design.md §6).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct EventLines {
     /// `正在经历`: the background and the foreground under way, rendered by
     /// `events_reply_text`.
     pub under_way: Option<String>,
-    /// `刚才`: an away-from-phone stretch this session has not been told
-    /// about.
-    pub away_unexplained: bool,
+    /// `刚才`: an offline stretch this session has not been told about and a
+    /// false alarm not yet resolved here, rendered by `just_now_text`.
+    pub just_now: Option<String>,
 }
 
-const AWAY_LINE: &str = "- 刚才：有段时间没看手机，对方那时发来的消息你现在才看到";
+/// What she says of an ended offline stretch or false alarm; `None` for any
+/// other kind.
+fn aftermath_text(kind: eros_engine_core::events::EventKind) -> Option<&'static str> {
+    use eros_engine_core::events::EventKind::*;
+    Some(match kind {
+        AwayFromPhone => "有段时间没看手机，对方那时发来的消息你现在才看到",
+        Busy => "一直在忙，对方那时发来的消息你现在才看到",
+        InBattle => "在打一场硬仗，对方那时发来的消息你现在才看到",
+        Asleep => "睡着了，对方那时发来的消息你现在才看到",
+        PeriodScare => "以为月经没来，后来来了，是虚惊一场",
+        PregnancyScare => "验出两条杠，后来复查是虚惊一场",
+        _ => return None,
+    })
+}
+
+/// `刚才` (§5.3): the offline text, then the false alarm's, joined by `；`.
+pub(crate) fn just_now_text(
+    offline: Option<&eros_engine_store::events::EventRecord>,
+    scare: Option<&eros_engine_store::events::EventRecord>,
+) -> Option<String> {
+    let items: Vec<&str> = [offline, scare]
+        .into_iter()
+        .flatten()
+        .filter_map(|e| aftermath_text(e.kind))
+        .collect();
+    (!items.is_empty()).then(|| items.join("；"))
+}
 
 /// Fold the last turns' `metadata` (newest first) into the active effects:
 /// a turn counts only with an accepted action; anything that does not parse
@@ -1505,8 +1542,8 @@ pub fn build_prompt(
         if let Some(s) = needs.map(str::trim).filter(|s| !s.is_empty()) {
             lines.push(format!("- 此刻的需要：{s}"));
         }
-        // The events she is in, after her needs; then an away stretch she
-        // has not explained.
+        // The events she is in, after her needs; then what she has not yet
+        // said about an offline stretch or a false alarm.
         if let Some(ev) = event {
             if let Some(s) = ev
                 .under_way
@@ -1516,8 +1553,13 @@ pub fn build_prompt(
             {
                 lines.push(format!("- 正在经历：{s}"));
             }
-            if ev.away_unexplained {
-                lines.push(AWAY_LINE.into());
+            if let Some(s) = ev
+                .just_now
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                lines.push(format!("- 刚才：{s}"));
             }
         }
         if lines.is_empty() {
@@ -3842,7 +3884,7 @@ mod tests {
         use eros_engine_core::events::EventKind;
         let c = only(event_at(EventKind::TempWork, 120, 120));
         assert_eq!(
-            events_judge_text(&c, None).unwrap(),
+            events_judge_text(&c, None, None).unwrap(),
             "临时接到工作（2 小时前开始，约 2 小时后结束）"
         );
         assert_eq!(
@@ -3851,7 +3893,7 @@ mod tests {
         );
         let c = only(event_at(EventKind::AnimalEncounter, 20, 40));
         assert_eq!(
-            events_judge_text(&c, None).unwrap(),
+            events_judge_text(&c, None, None).unwrap(),
             "路上遇到小动物（不到 1 小时前开始，不到 1 小时后结束）"
         );
         assert_eq!(
@@ -3861,7 +3903,7 @@ mod tests {
         // Rounded to whole hours: 89 minutes → 1, 151 minutes → 3.
         let c = only(event_at(EventKind::WeatherChange, 89, 151));
         assert_eq!(
-            events_judge_text(&c, None).unwrap(),
+            events_judge_text(&c, None, None).unwrap(),
             "天气突然变了（1 小时前开始，约 3 小时后结束）"
         );
         for (kind, label) in [
@@ -3887,7 +3929,7 @@ mod tests {
             at,
         };
         assert_eq!(
-            events_judge_text(&c, None).unwrap(),
+            events_judge_text(&c, None, None).unwrap(),
             "长途旅游（2 天前开始，约 3 天后结束）；在看书（不到 1 小时前开始，约 2 小时后结束）"
         );
         assert_eq!(
@@ -3899,7 +3941,7 @@ mod tests {
             background: None,
             at,
         };
-        assert_eq!(events_judge_text(&nothing, None), None);
+        assert_eq!(events_judge_text(&nothing, None, None), None);
         assert_eq!(events_reply_text(&nothing), None);
     }
 
@@ -3914,7 +3956,7 @@ mod tests {
             at,
         };
         assert_eq!(
-            events_judge_text(&c, Some(&away)).unwrap(),
+            events_judge_text(&c, Some(&away), None).unwrap(),
             "出差（10 小时前开始，约 14 小时后结束）；没看手机（不到 1 小时前结束，期间对方的消息你没有回）"
         );
         let (long_ago, _) = event_at(EventKind::AwayFromPhone, 240, -120);
@@ -3924,8 +3966,57 @@ mod tests {
             at,
         };
         assert_eq!(
-            events_judge_text(&nothing, Some(&long_ago)).unwrap(),
+            events_judge_text(&nothing, Some(&long_ago), None).unwrap(),
             "没看手机（2 小时前结束，期间对方的消息你没有回）"
+        );
+    }
+
+    #[test]
+    fn each_aftermath_has_its_words() {
+        use eros_engine_core::events::EventKind::*;
+        let rec = |kind| {
+            let (e, _) = event_at(kind, 70, -10);
+            e
+        };
+        for (kind, text) in [
+            (
+                AwayFromPhone,
+                "有段时间没看手机，对方那时发来的消息你现在才看到",
+            ),
+            (Busy, "一直在忙，对方那时发来的消息你现在才看到"),
+            (InBattle, "在打一场硬仗，对方那时发来的消息你现在才看到"),
+            (Asleep, "睡着了，对方那时发来的消息你现在才看到"),
+        ] {
+            assert_eq!(just_now_text(Some(&rec(kind)), None).as_deref(), Some(text));
+        }
+        assert_eq!(
+            just_now_text(None, Some(&rec(PeriodScare))).as_deref(),
+            Some("以为月经没来，后来来了，是虚惊一场")
+        );
+        assert_eq!(
+            just_now_text(None, Some(&rec(PregnancyScare))).as_deref(),
+            Some("验出两条杠，后来复查是虚惊一场")
+        );
+        assert_eq!(
+            just_now_text(Some(&rec(Asleep)), Some(&rec(PeriodScare))).as_deref(),
+            Some("睡着了，对方那时发来的消息你现在才看到；以为月经没来，后来来了，是虚惊一场")
+        );
+        assert_eq!(just_now_text(None, None), None);
+    }
+
+    #[test]
+    fn the_judge_hears_both_aftermaths() {
+        use eros_engine_core::events::EventKind::*;
+        let (asleep, at) = event_at(Asleep, 180, -120);
+        let (scare, _) = event_at(PregnancyScare, 70, -10);
+        let none = eros_engine_store::events::CurrentEvents {
+            foreground: None,
+            background: None,
+            at,
+        };
+        assert_eq!(
+            events_judge_text(&none, Some(&asleep), Some(&scare)).as_deref(),
+            Some("睡着了（2 小时前结束，期间对方的消息你没有回）；验出怀孕（不到 1 小时前结束，结果是虚惊一场）")
         );
     }
 
@@ -4029,7 +4120,7 @@ mod tests {
     fn prompt_with_event(needs: Option<&str>, event: Option<&str>) -> String {
         let lines = event.map(|s| EventLines {
             under_way: Some(s.into()),
-            away_unexplained: false,
+            just_now: None,
         });
         build_prompt(
             &fixture_persona(),
@@ -4058,7 +4149,7 @@ mod tests {
     fn the_away_line_follows_what_she_is_going_through() {
         let lines = EventLines {
             under_way: Some("出差（约 1 天后结束）".into()),
-            away_unexplained: true,
+            just_now: Some("有段时间没看手机，对方那时发来的消息你现在才看到".into()),
         };
         let p = build_prompt(
             &fixture_persona(),
@@ -4088,7 +4179,7 @@ mod tests {
             "{p}"
         );
         let quiet = EventLines {
-            away_unexplained: false,
+            just_now: None,
             ..lines
         };
         let p = build_prompt(

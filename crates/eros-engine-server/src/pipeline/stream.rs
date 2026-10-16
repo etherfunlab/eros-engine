@@ -4510,19 +4510,29 @@ pub(crate) fn run_stream_with(
             yield build_final_frame(false, None, user_msg.tier.clone(), 0, 0, attempts, gateways);
             return;
         }
-        // An away stretch that ended, with a user message ghosted inside it
-        // and no reply since: this turn explains it.
-        let away = eros_engine_store::events::EventRepo { pool: &state.pool }
+        // An offline stretch that ended with a user message ghosted inside
+        // it and no reply since, and a false alarm told here and not yet
+        // resolved: this turn speaks of them.
+        let repo = eros_engine_store::events::EventRepo { pool: &state.pool };
+        let offline = repo
             .unexplained_offline(user_msg.session_id, user_msg.instance_id, current.at)
             .await
             .unwrap_or_else(|e| {
-                tracing::warn!("stream: away read failed: {e}");
+                tracing::warn!("stream: offline read failed: {e}");
                 None
             });
-        let event_judge = crate::prompt::events_judge_text(&current, away.as_ref());
+        let scare = repo
+            .unresolved_scare(user_msg.session_id, user_msg.instance_id, current.at)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("stream: scare read failed: {e}");
+                None
+            });
+        let event_judge =
+            crate::prompt::events_judge_text(&current, offline.as_ref(), scare.as_ref());
         let event_lines = crate::prompt::EventLines {
             under_way: crate::prompt::events_reply_text(&current),
-            away_unexplained: away.is_some(),
+            just_now: crate::prompt::just_now_text(offline.as_ref(), scare.as_ref()),
         };
         // ── PDE decision (judge-first) ────────────────────────────────────────
         // The judge runs before vision/input-filter/chat so a `ghost` verdict
@@ -21323,7 +21333,7 @@ data: [DONE]\n\n"
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
-        seed_events(pool, user_id, instance_id, events).await;
+        seed_events(pool, user_id, instance_id, session_id, events).await;
         for (i, meta) in prior.iter().enumerate() {
             sqlx::query(
                 "INSERT INTO engine.chat_messages (session_id, role, content, metadata, sent_at) \
@@ -21620,6 +21630,8 @@ data: [DONE]\n\n"
         kind: &'static str,
         started_mins_ago: i32,
         ends_in_mins: i32,
+        /// Written in the turn's own session rather than another one.
+        here: bool,
     }
 
     fn ev(kind: &'static str, started_mins_ago: i32, ends_in_mins: i32) -> EventSeed {
@@ -21627,12 +21639,28 @@ data: [DONE]\n\n"
             kind,
             started_mins_ago,
             ends_in_mins,
+            here: false,
         }
     }
 
-    /// Write `events` for the persona, in a second session of it: an event
-    /// belongs to the persona, not to the session it was drawn in.
-    async fn seed_events(pool: &PgPool, user_id: Uuid, instance_id: Uuid, events: &[EventSeed]) {
+    /// [`ev`] written in the turn's own session.
+    fn ev_here(kind: &'static str, started_mins_ago: i32, ends_in_mins: i32) -> EventSeed {
+        EventSeed {
+            here: true,
+            ..ev(kind, started_mins_ago, ends_in_mins)
+        }
+    }
+
+    /// Write `events` for the persona: in a second session of it, or in the
+    /// turn's `session_id` for [`ev_here`]. An event belongs to the persona,
+    /// not to the session it was drawn in.
+    async fn seed_events(
+        pool: &PgPool,
+        user_id: Uuid,
+        instance_id: Uuid,
+        session_id: Uuid,
+        events: &[EventSeed],
+    ) {
         let elsewhere: Uuid = sqlx::query_scalar(
             "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
         )
@@ -21649,7 +21677,7 @@ data: [DONE]\n\n"
                          now() + make_interval(mins => $6))",
             )
             .bind(instance_id)
-            .bind(elsewhere)
+            .bind(if e.here { session_id } else { elsewhere })
             .bind(format!("seed-{i}"))
             .bind(e.kind)
             .bind(e.started_mins_ago)
@@ -21786,7 +21814,7 @@ data: [DONE]\n\n"
             .await
             .unwrap();
         }
-        seed_events(pool, user_id, instance_id, events).await;
+        seed_events(pool, user_id, instance_id, session_id, events).await;
         for m in ghosted_mins_ago {
             sqlx::query(
                 "INSERT INTO engine.chat_messages (session_id, role, content, ghost_decision, sent_at) \
@@ -22298,6 +22326,69 @@ data: [DONE]\n\n"
             "{judge}"
         );
         assert!(chat_request_body(&reqs).contains(AWAY_LINE));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn after_a_nap_she_says_she_was_asleep(pool: PgPool) {
+        let t = run_event_turn(
+            &pool,
+            &[],
+            &[ev("asleep", 70, -10)],
+            &[30],
+            Some(serde_json::json!({"action": "reply_text", "inner_state": ""})),
+            0,
+        )
+        .await;
+        let reqs = t.mock.received_requests().await.unwrap();
+        assert!(judge_request(&reqs)
+            .contains("[近期事件] 睡着了（不到 1 小时前结束，期间对方的消息你没有回）\\n"));
+        assert!(chat_request_body(&reqs).contains("- 刚才：睡着了，对方那时发来的消息你现在才看到"));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_false_alarm_is_resolved_where_she_told_it(pool: PgPool) {
+        let here = run_event_turn(
+            &pool,
+            &[],
+            &[ev_here("pregnancy_scare", 70, -10)],
+            &[],
+            Some(serde_json::json!({"action": "reply_text", "inner_state": ""})),
+            0,
+        )
+        .await;
+        let reqs = here.mock.received_requests().await.unwrap();
+        assert!(judge_request(&reqs).contains("验出怀孕（不到 1 小时前结束，结果是虚惊一场）"));
+        assert!(chat_request_body(&reqs).contains("- 刚才：验出两条杠，后来复查是虚惊一场"));
+
+        let elsewhere = run_event_turn(
+            &pool,
+            &[],
+            &[ev("pregnancy_scare", 70, -10)],
+            &[],
+            Some(serde_json::json!({"action": "reply_text", "inner_state": ""})),
+            0,
+        )
+        .await;
+        let reqs = elsewhere.mock.received_requests().await.unwrap();
+        assert!(!judge_request(&reqs).contains("虚惊一场"));
+        assert!(!chat_request_body(&reqs).contains("- 刚才："));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn while_the_scare_lasts_nothing_says_it_is_false(pool: PgPool) {
+        let t = run_event_turn(
+            &pool,
+            &[],
+            &[ev_here("period_scare", 10, 50)],
+            &[],
+            Some(serde_json::json!({"action": "reply_text", "inner_state": ""})),
+            0,
+        )
+        .await;
+        let reqs = t.mock.received_requests().await.unwrap();
+        assert!(chat_request_body(&reqs).contains("- 正在经历：月经没来（"));
+        assert!(!judge_request(&reqs).contains("虚惊"));
+        assert!(!chat_request_body(&reqs).contains("虚惊"));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

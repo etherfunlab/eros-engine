@@ -1287,6 +1287,45 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_opener_after_a_false_alarm_resolves_it(pool: PgPool) {
+        use eros_engine_core::events::EventKind;
+        let user_id = Uuid::new_v4();
+        let now = Utc::now();
+        let session_id =
+            session_with_history(&pool, user_id, now - chrono::Duration::days(2)).await;
+        seed_event(
+            &pool,
+            session_id,
+            EventKind::PeriodScare,
+            now - chrono::Duration::minutes(70),
+            now - chrono::Duration::minutes(10),
+        )
+        .await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "虚惊一场，来了").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        open_at(
+            &state,
+            session_id,
+            user_id,
+            opener(OpenOccasion::JustOpened, "visit-1"),
+            now,
+        )
+        .await
+        .unwrap()
+        .greeting
+        .expect("an opener");
+        let calls = companion_calls(&mock).await;
+        assert!(
+            calls[0]
+                .to_string()
+                .contains("- 刚才：以为月经没来，后来来了，是虚惊一场"),
+            "{}",
+            calls[0]
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn returning_within_a_day_says_less_than_a_day(pool: PgPool) {
         let user_id = Uuid::new_v4();
         let now = Utc::now();
