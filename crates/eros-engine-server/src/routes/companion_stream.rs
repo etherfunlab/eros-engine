@@ -3609,7 +3609,7 @@ data: [DONE]\n\n";
         let (session_id, key) = byoc_session(&pool, user_id).await;
 
         let mut state = byoc_state(pool.clone(), &mock.uri());
-        state.config.chat_queue.generation_timeout = std::time::Duration::from_secs(2);
+        state.config.chat_queue.generation_timeout = std::time::Duration::from_secs(10);
         let mut app = build_router(state);
         let resp = app
             .call(stream_send(

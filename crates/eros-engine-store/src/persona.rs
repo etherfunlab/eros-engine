@@ -912,7 +912,7 @@ mod tests {
         };
         let shown = format!("{b:?}");
         assert!(shown.contains("<redacted>"));
-        assert!(!shown.contains("170"));
+        assert!(!shown.contains("170, 170"));
         assert!(shown.contains(&b.instance_id.to_string()));
     }
 

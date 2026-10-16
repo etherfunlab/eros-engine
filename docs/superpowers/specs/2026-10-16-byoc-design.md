@@ -45,8 +45,8 @@ same character".
    back from storage to drive generation or judgement: no table or queue row
    that any request, worker or sweeper reads back holds card content, so the
    card exists only in the memory of the request that carries it. Audit
-   tables and logs are backups the engine never reads back; they are outside
-   this rule (§8).
+   tables and logs are backups the engine never reads back to drive
+   generation; they are outside this rule (§8).
 3. **The key is the card's only identity.** The engine never compares a
    request's card with an earlier one. Whatever decrypts under the instance's
    key is that instance's character for that request. Changing the card
@@ -132,7 +132,8 @@ feature, as `BYOK_CALLER_SECRET` gates BYOK:
   same value, compared in constant time; missing or different → 403
   `byoc_forbidden`.
 - A value shorter than 32 bytes refuses boot.
-- Admission runs before every other check.
+- Admission runs before every check of the request's fields. A missing
+  bearer token, or a body that fails to deserialize, is rejected first.
 
 The engine authenticates end users by their own bearer token, so an end user
 could otherwise call the engine directly with a card the downstream never saw.
@@ -156,9 +157,9 @@ engine draws 32 random bytes and answers:
 ```
 
 `ticket` is `HMAC-SHA256(BYOC_CALLER_SECRET, "eros-byoc-init-v1" ‖ user_id ‖ key)`,
-with `user_id` the bearer's, entering the HMAC as its 16 raw bytes. Init writes nothing. It relies on TLS alone; the
-card encryption (§6) protects the cards sent after create, not the key's
-delivery.
+with `user_id` the bearer's, entering the HMAC as its 16 raw bytes. Init
+writes nothing. It relies on TLS alone; the card encryption (§6) protects the
+cards sent after create, not the key's delivery.
 
 ### 5.2 Create
 
@@ -216,7 +217,7 @@ and ownership is checked, and before the user row is persisted:
 | genome instance, `character` present | 400 `invalid_payload` |
 | `character` not base64url, shorter than 28 bytes decoded, or longer than 96 KiB | 400 `invalid_payload` |
 | authentication tag fails | 403 `byoc_card_rejected` |
-| plaintext not a valid eros-character v1 document | 400 `invalid_payload`, naming the field |
+| plaintext not a valid eros-character v1 document | 400 `invalid_payload`, saying which rule failed |
 
 No error response quotes the sealed string, the key, or any part of the
 card: a response travels the same path the card is encrypted against.
@@ -289,7 +290,8 @@ A client that never creates a BYOC instance never sees a null.
   quotes the card: reply text, memories, insights, PDE verdicts, affinity.
   That is engine output, not the card.
 - **Audit tables and logs record a BYOC request as they record any other.**
-  They are backups the engine never reads back, outside §2.2's rule:
+  They are backups the engine never reads back to drive generation, outside
+  §2.2's rule:
   - the prompt log (`PROMPT_LOG_DIR`) writes a BYOC turn's full entry, card
     included;
   - `engine.chat_images_events` keeps the final image prompt in
@@ -415,8 +417,9 @@ shipping and records the result in the release notes.
 - **"BYOC" is derived from `byoc_key`**, over a flag column or a queue-row
   marker.
 - **"No stored card" covers the call path only.** Audit tables and logs are
-  backups the engine never reads back, so BYOC records into them as any
-  request does: no branch in the image audit or the prompt log, and
+  backups the engine never reads back to drive generation, so BYOC records
+  into them as any request does: no branch in the image audit or the prompt
+  log, and
   `GET …/image-request` returns the prompt the turn streamed. The line is
   held where it matters: nothing that drives generation reads card content
   from storage.
