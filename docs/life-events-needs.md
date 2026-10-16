@@ -141,7 +141,7 @@ the levels and decides.
 
 ### Categories
 
-An event is one of 33 kinds. Each kind belongs to a category, and the category sets its
+An event is one of 38 kinds. Each kind belongs to a category, and the category sets its
 shape:
 
 | `category` | shape | lasts | category weight | category cooldown |
@@ -167,7 +167,7 @@ The draw is a pure function of the inputs plus three random numbers (one per sta
 the length).
 
 1. **Eligibility.** A kind is eligible when all of these hold:
-   - it is in the caller's `kinds` (absent means all 33; `[]` means none);
+   - the caller's `kinds` allows it ([below](#the-callers-kinds); absent means all 38);
    - it passes its gate (below);
    - its own cooldown has elapsed;
    - its category's cooldown has elapsed;
@@ -195,7 +195,8 @@ eligible kind drops out of the first stage and the others share its weight.
 - While a background is under way, no second background is drawn. Incidents still are, except
   that during `hospitalized` and `post_surgery` the ones that need her out and about are not:
   `temp_work`, `police_encounter`, `animal_encounter`, `hit_someone`, `got_hit`,
-  `working_out`, `grocery_shopping`, `in_class`, `on_the_way`, `in_battle`. During `period`,
+  `working_out`, `grocery_shopping`, `in_class`, `on_the_way`, `in_battle`, `got_bumped`,
+  `bumped_someone`. During `period`,
   `period_scare` and `pregnancy_scare` are not drawn.
 - One incident and one background can run together. An incident drawn inside a background is
   told from inside it.
@@ -256,14 +257,36 @@ category, `period` included, and `period`'s own 28-day cooldown keeps it near mo
 way. `prefer_trip` raises the odds of a trip, not its frequency: the weekly category cooldown
 holds.
 
-The caller's `kinds` allowlist is the other lever: it is how a persona's world rules a kind
-out without the engine losing it.
+### The caller's `kinds`
+
+The caller's `kinds` is the other lever: it is how a persona's world, or a deployment's
+policy, rules a kind out without the engine losing it.
+
+| `kinds` | kinds that may be drawn |
+|---|---|
+| absent or `null` | all 38 |
+| `[]` | none: the response is `{"event": null, "message": null}` |
+| `["reading", "quarrel"]` | the listed ones |
+| `{"allow": […], "disallow": […]}` | what `allow` allows, minus what `disallow` lists |
+
+In the object, `allow` absent or `null` allows every kind and `[]` none; `disallow` absent,
+`null` or `[]` removes nothing; a kind in both is not drawn. `{"disallow": […]}` alone rules
+kinds out without freezing the rest, so a kind the engine adds later is drawn too. An unknown
+key in the object or an unknown kind anywhere rejects the request, so a misspelt `disallow`
+cannot quietly serve a kind it meant to exclude; a caller lists a new kind only once the
+engine knows it.
+
+Two kinds carry adult themes: `sudden_desire`, and `pregnancy_scare`, which implies sex. The
+engine keeps no group of them; a caller that serves them only to some users lists them under
+`disallow`. `scolded_by_superior` and `scolded_superior` assume someone above her, read in her
+world as a boss, a manager, a master or a sovereign; a persona with no one above her is a
+case for `disallow` too.
 
 ### Asking for an event
 
 The caller decides when to ask and the engine decides whether and what. Nothing starts a draw
 on its own, and nothing is sent when an event ends. Each draw carries an `event_key` (scoped to
-the session, so a retry is safe), an optional `kinds` allowlist, and the locale, tier and scope
+the session, so a retry is safe), an optional `kinds` filter, and the locale, tier and scope
 fields a chat turn would carry, because the engine does not keep them between calls. The
 response is the event and the message that tells it, or both `null`. A group or voice session
 is refused with `409 wrong_channel`.
@@ -495,7 +518,7 @@ steers which kind comes up, never whether a category does. The factors, from
 | `stamina` is `low` | `unwell`, `sick`, `bathing`, `asleep` | ×2 |
 | `hunger` is `high` | `grocery_shopping` | ×2 |
 | `emotional` is `high` | `ex_message` | ×3 |
-| `emotional` is `high` | `animal_encounter`, `irritable` | ×2 |
+| `emotional` is `high` | `animal_encounter`, `irritable`, `quarrel` | ×2 |
 
 `social` weights nothing. The factors apply only when the deployment runs the judge and the
 persona has a rating, carried to the moment of the call; otherwise every factor is 1. A

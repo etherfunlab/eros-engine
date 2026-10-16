@@ -70,6 +70,11 @@ pub enum EventKind {
     OnTheWay,
     PeriodScare,
     PregnancyScare,
+    GotBumped,
+    BumpedSomeone,
+    Quarrel,
+    ScoldedBySuperior,
+    ScoldedSuperior,
     TempWork,
     ExMessage,
     WeatherChange,
@@ -96,7 +101,7 @@ pub enum EventKind {
 
 impl EventKind {
     /// Every kind, in draw order.
-    pub const ALL: [EventKind; 33] = [
+    pub const ALL: [EventKind; 38] = [
         EventKind::PoliceEncounter,
         EventKind::AnimalEncounter,
         EventKind::HitSomeone,
@@ -108,6 +113,11 @@ impl EventKind {
         EventKind::OnTheWay,
         EventKind::PeriodScare,
         EventKind::PregnancyScare,
+        EventKind::GotBumped,
+        EventKind::BumpedSomeone,
+        EventKind::Quarrel,
+        EventKind::ScoldedBySuperior,
+        EventKind::ScoldedSuperior,
         EventKind::TempWork,
         EventKind::ExMessage,
         EventKind::WeatherChange,
@@ -146,6 +156,11 @@ impl EventKind {
             EventKind::OnTheWay => "on_the_way",
             EventKind::PeriodScare => "period_scare",
             EventKind::PregnancyScare => "pregnancy_scare",
+            EventKind::GotBumped => "got_bumped",
+            EventKind::BumpedSomeone => "bumped_someone",
+            EventKind::Quarrel => "quarrel",
+            EventKind::ScoldedBySuperior => "scolded_by_superior",
+            EventKind::ScoldedSuperior => "scolded_superior",
             EventKind::TempWork => "temp_work",
             EventKind::ExMessage => "ex_message",
             EventKind::WeatherChange => "weather_change",
@@ -179,7 +194,8 @@ impl EventKind {
         use EventKind::*;
         match self {
             PoliceEncounter | AnimalEncounter | HitSomeone | SuddenDesire | GroceryShopping
-            | Showering | Bathing | InClass | OnTheWay | PeriodScare | PregnancyScare => {
+            | Showering | Bathing | InClass | OnTheWay | PeriodScare | PregnancyScare
+            | GotBumped | BumpedSomeone | Quarrel | ScoldedBySuperior | ScoldedSuperior => {
                 EventCategory::Short
             }
             TempWork | ExMessage | WeatherChange | GotHit | Breakup | WorkingOut | Reading
@@ -240,6 +256,11 @@ fn rule(kind: EventKind) -> Rule {
         OnTheWay => (2.0, 12, Lasts::Minutes(30)),
         PeriodScare => (0.5, 28 * DAY, Lasts::Hours(1, 1)),
         PregnancyScare => (0.5, 60 * DAY, Lasts::Hours(1, 1)),
+        GotBumped => (1.0, 72, Lasts::Minutes(30)),
+        BumpedSomeone => (0.5, 7 * DAY, Lasts::Minutes(30)),
+        Quarrel => (1.0, 48, Lasts::Hours(1, 1)),
+        ScoldedBySuperior => (1.0, 72, Lasts::Hours(1, 1)),
+        ScoldedSuperior => (0.5, 14 * DAY, Lasts::Hours(1, 1)),
         TempWork => (3.0, 24, Lasts::Hours(4, 4)),
         ExMessage => (1.0, 72, Lasts::Hours(3, 3)),
         WeatherChange => (4.0, 8, Lasts::Hours(4, 4)),
@@ -338,7 +359,7 @@ fn needs_factor(kind: EventKind, needs: Option<&Needs>) -> f64 {
         Unwell | Sick | Bathing | Asleep if n.stamina == NeedLevel::Low => 2.0,
         GroceryShopping if n.hunger == NeedLevel::High => 2.0,
         ExMessage if n.emotional == NeedLevel::High => 3.0,
-        AnimalEncounter | Irritable if n.emotional == NeedLevel::High => 2.0,
+        AnimalEncounter | Irritable | Quarrel if n.emotional == NeedLevel::High => 2.0,
         _ => 1.0,
     }
 }
@@ -367,7 +388,8 @@ fn preference_factor(kind: EventKind, persona: &PersonaTraits) -> f64 {
 
 /// Whether a background rules a foreground kind out (spec
 /// 2026-10-15-life-events-v2-design.md §3.3; spec 2026-10-16-life-events-
-/// offline-and-scares-design.md §3.2): in hospital or recovering from surgery,
+/// offline-and-scares-design.md §3.2; spec 2026-10-17-life-events-run-ins-and-
+/// kind-filters-design.md §2.2): in hospital or recovering from surgery,
 /// she is not out and about; during her period, a late-period or pregnancy
 /// scare cannot happen.
 fn rules_out(background: EventKind, kind: EventKind) -> bool {
@@ -385,6 +407,8 @@ fn rules_out(background: EventKind, kind: EventKind) -> bool {
                 | InClass
                 | OnTheWay
                 | InBattle
+                | GotBumped
+                | BumpedSomeone
         ),
         Period => kind.is_false_alarm(),
         _ => false,
@@ -680,6 +704,8 @@ mod tests {
             GroceryShopping,
             InClass,
             OnTheWay,
+            GotBumped,
+            BumpedSomeone,
         ];
         for bg in [Hospitalized, PostSurgery] {
             let h = [past(bg, 1, 72)];
@@ -688,7 +714,13 @@ mod tests {
         }
         for bg in [Hospitalized, PostSurgery] {
             let h = [past(bg, 1, 72)];
-            for k in [Showering, Bathing] {
+            for k in [
+                Showering,
+                Bathing,
+                Quarrel,
+                ScoldedBySuperior,
+                ScoldedSuperior,
+            ] {
                 assert_eq!(pick(&h, &[k], rolls(0.0, 0.0)), Some(k), "{bg:?} {k:?}");
             }
         }
@@ -1068,7 +1100,7 @@ mod tests {
         let count = |c| EventKind::ALL.iter().filter(|k| k.category() == c).count();
         assert_eq!(
             EventCategory::ALL.map(count),
-            [11, 14, 4, 4],
+            [16, 14, 4, 4],
             "short, mid, body, trip"
         );
         assert!(!EventCategory::Short.is_background());
@@ -1095,9 +1127,20 @@ mod tests {
         assert_eq!(Health::default(), Health::Normal);
     }
 
-    /// The scare, busy, battle and sleep kinds; tests pinned to the weights of
-    /// the 28 kinds before them draw from `earlier()`.
-    const ADDED: [EventKind; 5] = [PeriodScare, PregnancyScare, Busy, InBattle, Asleep];
+    /// The kinds added after the 28 v2 kinds; tests pinned to the weights of
+    /// those 28 draw from `earlier()`.
+    const ADDED: [EventKind; 10] = [
+        PeriodScare,
+        PregnancyScare,
+        Busy,
+        InBattle,
+        Asleep,
+        GotBumped,
+        BumpedSomeone,
+        Quarrel,
+        ScoldedBySuperior,
+        ScoldedSuperior,
+    ];
 
     fn earlier() -> Vec<EventKind> {
         EventKind::ALL
@@ -1220,6 +1263,15 @@ mod tests {
         assert!(!is_told(AwayFromPhone, 3));
         assert!(is_told(Reading, 1));
         assert!(is_told(PeriodScare, 2));
+        for k in [
+            GotBumped,
+            BumpedSomeone,
+            Quarrel,
+            ScoldedBySuperior,
+            ScoldedSuperior,
+        ] {
+            assert!(is_told(k, 0), "{k:?}");
+        }
     }
 
     #[test]
@@ -1251,5 +1303,43 @@ mod tests {
         assert_eq!(lasts(InBattle, 1.0), Duration::hours(4));
         assert_eq!(lasts(Asleep, 0.0), Duration::hours(1));
         assert_eq!(lasts(Asleep, 1.0), Duration::hours(4));
+        for (k, want) in [
+            (GotBumped, Duration::minutes(30)),
+            (BumpedSomeone, Duration::minutes(30)),
+            (Quarrel, Duration::hours(1)),
+            (ScoldedBySuperior, Duration::hours(1)),
+            (ScoldedSuperior, Duration::hours(1)),
+        ] {
+            assert_eq!(lasts(k, 0.0), want, "{k:?}");
+            assert_eq!(lasts(k, 1.0), want, "{k:?}");
+        }
+    }
+
+    #[test]
+    fn the_run_ins_have_no_gate() {
+        let none = PersonaTraits::default();
+        for k in [
+            GotBumped,
+            BumpedSomeone,
+            Quarrel,
+            ScoldedBySuperior,
+            ScoldedSuperior,
+        ] {
+            assert_eq!(
+                pick_with(&none, None, 0, &[], &[k], rolls(0.0, 0.0)),
+                Some(k),
+                "{k:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_quarrel_weighs_double_when_she_needs_to_be_cared_for() {
+        // police 1 : quarrel 1 — 0.4 × 2 = 0.8 lands on police; with
+        // emotional high, quarrel weighs 2: 0.4 × 3 = 1.2 lands on quarrel.
+        let r = rolls(0.0, 0.4);
+        let at = |n| pick_with(&female(), n, 3, &[], &[PoliceEncounter, Quarrel], r);
+        assert_eq!(at(None), Some(PoliceEncounter));
+        assert_eq!(at(needs(NeedLevel::Mid, NeedLevel::High)), Some(Quarrel));
     }
 }

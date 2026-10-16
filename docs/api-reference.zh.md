@@ -754,7 +754,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | 字段 | 规则 |
 |---|---|
 | `event_key` | 必填：1–128 个 `[A-Za-z0-9_.:-]` 字符，只在本会话内有效。同一个 key 返回同一个事件 |
-| `kinds` | 选填，允许抽取的种类。不带：全部种类；`[]`：什么都不抽 |
+| `kinds` | 选填。不带或 `null`：全部种类。数组：只抽列出的种类（`[]`：什么都不抽）。对象 `{"allow": […], "disallow": […]}`：`allow` 允许的种类（不带或 `null`：全部；`[]`：一种都没有）去掉 `disallow` 列出的种类；两边都列了的种类不抽，`{}` 等于全部种类。对象里出现未知的键，或出现未知种类，返回 `422` |
 | `user_timezone`、`user_country`、`user_region`、`tier`、`prompt_traits`、`memory_scope`、`affinity_scope`、`audit` | 与 `/open` 相同，用于生成这条消息 |
 
 种类分四个类别（`category`）。`short` 与 `mid` 是插曲；`body` 与 `trip` 是持续数天的背景，背景进行期间插曲照样会发生。
@@ -772,6 +772,11 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | `short` | `on_the_way` | 30 分钟 | 赶路中 |
 | `short` | `period_scare` | 1 小时 | 月经没来——虚惊一场 |
 | `short` | `pregnancy_scare` | 1 小时 | 验出怀孕——虚惊一场 |
+| `short` | `got_bumped` | 30 分钟 | 走路时被人或车擦撞到 |
+| `short` | `bumped_someone` | 30 分钟 | 不小心撞到人：走路时，或驾着她的交通工具——车、马、飞行，由她的世界决定 |
+| `short` | `quarrel` | 1 小时 | 跟人吵架了 |
+| `short` | `scolded_by_superior` | 1 小时 | 被上级骂了——老板、上司、领导、主人或君主，由她的世界决定 |
+| `short` | `scolded_superior` | 1 小时 | 骂了上级 |
 | `mid` | `temp_work` | 4 小时 | 临时接到工作 |
 | `mid` | `ex_message` | 3 小时 | 前任发来消息 |
 | `mid` | `weather_change` | 4 小时 | 天气突然变了 |
@@ -797,12 +802,17 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 
 时长写成区间的，在事件开始时从区间里抽定。
 
+`sudden_desire` 与 `pregnancy_scare`（后者隐含性行为）带成人题材；只对部分用户提供这类内容的调用方，用
+`{"disallow": ["sudden_desire", "pregnancy_scare"]}` 把它们排除。`scolded_by_superior` 与 `scolded_superior`
+假定她有上级；角色没有上级时，由调用方排除。`disallow` 列表之外的种类都照常抽取，engine 以后新增的种类也一样。
+
 抽取规则：
 
 - **两段抽取。** engine 先按权重抽类别，再在类别内按权重抽种类。往一个类别里加种类，不会改变其他类别的占比。
 - **一次一件插曲，一个背景。** 角色的任何一个 session 里有插曲在进行时，不再抽取。背景进行期间只抽插曲；
-  住院和术后期间，不抽需要她出门活动的那十种（`temp_work`、`police_encounter`、`animal_encounter`、
-  `hit_someone`、`got_hit`、`working_out`、`grocery_shopping`、`in_class`、`on_the_way`、`in_battle`）；
+  住院和术后期间，不抽需要她出门活动的那十二种（`temp_work`、`police_encounter`、`animal_encounter`、
+  `hit_someone`、`got_hit`、`working_out`、`grocery_shopping`、`in_class`、`on_the_way`、`in_battle`、
+  `got_bumped`、`bumped_someone`）；
   `period` 期间，`period_scare` 与 `pregnancy_scare` 都不抽。
 - **冷却。** 每种事件从开始起有各自的冷却。trip 类每周最多开始一次，body 类每两周最多开始一次，不论具体是哪一种。
   任何离线类种类每 12 小时最多开始一次，不论具体是哪一种。

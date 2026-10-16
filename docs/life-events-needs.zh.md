@@ -118,7 +118,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 
 ### 类别
 
-事件共 33 种，每一种属于一个类别，类别决定它的形态：
+事件共 38 种，每一种属于一个类别，类别决定它的形态：
 
 | `category` | 形态 | 持续 | 类别权重 | 类别冷却 |
 |---|---|---|---|---|
@@ -139,7 +139,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 抽取是输入加三个随机数（两段各一个，时长一个）的纯函数。
 
 1. **资格。**一个种类同时满足下面几条才有资格：
-   - 在调用方的 `kinds` 里（不带表示全部 33 种，`[]` 表示一种都不要）；
+   - 调用方的 `kinds` 允许它（[见下](#调用方的-kinds)；不带表示全部 38 种）；
    - 过了它的门槛（见下）；
    - 它自己的冷却已过；
    - 它所属类别的冷却已过；
@@ -161,7 +161,8 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 - 有插曲在进行时，完全不抽，连背景也不抽。
 - 有背景在进行时，不会抽第二个背景，插曲照抽；只是住院（`hospitalized`）和术后（`post_surgery`）期间，
   需要她出门活动的那几种不抽：`temp_work`、`police_encounter`、`animal_encounter`、`hit_someone`、
-  `got_hit`、`working_out`、`grocery_shopping`、`in_class`、`on_the_way`、`in_battle`。`period` 期间，
+  `got_hit`、`working_out`、`grocery_shopping`、`in_class`、`on_the_way`、`in_battle`、`got_bumped`、
+  `bumped_someone`。`period` 期间，
   不抽 `period_scare` 与 `pregnancy_scare`。
 - 一件插曲和一个背景可以同时进行。背景里抽到的插曲，是从背景里讲出来的。
 - 这以角色实例为单位，跨它所有的 session：她只有一段人生。抽取会读该实例最近 90 天的事件，也就是最长的那个冷却。
@@ -210,12 +211,30 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 `health` 缩放整个 `body` 类别，`period` 也在内，`period` 自己 28 天的冷却让它不管怎样都大约每月一次。
 `prefer_trip` 提高的是出行的概率，不是频率：每周一次的类别冷却对它同样适用。
 
-调用方的 `kinds` 白名单是另一个手段：角色的世界观用它排除某些种类，engine 里并不丢掉这些种类。
+### 调用方的 `kinds`
+
+调用方的 `kinds` 是另一个手段：角色的世界观或部署方的策略用它排除某些种类，engine 里并不丢掉这些种类。
+
+| `kinds` | 可以抽的种类 |
+|---|---|
+| 不带或 `null` | 全部 38 种 |
+| `[]` | 一种都不抽：响应是 `{"event": null, "message": null}` |
+| `["reading", "quarrel"]` | 只抽列出的 |
+| `{"allow": […], "disallow": […]}` | `allow` 允许的，去掉 `disallow` 列出的 |
+
+对象里，`allow` 不带或为 `null` 表示全部允许，`[]` 表示一种都不允许；`disallow` 不带、为 `null` 或 `[]` 都不去掉任何种类；
+两边都列了的种类不抽。只写 `{"disallow": […]}` 就能排除种类而不冻结其余种类，engine 以后新增的种类也会照常抽取。
+对象里出现未知的键，或任何地方出现未知种类，请求都会被拒绝，所以拼错的 `disallow` 不会悄悄放出本想排除的种类；
+代价是调用方要等 engine 认识某个新种类之后才能列它。
+
+有两种带成人题材：`sudden_desire`，以及隐含性行为的 `pregnancy_scare`。engine 不内建这类分组；只对部分用户提供这类内容的调用方，
+把它们列进 `disallow`。`scolded_by_superior` 与 `scolded_superior` 假定她有上级，在她的世界里读作老板、上司、领导、主人或君主；
+没有上级的角色同样交给 `disallow` 排除。
 
 ### 发起一次抽取
 
 什么时候要由调用方决定，发不发生、发生什么由 engine 决定。没有任何东西会自己发起抽取，事件结束时也不会发出任何东西。
-每次抽取带一个 `event_key`（只在本会话内有效，所以重试是安全的）、可选的 `kinds` 白名单，以及聊天回合会带的
+每次抽取带一个 `event_key`（只在本会话内有效，所以重试是安全的）、可选的 `kinds` 过滤，以及聊天回合会带的
 语言、tier 和 scope 字段，因为 engine 不会在两次调用之间保存它们。响应是事件加上讲述它的那条消息，或者两者都是 `null`。
 群聊或语音 session 会被拒绝，返回 `409 wrong_channel`。
 
@@ -398,7 +417,7 @@ ghosting 开关关闭时，已经在进行的一段不会让任何轮次沉默�
 | `stamina` 为 `low` | `unwell`、`sick`、`bathing`、`asleep` | ×2 |
 | `hunger` 为 `high` | `grocery_shopping` | ×2 |
 | `emotional` 为 `high` | `ex_message` | ×3 |
-| `emotional` 为 `high` | `animal_encounter`、`irritable` | ×2 |
+| `emotional` 为 `high` | `animal_encounter`、`irritable`、`quarrel` | ×2 |
 
 `social` 不给任何种类加权。只有部署配置了判官、并且角色有一次评定时，系数才生效（评定推到调用时刻）；否则所有系数都是 1。
 系数不是门槛：权重 ×3 的种类仍然要先有资格。
