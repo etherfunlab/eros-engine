@@ -19,7 +19,7 @@ use crate::error::AppError;
 use crate::routes::companion_stream::StreamPreErrorBody;
 use crate::state::AppState;
 
-#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct ByocInitResponse {
     /// 32 random bytes, base64url. Keep it: it opens every card sent for
     /// the instance, and the engine never shows it again.
@@ -29,7 +29,7 @@ pub struct ByocInitResponse {
     pub ticket: String,
 }
 
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ByocCreateRequest {
     /// The `key` from init (base64url, padding optional).

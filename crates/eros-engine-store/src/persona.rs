@@ -100,12 +100,24 @@ const INSTANCE_ITEMS_SQL: &str = "COALESCE(( \
 
 /// What a BYOC turn needs from the database: the instance, its owner, the key
 /// that opens the card, and the instance's own item rows.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ByocInstance {
     pub instance_id: Uuid,
     pub owner_uid: Uuid,
     pub key: Vec<u8>,
     pub items: Vec<PersonaItem>,
+}
+
+impl std::fmt::Debug for ByocInstance {
+    /// The key never reaches a log line.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ByocInstance")
+            .field("instance_id", &self.instance_id)
+            .field("owner_uid", &self.owner_uid)
+            .field("key", &"<redacted>")
+            .field("items", &self.items)
+            .finish()
+    }
 }
 
 /// One row of `engine.persona_instance_items`.
@@ -888,6 +900,20 @@ mod tests {
             .await
             .unwrap();
         assert!(repo.load_byoc_instance(id).await.unwrap().is_none());
+    }
+
+    #[test]
+    fn byoc_instance_debug_hides_the_key() {
+        let b = ByocInstance {
+            instance_id: Uuid::new_v4(),
+            owner_uid: Uuid::new_v4(),
+            key: vec![170u8; 32],
+            items: vec![],
+        };
+        let shown = format!("{b:?}");
+        assert!(shown.contains("<redacted>"));
+        assert!(!shown.contains("170"));
+        assert!(shown.contains(&b.instance_id.to_string()));
     }
 
     #[sqlx::test(migrations = "./migrations")]
