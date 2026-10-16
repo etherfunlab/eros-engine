@@ -76,7 +76,7 @@ spawn post_process     tokio::spawn——跟返回響應並行：
 
 **Ghost streak 重置** 由編排器在 spawn post-process 之前處理：Reply 動作會在一個冪等 UPDATE 裡把 streak 清零；Ghost 動作則調 `AffinityRepo::record_ghost`。倉儲方法 `persist_with_event` 自身永遠不碰 streak。
 
-**没看手机。** 角色的 `away_from_phone` 生活事件进行期间，不带用户动作、也不带 `image.force` 的文字轮在 PDE 之前就被 ghost：该行被标记为已 ghost，发出 ghost 帧，判官和 `record_ghost` 都不运行。见 [ghost-mechanics.zh.md](ghost-mechanics.zh.md#engine-强制的-ghost)。
+**离线。** 角色的离线类生活事件（`away_from_phone`、`busy`、`in_battle`、`asleep`）进行期间，不带用户动作、也不带 `image.force` 的文字轮在 PDE 之前就被 ghost：该行被标记为已 ghost，发出 ghost 帧，判官和 `record_ghost` 都不运行。见 [ghost-mechanics.zh.md](ghost-mechanics.zh.md#engine-强制的-ghost)。
 
 **PDE 动作列表。** 判断器（或规则引擎）每轮给出的 action 是以下之一：
 `reply_text` | `ghost` | `reply_image` | `reply_text_image` | `product_qa`。
@@ -183,7 +183,7 @@ crates/
 │   └── src/
 │       ├── pool.rs           # PgPoolOptions 構造
 │       ├── chat.rs           # ChatRepo
-│       ├── events.rs         # EventRepo（persona_events：进行中的事件、历史、没看手机）
+│       ├── events.rs         # EventRepo（persona_events：进行中的事件、历史、离线时段、虚惊）
 │       ├── group.rs          # GroupRepo（群聊会话、成员关系）
 │       ├── affinity.rs       # AffinityRepo（persist_with_event、record_ghost）
 │       ├── memory.rs         # MemoryRepo（Profile / Relationship 兩層）
@@ -209,7 +209,7 @@ crates/
 - [好感度模型](affinity-model.zh.md)——6 個維度、档位写入管线、時間衰退、關係標籤
 - [Ghost 機制](ghost-mechanics.zh.md)——評分公式 + 保護規則 + 實例計算
 - [群聊](group-chat.zh.md)——一位用户加至多三位角色、导演、发言者接力
-- [生活事件与需求](life-events-needs.zh.md)——角色的需求及其漂移、事件抽取、背景事件、没看手机
+- [生活事件与需求](life-events-needs.zh.md)——角色的需求及其漂移、事件抽取、背景事件、离线类、虚惊
 - [記憶層](memory-layers.zh.md)——profile vs relationship、Voyage、pgvector 檢索
 - [部署](deploying.zh.md)——Docker、自带 Postgres / IdP
 - [API 參考](api-reference.zh.md)——每個 `/comp/*` 端點

@@ -208,7 +208,7 @@ unexplained away event (the stream, `greet`) loads both.
 
 | change | file |
 |---|---|
-| kinds, rules, gates, exclusions, needs factor, offline cooldown, `is_offline`, `is_told` | `core/src/events.rs` |
+| kinds, rules, gates, exclusions, needs factor, offline cooldown, `is_offline`, `is_false_alarm`, `is_told` | `core/src/events.rs` |
 | `unexplained_offline`, `unresolved_scare` | `store/src/events.rs` |
 | offline gates, told vs silent | `server/src/routes/session_events.rs` |
 | cues | `server/src/pipeline/proactive.rs` |
