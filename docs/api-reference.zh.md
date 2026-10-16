@@ -1798,7 +1798,7 @@ curl -H "x-insights-export-secret: $INSIGHTS_EXPORT_SECRET" \
 
 `metadata` 原样是抽取写下的内容，没写时为 `null`。行按 `(created_at, id)` 排序，分页与画像导出相同：页满时才有 `next`；把它的两个字段原样传回 `since` 与 `after_id`，保留微秒精度，直到 `next` 为 `null`。
 
-**下一次轮询从哪里开始。** 记住最后一行的 `(created_at, id)`；每次新轮询从它往前几秒开始，`since = last.created_at − 5s`，不传 `after_id`。`created_at` 在插入时打上，行要到提交才可见，重叠窗口会把晚提交的行捡回来。重复回来的行无害：行写入后不再变，按 `id` 去重即可。
+**下一次轮询从哪里开始。** 记住最后一行的 `(created_at, id)`；每次新轮询从它往前几秒开始，`since = last.created_at − 5s`，不传 `after_id`。`created_at` 是插入事务开始的时刻，行要到提交才可见；engine 的插入事务都很短，重叠窗口足以覆盖这段间隔。重复回来的行无害：行写入后不再变，按 `id` 去重即可。
 
 **不导出删除。** 行只会随它的 session 一起消失（硬删除级联），导出不会报告这件事。
 

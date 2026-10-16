@@ -2148,7 +2148,7 @@ curl -H "x-insights-export-secret: $INSIGHTS_EXPORT_SECRET" \
 
 `metadata` is what the extraction wrote, verbatim, or `null` when it wrote none. Rows are ordered by `(created_at, id)`, and paging works as on the insights export: `next` is present iff the page is full; pass both of its fields back verbatim as `since` and `after_id`, at full microsecond precision, until `next` is `null`.
 
-**Resuming the next poll.** Keep the last row's `(created_at, id)`; start each new poll a few seconds before it, `since = last.created_at − 5s` with no `after_id`. `created_at` is stamped at insert and the row is visible only at commit, so the overlap picks up a late commit. Re-returned rows are harmless: a row never changes, so deduplicate by `id`.
+**Resuming the next poll.** Keep the last row's `(created_at, id)`; start each new poll a few seconds before it, `since = last.created_at − 5s` with no `after_id`. `created_at` is the inserting transaction's start time and the row is visible only at its commit; the engine's insert transactions are short, so the overlap covers that gap. Re-returned rows are harmless: a row never changes, so deduplicate by `id`.
 
 **No deletions.** A row goes away only with its session (a hard delete cascades), and the export does not report it.
 
