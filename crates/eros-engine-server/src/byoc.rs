@@ -427,7 +427,7 @@ mod tests {
 
     #[test]
     fn padded_base64url_is_accepted() {
-        // Review Focus 2
+        // A padding encoder's output still opens.
         let key = [7u8; 32];
         let mut sealed = seal(&key, &card_json("A", "p", serde_json::json!({})));
         while !sealed.len().is_multiple_of(4) {
@@ -439,7 +439,7 @@ mod tests {
 
     #[test]
     fn plaintext_limit_is_64_kib() {
-        // Review Focus 5
+        // Exactly 64 KiB of plaintext is accepted; one byte more is refused.
         let key = [7u8; 32];
         let base = card_json("A", "", serde_json::json!({})).len();
         let at = card_json("A", &"x".repeat(65_536 - base), serde_json::json!({}));
@@ -462,6 +462,7 @@ mod tests {
                 .art_metadata,
             serde_json::json!({})
         );
+        // `art_metadata: null` reads as `{}`.
         assert_eq!(
             ok(d(
                 serde_json::json!({"name":"A","system_prompt":"p","art_metadata":null})
@@ -469,7 +470,7 @@ mod tests {
             .unwrap()
             .art_metadata,
             serde_json::json!({})
-        ); // Review Focus 1
+        );
         assert!(ok(
             serde_json::json!({"spec":"chara_card_v2","spec_version":"1","data":{"name":"A","system_prompt":"p"}})
         )

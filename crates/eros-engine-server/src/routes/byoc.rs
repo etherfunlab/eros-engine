@@ -338,7 +338,7 @@ mod tests {
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn byoc_recreate_after_archive_reactivates(pool: PgPool) {
-        // Review Focus 3
+        // Re-creating an archived instance reactivates it under the same id.
         let state = byoc_state(&pool);
         let user = Uuid::new_v4();
         let issued = issued(&state, user).await;
@@ -425,7 +425,7 @@ mod tests {
         );
         assert_eq!(count_instances(&pool).await, 0);
 
-        // Review Focus 2: a padding encoder's output is the same key and ticket.
+        // A padding encoder's output is the same key and ticket.
         let pad = |s: &str| {
             let mut s = s.to_owned();
             while !s.len().is_multiple_of(4) {
