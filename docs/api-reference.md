@@ -985,8 +985,8 @@ any session of the persona ghosts, without the judge and without counting
 towards the ghost streak, and `/open` returns `null`. A turn that carries a
 user `action` (any `type`: `give`, `gift`, `tip`, `kiss`, `hug`, `touch`,
 `lick`, `custom`) or `image.force = true` is the exception: it takes the normal
-path and is answered, because an action is always answered and a forced image
-turn is always `reply_image`. The persona goes silent this way only where the
+path and is answered, because an action is interaction in person, which needs
+no phone, and a forced image turn is always `reply_image`. The persona goes silent this way only where the
 ghost protection allows it, so with the deployment's ghosting switch off
 (`ghosting = false`) `away_from_phone` is not drawn and one already under way no
 longer silences turns, and it is not drawn in a session with fewer than 10 user
