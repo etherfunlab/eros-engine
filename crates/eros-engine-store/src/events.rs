@@ -1011,7 +1011,7 @@ mod tests {
             .unwrap();
 
         let mut conn = pool.acquire().await.unwrap();
-        for m in migrator.iter().filter(|m| m.version >= 72) {
+        for m in migrator.iter().filter(|m| m.version == 72) {
             conn.apply(m).await.unwrap();
         }
         drop(conn);
@@ -1047,5 +1047,60 @@ mod tests {
         .await
         .unwrap();
         assert!(index);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn the_v1_event_metadata_and_its_index_are_dropped(pool: PgPool) {
+        use sqlx::migrate::Migrate;
+        let migrator = sqlx::migrate!("./migrations");
+        let mut conn = pool.acquire().await.unwrap();
+        conn.ensure_migrations_table().await.unwrap();
+        for m in migrator.iter().filter(|m| m.version < 72) {
+            conn.apply(m).await.unwrap();
+        }
+        drop(conn);
+        let (_, _, session) = instance_and_session(&pool).await;
+        let id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.chat_messages \
+               (session_id, role, content, assistant_action_type, metadata, sent_at) \
+             VALUES ($1, 'assistant', '下雨了', 'proactive', $2, '2026-10-01T10:00:00Z') \
+             RETURNING id",
+        )
+        .bind(session)
+        .bind(
+            json!({"proactive": "event", "locale": "zh", "event_key": "k1",
+            "event": {"kind": "weather_change", "ends_at": "2026-10-01T14:00:00Z"}}),
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        for m in migrator.iter().filter(|m| m.version >= 72) {
+            conn.apply(m).await.unwrap();
+        }
+        drop(conn);
+
+        let meta: serde_json::Value =
+            sqlx::query_scalar("SELECT metadata FROM engine.chat_messages WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(meta, json!({"proactive": "event", "locale": "zh"}));
+        let e = EventRepo { pool: &pool }
+            .by_key(session, "k1")
+            .await
+            .unwrap()
+            .expect("the event row stays");
+        assert_eq!((e.kind, e.message_id), (WeatherChange, Some(id)));
+        let index: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_indexes \
+              WHERE schemaname = 'engine' AND indexname = 'chat_messages_event_key_uidx')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!index);
     }
 }
