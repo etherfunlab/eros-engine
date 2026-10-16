@@ -96,6 +96,7 @@ pub struct StartChatResponse {
     pub session_id: Uuid,
     pub instance_id: Uuid,
     /// Null for a BYOC instance, whose name only its card holds.
+    #[schema(required = true)]
     pub persona_name: Option<String>,
     pub is_new: bool,
 }

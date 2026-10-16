@@ -450,7 +450,8 @@ pub struct StreamSendRequest {
     #[serde(default)]
     pub byok: Option<crate::byok::ByokRequest>,
     /// Sealed eros-character v1 card (docs/byoc.md). Required on a BYOC
-    /// instance; refused on any other.
+    /// instance and refused on any other; honoured only with the deployment's
+    /// `X-Byoc-Caller-Secret` header. The async route refuses it.
     #[serde(default)]
     pub character: Option<String>,
 }

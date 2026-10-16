@@ -3297,6 +3297,7 @@
         "type": "object",
         "required": [
           "session_id",
+          "genome_id",
           "instance_id",
           "affinity"
         ],
@@ -3549,6 +3550,7 @@
         "required": [
           "session_id",
           "instance_id",
+          "persona_name",
           "is_new",
           "history"
         ],
@@ -5965,6 +5967,7 @@
         "required": [
           "session_id",
           "instance_id",
+          "persona_name",
           "is_new"
         ],
         "properties": {
@@ -6068,7 +6071,7 @@
               "string",
               "null"
             ],
-            "description": "Sealed eros-character v1 card (docs/byoc.md). Required on a BYOC\ninstance; refused on any other."
+            "description": "Sealed eros-character v1 card (docs/byoc.md). Required on a BYOC\ninstance and refused on any other; honoured only with the deployment's\n`X-Byoc-Caller-Secret` header. The async route refuses it."
           },
           "client_msg_id": {
             "type": "string"

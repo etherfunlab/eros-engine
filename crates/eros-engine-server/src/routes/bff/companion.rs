@@ -148,6 +148,7 @@ pub struct BffStartResponse {
     pub session_id: Uuid,
     pub instance_id: Uuid,
     /// Null for a BYOC instance, whose name only its card holds.
+    #[schema(required = true)]
     pub persona_name: Option<String>,
     pub is_new: bool,
     /// Most-recent N messages, oldest-first. Empty for brand-new sessions.

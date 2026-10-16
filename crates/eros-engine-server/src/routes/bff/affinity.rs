@@ -251,6 +251,7 @@ pub struct BffAffinityListItem {
     /// Companion this relationship is with. A client list keyed by companion
     /// joins on this without a second round trip to resolve the session.
     /// Null for a BYOC relationship; key such an item on `instance_id`.
+    #[schema(required = true)]
     pub genome_id: Option<Uuid>,
     /// The persona instance this relationship is with. Always set, so a client
     /// can key a relationship of either kind without a second round trip.
