@@ -20,7 +20,7 @@ about how the pieces work and how they fit together.
 |---|---|---|
 | What it is | four levels: `hunger`, `social`, `stamina`, `emotional`, each `low` / `mid` / `high` | things that happen in her day, in four categories |
 | Written by | the PDE judge, on a judged text turn | a caller's `POST /v2/comp/session/{session_id}/events`; the engine picks the kind |
-| Stored in | `metadata.needs` of the rated user row | `engine.persona_events`, plus the message that tells it |
+| Stored in | `metadata.needs` of the rated user row | `engine.persona_events`, plus the message that tells it (none for `away_from_phone`) |
 | Scope | one state per persona instance, across all its sessions | the same |
 | Time | drifts between ratings, computed on read | `started_at` and `ends_at`; cooldowns count from the start |
 | Needs the LLM judge | yes | no |
@@ -155,7 +155,8 @@ in the shower, not looking at her phone. A **background** is a state that lasts 
 an illness, her period) and incidents still happen inside it. The kinds, their durations and
 what each means are in
 [the events route](api-reference.md#post-v2compsessionsession_idevents). Per-kind weights,
-cooldowns and ranges are `const`s in `crates/eros-engine-core/src/events.rs`.
+cooldowns and ranges are in `rule`, and the category values in `category_rule`, in
+`crates/eros-engine-core/src/events.rs`.
 
 A duration written as a range is drawn uniformly in whole hours when the event starts.
 
@@ -281,7 +282,7 @@ world. Two cue variants:
 Then:
 
 - Output regex rules apply as on any reply. A blank reply, or one the rules strip to empty,
-  writes nothing and the response is `null`s. A failed generation returns the upstream error
+  writes nothing and the response's `event` and `message` are both `null`. A failed generation returns the upstream error
   and writes nothing.
 - The event row and the message are written in one transaction. The message's `sent_at` is
   the event's `started_at`, one instant taken after generation; `ends_at` is that instant plus
@@ -309,7 +310,7 @@ The events under way at a moment are the background and the incident whose
   A span under one hour reads `不到 1 小时` (and the end then drops the `约`); under 48 hours it
   is whole hours, rounded; from 48 hours it is whole days, rounded. `{label}` is a fixed
   Chinese name per kind (`reading` is `在看书`, `long_trip` is `长途旅游`). The line is absent
-  when nothing is under way.
+  when nothing is under way and no away stretch is unexplained (below).
 - **The reply** gets `- 正在经历：` in `[character_state]`, after `此刻的需要`, listing the same
   two events with only the end:
 
@@ -369,7 +370,7 @@ normal path and the `正在经历` line still lists it. The rest of the mechanic
 **Afterwards.** The explanation is derived, not flagged. In a session `S`, an away event `E`
 is unexplained at a moment when:
 
-- `E` is the instance's newest `away_from_phone` and has ended;
+- `E` is the instance's newest `away_from_phone` that has ended, within the last 90 days;
 - `S` holds a user row that was ghosted inside `E`'s window;
 - `S` holds no assistant row written since `E` ended.
 
@@ -451,7 +452,7 @@ again.
 | An event's message | generated and told as usual |
 | `正在经历` and `刚才` | reach replies, `/open` greetings and event messages |
 | `[近期事件]` | not rendered: there is no judge to read it |
-| `away_from_phone` | silences turns, since the check runs before the judge |
+| `away_from_phone` | silences turns as with the judge, since the check runs before it: the ghosting switch and the action and forced-image exemptions apply |
 
 ## Code pointers
 
