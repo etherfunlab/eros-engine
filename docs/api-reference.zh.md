@@ -1275,7 +1275,7 @@ create 对每个 key 幂等：用同一组 `key` 和 `ticket` 重复调用返回
 |---|---|---|
 | 403 | `byoc_forbidden` | 上面两个路由，或任何带有 `character` 的卡片路由请求：BYOC 关闭，或 caller secret 缺失或不对 |
 | 403 | `byoc_card_rejected` | `character` 无法在实例的 key 下打开 |
-| 400 | `invalid_payload` | 卡片路由：BYOC 实例缺 `character`、其他实例带了 `character`、格式错误、超出大小限制，或不是合法卡片，message 里写明字段名；async 路由：任何 `character` |
+| 400 | `invalid_payload` | 卡片路由：BYOC 实例缺 `character`、其他实例带了 `character`、格式错误、超出大小限制，或不是合法卡片，message 里说明哪条规则未通过；async 路由：任何 `character` |
 | 400 | `byoc_unsupported` | 该路由无法服务 BYOC 实例：async 发送、`/open`、语音轮次、生活事件、群聊 |
 
 BYOC 实例上的 stream 轮次如果被一次部署打断，会落为 `failed`，`chat_turn_queue.last_error = 'byoc_unavailable'`，并照常写入 `system_error` 行；卡片随进程一起消失了，部署也没有可以兜底的角色。

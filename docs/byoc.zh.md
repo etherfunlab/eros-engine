@@ -14,7 +14,7 @@
 |---|---|
 | `BYOC_CALLER_SECRET` | 开启 BYOC。至少 32 字节；更短的值会导致启动失败。未设置或为空 ⇒ BYOC 关闭：两个密钥路由，以及带有 `character` 的卡片路由请求，都返回 `403 byoc_forbidden`。 |
 
-引擎用终端用户自己的 bearer token 鉴权，因此终端用户可以直接调用引擎。密钥路由和任何带有 `character` 的请求，只有同时带有 `X-Byoc-Caller-Secret: <BYOC_CALLER_SECRET>` 时才会被采纳，比较以常数时间进行。请把这个 secret 留在下游的服务器上，由服务器添加该 header；绝不要发给客户端。在密钥路由上，以及在带有 `character` 的卡片路由请求上，准入检查先于其他一切检查，所以 secret 缺失或不对时，无论请求还有什么问题，都是 `403 byoc_forbidden`。
+引擎用终端用户自己的 bearer token 鉴权，因此终端用户可以直接调用引擎。密钥路由和任何带有 `character` 的请求，只有同时带有 `X-Byoc-Caller-Secret: <BYOC_CALLER_SECRET>` 时才会被采纳，比较以常数时间进行。请把这个 secret 留在下游的服务器上，由服务器添加该 header；绝不要发给客户端。在密钥路由上，以及在带有 `character` 的卡片路由请求上，准入检查先于对请求字段的任何检查，所以 secret 缺失或不对时，无论 body 的字段还有什么问题，都是 `403 byoc_forbidden`。缺少 bearer token，或 body 无法反序列化，会在准入之前就被拒绝。
 
 ## BYOC 覆盖的范围
 
@@ -38,12 +38,10 @@ World Memories、World Town 和 World Stories 从不包含 BYOC 实例。
 
 ### 客户端看到什么
 
-BYOC 实例没有 genome，所以有两个响应字段无话可说：
+BYOC 实例没有 genome，所以有两个响应字段没有值可填：
 
 - `POST /comp/chat/start` 和 `POST /bff/v1/comp/chat/start` 的 `persona_name` 为 `null`。名字在卡片里。
 - `GET /bff/v1/comp/affinities/{user_id}` 每个条目的 `genome_id` 为 `null`。每个条目都带有 `instance_id`，客户端可以用它为两种关系建键。
-
-这两个字段在 JSON 里始终存在。OpenAPI schema 把它们标为可选，是生成器处理可空字段的方式使然。从不创建 BYOC 实例的客户端永远不会看到 `null`。
 
 ## 创建实例
 
@@ -73,7 +71,7 @@ curl -X POST -H "Authorization: Bearer $JWT" \
 { "instance_id": "8a1f0c2e-4b6d-4f8a-9c31-2d5e7f0a1b3c" }
 ```
 
-- ticket 是针对 bearer 所属用户计算的 `HMAC-SHA256(BYOC_CALLER_SECRET, "eros-byoc-init-v1" ‖ user_id ‖ key)`。create 会重新计算它，所以引擎没有签发给该用户的 key 无法创建实例：`403 byoc_forbidden`。
+- ticket 是针对 bearer 所属用户计算的 `HMAC-SHA256(BYOC_CALLER_SECRET, "eros-byoc-init-v1" ‖ user_id ‖ key)`，其中 `user_id` 以其 16 个原始字节进入 HMAC。create 会重新计算它，所以引擎没有签发给该用户的 key 无法创建实例：`403 byoc_forbidden`。
 - `key` 和 `ticket` 是不带 padding 的 base64url；输入时接受 padding。解码后不是 32 字节的一律 `400 invalid_payload`。
 - create 对每个 key 幂等。重发同一组 `key` 和 `ticket` 会返回同一个 `instance_id`，所以丢了响应的下游可以放心重发。重新 create 一个已归档的 BYOC 实例会把它重新激活并返回同一个 id，因此归档之后，已保存的 key 依然有效。
 - 一个用户可以持有任意多个 BYOC 实例。
@@ -129,11 +127,11 @@ curl -N -X POST \
 | `character` 不是 base64url、解码后不足 28 字节，或超过 96 KiB | `400 invalid_payload` |
 | 明文超过 64 KiB | `400 invalid_payload` |
 | 认证 tag 校验失败（key 不对，或字节被改动） | `403 byoc_card_rejected` |
-| 明文不是合法的卡片 | `400 invalid_payload`，指出字段名 |
+| 明文不是合法的卡片 | `400 invalid_payload`，说明哪条规则未通过 |
 
 ## 错误
 
-每个 BYOC 拒绝都带有带 code 的响应体 `{code, message, user_message}`，在任何路由上都一样。任何错误响应都不会引用封装字符串、key 或卡片的任何部分。
+每个 BYOC 拒绝都使用带 code 的响应体 `{code, message, user_message}`，在任何路由上都一样。任何错误响应都不会引用封装字符串、key 或卡片的任何部分。
 
 | 状态 | Code | 何时 |
 |---|---|---|
@@ -149,7 +147,7 @@ BYOC 实例上的 stream 轮次如果被一次部署打断，就无法再被驱�
 引擎用来驱动请求而回读的行里，没有任何一行含有卡片的任何部分：`chat_messages`、`chat_turn_queue`（包括 `params` 和 `last_error`）、`persona_instances`、`persona_instance_items` 都没有。卡片只存在于携带它的那次请求的内存里，包括同一进程中回复之后运行的工作。每个实例，引擎只存 32 字节的 key，不存角色的其他任何内容。
 
 - 对话产生的内容与任何一轮一样照常存储，即使其中引用了卡片：回复正文、记忆、insight、PDE 判定、亲密度。
-- 审计表和日志对 BYOC 请求的记录与任何其他请求一样。它们是引擎从不回读的备份。
+- 审计表和日志对 BYOC 请求的记录与任何其他请求一样。它们是引擎从不回读来驱动生成的备份。
   - prompt log（`PROMPT_LOG_DIR`，不设置则关闭）会写入 BYOC 轮次的完整条目，包括卡片。
   - `engine.chat_images_events` 在 `composed_prompt` 里保留最终的图片 prompt——风格预设、原样的卡片 `appearance` 和 composer 的主体——并在它的 `inputs` 快照里再记一次 `appearance`，stream、compose 和图片编辑三条路由都是如此。
 - 审计表从不参与生成。`GET …/image-request` 读取 `chat_images_events`，只是把已存的 prompt 原样交还给调用方。想让角色的 `appearance` 驱动生成的功能，要从请求的卡片里取，绝不能从这张表里取。

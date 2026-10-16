@@ -126,8 +126,8 @@ client can key a BYOC relationship without a second round trip.
 `BYOC_CALLER_SECRET` (env, read in `ServerConfig::from_env`) gates the
 feature, as `BYOK_CALLER_SECRET` gates BYOK:
 
-- Unset or blank: BYOC is off. The two key routes (§5) and every request
-  carrying `character` get 403 `byoc_forbidden`.
+- Unset or blank: BYOC is off. The two key routes (§5) and every card-route
+  request carrying `character` get 403 `byoc_forbidden`.
 - Set: those requests must carry the header `X-Byoc-Caller-Secret` with the
   same value, compared in constant time; missing or different → 403
   `byoc_forbidden`.
@@ -156,7 +156,7 @@ engine draws 32 random bytes and answers:
 ```
 
 `ticket` is `HMAC-SHA256(BYOC_CALLER_SECRET, "eros-byoc-init-v1" ‖ user_id ‖ key)`,
-with `user_id` the bearer's. Init writes nothing. It relies on TLS alone; the
+with `user_id` the bearer's, entering the HMAC as its 16 raw bytes. Init writes nothing. It relies on TLS alone; the
 card encryption (§6) protects the cards sent after create, not the key's
 delivery.
 

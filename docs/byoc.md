@@ -25,9 +25,10 @@ can call the engine directly. The key routes and any request that carries
 `character` are honoured only with `X-Byoc-Caller-Secret: <BYOC_CALLER_SECRET>`,
 compared in constant time. Keep the secret on the downstream's server and add
 the header there; never send it to a client. On the key routes and on a card
-route request that carries `character`, admission runs before every other
-check, so a missing or wrong secret is `403 byoc_forbidden` whatever else is
-wrong with the request.
+route request that carries `character`, admission runs before any check of the
+request's fields, so a missing or wrong secret is `403 byoc_forbidden`
+whatever else is wrong with the body's fields. A missing bearer token or a
+body that fails to deserialize is rejected before admission.
 
 ## What BYOC covers
 
@@ -74,10 +75,6 @@ A BYOC instance has no genome, so two response fields have nothing to say:
   `null`. Every item carries `instance_id`, so a client can key a relationship
   of either kind on it.
 
-Both fields are always present in the JSON. The OpenAPI schema lists them as
-optional because of how the generator treats nullable fields. A client that
-never creates a BYOC instance never sees a `null`.
-
 ## Creating an instance
 
 Two calls, both with the user's bearer token and the caller secret. The first
@@ -109,8 +106,9 @@ curl -X POST -H "Authorization: Bearer $JWT" \
 ```
 
 - The ticket is `HMAC-SHA256(BYOC_CALLER_SECRET, "eros-byoc-init-v1" ‖ user_id ‖ key)`
-  for the bearer's user. Create recomputes it, so a key the engine did not
-  issue to this user cannot make an instance: `403 byoc_forbidden`.
+  for the bearer's user, where `user_id` enters the HMAC as its 16 raw bytes.
+  Create recomputes it, so a key the engine did not issue to this user cannot
+  make an instance: `403 byoc_forbidden`.
 - `key` and `ticket` are base64url without padding; padding is accepted on
   input. Anything that is not 32 bytes after decoding is `400 invalid_payload`.
 - Create is idempotent per key. Resending the same `key` and `ticket` returns
@@ -181,7 +179,7 @@ ownership is confirmed, and before any row is written:
 | `character` not base64url, shorter than 28 bytes decoded, or longer than 96 KiB | `400 invalid_payload` |
 | plaintext longer than 64 KiB | `400 invalid_payload` |
 | authentication tag fails (wrong key, altered bytes) | `403 byoc_card_rejected` |
-| plaintext not a valid card | `400 invalid_payload`, naming the field |
+| plaintext not a valid card | `400 invalid_payload`, saying which rule failed |
 
 ## Errors
 
@@ -214,7 +212,7 @@ nothing else of the character.
 - What the conversation produces is stored as on any turn, even where it quotes
   the card: reply text, memories, insights, PDE verdicts, affinity.
 - Audit tables and logs record a BYOC request as they record any other. They
-  are backups the engine never reads back.
+  are backups the engine never reads back to drive generation.
   - The prompt log (`PROMPT_LOG_DIR`, off unless set) writes a BYOC turn's full
     entry, the card included.
   - `engine.chat_images_events` keeps the final image prompt in

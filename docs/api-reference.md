@@ -1572,7 +1572,7 @@ reactivates it. Open sessions on it with `POST /comp/chat/start` and the
 |---|---|---|
 | 403 | `byoc_forbidden` | the two routes above, or any card route request carrying `character`: BYOC is off, or the caller secret is missing or wrong |
 | 403 | `byoc_card_rejected` | `character` does not open under the instance's key |
-| 400 | `invalid_payload` | a card route: `character` missing on a BYOC instance, present on any other, malformed, over its size limit, or not a valid card, with a message naming the field; the async route: any `character` |
+| 400 | `invalid_payload` | a card route: `character` missing on a BYOC instance, present on any other, malformed, over its size limit, or not a valid card, with a message saying which rule failed; the async route: any `character` |
 | 400 | `byoc_unsupported` | the route cannot serve a BYOC instance: async send, `/open`, voice turns, life events, group chat |
 
 A stream turn on a BYOC instance that a deploy interrupts is settled `failed`
