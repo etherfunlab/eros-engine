@@ -401,14 +401,15 @@ normal path and the `正在经历` line still lists it. The rest of the mechanic
 - `E` is the instance's newest offline event, of any offline kind, that has ended, within the
   last 90 days;
 - `S` holds a user row that was ghosted inside `E`'s window;
-- `S` holds no assistant row written since `E` ended.
+- `S` holds no assistant row with text written since `E` ended (an image-only reply does not
+  count).
 
 While `E` is unexplained, every persona message generated in `S` carries the line below: a
 turn's reply, an `/open` greeting or an event message. Its text is the kind's own: what kept
 her away, and that she only now sees what was sent. The judge's `[近期事件]` line ends with
 `{label}（{span}前结束，期间对方的消息你没有回）`, such as
-`睡着了（2 小时前结束，期间对方的消息你没有回）`. The first assistant row written after `E`
-ended closes it. A reply the persona wrote inside the window (an action turn) does not, and
+`睡着了（2 小时前结束，期间对方的消息你没有回）`. The first assistant row with text written
+after `E` ended closes it; an image-only reply does not. A reply the persona wrote inside the window (an action turn) does not, and
 neither does the announcement of `busy` or `in_battle`: it was written when the event started,
 before it ended. The text of every kind is in
 [model-config.md](model-config.md#taskspde_decision--opt-in-llm-pde-judge).
@@ -438,11 +439,12 @@ is unresolved at a moment when:
 
 - `F` is the newest `period_scare` or `pregnancy_scare` told in `S` that has ended, within the
   last 90 days;
-- `S` holds no assistant row written since `F` ended.
+- `S` holds no assistant row with text written since `F` ended (an image-only reply does not
+  count).
 
 While `F` is unresolved, every persona message generated in `S` carries the line below, and
 the judge's `[近期事件]` line ends with `月经没来（{span}前结束，结果是虚惊一场）` (or the
-same with `验出怀孕`). The first assistant row written after `F` ended closes it. Her other
+same with `验出怀孕`). The first assistant row with text written after `F` ended closes it. Her other
 sessions never carry it: she told it in one.
 
 ```

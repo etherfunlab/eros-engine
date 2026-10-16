@@ -129,7 +129,7 @@ While an offline life event of the persona is under way (`away_from_phone`, `bus
 - An offline kind is drawn only where a ghost is allowed. With the `ghosting` switch ([model-config.md](model-config.md)) off (`ghosting = false`) none is drawn, and one already under way no longer silences turns, so the companion never goes silent. In a session with fewer than 10 user messages, the floor `ghost_permitted` enforces (rule 1 above), none is drawn either. A caller that does not want them leaves them out of `kinds` on the events route.
 - `busy` and `in_battle` are announced in a message at intimacy rung 2 and up; the announcement does not end the silence, and it does not count as the explanation.
 
-When the stretch is over, the persona explains it in her next message in a session where she ghosted: a reply, an `/open` greeting or an event message. The explanation names what kept her away: she was asleep, busy, in the thick of a hard fight, or not looking at her phone, and only now sees what was sent. After she has written once, that is done.
+When the stretch is over, the persona explains it in her next message in a session where she ghosted: a reply, an `/open` greeting or an event message. The explanation names what kept her away: she was asleep, busy, in the thick of a hard fight, or not looking at her phone, and only now sees what was sent. After she has written a message with text there, that is done; an image-only reply does not count.
 
 ## What ghosting is not
 

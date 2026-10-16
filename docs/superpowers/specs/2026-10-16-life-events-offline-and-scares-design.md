@@ -133,8 +133,9 @@ Every check that reads `kind == AwayFromPhone` reads `kind.is_offline()`:
 - `EventRepo::unexplained_offline` (renamed from `unexplained_away`): the
   newest offline event of the instance that ended within `lookback()`, with
   a ghosted user row of the session inside its window and no assistant row
-  of the session after its end. The announcement, written at the start, is
-  before the end and does not count.
+  with text of the session after its end (an image-only reply does not
+  explain it). The announcement, written at the start, is before the end and
+  does not count.
 
 The judge's item for an unexplained offline event keeps its shape with the
 kind's label: 「睡着了（2 小时前结束，期间对方的消息你没有回）」.
@@ -164,10 +165,12 @@ any prompt says it is a false alarm before it ends.
 
 ### 5.2 Resolved after it ends
 
-`EventRepo::unresolved_scare(session_id, instance_id, at)`: the newest
-`period_scare` or `pregnancy_scare` of the instance that ended within
-`lookback()`, whose `session_id` is this session, with no assistant row of
-the session in `(ends_at, at]`.
+`EventRepo::unresolved_scare(session_id, instance_id, at)`: the newest false
+alarm (`period_scare` or `pregnancy_scare`) told in this session — its
+`session_id` is this session — that ended by `at` and started within
+`lookback()`, when the session holds no assistant row with text in
+`(ends_at, at]`. A newer false alarm told in another session of the instance
+does not hide it.
 
 While one is unresolved, every persona message generated in that session (a
 turn's reply, an `/open` greeting, an event message) carries its `刚才` text,
@@ -178,7 +181,8 @@ and the judge gets an item:
 | `period_scare` | 以为月经没来，后来来了，是虚惊一场 | 月经没来（{span}前结束，结果是虚惊一场） |
 | `pregnancy_scare` | 验出两条杠，后来复查是虚惊一场 | 验出怀孕（{span}前结束，结果是虚惊一场） |
 
-The first assistant row written in the session after the end resolves it.
+The first assistant row with text written in the session after the end
+resolves it; an image-only reply does not.
 Other sessions of the instance never carry it: she told it in one.
 
 ### 5.3 Both at once
@@ -233,8 +237,8 @@ unexplained away event (the stream, `greet`) loads both.
   `asleep` ×2 at low stamina; `is_told` for every offline kind at rungs 1
   and 2; `ALL` holds 33 distinct kinds.
 - **store.** `unexplained_offline` for each offline kind; `unresolved_scare`
-  only in the telling session, resolved by an assistant row after the end,
-  not by one before it.
+  only in the telling session, resolved by an assistant row with text after
+  the end, not by one before it nor by an image-only reply.
 - **route.** The offline gates remove all four offline kinds; `busy` at rung
   2 writes a message and at rung 1 writes none; `asleep` never does;
   `EventView.offline`.

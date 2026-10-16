@@ -880,8 +880,8 @@ Ask for something to happen in the persona's day. The caller decides when to
 ask; the engine decides whether and what. It draws one kind of event, or none,
 and the persona tells the user in one proactive message — except the offline
 kinds, which make her unreachable and are announced only in part (below). While
-an event lasts, the judge
-and the reply know she is in it (see [model-config.md](model-config.md#taskspde_decision--opt-in-llm-pde-judge)).
+an event lasts, the judge and the reply know she is in it (see
+[model-config.md](model-config.md#taskspde_decision--opt-in-llm-pde-judge)).
 How the draw works and how events and the persona's needs fit together is in
 [life-events-needs.md](life-events-needs.md).
 
@@ -960,8 +960,9 @@ The draw:
 - **Closeness gates.** `ex_message` and `breakup` are not drawn for someone she
   barely knows (intimacy rung 2 and up); `sudden_desire` only at the closest
   rung (3). `period` is drawn only for a persona whose `art_metadata.gender` is
-  `"female"`; so are `period_scare` (rung 2 and up) and `pregnancy_scare`
-  (rung 3). The offline kinds follow the two ghost gates (below).
+  `"female"`. `period_scare` (rung 2 and up) and `pregnancy_scare` (rung 3) are
+  also drawn only for such a persona. The offline kinds follow the two ghost
+  gates (below).
 - **Persona settings** in the genome's `art_metadata` shape the draw:
 
   | Key | Value | Effect |
@@ -1019,16 +1020,19 @@ persona's next message — a reply, an `/open` greeting or an event message —
 explains it in the kind's words: she was asleep, busy, in the thick of a hard
 fight or not looking at her phone, and only now sees what was sent. The
 announcement of `busy` or `in_battle` does not count as the explanation: it was
-written before the event ended. After she has written once, that is done. The
-mechanics are in
+written before the event ended. After she has written a message with text there,
+that is done; an image-only reply does not count. The mechanics are in
 [ghost-mechanics.md](ghost-mechanics.md#ghosting-the-engine-imposes).
 
 **False alarms.** `period_scare` and `pregnancy_scare` are told as the scare
 itself, in the persona's own words. While one lasts, nothing in the judge's or
-the reply's context says it is false. Once it is over, her next message in the
-session that told it — a reply, an `/open` greeting or an event message —
-says it was a false alarm. After she has written once, that is done. Her other
-sessions never carry it.
+the reply's context says it is false. The events and effects routes report its
+`kind` (`period_scare`, `pregnancy_scare`) all the same, and the client decides
+how to show it: showing the kind name tells the user it will turn out to be
+nothing. Once it is over, her next message in the session that told it — a
+reply, an `/open` greeting or an event message — says it was a false alarm.
+After she has written a message with text there, that is done; an image-only
+reply does not count. Her other sessions never carry it.
 
 - **Idempotent per session and `event_key`.** A repeat call returns the same
   event and message, with no draw and no generation. A repeat that arrives
@@ -1049,9 +1053,11 @@ sessions never carry it.
 - **While it lasts.** The judge's context carries a `[近期事件]` line and the
   reply's `[character_state]` a `- 正在经历：…` line, each listing the
   background and the incident under way; `/open` greetings carry the
-  `- 正在经历：…` line too. `GET …/effects` shows both. After an offline kind or
-  a false alarm has ended, the `[近期事件]` line adds an item for it and the
-  reply a `- 刚才：…` line until she has written once (see
+  `- 正在经历：…` line too. `GET …/effects` shows both. After an offline kind
+  has ended, in a session where it ghosted her messages, or a false alarm has
+  ended, in the session that told it, the `[近期事件]` line adds an item for it
+  and the reply a `- 刚才：…` line until she has written there once (a message
+  with text; see
   [model-config.md](model-config.md#taskspde_decision--opt-in-llm-pde-judge)).
 - **Errors:** `400` with `code: "invalid_payload"` for a malformed
   `event_key`; `422` for an unknown `kind`. Session checks as on `/open`
