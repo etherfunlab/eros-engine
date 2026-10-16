@@ -274,7 +274,7 @@ pub(crate) async fn greet(
     let event_lines = crate::prompt::EventLines {
         under_way: crate::prompt::events_reply_text(&current),
         away_unexplained: eros_engine_store::events::EventRepo { pool: &state.pool }
-            .unexplained_away(g.session_id, g.instance_id, g.now.now)
+            .unexplained_offline(g.session_id, g.instance_id, g.now.now)
             .await?
             .is_some(),
     };

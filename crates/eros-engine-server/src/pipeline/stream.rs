@@ -4513,7 +4513,7 @@ pub(crate) fn run_stream_with(
         // An away stretch that ended, with a user message ghosted inside it
         // and no reply since: this turn explains it.
         let away = eros_engine_store::events::EventRepo { pool: &state.pool }
-            .unexplained_away(user_msg.session_id, user_msg.instance_id, current.at)
+            .unexplained_offline(user_msg.session_id, user_msg.instance_id, current.at)
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!("stream: away read failed: {e}");

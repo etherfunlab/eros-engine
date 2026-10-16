@@ -268,37 +268,82 @@ impl EventRepo<'_> {
         Ok(out)
     }
 
-    /// The instance's newest `away_from_phone` that ended by `at`, when this
+    /// The instance's newest offline event that ended by `at`, when this
     /// session holds a user row ghosted inside it and no assistant row
-    /// written after it ended (spec §7.3).
-    pub async fn unexplained_away(
+    /// written after it ended (spec 2026-10-16-life-events-offline-and-scares-
+    /// design.md §4.2).
+    pub async fn unexplained_offline(
         &self,
         session_id: Uuid,
         instance_id: Uuid,
         at: DateTime<Utc>,
     ) -> Result<Option<EventRecord>, sqlx::Error> {
+        let offline: Vec<&str> = EventKind::ALL
+            .into_iter()
+            .filter(|k| k.is_offline())
+            .map(EventKind::as_str)
+            .collect();
         let row: Option<EventColumns> = sqlx::query_as(
-            "WITH away AS ( \
+            "WITH off AS ( \
                  SELECT id, kind, session_id, started_at, ends_at, message_id \
                    FROM engine.persona_events \
-                  WHERE instance_id = $2 AND kind = $4 \
+                  WHERE instance_id = $2 AND kind = ANY($4) \
                     AND ends_at <= $3 AND started_at > $3 - make_interval(hours => $5) \
                   ORDER BY started_at DESC, id DESC \
                   LIMIT 1 \
              ) \
-             SELECT away.id, away.kind, away.session_id, away.started_at, away.ends_at, away.message_id \
-               FROM away \
+             SELECT off.id, off.kind, off.session_id, off.started_at, off.ends_at, off.message_id \
+               FROM off \
               WHERE EXISTS (SELECT 1 FROM engine.chat_messages m \
                              WHERE m.session_id = $1 AND m.role = 'user' AND m.ghost_decision \
-                               AND m.sent_at >= away.started_at AND m.sent_at < away.ends_at) \
+                               AND m.sent_at >= off.started_at AND m.sent_at < off.ends_at) \
                 AND NOT EXISTS (SELECT 1 FROM engine.chat_messages m \
                                  WHERE m.session_id = $1 AND m.role = 'assistant' \
-                                   AND m.sent_at > away.ends_at AND m.sent_at <= $3)",
+                                   AND m.sent_at > off.ends_at AND m.sent_at <= $3)",
         )
         .bind(session_id)
         .bind(instance_id)
         .bind(at)
-        .bind(EventKind::AwayFromPhone.as_str())
+        .bind(&offline)
+        .bind(lookback_hours())
+        .fetch_optional(self.pool)
+        .await?;
+        Ok(row.and_then(record))
+    }
+
+    /// The newest false alarm told in this session that ended by `at`, while
+    /// the session holds no assistant row written after it ended (§5.2).
+    pub async fn unresolved_scare(
+        &self,
+        session_id: Uuid,
+        instance_id: Uuid,
+        at: DateTime<Utc>,
+    ) -> Result<Option<EventRecord>, sqlx::Error> {
+        let scares: Vec<&str> = EventKind::ALL
+            .into_iter()
+            .filter(|k| k.is_false_alarm())
+            .map(EventKind::as_str)
+            .collect();
+        let row: Option<EventColumns> = sqlx::query_as(
+            "WITH scare AS ( \
+                 SELECT id, kind, session_id, started_at, ends_at, message_id \
+                   FROM engine.persona_events \
+                  WHERE instance_id = $2 AND session_id = $1 AND kind = ANY($4) \
+                    AND ends_at <= $3 AND started_at > $3 - make_interval(hours => $5) \
+                  ORDER BY started_at DESC, id DESC \
+                  LIMIT 1 \
+             ) \
+             SELECT scare.id, scare.kind, scare.session_id, scare.started_at, scare.ends_at, \
+                    scare.message_id \
+               FROM scare \
+              WHERE NOT EXISTS (SELECT 1 FROM engine.chat_messages m \
+                                 WHERE m.session_id = $1 AND m.role = 'assistant' \
+                                   AND m.sent_at > scare.ends_at AND m.sent_at <= $3)",
+        )
+        .bind(session_id)
+        .bind(instance_id)
+        .bind(at)
+        .bind(&scares)
         .bind(lookback_hours())
         .fetch_optional(self.pool)
         .await?;
@@ -881,7 +926,7 @@ mod tests {
         // A user row before the window, not ghosted inside it: nothing to explain.
         row(&pool, s, "user", "2026-10-01T09:00:00Z", true).await;
         assert_eq!(
-            repo.unexplained_away(s, i, t("2026-10-01T13:00:00Z"))
+            repo.unexplained_offline(s, i, t("2026-10-01T13:00:00Z"))
                 .await
                 .unwrap(),
             None
@@ -889,14 +934,14 @@ mod tests {
         // Ghosted inside the window.
         row(&pool, s, "user", "2026-10-01T11:00:00Z", true).await;
         assert_eq!(
-            repo.unexplained_away(s, i, t("2026-10-01T13:00:00Z"))
+            repo.unexplained_offline(s, i, t("2026-10-01T13:00:00Z"))
                 .await
                 .unwrap(),
             Some(away.clone())
         );
         // Not before the stretch ended.
         assert_eq!(
-            repo.unexplained_away(s, i, t("2026-10-01T11:30:00Z"))
+            repo.unexplained_offline(s, i, t("2026-10-01T11:30:00Z"))
                 .await
                 .unwrap(),
             None
@@ -904,13 +949,13 @@ mod tests {
         // A reply after the end explains it — from the reply's moment on.
         row(&pool, s, "assistant", "2026-10-01T12:30:00Z", false).await;
         assert_eq!(
-            repo.unexplained_away(s, i, t("2026-10-01T12:15:00Z"))
+            repo.unexplained_offline(s, i, t("2026-10-01T12:15:00Z"))
                 .await
                 .unwrap(),
             Some(away)
         );
         assert_eq!(
-            repo.unexplained_away(s, i, t("2026-10-01T13:00:00Z"))
+            repo.unexplained_offline(s, i, t("2026-10-01T13:00:00Z"))
                 .await
                 .unwrap(),
             None
@@ -938,12 +983,12 @@ mod tests {
         .unwrap();
         row(&pool, s2, "user", "2026-10-01T11:00:00Z", true).await;
         assert!(repo
-            .unexplained_away(s2, i, t("2026-10-01T13:00:00Z"))
+            .unexplained_offline(s2, i, t("2026-10-01T13:00:00Z"))
             .await
             .unwrap()
             .is_some());
         assert!(repo
-            .unexplained_away(s1, i, t("2026-10-01T13:00:00Z"))
+            .unexplained_offline(s1, i, t("2026-10-01T13:00:00Z"))
             .await
             .unwrap()
             .is_none());
@@ -973,10 +1018,147 @@ mod tests {
         // An action turn answered mid-stretch.
         row(&pool, s, "assistant", "2026-10-01T11:00:00Z", false).await;
         assert_eq!(
-            repo.unexplained_away(s, i, t("2026-10-01T13:00:00Z"))
+            repo.unexplained_offline(s, i, t("2026-10-01T13:00:00Z"))
                 .await
                 .unwrap(),
             Some(away)
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn every_offline_kind_is_explained_afterwards(pool: PgPool) {
+        for kind in [AwayFromPhone, Busy, InBattle, Asleep] {
+            let (_, i, s) = instance_and_session(&pool).await;
+            let repo = EventRepo { pool: &pool };
+            repo.insert(
+                &ev(
+                    i,
+                    s,
+                    "off",
+                    kind,
+                    "2026-10-01T10:00:00Z",
+                    "2026-10-01T12:00:00Z",
+                ),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            row(&pool, s, "user", "2026-10-01T10:30:00Z", true).await;
+            let got = repo
+                .unexplained_offline(s, i, t("2026-10-01T13:00:00Z"))
+                .await
+                .unwrap();
+            assert_eq!(got.map(|e| e.kind), Some(kind), "{kind:?}");
+        }
+        let (_, i, s) = instance_and_session(&pool).await;
+        let repo = EventRepo { pool: &pool };
+        repo.insert(
+            &ev(
+                i,
+                s,
+                "r",
+                Reading,
+                "2026-10-01T10:00:00Z",
+                "2026-10-01T12:00:00Z",
+            ),
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        row(&pool, s, "user", "2026-10-01T10:30:00Z", true).await;
+        assert_eq!(
+            repo.unexplained_offline(s, i, t("2026-10-01T13:00:00Z"))
+                .await
+                .unwrap(),
+            None,
+            "reading is not offline"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_scare_is_resolved_where_it_was_told(pool: PgPool) {
+        let (owner, i, s) = instance_and_session(&pool).await;
+        let elsewhere = another_session(&pool, owner, i).await;
+        let repo = EventRepo { pool: &pool };
+        let scare = repo
+            .insert(
+                &ev(
+                    i,
+                    s,
+                    "scare",
+                    PeriodScare,
+                    "2026-10-01T10:00:00Z",
+                    "2026-10-01T11:00:00Z",
+                ),
+                Some(&message("月经推迟了好几天")),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .event;
+        // Not yet over.
+        assert_eq!(
+            repo.unresolved_scare(s, i, t("2026-10-01T10:30:00Z"))
+                .await
+                .unwrap(),
+            None
+        );
+        // Over, in the session that told it; never in another.
+        assert_eq!(
+            repo.unresolved_scare(s, i, t("2026-10-01T12:00:00Z"))
+                .await
+                .unwrap(),
+            Some(scare.clone())
+        );
+        assert_eq!(
+            repo.unresolved_scare(elsewhere, i, t("2026-10-01T12:00:00Z"))
+                .await
+                .unwrap(),
+            None
+        );
+        // A reply inside the scare does not resolve it.
+        row(&pool, s, "assistant", "2026-10-01T10:40:00Z", false).await;
+        assert_eq!(
+            repo.unresolved_scare(s, i, t("2026-10-01T12:00:00Z"))
+                .await
+                .unwrap(),
+            Some(scare)
+        );
+        // The first one after it does.
+        row(&pool, s, "assistant", "2026-10-01T11:30:00Z", false).await;
+        assert_eq!(
+            repo.unresolved_scare(s, i, t("2026-10-01T12:00:00Z"))
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn only_false_alarms_are_resolved(pool: PgPool) {
+        let (_, i, s) = instance_and_session(&pool).await;
+        let repo = EventRepo { pool: &pool };
+        repo.insert(
+            &ev(
+                i,
+                s,
+                "w",
+                WeatherChange,
+                "2026-10-01T10:00:00Z",
+                "2026-10-01T11:00:00Z",
+            ),
+            Some(&message("下雨了")),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            repo.unresolved_scare(s, i, t("2026-10-01T12:00:00Z"))
+                .await
+                .unwrap(),
+            None
         );
     }
 
