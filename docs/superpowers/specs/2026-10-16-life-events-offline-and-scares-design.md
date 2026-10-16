@@ -4,7 +4,7 @@
 - **Status:** Draft — ready for review
 - **Type:** Engine change. No migration. Additive API changes (five kinds,
   `EventView.offline`). `eros-engine-core::events` gains five `EventKind`
-  variants (breaks exhaustive matches) and two functions;
+  variants (breaks exhaustive matches) and three functions;
   `eros-engine-store::events` renames `unexplained_away` and gains
   `unresolved_scare`.
 - **Owner:** enriquephl (sole dev)
@@ -97,6 +97,8 @@ already covers 12 h).
 impl EventKind {
     /// Offline kinds make the persona unreachable while they last.
     pub fn is_offline(self) -> bool;
+    /// A scare that turns out to be nothing once it ends.
+    pub fn is_false_alarm(self) -> bool;
 }
 
 /// Whether a drawn kind is told in a message when it starts: every

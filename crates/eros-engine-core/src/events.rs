@@ -68,6 +68,8 @@ pub enum EventKind {
     Bathing,
     InClass,
     OnTheWay,
+    PeriodScare,
+    PregnancyScare,
     TempWork,
     ExMessage,
     WeatherChange,
@@ -79,6 +81,9 @@ pub enum EventKind {
     AwayFromPhone,
     Unwell,
     Irritable,
+    Busy,
+    InBattle,
+    Asleep,
     Sick,
     Period,
     Hospitalized,
@@ -91,7 +96,7 @@ pub enum EventKind {
 
 impl EventKind {
     /// Every kind, in draw order.
-    pub const ALL: [EventKind; 28] = [
+    pub const ALL: [EventKind; 33] = [
         EventKind::PoliceEncounter,
         EventKind::AnimalEncounter,
         EventKind::HitSomeone,
@@ -101,6 +106,8 @@ impl EventKind {
         EventKind::Bathing,
         EventKind::InClass,
         EventKind::OnTheWay,
+        EventKind::PeriodScare,
+        EventKind::PregnancyScare,
         EventKind::TempWork,
         EventKind::ExMessage,
         EventKind::WeatherChange,
@@ -112,6 +119,9 @@ impl EventKind {
         EventKind::AwayFromPhone,
         EventKind::Unwell,
         EventKind::Irritable,
+        EventKind::Busy,
+        EventKind::InBattle,
+        EventKind::Asleep,
         EventKind::Sick,
         EventKind::Period,
         EventKind::Hospitalized,
@@ -134,6 +144,8 @@ impl EventKind {
             EventKind::Bathing => "bathing",
             EventKind::InClass => "in_class",
             EventKind::OnTheWay => "on_the_way",
+            EventKind::PeriodScare => "period_scare",
+            EventKind::PregnancyScare => "pregnancy_scare",
             EventKind::TempWork => "temp_work",
             EventKind::ExMessage => "ex_message",
             EventKind::WeatherChange => "weather_change",
@@ -145,6 +157,9 @@ impl EventKind {
             EventKind::AwayFromPhone => "away_from_phone",
             EventKind::Unwell => "unwell",
             EventKind::Irritable => "irritable",
+            EventKind::Busy => "busy",
+            EventKind::InBattle => "in_battle",
+            EventKind::Asleep => "asleep",
             EventKind::Sick => "sick",
             EventKind::Period => "period",
             EventKind::Hospitalized => "hospitalized",
@@ -164,9 +179,13 @@ impl EventKind {
         use EventKind::*;
         match self {
             PoliceEncounter | AnimalEncounter | HitSomeone | SuddenDesire | GroceryShopping
-            | Showering | Bathing | InClass | OnTheWay => EventCategory::Short,
+            | Showering | Bathing | InClass | OnTheWay | PeriodScare | PregnancyScare => {
+                EventCategory::Short
+            }
             TempWork | ExMessage | WeatherChange | GotHit | Breakup | WorkingOut | Reading
-            | Gaming | AwayFromPhone | Unwell | Irritable => EventCategory::Mid,
+            | Gaming | AwayFromPhone | Unwell | Irritable | Busy | InBattle | Asleep => {
+                EventCategory::Mid
+            }
             Sick | Period | Hospitalized | PostSurgery => EventCategory::Body,
             BusinessTrip | ShortTrip | LongTrip | HometownVisit => EventCategory::Trip,
         }
@@ -174,6 +193,18 @@ impl EventKind {
 
     pub fn is_background(self) -> bool {
         self.category().is_background()
+    }
+
+    /// Offline kinds make the persona unreachable while they last
+    /// (spec 2026-10-16-life-events-offline-and-scares-design.md §2).
+    pub fn is_offline(self) -> bool {
+        use EventKind::*;
+        matches!(self, AwayFromPhone | Busy | InBattle | Asleep)
+    }
+
+    /// A scare that turns out to be nothing once it ends (§5).
+    pub fn is_false_alarm(self) -> bool {
+        matches!(self, EventKind::PeriodScare | EventKind::PregnancyScare)
     }
 }
 
@@ -206,6 +237,8 @@ fn rule(kind: EventKind) -> Rule {
         Bathing => (1.0, 48, Lasts::Hours(1, 1)),
         InClass => (1.0, 24, Lasts::Hours(1, 1)),
         OnTheWay => (2.0, 12, Lasts::Minutes(30)),
+        PeriodScare => (0.5, 28 * DAY, Lasts::Hours(1, 1)),
+        PregnancyScare => (0.5, 60 * DAY, Lasts::Hours(1, 1)),
         TempWork => (3.0, 24, Lasts::Hours(4, 4)),
         ExMessage => (1.0, 72, Lasts::Hours(3, 3)),
         WeatherChange => (4.0, 8, Lasts::Hours(4, 4)),
@@ -217,6 +250,9 @@ fn rule(kind: EventKind) -> Rule {
         AwayFromPhone => (1.0, 48, Lasts::Hours(1, 3)),
         Unwell => (1.0, 24, Lasts::Hours(1, 4)),
         Irritable => (1.0, 24, Lasts::Hours(2, 4)),
+        Busy => (2.0, 12, Lasts::Hours(1, 3)),
+        InBattle => (1.0, 48, Lasts::Hours(2, 4)),
+        Asleep => (2.0, 24, Lasts::Hours(1, 4)),
         Sick => (3.0, 14 * DAY, Lasts::Hours(DAY, 3 * DAY)),
         Period => (3.0, 28 * DAY, Lasts::Hours(3 * DAY, 7 * DAY)),
         Hospitalized => (0.5, 60 * DAY, Lasts::Hours(2 * DAY, 5 * DAY)),
@@ -240,6 +276,9 @@ const DESIRE_MIN_RUNG: u8 = 3;
 /// What a preferred `mid` kind, and a travel-loving persona's `trip`
 /// category, weigh relative to the base (§4).
 const PREFERENCE_FACTOR: f64 = 3.0;
+/// Hours after any offline kind started before any offline kind can start
+/// again (§3.4): it bounds how often she goes silent.
+const OFFLINE_COOLDOWN_HOURS: i64 = 12;
 
 /// How the persona's body fares (§4): it scales the `body` category.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -279,6 +318,8 @@ fn passes_gate(kind: EventKind, rung: u8, persona: &PersonaTraits) -> bool {
         EventKind::ExMessage | EventKind::Breakup => rung >= CONFIDE_MIN_RUNG,
         EventKind::SuddenDesire => rung >= DESIRE_MIN_RUNG,
         EventKind::Period => persona.female,
+        EventKind::PeriodScare => persona.female && rung >= CONFIDE_MIN_RUNG,
+        EventKind::PregnancyScare => persona.female && rung >= DESIRE_MIN_RUNG,
         _ => true,
     }
 }
@@ -292,7 +333,7 @@ fn needs_factor(kind: EventKind, needs: Option<&Needs>) -> f64 {
     };
     match kind {
         TempWork | WorkingOut if n.stamina == NeedLevel::Low => 0.5,
-        Unwell | Sick | Bathing if n.stamina == NeedLevel::Low => 2.0,
+        Unwell | Sick | Bathing | Asleep if n.stamina == NeedLevel::Low => 2.0,
         GroceryShopping if n.hunger == NeedLevel::High => 2.0,
         ExMessage if n.emotional == NeedLevel::High => 3.0,
         AnimalEncounter | Irritable if n.emotional == NeedLevel::High => 2.0,
@@ -323,11 +364,12 @@ fn preference_factor(kind: EventKind, persona: &PersonaTraits) -> f64 {
 }
 
 /// Whether a background rules a foreground kind out (§3.3): in hospital or
-/// recovering from surgery, she is not out and about.
+/// recovering from surgery, she is not out and about; during her period, a
+/// late-period or pregnancy scare cannot happen.
 fn rules_out(background: EventKind, kind: EventKind) -> bool {
     use EventKind::*;
-    matches!(background, Hospitalized | PostSurgery)
-        && matches!(
+    match background {
+        Hospitalized | PostSurgery => matches!(
             kind,
             TempWork
                 | PoliceEncounter
@@ -338,7 +380,11 @@ fn rules_out(background: EventKind, kind: EventKind) -> bool {
                 | GroceryShopping
                 | InClass
                 | OnTheWay
-        )
+                | InBattle
+        ),
+        Period => kind.is_false_alarm(),
+        _ => false,
+    }
 }
 
 /// An event that already happened (or is under way).
@@ -411,6 +457,13 @@ pub fn draw(input: &DrawInput, rolls: Rolls) -> Option<Drawn> {
             !input.history.iter().any(|e| {
                 e.kind.category() == c && cooling(e.started_at, category_rule(c).cooldown_hours)
             })
+        })
+        .filter(|k| {
+            !k.is_offline()
+                || !input
+                    .history
+                    .iter()
+                    .any(|e| e.kind.is_offline() && cooling(e.started_at, OFFLINE_COOLDOWN_HOURS))
         })
         .filter(|k| match background {
             Some(b) => !k.is_background() && !rules_out(b, *k),
@@ -499,6 +552,17 @@ pub fn background_kinds() -> Vec<EventKind> {
         .into_iter()
         .filter(|k| k.is_background())
         .collect()
+}
+
+/// Whether a drawn kind is told in a message when it starts (§3.5): every
+/// kind that is not offline; `busy` and `in_battle` from rung 2, so she says
+/// she will be away only to someone she is close to; never `asleep` or
+/// `away_from_phone`.
+pub fn is_told(kind: EventKind, rung: u8) -> bool {
+    match kind {
+        EventKind::Busy | EventKind::InBattle => rung >= CONFIDE_MIN_RUNG,
+        k => !k.is_offline(),
+    }
 }
 
 #[cfg(test)]
@@ -910,13 +974,14 @@ mod tests {
         }
     }
 
-    /// Every kind, rung 3, a female persona, no needs: categories short 5,
-    /// mid 4, body 0.5, trip 0.5 (10); within short police 1, animal 3,
-    /// hit 0.5, desire 2, grocery 2, showering 2, bathing 1, in_class 1,
-    /// on_the_way 2 (14.5).
+    /// Every kind in `earlier()`, rung 3, a female persona, no needs:
+    /// categories short 5, mid 4, body 0.5, trip 0.5 (10); within short
+    /// police 1, animal 3, hit 0.5, desire 2, grocery 2, showering 2,
+    /// bathing 1, in_class 1, on_the_way 2 (14.5).
     #[test]
     fn the_stages_pick_by_cumulative_weight() {
-        let at = |c: f64, k: f64| pick(&[], &EventKind::ALL, rolls(c, k)).unwrap();
+        let allowed = earlier();
+        let at = |c: f64, k: f64| pick(&[], &allowed, rolls(c, k)).unwrap();
         assert_eq!(at(0.0, 0.0), PoliceEncounter);
         assert_eq!(at(0.5 - E, 0.0).category(), EventCategory::Short);
         assert_eq!(at(0.5 + E, 0.0), TempWork);
@@ -999,7 +1064,7 @@ mod tests {
         let count = |c| EventKind::ALL.iter().filter(|k| k.category() == c).count();
         assert_eq!(
             EventCategory::ALL.map(count),
-            [9, 11, 4, 4],
+            [11, 14, 4, 4],
             "short, mid, body, trip"
         );
         assert!(!EventCategory::Short.is_background());
@@ -1024,5 +1089,163 @@ mod tests {
         assert_eq!(Health::parse("strong"), Some(Health::Strong));
         assert_eq!(Health::parse("fragile"), None);
         assert_eq!(Health::default(), Health::Normal);
+    }
+
+    /// The scare, busy, battle and sleep kinds; tests pinned to the weights of
+    /// the 28 kinds before them draw from `earlier()`.
+    const ADDED: [EventKind; 5] = [PeriodScare, PregnancyScare, Busy, InBattle, Asleep];
+
+    fn earlier() -> Vec<EventKind> {
+        EventKind::ALL
+            .into_iter()
+            .filter(|k| !ADDED.contains(k))
+            .collect()
+    }
+
+    #[test]
+    fn the_false_alarm_gates() {
+        let male = PersonaTraits::default();
+        for (k, min_rung) in [(PeriodScare, 2), (PregnancyScare, 3)] {
+            assert_eq!(
+                pick_with(&female(), None, min_rung - 1, &[], &[k], rolls(0.0, 0.0)),
+                None,
+                "{k:?} below its rung"
+            );
+            assert_eq!(
+                pick_with(&female(), None, min_rung, &[], &[k], rolls(0.0, 0.0)),
+                Some(k),
+                "{k:?} at its rung"
+            );
+            assert_eq!(
+                pick_with(&male, None, 3, &[], &[k], rolls(0.0, 0.0)),
+                None,
+                "{k:?} needs a female persona"
+            );
+        }
+    }
+
+    #[test]
+    fn a_period_rules_the_false_alarms_out() {
+        let h = [past(Period, 24, 96)];
+        for k in [PeriodScare, PregnancyScare] {
+            assert_eq!(pick(&h, &[k], rolls(0.0, 0.0)), None, "{k:?}");
+        }
+        assert_eq!(pick(&h, &[Reading], rolls(0.0, 0.0)), Some(Reading));
+        let trip = [past(BusinessTrip, 2, 24)];
+        assert_eq!(
+            pick(&trip, &[PeriodScare], rolls(0.0, 0.0)),
+            Some(PeriodScare)
+        );
+    }
+
+    #[test]
+    fn hospital_and_surgery_rule_out_a_hard_battle() {
+        for bg in [Hospitalized, PostSurgery] {
+            assert_eq!(
+                pick(&[past(bg, 1, 72)], &[InBattle], rolls(0.0, 0.0)),
+                None,
+                "{bg:?}"
+            );
+            assert_eq!(
+                pick(&[past(bg, 1, 72)], &[Asleep], rolls(0.0, 0.0)),
+                Some(Asleep)
+            );
+            assert_eq!(
+                pick(&[past(bg, 1, 72)], &[Busy], rolls(0.0, 0.0)),
+                Some(Busy)
+            );
+        }
+        assert_eq!(
+            pick(&[past(Sick, 1, 48)], &[InBattle], rolls(0.0, 0.0)),
+            Some(InBattle)
+        );
+    }
+
+    #[test]
+    fn offline_kinds_share_a_twelve_hour_cooldown() {
+        let asleep_at = |hours_ago: i64| PastEvent {
+            kind: Asleep,
+            started_at: now() - Duration::hours(hours_ago),
+            ends_at: now() - Duration::hours(hours_ago) + Duration::hours(1),
+        };
+        let cooling = [PastEvent {
+            started_at: now() - Duration::hours(12) + Duration::seconds(1),
+            ends_at: now() - Duration::hours(11),
+            kind: Asleep,
+        }];
+        for k in [Busy, InBattle, AwayFromPhone] {
+            assert_eq!(pick(&cooling, &[k], rolls(0.0, 0.0)), None, "{k:?}");
+            assert_eq!(
+                pick(&[asleep_at(12)], &[k], rolls(0.0, 0.0)),
+                Some(k),
+                "{k:?}"
+            );
+        }
+        assert_eq!(pick(&cooling, &[Reading], rolls(0.0, 0.0)), Some(Reading));
+    }
+
+    #[test]
+    fn asleep_weighs_double_when_she_is_worn_out() {
+        // Reading 2 then Asleep 2 within `mid`: 0.4 × 4 = 1.6 lands on Reading;
+        // worn out, Asleep weighs 4: 0.4 × 6 = 2.4 lands on Asleep.
+        let r = rolls(0.0, 0.4);
+        let at = |n| pick_with(&female(), n, 3, &[], &[Reading, Asleep], r);
+        assert_eq!(at(None), Some(Reading));
+        assert_eq!(at(needs(NeedLevel::Low, NeedLevel::Mid)), Some(Asleep));
+    }
+
+    #[test]
+    fn offline_false_alarm_and_told() {
+        for k in EventKind::ALL {
+            assert_eq!(
+                k.is_offline(),
+                matches!(k, AwayFromPhone | Busy | InBattle | Asleep),
+                "{k:?}"
+            );
+            assert_eq!(
+                k.is_false_alarm(),
+                matches!(k, PeriodScare | PregnancyScare),
+                "{k:?}"
+            );
+        }
+        assert!(!is_told(Busy, 1));
+        assert!(is_told(Busy, 2));
+        assert!(!is_told(InBattle, 1));
+        assert!(is_told(InBattle, 3));
+        assert!(!is_told(Asleep, 3));
+        assert!(!is_told(AwayFromPhone, 3));
+        assert!(is_told(Reading, 1));
+        assert!(is_told(PeriodScare, 2));
+    }
+
+    #[test]
+    fn the_added_kinds_last() {
+        let lasts = |kind: EventKind, duration: f64| {
+            draw(
+                &DrawInput {
+                    now: now(),
+                    needs: None,
+                    intimacy_rung: 3,
+                    persona: &female(),
+                    history: &[],
+                    allowed: &[kind],
+                },
+                Rolls {
+                    category: 0.0,
+                    kind: 0.0,
+                    duration,
+                },
+            )
+            .unwrap()
+            .lasts
+        };
+        assert_eq!(lasts(PeriodScare, 0.5), Duration::hours(1));
+        assert_eq!(lasts(PregnancyScare, 0.9), Duration::hours(1));
+        assert_eq!(lasts(Busy, 0.0), Duration::hours(1));
+        assert_eq!(lasts(Busy, 1.0), Duration::hours(3));
+        assert_eq!(lasts(InBattle, 0.0), Duration::hours(2));
+        assert_eq!(lasts(InBattle, 1.0), Duration::hours(4));
+        assert_eq!(lasts(Asleep, 0.0), Duration::hours(1));
+        assert_eq!(lasts(Asleep, 1.0), Duration::hours(4));
     }
 }

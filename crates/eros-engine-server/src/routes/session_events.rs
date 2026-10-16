@@ -52,6 +52,8 @@ pub enum EventKindDto {
     Bathing,
     InClass,
     OnTheWay,
+    PeriodScare,
+    PregnancyScare,
     TempWork,
     ExMessage,
     WeatherChange,
@@ -63,6 +65,9 @@ pub enum EventKindDto {
     AwayFromPhone,
     Unwell,
     Irritable,
+    Busy,
+    InBattle,
+    Asleep,
     Sick,
     Period,
     Hospitalized,
@@ -85,6 +90,8 @@ impl From<EventKindDto> for EventKind {
             EventKindDto::Bathing => EventKind::Bathing,
             EventKindDto::InClass => EventKind::InClass,
             EventKindDto::OnTheWay => EventKind::OnTheWay,
+            EventKindDto::PeriodScare => EventKind::PeriodScare,
+            EventKindDto::PregnancyScare => EventKind::PregnancyScare,
             EventKindDto::TempWork => EventKind::TempWork,
             EventKindDto::ExMessage => EventKind::ExMessage,
             EventKindDto::WeatherChange => EventKind::WeatherChange,
@@ -96,6 +103,9 @@ impl From<EventKindDto> for EventKind {
             EventKindDto::AwayFromPhone => EventKind::AwayFromPhone,
             EventKindDto::Unwell => EventKind::Unwell,
             EventKindDto::Irritable => EventKind::Irritable,
+            EventKindDto::Busy => EventKind::Busy,
+            EventKindDto::InBattle => EventKind::InBattle,
+            EventKindDto::Asleep => EventKind::Asleep,
             EventKindDto::Sick => EventKind::Sick,
             EventKindDto::Period => EventKind::Period,
             EventKindDto::Hospitalized => EventKind::Hospitalized,
@@ -120,6 +130,8 @@ impl From<EventKind> for EventKindDto {
             EventKind::Bathing => EventKindDto::Bathing,
             EventKind::InClass => EventKindDto::InClass,
             EventKind::OnTheWay => EventKindDto::OnTheWay,
+            EventKind::PeriodScare => EventKindDto::PeriodScare,
+            EventKind::PregnancyScare => EventKindDto::PregnancyScare,
             EventKind::TempWork => EventKindDto::TempWork,
             EventKind::ExMessage => EventKindDto::ExMessage,
             EventKind::WeatherChange => EventKindDto::WeatherChange,
@@ -131,6 +143,9 @@ impl From<EventKind> for EventKindDto {
             EventKind::AwayFromPhone => EventKindDto::AwayFromPhone,
             EventKind::Unwell => EventKindDto::Unwell,
             EventKind::Irritable => EventKindDto::Irritable,
+            EventKind::Busy => EventKindDto::Busy,
+            EventKind::InBattle => EventKindDto::InBattle,
+            EventKind::Asleep => EventKindDto::Asleep,
             EventKind::Sick => EventKindDto::Sick,
             EventKind::Period => EventKindDto::Period,
             EventKind::Hospitalized => EventKindDto::Hospitalized,
@@ -382,11 +397,12 @@ pub(crate) async fn draw_event_at(
         allowed.retain(|k| *k != EventKind::AwayFromPhone);
     }
     let traits = crate::prompt::persona_traits(&persona);
+    let rung = affinity.intimacy_rung();
     let Some(drawn) = events::draw(
         &DrawInput {
             now,
             needs,
-            intimacy_rung: affinity.intimacy_rung(),
+            intimacy_rung: rung,
             persona: &traits,
             history: &history,
             allowed: &allowed,
@@ -396,9 +412,9 @@ pub(crate) async fn draw_event_at(
         return Ok(DrawEventResponse::none());
     };
 
-    // Nothing to tell: the event is the silence (spec 2026-10-15-life-events-
-    // v2-design.md §7.1).
-    if drawn.kind == EventKind::AwayFromPhone {
+    // A kind she does not tell is written without a message (spec
+    // 2026-10-16-life-events-offline-and-scares-design.md §4.1).
+    if !events::is_told(drawn.kind, rung) {
         event_repo
             .insert(
                 &eros_engine_store::events::NewEvent {
