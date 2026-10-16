@@ -4238,14 +4238,15 @@
             "description": "The caller's idempotency key, scoped to the session: the same key\nreturns the same event. 1–128 chars of `[A-Za-z0-9_.:-]`."
           },
           "kinds": {
-            "type": [
-              "array",
-              "null"
-            ],
-            "items": {
-              "$ref": "#/components/schemas/EventKindDto"
-            },
-            "description": "The kinds that may be drawn. Absent: all of them."
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/KindsDto",
+                "description": "The kinds that may be drawn. Absent: all of them. An array allows\nthe listed kinds (`[]`: none); `{\"allow\": […], \"disallow\": […]}`\nallows what `allow` lists (absent: every kind) minus what `disallow`\nlists."
+              }
+            ]
           },
           "memory_scope": {
             "type": [
@@ -4455,6 +4456,11 @@
           "on_the_way",
           "period_scare",
           "pregnancy_scare",
+          "got_bumped",
+          "bumped_someone",
+          "quarrel",
+          "scolded_by_superior",
+          "scolded_superior",
           "temp_work",
           "ex_message",
           "weather_change",
@@ -5280,6 +5286,48 @@
           "gift",
           "caller"
         ]
+      },
+      "KindRulesDto": {
+        "type": "object",
+        "description": "`allow` is what may be drawn, `disallow` what may not; a kind in both is\nnot drawn. `{}` allows every kind.",
+        "properties": {
+          "allow": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/EventKindDto"
+            },
+            "description": "Absent: every kind. `[]`: none."
+          },
+          "disallow": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/EventKindDto"
+            },
+            "description": "Absent or `[]`: nothing removed."
+          }
+        },
+        "additionalProperties": false
+      },
+      "KindsDto": {
+        "oneOf": [
+          {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EventKindDto"
+            },
+            "description": "Only these kinds; `[]` allows none."
+          },
+          {
+            "$ref": "#/components/schemas/KindRulesDto"
+          }
+        ],
+        "description": "The kinds a draw may pick: a list of the allowed kinds, or an object of\nrules (spec 2026-10-17-life-events-run-ins-and-kind-filters-design.md §3)."
       },
       "LabelTransitionDto": {
         "type": "object",

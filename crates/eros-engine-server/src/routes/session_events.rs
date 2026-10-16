@@ -54,6 +54,11 @@ pub enum EventKindDto {
     OnTheWay,
     PeriodScare,
     PregnancyScare,
+    GotBumped,
+    BumpedSomeone,
+    Quarrel,
+    ScoldedBySuperior,
+    ScoldedSuperior,
     TempWork,
     ExMessage,
     WeatherChange,
@@ -92,6 +97,11 @@ impl From<EventKindDto> for EventKind {
             EventKindDto::OnTheWay => EventKind::OnTheWay,
             EventKindDto::PeriodScare => EventKind::PeriodScare,
             EventKindDto::PregnancyScare => EventKind::PregnancyScare,
+            EventKindDto::GotBumped => EventKind::GotBumped,
+            EventKindDto::BumpedSomeone => EventKind::BumpedSomeone,
+            EventKindDto::Quarrel => EventKind::Quarrel,
+            EventKindDto::ScoldedBySuperior => EventKind::ScoldedBySuperior,
+            EventKindDto::ScoldedSuperior => EventKind::ScoldedSuperior,
             EventKindDto::TempWork => EventKind::TempWork,
             EventKindDto::ExMessage => EventKind::ExMessage,
             EventKindDto::WeatherChange => EventKind::WeatherChange,
@@ -132,6 +142,11 @@ impl From<EventKind> for EventKindDto {
             EventKind::OnTheWay => EventKindDto::OnTheWay,
             EventKind::PeriodScare => EventKindDto::PeriodScare,
             EventKind::PregnancyScare => EventKindDto::PregnancyScare,
+            EventKind::GotBumped => EventKindDto::GotBumped,
+            EventKind::BumpedSomeone => EventKindDto::BumpedSomeone,
+            EventKind::Quarrel => EventKindDto::Quarrel,
+            EventKind::ScoldedBySuperior => EventKindDto::ScoldedBySuperior,
+            EventKind::ScoldedSuperior => EventKindDto::ScoldedSuperior,
             EventKind::TempWork => EventKindDto::TempWork,
             EventKind::ExMessage => EventKindDto::ExMessage,
             EventKind::WeatherChange => EventKindDto::WeatherChange,
@@ -210,14 +225,59 @@ impl From<&eros_engine_store::events::EventRecord> for EventView {
     }
 }
 
+/// The kinds a draw may pick: a list of the allowed kinds, or an object of
+/// rules (spec 2026-10-17-life-events-run-ins-and-kind-filters-design.md §3).
+#[derive(Debug, Clone, PartialEq, Deserialize, utoipa::ToSchema)]
+#[serde(untagged)]
+pub enum KindsDto {
+    /// Only these kinds; `[]` allows none.
+    List(Vec<EventKindDto>),
+    Rules(KindRulesDto),
+}
+
+/// `allow` is what may be drawn, `disallow` what may not; a kind in both is
+/// not drawn. `{}` allows every kind.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct KindRulesDto {
+    /// Absent: every kind. `[]`: none.
+    #[serde(default)]
+    pub allow: Option<Vec<EventKindDto>>,
+    /// Absent or `[]`: nothing removed.
+    #[serde(default)]
+    pub disallow: Option<Vec<EventKindDto>>,
+}
+
+/// The kinds a request allows, in draw order.
+fn allowed_kinds(kinds: Option<&KindsDto>) -> Vec<EventKind> {
+    let listed =
+        |ks: &[EventKindDto]| -> Vec<EventKind> { ks.iter().map(|k| (*k).into()).collect() };
+    match kinds {
+        None => EventKind::ALL.to_vec(),
+        Some(KindsDto::List(ks)) => listed(ks),
+        Some(KindsDto::Rules(r)) => {
+            let allow = r.allow.as_deref().map(listed);
+            let disallow = listed(r.disallow.as_deref().unwrap_or_default());
+            EventKind::ALL
+                .into_iter()
+                .filter(|k| allow.as_ref().is_none_or(|a| a.contains(k)))
+                .filter(|k| !disallow.contains(k))
+                .collect()
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize, utoipa::ToSchema)]
 pub struct DrawEventRequest {
     /// The caller's idempotency key, scoped to the session: the same key
     /// returns the same event. 1–128 chars of `[A-Za-z0-9_.:-]`.
     pub event_key: String,
-    /// The kinds that may be drawn. Absent: all of them.
+    /// The kinds that may be drawn. Absent: all of them. An array allows
+    /// the listed kinds (`[]`: none); `{"allow": […], "disallow": […]}`
+    /// allows what `allow` lists (absent: every kind) minus what `disallow`
+    /// lists.
     #[serde(default)]
-    pub kinds: Option<Vec<EventKindDto>>,
+    pub kinds: Option<KindsDto>,
     /// As on `/open`: the user's IANA timezone, for `[now]`.
     #[serde(default)]
     pub user_timezone: Option<String>,
@@ -394,10 +454,7 @@ pub(crate) async fn draw_event_at(
         .iter()
         .map(|e| e.past())
         .collect();
-    let mut allowed: Vec<EventKind> = match &req.kinds {
-        Some(kinds) => kinds.iter().map(|k| (*k).into()).collect(),
-        None => EventKind::ALL.to_vec(),
-    };
+    let mut allowed = allowed_kinds(req.kinds.as_ref());
     // An offline kind is silence: it follows the ghost protection (the
     // deployment's ghosting switch and the session's message floor).
     let signals =
@@ -569,7 +626,7 @@ mod tests {
     fn req(key: &str, kinds: Option<Vec<EventKindDto>>) -> DrawEventRequest {
         DrawEventRequest {
             event_key: key.into(),
-            kinds,
+            kinds: kinds.map(KindsDto::List),
             user_timezone: Some("Asia/Taipei".into()),
             ..Default::default()
         }
@@ -831,6 +888,39 @@ mod tests {
         .unwrap();
         assert!(out.event.is_none());
         assert!(calls(&mock).await.is_empty());
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_disallowed_kind_is_not_drawn(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "刚跟楼下邻居吵了一架").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let request = DrawEventRequest {
+            kinds: Some(KindsDto::Rules(KindRulesDto {
+                allow: Some(vec![EventKindDto::Quarrel, EventKindDto::Reading]),
+                disallow: Some(vec![EventKindDto::Reading]),
+            })),
+            ..req("k1", None)
+        };
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            request,
+            Utc::now(),
+            rolls(0.99),
+        )
+        .await
+        .unwrap();
+        let e = out.event.expect("an event");
+        assert_eq!(e.kind, EventKindDto::Quarrel);
+        assert_eq!(e.category, EventCategoryDto::Short);
+        assert_eq!((e.ends_at - e.started_at).num_minutes(), 60);
+        let c = calls(&mock).await;
+        let last = c[0]["messages"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(last["content"], json!("（你刚跟人吵了一架。）"));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -1416,6 +1506,62 @@ mod tests {
         .unwrap();
         assert!(out.event.is_none() && out.message.is_none());
         assert_eq!(event_count(&pool, session_id).await, 0, "no silence either");
+    }
+
+    #[test]
+    fn each_form_of_kinds_resolves_to_its_set() {
+        use EventKind::{Quarrel, Reading, SuddenDesire};
+        let parse = |kinds: Option<serde_json::Value>| -> Vec<EventKind> {
+            let mut body = json!({"event_key": "k"});
+            if let Some(v) = kinds {
+                body["kinds"] = v;
+            }
+            let r: DrawEventRequest = serde_json::from_value(body).unwrap();
+            allowed_kinds(r.kinds.as_ref())
+        };
+        let all = EventKind::ALL.to_vec();
+        let cases: [(Option<serde_json::Value>, Vec<EventKind>); 9] = [
+            (None, all.clone()),
+            (Some(json!(null)), all.clone()),
+            (Some(json!([])), vec![]),
+            (Some(json!(["reading", "quarrel"])), vec![Reading, Quarrel]),
+            (Some(json!({})), all.clone()),
+            (Some(json!({"allow": null, "disallow": []})), all.clone()),
+            (Some(json!({"allow": []})), vec![]),
+            (
+                Some(json!({"allow": ["reading", "quarrel"]})),
+                vec![Quarrel, Reading],
+            ),
+            (
+                Some(json!({"allow": ["reading", "quarrel"], "disallow": ["quarrel"]})),
+                vec![Reading],
+            ),
+        ];
+        for (kinds, want) in cases {
+            assert_eq!(parse(kinds.clone()), want, "{kinds:?}");
+        }
+        let without = parse(Some(json!({"disallow": ["sudden_desire"]})));
+        assert_eq!(without.len(), EventKind::ALL.len() - 1);
+        assert!(!without.contains(&SuddenDesire));
+    }
+
+    #[test]
+    fn a_kinds_object_rejects_unknown_keys_and_kinds() {
+        for kinds in [
+            json!({"deny": ["sudden_desire"]}),
+            json!({"disallow": ["dragon"]}),
+            json!({"allow": ["dragon"]}),
+            json!({"allow": "reading"}),
+            json!("reading"),
+        ] {
+            assert!(
+                serde_json::from_value::<DrawEventRequest>(
+                    json!({"event_key": "k", "kinds": kinds})
+                )
+                .is_err(),
+                "{kinds}"
+            );
+        }
     }
 
     #[test]

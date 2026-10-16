@@ -920,7 +920,7 @@ How the draw works and how events and the persona's needs fit together is in
 | Field | Rules |
 |---|---|
 | `event_key` | required: 1–128 characters of `[A-Za-z0-9_.:-]`, scoped to the session. The same key returns the same event |
-| `kinds` | optional allowlist of kinds. Absent: all of them. `[]`: nothing is drawn |
+| `kinds` | optional. Absent or `null`: every kind. An array allows the listed kinds (`[]`: nothing is drawn). An object `{"allow": […], "disallow": […]}` allows what `allow` lists (absent or `null`: every kind; `[]`: none) minus what `disallow` lists; a kind in both is not drawn, and `{}` allows every kind. An unknown key in the object or an unknown kind is a `422` |
 | `user_timezone`, `user_country`, `user_region`, `tier`, `prompt_traits`, `memory_scope`, `affinity_scope`, `audit` | as on `/open`, for generating the message |
 
 Kinds fall into four categories. `short` and `mid` are incidents; `body` and
@@ -939,6 +939,11 @@ Kinds fall into four categories. `short` and `mid` are incidents; `body` and
 | `short` | `on_the_way` | 30 min | she is on her way somewhere |
 | `short` | `period_scare` | 1 h | she thinks her period is late — a false alarm |
 | `short` | `pregnancy_scare` | 1 h | a pregnancy test comes up positive — a false alarm |
+| `short` | `got_bumped` | 30 min | someone or a vehicle brushes into her on foot |
+| `short` | `bumped_someone` | 30 min | she knocks into someone, on foot or in whatever she rides or drives — a car, a horse, a flight, by her world |
+| `short` | `quarrel` | 1 h | she had a row with someone |
+| `short` | `scolded_by_superior` | 1 h | someone above her told her off — a boss, a manager, a master, a sovereign, by her world |
+| `short` | `scolded_superior` | 1 h | she told off someone above her |
 | `mid` | `temp_work` | 4 h | she is called in to work |
 | `mid` | `ex_message` | 3 h | her ex texts her |
 | `mid` | `weather_change` | 4 h | the weather turns |
@@ -964,6 +969,13 @@ Kinds fall into four categories. `short` and `mid` are incidents; `body` and
 
 A range is drawn when the event starts.
 
+`sudden_desire` and `pregnancy_scare`, which implies sex, carry adult themes; a
+caller that serves them only to some users leaves them out with
+`{"disallow": ["sudden_desire", "pregnancy_scare"]}`. `scolded_by_superior` and
+`scolded_superior` assume someone above her; for a persona with no one above
+her, the caller disallows them. A `disallow` list leaves every other kind in,
+including kinds the engine adds later.
+
 The draw:
 
 - **Two stages.** The engine picks a category, then a kind within it, each by
@@ -973,7 +985,8 @@ The draw:
   under way, only incidents are drawn; in hospital or after surgery, not the
   ones that need her out and about (`temp_work`, `police_encounter`,
   `animal_encounter`, `hit_someone`, `got_hit`, `working_out`,
-  `grocery_shopping`, `in_class`, `on_the_way`, `in_battle`); during `period`,
+  `grocery_shopping`, `in_class`, `on_the_way`, `in_battle`, `got_bumped`,
+  `bumped_someone`); during `period`,
   neither `period_scare` nor `pregnancy_scare`.
 - **Cooldowns.** Each kind has a cooldown from when it started. A trip starts
   at most once a week, and a `body` state at most once a fortnight, whichever
