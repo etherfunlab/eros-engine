@@ -383,6 +383,43 @@ pub fn parse_byok_config(
     })
 }
 
+/// Bring-your-own-character settings (spec 2026-10-16-byoc-design §4).
+#[derive(Clone, Default)]
+pub struct ByocConfig {
+    /// `BYOC_CALLER_SECRET`. `None` turns the feature off.
+    pub caller_secret: Option<String>,
+}
+
+impl std::fmt::Debug for ByocConfig {
+    /// The secret never reaches a log line through `ServerConfig`'s `{:?}`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ByocConfig")
+            .field(
+                "caller_secret",
+                &self.caller_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+/// Shortest `BYOC_CALLER_SECRET` the engine boots with.
+pub const MIN_BYOC_CALLER_SECRET_LEN: usize = 32;
+
+/// Parse `BYOC_CALLER_SECRET`. A blank secret means off; a short one refuses
+/// boot.
+pub fn parse_byoc_config(caller_secret: Option<&str>) -> Result<ByocConfig, String> {
+    let caller_secret = match caller_secret.map(str::trim).filter(|s| !s.is_empty()) {
+        None => None,
+        Some(s) if s.len() < MIN_BYOC_CALLER_SECRET_LEN => {
+            return Err(format!(
+                "BYOC_CALLER_SECRET must be at least {MIN_BYOC_CALLER_SECRET_LEN} bytes"
+            ))
+        }
+        Some(s) => Some(s.to_string()),
+    };
+    Ok(ByocConfig { caller_secret })
+}
+
 /// Export admission for `/svc/v1/*` (`insights/changes`, `memories/changes`).
 #[derive(Clone, Default)]
 pub struct InsightsExportConfig {
@@ -483,6 +520,10 @@ pub struct ServerConfig {
     pub reaction_emoji: Option<crate::reaction::ReactionAllowlist>,
     /// Bring-your-own-key admission and transport settings.
     pub byok: ByokConfig,
+    /// Bring-your-own-character admission.
+    // TODO(byoc routes): read by `byoc::admit` once the routes call it.
+    #[allow(dead_code)]
+    pub byoc: ByocConfig,
     /// Insights export admission (`INSIGHTS_EXPORT_SECRET`).
     pub insights_export: InsightsExportConfig,
 }
@@ -569,6 +610,7 @@ impl ServerConfig {
                 std::env::var("BYOK_CALLER_SECRET").ok().as_deref(),
                 std::env::var("BYOK_ALLOW_PRIVATE_NETWORK").ok().as_deref(),
             )?,
+            byoc: parse_byoc_config(std::env::var("BYOC_CALLER_SECRET").ok().as_deref())?,
             insights_export: parse_insights_export_config(
                 std::env::var("INSIGHTS_EXPORT_SECRET").ok().as_deref(),
             )?,

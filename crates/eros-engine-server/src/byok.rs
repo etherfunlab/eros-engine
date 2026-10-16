@@ -292,7 +292,7 @@ pub(crate) fn admit_and_prepare(
         .map_err(|m| pre_error(StatusCode::BAD_REQUEST, "invalid_payload", m))
 }
 
-fn pre_error(status: StatusCode, code: &'static str, message: String) -> AppError {
+pub(crate) fn pre_error(status: StatusCode, code: &'static str, message: String) -> AppError {
     AppError::StreamPre(StreamPreError {
         status,
         code,
