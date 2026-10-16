@@ -893,7 +893,8 @@ fn ends_text(ends_in: chrono::Duration) -> String {
 /// foreground, an offline stretch she has not explained, then a false alarm
 /// not yet resolved, each 「临时接到工作（1 小时前开始，约 3 小时后结束）」,
 /// 「睡着了（2 小时前结束，期间对方的消息你没有回）」 or 「月经没来（1 小时前
-/// 结束，结果是虚惊一场）」; `None` when there is nothing.
+/// 结束，结果是虚惊一场）」; a false alarm under way is its label alone, with no
+/// span; `None` when there is nothing.
 pub(crate) fn events_judge_text(
     c: &eros_engine_store::events::CurrentEvents,
     offline: Option<&eros_engine_store::events::EventRecord>,
@@ -903,6 +904,9 @@ pub(crate) fn events_judge_text(
         .into_iter()
         .flatten()
         .map(|e| {
+            if e.kind.is_false_alarm() {
+                return event_label(e.kind).to_string();
+            }
             format!(
                 "{}（{}前开始，{}）",
                 event_label(e.kind),
@@ -929,12 +933,19 @@ pub(crate) fn events_judge_text(
 }
 
 /// `正在经历` (§8.2): the background, then the foreground, each
-/// 「临时接到工作（约 3 小时后结束）」; `None` when neither.
+/// 「临时接到工作（约 3 小时后结束）」; a false alarm under way is its label
+/// alone; `None` when neither.
 pub(crate) fn events_reply_text(c: &eros_engine_store::events::CurrentEvents) -> Option<String> {
     let items: Vec<String> = [c.background.as_ref(), c.foreground.as_ref()]
         .into_iter()
         .flatten()
-        .map(|e| format!("{}（{}）", event_label(e.kind), ends_text(e.ends_at - c.at)))
+        .map(|e| {
+            if e.kind.is_false_alarm() {
+                event_label(e.kind).to_string()
+            } else {
+                format!("{}（{}）", event_label(e.kind), ends_text(e.ends_at - c.at))
+            }
+        })
         .collect();
     (!items.is_empty()).then(|| items.join("；"))
 }
@@ -3969,6 +3980,44 @@ mod tests {
             events_judge_text(&nothing, Some(&long_ago), None).unwrap(),
             "没看手机（2 小时前结束，期间对方的消息你没有回）"
         );
+    }
+
+    #[test]
+    fn a_false_alarm_under_way_is_its_bare_label() {
+        use eros_engine_core::events::EventKind;
+        let (trip, at) = event_at(EventKind::BusinessTrip, 600, 840);
+        let (scare, _) = event_at(EventKind::PeriodScare, 30, 90);
+        let c = eros_engine_store::events::CurrentEvents {
+            foreground: Some(scare),
+            background: Some(trip),
+            at,
+        };
+        assert_eq!(
+            events_reply_text(&c).unwrap(),
+            "出差（约 14 小时后结束）；月经没来"
+        );
+        assert_eq!(
+            events_judge_text(&c, None, None).unwrap(),
+            "出差（10 小时前开始，约 14 小时后结束）；月经没来"
+        );
+        let (scare, at) = event_at(EventKind::PregnancyScare, 30, 90);
+        let c = only((scare, at));
+        assert_eq!(events_reply_text(&c).unwrap(), "验出怀孕");
+        assert_eq!(events_judge_text(&c, None, None).unwrap(), "验出怀孕");
+    }
+
+    #[test]
+    fn every_offline_and_false_alarm_kind_has_an_aftermath() {
+        use eros_engine_core::events::EventKind;
+        for kind in EventKind::ALL {
+            let (rec, _) = event_at(kind, 70, -10);
+            let text = just_now_text(Some(&rec), None);
+            if kind.is_offline() || kind.is_false_alarm() {
+                assert!(text.is_some(), "{kind:?}");
+            } else if kind == EventKind::TempWork {
+                assert_eq!(text, None, "{kind:?}");
+            }
+        }
     }
 
     #[test]

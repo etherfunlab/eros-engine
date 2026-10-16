@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! POST /v2/comp/session/{session_id}/events — the caller asks for something
 //! to happen in the persona's day; the engine decides whether and what. The
-//! persona tells the user in a message, except for the offline kinds, which
-//! are her silence (spec
+//! persona tells the user in a message, except for an offline kind she does
+//! not announce, which is only her silence (spec
 //! docs/superpowers/specs/2026-10-16-life-events-offline-and-scares-design.md).
 
 use axum::extract::{Extension, Path, State};
@@ -188,8 +188,9 @@ impl From<eros_engine_core::events::EventCategory> for EventCategoryDto {
 pub struct EventView {
     pub kind: EventKindDto,
     pub category: EventCategoryDto,
-    /// While it lasts, her 1:1 text turns go unanswered and `/open` returns
-    /// no greeting.
+    /// While it lasts, her 1:1 text turns in any of her sessions ghost,
+    /// except turns carrying a user `action` or `image.force`, and except on
+    /// a deployment with ghosting off; `/open` returns no greeting.
     pub offline: bool,
     pub started_at: DateTime<Utc>,
     pub ends_at: DateTime<Utc>,
@@ -289,9 +290,11 @@ async fn respond(
 /// background event (a trip or a body state) only incidents are drawn. The
 /// persona then tells the user in one proactive message, persisted like any
 /// reply and returned with the event. The offline kinds (`away_from_phone`,
-/// `busy`, `in_battle`, `asleep`) are silence: `busy` and `in_battle` are
-/// announced at intimacy rung 2 and up, the others are drawn without a
-/// message. The same `event_key` returns the same event.
+/// `busy`, `in_battle`, `asleep`) make her unreachable while they last.
+/// `busy` and `in_battle` are announced in a message at intimacy rung 2 and
+/// up; below that, and always for `away_from_phone` and `asleep`, the event
+/// comes back with `message: null`. The same `event_key` returns the same
+/// event.
 #[utoipa::path(
     post,
     path = "/v2/comp/session/{session_id}/events",

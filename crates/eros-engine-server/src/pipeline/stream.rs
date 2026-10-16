@@ -22386,9 +22386,14 @@ data: [DONE]\n\n"
         )
         .await;
         let reqs = t.mock.received_requests().await.unwrap();
-        assert!(chat_request_body(&reqs).contains("- 正在经历：月经没来（"));
-        assert!(!judge_request(&reqs).contains("虚惊"));
-        assert!(!chat_request_body(&reqs).contains("虚惊"));
+        let chat = chat_request_body(&reqs);
+        assert!(chat.contains("- 正在经历：月经没来"), "{chat}");
+        let judge = judge_request(&reqs);
+        for body in [&judge, &chat] {
+            assert!(!body.contains("虚惊"));
+            assert!(!body.contains("后结束"));
+            assert!(!body.contains("前开始"));
+        }
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

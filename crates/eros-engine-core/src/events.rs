@@ -202,7 +202,8 @@ impl EventKind {
         matches!(self, AwayFromPhone | Busy | InBattle | Asleep)
     }
 
-    /// A scare that turns out to be nothing once it ends (§5).
+    /// A scare that turns out to be nothing once it ends (spec
+    /// 2026-10-16-life-events-offline-and-scares-design.md §5).
     pub fn is_false_alarm(self) -> bool {
         matches!(self, EventKind::PeriodScare | EventKind::PregnancyScare)
     }
@@ -277,7 +278,8 @@ const DESIRE_MIN_RUNG: u8 = 3;
 /// category, weigh relative to the base (§4).
 const PREFERENCE_FACTOR: f64 = 3.0;
 /// Hours after any offline kind started before any offline kind can start
-/// again (§3.4): it bounds how often she goes silent.
+/// again (spec 2026-10-16-life-events-offline-and-scares-design.md §3.4): it
+/// bounds how often she goes silent.
 const OFFLINE_COOLDOWN_HOURS: i64 = 12;
 
 /// How the persona's body fares (§4): it scales the `body` category.
@@ -363,9 +365,11 @@ fn preference_factor(kind: EventKind, persona: &PersonaTraits) -> f64 {
     }
 }
 
-/// Whether a background rules a foreground kind out (§3.3): in hospital or
-/// recovering from surgery, she is not out and about; during her period, a
-/// late-period or pregnancy scare cannot happen.
+/// Whether a background rules a foreground kind out (spec
+/// 2026-10-15-life-events-v2-design.md §3.3; spec 2026-10-16-life-events-
+/// offline-and-scares-design.md §3.2): in hospital or recovering from surgery,
+/// she is not out and about; during her period, a late-period or pregnancy
+/// scare cannot happen.
 fn rules_out(background: EventKind, kind: EventKind) -> bool {
     use EventKind::*;
     match background {
@@ -554,10 +558,10 @@ pub fn background_kinds() -> Vec<EventKind> {
         .collect()
 }
 
-/// Whether a drawn kind is told in a message when it starts (§3.5): every
-/// kind that is not offline; `busy` and `in_battle` from rung 2, so she says
-/// she will be away only to someone she is close to; never `asleep` or
-/// `away_from_phone`.
+/// Whether a drawn kind is told in a message when it starts (spec
+/// 2026-10-16-life-events-offline-and-scares-design.md §3.5): every kind that
+/// is not offline; `busy` and `in_battle` from rung 2, so she says she will be
+/// away only to someone she is close to; never `asleep` or `away_from_phone`.
 pub fn is_told(kind: EventKind, rung: u8) -> bool {
     match kind {
         EventKind::Busy | EventKind::InBattle => rung >= CONFIDE_MIN_RUNG,

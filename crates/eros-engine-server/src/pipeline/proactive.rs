@@ -441,6 +441,20 @@ mod tests {
     use super::*;
     use chrono::Duration;
 
+    /// `kind_cue` panics for a kind that is never told; it must not for any
+    /// kind `is_told` lets through at any rung.
+    #[test]
+    fn every_kind_she_tells_has_a_cue() {
+        use eros_engine_core::events::{is_told, EventKind};
+        for k in EventKind::ALL {
+            for rung in 1..=3 {
+                if is_told(k, rung) {
+                    let _ = super::kind_cue(k, chrono::Duration::hours(1));
+                }
+            }
+        }
+    }
+
     #[test]
     fn every_told_kind_has_its_cue() {
         let h = Duration::hours(1);

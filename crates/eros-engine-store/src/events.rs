@@ -269,9 +269,9 @@ impl EventRepo<'_> {
     }
 
     /// The instance's newest offline event that ended by `at`, when this
-    /// session holds a user row ghosted inside it and no assistant row
-    /// written after it ended (spec 2026-10-16-life-events-offline-and-scares-
-    /// design.md §4.2).
+    /// session holds a user row ghosted inside it and no assistant row with
+    /// text written after it ended (spec 2026-10-16-life-events-offline-and-
+    /// scares-design.md §4.2).
     pub async fn unexplained_offline(
         &self,
         session_id: Uuid,
@@ -299,6 +299,7 @@ impl EventRepo<'_> {
                                AND m.sent_at >= off.started_at AND m.sent_at < off.ends_at) \
                 AND NOT EXISTS (SELECT 1 FROM engine.chat_messages m \
                                  WHERE m.session_id = $1 AND m.role = 'assistant' \
+                                   AND m.content <> '' \
                                    AND m.sent_at > off.ends_at AND m.sent_at <= $3)",
         )
         .bind(session_id)
@@ -312,7 +313,8 @@ impl EventRepo<'_> {
     }
 
     /// The newest false alarm told in this session that ended by `at`, while
-    /// the session holds no assistant row written after it ended (§5.2).
+    /// the session holds no assistant row with text written after it ended
+    /// (spec 2026-10-16-life-events-offline-and-scares-design.md §5.2).
     pub async fn unresolved_scare(
         &self,
         session_id: Uuid,
@@ -338,6 +340,7 @@ impl EventRepo<'_> {
                FROM scare \
               WHERE NOT EXISTS (SELECT 1 FROM engine.chat_messages m \
                                  WHERE m.session_id = $1 AND m.role = 'assistant' \
+                                   AND m.content <> '' \
                                    AND m.sent_at > scare.ends_at AND m.sent_at <= $3)",
         )
         .bind(session_id)
@@ -411,13 +414,27 @@ mod tests {
         }
     }
 
+    /// A row with text when it is the persona's, empty when it is the user's.
     async fn row(pool: &PgPool, session_id: Uuid, role: &str, at: &str, ghosted: bool) -> Uuid {
+        let content = if role == "assistant" { "…" } else { "" };
+        row_with(pool, session_id, role, content, at, ghosted).await
+    }
+
+    async fn row_with(
+        pool: &PgPool,
+        session_id: Uuid,
+        role: &str,
+        content: &str,
+        at: &str,
+        ghosted: bool,
+    ) -> Uuid {
         sqlx::query_scalar(
             "INSERT INTO engine.chat_messages (session_id, role, content, ghost_decision, sent_at) \
-             VALUES ($1, $2, '', $3, $4::timestamptz) RETURNING id",
+             VALUES ($1, $2, $3, $4, $5::timestamptz) RETURNING id",
         )
         .bind(session_id)
         .bind(role)
+        .bind(content)
         .bind(ghosted)
         .bind(at)
         .fetch_one(pool)
@@ -1133,6 +1150,100 @@ mod tests {
                 .await
                 .unwrap(),
             None
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_image_only_reply_does_not_explain_or_resolve(pool: PgPool) {
+        let (_, i, s) = instance_and_session(&pool).await;
+        let repo = EventRepo { pool: &pool };
+        let away = repo
+            .insert(
+                &ev(
+                    i,
+                    s,
+                    "away",
+                    AwayFromPhone,
+                    "2026-10-01T10:00:00Z",
+                    "2026-10-01T12:00:00Z",
+                ),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .event;
+        let scare = repo
+            .insert(
+                &ev(
+                    i,
+                    s,
+                    "scare",
+                    PeriodScare,
+                    "2026-10-01T12:00:00Z",
+                    "2026-10-01T13:00:00Z",
+                ),
+                Some(&message("月经推迟了好几天")),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .event;
+        row(&pool, s, "user", "2026-10-01T11:00:00Z", true).await;
+        let at = t("2026-10-01T15:00:00Z");
+        // An image-only reply after both ends carries no `刚才` line.
+        row_with(&pool, s, "assistant", "", "2026-10-01T14:00:00Z", false).await;
+        assert_eq!(
+            repo.unexplained_offline(s, i, at).await.unwrap(),
+            Some(away)
+        );
+        assert_eq!(repo.unresolved_scare(s, i, at).await.unwrap(), Some(scare));
+        // One with text does.
+        row_with(&pool, s, "assistant", "刚醒", "2026-10-01T14:30:00Z", false).await;
+        assert_eq!(repo.unexplained_offline(s, i, at).await.unwrap(), None);
+        assert_eq!(repo.unresolved_scare(s, i, at).await.unwrap(), None);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_newer_scare_elsewhere_does_not_hide_this_one(pool: PgPool) {
+        let (owner, i, s) = instance_and_session(&pool).await;
+        let elsewhere = another_session(&pool, owner, i).await;
+        let repo = EventRepo { pool: &pool };
+        let here = repo
+            .insert(
+                &ev(
+                    i,
+                    s,
+                    "here",
+                    PeriodScare,
+                    "2026-10-01T10:00:00Z",
+                    "2026-10-01T11:00:00Z",
+                ),
+                Some(&message("月经推迟了好几天")),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .event;
+        repo.insert(
+            &ev(
+                i,
+                elsewhere,
+                "there",
+                PregnancyScare,
+                "2026-10-01T12:00:00Z",
+                "2026-10-01T13:00:00Z",
+            ),
+            Some(&message("验出两条杠")),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            repo.unresolved_scare(s, i, t("2026-10-01T14:00:00Z"))
+                .await
+                .unwrap(),
+            Some(here)
         );
     }
 
