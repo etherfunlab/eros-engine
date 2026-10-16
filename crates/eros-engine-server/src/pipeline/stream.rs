@@ -5366,6 +5366,7 @@ pub(crate) fn run_stream_with(
                     let user_id_bg = user_msg.user_id;
                     let instance_id_bg = user_msg.instance_id;
                     let session_id_bg = user_msg.session_id;
+                    let persona_name_bg = input.persona.genome.name.clone();
                     let produced = image_only_produced;
                     tokio::spawn(async move {
                         crate::pipeline::post_process::run(
@@ -5373,6 +5374,7 @@ pub(crate) fn run_stream_with(
                             session_id_bg,
                             user_id_bg,
                             instance_id_bg,
+                            persona_name_bg,
                             event_bg,
                             plan_bg,
                             produced,
@@ -5897,12 +5899,14 @@ pub(crate) fn run_stream_with(
                 let user_id_bg = user_msg.user_id;
                 let instance_id_bg = user_msg.instance_id;
                 let session_id_bg = user_msg.session_id;
+                let persona_name_bg = input.persona.genome.name.clone();
                 tokio::spawn(async move {
                     crate::pipeline::post_process::run(
                         state_bg,
                         session_id_bg,
                         user_id_bg,
                         instance_id_bg,
+                        persona_name_bg,
                         event_bg,
                         plan_bg,
                         produced,

@@ -5,11 +5,6 @@
 //! (docs/eros-character-v1.md).
 //!
 //! No error built here quotes the sealed string, the key or any card text.
-//!
-//! TODO(byoc routes): card opening and `LoadedInstance::into_persona` stay
-//! unused until the routes that take a card call them. Allow-dead-code lifts
-//! once they have a caller.
-#![allow(dead_code)]
 
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};

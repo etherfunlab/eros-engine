@@ -273,9 +273,10 @@ async fn drive_turn(
         Err(e) => return TurnOutcome::Failure(format!("replay guard failed: {e}")),
     }
 
-    let row: Option<(String, Option<Uuid>, String)> = match sqlx::query_as(
-        "SELECT m.content, s.instance_id, s.channel \
+    let row: Option<(String, Option<Uuid>, String, bool)> = match sqlx::query_as(
+        "SELECT m.content, s.instance_id, s.channel, COALESCE(pi.byoc_key IS NOT NULL, false) \
          FROM engine.chat_messages m JOIN engine.chat_sessions s ON s.id = m.session_id \
+         LEFT JOIN engine.persona_instances pi ON pi.id = s.instance_id \
          WHERE m.id = $1",
     )
     .bind(turn.user_message_id)
@@ -287,10 +288,15 @@ async fn drive_turn(
     };
     // A group turn has one attempt, run by its stream handler; a released claim
     // is settled, never re-driven as a 1:1 turn (spec 2026-10-12 group chat §5.7).
-    if matches!(&row, Some((_, _, channel)) if channel == "group") {
+    if matches!(&row, Some((_, _, channel, _)) if channel == "group") {
         return TurnOutcome::Unservable("group_turn_not_redriven".into());
     }
-    let Some((content, Some(instance_id), _)) = row else {
+    // A BYOC turn's card lived only in the memory of the drive that died, and
+    // there is no character to fall back to (spec 2026-10-16-byoc §9).
+    if matches!(&row, Some((_, _, _, true))) {
+        return TurnOutcome::Unservable("byoc_unavailable".into());
+    }
+    let Some((content, Some(instance_id), _, _)) = row else {
         return TurnOutcome::Failure("user message or instance_id missing".into());
     };
 
@@ -1374,6 +1380,17 @@ data: [DONE]\n\n";
         .fetch_one(pool)
         .await
         .unwrap();
+        enqueue_in_session(pool, session_id, user_id, params, client_msg_id).await
+    }
+
+    /// Queue one turn in an existing session; returns (queue_id, user_message_id).
+    async fn enqueue_in_session(
+        pool: &PgPool,
+        session_id: Uuid,
+        user_id: Uuid,
+        params: serde_json::Value,
+        client_msg_id: &str,
+    ) -> (Uuid, Uuid) {
         let EnqueueOutcome::Queued {
             queue_id,
             user_message_id,
@@ -1431,6 +1448,58 @@ data: [DONE]\n\n";
                 .await
                 .unwrap();
         assert_eq!(last_error.as_deref(), Some("byok_unavailable"));
+        let notices: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_messages m \
+             JOIN engine.chat_messages u ON u.session_id = m.session_id \
+             WHERE u.id = $1 AND m.role = 'system_error'",
+        )
+        .bind(user_message_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(notices, 1, "terminal at once, with the usual notice");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_recovered_byoc_turn_is_unservable(pool: PgPool) {
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock)
+            .await;
+        let user_id = Uuid::new_v4();
+        let (_, session_id) =
+            crate::routes::companion::testutil::seed_byoc_session(&pool, user_id).await;
+        let (queue_id, user_message_id) = enqueue_in_session(
+            &pool,
+            session_id,
+            user_id,
+            serde_json::json!({}),
+            "01JW000000000000000000009C",
+        )
+        .await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+        assert_eq!(drain_once(&state, &sem).await.unwrap(), 1);
+
+        assert_eq!(
+            wait_for_status(&pool, queue_id, &["done", "failed"]).await,
+            "failed"
+        );
+        let last_error: Option<String> =
+            sqlx::query_scalar("SELECT last_error FROM engine.chat_turn_queue WHERE id = $1")
+                .bind(queue_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(last_error.as_deref(), Some("byoc_unavailable"));
         let notices: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM engine.chat_messages m \
              JOIN engine.chat_messages u ON u.session_id = m.session_id \

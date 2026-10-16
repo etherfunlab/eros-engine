@@ -449,6 +449,10 @@ pub struct StreamSendRequest {
     /// `X-Byok-Caller-Secret` header; refused on the async route.
     #[serde(default)]
     pub byok: Option<crate::byok::ByokRequest>,
+    /// Sealed eros-character v1 card (docs/byoc.md). Required on a BYOC
+    /// instance; refused on any other.
+    #[serde(default)]
+    pub character: Option<String>,
 }
 
 /// Pre-stream error body per spec §1.3. Schema-only struct for utoipa;
@@ -709,9 +713,8 @@ pub(crate) async fn resolve_text_session(
 /// [`resolve_text_session`] plus the session's persona, for routes that serve
 /// a genome instance only. A BYOC instance is refused with
 /// `byoc_unsupported` naming `route`; an instance that no longer exists or is
-/// inactive is a 404. The loaded persona is threaded into the detached drive
-/// task's `run_stream` call so the turn does not re-issue the same
-/// `load_companion` query inside the generator.
+/// inactive is a 404. The loaded persona is handed to the caller so its turn
+/// does not load it again.
 pub(crate) async fn resolve_text_turn(
     state: &AppState,
     session_id: Uuid,
@@ -839,6 +842,8 @@ pub(crate) fn build_user_row_metadata(
         ("session_id" = Uuid, Path, description = "Chat session id"),
         ("X-Byok-Caller-Secret" = Option<String>, Header,
             description = "The deployment's BYOK_CALLER_SECRET; required when the body carries `byok`"),
+        ("X-Byoc-Caller-Secret" = Option<String>, Header,
+            description = "The deployment's BYOC_CALLER_SECRET; required when the body carries `character`"),
     ),
     request_body = StreamSendRequest,
     responses(
@@ -867,6 +872,11 @@ pub async fn send_message_stream(
     headers: axum::http::HeaderMap,
     Json(req): Json<StreamSendRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
+    // A card is accepted only from the deployment's own server, checked
+    // before anything else (spec 2026-10-16-byoc §4).
+    if req.character.is_some() {
+        crate::byoc::admit(&state.config.byoc, &headers)?;
+    }
     // Validate payload first — before any DB call — so 422/400 never waste a roundtrip.
     validate_payload(&req)?;
     validate_image_capability(&req, &state.model_config)?;
@@ -899,8 +909,14 @@ pub async fn send_message_stream(
         )?)),
     };
 
-    let (_session, persona, instance_id) =
-        resolve_text_turn(&state, session_id, user_id, "the stream route").await?;
+    let (_session, instance_id) = resolve_text_session(&state, session_id, user_id).await?;
+    // The turn's persona: the genome's, or a BYOC instance's opened from the
+    // request's card, before any row is written (spec 2026-10-16-byoc §6.2).
+    // It travels in memory into the drive task and is never stored.
+    let persona = crate::byoc::load_instance(&state, instance_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("instance not found".into()))?
+        .into_persona(req.character.as_deref())?;
     let chat_repo = ChatRepo { pool: &state.pool };
     // Acquire a stream slot. `StreamSlotGuard` is now `'static` (holds Arc),
     // so it can be moved into the SSE body below.
@@ -1223,6 +1239,7 @@ mod tests {
             action: None,
             byok: None,
             outfit: None,
+            character: None,
         }
     }
 
@@ -3386,6 +3403,383 @@ data: [DONE]\n\n";
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert_eq!(byok_message_count(&pool, session_id).await, 0);
     }
+
+    const BYOC_MARKERS: [&str; 3] = ["BYOC-NAME-MARKER", "BYOC-SYSTEM-MARKER", "BYOC-ITEM-MARKER"];
+
+    /// The card every BYOC route test sends, each field carrying a marker.
+    fn marker_card(key: &[u8; 32]) -> String {
+        crate::routes::companion::testutil::sealed_card(
+            key,
+            "BYOC-NAME-MARKER",
+            "BYOC-SYSTEM-MARKER",
+            json!({"possessions": ["BYOC-ITEM-MARKER"]}),
+        )
+    }
+
+    /// A BYOC-enabled state whose platform chain is `mock_uri`.
+    fn byoc_state(pool: PgPool, mock_uri: &str) -> AppState {
+        let mut state = crate::routes::companion::test_state(pool);
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{mock_uri}/api/v1/chat/completions"),
+            ),
+        );
+        crate::routes::companion::testutil::enable_byoc(&mut state);
+        state
+    }
+
+    /// A BYOC instance with one text session; returns (session, key).
+    async fn byoc_session(pool: &PgPool, user_id: Uuid) -> (Uuid, [u8; 32]) {
+        let (instance_id, key) =
+            crate::routes::companion::testutil::seed_byoc_instance_with_key(pool, user_id).await;
+        let session_id =
+            crate::routes::companion::testutil::seed_session(pool, user_id, instance_id).await;
+        (session_id, key)
+    }
+
+    fn stream_send(
+        session_id: Uuid,
+        token: &str,
+        body: serde_json::Value,
+        headers: &[(&str, &str)],
+    ) -> Request<Body> {
+        let mut b = Request::builder()
+            .method("POST")
+            .uri(format!("/comp/chat/{session_id}/message/stream"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json");
+        for (name, value) in headers {
+            b = b.header(*name, *value);
+        }
+        b.body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    }
+
+    const WITH_BYOC_SECRET: [(&str, &str); 1] = [(
+        "x-byoc-caller-secret",
+        crate::routes::companion::testutil::BYOC_SECRET,
+    )];
+
+    /// Mount a streamed platform reply that quotes nothing of the card.
+    async fn mount_plain_reply(mock: &wiremock::MockServer) {
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, ResponseTemplate};
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi there\"}}],\"id\":\"gen-byoc\",\"model\":\"primary\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .mount(mock)
+            .await;
+    }
+
+    /// Status and body of a refused request.
+    async fn refusal(resp: axum::response::Response) -> (u16, String, String) {
+        let status = resp.status().as_u16();
+        let text = String::from_utf8(
+            to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let code = serde_json::from_str::<serde_json::Value>(&text).unwrap()["code"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        (status, code, text)
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn byoc_stream_turn_runs_on_the_card(pool: PgPool) {
+        let mock = wiremock::MockServer::start().await;
+        mount_plain_reply(&mock).await;
+        let user_id = Uuid::new_v4();
+        let (session_id, key) = byoc_session(&pool, user_id).await;
+
+        let mut app = build_router(byoc_state(pool.clone(), &mock.uri()));
+        let resp = app
+            .call(stream_send(
+                session_id,
+                &mint_jwt(user_id),
+                json!({"content": "hi", "client_msg_id": "01J6666666666666666666666A", "character": marker_card(&key)}),
+                &WITH_BYOC_SECRET,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        assert!(std::str::from_utf8(&body).unwrap().contains("hi there"));
+
+        let requests: Vec<Value> = mock
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect();
+        let companion = requests
+            .iter()
+            .find(|b| b["stream"] == json!(true))
+            .expect("a streamed companion call");
+        let system = companion["messages"][0]["content"].as_str().unwrap();
+        assert!(system.contains("BYOC-SYSTEM-MARKER"), "{system}");
+        assert!(system.contains("BYOC-ITEM-MARKER"), "{system}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn byoc_stream_turn_keeps_no_card_on_the_call_path(pool: PgPool) {
+        let mock = wiremock::MockServer::start().await;
+        mount_plain_reply(&mock).await;
+        let user_id = Uuid::new_v4();
+        let (session_id, key) = byoc_session(&pool, user_id).await;
+
+        let mut app = build_router(byoc_state(pool.clone(), &mock.uri()));
+        let resp = app
+            .call(stream_send(
+                session_id,
+                &mint_jwt(user_id),
+                json!({"content": "hi", "client_msg_id": "01J6666666666666666666666B", "character": marker_card(&key)}),
+                &WITH_BYOC_SECRET,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let queue_id: Uuid =
+            sqlx::query_scalar("SELECT q.id FROM engine.chat_turn_queue q WHERE q.session_id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            wait_for_status(&pool, queue_id, &["done", "failed"]).await,
+            "done"
+        );
+
+        let at_rest: String = sqlx::query_scalar(
+            "SELECT coalesce(string_agg(t, ' '), '') FROM ( \
+               SELECT row_to_json(m)::text AS t FROM engine.chat_messages m WHERE m.session_id = $1 \
+               UNION ALL SELECT row_to_json(q)::text FROM engine.chat_turn_queue q WHERE q.session_id = $1 \
+               UNION ALL SELECT row_to_json(p)::text FROM engine.persona_instances p WHERE p.owner_uid = $2 \
+               UNION ALL SELECT row_to_json(i)::text FROM engine.persona_instance_items i \
+                 JOIN engine.persona_instances p ON p.id = i.instance_id WHERE p.owner_uid = $2 \
+             ) s",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            at_rest.contains("hi there"),
+            "the rows under test were read: {at_rest}"
+        );
+        for marker in BYOC_MARKERS {
+            assert!(
+                !at_rest.contains(marker),
+                "`{marker}` found at rest: {at_rest}"
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn byoc_session_without_character_is_400(pool: PgPool) {
+        use crate::routes::companion::testutil::session_footprint;
+        let user_id = Uuid::new_v4();
+        let (session_id, _) = byoc_session(&pool, user_id).await;
+        let before = session_footprint(&pool, session_id).await;
+
+        let mut app = build_router(byoc_state(pool.clone(), "http://127.0.0.1:1"));
+        let resp = app
+            .call(stream_send(
+                session_id,
+                &mint_jwt(user_id),
+                json!({"content": "hi", "client_msg_id": "01J6666666666666666666666C"}),
+                &WITH_BYOC_SECRET,
+            ))
+            .await
+            .unwrap();
+        let (status, code, _) = refusal(resp).await;
+        assert_eq!((status, code.as_str()), (400, "invalid_payload"));
+        assert_eq!(session_footprint(&pool, session_id).await, before);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn genome_session_with_character_is_400(pool: PgPool) {
+        use crate::routes::companion::testutil::session_footprint;
+        let user_id = Uuid::new_v4();
+        // A genome instance's session.
+        let session_id = byok_session(&pool, user_id).await;
+        let before = session_footprint(&pool, session_id).await;
+        let (_, key) =
+            crate::routes::companion::testutil::seed_byoc_instance_with_key(&pool, user_id).await;
+
+        let mut app = build_router(byoc_state(pool.clone(), "http://127.0.0.1:1"));
+        let resp = app
+            .call(stream_send(
+                session_id,
+                &mint_jwt(user_id),
+                json!({"content": "hi", "client_msg_id": "01J6666666666666666666666D", "character": marker_card(&key)}),
+                &WITH_BYOC_SECRET,
+            ))
+            .await
+            .unwrap();
+        let (status, code, _) = refusal(resp).await;
+        assert_eq!((status, code.as_str()), (400, "invalid_payload"));
+        assert_eq!(session_footprint(&pool, session_id).await, before);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn character_under_the_wrong_key_is_403(pool: PgPool) {
+        use crate::routes::companion::testutil::session_footprint;
+        let user_id = Uuid::new_v4();
+        let (session_id, _) = byoc_session(&pool, user_id).await;
+        let before = session_footprint(&pool, session_id).await;
+        let other_key = crate::byoc::mint_key();
+
+        let mut app = build_router(byoc_state(pool.clone(), "http://127.0.0.1:1"));
+        let resp = app
+            .call(stream_send(
+                session_id,
+                &mint_jwt(user_id),
+                json!({"content": "hi", "client_msg_id": "01J6666666666666666666666E", "character": marker_card(&other_key)}),
+                &WITH_BYOC_SECRET,
+            ))
+            .await
+            .unwrap();
+        let (status, code, _) = refusal(resp).await;
+        assert_eq!((status, code.as_str()), (403, "byoc_card_rejected"));
+        assert_eq!(session_footprint(&pool, session_id).await, before);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn character_without_the_secret_is_403(pool: PgPool) {
+        use crate::routes::companion::testutil::session_footprint;
+        let user_id = Uuid::new_v4();
+        let token = mint_jwt(user_id);
+
+        // BYOC on, header missing.
+        let (session_id, key) = byoc_session(&pool, user_id).await;
+        let before = session_footprint(&pool, session_id).await;
+        let mut app = build_router(byoc_state(pool.clone(), "http://127.0.0.1:1"));
+        let resp = app
+            .call(stream_send(
+                session_id,
+                &token,
+                json!({"content": "hi", "client_msg_id": "01J6666666666666666666666F", "character": marker_card(&key)}),
+                &[],
+            ))
+            .await
+            .unwrap();
+        let (status, code, _) = refusal(resp).await;
+        assert_eq!((status, code.as_str()), (403, "byoc_forbidden"));
+        assert_eq!(session_footprint(&pool, session_id).await, before);
+
+        // BYOC off on this deployment: a card on a genome session is refused
+        // for the missing feature, not for the instance's kind.
+        let genome_session = byok_session(&pool, user_id).await;
+        let before = session_footprint(&pool, genome_session).await;
+        let mut app = build_router(crate::routes::companion::test_state(pool.clone()));
+        let resp = app
+            .call(stream_send(
+                genome_session,
+                &token,
+                json!({"content": "hi", "client_msg_id": "01J6666666666666666666666G", "character": marker_card(&key)}),
+                &WITH_BYOC_SECRET,
+            ))
+            .await
+            .unwrap();
+        let (status, code, _) = refusal(resp).await;
+        assert_eq!((status, code.as_str()), (403, "byoc_forbidden"));
+        assert_eq!(session_footprint(&pool, genome_session).await, before);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn byoc_error_bodies_never_quote_the_card(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (session_id, key) = byoc_session(&pool, user_id).await;
+        let card = crate::byoc::seal(
+            &key,
+            json!({"spec": "eros-character", "spec_version": "1", "data": {
+                "name": "BYOC-NAME-MARKER",
+                "system_prompt": "p",
+                "BYOC-NAME-MARKER": 1,
+            }})
+            .to_string()
+            .as_bytes(),
+        );
+
+        let mut app = build_router(byoc_state(pool.clone(), "http://127.0.0.1:1"));
+        let resp = app
+            .call(stream_send(
+                session_id,
+                &mint_jwt(user_id),
+                json!({"content": "hi", "client_msg_id": "01J6666666666666666666666H", "character": card}),
+                &WITH_BYOC_SECRET,
+            ))
+            .await
+            .unwrap();
+        let (status, code, text) = refusal(resp).await;
+        assert_eq!((status, code.as_str()), (400, "invalid_payload"));
+        assert!(!text.contains("BYOC-NAME-MARKER"), "{text}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn byok_and_byoc_combine_on_one_turn(pool: PgPool) {
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi there\"}}],\"id\":\"gen-byoc-byok\",\"model\":\"gpt-x\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/byok/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (session_id, key) = byoc_session(&pool, user_id).await;
+        let mut state = byok_state(pool.clone(), &mock.uri());
+        crate::routes::companion::testutil::enable_byoc(&mut state);
+        let mut app = build_router(state);
+        let resp = app
+            .call(stream_send(
+                session_id,
+                &mint_jwt(user_id),
+                json!({
+                    "content": "hi",
+                    "client_msg_id": "01J6666666666666666666666J",
+                    "character": marker_card(&key),
+                    "byok": byok_block(&mock.uri()),
+                }),
+                &[WITH_BYOC_SECRET[0], ("X-Byok-Caller-Secret", BYOK_SECRET)],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        assert!(std::str::from_utf8(&body).unwrap().contains("hi there"));
+
+        let byok_bodies: Vec<String> = mock
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == "/byok/v1/chat/completions")
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        assert_eq!(byok_bodies.len(), 1);
+        assert!(
+            byok_bodies[0].contains("BYOC-SYSTEM-MARKER"),
+            "the BYOK model got the card's prompt: {}",
+            byok_bodies[0]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3411,6 +3805,7 @@ mod validate_payload_tests {
             action: None,
             byok: None,
             outfit: None,
+            character: None,
         }
     }
 
@@ -3511,6 +3906,7 @@ mod validate_payload_tests {
             action: None,
             byok: None,
             outfit: None,
+            character: None,
         }
     }
 

@@ -946,6 +946,7 @@ async fn edit_image(
         let caption_bg = outcome.caption.clone();
         let tier_bg = req.tier.clone();
         let umid_bg = instruction_message_id.expect("full turn persisted the instruction");
+        let persona_name_bg = persona.genome.name.clone();
         tokio::spawn(async move {
             // A full turn counts as contact: reset the ghost streak the way
             // the chat stream does before spawning post_process.
@@ -966,6 +967,7 @@ async fn edit_image(
                 session_id,
                 user_id,
                 instance_id,
+                persona_name_bg,
                 // post_process never reads the quote; skip rebuilding it.
                 edit_turn_event(instruction_bg, umid_bg, None, tier_bg, prompt_traits),
                 plan,
@@ -986,12 +988,14 @@ async fn edit_image(
         );
         let task_state = state.clone();
         let instruction = instruction.clone();
+        let persona_name = persona.genome.name.clone();
         tokio::spawn(async move {
             crate::pipeline::post_process::run_affinity_turn(
                 &task_state,
                 session_id,
                 user_id,
                 instance_id,
+                &persona_name,
                 ActionType::ReplyImage,
                 &instruction,
                 &eval_text,

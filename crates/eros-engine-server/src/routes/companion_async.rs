@@ -137,6 +137,16 @@ pub async fn send_message_async(
             original_user_message_id: None,
         }));
     }
+    // Nor a card (spec 2026-10-16-byoc §3.3).
+    if req.character.is_some() {
+        return Err(AppError::StreamPre(StreamPreError {
+            status: StatusCode::BAD_REQUEST,
+            code: "invalid_payload",
+            message: "character is not accepted on the async endpoint".into(),
+            user_message: "请求无效".into(),
+            original_user_message_id: None,
+        }));
+    }
     validate_payload(&req)?;
     validate_image_capability(&req, &state.model_config)?;
     // Validate now so a bad request 400s at enqueue, not silently in the
@@ -560,6 +570,27 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
         assert_eq!(body["code"], "byoc_unsupported");
+        assert_eq!(session_footprint(&pool, session_id).await, before);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn async_send_refuses_a_character_field(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let before = session_footprint(&pool, session_id).await;
+
+        let mut app = build_router(test_state(pool.clone()));
+        let (status, body) = post_json(
+            &mut app,
+            &async_uri(session_id),
+            &mint_test_jwt(user_id),
+            json!({"content":"hi","client_msg_id":"01JV000000000000000000006A","character":"AAAA"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert_eq!(body["code"], "invalid_payload");
         assert_eq!(session_footprint(&pool, session_id).await, before);
     }
 

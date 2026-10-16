@@ -505,6 +505,18 @@
                 "null"
               ]
             }
+          },
+          {
+            "name": "X-Byoc-Caller-Secret",
+            "in": "header",
+            "description": "The deployment's BYOC_CALLER_SECRET; required when the body carries `character`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "requestBody": {
@@ -5999,6 +6011,13 @@
                 "description": "Bring-your-own-key configuration for this turn's reply (spec\n2026-10-08-byok-chat). Honoured only with the deployment's\n`X-Byok-Caller-Secret` header; refused on the async route."
               }
             ]
+          },
+          "character": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Sealed eros-character v1 card (docs/byoc.md). Required on a BYOC\ninstance; refused on any other."
           },
           "client_msg_id": {
             "type": "string"
