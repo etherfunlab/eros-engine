@@ -1,0 +1,31 @@
+name: CLA
+# Every pull request, docs-only ones included; the checks in ci.yml skip a PR
+# that changes only Markdown or docs/.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  cla:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    # Override the read-only top-level default: the CLA assistant comments on the
+    # PR and sets a commit status. Signature storage uses CLA_BOT_TOKEN, so the
+    # GITHUB_TOKEN only needs PR + status writes (contents stays read).
+    permissions:
+      contents: read
+      pull-requests: write
+      statuses: write
+      actions: write
+    steps:
+      - uses: contributor-assistant/github-action@v2.4.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PERSONAL_ACCESS_TOKEN: ${{ secrets.CLA_BOT_TOKEN }}
+        with:
+          path-to-signatures: 'cla-signatures.json'
+          path-to-document: 'https://github.com/etherfunlab/eros-engine/blob/main/CLA.md'
+          branch: 'main'
+          allowlist: dependabot[bot],enriquephl

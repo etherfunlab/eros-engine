@@ -1,8 +1,13 @@
 name: CI
 # Pull requests are the only gate: promotes to main are fast-forwards of
-# commits already tested on their PR, so no push trigger is needed.
+# commits already tested on their PR, so no push trigger is needed. A PR that
+# changes only Markdown or docs/ runs none of these checks: nothing here reads
+# them. The CLA check runs on every PR from its own workflow (cla.yml).
 on:
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
 
 # All jobs here are read-only checks (fmt / clippy / test / openapi snapshot).
 # Pin the token to the minimum so a compromised action can't write.
@@ -74,25 +79,3 @@ jobs:
             echo "::error::Regenerate locally: cargo run -p eros-engine-server -- print-openapi > crates/eros-engine-server/openapi.json"
             exit 1
           fi
-
-  cla:
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
-    # Override the read-only top-level default: the CLA assistant comments on the
-    # PR and sets a commit status. Signature storage uses CLA_BOT_TOKEN, so the
-    # GITHUB_TOKEN only needs PR + status writes (contents stays read).
-    permissions:
-      contents: read
-      pull-requests: write
-      statuses: write
-      actions: write
-    steps:
-      - uses: contributor-assistant/github-action@v2.4.0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PERSONAL_ACCESS_TOKEN: ${{ secrets.CLA_BOT_TOKEN }}
-        with:
-          path-to-signatures: 'cla-signatures.json'
-          path-to-document: 'https://github.com/etherfunlab/eros-engine/blob/main/CLA.md'
-          branch: 'main'
-          allowlist: dependabot[bot],enriquephl
