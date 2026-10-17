@@ -14,7 +14,7 @@ operators rolling it out, and code that depends on the `eros-engine-core` or
 
 | kinds | what a client sees |
 |---|---|
-| `busy`, `in_battle`, `asleep` | offline, as `away_from_phone`: her 1:1 text turns ghost while they last and `/open` returns `null`. `busy` and `in_battle` are announced in a message at intimacy rung 2 and up; below that, and always for `asleep`, the event comes back with `"message": null` |
+| `busy`, `in_battle`, `asleep` | offline, as `away_from_phone`: while they last her 1:1 text turns ghost, except turns that carry an `action` or `image.force = true`, and `/open` returns `"greeting": null`. `busy` and `in_battle` are announced in a message at intimacy rung 2 and up; below that, and always for `asleep`, the event comes back with `"message": null` |
 | `period_scare`, `pregnancy_scare` | a female persona only, at rung 2 and rung 3; told as a scare, resolved as a false alarm in her next message in that session after it ends |
 | `got_bumped`, `bumped_someone`, `quarrel`, `scolded_by_superior`, `scolded_superior` | ordinary incidents, told in a message |
 
@@ -27,9 +27,9 @@ values. Every kind is in
 **`kinds` takes an object.** Besides an array (an allowlist), `kinds` accepts
 `{"allow": […], "disallow": […]}`: what `allow` allows (absent: every kind)
 minus what `disallow` lists. `{"disallow": ["sudden_desire",
-"pregnancy_scare"]}` keeps the two kinds with adult themes away from users who
-should not get them while every other kind, including kinds added later, is
-still drawn. `v2.2.2` rejects the object form with `422`, so a caller that
+"pregnancy_scare"]}` keeps the two kinds the docs mark as adult themes away from
+users who should not get them while every other kind, including kinds added
+later, is still drawn. `v2.2.2` rejects the object form with `422`, so a caller that
 wants none of the new kinds before it switches sends an array of the 28 old
 kinds until the new image serves, then moves to `disallow`.
 
