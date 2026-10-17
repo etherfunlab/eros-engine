@@ -1558,26 +1558,6 @@ pub fn build_prompt(
         if let Some(s) = needs.map(str::trim).filter(|s| !s.is_empty()) {
             lines.push(format!("- 此刻的需要：{s}"));
         }
-        // The events she is in, after her needs; then what she has not yet
-        // said about an offline stretch or a false alarm.
-        if let Some(ev) = event {
-            if let Some(s) = ev
-                .under_way
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
-                lines.push(format!("- 正在经历：{s}"));
-            }
-            if let Some(s) = ev
-                .just_now
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
-                lines.push(format!("- 刚才：{s}"));
-            }
-        }
         if lines.is_empty() {
             String::new()
         } else {
@@ -1674,6 +1654,25 @@ pub fn build_prompt(
     let birthday = birthday_line(persona, now)
         .map(|l| format!("\n{l}"))
         .unwrap_or_default();
+    // The events she is in, then what she has not yet said about an offline
+    // stretch or a false alarm. They are drawn facts of this moment, so they
+    // sit under `[now]`, outside `[character_state]`, whose header defers to
+    // the blocks above it: a story digest written before an event started
+    // must not override it.
+    let events: String = event
+        .into_iter()
+        .flat_map(|ev| {
+            [
+                ("正在经历", ev.under_way.as_deref()),
+                ("刚才", ev.just_now.as_deref()),
+            ]
+        })
+        .filter_map(|(label, v)| {
+            v.map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| format!("\n- {label}：{s}"))
+        })
+        .collect();
 
     format!(
         "{head}{guard}{identity}\n\
@@ -1690,7 +1689,7 @@ pub fn build_prompt(
          [reply_length]\n{lr}{relationship}\
          {attitude}{state}{hints_section}{emotional_section}{quote_section}\n\
          \n\
-         [now]\n{tc}{holiday}{birthday}{this_turn}\n\
+         [now]\n{tc}{holiday}{birthday}{events}{this_turn}\n\
          \n\
          ---\n\
          [iron_rules — 违反即失效]\n\
@@ -4266,15 +4265,21 @@ mod tests {
     }
 
     #[test]
-    fn character_state_lists_the_event_after_the_needs() {
+    fn the_events_render_under_now_not_in_character_state() {
         let p = prompt_with_event(Some("饿了"), Some("临时接到工作（约 2 小时后结束）"));
-        let needs = p.find("- 此刻的需要：饿了").expect(&p);
+        let now = p.find("[now]").expect(&p);
+        let time = p.find("现在你当地时间是").expect(&p);
         let event = p
-            .find("- 正在经历：临时接到工作（约 2 小时后结束）")
+            .find("\n- 正在经历：临时接到工作（约 2 小时后结束）")
             .expect(&p);
-        assert!(needs < event, "{p}");
+        let iron = p.find("[iron_rules").expect(&p);
+        assert!(now < time && time < event && event < iron, "{p}");
+        let state = p.find("[character_state]").expect(&p);
+        let needs = p.find("- 此刻的需要：饿了").expect(&p);
+        assert!(state < needs && needs < now, "{p}");
         let alone = prompt_with_event(None, Some("天气突然变了（约 3 小时后结束）"));
-        assert!(alone.contains("[character_state]"), "{alone}");
+        assert!(!alone.contains("[character_state]"), "{alone}");
+        assert!(alone.contains("- 正在经历：天气突然变了"), "{alone}");
         assert_eq!(
             prompt_with_event(None, Some(" ")),
             prompt_with_event(None, None)

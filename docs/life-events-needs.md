@@ -344,8 +344,10 @@ The events under way at a moment are the background and the incident whose
   Chinese name per kind (`reading` is `在看书`, `long_trip` is `长途旅游`). The line is absent
   when nothing is under way, no offline stretch is unexplained and no false alarm is
   unresolved (below).
-- **The reply** gets `- 正在经历：` in `[character_state]`, after `此刻的需要`, listing the same
-  two events with only the end:
+- **The reply** gets `- 正在经历：` under `[now]`, after the time, holiday and birthday lines,
+  listing the same two events with only the end. The `- 刚才：` line below follows it. Both sit
+  outside `[character_state]`, whose header defers to the blocks above it, so a story digest
+  written before an event started does not override the event:
 
   ```
   - 正在经历：长途旅游（约 3 天后结束）；在看书（约 2 小时后结束）
@@ -567,7 +569,8 @@ again.
   `[需求]` and `[近期事件]` lines (`build_pde_ctx`), the offline branch ahead of the judge,
   `body_state_frame`.
 - `crates/eros-engine-server/src/prompt.rs`: `needs_line`, `events_judge_text`,
-  `events_reply_text`, `just_now_text`, `persona_traits`, and the `[character_state]` lines.
+  `events_reply_text`, `just_now_text`, `persona_traits`, the `[character_state]` lines and the
+  event lines under `[now]`.
 - `crates/eros-engine-server/src/routes/session_effects.rs`: `GET …/effects`.
 - `crates/eros-engine-server/src/pipeline/voice.rs`: the bootstrap's needs.
 - `crates/eros-engine-store/src/events.rs::EventRepo`: `insert`, `by_key`, `recent`, `current`,

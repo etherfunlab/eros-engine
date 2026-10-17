@@ -1087,7 +1087,7 @@ reply does not count. Her other sessions never carry it.
   same local day. An opener that is generating when an event message lands
   yields and returns `null`.
 - **While it lasts.** The judge's context carries a `[近期事件]` line and the
-  reply's `[character_state]` a `- 正在经历：…` line, each listing the
+  reply's `[now]` block a `- 正在经历：…` line, each listing the
   background and the incident under way; `/open` greetings carry the
   `- 正在经历：…` line too. `GET …/effects` shows both. After an offline kind
   has ended, in a session where it ghosted her messages, or a false alarm has
