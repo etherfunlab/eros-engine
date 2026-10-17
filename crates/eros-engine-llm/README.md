@@ -19,8 +19,8 @@ External LLM + embedding HTTP clients for the [`eros-engine`](https://github.com
 
 ```toml
 [dependencies]
-eros-engine-llm  = "2.2"
-eros-engine-core = "2.2"
+eros-engine-llm  = "2.3"
+eros-engine-core = "2.3"
 ```
 
 ## License
