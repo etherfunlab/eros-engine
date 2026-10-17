@@ -90,5 +90,6 @@ reads an event of a kind it does not know as absent: it does not go silent for
 `busy`, `in_battle` or `asleep`, does not resolve a scare, and may draw inside
 such an event's window. If any BYOC instance exists, it answers `500` on
 `GET /bff/v1/comp/affinities/{user_id}` for a user with a BYOC relationship,
-and treats the instance as missing (`404`) everywhere else. Rolling back past
-`v2.2.2` loses the v1 event metadata that `0073` removed.
+and treats the instance as missing (`404`) everywhere else. No image older than
+`v2.2.2` runs on a database past `0073`: the v1 event metadata and its
+idempotency index it relies on are gone.
