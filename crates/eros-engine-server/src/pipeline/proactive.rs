@@ -98,10 +98,8 @@ pub(crate) enum LifeChoiceCue {
     /// with the choice.
     Ask { tier_gap: i16 },
     /// The user agreed: they do not talk for `hours`.
-    #[allow(dead_code)] // said by the resolution route
     Goodbye { hours: i64 },
     /// The user declined.
-    #[allow(dead_code)] // said by the resolution route
     Hurt,
 }
 

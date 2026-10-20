@@ -2416,6 +2416,114 @@
         ]
       }
     },
+    "/v2/comp/session/{session_id}/life-choices/{choice_id}": {
+      "post": {
+        "tags": [
+          "companion"
+        ],
+        "summary": "Answer her ask for space.",
+        "description": "One transaction answers the choice and pays for it. Accept: the choice\nbecomes `accepted`, a `taking_space` separation starts now and lasts 6 hours\nper tier of the gap she asked at (12, 18 or 24 hours; she is offline for\nit, and an incident under way ends), and bond and chemistry each drop one\ntier. Decline: the choice becomes `declined` and the two lines drop one\ntier, with no separation. Either way she then answers in one proactive\nmessage, persisted like any reply and returned; if that generation fails\nthe call still succeeds with `message: null`.\n\n`409` when the choice is no longer pending: answered already (an ordinary\nmessage from the user counts, and the first writer wins), or lapsed 24\nhours after she asked. `404` when the choice is not in this session.",
+        "operationId": "respond_to_life_choice",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Chat session id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "choice_id",
+            "in": "path",
+            "description": "The choice's id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LifeChoiceRespondRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LifeChoiceRespondResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`response` is not `accept` or `decline`, or another malformed body field"
+          },
+          "429": {
+            "description": "per-user in-flight cap reached"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v2/comp/session/{session_id}/message/async": {
       "post": {
         "tags": [
@@ -4686,7 +4794,8 @@
           "first_meet",
           "returning",
           "just_opened",
-          "event"
+          "event",
+          "life_choice"
         ]
       },
       "GroupDto": {
@@ -5349,6 +5458,124 @@
           },
           "to": {
             "type": "string"
+          }
+        }
+      },
+      "LifeChoiceAnswer": {
+        "type": "string",
+        "description": "The user's answer to the ask.",
+        "enum": [
+          "accept",
+          "decline"
+        ]
+      },
+      "LifeChoiceRespondRequest": {
+        "type": "object",
+        "required": [
+          "response"
+        ],
+        "properties": {
+          "affinity_scope": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AffinityScopeDto"
+              }
+            ]
+          },
+          "audit": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LlmAuditDto"
+              }
+            ]
+          },
+          "memory_scope": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "prompt_traits": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/PromptTraitDto"
+            }
+          },
+          "response": {
+            "$ref": "#/components/schemas/LifeChoiceAnswer"
+          },
+          "tier": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "user_country": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "user_region": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "user_timezone": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "As on `/open`: the user's IANA timezone, for `[now]`."
+          }
+        }
+      },
+      "LifeChoiceRespondResponse": {
+        "type": "object",
+        "required": [
+          "status",
+          "affinity"
+        ],
+        "properties": {
+          "affinity": {
+            "$ref": "#/components/schemas/AffinitySnapshot",
+            "description": "The relationship after the drop."
+          },
+          "event": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EventView",
+                "description": "The separation an accept started; `null` after a decline."
+              }
+            ]
+          },
+          "message": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/GreetingDto",
+                "description": "What she says back: the goodbye after an accept, the hurt reply after\na decline. `null` when the generation failed, came back blank or a\nnewer message landed first; the answer and its costs stand either way."
+              }
+            ]
+          },
+          "status": {
+            "type": "string",
+            "description": "The choice's new status: `accepted` or `declined`."
           }
         }
       },

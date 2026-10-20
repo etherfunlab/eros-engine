@@ -124,6 +124,16 @@ impl LifeChoiceRepo<'_> {
         Ok(Some(choice))
     }
 
+    /// One choice by id, in whatever state it is in.
+    pub async fn get(&self, choice_id: Uuid) -> Result<Option<LifeChoiceRecord>, sqlx::Error> {
+        sqlx::query_as(&format!(
+            "SELECT {COLUMNS} FROM engine.life_choices WHERE id = $1"
+        ))
+        .bind(choice_id)
+        .fetch_optional(self.pool)
+        .await
+    }
+
     /// The session's unanswered choice that has not lapsed at `now`.
     pub async fn pending(
         &self,
@@ -243,12 +253,26 @@ impl LifeChoiceRepo<'_> {
         .await
     }
 
-    /// Record the separation an accept wrote.
+    /// Record the separation an accept wrote. See [`Self::set_event_in_tx`].
     pub async fn set_event(&self, choice_id: Uuid, event_id: Uuid) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        Self::set_event_in_tx(&mut tx, choice_id, event_id).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// [`Self::set_event`] inside the caller's transaction, so the link
+    /// commits or rolls back together with the separation it names and the
+    /// resolution it belongs to; nothing here commits.
+    pub async fn set_event_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        choice_id: Uuid,
+        event_id: Uuid,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE engine.life_choices SET event_id = $2 WHERE id = $1")
             .bind(choice_id)
             .bind(event_id)
-            .execute(self.pool)
+            .execute(&mut **tx)
             .await?;
         Ok(())
     }
@@ -588,6 +612,88 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!((message_id, event_id), (None, None));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_reads_a_choice_by_id_whatever_its_state(pool: PgPool) {
+        let (_, _, session) = instance_and_session(&pool).await;
+        let repo = LifeChoiceRepo { pool: &pool };
+        assert_eq!(repo.get(Uuid::new_v4()).await.unwrap(), None);
+        let choice = repo
+            .insert_ask(session, 3, &ask_message("想先分开"))
+            .await
+            .unwrap()
+            .expect("written");
+        assert_eq!(repo.get(choice.id).await.unwrap(), Some(choice.clone()));
+
+        let answered = repo
+            .resolve(choice.id, "declined", choice.asked_at + Duration::hours(1))
+            .await
+            .unwrap()
+            .expect("resolved");
+        assert_eq!(
+            repo.get(choice.id).await.unwrap(),
+            Some(answered),
+            "an answered choice reads too"
+        );
+    }
+
+    /// The accept's shape: resolve, the separation, and the link between them
+    /// in the caller's one transaction.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn set_event_in_tx_commits_or_rolls_back_with_the_transaction(pool: PgPool) {
+        use crate::events::{EventRepo, NewEvent};
+        use eros_engine_core::events::EventKind;
+
+        let (_, instance, session) = instance_and_session(&pool).await;
+        let repo = LifeChoiceRepo { pool: &pool };
+        let choice = repo
+            .insert_ask(session, 3, &ask_message("想先分开"))
+            .await
+            .unwrap()
+            .expect("written");
+        let at = choice.asked_at + Duration::hours(1);
+        let choice_id = choice.id;
+        let linked = |commit: bool| {
+            let pool = pool.clone();
+            async move {
+                let mut tx = pool.begin().await.unwrap();
+                let event = EventRepo::insert_preempting_in_tx(
+                    &mut tx,
+                    &NewEvent {
+                        instance_id: instance,
+                        session_id: session,
+                        event_key: "taking_space",
+                        kind: EventKind::TakingSpace,
+                        started_at: at,
+                        ends_at: at + Duration::hours(18),
+                    },
+                )
+                .await
+                .unwrap();
+                LifeChoiceRepo::set_event_in_tx(&mut tx, choice_id, event.id)
+                    .await
+                    .unwrap();
+                if commit {
+                    tx.commit().await.unwrap();
+                }
+                event.id
+            }
+        };
+        let event_id = |pool: PgPool| async move {
+            sqlx::query_scalar::<_, Option<Uuid>>(
+                "SELECT event_id FROM engine.life_choices WHERE id = $1",
+            )
+            .bind(choice_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+
+        linked(false).await;
+        assert_eq!(event_id(pool.clone()).await, None, "dropped: no link");
+        let written = linked(true).await;
+        assert_eq!(event_id(pool.clone()).await, Some(written));
     }
 
     /// The ignore conversion's shape: resolve first, the falling-out second,
