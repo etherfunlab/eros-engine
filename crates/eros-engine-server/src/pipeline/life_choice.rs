@@ -1348,4 +1348,61 @@ mod tests {
             judge[0]
         );
     }
+
+    /// The conversion is all or nothing, and a failure of it never costs the
+    /// user their reply. A falling-out already sits under the key the
+    /// conversion is about to write (the incident cap runs first, then the
+    /// insert hits the unique key and fails), so the production function's
+    /// own transaction must undo the resolve and the cap together: the ask
+    /// stays pending, the seeded row is untouched, and the turn is answered.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_failed_conversion_insert_leaves_the_ask_pending_and_the_turn_alive(pool: PgPool) {
+        let s = scene(&pool).await;
+        let (state, mock) = turn_env(&pool).await;
+        let sent = recent(10);
+        let choice = s.pending_at(sent - Duration::hours(2)).await;
+        // Running at the message, in the choice's own session: the cap would
+        // end it at `sent`, and its key is the one the insert is about to take.
+        let (started, ends) = (sent - Duration::minutes(20), sent + Duration::minutes(40));
+        sqlx::query(
+            "INSERT INTO engine.persona_events \
+               (instance_id, session_id, event_key, kind, started_at, ends_at) \
+             VALUES ($1, $2, $3, 'fell_out', $4, $5)",
+        )
+        .bind(s.instance_id)
+        .bind(s.session_id)
+        .bind(format!("life_choice:{choice}:fell_out"))
+        .bind(started)
+        .bind(ends)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let seeded = vec![(
+            "fell_out".to_string(),
+            format!("life_choice:{choice}:fell_out"),
+            Some(s.session_id),
+            started,
+            ends,
+            None,
+        )];
+        assert_eq!(s.instance_events().await, seeded);
+
+        s.stream_turn(&state, sent, None).await;
+
+        assert_eq!(
+            s.status_of(choice).await,
+            ("pending".into(), None),
+            "the resolve went down with the failed insert"
+        );
+        assert_eq!(
+            s.instance_events().await,
+            seeded,
+            "no second row, and the cap went down with the insert (ends_at not cut to the message)"
+        );
+        assert_eq!(
+            request_to(&mock, "deepseek/x").await.len(),
+            1,
+            "the error was logged and swallowed: the turn was still answered"
+        );
+    }
 }
