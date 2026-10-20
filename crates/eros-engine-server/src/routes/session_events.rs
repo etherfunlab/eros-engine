@@ -59,6 +59,8 @@ pub enum EventKindDto {
     Quarrel,
     ScoldedBySuperior,
     ScoldedSuperior,
+    SawBag,
+    SawClothes,
     TempWork,
     ExMessage,
     WeatherChange,
@@ -73,6 +75,9 @@ pub enum EventKindDto {
     Busy,
     InBattle,
     Asleep,
+    OutShopping,
+    BrosGathering,
+    SisGathering,
     Sick,
     Period,
     Hospitalized,
@@ -102,6 +107,8 @@ impl From<EventKindDto> for EventKind {
             EventKindDto::Quarrel => EventKind::Quarrel,
             EventKindDto::ScoldedBySuperior => EventKind::ScoldedBySuperior,
             EventKindDto::ScoldedSuperior => EventKind::ScoldedSuperior,
+            EventKindDto::SawBag => EventKind::SawBag,
+            EventKindDto::SawClothes => EventKind::SawClothes,
             EventKindDto::TempWork => EventKind::TempWork,
             EventKindDto::ExMessage => EventKind::ExMessage,
             EventKindDto::WeatherChange => EventKind::WeatherChange,
@@ -116,6 +123,9 @@ impl From<EventKindDto> for EventKind {
             EventKindDto::Busy => EventKind::Busy,
             EventKindDto::InBattle => EventKind::InBattle,
             EventKindDto::Asleep => EventKind::Asleep,
+            EventKindDto::OutShopping => EventKind::OutShopping,
+            EventKindDto::BrosGathering => EventKind::BrosGathering,
+            EventKindDto::SisGathering => EventKind::SisGathering,
             EventKindDto::Sick => EventKind::Sick,
             EventKindDto::Period => EventKind::Period,
             EventKindDto::Hospitalized => EventKind::Hospitalized,
@@ -147,6 +157,8 @@ impl From<EventKind> for EventKindDto {
             EventKind::Quarrel => EventKindDto::Quarrel,
             EventKind::ScoldedBySuperior => EventKindDto::ScoldedBySuperior,
             EventKind::ScoldedSuperior => EventKindDto::ScoldedSuperior,
+            EventKind::SawBag => EventKindDto::SawBag,
+            EventKind::SawClothes => EventKindDto::SawClothes,
             EventKind::TempWork => EventKindDto::TempWork,
             EventKind::ExMessage => EventKindDto::ExMessage,
             EventKind::WeatherChange => EventKindDto::WeatherChange,
@@ -161,6 +173,9 @@ impl From<EventKind> for EventKindDto {
             EventKind::Busy => EventKindDto::Busy,
             EventKind::InBattle => EventKindDto::InBattle,
             EventKind::Asleep => EventKindDto::Asleep,
+            EventKind::OutShopping => EventKindDto::OutShopping,
+            EventKind::BrosGathering => EventKindDto::BrosGathering,
+            EventKind::SisGathering => EventKindDto::SisGathering,
             EventKind::Sick => EventKindDto::Sick,
             EventKind::Period => EventKindDto::Period,
             EventKind::Hospitalized => EventKindDto::Hospitalized,
@@ -217,7 +232,7 @@ impl From<&eros_engine_store::events::EventRecord> for EventView {
         Self {
             kind: e.kind.into(),
             category: e.kind.category().into(),
-            offline: e.kind.is_offline(),
+            offline: e.kind.may_be_offline(),
             started_at: e.started_at,
             ends_at: e.ends_at,
             message_id: e.message_id,
@@ -483,12 +498,12 @@ pub(crate) async fn draw_event_at(
     // deployment's ghosting switch and the session's message floor).
     let signals =
         crate::pipeline::compute_signals_for_session(&state.pool, session_id, &affinity).await?;
+    let traits = crate::prompt::persona_traits(&persona);
     if !state.model_config.pde_ghosting_enabled()
         || signals.message_count < eros_engine_core::ghost::GHOST_MIN_MESSAGES
     {
-        allowed.retain(|k| !k.is_offline());
+        allowed.retain(|k| !k.is_offline(&traits));
     }
-    let traits = crate::prompt::persona_traits(&persona);
     let rung = affinity.intimacy_rung();
     let Some(drawn) = events::draw(
         &DrawInput {
@@ -506,7 +521,7 @@ pub(crate) async fn draw_event_at(
 
     // A kind she does not tell is written without a message (spec
     // 2026-10-16-life-events-offline-and-scares-design.md §4.1).
-    if !events::is_told(drawn.kind, rung) {
+    if !events::is_told(drawn.kind, rung, &traits) {
         event_repo
             .insert(
                 &eros_engine_store::events::NewEvent {

@@ -280,7 +280,7 @@ impl EventRepo<'_> {
     ) -> Result<Option<EventRecord>, sqlx::Error> {
         let offline: Vec<&str> = EventKind::ALL
             .into_iter()
-            .filter(|k| k.is_offline())
+            .filter(|k| k.may_be_offline())
             .map(EventKind::as_str)
             .collect();
         let row: Option<EventColumns> = sqlx::query_as(

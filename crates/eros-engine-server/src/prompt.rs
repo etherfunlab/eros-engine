@@ -846,6 +846,8 @@ fn event_label(kind: eros_engine_core::events::EventKind) -> &'static str {
         Quarrel => "吵架了",
         ScoldedBySuperior => "被上级骂了",
         ScoldedSuperior => "骂上级了",
+        SawBag => "看中了一个包",
+        SawClothes => "看中了一件衣服",
         TempWork => "临时接到工作",
         ExMessage => "前任发来消息",
         WeatherChange => "天气突然变了",
@@ -860,6 +862,9 @@ fn event_label(kind: eros_engine_core::events::EventKind) -> &'static str {
         Busy => "正在忙",
         InBattle => "在打一场硬仗",
         Asleep => "睡着了",
+        OutShopping => "在逛街",
+        BrosGathering => "兄弟聚会",
+        SisGathering => "姐妹聚会",
         Sick => "生病中",
         Period => "月经中",
         Hospitalized => "住院",
@@ -977,6 +982,9 @@ fn aftermath_text(kind: eros_engine_core::events::EventKind) -> Option<&'static 
         Busy => "一直在忙，对方那时发来的消息你现在才看到",
         InBattle => "在打一场硬仗，对方那时发来的消息你现在才看到",
         Asleep => "睡着了，对方那时发来的消息你现在才看到",
+        OutShopping => "在逛街，对方那时发来的消息你现在才看到",
+        BrosGathering => "去了兄弟聚会，对方那时发来的消息你现在才看到",
+        SisGathering => "去了姐妹聚会，对方那时发来的消息你现在才看到",
         PeriodScare => "以为月经没来，后来来了，是虚惊一场",
         PregnancyScare => "验出两条杠，后来复查是虚惊一场",
         _ => return None,
@@ -4016,7 +4024,7 @@ mod tests {
         for kind in EventKind::ALL {
             let (rec, _) = event_at(kind, 70, -10);
             let text = just_now_text(Some(&rec), None);
-            if kind.is_offline() || kind.is_false_alarm() {
+            if kind.may_be_offline() || kind.is_false_alarm() {
                 assert!(text.is_some(), "{kind:?}");
             } else if kind == EventKind::TempWork {
                 assert_eq!(text, None, "{kind:?}");
@@ -4109,6 +4117,8 @@ mod tests {
                 "吵架了",
                 "被上级骂了",
                 "骂上级了",
+                "看中了一个包",
+                "看中了一件衣服",
                 "临时接到工作",
                 "前任发来消息",
                 "天气突然变了",
@@ -4123,6 +4133,9 @@ mod tests {
                 "正在忙",
                 "在打一场硬仗",
                 "睡着了",
+                "在逛街",
+                "兄弟聚会",
+                "姐妹聚会",
                 "生病中",
                 "月经中",
                 "住院",

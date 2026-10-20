@@ -75,6 +75,8 @@ pub enum EventKind {
     Quarrel,
     ScoldedBySuperior,
     ScoldedSuperior,
+    SawBag,
+    SawClothes,
     TempWork,
     ExMessage,
     WeatherChange,
@@ -89,6 +91,9 @@ pub enum EventKind {
     Busy,
     InBattle,
     Asleep,
+    OutShopping,
+    BrosGathering,
+    SisGathering,
     Sick,
     Period,
     Hospitalized,
@@ -101,7 +106,7 @@ pub enum EventKind {
 
 impl EventKind {
     /// Every kind, in draw order.
-    pub const ALL: [EventKind; 38] = [
+    pub const ALL: [EventKind; 43] = [
         EventKind::PoliceEncounter,
         EventKind::AnimalEncounter,
         EventKind::HitSomeone,
@@ -118,6 +123,8 @@ impl EventKind {
         EventKind::Quarrel,
         EventKind::ScoldedBySuperior,
         EventKind::ScoldedSuperior,
+        EventKind::SawBag,
+        EventKind::SawClothes,
         EventKind::TempWork,
         EventKind::ExMessage,
         EventKind::WeatherChange,
@@ -132,6 +139,9 @@ impl EventKind {
         EventKind::Busy,
         EventKind::InBattle,
         EventKind::Asleep,
+        EventKind::OutShopping,
+        EventKind::BrosGathering,
+        EventKind::SisGathering,
         EventKind::Sick,
         EventKind::Period,
         EventKind::Hospitalized,
@@ -161,6 +171,8 @@ impl EventKind {
             EventKind::Quarrel => "quarrel",
             EventKind::ScoldedBySuperior => "scolded_by_superior",
             EventKind::ScoldedSuperior => "scolded_superior",
+            EventKind::SawBag => "saw_bag",
+            EventKind::SawClothes => "saw_clothes",
             EventKind::TempWork => "temp_work",
             EventKind::ExMessage => "ex_message",
             EventKind::WeatherChange => "weather_change",
@@ -175,6 +187,9 @@ impl EventKind {
             EventKind::Busy => "busy",
             EventKind::InBattle => "in_battle",
             EventKind::Asleep => "asleep",
+            EventKind::OutShopping => "out_shopping",
+            EventKind::BrosGathering => "bros_gathering",
+            EventKind::SisGathering => "sis_gathering",
             EventKind::Sick => "sick",
             EventKind::Period => "period",
             EventKind::Hospitalized => "hospitalized",
@@ -195,13 +210,11 @@ impl EventKind {
         match self {
             PoliceEncounter | AnimalEncounter | HitSomeone | SuddenDesire | GroceryShopping
             | Showering | Bathing | InClass | OnTheWay | PeriodScare | PregnancyScare
-            | GotBumped | BumpedSomeone | Quarrel | ScoldedBySuperior | ScoldedSuperior => {
-                EventCategory::Short
-            }
+            | GotBumped | BumpedSomeone | Quarrel | ScoldedBySuperior | ScoldedSuperior
+            | SawBag | SawClothes => EventCategory::Short,
             TempWork | ExMessage | WeatherChange | GotHit | Breakup | WorkingOut | Reading
-            | Gaming | AwayFromPhone | Unwell | Irritable | Busy | InBattle | Asleep => {
-                EventCategory::Mid
-            }
+            | Gaming | AwayFromPhone | Unwell | Irritable | Busy | InBattle | Asleep
+            | OutShopping | BrosGathering | SisGathering => EventCategory::Mid,
             Sick | Period | Hospitalized | PostSurgery => EventCategory::Body,
             BusinessTrip | ShortTrip | LongTrip | HometownVisit => EventCategory::Trip,
         }
@@ -212,10 +225,26 @@ impl EventKind {
     }
 
     /// Offline kinds make the persona unreachable while they last
-    /// (spec 2026-10-16-life-events-offline-and-scares-design.md §2).
-    pub fn is_offline(self) -> bool {
+    /// (spec 2026-10-16-life-events-offline-and-scares-design.md §2). Whether
+    /// `out_shopping` does depends on the persona (spec 2026-10-19-life-events-
+    /// shopping-gatherings-and-ask-for-space-design.md §2.1): a female persona
+    /// goes dark, any other keeps replying.
+    pub fn is_offline(self, persona: &PersonaTraits) -> bool {
+        match self {
+            EventKind::OutShopping => persona.female,
+            k => k.may_be_offline(),
+        }
+    }
+
+    /// Whether the kind takes any persona offline; `is_offline` narrows it to
+    /// one persona. For a reader with no persona in hand, such as a query over
+    /// stored events.
+    pub fn may_be_offline(self) -> bool {
         use EventKind::*;
-        matches!(self, AwayFromPhone | Busy | InBattle | Asleep)
+        matches!(
+            self,
+            AwayFromPhone | Busy | InBattle | Asleep | OutShopping | BrosGathering | SisGathering
+        )
     }
 
     /// A scare that turns out to be nothing once it ends (spec
@@ -261,6 +290,8 @@ fn rule(kind: EventKind) -> Rule {
         Quarrel => (1.0, 48, Lasts::Hours(1, 1)),
         ScoldedBySuperior => (1.0, 72, Lasts::Hours(1, 1)),
         ScoldedSuperior => (0.5, 14 * DAY, Lasts::Hours(1, 1)),
+        SawBag => (2.0, 48, Lasts::Hours(1, 1)),
+        SawClothes => (2.0, 48, Lasts::Hours(1, 1)),
         TempWork => (3.0, 24, Lasts::Hours(4, 4)),
         ExMessage => (1.0, 72, Lasts::Hours(3, 3)),
         WeatherChange => (4.0, 8, Lasts::Hours(4, 4)),
@@ -275,6 +306,9 @@ fn rule(kind: EventKind) -> Rule {
         Busy => (2.0, 12, Lasts::Hours(1, 3)),
         InBattle => (1.0, 48, Lasts::Hours(2, 4)),
         Asleep => (2.0, 24, Lasts::Hours(1, 4)),
+        OutShopping => (2.0, 24, Lasts::Hours(2, 4)),
+        BrosGathering => (1.0, 72, Lasts::Hours(2, 4)),
+        SisGathering => (1.0, 72, Lasts::Hours(2, 4)),
         Sick => (3.0, 14 * DAY, Lasts::Hours(DAY, 3 * DAY)),
         Period => (3.0, 28 * DAY, Lasts::Hours(3 * DAY, 7 * DAY)),
         Hospitalized => (0.5, 60 * DAY, Lasts::Hours(2 * DAY, 5 * DAY)),
@@ -328,7 +362,8 @@ impl Health {
 /// none of them.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PersonaTraits {
-    /// `art_metadata.gender` is `"female"`: the gate on `period`.
+    /// `art_metadata.gender` is `"female"`: the gate on `period` and the
+    /// shopping finds, and what takes `out_shopping` offline.
     pub female: bool,
     pub health: Health,
     pub prefer_trip: bool,
@@ -340,7 +375,7 @@ fn passes_gate(kind: EventKind, rung: u8, persona: &PersonaTraits) -> bool {
     match kind {
         EventKind::ExMessage | EventKind::Breakup => rung >= CONFIDE_MIN_RUNG,
         EventKind::SuddenDesire => rung >= DESIRE_MIN_RUNG,
-        EventKind::Period => persona.female,
+        EventKind::Period | EventKind::SawBag | EventKind::SawClothes => persona.female,
         EventKind::PeriodScare => persona.female && rung >= CONFIDE_MIN_RUNG,
         EventKind::PregnancyScare => persona.female && rung >= DESIRE_MIN_RUNG,
         _ => true,
@@ -409,6 +444,11 @@ fn rules_out(background: EventKind, kind: EventKind) -> bool {
                 | InBattle
                 | GotBumped
                 | BumpedSomeone
+                | SawBag
+                | SawClothes
+                | OutShopping
+                | BrosGathering
+                | SisGathering
         ),
         Period => kind.is_false_alarm(),
         _ => false,
@@ -487,11 +527,11 @@ pub fn draw(input: &DrawInput, rolls: Rolls) -> Option<Drawn> {
             })
         })
         .filter(|k| {
-            !k.is_offline()
-                || !input
-                    .history
-                    .iter()
-                    .any(|e| e.kind.is_offline() && cooling(e.started_at, OFFLINE_COOLDOWN_HOURS))
+            !k.is_offline(input.persona)
+                || !input.history.iter().any(|e| {
+                    e.kind.is_offline(input.persona)
+                        && cooling(e.started_at, OFFLINE_COOLDOWN_HOURS)
+                })
         })
         .filter(|k| match background {
             Some(b) => !k.is_background() && !rules_out(b, *k),
@@ -585,11 +625,14 @@ pub fn background_kinds() -> Vec<EventKind> {
 /// Whether a drawn kind is told in a message when it starts (spec
 /// 2026-10-16-life-events-offline-and-scares-design.md §3.5): every kind that
 /// is not offline; `busy` and `in_battle` from rung 2, so she says she will be
-/// away only to someone she is close to; never `asleep` or `away_from_phone`.
-pub fn is_told(kind: EventKind, rung: u8) -> bool {
+/// away only to someone she is close to, and so does a female persona's
+/// `out_shopping` (spec 2026-10-19-life-events-shopping-gatherings-and-ask-for-
+/// space-design.md §2.1); never `asleep`, `away_from_phone` or a gathering.
+pub fn is_told(kind: EventKind, rung: u8, persona: &PersonaTraits) -> bool {
     match kind {
         EventKind::Busy | EventKind::InBattle => rung >= CONFIDE_MIN_RUNG,
-        k => !k.is_offline(),
+        EventKind::OutShopping if persona.female => rung >= CONFIDE_MIN_RUNG,
+        k => !k.is_offline(persona),
     }
 }
 
@@ -1100,7 +1143,7 @@ mod tests {
         let count = |c| EventKind::ALL.iter().filter(|k| k.category() == c).count();
         assert_eq!(
             EventCategory::ALL.map(count),
-            [16, 14, 4, 4],
+            [18, 17, 4, 4],
             "short, mid, body, trip"
         );
         assert!(!EventCategory::Short.is_background());
@@ -1129,7 +1172,7 @@ mod tests {
 
     /// The kinds added after the 28 v2 kinds; tests pinned to the weights of
     /// those 28 draw from `earlier()`.
-    const ADDED: [EventKind; 10] = [
+    const ADDED: [EventKind; 15] = [
         PeriodScare,
         PregnancyScare,
         Busy,
@@ -1140,6 +1183,11 @@ mod tests {
         Quarrel,
         ScoldedBySuperior,
         ScoldedSuperior,
+        SawBag,
+        SawClothes,
+        OutShopping,
+        BrosGathering,
+        SisGathering,
     ];
 
     fn earlier() -> Vec<EventKind> {
@@ -1243,10 +1291,15 @@ mod tests {
 
     #[test]
     fn offline_false_alarm_and_told() {
+        let none = PersonaTraits::default();
         for k in EventKind::ALL {
+            // `out_shopping` is the one kind whose answer follows the persona.
             assert_eq!(
-                k.is_offline(),
-                matches!(k, AwayFromPhone | Busy | InBattle | Asleep),
+                k.is_offline(&none),
+                matches!(
+                    k,
+                    AwayFromPhone | Busy | InBattle | Asleep | BrosGathering | SisGathering
+                ),
                 "{k:?}"
             );
             assert_eq!(
@@ -1255,14 +1308,14 @@ mod tests {
                 "{k:?}"
             );
         }
-        assert!(!is_told(Busy, 1));
-        assert!(is_told(Busy, 2));
-        assert!(!is_told(InBattle, 1));
-        assert!(is_told(InBattle, 3));
-        assert!(!is_told(Asleep, 3));
-        assert!(!is_told(AwayFromPhone, 3));
-        assert!(is_told(Reading, 1));
-        assert!(is_told(PeriodScare, 2));
+        assert!(!is_told(Busy, 1, &none));
+        assert!(is_told(Busy, 2, &none));
+        assert!(!is_told(InBattle, 1, &none));
+        assert!(is_told(InBattle, 3, &none));
+        assert!(!is_told(Asleep, 3, &none));
+        assert!(!is_told(AwayFromPhone, 3, &none));
+        assert!(is_told(Reading, 1, &none));
+        assert!(is_told(PeriodScare, 2, &none));
         for k in [
             GotBumped,
             BumpedSomeone,
@@ -1270,7 +1323,7 @@ mod tests {
             ScoldedBySuperior,
             ScoldedSuperior,
         ] {
-            assert!(is_told(k, 0), "{k:?}");
+            assert!(is_told(k, 0, &none), "{k:?}");
         }
     }
 
@@ -1341,5 +1394,222 @@ mod tests {
         let at = |n| pick_with(&female(), n, 3, &[], &[PoliceEncounter, Quarrel], r);
         assert_eq!(at(None), Some(PoliceEncounter));
         assert_eq!(at(needs(NeedLevel::Mid, NeedLevel::High)), Some(Quarrel));
+    }
+
+    #[test]
+    fn new_kinds_parse_and_count() {
+        for (k, s) in [
+            (SawBag, "saw_bag"),
+            (SawClothes, "saw_clothes"),
+            (OutShopping, "out_shopping"),
+            (BrosGathering, "bros_gathering"),
+            (SisGathering, "sis_gathering"),
+        ] {
+            assert_eq!(k.as_str(), s);
+            assert_eq!(EventKind::parse(s), Some(k));
+            assert!(EventKind::ALL.contains(&k), "{k:?}");
+        }
+        assert_eq!(EventKind::ALL.len(), 43);
+    }
+
+    #[test]
+    fn shopping_finds_need_a_female_persona() {
+        let male = PersonaTraits::default();
+        for rung in 1..=3 {
+            for k in [SawBag, SawClothes] {
+                assert_eq!(
+                    pick_with(&male, None, rung, &[], &[k], rolls(0.0, 0.0)),
+                    None,
+                    "{k:?} at rung {rung}"
+                );
+                assert_eq!(
+                    pick_with(&female(), None, rung, &[], &[k], rolls(0.0, 0.0)),
+                    Some(k),
+                    "{k:?} at rung {rung}"
+                );
+            }
+            for k in [OutShopping, BrosGathering, SisGathering] {
+                for persona in [&male, &female()] {
+                    assert_eq!(
+                        pick_with(persona, None, rung, &[], &[k], rolls(0.0, 0.0)),
+                        Some(k),
+                        "{k:?} at rung {rung}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_new_kinds_weigh_cool_and_last_as_specified() {
+        // Short: police 1 : find 2 — 0.32 × 3 = 0.96 lands on police, 0.34 on the find.
+        for k in [SawBag, SawClothes] {
+            assert_eq!(
+                pick(&[], &[PoliceEncounter, k], rolls(0.0, 0.32)),
+                Some(PoliceEncounter)
+            );
+            assert_eq!(pick(&[], &[PoliceEncounter, k], rolls(0.0, 0.34)), Some(k));
+        }
+        // Mid: out_shopping 2 : gathering 1 — 0.66 × 3 = 1.98 lands on
+        // out_shopping, 0.68 on the gathering.
+        for k in [BrosGathering, SisGathering] {
+            assert_eq!(
+                pick(&[], &[OutShopping, k], rolls(0.0, 0.66)),
+                Some(OutShopping)
+            );
+            assert_eq!(pick(&[], &[OutShopping, k], rolls(0.0, 0.68)), Some(k));
+        }
+        for (k, cooldown) in [
+            (SawBag, 48),
+            (SawClothes, 48),
+            (OutShopping, 24),
+            (BrosGathering, 72),
+            (SisGathering, 72),
+        ] {
+            let cooling = [PastEvent {
+                started_at: now() - Duration::hours(cooldown) + Duration::seconds(1),
+                ..past(k, cooldown, 1)
+            }];
+            assert_eq!(pick(&cooling, &[k], rolls(0.0, 0.0)), None, "{k:?}");
+            assert_eq!(
+                pick(&[past(k, cooldown, 1)], &[k], rolls(0.0, 0.0)),
+                Some(k),
+                "{k:?}"
+            );
+        }
+        let lasts = |kind: EventKind, duration: f64| {
+            draw(
+                &DrawInput {
+                    now: now(),
+                    needs: None,
+                    intimacy_rung: 3,
+                    persona: &female(),
+                    history: &[],
+                    allowed: &[kind],
+                },
+                Rolls {
+                    category: 0.0,
+                    kind: 0.0,
+                    duration,
+                },
+            )
+            .unwrap()
+            .lasts
+        };
+        for k in [SawBag, SawClothes] {
+            assert_eq!(lasts(k, 0.0), Duration::hours(1), "{k:?}");
+            assert_eq!(lasts(k, 1.0), Duration::hours(1), "{k:?}");
+        }
+        for k in [OutShopping, BrosGathering, SisGathering] {
+            assert_eq!(lasts(k, 0.0), Duration::hours(2), "{k:?}");
+            assert_eq!(lasts(k, 1.0), Duration::hours(4), "{k:?}");
+        }
+    }
+
+    #[test]
+    fn offline_follows_the_persona() {
+        let male = PersonaTraits::default();
+        for persona in [&male, &female()] {
+            for k in [
+                BrosGathering,
+                SisGathering,
+                AwayFromPhone,
+                Busy,
+                InBattle,
+                Asleep,
+            ] {
+                assert!(k.is_offline(persona), "{k:?}");
+            }
+            for k in [SawBag, SawClothes, Reading] {
+                assert!(!k.is_offline(persona), "{k:?}");
+            }
+        }
+        assert!(OutShopping.is_offline(&female()));
+        assert!(!OutShopping.is_offline(&male));
+        for k in EventKind::ALL {
+            assert_eq!(
+                k.may_be_offline(),
+                matches!(
+                    k,
+                    AwayFromPhone
+                        | Busy
+                        | InBattle
+                        | Asleep
+                        | OutShopping
+                        | BrosGathering
+                        | SisGathering
+                ),
+                "{k:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn told_follows_offline_and_rung() {
+        let male = PersonaTraits::default();
+        assert!(!is_told(OutShopping, 1, &female()));
+        assert!(is_told(OutShopping, 2, &female()));
+        assert!(is_told(OutShopping, 3, &female()));
+        for rung in 0..=3 {
+            assert!(is_told(OutShopping, rung, &male), "rung {rung}");
+            for persona in [&male, &female()] {
+                assert!(!is_told(BrosGathering, rung, persona), "rung {rung}");
+                assert!(!is_told(SisGathering, rung, persona), "rung {rung}");
+                assert!(is_told(SawBag, rung, persona), "rung {rung}");
+                assert!(is_told(SawClothes, rung, persona), "rung {rung}");
+            }
+        }
+    }
+
+    #[test]
+    fn shopping_and_gatherings_stay_home_from_hospital() {
+        let five = [SawBag, SawClothes, OutShopping, BrosGathering, SisGathering];
+        for bg in [Hospitalized, PostSurgery] {
+            let h = [past(bg, 1, 72)];
+            for k in five {
+                assert_eq!(pick(&h, &[k], rolls(0.0, 0.0)), None, "{bg:?} {k:?}");
+            }
+        }
+        let h = [past(Sick, 1, 48)];
+        for k in five {
+            assert_eq!(pick(&h, &[k], rolls(0.0, 0.0)), Some(k), "Sick {k:?}");
+        }
+    }
+
+    #[test]
+    fn offline_cooldown_is_persona_aware() {
+        let male = PersonaTraits::default();
+        let shopping = |started_hours_ago: i64| [past(OutShopping, started_hours_ago, 2)];
+        for k in [Busy, InBattle, Asleep, AwayFromPhone, BrosGathering] {
+            // Her shopping went dark 5 h ago: another offline kind waits.
+            assert_eq!(
+                pick_with(&female(), None, 3, &shopping(5), &[k], rolls(0.0, 0.0)),
+                None,
+                "{k:?}"
+            );
+            // The same history under a persona who kept replying blocks nothing.
+            assert_eq!(
+                pick_with(&male, None, 3, &shopping(5), &[k], rolls(0.0, 0.0)),
+                Some(k),
+                "{k:?}"
+            );
+            // And 12 h after it started it is over for her too.
+            assert_eq!(
+                pick_with(&female(), None, 3, &shopping(12), &[k], rolls(0.0, 0.0)),
+                Some(k),
+                "{k:?}"
+            );
+        }
+        // The other way round: an offline kind in the history holds back her
+        // shopping only when shopping would take her offline.
+        let asleep = [past(Asleep, 5, 2)];
+        assert_eq!(
+            pick_with(&female(), None, 3, &asleep, &[OutShopping], rolls(0.0, 0.0)),
+            None
+        );
+        assert_eq!(
+            pick_with(&male, None, 3, &asleep, &[OutShopping], rolls(0.0, 0.0)),
+            Some(OutShopping)
+        );
     }
 }

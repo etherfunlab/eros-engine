@@ -140,6 +140,8 @@ fn kind_cue(kind: EventKind, lasts: chrono::Duration) -> String {
         Quarrel => "（你刚跟人吵了一架。）".into(),
         ScoldedBySuperior => "（你刚被上级骂了一顿。）".into(),
         ScoldedSuperior => "（你刚把上级骂了一顿。）".into(),
+        SawBag => "（你在逛街，随手看到一个挺好看的包。）".into(),
+        SawClothes => "（你在逛街，随手看到一件挺好看的衣服。）".into(),
         TempWork => "（你刚临时接到一份工作，得马上去处理。）".into(),
         ExMessage => "（你的前任刚给你发来消息。）".into(),
         WeatherChange => "（你那边的天气刚刚突然变了。）".into(),
@@ -152,7 +154,10 @@ fn kind_cue(kind: EventKind, lasts: chrono::Duration) -> String {
         Irritable => "（你现在心里很烦躁。）".into(),
         Busy => "（你接下来要忙一阵，这段时间顾不上看手机。）".into(),
         InBattle => "（你接下来要去打一场硬仗，一段时间顾不上手机。）".into(),
-        AwayFromPhone | Asleep => unreachable!("{kind:?} is never told"),
+        OutShopping => "（你正在外面逛街。）".into(),
+        AwayFromPhone | Asleep | BrosGathering | SisGathering => {
+            unreachable!("{kind:?} is never told")
+        }
         Sick => format!("（你生病了，大概要 {span}才会好。）"),
         Period => "（你的月经来了。）".into(),
         Hospitalized => format!("（你刚住进医院，大概要住 {span}。）"),
@@ -450,11 +455,17 @@ mod tests {
     /// kind `is_told` lets through at any rung.
     #[test]
     fn every_kind_she_tells_has_a_cue() {
-        use eros_engine_core::events::{is_told, EventKind};
-        for k in EventKind::ALL {
-            for rung in 1..=3 {
-                if is_told(k, rung) {
-                    let _ = super::kind_cue(k, chrono::Duration::hours(1));
+        use eros_engine_core::events::{is_told, EventKind, PersonaTraits};
+        let female = PersonaTraits {
+            female: true,
+            ..Default::default()
+        };
+        for persona in [PersonaTraits::default(), female] {
+            for k in EventKind::ALL {
+                for rung in 1..=3 {
+                    if is_told(k, rung, &persona) {
+                        let _ = super::kind_cue(k, chrono::Duration::hours(1));
+                    }
                 }
             }
         }

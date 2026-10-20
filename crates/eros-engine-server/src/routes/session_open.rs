@@ -274,7 +274,7 @@ pub(crate) async fn open_at(
         .current(instance_id, None, now)
         .await?
         .foreground
-        .is_some_and(|e| e.kind.is_offline());
+        .is_some_and(|e| e.kind.is_offline(&crate::prompt::persona_traits(&persona)));
     if away {
         return Ok(OpenSessionResponse { greeting: None });
     }

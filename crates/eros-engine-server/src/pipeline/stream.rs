@@ -4483,7 +4483,7 @@ pub(crate) fn run_stream_with(
             && current
                 .foreground
                 .as_ref()
-                .is_some_and(|e| e.kind.is_offline())
+                .is_some_and(|e| e.kind.is_offline(&crate::prompt::persona_traits(&input.persona)))
         {
             if let Err(e) = chat_repo
                 .mark_user_message_ghosted(user_msg.user_message_id)
