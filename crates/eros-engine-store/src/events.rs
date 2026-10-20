@@ -171,6 +171,54 @@ impl EventRepo<'_> {
         }))
     }
 
+    /// Write an event that displaces what she is doing: every foreground
+    /// under way at `started_at` ends there, a background keeps running, and
+    /// the event lands whether or not one was. No message, and no draw guard:
+    /// the caller has decided. One transaction; a repeated `event_key` in the
+    /// session is an error and undoes the cap.
+    pub async fn insert_preempting(&self, e: &NewEvent<'_>) -> Result<EventRecord, sqlx::Error> {
+        let background: Vec<String> = events::background_kinds()
+            .into_iter()
+            .map(|k| k.as_str().to_string())
+            .collect();
+        let mut tx = self.pool.begin().await?;
+        // `started_at < $2`: a row starting at the moment itself is not capped
+        // (its `ends_at` would equal its `started_at`, which the table forbids).
+        sqlx::query(
+            "UPDATE engine.persona_events SET ends_at = $2 \
+              WHERE instance_id = $1 AND started_at < $2 AND ends_at > $2 \
+                AND NOT (kind = ANY($3))",
+        )
+        .bind(e.instance_id)
+        .bind(e.started_at)
+        .bind(&background)
+        .execute(&mut *tx)
+        .await?;
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_events \
+               (instance_id, session_id, event_key, kind, started_at, ends_at) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
+             RETURNING id",
+        )
+        .bind(e.instance_id)
+        .bind(e.session_id)
+        .bind(e.event_key)
+        .bind(e.kind.as_str())
+        .bind(e.started_at)
+        .bind(e.ends_at)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(EventRecord {
+            id,
+            kind: e.kind,
+            session_id: Some(e.session_id),
+            started_at: e.started_at,
+            ends_at: e.ends_at,
+            message_id: None,
+        })
+    }
+
     /// The event written in this session under `event_key`.
     pub async fn by_key(
         &self,
@@ -268,21 +316,20 @@ impl EventRepo<'_> {
         Ok(out)
     }
 
-    /// The instance's newest offline event that ended by `at`, when this
-    /// session holds a user row ghosted inside it and no assistant row with
-    /// text written after it ended (spec 2026-10-16-life-events-offline-and-
-    /// scares-design.md §4.2).
+    /// The instance's newest event among `offline` that ended by `at`, when
+    /// this session holds a user row ghosted inside it and no assistant row
+    /// with text written after it ended (spec 2026-10-16-life-events-offline-
+    /// and-scares-design.md §4.2). `offline` is what took this persona offline
+    /// (`events::offline_kinds`): a stretch of any other kind is not in the
+    /// query, so it cannot hide an older one that was.
     pub async fn unexplained_offline(
         &self,
         session_id: Uuid,
         instance_id: Uuid,
         at: DateTime<Utc>,
+        offline: &[EventKind],
     ) -> Result<Option<EventRecord>, sqlx::Error> {
-        let offline: Vec<&str> = EventKind::ALL
-            .into_iter()
-            .filter(|k| k.may_be_offline())
-            .map(EventKind::as_str)
-            .collect();
+        let offline: Vec<&str> = offline.iter().map(|k| k.as_str()).collect();
         let row: Option<EventColumns> = sqlx::query_as(
             "WITH off AS ( \
                  SELECT id, kind, session_id, started_at, ends_at, message_id \
@@ -360,10 +407,23 @@ mod tests {
     use crate::chat::ChatRepo;
     use crate::testutil::seed_persona_instance;
     use eros_engine_core::events::EventKind::*;
+    use eros_engine_core::events::PersonaTraits;
     use serde_json::json;
 
     fn t(s: &str) -> DateTime<Utc> {
         s.parse().unwrap()
+    }
+
+    /// The kinds that take a non-female persona offline.
+    fn kinds() -> Vec<EventKind> {
+        events::offline_kinds(&PersonaTraits::default())
+    }
+
+    fn female_kinds() -> Vec<EventKind> {
+        events::offline_kinds(&PersonaTraits {
+            female: true,
+            ..PersonaTraits::default()
+        })
     }
 
     /// An instance and one text session of it; returns (owner, instance, session).
@@ -943,7 +1003,7 @@ mod tests {
         // A user row before the window, not ghosted inside it: nothing to explain.
         row(&pool, s, "user", "2026-10-01T09:00:00Z", true).await;
         assert_eq!(
-            repo.unexplained_offline(s, i, t("2026-10-01T13:00:00Z"))
+            repo.unexplained_offline(s, i, t("2026-10-01T13:00:00Z"), &kinds())
                 .await
                 .unwrap(),
             None
@@ -951,14 +1011,14 @@ mod tests {
         // Ghosted inside the window.
         row(&pool, s, "user", "2026-10-01T11:00:00Z", true).await;
         assert_eq!(
-            repo.unexplained_offline(s, i, t("2026-10-01T13:00:00Z"))
+            repo.unexplained_offline(s, i, t("2026-10-01T13:00:00Z"), &kinds())
                 .await
                 .unwrap(),
             Some(away.clone())
         );
         // Not before the stretch ended.
         assert_eq!(
-            repo.unexplained_offline(s, i, t("2026-10-01T11:30:00Z"))
+            repo.unexplained_offline(s, i, t("2026-10-01T11:30:00Z"), &kinds())
                 .await
                 .unwrap(),
             None
@@ -966,13 +1026,13 @@ mod tests {
         // A reply after the end explains it — from the reply's moment on.
         row(&pool, s, "assistant", "2026-10-01T12:30:00Z", false).await;
         assert_eq!(
-            repo.unexplained_offline(s, i, t("2026-10-01T12:15:00Z"))
+            repo.unexplained_offline(s, i, t("2026-10-01T12:15:00Z"), &kinds())
                 .await
                 .unwrap(),
             Some(away)
         );
         assert_eq!(
-            repo.unexplained_offline(s, i, t("2026-10-01T13:00:00Z"))
+            repo.unexplained_offline(s, i, t("2026-10-01T13:00:00Z"), &kinds())
                 .await
                 .unwrap(),
             None
@@ -1000,12 +1060,12 @@ mod tests {
         .unwrap();
         row(&pool, s2, "user", "2026-10-01T11:00:00Z", true).await;
         assert!(repo
-            .unexplained_offline(s2, i, t("2026-10-01T13:00:00Z"))
+            .unexplained_offline(s2, i, t("2026-10-01T13:00:00Z"), &kinds())
             .await
             .unwrap()
             .is_some());
         assert!(repo
-            .unexplained_offline(s1, i, t("2026-10-01T13:00:00Z"))
+            .unexplained_offline(s1, i, t("2026-10-01T13:00:00Z"), &kinds())
             .await
             .unwrap()
             .is_none());
@@ -1035,7 +1095,7 @@ mod tests {
         // An action turn answered mid-stretch.
         row(&pool, s, "assistant", "2026-10-01T11:00:00Z", false).await;
         assert_eq!(
-            repo.unexplained_offline(s, i, t("2026-10-01T13:00:00Z"))
+            repo.unexplained_offline(s, i, t("2026-10-01T13:00:00Z"), &kinds())
                 .await
                 .unwrap(),
             Some(away)
@@ -1044,7 +1104,15 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn every_offline_kind_is_explained_afterwards(pool: PgPool) {
-        for kind in [AwayFromPhone, Busy, InBattle, Asleep] {
+        for kind in [
+            AwayFromPhone,
+            Busy,
+            InBattle,
+            Asleep,
+            BrosGathering,
+            SisGathering,
+            TakingSpace,
+        ] {
             let (_, i, s) = instance_and_session(&pool).await;
             let repo = EventRepo { pool: &pool };
             repo.insert(
@@ -1063,7 +1131,7 @@ mod tests {
             .unwrap();
             row(&pool, s, "user", "2026-10-01T10:30:00Z", true).await;
             let got = repo
-                .unexplained_offline(s, i, t("2026-10-01T13:00:00Z"))
+                .unexplained_offline(s, i, t("2026-10-01T13:00:00Z"), &kinds())
                 .await
                 .unwrap();
             assert_eq!(got.map(|e| e.kind), Some(kind), "{kind:?}");
@@ -1086,11 +1154,248 @@ mod tests {
         .unwrap();
         row(&pool, s, "user", "2026-10-01T10:30:00Z", true).await;
         assert_eq!(
-            repo.unexplained_offline(s, i, t("2026-10-01T13:00:00Z"))
+            repo.unexplained_offline(s, i, t("2026-10-01T13:00:00Z"), &kinds())
                 .await
                 .unwrap(),
             None,
             "reading is not offline"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_taking_space_row_is_found_by_unexplained_offline(pool: PgPool) {
+        let (_, i, s) = instance_and_session(&pool).await;
+        let repo = EventRepo { pool: &pool };
+        let space = repo
+            .insert_preempting(&ev(
+                i,
+                s,
+                "space",
+                TakingSpace,
+                "2026-10-01T10:00:00Z",
+                "2026-10-01T16:00:00Z",
+            ))
+            .await
+            .unwrap();
+        // The user honoured the break: nothing ghosted inside it, nothing to explain
+        // under the standard rule.
+        assert_eq!(
+            repo.unexplained_offline(s, i, t("2026-10-01T17:00:00Z"), &kinds())
+                .await
+                .unwrap(),
+            None
+        );
+        // A message ghosted inside the window, no reply since.
+        row(&pool, s, "user", "2026-10-01T11:00:00Z", true).await;
+        assert_eq!(
+            repo.unexplained_offline(s, i, t("2026-10-01T17:00:00Z"), &kinds())
+                .await
+                .unwrap(),
+            Some(space)
+        );
+        // A reply after the end explains it.
+        row(&pool, s, "assistant", "2026-10-01T16:30:00Z", false).await;
+        assert_eq!(
+            repo.unexplained_offline(s, i, t("2026-10-01T17:00:00Z"), &kinds())
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_non_offline_kind_for_this_persona_is_invisible_to_the_query(pool: PgPool) {
+        let (_, i, s) = instance_and_session(&pool).await;
+        let repo = EventRepo { pool: &pool };
+        let asleep = repo
+            .insert(
+                &ev(
+                    i,
+                    s,
+                    "asleep",
+                    Asleep,
+                    "2026-10-01T02:00:00Z",
+                    "2026-10-01T08:00:00Z",
+                ),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .event;
+        let shopping = repo
+            .insert(
+                &ev(
+                    i,
+                    s,
+                    "shopping",
+                    OutShopping,
+                    "2026-10-01T14:00:00Z",
+                    "2026-10-01T16:00:00Z",
+                ),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .event;
+        row(&pool, s, "user", "2026-10-01T05:00:00Z", true).await;
+        row(&pool, s, "user", "2026-10-01T15:00:00Z", true).await;
+        let at = t("2026-10-01T17:00:00Z");
+        // For a persona who stayed reachable while shopping, the newest row is not
+        // in the query at all, so the older genuine stretch is found.
+        assert_eq!(
+            repo.unexplained_offline(s, i, at, &kinds()).await.unwrap(),
+            Some(asleep)
+        );
+        // For a female persona the shopping trip is the newest offline stretch.
+        assert_eq!(
+            repo.unexplained_offline(s, i, at, &female_kinds())
+                .await
+                .unwrap(),
+            Some(shopping)
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn insert_preempting_caps_the_running_incident(pool: PgPool) {
+        let (_, i, s) = instance_and_session(&pool).await;
+        let (_, other_i, other_s) = instance_and_session(&pool).await;
+        let repo = EventRepo { pool: &pool };
+        let wrote = |e: Option<Inserted>| e.expect("written").event;
+        let trip = wrote(
+            repo.insert(
+                &ev(
+                    i,
+                    s,
+                    "trip",
+                    BusinessTrip,
+                    "2026-10-01T09:00:00Z",
+                    "2026-10-02T09:00:00Z",
+                ),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        let earlier = wrote(
+            repo.insert(
+                &ev(
+                    i,
+                    s,
+                    "gaming",
+                    Gaming,
+                    "2026-10-01T09:30:00Z",
+                    "2026-10-01T09:50:00Z",
+                ),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        wrote(
+            repo.insert(
+                &ev(
+                    i,
+                    s,
+                    "reading",
+                    Reading,
+                    "2026-10-01T10:00:00Z",
+                    "2026-10-01T14:00:00Z",
+                ),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        let elsewhere = wrote(
+            repo.insert(
+                &ev(
+                    other_i,
+                    other_s,
+                    "reading",
+                    Reading,
+                    "2026-10-01T10:00:00Z",
+                    "2026-10-01T14:00:00Z",
+                ),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+
+        let space = repo
+            .insert_preempting(&ev(
+                i,
+                s,
+                "space",
+                TakingSpace,
+                "2026-10-01T11:00:00Z",
+                "2026-10-01T17:00:00Z",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                space.kind,
+                space.session_id,
+                space.started_at,
+                space.ends_at,
+                space.message_id
+            ),
+            (
+                TakingSpace,
+                Some(s),
+                t("2026-10-01T11:00:00Z"),
+                t("2026-10-01T17:00:00Z"),
+                None
+            )
+        );
+        let ends = |k: &str| {
+            let k = k.to_string();
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, DateTime<Utc>>(
+                    "SELECT ends_at FROM engine.persona_events WHERE session_id = $1 AND event_key = $2",
+                )
+                .bind(s)
+                .bind(k)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(
+            ends("reading").await,
+            t("2026-10-01T11:00:00Z"),
+            "the running incident is capped at the new one's start"
+        );
+        assert_eq!(
+            ends("trip").await,
+            trip.ends_at,
+            "a background keeps running"
+        );
+        assert_eq!(
+            ends("gaming").await,
+            earlier.ends_at,
+            "a finished one is left"
+        );
+        let other: DateTime<Utc> =
+            sqlx::query_scalar("SELECT ends_at FROM engine.persona_events WHERE id = $1")
+                .bind(elsewhere.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(other, elsewhere.ends_at, "another instance is untouched");
+
+        let c = repo
+            .current(i, None, t("2026-10-01T12:00:00Z"))
+            .await
+            .unwrap();
+        assert_eq!(
+            (c.foreground.map(|e| e.kind), c.background.map(|e| e.id)),
+            (Some(TakingSpace), Some(trip.id)),
+            "one incident at a time, the trip underneath"
         );
     }
 
@@ -1194,13 +1499,16 @@ mod tests {
         // An image-only reply after both ends carries no `刚才` line.
         row_with(&pool, s, "assistant", "", "2026-10-01T14:00:00Z", false).await;
         assert_eq!(
-            repo.unexplained_offline(s, i, at).await.unwrap(),
+            repo.unexplained_offline(s, i, at, &kinds()).await.unwrap(),
             Some(away)
         );
         assert_eq!(repo.unresolved_scare(s, i, at).await.unwrap(), Some(scare));
         // One with text does.
         row_with(&pool, s, "assistant", "刚醒", "2026-10-01T14:30:00Z", false).await;
-        assert_eq!(repo.unexplained_offline(s, i, at).await.unwrap(), None);
+        assert_eq!(
+            repo.unexplained_offline(s, i, at, &kinds()).await.unwrap(),
+            None
+        );
         assert_eq!(repo.unresolved_scare(s, i, at).await.unwrap(), None);
     }
 

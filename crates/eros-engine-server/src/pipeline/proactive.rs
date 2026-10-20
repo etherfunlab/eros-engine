@@ -19,7 +19,7 @@
 //! docs/superpowers/specs/2026-10-15-life-events-v2-design.md §6
 
 use chrono::{DateTime, NaiveDate, Utc};
-use eros_engine_core::events::{EventKind, PersonaTraits};
+use eros_engine_core::events::{offline_kinds, EventKind, PersonaTraits};
 use eros_engine_core::persona::CompanionPersona;
 use eros_engine_core::scope::{AffinityScope, MemoryScope};
 use eros_engine_core::types::{
@@ -319,12 +319,15 @@ pub(crate) async fn greet(
     };
     let repo = eros_engine_store::events::EventRepo { pool: &state.pool };
     let current = repo.current(g.instance_id, None, g.now.now).await?;
-    // A stretch that was not offline for this persona (a non-female
-    // `out_shopping`) left nothing unsaid.
+    // Only a stretch that took this persona offline left something unsaid.
     let offline = repo
-        .unexplained_offline(g.session_id, g.instance_id, g.now.now)
-        .await?
-        .filter(|e| e.kind.is_offline(&traits));
+        .unexplained_offline(
+            g.session_id,
+            g.instance_id,
+            g.now.now,
+            &offline_kinds(&traits),
+        )
+        .await?;
     let scare = repo
         .unresolved_scare(g.session_id, g.instance_id, g.now.now)
         .await?;

@@ -4513,17 +4513,21 @@ pub(crate) fn run_stream_with(
         }
         // An offline stretch that ended with a user message ghosted inside
         // it and no reply since, and a false alarm told here and not yet
-        // resolved: this turn speaks of them. A stretch that was not offline
-        // for this persona (a non-female `out_shopping`) left nothing unsaid.
+        // resolved: this turn speaks of them. Only a stretch that took this
+        // persona offline left something unsaid.
         let repo = eros_engine_store::events::EventRepo { pool: &state.pool };
         let offline = repo
-            .unexplained_offline(user_msg.session_id, user_msg.instance_id, current.at)
+            .unexplained_offline(
+                user_msg.session_id,
+                user_msg.instance_id,
+                current.at,
+                &eros_engine_core::events::offline_kinds(&traits),
+            )
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!("stream: offline read failed: {e}");
                 None
-            })
-            .filter(|e| e.kind.is_offline(&traits));
+            });
         let scare = repo
             .unresolved_scare(user_msg.session_id, user_msg.instance_id, current.at)
             .await

@@ -643,6 +643,17 @@ pub fn background_kinds() -> Vec<EventKind> {
         .collect()
 }
 
+/// The kinds that take this persona offline: the drawn ones that
+/// `is_offline`, and `taking_space`, which is written directly and never
+/// drawn. What a query over stored events asks for.
+pub fn offline_kinds(persona: &PersonaTraits) -> Vec<EventKind> {
+    EventKind::ALL
+        .into_iter()
+        .chain(EventKind::SPECIAL)
+        .filter(|k| k.is_offline(persona))
+        .collect()
+}
+
 /// Whether a drawn kind is told in a message when it starts (spec
 /// 2026-10-16-life-events-offline-and-scares-design.md §3.5): every kind that
 /// is not offline; `busy` and `in_battle` from rung 2, so she says she will be
@@ -1613,6 +1624,37 @@ mod tests {
                 ),
                 "{k:?}"
             );
+        }
+    }
+
+    #[test]
+    fn offline_kinds_list_what_takes_this_persona_offline() {
+        let male_kinds = offline_kinds(&PersonaTraits::default());
+        let female_kinds = offline_kinds(&female());
+        for persona in [&male_kinds, &female_kinds] {
+            for k in [
+                AwayFromPhone,
+                Busy,
+                InBattle,
+                Asleep,
+                BrosGathering,
+                SisGathering,
+                TakingSpace,
+            ] {
+                assert!(persona.contains(&k), "{k:?}");
+            }
+            assert!(!persona.contains(&FellOut));
+            assert!(!persona.contains(&Reading));
+        }
+        assert!(!male_kinds.contains(&OutShopping));
+        assert!(female_kinds.contains(&OutShopping));
+        for (traits, kinds) in [
+            (PersonaTraits::default(), &male_kinds),
+            (female(), &female_kinds),
+        ] {
+            for k in EventKind::ALL.into_iter().chain(EventKind::SPECIAL) {
+                assert_eq!(kinds.contains(&k), k.is_offline(&traits), "{k:?}");
+            }
         }
     }
 
