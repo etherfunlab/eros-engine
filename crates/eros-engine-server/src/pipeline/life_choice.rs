@@ -17,6 +17,7 @@ use eros_engine_store::chat::ChatRepo;
 use eros_engine_store::events::EventRepo;
 use eros_engine_store::life_choices::LifeChoiceRepo;
 
+use crate::byoc::LoadedInstance;
 use crate::error::AppError;
 use crate::holiday::UserLocale;
 use crate::pipeline::handlers::recall_query_text;
@@ -121,6 +122,15 @@ async fn try_ask(
         _ => return Ok(()),
     }
 
+    // A genome instance only: the resolution route refuses BYOC, so an ask to
+    // a BYOC session could never be answered.
+    if !matches!(
+        crate::byoc::load_instance(state, instance_id).await?,
+        Some(LoadedInstance::Genome(_))
+    ) {
+        return Ok(());
+    }
+
     // The turn's own request fields are not carried here; the locale and the
     // tier are read back from the user row that recorded them.
     let latest = chat_repo.latest_user_message(session_id).await?;
@@ -185,7 +195,9 @@ mod tests {
 
     use crate::pipeline::post_process::run_affinity_turn;
     use crate::routes::companion::test_state;
-    use crate::routes::companion::testutil::{seed_genome, seed_instance, seed_session};
+    use crate::routes::companion::testutil::{
+        seed_byoc_instance_with_key, seed_genome, seed_instance, seed_session,
+    };
 
     /// Her ask, the cue that is the request's last `user` turn.
     const ASK_CUE: &str = "（这段关系最近让你很累：心动还在，但交情和耐心都被磨薄了。你决定郑重地告诉对方：你想先分开一阵子，希望对方给你一个答复。）";
@@ -603,6 +615,34 @@ mod tests {
             s.turn(&state, SEEN).await;
         }
         assert!(s.choices().await.is_empty());
+        assert!(companion_calls(&mock).await.is_empty());
+    }
+
+    /// A BYOC session meeting every other condition never asks: the resolution
+    /// route refuses BYOC, so the ask could only be ignored or left to lapse.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_byoc_session_never_asks(pool: PgPool) {
+        let mut s = scene(&pool).await;
+        let (instance_id, session_id) = {
+            let (instance_id, _) = seed_byoc_instance_with_key(&pool, s.user_id).await;
+            let session_id = session_with_lines(&pool, s.user_id, instance_id, 0.0, 0.7).await;
+            (instance_id, session_id)
+        };
+        // The in-memory card a BYOC turn runs on has no genome behind it.
+        s.persona.instance_id = instance_id;
+        s.persona.instance.id = instance_id;
+        s.persona.instance.genome_id = None;
+        s.persona.genome.id = None;
+        s.instance_id = instance_id;
+        s.session_id = session_id;
+
+        let mock = mock_llm(LOW_PATIENCE, Some(ASK_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+        for _ in 0..4 {
+            s.turn(&state, SEEN).await;
+        }
+        assert!(s.choices().await.is_empty());
+        assert!(s.ask_rows().await.is_empty());
         assert!(companion_calls(&mock).await.is_empty());
     }
 

@@ -570,6 +570,7 @@ mod tests {
                 .unwrap();
         assert_eq!((message_id, event_id), (None, None));
     }
+
     /// An accepted choice for `session` whose separation runs `[starts, ends)`.
     async fn accepted_with_separation(
         pool: &PgPool,
