@@ -455,6 +455,7 @@ async fn persist_affinity(
                     gateway_errors,
                     user_message_id,
                     tier_drop,
+                    1.0, // growth_scale: full speed
                 )
                 .await
             {

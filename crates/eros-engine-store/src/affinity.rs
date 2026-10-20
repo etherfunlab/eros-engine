@@ -153,6 +153,22 @@ pub struct AffinityRepo<'a> {
     pub pool: &'a PgPool,
 }
 
+/// Multiply each positive delta on the four line axes by `scale`. Negative
+/// deltas pass in full; `warmth` / `patience` are derived endpoints and are
+/// never scaled.
+fn scale_positive_line_deltas(d: &mut AffinityDeltas, scale: f64) {
+    for axis in [
+        &mut d.trust,
+        &mut d.intrigue,
+        &mut d.intimacy,
+        &mut d.tension,
+    ] {
+        if *axis > 0.0 {
+            *axis *= scale;
+        }
+    }
+}
+
 /// The one SELECT behind `AffinityRepo::load` and `load_or_create_on`.
 async fn load_on<'e>(
     executor: impl sqlx::PgExecutor<'e>,
@@ -531,6 +547,10 @@ impl<'a> AffinityRepo<'a> {
         // A refused user action's line (spec 2026-10-05-chat-user-actions-design.md
         // §6.3); `None` on every other turn.
         tier_drop: Option<eros_engine_core::affinity::AffinityLine>,
+        // Multiplier on every POSITIVE committed delta of the four line axes
+        // (the post-separation slowdown, spec 2026-10-19 §3.5); 1.0 = none.
+        // Negatives and the two derived endpoints are never scaled.
+        growth_scale: f64,
     ) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
 
@@ -572,7 +592,11 @@ impl<'a> AffinityRepo<'a> {
         };
 
         let outcome = grade_turn(&current, grades, rule_deltas, &pending, boost, tuning);
-        current.apply_deltas(&outcome.committed);
+        // The damper trims growth that would land, it does not defer it: the
+        // cut part is gone, not parked in the gate's balance.
+        let mut committed = outcome.committed.clone();
+        scale_positive_line_deltas(&mut committed, growth_scale);
+        current.apply_deltas(&committed);
         // A refused action: its line lands one tier below the pre-turn
         // position, replacing whatever the judge's grades did to it, and
         // keeps nothing buffered on its axes to land later.
@@ -676,6 +700,13 @@ impl<'a> AffinityRepo<'a> {
                 None => {
                     obj.remove("tier_drop");
                 }
+            }
+            // A slowed turn's effective deltas sit below what the gate
+            // committed; say why. Absent at full speed.
+            if growth_scale != 1.0 {
+                obj.insert("growth_scale".into(), serde_json::json!(growth_scale));
+            } else {
+                obj.remove("growth_scale");
             }
             // 4.0 endpoint audit: judge levels (only when actually read this
             // turn), the boosts and decay in force, and the per-line units —
@@ -825,6 +856,129 @@ impl<'a> AffinityRepo<'a> {
         *affinity = after;
         Ok(())
     }
+
+    /// The tier drop a life choice costs (spec 2026-10-19 §3.5), in its own
+    /// transaction. See [`Self::persist_life_choice_drop_in_tx`].
+    pub async fn persist_life_choice_drop(
+        &self,
+        session_id: Uuid,
+        choice_id: Uuid,
+        resolution: &str,
+        tuning: &AffinityTuning,
+    ) -> Result<Affinity, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let after = Self::persist_life_choice_drop_in_tx(
+            &mut tx, session_id, choice_id, resolution, tuning,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(after)
+    }
+
+    /// Bond and chemistry each drop one tier, by the rejected-action landing
+    /// rule, and both lines' threshold-gate balances are cleared. Runs inside
+    /// the caller's transaction so the drop commits or rolls back together with
+    /// the choice's resolution; nothing here commits.
+    ///
+    /// Row-locked by `session_id`; time decay and the endpoint refresh run
+    /// before the `state_before` snapshot, exactly as in
+    /// [`Self::persist_with_event`], so `effective_deltas` is the drop alone.
+    /// The event is the non-turn type `life_choice` — never a turn, so
+    /// `latest_turn_event` does not return it. `resolution` (`accept` /
+    /// `decline`) and `choice_id` go in its `context`. Returns the post-drop
+    /// state.
+    pub async fn persist_life_choice_drop_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        session_id: Uuid,
+        choice_id: Uuid,
+        resolution: &str,
+        tuning: &AffinityTuning,
+    ) -> Result<Affinity, sqlx::Error> {
+        use eros_engine_core::affinity::AffinityLine;
+
+        let mut current = sqlx::query_as::<_, AffinityRow>(
+            "SELECT * FROM engine.companion_affinity WHERE session_id = $1 FOR UPDATE",
+        )
+        .bind(session_id)
+        .fetch_one(&mut **tx)
+        .await?
+        .into_domain();
+
+        current.apply_time_decay();
+        current.refresh_endpoints(tuning);
+        let before = current.clone();
+
+        current.drop_line_tier(&before, AffinityLine::Bond);
+        current.drop_line_tier(&before, AffinityLine::Chemistry);
+        // The endpoints follow the dropped lines at decay ≈ 1: the absence gap
+        // is already in `before`, the same as after `apply_deltas` on a turn.
+        current.updated_at = Utc::now();
+        current.refresh_endpoints(tuning);
+
+        let label_changes = eros_engine_core::affinity::diff_labels(&before, &current)
+            .and_then(|c| serde_json::to_value(&c).ok());
+        let effective_line_deltas = serde_json::json!({
+            "bond": current.bond_score() - before.bond_score(),
+            "chemistry": current.chemistry_score() - before.chemistry_score(),
+        });
+        let effective = AffinityDeltas {
+            warmth: current.warmth - before.warmth,
+            trust: current.trust - before.trust,
+            intrigue: current.intrigue - before.intrigue,
+            intimacy: current.intimacy - before.intimacy,
+            patience: current.patience - before.patience,
+            tension: current.tension - before.tension,
+        };
+
+        let (returned_updated_at,): (DateTime<Utc>,) = sqlx::query_as(
+            "UPDATE engine.companion_affinity \
+             SET warmth = $2, trust = $3, intrigue = $4, intimacy = $5, \
+                 patience = $6, tension = $7, \
+                 warmth_grade = $8, patience_grade = $9, \
+                 bond_tier = $10, chem_tier = $11, \
+                 pending_deltas = $12, updated_at = now() \
+             WHERE id = $1 \
+             RETURNING updated_at",
+        )
+        .bind(current.id)
+        .bind(current.warmth)
+        .bind(current.trust)
+        .bind(current.intrigue)
+        .bind(current.intimacy)
+        .bind(current.patience)
+        .bind(current.tension)
+        .bind(current.warmth_grade)
+        .bind(current.patience_grade)
+        .bind(i16::from(current.bond_tier()))
+        .bind(i16::from(current.chem_tier()))
+        .bind(serde_json::to_value(PendingDeltas::default()).ok())
+        .fetch_one(&mut **tx)
+        .await?;
+        // As in `persist_with_event`: the snapshot's `updated_at` is the value
+        // the table holds.
+        current.updated_at = returned_updated_at;
+
+        // No judge ran: the drop is the whole raw change, so `deltas` carries
+        // the same figures as `effective_deltas`.
+        let effective_json = serde_json::to_value(&effective).unwrap_or_default();
+        sqlx::query(
+            "INSERT INTO engine.companion_affinity_events \
+               (affinity_id, event_type, deltas, effective_deltas, label_changes, \
+                effective_line_deltas, context, state_before, state_after) \
+             VALUES ($1, 'life_choice', $2, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(current.id)
+        .bind(effective_json)
+        .bind(label_changes)
+        .bind(effective_line_deltas)
+        .bind(serde_json::json!({ "life_choice": resolution, "choice_id": choice_id }))
+        .bind(state_snapshot(&before))
+        .bind(state_snapshot(&current))
+        .execute(&mut **tx)
+        .await?;
+
+        Ok(current)
+    }
 }
 
 #[cfg(test)]
@@ -851,6 +1005,7 @@ mod tests {
             None,
             None,
             None,
+            1.0,
         )
         .await
         .unwrap()
@@ -1138,6 +1293,7 @@ mod tests {
                 None,
                 None,
                 None,
+                1.0,
             )
             .await
             .unwrap();
@@ -1197,6 +1353,7 @@ mod tests {
             None,
             None,
             None,
+            1.0,
         )
         .await
         .unwrap();
@@ -1251,6 +1408,7 @@ mod tests {
                 None,
                 None,
                 None,
+                1.0,
             )
             .await
             .unwrap();
@@ -1327,6 +1485,7 @@ mod tests {
             None,
             None,
             None,
+            1.0,
         )
         .await
         .unwrap();
@@ -1403,6 +1562,7 @@ mod tests {
             None,
             None,
             None,
+            1.0,
         )
         .await
         .unwrap();
@@ -1462,6 +1622,7 @@ mod tests {
             None,
             None,
             None,
+            1.0,
         )
         .await
         .unwrap();
@@ -1495,6 +1656,7 @@ mod tests {
             None,
             None,
             None,
+            1.0,
         )
         .await
         .unwrap();
@@ -1557,6 +1719,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    1.0,
                 )
                 .await
                 .unwrap();
@@ -1616,6 +1779,7 @@ mod tests {
                 None,
                 None,
                 None,
+                1.0,
             )
             .await
             .unwrap();
@@ -1675,6 +1839,7 @@ mod tests {
             None,
             None,
             None,
+            1.0,
         )
         .await
         .unwrap();
@@ -1799,6 +1964,7 @@ mod tests {
                 None,
                 None,
                 None,
+                1.0,
             )
             .await
             .unwrap();
@@ -1823,6 +1989,7 @@ mod tests {
                 None,
                 None,
                 None,
+                1.0,
             )
             .await
             .unwrap();
@@ -2456,6 +2623,7 @@ mod tests {
             None,
             None,
             None,
+            1.0,
         )
         .await
         .unwrap();
@@ -2629,6 +2797,7 @@ mod tests {
             None,
             None,
             None,
+            1.0,
         )
         .await
         .unwrap();
@@ -2799,6 +2968,7 @@ mod tests {
             None,
             Some(umid),
             None,
+            1.0,
         )
         .await
         .unwrap();
@@ -2928,6 +3098,7 @@ mod tests {
             None,
             None,
             None,
+            1.0,
         )
         .await
         .unwrap()
@@ -3067,6 +3238,7 @@ mod tests {
             None,
             None,
             Some(AffinityLine::Chemistry),
+            1.0,
         )
         .await
         .unwrap();
@@ -3134,6 +3306,7 @@ mod tests {
             None,
             None,
             None,
+            1.0,
         )
         .await
         .unwrap();
@@ -3191,6 +3364,7 @@ mod tests {
             None,
             None,
             Some(AffinityLine::Chemistry),
+            1.0,
         )
         .await
         .unwrap();
@@ -3223,5 +3397,291 @@ mod tests {
                 "{where_}: the other line's buffer must survive: {p}"
             );
         }
+    }
+
+    /// Seed a relationship whose chemistry sits at 0.80 (tier 4) and whose bond
+    /// sits at 0.10 (tier 1), with something buffered on all four line axes.
+    async fn seed_drop_relationship(pool: &PgPool) -> (Uuid, Affinity) {
+        let repo = AffinityRepo { pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(pool, user_id).await;
+        let session = make_session(pool, user_id, instance_id).await;
+        let a = repo
+            .load_or_create(session, user_id, instance_id)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE engine.companion_affinity SET trust=0.10, intrigue=0.10, intimacy=0.9, tension=0.7, \
+             pending_deltas='{\"trust\":0.01,\"intrigue\":0.01,\"intimacy\":0.02,\"tension\":0.02}'::jsonb \
+             WHERE id=$1",
+        )
+        .bind(a.id)
+        .execute(pool)
+        .await
+        .unwrap();
+        (session, a)
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn life_choice_drop_lowers_both_lines_one_tier(pool: PgPool) {
+        use eros_engine_core::affinity::tier_drop_target;
+        let repo = AffinityRepo { pool: &pool };
+        let (session, a) = seed_drop_relationship(&pool).await;
+        let choice_id = Uuid::new_v4();
+
+        let after = repo
+            .persist_life_choice_drop(session, choice_id, "accept", &AffinityTuning::default())
+            .await
+            .unwrap();
+
+        // Returned: chemistry one tier down at the same relative position,
+        // the tier-1 bond line at zero.
+        assert!(
+            (after.chemistry_score() - tier_drop_target(0.80)).abs() < 1e-3,
+            "chemistry {}",
+            after.chemistry_score()
+        );
+        assert_eq!(after.chem_tier(), 3);
+        assert_eq!(after.bond_score(), 0.0);
+        assert_eq!(after.bond_tier(), 1);
+
+        // Stored: the same, with both lines' buffers cleared.
+        let (trust, intrigue, bond_tier, chem_tier, pending): (
+            f64,
+            f64,
+            i16,
+            i16,
+            serde_json::Value,
+        ) = sqlx::query_as(
+            "SELECT trust, intrigue, bond_tier, chem_tier, pending_deltas \
+                 FROM engine.companion_affinity WHERE id = $1",
+        )
+        .bind(a.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((trust, intrigue), (0.0, 0.0));
+        assert_eq!((bond_tier, chem_tier), (1, 3));
+        for axis in ["trust", "intrigue", "intimacy", "tension"] {
+            assert_eq!(pending[axis].as_f64(), Some(0.0), "{axis}: {pending}");
+        }
+
+        // One audit row of the non-turn type, replayable from its snapshots.
+        let events = repo
+            .list_events(session, 10, 0, Some("life_choice"))
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        let e = &events[0];
+        assert_eq!(e.user_message_id, None);
+        let (before, state_after) = (
+            e.state_before.as_ref().expect("state_before"),
+            e.state_after.as_ref().expect("state_after"),
+        );
+        let effective = e.effective_deltas.as_ref().expect("effective_deltas");
+        for axis in [
+            "warmth", "trust", "intrigue", "intimacy", "patience", "tension",
+        ] {
+            let diff = state_after[axis].as_f64().unwrap() - before[axis].as_f64().unwrap();
+            assert!(
+                (effective[axis].as_f64().unwrap() - diff).abs() < 1e-12,
+                "{axis}: effective {effective} vs after − before {diff}"
+            );
+        }
+        assert!((before["chemistry"].as_f64().unwrap() - 0.80).abs() < 1e-3);
+        assert_eq!(before["chem_tier"], 4);
+        assert_eq!(state_after["chem_tier"], 3);
+        assert_eq!(state_after["bond"].as_f64(), Some(0.0));
+        let lines = e.effective_line_deltas.as_ref().expect("line deltas");
+        assert!((lines["bond"].as_f64().unwrap() + 0.10).abs() < 1e-9);
+        assert!(lines["chemistry"].as_f64().unwrap() < 0.0);
+
+        let context: serde_json::Value = sqlx::query_scalar(
+            "SELECT context FROM engine.companion_affinity_events WHERE id = $1",
+        )
+        .bind(e.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(context["life_choice"], "accept");
+        assert_eq!(context["choice_id"], choice_id.to_string());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn life_choice_drop_is_not_a_turn_event(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let (session, mut a) = seed_drop_relationship(&pool).await;
+        persist_rule(
+            &repo,
+            &mut a,
+            AffinityDeltas {
+                trust: 0.04,
+                ..Default::default()
+            },
+        )
+        .await;
+        let turn = repo
+            .latest_turn_event(session)
+            .await
+            .unwrap()
+            .expect("the message turn");
+
+        repo.persist_life_choice_drop(
+            session,
+            Uuid::new_v4(),
+            "decline",
+            &AffinityTuning::default(),
+        )
+        .await
+        .unwrap();
+
+        let latest = repo
+            .latest_turn_event(session)
+            .await
+            .unwrap()
+            .expect("still a turn event");
+        assert_eq!(latest.id, turn.id);
+        assert_eq!(latest.event_type, "message");
+        assert_eq!(
+            repo.list_events(session, 10, 0, Some("life_choice"))
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the drop is on the log, just not as a turn"
+        );
+    }
+
+    /// The caller owns the transaction, so a rollback takes the whole drop with
+    /// it: the row keeps its lines and buffers, and no event is written.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn life_choice_drop_in_tx_rolls_back_with_the_caller(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let (session, a) = seed_drop_relationship(&pool).await;
+
+        let mut tx = pool.begin().await.unwrap();
+        AffinityRepo::persist_life_choice_drop_in_tx(
+            &mut tx,
+            session,
+            Uuid::new_v4(),
+            "accept",
+            &AffinityTuning::default(),
+        )
+        .await
+        .unwrap();
+        tx.rollback().await.unwrap();
+
+        let stored = repo.load(session).await.unwrap().expect("row");
+        assert_eq!((stored.trust, stored.intimacy), (0.10, 0.9));
+        let pending: serde_json::Value = sqlx::query_scalar(
+            "SELECT pending_deltas FROM engine.companion_affinity WHERE id = $1",
+        )
+        .bind(a.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(pending["intimacy"].as_f64(), Some(0.02));
+        assert!(repo
+            .list_events(session, 10, 0, Some("life_choice"))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn growth_scale_halves_positive_line_deltas_only(pool: PgPool) {
+        /// One rule-only turn on a fresh tier-1 relationship (no tier decay, no
+        /// cross penalty, so rule values land 1:1): trust +0.04, tension −0.02.
+        async fn turn(pool: &PgPool, growth_scale: f64) -> (Affinity, AffinityEventRow) {
+            let repo = AffinityRepo { pool };
+            let user_id = Uuid::new_v4();
+            let instance_id = seed_persona_instance(pool, user_id).await;
+            let session = make_session(pool, user_id, instance_id).await;
+            let mut a = repo
+                .load_or_create(session, user_id, instance_id)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE engine.companion_affinity SET trust=0.05, tension=0.2 WHERE id=$1")
+                .bind(a.id)
+                .execute(pool)
+                .await
+                .unwrap();
+            repo.persist_with_event(
+                &mut a,
+                &AxisGrades::default(),
+                &AffinityDeltas {
+                    trust: 0.04,
+                    tension: -0.02,
+                    ..Default::default()
+                },
+                1.0,
+                &AffinityTuning::default(),
+                "message",
+                serde_json::json!({}),
+                None,
+                EndpointLevelReads::default(),
+                None,
+                None,
+                None,
+                None,
+                growth_scale,
+            )
+            .await
+            .unwrap();
+            let event = repo.latest_turn_event(session).await.unwrap().unwrap();
+            (a, event)
+        }
+
+        let (full, full_event) = turn(&pool, 1.0).await;
+        let (damped, damped_event) = turn(&pool, 0.5).await;
+        let eff = |e: &AffinityEventRow, axis: &str| {
+            e.effective_deltas.as_ref().unwrap()[axis].as_f64().unwrap()
+        };
+
+        // Positive: halved, and the stored axis moved by the halved amount.
+        assert!((eff(&full_event, "trust") - 0.04).abs() < 1e-9);
+        assert!((eff(&damped_event, "trust") - 0.02).abs() < 1e-9);
+        assert!((damped.trust - 0.07).abs() < 1e-9, "trust {}", damped.trust);
+        // The raw audit keeps what the turn earned before the damper.
+        assert!((damped_event.deltas["trust"].as_f64().unwrap() - 0.04).abs() < 1e-9);
+        // Negative: in full.
+        assert!((eff(&damped_event, "tension") + 0.02).abs() < 1e-9);
+        assert!(
+            (damped.tension - 0.18).abs() < 1e-9,
+            "tension {}",
+            damped.tension
+        );
+        // Nothing else moved.
+        assert!(eff(&damped_event, "intrigue").abs() < 1e-12);
+        assert!(eff(&damped_event, "intimacy").abs() < 1e-12);
+
+        // The audit says why effective sits under what was earned; a turn at
+        // full speed carries no such key.
+        let context_of = |id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, serde_json::Value>(
+                    "SELECT context FROM engine.companion_affinity_events WHERE id = $1",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(context_of(damped_event.id).await["growth_scale"], 0.5);
+        assert!(context_of(full_event.id)
+            .await
+            .get("growth_scale")
+            .is_none());
+
+        // Endpoints are derived, never scaled: warmth reads the same chemistry
+        // in both runs, and patience is exactly what the post-turn bond derives.
+        assert!((eff(&damped_event, "warmth") - eff(&full_event, "warmth")).abs() < 1e-12);
+        assert!((damped.warmth - full.warmth).abs() < 1e-12);
+        let mut rederived = damped.clone();
+        rederived.refresh_endpoints(&AffinityTuning::default());
+        assert!((rederived.warmth - damped.warmth).abs() < 1e-9);
+        assert!((rederived.patience - damped.patience).abs() < 1e-9);
     }
 }
