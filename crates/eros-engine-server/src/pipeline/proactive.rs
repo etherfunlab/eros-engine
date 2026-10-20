@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! A persona-initiated assistant message: the holiday and birthday greetings,
-//! the caller-named openers and the life events. The route
-//! (`routes::session_open`, `routes::session_events`) decides whether the
-//! persona speaks first; this module generates and persists it. Modelled on
+//! the caller-named openers, the life events and the ask-for-space choice. The
+//! route (`routes::session_open`, `routes::session_events`) or the pipeline
+//! (`pipeline::life_choice`) decides whether the persona speaks first; this
+//! module generates and persists it. Modelled on
 //! the image-edit text half: no PDE, no streaming, no user row, no
 //! post-process.
 //!
@@ -16,7 +17,8 @@
 //!
 //! Specs: docs/superpowers/specs/2026-09-26-user-locale-and-holiday-greeting-design.md §6,
 //! docs/superpowers/specs/2026-10-03-open-occasions-design.md §5–§6,
-//! docs/superpowers/specs/2026-10-15-life-events-v2-design.md §6
+//! docs/superpowers/specs/2026-10-15-life-events-v2-design.md §6,
+//! docs/superpowers/specs/2026-10-19-life-events-shopping-gatherings-and-ask-for-space-design.md §3.2
 
 use chrono::{DateTime, NaiveDate, Utc};
 use eros_engine_core::events::{offline_kinds, EventKind, PersonaTraits};
@@ -31,6 +33,7 @@ use eros_engine_llm::openrouter::ChatMessage as WireMessage;
 use eros_engine_llm::provider::bare_model_id;
 use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::{ChatMessage, ChatRepo, ProactiveInsert};
+use eros_engine_store::life_choices::LifeChoiceRepo;
 use ulid::Ulid;
 use uuid::Uuid;
 
@@ -81,6 +84,38 @@ pub(crate) enum Occasion {
         /// The background under way when it was drawn.
         background: Option<EventKind>,
     },
+    /// What she says about the ask-for-space choice (spec
+    /// 2026-10-19-life-events-shopping-gatherings-and-ask-for-space-design.md
+    /// §3.2, §3.4).
+    LifeChoice(LifeChoiceCue),
+}
+
+/// One thing she says about the choice. The ask is written with its choice
+/// row; the goodbye and the hurt reply are plain proactive rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LifeChoiceCue {
+    /// She asks to take a break. `tier_gap` is the gap at this moment, stored
+    /// with the choice.
+    Ask { tier_gap: i16 },
+    /// The user agreed: they do not talk for `hours`.
+    #[allow(dead_code)] // said by the resolution route
+    Goodbye { hours: i64 },
+    /// The user declined.
+    #[allow(dead_code)] // said by the resolution route
+    Hurt,
+}
+
+impl LifeChoiceCue {
+    /// The stage cue: states a fact, carries no instruction.
+    fn cue(self) -> String {
+        match self {
+            Self::Ask { .. } => "（这段关系最近让你很累：心动还在，但交情和耐心都被磨薄了。你决定郑重地告诉对方：你想先分开一阵子，希望对方给你一个答复。）".into(),
+            Self::Goodbye { hours } => format!(
+                "（对方同意了你提出的分开请求，接下来 {hours} 小时你们不联系。你跟对方道别。）"
+            ),
+            Self::Hurt => "（对方不同意你提出的分开请求，你心里不好受。）".into(),
+        }
+    }
 }
 
 impl Occasion {
@@ -93,6 +128,7 @@ impl Occasion {
             Self::Returning { .. } => "returning",
             Self::JustOpened { .. } => "just_opened",
             Self::Event { .. } => "event",
+            Self::LifeChoice(_) => "life_choice",
         }
     }
 
@@ -115,6 +151,7 @@ impl Occasion {
                 background,
                 ..
             } => event_cue(*kind, *lasts, *background, rung, traits, tip_personality),
+            Self::LifeChoice(cue) => cue.cue(),
         }
     }
 }
@@ -266,7 +303,8 @@ pub(crate) struct Greeting<'a> {
 /// reply and nothing was written; or, for a greeting or opener, the insert
 /// yielded to a message that landed first; or, for an event, another event
 /// under way for the persona blocked the insert, or a concurrent call with
-/// the same `event_key` won it (the caller reads the event by key). When a
+/// the same `event_key` won it (the caller reads the event by key); or, for
+/// the ask, the session already held a pending choice. When a
 /// concurrent call for the same local date or `open_key` won the insert,
 /// returns that call's row. An event is stamped with one instant taken after
 /// generation: its message's `sent_at`, its `started_at` and the start of its
@@ -426,7 +464,7 @@ pub(crate) async fn greet(
         Occasion::FirstMeet { open_key } | Occasion::JustOpened { open_key } => {
             metadata.insert("open_key".into(), open_key.as_str().into());
         }
-        Occasion::Event { .. } => {}
+        Occasion::Event { .. } | Occasion::LifeChoice(_) => {}
     }
     metadata.insert("prompt_traits".into(), serde_json::json!(injected_tags));
     metadata.insert(
@@ -490,6 +528,24 @@ pub(crate) async fn greet(
             )
             .await?
             .and_then(|i| i.message)),
+        // The ask lands with its choice row, in one transaction; a pending
+        // choice already in the session (a concurrent ask won) leaves nothing.
+        Occasion::LifeChoice(LifeChoiceCue::Ask { tier_gap }) => {
+            let asked = LifeChoiceRepo { pool: &state.pool }
+                .insert_ask(g.session_id, *tier_gap, &row)
+                .await?;
+            match asked {
+                Some(_) => Ok(chat_repo
+                    .message_by_id_in_session(g.session_id, row.id)
+                    .await?),
+                None => Ok(None),
+            }
+        }
+        // No key to dedupe on: the row yields only to a message that landed
+        // at or after `since`.
+        Occasion::LifeChoice(LifeChoiceCue::Goodbye { .. } | LifeChoiceCue::Hurt) => Ok(chat_repo
+            .insert_open_message(g.session_id, g.since, &row)
+            .await?),
     }
 }
 
@@ -709,6 +765,30 @@ mod tests {
             ),
             "（你正在外地出差。你发现月经推迟了好几天还没来，心里有点慌。）"
         );
+    }
+
+    #[test]
+    fn the_life_choice_cues_are_exact() {
+        let cue = |c| Occasion::LifeChoice(c).cue(1, &PersonaTraits::default(), None);
+        assert_eq!(
+            cue(LifeChoiceCue::Ask { tier_gap: 3 }),
+            "（这段关系最近让你很累：心动还在，但交情和耐心都被磨薄了。你决定郑重地告诉对方：你想先分开一阵子，希望对方给你一个答复。）"
+        );
+        assert_eq!(
+            cue(LifeChoiceCue::Goodbye { hours: 18 }),
+            "（对方同意了你提出的分开请求，接下来 18 小时你们不联系。你跟对方道别。）"
+        );
+        assert_eq!(
+            cue(LifeChoiceCue::Hurt),
+            "（对方不同意你提出的分开请求，你心里不好受。）"
+        );
+        for c in [
+            LifeChoiceCue::Ask { tier_gap: 2 },
+            LifeChoiceCue::Goodbye { hours: 12 },
+            LifeChoiceCue::Hurt,
+        ] {
+            assert_eq!(Occasion::LifeChoice(c).name(), "life_choice");
+        }
     }
 
     #[test]

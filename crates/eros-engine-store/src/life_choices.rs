@@ -13,6 +13,11 @@ use crate::chat::ProactiveInsert;
 /// A choice never stores its expiry: it is `asked_at` plus this.
 const PENDING_HOURS: i32 = 24;
 
+/// How long after an accepted separation ends her growth stays slowed
+/// (spec 2026-10-19 §3.5); the only place it is written down. The window is
+/// derived: `ends_at` of the separation the accepted choice wrote, plus this.
+const SLOWDOWN_HOURS: i32 = 72;
+
 /// The kind of the one choice there is.
 const ASK_FOR_SPACE: &str = "ask_for_space";
 
@@ -190,6 +195,33 @@ impl LifeChoiceRepo<'_> {
             .bind(session_id)
             .fetch_one(self.pool)
             .await
+    }
+
+    /// Whether `now` falls in the slowdown window of the session's newest
+    /// accepted choice: from the end of its separation (`persona_events.
+    /// ends_at`, through `event_id`) for 72 hours. Older accepted choices and
+    /// every other session of the instance have no say, and a choice whose
+    /// separation row is gone carries no window.
+    pub async fn growth_slowed(
+        &self,
+        session_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT EXISTS ( \
+               SELECT 1 \
+                 FROM (SELECT event_id FROM engine.life_choices \
+                        WHERE session_id = $1 AND status = 'accepted' \
+                        ORDER BY asked_at DESC LIMIT 1) c \
+                 JOIN engine.persona_events e ON e.id = c.event_id \
+                WHERE e.ends_at <= $2 \
+                  AND $2 < e.ends_at + make_interval(hours => $3))",
+        )
+        .bind(session_id)
+        .bind(now)
+        .bind(SLOWDOWN_HOURS)
+        .fetch_one(self.pool)
+        .await
     }
 
     /// Record the separation an accept wrote.
@@ -537,5 +569,133 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!((message_id, event_id), (None, None));
+    }
+    /// An accepted choice for `session` whose separation runs `[starts, ends)`.
+    async fn accepted_with_separation(
+        pool: &PgPool,
+        instance: Uuid,
+        session: Uuid,
+        asked_ago: Duration,
+        starts: DateTime<Utc>,
+        ends: DateTime<Utc>,
+        key: &str,
+    ) -> LifeChoiceRecord {
+        use crate::events::{EventRepo, NewEvent};
+        use eros_engine_core::events::EventKind;
+
+        let repo = LifeChoiceRepo { pool };
+        let choice = repo
+            .insert_ask(session, 3, &ask_message("想先分开"))
+            .await
+            .unwrap()
+            .expect("written");
+        repo.resolve(choice.id, "accepted", choice.asked_at)
+            .await
+            .unwrap()
+            .expect("resolved");
+        sqlx::query(
+            "UPDATE engine.life_choices SET asked_at = asked_at - make_interval(secs => $2) \
+              WHERE id = $1",
+        )
+        .bind(choice.id)
+        .bind(asked_ago.num_seconds() as f64)
+        .execute(pool)
+        .await
+        .unwrap();
+        let event = EventRepo { pool }
+            .insert_preempting(&NewEvent {
+                instance_id: instance,
+                session_id: session,
+                event_key: key,
+                kind: EventKind::TakingSpace,
+                started_at: starts,
+                ends_at: ends,
+            })
+            .await
+            .unwrap();
+        repo.set_event(choice.id, event.id).await.unwrap();
+        choice
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn growth_slowed_is_the_72_hours_after_the_newest_accepted_separation(pool: PgPool) {
+        use chrono::TimeZone;
+
+        let (owner, instance, session) = instance_and_session(&pool).await;
+        let sibling = ChatRepo { pool: &pool }
+            .create_session(owner, instance)
+            .await
+            .unwrap()
+            .id;
+        let repo = LifeChoiceRepo { pool: &pool };
+        let micro = Duration::microseconds(1);
+        let starts = Utc.with_ymd_and_hms(2026, 3, 1, 12, 0, 0).unwrap();
+        let ends = starts + Duration::hours(18);
+        let window_end = ends + Duration::hours(72);
+
+        // Nothing asked, nothing slowed.
+        assert!(!repo.growth_slowed(session, ends).await.unwrap());
+
+        let choice = accepted_with_separation(
+            &pool,
+            instance,
+            session,
+            Duration::hours(30),
+            starts,
+            ends,
+            "k1",
+        )
+        .await;
+        // The separation itself is not the window; it opens when it ends.
+        assert!(!repo.growth_slowed(session, starts).await.unwrap());
+        assert!(!repo.growth_slowed(session, ends - micro).await.unwrap());
+        assert!(repo.growth_slowed(session, ends).await.unwrap());
+        assert!(repo
+            .growth_slowed(session, window_end - micro)
+            .await
+            .unwrap());
+        assert!(!repo.growth_slowed(session, window_end).await.unwrap());
+        // The choice's session only: a sibling of the same instance pays nothing.
+        assert!(!repo.growth_slowed(sibling, ends).await.unwrap());
+
+        // A choice that was not accepted opens no window, even with an event.
+        sqlx::query("UPDATE engine.life_choices SET status = 'declined' WHERE id = $1")
+            .bind(choice.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(!repo.growth_slowed(session, ends).await.unwrap());
+        sqlx::query("UPDATE engine.life_choices SET status = 'accepted' WHERE id = $1")
+            .bind(choice.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(repo.growth_slowed(session, ends).await.unwrap());
+
+        // The newest accepted choice owns the window, not an older one.
+        let later_starts = window_end + Duration::hours(10);
+        let later_ends = later_starts + Duration::hours(12);
+        accepted_with_separation(
+            &pool,
+            instance,
+            session,
+            Duration::hours(1),
+            later_starts,
+            later_ends,
+            "k2",
+        )
+        .await;
+        assert!(
+            !repo.growth_slowed(session, ends).await.unwrap(),
+            "the older window no longer applies"
+        );
+        assert!(repo.growth_slowed(session, later_ends).await.unwrap());
+
+        // Once the separation row is gone the choice carries no window.
+        sqlx::query("DELETE FROM engine.persona_events WHERE kind = 'taking_space'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(!repo.growth_slowed(session, later_ends).await.unwrap());
     }
 }

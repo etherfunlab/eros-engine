@@ -18,6 +18,7 @@
 
 use uuid::Uuid;
 
+use eros_engine_core::persona::CompanionPersona;
 use eros_engine_core::types::{ActionPlan, ActionType, Event};
 use eros_engine_llm::model_config::ModelConfig;
 use eros_engine_llm::openrouter::{ChatMessage, ChatRequest, OpenRouterClient};
@@ -83,16 +84,16 @@ async fn session_still_live(state: &AppState, session_id: Uuid) -> bool {
 }
 
 /// Spawned by `pipeline::run`. Owned `state` so the future is `'static`.
-/// `persona_name` is the name of the persona the turn ran with. Nothing here
-/// reloads the persona by instance id: a BYOC instance's character lives only
-/// in the request's card.
+/// `persona` is the persona the turn ran with. Nothing here reloads the
+/// persona by instance id: a BYOC instance's character lives only in the
+/// request's card.
 #[allow(clippy::too_many_arguments)] // each arg is a distinct per-turn concern
 pub async fn run(
     state: AppState,
     session_id: Uuid,
     user_id: Uuid,
     instance_id: Uuid,
-    persona_name: String,
+    persona: CompanionPersona,
     event: Event,
     plan: ActionPlan,
     produced: Vec<ProducedMessage>,
@@ -177,7 +178,7 @@ pub async fn run(
             session_id,
             user_id,
             instance_id,
-            &persona_name,
+            &persona,
             plan.action_type,
             &user_msg,
             &eval_text,
@@ -243,14 +244,15 @@ pub async fn run(
 /// rewrite. Shared by the chat pipeline's `run` above and the image-edit
 /// endpoint's opt-in `evaluate_affinity`; the caller owns building
 /// `eval_text` (see `affinity_eval_text`), choosing the scope, and passing the
-/// persona's name (empty skips the eval).
+/// persona (a blank name skips the eval). After the persist, a judged turn may
+/// make her ask for space (`life_choice::maybe_ask_for_space`).
 #[allow(clippy::too_many_arguments)] // each arg is a distinct per-turn concern
 pub(crate) async fn run_affinity_turn(
     state: &AppState,
     session_id: Uuid,
     user_id: Uuid,
     instance_id: Uuid,
-    persona_name: &str,
+    persona: &CompanionPersona,
     action: ActionType,
     user_msg: &str,
     eval_text: &str,
@@ -276,6 +278,7 @@ pub(crate) async fn run_affinity_turn(
 
     // The feeling clause gets the name only on a turn whose eval was
     // attempted; a skipped turn hands it an empty name, which it declines.
+    let persona_name = persona.genome.name.as_str();
     let (persona_name, (grades, levels, reason, affinity_gen_id, skip_reason, eval_failures)) =
         if pre_skip.is_none() {
             let affinity_repo = AffinityRepo { pool: &state.pool };
@@ -325,7 +328,10 @@ pub(crate) async fn run_affinity_turn(
     // levels are `None` and the stored levels hold.
     let context = build_affinity_context(&reason, skip_reason);
 
-    persist_affinity(
+    // A judged turn: the eval ran and its generation came back (a failed call
+    // leaves none, a skipped one carries `skip_reason`).
+    let judged = skip_reason.is_none() && affinity_gen_id.is_some();
+    let committed = persist_affinity(
         state,
         session_id,
         user_id,
@@ -354,6 +360,12 @@ pub(crate) async fn run_affinity_turn(
     {
         summarize_feeling(state, session_id, persona_name, affinity_scope, client_id).await;
     }
+
+    // Last, so the ask's own generation never delays the feeling clause.
+    if committed && judged {
+        super::life_choice::maybe_ask_for_space(state, session_id, user_id, instance_id, persona)
+            .await;
+    }
 }
 
 /// Run the graded turn through the 4.0 pipeline (or ghost counters) and write
@@ -364,6 +376,8 @@ pub(crate) async fn run_affinity_turn(
 /// does not touch ghost_streak in `persist_with_event` — that's a caller
 /// responsibility because the streak reset is a pipeline-policy concern,
 /// not a row-update concern.
+///
+/// `true` when the turn's event row committed.
 #[allow(clippy::too_many_arguments)] // each arg is a distinct affinity-persist concern
 async fn persist_affinity(
     state: &AppState,
@@ -379,7 +393,7 @@ async fn persist_affinity(
     eval_failures: &[eros_engine_llm::failure::AttemptFailure],
     user_message_id: Option<Uuid>,
     tier_drop: Option<eros_engine_core::affinity::AffinityLine>,
-) {
+) -> bool {
     let repo = AffinityRepo { pool: &state.pool };
 
     // Demo sessions get boosted positive raw scores so meters move within the
@@ -408,10 +422,10 @@ async fn persist_affinity(
         .await
     {
         Ok(Some(a)) => a,
-        Ok(None) => return,
+        Ok(None) => return false,
         Err(e) => {
             tracing::warn!("affinity load_or_create failed: {e}");
-            return;
+            return false;
         }
     };
 
@@ -420,11 +434,13 @@ async fn persist_affinity(
             if let Err(e) = repo.record_ghost(&mut affinity, user_message_id).await {
                 tracing::warn!("affinity record_ghost failed: {e}");
             }
+            false
         }
         ActionType::ProductQa => {
             // product_qa turns never run post_process (the stream arm skips
             // it); keep the match exhaustive without side effects.
             tracing::warn!("persist_affinity called with ProductQa — ignoring");
+            false
         }
         ActionType::ReplyText
         | ActionType::ReplyImage
@@ -440,7 +456,11 @@ async fn persist_affinity(
             };
             let (llm_attempts, gateway_errors) =
                 crate::pipeline::stream::split_failures(eval_failures);
-            if let Err(e) = repo
+            // The 72 hours after a separation she asked for: positive growth
+            // is halved in that session (spec 2026-10-19 §3.5).
+            let growth_scale =
+                super::life_choice::growth_scale_for(state, session_id, chrono::Utc::now()).await;
+            match repo
                 .persist_with_event(
                     &mut affinity,
                     &grades,
@@ -455,11 +475,15 @@ async fn persist_affinity(
                     gateway_errors,
                     user_message_id,
                     tier_drop,
-                    1.0, // growth_scale: full speed
+                    growth_scale,
                 )
                 .await
             {
-                tracing::warn!("affinity persist_with_event failed: {e}");
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!("affinity persist_with_event failed: {e}");
+                    false
+                }
             }
         }
     }
@@ -2293,6 +2317,29 @@ mod tests {
         .unwrap()
     }
 
+    /// A persona named `name`, for the turns under test.
+    fn persona_named(name: &str) -> CompanionPersona {
+        use eros_engine_core::persona::{PersonaGenome, PersonaInstance};
+        let instance_id = Uuid::new_v4();
+        CompanionPersona {
+            instance_id,
+            genome: PersonaGenome {
+                id: Some(Uuid::new_v4()),
+                name: name.into(),
+                system_prompt: format!("You are {name}."),
+                tip_personality: None,
+                art_metadata: serde_json::json!({}),
+            },
+            instance: PersonaInstance {
+                id: instance_id,
+                genome_id: None,
+                owner_uid: Uuid::new_v4(),
+                status: "active".into(),
+            },
+            items: vec![],
+        }
+    }
+
     /// A `role='user'` row for the turn under test. Since migration 0056 the
     /// affinity event FK-references it, so a `run()` test that asserts on
     /// affinity rows must seed it and pass its id in the `Event`.
@@ -3747,7 +3794,7 @@ mod tests {
             session_id,
             user_id,
             instance_id,
-            "Aria".into(),
+            persona_named("Aria"),
             event,
             plan,
             produced,
@@ -3903,7 +3950,7 @@ mod tests {
             session_id,
             user_id,
             instance_id,
-            "Aria".into(),
+            persona_named("Aria"),
             event,
             plan,
             produced,
@@ -4038,7 +4085,7 @@ mod tests {
             session_id,
             user_id,
             instance_id,
-            "Aria".into(),
+            persona_named("Aria"),
             event,
             plan,
             produced,
@@ -4116,7 +4163,7 @@ mod tests {
             session_id,
             user_id,
             instance_id,
-            "BYOC-NAME-MARKER",
+            &persona_named("BYOC-NAME-MARKER"),
             ActionType::ReplyText,
             "我今天过得还不错，你呢",
             "挺好的，刚下班",
@@ -4707,7 +4754,7 @@ mod tests {
             session_id,
             user_id,
             instance_id,
-            "Aria".into(),
+            persona_named("Aria"),
             event,
             plan,
             produced,
