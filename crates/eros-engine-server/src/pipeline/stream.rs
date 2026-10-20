@@ -4472,6 +4472,7 @@ pub(crate) fn run_stream_with(
         // never met with silence.
         let action_turn = user_msg.action.is_some();
         let force_image = user_msg.image.as_ref().is_some_and(|i| i.force);
+        let traits = crate::prompt::persona_traits(&input.persona);
         // While she is offline (spec 2026-10-16-life-events-offline-and-scares-
         // design.md §4.2) a text turn ghosts without the judge. The silence is
         // circumstance, so the ghost accounting is left alone. A deployment
@@ -4483,7 +4484,7 @@ pub(crate) fn run_stream_with(
             && current
                 .foreground
                 .as_ref()
-                .is_some_and(|e| e.kind.is_offline(&crate::prompt::persona_traits(&input.persona)))
+                .is_some_and(|e| e.kind.is_offline(&traits))
         {
             if let Err(e) = chat_repo
                 .mark_user_message_ghosted(user_msg.user_message_id)
@@ -4512,7 +4513,8 @@ pub(crate) fn run_stream_with(
         }
         // An offline stretch that ended with a user message ghosted inside
         // it and no reply since, and a false alarm told here and not yet
-        // resolved: this turn speaks of them.
+        // resolved: this turn speaks of them. A stretch that was not offline
+        // for this persona (a non-female `out_shopping`) left nothing unsaid.
         let repo = eros_engine_store::events::EventRepo { pool: &state.pool };
         let offline = repo
             .unexplained_offline(user_msg.session_id, user_msg.instance_id, current.at)
@@ -4520,7 +4522,8 @@ pub(crate) fn run_stream_with(
             .unwrap_or_else(|e| {
                 tracing::warn!("stream: offline read failed: {e}");
                 None
-            });
+            })
+            .filter(|e| e.kind.is_offline(&traits));
         let scare = repo
             .unresolved_scare(user_msg.session_id, user_msg.instance_id, current.at)
             .await
@@ -22347,6 +22350,27 @@ data: [DONE]\n\n"
         assert!(judge_request(&reqs)
             .contains("[近期事件] 睡着了（不到 1 小时前结束，期间对方的消息你没有回）\\n"));
         assert!(chat_request_body(&reqs).contains("- 刚才：睡着了，对方那时发来的消息你现在才看到"));
+    }
+
+    /// `out_shopping` takes only a female persona offline; the seeded persona
+    /// is not, so a message the judge ghosted inside it was never unanswered
+    /// for the stretch's sake and she has nothing to explain.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_persona_who_stayed_reachable_while_shopping_has_nothing_to_explain(pool: PgPool) {
+        let t = run_event_turn(
+            &pool,
+            &[],
+            &[ev("out_shopping", 70, -10)],
+            &[30],
+            Some(serde_json::json!({"action": "reply_text", "inner_state": ""})),
+            0,
+        )
+        .await;
+        let reqs = t.mock.received_requests().await.unwrap();
+        assert!(!judge_request(&reqs).contains("在逛街"));
+        let chat = chat_request_body(&reqs);
+        assert!(!chat.contains("- 刚才："), "{chat}");
+        assert!(!chat.contains("在逛街，对方那时发来的消息"), "{chat}");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

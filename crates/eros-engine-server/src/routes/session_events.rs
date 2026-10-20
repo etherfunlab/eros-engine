@@ -39,8 +39,10 @@ use crate::state::AppState;
 const CONCURRENT_STREAMS_PER_USER: u32 = 3;
 const MAX_EVENT_KEY_CHARS: usize = 128;
 
-/// A kind of life event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, utoipa::ToSchema)]
+/// A kind of life event. `taking_space` and `fell_out` are placed by the
+/// engine, never drawn: they appear in responses only, and a `kinds` filter
+/// that lists one is rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKindDto {
     PoliceEncounter,
@@ -88,6 +90,22 @@ pub enum EventKindDto {
     HometownVisit,
     TakingSpace,
     FellOut,
+}
+
+/// Reads the drawable kinds only: a request names kinds to draw, and the
+/// engine's own (`EventKind::SPECIAL`) are never drawn.
+impl<'de> Deserialize<'de> for EventKindDto {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let name = String::deserialize(d)?;
+        match EventKind::parse(&name) {
+            Some(k) if !EventKind::SPECIAL.contains(&k) => Ok(k.into()),
+            Some(_) => Err(D::Error::custom(format!(
+                "`{name}` is placed by the engine and cannot be listed in kinds"
+            ))),
+            None => Err(D::Error::custom(format!("unknown kind `{name}`"))),
+        }
+    }
 }
 
 impl From<EventKindDto> for EventKind {
@@ -233,12 +251,17 @@ pub struct EventView {
     pub message_id: Option<Uuid>,
 }
 
-impl From<&eros_engine_store::events::EventRecord> for EventView {
-    fn from(e: &eros_engine_store::events::EventRecord) -> Self {
+impl EventView {
+    /// The event as `traits`' persona lives it: whether it keeps her offline
+    /// depends on the persona for `out_shopping`.
+    pub(crate) fn new(
+        e: &eros_engine_store::events::EventRecord,
+        traits: &eros_engine_core::events::PersonaTraits,
+    ) -> Self {
         Self {
             kind: e.kind.into(),
             category: e.kind.category().into(),
-            offline: e.kind.may_be_offline(),
+            offline: e.kind.is_offline(traits),
             started_at: e.started_at,
             ends_at: e.ends_at,
             message_id: e.message_id,
@@ -367,6 +390,7 @@ async fn respond(
     state: &AppState,
     session_id: Uuid,
     event_key: &str,
+    traits: &events::PersonaTraits,
 ) -> Result<DrawEventResponse, AppError> {
     let Some(event) = EventRepo { pool: &state.pool }
         .by_key(session_id, event_key)
@@ -383,7 +407,7 @@ async fn respond(
         None => None,
     };
     Ok(DrawEventResponse {
-        event: Some(EventView::from(&event)),
+        event: Some(EventView::new(&event, traits)),
         message: message.map(Into::into),
     })
 }
@@ -395,11 +419,13 @@ async fn respond(
 /// background event (a trip or a body state) only incidents are drawn. The
 /// persona then tells the user in one proactive message, persisted like any
 /// reply and returned with the event. The offline kinds (`away_from_phone`,
-/// `busy`, `in_battle`, `asleep`) make her unreachable while they last.
-/// `busy` and `in_battle` are announced in a message at intimacy rung 2 and
-/// up; below that, and always for `away_from_phone` and `asleep`, the event
-/// comes back with `message: null`. The same `event_key` returns the same
-/// event.
+/// `busy`, `in_battle`, `asleep`, `bros_gathering`, `sis_gathering`, and
+/// `out_shopping` for a female persona) make her unreachable while they last.
+/// `busy`, `in_battle` and a female persona's `out_shopping` are announced in
+/// a message at intimacy rung 2 and up; below that, and always for
+/// `away_from_phone`, `asleep` and the gatherings, the event comes back with
+/// `message: null`. For any other persona `out_shopping` is not offline and
+/// is announced at every rung. The same `event_key` returns the same event.
 #[utoipa::path(
     post,
     path = "/v2/comp/session/{session_id}/events",
@@ -413,7 +439,8 @@ async fn respond(
         (status = 403, body = StreamPreErrorBody),
         (status = 404, body = StreamPreErrorBody),
         (status = 409, body = StreamPreErrorBody),
-        (status = 422, description = "unknown kind or another malformed body field"),
+        (status = 422, description = "unknown kind, `taking_space` or `fell_out` in `kinds`, \
+            or another malformed body field"),
         (status = 429, description = "per-user in-flight cap reached"),
         (status = "5XX", description = "companion chain exhausted; the provider's own status \
             passes through. Nothing is persisted.")
@@ -479,8 +506,9 @@ pub(crate) async fn draw_event_at(
 
     let chat_repo = ChatRepo { pool: &state.pool };
     let event_repo = EventRepo { pool: &state.pool };
+    let traits = crate::prompt::persona_traits(&persona);
     if event_repo.by_key(session_id, &key).await?.is_some() {
-        return respond(state, session_id, &key).await;
+        return respond(state, session_id, &key, &traits).await;
     }
 
     let needs = if state.model_config.pde_enabled() {
@@ -504,7 +532,6 @@ pub(crate) async fn draw_event_at(
     // deployment's ghosting switch and the session's message floor).
     let signals =
         crate::pipeline::compute_signals_for_session(&state.pool, session_id, &affinity).await?;
-    let traits = crate::prompt::persona_traits(&persona);
     if !state.model_config.pde_ghosting_enabled()
         || signals.message_count < eros_engine_core::ghost::GHOST_MIN_MESSAGES
     {
@@ -541,7 +568,7 @@ pub(crate) async fn draw_event_at(
                 None,
             )
             .await?;
-        return respond(state, session_id, &key).await;
+        return respond(state, session_id, &key, &traits).await;
     }
 
     let background = history
@@ -601,7 +628,7 @@ pub(crate) async fn draw_event_at(
         },
     )
     .await?;
-    respond(state, session_id, &key).await
+    respond(state, session_id, &key, &traits).await
 }
 
 pub fn router() -> OpenApiRouter<AppState> {
@@ -1623,5 +1650,147 @@ mod tests {
             serde_json::from_value::<DrawEventRequest>(json!({"kinds": []})).is_err(),
             "event_key is required"
         );
+    }
+
+    /// `taking_space` and `fell_out` are placed by the writers, never drawn:
+    /// the DTO carries them for responses only.
+    #[test]
+    fn special_kinds_are_rejected_in_the_kinds_filter() {
+        for kinds in [
+            json!(["taking_space"]),
+            json!(["reading", "fell_out"]),
+            json!({"allow": ["taking_space"]}),
+            json!({"allow": ["reading", "fell_out"]}),
+            json!({"disallow": ["taking_space"]}),
+            json!({"disallow": ["fell_out"]}),
+        ] {
+            assert!(
+                serde_json::from_value::<DrawEventRequest>(
+                    json!({"event_key": "k", "kinds": kinds})
+                )
+                .is_err(),
+                "{kinds}"
+            );
+        }
+        // Both still serialize in a response.
+        assert_eq!(
+            serde_json::to_value(EventKindDto::TakingSpace).unwrap(),
+            json!("taking_space")
+        );
+        assert_eq!(
+            serde_json::to_value(EventKindDto::FellOut).unwrap(),
+            json!("fell_out")
+        );
+    }
+
+    /// Draw `kind` for a fresh persona (`art_metadata` `art`, `tip_personality`
+    /// `tip`) whose session is on rung 2 when `close`, else rung 1, with the
+    /// ghost floor met. Returns the event, its message and the cue the model
+    /// read (`None` when no message was generated).
+    async fn draw_told(
+        pool: &PgPool,
+        kind: EventKindDto,
+        art: serde_json::Value,
+        tip: Option<&str>,
+        close: bool,
+    ) -> (
+        EventView,
+        Option<crate::routes::session_open::GreetingDto>,
+        Option<String>,
+    ) {
+        let user_id = Uuid::new_v4();
+        let (instance_id, session_id) = setup(pool, user_id).await;
+        set_art(pool, instance_id, art).await;
+        sqlx::query(
+            "UPDATE engine.persona_genomes SET tip_personality = $2 \
+             WHERE id = (SELECT genome_id FROM engine.persona_instances WHERE id = $1)",
+        )
+        .bind(instance_id)
+        .bind(tip)
+        .execute(pool)
+        .await
+        .unwrap();
+        seed_user_messages(pool, session_id, 10).await;
+        if close {
+            rung_two(pool, session_id, user_id, instance_id).await;
+        }
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "好").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            req("k", Some(vec![kind])),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        let cue = calls(&mock).await.first().map(|c| {
+            let msgs = c["messages"].as_array().unwrap();
+            msgs.last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        });
+        (out.event.expect("drawn"), out.message, cue)
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_found_bag_is_told_by_rung_and_tip_personality(pool: PgPool) {
+        let female = || json!({"gender": "female"});
+        for (kind, rung_one, wants, tipped) in [
+            (
+                EventKindDto::SawBag,
+                "（你在逛街，随手看到一个挺好看的包。）",
+                "（你在逛街，看到一个特别喜欢的包，很想要。）",
+                "（你在逛街，看到一个特别喜欢的包，很想要。代入你「傲娇」的打赏人格，把这份心动告诉对方。）",
+            ),
+            (
+                EventKindDto::SawClothes,
+                "（你在逛街，随手看到一件挺好看的衣服。）",
+                "（你在逛街，看到一件特别喜欢的衣服，很想要。）",
+                "（你在逛街，看到一件特别喜欢的衣服，很想要。代入你「傲娇」的打赏人格，把这份心动告诉对方。）",
+            ),
+        ] {
+            for (close, tip, want) in [
+                (false, Some("傲娇"), rung_one),
+                (true, None, wants),
+                (true, Some("傲娇"), tipped),
+            ] {
+                let (e, message, cue) = draw_told(&pool, kind, female(), tip, close).await;
+                assert!(!e.offline && message.is_some(), "{kind:?}");
+                assert_eq!(cue.as_deref(), Some(want), "{kind:?} close={close} {tip:?}");
+            }
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn out_shopping_is_offline_and_told_by_rung_only_for_a_female_persona(pool: PgPool) {
+        let kind = EventKindDto::OutShopping;
+        // She says she is going, from rung 2, and goes dark.
+        let (e, message, cue) =
+            draw_told(&pool, kind, json!({"gender": "female"}), None, true).await;
+        assert!(e.offline && message.is_some());
+        assert_eq!(
+            cue.as_deref(),
+            Some("（你接下来要出门逛街，这段时间顾不上看手机。）")
+        );
+        // Below rung 2 she goes dark without a word.
+        let (e, message, cue) =
+            draw_told(&pool, kind, json!({"gender": "female"}), None, false).await;
+        assert!(e.offline && e.message_id.is_none() && message.is_none() && cue.is_none());
+        // Anyone else keeps replying: she is shopping, not away, at any rung.
+        for close in [false, true] {
+            let (e, message, cue) =
+                draw_told(&pool, kind, json!({"gender": "male"}), None, close).await;
+            assert!(!e.offline && message.is_some(), "close={close}");
+            assert_eq!(
+                cue.as_deref(),
+                Some("（你正在外面逛街。）"),
+                "close={close}"
+            );
+        }
     }
 }

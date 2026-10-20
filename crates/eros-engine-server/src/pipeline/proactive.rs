@@ -19,7 +19,7 @@
 //! docs/superpowers/specs/2026-10-15-life-events-v2-design.md §6
 
 use chrono::{DateTime, NaiveDate, Utc};
-use eros_engine_core::events::EventKind;
+use eros_engine_core::events::{EventKind, PersonaTraits};
 use eros_engine_core::persona::CompanionPersona;
 use eros_engine_core::scope::{AffinityScope, MemoryScope};
 use eros_engine_core::types::{
@@ -96,8 +96,10 @@ impl Occasion {
         }
     }
 
-    /// The stage cue: states a fact, carries no instruction.
-    fn cue(&self) -> String {
+    /// The stage cue: states a fact, carries no instruction. An event's wording
+    /// follows the session's intimacy `rung`, the persona's `traits` and her
+    /// `tip_personality`.
+    fn cue(&self, rung: u8, traits: &PersonaTraits, tip_personality: Option<&str>) -> String {
         match self {
             Self::Holiday { .. } | Self::Birthday { .. } | Self::JustOpened { .. } => {
                 OPEN_CUE.into()
@@ -112,15 +114,40 @@ impl Occasion {
                 lasts,
                 background,
                 ..
-            } => event_cue(*kind, *lasts, *background),
+            } => event_cue(*kind, *lasts, *background, rung, traits, tip_personality),
         }
+    }
+}
+
+/// The lowest intimacy rung at which she says she wants what she found: below
+/// it she only notices it.
+const FIND_WANT_MIN_RUNG: u8 = 2;
+
+/// A shopping find's cue (spec 2026-10-19-life-events-shopping-gatherings-and-
+/// ask-for-space-design.md §2.2): noticed in passing at rung 1; from rung 2
+/// she wants it, and a persona with a `tip_personality` tells it in that
+/// voice. `measure` and `noun` name the thing: 一个 / 包.
+fn find_cue(measure: &str, noun: &str, rung: u8, tip_personality: Option<&str>) -> String {
+    if rung < FIND_WANT_MIN_RUNG {
+        return format!("（你在逛街，随手看到{measure}挺好看的{noun}。）");
+    }
+    let want = format!("你在逛街，看到{measure}特别喜欢的{noun}，很想要。");
+    match tip_personality.map(str::trim).filter(|p| !p.is_empty()) {
+        Some(p) => format!("（{want}代入你「{p}」的打赏人格，把这份心动告诉对方。）"),
+        None => format!("（{want}）"),
     }
 }
 
 /// The stage cue for a life event (spec 2026-10-15-life-events-v2-design.md
 /// §3.4): states a fact, carries no instruction. A background's cue carries
 /// its length. A kind that is never told (`events::is_told`) has no cue.
-fn kind_cue(kind: EventKind, lasts: chrono::Duration) -> String {
+fn kind_cue(
+    kind: EventKind,
+    lasts: chrono::Duration,
+    rung: u8,
+    traits: &PersonaTraits,
+    tip_personality: Option<&str>,
+) -> String {
     use EventKind::*;
     let span = crate::prompt::span_text(lasts);
     match kind {
@@ -140,8 +167,8 @@ fn kind_cue(kind: EventKind, lasts: chrono::Duration) -> String {
         Quarrel => "（你刚跟人吵了一架。）".into(),
         ScoldedBySuperior => "（你刚被上级骂了一顿。）".into(),
         ScoldedSuperior => "（你刚把上级骂了一顿。）".into(),
-        SawBag => "（你在逛街，随手看到一个挺好看的包。）".into(),
-        SawClothes => "（你在逛街，随手看到一件挺好看的衣服。）".into(),
+        SawBag => find_cue("一个", "包", rung, tip_personality),
+        SawClothes => find_cue("一件", "衣服", rung, tip_personality),
         TempWork => "（你刚临时接到一份工作，得马上去处理。）".into(),
         ExMessage => "（你的前任刚给你发来消息。）".into(),
         WeatherChange => "（你那边的天气刚刚突然变了。）".into(),
@@ -154,6 +181,9 @@ fn kind_cue(kind: EventKind, lasts: chrono::Duration) -> String {
         Irritable => "（你现在心里很烦躁。）".into(),
         Busy => "（你接下来要忙一阵，这段时间顾不上看手机。）".into(),
         InBattle => "（你接下来要去打一场硬仗，一段时间顾不上手机。）".into(),
+        // Told only by a persona who goes dark, and only from rung 2
+        // (`events::is_told`); anyone else is simply out and keeps replying.
+        OutShopping if traits.female => "（你接下来要出门逛街，这段时间顾不上看手机。）".into(),
         OutShopping => "（你正在外面逛街。）".into(),
         AwayFromPhone | Asleep | BrosGathering | SisGathering | TakingSpace | FellOut => {
             unreachable!("{kind:?} is never told")
@@ -188,8 +218,15 @@ fn background_state(kind: EventKind) -> Option<&'static str> {
 
 /// The kind's cue, opened with the background's state when one is under
 /// way: 「（你正在外地出差。你刚在路上遇到了一只小动物。）」.
-fn event_cue(kind: EventKind, lasts: chrono::Duration, background: Option<EventKind>) -> String {
-    let cue = kind_cue(kind, lasts);
+fn event_cue(
+    kind: EventKind,
+    lasts: chrono::Duration,
+    background: Option<EventKind>,
+    rung: u8,
+    traits: &PersonaTraits,
+    tip_personality: Option<&str>,
+) -> String {
+    let cue = kind_cue(kind, lasts, rung, traits, tip_personality);
     match background.and_then(background_state) {
         Some(state) => format!(
             "（{state}。{}）",
@@ -243,6 +280,8 @@ pub(crate) async fn greet(
         .await?;
     affinity.apply_time_decay();
     affinity.refresh_endpoints(&state.config.affinity_tuning);
+    let rung = affinity.intimacy_rung();
+    let traits = crate::prompt::persona_traits(g.persona);
     let signals = compute_signals_for_session(&state.pool, g.session_id, &affinity).await?;
 
     // Prompt assembly only. The event's content is the memory-recall query;
@@ -280,9 +319,12 @@ pub(crate) async fn greet(
     };
     let repo = eros_engine_store::events::EventRepo { pool: &state.pool };
     let current = repo.current(g.instance_id, None, g.now.now).await?;
+    // A stretch that was not offline for this persona (a non-female
+    // `out_shopping`) left nothing unsaid.
     let offline = repo
         .unexplained_offline(g.session_id, g.instance_id, g.now.now)
-        .await?;
+        .await?
+        .filter(|e| e.kind.is_offline(&traits));
     let scare = repo
         .unresolved_scare(g.session_id, g.instance_id, g.now.now)
         .await?;
@@ -307,7 +349,9 @@ pub(crate) async fn greet(
     .await?;
     chat_req.messages.push(WireMessage {
         role: "user".into(),
-        content: g.occasion.cue(),
+        content: g
+            .occasion
+            .cue(rung, &traits, g.persona.genome.tip_personality.as_deref()),
     });
 
     let model_for_audit = chat_req.model.clone();
@@ -450,25 +494,114 @@ pub(crate) async fn greet(
 mod tests {
     use super::*;
     use chrono::Duration;
+    use eros_engine_core::events::is_told;
+
+    fn female() -> PersonaTraits {
+        PersonaTraits {
+            female: true,
+            ..Default::default()
+        }
+    }
 
     /// `kind_cue` panics for a kind that is never told; it must not for any
     /// kind `is_told` lets through at any rung.
     #[test]
     fn every_kind_she_tells_has_a_cue() {
-        use eros_engine_core::events::{is_told, EventKind, PersonaTraits};
-        let female = PersonaTraits {
-            female: true,
-            ..Default::default()
-        };
-        for persona in [PersonaTraits::default(), female] {
+        for persona in [PersonaTraits::default(), female()] {
             for k in EventKind::ALL {
                 for rung in 1..=3 {
                     if is_told(k, rung, &persona) {
-                        let _ = super::kind_cue(k, chrono::Duration::hours(1));
+                        let _ = kind_cue(k, Duration::hours(1), rung, &persona, Some("傲娇"));
                     }
                 }
             }
         }
+    }
+
+    #[test]
+    fn shopping_find_cue_follows_rung_and_tip_personality() {
+        let h = Duration::hours(1);
+        for (kind, rung_one, wants, tipped) in [
+            (
+                EventKind::SawBag,
+                "（你在逛街，随手看到一个挺好看的包。）",
+                "（你在逛街，看到一个特别喜欢的包，很想要。）",
+                "（你在逛街，看到一个特别喜欢的包，很想要。代入你「傲娇」的打赏人格，把这份心动告诉对方。）",
+            ),
+            (
+                EventKind::SawClothes,
+                "（你在逛街，随手看到一件挺好看的衣服。）",
+                "（你在逛街，看到一件特别喜欢的衣服，很想要。）",
+                "（你在逛街，看到一件特别喜欢的衣服，很想要。代入你「傲娇」的打赏人格，把这份心动告诉对方。）",
+            ),
+        ] {
+            let cue = |rung, tip| kind_cue(kind, h, rung, &female(), tip);
+            assert_eq!(cue(1, None), rung_one, "{kind:?}");
+            assert_eq!(
+                cue(1, Some("傲娇")),
+                rung_one,
+                "{kind:?}: below rung 2 she does not say she wants it"
+            );
+            for rung in [2, 3] {
+                assert_eq!(cue(rung, None), wants, "{kind:?} rung {rung}");
+                assert_eq!(cue(rung, Some("傲娇")), tipped, "{kind:?} rung {rung}");
+                assert_eq!(
+                    cue(rung, Some("  ")),
+                    wants,
+                    "{kind:?} rung {rung}: a blank tip personality is none"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn out_shopping_cue_differs_by_gender() {
+        let h = Duration::hours(1);
+        for rung in [2, 3] {
+            assert_eq!(
+                kind_cue(EventKind::OutShopping, h, rung, &female(), None),
+                "（你接下来要出门逛街，这段时间顾不上看手机。）",
+                "rung {rung}"
+            );
+        }
+        for rung in 1..=3 {
+            assert_eq!(
+                kind_cue(
+                    EventKind::OutShopping,
+                    h,
+                    rung,
+                    &PersonaTraits::default(),
+                    None
+                ),
+                "（你正在外面逛街。）",
+                "rung {rung}"
+            );
+        }
+    }
+
+    /// A gathering, `taking_space` and `fell_out` are never told, so none has
+    /// a cue; a female persona's `out_shopping` is told from rung 2 only.
+    #[test]
+    fn gatherings_have_no_cue() {
+        for persona in [PersonaTraits::default(), female()] {
+            for rung in 1..=3 {
+                for k in [
+                    EventKind::BrosGathering,
+                    EventKind::SisGathering,
+                    EventKind::TakingSpace,
+                    EventKind::FellOut,
+                ] {
+                    assert!(!is_told(k, rung, &persona), "{k:?} rung {rung}");
+                }
+            }
+        }
+        assert!(!is_told(EventKind::OutShopping, 1, &female()));
+        assert!(is_told(EventKind::OutShopping, 2, &female()));
+        assert!(is_told(
+            EventKind::OutShopping,
+            1,
+            &PersonaTraits::default()
+        ));
     }
 
     #[test]
@@ -526,15 +659,20 @@ mod tests {
                 "（你接下来要去打一场硬仗，一段时间顾不上手机。）",
             ),
         ] {
-            assert_eq!(kind_cue(kind, h), cue, "{kind:?}");
+            assert_eq!(
+                kind_cue(kind, h, 1, &PersonaTraits::default(), None),
+                cue,
+                "{kind:?}"
+            );
         }
     }
 
     #[test]
     fn an_incident_during_a_background_opens_with_its_state() {
         let h = Duration::hours(1);
+        let cue = |kind, bg| event_cue(kind, h, bg, 1, &PersonaTraits::default(), None);
         assert_eq!(
-            event_cue(EventKind::AnimalEncounter, h, Some(EventKind::BusinessTrip)),
+            cue(EventKind::AnimalEncounter, Some(EventKind::BusinessTrip)),
             "（你正在外地出差。你刚在路上遇到了一只小动物。）"
         );
         for (bg, state) in [
@@ -548,11 +686,11 @@ mod tests {
             (EventKind::HometownVisit, "你正在老家"),
         ] {
             assert_eq!(
-                event_cue(EventKind::Reading, h, Some(bg)),
+                cue(EventKind::Reading, Some(bg)),
                 format!("（{state}。你正在看书。）")
             );
         }
-        assert_eq!(event_cue(EventKind::Reading, h, None), "（你正在看书。）");
+        assert_eq!(cue(EventKind::Reading, None), "（你正在看书。）");
     }
 
     #[test]
@@ -561,7 +699,10 @@ mod tests {
             event_cue(
                 EventKind::PeriodScare,
                 Duration::hours(1),
-                Some(EventKind::BusinessTrip)
+                Some(EventKind::BusinessTrip),
+                1,
+                &PersonaTraits::default(),
+                None
             ),
             "（你正在外地出差。你发现月经推迟了好几天还没来，心里有点慌。）"
         );
@@ -569,7 +710,7 @@ mod tests {
 
     #[test]
     fn a_background_cue_carries_its_length() {
-        let cue = |k, h| kind_cue(k, Duration::hours(h));
+        let cue = |k, h| kind_cue(k, Duration::hours(h), 1, &PersonaTraits::default(), None);
         assert_eq!(
             cue(EventKind::Sick, 30),
             "（你生病了，大概要 30 小时才会好。）"

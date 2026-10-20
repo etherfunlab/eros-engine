@@ -2321,7 +2321,7 @@
           "companion"
         ],
         "summary": "Ask for something to happen in the persona's day.",
-        "description": "The engine draws one kind of event, or none (a short or mid-length\nincident is under way, or every allowed kind is cooling down). During a\nbackground event (a trip or a body state) only incidents are drawn. The\npersona then tells the user in one proactive message, persisted like any\nreply and returned with the event. The offline kinds (`away_from_phone`,\n`busy`, `in_battle`, `asleep`) make her unreachable while they last.\n`busy` and `in_battle` are announced in a message at intimacy rung 2 and\nup; below that, and always for `away_from_phone` and `asleep`, the event\ncomes back with `message: null`. The same `event_key` returns the same\nevent.",
+        "description": "The engine draws one kind of event, or none (a short or mid-length\nincident is under way, or every allowed kind is cooling down). During a\nbackground event (a trip or a body state) only incidents are drawn. The\npersona then tells the user in one proactive message, persisted like any\nreply and returned with the event. The offline kinds (`away_from_phone`,\n`busy`, `in_battle`, `asleep`, `bros_gathering`, `sis_gathering`, and\n`out_shopping` for a female persona) make her unreachable while they last.\n`busy`, `in_battle` and a female persona's `out_shopping` are announced in\na message at intimacy rung 2 and up; below that, and always for\n`away_from_phone`, `asleep` and the gatherings, the event comes back with\n`message: null`. For any other persona `out_shopping` is not offline and\nis announced at every rung. The same `event_key` returns the same event.",
         "operationId": "draw_event",
         "parameters": [
           {
@@ -2400,7 +2400,7 @@
             }
           },
           "422": {
-            "description": "unknown kind or another malformed body field"
+            "description": "unknown kind, `taking_space` or `fell_out` in `kinds`, or another malformed body field"
           },
           "429": {
             "description": "per-user in-flight cap reached"
@@ -4443,7 +4443,7 @@
       },
       "EventKindDto": {
         "type": "string",
-        "description": "A kind of life event.",
+        "description": "A kind of life event. `taking_space` and `fell_out` are placed by the\nengine, never drawn: they appear in responses only, and a `kinds` filter\nthat lists one is rejected.",
         "enum": [
           "police_encounter",
           "animal_encounter",

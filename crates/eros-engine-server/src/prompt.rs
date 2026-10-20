@@ -4070,6 +4070,43 @@ mod tests {
     }
 
     #[test]
+    fn new_labels_and_aftermaths() {
+        use eros_engine_core::events::EventKind::*;
+        for (kind, label) in [
+            (SawBag, "看中了一个包"),
+            (SawClothes, "看中了一件衣服"),
+            (OutShopping, "在逛街"),
+            (BrosGathering, "兄弟聚会"),
+            (SisGathering, "姐妹聚会"),
+            (TakingSpace, "说好暂时分开"),
+            (FellOut, "为分开的事闹得不愉快"),
+        ] {
+            assert_eq!(event_label(kind), label, "{kind:?}");
+        }
+        let rec = |kind| {
+            let (e, _) = event_at(kind, 70, -10);
+            e
+        };
+        for (kind, text) in [
+            (OutShopping, "在逛街，对方那时发来的消息你现在才看到"),
+            (
+                BrosGathering,
+                "去了兄弟聚会，对方那时发来的消息你现在才看到",
+            ),
+            (SisGathering, "去了姐妹聚会，对方那时发来的消息你现在才看到"),
+            (
+                TakingSpace,
+                "你们之前说好分开一阵，现在时间到了；对方那时发来的消息你现在才看到",
+            ),
+        ] {
+            assert_eq!(just_now_text(Some(&rec(kind)), None).as_deref(), Some(text));
+        }
+        for kind in [SawBag, SawClothes, FellOut] {
+            assert_eq!(just_now_text(Some(&rec(kind)), None), None, "{kind:?}");
+        }
+    }
+
+    #[test]
     fn the_judge_hears_both_aftermaths() {
         use eros_engine_core::events::EventKind::*;
         let (asleep, at) = event_at(Asleep, 180, -120);

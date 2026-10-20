@@ -168,9 +168,21 @@ async fn get_effects(
     let current = eros_engine_store::events::EventRepo { pool: &state.pool }
         .current(instance_id, None, now)
         .await?;
+    // Whether an event keeps her offline can depend on the persona. A BYOC
+    // instance has no genome, no events and no traits.
+    let traits = if current.foreground.is_some() || current.background.is_some() {
+        eros_engine_store::persona::PersonaRepo { pool: &state.pool }
+            .load_companion(instance_id)
+            .await?
+            .as_ref()
+            .map(crate::prompt::persona_traits)
+            .unwrap_or_default()
+    } else {
+        Default::default()
+    };
     let view = |e: &Option<eros_engine_store::events::EventRecord>| {
         e.as_ref()
-            .map(crate::routes::session_events::EventView::from)
+            .map(|e| crate::routes::session_events::EventView::new(e, &traits))
     };
     let changes_at = [
         needs_change,
@@ -391,6 +403,51 @@ mod tests {
             body["changes_at"], body["event"]["ends_at"],
             "the foreground ends first"
         );
+    }
+
+    /// Whether she is offline in `out_shopping` depends on the persona: only
+    /// a female one goes dark, so the wire flag follows the persona.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn out_shopping_is_offline_only_for_a_female_persona(pool: sqlx::PgPool) {
+        use eros_engine_core::events::EventKind;
+        for (art, offline) in [
+            (json!({"gender": "female"}), true),
+            (json!({"gender": "male"}), false),
+            (json!({}), false),
+        ] {
+            let owner = Uuid::new_v4();
+            let instance_id = seed_persona_instance(&pool, owner).await;
+            sqlx::query(
+                "UPDATE engine.persona_genomes SET art_metadata = $2 \
+                 WHERE id = (SELECT genome_id FROM engine.persona_instances WHERE id = $1)",
+            )
+            .bind(instance_id)
+            .bind(&art)
+            .execute(&pool)
+            .await
+            .unwrap();
+            let session_id = seed_session(&pool, owner, instance_id).await;
+            let now = chrono::Utc::now();
+            eros_engine_store::events::EventRepo { pool: &pool }
+                .insert(
+                    &eros_engine_store::events::NewEvent {
+                        instance_id,
+                        session_id,
+                        event_key: "shopping",
+                        kind: EventKind::OutShopping,
+                        started_at: now - chrono::Duration::minutes(5),
+                        ends_at: now + chrono::Duration::hours(2),
+                    },
+                    None,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            let (s, body) = get(pool.clone(), session_id, owner).await;
+            assert_eq!(s, StatusCode::OK);
+            assert_eq!(body["event"]["kind"], json!("out_shopping"), "{art}");
+            assert_eq!(body["event"]["offline"], json!(offline), "{art}");
+        }
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

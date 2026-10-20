@@ -1288,6 +1288,73 @@ mod tests {
         );
     }
 
+    /// `out_shopping` takes only a female persona offline, so only she has a
+    /// stretch to explain when the user opens the chat after it.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_opener_after_out_shopping_explains_it_only_for_a_female_persona(pool: PgPool) {
+        use eros_engine_core::events::EventKind;
+        for (art, line) in [
+            (json!({"gender": "female"}), true),
+            (json!({"gender": "male"}), false),
+            (json!({}), false),
+        ] {
+            let user_id = Uuid::new_v4();
+            let now = Utc::now();
+            let session_id =
+                session_with_history(&pool, user_id, now - chrono::Duration::days(2)).await;
+            sqlx::query(
+                "UPDATE engine.persona_genomes SET art_metadata = $2 WHERE id = \
+                 (SELECT i.genome_id FROM engine.persona_instances i \
+                    JOIN engine.chat_sessions s ON s.instance_id = i.id WHERE s.id = $1)",
+            )
+            .bind(session_id)
+            .bind(&art)
+            .execute(&pool)
+            .await
+            .unwrap();
+            seed_event(
+                &pool,
+                session_id,
+                EventKind::OutShopping,
+                now - chrono::Duration::minutes(70),
+                now - chrono::Duration::minutes(10),
+            )
+            .await;
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content, ghost_decision, sent_at) \
+                 VALUES ($1, 'user', '在吗', true, $2)",
+            )
+            .bind(session_id)
+            .bind(now - chrono::Duration::minutes(30))
+            .execute(&pool)
+            .await
+            .unwrap();
+            let mock = MockServer::start().await;
+            mount_companion(&mock, "刚刚在逛街，抱歉").await;
+            let state = with_companion(test_state(pool.clone()), &mock.uri());
+            open_at(
+                &state,
+                session_id,
+                user_id,
+                opener(OpenOccasion::JustOpened, "visit-1"),
+                now,
+            )
+            .await
+            .unwrap()
+            .greeting
+            .expect("an opener");
+            let calls = companion_calls(&mock).await;
+            assert_eq!(
+                calls[0]
+                    .to_string()
+                    .contains("- 刚才：在逛街，对方那时发来的消息你现在才看到"),
+                line,
+                "{art}: {}",
+                calls[0]
+            );
+        }
+    }
+
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn the_opener_after_a_false_alarm_resolves_it(pool: PgPool) {
         use eros_engine_core::events::EventKind;
