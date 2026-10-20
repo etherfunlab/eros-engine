@@ -873,6 +873,8 @@ fn event_label(kind: eros_engine_core::events::EventKind) -> &'static str {
         ShortTrip => "短途旅游",
         LongTrip => "长途旅游",
         HometownVisit => "回老家",
+        TakingSpace => "说好暂时分开",
+        FellOut => "为分开的事闹得不愉快",
     }
 }
 
@@ -987,6 +989,8 @@ fn aftermath_text(kind: eros_engine_core::events::EventKind) -> Option<&'static 
         SisGathering => "去了姐妹聚会，对方那时发来的消息你现在才看到",
         PeriodScare => "以为月经没来，后来来了，是虚惊一场",
         PregnancyScare => "验出两条杠，后来复查是虚惊一场",
+        TakingSpace => "你们之前说好分开一阵，现在时间到了；对方那时发来的消息你现在才看到",
+        FellOut => return None,
         _ => return None,
     })
 }

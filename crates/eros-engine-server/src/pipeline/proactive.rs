@@ -155,7 +155,7 @@ fn kind_cue(kind: EventKind, lasts: chrono::Duration) -> String {
         Busy => "（你接下来要忙一阵，这段时间顾不上看手机。）".into(),
         InBattle => "（你接下来要去打一场硬仗，一段时间顾不上手机。）".into(),
         OutShopping => "（你正在外面逛街。）".into(),
-        AwayFromPhone | Asleep | BrosGathering | SisGathering => {
+        AwayFromPhone | Asleep | BrosGathering | SisGathering | TakingSpace | FellOut => {
             unreachable!("{kind:?} is never told")
         }
         Sick => format!("（你生病了，大概要 {span}才会好。）"),

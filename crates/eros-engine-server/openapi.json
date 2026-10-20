@@ -4487,7 +4487,9 @@
           "business_trip",
           "short_trip",
           "long_trip",
-          "hometown_visit"
+          "hometown_visit",
+          "taking_space",
+          "fell_out"
         ]
       },
       "EventView": {

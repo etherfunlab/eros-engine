@@ -102,6 +102,8 @@ pub enum EventKind {
     ShortTrip,
     LongTrip,
     HometownVisit,
+    TakingSpace,
+    FellOut,
 }
 
 impl EventKind {
@@ -152,6 +154,9 @@ impl EventKind {
         EventKind::HometownVisit,
     ];
 
+    /// Kinds the writers place directly, never drawn: parsed and stored, not in `ALL`.
+    pub const SPECIAL: [EventKind; 2] = [EventKind::TakingSpace, EventKind::FellOut];
+
     /// The stored and wire value.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -198,11 +203,16 @@ impl EventKind {
             EventKind::ShortTrip => "short_trip",
             EventKind::LongTrip => "long_trip",
             EventKind::HometownVisit => "hometown_visit",
+            EventKind::TakingSpace => "taking_space",
+            EventKind::FellOut => "fell_out",
         }
     }
 
     pub fn parse(s: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|k| k.as_str() == s)
+        Self::ALL
+            .into_iter()
+            .chain(Self::SPECIAL)
+            .find(|k| k.as_str() == s)
     }
 
     pub fn category(self) -> EventCategory {
@@ -214,7 +224,9 @@ impl EventKind {
             | SawBag | SawClothes => EventCategory::Short,
             TempWork | ExMessage | WeatherChange | GotHit | Breakup | WorkingOut | Reading
             | Gaming | AwayFromPhone | Unwell | Irritable | Busy | InBattle | Asleep
-            | OutShopping | BrosGathering | SisGathering => EventCategory::Mid,
+            | OutShopping | BrosGathering | SisGathering | TakingSpace | FellOut => {
+                EventCategory::Mid
+            }
             Sick | Period | Hospitalized | PostSurgery => EventCategory::Body,
             BusinessTrip | ShortTrip | LongTrip | HometownVisit => EventCategory::Trip,
         }
@@ -243,7 +255,14 @@ impl EventKind {
         use EventKind::*;
         matches!(
             self,
-            AwayFromPhone | Busy | InBattle | Asleep | OutShopping | BrosGathering | SisGathering
+            AwayFromPhone
+                | Busy
+                | InBattle
+                | Asleep
+                | OutShopping
+                | BrosGathering
+                | SisGathering
+                | TakingSpace
         )
     }
 
@@ -317,6 +336,8 @@ fn rule(kind: EventKind) -> Rule {
         ShortTrip => (2.0, 0, Lasts::Hours(2 * DAY, 2 * DAY)),
         LongTrip => (1.0, 0, Lasts::Hours(3 * DAY, 7 * DAY)),
         HometownVisit => (1.0, 0, Lasts::Hours(3 * DAY, 3 * DAY)),
+        TakingSpace => (0.0, 0, Lasts::Hours(12, 24)),
+        FellOut => (0.0, 0, Lasts::Hours(1, 1)),
     };
     Rule {
         weight,
@@ -627,9 +648,11 @@ pub fn background_kinds() -> Vec<EventKind> {
 /// is not offline; `busy` and `in_battle` from rung 2, so she says she will be
 /// away only to someone she is close to, and so does a female persona's
 /// `out_shopping` (spec 2026-10-19-life-events-shopping-gatherings-and-ask-for-
-/// space-design.md §2.1); never `asleep`, `away_from_phone` or a gathering.
+/// space-design.md §2.1); never `asleep`, `away_from_phone`, a gathering, or
+/// the storage-only `taking_space` and `fell_out`.
 pub fn is_told(kind: EventKind, rung: u8, persona: &PersonaTraits) -> bool {
     match kind {
+        EventKind::TakingSpace | EventKind::FellOut => false,
         EventKind::Busy | EventKind::InBattle => rung >= CONFIDE_MIN_RUNG,
         EventKind::OutShopping if persona.female => rung >= CONFIDE_MIN_RUNG,
         k => !k.is_offline(persona),
@@ -1410,6 +1433,55 @@ mod tests {
             assert!(EventKind::ALL.contains(&k), "{k:?}");
         }
         assert_eq!(EventKind::ALL.len(), 43);
+    }
+
+    #[test]
+    fn special_kinds_parse_but_are_never_drawn() {
+        assert_eq!(EventKind::parse("taking_space"), Some(TakingSpace));
+        assert_eq!(EventKind::parse("fell_out"), Some(FellOut));
+        assert!(!EventKind::ALL.contains(&TakingSpace));
+        assert!(!EventKind::ALL.contains(&FellOut));
+        assert_eq!(EventKind::ALL.len(), 43);
+        for k in EventKind::SPECIAL {
+            assert_eq!(serde_json::to_value(k).unwrap(), k.as_str());
+            assert_eq!(EventKind::parse(k.as_str()), Some(k));
+            for i in 0..=10 {
+                let r = i as f64 / 10.0;
+                assert_eq!(pick(&[], &EventKind::SPECIAL, rolls(r, r)), None, "{k:?}");
+                assert_ne!(pick(&[], &EventKind::ALL, rolls(r, r)), Some(k), "{k:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn taking_space_is_offline_fell_out_is_not() {
+        let personas = [
+            PersonaTraits::default(),
+            female(),
+            PersonaTraits {
+                prefer_trip: true,
+                ..Default::default()
+            },
+        ];
+        for p in &personas {
+            assert!(TakingSpace.is_offline(p), "{p:?}");
+            assert!(!FellOut.is_offline(p), "{p:?}");
+            for rung in 0..=4 {
+                assert!(!is_told(TakingSpace, rung, p), "{p:?} rung {rung}");
+                assert!(!is_told(FellOut, rung, p), "{p:?} rung {rung}");
+            }
+        }
+        assert!(TakingSpace.may_be_offline());
+        assert!(!FellOut.may_be_offline());
+    }
+
+    #[test]
+    fn a_separation_blocks_the_draw() {
+        assert_eq!(TakingSpace.category(), EventCategory::Mid);
+        assert!(!TakingSpace.is_background());
+        let h = [past(TakingSpace, 1, 24)];
+        assert_eq!(pick(&h, &EventKind::ALL, rolls(0.99, 0.5)), None);
+        assert_eq!(pick(&h, &EventKind::ALL, rolls(0.0, 0.0)), None);
     }
 
     #[test]
