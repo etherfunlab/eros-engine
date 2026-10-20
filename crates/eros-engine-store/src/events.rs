@@ -175,13 +175,26 @@ impl EventRepo<'_> {
     /// under way at `started_at` ends there, a background keeps running, and
     /// the event lands whether or not one was. No message, and no draw guard:
     /// the caller has decided. One transaction; a repeated `event_key` in the
-    /// session is an error and undoes the cap.
+    /// session is an error and undoes the cap. See [`Self::insert_preempting_in_tx`].
     pub async fn insert_preempting(&self, e: &NewEvent<'_>) -> Result<EventRecord, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let event = Self::insert_preempting_in_tx(&mut tx, e).await?;
+        tx.commit().await?;
+        Ok(event)
+    }
+
+    /// [`Self::insert_preempting`] inside the caller's transaction, so the
+    /// event commits or rolls back together with whatever else the caller
+    /// writes; nothing here commits. An error leaves the transaction unusable:
+    /// drop it, and the cap goes with it.
+    pub async fn insert_preempting_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        e: &NewEvent<'_>,
+    ) -> Result<EventRecord, sqlx::Error> {
         let background: Vec<String> = events::background_kinds()
             .into_iter()
             .map(|k| k.as_str().to_string())
             .collect();
-        let mut tx = self.pool.begin().await?;
         // `started_at < $2`: a row starting at the moment itself is not capped
         // (its `ends_at` would equal its `started_at`, which the table forbids).
         sqlx::query(
@@ -192,7 +205,7 @@ impl EventRepo<'_> {
         .bind(e.instance_id)
         .bind(e.started_at)
         .bind(&background)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
         let id: Uuid = sqlx::query_scalar(
             "INSERT INTO engine.persona_events \
@@ -206,9 +219,8 @@ impl EventRepo<'_> {
         .bind(e.kind.as_str())
         .bind(e.started_at)
         .bind(e.ends_at)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?;
-        tx.commit().await?;
         Ok(EventRecord {
             id,
             kind: e.kind,

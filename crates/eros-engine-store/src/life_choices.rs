@@ -165,9 +165,28 @@ impl LifeChoiceRepo<'_> {
 
     /// Answer the choice: `status` and `now` as its resolution. `None` when
     /// it is no longer pending or has lapsed at `now` — the answer that lost
-    /// the race, or came too late. The first one wins.
+    /// the race, or came too late. The first one wins. See
+    /// [`Self::resolve_in_tx`].
     pub async fn resolve(
         &self,
+        choice_id: Uuid,
+        status: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<LifeChoiceRecord>, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let resolved = Self::resolve_in_tx(&mut tx, choice_id, status, now).await?;
+        tx.commit().await?;
+        Ok(resolved)
+    }
+
+    /// [`Self::resolve`] inside the caller's transaction, so the resolution
+    /// commits or rolls back together with what it is paired with (the
+    /// falling-out, the separation, the tier drop); nothing here commits. A
+    /// caller that gets `None` has lost and drops the transaction: nothing of
+    /// the rest of its work may land. A concurrent resolve of the same row
+    /// waits on its lock here and then finds the choice no longer pending.
+    pub async fn resolve_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         choice_id: Uuid,
         status: &str,
         now: DateTime<Utc>,
@@ -182,7 +201,7 @@ impl LifeChoiceRepo<'_> {
         .bind(status)
         .bind(now)
         .bind(PENDING_HOURS)
-        .fetch_optional(self.pool)
+        .fetch_optional(&mut **tx)
         .await
     }
 
@@ -569,6 +588,269 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!((message_id, event_id), (None, None));
+    }
+
+    /// The ignore conversion's shape: resolve first, the falling-out second,
+    /// in the caller's one transaction. `None` when the resolve lost; the
+    /// transaction is dropped uncommitted then, as on any error.
+    async fn convert_in_tx(
+        pool: &PgPool,
+        choice: &LifeChoiceRecord,
+        instance: Uuid,
+        started_at: DateTime<Utc>,
+        commit: bool,
+    ) -> Result<Option<crate::events::EventRecord>, sqlx::Error> {
+        use crate::events::{EventRepo, NewEvent};
+        use eros_engine_core::events::EventKind;
+
+        let mut tx = pool.begin().await?;
+        let Some(resolved) =
+            LifeChoiceRepo::resolve_in_tx(&mut tx, choice.id, "ignored", started_at).await?
+        else {
+            return Ok(None);
+        };
+        let key = format!("life_choice:{}:fell_out", resolved.id);
+        let event = EventRepo::insert_preempting_in_tx(
+            &mut tx,
+            &NewEvent {
+                instance_id: instance,
+                session_id: resolved.session_id,
+                event_key: &key,
+                kind: EventKind::FellOut,
+                started_at,
+                ends_at: started_at + Duration::hours(1),
+            },
+        )
+        .await?;
+        if commit {
+            tx.commit().await?;
+        }
+        Ok(Some(event))
+    }
+
+    async fn status_of(pool: &PgPool, choice: Uuid) -> (String, Option<DateTime<Utc>>) {
+        sqlx::query_as("SELECT status, resolved_at FROM engine.life_choices WHERE id = $1")
+            .bind(choice)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn event_kinds(pool: &PgPool, instance: Uuid) -> Vec<String> {
+        sqlx::query_scalar(
+            "SELECT kind FROM engine.persona_events WHERE instance_id = $1 ORDER BY started_at",
+        )
+        .bind(instance)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_resolution_and_the_event_commit_in_one_transaction(pool: PgPool) {
+        use crate::events::{EventRepo, NewEvent};
+        use eros_engine_core::events::EventKind;
+
+        let (_, instance, session) = instance_and_session(&pool).await;
+        let repo = LifeChoiceRepo { pool: &pool };
+        let choice = repo
+            .insert_ask(session, 3, &ask_message("想先分开"))
+            .await
+            .unwrap()
+            .expect("written");
+        // An incident under way when the conversion lands.
+        let at = choice.asked_at + Duration::hours(2);
+        let running = EventRepo { pool: &pool }
+            .insert_preempting(&NewEvent {
+                instance_id: instance,
+                session_id: session,
+                event_key: "running",
+                kind: EventKind::Quarrel,
+                started_at: at - Duration::minutes(20),
+                ends_at: at + Duration::minutes(40),
+            })
+            .await
+            .unwrap();
+
+        let event = convert_in_tx(&pool, &choice, instance, at, true)
+            .await
+            .unwrap()
+            .expect("the resolve won");
+        assert_eq!(
+            (
+                event.kind,
+                event.started_at,
+                event.ends_at,
+                event.message_id
+            ),
+            (EventKind::FellOut, at, at + Duration::hours(1), None)
+        );
+        assert_eq!(
+            status_of(&pool, choice.id).await,
+            ("ignored".into(), Some(at))
+        );
+        let capped: DateTime<Utc> =
+            sqlx::query_scalar("SELECT ends_at FROM engine.persona_events WHERE id = $1")
+                .bind(running.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(capped, at, "the incident ends where the falling-out starts");
+        assert_eq!(event_kinds(&pool, instance).await, ["quarrel", "fell_out"]);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_conversion_that_does_not_commit_leaves_no_trace(pool: PgPool) {
+        use crate::events::{EventRepo, NewEvent};
+        use eros_engine_core::events::EventKind;
+
+        let (_, instance, session) = instance_and_session(&pool).await;
+        let repo = LifeChoiceRepo { pool: &pool };
+        let choice = repo
+            .insert_ask(session, 3, &ask_message("想先分开"))
+            .await
+            .unwrap()
+            .expect("written");
+        let at = choice.asked_at + Duration::hours(2);
+        let ends = at + Duration::minutes(40);
+        let running = EventRepo { pool: &pool }
+            .insert_preempting(&NewEvent {
+                instance_id: instance,
+                session_id: session,
+                event_key: "running",
+                kind: EventKind::Quarrel,
+                started_at: at - Duration::minutes(20),
+                ends_at: ends,
+            })
+            .await
+            .unwrap();
+
+        // Both statements ran and the transaction was dropped: all or nothing.
+        let written = convert_in_tx(&pool, &choice, instance, at, false)
+            .await
+            .unwrap();
+        assert!(written.is_some(), "the statements themselves succeeded");
+        assert_eq!(status_of(&pool, choice.id).await, ("pending".into(), None));
+        assert_eq!(event_kinds(&pool, instance).await, ["quarrel"]);
+        let still: DateTime<Utc> =
+            sqlx::query_scalar("SELECT ends_at FROM engine.persona_events WHERE id = $1")
+                .bind(running.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(still, ends, "the cap is undone with it");
+        assert!(repo.pending(session, at).await.unwrap().is_some());
+
+        // The same transaction run to the end after a failure part-way: a
+        // repeated key makes the event insert error, and the resolve goes with it.
+        convert_in_tx(&pool, &choice, instance, at, true)
+            .await
+            .unwrap()
+            .expect("written");
+        sqlx::query("UPDATE engine.life_choices SET status = 'pending', resolved_at = NULL")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            convert_in_tx(&pool, &choice, instance, at + Duration::minutes(1), true)
+                .await
+                .is_err(),
+            "the key is taken"
+        );
+        assert_eq!(
+            status_of(&pool, choice.id).await,
+            ("pending".into(), None),
+            "the failed event insert undid the resolve"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_resolve_that_loses_in_a_transaction_returns_none(pool: PgPool) {
+        let (_, instance, session) = instance_and_session(&pool).await;
+        let repo = LifeChoiceRepo { pool: &pool };
+        let choice = repo
+            .insert_ask(session, 3, &ask_message("想先分开"))
+            .await
+            .unwrap()
+            .expect("written");
+        let at = choice.asked_at + Duration::hours(2);
+
+        // The endpoint answered first.
+        repo.resolve(choice.id, "declined", at - Duration::minutes(1))
+            .await
+            .unwrap()
+            .expect("resolved");
+        assert!(convert_in_tx(&pool, &choice, instance, at, true)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            status_of(&pool, choice.id).await,
+            ("declined".into(), Some(at - Duration::minutes(1)))
+        );
+        assert!(event_kinds(&pool, instance).await.is_empty());
+
+        // A choice that lapsed cannot be resolved either; it stays pending.
+        let lapsing = {
+            sqlx::query("DELETE FROM engine.life_choices WHERE id = $1")
+                .bind(choice.id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            repo.insert_ask(session, 3, &ask_message("再想想"))
+                .await
+                .unwrap()
+                .expect("written")
+        };
+        assert!(
+            convert_in_tx(&pool, &lapsing, instance, lapsing.expires_at(), true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(status_of(&pool, lapsing.id).await, ("pending".into(), None));
+        assert!(event_kinds(&pool, instance).await.is_empty());
+    }
+
+    /// Two transactions racing for one choice: the second waits on the first's
+    /// row lock and, once it commits, finds the choice answered.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn concurrent_resolves_in_transactions_first_writer_wins(pool: PgPool) {
+        let (_, _, session) = instance_and_session(&pool).await;
+        let choice = LifeChoiceRepo { pool: &pool }
+            .insert_ask(session, 3, &ask_message("想先分开"))
+            .await
+            .unwrap()
+            .expect("written");
+        let at = choice.asked_at + Duration::hours(2);
+
+        let mut first = pool.begin().await.unwrap();
+        LifeChoiceRepo::resolve_in_tx(&mut first, choice.id, "declined", at)
+            .await
+            .unwrap()
+            .expect("the first wins");
+        let second = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                let mut tx = pool.begin().await.unwrap();
+                let lost = LifeChoiceRepo::resolve_in_tx(&mut tx, choice.id, "ignored", at)
+                    .await
+                    .unwrap();
+                tx.commit().await.unwrap();
+                lost
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!second.is_finished(), "the second waits for the first");
+        first.commit().await.unwrap();
+        assert!(
+            second.await.unwrap().is_none(),
+            "and then finds it answered"
+        );
+        assert_eq!(
+            status_of(&pool, choice.id).await,
+            ("declined".into(), Some(at))
+        );
     }
 
     /// An accepted choice for `session` whose separation runs `[starts, ends)`.

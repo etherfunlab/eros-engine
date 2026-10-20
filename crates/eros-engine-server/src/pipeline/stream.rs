@@ -4450,6 +4450,23 @@ pub(crate) fn run_stream_with(
         } else {
             None
         };
+        // An ordinary message that arrives while she waits for an answer to
+        // her ask for space is the answer (spec 2026-10-19 §3.4c): the choice
+        // is ignored and the falling-out starts at this row, before the read
+        // below, so this very turn is answered with it. A give, a tip or a
+        // kiss does not answer her.
+        if user_msg.action.is_none() {
+            if let Err(e) = crate::pipeline::life_choice::convert_ignored_ask(
+                &state,
+                user_msg.session_id,
+                user_msg.instance_id,
+                user_msg.user_message_id,
+            )
+            .await
+            {
+                tracing::warn!("stream: ignore conversion failed: {e}");
+            }
+        }
         // The events under way at this turn, anchored at its own row so a
         // re-driven turn sees the same ones (spec 2026-10-15-life-events-v2-
         // design.md §6.4). Independent of the judge.

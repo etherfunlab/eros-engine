@@ -7,14 +7,14 @@
 //! Spec: docs/superpowers/specs/2026-10-19-life-events-shopping-gatherings-and-ask-for-space-design.md
 //! §3.1 (trigger), §3.2 (the ask), §3.5 (the slowdown).
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use uuid::Uuid;
 
 use eros_engine_core::events::EventKind;
 use eros_engine_core::persona::CompanionPersona;
 use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::ChatRepo;
-use eros_engine_store::events::EventRepo;
+use eros_engine_store::events::{EventRepo, NewEvent};
 use eros_engine_store::life_choices::LifeChoiceRepo;
 
 use crate::byoc::LoadedInstance;
@@ -53,6 +53,72 @@ pub(crate) async fn growth_scale_for(
             1.0
         }
     }
+}
+
+/// How long the falling-out lasts, from the message that caused it.
+const FELL_OUT_HOURS: i64 = 1;
+
+/// The ignore path (spec §3.4c): an ordinary text turn that arrives while she
+/// waits for an answer is the answer. The choice becomes `ignored` and a
+/// `fell_out` event starts at the user's row, in one transaction, so the turn
+/// that ignored her reads the falling-out in its events. An incident under
+/// way ends there, a background keeps running. No tier changes: the judge
+/// rates the turn itself.
+///
+/// The clock is the user row's `sent_at`: whether the message arrived while
+/// the choice was pending is a fact about the message, so a turn that waited
+/// in the queue past the 24 hours still answers it, and a re-drive reads the
+/// same. A message sent before her ask landed answers nothing: the ask can be
+/// written while the user's next message is already in flight.
+///
+/// Nothing happens (and nothing is written) when no choice is pending then —
+/// a lapsed one converts nothing (§3.4d) — or when the resolution route
+/// answered first. The caller leaves out action turns: a give, a tip or a
+/// kiss does not answer her. `Ok(true)` when the choice was converted.
+pub(crate) async fn convert_ignored_ask(
+    state: &AppState,
+    session_id: Uuid,
+    instance_id: Uuid,
+    user_message_id: Uuid,
+) -> Result<bool, AppError> {
+    let Some(sent_at) = (ChatRepo { pool: &state.pool })
+        .message_by_id_in_session(session_id, user_message_id)
+        .await?
+        .map(|m| m.sent_at)
+    else {
+        return Ok(false);
+    };
+    let Some(choice) = (LifeChoiceRepo { pool: &state.pool })
+        .pending(session_id, sent_at)
+        .await?
+        .filter(|c| c.asked_at <= sent_at)
+    else {
+        return Ok(false);
+    };
+
+    let mut tx = state.pool.begin().await?;
+    // First, the race guard: the resolution route may have answered between
+    // the read and here, and the loser writes nothing.
+    let Some(choice) =
+        LifeChoiceRepo::resolve_in_tx(&mut tx, choice.id, "ignored", sent_at).await?
+    else {
+        return Ok(false);
+    };
+    EventRepo::insert_preempting_in_tx(
+        &mut tx,
+        &NewEvent {
+            instance_id,
+            session_id: choice.session_id,
+            event_key: &format!("life_choice:{}:fell_out", choice.id),
+            kind: EventKind::FellOut,
+            started_at: sent_at,
+            ends_at: sent_at + Duration::hours(FELL_OUT_HOURS),
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    tracing::info!(%session_id, choice_id = %choice.id, "her ask went unanswered: fell out");
+    Ok(true)
 }
 
 /// After a judged turn's affinity committed: ask for space if the
@@ -835,5 +901,451 @@ mod tests {
         assert!((slowed - full / 2.0).abs() < 1e-9, "{slowed} vs {full}");
         assert_eq!(slowed_ctx["growth_scale"], json!(0.5));
         assert!(full_ctx.get("growth_scale").is_none(), "{full_ctx}");
+    }
+
+    // ---- The ignore conversion (spec §3.4c, §3.4d) ----
+
+    /// The turn's judge verdict: an ordinary reply.
+    const TURN_VERDICT: &str = r#"{"action": "reply_text", "inner_state": ""}"#;
+    /// The falling-out as the judge and the reply read it.
+    const FELL_OUT_LABEL: &str = "为分开的事闹得不愉快";
+
+    /// A whole turn's providers: the judge ("pde/judge") and her reply
+    /// ("deepseek/x"). Returns the state wired to them and the mock.
+    async fn turn_env(pool: &PgPool) -> (Arc<AppState>, MockServer) {
+        let mock = MockServer::start().await;
+        let judge = json!({
+            "id": "gj", "model": "pde/judge",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": TURN_VERDICT}}],
+        });
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("pde/judge"))
+            .respond_with(crate::pipeline::reasoning_call::test_support::sse_completion(judge))
+            .mount(&mock)
+            .await;
+        let reply = "data: {\"choices\":[{\"delta\":{\"content\":\"嗯\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"deepseek/x\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(reply, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+        let mut state = test_state(pool.clone());
+        state.model_config = Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"deepseek/x\"\n\
+                 [tasks.pde_decision]\nmodel = \"pde/judge\"\nfilter_prompt = \"Decide.\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        (Arc::new(state), mock)
+    }
+
+    /// A request body the judge or the reply received, by the model it names.
+    async fn request_to(mock: &MockServer, model: &str) -> Vec<String> {
+        mock.received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .filter(|b| b.contains(model))
+            .collect()
+    }
+
+    /// A time in the recent past, whole microseconds, so what Postgres stores
+    /// is what the test compares.
+    fn recent(minutes_ago: i64) -> DateTime<Utc> {
+        use chrono::SubsecRound;
+        (Utc::now() - Duration::minutes(minutes_ago)).trunc_subsecs(6)
+    }
+
+    impl Scene {
+        /// A choice asked at `asked_at`, still pending; returns its id.
+        async fn pending_at(&self, asked_at: DateTime<Utc>) -> Uuid {
+            sqlx::query_scalar(
+                "INSERT INTO engine.life_choices (session_id, kind, tier_gap, asked_at) \
+                 VALUES ($1, 'ask_for_space', 3, $2) RETURNING id",
+            )
+            .bind(self.session_id)
+            .bind(asked_at)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+        }
+
+        /// One 1:1 turn through the whole stream, the user's row sent at
+        /// `sent_at` and carrying `action`. Returns the user row's id.
+        async fn stream_turn(
+            &self,
+            state: &Arc<AppState>,
+            sent_at: DateTime<Utc>,
+            action: Option<eros_engine_core::types::UserAction>,
+        ) -> Uuid {
+            use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+            use futures_util::StreamExt;
+
+            let metadata = action
+                .as_ref()
+                .map(|a| json!({ "action": serde_json::to_value(a).unwrap() }));
+            let umid = match (ChatRepo { pool: &self.pool })
+                .upsert_user_message_idempotent(
+                    self.session_id,
+                    if action.is_some() { "" } else { "在吗" },
+                    &ulid::Ulid::new().to_string(),
+                    "user",
+                    metadata.as_ref(),
+                )
+                .await
+                .unwrap()
+            {
+                UpsertUserOutcome::Inserted { message_id } => message_id,
+                _ => unreachable!(),
+            };
+            sqlx::query("UPDATE engine.chat_messages SET sent_at = $2 WHERE id = $1")
+                .bind(umid)
+                .bind(sent_at)
+                .execute(&self.pool)
+                .await
+                .unwrap();
+            let _frames: Vec<_> = crate::pipeline::stream::run_stream(
+                state.clone(),
+                crate::pipeline::stream::PersistedUserMessage {
+                    user_message_id: umid,
+                    session_id: self.session_id,
+                    user_id: self.user_id,
+                    instance_id: self.instance_id,
+                    content: if action.is_some() { "" } else { "在吗" }.into(),
+                    prompt_traits: vec![],
+                    audit: None,
+                    tier: None,
+                    memory_scope: Default::default(),
+                    affinity_scope: Default::default(),
+                    image_url: None,
+                    image: None,
+                    quote: Default::default(),
+                    user_locale: Default::default(),
+                    action,
+                    outfit: None,
+                },
+                None,
+            )
+            .collect()
+            .await;
+            umid
+        }
+
+        /// (status, resolved_at) of the choice.
+        async fn status_of(&self, choice: Uuid) -> (String, Option<DateTime<Utc>>) {
+            sqlx::query_as("SELECT status, resolved_at FROM engine.life_choices WHERE id = $1")
+                .bind(choice)
+                .fetch_one(&self.pool)
+                .await
+                .unwrap()
+        }
+
+        /// (kind, event_key, session_id, started_at, ends_at, message_id) of
+        /// the instance's events, oldest first.
+        #[allow(clippy::type_complexity)]
+        async fn instance_events(
+            &self,
+        ) -> Vec<(
+            String,
+            String,
+            Option<Uuid>,
+            DateTime<Utc>,
+            DateTime<Utc>,
+            Option<Uuid>,
+        )> {
+            sqlx::query_as(
+                "SELECT kind, event_key, session_id, started_at, ends_at, message_id \
+                   FROM engine.persona_events WHERE instance_id = $1 \
+                  ORDER BY started_at, id",
+            )
+            .bind(self.instance_id)
+            .fetch_all(&self.pool)
+            .await
+            .unwrap()
+        }
+
+        /// A running event of the instance, written in a sibling session (an
+        /// event belongs to the persona, not the session it was drawn in).
+        async fn seed_running(
+            &self,
+            kind: &str,
+            key: &str,
+            started_at: DateTime<Utc>,
+            ends_at: DateTime<Utc>,
+        ) {
+            let elsewhere = seed_session(&self.pool, self.user_id, self.instance_id).await;
+            sqlx::query(
+                "INSERT INTO engine.persona_events \
+                   (instance_id, session_id, event_key, kind, started_at, ends_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+            )
+            .bind(self.instance_id)
+            .bind(elsewhere)
+            .bind(key)
+            .bind(kind)
+            .bind(started_at)
+            .bind(ends_at)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        }
+
+        /// The four line axes, whose position is the tiers, and the number of
+        /// `life_choice` affinity events of the session. The endpoints (warmth,
+        /// patience) and the stored tier columns follow the lines on any turn
+        /// and settle in the turn's detached post-process, so they are left out.
+        async fn affinity_fingerprint(&self) -> (Vec<f64>, i64) {
+            let axes: Vec<f64> = sqlx::query_scalar(
+                "SELECT ARRAY[trust, intrigue, intimacy, tension] \
+                   FROM engine.companion_affinity WHERE session_id = $1",
+            )
+            .bind(self.session_id)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap();
+            let drops: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM engine.companion_affinity_events e \
+                   JOIN engine.companion_affinity a ON a.id = e.affinity_id \
+                  WHERE a.session_id = $1 AND e.event_type = 'life_choice'",
+            )
+            .bind(self.session_id)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap();
+            (axes, drops)
+        }
+    }
+
+    /// The first ordinary text message after she asked is the user's answer:
+    /// the choice is `ignored`, the falling-out starts at that message, and
+    /// the very turn that ignored her is answered with it.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_first_ordinary_message_converts_to_fell_out(pool: PgPool) {
+        let s = scene(&pool).await;
+        let (state, mock) = turn_env(&pool).await;
+        let sent = recent(10);
+        let choice = s.pending_at(sent - Duration::hours(2)).await;
+
+        let umid = s.stream_turn(&state, sent, None).await;
+
+        assert_eq!(
+            s.status_of(choice).await,
+            ("ignored".into(), Some(sent)),
+            "resolved at the message that ignored her"
+        );
+        let events = s.instance_events().await;
+        assert_eq!(
+            events,
+            vec![(
+                "fell_out".to_string(),
+                format!("life_choice:{choice}:fell_out"),
+                Some(s.session_id),
+                sent,
+                sent + Duration::hours(1),
+                None,
+            )],
+            "an hour from the message, in the choice's session, with no message of its own"
+        );
+        let current = EventRepo { pool: &pool }
+            .current(s.instance_id, Some(umid), Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            current.foreground.map(|e| e.kind),
+            Some(EventKind::FellOut),
+            "under way"
+        );
+
+        // The same turn's judge and reply see it.
+        let judge = request_to(&mock, "pde/judge").await;
+        assert_eq!(judge.len(), 1);
+        assert!(
+            judge[0].contains(&format!("[近期事件] {FELL_OUT_LABEL}（")),
+            "{}",
+            judge[0]
+        );
+        let reply = request_to(&mock, "deepseek/x").await;
+        assert_eq!(reply.len(), 1);
+        assert!(
+            reply[0].contains(&format!("- 正在经历：{FELL_OUT_LABEL}（")),
+            "{}",
+            reply[0]
+        );
+
+        // No tier change, and no drop event: the judge rates the turn itself.
+        // The scene's lines (bond 0.0, chemistry 0.7: tiers 1 and 4) stand.
+        assert_eq!(
+            s.affinity_fingerprint().await,
+            (vec![0.0, 0.0, 0.7, 0.7], 0)
+        );
+
+        // The next message finds nothing pending: no second row, no new resolve.
+        s.stream_turn(&state, sent + Duration::minutes(5), None)
+            .await;
+        assert_eq!(s.instance_events().await, events);
+        assert_eq!(s.status_of(choice).await, ("ignored".into(), Some(sent)));
+    }
+
+    /// A give, a tip or a kiss while she waits is an attempt to mend, not an
+    /// answer: the ask stays pending and the action is answered by its own
+    /// rules. The next ordinary message is the answer.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_action_turn_leaves_the_ask_pending(pool: PgPool) {
+        use eros_engine_core::types::UserAction;
+
+        let s = scene(&pool).await;
+        let (state, mock) = turn_env(&pool).await;
+        let sent = recent(30);
+        let choice = s.pending_at(sent - Duration::hours(2)).await;
+
+        s.stream_turn(&state, sent, Some(UserAction::Kiss)).await;
+        s.stream_turn(
+            &state,
+            sent + Duration::minutes(1),
+            Some(UserAction::Tip { amount_usd: 1.0 }),
+        )
+        .await;
+        assert_eq!(s.status_of(choice).await, ("pending".into(), None));
+        assert!(s.instance_events().await.is_empty(), "no falling-out");
+        assert!(
+            request_to(&mock, "deepseek/x")
+                .await
+                .iter()
+                .all(|r| !r.contains(FELL_OUT_LABEL)),
+            "and her replies know of none"
+        );
+
+        let word = sent + Duration::minutes(2);
+        s.stream_turn(&state, word, None).await;
+        assert_eq!(s.status_of(choice).await, ("ignored".into(), Some(word)));
+        assert_eq!(s.instance_events().await.len(), 1);
+    }
+
+    /// A choice that lapsed (24 hours past its ask, the instant itself
+    /// included) converts nothing: it stays `pending`, there is no falling-out
+    /// and the turn goes on as any other. One microsecond earlier it was
+    /// still waiting.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_expired_ask_converts_nothing(pool: PgPool) {
+        let (state, mock) = turn_env(&pool).await;
+        let micro = Duration::microseconds(1);
+        let asked = recent(60 * 24 + 30);
+        let expiry = asked + Duration::hours(24);
+
+        for (sent, converts) in [
+            (expiry + micro, false),
+            (expiry, false),
+            (expiry - micro, true),
+        ] {
+            let s = scene(&pool).await;
+            let choice = s.pending_at(asked).await;
+            s.stream_turn(&state, sent, None).await;
+            let (status, resolved) = s.status_of(choice).await;
+            if converts {
+                assert_eq!((status.as_str(), resolved), ("ignored", Some(sent)));
+                assert_eq!(s.instance_events().await.len(), 1);
+            } else {
+                assert_eq!((status.as_str(), resolved), ("pending", None), "at {sent}");
+                assert!(s.instance_events().await.is_empty(), "at {sent}");
+            }
+        }
+        // The lapsed turns were answered all the same, with nothing said of it.
+        let replies = request_to(&mock, "deepseek/x").await;
+        assert_eq!(replies.len(), 3);
+        assert_eq!(
+            replies
+                .iter()
+                .filter(|r| r.contains(FELL_OUT_LABEL))
+                .count(),
+            1,
+            "only the turn that converted hears of the falling-out"
+        );
+    }
+
+    /// A message sent before her ask landed cannot be the answer to it: the
+    /// ask can be written while the user's next message is already in flight.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_message_sent_before_the_ask_does_not_answer_it(pool: PgPool) {
+        let s = scene(&pool).await;
+        let (state, _mock) = turn_env(&pool).await;
+        let asked = recent(20);
+        let choice = s.pending_at(asked).await;
+
+        s.stream_turn(&state, asked - Duration::seconds(1), None)
+            .await;
+        assert_eq!(s.status_of(choice).await, ("pending".into(), None));
+        assert!(s.instance_events().await.is_empty());
+
+        s.stream_turn(&state, asked + Duration::seconds(1), None)
+            .await;
+        assert_eq!(s.status_of(choice).await.0, "ignored");
+    }
+
+    /// The falling-out displaces the incident she was in: it ends where the
+    /// falling-out starts, so the one-incident invariant holds. A background
+    /// (a trip) keeps running underneath, and the turn hears of both.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_running_incident_is_capped_by_the_conversion(pool: PgPool) {
+        let s = scene(&pool).await;
+        let (state, mock) = turn_env(&pool).await;
+        let sent = recent(10);
+        s.pending_at(sent - Duration::hours(2)).await;
+        // She was reading, and she is on a business trip.
+        s.seed_running(
+            "reading",
+            "r",
+            sent - Duration::minutes(20),
+            sent + Duration::minutes(100),
+        )
+        .await;
+        s.seed_running(
+            "business_trip",
+            "t",
+            sent - Duration::hours(5),
+            sent + Duration::hours(10),
+        )
+        .await;
+
+        s.stream_turn(&state, sent, None).await;
+
+        let events = s.instance_events().await;
+        let by_kind = |k: &str| events.iter().find(|e| e.0 == k).unwrap().clone();
+        assert_eq!(events.len(), 3, "{events:?}");
+        assert_eq!(
+            by_kind("reading").4,
+            sent,
+            "the incident ends at the message"
+        );
+        assert_eq!(
+            by_kind("business_trip").4,
+            sent + Duration::hours(10),
+            "a background is not displaced"
+        );
+        assert_eq!(
+            (by_kind("fell_out").3, by_kind("fell_out").4),
+            (sent, sent + Duration::hours(1))
+        );
+
+        let judge = request_to(&mock, "pde/judge").await;
+        assert!(judge[0].contains(FELL_OUT_LABEL), "{}", judge[0]);
+        assert!(judge[0].contains("出差"), "{}", judge[0]);
+        assert!(
+            !judge[0].contains("看书"),
+            "she is no longer reading: {}",
+            judge[0]
+        );
     }
 }

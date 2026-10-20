@@ -19,6 +19,7 @@ use eros_engine_core::scope::MemoryScope;
 use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::ChatRepo;
 use eros_engine_store::events::EventRepo;
+use eros_engine_store::life_choices::LifeChoiceRepo;
 
 use crate::auth::middleware::AuthUser;
 use crate::error::{AppError, StreamPreError};
@@ -415,8 +416,10 @@ async fn respond(
 /// Ask for something to happen in the persona's day.
 ///
 /// The engine draws one kind of event, or none (a short or mid-length
-/// incident is under way, or every allowed kind is cooling down). During a
-/// background event (a trip or a body state) only incidents are drawn. The
+/// incident is under way, every allowed kind is cooling down, or she has asked
+/// the user for space and waits for the answer, in any session of the persona,
+/// until it is answered or lapses). During a background event (a trip or a
+/// body state) only incidents are drawn. The
 /// persona then tells the user in one proactive message, persisted like any
 /// reply and returned with the event. The offline kinds (`away_from_phone`,
 /// `busy`, `in_battle`, `asleep`, `bros_gathering`, `sis_gathering`, and
@@ -509,6 +512,15 @@ pub(crate) async fn draw_event_at(
     let traits = crate::prompt::persona_traits(&persona);
     if event_repo.by_key(session_id, &key).await?.is_some() {
         return respond(state, session_id, &key, &traits).await;
+    }
+    // She has asked for space and waits for an answer: the ask is the
+    // foreground drama, and it keeps an offline stretch from starting
+    // mid-question (spec 2026-10-19 §3.1). Any session of the instance.
+    let waiting = LifeChoiceRepo { pool: &state.pool }
+        .pending_for_instance(instance_id, now)
+        .await?;
+    if waiting {
+        return Ok(DrawEventResponse::none());
     }
 
     let needs = if state.model_config.pde_enabled() {
@@ -1792,5 +1804,133 @@ mod tests {
                 "close={close}"
             );
         }
+    }
+
+    /// She has asked for space and waits for an answer: the ask is the
+    /// foreground drama, so nothing is drawn for the instance, from any of
+    /// its sessions, until it is answered or lapses.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn no_draw_while_a_choice_is_pending(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (instance_id, session_id) = setup(&pool, user_id).await;
+        let sibling = seed_session(&pool, user_id, instance_id).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "刚被老板叫去加班，晚点聊").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let choice: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.life_choices (session_id, kind, tier_gap, asked_at) \
+             VALUES ($1, 'ask_for_space', 3, now() - interval '1 hour') RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let temp_work = |key: &str| req(key, Some(vec![EventKindDto::TempWork]));
+
+        // Pending: the asking session and its sibling both draw nothing, and
+        // nothing is generated or written.
+        for session in [session_id, sibling] {
+            let out = draw_event_at(
+                &state,
+                session,
+                user_id,
+                temp_work("k1"),
+                Utc::now(),
+                rolls(0.5),
+            )
+            .await
+            .unwrap();
+            assert!(out.event.is_none() && out.message.is_none());
+            assert_eq!(
+                serde_json::to_value(&out).unwrap(),
+                json!({"event": null, "message": null})
+            );
+        }
+        assert!(calls(&mock).await.is_empty(), "no generation");
+        assert_eq!(event_count(&pool, session_id).await, 0);
+        assert_eq!(event_count(&pool, sibling).await, 0);
+        assert_eq!(event_rows(&pool, session_id).await, 0);
+
+        // Another persona's choice has no say over this one.
+        let (_, elsewhere) = setup(&pool, user_id).await;
+        assert!(draw_event_at(
+            &state,
+            elsewhere,
+            user_id,
+            temp_work("k1"),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap()
+        .event
+        .is_some());
+
+        // Lapsed (still `pending` in the table): the draw works again.
+        sqlx::query(
+            "UPDATE engine.life_choices SET asked_at = asked_at - interval '24 hours' \
+              WHERE id = $1",
+        )
+        .bind(choice)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let drawn = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            temp_work("k2"),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(drawn.event.map(|e| e.kind), Some(EventKindDto::TempWork));
+        assert!(drawn.message.is_some());
+    }
+
+    /// A key that already drew its event returns it even when a choice is
+    /// pending: the replay reads, it draws nothing.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_replayed_key_still_returns_its_event_while_a_choice_is_pending(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "刚被老板叫去加班，晚点聊").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let first = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            req("k1", Some(vec![EventKindDto::TempWork])),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.life_choices (session_id, kind, tier_gap, asked_at) \
+             VALUES ($1, 'ask_for_space', 3, now() - interval '1 minute')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let again = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            req("k1", None),
+            Utc::now(),
+            rolls(0.9),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            again.message.map(|m| m.message_id),
+            first.message.map(|m| m.message_id)
+        );
+        assert!(again.event.is_some());
+        assert_eq!(calls(&mock).await.len(), 1, "no second generation");
     }
 }
