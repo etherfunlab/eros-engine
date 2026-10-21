@@ -364,12 +364,22 @@ pub(crate) async fn greet(
             &offline_kinds(&traits),
         )
         .await?;
+    // A separation this session agreed to is marked at its return whether or
+    // not the user wrote during it; it speaks for its event in place of the
+    // standard entry.
+    let separation = repo
+        .unreturned_separation(g.session_id, g.instance_id, g.now.now)
+        .await?;
     let scare = repo
         .unresolved_scare(g.session_id, g.instance_id, g.now.now)
         .await?;
     let event_lines = crate::prompt::EventLines {
         under_way: crate::prompt::events_reply_text(&current),
-        just_now: crate::prompt::just_now_text(offline.as_ref(), scare.as_ref()),
+        just_now: crate::prompt::just_now_text(
+            offline.as_ref(),
+            separation.as_ref(),
+            scare.as_ref(),
+        ),
     };
     let (mut chat_req, injected_tags) = build_reply_request(
         state,

@@ -371,6 +371,66 @@ impl EventRepo<'_> {
         Ok(row.and_then(record))
     }
 
+    /// The separation this session agreed to (spec 2026-10-19-life-events-
+    /// shopping-gatherings-and-ask-for-space-design.md §3.5, "The return is
+    /// acknowledged either way"): the newest `taking_space` row an accepted
+    /// choice of this session points at (`life_choices.event_id`) that ended
+    /// by `at`, while the session holds no assistant row with text written
+    /// after it ended. The flag says whether a user row ghosted inside it
+    /// exists: `true` when they wrote into the silence, `false` when they
+    /// honoured it. The standard rule of [`Self::unexplained_offline`] needs
+    /// that row; this one does not, so the return is marked either way.
+    pub async fn unreturned_separation(
+        &self,
+        session_id: Uuid,
+        instance_id: Uuid,
+        at: DateTime<Utc>,
+    ) -> Result<Option<(EventRecord, bool)>, sqlx::Error> {
+        type Row = (
+            Uuid,
+            String,
+            Option<Uuid>,
+            DateTime<Utc>,
+            DateTime<Utc>,
+            Option<Uuid>,
+            bool,
+        );
+        let row: Option<Row> = sqlx::query_as(
+            "WITH sep AS ( \
+                 SELECT e.id, e.kind, e.session_id, e.started_at, e.ends_at, e.message_id \
+                   FROM engine.life_choices c \
+                   JOIN engine.persona_events e ON e.id = c.event_id \
+                  WHERE c.session_id = $1 AND c.status = 'accepted' \
+                    AND e.instance_id = $2 AND e.kind = $4 \
+                    AND e.ends_at <= $3 AND e.started_at > $3 - make_interval(hours => $5) \
+                  ORDER BY e.started_at DESC, e.id DESC \
+                  LIMIT 1 \
+             ) \
+             SELECT sep.id, sep.kind, sep.session_id, sep.started_at, sep.ends_at, \
+                    sep.message_id, \
+                    EXISTS (SELECT 1 FROM engine.chat_messages m \
+                             WHERE m.session_id = $1 AND m.role = 'user' AND m.ghost_decision \
+                               AND m.sent_at >= sep.started_at AND m.sent_at < sep.ends_at) \
+               FROM sep \
+              WHERE NOT EXISTS (SELECT 1 FROM engine.chat_messages m \
+                                 WHERE m.session_id = $1 AND m.role = 'assistant' \
+                                   AND m.content <> '' \
+                                   AND m.sent_at > sep.ends_at AND m.sent_at <= $3)",
+        )
+        .bind(session_id)
+        .bind(instance_id)
+        .bind(at)
+        .bind(EventKind::TakingSpace.as_str())
+        .bind(lookback_hours())
+        .fetch_optional(self.pool)
+        .await?;
+        Ok(row.and_then(
+            |(id, kind, session_id, started_at, ends_at, message_id, wrote)| {
+                record((id, kind, session_id, started_at, ends_at, message_id)).map(|e| (e, wrote))
+            },
+        ))
+    }
+
     /// The newest false alarm told in this session that ended by `at`, while
     /// the session holds no assistant row with text written after it ended
     /// (spec 2026-10-16-life-events-offline-and-scares-design.md §5.2).
@@ -1212,6 +1272,241 @@ mod tests {
                 .await
                 .unwrap(),
             None
+        );
+    }
+
+    /// An accepted choice of `session_id` whose separation is `event_id`.
+    async fn accepted_choice(pool: &PgPool, session_id: Uuid, event_id: Uuid) {
+        choice_with(pool, session_id, event_id, "accepted").await;
+    }
+
+    async fn choice_with(pool: &PgPool, session_id: Uuid, event_id: Uuid, status: &str) {
+        sqlx::query(
+            "INSERT INTO engine.life_choices \
+               (session_id, kind, status, tier_gap, asked_at, resolved_at, event_id) \
+             VALUES ($1, 'ask_for_space', $3, 3, '2026-10-01T09:00:00Z', \
+                     '2026-10-01T09:00:00Z', $2)",
+        )
+        .bind(session_id)
+        .bind(event_id)
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// A separation of the persona written in `session_id` between `from` and `to`.
+    async fn separation(
+        repo: &EventRepo<'_>,
+        instance: Uuid,
+        session_id: Uuid,
+        key: &str,
+        from: &str,
+        to: &str,
+    ) -> EventRecord {
+        repo.insert_preempting(&ev(instance, session_id, key, TakingSpace, from, to))
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn unreturned_separation_stands_from_its_end_until_the_first_reply_with_text(
+        pool: PgPool,
+    ) {
+        let (_, i, s) = instance_and_session(&pool).await;
+        let repo = EventRepo { pool: &pool };
+        let space = separation(
+            &repo,
+            i,
+            s,
+            "space",
+            "2026-10-01T10:00:00Z",
+            "2026-10-01T16:00:00Z",
+        )
+        .await;
+        accepted_choice(&pool, s, space.id).await;
+        let read = |at: &str| {
+            let repo = EventRepo { pool: &pool };
+            let at = t(at);
+            async move { repo.unreturned_separation(s, i, at).await.unwrap() }
+        };
+
+        // Under way: nothing to mark yet.
+        assert_eq!(read("2026-10-01T15:59:59.999999Z").await, None);
+        // Back, and nobody wrote: still the one to mark.
+        assert_eq!(
+            read("2026-10-01T16:00:00Z").await,
+            Some((space.clone(), false))
+        );
+        // A reply inside the window, one exactly at its end, and one with no
+        // text (an image alone) do not mark it.
+        row(&pool, s, "assistant", "2026-10-01T12:00:00Z", false).await;
+        row(&pool, s, "assistant", "2026-10-01T16:00:00Z", false).await;
+        row_with(&pool, s, "assistant", "", "2026-10-01T16:30:00Z", false).await;
+        assert_eq!(
+            read("2026-10-01T17:00:00Z").await,
+            Some((space.clone(), false))
+        );
+        // The first reply with text after it ended closes it, from its moment on.
+        row(&pool, s, "assistant", "2026-10-01T18:00:00Z", false).await;
+        assert_eq!(
+            read("2026-10-01T17:59:59.999999Z").await,
+            Some((space.clone(), false))
+        );
+        assert_eq!(read("2026-10-01T18:00:00Z").await, None);
+        assert_eq!(read("2026-10-02T09:00:00Z").await, None);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn unreturned_separation_flags_only_a_ghosted_row_inside_the_window(pool: PgPool) {
+        let (owner, i, s) = instance_and_session(&pool).await;
+        let sibling = another_session(&pool, owner, i).await;
+        let repo = EventRepo { pool: &pool };
+        let space = separation(
+            &repo,
+            i,
+            s,
+            "space",
+            "2026-10-01T10:00:00Z",
+            "2026-10-01T16:00:00Z",
+        )
+        .await;
+        accepted_choice(&pool, s, space.id).await;
+        let at = t("2026-10-01T17:00:00Z");
+        let flag = || async {
+            repo.unreturned_separation(s, i, at)
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+        };
+
+        // A message that was answered, one before it began, one at its end,
+        // one after it, and another session's ghosted row: none is the user
+        // writing into the silence.
+        row(&pool, s, "user", "2026-10-01T11:00:00Z", false).await;
+        row(&pool, s, "user", "2026-10-01T09:59:59.999999Z", true).await;
+        row(&pool, s, "user", "2026-10-01T16:00:00Z", true).await;
+        row(&pool, s, "user", "2026-10-01T16:30:00Z", true).await;
+        row(&pool, sibling, "user", "2026-10-01T11:00:00Z", true).await;
+        assert!(!flag().await);
+        // A ghosted row in the window is.
+        row(&pool, s, "user", "2026-10-01T10:00:00Z", true).await;
+        assert!(flag().await);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn unreturned_separation_is_reached_only_through_this_sessions_accepted_choice(
+        pool: PgPool,
+    ) {
+        let (owner, i, s) = instance_and_session(&pool).await;
+        let sibling = another_session(&pool, owner, i).await;
+        let repo = EventRepo { pool: &pool };
+        let at = t("2026-10-01T17:00:00Z");
+        let space = separation(
+            &repo,
+            i,
+            s,
+            "space",
+            "2026-10-01T10:00:00Z",
+            "2026-10-01T16:00:00Z",
+        )
+        .await;
+        // The separation is the instance's, but only the choice's session
+        // owes the return.
+        accepted_choice(&pool, s, space.id).await;
+        assert!(repo
+            .unreturned_separation(s, i, at)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            repo.unreturned_separation(sibling, i, at).await.unwrap(),
+            None
+        );
+
+        // A separation no choice points at, and one a choice that did not
+        // end in an accept points at, are not reached.
+        let (owner, i, s) = instance_and_session(&pool).await;
+        let repo = EventRepo { pool: &pool };
+        let loose = separation(
+            &repo,
+            i,
+            s,
+            "loose",
+            "2026-10-01T10:00:00Z",
+            "2026-10-01T16:00:00Z",
+        )
+        .await;
+        assert_eq!(repo.unreturned_separation(s, i, at).await.unwrap(), None);
+        choice_with(&pool, s, loose.id, "declined").await;
+        assert_eq!(repo.unreturned_separation(s, i, at).await.unwrap(), None);
+
+        // Only a separation: another kind a choice points at is not one.
+        let s2 = another_session(&pool, owner, i).await;
+        let away = repo
+            .insert(
+                &ev(
+                    i,
+                    s2,
+                    "away",
+                    AwayFromPhone,
+                    "2026-10-01T16:30:00Z",
+                    "2026-10-01T16:45:00Z",
+                ),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .event;
+        accepted_choice(&pool, s2, away.id).await;
+        assert_eq!(repo.unreturned_separation(s2, i, at).await.unwrap(), None);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn unreturned_separation_reads_the_newest_inside_the_lookback(pool: PgPool) {
+        let (_, i, s) = instance_and_session(&pool).await;
+        let repo = EventRepo { pool: &pool };
+        let older = separation(
+            &repo,
+            i,
+            s,
+            "older",
+            "2026-10-01T10:00:00Z",
+            "2026-10-01T16:00:00Z",
+        )
+        .await;
+        accepted_choice(&pool, s, older.id).await;
+        // 90 days of lookback, counted from the start.
+        assert_eq!(
+            repo.unreturned_separation(s, i, t("2026-12-30T09:59:59Z"))
+                .await
+                .unwrap(),
+            Some((older.clone(), false))
+        );
+        assert_eq!(
+            repo.unreturned_separation(s, i, t("2026-12-30T10:00:00Z"))
+                .await
+                .unwrap(),
+            None
+        );
+
+        let newer = separation(
+            &repo,
+            i,
+            s,
+            "newer",
+            "2026-10-05T10:00:00Z",
+            "2026-10-05T16:00:00Z",
+        )
+        .await;
+        accepted_choice(&pool, s, newer.id).await;
+        assert_eq!(
+            repo.unreturned_separation(s, i, t("2026-10-06T00:00:00Z"))
+                .await
+                .unwrap(),
+            Some((newer, false))
         );
     }
 

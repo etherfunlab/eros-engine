@@ -1243,6 +1243,76 @@ mod tests {
         assert_eq!(proactive_rows(&pool, session_id).await, 0);
     }
 
+    /// The user honoured a separation agreed in this session: the opener is
+    /// the persona message that marks the return, and once it has landed
+    /// nothing more is said of it.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_opener_after_a_separation_marks_the_return_once(pool: PgPool) {
+        use eros_engine_core::events::EventKind;
+        let user_id = Uuid::new_v4();
+        let now = Utc::now();
+        let session_id =
+            session_with_history(&pool, user_id, now - chrono::Duration::days(2)).await;
+        seed_event(
+            &pool,
+            session_id,
+            EventKind::TakingSpace,
+            now - chrono::Duration::hours(7),
+            now - chrono::Duration::hours(1),
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO engine.life_choices \
+               (session_id, kind, status, tier_gap, asked_at, resolved_at, event_id) \
+             SELECT $1, 'ask_for_space', 'accepted', 3, $2, $2, id \
+               FROM engine.persona_events WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .bind(now - chrono::Duration::hours(7))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "好久不见").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        open_at(
+            &state,
+            session_id,
+            user_id,
+            opener(OpenOccasion::JustOpened, "visit-1"),
+            now,
+        )
+        .await
+        .unwrap()
+        .greeting
+        .expect("an opener");
+        let calls = companion_calls(&mock).await;
+        assert!(
+            calls[0]
+                .to_string()
+                .contains("- 刚才：你们之前说好分开一阵，现在时间到了，你们重新开始联系"),
+            "{}",
+            calls[0]
+        );
+        // The opener is the first message with text since it ended.
+        open_at(
+            &state,
+            session_id,
+            user_id,
+            opener(OpenOccasion::JustOpened, "visit-2"),
+            now + chrono::Duration::minutes(1),
+        )
+        .await
+        .unwrap();
+        let calls = companion_calls(&mock).await;
+        assert_eq!(calls.len(), 2);
+        assert!(
+            !calls[1].to_string().contains("说好分开一阵"),
+            "{}",
+            calls[1]
+        );
+    }
+
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn the_opener_after_an_away_stretch_explains_it(pool: PgPool) {
         use eros_engine_core::events::EventKind;
