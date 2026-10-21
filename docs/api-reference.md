@@ -1152,7 +1152,8 @@ The persona's lingering state from accepted gives, her needs and the events unde
 Answer her ask for space. When chemistry runs two tiers past bond and her
 patience stays low for three judged turns, the persona asks the user for a
 break in a proactive message (`metadata.proactive = "life_choice"`) and the
-session carries a pending choice for 24 hours. The user answers here, answers
+session carries a pending choice for 24 hours; she has one such ask pending at
+a time across all her sessions with the user. The user answers here, answers
 in words, or says nothing. How and when she asks, and what each path costs, is
 in [life-events-needs.md](life-events-needs.md#the-ask-for-space-choice).
 
@@ -1160,8 +1161,9 @@ A client learns of the choice from the `life_choice` field of
 [`GET /bff/v1/comp/affinity/{session_id}/event`](#get-bffv1compaffinitysession_idevent),
 which carries the choice's `id` and the answers it accepts. The ask lands
 seconds after the turn that triggered it, so the delta that turn releases
-usually misses it: **re-fetch the delta when you read a proactive message with
-`metadata.proactive = "life_choice"`**. A client that never adapts loses
+usually misses it: **re-fetch the delta when a history row carries
+`occasion: "life_choice"`** (both history routes expose the row's
+`metadata.proactive` as `occasion`). A client that never adapts loses
 nothing. It shows the ask as an ordinary message, the user replies in words,
 and that is the ignore path (below).
 
@@ -1213,7 +1215,8 @@ If the user does not call this route, two other things resolve the choice:
   one-hour `fell_out` incident starts at that message, so the very turn that
   ignored her is answered with the falling-out in her context. No tier changes.
   Only a message sent after her ask converts it. An action turn does not
-  resolve it, and neither does `/open` or a reaction.
+  resolve it, and neither does `/open` or a reaction. During a separation a
+  message only ghosts and never converts a pending ask.
 - **Lapse.** 24 hours after her ask the choice reads as expired everywhere:
   `life_choice` is no longer attached, this route answers `409`, a later
   message converts nothing, and it costs nothing.
@@ -1313,6 +1316,8 @@ with, plus `response` (`"accept"` | `"refuse"`) once the turn took effect.
 `reaction` (assistant rows only, omitted otherwise) is `{emoji, reacted_at}`.
 
 `speaker_session_id` (assistant rows of a group session only, omitted otherwise) is the member session that spoke the line; resolve a departed speaker's name through session, then instance.
+
+`occasion` (assistant rows the persona wrote on her own only, omitted otherwise) says why she spoke: the row's `metadata.proactive`, one of `birthday`, `holiday`, `first_meet`, `returning`, `just_opened`, `event` or `life_choice`. A client adapted to the [life choice](#post-v2compsessionsession_idlife-choiceschoice_id) re-fetches the affinity delta when it reads `life_choice`.
 
 `user_message_id` names the `role='user'` row whose turn produced this row. It
 is present on assistant rows and on `system_error` notices, and omitted on the
@@ -2156,7 +2161,7 @@ echoes the quote a `user` row was sent with (see the stream route's
 session; omitted on ordinary turns and on turns whose anchor failed to resolve,
 so a cold mount can re-render the quote without keeping local state.
 `action` (user rows only, omitted otherwise) is the action the row was sent
-with, plus `response` (`"accept"` | `"refuse"`) once the turn took effect. `reaction` (assistant rows only, omitted otherwise) is `{emoji, reacted_at}`. Same auth, ownership check, and
+with, plus `response` (`"accept"` | `"refuse"`) once the turn took effect. `reaction` (assistant rows only, omitted otherwise) is `{emoji, reacted_at}`. `occasion` (assistant rows the persona wrote on her own only, omitted otherwise) is the canonical route's field of the same name, `life_choice` included; the start bundle carries it too. Same auth, ownership check, and
 `limit ∈ [1, 50]` clamp as the canonical history route. **Intentional
 divergence:** the default `limit` is 50 (the canonical route defaults to 20),
 because the BFF exists for a cold mount that wants a full backscroll in one
@@ -2284,8 +2289,8 @@ from the absolute route below on any other device.
   [life-choice route](#post-v2compsessionsession_idlife-choiceschoice_id)
   takes; `message_id` is the chat message that asked it (absent once that row
   is gone). The ask lands seconds after the turn that triggered it, so re-fetch
-  the delta when you read a proactive message with
-  `metadata.proactive = "life_choice"`. A client that ignores the field
+  the delta when a history row carries `occasion: "life_choice"`. A client
+  that ignores the field
   degrades to the ignore path described there.
 
 ### `GET /bff/v1/comp/affinity/{session_id}`

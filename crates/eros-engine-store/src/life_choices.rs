@@ -215,15 +215,26 @@ impl LifeChoiceRepo<'_> {
         .await
     }
 
-    /// When the session was last asked, answered or not.
-    pub async fn latest_asked_at(
+    /// Where the session's next streak of judged turns starts: the latest of
+    /// its newest choice's `asked_at`, its `resolved_at` and, for an accepted
+    /// one, the end of the separation it wrote (`persona_events.ends_at`,
+    /// through `event_id`). Turns up to that instant belong to the episode,
+    /// not to the streak. `None` when the session was never asked; a choice
+    /// whose separation row is gone anchors at its answer.
+    pub async fn streak_anchor(
         &self,
         session_id: Uuid,
     ) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
-        sqlx::query_scalar("SELECT max(asked_at) FROM engine.life_choices WHERE session_id = $1")
-            .bind(session_id)
-            .fetch_one(self.pool)
-            .await
+        sqlx::query_scalar(
+            "SELECT GREATEST(c.asked_at, c.resolved_at, e.ends_at) \
+               FROM engine.life_choices c \
+               LEFT JOIN engine.persona_events e ON e.id = c.event_id \
+              WHERE c.session_id = $1 \
+              ORDER BY c.asked_at DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_optional(self.pool)
+        .await
     }
 
     /// Whether `now` falls in the slowdown window of the session's newest
@@ -516,11 +527,6 @@ mod tests {
                 .unwrap(),
             None
         );
-        // The latest ask is the one just made, answered or not.
-        assert_eq!(
-            repo.latest_asked_at(session).await.unwrap(),
-            Some(choice.asked_at)
-        );
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -557,13 +563,12 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn set_event_records_the_separation_and_latest_asked_at_reads_the_newest(pool: PgPool) {
+    async fn set_event_records_the_separation_the_choice_wrote(pool: PgPool) {
         use crate::events::{EventRepo, NewEvent};
         use eros_engine_core::events::EventKind;
 
         let (_, instance, session) = instance_and_session(&pool).await;
         let repo = LifeChoiceRepo { pool: &pool };
-        assert_eq!(repo.latest_asked_at(session).await.unwrap(), None);
         let choice = repo
             .insert_ask(session, 3, &ask_message("想先分开"))
             .await
@@ -589,10 +594,6 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(event_id, Some(event.id));
-        assert_eq!(
-            repo.latest_asked_at(session).await.unwrap(),
-            Some(choice.asked_at)
-        );
 
         // Deleting the event or the message keeps the choice: the thread outlives both.
         sqlx::query("DELETE FROM engine.persona_events WHERE id = $1")
@@ -612,6 +613,88 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!((message_id, event_id), (None, None));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn streak_anchor_is_the_latest_of_the_ask_its_answer_and_the_separation_end(
+        pool: PgPool,
+    ) {
+        use crate::events::{EventRepo, NewEvent};
+        use eros_engine_core::events::EventKind;
+
+        let (owner, instance, session) = instance_and_session(&pool).await;
+        let sibling = ChatRepo { pool: &pool }
+            .create_session(owner, instance)
+            .await
+            .unwrap()
+            .id;
+        let repo = LifeChoiceRepo { pool: &pool };
+        assert_eq!(
+            repo.streak_anchor(session).await.unwrap(),
+            None,
+            "never asked"
+        );
+
+        // Asked and waiting: the ask itself.
+        let choice = repo
+            .insert_ask(session, 3, &ask_message("想先分开"))
+            .await
+            .unwrap()
+            .expect("written");
+        assert_eq!(
+            repo.streak_anchor(session).await.unwrap(),
+            Some(choice.asked_at)
+        );
+
+        // Answered: the answer, not the ask.
+        let answered_at = choice.asked_at + Duration::hours(1);
+        repo.resolve(choice.id, "accepted", answered_at)
+            .await
+            .unwrap()
+            .expect("resolved");
+        assert_eq!(
+            repo.streak_anchor(session).await.unwrap(),
+            Some(answered_at)
+        );
+
+        // Accepted with a separation: where the separation ends.
+        let ends_at = answered_at + Duration::hours(18);
+        let event = EventRepo { pool: &pool }
+            .insert_preempting(&NewEvent {
+                instance_id: instance,
+                session_id: session,
+                event_key: "taking_space",
+                kind: EventKind::TakingSpace,
+                started_at: answered_at,
+                ends_at,
+            })
+            .await
+            .unwrap();
+        repo.set_event(choice.id, event.id).await.unwrap();
+        assert_eq!(repo.streak_anchor(session).await.unwrap(), Some(ends_at));
+
+        // The separation row gone: back to the answer.
+        sqlx::query("DELETE FROM engine.persona_events WHERE id = $1")
+            .bind(event.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.streak_anchor(session).await.unwrap(),
+            Some(answered_at)
+        );
+
+        // The newest choice speaks, and a sibling session's episode has no say.
+        let later = repo
+            .insert_ask(session, 2, &ask_message("又来了"))
+            .await
+            .unwrap()
+            .expect("written");
+        assert_eq!(
+            repo.streak_anchor(session).await.unwrap(),
+            Some(later.asked_at)
+        );
+        assert_eq!(repo.streak_anchor(sibling).await.unwrap(), None);
     }
 
     #[sqlx::test(migrations = "./migrations")]

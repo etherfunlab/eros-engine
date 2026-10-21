@@ -186,6 +186,10 @@ pub struct ChatMessageSlim {
     /// above: the caller parses it and drops what does not parse.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<serde_json::Value>,
+    /// The row's `metadata.proactive` — why the persona spoke on her own — as
+    /// stored; the caller maps the name it knows and drops the rest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proactive: Option<String>,
     /// The `role='user'` row that drove the turn this row belongs to. Set on
     /// assistant rows, and on the `system_error` notices the queue worker and
     /// the stale-claim reaper write (#295) — those are written after the client
@@ -210,6 +214,7 @@ const SLIM_COLUMNS: &str = "id, role, content, sent_at, client_msg_id, \
      (metadata->'image' IS NOT NULL) AS image, \
      metadata->>'reply_to_message_id' AS reply_to_message_id, \
      metadata->'action' AS action, \
+     metadata->>'proactive' AS proactive, \
      user_message_id, speaker_session_id";
 
 /// An assistant row's reaction as the next reply turn renders it (spec
@@ -5919,6 +5924,31 @@ mod tests {
             with,
             vec![serde_json::json!({"type": "hug", "response": "accept"})]
         );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn history_slim_projects_the_proactive_name(pool: PgPool) {
+        let s = throwaway_session(&pool).await;
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata) VALUES \
+             ($1, 'assistant', 'ask', '{\"proactive\":\"life_choice\"}'::jsonb), \
+             ($1, 'assistant', 'plain', NULL)",
+        )
+        .bind(s.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let rows = ChatRepo { pool: &pool }
+            .history_slim(s.id, 10, 0)
+            .await
+            .unwrap();
+        // One statement wrote both rows, so their order is the ids' tie-break.
+        let mut named: Vec<_> = rows
+            .iter()
+            .map(|r| (r.content.as_str(), r.proactive.as_deref()))
+            .collect();
+        named.sort();
+        assert_eq!(named, vec![("ask", Some("life_choice")), ("plain", None)]);
     }
 
     async fn insert_row(

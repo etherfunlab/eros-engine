@@ -531,9 +531,12 @@ engine 在每一轮 affinity 评估已经落库的 1:1 文字回合结束时检�
 - **差距。** chemistry 的档位减去 bond 的档位至少为 2，按两条五档的阶梯算。有符号：只有 chemistry 高于 bond 才算。
 - **耐心。** 推算出的 `patience` 在这一轮和之前两个被判官评过的回合都低于 0.5。评估被跳过或失败的回合既不计数也不打断。
   各轮的值读自该 session 的好感度回合事件（`state_after.patience`），不另存；0.5 是 engine 自己的规则阈值，不是判官的档。
-- **新的连续。** 三个回合都在该 session 最新一次选择之后，不论那次有没有被回答。提出一次就用掉这段连续：
+- **新的连续。** 三个回合都在该 session 最新一段经过之后：她的请求、它的结算，以及它开启的分开
+  （取 `asked_at`、`resolved_at`，接受的选择再加上分开的 `ends_at`，三者最晚的那个）。她等待期间或分开期间发生的、
+  被判官评过的动作回合属于这段经过，不计数；转换了不理会的请求的那一轮，是新连续的第一轮。提出一次就用掉这段连续：
   下一次要三个新的被判官评过的回合。
-- **跑道清空。** 该 session 没有待回答的选择，角色也没有正在进行的分开（`taking_space`）。
+- **跑道清空。** 角色的所有 session 都没有待回答的选择，角色也没有正在进行的分开（`taking_space`）。
+  她只有一段人生，所以同一时间最多只有一个请求待回答。
 - **合适的 session。** 角色是 genome 角色的 1:1 文字 session。语音 session 不会触发、送达或结算选择，群聊根本不写好感度，
   BYOC session 从不触发，因为结算端点不服务 BYOC。
 
@@ -568,7 +571,10 @@ post-process 的最后，在好感度落库和 feeling 摘要之后，所以它�
 [`GET /bff/v1/comp/affinity/{session_id}/event`](api-reference.zh.md#get-bffv1compaffinitysession_idevent)。
 它的 `event` 对象多一个可选字段 `life_choice`（`id`、`kind`、`options`、`asked_at`、`expires_at`、`message_id`），
 在响应时按该 session 待回答、未过期的选择现场拼出，没有时不带。请求落在触发那一轮的事件落库之后几秒，所以这一轮自己放行的那次查询
-通常赶不上它：适配过的客户端读到 `metadata.proactive = 'life_choice'` 的主动消息时，应当重新拉一次 delta。
+通常赶不上它：适配过的客户端在历史里某一行带 `occasion: "life_choice"` 时，应当重新拉一次 delta。两个历史路由
+（[canonical](api-reference.zh.md#get-compchatsession_idhistorylimit20offset0) 与
+[BFF](api-reference.zh.md#get-bffv1compchatsession_idhistorylimit50offset0)）都把主动 assistant 行的 `metadata.proactive`
+作为可选的 `occasion` 给出，其他行省略。
 降档产生的好感度事件不会从这条路由返回，客户端不会遇到不认识的 `event_type`；新的状态在结算响应里带回，
 别的设备从绝对值路由读。
 
@@ -639,8 +645,8 @@ post-process 的最后，在好感度落库和 feeling 摘要之后，所以它�
 - 它进行期间不抽任何事件，并且启动共享的 12 小时离线冷却。
 - 它和每一行 `persona_events` 一样按实例算：她只有一段人生，说好分开，就是她的手机在哪里都放下了。
 
-ghosting 开关关闭时它不让任何轮次沉默，和任何离线时段一样；降档、放缓和归来那一行都不依赖这个开关。分开期间发来的消息和任何离线时段一样被 ghost，
-也不会再转换成什么，因为选择已经结算。分开进行期间，`正在经历` 和例外的动作轮次读到它的标签是说好暂时分开。
+ghosting 开关关闭时它不让任何轮次沉默，和任何离线时段一样；降档、放缓和归来那一行都不依赖这个开关。分开期间的消息一律只是 ghost，不会转化任何挂起的请求。
+分开进行期间，`正在经历` 和例外的动作轮次读到它的标签是说好暂时分开。
 
 ### 归来
 

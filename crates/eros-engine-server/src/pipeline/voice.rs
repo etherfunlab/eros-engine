@@ -1130,6 +1130,7 @@ mod tests {
             image: false,
             reply_to_message_id: None,
             action: None,
+            proactive: None,
             user_message_id: None,
             speaker_session_id: None,
             reaction: None,

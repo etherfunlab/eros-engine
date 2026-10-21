@@ -462,7 +462,8 @@ drains naturally. `NULL` reads as all-zero.
 Each delta turn appends one row to `engine.companion_affinity_events`:
 
 - `deltas` — raw scores: grade conversion plus rule nudges, pre-decay.
-  `warmth`/`patience` are always `0.0` here.
+  `warmth`/`patience` are always `0.0` here, except on a `life_choice` row,
+  whose `deltas` equal its `effective_deltas` ([above](#life-choice-drops-and-the-slowdown)).
 - `effective_deltas` — the applied change, `after − before`; for the base
   pair, the per-turn derivation delta.
 - `context` — `affinity_reason`, `eval_skip_reason`, the verbatim signed

@@ -917,14 +917,16 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 ### `POST /v2/comp/session/{session_id}/life-choices/{choice_id}`
 
 回答她提出的分开请求。chemistry 比 bond 高出两档、她的耐心连续三个被判官评过的回合都很低时，角色会用一条主动消息
-（`metadata.proactive = "life_choice"`）向用户提出想先分开一阵，这个 session 随之带着一次待回答的选择，有效期 24 小时。
+（`metadata.proactive = "life_choice"`）向用户提出想先分开一阵，这个 session 随之带着一次待回答的选择，有效期 24 小时；
+她在与该用户的所有 session 里同一时间最多只有一个这样的请求待回答。
 用户可以在这里回答、用文字回复，或者什么都不说。她怎么提出、什么时候提出、每条路各付什么代价，见
 [life-events-needs.zh.md](life-events-needs.zh.md#提出分开的选择)。
 
 客户端从
 [`GET /bff/v1/comp/affinity/{session_id}/event`](#get-bffv1compaffinitysession_idevent)
 的 `life_choice` 字段得知这次选择，字段里有选择的 `id` 和它接受的回答。请求落在触发它的那一轮之后几秒，所以那一轮放行的 delta
-通常赶不上它：**读到 `metadata.proactive = "life_choice"` 的主动消息时，应当重新拉一次 delta**。没有适配的客户端什么都不会损失：
+通常赶不上它：**历史里某一行带 `occasion: "life_choice"` 时，应当重新拉一次 delta**（两个历史路由都把这一行的
+`metadata.proactive` 作为 `occasion` 给出）。没有适配的客户端什么都不会损失：
 它把请求当成一条普通消息显示，用户用文字回复，走的就是下面的“不理会”那条路。
 
 ```json
@@ -964,7 +966,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 
 - **不理会。** 选择待回答期间到达的第一条普通用户文字消息（不带 `action` 的轮次）会转换它：状态变为 `ignored`，并从那条消息起开始一场一小时的
   `fell_out` 插曲，所以正是这一条不理会她的消息，回复时她的上下文里已经带着这场不愉快。不改任何档位。
-  只有在她提出之后发出的消息才会触发。动作轮次不会结算它，`/open` 和 reaction 也不会。
+  只有在她提出之后发出的消息才会触发。动作轮次不会结算它，`/open` 和 reaction 也不会。分开期间的消息一律只是 ghost，不会转化任何挂起的请求。
 - **过期。** 她提出 24 小时后，这次选择处处读作已过期：`life_choice` 不再附带，这个路由返回 `409`，之后的消息什么都不转换，也没有任何代价。
 
 结算和一条进来的消息按事务竞争；先写入的赢，输的一方得到这个路由的 `409`。
@@ -1041,6 +1043,8 @@ SSE 帧是整轮最后一帧且只走线上——在它发出前断线，光看 
 `reaction`（只出现在 assistant 行上）为 `{emoji, reacted_at}`。
 
 `speaker_session_id`（只出现在群 session 的 assistant 行上，其余省略）是说这句话的成员 session；已离群的发言者，其名字通过 session 再到 instance 解析。
+
+`occasion`（只出现在角色主动写下的 assistant 行上，其余省略）说明她为什么开口：这一行的 `metadata.proactive`，取值为 `birthday`、`holiday`、`first_meet`、`returning`、`just_opened`、`event` 或 `life_choice`。适配了[生活选择](#post-v2compsessionsession_idlife-choiceschoice_id)的客户端读到 `life_choice` 时，应当重新拉一次好感度 delta。
 
 `user_message_id` 指向产生这一行的那一轮的 `role='user'` 行。assistant 行和
 `system_error` 通知行上都有，user 行本身省略。通知行最要紧：队列 worker 和
@@ -1769,6 +1773,8 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
 所以同样带这个标记。
 `user_message_id` 指向产生这一行的那一轮的 `role='user'` 行 —— assistant 行和
 `system_error` 通知行上都有，user 行省略。`speaker_session_id` 标出群 session 里 assistant 行的发言者，其余行省略。
+`occasion`（只出现在角色主动写下的 assistant 行上，其余省略）与上面 canonical history 里的同名字段相同，包括 `life_choice`；
+`start` 打包的历史同样带它。
 `reply_to_message_id` 回显 `user` 行发送时带的引用（见 stream 路由的**可选：引用**
 一节）——它引用的那条消息的 id，一定在同一个 session 里；
 普通轮次、以及锚点没解析成功的轮次都省略该字段，这样冷启动不必自己存状态
@@ -1881,7 +1887,7 @@ time-decay），或最近一次事件早于 affinity migration `0014`。`event_t
 - `life_choice` —— 该 session 待回答的选择，在响应时现场拼出，只要有一次选择未被回答、也没过 24 小时，就附在 `event` 上；
   没有时不带。`options` 列出
   [生活选择路由](#post-v2compsessionsession_idlife-choiceschoice_id)接受的回答；`message_id` 是提出它的那条聊天消息
-  （那一行没了就不带）。请求落在触发它的那一轮之后几秒，所以读到 `metadata.proactive = "life_choice"` 的主动消息时，
+  （那一行没了就不带）。请求落在触发它的那一轮之后几秒，所以历史里某一行带 `occasion: "life_choice"` 时，
   应当重新拉一次 delta。忽略这个字段的客户端会降级成那里描述的“不理会”。
 
 ### `GET /bff/v1/comp/affinity/{session_id}`

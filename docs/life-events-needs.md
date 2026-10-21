@@ -663,10 +663,15 @@ committed, time-decayed state:
   before it. A turn whose evaluation was skipped or failed neither counts nor breaks the run.
   The values are read from the session's affinity turn events (`state_after.patience`), not
   stored anew; 0.5 is a rule threshold the engine owns, not a judge band.
-- **Fresh streak.** All three turns come after the session's newest choice, answered or not.
-  Asking consumes the streak: the next ask needs three fresh judged turns.
-- **Clear runway.** The session has no pending choice, and the persona has no separation
-  (`taking_space`) under way.
+- **Fresh streak.** All three turns come after the session's newest episode: her ask, its
+  resolution, and any separation it started (the latest of `asked_at`, `resolved_at` and, for an
+  accepted choice, the separation's `ends_at`). A judged action turn that fell while she waited
+  or during the separation belongs to the episode and counts for nothing; the turn that converts
+  an ignored ask is the first of the new streak. Asking consumes the streak: the next ask needs
+  three fresh judged turns.
+- **Clear runway.** No session of the persona has a pending choice, and the persona has no
+  separation (`taking_space`) under way. She has one life, so at most one ask is pending at a
+  time.
 - **The right session.** A 1:1 text session of a genome persona. A voice session never
   triggers, delivers or resolves a choice, and a group session writes no affinity at all. A BYOC
   session never triggers one, because the resolution endpoint refuses BYOC.
@@ -711,7 +716,10 @@ Its `event` object gains one optional field, `life_choice` (`id`, `kind`, `optio
 `asked_at`, `expires_at`, `message_id`), composed at serve time from the session's pending,
 unexpired choice and absent otherwise. The ask lands seconds after the triggering turn's event
 commits, so the fetch the turn itself releases usually misses it: an adapted client re-fetches
-the delta when it reads a proactive message with `metadata.proactive = 'life_choice'`. The
+the delta when a history row carries `occasion: "life_choice"`. Both history routes
+([canonical](api-reference.md#get-compchatsession_idhistorylimit20offset0) and
+[BFF](api-reference.md#get-bffv1compchatsession_idhistorylimit50offset0)) expose a proactive
+assistant row's `metadata.proactive` as an optional `occasion`, omitted on every other row. The
 tier-drop affinity event is not served on this route, so a client never meets an unknown
 `event_type`; the new state comes back in the resolution response, and any other device reads
 it from the absolute affinity route.
@@ -809,8 +817,8 @@ machinery](#offline-kinds) wholesale:
   means her phone is down everywhere.
 
 With the ghosting switch off it silences nothing, like any offline stretch; the drop, the
-slowdown and the return line do not depend on the switch. Messages sent during the separation
-ghost as in any offline stretch and convert nothing, because the choice is already resolved.
+slowdown and the return line do not depend on the switch. During a separation a message only
+ghosts and never converts any pending ask.
 While it lasts, `正在经历` and the exempt action turns read it as 说好暂时分开.
 
 ### The return

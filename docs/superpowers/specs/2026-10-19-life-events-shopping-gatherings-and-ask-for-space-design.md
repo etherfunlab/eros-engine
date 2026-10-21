@@ -136,12 +136,18 @@ all of these hold, read from the committed, time-decayed state:
   run. The per-turn values are read from the session's affinity turn
   events (`state_after.patience`), not stored anew. 0.5 is a rule
   threshold owned by the engine, not a judge band.
-- **Fresh streak:** all three turns postdate the session's newest
-  `life_choices` row. Firing a request consumes the streak; the next
-  request needs three fresh low-patience judged turns.
-- **Clear runway:** the session has no pending un-expired choice, and
-  the instance has no `taking_space` event under way. (An offline
-  stretch silences the judge anyway, so no trigger can fire inside one.)
+- **Fresh streak:** all three turns postdate the session's newest episode:
+  the request, its resolution, and any separation it started (the latest
+  of `asked_at`, `resolved_at` and, for an accepted choice, the separation's
+  `ends_at`). Firing a request consumes the streak; the next request needs
+  three fresh low-patience judged turns. A judged action turn that fell
+  while she waited, or during the separation, belongs to the episode and
+  counts for nothing; the turn that converts an ignored ask is the first
+  of the new streak.
+- **Clear runway:** no session of the instance has a pending un-expired
+  choice, and the instance has no `taking_space` event under way. (An
+  offline stretch silences the judge anyway, so no trigger can fire inside
+  one.) She has one life, so the instance holds at most one pending ask.
 - **Session:** a 1:1 text session of a genome instance. A BYOC session never
   triggers: the resolution endpoint refuses BYOC, so an ask there could never
   be answered.
@@ -212,8 +218,11 @@ attached to the latest event, because any later ordinary message would
 have resolved it). `null` / absent otherwise. The ask lands seconds after
 the triggering turn's event commits, so the fetch that the turn itself
 releases usually misses it; the adapted client's contract is to re-fetch
-the delta when it reads a proactive message with
-`metadata.proactive = 'life_choice'`. The tier-drop affinity event (§3.5)
+the delta when it reads a history row whose `occasion` is `life_choice`.
+Both history routes (`/comp/chat/{session_id}/history` and the BFF history
+and start routes) carry a proactive assistant row's `metadata.proactive`
+as an optional `occasion` (omitted on every other row, like `read_at`).
+The tier-drop affinity event (§3.5)
 is **not** served on this route — `latest_turn_event` excludes it like
 `time_decay`, so an unadapted client never meets an unknown `event_type`;
 an adapted client gets the new state in the resolution response, and any
@@ -288,7 +297,10 @@ displaces it, and the one-incident invariant holds. **No tier change**:
 the judge sees the context and rates the turn itself. An **action turn** (a give, a tip, a
 kiss) does not resolve the choice; it is answered by its own rules and
 the ask stays pending — a gift while she waits is an attempt to mend,
-not an answer. `/open` greetings and reactions resolve nothing.
+not an answer. `/open` greetings and reactions resolve nothing. The
+conversion never runs while a separation is under way at the message's
+`sent_at`: such a message only ghosts, and it would otherwise cap the
+separation.
 
 **(d) expiry.** 24 hours with no answer and no message: the choice
 simply lapses. Status stays `pending` and reads as expired everywhere
@@ -344,7 +356,7 @@ left-column texts.
 
 The label seen by exempt action turns while it lasts is 说好暂时分开.
 Messages sent during the separation ghost as in any offline stretch; they
-do not re-convert anything — the choice is already resolved.
+never convert any pending ask, in this session or a sibling one.
 
 ### 3.6 Storage
 

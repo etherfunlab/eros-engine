@@ -121,6 +121,14 @@ pub enum GreetingOccasion {
     LifeChoice,
 }
 
+impl GreetingOccasion {
+    /// The occasion a row's `metadata.proactive` names; `None` for a name
+    /// this build does not know.
+    pub fn from_name(name: &str) -> Option<Self> {
+        serde_json::from_value(serde_json::Value::String(name.to_owned())).ok()
+    }
+}
+
 impl From<ChatMessage> for GreetingDto {
     fn from(m: ChatMessage) -> Self {
         // Every proactive row records `metadata.proactive`; holiday greetings

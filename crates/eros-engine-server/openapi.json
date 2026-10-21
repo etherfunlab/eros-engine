@@ -3539,6 +3539,17 @@
             "type": "boolean",
             "description": "Present (always `true`) only on assistant rows whose turn delegated an\nimage to the consumer (`metadata.image` marker recorded) — key-presence\ncontract like `read_at`. Recover the payload via\n`GET /comp/chat/{session_id}/messages/{message_id}/image-request`; a 404\nthere on a flagged row means the composed prompt was never recorded\n(fail-open audit) — genuinely unrecoverable. Spec:\ndocs/superpowers/specs/2026-08-21-image-turn-discovery-design.md."
           },
+          "occasion": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/GreetingOccasion",
+                "description": "Why the persona spoke on her own — set on the assistant rows she wrote\nunprompted (the row's `metadata.proactive`): a greeting, a life event,\nor `life_choice` for her ask for space and what she says about the\nanswer. A client that has adapted to the choice re-fetches the affinity\ndelta on reading `life_choice`. Omitted on every other row; same\nkey-presence contract as `read_at`."
+              }
+            ]
+          },
           "reaction": {
             "oneOf": [
               {
@@ -4151,6 +4162,17 @@
           "image": {
             "type": "boolean",
             "description": "Present (always `true`) only on assistant rows whose turn delegated an\nimage to the consumer (`metadata.image` marker recorded) — key-presence\ncontract like `read_at`. Recover the payload via the `image-request`\nendpoint; a 404 there on a flagged row means the composed prompt was\nnever recorded (fail-open audit) — genuinely unrecoverable."
+          },
+          "occasion": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/GreetingOccasion",
+                "description": "Why the persona spoke on her own — set on the assistant rows she wrote\nunprompted (the row's `metadata.proactive`): a greeting, a life event,\nor `life_choice` for her ask for space and what she says about the\nanswer. A client that has adapted to the choice re-fetches the affinity\ndelta on reading `life_choice`. Omitted on every other row; same\nkey-presence contract as `read_at`. The BFF history entry carries the\nsame field."
+              }
+            ]
           },
           "reaction": {
             "oneOf": [

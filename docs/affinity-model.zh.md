@@ -355,7 +355,8 @@ Migration `0048` 把 `bond`、`chemistry` 重定义为 Postgres
 每个增量回合向 `companion_affinity_events` 追加一行：
 
 - `deltas`：本轮线轴的原始分（档位换算加规则微调，衰减前）；这里的
-  `warmth`/`patience` 恒为 `0.0`。
+  `warmth`/`patience` 恒为 `0.0`，`life_choice` 行除外，它的 `deltas` 与
+  `effective_deltas` 相同（见[上文](#生活选择的降档与放缓)）。
 - `effective_deltas`：实际应用的逐轴变化，`after − before`；基础对上它
   就是本轮派生 delta。
 - `context`：`affinity_reason`、`eval_skip_reason`、判官原样的有符号

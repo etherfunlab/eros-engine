@@ -8,6 +8,7 @@
 //! §3.1 (trigger), §3.2 (the ask), §3.5 (the slowdown).
 
 use chrono::{DateTime, Duration, Utc};
+use sqlx::PgPool;
 use uuid::Uuid;
 
 use eros_engine_core::events::EventKind;
@@ -72,9 +73,10 @@ const FELL_OUT_HOURS: i64 = 1;
 /// written while the user's next message is already in flight.
 ///
 /// Nothing happens (and nothing is written) when no choice is pending then —
-/// a lapsed one converts nothing (§3.4d) — or when the resolution route
-/// answered first. The caller leaves out action turns: a give, a tip or a
-/// kiss does not answer her. `Ok(true)` when the choice was converted.
+/// a lapsed one converts nothing (§3.4d) — when a separation she agreed to is
+/// under way at the message, or when the resolution route answered first. The
+/// caller leaves out action turns: a give, a tip or a kiss does not answer
+/// her. `Ok(true)` when the choice was converted.
 pub(crate) async fn convert_ignored_ask(
     state: &AppState,
     session_id: Uuid,
@@ -95,6 +97,11 @@ pub(crate) async fn convert_ignored_ask(
     else {
         return Ok(false);
     };
+    // A message during an agreed separation only ghosts: converting would cap
+    // the separation at the message.
+    if separated(&state.pool, instance_id, Some(user_message_id), sent_at).await? {
+        return Ok(false);
+    }
 
     let mut tx = state.pool.begin().await?;
     // First, the race guard: the resolution route may have answered between
@@ -119,6 +126,21 @@ pub(crate) async fn convert_ignored_ask(
     tx.commit().await?;
     tracing::info!(%session_id, choice_id = %choice.id, "her ask went unanswered: fell out");
     Ok(true)
+}
+
+/// Whether a separation she agreed to is under way for the instance: at
+/// `at_message`'s `sent_at`, or at `now` without one.
+async fn separated(
+    pool: &PgPool,
+    instance_id: Uuid,
+    at_message: Option<Uuid>,
+    now: DateTime<Utc>,
+) -> Result<bool, sqlx::Error> {
+    Ok(EventRepo { pool }
+        .current(instance_id, at_message, now)
+        .await?
+        .foreground
+        .is_some_and(|e| e.kind == EventKind::TakingSpace))
 }
 
 /// After a judged turn's affinity committed: ask for space if the
@@ -158,21 +180,19 @@ async fn try_ask(
         return Ok(());
     }
 
+    // She has one life: one pending ask at a time across the instance's
+    // sessions, and none while she is apart from the user.
     let choices = LifeChoiceRepo { pool: &state.pool };
-    if choices.pending(session_id, now).await?.is_some() {
+    if choices.pending_for_instance(instance_id, now).await? {
         return Ok(());
     }
-    let apart = EventRepo { pool: &state.pool }
-        .current(instance_id, None, now)
-        .await?
-        .foreground
-        .is_some_and(|e| e.kind == EventKind::TakingSpace);
-    if apart {
+    if separated(&state.pool, instance_id, None, now).await? {
         return Ok(());
     }
 
-    // Three judged turns, this one included, all after the last ask.
-    let since = choices.latest_asked_at(session_id).await?;
+    // Three judged turns, this one included, all after the last episode: the
+    // ask, its answer and any separation it started.
+    let since = choices.streak_anchor(session_id).await?;
     let patiences = affinity_repo
         .last_judged_patiences(session_id, since, STREAK)
         .await?;
@@ -401,8 +421,16 @@ mod tests {
 
     impl Scene {
         /// One 1:1 text turn in `session`, through the whole affinity pass.
+        /// No ignore conversion runs: as far as a pending ask is concerned
+        /// this is an action turn, which does not answer her.
         async fn turn_in(&self, state: &AppState, session_id: Uuid, text: &str) {
-            let umid: Uuid = sqlx::query_scalar(
+            let umid = self.user_row(session_id, text).await;
+            self.affinity_pass(state, session_id, text, umid).await;
+        }
+
+        /// The user's row of a turn, as the stream persists it.
+        async fn user_row(&self, session_id: Uuid, text: &str) -> Uuid {
+            sqlx::query_scalar(
                 "INSERT INTO engine.chat_messages (session_id, role, content) \
                  VALUES ($1, 'user', $2) RETURNING id",
             )
@@ -410,7 +438,20 @@ mod tests {
             .bind(text)
             .fetch_one(&self.pool)
             .await
-            .unwrap();
+            .unwrap()
+        }
+
+        /// An ordinary text turn in the scene's own session: the ignore
+        /// conversion first, as the stream runs it, then the affinity pass.
+        async fn converting_turn(&self, state: &AppState, text: &str) {
+            let umid = self.user_row(self.session_id, text).await;
+            convert_ignored_ask(state, self.session_id, self.instance_id, umid)
+                .await
+                .unwrap();
+            self.affinity_pass(state, self.session_id, text, umid).await;
+        }
+
+        async fn affinity_pass(&self, state: &AppState, session_id: Uuid, text: &str, umid: Uuid) {
             run_affinity_turn(
                 state,
                 session_id,
@@ -972,11 +1013,16 @@ mod tests {
     impl Scene {
         /// A choice asked at `asked_at`, still pending; returns its id.
         async fn pending_at(&self, asked_at: DateTime<Utc>) -> Uuid {
+            self.pending_in(self.session_id, asked_at).await
+        }
+
+        /// [`Self::pending_at`] in any session of the instance.
+        async fn pending_in(&self, session_id: Uuid, asked_at: DateTime<Utc>) -> Uuid {
             sqlx::query_scalar(
                 "INSERT INTO engine.life_choices (session_id, kind, tier_gap, asked_at) \
                  VALUES ($1, 'ask_for_space', 3, $2) RETURNING id",
             )
-            .bind(self.session_id)
+            .bind(session_id)
             .bind(asked_at)
             .fetch_one(&self.pool)
             .await
@@ -991,6 +1037,18 @@ mod tests {
             sent_at: DateTime<Utc>,
             action: Option<eros_engine_core::types::UserAction>,
         ) -> Uuid {
+            self.stream_turn_in(self.session_id, state, sent_at, action)
+                .await
+        }
+
+        /// [`Self::stream_turn`] in any session of the instance.
+        async fn stream_turn_in(
+            &self,
+            session_id: Uuid,
+            state: &Arc<AppState>,
+            sent_at: DateTime<Utc>,
+            action: Option<eros_engine_core::types::UserAction>,
+        ) -> Uuid {
             use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
             use futures_util::StreamExt;
 
@@ -999,7 +1057,7 @@ mod tests {
                 .map(|a| json!({ "action": serde_json::to_value(a).unwrap() }));
             let umid = match (ChatRepo { pool: &self.pool })
                 .upsert_user_message_idempotent(
-                    self.session_id,
+                    session_id,
                     if action.is_some() { "" } else { "在吗" },
                     &ulid::Ulid::new().to_string(),
                     "user",
@@ -1021,7 +1079,7 @@ mod tests {
                 state.clone(),
                 crate::pipeline::stream::PersistedUserMessage {
                     user_message_id: umid,
-                    session_id: self.session_id,
+                    session_id,
                     user_id: self.user_id,
                     instance_id: self.instance_id,
                     content: if action.is_some() { "" } else { "在吗" }.into(),
@@ -1404,5 +1462,202 @@ mod tests {
             1,
             "the error was logged and swallowed: the turn was still answered"
         );
+    }
+
+    // ---- One pending ask per instance; the conversion never runs apart ----
+
+    /// She has one life: while any session of the instance waits for an answer
+    /// the others do not ask, however thin her patience runs there. Answering
+    /// it lets the same streak through.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_sibling_sessions_pending_ask_holds_the_trigger_back(pool: PgPool) {
+        let a = scene(&pool).await;
+        let b = lopsided_session(&pool, a.user_id, a.instance_id).await;
+        let mock = mock_llm(LOW_PATIENCE, Some(ASK_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+        a.seed_choice("pending", Duration::hours(1)).await;
+
+        // B meets every other condition: the gap, three low judged turns, a
+        // text session of a genome instance, nothing under way.
+        for _ in 0..3 {
+            a.turn_in(&state, b, SEEN).await;
+        }
+        assert!(a.choices_in(b).await.is_empty(), "A's ask holds B back");
+        assert!(
+            companion_calls(&mock).await.is_empty(),
+            "and no generation spent"
+        );
+        assert_eq!(a.choices().await.len(), 1, "A's ask is untouched");
+
+        sqlx::query("UPDATE engine.life_choices SET status = 'ignored' WHERE session_id = $1")
+            .bind(a.session_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        a.turn_in(&state, b, SEEN).await;
+        assert_eq!(a.choices_in(b).await.len(), 1, "answered, B asks");
+        assert_eq!(companion_calls(&mock).await.len(), 1);
+    }
+
+    /// A message during an agreed separation only ghosts. A choice a sibling
+    /// session holds pending (the state before the instance held one ask at a
+    /// time) is not converted by it: no falling-out, and the separation
+    /// keeps its `ends_at`.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_message_during_a_separation_converts_no_pending_ask(pool: PgPool) {
+        let a = scene(&pool).await;
+        let b = lopsided_session(&pool, a.user_id, a.instance_id).await;
+        let (state, _mock) = turn_env(&pool).await;
+        let sent = recent(10);
+        // A's ask was accepted: she is apart until ten hours after the message.
+        accepted_separation(&a, a.session_id, sent + Duration::hours(10)).await;
+        let choice = a.pending_in(b, sent - Duration::hours(2)).await;
+        let before = a.instance_events().await;
+        assert_eq!(before.len(), 1, "the separation, nothing else");
+
+        let umid = a.stream_turn_in(b, &state, sent, None).await;
+
+        let ghosted: bool =
+            sqlx::query_scalar("SELECT ghost_decision FROM engine.chat_messages WHERE id = $1")
+                .bind(umid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(ghosted, "a message during a separation ghosts");
+        assert_eq!(
+            a.status_of(choice).await,
+            ("pending".into(), None),
+            "and converts nothing"
+        );
+        assert_eq!(
+            a.instance_events().await,
+            before,
+            "no falling-out, and the separation is not capped at the message"
+        );
+    }
+
+    // ---- The streak starts over after the whole episode (spec §3.1) ----
+
+    impl Scene {
+        /// An accepted choice asked `asked_ago` ago and answered `resolved_ago`
+        /// ago, whose separation ran from the answer until `ends_ago` ago.
+        async fn seed_accepted_choice(
+            &self,
+            asked_ago: Duration,
+            resolved_ago: Duration,
+            ends_ago: Duration,
+        ) {
+            let now = Utc::now();
+            let choice: Uuid = sqlx::query_scalar(
+                "INSERT INTO engine.life_choices \
+                   (session_id, kind, status, tier_gap, asked_at, resolved_at) \
+                 VALUES ($1, 'ask_for_space', 'accepted', 3, $2, $3) RETURNING id",
+            )
+            .bind(self.session_id)
+            .bind(now - asked_ago)
+            .bind(now - resolved_ago)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap();
+            let event = EventRepo { pool: &self.pool }
+                .insert_preempting(&NewEvent {
+                    instance_id: self.instance_id,
+                    session_id: self.session_id,
+                    event_key: "apart",
+                    kind: EventKind::TakingSpace,
+                    started_at: now - resolved_ago,
+                    ends_at: now - ends_ago,
+                })
+                .await
+                .unwrap();
+            LifeChoiceRepo { pool: &self.pool }
+                .set_event(choice, event.id)
+                .await
+                .unwrap();
+        }
+
+        /// Move every affinity event of the scene `ago` into the past.
+        async fn age_events(&self, ago: Duration) {
+            sqlx::query(
+                "UPDATE engine.companion_affinity_events \
+                    SET created_at = created_at - make_interval(secs => $1)",
+            )
+            .bind(ago.num_seconds() as f64)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    /// Judged turns while she waits (a give, a tip or a kiss does not answer
+    /// her) are not the new streak: the ignore that follows resolves the
+    /// choice at the converting message, and the converting turn is the first
+    /// of three. Anchored at the ask it would fire on the converting turn
+    /// itself.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_give_then_an_ignore_does_not_ask_again_on_the_converting_turn(pool: PgPool) {
+        let s = scene(&pool).await;
+        let mock = mock_llm(LOW_PATIENCE, Some(ASK_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+        s.pending_at(Utc::now() - Duration::hours(2)).await;
+
+        // Three low judged turns, all after the ask, none of them an answer.
+        for _ in 0..3 {
+            s.turn(&state, SEEN).await;
+        }
+        assert_eq!(s.choices().await.len(), 1, "held back while she waits");
+
+        // An ordinary message: the ask is ignored. Its own judge reading is low,
+        // and it is turn one of the new streak.
+        s.converting_turn(&state, SEEN).await;
+        let choices = s.choices().await;
+        assert_eq!(choices.len(), 1, "{choices:?}");
+        assert_eq!(choices[0].0, "ignored");
+        assert!(
+            companion_calls(&mock).await.is_empty(),
+            "no ask on the turn that ignored her"
+        );
+
+        s.turn(&state, SEEN).await;
+        assert_eq!(s.choices().await.len(), 1, "two turns after the episode");
+        s.turn(&state, SEEN).await;
+        assert_eq!(s.choices().await.len(), 2, "three turns after it ask again");
+        assert_eq!(companion_calls(&mock).await.len(), 1);
+    }
+
+    /// Action turns inside a separation are judged like any other, but they
+    /// are part of the episode: once she is back the streak counts only the
+    /// turns after the separation ended.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn action_turns_during_a_separation_do_not_pre_load_the_return_streak(pool: PgPool) {
+        let s = scene(&pool).await;
+        let mock = mock_llm(LOW_PATIENCE, Some(ASK_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+
+        // Two judged action turns, 20 hours ago. The separation they fell in
+        // ran from 29 to 11 hours ago, and the ask was put 30 hours ago.
+        s.turn(&state, SEEN).await;
+        s.turn(&state, SEEN).await;
+        assert!(s.choices().await.is_empty(), "two turns are not three");
+        s.age_events(Duration::hours(20)).await;
+        s.seed_accepted_choice(
+            Duration::hours(30),
+            Duration::hours(29),
+            Duration::hours(11),
+        )
+        .await;
+
+        s.turn(&state, SEEN).await;
+        assert_eq!(s.choices().await.len(), 1, "one turn since she came back");
+        assert!(companion_calls(&mock).await.is_empty());
+        s.turn(&state, SEEN).await;
+        assert_eq!(s.choices().await.len(), 1, "two");
+        s.turn(&state, SEEN).await;
+        assert_eq!(
+            s.choices().await.len(),
+            2,
+            "three since the return ask again"
+        );
+        assert_eq!(companion_calls(&mock).await.len(), 1);
     }
 }
