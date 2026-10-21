@@ -15,6 +15,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use eros_engine_store::affinity::AffinityRepo;
+use eros_engine_store::life_choices::{LifeChoiceRecord, LifeChoiceRepo};
 
 use crate::auth::middleware::AuthUser;
 use crate::error::AppError;
@@ -54,7 +55,43 @@ pub struct BffAffinityDelta {
     /// `time_decay` events and on rows written before migration 0056.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_message_id: Option<Uuid>,
+    /// The session's pending choice, whichever event this is: composed at
+    /// serve time, present while one is unanswered and not past its 24 hours.
+    /// Answer it at `POST /v2/comp/session/{session_id}/life-choices/{choice_id}`.
+    /// A client that does not know the field shows the ask as an ordinary
+    /// message and its user answers in words.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub life_choice: Option<LifeChoiceDto>,
     pub created_at: DateTime<Utc>,
+}
+
+/// A choice the persona has put to the user and is waiting on.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct LifeChoiceDto {
+    pub id: Uuid,
+    /// `ask_for_space`.
+    pub kind: String,
+    /// The answers the resolution endpoint takes: `["accept", "decline"]`.
+    pub options: Vec<String>,
+    pub asked_at: DateTime<Utc>,
+    /// `asked_at` plus 24 hours; past it the choice is no longer offered.
+    pub expires_at: DateTime<Utc>,
+    /// The chat message that asked it. Absent once that row is gone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<Uuid>,
+}
+
+impl From<LifeChoiceRecord> for LifeChoiceDto {
+    fn from(choice: LifeChoiceRecord) -> Self {
+        Self {
+            expires_at: choice.expires_at(),
+            id: choice.id,
+            kind: choice.kind,
+            options: vec!["accept".to_owned(), "decline".to_owned()],
+            asked_at: choice.asked_at,
+            message_id: choice.message_id,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -140,7 +177,7 @@ async fn bff_get_affinity_delta(
         }
     }
 
-    let event = row.and_then(|r| {
+    let mut event = row.and_then(|r| {
         // Pre-0014 rows have NULL effective_deltas → omit (don't fabricate).
         let effective = r.effective_deltas?;
         let effective_deltas: AffinityDeltasDto = serde_json::from_value(effective).ok()?;
@@ -158,9 +195,19 @@ async fn bff_get_affinity_delta(
             label_changes,
             state_after: r.state_after,
             user_message_id: r.user_message_id,
+            life_choice: None,
             created_at: r.created_at,
         })
     });
+
+    // Read once, here, after any hold: the ask lands seconds after the turn's
+    // own event, so what is pending when the response goes out is what rides.
+    if let Some(event) = event.as_mut() {
+        event.life_choice = (LifeChoiceRepo { pool: &state.pool })
+            .pending(session_id, Utc::now())
+            .await?
+            .map(LifeChoiceDto::from);
+    }
 
     Ok(Json(BffAffinityDeltaResponse { session_id, event }))
 }
@@ -402,6 +449,10 @@ mod tests {
         body::Body,
         http::{header, Request, StatusCode},
     };
+    use chrono::{DateTime, Duration, SubsecRound, Utc};
+    use eros_engine_core::affinity::AffinityTuning;
+    use eros_engine_store::affinity::AffinityRepo;
+    use eros_engine_store::life_choices::LifeChoiceRepo;
     use serde_json::json;
     use sqlx::PgPool;
     use uuid::Uuid;
@@ -1287,6 +1338,180 @@ mod tests {
             .unwrap();
         let (status, _b) = send_request(&mut app, r).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    // ─── life_choice on the delta (spec 2026-10-19 §3.3) ────────────────
+
+    /// A time in the recent past, whole microseconds, so what Postgres stores
+    /// is what the test compares.
+    fn recent(minutes_ago: i64) -> DateTime<Utc> {
+        (Utc::now() - Duration::minutes(minutes_ago)).trunc_subsecs(6)
+    }
+
+    /// A session with one turn event on its delta route; returns
+    /// (user, session, affinity id, the turn event's id).
+    async fn session_with_turn(pool: &PgPool) -> (Uuid, Uuid, Uuid, Uuid) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(pool, "Aria").await;
+        let instance_id = seed_instance(pool, genome_id, user_id).await;
+        let session_id = seed_session(pool, user_id, instance_id).await;
+        let aid = seed_affinity(pool, session_id, user_id, instance_id).await;
+        let turn = seed_event(pool, aid, "message", 0.05, 600).await;
+        (user_id, session_id, aid, turn)
+    }
+
+    /// A choice row of the session in `status`, asked at `asked_at`.
+    async fn seed_choice(
+        pool: &PgPool,
+        session_id: Uuid,
+        status: &str,
+        asked_at: DateTime<Utc>,
+        message_id: Option<Uuid>,
+    ) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO engine.life_choices \
+               (session_id, kind, status, tier_gap, asked_at, message_id) \
+             VALUES ($1, 'ask_for_space', $2, 3, $3, $4) RETURNING id",
+        )
+        .bind(session_id)
+        .bind(status)
+        .bind(asked_at)
+        .bind(message_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    fn at(v: &serde_json::Value) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(v.as_str().expect("a timestamp string"))
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    /// The pending, un-expired choice rides the event the route returns, with
+    /// both options spelled out and the expiry derived from `asked_at`.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_pending_choice_rides_the_delta(pool: PgPool) {
+        let (user_id, session_id, _aid, turn) = session_with_turn(&pool).await;
+        let ask: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content) \
+             VALUES ($1, 'assistant', 'ask') RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let asked_at = recent(30);
+        let choice = seed_choice(&pool, session_id, "pending", asked_at, Some(ask)).await;
+
+        let mut app = build_router(test_state(pool));
+        let token = mint_test_jwt(user_id);
+        let (status, body) = send_request(&mut app, req(&token, session_id)).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+
+        assert_eq!(body["event"]["event_id"], json!(turn.to_string()));
+        let lc = &body["event"]["life_choice"];
+        assert_eq!(lc["id"], json!(choice.to_string()));
+        assert_eq!(lc["kind"], "ask_for_space");
+        assert_eq!(lc["options"], json!(["accept", "decline"]));
+        assert_eq!(at(&lc["asked_at"]), asked_at);
+        assert_eq!(at(&lc["expires_at"]), asked_at + Duration::hours(24));
+        assert_eq!(lc["message_id"], json!(ask.to_string()));
+    }
+
+    /// A pending row past its 24 hours and a resolved one are not offered; a
+    /// fresh pending one after them is, so the absence is not for want of a
+    /// choice.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_expired_or_resolved_choice_does_not(pool: PgPool) {
+        let (user_id, session_id, _aid, _turn) = session_with_turn(&pool).await;
+        let mut app = build_router(test_state(pool.clone()));
+        let token = mint_test_jwt(user_id);
+
+        seed_choice(&pool, session_id, "pending", recent(24 * 60 + 1), None).await;
+        for status in ["accepted", "declined", "ignored"] {
+            seed_choice(&pool, session_id, status, recent(30), None).await;
+        }
+        let (code, body) = send_request(&mut app, req(&token, session_id)).await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        assert!(body["event"].is_object(), "there is an event to ride");
+        assert!(
+            body["event"].get("life_choice").is_none(),
+            "the key is absent, not null: {body}"
+        );
+
+        let fresh = seed_choice(&pool, session_id, "pending", recent(5), None).await;
+        let (_, body) = send_request(&mut app, req(&token, session_id)).await;
+        assert_eq!(body["event"]["life_choice"]["id"], json!(fresh.to_string()));
+    }
+
+    /// The tier drop a choice costs is on the log but never the route's event,
+    /// and the resolved choice is gone from it.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_life_choice_event_type_never_surfaces(pool: PgPool) {
+        let (user_id, session_id, _aid, turn) = session_with_turn(&pool).await;
+        let choice = seed_choice(&pool, session_id, "pending", recent(30), None).await;
+        LifeChoiceRepo { pool: &pool }
+            .resolve(choice, "declined", Utc::now())
+            .await
+            .unwrap()
+            .expect("resolved");
+        AffinityRepo { pool: &pool }
+            .persist_life_choice_drop(session_id, choice, "decline", &AffinityTuning::default())
+            .await
+            .unwrap();
+        let dropped: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.companion_affinity_events \
+              WHERE event_type = 'life_choice'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(dropped, 1, "the drop is on the log");
+
+        let mut app = build_router(test_state(pool));
+        let token = mint_test_jwt(user_id);
+        let (status, body) = send_request(&mut app, req(&token, session_id)).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["event"]["event_id"], json!(turn.to_string()));
+        assert_eq!(body["event"]["event_type"], "message");
+        assert!(body["event"].get("life_choice").is_none(), "body={body}");
+    }
+
+    /// The long-poll path composes the choice at response time, after the hold:
+    /// one that lands while the request is held rides the release, and a held
+    /// request that times out unchanged carries it too.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_pending_choice_rides_the_long_poll_release(pool: PgPool) {
+        let (user_id, session_id, aid, baseline) = session_with_turn(&pool).await;
+        let mut app = build_router(test_state(pool.clone()));
+        let token = mint_test_jwt(user_id);
+
+        let writer = {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                let choice = seed_choice(&pool, session_id, "pending", recent(1), None).await;
+                let event = seed_event(&pool, aid, "message", 0.07, 0).await;
+                (choice, event)
+            })
+        };
+        let (status, body) =
+            send_request(&mut app, req_longpoll(&token, session_id, baseline, 10_000)).await;
+        let (choice, event) = writer.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["event"]["event_id"], json!(event.to_string()));
+        assert_eq!(
+            body["event"]["life_choice"]["id"],
+            json!(choice.to_string())
+        );
+
+        let (_, body) = send_request(&mut app, req_longpoll(&token, session_id, event, 400)).await;
+        assert_eq!(body["event"]["event_id"], json!(event.to_string()));
+        assert_eq!(
+            body["event"]["life_choice"]["id"],
+            json!(choice.to_string())
+        );
     }
 
     #[test]
