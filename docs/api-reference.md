@@ -872,7 +872,8 @@ occasion that is not true of the session returns `null` without generating.
 
 `occasion` in the response is `birthday`, `holiday`, `first_meet`,
 `returning` or `just_opened`. The same message shape carries `event` on a life
-event's message (see the events route below).
+event's message (see the events route below) and `life_choice` on her ask for
+space and her answer to the user's reply (see the life-choice route below).
 
 - **Synchronous:** one non-streaming generation, a few seconds. Don't block UI on it.
 - **Idempotent:** per session and local date for a birthday or holiday
@@ -902,7 +903,9 @@ event's message (see the events route below).
 Ask for something to happen in the persona's day. The caller decides when to
 ask; the engine decides whether and what. It draws one kind of event, or none,
 and the persona tells the user in one proactive message — except the offline
-kinds, which make her unreachable and are announced only in part (below). While
+kinds, which make her unreachable and are announced only in part (below). Nothing
+is drawn while she waits for the user's answer to her ask for space (see
+[the life-choice route](#post-v2compsessionsession_idlife-choiceschoice_id)). While
 an event lasts, the judge and the reply know she is in it (see
 [model-config.md](model-config.md#taskspde_decision--opt-in-llm-pde-judge)).
 How the draw works and how events and the persona's needs fit together is in
@@ -920,7 +923,7 @@ How the draw works and how events and the persona's needs fit together is in
 | Field | Rules |
 |---|---|
 | `event_key` | required: 1–128 characters of `[A-Za-z0-9_.:-]`, scoped to the session. The same key returns the same event |
-| `kinds` | optional. Absent or `null`: every kind. An array allows the listed kinds (`[]`: nothing is drawn). An object `{"allow": […], "disallow": […]}` allows what `allow` lists (absent or `null`: every kind; `[]`: none) minus what `disallow` lists; a kind in both is not drawn, and `{}` allows every kind. An unknown key in the object or an unknown kind is a `422` |
+| `kinds` | optional. Absent or `null`: every kind. An array allows the listed kinds (`[]`: nothing is drawn). An object `{"allow": […], "disallow": […]}` allows what `allow` lists (absent or `null`: every kind; `[]`: none) minus what `disallow` lists; a kind in both is not drawn, and `{}` allows every kind. An unknown key in the object or an unknown kind is a `422`, and so is `taking_space` or `fell_out`: the engine places those itself and never draws them |
 | `user_timezone`, `user_country`, `user_region`, `tier`, `prompt_traits`, `memory_scope`, `affinity_scope`, `audit` | as on `/open`, for generating the message |
 
 Kinds fall into four categories. `short` and `mid` are incidents; `body` and
@@ -944,6 +947,8 @@ Kinds fall into four categories. `short` and `mid` are incidents; `body` and
 | `short` | `quarrel` | 1 h | she had a row with someone |
 | `short` | `scolded_by_superior` | 1 h | someone above her told her off — a boss, a manager, a master, a sovereign, by her world |
 | `short` | `scolded_superior` | 1 h | she told off someone above her |
+| `short` | `saw_bag` | 1 h | she has her eye on a bag (female persona) |
+| `short` | `saw_clothes` | 1 h | she has her eye on a piece of clothing (female persona) |
 | `mid` | `temp_work` | 4 h | she is called in to work |
 | `mid` | `ex_message` | 3 h | her ex texts her |
 | `mid` | `weather_change` | 4 h | the weather turns |
@@ -958,6 +963,9 @@ Kinds fall into four categories. `short` and `mid` are incidents; `body` and
 | `mid` | `busy` | 1–3 h | she is busy (offline) |
 | `mid` | `in_battle` | 2–4 h | she is in the thick of a hard fight — a business dinner, a negotiation, or a real battle, by her world (offline) |
 | `mid` | `asleep` | 1–4 h | she has fallen asleep (offline) |
+| `mid` | `out_shopping` | 2–4 h | she is out shopping (offline for a female persona) |
+| `mid` | `bros_gathering` | 2–4 h | she is at a gathering of brothers (offline) |
+| `mid` | `sis_gathering` | 2–4 h | she is at a gathering of sisters (offline) |
 | `body` | `sick` | 1–3 d | she is ill |
 | `body` | `period` | 3–7 d | her period |
 | `body` | `hospitalized` | 2–5 d | she is in hospital |
@@ -967,7 +975,15 @@ Kinds fall into four categories. `short` and `mid` are incidents; `body` and
 | `trip` | `long_trip` | 3–7 d | a long trip |
 | `trip` | `hometown_visit` | 72 h | a visit home |
 
-A range is drawn when the event starts.
+A range is drawn when the event starts. That is 43 drawable kinds. Both genders
+draw both gatherings, at the same weight; that is deliberate.
+
+Two more kinds are never drawn: `taking_space` (a separation she asked for and
+the user agreed to, 12–24 h, offline) and `fell_out` (the falling-out when the
+user ignores her ask, 1 h). The engine writes them for the
+[life-choice flow](#post-v2compsessionsession_idlife-choiceschoice_id). They
+show up as the `event` of `…/effects` and of the life-choice response, and
+cannot be listed in `kinds`.
 
 `sudden_desire` and `pregnancy_scare`, which implies sex, carry adult themes; a
 caller that serves them only to some users leaves them out with
@@ -986,8 +1002,13 @@ The draw:
   ones that need her out and about (`temp_work`, `police_encounter`,
   `animal_encounter`, `hit_someone`, `got_hit`, `working_out`,
   `grocery_shopping`, `in_class`, `on_the_way`, `in_battle`, `got_bumped`,
-  `bumped_someone`); during `period`,
+  `bumped_someone`, `saw_bag`, `saw_clothes`, `out_shopping`,
+  `bros_gathering`, `sis_gathering`); during `period`,
   neither `period_scare` nor `pregnancy_scare`.
+- **While she waits for an answer, nothing is drawn.** From her ask for space
+  until it is answered or lapses (24 h), the draw returns `{"event": null,
+  "message": null}` for every session of the persona. A repeat of an
+  `event_key` that already drew still returns its event.
 - **Cooldowns.** Each kind has a cooldown from when it started. A trip starts
   at most once a week, and a `body` state at most once a fortnight, whichever
   kind. Any offline kind starts at most once every 12 hours, whichever kind.
@@ -997,8 +1018,10 @@ The draw:
   barely knows (intimacy rung 2 and up); `sudden_desire` only at the closest
   rung (3). `period` is drawn only for a persona whose `art_metadata.gender` is
   `"female"`. `period_scare` (rung 2 and up) and `pregnancy_scare` (rung 3) are
-  also drawn only for such a persona. The offline kinds follow the two ghost
-  gates (below).
+  also drawn only for such a persona, and so are `saw_bag` and `saw_clothes`;
+  from rung 2 she says she wants what she found, in her `tip_personality`'s
+  register when she has one. The offline kinds follow the two ghost gates
+  (below).
 - **Persona settings** in the genome's `art_metadata` shape the draw:
 
   | Key | Value | Effect |
@@ -1027,11 +1050,16 @@ drawn length. An incident drawn during a background is told from inside it
 (「出差途中遇到一只小猫」). `offline` is `true` for the offline kinds (below)
 and `false` for every other kind.
 
-**Offline kinds.** `away_from_phone`, `busy`, `in_battle` and `asleep` make her
-unreachable while they last. `busy` and `in_battle` are announced in one
-message at intimacy rung 2 and up. Otherwise, and always for the other two,
-nothing is generated: the response carries the event with `"message": null`
-and `"message_id": null`, and `started_at` is the moment of the call.
+**Offline kinds.** `away_from_phone`, `busy`, `in_battle`, `asleep`,
+`bros_gathering`, `sis_gathering` and, for a female persona, `out_shopping` make
+her unreachable while they last; for any other persona `out_shopping` is an
+ordinary incident (`"offline": false`, told at every rung) and she keeps
+replying. The gatherings exist so that she has a life of her own and does not
+orbit the user. `busy`, `in_battle` and a female persona's `out_shopping` are
+announced in one message at intimacy rung 2 and up. Otherwise, and always for
+`away_from_phone`, `asleep` and the gatherings, nothing is generated: the
+response carries the event with `"message": null` and `"message_id": null`, and
+`started_at` is the moment of the call.
 
 ```json
 {"event": {"kind": "asleep", "category": "mid", "offline": true, "started_at": "2026-10-15T15:00:00Z", "ends_at": "2026-10-15T18:00:00Z", "message_id": null},
@@ -1040,7 +1068,7 @@ and `"message_id": null`, and `started_at` is the moment of the call.
 
 While one lasts, every text turn in any session of the persona ghosts, without
 the judge and without counting towards the ghost streak, and `/open` returns
-`null`. An announced `busy` or `in_battle` still ghosts. A turn that carries a
+`null`. An announced `busy`, `in_battle` or `out_shopping` still ghosts. A turn that carries a
 user `action` (any `type`: `give`, `gift`, `tip`, `kiss`, `hug`, `touch`,
 `lick`, `custom`) or `image.force = true` is the exception: it takes the normal
 path and is answered, because an action is interaction in person, which needs
@@ -1054,8 +1082,9 @@ leaves them out of `kinds`. A message ghosted this way carries no read receipt
 the event is over, in a session where the user's messages were ghosted, the
 persona's next message — a reply, an `/open` greeting or an event message —
 explains it in the kind's words: she was asleep, busy, in the thick of a hard
-fight or not looking at her phone, and only now sees what was sent. The
-announcement of `busy` or `in_battle` does not count as the explanation: it was
+fight, shopping, at a gathering of her brothers or sisters or not looking at her
+phone, and only now sees what was sent. The
+announcement of `busy`, `in_battle` or `out_shopping` does not count as the explanation: it was
 written before the event ended. After she has written a message with text there,
 that is done; an image-only reply does not count. The mechanics are in
 [ghost-mechanics.md](ghost-mechanics.md#ghosting-the-engine-imposes).
@@ -1096,7 +1125,7 @@ reply does not count. Her other sessions never carry it.
   with text; see
   [model-config.md](model-config.md#taskspde_decision--opt-in-llm-pde-judge)).
 - **Errors:** `400` with `code: "invalid_payload"` for a malformed
-  `event_key`; `422` for an unknown `kind`. Session checks as on `/open`
+  `event_key`; `422` for an unknown `kind`, or for `taking_space` or `fell_out`. Session checks as on `/open`
   (`403`, `404`, `409` for a voice or group session), `429` at the per-user
   in-flight cap. A BYOC instance's session is `400 byoc_unsupported`. A failed
   generation returns the upstream error the image endpoints return and
@@ -1117,6 +1146,96 @@ The persona's lingering state from accepted gives, her needs and the events unde
 ```
 
 `effects` is `[]` when nothing is at work. Errors as `/open`: `404 session_not_found`, `403 session_forbidden`, `409 wrong_channel` for a voice or group session.
+
+### `POST /v2/comp/session/{session_id}/life-choices/{choice_id}`
+
+Answer her ask for space. When chemistry runs two tiers past bond and her
+patience stays low for three judged turns, the persona asks the user for a
+break in a proactive message (`metadata.proactive = "life_choice"`) and the
+session carries a pending choice for 24 hours. The user answers here, answers
+in words, or says nothing. How and when she asks, and what each path costs, is
+in [life-events-needs.md](life-events-needs.md#the-ask-for-space-choice).
+
+A client learns of the choice from the `life_choice` field of
+[`GET /bff/v1/comp/affinity/{session_id}/event`](#get-bffv1compaffinitysession_idevent),
+which carries the choice's `id` and the answers it accepts. The ask lands
+seconds after the turn that triggered it, so the delta that turn releases
+usually misses it: **re-fetch the delta when you read a proactive message with
+`metadata.proactive = "life_choice"`**. A client that never adapts loses
+nothing. It shows the ask as an ordinary message, the user replies in words,
+and that is the ignore path (below).
+
+```json
+{
+  "response": "accept",
+  "user_timezone": "Asia/Taipei",
+  "tier": "gold"
+}
+```
+
+| Field | Rules |
+|---|---|
+| `response` | required: `"accept"` or `"decline"`; anything else is a `422` |
+| `user_timezone`, `user_country`, `user_region`, `tier`, `prompt_traits`, `memory_scope`, `affinity_scope`, `audit` | as on `/open`, for generating her reply. The engine keeps nothing between calls |
+
+1:1 text sessions only. One transaction answers the choice and pays for it:
+
+- **`accept`:** the choice becomes `accepted`. A `taking_space` separation
+  starts now and lasts 6 hours per tier of the gap she asked at (gap 2, 3, 4:
+  12, 18, 24 hours); she is offline for all her sessions while it lasts, and an
+  incident under way ends. Bond and chemistry each drop one tier, and for 72
+  hours after the separation ends positive growth in this session is halved.
+- **`decline`:** the choice becomes `declined`. The same tier drop; no
+  separation and no slowdown.
+
+Then she answers in one proactive message (a goodbye after an accept, a hurt
+reply after a decline), persisted like any reply and returned:
+
+```json
+{"status": "accepted",
+ "message": {"message_id": "…", "content": "好，那我们先各自安静一下。", "sent_at": "2026-10-20T12:00:00Z", "occasion": "life_choice"},
+ "affinity": {"bond_tier": 2, "chem_tier": 3, "bond_label": "friend", "chemistry_label": "crush", "…": "…"},
+ "event": {"kind": "taking_space", "category": "mid", "offline": true, "started_at": "2026-10-20T12:00:00Z", "ends_at": "2026-10-21T06:00:00Z", "message_id": null}}
+```
+
+`status` is `accepted` or `declined`. `affinity` is the relationship after the
+drop, in the shape of
+[`GET /bff/v1/comp/affinity/{session_id}`](#get-bffv1compaffinitysession_id)'s
+`affinity`. `event` is the separation an accept started and `null` after a
+decline. `message` is `null` when her generation failed, came back blank, or a
+newer message of the user's landed first: the answer, the separation and the
+drop stand either way.
+
+If the user does not call this route, two other things resolve the choice:
+
+- **Ignore.** The first ordinary user text message that arrives while it is
+  pending (a turn without an `action`) converts it: status `ignored`, and a
+  one-hour `fell_out` incident starts at that message, so the very turn that
+  ignored her is answered with the falling-out in her context. No tier changes.
+  Only a message sent after her ask converts it. An action turn does not
+  resolve it, and neither does `/open` or a reaction.
+- **Lapse.** 24 hours after her ask the choice reads as expired everywhere:
+  `life_choice` is no longer attached, this route answers `409`, a later
+  message converts nothing, and it costs nothing.
+
+A resolution and an incoming message race transactionally; the first writer
+wins and this route answers the loser `409`.
+
+Errors. These refusals carry the pre-stream body `{code, message, user_message}`:
+
+| Status | Code | When |
+|---|---|---|
+| 400 | `invalid_payload` | malformed `tier`, `prompt_traits` or `audit` |
+| 400 | `byoc_unsupported` | the session belongs to a BYOC instance |
+| 403 | `session_forbidden` | the session is not the caller's |
+| 404 | `session_not_found` | unknown session |
+| 404 | `life_choice_not_found` | the choice is not a choice of this session |
+| 409 | `wrong_channel` | a voice or group session |
+| 409 | `life_choice_closed` | the choice is already resolved (by this route, or by the user's message), or lapsed |
+
+`422` for a `response` that is not `accept` or `decline`, or another malformed
+field; `429` at the per-user in-flight cap, taken before anything is written, so
+the choice stays open.
 
 ### `PUT /v2/comp/session/{session_id}/message/{message_id}/reaction`
 
@@ -2121,6 +2240,14 @@ Query parameters (both optional):
       "updated_at": "2026-08-17T14:02:11.412Z"
     },
     "user_message_id": "…",
+    "life_choice": {
+      "id": "…",
+      "kind": "ask_for_space",
+      "options": ["accept", "decline"],
+      "asked_at": "…",
+      "expires_at": "…",
+      "message_id": "…"
+    },
     "created_at": "…"
   }
 }
@@ -2129,7 +2256,10 @@ Query parameters (both optional):
 `event` is `null` when there is no user-turn event yet (brand-new session,
 or only time-decay), or when the latest event predates affinity migration
 `0014`. `event_type` ∈ `message | gift | proactive | ghost`; a ghost turn
-reports all-zero `effective_deltas`.
+reports all-zero `effective_deltas`. The tier drop of a life choice is an
+affinity event of its own type, `life_choice`, which this route never returns,
+like `time_decay`: the new state comes back in the resolution response, and
+from the absolute route below on any other device.
 
 - `effective_deltas_computed` — exact floored per-turn line delta computed at
   persist time from the floored before/after bond/chemistry scores; read from
@@ -2148,6 +2278,15 @@ reports all-zero `effective_deltas`.
   turn; attach the delta to that message or to its replies
   (`chat_messages.user_message_id`). Absent on `proactive` / `time_decay`
   events and on rows written before migration `0056`.
+- `life_choice` — the session's pending choice, composed at serve time and
+  attached to `event` whenever one is unanswered and not past its 24 hours;
+  absent otherwise. `options` lists the answers the
+  [life-choice route](#post-v2compsessionsession_idlife-choiceschoice_id)
+  takes; `message_id` is the chat message that asked it (absent once that row
+  is gone). The ask lands seconds after the turn that triggered it, so re-fetch
+  the delta when you read a proactive message with
+  `metadata.proactive = "life_choice"`. A client that ignores the field
+  degrades to the ignore path described there.
 
 ### `GET /bff/v1/comp/affinity/{session_id}`
 
@@ -2337,7 +2476,7 @@ on whichever route it comes from. The table below covers the plain shape:
 | 401 | `unauthorized` | Missing / malformed / expired / wrong-secret JWT |
 | 403 | `forbidden` | Path-user vs JWT-user mismatch, or trying to read a session you don't own; or `x-insights-export-secret` missing or wrong on `/svc/v1/*` |
 | 404 | `not_found` | Unknown session / persona / message id |
-| 409 | `conflict` | The resource's state does not permit the action. The reaction route and image edit return it for a group session, with a `message` containing `wrong_channel`. The 1:1 stream and async send routes, `/open`, `/events` and `/effects` refuse a group session with the coded body instead (`code: wrong_channel`), as the group routes refuse a non-group session |
+| 409 | `conflict` | The resource's state does not permit the action. The reaction route and image edit return it for a group session, with a `message` containing `wrong_channel`. The 1:1 stream and async send routes, `/open`, `/events`, `/effects` and the life-choice route refuse a group session with the coded body instead (`code: wrong_channel`), as the group routes refuse a non-group session |
 | 500 | `internal` | Anything else (DB error, LLM API error, etc.) |
 | *the provider's own status* | `upstream` | The upstream provider failed the call (currently only the persona compose endpoint — its composer chain was exhausted). Since v1.4.0 this is **not always 502**: the provider's status passes through verbatim (`529`, `503`, `429`, …), and a gateway-layer failure with no upstream status maps to `504` for a timeout and `502` otherwise. The body carries `upstream_status` / `provider_code` / `error_type` or `gateway_kind`, plus `retryable` — see [the compose endpoint](#post-personainstance_idimagecompose). Branch on the `"error": "upstream"` key, not on the status. |
 
@@ -2349,6 +2488,7 @@ on whichever route it comes from. The table below covers the plain shape:
 - `crates/eros-engine-server/src/routes/session_open.rs` — the persona speaking first: birthday and holiday greetings and caller-named occasions (`v2/comp/session/{session_id}/open`)
 - `crates/eros-engine-server/src/routes/session_events.rs` — life events the persona tells: the draw, and the proactive message that tells it (none for an offline kind she does not announce) (`v2/comp/session/{session_id}/events`)
 - `crates/eros-engine-server/src/routes/session_effects.rs` — the persona's lingering state from accepted gives, her needs and the events under way (`v2/comp/session/{session_id}/effects`)
+- `crates/eros-engine-server/src/routes/life_choices.rs` — the user's answer to her ask for space: accept or decline (`v2/comp/session/{session_id}/life-choices/{choice_id}`)
 - `crates/eros-engine-server/src/routes/group.rs` — group management and the group send route (`v2/comp/group*`)
 - `crates/eros-engine-server/src/routes/reaction.rs` — message reactions: set, clear and the allowlist (`v2/comp/session/{session_id}/message/{message_id}/reaction`, `v2/comp/reactions`)
 - `crates/eros-engine-server/src/routes/insight.rs` — v2 relationship-scoped insight profiles (`v2/comp/instance/{instance_id}/insight/character`, `.../insight/user`)

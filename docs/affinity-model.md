@@ -8,7 +8,8 @@ Affinity is a six-axis vector, one per relationship (one per session). Every
 axis is bounded to `[0, 1]` and clamped on every update. It moves only on
 text-channel, non-`product_qa` chat turns; voice turns and `product_qa`
 turns never write an affinity event, and neither do group turns (a group
-reads each member's affinity and writes none).
+reads each member's affinity and writes none). The one move that is not a turn
+is the tier drop of an answered life choice ([below](#life-choice-drops-and-the-slowdown)).
 
 The judge (the LLM evaluator) only ever outputs ordinal buckets: a grade
 or a level, never a continuous number. The engine owns every score, every
@@ -207,7 +208,9 @@ uniformly.
 **4. Threshold gate.** Each axis keeps a signed accumulator; it commits once
 `|accumulated| ≥ AFFINITY_DELTA_THRESHOLD` (default `0`, so every turn
 commits), otherwise the turn's real score buffers in `pending_deltas`.
-Committed deltas apply 1:1 and clamp to `[0,1]`. The judge's levels, when
+Committed deltas apply 1:1 and clamp to `[0,1]`; in the 72 hours after a
+separation she asked for, the positive ones are first halved
+([below](#life-choice-drops-and-the-slowdown)). The judge's levels, when
 read this turn, then overwrite the stored levels, and both endpoints
 re-derive from the post-turn lines.
 
@@ -260,6 +263,40 @@ whether the persona accepts it; without a definite refusal the engine accepts.
   refused, it joins nothing and drops Bond like a refused `give`.
 
 Example: chemistry `0.80` (64% of tier 4) lands at 64% of tier 3, `≈ 0.524`.
+
+### Life-choice drops and the slowdown
+
+When she asks for space the user answers, and either answer costs the
+relationship ([the choice](life-events-needs.md#the-ask-for-space-choice)).
+Nothing here is a chat turn: no judge runs.
+
+- **The drop (accept and decline).** Bond and chemistry each fall one tier by
+  the landing rule of a refused action, applied to both lines at once: the
+  same relative position one tier down, both axes of each line scaled by the
+  same factor, a tier-1 line to `0`. Both lines' `pending_deltas` are cleared.
+  It is computed from the snapshot after time decay and the endpoint refresh
+  (with the deployment's affinity tuning), inside the row lock and in the
+  transaction that resolves the choice, so a rolled-back resolution leaves no
+  drop. On accept the drop is the state she comes back to; nothing further
+  happens at return.
+- **Its event row.** One row of its own non-turn `event_type`, `life_choice`
+  (migration `0077` widened the type check by this one value). `deltas` and
+  `effective_deltas` carry the same figures, because the drop is the whole raw
+  change; `label_changes`, `effective_line_deltas` and the two state snapshots
+  record the tier move. `context` holds `life_choice` (`accept` | `decline`)
+  and `choice_id`. The row has no `user_message_id`. The delta route
+  `GET /bff/v1/comp/affinity/{session_id}/event` never returns it, like
+  `time_decay`, and it is not a judged turn either.
+- **The slowdown (accept only).** For 72 hours after the separation ends, every
+  positive committed delta on the four line axes is halved before it is
+  applied. Negative deltas apply in full, and `warmth` and `patience` re-derive
+  from the post-turn lines as always. The cut part is gone: it is not parked in
+  the gate's balance. It applies in the choice's session only, and the window
+  is derived, with no new state: the choice's `event_id` leads to the
+  separation's `ends_at`, and the window is `ends_at` to `ends_at` plus 72
+  hours, wall-clock. A slowed turn's event row carries `context.growth_scale`
+  (`0.5`), absent at full speed, and its `effective_deltas` show the halved
+  values.
 
 ## Base-pair derivation details
 
@@ -334,8 +371,14 @@ moved (format in [Event rows](#event-rows)).
   each member, read from the member's 1:1 session and never written.
 - The life-event draw — the intimacy rung gates `ex_message`, `breakup` and
   `period_scare` (not drawn on rung 1), `sudden_desire` and `pregnancy_scare`
-  (rung 3 only), and whether `busy` and `in_battle` are announced (from rung 2)
+  (rung 3 only), and whether `busy`, `in_battle` and a female persona's
+  `out_shopping` are announced (from rung 2); from rung 2 she also says she wants
+  what the shopping finds (`saw_bag`, `saw_clothes`) put in front of her
   (see [the events route](api-reference.md#post-v2compsessionsession_idevents)).
+- The ask for space — the two tier ladders (chemistry two tiers or more above
+  bond) and the derived `patience` of the last three judged turns decide
+  whether she asks for a break
+  ([the choice](life-events-needs.md#the-ask-for-space-choice)).
 - Ghost scoring —
   `score = (1−intrigue)·0.4 + (1−patience)·0.4 + tension·0.2`, with hard
   vetoes (first 10 messages, streak ≥ 2, 1 h cooldown) and threshold `0.65`
@@ -427,7 +470,11 @@ Each delta turn appends one row to `engine.companion_affinity_events`:
   `patience_grade` when read, `boost_warmth`/`boost_patience`,
   `decay_factor`, `units`. `cross_penalty_assessed` joins them whenever a
   turn was taxed; `tier_drop` (`bond` | `chemistry`) joins them on a turn
-  whose refused action dropped that line.
+  whose refused action dropped that line; `growth_scale` (`0.5`) joins them
+  on a turn whose positive growth was halved by the slowdown after a
+  separation. A life choice's own `life_choice` row has a `context` of
+  `life_choice` and `choice_id` instead (see
+  [above](#life-choice-drops-and-the-slowdown)).
 - `user_message_id` (migration `0056`) — a real FK to `chat_messages`,
   `ON DELETE SET NULL`. `NULL` on `proactive`/`time_decay` rows and on
   pre-migration rows; never backfilled. Assistant rows point at the same
@@ -448,6 +495,10 @@ Each delta turn appends one row to `engine.companion_affinity_events`:
 - `state_after` — the whole post-turn vector (migration `0049`).
   `state_before` exists but is not served; replay is a direct query
   against `engine.companion_affinity_events`.
+
+`event_type` is `message`, `ghost`, `gift`, `proactive`, `time_decay` or
+`life_choice`. The last two are not turns: the per-turn delta route reads
+`message`, `gift`, `proactive` and `ghost` only.
 
 ### API surfaces
 
@@ -549,7 +600,10 @@ env override could break.
 - `crates/eros-engine-core/src/scope.rs` — `AffinityScope` / `MemoryScope`,
   `length_score` (see [`affinity.rs` vs `scope.rs`](#affinityrs-vs-scopers))
 - `crates/eros-engine-store/src/affinity.rs` — `AffinityRepo`
-  (persist_with_event, record_ghost), migrations 0048–0049
+  (persist_with_event, record_ghost, persist_life_choice_drop_in_tx,
+  last_judged_patiences), migrations 0048–0049, 0077
+- `crates/eros-engine-store/src/life_choices.rs` — `LifeChoiceRepo`
+  (the choice rows; `growth_slowed` derives the slowdown window)
 - `crates/eros-engine-server/src/pipeline/post_process.rs` — LLM
   evaluation, grade/level parsing
 - `crates/eros-engine-server/src/prompt.rs` — affinity → attitude directive
@@ -564,3 +618,5 @@ env override could break.
   stored tier columns, event state snapshots, the value endpoint
 - Design spec: `docs/superpowers/specs/2026-10-05-chat-user-actions-design.md` —
   user actions, the judge's response, the tier drop
+- Design spec: `docs/superpowers/specs/2026-10-19-life-events-shopping-gatherings-and-ask-for-space-design.md` —
+  the ask-for-space choice, its double tier drop and the growth slowdown

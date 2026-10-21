@@ -2,7 +2,8 @@
 
 - **Date:** 2026-10-19
 - **Status:** Approved
-- **Type:** Engine change. One migration (`engine.life_choices`). Additive
+- **Type:** Engine change. Two migrations (`engine.life_choices`; the affinity
+  `event_type` check widened by one value, `life_choice`). Additive
   API changes (five drawable kinds, two non-drawable kinds, a `life_choice`
   field on the affinity delta, one new endpoint).
   `eros-engine-core::events` gains seven `EventKind` variants (breaks
@@ -141,11 +142,16 @@ all of these hold, read from the committed, time-decayed state:
 - **Clear runway:** the session has no pending un-expired choice, and
   the instance has no `taking_space` event under way. (An offline
   stretch silences the judge anyway, so no trigger can fire inside one.)
+- **Session:** a 1:1 text session of a genome instance. A BYOC session never
+  triggers: the resolution endpoint refuses BYOC, so an ask there could never
+  be answered.
 
 While a choice is pending and un-expired, the events route draws nothing
 for the instance (`{"event": null, "message": null}`, like an incident
 under way): the ask is itself the foreground drama, and it keeps an
-offline stretch from starting mid-question. An ordinary incident that was
+offline stretch from starting mid-question. (A repeat of an `event_key` that
+already drew still returns its event: the replay reads the stored row before
+the pending check.) An ordinary incident that was
 already under way when the ask fired (she can be `reading` on a judged
 turn) keeps running; §3.4 says what happens to it at resolution.
 
@@ -245,7 +251,8 @@ four paths:
   doing; a background (trip, sickness) keeps running underneath.
 - The tier drop (below), recorded as an affinity event of a new
   non-turn `event_type = 'life_choice'` with
-  `context.life_choice = "accept"`.
+  `context.life_choice = "accept"` and `context.choice_id`. Migration `0077`
+  widens the table's `event_type` CHECK by this one value.
 
 Then her goodbye is generated through the proactive path (an ordinary
 proactive row, `metadata.proactive = 'life_choice'`) and returned:
@@ -269,10 +276,14 @@ slowdown. Her hurt reply is generated and returned:
 while the choice is pending and un-expired resolves it: status →
 `ignored`, and a `fell_out` event row (label 为分开的事闹得不愉快, an
 incident shaped like `quarrel`: 1 hour, not offline, no message of its
-own) is written in the same transaction, before the turn runs — so the
+own) is written in the same transaction, before the turn runs. The clock is
+the user row's `sent_at`, not the wall clock of the turn: only a message sent
+after the ask (`asked_at <= sent_at`) converts it, so a message already in
+flight when the ask landed answers nothing, and a queued or re-driven turn
+reads the same. The `fell_out` row starts at that `sent_at`. So the
 very turn that ignored her is answered with the falling-out in
 `[近期事件]` and `正在经历`. An incident still under way from before the
-ask is capped to now in that transaction, as on accept: the falling-out
+ask is capped to that `sent_at` in that transaction, as on accept: the falling-out
 displaces it, and the one-incident invariant holds. **No tier change**:
 the judge sees the context and rates the turn itself. An **action turn** (a give, a tip, a
 kiss) does not resolve the choice; it is answered by its own rules and
@@ -293,7 +304,9 @@ line lands at the same relative position one tier down, its two axes
 scaled by the same factor; a tier-1 line goes to 0. Both lines' pending
 deltas are cleared. Applied at resolution time, atomically with it — on
 accept the drop is the state she comes back to; nothing further happens
-at return.
+at return. The drop is computed from the snapshot after time decay and the
+endpoint refresh, so the drop functions take the deployment's affinity
+tuning.
 
 **The slowdown (accept only).** For 72 hours after the separation ends,
 every **positive** effective delta on the four line axes is halved before

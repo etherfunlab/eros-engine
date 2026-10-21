@@ -986,8 +986,10 @@ pub struct EventLines {
     /// `正在经历`: the background and the foreground under way, rendered by
     /// `events_reply_text`.
     pub under_way: Option<String>,
-    /// `刚才`: an offline stretch this session has not been told about and a
-    /// false alarm not yet resolved here, rendered by `just_now_text`.
+    /// `刚才`: an offline stretch this session has not been told about, the
+    /// return of a separation she asked for (marked whether or not the user
+    /// wrote during it) and a false alarm not yet resolved here, rendered by
+    /// `just_now_text`.
     pub just_now: Option<String>,
 }
 

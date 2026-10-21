@@ -107,7 +107,7 @@ pub enum EventKind {
 }
 
 impl EventKind {
-    /// Every kind, in draw order.
+    /// Every drawable kind, in draw order.
     pub const ALL: [EventKind; 43] = [
         EventKind::PoliceEncounter,
         EventKind::AnimalEncounter,

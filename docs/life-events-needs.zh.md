@@ -5,7 +5,8 @@
 角色有自己的一天，有两类状态跟着这一天走。**需求**是四项基本水平（饥饿、社交欲、体力、情感需求），
 由 PDE 判官评定，由 engine 随时间往前推。**生活事件**是发生在她身上的事，调用方来要的时候才抽：
 一趟出差、一场病、路上遇到的一只流浪猫、一个小时没看手机。两者都以平实的当前事实交给判官和回复，
-都不告诉她该怎么表现；例外是本身就是沉默的事件（离线类种类）。
+都不告诉她该怎么表现；例外是本身就是沉默的事件（离线类种类）。两者之上还有第三件事：关系磨薄了，她可以提出先分开一阵，
+这是第一个**生活选择**（见[提出分开的选择](#提出分开的选择)）。
 
 请求与响应的形状见 [api-reference.zh.md](api-reference.zh.md)，判官的上下文和 verdict 见
 [model-config.zh.md](model-config.zh.md#taskspde_decision--opt-in-llm-pde-判断器)。
@@ -118,7 +119,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 
 ### 类别
 
-事件共 38 种，每一种属于一个类别，类别决定它的形态：
+可抽取的事件共 43 种，每一种属于一个类别，类别决定它的形态：
 
 | `category` | 形态 | 持续 | 类别权重 | 类别冷却 |
 |---|---|---|---|---|
@@ -134,12 +135,17 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 
 时长写成区间的，在事件开始时按整小时均匀抽定。
 
+另有两种永远不会被抽到：`taking_space`（说好暂时分开）和 `fell_out`（为分开的事闹得不愉快）。
+她提出先分开一阵、用户作答或不作答时，由 engine 自己写入（见[提出分开的选择](#提出分开的选择)）。
+它们按形态是 `mid` 插曲，其中 `taking_space` 超出了这个类别的 4 小时：它持续 12 到 24 小时。
+它们没有抽取规则，调用方的 `kinds` 也拒绝它们。
+
 ### 抽取
 
 抽取是输入加三个随机数（两段各一个，时长一个）的纯函数。
 
 1. **资格。** 一个种类同时满足下面几条才有资格：
-   - 调用方的 `kinds` 允许它（[见下](#调用方的-kinds)；不带表示全部 38 种）；
+   - 调用方的 `kinds` 允许它（[见下](#调用方的-kinds)；不带表示全部 43 种）；
    - 过了它的门槛（见下）；
    - 它自己的冷却已过；
    - 它所属类别的冷却已过；
@@ -162,8 +168,11 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 - 有背景在进行时，不会抽第二个背景，插曲照抽；只是住院（`hospitalized`）和术后（`post_surgery`）期间，
   需要她出门活动的那几种不抽：`temp_work`、`police_encounter`、`animal_encounter`、`hit_someone`、
   `got_hit`、`working_out`、`grocery_shopping`、`in_class`、`on_the_way`、`in_battle`、`got_bumped`、
-  `bumped_someone`。`period` 期间，
+  `bumped_someone`、`saw_bag`、`saw_clothes`、`out_shopping`、`bros_gathering`、`sis_gathering`。
+  `period` 期间，
   不抽 `period_scare` 与 `pregnancy_scare`。
+- 她在等用户回答自己提出的分开请求时，同样完全不抽，角色的任何一个 session 都一样：这个请求本身就是前台戏，
+  也免得一段离线时段在问话中间开始。带着已经抽过的 `event_key` 来重复调用，照样返回那个事件。
 - 一件插曲和一个背景可以同时进行。背景里抽到的插曲，是从背景里讲出来的。
 - 这以角色实例为单位，跨它所有的 session：她只有一段人生。抽取会读该实例最近 90 天的事件，也就是最长的那个冷却。
 
@@ -176,7 +185,8 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
   `post_surgery` 90 天）。四个 `trip` 种类自己没有冷却，由类别冷却管。
 - **按类别。**`body` 每两周最多开始一次，`trip` 每周最多开始一次，不论具体是哪个种类。`short` 与 `mid` 没有。
 - **离线类共享。** 任何一个离线类种类开始后的 12 小时里，所有离线类种类都没有资格，不论刚才是哪一个；
-  各自的冷却照样适用。它限制她沉默的频率，就像类别冷却限制出行和身体状态的频率。
+  各自的冷却照样适用。它限制她沉默的频率，就像类别冷却限制出行和身体状态的频率。一次被接受的分开同样会启动它；
+  `out_shopping` 只对被它带进离线的角色才算离线类种类。
 - **按 key。** 同一个 session 里同一个 `event_key` 返回同一个事件，不抽取，也不生成。
 - **不设总量上限。** engine 不限制调用方多久来要一次。频率由冷却加上调用方自己的策略决定。要生成消息的抽取会占一个
   单用户并发名额，所有 LLM 入口共用这个上限（到上限返回 `429`）。
@@ -189,10 +199,13 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 |---|---|
 | `ex_message`、`breakup` | 亲密度档 2 及以上 |
 | `sudden_desire` | 亲密度档 3 |
-| `period` | 角色的 `art_metadata.gender` 为 `"female"` |
+| `period`、`saw_bag`、`saw_clothes` | 角色的 `art_metadata.gender` 为 `"female"` |
 | `period_scare` | 角色的 `art_metadata.gender` 为 `"female"`，并且亲密度档 2 及以上 |
 | `pregnancy_scare` | 角色的 `art_metadata.gender` 为 `"female"`，并且亲密度档 3 |
-| `away_from_phone`、`busy`、`in_battle`、`asleep` | ghost 保护允许（见[下文](#离线类)） |
+| `away_from_phone`、`busy`、`in_battle`、`asleep`、`bros_gathering`、`sis_gathering`，以及女性角色的 `out_shopping` | ghost 保护允许（见[下文](#离线类)） |
+
+`out_shopping` 和两个聚会没有性别门槛：谁会因此离线、为什么两种性别都会抽到两个聚会，见
+[逛街与聚会](#逛街与聚会)。
 
 档位（1 到 3）读自该 session 的好感度，和聊天回合一样先做时间衰减；见 [affinity-model.zh.md](affinity-model.zh.md)。
 
@@ -217,7 +230,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 
 | `kinds` | 可以抽的种类 |
 |---|---|
-| 不带或 `null` | 全部 38 种 |
+| 不带或 `null` | 全部 43 种 |
 | `[]` | 一种都不抽：响应是 `{"event": null, "message": null}` |
 | `["reading", "quarrel"]` | 只抽列出的 |
 | `{"allow": […], "disallow": […]}` | `allow` 允许的，去掉 `disallow` 列出的 |
@@ -225,7 +238,8 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 对象里，`allow` 不带或为 `null` 表示全部允许，`[]` 表示一种都不允许；`disallow` 不带、为 `null` 或 `[]` 都不去掉任何种类；
 两边都列了的种类不抽。只写 `{"disallow": […]}` 就能排除种类而不冻结其余种类，engine 以后新增的种类也会照常抽取。
 对象里出现未知的键，或任何地方出现未知种类，请求都会被拒绝，所以拼错的 `disallow` 不会悄悄放出本想排除的种类；
-代价是调用方要等 engine 认识某个新种类之后才能列它。
+代价是调用方要等 engine 认识某个新种类之后才能列它。`taking_space` 和 `fell_out` 永远不会被抽到，
+所以在 `kinds` 的任何位置写它们，都按同样的方式被拒绝。
 
 有两种带成人题材：`sudden_desire`，以及隐含性行为的 `pregnancy_scare`。engine 不内建这类分组；只对部分用户提供这类内容的调用方，
 把它们列进 `disallow`。`scolded_by_superior` 与 `scolded_superior` 假定她有上级，在她的世界里读作老板、上司、领导、主人或君主；
@@ -240,8 +254,8 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 
 ### 她怎么讲出来
 
-每种事件都由一条主动消息讲出来，除了 `away_from_phone`、`asleep`，以及亲密度档 2 以下的 `busy` 和
-`in_battle`（见[下文](#离线类)）。这条消息走和回复同一条 companion 模型路径
+每种事件都由一条主动消息讲出来，除了 `away_from_phone`、`asleep`、两个聚会，以及亲密度档 2 以下的 `busy`、
+`in_battle` 和女性角色的 `out_shopping`（见[下文](#离线类)）。这条消息走和回复同一条 companion 模型路径
 （角色设定、历史窗口、记忆召回、`[now]`），不经过判官，不流式，也没有用户消息行。engine 在请求末尾补一条舞台提示，
 作为最后一条 `user` 消息。提示不落库。它只陈述事实，不下指令：
 
@@ -277,7 +291,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 
   不到一小时的跨度读作 `不到 1 小时`（结束那一半此时不带 `约`）；不满 48 小时按整小时四舍五入；
   从 48 小时起按整天四舍五入。`{label}` 是每个种类固定的中文名（`reading` 是 `在看书`，`long_trip` 是
-  `长途旅游`）。没有进行中的事件、没有未解释的离线时段、也没有未交代的虚惊（见下）时，这一行不出现。
+  `长途旅游`）。没有进行中的事件、没有未解释的离线时段、没有等着标记归来的分开、也没有未交代的虚惊（见下）时，这一行不出现。
 - **回复**在 `[now]` 块里得到 `- 正在经历：`，排在时间、节日和生日几行之后，列出同样两件事，只写结束时间；
   下文的 `- 刚才：` 行紧跟其后。两行都不在 `[character_state]` 里：那个块的表头让位于它上面的块，
   放在那里，事件开始之前写下的故事摘要就会盖过事件：
@@ -294,25 +308,40 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 
 ### 离线类
 
-四个种类会让角色联系不上，直到它们结束：`away_from_phone`、`busy`、`in_battle`、`asleep`。离线是事件持续期间她的行为方式，
-不是类别：`busy` 按时长属于 `mid`，按行为属于离线。四者的门槛、沉默、例外和事后的解释都相同；
+七个可抽取的种类会让角色联系不上，直到它们结束：`away_from_phone`、`busy`、`in_battle`、`asleep`、`bros_gathering`、
+`sis_gathering`，以及只对女性角色生效的 `out_shopping`。离线是事件持续期间她的行为方式，
+不是类别：`busy` 按时长属于 `mid`，按行为属于离线。它们的门槛、沉默、例外和事后的解释都相同；
 区别只在措辞，以及她讲不讲出来。`in_battle` 的措辞让她的世界观决定它是什么：现代角色把它读成一场艰难的谈判、
-一顿商务宴请或一件难办的事，历史或奇幻角色把它读成一场真正的战斗。各种类及其时长见
+一顿商务宴请或一件难办的事，历史或奇幻角色把它读成一场真正的战斗。engine 自己写入的 `taking_space` 对所有角色都是离线，
+走的是同一套机制（见[提出分开的选择](#提出分开的选择)）。各种类及其时长见
 [events 路由](api-reference.zh.md#post-v2compsessionsession_idevents)。
 
-**讲出来，还是沉默。** 亲密度档 2 及以上，`busy` 和 `in_battle` 像其他种类一样用一条主动消息讲出来，
+**讲出来，还是沉默。** 哪些种类算离线、开始时讲不讲：
+
+| 种类 | 谁会离线 | 讲不讲 |
+|---|---|---|
+| `away_from_phone`、`asleep` | 所有角色 | 从不讲 |
+| `busy`、`in_battle` | 所有角色 | 亲密度档 2 起讲；以下沉默 |
+| `out_shopping` | 女性角色；其他角色照常回复 | 女性角色档 2 起讲、以下沉默；其他角色每一档都讲，是一件普通的插曲 |
+| `bros_gathering`、`sis_gathering` | 所有角色 | 从不讲；事后由她解释 |
+| `taking_space` | 所有角色 | 不由抽取产生；分开的流程里由她道别 |
+
+亲密度档 2 及以上，`busy`、`in_battle` 和女性角色的 `out_shopping` 像其他种类一样用一条主动消息讲出来，
 舞台提示只陈述事实：
 
 ```
 （你接下来要忙一阵，这段时间顾不上看手机。）
 （你接下来要去打一场硬仗，一段时间顾不上手机。）
+（你接下来要出门逛街，这段时间顾不上看手机。）
 ```
 
-档 2 以下，她一声不吭地沉默下去。`asleep` 和 `away_from_phone` 从不讲出来。讲述的那条消息为空或生成失败，
+档 2 以下，她一声不吭地沉默下去。讲述的那条消息为空或生成失败，
 什么都不写，和任何要讲述的种类一样。
 
 **抽到。** 她不讲的种类不调模型。事件行写入时 `message_id` 为 NULL，`started_at` 是调用的时刻，响应带着事件，
-`"message": null`。离线类种类只在角色可以沉默的地方才抽，所以抽取要过两道借自 ghost 保护的门槛。被挡住的抽取只是把
+`"message": null`。`out_shopping` 算不算离线取决于角色，凡是由离线与否推出的一切都跟着这个答案走：
+对不会被它带进离线的角色，它没有门槛、没有沉默，事后也没有解释。离线类种类只在角色可以沉默的地方才抽，
+所以抽取要过两道借自 ghost 保护的门槛。被挡住的抽取只是把
 离线类种类从允许的种类里拿掉，其他种类照常抽：
 
 - 部署的 ghosting 开关关闭时不抽（`[tasks.pde_decision]` 上 `ghosting = false`）；
@@ -322,7 +351,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 离线类种类还共享一个冷却（见[冷却与上限](#冷却与上限)）。
 
 **持续期间。** 角色任何一个 session 里的每一轮 1:1 文字消息都会被 ghost，不经过判官，也不经过 ghost 打分。
-已经讲出来的 `busy` 或 `in_battle` 同样让轮次沉默。
+已经讲出来的 `busy`、`in_battle` 或 `out_shopping` 同样让轮次沉默。
 
 - 用户那一行被标记为已 ghost。它没有已读回执，因为没有判官读过它，角色解释之后也依然没有。
 - 不调用 `record_ghost`：`ghost_streak`、`total_ghosts`、`last_ghost_at` 都不动，判官自己的 ghost 否决也不受影响。
@@ -342,7 +371,7 @@ ghosting 开关关闭时，已经在进行的一段不会让任何轮次沉默�
 
 **事后。** 解释是推算出来的，不存标记。在 session `S` 里，某一时刻若满足下面三条，离线事件 `E` 就是未解释的：
 
-- `E` 是该实例最近 90 天内已经结束的离线类事件（任何离线类种类）里最新的一次；
+- `E` 是该实例最近 90 天内已经结束的事件里最新的一次，种类是任何会把这个角色带进离线的种类；
 - `S` 里有一行用户消息，在 `E` 的时间窗内被 ghost；
 - `S` 里在 `E` 结束之后没有写过带文字的 assistant 消息（只有图的回复不算）。
 
@@ -350,12 +379,17 @@ ghosting 开关关闭时，已经在进行的一段不会让任何轮次沉默�
 文字是这个种类自己的：是什么让她联系不上，以及对方那时发来的消息她现在才看到。
 判官的 `[近期事件]` 行末尾会多一项 `{label}（{span}前结束，期间对方的消息你没有回）`，比如
 `睡着了（2 小时前结束，期间对方的消息你没有回）`。`E` 结束后写下的第一行带文字的 assistant 消息终结它，只有图的回复不算。窗内角色写过的回复
-（动作轮次的那种）不算，`busy` 或 `in_battle` 开始时讲的那条消息也不算：它写在事件开始的时候，早于结束。
+（动作轮次的那种）不算，`busy`、`in_battle` 或 `out_shopping` 开始时讲的那条消息也不算：它写在事件开始的时候，早于结束。
 每个种类的文字见 [model-config.zh.md](model-config.zh.md#taskspde_decision--opt-in-llm-pde-判断器)。
 
 ```
 - 刚才：睡着了，对方那时发来的消息你现在才看到
 ```
+
+两个聚会从不事先讲出来，所以由这里来交代：`去了兄弟聚会，对方那时发来的消息你现在才看到` 与
+`去了姐妹聚会，对方那时发来的消息你现在才看到`，判官那一行的后缀是
+`兄弟聚会（{span}前结束，期间对方的消息你没有回）` 及其对应的姐妹版。女性角色的 `out_shopping` 读作
+`在逛街，对方那时发来的消息你现在才看到`。分开自有两种说法（见[归来](#归来)）。
 
 ### 虚惊
 
@@ -390,6 +424,48 @@ ghosting 开关关闭时，已经在进行的一段不会让任何轮次沉默�
 - 刚才：睡着了，对方那时发来的消息你现在才看到；以为月经没来，后来来了，是虚惊一场
 ```
 
+### 逛街与聚会
+
+五个种类给她一段属于自己的时间，也给亲近的关系添一样可以想要的东西：
+
+| 种类 | 标签 | 类别 | 权重 | 冷却 | 持续 | 门槛 |
+|---|---|---|---|---|---|---|
+| `saw_bag` | 看中了一个包 | `short` | 2 | 48 小时 | 1 小时 | 女性 |
+| `saw_clothes` | 看中了一件衣服 | `short` | 2 | 48 小时 | 1 小时 | 女性 |
+| `out_shopping` | 在逛街 | `mid` | 2 | 24 小时 | 2 到 4 小时 | 无 |
+| `bros_gathering` | 兄弟聚会 | `mid` | 1 | 72 小时 | 2 到 4 小时 | 无 |
+| `sis_gathering` | 姐妹聚会 | `mid` | 1 | 72 小时 | 2 到 4 小时 | 无 |
+
+女性门槛读 `art_metadata.gender`，也就是 `period` 已经在用的那个键。没有任何需求系数作用在它们身上，三个 `mid` 种类
+和其他 `mid` 种类一样可以写进 `prefer_events`。五个都在住院（`hospitalized`）和术后（`post_surgery`）期间排除：她那时不在外面走动。
+
+**两个小发现。** `saw_bag` 和 `saw_clothes` 是普通的、会讲出来的插曲。亲密度档 1 时，这只是日常的一点质感，仅此而已。
+从档 2 起，她可以直说自己想要；有 `tip_personality` 的角色用那份人格的口吻说，也就是打赏动作收尾时用的同一种口吻。
+想要之后会不会有下文，是下游的事，engine 只负责把场景摆出来。舞台提示陈述事实，`{p}` 是角色的 `tip_personality`（去掉首尾空白）。
+`saw_bag` 的提示：
+
+| 亲密度档 | 提示 |
+|---|---|
+| 1 | `（你在逛街，随手看到一个挺好看的包。）` |
+| 2 及以上，没有 `tip_personality` | `（你在逛街，看到一个特别喜欢的包，很想要。）` |
+| 2 及以上，有 `tip_personality` | `（你在逛街，看到一个特别喜欢的包，很想要。代入你「{p}」的打赏人格，把这份心动告诉对方。）` |
+
+`saw_clothes` 同理，把「一个」「包」换成「一件」「衣服」。
+
+**`out_shopping`。** 只对女性角色离线；其他角色逛街时手机还在手里，照常回复。女性角色从档 2 起讲出来，
+档 2 以下一声不吭地沉默（不调模型，`message_id` 为 NULL，`"message": null`）。不会被它带进离线的角色在每一档都讲它：
+
+```
+（你正在外面逛街。）
+```
+
+**两个聚会。** 两种性别都会抽到 `bros_gathering` 和 `sis_gathering`，权重相同，抽取里任何地方都没有性别系数。
+这是有意为之：它读起来是平等，而撞上的那些场面本身就是内容，男性角色去了姐妹聚会，正是用户会追问的事。
+两个聚会对所有角色都是离线，也从不事先讲出来：她和自己的朋友在一起，没有看手机，事后通过上文那条未解释的离线行来交代。
+不想要这些的部署，像对其他种类一样把它们列进 `disallow`。
+
+**为什么有离线事件。** 会消失的角色有自己的生活，不会围着用户转。角色正在聚会的用户，有理由去找另一个角色说话。
+
 ### 与 `/open` 的关系
 
 事件消息算作会话里有人说过话，所以同一个当地日期里，生日和节日开场白都不会跟在它后面。事件消息落库时，
@@ -405,6 +481,8 @@ ghosting 开关关闭时，已经在进行的一段不会让任何轮次沉默�
 - 消息是 `engine.chat_messages` 的一行，带 `metadata.proactive = 'event'`；事件的种类和时间在 `persona_events` 里。
 - 需求存在被评定的用户消息行上，键为 `metadata.needs`，配一个部分索引（`chat_messages_needs_idx`），让读取最新评定
   对每个 session 都是一次索引探测。
+- `taking_space` 和 `fell_out` 和其他事件一样是 `persona_events` 的一行，`message_id` 为 NULL；写下它们的那次选择在
+  `engine.life_choices` 里（见[选择存在哪](#选择存在哪)）。
 
 ## 两者如何互相影响
 
@@ -438,6 +516,151 @@ ghosting 开关关闭时，已经在进行的一段不会让任何轮次沉默�
 
 合在一起，两者构成一个以判官为中心的回路：饿着的角色更可能正在外面买菜；这件事进入判官的上下文；判官再评一次饥饿。
 
+## 提出分开的选择
+
+chemistry 比 bond 高出两档、她的耐心又连续三个被判官评过的回合被磨低，这段关系就失衡了：心动跑在交情前面，而她累了。
+她提出想先分开一阵。这是第一个**生活选择**：一个真实的请求，每一条路都有真实的代价，由上面那套机制搭起来：
+她的请求是一条主动消息，分开是一段离线事件，用户的回答走一个端点。更完整的 `life_choices` 系统
+（更多种类的选择、可配置的后果）不在这个流程之内。
+
+### 她什么时候提出
+
+engine 在每一轮 affinity 评估已经落库的 1:1 文字回合结束时检查（即*被判官评过的回合*：affinity 评估器跑过、verdict 落了库，
+不管部署有没有配置 PDE 判官），时间在落库之后。下面几条同时满足时她提出，读的是已落库、做过时间衰减的状态：
+
+- **差距。** chemistry 的档位减去 bond 的档位至少为 2，按两条五档的阶梯算。有符号：只有 chemistry 高于 bond 才算。
+- **耐心。** 推算出的 `patience` 在这一轮和之前两个被判官评过的回合都低于 0.5。评估被跳过或失败的回合既不计数也不打断。
+  各轮的值读自该 session 的好感度回合事件（`state_after.patience`），不另存；0.5 是 engine 自己的规则阈值，不是判官的档。
+- **新的连续。** 三个回合都在该 session 最新一次选择之后，不论那次有没有被回答。提出一次就用掉这段连续：
+  下一次要三个新的被判官评过的回合。
+- **跑道清空。** 该 session 没有待回答的选择，角色也没有正在进行的分开（`taking_space`）。
+- **合适的 session。** 角色是 genome 角色的 1:1 文字 session。语音 session 不会触发、送达或结算选择，群聊根本不写好感度，
+  BYOC session 从不触发，因为结算端点不服务 BYOC。
+
+触发是 engine 对已落库状态做的数学，没有判官参与。除了这些机制之外没有别的冷却。用户一直重新造出这个条件，她就一直问：
+下面的降档同时压低两条线，所以只有 bond 到了第 1 档（第 1 档的线不能再降，而 chemistry 还能降），或者用户把 bond 养上来，
+差距才会合上。重复的提问，是关系一直失衡的自然后果。
+
+### 她的请求与送达
+
+触发之后，依次发生：
+
+1. **她的话。** companion 对话模型走和事件消息相同的主动消息路径生成这个请求（角色设定、历史窗口、记忆召回、`[now]`；
+   没有判官，不流式，没有用户消息行）。舞台提示是最后一条 `user` 消息，不落库：
+
+   ```
+   （这段关系最近让你很累：心动还在，但交情和耐心都被磨薄了。你决定郑重地告诉对方：你想先分开一阵子，希望对方给你一个答复。）
+   ```
+
+   这条消息是一行普通的 assistant 消息，`assistant_action_type = 'proactive'`、`metadata.proactive = 'life_choice'`，
+   在调用已读接口之前一直是未读，不跑 post-process。
+2. **选择这一行。** `engine.life_choices` 里的一行，和她的消息在同一个事务里写入：种类 `ask_for_space`，状态 `pending`，
+   此刻的档位差距（2 到 4），`asked_at` 就是这条消息的 `sent_at`。待回答的窗口是 24 小时；过期时刻是
+   `asked_at` 加 24 小时，推算出来，不存。
+
+回复为空、被规则剥到一无所剩，或生成失败，什么都不写：没有消息，没有选择行，之后符合条件的回合还可以再问。这个检查排在这一轮
+post-process 的最后，在好感度落库和 feeling 摘要之后，所以它的生成不会拖慢这两件事，这一轮自己的好感度写入（状态加事件行，一个事务）
+也不受影响。
+
+选择待回答且未过期期间，events 路由对这个角色什么都不抽。她提出时已经在进行的插曲照样跑到回答出来为止；接受或不理会会把它截断。
+
+**送达。** 通知搭在逐轮的好感度 delta 查询上，即
+[`GET /bff/v1/comp/affinity/{session_id}/event`](api-reference.zh.md#get-bffv1compaffinitysession_idevent)。
+它的 `event` 对象多一个可选字段 `life_choice`（`id`、`kind`、`options`、`asked_at`、`expires_at`、`message_id`），
+在响应时按该 session 待回答、未过期的选择现场拼出，没有时不带。请求落在触发那一轮的事件落库之后几秒，所以这一轮自己放行的那次查询
+通常赶不上它：适配过的客户端读到 `metadata.proactive = 'life_choice'` 的主动消息时，应当重新拉一次 delta。
+降档产生的好感度事件不会从这条路由返回，客户端不会遇到不认识的 `event_type`；新的状态在结算响应里带回，
+别的设备从绝对值路由读。
+
+**降级本身就是设计。** 没有适配的下游会忽略这个不认识的字段，把请求当成一条普通的主动消息渲染，用户用文字回复。
+这就是下面的"不理会"那条路。什么都不会坏；选择的界面完全是增量。
+
+### 用户的回答
+
+回答是 `POST /v2/comp/session/{session_id}/life-choices/{choice_id}`，带 `{"response": "accept" | "decline"}`
+（[接口参考](api-reference.zh.md#post-v2compsessionsession_idlife-choiceschoice_id)），也可以是用户自己的话，或者沉默。
+
+| 路径 | 怎么发生 | 选择的状态 | 降档 | 分开 | 她说的话 |
+|---|---|---|---|---|---|
+| 接受 | 端点，`accept` | `accepted` | 有 | `taking_space`，缺口每一档 6 小时 | 生成的道别 |
+| 拒绝 | 端点，`decline` | `declined` | 有 | 无 | 生成的受伤回应 |
+| 不理会 | 待回答期间用户的第一条普通消息 | `ignored` | 无 | 无；一小时的 `fell_out` 插曲 | 没有专门的一条：这一轮带着这场不愉快回复 |
+| 过期 | 24 小时内既没回答也没发消息 | 仍为 `pending`，读作已过期 | 无 | 无 | 无 |
+
+**接受。** 同一个事务里：选择变为 `accepted`；`taking_space` 事件（说好暂时分开）从此刻开始，持续时长是提出时存下的档位差距每一档
+6 小时（差距 2、3、4 对应 12、18、24 小时）；执行降档。正在进行的插曲在这一刻结束，她放下手头的事；背景（出行、生病）
+在底下照常进行。然后生成她的道别并返回，是一行普通的主动消息，`metadata.proactive = 'life_choice'`：
+
+```
+（对方同意了你提出的分开请求，接下来 {n} 小时你们不联系。你跟对方道别。）
+```
+
+`{n}` 是这段分开的小时数。道别生成失败或为空，结算、事件和降档照样保留：选择已经做出。
+
+**拒绝。** 同一个事务里执行同样的降档，没有事件，也没有放缓。生成她受伤的回应并返回：
+
+```
+（对方不同意你提出的分开请求，你心里不好受。）
+```
+
+**不理会。** 选择待回答期间到达的第一条普通用户文字消息就是回答：状态变为 `ignored`，并且在同一个事务里、在这一轮运行之前，
+写入一条 `fell_out` 事件（为分开的事闹得不愉快，形态像 `quarrel` 的插曲：一小时，不离线，没有自己的消息）。所以正是这一条不理会她的消息，
+它的回复已经能在 `[近期事件]` 和 `正在经历` 里读到这场不愉快。正在进行的插曲在此被截断，和接受时一样：这场不愉快取代它，
+一次一件插曲的规则不破。不改任何档位；判官看到这个上下文，自己给这一轮打分。时钟看的是用户那一行的 `sent_at`：
+只有在她提出之后发出的消息才会触发（提出时已经在路上的那条不算回答），排队或被重新驱动的回合读到的结果相同。
+**动作轮次**（give、打赏、亲吻）不算回答：它按自己的规则回复，请求仍然待回答，因为她等着的时候收到礼物，是在示好，不是在回答。
+`/open` 开场白和 reaction 都不会让它结算。
+
+**过期。** 24 小时内既没有回答、也没有消息，选择就此失效。它在表里的状态仍是 `pending`，但处处读作已过期：delta 上的字段不再附带，
+端点返回 `409`，之后的消息也不会转成 `fell_out`。没有任何代价；之后再提出，需要重新满足完整的触发条件。
+
+结算和一条进来的用户消息按事务竞争。先写入的赢，输的一方什么都不写（端点返回 `409`）。
+
+### 代价
+
+**降档（接受和拒绝）。** bond 和 chemistry 各降一档，按被拒动作的落点规则分别作用在每条线上：这条线落在下一档内的相同相对位置，
+两个轴按同一比例缩放，第 1 档的线直接归 0。两条线的 `pending_deltas` 都清零。降档在结算的那一刻、与结算同一个事务里应用：
+接受之后，降档就是她归来时的状态，归来时不再有别的事发生。好感度事件和它的 context 键见
+[affinity-model.zh.md](affinity-model.zh.md#生活选择的降档与放缓)。
+
+**放缓（只在接受时）。** 分开结束之后的 72 小时内，四个线轴上每一个为正的实际增量在落库前减半。负增量照常全额应用，
+推算出来的 `warmth` 和 `patience` 不缩放。它只作用于这次选择所在的 session：代价是这段关系的，和降档一样，
+同一角色的其他 session 什么都不付。窗口是通过选择行推算出来的（`life_choices.event_id` 指向的 `taking_space` 行，
+从它的 `ends_at` 到 `ends_at` 加 72 小时）：不新增状态，按墙钟而不是回合数算，所以用户晚些才回来，它照样在跑。
+返回的 `effective_deltas` 如实显示减半后的值。
+
+### 分开期间
+
+`taking_space` 是一种不可抽取的离线插曲，整套照搬[离线类](#离线类)的机制：
+
+- 角色任何一个 session 里的每一轮 1:1 文字消息都被 ghost，不经过判官：`meta(ghost)`、`done`、`final`；不评定需求，不写 ghost 连续次数。
+- 动作轮次和强制出图的轮次是例外，和任何离线时段一样。
+- `/open` 返回 `null`。
+- 它进行期间不抽任何事件，并且启动共享的 12 小时离线冷却。
+- 它和每一行 `persona_events` 一样按实例算：她只有一段人生，说好分开，就是她的手机在哪里都放下了。
+
+ghosting 开关关闭时它不让任何轮次沉默，和任何离线时段一样；降档、放缓和归来那一行都不依赖这个开关。分开期间发来的消息和任何离线时段一样被 ghost，
+也不会再转换成什么，因为选择已经结算。分开进行期间，`正在经历` 和例外的动作轮次读到它的标签是说好暂时分开。
+
+### 归来
+
+不论哪种情况，归来都会被交代。标准的“未解释”规则需要窗口内有一行被 ghost 的用户消息，但守约的用户什么也不会发，
+而她仍然得把归来标出来，否则这条弧线就断了。所以在这次选择所在的 session 里，`taking_space` 从它的 `ends_at` 起算未解释，
+直到其后的第一行带文字的 assistant 消息，不论有没有被 ghost 的行；措辞随用户在窗口内有没有发过消息而定。她的道别写在分开开始的时候，
+所以不会终结归来。该角色的其他 session 用标准的被 ghost 行规则，用第一种措辞。
+
+| 用户 | `- 刚才：` | 判官一行的后缀 |
+|---|---|---|
+| 窗口内发过消息 | `你们之前说好分开一阵，现在时间到了；对方那时发来的消息你现在才看到` | `说好暂时分开（{span}前结束，期间对方的消息你没有回）` |
+| 守约 | `你们之前说好分开一阵，现在时间到了，你们重新开始联系` | `说好暂时分开（{span}前结束，对方等到了约定之后）` |
+
+### 选择存在哪
+
+`engine.life_choices` 每次选择一行：`session_id`（非空，随 session 级联删除）、`kind`、`status`（`pending`、`accepted`、
+`declined`、`ignored`）、`tier_gap`、`asked_at`、`resolved_at`、`message_id`（那条请求；消息没了就置为 NULL）和
+`event_id`（接受时写下的 `taking_space` 行，其他路径为 NULL；事件没了就置为 NULL）。过期和放缓的窗口都是推算出来的，不存。
+分开和不愉快那两行和其他事件一样在 `engine.persona_events` 里。
+
 ## 没有 LLM 判官时
 
 | | 没有 `[tasks.pde_decision].filter_prompt` |
@@ -448,19 +671,26 @@ ghosting 开关关闭时，已经在进行的一段不会让任何轮次沉默�
 | `正在经历` 与 `刚才` | 照常进入回复、`/open` 开场白和事件消息 |
 | `[近期事件]` | 不渲染：没有判官来读它 |
 | 离线类种类 | 和有判官时一样让轮次沉默，因为这个检查在判官之前：ghosting 开关以及动作、强制出图两种例外照样适用 |
+| 提出分开 | 不变：触发读的是 affinity 评估器评过的回合，不是 PDE 判官 |
 
 ## 代码指引
 
 - `crates/eros-engine-core/src/needs.rs`：水平、漂移常量、`carried`。
-- `crates/eros-engine-core/src/events.rs`：类别和种类、每个种类的规则、门槛、需求与角色系数、`draw`、`lookback`。
+- `crates/eros-engine-core/src/events.rs`：类别和种类、每个种类的规则、门槛、需求与角色系数、`is_offline` 与 `is_told`、`draw`、`lookback`。
 - `crates/eros-engine-server/src/routes/session_events.rs`：events 路由、抽取的输入、离线类的两道门槛。
-- `crates/eros-engine-server/src/pipeline/proactive.rs`：事件消息、它的舞台提示和写入。
+- `crates/eros-engine-server/src/routes/life_choices.rs`：结算端点。
+- `crates/eros-engine-server/src/routes/bff/affinity.rs`：delta 上的 `life_choice` 字段。
+- `crates/eros-engine-server/src/pipeline/proactive.rs`：事件消息和选择相关的消息、它们的舞台提示和写入（`kind_cue`、`find_cue`）。
+- `crates/eros-engine-server/src/pipeline/life_choice.rs`：触发与她的请求、不理会的转换、放缓的读取。
 - `crates/eros-engine-server/src/pipeline/stream.rs::run_stream`：需求的读取与写入、`[需求]` 与 `[近期事件]` 两行
   （`build_pde_ctx`）、判官之前的 offline 分支、`body_state_frame`。
 - `crates/eros-engine-server/src/prompt.rs`：`needs_line`、`events_judge_text`、`events_reply_text`、
   `just_now_text`、`persona_traits`、`[character_state]` 里的各行，以及 `[now]` 里的事件行。
 - `crates/eros-engine-server/src/routes/session_effects.rs`：`GET …/effects`。
 - `crates/eros-engine-server/src/pipeline/voice.rs`：bootstrap 里的需求。
-- `crates/eros-engine-store/src/events.rs::EventRepo`：`insert`、`by_key`、`recent`、`current`、`unexplained_offline`、`unresolved_scare`。
+- `crates/eros-engine-store/src/events.rs::EventRepo`：`insert`、`insert_preempting_in_tx`、`by_key`、`recent`、`current`、`unexplained_offline`、`unreturned_separation`、`unresolved_scare`。
+- `crates/eros-engine-store/src/life_choices.rs::LifeChoiceRepo`：选择行、`pending`、`resolve_in_tx`、`growth_slowed`。
+- `crates/eros-engine-store/src/affinity.rs::AffinityRepo`：`persist_life_choice_drop_in_tx`、`last_judged_patiences`。
 - `crates/eros-engine-store/src/chat.rs::ChatRepo`：`set_needs` 与 `latest_needs`。
 - `crates/eros-engine-store/migrations/0070_chat_messages_needs_idx.sql` 与 `0072_persona_events.sql`：索引和表。
+- `crates/eros-engine-store/migrations/0076_life_choices.sql` 与 `0077_affinity_event_life_choice.sql`：选择表，以及放宽后的 affinity `event_type` 检查。

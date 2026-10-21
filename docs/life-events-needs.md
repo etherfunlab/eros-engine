@@ -7,7 +7,9 @@ basic levels (hunger, social, stamina, emotional) that the PDE judge rates and t
 carries forward in time. **Life events** are things that happen to her, drawn when a
 caller asks: a trip, an illness, a stray cat, an hour away from her phone. Both reach the
 judge and the reply as plain facts in the present tense. Neither tells her how to behave;
-the exception is an event that is silence (the offline kinds).
+the exception is an event that is silence (the offline kinds). A third piece sits on top of
+both: when a relationship has worn thin she can ask for a break, the first *life choice*
+([the ask-for-space choice](#the-ask-for-space-choice)).
 
 Request and response shapes are in [api-reference.md](api-reference.md), the judge's
 context and verdict in
@@ -141,7 +143,7 @@ the levels and decides.
 
 ### Categories
 
-An event is one of 38 kinds. Each kind belongs to a category, and the category sets its
+An event is one of 43 drawable kinds. Each kind belongs to a category, and the category sets its
 shape:
 
 | `category` | shape | lasts | category weight | category cooldown |
@@ -161,13 +163,19 @@ cooldowns and ranges are in `rule`, and the category values in `category_rule`, 
 
 A duration written as a range is drawn uniformly in whole hours when the event starts.
 
+Two more kinds are never drawn: `taking_space` (说好暂时分开) and `fell_out`
+(为分开的事闹得不愉快). The engine writes them itself when she asks for space and the
+user answers or ignores her ([the ask-for-space choice](#the-ask-for-space-choice)). They are
+`mid` incidents by shape, and `taking_space` is the one that outlasts the category's four
+hours: it lasts 12 to 24. They have no draw rule and the caller's `kinds` rejects them.
+
 ### The draw
 
 The draw is a pure function of the inputs plus three random numbers (one per stage, one for
 the length).
 
 1. **Eligibility.** A kind is eligible when all of these hold:
-   - the caller's `kinds` allows it ([below](#the-callers-kinds); absent means all 38);
+   - the caller's `kinds` allows it ([below](#the-callers-kinds); absent means all 43);
    - it passes its gate (below);
    - its own cooldown has elapsed;
    - its category's cooldown has elapsed;
@@ -196,10 +204,14 @@ eligible kind drops out of the first stage and the others share its weight.
   that during `hospitalized` and `post_surgery` the ones that need her out and about are not:
   `temp_work`, `police_encounter`, `animal_encounter`, `hit_someone`, `got_hit`,
   `working_out`, `grocery_shopping`, `in_class`, `on_the_way`, `in_battle`, `got_bumped`,
-  `bumped_someone`. During `period`,
+  `bumped_someone`, `saw_bag`, `saw_clothes`, `out_shopping`, `bros_gathering`,
+  `sis_gathering`. During `period`,
   `period_scare` and `pregnancy_scare` are not drawn.
 - One incident and one background can run together. An incident drawn inside a background is
   told from inside it.
+- While she waits for the user's answer to her ask for space, no draw happens either, in any
+  session of the persona: the ask is the foreground drama, and it keeps an offline stretch from
+  starting mid-question. A repeat of an `event_key` that already drew still returns its event.
 - This is per persona instance across all its sessions: she has one life. A draw reads the
   instance's events of the last 90 days, the longest cooldown there is.
 
@@ -216,7 +228,9 @@ is under way, and a background is not written while any event is.
   a week, whichever kinds are involved. `short` and `mid` have none.
 - **Shared by the offline kinds.** For 12 hours after any offline kind started, no offline kind
   is eligible, whichever kind it was; each kind's own cooldown still applies. It bounds how often
-  she goes silent, the way the category cooldowns bound trips and body states.
+  she goes silent, the way the category cooldowns bound trips and body states. An accepted
+  separation starts it too, and `out_shopping` counts as an offline kind only for a persona it
+  takes offline.
 - **Per key.** The same `event_key` in the same session returns the same event with no draw
   and no generation.
 - **Not capped.** The engine sets no limit on how often a caller may ask. Frequency is the
@@ -232,10 +246,14 @@ weight and never lifts a gate.
 |---|---|
 | `ex_message`, `breakup` | intimacy rung 2 or higher |
 | `sudden_desire` | intimacy rung 3 |
-| `period` | the persona's `art_metadata.gender` is `"female"` |
+| `period`, `saw_bag`, `saw_clothes` | the persona's `art_metadata.gender` is `"female"` |
 | `period_scare` | the persona's `art_metadata.gender` is `"female"`, and intimacy rung 2 or higher |
 | `pregnancy_scare` | the persona's `art_metadata.gender` is `"female"`, and intimacy rung 3 |
-| `away_from_phone`, `busy`, `in_battle`, `asleep` | the ghost protections allow it (see [below](#offline-kinds)) |
+| `away_from_phone`, `busy`, `in_battle`, `asleep`, `bros_gathering`, `sis_gathering`, and `out_shopping` for a female persona | the ghost protections allow it (see [below](#offline-kinds)) |
+
+`out_shopping` and the two gatherings have no gender gate: [Shopping and
+gatherings](#shopping-and-gatherings) says who goes offline and why both genders draw both
+gatherings.
 
 The rung (1 to 3) is read from the session's affinity, time-decayed as in a chat turn; see
 [affinity-model.md](affinity-model.md).
@@ -264,7 +282,7 @@ policy, rules a kind out without the engine losing it.
 
 | `kinds` | kinds that may be drawn |
 |---|---|
-| absent or `null` | all 38 |
+| absent or `null` | all 43 |
 | `[]` | none: the response is `{"event": null, "message": null}` |
 | `["reading", "quarrel"]` | the listed ones |
 | `{"allow": […], "disallow": […]}` | what `allow` allows, minus what `disallow` lists |
@@ -274,7 +292,8 @@ In the object, `allow` absent or `null` allows every kind and `[]` none; `disall
 kinds out without freezing the rest, so a kind the engine adds later is drawn too. An unknown
 key in the object or an unknown kind anywhere rejects the request, so a misspelt `disallow`
 cannot quietly serve a kind it meant to exclude; a caller lists a new kind only once the
-engine knows it.
+engine knows it. `taking_space` and `fell_out` are never drawn, so naming one anywhere in
+`kinds` is rejected the same way.
 
 Two kinds carry adult themes: `sudden_desire`, and `pregnancy_scare`, which implies sex. The
 engine keeps no group of them; a caller that serves them only to some users lists them under
@@ -293,8 +312,9 @@ is refused with `409 wrong_channel`.
 
 ### How she tells it
 
-Every kind is told in one proactive message, except `away_from_phone`, `asleep`, and `busy` and
-`in_battle` below intimacy rung 2 ([below](#offline-kinds)). It is generated by the
+Every kind is told in one proactive message, except `away_from_phone`, `asleep`, the two
+gatherings, and `busy`, `in_battle` and a female persona's `out_shopping` below intimacy rung 2
+([below](#offline-kinds)). It is generated by the
 same companion model path as a reply (persona, history window, memory recall, `[now]`), with
 no judge, no streaming and no user row. The engine adds a stage cue as the final `user` turn
 of the request. The cue is never persisted. It states a fact and carries no instruction:
@@ -342,8 +362,8 @@ The events under way at a moment are the background and the incident whose
   A span under one hour reads `不到 1 小时` (and the end then drops the `约`); under 48 hours it
   is whole hours, rounded; from 48 hours it is whole days, rounded. `{label}` is a fixed
   Chinese name per kind (`reading` is `在看书`, `long_trip` is `长途旅游`). The line is absent
-  when nothing is under way, no offline stretch is unexplained and no false alarm is
-  unresolved (below).
+  when nothing is under way, no offline stretch is unexplained, no separation awaits its return
+  mark and no false alarm is unresolved (below).
 - **The reply** gets `- 正在经历：` under `[now]`, after the time, holiday and birthday lines,
   listing the same two events with only the end. The `- 刚才：` line below follows it. Both sit
   outside `[character_state]`, whose header defers to the blocks above it, so a story digest
@@ -364,31 +384,48 @@ again sees the same ones.
 
 ### Offline kinds
 
-Four kinds make the persona unreachable while they last: `away_from_phone`, `busy`,
-`in_battle` and `asleep`. Offline is how she behaves while the event lasts, not a category:
-`busy` is `mid` by length and offline by behaviour. The four share the same gates, the same
+Seven drawable kinds make a persona unreachable while they last: `away_from_phone`, `busy`,
+`in_battle`, `asleep`, `bros_gathering`, `sis_gathering` and, for a female persona only,
+`out_shopping`. Offline is how she behaves while the event lasts, not a category:
+`busy` is `mid` by length and offline by behaviour. They share the same gates, the same
 silence, the same exemptions and the same explanation afterwards; they differ in wording and
 in whether she announces them. `in_battle` is worded so that her world decides what it is: a
 modern persona reads it as a hard negotiation, a business dinner or a difficult matter, a
-historical or fantasy persona as a real fight. The kinds and their durations are in
+historical or fantasy persona as a real fight. The engine's own `taking_space` is offline for
+every persona and rides the same machinery ([the ask-for-space
+choice](#the-ask-for-space-choice)). The kinds and their durations are in
 [the events route](api-reference.md#post-v2compsessionsession_idevents).
 
-**Announced or silent.** At intimacy rung 2 and up, `busy` and `in_battle` are told in one
-proactive message like any other kind, with a stage cue that states the fact:
+**Announced or silent.** Which kinds are offline, and which are told when they start:
+
+| kind | who goes offline | told |
+|---|---|---|
+| `away_from_phone`, `asleep` | every persona | never |
+| `busy`, `in_battle` | every persona | from intimacy rung 2; silent below |
+| `out_shopping` | a female persona; any other persona keeps replying | a female persona from rung 2 and silent below; any other persona at every rung, as an ordinary incident |
+| `bros_gathering`, `sis_gathering` | every persona | never; she explains afterwards |
+| `taking_space` | every persona | not by the draw; the ask-for-space flow has her say goodbye |
+
+At intimacy rung 2 and up, `busy`, `in_battle` and a female persona's `out_shopping` are told in
+one proactive message like any other kind, with a stage cue that states the fact:
 
 ```
 （你接下来要忙一阵，这段时间顾不上看手机。）
 （你接下来要去打一场硬仗，一段时间顾不上手机。）
+（你接下来要出门逛街，这段时间顾不上看手机。）
 ```
 
-Below rung 2 she goes quiet without a word. `asleep` and `away_from_phone` are never
-announced. A blank or failed announcement writes nothing, as for any told kind.
+Below rung 2 she goes quiet without a word. A blank or failed announcement writes nothing, as
+for any told kind.
 
 **Drawn.** For a kind she does not announce there is no model call. The event row is written
 with `message_id` NULL and `started_at` at the moment of the call, and the response carries the
-event with `"message": null`. An offline kind is drawn only where the persona may go silent,
-so the draw applies two gates borrowed from the ghost protections. A gated draw leaves the
-offline kinds out of the allowed kinds and the others draw as usual:
+event with `"message": null`. Whether `out_shopping` is offline depends on the persona, and
+everything that follows from offline-ness follows that answer: for a persona it does not take
+offline it has no gates, no silence and no explanation afterwards. An offline kind is drawn
+only where the persona may go silent, so the draw applies two gates borrowed from the ghost
+protections. A gated draw leaves the offline kinds out of the allowed kinds and the others draw
+as usual:
 
 - not while the deployment's ghosting switch is off (`ghosting = false` on
   `[tasks.pde_decision]`);
@@ -399,7 +436,7 @@ silences the persona's turns in every session. The offline kinds also share one 
 (see [Cooldowns and caps](#cooldowns-and-caps)).
 
 **While it lasts.** Every 1:1 text turn of the persona, in any session, ghosts without the
-judge and without the ghost score. An announced `busy` or `in_battle` still ghosts.
+judge and without the ghost score. An announced `busy`, `in_battle` or `out_shopping` still ghosts.
 
 - The user's row is marked ghosted. It carries no read receipt, because no judge read it, and
   still carries none after she explains.
@@ -424,8 +461,8 @@ normal path and the `正在经历` line still lists it. The rest of the mechanic
 **Afterwards.** The explanation is derived, not flagged. In a session `S`, an offline event
 `E` is unexplained at a moment when:
 
-- `E` is the instance's newest offline event, of any offline kind, that has ended, within the
-  last 90 days;
+- `E` is the instance's newest event that has ended, within the last 90 days, of any kind that
+  takes this persona offline;
 - `S` holds a user row that was ghosted inside `E`'s window;
 - `S` holds no assistant row with text written since `E` ended (an image-only reply does not
   count).
@@ -436,13 +473,19 @@ her away, and that she only now sees what was sent. The judge's `[近期事件]`
 `{label}（{span}前结束，期间对方的消息你没有回）`, such as
 `睡着了（2 小时前结束，期间对方的消息你没有回）`. The first assistant row with text written
 after `E` ended closes it; an image-only reply does not. A reply the persona wrote inside the window (an action turn) does not, and
-neither does the announcement of `busy` or `in_battle`: it was written when the event started,
-before it ended. The text of every kind is in
+neither does the announcement of `busy`, `in_battle` or `out_shopping`: it was written when the
+event started, before it ended. The text of every kind is in
 [model-config.md](model-config.md#taskspde_decision--opt-in-llm-pde-judge).
 
 ```
 - 刚才：睡着了，对方那时发来的消息你现在才看到
 ```
+
+The gatherings are never announced, so this is where she accounts for them:
+`去了兄弟聚会，对方那时发来的消息你现在才看到` and `去了姐妹聚会，对方那时发来的消息你现在才看到`,
+with the judge's suffix `兄弟聚会（{span}前结束，期间对方的消息你没有回）` and its twin. A female
+persona's `out_shopping` reads `在逛街，对方那时发来的消息你现在才看到`. The engine's separation
+has two wordings of its own ([below](#the-return)).
 
 ### False alarms
 
@@ -485,6 +528,57 @@ items in the same order:
 - 刚才：睡着了，对方那时发来的消息你现在才看到；以为月经没来，后来来了，是虚惊一场
 ```
 
+### Shopping and gatherings
+
+Five kinds give her an afternoon of her own and, for a close relationship, something to want:
+
+| kind | label | category | weight | cooldown | lasts | gate |
+|---|---|---|---|---|---|---|
+| `saw_bag` | 看中了一个包 | `short` | 2 | 48 h | 1 h | female |
+| `saw_clothes` | 看中了一件衣服 | `short` | 2 | 48 h | 1 h | female |
+| `out_shopping` | 在逛街 | `mid` | 2 | 24 h | 2 to 4 h | none |
+| `bros_gathering` | 兄弟聚会 | `mid` | 1 | 72 h | 2 to 4 h | none |
+| `sis_gathering` | 姐妹聚会 | `mid` | 1 | 72 h | 2 to 4 h | none |
+
+The female gate reads `art_metadata.gender`, the key `period` already uses. No needs factor
+touches them, and the three `mid` kinds join `prefer_events`' vocabulary like any `mid` kind.
+All five are ruled out during `hospitalized` and `post_surgery`: she is not out and about.
+
+**The finds.** `saw_bag` and `saw_clothes` are ordinary told incidents. At intimacy rung 1 the
+find is daily-life texture and nothing more. From rung 2 she is allowed to want it out loud,
+and a persona with a `tip_personality` says so in that register, the same one the tip action
+closes on. Whether anything comes of the wanting is the downstream's business; the engine only
+sets the scene. The stage cue states the fact, and `{p}` is the persona's `tip_personality`,
+trimmed. The cues of `saw_bag`:
+
+| intimacy rung | cue |
+|---|---|
+| 1 | `（你在逛街，随手看到一个挺好看的包。）` |
+| 2 and up, no `tip_personality` | `（你在逛街，看到一个特别喜欢的包，很想要。）` |
+| 2 and up, with one | `（你在逛街，看到一个特别喜欢的包，很想要。代入你「{p}」的打赏人格，把这份心动告诉对方。）` |
+
+`saw_clothes` is the same with 一件 and 衣服 where `saw_bag` has 一个 and 包.
+
+**`out_shopping`.** Offline only for a female persona; any other persona wanders the shops with
+her phone in hand and keeps replying. A female persona announces it from rung 2 and goes quiet
+without a word below it (no model call, `message_id` NULL, `"message": null`). A persona it does
+not take offline tells it at every rung:
+
+```
+（你正在外面逛街。）
+```
+
+**The gatherings.** Both genders draw both `bros_gathering` and `sis_gathering`, at the same
+weight, and there is no gender factor anywhere in the draw. This is deliberate: it reads as
+equality, and the collisions are content, since a male persona at a 姐妹聚会 is exactly what a
+user asks about. Both gatherings are offline for every persona and never announced: she is with
+her people and not looking at her phone, and explains afterwards through the unexplained-offline
+line above. A deployment that wants none of this lists them under `disallow`, like any kind.
+
+**Why offline events exist.** A persona who goes dark has a life of her own and does not orbit
+the user. A user whose companion is away at a gathering has a reason to talk to another
+character.
+
 ### Next to `/open`
 
 An event's message counts as a message for the `/open` birthday and holiday check, so neither
@@ -505,6 +599,8 @@ offline kind is under way.
   event's kind and times live in `persona_events`.
 - Needs live on the rated user row, as `metadata.needs`, with a partial index
   (`chat_messages_needs_idx`) that keeps the newest-rating read an index probe per session.
+- `taking_space` and `fell_out` are rows of `persona_events` like any other, with `message_id`
+  NULL; the choice that wrote them lives in `engine.life_choices` ([below](#where-the-choice-is-stored)).
 
 ## How the two interact
 
@@ -545,6 +641,201 @@ Put together, the two form a loop with the judge in the middle: a hungry persona
 to be out buying groceries; the event reaches the judge's context; the judge rates hunger
 again.
 
+## The ask-for-space choice
+
+When chemistry has run two tiers past bond and her patience has been worn low for three judged
+turns running, the relationship is lopsided: passion ahead of friendship, and she is tired. She
+asks for a break. It is the first *life choice*, a real request with a real cost on every path,
+and it is built from the machinery above: her ask is a proactive message, the break is an
+offline event, and the user answers through one endpoint. The fuller `life_choices` system (more
+kinds of choice, configurable consequences) is not part of this flow.
+
+### When she asks
+
+The engine checks at the end of every 1:1 text turn whose affinity evaluation committed (a
+*judged turn*: the affinity evaluator ran and its verdict landed, whether or not the deployment
+runs the PDE judge), after the commit. She asks when all of these hold, read from the
+committed, time-decayed state:
+
+- **Gap.** Chemistry tier minus bond tier is at least 2, on the two five-tier ladders. Signed:
+  only chemistry above bond counts.
+- **Patience.** The derived `patience` is below 0.5 on this turn and on the two judged turns
+  before it. A turn whose evaluation was skipped or failed neither counts nor breaks the run.
+  The values are read from the session's affinity turn events (`state_after.patience`), not
+  stored anew; 0.5 is a rule threshold the engine owns, not a judge band.
+- **Fresh streak.** All three turns come after the session's newest choice, answered or not.
+  Asking consumes the streak: the next ask needs three fresh judged turns.
+- **Clear runway.** The session has no pending choice, and the persona has no separation
+  (`taking_space`) under way.
+- **The right session.** A 1:1 text session of a genome persona. A voice session never
+  triggers, delivers or resolves a choice, and a group session writes no affinity at all. A BYOC
+  session never triggers one, because the resolution endpoint refuses BYOC.
+
+The trigger is engine math over committed state; no judge takes part. There is no cooldown
+beyond these mechanics. If the user keeps recreating the condition she keeps asking: the tier
+drop below lowers both lines, so the gap closes only once bond is at tier 1 (a tier-1 line
+cannot drop further while chemistry still can) or the user raises bond. Repeated asks are the
+consequence of a relationship kept lopsided.
+
+### Her ask and its delivery
+
+When the trigger fires, in order:
+
+1. **Her words.** The companion chat model generates the request through the same proactive
+   path as an event message (persona, history window, memory recall, `[now]`; no judge, no
+   streaming, no user row). The stage cue is the final `user` turn and is never persisted:
+
+   ```
+   （这段关系最近让你很累：心动还在，但交情和耐心都被磨薄了。你决定郑重地告诉对方：你想先分开一阵子，希望对方给你一个答复。）
+   ```
+
+   The message is an ordinary assistant row, `assistant_action_type = 'proactive'`,
+   `metadata.proactive = 'life_choice'`, unread until the read call, with no post-process.
+2. **The choice row.** One row in `engine.life_choices`, written in the same transaction as her
+   message: kind `ask_for_space`, status `pending`, the tier gap at this moment (2 to 4), and
+   `asked_at`, which is the message's `sent_at`. The pending window is 24 hours; the expiry is
+   `asked_at` plus 24 hours, derived and never stored.
+
+A blank or stripped-empty generation, or a failed one, writes nothing: no message, no choice
+row, and a later qualifying turn may ask again. The check runs last in the turn's post-process,
+after the affinity commit and the feeling clause, so its generation delays neither, and the
+turn's own affinity write (state and event row, one transaction) is untouched.
+
+While a choice is pending and unexpired, the events route draws nothing for the persona. An
+incident that was already under way when she asked keeps running until the answer; an accept or
+an ignore caps it.
+
+**Delivery.** The notification rides the per-turn affinity delta fetch,
+[`GET /bff/v1/comp/affinity/{session_id}/event`](api-reference.md#get-bffv1compaffinitysession_idevent).
+Its `event` object gains one optional field, `life_choice` (`id`, `kind`, `options`,
+`asked_at`, `expires_at`, `message_id`), composed at serve time from the session's pending,
+unexpired choice and absent otherwise. The ask lands seconds after the triggering turn's event
+commits, so the fetch the turn itself releases usually misses it: an adapted client re-fetches
+the delta when it reads a proactive message with `metadata.proactive = 'life_choice'`. The
+tier-drop affinity event is not served on this route, so a client never meets an unknown
+`event_type`; the new state comes back in the resolution response, and any other device reads
+it from the absolute affinity route.
+
+**Degradation is the design.** A downstream that has not adapted ignores the unknown field and
+renders the ask as an ordinary proactive message, and its user replies in words. That is the
+ignore path below. Nothing breaks; the choice UI is strictly additive.
+
+### The user's answer
+
+The answer is `POST /v2/comp/session/{session_id}/life-choices/{choice_id}` with
+`{"response": "accept" | "decline"}`
+([API reference](api-reference.md#post-v2compsessionsession_idlife-choiceschoice_id)),
+or the user's own words, or silence.
+
+| path | how it happens | choice status | tier drop | separation | her words |
+|---|---|---|---|---|---|
+| accept | the endpoint, `accept` | `accepted` | yes | `taking_space`, 6 h per tier of the gap | a generated goodbye |
+| decline | the endpoint, `decline` | `declined` | yes | none | a generated hurt reply |
+| ignore | the first ordinary user message while it is pending | `ignored` | no | none; a one-hour `fell_out` incident | none of its own: the turn is answered with the falling-out in view |
+| lapse | 24 hours with no answer and no message | stays `pending`, reads as expired | no | none | none |
+
+**Accept.** In one transaction the choice becomes `accepted`, a `taking_space` event
+(说好暂时分开) starts now and lasts 6 hours per tier of the gap stored at ask time (gap 2, 3, 4:
+12, 18, 24 hours), and the tier drop is applied. An incident under way ends at that moment, as
+she drops what she was doing; a background (a trip, an illness) keeps running underneath. Then
+her goodbye is generated and returned, as an ordinary proactive row with
+`metadata.proactive = 'life_choice'`:
+
+```
+（对方同意了你提出的分开请求，接下来 {n} 小时你们不联系。你跟对方道别。）
+```
+
+`{n}` is the separation's length in hours. A failed or empty goodbye still leaves the
+resolution, the event and the drop in place: the choice was made.
+
+**Decline.** The same tier drop in the same transaction, no event and no slowdown. Her hurt
+reply is generated and returned:
+
+```
+（对方不同意你提出的分开请求，你心里不好受。）
+```
+
+**Ignore.** The first ordinary user text message that arrives while the choice is pending
+resolves it: the status becomes `ignored`, and a `fell_out` event (为分开的事闹得不愉快, an
+incident shaped like `quarrel`: one hour, not offline, no message of its own) is written in the
+same transaction, before the turn runs. The very turn that ignored her is therefore answered
+with the falling-out in `[近期事件]` and `正在经历`. An incident under way is capped there, as
+on accept: the falling-out displaces it, and the one-incident rule holds. No tier changes; the
+judge sees the context and rates the turn itself. The clock is the user row's `sent_at`: only a
+message sent after her ask converts it (one already in flight when the ask landed answers
+nothing), and a queued or re-driven turn reads the same. An **action turn** (a give, a tip, a
+kiss) does not resolve the choice: it is answered by its own rules and the ask stays pending, as
+a gift while she waits is an attempt to mend, not an answer. `/open` greetings and reactions
+resolve nothing.
+
+**Lapse.** With no answer and no message for 24 hours the choice simply lapses. Its status stays
+`pending` in the table and reads as expired everywhere: the delta field stops being attached,
+the endpoint answers `409`, and a later message does not convert to `fell_out`. There is no
+cost; a later ask needs the full trigger again.
+
+A resolution and an incoming user message race transactionally. The first writer wins and the
+loser writes nothing (the endpoint answers `409`).
+
+### The costs
+
+**The tier drop (accept and decline).** Bond and chemistry each drop one tier, by the
+rejected-action landing rule applied to each line: the line lands at the same relative position
+one tier down, its two axes scaled by the same factor, and a tier-1 line goes to 0. Both lines'
+pending deltas are cleared. It is applied at resolution time, atomically with it: on accept the
+drop is the state she comes back to, and nothing further happens at return. The affinity event
+and its context keys are in [affinity-model.md](affinity-model.md#life-choice-drops-and-the-slowdown).
+
+**The slowdown (accept only).** For 72 hours after the separation ends, every positive effective
+delta on the four line axes is halved before commit. Negative deltas apply in full, and the
+derived `warmth` and `patience` are not scaled. It applies in the choice's session only: the
+cost is that relationship's, like the drop, and another session of the same persona pays
+nothing. The window is derived through the choice row (`life_choices.event_id`, the
+`taking_space` row's `ends_at`, to `ends_at` plus 72 hours): no new state, wall-clock rather than
+turn count, so it runs even if the user only returns later. The returned `effective_deltas` show
+the halved values.
+
+### The separation
+
+`taking_space` is a non-drawable offline incident and reuses [the offline
+machinery](#offline-kinds) wholesale:
+
+- Every 1:1 text turn of the persona, in any session, ghosts without the judge: `meta(ghost)`,
+  `done`, `final`; no needs rating, no ghost-streak write.
+- Action turns and forced-image turns are exempt, as for any offline stretch.
+- `/open` returns `null`.
+- No event is drawn while it is under way, and it starts the shared 12-hour offline cooldown.
+- It is instance-scoped like every `persona_events` row: she has one life, and taking space
+  means her phone is down everywhere.
+
+With the ghosting switch off it silences nothing, like any offline stretch; the drop, the
+slowdown and the return line do not depend on the switch. Messages sent during the separation
+ghost as in any offline stretch and convert nothing, because the choice is already resolved.
+While it lasts, `正在经历` and the exempt action turns read it as 说好暂时分开.
+
+### The return
+
+The return is acknowledged either way. The standard unexplained rule needs a ghosted user row
+inside the window, but a user who honours the break sends nothing, and she must still mark the
+return or the arc fizzles. So in the choice's session, `taking_space` is unexplained from its
+`ends_at` until the first assistant row with text after it, ghosted rows or none, and the
+wording follows whether the user wrote during the window. Her goodbye was written when the
+separation started, so it does not close the return. The persona's other sessions use the
+standard ghosted-row rule with the first wording.
+
+| the user | `- 刚才：` | judge suffix |
+|---|---|---|
+| wrote during the window | `你们之前说好分开一阵，现在时间到了；对方那时发来的消息你现在才看到` | `说好暂时分开（{span}前结束，期间对方的消息你没有回）` |
+| honoured the break | `你们之前说好分开一阵，现在时间到了，你们重新开始联系` | `说好暂时分开（{span}前结束，对方等到了约定之后）` |
+
+### Where the choice is stored
+
+`engine.life_choices` holds one row per choice: `session_id` (non-null, cascades with the
+session), `kind`, `status` (`pending`, `accepted`, `declined`, `ignored`), `tier_gap`,
+`asked_at`, `resolved_at`, `message_id` (the ask; set to NULL if the message goes) and
+`event_id` (the `taking_space` row an accept wrote, NULL on every other path; set to NULL if
+the event goes). Expiry and the slowdown window are derived, never stored. The separation and
+falling-out rows live in `engine.persona_events` like any event.
+
 ## Without the LLM judge
 
 | | Without `[tasks.pde_decision].filter_prompt` |
@@ -555,16 +846,21 @@ again.
 | `正在经历` and `刚才` | reach replies, `/open` greetings and event messages |
 | `[近期事件]` | not rendered: there is no judge to read it |
 | Offline kinds | silence turns as with the judge, since the check runs before it: the ghosting switch and the action and forced-image exemptions apply |
+| The ask for space | unchanged: the trigger reads the affinity evaluator's judged turns, not the PDE judge |
 
 ## Code pointers
 
 - `crates/eros-engine-core/src/needs.rs`: the levels, the drift constants, `carried`.
 - `crates/eros-engine-core/src/events.rs`: categories and kinds, per-kind rules, gates, the
-  needs and persona factors, `draw`, `lookback`.
+  needs and persona factors, `is_offline` and `is_told`, `draw`, `lookback`.
 - `crates/eros-engine-server/src/routes/session_events.rs`: the events route, the draw's
   inputs, the offline gates.
-- `crates/eros-engine-server/src/pipeline/proactive.rs`: the event message, its cue and its
-  write.
+- `crates/eros-engine-server/src/routes/life_choices.rs`: the resolution endpoint.
+- `crates/eros-engine-server/src/routes/bff/affinity.rs`: the `life_choice` field on the delta.
+- `crates/eros-engine-server/src/pipeline/proactive.rs`: the event message and the choice's
+  messages, their cues and their write (`kind_cue`, `find_cue`).
+- `crates/eros-engine-server/src/pipeline/life_choice.rs`: the trigger and her ask, the ignore
+  conversion, the slowdown read.
 - `crates/eros-engine-server/src/pipeline/stream.rs::run_stream`: the needs read and write, the
   `[需求]` and `[近期事件]` lines (`build_pde_ctx`), the offline branch ahead of the judge,
   `body_state_frame`.
@@ -573,8 +869,16 @@ again.
   event lines under `[now]`.
 - `crates/eros-engine-server/src/routes/session_effects.rs`: `GET …/effects`.
 - `crates/eros-engine-server/src/pipeline/voice.rs`: the bootstrap's needs.
-- `crates/eros-engine-store/src/events.rs::EventRepo`: `insert`, `by_key`, `recent`, `current`,
-  `unexplained_offline`, `unresolved_scare`.
+- `crates/eros-engine-store/src/events.rs::EventRepo`: `insert`, `insert_preempting_in_tx`,
+  `by_key`, `recent`, `current`, `unexplained_offline`, `unreturned_separation`,
+  `unresolved_scare`.
+- `crates/eros-engine-store/src/life_choices.rs::LifeChoiceRepo`: the choice rows, `pending`,
+  `resolve_in_tx`, `growth_slowed`.
+- `crates/eros-engine-store/src/affinity.rs::AffinityRepo`: `persist_life_choice_drop_in_tx`,
+  `last_judged_patiences`.
 - `crates/eros-engine-store/src/chat.rs::ChatRepo`: `set_needs` and `latest_needs`.
 - `crates/eros-engine-store/migrations/0070_chat_messages_needs_idx.sql` and
   `0072_persona_events.sql`: the index and the table.
+- `crates/eros-engine-store/migrations/0076_life_choices.sql` and
+  `0077_affinity_event_life_choice.sql`: the choices table and the widened affinity
+  `event_type` check.
