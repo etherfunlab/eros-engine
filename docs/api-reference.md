@@ -1194,7 +1194,7 @@ reply after a decline), persisted like any reply and returned:
 ```json
 {"status": "accepted",
  "message": {"message_id": "…", "content": "好，那我们先各自安静一下。", "sent_at": "2026-10-20T12:00:00Z", "occasion": "life_choice"},
- "affinity": {"bond_tier": 2, "chem_tier": 3, "bond_label": "friend", "chemistry_label": "crush", "…": "…"},
+ "affinity": {"bond_tier": 1, "chem_tier": 3, "bond_label": "acquaintance", "chemistry_label": "crush", "…": "…"},
  "event": {"kind": "taking_space", "category": "mid", "offline": true, "started_at": "2026-10-20T12:00:00Z", "ends_at": "2026-10-21T06:00:00Z", "message_id": null}}
 ```
 

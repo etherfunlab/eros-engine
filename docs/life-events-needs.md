@@ -785,9 +785,10 @@ pending deltas are cleared. It is applied at resolution time, atomically with it
 drop is the state she comes back to, and nothing further happens at return. The affinity event
 and its context keys are in [affinity-model.md](affinity-model.md#life-choice-drops-and-the-slowdown).
 
-**The slowdown (accept only).** For 72 hours after the separation ends, every positive effective
-delta on the four line axes is halved before commit. Negative deltas apply in full, and the
-derived `warmth` and `patience` are not scaled. It applies in the choice's session only: the
+**The slowdown (accept only).** For 72 hours after the separation ends, every positive committed
+delta on the four line axes is halved before it is applied; the cut part is dropped, not parked in
+`pending_deltas`. Negative deltas apply in full, and the derived `warmth` and `patience` are not
+scaled. It applies in the choice's session only: the
 cost is that relationship's, like the drop, and another session of the same persona pays
 nothing. The window is derived through the choice row (`life_choices.event_id`, the
 `taking_space` row's `ends_at`, to `ends_at` plus 72 hours): no new state, wall-clock rather than

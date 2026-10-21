@@ -711,9 +711,9 @@ When any accepted `give` is still at work, the engine also adds a `[身体状态
 | `period_scare` | `月经没来` | `以为月经没来，后来来了，是虚惊一场` |
 | `pregnancy_scare` | `验出怀孕` | `验出两条杠，后来复查是虚惊一场` |
 
-The kinds with no aftermath text carry their label alone while they last: `看中了一个包` (`saw_bag`), `看中了一件衣服` (`saw_clothes`) and `为分开的事闹得不愉快` (`fell_out`, the one-hour falling-out when the user ignores her ask for space).
+The kinds with no aftermath text have no row above: `看中了一个包` (`saw_bag`), `看中了一件衣服` (`saw_clothes`) and `为分开的事闹得不愉快` (`fell_out`, the one-hour falling-out when the user ignores her ask for space). While they last, their label appears in the usual `[近期事件]` and `- 正在经历：` lines.
 
-**Stage cues of the new kinds and the ask for space.** Like every event message, these are the final `user` turn of the generation request. The engine owns them and they are not persisted. `{p}` is the persona's `tip_personality`, trimmed; the rung is the session's intimacy rung. The gatherings are never told and have no cue.
+**Stage cues of the new kinds and the ask for space.** Like every event message, these are the final `user` turn of the generation request. The engine owns them and they are not persisted. `{p}` is the persona's `tip_personality`, trimmed; the rung is the session's intimacy rung. The gatherings are never told and have no cue. The cues of the older kinds are documented in [life-events-needs.md](life-events-needs.md#how-she-tells-it), [Offline kinds](life-events-needs.md#offline-kinds) and [False alarms](life-events-needs.md#false-alarms); this table covers only the new kinds and the ask for space.
 
 | What she tells | When | Cue |
 |---|---|---|

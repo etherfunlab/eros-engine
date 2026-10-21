@@ -309,8 +309,9 @@ endpoint refresh, so the drop functions take the deployment's affinity
 tuning.
 
 **The slowdown (accept only).** For 72 hours after the separation ends,
-every **positive** effective delta on the four line axes is halved before
-commit; negative deltas apply in full. It applies in the choice's session
+every **positive** committed delta on the four line axes is halved before
+it is applied, and the cut part is dropped, not parked in `pending_deltas`;
+negative deltas apply in full. It applies in the choice's session
 only — the costs are that relationship's, like the drop; another session
 of the same instance pays nothing. The window is derived through the
 choice row (`life_choices.event_id` → the `taking_space` row's `ends_at`

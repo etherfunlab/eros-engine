@@ -942,17 +942,17 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 
 只服务 1:1 文字 session。一个事务里完成回答并付清代价：
 
-- **`accept`：**选择变为 `accepted`。一段 `taking_space` 分开从此刻开始，持续时长是她提出时的档位差距每一档 6 小时
+- **`accept`：** 选择变为 `accepted`。一段 `taking_space` 分开从此刻开始，持续时长是她提出时的档位差距每一档 6 小时
   （差距 2、3、4 对应 12、18、24 小时）；期间她在所有 session 里都离线，正在进行的插曲在这一刻结束。
   bond 和 chemistry 各降一档，分开结束后的 72 小时内，这个 session 里为正的增长减半。
-- **`decline`：**选择变为 `declined`。同样的降档；没有分开，也没有放缓。
+- **`decline`：** 选择变为 `declined`。同样的降档；没有分开，也没有放缓。
 
 然后她用一条主动消息回应（接受之后是道别，拒绝之后是受伤的回应），与普通回复一样落库并返回：
 
 ```json
 {"status": "accepted",
  "message": {"message_id": "…", "content": "好，那我们先各自安静一下。", "sent_at": "2026-10-20T12:00:00Z", "occasion": "life_choice"},
- "affinity": {"bond_tier": 2, "chem_tier": 3, "bond_label": "friend", "chemistry_label": "crush", "…": "…"},
+ "affinity": {"bond_tier": 1, "chem_tier": 3, "bond_label": "acquaintance", "chemistry_label": "crush", "…": "…"},
  "event": {"kind": "taking_space", "category": "mid", "offline": true, "started_at": "2026-10-20T12:00:00Z", "ends_at": "2026-10-21T06:00:00Z", "message_id": null}}
 ```
 
