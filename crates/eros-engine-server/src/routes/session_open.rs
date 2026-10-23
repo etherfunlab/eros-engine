@@ -116,6 +116,17 @@ pub enum GreetingOccasion {
     JustOpened,
     /// A life event the persona tells about (`POST …/events`).
     Event,
+    /// What she says about her ask for space: the ask, the goodbye after an
+    /// accept, the hurt reply after a decline (`POST …/life-choices/{id}`).
+    LifeChoice,
+}
+
+impl GreetingOccasion {
+    /// The occasion a row's `metadata.proactive` names; `None` for a name
+    /// this build does not know.
+    pub fn from_name(name: &str) -> Option<Self> {
+        serde_json::from_value(serde_json::Value::String(name.to_owned())).ok()
+    }
 }
 
 impl From<ChatMessage> for GreetingDto {
@@ -274,7 +285,7 @@ pub(crate) async fn open_at(
         .current(instance_id, None, now)
         .await?
         .foreground
-        .is_some_and(|e| e.kind.is_offline());
+        .is_some_and(|e| e.kind.is_offline(&crate::prompt::persona_traits(&persona)));
     if away {
         return Ok(OpenSessionResponse { greeting: None });
     }
@@ -1240,6 +1251,76 @@ mod tests {
         assert_eq!(proactive_rows(&pool, session_id).await, 0);
     }
 
+    /// The user honoured a separation agreed in this session: the opener is
+    /// the persona message that marks the return, and once it has landed
+    /// nothing more is said of it.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_opener_after_a_separation_marks_the_return_once(pool: PgPool) {
+        use eros_engine_core::events::EventKind;
+        let user_id = Uuid::new_v4();
+        let now = Utc::now();
+        let session_id =
+            session_with_history(&pool, user_id, now - chrono::Duration::days(2)).await;
+        seed_event(
+            &pool,
+            session_id,
+            EventKind::TakingSpace,
+            now - chrono::Duration::hours(7),
+            now - chrono::Duration::hours(1),
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO engine.life_choices \
+               (session_id, kind, status, tier_gap, asked_at, resolved_at, event_id) \
+             SELECT $1, 'ask_for_space', 'accepted', 3, $2, $2, id \
+               FROM engine.persona_events WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .bind(now - chrono::Duration::hours(7))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "好久不见").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        open_at(
+            &state,
+            session_id,
+            user_id,
+            opener(OpenOccasion::JustOpened, "visit-1"),
+            now,
+        )
+        .await
+        .unwrap()
+        .greeting
+        .expect("an opener");
+        let calls = companion_calls(&mock).await;
+        assert!(
+            calls[0]
+                .to_string()
+                .contains("- 刚才：你们之前说好分开一阵，现在时间到了，你们重新开始联系"),
+            "{}",
+            calls[0]
+        );
+        // The opener is the first message with text since it ended.
+        open_at(
+            &state,
+            session_id,
+            user_id,
+            opener(OpenOccasion::JustOpened, "visit-2"),
+            now + chrono::Duration::minutes(1),
+        )
+        .await
+        .unwrap();
+        let calls = companion_calls(&mock).await;
+        assert_eq!(calls.len(), 2);
+        assert!(
+            !calls[1].to_string().contains("说好分开一阵"),
+            "{}",
+            calls[1]
+        );
+    }
+
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn the_opener_after_an_away_stretch_explains_it(pool: PgPool) {
         use eros_engine_core::events::EventKind;
@@ -1286,6 +1367,73 @@ mod tests {
             "{}",
             calls[0]
         );
+    }
+
+    /// `out_shopping` takes only a female persona offline, so only she has a
+    /// stretch to explain when the user opens the chat after it.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_opener_after_out_shopping_explains_it_only_for_a_female_persona(pool: PgPool) {
+        use eros_engine_core::events::EventKind;
+        for (art, line) in [
+            (json!({"gender": "female"}), true),
+            (json!({"gender": "male"}), false),
+            (json!({}), false),
+        ] {
+            let user_id = Uuid::new_v4();
+            let now = Utc::now();
+            let session_id =
+                session_with_history(&pool, user_id, now - chrono::Duration::days(2)).await;
+            sqlx::query(
+                "UPDATE engine.persona_genomes SET art_metadata = $2 WHERE id = \
+                 (SELECT i.genome_id FROM engine.persona_instances i \
+                    JOIN engine.chat_sessions s ON s.instance_id = i.id WHERE s.id = $1)",
+            )
+            .bind(session_id)
+            .bind(&art)
+            .execute(&pool)
+            .await
+            .unwrap();
+            seed_event(
+                &pool,
+                session_id,
+                EventKind::OutShopping,
+                now - chrono::Duration::minutes(70),
+                now - chrono::Duration::minutes(10),
+            )
+            .await;
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content, ghost_decision, sent_at) \
+                 VALUES ($1, 'user', '在吗', true, $2)",
+            )
+            .bind(session_id)
+            .bind(now - chrono::Duration::minutes(30))
+            .execute(&pool)
+            .await
+            .unwrap();
+            let mock = MockServer::start().await;
+            mount_companion(&mock, "刚刚在逛街，抱歉").await;
+            let state = with_companion(test_state(pool.clone()), &mock.uri());
+            open_at(
+                &state,
+                session_id,
+                user_id,
+                opener(OpenOccasion::JustOpened, "visit-1"),
+                now,
+            )
+            .await
+            .unwrap()
+            .greeting
+            .expect("an opener");
+            let calls = companion_calls(&mock).await;
+            assert_eq!(
+                calls[0]
+                    .to_string()
+                    .contains("- 刚才：在逛街，对方那时发来的消息你现在才看到"),
+                line,
+                "{art}: {}",
+                calls[0]
+            );
+        }
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

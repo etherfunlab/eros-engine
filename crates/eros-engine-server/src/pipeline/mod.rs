@@ -8,6 +8,7 @@ pub mod dreaming;
 pub mod group;
 pub mod group_director;
 pub mod handlers;
+pub mod life_choice;
 pub mod post_process;
 pub mod proactive;
 pub mod reasoning_call;

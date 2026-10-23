@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! A persona-initiated assistant message: the holiday and birthday greetings,
-//! the caller-named openers and the life events. The route
-//! (`routes::session_open`, `routes::session_events`) decides whether the
-//! persona speaks first; this module generates and persists it. Modelled on
+//! the caller-named openers, the life events and the ask-for-space choice. The
+//! route (`routes::session_open`, `routes::session_events`) or the pipeline
+//! (`pipeline::life_choice`) decides whether the persona speaks first; this
+//! module generates and persists it. Modelled on
 //! the image-edit text half: no PDE, no streaming, no user row, no
 //! post-process.
 //!
@@ -16,10 +17,11 @@
 //!
 //! Specs: docs/superpowers/specs/2026-09-26-user-locale-and-holiday-greeting-design.md §6,
 //! docs/superpowers/specs/2026-10-03-open-occasions-design.md §5–§6,
-//! docs/superpowers/specs/2026-10-15-life-events-v2-design.md §6
+//! docs/superpowers/specs/2026-10-15-life-events-v2-design.md §6,
+//! docs/superpowers/specs/2026-10-19-life-events-shopping-gatherings-and-ask-for-space-design.md §3.2
 
 use chrono::{DateTime, NaiveDate, Utc};
-use eros_engine_core::events::EventKind;
+use eros_engine_core::events::{offline_kinds, EventKind, PersonaTraits};
 use eros_engine_core::persona::CompanionPersona;
 use eros_engine_core::scope::{AffinityScope, MemoryScope};
 use eros_engine_core::types::{
@@ -31,6 +33,7 @@ use eros_engine_llm::openrouter::ChatMessage as WireMessage;
 use eros_engine_llm::provider::bare_model_id;
 use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::{ChatMessage, ChatRepo, ProactiveInsert};
+use eros_engine_store::life_choices::LifeChoiceRepo;
 use ulid::Ulid;
 use uuid::Uuid;
 
@@ -81,6 +84,40 @@ pub(crate) enum Occasion {
         /// The background under way when it was drawn.
         background: Option<EventKind>,
     },
+    /// What she says about the ask-for-space choice (spec
+    /// 2026-10-19-life-events-shopping-gatherings-and-ask-for-space-design.md
+    /// §3.2, §3.4).
+    LifeChoice(LifeChoiceCue),
+}
+
+/// One thing she says about the choice. The ask is written with its choice
+/// row; the goodbye and the hurt reply are plain proactive rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LifeChoiceCue {
+    /// She asks to take a break. `tier_gap` is the gap at this moment, stored
+    /// with the choice; `anchor_seen` is the session's streak anchor the
+    /// trigger judged by, which the write checks is still current.
+    Ask {
+        tier_gap: i16,
+        anchor_seen: Option<DateTime<Utc>>,
+    },
+    /// The user agreed: they do not talk for `hours`.
+    Goodbye { hours: i64 },
+    /// The user declined.
+    Hurt,
+}
+
+impl LifeChoiceCue {
+    /// The stage cue: states a fact, carries no instruction.
+    fn cue(self) -> String {
+        match self {
+            Self::Ask { .. } => "（这段关系最近让你很累：心动还在，但交情和耐心都被磨薄了。你决定郑重地告诉对方：你想先分开一阵子，希望对方给你一个答复。）".into(),
+            Self::Goodbye { hours } => format!(
+                "（对方同意了你提出的分开请求，接下来 {hours} 小时你们不联系。你跟对方道别。）"
+            ),
+            Self::Hurt => "（对方不同意你提出的分开请求，你心里不好受。）".into(),
+        }
+    }
 }
 
 impl Occasion {
@@ -93,11 +130,14 @@ impl Occasion {
             Self::Returning { .. } => "returning",
             Self::JustOpened { .. } => "just_opened",
             Self::Event { .. } => "event",
+            Self::LifeChoice(_) => "life_choice",
         }
     }
 
-    /// The stage cue: states a fact, carries no instruction.
-    fn cue(&self) -> String {
+    /// The stage cue: states a fact, carries no instruction. An event's wording
+    /// follows the session's intimacy `rung`, the persona's `traits` and her
+    /// `tip_personality`.
+    fn cue(&self, rung: u8, traits: &PersonaTraits, tip_personality: Option<&str>) -> String {
         match self {
             Self::Holiday { .. } | Self::Birthday { .. } | Self::JustOpened { .. } => {
                 OPEN_CUE.into()
@@ -112,15 +152,41 @@ impl Occasion {
                 lasts,
                 background,
                 ..
-            } => event_cue(*kind, *lasts, *background),
+            } => event_cue(*kind, *lasts, *background, rung, traits, tip_personality),
+            Self::LifeChoice(cue) => cue.cue(),
         }
+    }
+}
+
+/// The lowest intimacy rung at which she says she wants what she found: below
+/// it she only notices it.
+const FIND_WANT_MIN_RUNG: u8 = 2;
+
+/// A shopping find's cue (spec 2026-10-19-life-events-shopping-gatherings-and-
+/// ask-for-space-design.md §2.2): noticed in passing at rung 1; from rung 2
+/// she wants it, and a persona with a `tip_personality` tells it in that
+/// voice. `measure` and `noun` name the thing: 一个 / 包.
+fn find_cue(measure: &str, noun: &str, rung: u8, tip_personality: Option<&str>) -> String {
+    if rung < FIND_WANT_MIN_RUNG {
+        return format!("（你在逛街，随手看到{measure}挺好看的{noun}。）");
+    }
+    let want = format!("你在逛街，看到{measure}特别喜欢的{noun}，很想要。");
+    match tip_personality.map(str::trim).filter(|p| !p.is_empty()) {
+        Some(p) => format!("（{want}代入你「{p}」的打赏人格，把这份心动告诉对方。）"),
+        None => format!("（{want}）"),
     }
 }
 
 /// The stage cue for a life event (spec 2026-10-15-life-events-v2-design.md
 /// §3.4): states a fact, carries no instruction. A background's cue carries
 /// its length. A kind that is never told (`events::is_told`) has no cue.
-fn kind_cue(kind: EventKind, lasts: chrono::Duration) -> String {
+fn kind_cue(
+    kind: EventKind,
+    lasts: chrono::Duration,
+    rung: u8,
+    traits: &PersonaTraits,
+    tip_personality: Option<&str>,
+) -> String {
     use EventKind::*;
     let span = crate::prompt::span_text(lasts);
     match kind {
@@ -140,6 +206,8 @@ fn kind_cue(kind: EventKind, lasts: chrono::Duration) -> String {
         Quarrel => "（你刚跟人吵了一架。）".into(),
         ScoldedBySuperior => "（你刚被上级骂了一顿。）".into(),
         ScoldedSuperior => "（你刚把上级骂了一顿。）".into(),
+        SawBag => find_cue("一个", "包", rung, tip_personality),
+        SawClothes => find_cue("一件", "衣服", rung, tip_personality),
         TempWork => "（你刚临时接到一份工作，得马上去处理。）".into(),
         ExMessage => "（你的前任刚给你发来消息。）".into(),
         WeatherChange => "（你那边的天气刚刚突然变了。）".into(),
@@ -152,7 +220,13 @@ fn kind_cue(kind: EventKind, lasts: chrono::Duration) -> String {
         Irritable => "（你现在心里很烦躁。）".into(),
         Busy => "（你接下来要忙一阵，这段时间顾不上看手机。）".into(),
         InBattle => "（你接下来要去打一场硬仗，一段时间顾不上手机。）".into(),
-        AwayFromPhone | Asleep => unreachable!("{kind:?} is never told"),
+        // Told only by a persona who goes dark, and only from rung 2
+        // (`events::is_told`); anyone else is simply out and keeps replying.
+        OutShopping if traits.female => "（你接下来要出门逛街，这段时间顾不上看手机。）".into(),
+        OutShopping => "（你正在外面逛街。）".into(),
+        AwayFromPhone | Asleep | BrosGathering | SisGathering | TakingSpace | FellOut => {
+            unreachable!("{kind:?} is never told")
+        }
         Sick => format!("（你生病了，大概要 {span}才会好。）"),
         Period => "（你的月经来了。）".into(),
         Hospitalized => format!("（你刚住进医院，大概要住 {span}。）"),
@@ -183,8 +257,15 @@ fn background_state(kind: EventKind) -> Option<&'static str> {
 
 /// The kind's cue, opened with the background's state when one is under
 /// way: 「（你正在外地出差。你刚在路上遇到了一只小动物。）」.
-fn event_cue(kind: EventKind, lasts: chrono::Duration, background: Option<EventKind>) -> String {
-    let cue = kind_cue(kind, lasts);
+fn event_cue(
+    kind: EventKind,
+    lasts: chrono::Duration,
+    background: Option<EventKind>,
+    rung: u8,
+    traits: &PersonaTraits,
+    tip_personality: Option<&str>,
+) -> String {
+    let cue = kind_cue(kind, lasts, rung, traits, tip_personality);
     match background.and_then(background_state) {
         Some(state) => format!(
             "（{state}。{}）",
@@ -224,7 +305,8 @@ pub(crate) struct Greeting<'a> {
 /// reply and nothing was written; or, for a greeting or opener, the insert
 /// yielded to a message that landed first; or, for an event, another event
 /// under way for the persona blocked the insert, or a concurrent call with
-/// the same `event_key` won it (the caller reads the event by key). When a
+/// the same `event_key` won it (the caller reads the event by key); or, for
+/// the ask, the session already held a pending choice. When a
 /// concurrent call for the same local date or `open_key` won the insert,
 /// returns that call's row. An event is stamped with one instant taken after
 /// generation: its message's `sent_at`, its `started_at` and the start of its
@@ -238,6 +320,8 @@ pub(crate) async fn greet(
         .await?;
     affinity.apply_time_decay();
     affinity.refresh_endpoints(&state.config.affinity_tuning);
+    let rung = affinity.intimacy_rung();
+    let traits = crate::prompt::persona_traits(g.persona);
     let signals = compute_signals_for_session(&state.pool, g.session_id, &affinity).await?;
 
     // Prompt assembly only. The event's content is the memory-recall query;
@@ -275,15 +359,31 @@ pub(crate) async fn greet(
     };
     let repo = eros_engine_store::events::EventRepo { pool: &state.pool };
     let current = repo.current(g.instance_id, None, g.now.now).await?;
+    // Only a stretch that took this persona offline left something unsaid.
     let offline = repo
-        .unexplained_offline(g.session_id, g.instance_id, g.now.now)
+        .unexplained_offline(
+            g.session_id,
+            g.instance_id,
+            g.now.now,
+            &offline_kinds(&traits),
+        )
+        .await?;
+    // A separation this session agreed to is marked at its return whether or
+    // not the user wrote during it; it speaks for its event in place of the
+    // standard entry.
+    let separation = repo
+        .unreturned_separation(g.session_id, g.instance_id, g.now.now)
         .await?;
     let scare = repo
         .unresolved_scare(g.session_id, g.instance_id, g.now.now)
         .await?;
     let event_lines = crate::prompt::EventLines {
         under_way: crate::prompt::events_reply_text(&current),
-        just_now: crate::prompt::just_now_text(offline.as_ref(), scare.as_ref()),
+        just_now: crate::prompt::just_now_text(
+            offline.as_ref(),
+            separation.as_ref(),
+            scare.as_ref(),
+        ),
     };
     let (mut chat_req, injected_tags) = build_reply_request(
         state,
@@ -302,7 +402,9 @@ pub(crate) async fn greet(
     .await?;
     chat_req.messages.push(WireMessage {
         role: "user".into(),
-        content: g.occasion.cue(),
+        content: g
+            .occasion
+            .cue(rung, &traits, g.persona.genome.tip_personality.as_deref()),
     });
 
     let model_for_audit = chat_req.model.clone();
@@ -374,7 +476,7 @@ pub(crate) async fn greet(
         Occasion::FirstMeet { open_key } | Occasion::JustOpened { open_key } => {
             metadata.insert("open_key".into(), open_key.as_str().into());
         }
-        Occasion::Event { .. } => {}
+        Occasion::Event { .. } | Occasion::LifeChoice(_) => {}
     }
     metadata.insert("prompt_traits".into(), serde_json::json!(injected_tags));
     metadata.insert(
@@ -438,6 +540,28 @@ pub(crate) async fn greet(
             )
             .await?
             .and_then(|i| i.message)),
+        // The ask lands with its choice row, in one transaction; a pending
+        // choice already in the instance (a concurrent ask won) or a streak
+        // anchor that moved since the trigger read it leaves nothing.
+        Occasion::LifeChoice(LifeChoiceCue::Ask {
+            tier_gap,
+            anchor_seen,
+        }) => {
+            let asked = LifeChoiceRepo { pool: &state.pool }
+                .insert_ask(g.session_id, *tier_gap, *anchor_seen, &row)
+                .await?;
+            match asked {
+                Some(_) => Ok(chat_repo
+                    .message_by_id_in_session(g.session_id, row.id)
+                    .await?),
+                None => Ok(None),
+            }
+        }
+        // No key to dedupe on: the row yields only to a message that landed
+        // at or after `since`.
+        Occasion::LifeChoice(LifeChoiceCue::Goodbye { .. } | LifeChoiceCue::Hurt) => Ok(chat_repo
+            .insert_open_message(g.session_id, g.since, &row)
+            .await?),
     }
 }
 
@@ -445,19 +569,114 @@ pub(crate) async fn greet(
 mod tests {
     use super::*;
     use chrono::Duration;
+    use eros_engine_core::events::is_told;
+
+    fn female() -> PersonaTraits {
+        PersonaTraits {
+            female: true,
+            ..Default::default()
+        }
+    }
 
     /// `kind_cue` panics for a kind that is never told; it must not for any
     /// kind `is_told` lets through at any rung.
     #[test]
     fn every_kind_she_tells_has_a_cue() {
-        use eros_engine_core::events::{is_told, EventKind};
-        for k in EventKind::ALL {
-            for rung in 1..=3 {
-                if is_told(k, rung) {
-                    let _ = super::kind_cue(k, chrono::Duration::hours(1));
+        for persona in [PersonaTraits::default(), female()] {
+            for k in EventKind::ALL {
+                for rung in 1..=3 {
+                    if is_told(k, rung, &persona) {
+                        let _ = kind_cue(k, Duration::hours(1), rung, &persona, Some("傲娇"));
+                    }
                 }
             }
         }
+    }
+
+    #[test]
+    fn shopping_find_cue_follows_rung_and_tip_personality() {
+        let h = Duration::hours(1);
+        for (kind, rung_one, wants, tipped) in [
+            (
+                EventKind::SawBag,
+                "（你在逛街，随手看到一个挺好看的包。）",
+                "（你在逛街，看到一个特别喜欢的包，很想要。）",
+                "（你在逛街，看到一个特别喜欢的包，很想要。代入你「傲娇」的打赏人格，把这份心动告诉对方。）",
+            ),
+            (
+                EventKind::SawClothes,
+                "（你在逛街，随手看到一件挺好看的衣服。）",
+                "（你在逛街，看到一件特别喜欢的衣服，很想要。）",
+                "（你在逛街，看到一件特别喜欢的衣服，很想要。代入你「傲娇」的打赏人格，把这份心动告诉对方。）",
+            ),
+        ] {
+            let cue = |rung, tip| kind_cue(kind, h, rung, &female(), tip);
+            assert_eq!(cue(1, None), rung_one, "{kind:?}");
+            assert_eq!(
+                cue(1, Some("傲娇")),
+                rung_one,
+                "{kind:?}: below rung 2 she does not say she wants it"
+            );
+            for rung in [2, 3] {
+                assert_eq!(cue(rung, None), wants, "{kind:?} rung {rung}");
+                assert_eq!(cue(rung, Some("傲娇")), tipped, "{kind:?} rung {rung}");
+                assert_eq!(
+                    cue(rung, Some("  ")),
+                    wants,
+                    "{kind:?} rung {rung}: a blank tip personality is none"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn out_shopping_cue_differs_by_gender() {
+        let h = Duration::hours(1);
+        for rung in [2, 3] {
+            assert_eq!(
+                kind_cue(EventKind::OutShopping, h, rung, &female(), None),
+                "（你接下来要出门逛街，这段时间顾不上看手机。）",
+                "rung {rung}"
+            );
+        }
+        for rung in 1..=3 {
+            assert_eq!(
+                kind_cue(
+                    EventKind::OutShopping,
+                    h,
+                    rung,
+                    &PersonaTraits::default(),
+                    None
+                ),
+                "（你正在外面逛街。）",
+                "rung {rung}"
+            );
+        }
+    }
+
+    /// A gathering, `taking_space` and `fell_out` are never told, so none has
+    /// a cue; a female persona's `out_shopping` is told from rung 2 only.
+    #[test]
+    fn gatherings_have_no_cue() {
+        for persona in [PersonaTraits::default(), female()] {
+            for rung in 1..=3 {
+                for k in [
+                    EventKind::BrosGathering,
+                    EventKind::SisGathering,
+                    EventKind::TakingSpace,
+                    EventKind::FellOut,
+                ] {
+                    assert!(!is_told(k, rung, &persona), "{k:?} rung {rung}");
+                }
+            }
+        }
+        assert!(!is_told(EventKind::OutShopping, 1, &female()));
+        assert!(is_told(EventKind::OutShopping, 2, &female()));
+        assert!(is_told(
+            EventKind::OutShopping,
+            1,
+            &PersonaTraits::default()
+        ));
     }
 
     #[test]
@@ -515,15 +734,20 @@ mod tests {
                 "（你接下来要去打一场硬仗，一段时间顾不上手机。）",
             ),
         ] {
-            assert_eq!(kind_cue(kind, h), cue, "{kind:?}");
+            assert_eq!(
+                kind_cue(kind, h, 1, &PersonaTraits::default(), None),
+                cue,
+                "{kind:?}"
+            );
         }
     }
 
     #[test]
     fn an_incident_during_a_background_opens_with_its_state() {
         let h = Duration::hours(1);
+        let cue = |kind, bg| event_cue(kind, h, bg, 1, &PersonaTraits::default(), None);
         assert_eq!(
-            event_cue(EventKind::AnimalEncounter, h, Some(EventKind::BusinessTrip)),
+            cue(EventKind::AnimalEncounter, Some(EventKind::BusinessTrip)),
             "（你正在外地出差。你刚在路上遇到了一只小动物。）"
         );
         for (bg, state) in [
@@ -537,11 +761,11 @@ mod tests {
             (EventKind::HometownVisit, "你正在老家"),
         ] {
             assert_eq!(
-                event_cue(EventKind::Reading, h, Some(bg)),
+                cue(EventKind::Reading, Some(bg)),
                 format!("（{state}。你正在看书。）")
             );
         }
-        assert_eq!(event_cue(EventKind::Reading, h, None), "（你正在看书。）");
+        assert_eq!(cue(EventKind::Reading, None), "（你正在看书。）");
     }
 
     #[test]
@@ -550,15 +774,48 @@ mod tests {
             event_cue(
                 EventKind::PeriodScare,
                 Duration::hours(1),
-                Some(EventKind::BusinessTrip)
+                Some(EventKind::BusinessTrip),
+                1,
+                &PersonaTraits::default(),
+                None
             ),
             "（你正在外地出差。你发现月经推迟了好几天还没来，心里有点慌。）"
         );
     }
 
     #[test]
+    fn the_life_choice_cues_are_exact() {
+        let cue = |c| Occasion::LifeChoice(c).cue(1, &PersonaTraits::default(), None);
+        assert_eq!(
+            cue(LifeChoiceCue::Ask {
+                tier_gap: 3,
+                anchor_seen: None
+            }),
+            "（这段关系最近让你很累：心动还在，但交情和耐心都被磨薄了。你决定郑重地告诉对方：你想先分开一阵子，希望对方给你一个答复。）"
+        );
+        assert_eq!(
+            cue(LifeChoiceCue::Goodbye { hours: 18 }),
+            "（对方同意了你提出的分开请求，接下来 18 小时你们不联系。你跟对方道别。）"
+        );
+        assert_eq!(
+            cue(LifeChoiceCue::Hurt),
+            "（对方不同意你提出的分开请求，你心里不好受。）"
+        );
+        for c in [
+            LifeChoiceCue::Ask {
+                tier_gap: 2,
+                anchor_seen: None,
+            },
+            LifeChoiceCue::Goodbye { hours: 12 },
+            LifeChoiceCue::Hurt,
+        ] {
+            assert_eq!(Occasion::LifeChoice(c).name(), "life_choice");
+        }
+    }
+
+    #[test]
     fn a_background_cue_carries_its_length() {
-        let cue = |k, h| kind_cue(k, Duration::hours(h));
+        let cue = |k, h| kind_cue(k, Duration::hours(h), 1, &PersonaTraits::default(), None);
         assert_eq!(
             cue(EventKind::Sick, 30),
             "（你生病了，大概要 30 小时才会好。）"

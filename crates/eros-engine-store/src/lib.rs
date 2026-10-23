@@ -13,6 +13,7 @@ pub mod group;
 pub mod human_insight;
 pub mod image_events;
 pub mod insight;
+pub mod life_choices;
 pub mod memory;
 pub mod persona;
 pub mod pool;

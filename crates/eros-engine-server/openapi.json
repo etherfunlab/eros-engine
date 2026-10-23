@@ -2321,7 +2321,7 @@
           "companion"
         ],
         "summary": "Ask for something to happen in the persona's day.",
-        "description": "The engine draws one kind of event, or none (a short or mid-length\nincident is under way, or every allowed kind is cooling down). During a\nbackground event (a trip or a body state) only incidents are drawn. The\npersona then tells the user in one proactive message, persisted like any\nreply and returned with the event. The offline kinds (`away_from_phone`,\n`busy`, `in_battle`, `asleep`) make her unreachable while they last.\n`busy` and `in_battle` are announced in a message at intimacy rung 2 and\nup; below that, and always for `away_from_phone` and `asleep`, the event\ncomes back with `message: null`. The same `event_key` returns the same\nevent.",
+        "description": "The engine draws one kind of event, or none (a short or mid-length\nincident is under way, every allowed kind is cooling down, or she has asked\nthe user for space and waits for the answer, in any session of the persona,\nuntil it is answered or lapses). During a background event (a trip or a\nbody state) only incidents are drawn. The\npersona then tells the user in one proactive message, persisted like any\nreply and returned with the event. The offline kinds (`away_from_phone`,\n`busy`, `in_battle`, `asleep`, `bros_gathering`, `sis_gathering`, and\n`out_shopping` for a female persona) make her unreachable while they last.\n`busy`, `in_battle` and a female persona's `out_shopping` are announced in\na message at intimacy rung 2 and up; below that, and always for\n`away_from_phone`, `asleep` and the gatherings, the event comes back with\n`message: null`. For any other persona `out_shopping` is not offline and\nis announced at every rung. The same `event_key` returns the same event.",
         "operationId": "draw_event",
         "parameters": [
           {
@@ -2400,13 +2400,121 @@
             }
           },
           "422": {
-            "description": "unknown kind or another malformed body field"
+            "description": "unknown kind, `taking_space` or `fell_out` in `kinds`, or another malformed body field"
           },
           "429": {
             "description": "per-user in-flight cap reached"
           },
           "5XX": {
             "description": "companion chain exhausted; the provider's own status passes through. Nothing is persisted."
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v2/comp/session/{session_id}/life-choices/{choice_id}": {
+      "post": {
+        "tags": [
+          "companion"
+        ],
+        "summary": "Answer her ask for space.",
+        "description": "One transaction answers the choice and pays for it. Accept: the choice\nbecomes `accepted`, a `taking_space` separation starts now and lasts 6 hours\nper tier of the gap she asked at (12, 18 or 24 hours; she is offline for\nit, and an incident under way ends), and bond and chemistry each drop one\ntier. Decline: the choice becomes `declined` and the two lines drop one\ntier, with no separation. Either way she then answers in one proactive\nmessage, persisted like any reply and returned; if that generation fails\nthe call still succeeds with `message: null`.\n\n`409` when the choice is no longer pending: answered already (an ordinary\nmessage from the user counts, and the first writer wins), or lapsed 24\nhours after she asked. `404` when the choice is not in this session.",
+        "operationId": "respond_to_life_choice",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Chat session id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "choice_id",
+            "in": "path",
+            "description": "The choice's id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LifeChoiceRespondRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LifeChoiceRespondResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`response` is not `accept` or `decline`, or another malformed body field"
+          },
+          "429": {
+            "description": "per-user in-flight cap reached"
           }
         },
         "security": [
@@ -3257,6 +3365,17 @@
               }
             ]
           },
+          "life_choice": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LifeChoiceDto",
+                "description": "The session's pending choice, whichever event this is: composed at\nserve time, present while one is unanswered and not past its 24 hours.\nAnswer it at `POST /v2/comp/session/{session_id}/life-choices/{choice_id}`.\nA client that does not know the field shows the ask as an ordinary\nmessage and its user answers in words."
+              }
+            ]
+          },
           "state_after": {
             "description": "Post-turn absolute state — axes, both line scores, both tiers, both\njudge levels. Absent on rows written before migration 0049.\n\nTakes the place of client-side accumulation: with this, a consumer\nadopts the authoritative absolute value every turn instead of adding\ndeltas to a running total. It is a WRITE-TIME snapshot, so after an\nabsence only `GET /bff/v1/comp/affinity/{sid}` is correct — that one\nrefreshes the derived endpoints at read."
           },
@@ -3419,6 +3538,17 @@
           "image": {
             "type": "boolean",
             "description": "Present (always `true`) only on assistant rows whose turn delegated an\nimage to the consumer (`metadata.image` marker recorded) — key-presence\ncontract like `read_at`. Recover the payload via\n`GET /comp/chat/{session_id}/messages/{message_id}/image-request`; a 404\nthere on a flagged row means the composed prompt was never recorded\n(fail-open audit) — genuinely unrecoverable. Spec:\ndocs/superpowers/specs/2026-08-21-image-turn-discovery-design.md."
+          },
+          "occasion": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/GreetingOccasion",
+                "description": "Why the persona spoke on her own — set on the assistant rows she wrote\nunprompted (the row's `metadata.proactive`): a greeting, a life event,\nor `life_choice` for her ask for space and what she says about the\nanswer. A client that has adapted to the choice re-fetches the affinity\ndelta on reading `life_choice`. Omitted on every other row; same\nkey-presence contract as `read_at`."
+              }
+            ]
           },
           "reaction": {
             "oneOf": [
@@ -4033,6 +4163,17 @@
             "type": "boolean",
             "description": "Present (always `true`) only on assistant rows whose turn delegated an\nimage to the consumer (`metadata.image` marker recorded) — key-presence\ncontract like `read_at`. Recover the payload via the `image-request`\nendpoint; a 404 there on a flagged row means the composed prompt was\nnever recorded (fail-open audit) — genuinely unrecoverable."
           },
+          "occasion": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/GreetingOccasion",
+                "description": "Why the persona spoke on her own — set on the assistant rows she wrote\nunprompted (the row's `metadata.proactive`): a greeting, a life event,\nor `life_choice` for her ask for space and what she says about the\nanswer. A client that has adapted to the choice re-fetches the affinity\ndelta on reading `life_choice`. Omitted on every other row; same\nkey-presence contract as `read_at`. The BFF history entry carries the\nsame field."
+              }
+            ]
+          },
           "reaction": {
             "oneOf": [
               {
@@ -4443,7 +4584,7 @@
       },
       "EventKindDto": {
         "type": "string",
-        "description": "A kind of life event.",
+        "description": "A kind of life event. `taking_space` and `fell_out` are placed by the\nengine, never drawn: they appear in responses only, and a `kinds` filter\nthat lists one is rejected.",
         "enum": [
           "police_encounter",
           "animal_encounter",
@@ -4461,6 +4602,8 @@
           "quarrel",
           "scolded_by_superior",
           "scolded_superior",
+          "saw_bag",
+          "saw_clothes",
           "temp_work",
           "ex_message",
           "weather_change",
@@ -4475,6 +4618,9 @@
           "busy",
           "in_battle",
           "asleep",
+          "out_shopping",
+          "bros_gathering",
+          "sis_gathering",
           "sick",
           "period",
           "hospitalized",
@@ -4482,7 +4628,9 @@
           "business_trip",
           "short_trip",
           "long_trip",
-          "hometown_visit"
+          "hometown_visit",
+          "taking_space",
+          "fell_out"
         ]
       },
       "EventView": {
@@ -4679,7 +4827,8 @@
           "first_meet",
           "returning",
           "just_opened",
-          "event"
+          "event",
+          "life_choice"
         ]
       },
       "GroupDto": {
@@ -5342,6 +5491,169 @@
           },
           "to": {
             "type": "string"
+          }
+        }
+      },
+      "LifeChoiceAnswer": {
+        "type": "string",
+        "description": "The user's answer to the ask.",
+        "enum": [
+          "accept",
+          "decline"
+        ]
+      },
+      "LifeChoiceDto": {
+        "type": "object",
+        "description": "A choice the persona has put to the user and is waiting on.",
+        "required": [
+          "id",
+          "kind",
+          "options",
+          "asked_at",
+          "expires_at"
+        ],
+        "properties": {
+          "asked_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "`asked_at` plus 24 hours; past it the choice is no longer offered."
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "kind": {
+            "type": "string",
+            "description": "`ask_for_space`."
+          },
+          "message_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "The chat message that asked it. Absent once that row is gone."
+          },
+          "options": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The answers the resolution endpoint takes: `[\"accept\", \"decline\"]`."
+          }
+        }
+      },
+      "LifeChoiceRespondRequest": {
+        "type": "object",
+        "required": [
+          "response"
+        ],
+        "properties": {
+          "affinity_scope": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AffinityScopeDto"
+              }
+            ]
+          },
+          "audit": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LlmAuditDto"
+              }
+            ]
+          },
+          "memory_scope": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "prompt_traits": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/PromptTraitDto"
+            }
+          },
+          "response": {
+            "$ref": "#/components/schemas/LifeChoiceAnswer"
+          },
+          "tier": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "user_country": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "user_region": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "user_timezone": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "As on `/open`: the user's IANA timezone, for `[now]`."
+          }
+        }
+      },
+      "LifeChoiceRespondResponse": {
+        "type": "object",
+        "required": [
+          "status",
+          "affinity"
+        ],
+        "properties": {
+          "affinity": {
+            "$ref": "#/components/schemas/AffinitySnapshot",
+            "description": "The relationship after the drop."
+          },
+          "event": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EventView",
+                "description": "The separation an accept started; `null` after a decline."
+              }
+            ]
+          },
+          "message": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/GreetingDto",
+                "description": "What she says back: the goodbye after an accept, the hurt reply after\na decline. `null` when the generation failed, came back blank or a\nnewer message landed first; the answer and its costs stand either way."
+              }
+            ]
+          },
+          "status": {
+            "type": "string",
+            "description": "The choice's new status: `accepted` or `declined`."
           }
         }
       },

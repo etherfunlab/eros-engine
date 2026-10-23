@@ -164,6 +164,15 @@ pub struct ChatHistoryEntry {
     /// Omitted on rows without one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reaction: Option<crate::routes::reaction::ReactionView>,
+    /// Why the persona spoke on her own — set on the assistant rows she wrote
+    /// unprompted (the row's `metadata.proactive`): a greeting, a life event,
+    /// or `life_choice` for her ask for space and what she says about the
+    /// answer. A client that has adapted to the choice re-fetches the affinity
+    /// delta on reading `life_choice`. Omitted on every other row; same
+    /// key-presence contract as `read_at`. The BFF history entry carries the
+    /// same field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub occasion: Option<crate::routes::session_open::GreetingOccasion>,
     /// The member session that spoke this line (group sessions only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speaker_session_id: Option<Uuid>,
@@ -797,6 +806,12 @@ async fn get_history(
                 .and_then(|md| md.get("action"))
                 .and_then(crate::routes::companion_stream::UserActionView::from_metadata_action),
             reaction: crate::routes::reaction::reaction_view(m.reaction, m.reacted_at),
+            occasion: m
+                .metadata
+                .as_ref()
+                .and_then(|md| md.get("proactive"))
+                .and_then(|v| v.as_str())
+                .and_then(crate::routes::session_open::GreetingOccasion::from_name),
             speaker_session_id: m.speaker_session_id,
             role: m.role,
             content: m.content,
@@ -2604,6 +2619,85 @@ mod tests {
             messages[1]
         );
         assert_eq!(messages[2]["image"], true, "image turn is flagged");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn history_names_the_occasion_of_a_proactive_row(pool: PgPool) {
+        // The delivery contract of the life choice: a client that reads her ask
+        // in history re-fetches the affinity delta, so the row has to say what
+        // it is. Only the rows she wrote on her own carry it.
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Nova").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+             VALUES ($1, 'user', 'hey', now() - interval '3 seconds'), \
+                    ($1, 'assistant', 'hi', now() - interval '2 seconds')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        eros_engine_store::life_choices::LifeChoiceRepo { pool: &pool }
+            .insert_ask(
+                session_id,
+                3,
+                None,
+                &eros_engine_store::chat::ProactiveInsert {
+                    id: Uuid::new_v4(),
+                    content: "我想先分开一阵子".into(),
+                    generation_id: None,
+                    metadata: json!({"proactive": "life_choice"}),
+                    llm_attempts: None,
+                    gateway_errors: None,
+                },
+            )
+            .await
+            .unwrap()
+            .expect("written");
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, assistant_action_type, \
+                                               metadata) \
+             VALUES ($1, 'assistant', '在逛街', 'proactive', '{\"proactive\":\"event\"}'), \
+                    ($1, 'assistant', 'an unknown name', 'proactive', '{\"proactive\":\"later\"}')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let jwt = mint_test_jwt(user_id);
+        let mut router = build_router(test_state(pool.clone()));
+
+        let (status, body) = send_request(
+            &mut router,
+            Request::builder()
+                .uri(format!("/comp/chat/{session_id}/history"))
+                .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let occasion = |content: &str| {
+            body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["content"] == content)
+                .unwrap_or_else(|| panic!("no row {content}: {body}"))
+                .get("occasion")
+                .cloned()
+        };
+        assert_eq!(occasion("我想先分开一阵子"), Some(json!("life_choice")));
+        assert_eq!(occasion("在逛街"), Some(json!("event")));
+        assert_eq!(occasion("hi"), None, "an ordinary reply omits the key");
+        assert_eq!(occasion("hey"), None, "and so does a user row");
+        assert_eq!(
+            occasion("an unknown name"),
+            None,
+            "a name this build does not know is left out, never sent as null"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

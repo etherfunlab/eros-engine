@@ -78,7 +78,7 @@ spawn post_process     tokio::spawn — runs concurrent with response return:
 
 **Ghost-streak reset** is handled by the orchestrator before spawning post-process: on Reply the streak is cleared in a single idempotent UPDATE; on Ghost the orchestrator calls `AffinityRepo::record_ghost` instead. The `persist_with_event` repo method itself never touches the streak.
 
-**Offline.** While an offline life event of the persona is under way (`away_from_phone`, `busy`, `in_battle`, `asleep`), a text turn without a user action or `image.force` ghosts before the PDE: the row is marked ghosted and the ghost frames are yielded, and neither the judge nor `record_ghost` runs. See [ghost-mechanics.md](ghost-mechanics.md#ghosting-the-engine-imposes).
+**Offline.** While an offline life event of the persona is under way (`away_from_phone`, `busy`, `in_battle`, `asleep`, the two gatherings, a female persona's `out_shopping`, or the separation she asked for), a text turn without a user action or `image.force` ghosts before the PDE: the row is marked ghosted and the ghost frames are yielded, and neither the judge nor `record_ghost` runs. See [ghost-mechanics.md](ghost-mechanics.md#ghosting-the-engine-imposes).
 
 **PDE action list.** The judge's (or rule engine's) per-turn action is one of
 `reply_text` | `ghost` | `reply_image` | `reply_text_image` | `product_qa`.
@@ -191,13 +191,14 @@ crates/
 │       ├── voyage.rs         # 512-dim embeddings, fail-loud on empty key
 │       └── model_config.rs   # TOML loader
 ├── eros-engine-store/
-│   ├── migrations/           # 0000_schema → 0072_persona_events
+│   ├── migrations/           # 0000_schema → 0077_affinity_event_life_choice
 │   └── src/
 │       ├── pool.rs           # PgPoolOptions builder
 │       ├── chat.rs           # ChatRepo
 │       ├── events.rs         # EventRepo (persona_events: life events under way, history, offline stretches, false alarms)
 │       ├── group.rs          # GroupRepo (group sessions, membership)
-│       ├── affinity.rs       # AffinityRepo (persist_with_event, record_ghost)
+│       ├── life_choices.rs   # LifeChoiceRepo (the persona's ask-for-space choice: rows, pending, resolve, slowdown window)
+│       ├── affinity.rs       # AffinityRepo (persist_with_event, record_ghost, persist_life_choice_drop_in_tx)
 │       ├── memory.rs         # MemoryRepo (Profile/Relationship layers)
 │       ├── insight.rs        # InsightEventRepo (companion_insights_events audit rows)
 │       ├── human_insight.rs  # HumanInsightRepo (typed profile columns, per-field UPSERT)
@@ -212,7 +213,7 @@ crates/
         ├── auth/             # AuthValidator trait + Supabase impl + middleware
         ├── pipeline/         # stream (run_stream) / group + group_director / reasoning_call / handlers / post_process / dreaming / …
         ├── prompt.rs         # system-prompt builder (affinity → directives)
-        ├── routes/           # health / companion / companion_stream / companion_async / insight / image_edit / voice / persona / session_open / session_events / session_effects / persona_items / reaction / group / world_town / svc (service-to-service export, `/svc/v1/*`) / bff / dto / mod
+        ├── routes/           # health / companion / companion_stream / companion_async / insight / image_edit / voice / persona / session_open / session_events / session_effects / life_choices / persona_items / reaction / group / world_town / svc (service-to-service export, `/svc/v1/*`) / bff / dto / mod
         └── openapi.rs        # utoipa ApiDoc spec metadata
 ```
 
@@ -221,7 +222,7 @@ crates/
 - [Affinity model](affinity-model.md) — 6 dimensions, graded write pipeline, time decay, relationship labels
 - [Ghost mechanics](ghost-mechanics.md) — score formula + protection rules + worked examples
 - [Group chat](group-chat.md) — one user, up to three personas, the director, the speaker relay
-- [Life events and needs](life-events-needs.md) — the persona's needs and their drift, the event draw, backgrounds, offline kinds, false alarms
+- [Life events and needs](life-events-needs.md) — the persona's needs and their drift, the event draw, backgrounds, offline kinds, false alarms, the ask-for-space choice
 - [Memory layers](memory-layers.md) — profile vs relationship, Voyage, pgvector retrieval
 - [Deploying](deploying.md) — Docker, bring-your-own Postgres / IdP
 - [API reference](api-reference.md) — every `/comp/*` endpoint

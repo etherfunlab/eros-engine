@@ -61,6 +61,7 @@ anything; the message names the route:
 - `POST /v2/comp/session/{session_id}/open`
 - `POST /comp/voice/{session_id}/turn/stream`
 - `POST /v2/comp/session/{session_id}/events` (life events)
+- `POST /v2/comp/session/{session_id}/life-choices/{choice_id}` (the answer to her ask for space; a BYOC session never triggers the ask)
 - Group chat: creating a group with a BYOC member, or adding one.
 
 World Memories, World Town and World Stories never include a BYOC instance.

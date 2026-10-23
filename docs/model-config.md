@@ -695,7 +695,7 @@ When any accepted `give` is still at work, the engine also adds a `[身体状态
 
 **Needs context line.** On every judged turn the context carries one `[需求]` line, before `[身体状态]`: `[需求] 饥饿=高 社交欲=低 体力=中 情感需求=中`, the previous rating carried to this turn, or `[需求] 尚未判定` before the first rating.
 
-**Event context line.** While an event drawn through the [events route](api-reference.md#post-v2compsessionsession_idevents) is under way, the judge context carries one `[近期事件]` line, after `[需求]` and before `[身体状态]`. It lists the background, then the incident, joined by `；`: `[近期事件] 长途旅游（2 天前开始，约 3 天后结束）；在看书（不到 1 小时前开始，约 2 小时后结束）`. Spans under an hour read `不到 1 小时`, under 48 hours whole hours, from 48 hours whole days. After an offline stretch (`away_from_phone`, `busy`, `in_battle`, `asleep`), in a session whose messages it ghosted and before the persona has written a message with text there, the line ends with `{label}（{span}前结束，期间对方的消息你没有回）`. After a false alarm (`period_scare`, `pregnancy_scare`), in the session that told it and before the persona has written a message with text there, it ends with `{label}（{span}前结束，结果是虚惊一场）`. With both, the offline item comes first. `{label}` and `{text}` are given per kind in the table below. A text turn's reply carries `- 正在经历：…` under `[now]` (background and incident) and, after such a stretch or false alarm, a `- 刚才：{text}` line, with or without the LLM judge; `/open` greetings and event messages carry the same lines. With both, the two texts share the line, the offline text first, joined by `；`: `- 刚才：睡着了，对方那时发来的消息你现在才看到；以为月经没来，后来来了，是虚惊一场`. The lines are absent when there is nothing to say. Events change no stored need: the judge reads the line and rates the needs itself.
+**Event context line.** While an event drawn through the [events route](api-reference.md#post-v2compsessionsession_idevents) is under way, the judge context carries one `[近期事件]` line, after `[需求]` and before `[身体状态]`. It lists the background, then the incident, joined by `；`: `[近期事件] 长途旅游（2 天前开始，约 3 天后结束）；在看书（不到 1 小时前开始，约 2 小时后结束）`. Spans under an hour read `不到 1 小时`, under 48 hours whole hours, from 48 hours whole days. After an offline stretch (`away_from_phone`, `busy`, `in_battle`, `asleep`, `bros_gathering`, `sis_gathering`, and `out_shopping` for a female persona), in a session whose messages it ghosted and before the persona has written a message with text there, the line ends with `{label}（{span}前结束，期间对方的消息你没有回）`. After a separation she asked for (`taking_space`), in the session of that choice and until the persona has written a message with text there, the line ends with `说好暂时分开（{span}前结束，期间对方的消息你没有回）` when the user wrote during it, or `说好暂时分开（{span}前结束，对方等到了约定之后）` when they honoured it; the reply's `- 刚才：` text follows the same split (the two `taking_space` rows below). After a false alarm (`period_scare`, `pregnancy_scare`), in the session that told it and before the persona has written a message with text there, it ends with `{label}（{span}前结束，结果是虚惊一场）`. With both, the offline item comes first. `{label}` and `{text}` are given per kind in the table below. A text turn's reply carries `- 正在经历：…` under `[now]` (background and incident) and, after such a stretch or false alarm, a `- 刚才：{text}` line, with or without the LLM judge; `/open` greetings and event messages carry the same lines. With both, the two texts share the line, the offline text first, joined by `；`: `- 刚才：睡着了，对方那时发来的消息你现在才看到；以为月经没来，后来来了，是虚惊一场`. The lines are absent when there is nothing to say. Events change no stored need: the judge reads the line and rates the needs itself.
 
 | Kind | `{label}` | `{text}` |
 |---|---|---|
@@ -703,8 +703,31 @@ When any accepted `give` is still at work, the engine also adds a `[身体状态
 | `busy` | `正在忙` | `一直在忙，对方那时发来的消息你现在才看到` |
 | `in_battle` | `在打一场硬仗` | `在打一场硬仗，对方那时发来的消息你现在才看到` |
 | `asleep` | `睡着了` | `睡着了，对方那时发来的消息你现在才看到` |
+| `out_shopping` (female persona) | `在逛街` | `在逛街，对方那时发来的消息你现在才看到` |
+| `bros_gathering` | `兄弟聚会` | `去了兄弟聚会，对方那时发来的消息你现在才看到` |
+| `sis_gathering` | `姐妹聚会` | `去了姐妹聚会，对方那时发来的消息你现在才看到` |
+| `taking_space` (the user wrote during it) | `说好暂时分开` | `你们之前说好分开一阵，现在时间到了；对方那时发来的消息你现在才看到` |
+| `taking_space` (the user honoured it) | `说好暂时分开` | `你们之前说好分开一阵，现在时间到了，你们重新开始联系` |
 | `period_scare` | `月经没来` | `以为月经没来，后来来了，是虚惊一场` |
 | `pregnancy_scare` | `验出怀孕` | `验出两条杠，后来复查是虚惊一场` |
+
+The kinds with no aftermath text have no row above: `看中了一个包` (`saw_bag`), `看中了一件衣服` (`saw_clothes`) and `为分开的事闹得不愉快` (`fell_out`, the one-hour falling-out when the user ignores her ask for space). While they last, their label appears in the usual `[近期事件]` and `- 正在经历：` lines.
+
+**Stage cues of the new kinds and the ask for space.** Like every event message, these are the final `user` turn of the generation request. The engine owns them and they are not persisted. `{p}` is the persona's `tip_personality`, trimmed; the rung is the session's intimacy rung. The gatherings are never told and have no cue. The cues of the older kinds are documented in [life-events-needs.md](life-events-needs.md#how-she-tells-it), [Offline kinds](life-events-needs.md#offline-kinds) and [False alarms](life-events-needs.md#false-alarms); this table covers only the new kinds and the ask for space.
+
+| What she tells | When | Cue |
+|---|---|---|
+| `saw_bag` | rung 1 | `（你在逛街，随手看到一个挺好看的包。）` |
+| `saw_bag` | rung 2 and up, no `tip_personality` | `（你在逛街，看到一个特别喜欢的包，很想要。）` |
+| `saw_bag` | rung 2 and up, with `tip_personality` | `（你在逛街，看到一个特别喜欢的包，很想要。代入你「{p}」的打赏人格，把这份心动告诉对方。）` |
+| `saw_clothes` | rung 1 | `（你在逛街，随手看到一件挺好看的衣服。）` |
+| `saw_clothes` | rung 2 and up, no `tip_personality` | `（你在逛街，看到一件特别喜欢的衣服，很想要。）` |
+| `saw_clothes` | rung 2 and up, with `tip_personality` | `（你在逛街，看到一件特别喜欢的衣服，很想要。代入你「{p}」的打赏人格，把这份心动告诉对方。）` |
+| `out_shopping` | female persona, rung 2 and up (below rung 2 she is not told) | `（你接下来要出门逛街，这段时间顾不上看手机。）` |
+| `out_shopping` | any other persona | `（你正在外面逛街。）` |
+| her ask for space | the trigger fired | `（这段关系最近让你很累：心动还在，但交情和耐心都被磨薄了。你决定郑重地告诉对方：你想先分开一阵子，希望对方给你一个答复。）` |
+| her goodbye | the user accepted; `{n}` is the separation's hours (12, 18 or 24) | `（对方同意了你提出的分开请求，接下来 {n} 小时你们不联系。你跟对方道别。）` |
+| her hurt reply | the user declined | `（对方不同意你提出的分开请求，你心里不好受。）` |
 
 **Recent-image context line.** The judge context also always carries exactly one
 `[近期图片] 最近8条消息内已发图=<n> 张；上一条 AI 消息是图片=<是/否>（以本行计数为准，对话记录里的图片标记仅供参考）`
@@ -723,7 +746,7 @@ available on `[tasks.group_director]`, `[tasks.world_director]`,
 `[tasks.world_stories_director]`, and `[tasks.world_comment]`, with the same
 default.
 
-**`ghosting` field** (bool, default `true`): a safety switch for downstream products. Set `ghosting = false` to disable ghosting across the _entire_ PDE path — LLM verdict, rule fallback, and the pure rule engine — so the companion never goes silent. Useful for products where silent turns are undesirable. With the switch off, no offline life event (`away_from_phone`, `busy`, `in_battle`, `asleep`) is drawn either, and one already under way no longer silences turns (see [ghost-mechanics.md](ghost-mechanics.md#ghosting-the-engine-imposes)).
+**`ghosting` field** (bool, default `true`): a safety switch for downstream products. Set `ghosting = false` to disable ghosting across the _entire_ PDE path — LLM verdict, rule fallback, and the pure rule engine — so the companion never goes silent. Useful for products where silent turns are undesirable. With the switch off, no offline life event (`away_from_phone`, `busy`, `in_battle`, `asleep`, the two gatherings, and `out_shopping` for a female persona) is drawn either, and one already under way, a separation she asked for included, no longer silences turns (see [ghost-mechanics.md](ghost-mechanics.md#ghosting-the-engine-imposes)).
 
 ### `[tasks.chat_image_prompt_compose]` — image-prompt composer (required for image turns)
 

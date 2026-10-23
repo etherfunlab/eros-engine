@@ -721,7 +721,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 { "greeting": { "message_id": "01J…", "content": "好久不见，最近忙什么呢", "sent_at": "…", "occasion": "returning" } }
 ```
 
-响应里的 `occasion` 取值为 `birthday`、`holiday`、`first_meet`、`returning` 或 `just_opened`。同样形状的消息在生活事件的消息上带 `event`（见下面的 events 路由）。
+响应里的 `occasion` 取值为 `birthday`、`holiday`、`first_meet`、`returning` 或 `just_opened`。同样形状的消息在生活事件的消息上带 `event`（见下面的 events 路由），在她提出分开的请求和对用户回答的回应上带 `life_choice`（见下面的生活选择路由）。
 
 - **同步：** 一次非流式生成，需要几秒，不要阻塞 UI。
 - **幂等：** 生日和节日开场白按会话加当地日期（生日用角色那边的日期，节日用用户那边的日期），场合按会话加 `open_key`。写入过之后，重复调用返回那一条，不会再生成；返回 `null` 的调用什么都没写，同一个 key 再调仍可能生成。
@@ -738,6 +738,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 
 让角色的一天里发生点什么。什么时候要，由调用方决定；发不发生、发生什么，由 engine 决定。
 engine 抽一种事件，或者什么都不抽，然后角色用一条主动消息告诉用户——离线类种类除外，它们让她联系不上，只讲出一部分（见下）。
+她在等用户回答自己提出的分开请求时什么都不抽（见[生活选择路由](#post-v2compsessionsession_idlife-choiceschoice_id)）。
 事件持续期间，判官和回复都知道她正在经历它
 （见 [model-config.zh.md](model-config.zh.md#taskspde_decision--opt-in-llm-pde-判断器)）。
 抽取怎么运转、事件和角色的需求怎么配合，见 [life-events-needs.zh.md](life-events-needs.zh.md)。
@@ -754,7 +755,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | 字段 | 规则 |
 |---|---|
 | `event_key` | 必填：1–128 个 `[A-Za-z0-9_.:-]` 字符，只在本会话内有效。同一个 key 返回同一个事件 |
-| `kinds` | 选填。不带或 `null`：全部种类。数组：只抽列出的种类（`[]`：什么都不抽）。对象 `{"allow": […], "disallow": […]}`：`allow` 允许的种类（不带或 `null`：全部；`[]`：一种都没有）去掉 `disallow` 列出的种类；两边都列了的种类不抽，`{}` 等于全部种类。对象里出现未知的键，或出现未知种类，返回 `422` |
+| `kinds` | 选填。不带或 `null`：全部种类。数组：只抽列出的种类（`[]`：什么都不抽）。对象 `{"allow": […], "disallow": […]}`：`allow` 允许的种类（不带或 `null`：全部；`[]`：一种都没有）去掉 `disallow` 列出的种类；两边都列了的种类不抽，`{}` 等于全部种类。对象里出现未知的键，或出现未知种类，返回 `422`；写了 `taking_space` 或 `fell_out` 同样返回 `422`：它们由 engine 自己写入，从不抽取 |
 | `user_timezone`、`user_country`、`user_region`、`tier`、`prompt_traits`、`memory_scope`、`affinity_scope`、`audit` | 与 `/open` 相同，用于生成这条消息 |
 
 种类分四个类别（`category`）。`short` 与 `mid` 是插曲；`body` 与 `trip` 是持续数天的背景，背景进行期间插曲照样会发生。
@@ -777,6 +778,8 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | `short` | `quarrel` | 1 小时 | 跟人吵架了 |
 | `short` | `scolded_by_superior` | 1 小时 | 被上级骂了——老板、上司、领导、主人或君主，由她的世界决定 |
 | `short` | `scolded_superior` | 1 小时 | 骂了上级 |
+| `short` | `saw_bag` | 1 小时 | 看中了一个包（女性角色） |
+| `short` | `saw_clothes` | 1 小时 | 看中了一件衣服（女性角色） |
 | `mid` | `temp_work` | 4 小时 | 临时接到工作 |
 | `mid` | `ex_message` | 3 小时 | 前任发来消息 |
 | `mid` | `weather_change` | 4 小时 | 天气突然变了 |
@@ -791,6 +794,9 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | `mid` | `busy` | 1–3 小时 | 正在忙（离线） |
 | `mid` | `in_battle` | 2–4 小时 | 在打一场硬仗——商务宴请、谈判，或真正的战斗，由她的世界决定（离线） |
 | `mid` | `asleep` | 1–4 小时 | 睡着了（离线） |
+| `mid` | `out_shopping` | 2–4 小时 | 在逛街（女性角色离线） |
+| `mid` | `bros_gathering` | 2–4 小时 | 兄弟聚会（离线） |
+| `mid` | `sis_gathering` | 2–4 小时 | 姐妹聚会（离线） |
 | `body` | `sick` | 1–3 天 | 生病中 |
 | `body` | `period` | 3–7 天 | 月经中 |
 | `body` | `hospitalized` | 2–5 天 | 住院 |
@@ -800,7 +806,11 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | `trip` | `long_trip` | 3–7 天 | 长途旅游 |
 | `trip` | `hometown_visit` | 72 小时 | 回老家 |
 
-时长写成区间的，在事件开始时从区间里抽定。
+时长写成区间的，在事件开始时从区间里抽定。以上共 43 种可抽取的种类。两种性别都会抽到两个聚会，权重相同，这是有意为之。
+
+另有两种永远不会被抽到：`taking_space`（她提出、用户同意的分开，12–24 小时，离线）和 `fell_out`（用户不理会她的请求时的那场不愉快，1 小时）。
+它们由 engine 为[生活选择流程](#post-v2compsessionsession_idlife-choiceschoice_id)写入，作为 `…/effects` 和生活选择响应里的 `event` 出现，
+不能写进 `kinds`。
 
 `sudden_desire` 与 `pregnancy_scare`（后者隐含性行为）带成人题材；只对部分用户提供这类内容的调用方，用
 `{"disallow": ["sudden_desire", "pregnancy_scare"]}` 把它们排除。`scolded_by_superior` 与 `scolded_superior`
@@ -810,16 +820,19 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 
 - **两段抽取。** engine 先按权重抽类别，再在类别内按权重抽种类。往一个类别里加种类，不会改变其他类别的占比。
 - **一次一件插曲，一个背景。** 角色的任何一个 session 里有插曲在进行时，不再抽取。背景进行期间只抽插曲；
-  住院和术后期间，不抽需要她出门活动的那十二种（`temp_work`、`police_encounter`、`animal_encounter`、
+  住院和术后期间，不抽需要她出门活动的那十七种（`temp_work`、`police_encounter`、`animal_encounter`、
   `hit_someone`、`got_hit`、`working_out`、`grocery_shopping`、`in_class`、`on_the_way`、`in_battle`、
-  `got_bumped`、`bumped_someone`）；
+  `got_bumped`、`bumped_someone`、`saw_bag`、`saw_clothes`、`out_shopping`、`bros_gathering`、`sis_gathering`）；
   `period` 期间，`period_scare` 与 `pregnancy_scare` 都不抽。
+- **她在等回答时什么都不抽。** 从她提出分开的请求起，到它被回答或过期（24 小时）为止，角色任何一个 session 的抽取都返回
+  `{"event": null, "message": null}`。带着已经抽过的 `event_key` 来重复调用，照样返回那个事件。
 - **冷却。** 每种事件从开始起有各自的冷却。trip 类每周最多开始一次，body 类每两周最多开始一次，不论具体是哪一种。
   任何离线类种类每 12 小时最多开始一次，不论具体是哪一种。
 - **她的需求给类别内的种类加权**，前提是部署配置了 LLM 判官，并且角色有一次判定。
 - **亲近度门槛。** `ex_message` 与 `breakup` 不会向不太熟的人抽出（intimacy 档 2 及以上）；
   `sudden_desire` 只在最亲近的档（3）。`period` 只对 `art_metadata.gender` 为 `"female"` 的角色抽取；
-  `period_scare`（档 2 及以上）与 `pregnancy_scare`（档 3）同样只对这样的角色抽取。离线类种类遵循两道 ghost 门槛（见下）。
+  `period_scare`（档 2 及以上）与 `pregnancy_scare`（档 3）同样只对这样的角色抽取，`saw_bag` 和 `saw_clothes` 也是；
+  从档 2 起，她会说自己想要看中的东西，有 `tip_personality` 的角色用那份人格的口吻说。离线类种类遵循两道 ghost 门槛（见下）。
 - **角色设置**，写在 genome 的 `art_metadata` 里，影响抽取：
 
   | 键 | 取值 | 效果 |
@@ -842,8 +855,10 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 `ends_at` 是那一刻加上抽到的时长。背景进行期间抽到的插曲，从背景里讲出来（「出差途中遇到一只小猫」）。
 `offline` 对离线类种类（见下）为 `true`，其他种类为 `false`。
 
-**离线类。** `away_from_phone`、`busy`、`in_battle`、`asleep` 持续期间，角色联系不上。
-`busy` 与 `in_battle` 在 intimacy 档 2 及以上会用一条消息讲出来。其他情况，以及另外两种的所有情况，
+**离线类。** `away_from_phone`、`busy`、`in_battle`、`asleep`、`bros_gathering`、`sis_gathering`，以及女性角色的
+`out_shopping` 持续期间，角色联系不上；对其他角色，`out_shopping` 是一件普通的插曲（`"offline": false`，每一档都讲出来），
+她照常回复。两个聚会的存在，是为了让她有自己的生活，不围着用户转。`busy`、`in_battle` 和女性角色的 `out_shopping`
+在 intimacy 档 2 及以上会用一条消息讲出来。其他情况，以及 `away_from_phone`、`asleep` 和两个聚会的所有情况，
 都不生成任何东西：响应里带着事件，`"message": null`、`"message_id": null`，`started_at` 是调用的那一刻。
 
 ```json
@@ -852,14 +867,14 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 ```
 
 它们持续期间，角色任何一个 session 里的每一轮文字消息都会被 ghost，不经过判官，也不计入 ghost 连续次数，
-`/open` 返回 `null`。已经讲出来的 `busy` 或 `in_battle` 同样让轮次沉默。
+`/open` 返回 `null`。已经讲出来的 `busy`、`in_battle` 或 `out_shopping` 同样让轮次沉默。
 带用户 `action` 的轮次（任何 `type`：`give`、`gift`、`tip`、`kiss`、`hug`、`touch`、`lick`、`custom`）或 `image.force = true` 是例外：
 它走正常路径并得到回复，因为动作在语义上是线下互动，用不着手机，强制出图的轮次永远是 `reply_image`。
 角色只在 ghost 保护允许的地方才会这样沉默：部署的 ghosting 开关关闭（`ghosting = false`）时不会抽到任何离线类种类，已经在进行的一段也不再让轮次沉默，
 用户消息不足 10 条的会话里也不会抽到；调用方完全不想要它们，就在 `kinds` 里不写。这样被 ghost 的消息没有回执（没有判官读过它），
 角色解释之后它依然没有回执。事件结束后，在用户消息被 ghost 过的会话里，角色的下一条消息——回复、`/open` 开场白或事件消息——
-会按这一种的说法解释：她刚才睡着了、在忙、在打一场硬仗或没看手机，对方那时发来的消息她现在才看到。
-`busy` 或 `in_battle` 开始时讲的那条消息不算解释：它写在事件结束之前。她在那里写过一条带文字的消息之后，这件事就了结了；只有图的回复不算。机制见
+会按这一种的说法解释：她刚才睡着了、在忙、在打一场硬仗、在逛街、在兄弟或姐妹的聚会上，或没看手机，对方那时发来的消息她现在才看到。
+`busy`、`in_battle` 或 `out_shopping` 开始时讲的那条消息不算解释：它写在事件结束之前。她在那里写过一条带文字的消息之后，这件事就了结了；只有图的回复不算。机制见
 [ghost-mechanics.zh.md](ghost-mechanics.zh.md#engine-强制的-ghost)。
 
 **虚惊一场。** `period_scare` 与 `pregnancy_scare` 讲出来的就是这场惊吓本身，用角色自己的口吻。
@@ -878,7 +893,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
   各自列出正在进行的背景和插曲；`/open` 开场白同样带 `- 正在经历：…` 这一行。`GET …/effects` 两者都会列出。
   一段离线类事件结束之后（在被它 ghost 过消息的会话里），或一场虚惊结束之后（在讲出它的那个会话里），`[近期事件]` 行多出一项，回复多出一行 `- 刚才：…`，直到她在那里写过一次为止（一条带文字的消息；
   见 [model-config.zh.md](model-config.zh.md#taskspde_decision--opt-in-llm-pde-判断器)）。
-- **错误：** `event_key` 格式不对返回 `400`，`code: "invalid_payload"`；未知的 `kind` 返回 `422`。会话检查与 `/open` 相同
+- **错误：** `event_key` 格式不对返回 `400`，`code: "invalid_payload"`；未知的 `kind`，或 `taking_space`、`fell_out`，返回 `422`。会话检查与 `/open` 相同
   （`403`、`404`，语音或群会话 `409`），达到单用户并发上限 `429`。BYOC 实例的会话返回 `400 byoc_unsupported`。
   生成失败时返回与图片接口相同的上游错误，不写入任何内容。
   回复为空时不写入任何内容，返回空值。
@@ -898,6 +913,77 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 ```
 
 没有余效时 `effects` 为 `[]`。错误同 `/open`：`404 session_not_found`、`403 session_forbidden`，语音或群 session 为 `409 wrong_channel`。
+
+### `POST /v2/comp/session/{session_id}/life-choices/{choice_id}`
+
+回答她提出的分开请求。chemistry 比 bond 高出两档、她的耐心连续三个被判官评过的回合都很低时，角色会用一条主动消息
+（`metadata.proactive = "life_choice"`）向用户提出想先分开一阵，这个 session 随之带着一次待回答的选择，有效期 24 小时；
+她在与该用户的所有 session 里同一时间最多只有一个这样的请求待回答。
+用户可以在这里回答、用文字回复，或者什么都不说。她怎么提出、什么时候提出、每条路各付什么代价，见
+[life-events-needs.zh.md](life-events-needs.zh.md#提出分开的选择)。
+
+客户端从
+[`GET /bff/v1/comp/affinity/{session_id}/event`](#get-bffv1compaffinitysession_idevent)
+的 `life_choice` 字段得知这次选择，字段里有选择的 `id` 和它接受的回答。请求落在触发它的那一轮之后几秒，所以那一轮放行的 delta
+通常赶不上它：**历史里某一行带 `occasion: "life_choice"` 时，应当重新拉一次 delta**（两个历史路由都把这一行的
+`metadata.proactive` 作为 `occasion` 给出）。没有适配的客户端什么都不会损失：
+它把请求当成一条普通消息显示，用户用文字回复，走的就是下面的“不理会”那条路。
+
+```json
+{
+  "response": "accept",
+  "user_timezone": "Asia/Taipei",
+  "tier": "gold"
+}
+```
+
+| 字段 | 规则 |
+|---|---|
+| `response` | 必填：`"accept"` 或 `"decline"`；其他取值返回 `422` |
+| `user_timezone`、`user_country`、`user_region`、`tier`、`prompt_traits`、`memory_scope`、`affinity_scope`、`audit` | 与 `/open` 相同，用于生成她的回应。engine 在两次调用之间不保存任何东西 |
+
+只服务 1:1 文字 session。一个事务里完成回答并付清代价：
+
+- **`accept`：** 选择变为 `accepted`。一段 `taking_space` 分开从此刻开始，持续时长是她提出时的档位差距每一档 6 小时
+  （差距 2、3、4 对应 12、18、24 小时）；期间她在所有 session 里都离线，正在进行的插曲在这一刻结束。
+  bond 和 chemistry 各降一档，分开结束后的 72 小时内，这个 session 里为正的增长减半。
+- **`decline`：** 选择变为 `declined`。同样的降档；没有分开，也没有放缓。
+
+然后她用一条主动消息回应（接受之后是道别，拒绝之后是受伤的回应），与普通回复一样落库并返回：
+
+```json
+{"status": "accepted",
+ "message": {"message_id": "…", "content": "好，那我们先各自安静一下。", "sent_at": "2026-10-20T12:00:00Z", "occasion": "life_choice"},
+ "affinity": {"bond_tier": 1, "chem_tier": 3, "bond_label": "acquaintance", "chemistry_label": "crush", "…": "…"},
+ "event": {"kind": "taking_space", "category": "mid", "offline": true, "started_at": "2026-10-20T12:00:00Z", "ends_at": "2026-10-21T06:00:00Z", "message_id": null}}
+```
+
+`status` 为 `accepted` 或 `declined`。`affinity` 是降档之后的关系，形状同
+[`GET /bff/v1/comp/affinity/{session_id}`](#get-bffv1compaffinitysession_id) 里的 `affinity`。`event` 是接受时开始的分开，拒绝时为 `null`。
+她的生成失败、回复为空，或用户有更新的消息先落库时，`message` 为 `null`：回答、分开和降档照样生效。
+
+用户不调用这个路由时，还有两件事会让选择结算：
+
+- **不理会。** 选择待回答期间到达的第一条普通用户文字消息（不带 `action` 的轮次）会转换它：状态变为 `ignored`，并从那条消息起开始一场一小时的
+  `fell_out` 插曲，所以正是这一条不理会她的消息，回复时她的上下文里已经带着这场不愉快。不改任何档位。
+  只有在她提出之后发出的消息才会触发。动作轮次不会结算它，`/open` 和 reaction 也不会。分开期间的消息一律只是 ghost，不会转化任何挂起的请求。
+- **过期。** 她提出 24 小时后，这次选择处处读作已过期：`life_choice` 不再附带，这个路由返回 `409`，之后的消息什么都不转换，也没有任何代价。
+
+结算和一条进来的消息按事务竞争；先写入的赢，输的一方得到这个路由的 `409`。
+
+错误。下面这些拒绝用流前错误的响应体 `{code, message, user_message}`：
+
+| 状态码 | code | 何时 |
+|---|---|---|
+| 400 | `invalid_payload` | `tier`、`prompt_traits` 或 `audit` 格式不对 |
+| 400 | `byoc_unsupported` | 这个 session 属于 BYOC 实例 |
+| 403 | `session_forbidden` | session 不是调用方的 |
+| 404 | `session_not_found` | session 不存在 |
+| 404 | `life_choice_not_found` | 这次选择不属于这个 session |
+| 409 | `wrong_channel` | 语音或群 session |
+| 409 | `life_choice_closed` | 选择已经结算（被这个路由，或被用户的消息），或已过期 |
+
+`response` 不是 `accept` 或 `decline`、或其他字段格式不对返回 `422`；达到单用户并发上限返回 `429`，这一步发生在写入任何东西之前，所以选择仍然开着。
 
 ### `PUT /v2/comp/session/{session_id}/message/{message_id}/reaction`
 
@@ -957,6 +1043,8 @@ SSE 帧是整轮最后一帧且只走线上——在它发出前断线，光看 
 `reaction`（只出现在 assistant 行上）为 `{emoji, reacted_at}`。
 
 `speaker_session_id`（只出现在群 session 的 assistant 行上，其余省略）是说这句话的成员 session；已离群的发言者，其名字通过 session 再到 instance 解析。
+
+`occasion`（只出现在角色主动写下的 assistant 行上，其余省略）说明她为什么开口：这一行的 `metadata.proactive`，取值为 `birthday`、`holiday`、`first_meet`、`returning`、`just_opened`、`event` 或 `life_choice`。适配了[生活选择](#post-v2compsessionsession_idlife-choiceschoice_id)的客户端读到 `life_choice` 时，应当重新拉一次好感度 delta。
 
 `user_message_id` 指向产生这一行的那一轮的 `role='user'` 行。assistant 行和
 `system_error` 通知行上都有，user 行本身省略。通知行最要紧：队列 worker 和
@@ -1685,6 +1773,8 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
 所以同样带这个标记。
 `user_message_id` 指向产生这一行的那一轮的 `role='user'` 行 —— assistant 行和
 `system_error` 通知行上都有，user 行省略。`speaker_session_id` 标出群 session 里 assistant 行的发言者，其余行省略。
+`occasion`（只出现在角色主动写下的 assistant 行上，其余省略）与上面 canonical history 里的同名字段相同，包括 `life_choice`；
+`start` 打包的历史同样带它。
 `reply_to_message_id` 回显 `user` 行发送时带的引用（见 stream 路由的**可选：引用**
 一节）——它引用的那条消息的 id，一定在同一个 session 里；
 普通轮次、以及锚点没解析成功的轮次都省略该字段，这样冷启动不必自己存状态
@@ -1765,6 +1855,14 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
       "updated_at": "2026-08-17T14:02:11.412Z"
     },
     "user_message_id": "…",
+    "life_choice": {
+      "id": "…",
+      "kind": "ask_for_space",
+      "options": ["accept", "decline"],
+      "asked_at": "…",
+      "expires_at": "…",
+      "message_id": "…"
+    },
     "created_at": "…"
   }
 }
@@ -1773,7 +1871,8 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
 `event` 为 `null` 的情况：还没有任何用户轮次事件（全新 session，或只有
 time-decay），或最近一次事件早于 affinity migration `0014`。`event_type`
 ∈ `message | gift | proactive | ghost`；ghost 轮次的 `effective_deltas`
-全为零。
+全为零。生活选择的降档是它自己类型的好感度事件，`life_choice`，这条路由和 `time_decay` 一样从不返回它：
+新的状态在结算响应里带回，别的设备从下面的绝对值路由读。
 
 - `effective_deltas_computed` —— 精确的每轮行增量，在持久化时从取下界前后的 bond/chemistry 分数计算得出，存储于事件行。单位为合成分增量——与快照的 `bond`/`chemistry` 同一 0..1 刻度——适合每轮 "+X bond / +Y chemistry" 脉冲显示。迁移前的旧行可能缺省。
 - `label_changes` —— 引擎权威的档位变化（本轮无档位跨越时为 `null` / 缺省）。前端无需自行计算变化。
@@ -1785,6 +1884,11 @@ time-decay），或最近一次事件早于 affinity migration `0014`。`event_t
 - `user_message_id` —— 驱动本轮的用户消息（`chat_messages.id`）；把 delta 挂到这条消息
   或它的回复（`chat_messages.user_message_id`）上。`proactive` / `time_decay` 事件
   以及 migration `0056` 之前写入的行没有这个键。
+- `life_choice` —— 该 session 待回答的选择，在响应时现场拼出，只要有一次选择未被回答、也没过 24 小时，就附在 `event` 上；
+  没有时不带。`options` 列出
+  [生活选择路由](#post-v2compsessionsession_idlife-choiceschoice_id)接受的回答；`message_id` 是提出它的那条聊天消息
+  （那一行没了就不带）。请求落在触发它的那一轮之后几秒，所以历史里某一行带 `occasion: "life_choice"` 时，
+  应当重新拉一次 delta。忽略这个字段的客户端会降级成那里描述的“不理会”。
 
 ### `GET /bff/v1/comp/affinity/{session_id}`
 
@@ -1938,7 +2042,7 @@ curl -H "x-insights-export-secret: $INSIGHTS_EXPORT_SECRET" \
 | 401 | `unauthorized` | JWT 缺失 / 格式錯 / 過期 / 密鑰不符 |
 | 403 | `forbidden` | 路徑 user 跟 JWT user 不匹配，或想讀別人的 session；或 `/svc/v1/*` 上 `x-insights-export-secret` 缺失或錯誤 |
 | 404 | `not_found` | session / 人格 / 消息 id 不存在 |
-| 409 | `conflict` | 资源当前的状态不允许这个操作。reaction 路由和改图在收到群 session 时返回它，`message` 里含 `wrong_channel`。1:1 的流式与异步发送、`/open`、`/events` 和 `/effects` 拒绝群 session 时改用带代码的响应体（`code: wrong_channel`），群路由拒绝非群 session 时也一样 |
+| 409 | `conflict` | 资源当前的状态不允许这个操作。reaction 路由和改图在收到群 session 时返回它，`message` 里含 `wrong_channel`。1:1 的流式与异步发送、`/open`、`/events`、`/effects` 和生活选择路由拒绝群 session 时改用带代码的响应体（`code: wrong_channel`），群路由拒绝非群 session 时也一样 |
 | 500 | `internal` | 其餘一切（DB 錯、LLM API 錯等） |
 | *provider 自己的状态码* | `upstream` | 上游供应商调用失败（目前仅 persona compose 端点——合成器链条全部失败）。自 v1.4.0 起**不再固定是 502**：provider 的状态码原样透传（`529`、`503`、`429`……），没有上游状态码的网关层失败则超时映射为 `504`、其余为 `502`。响应体带 `upstream_status` / `provider_code` / `error_type` 或 `gateway_kind`，以及 `retryable`——见 [compose 端点](#post-personainstance_idimagecompose)。请按 `"error": "upstream"` 这个 key 判断，不要按状态码。 |
 
@@ -1950,6 +2054,7 @@ curl -H "x-insights-export-secret: $INSIGHTS_EXPORT_SECRET" \
 - `crates/eros-engine-server/src/routes/session_open.rs`——角色先开口：生日、节日开场白与调用方指定的场合（`v2/comp/session/{session_id}/open`）
 - `crates/eros-engine-server/src/routes/session_events.rs`——角色讲述的生活事件：抽取，以及讲述它的那条主动消息（她不讲的离线类种类没有）（`v2/comp/session/{session_id}/events`）
 - `crates/eros-engine-server/src/routes/session_effects.rs`——角色因被接受的 give 而带着的余效、她的需求和正在经历的事件（`v2/comp/session/{session_id}/effects`）
+- `crates/eros-engine-server/src/routes/life_choices.rs`——用户对她提出分开的回答：接受或拒绝（`v2/comp/session/{session_id}/life-choices/{choice_id}`）
 - `crates/eros-engine-server/src/routes/group.rs`——群管理与群发送路由（`v2/comp/group*`）
 - `crates/eros-engine-server/src/routes/reaction.rs`——消息 reaction：设置、撤销与允许列表（`v2/comp/session/{session_id}/message/{message_id}/reaction`、`v2/comp/reactions`）
 - `crates/eros-engine-server/src/routes/insight.rs`——按关系分开的 v2 画像端点（`v2/comp/instance/{instance_id}/insight/character`、`.../insight/user`）

@@ -6,7 +6,8 @@
 
 好感度是每个关系（即每个 session）一份的六轴向量，每轴限定在 `[0, 1]`，每次更新都
 clamp。它只在文本通道、非 `product_qa` 的聊天回合上移动。语音回合与 `product_qa`
-回合从不写好感度事件，群聊回合也不写（群只读取各成员的好感度，从不写入）。判官（LLM 评估器）在任何地方都只输出 ordinal 的档位或等级；
+回合从不写好感度事件，群聊回合也不写（群只读取各成员的好感度，从不写入）。唯一不属于回合的变动，
+是被回答的生活选择带来的降档（见[生活选择的降档与放缓](#生活选择的降档与放缓)）。判官（LLM 评估器）在任何地方都只输出 ordinal 的档位或等级；
 引擎拥有每一个数字、每一个标签、每一次档位迁移，是唯一权威来源。
 
 六轴分三组，全文都围绕这三组组织：**基础对**（`warmth`、`patience`）、**Bond**
@@ -163,7 +164,8 @@ penalty = κ_line × ((y − y₀)⁺ / (1 − y₀))² × (|g| / 4)
 
 **4. 阈值门。** 每条线轴维护一个有符号累加器；本轮真实分并入后，只有
 `|累计| ≥ AFFINITY_DELTA_THRESHOLD`（默认 `0` = 每轮都提交）才整体提交，否则
-缓存在 `pending_deltas`。提交的增量 1:1 应用并 clamp 到 `[0,1]`；随后（若本轮
+缓存在 `pending_deltas`。提交的增量 1:1 应用并 clamp 到 `[0,1]`（她提出的分开结束后的 72 小时内，
+为正的增量先减半，见[生活选择的降档与放缓](#生活选择的降档与放缓)）；随后（若本轮
 读到）判官档位覆写存储档位，两个端点按回合后的线值重新派生。
 
 ### 时间
@@ -196,6 +198,27 @@ PDE 判定的 ghost 回合从不进入 `persist_with_event`：只有 `ghost_stre
 - **礼物：** 被接受时还会进入角色的持有物品或衣柜；被拒时什么也不进，并像被拒的 `give` 一样让 Bond 掉一档。
 
 例：chemistry `0.80`（第 4 档内 64% 处）落到第 3 档内 64% 处，约 `0.524`。
+
+### 生活选择的降档与放缓
+
+她提出想先分开一阵，用户回答之后，不论接受还是拒绝，这段关系都要付出代价
+（见[选择](life-events-needs.zh.md#提出分开的选择)）。这里没有任何一步是聊天回合：不跑判官。
+
+- **降档（接受和拒绝）。** bond 与 chemistry 各降一档，用被拒动作的落点规则，同时作用在两条线上：
+  落在下一档内的相同相对位置，每条线的两个轴按同一比例缩放，第 1 档的线直接归 `0`。两条线的
+  `pending_deltas` 都清零。它按时间衰减和端点刷新之后的快照计算（用部署的 affinity 调参值），
+  在行锁内、与结算这次选择的同一个事务里完成，所以结算回滚时不会留下降档。接受之后，降档就是她归来时的状态，
+  归来时不再有别的事发生。
+- **它的事件行。** 一行自己类型的非回合事件，`event_type = 'life_choice'`（migration `0077` 把类型检查放宽了这一个取值）。
+  `deltas` 与 `effective_deltas` 的数字相同，因为降档就是全部的原始变化；`label_changes`、
+  `effective_line_deltas` 和前后两份状态快照记录档位的移动。`context` 里有 `life_choice`（`accept` | `decline`）
+  和 `choice_id`。这一行没有 `user_message_id`。逐轮 delta 路由
+  `GET /bff/v1/comp/affinity/{session_id}/event` 从不返回它，和 `time_decay` 一样，它也不算被判官评过的回合。
+- **放缓（只在接受时）。** 分开结束之后的 72 小时内，四个线轴上每一个为正的已提交增量，在应用前减半。负增量全额应用，
+  `warmth` 与 `patience` 照常从回合后的线值重新派生。被削掉的部分就没了：不会存进门的余额里。它只作用于这次选择所在的
+  session；窗口是推算出来的，没有新状态：选择的 `event_id` 指向分开那一行的 `ends_at`，窗口是 `ends_at` 到
+  `ends_at` 加 72 小时，按墙钟算。被放缓的回合，事件行带 `context.growth_scale`（`0.5`），全速时没有这个键，
+  它的 `effective_deltas` 显示的是减半后的值。
 
 ## 基础对派生细节
 
@@ -262,8 +285,11 @@ PDE 判定的 ghost 回合从不进入 `persist_with_event`：只有 `ghost_stre
 - 群聊导演：每位成员的 Bond 与 Chemistry 档位标签和 intimacy 档，从该成员的
   1:1 会话里读取，从不写入。
 - 生活事件抽取：intimacy 档决定能否抽到 `ex_message`、`breakup` 与 `period_scare`（档 1 时不会抽到）、
-  `sudden_desire` 与 `pregnancy_scare`（只在档 3），以及 `busy` 和 `in_battle` 讲不讲出来（档 2 起）
+  `sudden_desire` 与 `pregnancy_scare`（只在档 3），以及 `busy`、`in_battle` 和女性角色的 `out_shopping`
+  讲不讲出来（档 2 起）；从档 2 起，她也会说自己想要购物小发现（`saw_bag`、`saw_clothes`）里看中的东西
   （见 [events 路由](api-reference.zh.md#post-v2compsessionsession_idevents)）。
+- 提出分开：两条档位阶梯（chemistry 比 bond 高出两档或更多）和最近三个被判官评过的回合推算出的 `patience`，
+  决定她要不要提出先分开一阵（见[选择](life-events-needs.zh.md#提出分开的选择)）。
 - Ghost 打分：`score = (1−intrigue)·0.4 + (1−patience)·0.4 + tension·0.2`，
   带硬否决（前 10 条消息、连续 ghost ≥2、1 小时冷却），阈值 `0.65`，会话已经
   ghost 过一次后升为 `0.85`。
@@ -329,14 +355,16 @@ Migration `0048` 把 `bond`、`chemistry` 重定义为 Postgres
 每个增量回合向 `companion_affinity_events` 追加一行：
 
 - `deltas`：本轮线轴的原始分（档位换算加规则微调，衰减前）；这里的
-  `warmth`/`patience` 恒为 `0.0`。
+  `warmth`/`patience` 恒为 `0.0`，`life_choice` 行除外，它的 `deltas` 与
+  `effective_deltas` 相同（见[上文](#生活选择的降档与放缓)）。
 - `effective_deltas`：实际应用的逐轴变化，`after − before`；基础对上它
   就是本轮派生 delta。
 - `context`：`affinity_reason`、`eval_skip_reason`、判官原样的有符号
   `grades`、门的 `pending_after`，以及端点审计（本轮实际读到时的
   `warmth_grade`/`patience_grade`、`boost_warmth`/`boost_patience`、
   `decay_factor`、`units`）；被收税的回合另有 `cross_penalty_assessed`；动作被拒绝而降档的回合另有
-  `tier_drop`（`bond` | `chemistry`），标明被降的那条线。
+  `tier_drop`（`bond` | `chemistry`），标明被降的那条线；分开之后的放缓减半了为正的增长时，另有 `growth_scale`（`0.5`）。
+  生活选择自己的 `life_choice` 行，`context` 是 `life_choice` 与 `choice_id`（见[上文](#生活选择的降档与放缓)）。
 - `user_message_id`（migration `0056`）：对 `chat_messages` 的真外键，
   `ON DELETE SET NULL`；`proactive`/`time_decay` 行与迁移前写入的行为
   `NULL`，不回填。
@@ -344,6 +372,9 @@ Migration `0048` 把 `bond`、`chemistry` 重定义为 Postgres
   bond/chemistry delta，API 上服务为 `effective_deltas_computed`）、
   `state_after`（本轮结束时的整个向量，migration `0049`）。`state_before`
   列存在但不对外服务，要重放请直接查表。
+
+`event_type` 取值为 `message`、`ghost`、`gift`、`proactive`、`time_decay` 或 `life_choice`。
+后两个不是回合：逐轮 delta 路由只读 `message`、`gift`、`proactive` 和 `ghost`。
 
 ### API 表面
 
@@ -435,7 +466,9 @@ Migration `0048` 把 `bond`、`chemistry` 重定义为 Postgres
 - `crates/eros-engine-core/src/scope.rs`：`AffinityScope` / `MemoryScope`、
   `length_score`（见「`affinity.rs` 与 `scope.rs`」）
 - `crates/eros-engine-store/src/affinity.rs`：`AffinityRepo`
-  （`persist_with_event`、`record_ghost`）、migrations 0048–0049
+  （`persist_with_event`、`record_ghost`、`persist_life_choice_drop_in_tx`、`last_judged_patiences`）、migrations 0048–0049、0077
+- `crates/eros-engine-store/src/life_choices.rs`：`LifeChoiceRepo`
+  （选择行；`growth_slowed` 推算放缓窗口）
 - `crates/eros-engine-server/src/pipeline/post_process.rs`：LLM 评估、
   档位解析
 - `crates/eros-engine-server/src/prompt.rs`：好感度 → 态度指令 + 评估提示词
@@ -448,3 +481,4 @@ Migration `0048` 把 `bond`、`chemistry` 重定义为 Postgres
 - 设计 spec：`docs/superpowers/specs/2026-08-17-affinity-41-design.md`，
   档位列落库、事件状态快照、绝对值端点
 - 设计 spec：`docs/superpowers/specs/2026-10-05-chat-user-actions-design.md` —— 用户动作、判官的接受与拒绝、降档
+- 设计 spec：`docs/superpowers/specs/2026-10-19-life-events-shopping-gatherings-and-ask-for-space-design.md` —— 提出分开的选择、双线降档、增长放缓

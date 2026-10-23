@@ -4,7 +4,7 @@
 
 ## 1. 概要
 
-Affinity(親密度)は、セッション(会話単位の関係)ごとに保持される6軸のベクトルである。各軸の値は `[0, 1]` の範囲に収まり、更新のたびにクランプされる。値が変化するのは、テキストチャンネルの `product_qa` 以外のチャットターンに限られる。voice チャンネルのターンと `product_qa` ターンでは、親密度イベントは一切書き込まれない。グループチャットのターンも同様で、グループは各メンバーの親密度を読み取るだけで、書き込まない。
+Affinity(親密度)は、セッション(会話単位の関係)ごとに保持される6軸のベクトルである。各軸の値は `[0, 1]` の範囲に収まり、更新のたびにクランプされる。値が変化するのは、テキストチャンネルの `product_qa` 以外のチャットターンに限られる。voice チャンネルのターンと `product_qa` ターンでは、親密度イベントは一切書き込まれない。グループチャットのターンも同様で、グループは各メンバーの親密度を読み取るだけで、書き込まない。ターンではない唯一の変化は、回答された生活選択によるティア降格である([生活選択による降格と成長の鈍化](#生活選択による降格と成長の鈍化)を参照)。
 
 ジャッジ(LLM 評価器)が返すのは、グレードやレベルといった離散的な区分による順序尺度のみである。実数値、ラベル、ティア遷移の判定は、すべてエンジンが担う。数値を決定する唯一の主体はエンジンである。
 
@@ -144,7 +144,7 @@ penalty = κ_line × ((y − y₀)⁺ / (1 − y₀))² × (|g| / 4)
 
 4. **閾値ゲート。** 軸ごとに符号付きアキュムレータを持つ。累積値の絶対値が `AFFINITY_DELTA_THRESHOLD`(デフォルト 0 = 毎ターン確定)以上になった時点で確定し、それ以外は `pending_deltas` に蓄積される。
 
-   確定したデルタは 1:1 で適用され、`[0,1]` にクランプされる。その後、そのターンでジャッジのレベルが読み取られていれば保存済みレベルを上書きし、両エンドポイントをターン後のライン値から再導出する。
+   確定したデルタは 1:1 で適用され、`[0,1]` にクランプされる(彼女が持ち出した別離が終わってから 72 時間は、正のデルタが先に半分になる。[生活選択による降格と成長の鈍化](#生活選択による降格と成長の鈍化)を参照)。その後、そのターンでジャッジのレベルが読み取られていれば保存済みレベルを上書きし、両エンドポイントをターン後のライン値から再導出する。
 
 ### 3.3 時間
 
@@ -168,6 +168,14 @@ PDE が決めたゴーストターンは `persist_with_event` に到達しない
 - **ギフト：** 受け取られると、キャラクターの持ち物かワードローブにも加わる。断られると何も加わらず、断られた `give` と同じく Bond が一段下がる。
 
 例：chemistry `0.80`（段階 4 の 64% の位置）は段階 3 の 64% の位置、約 `0.524` に着地する。
+
+### 生活選択による降格と成長の鈍化
+
+彼女が「少し距離を置きたい」と切り出し、ユーザーが答えると、どちらの答えでも関係に代償が生じる([選択](life-events-needs.md#the-ask-for-space-choice)を参照)。ここにチャットのターンはなく、ジャッジも動かない。
+
+- **降格(accept と decline)。** Bond と chemistry は、拒否されたアクションと同じ着地規則で、両方のラインが同時に 1 段階下がる。下の段階の中で同じ相対位置に着地し、各ラインの 2 軸は同じ係数で縮小され、段階 1 のラインは `0` になる。両ラインの `pending_deltas` はクリアされる。時間減衰とエンドポイント再計算(デプロイの affinity チューニングを使う)を済ませたスナップショットから、行ロック内で、選択を解決するトランザクションの中で計算されるため、解決がロールバックされれば降格も残らない。accept の場合、降格は彼女が戻ってきたときの状態であり、戻った時点でさらに何かが起きることはない。
+- **そのイベント行。** ターンではない専用の `event_type`、`life_choice` の 1 行(マイグレーション `0077` が型チェックにこの値を 1 つ加えた)。降格が生の変化のすべてなので、`deltas` と `effective_deltas` は同じ値を持つ。`label_changes`、`effective_line_deltas`、前後 2 つの状態スナップショットがティアの移動を記録する。`context` には `life_choice`(`accept` | `decline`)と `choice_id` が入る。この行に `user_message_id` はない。ターンごとの delta ルート `GET /bff/v1/comp/affinity/{session_id}/event` は `time_decay` と同様にこの行を返さず、ジャッジが採点したターンとしても数えられない。
+- **成長の鈍化(accept のみ)。** 別離が終わってから 72 時間、4 つのライン軸で確定した正のデルタはすべて、適用前に半分になる。負のデルタは全額適用され、`warmth` と `patience` は従来どおりターン後のライン値から再導出される。削られた分は失われ、ゲートの残高には積まれない。適用されるのは選択が行われたセッションだけである。ウィンドウは導出されるもので新しい状態はない。選択の `event_id` から別離の `ends_at` を引き、`ends_at` から `ends_at` + 72 時間までを実時間で数える。鈍化したターンのイベント行は `context.growth_scale`(`0.5`)を持ち、通常の速度ではこのキーは付かず、`effective_deltas` には半分になった値が出る。
 
 ## 4. 基礎ペア導出の詳細(定数とその根拠)
 
@@ -225,7 +233,9 @@ Chemistry: `spark` / `flirtation` / `crush` / `lover` / `beloved`
 
 - グループチャットのディレクター — 各メンバーの Bond と Chemistry のラベルおよび intimacy rung。メンバーの 1:1 セッションから読み取るだけで、書き込みは一切行わない。
 
-- ライフイベントの抽選 — intimacy rung が `ex_message`、`breakup`、`period_scare`(rung 1 では抽選されない)、`sudden_desire`、`pregnancy_scare`(rung 3 のみ)の可否と、`busy` と `in_battle` を告げるかどうか(rung 2 から)を決める(events ルートの説明は [API reference](api-reference.md#post-v2compsessionsession_idevents) を参照)。
+- ライフイベントの抽選 — intimacy rung が `ex_message`、`breakup`、`period_scare`(rung 1 では抽選されない)、`sudden_desire`、`pregnancy_scare`(rung 3 のみ)の可否と、`busy`、`in_battle`、女性ペルソナの `out_shopping` を告げるかどうか(rung 2 から)を決める。rung 2 からは、ショッピングの小さな発見(`saw_bag`、`saw_clothes`)で目に留まったものを「欲しい」と口に出すようにもなる(events ルートの説明は [API reference](api-reference.md#post-v2compsessionsession_idevents) を参照)。
+
+- 距離を置きたいという切り出し — 2 本のティア階段(chemistry が bond より 2 段階以上高い)と、直近 3 回のジャッジ採点ターンから導出された `patience` が、彼女が休みを切り出すかどうかを決める([選択](life-events-needs.md#the-ask-for-space-choice)を参照)。
 
 - ゴーストスコアリング — `score = (1−intrigue)·0.4 + (1−patience)·0.4 + tension·0.2` を使い、ハード veto(最初の10メッセージ、streak ≥ 2、1時間クールダウン)と閾値 0.65(セッションが一度ゴーストした後は 0.85)を適用する。
 
@@ -280,15 +290,17 @@ DB が書き込みのたびに再計算するため、ライン軸の値との�
 
 デルタが生じたターンごとに1行が追加される。
 
-- `deltas` = 生スコア(グレード変換 + ルールナッジ、減衰前)。ここでは `warmth`/`patience` は常に 0.0 である。
+- `deltas` = 生スコア(グレード変換 + ルールナッジ、減衰前)。ここでは `warmth`/`patience` は常に 0.0 である。ただし `life_choice` 行は例外で、その `deltas` は `effective_deltas` と同じ値を持つ([上記](#生活選択による降格と成長の鈍化)を参照)。
 
 - `effective_deltas` = after − before の適用済み変化(基礎ペアについては、そのターンの導出デルタ)。
 
-- `context` = `affinity_reason`、`eval_skip_reason`、判定どおりの符号付き `grades`、`pending_after`、エンドポイント監査情報(読み取られた場合の `warmth_grade` / `patience_grade`、`boost_warmth` / `boost_patience`、`decay_factor`、`units`)、ペナルティが課された場合の `cross_penalty_assessed`、拒否されたアクションでラインが下がった場合の `tier_drop`(`bond` | `chemistry`)。
+- `context` = `affinity_reason`、`eval_skip_reason`、判定どおりの符号付き `grades`、`pending_after`、エンドポイント監査情報(読み取られた場合の `warmth_grade` / `patience_grade`、`boost_warmth` / `boost_patience`、`decay_factor`、`units`)、ペナルティが課された場合の `cross_penalty_assessed`、拒否されたアクションでラインが下がった場合の `tier_drop`(`bond` | `chemistry`)、別離後の鈍化で正の成長が半分になった場合の `growth_scale`(`0.5`)。生活選択自身の `life_choice` 行の `context` は、代わりに `life_choice` と `choice_id` になる([上記](#生活選択による降格と成長の鈍化)を参照)。
 
 - `user_message_id`(マイグレーション 0056): `chat_messages` への実際の FK、`ON DELETE SET NULL`。`proactive` / `time_decay` 行および移行前の行では NULL であり、バックフィルはされない。
 
 - `label_changes`(§5参照)、`effective_line_deltas`(ターンごとの正確な bond/chemistry デルタ、`effective_deltas_computed` として提供される)、`state_after`(ターン後の全ベクトル、マイグレーション 0049)。`state_before` は存在するが提供されない。リプレイは直接クエリで行う。
+
+`event_type` は `message`、`ghost`、`gift`、`proactive`、`time_decay`、`life_choice` のいずれかである。後ろの 2 つはターンではなく、ターンごとの delta ルートが読むのは `message`、`gift`、`proactive`、`ghost` だけである。
 
 ### API インターフェース
 
@@ -375,7 +387,8 @@ DB が書き込みのたびに再計算するため、ライン軸の値との�
 
 - `crates/eros-engine-core/src/affinity.rs` — 型定義、`grade_turn` 書き込みパイプライン、エンドポイント導出、時間減衰、bond/chemistry スコア、ティア、ラベル、`diff_labels`
 - `crates/eros-engine-core/src/scope.rs` — `AffinityScope` / `MemoryScope`、`length_score`(§7参照)
-- `crates/eros-engine-store/src/affinity.rs` — `AffinityRepo`(persist_with_event、record_ghost)、マイグレーション 0048–0049
+- `crates/eros-engine-store/src/affinity.rs` — `AffinityRepo`(persist_with_event、record_ghost、persist_life_choice_drop_in_tx、last_judged_patiences)、マイグレーション 0048–0049、0077
+- `crates/eros-engine-store/src/life_choices.rs` — `LifeChoiceRepo`(選択の行。`growth_slowed` が鈍化ウィンドウを導出する)
 - `crates/eros-engine-server/src/pipeline/post_process.rs` — LLM 評価、grade/level のパース
 - `crates/eros-engine-server/src/prompt.rs` — affinity → attitude ディレクティブ + eval プロンプト
 - `crates/eros-engine-server/src/routes/dto.rs` — `AffinitySnapshot`(複合スコア + ラベル)
@@ -383,3 +396,4 @@ DB が書き込みのたびに再計算するため、ライン軸の値との�
 - 設計仕様書: `docs/superpowers/specs/2026-08-16-affinity-40-design.md` — ライン数式、エンドポイント導出、ティア
 - 設計仕様書: `docs/superpowers/specs/2026-08-17-affinity-41-design.md` — 永続化されたティアカラム、イベントの状態スナップショット、value エンドポイント
 - 設計仕様書: `docs/superpowers/specs/2026-10-05-chat-user-actions-design.md` — ユーザーアクション、ジャッジの応答、ティア降格
+- 設計仕様書: `docs/superpowers/specs/2026-10-19-life-events-shopping-gatherings-and-ask-for-space-design.md` — 距離を置きたいという切り出し、両ラインの降格、成長の鈍化
