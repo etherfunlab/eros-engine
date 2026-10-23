@@ -294,7 +294,9 @@ impl<'a> StoryRepo<'a> {
     /// role/channel/truncation filters as elsewhere in this crate. Pairing
     /// walks chronologically and collapses consecutive user rows to the
     /// latest before pairing with the next assistant reply; a lone assistant
-    /// with no preceding user row is dropped.
+    /// with no preceding user row is dropped. Proactive rows (event and choice
+    /// messages, openers, greetings) are not evidence: life events and choices
+    /// reach the director through their own reads.
     pub async fn chat_evidence(
         &self,
         owner_uid: Uuid,
@@ -312,6 +314,7 @@ impl<'a> StoryRepo<'a> {
                AND cm.truncated = FALSE \
                AND cm.channel IS NULL \
                AND cm.role IN ('user', 'assistant') \
+               AND cm.assistant_action_type IS DISTINCT FROM 'proactive' \
              ORDER BY cm.sent_at DESC \
              LIMIT $4",
         )
@@ -993,6 +996,60 @@ mod tests {
             !pairs.iter().any(|(u, a)| u == "S1问题" && a == "S2回答"),
             "must not pair across sessions"
         );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn chat_evidence_skips_proactive_rows(pool: PgPool) {
+        let repo = StoryRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        let inst = seed_instance(&pool, owner, "A", "active").await;
+        let session: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(owner)
+        .bind(inst)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // A ghosted user row, then an event message she sent on her own: the
+        // event must not read as her answer to it. A greeting is no evidence
+        // either.
+        for (role, content, action, metadata, mins_ago) in [
+            ("user", "在吗", None, "{}", 50),
+            (
+                "assistant",
+                "我刚在路上遇到一只猫",
+                Some("proactive"),
+                r#"{"proactive":"event"}"#,
+                40,
+            ),
+            ("user", "什么猫？", None, "{}", 30),
+            ("assistant", "一只橘猫", None, "{}", 20),
+            (
+                "assistant",
+                "今天是你的节日",
+                Some("proactive"),
+                r#"{"proactive":"holiday"}"#,
+                10,
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages \
+                     (session_id, role, content, assistant_action_type, metadata, sent_at) \
+                 VALUES ($1, $2, $3, $4, $5::jsonb, now() - make_interval(mins => $6))",
+            )
+            .bind(session)
+            .bind(role)
+            .bind(content)
+            .bind(action)
+            .bind(metadata)
+            .bind(mins_ago)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let pairs = repo.chat_evidence(owner, inst, 7, 60).await.unwrap();
+        assert_eq!(pairs, vec![("什么猫？".to_string(), "一只橘猫".to_string())]);
     }
 
     #[sqlx::test(migrations = "./migrations")]
