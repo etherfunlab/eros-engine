@@ -20,7 +20,7 @@ const PENDING_HOURS: i32 = 24;
 const SLOWDOWN_HOURS: i32 = 72;
 
 /// The kind of the one choice there is.
-const ASK_FOR_SPACE: &str = "ask_for_space";
+pub(crate) const ASK_FOR_SPACE: &str = "ask_for_space";
 
 /// A choice's columns, in `LifeChoiceRecord` order.
 const COLUMNS: &str = "id, session_id, kind, status, tier_gap, asked_at, resolved_at, \

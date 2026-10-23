@@ -14,6 +14,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::events::EventRecord;
+use crate::life_choices::{LifeChoiceRecord, ASK_FOR_SPACE};
 
 /// The fixed insight column list, DDL order. Single source for the
 /// full-column UPDATE and the prompt-schema lockstep test (server side).
@@ -120,6 +121,16 @@ pub struct StoryLifeEvent {
     pub event: EventRecord,
     /// The narration; `None` when untold, the message is gone, or its session is archived.
     pub told: Option<String>,
+}
+
+/// One ask-for-space choice as the story director reads it (spec §3.3).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoryLifeChoice {
+    pub choice: LifeChoiceRecord,
+    /// The ask's text; `None` when the message is gone.
+    pub asked: Option<String>,
+    /// The linked `taking_space` row's length in whole hours (rounded); `None` without one.
+    pub separation_hours: Option<i64>,
 }
 
 pub struct StoryRepo<'a> {
@@ -433,6 +444,84 @@ impl<'a> StoryRepo<'a> {
                         },
                         told,
                     })
+                },
+            )
+            .collect())
+    }
+
+    /// The pair's ask-for-space choices for a story round (spec §3.3), newest
+    /// first, asked at or after `since`, from the pair's unarchived sessions:
+    /// a choice belongs to one relationship. Each carries the ask's text and,
+    /// for an accept, the length of the separation it wrote.
+    pub async fn life_choices(
+        &self,
+        owner_uid: Uuid,
+        instance_id: Uuid,
+        since: DateTime<Utc>,
+        cap: i64,
+    ) -> Result<Vec<StoryLifeChoice>, sqlx::Error> {
+        #[allow(clippy::type_complexity)] // sqlx tuple query — type alias would add noise
+        let rows: Vec<(
+            Uuid,
+            Uuid,
+            String,
+            String,
+            i16,
+            DateTime<Utc>,
+            Option<DateTime<Utc>>,
+            Option<Uuid>,
+            Option<Uuid>,
+            Option<String>,
+            Option<i64>,
+        )> = sqlx::query_as(
+            "SELECT lc.id, lc.session_id, lc.kind, lc.status, lc.tier_gap, lc.asked_at, \
+                    lc.resolved_at, lc.message_id, lc.event_id, m.content, \
+                    round(extract(epoch FROM e.ends_at - e.started_at) / 3600)::bigint \
+               FROM engine.life_choices lc \
+               JOIN engine.chat_sessions cs ON cs.id = lc.session_id AND NOT cs.archived \
+               LEFT JOIN engine.chat_messages m ON m.id = lc.message_id \
+               LEFT JOIN engine.persona_events e ON e.id = lc.event_id \
+              WHERE cs.user_id = $1 AND cs.instance_id = $2 \
+                AND lc.kind = $3 AND lc.asked_at >= $4 \
+              ORDER BY lc.asked_at DESC, lc.id DESC \
+              LIMIT $5",
+        )
+        .bind(owner_uid)
+        .bind(instance_id)
+        .bind(ASK_FOR_SPACE)
+        .bind(since)
+        .bind(cap)
+        .fetch_all(self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    id,
+                    session_id,
+                    kind,
+                    status,
+                    tier_gap,
+                    asked_at,
+                    resolved_at,
+                    message_id,
+                    event_id,
+                    asked,
+                    separation_hours,
+                )| StoryLifeChoice {
+                    choice: LifeChoiceRecord {
+                        id,
+                        session_id,
+                        kind,
+                        status,
+                        tier_gap,
+                        asked_at,
+                        resolved_at,
+                        message_id,
+                        event_id,
+                    },
+                    asked,
+                    separation_hours,
                 },
             )
             .collect())
@@ -1299,6 +1388,78 @@ mod tests {
             .unwrap();
         let kinds: Vec<_> = got.iter().map(|e| e.event.kind.as_str()).collect();
         assert_eq!(kinds, vec!["pregnancy_scare"]);
+    }
+
+    #[allow(clippy::too_many_arguments)] // one column per argument
+    async fn seed_choice(
+        pool: &PgPool,
+        session: Uuid,
+        kind: &str,
+        status: &str,
+        asked_at: DateTime<Utc>,
+        message: Option<Uuid>,
+        event: Option<Uuid>,
+    ) {
+        sqlx::query(
+            "INSERT INTO engine.life_choices \
+                 (session_id, kind, status, tier_gap, asked_at, resolved_at, message_id, event_id) \
+             VALUES ($1, $2, $3, 2, $4, \
+                     CASE WHEN $3 = 'pending' THEN NULL ELSE $4 + interval '1 hour' END, $5, $6)",
+        )
+        .bind(session)
+        .bind(kind)
+        .bind(status)
+        .bind(asked_at)
+        .bind(message)
+        .bind(event)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn life_choices_scope_window_and_fields(pool: PgPool) {
+        let repo = StoryRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        let inst = seed_instance(&pool, owner, "A", "active").await;
+        let other = seed_instance(&pool, owner, "B", "active").await;
+        let s = seed_session(&pool, owner, inst).await;
+        let a = seed_session(&pool, owner, inst).await;
+        let x = seed_session(&pool, owner, other).await;
+        let now = Utc::now();
+        let d = chrono::Duration::days;
+        let h = chrono::Duration::hours;
+
+        let ask = seed_told(&pool, s, "我们先分开一阵子好吗").await;
+        let sep_start = now - d(1) + h(1);
+        let sep = seed_event(&pool, inst, Some(s), "k1", "taking_space", sep_start, sep_start + h(12), None)
+            .await;
+        seed_choice(&pool, s, "ask_for_space", "accepted", now - d(1), Some(ask), Some(sep)).await;
+        let gone = seed_told(&pool, s, "我想静一静").await;
+        seed_choice(&pool, s, "ask_for_space", "declined", now - d(2), Some(gone), None).await;
+        sqlx::query("DELETE FROM engine.chat_messages WHERE id = $1")
+            .bind(gone)
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_choice(&pool, s, "ask_for_space", "ignored", now - d(8), None, None).await;
+        seed_choice(&pool, s, "other_kind", "declined", now - d(3), None, None).await;
+        seed_choice(&pool, a, "ask_for_space", "pending", now - h(1), None, None).await;
+        seed_choice(&pool, x, "ask_for_space", "pending", now - h(1), None, None).await;
+        sqlx::query("UPDATE engine.chat_sessions SET archived = true WHERE id = $1")
+            .bind(a)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let got = repo.life_choices(owner, inst, now - d(7), 10).await.unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].choice.status, "accepted");
+        assert_eq!(got[0].asked.as_deref(), Some("我们先分开一阵子好吗"));
+        assert_eq!(got[0].separation_hours, Some(12));
+        assert_eq!(got[1].choice.status, "declined");
+        assert_eq!(got[1].asked, None);
+        assert_eq!(got[1].separation_hours, None);
     }
 
     #[sqlx::test(migrations = "./migrations")]
