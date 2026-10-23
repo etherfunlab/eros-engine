@@ -653,8 +653,18 @@ mod tests {
         let d = chrono::Duration::days;
         let p = payload_with(&StoryEvidence {
             life_events: vec![
-                life(EventKind::Reading, now - m(30), now + h(2), Some("在看小说")),
-                life(EventKind::LongTrip, now - d(2), now + d(3), Some("我去云南了")),
+                life(
+                    EventKind::Reading,
+                    now - m(30),
+                    now + h(2),
+                    Some("在看小说"),
+                ),
+                life(
+                    EventKind::LongTrip,
+                    now - d(2),
+                    now + d(3),
+                    Some("我去云南了"),
+                ),
                 life(EventKind::Asleep, now - d(3), now - d(3) + h(6), None),
                 life(
                     EventKind::PregnancyScare,
@@ -697,7 +707,10 @@ mod tests {
         assert_eq!(d["life_events"], serde_json::json!([]));
         assert!(d["current_background"].is_null());
         assert_eq!(d["life_choices"], serde_json::json!([]));
-        assert!(p.contains("life_events 与 life_choices 是引擎记录的"), "rule 8");
+        assert!(
+            p.contains("life_events 与 life_choices 是引擎记录的"),
+            "rule 8"
+        );
     }
 
     #[test]
@@ -772,9 +785,7 @@ mod tests {
     /// the way the engine writes them reach the story director, and not as
     /// chat evidence.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn event_and_choice_reach_the_story_payload_not_the_chat_evidence(
-        pool: sqlx::PgPool,
-    ) {
+    async fn event_and_choice_reach_the_story_payload_not_the_chat_evidence(pool: sqlx::PgPool) {
         use eros_engine_store::events::{EventRepo, NewEvent};
         use eros_engine_store::life_choices::LifeChoiceRepo;
         let owner = Uuid::new_v4();

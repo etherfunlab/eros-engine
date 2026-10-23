@@ -809,8 +809,15 @@ mod tests {
             "现代都市",
         );
         assert!(!plain.contains("posts"), "no posts rule for memories-only");
-        let town =
-            director_user_payload(&serde_json::json!({}), &roster, &[], true, None, &std::collections::HashMap::new(), "现代都市");
+        let town = director_user_payload(
+            &serde_json::json!({}),
+            &roster,
+            &[],
+            true,
+            None,
+            &std::collections::HashMap::new(),
+            "现代都市",
+        );
         assert!(
             town.contains("posts"),
             "town payload carries the posts rule"
@@ -853,8 +860,15 @@ mod tests {
         assert!(p.contains("5) 一切设定"), "worldview rule is rule 5");
 
         // Renumbering lock: conditional rules follow the new rule 5.
-        let town =
-            director_user_payload(&serde_json::json!({}), &roster, &[], true, None, &std::collections::HashMap::new(), "现代都市");
+        let town = director_user_payload(
+            &serde_json::json!({}),
+            &roster,
+            &[],
+            true,
+            None,
+            &std::collections::HashMap::new(),
+            "现代都市",
+        );
         assert!(town.contains("6) posts"), "town rule renumbered to 6");
         let mut life = std::collections::HashMap::new();
         life.insert(
@@ -909,7 +923,15 @@ mod tests {
         let roster = roster_of(&[a, b]);
         let mut bg = std::collections::HashMap::new();
         bg.insert(a, "住院（1 天前开始，约 3 天后结束）".to_string());
-        let p = director_user_payload(&serde_json::json!({}), &roster, &[], false, None, &bg, "现代都市");
+        let p = director_user_payload(
+            &serde_json::json!({}),
+            &roster,
+            &[],
+            false,
+            None,
+            &bg,
+            "现代都市",
+        );
         let d: serde_json::Value = serde_json::from_str(p.split("\n\n").nth(1).unwrap()).unwrap();
         let personas = d["personas"].as_array().unwrap();
         assert_eq!(

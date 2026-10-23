@@ -371,22 +371,31 @@ impl EventRepo<'_> {
             .into_iter()
             .map(|k| k.as_str().to_string())
             .collect();
-        let rows: Vec<(Uuid, Uuid, String, Option<Uuid>, DateTime<Utc>, DateTime<Utc>, Option<Uuid>)> =
-            sqlx::query_as(
-                "SELECT DISTINCT ON (instance_id) \
+        // instance_id, then the event's columns.
+        type Row = (
+            Uuid,
+            Uuid,
+            String,
+            Option<Uuid>,
+            DateTime<Utc>,
+            DateTime<Utc>,
+            Option<Uuid>,
+        );
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT DISTINCT ON (instance_id) \
                         instance_id, id, kind, session_id, started_at, ends_at, message_id \
                    FROM engine.persona_events \
                   WHERE instance_id = ANY($1) AND kind = ANY($2) \
                     AND started_at <= $3 AND ends_at > $3 \
                     AND started_at > $3 - make_interval(hours => $4) \
                   ORDER BY instance_id, started_at DESC, id DESC",
-            )
-            .bind(instance_ids)
-            .bind(&background)
-            .bind(at)
-            .bind(lookback_hours())
-            .fetch_all(self.pool)
-            .await?;
+        )
+        .bind(instance_ids)
+        .bind(&background)
+        .bind(at)
+        .bind(lookback_hours())
+        .fetch_all(self.pool)
+        .await?;
         Ok(rows
             .into_iter()
             .filter_map(
@@ -2255,16 +2264,55 @@ mod tests {
         let (_, d, sd) = instance_and_session(&pool).await;
         let now = t("2026-10-23T08:00:00Z");
         for e in [
-            ev(a, sa, "k1", Hospitalized, "2026-10-22T08:00:00Z", "2026-10-25T08:00:00Z"),
-            ev(a, sa, "k2", Reading, "2026-10-23T07:50:00Z", "2026-10-23T09:00:00Z"),
-            ev(b, sb, "k3", BusinessTrip, "2026-10-21T08:00:00Z", "2026-10-22T08:00:00Z"),
-            ev(c, sc, "k4", Sick, "2026-10-22T08:00:00Z", "2026-10-24T08:00:00Z"),
-            ev(d, sd, "k5", Busy, "2026-10-23T07:00:00Z", "2026-10-23T10:00:00Z"),
+            ev(
+                a,
+                sa,
+                "k1",
+                Hospitalized,
+                "2026-10-22T08:00:00Z",
+                "2026-10-25T08:00:00Z",
+            ),
+            ev(
+                a,
+                sa,
+                "k2",
+                Reading,
+                "2026-10-23T07:50:00Z",
+                "2026-10-23T09:00:00Z",
+            ),
+            ev(
+                b,
+                sb,
+                "k3",
+                BusinessTrip,
+                "2026-10-21T08:00:00Z",
+                "2026-10-22T08:00:00Z",
+            ),
+            ev(
+                c,
+                sc,
+                "k4",
+                Sick,
+                "2026-10-22T08:00:00Z",
+                "2026-10-24T08:00:00Z",
+            ),
+            ev(
+                d,
+                sd,
+                "k5",
+                Busy,
+                "2026-10-23T07:00:00Z",
+                "2026-10-23T10:00:00Z",
+            ),
         ] {
             repo.insert_preempting(&e).await.unwrap();
         }
         let got = repo.backgrounds_at(&[a, b, d], now).await.unwrap();
-        assert_eq!(got.len(), 1, "only a has a background under way among a, b, d");
+        assert_eq!(
+            got.len(),
+            1,
+            "only a has a background under way among a, b, d"
+        );
         assert_eq!(got[&a].kind, Hospitalized);
     }
 }

@@ -1229,7 +1229,10 @@ mod tests {
             .unwrap();
         }
         let pairs = repo.chat_evidence(owner, inst, 7, 60).await.unwrap();
-        assert_eq!(pairs, vec![("什么猫？".to_string(), "一只橘猫".to_string())]);
+        assert_eq!(
+            pairs,
+            vec![("什么猫？".to_string(), "一只橘猫".to_string())]
+        );
     }
 
     async fn seed_session(pool: &PgPool, owner: Uuid, inst: Uuid) -> Uuid {
@@ -1297,11 +1300,44 @@ mod tests {
         let h = chrono::Duration::hours;
         // A long background that started before the window and is still under
         // way, an event wholly before the window, and three ended in it.
-        seed_event(&pool, inst, Some(s), "k1", "long_trip", now - d(8), now + h(1), None).await;
-        seed_event(&pool, inst, Some(s), "k2", "reading", now - d(9), now - d(9) + h(2), None).await;
-        for (key, kind, ago) in [("k3", "gaming", 3), ("k4", "asleep", 2), ("k5", "quarrel", 1)] {
-            seed_event(&pool, inst, Some(s), key, kind, now - d(ago), now - d(ago) + h(1), None)
-                .await;
+        seed_event(
+            &pool,
+            inst,
+            Some(s),
+            "k1",
+            "long_trip",
+            now - d(8),
+            now + h(1),
+            None,
+        )
+        .await;
+        seed_event(
+            &pool,
+            inst,
+            Some(s),
+            "k2",
+            "reading",
+            now - d(9),
+            now - d(9) + h(2),
+            None,
+        )
+        .await;
+        for (key, kind, ago) in [
+            ("k3", "gaming", 3),
+            ("k4", "asleep", 2),
+            ("k5", "quarrel", 1),
+        ] {
+            seed_event(
+                &pool,
+                inst,
+                Some(s),
+                key,
+                kind,
+                now - d(ago),
+                now - d(ago) + h(1),
+                None,
+            )
+            .await;
         }
         let got = repo.life_events(inst, now - d(7), now, 2).await.unwrap();
         let kinds: Vec<_> = got.iter().map(|e| e.event.kind.as_str()).collect();
@@ -1325,7 +1361,17 @@ mod tests {
 
         let cat = seed_told(&pool, s, "我遇到一只猫").await;
         let (st, en) = ended(10);
-        seed_event(&pool, inst, Some(s), "k1", "animal_encounter", st, en, Some(cat)).await;
+        seed_event(
+            &pool,
+            inst,
+            Some(s),
+            "k1",
+            "animal_encounter",
+            st,
+            en,
+            Some(cat),
+        )
+        .await;
         let (st, en) = ended(20);
         seed_event(&pool, inst, Some(s), "k2", "asleep", st, en, None).await;
         let ex = seed_told(&pool, a, "前任找我了").await;
@@ -1379,9 +1425,28 @@ mod tests {
         let now = Utc::now();
         let m = chrono::Duration::minutes;
         let h = chrono::Duration::hours;
-        seed_event(&pool, inst, Some(s), "k1", "period_scare", now - m(10), now + m(50), None).await;
-        seed_event(&pool, inst, Some(s), "k2", "pregnancy_scare", now - h(3), now - h(2), None)
-            .await;
+        seed_event(
+            &pool,
+            inst,
+            Some(s),
+            "k1",
+            "period_scare",
+            now - m(10),
+            now + m(50),
+            None,
+        )
+        .await;
+        seed_event(
+            &pool,
+            inst,
+            Some(s),
+            "k2",
+            "pregnancy_scare",
+            now - h(3),
+            now - h(2),
+            None,
+        )
+        .await;
         let got = repo
             .life_events(inst, now - chrono::Duration::days(7), now, 30)
             .await
@@ -1432,11 +1497,38 @@ mod tests {
 
         let ask = seed_told(&pool, s, "我们先分开一阵子好吗").await;
         let sep_start = now - d(1) + h(1);
-        let sep = seed_event(&pool, inst, Some(s), "k1", "taking_space", sep_start, sep_start + h(12), None)
-            .await;
-        seed_choice(&pool, s, "ask_for_space", "accepted", now - d(1), Some(ask), Some(sep)).await;
+        let sep = seed_event(
+            &pool,
+            inst,
+            Some(s),
+            "k1",
+            "taking_space",
+            sep_start,
+            sep_start + h(12),
+            None,
+        )
+        .await;
+        seed_choice(
+            &pool,
+            s,
+            "ask_for_space",
+            "accepted",
+            now - d(1),
+            Some(ask),
+            Some(sep),
+        )
+        .await;
         let gone = seed_told(&pool, s, "我想静一静").await;
-        seed_choice(&pool, s, "ask_for_space", "declined", now - d(2), Some(gone), None).await;
+        seed_choice(
+            &pool,
+            s,
+            "ask_for_space",
+            "declined",
+            now - d(2),
+            Some(gone),
+            None,
+        )
+        .await;
         sqlx::query("DELETE FROM engine.chat_messages WHERE id = $1")
             .bind(gone)
             .execute(&pool)
@@ -1452,7 +1544,10 @@ mod tests {
             .await
             .unwrap();
 
-        let got = repo.life_choices(owner, inst, now - d(7), 10).await.unwrap();
+        let got = repo
+            .life_choices(owner, inst, now - d(7), 10)
+            .await
+            .unwrap();
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].choice.status, "accepted");
         assert_eq!(got[0].asked.as_deref(), Some("我们先分开一阵子好吗"));
