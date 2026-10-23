@@ -70,6 +70,13 @@ const WORLD_STORIES_WM_RULES: &str = "\
 角色与用户的关系状态以 recent_life 为准，其他角色可以自然提及，\
 但仍绝不编造用户的言行。";
 
+/// Appended only when a roster persona has a background under way (spec
+/// 2026-10-23-life-events-world-wiring-design.md §4). Numbered 8 like the
+/// stories rule is 7: the numbers are labels.
+const WORLD_BACKGROUND_RULES: &str = "\
+8) 带 current_background 的角色此刻处在该状态中，剧本必须与之一致\
+（例：住院中的角色不会出现在聚会现场）。";
+
 /// SHA-256 lowercase hex of the (already trimmed) worldview content —
 /// stored in world_states.worldview_hash; mismatch ⇒ reset round (spec §3).
 fn worldview_sha256_hex(content: &str) -> String {
@@ -278,6 +285,24 @@ async fn direct_world(
         .recent_extracted_memories(owner, WORLD_FEEDBACK_K)
         .await
         .map_err(|e| format!("memory feedback load failed: {e}"))?;
+    // A background under way reaches the director straight from the event
+    // table, stories or not, reset round or not: a rule drew it.
+    let now = chrono::Utc::now();
+    let roster_instances: Vec<Uuid> = roster.iter().map(|r| r.instance_id).collect();
+    let backgrounds: std::collections::HashMap<Uuid, String> =
+        eros_engine_store::events::EventRepo { pool: &state.pool }
+            .backgrounds_at(&roster_instances, now)
+            .await
+            .map_err(|e| format!("backgrounds load failed: {e}"))?
+            .into_iter()
+            .map(|(instance, e)| {
+                let when = crate::prompt::event_when_text(e.started_at, e.ends_at, now);
+                (
+                    instance,
+                    format!("{}（{when}）", crate::prompt::event_label(e.kind)),
+                )
+            })
+            .collect();
 
     let payload = director_user_payload(
         &seed,
@@ -285,6 +310,7 @@ async fn direct_world(
         &memories,
         town,
         recent_life.as_ref(),
+        &backgrounds,
         &worldview,
     );
     let req = ChatRequest {
@@ -417,12 +443,16 @@ async fn direct_world(
 /// still carries `worldview` and rule 5 regardless (see below).
 /// `worldview` (spec §3) always rides the `data` JSON's `worldview` key and
 /// rule 5 always applies — there is no v1-shaped "no worldview" branch.
+/// `backgrounds` holds each persona's background under way, rendered; a
+/// persona in it gains `current_background`, and `WORLD_BACKGROUND_RULES` is
+/// appended when any roster persona is. Empty ⇒ no trace of either.
 fn director_user_payload(
     seed: &serde_json::Value,
     roster: &[RosterEntry],
     memories: &[String],
     town: bool,
     recent_life: Option<&std::collections::HashMap<Uuid, Vec<(String, String)>>>,
+    backgrounds: &std::collections::HashMap<Uuid, String>,
     worldview: &str,
 ) -> String {
     let is_init = seed.as_object().map(|o| o.is_empty()).unwrap_or(false);
@@ -446,6 +476,9 @@ fn director_user_payload(
                     .unwrap_or_default();
                 p["recent_life"] = serde_json::Value::Array(events);
             }
+            if let Some(bg) = backgrounds.get(&r.instance_id) {
+                p["current_background"] = serde_json::Value::String(bg.clone());
+            }
             p
         })
         .collect();
@@ -466,6 +499,12 @@ fn director_user_payload(
     }
     if recent_life.is_some() {
         rules.push_str(WORLD_STORIES_WM_RULES);
+    }
+    if roster
+        .iter()
+        .any(|r| backgrounds.contains_key(&r.instance_id))
+    {
+        rules.push_str(WORLD_BACKGROUND_RULES);
     }
     format!(
         "{header}\n\n{}\n\n{rules}",
@@ -625,6 +664,7 @@ mod tests {
             &[],
             false,
             None,
+            &std::collections::HashMap::new(),
             "现代都市",
         );
         assert!(init.contains("初始化这个世界"));
@@ -638,6 +678,7 @@ mod tests {
             &["用户喜欢旅行".into()],
             false,
             None,
+            &std::collections::HashMap::new(),
             "现代都市",
         );
         assert!(cont.contains("延续这个世界"));
@@ -660,6 +701,7 @@ mod tests {
             &[],
             false,
             None,
+            &std::collections::HashMap::new(),
             "现代都市",
         );
         assert!(
@@ -676,6 +718,7 @@ mod tests {
             &[],
             false,
             Some(&life),
+            &std::collections::HashMap::new(),
             "现代都市",
         );
         assert!(v2.contains("recent_life"));
@@ -762,11 +805,19 @@ mod tests {
             &[],
             false,
             None,
+            &std::collections::HashMap::new(),
             "现代都市",
         );
         assert!(!plain.contains("posts"), "no posts rule for memories-only");
-        let town =
-            director_user_payload(&serde_json::json!({}), &roster, &[], true, None, "现代都市");
+        let town = director_user_payload(
+            &serde_json::json!({}),
+            &roster,
+            &[],
+            true,
+            None,
+            &std::collections::HashMap::new(),
+            "现代都市",
+        );
         assert!(
             town.contains("posts"),
             "town payload carries the posts rule"
@@ -798,6 +849,7 @@ mod tests {
             &[],
             false,
             None,
+            &std::collections::HashMap::new(),
             "赛博朋克近未来都市",
         );
         assert!(
@@ -808,8 +860,15 @@ mod tests {
         assert!(p.contains("5) 一切设定"), "worldview rule is rule 5");
 
         // Renumbering lock: conditional rules follow the new rule 5.
-        let town =
-            director_user_payload(&serde_json::json!({}), &roster, &[], true, None, "现代都市");
+        let town = director_user_payload(
+            &serde_json::json!({}),
+            &roster,
+            &[],
+            true,
+            None,
+            &std::collections::HashMap::new(),
+            "现代都市",
+        );
         assert!(town.contains("6) posts"), "town rule renumbered to 6");
         let mut life = std::collections::HashMap::new();
         life.insert(
@@ -822,11 +881,88 @@ mod tests {
             &[],
             false,
             Some(&life),
+            &std::collections::HashMap::new(),
             "现代都市",
         );
         assert!(
             stories.contains("7) 各角色的个人生活"),
             "stories rule renumbered to 7"
+        );
+    }
+
+    fn roster_of(ids: &[Uuid]) -> Vec<RosterEntry> {
+        ids.iter()
+            .map(|id| RosterEntry {
+                instance_id: *id,
+                name: "Aria".into(),
+                tip_personality: None,
+                art_metadata: serde_json::json!({}),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn director_payload_without_backgrounds_has_no_trace() {
+        let roster = roster_of(&[Uuid::new_v4()]);
+        let p = director_user_payload(
+            &serde_json::json!({}),
+            &roster,
+            &[],
+            true,
+            None,
+            &std::collections::HashMap::new(),
+            "现代都市",
+        );
+        assert!(!p.contains("current_background"));
+        assert!(!p.contains("带 current_background 的角色"));
+    }
+
+    #[test]
+    fn director_payload_background_on_its_persona_only() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let roster = roster_of(&[a, b]);
+        let mut bg = std::collections::HashMap::new();
+        bg.insert(a, "住院（1 天前开始，约 3 天后结束）".to_string());
+        let p = director_user_payload(
+            &serde_json::json!({}),
+            &roster,
+            &[],
+            false,
+            None,
+            &bg,
+            "现代都市",
+        );
+        let d: serde_json::Value = serde_json::from_str(p.split("\n\n").nth(1).unwrap()).unwrap();
+        let personas = d["personas"].as_array().unwrap();
+        assert_eq!(
+            personas[0]["current_background"],
+            "住院（1 天前开始，约 3 天后结束）"
+        );
+        assert!(personas[1].get("current_background").is_none());
+        assert_eq!(p.matches("带 current_background 的角色").count(), 1);
+    }
+
+    #[test]
+    fn director_payload_background_with_stories_and_town() {
+        let a = Uuid::new_v4();
+        let roster = roster_of(&[a]);
+        let mut bg = std::collections::HashMap::new();
+        bg.insert(a, "出差（1 天前开始，约 2 天后结束）".to_string());
+        let life = std::collections::HashMap::new();
+        let p = director_user_payload(
+            &serde_json::json!({}),
+            &roster,
+            &[],
+            true,
+            Some(&life),
+            &bg,
+            "现代都市",
+        );
+        assert_eq!(p.matches("带 current_background 的角色").count(), 1);
+        assert!(
+            p.find("各角色的个人生活以其 recent_life 为准").unwrap()
+                < p.find("带 current_background 的角色").unwrap(),
+            "the background rule follows the stories rule"
         );
     }
 

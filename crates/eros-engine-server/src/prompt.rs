@@ -827,7 +827,7 @@ pub(crate) fn needs_line(n: &eros_engine_core::needs::Needs) -> Option<String> {
 
 /// What the persona calls an event (spec 2026-10-15-life-events-v2-design.md
 /// §3.2).
-fn event_label(kind: eros_engine_core::events::EventKind) -> &'static str {
+pub(crate) fn event_label(kind: eros_engine_core::events::EventKind) -> &'static str {
     use eros_engine_core::events::EventKind::*;
     match kind {
         PoliceEncounter => "被警察拦下问话",
@@ -891,12 +891,32 @@ pub(crate) fn span_text(d: chrono::Duration) -> String {
     }
 }
 
-fn ends_text(ends_in: chrono::Duration) -> String {
+pub(crate) fn ends_text(ends_in: chrono::Duration) -> String {
     let span = span_text(ends_in);
     if ends_in.num_minutes() < 60 {
         format!("{span}后结束")
     } else {
         format!("约 {span}后结束")
+    }
+}
+
+/// How long ago an event started and when it ends or how long it lasted
+/// (spec 2026-10-23-life-events-world-wiring-design.md §3.1):
+/// 「3 天前开始，约 2 天后结束」, 「3 天前开始，持续 2 小时」.
+pub(crate) fn event_when_text(
+    started_at: chrono::DateTime<chrono::Utc>,
+    ends_at: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let started = span_text(now - started_at);
+    if ends_at > now {
+        return format!("{started}前开始，{}", ends_text(ends_at - now));
+    }
+    let lasted = ends_at - started_at;
+    if lasted.num_minutes() < 60 {
+        format!("{started}前开始，持续不到 1 小时")
+    } else {
+        format!("{started}前开始，持续 {}", span_text(lasted))
     }
 }
 
@@ -4256,6 +4276,29 @@ mod tests {
         assert_eq!(span_text(m(48 * 60)), "2 天");
         assert_eq!(span_text(m(60 * 60)), "3 天");
         assert_eq!(span_text(m(168 * 60)), "7 天");
+    }
+
+    #[test]
+    fn event_when_text_under_way_and_ended() {
+        let now = chrono::Utc.with_ymd_and_hms(2026, 10, 23, 8, 0, 0).unwrap();
+        let h = chrono::Duration::hours;
+        let m = chrono::Duration::minutes;
+        assert_eq!(
+            event_when_text(now - h(72), now + h(50), now),
+            "3 天前开始，约 2 天后结束"
+        );
+        assert_eq!(
+            event_when_text(now - h(72), now - h(70), now),
+            "3 天前开始，持续 2 小时"
+        );
+        assert_eq!(
+            event_when_text(now - m(30), now + m(30), now),
+            "不到 1 小时前开始，不到 1 小时后结束"
+        );
+        assert_eq!(
+            event_when_text(now - h(5), now - h(5) + m(40), now),
+            "5 小时前开始，持续不到 1 小时"
+        );
     }
 
     #[test]

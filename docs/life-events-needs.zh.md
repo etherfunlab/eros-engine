@@ -280,7 +280,8 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 
 ### 持续期间
 
-某一时刻正在进行的事件，是满足 `started_at <= 该时刻 < ends_at` 的那个背景和那件插曲。它们到达三个读取方。
+某一时刻正在进行的事件，是满足 `started_at <= 该时刻 < ends_at` 的那个背景和那件插曲。在聊天里它们到达三个读取方；
+开启世界系统时，故事导演和世界导演也会读到（见[聊天之外](#聊天之外)）。
 
 - **判官**得到一行 `[近期事件]`，排在 `[需求]` 之后、`[身体状态]` 之前。先列背景，再列插曲，用 `；` 连接，
   每项形如 `{label}（{span}前开始，约 {span}后结束）`：
@@ -483,6 +484,13 @@ ghosting 开关关闭时，已经在进行的一段不会让任何轮次沉默�
   对每个 session 都是一次索引探测。
 - `taking_space` 和 `fell_out` 和其他事件一样是 `persona_events` 的一行，`message_id` 为 NULL；写下它们的那次选择在
   `engine.life_choices` 里（见[选择存在哪](#选择存在哪)）。
+
+### 聊天之外
+
+开启 [World Stories](world-system.zh.md#world-stories人生故事) 时，故事导演直接读该实例的事件，每件带标签、相对时间和她讲述时的那条
+消息，另外还读在途背景，以及这对关系里的分开请求和结果，并把它们当作既成事实。她主动发的消息不进它的聊天证据，所以一件事
+不会被读成她对一句不相干的话的回答。World Memories 导演对名单里的每个角色读在途背景，不论开没开 stories，住院中的角色
+就不会被写进聚会。两位导演都不写事件，也不改上面的角色设置。需求不进其中任何一个。
 
 ## 两者如何互相影响
 
@@ -694,7 +702,9 @@ ghosting 开关关闭时它不让任何轮次沉默，和任何离线时段一�
   `just_now_text`、`persona_traits`、`[character_state]` 里的各行，以及 `[now]` 里的事件行。
 - `crates/eros-engine-server/src/routes/session_effects.rs`：`GET …/effects`。
 - `crates/eros-engine-server/src/pipeline/voice.rs`：bootstrap 里的需求。
-- `crates/eros-engine-store/src/events.rs::EventRepo`：`insert`、`insert_preempting_in_tx`、`by_key`、`recent`、`current`、`unexplained_offline`、`unreturned_separation`、`unresolved_scare`。
+- `crates/eros-engine-store/src/events.rs::EventRepo`：`insert`、`insert_preempting_in_tx`、`by_key`、`recent`、`current`、`backgrounds_at`、`unexplained_offline`、`unreturned_separation`、`unresolved_scare`。
+- `crates/eros-engine-store/src/story.rs::StoryRepo`：`life_events`、`life_choices`，以及不含 proactive 行的 `chat_evidence`。
+- `crates/eros-engine-server/src/pipeline/story.rs`：`load_evidence` 与故事 payload 的 `life_events`、`current_background`、`life_choices`；`pipeline/world.rs::direct_world`：世界导演的 `current_background`；`prompt.rs::event_when_text`：两者共用的相对时间。
 - `crates/eros-engine-store/src/life_choices.rs::LifeChoiceRepo`：选择行、`pending`、`resolve_in_tx`、`growth_slowed`。
 - `crates/eros-engine-store/src/affinity.rs::AffinityRepo`：`persist_life_choice_drop_in_tx`、`last_judged_patiences`。
 - `crates/eros-engine-store/src/chat.rs::ChatRepo`：`set_needs` 与 `latest_needs`。

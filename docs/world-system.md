@@ -210,7 +210,10 @@ base by construction:
 Per `persona_instance`, every `interval_hours` (default 8), behind an
 **activity gate**: only instances chatted with inside `active_window_hours`
 (default 72) get a round. A quiet instance's life simply pauses and resumes
-the moment chat activity resumes — no catch-up rounds. Turns in a
+the moment chat activity resumes — no catch-up rounds. A message the persona
+sends on her own (a [life event](life-events-needs.md#life-events), a greeting,
+her ask for space) counts as activity like a reply does: something happening to
+her keeps her life moving. Turns in a
 [group](group-chat.md) do not count: they leave the member sessions' activity
 untouched. A [BYOC](byoc.md) instance gets no round and no story row, and
 takes no roster slot from an instance that has a genome.
@@ -222,7 +225,10 @@ takes no roster slot from an instance that has a genome.
 | Current insight + digest | `persona_story_insights` row (`last_run_at IS NULL` ⇒ first-round init) |
 | Recent events (12) | `persona_story_events`, chronological — continuity + repetition guard |
 | Affinity snapshot | latest session's six axes + bond + chemistry + both tier labels — advisory only |
-| Chat evidence | messages of this (owner, instance), last `context_days` (default 7), capped by turn count |
+| Chat evidence | user→reply pairs of this (owner, instance), last `context_days` (default 7), capped by turn count; messages the persona sent on her own (event and ask-for-space messages, greetings) are not evidence |
+| Life events (30) | `persona_events` of the instance started in the same window, plus any under way: label, category, relative time (`3 天前开始，持续 2 小时`), and the message she told it in, if any. `taking_space` / `fell_out` only from unarchived sessions; the narration of an event told in an archived session is left out; a false alarm only once it has ended, with its outcome |
+| Background under way | the one of those life events that is a background under way, repeated on its own |
+| Ask-for-space choices (10) | `life_choices` of the pair's unarchived sessions in the window: her ask and its outcome (accepted with the separation's length, declined, ignored, unanswered, still waiting) |
 
 | Output | Where it goes |
 |--------|---------------|
@@ -240,6 +246,16 @@ columns — `work_history`
 `user_relationship` (与用户的关系状态). The list ships as an engine constant;
 the operator `filter_prompt` controls each field's *richness*, never the
 field list itself.
+
+Life events and choices are engine-recorded facts, upstream of the story. A
+fixed rule tells the director they have happened: it may build on them (a
+breakup feeds `romance_history`, an ask for space feeds `user_relationship`)
+but not rewrite, deny or move them, nor contradict what she said when she told
+them. Nothing it writes may contradict the background under way; the digest
+need not mention it, and when it does, writes it as something that ends, since
+the reply already reads the background live under `[now]`. Neither the story
+nor the World Memories director writes events or changes a persona's event
+settings.
 
 Persistence mirrors World Memories: single transaction, both
 `persona_story_events` and `persona_story_memories` pruned by
@@ -260,12 +276,19 @@ extra Voyage call. Injection is **ON by default** once the layer is enabled;
 When an owner is stories-active, the WM director's per-persona payload
 additionally carries `recent_life` — that instance's story events since the
 WM director's last run — plus a fixed rule that WM scripts must stay
-consistent with it. Owners without stories see byte-identical WM behavior.
+consistent with it. Owners without stories see no `recent_life`.
 Data flow stays strictly one-way:
 
 ```
 World Stories (per-instance life)  →  World Memories (persona↔persona graph)  →  World Town (stage)
 ```
+
+Separately, and for every owner whether or not it runs stories, a persona with
+a background life event under way at round time (a trip, an illness, a
+hospital stay) carries `current_background`, e.g.
+`住院（1 天前开始，约 3 天后结束）`, with a fixed rule that the scripts stay
+consistent with it. With no background under way anywhere in the roster the
+payload carries neither.
 
 A story round never reads the WM seed or `world_memories` back.
 
@@ -392,3 +415,4 @@ Design documents (decision history and full edge-case tables):
 - [`docs/superpowers/specs/2026-07-21-world-town-reply-window-design.md`](superpowers/specs/2026-07-21-world-town-reply-window-design.md)
 - [`docs/superpowers/specs/2026-07-23-world-stories-design.md`](superpowers/specs/2026-07-23-world-stories-design.md)
 - [`docs/superpowers/specs/2026-07-28-world-worldview-design.md`](superpowers/specs/2026-07-28-world-worldview-design.md)
+- [`docs/superpowers/specs/2026-10-23-life-events-world-wiring-design.md`](superpowers/specs/2026-10-23-life-events-world-wiring-design.md)
