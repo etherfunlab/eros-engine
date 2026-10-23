@@ -389,9 +389,10 @@ impl<'a> StoryRepo<'a> {
             .iter()
             .map(|k| k.as_str().to_string())
             .collect();
-        let scares: Vec<String> = [EventKind::PeriodScare, EventKind::PregnancyScare]
-            .iter()
-            .map(|k| k.as_str().to_string())
+        let scares: Vec<&str> = EventKind::ALL
+            .into_iter()
+            .filter(|k| k.is_false_alarm())
+            .map(EventKind::as_str)
             .collect();
         #[allow(clippy::type_complexity)] // sqlx tuple query — type alias would add noise
         let rows: Vec<(
@@ -1414,6 +1415,41 @@ mod tests {
                 ("irritable", None),
             ]
         );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn life_events_hide_every_false_alarm_under_way(pool: PgPool) {
+        let repo = StoryRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        let inst = seed_instance(&pool, owner, "A", "active").await;
+        let now = Utc::now();
+        let m = chrono::Duration::minutes;
+        for (i, kind) in EventKind::ALL
+            .into_iter()
+            .filter(|k| k.is_false_alarm())
+            .enumerate()
+        {
+            // One session each: two incidents never overlap in one life, but
+            // the read does not care, and the point is every kind.
+            let s = seed_session(&pool, owner, inst).await;
+            let key = format!("k{i}");
+            seed_event(
+                &pool,
+                inst,
+                Some(s),
+                &key,
+                kind.as_str(),
+                now - m(10),
+                now + m(50),
+                None,
+            )
+            .await;
+        }
+        let got = repo
+            .life_events(inst, now - chrono::Duration::days(7), now, 30)
+            .await
+            .unwrap();
+        assert!(got.is_empty(), "no false alarm under way reaches the story");
     }
 
     #[sqlx::test(migrations = "./migrations")]
