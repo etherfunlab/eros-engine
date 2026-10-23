@@ -178,7 +178,9 @@ Stories 需要**全部条件**同时成立——且按构造骑在 World Memorie
 
 对每个 `persona_instance`，每 `interval_hours`（默认 8 小时）跑一轮，前置一道
 **活跃度闸门**：只有在 `active_window_hours`（默认 72 小时）内被聊过的角色才
-会推进。安静的角色人生会暂停，一旦聊天重新活跃就自动续上——不做补跑。[群聊](group-chat.zh.md)
+会推进。安静的角色人生会暂停，一旦聊天重新活跃就自动续上——不做补跑。角色主动发的消息
+（[生活事件](life-events-needs.zh.md#生活事件)、问候、提出分开）和回复一样算活跃：她身上发生了事，
+她的人生就继续往前走。[群聊](group-chat.zh.md)
 里的回合不算：它们不会动成员 session 的活跃时间。[BYOC](byoc.zh.md) 实例不会有一轮，也不会有 story 行，
 也不会占走有 genome 的实例的名单位置。
 
@@ -189,7 +191,10 @@ Stories 需要**全部条件**同时成立——且按构造骑在 World Memorie
 | 当前 insight + digest | `persona_story_insights` 行（`last_run_at IS NULL` ⇒ 首轮初始化） |
 | 近期事件（12 条） | `persona_story_events`，按时间顺序——保连贯性、防重复 |
 | 亲密度快照 | 最新会话的六轴 + bond + chemistry + 两条线的档位名——仅供参考 |
-| 聊天证据 | 该 (owner, instance) 最近 `context_days`（默认 7 天）内的消息，按轮数上限截断 |
+| 聊天证据 | 该 (owner, instance) 最近 `context_days`（默认 7 天）内的「用户→回复」配对，按轮数上限截断；角色主动发的消息（事件消息、提出分开的消息、问候）不算证据 |
+| 生活事件（30 条） | 同一窗口内开始的、以及此刻仍在进行的 `persona_events`：标签、类别、相对时间（`3 天前开始，持续 2 小时`），讲述过的附上她讲述时的原文。`taking_space` / `fell_out` 只取未归档会话里的；讲述原文在已归档会话里的不给原文；虚惊要结束后才给，并带上结果 |
+| 在途背景 | 上述生活事件里此刻仍在进行的那个背景，单独再列一次 |
+| 分开请求（10 条） | 这对关系未归档会话里、窗口内的 `life_choices`：她的原话和结果（同意并分开多久、拒绝、忽略、一直没回、还在等） |
 
 | 输出 | 去向 |
 |------|------|
@@ -206,6 +211,12 @@ companion 那边直到 companion_insights 拆除（spec 2026-08-11）才追上�
 的形式交付；运营方的 `filter_prompt` 只能控制各栏位内容的*丰富程度*，不能改
 动字段列表本身。
 
+生活事件和分开请求是引擎记录的事实，位于故事的上游。一条固定规则告诉导演这些事已经发生：
+可以拿来展开（分手之后更新 `romance_history`，提出分开之后更新 `user_relationship`），
+但不得改写、否认或挪动时间，也不得与她讲述时的原文矛盾。导演写的任何内容都不得与在途背景矛盾；
+digest 不必提它，提到时写成有终点的事——回复在 `[now]` 下已经实时读到背景。
+故事导演和 World Memories 导演都不写事件，也不改角色的事件设定。
+
 持久化与 World Memories 相同：单个事务，`persona_story_events` 与
 `persona_story_memories` 都按 `retention_days`（默认 30）清理；任何失败
 （LLM、解析、嵌入、DB）都会释放认领，等下一次到期扫描重试。
@@ -221,12 +232,16 @@ Voyage 调用。该层一旦启用，注入**默认开启**；`WORLD_STORIES_PRO
 
 当某个 owner 处于 stories-active 状态时，WM 导演每个角色的 payload 条目会
 额外带上 `recent_life`——该 instance 自 WM 上次运行以来的 story 事件——并加
-一条固定规则，要求 WM 剧本必须与之保持一致。没开 stories 的 owner，WM 行为
-与今天完全字节一致。数据流严格单向：
+一条固定规则，要求 WM 剧本必须与之保持一致。没开 stories 的 owner 不带
+`recent_life`。数据流严格单向：
 
 ```
 World Stories（角色个人生活）  →  World Memories（角色↔角色关系图谱）  →  World Town（舞台）
 ```
+
+另外，不论 owner 开没开 stories，导演回合时有背景生活事件在进行（出差、生病、住院）的角色，
+条目里会带 `current_background`，如 `住院（1 天前开始，约 3 天后结束）`，并加一条固定规则，
+要求剧本与之一致。名单里没有任何角色在途背景时，两者都不出现。
 
 story 回合从不回读 WM 种子或 `world_memories`。
 

@@ -602,6 +602,17 @@ offline kind is under way.
 - `taking_space` and `fell_out` are rows of `persona_events` like any other, with `message_id`
   NULL; the choice that wrote them lives in `engine.life_choices` ([below](#where-the-choice-is-stored)).
 
+### Beyond the chat
+
+With [World Stories](world-system.md#world-stories) enabled, the story director reads the
+instance's events directly, each with its label, a relative time and the message she told it
+in, plus the background under way and the pair's asks for space with their outcome. It takes
+them as settled fact. The messages she sends on her own are not part of its chat evidence, so
+an event is never read as her answer to an unrelated line. The World Memories director reads a
+background under way for every persona in the roster, stories or not, so a persona in hospital
+is not scripted into a party. Neither director writes events or changes the persona settings
+above. Needs reach neither.
+
 ## How the two interact
 
 ### 1. Needs weight the kind pick
