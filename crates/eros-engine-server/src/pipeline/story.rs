@@ -30,6 +30,10 @@ const STORY_EVENTS_CAP: usize = 6;
 const STORY_RECENT_EVENTS: i64 = 12;
 /// Max chat turns fed as evidence (inside the context_days window).
 const STORY_CHAT_TURNS_CAP: u8 = 60;
+/// Max life events fed per round; events under way are kept beyond it.
+const STORY_LIFE_EVENTS_CAP: i64 = 30;
+/// Max ask-for-space choices fed per round.
+const STORY_LIFE_CHOICES_CAP: i64 = 10;
 
 /// Fixed engine-owned rules (spec §3.3). The operator filter_prompt carries
 /// tone / genre / category vocabulary / per-field richness; these are the floor.
@@ -305,6 +309,42 @@ fn cap_events(events: Vec<StoryEventOut>, instance: Uuid) -> Vec<StoryEventOut> 
     out
 }
 
+/// The round's reads, with the life events and choices of the last
+/// `context_days` as of `now` (the instant the payload sends as
+/// `current_time`).
+async fn load_evidence(
+    pool: &sqlx::PgPool,
+    owner: Uuid,
+    instance: Uuid,
+    context_days: u32,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<StoryEvidence, String> {
+    let repo = StoryRepo { pool };
+    let since = now - chrono::Duration::days(i64::from(context_days));
+    Ok(StoryEvidence {
+        recent_events: repo
+            .recent_events(instance, STORY_RECENT_EVENTS)
+            .await
+            .map_err(|e| format!("recent events load failed: {e}"))?,
+        affinity: repo
+            .affinity_snapshot(owner, instance)
+            .await
+            .map_err(|e| format!("affinity load failed: {e}"))?,
+        chat: repo
+            .chat_evidence(owner, instance, context_days, STORY_CHAT_TURNS_CAP)
+            .await
+            .map_err(|e| format!("chat evidence load failed: {e}"))?,
+        life_events: repo
+            .life_events(instance, since, now, STORY_LIFE_EVENTS_CAP)
+            .await
+            .map_err(|e| format!("life events load failed: {e}"))?,
+        life_choices: repo
+            .life_choices(owner, instance, since, STORY_LIFE_CHOICES_CAP)
+            .await
+            .map_err(|e| format!("life choices load failed: {e}"))?,
+    })
+}
+
 /// One tick's story phase: backfill + claim + per-instance rounds.
 /// Per-instance failures release that claim and continue.
 pub(crate) async fn run_stories_scan(
@@ -372,32 +412,9 @@ async fn direct_story(
         // between claim and round — release and wait for it to reappear.
         return Err("worldview missing at story round time".into());
     };
-    let recent = repo
-        .recent_events(instance, STORY_RECENT_EVENTS)
-        .await
-        .map_err(|e| format!("recent events load failed: {e}"))?;
-    let affinity = repo
-        .affinity_snapshot(owner, instance)
-        .await
-        .map_err(|e| format!("affinity load failed: {e}"))?;
-    let chat = repo
-        .chat_evidence(owner, instance, resolved.context_days, STORY_CHAT_TURNS_CAP)
-        .await
-        .map_err(|e| format!("chat evidence load failed: {e}"))?;
-
-    let evidence = StoryEvidence {
-        recent_events: recent,
-        affinity,
-        chat,
-        ..Default::default()
-    };
-    let payload = story_user_payload(
-        chrono::Utc::now(),
-        &persona,
-        &row,
-        &evidence,
-        &worldview,
-    );
+    let now = chrono::Utc::now();
+    let evidence = load_evidence(&state.pool, owner, instance, resolved.context_days, now).await?;
+    let payload = story_user_payload(now, &persona, &row, &evidence, &worldview);
     let req = ChatRequest {
         model: resolved.model.clone(),
         fallback_model: resolved.fallback_model.clone(),
@@ -738,6 +755,138 @@ mod tests {
         );
         assert!(d["life_choices"][4].get("asked").is_none());
         assert_eq!(d["life_choices"][0]["label"], "角色提出想先分开一阵子");
+    }
+
+    fn proactive(content: &str, occasion: &str) -> eros_engine_store::chat::ProactiveInsert {
+        eros_engine_store::chat::ProactiveInsert {
+            id: Uuid::new_v4(),
+            content: content.into(),
+            generation_id: None,
+            metadata: serde_json::json!({ "proactive": occasion }),
+            llm_attempts: None,
+            gateway_errors: None,
+        }
+    }
+
+    /// The path the life-event specs assumed: an event and an ask written
+    /// the way the engine writes them reach the story director, and not as
+    /// chat evidence.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn event_and_choice_reach_the_story_payload_not_the_chat_evidence(
+        pool: sqlx::PgPool,
+    ) {
+        use eros_engine_store::events::{EventRepo, NewEvent};
+        use eros_engine_store::life_choices::LifeChoiceRepo;
+        let owner = Uuid::new_v4();
+        let genome: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('Aria', 'sp', '{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let inst: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid, status) \
+             VALUES ($1, $2, 'active') RETURNING id",
+        )
+        .bind(genome)
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let session: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(owner)
+        .bind(inst)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // A user row she never answered: before, the event message paired with it.
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+             VALUES ($1, 'user', '在吗', now() - interval '30 minutes')",
+        )
+        .bind(session)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let events = EventRepo { pool: &pool };
+        let started = chrono::Utc::now();
+        events
+            .insert(
+                &NewEvent {
+                    instance_id: inst,
+                    session_id: session,
+                    event_key: "day:test",
+                    kind: EventKind::BusinessTrip,
+                    started_at: started,
+                    ends_at: started + chrono::Duration::hours(24),
+                },
+                Some(&proactive("我刚到机场，要去外地出差一天", "event")),
+            )
+            .await
+            .unwrap()
+            .expect("the trip is written");
+        let choices = LifeChoiceRepo { pool: &pool };
+        let ask = choices
+            .insert_ask(
+                session,
+                2,
+                None,
+                &proactive("我们先分开一阵子好吗", "life_choice"),
+            )
+            .await
+            .unwrap()
+            .expect("the ask is written");
+        let sep_start = chrono::Utc::now();
+        let separation = events
+            .insert_preempting(&NewEvent {
+                instance_id: inst,
+                session_id: session,
+                event_key: "life_choice:test",
+                kind: EventKind::TakingSpace,
+                started_at: sep_start,
+                ends_at: sep_start + chrono::Duration::hours(12),
+            })
+            .await
+            .unwrap();
+        choices
+            .resolve(ask.id, "accepted", chrono::Utc::now())
+            .await
+            .unwrap()
+            .expect("the accept lands");
+        choices.set_event(ask.id, separation.id).await.unwrap();
+
+        let now = chrono::Utc::now();
+        let evidence = load_evidence(&pool, owner, inst, 7, now).await.unwrap();
+        let p = story_user_payload(
+            now,
+            &fixture_persona(),
+            &fixture_row(true),
+            &evidence,
+            "现代都市",
+        );
+        let d = data(&p);
+        let labels: Vec<_> = d["life_events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["label"].as_str().unwrap())
+            .collect();
+        assert!(labels.contains(&"出差") && labels.contains(&"说好暂时分开"));
+        assert_eq!(d["current_background"]["label"], "出差");
+        assert_eq!(
+            d["current_background"]["told"],
+            "我刚到机场，要去外地出差一天"
+        );
+        assert_eq!(
+            d["life_choices"][0]["outcome"],
+            "用户同意了，两人说好暂时分开 12 小时"
+        );
+        assert_eq!(d["life_choices"][0]["asked"], "我们先分开一阵子好吗");
+        assert_eq!(d["recent_chat"], serde_json::json!([]));
     }
 
     #[test]
