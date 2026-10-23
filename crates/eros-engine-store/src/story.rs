@@ -7,10 +7,13 @@
 //! `persona_story_memories` its 1:1 embedded recall mirror.
 
 use chrono::{DateTime, NaiveDate, Utc};
+use eros_engine_core::events::EventKind;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::time::Duration;
 use uuid::Uuid;
+
+use crate::events::EventRecord;
 
 /// The fixed insight column list, DDL order. Single source for the
 /// full-column UPDATE and the prompt-schema lockstep test (server side).
@@ -108,6 +111,15 @@ pub struct StoryEventInsert {
     pub category: String,
     pub content: String,
     pub embedding: Vec<f32>,
+}
+
+/// One life event as the story director reads it (spec
+/// 2026-10-23-life-events-world-wiring-design.md §3.1).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoryLifeEvent {
+    pub event: EventRecord,
+    /// The narration; `None` when untold, the message is gone, or its session is archived.
+    pub told: Option<String>,
 }
 
 pub struct StoryRepo<'a> {
@@ -345,6 +357,85 @@ impl<'a> StoryRepo<'a> {
             pairs.drain(..drop);
         }
         Ok(pairs)
+    }
+
+    /// The instance's life events for a story round (spec 2026-10-23-life-
+    /// events-world-wiring-design.md §3.1), newest first: those started in
+    /// `[since, now]` plus any still under way at `now`. The cap keeps the
+    /// `cap` newest, and a row under way survives it. Left out: a
+    /// `taking_space` / `fell_out` whose session is gone or archived (it
+    /// belongs to that relationship), and a false alarm still under way (she
+    /// does not know yet). The narration is dropped when its session is
+    /// archived; the event stays, as her own life.
+    pub async fn life_events(
+        &self,
+        instance_id: Uuid,
+        since: DateTime<Utc>,
+        now: DateTime<Utc>,
+        cap: i64,
+    ) -> Result<Vec<StoryLifeEvent>, sqlx::Error> {
+        let special: Vec<String> = EventKind::SPECIAL
+            .iter()
+            .map(|k| k.as_str().to_string())
+            .collect();
+        let scares: Vec<String> = [EventKind::PeriodScare, EventKind::PregnancyScare]
+            .iter()
+            .map(|k| k.as_str().to_string())
+            .collect();
+        #[allow(clippy::type_complexity)] // sqlx tuple query — type alias would add noise
+        let rows: Vec<(
+            Uuid,
+            String,
+            Option<Uuid>,
+            DateTime<Utc>,
+            DateTime<Utc>,
+            Option<Uuid>,
+            Option<String>,
+        )> = sqlx::query_as(
+            "WITH e AS ( \
+                 SELECT p.id, p.kind, p.session_id, p.started_at, p.ends_at, p.message_id, \
+                        CASE WHEN ms.archived THEN NULL ELSE m.content END AS told, \
+                        row_number() OVER (ORDER BY p.started_at DESC, p.id DESC) AS rn \
+                   FROM engine.persona_events p \
+                   LEFT JOIN engine.chat_sessions es ON es.id = p.session_id \
+                   LEFT JOIN engine.chat_messages m ON m.id = p.message_id \
+                   LEFT JOIN engine.chat_sessions ms ON ms.id = m.session_id \
+                  WHERE p.instance_id = $1 \
+                    AND p.started_at <= $3 \
+                    AND (p.started_at >= $2 OR p.ends_at > $3) \
+                    AND NOT (p.kind = ANY($5) AND (es.id IS NULL OR es.archived)) \
+                    AND NOT (p.kind = ANY($6) AND p.ends_at > $3) \
+             ) \
+             SELECT id, kind, session_id, started_at, ends_at, message_id, told \
+               FROM e WHERE rn <= $4 OR ends_at > $3 \
+              ORDER BY started_at DESC, id DESC",
+        )
+        .bind(instance_id)
+        .bind(since)
+        .bind(now)
+        .bind(cap)
+        .bind(&special)
+        .bind(&scares)
+        .fetch_all(self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(
+                |(id, kind, session_id, started_at, ends_at, message_id, told)| {
+                    Some(StoryLifeEvent {
+                        event: EventRecord {
+                            id,
+                            kind: EventKind::parse(&kind)?,
+                            session_id,
+                            started_at,
+                            ends_at,
+                            message_id,
+                        },
+                        told,
+                    })
+                },
+            )
+            .collect())
     }
 
     /// Current affinity for the pair via its latest-active session. Advisory
@@ -1050,6 +1141,164 @@ mod tests {
         }
         let pairs = repo.chat_evidence(owner, inst, 7, 60).await.unwrap();
         assert_eq!(pairs, vec![("什么猫？".to_string(), "一只橘猫".to_string())]);
+    }
+
+    async fn seed_session(pool: &PgPool, owner: Uuid, inst: Uuid) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(owner)
+        .bind(inst)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// A proactive assistant row, as an event or an ask is told.
+    async fn seed_told(pool: &PgPool, session: Uuid, content: &str) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages \
+                 (session_id, role, content, assistant_action_type, metadata) \
+             VALUES ($1, 'assistant', $2, 'proactive', '{\"proactive\":\"event\"}') \
+             RETURNING id",
+        )
+        .bind(session)
+        .bind(content)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[allow(clippy::too_many_arguments)] // one column per argument
+    async fn seed_event(
+        pool: &PgPool,
+        inst: Uuid,
+        session: Option<Uuid>,
+        key: &str,
+        kind: &str,
+        started_at: DateTime<Utc>,
+        ends_at: DateTime<Utc>,
+        message: Option<Uuid>,
+    ) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO engine.persona_events \
+                 (instance_id, session_id, event_key, kind, started_at, ends_at, message_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
+        )
+        .bind(inst)
+        .bind(session)
+        .bind(key)
+        .bind(kind)
+        .bind(started_at)
+        .bind(ends_at)
+        .bind(message)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn life_events_window_cap_and_under_way(pool: PgPool) {
+        let repo = StoryRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        let inst = seed_instance(&pool, owner, "A", "active").await;
+        let s = seed_session(&pool, owner, inst).await;
+        let now = Utc::now();
+        let d = chrono::Duration::days;
+        let h = chrono::Duration::hours;
+        // A long background that started before the window and is still under
+        // way, an event wholly before the window, and three ended in it.
+        seed_event(&pool, inst, Some(s), "k1", "long_trip", now - d(8), now + h(1), None).await;
+        seed_event(&pool, inst, Some(s), "k2", "reading", now - d(9), now - d(9) + h(2), None).await;
+        for (key, kind, ago) in [("k3", "gaming", 3), ("k4", "asleep", 2), ("k5", "quarrel", 1)] {
+            seed_event(&pool, inst, Some(s), key, kind, now - d(ago), now - d(ago) + h(1), None)
+                .await;
+        }
+        let got = repo.life_events(inst, now - d(7), now, 2).await.unwrap();
+        let kinds: Vec<_> = got.iter().map(|e| e.event.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec!["quarrel", "asleep", "long_trip"],
+            "the cap keeps the newest; a row under way survives it"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn life_events_narration_archive_and_unknown_kinds(pool: PgPool) {
+        let repo = StoryRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        let inst = seed_instance(&pool, owner, "A", "active").await;
+        let s = seed_session(&pool, owner, inst).await;
+        let a = seed_session(&pool, owner, inst).await;
+        let now = Utc::now();
+        let h = chrono::Duration::hours;
+        let ended = |ago: i64| (now - h(ago), now - h(ago) + h(1));
+
+        let cat = seed_told(&pool, s, "我遇到一只猫").await;
+        let (st, en) = ended(10);
+        seed_event(&pool, inst, Some(s), "k1", "animal_encounter", st, en, Some(cat)).await;
+        let (st, en) = ended(20);
+        seed_event(&pool, inst, Some(s), "k2", "asleep", st, en, None).await;
+        let ex = seed_told(&pool, a, "前任找我了").await;
+        let (st, en) = ended(30);
+        seed_event(&pool, inst, Some(a), "k3", "ex_message", st, en, Some(ex)).await;
+        let gone = seed_told(&pool, s, "烦死了").await;
+        let (st, en) = ended(40);
+        seed_event(&pool, inst, Some(s), "k4", "irritable", st, en, Some(gone)).await;
+        sqlx::query("DELETE FROM engine.chat_messages WHERE id = $1")
+            .bind(gone)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (st, en) = ended(50);
+        seed_event(&pool, inst, Some(a), "k5", "taking_space", st, en, None).await;
+        let (st, en) = ended(60);
+        seed_event(&pool, inst, None, "k6", "fell_out", st, en, None).await;
+        let (st, en) = ended(70);
+        seed_event(&pool, inst, Some(s), "k7", "bogus_kind", st, en, None).await;
+        sqlx::query("UPDATE engine.chat_sessions SET archived = true WHERE id = $1")
+            .bind(a)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let got = repo
+            .life_events(inst, now - chrono::Duration::days(7), now, 30)
+            .await
+            .unwrap();
+        let told: Vec<_> = got
+            .iter()
+            .map(|e| (e.event.kind.as_str(), e.told.as_deref()))
+            .collect();
+        assert_eq!(
+            told,
+            vec![
+                ("animal_encounter", Some("我遇到一只猫")),
+                ("asleep", None),
+                ("ex_message", None),
+                ("irritable", None),
+            ]
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn life_events_hide_a_scare_under_way(pool: PgPool) {
+        let repo = StoryRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        let inst = seed_instance(&pool, owner, "A", "active").await;
+        let s = seed_session(&pool, owner, inst).await;
+        let now = Utc::now();
+        let m = chrono::Duration::minutes;
+        let h = chrono::Duration::hours;
+        seed_event(&pool, inst, Some(s), "k1", "period_scare", now - m(10), now + m(50), None).await;
+        seed_event(&pool, inst, Some(s), "k2", "pregnancy_scare", now - h(3), now - h(2), None)
+            .await;
+        let got = repo
+            .life_events(inst, now - chrono::Duration::days(7), now, 30)
+            .await
+            .unwrap();
+        let kinds: Vec<_> = got.iter().map(|e| e.event.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["pregnancy_scare"]);
     }
 
     #[sqlx::test(migrations = "./migrations")]
