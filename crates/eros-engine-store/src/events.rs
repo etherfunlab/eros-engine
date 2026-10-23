@@ -8,6 +8,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::chat::{ChatMessage, ProactiveInsert};
+use crate::life_choices::pending_for_instance_on;
 
 /// One event. `session_id` is where it was drawn and told, `message_id` the
 /// message that told it; either is `None` once its row is gone, and
@@ -86,6 +87,23 @@ fn lookback_hours() -> i32 {
     events::lookback().num_hours() as i32
 }
 
+/// Serialize the writers of one instance's incidents and asks: a
+/// transaction-scoped advisory lock keyed on the instance, released with the
+/// transaction. Every writer takes it as its first statement; under READ
+/// COMMITTED each later statement then sees all that the previous holder
+/// committed, so a guard or a recheck reads the real state, not a snapshot
+/// that misses a transaction still in flight.
+pub(crate) async fn lock_instance(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    instance_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))")
+        .bind(instance_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 pub struct EventRepo<'a> {
     pub pool: &'a PgPool,
 }
@@ -94,14 +112,22 @@ impl EventRepo<'_> {
     /// Write an event and, when it has one, the message that tells it, in
     /// one transaction (spec §6.4). Nothing is written — `None` — while the
     /// instance has a foreground event under way at `started_at`, or, for a
-    /// background, any event; nor on a repeated `event_key` in the session.
-    /// The message's `sent_at` is the event's `started_at`.
+    /// background, any event; nor while any session of the instance waits for
+    /// an answer to an ask; nor on a repeated `event_key` in the session.
+    /// The guards are read under the instance's lock, so a writer in flight
+    /// (an accept, a conversion, an ask) is waited for, not missed. The
+    /// message's `sent_at` is the event's `started_at`.
     pub async fn insert(
         &self,
         e: &NewEvent<'_>,
         message: Option<&ProactiveInsert>,
     ) -> Result<Option<Inserted>, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
+        lock_instance(&mut tx, e.instance_id).await?;
+        if pending_for_instance_on(&mut *tx, e.instance_id, Utc::now()).await? {
+            // Dropped uncommitted.
+            return Ok(None);
+        }
         let written = match message {
             Some(m) => Some(
                 sqlx::query_as::<_, ChatMessage>(
@@ -191,6 +217,10 @@ impl EventRepo<'_> {
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         e: &NewEvent<'_>,
     ) -> Result<EventRecord, sqlx::Error> {
+        // The cap and the insert are two statements: no other writer of the
+        // instance may land between them. The lock is held to the caller's
+        // commit.
+        lock_instance(tx, e.instance_id).await?;
         let background: Vec<String> = events::background_kinds()
             .into_iter()
             .map(|k| k.as_str().to_string())
@@ -1704,6 +1734,170 @@ mod tests {
             (Some(TakingSpace), Some(trip.id)),
             "one incident at a time, the trip underneath"
         );
+    }
+
+    /// (events of the instance, rows of the message id).
+    async fn counts(pool: &PgPool, instance: Uuid, message_id: Uuid) -> (i64, i64) {
+        let events =
+            sqlx::query_scalar("SELECT count(*) FROM engine.persona_events WHERE instance_id = $1")
+                .bind(instance)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        let messages =
+            sqlx::query_scalar("SELECT count(*) FROM engine.chat_messages WHERE id = $1")
+                .bind(message_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        (events, messages)
+    }
+
+    /// While she waits for an answer to an ask, in any session of the
+    /// instance, a draw writes nothing: not the event, not its message. The
+    /// route's own check only sees an ask that landed before it ran; this is
+    /// the one that closes the gap.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_draw_is_refused_while_an_ask_is_pending_in_a_sibling_session(pool: PgPool) {
+        use crate::life_choices::LifeChoiceRepo;
+
+        let (owner, i, s) = instance_and_session(&pool).await;
+        let sibling = another_session(&pool, owner, i).await;
+        let (_, other_i, other_s) = instance_and_session(&pool).await;
+        let asks = LifeChoiceRepo { pool: &pool };
+        let ask = asks
+            .insert_ask(sibling, 3, None, &message("想先分开"))
+            .await
+            .unwrap()
+            .expect("asked");
+        let repo = EventRepo { pool: &pool };
+        let now = Utc::now();
+        let draw = |instance, session, key| NewEvent {
+            instance_id: instance,
+            session_id: session,
+            event_key: key,
+            kind: TempWork,
+            started_at: now,
+            ends_at: now + chrono::Duration::hours(4),
+        };
+
+        let told = message("刚被叫去加班");
+        assert!(repo
+            .insert(&draw(i, s, "work"), Some(&told))
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            counts(&pool, i, told.id).await,
+            (0, 0),
+            "no event and no message"
+        );
+        assert!(
+            repo.insert(&draw(other_i, other_s, "work"), None)
+                .await
+                .unwrap()
+                .is_some(),
+            "another instance's ask has no say"
+        );
+
+        // Answered, or lapsed: the draw goes through again.
+        asks.resolve(ask.id, "declined", now)
+            .await
+            .unwrap()
+            .expect("resolved");
+        assert!(repo
+            .insert(&draw(i, s, "work"), Some(&told))
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(counts(&pool, i, told.id).await, (1, 1));
+        sqlx::query("DELETE FROM engine.persona_events WHERE instance_id = $1")
+            .bind(i)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE engine.life_choices SET status = 'pending', resolved_at = NULL, \
+                    asked_at = $2 WHERE id = $1",
+        )
+        .bind(ask.id)
+        .bind(now - chrono::Duration::hours(25))
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            repo.insert(&draw(i, s, "work2"), None)
+                .await
+                .unwrap()
+                .is_some(),
+            "a lapsed ask does not hold a draw"
+        );
+    }
+
+    /// An accept in flight (its cap run, its separation written, nothing
+    /// committed) is invisible to a draw's guard snapshot. The draw waits for
+    /// the instance's lock instead, then reads the committed separation and
+    /// lands nothing: one foreground at a time.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_draw_waits_for_an_accept_in_flight_and_then_yields_to_it(pool: PgPool) {
+        let (_, i, s) = instance_and_session(&pool).await;
+        let mut accepting = pool.begin().await.unwrap();
+        let space = EventRepo::insert_preempting_in_tx(
+            &mut accepting,
+            &ev(
+                i,
+                s,
+                "space",
+                TakingSpace,
+                "2026-10-01T10:00:00Z",
+                "2026-10-01T22:00:00Z",
+            ),
+        )
+        .await
+        .unwrap();
+
+        let told = message("刚被叫去加班");
+        let drawing = tokio::spawn({
+            let (pool, told) = (pool.clone(), told.clone());
+            async move {
+                EventRepo { pool: &pool }
+                    .insert(
+                        &ev(
+                            i,
+                            s,
+                            "work",
+                            TempWork,
+                            "2026-10-01T11:00:00Z",
+                            "2026-10-01T15:00:00Z",
+                        ),
+                        Some(&told),
+                    )
+                    .await
+                    .unwrap()
+                    .map(|w| w.event.id)
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !drawing.is_finished(),
+            "the draw waits for the accept's lock"
+        );
+        accepting.commit().await.unwrap();
+
+        assert!(
+            drawing.await.unwrap().is_none(),
+            "and then sees the separation under way"
+        );
+        assert_eq!(
+            counts(&pool, i, told.id).await,
+            (1, 0),
+            "only the separation; the draw's message went with it"
+        );
+        let c = EventRepo { pool: &pool }
+            .current(i, None, t("2026-10-01T11:00:00Z"))
+            .await
+            .unwrap();
+        assert_eq!(c.foreground.map(|e| e.id), Some(space.id));
     }
 
     #[sqlx::test(migrations = "./migrations")]

@@ -95,8 +95,12 @@ pub(crate) enum Occasion {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LifeChoiceCue {
     /// She asks to take a break. `tier_gap` is the gap at this moment, stored
-    /// with the choice.
-    Ask { tier_gap: i16 },
+    /// with the choice; `anchor_seen` is the session's streak anchor the
+    /// trigger judged by, which the write checks is still current.
+    Ask {
+        tier_gap: i16,
+        anchor_seen: Option<DateTime<Utc>>,
+    },
     /// The user agreed: they do not talk for `hours`.
     Goodbye { hours: i64 },
     /// The user declined.
@@ -537,10 +541,14 @@ pub(crate) async fn greet(
             .await?
             .and_then(|i| i.message)),
         // The ask lands with its choice row, in one transaction; a pending
-        // choice already in the session (a concurrent ask won) leaves nothing.
-        Occasion::LifeChoice(LifeChoiceCue::Ask { tier_gap }) => {
+        // choice already in the instance (a concurrent ask won) or a streak
+        // anchor that moved since the trigger read it leaves nothing.
+        Occasion::LifeChoice(LifeChoiceCue::Ask {
+            tier_gap,
+            anchor_seen,
+        }) => {
             let asked = LifeChoiceRepo { pool: &state.pool }
-                .insert_ask(g.session_id, *tier_gap, &row)
+                .insert_ask(g.session_id, *tier_gap, *anchor_seen, &row)
                 .await?;
             match asked {
                 Some(_) => Ok(chat_repo
@@ -779,7 +787,10 @@ mod tests {
     fn the_life_choice_cues_are_exact() {
         let cue = |c| Occasion::LifeChoice(c).cue(1, &PersonaTraits::default(), None);
         assert_eq!(
-            cue(LifeChoiceCue::Ask { tier_gap: 3 }),
+            cue(LifeChoiceCue::Ask {
+                tier_gap: 3,
+                anchor_seen: None
+            }),
             "（这段关系最近让你很累：心动还在，但交情和耐心都被磨薄了。你决定郑重地告诉对方：你想先分开一阵子，希望对方给你一个答复。）"
         );
         assert_eq!(
@@ -791,7 +802,10 @@ mod tests {
             "（对方不同意你提出的分开请求，你心里不好受。）"
         );
         for c in [
-            LifeChoiceCue::Ask { tier_gap: 2 },
+            LifeChoiceCue::Ask {
+                tier_gap: 2,
+                anchor_seen: None,
+            },
             LifeChoiceCue::Goodbye { hours: 12 },
             LifeChoiceCue::Hurt,
         ] {

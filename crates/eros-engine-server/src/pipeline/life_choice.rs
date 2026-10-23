@@ -246,7 +246,10 @@ async fn try_ask(
             instance_id,
             persona,
             now: &NowContext::for_user(&locale, now),
-            occasion: Occasion::LifeChoice(LifeChoiceCue::Ask { tier_gap }),
+            occasion: Occasion::LifeChoice(LifeChoiceCue::Ask {
+                tier_gap,
+                anchor_seen: since,
+            }),
             recall_query,
             since: now,
             tier,
@@ -852,7 +855,7 @@ mod tests {
             gateway_errors: None,
         };
         let choice = repo
-            .insert_ask(session_id, 3, &message)
+            .insert_ask(session_id, 3, None, &message)
             .await
             .unwrap()
             .expect("written");

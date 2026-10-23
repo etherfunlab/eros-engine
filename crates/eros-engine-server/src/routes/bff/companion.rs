@@ -1486,6 +1486,7 @@ mod tests {
             .insert_ask(
                 session_id,
                 3,
+                None,
                 &eros_engine_store::chat::ProactiveInsert {
                     id: Uuid::new_v4(),
                     content: "我想先分开一阵子".into(),

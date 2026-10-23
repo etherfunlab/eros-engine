@@ -147,7 +147,8 @@ all of these hold, read from the committed, time-decayed state:
 - **Clear runway:** no session of the instance has a pending un-expired
   choice, and the instance has no `taking_space` event under way. (An
   offline stretch silences the judge anyway, so no trigger can fire inside
-  one.) She has one life, so the instance holds at most one pending ask.
+  one.) She has one life, so the instance holds at most one pending ask;
+  the write re-checks the pending ask under the instance's lock (§3.2).
 - **Session:** a 1:1 text session of a genome instance. A BYOC session never
   triggers: the resolution endpoint refuses BYOC, so an ask there could never
   be answered.
@@ -190,6 +191,14 @@ When the trigger fires, in order:
    `ask_for_space`, status `pending`, the tier gap at this moment
    (`tier_gap`, 2–4), `asked_at` now. The pending window is 24 hours;
    `expires_at` is derived (`asked_at + 24 h`), never stored.
+
+Generation takes seconds, so the write re-checks what the trigger read
+before it: ask creation and every persona-event write serialize per instance
+(an advisory transaction lock keyed on the instance, taken first), and under
+that lock the ask lands only if no session of the instance holds a pending
+un-expired choice and the session's streak anchor is still the one the
+trigger judged by. The ordinary event draw refuses under the same lock while
+a choice is pending.
 
 The turn's own affinity persist (state + event row, one transaction) is
 untouched: the trigger runs after it, and the ask's generation and writes

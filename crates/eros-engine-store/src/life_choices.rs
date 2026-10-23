@@ -8,6 +8,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::chat::ProactiveInsert;
+use crate::events::lock_instance;
 
 /// How long a choice waits for an answer; the only place it is written down.
 /// A choice never stores its expiry: it is `asked_at` plus this.
@@ -62,32 +63,38 @@ pub struct LifeChoiceRepo<'a> {
 
 impl LifeChoiceRepo<'_> {
     /// Write the message that asks and the choice it asks, in one
-    /// transaction. `None` (nothing written, the message with it) while the
-    /// session holds a pending choice that has not lapsed. `asked_at` is the
-    /// message's `sent_at`.
+    /// transaction. `None` (nothing written, the message with it) while any
+    /// session of the instance holds a pending choice that has not lapsed, or
+    /// when the session's streak anchor is no longer `anchor_seen`, the one
+    /// the trigger judged by before generation ran: another ask landed or was
+    /// answered meanwhile, and the streak it counted is stale. Both are read
+    /// under the instance's lock, so asks and event writes of one instance
+    /// queue here. `asked_at` is the message's `sent_at`.
     pub async fn insert_ask(
         &self,
         session_id: Uuid,
         tier_gap: i16,
+        anchor_seen: Option<DateTime<Utc>>,
         message: &ProactiveInsert,
     ) -> Result<Option<LifeChoiceRecord>, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
-        // Touching the session first takes its row lock: two asks for one
-        // session queue here, and the second one's check sees the first's commit.
+        // The lock's key is the session's instance, a column that never
+        // changes, so reading it ahead of the lock is safe.
+        let instance_id: Uuid = sqlx::query_scalar(
+            "SELECT instance_id FROM engine.chat_sessions \
+              WHERE id = $1 AND instance_id IS NOT NULL",
+        )
+        .bind(session_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        lock_instance(&mut tx, instance_id).await?;
         sqlx::query("UPDATE engine.chat_sessions SET last_active_at = now() WHERE id = $1")
             .bind(session_id)
             .execute(&mut *tx)
             .await?;
-        let held: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM engine.life_choices \
-                             WHERE session_id = $1 AND status = 'pending' \
-                               AND asked_at > now() - make_interval(hours => $2))",
-        )
-        .bind(session_id)
-        .bind(PENDING_HOURS)
-        .fetch_one(&mut *tx)
-        .await?;
-        if held {
+        if pending_for_instance_on(&mut *tx, instance_id, Utc::now()).await?
+            || streak_anchor_on(&mut *tx, session_id).await? != anchor_seen
+        {
             // Dropped uncommitted.
             return Ok(None);
         }
@@ -160,17 +167,7 @@ impl LifeChoiceRepo<'_> {
         instance_id: Uuid,
         now: DateTime<Utc>,
     ) -> Result<bool, sqlx::Error> {
-        sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM engine.life_choices c \
-                              JOIN engine.chat_sessions s ON s.id = c.session_id \
-                             WHERE s.instance_id = $1 AND c.status = 'pending' \
-                               AND c.asked_at > $2 - make_interval(hours => $3))",
-        )
-        .bind(instance_id)
-        .bind(now)
-        .bind(PENDING_HOURS)
-        .fetch_one(self.pool)
-        .await
+        pending_for_instance_on(self.pool, instance_id, now).await
     }
 
     /// Answer the choice: `status` and `now` as its resolution. `None` when
@@ -225,16 +222,7 @@ impl LifeChoiceRepo<'_> {
         &self,
         session_id: Uuid,
     ) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
-        sqlx::query_scalar(
-            "SELECT GREATEST(c.asked_at, c.resolved_at, e.ends_at) \
-               FROM engine.life_choices c \
-               LEFT JOIN engine.persona_events e ON e.id = c.event_id \
-              WHERE c.session_id = $1 \
-              ORDER BY c.asked_at DESC LIMIT 1",
-        )
-        .bind(session_id)
-        .fetch_optional(self.pool)
-        .await
+        streak_anchor_on(self.pool, session_id).await
     }
 
     /// Whether `now` falls in the slowdown window of the session's newest
@@ -289,6 +277,43 @@ impl LifeChoiceRepo<'_> {
     }
 }
 
+/// [`LifeChoiceRepo::pending_for_instance`] on any executor, so the write
+/// that must refuse while she waits asks inside its own transaction.
+pub(crate) async fn pending_for_instance_on<'e, E: sqlx::PgExecutor<'e>>(
+    ex: E,
+    instance_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM engine.life_choices c \
+                          JOIN engine.chat_sessions s ON s.id = c.session_id \
+                         WHERE s.instance_id = $1 AND c.status = 'pending' \
+                           AND c.asked_at > $2 - make_interval(hours => $3))",
+    )
+    .bind(instance_id)
+    .bind(now)
+    .bind(PENDING_HOURS)
+    .fetch_one(ex)
+    .await
+}
+
+/// [`LifeChoiceRepo::streak_anchor`] on any executor.
+async fn streak_anchor_on<'e, E: sqlx::PgExecutor<'e>>(
+    ex: E,
+    session_id: Uuid,
+) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT GREATEST(c.asked_at, c.resolved_at, e.ends_at) \
+           FROM engine.life_choices c \
+           LEFT JOIN engine.persona_events e ON e.id = c.event_id \
+          WHERE c.session_id = $1 \
+          ORDER BY c.asked_at DESC LIMIT 1",
+    )
+    .bind(session_id)
+    .fetch_optional(ex)
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,7 +356,7 @@ mod tests {
         let (_, _, session) = instance_and_session(&pool).await;
         let m = ask_message("我想先分开一阵子");
         let choice = LifeChoiceRepo { pool: &pool }
-            .insert_ask(session, 3, &m)
+            .insert_ask(session, 3, None, &m)
             .await
             .unwrap()
             .expect("written");
@@ -375,13 +400,14 @@ mod tests {
         let (_, _, session) = instance_and_session(&pool).await;
         let repo = LifeChoiceRepo { pool: &pool };
         let first = repo
-            .insert_ask(session, 2, &ask_message("第一次"))
+            .insert_ask(session, 2, None, &ask_message("第一次"))
             .await
             .unwrap()
             .expect("written");
         let second = ask_message("第二次");
+        let anchor = repo.streak_anchor(session).await.unwrap();
         assert!(repo
-            .insert_ask(session, 4, &second)
+            .insert_ask(session, 4, anchor, &second)
             .await
             .unwrap()
             .is_none());
@@ -406,7 +432,12 @@ mod tests {
         .await
         .unwrap();
         let third = ask_message("过了一天再问");
-        assert!(repo.insert_ask(session, 4, &third).await.unwrap().is_some());
+        let anchor = repo.streak_anchor(session).await.unwrap();
+        assert!(repo
+            .insert_ask(session, 4, anchor, &third)
+            .await
+            .unwrap()
+            .is_some());
         // Not so once it was answered, either: a resolved choice does not block.
         let latest = repo
             .pending(session, Utc::now())
@@ -417,8 +448,9 @@ mod tests {
             .await
             .unwrap()
             .expect("resolved");
+        let anchor = repo.streak_anchor(session).await.unwrap();
         assert!(repo
-            .insert_ask(session, 2, &ask_message("再问"))
+            .insert_ask(session, 2, anchor, &ask_message("再问"))
             .await
             .unwrap()
             .is_some());
@@ -429,7 +461,7 @@ mod tests {
         let (_, _, session) = instance_and_session(&pool).await;
         let repo = LifeChoiceRepo { pool: &pool };
         let choice = repo
-            .insert_ask(session, 3, &ask_message("想先分开"))
+            .insert_ask(session, 3, None, &ask_message("想先分开"))
             .await
             .unwrap()
             .expect("written");
@@ -465,7 +497,7 @@ mod tests {
             .await
             .unwrap();
         let lapsing = repo
-            .insert_ask(session, 3, &ask_message("再想想"))
+            .insert_ask(session, 3, None, &ask_message("再想想"))
             .await
             .unwrap()
             .expect("written");
@@ -495,7 +527,7 @@ mod tests {
         let (_, _, session) = instance_and_session(&pool).await;
         let repo = LifeChoiceRepo { pool: &pool };
         let choice = repo
-            .insert_ask(session, 2, &ask_message("想先分开"))
+            .insert_ask(session, 2, None, &ask_message("想先分开"))
             .await
             .unwrap()
             .expect("written");
@@ -540,7 +572,7 @@ mod tests {
         let (_, other_instance, _) = instance_and_session(&pool).await;
         let repo = LifeChoiceRepo { pool: &pool };
         let choice = repo
-            .insert_ask(asked_in, 3, &ask_message("想先分开"))
+            .insert_ask(asked_in, 3, None, &ask_message("想先分开"))
             .await
             .unwrap()
             .expect("written");
@@ -562,6 +594,147 @@ mod tests {
         assert!(!repo.pending_for_instance(instance, inside).await.unwrap());
     }
 
+    /// She has one life: two asks racing from sibling sessions (two detached
+    /// post-process tasks, each past its own pre-generation check) land one.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn concurrent_asks_from_sibling_sessions_land_one(pool: PgPool) {
+        let (owner, instance, first) = instance_and_session(&pool).await;
+        let second = ChatRepo { pool: &pool }
+            .create_session(owner, instance)
+            .await
+            .unwrap()
+            .id;
+        let (m1, m2) = (ask_message("想先分开"), ask_message("我想静一静"));
+        let ask = |session, message: ProactiveInsert| {
+            let pool = pool.clone();
+            async move {
+                LifeChoiceRepo { pool: &pool }
+                    .insert_ask(session, 3, None, &message)
+                    .await
+                    .unwrap()
+            }
+        };
+        let (a, b) = tokio::join!(ask(first, m1.clone()), ask(second, m2.clone()));
+        assert_eq!(
+            [a.is_some(), b.is_some()].iter().filter(|w| **w).count(),
+            1,
+            "exactly one ask lands"
+        );
+        let (winner, loser) = if a.is_some() { (&m1, &m2) } else { (&m2, &m1) };
+        assert_eq!(message_count(&pool, winner.id).await, 1);
+        assert_eq!(
+            message_count(&pool, loser.id).await,
+            0,
+            "the loser leaves no message"
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM engine.life_choices")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    /// An ask in flight (written, not committed) is invisible to another
+    /// ask's check. The second one waits for the instance's lock instead,
+    /// then reads the committed ask and lands nothing.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_ask_waits_for_an_ask_in_flight_and_then_yields_to_it(pool: PgPool) {
+        let (owner, instance, first) = instance_and_session(&pool).await;
+        let second = ChatRepo { pool: &pool }
+            .create_session(owner, instance)
+            .await
+            .unwrap()
+            .id;
+        let landing_message = ask_message("想先分开");
+        let mut landing = pool.begin().await.unwrap();
+        lock_instance(&mut landing, instance).await.unwrap();
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (id, session_id, role, content, assistant_action_type) \
+             VALUES ($1, $2, 'assistant', $3, 'proactive')",
+        )
+        .bind(landing_message.id)
+        .bind(first)
+        .bind(&landing_message.content)
+        .execute(&mut *landing)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.life_choices (session_id, kind, tier_gap, asked_at, message_id) \
+             VALUES ($1, 'ask_for_space', 3, now(), $2)",
+        )
+        .bind(first)
+        .bind(landing_message.id)
+        .execute(&mut *landing)
+        .await
+        .unwrap();
+
+        let waiting_message = ask_message("我想静一静");
+        let waiting = tokio::spawn({
+            let (pool, message) = (pool.clone(), waiting_message.clone());
+            async move {
+                LifeChoiceRepo { pool: &pool }
+                    .insert_ask(second, 3, None, &message)
+                    .await
+                    .unwrap()
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!waiting.is_finished(), "the second ask waits for the lock");
+        landing.commit().await.unwrap();
+
+        assert!(
+            waiting.await.unwrap().is_none(),
+            "and then sees the first one pending"
+        );
+        assert_eq!(message_count(&pool, landing_message.id).await, 1);
+        assert_eq!(message_count(&pool, waiting_message.id).await, 0);
+    }
+
+    /// The streak was judged on an anchor the trigger read before generation
+    /// ran. An ask that landed and was answered meanwhile moved it: the stale
+    /// write is refused, the current one lands.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_ask_on_a_stale_streak_anchor_is_refused(pool: PgPool) {
+        let (_, _, session) = instance_and_session(&pool).await;
+        let repo = LifeChoiceRepo { pool: &pool };
+        let seen = repo.streak_anchor(session).await.unwrap();
+        assert_eq!(seen, None, "never asked when the trigger read it");
+
+        // Meanwhile another ask landed and was answered.
+        let earlier = repo
+            .insert_ask(session, 3, seen, &ask_message("想先分开"))
+            .await
+            .unwrap()
+            .expect("written");
+        repo.resolve(
+            earlier.id,
+            "declined",
+            earlier.asked_at + Duration::hours(1),
+        )
+        .await
+        .unwrap()
+        .expect("resolved");
+        let moved = repo.streak_anchor(session).await.unwrap();
+        assert_ne!(moved, seen);
+
+        let stale = ask_message("又想分开");
+        assert!(repo
+            .insert_ask(session, 3, seen, &stale)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            message_count(&pool, stale.id).await,
+            0,
+            "the stale ask leaves no message"
+        );
+        assert!(repo
+            .insert_ask(session, 3, moved, &ask_message("又想分开"))
+            .await
+            .unwrap()
+            .is_some());
+    }
+
     #[sqlx::test(migrations = "./migrations")]
     async fn set_event_records_the_separation_the_choice_wrote(pool: PgPool) {
         use crate::events::{EventRepo, NewEvent};
@@ -570,7 +743,7 @@ mod tests {
         let (_, instance, session) = instance_and_session(&pool).await;
         let repo = LifeChoiceRepo { pool: &pool };
         let choice = repo
-            .insert_ask(session, 3, &ask_message("想先分开"))
+            .insert_ask(session, 3, None, &ask_message("想先分开"))
             .await
             .unwrap()
             .expect("written");
@@ -637,7 +810,7 @@ mod tests {
 
         // Asked and waiting: the ask itself.
         let choice = repo
-            .insert_ask(session, 3, &ask_message("想先分开"))
+            .insert_ask(session, 3, None, &ask_message("想先分开"))
             .await
             .unwrap()
             .expect("written");
@@ -685,8 +858,9 @@ mod tests {
         );
 
         // The newest choice speaks, and a sibling session's episode has no say.
+        let anchor = repo.streak_anchor(session).await.unwrap();
         let later = repo
-            .insert_ask(session, 2, &ask_message("又来了"))
+            .insert_ask(session, 2, anchor, &ask_message("又来了"))
             .await
             .unwrap()
             .expect("written");
@@ -703,7 +877,7 @@ mod tests {
         let repo = LifeChoiceRepo { pool: &pool };
         assert_eq!(repo.get(Uuid::new_v4()).await.unwrap(), None);
         let choice = repo
-            .insert_ask(session, 3, &ask_message("想先分开"))
+            .insert_ask(session, 3, None, &ask_message("想先分开"))
             .await
             .unwrap()
             .expect("written");
@@ -731,7 +905,7 @@ mod tests {
         let (_, instance, session) = instance_and_session(&pool).await;
         let repo = LifeChoiceRepo { pool: &pool };
         let choice = repo
-            .insert_ask(session, 3, &ask_message("想先分开"))
+            .insert_ask(session, 3, None, &ask_message("想先分开"))
             .await
             .unwrap()
             .expect("written");
@@ -843,7 +1017,7 @@ mod tests {
         let (_, instance, session) = instance_and_session(&pool).await;
         let repo = LifeChoiceRepo { pool: &pool };
         let choice = repo
-            .insert_ask(session, 3, &ask_message("想先分开"))
+            .insert_ask(session, 3, None, &ask_message("想先分开"))
             .await
             .unwrap()
             .expect("written");
@@ -896,7 +1070,7 @@ mod tests {
         let (_, instance, session) = instance_and_session(&pool).await;
         let repo = LifeChoiceRepo { pool: &pool };
         let choice = repo
-            .insert_ask(session, 3, &ask_message("想先分开"))
+            .insert_ask(session, 3, None, &ask_message("想先分开"))
             .await
             .unwrap()
             .expect("written");
@@ -958,7 +1132,7 @@ mod tests {
         let (_, instance, session) = instance_and_session(&pool).await;
         let repo = LifeChoiceRepo { pool: &pool };
         let choice = repo
-            .insert_ask(session, 3, &ask_message("想先分开"))
+            .insert_ask(session, 3, None, &ask_message("想先分开"))
             .await
             .unwrap()
             .expect("written");
@@ -986,7 +1160,7 @@ mod tests {
                 .execute(&pool)
                 .await
                 .unwrap();
-            repo.insert_ask(session, 3, &ask_message("再想想"))
+            repo.insert_ask(session, 3, None, &ask_message("再想想"))
                 .await
                 .unwrap()
                 .expect("written")
@@ -1007,7 +1181,7 @@ mod tests {
     async fn concurrent_resolves_in_transactions_first_writer_wins(pool: PgPool) {
         let (_, _, session) = instance_and_session(&pool).await;
         let choice = LifeChoiceRepo { pool: &pool }
-            .insert_ask(session, 3, &ask_message("想先分开"))
+            .insert_ask(session, 3, None, &ask_message("想先分开"))
             .await
             .unwrap()
             .expect("written");
@@ -1056,8 +1230,9 @@ mod tests {
         use eros_engine_core::events::EventKind;
 
         let repo = LifeChoiceRepo { pool };
+        let anchor = repo.streak_anchor(session).await.unwrap();
         let choice = repo
-            .insert_ask(session, 3, &ask_message("想先分开"))
+            .insert_ask(session, 3, anchor, &ask_message("想先分开"))
             .await
             .unwrap()
             .expect("written");
