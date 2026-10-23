@@ -358,6 +358,46 @@ impl EventRepo<'_> {
         Ok(out)
     }
 
+    /// For each of `instance_ids`, the background under way at `at`
+    /// (`started_at <= at < ends_at`, within `lookback()`), newest start
+    /// first. Instances with none are absent. One query (spec 2026-10-23-
+    /// life-events-world-wiring-design.md §4).
+    pub async fn backgrounds_at(
+        &self,
+        instance_ids: &[Uuid],
+        at: DateTime<Utc>,
+    ) -> Result<std::collections::HashMap<Uuid, EventRecord>, sqlx::Error> {
+        let background: Vec<String> = events::background_kinds()
+            .into_iter()
+            .map(|k| k.as_str().to_string())
+            .collect();
+        let rows: Vec<(Uuid, Uuid, String, Option<Uuid>, DateTime<Utc>, DateTime<Utc>, Option<Uuid>)> =
+            sqlx::query_as(
+                "SELECT DISTINCT ON (instance_id) \
+                        instance_id, id, kind, session_id, started_at, ends_at, message_id \
+                   FROM engine.persona_events \
+                  WHERE instance_id = ANY($1) AND kind = ANY($2) \
+                    AND started_at <= $3 AND ends_at > $3 \
+                    AND started_at > $3 - make_interval(hours => $4) \
+                  ORDER BY instance_id, started_at DESC, id DESC",
+            )
+            .bind(instance_ids)
+            .bind(&background)
+            .bind(at)
+            .bind(lookback_hours())
+            .fetch_all(self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(
+                |(instance_id, id, kind, session_id, started_at, ends_at, message_id)| {
+                    record((id, kind, session_id, started_at, ends_at, message_id))
+                        .map(|e| (instance_id, e))
+                },
+            )
+            .collect())
+    }
+
     /// The instance's newest event among `offline` that ended by `at`, when
     /// this session holds a user row ghosted inside it and no assistant row
     /// with text written after it ended (spec 2026-10-16-life-events-offline-
@@ -2204,5 +2244,27 @@ mod tests {
         .await
         .unwrap();
         assert!(!index);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn backgrounds_at_maps_each_instance(pool: PgPool) {
+        let repo = EventRepo { pool: &pool };
+        let (_, a, sa) = instance_and_session(&pool).await;
+        let (_, b, sb) = instance_and_session(&pool).await;
+        let (_, c, sc) = instance_and_session(&pool).await;
+        let (_, d, sd) = instance_and_session(&pool).await;
+        let now = t("2026-10-23T08:00:00Z");
+        for e in [
+            ev(a, sa, "k1", Hospitalized, "2026-10-22T08:00:00Z", "2026-10-25T08:00:00Z"),
+            ev(a, sa, "k2", Reading, "2026-10-23T07:50:00Z", "2026-10-23T09:00:00Z"),
+            ev(b, sb, "k3", BusinessTrip, "2026-10-21T08:00:00Z", "2026-10-22T08:00:00Z"),
+            ev(c, sc, "k4", Sick, "2026-10-22T08:00:00Z", "2026-10-24T08:00:00Z"),
+            ev(d, sd, "k5", Busy, "2026-10-23T07:00:00Z", "2026-10-23T10:00:00Z"),
+        ] {
+            repo.insert_preempting(&e).await.unwrap();
+        }
+        let got = repo.backgrounds_at(&[a, b, d], now).await.unwrap();
+        assert_eq!(got.len(), 1, "only a has a background under way among a, b, d");
+        assert_eq!(got[&a].kind, Hospitalized);
     }
 }
