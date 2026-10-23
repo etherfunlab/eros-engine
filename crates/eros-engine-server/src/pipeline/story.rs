@@ -12,7 +12,8 @@ use uuid::Uuid;
 use eros_engine_llm::model_config::ResolvedWorldStories;
 use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
 use eros_engine_store::story::{
-    StoryAffinity, StoryEventInsert, StoryInsight, StoryInsightRow, StoryPersona, StoryRepo,
+    StoryAffinity, StoryEventInsert, StoryInsight, StoryInsightRow, StoryLifeChoice,
+    StoryLifeEvent, StoryPersona, StoryRepo,
 };
 
 use crate::state::AppState;
@@ -43,7 +44,12 @@ backstory 是 canon，不可与之冲突。每轮输出更新后的完整 insigh
 每条一句、自成一体、适合单独召回；避免与近期事件重复。\
 6) digest：1-2 句该角色当前人生近况。\
 7) 一切生活设定（职业、居所、日常事件）必须发生在 worldview 描述的世界观内，\
-不得引入与其冲突的元素。";
+不得引入与其冲突的元素。\
+8) life_events 与 life_choices 是引擎记录的、已经发生的事：不得改写、否认或挪动时间，\
+也不得与 told / asked 的讲述原文矛盾；可以作为 events 与 insight 的素材展开\
+（例：刚分手之后更新 romance_history；分开请求之后更新 user_relationship）。\
+current_background 是角色此刻所处的状态，会按 when 结束：digest 与 insight 不得与它矛盾；\
+写到它时写成有终点的事（这几天在外地出差），不要写成长期状态。";
 
 /// Persona-side life-base schema: superset of COMPANION_INSIGHTS_SCHEMA
 /// (prompt.rs), reworded for the persona, flat (matching preferences
@@ -95,16 +101,75 @@ struct StoryEventOut {
     content: String,
 }
 
+/// Everything a round reads besides the persona, its story row and the
+/// worldview.
+#[derive(Debug, Default)]
+pub(crate) struct StoryEvidence {
+    pub recent_events: Vec<(String, String)>,
+    pub affinity: Option<StoryAffinity>,
+    pub chat: Vec<(String, String)>,
+    pub life_events: Vec<StoryLifeEvent>,
+    pub life_choices: Vec<StoryLifeChoice>,
+}
+
+/// One `life_events` entry (spec 2026-10-23-life-events-world-wiring-design.md
+/// §3.1): label, category, relative time, the narration when told, and the
+/// outcome of an ended false alarm.
+fn life_event_value(e: &StoryLifeEvent, now: chrono::DateTime<chrono::Utc>) -> serde_json::Value {
+    let ev = &e.event;
+    let mut v = serde_json::json!({
+        "label": crate::prompt::event_label(ev.kind),
+        "category": serde_json::to_value(ev.kind.category()).unwrap_or_default(),
+        "when": crate::prompt::event_when_text(ev.started_at, ev.ends_at, now),
+    });
+    if let Some(told) = &e.told {
+        v["told"] = serde_json::Value::String(told.clone());
+    }
+    if ev.kind.is_false_alarm() && ev.ends_at <= now {
+        v["outcome"] = serde_json::Value::String("虚惊一场".into());
+    }
+    v
+}
+
+/// One `life_choices` entry (spec §3.3); `None` for a status the engine does
+/// not write.
+fn life_choice_value(
+    c: &StoryLifeChoice,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<serde_json::Value> {
+    let outcome = match c.choice.status.as_str() {
+        "pending" if c.choice.is_pending(now) => "还在等用户答复".to_string(),
+        "pending" => "用户一直没有答复，这件事不了了之".to_string(),
+        "accepted" => match c.separation_hours {
+            Some(n) => format!("用户同意了，两人说好暂时分开 {n} 小时"),
+            None => "用户同意了，两人说好暂时分开".to_string(),
+        },
+        "declined" => "用户不同意分开".to_string(),
+        "ignored" => "用户没有回应这个请求，接着说了别的，两人为此闹得不愉快".to_string(),
+        _ => return None,
+    };
+    let mut v = serde_json::json!({
+        "label": "角色提出想先分开一阵子",
+        "when": format!("{}前", crate::prompt::span_text(now - c.choice.asked_at)),
+        "outcome": outcome,
+    });
+    if let Some(asked) = &c.asked {
+        v["asked"] = serde_json::Value::String(asked.clone());
+    }
+    Some(v)
+}
+
 /// Assemble the story director's user message.
 fn story_user_payload(
     now: chrono::DateTime<chrono::Utc>,
     persona: &StoryPersona,
     row: &StoryInsightRow,
-    recent_events: &[(String, String)],
-    affinity: Option<&StoryAffinity>,
-    chat_pairs: &[(String, String)],
+    evidence: &StoryEvidence,
     worldview: &str,
 ) -> String {
+    let recent_events = &evidence.recent_events;
+    let affinity = evidence.affinity.as_ref();
+    let chat_pairs = &evidence.chat;
     let is_init = row.last_run_at.is_none();
     let header = if is_init {
         "初始化这个角色的人生：先把 backstory 烤入 insight 底座，再补足其余栏位的丰富度，并生成当期 events。"
@@ -128,6 +193,22 @@ fn story_user_payload(
         .iter()
         .map(|(u, a)| serde_json::json!({"用户": u, "角色": a}))
         .collect();
+    let life_events: Vec<serde_json::Value> = evidence
+        .life_events
+        .iter()
+        .map(|e| life_event_value(e, now))
+        .collect();
+    let current_background = evidence
+        .life_events
+        .iter()
+        .find(|e| e.event.kind.is_background() && e.event.ends_at > now)
+        .map(|e| life_event_value(e, now))
+        .unwrap_or(serde_json::Value::Null);
+    let life_choices: Vec<serde_json::Value> = evidence
+        .life_choices
+        .iter()
+        .filter_map(|c| life_choice_value(c, now))
+        .collect();
     let data = serde_json::json!({
         "current_time": now.to_rfc3339(),
         "worldview": worldview,
@@ -148,6 +229,9 @@ fn story_user_payload(
             .collect::<Vec<_>>(),
         "affinity_reference": affinity_json,
         "recent_chat": chat,
+        "life_events": life_events,
+        "current_background": current_background,
+        "life_choices": life_choices,
     });
     format!(
         "{header}\n\n{}\n\n{PERSONA_STORY_INSIGHTS_SCHEMA}\n{STORY_DIRECTOR_RULES}",
@@ -301,13 +385,17 @@ async fn direct_story(
         .await
         .map_err(|e| format!("chat evidence load failed: {e}"))?;
 
+    let evidence = StoryEvidence {
+        recent_events: recent,
+        affinity,
+        chat,
+        ..Default::default()
+    };
     let payload = story_user_payload(
         chrono::Utc::now(),
         &persona,
         &row,
-        &recent,
-        affinity.as_ref(),
-        &chat,
+        &evidence,
         &worldview,
     );
     let req = ChatRequest {
@@ -390,6 +478,9 @@ async fn direct_story(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eros_engine_core::events::EventKind;
+    use eros_engine_store::events::EventRecord;
+    use eros_engine_store::life_choices::LifeChoiceRecord;
     use eros_engine_store::story::{
         StoryInsight, StoryInsightRow, StoryPersona, STORY_INSIGHT_FIELDS,
     };
@@ -431,9 +522,7 @@ mod tests {
             chrono::Utc::now(),
             &fixture_persona(),
             &fixture_row(false),
-            &[],
-            None,
-            &[],
+            &StoryEvidence::default(),
             "现代都市",
         );
         assert!(init.contains("初始化这个角色的人生"));
@@ -447,9 +536,11 @@ mod tests {
             chrono::Utc::now(),
             &fixture_persona(),
             &fixture_row(true),
-            &[("work".into(), "上周修好了咖啡机".into())],
-            None,
-            &[("最近好吗".into(), "在忙开店".into())],
+            &StoryEvidence {
+                recent_events: vec![("work".into(), "上周修好了咖啡机".into())],
+                chat: vec![("最近好吗".into(), "在忙开店".into())],
+                ..Default::default()
+            },
             "现代都市",
         );
         assert!(cont.contains("延续这个角色的人生"));
@@ -463,9 +554,7 @@ mod tests {
             chrono::Utc::now(),
             &fixture_persona(),
             &fixture_row(false),
-            &[],
-            None,
-            &[],
+            &StoryEvidence::default(),
             "古代宫廷",
         );
         assert!(p.contains("\"worldview\""));
@@ -474,6 +563,181 @@ mod tests {
             p.contains("必须发生在 worldview"),
             "worldview rule appended"
         );
+    }
+
+    /// The payload's data object: header, blank line, pretty JSON, blank
+    /// line, schema and rules.
+    fn data(p: &str) -> serde_json::Value {
+        serde_json::from_str(p.split("\n\n").nth(1).unwrap()).unwrap()
+    }
+
+    fn fixed_now() -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        chrono::Utc.with_ymd_and_hms(2026, 10, 23, 8, 0, 0).unwrap()
+    }
+
+    fn life(
+        kind: EventKind,
+        started_at: chrono::DateTime<chrono::Utc>,
+        ends_at: chrono::DateTime<chrono::Utc>,
+        told: Option<&str>,
+    ) -> StoryLifeEvent {
+        StoryLifeEvent {
+            event: EventRecord {
+                id: Uuid::new_v4(),
+                kind,
+                session_id: None,
+                started_at,
+                ends_at,
+                message_id: None,
+            },
+            told: told.map(str::to_string),
+        }
+    }
+
+    fn choice(
+        status: &str,
+        asked_at: chrono::DateTime<chrono::Utc>,
+        asked: Option<&str>,
+        separation_hours: Option<i64>,
+    ) -> StoryLifeChoice {
+        StoryLifeChoice {
+            choice: LifeChoiceRecord {
+                id: Uuid::new_v4(),
+                session_id: Uuid::new_v4(),
+                kind: "ask_for_space".into(),
+                status: status.into(),
+                tier_gap: 2,
+                asked_at,
+                resolved_at: None,
+                message_id: None,
+                event_id: None,
+            },
+            asked: asked.map(str::to_string),
+            separation_hours,
+        }
+    }
+
+    fn payload_with(evidence: &StoryEvidence) -> String {
+        story_user_payload(
+            fixed_now(),
+            &fixture_persona(),
+            &fixture_row(true),
+            evidence,
+            "现代都市",
+        )
+    }
+
+    #[test]
+    fn payload_carries_life_events_background_and_choices() {
+        let now = fixed_now();
+        let m = chrono::Duration::minutes;
+        let h = chrono::Duration::hours;
+        let d = chrono::Duration::days;
+        let p = payload_with(&StoryEvidence {
+            life_events: vec![
+                life(EventKind::Reading, now - m(30), now + h(2), Some("在看小说")),
+                life(EventKind::LongTrip, now - d(2), now + d(3), Some("我去云南了")),
+                life(EventKind::Asleep, now - d(3), now - d(3) + h(6), None),
+                life(
+                    EventKind::PregnancyScare,
+                    now - d(4),
+                    now - d(4) + h(1),
+                    Some("我验出两条杠"),
+                ),
+            ],
+            life_choices: vec![choice(
+                "declined",
+                now - d(5),
+                Some("我们先分开一阵子好吗"),
+                None,
+            )],
+            ..Default::default()
+        });
+        let d = data(&p);
+        assert_eq!(d["life_events"].as_array().unwrap().len(), 4);
+        assert_eq!(d["life_events"][0]["label"], "在看书");
+        assert_eq!(
+            d["life_events"][0]["when"],
+            "不到 1 小时前开始，约 2 小时后结束"
+        );
+        assert!(d["life_events"][0].get("outcome").is_none());
+        assert_eq!(d["life_events"][1]["category"], "trip");
+        assert_eq!(d["life_events"][2]["when"], "3 天前开始，持续 6 小时");
+        assert!(d["life_events"][2].get("told").is_none());
+        assert_eq!(d["life_events"][3]["outcome"], "虚惊一场");
+        assert_eq!(d["current_background"]["label"], "长途旅游");
+        assert_eq!(d["current_background"]["told"], "我去云南了");
+        assert_eq!(d["life_choices"][0]["when"], "5 天前");
+        assert_eq!(d["life_choices"][0]["outcome"], "用户不同意分开");
+        assert_eq!(d["life_choices"][0]["asked"], "我们先分开一阵子好吗");
+    }
+
+    #[test]
+    fn payload_without_life_inputs() {
+        let p = payload_with(&StoryEvidence::default());
+        let d = data(&p);
+        assert_eq!(d["life_events"], serde_json::json!([]));
+        assert!(d["current_background"].is_null());
+        assert_eq!(d["life_choices"], serde_json::json!([]));
+        assert!(p.contains("life_events 与 life_choices 是引擎记录的"), "rule 8");
+    }
+
+    #[test]
+    fn incident_under_way_is_not_the_background() {
+        let now = fixed_now();
+        let p = payload_with(&StoryEvidence {
+            life_events: vec![life(
+                EventKind::Reading,
+                now - chrono::Duration::minutes(30),
+                now + chrono::Duration::hours(2),
+                None,
+            )],
+            ..Default::default()
+        });
+        let d = data(&p);
+        assert!(d["current_background"].is_null());
+        assert!(d["life_events"][0]["when"]
+            .as_str()
+            .unwrap()
+            .ends_with("后结束"));
+    }
+
+    #[test]
+    fn life_choice_outcomes() {
+        let now = fixed_now();
+        let h = chrono::Duration::hours;
+        let p = payload_with(&StoryEvidence {
+            life_choices: vec![
+                choice("pending", now - h(1), Some("a"), None),
+                choice("pending", now - h(30), Some("b"), None),
+                choice("accepted", now - h(40), Some("c"), Some(12)),
+                choice("accepted", now - h(50), Some("d"), None),
+                choice("declined", now - h(60), None, None),
+                choice("ignored", now - h(70), Some("f"), None),
+            ],
+            ..Default::default()
+        });
+        let d = data(&p);
+        let outcomes: Vec<_> = d["life_choices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["outcome"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            outcomes,
+            vec![
+                "还在等用户答复",
+                "用户一直没有答复，这件事不了了之",
+                "用户同意了，两人说好暂时分开 12 小时",
+                "用户同意了，两人说好暂时分开",
+                "用户不同意分开",
+                "用户没有回应这个请求，接着说了别的，两人为此闹得不愉快",
+            ]
+        );
+        assert!(d["life_choices"][4].get("asked").is_none());
+        assert_eq!(d["life_choices"][0]["label"], "角色提出想先分开一阵子");
     }
 
     #[test]
