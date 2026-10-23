@@ -349,7 +349,8 @@ Then:
 ### While it lasts
 
 The events under way at a moment are the background and the incident whose
-`started_at <= moment < ends_at`. They reach three readers.
+`started_at <= moment < ends_at`. They reach three readers in the chat; with the world system
+on, the story and world directors read them too ([Beyond the chat](#beyond-the-chat)).
 
 - **The judge** gets one `[近期事件]` line, after `[需求]` and before `[身体状态]`. It lists the
   background, then the incident, joined by `；`, each as
@@ -890,8 +891,14 @@ falling-out rows live in `engine.persona_events` like any event.
 - `crates/eros-engine-server/src/routes/session_effects.rs`: `GET …/effects`.
 - `crates/eros-engine-server/src/pipeline/voice.rs`: the bootstrap's needs.
 - `crates/eros-engine-store/src/events.rs::EventRepo`: `insert`, `insert_preempting_in_tx`,
-  `by_key`, `recent`, `current`, `unexplained_offline`, `unreturned_separation`,
-  `unresolved_scare`.
+  `by_key`, `recent`, `current`, `backgrounds_at`, `unexplained_offline`,
+  `unreturned_separation`, `unresolved_scare`.
+- `crates/eros-engine-store/src/story.rs::StoryRepo`: `life_events`, `life_choices`, and
+  `chat_evidence` without proactive rows.
+- `crates/eros-engine-server/src/pipeline/story.rs`: `load_evidence` and the story payload's
+  `life_events`, `current_background`, `life_choices`; `pipeline/world.rs::direct_world`: the
+  world director's `current_background`; `prompt.rs::event_when_text`: the relative times both
+  read.
 - `crates/eros-engine-store/src/life_choices.rs::LifeChoiceRepo`: the choice rows, `pending`,
   `resolve_in_tx`, `growth_slowed`.
 - `crates/eros-engine-store/src/affinity.rs::AffinityRepo`: `persist_life_choice_drop_in_tx`,
