@@ -77,6 +77,9 @@ pub enum EventKind {
     ScoldedSuperior,
     SawBag,
     SawClothes,
+    AdmiringScenery,
+    AdmiringArt,
+    TakingSelfie,
     TempWork,
     ExMessage,
     WeatherChange,
@@ -94,6 +97,10 @@ pub enum EventKind {
     OutShopping,
     BrosGathering,
     SisGathering,
+    OnTheRoad,
+    WatchingMatch,
+    WatchingShow,
+    HavingSex,
     Sick,
     Period,
     Hospitalized,
@@ -108,7 +115,7 @@ pub enum EventKind {
 
 impl EventKind {
     /// Every drawable kind, in draw order.
-    pub const ALL: [EventKind; 43] = [
+    pub const ALL: [EventKind; 50] = [
         EventKind::PoliceEncounter,
         EventKind::AnimalEncounter,
         EventKind::HitSomeone,
@@ -127,6 +134,9 @@ impl EventKind {
         EventKind::ScoldedSuperior,
         EventKind::SawBag,
         EventKind::SawClothes,
+        EventKind::AdmiringScenery,
+        EventKind::AdmiringArt,
+        EventKind::TakingSelfie,
         EventKind::TempWork,
         EventKind::ExMessage,
         EventKind::WeatherChange,
@@ -144,6 +154,10 @@ impl EventKind {
         EventKind::OutShopping,
         EventKind::BrosGathering,
         EventKind::SisGathering,
+        EventKind::OnTheRoad,
+        EventKind::WatchingMatch,
+        EventKind::WatchingShow,
+        EventKind::HavingSex,
         EventKind::Sick,
         EventKind::Period,
         EventKind::Hospitalized,
@@ -195,6 +209,13 @@ impl EventKind {
             EventKind::OutShopping => "out_shopping",
             EventKind::BrosGathering => "bros_gathering",
             EventKind::SisGathering => "sis_gathering",
+            EventKind::OnTheRoad => "on_the_road",
+            EventKind::WatchingMatch => "watching_match",
+            EventKind::WatchingShow => "watching_show",
+            EventKind::HavingSex => "having_sex",
+            EventKind::AdmiringScenery => "admiring_scenery",
+            EventKind::AdmiringArt => "admiring_art",
+            EventKind::TakingSelfie => "taking_selfie",
             EventKind::Sick => "sick",
             EventKind::Period => "period",
             EventKind::Hospitalized => "hospitalized",
@@ -221,12 +242,13 @@ impl EventKind {
             PoliceEncounter | AnimalEncounter | HitSomeone | SuddenDesire | GroceryShopping
             | Showering | Bathing | InClass | OnTheWay | PeriodScare | PregnancyScare
             | GotBumped | BumpedSomeone | Quarrel | ScoldedBySuperior | ScoldedSuperior
-            | SawBag | SawClothes => EventCategory::Short,
+            | SawBag | SawClothes | AdmiringScenery | AdmiringArt | TakingSelfie => {
+                EventCategory::Short
+            }
             TempWork | ExMessage | WeatherChange | GotHit | Breakup | WorkingOut | Reading
             | Gaming | AwayFromPhone | Unwell | Irritable | Busy | InBattle | Asleep
-            | OutShopping | BrosGathering | SisGathering | TakingSpace | FellOut => {
-                EventCategory::Mid
-            }
+            | OutShopping | BrosGathering | SisGathering | OnTheRoad | WatchingMatch
+            | WatchingShow | HavingSex | TakingSpace | FellOut => EventCategory::Mid,
             Sick | Period | Hospitalized | PostSurgery => EventCategory::Body,
             BusinessTrip | ShortTrip | LongTrip | HometownVisit => EventCategory::Trip,
         }
@@ -262,6 +284,7 @@ impl EventKind {
                 | OutShopping
                 | BrosGathering
                 | SisGathering
+                | HavingSex
                 | TakingSpace
         )
     }
@@ -311,6 +334,9 @@ fn rule(kind: EventKind) -> Rule {
         ScoldedSuperior => (0.5, 14 * DAY, Lasts::Hours(1, 1)),
         SawBag => (2.0, 48, Lasts::Hours(1, 1)),
         SawClothes => (2.0, 48, Lasts::Hours(1, 1)),
+        AdmiringScenery => (2.0, 24, Lasts::Hours(1, 1)),
+        AdmiringArt => (1.0, 48, Lasts::Hours(1, 1)),
+        TakingSelfie => (2.0, 24, Lasts::Minutes(30)),
         TempWork => (3.0, 24, Lasts::Hours(4, 4)),
         ExMessage => (1.0, 72, Lasts::Hours(3, 3)),
         WeatherChange => (4.0, 8, Lasts::Hours(4, 4)),
@@ -328,6 +354,10 @@ fn rule(kind: EventKind) -> Rule {
         OutShopping => (2.0, 24, Lasts::Hours(2, 4)),
         BrosGathering => (1.0, 72, Lasts::Hours(2, 4)),
         SisGathering => (1.0, 72, Lasts::Hours(2, 4)),
+        OnTheRoad => (2.0, 24, Lasts::Hours(2, 4)),
+        WatchingMatch => (2.0, 24, Lasts::Hours(2, 3)),
+        WatchingShow => (1.0, 72, Lasts::Hours(2, 3)),
+        HavingSex => (1.0, 48, Lasts::Hours(1, 2)),
         Sick => (3.0, 14 * DAY, Lasts::Hours(DAY, 3 * DAY)),
         Period => (3.0, 28 * DAY, Lasts::Hours(3 * DAY, 7 * DAY)),
         Hospitalized => (0.5, 60 * DAY, Lasts::Hours(2 * DAY, 5 * DAY)),
@@ -470,6 +500,11 @@ fn rules_out(background: EventKind, kind: EventKind) -> bool {
                 | OutShopping
                 | BrosGathering
                 | SisGathering
+                | AdmiringScenery
+                | AdmiringArt
+                | WatchingShow
+                | OnTheRoad
+                | HavingSex
         ),
         Period => kind.is_false_alarm(),
         _ => false,
@@ -1177,7 +1212,7 @@ mod tests {
         let count = |c| EventKind::ALL.iter().filter(|k| k.category() == c).count();
         assert_eq!(
             EventCategory::ALL.map(count),
-            [18, 17, 4, 4],
+            [21, 21, 4, 4],
             "short, mid, body, trip"
         );
         assert!(!EventCategory::Short.is_background());
@@ -1206,7 +1241,7 @@ mod tests {
 
     /// The kinds added after the 28 v2 kinds; tests pinned to the weights of
     /// those 28 draw from `earlier()`.
-    const ADDED: [EventKind; 15] = [
+    const ADDED: [EventKind; 22] = [
         PeriodScare,
         PregnancyScare,
         Busy,
@@ -1222,6 +1257,13 @@ mod tests {
         OutShopping,
         BrosGathering,
         SisGathering,
+        AdmiringScenery,
+        AdmiringArt,
+        TakingSelfie,
+        OnTheRoad,
+        WatchingMatch,
+        WatchingShow,
+        HavingSex,
     ];
 
     fn earlier() -> Vec<EventKind> {
@@ -1332,7 +1374,13 @@ mod tests {
                 k.is_offline(&none),
                 matches!(
                     k,
-                    AwayFromPhone | Busy | InBattle | Asleep | BrosGathering | SisGathering
+                    AwayFromPhone
+                        | Busy
+                        | InBattle
+                        | Asleep
+                        | BrosGathering
+                        | SisGathering
+                        | HavingSex
                 ),
                 "{k:?}"
             );
@@ -1443,7 +1491,7 @@ mod tests {
             assert_eq!(EventKind::parse(s), Some(k));
             assert!(EventKind::ALL.contains(&k), "{k:?}");
         }
-        assert_eq!(EventKind::ALL.len(), 43);
+        assert_eq!(EventKind::ALL.len(), 50);
     }
 
     #[test]
@@ -1452,7 +1500,7 @@ mod tests {
         assert_eq!(EventKind::parse("fell_out"), Some(FellOut));
         assert!(!EventKind::ALL.contains(&TakingSpace));
         assert!(!EventKind::ALL.contains(&FellOut));
-        assert_eq!(EventKind::ALL.len(), 43);
+        assert_eq!(EventKind::ALL.len(), 50);
         for k in EventKind::SPECIAL {
             assert_eq!(serde_json::to_value(k).unwrap(), k.as_str());
             assert_eq!(EventKind::parse(k.as_str()), Some(k));
@@ -1621,6 +1669,7 @@ mod tests {
                         | OutShopping
                         | BrosGathering
                         | SisGathering
+                        | HavingSex
                 ),
                 "{k:?}"
             );
@@ -1725,5 +1774,90 @@ mod tests {
             pick_with(&male, None, 3, &asleep, &[OutShopping], rolls(0.0, 0.0)),
             Some(OutShopping)
         );
+    }
+
+    #[test]
+    fn seven_more_kinds_parse_and_categorise() {
+        for (k, s, c) in [
+            (AdmiringScenery, "admiring_scenery", EventCategory::Short),
+            (AdmiringArt, "admiring_art", EventCategory::Short),
+            (TakingSelfie, "taking_selfie", EventCategory::Short),
+            (OnTheRoad, "on_the_road", EventCategory::Mid),
+            (WatchingMatch, "watching_match", EventCategory::Mid),
+            (WatchingShow, "watching_show", EventCategory::Mid),
+            (HavingSex, "having_sex", EventCategory::Mid),
+        ] {
+            assert_eq!(k.as_str(), s);
+            assert_eq!(EventKind::parse(s), Some(k));
+            assert_eq!(k.category(), c, "{k:?}");
+            assert!(EventKind::ALL.contains(&k), "{k:?}");
+        }
+    }
+
+    #[test]
+    fn having_sex_is_offline_for_everyone_and_never_told() {
+        let none = PersonaTraits::default();
+        assert!(HavingSex.is_offline(&none));
+        assert!(HavingSex.is_offline(&female()));
+        assert!(!is_told(HavingSex, 3, &none));
+        for k in [
+            AdmiringScenery,
+            AdmiringArt,
+            TakingSelfie,
+            OnTheRoad,
+            WatchingMatch,
+            WatchingShow,
+        ] {
+            assert!(!k.is_offline(&none), "{k:?}");
+            assert!(!k.is_offline(&female()), "{k:?}");
+            assert!(is_told(k, 1, &none), "{k:?}");
+        }
+    }
+
+    #[test]
+    fn hospital_keeps_the_sights_and_shows_in_but_allows_a_selfie() {
+        let allowed = [
+            AdmiringScenery,
+            AdmiringArt,
+            WatchingShow,
+            OnTheRoad,
+            HavingSex,
+            TakingSelfie,
+            WatchingMatch,
+        ];
+        for bg in [Hospitalized, PostSurgery] {
+            let h = [past(bg, 24, 72)];
+            for c in [0.0, 0.99] {
+                for k in [0.0, 0.25, 0.5, 0.75, 0.99] {
+                    let got = pick(&h, &allowed, rolls(c, k));
+                    assert!(
+                        matches!(got, Some(TakingSelfie) | Some(WatchingMatch)),
+                        "{bg:?} {c} {k} {got:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn seven_more_rules() {
+        for (k, weight, cooldown, lo, hi) in [
+            (AdmiringScenery, 2.0, 24, 1, 1),
+            (AdmiringArt, 1.0, 48, 1, 1),
+            (OnTheRoad, 2.0, 24, 2, 4),
+            (WatchingMatch, 2.0, 24, 2, 3),
+            (WatchingShow, 1.0, 72, 2, 3),
+            (HavingSex, 1.0, 48, 1, 2),
+        ] {
+            let r = rule(k);
+            assert!((r.weight - weight).abs() < E, "{k:?}");
+            assert_eq!(r.cooldown_hours, cooldown, "{k:?}");
+            assert_eq!(lasts(k, 0.0), Duration::hours(lo), "{k:?}");
+            assert_eq!(lasts(k, 0.999), Duration::hours(hi), "{k:?}");
+        }
+        let r = rule(TakingSelfie);
+        assert!((r.weight - 2.0).abs() < E);
+        assert_eq!(r.cooldown_hours, 24);
+        assert_eq!(lasts(TakingSelfie, 0.5), Duration::minutes(30));
     }
 }
