@@ -4956,6 +4956,20 @@
               }
             ]
           },
+          "member_scopes": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Per-speaker scopes keyed by `member_session_id` (spec\n2026-10-26-group-member-scopes-and-last-message-design.md §2): a\nspeaker without an entry runs on the engine defaults; a key that is not\na seated member is refused like a stray mention.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/MemberScopeDto"
+            },
+            "propertyNames": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
           "mentions": {
             "type": "array",
             "items": {
@@ -5735,6 +5749,28 @@
           "session_id": {
             "type": "string",
             "format": "uuid"
+          }
+        }
+      },
+      "MemberScopeDto": {
+        "type": "object",
+        "description": "One speaker's scopes on the group send: the 1:1 send's two fields.",
+        "properties": {
+          "affinity_scope": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AffinityScopeDto"
+              }
+            ]
+          },
+          "memory_scope": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },

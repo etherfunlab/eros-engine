@@ -333,10 +333,26 @@ pub struct GroupSendRequest {
     /// Member sessions the user @-mentioned; each must be seated.
     #[serde(default)]
     pub mentions: Vec<Uuid>,
+    /// Per-speaker scopes keyed by `member_session_id` (spec
+    /// 2026-10-26-group-member-scopes-and-last-message-design.md §2): a
+    /// speaker without an entry runs on the engine defaults; a key that is not
+    /// a seated member is refused like a stray mention.
+    #[serde(default)]
+    pub member_scopes: Option<std::collections::HashMap<Uuid, MemberScopeDto>>,
     /// Refused: group turns run on the deployment's key only.
     #[serde(default)]
     #[schema(value_type = Option<Object>)]
     pub byok: Option<serde_json::Value>,
+}
+
+/// One speaker's scopes on the group send: the 1:1 send's two fields.
+#[derive(Debug, Clone, Default, Deserialize, utoipa::ToSchema)]
+pub struct MemberScopeDto {
+    #[serde(default)]
+    #[schema(value_type = Option<String>)]
+    pub memory_scope: Option<eros_engine_core::scope::MemoryScope>,
+    #[serde(default)]
+    pub affinity_scope: Option<crate::routes::companion_stream::AffinityScopeDto>,
 }
 
 fn duplicate_in_progress(user_message_id: Uuid) -> AppError {
@@ -464,6 +480,18 @@ async fn send_group_message_stream(
             "点名的角色不在群里",
         ));
     }
+    let member_scopes = req.member_scopes.clone().unwrap_or_default();
+    if member_scopes
+        .keys()
+        .any(|k| !members.iter().any(|x| x.member_session_id == *k))
+    {
+        return Err(pre(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unprocessable",
+            "a member scope names a session that is not a seated member",
+            "scope 指到的角色不在群里",
+        ));
+    }
 
     let guard = state
         .stream_slots
@@ -516,6 +544,7 @@ async fn send_group_message_stream(
                     title: session.title.clone(),
                     members,
                     mentions: req.mentions.clone(),
+                    member_scopes,
                     prompt_traits,
                     audit,
                     tier: req.tier.clone(),
@@ -1198,6 +1227,74 @@ mod tests {
             r#"{"choices":[{"delta":{"reasoning":"阿哲被点名了"}}]}"#.to_string(),
             format!(r#"{{"choices":[{{"delta":{{"content":"{escaped}"}}}}],"id":"gen-dir"}}"#),
         ])
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_member_scope_for_a_stranger_is_422(pool: PgPool) {
+        let mut f = fixture(pool, None, 200, None).await;
+        let stranger = Uuid::new_v4().to_string();
+        let (s, body) = send(
+            &mut f,
+            json!({"content":"嗨","client_msg_id":"01JSSSSSSSSSSSSSSSSSSSSSSG",
+                   "member_scopes":{stranger:{"memory_scope":"neutral_only"}}}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM engine.chat_messages WHERE session_id = $1")
+                .bind(f.group)
+                .fetch_one(&f.pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 0, "nothing enqueued");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn member_scopes_reach_their_speakers(pool: PgPool) {
+        let verdict = r#"{"speakers":[{"member":"m1","action":"reply_text","inner_state":null,"reply_mode":null,"clothing":null},{"member":"m2","action":"reply_text","inner_state":null,"reply_mode":null,"clothing":null}],"reason":null}"#;
+        let mut f = fixture(pool, Some(director_sse(verdict)), 200, None).await;
+        let a_key = f.a.to_string();
+        let (s, body) = send(
+            &mut f,
+            json!({"content":"周末去哪","client_msg_id":"01JSCOPESSSSSSSSSSSSSSSSSG",
+                   "member_scopes":{a_key:{"memory_scope":"neutral_only","affinity_scope":"chemistry"}}}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+        let rows: Vec<(Option<Uuid>, serde_json::Value)> = sqlx::query_as(
+            "SELECT speaker_session_id, metadata FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant' ORDER BY sent_at, id",
+        )
+        .bind(f.group)
+        .fetch_all(&f.pool)
+        .await
+        .unwrap();
+        let of = |who: Uuid| {
+            rows.iter()
+                .find(|(s, _)| *s == Some(who))
+                .map(|(_, m)| m.clone())
+                .unwrap_or_else(|| panic!("no row for {who}: {rows:?}"))
+        };
+        let a = of(f.a);
+        assert_eq!(a["memory_scope"], "neutral_only");
+        assert_eq!(
+            (
+                &a["affinity_scope"]["trust"],
+                &a["affinity_scope"]["warmth"]
+            ),
+            (&json!(true), &json!(false)),
+            "chemistry axes for A: {a}"
+        );
+        let b = of(f.b);
+        assert_eq!(b["memory_scope"], "neutral_and_relationship");
+        assert_eq!(
+            (
+                &b["affinity_scope"]["warmth"],
+                &b["affinity_scope"]["trust"]
+            ),
+            (&json!(true), &json!(false)),
+            "bond axes for B: {b}"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
