@@ -185,8 +185,10 @@ the length).
 2. **Category.** Each category with at least one eligible kind weighs its category weight
    times its persona factor. A roll picks one by cumulative weight.
 3. **Kind.** Each eligible kind in that category weighs its base weight times its
-   [needs factor](#1-needs-weight-the-kind-pick) times its `prefer_events` factor. A second
-   roll picks one.
+   [needs factor](#1-needs-weight-the-kind-pick), its `prefer_events` factor, its
+   [follow-on factor](#follow-on-factors) and, for a few kinds, a persona factor
+   ([`is_virgin`](#persona-settings), [`homesick`](#persona-settings)). A second roll picks
+   one.
 4. **Duration.** A fixed length is taken as is; a range is rolled.
 
 No eligible kind means no event: the response is `{"event": null, "message": null}`. Whenever
@@ -262,7 +264,7 @@ The rung (1 to 3) is read from the session's affinity, time-decayed as in a chat
 
 ### Persona settings
 
-Three keys in the persona genome's `art_metadata`, read by the engine and written by whoever
+Five keys in the persona genome's `art_metadata`, read by the engine and written by whoever
 authors the persona, sit beside `gender`, `birthday` and `timezone`:
 
 | key | value | effect |
@@ -270,12 +272,53 @@ authors the persona, sit beside `gender`, `birthday` and `timezone`:
 | `prefer_events` | array of `mid` kinds | each listed kind weighs 3 times as much within `mid` |
 | `health` | `"weak"`, `"normal"` (default), `"strong"` | the `body` category weighs 2 times, 1 time, half as much |
 | `prefer_trip` | `true`, `false` (default) | the `trip` category weighs 3 times as much |
+| `homesick` | `true`, `false`, absent (default) | within `trip`: `true` weighs `hometown_visit` 3 times and `short_trip` / `long_trip` a third; `false` weighs `hometown_visit` a third; `business_trip` is work and untouched either way |
+| `is_virgin` | `true`, `false` (default) | while she is a virgin, `having_sex` weighs a fifth within `mid` |
+
+`prefer_trip` says whether she moves at all; `homesick` says where she goes when she does. A
+flight attendant with both `true` travels often, works her trips as before, and spends her
+leave at home rather than elsewhere.
+
+Her virginity as the draw sees it is derived: the card says `is_virgin` and the instance has
+no `having_sex` event, ever. The first `having_sex` row ends it, with no write anywhere: the
+next draw reads the row. The key reaches no prompt; what she is like is written into her
+persona by its author, as every other persona fact.
 
 Reads are lenient. A value of the wrong type reads as absent; in `prefer_events`, an entry that
 is not a known `mid` kind is dropped and the rest are kept. `health` scales the whole `body`
 category, `period` included, and `period`'s own 28-day cooldown keeps it near monthly either
 way. `prefer_trip` raises the odds of a trip, not its frequency: the weekly category cooldown
 holds.
+
+### Follow-on factors
+
+Her day hangs together: an event that is **live** makes the kinds that follow it in life
+likelier. A prior is live while it is under way, or for 48 hours after it ended. In the
+second stage of the draw, a kind weighs 3 times as much for every distinct live prior that
+leads to it; two live priors make it 9 times. The factor never lifts a gate (a live `sick`
+makes `period_scare` likelier only for a female persona at rung 2 or above), never touches
+the first stage, and does not shorten a cooldown.
+
+| live prior | kinds weighed 3 times |
+|---|---|
+| `ex_message`, `sudden_desire` | `having_sex` |
+| `sick` | `period_scare` |
+| `having_sex` | `pregnancy_scare` |
+| `business_trip` | `on_the_road`, `on_the_way`, `busy`, `temp_work` |
+| `short_trip`, `long_trip`, `hometown_visit` | `on_the_road`, `admiring_scenery`, `taking_selfie` |
+| `hometown_visit` | `bros_gathering`, `sis_gathering` |
+| `hospitalized`, `post_surgery` | `reading`, `gaming` |
+| `period` | `irritable`, `unwell` |
+| `breakup`, `quarrel`, `scolded_by_superior`, `in_battle` | `irritable` |
+| `got_hit`, `got_bumped`, `weather_change` | `unwell` |
+| `working_out` | `showering`, `bathing` |
+
+One kind is weighed down rather than ruled out while what leads to it has never happened:
+`pregnancy_scare` weighs a fifth while the instance has no `having_sex` event, ever. There is
+no hard "only after" gate and no state machine: a deployment that never draws `having_sex`
+keeps the scare at a fifth of its weight rather than losing it. The table and the constants
+(`FOLLOW_FACTOR`, `FOLLOW_WINDOW_HOURS`, `UNLIKELY_FACTOR`) are in
+`crates/eros-engine-core/src/events.rs`.
 
 ### The caller's `kinds`
 
@@ -629,6 +672,9 @@ is not scripted into a party. Neither director writes events or changes the pers
 above. Needs reach neither.
 
 ## How the two interact
+
+The needs factor below is one of the second-stage factors; the others ([follow-on
+factors](#follow-on-factors), `prefer_events`, `is_virgin`, `homesick`) read no need.
 
 ### 1. Needs weight the kind pick
 

@@ -383,6 +383,15 @@ const DESIRE_MIN_RUNG: u8 = 3;
 /// What a preferred `mid` kind, and a travel-loving persona's `trip`
 /// category, weigh relative to the base (§4).
 const PREFERENCE_FACTOR: f64 = 3.0;
+/// What a kind weighs while an event that leads to it is live (spec
+/// 2026-10-25-life-events-follow-ons-and-persona-keys-design.md §2.1), per
+/// live prior.
+const FOLLOW_FACTOR: f64 = 3.0;
+/// How long after it ended a prior stays live.
+const FOLLOW_WINDOW_HOURS: i64 = 48;
+/// What a kind weighs while what leads to it in life has never happened
+/// (spec §3, §4): rare, not impossible.
+const UNLIKELY_FACTOR: f64 = 0.2;
 /// Hours after any offline kind started before any offline kind can start
 /// again (spec 2026-10-16-life-events-offline-and-scares-design.md §3.4): it
 /// bounds how often she goes silent.
@@ -420,6 +429,13 @@ pub struct PersonaTraits {
     pub prefer_trip: bool,
     /// Weighs only `mid` kinds; any other kind listed has no effect.
     pub prefer_events: Vec<EventKind>,
+    /// `art_metadata.is_virgin`. Her virginity as the draw sees it is this
+    /// and no `having_sex` row ever (`DrawInput::ever_had_sex`); the first
+    /// row ends it with no write.
+    pub is_virgin: bool,
+    /// `art_metadata.homesick`: `true`, her home is her base; `false`, she
+    /// roams; `None`, no preference. Steers where a trip goes (§5).
+    pub homesick: Option<bool>,
 }
 
 fn passes_gate(kind: EventKind, rung: u8, persona: &PersonaTraits) -> bool {
@@ -469,6 +485,66 @@ fn preference_factor(kind: EventKind, persona: &PersonaTraits) -> f64 {
         PREFERENCE_FACTOR
     } else {
         1.0
+    }
+}
+
+/// Whether `prior` makes `kind` likelier while it is live (spec §2.2).
+fn follows(prior: EventKind, kind: EventKind) -> bool {
+    use EventKind::*;
+    matches!(
+        (prior, kind),
+        (ExMessage | SuddenDesire, HavingSex)
+            | (Sick, PeriodScare)
+            | (HavingSex, PregnancyScare)
+            | (BusinessTrip, OnTheRoad | OnTheWay | Busy | TempWork)
+            | (
+                ShortTrip | LongTrip | HometownVisit,
+                OnTheRoad | AdmiringScenery | TakingSelfie
+            )
+            | (HometownVisit, BrosGathering | SisGathering)
+            | (Hospitalized | PostSurgery, Reading | Gaming)
+            | (Period, Irritable | Unwell)
+            | (Breakup | Quarrel | ScoldedBySuperior | InBattle, Irritable)
+            | (GotHit | GotBumped | WeatherChange, Unwell)
+            | (WorkingOut, Showering | Bathing)
+    )
+}
+
+/// `FOLLOW_FACTOR` once for every distinct live prior of `kind`: under way
+/// at `now`, or ended within `FOLLOW_WINDOW_HOURS` before it.
+fn follow_factor(kind: EventKind, history: &[PastEvent], now: DateTime<Utc>) -> f64 {
+    let since = now - Duration::hours(FOLLOW_WINDOW_HOURS);
+    let mut live: Vec<EventKind> = history
+        .iter()
+        .filter(|e| e.ends_at > since && follows(e.kind, kind))
+        .map(|e| e.kind)
+        .collect();
+    live.sort_by_key(|k| k.as_str());
+    live.dedup();
+    FOLLOW_FACTOR.powi(live.len() as i32)
+}
+
+/// `UNLIKELY_FACTOR` for `having_sex` while she is a virgin, and for
+/// `pregnancy_scare` while she has never had sex (spec §3, §4).
+fn prior_factor(kind: EventKind, persona: &PersonaTraits, ever_had_sex: bool) -> f64 {
+    match kind {
+        EventKind::HavingSex if persona.is_virgin && !ever_had_sex => UNLIKELY_FACTOR,
+        EventKind::PregnancyScare if !ever_had_sex => UNLIKELY_FACTOR,
+        _ => 1.0,
+    }
+}
+
+/// How `homesick` steers a trip within its category (spec §5): home three
+/// times or a third as likely, and leisure trips a third as likely for a
+/// persona whose home is her base. `business_trip` is work and untouched.
+fn homesick_factor(kind: EventKind, persona: &PersonaTraits) -> f64 {
+    use EventKind::*;
+    match (kind, persona.homesick) {
+        (HometownVisit, Some(true)) => PREFERENCE_FACTOR,
+        (HometownVisit, Some(false)) | (ShortTrip | LongTrip, Some(true)) => {
+            1.0 / PREFERENCE_FACTOR
+        }
+        _ => 1.0,
     }
 }
 
@@ -530,6 +606,9 @@ pub struct DrawInput<'a> {
     pub history: &'a [PastEvent],
     /// The kinds the caller allows.
     pub allowed: &'a [EventKind],
+    /// Whether the instance has a `having_sex` row, ever (not bounded by
+    /// `lookback()`).
+    pub ever_had_sex: bool,
 }
 
 /// Three uniform draws in [0, 1): one per stage, one for the length.
@@ -611,7 +690,10 @@ pub fn draw(input: &DrawInput, rolls: Rolls) -> Option<Drawn> {
         .map(|k| {
             let weight = rule(k).weight
                 * needs_factor(k, input.needs.as_ref())
-                * preference_factor(k, input.persona);
+                * preference_factor(k, input.persona)
+                * follow_factor(k, input.history, input.now)
+                * prior_factor(k, input.persona, input.ever_had_sex)
+                * homesick_factor(k, input.persona);
             (k, weight)
         })
         .collect();
@@ -775,6 +857,7 @@ mod tests {
                 persona,
                 history,
                 allowed,
+                ever_had_sex: false,
             },
             r,
         )
@@ -1165,6 +1248,7 @@ mod tests {
                     persona: &female(),
                     history: &[],
                     allowed: &[kind],
+                    ever_had_sex: false,
                 },
                 Rolls {
                     category: 0.0,
@@ -1420,6 +1504,7 @@ mod tests {
                     persona: &female(),
                     history: &[],
                     allowed: &[kind],
+                    ever_had_sex: false,
                 },
                 Rolls {
                     category: 0.0,
@@ -1617,6 +1702,7 @@ mod tests {
                     persona: &female(),
                     history: &[],
                     allowed: &[kind],
+                    ever_had_sex: false,
                 },
                 Rolls {
                     category: 0.0,
@@ -1859,5 +1945,208 @@ mod tests {
         assert!((r.weight - 2.0).abs() < E);
         assert_eq!(r.cooldown_hours, 24);
         assert_eq!(lasts(TakingSelfie, 0.5), Duration::minutes(30));
+    }
+
+    #[test]
+    fn a_live_prior_triples_its_follow_on() {
+        // HavingSex 1 : Reading 2. With ex_message live, HavingSex weighs 3:
+        // 0.5 × 5 = 2.5 lands on HavingSex; without, 0.5 × 3 = 1.5 on Reading.
+        let none = PersonaTraits::default();
+        let live = [past(ExMessage, 20, 3)];
+        let r = rolls(0.0, 0.5);
+        assert_eq!(
+            pick_with(&none, None, 3, &live, &[HavingSex, Reading], r),
+            Some(HavingSex)
+        );
+        assert_eq!(
+            pick_with(&none, None, 3, &[], &[HavingSex, Reading], r),
+            Some(Reading)
+        );
+    }
+
+    #[test]
+    fn a_prior_ended_49_hours_ago_is_not_live() {
+        let none = PersonaTraits::default();
+        let stale = [past(ExMessage, 52, 3)];
+        assert_eq!(
+            pick_with(
+                &none,
+                None,
+                3,
+                &stale,
+                &[HavingSex, Reading],
+                rolls(0.0, 0.5)
+            ),
+            Some(Reading)
+        );
+    }
+
+    #[test]
+    fn a_background_under_way_is_live() {
+        let none = PersonaTraits::default();
+        let trip = [past(BusinessTrip, 2, 24)];
+        assert_eq!(
+            pick_with(
+                &none,
+                None,
+                3,
+                &trip,
+                &[OnTheRoad, Reading],
+                rolls(0.0, 0.5)
+            ),
+            Some(OnTheRoad)
+        );
+    }
+
+    #[test]
+    fn two_live_priors_multiply() {
+        // HavingSex 1 × 3 × 3 = 9 : Reading 2 — 0.8 × 11 = 8.8 lands on HavingSex.
+        let none = PersonaTraits::default();
+        let live = [past(ExMessage, 20, 3), past(SuddenDesire, 10, 1)];
+        assert_eq!(
+            pick_with(
+                &none,
+                None,
+                3,
+                &live,
+                &[HavingSex, Reading],
+                rolls(0.0, 0.8)
+            ),
+            Some(HavingSex)
+        );
+    }
+
+    #[test]
+    fn a_live_prior_never_lifts_a_gate() {
+        let male = PersonaTraits::default();
+        let sick = [past(Sick, 2, 72)];
+        for k in [0.0, 0.5, 0.99] {
+            assert_eq!(
+                pick_with(
+                    &male,
+                    None,
+                    3,
+                    &sick,
+                    &[PeriodScare, Reading],
+                    rolls(0.0, k)
+                ),
+                Some(Reading)
+            );
+        }
+    }
+
+    #[test]
+    fn follow_table_is_what_the_spec_says() {
+        for (prior, kind) in [
+            (ExMessage, HavingSex),
+            (SuddenDesire, HavingSex),
+            (Sick, PeriodScare),
+            (HavingSex, PregnancyScare),
+            (BusinessTrip, OnTheRoad),
+            (BusinessTrip, OnTheWay),
+            (BusinessTrip, Busy),
+            (BusinessTrip, TempWork),
+            (ShortTrip, OnTheRoad),
+            (LongTrip, AdmiringScenery),
+            (HometownVisit, TakingSelfie),
+            (HometownVisit, BrosGathering),
+            (HometownVisit, SisGathering),
+            (Hospitalized, Reading),
+            (PostSurgery, Gaming),
+            (Period, Irritable),
+            (Period, Unwell),
+            (Breakup, Irritable),
+            (Quarrel, Irritable),
+            (ScoldedBySuperior, Irritable),
+            (InBattle, Irritable),
+            (GotHit, Unwell),
+            (GotBumped, Unwell),
+            (WeatherChange, Unwell),
+            (WorkingOut, Showering),
+            (WorkingOut, Bathing),
+        ] {
+            assert!(follows(prior, kind), "{prior:?} -> {kind:?}");
+        }
+        assert!(!follows(Reading, HavingSex));
+        assert!(!follows(HavingSex, HavingSex));
+    }
+
+    /// A draw with no history for `persona`, with or without a `having_sex`
+    /// row ever.
+    fn pick_ever(
+        persona: &PersonaTraits,
+        ever_had_sex: bool,
+        allowed: &[EventKind],
+        r: Rolls,
+    ) -> Option<EventKind> {
+        draw(
+            &DrawInput {
+                now: now(),
+                needs: None,
+                intimacy_rung: 3,
+                persona,
+                history: &[],
+                allowed,
+                ever_had_sex,
+            },
+            r,
+        )
+        .map(|d| d.kind)
+    }
+
+    #[test]
+    fn a_virgin_rarely_has_sex_until_she_has() {
+        // Draw order is `ALL` order: Reading 2 then HavingSex 0.2 — 0.8 × 2.2
+        // = 1.76 lands on Reading; once she has, Reading 2 then HavingSex 1 —
+        // 0.8 × 3 = 2.4 lands on HavingSex.
+        let virgin = PersonaTraits {
+            is_virgin: true,
+            ..Default::default()
+        };
+        let both = [HavingSex, Reading];
+        let r = rolls(0.0, 0.8);
+        assert_eq!(pick_ever(&virgin, false, &both, r), Some(Reading));
+        assert_eq!(pick_ever(&virgin, true, &both, r), Some(HavingSex));
+        assert_eq!(
+            pick_ever(&PersonaTraits::default(), false, &both, r),
+            Some(HavingSex)
+        );
+    }
+
+    #[test]
+    fn a_pregnancy_scare_is_unlikely_without_sex() {
+        // AnimalEncounter 3 then PregnancyScare 0.5 × 0.2 = 0.1 — 0.9 × 3.1 =
+        // 2.79 lands on AnimalEncounter; with a row, 3 then 0.5 — 0.9 × 3.5 =
+        // 3.15 on PregnancyScare.
+        let both = [PregnancyScare, AnimalEncounter];
+        let r = rolls(0.0, 0.9);
+        assert_eq!(pick_ever(&female(), false, &both, r), Some(AnimalEncounter));
+        assert_eq!(pick_ever(&female(), true, &both, r), Some(PregnancyScare));
+    }
+
+    #[test]
+    fn homesick_steers_her_leave() {
+        let trips = [HometownVisit, ShortTrip, BusinessTrip];
+        let with = |homesick| PersonaTraits {
+            homesick,
+            ..Default::default()
+        };
+        let at = |p: &PersonaTraits, k| pick_ever(p, false, &trips, rolls(0.0, k));
+        // Draw order is `ALL` order: BusinessTrip, ShortTrip, HometownVisit.
+        // true: 3, 2/3, 3 (6 2/3) — spans [0, .45), [.45, .55), [.55, 1].
+        let home = with(Some(true));
+        assert_eq!(at(&home, 0.44), Some(BusinessTrip));
+        assert_eq!(at(&home, 0.5), Some(ShortTrip));
+        assert_eq!(at(&home, 0.6), Some(HometownVisit));
+        // false: 3, 2, 1/3 (5 1/3) — spans [0, .5625), [.5625, .9375), [.9375, 1].
+        let roams = with(Some(false));
+        assert_eq!(at(&roams, 0.5), Some(BusinessTrip));
+        assert_eq!(at(&roams, 0.8), Some(ShortTrip));
+        assert_eq!(at(&roams, 0.95), Some(HometownVisit));
+        // absent: 3, 2, 1 (6) — spans [0, .5), [.5, .833), [.833, 1].
+        let none = with(None);
+        assert_eq!(at(&none, 0.4), Some(BusinessTrip));
+        assert_eq!(at(&none, 0.6), Some(ShortTrip));
+        assert_eq!(at(&none, 0.9), Some(HometownVisit));
     }
 }

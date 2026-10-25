@@ -1230,6 +1230,11 @@ pub(crate) fn persona_traits(
                     .collect()
             })
             .unwrap_or_default(),
+        is_virgin: art
+            .get("is_virgin")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        homesick: art.get("homesick").and_then(|v| v.as_bool()),
     }
 }
 
@@ -4408,7 +4413,8 @@ mod tests {
         let mut p = fixture_persona();
         p.genome.art_metadata = serde_json::json!({
             "gender": "female", "health": "weak", "prefer_trip": true,
-            "prefer_events": ["gaming", "reading"]
+            "prefer_events": ["gaming", "reading"],
+            "is_virgin": true, "homesick": false
         });
         assert_eq!(
             persona_traits(&p),
@@ -4417,8 +4423,12 @@ mod tests {
                 health: Health::Weak,
                 prefer_trip: true,
                 prefer_events: vec![EventKind::Gaming, EventKind::Reading],
+                is_virgin: true,
+                homesick: Some(false),
             }
         );
+        p.genome.art_metadata = serde_json::json!({"is_virgin": "yes", "homesick": "home"});
+        assert_eq!(persona_traits(&p), PersonaTraits::default());
         p.genome.art_metadata = serde_json::json!({});
         assert_eq!(persona_traits(&p), PersonaTraits::default());
     }

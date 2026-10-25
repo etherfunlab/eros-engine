@@ -153,8 +153,9 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
    - 离线类种类还要过了共享的离线冷却（见下）；
    - 背景规则允许它（见下）。
 2. **类别。** 每个至少有一个合格种类的类别，权重是类别权重乘以角色系数。掷一次随机数，按累计权重选一个。
-3. **种类。** 该类别里每个合格种类的权重是基础权重乘以它的[需求系数](#1-需求给种类加权)再乘以
-   `prefer_events` 系数。再掷一次，选一个。
+3. **种类。** 该类别里每个合格种类的权重是基础权重乘以它的[需求系数](#1-需求给种类加权)、
+   `prefer_events` 系数、[关联系数](#关联系数)，少数种类再乘一个角色系数（[`is_virgin`](#角色设置)、
+   [`homesick`](#角色设置)）。再掷一次，选一个。
 4. **时长。** 固定时长照用；区间则掷出来。
 
 没有合格种类就没有事件，响应是 `{"event": null, "message": null}`。只要有合格种类，抽取就一定得到事件。
@@ -213,7 +214,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 
 ### 角色设置
 
-角色 genome 的 `art_metadata` 里有三个键，由 engine 读取，由写角色的人填写，和 `gender`、`birthday`、
+角色 genome 的 `art_metadata` 里有五个键，由 engine 读取，由写角色的人填写，和 `gender`、`birthday`、
 `timezone` 放在一起：
 
 | 键 | 取值 | 效果 |
@@ -221,10 +222,43 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 | `prefer_events` | `mid` 种类的数组 | 列出的种类在 `mid` 内权重为 3 倍 |
 | `health` | `"weak"`、`"normal"`（默认）、`"strong"` | `body` 类别权重分别为 2 倍、1 倍、一半 |
 | `prefer_trip` | `true`、`false`（默认） | `trip` 类别权重为 3 倍 |
+| `homesick` | `true`、`false`、不写（默认） | `trip` 内部：`true` 时 `hometown_visit` 3 倍、`short_trip` / `long_trip` 三分之一；`false` 时 `hometown_visit` 三分之一；`business_trip` 是工作，两种情况都不动 |
+| `is_virgin` | `true`、`false`（默认） | 她还是处女期间，`having_sex` 在 `mid` 内权重为五分之一 |
+
+`prefer_trip` 管她动不动，`homesick` 管她动起来往哪去。两者都为 `true` 的空姐角色经常出行、照常出差，
+放假回家而不是去别处。
+
+抽取看到的「是否处女」是推导出来的：卡上写了 `is_virgin`，并且这个实例从来没有过 `having_sex` 事件。
+第一条 `having_sex` 行写下之后就不再是了，不需要任何写入：下一次抽取读到那一行就行。这个键不进任何
+prompt；她是什么样的人由写角色的人写进人设，和其他人设事实一样。
 
 读取是宽松的。类型不对的值按没写处理；`prefer_events` 里不是已知 `mid` 种类的条目被丢掉，其余保留。
 `health` 缩放整个 `body` 类别，`period` 也在内，`period` 自己 28 天的冷却让它不管怎样都大约每月一次。
 `prefer_trip` 提高的是出行的概率，不是频率：每周一次的类别冷却对它同样适用。
+
+### 关联系数
+
+她的一天是连着的：一件**在线**的事件会让生活里跟在它后面的种类更容易抽到。先行事件在进行中，或结束后
+48 小时内，算在线。抽取第二段里，每有一个指向它的、不同种类的在线先行事件，该种类权重乘 3；两个就是 9 倍。
+这个系数不解除门槛（在线的 `sick` 只对档 2 以上的女性角色提高 `period_scare`），不碰第一段，也不缩短冷却。
+
+| 在线的先行事件 | 权重乘 3 的种类 |
+|---|---|
+| `ex_message`、`sudden_desire` | `having_sex` |
+| `sick` | `period_scare` |
+| `having_sex` | `pregnancy_scare` |
+| `business_trip` | `on_the_road`、`on_the_way`、`busy`、`temp_work` |
+| `short_trip`、`long_trip`、`hometown_visit` | `on_the_road`、`admiring_scenery`、`taking_selfie` |
+| `hometown_visit` | `bros_gathering`、`sis_gathering` |
+| `hospitalized`、`post_surgery` | `reading`、`gaming` |
+| `period` | `irritable`、`unwell` |
+| `breakup`、`quarrel`、`scolded_by_superior`、`in_battle` | `irritable` |
+| `got_hit`、`got_bumped`、`weather_change` | `unwell` |
+| `working_out` | `showering`、`bathing` |
+
+有一种是压低而不是排除：实例从来没有过 `having_sex` 事件时，`pregnancy_scare` 权重为五分之一。没有硬性的
+「只能在之后」门槛，也没有状态机：从不抽 `having_sex` 的部署里，这个虚惊只是降到五分之一，不会消失。
+表和常量（`FOLLOW_FACTOR`、`FOLLOW_WINDOW_HOURS`、`UNLIKELY_FACTOR`）在 `crates/eros-engine-core/src/events.rs`。
 
 ### 调用方的 `kinds`
 
@@ -504,6 +538,9 @@ ghosting 开关关闭时，已经在进行的一段不会让任何轮次沉默�
 就不会被写进聚会。两位导演都不写事件，也不改上面的角色设置。需求不进其中任何一个。
 
 ## 两者如何互相影响
+
+下面的需求系数是第二段里的系数之一；其余几个（[关联系数](#关联系数)、`prefer_events`、`is_virgin`、`homesick`）
+都不读需求。
 
 ### 1. 需求给种类加权
 

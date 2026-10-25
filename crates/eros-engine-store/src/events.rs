@@ -298,6 +298,19 @@ impl EventRepo<'_> {
         Ok(rows.into_iter().filter_map(record).collect())
     }
 
+    /// Whether the instance has ever had an event of `kind`, however long
+    /// ago: not bounded by `lookback()`.
+    pub async fn ever(&self, instance_id: Uuid, kind: EventKind) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM engine.persona_events \
+                             WHERE instance_id = $1 AND kind = $2)",
+        )
+        .bind(instance_id)
+        .bind(kind.as_str())
+        .fetch_one(self.pool)
+        .await
+    }
+
     /// The foreground and the background under way at `at_message`'s
     /// `sent_at`, or at `now` without one: started at or before that moment,
     /// ending after it.
@@ -2253,6 +2266,27 @@ mod tests {
         .await
         .unwrap();
         assert!(!index);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn ever_sees_rows_older_than_lookback(pool: PgPool) {
+        let repo = EventRepo { pool: &pool };
+        let (_, a, sa) = instance_and_session(&pool).await;
+        let (_, b, _) = instance_and_session(&pool).await;
+        let long_ago = Utc::now() - chrono::Duration::days(200);
+        repo.insert_preempting(&NewEvent {
+            instance_id: a,
+            session_id: sa,
+            event_key: "k1",
+            kind: HavingSex,
+            started_at: long_ago,
+            ends_at: long_ago + chrono::Duration::hours(1),
+        })
+        .await
+        .unwrap();
+        assert!(repo.ever(a, HavingSex).await.unwrap());
+        assert!(!repo.ever(a, Reading).await.unwrap());
+        assert!(!repo.ever(b, HavingSex).await.unwrap());
     }
 
     #[sqlx::test(migrations = "./migrations")]
