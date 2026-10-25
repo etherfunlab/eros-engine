@@ -495,6 +495,7 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 | `composed_prompt` | `String` | 最终发给图像服务的提示词的 UTF-8 字节的 base64（`STANDARD`，无换行）。在最后一跳解码后原样用作图像服务的文本提示词，不要再重建任何提示词逻辑。|
 | `image_ref` | `"face"` \| `"previous"` | 计划选择的参考图；实际 URL 由消费方解析。|
 | `aspect_ratio` | `String` \| 不存在 | 语义画幅（`1:1`,`3:4`,`4:3`,`9:16`,`16:9`）或不存在。画幅→分辨率映射由消费方负责，引擎不发送宽高。|
+| `companion` | `{member_session_id, instance_id}` \| 不存在 | [群聊](group-chat.zh.md#导演)图片轮里导演安排了同框成员时才有：再取那位角色的脸参考图，两人一起画。1:1 轮次和只有一个人的群聊图都没有。|
 
 **完整 SSE 帧序列：**
 
@@ -1072,11 +1073,12 @@ SSE 帧是整轮最后一帧且只走线上——在它发出前断线，光看 
 `history` 相同。
 
 ```json
-{ "message_id": "01J…", "composed_prompt": "5YaZ5a6e…", "image_ref": "previous", "aspect_ratio": "3:4" }
+{ "message_id": "01J…", "composed_prompt": "5YaZ5a6e…", "image_ref": "previous", "aspect_ratio": "3:4",
+  "companion": {"member_session_id": "…", "instance_id": "…"} }
 ```
 
-字段与 SSE 帧一致：`composed_prompt` 是 UTF-8 wire prompt 的 base64（`STANDARD`）；
-`image_ref` 在该键加入前落库的旧行上缺省。**缺省是「未知」，不是 `face`**——
+字段与 SSE 帧一致：`composed_prompt` 是 UTF-8 wire prompt 的 base64（`STANDARD`）；`companion` 只在
+群聊双人图上出现；`image_ref` 在该键加入前落库的旧行上缺省。**缺省是「未知」，不是 `face`**——
 把缺省默认成 `face`，会让 `previous` 参照的轮次拿错参考图重画。消息不是图片轮、或该轮的 compose
 事件当时没写成（审计写入是 fail-open）时返回 `404`——后者意味着 prompt 已无从取回，
 消费方应把该轮当纯文本处理。
