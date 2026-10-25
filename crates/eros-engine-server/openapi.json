@@ -4865,6 +4865,17 @@
             "type": "string",
             "format": "date-time"
           },
+          "last_message": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/GroupLastMessageDto",
+                "description": "`null` for a group with no visible message yet."
+              }
+            ]
+          },
           "members": {
             "type": "array",
             "items": {
@@ -4876,6 +4887,46 @@
               "string",
               "null"
             ]
+          }
+        }
+      },
+      "GroupLastMessageDto": {
+        "type": "object",
+        "description": "The group's newest visible message: a user or assistant row that is not\na product answer and has text or an image.",
+        "required": [
+          "message_id",
+          "role",
+          "preview",
+          "is_image",
+          "sent_at"
+        ],
+        "properties": {
+          "is_image": {
+            "type": "boolean"
+          },
+          "message_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "preview": {
+            "type": "string",
+            "description": "The content, trimmed and cut to its first 120 characters."
+          },
+          "role": {
+            "type": "string",
+            "description": "`user` or `assistant`."
+          },
+          "sent_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "speaker_session_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "The speaker's member session on an assistant row; `null` on a user row."
           }
         }
       },

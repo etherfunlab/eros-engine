@@ -46,6 +46,21 @@ pub struct GroupMemberDto {
     pub joined_at: DateTime<Utc>,
 }
 
+/// The group's newest visible message: a user or assistant row that is not
+/// a product answer and has text or an image.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct GroupLastMessageDto {
+    pub message_id: Uuid,
+    /// `user` or `assistant`.
+    pub role: String,
+    /// The speaker's member session on an assistant row; `null` on a user row.
+    pub speaker_session_id: Option<Uuid>,
+    /// The content, trimmed and cut to its first 120 characters.
+    pub preview: String,
+    pub is_image: bool,
+    pub sent_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct GroupDto {
     pub group_id: Uuid,
@@ -53,6 +68,8 @@ pub struct GroupDto {
     pub members: Vec<GroupMemberDto>,
     pub created_at: DateTime<Utc>,
     pub last_active_at: DateTime<Utc>,
+    /// `null` for a group with no visible message yet.
+    pub last_message: Option<GroupLastMessageDto>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -75,6 +92,14 @@ pub(crate) fn group_dto(g: &Group) -> GroupDto {
             .collect(),
         created_at: g.created_at,
         last_active_at: g.last_active_at,
+        last_message: g.last_message.as_ref().map(|m| GroupLastMessageDto {
+            message_id: m.message_id,
+            role: m.role.clone(),
+            speaker_session_id: m.speaker_session_id,
+            preview: m.preview.clone(),
+            is_image: m.is_image,
+            sent_at: m.sent_at,
+        }),
     }
 }
 
@@ -1295,6 +1320,39 @@ mod tests {
             (&json!(true), &json!(false)),
             "bond axes for B: {b}"
         );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn group_dto_carries_last_message(pool: PgPool) {
+        use tower::Service;
+        let verdict = r#"{"speakers":[{"member":"m1","action":"reply_text","inner_state":null,"reply_mode":null,"clothing":null}],"reason":null}"#;
+        let mut f = fixture(pool, Some(director_sse(verdict)), 200, None).await;
+        let (s, body) = send(
+            &mut f,
+            json!({"content":"周末去哪","client_msg_id":"01JLASTMSGSSSSSSSSSSSSSSSG"}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+        for uri in [
+            "/v2/comp/groups".to_string(),
+            format!("/v2/comp/group/{}", f.group),
+        ] {
+            let r = f.app.call(req("GET", &uri, f.user, None)).await.unwrap();
+            assert_eq!(r.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(r.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_slice(&bytes).unwrap();
+            let dto = if uri.ends_with("groups") {
+                v["groups"][0].clone()
+            } else {
+                v
+            };
+            assert_eq!(dto["last_message"]["role"], "assistant", "{uri}: {dto}");
+            assert_eq!(dto["last_message"]["speaker_session_id"], json!(f.a));
+            assert_eq!(dto["last_message"]["is_image"], false);
+            assert!(!dto["last_message"]["preview"].as_str().unwrap().is_empty());
+        }
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

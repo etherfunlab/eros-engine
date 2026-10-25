@@ -26,6 +26,21 @@ pub struct GroupMember {
     pub joined_at: DateTime<Utc>,
 }
 
+/// The group's newest visible row (spec 2026-10-26-group-member-scopes-and-
+/// last-message-design.md §3): a user or assistant row that is not a
+/// product answer and has text or an image.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct GroupLastMessage {
+    pub message_id: Uuid,
+    pub role: String,
+    /// The speaker's member session on an assistant row; `None` on a user row.
+    pub speaker_session_id: Option<Uuid>,
+    /// The content, trimmed and cut to its first 120 characters.
+    pub preview: String,
+    pub is_image: bool,
+    pub sent_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Group {
     pub id: Uuid,
@@ -34,6 +49,7 @@ pub struct Group {
     pub created_at: DateTime<Utc>,
     pub last_active_at: DateTime<Utc>,
     pub members: Vec<GroupMember>,
+    pub last_message: Option<GroupLastMessage>,
 }
 
 /// Why a session cannot join a group. `NotFound` covers "not yours" too, so a
@@ -56,7 +72,52 @@ struct GroupRow {
     title: Option<String>,
     created_at: DateTime<Utc>,
     last_active_at: DateTime<Utc>,
+    #[sqlx(flatten)]
+    last_message: LastMessageColumns,
 }
+
+/// The lateral join's columns, all NULL for a group with no visible row.
+#[derive(sqlx::FromRow)]
+struct LastMessageColumns {
+    lm_message_id: Option<Uuid>,
+    lm_role: Option<String>,
+    lm_speaker_session_id: Option<Uuid>,
+    lm_preview: Option<String>,
+    lm_is_image: Option<bool>,
+    lm_sent_at: Option<DateTime<Utc>>,
+}
+
+impl LastMessageColumns {
+    fn into_message(self) -> Option<GroupLastMessage> {
+        Some(GroupLastMessage {
+            message_id: self.lm_message_id?,
+            role: self.lm_role?,
+            speaker_session_id: self.lm_speaker_session_id,
+            preview: self.lm_preview?,
+            is_image: self.lm_is_image?,
+            sent_at: self.lm_sent_at?,
+        })
+    }
+}
+
+/// A group row with its newest visible message, for `get` and `list`.
+const GROUP_SQL: &str = "SELECT s.id, s.user_id, s.title, s.created_at, s.last_active_at, \
+            lm.id AS lm_message_id, lm.role AS lm_role, \
+            lm.speaker_session_id AS lm_speaker_session_id, \
+            left(btrim(lm.content), 120) AS lm_preview, \
+            COALESCE(lm.metadata ? 'image', false) AS lm_is_image, \
+            lm.sent_at AS lm_sent_at \
+     FROM engine.chat_sessions s \
+     LEFT JOIN LATERAL ( \
+         SELECT m.id, m.role, m.speaker_session_id, m.content, m.metadata, m.sent_at \
+           FROM engine.chat_messages m \
+          WHERE m.session_id = s.id \
+            AND m.role IN ('user', 'assistant') \
+            AND m.channel IS DISTINCT FROM 'product_qa' \
+            AND (btrim(m.content) <> '' OR m.metadata ? 'image') \
+          ORDER BY m.sent_at DESC, m.id DESC \
+          LIMIT 1 \
+     ) lm ON true";
 
 const MEMBERS_SQL: &str = "SELECT gm.member_session_id, s.instance_id, gm.joined_at \
      FROM engine.chat_session_members gm \
@@ -94,10 +155,9 @@ impl<'a> GroupRepo<'a> {
     }
 
     pub async fn get(&self, group_id: Uuid, user_id: Uuid) -> Result<Option<Group>, sqlx::Error> {
-        let row = sqlx::query_as::<_, GroupRow>(
-            "SELECT id, user_id, title, created_at, last_active_at FROM engine.chat_sessions \
-             WHERE id = $1 AND user_id = $2 AND channel = 'group' AND NOT archived",
-        )
+        let row = sqlx::query_as::<_, GroupRow>(&format!(
+            "{GROUP_SQL} WHERE s.id = $1 AND s.user_id = $2 AND s.channel = 'group' AND NOT s.archived"
+        ))
         .bind(group_id)
         .bind(user_id)
         .fetch_optional(self.pool)
@@ -109,11 +169,10 @@ impl<'a> GroupRepo<'a> {
     }
 
     pub async fn list(&self, user_id: Uuid) -> Result<Vec<Group>, sqlx::Error> {
-        let rows = sqlx::query_as::<_, GroupRow>(
-            "SELECT id, user_id, title, created_at, last_active_at FROM engine.chat_sessions \
-             WHERE user_id = $1 AND channel = 'group' AND NOT archived \
-             ORDER BY last_active_at DESC",
-        )
+        let rows = sqlx::query_as::<_, GroupRow>(&format!(
+            "{GROUP_SQL} WHERE s.user_id = $1 AND s.channel = 'group' AND NOT s.archived \
+             ORDER BY s.last_active_at DESC"
+        ))
         .bind(user_id)
         .fetch_all(self.pool)
         .await?;
@@ -236,6 +295,7 @@ impl<'a> GroupRepo<'a> {
             title: r.title,
             created_at: r.created_at,
             last_active_at: r.last_active_at,
+            last_message: r.last_message.into_message(),
         })
     }
 }
@@ -600,5 +660,149 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![fresh]
         );
+    }
+
+    async fn row(
+        pool: &PgPool,
+        group: Uuid,
+        role: &str,
+        content: &str,
+        speaker: Option<Uuid>,
+        channel: Option<&str>,
+        metadata: serde_json::Value,
+        mins_ago: i32,
+    ) {
+        sqlx::query(
+            "INSERT INTO engine.chat_messages \
+                 (session_id, role, content, speaker_session_id, channel, metadata, sent_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, now() - make_interval(mins => $7))",
+        )
+        .bind(group)
+        .bind(role)
+        .bind(content)
+        .bind(speaker)
+        .bind(channel)
+        .bind(metadata)
+        .bind(mins_ago)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn list_and_get_carry_the_last_visible_message(pool: PgPool) {
+        let repo = GroupRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        async fn mk(pool: &PgPool, user_id: Uuid, title: &str) -> (Uuid, Uuid) {
+            let a = text_session(pool, user_id).await;
+            let g = GroupRepo { pool }
+                .create(user_id, Some(title), &[a])
+                .await
+                .unwrap()
+                .unwrap();
+            (g.id, a)
+        }
+        let (empty, _) = mk(&pool, user_id, "空").await;
+        let (pics, member) = mk(&pool, user_id, "图").await;
+        row(
+            &pool,
+            pics,
+            "user",
+            "嗨",
+            None,
+            None,
+            serde_json::json!({}),
+            40,
+        )
+        .await;
+        row(
+            &pool,
+            pics,
+            "assistant",
+            "山顶的风好大",
+            Some(member),
+            None,
+            serde_json::json!({}),
+            30,
+        )
+        .await;
+        row(
+            &pool,
+            pics,
+            "assistant",
+            "",
+            Some(member),
+            None,
+            serde_json::json!({}),
+            20,
+        )
+        .await;
+        row(
+            &pool,
+            pics,
+            "assistant",
+            "",
+            Some(member),
+            None,
+            serde_json::json!({"image": {"caption": "x"}}),
+            10,
+        )
+        .await;
+        let (long, _) = mk(&pool, user_id, "长").await;
+        let long_text: String = "字".repeat(130);
+        row(
+            &pool,
+            long,
+            "user",
+            &long_text,
+            None,
+            None,
+            serde_json::json!({}),
+            20,
+        )
+        .await;
+        row(
+            &pool,
+            long,
+            "assistant",
+            "product",
+            None,
+            Some("product_qa"),
+            serde_json::json!({}),
+            10,
+        )
+        .await;
+
+        let by_id = |groups: Vec<Group>| {
+            groups
+                .into_iter()
+                .map(|g| (g.id, g.last_message))
+                .collect::<HashMap<_, _>>()
+        };
+        let listed = by_id(repo.list(user_id).await.unwrap());
+        assert_eq!(listed[&empty], None);
+        let p = listed[&pics].clone().expect("the image row");
+        assert_eq!(
+            (
+                p.role.as_str(),
+                p.speaker_session_id,
+                p.preview.as_str(),
+                p.is_image
+            ),
+            ("assistant", Some(member), "", true)
+        );
+        let l = listed[&long].clone().expect("the user row");
+        assert_eq!(
+            (l.role.as_str(), l.speaker_session_id, l.is_image),
+            ("user", None, false)
+        );
+        assert_eq!(l.preview.chars().count(), 120);
+        for id in [empty, pics, long] {
+            assert_eq!(
+                repo.get(id, user_id).await.unwrap().unwrap().last_message,
+                listed[&id],
+                "get agrees with list"
+            );
+        }
     }
 }
