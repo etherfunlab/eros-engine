@@ -4519,9 +4519,15 @@
       "EffectsResponse": {
         "type": "object",
         "required": [
-          "effects"
+          "effects",
+          "as_of"
         ],
         "properties": {
+          "as_of": {
+            "type": "string",
+            "format": "date-time",
+            "description": "The server time this response was computed for: the instant the\ncarried needs and `changes_at` derive from. A client schedules its\nre-read by `changes_at - as_of`, counted from the moment it received\nthe response, so the device clock does not matter."
+          },
           "background_event": {
             "oneOf": [
               {

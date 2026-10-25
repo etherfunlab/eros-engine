@@ -126,7 +126,8 @@ again shows the judge the same line.
   sent when a give's effect is at work or needs are known, and re-sent on an idempotent
   replay. `GET …/effects` returns them carried to the moment of the call, or `null` with no
   rating or no judge, and its `changes_at` says when the response next changes on its own: a
-  need's next step or the end of an event under way. See
+  need's next step or the end of an event under way; `as_of` is the instant it was computed
+  for, so a client can count the wait as a duration. See
   [the message stream](api-reference.md#post-compchatsession_idmessagestream) and
   [the effects route](api-reference.md#get-v2compsessionsession_ideffects).
 - **A voice call** freezes the levels carried to its first turn into the bootstrap snapshot.
