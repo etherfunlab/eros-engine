@@ -662,6 +662,7 @@ mod tests {
         );
     }
 
+    #[allow(clippy::too_many_arguments)] // one column per argument
     async fn row(
         pool: &PgPool,
         group: Uuid,
