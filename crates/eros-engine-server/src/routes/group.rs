@@ -2100,6 +2100,169 @@ mod tests {
         );
     }
 
+    async fn mount_failing_composer(server: &wiremock::MockServer) {
+        wiremock::Mock::given(wiremock::matchers::path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                json!({"model": "composer-model"}),
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(server)
+            .await;
+    }
+
+    async fn instance_of(pool: &PgPool, session: Uuid) -> Uuid {
+        sqlx::query_scalar("SELECT instance_id FROM engine.chat_sessions WHERE id = $1")
+            .bind(session)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// The `image_request` frame's JSON from a stream body.
+    fn image_request_of(body: &str) -> Value {
+        let line = body
+            .lines()
+            .find(|l| l.contains(r#""type":"image_request""#))
+            .unwrap_or_else(|| panic!("no image_request: {body}"));
+        serde_json::from_str(line.trim_start_matches("data: ")).unwrap()
+    }
+
+    async fn group_image_turn_carries_the_companion(pool: PgPool, action: &str, key: &str) {
+        use tower::Service;
+        let verdict = format!(
+            r#"{{"speakers":[{{"member":"m1","action":"{action}","inner_state":null,"reply_mode":null,"clothing":null,"with":"m2"}}],"reason":null}}"#
+        );
+        let mut f = fixture_with(
+            pool,
+            Some(director_sse(&verdict)),
+            200,
+            None,
+            COMPOSE_TASK,
+            |_| {},
+        )
+        .await;
+        mount_composer(&f._server).await;
+        let (s, body) = send(
+            &mut f,
+            json!({"content":"拍张合照","client_msg_id":key,"image":{}}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+        let b_instance = instance_of(&f.pool, f.b).await;
+        let frame = image_request_of(&body);
+        assert_eq!(
+            frame["companion"]["member_session_id"],
+            json!(f.b),
+            "{frame}"
+        );
+        assert_eq!(frame["companion"]["instance_id"], json!(b_instance));
+        let (message_id, marker): (Uuid, Value) = sqlx::query_as(
+            "SELECT id, metadata->'image' FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant' AND metadata ? 'image'",
+        )
+        .bind(f.group)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            marker["companion"]["member_session_id"],
+            json!(f.b),
+            "{marker}"
+        );
+        let r = f
+            .app
+            .call(req(
+                "GET",
+                &format!("/comp/chat/{}/messages/{message_id}/image-request", f.group),
+                f.user,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let restored: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            restored["companion"]["member_session_id"],
+            json!(f.b),
+            "{restored}"
+        );
+        assert_eq!(restored["companion"]["instance_id"], json!(b_instance));
+        // The composer saw both.
+        let inputs: Value = sqlx::query_scalar(
+            "SELECT inputs FROM engine.chat_images_events WHERE session_id = $1",
+        )
+        .bind(f.group)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(inputs["companion"]["name"], "阿哲", "{inputs}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_group_image_turn_carries_the_companion(pool: PgPool) {
+        group_image_turn_carries_the_companion(pool, "reply_image", "01JCOMPANIONIMAGEONLYSSSSG")
+            .await;
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_text_image_turn_carries_the_companion(pool: PgPool) {
+        group_image_turn_carries_the_companion(
+            pool,
+            "reply_text_image",
+            "01JCOMPANIONTEXTIMAGESSSSG",
+        )
+        .await;
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_exhausted_composer_drops_the_companion_from_the_frame(pool: PgPool) {
+        let verdict = r#"{"speakers":[{"member":"m1","action":"reply_image","inner_state":null,"reply_mode":null,"clothing":null,"with":"m2"}],"reason":null}"#;
+        let mut f = fixture_with(
+            pool,
+            Some(director_sse(verdict)),
+            200,
+            None,
+            COMPOSE_TASK,
+            |_| {},
+        )
+        .await;
+        mount_failing_composer(&f._server).await;
+        let (s, body) = send(
+            &mut f,
+            json!({"content":"拍张合照","client_msg_id":"01JCOMPANIONEXHAUSTEDSSSSG","image":{}}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+        let frame = image_request_of(&body);
+        assert!(
+            frame.get("companion").is_none(),
+            "solo portrait, no companion: {frame}"
+        );
+        let marker: Value = sqlx::query_scalar(
+            "SELECT metadata->'image' FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant' AND metadata ? 'image'",
+        )
+        .bind(f.group)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert!(marker.get("companion").is_none(), "{marker}");
+        let inputs: Value = sqlx::query_scalar(
+            "SELECT inputs FROM engine.chat_images_events WHERE session_id = $1",
+        )
+        .bind(f.group)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            inputs["companion"]["name"], "阿哲",
+            "the audit still records the ask: {inputs}"
+        );
+    }
+
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn an_image_only_speaker_sends_meta_done_then_the_picture(pool: PgPool) {
         let verdict = r#"{"speakers":[{"member":"m1","action":"reply_image","inner_state":null,"reply_mode":null,"clothing":null}],"reason":null}"#;

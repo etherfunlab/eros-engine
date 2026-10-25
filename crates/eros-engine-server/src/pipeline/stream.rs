@@ -138,6 +138,10 @@ pub enum ProtocolFrame {
         image_ref: eros_engine_core::types::ImageRef,
         #[serde(skip_serializing_if = "Option::is_none")]
         aspect_ratio: Option<String>,
+        /// The second person in the picture, on a group turn whose director
+        /// seated one (spec 2026-10-26-group-two-person-image-design.md §4).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        companion: Option<ImageCompanion>,
     },
     /// The response in effect for this turn's user action (spec
     /// 2026-10-05-chat-user-actions-design.md §3.4). Emitted once, before the
@@ -216,6 +220,17 @@ pub(crate) fn build_image_request_frame(
     image_ref: eros_engine_core::types::ImageRef,
     aspect_ratio: Option<&str>,
 ) -> ProtocolFrame {
+    build_image_request_frame_with(message_id, composed_prompt, image_ref, aspect_ratio, None)
+}
+
+/// [`build_image_request_frame`] with the second person of a group picture.
+pub(crate) fn build_image_request_frame_with(
+    message_id: String,
+    composed_prompt: &str,
+    image_ref: eros_engine_core::types::ImageRef,
+    aspect_ratio: Option<&str>,
+    companion: Option<ImageCompanion>,
+) -> ProtocolFrame {
     use base64::Engine as _;
     ProtocolFrame::ImageRequest {
         message_id,
@@ -223,7 +238,25 @@ pub(crate) fn build_image_request_frame(
             .encode(composed_prompt.as_bytes()),
         image_ref,
         aspect_ratio: aspect_ratio.map(str::to_string),
+        companion,
     }
+}
+
+/// The second person in a group picture, as the frame and the restore route
+/// carry it (spec 2026-10-26-group-two-person-image-design.md §4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct ImageCompanion {
+    pub member_session_id: Uuid,
+    pub instance_id: Uuid,
+}
+
+/// What the composer hears of the second person (spec §3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ImageCompanionContext {
+    pub name: String,
+    pub appearance: Option<String>,
+    pub personality: Option<String>,
+    pub speaker_name: String,
 }
 
 /// The `action_response` frame a replayed action turn re-emits, from the user
@@ -282,7 +315,38 @@ pub(crate) fn build_delegated_image_marker(
     image_ref: eros_engine_core::types::ImageRef,
     edit_of: Option<Uuid>,
 ) -> serde_json::Value {
+    build_delegated_image_marker_with(
+        subject,
+        caption,
+        aspect_ratio,
+        compose_variant,
+        compose_model,
+        compose_generation_id,
+        compose_event_id,
+        image_ref,
+        edit_of,
+        None,
+    )
+}
+
+/// [`build_delegated_image_marker`] with the second person of a group picture.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_delegated_image_marker_with(
+    subject: &str,
+    caption: Option<&str>,
+    aspect_ratio: Option<&str>,
+    compose_variant: Option<&str>,
+    compose_model: Option<&str>,
+    compose_generation_id: Option<&str>,
+    compose_event_id: Option<Uuid>,
+    image_ref: eros_engine_core::types::ImageRef,
+    edit_of: Option<Uuid>,
+    companion: Option<&ImageCompanion>,
+) -> serde_json::Value {
     let mut m = serde_json::json!({ "prompt": subject });
+    if let Some(c) = companion {
+        m["companion"] = serde_json::to_value(c).expect("ImageCompanion serializes");
+    }
     m["image_ref"] = serde_json::to_value(image_ref).expect("ImageRef serializes");
     if let Some(c) = caption.filter(|s| !s.trim().is_empty()) {
         m["caption"] = serde_json::Value::String(c.to_string());
@@ -316,6 +380,17 @@ pub(crate) fn delegated_image_only_frames(
     image_ref: eros_engine_core::types::ImageRef,
     aspect_ratio: Option<&str>,
 ) -> Vec<ProtocolFrame> {
+    delegated_image_only_frames_with(message_id, composed_prompt, image_ref, aspect_ratio, None)
+}
+
+/// [`delegated_image_only_frames`] with the second person of a group picture.
+pub(crate) fn delegated_image_only_frames_with(
+    message_id: String,
+    composed_prompt: &str,
+    image_ref: eros_engine_core::types::ImageRef,
+    aspect_ratio: Option<&str>,
+    companion: Option<ImageCompanion>,
+) -> Vec<ProtocolFrame> {
     vec![
         ProtocolFrame::Meta {
             message_id: message_id.clone(),
@@ -331,7 +406,13 @@ pub(crate) fn delegated_image_only_frames(
             generation_id: None,
             ghost_fallback: false,
         },
-        build_image_request_frame(message_id, composed_prompt, image_ref, aspect_ratio),
+        build_image_request_frame_with(
+            message_id,
+            composed_prompt,
+            image_ref,
+            aspect_ratio,
+            companion,
+        ),
     ]
 }
 
@@ -3428,8 +3509,52 @@ pub(crate) fn compose_user_payload(
     aspect_ratio: &str,
     body_state: &str,
 ) -> String {
+    compose_user_payload_with(
+        appearance,
+        clothing,
+        recent_scene,
+        latest_user_msg,
+        style,
+        aspect_ratio,
+        body_state,
+        None,
+    )
+}
+
+/// [`compose_user_payload`] with the `[同框人物]` section after `[此刻穿着]`
+/// when a second person is in the picture (spec 2026-10-26-group-two-person-
+/// image-design.md §3); byte-identical without.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compose_user_payload_with(
+    appearance: &str,
+    clothing: &str,
+    recent_scene: &str,
+    latest_user_msg: &str,
+    style: &str,
+    aspect_ratio: &str,
+    body_state: &str,
+    companion: Option<&ImageCompanionContext>,
+) -> String {
+    let companion = companion
+        .map(|c| {
+            let blank = |s: Option<&str>| {
+                s.map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("（无）")
+                    .to_string()
+            };
+            format!(
+                "[同框人物]\n{}：{}；{}\n这张图里有两个人：{} 和 {}。\n\n",
+                c.name,
+                blank(c.appearance.as_deref()),
+                blank(c.personality.as_deref()),
+                c.speaker_name,
+                c.name
+            )
+        })
+        .unwrap_or_default();
     format!(
-        "[人物外观]\n{appearance}\n\n[此刻穿着]\n{clothing}\n\n[身体状态]\n{body_state}\n\n[最近场景]\n{recent_scene}\n\n[对方最新消息]\n{latest_user_msg}\n\n[风格]\n{style}\n\n[画幅]\n{aspect_ratio}"
+        "[人物外观]\n{appearance}\n\n[此刻穿着]\n{clothing}\n\n{companion}[身体状态]\n{body_state}\n\n[最近场景]\n{recent_scene}\n\n[对方最新消息]\n{latest_user_msg}\n\n[风格]\n{style}\n\n[画幅]\n{aspect_ratio}"
     )
 }
 
@@ -3446,7 +3571,31 @@ pub(crate) fn compose_inputs_json(
     aspect_ratio: Option<&str>,
     body_state: Option<&str>,
 ) -> serde_json::Value {
-    serde_json::json!({
+    compose_inputs_json_with(
+        persona,
+        clothing,
+        recent_scene,
+        latest_user_msg,
+        style,
+        aspect_ratio,
+        body_state,
+        None,
+    )
+}
+
+/// [`compose_inputs_json`] with the second person the composer was shown.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compose_inputs_json_with(
+    persona: &eros_engine_core::persona::CompanionPersona,
+    clothing: Option<&str>,
+    recent_scene: &str,
+    latest_user_msg: &str,
+    style: &str,
+    aspect_ratio: Option<&str>,
+    body_state: Option<&str>,
+    companion: Option<&ImageCompanionContext>,
+) -> serde_json::Value {
+    let mut v = serde_json::json!({
         "appearance": crate::prompt::meta_str(persona, "appearance")
             .map(str::trim)
             .unwrap_or(""),
@@ -3456,7 +3605,15 @@ pub(crate) fn compose_inputs_json(
         "latest_user_msg": latest_user_msg.trim(),
         "style": style,
         "aspect_ratio": aspect_ratio.unwrap_or(""),
-    })
+    });
+    if let Some(c) = companion {
+        v["companion"] = serde_json::json!({
+            "name": c.name,
+            "appearance": c.appearance.as_deref().map(str::trim).unwrap_or(""),
+            "personality": c.personality.as_deref().map(str::trim).unwrap_or(""),
+        });
+    }
+    v
 }
 
 /// Fail-open audit write, bounded by `AUDIT_WRITE_TIMEOUT` so a stalled pool
@@ -3569,6 +3726,30 @@ pub(crate) fn render_compose_payload(
     style: &str,
     body_state: Option<&str>,
 ) -> String {
+    render_compose_payload_with(
+        persona,
+        clothing,
+        recent_scene,
+        latest_user_msg,
+        aspect_ratio,
+        style,
+        body_state,
+        None,
+    )
+}
+
+/// [`render_compose_payload`] with the second person of a group picture.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_compose_payload_with(
+    persona: &eros_engine_core::persona::CompanionPersona,
+    clothing: Option<&str>,
+    recent_scene: &str,
+    latest_user_msg: &str,
+    aspect_ratio: Option<&str>,
+    style: &str,
+    body_state: Option<&str>,
+    companion: Option<&ImageCompanionContext>,
+) -> String {
     let appearance = crate::prompt::meta_str(persona, "appearance")
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -3592,7 +3773,9 @@ pub(crate) fn render_compose_payload(
         latest_user_msg
     };
     let ar = aspect_ratio.unwrap_or("（未指定）");
-    compose_user_payload(appearance, clothing, scene, latest, style, ar, body_state)
+    compose_user_payload_with(
+        appearance, clothing, scene, latest, style, ar, body_state, companion,
+    )
 }
 
 /// Walk `[model] + fallback` for a composer task, named by `task`, on
@@ -3852,6 +4035,37 @@ pub(crate) async fn build_delegated_image_prompt(
     session_id: Uuid,
     body_state: Option<&str>,
 ) -> DelegatedImagePrompt {
+    build_delegated_image_prompt_with(
+        state,
+        persona,
+        plan,
+        req_image,
+        pde_transcript,
+        latest_user_msg,
+        user_id,
+        session_id,
+        body_state,
+        None,
+    )
+    .await
+}
+
+/// [`build_delegated_image_prompt`] with the second person of a group
+/// picture: the composer hears both (spec 2026-10-26-group-two-person-image-
+/// design.md §3), and the audit `inputs` record the companion.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn build_delegated_image_prompt_with(
+    state: &AppState,
+    persona: &eros_engine_core::persona::CompanionPersona,
+    plan: &eros_engine_core::types::ActionPlan,
+    req_image: Option<&crate::routes::companion_stream::ImageReplyParams>,
+    pde_transcript: &str,
+    latest_user_msg: &str,
+    user_id: Uuid,
+    session_id: Uuid,
+    body_state: Option<&str>,
+    companion: Option<&ImageCompanionContext>,
+) -> DelegatedImagePrompt {
     let inputs = resolve_image_turn_inputs(plan, req_image);
     let style_str = serde_json::to_value(inputs.style)
         .ok()
@@ -3866,7 +4080,7 @@ pub(crate) async fn build_delegated_image_prompt(
                 state,
                 Some(session_id),
                 &c,
-                &render_compose_payload(
+                &render_compose_payload_with(
                     persona,
                     plan.clothing.as_deref(),
                     pde_transcript,
@@ -3874,6 +4088,7 @@ pub(crate) async fn build_delegated_image_prompt(
                     inputs.aspect_ratio.as_deref(),
                     &style_str,
                     body_state,
+                    companion,
                 ),
                 "chat_image_prompt_compose",
             )
@@ -3975,7 +4190,7 @@ pub(crate) async fn build_delegated_image_prompt(
             instance_id: Some(persona.instance.id),
             session_id: Some(session_id),
             status,
-            inputs: compose_inputs_json(
+            inputs: compose_inputs_json_with(
                 persona,
                 plan.clothing.as_deref(),
                 pde_transcript,
@@ -3983,6 +4198,7 @@ pub(crate) async fn build_delegated_image_prompt(
                 &style_str,
                 inputs.aspect_ratio.as_deref(),
                 body_state,
+                companion,
             ),
             subject: (!final_subject.is_empty()).then_some(final_subject.as_str()),
             caption: caption.as_deref(),
@@ -20910,6 +21126,57 @@ data: [DONE]\n\n"
         assert!(
             meta.get("model").is_none(),
             "delegated meta carries no model"
+        );
+        let image = serde_json::to_value(&frames[2]).unwrap();
+        assert!(
+            image.get("companion").is_none(),
+            "a 1:1 image turn carries no companion key: {image}"
+        );
+    }
+
+    #[test]
+    fn compose_user_payload_with_a_companion_adds_one_section() {
+        let base = compose_user_payload(
+            "freckled",
+            "（无）",
+            "（无）",
+            "（无）",
+            "realistic",
+            "3:4",
+            "（无）",
+        );
+        assert_eq!(
+            compose_user_payload_with(
+                "freckled",
+                "（无）",
+                "（无）",
+                "（无）",
+                "realistic",
+                "3:4",
+                "（无）",
+                None
+            ),
+            base
+        );
+        let ctx = ImageCompanionContext {
+            name: "阿哲".into(),
+            appearance: Some("短发，高个".into()),
+            personality: None,
+            speaker_name: "小美".into(),
+        };
+        let with = compose_user_payload_with(
+            "freckled",
+            "（无）",
+            "（无）",
+            "（无）",
+            "realistic",
+            "3:4",
+            "（无）",
+            Some(&ctx),
+        );
+        assert_eq!(
+            with,
+            "[人物外观]\nfreckled\n\n[此刻穿着]\n（无）\n\n[同框人物]\n阿哲：短发，高个；（无）\n这张图里有两个人：小美 和 阿哲。\n\n[身体状态]\n（无）\n\n[最近场景]\n（无）\n\n[对方最新消息]\n（无）\n\n[风格]\nrealistic\n\n[画幅]\n3:4"
         );
     }
 

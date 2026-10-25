@@ -848,6 +848,9 @@ pub struct ImageRequestPayloadResponse {
     pub image_ref: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aspect_ratio: Option<String>,
+    /// The second person in a group picture; absent on every other row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub companion: Option<crate::pipeline::stream::ImageCompanion>,
 }
 
 /// The delegated `image_request` payload for one persisted image turn.
@@ -916,6 +919,10 @@ async fn get_image_request_payload(
             .get("aspect_ratio")
             .and_then(|v| v.as_str())
             .map(str::to_owned),
+        companion: image
+            .get("companion")
+            .cloned()
+            .and_then(|v| serde_json::from_value(v).ok()),
     }))
 }
 
