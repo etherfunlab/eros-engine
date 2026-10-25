@@ -572,6 +572,9 @@ pub(crate) async fn draw_event_at(
         allowed.retain(|k| !k.is_offline(&traits));
     }
     let rung = affinity.intimacy_rung();
+    let ever_had_sex = event_repo
+        .ever(instance_id, events::EventKind::HavingSex)
+        .await?;
     let Some(drawn) = events::draw(
         &DrawInput {
             now,
@@ -580,6 +583,7 @@ pub(crate) async fn draw_event_at(
             persona: &traits,
             history: &history,
             allowed: &allowed,
+            ever_had_sex,
         },
         rolls,
     ) else {
@@ -1444,6 +1448,43 @@ mod tests {
         let e = out.event.expect("having_sex at rung 2");
         assert!(e.offline && e.message_id.is_none() && out.message.is_none());
         assert!(calls(&mock).await.is_empty(), "nothing is generated");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn draw_reads_whether_she_ever_had_sex(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (instance_id, session_id) = setup(&pool, user_id).await;
+        seed_user_messages(&pool, session_id, 10).await;
+        set_art(&pool, instance_id, json!({"is_virgin": true})).await;
+        let long_ago = Utc::now() - chrono::Duration::days(200);
+        eros_engine_store::events::EventRepo { pool: &pool }
+            .insert_preempting(&eros_engine_store::events::NewEvent {
+                instance_id,
+                session_id,
+                event_key: "old",
+                kind: EventKind::HavingSex,
+                started_at: long_ago,
+                ends_at: long_ago + chrono::Duration::hours(1),
+            })
+            .await
+            .unwrap();
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "在看书").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            req(
+                "x1",
+                Some(vec![EventKindDto::HavingSex, EventKindDto::Reading]),
+            ),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        assert!(out.event.is_some(), "the read is wired and the draw lands");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
