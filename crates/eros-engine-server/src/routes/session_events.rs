@@ -1480,11 +1480,18 @@ mod tests {
                 Some(vec![EventKindDto::HavingSex, EventKindDto::Reading]),
             ),
             Utc::now(),
-            rolls(0.5),
+            rolls(0.8),
         )
         .await
         .unwrap();
-        assert!(out.event.is_some(), "the read is wired and the draw lands");
+        // Draw order is Reading 2 then HavingSex: 1 once she has (0.8 × 3 =
+        // 2.4 lands on HavingSex), 0.2 if the read were not wired (0.8 × 2.2
+        // = 1.76 would land on Reading).
+        assert_eq!(
+            out.event.map(|e| e.kind),
+            Some(EventKindDto::HavingSex),
+            "the ever-had-sex read reaches the draw"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
