@@ -780,6 +780,9 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | `short` | `scolded_superior` | 1 小时 | 骂了上级 |
 | `short` | `saw_bag` | 1 小时 | 看中了一个包（女性角色） |
 | `short` | `saw_clothes` | 1 小时 | 看中了一件衣服（女性角色） |
+| `short` | `admiring_scenery` | 1 小时 | 在看风景 |
+| `short` | `admiring_art` | 1 小时 | 在看展，停在一件作品前 |
+| `short` | `taking_selfie` | 30 分钟 | 刚拍了张自拍，想给对方看（只有文字，不出图） |
 | `mid` | `temp_work` | 4 小时 | 临时接到工作 |
 | `mid` | `ex_message` | 3 小时 | 前任发来消息 |
 | `mid` | `weather_change` | 4 小时 | 天气突然变了 |
@@ -797,6 +800,10 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | `mid` | `out_shopping` | 2–4 小时 | 在逛街（女性角色离线） |
 | `mid` | `bros_gathering` | 2–4 小时 | 兄弟聚会（离线） |
 | `mid` | `sis_gathering` | 2–4 小时 | 姐妹聚会（离线） |
+| `mid` | `on_the_road` | 2–4 小时 | 在路上：长途通勤、坐车、坐火车、坐飞机 |
+| `mid` | `watching_match` | 2–3 小时 | 在看比赛 |
+| `mid` | `watching_show` | 2–3 小时 | 在看表演 |
+| `mid` | `having_sex` | 1–2 小时 | 在做爱（离线，从不讲出来） |
 | `body` | `sick` | 1–3 天 | 生病中 |
 | `body` | `period` | 3–7 天 | 月经中 |
 | `body` | `hospitalized` | 2–5 天 | 住院 |
@@ -806,23 +813,24 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | `trip` | `long_trip` | 3–7 天 | 长途旅游 |
 | `trip` | `hometown_visit` | 72 小时 | 回老家 |
 
-时长写成区间的，在事件开始时从区间里抽定。以上共 43 种可抽取的种类。两种性别都会抽到两个聚会，权重相同，这是有意为之。
+时长写成区间的，在事件开始时从区间里抽定。以上共 50 种可抽取的种类。两种性别都会抽到两个聚会，权重相同，这是有意为之。
 
 另有两种永远不会被抽到：`taking_space`（她提出、用户同意的分开，12–24 小时，离线）和 `fell_out`（用户不理会她的请求时的那场不愉快，1 小时）。
 它们由 engine 为[生活选择流程](#post-v2compsessionsession_idlife-choiceschoice_id)写入，作为 `…/effects` 和生活选择响应里的 `event` 出现，
 不能写进 `kinds`。
 
-`sudden_desire` 与 `pregnancy_scare`（后者隐含性行为）带成人题材；只对部分用户提供这类内容的调用方，用
-`{"disallow": ["sudden_desire", "pregnancy_scare"]}` 把它们排除。`scolded_by_superior` 与 `scolded_superior`
+`sudden_desire`、`having_sex` 与 `pregnancy_scare`（后者隐含性行为）带成人题材；只对部分用户提供这类内容的调用方，用
+`{"disallow": ["sudden_desire", "having_sex", "pregnancy_scare"]}` 把它们排除。`scolded_by_superior` 与 `scolded_superior`
 假定她有上级；角色没有上级时，由调用方排除。`disallow` 列表之外的种类都照常抽取，engine 以后新增的种类也一样。
 
 抽取规则：
 
 - **两段抽取。** engine 先按权重抽类别，再在类别内按权重抽种类。往一个类别里加种类，不会改变其他类别的占比。
 - **一次一件插曲，一个背景。** 角色的任何一个 session 里有插曲在进行时，不再抽取。背景进行期间只抽插曲；
-  住院和术后期间，不抽需要她出门活动的那十七种（`temp_work`、`police_encounter`、`animal_encounter`、
+  住院和术后期间，不抽需要她出门活动的那二十二种（`temp_work`、`police_encounter`、`animal_encounter`、
   `hit_someone`、`got_hit`、`working_out`、`grocery_shopping`、`in_class`、`on_the_way`、`in_battle`、
-  `got_bumped`、`bumped_someone`、`saw_bag`、`saw_clothes`、`out_shopping`、`bros_gathering`、`sis_gathering`）；
+  `got_bumped`、`bumped_someone`、`saw_bag`、`saw_clothes`、`out_shopping`、`bros_gathering`、`sis_gathering`、
+  `admiring_scenery`、`admiring_art`、`watching_show`、`on_the_road`、`having_sex`）；
   `period` 期间，`period_scare` 与 `pregnancy_scare` 都不抽。
 - **她在等回答时什么都不抽。** 从她提出分开的请求起，到它被回答或过期（24 小时）为止，角色任何一个 session 的抽取都返回
   `{"event": null, "message": null}`。带着已经抽过的 `event_key` 来重复调用，照样返回那个事件。
@@ -855,7 +863,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 `ends_at` 是那一刻加上抽到的时长。背景进行期间抽到的插曲，从背景里讲出来（「出差途中遇到一只小猫」）。
 `offline` 对离线类种类（见下）为 `true`，其他种类为 `false`。
 
-**离线类。** `away_from_phone`、`busy`、`in_battle`、`asleep`、`bros_gathering`、`sis_gathering`，以及女性角色的
+**离线类。** `away_from_phone`、`busy`、`in_battle`、`asleep`、`bros_gathering`、`sis_gathering`、`having_sex`，以及女性角色的
 `out_shopping` 持续期间，角色联系不上；对其他角色，`out_shopping` 是一件普通的插曲（`"offline": false`，每一档都讲出来），
 她照常回复。两个聚会的存在，是为了让她有自己的生活，不围着用户转。`busy`、`in_battle` 和女性角色的 `out_shopping`
 在 intimacy 档 2 及以上会用一条消息讲出来。其他情况，以及 `away_from_phone`、`asleep` 和两个聚会的所有情况，

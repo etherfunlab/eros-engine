@@ -208,6 +208,12 @@ fn kind_cue(
         ScoldedSuperior => "（你刚把上级骂了一顿。）".into(),
         SawBag => find_cue("一个", "包", rung, tip_personality),
         SawClothes => find_cue("一件", "衣服", rung, tip_personality),
+        AdmiringScenery => "（你正在看眼前的风景，看得有点出神。）".into(),
+        AdmiringArt => "（你正在看展，眼前有一件作品让你停了下来。）".into(),
+        TakingSelfie => "（你刚拍了一张自拍，想发给对方看看。）".into(),
+        OnTheRoad => "（你正在路上，这一趟要走好几个小时。）".into(),
+        WatchingMatch => "（你正在看一场比赛。）".into(),
+        WatchingShow => "（你正在看一场演出。）".into(),
         TempWork => "（你刚临时接到一份工作，得马上去处理。）".into(),
         ExMessage => "（你的前任刚给你发来消息。）".into(),
         WeatherChange => "（你那边的天气刚刚突然变了。）".into(),
@@ -224,7 +230,8 @@ fn kind_cue(
         // (`events::is_told`); anyone else is simply out and keeps replying.
         OutShopping if traits.female => "（你接下来要出门逛街，这段时间顾不上看手机。）".into(),
         OutShopping => "（你正在外面逛街。）".into(),
-        AwayFromPhone | Asleep | BrosGathering | SisGathering | TakingSpace | FellOut => {
+        AwayFromPhone | Asleep | BrosGathering | SisGathering | HavingSex | TakingSpace
+        | FellOut => {
             unreachable!("{kind:?} is never told")
         }
         Sick => format!("（你生病了，大概要 {span}才会好。）"),
@@ -733,6 +740,24 @@ mod tests {
                 EventKind::InBattle,
                 "（你接下来要去打一场硬仗，一段时间顾不上手机。）",
             ),
+            (
+                EventKind::AdmiringScenery,
+                "（你正在看眼前的风景，看得有点出神。）",
+            ),
+            (
+                EventKind::AdmiringArt,
+                "（你正在看展，眼前有一件作品让你停了下来。）",
+            ),
+            (
+                EventKind::TakingSelfie,
+                "（你刚拍了一张自拍，想发给对方看看。）",
+            ),
+            (
+                EventKind::OnTheRoad,
+                "（你正在路上，这一趟要走好几个小时。）",
+            ),
+            (EventKind::WatchingMatch, "（你正在看一场比赛。）"),
+            (EventKind::WatchingShow, "（你正在看一场演出。）"),
         ] {
             assert_eq!(
                 kind_cue(kind, h, 1, &PersonaTraits::default(), None),

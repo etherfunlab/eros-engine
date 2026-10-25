@@ -64,6 +64,9 @@ pub enum EventKindDto {
     ScoldedSuperior,
     SawBag,
     SawClothes,
+    AdmiringScenery,
+    AdmiringArt,
+    TakingSelfie,
     TempWork,
     ExMessage,
     WeatherChange,
@@ -81,6 +84,10 @@ pub enum EventKindDto {
     OutShopping,
     BrosGathering,
     SisGathering,
+    OnTheRoad,
+    WatchingMatch,
+    WatchingShow,
+    HavingSex,
     Sick,
     Period,
     Hospitalized,
@@ -147,6 +154,13 @@ impl From<EventKindDto> for EventKind {
             EventKindDto::OutShopping => EventKind::OutShopping,
             EventKindDto::BrosGathering => EventKind::BrosGathering,
             EventKindDto::SisGathering => EventKind::SisGathering,
+            EventKindDto::AdmiringScenery => EventKind::AdmiringScenery,
+            EventKindDto::AdmiringArt => EventKind::AdmiringArt,
+            EventKindDto::TakingSelfie => EventKind::TakingSelfie,
+            EventKindDto::OnTheRoad => EventKind::OnTheRoad,
+            EventKindDto::WatchingMatch => EventKind::WatchingMatch,
+            EventKindDto::WatchingShow => EventKind::WatchingShow,
+            EventKindDto::HavingSex => EventKind::HavingSex,
             EventKindDto::Sick => EventKind::Sick,
             EventKindDto::Period => EventKind::Period,
             EventKindDto::Hospitalized => EventKind::Hospitalized,
@@ -199,6 +213,13 @@ impl From<EventKind> for EventKindDto {
             EventKind::OutShopping => EventKindDto::OutShopping,
             EventKind::BrosGathering => EventKindDto::BrosGathering,
             EventKind::SisGathering => EventKindDto::SisGathering,
+            EventKind::AdmiringScenery => EventKindDto::AdmiringScenery,
+            EventKind::AdmiringArt => EventKindDto::AdmiringArt,
+            EventKind::TakingSelfie => EventKindDto::TakingSelfie,
+            EventKind::OnTheRoad => EventKindDto::OnTheRoad,
+            EventKind::WatchingMatch => EventKindDto::WatchingMatch,
+            EventKind::WatchingShow => EventKindDto::WatchingShow,
+            EventKind::HavingSex => EventKindDto::HavingSex,
             EventKind::Sick => EventKindDto::Sick,
             EventKind::Period => EventKindDto::Period,
             EventKind::Hospitalized => EventKindDto::Hospitalized,
@@ -422,11 +443,12 @@ async fn respond(
 /// body state) only incidents are drawn. The
 /// persona then tells the user in one proactive message, persisted like any
 /// reply and returned with the event. The offline kinds (`away_from_phone`,
-/// `busy`, `in_battle`, `asleep`, `bros_gathering`, `sis_gathering`, and
-/// `out_shopping` for a female persona) make her unreachable while they last.
+/// `busy`, `in_battle`, `asleep`, `bros_gathering`, `sis_gathering`,
+/// `having_sex`, and `out_shopping` for a female persona) make her
+/// unreachable while they last.
 /// `busy`, `in_battle` and a female persona's `out_shopping` are announced in
 /// a message at intimacy rung 2 and up; below that, and always for
-/// `away_from_phone`, `asleep` and the gatherings, the event comes back with
+/// `away_from_phone`, `asleep`, `having_sex` and the gatherings, the event comes back with
 /// `message: null`. For any other persona `out_shopping` is not offline and
 /// is announced at every rung. The same `event_key` returns the same event.
 #[utoipa::path(
@@ -1374,6 +1396,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.event.map(|e| e.kind), Some(EventKindDto::AwayFromPhone));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn having_sex_is_stripped_like_any_offline_kind(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (instance_id, session_id) = setup(&pool, user_id).await;
+        seed_user_messages(&pool, session_id, 10).await;
+        let only = |key: &str| req(key, Some(vec![EventKindDto::HavingSex]));
+        let mut off = test_state(pool.clone());
+        off.model_config = Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.pde_decision]\nmodel = \"judge\"\nghosting = false\n",
+            )
+            .unwrap(),
+        );
+        let out = draw_event_at(
+            &off,
+            session_id,
+            user_id,
+            only("x1"),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        assert!(out.event.is_none() && out.message.is_none());
+        assert_eq!(event_count(&pool, session_id).await, 0);
+
+        // Ghosting on: written without a message at rung 1 …
+        let mock = MockServer::start().await;
+        let on = with_companion(test_state(pool.clone()), &mock.uri());
+        let earlier = Utc::now() - chrono::Duration::hours(61);
+        let out = draw_event_at(&on, session_id, user_id, only("x2"), earlier, rolls(0.5))
+            .await
+            .unwrap();
+        let e = out.event.expect("having_sex at rung 1");
+        assert!(e.offline && e.message_id.is_none() && out.message.is_none());
+
+        // … and at rung 2 alike: it is never announced.
+        let other = seed_session(&pool, user_id, instance_id).await;
+        seed_user_messages(&pool, other, 10).await;
+        rung_two(&pool, other, user_id, instance_id).await;
+        let out = draw_event_at(&on, other, user_id, only("x3"), Utc::now(), rolls(0.5))
+            .await
+            .unwrap();
+        let e = out.event.expect("having_sex at rung 2");
+        assert!(e.offline && e.message_id.is_none() && out.message.is_none());
+        assert!(calls(&mock).await.is_empty(), "nothing is generated");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

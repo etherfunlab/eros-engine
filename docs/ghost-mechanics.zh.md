@@ -121,7 +121,7 @@ score = (1−0.05)×0.4 + (1−0.05)×0.4 + 0×0.2
 
 ## engine 强制的 ghost
 
-角色的离线类生活事件进行期间（`away_from_phone`、`busy`、`in_battle`、`asleep`、两个聚会、女性角色的 `out_shopping`，或她提出的分开 `taking_space`；见 [events 路由](api-reference.zh.md#post-v2compsessionsession_idevents)和[提出分开的选择](life-events-needs.zh.md#提出分开的选择)），她任何一个 session 里的每一轮 1:1 文字消息都会被 ghost，不经过判官，也不经过上面的打分。本页的其他规则都不适用于它：它不计入 `ghost_streak`，不写 `last_ghost_at`，也不会抬高之后各轮的阈值。它和任何一次 ghost 一样，以同样的三帧收尾。
+角色的离线类生活事件进行期间（`away_from_phone`、`busy`、`in_battle`、`asleep`、两个聚会、`having_sex`、女性角色的 `out_shopping`，或她提出的分开 `taking_space`；见 [events 路由](api-reference.zh.md#post-v2compsessionsession_idevents)和[提出分开的选择](life-events-needs.zh.md#提出分开的选择)），她任何一个 session 里的每一轮 1:1 文字消息都会被 ghost，不经过判官，也不经过上面的打分。本页的其他规则都不适用于它：它不计入 `ghost_streak`，不写 `last_ghost_at`，也不会抬高之后各轮的阈值。它和任何一次 ghost 一样，以同样的三帧收尾。
 
 - 用户那一行和其他被 ghost 的行一样标记为已 ghost，但没有回执（`read_at` 不出现）：没有判官读过它，角色解释之后它依然没有回执。
 - 带用户动作的轮次是例外。动作（送礼、打赏、亲吻这类）在语义上是线下互动，用不着手机，所以这一轮走正常路径并得到回复。带 `image.force = true` 的轮次也一样：强制出图的轮次永远是 `reply_image`。
