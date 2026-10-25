@@ -2321,7 +2321,7 @@
           "companion"
         ],
         "summary": "Ask for something to happen in the persona's day.",
-        "description": "The engine draws one kind of event, or none (a short or mid-length\nincident is under way, every allowed kind is cooling down, or she has asked\nthe user for space and waits for the answer, in any session of the persona,\nuntil it is answered or lapses). During a background event (a trip or a\nbody state) only incidents are drawn. The\npersona then tells the user in one proactive message, persisted like any\nreply and returned with the event. The offline kinds (`away_from_phone`,\n`busy`, `in_battle`, `asleep`, `bros_gathering`, `sis_gathering`, and\n`out_shopping` for a female persona) make her unreachable while they last.\n`busy`, `in_battle` and a female persona's `out_shopping` are announced in\na message at intimacy rung 2 and up; below that, and always for\n`away_from_phone`, `asleep` and the gatherings, the event comes back with\n`message: null`. For any other persona `out_shopping` is not offline and\nis announced at every rung. The same `event_key` returns the same event.",
+        "description": "The engine draws one kind of event, or none (a short or mid-length\nincident is under way, every allowed kind is cooling down, or she has asked\nthe user for space and waits for the answer, in any session of the persona,\nuntil it is answered or lapses). During a background event (a trip or a\nbody state) only incidents are drawn. The\npersona then tells the user in one proactive message, persisted like any\nreply and returned with the event. The offline kinds (`away_from_phone`,\n`busy`, `in_battle`, `asleep`, `bros_gathering`, `sis_gathering`,\n`having_sex`, and `out_shopping` for a female persona) make her\nunreachable while they last.\n`busy`, `in_battle` and a female persona's `out_shopping` are announced in\na message at intimacy rung 2 and up; below that, and always for\n`away_from_phone`, `asleep`, `having_sex` and the gatherings, the event comes back with\n`message: null`. For any other persona `out_shopping` is not offline and\nis announced at every rung. The same `event_key` returns the same event.",
         "operationId": "draw_event",
         "parameters": [
           {
@@ -4610,6 +4610,9 @@
           "scolded_superior",
           "saw_bag",
           "saw_clothes",
+          "admiring_scenery",
+          "admiring_art",
+          "taking_selfie",
           "temp_work",
           "ex_message",
           "weather_change",
@@ -4627,6 +4630,10 @@
           "out_shopping",
           "bros_gathering",
           "sis_gathering",
+          "on_the_road",
+          "watching_match",
+          "watching_show",
+          "having_sex",
           "sick",
           "period",
           "hospitalized",

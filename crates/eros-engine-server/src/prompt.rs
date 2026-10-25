@@ -848,6 +848,9 @@ pub(crate) fn event_label(kind: eros_engine_core::events::EventKind) -> &'static
         ScoldedSuperior => "骂上级了",
         SawBag => "看中了一个包",
         SawClothes => "看中了一件衣服",
+        AdmiringScenery => "在看风景",
+        AdmiringArt => "在看展",
+        TakingSelfie => "发了张自拍",
         TempWork => "临时接到工作",
         ExMessage => "前任发来消息",
         WeatherChange => "天气突然变了",
@@ -865,6 +868,10 @@ pub(crate) fn event_label(kind: eros_engine_core::events::EventKind) -> &'static
         OutShopping => "在逛街",
         BrosGathering => "兄弟聚会",
         SisGathering => "姐妹聚会",
+        OnTheRoad => "在路上",
+        WatchingMatch => "在看比赛",
+        WatchingShow => "在看表演",
+        HavingSex => "在做爱",
         Sick => "生病中",
         Period => "月经中",
         Hospitalized => "住院",
@@ -1034,6 +1041,7 @@ fn aftermath_text(kind: eros_engine_core::events::EventKind) -> Option<&'static 
         OutShopping => "在逛街，对方那时发来的消息你现在才看到",
         BrosGathering => "去了兄弟聚会，对方那时发来的消息你现在才看到",
         SisGathering => "去了姐妹聚会，对方那时发来的消息你现在才看到",
+        HavingSex => "在做爱，对方那时发来的消息你现在才看到",
         PeriodScare => "以为月经没来，后来来了，是虚惊一场",
         PregnancyScare => "验出两条杠，后来复查是虚惊一场",
         TakingSpace => SEPARATION_UNREAD,
@@ -4039,6 +4047,37 @@ mod tests {
     }
 
     #[test]
+    fn seven_more_labels() {
+        use eros_engine_core::events::EventKind::*;
+        for (k, label) in [
+            (AdmiringScenery, "在看风景"),
+            (AdmiringArt, "在看展"),
+            (TakingSelfie, "发了张自拍"),
+            (OnTheRoad, "在路上"),
+            (WatchingMatch, "在看比赛"),
+            (WatchingShow, "在看表演"),
+            (HavingSex, "在做爱"),
+        ] {
+            assert_eq!(event_label(k), label, "{k:?}");
+        }
+    }
+
+    #[test]
+    fn having_sex_judge_suffix() {
+        use eros_engine_core::events::EventKind;
+        let (sex, at) = event_at(EventKind::HavingSex, 180, -120);
+        let nothing = eros_engine_store::events::CurrentEvents {
+            foreground: None,
+            background: None,
+            at,
+        };
+        assert_eq!(
+            events_judge_text(&nothing, Some(&sex), None, None).unwrap(),
+            "在做爱（2 小时前结束，期间对方的消息你没有回）"
+        );
+    }
+
+    #[test]
     fn an_unexplained_away_stretch_is_the_last_judge_item() {
         use eros_engine_core::events::EventKind;
         let (trip, at) = event_at(EventKind::BusinessTrip, 600, 840);
@@ -4117,6 +4156,7 @@ mod tests {
             (Busy, "一直在忙，对方那时发来的消息你现在才看到"),
             (InBattle, "在打一场硬仗，对方那时发来的消息你现在才看到"),
             (Asleep, "睡着了，对方那时发来的消息你现在才看到"),
+            (HavingSex, "在做爱，对方那时发来的消息你现在才看到"),
         ] {
             assert_eq!(
                 just_now_text(Some(&rec(kind)), None, None).as_deref(),
@@ -4326,6 +4366,9 @@ mod tests {
                 "骂上级了",
                 "看中了一个包",
                 "看中了一件衣服",
+                "在看风景",
+                "在看展",
+                "发了张自拍",
                 "临时接到工作",
                 "前任发来消息",
                 "天气突然变了",
@@ -4343,6 +4386,10 @@ mod tests {
                 "在逛街",
                 "兄弟聚会",
                 "姐妹聚会",
+                "在路上",
+                "在看比赛",
+                "在看表演",
+                "在做爱",
                 "生病中",
                 "月经中",
                 "住院",
