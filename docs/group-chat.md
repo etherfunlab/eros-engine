@@ -53,8 +53,17 @@ Group DTO:
 ```json
 {"group_id": "…", "title": "周末爬山",
  "members": [{"member_session_id": "…", "instance_id": "…", "joined_at": "…"}],
- "created_at": "…", "last_active_at": "…"}
+ "created_at": "…", "last_active_at": "…",
+ "last_message": {"message_id": "…", "role": "assistant", "speaker_session_id": "…",
+                  "preview": "山顶的风好大", "is_image": false, "sent_at": "…"}}
 ```
+
+`last_message` is the group's newest visible row, or `null`: a `user` or
+`assistant` row that is not a product answer and has text or an image.
+`speaker_session_id` is the speaker on an assistant row and `null` on a user
+row; `preview` is the content trimmed and cut to its first 120 characters
+(empty for an image-only row, with `is_image` true). A client lists groups
+without fetching each one's history.
 
 Create and add-member refusals:
 
@@ -83,11 +92,22 @@ async variant.
 
 Request body: `content`, `client_msg_id`, `tier`, `prompt_traits`,
 `user_timezone` / `user_country` / `user_region`, the 1:1 `image` block, the
-1:1 `audit` block, and an optional `mentions: [member_session_id]` for a
-client-side @.
+1:1 `audit` block, an optional `mentions: [member_session_id]` for a
+client-side @, and an optional `member_scopes`: an object keyed by
+`member_session_id`, each value `{memory_scope?, affinity_scope?}` with the
+1:1 send's types. Each speaker runs on its own entry; a member without one,
+or a missing key inside one, gets the engine default for that field
+(`neutral_and_relationship`, `bond`), as every speaker did before. The map is
+not stored; what the 1:1 send records for a scope, the speaker's row records.
+
+```json
+{"content": "…", "client_msg_id": "…",
+ "member_scopes": {"<member_session_id>": {"memory_scope": "neutral_only", "affinity_scope": "chemistry"}}}
+```
 
 - Mentions must name members of the group; an unknown id returns
-  `422 unprocessable`.
+  `422 unprocessable`. A `member_scopes` key that is not a seated member is
+  refused the same way, before anything is enqueued.
 - `audit` takes the 1:1 caps (a violation returns `400 invalid_payload`) and
   rides each speaker's reply call; see [llm-audit.md](llm-audit.md).
 - `image` means what it means on the 1:1 route: its presence, together with a

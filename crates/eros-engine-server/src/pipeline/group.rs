@@ -164,6 +164,8 @@ pub(crate) struct GroupTurn {
     pub title: Option<String>,
     pub members: Vec<GroupMember>,
     pub mentions: Vec<Uuid>,
+    /// Per-speaker scopes; a seat without an entry runs on the defaults.
+    pub member_scopes: std::collections::HashMap<Uuid, crate::routes::group::MemberScopeDto>,
     pub prompt_traits: Vec<PromptTrait>,
     pub audit: Option<LlmAudit>,
     pub tier: Option<String>,
@@ -180,15 +182,35 @@ struct Seat {
 }
 
 impl GroupTurn {
-    fn event(&self) -> Event {
+    /// The seat's resolved scopes: its `member_scopes` entry, each field
+    /// falling back to the engine default.
+    fn scopes(
+        &self,
+        member_session_id: Uuid,
+    ) -> (
+        eros_engine_core::scope::MemoryScope,
+        eros_engine_core::scope::AffinityScope,
+    ) {
+        let entry = self.member_scopes.get(&member_session_id);
+        (
+            entry.and_then(|e| e.memory_scope).unwrap_or_default(),
+            entry
+                .and_then(|e| e.affinity_scope.as_ref())
+                .map(|a| a.resolve())
+                .unwrap_or_default(),
+        )
+    }
+
+    fn event(&self, member_session_id: Uuid) -> Event {
+        let (memory_scope, affinity_scope) = self.scopes(member_session_id);
         Event::UserMessage {
             content: self.content.clone(),
             message_id: self.user_message_id,
             prompt_traits: self.prompt_traits.clone(),
             audit: self.audit.clone(),
             tier: self.tier.clone(),
-            memory_scope: Default::default(),
-            affinity_scope: Default::default(),
+            memory_scope,
+            affinity_scope,
             quote: None,
             action: None,
             outfit: None,
@@ -419,7 +441,7 @@ pub(crate) fn run_group_turn(
         for cue in &cues {
             let seat = &seats[cue.seat];
             let input = DecisionInput {
-                event: turn.event(),
+                event: turn.event(seat.member_session_id),
                 affinity: seat.affinity.clone(),
                 persona: seat.persona.clone(),
                 signals: seat.signals.clone(),
@@ -638,6 +660,7 @@ pub(crate) fn run_group_turn(
                 ActionType::ReplyText
             };
             let outcome = Arc::new(std::sync::Mutex::new(BurstOutcome::default()));
+            let seat_scopes = turn.scopes(seat.member_session_id);
             let burst = drive_chat_burst_for(
                 state.clone(),
                 turn.group_session_id,
@@ -650,8 +673,8 @@ pub(crate) fn run_group_turn(
                 filter,
                 injected_tags,
                 turn.tier.clone(),
-                Default::default(),
-                Default::default(),
+                seat_scopes.0,
+                seat_scopes.1,
                 random_draw,
                 outcome.clone(),
                 chain,
