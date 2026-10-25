@@ -1037,6 +1037,8 @@ The draw:
   | `prefer_events` | array of `mid` kinds | the listed kinds come up three times as often within `mid` |
   | `health` | `"weak"`, `"normal"` (default), `"strong"` | `body` states come up twice / once / half as often |
   | `prefer_trip` | `true` / `false` (default) | trips come up three times as often; still once a week at most |
+  | `homesick` | `true` / `false` / absent | where a trip goes: `true` favours `hometown_visit` and thins the leisure trips, `false` thins `hometown_visit`; `business_trip` untouched |
+  | `is_virgin` | `true` / `false` (default) | `having_sex` is a fifth as likely until her first `having_sex` event, after which the key no longer applies |
 
   A value of the wrong shape, an unknown kind or a kind outside `mid` is
   ignored. A preference never lifts a gate.

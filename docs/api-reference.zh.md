@@ -848,6 +848,8 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
   | `prefer_events` | `mid` 种类的数组 | 列出的种类在 `mid` 内被抽到的概率是原来的三倍 |
   | `health` | `"weak"`、`"normal"`（默认）、`"strong"` | body 类被抽到的概率分别是原来的两倍 / 一倍 / 一半 |
   | `prefer_trip` | `true` / `false`（默认） | trip 类被抽到的概率是原来的三倍；仍然每周最多一次 |
+  | `homesick` | `true` / `false` / 不写 | 出行往哪去：`true` 偏向 `hometown_visit`、压低游玩的两种；`false` 压低 `hometown_visit`；`business_trip` 不动 |
+  | `is_virgin` | `true` / `false`（默认） | 第一次 `having_sex` 事件之前，`having_sex` 的概率是五分之一；之后这个键不再起作用 |
 
   取值形状不对、种类未知，或种类不在 `mid` 里，一律忽略。偏好不会绕过任何门槛。
 - **只要有符合条件的种类，抽取就一定得到一个事件。** 她的一天有多热闹，取决于调用方什么时候来要。
