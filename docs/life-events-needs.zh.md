@@ -120,7 +120,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 
 ### 类别
 
-可抽取的事件共 43 种，每一种属于一个类别，类别决定它的形态：
+可抽取的事件共 50 种，每一种属于一个类别，类别决定它的形态：
 
 | `category` | 形态 | 持续 | 类别权重 | 类别冷却 |
 |---|---|---|---|---|
@@ -146,7 +146,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 抽取是输入加三个随机数（两段各一个，时长一个）的纯函数。
 
 1. **资格。** 一个种类同时满足下面几条才有资格：
-   - 调用方的 `kinds` 允许它（[见下](#调用方的-kinds)；不带表示全部 43 种）；
+   - 调用方的 `kinds` 允许它（[见下](#调用方的-kinds)；不带表示全部 50 种）；
    - 过了它的门槛（见下）；
    - 它自己的冷却已过；
    - 它所属类别的冷却已过；
@@ -169,7 +169,8 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 - 有背景在进行时，不会抽第二个背景，插曲照抽；只是住院（`hospitalized`）和术后（`post_surgery`）期间，
   需要她出门活动的那几种不抽：`temp_work`、`police_encounter`、`animal_encounter`、`hit_someone`、
   `got_hit`、`working_out`、`grocery_shopping`、`in_class`、`on_the_way`、`in_battle`、`got_bumped`、
-  `bumped_someone`、`saw_bag`、`saw_clothes`、`out_shopping`、`bros_gathering`、`sis_gathering`。
+  `bumped_someone`、`saw_bag`、`saw_clothes`、`out_shopping`、`bros_gathering`、`sis_gathering`、
+  `admiring_scenery`、`admiring_art`、`watching_show`、`on_the_road`、`having_sex`。
   `period` 期间，
   不抽 `period_scare` 与 `pregnancy_scare`。
 - 她在等用户回答自己提出的分开请求时，同样完全不抽，角色的任何一个 session 都一样：这个请求本身就是前台戏，
@@ -203,7 +204,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 | `period`、`saw_bag`、`saw_clothes` | 角色的 `art_metadata.gender` 为 `"female"` |
 | `period_scare` | 角色的 `art_metadata.gender` 为 `"female"`，并且亲密度档 2 及以上 |
 | `pregnancy_scare` | 角色的 `art_metadata.gender` 为 `"female"`，并且亲密度档 3 |
-| `away_from_phone`、`busy`、`in_battle`、`asleep`、`bros_gathering`、`sis_gathering`，以及女性角色的 `out_shopping` | ghost 保护允许（见[下文](#离线类)） |
+| `away_from_phone`、`busy`、`in_battle`、`asleep`、`bros_gathering`、`sis_gathering`、`having_sex`，以及女性角色的 `out_shopping` | ghost 保护允许（见[下文](#离线类)） |
 
 `out_shopping` 和两个聚会没有性别门槛：谁会因此离线、为什么两种性别都会抽到两个聚会，见
 [逛街与聚会](#逛街与聚会)。
@@ -231,7 +232,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 
 | `kinds` | 可以抽的种类 |
 |---|---|
-| 不带或 `null` | 全部 43 种 |
+| 不带或 `null` | 全部 50 种 |
 | `[]` | 一种都不抽：响应是 `{"event": null, "message": null}` |
 | `["reading", "quarrel"]` | 只抽列出的 |
 | `{"allow": […], "disallow": […]}` | `allow` 允许的，去掉 `disallow` 列出的 |
@@ -242,7 +243,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 代价是调用方要等 engine 认识某个新种类之后才能列它。`taking_space` 和 `fell_out` 永远不会被抽到，
 所以在 `kinds` 的任何位置写它们，都按同样的方式被拒绝。
 
-有两种带成人题材：`sudden_desire`，以及隐含性行为的 `pregnancy_scare`。engine 不内建这类分组；只对部分用户提供这类内容的调用方，
+有三种带成人题材：`sudden_desire`、`having_sex`，以及隐含性行为的 `pregnancy_scare`。engine 不内建这类分组；只对部分用户提供这类内容的调用方，
 把它们列进 `disallow`。`scolded_by_superior` 与 `scolded_superior` 假定她有上级，在她的世界里读作老板、上司、领导、主人或君主；
 没有上级的角色同样交给 `disallow` 排除。
 
@@ -255,7 +256,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 
 ### 她怎么讲出来
 
-每种事件都由一条主动消息讲出来，除了 `away_from_phone`、`asleep`、两个聚会，以及亲密度档 2 以下的 `busy`、
+每种事件都由一条主动消息讲出来，除了 `away_from_phone`、`asleep`、`having_sex`、两个聚会，以及亲密度档 2 以下的 `busy`、
 `in_battle` 和女性角色的 `out_shopping`（见[下文](#离线类)）。这条消息走和回复同一条 companion 模型路径
 （角色设定、历史窗口、记忆召回、`[now]`），不经过判官，不流式，也没有用户消息行。engine 在请求末尾补一条舞台提示，
 作为最后一条 `user` 消息。提示不落库。它只陈述事实，不下指令：
@@ -310,8 +311,8 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 
 ### 离线类
 
-七个可抽取的种类会让角色联系不上，直到它们结束：`away_from_phone`、`busy`、`in_battle`、`asleep`、`bros_gathering`、
-`sis_gathering`，以及只对女性角色生效的 `out_shopping`。离线是事件持续期间她的行为方式，
+八个可抽取的种类会让角色联系不上，直到它们结束：`away_from_phone`、`busy`、`in_battle`、`asleep`、`bros_gathering`、
+`sis_gathering`、`having_sex`，以及只对女性角色生效的 `out_shopping`。离线是事件持续期间她的行为方式，
 不是类别：`busy` 按时长属于 `mid`，按行为属于离线。它们的门槛、沉默、例外和事后的解释都相同；
 区别只在措辞，以及她讲不讲出来。`in_battle` 的措辞让她的世界观决定它是什么：现代角色把它读成一场艰难的谈判、
 一顿商务宴请或一件难办的事，历史或奇幻角色把它读成一场真正的战斗。engine 自己写入的 `taking_space` 对所有角色都是离线，
@@ -326,6 +327,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 | `busy`、`in_battle` | 所有角色 | 亲密度档 2 起讲；以下沉默 |
 | `out_shopping` | 女性角色；其他角色照常回复 | 女性角色档 2 起讲、以下沉默；其他角色每一档都讲，是一件普通的插曲 |
 | `bros_gathering`、`sis_gathering` | 所有角色 | 从不讲；事后由她解释 |
+| `having_sex` | 所有角色 | 从不讲；事后直说（`在做爱，对方那时发来的消息你现在才看到`），跟谁由她自己说 |
 | `taking_space` | 所有角色 | 不由抽取产生；分开的流程里由她道别 |
 
 亲密度档 2 及以上，`busy`、`in_battle` 和女性角色的 `out_shopping` 像其他种类一样用一条主动消息讲出来，
@@ -467,6 +469,14 @@ ghosting 开关关闭时，已经在进行的一段不会让任何轮次沉默�
 不想要这些的部署，像对其他种类一样把它们列进 `disallow`。
 
 **为什么有离线事件。** 会消失的角色有自己的生活，不会围着用户转。角色正在聚会的用户，有理由去找另一个角色说话。
+
+### 风景、演出与自拍
+
+六种会讲出来的插曲，给她一个用户听得到的下午：`admiring_scenery`、`admiring_art`（`short`，1 小时）、`taking_selfie`
+（`short`，30 分钟）、`on_the_road`（`mid`，2 到 4 小时：长途通勤、坐车、坐火车、坐飞机；`on_the_way` 仍是那 30 分钟的赶路）、
+`watching_match` 与 `watching_show`（`mid`，2 到 3 小时）。期间她照常回复。提示只陈述事实，细节由她填：看的什么风景、
+哪件作品、什么比赛、坐的什么。`taking_selfie` 只有文字：消息讲她拍了照，不出图。`watching_match` 和 `taking_selfie`
+住院也抽；其余四种要她出门。
 
 ### 与 `/open` 的关系
 

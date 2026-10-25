@@ -949,6 +949,9 @@ Kinds fall into four categories. `short` and `mid` are incidents; `body` and
 | `short` | `scolded_superior` | 1 h | she told off someone above her |
 | `short` | `saw_bag` | 1 h | she has her eye on a bag (female persona) |
 | `short` | `saw_clothes` | 1 h | she has her eye on a piece of clothing (female persona) |
+| `short` | `admiring_scenery` | 1 h | she is taking in a view |
+| `short` | `admiring_art` | 1 h | she is at an exhibition, in front of a piece |
+| `short` | `taking_selfie` | 30 min | she has just taken a selfie and wants to show it (words only; no image is composed) |
 | `mid` | `temp_work` | 4 h | she is called in to work |
 | `mid` | `ex_message` | 3 h | her ex texts her |
 | `mid` | `weather_change` | 4 h | the weather turns |
@@ -966,6 +969,10 @@ Kinds fall into four categories. `short` and `mid` are incidents; `body` and
 | `mid` | `out_shopping` | 2–4 h | she is out shopping (offline for a female persona) |
 | `mid` | `bros_gathering` | 2–4 h | she is at a gathering of brothers (offline) |
 | `mid` | `sis_gathering` | 2–4 h | she is at a gathering of sisters (offline) |
+| `mid` | `on_the_road` | 2–4 h | she is on a long stretch of travel: a commute, a coach, a train, a flight |
+| `mid` | `watching_match` | 2–3 h | she is watching a match |
+| `mid` | `watching_show` | 2–3 h | she is at a show |
+| `mid` | `having_sex` | 1–2 h | she is having sex (offline, never announced) |
 | `body` | `sick` | 1–3 d | she is ill |
 | `body` | `period` | 3–7 d | her period |
 | `body` | `hospitalized` | 2–5 d | she is in hospital |
@@ -975,7 +982,7 @@ Kinds fall into four categories. `short` and `mid` are incidents; `body` and
 | `trip` | `long_trip` | 3–7 d | a long trip |
 | `trip` | `hometown_visit` | 72 h | a visit home |
 
-A range is drawn when the event starts. That is 43 drawable kinds. Both genders
+A range is drawn when the event starts. That is 50 drawable kinds. Both genders
 draw both gatherings, at the same weight; that is deliberate.
 
 Two more kinds are never drawn: `taking_space` (a separation she asked for and
@@ -985,9 +992,9 @@ user ignores her ask, 1 h). The engine writes them for the
 show up as the `event` of `…/effects` and of the life-choice response, and
 cannot be listed in `kinds`.
 
-`sudden_desire` and `pregnancy_scare`, which implies sex, carry adult themes; a
-caller that serves them only to some users leaves them out with
-`{"disallow": ["sudden_desire", "pregnancy_scare"]}`. `scolded_by_superior` and
+`sudden_desire`, `having_sex` and `pregnancy_scare`, which implies sex, carry adult themes;
+a caller that serves them only to some users leaves them out with
+`{"disallow": ["sudden_desire", "having_sex", "pregnancy_scare"]}`. `scolded_by_superior` and
 `scolded_superior` assume someone above her; for a persona with no one above
 her, the caller disallows them. A `disallow` list leaves every other kind in,
 including kinds the engine adds later.
@@ -1003,7 +1010,8 @@ The draw:
   `animal_encounter`, `hit_someone`, `got_hit`, `working_out`,
   `grocery_shopping`, `in_class`, `on_the_way`, `in_battle`, `got_bumped`,
   `bumped_someone`, `saw_bag`, `saw_clothes`, `out_shopping`,
-  `bros_gathering`, `sis_gathering`); during `period`,
+  `bros_gathering`, `sis_gathering`, `admiring_scenery`, `admiring_art`,
+  `watching_show`, `on_the_road`, `having_sex`); during `period`,
   neither `period_scare` nor `pregnancy_scare`.
 - **While she waits for an answer, nothing is drawn.** From her ask for space
   until it is answered or lapses (24 h), the draw returns `{"event": null,
@@ -1051,7 +1059,7 @@ drawn length. An incident drawn during a background is told from inside it
 and `false` for every other kind.
 
 **Offline kinds.** `away_from_phone`, `busy`, `in_battle`, `asleep`,
-`bros_gathering`, `sis_gathering` and, for a female persona, `out_shopping` make
+`bros_gathering`, `sis_gathering`, `having_sex` and, for a female persona, `out_shopping` make
 her unreachable while they last; for any other persona `out_shopping` is an
 ordinary incident (`"offline": false`, told at every rung) and she keeps
 replying. The gatherings exist so that she has a life of her own and does not
