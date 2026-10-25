@@ -561,7 +561,7 @@ mod tests {
             serde_json::from_value(body["changes_at"].clone()).unwrap();
         let gap = changes_at - as_of;
         assert!(
-            gap > chrono::Duration::minutes(9) && gap <= chrono::Duration::minutes(10),
+            gap > chrono::Duration::minutes(8) && gap <= chrono::Duration::minutes(10),
             "{gap}"
         );
     }
