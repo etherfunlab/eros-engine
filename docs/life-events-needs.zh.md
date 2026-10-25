@@ -104,7 +104,8 @@
   判官评了就用 verdict 里的，否则用判官看到的那组推算后的水平。配置了判官的部署里，规则引擎回合用推算后的水平。
 - **调用方**在 `body_state` 帧上拿到同样的水平（`needs`，对象或 `null`）。有 give 余效在起作用，或需求已知时发送，
   幂等重放时重发。`GET …/effects` 返回推到调用时刻的水平，没有评定或没有判官时为 `null`；
-  它的 `changes_at` 给出这份响应下一次自己变化的时刻：某项需求的下一步，或进行中事件的结束。见
+  它的 `changes_at` 给出这份响应下一次自己变化的时刻：某项需求的下一步，或进行中事件的结束；`as_of` 是计算它的时刻，
+  客户端据此把等待算成一段时长。见
   [消息流](api-reference.zh.md#post-compchatsession_idmessagestream)和
   [effects 路由](api-reference.zh.md#get-v2compsessionsession_ideffects)。
 - **语音通话**把推到通话第一轮的水平冻结进 bootstrap 快照。它们渲染成 `[身体状态]` 块里的

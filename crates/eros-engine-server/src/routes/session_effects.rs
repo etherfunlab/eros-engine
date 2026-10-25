@@ -116,6 +116,11 @@ pub struct EffectsResponse {
     /// The persona's background under way now (a trip, an illness), or
     /// `null`.
     pub background_event: Option<crate::routes::session_events::EventView>,
+    /// The server time this response was computed for: the instant the
+    /// carried needs and `changes_at` derive from. A client schedules its
+    /// re-read by `changes_at - as_of`, counted from the moment it received
+    /// the response, so the device clock does not matter.
+    pub as_of: chrono::DateTime<chrono::Utc>,
     /// The earliest time at which this response changes with no new turn and
     /// no new event: the next drift step of a need, or the end of `event` or
     /// `background_event`. `null` when nothing changes on its own.
@@ -197,6 +202,7 @@ async fn get_effects(
         needs: needs.as_ref().map(NeedsView::from),
         event: view(&current.foreground),
         background_event: view(&current.background),
+        as_of: now,
         changes_at,
     }))
 }
@@ -275,7 +281,7 @@ mod tests {
         let (s, body) = get(pool, session_id, owner).await;
         assert_eq!(s, StatusCode::OK, "{body}");
         assert_eq!(
-            body,
+            without_as_of(body),
             json!({"effects": [], "needs": null, "event": null, "background_event": null, "changes_at": null})
         );
     }
@@ -294,7 +300,7 @@ mod tests {
         let (s, body) = get(pool, session_id, owner).await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(
-            body,
+            without_as_of(body),
             json!({"effects": [
                 {"item": "cigarette", "quantity": 1, "level": 3, "phase": "peak", "step": 1, "steps": 1},
                 {"item": "alcohol", "name": "威士忌", "quantity": 3, "level": 3, "phase": "peak", "step": 3, "steps": 3},
@@ -310,7 +316,7 @@ mod tests {
         let (s, body) = get(pool, session_id, owner).await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(
-            body,
+            without_as_of(body),
             json!({"effects": [], "needs": null, "event": null, "background_event": null, "changes_at": null})
         );
     }
@@ -524,6 +530,39 @@ mod tests {
         assert_eq!(
             body["changes_at"],
             json!(rated_at + chrono::Duration::hours(8))
+        );
+    }
+
+    /// `as_of` is the handler's instant and differs per run: check it parses,
+    /// then compare the rest.
+    fn without_as_of(mut body: serde_json::Value) -> serde_json::Value {
+        let as_of = body
+            .as_object_mut()
+            .unwrap()
+            .remove("as_of")
+            .expect("as_of present");
+        serde_json::from_value::<chrono::DateTime<chrono::Utc>>(as_of).expect("as_of is RFC 3339");
+        body
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn as_of_is_the_instant_changes_at_counts_from(pool: sqlx::PgPool) {
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, owner).await;
+        let session_id = seed_session(&pool, owner, instance_id).await;
+        // Hunger steps 4 hours after the rating, 10 minutes from now.
+        user_row(&pool, session_id, 230,
+            json!({"needs": {"hunger": "low", "social": "high", "stamina": "mid", "emotional": "mid"}})).await;
+        let (s, body) = get_judged(pool, session_id, owner).await;
+        assert_eq!(s, StatusCode::OK);
+        let as_of: chrono::DateTime<chrono::Utc> =
+            serde_json::from_value(body["as_of"].clone()).unwrap();
+        let changes_at: chrono::DateTime<chrono::Utc> =
+            serde_json::from_value(body["changes_at"].clone()).unwrap();
+        let gap = changes_at - as_of;
+        assert!(
+            gap > chrono::Duration::minutes(8) && gap <= chrono::Duration::minutes(10),
+            "{gap}"
         );
     }
 

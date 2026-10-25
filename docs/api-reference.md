@@ -1135,13 +1135,14 @@ reply does not count. Her other sessions never carry it.
 
 The persona's lingering state from accepted gives, her needs and the events under way, as a text turn sent now would carry them: for a page that opens on a conversation, and for async callers, which receive no frames. Right after the turn that accepted a consumable, this route already lists it at step 1, while that turn's `body_state` frame does not list it: the frame describes the reply just written, the route the persona as she is now. `needs` is the persona's needs carried to now (the same shape as on the `body_state` frame), or `null` with no rating or without the LLM judge. `event` is the incident under way now and `background_event` the background under way now (the same shape as on the events route), each `null` when there is none. An offline kind under way is reported as `event`, like any other incident, with `"offline": true`.
 
-`changes_at` is the earliest time at which this response changes with no new turn and no new event: the next time a need steps toward its resting level, or the `ends_at` of `event` or `background_event`, whichever comes first. It is `null` when nothing changes on its own. Lingering effects move only with turns and do not count. A client that keeps a copy of the response re-reads it at `changes_at`, after a turn and after an event draw.
+`changes_at` is the earliest time at which this response changes with no new turn and no new event: the next time a need steps toward its resting level, or the `ends_at` of `event` or `background_event`, whichever comes first. It is `null` when nothing changes on its own. Lingering effects move only with turns and do not count. `as_of` is the server time the response was computed for: the instant the carried needs and `changes_at` derive from. A client that keeps a copy of the response re-reads it after a turn, after an event draw, and when `changes_at - as_of` has elapsed since it received the response: the duration, not the absolute time, so the device clock does not matter.
 
 ```json
 {"effects": [{"item": "alcohol", "name": "威士忌", "quantity": 3, "level": 2, "phase": "rising", "step": 2, "steps": 3}],
  "needs": {"hunger": "high", "social": "mid", "stamina": "low", "emotional": "mid"},
  "event": null,
  "background_event": {"kind": "short_trip", "category": "trip", "offline": false, "started_at": "2026-10-15T08:00:00Z", "ends_at": "2026-10-17T08:00:00Z", "message_id": "…"},
+ "as_of": "2026-10-16T13:00:00Z",
  "changes_at": "2026-10-16T14:00:00Z"}
 ```
 
