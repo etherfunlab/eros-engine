@@ -44,8 +44,14 @@
 ```json
 {"group_id": "…", "title": "周末爬山",
  "members": [{"member_session_id": "…", "instance_id": "…", "joined_at": "…"}],
- "created_at": "…", "last_active_at": "…"}
+ "created_at": "…", "last_active_at": "…",
+ "last_message": {"message_id": "…", "role": "assistant", "speaker_session_id": "…",
+                  "preview": "山顶的风好大", "is_image": false, "sent_at": "…"}}
 ```
+
+`last_message` 是群里最新一条可见的行，没有则为 `null`：`user` 或 `assistant` 行，不是产品问答，
+且有文字或有图。`speaker_session_id` 在 assistant 行上是发言人、在用户行上为 `null`；`preview` 是
+去掉首尾空白后的前 120 个字符（只有图的行为空串，`is_image` 为 true）。客户端列群时不用再逐个拉 history。
 
 创建与加人时的拒绝情形：
 
@@ -71,9 +77,18 @@
 
 请求体：`content`、`client_msg_id`、`tier`、`prompt_traits`、
 `user_timezone` / `user_country` / `user_region`、1:1 的 `image` 块、1:1 的 `audit` 块，
-以及可选的 `mentions: [member_session_id]`（客户端 @ 用）。
+可选的 `mentions: [member_session_id]`（客户端 @ 用），以及可选的 `member_scopes`：以 `member_session_id`
+为键的对象，每个值是 `{memory_scope?, affinity_scope?}`，类型与 1:1 发送相同。每位发言人用自己那份；
+没给的成员，或份里缺的那个字段，走 engine 默认（`neutral_and_relationship`、`bond`），和以前每位发言人一样。
+这份映射不存储；1:1 发送给 scope 记什么，发言人那一行就记什么。
 
-- 点名必须是群里的成员，未知 id 返回 `422 unprocessable`。
+```json
+{"content": "…", "client_msg_id": "…",
+ "member_scopes": {"<member_session_id>": {"memory_scope": "neutral_only", "affinity_scope": "chemistry"}}}
+```
+
+- 点名必须是群里的成员，未知 id 返回 `422 unprocessable`。`member_scopes` 里不是座上成员的键同样拒绝，
+  在入队之前。
 - `audit` 沿用 1:1 的上限（超限返回 `400 invalid_payload`），随每位发言者的回复调用发出；
   见 [llm-audit.zh.md](llm-audit.zh.md)。
 - `image` 的含义与 1:1 路由相同：带了它，并且配置了 `[tasks.chat_image_prompt_compose]`，本轮就可以发图。
