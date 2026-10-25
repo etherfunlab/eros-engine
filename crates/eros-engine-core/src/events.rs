@@ -383,6 +383,12 @@ const DESIRE_MIN_RUNG: u8 = 3;
 /// What a preferred `mid` kind, and a travel-loving persona's `trip`
 /// category, weigh relative to the base (§4).
 const PREFERENCE_FACTOR: f64 = 3.0;
+/// What a kind weighs while an event that leads to it is live (spec
+/// 2026-10-25-life-events-follow-ons-and-persona-keys-design.md §2.1), per
+/// live prior.
+const FOLLOW_FACTOR: f64 = 3.0;
+/// How long after it ended a prior stays live.
+const FOLLOW_WINDOW_HOURS: i64 = 48;
 /// Hours after any offline kind started before any offline kind can start
 /// again (spec 2026-10-16-life-events-offline-and-scares-design.md §3.4): it
 /// bounds how often she goes silent.
@@ -470,6 +476,42 @@ fn preference_factor(kind: EventKind, persona: &PersonaTraits) -> f64 {
     } else {
         1.0
     }
+}
+
+/// Whether `prior` makes `kind` likelier while it is live (spec §2.2).
+fn follows(prior: EventKind, kind: EventKind) -> bool {
+    use EventKind::*;
+    matches!(
+        (prior, kind),
+        (ExMessage | SuddenDesire, HavingSex)
+            | (Sick, PeriodScare)
+            | (HavingSex, PregnancyScare)
+            | (BusinessTrip, OnTheRoad | OnTheWay | Busy | TempWork)
+            | (
+                ShortTrip | LongTrip | HometownVisit,
+                OnTheRoad | AdmiringScenery | TakingSelfie
+            )
+            | (HometownVisit, BrosGathering | SisGathering)
+            | (Hospitalized | PostSurgery, Reading | Gaming)
+            | (Period, Irritable | Unwell)
+            | (Breakup | Quarrel | ScoldedBySuperior | InBattle, Irritable)
+            | (GotHit | GotBumped | WeatherChange, Unwell)
+            | (WorkingOut, Showering | Bathing)
+    )
+}
+
+/// `FOLLOW_FACTOR` once for every distinct live prior of `kind`: under way
+/// at `now`, or ended within `FOLLOW_WINDOW_HOURS` before it.
+fn follow_factor(kind: EventKind, history: &[PastEvent], now: DateTime<Utc>) -> f64 {
+    let since = now - Duration::hours(FOLLOW_WINDOW_HOURS);
+    let mut live: Vec<EventKind> = history
+        .iter()
+        .filter(|e| e.ends_at > since && follows(e.kind, kind))
+        .map(|e| e.kind)
+        .collect();
+    live.sort_by_key(|k| k.as_str());
+    live.dedup();
+    FOLLOW_FACTOR.powi(live.len() as i32)
 }
 
 /// Whether a background rules a foreground kind out (spec
@@ -611,7 +653,8 @@ pub fn draw(input: &DrawInput, rolls: Rolls) -> Option<Drawn> {
         .map(|k| {
             let weight = rule(k).weight
                 * needs_factor(k, input.needs.as_ref())
-                * preference_factor(k, input.persona);
+                * preference_factor(k, input.persona)
+                * follow_factor(k, input.history, input.now);
             (k, weight)
         })
         .collect();
@@ -1859,5 +1902,129 @@ mod tests {
         assert!((r.weight - 2.0).abs() < E);
         assert_eq!(r.cooldown_hours, 24);
         assert_eq!(lasts(TakingSelfie, 0.5), Duration::minutes(30));
+    }
+
+    #[test]
+    fn a_live_prior_triples_its_follow_on() {
+        // HavingSex 1 : Reading 2. With ex_message live, HavingSex weighs 3:
+        // 0.5 × 5 = 2.5 lands on HavingSex; without, 0.5 × 3 = 1.5 on Reading.
+        let none = PersonaTraits::default();
+        let live = [past(ExMessage, 20, 3)];
+        let r = rolls(0.0, 0.5);
+        assert_eq!(
+            pick_with(&none, None, 3, &live, &[HavingSex, Reading], r),
+            Some(HavingSex)
+        );
+        assert_eq!(
+            pick_with(&none, None, 3, &[], &[HavingSex, Reading], r),
+            Some(Reading)
+        );
+    }
+
+    #[test]
+    fn a_prior_ended_49_hours_ago_is_not_live() {
+        let none = PersonaTraits::default();
+        let stale = [past(ExMessage, 52, 3)];
+        assert_eq!(
+            pick_with(
+                &none,
+                None,
+                3,
+                &stale,
+                &[HavingSex, Reading],
+                rolls(0.0, 0.5)
+            ),
+            Some(Reading)
+        );
+    }
+
+    #[test]
+    fn a_background_under_way_is_live() {
+        let none = PersonaTraits::default();
+        let trip = [past(BusinessTrip, 2, 24)];
+        assert_eq!(
+            pick_with(
+                &none,
+                None,
+                3,
+                &trip,
+                &[OnTheRoad, Reading],
+                rolls(0.0, 0.5)
+            ),
+            Some(OnTheRoad)
+        );
+    }
+
+    #[test]
+    fn two_live_priors_multiply() {
+        // HavingSex 1 × 3 × 3 = 9 : Reading 2 — 0.8 × 11 = 8.8 lands on HavingSex.
+        let none = PersonaTraits::default();
+        let live = [past(ExMessage, 20, 3), past(SuddenDesire, 10, 1)];
+        assert_eq!(
+            pick_with(
+                &none,
+                None,
+                3,
+                &live,
+                &[HavingSex, Reading],
+                rolls(0.0, 0.8)
+            ),
+            Some(HavingSex)
+        );
+    }
+
+    #[test]
+    fn a_live_prior_never_lifts_a_gate() {
+        let male = PersonaTraits::default();
+        let sick = [past(Sick, 2, 72)];
+        for k in [0.0, 0.5, 0.99] {
+            assert_eq!(
+                pick_with(
+                    &male,
+                    None,
+                    3,
+                    &sick,
+                    &[PeriodScare, Reading],
+                    rolls(0.0, k)
+                ),
+                Some(Reading)
+            );
+        }
+    }
+
+    #[test]
+    fn follow_table_is_what_the_spec_says() {
+        for (prior, kind) in [
+            (ExMessage, HavingSex),
+            (SuddenDesire, HavingSex),
+            (Sick, PeriodScare),
+            (HavingSex, PregnancyScare),
+            (BusinessTrip, OnTheRoad),
+            (BusinessTrip, OnTheWay),
+            (BusinessTrip, Busy),
+            (BusinessTrip, TempWork),
+            (ShortTrip, OnTheRoad),
+            (LongTrip, AdmiringScenery),
+            (HometownVisit, TakingSelfie),
+            (HometownVisit, BrosGathering),
+            (HometownVisit, SisGathering),
+            (Hospitalized, Reading),
+            (PostSurgery, Gaming),
+            (Period, Irritable),
+            (Period, Unwell),
+            (Breakup, Irritable),
+            (Quarrel, Irritable),
+            (ScoldedBySuperior, Irritable),
+            (InBattle, Irritable),
+            (GotHit, Unwell),
+            (GotBumped, Unwell),
+            (WeatherChange, Unwell),
+            (WorkingOut, Showering),
+            (WorkingOut, Bathing),
+        ] {
+            assert!(follows(prior, kind), "{prior:?} -> {kind:?}");
+        }
+        assert!(!follows(Reading, HavingSex));
+        assert!(!follows(HavingSex, HavingSex));
     }
 }
