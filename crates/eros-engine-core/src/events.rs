@@ -258,6 +258,11 @@ impl EventKind {
         self.category().is_background()
     }
 
+    /// A kind whose message can carry her picture.
+    pub fn is_photo(self) -> bool {
+        self == EventKind::TakingSelfie
+    }
+
     /// Offline kinds make the persona unreachable while they last
     /// (spec 2026-10-16-life-events-offline-and-scares-design.md §2). Whether
     /// `out_shopping` does depends on the persona (spec 2026-10-19-life-events-
@@ -1945,6 +1950,13 @@ mod tests {
         assert!((r.weight - 2.0).abs() < E);
         assert_eq!(r.cooldown_hours, 24);
         assert_eq!(lasts(TakingSelfie, 0.5), Duration::minutes(30));
+    }
+
+    #[test]
+    fn only_a_selfie_is_a_photo() {
+        for k in EventKind::ALL {
+            assert_eq!(k.is_photo(), k == EventKind::TakingSelfie, "{k:?}");
+        }
     }
 
     #[test]
