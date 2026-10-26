@@ -104,7 +104,7 @@ impl LastMessageColumns {
 const GROUP_SQL: &str = "SELECT s.id, s.user_id, s.title, s.created_at, s.last_active_at, \
             lm.id AS lm_message_id, lm.role AS lm_role, \
             lm.speaker_session_id AS lm_speaker_session_id, \
-            left(btrim(lm.content), 120) AS lm_preview, \
+            left(btrim(lm.content, E' \\t\\r\\n\\f\\v'), 120) AS lm_preview, \
             COALESCE(lm.metadata ? 'image', false) AS lm_is_image, \
             lm.sent_at AS lm_sent_at \
      FROM engine.chat_sessions s \
@@ -114,7 +114,7 @@ const GROUP_SQL: &str = "SELECT s.id, s.user_id, s.title, s.created_at, s.last_a
           WHERE m.session_id = s.id \
             AND m.role IN ('user', 'assistant') \
             AND m.channel IS DISTINCT FROM 'product_qa' \
-            AND (btrim(m.content) <> '' OR m.metadata ? 'image') \
+            AND (btrim(m.content, E' \\t\\r\\n\\f\\v') <> '' OR m.metadata ? 'image') \
           ORDER BY m.sent_at DESC, m.id DESC \
           LIMIT 1 \
      ) lm ON true";
@@ -805,5 +805,48 @@ mod tests {
                 "get agrees with list"
             );
         }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn last_message_treats_newlines_as_blank(pool: PgPool) {
+        let repo = GroupRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let a = text_session(&pool, user_id).await;
+        let g = repo
+            .create(user_id, Some("空白"), &[a])
+            .await
+            .unwrap()
+            .unwrap();
+        row(
+            &pool,
+            g.id,
+            "user",
+            "\n  嗨  \n",
+            None,
+            None,
+            serde_json::json!({}),
+            20,
+        )
+        .await;
+        row(
+            &pool,
+            g.id,
+            "assistant",
+            "\n\t\n",
+            Some(a),
+            None,
+            serde_json::json!({}),
+            10,
+        )
+        .await;
+        let got = repo
+            .get(g.id, user_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_message
+            .unwrap();
+        assert_eq!(got.role, "user", "a newline-only row is not visible");
+        assert_eq!(got.preview, "嗨");
     }
 }

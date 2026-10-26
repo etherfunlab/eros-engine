@@ -78,7 +78,7 @@ spawn post_process     tokio::spawn — runs concurrent with response return:
 
 **Ghost-streak reset** is handled by the orchestrator before spawning post-process: on Reply the streak is cleared in a single idempotent UPDATE; on Ghost the orchestrator calls `AffinityRepo::record_ghost` instead. The `persist_with_event` repo method itself never touches the streak.
 
-**Offline.** While an offline life event of the persona is under way (`away_from_phone`, `busy`, `in_battle`, `asleep`, the two gatherings, a female persona's `out_shopping`, or the separation she asked for), a text turn without a user action or `image.force` ghosts before the PDE: the row is marked ghosted and the ghost frames are yielded, and neither the judge nor `record_ghost` runs. See [ghost-mechanics.md](ghost-mechanics.md#ghosting-the-engine-imposes).
+**Offline.** While an offline life event of the persona is under way (`away_from_phone`, `busy`, `in_battle`, `asleep`, the two gatherings, `having_sex`, a female persona's `out_shopping`, or the separation she asked for), a text turn without a user action or `image.force` ghosts before the PDE: the row is marked ghosted and the ghost frames are yielded, and neither the judge nor `record_ghost` runs. See [ghost-mechanics.md](ghost-mechanics.md#ghosting-the-engine-imposes).
 
 **PDE action list.** The judge's (or rule engine's) per-turn action is one of
 `reply_text` | `ghost` | `reply_image` | `reply_text_image` | `product_qa`.

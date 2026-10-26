@@ -495,7 +495,7 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 | `composed_prompt` | `String` | 最终发给图像服务的提示词的 UTF-8 字节的 base64（`STANDARD`，无换行）。在最后一跳解码后原样用作图像服务的文本提示词，不要再重建任何提示词逻辑。|
 | `image_ref` | `"face"` \| `"previous"` | 计划选择的参考图；实际 URL 由消费方解析。|
 | `aspect_ratio` | `String` \| 不存在 | 语义画幅（`1:1`,`3:4`,`4:3`,`9:16`,`16:9`）或不存在。画幅→分辨率映射由消费方负责，引擎不发送宽高。|
-| `companion` | `{member_session_id, instance_id}` \| 不存在 | [群聊](group-chat.zh.md#导演)图片轮里导演安排了同框成员时才有：再取那位角色的脸参考图，两人一起画。1:1 轮次和只有一个人的群聊图都没有。|
+| `companion` | `{member_session_id, instance_id}` \| 不存在 | [群聊](group-chat.zh.md#导演)图片轮里导演安排了同框成员时才有：再取那位角色的脸参考图，两人一起画。1:1 轮次、只有一个人的群聊图，以及合成器退回单人肖像时都没有。|
 
 **完整 SSE 帧序列：**
 
@@ -884,7 +884,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 角色只在 ghost 保护允许的地方才会这样沉默：部署的 ghosting 开关关闭（`ghosting = false`）时不会抽到任何离线类种类，已经在进行的一段也不再让轮次沉默，
 用户消息不足 10 条的会话里也不会抽到；调用方完全不想要它们，就在 `kinds` 里不写。这样被 ghost 的消息没有回执（没有判官读过它），
 角色解释之后它依然没有回执。事件结束后，在用户消息被 ghost 过的会话里，角色的下一条消息——回复、`/open` 开场白或事件消息——
-会按这一种的说法解释：她刚才睡着了、在忙、在打一场硬仗、在逛街、在兄弟或姐妹的聚会上，或没看手机，对方那时发来的消息她现在才看到。
+会按这一种的说法解释：她刚才睡着了、在忙、在打一场硬仗、在逛街、在兄弟或姐妹的聚会上、在做爱，或没看手机，对方那时发来的消息她现在才看到。
 `busy`、`in_battle` 或 `out_shopping` 开始时讲的那条消息不算解释：它写在事件结束之前。她在那里写过一条带文字的消息之后，这件事就了结了；只有图的回复不算。机制见
 [ghost-mechanics.zh.md](ghost-mechanics.zh.md#engine-强制的-ghost)。
 
@@ -1073,7 +1073,7 @@ SSE 帧是整轮最后一帧且只走线上——在它发出前断线，光看 
 `history` 相同。
 
 ```json
-{ "message_id": "01J…", "composed_prompt": "5YaZ5a6e…", "image_ref": "previous", "aspect_ratio": "3:4",
+{ "message_id": "01J…", "composed_prompt": "5YaZ5a6e…", "image_ref": "face", "aspect_ratio": "3:4",
   "companion": {"member_session_id": "…", "instance_id": "…"} }
 ```
 

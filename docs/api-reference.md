@@ -588,7 +588,7 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 | `composed_prompt` | `String` | base64(`STANDARD`, unwrapped) of the UTF-8 final wire prompt. Decode at the last hop and use verbatim as the provider text prompt — reconstruct no prompt logic. |
 | `image_ref` | `"face"` \| `"previous"` | Which reference image the plan chose; the consumer resolves the actual URL. |
 | `aspect_ratio` | `String` \| absent | The semantic aspect (`1:1`,`3:4`,`4:3`,`9:16`,`16:9`) or absent. The consumer owns aspect→resolution mapping; no width/height is sent. |
-| `companion` | `{member_session_id, instance_id}` \| absent | On a [group](group-chat.md#the-director) image turn whose director seated a second person: fetch that persona's face reference too and draw both. Absent on every 1:1 turn and on a group turn with one person in the picture. |
+| `companion` | `{member_session_id, instance_id}` \| absent | On a [group](group-chat.md#the-director) image turn whose director seated a second person: fetch that persona's face reference too and draw both. Absent on every 1:1 turn, on a group turn with one person in the picture, and when the composer fell back to the speaker's solo portrait. |
 
 **Full SSE frame sequences:**
 
@@ -1093,8 +1093,8 @@ leaves them out of `kinds`. A message ghosted this way carries no read receipt
 the event is over, in a session where the user's messages were ghosted, the
 persona's next message — a reply, an `/open` greeting or an event message —
 explains it in the kind's words: she was asleep, busy, in the thick of a hard
-fight, shopping, at a gathering of her brothers or sisters or not looking at her
-phone, and only now sees what was sent. The
+fight, shopping, at a gathering of her brothers or sisters, having sex, or not
+looking at her phone, and only now sees what was sent. The
 announcement of `busy`, `in_battle` or `out_shopping` does not count as the explanation: it was
 written before the event ended. After she has written a message with text there,
 that is done; an image-only reply does not count. The mechanics are in
@@ -1350,7 +1350,7 @@ stream clients that disconnected before the frame fired). Auth and session
 ownership checks are the same as `history`.
 
 ```json
-{ "message_id": "01J…", "composed_prompt": "5YaZ5a6e…", "image_ref": "previous", "aspect_ratio": "3:4",
+{ "message_id": "01J…", "composed_prompt": "5YaZ5a6e…", "image_ref": "face", "aspect_ratio": "3:4",
   "companion": {"member_session_id": "…", "instance_id": "…"} }
 ```
 
