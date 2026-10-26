@@ -759,7 +759,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | `event_key` | 必填：1–128 个 `[A-Za-z0-9_.:-]` 字符，只在本会话内有效。同一个 key 返回同一个事件 |
 | `kinds` | 选填。不带或 `null`：全部种类。数组：只抽列出的种类（`[]`：什么都不抽）。对象 `{"allow": […], "disallow": […]}`：`allow` 允许的种类（不带或 `null`：全部；`[]`：一种都没有）去掉 `disallow` 列出的种类；两边都列了的种类不抽，`{}` 等于全部种类。对象里出现未知的键，或出现未知种类，返回 `422`；写了 `taking_space` 或 `fell_out` 同样返回 `422`：它们由 engine 自己写入，从不抽取 |
 | `user_timezone`、`user_country`、`user_region`、`tier`、`prompt_traits`、`memory_scope`、`affinity_scope`、`audit` | 与 `/open` 相同，用于生成这条消息 |
-| `image` | 选填：`{"style", "aspect_ratio", "prompt_variant"}`，各字段与聊天回合的 `image` 相同（没有 `force`）。表示调用方能处理图：部署配了 `[tasks.chat_image_prompt_compose]` 时，`taking_selfie` 的消息会带上她的图（见下）。不带、或没配 composer：只有文字。其他种类忽略它 |
+| `image` | 选填：`{"style", "aspect_ratio", "prompt_variant"}`，各字段与聊天回合的 `image` 相同（没有 `force`；不支持的 `aspect_ratio` 返回 `422`）。表示调用方能处理图：部署配了 `[tasks.chat_image_prompt_compose]` 时，`taking_selfie` 的消息会带上她的图（见下）。不带、或没配 composer：只有文字。其他种类忽略它 |
 | `outfit` | 选填：她穿什么，与聊天回合相同——通常是她衣橱里的一项，不做核对；去掉首尾空白后 1–64 个字符，空白等于不带，超长返回 `422`。她的话会跟着这身衣服，图也会。不带：prompt 里没有穿着，composer 按场景给她穿 |
 
 种类分四个类别（`category`）。`short` 与 `mid` 是插曲；`body` 与 `trip` 是持续数天的背景，背景进行期间插曲照样会发生。

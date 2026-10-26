@@ -2400,7 +2400,7 @@
             }
           },
           "422": {
-            "description": "unknown kind, `taking_space` or `fell_out` in `kinds`, or another malformed body field"
+            "description": "unknown kind, `taking_space` or `fell_out` in `kinds`, an `outfit` over 64 chars, an unsupported `image.aspect_ratio`, or another malformed body field"
           },
           "429": {
             "description": "per-user in-flight cap reached"

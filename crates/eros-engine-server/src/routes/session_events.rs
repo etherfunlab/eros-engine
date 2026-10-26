@@ -32,8 +32,8 @@ use crate::routes::companion::{
     LlmAuditDto, PromptTraitDto,
 };
 use crate::routes::companion_stream::{
-    resolve_text_turn, validate_tier, validated_outfit, AffinityScopeDto, ImageReplyParams,
-    StreamPreErrorBody,
+    resolve_text_turn, validate_image_params, validate_tier, validated_outfit, AffinityScopeDto,
+    ImageReplyParams, StreamPreErrorBody,
 };
 use crate::routes::session_open::GreetingDto;
 use crate::state::AppState;
@@ -520,6 +520,7 @@ async fn respond(
         (status = 404, body = StreamPreErrorBody),
         (status = 409, body = StreamPreErrorBody),
         (status = 422, description = "unknown kind, `taking_space` or `fell_out` in `kinds`, \
+            an `outfit` over 64 chars, an unsupported `image.aspect_ratio`, \
             or another malformed body field"),
         (status = 429, description = "per-user in-flight cap reached"),
         (status = "5XX", description = "companion chain exhausted; the provider's own status \
@@ -580,6 +581,7 @@ pub(crate) async fn draw_event_at(
             original_user_message_id: None,
         })
     })?;
+    validate_image_params(req.image.clone().map(ImageReplyParams::from).as_ref())?;
     let key = req.event_key.clone();
     let well_formed = (1..=MAX_EVENT_KEY_CHARS).contains(&key.len())
         && key
@@ -2563,6 +2565,42 @@ mod tests {
         assert!(!c[0].to_string().contains("此刻的穿着"), "{}", c[0]);
         let m = out.message.expect("a message");
         assert!(row_meta(&pool, m.message_id).await.get("outfit").is_none());
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_unsupported_aspect_ratio_is_422(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        let state = with_companion_and_composer(test_state(pool.clone()), &mock.uri());
+        let err = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            DrawEventRequest {
+                image: Some(EventImageParams {
+                    aspect_ratio: Some("2:1".into()),
+                    ..Default::default()
+                }),
+                ..req("k1", Some(vec![EventKindDto::TakingSelfie]))
+            },
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .expect_err("rejected");
+        assert!(
+            matches!(
+                err,
+                AppError::StreamPre(StreamPreError {
+                    status: StatusCode::UNPROCESSABLE_ENTITY,
+                    code: "unprocessable",
+                    ..
+                })
+            ),
+            "{err:?}"
+        );
+        assert!(calls(&mock).await.is_empty());
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
