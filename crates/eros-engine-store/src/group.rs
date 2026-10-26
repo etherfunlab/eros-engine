@@ -821,8 +821,19 @@ mod tests {
             &pool,
             g.id,
             "user",
-            "\n  嗨  \n",
+            "\n  v嗨v  \n",
             None,
+            None,
+            serde_json::json!({}),
+            30,
+        )
+        .await;
+        row(
+            &pool,
+            g.id,
+            "assistant",
+            "\n\t\n",
+            Some(a),
             None,
             serde_json::json!({}),
             20,
@@ -832,7 +843,7 @@ mod tests {
             &pool,
             g.id,
             "assistant",
-            "\n\t\n",
+            "\u{000b}",
             Some(a),
             None,
             serde_json::json!({}),
@@ -846,7 +857,13 @@ mod tests {
             .unwrap()
             .last_message
             .unwrap();
-        assert_eq!(got.role, "user", "a newline-only row is not visible");
-        assert_eq!(got.preview, "嗨");
+        assert_eq!(
+            got.role, "user",
+            "newline-only and vertical-tab-only rows are not visible"
+        );
+        assert_eq!(
+            got.preview, "v嗨v",
+            "a literal v is content, not whitespace"
+        );
     }
 }
