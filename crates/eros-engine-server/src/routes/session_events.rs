@@ -506,6 +506,13 @@ async fn respond(
 /// `away_from_phone`, `asleep`, `having_sex` and the gatherings, the event comes back with
 /// `message: null`. For any other persona `out_shopping` is not offline and
 /// is announced at every rung. The same `event_key` returns the same event.
+///
+/// With `image` in the request and `[tasks.chat_image_prompt_compose]`
+/// configured, a `taking_selfie` message also carries her picture: her words
+/// are written first, the composer draws from them, and the response's
+/// `image_request` is the `image-request` route's payload (absent without a
+/// picture). `outfit` dresses her as on a chat turn, in her words and in the
+/// picture.
 #[utoipa::path(
     post,
     path = "/v2/comp/session/{session_id}/events",
@@ -2249,6 +2256,91 @@ mod tests {
         assert_eq!(marker["image_ref"], json!("face"));
         let (source, status, _) = compose_row(&pool, &marker).await;
         assert_eq!((source.as_str(), status.as_str()), ("event", "ok"));
+    }
+
+    /// A lingering accepted give reaches her picture's `[身体状态]` and the
+    /// audit `inputs.body_state`.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_selfie_picture_hears_her_body_state(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata, sent_at) \
+             VALUES ($1, 'user', '', $2, now() - make_interval(mins => 1))",
+        )
+        .bind(session_id)
+        .bind(json!({"action": {"type": "give", "item": "cigarette", "quantity": 1, "response": "accept"}}))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "刚拍的").await;
+        mount_composer(&mock, "叼着烟自拍", "叼烟自拍").await;
+        let state = with_companion_and_composer(test_state(pool.clone()), &mock.uri());
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            selfie_req("k1", true),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        let c = calls(&mock).await;
+        let payload = last_content(&c[1]);
+        assert!(
+            payload.contains("[身体状态]\n1 支烟，烟劲很足，正在劲头上"),
+            "{payload}"
+        );
+        let m = out.message.expect("a message");
+        let marker = row_meta(&pool, m.message_id).await["image"].clone();
+        let (_, _, inputs) = compose_row(&pool, &marker).await;
+        assert_eq!(inputs["body_state"], json!("1 支烟，烟劲很足，正在劲头上"));
+    }
+
+    /// A selfie drawn during a trip is told from inside it, and still says
+    /// she sent the picture.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_selfie_during_a_trip_is_sent_from_the_trip(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (instance_id, session_id) = setup(&pool, user_id).await;
+        let started = Utc::now() - chrono::Duration::hours(2);
+        EventRepo { pool: &pool }
+            .insert(
+                &eros_engine_store::events::NewEvent {
+                    instance_id,
+                    session_id,
+                    event_key: "trip",
+                    kind: EventKind::ShortTrip,
+                    started_at: started,
+                    ends_at: started + chrono::Duration::hours(48),
+                },
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "在海边拍的").await;
+        mount_composer(&mock, "海边自拍", "海边自拍").await;
+        let state = with_companion_and_composer(test_state(pool.clone()), &mock.uri());
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            selfie_req("k1", true),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        assert!(out.image_request.is_some());
+        let c = calls(&mock).await;
+        assert_eq!(
+            last_content(&c[0]),
+            "（你正在短途旅行。你刚拍了一张自拍，发给了对方。）"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
