@@ -43,9 +43,9 @@ use crate::pipeline::stream::{
     build_delegated_image_marker, build_delegated_image_prompt_for, recent_transcript,
     split_failures,
 };
-use crate::routes::companion_stream::ImageReplyParams;
 use crate::pipeline::{compute_signals_for_session, record_generation, GenerationRecord};
 use crate::prompt::NowContext;
+use crate::routes::companion_stream::ImageReplyParams;
 use crate::state::AppState;
 
 /// Speaking first is the engine's decision (spec §6.1), delivered as a stage
@@ -677,14 +677,8 @@ mod tests {
             for k in EventKind::ALL {
                 for rung in 1..=3 {
                     if is_told(k, rung, &persona) {
-                        let _ = kind_cue(
-                            k,
-                            Duration::hours(1),
-                            rung,
-                            &persona,
-                            Some("傲娇"),
-                            false,
-                        );
+                        let _ =
+                            kind_cue(k, Duration::hours(1), rung, &persona, Some("傲娇"), false);
                     }
                 }
             }

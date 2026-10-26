@@ -35,9 +35,9 @@ use crate::routes::companion_stream::{
     resolve_text_turn, validate_tier, validated_outfit, AffinityScopeDto, ImageReplyParams,
     StreamPreErrorBody,
 };
-use eros_engine_llm::model_config::StyleKey;
 use crate::routes::session_open::GreetingDto;
 use crate::state::AppState;
+use eros_engine_llm::model_config::StyleKey;
 
 /// Same per-user in-flight cap as every other LLM entry point.
 const CONCURRENT_STREAMS_PER_USER: u32 = 3;
@@ -836,8 +836,15 @@ mod tests {
     }
 
     /// The compose audit row a marker names: (source, status, inputs).
-    async fn compose_row(pool: &PgPool, marker: &serde_json::Value) -> (String, String, serde_json::Value) {
-        let id: Uuid = marker["compose_event_id"].as_str().unwrap().parse().unwrap();
+    async fn compose_row(
+        pool: &PgPool,
+        marker: &serde_json::Value,
+    ) -> (String, String, serde_json::Value) {
+        let id: Uuid = marker["compose_event_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
         sqlx::query_as("SELECT source, status, inputs FROM engine.chat_images_events WHERE id = $1")
             .bind(id)
             .fetch_one(pool)
@@ -2262,7 +2269,10 @@ mod tests {
         .unwrap();
         let c = calls(&mock).await;
         assert_eq!(c.len(), 1);
-        assert_eq!(last_content(&c[0]), "（你刚拍了一张自拍，想发给对方看看。）");
+        assert_eq!(
+            last_content(&c[0]),
+            "（你刚拍了一张自拍，想发给对方看看。）"
+        );
         assert!(out.image_request.is_none());
         let m = out.message.expect("a message");
         assert!(row_meta(&pool, m.message_id).await.get("image").is_none());
@@ -2287,7 +2297,10 @@ mod tests {
         .unwrap();
         let c = calls(&mock).await;
         assert_eq!(c.len(), 1);
-        assert_eq!(last_content(&c[0]), "（你刚拍了一张自拍，想发给对方看看。）");
+        assert_eq!(
+            last_content(&c[0]),
+            "（你刚拍了一张自拍，想发给对方看看。）"
+        );
         assert!(out.message.is_some() && out.image_request.is_none());
     }
 
@@ -2483,9 +2496,16 @@ mod tests {
         .await
         .unwrap();
         let c = calls(&mock).await;
-        assert!(c[0].to_string().contains("- 此刻的穿着：红色旗袍"), "{}", c[0]);
+        assert!(
+            c[0].to_string().contains("- 此刻的穿着：红色旗袍"),
+            "{}",
+            c[0]
+        );
         let m = out.message.expect("a message");
-        assert_eq!(row_meta(&pool, m.message_id).await["outfit"], json!("红色旗袍"));
+        assert_eq!(
+            row_meta(&pool, m.message_id).await["outfit"],
+            json!("红色旗袍")
+        );
 
         // With a picture: the composer dresses her in it too.
         let user_id = Uuid::new_v4();
@@ -2563,8 +2583,7 @@ mod tests {
             rolls(0.5),
         )
         .await
-        .err()
-        .expect("rejected");
+        .expect_err("rejected");
         assert!(
             matches!(
                 err,
