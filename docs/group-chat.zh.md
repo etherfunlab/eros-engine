@@ -202,7 +202,7 @@ final
 | `reasoning` | `{content}`：一段推理增量 |
 | `cast` | `{speakers: [{member_session_id, action_type}]}`；`action_type` 用 `meta` 的线上取值 `reply` / `reply_image` / `reply_text_image`。规则兜底之后同样会发，客户端始终能显示谁即将发言 |
 | `meta` | 群聊轮次多一个 `speaker_session_id`；1:1 轮次省略，帧不变 |
-| `delta` / `done` / `image_request` | 不变，以 `message_id` 为键 |
+| `delta` / `done` / `image_request` | 不变，以 `message_id` 为键；双人图的 `image_request` 多一个 `companion` |
 | `speaker_error` | `{speaker_session_id, code, message}`；非终止。它是新帧而不是 `error` 的变体，因为客户端把 `error` 当作轮次结束 |
 | `final` | 与 1:1 形状相同；计数在各发言者之间求和，`filtered` / `prompt_injected` 只要有一位发言者为真就为真，`llm_attempts` / `gateway_errors` 汇总导演、每位发言者和图片合成器失败的尝试 |
 
@@ -215,7 +215,7 @@ final
 | 导演失败、返回空或未配置 | 规则兜底；审计行记录状态 |
 | 某位发言者的链用尽 | `meta → done{truncated:true} → speaker_error`（尝试行照 1:1 的方式落库）；接力继续，轮到下一位 |
 | 某位发言者的请求构建失败，或图片行落库失败 | 只发一个 `speaker_error`；接力继续，轮到下一位 |
-| 图片合成器失败 | 文字部分照常落库，不发 `image_request` |
+| 图片合成器失败 | 文字部分照常落库；`image_request` 带发言人的单人肖像兜底，不带 `companion` |
 | 没有任何发言者产出回复 | 流以 `error` 帧结束，不发 `final`，也不运行 post-process |
 | `CHAT_QUEUE_GEN_TIMEOUT_SECS` 到期 | 导演和所有发言者共用一份预算。已经说完的发言者保留，其余跳过，终止帧是 `error generation_timeout`。不运行 post-process：已说完的发言者的话留在历史里，但这一轮用户说的话不会进入任何成员的记忆和 insights |
 | 结算 | 只要有一条 assistant 行落库，这一轮就结算为 `done`；一条都没有时才写 `system_error` 通知，该通知不带发言者 |

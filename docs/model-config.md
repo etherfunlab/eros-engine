@@ -796,7 +796,13 @@ standalone `POST /persona/{instance_id}/image/compose` endpoint (see
 [api-reference.md](api-reference.md)) runs this same task with the same
 seven-slot payload (`[人物外观] / [此刻穿着] / [身体状态] / [最近场景] / [对方最新消息] / [风格] / [画幅]`)
 and the same `filter_prompt` contract — a deployment's custom prompt needs no
-changes to serve both. Two behavioural differences on the endpoint side: the
+changes to serve both. On a [group](group-chat.md#the-director) image turn
+whose director seated a second person, the payload gains one more section,
+`[同框人物]`, after `[此刻穿着]`: that person's name, appearance and
+personality, and the line `这张图里有两个人：{speaker} 和 {companion}。`. The
+built-in prompt knows it; a custom prompt that only depicts the character
+should be told to show both people when the section is present, since the
+`image_request` frame then carries a second face reference. Two behavioural differences on the endpoint side: the
 `[最近场景]` slot is filled from the request's `scene` field instead of the
 conversation history, and there is **no portrait fallback** — a fully failed
 chain is an HTTP error carrying the provider's own status (the endpoint doubles

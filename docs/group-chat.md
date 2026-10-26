@@ -246,7 +246,7 @@ after the first frame.
 | `reasoning` | `{content}`: a reasoning delta |
 | `cast` | `{speakers: [{member_session_id, action_type}]}`; `action_type` uses the `meta` wire values `reply` / `reply_image` / `reply_text_image`. Emitted after the rule fallback too, so a client can always show who is about to speak |
 | `meta` | gains `speaker_session_id` on group turns; omitted on 1:1 turns, whose frames are unchanged |
-| `delta` / `done` / `image_request` | unchanged, keyed by `message_id` |
+| `delta` / `done` / `image_request` | unchanged, keyed by `message_id`; `image_request` gains `companion` on a picture of two |
 | `speaker_error` | `{speaker_session_id, code, message}`; non-terminal. A new frame rather than an `error` variant, because clients treat `error` as the end of the turn |
 | `final` | the 1:1 shape; counters are summed over speakers, `filtered` / `prompt_injected` are true if any speaker's was, and `llm_attempts` / `gateway_errors` collect the failed attempts of the director, every speaker and any image composer |
 
@@ -260,7 +260,7 @@ as a "thinking" indicator is the client's decision.
 | Director fails, is empty or is absent | Rule fallback; the audit row records the status |
 | One speaker's chain is exhausted | `meta → done{truncated:true} → speaker_error` (the attempt row is persisted, as on 1:1); the relay continues with the next speaker |
 | A speaker's request cannot be built, or its image row cannot be persisted | A bare `speaker_error`; the relay continues with the next speaker |
-| The composer fails | The text half lands; no `image_request` |
+| The composer fails | The text half lands; the `image_request` carries the speaker's portrait fallback and no `companion` |
 | No speaker produced a reply | The stream ends with an `error` frame instead of `final`, and no post-process runs |
 | `CHAT_QUEUE_GEN_TIMEOUT_SECS` expires | One budget covers the director and every speaker. Speakers who finished stay persisted, the rest are skipped, and the terminal frame is `error generation_timeout`. No post-process runs: the finished speakers' lines stay, but the user's line reaches no member's memory or insights for that turn |
 | Settle | The turn settles `done` if any assistant row landed. A `system_error` notice, which carries no speaker, is written only when none did |

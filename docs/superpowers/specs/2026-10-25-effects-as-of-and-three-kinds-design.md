@@ -47,13 +47,13 @@ construction; a test pins it.
 |---|---|---|---|---|---|---|---|---|
 | `admiring_scenery` | 在看风景 | `short` | 2 | 24 h | 1 h | no | yes | none |
 | `admiring_art` | 在看展 | `short` | 1 | 48 h | 1 h | no | yes | none |
-| `taking_selfie` | 发了张自拍 | `short` | 2 | 24 h | 30 min | no | yes | none |
+| `taking_selfie` | 刚拍了张自拍 | `short` | 2 | 24 h | 30 min | no | yes | none |
 | `on_the_road` | 在路上 | `mid` | 2 | 24 h | 2 to 4 h | no | yes | none |
 | `watching_match` | 在看比赛 | `mid` | 2 | 24 h | 2 to 3 h | no | yes | none |
 | `watching_show` | 在看表演 | `mid` | 1 | 72 h | 2 to 3 h | no | yes | none |
 | `having_sex` | 在做爱 | `mid` | 1 | 48 h | 1 to 2 h | every persona | never | none |
 
-All seven join the `kinds` filter vocabulary; the three `mid` kinds join
+All seven join the `kinds` filter vocabulary; the four `mid` kinds join
 the `prefer_events` vocabulary. The drawable count goes from 43 to 50.
 
 ### 2.0 The four told incidents of the day
@@ -121,9 +121,9 @@ serves only to some users through `disallow`.
 
 ### 2.4 What does not change
 
-No needs factor touches the three. No persona setting beyond
+No needs factor touches the seven. No persona setting beyond
 `prefer_events`. The categories' weights and cooldowns, the two-stage draw
-and the one-incident rule stand. All three reach the story director like
+and the one-incident rule stand. All seven reach the story director like
 any other kind (`2026-10-23-life-events-world-wiring-design.md` §3.1),
 `having_sex` included: what happened in her life happened, and who she was
 with is for the director to settle against her `romance_history`. No

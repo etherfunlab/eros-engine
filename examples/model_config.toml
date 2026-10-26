@@ -335,7 +335,9 @@ model_name_display_override = true
 # When this block is present, after an image action is decided the engine
 # generates one image prompt from turn context: it feeds the persona appearance
 # + current outfit + body state + recent scene + the partner's latest message + chosen aspect ratio + style to
-# this model and uses the result as the image subject. Omit the block entirely
+# this model and uses the result as the image subject. On a group image turn
+# with a companion, one more labeled section ([同框人物]) names the second
+# person in the picture; a custom prompt should depict both when it is present. Omit the block entirely
 # and image turns stay unavailable. Fail-open: on failure / timeout / empty
 # reply it falls back to an empty subject (a plain persona-appearance
 # portrait), so it never blocks the image turn (and never advances any
