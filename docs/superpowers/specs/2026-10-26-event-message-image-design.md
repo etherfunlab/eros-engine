@@ -159,14 +159,14 @@ The route is not streamed; the composer adds one serial hop to its latency.
 
 - The type is the restore route's `ImageRequestPayloadResponse`, same fields
   and encoding (`composed_prompt` is base64 of the UTF-8 wire prompt).
-- It is `null` when the message carries no picture, like `event` and
-  `message` when nothing was drawn.
+- It is absent when the message carries no picture, so a response without
+  one keeps today's shape.
 - It is rebuilt from the stored row in `respond()`, by the same logic as
   `GET …/image-request` (extract it into one shared function). So a replay
   of the same `event_key` returns it too, and the composed prompt keeps its
   one home on the compose audit row.
 - A row whose compose audit write failed (fail-open) has the marker but no
-  recoverable prompt: `image_request` is null, matching the restore route's
+  recoverable prompt: `image_request` is absent, matching the restore route's
   404 for the same row.
 
 `GreetingDto` is unchanged.

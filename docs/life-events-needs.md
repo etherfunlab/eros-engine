@@ -633,8 +633,10 @@ Six told incidents give her an afternoon the user hears about: `admiring_scenery
 4 h: a long commute, a coach, a train, a flight; `on_the_way` stays the 30-minute errand),
 `watching_match` and `watching_show` (`mid`, 2 to 3 h). She keeps replying through all of
 them. The cue states the fact and the details are hers: which view, which piece, which
-sport, which vehicle. `taking_selfie` is words only: the message tells of the photo and no
-image is composed. `watching_match` and `taking_selfie` are drawn in hospital; the other
+sport, which vehicle. When the request carries `image` and the deployment configures the
+composer, a `taking_selfie` message carries the selfie: her words come first and the composer
+draws from them (see [api-reference](api-reference.md#post-v2compsessionsession_idevents));
+otherwise it is words only. `watching_match` and `taking_selfie` are drawn in hospital; the other
 four need her out and about.
 
 ### Next to `/open`

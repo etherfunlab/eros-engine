@@ -784,7 +784,9 @@ affinity movement, no insight or memory extraction. Two opt-ins widen that:
 Without `persist_instruction` the
 new row inherits the source's `user_message_id` — the edit belongs to the turn
 the original picture answered; with it, the new row's `user_message_id` is the
-persisted instruction message.
+persisted instruction message. A life event's picture (`POST …/events`) answers
+no user message, so editing one needs `persist_instruction: true`; without it
+the call is a `409`.
 
 | Status | Meaning |
 |---|---|
@@ -792,7 +794,7 @@ persisted instruction message.
 | 401 | missing or invalid bearer |
 | 403 | not your session; `byoc_forbidden` (the caller secret is missing or wrong); `byoc_card_rejected` (the card does not open under the instance's key) |
 | 404 | unknown session, or no such message in it |
-| **409** | the message exists but is not an image turn; or the session is a group session (`message` contains `wrong_channel`) |
+| **409** | the message exists but is not an image turn; or it answers no user message (a life event's picture) and `persist_instruction` is not set; or the session is a group session (`message` contains `wrong_channel`) |
 | 422 | blank `instruction`, or unsupported `aspect_ratio` |
 | 501 | neither `[tasks.chat_image_edit_compose]` nor `[tasks.chat_image_prompt_compose]` is configured |
 | 429 | per-user in-flight cap reached (3, shared with chat/voice/compose) |
@@ -926,6 +928,8 @@ How the draw works and how events and the persona's needs fit together is in
 | `event_key` | required: 1–128 characters of `[A-Za-z0-9_.:-]`, scoped to the session. The same key returns the same event |
 | `kinds` | optional. Absent or `null`: every kind. An array allows the listed kinds (`[]`: nothing is drawn). An object `{"allow": […], "disallow": […]}` allows what `allow` lists (absent or `null`: every kind; `[]`: none) minus what `disallow` lists; a kind in both is not drawn, and `{}` allows every kind. An unknown key in the object or an unknown kind is a `422`, and so is `taking_space` or `fell_out`: the engine places those itself and never draws them |
 | `user_timezone`, `user_country`, `user_region`, `tier`, `prompt_traits`, `memory_scope`, `affinity_scope`, `audit` | as on `/open`, for generating the message |
+| `image` | optional: `{"style", "aspect_ratio", "prompt_variant"}`, each as on a chat turn's `image` (no `force`). The caller handles images: a `taking_selfie` message then carries her picture, when `[tasks.chat_image_prompt_compose]` is configured (below). Absent, or no composer: words only. Every other kind ignores it |
+| `outfit` | optional: what she wears, as on a chat turn — typically one of her wardrobe entries, not checked against it; 1–64 characters after trim, blank reads as absent, longer is a `422`. Her words follow it, and so does her picture. Absent: no outfit in her prompt, and the composer dresses her from the scene |
 
 Kinds fall into four categories. `short` and `mid` are incidents; `body` and
 `trip` are backgrounds that last days, during which incidents still happen.
@@ -952,7 +956,7 @@ Kinds fall into four categories. `short` and `mid` are incidents; `body` and
 | `short` | `saw_clothes` | 1 h | she has her eye on a piece of clothing (female persona) |
 | `short` | `admiring_scenery` | 1 h | she is taking in a view |
 | `short` | `admiring_art` | 1 h | she is at an exhibition, in front of a piece |
-| `short` | `taking_selfie` | 30 min | she has just taken a selfie and wants to show it (words only; no image is composed) |
+| `short` | `taking_selfie` | 30 min | she has just taken a selfie and wants to show it; with `image` in the request, the message carries it |
 | `mid` | `temp_work` | 4 h | she is called in to work |
 | `mid` | `ex_message` | 3 h | her ex texts her |
 | `mid` | `weather_change` | 4 h | the weather turns |
@@ -1060,6 +1064,27 @@ seconds:
 drawn length. An incident drawn during a background is told from inside it
 (「出差途中遇到一只小猫」). `offline` is `true` for the offline kinds (below)
 and `false` for every other kind.
+
+**Her picture.** A `taking_selfie` drawn with `image` in the request, on a
+deployment that configures `[tasks.chat_image_prompt_compose]`, is told in
+words plus one delegated picture, like a chat turn's `reply_text_image`. Her
+message is written first; the composer then reads it as the end of the recent
+scene, so the picture shows what she says. No user message asked for it, so
+the composer's latest-message slot is empty. A failed composer degrades to a
+plain portrait prompt, as on a chat turn. The response gains `image_request`,
+the payload of [`GET …/image-request`](#get-compchatsession_idmessagesmessage_idimage-request)
+(base64 `composed_prompt`, `image_ref: "face"`, `aspect_ratio`); render it as
+a turn's `image_request` frame. The same `event_key` returns it again. It is
+absent when the message carries no picture, or when its composed prompt was
+never recorded (the audit write is fail-open). The stored message is an image
+row like any other: history flags it with `image: true`. Engine-side this is
+one more serial model call on the route.
+
+```json
+{"event": {"kind": "taking_selfie", "category": "short", "offline": false, "started_at": "2026-10-26T09:00:00Z", "ends_at": "2026-10-26T09:30:00Z", "message_id": "…"},
+ "message": {"message_id": "…", "content": "刚在海边拍的，好看吗", "sent_at": "2026-10-26T09:00:00Z", "occasion": "event"},
+ "image_request": {"message_id": "…", "composed_prompt": "<base64>", "image_ref": "face", "aspect_ratio": "3:4"}}
+```
 
 **Offline kinds.** `away_from_phone`, `busy`, `in_battle`, `asleep`,
 `bros_gathering`, `sis_gathering`, `having_sex` and, for a female persona, `out_shopping` make

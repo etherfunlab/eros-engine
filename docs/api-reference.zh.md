@@ -657,7 +657,8 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 `reply_with_text` 则把整次调用变成一个完整聊天回合（见上）。
 不带 `persist_instruction` 时新行沿用原图行的 `user_message_id` ——
 这次编辑属于原图所回应的那个回合；带上时，新行的 `user_message_id`
-就是落库的那条指令消息。
+就是落库的那条指令消息。生活事件的图（`POST …/events`）不回应任何用户消息，
+所以编辑它必须带 `persist_instruction: true`，不带就返回 `409`。
 
 | 状态码 | 含义 |
 |---|---|
@@ -665,7 +666,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 | 401 | bearer 缺失或无效 |
 | 403 | 不是你的 session；`byoc_forbidden`（caller secret 缺失或不对）；`byoc_card_rejected`（卡片无法在实例的 key 下打开） |
 | 404 | session 不存在，或该 session 里没有这条消息 |
-| **409** | 消息存在，但不是图片回合；或该 session 是群 session（`message` 里含 `wrong_channel`） |
+| **409** | 消息存在，但不是图片回合；或它不回应任何用户消息（生活事件的图）且没带 `persist_instruction`；或该 session 是群 session（`message` 里含 `wrong_channel`） |
 | 422 | `instruction` 空白，或 `aspect_ratio` 不支持 |
 | 501 | `[tasks.chat_image_edit_compose]` 与 `[tasks.chat_image_prompt_compose]` 都没配 |
 | 429 | 达到每用户并发上限（3，与 chat/voice/compose 共用） |
@@ -758,6 +759,8 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | `event_key` | 必填：1–128 个 `[A-Za-z0-9_.:-]` 字符，只在本会话内有效。同一个 key 返回同一个事件 |
 | `kinds` | 选填。不带或 `null`：全部种类。数组：只抽列出的种类（`[]`：什么都不抽）。对象 `{"allow": […], "disallow": […]}`：`allow` 允许的种类（不带或 `null`：全部；`[]`：一种都没有）去掉 `disallow` 列出的种类；两边都列了的种类不抽，`{}` 等于全部种类。对象里出现未知的键，或出现未知种类，返回 `422`；写了 `taking_space` 或 `fell_out` 同样返回 `422`：它们由 engine 自己写入，从不抽取 |
 | `user_timezone`、`user_country`、`user_region`、`tier`、`prompt_traits`、`memory_scope`、`affinity_scope`、`audit` | 与 `/open` 相同，用于生成这条消息 |
+| `image` | 选填：`{"style", "aspect_ratio", "prompt_variant"}`，各字段与聊天回合的 `image` 相同（没有 `force`）。表示调用方能处理图：部署配了 `[tasks.chat_image_prompt_compose]` 时，`taking_selfie` 的消息会带上她的图（见下）。不带、或没配 composer：只有文字。其他种类忽略它 |
+| `outfit` | 选填：她穿什么，与聊天回合相同——通常是她衣橱里的一项，不做核对；去掉首尾空白后 1–64 个字符，空白等于不带，超长返回 `422`。她的话会跟着这身衣服，图也会。不带：prompt 里没有穿着，composer 按场景给她穿 |
 
 种类分四个类别（`category`）。`short` 与 `mid` 是插曲；`body` 与 `trip` 是持续数天的背景，背景进行期间插曲照样会发生。
 
@@ -783,7 +786,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | `short` | `saw_clothes` | 1 小时 | 看中了一件衣服（女性角色） |
 | `short` | `admiring_scenery` | 1 小时 | 在看风景 |
 | `short` | `admiring_art` | 1 小时 | 在看展，停在一件作品前 |
-| `short` | `taking_selfie` | 30 分钟 | 刚拍了张自拍，想给对方看（只有文字，不出图） |
+| `short` | `taking_selfie` | 30 分钟 | 刚拍了张自拍，想给对方看；请求带 `image` 时，消息会带上这张图 |
 | `mid` | `temp_work` | 4 小时 | 临时接到工作 |
 | `mid` | `ex_message` | 3 小时 | 前任发来消息 |
 | `mid` | `weather_change` | 4 小时 | 天气突然变了 |
@@ -865,6 +868,21 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 `message` 的形状与 `/open` 的开场白相同，`occasion` 为 `"event"`。`started_at` 即这条消息的 `sent_at`；
 `ends_at` 是那一刻加上抽到的时长。背景进行期间抽到的插曲，从背景里讲出来（「出差途中遇到一只小猫」）。
 `offline` 对离线类种类（见下）为 `true`，其他种类为 `false`。
+
+**她的图。** 请求带 `image`、部署配了 `[tasks.chat_image_prompt_compose]` 时，抽到的 `taking_selfie`
+用一段文字加一张委托出去的图讲出来，跟聊天回合的 `reply_text_image` 一样。先写她的话；composer 再把这句话当作
+最近场景的最后一行来读，所以图里画的就是她说的。没有用户消息要这张图，所以 composer 的「对方最新消息」槽位为空。
+composer 失败时退回普通的人物肖像 prompt，跟聊天回合一样。响应多出 `image_request`，内容与
+[`GET …/image-request`](#get-compchatsession_idmessagesmessage_idimage-request) 相同（base64 的 `composed_prompt`、
+`image_ref: "face"`、`aspect_ratio`），按聊天回合的 `image_request` 帧去渲染。同一个 `event_key` 会再次返回它。
+消息不带图、或它的合成 prompt 没有记录下来（审计写入是 fail-open 的）时，响应里没有这个字段。存下来的消息就是一条普通的
+图片行：历史记录里标着 `image: true`。engine 这边，这条路由多一次串行的模型调用。
+
+```json
+{"event": {"kind": "taking_selfie", "category": "short", "offline": false, "started_at": "2026-10-26T09:00:00Z", "ends_at": "2026-10-26T09:30:00Z", "message_id": "…"},
+ "message": {"message_id": "…", "content": "刚在海边拍的，好看吗", "sent_at": "2026-10-26T09:00:00Z", "occasion": "event"},
+ "image_request": {"message_id": "…", "composed_prompt": "<base64>", "image_ref": "face", "aspect_ratio": "3:4"}}
+```
 
 **离线类。** `away_from_phone`、`busy`、`in_battle`、`asleep`、`bros_gathering`、`sis_gathering`、`having_sex`，以及女性角色的
 `out_shopping` 持续期间，角色联系不上；对其他角色，`out_shopping` 是一件普通的插曲（`"offline": false`，每一档都讲出来），

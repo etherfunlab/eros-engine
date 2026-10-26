@@ -4378,6 +4378,17 @@
             "type": "string",
             "description": "The caller's idempotency key, scoped to the session: the same key\nreturns the same event. 1–128 chars of `[A-Za-z0-9_.:-]`."
           },
+          "image": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EventImageParams",
+                "description": "The caller handles images: a kind about a photo (`taking_selfie`)\nthen carries her picture, when the deployment configures\n`[tasks.chat_image_prompt_compose]`. Absent: words only."
+              }
+            ]
+          },
           "kinds": {
             "oneOf": [
               {
@@ -4394,6 +4405,14 @@
               "string",
               "null"
             ]
+          },
+          "outfit": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The outfit the persona wears, as on a chat turn: typically one of her\nwardrobe entries, not checked against it. 1–64 chars after trim; blank\nreads as absent. Her words follow it, and so does her picture.",
+            "maxLength": 64
           },
           "prompt_traits": {
             "type": [
@@ -4442,6 +4461,17 @@
               {
                 "$ref": "#/components/schemas/EventView",
                 "description": "The event drawn (or the key's existing one); `null` when nothing\nhappened."
+              }
+            ]
+          },
+          "image_request": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ImageRequestPayloadResponse",
+                "description": "Her picture on the message, the restore route's payload. Absent when\nthe message carries none, or its composed prompt was never recorded."
               }
             ]
           },
@@ -4587,6 +4617,31 @@
           "body",
           "trip"
         ]
+      },
+      "EventImageParams": {
+        "type": "object",
+        "description": "How her picture is composed; each field as on a chat turn's `image`.",
+        "properties": {
+          "aspect_ratio": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "prompt_variant": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Which `[tasks.chat_image_prompt_compose].filter_prompt` variant to use:\nan index (`\"0\"`, `\"1\"`) for the array shape, or a key (`\"a\"`, `\"b\"`)\nfor the table shape. An unknown one falls back to the built-in\ncomposer prompt."
+          },
+          "style": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
       },
       "EventKindDto": {
         "type": "string",
