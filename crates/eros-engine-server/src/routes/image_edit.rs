@@ -657,9 +657,9 @@ async fn edit_image(
         .cloned()
         .ok_or_else(|| AppError::Conflict("not an image turn".into()))?;
     // Without `persist_instruction` the edit belongs to the turn the source
-    // answered, and a source with no turn has nothing to attach to (no engine
-    // path produces one). With it, the new user row is the anchor and the
-    // source's is never read — `None` here means exactly that branch.
+    // answered, and a source with no turn (a life event's picture) has nothing
+    // to attach to. With it, the new user row is the anchor and the source's
+    // is never read — `None` here means exactly that branch.
     let source_user_message_id = if req.persist_instruction {
         None
     } else {
@@ -1271,6 +1271,46 @@ mod tests {
         .await;
         // 409, NOT 404: the message was found; its state forbids the action.
         assert_eq!(status, StatusCode::CONFLICT, "body={body}");
+    }
+
+    /// A life event's picture has no originating user message: without
+    /// `persist_instruction` there is no turn to attach the edit to.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn image_edit_409_for_an_event_picture_without_persist_instruction(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let mid: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata) \
+             VALUES ($1, 'assistant', '刚拍的', $2) RETURNING id",
+        )
+        .bind(session_id)
+        .bind(json!({
+            "proactive": "event",
+            "image": {"prompt": "海边自拍", "caption": "海边自拍", "image_ref": "face"}
+        }))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let mut app = build_router(test_state(pool));
+        let (status, body) = send_request(
+            &mut app,
+            edit_req(
+                session_id,
+                mid,
+                &mint_test_jwt(user_id),
+                json!({"instruction": "换套衣服"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "body={body}");
+        assert!(
+            body.to_string()
+                .contains("source image turn has no originating user message"),
+            "body={body}"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

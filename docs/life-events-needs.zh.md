@@ -509,7 +509,8 @@ ghosting 开关关闭时，已经在进行的一段不会让任何轮次沉默�
 六种会讲出来的插曲，给她一个用户听得到的下午：`admiring_scenery`、`admiring_art`（`short`，1 小时）、`taking_selfie`
 （`short`，30 分钟）、`on_the_road`（`mid`，2 到 4 小时：长途通勤、坐车、坐火车、坐飞机；`on_the_way` 仍是那 30 分钟的赶路）、
 `watching_match` 与 `watching_show`（`mid`，2 到 3 小时）。期间她照常回复。提示只陈述事实，细节由她填：看的什么风景、
-哪件作品、什么比赛、坐的什么。`taking_selfie` 只有文字：消息讲她拍了照，不出图。`watching_match` 和 `taking_selfie`
+哪件作品、什么比赛、坐的什么。请求带 `image`、部署配了 composer 时，`taking_selfie` 的消息带上这张自拍：先写她的话，
+composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2compsessionsession_idevents)）；否则只有文字。`watching_match` 和 `taking_selfie`
 住院也抽；其余四种要她出门。
 
 ### 与 `/open` 的关系

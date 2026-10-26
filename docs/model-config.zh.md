@@ -523,7 +523,7 @@ BYOK hop 使用其请求中 `byok` 块的 `output_regex` 规则，而不是这�
 | `insight_structuring` | `pipeline::post_process::extract_structured_insights`（人类链 stage 2——把 stage 1 挖掘出的事实加上已有的 `human_insights` 行，转成类型化的画像对象。**仅参数，不接受 `filter_prompt`**——它的 prompt 写在 `prompt.rs` 里，必须与它要填的 `human_insights` 列保持同步，所以设置该键会拒绝启动，**任何写法都算，包括显式留空**——与 `affinity_evaluation` 同样处理。块缺失时 stage 2 会退回到 stage 1 的模型/预算，绝不退到全局默认） | live |
 | `chat_output_filter` | `pipeline::stream`，通过 `resolve_output_filter()`（交付前对 chat 回复进行可选的二次改写） | live |
 | `pde_decision` | `pipeline::stream`（通过 `run_pde_decision` 实现的 opt-in LLM 判断器，由 `run_stream` 调用；缺少 `filter_prompt` 或 LLM 调用失败时使用规则引擎） | live（opt-in） |
-| `chat_image_prompt_compose` | `pipeline::stream`（出图 prompt 合成器；**图片轮次必需** —— PDE judge 不再写种子，未配置该任务时引擎报 可发图=否 并把图片动作降级为纯文本。它从当轮上下文生成 prompt，返回 JSON `{prompt, caption}`；`caption` 落到 `metadata.image.caption`，是聊天历史与 judge transcript 实际读取的字段） | live（图片必需） |
+| `chat_image_prompt_compose` | `pipeline::stream`，以及生活事件的图走 `pipeline::proactive`（出图 prompt 合成器；**图片轮次必需** —— PDE judge 不再写种子，未配置该任务时引擎报 可发图=否 并把图片动作降级为纯文本。它从当轮上下文生成 prompt，返回 JSON `{prompt, caption}`；`caption` 落到 `metadata.image.caption`，是聊天历史与 judge transcript 实际读取的字段） | live（图片必需） |
 | `chat_image_edit_compose` | `routes::image_edit`，通过 `resolve_image_edit_compose()`（`POST /v2/comp/session/{session_id}/message/{message_id}/image/edit` 的图片-EDIT 合成器；根据一条指令改写角色已发过的图。**即便对该端点本身也是可选的**——块缺失时端点走 `[tasks.chat_image_prompt_compose]` 的模型链与参数，配上引擎内置的编辑 prompt；两块都缺失时端点回 501） | live（可选） |
 | `chat_vision` | `pipeline::stream`，通过 `resolve_vision()`（视觉预处理阶段：在 reply prompt 前将 `image_url` 附件描述为 JSON；任务块缺失或 `filter_prompt` 为空白时关闭） | live（opt-in） |
 | `group_director` | `pipeline::group`，通过 `resolve_group_director()`（群聊导演：一次流式调用为群聊轮次选出发言者；缺失 ⇒ 所有成员按加入顺序依次发言；任务块存在但 `filter_prompt` 为空白则拒绝启动） | live（opt-in） |
@@ -549,6 +549,7 @@ BYOK hop 使用其请求中 `byok` 块的 `output_regex` 规则，而不是这�
 - `crates/eros-engine-server/src/pipeline/handlers.rs` → `chat_companion`、`chat_output_filter`
 - `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`、`insight_structuring`、`affinity_evaluation`、`affinity_summary`、`character_insight_extraction`、`character_insight_structuring`、`user_insight_extraction`、`user_insight_structuring`
 - `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision`，通过 `run_stream` 内的 `run_pde_decision`（仅当设置了 `filter_prompt`）；`chat_image_prompt_compose`，通过 `resolve_image_prompt_compose()`（出图 prompt 合成器，图片轮次必需，仅在图片轮次按需解析）；`chat_vision`，通过 `resolve_vision()`（视觉预处理阶段，opt-in）；`chat_product_qa`，通过 `resolve_product_qa()`（产品问答执行器，opt-in）；`chat_input_filter`，通过 `resolve_input_filter()`（输入改写，opt-in）；`memory_extraction`，通过 dreaming sweeper
+- `crates/eros-engine-server/src/pipeline/proactive.rs` → `chat_image_prompt_compose`，通过 `build_delegated_image_prompt_for`（`taking_selfie` 事件的图，events 请求带 `image` 时；审计 `source = event`）
 - `crates/eros-engine-server/src/routes/image_edit.rs` → `chat_image_edit_compose`，通过 `resolve_image_edit_compose()`（图片-EDIT 合成器，编辑端点每次请求都会解析；编辑块缺失时回退到 `[tasks.chat_image_prompt_compose]` 的模型链——详见下文）
 
 `embedding` 不走上面这条通用 `resolve()` 路径——它有自己的解析器

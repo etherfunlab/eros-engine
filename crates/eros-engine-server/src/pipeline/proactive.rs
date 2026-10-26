@@ -38,10 +38,14 @@ use ulid::Ulid;
 use uuid::Uuid;
 
 use crate::error::AppError;
-use crate::pipeline::handlers::{build_reply_request, CHAT_TASK};
-use crate::pipeline::stream::split_failures;
+use crate::pipeline::handlers::{build_reply_request, load_effects, CHAT_TASK};
+use crate::pipeline::stream::{
+    build_delegated_image_marker, build_delegated_image_prompt_for, recent_transcript,
+    split_failures,
+};
 use crate::pipeline::{compute_signals_for_session, record_generation, GenerationRecord};
 use crate::prompt::NowContext;
+use crate::routes::companion_stream::ImageReplyParams;
 use crate::state::AppState;
 
 /// Speaking first is the engine's decision (spec §6.1), delivered as a stage
@@ -83,6 +87,11 @@ pub(crate) enum Occasion {
         lasts: chrono::Duration,
         /// The background under way when it was drawn.
         background: Option<EventKind>,
+        /// The message carries her picture, composed with these (spec
+        /// 2026-10-26-event-message-image-design.md §3–§4).
+        image: Option<ImageReplyParams>,
+        /// What she wears (§3a), already validated.
+        outfit: Option<String>,
     },
     /// What she says about the ask-for-space choice (spec
     /// 2026-10-19-life-events-shopping-gatherings-and-ask-for-space-design.md
@@ -151,8 +160,17 @@ impl Occasion {
                 kind,
                 lasts,
                 background,
+                image,
                 ..
-            } => event_cue(*kind, *lasts, *background, rung, traits, tip_personality),
+            } => event_cue(
+                *kind,
+                *lasts,
+                *background,
+                rung,
+                traits,
+                tip_personality,
+                image.is_some(),
+            ),
             Self::LifeChoice(cue) => cue.cue(),
         }
     }
@@ -180,12 +198,15 @@ fn find_cue(measure: &str, noun: &str, rung: u8, tip_personality: Option<&str>) 
 /// The stage cue for a life event (spec 2026-10-15-life-events-v2-design.md
 /// §3.4): states a fact, carries no instruction. A background's cue carries
 /// its length. A kind that is never told (`events::is_told`) has no cue.
+/// `picture`: the message carries her picture (spec 2026-10-26-event-message-
+/// image-design.md §4), so a selfie's cue says she sent it.
 fn kind_cue(
     kind: EventKind,
     lasts: chrono::Duration,
     rung: u8,
     traits: &PersonaTraits,
     tip_personality: Option<&str>,
+    picture: bool,
 ) -> String {
     use EventKind::*;
     let span = crate::prompt::span_text(lasts);
@@ -210,6 +231,7 @@ fn kind_cue(
         SawClothes => find_cue("一件", "衣服", rung, tip_personality),
         AdmiringScenery => "（你正在看眼前的风景，看得有点出神。）".into(),
         AdmiringArt => "（你正在看展，眼前有一件作品让你停了下来。）".into(),
+        TakingSelfie if picture => "（你刚拍了一张自拍，发给了对方。）".into(),
         TakingSelfie => "（你刚拍了一张自拍，想发给对方看看。）".into(),
         OnTheRoad => "（你正在路上，这一趟要走好几个小时。）".into(),
         WatchingMatch => "（你正在看一场比赛。）".into(),
@@ -271,8 +293,9 @@ fn event_cue(
     rung: u8,
     traits: &PersonaTraits,
     tip_personality: Option<&str>,
+    picture: bool,
 ) -> String {
-    let cue = kind_cue(kind, lasts, rung, traits, tip_personality);
+    let cue = kind_cue(kind, lasts, rung, traits, tip_personality, picture);
     match background.and_then(background_state) {
         Some(state) => format!(
             "（{state}。{}）",
@@ -358,7 +381,12 @@ pub(crate) async fn greet(
         context_hints: vec![],
         reply_mode: None,
         nudges: Default::default(),
-        clothing: None,
+        // An event's outfit, as a chat turn's named outfit: in the reply
+        // prompt and, with a picture, the composer's `[此刻穿着]`.
+        clothing: match &g.occasion {
+            Occasion::Event { outfit, .. } => outfit.clone(),
+            _ => None,
+        },
         image_caption: None,
         image_ref: ImageRef::Previous,
         aspect_ratio: None,
@@ -461,9 +489,60 @@ pub(crate) async fn greet(
     }
     let (llm_attempts, gateway_errors) = split_failures(&resp.failures);
 
+    let mut metadata = g.metadata;
+    // Her picture is composed from what she just said (spec 2026-10-26-event-
+    // message-image-design.md §4): the recent scene ends with her message, and
+    // no user message asked for it. Fail-open, as on a chat turn.
+    if let Occasion::Event {
+        image: Some(image), ..
+    } = &g.occasion
+    {
+        let effects = load_effects(&state.pool, g.session_id, None)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(session_id = %g.session_id, "proactive message: lingering effects read failed: {e}");
+                Vec::new()
+            });
+        let body_state = crate::prompt::body_state(&effects);
+        let transcript = recent_transcript(&ChatRepo { pool: &state.pool }, g.session_id).await;
+        let her_line = format!("AI: {content}");
+        let scene = if transcript.is_empty() {
+            her_line
+        } else {
+            format!("{transcript}\n{her_line}")
+        };
+        let img = build_delegated_image_prompt_for(
+            state,
+            g.persona,
+            &plan,
+            Some(image),
+            &scene,
+            "",
+            g.user_id,
+            g.session_id,
+            body_state.as_deref(),
+            None,
+            "event",
+        )
+        .await;
+        metadata.insert(
+            "image".into(),
+            build_delegated_image_marker(
+                &img.subject,
+                img.caption.as_deref(),
+                img.aspect_ratio.as_deref(),
+                img.compose_variant.as_deref(),
+                img.compose_model.as_deref(),
+                img.compose_generation_id.as_deref(),
+                img.compose_event_id,
+                ImageRef::Face,
+                None,
+            ),
+        );
+    }
+
     // An event is written when its message is, not when the request began.
     let event_at = Utc::now();
-    let mut metadata = g.metadata;
     metadata.insert("proactive".into(), g.occasion.name().into());
     match &g.occasion {
         Occasion::Holiday {
@@ -483,7 +562,12 @@ pub(crate) async fn greet(
         Occasion::FirstMeet { open_key } | Occasion::JustOpened { open_key } => {
             metadata.insert("open_key".into(), open_key.as_str().into());
         }
-        Occasion::Event { .. } | Occasion::LifeChoice(_) => {}
+        Occasion::Event { outfit, .. } => {
+            if let Some(o) = outfit {
+                metadata.insert("outfit".into(), o.as_str().into());
+            }
+        }
+        Occasion::LifeChoice(_) => {}
     }
     metadata.insert("prompt_traits".into(), serde_json::json!(injected_tags));
     metadata.insert(
@@ -593,7 +677,8 @@ mod tests {
             for k in EventKind::ALL {
                 for rung in 1..=3 {
                     if is_told(k, rung, &persona) {
-                        let _ = kind_cue(k, Duration::hours(1), rung, &persona, Some("傲娇"));
+                        let _ =
+                            kind_cue(k, Duration::hours(1), rung, &persona, Some("傲娇"), false);
                     }
                 }
             }
@@ -617,7 +702,7 @@ mod tests {
                 "（你在逛街，看到一件特别喜欢的衣服，很想要。代入你「傲娇」的打赏人格，把这份心动告诉对方。）",
             ),
         ] {
-            let cue = |rung, tip| kind_cue(kind, h, rung, &female(), tip);
+            let cue = |rung, tip| kind_cue(kind, h, rung, &female(), tip, false);
             assert_eq!(cue(1, None), rung_one, "{kind:?}");
             assert_eq!(
                 cue(1, Some("傲娇")),
@@ -641,7 +726,7 @@ mod tests {
         let h = Duration::hours(1);
         for rung in [2, 3] {
             assert_eq!(
-                kind_cue(EventKind::OutShopping, h, rung, &female(), None),
+                kind_cue(EventKind::OutShopping, h, rung, &female(), None, false),
                 "（你接下来要出门逛街，这段时间顾不上看手机。）",
                 "rung {rung}"
             );
@@ -653,7 +738,8 @@ mod tests {
                     h,
                     rung,
                     &PersonaTraits::default(),
-                    None
+                    None,
+                    false
                 ),
                 "（你正在外面逛街。）",
                 "rung {rung}"
@@ -760,7 +846,7 @@ mod tests {
             (EventKind::WatchingShow, "（你正在看一场演出。）"),
         ] {
             assert_eq!(
-                kind_cue(kind, h, 1, &PersonaTraits::default(), None),
+                kind_cue(kind, h, 1, &PersonaTraits::default(), None, false),
                 cue,
                 "{kind:?}"
             );
@@ -770,7 +856,7 @@ mod tests {
     #[test]
     fn an_incident_during_a_background_opens_with_its_state() {
         let h = Duration::hours(1);
-        let cue = |kind, bg| event_cue(kind, h, bg, 1, &PersonaTraits::default(), None);
+        let cue = |kind, bg| event_cue(kind, h, bg, 1, &PersonaTraits::default(), None, false);
         assert_eq!(
             cue(EventKind::AnimalEncounter, Some(EventKind::BusinessTrip)),
             "（你正在外地出差。你刚在路上遇到了一只小动物。）"
@@ -794,6 +880,55 @@ mod tests {
     }
 
     #[test]
+    fn a_selfie_with_its_picture_says_she_sent_it() {
+        let h = Duration::hours(1);
+        let d = PersonaTraits::default();
+        assert_eq!(
+            kind_cue(EventKind::TakingSelfie, h, 1, &d, None, true),
+            "（你刚拍了一张自拍，发给了对方。）"
+        );
+        assert_eq!(
+            kind_cue(EventKind::TakingSelfie, h, 1, &d, None, false),
+            "（你刚拍了一张自拍，想发给对方看看。）"
+        );
+        // `picture` is read by the selfie only.
+        for k in [
+            EventKind::Reading,
+            EventKind::AdmiringScenery,
+            EventKind::SawBag,
+        ] {
+            assert_eq!(
+                kind_cue(k, h, 2, &female(), Some("傲娇"), true),
+                kind_cue(k, h, 2, &female(), Some("傲娇"), false),
+                "{k:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_picture_cue_opens_with_the_background() {
+        let cue = |bg| {
+            event_cue(
+                EventKind::TakingSelfie,
+                Duration::minutes(30),
+                Some(bg),
+                1,
+                &PersonaTraits::default(),
+                None,
+                true,
+            )
+        };
+        assert_eq!(
+            cue(EventKind::ShortTrip),
+            "（你正在短途旅行。你刚拍了一张自拍，发给了对方。）"
+        );
+        assert_eq!(
+            cue(EventKind::Hospitalized),
+            "（你正在住院。你刚拍了一张自拍，发给了对方。）"
+        );
+    }
+
+    #[test]
     fn a_false_alarm_during_a_trip_opens_with_the_trip() {
         assert_eq!(
             event_cue(
@@ -802,7 +937,8 @@ mod tests {
                 Some(EventKind::BusinessTrip),
                 1,
                 &PersonaTraits::default(),
-                None
+                None,
+                false
             ),
             "（你正在外地出差。你发现月经推迟了好几天还没来，心里有点慌。）"
         );
@@ -840,7 +976,16 @@ mod tests {
 
     #[test]
     fn a_background_cue_carries_its_length() {
-        let cue = |k, h| kind_cue(k, Duration::hours(h), 1, &PersonaTraits::default(), None);
+        let cue = |k, h| {
+            kind_cue(
+                k,
+                Duration::hours(h),
+                1,
+                &PersonaTraits::default(),
+                None,
+                false,
+            )
+        };
         assert_eq!(
             cue(EventKind::Sick, 30),
             "（你生病了，大概要 30 小时才会好。）"

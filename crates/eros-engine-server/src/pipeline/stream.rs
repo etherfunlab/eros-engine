@@ -3350,9 +3350,30 @@ async fn build_input_filter_transcript(
         )
         .await
         .unwrap_or_default();
+    fold_transcript(rows, Some(current_user_message_id))
+}
+
+/// The newest `INPUT_FILTER_CONTEXT_TURNS` rows of the session, folded as the
+/// judge's transcript: the scene for a picture no user row asked for (a life
+/// event's, spec 2026-10-26-event-message-image-design.md §4). Best-effort:
+/// empty on a DB error.
+pub(crate) async fn recent_transcript(chat_repo: &ChatRepo<'_>, session_id: Uuid) -> String {
+    let rows = chat_repo
+        .history(session_id, INPUT_FILTER_CONTEXT_TURNS, 0)
+        .await
+        .unwrap_or_default();
+    fold_transcript(rows, None).transcript
+}
+
+/// Fold rows (oldest first) into the judge's transcript, leaving out `skip`
+/// and channel-marked rows.
+fn fold_transcript(
+    rows: Vec<eros_engine_store::chat::ChatMessage>,
+    skip: Option<Uuid>,
+) -> JudgeTranscript {
     let mut acc = JudgeTranscriptAcc::default();
     for m in rows {
-        if m.id == current_user_message_id {
+        if Some(m.id) == skip {
             continue;
         }
         // Channel-marked rows (voice / product_qa) are out of companion
@@ -4066,6 +4087,55 @@ pub(crate) async fn build_delegated_image_prompt_with(
     body_state: Option<&str>,
     companion: Option<&ImageCompanionContext>,
 ) -> DelegatedImagePrompt {
+    build_delegated_image_prompt_for(
+        state,
+        persona,
+        plan,
+        req_image,
+        pde_transcript,
+        latest_user_msg,
+        user_id,
+        session_id,
+        body_state,
+        companion,
+        compose_source(plan.action_type),
+    )
+    .await
+}
+
+/// The audit `source` of a chat turn's picture.
+pub(crate) fn compose_source(a: ActionType) -> &'static str {
+    match a {
+        ActionType::ReplyImage => "chat_reply_image",
+        ActionType::ReplyTextImage => "chat_reply_text_image",
+        other => {
+            tracing::warn!(
+                ?other,
+                "image-compose: unexpected action_type for a delegated image turn; \
+                 labelling source as chat_reply_text_image"
+            );
+            "chat_reply_text_image"
+        }
+    }
+}
+
+/// [`build_delegated_image_prompt_with`] with the audit `source` named by the
+/// caller: `event` for a life event's picture (spec 2026-10-26-event-message-
+/// image-design.md §6).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn build_delegated_image_prompt_for(
+    state: &AppState,
+    persona: &eros_engine_core::persona::CompanionPersona,
+    plan: &eros_engine_core::types::ActionPlan,
+    req_image: Option<&crate::routes::companion_stream::ImageReplyParams>,
+    pde_transcript: &str,
+    latest_user_msg: &str,
+    user_id: Uuid,
+    session_id: Uuid,
+    body_state: Option<&str>,
+    companion: Option<&ImageCompanionContext>,
+    source: &'static str,
+) -> DelegatedImagePrompt {
     let inputs = resolve_image_turn_inputs(plan, req_image);
     let style_str = serde_json::to_value(inputs.style)
         .ok()
@@ -4167,18 +4237,6 @@ pub(crate) async fn build_delegated_image_prompt_with(
     let audit_generation_id = compose_generation_id
         .clone()
         .or_else(|| run.last_generation_id.clone());
-    let source = match plan.action_type {
-        ActionType::ReplyImage => "chat_reply_image",
-        ActionType::ReplyTextImage => "chat_reply_text_image",
-        other => {
-            tracing::warn!(
-                ?other,
-                "image-compose: unexpected action_type for a delegated image turn; \
-                 labelling source as chat_reply_text_image"
-            );
-            "chat_reply_text_image"
-        }
-    };
     let (compose_attempts, compose_gateways) = split_failures(&run.failures);
     let compose_event_id = record_compose_event(
         &state.pool,
@@ -9205,6 +9263,50 @@ data: [DONE]\n\n";
 
         let reqs = mock.received_requests().await.expect("recorded requests");
         (reqs, frames)
+    }
+
+    /// The scene for a picture no user row asked for (a life event's): the
+    /// newest rows, folded as the judge's transcript folds them.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn recent_transcript_is_the_newest_rows_without_an_anchor(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        // Oldest first, one minute apart; the product_qa row is the newest.
+        for i in 0..10 {
+            let (role, content) = if i % 2 == 0 {
+                ("user", format!("u{i}"))
+            } else {
+                ("assistant", format!("a{i}"))
+            };
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+                 VALUES ($1, $2, $3, now() - make_interval(mins => $4))",
+            )
+            .bind(session_id)
+            .bind(role)
+            .bind(content)
+            .bind(20 - i)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, channel, sent_at) \
+             VALUES ($1, 'assistant', 'product answer', 'product_qa', now() - interval '1 minute')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // The window is the newest eight rows; the product_qa row takes a
+        // slot and is then left out, as in the judge's transcript.
+        let t = recent_transcript(&ChatRepo { pool: &pool }, session_id).await;
+        let lines: Vec<&str> = t.lines().collect();
+        assert_eq!(lines.len(), 7, "{t}");
+        assert_eq!(lines[0], "AI: a3", "{t}");
+        assert_eq!(lines[6], "AI: a9", "{t}");
+        assert!(!t.contains("product answer"), "{t}");
     }
 
     /// Codex-review P1 regression (PR #216): a forced image turn with the PDE

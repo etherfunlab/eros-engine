@@ -279,6 +279,33 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn the_event_source_is_accepted(pool: PgPool) {
+        let user = Uuid::new_v4();
+        let instance = seed_persona_instance(&pool, user).await;
+        let session = seed_chat_session(&pool, user).await;
+        ImageComposeEventRepo { pool: &pool }
+            .record(ImageComposeEventInsert {
+                source: "event",
+                user_id: user,
+                instance_id: Some(instance),
+                session_id: Some(session),
+                status: "ok",
+                inputs: serde_json::json!({"recent_scene": "AI: 刚拍的", "latest_user_msg": ""}),
+                subject: Some("a selfie by the sea"),
+                caption: Some("海边自拍"),
+                composed_prompt: Some("photorealistic, a selfie by the sea"),
+                variant: None,
+                generation_id: None,
+                attempts: 1,
+                last_failure: None,
+                llm_attempts: None,
+                gateway_errors: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn chat_images_events_has_rls_enabled(pool: PgPool) {
         let enabled: bool = sqlx::query_scalar(
             "SELECT relrowsecurity FROM pg_class \

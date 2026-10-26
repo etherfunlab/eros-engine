@@ -890,6 +890,18 @@ async fn get_image_request_payload(
         .message_by_id_in_session(session_id, message_id)
         .await?
         .ok_or_else(|| AppError::NotFound("no such message".into()))?;
+    Ok(Json(image_request_payload(&state, session_id, &msg).await?))
+}
+
+/// The delegated `image_request` payload rebuilt from a stored row: its
+/// `metadata.image` marker plus the composed prompt on the compose audit row.
+/// `NotFound` when the row is not an image turn or the prompt was never
+/// recorded.
+pub(crate) async fn image_request_payload(
+    state: &AppState,
+    session_id: Uuid,
+    msg: &eros_engine_store::chat::ChatMessage,
+) -> Result<ImageRequestPayloadResponse, AppError> {
     let image = msg
         .metadata
         .as_ref()
@@ -908,8 +920,8 @@ async fn get_image_request_payload(
         .await?
         .ok_or_else(|| AppError::NotFound("prompt unavailable".into()))?;
     use base64::Engine as _;
-    Ok(Json(ImageRequestPayloadResponse {
-        message_id,
+    Ok(ImageRequestPayloadResponse {
+        message_id: msg.id,
         composed_prompt: base64::engine::general_purpose::STANDARD.encode(prompt.as_bytes()),
         image_ref: image
             .get("image_ref")
@@ -923,7 +935,7 @@ async fn get_image_request_payload(
             .get("companion")
             .cloned()
             .and_then(|v| serde_json::from_value(v).ok()),
-    }))
+    })
 }
 
 /// All sessions for the JWT user. The `{user_id}` path parameter MUST
