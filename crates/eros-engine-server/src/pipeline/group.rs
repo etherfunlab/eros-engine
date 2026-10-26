@@ -30,10 +30,11 @@ use crate::pipeline::group_director::{
 use crate::pipeline::post_process::{GroupSpoken, ProducedMessage};
 use crate::pipeline::reasoning_call::JudgeStep;
 use crate::pipeline::stream::{
-    build_delegated_image_marker, build_delegated_image_prompt, build_final_frame,
-    build_image_request_frame, delegated_image_only_frames, drive_chat_burst_for, frame_action_for,
-    image_capability_available, sanitize_inner_state, split_failures_typed, ulid_string,
-    AbortOnDrop, BurstOutcome, CastEntry, PdeStatus, ProtocolFrame, StreamErrorCode,
+    build_delegated_image_marker_with, build_delegated_image_prompt_with, build_final_frame,
+    build_image_request_frame_with, delegated_image_only_frames_with, drive_chat_burst_for,
+    frame_action_for, image_capability_available, sanitize_inner_state, split_failures_typed,
+    ulid_string, AbortOnDrop, BurstOutcome, CastEntry, ImageCompanion, ImageCompanionContext,
+    PdeStatus, ProtocolFrame, StreamErrorCode,
 };
 use crate::repetition::Injected;
 use crate::routes::companion_stream::ImageReplyParams;
@@ -476,9 +477,24 @@ pub(crate) fn run_group_turn(
                 );
             }
 
+            // The second person in the picture, when the director seated one
+            // (spec 2026-10-26-group-two-person-image-design.md §2–§4): what
+            // the composer hears, and who the client fetches a face for.
+            let companion = cue.with.map(|w| &seats[w]);
+            let companion_ctx = companion.map(|c| ImageCompanionContext {
+                name: c.persona.genome.name.clone(),
+                appearance: crate::prompt::meta_str(&c.persona, "appearance").map(str::to_string),
+                personality: c.persona.genome.tip_personality.clone(),
+                speaker_name: seat.persona.genome.name.clone(),
+            });
+            let companion_id = companion.map(|c| ImageCompanion {
+                member_session_id: c.member_session_id,
+                instance_id: c.instance_id,
+            });
+
             // Image only: compose, persist an image row, emit meta/done/image_request.
             if plan.action_type == ActionType::ReplyImage {
-                let img = build_delegated_image_prompt(
+                let img = build_delegated_image_prompt_with(
                     &state,
                     &seat.persona,
                     &plan,
@@ -488,12 +504,16 @@ pub(crate) fn run_group_turn(
                     turn.user_id,
                     turn.group_session_id,
                     None,
+                    companion_ctx.as_ref(),
                 )
                 .await;
                 turn_failures.extend(img.failures.iter().cloned());
+                // A solo portrait (the composer produced no subject) names
+                // no companion: the client must not draw two faces into it.
+                let shown = img.compose_model.is_some().then(|| companion_id.clone()).flatten();
                 let msg_ulid = Ulid::new();
                 let msg_uuid: Uuid = msg_ulid.into();
-                let marker = build_delegated_image_marker(
+                let marker = build_delegated_image_marker_with(
                     &img.subject,
                     img.caption.as_deref(),
                     img.aspect_ratio.as_deref(),
@@ -503,6 +523,7 @@ pub(crate) fn run_group_turn(
                     img.compose_event_id,
                     plan.image_ref,
                     None,
+                    shown.as_ref(),
                 );
                 let row = eros_engine_store::chat::AssistantInsert {
                     id: msg_uuid,
@@ -533,11 +554,12 @@ pub(crate) fn run_group_turn(
                     };
                     continue;
                 }
-                for mut frame in delegated_image_only_frames(
+                for mut frame in delegated_image_only_frames_with(
                     ulid_string(msg_ulid),
                     &img.composed_prompt,
                     plan.image_ref,
                     img.aspect_ratio.as_deref(),
+                    shown,
                 ) {
                     if let ProtocolFrame::Meta {
                         speaker_session_id, ..
@@ -562,17 +584,18 @@ pub(crate) fn run_group_turn(
 
             // Text, or text + image: the composer starts before the chat call.
             let mut compose = if plan.action_type == ActionType::ReplyTextImage {
-                let (st, persona, plan_c, image_c, scene, latest_c) = (
+                let (st, persona, plan_c, image_c, scene, latest_c, ctx_c) = (
                     (*state).clone(),
                     seat.persona.clone(),
                     plan.clone(),
                     turn.image.clone(),
                     transcript.clone(),
                     latest.clone(),
+                    companion_ctx.clone(),
                 );
                 let (uid, gid) = (turn.user_id, turn.group_session_id);
                 AbortOnDrop(Some(tokio::spawn(async move {
-                    build_delegated_image_prompt(
+                    build_delegated_image_prompt_with(
                         &st,
                         &persona,
                         &plan_c,
@@ -582,6 +605,7 @@ pub(crate) fn run_group_turn(
                         uid,
                         gid,
                         None,
+                        ctx_c.as_ref(),
                     )
                     .await
                 })))
@@ -720,7 +744,7 @@ pub(crate) fn run_group_turn(
                             if let Some(Err(e)) = failed {
                                 tracing::warn!("image-compose task failed: {e}");
                             }
-                            build_delegated_image_prompt(
+                            build_delegated_image_prompt_with(
                                 &state,
                                 &seat.persona,
                                 &plan,
@@ -730,12 +754,14 @@ pub(crate) fn run_group_turn(
                                 turn.user_id,
                                 turn.group_session_id,
                                 None,
+                                companion_ctx.as_ref(),
                             )
                             .await
                         }
                     };
                     turn_failures.extend(img.failures.iter().cloned());
-                    let marker = build_delegated_image_marker(
+                    let shown = img.compose_model.is_some().then(|| companion_id.clone()).flatten();
+                    let marker = build_delegated_image_marker_with(
                         &img.subject,
                         img.caption.as_deref(),
                         img.aspect_ratio.as_deref(),
@@ -745,6 +771,7 @@ pub(crate) fn run_group_turn(
                         img.compose_event_id,
                         plan.image_ref,
                         None,
+                        shown.as_ref(),
                     );
                     if let Err(e) = chat_repo
                         .merge_assistant_image_meta(turn.group_session_id, last.message_id, &marker)
@@ -752,11 +779,12 @@ pub(crate) fn run_group_turn(
                     {
                         tracing::warn!("group(text_image): merge marker failed: {e}");
                     }
-                    yield build_image_request_frame(
+                    yield build_image_request_frame_with(
                         ulid_string(Ulid::from(last.message_id)),
                         &img.composed_prompt,
                         plan.image_ref,
                         img.aspect_ratio.as_deref(),
+                        shown,
                     );
                 }
             }

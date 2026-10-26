@@ -57,6 +57,11 @@ pub(crate) fn director_context(
         "[图片能力] 本轮可发图={}\n",
         if image_available { "是" } else { "否" }
     ));
+    if image_available {
+        s.push_str(
+            "[同框] 发图的发言人可用 with 指定一位同框成员（m1/m2/m3），独自一人或不发图时为 null\n",
+        );
+    }
     s.push_str("[最近群聊]\n");
     s.push_str(if transcript.trim().is_empty() {
         "（无）"
@@ -75,6 +80,11 @@ pub(crate) fn director_context(
 /// actually seated this turn.
 pub(crate) fn director_response_format(seat_count: usize) -> serde_json::Value {
     let handles: Vec<String> = (0..seat_count).map(handle).collect();
+    let with_handles: Vec<serde_json::Value> = handles
+        .iter()
+        .map(|h| serde_json::Value::String(h.clone()))
+        .chain(std::iter::once(serde_json::Value::Null))
+        .collect();
     serde_json::json!({
         "type": "json_schema",
         "json_schema": {
@@ -90,7 +100,7 @@ pub(crate) fn director_response_format(seat_count: usize) -> serde_json::Value {
                         "items": {
                             "type": "object",
                             "additionalProperties": false,
-                            "required": ["member", "action", "inner_state", "reply_mode", "clothing"],
+                            "required": ["member", "action", "inner_state", "reply_mode", "clothing", "with"],
                             "properties": {
                                 "member": { "type": "string", "enum": handles },
                                 "action": { "type": "string",
@@ -98,7 +108,8 @@ pub(crate) fn director_response_format(seat_count: usize) -> serde_json::Value {
                                 "inner_state": { "type": ["string", "null"] },
                                 "reply_mode": { "type": ["string", "null"],
                                     "enum": ["listen", "follow", "ask", "judge", null] },
-                                "clothing": { "type": ["string", "null"] }
+                                "clothing": { "type": ["string", "null"] },
+                                "with": { "type": ["string", "null"], "enum": with_handles }
                             }
                         }
                     },
@@ -235,6 +246,7 @@ mod tests {
 - m1：小美（活泼）bond=friend chemistry=crush 亲密度=第 2 档\n\
 - m2：阿哲 bond=acquaintance chemistry=spark 亲密度=第 1 档\n\
 [图片能力] 本轮可发图=是\n\
+[同框] 发图的发言人可用 with 指定一位同框成员（m1/m2/m3），独自一人或不发图时为 null\n\
 [最近群聊]\n\
 用户：早\n小美：早呀\n\
 [用户点名] 阿哲\n\
@@ -257,6 +269,10 @@ mod tests {
         assert!(!got.contains("[群聊]"));
         assert!(!got.contains("[用户点名]"));
         assert!(got.contains("[图片能力] 本轮可发图=否\n"));
+        assert!(
+            !got.contains("[同框]"),
+            "no companion line without a picture"
+        );
         assert!(got.contains("[最近群聊]\n（无）\n"));
     }
 
@@ -268,6 +284,25 @@ mod tests {
             items["properties"]["member"]["enum"],
             serde_json::json!(["m1", "m2"])
         );
+    }
+
+    #[test]
+    fn response_format_lists_with_over_the_seated_handles() {
+        let f = director_response_format(2);
+        let items = &f["json_schema"]["schema"]["properties"]["speakers"]["items"];
+        assert_eq!(
+            items["properties"]["with"]["enum"],
+            serde_json::json!(["m1", "m2", null])
+        );
+        assert_eq!(
+            items["properties"]["with"]["type"],
+            serde_json::json!(["string", "null"])
+        );
+        assert!(items["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r == "with"));
     }
 
     fn sse(frames: &[&str]) -> String {

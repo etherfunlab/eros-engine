@@ -315,6 +315,7 @@ section is omitted when it has nothing to say.
 - m1：{name}（{personality}）bond={bond_key} chemistry={chem_key} 亲密度=第 {rung} 档
 - m2：{name} bond={bond_key} chemistry={chem_key} 亲密度=第 {rung} 档   ← no personality ⇒ no （…）
 [图片能力] 本轮可发图={是|否}
+[同框] 发图的发言人可用 with 指定一位同框成员（m1/m2/m3），独自一人或不发图时为 null   ← only when a picture is available
 [最近群聊]
 {transcript}                                           ← "（无）" when empty
 [用户点名] {name}、{name}                               ← only when mentions are present
@@ -333,18 +334,34 @@ with `\n`.
 
 ```json
 {"speakers": [{"member": "m2", "action": "reply_text_image",
-               "inner_state": "…", "reply_mode": null, "clothing": null}],
+               "inner_state": "…", "reply_mode": null, "clothing": null, "with": "m1"}],
  "reason": "…"}
 ```
 
 `member` is an enum over the handles present. `action` is `reply_text`,
 `reply_image` or `reply_text_image`. `inner_state`, `reply_mode` and `clothing`
-are optional, with the 1:1 judge's semantics.
+are optional, with the 1:1 judge's semantics. `with` is the handle of the one
+member who is in the picture with the speaker, or `null`: a group picture
+holds at most two people, the speaker and one companion.
 
 **Normalization** (pure, in `eros-engine-core`): an unknown or unseated handle
 is dropped; a repeated handle keeps its first occurrence; an image action on a
 turn without image availability degrades to `reply_text` (an action only goes
-down); a list that is empty afterwards counts as a director failure.
+down); a list that is empty afterwards counts as a director failure. `with` is
+dropped, never an error, when it names no seated member, names the speaker's
+own seat, or rides an action that carries no picture after that downgrade.
+
+**A picture of two.** With a companion, the speaker's composer payload gains
+one section after `[此刻穿着]`: `[同框人物]` with the companion's name,
+appearance and personality, and the line
+`这张图里有两个人：{speaker} 和 {companion}。`; the built-in composer prompt
+knows the section. The `image_request` frame and
+[`GET …/image-request`](api-reference.md#get-compchatsession_idmessagesmessage_idimage-request)
+then carry `companion: {member_session_id, instance_id}`, so the client
+fetches a second face reference and draws with both. When the composer chain
+is exhausted and the wire prompt is the speaker's solo portrait, no
+`companion` is sent; the compose audit row still records who was asked for.
+The 1:1 path is unchanged.
 
 **Rule fallback.** Every seated member speaks `reply_text`, in join order. It
 applies when the director fails, times out, returns unparseable output or an

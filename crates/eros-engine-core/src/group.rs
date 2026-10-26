@@ -33,6 +33,10 @@ pub struct DirectorEntry {
     pub reply_mode: Option<ReplyMode>,
     #[serde(default)]
     pub clothing: Option<String>,
+    /// The handle of the member in the picture with this speaker (spec
+    /// 2026-10-26-group-two-person-image-design.md §2); `None` when alone.
+    #[serde(default)]
+    pub with: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -51,6 +55,9 @@ pub struct Cue {
     pub inner_state: Option<String>,
     pub reply_mode: Option<ReplyMode>,
     pub clothing: Option<String>,
+    /// The seat in the picture with this one: another seated member, on an
+    /// action that carries a picture; `None` otherwise.
+    pub with: Option<usize>,
 }
 
 /// Who said a transcript line, from the point of view of the speaker the
@@ -103,12 +110,18 @@ pub fn normalize(v: &DirectorVerdict, seats: usize, image_available: bool) -> Ve
             (DirectorAction::ReplyTextImage, true) => ActionType::ReplyTextImage,
             _ => ActionType::ReplyText,
         };
+        let with = e
+            .with
+            .as_deref()
+            .and_then(|h| seat_of(h, seats))
+            .filter(|w| *w != seat && action != ActionType::ReplyText);
         out.push(Cue {
             seat,
             action,
             inner_state: e.inner_state.clone(),
             reply_mode: e.reply_mode,
             clothing: e.clothing.clone(),
+            with,
         });
     }
     out
@@ -124,6 +137,7 @@ pub fn fallback_cues(seats: usize) -> Vec<Cue> {
             inner_state: None,
             reply_mode: None,
             clothing: None,
+            with: None,
         })
         .collect()
 }
@@ -161,7 +175,48 @@ mod tests {
             inner_state: None,
             reply_mode: None,
             clothing: None,
+            with: None,
         }
+    }
+
+    fn entry_with(member: &str, action: DirectorAction, with: &str) -> DirectorEntry {
+        DirectorEntry {
+            with: Some(with.into()),
+            ..entry(member, action)
+        }
+    }
+
+    #[test]
+    fn normalize_keeps_a_companion_only_for_another_seated_member_on_an_image_action() {
+        let v = DirectorVerdict {
+            speakers: vec![
+                entry_with("m1", DirectorAction::ReplyImage, "m2"),
+                entry_with("m2", DirectorAction::ReplyTextImage, "m9"),
+                entry_with("m3", DirectorAction::ReplyImage, "m3"),
+            ],
+            reason: None,
+        };
+        let cues = normalize(&v, 3, true);
+        assert_eq!(
+            cues.iter().map(|c| c.with).collect::<Vec<_>>(),
+            vec![Some(1), None, None]
+        );
+        let text = DirectorVerdict {
+            speakers: vec![entry_with("m1", DirectorAction::ReplyText, "m2")],
+            reason: None,
+        };
+        assert_eq!(normalize(&text, 2, true)[0].with, None);
+        let image = DirectorVerdict {
+            speakers: vec![entry_with("m1", DirectorAction::ReplyImage, "m2")],
+            reason: None,
+        };
+        assert_eq!(
+            normalize(&image, 2, false)[0].with,
+            None,
+            "downgraded to text"
+        );
+        assert_eq!(normalize(&image, 2, true)[0].with, Some(1));
+        assert!(fallback_cues(2).iter().all(|c| c.with.is_none()));
     }
 
     #[test]

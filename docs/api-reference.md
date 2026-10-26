@@ -588,6 +588,7 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 | `composed_prompt` | `String` | base64(`STANDARD`, unwrapped) of the UTF-8 final wire prompt. Decode at the last hop and use verbatim as the provider text prompt — reconstruct no prompt logic. |
 | `image_ref` | `"face"` \| `"previous"` | Which reference image the plan chose; the consumer resolves the actual URL. |
 | `aspect_ratio` | `String` \| absent | The semantic aspect (`1:1`,`3:4`,`4:3`,`9:16`,`16:9`) or absent. The consumer owns aspect→resolution mapping; no width/height is sent. |
+| `companion` | `{member_session_id, instance_id}` \| absent | On a [group](group-chat.md#the-director) image turn whose director seated a second person: fetch that persona's face reference too and draw both. Absent on every 1:1 turn and on a group turn with one person in the picture. |
 
 **Full SSE frame sequences:**
 
@@ -1349,11 +1350,13 @@ stream clients that disconnected before the frame fired). Auth and session
 ownership checks are the same as `history`.
 
 ```json
-{ "message_id": "01J…", "composed_prompt": "5YaZ5a6e…", "image_ref": "previous", "aspect_ratio": "3:4" }
+{ "message_id": "01J…", "composed_prompt": "5YaZ5a6e…", "image_ref": "previous", "aspect_ratio": "3:4",
+  "companion": {"member_session_id": "…", "instance_id": "…"} }
 ```
 
 Fields mirror the SSE frame: `composed_prompt` is base64(`STANDARD`) of the
-UTF-8 wire prompt; `image_ref` may be absent on rows persisted before the
+UTF-8 wire prompt; `companion` is present only on a group picture of two;
+`image_ref` may be absent on rows persisted before the
 marker carried it. **Absent `image_ref` means unknown, not `face`** — a
 consumer that defaults it to `face` will redraw a `previous`-ref turn against
 the wrong reference image. `404` when the message is not an image turn — or when the

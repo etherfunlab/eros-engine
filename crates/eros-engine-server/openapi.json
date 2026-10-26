@@ -5112,6 +5112,24 @@
           }
         }
       },
+      "ImageCompanion": {
+        "type": "object",
+        "description": "The second person in a group picture, as the frame and the restore route\ncarry it (spec 2026-10-26-group-two-person-image-design.md §4).",
+        "required": [
+          "member_session_id",
+          "instance_id"
+        ],
+        "properties": {
+          "instance_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "member_session_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
       "ImageEditRequest": {
         "type": "object",
         "required": [
@@ -5305,6 +5323,17 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "companion": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ImageCompanion",
+                "description": "The second person in a group picture; absent on every other row."
+              }
             ]
           },
           "composed_prompt": {

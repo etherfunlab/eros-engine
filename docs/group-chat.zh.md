@@ -260,6 +260,7 @@ params = { reasoning = { effort = "medium" } }
 - m1：{name}（{personality}）bond={bond_key} chemistry={chem_key} 亲密度=第 {rung} 档
 - m2：{name} bond={bond_key} chemistry={chem_key} 亲密度=第 {rung} 档   ← 没有 personality 就没有 （…）
 [图片能力] 本轮可发图={是|否}
+[同框] 发图的发言人可用 with 指定一位同框成员（m1/m2/m3），独自一人或不发图时为 null   ← 仅在本轮可发图时
 [最近群聊]
 {transcript}                                           ← 为空时写 "（无）"
 [用户点名] {name}、{name}                               ← 仅在有点名时
@@ -276,15 +277,25 @@ params = { reasoning = { effort = "medium" } }
 
 ```json
 {"speakers": [{"member": "m2", "action": "reply_text_image",
-               "inner_state": "…", "reply_mode": null, "clothing": null}],
+               "inner_state": "…", "reply_mode": null, "clothing": null, "with": "m1"}],
  "reason": "…"}
 ```
 
 `member` 是当前存在的句柄上的枚举。`action` 是 `reply_text`、`reply_image` 或 `reply_text_image`。
-`inner_state`、`reply_mode`、`clothing` 可选，语义与 1:1 判官相同。
+`inner_state`、`reply_mode`、`clothing` 可选，语义与 1:1 判官相同。`with` 是和发言人同框的那一位成员的句柄，
+没有则为 `null`：一张群聊图最多两个人，发言人加一位同框成员。
 
 **规整**（纯函数，在 `eros-engine-core`）：未知或未入座的句柄丢弃；重复的句柄保留第一次出现；
 没有图片能力的轮次上，图片动作降为 `reply_text`（动作只降不升）；规整后列表为空，按导演失败处理。
+`with` 指到非座上成员、指到发言人自己，或挂在降级后不带图的动作上时，静默丢弃，不报错。
+
+**双人图。** 有同框成员时，发言人的 composer payload 在 `[此刻穿着]` 之后多一段 `[同框人物]`：
+同框成员的名字、外貌与性格，以及一句 `这张图里有两个人：{发言人} 和 {同框成员}。`；内建的 composer
+提示词认得这一段。随后 `image_request` 帧和
+[`GET …/image-request`](api-reference.zh.md#get-compchatsession_idmessagesmessage_idimage-request)
+都带 `companion: {member_session_id, instance_id}`，客户端据此再取一张脸的参考图，两张一起画。
+composer 链路耗尽、wire prompt 退回发言人单人肖像时，不发 `companion`；compose 审计行仍记录当时要的是谁。
+1:1 路径不变。
 
 **规则兜底。** 每位入座成员按加入顺序各说一句 `reply_text`。导演失败、超时、返回无法解析的输出或
 空列表时，以及 `[tasks.group_director]` 缺失时，都会走它。
