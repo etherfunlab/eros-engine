@@ -104,7 +104,7 @@ impl LastMessageColumns {
 const GROUP_SQL: &str = "SELECT s.id, s.user_id, s.title, s.created_at, s.last_active_at, \
             lm.id AS lm_message_id, lm.role AS lm_role, \
             lm.speaker_session_id AS lm_speaker_session_id, \
-            left(btrim(lm.content, E' \\t\\r\\n\\f\\v'), 120) AS lm_preview, \
+            left(btrim(lm.content, E' \\t\\r\\n\\f\\013'), 120) AS lm_preview, \
             COALESCE(lm.metadata ? 'image', false) AS lm_is_image, \
             lm.sent_at AS lm_sent_at \
      FROM engine.chat_sessions s \
@@ -114,7 +114,7 @@ const GROUP_SQL: &str = "SELECT s.id, s.user_id, s.title, s.created_at, s.last_a
           WHERE m.session_id = s.id \
             AND m.role IN ('user', 'assistant') \
             AND m.channel IS DISTINCT FROM 'product_qa' \
-            AND (btrim(m.content, E' \\t\\r\\n\\f\\v') <> '' OR m.metadata ? 'image') \
+            AND (btrim(m.content, E' \\t\\r\\n\\f\\013') <> '' OR m.metadata ? 'image') \
           ORDER BY m.sent_at DESC, m.id DESC \
           LIMIT 1 \
      ) lm ON true";
