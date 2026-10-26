@@ -28,11 +28,14 @@ use crate::pipeline::handlers::recall_query_text;
 use crate::pipeline::proactive::{greet, Greeting, Occasion};
 use crate::prompt::NowContext;
 use crate::routes::companion::{
-    validate_llm_audit, validate_prompt_traits, LlmAuditDto, PromptTraitDto,
+    image_request_payload, validate_llm_audit, validate_prompt_traits, ImageRequestPayloadResponse,
+    LlmAuditDto, PromptTraitDto,
 };
 use crate::routes::companion_stream::{
-    resolve_text_turn, validate_tier, AffinityScopeDto, StreamPreErrorBody,
+    resolve_text_turn, validate_tier, validated_outfit, AffinityScopeDto, ImageReplyParams,
+    StreamPreErrorBody,
 };
+use eros_engine_llm::model_config::StyleKey;
 use crate::routes::session_open::GreetingDto;
 use crate::state::AppState;
 
@@ -386,6 +389,44 @@ pub struct DrawEventRequest {
     pub affinity_scope: Option<AffinityScopeDto>,
     #[serde(default)]
     pub audit: Option<LlmAuditDto>,
+    /// The caller handles images: a kind about a photo (`taking_selfie`)
+    /// then carries her picture, when the deployment configures
+    /// `[tasks.chat_image_prompt_compose]`. Absent: words only.
+    #[serde(default)]
+    pub image: Option<EventImageParams>,
+    /// The outfit the persona wears, as on a chat turn: typically one of her
+    /// wardrobe entries, not checked against it. 1–64 chars after trim; blank
+    /// reads as absent. Her words follow it, and so does her picture.
+    #[serde(default)]
+    #[schema(max_length = 64)]
+    pub outfit: Option<String>,
+}
+
+/// How her picture is composed; each field as on a chat turn's `image`.
+#[derive(Debug, Clone, Default, Deserialize, utoipa::ToSchema)]
+pub struct EventImageParams {
+    #[serde(default)]
+    #[schema(value_type = Option<String>)]
+    pub style: Option<StyleKey>,
+    #[serde(default)]
+    pub aspect_ratio: Option<String>,
+    /// Which `[tasks.chat_image_prompt_compose].filter_prompt` variant to use:
+    /// an index (`"0"`, `"1"`) for the array shape, or a key (`"a"`, `"b"`)
+    /// for the table shape. An unknown one falls back to the built-in
+    /// composer prompt.
+    #[serde(default)]
+    pub prompt_variant: Option<String>,
+}
+
+impl From<EventImageParams> for ImageReplyParams {
+    fn from(p: EventImageParams) -> Self {
+        Self {
+            force: false,
+            style: p.style,
+            aspect_ratio: p.aspect_ratio,
+            prompt_variant: p.prompt_variant,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -395,6 +436,10 @@ pub struct DrawEventResponse {
     pub event: Option<EventView>,
     /// The persona's message telling it; `null` with `event`.
     pub message: Option<GreetingDto>,
+    /// Her picture on the message, the restore route's payload. Absent when
+    /// the message carries none, or its composed prompt was never recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_request: Option<ImageRequestPayloadResponse>,
 }
 
 impl DrawEventResponse {
@@ -402,6 +447,7 @@ impl DrawEventResponse {
         Self {
             event: None,
             message: None,
+            image_request: None,
         }
     }
 }
@@ -428,9 +474,18 @@ async fn respond(
         }
         None => None,
     };
+    let image_request = match &message {
+        Some(m) => match image_request_payload(state, session_id, m).await {
+            Ok(p) => Some(p),
+            Err(AppError::NotFound(_)) => None,
+            Err(e) => return Err(e),
+        },
+        None => None,
+    };
     Ok(DrawEventResponse {
         event: Some(EventView::new(&event, traits)),
         message: message.map(Into::into),
+        image_request,
     })
 }
 
@@ -516,6 +571,15 @@ pub(crate) async fn draw_event_at(
         .map_err(|e| invalid_payload(e.to_string()))?;
     let audit =
         validate_llm_audit(req.audit.clone()).map_err(|e| invalid_payload(e.to_string()))?;
+    let outfit = validated_outfit(req.outfit.as_deref()).map_err(|message| {
+        AppError::StreamPre(StreamPreError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "unprocessable",
+            message,
+            user_message: "穿着无效".into(),
+            original_user_message_id: None,
+        })
+    })?;
     let key = req.event_key.clone();
     let well_formed = (1..=MAX_EVENT_KEY_CHARS).contains(&key.len())
         && key
@@ -613,6 +677,15 @@ pub(crate) async fn draw_event_at(
         .iter()
         .find(|e| e.kind.is_background() && e.ends_at > now)
         .map(|e| e.kind);
+    // Her picture: a kind about a photo, a caller that handles images, and a
+    // configured composer (spec 2026-10-26-event-message-image-design.md §3).
+    let image = req
+        .image
+        .filter(|_| {
+            drawn.kind.is_photo()
+                && crate::pipeline::stream::image_capability_available(true, &state.model_config)
+        })
+        .map(ImageReplyParams::from);
 
     let _guard = state
         .stream_slots
@@ -650,6 +723,8 @@ pub(crate) async fn draw_event_at(
                 kind: drawn.kind,
                 lasts: drawn.lasts,
                 background,
+                image,
+                outfit,
             },
             recall_query,
             since: now,
@@ -713,6 +788,68 @@ mod tests {
             })))
             .mount(mock)
             .await;
+    }
+
+    /// The companion plus the image composer (its prompt is "COMPOSE").
+    fn with_companion_and_composer(mut state: AppState, mock_uri: &str) -> AppState {
+        state = with_companion(state, mock_uri);
+        state.model_config = Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"companion\"\n\
+                 [tasks.chat_image_prompt_compose]\nmodel = \"composer\"\nfilter_prompt = \"COMPOSE\"\n",
+            )
+            .unwrap(),
+        );
+        state
+    }
+
+    async fn mount_composer(mock: &MockServer, prompt: &str, caption: &str) {
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("COMPOSE"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "gen-compose",
+                "model": "served/composer",
+                "choices": [{"message": {"content":
+                    json!({"prompt": prompt, "caption": caption}).to_string()}}],
+            })))
+            .mount(mock)
+            .await;
+    }
+
+    fn selfie_req(key: &str, image: bool) -> DrawEventRequest {
+        DrawEventRequest {
+            image: image.then(|| EventImageParams {
+                aspect_ratio: Some("3:4".into()),
+                ..Default::default()
+            }),
+            ..req(key, Some(vec![EventKindDto::TakingSelfie]))
+        }
+    }
+
+    /// The message row's metadata.
+    async fn row_meta(pool: &PgPool, message_id: Uuid) -> serde_json::Value {
+        sqlx::query_scalar("SELECT metadata FROM engine.chat_messages WHERE id = $1")
+            .bind(message_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// The compose audit row a marker names: (source, status, inputs).
+    async fn compose_row(pool: &PgPool, marker: &serde_json::Value) -> (String, String, serde_json::Value) {
+        let id: Uuid = marker["compose_event_id"].as_str().unwrap().parse().unwrap();
+        sqlx::query_as("SELECT source, status, inputs FROM engine.chat_images_events WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    fn last_content(call: &serde_json::Value) -> String {
+        call["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_string()
     }
 
     async fn calls(mock: &MockServer) -> Vec<serde_json::Value> {
@@ -2050,5 +2187,395 @@ mod tests {
         );
         assert!(again.event.is_some());
         assert_eq!(calls(&mock).await.len(), 1, "no second generation");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_selfie_with_image_carries_its_picture(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "刚拍的，好看吗").await;
+        mount_composer(&mock, "在海边对着镜头笑", "海边自拍").await;
+        let state = with_companion_and_composer(test_state(pool.clone()), &mock.uri());
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            selfie_req("k1", true),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        let e = out.event.expect("an event");
+        let m = out.message.expect("a message");
+        assert_eq!(e.message_id, Some(m.message_id));
+
+        let c = calls(&mock).await;
+        assert_eq!(c.len(), 2, "the companion, then the composer");
+        assert_eq!(last_content(&c[0]), "（你刚拍了一张自拍，发给了对方。）");
+        let payload = last_content(&c[1]);
+        assert!(payload.contains("[最近场景]\n"), "{payload}");
+        assert!(
+            payload.contains("AI: 刚拍的，好看吗\n\n[对方最新消息]\n（无）"),
+            "{payload}"
+        );
+        assert!(payload.contains("[画幅]\n3:4"), "{payload}");
+
+        let img = out.image_request.expect("an image request");
+        assert_eq!(img.message_id, m.message_id);
+        assert_eq!(img.image_ref.as_deref(), Some("face"));
+        assert_eq!(img.aspect_ratio.as_deref(), Some("3:4"));
+        use base64::Engine as _;
+        let prompt = String::from_utf8(
+            base64::engine::general_purpose::STANDARD
+                .decode(&img.composed_prompt)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(prompt.contains("在海边对着镜头笑"), "{prompt}");
+
+        let marker = row_meta(&pool, m.message_id).await["image"].clone();
+        assert_eq!(marker["caption"], json!("海边自拍"));
+        assert_eq!(marker["image_ref"], json!("face"));
+        let (source, status, _) = compose_row(&pool, &marker).await;
+        assert_eq!((source.as_str(), status.as_str()), ("event", "ok"));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_selfie_without_image_is_words_only(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "刚拍了张自拍").await;
+        mount_composer(&mock, "p", "c").await;
+        let state = with_companion_and_composer(test_state(pool.clone()), &mock.uri());
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            selfie_req("k1", false),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        let c = calls(&mock).await;
+        assert_eq!(c.len(), 1);
+        assert_eq!(last_content(&c[0]), "（你刚拍了一张自拍，想发给对方看看。）");
+        assert!(out.image_request.is_none());
+        let m = out.message.expect("a message");
+        assert!(row_meta(&pool, m.message_id).await.get("image").is_none());
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_selfie_without_a_composer_is_words_only(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "刚拍了张自拍").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            selfie_req("k1", true),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        let c = calls(&mock).await;
+        assert_eq!(c.len(), 1);
+        assert_eq!(last_content(&c[0]), "（你刚拍了一张自拍，想发给对方看看。）");
+        assert!(out.message.is_some() && out.image_request.is_none());
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn another_kind_with_image_gets_no_picture(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "要去加班了").await;
+        mount_composer(&mock, "p", "c").await;
+        let state = with_companion_and_composer(test_state(pool.clone()), &mock.uri());
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            DrawEventRequest {
+                image: Some(EventImageParams::default()),
+                ..req("k1", Some(vec![EventKindDto::TempWork]))
+            },
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        let c = calls(&mock).await;
+        assert_eq!(c.len(), 1);
+        assert_eq!(
+            last_content(&c[0]),
+            "（你刚临时接到一份工作，得马上去处理。）"
+        );
+        assert!(out.message.is_some() && out.image_request.is_none());
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_blank_selfie_calls_no_composer(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "").await;
+        mount_composer(&mock, "p", "c").await;
+        let state = with_companion_and_composer(test_state(pool.clone()), &mock.uri());
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            selfie_req("k1", true),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        assert!(out.event.is_none() && out.message.is_none() && out.image_request.is_none());
+        assert_eq!(calls(&mock).await.len(), 1);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_replayed_selfie_key_returns_its_picture(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "刚拍的").await;
+        mount_composer(&mock, "在窗边", "窗边自拍").await;
+        let state = with_companion_and_composer(test_state(pool.clone()), &mock.uri());
+        let draw = || {
+            draw_event_at(
+                &state,
+                session_id,
+                user_id,
+                selfie_req("k1", true),
+                Utc::now(),
+                rolls(0.5),
+            )
+        };
+        let first = draw().await.unwrap();
+        let again = draw().await.unwrap();
+        assert!(first.image_request.is_some());
+        assert_eq!(
+            serde_json::to_value(&again.image_request).unwrap(),
+            serde_json::to_value(&first.image_request).unwrap()
+        );
+        assert_eq!(calls(&mock).await.len(), 2, "no second generation");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_selfie_whose_composer_fails_still_carries_a_portrait(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "刚拍的").await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("COMPOSE"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+        let state = with_companion_and_composer(test_state(pool.clone()), &mock.uri());
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            selfie_req("k1", true),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        assert!(out.image_request.is_some(), "the portrait fallback");
+        let m = out.message.expect("a message");
+        let marker = row_meta(&pool, m.message_id).await["image"].clone();
+        assert!(marker.get("caption").is_none() && marker.get("compose_model").is_none());
+        let (source, status, _) = compose_row(&pool, &marker).await;
+        assert_eq!((source.as_str(), status.as_str()), ("event", "exhausted"));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_selfie_without_a_recorded_compose_returns_no_image_request(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "刚拍的").await;
+        mount_composer(&mock, "在窗边", "窗边自拍").await;
+        let state = with_companion_and_composer(test_state(pool.clone()), &mock.uri());
+        let draw = || {
+            draw_event_at(
+                &state,
+                session_id,
+                user_id,
+                selfie_req("k1", true),
+                Utc::now(),
+                rolls(0.5),
+            )
+        };
+        let first = draw().await.unwrap();
+        let m = first.message.expect("a message");
+        // As when the fail-open audit write did not land.
+        sqlx::query(
+            "UPDATE engine.chat_messages SET metadata = metadata #- '{image,compose_event_id}' \
+             WHERE id = $1",
+        )
+        .bind(m.message_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let again = draw().await.unwrap();
+        assert_eq!(again.message.map(|m| m.message_id), Some(m.message_id));
+        assert!(again.image_request.is_none());
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_untold_kind_with_image_composes_nothing(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (instance_id, session_id) = setup(&pool, user_id).await;
+        seed_user_messages(&pool, session_id, 10).await;
+        rung_two(&pool, session_id, user_id, instance_id).await;
+        let mock = MockServer::start().await;
+        let state = with_companion_and_composer(test_state(pool.clone()), &mock.uri());
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            DrawEventRequest {
+                image: Some(EventImageParams::default()),
+                ..req("s1", Some(vec![EventKindDto::Asleep]))
+            },
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        let e = out.event.expect("asleep");
+        assert!(e.message_id.is_none() && out.message.is_none() && out.image_request.is_none());
+        assert!(calls(&mock).await.is_empty());
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_outfit_dresses_the_event(pool: PgPool) {
+        // Told without a picture: her words follow it.
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "要去加班了").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            DrawEventRequest {
+                outfit: Some("红色旗袍".into()),
+                ..req("k1", Some(vec![EventKindDto::TempWork]))
+            },
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        let c = calls(&mock).await;
+        assert!(c[0].to_string().contains("- 此刻的穿着：红色旗袍"), "{}", c[0]);
+        let m = out.message.expect("a message");
+        assert_eq!(row_meta(&pool, m.message_id).await["outfit"], json!("红色旗袍"));
+
+        // With a picture: the composer dresses her in it too.
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "刚拍的").await;
+        mount_composer(&mock, "穿着旗袍自拍", "旗袍自拍").await;
+        let state = with_companion_and_composer(test_state(pool.clone()), &mock.uri());
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            DrawEventRequest {
+                outfit: Some("红色旗袍".into()),
+                ..selfie_req("k1", true)
+            },
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        let c = calls(&mock).await;
+        assert!(
+            last_content(&c[1]).contains("[此刻穿着]\n红色旗袍"),
+            "{}",
+            last_content(&c[1])
+        );
+        let m = out.message.expect("a message");
+        let marker = row_meta(&pool, m.message_id).await["image"].clone();
+        let (_, _, inputs) = compose_row(&pool, &marker).await;
+        assert_eq!(inputs["clothing"], json!("红色旗袍"));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_blank_outfit_is_absent(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "要去加班了").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            DrawEventRequest {
+                outfit: Some("   ".into()),
+                ..req("k1", Some(vec![EventKindDto::TempWork]))
+            },
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        let c = calls(&mock).await;
+        assert!(!c[0].to_string().contains("此刻的穿着"), "{}", c[0]);
+        let m = out.message.expect("a message");
+        assert!(row_meta(&pool, m.message_id).await.get("outfit").is_none());
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_long_outfit_is_422(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let err = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            DrawEventRequest {
+                outfit: Some("字".repeat(65)),
+                ..req("k1", None)
+            },
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .err()
+        .expect("rejected");
+        assert!(
+            matches!(
+                err,
+                AppError::StreamPre(StreamPreError {
+                    status: StatusCode::UNPROCESSABLE_ENTITY,
+                    code: "unprocessable",
+                    ..
+                })
+            ),
+            "{err:?}"
+        );
+        assert!(calls(&mock).await.is_empty());
     }
 }

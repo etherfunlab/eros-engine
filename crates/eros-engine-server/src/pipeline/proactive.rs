@@ -38,8 +38,12 @@ use ulid::Ulid;
 use uuid::Uuid;
 
 use crate::error::AppError;
-use crate::pipeline::handlers::{build_reply_request, CHAT_TASK};
-use crate::pipeline::stream::split_failures;
+use crate::pipeline::handlers::{build_reply_request, load_effects, CHAT_TASK};
+use crate::pipeline::stream::{
+    build_delegated_image_marker, build_delegated_image_prompt_for, recent_transcript,
+    split_failures,
+};
+use crate::routes::companion_stream::ImageReplyParams;
 use crate::pipeline::{compute_signals_for_session, record_generation, GenerationRecord};
 use crate::prompt::NowContext;
 use crate::state::AppState;
@@ -83,6 +87,11 @@ pub(crate) enum Occasion {
         lasts: chrono::Duration,
         /// The background under way when it was drawn.
         background: Option<EventKind>,
+        /// The message carries her picture, composed with these (spec
+        /// 2026-10-26-event-message-image-design.md §3–§4).
+        image: Option<ImageReplyParams>,
+        /// What she wears (§3a), already validated.
+        outfit: Option<String>,
     },
     /// What she says about the ask-for-space choice (spec
     /// 2026-10-19-life-events-shopping-gatherings-and-ask-for-space-design.md
@@ -151,6 +160,7 @@ impl Occasion {
                 kind,
                 lasts,
                 background,
+                image,
                 ..
             } => event_cue(
                 *kind,
@@ -159,7 +169,7 @@ impl Occasion {
                 rung,
                 traits,
                 tip_personality,
-                false,
+                image.is_some(),
             ),
             Self::LifeChoice(cue) => cue.cue(),
         }
@@ -371,7 +381,12 @@ pub(crate) async fn greet(
         context_hints: vec![],
         reply_mode: None,
         nudges: Default::default(),
-        clothing: None,
+        // An event's outfit, as a chat turn's named outfit: in the reply
+        // prompt and, with a picture, the composer's `[此刻穿着]`.
+        clothing: match &g.occasion {
+            Occasion::Event { outfit, .. } => outfit.clone(),
+            _ => None,
+        },
         image_caption: None,
         image_ref: ImageRef::Previous,
         aspect_ratio: None,
@@ -474,9 +489,60 @@ pub(crate) async fn greet(
     }
     let (llm_attempts, gateway_errors) = split_failures(&resp.failures);
 
+    let mut metadata = g.metadata;
+    // Her picture is composed from what she just said (spec 2026-10-26-event-
+    // message-image-design.md §4): the recent scene ends with her message, and
+    // no user message asked for it. Fail-open, as on a chat turn.
+    if let Occasion::Event {
+        image: Some(image), ..
+    } = &g.occasion
+    {
+        let effects = load_effects(&state.pool, g.session_id, None)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(session_id = %g.session_id, "proactive message: lingering effects read failed: {e}");
+                Vec::new()
+            });
+        let body_state = crate::prompt::body_state(&effects);
+        let transcript = recent_transcript(&ChatRepo { pool: &state.pool }, g.session_id).await;
+        let her_line = format!("AI: {content}");
+        let scene = if transcript.is_empty() {
+            her_line
+        } else {
+            format!("{transcript}\n{her_line}")
+        };
+        let img = build_delegated_image_prompt_for(
+            state,
+            g.persona,
+            &plan,
+            Some(image),
+            &scene,
+            "",
+            g.user_id,
+            g.session_id,
+            body_state.as_deref(),
+            None,
+            "event",
+        )
+        .await;
+        metadata.insert(
+            "image".into(),
+            build_delegated_image_marker(
+                &img.subject,
+                img.caption.as_deref(),
+                img.aspect_ratio.as_deref(),
+                img.compose_variant.as_deref(),
+                img.compose_model.as_deref(),
+                img.compose_generation_id.as_deref(),
+                img.compose_event_id,
+                ImageRef::Face,
+                None,
+            ),
+        );
+    }
+
     // An event is written when its message is, not when the request began.
     let event_at = Utc::now();
-    let mut metadata = g.metadata;
     metadata.insert("proactive".into(), g.occasion.name().into());
     match &g.occasion {
         Occasion::Holiday {
@@ -496,7 +562,12 @@ pub(crate) async fn greet(
         Occasion::FirstMeet { open_key } | Occasion::JustOpened { open_key } => {
             metadata.insert("open_key".into(), open_key.as_str().into());
         }
-        Occasion::Event { .. } | Occasion::LifeChoice(_) => {}
+        Occasion::Event { outfit, .. } => {
+            if let Some(o) = outfit {
+                metadata.insert("outfit".into(), o.as_str().into());
+            }
+        }
+        Occasion::LifeChoice(_) => {}
     }
     metadata.insert("prompt_traits".into(), serde_json::json!(injected_tags));
     metadata.insert(
