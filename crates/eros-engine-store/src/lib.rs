@@ -61,6 +61,27 @@ pub(crate) mod testutil {
     use sqlx::PgPool;
     use uuid::Uuid;
 
+    /// Return once some backend of this test's database is blocked on a row
+    /// lock, so a test can hold a lock on one connection, start a competing
+    /// statement on another and know the competitor has reached the lock before
+    /// it releases it. Panics after ten seconds.
+    pub(crate) async fn wait_for_lock_wait(pool: &PgPool) {
+        for _ in 0..1000 {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity \
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if waiting > 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("no statement ever blocked on a lock");
+    }
+
     /// Persist a genome + active instance and return the instance id.
     /// Since 0040 `chat_sessions.instance_id`, `companion_affinity.instance_id`
     /// and `companion_memories.instance_id` carry real FKs, so a test that just

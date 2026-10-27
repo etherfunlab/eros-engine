@@ -42,13 +42,18 @@ const BY_INSTANCE: &str = "instance_id IN (SELECT id FROM engine.persona_instanc
 /// user. Children precede their parents so a cascade never removes rows the
 /// report should have counted.
 const DERIVED: &[(&str, &str)] = &[
+    // The state row is the lock anchor that serializes this erase against an
+    // in-flight profile write (`HumanInsightRepo::replace_profile_if_claimed`
+    // writes under a `FOR UPDATE` on it). It must be deleted first: the delete
+    // waits for a write that holds the lock, and the `human_insights` delete
+    // below then removes the row that write committed.
+    ("human_profile_state", BY_USER),
     ("human_facts", BY_USER),
     ("human_insights", BY_USER),
     ("human_insights_snapshot", BY_USER),
     // Frozen history of the retired profile table; no writer remains, but rows
     // written before it was retired are still attributed to their user.
     ("companion_insights_snapshot", BY_USER),
-    ("human_profile_state", BY_USER),
     ("companion_memories", BY_USER),
     ("world_memories", BY_OWNER),
     ("world_states", BY_OWNER),
@@ -362,6 +367,51 @@ mod tests {
          SELECT (SELECT id FROM engine.companion_affinity WHERE session_id = p.s), 'message', \
                 '{\"said\":\"x\"}'",
     ];
+
+    /// A profile write that holds the state row's lock when the erase starts is
+    /// not lost to it: the erase waits, then deletes the row the write
+    /// committed.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn erase_waits_for_an_in_flight_profile_write_and_removes_what_it_wrote(pool: PgPool) {
+        let user = Uuid::new_v4();
+        let state = ProfileStateRepo { pool: &pool };
+        state.bump(user, 1).await.unwrap();
+        assert!(state
+            .claim(user, std::time::Duration::from_secs(600))
+            .await
+            .unwrap());
+
+        // The rebuild's side: the claimed row locked, the profile not yet committed.
+        let mut write = pool.begin().await.unwrap();
+        sqlx::query("SELECT user_id FROM engine.human_profile_state WHERE user_id = $1 FOR UPDATE")
+            .bind(user)
+            .fetch_one(&mut *write)
+            .await
+            .unwrap();
+
+        let erase = tokio::spawn({
+            let pool = pool.clone();
+            async move { ErasureRepo { pool: &pool }.erase_user(user).await }
+        });
+        crate::testutil::wait_for_lock_wait(&pool).await;
+        assert!(!erase.is_finished(), "the erase waits for the write");
+
+        sqlx::query("INSERT INTO engine.human_insights (user_id, interests) VALUES ($1, '{jazz}')")
+            .bind(user)
+            .execute(&mut *write)
+            .await
+            .unwrap();
+        write.commit().await.unwrap();
+
+        let report = erase.await.unwrap().unwrap();
+        assert_eq!(report.deleted["human_insights"], 1);
+        assert_eq!(report.deleted["human_profile_state"], 1);
+        assert!(HumanInsightRepo { pool: &pool }
+            .load(user)
+            .await
+            .unwrap()
+            .is_none());
+    }
 
     /// One row of everything for `user`: the repo-written tables through their
     /// repos, the rest through `SEEDS`.

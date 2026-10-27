@@ -174,87 +174,37 @@ impl<'a> HumanInsightRepo<'a> {
         user_id: Uuid,
         c: &ProjectedColumns,
     ) -> Result<(), sqlx::Error> {
-        self.write_profile(user_id, c, false).await?;
-        Ok(())
+        write_profile(self.pool, user_id, c).await
     }
 
     /// `replace_profile` for a writer that holds the user's rebuild claim: the
-    /// row is written only while `human_profile_state` still has a claimed row
-    /// for the user. A user erased while the rebuild was running has no state
-    /// row left, so the write is refused instead of re-creating a profile the
-    /// erasure just removed. Returns whether the profile was written.
+    /// profile is written only while `human_profile_state` still has a claimed
+    /// row for the user, and the write runs under that row's lock. The erase
+    /// deletes the state row before the profile, so with the lock it either
+    /// waits for this write and then deletes the row written here, or has
+    /// already removed the state row, in which case this write is refused
+    /// instead of re-creating a profile the erase just removed. Returns whether
+    /// the profile was written.
     pub async fn replace_profile_if_claimed(
         &self,
         user_id: Uuid,
         c: &ProjectedColumns,
     ) -> Result<bool, sqlx::Error> {
-        Ok(self.write_profile(user_id, c, true).await? > 0)
-    }
-
-    async fn write_profile(
-        &self,
-        user_id: Uuid,
-        c: &ProjectedColumns,
-        require_claim: bool,
-    ) -> Result<u64, sqlx::Error> {
-        let res = sqlx::query(
-            "INSERT INTO engine.human_insights \
-                (user_id, occupation, mbti_guess, love_values, emotional_needs, \
-                 life_rhythm, interests, personality_traits, deal_breakers, education, \
-                 education_level, education_status, family, relationship_history, \
-                 social_pattern, future_plans, finance_status, kinks, ideology, \
-                 mental_health) \
-             SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
-                    $16, $17, $18, $19, $20 \
-             WHERE NOT $21 OR EXISTS ( \
-                 SELECT 1 FROM engine.human_profile_state \
-                 WHERE user_id = $1 AND claimed_at IS NOT NULL) \
-             ON CONFLICT (user_id) DO UPDATE SET \
-                 occupation           = EXCLUDED.occupation, \
-                 mbti_guess           = EXCLUDED.mbti_guess, \
-                 love_values          = EXCLUDED.love_values, \
-                 emotional_needs      = EXCLUDED.emotional_needs, \
-                 life_rhythm          = EXCLUDED.life_rhythm, \
-                 interests            = EXCLUDED.interests, \
-                 personality_traits   = EXCLUDED.personality_traits, \
-                 deal_breakers        = EXCLUDED.deal_breakers, \
-                 education            = EXCLUDED.education, \
-                 education_level      = EXCLUDED.education_level, \
-                 education_status     = EXCLUDED.education_status, \
-                 family               = EXCLUDED.family, \
-                 relationship_history = EXCLUDED.relationship_history, \
-                 social_pattern       = EXCLUDED.social_pattern, \
-                 future_plans         = EXCLUDED.future_plans, \
-                 finance_status       = EXCLUDED.finance_status, \
-                 kinks                = EXCLUDED.kinks, \
-                 ideology             = EXCLUDED.ideology, \
-                 mental_health        = EXCLUDED.mental_health, \
-                 updated_at           = now()",
+        let mut tx = self.pool.begin().await?;
+        let claimed: Option<Uuid> = sqlx::query_scalar(
+            "SELECT user_id FROM engine.human_profile_state \
+             WHERE user_id = $1 AND claimed_at IS NOT NULL FOR UPDATE",
         )
         .bind(user_id)
-        .bind(&c.occupation)
-        .bind(&c.mbti_guess)
-        .bind(&c.love_values)
-        .bind(&c.emotional_needs)
-        .bind(&c.life_rhythm)
-        .bind(&c.interests)
-        .bind(&c.personality_traits)
-        .bind(&c.deal_breakers)
-        .bind(&c.education)
-        .bind(&c.education_level)
-        .bind(&c.education_status)
-        .bind(&c.family)
-        .bind(&c.relationship_history)
-        .bind(&c.social_pattern)
-        .bind(&c.future_plans)
-        .bind(&c.finance_status)
-        .bind(&c.kinks)
-        .bind(&c.ideology)
-        .bind(&c.mental_health)
-        .bind(require_claim)
-        .execute(self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
-        Ok(res.rows_affected())
+        if claimed.is_none() {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        write_profile(&mut *tx, user_id, c).await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// Rows changed strictly after the `(since, after_user)` keyset tuple, in
@@ -307,6 +257,69 @@ impl<'a> HumanInsightRepo<'a> {
         .await?;
         Ok(res.rows_affected() as usize)
     }
+}
+
+/// The profile upsert shared by `replace_profile` and
+/// `replace_profile_if_claimed`.
+async fn write_profile<'e>(
+    exec: impl sqlx::PgExecutor<'e>,
+    user_id: Uuid,
+    c: &ProjectedColumns,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO engine.human_insights \
+            (user_id, occupation, mbti_guess, love_values, emotional_needs, \
+             life_rhythm, interests, personality_traits, deal_breakers, education, \
+             education_level, education_status, family, relationship_history, \
+             social_pattern, future_plans, finance_status, kinks, ideology, \
+             mental_health) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
+                 $16, $17, $18, $19, $20) \
+         ON CONFLICT (user_id) DO UPDATE SET \
+             occupation           = EXCLUDED.occupation, \
+             mbti_guess           = EXCLUDED.mbti_guess, \
+             love_values          = EXCLUDED.love_values, \
+             emotional_needs      = EXCLUDED.emotional_needs, \
+             life_rhythm          = EXCLUDED.life_rhythm, \
+             interests            = EXCLUDED.interests, \
+             personality_traits   = EXCLUDED.personality_traits, \
+             deal_breakers        = EXCLUDED.deal_breakers, \
+             education            = EXCLUDED.education, \
+             education_level      = EXCLUDED.education_level, \
+             education_status     = EXCLUDED.education_status, \
+             family               = EXCLUDED.family, \
+             relationship_history = EXCLUDED.relationship_history, \
+             social_pattern       = EXCLUDED.social_pattern, \
+             future_plans         = EXCLUDED.future_plans, \
+             finance_status       = EXCLUDED.finance_status, \
+             kinks                = EXCLUDED.kinks, \
+             ideology             = EXCLUDED.ideology, \
+             mental_health        = EXCLUDED.mental_health, \
+             updated_at           = now()",
+    )
+    .bind(user_id)
+    .bind(&c.occupation)
+    .bind(&c.mbti_guess)
+    .bind(&c.love_values)
+    .bind(&c.emotional_needs)
+    .bind(&c.life_rhythm)
+    .bind(&c.interests)
+    .bind(&c.personality_traits)
+    .bind(&c.deal_breakers)
+    .bind(&c.education)
+    .bind(&c.education_level)
+    .bind(&c.education_status)
+    .bind(&c.family)
+    .bind(&c.relationship_history)
+    .bind(&c.social_pattern)
+    .bind(&c.future_plans)
+    .bind(&c.finance_status)
+    .bind(&c.kinks)
+    .bind(&c.ideology)
+    .bind(&c.mental_health)
+    .execute(exec)
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -588,6 +601,48 @@ mod tests {
             .await
             .unwrap());
         assert!(repo.load(user_id).await.unwrap().is_none());
+    }
+
+    /// An erase that has deleted the state row but not yet committed holds its
+    /// lock: the guarded write waits for it, then finds the row gone.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn replace_profile_if_claimed_waits_for_an_erase_holding_the_state_row(pool: PgPool) {
+        use crate::profile_state::ProfileStateRepo;
+
+        let user_id = Uuid::new_v4();
+        let state = ProfileStateRepo { pool: &pool };
+        state.bump(user_id, 1).await.unwrap();
+        assert!(state
+            .claim(user_id, std::time::Duration::from_secs(600))
+            .await
+            .unwrap());
+
+        let mut erase = pool.begin().await.unwrap();
+        sqlx::query("DELETE FROM engine.human_profile_state WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&mut *erase)
+            .await
+            .unwrap();
+
+        let write = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                let cols = project_profile(&serde_json::json!({ "occupation": "设计师" }));
+                HumanInsightRepo { pool: &pool }
+                    .replace_profile_if_claimed(user_id, &cols)
+                    .await
+            }
+        });
+        crate::testutil::wait_for_lock_wait(&pool).await;
+        assert!(!write.is_finished(), "the write waits for the erase");
+        erase.commit().await.unwrap();
+
+        assert!(!write.await.unwrap().unwrap(), "the claim is gone");
+        assert!(HumanInsightRepo { pool: &pool }
+            .load(user_id)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[sqlx::test(migrations = "./migrations")]
