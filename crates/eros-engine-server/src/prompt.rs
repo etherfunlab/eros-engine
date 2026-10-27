@@ -1838,6 +1838,7 @@ profile schema（真人用户画像；所有字段可选；只输出下列字段
 - 账本是你掌握的关于该用户的全部信息。只填账本清楚支持的字段，没有依据就整个省略该字段，绝不猜测、外推或编造；对已支持的内容尽量写足细节与情境，用完整短语或句子，不要用单个词/标签凑数。
 - 标为 transient 的事实只反映当下状态，不进任何字段；除非其出现频次标注为 repeated_across_sessions（跨会话反复出现）。
 - interests、personality_traits 每项是 4~12 个汉字、带实际细节的具体短语，不要孤立的单字/双字标签。
+- interests、personality_traits、deal_breakers、kinks 每个数组至多 12 项：按出现频次与新近度挑最重要的；同一数组内不要重复，也不要换措辞重复同一条。
 - love_values、emotional_needs 各写成一个字符串，至多三条命题，用分号隔开。
 - deal_breakers 只收现实生活中的无法接受点；对 AI 说话风格的不满、剧情中的即时反应不算。
 - kinks 保留具体的玩法与角色设定，不要概括成笼统标签；证据来自角色扮演的条目，在短语里写明「角色扮演中」。
@@ -1847,7 +1848,7 @@ profile schema（真人用户画像；所有字段可选；只输出下列字段
 - mbti_guess：用户自报的类型原样填；没有自报时，只有当多条事实里反复出现同一类行为/表达模式，才可基于此谨慎推断，并在值里带「像/偏」措辞；不要凭一两条事实臆断。
 - education 写学校、专业等具体信息；education_level 是编码对象：level 取 secondary_or_below（高中及以下）、associate（大专）、bachelor（本科）、master（硕士）、doctorate（博士）之一，status 取 enrolled（在读）、graduated（已毕业）之一；账本只支持其中一项时只写那一项，不要写这些代码之外的值。
 - 只输出上表列出的字段名，不要新增、不要改名。
-- 仅输出一个 JSON 对象，不要 markdown、不要解释；账本里没有任何可写的内容时输出 {}。
+- 仅输出一个紧凑的 JSON 对象（不要缩进或换行），不要 markdown、不要解释；账本里没有任何可写的内容时输出 {}。
 "#;
 
 /// Build the *user* message for the facts-extraction call: just the turn,
@@ -3528,6 +3529,28 @@ mod tests {
             "the model reads the ledger before the schema"
         );
         assert!(p.contains("真人用户"), "subject must be named: {p}");
+    }
+
+    #[test]
+    fn profile_rebuild_schema_caps_arrays_and_asks_compact_json() {
+        // The projection enforces the same cap at write time (#463); the two
+        // must quote one number.
+        let cap = format!(
+            "至多 {} 项",
+            eros_engine_store::human_insight::PROFILE_LIST_MAX_ITEMS
+        );
+        assert!(
+            PROFILE_REBUILD_SCHEMA.contains(&cap),
+            "array cap must be stated: {PROFILE_REBUILD_SCHEMA}"
+        );
+        assert!(
+            PROFILE_REBUILD_SCHEMA.contains("不要重复"),
+            "the no-duplicates rule must be stated"
+        );
+        assert!(
+            PROFILE_REBUILD_SCHEMA.contains("紧凑"),
+            "compact JSON must be asked for"
+        );
     }
 
     #[test]
