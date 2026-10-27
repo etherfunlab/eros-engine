@@ -10,6 +10,8 @@ This page is a hand-written summary of the endpoints worth knowing. The Scalar U
 
 Every `/comp/*` and `/bff/v1/*` endpoint requires `Authorization: Bearer <Supabase JWT>`. The token's `alg` header selects the validator: asymmetric signatures (ES256/RS256/EdDSA) are checked against the project's JWKS, resolved from `SUPABASE_JWKS_URL` or derived from `SUPABASE_URL` — this is the default for Supabase projects since the 2025 JWT Signing Keys rollout. Legacy HS256 against a shared `SUPABASE_JWT_SECRET` is still accepted for deployments that have not migrated; at least one of the two sources must be configured or the server fails to boot. The `sub` claim must be a UUID; that becomes the user_id for the request.
 
+When the deployment sets `CALLER_SECRET`, every bearer-authenticated endpoint also requires `x-caller-secret: <one of its secrets>`. It is checked before the bearer: a missing or wrong value is `403` with `code: caller_forbidden` in the coded body, whether or not a token was sent. `/healthz`, `/docs` and `/svc/v1/*` never require it. See [Deploying](deploying.md).
+
 `/healthz` and `/docs` are public. `/svc/v1/*` is a third class: admitted by a shared secret header, never by a bearer token — see [Service endpoints](#service-endpoints).
 
 ## Public endpoints
@@ -2616,7 +2618,8 @@ response is plain JSON) — it reuses the voice turn's precondition checks and
 error type. The group routes (`/v2/comp/group*`) use the coded shape for their
 refusals too, and so does every BYOC refusal (`byoc_forbidden`,
 `byoc_card_rejected`, `byoc_unsupported` and the `invalid_payload` of a card),
-on whichever route it comes from. The table below covers the plain shape:
+on whichever route it comes from, as does the caller-secret refusal
+(`caller_forbidden`). The table below covers the plain shape:
 
 | Status | Code | When |
 |--------|------|------|

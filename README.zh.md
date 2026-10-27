@@ -117,7 +117,7 @@ cargo run -p eros-engine-server -- serve
 
 ## API 一览
 
-核心流程很简单：创建人设会话，然后向 SSE 流式端点发送对话。语音走独立通道——用 `channel: "voice"` 创建会话并调用语音回合端点（prompt 更精简，另带一个打断调用）；两个通道不会写进彼此的会话。另有一个只入队的备选端点（`POST /v2/comp/session/{session_id}/message/async`），面向无法保持流式连接的 bot 式调用方——回复由后台 worker 生成，落库后从历史记录 / Realtime 读取，而不是走流式帧。引擎还提供历史记录、会话、画像及好感度路由，`/v2/comp/group*` 下的群管理，以及一个让角色的一天里发生点什么的生活事件路由（`POST /v2/comp/session/{session_id}/events`）。默认使用 Supabase JWT 鉴权，也可通过 `AuthValidator` 替换；可选的 `/svc/v1/*` 服务路由改用共享 secret 放行，分成三棵子树，各自只有设置了自己的 secret 才会挂载：`INSIGHTS_EXPORT_SECRET`（画像与记忆导出，以及已抹除用户流）、`FACTS_EXPORT_SECRET`（事实账本导出）和 `USER_ERASE_SECRET`（用户抹除）。具体路径、payload 与流式帧详见 [API 参考](docs/api-reference.zh.md)。
+核心流程很简单：创建人设会话，然后向 SSE 流式端点发送对话。语音走独立通道——用 `channel: "voice"` 创建会话并调用语音回合端点（prompt 更精简，另带一个打断调用）；两个通道不会写进彼此的会话。另有一个只入队的备选端点（`POST /v2/comp/session/{session_id}/message/async`），面向无法保持流式连接的 bot 式调用方——回复由后台 worker 生成，落库后从历史记录 / Realtime 读取，而不是走流式帧。引擎还提供历史记录、会话、画像及好感度路由，`/v2/comp/group*` 下的群管理，以及一个让角色的一天里发生点什么的生活事件路由（`POST /v2/comp/session/{session_id}/events`）。默认使用 Supabase JWT 鉴权，也可通过 `AuthValidator` 替换。设置 `CALLER_SECRET` 后，这些路由还要求 `x-caller-secret` header，只有部署自己的服务器能调用，持有 JWT 的终端用户无法直连。可选的 `/svc/v1/*` 服务路由改用共享 secret 放行，分成三棵子树，各自只有设置了自己的 secret 才会挂载：`INSIGHTS_EXPORT_SECRET`（画像与记忆导出，以及已抹除用户流）、`FACTS_EXPORT_SECRET`（事实账本导出）和 `USER_ERASE_SECRET`（用户抹除）。具体路径、payload 与流式帧详见 [API 参考](docs/api-reference.zh.md)。
 
 ## 配置
 
