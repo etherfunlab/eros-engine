@@ -3,7 +3,7 @@
 //! *injection* only — post-process writes (insight extraction, memory writes,
 //! six-axis affinity eval) are unaffected.
 
-use crate::affinity::Affinity;
+use crate::affinity::{Affinity, AffinityLine};
 use serde::{Deserialize, Serialize};
 
 /// How much of the user-global structured profile ("基础画像") to inject.
@@ -42,6 +42,135 @@ impl MemoryScope {
             MemoryScope::InsightsOnly => (InsightMode::Full, false, false),
             MemoryScope::None => (InsightMode::Off, false, false),
         }
+    }
+}
+
+/// One of the eight intimate 基础画像 fields — the ones only
+/// `InsightMode::Full` renders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntimateField {
+    LoveValues,
+    RelationshipHistory,
+    Kinks,
+    Interests,
+    EmotionalNeeds,
+    Family,
+    FinanceStatus,
+    MentalHealth,
+}
+
+impl IntimateField {
+    pub const ALL: [IntimateField; 8] = [
+        IntimateField::LoveValues,
+        IntimateField::RelationshipHistory,
+        IntimateField::Kinks,
+        IntimateField::Interests,
+        IntimateField::EmotionalNeeds,
+        IntimateField::Family,
+        IntimateField::FinanceStatus,
+        IntimateField::MentalHealth,
+    ];
+
+    /// The line this field reads and the lowest tier on it that lets the
+    /// field into the prompt (spec 2026-10-27-affinity-gated-profile-recall
+    /// §2.4). Each field reads its own line only, so friendship never
+    /// unlocks romance-side knowledge.
+    pub fn threshold(self) -> (AffinityLine, u8) {
+        use AffinityLine::{Bond, Chemistry};
+        match self {
+            IntimateField::LoveValues => (Chemistry, 2),
+            IntimateField::RelationshipHistory => (Chemistry, 3),
+            IntimateField::Kinks => (Chemistry, 4),
+            IntimateField::Interests => (Bond, 2),
+            IntimateField::EmotionalNeeds => (Bond, 3),
+            IntimateField::Family => (Bond, 3),
+            IntimateField::FinanceStatus => (Bond, 4),
+            IntimateField::MentalHealth => (Bond, 4),
+        }
+    }
+
+    /// The field a profile-layer memory's `metadata.domain` label mirrors
+    /// (spec §2.6). The label is prompt-owned, so it is matched trimmed and
+    /// case-folded; anything else is unrouted (`None`). `kink` and
+    /// `mental_health` are the fact ledger's names for the same split.
+    pub fn from_memory_domain(domain: &str) -> Option<IntimateField> {
+        Some(match domain.trim().to_ascii_lowercase().as_str() {
+            "sexuality" | "kink" => IntimateField::Kinks,
+            "romance" => IntimateField::LoveValues,
+            "family" => IntimateField::Family,
+            "finance" => IntimateField::FinanceStatus,
+            "health" | "mental_health" => IntimateField::MentalHealth,
+            _ => return None,
+        })
+    }
+}
+
+/// How much of the user's profile the relationship's affinity lets into the
+/// prompt (spec 2026-10-27-affinity-gated-profile-recall). Read side only,
+/// and always inside the caller's `MemoryScope`: the gate narrows, never
+/// widens. Built from the two line tiers of the (decayed) affinity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecallGate {
+    pub bond_tier: u8,
+    pub chem_tier: u8,
+}
+
+impl RecallGate {
+    /// A relationship with no affinity yet: tier 1 on both lines.
+    pub const STRANGER: RecallGate = RecallGate {
+        bond_tier: 1,
+        chem_tier: 1,
+    };
+
+    pub fn from_affinity(a: &Affinity) -> RecallGate {
+        RecallGate {
+            bond_tier: a.bond_tier(),
+            chem_tier: a.chem_tier(),
+        }
+    }
+
+    pub fn allows(self, field: IntimateField) -> bool {
+        let (line, min) = field.threshold();
+        let tier = match line {
+            AffinityLine::Bond => self.bond_tier,
+            AffinityLine::Chemistry => self.chem_tier,
+        };
+        tier >= min
+    }
+
+    /// Whether a profile-layer memory labelled `domain` may be recalled.
+    /// Unrouted (or absent) domains pass; the K ramp still applies.
+    pub fn allows_memory_domain(self, domain: Option<&str>) -> bool {
+        domain
+            .and_then(IntimateField::from_memory_domain)
+            .is_none_or(|f| self.allows(f))
+    }
+
+    /// The profile memory layer is recalled at all (higher tier ≥ 2).
+    pub fn recalls_profile_layer(self) -> bool {
+        self.higher_tier() >= 2
+    }
+
+    /// Profile-layer K from the site's constant `k`: none at tier 1, half
+    /// (rounded up) at tier 2, all of it from tier 3 (spec §2.5).
+    pub fn profile_k(self, k: i32) -> i32 {
+        match self.higher_tier() {
+            0 | 1 => 0,
+            2 => (k + 1) / 2,
+            _ => k,
+        }
+    }
+
+    /// Relationship-layer K: shrinks at low tiers, never exceeds `k`
+    /// (spec §2.7).
+    pub fn relationship_k(self, k: i32) -> i32 {
+        k.min(i32::from(self.higher_tier()))
+    }
+
+    /// The memory layers carry no field to route by line, so they read the
+    /// higher of the two tiers.
+    fn higher_tier(self) -> u8 {
+        self.bond_tier.max(self.chem_tier)
     }
 }
 
@@ -233,6 +362,117 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    fn gate(bond_tier: u8, chem_tier: u8) -> RecallGate {
+        RecallGate {
+            bond_tier,
+            chem_tier,
+        }
+    }
+
+    #[test]
+    fn intimate_field_thresholds_match_the_spec_table() {
+        use AffinityLine::*;
+        use IntimateField::*;
+        let want = [
+            (LoveValues, (Chemistry, 2)),
+            (RelationshipHistory, (Chemistry, 3)),
+            (Kinks, (Chemistry, 4)),
+            (Interests, (Bond, 2)),
+            (EmotionalNeeds, (Bond, 3)),
+            (Family, (Bond, 3)),
+            (FinanceStatus, (Bond, 4)),
+            (MentalHealth, (Bond, 4)),
+        ];
+        for (f, t) in want {
+            assert_eq!(f.threshold(), t, "{f:?}");
+        }
+        assert_eq!(IntimateField::ALL.len(), 8);
+    }
+
+    #[test]
+    fn a_field_unlocks_at_its_tier_on_its_own_line_only() {
+        for f in IntimateField::ALL {
+            let (line, min) = f.threshold();
+            // The other line is maxed: it must not unlock the field.
+            let on = |t: u8| match line {
+                AffinityLine::Bond => gate(t, 5),
+                AffinityLine::Chemistry => gate(5, t),
+            };
+            assert!(!on(min - 1).allows(f), "{f:?} below its tier");
+            assert!(on(min).allows(f), "{f:?} at its tier");
+        }
+        assert!(!gate(5, 3).allows(IntimateField::Kinks));
+        assert!(!gate(3, 5).allows(IntimateField::FinanceStatus));
+    }
+
+    #[test]
+    fn memory_domains_mirror_their_fields() {
+        use IntimateField::*;
+        for (d, f) in [
+            ("sexuality", Kinks),
+            ("kink", Kinks),
+            ("romance", LoveValues),
+            ("family", Family),
+            ("finance", FinanceStatus),
+            ("health", MentalHealth),
+            ("mental_health", MentalHealth),
+            ("Sexuality", Kinks),
+            (" sexuality ", Kinks),
+        ] {
+            assert_eq!(IntimateField::from_memory_domain(d), Some(f), "{d:?}");
+        }
+        for d in ["career", "communication", "", "sexual"] {
+            assert_eq!(IntimateField::from_memory_domain(d), None, "{d:?}");
+        }
+    }
+
+    #[test]
+    fn memory_domain_gate() {
+        assert!(RecallGate::STRANGER.allows_memory_domain(None));
+        assert!(RecallGate::STRANGER.allows_memory_domain(Some("career")));
+        assert!(!gate(1, 3).allows_memory_domain(Some("sexuality")));
+        assert!(gate(1, 4).allows_memory_domain(Some("sexuality")));
+        assert!(gate(1, 2).allows_memory_domain(Some("romance")));
+        assert!(!gate(5, 1).allows_memory_domain(Some("romance")));
+    }
+
+    #[test]
+    fn profile_k_ramps_on_the_higher_tier() {
+        assert!(!RecallGate::STRANGER.recalls_profile_layer());
+        assert!(gate(1, 2).recalls_profile_layer());
+        for k in [1, 2, 4] {
+            assert_eq!(RecallGate::STRANGER.profile_k(k), 0);
+        }
+        assert_eq!(gate(2, 1).profile_k(2), 1);
+        assert_eq!(gate(1, 2).profile_k(4), 2);
+        assert_eq!(gate(2, 1).profile_k(1), 1); // ⌈1/2⌉
+        assert_eq!(gate(1, 3).profile_k(4), 4);
+        assert_eq!(gate(5, 5).profile_k(2), 2);
+    }
+
+    #[test]
+    fn relationship_k_is_capped_by_the_higher_tier() {
+        let got: Vec<i32> = [gate(1, 1), gate(2, 1), gate(1, 3), gate(5, 5)]
+            .into_iter()
+            .map(|g| g.relationship_k(3))
+            .collect();
+        assert_eq!(got, vec![1, 2, 3, 3]);
+        assert_eq!(gate(1, 1).relationship_k(2), 1);
+        assert_eq!(gate(5, 1).relationship_k(2), 2);
+    }
+
+    #[test]
+    fn gate_reads_the_two_line_tiers() {
+        assert_eq!(
+            RecallGate::from_affinity(&Affinity::unrecorded()),
+            RecallGate::STRANGER
+        );
+        // bond = (trust + intrigue)/2 = 0.7 → tier 4;
+        // chemistry = (intimacy + tension)/2 = 0.4 → tier 3.
+        let a = affinity(0.5, 0.7, 0.7, 0.4, 0.5, 0.4);
+        assert_eq!(RecallGate::from_affinity(&a), gate(4, 3));
     }
 
     #[test]

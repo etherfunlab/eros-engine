@@ -1085,6 +1085,36 @@ mod tests {
         let user_id = Uuid::new_v4();
         let session_id = seed(&pool, user_id).await;
 
+        // A pair affinity at chemistry tier 2, on a text session of its own:
+        // the recall gate lets the profile-layer marker row below through.
+        let instance_id: Uuid =
+            sqlx::query_scalar("SELECT instance_id FROM engine.chat_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let text_session: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id, channel) \
+             VALUES ($1, $2, 'text') RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        eros_engine_store::affinity::AffinityRepo { pool: &pool }
+            .load_or_create(text_session, user_id, instance_id)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE engine.companion_affinity SET intimacy = 0.2, tension = 0.2, \
+             updated_at = now() WHERE session_id = $1",
+        )
+        .bind(text_session)
+        .execute(&pool)
+        .await
+        .unwrap();
+
         let persisted_text = "persisted words";
         let retry_text = "different words";
         let client_msg_id = "01J9CONTENT0000000000000003";

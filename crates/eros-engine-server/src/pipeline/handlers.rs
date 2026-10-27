@@ -9,14 +9,14 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use eros_engine_core::scope::{AffinityScope, InsightMode, MemoryScope};
+use eros_engine_core::scope::{AffinityScope, InsightMode, IntimateField, MemoryScope, RecallGate};
 use eros_engine_core::types::{ActionPlan, DecisionInput, Event, LlmAudit, PromptTrait};
 use eros_engine_llm::model_config::{style_preset, ResolvedModel, StyleKey};
 use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
 use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::ChatRepo;
 use eros_engine_store::human_insight::{HumanInsightRepo, HumanInsightsRow};
-use eros_engine_store::memory::MemoryRepo;
+use eros_engine_store::memory::{MemoryRepo, MemoryRow};
 
 use crate::error::AppError;
 use crate::prompt::build_prompt;
@@ -413,11 +413,118 @@ pub(crate) fn compose_image_prompt(
 
 // ─── Memory recall + insight injection helpers ────────────────────
 
+/// What one turn's memory recall fetched, before the recall gate. The
+/// searches always run at the site's full `tier`; [`Recalled::render`]
+/// applies the gate afterwards, so a site that loads its affinity alongside
+/// recall (voice) never has to wait for it before searching (spec
+/// 2026-10-27-affinity-gated-profile-recall §2.9).
+pub(crate) struct Recalled {
+    tier: RecallTier,
+    grouped: Vec<MemoryRow>,
+    raw: Vec<MemoryRow>,
+    relationship: Vec<String>,
+}
+
+impl Recalled {
+    fn empty(tier: RecallTier) -> Self {
+        Self {
+            tier,
+            grouped: vec![],
+            raw: vec![],
+            relationship: vec![],
+        }
+    }
+
+    /// Gate the fetched rows and shape them for the prompt:
+    /// - profile_groups: `Vec<(label, bullets)>` — categorised rows grouped by
+    ///   `category` if the search found any; otherwise a single
+    ///   `("近况", raw_rows)` group so users with no classified sessions yet
+    ///   still get profile context. Rows whose `domain` the gate withholds
+    ///   are dropped, then each category keeps `gate.profile_k(grouped_k)`
+    ///   (the raw group `gate.profile_k(raw_k)`).
+    /// - relationship: flat `Vec<String>`, the first
+    ///   `gate.relationship_k(relationship_k)` — never domain-filtered: it is
+    ///   what the user said to this persona.
+    pub(crate) fn render(self, gate: RecallGate) -> (Vec<(String, Vec<String>)>, Vec<String>) {
+        let grouped_k = gate.profile_k(self.tier.grouped_k);
+        let raw_k = gate.profile_k(self.tier.raw_k);
+        let relationship_k = gate.relationship_k(self.tier.relationship_k);
+        let mut withheld_by_domain = 0usize;
+        let mut allowed = |row: &MemoryRow| {
+            let ok = gate.allows_memory_domain(memory_domain(row));
+            if !ok {
+                withheld_by_domain += 1;
+            }
+            ok
+        };
+        // The fallback is decided on what the search found, not on what
+        // survives the gate: the raw search returns categorised rows too, so
+        // a user whose grouped rows are all withheld must not fall through
+        // to it.
+        let profile_groups = if self.grouped.is_empty() {
+            let raw = self
+                .raw
+                .into_iter()
+                .filter(|r| allowed(r))
+                .take(raw_k as usize)
+                .collect();
+            build_profile_groups(vec![], raw)
+        } else {
+            let mut kept = Vec::new();
+            let mut category: Option<String> = None;
+            let mut taken = 0;
+            for row in self.grouped.into_iter().filter(|r| allowed(r)) {
+                if row.category != category {
+                    category = row.category.clone();
+                    taken = 0;
+                }
+                if taken < grouped_k {
+                    kept.push(row);
+                    taken += 1;
+                }
+            }
+            build_profile_groups(kept, vec![])
+        };
+        let relationship: Vec<String> = self
+            .relationship
+            .into_iter()
+            .take(relationship_k as usize)
+            .collect();
+
+        let profile_total_chars: usize = profile_groups
+            .iter()
+            .flat_map(|(_, items)| items.iter().map(|s| s.chars().count()))
+            .sum();
+        tracing::debug!(
+            bond_tier = gate.bond_tier,
+            chem_tier = gate.chem_tier,
+            grouped_k,
+            raw_k,
+            relationship_k,
+            withheld_by_domain,
+            profile_groups = profile_groups.len(),
+            profile_total_chars,
+            relationship_hits = relationship.len(),
+            relationship_total_chars = relationship
+                .iter()
+                .map(|s| s.chars().count())
+                .sum::<usize>(),
+            "recall rendered through the recall gate"
+        );
+        (profile_groups, relationship)
+    }
+}
+
+/// A profile-layer row's `metadata.domain`, when it is a string.
+fn memory_domain(row: &MemoryRow) -> Option<&str> {
+    row.metadata.as_ref()?.get("domain")?.as_str()
+}
+
 /// Embed `query_text` once, then delegate to `recall_memory_with_embedding`.
-/// Returns (empty, empty, None) without hitting Voyage when both layers are
-/// off or the query is blank. Voyage failure also degrades silently to
-/// (empty, empty, None) — recall failure must never block a chat reply (the
-/// persona just looks slightly less "with it" for that turn). The third
+/// Returns an empty [`Recalled`] and `None` without hitting Voyage when both
+/// layers are off or the query is blank. Voyage failure also degrades
+/// silently to empty — recall failure must never block a chat reply (the
+/// persona just looks slightly less "with it" for that turn). The second
 /// element is the computed query embedding (`Some` only on success), reused
 /// by `fetch_world_context` so world-fragment recall doesn't pay a second
 /// Voyage call.
@@ -429,15 +536,15 @@ pub(crate) async fn recall_memory(
     x_on: bool,
     y_on: bool,
     tier: RecallTier,
-) -> (Vec<(String, Vec<String>)>, Vec<String>, Option<Vec<f32>>) {
+) -> (Recalled, Option<Vec<f32>>) {
     if (!x_on && !y_on) || query_text.trim().is_empty() {
-        return (vec![], vec![], None);
+        return (Recalled::empty(tier), None);
     }
     let embedding = match state.embed.embed_query(query_text).await {
         Ok(e) => e,
         Err(e) => {
             tracing::warn!("embed_query failed: {e}");
-            return (vec![], vec![], None);
+            return (Recalled::empty(tier), None);
         }
     };
     tracing::debug!(
@@ -448,7 +555,7 @@ pub(crate) async fn recall_memory(
         y_on,
         "recall_memory: embedded query, dispatching pgvector search"
     );
-    let (profile_groups, relationship) = recall_memory_with_embedding(
+    let recalled = recall_memory_with_embedding(
         &state.pool,
         user_id,
         instance_id,
@@ -458,18 +565,14 @@ pub(crate) async fn recall_memory(
         tier,
     )
     .await;
-    (profile_groups, relationship, Some(embedding))
+    (recalled, Some(embedding))
 }
 
 /// Pure-DB inner half of memory recall. Takes a pre-computed embedding and
-/// layer-enable flags, then returns:
-/// - profile_groups: `Vec<(label, bullets)>` — categorised rows grouped by
-///   `category` if any exist; otherwise a single `("近况", raw_rows)` group
-///   so users with no classified sessions yet still get profile context.
-///   Empty when `x_on` is false.
-/// - relationship: flat `Vec<String>` — relationship rows are full turn
-///   dumps and not categorised by the dreaming-lite pass. Empty when `y_on`
-///   is false.
+/// layer-enable flags and returns the rows found, ungated: the profile
+/// layer's grouped and raw searches (empty when `x_on` is false) and the
+/// relationship layer's contents (empty when `y_on` is false). Relationship
+/// rows are full turn dumps and not categorised by the dreaming-lite pass.
 ///
 /// Hot path (`x_on` ⇒ `y_on`): the three profile + relationship searches run
 /// in parallel via `tokio::join!`. Relationship-only (`!x_on && y_on`): only
@@ -482,35 +585,40 @@ pub(crate) async fn recall_memory_with_embedding(
     x_on: bool,
     y_on: bool,
     tier: RecallTier,
-) -> (Vec<(String, Vec<String>)>, Vec<String>) {
+) -> Recalled {
     let repo = MemoryRepo { pool };
 
-    let (profile_groups, relationship): (Vec<(String, Vec<String>)>, Vec<String>) = if x_on {
+    let recalled = if x_on {
         // X on ⇒ Y on: original three-way parallel recall (hot path).
         let (grouped_res, raw_res, rel_res) = tokio::join!(
             repo.search_profile_grouped(user_id, embedding, tier.grouped_k),
             repo.search(user_id, None, embedding, tier.raw_k),
             repo.search(user_id, Some(instance_id), embedding, tier.relationship_k),
         );
-        let grouped_rows = grouped_res.unwrap_or_else(|e| {
+        let grouped = grouped_res.unwrap_or_else(|e| {
             tracing::warn!("profile-layer grouped search failed: {e}");
             vec![]
         });
-        let raw_rows = raw_res.unwrap_or_else(|e| {
+        let raw = raw_res.unwrap_or_else(|e| {
             tracing::warn!("profile-layer raw search failed: {e}");
             vec![]
         });
-        let rel = match rel_res {
+        let relationship = match rel_res {
             Ok(rows) => rows.into_iter().map(|r| r.content).collect(),
             Err(e) => {
                 tracing::warn!("relationship-layer memory search failed: {e}");
                 vec![]
             }
         };
-        (build_profile_groups(grouped_rows, raw_rows), rel)
+        Recalled {
+            tier,
+            grouped,
+            raw,
+            relationship,
+        }
     } else if y_on {
         // relationship_only: skip both profile-layer searches.
-        let rel = match repo
+        let relationship = match repo
             .search(user_id, Some(instance_id), embedding, tier.relationship_k)
             .await
         {
@@ -520,29 +628,27 @@ pub(crate) async fn recall_memory_with_embedding(
                 vec![]
             }
         };
-        (vec![], rel)
+        Recalled {
+            relationship,
+            ..Recalled::empty(tier)
+        }
     } else {
         // Unreachable via MemoryScope::resolve() (x_on ⇒ y_on); defensive for
         // any direct caller that passes both layers off.
-        (vec![], vec![])
+        Recalled::empty(tier)
     };
 
-    let profile_total_chars: usize = profile_groups
-        .iter()
-        .flat_map(|(_, items)| items.iter().map(|s| s.chars().count()))
-        .sum();
     tracing::debug!(
         user_id = %user_id,
         instance_id = %instance_id,
         x_on,
         y_on,
-        profile_groups = profile_groups.len(),
-        profile_total_chars,
-        relationship_hits = relationship.len(),
-        relationship_total_chars = relationship.iter().map(|s| s.chars().count()).sum::<usize>(),
+        grouped_rows = recalled.grouped.len(),
+        raw_rows = recalled.raw.len(),
+        relationship_hits = recalled.relationship.len(),
         "recall_memory_with_embedding: completed"
     );
-    (profile_groups, relationship)
+    recalled
 }
 
 /// Map a raw category tag (`fact` / `preference` / ...) to its Chinese
@@ -569,8 +675,8 @@ fn category_label(category: &str) -> &'static str {
 ///   "近况" label so newly-onboarded users still get profile context
 ///   before their first dreaming sweep runs.
 fn build_profile_groups(
-    grouped_rows: Vec<eros_engine_store::memory::MemoryRow>,
-    raw_rows: Vec<eros_engine_store::memory::MemoryRow>,
+    grouped_rows: Vec<MemoryRow>,
+    raw_rows: Vec<MemoryRow>,
 ) -> Vec<(String, Vec<String>)> {
     if !grouped_rows.is_empty() {
         let mut out: Vec<(String, Vec<String>)> = Vec::new();
@@ -640,20 +746,67 @@ pub(crate) fn human_insights_to_bullets(row: &HumanInsightsRow, mode: InsightMod
     push_str(&mut out, &row.mbti_guess, "MBTI");
     push_str(&mut out, &row.ideology, "意识形态");
     if intimate {
-        push_str(&mut out, &row.love_values, "感情观");
-        push_str(&mut out, &row.relationship_history, "感情经历");
-        push_arr(&mut out, &row.interests, "兴趣");
-        push_str(&mut out, &row.emotional_needs, "情感需求");
-        push_str(&mut out, &row.family, "家庭");
-        push_str(&mut out, &row.finance_status, "经济状况");
-        push_arr(&mut out, &row.kinks, "性癖");
-        push_str(&mut out, &row.mental_health, "心理健康");
+        use IntimateField as F;
+        push_str(&mut out, &row.love_values, intimate_label(F::LoveValues));
+        push_str(
+            &mut out,
+            &row.relationship_history,
+            intimate_label(F::RelationshipHistory),
+        );
+        push_arr(&mut out, &row.interests, intimate_label(F::Interests));
+        push_str(
+            &mut out,
+            &row.emotional_needs,
+            intimate_label(F::EmotionalNeeds),
+        );
+        push_str(&mut out, &row.family, intimate_label(F::Family));
+        push_str(
+            &mut out,
+            &row.finance_status,
+            intimate_label(F::FinanceStatus),
+        );
+        push_arr(&mut out, &row.kinks, intimate_label(F::Kinks));
+        push_str(
+            &mut out,
+            &row.mental_health,
+            intimate_label(F::MentalHealth),
+        );
     }
     push_str(&mut out, &row.life_rhythm, "作息");
     push_str(&mut out, &row.social_pattern, "社交模式");
     push_arr(&mut out, &row.personality_traits, "性格特质");
     push_str(&mut out, &row.future_plans, "未来计划");
     out
+}
+
+/// The 基础画像 label an intimate field renders under. The bullet renderer
+/// and the gate's bullet filter both read it, so the two can't drift.
+fn intimate_label(field: IntimateField) -> &'static str {
+    match field {
+        IntimateField::LoveValues => "感情观",
+        IntimateField::RelationshipHistory => "感情经历",
+        IntimateField::Kinks => "性癖",
+        IntimateField::Interests => "兴趣",
+        IntimateField::EmotionalNeeds => "情感需求",
+        IntimateField::Family => "家庭",
+        IntimateField::FinanceStatus => "经济状况",
+        IntimateField::MentalHealth => "心理健康",
+    }
+}
+
+/// Whether a rendered 基础画像 bullet passes the recall gate. Only the
+/// leading `label：` decides, so a neutral bullet whose value mentions an
+/// intimate label stays. Works on rendered strings because voice freezes its
+/// bullets rendered (spec 2026-10-27-affinity-gated-profile-recall §4).
+pub(crate) fn insight_bullet_allowed(bullet: &str, gate: RecallGate) -> bool {
+    IntimateField::ALL
+        .into_iter()
+        .find(|f| {
+            bullet
+                .strip_prefix(intimate_label(*f))
+                .is_some_and(|rest| rest.starts_with('：'))
+        })
+        .is_none_or(|f| gate.allows(f))
 }
 
 /// The 学历 label for a stored `education_level` code; an unknown code has none.
@@ -938,6 +1091,10 @@ pub(crate) async fn build_reply_request_with(
         _ => (MemoryScope::default(), AffinityScope::default()),
     };
     let (mem_mode, x_on, y_on) = memory_scope.resolve();
+    // The scope is the ceiling; this turn's affinity narrows within it (spec
+    // 2026-10-27-affinity-gated-profile-recall). Group seats arrive here with
+    // their own decayed affinity.
+    let gate = RecallGate::from_affinity(&input.affinity);
     // Routine turns use the defaults — keep those at debug. Surface only
     // caller-overridden scopes at info, where they're actually notable.
     if memory_scope != MemoryScope::default() || affinity_scope != AffinityScope::default() {
@@ -946,17 +1103,23 @@ pub(crate) async fn build_reply_request_with(
             affinity_axes_active = affinity_scope.active_count(),
             x_on,
             y_on,
+            bond_tier = gate.bond_tier,
+            chem_tier = gate.chem_tier,
             "chat scopes resolved (non-default)"
         );
     } else {
         tracing::debug!(
             memory_scope = ?memory_scope,
             affinity_axes_active = affinity_scope.active_count(),
+            bond_tier = gate.bond_tier,
+            chem_tier = gate.chem_tier,
             "chat scopes resolved (defaults)"
         );
     }
 
-    let (mut profile_groups, relationship_facts, query_embedding) = recall_memory(
+    // Tier 1 recalls no profile-layer row, so it doesn't search that layer.
+    let x_on = x_on && gate.recalls_profile_layer();
+    let (recalled, query_embedding) = recall_memory(
         state,
         user_id,
         instance_id,
@@ -966,8 +1129,22 @@ pub(crate) async fn build_reply_request_with(
         TEXT_RECALL_TIER,
     )
     .await;
+    let (mut profile_groups, relationship_facts) = recalled.render(gate);
 
-    let insight_bullets = load_human_insight_bullets(&state.pool, user_id, mem_mode).await;
+    let loaded_bullets = load_human_insight_bullets(&state.pool, user_id, mem_mode).await;
+    let loaded_count = loaded_bullets.len();
+    let insight_bullets: Vec<String> = loaded_bullets
+        .into_iter()
+        .filter(|b| insight_bullet_allowed(b, gate))
+        .collect();
+    if insight_bullets.len() < loaded_count {
+        tracing::debug!(
+            withheld = loaded_count - insight_bullets.len(),
+            bond_tier = gate.bond_tier,
+            chem_tier = gate.chem_tier,
+            "insight bullets gated"
+        );
+    }
     if !insight_bullets.is_empty() {
         profile_groups.insert(0, ("基础画像".into(), insight_bullets));
     }
@@ -1186,6 +1363,12 @@ pub(crate) async fn build_reply_request_with(
 mod tests {
     use super::*;
 
+    /// Every line at its top tier: the gate passes everything recall fetched.
+    const OPEN_GATE: RecallGate = RecallGate {
+        bond_tier: 5,
+        chem_tier: 5,
+    };
+
     // ─── Integration tests: recall_memory_with_embedding ──────────────────
     //
     // These exercise the pure-DB half of the recall pipeline against a
@@ -1234,7 +1417,8 @@ mod tests {
             true,
             TEXT_RECALL_TIER,
         )
-        .await;
+        .await
+        .render(OPEN_GATE);
         assert!(profile.is_empty());
         assert!(relationship.is_empty());
     }
@@ -1284,7 +1468,8 @@ mod tests {
             true,
             TEXT_RECALL_TIER,
         )
-        .await;
+        .await
+        .render(OPEN_GATE);
         assert_eq!(
             profile_groups,
             vec![("近况".to_string(), vec!["profile fact".to_string()])]
@@ -1348,7 +1533,8 @@ mod tests {
             true,
             TEXT_RECALL_TIER,
         )
-        .await;
+        .await
+        .render(OPEN_GATE);
 
         // Categorised rows surfaced; raw row dropped because grouped path won.
         let labels: Vec<&str> = profile_groups.iter().map(|(l, _)| l.as_str()).collect();
@@ -1413,7 +1599,8 @@ mod tests {
             true,
             TEXT_RECALL_TIER,
         )
-        .await;
+        .await
+        .render(OPEN_GATE);
 
         // No categorised rows exist → raw fallback fires under "近况"
         // with PROFILE_RECALL_K entries from the cosine top-K.
@@ -1496,7 +1683,8 @@ mod tests {
             true,
             TEXT_RECALL_TIER,
         )
-        .await;
+        .await
+        .render(OPEN_GATE);
         assert_eq!(profile_groups.len(), 1);
         assert_eq!(profile_groups[0].0, "近况");
         assert_eq!(
@@ -1514,7 +1702,8 @@ mod tests {
             true,
             TEXT_RECALL_TIER,
         )
-        .await;
+        .await
+        .render(OPEN_GATE);
         assert_eq!(
             relationship2.first().map(String::as_str),
             Some("relationship target"),
@@ -1562,7 +1751,8 @@ mod tests {
             true,
             TEXT_RECALL_TIER,
         )
-        .await;
+        .await
+        .render(OPEN_GATE);
         assert!(prof.is_empty(), "profile groups must be empty when X off");
         assert_eq!(rel, vec!["relationship fact".to_string()]);
 
@@ -1576,7 +1766,8 @@ mod tests {
             false,
             TEXT_RECALL_TIER,
         )
-        .await;
+        .await
+        .render(OPEN_GATE);
         assert!(prof2.is_empty() && rel2.is_empty());
 
         // both on → both layers (sanity that the hot path still works)
@@ -1589,7 +1780,8 @@ mod tests {
             true,
             TEXT_RECALL_TIER,
         )
-        .await;
+        .await
+        .render(OPEN_GATE);
         assert!(
             !prof3.is_empty(),
             "profile groups should be present when X on"
@@ -1663,7 +1855,8 @@ mod tests {
             true,
             voice_tier,
         )
-        .await;
+        .await
+        .render(OPEN_GATE);
 
         // grouped_k=1 ⇒ each of the two categories is capped to a single
         // bullet even though 2 rows exist per category.
@@ -1724,7 +1917,8 @@ mod tests {
             true,
             voice_tier,
         )
-        .await;
+        .await
+        .render(OPEN_GATE);
 
         // No categorised rows exist ⇒ raw fallback fires under "近况",
         // capped to raw_k=2 even though 3 rows were seeded.
@@ -1735,6 +1929,254 @@ mod tests {
             2,
             "raw_k=2 must cap the 近况 fallback group to 2 rows"
         );
+    }
+
+    // ─── recall gate: memory layers (spec 2026-10-27 §2.5–2.7) ─────────
+
+    fn gate(bond_tier: u8, chem_tier: u8) -> RecallGate {
+        RecallGate {
+            bond_tier,
+            chem_tier,
+        }
+    }
+
+    async fn seed_profile_row(
+        pool: &PgPool,
+        session_id: Uuid,
+        user_id: Uuid,
+        content: &str,
+        seed: usize,
+        category: Option<&str>,
+        metadata: Option<serde_json::Value>,
+    ) {
+        MemoryRepo { pool }
+            .upsert(
+                MemoryLayer::Profile,
+                session_id,
+                user_id,
+                None,
+                content,
+                &unit_embedding(seed),
+                category,
+                metadata.as_ref(),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Text-tier recall with both layers on, rendered through `g`.
+    async fn recall_through(
+        pool: &PgPool,
+        user_id: Uuid,
+        instance_id: Uuid,
+        g: RecallGate,
+    ) -> (Vec<(String, Vec<String>)>, Vec<String>) {
+        recall_memory_with_embedding(
+            pool,
+            user_id,
+            instance_id,
+            &unit_embedding(7),
+            true,
+            true,
+            TEXT_RECALL_TIER,
+        )
+        .await
+        .render(g)
+    }
+
+    fn profile_items(groups: &[(String, Vec<String>)]) -> Vec<&str> {
+        groups
+            .iter()
+            .flat_map(|(_, items)| items.iter().map(String::as_str))
+            .collect()
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn render_routes_profile_rows_by_domain(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = make_session(&pool, user_id, Some(instance_id)).await;
+        let dom = |d: &str| Some(serde_json::json!({ "domain": d }));
+        seed_profile_row(
+            &pool,
+            session_id,
+            user_id,
+            "S",
+            7,
+            Some("preference"),
+            dom("sexuality"),
+        )
+        .await;
+        seed_profile_row(
+            &pool,
+            session_id,
+            user_id,
+            "R",
+            8,
+            Some("preference"),
+            dom("romance"),
+        )
+        .await;
+        seed_profile_row(
+            &pool,
+            session_id,
+            user_id,
+            "C",
+            9,
+            Some("fact"),
+            dom("career"),
+        )
+        .await;
+
+        let (groups, _) = recall_through(&pool, user_id, instance_id, gate(1, 3)).await;
+        let items = profile_items(&groups);
+        assert!(items.contains(&"R") && items.contains(&"C"), "{items:?}");
+        assert!(!items.contains(&"S"), "{items:?}");
+
+        let (groups, _) = recall_through(&pool, user_id, instance_id, gate(1, 4)).await;
+        let items = profile_items(&groups);
+        for c in ["S", "R", "C"] {
+            assert!(items.contains(&c), "{c} in {items:?}");
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn render_profile_k_ramps_by_higher_tier(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = make_session(&pool, user_id, Some(instance_id)).await;
+        for (i, c) in ["f1", "f2", "f3"].into_iter().enumerate() {
+            seed_profile_row(&pool, session_id, user_id, c, 7 + i, Some("fact"), None).await;
+        }
+        let count = |groups: Vec<(String, Vec<String>)>| profile_items(&groups).len();
+        assert_eq!(
+            count(
+                recall_through(&pool, user_id, instance_id, gate(1, 1))
+                    .await
+                    .0
+            ),
+            0
+        );
+        assert_eq!(
+            count(
+                recall_through(&pool, user_id, instance_id, gate(2, 1))
+                    .await
+                    .0
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                recall_through(&pool, user_id, instance_id, gate(3, 1))
+                    .await
+                    .0
+            ),
+            2
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn render_raw_fallback_follows_the_ramp(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = make_session(&pool, user_id, Some(instance_id)).await;
+        for i in 0..5 {
+            seed_profile_row(
+                &pool,
+                session_id,
+                user_id,
+                &format!("raw{i}"),
+                7 + i,
+                None,
+                None,
+            )
+            .await;
+        }
+        let (groups, _) = recall_through(&pool, user_id, instance_id, gate(1, 1)).await;
+        assert!(groups.is_empty(), "{groups:?}");
+        let (groups, _) = recall_through(&pool, user_id, instance_id, gate(1, 2)).await;
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, "近况");
+        assert_eq!(groups[0].1.len(), 2);
+        let (groups, _) = recall_through(&pool, user_id, instance_id, gate(3, 3)).await;
+        assert_eq!(groups[0].1.len(), 4);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn withheld_only_grouped_rows_do_not_fall_through_to_raw(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = make_session(&pool, user_id, Some(instance_id)).await;
+        let sexuality = Some(serde_json::json!({ "domain": "sexuality" }));
+        seed_profile_row(
+            &pool,
+            session_id,
+            user_id,
+            "S",
+            7,
+            Some("preference"),
+            sexuality,
+        )
+        .await;
+        seed_profile_row(&pool, session_id, user_id, "raw", 8, None, None).await;
+
+        let (groups, _) = recall_through(&pool, user_id, instance_id, gate(5, 3)).await;
+        assert!(groups.is_empty(), "{groups:?}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn non_string_domain_is_unrouted(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = make_session(&pool, user_id, Some(instance_id)).await;
+        let rows = [
+            ("n", "fact", serde_json::json!({ "domain": 42 })),
+            ("a", "event", serde_json::json!({ "domain": ["sexuality"] })),
+            ("z", "emotion", serde_json::json!({ "domain": null })),
+        ];
+        for (i, (content, category, meta)) in rows.into_iter().enumerate() {
+            seed_profile_row(
+                &pool,
+                session_id,
+                user_id,
+                content,
+                7 + i,
+                Some(category),
+                Some(meta),
+            )
+            .await;
+        }
+        let (groups, _) = recall_through(&pool, user_id, instance_id, gate(3, 1)).await;
+        let items = profile_items(&groups);
+        for c in ["n", "a", "z"] {
+            assert!(items.contains(&c), "{c} in {items:?}");
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn render_caps_relationship_recall_by_higher_tier(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = make_session(&pool, user_id, Some(instance_id)).await;
+        for i in 0..4 {
+            MemoryRepo { pool: &pool }
+                .upsert(
+                    MemoryLayer::Relationship,
+                    session_id,
+                    user_id,
+                    Some(instance_id),
+                    &format!("rel{i}"),
+                    &unit_embedding(7 + i),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        for (g, want) in [(gate(1, 1), 1), (gate(2, 1), 2), (gate(5, 5), 3)] {
+            let (_, rel) = recall_through(&pool, user_id, instance_id, g).await;
+            assert_eq!(rel.len(), want, "{g:?}");
+        }
     }
 
     // ─── human_insights_to_bullets ──────────────────────────────────────
@@ -1896,6 +2338,160 @@ mod tests {
 
         let off = load_human_insight_bullets(&pool, user_id, InsightMode::Off).await;
         assert!(off.is_empty());
+    }
+
+    // ─── recall gate: 基础画像 bullets (spec 2026-10-27 §2.4) ──────────
+
+    #[test]
+    fn insight_bullet_allowed_matches_the_leading_label_only() {
+        let s = RecallGate::STRANGER;
+        assert!(!insight_bullet_allowed("性癖：束缚", s));
+        assert!(!insight_bullet_allowed("感情观：慢热", s));
+        assert!(insight_bullet_allowed("职业：设计师", s));
+        assert!(insight_bullet_allowed("职业：性癖研究员", s));
+        let chem2 = RecallGate {
+            bond_tier: 1,
+            chem_tier: 2,
+        };
+        assert!(insight_bullet_allowed("感情观：慢热", chem2));
+        assert!(!insight_bullet_allowed("感情经历：单身两年", chem2));
+    }
+
+    #[test]
+    fn gated_full_bullets_unlock_field_by_field() {
+        let full = human_insights_to_bullets(&sample_human_row(), InsightMode::Full);
+        let keep = |g: RecallGate| -> Vec<String> {
+            full.iter()
+                .filter(|b| insight_bullet_allowed(b, g))
+                .cloned()
+                .collect()
+        };
+        let neutral = human_insights_to_bullets(&sample_human_row(), InsightMode::Neutral);
+        assert_eq!(keep(RecallGate::STRANGER), neutral);
+        assert_eq!(
+            keep(RecallGate {
+                bond_tier: 5,
+                chem_tier: 5
+            }),
+            full
+        );
+        let mid = keep(RecallGate {
+            bond_tier: 3,
+            chem_tier: 4,
+        });
+        for present in [
+            "性癖：束缚、角色扮演",
+            "感情经历：单身两年",
+            "家庭：独生女，父母在杭州",
+            "兴趣：登山、摄影",
+        ] {
+            assert!(mid.iter().any(|b| b == present), "{present}");
+        }
+        assert!(!mid
+            .iter()
+            .any(|b| b.starts_with("经济状况：") || b.starts_with("心理健康：")));
+    }
+
+    /// The reply builder gates 基础画像 by the turn's own affinity — the same
+    /// `DecisionInput.affinity` a group seat carries. `InsightsOnly` renders
+    /// Full bullets with both memory layers off, so no Voyage call runs.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn build_reply_request_gates_intimate_insights_by_affinity(pool: PgPool) {
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, owner).await;
+        let session_id = make_session(&pool, owner, Some(instance_id)).await;
+        let user_message_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.chat_messages (session_id, role, content) \
+             VALUES ($1, 'user', '你好') RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let insights = serde_json::json!({
+            "occupation": "工程师", "kinks": ["束缚"], "family": "独生女"
+        });
+        HumanInsightRepo { pool: &pool }
+            .replace_profile(owner, &project_profile(&insights))
+            .await
+            .unwrap();
+
+        let state = crate::routes::companion::test_state(pool.clone());
+        let plan = ActionPlan {
+            action_type: eros_engine_core::types::ActionType::ReplyText,
+            reply_style: eros_engine_core::types::ReplyStyle::Neutral,
+            affinity_deltas: Default::default(),
+            energy_cost: 0.0,
+            context_hints: vec![],
+            reply_mode: None,
+            nudges: Default::default(),
+            clothing: None,
+            image_caption: None,
+            image_ref: eros_engine_core::types::ImageRef::Face,
+            aspect_ratio: None,
+            action_response: None,
+        };
+        let system_with = |intimacy_tension: f64| {
+            let mut affinity = ladder_test_affinity(session_id, owner, instance_id);
+            affinity.trust = 0.0;
+            affinity.intrigue = 0.0;
+            affinity.intimacy = intimacy_tension;
+            affinity.tension = intimacy_tension;
+            let input = DecisionInput {
+                event: Event::UserMessage {
+                    content: "你好".into(),
+                    message_id: user_message_id,
+                    prompt_traits: vec![],
+                    audit: None,
+                    tier: None,
+                    memory_scope: MemoryScope::InsightsOnly,
+                    affinity_scope: Default::default(),
+                    quote: Default::default(),
+                    action: None,
+                    outfit: None,
+                },
+                affinity,
+                persona: ladder_test_persona(instance_id, owner),
+                signals: eros_engine_core::types::ConversationSignals {
+                    message_count: 1,
+                    hours_since_last_message: 0.1,
+                    ghost_streak: 0,
+                    hours_since_last_ghost: None,
+                },
+            };
+            let state = &state;
+            let plan = &plan;
+            async move {
+                let (req, _tags) = build_reply_request(
+                    state,
+                    &input,
+                    plan,
+                    session_id,
+                    owner,
+                    instance_id,
+                    user_message_id,
+                    &crate::prompt::NowContext::default(),
+                    false,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("build_reply_request succeeds");
+                req.messages[0].content.clone()
+            }
+        };
+
+        // chemistry 0.4 → tier 3; bond 0 → tier 1.
+        let sys = system_with(0.4).await;
+        assert!(sys.contains("职业：工程师"), "{sys}");
+        assert!(!sys.contains("性癖："), "{sys}");
+        assert!(!sys.contains("家庭："), "{sys}");
+
+        // chemistry 0.7 → tier 4.
+        let sys = system_with(0.7).await;
+        assert!(sys.contains("性癖：束缚"), "{sys}");
+        assert!(!sys.contains("家庭："), "{sys}");
     }
 
     // ─── audit_from_event ───────────────────────────────────────────────
