@@ -143,9 +143,10 @@ the user.
 **Erase before the caller deletes the user's sessions or persona instances.**
 The per-relationship insight tables (`user_insights`, `character_insights`,
 their snapshots and events) key on the instance alone, so they are reachable
-only while the instance row exists. **Quiesce the user's traffic first:** an
-extraction or rebuild already in flight can write after the erase commits, and
-a repeat call cleans up. The call is idempotent and returns per-table counts of
+only while the instance row exists. **Quiesce the user's traffic first:** a
+stage-1 extraction already in flight can write facts after the erase commits,
+and a repeat call cleans up. A rebuild in flight cannot: its write waits on the
+state-row lock the erase takes first, and then finds the user gone. The call is idempotent and returns per-table counts of
 rows deleted and rows blanked. What it removes, and what it blanks instead, is
 tabulated in [insights.md](../insights.md#erasure). Chat history stays the
 caller's own deletion.
@@ -157,7 +158,7 @@ caller's own deletion.
 | `PROFILE_REBUILD_DISABLED` | unset | `1` or `true` stops the idle-flush sweeper. |
 | `PROFILE_REBUILD_TICK_SECS` | `300` | Sweeper interval; `0` also stops it. |
 | `PROFILE_REBUILD_IDLE_SECS` | `3600` | How long a user's last new fact sits before the sweeper rebuilds. |
-| `PROFILE_REBUILD_BATCH` | `20` | Users rebuilt per tick. |
+| `PROFILE_REBUILD_BATCH` | `20` | Users rebuilt per tick, at least 1. |
 
 **With the sweeper off, only the count trigger fires**: a user is rebuilt when
 the run that just wrote facts brings `pending_facts` to 20. Facts that never
@@ -188,8 +189,9 @@ The release carries two migrations. `0079` creates `engine.human_facts`, `engine
    timestamp a day old.
 
 The migration prints its counts as a Postgres notice: `insights_2_backfill:
-events=<n> seeds=<n> pending=<n>`. **`pending` is the number of LLM calls the
-rebuild drain will make**, about one per profile row; the idle sweeper spends
+events=<n> seeds=<n> pending=<n>`. **`pending` is the number of users queued for
+a rebuild**: budget about one LLM call each (a user whose ledger stays empty
+costs none; a failed rebuild retries, at most three times); the idle sweeper spends
 them at `PROFILE_REBUILD_BATCH` users per `PROFILE_REBUILD_TICK_SECS`, and
 until a user's turn comes their old profile row keeps serving injection. With
 the sweeper off, each queued user is rebuilt at their next extraction run

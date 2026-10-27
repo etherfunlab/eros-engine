@@ -78,14 +78,14 @@ The reply is one JSON object whose `facts` is an array of objects: `content` plu
 What the engine does with the reply:
 
 - Parses it as JSON, the whole text first and then the first balanced `{…}` block. No parseable JSON ends the run (audit status `parse_error`).
-- Reads `facts` as an array and keeps the items that are objects with a non-blank `content`. Any other item is ignored, and a run that ignored any logs one warning with the count. A prompt still on a string-array contract therefore writes nothing to the ledger and warns on every run.
+- Reads `facts` as an array and keeps the items that are objects whose `content` is neither blank nor a placeholder (`string`, `null`, `unknown`, `n/a`, `未知`, `无`, or a `<…>` / `「<…>」` slot). Any other item is ignored, and a run that ignored any logs one warning with the count. A prompt still on a string-array contract therefore writes nothing to the ledger and warns on every run.
 - Folds labels into the vocabularies below; a missing or unlisted label never rejects a fact.
 - Ends the run when no usable fact remains (audit status `empty`).
 - Writes the usable facts to the ledger in one statement, so a failed write changes nothing and a retry cannot count a fact twice.
 
 ### Vocabularies
 
-The engine owns the vocabularies and validates every label against them. `content` is trimmed; blank `content` is skipped.
+The engine owns the vocabularies and validates every label against them. `content` is trimmed; blank or placeholder `content` is skipped.
 
 | Field | Values | Fallback |
 |-------|--------|----------|
@@ -145,7 +145,7 @@ After each extraction run that wrote or bumped N ≥ 1 ledger rows, `pending_fac
 - **Count.** When `pending_facts` reaches 20 after a run, that run's post-process task rebuilds inline. It is already off the reply path.
 - **Idle flush.** A sweeper wakes every `PROFILE_REBUILD_TICK_SECS`, claims up to `PROFILE_REBUILD_BATCH` users whose `pending_facts > 0` and whose `last_fact_at` is older than `PROFILE_REBUILD_IDLE_SECS`, longest-waiting first, and rebuilds them one after another. With the sweeper off, only the count trigger fires.
 
-A rebuild first claims the state row, so overlapping turns and the sweeper never rebuild one user twice. A claim older than 600 seconds is taken as a dead worker's and can be claimed again.
+A rebuild first claims the state row, so overlapping turns and the sweeper never rebuild one user twice. A claim older than 600 seconds is taken as a dead worker's and can be claimed again; the sweeper refreshes each claim right before that user's rebuild, so a long batch does not age its own tail into re-claimable claims.
 
 ### What a rebuild reads
 
@@ -180,7 +180,7 @@ The write is a **full replace** of the 19 fields in one statement: a field the r
 |---------|------|-------------|---------|
 | `ok` | The object projected to at least one field and the write succeeded. | Replaced. | `pending_facts = 0`, `last_rebuilt_at = now`, `rebuild_failures = 0`. |
 | `empty` | The user has no ledger rows (no call is made), or the reply is a JSON object with nothing writable (including `{}`). | Untouched. | Settled like `ok`: the batch is accepted as a residual, and the user's next facts arm the trigger again. |
-| `failed` | The ledger read failed, the call returned no reply, the reply is not a JSON object, or the write failed. | Untouched; the old row keeps serving. | `pending_facts` is kept and `last_fact_at = now`, so the idle flush waits another full idle period; `rebuild_failures` goes up by one. The third consecutive failure instead zeroes `pending_facts` and `rebuild_failures`. |
+| `failed` | The ledger read failed, the call returned no reply, the reply is not a JSON object, or the write failed. | Untouched; the old row keeps serving. | `pending_facts` is kept and `last_fact_at = now`, so the idle flush waits another full idle period (`PROFILE_REBUILD_IDLE_SECS`, one hour by default); `rebuild_failures` goes up by one. The third consecutive failure instead zeroes `pending_facts` and `rebuild_failures`. |
 
 A user with an unrebuildable ledger therefore costs at most three calls per burst of activity, never a call per tick. The claim is released in every outcome.
 
@@ -234,7 +234,7 @@ Three sub-trees of `/svc/v1/*`, each mounted only when its own secret is set, so
 All streams are keyset-paged with `since`, a tie-break id, and `limit` (default 500, clamped to 1..=1000); `next` is present only when the page is full and `null` means the walk is complete. Request and response shapes and polling guidance are in [api-reference.md](api-reference.md#service-endpoints).
 
 - **Profile export.** `GET /svc/v1/insights/changes` walks `human_insights` by `(updated_at, user_id)`. A row carries `user_id`, `updated_at` and every profile field **except `kinks`, `ideology` and `mental_health`: those three are never exported.**
-- **Facts export.** `GET /svc/v1/facts/changes` walks the ledger by `(last_seen_at, id)`. A row carries `id`, `user_id`, `content`, the six labels, `occurrences`, `session_count`, `recurrence`, `first_seen_at` and `last_seen_at`; the session, message and run pointers stay inside the engine. A repeat moves `last_seen_at`, so a row reappears in the stream each time its counters change. `last_seen_at` is stamped when the extraction run starts and the row is visible when the run commits, so a resuming poller overlaps by more than the extraction call's duration (minutes, not seconds).
+- **Facts export.** `GET /svc/v1/facts/changes` walks the ledger by `(last_seen_at, id)`. A row carries `id`, `user_id`, `content`, the six labels, `occurrences`, `session_count`, `recurrence`, `first_seen_at` and `last_seen_at`; the session, message and run pointers stay inside the engine. A repeat moves `last_seen_at`, so a row reappears in the stream each time its counters change. `first_seen_at` and `last_seen_at` are stamped by the ledger write itself (`now()`, and a recurrence never moves `last_seen_at` backwards), so a stamp precedes its commit by one short statement; a resuming poller overlaps by a few seconds.
 - **Deletions.** `GET /svc/v1/insights/deletions` and `GET /svc/v1/facts/deletions` are the same stream, one route per secret: user-level tombstones `{user_id, erased_at}` from `engine.user_erasures`, keyset-paged by `(erased_at, user_id)`. There is no per-fact deletion. **A consumer that mirrors profiles, memories or facts must honor this stream**: an erase deletes the rows it mirrors, and none of the changes feeds can report a row that is gone.
 - **Memories export.** `GET /svc/v1/memories/changes` is unchanged and carries no deletions of its own; its mirror learns about erased users from `insights/deletions`.
 
@@ -246,7 +246,7 @@ All streams are keyset-paged with `since`, a tie-break id, and `limit` (default 
 
 | Table | Scope |
 |-------|-------|
-| `human_facts`, `human_insights`, `human_insights_snapshot`, `companion_insights_snapshot`, `human_profile_state` | `user_id` |
+| `human_profile_state` (first: it is the lock that serializes the erase against an in-flight rebuild write), `human_facts`, `human_insights`, `human_insights_snapshot`, `companion_insights_snapshot` | `user_id` |
 | `companion_memories` | `user_id` (profile and relationship layers) |
 | `world_memories`, `world_states`, `world_enrollments`, `world_posts` (comments go with their post), `persona_story_insights`, `persona_story_memories`, `persona_story_events` | `owner_uid` |
 | `user_insights`, `user_insights_snapshot`, `character_insights`, `character_insights_snapshot` | the user's persona instances (`persona_instances.owner_uid`) |
@@ -269,7 +269,7 @@ The response is `{user_id, erased_at, deleted: {table: n}, blanked: {table: n}}`
 
 - **Idempotent.** A repeat finds nothing left, reports 0 everywhere, and moves `erased_at` forward, which re-announces the erasure on the deletion streams for a mirror that missed the first.
 - **Order.** Call it **before** deleting the user's sessions or persona instances. The insight chains key on the instance alone, so they are reachable only while the instance row exists.
-- **Quiesce first.** An extraction or rebuild already in flight can write after the erase commits; stop the user's traffic before calling, and call again to clean up if one slipped through.
+- **Quiesce first.** A stage-1 extraction already in flight can write facts after the erase commits; stop the user's traffic before calling, and call again to clean up if one slipped through. A rebuild in flight cannot write a profile back: it writes under the state row's lock, which the erase takes first, and then finds the user gone.
 - **Not touched.** Chat history (`chat_messages`, sessions, instances) belongs to the caller's own deletion flow.
 
 A table added later that carries a user attribution joins the erase in the change that adds it.

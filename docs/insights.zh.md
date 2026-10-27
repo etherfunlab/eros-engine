@@ -78,14 +78,14 @@ AI:   {assistant message}
 引擎对回复做的处理：
 
 - 按 JSON 解析，先解析整段文本，再解析第一个平衡的 `{…}` 块。解析不出 JSON，这次运行结束（审计状态 `parse_error`）。
-- 把 `facts` 当数组读，保留是对象且 `content` 非空白的项。其余任何项都被忽略，只要忽略了任何一项，这次运行就记录一条带数量的警告。仍停留在字符串数组契约的 prompt 因此不会往账本写任何东西，并且每次运行都告警。
+- 把 `facts` 当数组读，保留是对象、且 `content` 既非空白也非占位串（`string`、`null`、`unknown`、`n/a`、`未知`、`无`，或 `<…>` / `「<…>」` 形状的槽位）的项。其余任何项都被忽略，只要忽略了任何一项，这次运行就记录一条带数量的警告。仍停留在字符串数组契约的 prompt 因此不会往账本写任何东西，并且每次运行都告警。
 - 把标签收敛进下面的词表；缺失或不在词表里的标签从不拒绝一条事实。
 - 没有可用事实时结束这次运行（审计状态 `empty`）。
 - 用一条语句把可用事实写入账本，所以写入失败不改变任何东西，重试也不会把同一条事实计两次。
 
 ### 词表
 
-词表归引擎所有，每个标签都对照它校验。`content` 会 trim；`content` 为空白的项被跳过。
+词表归引擎所有，每个标签都对照它校验。`content` 会 trim；`content` 为空白或占位串的项被跳过。
 
 | 字段 | 取值 | 兜底 |
 |------|------|------|
@@ -145,7 +145,7 @@ AI:   {assistant message}
 - **计数。** 一次运行之后 `pending_facts` 达到 20，该运行的 post-process 任务就地重建。它本来就在回复路径之外。
 - **闲置清扫。** 清扫器每隔 `PROFILE_REBUILD_TICK_SECS` 醒来，认领至多 `PROFILE_REBUILD_BATCH` 个 `pending_facts > 0` 且 `last_fact_at` 早于 `PROFILE_REBUILD_IDLE_SECS` 的用户，等得最久的优先，然后逐个重建。清扫器关闭时，只有计数触发。
 
-重建先认领状态行，所以重叠的轮次与清扫器不会把同一个用户重建两次。超过 600 秒的认领被视为已死亡的 worker 留下的，可以被再次认领。
+重建先认领状态行，所以重叠的轮次与清扫器不会把同一个用户重建两次。超过 600 秒的认领被视为已死亡的 worker 留下的，可以被再次认领；清扫器在每个用户重建前刷新其认领，所以一个长批次不会把自己批尾的认领拖到可被再次认领。
 
 ### 重建读什么
 
@@ -180,7 +180,7 @@ AI:   {assistant message}
 |------|------|--------|--------|
 | `ok` | 对象至少投影出一个字段，且写入成功。 | 被替换。 | `pending_facts = 0`，`last_rebuilt_at = now`，`rebuild_failures = 0`。 |
 | `empty` | 用户没有账本行（不发起调用），或回复是没有可写内容的 JSON 对象（包括 `{}`）。 | 不动。 | 与 `ok` 一样落定：这批事实作为残余被接受，用户的下一批事实重新武装触发器。 |
-| `failed` | 账本读取失败、调用没有返回回复、回复不是 JSON 对象，或写入失败。 | 不动；旧行继续服务。 | 保留 `pending_facts`，并设 `last_fact_at = now`，于是闲置清扫再等一个完整的闲置时长；`rebuild_failures` 加一。第三次连续失败则改为把 `pending_facts` 与 `rebuild_failures` 清零。 |
+| `failed` | 账本读取失败、调用没有返回回复、回复不是 JSON 对象，或写入失败。 | 不动；旧行继续服务。 | 保留 `pending_facts`，并设 `last_fact_at = now`，于是闲置清扫再等一个完整的闲置时长（`PROFILE_REBUILD_IDLE_SECS`，默认一小时）；`rebuild_failures` 加一。第三次连续失败则改为把 `pending_facts` 与 `rebuild_failures` 清零。 |
 
 所以账本无法重建的用户，每一波活动至多花三次调用，绝不会每个 tick 一次。无论哪种结果，认领都会释放。
 
@@ -234,7 +234,7 @@ Off 什么都不读。渲染器只对非空白的值输出 bullet：
 所有流都用 keyset 分页：`since`、一个平局 id 和 `limit`（默认 500，夹在 1..=1000）；`next` 仅在页满时出现，`null` 表示遍历结束。请求与响应形状及轮询建议见 [api-reference.zh.md](api-reference.zh.md#服務端點)。
 
 - **画像导出。** `GET /svc/v1/insights/changes` 按 `(updated_at, user_id)` 遍历 `human_insights`。一行包含 `user_id`、`updated_at` 和除 `kinks`、`ideology`、`mental_health` 之外的每个画像字段：**这三个字段从不导出。**
-- **事实导出。** `GET /svc/v1/facts/changes` 按 `(last_seen_at, id)` 遍历账本。一行包含 `id`、`user_id`、`content`、六个标签、`occurrences`、`session_count`、`recurrence`、`first_seen_at` 和 `last_seen_at`；session、消息和 run 的指针留在引擎内部。一次复现会移动 `last_seen_at`，所以每当计数器变化，该行就会在流里再出现一次。`last_seen_at` 在抽取运行开始时打上，而行要等运行提交后才可见，所以续接的轮询方应当重叠超过抽取调用时长的区间（以分钟计，不是秒）。
+- **事实导出。** `GET /svc/v1/facts/changes` 按 `(last_seen_at, id)` 遍历账本。一行包含 `id`、`user_id`、`content`、六个标签、`occurrences`、`session_count`、`recurrence`、`first_seen_at` 和 `last_seen_at`；session、消息和 run 的指针留在引擎内部。一次复现会移动 `last_seen_at`，所以每当计数器变化，该行就会在流里再出现一次。`first_seen_at` 与 `last_seen_at` 由写账本的那条语句自己打上（`now()`，复现时 `last_seen_at` 只进不退），时间戳只比提交早一条短语句，所以续接的轮询方重叠几秒即可。
 - **删除。** `GET /svc/v1/insights/deletions` 与 `GET /svc/v1/facts/deletions` 是同一条流，每个 secret 一条路由：来自 `engine.user_erasures` 的用户级墓碑 `{user_id, erased_at}`，按 `(erased_at, user_id)` keyset 分页。没有逐条事实的删除。**镜像画像、记忆或事实的消费方必须遵守这条流**：抹除会删掉它所镜像的行，而任何 changes 流都无法报告一行已经不存在。
 - **记忆导出。** `GET /svc/v1/memories/changes` 不变，自己不带删除信息；它的镜像通过 `insights/deletions` 得知哪些用户被抹除。
 
@@ -246,7 +246,7 @@ Off 什么都不读。渲染器只对非空白的值输出 bullet：
 
 | 表 | 范围 |
 |----|------|
-| `human_facts`、`human_insights`、`human_insights_snapshot`、`companion_insights_snapshot`、`human_profile_state` | `user_id` |
+| `human_profile_state`（最先删：它是把抹除与进行中的重建写入串行化的那把锁）、`human_facts`、`human_insights`、`human_insights_snapshot`、`companion_insights_snapshot` | `user_id` |
 | `companion_memories` | `user_id`（画像层与关系层） |
 | `world_memories`、`world_states`、`world_enrollments`、`world_posts`（评论随帖子一起走）、`persona_story_insights`、`persona_story_memories`、`persona_story_events` | `owner_uid` |
 | `user_insights`、`user_insights_snapshot`、`character_insights`、`character_insights_snapshot` | 该用户的角色实例（`persona_instances.owner_uid`） |
@@ -269,7 +269,7 @@ Off 什么都不读。渲染器只对非空白的值输出 bullet：
 
 - **幂等。** 重复调用什么都找不到，各处报 0，并把 `erased_at` 往前移，让错过第一次的镜像在删除流上再次收到通知。
 - **顺序。** 在删除该用户的 session 或角色实例**之前**调用。几条 insight 链只以实例为键，所以只有实例行还在时才够得着它们。
-- **先静默流量。** 已经在进行中的抽取或重建可能在抹除提交之后写入；调用前先停掉该用户的流量，若仍有漏网，再调用一次清理。
+- **先静默流量。** 已经在进行中的第一段抽取可能在抹除提交之后写入事实；调用前先停掉该用户的流量，若仍有漏网，再调用一次清理。进行中的重建写不回画像：它在状态行的锁下写入，而抹除最先拿这把锁，之后它会发现用户已不在。
 - **不触碰。** 聊天历史（`chat_messages`、session、实例）属于调用方自己的删除流程。
 
 之后新增的、带用户归属的表，会在新增它的那次改动里加入抹除。

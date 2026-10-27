@@ -2572,7 +2572,7 @@ curl -H "x-facts-export-secret: $FACTS_EXPORT_SECRET" \
 
 A repeat moves `last_seen_at`, so a row reappears each time its counters change; deduplicate by `id`, last one wins. Rows leave the ledger only through an erase; see [`facts/deletions`](#get-svcv1factsdeletions).
 
-**Resuming the next poll.** Keep the last row's `(last_seen_at, id)`; start each new poll *before* it with no `after_id`. `last_seen_at` is stamped when the extraction run starts, before its model call, and the row is visible only when the run commits, so the overlap must exceed the extraction call's duration: minutes, not seconds.
+**Resuming the next poll.** Keep the last row's `(last_seen_at, id)`; start each new poll *before* it with no `after_id`. `last_seen_at` is stamped by the ledger write itself (`now()`; a recurrence never moves it backwards), so it precedes the commit by one short statement: an overlap of a few seconds is enough.
 
 ### `GET /svc/v1/facts/deletions`
 
@@ -2600,7 +2600,7 @@ curl -X POST -H "x-user-erase-secret: $USER_ERASE_SECRET" \
 
 - **Idempotent.** A repeat finds nothing left, reports `0` everywhere, and moves `erased_at` forward.
 - **Call it before deleting the user's sessions or persona instances.** The per-relationship insight tables key on the instance alone and are reachable only while the instance row exists.
-- **Stop the user's traffic first.** An extraction or rebuild already in flight can write after the erase commits; call again to clean up.
+- **Stop the user's traffic first.** A stage-1 extraction already in flight can write facts after the erase commits; call again to clean up. (A rebuild in flight cannot write a profile back.)
 
 ## Error responses
 
