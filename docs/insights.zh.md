@@ -165,12 +165,16 @@ AI:   {assistant message}
 模型返回一个带有上述字段的 JSON 对象（schema 里只有 `<…>` 占位，没有可能被抄回去的示例值）。prompt 带的规则：
 
 - 只填账本清楚支持的字段，其余省略。
+- 数组字段每个至多 12 项，按出现频次与新近度挑最重要的，不重复，也不换措辞重复。
 - `transient` 事实不进任何字段，除非它跨 session 反复出现。
 - `roleplay_expression` 事实只能进 `kinks`，并在短语里标明来自角色扮演；绝不进入现实生活的字段。
 - `mental_health` 只记用户自述；`ideology` 可以依据事实里表现出的行为，措辞留有余地。
 - `education_level` 是对象 `{"level", "status"}`；没有可写的内容时输出 `{}`。
+- 回复是一个紧凑的 JSON 对象，不带缩进和换行。
 
-写入之前，引擎把对象投影到各列，丢掉不携带信息的内容：标量必须是 JSON 字符串，数组只保留其中的字符串项，空白、`string`、`null`、`unknown`、`N/A`（不分大小写）、`未知`、`无`，或没填的 `<…>` / `「<…>」` 槽位，都被丢弃。`education_level.level` 与 `.status` 各自只在是上表中的代码时才保留。类型不对的值和未知的键被忽略。
+写入之前，引擎把对象投影到各列，丢掉不携带信息的内容：标量必须是 JSON 字符串，数组只保留其中的字符串项——每项取首次出现的那条、至多 12 项（`PROFILE_LIST_MAX_ITEMS`），所以无视上限或在同一批条目上打转的回复，写进去的行仍然有界——空白、`string`、`null`、`unknown`、`N/A`（不分大小写）、`未知`、`无`，或没填的 `<…>` / `「<…>」` 槽位，都被丢弃。`education_level.level` 与 `.status` 各自只在是上表中的代码时才保留。类型不对的值和未知的键被忽略。
+
+投影与写入之间还有两道看账本的闸，兜住无视 prompt 规则的回复（投影是纯函数，看不到账本）：账本只有 `roleplay_expression` 事实时，只保留 `kinks`；账本没有 `health` / `mental_health` 域的事实时，丢弃 `mental_health`。
 
 写入是一条语句**整体替换** 19 个字段：重建里省略的字段变空，`updated_at` 随之移动，这正是该行出现在 `GET /svc/v1/insights/changes` 里的原因。
 
@@ -179,7 +183,7 @@ AI:   {assistant message}
 | 结果 | 何时 | 画像行 | 计数器 |
 |------|------|--------|--------|
 | `ok` | 对象至少投影出一个字段，且写入成功。 | 被替换。 | `pending_facts = 0`，`last_rebuilt_at = now`，`rebuild_failures = 0`。 |
-| `empty` | 用户没有账本行（不发起调用），或回复是没有可写内容的 JSON 对象（包括 `{}`）。 | 不动。 | 与 `ok` 一样落定：这批事实作为残余被接受，用户的下一批事实重新武装触发器。 |
+| `empty` | 用户没有账本行，或只有从未跨 session 复现的 `transient` 事实（两种情况都不发起调用——正确的回复必然是 `{}`），或回复是没有可写内容的 JSON 对象（包括 `{}`）。 | 不动。 | 与 `ok` 一样落定：这批事实作为残余被接受，用户的下一批事实重新武装触发器。 |
 | `failed` | 账本读取失败、调用没有返回回复、回复不是 JSON 对象，或写入失败。 | 不动；旧行继续服务。 | 保留 `pending_facts`，并设 `last_fact_at = now`，于是闲置清扫再等一个完整的闲置时长（`PROFILE_REBUILD_IDLE_SECS`，默认一小时）；`rebuild_failures` 加一。第三次连续失败则改为把 `pending_facts` 与 `rebuild_failures` 清零。 |
 
 所以账本无法重建的用户，每一波活动至多花三次调用，绝不会每个 tick 一次。无论哪种结果，认领都会释放。
@@ -310,9 +314,9 @@ Off 什么都不读。渲染器只对非空白的值输出 bullet：
 | `facts` | `parse_error` | `NULL`。 |
 | `profile` | `ok` | 模型返回的 JSON 对象原样保留，包括 schema 之外的键。 |
 | `profile` | `empty` | 模型的 JSON 对象，其中没有可写内容。 |
-| `profile` | `parse_error` | `{"raw": "<回复的前 2000 个字符>"}`。 |
+| `profile` | `parse_error` | `{"raw": "<回复的前 2000 个字符>"}`；provider 报了 `finish_reason` 时一并记下（`"length"`：被 `max_tokens` 截断）。 |
 
-`stage = 'structured'` 的行（以及形如 `{"facts": [...], "details": [...]}` 的 `facts` payload）是此前流水线留下的历史，现在没有任何东西再写它们。传输错误不写行；账本为空的用户触发重建时，不发起调用，也不写行。
+`stage = 'structured'` 的行（以及形如 `{"facts": [...], "details": [...]}` 的 `facts` payload）是此前流水线留下的历史，现在没有任何东西再写它们。传输错误不写行；账本为空、或只有从未跨 session 复现的 `transient` 事实的用户触发重建时，不发起调用，也不写行。
 
 模型和 token 用量不在事件行上。抽取调用在 `llm_generations` 里记为任务 `insight_extraction`，重建记为 `profile_rebuild`，其 `session_id` 为 `NULL`：
 

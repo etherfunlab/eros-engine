@@ -624,7 +624,8 @@ two-call pipeline, and nothing writes them now.
   [objects]}`.
 - **`profile` payload.** The model's JSON object as returned (`ok`, or `empty`
   when nothing in it was writable), or `{"raw": "<first 2000 characters of the
-  reply>"}` on `parse_error`. A `profile` row has `NULL` `session_id` and
+  reply>"}` on `parse_error` — plus `finish_reason` when the provider reported
+  one (`"length"`: truncated at `max_tokens`). A `profile` row has `NULL` `session_id` and
   `message_id`: a rebuild is not a turn. Its `generation_id` joins
   `llm_generations` with task `profile_rebuild`.
 - **Erasure.** `POST /svc/v1/users/{user_id}/erase` sets `payload` to `NULL` on

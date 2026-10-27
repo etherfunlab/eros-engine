@@ -165,12 +165,16 @@ The labels are printed as their literal codes because the prompt's rules name th
 The model returns one JSON object with the fields above (the schema uses `<…>` placeholders only, never example values that could be copied back). Rules the prompt carries:
 
 - Fill only fields the ledger clearly supports; omit the rest.
+- The array fields carry at most 12 items each, picked by occurrence and recency, with no duplicates, verbatim or reworded.
 - `transient` facts stay out of every field unless they recur across sessions.
 - `roleplay_expression` facts go only into `kinks`, marked as roleplay inside the phrase; they never reach a real-life field.
 - `mental_health` is the user's self-report; `ideology` may rest on behavior shown in the facts, with hedged wording.
 - `education_level` is an object `{"level", "status"}`; `{}` when nothing is writable.
+- The reply is one compact JSON object, no indentation or newlines.
 
-Before writing, the engine projects the object onto the columns and drops what carries no information: a scalar must be a JSON string, an array keeps only its string items, and a value that is blank, `string`, `null`, `unknown`, `N/A` (any case), `未知`, `无`, or a `<…>` / `「<…>」` slot left unfilled is dropped. `education_level.level` and `.status` are each kept only when they are one of the codes in the table above. Wrong types and unknown keys are ignored.
+Before writing, the engine projects the object onto the columns and drops what carries no information: a scalar must be a JSON string, an array keeps only its string items — the first occurrence of each, at most 12 (`PROFILE_LIST_MAX_ITEMS`), so a reply that ignored the cap or looped on the same batch still writes a bounded row — and a value that is blank, `string`, `null`, `unknown`, `N/A` (any case), `未知`, `无`, or a `<…>` / `「<…>」` slot left unfilled is dropped. `education_level.level` and `.status` are each kept only when they are one of the codes in the table above. Wrong types and unknown keys are ignored.
+
+Two ledger-aware guards run between the projection and the write, for replies that ignored the prompt's rules (the projection is pure and cannot see the ledger): a ledger of only `roleplay_expression` facts keeps `kinks` and nothing else, and `mental_health` is dropped unless the ledger holds a `health` or `mental_health` fact.
 
 The write is a **full replace** of the 19 fields in one statement: a field the rebuild omits becomes empty, and `updated_at` moves, which is what moves the row through `GET /svc/v1/insights/changes`.
 
@@ -179,7 +183,7 @@ The write is a **full replace** of the 19 fields in one statement: a field the r
 | Outcome | When | Profile row | Counter |
 |---------|------|-------------|---------|
 | `ok` | The object projected to at least one field and the write succeeded. | Replaced. | `pending_facts = 0`, `last_rebuilt_at = now`, `rebuild_failures = 0`. |
-| `empty` | The user has no ledger rows (no call is made), or the reply is a JSON object with nothing writable (including `{}`). | Untouched. | Settled like `ok`: the batch is accepted as a residual, and the user's next facts arm the trigger again. |
+| `empty` | The user has no ledger rows, or only `transient` facts that never recurred across sessions (no call is made in either case — the correct reply is always `{}`), or the reply is a JSON object with nothing writable (including `{}`). | Untouched. | Settled like `ok`: the batch is accepted as a residual, and the user's next facts arm the trigger again. |
 | `failed` | The ledger read failed, the call returned no reply, the reply is not a JSON object, or the write failed. | Untouched; the old row keeps serving. | `pending_facts` is kept and `last_fact_at = now`, so the idle flush waits another full idle period (`PROFILE_REBUILD_IDLE_SECS`, one hour by default); `rebuild_failures` goes up by one. The third consecutive failure instead zeroes `pending_facts` and `rebuild_failures`. |
 
 A user with an unrebuildable ledger therefore costs at most three calls per burst of activity, never a call per tick. The claim is released in every outcome.
@@ -310,9 +314,9 @@ Each LLM call that returned a response writes one row to `engine.human_insights_
 | `facts` | `parse_error` | `NULL`. |
 | `profile` | `ok` | The model's JSON object as returned, off-schema keys included. |
 | `profile` | `empty` | The model's JSON object, with nothing writable in it. |
-| `profile` | `parse_error` | `{"raw": "<first 2000 characters of the reply>"}`. |
+| `profile` | `parse_error` | `{"raw": "<first 2000 characters of the reply>"}`, plus `finish_reason` when the provider reported one (`"length"`: truncated at `max_tokens`). |
 
-Rows with `stage = 'structured'` (and `facts` payloads of the form `{"facts": [...], "details": [...]}`) are history written by the previous pipeline; nothing writes them now. A transport error writes no row, and a rebuild for a user with an empty ledger makes no call and writes none.
+Rows with `stage = 'structured'` (and `facts` payloads of the form `{"facts": [...], "details": [...]}`) are history written by the previous pipeline; nothing writes them now. A transport error writes no row, and a rebuild for a user whose ledger is empty — or holds only `transient` facts that never recurred across sessions — makes no call and writes none.
 
 Model and token usage are not on the event row. The extraction call is recorded in `llm_generations` as task `insight_extraction`, the rebuild as `profile_rebuild` with a `NULL` `session_id`:
 
