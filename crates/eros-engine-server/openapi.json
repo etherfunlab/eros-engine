@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "eros-engine API",
-    "description": "Open-source AI companion engine — chat + 6-dim affinity + memory. Source of truth: src/routes/.",
+    "description": "Open-source AI companion engine — chat + 6-dim affinity + memory. Source of truth: src/routes/. When the deployment sets CALLER_SECRET, every bearer-authenticated route also requires the x-caller-secret header.",
     "license": {
       "name": "AGPL-3.0-only",
       "identifier": "AGPL-3.0-only"
@@ -7401,6 +7401,12 @@
         "scheme": "bearer",
         "bearerFormat": "JWT",
         "description": "Supabase JWT bearer token"
+      },
+      "caller_secret": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-caller-secret",
+        "description": "Deployment-wide caller secret; required on every bearer-authenticated route when the deployment sets CALLER_SECRET"
       },
       "facts_export_secret": {
         "type": "apiKey",

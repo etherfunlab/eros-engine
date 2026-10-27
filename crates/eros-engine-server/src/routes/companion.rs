@@ -1213,6 +1213,7 @@ pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
             reaction_emoji: None,
             byok: crate::state::ByokConfig::default(),
             byoc: crate::state::ByocConfig::default(),
+            caller_secret: crate::state::CallerSecretConfig::default(),
             insights_export: crate::state::InsightsExportConfig::default(),
             facts_export: crate::state::FactsExportConfig::default(),
             user_erase: crate::state::UserEraseConfig::default(),

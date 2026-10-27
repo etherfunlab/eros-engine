@@ -164,6 +164,13 @@ async fn run_migrations() -> Result<()> {
 async fn run_server() -> Result<()> {
     let cfg = ServerConfig::from_env().map_err(anyhow::Error::msg)?;
 
+    if !cfg.caller_secret.secrets.is_empty() {
+        tracing::info!(
+            keys = cfg.caller_secret.secrets.len(),
+            "caller secret gate ENABLED on the authenticated tree"
+        );
+    }
+
     if let Some(dir) = cfg.prompt_log_dir.as_ref() {
         if let Err(e) = std::fs::create_dir_all(dir) {
             tracing::warn!(error = %e, dir = %dir.display(),

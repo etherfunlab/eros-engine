@@ -5,10 +5,13 @@
 use utoipa::openapi::security::{ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 
+use crate::auth::middleware::CALLER_SECRET_HEADER;
 use crate::routes::svc::{ERASE_SECRET_HEADER, EXPORT_SECRET_HEADER, FACTS_SECRET_HEADER};
 
 /// Registers the security schemes used by handlers:
 ///   - `bearer` — Supabase JWT, attached to /comp/* and /bff/* routes
+///   - `caller_secret` — `x-caller-secret` header, required on the whole bearer tree when the
+///     deployment sets `CALLER_SECRET`; declared once, not per route
 ///   - `insights_export_secret` — `x-insights-export-secret` header, the insights /svc/v1/* routes
 ///   - `facts_export_secret` — `x-facts-export-secret` header, the facts /svc/v1/* routes
 ///   - `user_erase_secret` — `x-user-erase-secret` header, the user-erase /svc/v1/* routes
@@ -31,6 +34,14 @@ impl Modify for SecurityAddon {
                     .description(Some("Supabase JWT bearer token"))
                     .build(),
             ),
+        );
+        components.add_security_scheme(
+            "caller_secret",
+            SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::with_description(
+                CALLER_SECRET_HEADER,
+                "Deployment-wide caller secret; required on every bearer-authenticated route \
+                 when the deployment sets CALLER_SECRET",
+            ))),
         );
         components.add_security_scheme(
             "insights_export_secret",
@@ -62,7 +73,8 @@ impl Modify for SecurityAddon {
         title = "eros-engine API",
         version = env!("CARGO_PKG_VERSION"),
         description = "Open-source AI companion engine — chat + 6-dim affinity + memory. \
-                       Source of truth: src/routes/."
+                       Source of truth: src/routes/. When the deployment sets CALLER_SECRET, \
+                       every bearer-authenticated route also requires the x-caller-secret header."
     ),
     servers(
         (url = "http://localhost:8080", description = "Local dev")
@@ -80,3 +92,18 @@ impl Modify for SecurityAddon {
     modifiers(&SecurityAddon)
 )]
 pub struct ApiDoc;
+
+#[cfg(test)]
+mod tests {
+    use super::ApiDoc;
+    use utoipa::OpenApi;
+
+    #[test]
+    fn declares_the_caller_secret_scheme() {
+        let doc = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let s = &doc["components"]["securitySchemes"]["caller_secret"];
+        assert_eq!(s["type"], "apiKey");
+        assert_eq!(s["in"], "header");
+        assert_eq!(s["name"], "x-caller-secret");
+    }
+}
