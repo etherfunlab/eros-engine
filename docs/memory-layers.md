@@ -8,10 +8,10 @@ Two pgvector tables hold what the persona remembers about you. They serve differ
 
 | Layer | `instance_id` | What it holds | Lifetime |
 |-------|---------------|---------------|----------|
-| **Profile** | `NULL` | Cross-session facts about the user — things any persona could know. | Permanent |
+| **Profile** | `NULL` | Cross-session facts about the user — things any persona can come to know as it gets close to the user. | Permanent |
 | **Relationship** | `<uuid>` | Per-session callbacks — the small things this specific persona shared with this user. | Per session |
 
-The distinction matters because **persona stability across personas** is different from **intimacy within a relationship**. If you tell Aria you're allergic to peanuts, that's a profile fact — Kenji should know it too. If Aria mentioned she's reading Bishop tonight, that's a relationship memory — Kenji shouldn't pretend to know.
+The distinction matters because **persona stability across personas** is different from **intimacy within a relationship**. If you tell Aria you're allergic to peanuts, that's a profile fact — Kenji can know it too, once he and the user are past strangers (see [Affinity gate](#affinity-gate)). If Aria mentioned she's reading Bishop tonight, that's a relationship memory — Kenji shouldn't pretend to know.
 
 ## Storage
 
@@ -130,6 +130,45 @@ evaluation still run; there is currently no scope value that suppresses
 writing. The frontend's `/comp/user/{user_id}/profile` endpoint returns the
 typed `human_insights` row as a human-readable view of what's been collected.
 
+### Affinity gate
+
+`memory_scope` is the ceiling. Within it, the relationship's current affinity
+decides how much reaches the prompt: a persona the user barely knows doesn't
+know what they told other personas, and doesn't hold on to much of what they
+say. The gate reads the bond and chemistry tiers (1–5) of the time-decayed
+affinity ([affinity-model.md](affinity-model.md)); a pair with no affinity
+row is tier 1 on both lines. It only removes — nothing the scope excludes is
+ever added — and it applies on every injection path: text turns, each group
+seat (with that seat's own affinity), voice, and the text half of an image
+edit.
+
+- **基础画像 intimate fields** — each field reads one line and has a minimum
+  tier on it; the table is in [insights.md](insights.md#chat-prompt).
+- **Profile layer** — K follows the higher of the two tiers: tier 1 recalls
+  nothing from this layer, tier 2 half the usual K (rounded up), tier 3 and
+  above the usual K. Both the per-category grouped recall and the
+  uncategorized fallback follow it. On top of that, a row whose
+  `metadata.domain` mirrors an intimate field needs that field's tier:
+
+  | `metadata.domain` | Line | From tier | Mirrors |
+  |-------------------|------|-----------|---------|
+  | `sexuality`, `kink` | chemistry | 4 | `kinks` |
+  | `romance` | chemistry | 2 | `love_values` |
+  | `family` | bond | 3 | `family` |
+  | `finance` | bond | 4 | `finance_status` |
+  | `health`, `mental_health` | bond | 4 | `mental_health` |
+
+  The domain is the label the `memory_extraction` prompt writes
+  ([model-config.md](model-config.md)); it is matched trimmed and
+  case-insensitively. Any other value, a non-string, or no domain at all
+  passes on the K ramp alone. Uncategorized rows (raw turns, before the
+  dreaming sweeper reaches a user) carry no domain, so they are only
+  K-limited. Withheld rows still count toward their category's fetched K:
+  the search runs once at the usual K and the gate trims its result.
+- **Relationship layer** — K is the usual K capped at the higher tier
+  (text: 1 / 2 / 3 at tiers 1 / 2 / 3+; voice: 1 / 2). Content is not
+  filtered: it is what the user said to this persona.
+
 ### Voice turns
 
 The voice endpoint (`POST /comp/voice/{session_id}/turn/stream`) reads from
@@ -149,11 +188,15 @@ the request shape and [model-config.md](model-config.md) for the
   [API reference](api-reference.md#get-v2compsessionsession_ideffects));
   and the persona's needs at the call's start.
   Each part degrades independently; a failed assembly leaves the marker
-  unwritten so the next turn retries.
+  unwritten so the next turn retries. The marker never changes, but each
+  turn passes its 基础画像 bullets through the [affinity gate](#affinity-gate)
+  with that turn's tiers.
 - **Per-turn recall** — the same `companion_memories` search as the chat
   path (`memory_scope`-gated, cross-layer dedup via `memory_hygiene`) but at
   a much smaller K: grouped profile 1/category + raw fallback 2 +
-  relationship 2 (chat's tier is 2/4/3), wrapped in a 300 ms budget — a
+  relationship 2 (chat's tier is 2/4/3), then trimmed by the
+  [affinity gate](#affinity-gate) once the pair's affinity (read in parallel,
+  time-decayed like text) has landed; wrapped in a 300 ms budget — a
   timeout or search error just drops that turn's recall block, with a warn
   log, never an error frame. An utterance under 4 alphanumeric characters
   after stripping whitespace/punctuation (嗯 / 好啊 / 哈哈-style

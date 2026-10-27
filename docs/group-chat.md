@@ -97,7 +97,9 @@ client-side @, and an optional `member_scopes`: an object keyed by
 `member_session_id`, each value `{memory_scope?, affinity_scope?}` with the
 1:1 send's types. Each speaker runs on its own entry; a member without one,
 or a missing key inside one, gets the engine default for that field
-(`neutral_and_relationship`, `bond`), as every speaker did before. The map is
+(`neutral_and_relationship`, `bond`), as every speaker did before. Within its
+scope, each speaker is also narrowed by its own affinity with the user
+([affinity gate](memory-layers.md#affinity-gate)). The map is
 not stored; what the 1:1 send records for a scope, the speaker's row records.
 
 ```json

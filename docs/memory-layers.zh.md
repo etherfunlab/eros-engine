@@ -8,10 +8,10 @@
 
 | 層 | `instance_id` | 存甚麼 | 生命周期 |
 |---|---|---|---|
-| **Profile** | `NULL` | 跨 session 的事實——任何人格都能知道的東西。 | 永久 |
+| **Profile** | `NULL` | 跨 session 的事實——任何人格跟用户熟起来之后都能知道的东西。 | 永久 |
 | **Relationship** | `<uuid>` | per-session 的回想——這個特定人格跟這位用戶之間的小事。 | 隨 session |
 
-這個區分要緊，因為 **跨人格的角色穩定性** 跟 **單個關係內的親密度** 是不同的需求。如果你跟 Aria 說你對花生過敏，那是 profile 事實——Kenji 也應該知道。如果 Aria 提到她今晚在讀 Bishop，那是 relationship 記憶——Kenji 不應該假裝知道這事。
+這個區分要緊，因為 **跨人格的角色穩定性** 跟 **單個關係內的親密度** 是不同的需求。如果你跟 Aria 說你對花生過敏，那是 profile 事實——Kenji 和用户不再是陌生人之后也能知道（见[亲密度门控](#亲密度门控)）。如果 Aria 提到她今晚在讀 Bishop，那是 relationship 記憶——Kenji 不應該假裝知道這事。
 
 ## 存儲
 
@@ -125,6 +125,36 @@ handler（`pipeline::handlers`）从两个来源拼出画像 / 关系上下文�
 `/comp/user/{user_id}/profile` 端点返回类型化的 `human_insights` 行，作为已收集
 内容的人类可读视图。
 
+### 亲密度门控
+
+`memory_scope` 是上限。在它之内，这段关系当前的亲密度决定有多少内容进 prompt：
+一个跟用户还不熟的人格，不知道用户跟别的人格说过什么，也不会把用户说的话记得多清楚。
+门控读取时间衰减后亲密度的 bond 和 chemistry 两条线的档位（1–5，见
+[affinity-model.zh.md](affinity-model.zh.md)）；没有亲密度记录的组合两条线都按第 1 档算。
+它只做减法——scope 排除的东西永远不会被加回来——并且作用在每一条注入路径上：
+文字轮次、群聊里的每个席位（用该席位自己的亲密度）、语音，以及改图请求生成的文字回复。
+
+- **基础画像私密字段** —— 每个字段只看一条线，并有这条线上的起始档；对照表在
+  [insights.zh.md](insights.zh.md#聊天-prompt)。
+- **画像层** —— K 跟着两条线里较高的那一档走：第 1 档完全不召回这一层，第 2 档取平常 K
+  的一半（向上取整），第 3 档及以上取平常的 K。按类别分组的召回和未分类兜底都照此执行。
+  此外，`metadata.domain` 对应某个私密字段的记忆行，还要达到那个字段的档位：
+
+  | `metadata.domain` | 线 | 起始档 | 对应字段 |
+  |-------------------|----|--------|----------|
+  | `sexuality`、`kink` | chemistry | 4 | `kinks` |
+  | `romance` | chemistry | 2 | `love_values` |
+  | `family` | bond | 3 | `family` |
+  | `finance` | bond | 4 | `finance_status` |
+  | `health`、`mental_health` | bond | 4 | `mental_health` |
+
+  domain 是 `memory_extraction` prompt 写下的标签（见 [model-config.zh.md](model-config.zh.md)），
+  匹配时去掉首尾空白、不分大小写。其他取值、非字符串或没有 domain 的行只受 K 的限制。
+  未分类的行（原话行，dreaming 清扫器还没处理到这个用户之前）没有 domain，所以也只受 K 限制。
+  被扣下的行照样占它所在类别的检索名额：检索按平常的 K 只跑一次，门控再裁剪结果。
+- **关系层** —— K 是平常的 K，但不超过两条线里较高的那一档（文字：第 1 / 2 / 3+ 档分别
+  1 / 2 / 3 条；语音：1 / 2 条）。内容不过滤：这些是用户对这个人格说过的话。
+
 ### 语音轮次
 
 语音端点（`POST /comp/voice/{session_id}/turn/stream`）读取同样的两层，但走
@@ -140,10 +170,12 @@ handler（`pipeline::handlers`）从两个来源拼出画像 / 关系上下文�
   那条记录所属的文字 session 的余效（见
   [接口参考](api-reference.zh.md#get-v2compsessionsession_ideffects)）；以及
   通话开始时角色的需求。各部分
-  各自独立降级；组装失败时标记位不落，下一轮重试。
+  各自独立降级；组装失败时标记位不落，下一轮重试。标记位本身不变，但每一轮都用当轮的档位
+  让其中的基础画像 bullets 过一遍[亲密度门控](#亲密度门控)。
 - **逐轮召回** —— 与聊天路径相同的 `companion_memories` 检索（受
   `memory_scope` 门控，经 `memory_hygiene` 做跨层去重），但 K 值小得多：
-  分组画像 1/类别 + 原始兜底 2 + 关系记忆 2（聊天路径是 2/4/3），整体包在
+  分组画像 1/类别 + 原始兜底 2 + 关系记忆 2（聊天路径是 2/4/3），等这对组合的亲密度
+  （并行读取，和文字端一样做时间衰减）返回后再由[亲密度门控](#亲密度门控)裁剪；整体包在
   300 ms 预算里——超时或检索出错只是丢掉这一轮的召回块，打一条 warn 日志，
   绝不是 error 帧。去掉空白和标点后不足 4 个字母数字字符的话语（嗯 / 好啊 /
   哈哈这类应和词）直接跳过召回，不发起 embedding 调用。部署方可以用

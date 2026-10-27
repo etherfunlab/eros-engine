@@ -290,6 +290,9 @@ PDE 判定的 ghost 回合从不进入 `persist_with_event`：只有 `ghost_stre
   （见 [events 路由](api-reference.zh.md#post-v2compsessionsession_idevents)）。
 - 提出分开：两条档位阶梯（chemistry 比 bond 高出两档或更多）和最近三个被判官评过的回合推算出的 `patience`，
   决定她要不要提出先分开一阵（见[选择](life-events-needs.zh.md#提出分开的选择)）。
+- 召回门控：时间衰减后那行的 Bond 和 Chemistry 档位，决定哪些基础画像私密字段、哪些带 domain
+  标签的画像层记忆能进 prompt，以及每一层召回多少条；没有记录的组合两条线都按第 1 档算。
+  文字、群聊、语音和改图请求生成的文字回复都读衰减后的值（见 [memory-layers.zh.md](memory-layers.zh.md#亲密度门控)）。
 - Ghost 打分：`score = (1−intrigue)·0.4 + (1−patience)·0.4 + tension·0.2`，
   带硬否决（前 10 条消息、连续 ghost ≥2、1 小时冷却），阈值 `0.65`，会话已经
   ghost 过一次后升为 `0.85`。

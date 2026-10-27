@@ -236,6 +236,7 @@ Chemistry: `spark` / `flirtation` / `crush` / `lover` / `beloved`
 - ライフイベントの抽選 — intimacy rung が `ex_message`、`breakup`、`period_scare`(rung 1 では抽選されない)、`sudden_desire`、`pregnancy_scare`(rung 3 のみ)の可否と、`busy`、`in_battle`、女性ペルソナの `out_shopping` を告げるかどうか(rung 2 から)を決める。rung 2 からは、ショッピングの小さな発見(`saw_bag`、`saw_clothes`)で目に留まったものを「欲しい」と口に出すようにもなる(events ルートの説明は [API reference](api-reference.md#post-v2compsessionsession_idevents) を参照)。
 
 - 距離を置きたいという切り出し — 2 本のティア階段(chemistry が bond より 2 段階以上高い)と、直近 3 回のジャッジ採点ターンから導出された `patience` が、彼女が休みを切り出すかどうかを決める([選択](life-events-needs.md#the-ask-for-space-choice)を参照)。
+- リコールゲート — 時間減衰後の行の Bond と Chemistry のティアが、どの基礎プロフィールの親密フィールドとどの domain 付きプロフィール層メモリーがプロンプトに入るか、そして各層から何件リコールするかを決める。行がないペアは両ラインともティア 1 とみなす。テキスト、グループ、音声、画像編集のテキスト返信はいずれも減衰後の値を読む([memory-layers.md](memory-layers.md#affinity-gate)を参照)。
 
 - ゴーストスコアリング — `score = (1−intrigue)·0.4 + (1−patience)·0.4 + tension·0.2` を使い、ハード veto(最初の10メッセージ、streak ≥ 2、1時間クールダウン)と閾値 0.65(セッションが一度ゴーストした後は 0.85)を適用する。
 

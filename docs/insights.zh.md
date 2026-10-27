@@ -209,9 +209,24 @@ Off 什么都不读。渲染器只对非空白的值输出 bullet：
 
 一条 bullet 是 `{label}：{value}`，数组值用 `、` 连接。顺序固定：`职业`、`教育`、`学历`、`MBTI`、`意识形态`，然后是仅 Full 的字段（按上表顺序），再是 `作息`、`社交模式`、`性格特质`、`未来计划`。读取失败只记日志，不产生 bullet。见 [memory-layers.zh.md](memory-layers.zh.md#检索与注入)。
 
+**亲密度门控。** 在 Full 下，每个私密字段还要过这段关系的亲密度：它只看一条线，并且要到这条线的某一档才渲染（档位是时间衰减后亲密度的 1–5 档，见 [affinity-model.zh.md](affinity-model.zh.md)；没有亲密度记录的组合两条线都按第 1 档算）。另一条线再高也解不开它，所以刷友情刷不出恋爱那一侧的字段。
+
+| 字段（标签） | 线 | 起始档 |
+|--------------|----|--------|
+| `love_values`（`感情观`） | chemistry | 2（flirtation） |
+| `relationship_history`（`感情经历`） | chemistry | 3（crush） |
+| `kinks`（`性癖`） | chemistry | 4（lover） |
+| `interests`（`兴趣`） | bond | 2（friend） |
+| `emotional_needs`（`情感需求`） | bond | 3（close_friend） |
+| `family`（`家庭`） | bond | 3（close_friend） |
+| `finance_status`（`经济状况`） | bond | 4（confidant） |
+| `mental_health`（`心理健康`） | bond | 4（confidant） |
+
+门控按渲染后 bullet 开头的 `{label}：` 过滤，而且只做减法：中性字段从不受门控，`memory_scope` 之外的东西也不会被加进来。画像层记忆按 domain 路由用的是同一张表（[memory-layers.zh.md](memory-layers.zh.md#亲密度门控)）。
+
 ### 语音
 
-语音 session 首轮，引导快照用同一个函数渲染同样的 bullet，放在 `[关于他]` 下。档位取自首轮的 `memory_scope`（省略时为 Neutral），快照冻结进 `chat_sessions.metadata.voice_bootstrap`，所以之后该行的变化不会进入这通通话。读取失败不会被吞掉：快照不冻结，下一轮重试。见 [memory-layers.zh.md](memory-layers.zh.md#语音轮次)。
+语音 session 首轮，引导快照用同一个函数渲染同样的 bullet，放在 `[关于他]` 下。档位取自首轮的 `memory_scope`（省略时为 Neutral），快照冻结进 `chat_sessions.metadata.voice_bootstrap`，所以之后该行的变化不会进入这通通话。每一轮都用当轮的档位让冻结的 bullet 过一遍上面的亲密度门控：存下来的快照不变，进 prompt 的内容跟着这对组合的亲密度走。读取失败不会被吞掉：快照不冻结，下一轮重试。见 [memory-layers.zh.md](memory-layers.zh.md#语音轮次)。
 
 ### 画像端点
 
