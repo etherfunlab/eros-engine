@@ -2144,7 +2144,6 @@ mod tests {
         );
     }
 
-
     #[sqlx::test(migrations = "./migrations")]
     async fn ever_sees_rows_older_than_lookback(pool: PgPool) {
         let repo = EventRepo { pool: &pool };

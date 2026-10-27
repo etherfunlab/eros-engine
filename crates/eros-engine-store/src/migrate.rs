@@ -164,6 +164,22 @@ mod tests {
             .unwrap()
     }
 
+    /// The original chain never pinned pgvector's schema; the baseline must
+    /// not either, or a fresh install where the extension already lives
+    /// outside `public` (a managed-Postgres toggle) fails on the first
+    /// vector column.
+    #[test]
+    fn baseline_carries_no_schema_pinned_vector() {
+        assert!(
+            !BASELINE_SQL.contains("WITH SCHEMA public"),
+            "extension schema pinned"
+        );
+        assert!(
+            !BASELINE_SQL.contains("public.vector"),
+            "vector type/opclass schema-pinned"
+        );
+    }
+
     #[sqlx::test(migrations = false)]
     async fn upgrade_from_v2_3_1_collapses_and_applies_increments(pool: PgPool) {
         fabricate_v2_3_1(&pool).await;

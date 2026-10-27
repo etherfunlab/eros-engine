@@ -154,7 +154,7 @@ async fn run_migrations() -> Result<()> {
     tracing::info!("running migrations…");
     // Collapse-then-run: the store folds a pre-squash history onto the
     // baseline before sqlx validates it (see eros_engine_store::migrate).
-    eros_engine_store::migrate::migrate(&pool)
+    eros_engine_store::migrate(&pool)
         .await
         .context("migrate failed")?;
     tracing::info!("migrations applied");

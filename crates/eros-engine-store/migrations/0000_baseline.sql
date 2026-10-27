@@ -13,6 +13,10 @@
 -- The guard below only fires when raw sqlx is pointed at an existing
 -- database, which is unsupported; it aborts before touching anything.
 --
+-- FROZEN: any byte change to this file breaks checksum validation at
+-- version 0 for every existing database. Schema changes go in new
+-- incremental migrations, never here.
+--
 -- Spec: docs/superpowers/specs/2026-10-27-migration-baseline-squash-design.md
 
 DO $baseline_guard$
@@ -43,7 +47,7 @@ CREATE SCHEMA engine;
 -- Name: vector; Type: EXTENSION; Schema: -; Owner: -
 --
 
-CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;
+CREATE EXTENSION IF NOT EXISTS vector;
 
 
 --
@@ -387,7 +391,7 @@ CREATE TABLE engine.companion_memories (
     user_id uuid NOT NULL,
     instance_id uuid,
     content text NOT NULL,
-    embedding public.vector(512) NOT NULL,
+    embedding vector(512) NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     category text,
     metadata jsonb
@@ -608,7 +612,7 @@ CREATE TABLE engine.persona_story_memories (
     instance_id uuid NOT NULL,
     event_id uuid NOT NULL,
     content text NOT NULL,
-    embedding public.vector(512) NOT NULL,
+    embedding vector(512) NOT NULL,
     story_date date NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL
 );
@@ -687,7 +691,7 @@ CREATE TABLE engine.world_memories (
     owner_uid uuid NOT NULL,
     instance_id uuid NOT NULL,
     content text NOT NULL,
-    embedding public.vector(512) NOT NULL,
+    embedding vector(512) NOT NULL,
     script_date date NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL
 );
@@ -1457,7 +1461,7 @@ CREATE INDEX idx_llm_generations_task_created ON engine.llm_generations USING bt
 -- Name: idx_memories_embedding; Type: INDEX; Schema: engine; Owner: -
 --
 
-CREATE INDEX idx_memories_embedding ON engine.companion_memories USING ivfflat (embedding public.vector_cosine_ops) WITH (lists='100');
+CREATE INDEX idx_memories_embedding ON engine.companion_memories USING ivfflat (embedding vector_cosine_ops) WITH (lists='100');
 
 
 --
@@ -1499,7 +1503,7 @@ CREATE INDEX idx_persona_story_insights_owner ON engine.persona_story_insights U
 -- Name: idx_persona_story_memories_embedding; Type: INDEX; Schema: engine; Owner: -
 --
 
-CREATE INDEX idx_persona_story_memories_embedding ON engine.persona_story_memories USING ivfflat (embedding public.vector_cosine_ops) WITH (lists='100');
+CREATE INDEX idx_persona_story_memories_embedding ON engine.persona_story_memories USING ivfflat (embedding vector_cosine_ops) WITH (lists='100');
 
 
 --
@@ -1555,7 +1559,7 @@ CREATE INDEX idx_user_insights_snapshot_instance_time ON engine.user_insights_sn
 -- Name: idx_world_memories_embedding; Type: INDEX; Schema: engine; Owner: -
 --
 
-CREATE INDEX idx_world_memories_embedding ON engine.world_memories USING ivfflat (embedding public.vector_cosine_ops) WITH (lists='100');
+CREATE INDEX idx_world_memories_embedding ON engine.world_memories USING ivfflat (embedding vector_cosine_ops) WITH (lists='100');
 
 
 --
