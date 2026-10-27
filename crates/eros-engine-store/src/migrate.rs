@@ -31,6 +31,14 @@ pub enum MigrateFailure {
          0077); upgrade to v2.3.1 and run its migrations first"
     )]
     PredatesBaseline,
+    /// A folded history row is marked failed (`success = false`): the schema
+    /// may be half-applied, and folding would erase the marker sqlx's own
+    /// dirty check refuses on. Repair the history first.
+    #[error(
+        "migration version {0} is recorded as failed; repair the database's \
+         migration history before upgrading across the baseline"
+    )]
+    DirtyHistory(i64),
     #[error(transparent)]
     Migrate(#[from] sqlx::migrate::MigrateError),
     #[error(transparent)]
@@ -92,6 +100,16 @@ async fn collapse(pool: &PgPool) -> Result<(), MigrateFailure> {
     }
     if !floor_applied {
         return Err(MigrateFailure::PredatesBaseline);
+    }
+    let dirty: Option<i64> = sqlx::query_scalar(
+        "SELECT version FROM _sqlx_migrations \
+          WHERE version <= $1 AND NOT success ORDER BY version LIMIT 1",
+    )
+    .bind(FLOOR)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(v) = dirty {
+        return Err(MigrateFailure::DirtyHistory(v));
     }
 
     let folded = sqlx::query("DELETE FROM _sqlx_migrations WHERE version <= $1")
@@ -238,6 +256,24 @@ mod tests {
         );
         assert!(err.to_string().contains("v2.3.1"), "{err}");
         assert_eq!(bookkeeping(&pool).await.len(), 61, "history untouched");
+    }
+
+    /// A failed (dirty) row anywhere in the folded range marks a half-applied
+    /// schema; folding it away would erase the marker sqlx itself refuses on.
+    #[sqlx::test(migrations = false)]
+    async fn a_dirty_folded_row_is_refused_untouched(pool: PgPool) {
+        fabricate_v2_3_1(&pool).await;
+        sqlx::query("UPDATE _sqlx_migrations SET success = false WHERE version = 50")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let err = migrate(&pool).await.unwrap_err();
+        assert!(
+            matches!(err, MigrateFailure::DirtyHistory(50)),
+            "got: {err}"
+        );
+        assert!(err.to_string().contains("version 50"), "{err}");
+        assert_eq!(bookkeeping(&pool).await.len(), 78, "history untouched");
     }
 
     #[sqlx::test(migrations = false)]
