@@ -1418,6 +1418,39 @@ mod migration_tests {
             "indexes and constraints keep the old name: {leftovers:?}"
         );
 
+        // Renamed, not dropped: every object 0081 renames exists under its new name.
+        let renamed: Vec<String> = sqlx::query_scalar(
+            "SELECT c.relname::text FROM pg_class c \
+               JOIN pg_namespace n ON n.oid = c.relnamespace \
+              WHERE n.nspname = 'engine' AND c.relkind = 'i' \
+                AND c.relname LIKE 'idx\\_human\\_insights\\_events\\_%' \
+             UNION ALL \
+             SELECT con.conname::text FROM pg_constraint con \
+               JOIN pg_namespace n ON n.oid = con.connamespace \
+              WHERE n.nspname = 'engine' AND con.conname LIKE 'human\\_insights\\_events\\_%' \
+             ORDER BY 1",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            renamed,
+            [
+                "human_insights_events_generation_id_fkey",
+                "human_insights_events_message_id_fkey",
+                "human_insights_events_pkey",
+                "human_insights_events_session_id_fkey",
+                "human_insights_events_stage_check",
+                "human_insights_events_status_check",
+                "idx_human_insights_events_generation",
+                "idx_human_insights_events_message",
+                "idx_human_insights_events_run",
+                "idx_human_insights_events_session",
+                "idx_human_insights_events_user_time",
+            ],
+            "every index and constraint 0081 renames must exist under its new name"
+        );
+
         let backfill_gone: bool =
             sqlx::query_scalar("SELECT to_regprocedure('engine.insights_2_backfill()') IS NULL")
                 .fetch_one(&pool)
