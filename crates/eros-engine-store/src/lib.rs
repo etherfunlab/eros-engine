@@ -225,6 +225,7 @@ mod audit_helper_tests {
 #[cfg(test)]
 mod migration_tests {
     use sqlx::PgPool;
+    use uuid::Uuid;
 
     #[sqlx::test(migrations = "./migrations")]
     async fn human_insights_has_rls_enabled(pool: PgPool) {
@@ -1354,5 +1355,592 @@ mod migration_tests {
         .execute(&pool)
         .await;
         assert!(bad.is_err(), "an unknown stage must still be rejected");
+    }
+
+    // ─── 0080: backfill of the fact ledger ───────────────────────────────
+    //
+    // The migration has already run `engine.insights_2_backfill()` on the empty
+    // test database, so each test seeds first and then calls it itself.
+
+    /// One ledger row as the backfill tests read it back.
+    #[derive(Debug, sqlx::FromRow)]
+    struct LedgerRow {
+        content: String,
+        category: String,
+        domain: String,
+        evidence_type: String,
+        temporality: String,
+        persistence: String,
+        confidence: String,
+        occurrences: i32,
+        session_count: i32,
+        first_seen_at: chrono::DateTime<chrono::Utc>,
+        last_seen_at: chrono::DateTime<chrono::Utc>,
+        first_session_id: Option<Uuid>,
+        first_message_id: Option<Uuid>,
+        first_run_id: Option<Uuid>,
+        last_session_id: Option<Uuid>,
+        last_message_id: Option<Uuid>,
+        last_run_id: Option<Uuid>,
+    }
+
+    /// A whole-second instant, so earliest / latest are unambiguous.
+    fn at(secs: i64) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp(1_800_000_000 + secs, 0).expect("timestamp")
+    }
+
+    /// `(step, rows)` as the backfill reports them, in call order.
+    async fn run_backfill(pool: &PgPool) -> Vec<(String, i64)> {
+        sqlx::query_as("SELECT step, rows FROM engine.insights_2_backfill()")
+            .fetch_all(pool)
+            .await
+            .expect("engine.insights_2_backfill")
+    }
+
+    fn counts(report: &[(String, i64)]) -> Vec<i64> {
+        report.iter().map(|(_, rows)| *rows).collect()
+    }
+
+    async fn profile_row(pool: &PgPool, user_id: Uuid) {
+        sqlx::query("INSERT INTO engine.human_insights (user_id) VALUES ($1)")
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .expect("human_insights row");
+    }
+
+    /// A `stage = 'facts'`, `status = 'ok'` audit row created at `at(secs)`.
+    async fn facts_event(
+        pool: &PgPool,
+        user_id: Uuid,
+        run_id: Uuid,
+        pointers: (Option<Uuid>, Option<Uuid>),
+        secs: i64,
+        payload: Option<serde_json::Value>,
+    ) {
+        sqlx::query(
+            "INSERT INTO engine.companion_insights_events \
+               (run_id, user_id, session_id, message_id, stage, status, payload, created_at) \
+             VALUES ($1, $2, $3, $4, 'facts', 'ok', $5, $6)",
+        )
+        .bind(run_id)
+        .bind(user_id)
+        .bind(pointers.0)
+        .bind(pointers.1)
+        .bind(payload)
+        .bind(at(secs))
+        .execute(pool)
+        .await
+        .expect("companion_insights_events row");
+    }
+
+    async fn ledger(pool: &PgPool, user_id: Uuid) -> Vec<LedgerRow> {
+        sqlx::query_as(
+            "SELECT content, category, domain, evidence_type, temporality, persistence, \
+                    confidence, occurrences, session_count, first_seen_at, last_seen_at, \
+                    first_session_id, first_message_id, first_run_id, \
+                    last_session_id, last_message_id, last_run_id \
+             FROM engine.human_facts WHERE user_id = $1 ORDER BY content",
+        )
+        .bind(user_id)
+        .fetch_all(pool)
+        .await
+        .expect("human_facts rows")
+    }
+
+    async fn ledger_count(pool: &PgPool) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM engine.human_facts")
+            .fetch_one(pool)
+            .await
+            .expect("count human_facts")
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn backfill_groups_events_into_ledger_rows(pool: PgPool) {
+        let user = Uuid::new_v4();
+        profile_row(&pool, user).await;
+        let s1 = crate::testutil::seed_chat_session(&pool, user).await;
+        let s2 = crate::testutil::seed_chat_session(&pool, user).await;
+        let m1 = crate::testutil::seed_chat_message(&pool, s1).await;
+        let m2 = crate::testutil::seed_chat_message(&pool, s2).await;
+        let (run1, run2) = (Uuid::new_v4(), Uuid::new_v4());
+
+        facts_event(
+            &pool,
+            user,
+            run1,
+            (Some(s1), Some(m1)),
+            10,
+            Some(serde_json::json!({
+                "facts": ["a", "b", "c"],
+                "details": [
+                    {"content": "用户喜欢爬山。", "category": "preference", "domain": "hobby",
+                     "evidence_type": "explicit_statement", "temporality": "current",
+                     "persistence": "stable", "confidence": "high"},
+                    {"content": "用户关心选举", "category": "value", "domain": "politics",
+                     "evidence_type": "explicit_statement", "temporality": "current",
+                     "persistence": "stable", "confidence": "medium"},
+                    {"content": "用户住在海边", "category": "fact", "domain": "location_culture",
+                     "evidence_type": "explicit_statement", "temporality": "current",
+                     "persistence": "stable", "confidence": "high"}
+                ]
+            })),
+        )
+        .await;
+        facts_event(
+            &pool,
+            user,
+            run2,
+            (Some(s2), Some(m2)),
+            20,
+            Some(serde_json::json!({
+                "facts": ["a"],
+                "details": [
+                    {"content": "用户喜欢爬山", "category": "habit", "domain": "lifestyle",
+                     "evidence_type": "observed_behavior", "temporality": "past",
+                     "persistence": "transient", "confidence": "low"}
+                ]
+            })),
+        )
+        .await;
+
+        let report = run_backfill(&pool).await;
+        assert_eq!(
+            report,
+            [
+                ("events".to_string(), 2),
+                ("seeds".to_string(), 0),
+                ("pending".to_string(), 1)
+            ]
+        );
+
+        let rows = ledger(&pool, user).await;
+        assert_eq!(rows.len(), 2, "climbing merges, politics stays: {rows:?}");
+        assert!(
+            rows.iter().all(|r| r.content != "用户住在海边"),
+            "location_culture rows are dropped"
+        );
+
+        let ideology = rows.iter().find(|r| r.content == "用户关心选举").unwrap();
+        assert_eq!(ideology.domain, "ideology");
+        assert_eq!((ideology.occurrences, ideology.session_count), (1, 1));
+
+        let climb = rows
+            .iter()
+            .find(|r| r.content.starts_with("用户喜欢爬山"))
+            .unwrap();
+        // Text and labels come from the earliest sighting.
+        assert_eq!(climb.content, "用户喜欢爬山。");
+        assert_eq!(
+            (
+                climb.category.as_str(),
+                climb.domain.as_str(),
+                climb.evidence_type.as_str(),
+                climb.temporality.as_str(),
+                climb.persistence.as_str(),
+                climb.confidence.as_str()
+            ),
+            (
+                "preference",
+                "hobby",
+                "explicit_statement",
+                "current",
+                "stable",
+                "high"
+            )
+        );
+        assert_eq!((climb.occurrences, climb.session_count), (2, 2));
+        assert_eq!((climb.first_seen_at, climb.last_seen_at), (at(10), at(20)));
+        assert_eq!(
+            (
+                climb.first_session_id,
+                climb.first_message_id,
+                climb.first_run_id
+            ),
+            (Some(s1), Some(m1), Some(run1))
+        );
+        assert_eq!(
+            (
+                climb.last_session_id,
+                climb.last_message_id,
+                climb.last_run_id
+            ),
+            (Some(s2), Some(m2), Some(run2))
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn backfill_skips_users_without_profile_row(pool: PgPool) {
+        let user = Uuid::new_v4();
+        facts_event(
+            &pool,
+            user,
+            Uuid::new_v4(),
+            (None, None),
+            10,
+            Some(serde_json::json!({"details": [{"content": "用户喜欢爬山"}]})),
+        )
+        .await;
+
+        let report = run_backfill(&pool).await;
+        assert_eq!(counts(&report), [0, 0, 0]);
+        assert_eq!(ledger_count(&pool).await, 0);
+        let states: i64 = sqlx::query_scalar("SELECT count(*) FROM engine.human_profile_state")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(states, 0);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn backfill_seeds_profile_values_and_filters_examples(pool: PgPool) {
+        let user = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO engine.human_insights \
+               (user_id, occupation, interests, city, finance_status, mbti_guess, \
+                life_rhythm, family, education, updated_at) \
+             VALUES ($1, '在深圳一家中厂做后端工程师，常年加班，最近想跳槽', \
+                     ARRAY['周末常去爬山', '养了只橘猫', '周末打篮球'], 'x', '未知', \
+                     'N/A', '   ', 'Unknown', '无', $2)",
+        )
+        .bind(user)
+        .bind(at(5))
+        .execute(&pool)
+        .await
+        .expect("profile row");
+
+        let report = run_backfill(&pool).await;
+        assert_eq!(counts(&report), [0, 1, 1]);
+
+        let rows = ledger(&pool, user).await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "only the non-example interest survives: {rows:?}"
+        );
+        let seed = &rows[0];
+        assert_eq!(seed.content, "兴趣：周末打篮球");
+        assert_eq!(
+            (
+                seed.category.as_str(),
+                seed.domain.as_str(),
+                seed.evidence_type.as_str(),
+                seed.temporality.as_str(),
+                seed.persistence.as_str(),
+                seed.confidence.as_str()
+            ),
+            (
+                "preference",
+                "hobby",
+                "legacy_profile",
+                "unknown",
+                "unknown",
+                "unknown"
+            )
+        );
+        assert_eq!((seed.occurrences, seed.session_count), (1, 1));
+        assert_eq!((seed.first_seen_at, seed.last_seen_at), (at(5), at(5)));
+        assert_eq!(
+            [
+                seed.first_session_id,
+                seed.first_message_id,
+                seed.first_run_id,
+                seed.last_session_id,
+                seed.last_message_id,
+                seed.last_run_id
+            ],
+            [None; 6]
+        );
+    }
+
+    /// Every seeded column keeps its label, domain and category; the five
+    /// columns 2.0 added and the retired seven stay out.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn backfill_seed_mapping_covers_every_column(pool: PgPool) {
+        let user = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO engine.human_insights \
+               (user_id, occupation, mbti_guess, love_values, emotional_needs, life_rhythm, \
+                interests, personality_traits, deal_breakers, education, family, \
+                relationship_history, social_pattern, future_plans, finance_status, \
+                kinks, ideology, mental_health, education_level, education_status, \
+                city, location, hometown, nationality, preferred_gender, age_min, age_max) \
+             VALUES ($1, 'v1', 'v2', 'v3', 'v4', 'v5', ARRAY['v6a', 'v6b'], ARRAY['v7'], \
+                     ARRAY['v8'], 'v9', 'v10', 'v11', 'v12', 'v13', 'v14', \
+                     ARRAY['k'], 'i', 'm', 'bachelor', 'graduated', \
+                     'c', 'l', 'h', 'n', 'g', 20, 30)",
+        )
+        .bind(user)
+        .execute(&pool)
+        .await
+        .expect("profile row");
+
+        let report = run_backfill(&pool).await;
+        assert_eq!(counts(&report), [0, 15, 1]);
+
+        let mut rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT content, domain, category FROM engine.human_facts WHERE user_id = $1",
+        )
+        .bind(user)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        rows.sort();
+        let mut expected: Vec<(String, String, String)> = [
+            ("职业：v1", "career", "fact"),
+            ("MBTI：v2", "personality", "fact"),
+            ("感情观：v3", "romance", "value"),
+            ("情感需求：v4", "romance", "emotion"),
+            ("作息：v5", "lifestyle", "habit"),
+            ("兴趣：v6a", "hobby", "preference"),
+            ("兴趣：v6b", "hobby", "preference"),
+            ("性格特质：v7", "personality", "fact"),
+            ("择偶雷区：v8", "romance", "constraint"),
+            ("教育：v9", "education", "fact"),
+            ("家庭：v10", "family", "fact"),
+            ("感情经历：v11", "romance", "event"),
+            ("社交模式：v12", "friendship", "habit"),
+            ("未来计划：v13", "other", "goal"),
+            ("经济状况：v14", "finance", "fact"),
+        ]
+        .into_iter()
+        .map(|(c, d, k)| (c.to_string(), d.to_string(), k.to_string()))
+        .collect();
+        expected.sort();
+        assert_eq!(rows, expected);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn backfill_sets_pending_for_every_profile_row(pool: PgPool) {
+        let (a, b, kept) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for user in [a, b, kept] {
+            profile_row(&pool, user).await;
+        }
+        sqlx::query(
+            "INSERT INTO engine.human_profile_state (user_id, pending_facts, last_fact_at) \
+             VALUES ($1, 3, now())",
+        )
+        .bind(kept)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let report = run_backfill(&pool).await;
+        assert_eq!(counts(&report), [0, 0, 2]);
+
+        for user in [a, b] {
+            let (pending, old_enough): (i32, bool) = sqlx::query_as(
+                "SELECT pending_facts, last_fact_at < now() - interval '1 hour' \
+                 FROM engine.human_profile_state WHERE user_id = $1",
+            )
+            .bind(user)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(pending, 20);
+            assert!(old_enough, "the idle sweeper must see the queue as due");
+        }
+        let kept_pending: i32 = sqlx::query_scalar(
+            "SELECT pending_facts FROM engine.human_profile_state WHERE user_id = $1",
+        )
+        .bind(kept)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(kept_pending, 3, "an existing counter is left alone");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn backfill_is_idempotent(pool: PgPool) {
+        let user = Uuid::new_v4();
+        sqlx::query("INSERT INTO engine.human_insights (user_id, family) VALUES ($1, '独居')")
+            .bind(user)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let s = crate::testutil::seed_chat_session(&pool, user).await;
+        for (secs, content) in [(10, "用户喜欢爬山"), (20, "用户喜欢爬山。")] {
+            facts_event(
+                &pool,
+                user,
+                Uuid::new_v4(),
+                (Some(s), None),
+                secs,
+                Some(serde_json::json!({"details": [{"content": content}]})),
+            )
+            .await;
+        }
+
+        let first = run_backfill(&pool).await;
+        assert_eq!(counts(&first), [1, 1, 1]);
+        let before = ledger(&pool, user).await;
+
+        let second = run_backfill(&pool).await;
+        assert_eq!(counts(&second), [0, 0, 0]);
+        let after = ledger(&pool, user).await;
+        assert_eq!(after.len(), 2);
+        assert_eq!(
+            before
+                .iter()
+                .map(|r| (r.occurrences, r.session_count))
+                .collect::<Vec<_>>(),
+            after
+                .iter()
+                .map(|r| (r.occurrences, r.session_count))
+                .collect::<Vec<_>>(),
+            "a replay must not bump counters"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn backfill_tolerates_malformed_payloads(pool: PgPool) {
+        let user = Uuid::new_v4();
+        profile_row(&pool, user).await;
+        let payloads = [
+            None,
+            Some(serde_json::json!({"facts": []})),
+            Some(serde_json::json!({"details": {"content": "对象不是数组"}})),
+            Some(serde_json::json!({"details": "字符串"})),
+            Some(serde_json::json!({"details": ["字符串元素", 7, null]})),
+            Some(serde_json::json!({"details": [{}]})),
+            Some(serde_json::json!({"details": [{"content": 5}]})),
+            Some(serde_json::json!({"details": [{"content": "   "}]})),
+            Some(serde_json::json!({"details": [{"content": "只有内容"}]})),
+        ];
+        for (i, payload) in payloads.into_iter().enumerate() {
+            facts_event(&pool, user, Uuid::new_v4(), (None, None), i as i64, payload).await;
+        }
+
+        let report = run_backfill(&pool).await;
+        assert_eq!(counts(&report), [1, 0, 1]);
+
+        let rows = ledger(&pool, user).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row = &rows[0];
+        assert_eq!(row.content, "只有内容");
+        assert_eq!(
+            (
+                row.category.as_str(),
+                row.domain.as_str(),
+                row.evidence_type.as_str(),
+                row.temporality.as_str(),
+                row.persistence.as_str(),
+                row.confidence.as_str()
+            ),
+            ("other", "other", "unknown", "unknown", "unknown", "unknown")
+        );
+        assert_eq!((row.occurrences, row.session_count), (1, 1));
+    }
+
+    /// The SQL fold and `FactInput::from_json` must agree label for label.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn backfill_folds_labels_like_rust(pool: PgPool) {
+        let user = Uuid::new_v4();
+        profile_row(&pool, user).await;
+        let details = [
+            serde_json::json!({"content": "事实甲", "domain": "astrology", "category": "zodiac",
+                "evidence_type": "explicit_statement", "temporality": "current",
+                "persistence": "stable"}),
+            serde_json::json!({"content": "事实乙", "domain": "politics", "category": "value",
+                "evidence_type": "explicit_agreement", "temporality": "sometime",
+                "persistence": "ongoing", "confidence": "certain"}),
+            serde_json::json!({"content": "事实丙", "domain": "religion", "category": "roleplay_tendency",
+                "evidence_type": "roleplay_expression", "temporality": "future",
+                "persistence": "transient", "confidence": "low"}),
+            serde_json::json!({"content": "事实丁", "domain": "kink", "category": "preference",
+                "evidence_type": "made_up", "temporality": "past",
+                "persistence": "one_off", "confidence": "medium"}),
+        ];
+        facts_event(
+            &pool,
+            user,
+            Uuid::new_v4(),
+            (None, None),
+            1,
+            Some(serde_json::json!({ "details": details })),
+        )
+        .await;
+
+        run_backfill(&pool).await;
+
+        let rows = ledger(&pool, user).await;
+        assert_eq!(rows.len(), details.len());
+        for detail in &details {
+            let want = crate::human_fact::FactInput::from_json(detail).expect("valid fact");
+            let got = rows
+                .iter()
+                .find(|r| r.content == want.content)
+                .unwrap_or_else(|| panic!("no ledger row for {}", want.content));
+            assert_eq!(
+                (
+                    got.category.as_str(),
+                    got.domain.as_str(),
+                    got.evidence_type.as_str(),
+                    got.temporality.as_str(),
+                    got.persistence.as_str(),
+                    got.confidence.as_str()
+                ),
+                (
+                    want.category.as_str(),
+                    want.domain.as_str(),
+                    want.evidence_type.as_str(),
+                    want.temporality.as_str(),
+                    want.persistence.as_str(),
+                    want.confidence.as_str()
+                ),
+                "{}",
+                want.content
+            );
+        }
+    }
+
+    /// 0058 left the audit pointers unvalidated, so old rows can name a
+    /// session or message that no longer exists; the ledger's pointers are
+    /// validated, so the backfill must null those and still count the session.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn backfill_nulls_dangling_event_pointers(pool: PgPool) {
+        for constraint in [
+            "companion_insights_events_session_id_fkey",
+            "companion_insights_events_message_id_fkey",
+        ] {
+            sqlx::query(&format!(
+                "ALTER TABLE engine.companion_insights_events DROP CONSTRAINT {constraint}"
+            ))
+            .execute(&pool)
+            .await
+            .expect("drop the audit FK to fabricate a dangling row");
+        }
+        let user = Uuid::new_v4();
+        profile_row(&pool, user).await;
+        for secs in [10, 20] {
+            facts_event(
+                &pool,
+                user,
+                Uuid::new_v4(),
+                (Some(Uuid::new_v4()), Some(Uuid::new_v4())),
+                secs,
+                Some(serde_json::json!({"details": [{"content": "用户喜欢爬山"}]})),
+            )
+            .await;
+        }
+
+        let report = run_backfill(&pool).await;
+        assert_eq!(counts(&report), [1, 0, 1]);
+
+        let rows = ledger(&pool, user).await;
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!((row.occurrences, row.session_count), (2, 2));
+        assert_eq!(
+            [
+                row.first_session_id,
+                row.first_message_id,
+                row.last_session_id,
+                row.last_message_id
+            ],
+            [None; 4]
+        );
+        assert!(row.first_run_id.is_some() && row.last_run_id.is_some());
+        assert_ne!(row.first_run_id, row.last_run_id);
     }
 }
