@@ -757,5 +757,4 @@ ghosting 开关关闭时它不让任何轮次沉默，和任何离线时段一�
 - `crates/eros-engine-store/src/life_choices.rs::LifeChoiceRepo`：选择行、`pending`、`resolve_in_tx`、`growth_slowed`。
 - `crates/eros-engine-store/src/affinity.rs::AffinityRepo`：`persist_life_choice_drop_in_tx`、`last_judged_patiences`。
 - `crates/eros-engine-store/src/chat.rs::ChatRepo`：`set_needs` 与 `latest_needs`。
-- `crates/eros-engine-store/migrations/0070_chat_messages_needs_idx.sql` 与 `0072_persona_events.sql`：索引和表。
-- `crates/eros-engine-store/migrations/0076_life_choices.sql` 与 `0077_affinity_event_life_choice.sql`：选择表，以及放宽后的 affinity `event_type` 检查。
+- `crates/eros-engine-store/migrations/0000_baseline.sql`：事件表与选择表、needs 索引，以及放宽后的 affinity `event_type` 检查（由 baseline 之前的迁移链折叠而来）。

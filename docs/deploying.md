@@ -121,7 +121,7 @@ match eros_engine_core::ghost::decide(&affinity, signals) {
 }
 ```
 
-The migration files ship with the `eros-engine-store` crate under `migrations/`; point `sqlx::migrate!("<path>")` at that directory and run it against your pool. The macro needs a compile-time path, so vendor the directory or use a path dependency — the server itself does `sqlx::migrate!("../eros-engine-store/migrations")`.
+The migration files ship with the `eros-engine-store` crate under `migrations/` — a baseline plus the increments since it. Apply them by calling the crate's entry, which the engine's own `migrate` subcommand uses too: `eros_engine_store::migrate(&pool)`. It folds a pre-baseline history onto the baseline before sqlx validates it, so pointing raw `sqlx::migrate!` / `sqlx migrate run` at the directory fails on an existing database (works only on a fresh one) and is unsupported.
 
 ## Bring-your-own auth
 
@@ -148,7 +148,7 @@ Then inject your impl into `AppState.auth: Arc<dyn AuthValidator>`. The middlewa
 
 ## Bring-your-own Postgres
 
-Anything compatible with the sqlx Postgres driver works — Supabase, Neon, RDS, Crunchy Bridge, plain self-hosted. Hard requirement: pgvector extension installed (`CREATE EXTENSION vector;`). The engine creates its own schema (`CREATE SCHEMA IF NOT EXISTS engine;` in migration `0000_schema.sql`) so it coexists cleanly with whatever else is in the database.
+Anything compatible with the sqlx Postgres driver works — Supabase, Neon, RDS, Crunchy Bridge, plain self-hosted. Hard requirement: pgvector extension installed (`CREATE EXTENSION vector;`). The engine creates its own schema (`CREATE SCHEMA IF NOT EXISTS engine;` at the top of `0000_baseline.sql`) so it coexists cleanly with whatever else is in the database.
 
 If you're sharing a database with another service, the engine's tables stay in `engine.*` and never write to `public.*` — collision-free.
 

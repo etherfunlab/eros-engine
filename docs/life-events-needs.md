@@ -966,8 +966,6 @@ falling-out rows live in `engine.persona_events` like any event.
 - `crates/eros-engine-store/src/affinity.rs::AffinityRepo`: `persist_life_choice_drop_in_tx`,
   `last_judged_patiences`.
 - `crates/eros-engine-store/src/chat.rs::ChatRepo`: `set_needs` and `latest_needs`.
-- `crates/eros-engine-store/migrations/0070_chat_messages_needs_idx.sql` and
-  `0072_persona_events.sql`: the index and the table.
-- `crates/eros-engine-store/migrations/0076_life_choices.sql` and
-  `0077_affinity_event_life_choice.sql`: the choices table and the widened affinity
-  `event_type` check.
+- `crates/eros-engine-store/migrations/0000_baseline.sql`: the events and choices
+  tables, the needs index, and the widened affinity `event_type` check (folded
+  from the pre-baseline chain).

@@ -180,6 +180,4 @@ handler（`pipeline::handlers`）从两个来源拼出画像 / 关系上下文�
 - `crates/eros-engine-server/src/pipeline/dreaming.rs`——dreaming-lite 清扫器
 - `crates/eros-engine-server/src/pipeline/handlers.rs`——检索 + prompt 注入
 - `crates/eros-engine-server/src/pipeline/voice.rs`——语音轮次的引导快照 + 逐轮召回
-- `crates/eros-engine-store/migrations/0003_memory.sql`——schema + 索引 DDL
-- `crates/eros-engine-store/migrations/0006_memory_category.sql`——`category` 列
-- `crates/eros-engine-store/migrations/0032_companion_memories_metadata.sql`——`metadata` 列
+- `crates/eros-engine-store/migrations/0000_baseline.sql`——表、索引与 `category` / `metadata` 列（由 baseline 之前的迁移链折叠而来）

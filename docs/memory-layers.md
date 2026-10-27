@@ -196,6 +196,4 @@ Design specs:
 - `crates/eros-engine-server/src/pipeline/dreaming.rs` — dreaming-lite sweeper
 - `crates/eros-engine-server/src/pipeline/handlers.rs` — retrieval + prompt injection
 - `crates/eros-engine-server/src/pipeline/voice.rs` — voice-turn bootstrap snapshot + per-turn recall
-- `crates/eros-engine-store/migrations/0003_memory.sql` — schema + index DDL
-- `crates/eros-engine-store/migrations/0006_memory_category.sql` — `category` column
-- `crates/eros-engine-store/migrations/0032_companion_memories_metadata.sql` — `metadata` column
+- `crates/eros-engine-store/migrations/0000_baseline.sql` — the table, its indexes, and the `category` / `metadata` columns (folded from the pre-baseline chain)
