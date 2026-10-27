@@ -1580,7 +1580,7 @@ mod tests {
                 "{map}: {again}"
             );
         }
-        assert_eq!(again["deleted"].as_object().unwrap().len(), 14);
+        assert_eq!(again["deleted"].as_object().unwrap().len(), 15);
         assert_eq!(again["blanked"].as_object().unwrap().len(), 8);
         assert!(again["erased_at"].as_str().unwrap() > erased_at.as_str());
         assert_eq!(tombstone_count(&pool, user).await, 1);

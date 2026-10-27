@@ -45,6 +45,9 @@ const DERIVED: &[(&str, &str)] = &[
     ("human_facts", BY_USER),
     ("human_insights", BY_USER),
     ("human_insights_snapshot", BY_USER),
+    // Frozen history of the retired profile table; no writer remains, but rows
+    // written before it was retired are still attributed to their user.
+    ("companion_insights_snapshot", BY_USER),
     ("human_profile_state", BY_USER),
     ("companion_memories", BY_USER),
     ("world_memories", BY_OWNER),
@@ -217,6 +220,7 @@ mod tests {
         ("human_facts", "user_id = $1"),
         ("human_insights", "user_id = $1"),
         ("human_insights_snapshot", "user_id = $1"),
+        ("companion_insights_snapshot", "user_id = $1"),
         ("human_profile_state", "user_id = $1"),
         ("companion_memories", "user_id = $1"),
         ("world_enrollments", "owner_uid = $1"),
@@ -289,6 +293,8 @@ mod tests {
     const SEEDS: &[&str] = &[
         "INSERT INTO engine.human_insights_snapshot (user_id, snapshot, captured_at) \
          SELECT p.u, '{\"interests\":[\"jazz\"]}', now()",
+        "INSERT INTO engine.companion_insights_snapshot (user_id, insights, training_level, captured_at) \
+         SELECT p.u, '{\"interests\":[\"jazz\"]}', 0.5, now()",
         "INSERT INTO engine.world_enrollments (owner_uid) SELECT p.u",
         "INSERT INTO engine.world_states (owner_uid, seed, digests) \
          SELECT p.u, '{\"a\":1}', '{\"b\":2}'",
