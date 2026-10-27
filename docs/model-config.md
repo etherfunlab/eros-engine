@@ -112,9 +112,10 @@ parameters" under `[providers]` below.
 
 ```toml
 [providers]
-venice = { chat = "https://api.venice.ai/api/v1/chat/completions" }
-mixed  = { chat = "https://x/v1/chat/completions", embeddings = "https://x/v1/embeddings" }
-local  = { embeddings = "http://127.0.0.1:8080/v1/embeddings" }
+venice     = { chat = "https://api.venice.ai/api/v1/chat/completions" }
+demonroute = { chat = "https://api.demonroute.com/v1/chat/completions" }
+mixed      = { chat = "https://x/v1/chat/completions", embeddings = "https://x/v1/embeddings" }
+local      = { embeddings = "http://127.0.0.1:8080/v1/embeddings" }
 
 [providers.proxy]           # TOML section form works too
 chat    = "https://proxy.internal/v1/chat/completions"
@@ -164,9 +165,9 @@ Rules, all enforced at boot (the engine refuses to boot on any violation):
   kind of footgun. Every other name/value must be valid HTTP header material
   or the load refuses.
 - **API key** comes from the environment as `<NAME_UPPERCASED>_API_KEY`
-  (`venice` → `$VENICE_API_KEY`), one key covering both the `chat` and
-  `embeddings` endpoints of that entry, required only for providers actually
-  referenced by some model slug. Declared-but-unreferenced entries need no
+  (`venice` → `$VENICE_API_KEY`, `demonroute` → `$DEMONROUTE_API_KEY`), one
+  key covering both the `chat` and `embeddings` endpoints of that entry,
+  required only for providers actually referenced by some model slug. Declared-but-unreferenced entries need no
   key. `openrouter` keeps using the existing `$OPENROUTER_API_KEY` — the
   naming convention degenerates to the var that already exists.
 - **Model ids are the provider's own slugs**, sent verbatim — the engine

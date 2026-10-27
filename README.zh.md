@@ -140,6 +140,12 @@ cargo run -p eros-engine-server -- serve
 
 也可通过 [`prompt_traits`](docs/prompt-traits.zh.md) 调整每次请求的行为。引擎将其文本视为不透明内容，具体策略由你的前端或中间件负责。
 
+## 合作伙伴
+
+- **[DemonRoute](https://demonroute.com/etherfun)**——预付费、隐私优先的模型网关，提供开放权重模型与无审查模型。不记录 IP 日志，提示词从不留存。可通过 `[providers]` 与 BYOK 接入。→ [模型配置](docs/model-config.zh.md) · [BYOK](docs/byok.zh.md)
+
+<sub>合作伙伴链接可能为 eros-engine 带来推荐佣金。</sub>
+
 ## 贡献
 
 请阅读 [`CONTRIBUTING.md`](CONTRIBUTING.md)。贡献者须在首次 PR 时通过 cla-assistant.io 接受 [`CLA`](CLA.md)。

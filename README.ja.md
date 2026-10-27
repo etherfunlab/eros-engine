@@ -140,6 +140,12 @@ cargo run -p eros-engine-server -- serve
 
 リクエストごとの振る舞いは [`prompt_traits`](docs/prompt-traits.md) でも調整できます。エンジンはその文字列を解釈しないため、方針はフロントエンドまたはミドルウェア側で定義します。
 
+## パートナー
+
+- **[DemonRoute](https://demonroute.com/etherfun)** — オープンウェイトモデルと無検閲モデルを扱う、プリペイド式でプライバシー重視のゲートウェイ。IP ログを残さず、プロンプトも保持しません。`[providers]` と BYOK で利用できます。→ [Model config](docs/model-config.md) · [BYOK](docs/byok.md)
+
+<sub>パートナーリンクを経由すると、eros-engine が紹介報酬を受け取る場合があります。</sub>
+
 ## コントリビューション
 
 [`CONTRIBUTING.md`](CONTRIBUTING.md) をお読みください。初回 PR では cla-assistant.io を通じて [`CLA`](CLA.md) への同意が必要です。
