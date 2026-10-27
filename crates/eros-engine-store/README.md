@@ -16,7 +16,7 @@ Postgres + pgvector persistence for the [`eros-engine`](https://github.com/ether
 - `group` — group chat sessions and their members.
 - `pool` — `PgPool` construction helpers.
 
-SQL migrations ship inside this crate under [`migrations/`](https://github.com/etherfunlab/eros-engine/tree/main/crates/eros-engine-store/migrations) and can be applied with [`sqlx migrate run --source <path>`](https://docs.rs/sqlx).
+SQL migrations ship inside this crate under [`migrations/`](https://github.com/etherfunlab/eros-engine/tree/main/crates/eros-engine-store/migrations) (a baseline plus increments) and are applied with `eros_engine_store::migrate(&pool)`, which also folds a pre-baseline history onto the baseline; raw `sqlx migrate run` against the directory only works on a fresh database.
 
 ## Use it
 

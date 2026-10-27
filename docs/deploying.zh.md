@@ -121,7 +121,7 @@ match eros_engine_core::ghost::decide(&affinity, signals) {
 }
 ```
 
-迁移文件随 `eros-engine-store` crate 发布（`migrations/` 目录）；把 `sqlx::migrate!("<path>")` 指向该目录、对你的 pool 跑。这个宏要编译期路径，所以要么 vendor 这个目录、要么用 path 依赖——server 自己用的是 `sqlx::migrate!("../eros-engine-store/migrations")`。
+迁移文件随 `eros-engine-store` crate 发布（`migrations/` 目录）——一份 baseline 加其后的增量。应用方式是调用 crate 的入口（引擎自己的 `migrate` 子命令也走它）：`eros_engine_store::migrate(&pool)`。它会在 sqlx 校验前把 baseline 之前的历史折叠到 baseline 上，所以把裸 `sqlx::migrate!` / `sqlx migrate run` 指向该目录在已有数据库上会失败（只有全新库能跑通），不受支持。
 
 ## 自帶 Auth
 
@@ -148,7 +148,7 @@ impl AuthValidator for MyValidator {
 
 ## 自帶 Postgres
 
-任何 sqlx Postgres 驅動兼容的都能用——Supabase、Neon、RDS、Crunchy Bridge、純自托管都行。硬要求：裝了 pgvector extension（`CREATE EXTENSION vector;`）。引擎自己建 schema（遷移 `0000_schema.sql` 裡的 `CREATE SCHEMA IF NOT EXISTS engine;`），跟數據庫裡其他東西可以乾淨共存。
+任何 sqlx Postgres 驅動兼容的都能用——Supabase、Neon、RDS、Crunchy Bridge、純自托管都行。硬要求：裝了 pgvector extension（`CREATE EXTENSION vector;`）。引擎自己建 schema（`0000_baseline.sql` 開頭的 `CREATE SCHEMA IF NOT EXISTS engine;`），跟數據庫裡其他東西可以乾淨共存。
 
 如果跟另一個服務共用一個數據庫，引擎的表都在 `engine.*` 下、永不寫 `public.*`——零衝突。
 
