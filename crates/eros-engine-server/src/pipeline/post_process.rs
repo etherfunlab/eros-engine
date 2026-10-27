@@ -8,13 +8,14 @@
 //! - All DB writes go through `eros-engine-store` repos (`AffinityRepo`,
 //!   `MemoryRepo`, `InsightEventRepo`, `ChatRepo`) instead of inline
 //!   `sqlx::query`.
-//! - Insight extraction (`extract_insights`) distils the turn's facts; the
-//!   audit trail lands in `companion_insights_events`.
+//! - Insight extraction (`extract_insights`) distils the turn's facts into the
+//!   user's fact ledger; the audit trail lands in `companion_insights_events`.
 //! - Ghost-streak reset on Reply/Proactive happens in the orchestrator
 //!   (`pipeline::run`) before this function is spawned, since the store
 //!   crate's `AffinityRepo::persist_with_event` deliberately does not
 //!   touch `ghost_streak`.
 
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use eros_engine_core::persona::CompanionPersona;
@@ -27,8 +28,10 @@ use eros_engine_store::character_insight::{
     CharacterInsightEventRepo, CharacterInsightRepo,
 };
 use eros_engine_store::chat::ChatRepo;
+use eros_engine_store::human_fact::{FactInput, FactSource, HumanFactRepo};
 use eros_engine_store::insight::{InsightEventInsert, InsightEventRepo};
 use eros_engine_store::memory::{MemoryLayer, MemoryRepo};
+use eros_engine_store::profile_state::{ProfileStateRepo, REBUILD_K};
 use eros_engine_store::user_insight::{
     existing_as_extraction_json as user_existing_json, UserInsightEventInsert,
     UserInsightEventRepo, UserInsightRepo,
@@ -1328,10 +1331,11 @@ struct CallAudit {
     generation_id: Option<String>,
 }
 
-/// Top-level entry: extract the turn's facts.
+/// Top-level entry: extract the turn's facts, record them in the user's fact
+/// ledger, and rebuild the derived profile once enough have piled up.
 /// Writes one companion_insights_events row per OpenRouter call that returned a
-/// response, tied by a shared run_id. Fail-open: an audit-row insert failure
-/// only warns and never breaks the turn.
+/// response. Fail-open: an audit-row or ledger write failure only warns and
+/// never breaks the turn.
 async fn extract_insights(
     state: &AppState,
     session_id: Uuid,
@@ -1342,6 +1346,7 @@ async fn extract_insights(
     audit_user: Option<&str>,
 ) {
     let run_id = Uuid::new_v4();
+    let seen_at = Utc::now();
 
     let (facts, facts_audit) = extract_facts(
         &state.openrouter,
@@ -1369,7 +1374,65 @@ async fn extract_insights(
         return;
     }
 
-    tracing::debug!("ledger write lands in a later task");
+    let pending = record_facts(
+        state, user_id, session_id, message_id, run_id, seen_at, &facts,
+    )
+    .await;
+    // The claim is taken before the rebuild so that overlapping turns and the
+    // idle sweeper never rebuild the same user twice.
+    if pending.is_some_and(|p| p >= REBUILD_K) {
+        let claimed = (ProfileStateRepo { pool: &state.pool })
+            .claim(user_id, state.config.profile_rebuild.claim_stale)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(%user_id, "profile rebuild claim failed: {e}");
+                false
+            });
+        if claimed {
+            crate::pipeline::profile_rebuild::rebuild_user(state, user_id).await;
+        }
+    }
+}
+
+/// Record one run's facts in the ledger and add them to the user's rebuild
+/// counter. Returns the counter after the bump, or `None` when either write
+/// fails: a ledger failure must not move the counter, and a counter failure
+/// leaves the idle sweeper without a count to act on until the next fact.
+async fn record_facts(
+    state: &AppState,
+    user_id: Uuid,
+    session_id: Uuid,
+    message_id: Uuid,
+    run_id: Uuid,
+    seen_at: DateTime<Utc>,
+    facts: &[FactInput],
+) -> Option<i32> {
+    let src = FactSource {
+        session_id: Some(session_id),
+        message_id: Some(message_id),
+        run_id: Some(run_id),
+        seen_at,
+    };
+    let written = match (HumanFactRepo { pool: &state.pool })
+        .upsert_run(user_id, facts, &src)
+        .await
+    {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(%user_id, "fact ledger write failed: {e}");
+            return None;
+        }
+    };
+    match (ProfileStateRepo { pool: &state.pool })
+        .bump(user_id, written as i32)
+        .await
+    {
+        Ok(pending) => Some(pending),
+        Err(e) => {
+            tracing::warn!(%user_id, "profile rebuild counter bump failed: {e}");
+            None
+        }
+    }
 }
 
 /// Fail-open insert of one companion_insights_events row. Never returns an
@@ -1407,14 +1470,13 @@ async fn extract_facts(
     user_msg: &str,
     assistant_msg: &str,
     audit_user: Option<&str>,
-) -> (Vec<String>, Option<CallAudit>) {
+) -> (Vec<FactInput>, Option<CallAudit>) {
     if user_msg.trim().is_empty() {
         return (vec![], None);
     }
     let Some(resolved) = model_config.resolve_insight_extract() else {
-        // Defensive skip: production configs always set insight_extraction.filter_prompt
-        // (enforced by the boot gate added in this change set — see main.rs). Without it
-        // there is no instruction to extract with, so do nothing rather than guess.
+        // An absent `[tasks.insight_extraction]` section is the supported off
+        // state: no instruction to extract with, so no call and no audit row.
         return (vec![], None);
     };
 
@@ -1464,16 +1526,27 @@ async fn extract_facts(
     let parsed = super::parse_llm_json::<serde_json::Value>(&raw);
     match parsed {
         Some(v) => {
-            let facts = extract_facts_array(&v);
-            // Opaque sibling of `facts`: per-fact structured metadata emitted by
-            // dual-track prompts. The engine never validates items or zips them
-            // against `facts` — vocabulary and the facts[i]==details[i].content
-            // contract are prompt-level concerns.
-            let details = extract_details_array(&v);
+            let (facts, ignored) = parse_fact_objects(&v);
+            // Items outside the object contract are dropped, never repaired.
+            // A prompt still on the string-array contract makes every item
+            // land here, so the warning is the only sign that no fact reaches
+            // the ledger.
+            if ignored > 0 {
+                tracing::warn!(
+                    ignored,
+                    "fact extraction: ignored fact items that are not objects with content \
+                     (a prompt still on the string-array contract yields only these)"
+                );
+            }
             let status = if facts.is_empty() { "empty" } else { "ok" };
+            // The audit row keeps the array exactly as the model emitted it.
+            let emitted = v
+                .get("facts")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([]));
             let audit = CallAudit {
                 status,
-                payload: Some(serde_json::json!({ "facts": facts, "details": details })),
+                payload: Some(serde_json::json!({ "facts": emitted })),
                 generation_id,
             };
             (facts, Some(audit))
@@ -1487,6 +1560,18 @@ async fn extract_facts(
             }),
         ),
     }
+}
+
+/// The usable facts in `v["facts"]`, and how many array items were not usable
+/// (not an object, or blank `content`). A missing or non-array `facts` is
+/// `(vec![], 0)`.
+fn parse_fact_objects(v: &serde_json::Value) -> (Vec<FactInput>, usize) {
+    let Some(items) = v.get("facts").and_then(|a| a.as_array()) else {
+        return (vec![], 0);
+    };
+    let facts: Vec<FactInput> = items.iter().filter_map(FactInput::from_json).collect();
+    let ignored = items.len() - facts.len();
+    (facts, ignored)
 }
 
 fn extract_facts_array(v: &serde_json::Value) -> Vec<String> {
@@ -1707,10 +1792,9 @@ async fn extract_character_facts(
             )
         }
         // The unparseable reply is KEPT: a whole-turn refusal and malformed
-        // JSON are otherwise the same row. All three chains' structuring
-        // stages keep it too (including the human chain's, since its
-        // stage-2 split); `extract_facts`, the human chain's own extraction
-        // stage, is the one place that still discards it.
+        // JSON are otherwise the same row. The character and user chains'
+        // structuring stages keep it too; `extract_facts`, the human chain's
+        // only stage, is the one place that still discards it.
         None => (
             vec![],
             Some(CallAudit {
@@ -2131,9 +2215,8 @@ mod tests {
 
     // ─── Shared test seeding + mock-OpenRouter helpers ────────────────
     //
-    // Extracted from the setup `insight_extraction_writes_two_events_
-    // sharing_run_id` used to build inline; both the human-chain insight
-    // tests and the new user-insight tests below need the same shape.
+    // The human-chain insight tests and the user-insight tests share the same
+    // seeding and mock-server shape.
 
     /// Seed a throwaway persona_instances row (genome + instance, random
     /// owner) and return its id. The user-insight chain is keyed on this,
@@ -2350,6 +2433,65 @@ mod tests {
     fn client_id_from_event_none_for_non_user_message() {
         let event = Event::ProactiveTrigger;
         assert_eq!(client_id_from_event(&event), None);
+    }
+
+    #[test]
+    fn parse_fact_objects_reads_object_items() {
+        let v = serde_json::json!({"facts": [
+            {"content": "在深圳工作", "category": "fact", "domain": "career"},
+            {"content": "喜欢爬山", "category": "preference"},
+        ]});
+        let (facts, ignored) = parse_fact_objects(&v);
+        assert_eq!(ignored, 0);
+        assert_eq!(facts.len(), 2);
+        assert_eq!(facts[0].content, "在深圳工作");
+        assert_eq!(facts[0].domain, "career");
+        assert_eq!(facts[1].category, "preference");
+        assert_eq!(
+            facts[1].domain, "other",
+            "a missing label folds, not rejects"
+        );
+    }
+
+    #[test]
+    fn parse_fact_objects_ignores_string_items() {
+        let v = serde_json::json!({
+            "facts": ["a", "b"],
+            "details": [{"content": "a"}, {"content": "b"}],
+        });
+        let (facts, ignored) = parse_fact_objects(&v);
+        assert!(facts.is_empty());
+        assert_eq!(ignored, 2);
+    }
+
+    #[test]
+    fn parse_fact_objects_skips_blank_content_items() {
+        let v = serde_json::json!({"facts": [
+            {"content": "   "},
+            {"content": "ok"},
+            {"domain": "career"},
+            {"content": 7},
+            42,
+        ]});
+        let (facts, ignored) = parse_fact_objects(&v);
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].content, "ok");
+        assert_eq!(ignored, 4);
+    }
+
+    #[test]
+    fn parse_fact_objects_missing_or_non_array_facts_is_empty() {
+        for v in [
+            serde_json::json!({}),
+            serde_json::json!({"facts": null}),
+            serde_json::json!({"facts": "oops"}),
+            serde_json::json!({"facts": {"content": "x"}}),
+            serde_json::json!(["x"]),
+        ] {
+            let (facts, ignored) = parse_fact_objects(&v);
+            assert!(facts.is_empty(), "{v}");
+            assert_eq!(ignored, 0, "{v}");
+        }
     }
 
     #[test]
@@ -2743,6 +2885,33 @@ mod tests {
         );
     }
 
+    /// Stage-1 config for the ledger tests; `profile_rebuild` falls back to this
+    /// block, so a rebuild in these tests resolves a model too.
+    const LEDGER_TEST_CONFIG: &str =
+        "[tasks.insight_extraction]\nmodel=\"ins/m\"\nfilter_prompt=\"facts-sys-prompt-sentinel\"\n";
+
+    /// Three distinct object facts, as the stage-1 prompt contract emits them.
+    const THREE_FACTS_REPLY: &str = r#"{"facts":[
+        {"content":"用户在深圳工作","category":"fact","domain":"career","evidence_type":"explicit_statement","temporality":"current","persistence":"stable","confidence":"high"},
+        {"content":"用户养了一只猫","category":"fact","domain":"lifestyle"},
+        {"content":"用户喜欢爬山","category":"preference","domain":"hobby"}
+    ]}"#;
+
+    /// `(live user id, session id, message id)` with the FK targets seeded.
+    async fn seed_turn(pool: &sqlx::PgPool) -> (Uuid, Uuid, Uuid) {
+        let session_id = seed_session(pool, seed_instance(pool).await).await;
+        let message_id = seed_user_message(pool, session_id).await;
+        (Uuid::new_v4(), session_id, message_id)
+    }
+
+    async fn ledger_count(pool: &sqlx::PgPool, user_id: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM engine.human_facts WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn insight_extraction_writes_the_facts_event(pool: sqlx::PgPool) {
         use wiremock::matchers::{body_string_contains, method, path as wm_path};
@@ -2756,7 +2925,7 @@ mod tests {
             "id": "gen-facts", "model": "ins/m",
             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
             "choices": [{"message": {"content":
-                "{\"facts\":[\"用户在深圳工作\"],\"details\":[{\"content\":\"用户在深圳工作\",\"category\":\"fact\",\"domain\":\"career\",\"evidence_type\":\"explicit_statement\",\"temporality\":\"current\",\"persistence\":\"stable\",\"confidence\":\"high\"}]}"
+                "{\"facts\":[{\"content\":\"用户在深圳工作\",\"category\":\"fact\",\"domain\":\"career\",\"evidence_type\":\"explicit_statement\",\"temporality\":\"current\",\"persistence\":\"stable\",\"confidence\":\"high\"}]}"
             }}],
         });
         Mock::given(method("POST"))
@@ -2768,10 +2937,7 @@ mod tests {
 
         let mut state = crate::routes::companion::test_state(pool.clone());
         state.model_config = std::sync::Arc::new(
-            eros_engine_llm::model_config::ModelConfig::from_toml_str(
-                "[tasks.insight_extraction]\nmodel=\"ins/m\"\nfilter_prompt=\"facts-sys-prompt-sentinel\"\n",
-            )
-            .unwrap(),
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(LEDGER_TEST_CONFIG).unwrap(),
         );
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
@@ -2780,10 +2946,8 @@ mod tests {
             ),
         );
 
-        let user_id = uuid::Uuid::new_v4();
-        // Both are FK-referenced by the insight event since migration 0058.
-        let session_id = seed_session(&pool, seed_instance(&pool).await).await;
-        let message_id = seed_user_message(&pool, session_id).await;
+        // Both ids are FK-referenced by the insight event since migration 0058.
+        let (user_id, session_id, message_id) = seed_turn(&pool).await;
 
         extract_insights(
             &state,
@@ -2796,77 +2960,77 @@ mod tests {
         )
         .await;
 
-        #[allow(clippy::type_complexity)]
-        let rows: Vec<(String, String, Option<String>, Option<serde_json::Value>)> =
-            sqlx::query_as(
-                "SELECT stage, status, generation_id, payload \
-                 FROM engine.companion_insights_events WHERE user_id = $1",
-            )
-            .bind(user_id)
-            .fetch_all(&pool)
-            .await
-            .unwrap();
-        assert_eq!(rows.len(), 1, "only the facts row; got {rows:?}");
-        assert_eq!(rows[0].0, "facts");
+        let rows: Vec<(Uuid, String, Option<String>, Option<serde_json::Value>)> = sqlx::query_as(
+            "SELECT run_id, status, generation_id, payload \
+                 FROM engine.companion_insights_events \
+                 WHERE user_id = $1 AND stage = 'facts'",
+        )
+        .bind(user_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1, "one facts row; got {rows:?}");
+        assert_eq!(rows[0].1, "ok");
         assert_eq!(rows[0].2.as_deref(), Some("gen-facts"));
-        // facts-stage payload is a {facts, details} object.
+        // facts-stage payload is the array exactly as the model emitted it.
         let payload = rows[0].3.as_ref().expect("facts payload present");
-        assert_eq!(payload["facts"], serde_json::json!(["用户在深圳工作"]));
-        assert_eq!(payload["details"][0]["category"], "fact");
-        assert_eq!(payload["details"][0]["confidence"], "high");
+        assert_eq!(payload["facts"][0]["content"], "用户在深圳工作");
+        assert_eq!(payload["facts"][0]["category"], "fact");
+        assert_eq!(payload["facts"][0]["confidence"], "high");
+        let all_events: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.companion_insights_events WHERE user_id = $1",
+        )
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(all_events, 1, "stage 1 is the only audit row");
+
+        // The ledger row points back at the same run, session and message.
+        let (occurrences, last_run, last_session, last_message): (
+            i32,
+            Option<Uuid>,
+            Option<Uuid>,
+            Option<Uuid>,
+        ) = sqlx::query_as(
+            "SELECT occurrences, last_run_id, last_session_id, last_message_id \
+             FROM engine.human_facts WHERE user_id = $1",
+        )
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(occurrences, 1);
+        assert_eq!(
+            last_run,
+            Some(rows[0].0),
+            "ledger row and event share a run"
+        );
+        assert_eq!(last_session, Some(session_id));
+        assert_eq!(last_message, Some(message_id));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn insight_extraction_empty_facts_writes_one_event(pool: sqlx::PgPool) {
-        use wiremock::matchers::{body_string_contains, method, path as wm_path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        // The facts call returns an empty list ⇒ status='empty', no ledger write.
+        let (state, recorder) = state_with_mock_openrouter_recording(
+            pool.clone(),
+            LEDGER_TEST_CONFIG,
+            vec![("facts-sys-prompt-sentinel", r#"{"facts":[]}"#)],
+        )
+        .await;
 
-        let mock = MockServer::start().await;
-
-        // Facts call returns an empty list ⇒ status='empty', no structured call.
-        let facts_body = serde_json::json!({
-            "id": "gen-facts", "model": "ins/m",
-            "usage": {"total_tokens": 2},
-            "choices": [{"message": {"content": "{\"facts\":[]}"}}],
-        });
-        Mock::given(method("POST"))
-            .and(wm_path("/api/v1/chat/completions"))
-            .and(body_string_contains("facts-sys-prompt-sentinel"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(facts_body))
-            .mount(&mock)
-            .await;
-        // Structured mock must NOT be hit.
-        Mock::given(method("POST"))
-            .and(wm_path("/api/v1/chat/completions"))
-            .and(body_string_contains("填充以下 schema"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
-            .expect(0)
-            .mount(&mock)
-            .await;
-
-        let mut state = crate::routes::companion::test_state(pool.clone());
-        state.model_config = std::sync::Arc::new(
-            eros_engine_llm::model_config::ModelConfig::from_toml_str(
-                "[tasks.insight_extraction]\nmodel=\"ins/m\"\nfilter_prompt=\"facts-sys-prompt-sentinel\"\n",
-            )
-            .unwrap(),
-        );
-        state.openrouter = std::sync::Arc::new(
-            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
-                "k".into(),
-                format!("{}/api/v1/chat/completions", mock.uri()),
-            ),
-        );
-
-        let user_id = uuid::Uuid::new_v4();
-        // Both are FK-referenced by the insight event since migration 0058.
-        let session_id = seed_session(&pool, seed_instance(&pool).await).await;
-        let message_id = seed_user_message(&pool, session_id).await;
+        let (user_id, session_id, message_id) = seed_turn(&pool).await;
         extract_insights(
             &state, session_id, user_id, message_id, "hi there", "嗯嗯", None,
         )
         .await;
 
+        assert_eq!(
+            recorder.lock().unwrap().len(),
+            1,
+            "stage 1 is the only call"
+        );
         let rows: Vec<(String, String, Option<serde_json::Value>)> = sqlx::query_as(
             "SELECT stage, status, payload FROM engine.companion_insights_events WHERE user_id = $1",
         )
@@ -2879,62 +3043,38 @@ mod tests {
         assert_eq!(rows[0].1, "empty");
         assert_eq!(
             rows[0].2,
-            Some(serde_json::json!({"facts": [], "details": []})),
+            Some(serde_json::json!({"facts": []})),
             "empty run still writes the uniform object payload"
         );
+        assert_eq!(ledger_count(&pool, user_id).await, 0);
+        assert!(ProfileStateRepo { pool: &pool }
+            .load(user_id)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn insight_extraction_facts_parse_error_writes_one_event(pool: sqlx::PgPool) {
-        use wiremock::matchers::{body_string_contains, method, path as wm_path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        // Non-JSON garbage ⇒ status='parse_error', payload NULL, nothing ledgered.
+        let (state, recorder) = state_with_mock_openrouter_recording(
+            pool.clone(),
+            LEDGER_TEST_CONFIG,
+            vec![("facts-sys-prompt-sentinel", "这不是 JSON")],
+        )
+        .await;
 
-        let mock = MockServer::start().await;
-
-        // Facts call returns non-JSON garbage ⇒ status='parse_error', payload NULL,
-        // and the structured call is never made.
-        let facts_body = serde_json::json!({
-            "id": "gen-facts", "model": "ins/m",
-            "usage": {"total_tokens": 2},
-            "choices": [{"message": {"content": "这不是 JSON"}}],
-        });
-        Mock::given(method("POST"))
-            .and(wm_path("/api/v1/chat/completions"))
-            .and(body_string_contains("facts-sys-prompt-sentinel"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(facts_body))
-            .mount(&mock)
-            .await;
-        Mock::given(method("POST"))
-            .and(wm_path("/api/v1/chat/completions"))
-            .and(body_string_contains("填充以下 schema"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
-            .expect(0)
-            .mount(&mock)
-            .await;
-
-        let mut state = crate::routes::companion::test_state(pool.clone());
-        state.model_config = std::sync::Arc::new(
-            eros_engine_llm::model_config::ModelConfig::from_toml_str(
-                "[tasks.insight_extraction]\nmodel=\"ins/m\"\nfilter_prompt=\"facts-sys-prompt-sentinel\"\n",
-            )
-            .unwrap(),
-        );
-        state.openrouter = std::sync::Arc::new(
-            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
-                "k".into(),
-                format!("{}/api/v1/chat/completions", mock.uri()),
-            ),
-        );
-
-        let user_id = uuid::Uuid::new_v4();
-        // Both are FK-referenced by the insight event since migration 0058.
-        let session_id = seed_session(&pool, seed_instance(&pool).await).await;
-        let message_id = seed_user_message(&pool, session_id).await;
+        let (user_id, session_id, message_id) = seed_turn(&pool).await;
         extract_insights(
             &state, session_id, user_id, message_id, "hi there", "嗯嗯", None,
         )
         .await;
 
+        assert_eq!(
+            recorder.lock().unwrap().len(),
+            1,
+            "stage 1 is the only call"
+        );
         let rows: Vec<(String, String, Option<serde_json::Value>)> = sqlx::query_as(
             "SELECT stage, status, payload FROM engine.companion_insights_events WHERE user_id = $1",
         )
@@ -2946,31 +3086,23 @@ mod tests {
         assert_eq!(rows[0].0, "facts");
         assert_eq!(rows[0].1, "parse_error");
         assert_eq!(rows[0].2, None, "parse_error ⇒ NULL payload");
+        assert_eq!(ledger_count(&pool, user_id).await, 0);
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn insight_extraction_details_absent_persists_empty_array(pool: sqlx::PgPool) {
-        // Neither response `id` nor call count is asserted below, so this one
-        // (unlike its `_sharing_run_id` and `.expect(0)`-guarded siblings
-        // above) can safely go through the shared mock-router helper.
-        let state = state_with_mock_openrouter(
+    async fn insight_extraction_audit_payload_is_the_facts_array_only(pool: sqlx::PgPool) {
+        // A stray sibling key from an older prompt must not reach the audit row.
+        let (state, _) = state_with_mock_openrouter_recording(
             pool.clone(),
-            "[tasks.insight_extraction]\nmodel=\"ins/m\"\nfilter_prompt=\"facts-sys-prompt-sentinel\"\n",
-            vec![
-                (
-                    "facts-sys-prompt-sentinel",
-                    r#"{"facts":["用户在深圳工作"]}"#,
-                ),
-                ("填充以下 schema", r#"{"city":"深圳"}"#),
-            ],
+            LEDGER_TEST_CONFIG,
+            vec![(
+                "facts-sys-prompt-sentinel",
+                r#"{"facts":[{"content":"用户在深圳工作","domain":"career"}],"details":[{"content":"x"}]}"#,
+            )],
         )
         .await;
 
-        let user_id = uuid::Uuid::new_v4();
-        // Both are FK-referenced by the insight event since migration 0058.
-        let session_id = seed_session(&pool, seed_instance(&pool).await).await;
-        let message_id = seed_user_message(&pool, session_id).await;
-
+        let (user_id, session_id, message_id) = seed_turn(&pool).await;
         extract_insights(
             &state,
             session_id,
@@ -2992,12 +3124,201 @@ mod tests {
         .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, "ok");
-        let payload = rows[0].1.as_ref().unwrap();
-        assert_eq!(payload["facts"], serde_json::json!(["用户在深圳工作"]));
         assert_eq!(
-            payload["details"],
-            serde_json::json!([]),
-            "no details key ⇒ []"
+            rows[0].1,
+            Some(serde_json::json!({"facts": [{"content": "用户在深圳工作", "domain": "career"}]})),
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn insight_extraction_legacy_string_facts_write_no_ledger(pool: sqlx::PgPool) {
+        // A prompt still on the string-array contract yields no usable fact:
+        // the audit row keeps what the model said, the ledger stays untouched.
+        let (state, recorder) = state_with_mock_openrouter_recording(
+            pool.clone(),
+            LEDGER_TEST_CONFIG,
+            vec![(
+                "facts-sys-prompt-sentinel",
+                r#"{"facts":["a","b"],"details":[]}"#,
+            )],
+        )
+        .await;
+
+        let (user_id, session_id, message_id) = seed_turn(&pool).await;
+        extract_insights(
+            &state, session_id, user_id, message_id, "hi there", "嗯嗯", None,
+        )
+        .await;
+
+        assert_eq!(recorder.lock().unwrap().len(), 1, "no rebuild");
+        let (status, payload): (String, Option<serde_json::Value>) = sqlx::query_as(
+            "SELECT status, payload FROM engine.companion_insights_events \
+             WHERE user_id = $1 AND stage = 'facts'",
+        )
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "empty");
+        assert_eq!(payload, Some(serde_json::json!({"facts": ["a", "b"]})));
+        assert_eq!(ledger_count(&pool, user_id).await, 0);
+        assert!(ProfileStateRepo { pool: &pool }
+            .load(user_id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn record_facts_writes_the_ledger_and_bumps_pending(pool: sqlx::PgPool) {
+        let state = crate::routes::companion::test_state(pool.clone());
+        let (user_id, session_id, message_id) = seed_turn(&pool).await;
+        let facts: Vec<FactInput> = serde_json::from_str::<serde_json::Value>(THREE_FACTS_REPLY)
+            .unwrap()["facts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(FactInput::from_json)
+            .collect();
+        assert_eq!(facts.len(), 3);
+
+        let pending = record_facts(
+            &state,
+            user_id,
+            session_id,
+            message_id,
+            Uuid::new_v4(),
+            Utc::now(),
+            &facts,
+        )
+        .await;
+        assert_eq!(pending, Some(3));
+        assert_eq!(ledger_count(&pool, user_id).await, 3);
+        let s = ProfileStateRepo { pool: &pool }
+            .load(user_id)
+            .await
+            .unwrap()
+            .expect("state row exists");
+        assert_eq!((s.pending_facts, s.rebuild_failures), (3, 0));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn below_k_ledgers_facts_without_a_rebuild(pool: sqlx::PgPool) {
+        let (state, recorder) = state_with_mock_openrouter_recording(
+            pool.clone(),
+            LEDGER_TEST_CONFIG,
+            vec![("facts-sys-prompt-sentinel", THREE_FACTS_REPLY)],
+        )
+        .await;
+        let (user_id, session_id, message_id) = seed_turn(&pool).await;
+        ProfileStateRepo { pool: &pool }
+            .bump(user_id, 16)
+            .await
+            .unwrap();
+
+        extract_insights(
+            &state,
+            session_id,
+            user_id,
+            message_id,
+            "我在深圳工作",
+            "嗯嗯",
+            None,
+        )
+        .await;
+
+        assert_eq!(recorder.lock().unwrap().len(), 1, "19 < K: stage 1 only");
+        let s = ProfileStateRepo { pool: &pool }
+            .load(user_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((s.pending_facts, s.claimed_at), (19, None));
+        assert_eq!(ledger_count(&pool, user_id).await, 3);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn crossing_k_claims_and_rebuilds_once(pool: sqlx::PgPool) {
+        // Only stage 1 has a configured reply; the rebuild request gets a 500,
+        // so the rebuild ends Failed and keeps its pending count.
+        let (state, recorder) = state_with_mock_openrouter_recording(
+            pool.clone(),
+            LEDGER_TEST_CONFIG,
+            vec![("facts-sys-prompt-sentinel", THREE_FACTS_REPLY)],
+        )
+        .await;
+        let (user_id, session_id, message_id) = seed_turn(&pool).await;
+        ProfileStateRepo { pool: &pool }
+            .bump(user_id, 18)
+            .await
+            .unwrap();
+
+        extract_insights(
+            &state,
+            session_id,
+            user_id,
+            message_id,
+            "我在深圳工作",
+            "嗯嗯",
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            recorder.lock().unwrap().len(),
+            2,
+            "stage 1, then exactly one rebuild call"
+        );
+        let s = ProfileStateRepo { pool: &pool }
+            .load(user_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (s.pending_facts, s.rebuild_failures, s.claimed_at),
+            (21, 1, None),
+            "the failed rebuild released its claim and kept the count"
+        );
+        assert_eq!(ledger_count(&pool, user_id).await, 3);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn crossing_k_under_a_live_claim_does_not_rebuild(pool: sqlx::PgPool) {
+        let (state, recorder) = state_with_mock_openrouter_recording(
+            pool.clone(),
+            LEDGER_TEST_CONFIG,
+            vec![("facts-sys-prompt-sentinel", THREE_FACTS_REPLY)],
+        )
+        .await;
+        let (user_id, session_id, message_id) = seed_turn(&pool).await;
+        let repo = ProfileStateRepo { pool: &pool };
+        repo.bump(user_id, 18).await.unwrap();
+        assert!(repo
+            .claim(user_id, state.config.profile_rebuild.claim_stale)
+            .await
+            .unwrap());
+
+        extract_insights(
+            &state,
+            session_id,
+            user_id,
+            message_id,
+            "我在深圳工作",
+            "嗯嗯",
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            recorder.lock().unwrap().len(),
+            1,
+            "another worker holds the claim: stage 1 only"
+        );
+        let s = repo.load(user_id).await.unwrap().unwrap();
+        assert_eq!((s.pending_facts, s.rebuild_failures), (21, 0));
+        assert!(
+            s.claimed_at.is_some(),
+            "the other worker's claim is untouched"
         );
     }
 
