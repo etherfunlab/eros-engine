@@ -498,6 +498,17 @@ impl std::fmt::Debug for CallerSecretConfig {
     }
 }
 
+/// The raw `CALLER_SECRET` lookup. Unlike the feature secrets, reading this
+/// one as unset turns a gate off, so a value that is not UTF-8 refuses boot
+/// instead.
+fn caller_secret_env(v: Result<String, std::env::VarError>) -> Result<Option<String>, String> {
+    match v {
+        Ok(s) => Ok(Some(s)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err("CALLER_SECRET is not valid UTF-8".into()),
+    }
+}
+
 /// A blank value means off. Entries are trimmed and empty ones skipped; a
 /// value with no entry left, or any entry shorter than
 /// [`MIN_SVC_SECRET_LEN`], refuses boot.
@@ -758,7 +769,7 @@ impl ServerConfig {
             )?,
             byoc: parse_byoc_config(std::env::var("BYOC_CALLER_SECRET").ok().as_deref())?,
             caller_secret: parse_caller_secret_config(
-                std::env::var("CALLER_SECRET").ok().as_deref(),
+                caller_secret_env(std::env::var("CALLER_SECRET"))?.as_deref(),
             )?,
             insights_export: parse_insights_export_config(
                 std::env::var("INSIGHTS_EXPORT_SECRET").ok().as_deref(),
@@ -1311,6 +1322,22 @@ mod tests {
     fn caller_secret_with_no_entries_refuses_boot() {
         let err = parse_caller_secret_config(Some(" , ")).unwrap_err();
         assert!(err.contains("CALLER_SECRET"), "{err}");
+    }
+
+    /// `std::env::var(..).ok()` would read a non-UTF-8 value as unset and
+    /// leave the gate silently off.
+    #[test]
+    fn caller_secret_non_unicode_refuses_boot() {
+        let err = caller_secret_env(Err(std::env::VarError::NotUnicode("x".into()))).unwrap_err();
+        assert!(err.contains("CALLER_SECRET"), "{err}");
+        assert_eq!(
+            caller_secret_env(Err(std::env::VarError::NotPresent)).unwrap(),
+            None
+        );
+        assert_eq!(
+            caller_secret_env(Ok(KEY_A.into())).unwrap().as_deref(),
+            Some(KEY_A)
+        );
     }
 
     #[test]
