@@ -5,6 +5,7 @@ operators rolling it out, deployments that mirror the profile or the memories
 through `/svc/v1/*`, and code that depends on the `eros-engine-store` or
 `eros-engine-llm` crates.
 **Design:** [`2026-10-26-insights-2-fact-ledger-design.md`](../superpowers/specs/2026-10-26-insights-2-fact-ledger-design.md)
+**Sibling guide for this release:** [`v2-4-0-event-selfie-image.md`](v2-4-0-event-selfie-image.md)
 
 The human profile is no longer rewritten by a second LLM call on every turn.
 Extraction writes atomic facts into a ledger (`engine.human_facts`), and the
