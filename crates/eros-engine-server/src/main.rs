@@ -152,10 +152,11 @@ async fn run_migrations() -> Result<()> {
         .await
         .context("failed to connect to DATABASE_URL")?;
     tracing::info!("running migrations…");
-    sqlx::migrate!("../eros-engine-store/migrations")
-        .run(&pool)
+    // Collapse-then-run: the store folds a pre-squash history onto the
+    // baseline before sqlx validates it (see eros_engine_store::migrate).
+    eros_engine_store::migrate::migrate(&pool)
         .await
-        .context("sqlx migrate run failed")?;
+        .context("migrate failed")?;
     tracing::info!("migrations applied");
     Ok(())
 }

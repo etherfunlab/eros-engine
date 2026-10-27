@@ -3705,7 +3705,6 @@ mod tests {
         assert_eq!(rows[0].content, ""); // untouched
     }
 
-
     async fn gift_row(pool: &PgPool, session_id: Uuid, action: serde_json::Value) -> Uuid {
         sqlx::query_scalar(
             "INSERT INTO engine.chat_messages (session_id, role, content, metadata) \

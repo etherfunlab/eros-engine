@@ -17,6 +17,7 @@ pub mod image_events;
 pub mod insight;
 pub mod life_choices;
 pub mod memory;
+pub mod migrate;
 pub mod persona;
 pub mod pool;
 pub mod profile_state;
