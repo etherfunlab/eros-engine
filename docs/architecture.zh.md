@@ -62,8 +62,9 @@ spawn post_process     tokio::spawn——跟返回響應並行：
                         - affinity 寫入（LLM 判官报档位 →
                           引擎写入管线 → DB）
                         - memory   （Voyage embed → pgvector upsert）
-                        - insight  （LLM 抽事实 → human_insights UPSERT，
-                          按列增量更新）
+                        - insight  （LLM 抽事实 → human_facts 账本；
+                          由按计划的重建从账本派生
+                          human_insights 画像，绝不逐轮）
                         - character insight（LLM 抽 AI 角色自身的事实 →
                           character_insights UPSERT，实验特性）
                         - user insight（LLM 抽真人用户的事实，按这段关系分开
@@ -119,11 +120,14 @@ eros-engine-server :8080
                        companion_affinity / companion_affinity_events
                        companion_memories（vector(512)）
                        persona_genomes / persona_instances / persona_instance_items
-                       human_insights
+                       human_facts / human_profile_state / human_insights
+                       user_erasures
                        companion_decision_events
                        chat_images_events / chat_vision_events
                        llm_generations（每次 LLM 调用，审计）
 ```
+
+insight 这一步把每轮的事实记进每个用户各一份的账本，按计划的画像重建（累积 20 条新事实，或闲置一段时间后）再从账本派生出 `human_insights` 行；见 [insights.zh.md](insights.zh.md)。
 
 post-process spawn 返回 `()` 是 fire-and-forget 設計——用戶面前的響應不會被 affinity / memory / insight 寫入阻塞。它們任何一個失敗，對話回覆還是會落地；失敗會記日誌但不會冒給用戶。
 
@@ -189,7 +193,10 @@ crates/
 │       ├── affinity.rs       # AffinityRepo（persist_with_event、record_ghost、persist_life_choice_drop_in_tx）
 │       ├── memory.rs         # MemoryRepo（Profile / Relationship 兩層）
 │       ├── insight.rs        # InsightEventRepo（companion_insights_events 审计行）
-│       ├── human_insight.rs  # HumanInsightRepo（类型化画像列，按字段 UPSERT）
+│       ├── human_fact.rs     # HumanFactRepo（用户的事实账本：去重写入、导出 keyset）
+│       ├── profile_state.rs  # ProfileStateRepo（重建计数器、认领、结果）
+│       ├── erasure.rs        # ErasureRepo（用户抹除、删除流）
+│       ├── human_insight.rs  # HumanInsightRepo（类型化画像列，由重建整行替换）
 │       ├── character_insight.rs # CharacterInsightRepo + 事件/快照 repo（AI 角色自己的画像，实验特性）
 │       ├── user_insight.rs   # UserInsightRepo + 事件/快照 repo（真人用户按关系分开的画像，实验特性）
 │       └── persona.rs        # PersonaRepo（upsert_genome 給 seed 用）

@@ -91,7 +91,7 @@ Two independent writers, on different schedules:
 1. **Raw-turn writer** (`write_turn`, post-process) — runs on **every** substantive turn (non-empty user utterance and at least one non-empty assistant message). It embeds **the user's utterance only** into *both* layers — never the assistant's prose, which fed back into the model's own prompt via recall and collapsed replies to a repeated line (issue #113). The relationship-layer copy is prefixed `用户：` so a recalled line stays readable as "what the user said." These rows carry `category = NULL` and `metadata = NULL`.
 2. **Dreaming-lite sweeper** (`[tasks.memory_extraction]`, `pipeline::dreaming`) — a background, idle-session-triggered pass that asks an LLM for durable memory candidates. It writes **profile-layer rows only**, tagged `category ∈ {fact, preference, event, emotion, relation}` (anything else the model invents collapses to `fact`) plus an opaque `metadata` payload.
 
-`insight_extraction` is a **separate** pipeline and writes nothing to this table — its structured output is UPSERTed directly into the flat `human_insights` table (per-column incremental merge; see [api-reference.md](api-reference.md#get-compuseruser_idprofile)), not embedded here. Two further experimental, per-relationship chains (`character_insight_*`, `user_insight_*`) work the same way, UPSERTing into their own flat tables — `character_insights` (see [api-reference.md](api-reference.md#get-v2compinstanceinstance_idinsightcharacter)) and `user_insights` (see [api-reference.md](api-reference.md#get-v2compinstanceinstance_idinsightuser)); like `human_insights`, neither table is embedded into this one. `user_insights` is not injected into any chat, voice, or PDE prompt; `character_insights` is — four of its fields render the chat prompt's `[character_state]` block, and how completely the row is filled sizes the injected history window (see [deploying.md](deploying.md#operational-notes)).
+`insight_extraction` is a **separate** pipeline and writes nothing to this table: it records atomic facts about the user in a fact ledger (`human_facts`), and a scheduled rebuild derives the flat `human_insights` profile from that ledger; none of it is embedded here (see [insights.md](insights.md)). Two further experimental, per-relationship chains (`character_insight_*`, `user_insight_*`) UPSERT into their own flat tables — `character_insights` (see [api-reference.md](api-reference.md#get-v2compinstanceinstance_idinsightcharacter)) and `user_insights` (see [api-reference.md](api-reference.md#get-v2compinstanceinstance_idinsightuser)); like `human_insights`, neither table is embedded into this one. `user_insights` is not injected into any chat, voice, or PDE prompt; `character_insights` is — four of its fields render the chat prompt's `[character_state]` block, and how completely the row is filled sizes the injected history window (see [deploying.md](deploying.md#operational-notes)).
 
 **Group turns** write through the same raw-turn writer, with the user's message embedded once. The profile layer gets one row (`instance_id` NULL). The relationship layer gets one row for every seated member, whether or not it spoke, because every member was present. A member whose persona instance is inactive is not seated that turn. Group-sourced rows carry `session_id` = the group (where it was said) and the content prefix `（群聊）用户：`, so a later 1:1 recall knows where the line came from. They are keyed to each member's `instance_id`, so `DELETE /comp/instance/{instance_id}/sessions` removes them with the rest of that relationship. See [group-chat.md](group-chat.md#what-reaches-11).
 
@@ -109,9 +109,8 @@ default `neutral_and_relationship`). The reply handler (`pipeline::handlers`)
 builds a profile/relationship context block from two sources:
 
 - **Profile layer** — two merged sources. The 基础画像 bullets come directly
-  from the flat **`human_insights`** table — the insight extractor's only
-  write target since the companion_insights teardown (spec 2026-08-11); there
-  is no JSONB blob or mirror step anymore. `memory_scope` decides
+  from the flat **`human_insights`** table, the profile derived from the
+  user's fact ledger ([insights.md](insights.md#readers)). `memory_scope` decides
   whether intimate fields are included (`full` / `insights_only`) or only the
   neutral subset (`neutral_*`). Alongside them, profile-layer
   `companion_memories` rows are pulled by similarity search and grouped by
@@ -190,7 +189,7 @@ Design specs:
 ## Source
 
 - `crates/eros-engine-store/src/memory.rs` — `MemoryRepo` (upsert + search, 7 sqlx::test integration tests)
-- `crates/eros-engine-store/src/human_insight.rs` — flat, typed `human_insights` store; the insight extractor's `apply_extraction` writes it incrementally, the reply handler reads it at injection
+- `crates/eros-engine-store/src/human_insight.rs` — flat, typed `human_insights` store; the profile rebuild's `replace_profile` writes it, the reply handler reads it at injection; the fact ledger is in `human_fact.rs`
 - `crates/eros-engine-llm/src/voyage.rs` — native Voyage client
 - `crates/eros-engine-llm/src/embedding.rs` — `EmbeddingRouter` + OpenRouter-compatible client
 - `crates/eros-engine-server/src/pipeline/post_process.rs` — raw-turn write path

@@ -277,7 +277,8 @@ pub struct MemoryChangesQuery {
 /// Extracted profile-layer memories created since a keyset cursor, for a
 /// downstream service that builds on the facts the engine extracted about a
 /// user. Raw-turn rows and relationship-layer rows are not exported. The rows
-/// are insert-only; the export carries no deletions.
+/// are insert-only; this feed carries no deletions, so a mirror drops a user's
+/// rows when `GET /svc/v1/insights/deletions` names the user.
 #[utoipa::path(
     get,
     path = "/svc/v1/memories/changes",
@@ -573,6 +574,12 @@ pub struct EraseResponse {
 ///
 /// Idempotent: a repeat finds nothing left to erase, reports 0 everywhere and
 /// re-stamps the tombstone.
+///
+/// Callers should quiesce the user's traffic first: an extraction or rebuild
+/// already in flight can write after the commit, and a repeat call cleans it
+/// up. Call this BEFORE deleting the user's sessions or persona instances: the
+/// per-relationship insight tables are keyed by instance alone and are reached
+/// only while the instance row exists.
 #[utoipa::path(
     post,
     path = "/svc/v1/users/{user_id}/erase",

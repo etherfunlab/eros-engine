@@ -321,7 +321,7 @@ post-process 在 `final` 之后启动一次，从不阻塞流。没有走到 `fi
 - **记忆。** 用户消息只 embed 一次。Profile 层写一行（`instance_id` 为 NULL）；关系层为**每位入座
   成员**各写一行，不论它有没有开口，内容是 `（群聊）用户：{message}`，`session_id` 是群。每次成员写入
   都会复查该成员 session 没有被归档。见 [memory-layers.zh.md](memory-layers.zh.md)。
-- **Insights。** `human_insights` 每轮运行一次，输入是用户消息加上每条产出的回复，格式
+- **Insights。** 用户画像的事实抽取（[insights.zh.md](insights.zh.md)）每轮运行一次，输入是用户消息加上每条产出的回复，格式
   `{name}：{full_text}`。`character_insights` 和 `user_insights` 每位发言者各运行一次，输入是用户消息和
   该发言者的回复，以该发言者的 instance 为键。写入之前，每一次都会复查该发言者的成员 session 没有被归档。
   N 位发言者的一轮会发起 1 + 2N 次抽取调用。

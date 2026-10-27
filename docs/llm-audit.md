@@ -158,7 +158,7 @@ call now writes here: `chat_companion`, `chat_voice`, `chat_product_qa`,
 `chat_input_filter`, `chat_output_filter`, `chat_vision`,
 `chat_image_prompt_compose`, `chat_image_edit_compose`, `pde_decision`,
 `group_director`, `affinity_evaluation`, `affinity_summary`, `insight_extraction`,
-`insight_structuring`, `character_insight_extraction`,
+`profile_rebuild`, `character_insight_extraction`,
 `character_insight_structuring`, `user_insight_extraction`,
 `user_insight_structuring`, `memory_extraction`, `world_director`,
 `world_stories_director`, `world_comment`, `world_reply`.
@@ -357,8 +357,8 @@ as shown above.
   `model` and `usage` in `engine.llm_generations`, and `generation_id` on the
   row that call produced: `chat_messages.generation_id` for the chat completion
   (mirrored on `companion_affinity_events` for the affinity eval, on
-  `companion_insights_events` for each `insight_extraction` /
-  `insight_structuring` call of the human chain, on
+  `companion_insights_events` for each `insight_extraction` and
+  `profile_rebuild` call of the human chain, on
   `engine.character_insights_events` for each call of the experimental
   character chain and on `engine.user_insights_events` for each call of the
   experimental user chain (§"Character and user insights" below), on
@@ -368,14 +368,12 @@ as shown above.
   [Image-path event tables](#image-path-event-tables) below;
   `chat_messages.metadata.image` keeps its existing `compose_*` keys plus a
   `compose_event_id` pointer into `chat_images_events`) — see the `usage`
-  filtering note above. Since the companion_insights
-  teardown (spec 2026-08-11), `companion_insights_events` rows can contain
-  keys the typed `human_insights` store never persists: the extractor's
-  `existing_insights` context is now reverse-projected from `human_insights`
-  (not the retired JSONB blob), and any off-schema key the LLM emits still
-  lands in the event payload but nowhere else — a future events↔store
-  reconciliation has to compare on payload keys ∩ `human_insights` column
-  set, not full equality. Since migration `0059`, every one of the calls
+  filtering note above. A `profile`-stage
+  `companion_insights_events` payload is the model's JSON object as returned,
+  so it can contain keys the typed `human_insights` store never persists: any
+  off-schema key the LLM emits lands in the event payload but nowhere else — a
+  reconciliation between events and store has to compare on payload keys ∩
+  `human_insights` column set, not full equality. Since migration `0059`, every one of the calls
   above — plus `chat_voice`, `chat_product_qa`, `chat_input_filter`,
   `chat_output_filter`, and the five background sweepers that wrote none of
   the above — also lands one row in `engine.llm_generations`; see [LLM
@@ -544,7 +542,8 @@ Two attempts sharing the same `reason` differ materially on this key.
 
 `engine.chat_messages` hosts three call sites in one pair of columns; each
 element's `task` tells them apart. It is the existing `[tasks.*]` config key —
-the same vocabulary already carried on the wire as `ChatRequest.task` and
+the same vocabulary already carried as `ChatRequest.task` (which scopes
+`[[providers.<name>.body]]` rules and is never sent to the provider) and
 already keying per-task model resolution — not a new discriminator, and
 strictly finer than one would have been: it separates `chat_companion` from
 `chat_voice` from `chat_product_qa`.
@@ -611,15 +610,27 @@ both, one row per OpenRouter call that returned a response:
   and the structuring call it fed are joinable without going through
   `session_id`/`message_id`.
 
-**`companion_insights_events.stage` is the deliberate exception.** The human
-chain's two stages now live behind their own separate config blocks too
-(`insight_extraction` / `insight_structuring`, since the structuring split),
-and the stage-2 call reports `insight_structuring` as its wire task name —
-but the audit row it lands on still writes `stage='structured'`, not
-`stage='structuring'`. `companion_insights_events` keeps its older
-`'facts'`/`'structured'` vocabulary on purpose: the table is live and
-downstream consumers already read it by that stage value, so renaming it to
-match the two experimental tables is not worth the migration.
+**`companion_insights_events.stage` has its own vocabulary.** The human chain
+writes one row per extraction run with `stage = 'facts'` and one row per profile
+rebuild with `stage = 'profile'`, not the `'extraction'` / `'structuring'` of the
+two tables above; the table is live and downstream consumers read it by those
+values. Rows with `stage = 'structured'` are history from the previous
+two-call pipeline, and nothing writes them now.
+
+- **`facts` payload.** `{"facts": [...]}`: the array exactly as the model
+  emitted it, items the engine ignored included. `status` is `ok` when at least
+  one item is a usable fact, `empty` when none is, `parse_error` (payload
+  `NULL`) when no JSON parsed. Older rows hold `{"facts": [strings], "details":
+  [objects]}`.
+- **`profile` payload.** The model's JSON object as returned (`ok`, or `empty`
+  when nothing in it was writable), or `{"raw": "<first 2000 characters of the
+  reply>"}` on `parse_error`. A `profile` row has `NULL` `session_id` and
+  `message_id`: a rebuild is not a turn. Its `generation_id` joins
+  `llm_generations` with task `profile_rebuild`.
+- **Erasure.** `POST /svc/v1/users/{user_id}/erase` sets `payload` to `NULL` on
+  every row of the user and keeps the rest of the row.
+
+The full column and payload reference is in [insights.md](insights.md#audit).
 
 ## Image-path event tables
 

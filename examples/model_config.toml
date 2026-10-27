@@ -509,8 +509,11 @@ content 表达规则：第三人称、以「用户」开头；保留原始信息
 """
 
 # Scheduled profile rebuild: reads the user's whole fact ledger (16,000-character
-# budget) and rewrites the human_insights profile row. By default it runs once
-# 20 new facts have arrived or after an hour idle — not per turn.
+# budget) and rewrites the human_insights profile row. It runs once 20 new
+# facts have arrived, or once a user's newest fact has sat idle — never per
+# turn. The idle sweeper is tuned by PROFILE_REBUILD_IDLE_SECS,
+# PROFILE_REBUILD_TICK_SECS and PROFILE_REBUILD_BATCH, and switched off by
+# PROFILE_REBUILD_DISABLED=1 (the 20-fact trigger then still fires).
 # NO filter_prompt here — that prompt is built in the engine (prompt.rs) and is
 # not configurable; setting the key REFUSES TO BOOT (in any shape, blank
 # included) rather than being silently ignored, because it has to stay in

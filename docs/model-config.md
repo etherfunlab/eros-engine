@@ -256,15 +256,17 @@ warns and never applies (that call builds its own body and takes no
 chat-shaped parameters). Custom providers must declare `chat` to use body
 rules; the reserved `openrouter` entry may declare rules alone.
 
-**Upgrade hazard: `tasks` matches by exact string, not by chain.** The human
-chain used to report a single wire task name (`insight_extraction`) for both
-its stages; since the structuring split it reports `insight_extraction` for
-stage 1 and `insight_structuring` for stage 2 (see the task table below). A
-rule written before the split — `tasks = ["insight_extraction"]` — now scopes
-to stage 1 only. It silently stops applying to stage 2: there is no boot
-warning, because `insight_structuring` is a known task name, just not the one
-your rule lists. If a rule is meant to cover both stages of the human chain,
-list both: `tasks = ["insight_extraction", "insight_structuring"]`.
+**`tasks` matches by exact string, not by chain.** The human chain's two
+calls carry different task names: `insight_extraction` for fact extraction and
+`profile_rebuild` for the scheduled profile rebuild (see the task table
+below). `ChatRequest::task` is config routing only: it scopes body rules and
+keys `llm_generations.task`, and is never sent to the provider. A rule with
+`tasks = ["insight_extraction"]` scopes to extraction only; it does not apply
+to the rebuild, and there is no boot warning, because `profile_rebuild` is a
+known task name, just not the one the rule lists. If a rule is meant to cover
+both calls, list both: `tasks = ["insight_extraction", "profile_rebuild"]`. A
+rule naming a task the engine does not know warns at boot and applies to
+nothing.
 
 Weigh the trade-off before reaching for a body rule instead of the task
 block: rules are **provider-scoped** while a `fallback` chain crosses
@@ -598,8 +600,8 @@ input filter has no triggers, timing, or tiers).
 | Name | Consumed by | Status |
 |---|---|---|
 | `chat_companion` | `pipeline::handlers` via `resolve()` (chat completions) | live |
-| `insight_extraction` | `pipeline::post_process::extract_facts` (stage 1 of the human chain — per-turn fact mining. Prompt-bearing; joins the required-`filter_prompt` gate alongside `character_insight_extraction` / `user_insight_extraction` / `memory_extraction`. This block is the whole chain's on/off switch — off when the task block is absent) | live |
-| `insight_structuring` | `pipeline::post_process::extract_structured_insights` (stage 2 of the human chain — turns stage 1's mined facts plus the existing `human_insights` row into the typed profile object. **Parameters-only, takes no `filter_prompt`** — its prompt is built in `prompt.rs` and must stay in lockstep with the `human_insights` columns it fills, so setting the key refuses to boot, **in any shape, an explicit blank included** — same treatment as `affinity_evaluation`. Absent block ⇒ stage 2 resolves on stage 1's model/budget, never the global default) | live |
+| `insight_extraction` | `pipeline::post_process::extract_facts` (fact extraction for the human chain — one call per produced assistant message in 1:1 chat and one per group turn; it writes atomic facts to the user's fact ledger, not the profile. Prompt-bearing; joins the required-`filter_prompt` gate alongside `character_insight_extraction` / `user_insight_extraction` / `memory_extraction`. This block is the extraction's on/off switch — off when the task block is absent. Output contract: [Insights → Fact extraction](insights.md#fact-extraction)) | live |
+| `profile_rebuild` | `pipeline::profile_rebuild` (the scheduled rebuild of the `human_insights` profile from the user's whole fact ledger — when 20 facts have accumulated or after an idle period, never per turn; see [Insights](insights.md#the-derived-profile). **Parameters-only, takes no `filter_prompt`** — its prompt is built in `prompt.rs` and must stay in lockstep with the `human_insights` columns it fills, so setting the key refuses to boot, **in any shape, an explicit blank included** — same treatment as `affinity_evaluation`. Absent block ⇒ the rebuild resolves on `insight_extraction`'s model/budget, never the global default. A `[tasks.insight_structuring]` block is ignored) | live |
 | `chat_output_filter` | `pipeline::stream` via `resolve_output_filter()` (optional second-pass rewrite of the chat reply before delivery) | live |
 | `pde_decision` | `pipeline::stream` (opt-in LLM judge via `run_pde_decision`, called from `run_stream`; rules engine used when `filter_prompt` is absent or the LLM call fails) | live (opt-in) |
 | `chat_image_prompt_compose` | `pipeline::stream`, and `pipeline::proactive` for a life event's picture (image-prompt composer; **required for image turns** — the PDE judge writes no seed, so without this task the engine reports 可发图=否 and downgrades image actions. Generates the prompt from turn context and returns JSON `{prompt, caption}`; `caption` is persisted to `metadata.image.caption` and is what history-facing renders read) | live (required for images) |
@@ -626,7 +628,8 @@ A `[tasks.<name>]` entry is only meaningful if the engine actually calls `model_
 
 - `crates/eros-engine-server/src/pipeline/group_director.rs` → `group_director` via `resolve_group_director()` (group chat director, opt-in)
 - `crates/eros-engine-server/src/pipeline/handlers.rs` → `chat_companion`, `chat_output_filter`
-- `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`, `insight_structuring`, `affinity_evaluation`, `affinity_summary`, `character_insight_extraction`, `character_insight_structuring`, `user_insight_extraction`, `user_insight_structuring`
+- `crates/eros-engine-server/src/pipeline/profile_rebuild.rs` → `profile_rebuild` via `resolve_profile_rebuild()` (the scheduled profile rebuild)
+- `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`, `affinity_evaluation`, `affinity_summary`, `character_insight_extraction`, `character_insight_structuring`, `user_insight_extraction`, `user_insight_structuring`
 - `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision` via `run_pde_decision` inside `run_stream` (only when `filter_prompt` is set); `chat_image_prompt_compose` via `resolve_image_prompt_compose()` (image-prompt composer, required for image turns, resolved lazily only on image turns); `chat_vision` via `resolve_vision()` (vision pre-stage, opt-in); `chat_product_qa` via `resolve_product_qa()` (product-QA executor, opt-in); `chat_input_filter` via `resolve_input_filter()` (input rewrite, opt-in); `memory_extraction` via the dreaming sweeper
 - `crates/eros-engine-server/src/pipeline/proactive.rs` → `chat_image_prompt_compose` via `build_delegated_image_prompt_for` (a `taking_selfie` event's picture, when the events request carries `image`; audit `source = event`)
 - `crates/eros-engine-server/src/routes/image_edit.rs` → `chat_image_edit_compose` via `resolve_image_edit_compose()` (image-EDIT composer, resolved on every request to the edit endpoint; falls back to `[tasks.chat_image_prompt_compose]`'s chain when the edit block is absent — see below)
@@ -1154,9 +1157,13 @@ once at boot; `AppState.embed: Arc<EmbeddingRouter>` serves `embed_query` /
 `embed_document` / `embed_documents` from `handlers.rs` / `post_process.rs`
 / `dreaming.rs` / `world.rs` / `story.rs`, unchanged call shapes.
 
+### Insight extraction output contract
+
+The `[tasks.insight_extraction]` prompt is the deployment's; the output contract is the engine's. The reply is one JSON object whose `facts` is an array of objects, each with `content` and six labels: `category`, `domain`, `evidence_type`, `temporality`, `persistence` and `confidence`. Items that are not objects with a non-blank `content`, a bare string included, are ignored with a warning, so a prompt still on a string-array contract writes nothing to the ledger. The engine validates each label against its vocabulary ([lists](insights.md#vocabularies)) and folds an unlisted value to `other` (`category`, `domain`) or `unknown` (the rest); the fact is kept. The shipped `examples/model_config.toml` prompt follows the contract.
+
 ### Enabling / disabling extraction
 
-`insight_extraction` (stage 1 of the human chain, per-turn fact mining),
+`insight_extraction` (fact extraction for the human chain),
 `memory_extraction` (session-end dreaming sweeper), `character_insight_extraction`
 (stage 1 of the experimental character chain, §"Task names" above), and
 `user_insight_extraction` (stage 1 of the experimental user chain) are
@@ -1166,14 +1173,14 @@ is `validate_extraction_prompts()`'s gate, and all four names are in it:
 - **Section present** → `filter_prompt` is **required**; the server refuses to boot
   if it is blank or absent.
 - **Section absent** → that extraction is **off**. The engine boots and runs without
-  it (`insight_extraction` is skipped per turn; the dreaming sweeper stays inert;
+  it (`insight_extraction` is skipped per turn, so the fact ledger stops growing; the dreaming sweeper stays inert;
   the character chain — both stages — never runs; the user chain — both
   stages — never runs).
 
-`insight_structuring`, `character_insight_structuring`, and
-`user_insight_structuring` — stage 2 of each of the three chains — are
+`profile_rebuild`, `character_insight_structuring`, and
+`user_insight_structuring` — the second call of each chain — are
 **deliberately NOT in this gate**, because this gate *requires* a prompt and
-no stage-2 block may have one. Each is gated in the opposite direction
+none of these blocks may have one. Each is gated in the opposite direction
 instead: its prompt is built in `prompt.rs`, so setting `filter_prompt` on it
 refuses to boot (see `affinity_evaluation` above — same dead-config rule).
 "Not in this gate" means "gated the other way", not "ungated".

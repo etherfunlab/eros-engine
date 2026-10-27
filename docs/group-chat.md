@@ -394,7 +394,7 @@ none.
   `（群聊）用户：{message}` and `session_id` = the group. Each member write
   rechecks that the member session is not archived. See
   [memory-layers.md](memory-layers.md).
-- **Insights.** `human_insights` runs once per turn, over the user's message and
+- **Insights.** Fact extraction for the user's profile ([insights.md](insights.md)) runs once per turn, over the user's message and
   each produced reply as `{name}：{full_text}`. `character_insights` and
   `user_insights` run once per speaker, from the user's message and that
   speaker's reply, keyed by that speaker's instance. Before it writes, each
