@@ -1561,6 +1561,48 @@
         ]
       }
     },
+    "/svc/v1/users/{user_id}/erase": {
+      "post": {
+        "tags": [
+          "svc"
+        ],
+        "summary": "Erase everything the engine derived about a user, and list the user on the\ndeletion streams.",
+        "description": "For a deployment to call when the user deletes their account. Derived rows\n(facts, profile, memories, world and story content, per-relationship\ninsights) are deleted. Audit and event rows keep their ids and timestamps but\nlose their payloads and free text; relationship state keeps its numbers and\nloses its generated summary. Chat sessions and messages belong to the caller\nand are not touched.\n\nIdempotent: a repeat finds nothing left to erase, reports 0 everywhere and\nre-stamps the tombstone.",
+        "operationId": "erase_user",
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "description": "The user to erase",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EraseResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "x-user-erase-secret missing or wrong"
+          }
+        },
+        "security": [
+          {
+            "user_erase_secret": []
+          }
+        ]
+      }
+    },
     "/v2/comp/byoc/create": {
       "post": {
         "tags": [
@@ -4788,6 +4830,49 @@
                 "description": "The persona's needs carried to now; `null` with no rating, or when the\ndeployment runs no LLM judge."
               }
             ]
+          }
+        }
+      },
+      "EraseResponse": {
+        "type": "object",
+        "description": "What one erase call removed, by table. Every covered table is listed, with 0\nwhen it had nothing to do.",
+        "required": [
+          "user_id",
+          "erased_at",
+          "deleted",
+          "blanked"
+        ],
+        "properties": {
+          "blanked": {
+            "type": "object",
+            "description": "Rows kept with their content cleared, by table. Counts only rows that\nstill carried content, so a repeat reports 0.",
+            "additionalProperties": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "deleted": {
+            "type": "object",
+            "description": "Rows removed, by table.",
+            "additionalProperties": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "erased_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "The tombstone's timestamp. A repeat call moves it forward."
+          },
+          "user_id": {
+            "type": "string",
+            "format": "uuid"
           }
         }
       },

@@ -8,7 +8,7 @@
 //!   * insights: `insights/changes`, `memories/changes`, `insights/deletions`
 //!     (`x-insights-export-secret`)
 //!   * facts: `facts/changes`, `facts/deletions` (`x-facts-export-secret`)
-//!   * user erase (`x-user-erase-secret`)
+//!   * user erase: `users/{user_id}/erase` (`x-user-erase-secret`)
 //!
 //! A sub-tree is left unmounted when the deployment did not configure its
 //! secret (see `routes::router`), so an unconfigured deployment answers on
@@ -18,8 +18,10 @@
 //! memories and a mirror of facts each have to learn which users to drop, and
 //! neither is given the other's credential to do it.
 
-use axum::extract::rejection::QueryRejection;
-use axum::extract::{Query, State};
+use std::collections::BTreeMap;
+
+use axum::extract::rejection::{PathRejection, QueryRejection};
+use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::Json;
 use chrono::{DateTime, Utc};
@@ -163,6 +165,15 @@ fn admit_facts(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
         state.config.facts_export.secret.as_deref(),
         FACTS_SECRET_HEADER,
         "facts export",
+    )
+}
+
+fn admit_erase(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
+    admit_with(
+        headers,
+        state.config.user_erase.secret.as_deref(),
+        ERASE_SECRET_HEADER,
+        "user erase",
     )
 }
 
@@ -536,6 +547,67 @@ async fn facts_deletions(
     erasures_page(&state, q).await
 }
 
+/// What one erase call removed, by table. Every covered table is listed, with 0
+/// when it had nothing to do.
+#[derive(Serialize, ToSchema)]
+pub struct EraseResponse {
+    pub user_id: Uuid,
+    /// The tombstone's timestamp. A repeat call moves it forward.
+    pub erased_at: DateTime<Utc>,
+    /// Rows removed, by table.
+    pub deleted: BTreeMap<String, i64>,
+    /// Rows kept with their content cleared, by table. Counts only rows that
+    /// still carried content, so a repeat reports 0.
+    pub blanked: BTreeMap<String, i64>,
+}
+
+/// Erase everything the engine derived about a user, and list the user on the
+/// deletion streams.
+///
+/// For a deployment to call when the user deletes their account. Derived rows
+/// (facts, profile, memories, world and story content, per-relationship
+/// insights) are deleted. Audit and event rows keep their ids and timestamps but
+/// lose their payloads and free text; relationship state keeps its numbers and
+/// loses its generated summary. Chat sessions and messages belong to the caller
+/// and are not touched.
+///
+/// Idempotent: a repeat finds nothing left to erase, reports 0 everywhere and
+/// re-stamps the tombstone.
+#[utoipa::path(
+    post,
+    path = "/svc/v1/users/{user_id}/erase",
+    tag = "svc",
+    params(("user_id" = Uuid, Path, description = "The user to erase")),
+    responses(
+        (status = 200, body = EraseResponse),
+        (status = 403, description = "x-user-erase-secret missing or wrong")
+    ),
+    security(("user_erase_secret" = []))
+)]
+async fn erase_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    user_id: Result<Path<Uuid>, PathRejection>,
+) -> Result<Json<EraseResponse>, AppError> {
+    // As in the read routes: admission before the path error, no DB access
+    // before `admit_erase`.
+    admit_erase(&state, &headers)?;
+    let Path(user_id) = user_id.map_err(|e| AppError::BadRequest(e.body_text()))?;
+
+    let report = ErasureRepo { pool: &state.pool }
+        .erase_user(user_id)
+        .await?;
+    let named = |m: BTreeMap<&'static str, i64>| -> BTreeMap<String, i64> {
+        m.into_iter().map(|(t, n)| (t.to_string(), n)).collect()
+    };
+    Ok(Json(EraseResponse {
+        user_id,
+        erased_at: report.erased_at,
+        deleted: named(report.deleted),
+        blanked: named(report.blanked),
+    }))
+}
+
 /// Insights sub-tree: mounted under `INSIGHTS_EXPORT_SECRET`.
 pub fn router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -553,7 +625,7 @@ pub fn facts_router() -> OpenApiRouter<AppState> {
 
 /// User-erase sub-tree: mounted under `USER_ERASE_SECRET`.
 pub fn erase_router() -> OpenApiRouter<AppState> {
-    OpenApiRouter::new()
+    OpenApiRouter::new().routes(routes!(erase_user))
 }
 
 #[cfg(test)]
@@ -617,7 +689,24 @@ mod tests {
         header: &str,
         secret: Option<&str>,
     ) -> (StatusCode, serde_json::Value) {
-        let mut req = Request::get(uri);
+        send_with(app, Request::get(uri), header, secret).await
+    }
+
+    async fn post_with(
+        app: Router,
+        uri: &str,
+        header: &str,
+        secret: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        send_with(app, Request::post(uri), header, secret).await
+    }
+
+    async fn send_with(
+        app: Router,
+        mut req: axum::http::request::Builder,
+        header: &str,
+        secret: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
         if let Some(s) = secret {
             req = req.header(header, s);
         }
@@ -1391,6 +1480,147 @@ mod tests {
         }
     }
 
+    async fn tombstone_count(pool: &sqlx::PgPool, user: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM engine.user_erasures WHERE user_id = $1")
+            .bind(user)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn erase_requires_its_own_secret_and_is_absent_without_it(pool: sqlx::PgPool) {
+        let user = Uuid::new_v4();
+        let uri = format!("/svc/v1/users/{user}/erase");
+
+        // Unmounted without USER_ERASE_SECRET, whatever the other secrets are.
+        let app = || app_with_secrets(pool.clone(), Some(SECRET), Some(FACTS_SECRET), None);
+        let (unknown, _) = post_with(
+            app(),
+            "/svc-does-not-exist/zzz",
+            ERASE_SECRET_HEADER,
+            Some(ERASE_SECRET),
+        )
+        .await;
+        for (header, secret) in [
+            (ERASE_SECRET_HEADER, ERASE_SECRET),
+            (ERASE_SECRET_HEADER, SECRET),
+            (EXPORT_SECRET_HEADER, SECRET),
+            (FACTS_SECRET_HEADER, FACTS_SECRET),
+        ] {
+            let (status, _) = post_with(app(), &uri, header, Some(secret)).await;
+            assert_eq!(status, unknown, "{header} must look like an unknown path");
+        }
+
+        // Mounted: only its own secret, only under its own header.
+        let app = || {
+            app_with_secrets(
+                pool.clone(),
+                Some(SECRET),
+                Some(FACTS_SECRET),
+                Some(ERASE_SECRET),
+            )
+        };
+        for (header, sent) in [
+            (ERASE_SECRET_HEADER, None),
+            (ERASE_SECRET_HEADER, Some("wrong")),
+            (ERASE_SECRET_HEADER, Some(SECRET)),
+            (ERASE_SECRET_HEADER, Some(FACTS_SECRET)),
+            (EXPORT_SECRET_HEADER, Some(ERASE_SECRET)),
+            (FACTS_SECRET_HEADER, Some(ERASE_SECRET)),
+        ] {
+            let (status, body) = post_with(app(), &uri, header, sent).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{header} sent={sent:?}");
+            assert_eq!(body["error"], "forbidden");
+        }
+        assert_eq!(
+            tombstone_count(&pool, user).await,
+            0,
+            "a refused call erases nothing"
+        );
+        // The erase secret opens nothing in the other sub-trees.
+        let (status, _) = get_with(
+            app(),
+            "/svc/v1/insights/changes",
+            EXPORT_SECRET_HEADER,
+            Some(ERASE_SECRET),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // Right secret: the user's rows go and the report says how many.
+        HumanFactRepo { pool: &pool }
+            .upsert_run(user, &[fact("用户喜欢爬山")], &seen(Utc::now()))
+            .await
+            .unwrap();
+        let (status, body) = post_with(app(), &uri, ERASE_SECRET_HEADER, Some(ERASE_SECRET)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["user_id"], user.to_string());
+        assert_eq!(body["deleted"]["human_facts"], 1);
+        assert_eq!(body["deleted"]["companion_memories"], 0);
+        assert_eq!(body["blanked"]["companion_insights_events"], 0);
+        let erased_at = body["erased_at"].as_str().unwrap().to_string();
+        assert!(HumanFactRepo { pool: &pool }
+            .list_for_user(user)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(tombstone_count(&pool, user).await, 1);
+
+        // A repeat is a 200 with nothing left to count, and moves the tombstone.
+        let (status, again) = post_with(app(), &uri, ERASE_SECRET_HEADER, Some(ERASE_SECRET)).await;
+        assert_eq!(status, StatusCode::OK);
+        for map in ["deleted", "blanked"] {
+            assert!(
+                again[map]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .all(|n| n.as_i64() == Some(0)),
+                "{map}: {again}"
+            );
+        }
+        assert_eq!(again["deleted"].as_object().unwrap().len(), 14);
+        assert_eq!(again["blanked"].as_object().unwrap().len(), 8);
+        assert!(again["erased_at"].as_str().unwrap() > erased_at.as_str());
+        assert_eq!(tombstone_count(&pool, user).await, 1);
+
+        // A user the engine never saw is still a 200 with a tombstone.
+        let stranger = Uuid::new_v4();
+        let (status, body) = post_with(
+            app(),
+            &format!("/svc/v1/users/{stranger}/erase"),
+            ERASE_SECRET_HEADER,
+            Some(ERASE_SECRET),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["user_id"], stranger.to_string());
+        assert!(body["deleted"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|n| n.as_i64() == Some(0)));
+        assert_eq!(tombstone_count(&pool, stranger).await, 1);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn erase_with_a_malformed_user_id_is_refused_before_it_is_rejected(pool: sqlx::PgPool) {
+        let app = || app_with_secrets(pool.clone(), None, None, Some(ERASE_SECRET));
+        let uri = "/svc/v1/users/not-a-uuid/erase";
+        let (status, body) = post_with(app(), uri, ERASE_SECRET_HEADER, Some("wrong")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"], "forbidden");
+        let (status, body) = post_with(app(), uri, ERASE_SECRET_HEADER, Some(ERASE_SECRET)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "bad_request");
+        let tombstones: i64 = sqlx::query_scalar("SELECT count(*) FROM engine.user_erasures")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(tombstones, 0);
+    }
+
     #[test]
     fn openapi_lists_new_svc_paths_and_schemes() {
         let api = crate::routes::openapi_for_tests();
@@ -1403,6 +1633,9 @@ mod tests {
             assert!(op.is_object(), "{path}");
             assert!(op["security"][0][scheme].is_array(), "{path} uses {scheme}");
         }
+        let op = &api["paths"]["/svc/v1/users/{user_id}/erase"]["post"];
+        assert!(op.is_object(), "the erase path is documented");
+        assert!(op["security"][0]["user_erase_secret"].is_array());
         // The schemes live on the full document (`ApiDoc` + routes), as
         // `print-openapi` builds it.
         let (_router, full) =
