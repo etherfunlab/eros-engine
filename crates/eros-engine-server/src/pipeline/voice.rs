@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use eros_engine_core::affinity::{Affinity, BondLabel, ChemistryLabel};
 use eros_engine_core::persona::PersonaGenome;
-use eros_engine_core::scope::{AffinityScope, InsightMode, MemoryScope};
+use eros_engine_core::scope::{AffinityScope, InsightMode, MemoryScope, RecallGate};
 use eros_engine_llm::model_config::ResolvedVoice;
 use eros_engine_llm::openrouter::{ChatMessage as WireMessage, ChatRequest, UsageBlock};
 use eros_engine_store::affinity::AffinityRepo;
@@ -656,6 +656,11 @@ pub fn run_voice_turn(
         };
 
         let affinity = affinity_res.unwrap_or(None);
+        // No pair row ⇒ a stranger to the recall gate (spec
+        // 2026-10-27-affinity-gated-profile-recall §2.3).
+        let gate = affinity
+            .as_ref()
+            .map_or(RecallGate::STRANGER, RecallGate::from_affinity);
 
         let history = match history_res {
             Ok(h) => h,
@@ -748,8 +753,10 @@ pub fn run_voice_turn(
                 None
             }
             // The query embedding is deliberately DISCARDED: the voice path has
-            // no world-fragment recall to reuse it for.
-            Some(Ok((profile_groups, relationship_facts, _embedding))) => {
+            // no world-fragment recall to reuse it for. Recall ran alongside
+            // the affinity read, so the gate applies here, after both landed.
+            Some(Ok((recalled, _embedding))) => {
+                let (profile_groups, relationship_facts) = recalled.render(gate);
                 render_recall_block(profile_groups, relationship_facts)
             }
         };
@@ -3152,6 +3159,36 @@ data: [DONE]\n\n";
         .unwrap()
     }
 
+    /// The pair's affinity, on a text session of its own: bond stays at tier
+    /// 1, chemistry lands where `intimacy` / `tension` put it, last touched
+    /// `days_ago` days back (so the read path's time decay applies).
+    async fn seed_pair_affinity(
+        pool: &sqlx::PgPool,
+        user_id: Uuid,
+        instance_id: Uuid,
+        intimacy: f64,
+        tension: f64,
+        days_ago: i32,
+    ) {
+        let text_session = seed_session(pool, user_id, instance_id, "text").await;
+        AffinityRepo { pool }
+            .load_or_create(text_session, user_id, instance_id)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE engine.companion_affinity \
+             SET intimacy = $2, tension = $3, updated_at = now() - make_interval(days => $4) \
+             WHERE session_id = $1",
+        )
+        .bind(text_session)
+        .bind(intimacy)
+        .bind(tension)
+        .bind(days_ago)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     async fn seed_session(pool: &sqlx::PgPool, user_id: Uuid, instance_id: Uuid, ch: &str) -> Uuid {
         sqlx::query_scalar(
             "INSERT INTO engine.chat_sessions (user_id, instance_id, channel) \
@@ -4153,9 +4190,22 @@ data: [DONE]\n\n";
             .len()
     }
 
+    /// [`seed_recallable_memory_rows`] plus a pair affinity at chemistry tier
+    /// 2, high enough for the recall gate to let one profile row per category
+    /// through while every relationship line still reads as just-met.
+    async fn seed_recallable_memories(
+        pool: &sqlx::PgPool,
+        session_id: Uuid,
+        user_id: Uuid,
+        instance_id: Uuid,
+    ) {
+        seed_recallable_memory_rows(pool, session_id, user_id, instance_id).await;
+        seed_pair_affinity(pool, user_id, instance_id, 0.2, 0.2, 0).await;
+    }
+
     /// One categorised profile row + one relationship row, both stored at
     /// `unit_embedding(1)` — the vector `embed_mock` hands back.
-    async fn seed_recallable_memories(
+    async fn seed_recallable_memory_rows(
         pool: &sqlx::PgPool,
         session_id: Uuid,
         user_id: Uuid,
@@ -4314,15 +4364,9 @@ data: [DONE]\n\n";
         let user_id = Uuid::new_v4();
         let instance_id = seed_instance(&pool, user_id).await;
         let session_id = seed_session(&pool, user_id, instance_id, "voice").await;
+        // Also seeds the pair's affinity row, so a relationship line exists
+        // for the recall block to sit after (Acquaintance / Flirtation).
         seed_recallable_memories(&pool, session_id, user_id, instance_id).await;
-
-        // An affinity row for the pair, so a relationship line exists for the
-        // recall block to sit after (fresh seed ⇒ Acquaintance / Spark).
-        let text_session = seed_session(&pool, user_id, instance_id, "text").await;
-        AffinityRepo { pool: &pool }
-            .load_or_create(text_session, user_id, instance_id)
-            .await
-            .unwrap();
 
         let frames = run_recall_turn(
             &pool,
@@ -4363,6 +4407,42 @@ data: [DONE]\n\n";
             sys.ends_with("[shared_memories]\n- 上次约好一起去东京"),
             "the recall block must be the final segment: {sys}"
         );
+    }
+
+    /// A pair with no affinity row is a stranger to the recall gate: what the
+    /// user said to this persona still comes back, the cross-persona profile
+    /// layer does not — even under a `full` scope.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_voice_turn_without_affinity_gets_the_stranger_gate(pool: sqlx::PgPool) {
+        let mock = bootstrap_mock().await;
+        let embed = embed_mock(200, None).await;
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id, "voice").await;
+        seed_recallable_memory_rows(&pool, session_id, user_id, instance_id).await;
+
+        let frames = run_recall_turn(
+            &pool,
+            &mock,
+            &embed,
+            session_id,
+            instance_id,
+            user_id,
+            RecallTurnOpts {
+                memory_scope: MemoryScope::Full,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_streamed_hi(&frames);
+
+        let sys = system_prompt_of(&last_request_body(&mock).await);
+        assert!(
+            sys.contains("[shared_memories]\n- 上次约好一起去东京"),
+            "relationship memory missing: {sys}"
+        );
+        assert!(!sys.contains("[user_profile]"), "{sys}");
+        assert!(!sys.contains("喜欢在东京散步"), "{sys}");
     }
 
     /// The embedding provider fails: the reply still streams, no recall block,
@@ -4556,6 +4636,9 @@ data: [DONE]\n\n";
         let user_id = Uuid::new_v4();
         let instance_id = seed_instance(&pool, user_id).await;
         let session_id = seed_session(&pool, user_id, instance_id, "voice").await;
+        // Chemistry tier 2: the recall gate lets the profile-layer marker row
+        // through.
+        seed_pair_affinity(&pool, user_id, instance_id, 0.2, 0.2, 0).await;
 
         let persisted_text = "persisted words";
         let retry_text = "different words";
