@@ -9,7 +9,7 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use eros_engine_core::scope::{AffinityScope, InsightMode, MemoryScope};
+use eros_engine_core::scope::{AffinityScope, InsightMode, IntimateField, MemoryScope, RecallGate};
 use eros_engine_core::types::{ActionPlan, DecisionInput, Event, LlmAudit, PromptTrait};
 use eros_engine_llm::model_config::{style_preset, ResolvedModel, StyleKey};
 use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
@@ -640,20 +640,67 @@ pub(crate) fn human_insights_to_bullets(row: &HumanInsightsRow, mode: InsightMod
     push_str(&mut out, &row.mbti_guess, "MBTI");
     push_str(&mut out, &row.ideology, "意识形态");
     if intimate {
-        push_str(&mut out, &row.love_values, "感情观");
-        push_str(&mut out, &row.relationship_history, "感情经历");
-        push_arr(&mut out, &row.interests, "兴趣");
-        push_str(&mut out, &row.emotional_needs, "情感需求");
-        push_str(&mut out, &row.family, "家庭");
-        push_str(&mut out, &row.finance_status, "经济状况");
-        push_arr(&mut out, &row.kinks, "性癖");
-        push_str(&mut out, &row.mental_health, "心理健康");
+        use IntimateField as F;
+        push_str(&mut out, &row.love_values, intimate_label(F::LoveValues));
+        push_str(
+            &mut out,
+            &row.relationship_history,
+            intimate_label(F::RelationshipHistory),
+        );
+        push_arr(&mut out, &row.interests, intimate_label(F::Interests));
+        push_str(
+            &mut out,
+            &row.emotional_needs,
+            intimate_label(F::EmotionalNeeds),
+        );
+        push_str(&mut out, &row.family, intimate_label(F::Family));
+        push_str(
+            &mut out,
+            &row.finance_status,
+            intimate_label(F::FinanceStatus),
+        );
+        push_arr(&mut out, &row.kinks, intimate_label(F::Kinks));
+        push_str(
+            &mut out,
+            &row.mental_health,
+            intimate_label(F::MentalHealth),
+        );
     }
     push_str(&mut out, &row.life_rhythm, "作息");
     push_str(&mut out, &row.social_pattern, "社交模式");
     push_arr(&mut out, &row.personality_traits, "性格特质");
     push_str(&mut out, &row.future_plans, "未来计划");
     out
+}
+
+/// The 基础画像 label an intimate field renders under. The bullet renderer
+/// and the gate's bullet filter both read it, so the two can't drift.
+fn intimate_label(field: IntimateField) -> &'static str {
+    match field {
+        IntimateField::LoveValues => "感情观",
+        IntimateField::RelationshipHistory => "感情经历",
+        IntimateField::Kinks => "性癖",
+        IntimateField::Interests => "兴趣",
+        IntimateField::EmotionalNeeds => "情感需求",
+        IntimateField::Family => "家庭",
+        IntimateField::FinanceStatus => "经济状况",
+        IntimateField::MentalHealth => "心理健康",
+    }
+}
+
+/// Whether a rendered 基础画像 bullet passes the recall gate. Only the
+/// leading `label：` decides, so a neutral bullet whose value mentions an
+/// intimate label stays. Works on rendered strings because voice freezes its
+/// bullets rendered (spec 2026-10-27-affinity-gated-profile-recall §4).
+pub(crate) fn insight_bullet_allowed(bullet: &str, gate: RecallGate) -> bool {
+    IntimateField::ALL
+        .into_iter()
+        .find(|f| {
+            bullet
+                .strip_prefix(intimate_label(*f))
+                .is_some_and(|rest| rest.starts_with('：'))
+        })
+        .is_none_or(|f| gate.allows(f))
 }
 
 /// The 学历 label for a stored `education_level` code; an unknown code has none.
@@ -938,6 +985,10 @@ pub(crate) async fn build_reply_request_with(
         _ => (MemoryScope::default(), AffinityScope::default()),
     };
     let (mem_mode, x_on, y_on) = memory_scope.resolve();
+    // The scope is the ceiling; this turn's affinity narrows within it (spec
+    // 2026-10-27-affinity-gated-profile-recall). Group seats arrive here with
+    // their own decayed affinity.
+    let gate = RecallGate::from_affinity(&input.affinity);
     // Routine turns use the defaults — keep those at debug. Surface only
     // caller-overridden scopes at info, where they're actually notable.
     if memory_scope != MemoryScope::default() || affinity_scope != AffinityScope::default() {
@@ -946,12 +997,16 @@ pub(crate) async fn build_reply_request_with(
             affinity_axes_active = affinity_scope.active_count(),
             x_on,
             y_on,
+            bond_tier = gate.bond_tier,
+            chem_tier = gate.chem_tier,
             "chat scopes resolved (non-default)"
         );
     } else {
         tracing::debug!(
             memory_scope = ?memory_scope,
             affinity_axes_active = affinity_scope.active_count(),
+            bond_tier = gate.bond_tier,
+            chem_tier = gate.chem_tier,
             "chat scopes resolved (defaults)"
         );
     }
@@ -967,7 +1022,20 @@ pub(crate) async fn build_reply_request_with(
     )
     .await;
 
-    let insight_bullets = load_human_insight_bullets(&state.pool, user_id, mem_mode).await;
+    let loaded_bullets = load_human_insight_bullets(&state.pool, user_id, mem_mode).await;
+    let loaded_count = loaded_bullets.len();
+    let insight_bullets: Vec<String> = loaded_bullets
+        .into_iter()
+        .filter(|b| insight_bullet_allowed(b, gate))
+        .collect();
+    if insight_bullets.len() < loaded_count {
+        tracing::debug!(
+            withheld = loaded_count - insight_bullets.len(),
+            bond_tier = gate.bond_tier,
+            chem_tier = gate.chem_tier,
+            "insight bullets gated"
+        );
+    }
     if !insight_bullets.is_empty() {
         profile_groups.insert(0, ("基础画像".into(), insight_bullets));
     }
@@ -1896,6 +1964,160 @@ mod tests {
 
         let off = load_human_insight_bullets(&pool, user_id, InsightMode::Off).await;
         assert!(off.is_empty());
+    }
+
+    // ─── recall gate: 基础画像 bullets (spec 2026-10-27 §2.4) ──────────
+
+    #[test]
+    fn insight_bullet_allowed_matches_the_leading_label_only() {
+        let s = RecallGate::STRANGER;
+        assert!(!insight_bullet_allowed("性癖：束缚", s));
+        assert!(!insight_bullet_allowed("感情观：慢热", s));
+        assert!(insight_bullet_allowed("职业：设计师", s));
+        assert!(insight_bullet_allowed("职业：性癖研究员", s));
+        let chem2 = RecallGate {
+            bond_tier: 1,
+            chem_tier: 2,
+        };
+        assert!(insight_bullet_allowed("感情观：慢热", chem2));
+        assert!(!insight_bullet_allowed("感情经历：单身两年", chem2));
+    }
+
+    #[test]
+    fn gated_full_bullets_unlock_field_by_field() {
+        let full = human_insights_to_bullets(&sample_human_row(), InsightMode::Full);
+        let keep = |g: RecallGate| -> Vec<String> {
+            full.iter()
+                .filter(|b| insight_bullet_allowed(b, g))
+                .cloned()
+                .collect()
+        };
+        let neutral = human_insights_to_bullets(&sample_human_row(), InsightMode::Neutral);
+        assert_eq!(keep(RecallGate::STRANGER), neutral);
+        assert_eq!(
+            keep(RecallGate {
+                bond_tier: 5,
+                chem_tier: 5
+            }),
+            full
+        );
+        let mid = keep(RecallGate {
+            bond_tier: 3,
+            chem_tier: 4,
+        });
+        for present in [
+            "性癖：束缚、角色扮演",
+            "感情经历：单身两年",
+            "家庭：独生女，父母在杭州",
+            "兴趣：登山、摄影",
+        ] {
+            assert!(mid.iter().any(|b| b == present), "{present}");
+        }
+        assert!(!mid
+            .iter()
+            .any(|b| b.starts_with("经济状况：") || b.starts_with("心理健康：")));
+    }
+
+    /// The reply builder gates 基础画像 by the turn's own affinity — the same
+    /// `DecisionInput.affinity` a group seat carries. `InsightsOnly` renders
+    /// Full bullets with both memory layers off, so no Voyage call runs.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn build_reply_request_gates_intimate_insights_by_affinity(pool: PgPool) {
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, owner).await;
+        let session_id = make_session(&pool, owner, Some(instance_id)).await;
+        let user_message_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.chat_messages (session_id, role, content) \
+             VALUES ($1, 'user', '你好') RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let insights = serde_json::json!({
+            "occupation": "工程师", "kinks": ["束缚"], "family": "独生女"
+        });
+        HumanInsightRepo { pool: &pool }
+            .replace_profile(owner, &project_profile(&insights))
+            .await
+            .unwrap();
+
+        let state = crate::routes::companion::test_state(pool.clone());
+        let plan = ActionPlan {
+            action_type: eros_engine_core::types::ActionType::ReplyText,
+            reply_style: eros_engine_core::types::ReplyStyle::Neutral,
+            affinity_deltas: Default::default(),
+            energy_cost: 0.0,
+            context_hints: vec![],
+            reply_mode: None,
+            nudges: Default::default(),
+            clothing: None,
+            image_caption: None,
+            image_ref: eros_engine_core::types::ImageRef::Face,
+            aspect_ratio: None,
+            action_response: None,
+        };
+        let system_with = |intimacy_tension: f64| {
+            let mut affinity = ladder_test_affinity(session_id, owner, instance_id);
+            affinity.trust = 0.0;
+            affinity.intrigue = 0.0;
+            affinity.intimacy = intimacy_tension;
+            affinity.tension = intimacy_tension;
+            let input = DecisionInput {
+                event: Event::UserMessage {
+                    content: "你好".into(),
+                    message_id: user_message_id,
+                    prompt_traits: vec![],
+                    audit: None,
+                    tier: None,
+                    memory_scope: MemoryScope::InsightsOnly,
+                    affinity_scope: Default::default(),
+                    quote: Default::default(),
+                    action: None,
+                    outfit: None,
+                },
+                affinity,
+                persona: ladder_test_persona(instance_id, owner),
+                signals: eros_engine_core::types::ConversationSignals {
+                    message_count: 1,
+                    hours_since_last_message: 0.1,
+                    ghost_streak: 0,
+                    hours_since_last_ghost: None,
+                },
+            };
+            let state = &state;
+            let plan = &plan;
+            async move {
+                let (req, _tags) = build_reply_request(
+                    state,
+                    &input,
+                    plan,
+                    session_id,
+                    owner,
+                    instance_id,
+                    user_message_id,
+                    &crate::prompt::NowContext::default(),
+                    false,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("build_reply_request succeeds");
+                req.messages[0].content.clone()
+            }
+        };
+
+        // chemistry 0.4 → tier 3; bond 0 → tier 1.
+        let sys = system_with(0.4).await;
+        assert!(sys.contains("职业：工程师"), "{sys}");
+        assert!(!sys.contains("性癖："), "{sys}");
+        assert!(!sys.contains("家庭："), "{sys}");
+
+        // chemistry 0.7 → tier 4.
+        let sys = system_with(0.7).await;
+        assert!(sys.contains("性癖：束缚"), "{sys}");
+        assert!(!sys.contains("家庭："), "{sys}");
     }
 
     // ─── audit_from_event ───────────────────────────────────────────────
