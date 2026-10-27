@@ -22,7 +22,9 @@ use eros_engine_store::human_insight::HumanInsightRepo;
 use eros_engine_store::persona::PersonaRepo;
 
 use crate::memory_hygiene::prune_recalled;
-use crate::pipeline::handlers::{human_insights_to_bullets, recall_memory, RecallTier};
+use crate::pipeline::handlers::{
+    human_insights_to_bullets, insight_bullet_allowed, recall_memory, RecallTier,
+};
 use crate::pipeline::stream::{
     error_frame_fields_from_last, split_failures, ulid_string, ProtocolFrame, StreamErrorCode,
     STREAM_OPEN_TIMEOUT, STREAM_TOTAL_TIMEOUT,
@@ -149,7 +151,8 @@ pub fn build_voice_prompt(
 /// underlying `human_insights` row changes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VoiceBootstrap {
-    /// 基础画像 bullets, rendered at first turn under that turn's `InsightMode`.
+    /// 基础画像 bullets, rendered at first turn under that turn's `InsightMode`
+    /// and filtered through each turn's recall gate when injected.
     pub insights: Vec<String>,
     /// Previous voice call's tail, rendered as a plain transcript.
     #[serde(default)]
@@ -199,12 +202,12 @@ fn plan_bootstrap(session_metadata: &serde_json::Value) -> BootstrapPlan {
 /// transcript, then the `[身体状态]` lines (effects, then needs). Each
 /// sub-block is omitted when its part is empty; `None` when all are — the
 /// caller then emits no block at all (no stray blank lines).
-fn render_bootstrap(b: &VoiceBootstrap) -> Option<String> {
+fn render_bootstrap(b: &VoiceBootstrap, gate: RecallGate) -> Option<String> {
     let bullets: Vec<&str> = b
         .insights
         .iter()
         .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty() && insight_bullet_allowed(s, gate))
         .collect();
     let prev = b
         .prev_call
@@ -655,7 +658,13 @@ pub fn run_voice_turn(
             }
         };
 
-        let affinity = affinity_res.unwrap_or(None);
+        // Decayed once, as the text and group paths do, so the relationship
+        // line and the recall gate below read the same tiers text would.
+        let affinity = affinity_res.unwrap_or(None).map(|mut a| {
+            a.apply_time_decay();
+            a.refresh_endpoints(&state.config.affinity_tuning);
+            a
+        });
         // No pair row ⇒ a stranger to the recall gate (spec
         // 2026-10-27-affinity-gated-profile-recall §2.3).
         let gate = affinity
@@ -728,7 +737,7 @@ pub fn run_voice_turn(
                 None => None,
             },
         };
-        let bootstrap_block = bootstrap.as_ref().and_then(render_bootstrap);
+        let bootstrap_block = bootstrap.as_ref().and_then(|b| render_bootstrap(b, gate));
 
         // The call's frozen state for the caller (spec 2026-10-12-given-item-
         // lingering-effects-design.md §9.1), before the first `delta`.
@@ -1068,6 +1077,12 @@ pub fn run_voice_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every line at its top tier: the recall gate withholds nothing.
+    const OPEN_GATE: RecallGate = RecallGate {
+        bond_tier: 5,
+        chem_tier: 5,
+    };
     use chrono::Utc;
     use uuid::Uuid;
 
@@ -1163,6 +1178,26 @@ mod tests {
     /// The whole block, byte-pinned: label, bullet prefix, sub-block order,
     /// and the `\n\n` joining discipline the prompt already uses.
     #[test]
+    fn bootstrap_block_filters_intimate_bullets_through_the_gate() {
+        let s = snapshot(&["职业：设计师", "性癖：束缚", "家庭：独生女"], None);
+        assert_eq!(
+            render_bootstrap(&s, RecallGate::STRANGER).as_deref(),
+            Some("[关于他]\n- 职业：设计师")
+        );
+        assert_eq!(
+            render_bootstrap(
+                &s,
+                RecallGate {
+                    bond_tier: 3,
+                    chem_tier: 4
+                }
+            )
+            .as_deref(),
+            Some("[关于他]\n- 职业：设计师\n- 性癖：束缚\n- 家庭：独生女")
+        );
+    }
+
+    #[test]
     fn bootstrap_block_rendering_is_pinned() {
         let s = snapshot(
             &["城市：上海", "职业：设计师"],
@@ -1171,7 +1206,7 @@ mod tests {
         let p = build_voice_prompt(
             &genome(),
             "DIRECTIVE",
-            render_bootstrap(&s).as_deref(),
+            render_bootstrap(&s, OPEN_GATE).as_deref(),
             None,
             AffinityScope::none(),
             None,
@@ -1201,13 +1236,13 @@ mod tests {
         let mut s = snapshot(&["城市：上海"], Some("用户：你好"));
         s.effects = vec![cigarette()];
         assert_eq!(
-            render_bootstrap(&s).as_deref(),
+            render_bootstrap(&s, OPEN_GATE).as_deref(),
             Some("[关于他]\n- 城市：上海\n\n[上次通话]\n用户：你好\n\n[身体状态]\n1 支烟，烟劲很足，正在劲头上")
         );
         let mut alone = snapshot(&[], None);
         alone.effects = vec![cigarette()];
         assert_eq!(
-            render_bootstrap(&alone).as_deref(),
+            render_bootstrap(&alone, OPEN_GATE).as_deref(),
             Some("[身体状态]\n1 支烟，烟劲很足，正在劲头上")
         );
     }
@@ -1237,13 +1272,13 @@ mod tests {
         s.effects = vec![cigarette()];
         s.needs = Some(hungry());
         assert_eq!(
-            render_bootstrap(&s).as_deref(),
+            render_bootstrap(&s, OPEN_GATE).as_deref(),
             Some("[身体状态]\n1 支烟，烟劲很足，正在劲头上\n此刻的需要：饿了；很累")
         );
         let mut alone = snapshot(&[], None);
         alone.needs = Some(hungry());
         assert_eq!(
-            render_bootstrap(&alone).as_deref(),
+            render_bootstrap(&alone, OPEN_GATE).as_deref(),
             Some("[身体状态]\n此刻的需要：饿了；很累")
         );
     }
@@ -1265,7 +1300,7 @@ mod tests {
         let p = build_voice_prompt(
             &genome(),
             "DIRECTIVE",
-            render_bootstrap(&s).as_deref(),
+            render_bootstrap(&s, OPEN_GATE).as_deref(),
             Some(&a),
             AffinityScope::full(),
             None,
@@ -1288,7 +1323,7 @@ mod tests {
         let p = build_voice_prompt(
             &genome(),
             "DIRECTIVE",
-            render_bootstrap(&s).as_deref(),
+            render_bootstrap(&s, OPEN_GATE).as_deref(),
             None,
             AffinityScope::none(),
             None,
@@ -1303,7 +1338,7 @@ mod tests {
         let p = build_voice_prompt(
             &genome(),
             "DIRECTIVE",
-            render_bootstrap(&s).as_deref(),
+            render_bootstrap(&s, OPEN_GATE).as_deref(),
             None,
             AffinityScope::none(),
             None,
@@ -1317,11 +1352,11 @@ mod tests {
     #[test]
     fn bootstrap_both_parts_empty_emits_no_block() {
         let empty = snapshot(&[], None);
-        assert!(render_bootstrap(&empty).is_none());
+        assert!(render_bootstrap(&empty, OPEN_GATE).is_none());
         let p = build_voice_prompt(
             &genome(),
             "DIRECTIVE",
-            render_bootstrap(&empty).as_deref(),
+            render_bootstrap(&empty, OPEN_GATE).as_deref(),
             None,
             AffinityScope::none(),
             None,
@@ -1329,7 +1364,7 @@ mod tests {
         assert_eq!(p, "You are Mia.\n\nDIRECTIVE");
         // A whitespace-only prev_call is empty too.
         let blank = snapshot(&["  "], Some("   \n "));
-        assert!(render_bootstrap(&blank).is_none());
+        assert!(render_bootstrap(&blank, OPEN_GATE).is_none());
     }
 
     // ─── per-turn recall block ──────────────────────────────────────────
@@ -1401,7 +1436,7 @@ mod tests {
         let p = build_voice_prompt(
             &genome(),
             "DIRECTIVE",
-            render_bootstrap(&s).as_deref(),
+            render_bootstrap(&s, OPEN_GATE).as_deref(),
             Some(&a),
             AffinityScope::full(),
             block.as_deref(),
@@ -1486,7 +1521,7 @@ mod tests {
                 let p = build_voice_prompt(
                     &genome(),
                     "DIRECTIVE",
-                    render_bootstrap(&s).as_deref(),
+                    render_bootstrap(&s, OPEN_GATE).as_deref(),
                     Some(&a),
                     AffinityScope::full(),
                     render_recall_block(groups.clone(), facts.clone()).as_deref(),
@@ -3511,6 +3546,89 @@ data: [DONE]\n\n";
             !sys.contains("感情观"),
             "Neutral tier must not leak intimate fields: {sys}"
         );
+    }
+
+    /// A frozen `[性癖, 职业]` marker, written the way any marker — including
+    /// one frozen before the recall gate existed — sits in `metadata`.
+    async fn freeze_intimate_marker(pool: &sqlx::PgPool, session_id: Uuid) -> serde_json::Value {
+        let marker = serde_json::to_value(snapshot(&["职业：设计师", "性癖：束缚"], None)).unwrap();
+        ChatRepo { pool }
+            .set_voice_bootstrap(session_id, &marker)
+            .await
+            .unwrap();
+        marker
+    }
+
+    /// The frozen bullets pass through each turn's recall gate: the marker
+    /// never changes, what reaches the prompt follows the pair's tiers.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_voice_turn_gates_the_frozen_snapshot_per_turn(pool: sqlx::PgPool) {
+        let mock = bootstrap_mock().await;
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id, "voice").await;
+        let marker = freeze_intimate_marker(&pool, session_id).await;
+
+        let frames = run_bootstrap_turn(
+            &pool,
+            &mock,
+            session_id,
+            instance_id,
+            user_id,
+            "01J9GATE00000000000000001",
+            MemoryScope::Full,
+        )
+        .await;
+        assert_no_error_frame(&frames);
+        let sys = system_prompt_of(&last_request_body(&mock).await);
+        assert!(sys.contains("职业：设计师"), "{sys}");
+        assert!(!sys.contains("性癖："), "no pair row ⇒ stranger: {sys}");
+
+        // Chemistry 0.7 → tier 4.
+        seed_pair_affinity(&pool, user_id, instance_id, 0.7, 0.7, 0).await;
+        let frames = run_bootstrap_turn(
+            &pool,
+            &mock,
+            session_id,
+            instance_id,
+            user_id,
+            "01J9GATE00000000000000002",
+            MemoryScope::Full,
+        )
+        .await;
+        assert_no_error_frame(&frames);
+        let sys = system_prompt_of(&last_request_body(&mock).await);
+        assert!(sys.contains("性癖：束缚"), "{sys}");
+        assert_eq!(read_marker(&pool, session_id).await, Some(marker));
+    }
+
+    /// Voice gates on the decayed affinity, as text does: a pair at chemistry
+    /// tier 4 on its stored row, idle for a month, has dropped to tier 3.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_voice_turn_gate_reads_decayed_affinity(pool: sqlx::PgPool) {
+        let mock = bootstrap_mock().await;
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id, "voice").await;
+        freeze_intimate_marker(&pool, session_id).await;
+        // Stored chemistry (0.6 + 0.7) / 2 = 0.65 → tier 4; thirty days of
+        // tension decay (0.005/day) leave (0.6 + 0.55) / 2 = 0.575 → tier 3.
+        seed_pair_affinity(&pool, user_id, instance_id, 0.6, 0.7, 30).await;
+
+        let frames = run_bootstrap_turn(
+            &pool,
+            &mock,
+            session_id,
+            instance_id,
+            user_id,
+            "01J9GATE00000000000000003",
+            MemoryScope::Full,
+        )
+        .await;
+        assert_no_error_frame(&frames);
+        let sys = system_prompt_of(&last_request_body(&mock).await);
+        assert!(sys.contains("职业：设计师"), "{sys}");
+        assert!(!sys.contains("性癖："), "{sys}");
     }
 
     /// The snapshot is frozen: a later turn re-injects the stored strings and
