@@ -4,7 +4,9 @@
 //! The HTTP surface is split into three independently-authed sub-trees:
 //!   * Public:        `/healthz` — no auth
 //!   * Bearer JWT:    `/comp/*`, `/bff/v1/*`, `/world/*`, `/persona/*` — Supabase JWT (see auth::middleware)
-//!   * Service secret: `/svc/v1/*` — `x-insights-export-secret`; mounted only when configured
+//!   * Service secrets: `/svc/v1/*` — three sub-trees, each behind its own secret header
+//!     (`x-insights-export-secret`, `x-facts-export-secret`, `x-user-erase-secret`); a sub-tree is
+//!     mounted only when its secret is configured
 //!
 //! The auth layer is applied to the `/comp` + `/bff` merge, NOT the
 //! top-level merge, so the public `/healthz` route stays unauthenticated
@@ -66,12 +68,20 @@ pub fn router(state: AppState) -> OpenApiRouter<AppState> {
         .layer(from_fn_with_state(state.clone(), require_auth));
 
     let mut app = OpenApiRouter::new().merge(health::router()).merge(comp);
-    // Service sub-tree: secret-admitted, mounted only when the deployment set
-    // INSIGHTS_EXPORT_SECRET. An unconfigured deployment answers on /svc/*
-    // exactly as it does for any unknown path, so it does not confirm the
-    // feature exists.
+    // Service sub-trees: secret-admitted, each mounted only when the
+    // deployment set its own secret (INSIGHTS_EXPORT_SECRET,
+    // FACTS_EXPORT_SECRET, USER_ERASE_SECRET). Separate secrets keep a
+    // consumer of one stream from reaching another's routes. An unconfigured
+    // sub-tree answers exactly as any unknown path does, so it does not
+    // confirm the feature exists.
     if state.config.insights_export.secret.is_some() {
         app = app.merge(svc::router());
+    }
+    if state.config.facts_export.secret.is_some() {
+        app = app.merge(svc::facts_router());
+    }
+    if state.config.user_erase.secret.is_some() {
+        app = app.merge(svc::erase_router());
     }
     app
 }
@@ -101,6 +111,8 @@ pub fn router_for_openapi() -> OpenApiRouter<AppState> {
         .merge(reaction::router())
         .merge(group::router())
         .merge(svc::router())
+        .merge(svc::facts_router())
+        .merge(svc::erase_router())
 }
 
 /// The generated OpenAPI document as JSON, for tests that assert on the wire

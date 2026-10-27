@@ -1214,6 +1214,8 @@ pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
             byok: crate::state::ByokConfig::default(),
             byoc: crate::state::ByocConfig::default(),
             insights_export: crate::state::InsightsExportConfig::default(),
+            facts_export: crate::state::FactsExportConfig::default(),
+            user_erase: crate::state::UserEraseConfig::default(),
             profile_rebuild: crate::state::parse_profile_rebuild_config(None, None, None, None),
         },
         openrouter: Arc::new(eros_engine_llm::openrouter::OpenRouterClient::new(

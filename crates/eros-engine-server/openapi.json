@@ -1256,6 +1256,128 @@
         ]
       }
     },
+    "/svc/v1/facts/changes": {
+      "get": {
+        "tags": [
+          "svc"
+        ],
+        "summary": "Ledger facts first seen or seen again since a keyset cursor, for a\ndownstream service that mirrors what was mined about each user. A repeat\nmoves `last_seen_at`, so a row reappears in the stream each time its\ncounters change. Rows leave the ledger only through erasure; see\n`/svc/v1/facts/deletions`.",
+        "operationId": "facts_changes",
+        "parameters": [
+          {
+            "name": "since",
+            "in": "query",
+            "description": "RFC 3339. Default: Unix epoch (walk everything).",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "after_id",
+            "in": "query",
+            "description": "Tie-break within `since`. Default: nil UUID. Pass `next.id`.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Default 500, clamped to 1..=1000.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FactChangesResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "x-facts-export-secret missing or wrong"
+          }
+        },
+        "security": [
+          {
+            "facts_export_secret": []
+          }
+        ]
+      }
+    },
+    "/svc/v1/facts/deletions": {
+      "get": {
+        "tags": [
+          "svc"
+        ],
+        "summary": "Users whose data the engine erased since a keyset cursor, for the facts\nmirror to drop in turn. The same stream as `/svc/v1/insights/deletions`,\nreadable with the facts secret so that mirror needs no second credential.",
+        "operationId": "facts_deletions",
+        "parameters": [
+          {
+            "name": "since",
+            "in": "query",
+            "description": "RFC 3339. Default: Unix epoch (walk everything).",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "after_user",
+            "in": "query",
+            "description": "Tie-break within `since`. Default: nil UUID. Pass `next.user_id`.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Default 500, clamped to 1..=1000.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErasuresResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "x-facts-export-secret missing or wrong"
+          }
+        },
+        "security": [
+          {
+            "facts_export_secret": []
+          }
+        ]
+      }
+    },
     "/svc/v1/insights/changes": {
       "get": {
         "tags": [
@@ -1302,6 +1424,67 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/InsightChangesResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "x-insights-export-secret missing or wrong"
+          }
+        },
+        "security": [
+          {
+            "insights_export_secret": []
+          }
+        ]
+      }
+    },
+    "/svc/v1/insights/deletions": {
+      "get": {
+        "tags": [
+          "svc"
+        ],
+        "summary": "Users whose data the engine erased since a keyset cursor, for the mirror of\nprofiles and memories to drop in turn. The same stream as\n`/svc/v1/facts/deletions`, readable with the insights secret so that mirror\nneeds no second credential.",
+        "operationId": "insights_deletions",
+        "parameters": [
+          {
+            "name": "since",
+            "in": "query",
+            "description": "RFC 3339. Default: Unix epoch (walk everything).",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "after_user",
+            "in": "query",
+            "description": "Tie-break within `since`. Default: nil UUID. Pass `next.user_id`.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Default 500, clamped to 1..=1000.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErasuresResponse"
                 }
               }
             }
@@ -4608,6 +4791,67 @@
           }
         }
       },
+      "ErasureCursor": {
+        "type": "object",
+        "description": "Keyset position. Pass both fields back as `since` + `after_user`.",
+        "required": [
+          "erased_at",
+          "user_id"
+        ],
+        "properties": {
+          "erased_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "user_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "ErasureExportRow": {
+        "type": "object",
+        "description": "One user's erasure tombstone as exported.",
+        "required": [
+          "user_id",
+          "erased_at"
+        ],
+        "properties": {
+          "erased_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "user_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "ErasuresResponse": {
+        "type": "object",
+        "required": [
+          "erasures"
+        ],
+        "properties": {
+          "erasures": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ErasureExportRow"
+            }
+          },
+          "next": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ErasureCursor",
+                "description": "Present iff the page is full; `null` means the walk is complete."
+              }
+            ]
+          }
+        }
+      },
       "EventCategoryDto": {
         "type": "string",
         "description": "A life event's category: `short` and `mid` are incidents, `body` and\n`trip` backgrounds that last days.",
@@ -4736,6 +4980,120 @@
           "started_at": {
             "type": "string",
             "format": "date-time"
+          }
+        }
+      },
+      "FactChangesCursor": {
+        "type": "object",
+        "description": "Keyset position. Pass both fields back as `since` + `after_id`.",
+        "required": [
+          "last_seen_at",
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "last_seen_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "FactChangesResponse": {
+        "type": "object",
+        "required": [
+          "facts"
+        ],
+        "properties": {
+          "facts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FactExportRow"
+            }
+          },
+          "next": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FactChangesCursor",
+                "description": "Present iff the page is full; `null` means the walk is complete."
+              }
+            ]
+          }
+        }
+      },
+      "FactExportRow": {
+        "type": "object",
+        "description": "One `human_facts` row as exported. Source pointers (session, message, run)\nstay inside the engine; `recurrence` is the derived tier.",
+        "required": [
+          "id",
+          "user_id",
+          "content",
+          "category",
+          "domain",
+          "evidence_type",
+          "temporality",
+          "persistence",
+          "confidence",
+          "occurrences",
+          "session_count",
+          "recurrence",
+          "first_seen_at",
+          "last_seen_at"
+        ],
+        "properties": {
+          "category": {
+            "type": "string"
+          },
+          "confidence": {
+            "type": "string"
+          },
+          "content": {
+            "type": "string"
+          },
+          "domain": {
+            "type": "string"
+          },
+          "evidence_type": {
+            "type": "string"
+          },
+          "first_seen_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "last_seen_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "occurrences": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "persistence": {
+            "type": "string"
+          },
+          "recurrence": {
+            "type": "string",
+            "description": "`once`, `repeated_in_session` or `repeated_across_sessions`."
+          },
+          "session_count": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "temporality": {
+            "type": "string"
+          },
+          "user_id": {
+            "type": "string",
+            "format": "uuid"
           }
         }
       },
@@ -6948,11 +7306,23 @@
         "bearerFormat": "JWT",
         "description": "Supabase JWT bearer token"
       },
+      "facts_export_secret": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-facts-export-secret",
+        "description": "Shared secret for the facts export sub-tree; FACTS_EXPORT_SECRET on the deployment"
+      },
       "insights_export_secret": {
         "type": "apiKey",
         "in": "header",
         "name": "x-insights-export-secret",
         "description": "Shared secret for the service sub-tree; INSIGHTS_EXPORT_SECRET on the deployment"
+      },
+      "user_erase_secret": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-user-erase-secret",
+        "description": "Shared secret for the user-erase sub-tree; USER_ERASE_SECRET on the deployment"
       }
     }
   },

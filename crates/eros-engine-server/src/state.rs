@@ -461,7 +461,25 @@ pub fn parse_byoc_config(caller_secret: Option<&str>) -> Result<ByocConfig, Stri
     Ok(ByocConfig { caller_secret })
 }
 
-/// Export admission for `/svc/v1/*` (`insights/changes`, `memories/changes`).
+/// Shortest secret the engine boots with. The `/svc/v1/*` sub-trees (insights,
+/// facts, user erase) each take their own, so a consumer holds only the
+/// credential for the streams it reads.
+pub const MIN_SVC_SECRET_LEN: usize = 32;
+
+/// A blank secret means off; a short one refuses boot with an error naming
+/// `env`.
+fn parse_svc_secret(env: &str, secret: Option<&str>) -> Result<Option<String>, String> {
+    match secret.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(None),
+        Some(s) if s.len() < MIN_SVC_SECRET_LEN => {
+            Err(format!("{env} must be at least {MIN_SVC_SECRET_LEN} bytes"))
+        }
+        Some(s) => Ok(Some(s.to_string())),
+    }
+}
+
+/// Export admission for the insights sub-tree (`insights/changes`,
+/// `memories/changes`, `insights/deletions`).
 #[derive(Clone, Default)]
 pub struct InsightsExportConfig {
     /// `INSIGHTS_EXPORT_SECRET`. `None` leaves the routes unmounted.
@@ -477,21 +495,58 @@ impl std::fmt::Debug for InsightsExportConfig {
     }
 }
 
-/// Shortest `INSIGHTS_EXPORT_SECRET` the engine boots with.
-pub const MIN_INSIGHTS_EXPORT_SECRET_LEN: usize = 32;
-
 /// A blank secret means off; a short one refuses boot.
 pub fn parse_insights_export_config(secret: Option<&str>) -> Result<InsightsExportConfig, String> {
-    let secret = match secret.map(str::trim).filter(|s| !s.is_empty()) {
-        None => None,
-        Some(s) if s.len() < MIN_INSIGHTS_EXPORT_SECRET_LEN => {
-            return Err(format!(
-                "INSIGHTS_EXPORT_SECRET must be at least {MIN_INSIGHTS_EXPORT_SECRET_LEN} bytes"
-            ));
-        }
-        Some(s) => Some(s.to_string()),
-    };
-    Ok(InsightsExportConfig { secret })
+    Ok(InsightsExportConfig {
+        secret: parse_svc_secret("INSIGHTS_EXPORT_SECRET", secret)?,
+    })
+}
+
+/// Export admission for the facts sub-tree (`facts/changes`,
+/// `facts/deletions`).
+#[derive(Clone, Default)]
+pub struct FactsExportConfig {
+    /// `FACTS_EXPORT_SECRET`. `None` leaves the routes unmounted.
+    pub secret: Option<String>,
+}
+
+impl std::fmt::Debug for FactsExportConfig {
+    /// The secret never reaches a log line through `ServerConfig`'s `{:?}`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FactsExportConfig")
+            .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// A blank secret means off; a short one refuses boot.
+pub fn parse_facts_export_config(secret: Option<&str>) -> Result<FactsExportConfig, String> {
+    Ok(FactsExportConfig {
+        secret: parse_svc_secret("FACTS_EXPORT_SECRET", secret)?,
+    })
+}
+
+/// Admission for the user-erase sub-tree.
+#[derive(Clone, Default)]
+pub struct UserEraseConfig {
+    /// `USER_ERASE_SECRET`. `None` leaves the routes unmounted.
+    pub secret: Option<String>,
+}
+
+impl std::fmt::Debug for UserEraseConfig {
+    /// The secret never reaches a log line through `ServerConfig`'s `{:?}`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserEraseConfig")
+            .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// A blank secret means off; a short one refuses boot.
+pub fn parse_user_erase_config(secret: Option<&str>) -> Result<UserEraseConfig, String> {
+    Ok(UserEraseConfig {
+        secret: parse_svc_secret("USER_ERASE_SECRET", secret)?,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -565,6 +620,10 @@ pub struct ServerConfig {
     pub byoc: ByocConfig,
     /// Insights export admission (`INSIGHTS_EXPORT_SECRET`).
     pub insights_export: InsightsExportConfig,
+    /// Facts export admission (`FACTS_EXPORT_SECRET`).
+    pub facts_export: FactsExportConfig,
+    /// User-erase admission (`USER_ERASE_SECRET`).
+    pub user_erase: UserEraseConfig,
     /// Profile-rebuild idle-flush sweeper (`PROFILE_REBUILD_*` env vars).
     pub profile_rebuild: ProfileRebuildConfig,
 }
@@ -654,6 +713,12 @@ impl ServerConfig {
             byoc: parse_byoc_config(std::env::var("BYOC_CALLER_SECRET").ok().as_deref())?,
             insights_export: parse_insights_export_config(
                 std::env::var("INSIGHTS_EXPORT_SECRET").ok().as_deref(),
+            )?,
+            facts_export: parse_facts_export_config(
+                std::env::var("FACTS_EXPORT_SECRET").ok().as_deref(),
+            )?,
+            user_erase: parse_user_erase_config(
+                std::env::var("USER_ERASE_SECRET").ok().as_deref(),
             )?,
             profile_rebuild: parse_profile_rebuild_config(
                 std::env::var("PROFILE_REBUILD_DISABLED").ok().as_deref(),
@@ -1112,5 +1177,56 @@ mod tests {
             .unwrap()
             .secret
             .is_some());
+    }
+
+    #[test]
+    fn facts_export_secret_too_short_refuses_boot() {
+        let err = parse_facts_export_config(Some("too-short")).unwrap_err();
+        assert!(err.contains("FACTS_EXPORT_SECRET"));
+        assert!(parse_facts_export_config(Some(&"s".repeat(31))).is_err());
+        assert!(parse_facts_export_config(Some(&"s".repeat(32)))
+            .unwrap()
+            .secret
+            .is_some());
+    }
+
+    #[test]
+    fn facts_export_secret_blank_is_off() {
+        assert!(parse_facts_export_config(None).unwrap().secret.is_none());
+        assert!(parse_facts_export_config(Some("   "))
+            .unwrap()
+            .secret
+            .is_none());
+    }
+
+    #[test]
+    fn user_erase_secret_too_short_refuses_boot() {
+        let err = parse_user_erase_config(Some("too-short")).unwrap_err();
+        assert!(err.contains("USER_ERASE_SECRET"));
+        assert!(parse_user_erase_config(Some(&"s".repeat(31))).is_err());
+        assert!(parse_user_erase_config(Some(&"s".repeat(32)))
+            .unwrap()
+            .secret
+            .is_some());
+    }
+
+    #[test]
+    fn user_erase_secret_blank_is_off() {
+        assert!(parse_user_erase_config(None).unwrap().secret.is_none());
+        assert!(parse_user_erase_config(Some("   "))
+            .unwrap()
+            .secret
+            .is_none());
+    }
+
+    #[test]
+    fn facts_export_and_user_erase_config_debug_hide_the_secret() {
+        let secret = "THE-SVC-SECRET-0123456789-abcdefghij";
+        let facts = format!("{:?}", parse_facts_export_config(Some(secret)).unwrap());
+        let erase = format!("{:?}", parse_user_erase_config(Some(secret)).unwrap());
+        for shown in [facts, erase] {
+            assert!(shown.contains("<redacted>"));
+            assert!(!shown.contains(secret));
+        }
     }
 }

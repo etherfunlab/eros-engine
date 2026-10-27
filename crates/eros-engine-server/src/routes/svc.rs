@@ -2,10 +2,21 @@
 //! Service-to-service routes (`/svc/v1/*`).
 //!
 //! A third auth class next to the public and bearer-JWT sub-trees: admitted by
-//! a shared secret header, never by a user token. The whole sub-tree is left
-//! unmounted when the deployment did not configure the secret (see
-//! `routes::router`), so an unconfigured deployment answers on `/svc/*`
-//! exactly as it does for any unknown path.
+//! a shared secret header, never by a user token. The class is split into three
+//! sub-trees, each behind its own secret so a consumer holds only the
+//! credential for the streams it reads:
+//!   * insights: `insights/changes`, `memories/changes`, `insights/deletions`
+//!     (`x-insights-export-secret`)
+//!   * facts: `facts/changes`, `facts/deletions` (`x-facts-export-secret`)
+//!   * user erase (`x-user-erase-secret`)
+//!
+//! A sub-tree is left unmounted when the deployment did not configure its
+//! secret (see `routes::router`), so an unconfigured deployment answers on
+//! those paths exactly as it does for any unknown path.
+//!
+//! The erasure stream rides both read secrets: a mirror of profiles and
+//! memories and a mirror of facts each have to learn which users to drop, and
+//! neither is given the other's credential to do it.
 
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Query, State};
@@ -17,6 +28,8 @@ use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
+use eros_engine_store::erasure::ErasureRepo;
+use eros_engine_store::human_fact::{HumanFactRepo, HumanFactRow};
 use eros_engine_store::human_insight::{HumanInsightRepo, HumanInsightsRow};
 use eros_engine_store::memory::{MemoryRepo, ProfileMemoryChange};
 
@@ -25,6 +38,8 @@ use crate::error::AppError;
 use crate::state::AppState;
 
 pub(crate) const EXPORT_SECRET_HEADER: &str = "x-insights-export-secret";
+pub(crate) const FACTS_SECRET_HEADER: &str = "x-facts-export-secret";
+pub(crate) const ERASE_SECRET_HEADER: &str = "x-user-erase-secret";
 const DEFAULT_LIMIT: i64 = 500;
 const MAX_LIMIT: i64 = 1000;
 
@@ -108,24 +123,47 @@ fn clamp_limit(requested: Option<i64>) -> i64 {
     requested.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT)
 }
 
-/// 403 unless the header matches the configured secret. The route is only
-/// mounted when the secret is set, so `None` here is unreachable in practice;
-/// it still fails closed.
-fn admit(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
-    let Some(secret) = state.config.insights_export.secret.as_deref() else {
-        return Err(AppError::Forbidden("insights export is not enabled".into()));
+/// 403 unless `header` carries `secret`. A sub-tree is only mounted when its
+/// secret is set, so `None` here is unreachable in practice; it still fails
+/// closed. `what` names the sub-tree in the error text.
+fn admit_with(
+    headers: &HeaderMap,
+    secret: Option<&str>,
+    header: &str,
+    what: &str,
+) -> Result<(), AppError> {
+    let Some(secret) = secret else {
+        return Err(AppError::Forbidden(format!("{what} is not enabled")));
     };
     let sent = headers
-        .get(EXPORT_SECRET_HEADER)
+        .get(header)
         .map(|v| v.as_bytes())
         .unwrap_or_default();
     if constant_time_eq(sent, secret.as_bytes()) {
         Ok(())
     } else {
-        Err(AppError::Forbidden(
-            "insights export secret missing or wrong".into(),
-        ))
+        Err(AppError::Forbidden(format!(
+            "{what} secret missing or wrong"
+        )))
     }
+}
+
+fn admit(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
+    admit_with(
+        headers,
+        state.config.insights_export.secret.as_deref(),
+        EXPORT_SECRET_HEADER,
+        "insights export",
+    )
+}
+
+fn admit_facts(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
+    admit_with(
+        headers,
+        state.config.facts_export.secret.as_deref(),
+        FACTS_SECRET_HEADER,
+        "facts export",
+    )
 }
 
 /// `human_insights` rows changed since a keyset cursor, for a downstream
@@ -270,10 +308,252 @@ async fn memories_changes(
     }))
 }
 
+/// One user's erasure tombstone as exported.
+#[derive(Serialize, ToSchema)]
+pub struct ErasureExportRow {
+    pub user_id: Uuid,
+    pub erased_at: DateTime<Utc>,
+}
+
+/// Keyset position. Pass both fields back as `since` + `after_user`.
+#[derive(Serialize, ToSchema)]
+pub struct ErasureCursor {
+    pub erased_at: DateTime<Utc>,
+    pub user_id: Uuid,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ErasuresResponse {
+    pub erasures: Vec<ErasureExportRow>,
+    /// Present iff the page is full; `null` means the walk is complete.
+    pub next: Option<ErasureCursor>,
+}
+
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct ErasuresQuery {
+    /// RFC 3339. Default: Unix epoch (walk everything).
+    pub since: Option<DateTime<Utc>>,
+    /// Tie-break within `since`. Default: nil UUID. Pass `next.user_id`.
+    pub after_user: Option<Uuid>,
+    /// Default 500, clamped to 1..=1000.
+    pub limit: Option<i64>,
+}
+
+/// One page of the erasure stream. Callers admit before they get here.
+async fn erasures_page(
+    state: &AppState,
+    q: Result<Query<ErasuresQuery>, QueryRejection>,
+) -> Result<Json<ErasuresResponse>, AppError> {
+    let Query(q) = q.map_err(|e| AppError::BadRequest(e.body_text()))?;
+    let since = q.since.unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
+    let after_user = q.after_user.unwrap_or(Uuid::nil());
+    let limit = clamp_limit(q.limit);
+
+    let rows = ErasureRepo { pool: &state.pool }
+        .list_changes(since, after_user, limit)
+        .await?;
+    let next = if rows.len() as i64 == limit {
+        rows.last().map(|r| ErasureCursor {
+            erased_at: r.erased_at,
+            user_id: r.user_id,
+        })
+    } else {
+        None
+    };
+    Ok(Json(ErasuresResponse {
+        erasures: rows
+            .into_iter()
+            .map(|r| ErasureExportRow {
+                user_id: r.user_id,
+                erased_at: r.erased_at,
+            })
+            .collect(),
+        next,
+    }))
+}
+
+/// Users whose data the engine erased since a keyset cursor, for the mirror of
+/// profiles and memories to drop in turn. The same stream as
+/// `/svc/v1/facts/deletions`, readable with the insights secret so that mirror
+/// needs no second credential.
+#[utoipa::path(
+    get,
+    path = "/svc/v1/insights/deletions",
+    tag = "svc",
+    params(ErasuresQuery),
+    responses(
+        (status = 200, body = ErasuresResponse),
+        (status = 403, description = "x-insights-export-secret missing or wrong")
+    ),
+    security(("insights_export_secret" = []))
+)]
+async fn insights_deletions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    q: Result<Query<ErasuresQuery>, QueryRejection>,
+) -> Result<Json<ErasuresResponse>, AppError> {
+    // Admission before the query error, no DB access before `admit`.
+    admit(&state, &headers)?;
+    erasures_page(&state, q).await
+}
+
+/// One `human_facts` row as exported. Source pointers (session, message, run)
+/// stay inside the engine; `recurrence` is the derived tier.
+#[derive(Serialize, ToSchema)]
+pub struct FactExportRow {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub content: String,
+    pub category: String,
+    pub domain: String,
+    pub evidence_type: String,
+    pub temporality: String,
+    pub persistence: String,
+    pub confidence: String,
+    pub occurrences: i32,
+    pub session_count: i32,
+    /// `once`, `repeated_in_session` or `repeated_across_sessions`.
+    pub recurrence: String,
+    pub first_seen_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+}
+
+impl From<HumanFactRow> for FactExportRow {
+    fn from(r: HumanFactRow) -> Self {
+        let recurrence = r.recurrence().as_str().to_string();
+        Self {
+            id: r.id,
+            user_id: r.user_id,
+            content: r.content,
+            category: r.category,
+            domain: r.domain,
+            evidence_type: r.evidence_type,
+            temporality: r.temporality,
+            persistence: r.persistence,
+            confidence: r.confidence,
+            occurrences: r.occurrences,
+            session_count: r.session_count,
+            recurrence,
+            first_seen_at: r.first_seen_at,
+            last_seen_at: r.last_seen_at,
+        }
+    }
+}
+
+/// Keyset position. Pass both fields back as `since` + `after_id`.
+#[derive(Serialize, ToSchema)]
+pub struct FactChangesCursor {
+    pub last_seen_at: DateTime<Utc>,
+    pub id: Uuid,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct FactChangesResponse {
+    pub facts: Vec<FactExportRow>,
+    /// Present iff the page is full; `null` means the walk is complete.
+    pub next: Option<FactChangesCursor>,
+}
+
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct FactChangesQuery {
+    /// RFC 3339. Default: Unix epoch (walk everything).
+    pub since: Option<DateTime<Utc>>,
+    /// Tie-break within `since`. Default: nil UUID. Pass `next.id`.
+    pub after_id: Option<Uuid>,
+    /// Default 500, clamped to 1..=1000.
+    pub limit: Option<i64>,
+}
+
+/// Ledger facts first seen or seen again since a keyset cursor, for a
+/// downstream service that mirrors what was mined about each user. A repeat
+/// moves `last_seen_at`, so a row reappears in the stream each time its
+/// counters change. Rows leave the ledger only through erasure; see
+/// `/svc/v1/facts/deletions`.
+#[utoipa::path(
+    get,
+    path = "/svc/v1/facts/changes",
+    tag = "svc",
+    params(FactChangesQuery),
+    responses(
+        (status = 200, body = FactChangesResponse),
+        (status = 403, description = "x-facts-export-secret missing or wrong")
+    ),
+    security(("facts_export_secret" = []))
+)]
+async fn facts_changes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    q: Result<Query<FactChangesQuery>, QueryRejection>,
+) -> Result<Json<FactChangesResponse>, AppError> {
+    // As in `insights_changes`: admission before the query error, no DB access
+    // before `admit_facts`.
+    admit_facts(&state, &headers)?;
+    let Query(q) = q.map_err(|e| AppError::BadRequest(e.body_text()))?;
+    let since = q.since.unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
+    let after_id = q.after_id.unwrap_or(Uuid::nil());
+    let limit = clamp_limit(q.limit);
+
+    let rows = HumanFactRepo { pool: &state.pool }
+        .list_changes(since, after_id, limit)
+        .await?;
+    let next = if rows.len() as i64 == limit {
+        rows.last().map(|r| FactChangesCursor {
+            last_seen_at: r.last_seen_at,
+            id: r.id,
+        })
+    } else {
+        None
+    };
+    Ok(Json(FactChangesResponse {
+        facts: rows.into_iter().map(FactExportRow::from).collect(),
+        next,
+    }))
+}
+
+/// Users whose data the engine erased since a keyset cursor, for the facts
+/// mirror to drop in turn. The same stream as `/svc/v1/insights/deletions`,
+/// readable with the facts secret so that mirror needs no second credential.
+#[utoipa::path(
+    get,
+    path = "/svc/v1/facts/deletions",
+    tag = "svc",
+    params(ErasuresQuery),
+    responses(
+        (status = 200, body = ErasuresResponse),
+        (status = 403, description = "x-facts-export-secret missing or wrong")
+    ),
+    security(("facts_export_secret" = []))
+)]
+async fn facts_deletions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    q: Result<Query<ErasuresQuery>, QueryRejection>,
+) -> Result<Json<ErasuresResponse>, AppError> {
+    // Admission before the query error, no DB access before `admit_facts`.
+    admit_facts(&state, &headers)?;
+    erasures_page(&state, q).await
+}
+
+/// Insights sub-tree: mounted under `INSIGHTS_EXPORT_SECRET`.
 pub fn router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(insights_changes))
         .routes(routes!(memories_changes))
+        .routes(routes!(insights_deletions))
+}
+
+/// Facts sub-tree: mounted under `FACTS_EXPORT_SECRET`.
+pub fn facts_router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(facts_changes))
+        .routes(routes!(facts_deletions))
+}
+
+/// User-erase sub-tree: mounted under `USER_ERASE_SECRET`.
+pub fn erase_router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
 }
 
 #[cfg(test)]
@@ -285,15 +565,31 @@ mod tests {
     use tower::ServiceExt;
     use uuid::Uuid;
 
-    use super::{clamp_limit, EXPORT_SECRET_HEADER};
+    use eros_engine_store::human_fact::{FactInput, FactSource, HumanFactRepo};
+
+    use super::{clamp_limit, ERASE_SECRET_HEADER, EXPORT_SECRET_HEADER, FACTS_SECRET_HEADER};
     use crate::routes::companion::test_state;
     use crate::routes::companion::testutil::build_router;
 
     const SECRET: &str = "0123456789abcdef0123456789abcdef";
+    const FACTS_SECRET: &str = "fedcba9876543210fedcba9876543210";
+    const ERASE_SECRET: &str = "abcdef0123456789abcdef0123456789";
 
     fn app_with_secret(pool: sqlx::PgPool, secret: Option<&str>) -> Router {
+        app_with_secrets(pool, secret, None, None)
+    }
+
+    /// The three sub-trees are configured independently.
+    fn app_with_secrets(
+        pool: sqlx::PgPool,
+        insights: Option<&str>,
+        facts: Option<&str>,
+        erase: Option<&str>,
+    ) -> Router {
         let mut state = test_state(pool);
-        state.config.insights_export.secret = secret.map(String::from);
+        state.config.insights_export.secret = insights.map(String::from);
+        state.config.facts_export.secret = facts.map(String::from);
+        state.config.user_erase.secret = erase.map(String::from);
         build_router(state)
     }
 
@@ -312,9 +608,18 @@ mod tests {
     }
 
     async fn get(app: Router, uri: &str, secret: Option<&str>) -> (StatusCode, serde_json::Value) {
+        get_with(app, uri, EXPORT_SECRET_HEADER, secret).await
+    }
+
+    async fn get_with(
+        app: Router,
+        uri: &str,
+        header: &str,
+        secret: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
         let mut req = Request::get(uri);
         if let Some(s) = secret {
-            req = req.header(EXPORT_SECRET_HEADER, s);
+            req = req.header(header, s);
         }
         let res = app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
         let status = res.status();
@@ -757,5 +1062,363 @@ mod tests {
     fn openapi_lists_the_memories_export_route() {
         let api = crate::routes::openapi_for_tests();
         assert!(api["paths"]["/svc/v1/memories/changes"]["get"].is_object());
+    }
+
+    fn fact(content: &str) -> FactInput {
+        FactInput {
+            content: content.into(),
+            category: "preference".into(),
+            domain: "hobby".into(),
+            evidence_type: "explicit_statement".into(),
+            temporality: "current".into(),
+            persistence: "stable".into(),
+            confidence: "high".into(),
+        }
+    }
+
+    fn seen(at: chrono::DateTime<Utc>) -> FactSource {
+        FactSource {
+            session_id: None,
+            message_id: None,
+            run_id: None,
+            seen_at: at,
+        }
+    }
+
+    async fn seed_erasure(pool: &sqlx::PgPool, at: chrono::DateTime<Utc>) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO engine.user_erasures (user_id, erased_at) VALUES ($1, $2)")
+            .bind(id)
+            .bind(at)
+            .execute(pool)
+            .await
+            .unwrap();
+        id
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn facts_subtree_unmounted_without_its_secret_even_when_insights_secret_set(
+        pool: sqlx::PgPool,
+    ) {
+        let app = || app_with_secrets(pool.clone(), Some(SECRET), None, None);
+        let (unknown, _) = get_with(
+            app(),
+            "/svc-does-not-exist/zzz",
+            FACTS_SECRET_HEADER,
+            Some(FACTS_SECRET),
+        )
+        .await;
+        for uri in ["/svc/v1/facts/changes", "/svc/v1/facts/deletions"] {
+            for (header, secret) in [
+                (FACTS_SECRET_HEADER, FACTS_SECRET),
+                (EXPORT_SECRET_HEADER, SECRET),
+            ] {
+                let (status, _) = get_with(app(), uri, header, Some(secret)).await;
+                assert_eq!(status, unknown, "{uri} must look like an unknown path");
+            }
+        }
+        let (status, _) = get_with(
+            app(),
+            "/svc/v1/insights/changes",
+            EXPORT_SECRET_HEADER,
+            Some(SECRET),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the insights sub-tree stays mounted"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn insights_secret_does_not_admit_facts_routes(pool: sqlx::PgPool) {
+        let app = || app_with_secrets(pool.clone(), Some(SECRET), Some(FACTS_SECRET), None);
+        for uri in ["/svc/v1/facts/changes", "/svc/v1/facts/deletions"] {
+            // The insights secret under either header name.
+            for header in [EXPORT_SECRET_HEADER, FACTS_SECRET_HEADER] {
+                let (status, body) = get_with(app(), uri, header, Some(SECRET)).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{uri} via {header}");
+                assert_eq!(body["error"], "forbidden");
+            }
+            let (status, _) = get_with(app(), uri, FACTS_SECRET_HEADER, None).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{uri} without a header");
+            let (status, _) = get_with(app(), uri, FACTS_SECRET_HEADER, Some(FACTS_SECRET)).await;
+            assert_eq!(status, StatusCode::OK, "{uri} with its own secret");
+        }
+        // And the other way round: the facts secret opens nothing in the
+        // insights sub-tree.
+        for uri in [
+            "/svc/v1/insights/changes",
+            "/svc/v1/memories/changes",
+            "/svc/v1/insights/deletions",
+        ] {
+            let (status, _) = get_with(app(), uri, EXPORT_SECRET_HEADER, Some(FACTS_SECRET)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn erase_secret_mounts_nothing_in_the_other_sub_trees(pool: sqlx::PgPool) {
+        let app = || app_with_secrets(pool.clone(), None, None, Some(ERASE_SECRET));
+        let (unknown, _) = get_with(
+            app(),
+            "/svc-does-not-exist/zzz",
+            ERASE_SECRET_HEADER,
+            Some(ERASE_SECRET),
+        )
+        .await;
+        for uri in [
+            "/svc/v1/insights/changes",
+            "/svc/v1/insights/deletions",
+            "/svc/v1/facts/changes",
+            "/svc/v1/facts/deletions",
+        ] {
+            let (status, _) = get_with(app(), uri, ERASE_SECRET_HEADER, Some(ERASE_SECRET)).await;
+            assert_eq!(status, unknown, "{uri}");
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn facts_changes_pages_by_last_seen_then_id_and_exposes_recurrence(pool: sqlx::PgPool) {
+        let t0 = Utc.with_ymd_and_hms(2026, 10, 13, 12, 0, 0).unwrap();
+        let t1 = Utc.with_ymd_and_hms(2026, 10, 14, 12, 0, 0).unwrap();
+        let user = Uuid::new_v4();
+        let repo = HumanFactRepo { pool: &pool };
+        // Three rows tie on t0; the third is seen again at t1 and sorts last.
+        repo.upsert_run(
+            user,
+            &[
+                fact("用户喜欢爬山"),
+                fact("用户在深圳工作"),
+                fact("用户有一个妹妹"),
+            ],
+            &seen(t0),
+        )
+        .await
+        .unwrap();
+        repo.upsert_run(user, &[fact("用户有一个妹妹")], &seen(t1))
+            .await
+            .unwrap();
+        let mut tied: Vec<Uuid> = repo
+            .list_for_user(user)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.last_seen_at == t0)
+            .map(|r| r.id)
+            .collect();
+        tied.sort();
+        assert_eq!(tied.len(), 2);
+
+        let app = || app_with_secrets(pool.clone(), None, Some(FACTS_SECRET), None);
+        let (status, p1) = get_with(
+            app(),
+            "/svc/v1/facts/changes?limit=2",
+            FACTS_SECRET_HEADER,
+            Some(FACTS_SECRET),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = p1["facts"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter()
+                .map(|r| r["id"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>(),
+            tied.iter().map(|u| u.to_string()).collect::<Vec<_>>(),
+            "ties on last_seen_at break by id"
+        );
+        assert!(p1["next"].is_object(), "full page must carry next");
+        assert_eq!(p1["next"]["id"], rows[1]["id"]);
+        assert_eq!(p1["next"]["last_seen_at"], rows[1]["last_seen_at"]);
+
+        let next_ts = p1["next"]["last_seen_at"].as_str().unwrap();
+        let next_id = p1["next"]["id"].as_str().unwrap();
+        let (status, p2) = get_with(
+            app(),
+            &format!("/svc/v1/facts/changes?limit=2&since={next_ts}&after_id={next_id}"),
+            FACTS_SECRET_HEADER,
+            Some(FACTS_SECRET),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let rows2 = p2["facts"].as_array().unwrap();
+        assert_eq!(rows2.len(), 1);
+        assert!(p2["next"].is_null(), "short page must not carry next");
+        assert_eq!(rows2[0]["content"], "用户有一个妹妹");
+        assert_eq!(rows2[0]["recurrence"], "repeated_in_session");
+        assert_eq!(rows2[0]["occurrences"], 2);
+        assert_eq!(rows2[0]["session_count"], 1);
+
+        // A once-seen row, and the exact wire shape: no session / message /
+        // run pointers.
+        let once = &rows[0];
+        assert_eq!(once["recurrence"], "once");
+        assert_eq!(once["user_id"], user.to_string());
+        assert_eq!(once["category"], "preference");
+        assert_eq!(once["domain"], "hobby");
+        assert_eq!(once["evidence_type"], "explicit_statement");
+        assert_eq!(once["temporality"], "current");
+        assert_eq!(once["persistence"], "stable");
+        assert_eq!(once["confidence"], "high");
+        assert_eq!(once["first_seen_at"], "2026-10-13T12:00:00Z");
+        assert_eq!(once["last_seen_at"], "2026-10-13T12:00:00Z");
+        let mut keys: Vec<&str> = once
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "category",
+                "confidence",
+                "content",
+                "domain",
+                "evidence_type",
+                "first_seen_at",
+                "id",
+                "last_seen_at",
+                "occurrences",
+                "persistence",
+                "recurrence",
+                "session_count",
+                "temporality",
+                "user_id",
+            ]
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn insights_deletions_and_facts_deletions_page_user_erasures(pool: sqlx::PgPool) {
+        let t0 = Utc.with_ymd_and_hms(2026, 10, 13, 12, 0, 0).unwrap();
+        let t1 = Utc.with_ymd_and_hms(2026, 10, 14, 12, 0, 0).unwrap();
+        let first = seed_erasure(&pool, t0).await;
+        let second = seed_erasure(&pool, t1).await;
+
+        let app = || app_with_secrets(pool.clone(), Some(SECRET), Some(FACTS_SECRET), None);
+        for (uri, header, secret) in [
+            ("/svc/v1/insights/deletions", EXPORT_SECRET_HEADER, SECRET),
+            ("/svc/v1/facts/deletions", FACTS_SECRET_HEADER, FACTS_SECRET),
+        ] {
+            let (status, body) = get_with(app(), uri, header, Some(secret)).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert_eq!(
+                body,
+                serde_json::json!({
+                    "erasures": [
+                        {"user_id": first, "erased_at": "2026-10-13T12:00:00Z"},
+                        {"user_id": second, "erased_at": "2026-10-14T12:00:00Z"},
+                    ],
+                    "next": null,
+                }),
+                "{uri}"
+            );
+
+            let (_, p1) = get_with(app(), &format!("{uri}?limit=1"), header, Some(secret)).await;
+            assert_eq!(p1["erasures"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                p1["next"],
+                serde_json::json!({"erased_at": "2026-10-13T12:00:00Z", "user_id": first})
+            );
+            let next_ts = p1["next"]["erased_at"].as_str().unwrap();
+            let next_user = p1["next"]["user_id"].as_str().unwrap();
+            let (_, p2) = get_with(
+                app(),
+                &format!("{uri}?limit=1&since={next_ts}&after_user={next_user}"),
+                header,
+                Some(secret),
+            )
+            .await;
+            assert_eq!(
+                p2["erasures"],
+                serde_json::json!([{"user_id": second, "erased_at": "2026-10-14T12:00:00Z"}])
+            );
+            // limit == remaining rows: a full page still carries next.
+            assert!(p2["next"].is_object());
+        }
+
+        // Each stream is closed to the other's secret.
+        let (status, _) = get_with(
+            app(),
+            "/svc/v1/insights/deletions",
+            EXPORT_SECRET_HEADER,
+            Some(FACTS_SECRET),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = get_with(
+            app(),
+            "/svc/v1/facts/deletions",
+            FACTS_SECRET_HEADER,
+            Some(SECRET),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn facts_and_deletions_routes_admit_before_query_errors(pool: sqlx::PgPool) {
+        let app = || app_with_secrets(pool.clone(), Some(SECRET), Some(FACTS_SECRET), None);
+        for (uri, header, secret) in [
+            (
+                "/svc/v1/facts/changes?limit=abc",
+                FACTS_SECRET_HEADER,
+                FACTS_SECRET,
+            ),
+            (
+                "/svc/v1/facts/deletions?limit=abc",
+                FACTS_SECRET_HEADER,
+                FACTS_SECRET,
+            ),
+            (
+                "/svc/v1/insights/deletions?limit=abc",
+                EXPORT_SECRET_HEADER,
+                SECRET,
+            ),
+        ] {
+            for sent in [None, Some("wrong")] {
+                let (status, body) = get_with(app(), uri, header, sent).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{uri} sent={sent:?}");
+                assert_eq!(body["error"], "forbidden");
+            }
+            let (status, body) = get_with(app(), uri, header, Some(secret)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(body["error"], "bad_request");
+        }
+    }
+
+    #[test]
+    fn openapi_lists_new_svc_paths_and_schemes() {
+        let api = crate::routes::openapi_for_tests();
+        for (path, scheme) in [
+            ("/svc/v1/facts/changes", "facts_export_secret"),
+            ("/svc/v1/facts/deletions", "facts_export_secret"),
+            ("/svc/v1/insights/deletions", "insights_export_secret"),
+        ] {
+            let op = &api["paths"][path]["get"];
+            assert!(op.is_object(), "{path}");
+            assert!(op["security"][0][scheme].is_array(), "{path} uses {scheme}");
+        }
+        // The schemes live on the full document (`ApiDoc` + routes), as
+        // `print-openapi` builds it.
+        let (_router, full) =
+            utoipa_axum::router::OpenApiRouter::<crate::state::AppState>::with_openapi(
+                <crate::openapi::ApiDoc as utoipa::OpenApi>::openapi(),
+            )
+            .merge(crate::routes::router_for_openapi())
+            .split_for_parts();
+        let full = serde_json::to_value(full).unwrap();
+        let schemes = &full["components"]["securitySchemes"];
+        assert_eq!(
+            schemes["facts_export_secret"]["name"],
+            "x-facts-export-secret"
+        );
+        assert_eq!(schemes["facts_export_secret"]["in"], "header");
+        assert_eq!(schemes["user_erase_secret"]["name"], "x-user-erase-secret");
+        assert_eq!(schemes["user_erase_secret"]["in"], "header");
     }
 }

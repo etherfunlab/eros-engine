@@ -5,9 +5,13 @@
 use utoipa::openapi::security::{ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 
+use crate::routes::svc::{ERASE_SECRET_HEADER, EXPORT_SECRET_HEADER, FACTS_SECRET_HEADER};
+
 /// Registers the security schemes used by handlers:
 ///   - `bearer` — Supabase JWT, attached to /comp/* and /bff/* routes
-///   - `insights_export_secret` — `x-insights-export-secret` header, /svc/v1/* routes
+///   - `insights_export_secret` — `x-insights-export-secret` header, the insights /svc/v1/* routes
+///   - `facts_export_secret` — `x-facts-export-secret` header, the facts /svc/v1/* routes
+///   - `user_erase_secret` — `x-user-erase-secret` header, the user-erase /svc/v1/* routes
 ///
 /// Without this declaration the generated spec has dangling
 /// `security(...)` references and fails standard OpenAPI validators.
@@ -31,8 +35,22 @@ impl Modify for SecurityAddon {
         components.add_security_scheme(
             "insights_export_secret",
             SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::with_description(
-                "x-insights-export-secret",
+                EXPORT_SECRET_HEADER,
                 "Shared secret for the service sub-tree; INSIGHTS_EXPORT_SECRET on the deployment",
+            ))),
+        );
+        components.add_security_scheme(
+            "facts_export_secret",
+            SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::with_description(
+                FACTS_SECRET_HEADER,
+                "Shared secret for the facts export sub-tree; FACTS_EXPORT_SECRET on the deployment",
+            ))),
+        );
+        components.add_security_scheme(
+            "user_erase_secret",
+            SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::with_description(
+                ERASE_SECRET_HEADER,
+                "Shared secret for the user-erase sub-tree; USER_ERASE_SECRET on the deployment",
             ))),
         );
     }
