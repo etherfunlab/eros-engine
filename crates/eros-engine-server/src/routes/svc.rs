@@ -565,11 +565,11 @@ pub struct EraseResponse {
 /// deletion streams.
 ///
 /// For a deployment to call when the user deletes their account. Derived rows
-/// (facts, profile, memories, world and story content, per-relationship
-/// insights) are deleted. Audit and event rows keep their ids and timestamps but
-/// lose their payloads and free text; relationship state keeps its numbers and
-/// loses its generated summary. Chat sessions and messages belong to the caller
-/// and are not touched.
+/// (facts, profile, memories, world and story content, and both sides'
+/// per-relationship insights) are deleted. Audit and event rows keep their ids
+/// and timestamps but lose their payloads and free text; relationship state
+/// keeps its numbers and loses its generated summary. Chat sessions and
+/// messages belong to the caller and are not touched.
 ///
 /// Idempotent: a repeat finds nothing left to erase, reports 0 everywhere and
 /// re-stamps the tombstone.
@@ -1580,7 +1580,7 @@ mod tests {
                 "{map}: {again}"
             );
         }
-        assert_eq!(again["deleted"].as_object().unwrap().len(), 15);
+        assert_eq!(again["deleted"].as_object().unwrap().len(), 17);
         assert_eq!(again["blanked"].as_object().unwrap().len(), 8);
         assert!(again["erased_at"].as_str().unwrap() > erased_at.as_str());
         assert_eq!(tombstone_count(&pool, user).await, 1);

@@ -61,6 +61,10 @@ const DERIVED: &[(&str, &str)] = &[
     ("persona_story_events", BY_OWNER),
     ("user_insights", BY_INSTANCE),
     ("user_insights_snapshot", BY_INSTANCE),
+    // The persona's side of the same relationship, extracted from the same
+    // conversation.
+    ("character_insights", BY_INSTANCE),
+    ("character_insights_snapshot", BY_INSTANCE),
 ];
 
 /// An audit or state row that survives an erasure with its content cleared.
@@ -94,16 +98,17 @@ const BLANKS: &[Blank] = &[
     },
     Blank {
         table: "chat_images_events",
-        clear: "inputs = '{}'::jsonb, subject = NULL, caption = NULL, composed_prompt = NULL",
+        clear: "inputs = '{}'::jsonb, subject = NULL, caption = NULL, composed_prompt = NULL, \
+                last_failure = NULL",
         scope: BY_USER,
         carries_content: "inputs <> '{}'::jsonb OR subject IS NOT NULL OR caption IS NOT NULL \
-                          OR composed_prompt IS NOT NULL",
+                          OR composed_prompt IS NOT NULL OR last_failure IS NOT NULL",
     },
     Blank {
         table: "chat_vision_events",
-        clear: "vision = NULL, image_url = ''",
+        clear: "vision = NULL, image_url = '', last_failure = NULL",
         scope: BY_USER,
-        carries_content: "vision IS NOT NULL OR image_url <> ''",
+        carries_content: "vision IS NOT NULL OR image_url <> '' OR last_failure IS NOT NULL",
     },
     Blank {
         table: "user_insights_events",
@@ -238,6 +243,14 @@ mod tests {
             "user_insights_snapshot",
             "instance_id IN (SELECT id FROM engine.persona_instances WHERE owner_uid = $1)",
         ),
+        (
+            "character_insights",
+            "instance_id IN (SELECT id FROM engine.persona_instances WHERE owner_uid = $1)",
+        ),
+        (
+            "character_insights_snapshot",
+            "instance_id IN (SELECT id FROM engine.persona_instances WHERE owner_uid = $1)",
+        ),
     ];
 
     /// Audit tables an erasure keeps and blanks: (table, scope to user `$1`,
@@ -257,12 +270,12 @@ mod tests {
             "chat_images_events",
             "user_id = $1",
             "inputs <> '{}'::jsonb OR subject IS NOT NULL OR caption IS NOT NULL \
-             OR composed_prompt IS NOT NULL",
+             OR composed_prompt IS NOT NULL OR last_failure IS NOT NULL",
         ),
         (
             "chat_vision_events",
             "user_id = $1",
-            "vision IS NOT NULL OR image_url <> ''",
+            "vision IS NOT NULL OR image_url <> '' OR last_failure IS NOT NULL",
         ),
         (
             "user_insights_events",
@@ -313,6 +326,9 @@ mod tests {
          SELECT p.u, p.i, (SELECT id FROM engine.persona_story_events WHERE instance_id = p.i), \
                 'story', array_fill(0::real, ARRAY[512])::vector(512), current_date",
         "INSERT INTO engine.user_insights (instance_id, location) SELECT p.i, 'Lisbon'",
+        "INSERT INTO engine.character_insights (instance_id, location) SELECT p.i, 'Porto'",
+        "INSERT INTO engine.character_insights_snapshot (instance_id, snapshot, captured_at) \
+         SELECT p.i, '{\"location\":\"Porto\"}', now()",
         "INSERT INTO engine.user_insights_snapshot (instance_id, snapshot, captured_at) \
          SELECT p.i, '{\"location\":\"Lisbon\"}', now()",
         "INSERT INTO engine.user_insights_events (run_id, instance_id, stage, status, payload) \
@@ -324,12 +340,21 @@ mod tests {
         "INSERT INTO engine.companion_decision_events (run_id, user_id, status, payload) \
          SELECT gen_random_uuid(), p.u, 'ok', '{\"action\":\"reply\"}'",
         "INSERT INTO engine.chat_images_events \
-             (source, user_id, session_id, status, inputs, subject, caption, composed_prompt, attempts) \
+             (source, user_id, session_id, status, inputs, subject, caption, composed_prompt, \
+              last_failure, attempts) \
          SELECT 'compose_endpoint', p.u, p.s, 'ok', '{\"slot\":\"x\"}', 'subject', 'caption', \
-                'prompt', 1",
+                'prompt', 'upstream_error', 1",
         "INSERT INTO engine.chat_vision_events \
-             (user_id, session_id, message_id, status, image_url, vision, attempts) \
-         SELECT p.u, p.s, p.m, 'ok', 'https://example.test/a.png', '{\"seen\":\"x\"}', 1",
+             (user_id, session_id, message_id, status, image_url, vision, last_failure, attempts) \
+         SELECT p.u, p.s, p.m, 'ok', 'https://example.test/a.png', '{\"seen\":\"x\"}', \
+                'upstream_error', 1",
+        // Rows whose only content is the failure text.
+        "INSERT INTO engine.chat_images_events \
+             (source, user_id, session_id, status, inputs, last_failure, attempts) \
+         SELECT 'compose_endpoint', p.u, p.s, 'exhausted', '{}', 'gateway_error', 1",
+        "INSERT INTO engine.chat_vision_events \
+             (user_id, session_id, message_id, status, image_url, last_failure, attempts) \
+         SELECT p.u, p.s, p.m, 'exhausted', '', 'gateway_error', 1",
         "INSERT INTO engine.companion_affinity \
              (session_id, user_id, instance_id, feeling_clause, feeling_clause_at) \
          SELECT p.s, p.u, p.i, 'warm', now()",

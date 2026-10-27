@@ -1567,7 +1567,7 @@
           "svc"
         ],
         "summary": "Erase everything the engine derived about a user, and list the user on the\ndeletion streams.",
-        "description": "For a deployment to call when the user deletes their account. Derived rows\n(facts, profile, memories, world and story content, per-relationship\ninsights) are deleted. Audit and event rows keep their ids and timestamps but\nlose their payloads and free text; relationship state keeps its numbers and\nloses its generated summary. Chat sessions and messages belong to the caller\nand are not touched.\n\nIdempotent: a repeat finds nothing left to erase, reports 0 everywhere and\nre-stamps the tombstone.",
+        "description": "For a deployment to call when the user deletes their account. Derived rows\n(facts, profile, memories, world and story content, and both sides'\nper-relationship insights) are deleted. Audit and event rows keep their ids\nand timestamps but lose their payloads and free text; relationship state\nkeeps its numbers and loses its generated summary. Chat sessions and\nmessages belong to the caller and are not touched.\n\nIdempotent: a repeat finds nothing left to erase, reports 0 everywhere and\nre-stamps the tombstone.",
         "operationId": "erase_user",
         "parameters": [
           {
