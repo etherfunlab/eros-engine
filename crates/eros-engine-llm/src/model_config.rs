@@ -2371,8 +2371,8 @@ impl ModelConfig {
     /// With the explicit fallback, one block reproduces the single-block
     /// behaviour exactly and two blocks tune the stages independently.
     ///
-    /// Parameterised over both names so the human chain's split reuses it
-    /// rather than copying it.
+    /// Parameterised over both names so every chain with a dedicated second
+    /// task (character, user, profile rebuild) reuses it rather than copying it.
     pub fn resolve_structuring(&self, stage2: &str, stage1: &str) -> ResolvedModel {
         let name = if self.tasks.contains_key(stage2) {
             stage2
@@ -2380,6 +2380,14 @@ impl ModelConfig {
             stage1
         };
         self.resolve(name, None)
+    }
+
+    /// Parameters for the scheduled profile rebuild: `[tasks.profile_rebuild]`
+    /// when present, else `[tasks.insight_extraction]`'s — never the global
+    /// defaults (see [`Self::resolve_structuring`]). The rebuild's prompt is
+    /// engine-owned, so only the model parameters resolve here.
+    pub fn resolve_profile_rebuild(&self) -> ResolvedModel {
+        self.resolve_structuring("profile_rebuild", "insight_extraction")
     }
 
     /// Resolve the world-director bundle. `None` when `[tasks.world_director]`
@@ -2638,9 +2646,9 @@ impl ModelConfig {
         Ok(())
     }
 
-    /// Boot gate for the structuring stages' `filter_prompt` keys —
+    /// Boot gate for the engine-owned prompts' `filter_prompt` keys —
     /// `[tasks.character_insight_structuring]`, `[tasks.user_insight_structuring]`,
-    /// and `[tasks.insight_structuring]` all parse the key but never read it.
+    /// and `[tasks.profile_rebuild]` all parse the key but never read it.
     ///
     /// The character chain's structuring stage builds its prompt in
     /// `prompt.rs`: the ten-column schema it must emit is the same schema
@@ -2658,7 +2666,7 @@ impl ModelConfig {
     /// max_tokens, sampling) stays configurable; those are the whole
     /// point of the block existing separately from stage 1.
     ///
-    /// Covers all three structuring blocks. The affinity gate stays separate:
+    /// Covers all three blocks. The affinity gate stays separate:
     /// it enforces the same rule for a different reason and has its own error
     /// text, and merging them would buy nothing but one fewer function.
     pub fn validate_structuring_prompt_unset(&self) -> Result<(), String> {
@@ -2675,11 +2683,7 @@ impl ModelConfig {
                 "user_insights",
                 "user_insight_extraction",
             ),
-            (
-                "insight_structuring",
-                "human_insights",
-                "insight_extraction",
-            ),
+            ("profile_rebuild", "human_insights", "insight_extraction"),
         ];
         for (task, table, stage1) in STRUCTURING_TASKS {
             let has_prompt = self
@@ -2688,7 +2692,7 @@ impl ModelConfig {
                 .is_some_and(|t| t.filter_prompt.is_some());
             if has_prompt {
                 return Err(format!(
-                    "[tasks.{task}].filter_prompt is set, but the structuring stage's prompt is \
+                    "[tasks.{task}].filter_prompt is set, but this task's prompt is \
                      engine-owned and deliberately not configurable — it was never read, and \
                      eros-engine refuses to boot rather than let it silently no-op. The prompt \
                      must stay in lockstep with the {table} columns it fills. Remove the key; \
@@ -2846,7 +2850,7 @@ pub const KNOWN_CHAT_TASKS: &[&str] = &[
     "memory_extraction",
     "character_insight_extraction",
     "character_insight_structuring",
-    "insight_structuring",
+    "profile_rebuild",
     "user_insight_extraction",
     "user_insight_structuring",
     "affinity_evaluation",
@@ -4041,19 +4045,63 @@ fallback = ""
         assert!(cfg.validate_prompt_variants().is_ok());
     }
 
-    // Regression: the committed example extraction prompts stay dual-track
-    // (insight: facts+details; memory: category + metadata taxonomy) with the
-    // budget that covers them (spec 2026-07-15-insight-memory-enrichment).
+    // Regression: the committed example extraction prompts keep their output
+    // contracts (insight: one `facts` array of objects over the ledger
+    // vocabulary; memory: category + metadata taxonomy) with the budget that
+    // covers them, and the rebuild block ships parameters-only.
     #[test]
-    fn committed_example_extraction_tasks_are_dual_track() {
+    fn committed_example_extraction_tasks_carry_their_contracts() {
         let text = include_str!("../../../examples/model_config.toml");
         let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml must parse");
         let ins = cfg.resolve_insight_extract().expect("insight task present");
         assert_eq!(ins.max_tokens, 1200);
         assert!(
-            ins.extract_prompt.contains("\"details\""),
-            "insight prompt must demand the dual-track output"
+            ins.extract_prompt.contains("{\"facts\":[{\"content\":"),
+            "insight prompt must demand one array of fact objects"
         );
+        assert!(
+            !ins.extract_prompt.contains("\"details\""),
+            "insight prompt must not carry the retired details track"
+        );
+        let domain_line = ins
+            .extract_prompt
+            .lines()
+            .find(|l| l.starts_with("- domain:"))
+            .expect("insight prompt lists the domain vocabulary");
+        let vocab: Vec<&str> = domain_line
+            .trim_start_matches("- domain:")
+            .split('。')
+            .next()
+            .unwrap()
+            .split('/')
+            .map(str::trim)
+            .collect();
+        assert_eq!(
+            vocab,
+            [
+                "basic_profile",
+                "career",
+                "education",
+                "technology",
+                "finance",
+                "family",
+                "friendship",
+                "romance",
+                "sexuality",
+                "kink",
+                "health",
+                "mental_health",
+                "lifestyle",
+                "hobby",
+                "ideology",
+                "personality",
+                "communication",
+                "other",
+            ]
+        );
+        assert!(cfg.has_task("profile_rebuild"));
+        assert!(!cfg.has_task("insight_structuring"));
+        assert_eq!(cfg.resolve_profile_rebuild().max_tokens, 1200);
         let mem = cfg.resolve_memory_extract().expect("memory task present");
         assert_eq!(mem.max_tokens, 1200);
         assert!(
@@ -5329,7 +5377,7 @@ filter_prompt = "   "
         for (task, table) in [
             ("character_insight_structuring", "character_insights"),
             ("user_insight_structuring", "user_insights"),
-            ("insight_structuring", "human_insights"),
+            ("profile_rebuild", "human_insights"),
         ] {
             let cfg = ModelConfig::from_toml_str(&format!(
                 "[tasks.{task}]\nmodel = \"m\"\nfilter_prompt = \"nope\"\n"
@@ -5354,7 +5402,7 @@ filter_prompt = "   "
     fn validate_structuring_prompt_unset_passes_on_parameters_only_blocks() {
         let cfg = ModelConfig::from_toml_str(
             "[tasks.user_insight_structuring]\nmodel = \"m\"\nmax_tokens = 600\n\
-             [tasks.insight_structuring]\nmodel = \"m\"\nmax_tokens = 600\n",
+             [tasks.profile_rebuild]\nmodel = \"m\"\nmax_tokens = 600\n",
         )
         .unwrap();
         assert!(cfg.validate_structuring_prompt_unset().is_ok());
@@ -5384,34 +5432,91 @@ filter_prompt = "   "
     }
 
     #[test]
-    fn resolve_structuring_falls_back_to_stage_one_model_for_the_human_chain() {
-        let cfg = ModelConfig::from_toml_str(
-            "[tasks.insight_extraction]\nmodel = \"human-stage-one/m\"\nfilter_prompt = \"p\"\n",
-        )
-        .unwrap();
-        let r = cfg.resolve_structuring("insight_structuring", "insight_extraction");
-        assert_eq!(r.model, "human-stage-one/m");
-    }
-
-    #[test]
-    fn insight_structuring_absent_block_reproduces_the_pre_split_parameters() {
-        // The split must be a no-op for anyone who does not add the new block.
-        let toml = "[tasks.insight_extraction]\nmodel = \"ins/m\"\nfallback = [\"fb/m\"]\n\
+    fn profile_rebuild_falls_back_to_extraction_block_when_absent() {
+        // An absent [tasks.profile_rebuild] must resolve to the extraction
+        // block's parameters, never to the global default model.
+        let toml = "[defaults]\nfallback_model = \"global/default\"\n\n\
+                    [tasks.insight_extraction]\nmodel = \"ins/m\"\nfallback = [\"fb/m\"]\n\
                     temperature = 0.2\nmax_tokens = 1200\nfilter_prompt = \"p\"\n";
         let cfg = ModelConfig::from_toml_str(toml).unwrap();
 
         let stage1 = cfg.resolve("insight_extraction", None);
-        let stage2 = cfg.resolve_structuring("insight_structuring", "insight_extraction");
+        let rebuild = cfg.resolve_profile_rebuild();
 
-        assert_eq!(stage2.model, stage1.model);
-        assert_eq!(stage2.max_tokens, stage1.max_tokens);
-        assert_eq!(stage2.temperature, stage1.temperature);
+        assert_eq!(rebuild.model, "ins/m");
+        assert_ne!(rebuild.model, "global/default");
+        assert_eq!(rebuild.model, stage1.model);
+        assert_eq!(rebuild.fallback_model, stage1.fallback_model);
+        assert_eq!(rebuild.max_tokens, stage1.max_tokens);
+        assert_eq!(rebuild.temperature, stage1.temperature);
+    }
+
+    #[test]
+    fn profile_rebuild_block_overrides_model_and_max_tokens() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.insight_extraction]\nmodel = \"ins/m\"\nmax_tokens = 1200\n\
+             filter_prompt = \"p\"\n\n\
+             [tasks.profile_rebuild]\nmodel = \"rebuild/m\"\nmax_tokens = 2400\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_profile_rebuild();
+        assert_eq!(r.model, "rebuild/m");
+        assert_eq!(r.max_tokens, 2400);
+        // The extraction block is untouched by the rebuild block.
+        let stage1 = cfg.resolve("insight_extraction", None);
+        assert_eq!(stage1.model, "ins/m");
+        assert_eq!(stage1.max_tokens, 1200);
+    }
+
+    #[test]
+    fn profile_rebuild_filter_prompt_refuses_boot() {
+        // Every shape, blank included: the rebuild prompt is engine-owned.
+        for prompt in [
+            "\"nope\"",
+            "\"\"",
+            "[\"a\", \"b\"]",
+            "{ a = \"x\", b = \"y\" }",
+        ] {
+            let cfg = ModelConfig::from_toml_str(&format!(
+                "[tasks.profile_rebuild]\nmodel = \"m\"\nfilter_prompt = {prompt}\n"
+            ))
+            .unwrap();
+            let err = cfg.validate_structuring_prompt_unset().unwrap_err();
+            assert!(
+                err.contains("[tasks.profile_rebuild].filter_prompt"),
+                "error must name the block for {prompt}, got: {err}"
+            );
+            assert!(err.contains("human_insights"), "got: {err}");
+            assert!(
+                err.contains("[tasks.insight_extraction].filter_prompt"),
+                "error must point at the configurable stage-1 key, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn insight_structuring_filter_prompt_no_longer_gated() {
+        // The retired stage-2 block is ignored: it parses, passes every boot
+        // gate that looks at prompts, and is no longer a known task name (a
+        // body rule naming it warns, never errors).
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.insight_extraction]\nmodel = \"m\"\nfilter_prompt = \"p\"\n\n\
+             [tasks.insight_structuring]\nmodel = \"m2\"\nfilter_prompt = \"leftover\"\n",
+        )
+        .unwrap();
+        assert!(cfg.validate_structuring_prompt_unset().is_ok());
+        assert!(cfg.validate_extraction_prompts().is_ok());
+        assert!(cfg.validate_prompt_variants().is_ok());
+        assert!(!KNOWN_CHAT_TASKS.contains(&"insight_structuring"));
+        assert!(KNOWN_CHAT_TASKS.contains(&"profile_rebuild"));
+        // The ignored block never feeds the rebuild's parameters.
+        assert_eq!(cfg.resolve_profile_rebuild().model, "m");
     }
 
     #[test]
     fn known_chat_tasks_covers_the_three_new_blocks() {
         for t in [
-            "insight_structuring",
+            "profile_rebuild",
             "user_insight_extraction",
             "user_insight_structuring",
         ] {
