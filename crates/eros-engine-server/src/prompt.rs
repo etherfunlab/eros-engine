@@ -15,9 +15,9 @@
 //!      JSONB instead of a flat `CompanionPersona` DTO
 //!
 //! 2. **Insight extraction prompts** (`facts_user_message`,
-//!    `extract_structured_insights_prompt`) — drive the post-process
-//!    insight-extraction pipeline. The schema description constant
-//!    `COMPANION_INSIGHTS_SCHEMA` is shared by the second of these.
+//!    `profile_rebuild_prompt`) — drive the post-process insight-extraction
+//!    pipeline. The schema description constant `PROFILE_REBUILD_SCHEMA`
+//!    belongs to the second of these.
 //!
 //! Memory-layer "prompts" are not LLM-driven (the embedding router only) and
 //! so don't live here. Future port targets (dream / proactive) should be
@@ -1802,42 +1802,52 @@ pub fn build_prompt(
 // module and future syncs from the closed-source `eros-gateway/src/ai/
 // prompts.rs` have a clear destination.
 
-/// Schema description used in `extract_structured_insights_prompt`. Mirrors
-/// the JSON shape that `HumanInsightRepo::apply_extraction` accepts
-/// (projected by `project_columns`).
-pub const COMPANION_INSIGHTS_SCHEMA: &str = r#"
-companion_insights schema（真人用户画像；所有字段可选；只输出下列字段，不要新增/编造字段名）：
+/// Output contract of the profile rebuild: the keys
+/// `human_insight::project_profile` reads, and the rules for filling them.
+///
+/// Every value is a `<…>` slot, never an example: the projection drops any
+/// value still shaped like a slot, and a concrete example would be copied
+/// back into real rows. `love_values` and `emotional_needs` are single
+/// strings and the four array fields are string arrays, because that is what
+/// the projection accepts. The accepted `education_level` codes are the
+/// store's `EDUCATION_LEVELS` / `EDUCATION_STATUSES` (a test pins them).
+pub const PROFILE_REBUILD_SCHEMA: &str = r#"
+profile schema（真人用户画像；所有字段可选；只输出下列字段，不要新增/编造字段名）：
 {
-  "city": "string — 常住城市（用户长期居住/生活的地方）。写出具体地点，如事实支持可加居住时长等细节，不要只写省份或泛称。例：深圳南山，工作生活五年多",
-  "location": "string — 此刻/近期所在地（出差、旅行、临时停留），仅当明显不同于常住城市才填。例：这周在东京出差",
-  "hometown": "string — 老家 / 籍贯 / 出生成长地，仅当用户明确提到才填，不要用当前居住城市替代。例：湖南长沙人，大学才离开",
-  "nationality": "string — 国籍/地区身份。例：中国香港",
-  "occupation": "string — 职业与工作状态，写出行业/职级/公司类型/日常细节，不要只写职位名词（不要只写「工程师」）。例：在深圳一家中厂做后端工程师，常年加班，最近想跳槽",
-  "mbti_guess": "string — MBTI。用户自报的类型直接填；没有自报时，只有当事实里反复出现同一类典型行为/表达模式，才可基于此谨慎推断，并在值里带上推测措辞（如「像/偏」），不要凭一两句话臆断。例：用户自述 INFP；或 偏 INFP，多次表现出重意义、不爱社交",
-  "love_values": "string — 对爱情/亲密关系的态度与期待，写成一两句具体总结。例：渴望被理解胜过浪漫仪式，慢热，怕被抛弃所以习惯先推开人",
-  "interests": ["array of strings — 兴趣爱好，每项 4~12 个汉字的具体短语，带一个实际细节，不要是孤立的单字/双字标签（如「爬山」「音乐」）。例：周末常去爬山 / 沉迷手冲咖啡 / 养了只橘猫"],
-  "emotional_needs": "string — 需要什么样的情感支持，写成一两句。例：下班后想有人先听他吐槽、被肯定，不喜欢被讲道理",
-  "life_rhythm": "string — 作息与生活节奏，写出具体模式，不要只写单一标签（不要只写「夜猫子」）。例：典型夜猫子，凌晨两三点睡、中午起，靠咖啡和外卖过日子",
-  "matching_preferences": {
-    "preferred_gender": "string — 偏好对象性别",
-    "age_range": [min_int, max_int],
-    "deal_breakers": ["array of strings — 无法接受的点，每项一个具体短语。例：长期冷暴力"]
-  },
-  "personality_traits": ["array of strings — 性格特质，每项 4~12 个汉字的具体短语，带依据/情境，不要是孤立单字（如「内向」「幽默」）。例：嘴硬心软 / 难过也说没事 / 对朋友很讲义气"],
-  "education": "string — 教育背景：学历/学校/专业/在读或毕业状态，写出具体信息，不要只写「大学毕业」。例：985 本科计算机，毕业五年",
-  "family": "string — 家庭结构：婚育状况、家庭成员、与家人关系概况，仅当用户明确提到才填。例：独生子，父母在老家，未婚，和妈妈每周通话",
-  "relationship_history": "string — 感情经历概况：过往恋情、上一段怎么结束、单身多久等，写成一两句具体总结。例：去年和异地恋三年的前任分手，之后一直单身",
-  "social_pattern": "string — 社交模式：独处/聚会倾向、线上线下社交习惯、朋友圈子状态。例：周末宅家，社交主要靠线上游戏开黑",
-  "future_plans": "string — 对未来的计划：近期目标、人生方向、正在筹划的事。例：想两年内跳去外企，攒钱在老家买房",
-  "finance_status": "string — 收入线索：收入水平/消费习惯/经济压力，仅当用户明确提到才填，绝不推断。例：月薪两万出头，房贷压力大"
+  "occupation": "<职业与工作状态，含行业、职级与日常细节>",
+  "mbti_guess": "<MBTI：自报的类型原样填；否则带「像/偏」措辞的谨慎推断>",
+  "love_values": "<对爱情与亲密关系的态度与期待，至多三条命题>",
+  "emotional_needs": "<需要什么样的情感支持，至多三条命题>",
+  "life_rhythm": "<作息与生活节奏的具体模式>",
+  "interests": ["<兴趣爱好，每项一个带实际细节的具体短语>"],
+  "personality_traits": ["<性格特质，每项一个带依据或情境的具体短语>"],
+  "deal_breakers": ["<现实生活中无法接受的点，每项一个具体短语>"],
+  "education": "<学校、专业与就读情况等教育细节>",
+  "education_level": {"level": "<学历档位代码>", "status": "<学业状态代码>"},
+  "family": "<家庭结构：婚育状况、家庭成员、与家人的关系>",
+  "relationship_history": "<感情经历概况：过往恋情、上一段怎么结束、单身多久>",
+  "social_pattern": "<社交模式：独处与聚会倾向、线上线下社交习惯>",
+  "future_plans": "<近期目标、人生方向与正在筹划的事>",
+  "finance_status": "<收入水平、消费习惯与经济压力>",
+  "kinks": ["<性方面的具体玩法或角色设定，每项一个短语>"],
+  "ideology": "<政治立场、宗教信仰与价值倾向>",
+  "mental_health": "<用户自述的心理与精神健康状况>"
 }
-地理字段示例：一个在深圳工作的香港新界人到台北旅游 → city=深圳, location=台北, hometown=新界, nationality=中国香港。
 填写规范：
-- 只填【用户事实】清楚支持的字段；对已支持的内容尽量写足细节与情境，用完整短语或句子，不要用单个词/标签凑数。
-- 绝不虚构、外推或编造事实中没有的信息；mbti_guess 的推断规则见上，且仍需基于事实中反复出现的信号，不要凭单次只言片语臆断。
-- 更新 matching_preferences 等嵌套对象时，把仍然成立的旧字段一起带上返回完整对象，不要只给单个子字段（否则旧值会被覆盖丢失）。
+- schema 描述的是【真人用户】本人 —— 所有字段都指用户，绝不是 AI 伴侣。
+- 账本是你掌握的关于该用户的全部信息。只填账本清楚支持的字段，没有依据就整个省略该字段，绝不猜测、外推或编造；对已支持的内容尽量写足细节与情境，用完整短语或句子，不要用单个词/标签凑数。
+- 标为 transient 的事实只反映当下状态，不进任何字段；除非其出现频次标注为 repeated_across_sessions（跨会话反复出现）。
+- interests、personality_traits 每项是 4~12 个汉字、带实际细节的具体短语，不要孤立的单字/双字标签。
+- love_values、emotional_needs 各写成一个字符串，至多三条命题，用分号隔开。
+- deal_breakers 只收现实生活中的无法接受点；对 AI 说话风格的不满、剧情中的即时反应不算。
+- kinks 保留具体的玩法与角色设定，不要概括成笼统标签；证据来自角色扮演的条目，在短语里写明「角色扮演中」。
+- 证据类型为 roleplay_expression 的事实只能进 kinks，不得进入其它任何字段。
+- ideology 可以依据事实里呈现出的行为，措辞要留有余地；绝不依据用户是谁（年龄、性别、职业、国籍、兴趣、所用语言）推断。
+- mental_health 只记用户自述，不做诊断、不下结论。
+- mbti_guess：用户自报的类型原样填；没有自报时，只有当多条事实里反复出现同一类行为/表达模式，才可基于此谨慎推断，并在值里带「像/偏」措辞；不要凭一两条事实臆断。
+- education 写学校、专业等具体信息；education_level 是编码对象：level 取 secondary_or_below（高中及以下）、associate（大专）、bachelor（本科）、master（硕士）、doctorate（博士）之一，status 取 enrolled（在读）、graduated（已毕业）之一；账本只支持其中一项时只写那一项，不要写这些代码之外的值。
 - 只输出上表列出的字段名，不要新增、不要改名。
-- 仅输出一个 JSON 对象，不要 markdown、不要解释。
+- 仅输出一个 JSON 对象，不要 markdown、不要解释；账本里没有任何可写的内容时输出 {}。
 "#;
 
 /// Build the *user* message for the facts-extraction call: just the turn,
@@ -1856,33 +1866,20 @@ pub fn memories_user_message(turns: &[String]) -> String {
     turns.join("\n")
 }
 
-/// Stage-2 insight extraction prompt: take the bullet list of facts mined
-/// in stage 1 plus the user's existing insights (reverse-projected from
-/// `human_insights`), and fill in whatever fields the LLM is confident
-/// about. Output expected as a JSON object matching `COMPANION_INSIGHTS_SCHEMA`.
-pub fn extract_structured_insights_prompt(
-    facts: &[String],
-    existing_insights: Option<&serde_json::Value>,
-) -> String {
-    let facts_str = facts
-        .iter()
-        .map(|f| format!("- {f}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let existing_str = existing_insights
-        .map(|v| serde_json::to_string_pretty(v).unwrap_or_else(|_| "{}".into()))
-        .unwrap_or_else(|| "{}".into());
-
+/// Profile-rebuild prompt: a single user message holding the user's whole
+/// fact ledger (rendered by the caller, grouped by domain) and
+/// `PROFILE_REBUILD_SCHEMA`. The previous profile is deliberately not an
+/// input; the model's JSON replaces the row and is parsed by
+/// `human_insight::project_profile`.
+#[allow(dead_code)]
+pub fn profile_rebuild_prompt(ledger: &str) -> String {
     format!(
-        "以下是从对话中提取的【用户】事实：\n\
-         {facts_str}\n\n\
-         现有的用户画像（companion_insights，供参考；如新事实能让某个已有字段更完整或更准确，\
-         请输出更新后的完整版本覆盖旧值，不要因为字段已存在就跳过或原样重复）：\n\
-         {existing_str}\n\n\
-         请根据上方的【用户事实】，填充以下 schema 中你有信心的字段。\
-         schema 描述的是【真人用户】本人——occupation、city、location 等都指用户，绝不是 AI 伴侣：\n\
-         {COMPANION_INSIGHTS_SCHEMA}\n\n\
-         仅输出 JSON，不要任何解释。",
+        "以下是【真人用户】的完整证据账本，按领域分组（## 领域）；每行是一条事实，\
+         附证据类型、持久性、出现频次与最近出现日期：\n\
+         {ledger}\n\n\
+         请只根据上方账本，填充以下 schema 中账本能支持的字段。\
+         schema 描述的是【真人用户】本人，绝不是 AI 伴侣：\n\
+         {PROFILE_REBUILD_SCHEMA}",
     )
 }
 
@@ -3483,48 +3480,117 @@ mod tests {
         assert!(p.contains("AI:   嗯嗯，魔都人"));
     }
 
-    #[test]
-    fn extract_structured_insights_prompt_renders_facts_as_bullets() {
-        let facts = vec!["住在上海".to_string(), "夜猫子".to_string()];
-        let p = extract_structured_insights_prompt(&facts, None);
-        assert!(p.contains("- 住在上海"));
-        assert!(p.contains("- 夜猫子"));
-        // Empty existing_insights renders as "{}".
-        assert!(p.contains("{}"));
-        // Schema description must be embedded.
-        assert!(p.contains("companion_insights schema"));
+    // ─── Profile rebuild prompt tests ──────────────────────────────
+
+    /// The 2.0 profile's top-level keys, in no particular order.
+    const PROFILE_KEYS: [&str; 18] = [
+        "occupation",
+        "mbti_guess",
+        "love_values",
+        "emotional_needs",
+        "life_rhythm",
+        "interests",
+        "personality_traits",
+        "deal_breakers",
+        "education",
+        "education_level",
+        "family",
+        "relationship_history",
+        "social_pattern",
+        "future_plans",
+        "finance_status",
+        "kinks",
+        "ideology",
+        "mental_health",
+    ];
+
+    /// `(key, value text)` for every top-level line of the schema block: a
+    /// two-space indent, then `"key": <value>`.
+    fn profile_schema_entries() -> Vec<(&'static str, &'static str)> {
+        PROFILE_REBUILD_SCHEMA
+            .lines()
+            .filter_map(|l| l.strip_prefix("  \""))
+            .filter_map(|l| l.split_once("\":"))
+            .map(|(key, value)| (key, value.trim()))
+            .collect()
     }
 
     #[test]
-    fn extract_structured_insights_prompt_includes_existing_jsonb() {
-        let existing = serde_json::json!({ "city": "Shanghai", "mbti_guess": "INFP" });
-        let p = extract_structured_insights_prompt(&[], Some(&existing));
-        // Pretty-printed existing object should appear in the prompt.
-        assert!(p.contains("\"city\": \"Shanghai\""));
-        assert!(p.contains("\"mbti_guess\": \"INFP\""));
+    fn profile_rebuild_prompt_contains_ledger_and_schema() {
+        let ledger = "## career\n- 用户做后端开发（explicit_statement，stable）";
+        let p = profile_rebuild_prompt(ledger);
+        assert!(p.contains(ledger), "ledger must be embedded verbatim: {p}");
+        assert!(
+            p.contains(PROFILE_REBUILD_SCHEMA),
+            "schema must be embedded: {p}"
+        );
+        assert!(
+            p.find(ledger) < p.find(PROFILE_REBUILD_SCHEMA),
+            "the model reads the ledger before the schema"
+        );
+        assert!(p.contains("真人用户"), "subject must be named: {p}");
     }
 
     #[test]
-    fn extract_structured_insights_prompt_schema_includes_geo_fields() {
-        // The embedded schema must carry the geo cluster so the model can fill them.
-        let p = extract_structured_insights_prompt(&["住在上海".to_string()], None);
-        assert!(p.contains("location"));
-        assert!(p.contains("hometown"));
-        assert!(p.contains("nationality"));
+    fn profile_rebuild_schema_has_no_copyable_examples() {
+        for marker in ["例：", "例:", "深圳"] {
+            assert!(
+                !PROFILE_REBUILD_SCHEMA.contains(marker),
+                "schema must not carry example values ({marker})"
+            );
+        }
+        let entries = profile_schema_entries();
+        assert!(!entries.is_empty());
+        for (key, value) in entries {
+            // Quoted segments sit at odd positions; only the object keys of
+            // `education_level` may be bare words, everything else is a slot.
+            for seg in value.split('"').skip(1).step_by(2) {
+                assert!(
+                    seg == "level"
+                        || seg == "status"
+                        || (seg.starts_with('<')
+                            && seg.ends_with('>')
+                            && eros_engine_store::human_insight::is_placeholder(seg)),
+                    "{key}: {seg:?} must be a <…> placeholder the engine drops"
+                );
+            }
+        }
     }
 
     #[test]
-    fn extract_structured_insights_prompt_schema_includes_expansion_fields() {
-        let p = extract_structured_insights_prompt(&["在读研究生".to_string()], None);
-        for key in [
-            "\"education\"",
-            "\"family\"",
-            "\"relationship_history\"",
-            "\"social_pattern\"",
-            "\"future_plans\"",
-            "\"finance_status\"",
+    fn profile_rebuild_schema_lists_exactly_the_2_0_keys() {
+        let mut keys: Vec<&str> = profile_schema_entries()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        keys.sort_unstable();
+        let mut want = PROFILE_KEYS.to_vec();
+        want.sort_unstable();
+        assert_eq!(keys, want);
+        for gone in [
+            "matching_preferences",
+            "preferred_gender",
+            "age_range",
+            "city",
+            "location",
+            "hometown",
+            "nationality",
         ] {
-            assert!(p.contains(key), "schema must describe {key}");
+            assert!(
+                !PROFILE_REBUILD_SCHEMA.contains(&format!("\"{gone}\"")),
+                "retired key {gone} must not be described"
+            );
+        }
+    }
+
+    #[test]
+    fn profile_rebuild_schema_codes_match_store_enums() {
+        use eros_engine_store::human_insight::{EDUCATION_LEVELS, EDUCATION_STATUSES};
+        for code in EDUCATION_LEVELS.iter().chain(EDUCATION_STATUSES) {
+            assert!(
+                PROFILE_REBUILD_SCHEMA.contains(code),
+                "schema must name the accepted code {code}"
+            );
         }
     }
 

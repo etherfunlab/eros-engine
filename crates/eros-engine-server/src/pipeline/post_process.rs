@@ -1315,18 +1315,6 @@ async fn summarize_feeling(
 
 const INSIGHT_TASK: &str = "insight_extraction";
 
-/// Stage 2 of the human chain. Split out from `INSIGHT_TASK` so the engine's
-/// own `record_generation` call and `[[providers.*.body]]` rules can tell
-/// the two stages apart, and so `max_tokens` stops being one number covering
-/// two very different outputs. This does NOT help OpenRouter-side accounting:
-/// `task` is config routing only and is never serialized to the wire (see
-/// `ChatRequest::task` in eros-engine-llm), so OpenRouter's own dashboard
-/// only ever sees `model` and `user`. An absent `[tasks.insight_structuring]`
-/// block resolves to stage 1's parameters — identical to the pre-split
-/// behaviour.
-#[allow(dead_code)]
-const INSIGHT_STRUCTURING_TASK: &str = "insight_structuring";
-
 /// Per-call audit captured from one insight_extraction OpenRouter call that
 /// returned a response. `None` (at the call site) means the call got no response
 /// (transport error / timeout) → no row is written.
@@ -1518,105 +1506,6 @@ fn extract_details_array(v: &serde_json::Value) -> Vec<serde_json::Value> {
         .and_then(|a| a.as_array())
         .cloned()
         .unwrap_or_default()
-}
-
-#[allow(dead_code)]
-async fn extract_structured_insights(
-    llm: &OpenRouterClient,
-    model_config: &ModelConfig,
-    pool: &sqlx::PgPool,
-    session_id: Uuid,
-    facts: &[String],
-    existing_insights: Option<&serde_json::Value>,
-    audit_user: Option<&str>,
-) -> (serde_json::Value, Option<CallAudit>) {
-    let empty = || serde_json::Value::Object(serde_json::Map::new());
-    if facts.is_empty() {
-        return (empty(), None);
-    }
-
-    let prompt = crate::prompt::extract_structured_insights_prompt(facts, existing_insights);
-
-    let resolved = model_config.resolve_structuring(INSIGHT_STRUCTURING_TASK, INSIGHT_TASK);
-    let req = ChatRequest {
-        model: resolved.model,
-        fallback_model: resolved.fallback_model,
-        messages: vec![ChatMessage {
-            role: "user".into(),
-            content: prompt,
-        }],
-        temperature: resolved.temperature as f32,
-        max_tokens: resolved.max_tokens,
-        sampling: resolved.sampling,
-        user: audit_user.map(String::from),
-        task: Some(INSIGHT_STRUCTURING_TASK.into()),
-        ..Default::default()
-    };
-
-    let (raw, generation_id) = match llm.execute(req).await {
-        Ok(r) => {
-            let generation_id = super::record_generation(
-                pool,
-                super::GenerationRecord {
-                    task: INSIGHT_STRUCTURING_TASK,
-                    session_id: Some(session_id),
-                    generation_id: r.generation_id.as_deref(),
-                    model: r.model.as_deref(),
-                    usage: r.usage.as_ref(),
-                },
-            )
-            .await;
-            (r.reply.trim().to_string(), generation_id)
-        }
-        Err(_) => return (empty(), None),
-    };
-
-    let parsed = serde_json::from_str::<serde_json::Value>(&raw)
-        .ok()
-        .filter(|v| v.is_object())
-        .or_else(|| {
-            super::find_json_block(&raw)
-                .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
-                .filter(|v| v.is_object())
-        });
-    match parsed {
-        Some(v) => {
-            let status = if v.as_object().is_some_and(|o| o.is_empty()) {
-                "empty"
-            } else {
-                "ok"
-            };
-            // Record which columns arrived pre-filled. Without it, a fact that
-            // does not appear in the output is ambiguous between "dropped" and
-            // "judged already covered".
-            let mut audited = v.clone();
-            if let Some(o) = audited.as_object_mut() {
-                o.insert(
-                    "_existing_keys".into(),
-                    serde_json::json!(existing_keys(existing_insights)),
-                );
-            }
-            (
-                v,
-                Some(CallAudit {
-                    status,
-                    payload: Some(audited),
-                    generation_id,
-                }),
-            )
-        }
-        // The unparseable reply is KEPT: a whole-turn refusal and malformed
-        // JSON were otherwise the same row, and refusal is the likeliest way
-        // a mined fact goes missing.
-        None => (
-            empty(),
-            Some(CallAudit {
-                status: "parse_error",
-                payload: Some(parse_error_payload(&raw)),
-                generation_id,
-            }),
-        ),
-    }
 }
 
 // ─── Character insights ────────────────────────────────────────────
