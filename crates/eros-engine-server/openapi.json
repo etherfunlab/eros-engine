@@ -5495,6 +5495,17 @@
           "content": {
             "type": "string"
           },
+          "expected_members": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "The `member_session_id`s the client computed this send against. When\npresent and not the same set as the group's active members, the send is\nrefused with `409 members_changed` before anything is written or any\nmodel is called. Absent: no check."
+          },
           "image": {
             "oneOf": [
               {

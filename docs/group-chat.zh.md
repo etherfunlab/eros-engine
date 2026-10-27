@@ -89,6 +89,10 @@
 
 - 点名必须是群里的成员，未知 id 返回 `422 unprocessable`。`member_scopes` 里不是座上成员的键同样拒绝，
   在入队之前。
+- 可选的 `expected_members: [member_session_id]` 写明客户端做检查时依据的那组座位。带了它、且与群当前
+  在座成员不是同一个集合（顺序与重复不计）时，发送以 `409 members_changed` 拒绝，在入队与调用任何模型之前；
+  客户端重新读群后再发。本轮用的就是这一次读到的成员，所以匹配通过的发送，导演只会从这些座位里挑发言人。
+  不带：不做这项检查，`member_scopes` 里没给的成员照旧走默认值。
 - `audit` 沿用 1:1 的上限（超限返回 `400 invalid_payload`），随每位发言者的回复调用发出；
   见 [llm-audit.zh.md](llm-audit.zh.md)。
 - `image` 的含义与 1:1 路由相同：带了它，并且配置了 `[tasks.chat_image_prompt_compose]`，本轮就可以发图。
