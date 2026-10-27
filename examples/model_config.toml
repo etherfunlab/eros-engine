@@ -24,6 +24,9 @@
 #   [providers.local]
 #   embeddings = "http://127.0.0.1:8080/v1/embeddings"
 #
+#   [providers]
+#   demonroute = { chat = "https://api.demonroute.com/v1/chat/completions" }
+#
 # Rules:
 # - Names match [a-z0-9_]+. "voyage" is reserved ($VOYAGE_API_KEY belongs to
 #   the built-in native Voyage embeddings client).
@@ -37,7 +40,8 @@
 #   headers = { "HTTP-Referer" = "https://eros.example", "X-OpenRouter-Title" = "Eros" }
 #
 # - URLs are COMPLETE and posted verbatim — no path joining.
-# - The API key comes from env: [providers].venice → $VENICE_API_KEY
+# - The API key comes from env: [providers].venice → $VENICE_API_KEY,
+#   [providers].demonroute → $DEMONROUTE_API_KEY
 #   (one key per entry, shared by both endpoints). Required only when some
 #   slug actually references the entry. `openrouter` uses the existing
 #   $OPENROUTER_API_KEY.
