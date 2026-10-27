@@ -364,6 +364,12 @@ pub struct GroupSendRequest {
     /// a seated member is refused like a stray mention.
     #[serde(default)]
     pub member_scopes: Option<std::collections::HashMap<Uuid, MemberScopeDto>>,
+    /// The `member_session_id`s the client computed this send against. When
+    /// present and not the same set as the group's active members, the send is
+    /// refused with `409 members_changed` before anything is written or any
+    /// model is called. Absent: no check.
+    #[serde(default)]
+    pub expected_members: Option<Vec<Uuid>>,
     /// Refused: group turns run on the deployment's key only.
     #[serde(default)]
     #[schema(value_type = Option<Object>)]
@@ -516,6 +522,21 @@ async fn send_group_message_stream(
             "a member scope names a session that is not a seated member",
             "scope 指到的角色不在群里",
         ));
+    }
+    // The turn below runs on this same `members` read, so a match here means
+    // the speakers are exactly the seats the client checked.
+    if let Some(expected) = &req.expected_members {
+        let want: std::collections::HashSet<Uuid> = expected.iter().copied().collect();
+        let have: std::collections::HashSet<Uuid> =
+            members.iter().map(|m| m.member_session_id).collect();
+        if want != have {
+            return Err(pre(
+                StatusCode::CONFLICT,
+                "members_changed",
+                "expected_members does not match the group's active members",
+                "群成员有变动，请刷新后再发",
+            ));
+        }
     }
 
     let guard = state
@@ -1272,6 +1293,50 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(rows, 0, "nothing enqueued");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn expected_members_that_differ_from_the_seats_are_409_and_write_nothing(pool: PgPool) {
+        let mut f = fixture(pool, None, 200, None).await;
+        let rows = |pool: PgPool, group: Uuid| async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM engine.chat_messages WHERE session_id = $1",
+            )
+            .bind(group)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+        let (a, b) = (f.a, f.b);
+        // A seat the client missed, a seat that is not there, and an empty list.
+        for (i, expected) in [vec![a], vec![a, b, Uuid::new_v4()], vec![]]
+            .into_iter()
+            .enumerate()
+        {
+            let (s, body) = send(
+                &mut f,
+                json!({"content":"嗨","client_msg_id":format!("01JEXPECTED{i}SSSSSSSSSSSSSG"),
+                       "expected_members":expected}),
+            )
+            .await;
+            assert_eq!(s, StatusCode::CONFLICT, "{body}");
+            assert!(body.contains("members_changed"), "{body}");
+        }
+        assert_eq!(rows(f.pool.clone(), f.group).await, 0, "nothing enqueued");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn expected_members_matching_the_seats_in_any_order_send(pool: PgPool) {
+        let verdict = r#"{"speakers":[{"member":"m1","action":"reply_text","inner_state":null,"reply_mode":null,"clothing":null}],"reason":null}"#;
+        let mut f = fixture(pool, Some(director_sse(verdict)), 200, None).await;
+        let (a, b) = (f.a, f.b);
+        let (s, body) = send(
+            &mut f,
+            json!({"content":"周末去哪","client_msg_id":"01JEXPECTEDOKSSSSSSSSSSSSG",
+                   "expected_members":[b, a, b]}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{body}");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
