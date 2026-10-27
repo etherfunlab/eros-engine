@@ -4,8 +4,6 @@
 //! vocabulary validated here; the table keeps them as free text so a retired
 //! value never blocks a write.
 
-use std::collections::HashSet;
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -181,60 +179,80 @@ pub struct HumanFactRepo<'a> {
 }
 
 impl HumanFactRepo<'_> {
-    /// Record one run's facts and return how many statements inserted or
-    /// bumped a row. A fact already in the ledger (same user, same
+    /// Record one run's facts in a single statement and return how many rows it
+    /// inserted or bumped. A fact already in the ledger (same user, same
     /// roleplay-ness, same normalised text) keeps its text, labels and first
     /// pointers; only its counters and `last_*` pointers move. `session_count`
     /// grows only when the run's session differs from the stored `last_session_id`.
-    /// Within the slice a repeat of the same text is written once; a roleplay
-    /// line and a real statement of the same words stay separate.
+    ///
+    /// Facts within the batch that normalise to the same text count once, the
+    /// first of them winning; a roleplay line and a real statement of the same
+    /// words stay separate. The grouping uses the database's `fact_norm`, the
+    /// same function the dedup index hashes, so the batch and the index cannot
+    /// disagree. One statement means a failed run changes nothing, so a retry
+    /// cannot count a fact twice.
     pub async fn upsert_run(
         &self,
         user_id: Uuid,
         facts: &[FactInput],
         src: &FactSource,
     ) -> Result<usize, sqlx::Error> {
-        let mut seen: HashSet<(&str, bool)> = HashSet::new();
-        let mut written = 0;
-        for f in facts {
-            let content = f.content.trim();
-            if !seen.insert((content, f.evidence_type == "roleplay_expression")) {
-                continue;
-            }
-            let res = sqlx::query(
-                "INSERT INTO engine.human_facts \
-                    (user_id, content, category, domain, evidence_type, temporality, \
-                     persistence, confidence, first_seen_at, last_seen_at, \
-                     first_session_id, first_message_id, first_run_id, \
-                     last_session_id, last_message_id, last_run_id) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $10, $11, $12, $10, $11, $12) \
-                 ON CONFLICT (user_id, roleplay, content_hash) DO UPDATE SET \
-                    occurrences     = human_facts.occurrences + 1, \
-                    session_count   = human_facts.session_count + CASE \
-                        WHEN human_facts.last_session_id IS DISTINCT FROM EXCLUDED.last_session_id \
-                        THEN 1 ELSE 0 END, \
-                    last_seen_at    = EXCLUDED.last_seen_at, \
-                    last_session_id = EXCLUDED.last_session_id, \
-                    last_message_id = EXCLUDED.last_message_id, \
-                    last_run_id     = EXCLUDED.last_run_id",
-            )
-            .bind(user_id)
-            .bind(content)
-            .bind(&f.category)
-            .bind(&f.domain)
-            .bind(&f.evidence_type)
-            .bind(&f.temporality)
-            .bind(&f.persistence)
-            .bind(&f.confidence)
-            .bind(src.seen_at)
-            .bind(src.session_id)
-            .bind(src.message_id)
-            .bind(src.run_id)
-            .execute(self.pool)
-            .await?;
-            written += res.rows_affected() as usize;
+        if facts.is_empty() {
+            return Ok(0);
         }
-        Ok(written)
+        let contents: Vec<String> = facts.iter().map(|f| f.content.trim().to_string()).collect();
+        let categories: Vec<String> = facts.iter().map(|f| f.category.clone()).collect();
+        let domains: Vec<String> = facts.iter().map(|f| f.domain.clone()).collect();
+        let evidence_types: Vec<String> = facts.iter().map(|f| f.evidence_type.clone()).collect();
+        let temporalities: Vec<String> = facts.iter().map(|f| f.temporality.clone()).collect();
+        let persistences: Vec<String> = facts.iter().map(|f| f.persistence.clone()).collect();
+        let confidences: Vec<String> = facts.iter().map(|f| f.confidence.clone()).collect();
+
+        let res = sqlx::query(
+            "INSERT INTO engine.human_facts \
+                (user_id, content, category, domain, evidence_type, temporality, \
+                 persistence, confidence, first_seen_at, last_seen_at, \
+                 first_session_id, first_message_id, first_run_id, \
+                 last_session_id, last_message_id, last_run_id) \
+             SELECT $1, content, category, domain, evidence_type, temporality, \
+                    persistence, confidence, $9, $9, $10, $11, $12, $10, $11, $12 \
+             FROM ( \
+                 SELECT DISTINCT ON ((evidence_type = 'roleplay_expression'), \
+                                     md5(engine.fact_norm(content))) \
+                        content, category, domain, evidence_type, temporality, \
+                        persistence, confidence \
+                 FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], \
+                             $6::text[], $7::text[], $8::text[]) \
+                      WITH ORDINALITY AS t(content, category, domain, evidence_type, \
+                                           temporality, persistence, confidence, ord) \
+                 ORDER BY (evidence_type = 'roleplay_expression'), \
+                          md5(engine.fact_norm(content)), ord \
+             ) AS batch \
+             ON CONFLICT (user_id, roleplay, content_hash) DO UPDATE SET \
+                occurrences     = human_facts.occurrences + 1, \
+                session_count   = human_facts.session_count + CASE \
+                    WHEN human_facts.last_session_id IS DISTINCT FROM EXCLUDED.last_session_id \
+                    THEN 1 ELSE 0 END, \
+                last_seen_at    = EXCLUDED.last_seen_at, \
+                last_session_id = EXCLUDED.last_session_id, \
+                last_message_id = EXCLUDED.last_message_id, \
+                last_run_id     = EXCLUDED.last_run_id",
+        )
+        .bind(user_id)
+        .bind(&contents)
+        .bind(&categories)
+        .bind(&domains)
+        .bind(&evidence_types)
+        .bind(&temporalities)
+        .bind(&persistences)
+        .bind(&confidences)
+        .bind(src.seen_at)
+        .bind(src.session_id)
+        .bind(src.message_id)
+        .bind(src.run_id)
+        .execute(self.pool)
+        .await?;
+        Ok(res.rows_affected() as usize)
     }
 
     pub async fn list_for_user(&self, user_id: Uuid) -> Result<Vec<HumanFactRow>, sqlx::Error> {
@@ -545,6 +563,30 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].occurrences, 1);
         assert_eq!(rows[0].persistence, "stable", "first of the run is kept");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn upsert_dedupes_punctuation_variants_within_one_run(pool: PgPool) {
+        let repo = HumanFactRepo { pool: &pool };
+        let user = Uuid::new_v4();
+        let n = repo
+            .upsert_run(
+                user,
+                &[
+                    fact("用户喜欢爬山。", "explicit_statement", "stable"),
+                    fact("用户喜欢爬山", "explicit_statement", "transient"),
+                ],
+                &src(None, None, None, 0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "one fact seen once is one row written");
+        let rows = repo.list_for_user(user).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].occurrences, 1);
+        assert_eq!(rows[0].content, "用户喜欢爬山。", "first of the batch wins");
+        assert_eq!(rows[0].persistence, "stable");
+        assert_eq!(rows[0].recurrence(), Recurrence::Once);
     }
 
     #[sqlx::test(migrations = "./migrations")]
