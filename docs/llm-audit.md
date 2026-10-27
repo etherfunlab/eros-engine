@@ -261,7 +261,7 @@ salvaged-garble fallback and for direct providers that omit it.
 ### The foreign keys
 
 **The child tables' `generation_id` columns — `chat_messages`,
-`companion_affinity_events`, `companion_insights_events`,
+`companion_affinity_events`, `human_insights_events`,
 `companion_decision_events`, `chat_images_events`, `chat_vision_events`,
 `character_insights_events`, `user_insights_events` — each reference this
 table**, `ON DELETE SET NULL`, and each is indexed. Migration `0060` added
@@ -357,7 +357,7 @@ as shown above.
   `model` and `usage` in `engine.llm_generations`, and `generation_id` on the
   row that call produced: `chat_messages.generation_id` for the chat completion
   (mirrored on `companion_affinity_events` for the affinity eval, on
-  `companion_insights_events` for each `insight_extraction` and
+  `human_insights_events` for each `insight_extraction` and
   `profile_rebuild` call of the human chain, on
   `engine.character_insights_events` for each call of the experimental
   character chain and on `engine.user_insights_events` for each call of the
@@ -369,7 +369,7 @@ as shown above.
   `chat_messages.metadata.image` keeps its existing `compose_*` keys plus a
   `compose_event_id` pointer into `chat_images_events`) — see the `usage`
   filtering note above. A `profile`-stage
-  `companion_insights_events` payload is the model's JSON object as returned,
+  `human_insights_events` payload is the model's JSON object as returned,
   so it can contain keys the typed `human_insights` store never persists: any
   off-schema key the LLM emits lands in the event payload but nowhere else — a
   reconciliation between events and store has to compare on payload keys ∩
@@ -610,7 +610,7 @@ both, one row per OpenRouter call that returned a response:
   and the structuring call it fed are joinable without going through
   `session_id`/`message_id`.
 
-**`companion_insights_events.stage` has its own vocabulary.** The human chain
+**`human_insights_events.stage` has its own vocabulary.** The human chain
 writes one row per extraction run with `stage = 'facts'` and one row per profile
 rebuild with `stage = 'profile'`, not the `'extraction'` / `'structuring'` of the
 two tables above; the table is live and downstream consumers read it by those
@@ -640,7 +640,7 @@ the INSERT is awaited, bounded by a short `AUDIT_WRITE_TIMEOUT`, and its
 error OR timeout is `warn!`ed and dropped — a failed or stalled audit
 write costs the event row, never the turn (same discipline as
 `companion_decision_events`). Since migration 0058 both tables — and
-`companion_decision_events` and `companion_insights_events` with them — carry
+`companion_decision_events` and `human_insights_events` with them — carry
 real foreign keys on their `instance_id` / `session_id` / `message_id`
 pointers, all `ON DELETE SET NULL` and all `NOT VALID` — binding on every row
 written from here on, with the handful of pre-existing dangling ids left as

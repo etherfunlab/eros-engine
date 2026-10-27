@@ -20,10 +20,7 @@ pub const EDUCATION_LEVELS: &[&str] = &[
 /// Accepted `education_status` codes.
 pub const EDUCATION_STATUSES: &[&str] = &["enrolled", "graduated"];
 
-/// The profile row's columns, in the order every read selects them. Named
-/// explicitly because the table still carries seven retired columns (city,
-/// location, hometown, nationality, preferred_gender, age_min, age_max) that
-/// nothing reads or writes.
+/// The profile row's columns, in the order every read selects them.
 const ROW_COLUMNS: &str = "user_id, occupation, mbti_guess, love_values, emotional_needs, \
      life_rhythm, interests, personality_traits, deal_breakers, education, \
      education_level, education_status, family, relationship_history, \
@@ -166,9 +163,9 @@ pub struct HumanInsightRepo<'a> {
 }
 
 impl<'a> HumanInsightRepo<'a> {
-    /// Write the whole profile in one statement: every 2.0 column takes the
+    /// Write the whole profile in one statement: every column takes the
     /// incoming value, so a rebuild that omits a field clears it (empty arrays
-    /// included). The seven retired columns are never touched.
+    /// included).
     pub async fn replace_profile(
         &self,
         user_id: Uuid,
@@ -643,37 +640,6 @@ mod tests {
             .await
             .unwrap()
             .is_none());
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    async fn replace_profile_leaves_retired_columns_untouched(pool: PgPool) {
-        let user_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO engine.human_insights (user_id, city, age_min) VALUES ($1, 'x', 18)",
-        )
-        .bind(user_id)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let repo = HumanInsightRepo { pool: &pool };
-        repo.replace_profile(
-            user_id,
-            &project_profile(&serde_json::json!({ "occupation": "设计师" })),
-        )
-        .await
-        .unwrap();
-
-        let (city, age_min): (Option<String>, Option<i32>) =
-            sqlx::query_as("SELECT city, age_min FROM engine.human_insights WHERE user_id = $1")
-                .bind(user_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(city.as_deref(), Some("x"));
-        assert_eq!(age_min, Some(18));
-        let row = repo.load(user_id).await.unwrap().unwrap();
-        assert_eq!(row.occupation.as_deref(), Some("设计师"));
     }
 
     #[sqlx::test(migrations = "./migrations")]

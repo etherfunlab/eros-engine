@@ -2147,7 +2147,7 @@ curl -X POST -H "x-user-erase-secret: $USER_ERASE_SECRET" \
   "user_id": "8d1f…",
   "erased_at": "2026-10-13T12:00:00.123456Z",
   "deleted": { "human_facts": 41, "human_insights": 1, "human_profile_state": 1, "companion_memories": 63, "user_insights": 2, "…": 0 },
-  "blanked": { "companion_insights_events": 87, "companion_affinity": 2, "…": 0 }
+  "blanked": { "human_insights_events": 87, "companion_affinity": 2, "…": 0 }
 }
 ```
 

@@ -9,7 +9,7 @@
 //!   `MemoryRepo`, `InsightEventRepo`, `ChatRepo`) instead of inline
 //!   `sqlx::query`.
 //! - Insight extraction (`extract_insights`) distils the turn's facts into the
-//!   user's fact ledger; the audit trail lands in `companion_insights_events`.
+//!   user's fact ledger; the audit trail lands in `human_insights_events`.
 //! - Ghost-streak reset on Reply/Proactive happens in the orchestrator
 //!   (`pipeline::run`) before this function is spawned, since the store
 //!   crate's `AffinityRepo::persist_with_event` deliberately does not
@@ -1332,7 +1332,7 @@ struct CallAudit {
 
 /// Top-level entry: extract the turn's facts, record them in the user's fact
 /// ledger, and rebuild the derived profile once enough have piled up.
-/// Writes one companion_insights_events row per OpenRouter call that returned a
+/// Writes one human_insights_events row per OpenRouter call that returned a
 /// response. Fail-open: an audit-row or ledger write failure only warns and
 /// never breaks the turn.
 async fn extract_insights(
@@ -1428,7 +1428,7 @@ async fn record_facts(
     }
 }
 
-/// Fail-open insert of one companion_insights_events row. Never returns an
+/// Fail-open insert of one human_insights_events row. Never returns an
 /// error to the caller — an audit-row failure must not break the chat turn.
 async fn write_insight_event(
     pool: &sqlx::PgPool,
@@ -2955,7 +2955,7 @@ mod tests {
 
         let rows: Vec<(Uuid, String, Option<String>, Option<serde_json::Value>)> = sqlx::query_as(
             "SELECT run_id, status, generation_id, payload \
-                 FROM engine.companion_insights_events \
+                 FROM engine.human_insights_events \
                  WHERE user_id = $1 AND stage = 'facts'",
         )
         .bind(user_id)
@@ -2971,7 +2971,7 @@ mod tests {
         assert_eq!(payload["facts"][0]["category"], "fact");
         assert_eq!(payload["facts"][0]["confidence"], "high");
         let all_events: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM engine.companion_insights_events WHERE user_id = $1",
+            "SELECT count(*) FROM engine.human_insights_events WHERE user_id = $1",
         )
         .bind(user_id)
         .fetch_one(&pool)
@@ -3025,7 +3025,7 @@ mod tests {
             "stage 1 is the only call"
         );
         let rows: Vec<(String, String, Option<serde_json::Value>)> = sqlx::query_as(
-            "SELECT stage, status, payload FROM engine.companion_insights_events WHERE user_id = $1",
+            "SELECT stage, status, payload FROM engine.human_insights_events WHERE user_id = $1",
         )
         .bind(user_id)
         .fetch_all(&pool)
@@ -3069,7 +3069,7 @@ mod tests {
             "stage 1 is the only call"
         );
         let rows: Vec<(String, String, Option<serde_json::Value>)> = sqlx::query_as(
-            "SELECT stage, status, payload FROM engine.companion_insights_events WHERE user_id = $1",
+            "SELECT stage, status, payload FROM engine.human_insights_events WHERE user_id = $1",
         )
         .bind(user_id)
         .fetch_all(&pool)
@@ -3108,7 +3108,7 @@ mod tests {
         .await;
 
         let rows: Vec<(String, Option<serde_json::Value>)> = sqlx::query_as(
-            "SELECT status, payload FROM engine.companion_insights_events \
+            "SELECT status, payload FROM engine.human_insights_events \
              WHERE user_id = $1 AND stage = 'facts'",
         )
         .bind(user_id)
@@ -3145,7 +3145,7 @@ mod tests {
 
         assert_eq!(recorder.lock().unwrap().len(), 1, "no rebuild");
         let (status, payload): (String, Option<serde_json::Value>) = sqlx::query_as(
-            "SELECT status, payload FROM engine.companion_insights_events \
+            "SELECT status, payload FROM engine.human_insights_events \
              WHERE user_id = $1 AND stage = 'facts'",
         )
         .bind(user_id)

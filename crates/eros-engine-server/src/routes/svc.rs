@@ -957,9 +957,8 @@ mod tests {
         sqlx::query(
             "INSERT INTO engine.human_insights \
                (user_id, occupation, education_level, education_status, \
-                kinks, ideology, mental_health, city, age_min) \
-             VALUES ($1, '设计师', 'bachelor', 'enrolled', '{\"k\"}', 'liberal', 'anxious', \
-                     '上海', 20)",
+                kinks, ideology, mental_health) \
+             VALUES ($1, '设计师', 'bachelor', 'enrolled', '{\"k\"}', 'liberal', 'anxious')",
         )
         .bind(id)
         .execute(&pool)
@@ -1591,7 +1590,7 @@ mod tests {
         assert_eq!(body["user_id"], user.to_string());
         assert_eq!(body["deleted"]["human_facts"], 1);
         assert_eq!(body["deleted"]["companion_memories"], 0);
-        assert_eq!(body["blanked"]["companion_insights_events"], 0);
+        assert_eq!(body["blanked"]["human_insights_events"], 0);
         let erased_at = body["erased_at"].as_str().unwrap().to_string();
         assert!(HumanFactRepo { pool: &pool }
             .list_for_user(user)
