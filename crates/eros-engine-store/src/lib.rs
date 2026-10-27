@@ -10,6 +10,7 @@ pub mod error_handling;
 pub mod events;
 pub mod generation;
 pub mod group;
+pub mod human_fact;
 pub mod human_insight;
 pub mod image_events;
 pub mod insight;
