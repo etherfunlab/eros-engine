@@ -537,7 +537,8 @@ OpenRouter 调用落一行：
   没有解析出 JSON 时为 `parse_error`（payload 为 `NULL`）。更早的行是
   `{"facts": [字符串], "details": [对象]}`。
 - **`profile` payload。** 模型原样返回的 JSON 对象（`ok`；其中没有可写内容时为
-  `empty`），`parse_error` 时是 `{"raw": "<回复的前 2000 个字符>"}`。`profile` 行的
+  `empty`），`parse_error` 时是 `{"raw": "<回复的前 2000 个字符>"}`，provider 报了
+  `finish_reason` 时一并记下（`"length"`：被 `max_tokens` 截断）。`profile` 行的
   `session_id` 与 `message_id` 为 `NULL`：重建不是一个轮次。它的 `generation_id`
   对应 `llm_generations` 里任务为 `profile_rebuild` 的行。
 - **抹除。** `POST /svc/v1/users/{user_id}/erase` 会把该用户每一行的 `payload` 置为
