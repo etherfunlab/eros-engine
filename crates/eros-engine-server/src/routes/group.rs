@@ -524,7 +524,7 @@ async fn send_group_message_stream(
         ));
     }
     // The turn below runs on this same `members` read, so a match here means
-    // the speakers are exactly the seats the client checked.
+    // the director picks its speakers from exactly the seats the client checked.
     if let Some(expected) = &req.expected_members {
         let want: std::collections::HashSet<Uuid> = expected.iter().copied().collect();
         let have: std::collections::HashSet<Uuid> =

@@ -113,7 +113,8 @@ not stored; what the 1:1 send records for a scope, the speaker's row records.
   group's active members (order and duplicates do not matter), the send is
   refused with `409 members_changed` before anything is enqueued or any model
   is called; re-read the group and resend. The turn runs on the same member
-  read, so a matching send has exactly those speakers. Absent: no check, and a
+  read, so on a matching send the director picks its speakers from exactly
+  those seats. Absent: no check, and a
   member missing from `member_scopes` still runs on the defaults.
 - `audit` takes the 1:1 caps (a violation returns `400 invalid_payload`) and
   rides each speaker's reply call; see [llm-audit.md](llm-audit.md).
