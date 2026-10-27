@@ -10,6 +10,8 @@
 
 每個 `/comp/*` 跟 `/bff/v1/*` 端點都需要 `Authorization: Bearer <Supabase JWT>`。用 token 的 `alg` 头选校验器：非对称签名（ES256/RS256/EdDSA）走项目的 JWKS 校验，地址取自 `SUPABASE_JWKS_URL`，或由 `SUPABASE_URL` 推导——自 Supabase 2025 年 JWT Signing Keys 上线后这是默认路径。尚未迁移的部署仍可用旧的 HS256 + 共享密钥 `SUPABASE_JWT_SECRET`；两个来源至少要配一个，否则服务器拒绝启动。`sub` claim 必須是個 UUID；該 UUID 即該請求的 user_id。
 
+部署设置了 `CALLER_SECRET` 时，每个需要 bearer 鉴权的端点还要求 `x-caller-secret: <其中一个 secret>`。它在 bearer 之前检查：缺失或不对返回 `403`，带代码的响应体里是 `code: caller_forbidden`，不管有没有带 token。`/healthz`、`/docs` 和 `/svc/v1/*` 从不要求它。见[部署](deploying.zh.md)。
+
 `/healthz` 跟 `/docs` 是公開的。`/svc/v1/*` 是第三類：以共享 secret header 放行，從不認 bearer token——見[服務端點](#服務端點)。
 
 ## 公開端點
@@ -2167,7 +2169,7 @@ curl -X POST -H "x-user-erase-secret: $USER_ERASE_SECRET" \
 `user_message` 形状，没有 `"error"` 字段。`POST
 /comp/voice/{session_id}/turn/interrupt` 本身不是流式接口（成功时返回的是
 普通 JSON），但复用了语音轮次的前置检查和错误类型，错误响应用的也是这同一套
-形状。群路由（`/v2/comp/group*`）的拒绝响应同样用带代码的形状，每一个 BYOC 拒绝（`byoc_forbidden`、`byoc_card_rejected`、`byoc_unsupported`，以及卡片相关的 `invalid_payload`）也是，无论来自哪条路由。下表覆盖的是普通形状：
+形状。群路由（`/v2/comp/group*`）的拒绝响应同样用带代码的形状，每一个 BYOC 拒绝（`byoc_forbidden`、`byoc_card_rejected`、`byoc_unsupported`，以及卡片相关的 `invalid_payload`）也是，无论来自哪条路由；调用方密钥的拒绝（`caller_forbidden`）同样如此。下表覆盖的是普通形状：
 
 | 狀態碼 | code | 何時 |
 |--------|------|------|
