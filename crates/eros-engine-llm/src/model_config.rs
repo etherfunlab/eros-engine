@@ -6767,6 +6767,54 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         assert!(err.contains("broken.toml"), "{err}");
     }
 
+    /// `examples/model_config.d` is `examples/model_config.toml` split by
+    /// subsystem for `MODEL_CONFIG_DIR`; the two must stay one config.
+    #[test]
+    fn example_config_dir_matches_the_single_file_example() {
+        let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+        let dir = examples.join("model_config.d");
+        ModelConfig::from_toml_dir(&dir).expect("examples/model_config.d must load");
+
+        let parse = |p: &std::path::Path| -> toml::Table {
+            std::fs::read_to_string(p).unwrap().parse().unwrap()
+        };
+        let single = parse(&examples.join("model_config.toml"));
+        let mut merged = toml::Table::new();
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "toml") {
+                continue;
+            }
+            for (key, value) in parse(&path) {
+                match (key.as_str(), value) {
+                    ("tasks", toml::Value::Table(tasks)) => merged
+                        .entry("tasks")
+                        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                        .as_table_mut()
+                        .unwrap()
+                        .extend(tasks),
+                    (_, value) => {
+                        merged.insert(key, value);
+                    }
+                }
+            }
+        }
+
+        let keys = |t: &toml::Table| t.keys().cloned().collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(keys(&merged), keys(&single), "top-level keys");
+        let (m_tasks, s_tasks) = (
+            merged["tasks"].as_table().unwrap(),
+            single["tasks"].as_table().unwrap(),
+        );
+        assert_eq!(keys(m_tasks), keys(s_tasks), "task names");
+        for (name, task) in s_tasks {
+            assert_eq!(&m_tasks[name], task, "[tasks.{name}] drifted");
+        }
+        for key in keys(&single).into_iter().filter(|k| k != "tasks") {
+            assert_eq!(merged[&key], single[&key], "[{key}] drifted");
+        }
+    }
+
     #[test]
     fn resolve_world_director_defaults_and_overrides() {
         let cfg = ModelConfig::from_toml_str(

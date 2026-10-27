@@ -1,0 +1,214 @@
+[tasks.chat_companion]
+# Example chat primary. deepseek-v4-flash is a cheap, fast, permissive
+# default — swap in whatever suits your product. The first fallback (Cydonia)
+# is roleplay-tuned so a primary outage doesn't make the companion prudish;
+# glm-4.7-flash is a fast, reliable last resort.
+# `fallback` accepts either a single string (legacy) or an array of model
+# ids in preference order. The chain is tried sequentially; first success
+# wins. An explicit empty value (`""` or `[]`) opts out of the defaults
+# block's fallback for this task.
+# Recommendation: keep `fallback` to at most 2 entries. The chain is truncated
+# to `retry_depth` entries before the streaming chat burst — default 2 on this
+# task (primary + 2 fallbacks = 3 attempts), settable here or per tier;
+# anything past the truncation point is never tried. The single-purpose tasks
+# below (output/input filter, vision, PDE, product QA, image compose) default
+# to retry_depth = 1 instead.
+model = "deepseek/deepseek-v4-flash"
+fallback = ["thedrummer/cydonia-24b-v4.1", "z-ai/glm-4.7-flash"]
+temperature = 0.8
+# Sampling knobs. Every task except `embedding` may set these; extraction /
+# vision / affinity want determinism and deliberately leave them unset. They
+# ship as the OSS default on the chat task only; a deployment opts out by
+# removing them. top_p trims the long tail; the two penalties are the
+# repetition levers. repetition_penalty is available here too — it is a
+# standard OpenAI-format field every chat/completions endpoint accepts — and is
+# deliberately left unset in this example because it distorts CJK at the useful
+# range. Ranges are enforced at boot: top_p (0.0, 1.0], the two penalties
+# [-2.0, 2.0], repetition_penalty (0.0, 2.0] with 1.0 the no-op identity.
+top_p = 0.9
+frequency_penalty = 0.4
+presence_penalty = 0.2
+max_tokens = 1600
+# Controls the `model` value sent to clients in chat `meta` frames. Affects ONLY
+# the client display — never the OpenRouter call or the persisted row. Omit this
+# line and the field defaults to `false` (the model name is NOT sent). Four forms:
+#   model_name_display_override = false               # omit model from meta
+#   model_name_display_override = true                # send the real model id (this line)
+#   model_name_display_override = "Aria"              # always show "Aria"
+#   model_name_display_override = ["Aria", "Nova"]    # random per bubble
+#   model_name_display_override = { "deepseek/deepseek-v4-flash" = "Aria", default = "Companion" }
+# Map keys must be quoted (ids contain "/" and "."); the bareword `default` key
+# is the fallback when the real id isn't listed (no default ⇒ omit). Task-level;
+# every tier inherits it.
+model_name_display_override = true
+# Optional prompt-trait allow-list (three-state). Commented out here means no
+# gating. See docs/prompt-traits.md.
+#allow_traits = ["nsfw_boost","politics_open"]
+
+# Per-tier overrides are OPTIONAL and downstream-defined: `tier` is whatever
+# your product sends per request. The OSS template enables none — with no tier
+# (or an unknown one) the task default block above is used. Uncomment and adapt
+# these as a starting point, or define your own. A tier may override
+# model / fallback / allow_traits; `model` here also accepts the array
+# (round-robin) and table (weighted) forms shown at the top of this file.
+#
+# Tier blocks are read by THIS task and [tasks.chat_output_filter] only. Every
+# other task resolves without a tier, so a [tasks.<other>.tiers.*] block could
+# never be selected — the server refuses to boot on one instead of ignoring it.
+#[tasks.chat_companion.tiers.free]
+#model        = "z-ai/glm-4.5-air"
+#fallback     = ["thedrummer/cydonia-24b-v4.1","z-ai/glm-4.7-flash"]
+#allow_traits = ["politics_open"]
+
+#[tasks.chat_companion.tiers.plus]
+#model        = "x-ai/grok-4.20"
+#fallback     = ["thedrummer/cydonia-24b-v4.1", "x-ai/grok-4.3"]
+#allow_traits = ["nsfw_boost", "politics_open"]
+
+# (belongs to the [tasks.chat_companion] table above)
+# Deterministic per-model regex strips for the assistant reply. Task-level only
+# (no per-tier override). Each rule deletes (or replaces) matches in replies
+# produced by any model in `models`. Applied BEFORE the client sees the reply,
+# before any LLM output_filter, and before memory/insight/affinity extract — so
+# the matched text reaches neither the client nor the stored history/memory. The
+# raw reply is kept on the row's pre_filter_content (filter_model = "<regex>").
+# Uses the Rust `regex` crate: NO lookaround/backreferences — anchor with $, ^,
+# \s*, char classes. An invalid pattern fails server boot.
+# output_regex = [
+#   # Strip L3.3-Euryale's self-narrated photo line on reply_text_image turns.
+#   { models = ["sao10k/l3.3-euryale-70b"],
+#     pattern = '\s*\[你的照片[：:][^\]]*\]\s*$' },
+#   # { models = ["x/y"], pattern = '...', replacement = "…" },  # replacement default "" = delete
+# ]
+
+# ── Optional output filter (OFF by default) ──────────────────────────────
+# Rewrites the chat reply through a second LLM before the client sees it.
+# Enable per-tier (or globally) with `output_filter` on [tasks.chat_companion]:
+#   [tasks.chat_companion]
+#   output_filter = true                 # global default (default: false)
+#   [tasks.chat_companion.tiers.gold]
+#   output_filter = true                 # per-tier; overrides the global default
+#
+# The filter only runs if BOTH output_filter is true AND this table exists with
+# a non-blank filter_prompt; otherwise it is inert. Only the FILTERED text is
+# shown/stored; extract (memory/insight/affinity) reads the original by default.
+#
+# ── Recommended models for chat_output_filter ────────────────────────────
+# Primary: openai/gpt-5.4-nano — fast, stable filtered output.
+#
+# DO NOT use openai/gpt-4.1-nano as the filter model — it empirically returns
+# "对不起，无法满足你的要求"-style refusals with HTTP 200, which the engine
+# cannot distinguish from a successful filtered rewrite, so the fail-open path
+# never triggers and the user sees the refusal text.
+#
+# Recommended fallback: google/gemini-3.1-flash — high success rate; when it
+# does fail it surfaces a proper error response (non-200), letting the engine's
+# fail-open path kick in and emit the original reply.
+#
+# Cost-saving fallback: zhipuai/zlm-4.7-flash — cheaper, similar fail-mode
+# profile to gemini-3.1-flash.
+#
+# DO NOT use anthropic/claude-haiku-4.5 for the filter — its input tolerance
+# for NSFW (great for extraction) does NOT extend to output; the safety
+# alignment on the output side is strict enough that the filter LLM often
+# refuses to produce rewritten text at all.
+#[tasks.chat_output_filter]
+#model        = "openai/gpt-5.4-nano"
+#fallback     = ["google/gemini-3.1-flash", "zhipuai/zlm-4.7-flash"]
+#retry_depth  = 1     # fallbacks to try on filter failure; default 1 (primary + first fallback)
+#temperature  = 0.3
+#max_tokens   = 400
+#filter_prompt = """
+#Rewrite the assistant reply below per <your policy>. Output only the rewrite.
+#"""
+# trigger: AND of the predicates you specify; omit all ⇒ filter every turn.
+# `traits` matches the tags ACTUALLY injected (after tier allow_traits gating),
+# i.e. the same set reported in the final frame's prompt_injected.
+#trigger      = { random = 0.3, models = ["x/y"], traits = { any = ["nsfw_boost"], when = "present" } }
+#timing       = "after_extract"   # or "before_extract"
+#[tasks.chat_output_filter.tiers.gold]
+# per-tier may override model/fallback/retry_depth/filter_prompt/trigger/timing
+# (NOT temperature/max_tokens/top_p/frequency_penalty/presence_penalty/
+#  repetition_penalty — those are task-level only, like every other task)
+#filter_prompt = "..."
+
+# ── Optional user-input rewrite filter (OFF by default) ──────────────────────
+# Rewrites a MEANINGLESS user turn (e.g. "1111", "？？？", key-mashing) into one
+# natural, context-appropriate user message before it reaches chat_companion, so
+# the companion answers a real message instead of parroting history. Meaningful
+# turns — including short ones like "嗯"/"好啊"/"在吗" and genuine short
+# questions — are left untouched.
+#
+# Enable with a single global switch on [tasks.chat_companion]. It accepts a
+# bool OR a probability:
+#   [tasks.chat_companion]
+#   input_filter = false   # off (default)
+#   input_filter = true    # run on every user turn (= 1.0)
+#   input_filter = 0.8     # run on ~80% of user turns
+# A number outside [0.0, 1.0] (or non-finite) is rejected at load time.
+#
+# The filter runs only if BOTH input_filter fires (true/probability) AND this
+# table exists with a non-blank filter_prompt; otherwise it is inert. The user's
+# ORIGINAL text is
+# always persisted (content) and shown to the client; the rewrite is stored
+# separately in pre_filter_content and seen only by the model. A turn that
+# carries a user action with blank content skips the filter.
+#
+# Pick a fast, cheap model — this runs on every user turn before generation.
+# Recommended: google/gemini-3.1-flash-lite or deepseek/deepseek-v4-flash.
+#[tasks.chat_input_filter]
+#model        = "google/gemini-3.1-flash-lite"
+#fallback     = ["deepseek/deepseek-v4-flash"]
+#retry_depth  = 1
+#temperature  = 0.3
+#max_tokens   = 400
+#filter_prompt = """
+#You are an input-cleaning filter for a companion chat. You receive the recent
+#conversation and the user's latest input. Decide whether the latest input is a
+#meaningful message.
+#
+#- If it IS meaningful (any real intent, INCLUDING short replies like "嗯",
+#  "好啊", "在吗", or a short question), respond EXACTLY:
+#    {"rewrite": false}
+#- If it is NOT meaningful (random characters, key-mashing, repeated chars,
+#  punctuation-only noise), rewrite it into ONE short, natural user message that
+#  fits the conversation, and give a brief reason. Respond EXACTLY:
+#    {"rewrite": true, "content": "<the rewritten user message>", "reason": "<why it was meaningless>"}
+#
+# Output JSON only. No explanation outside the JSON, no code fences.
+#"""
+
+# ── Voice channel (chat_voice) ───────────────────────────────────────────────
+# OPT-IN. Feature is OFF unless this block exists. Powers the lean voice-call
+# endpoint POST /comp/voice/{session_id}/turn/stream (text in → streamed text
+# out). Latency-sensitive: pick a fast model (time-to-first-token first).
+#
+# `model` MUST be a single fixed id — NOT the round-robin array or weighted
+# table forms (the server refuses to boot otherwise). `fallback` is allowed as
+# an outage retry chain (tried sequentially; NOT rotation). `filter_prompt` is
+# OPTIONAL: it overrides the built-in, product-identity-free voice directive
+# (short, spoken, no markdown/emoji/stage-directions). Voice turns persist on a
+# `channel = 'voice'` column. An ended call is swept into profile-layer memories
+# by dreaming-lite, same as a text session — set DREAMING_VOICE_DISABLED=1 to
+# keep calls out of memory. A live turn itself still writes nothing.
+#[tasks.chat_voice]
+#model        = "vendor/fast-voice-model"
+#fallback     = ["vendor/backup-model"]
+#temperature  = 0.8
+#max_tokens   = 300
+#filter_prompt = """
+#…optional override of the built-in voice directive…
+#"""
+# `tts_audio_tags` (OPTIONAL, default false): when true, the voice directive
+# invites inline audio tags — bracketed cues like [laughs], [whispers] that
+# Gemini TTS models interpret as delivery/emotion. Tags pass through verbatim
+# (streamed, persisted, replayed); the client must feed the text to a TTS model
+# that understands them. Works with a custom filter_prompt too (the tag guidance
+# is appended to it).
+#tts_audio_tags = true
+
+# `recall` (OPTIONAL, default true): per-turn read-only vector recall on the
+# voice path; the first-turn bootstrap snapshot is separate and unaffected.
+# Set to false to keep the voice prompt recall-free, regardless of the
+# request's memory_scope — config always wins over the per-request scope.
+#recall = false

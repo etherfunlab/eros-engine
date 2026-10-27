@@ -1,0 +1,120 @@
+# `model` accepts three forms (task-level and per-tier):
+#   model = "id"                       # fixed
+#   model = ["id_a", "id_b"]           # round-robin (deterministic alternation)
+#   model = { "id_a" = 0.8, "id_b" = 0.2 }  # weighted random (normalized by sum)
+# Weighted-table keys must be quoted (model ids contain "/" and ".").
+# If the selected primary also appears in `fallback`, it is auto-skipped.
+
+# ── Global defaults (optional) ───────────────────────────────────────────────
+# OpenRouter routing prefs (formerly [defaults].ignore_providers /
+# [defaults].provider_sort here) are removed — they're now
+# [[providers.<name>.body]] rules. See the example under "Custom providers"
+# below.
+#
+# ── Custom providers (optional) ──────────────────────────────────────────────
+# Route model slugs to your own endpoints. Each entry is a table with up to
+# three keys — `chat` (an OpenAI-compatible chat-completions URL), `embeddings`
+# (an OpenRouter-compatible embeddings URL), and `headers` (sent verbatim on
+# every request to this entry's endpoints):
+#
+#   [providers.venice]
+#   chat    = "https://api.venice.ai/api/v1/chat/completions"
+#   headers = { "X-Team" = "companion" }
+#
+#   [providers.local]
+#   embeddings = "http://127.0.0.1:8080/v1/embeddings"
+#
+#   [providers]
+#   demonroute = { chat = "https://api.demonroute.com/v1/chat/completions" }
+#
+# Rules:
+# - Names match [a-z0-9_]+. "voyage" is reserved ($VOYAGE_API_KEY belongs to
+#   the built-in native Voyage embeddings client).
+# - "openrouter" is special: declaring it overrides the BUILT-IN endpoints
+#   per key (an absent key keeps the official URL), and its `headers` table
+#   is the one home for the attribution headers (HTTP-Referer,
+#   X-OpenRouter-Title, X-OpenRouter-Categories). The old OPENROUTER_APP_*
+#   env vars are ignored; OPENROUTER_BASE_URL is gone.
+#
+#   [providers.openrouter]
+#   headers = { "HTTP-Referer" = "https://eros.example", "X-OpenRouter-Title" = "Eros" }
+#
+# - URLs are COMPLETE and posted verbatim — no path joining.
+# - The API key comes from env: [providers].venice → $VENICE_API_KEY,
+#   [providers].demonroute → $DEMONROUTE_API_KEY
+#   (one key per entry, shared by both endpoints). Required only when some
+#   slug actually references the entry. `openrouter` uses the existing
+#   $OPENROUTER_API_KEY.
+# - `headers` cannot declare Authorization or Content-Type (engine-owned).
+# - Suffix a model slug with "@<name>" to route it. "@openrouter" is always
+#   valid and means the built-in endpoint — on chat tasks it is equivalent
+#   to writing no suffix at all.
+# - Model ids before "@" are the PROVIDER'S OWN slugs, sent verbatim; a
+#   literal "@" inside a model id is escaped "\@" (in TOML: "weird\\@vendor/m").
+# - Model-keyed tables (`display`, `output_regex` models, `output_filter`
+#   trigger models) always use the BARE id, never "id@provider".
+# - Custom providers receive a strict OpenAI-compatible request plus exactly
+#   the headers (and any [[providers.<name>.body]] rules, see below) you
+#   declare for that entry.
+# - Under MODEL_CONFIG_DIR, [providers] merges as ONE top-level key.
+#
+# Per-provider custom body parameters. `params` is merged into the request
+# body verbatim; `tasks` scopes the rule (omit = every task on this
+# provider). Later rules win; params win over engine fields.
+# model/messages/stream are engine-owned (boot refusal).
+#[[providers.venice.body]]
+#tasks  = ["chat_companion"]
+#params = { venice_parameters = { include_venice_system_prompt = false } }
+#
+# Reasoning control lives here too (same shape as OpenRouter's `reasoning`
+# object; `{ exclude = true }` keeps it generated but hidden). Companion
+# replies only render `content`, so the reasoning channel is wasted latency
+# and cost — off for chat_companion, and every tier inherits the rule.
+# Omit `tasks` to switch it off for every task on this provider.
+[[providers.openrouter.body]]
+tasks  = ["chat_companion"]
+params = { reasoning = { enabled = false } }
+#
+# The group director reasons before it casts a group turn; the reasoning
+# streams to the client as `reasoning` frames. Reasoning tokens count
+# against the task's `max_tokens`, so cap reasoning here (`effort` or
+# `reasoning.max_tokens`) rather than by lowering `max_tokens`.
+[[providers.openrouter.body]]
+tasks  = ["group_director"]
+params = { reasoning = { effort = "medium" } }
+#
+# Covers chat_vision too, even though that stage builds its own body — the
+# lever for models that ignore `reasoning = { enabled = false }`, reason
+# anyway, and bill for it (`reasoning_effort` is a separate top-level field,
+# not part of the `reasoning` object). Only `embedding` is uncovered.
+#[[providers.openrouter.body]]
+#tasks  = ["chat_vision"]
+#params = { reasoning_effort = "none" }
+#
+# Judge reasoning (optional). The PDE judge streams, and whatever reasoning its
+# model returns reaches the 1:1 client as `reasoning` frames ahead of the reply
+# and is kept on the decision audit row. This rule turns reasoning on;
+# `reasoning = { enabled = false }` or `{ exclude = true }` turns it off.
+# Reasoning tokens count against the task's
+# `max_tokens`, and the reply waits for the judge — raise
+# `[tasks.pde_decision].max_tokens` and `timeout_secs` together with it.
+#[[providers.openrouter.body]]
+#tasks  = ["pde_decision"]
+#params = { reasoning = { effort = "low" } }
+#
+# OpenRouter routing prefs (the former [defaults].ignore_providers /
+# provider_sort) are now body params on the reserved openrouter entry —
+# bare provider slugs, no @openrouter suffix:
+#[[providers.openrouter.body]]
+#params = { provider = { ignore = ["some-bad-provider"], sort = "latency" } }
+#
+# One-off repair of rows already persisted with byte-BPE garble (run manually,
+# NOT a migration — the engine refuses to own downstream prod data). Repairs the
+# two unambiguous whitespace glyphs only (Ġ→space, Ċ→newline), idempotent,
+# touches only rows that still contain a glyph:
+#   supabase db query --linked "UPDATE engine.chat_messages
+#     SET content = replace(replace(content,'Ġ',' '),'Ċ',E'\n')
+#     WHERE content ~ '[ĠĊ]';"
+#   supabase db query --linked "UPDATE engine.chat_messages
+#     SET pre_filter_content = replace(replace(pre_filter_content,'Ġ',' '),'Ċ',E'\n')
+#     WHERE pre_filter_content ~ '[ĠĊ]';"
