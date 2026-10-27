@@ -42,6 +42,11 @@ pub fn is_placeholder(s: &str) -> bool {
         || (t.starts_with("「<") && t.ends_with(">」"))
 }
 
+/// Cap on items kept per array column (#463). The rebuild prompt asks for at
+/// most this many; the projection enforces it so a reply that ignored the
+/// prompt still writes a bounded row.
+pub const PROFILE_LIST_MAX_ITEMS: usize = 12;
+
 /// The typed profile columns a rebuild writes. Owned values so the caller can
 /// move them straight into `.bind(...)`.
 #[derive(Debug, Default, PartialEq)]
@@ -82,15 +87,19 @@ fn scalar(v: &serde_json::Value, key: &str) -> Option<String> {
         .map(String::from)
 }
 
-/// An array field: the non-placeholder string items. A missing or non-array
-/// value yields `[]`.
+/// An array field: the non-placeholder string items, first occurrence of each
+/// (a looping reply repeats the same batch), at most `PROFILE_LIST_MAX_ITEMS`.
+/// A missing or non-array value yields `[]`.
 fn list(v: &serde_json::Value, key: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
     v.get(key)
         .and_then(|a| a.as_array())
         .map(|arr| {
             arr.iter()
                 .filter_map(|x| x.as_str())
                 .filter(|s| !is_placeholder(s))
+                .filter(|s| seen.insert(s.to_string()))
+                .take(PROFILE_LIST_MAX_ITEMS)
                 .map(String::from)
                 .collect()
         })
@@ -402,6 +411,20 @@ mod tests {
         }));
         assert_eq!(c.interests, vec!["周末常去爬山"]);
         assert!(c.kinks.is_empty());
+    }
+
+    #[test]
+    fn project_profile_dedups_and_caps_array_fields() {
+        // A reply past the prompt's cap — or looping on the same batch of
+        // items (#463) — still projects to a bounded, duplicate-free column.
+        let many: Vec<String> = (0..30).map(|i| format!("兴趣主题{i}")).collect();
+        let c = project_profile(&serde_json::json!({
+            "interests": many,
+            "kinks": ["束缚", "束缚", "角色扮演", "束缚", "角色扮演"],
+        }));
+        assert_eq!(c.interests.len(), PROFILE_LIST_MAX_ITEMS);
+        assert_eq!(c.interests[0], "兴趣主题0", "first occurrences win");
+        assert_eq!(c.kinks, vec!["束缚".to_string(), "角色扮演".to_string()]);
     }
 
     #[test]

@@ -11,8 +11,8 @@
 use uuid::Uuid;
 
 use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
-use eros_engine_store::human_fact::{HumanFactRepo, HumanFactRow};
-use eros_engine_store::human_insight::{project_profile, HumanInsightRepo};
+use eros_engine_store::human_fact::{HumanFactRepo, HumanFactRow, Recurrence};
+use eros_engine_store::human_insight::{project_profile, HumanInsightRepo, ProjectedColumns};
 use eros_engine_store::insight::{InsightEventInsert, InsightEventRepo};
 use eros_engine_store::parse_error_payload;
 use eros_engine_store::profile_state::ProfileStateRepo;
@@ -153,6 +153,15 @@ async fn rebuild(state: &AppState, user_id: Uuid) -> Option<RebuildOutcome> {
     if rows.is_empty() {
         return Some(RebuildOutcome::Empty);
     }
+    // A ledger of nothing but transient facts that never recurred across
+    // sessions supports no field (the prompt's transient rule), so the correct
+    // reply is always `{}`: skip the model call rather than spend it.
+    let usable = rows.iter().any(|r| {
+        r.persistence != "transient" || r.recurrence() == Recurrence::RepeatedAcrossSessions
+    });
+    if !usable {
+        return Some(RebuildOutcome::Empty);
+    }
 
     let resolved = state.model_config.resolve_profile_rebuild();
     let req = ChatRequest {
@@ -199,18 +208,44 @@ async fn rebuild(state: &AppState, user_id: Uuid) -> Option<RebuildOutcome> {
     let Some(profile) =
         super::parse_llm_json::<serde_json::Value>(raw).filter(serde_json::Value::is_object)
     else {
+        // `finish_reason = "length"` makes truncation readable apart from a
+        // malformed reply without inspecting the (capped) raw text.
+        let mut payload = parse_error_payload(raw);
+        if let Some(reason) = resp.finish_reason.as_deref() {
+            payload["finish_reason"] = reason.into();
+        }
         write_profile_event(
             &state.pool,
             user_id,
             "parse_error",
-            Some(parse_error_payload(raw)),
+            Some(payload),
             generation_id,
         )
         .await;
         return Some(RebuildOutcome::Failed);
     };
 
-    let columns = project_profile(&profile);
+    let mut columns = project_profile(&profile);
+    // Write-time guards for replies that ignored the prompt's rules. The
+    // projection is pure and cannot see the ledger, so they live here.
+    // Roleplay-only ledger: kinks is the only field such evidence may enter.
+    if rows
+        .iter()
+        .all(|r| r.evidence_type == "roleplay_expression")
+    {
+        columns = ProjectedColumns {
+            kinks: columns.kinks,
+            ..Default::default()
+        };
+    }
+    // mental_health records only what the user said about their health; with
+    // no health-domain fact in the ledger there is nothing it could restate.
+    if !rows
+        .iter()
+        .any(|r| r.domain == "health" || r.domain == "mental_health")
+    {
+        columns.mental_health = None;
+    }
     // An empty projection settles the counter too. The same ledger would yield
     // the same answer, so retrying cannot help; the next new fact starts a
     // fresh count.
@@ -451,14 +486,21 @@ mod tests {
         assert_eq!(render_ledger(&[], LEDGER_BUDGET_CHARS), "");
     }
 
-    async fn seed_fact(pool: &PgPool, user_id: Uuid, content: &str, domain: &str) {
+    async fn seed_fact_as(
+        pool: &PgPool,
+        user_id: Uuid,
+        content: &str,
+        domain: &str,
+        evidence_type: &str,
+        persistence: &str,
+    ) {
         let fact = FactInput {
             content: content.into(),
             category: "other".into(),
             domain: domain.into(),
-            evidence_type: "explicit_statement".into(),
+            evidence_type: evidence_type.into(),
             temporality: "current".into(),
-            persistence: "stable".into(),
+            persistence: persistence.into(),
             confidence: "high".into(),
         };
         let src = FactSource {
@@ -470,6 +512,37 @@ mod tests {
             .upsert_run(user_id, &[fact], &src)
             .await
             .unwrap();
+    }
+
+    async fn seed_fact(pool: &PgPool, user_id: Uuid, content: &str, domain: &str) {
+        seed_fact_as(
+            pool,
+            user_id,
+            content,
+            domain,
+            "explicit_statement",
+            "stable",
+        )
+        .await;
+    }
+
+    /// A state whose LLM calls go to `mock`. The caller mounts expectations.
+    fn state_pointing_at(pool: PgPool, mock: &MockServer) -> AppState {
+        let mut state = crate::routes::companion::test_state(pool);
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.insight_extraction]\nmodel=\"i/m\"\nfilter_prompt=\"p\"\n\
+                 [tasks.profile_rebuild]\nmodel=\"p/m\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        state
     }
 
     /// A state whose single LLM call is answered with `reply` verbatim.
@@ -497,20 +570,7 @@ mod tests {
             .expect(1)
             .mount(&mock)
             .await;
-        let mut state = crate::routes::companion::test_state(pool);
-        state.model_config = std::sync::Arc::new(
-            eros_engine_llm::model_config::ModelConfig::from_toml_str(
-                "[tasks.insight_extraction]\nmodel=\"i/m\"\nfilter_prompt=\"p\"\n\
-                 [tasks.profile_rebuild]\nmodel=\"p/m\"\n",
-            )
-            .unwrap(),
-        );
-        state.openrouter = std::sync::Arc::new(
-            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
-                "k".into(),
-                format!("{}/api/v1/chat/completions", mock.uri()),
-            ),
-        );
+        let state = state_pointing_at(pool, &mock);
         (state, mock)
     }
 
@@ -718,6 +778,212 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(profiles, 0);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn rebuild_user_transient_only_ledger_is_empty_without_model_call(pool: PgPool) {
+        let user = Uuid::new_v4();
+        seed_fact_as(
+            &pool,
+            user,
+            "在煮面",
+            "lifestyle",
+            "observed_behavior",
+            "transient",
+        )
+        .await;
+        seed_claim(&pool, user).await;
+
+        // expect(0): the correct reply to such a ledger is always `{}`, so no
+        // model call is spent on it.
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock)
+            .await;
+        let state = state_pointing_at(pool.clone(), &mock);
+        assert_eq!(rebuild_user(&state, user).await, RebuildOutcome::Empty);
+
+        let s = ProfileStateRepo { pool: &pool }
+            .load(user)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((s.pending_facts, s.claimed_at), (0, None));
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT count(*) FROM engine.human_insights WHERE user_id = $1",
+                user
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT count(*) FROM engine.human_insights_events WHERE user_id = $1",
+                user
+            )
+            .await,
+            0,
+            "skipped like an empty ledger: no call, no audit row"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn rebuild_user_cross_session_transient_fact_still_calls_model(pool: PgPool) {
+        let user = Uuid::new_v4();
+        seed_fact_as(
+            &pool,
+            user,
+            "最近在赶版本",
+            "career",
+            "explicit_statement",
+            "transient",
+        )
+        .await;
+        // The prompt's transient rule admits a fact repeated across sessions.
+        sqlx::query(
+            "UPDATE engine.human_facts SET occurrences = 3, session_count = 2 \
+             WHERE user_id = $1",
+        )
+        .bind(user)
+        .execute(&pool)
+        .await
+        .unwrap();
+        seed_claim(&pool, user).await;
+
+        let (state, mock) = state_replying(pool.clone(), "{}").await;
+        assert_eq!(rebuild_user(&state, user).await, RebuildOutcome::Empty);
+        assert_eq!(mock.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn rebuild_user_roleplay_only_ledger_writes_only_kinks(pool: PgPool) {
+        let user = Uuid::new_v4();
+        seed_fact_as(
+            &pool,
+            user,
+            "喜欢扮演医生",
+            "kink",
+            "roleplay_expression",
+            "one_off",
+        )
+        .await;
+        seed_claim(&pool, user).await;
+
+        // A reply that ignored the prompt's roleplay rule: kinks is the only
+        // field such evidence may enter, the rest is dropped at write time.
+        let reply = serde_json::json!({
+            "occupation": "医生",
+            "kinks": ["角色扮演中扮演医生"],
+            "mental_health": "焦虑",
+        });
+        let (state, _mock) = state_replying(pool.clone(), &reply.to_string()).await;
+        assert_eq!(rebuild_user(&state, user).await, RebuildOutcome::Ok);
+
+        let (occupation, kinks, mental_health): (Option<String>, Vec<String>, Option<String>) =
+            sqlx::query_as(
+                "SELECT occupation, interests || personality_traits || deal_breakers || kinks, \
+                        mental_health \
+                 FROM engine.human_insights WHERE user_id = $1",
+            )
+            .bind(user)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(occupation, None);
+        assert_eq!(kinks, vec!["角色扮演中扮演医生".to_string()]);
+        assert_eq!(mental_health, None);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn rebuild_user_mental_health_needs_a_health_fact(pool: PgPool) {
+        let (without, with) = (Uuid::new_v4(), Uuid::new_v4());
+        seed_fact(&pool, without, "是后端工程师", "career").await;
+        seed_fact(&pool, with, "长期失眠", "mental_health").await;
+
+        let mock = MockServer::start().await;
+        let reply = serde_json::json!({
+            "occupation": "后端工程师",
+            "mental_health": "长期失眠，压力大",
+        });
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen-profile", "model": "p/m",
+                "choices": [{"message": {"content": reply.to_string()}}],
+            })))
+            .expect(2)
+            .mount(&mock)
+            .await;
+        let state = state_pointing_at(pool.clone(), &mock);
+
+        for user in [without, with] {
+            seed_claim(&pool, user).await;
+            assert_eq!(rebuild_user(&state, user).await, RebuildOutcome::Ok);
+        }
+        const MH: &str = "SELECT mental_health FROM engine.human_insights WHERE user_id = $1";
+        let dropped: Option<String> = sqlx::query_scalar(MH)
+            .bind(without)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            dropped, None,
+            "no health/mental_health fact in the ledger, nothing it could be"
+        );
+        let kept: Option<String> = sqlx::query_scalar(MH)
+            .bind(with)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kept.as_deref(), Some("长期失眠，压力大"));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn rebuild_user_truncated_reply_audits_finish_reason(pool: PgPool) {
+        let user = Uuid::new_v4();
+        seed_fact(&pool, user, "是后端工程师", "career").await;
+        seed_claim(&pool, user).await;
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen-profile", "model": "p/m",
+                "choices": [{
+                    "message": {"content": "{\"interests\": [\"爬山\", \"手冲"},
+                    "finish_reason": "length",
+                }],
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        let state = state_pointing_at(pool.clone(), &mock);
+        assert_eq!(rebuild_user(&state, user).await, RebuildOutcome::Failed);
+
+        let (status, payload): (String, serde_json::Value) = sqlx::query_as(
+            "SELECT status, payload FROM engine.human_insights_events \
+             WHERE user_id = $1 AND stage = 'profile'",
+        )
+        .bind(user)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "parse_error");
+        assert_eq!(
+            payload["finish_reason"].as_str(),
+            Some("length"),
+            "truncation is readable without the raw text: {payload}"
+        );
+        assert!(payload["raw"]
+            .as_str()
+            .unwrap()
+            .starts_with("{\"interests\""));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
