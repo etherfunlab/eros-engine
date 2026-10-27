@@ -386,7 +386,8 @@ mod migration_tests {
     /// event tables it is a correlation token tying the stages of one run
     /// together, with no `runs` table behind it. Excluding the NAME schema-wide
     /// would silently exempt a future `run_id` that really does reference
-    /// something.
+    /// something. `human_facts.first_run_id` / `last_run_id` are the same
+    /// token, naming the extraction run that first and last emitted the fact.
     ///
     /// Covers `relkind` `'r'` and `'p'` — a partitioned table can carry an FK
     /// and must not slip through. Materialized views cannot, so they are out.
@@ -408,6 +409,8 @@ mod migration_tests {
                AND NOT (a.attname = 'run_id' AND c.relname IN ( \
                      'companion_insights_events', 'companion_decision_events', \
                      'character_insights_events', 'user_insights_events')) \
+               AND NOT (a.attname IN ('first_run_id', 'last_run_id') \
+                        AND c.relname = 'human_facts') \
                AND NOT EXISTS ( \
                      SELECT 1 FROM pg_constraint fk \
                      JOIN unnest(fk.conkey) k(attnum) ON k.attnum = a.attnum \
@@ -1135,5 +1138,218 @@ mod migration_tests {
             Some("false"),
             "archived must default to false so existing sessions stay visible"
         );
+    }
+
+    async fn norm(pool: &PgPool, text: &str) -> String {
+        sqlx::query_scalar("SELECT engine.fact_norm($1)")
+            .bind(text)
+            .fetch_one(pool)
+            .await
+            .expect("engine.fact_norm")
+    }
+
+    /// 0079. The ledger dedups on this function's output, so what it merges and
+    /// what it keeps apart IS the dedup contract: surface noise (width, case,
+    /// whitespace, punctuation) must collapse, while a negation or a hedge must
+    /// stay its own fact.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn fact_norm_merges_width_case_space_and_punctuation(pool: PgPool) {
+        for (a, b) in [
+            ("用户喜欢爬山。", "用户喜欢爬山"),
+            ("ＡＢＣ", "abc"),
+            ("用户 喜欢 爬山", "用户喜欢爬山"),
+            ("用户喜欢爬山，周末常去", "用户喜欢爬山周末常去"),
+        ] {
+            assert_eq!(norm(&pool, a).await, norm(&pool, b).await, "{a} vs {b}");
+        }
+        assert_ne!(
+            norm(&pool, "用户喜欢爬山").await,
+            norm(&pool, "用户不喜欢爬山").await
+        );
+        assert_ne!(
+            norm(&pool, "用户很喜欢爬山").await,
+            norm(&pool, "用户喜欢爬山").await
+        );
+    }
+
+    /// 0079. Pins the three new tables, the dedup key's shape (roleplay is part
+    /// of it), the five widened `human_insights` columns and the third audit
+    /// `stage`.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn migration_0079_shapes(pool: PgPool) {
+        let user_id = uuid::Uuid::new_v4();
+        let insert = |content: &'static str, evidence: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO engine.human_facts \
+                       (user_id, content, category, domain, evidence_type, temporality, \
+                        persistence, confidence, first_seen_at, last_seen_at) \
+                     VALUES ($1, $2, 'other', 'other', $3, 'unknown', 'unknown', 'unknown', \
+                             now(), now())",
+                )
+                .bind(user_id)
+                .bind(content)
+                .bind(evidence)
+                .execute(&pool)
+                .await
+            }
+        };
+
+        insert("用户喜欢爬山。", "explicit_self_report")
+            .await
+            .expect("first insert");
+        let dup = insert("用户喜欢爬山", "explicit_self_report").await;
+        assert!(
+            matches!(&dup, Err(sqlx::Error::Database(e)) if e.is_unique_violation()),
+            "same normalized content, same user, same roleplay flag must collide: {dup:?}"
+        );
+        insert("用户喜欢爬山", "roleplay_expression")
+            .await
+            .expect("roleplay is its own dedup bucket");
+        insert("用户不喜欢爬山", "explicit_self_report")
+            .await
+            .expect("a negation is its own fact");
+
+        let (roleplay, hash_len): (bool, i32) = sqlx::query_as(
+            "SELECT roleplay, length(content_hash) FROM engine.human_facts \
+             WHERE content = '用户喜欢爬山' AND evidence_type = 'roleplay_expression'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("generated columns");
+        assert!(roleplay);
+        assert_eq!(hash_len, 32, "content_hash is an md5 hex digest");
+
+        // Pointers are SET NULL: deleting the session blanks them, the fact stays.
+        let session_id = crate::testutil::seed_chat_session(&pool, user_id).await;
+        let message_id = crate::testutil::seed_chat_message(&pool, session_id).await;
+        sqlx::query(
+            "INSERT INTO engine.human_facts \
+               (user_id, content, category, domain, evidence_type, temporality, persistence, \
+                confidence, first_seen_at, last_seen_at, first_session_id, first_message_id, \
+                last_session_id, last_message_id) \
+             VALUES ($1, 'x', 'other', 'other', 'explicit_self_report', 'unknown', 'unknown', \
+                     'unknown', now(), now(), $2, $3, $2, $3)",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(message_id)
+        .execute(&pool)
+        .await
+        .expect("insert with pointers");
+        sqlx::query("DELETE FROM engine.chat_sessions WHERE id = $1")
+            .bind(session_id)
+            .execute(&pool)
+            .await
+            .expect("delete session");
+        let (first_session, last_message): (Option<uuid::Uuid>, Option<uuid::Uuid>) =
+            sqlx::query_as(
+                "SELECT first_session_id, last_message_id FROM engine.human_facts \
+                 WHERE content = 'x'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("fact survives its session");
+        assert_eq!((first_session, last_message), (None, None));
+
+        // Every FK column of the ledger leads an index.
+        for column in [
+            "first_session_id",
+            "first_message_id",
+            "last_session_id",
+            "last_message_id",
+        ] {
+            let indexed: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_index i \
+                   JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0] \
+                  WHERE i.indrelid = 'engine.human_facts'::regclass AND a.attname = $1)",
+            )
+            .bind(column)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert!(indexed, "engine.human_facts.{column} must lead an index");
+        }
+
+        // The two state tables exist, are locked down, and take their defaults.
+        sqlx::query("INSERT INTO engine.human_profile_state (user_id) VALUES ($1)")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("human_profile_state");
+        let (pending, failures): (i32, i32) = sqlx::query_as(
+            "SELECT pending_facts, rebuild_failures FROM engine.human_profile_state \
+             WHERE user_id = $1",
+        )
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((pending, failures), (0, 0));
+        sqlx::query("INSERT INTO engine.user_erasures (user_id, erased_at) VALUES ($1, now())")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("user_erasures");
+        for table in ["human_facts", "human_profile_state", "user_erasures"] {
+            let rls: bool = sqlx::query_scalar(
+                "SELECT relrowsecurity FROM pg_class WHERE oid = ('engine.' || $1)::regclass",
+            )
+            .bind(table)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert!(rls, "RLS must be enabled on engine.{table}");
+        }
+
+        // human_insights grew the five profile columns.
+        let cols: Vec<String> = sqlx::query_scalar(
+            "SELECT column_name::text FROM information_schema.columns \
+             WHERE table_schema = 'engine' AND table_name = 'human_insights' \
+               AND column_name IN ('kinks', 'ideology', 'mental_health', \
+                                   'education_level', 'education_status') \
+             ORDER BY column_name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            cols,
+            [
+                "education_level",
+                "education_status",
+                "ideology",
+                "kinks",
+                "mental_health"
+            ]
+        );
+
+        // The audit table accepts the third stage.
+        let run_id = uuid::Uuid::new_v4();
+        let session_id = crate::testutil::seed_chat_session(&pool, user_id).await;
+        let message_id = crate::testutil::seed_chat_message(&pool, session_id).await;
+        crate::testutil::seed_generation(&pool, "g").await;
+        sqlx::query(
+            "INSERT INTO engine.companion_insights_events \
+               (run_id, user_id, session_id, message_id, stage, status, payload, generation_id) \
+             VALUES ($1,$2,$3,$4,'profile','ok','{}'::jsonb,'g')",
+        )
+        .bind(run_id)
+        .bind(user_id)
+        .bind(session_id)
+        .bind(message_id)
+        .execute(&pool)
+        .await
+        .expect("stage 'profile' must be accepted");
+        let bad = sqlx::query(
+            "INSERT INTO engine.companion_insights_events \
+               (run_id, user_id, stage, status) VALUES ($1,$2,'bogus','ok')",
+        )
+        .bind(run_id)
+        .bind(user_id)
+        .execute(&pool)
+        .await;
+        assert!(bad.is_err(), "an unknown stage must still be rejected");
     }
 }
