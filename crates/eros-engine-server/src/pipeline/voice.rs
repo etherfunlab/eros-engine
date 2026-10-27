@@ -3188,7 +3188,10 @@ data: [DONE]\n\n";
 
     async fn seed_insights(pool: &sqlx::PgPool, user_id: Uuid, insights: serde_json::Value) {
         eros_engine_store::human_insight::HumanInsightRepo { pool }
-            .apply_extraction(user_id, &insights)
+            .replace_profile(
+                user_id,
+                &eros_engine_store::human_insight::project_profile(&insights),
+            )
             .await
             .unwrap();
     }
@@ -3416,7 +3419,7 @@ data: [DONE]\n\n";
         seed_insights(
             &pool,
             user_id,
-            serde_json::json!({ "city": "上海", "occupation": "设计师", "love_values": "慢热" }),
+            serde_json::json!({ "occupation": "设计师", "education": "美院本科", "love_values": "慢热" }),
         )
         .await;
 
@@ -3444,7 +3447,7 @@ data: [DONE]\n\n";
             .expect("marker written");
         assert_eq!(
             marker["insights"],
-            serde_json::json!(["城市：上海", "职业：设计师"]),
+            serde_json::json!(["职业：设计师", "教育：美院本科"]),
             "default scope ⇒ Neutral tier (no 感情观); got {marker}"
         );
         assert_eq!(
@@ -3460,7 +3463,7 @@ data: [DONE]\n\n";
         // …and injected into this very turn's system prompt.
         let sys = system_prompt_of(&last_request_body(&mock).await);
         assert!(
-            sys.contains("[关于他]\n- 城市：上海\n- 职业：设计师"),
+            sys.contains("[关于他]\n- 职业：设计师\n- 教育：美院本科"),
             "insights sub-block missing: {sys}"
         );
         assert!(
@@ -3480,7 +3483,12 @@ data: [DONE]\n\n";
         let mock = bootstrap_mock().await;
         let user_id = Uuid::new_v4();
         let instance_id = seed_instance(&pool, user_id).await;
-        seed_insights(&pool, user_id, serde_json::json!({ "city": "上海" })).await;
+        seed_insights(
+            &pool,
+            user_id,
+            serde_json::json!({ "occupation": "设计师" }),
+        )
+        .await;
         let session_id = seed_session(&pool, user_id, instance_id, "voice").await;
 
         let frames = run_bootstrap_turn(
@@ -3499,7 +3507,12 @@ data: [DONE]\n\n";
             .expect("marker written");
 
         // Live data moves on mid-call — and must NOT reach the prompt.
-        seed_insights(&pool, user_id, serde_json::json!({ "city": "北京" })).await;
+        seed_insights(
+            &pool,
+            user_id,
+            serde_json::json!({ "occupation": "工程师" }),
+        )
+        .await;
 
         let frames = run_bootstrap_turn(
             &pool,
@@ -3519,9 +3532,9 @@ data: [DONE]\n\n";
         assert_eq!(second, first, "the snapshot must never be rewritten");
 
         let sys = system_prompt_of(&last_request_body(&mock).await);
-        assert!(sys.contains("城市：上海"), "frozen bullet missing: {sys}");
+        assert!(sys.contains("职业：设计师"), "frozen bullet missing: {sys}");
         assert!(
-            !sys.contains("北京"),
+            !sys.contains("工程师"),
             "live insight data must not reach a later turn: {sys}"
         );
     }
@@ -3546,7 +3559,12 @@ data: [DONE]\n\n";
 
         // What this turn's OWN live assembly would produce, had it not lost
         // the race — must NOT reach the wire prompt.
-        seed_insights(&pool, user_id, serde_json::json!({ "city": "上海" })).await;
+        seed_insights(
+            &pool,
+            user_id,
+            serde_json::json!({ "occupation": "设计师" }),
+        )
+        .await;
 
         let session_id = seed_session(&pool, user_id, instance_id, "voice").await;
 
@@ -3616,7 +3634,7 @@ data: [DONE]\n\n";
             "winner's stored snapshot missing from wire prompt: {sys}"
         );
         assert!(
-            !sys.contains("城市：上海"),
+            !sys.contains("职业：设计师"),
             "loser's own locally-assembled snapshot leaked into the wire prompt: {sys}"
         );
 
@@ -3637,7 +3655,12 @@ data: [DONE]\n\n";
         let mock = bootstrap_mock().await;
         let user_id = Uuid::new_v4();
         let instance_id = seed_instance(&pool, user_id).await;
-        seed_insights(&pool, user_id, serde_json::json!({ "city": "上海" })).await;
+        seed_insights(
+            &pool,
+            user_id,
+            serde_json::json!({ "occupation": "设计师" }),
+        )
+        .await;
         let session_id = seed_session(&pool, user_id, instance_id, "voice").await;
 
         let frames = run_bootstrap_turn(
@@ -3655,7 +3678,7 @@ data: [DONE]\n\n";
         let marker = read_marker(&pool, session_id)
             .await
             .expect("marker written");
-        assert_eq!(marker["insights"], serde_json::json!(["城市：上海"]));
+        assert_eq!(marker["insights"], serde_json::json!(["职业：设计师"]));
         assert_eq!(marker["prev_call"], serde_json::Value::Null);
         assert_eq!(marker["prev_session_id"], serde_json::Value::Null);
 
@@ -3730,7 +3753,12 @@ data: [DONE]\n\n";
         let mock = bootstrap_mock().await;
         let user_id = Uuid::new_v4();
         let instance_id = seed_instance(&pool, user_id).await;
-        seed_insights(&pool, user_id, serde_json::json!({ "city": "上海" })).await;
+        seed_insights(
+            &pool,
+            user_id,
+            serde_json::json!({ "occupation": "设计师" }),
+        )
+        .await;
         let sibling = seed_session(&pool, user_id, instance_id, "voice").await;
         seed_message(&pool, sibling, "user", "你好", 20).await;
         let session_id = seed_session(&pool, user_id, instance_id, "voice").await;
@@ -3780,7 +3808,7 @@ data: [DONE]\n\n";
         assert_no_error_frame(&frames);
         let sys = system_prompt_of(&last_request_body(&mock).await);
         assert!(
-            !sys.contains("城市：上海"),
+            !sys.contains("职业：设计师"),
             "the first turn's scope decides the whole call: {sys}"
         );
     }
@@ -3882,7 +3910,12 @@ data: [DONE]\n\n";
         let mock = bootstrap_mock().await;
         let user_id = Uuid::new_v4();
         let instance_id = seed_instance(&pool, user_id).await;
-        seed_insights(&pool, user_id, serde_json::json!({ "city": "上海" })).await;
+        seed_insights(
+            &pool,
+            user_id,
+            serde_json::json!({ "occupation": "设计师" }),
+        )
+        .await;
         let sibling = seed_session(&pool, user_id, instance_id, "voice").await;
         seed_message(&pool, sibling, "user", "你好", 20).await;
         let session_id = seed_session(&pool, user_id, instance_id, "voice").await;
@@ -3925,7 +3958,12 @@ data: [DONE]\n\n";
         let mock = bootstrap_mock().await;
         let user_id = Uuid::new_v4();
         let instance_id = seed_instance(&pool, user_id).await;
-        seed_insights(&pool, user_id, serde_json::json!({ "city": "上海" })).await;
+        seed_insights(
+            &pool,
+            user_id,
+            serde_json::json!({ "occupation": "设计师" }),
+        )
+        .await;
         let sibling = seed_session(&pool, user_id, instance_id, "voice").await;
         seed_message(&pool, sibling, "user", "你好", 20).await;
         let session_id = seed_session(&pool, user_id, instance_id, "voice").await;
@@ -3975,9 +4013,9 @@ data: [DONE]\n\n";
         let marker = read_marker(&pool, session_id)
             .await
             .expect("the retry wrote the marker");
-        assert_eq!(marker["insights"], serde_json::json!(["城市：上海"]));
+        assert_eq!(marker["insights"], serde_json::json!(["职业：设计师"]));
         let sys = system_prompt_of(&last_request_body(&mock).await);
-        assert!(sys.contains("[关于他]\n- 城市：上海"), "{sys}");
+        assert!(sys.contains("[关于他]\n- 职业：设计师"), "{sys}");
     }
 
     /// A failed effects read leaves the marker unwritten so the NEXT turn
@@ -4660,7 +4698,12 @@ data: [DONE]\n\n";
         let mock = bootstrap_mock().await;
         let user_id = Uuid::new_v4();
         let instance_id = seed_instance(&pool, user_id).await;
-        seed_insights(&pool, user_id, serde_json::json!({ "city": "上海" })).await;
+        seed_insights(
+            &pool,
+            user_id,
+            serde_json::json!({ "occupation": "设计师" }),
+        )
+        .await;
         let session_id = seed_session(&pool, user_id, instance_id, "voice").await;
 
         // Turn 1 completes normally and freezes the bootstrap snapshot.

@@ -11,6 +11,7 @@ pub mod handlers;
 pub mod life_choice;
 pub mod post_process;
 pub mod proactive;
+pub mod profile_rebuild;
 pub mod reasoning_call;
 pub mod snapshot;
 pub mod story;

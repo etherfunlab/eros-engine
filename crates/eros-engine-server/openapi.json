@@ -1256,6 +1256,128 @@
         ]
       }
     },
+    "/svc/v1/facts/changes": {
+      "get": {
+        "tags": [
+          "svc"
+        ],
+        "summary": "Ledger facts first seen or seen again since a keyset cursor, for a\ndownstream service that mirrors what was mined about each user. A repeat\nmoves `last_seen_at`, so a row reappears in the stream each time its\ncounters change. Rows leave the ledger only through erasure; see\n`/svc/v1/facts/deletions`.",
+        "operationId": "facts_changes",
+        "parameters": [
+          {
+            "name": "since",
+            "in": "query",
+            "description": "RFC 3339. Default: Unix epoch (walk everything).",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "after_id",
+            "in": "query",
+            "description": "Tie-break within `since`. Default: nil UUID. Pass `next.id`.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Default 500, clamped to 1..=1000.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FactChangesResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "x-facts-export-secret missing or wrong"
+          }
+        },
+        "security": [
+          {
+            "facts_export_secret": []
+          }
+        ]
+      }
+    },
+    "/svc/v1/facts/deletions": {
+      "get": {
+        "tags": [
+          "svc"
+        ],
+        "summary": "Users whose data the engine erased since a keyset cursor, for the facts\nmirror to drop in turn. The same stream as `/svc/v1/insights/deletions`,\nreadable with the facts secret so that mirror needs no second credential.",
+        "operationId": "facts_deletions",
+        "parameters": [
+          {
+            "name": "since",
+            "in": "query",
+            "description": "RFC 3339. Default: Unix epoch (walk everything).",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "after_user",
+            "in": "query",
+            "description": "Tie-break within `since`. Default: nil UUID. Pass `next.user_id`.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Default 500, clamped to 1..=1000.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErasuresResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "x-facts-export-secret missing or wrong"
+          }
+        },
+        "security": [
+          {
+            "facts_export_secret": []
+          }
+        ]
+      }
+    },
     "/svc/v1/insights/changes": {
       "get": {
         "tags": [
@@ -1302,6 +1424,67 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/InsightChangesResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "x-insights-export-secret missing or wrong"
+          }
+        },
+        "security": [
+          {
+            "insights_export_secret": []
+          }
+        ]
+      }
+    },
+    "/svc/v1/insights/deletions": {
+      "get": {
+        "tags": [
+          "svc"
+        ],
+        "summary": "Users whose data the engine erased since a keyset cursor, for the mirror of\nprofiles and memories to drop in turn. The same stream as\n`/svc/v1/facts/deletions`, readable with the insights secret so that mirror\nneeds no second credential.",
+        "operationId": "insights_deletions",
+        "parameters": [
+          {
+            "name": "since",
+            "in": "query",
+            "description": "RFC 3339. Default: Unix epoch (walk everything).",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "after_user",
+            "in": "query",
+            "description": "Tie-break within `since`. Default: nil UUID. Pass `next.user_id`.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Default 500, clamped to 1..=1000.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErasuresResponse"
                 }
               }
             }
@@ -1374,6 +1557,48 @@
         "security": [
           {
             "insights_export_secret": []
+          }
+        ]
+      }
+    },
+    "/svc/v1/users/{user_id}/erase": {
+      "post": {
+        "tags": [
+          "svc"
+        ],
+        "summary": "Erase everything the engine derived about a user, and list the user on the\ndeletion streams.",
+        "description": "For a deployment to call when the user deletes their account. Derived rows\n(facts, profile, memories, world and story content, and both sides'\nper-relationship insights) are deleted. Audit and event rows keep their ids\nand timestamps but lose their payloads and free text; relationship state\nkeeps its numbers and loses its generated summary. Chat sessions and\nmessages belong to the caller and are not touched.\n\nIdempotent: a repeat finds nothing left to erase, reports 0 everywhere and\nre-stamps the tombstone.",
+        "operationId": "erase_user",
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "description": "The user to erase",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EraseResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "x-user-erase-secret missing or wrong"
+          }
+        },
+        "security": [
+          {
+            "user_erase_secret": []
           }
         ]
       }
@@ -4608,6 +4833,110 @@
           }
         }
       },
+      "EraseResponse": {
+        "type": "object",
+        "description": "What one erase call removed, by table. Every covered table is listed, with 0\nwhen it had nothing to do.",
+        "required": [
+          "user_id",
+          "erased_at",
+          "deleted",
+          "blanked"
+        ],
+        "properties": {
+          "blanked": {
+            "type": "object",
+            "description": "Rows kept with their content cleared, by table. Counts only rows that\nstill carried content, so a repeat reports 0.",
+            "additionalProperties": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "deleted": {
+            "type": "object",
+            "description": "Rows removed, by table.",
+            "additionalProperties": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "erased_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "The tombstone's timestamp. A repeat call moves it forward."
+          },
+          "user_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "ErasureCursor": {
+        "type": "object",
+        "description": "Keyset position. Pass both fields back as `since` + `after_user`.",
+        "required": [
+          "erased_at",
+          "user_id"
+        ],
+        "properties": {
+          "erased_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "user_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "ErasureExportRow": {
+        "type": "object",
+        "description": "One user's erasure tombstone as exported.",
+        "required": [
+          "user_id",
+          "erased_at"
+        ],
+        "properties": {
+          "erased_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "user_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "ErasuresResponse": {
+        "type": "object",
+        "required": [
+          "erasures"
+        ],
+        "properties": {
+          "erasures": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ErasureExportRow"
+            }
+          },
+          "next": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ErasureCursor",
+                "description": "Present iff the page is full; `null` means the walk is complete."
+              }
+            ]
+          }
+        }
+      },
       "EventCategoryDto": {
         "type": "string",
         "description": "A life event's category: `short` and `mid` are incidents, `body` and\n`trip` backgrounds that last days.",
@@ -4736,6 +5065,120 @@
           "started_at": {
             "type": "string",
             "format": "date-time"
+          }
+        }
+      },
+      "FactChangesCursor": {
+        "type": "object",
+        "description": "Keyset position. Pass both fields back as `since` + `after_id`.",
+        "required": [
+          "last_seen_at",
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "last_seen_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "FactChangesResponse": {
+        "type": "object",
+        "required": [
+          "facts"
+        ],
+        "properties": {
+          "facts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FactExportRow"
+            }
+          },
+          "next": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FactChangesCursor",
+                "description": "Present iff the page is full; `null` means the walk is complete."
+              }
+            ]
+          }
+        }
+      },
+      "FactExportRow": {
+        "type": "object",
+        "description": "One `human_facts` row as exported. Source pointers (session, message, run)\nstay inside the engine; `recurrence` is the derived tier.",
+        "required": [
+          "id",
+          "user_id",
+          "content",
+          "category",
+          "domain",
+          "evidence_type",
+          "temporality",
+          "persistence",
+          "confidence",
+          "occurrences",
+          "session_count",
+          "recurrence",
+          "first_seen_at",
+          "last_seen_at"
+        ],
+        "properties": {
+          "category": {
+            "type": "string"
+          },
+          "confidence": {
+            "type": "string"
+          },
+          "content": {
+            "type": "string"
+          },
+          "domain": {
+            "type": "string"
+          },
+          "evidence_type": {
+            "type": "string"
+          },
+          "first_seen_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "last_seen_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "occurrences": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "persistence": {
+            "type": "string"
+          },
+          "recurrence": {
+            "type": "string",
+            "description": "`once`, `repeated_in_session` or `repeated_across_sessions`."
+          },
+          "session_count": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "temporality": {
+            "type": "string"
+          },
+          "user_id": {
+            "type": "string",
+            "format": "uuid"
           }
         }
       },
@@ -5434,7 +5877,7 @@
       },
       "InsightExportRow": {
         "type": "object",
-        "description": "One `human_insights` row as exported. All 21 data columns: the export does\nnot guess which ones a consumer wants.",
+        "description": "One `human_insights` row as exported: every profile column except the\nsensitive three (`kinks`, `ideology`, `mental_health`), which this export\nnever carries.",
         "required": [
           "user_id",
           "interests",
@@ -5443,26 +5886,6 @@
           "updated_at"
         ],
         "properties": {
-          "age_max": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int32"
-          },
-          "age_min": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int32"
-          },
-          "city": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "deal_breakers": {
             "type": "array",
             "items": {
@@ -5470,6 +5893,18 @@
             }
           },
           "education": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "education_level": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "education_status": {
             "type": [
               "string",
               "null"
@@ -5499,12 +5934,6 @@
               "null"
             ]
           },
-          "hometown": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "interests": {
             "type": "array",
             "items": {
@@ -5512,12 +5941,6 @@
             }
           },
           "life_rhythm": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "location": {
             "type": [
               "string",
               "null"
@@ -5535,12 +5958,6 @@
               "null"
             ]
           },
-          "nationality": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "occupation": {
             "type": [
               "string",
@@ -5552,12 +5969,6 @@
             "items": {
               "type": "string"
             }
-          },
-          "preferred_gender": {
-            "type": [
-              "string",
-              "null"
-            ]
           },
           "relationship_history": {
             "type": [
@@ -6197,29 +6608,10 @@
           "user_id",
           "interests",
           "personality_traits",
-          "deal_breakers"
+          "deal_breakers",
+          "kinks"
         ],
         "properties": {
-          "age_max": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int32"
-          },
-          "age_min": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int32"
-          },
-          "city": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "deal_breakers": {
             "type": "array",
             "items": {
@@ -6231,6 +6623,20 @@
               "string",
               "null"
             ]
+          },
+          "education_level": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "One of `secondary_or_below` / `associate` / `bachelor` / `master` /\n`doctorate`."
+          },
+          "education_status": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`enrolled` or `graduated`."
           },
           "emotional_needs": {
             "type": [
@@ -6256,7 +6662,7 @@
               "null"
             ]
           },
-          "hometown": {
+          "ideology": {
             "type": [
               "string",
               "null"
@@ -6268,13 +6674,13 @@
               "type": "string"
             }
           },
-          "life_rhythm": {
-            "type": [
-              "string",
-              "null"
-            ]
+          "kinks": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           },
-          "location": {
+          "life_rhythm": {
             "type": [
               "string",
               "null"
@@ -6292,7 +6698,7 @@
               "null"
             ]
           },
-          "nationality": {
+          "mental_health": {
             "type": [
               "string",
               "null"
@@ -6309,12 +6715,6 @@
             "items": {
               "type": "string"
             }
-          },
-          "preferred_gender": {
-            "type": [
-              "string",
-              "null"
-            ]
           },
           "relationship_history": {
             "type": [
@@ -6991,11 +7391,23 @@
         "bearerFormat": "JWT",
         "description": "Supabase JWT bearer token"
       },
+      "facts_export_secret": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-facts-export-secret",
+        "description": "Shared secret for the facts export sub-tree; FACTS_EXPORT_SECRET on the deployment"
+      },
       "insights_export_secret": {
         "type": "apiKey",
         "in": "header",
         "name": "x-insights-export-secret",
         "description": "Shared secret for the service sub-tree; INSIGHTS_EXPORT_SECRET on the deployment"
+      },
+      "user_erase_secret": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-user-erase-secret",
+        "description": "Shared secret for the user-erase sub-tree; USER_ERASE_SECRET on the deployment"
       }
     }
   },

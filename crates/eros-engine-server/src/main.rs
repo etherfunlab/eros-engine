@@ -424,6 +424,10 @@ async fn run_server() -> Result<()> {
     // 2026-08-20-async-chat-endpoint-design). Inert when CHAT_QUEUE_DISABLED.
     tokio::spawn(crate::pipeline::chat_queue::worker(state.clone()));
 
+    // Profile rebuild sweeper: regenerates the derived profile for users whose
+    // new facts have sat idle. Inert when PROFILE_REBUILD_DISABLED=1 or tick=0.
+    tokio::spawn(crate::pipeline::profile_rebuild::sweeper(state.clone()));
+
     let app: Router = open_router
         .with_state(state)
         .merge(Scalar::with_url("/docs", api))

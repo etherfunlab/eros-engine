@@ -21,7 +21,7 @@
 //! - The credit ledger is gone in OSS — a tip is a `tip` user action on the
 //!   send routes, not a separate credit-spending endpoint.
 //! - `/comp/user/{user_id}/profile` returns the flat, typed `human_insights`
-//!   row (city/occupation/interests/... — see `ProfileResponse`), not the
+//!   row (occupation/interests/... — see `ProfileResponse`), not the
 //!   legacy freeform `companion_insights` JSON blob.
 
 use axum::{
@@ -219,10 +219,6 @@ pub struct ArchiveSessionsResponse {
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ProfileResponse {
     pub user_id: Uuid,
-    pub city: Option<String>,
-    pub location: Option<String>,
-    pub hometown: Option<String>,
-    pub nationality: Option<String>,
     pub occupation: Option<String>,
     pub mbti_guess: Option<String>,
     pub love_values: Option<String>,
@@ -230,16 +226,21 @@ pub struct ProfileResponse {
     pub life_rhythm: Option<String>,
     pub interests: Vec<String>,
     pub personality_traits: Vec<String>,
-    pub preferred_gender: Option<String>,
-    pub age_min: Option<i32>,
-    pub age_max: Option<i32>,
     pub deal_breakers: Vec<String>,
     pub education: Option<String>,
+    /// One of `secondary_or_below` / `associate` / `bachelor` / `master` /
+    /// `doctorate`.
+    pub education_level: Option<String>,
+    /// `enrolled` or `graduated`.
+    pub education_status: Option<String>,
     pub family: Option<String>,
     pub relationship_history: Option<String>,
     pub social_pattern: Option<String>,
     pub future_plans: Option<String>,
     pub finance_status: Option<String>,
+    pub kinks: Vec<String>,
+    pub ideology: Option<String>,
+    pub mental_health: Option<String>,
     /// None when the user has no insights row yet.
     pub updated_at: Option<DateTime<Utc>>,
 }
@@ -252,10 +253,6 @@ impl ProfileResponse {
         match row {
             Some(r) => Self {
                 user_id,
-                city: r.city,
-                location: r.location,
-                hometown: r.hometown,
-                nationality: r.nationality,
                 occupation: r.occupation,
                 mbti_guess: r.mbti_guess,
                 love_values: r.love_values,
@@ -263,24 +260,22 @@ impl ProfileResponse {
                 life_rhythm: r.life_rhythm,
                 interests: r.interests,
                 personality_traits: r.personality_traits,
-                preferred_gender: r.preferred_gender,
-                age_min: r.age_min,
-                age_max: r.age_max,
                 deal_breakers: r.deal_breakers,
                 education: r.education,
+                education_level: r.education_level,
+                education_status: r.education_status,
                 family: r.family,
                 relationship_history: r.relationship_history,
                 social_pattern: r.social_pattern,
                 future_plans: r.future_plans,
                 finance_status: r.finance_status,
+                kinks: r.kinks,
+                ideology: r.ideology,
+                mental_health: r.mental_health,
                 updated_at: Some(r.updated_at),
             },
             None => Self {
                 user_id,
-                city: None,
-                location: None,
-                hometown: None,
-                nationality: None,
                 occupation: None,
                 mbti_guess: None,
                 love_values: None,
@@ -288,16 +283,18 @@ impl ProfileResponse {
                 life_rhythm: None,
                 interests: vec![],
                 personality_traits: vec![],
-                preferred_gender: None,
-                age_min: None,
-                age_max: None,
                 deal_breakers: vec![],
                 education: None,
+                education_level: None,
+                education_status: None,
                 family: None,
                 relationship_history: None,
                 social_pattern: None,
                 future_plans: None,
                 finance_status: None,
+                kinks: vec![],
+                ideology: None,
+                mental_health: None,
                 updated_at: None,
             },
         }
@@ -1217,6 +1214,9 @@ pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
             byok: crate::state::ByokConfig::default(),
             byoc: crate::state::ByocConfig::default(),
             insights_export: crate::state::InsightsExportConfig::default(),
+            facts_export: crate::state::FactsExportConfig::default(),
+            user_erase: crate::state::UserEraseConfig::default(),
+            profile_rebuild: crate::state::parse_profile_rebuild_config(None, None, None, None),
         },
         openrouter: Arc::new(eros_engine_llm::openrouter::OpenRouterClient::new(
             "stub".into(),
@@ -2187,10 +2187,6 @@ mod tests {
         let updated_at = Utc::now();
         let row = HumanInsightsRow {
             user_id,
-            city: Some("city".into()),
-            location: Some("location".into()),
-            hometown: Some("hometown".into()),
-            nationality: Some("nationality".into()),
             occupation: Some("occupation".into()),
             mbti_guess: Some("mbti_guess".into()),
             love_values: Some("love_values".into()),
@@ -2198,25 +2194,23 @@ mod tests {
             life_rhythm: Some("life_rhythm".into()),
             interests: vec!["interests_0".into(), "interests_1".into()],
             personality_traits: vec!["personality_traits_0".into()],
-            preferred_gender: Some("preferred_gender".into()),
-            age_min: Some(21),
-            age_max: Some(35),
             deal_breakers: vec!["deal_breakers_0".into(), "deal_breakers_1".into()],
             education: Some("education".into()),
+            education_level: Some("education_level".into()),
+            education_status: Some("education_status".into()),
             family: Some("family".into()),
             relationship_history: Some("relationship_history".into()),
             social_pattern: Some("social_pattern".into()),
             future_plans: Some("future_plans".into()),
             finance_status: Some("finance_status".into()),
+            kinks: vec!["kinks_0".into(), "kinks_1".into()],
+            ideology: Some("ideology".into()),
+            mental_health: Some("mental_health".into()),
             updated_at,
         };
 
         let resp = ProfileResponse::from_row(user_id, Some(row.clone()));
         assert_eq!(resp.user_id, user_id);
-        assert_eq!(resp.city.as_deref(), Some("city"));
-        assert_eq!(resp.location.as_deref(), Some("location"));
-        assert_eq!(resp.hometown.as_deref(), Some("hometown"));
-        assert_eq!(resp.nationality.as_deref(), Some("nationality"));
         assert_eq!(resp.occupation.as_deref(), Some("occupation"));
         assert_eq!(resp.mbti_guess.as_deref(), Some("mbti_guess"));
         assert_eq!(resp.love_values.as_deref(), Some("love_values"));
@@ -2224,14 +2218,13 @@ mod tests {
         assert_eq!(resp.life_rhythm.as_deref(), Some("life_rhythm"));
         assert_eq!(resp.interests, vec!["interests_0", "interests_1"]);
         assert_eq!(resp.personality_traits, vec!["personality_traits_0"]);
-        assert_eq!(resp.preferred_gender.as_deref(), Some("preferred_gender"));
-        assert_eq!(resp.age_min, Some(21));
-        assert_eq!(resp.age_max, Some(35));
         assert_eq!(
             resp.deal_breakers,
             vec!["deal_breakers_0", "deal_breakers_1"]
         );
         assert_eq!(resp.education.as_deref(), Some("education"));
+        assert_eq!(resp.education_level.as_deref(), Some("education_level"));
+        assert_eq!(resp.education_status.as_deref(), Some("education_status"));
         assert_eq!(resp.family.as_deref(), Some("family"));
         assert_eq!(
             resp.relationship_history.as_deref(),
@@ -2240,15 +2233,38 @@ mod tests {
         assert_eq!(resp.social_pattern.as_deref(), Some("social_pattern"));
         assert_eq!(resp.future_plans.as_deref(), Some("future_plans"));
         assert_eq!(resp.finance_status.as_deref(), Some("finance_status"));
+        assert_eq!(resp.kinks, vec!["kinks_0", "kinks_1"]);
+        assert_eq!(resp.ideology.as_deref(), Some("ideology"));
+        assert_eq!(resp.mental_health.as_deref(), Some("mental_health"));
         assert_eq!(resp.updated_at, Some(row.updated_at));
+
+        // The user reading their own profile sees the sensitive three; the
+        // retired geo / matching columns are gone from the wire shape.
+        let wire = serde_json::to_value(&resp).unwrap();
+        for key in [
+            "kinks",
+            "ideology",
+            "mental_health",
+            "education_level",
+            "education_status",
+        ] {
+            assert!(wire.get(key).is_some(), "{key} serialised");
+        }
+        for key in [
+            "city",
+            "location",
+            "hometown",
+            "nationality",
+            "preferred_gender",
+            "age_min",
+            "age_max",
+        ] {
+            assert!(wire.get(key).is_none(), "{key} must not serialise");
+        }
 
         // None row: every field falls back to its empty/None default.
         let empty = ProfileResponse::from_row(user_id, None);
         assert_eq!(empty.user_id, user_id);
-        assert_eq!(empty.city, None);
-        assert_eq!(empty.location, None);
-        assert_eq!(empty.hometown, None);
-        assert_eq!(empty.nationality, None);
         assert_eq!(empty.occupation, None);
         assert_eq!(empty.mbti_guess, None);
         assert_eq!(empty.love_values, None);
@@ -2256,16 +2272,18 @@ mod tests {
         assert_eq!(empty.life_rhythm, None);
         assert_eq!(empty.interests, Vec::<String>::new());
         assert_eq!(empty.personality_traits, Vec::<String>::new());
-        assert_eq!(empty.preferred_gender, None);
-        assert_eq!(empty.age_min, None);
-        assert_eq!(empty.age_max, None);
         assert_eq!(empty.deal_breakers, Vec::<String>::new());
         assert_eq!(empty.education, None);
+        assert_eq!(empty.education_level, None);
+        assert_eq!(empty.education_status, None);
         assert_eq!(empty.family, None);
         assert_eq!(empty.relationship_history, None);
         assert_eq!(empty.social_pattern, None);
         assert_eq!(empty.future_plans, None);
         assert_eq!(empty.finance_status, None);
+        assert_eq!(empty.kinks, Vec::<String>::new());
+        assert_eq!(empty.ideology, None);
+        assert_eq!(empty.mental_health, None);
         assert_eq!(empty.updated_at, None);
     }
 
