@@ -61,11 +61,25 @@ mod tests {
             .get(0)
     }
 
+    /// Wait until the pool's one connection is parked idle. Releases are
+    /// returned on a spawned task; a kill landing mid-return is absorbed by
+    /// the return-path check and the test would exercise nothing.
+    async fn settled(pool: &PgPool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while pool.num_idle() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the released connection parks idle");
+    }
+
     #[sqlx::test]
     async fn hot_connection_is_handed_out_without_a_ping(killer: PgPool) {
         // Threshold far above the test's pace: the connection is always "hot".
         let pool = one_conn_pool(Duration::from_secs(600)).await;
         let pid = backend_pid(&pool).await;
+        settled(&pool).await;
         sqlx::query("SELECT pg_terminate_backend($1)")
             .bind(pid)
             .execute(&killer)
@@ -86,6 +100,7 @@ mod tests {
     async fn stale_idle_connection_is_pinged_and_replaced(killer: PgPool) {
         let pool = one_conn_pool(Duration::from_millis(100)).await;
         let pid = backend_pid(&pool).await;
+        settled(&pool).await;
         sqlx::query("SELECT pg_terminate_backend($1)")
             .bind(pid)
             .execute(&killer)
