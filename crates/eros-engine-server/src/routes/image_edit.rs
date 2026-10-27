@@ -362,11 +362,17 @@ async fn generate_reply_text(
     prompt_traits: Vec<PromptTrait>,
     now: &crate::prompt::NowContext,
 ) -> TextOutcome {
+    // Decayed in memory as the chat turn does, so the prompt (recall gate
+    // included) reads the same tiers a text turn would.
     let affinity = match (AffinityRepo { pool: &state.pool })
         .load_or_create(session_id, user_id, instance_id)
         .await
     {
-        Ok(a) => a,
+        Ok(mut a) => {
+            a.apply_time_decay();
+            a.refresh_endpoints(&state.config.affinity_tuning);
+            a
+        }
         Err(e) => {
             tracing::warn!("image_edit text half: affinity load_or_create failed: {e}");
             return TextOutcome::default();
@@ -2160,6 +2166,62 @@ pattern = '\s*\[note:[^\]]*\]'
         assert!(
             chat.contains("新照片里换了条裙子"),
             "the new caption is hinted, prose-woven: {chat}"
+        );
+    }
+
+    /// The text half reads the pair's decayed affinity, as a chat turn does —
+    /// the recall gate and every affinity-driven prompt line see the same
+    /// tiers. Stored tension 0.7, idle sixty days (0.005/day) ⇒ 0.4: the
+    /// `tension > 0.5` mood line must be gone.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_text_half_reads_decayed_affinity(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let (_, mid) = seed_image_turn(&pool, session_id).await;
+        seed_affinity(&pool, session_id, user_id, instance_id).await;
+        sqlx::query(
+            "UPDATE engine.companion_affinity \
+             SET tension = 0.7, updated_at = now() - interval '60 days' \
+             WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mock = MockServer::start().await;
+        mount_editor_and_judge(&mock).await;
+        mount_companion(&mock).await;
+        let state = with_composer(test_state(pool.clone()), &mock.uri(), FULL_TURN_TOML);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let (status, body) = send_request(
+            &mut app,
+            edit_req(
+                session_id,
+                mid,
+                &token,
+                json!({"instruction": "换套衣服",
+                       "persist_instruction": true,
+                       "reply_with_text": 1.0}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        let chat = mock
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .find(|b| b.contains("you are a companion"))
+            .expect("a chat companion call was made");
+        assert!(
+            !chat.contains("带点小傲娇"),
+            "stored, undecayed tension leaked: {chat}"
         );
     }
 
