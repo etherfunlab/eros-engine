@@ -38,8 +38,10 @@ DECLARE
     v_persistence TEXT[] := ARRAY['stable', 'ongoing', 'transient', 'one_off', 'unknown'];
     v_confidence  TEXT[] := ARRAY['high', 'medium', 'low', 'unknown'];
 
-    -- What btrim strips: ASCII whitespace, no-break space, ideographic space.
-    v_ws TEXT := E' \t\r\n\f\v 　';
+    -- What btrim strips: space, tab, CR, LF, FF, VT, no-break space and
+    -- ideographic space. Built with chr() because the E'' escape for VT exists
+    -- only on the newest servers and elsewhere reads as the letter v.
+    v_ws TEXT := E' \t\r\n\f' || chr(11) || chr(160) || chr(12288);
 
     -- The example values the old profile-extraction schema showed the model.
     -- Models echoed them back as if they were the user's own facts, so a stored
@@ -144,7 +146,8 @@ BEGIN
     -- 2. seeds. The profile columns that survive into 2.0, one row per scalar
     -- column and per array item. The retired columns are not seeded, nor are the
     -- five columns 2.0 added: those are empty until a user's first rebuild.
-    -- Placeholder strings and the schema examples above carry no information.
+    -- Placeholder strings, unfilled template slots (`<...>`, `「<...>」`) and the
+    -- schema examples above carry no information.
     INSERT INTO engine.human_facts
         (user_id, content, category, domain, evidence_type, temporality, persistence,
          confidence, first_seen_at, last_seen_at)
@@ -174,6 +177,8 @@ BEGIN
      WHERE btrim(item.val, v_ws) <> ''
        AND lower(btrim(item.val, v_ws)) NOT IN ('string', 'null', 'unknown', 'n/a')
        AND btrim(item.val, v_ws) NOT IN ('未知', '无')
+       AND btrim(item.val, v_ws) NOT LIKE '<%>'
+       AND btrim(item.val, v_ws) NOT LIKE '「<%>」'
        AND btrim(item.val, v_ws) <> ALL (v_examples)
     ON CONFLICT (user_id, roleplay, content_hash) DO NOTHING;
     GET DIAGNOSTICS n = ROW_COUNT;

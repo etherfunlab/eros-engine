@@ -1598,10 +1598,10 @@ mod migration_tests {
         sqlx::query(
             "INSERT INTO engine.human_insights \
                (user_id, occupation, interests, city, finance_status, mbti_guess, \
-                life_rhythm, family, education, updated_at) \
+                life_rhythm, family, education, social_pattern, future_plans, updated_at) \
              VALUES ($1, '在深圳一家中厂做后端工程师，常年加班，最近想跳槽', \
-                     ARRAY['周末常去爬山', '养了只橘猫', '周末打篮球'], 'x', '未知', \
-                     'N/A', '   ', 'Unknown', '无', $2)",
+                     ARRAY['周末常去爬山', '养了只橘猫', '周末打篮球', '<兴趣>'], 'x', '未知', \
+                     'N/A', '   ', 'Unknown', '无', '「<待填>」', ' <待填> ', $2)",
         )
         .bind(user)
         .bind(at(5))
@@ -1832,25 +1832,55 @@ mod migration_tests {
         assert_eq!((row.occurrences, row.session_count), (1, 1));
     }
 
-    /// The SQL fold and `FactInput::from_json` must agree label for label.
+    /// The SQL fold and `FactInput::from_json` must agree label for label over
+    /// the whole vocabulary: every listed value, an unlisted one, a non-string,
+    /// a JSON null and a missing key, per label; plus the two retired domains.
+    /// `location_culture` is left out because the backfill drops it where
+    /// `from_json` folds it to `other`.
     #[sqlx::test(migrations = "./migrations")]
     async fn backfill_folds_labels_like_rust(pool: PgPool) {
+        use crate::human_fact::{
+            FactInput, CATEGORIES, CONFIDENCES, DOMAINS, EVIDENCE_TYPES, PERSISTENCES,
+            TEMPORALITIES,
+        };
+
         let user = Uuid::new_v4();
         profile_row(&pool, user).await;
-        let details = [
-            serde_json::json!({"content": "事实甲", "domain": "astrology", "category": "zodiac",
+        let base = |content: String| {
+            serde_json::json!({
+                "content": content, "category": "fact", "domain": "hobby",
                 "evidence_type": "explicit_statement", "temporality": "current",
-                "persistence": "stable"}),
-            serde_json::json!({"content": "事实乙", "domain": "politics", "category": "value",
-                "evidence_type": "explicit_agreement", "temporality": "sometime",
-                "persistence": "ongoing", "confidence": "certain"}),
-            serde_json::json!({"content": "事实丙", "domain": "religion", "category": "roleplay_tendency",
-                "evidence_type": "roleplay_expression", "temporality": "future",
-                "persistence": "transient", "confidence": "low"}),
-            serde_json::json!({"content": "事实丁", "domain": "kink", "category": "preference",
-                "evidence_type": "made_up", "temporality": "past",
-                "persistence": "one_off", "confidence": "medium"}),
-        ];
+                "persistence": "stable", "confidence": "high"
+            })
+        };
+        let mut details: Vec<serde_json::Value> = Vec::new();
+        for (key, vocabulary) in [
+            ("domain", DOMAINS),
+            ("category", CATEGORIES),
+            ("evidence_type", EVIDENCE_TYPES),
+            ("temporality", TEMPORALITIES),
+            ("persistence", PERSISTENCES),
+            ("confidence", CONFIDENCES),
+        ] {
+            let mut candidates: Vec<serde_json::Value> =
+                vocabulary.iter().map(|v| serde_json::json!(v)).collect();
+            candidates.extend([
+                serde_json::json!("bogus"),
+                serde_json::json!(5),
+                serde_json::Value::Null,
+            ]);
+            if key == "domain" {
+                candidates.extend([serde_json::json!("politics"), serde_json::json!("religion")]);
+            }
+            for (i, candidate) in candidates.into_iter().enumerate() {
+                let mut detail = base(format!("{key} 事实 {i}"));
+                detail[key] = candidate;
+                details.push(detail);
+            }
+            let mut detail = base(format!("{key} 事实 缺省"));
+            detail.as_object_mut().unwrap().remove(key);
+            details.push(detail);
+        }
         facts_event(
             &pool,
             user,
@@ -1864,9 +1894,9 @@ mod migration_tests {
         run_backfill(&pool).await;
 
         let rows = ledger(&pool, user).await;
-        assert_eq!(rows.len(), details.len());
+        assert_eq!(rows.len(), details.len(), "every detail is its own fact");
         for detail in &details {
-            let want = crate::human_fact::FactInput::from_json(detail).expect("valid fact");
+            let want = FactInput::from_json(detail).expect("valid fact");
             let got = rows
                 .iter()
                 .find(|r| r.content == want.content)
@@ -1888,10 +1918,47 @@ mod migration_tests {
                     want.persistence.as_str(),
                     want.confidence.as_str()
                 ),
-                "{}",
-                want.content
+                "{detail}"
             );
         }
+    }
+
+    /// Trimming strips whitespace only. Edge letters survive (`tv`, `vlog`, a
+    /// lone `v`), and tab, vertical tab and the wide spaces still go.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn backfill_trims_whitespace_not_letters(pool: PgPool) {
+        let user = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO engine.human_insights (user_id, occupation, interests) VALUES ($1, $2, $3)",
+        )
+        .bind(user)
+        .bind("\u{b}\u{3000}tv\u{a0}")
+        .bind(vec!["\tvlog\n".to_string(), "\u{b}v\u{b}".to_string(), "\u{b}".to_string()])
+        .execute(&pool)
+        .await
+        .expect("profile row");
+        facts_event(
+            &pool,
+            user,
+            Uuid::new_v4(),
+            (None, None),
+            1,
+            Some(serde_json::json!({"details": [{"content": "\u{b}vlog\u{3000}"}]})),
+        )
+        .await;
+
+        let report = run_backfill(&pool).await;
+        assert_eq!(counts(&report), [1, 3, 1]);
+
+        let mut contents: Vec<String> = ledger(&pool, user)
+            .await
+            .into_iter()
+            .map(|r| r.content)
+            .collect();
+        contents.sort();
+        let mut expected = ["vlog", "兴趣：vlog", "兴趣：v", "职业：tv"].map(String::from);
+        expected.sort();
+        assert_eq!(contents, expected);
     }
 
     /// 0058 left the audit pointers unvalidated, so old rows can name a
