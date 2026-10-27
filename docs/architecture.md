@@ -204,7 +204,7 @@ crates/
 │       ├── life_choices.rs   # LifeChoiceRepo (the persona's ask-for-space choice: rows, pending, resolve, slowdown window)
 │       ├── affinity.rs       # AffinityRepo (persist_with_event, record_ghost, persist_life_choice_drop_in_tx)
 │       ├── memory.rs         # MemoryRepo (Profile/Relationship layers)
-│       ├── insight.rs        # InsightEventRepo (companion_insights_events audit rows)
+│       ├── insight.rs        # InsightEventRepo (human_insights_events audit rows)
 │       ├── human_fact.rs     # HumanFactRepo (the user's fact ledger: dedup upsert, export keyset)
 │       ├── profile_state.rs  # ProfileStateRepo (rebuild counter, claim, outcomes)
 │       ├── erasure.rs        # ErasureRepo (user erase, deletion stream)

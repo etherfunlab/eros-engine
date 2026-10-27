@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! companion_insights_events audit storage (per-LLM-call rows for the insight
+//! human_insights_events audit storage (per-LLM-call rows for the insight
 //! extractor).
 
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// One `companion_insights_events` row to insert. `payload` is the
+/// One `human_insights_events` row to insert. `payload` is the
 /// `{"facts": [objects]}` object as the model emitted it (`stage='facts'`) or
 /// the model's profile object (`stage='profile'`), or `None` on a parse error.
 pub struct InsightEventInsert<'a> {
@@ -32,7 +32,7 @@ impl<'a> InsightEventRepo<'a> {
     /// the user's first human_insights row on an empty-facts run).
     pub async fn record(&self, ev: InsightEventInsert<'_>) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "INSERT INTO engine.companion_insights_events \
+            "INSERT INTO engine.human_insights_events \
                (run_id, user_id, session_id, message_id, stage, status, payload, \
                 generation_id) \
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
@@ -103,7 +103,7 @@ mod tests {
             Option<serde_json::Value>,
         )> = sqlx::query_as(
             "SELECT e.stage, e.status, e.generation_id, e.payload, g.usage \
-             FROM engine.companion_insights_events e \
+             FROM engine.human_insights_events e \
              LEFT JOIN engine.llm_generations g ON g.generation_id = e.generation_id \
              WHERE e.run_id = $1 ORDER BY e.stage",
         )
@@ -131,7 +131,7 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn migration_0025_creates_events_table_and_affinity_audit_cols(pool: PgPool) {
-        // companion_insights_events exists with every column. session_id and
+        // human_insights_events exists with every column. session_id and
         // message_id are FK-referenced since 0058, so they have to be real.
         let user_id = Uuid::new_v4();
         let session_id = crate::testutil::seed_chat_session(&pool, user_id).await;
@@ -139,7 +139,7 @@ mod tests {
         // ...and generation_id since 0060.
         crate::testutil::seed_generation(&pool, "g").await;
         sqlx::query(
-            "INSERT INTO engine.companion_insights_events \
+            "INSERT INTO engine.human_insights_events \
                (run_id, user_id, session_id, message_id, stage, status, payload, generation_id) \
              VALUES ($1,$2,$3,$4,'facts','ok','[]'::jsonb,'g')",
         )
@@ -149,9 +149,9 @@ mod tests {
         .bind(message_id)
         .execute(&pool)
         .await
-        .expect("insert into companion_insights_events");
+        .expect("insert into human_insights_events");
 
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM engine.companion_insights_events")
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM engine.human_insights_events")
             .fetch_one(&pool)
             .await
             .unwrap();

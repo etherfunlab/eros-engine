@@ -192,7 +192,7 @@ crates/
 │       ├── life_choices.rs   # LifeChoiceRepo（角色提出分开的选择：选择行、待回答、结算、放缓窗口）
 │       ├── affinity.rs       # AffinityRepo（persist_with_event、record_ghost、persist_life_choice_drop_in_tx）
 │       ├── memory.rs         # MemoryRepo（Profile / Relationship 兩層）
-│       ├── insight.rs        # InsightEventRepo（companion_insights_events 审计行）
+│       ├── insight.rs        # InsightEventRepo（human_insights_events 审计行）
 │       ├── human_fact.rs     # HumanFactRepo（用户的事实账本：去重写入、导出 keyset）
 │       ├── profile_state.rs  # ProfileStateRepo（重建计数器、认领、结果）
 │       ├── erasure.rs        # ErasureRepo（用户抹除、删除流）

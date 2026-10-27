@@ -90,7 +90,7 @@ struct Blank {
 /// generated summary is text.
 const BLANKS: &[Blank] = &[
     Blank {
-        table: "companion_insights_events",
+        table: "human_insights_events",
         clear: "payload = NULL",
         scope: BY_USER,
         carries_content: "payload IS NOT NULL",
@@ -262,7 +262,7 @@ mod tests {
     /// predicate that is true while the row still carries content).
     const KEPT_TABLES: &[(&str, &str, &str)] = &[
         (
-            "companion_insights_events",
+            "human_insights_events",
             "user_id = $1",
             "payload IS NOT NULL",
         ),
@@ -340,7 +340,7 @@ mod tests {
          SELECT gen_random_uuid(), p.i, 'extraction', 'ok', '{\"raw\":\"x\"}'",
         "INSERT INTO engine.character_insights_events (run_id, instance_id, stage, status, payload) \
          SELECT gen_random_uuid(), p.i, 'extraction', 'ok', '{\"raw\":\"x\"}'",
-        "INSERT INTO engine.companion_insights_events (run_id, user_id, stage, status, payload) \
+        "INSERT INTO engine.human_insights_events (run_id, user_id, stage, status, payload) \
          SELECT gen_random_uuid(), p.u, 'facts', 'ok', '{\"facts\":[\"x\"]}'",
         "INSERT INTO engine.companion_decision_events (run_id, user_id, status, payload) \
          SELECT gen_random_uuid(), p.u, 'ok', '{\"action\":\"reply\"}'",

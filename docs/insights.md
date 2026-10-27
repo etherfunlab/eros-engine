@@ -2,9 +2,9 @@
 
 [English](insights.md) · [中文](insights.zh.md)
 
-The insights pipeline builds what the engine knows about the real user from conversation, in two layers. A **fact ledger** (`engine.human_facts`) records atomic facts the extraction call mines from each turn, one row per distinct fact with recurrence counters. A **profile** (`engine.human_insights`, one row per user) is derived from the ledger on a schedule, not per turn; the chat prompt, the voice opener, the profile route and the profile export read it. Every LLM call leaves an audit row in `engine.companion_insights_events`. A user's data can be erased in one call, and exports carry the erasure to downstream mirrors.
+The insights pipeline builds what the engine knows about the real user from conversation, in two layers. A **fact ledger** (`engine.human_facts`) records atomic facts the extraction call mines from each turn, one row per distinct fact with recurrence counters. A **profile** (`engine.human_insights`, one row per user) is derived from the ledger on a schedule, not per turn; the chat prompt, the voice opener, the profile route and the profile export read it. Every LLM call leaves an audit row in `engine.human_insights_events`. A user's data can be erased in one call, and exports carry the erasure to downstream mirrors.
 
-The per-relationship chains `character_insights` and `user_insights` are separate pipelines with their own tables; see [llm-audit.md](llm-audit.md#character-and-user-insights-experimental). Deployments upgrading from v2.3.1 or earlier find the previous two-call pipeline in [insights_legacy.md](insights_legacy.md) and the upgrade steps in [migrating/v2-4-0-insights-2-0.md](migrating/v2-4-0-insights-2-0.md).
+The per-relationship chains `character_insights` and `user_insights` are separate pipelines with their own tables; see [llm-audit.md](llm-audit.md#character-and-user-insights-experimental). Upgrade steps for deployments coming from v2.3.1 or earlier are in [migrating/v2-4-0-insights-2-0.md](migrating/v2-4-0-insights-2-0.md) and [migrating/v2-4-1-insights-cleanup.md](migrating/v2-4-1-insights-cleanup.md).
 
 ```
 user message + assistant message
@@ -124,7 +124,7 @@ The engine owns the vocabularies and validates every label against them. `conten
 | `ideology` | `TEXT` | Political, religious and social-values stance; hedged wording when inferred from behavior, never from who the user is. |
 | `mental_health` | `TEXT` | User self-report only, no diagnosis. |
 
-That is 19 fields (`education_level` and `education_status` count as two) plus `user_id` and `updated_at`. Unknown means absent: an empty field is `NULL` (or `[]`), never a stored placeholder. `city`, `location`, `hometown`, `nationality`, `preferred_gender`, `age_min` and `age_max` are retired: the engine no longer writes, renders or exports them, and the columns stay in the table unread until a later release drops them. A deployment that needs location, a gender preference or an age range for matching should collect it from the user directly.
+That is 19 fields (`education_level` and `education_status` count as two) plus `user_id` and `updated_at`. Unknown means absent: an empty field is `NULL` (or `[]`), never a stored placeholder. The row has no geography, gender-preference or age-range columns (`city`, `location`, `hometown`, `nationality`, `preferred_gender`, `age_min`, `age_max`); a deployment that needs them for matching should collect them from the user directly.
 
 Indexes: GIN on `interests` and `personality_traits` and a btree on `(updated_at, user_id)` (the export keyset). Row-level security is enabled with no policy, and the `anon` and `authenticated` roles are revoked where they exist.
 
@@ -172,7 +172,7 @@ The model returns one JSON object with the fields above (the schema uses `<…>`
 
 Before writing, the engine projects the object onto the columns and drops what carries no information: a scalar must be a JSON string, an array keeps only its string items, and a value that is blank, `string`, `null`, `unknown`, `N/A` (any case), `未知`, `无`, or a `<…>` / `「<…>」` slot left unfilled is dropped. `education_level.level` and `.status` are each kept only when they are one of the codes in the table above. Wrong types and unknown keys are ignored.
 
-The write is a **full replace** of the 19 fields in one statement: a field the rebuild omits becomes empty, and `updated_at` moves, which is what moves the row through `GET /svc/v1/insights/changes`. The seven retired columns are not touched.
+The write is a **full replace** of the 19 fields in one statement: a field the rebuild omits becomes empty, and `updated_at` moves, which is what moves the row through `GET /svc/v1/insights/changes`.
 
 ### Outcomes
 
@@ -255,7 +255,7 @@ All streams are keyset-paged with `since`, a tie-break id, and `limit` (default 
 
 | Table | Cleared |
 |-------|---------|
-| `companion_insights_events` | `payload` |
+| `human_insights_events` | `payload` |
 | `companion_decision_events` | `payload` |
 | `chat_images_events` | `inputs`, `subject`, `caption`, `composed_prompt`, `last_failure` |
 | `chat_vision_events` | `vision`, `image_url`, `last_failure` |
@@ -276,7 +276,7 @@ A table added later that carries a user attribution joins the erase in the chang
 
 ## Audit
 
-Each LLM call that returned a response writes one row to `engine.companion_insights_events`, append-only.
+Each LLM call that returned a response writes one row to `engine.human_insights_events`, append-only.
 
 | Column | Meaning |
 |--------|---------|
@@ -303,7 +303,7 @@ Model and token usage are not on the event row. The extraction call is recorded 
 
 ```sql
 SELECT e.run_id, e.stage, e.status, g.task, g.model, g.usage
-FROM engine.companion_insights_events e
+FROM engine.human_insights_events e
 LEFT JOIN engine.llm_generations g ON g.generation_id = e.generation_id
 WHERE e.user_id = $1
 ORDER BY e.created_at DESC, e.stage;
@@ -336,7 +336,7 @@ The count (20) and the 600-second claim staleness are constants, not settings. S
 
 ## Operator notes
 
-- **The upgrade backfills the ledger and queues one rebuild per profile row.** The backfill migration reports its counts as a Postgres `NOTICE` of the form `insights_2_backfill: events=<n> seeds=<n> pending=<n>`. `events` is the number of ledger rows built from audit events; `seeds` is the number of rows seeded from current profile values (evidence type `legacy_profile`); `pending` is the number of users queued for a rebuild. Only users that currently have a profile row are touched, so a deployment with none backfills nothing.
+- **The upgrade backfills the ledger and queues one rebuild per profile row.** The backfill migration reports its counts as a Postgres `NOTICE` of the form `events=<n> seeds=<n> pending=<n>`. `events` is the number of ledger rows built from audit events; `seeds` is the number of rows seeded from current profile values (evidence type `legacy_profile`); `pending` is the number of users queued for a rebuild. Only users that currently have a profile row are touched, so a deployment with none backfills nothing.
 - **The rebuild drain costs one LLM call per queued user**, so expect `pending` calls after the deploy, drained by the idle sweeper at `PROFILE_REBUILD_BATCH` users per `PROFILE_REBUILD_TICK_SECS`. Until a user's first rebuild their previous profile row keeps serving injection. With the sweeper off, each queued user is rebuilt at their next extraction run, since the queue is seeded at the count threshold. Size `[tasks.profile_rebuild]` before the deploy: with extraction turned off and no `[tasks.profile_rebuild]` block, the drain runs on the global default model. `PROFILE_REBUILD_DISABLED=1` keeps the drain from running, and with extraction off nothing else triggers a rebuild.
 - **Domain reclassification is the deployment's.** Backfilled rows keep the old `sexuality` and `health` domains; the split into `kink` and `mental_health` applies to new facts. The engine ships no reclassifier: an operator who wants old rows split runs an offline pass that updates `engine.human_facts.domain`, which needs nothing beyond `UPDATE` access. A relabel does not queue a rebuild; the corrected domains are read at the user's next rebuild. To queue one by hand, set `pending_facts` above 0 and `last_fact_at` older than the idle period on the user's `human_profile_state` row.
 - **A deployment that mirrors profiles, memories or facts must consume the deletion stream**, and call erase before deleting a user's sessions.
@@ -350,7 +350,7 @@ The count (20) and the 600-second claim staleness are constants, not settings. S
 - A ledger larger than the 16,000-character budget feeds each rebuild its top-ranked prefix.
 - A rebuild that returns nothing writable accepts its batch as a residual rather than retrying.
 - There is no per-fact deletion; erasure is per user.
-- No code path prunes `engine.human_insights_snapshot` or `engine.companion_insights_events`.
+- No code path prunes `engine.human_insights_snapshot` or `engine.human_insights_events`.
 
 ## Source
 
@@ -368,6 +368,6 @@ The count (20) and the 600-second claim staleness are constants, not settings. S
 - `crates/eros-engine-server/src/routes/svc.rs` — the three `/svc/v1/*` sub-trees; `routes/mod.rs` mounts each under its secret
 - `crates/eros-engine-server/src/routes/companion.rs` — `GET /comp/user/{user_id}/profile`
 - `crates/eros-engine-llm/src/model_config.rs` — `resolve_insight_extract`, `resolve_profile_rebuild`, `validate_structuring_prompt_unset`
-- `crates/eros-engine-store/migrations/0079_human_facts.sql`, `0080_human_facts_backfill.sql`
+- `crates/eros-engine-store/migrations/0079_human_facts.sql`, `0080_human_facts_backfill.sql`, `0081_insights_2_cleanup.sql`
 - `examples/model_config.toml` — `[tasks.insight_extraction]` and `[tasks.profile_rebuild]`
 - Design: [2026-10-26-insights-2-fact-ledger-design.md](superpowers/specs/2026-10-26-insights-2-fact-ledger-design.md)

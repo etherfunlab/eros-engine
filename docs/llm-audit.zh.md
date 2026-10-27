@@ -226,7 +226,7 @@ provider 响应——所以一次降级的父行写入，连同这一轮客户�
 ### 外键
 
 **子表的 `generation_id` 列——`chat_messages`、`companion_affinity_events`、
-`companion_insights_events`、`companion_decision_events`、
+`human_insights_events`、`companion_decision_events`、
 `chat_images_events`、`chat_vision_events`、`character_insights_events`、
 `user_insights_events`——每一列都引用这张表**，一律 `ON DELETE SET NULL`，
 每一列都有索引。迁移 `0060` 加的，同一个文件里还做了历史数据回填。
@@ -309,7 +309,7 @@ material 会直接拒绝加载，而不是像以前那样在构造时 warn-and-d
   补全落在 `chat_messages.generation_id`（好感度评估镜像在
   `companion_affinity_events`，人类链每次 `insight_extraction` 和
   `profile_rebuild` 调用落在
-  `companion_insights_events`，实验性角色链的每次调用落在
+  `human_insights_events`，实验性角色链的每次调用落在
   `engine.character_insights_events`，实验性用户链的每次调用落在
   `engine.user_insights_events`（见下文"角色画像与用户画像"一节），每次 `pde_decision` judge 运行落在
   `companion_decision_events`，每次图片合成器调用落在
@@ -317,7 +317,7 @@ material 会直接拒绝加载，而不是像以前那样在构造时 warn-and-d
   `chat_vision_events`——详见下面的[图片链路事件表](#图片链路事件表)；
   `chat_messages.metadata.image` 仍保留现有的 `compose_*` 键，只是多加了一个
   指向 `chat_images_events` 的 `compose_event_id` 指针）——参见上面 `usage`
-  过滤那节。`profile` 阶段的 `companion_insights_events` payload 是模型原样返回的
+  过滤那节。`profile` 阶段的 `human_insights_events` payload 是模型原样返回的
   JSON 对象，所以可能出现类型化 `human_insights` 表从不落库的 key：LLM 吐出的
   任何 schema 之外的 key 会进事件 payload，但不会落在其它任何地方——事件与
   存储之间做对账时，要按 payload key 与 `human_insights` 列集合的交集比较，
@@ -527,7 +527,7 @@ OpenRouter 调用落一行：
 - **同一次抽取的两行共享同一个 `run_id`**——抽取调用和它喂给的结构化调用不
   需要经过 `session_id`/`message_id` 就能直接关联。
 
-**`companion_insights_events.stage` 有自己的词汇。** 人类链每次抽取运行写一行
+**`human_insights_events.stage` 有自己的词汇。** 人类链每次抽取运行写一行
 `stage = 'facts'`，每次画像重建写一行 `stage = 'profile'`，不是上面两张表的
 `'extraction'` / `'structuring'`；这张表是线上活表，下游消费方就是按这些取值在读。
 `stage = 'structured'` 的行是此前两次调用流水线留下的历史，现在没有任何东西再写它们。
@@ -552,7 +552,7 @@ OpenRouter 调用落一行：
 但有一个较短的 `AUDIT_WRITE_TIMEOUT` 兜底，出错或超时都会 `warn!` 一条日志
 然后丢弃——一次审计写入失败或卡住只是丢掉这一行事件，绝不影响这一轮对话
 （与 `companion_decision_events` 同样的纪律）。自迁移 0058 起，这两张表
-——连同 `companion_decision_events` 和 `companion_insights_events`——的
+——连同 `companion_decision_events` 和 `human_insights_events`——的
 `instance_id` / `session_id` / `message_id` 都带上了真正的外键，一律
 `ON DELETE SET NULL`，且一律 `NOT VALID` —— 约束对此后写入的每一行生效，
 迁移前就已经指向被删父行的少数几个 id 原样留着。一行仍然可以比它指向的东西

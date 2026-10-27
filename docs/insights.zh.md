@@ -2,9 +2,9 @@
 
 [English](insights.md) · [中文](insights.zh.md)
 
-洞察流水线从对话里建立引擎对真人用户的了解，分两层。**事实账本**（`engine.human_facts`）记录抽取调用从每一轮挖出的原子事实，每条不同的事实一行，附复现计数器。**画像**（`engine.human_insights`，每个用户一行）按计划从账本派生，不是逐轮更新；聊天 prompt、语音开场、画像端点和画像导出都读它。每次 LLM 调用都在 `engine.companion_insights_events` 留一行审计。用户的数据可以一次调用抹除，导出会把抹除传达给下游镜像。
+洞察流水线从对话里建立引擎对真人用户的了解，分两层。**事实账本**（`engine.human_facts`）记录抽取调用从每一轮挖出的原子事实，每条不同的事实一行，附复现计数器。**画像**（`engine.human_insights`，每个用户一行）按计划从账本派生，不是逐轮更新；聊天 prompt、语音开场、画像端点和画像导出都读它。每次 LLM 调用都在 `engine.human_insights_events` 留一行审计。用户的数据可以一次调用抹除，导出会把抹除传达给下游镜像。
 
-按关系分开的 `character_insights` 与 `user_insights` 两条链是另外的流水线，各有自己的表，见 [llm-audit.zh.md](llm-audit.zh.md#角色画像与用户画像实验特性)。从 v2.3.1 或更早版本升级的部署，可在 [insights_legacy.md](insights_legacy.md)（仅英文）找到此前的两次调用流水线，升级步骤见 [migrating/v2-4-0-insights-2-0.md](migrating/v2-4-0-insights-2-0.md)。
+按关系分开的 `character_insights` 与 `user_insights` 两条链是另外的流水线，各有自己的表，见 [llm-audit.zh.md](llm-audit.zh.md#角色画像与用户画像实验特性)。从 v2.3.1 或更早版本升级的部署，升级步骤见 [migrating/v2-4-0-insights-2-0.md](migrating/v2-4-0-insights-2-0.md) 与 [migrating/v2-4-1-insights-cleanup.md](migrating/v2-4-1-insights-cleanup.md)（仅英文）。
 
 ```
 用户消息 + 助手消息
@@ -124,7 +124,7 @@ AI:   {assistant message}
 | `ideology` | `TEXT` | 政治、宗教与社会价值立场；依据行为推断时措辞留有余地，绝不依据用户是谁。 |
 | `mental_health` | `TEXT` | 仅限用户自述，不做诊断。 |
 
-共 19 个字段（`education_level` 与 `education_status` 算两个），外加 `user_id` 和 `updated_at`。未知即缺省：空字段是 `NULL`（或 `[]`），从不存占位值。`city`、`location`、`hometown`、`nationality`、`preferred_gender`、`age_min`、`age_max` 已退役：引擎不再写、不再渲染、不再导出它们，这几列留在表里无人读取，直到后续版本删掉。需要位置、性别偏好或年龄范围来做匹配的部署，应直接向用户收集。
+共 19 个字段（`education_level` 与 `education_status` 算两个），外加 `user_id` 和 `updated_at`。未知即缺省：空字段是 `NULL`（或 `[]`），从不存占位值。该行没有地理、性别偏好和年龄范围的列（`city`、`location`、`hometown`、`nationality`、`preferred_gender`、`age_min`、`age_max`）；需要它们来做匹配的部署，应直接向用户收集。
 
 索引：`interests` 和 `personality_traits` 上的 GIN，以及 `(updated_at, user_id)` 上的 btree（导出的 keyset）。启用行级安全且不设 policy，`anon` 与 `authenticated` 角色（存在时）被撤销权限。
 
@@ -172,7 +172,7 @@ AI:   {assistant message}
 
 写入之前，引擎把对象投影到各列，丢掉不携带信息的内容：标量必须是 JSON 字符串，数组只保留其中的字符串项，空白、`string`、`null`、`unknown`、`N/A`（不分大小写）、`未知`、`无`，或没填的 `<…>` / `「<…>」` 槽位，都被丢弃。`education_level.level` 与 `.status` 各自只在是上表中的代码时才保留。类型不对的值和未知的键被忽略。
 
-写入是一条语句**整体替换** 19 个字段：重建里省略的字段变空，`updated_at` 随之移动，这正是该行出现在 `GET /svc/v1/insights/changes` 里的原因。七个已退役的列不被触碰。
+写入是一条语句**整体替换** 19 个字段：重建里省略的字段变空，`updated_at` 随之移动，这正是该行出现在 `GET /svc/v1/insights/changes` 里的原因。
 
 ### 结果
 
@@ -255,7 +255,7 @@ Off 什么都不读。渲染器只对非空白的值输出 bullet：
 
 | 表 | 清除的内容 |
 |----|-----------|
-| `companion_insights_events` | `payload` |
+| `human_insights_events` | `payload` |
 | `companion_decision_events` | `payload` |
 | `chat_images_events` | `inputs`、`subject`、`caption`、`composed_prompt`、`last_failure` |
 | `chat_vision_events` | `vision`、`image_url`、`last_failure` |
@@ -276,7 +276,7 @@ Off 什么都不读。渲染器只对非空白的值输出 bullet：
 
 ## 审计
 
-每次返回了响应的 LLM 调用都向 `engine.companion_insights_events` 写一行，只追加。
+每次返回了响应的 LLM 调用都向 `engine.human_insights_events` 写一行，只追加。
 
 | 列 | 含义 |
 |----|------|
@@ -303,7 +303,7 @@ Off 什么都不读。渲染器只对非空白的值输出 bullet：
 
 ```sql
 SELECT e.run_id, e.stage, e.status, g.task, g.model, g.usage
-FROM engine.companion_insights_events e
+FROM engine.human_insights_events e
 LEFT JOIN engine.llm_generations g ON g.generation_id = e.generation_id
 WHERE e.user_id = $1
 ORDER BY e.created_at DESC, e.stage;
@@ -336,7 +336,7 @@ ORDER BY e.created_at DESC, e.stage;
 
 ## 运维须知
 
-- **升级会回填账本，并为每个画像行排一次重建。** 回填迁移以 Postgres `NOTICE` 报告计数，形如 `insights_2_backfill: events=<n> seeds=<n> pending=<n>`。`events` 是由审计事件建出的账本行数；`seeds` 是由当前画像值播种的行数（证据类型 `legacy_profile`）；`pending` 是排队等重建的用户数。只有当前有画像行的用户会被处理，所以没有画像行的部署什么都不回填。
+- **升级会回填账本，并为每个画像行排一次重建。** 回填迁移以 Postgres `NOTICE` 报告计数，形如 `events=<n> seeds=<n> pending=<n>`。`events` 是由审计事件建出的账本行数；`seeds` 是由当前画像值播种的行数（证据类型 `legacy_profile`）；`pending` 是排队等重建的用户数。只有当前有画像行的用户会被处理，所以没有画像行的部署什么都不回填。
 - **重建排空的成本是每个排队用户一次 LLM 调用**，所以部署之后预计有 `pending` 次调用，由闲置清扫器按每 `PROFILE_REBUILD_TICK_SECS` 处理 `PROFILE_REBUILD_BATCH` 个用户的节奏排空。在用户首次重建之前，他原来的画像行继续服务注入。清扫器关闭时，每个排队用户会在他下一次抽取运行时被重建，因为队列是按计数阈值播下的。请在部署前为 `[tasks.profile_rebuild]` 定好规格：抽取已关闭且没有 `[tasks.profile_rebuild]` 块时，排空会跑在全局默认模型上。`PROFILE_REBUILD_DISABLED=1` 可以阻止排空运行，而抽取关闭时再没有别的东西会触发重建。
 - **领域重分类归部署负责。** 回填的行保留旧的 `sexuality` 与 `health` 领域；拆出 `kink` 与 `mental_health` 只作用于新事实。引擎不带重分类器：想把旧行拆开的运维方，自己跑一遍离线流程去更新 `engine.human_facts.domain`，除 `UPDATE` 权限外不需要别的。重新打标签不会排队重建；更正后的领域会在该用户下一次重建时被读到。要手动排一次，把该用户 `human_profile_state` 行的 `pending_facts` 设为大于 0，并把 `last_fact_at` 设成早于闲置时长。
 - **镜像画像、记忆或事实的部署必须消费删除流**，并且在删除用户的 session 之前先调用抹除。
@@ -350,7 +350,7 @@ ORDER BY e.created_at DESC, e.stage;
 - 账本超过 16,000 字符的预算时，每次重建只读它排名靠前的前缀。
 - 重建返回了没有可写内容的结果时，这批事实作为残余被接受，不会重试。
 - 没有逐条事实的删除；抹除以用户为单位。
-- 没有任何代码路径清理 `engine.human_insights_snapshot` 或 `engine.companion_insights_events`。
+- 没有任何代码路径清理 `engine.human_insights_snapshot` 或 `engine.human_insights_events`。
 
 ## 源码
 
@@ -368,6 +368,6 @@ ORDER BY e.created_at DESC, e.stage;
 - `crates/eros-engine-server/src/routes/svc.rs` —— 三棵 `/svc/v1/*` 子树；`routes/mod.rs` 按各自的 secret 挂载
 - `crates/eros-engine-server/src/routes/companion.rs` —— `GET /comp/user/{user_id}/profile`
 - `crates/eros-engine-llm/src/model_config.rs` —— `resolve_insight_extract`、`resolve_profile_rebuild`、`validate_structuring_prompt_unset`
-- `crates/eros-engine-store/migrations/0079_human_facts.sql`、`0080_human_facts_backfill.sql`
+- `crates/eros-engine-store/migrations/0079_human_facts.sql`、`0080_human_facts_backfill.sql`、`0081_insights_2_cleanup.sql`
 - `examples/model_config.toml` —— `[tasks.insight_extraction]` 与 `[tasks.profile_rebuild]`
 - 设计：[2026-10-26-insights-2-fact-ledger-design.md](superpowers/specs/2026-10-26-insights-2-fact-ledger-design.md)

@@ -567,7 +567,7 @@ mod tests {
                 .await
                 .unwrap();
         let events: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM engine.companion_insights_events WHERE user_id = $1",
+            "SELECT count(*) FROM engine.human_insights_events WHERE user_id = $1",
         )
         .bind(user)
         .fetch_one(&pool)
@@ -594,7 +594,7 @@ mod tests {
             Option<serde_json::Value>,
         ) = sqlx::query_as(
             "SELECT stage, status, session_id, message_id, payload \
-             FROM engine.companion_insights_events WHERE user_id = $1",
+             FROM engine.human_insights_events WHERE user_id = $1",
         )
         .bind(user)
         .fetch_one(&pool)
@@ -627,7 +627,7 @@ mod tests {
                 .unwrap();
         assert_eq!(occupation.as_deref(), Some("后端工程师"));
         let (status, payload): (String, Option<serde_json::Value>) = sqlx::query_as(
-            "SELECT status, payload FROM engine.companion_insights_events \
+            "SELECT status, payload FROM engine.human_insights_events \
              WHERE user_id = $1 AND stage = 'profile'",
         )
         .bind(user)
@@ -657,7 +657,7 @@ mod tests {
         assert_eq!(rebuild_user(&state, user).await, RebuildOutcome::Failed);
 
         let status: String = sqlx::query_scalar(
-            "SELECT status FROM engine.companion_insights_events \
+            "SELECT status FROM engine.human_insights_events \
              WHERE user_id = $1 AND stage = 'profile'",
         )
         .bind(user)
@@ -697,7 +697,7 @@ mod tests {
         assert_eq!(rebuild_user(&state, user).await, RebuildOutcome::Empty);
 
         let status: String = sqlx::query_scalar(
-            "SELECT status FROM engine.companion_insights_events \
+            "SELECT status FROM engine.human_insights_events \
              WHERE user_id = $1 AND stage = 'profile'",
         )
         .bind(user)
@@ -754,7 +754,7 @@ mod tests {
         assert_eq!(
             count(
                 &pool,
-                "SELECT count(*) FROM engine.companion_insights_events \
+                "SELECT count(*) FROM engine.human_insights_events \
                  WHERE user_id = $1 AND stage = 'profile'",
                 user
             )
