@@ -41,6 +41,8 @@ model = "provider/extract-model"
 model = "provider/extract-model"
 ```
 
+完整可用的拆分见 [`examples/model_config.d/`](../examples/model_config.d/)：把自带的 `examples/model_config.toml` 按子系统切成多个文件，每个子系统一个（`providers`、`chat`、`chat_vision`、`insights`、`character_insights`、`user_insights`、`memory`、`decision`、`affinity`、`group`、`world`、`embedding`）。两者是同一份配置，由测试保证一致。用 `MODEL_CONFIG_PATH= MODEL_CONFIG_DIR=examples/model_config.d` 运行。
+
 ## Schema
 
 ```toml

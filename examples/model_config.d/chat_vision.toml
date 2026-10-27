@@ -1,0 +1,143 @@
+# ── Image input (chat_vision) ────────────────────────────────────────────────
+# When a chat/stream turn carries an `image_url`, the image is described by a
+# vision model into a fixed JSON schema and the description is folded into the
+# user text the main chat model sees. The main chat model stays text-only.
+#
+# Feature is OFF unless this table exists with a non-blank filter_prompt.
+# The fixed schema is: { "description", "ocr_text", "people", "scene" }.
+# Pick a vision-capable model.
+#[tasks.chat_vision]
+#model        = "google/gemini-3.1-flash-lite"
+#fallback     = ["openai/gpt-5.1-mini"]
+#retry_depth  = 1
+#temperature  = 0.2
+#max_tokens   = 400
+#filter_prompt = """
+#你是图像识别助手。只输出 JSON，字段：
+#  "description": 画面/主体/正在发生什么（必填）
+#  "ocr_text":    图中文字；没有则空字符串
+#  "people":      是否有人物、表情/情绪；没有则空字符串
+#  "scene":       场景/地点/氛围；没有则空字符串
+#不要输出 JSON 以外的任何内容，不要代码围栏。
+#"""
+
+# ── Image-prompt composer (chat_image_prompt_compose) ───────────────────────
+# BREAKING (v0.10): this task is now REQUIRED for image turns. The PDE judge no
+# longer writes an image-prompt seed, so with no composer configured the engine
+# reports 可发图=否 and downgrades image actions to text.
+#
+# The composer's contract also changed: it now GENERATES from context (rather
+# than expanding a seed) and must return JSON with two fields —
+#   {"prompt": "<image-generation prompt>", "caption": "<one short line>"}
+# `caption` is what the chat history and the judge transcript read back; the
+# long prompt is never injected into either. A reply that is not JSON is used
+# as the prompt with no caption, so an old EXPAND-era filter_prompt still
+# produces images — but rewrite it, or you get no captions and a prompt aimed at
+# a seed that is now always empty.
+#
+# When this block is present, after an image action is decided the engine
+# generates one image prompt from turn context: it feeds the persona appearance
+# + current outfit + body state + recent scene + the partner's latest message + chosen aspect ratio + style to
+# this model and uses the result as the image subject. On a group image turn
+# with a companion, one more labeled section ([同框人物]) names the second
+# person in the picture; a custom prompt should depict both when it is present. Omit the block entirely
+# and image turns stay unavailable. Fail-open: on failure / timeout / empty
+# reply it falls back to an empty subject (a plain persona-appearance
+# portrait), so it never blocks the image turn (and never advances any
+# round-robin cursor on non-image turns).
+#
+# `filter_prompt` is OPTIONAL here (unlike the other tasks): omit it to use the
+# engine's built-in, product-identity-free GENERATE-FROM-CONTEXT default prompt,
+# or set it to override. The built-in generates faithfully from context and
+# never softens, downgrades, or refuses, and adds no moderation of its own —
+# content policy is the image provider's and the downstream consumer's
+# responsibility, not this step. Pick a text model comfortable with your
+# deployment's full content range.
+#
+# This task serves TWO callers with the same seven-slot payload and the same
+# filter_prompt contract: the chat stream's image turns, and the standalone
+# POST /persona/{instance_id}/image/compose endpoint (which also requires this
+# block — 501 without it, and on failure an HTTP error carrying the provider's
+# own status instead of the portrait fallback).
+#[tasks.chat_image_prompt_compose]
+#model        = "x-ai/grok-4"
+#fallback     = ["google/gemini-3.1-flash-lite"]
+#retry_depth  = 1
+#temperature  = 0.7
+#max_tokens   = 700
+#
+# This task's `filter_prompt` accepts VARIANTS. The consumer
+# picks one per chat turn via `image.prompt_variant` on the send-message body.
+# Three shapes:
+#
+#   filter_prompt = "…"                       # one prompt; prompt_variant is ignored
+#   filter_prompt = ["…", "…"]                # pick by index: prompt_variant = "0" / "1"
+#   filter_prompt = { a = "…", b = "…" }      # pick by key:   prompt_variant = "a" / "b"
+#
+# Composer prompts tend to be long/multi-paragraph, and TOML 1.0.0 discourages
+# breaking an inline table across lines — the keyed form also works as a
+# standard (non-inline) table, one key per section:
+#
+#   [tasks.chat_image_prompt_compose.filter_prompt]
+#   a = """
+#   …long prompt…
+#   """
+#   b = """
+#   …another long prompt…
+#   """
+#
+# Anything not selected falls back to the BUILT-IN prompt above. That covers
+# both an absent prompt_variant (silent — this is the common case, no LLM was
+# asked to pick anything) and an explicitly-supplied variant that fails to
+# match — an out-of-range index or an unknown key — which additionally logs a
+# warn (a supplied variant that goes unused is worth a human's attention).
+# There is no "first entry wins" and no reserved `default` key: writing
+# `default = "…"` defines an ordinary variant that is selected only by a
+# literal prompt_variant = "default".
+#
+# `prompt_variant = "raw"` (case-insensitive) carries NO special meaning now.
+# It selects a prompt only if this deployment configures a variant under that
+# literal key, exactly like any other variant name — `raw` is no longer
+# reserved and a table key named `raw` (any casing) boots fine. An unknown
+# index or key falls back to the BUILT-IN prompt above, same as any other miss
+# — never an error.
+#
+# Variants are honored on this task and [tasks.chat_image_edit_compose] only.
+# An array/table `filter_prompt` on any other task refuses to boot rather than
+# sit there unreachable. A [tasks.chat_image_prompt_compose.tiers.*] block
+# refuses to boot in ANY shape: the composer resolves with no tier, so the
+# whole block is unreachable.
+#filter_prompt = """
+#…your override here…
+#"""
+
+# ── Image-EDIT composer (chat_image_edit_compose) ───────────────────────────
+# Powers POST /v2/comp/session/{session_id}/message/{message_id}/image/edit:
+# the consumer names an existing image turn and an instruction ("换套衣服"),
+# and the engine composes a NEW image prompt from that picture's subject and
+# force-emits an image turn for it. Same JSON contract as the composer above
+# ({"prompt": …, "caption": …}) and the same variant rules for filter_prompt.
+#
+# This block is OPTIONAL EVEN FOR THE ENDPOINT. With it absent the edit
+# endpoint runs on [tasks.chat_image_prompt_compose]'s chain and parameters,
+# using the engine's built-in EDIT prompt — so configuring image turns is
+# enough to get edits. The chat composer's own filter_prompt is never reused
+# here: it is written to compose from conversation context, not to revise a
+# picture. With BOTH blocks absent the endpoint answers 501.
+#
+# Configure this block to give edits their own model or their own prompt —
+# worth doing once engine.chat_images_events (source = 'image_edit') shows how
+# often edits are asked for and how often the composer refuses.
+#[tasks.chat_image_edit_compose]
+#model        = "x-ai/grok-4"
+#fallback     = ["google/gemini-3.1-flash-lite"]
+#retry_depth  = 1
+#temperature  = 0.7
+#max_tokens   = 700
+#
+# `filter_prompt` accepts the same three shapes as the composer above (plain /
+# array-by-index / table-by-key), selected per request via `prompt_variant` on
+# the edit body, with the same "a miss falls back to the built-in" rule.
+#filter_prompt = """
+#…your override here…
+#"""

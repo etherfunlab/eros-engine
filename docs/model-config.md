@@ -41,6 +41,8 @@ model = "provider/extract-model"
 model = "provider/extract-model"
 ```
 
+A full working split is [`examples/model_config.d/`](../examples/model_config.d/): the bundled `examples/model_config.toml` cut into one file per subsystem (`providers`, `chat`, `chat_vision`, `insights`, `character_insights`, `user_insights`, `memory`, `decision`, `affinity`, `group`, `world`, `embedding`). It is the same config, and a test keeps the two equal. Run it with `MODEL_CONFIG_PATH= MODEL_CONFIG_DIR=examples/model_config.d`.
+
 ## Schema
 
 ```toml

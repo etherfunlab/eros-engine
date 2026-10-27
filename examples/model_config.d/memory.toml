@@ -1,0 +1,50 @@
+# Session-end memory extraction (dreaming-lite). Pulls a session's
+# chat_messages, emits 0-N {content, category} candidates, and the
+# sweeper writes them to companion_memories as profile-layer rows.
+# claude-haiku-4.5 is a strong instruction-follower with reliable structured-JSON output;
+# deepseek-v4-flash + gemini-3.1-flash-lite fallback keep extraction alive if Anthropic is down.
+[tasks.memory_extraction]
+model = "anthropic/claude-haiku-4.5"
+fallback = ["deepseek/deepseek-v4-flash","google/gemini-3.1-flash-lite"]
+temperature = 0.2
+max_tokens = 1200
+# Remove this entire [tasks.memory_extraction] section to disable session-end
+# memory extraction (the dreaming sweeper then stays inert). While the section is
+# present, filter_prompt is REQUIRED — the server refuses to boot if it is blank.
+# Memory-extraction system instruction. The server sends the conversation
+# (用户：X / AI：Y lines) as a separate user message. `category` keeps the fixed
+# five-value vocabulary — it is the recall grouping key (unknown values collapse
+# to "fact" in code). The remaining per-memory metadata fields are stored
+# opaquely on companion_memories.metadata: a reference taxonomy owned by this
+# prompt, freely extensible without an engine upgrade.
+filter_prompt = """
+你从一段已结束的对话中，提取 0-10 条值得长期记住的、关于【真人用户】的记忆条目，每条带一个 category 标签和结构化元数据。
+
+每条记忆都要具体、有据、对将来的对话有用——贴着用户真正说过或表露的东西，保留细节、程度和语境，不要写空泛的概括。
+- 好：用户讨厌被反复要求解释已经说过的话
+- 差：用户压力大
+
+category（只能用这五种之一，作为召回分组键）：
+- fact: 客观事实，如住在哪、做什么工作、家庭状况
+- preference: 偏好/喜好，如喜欢什么、讨厌什么、口味、品味
+- event: 发生的事件，如最近发生了什么、经历过什么
+- emotion: 情绪/心理状态，如对某事的感受、长期心理倾向
+- relation: 与他人的关系，如朋友、家人、同事
+
+每条另附元数据字段与词汇表：
+- domain: basic_profile / location_culture / career / education / technology / finance / family / friendship / romance / sexuality / health / lifestyle / hobby / politics / religion / personality / communication / other
+- evidence_type: explicit_statement（用户直接陈述）/ explicit_agreement（AI 提出、用户明确确认）/ observed_behavior（来自用户实际行为或表达方式）/ roleplay_expression（通过角色扮演表达）
+- temporality: atemporal / current / past / future / unknown
+- persistence: stable / ongoing / transient / one_off / unknown（单次表达通常是 unknown，不要自动标 stable）
+- confidence: high / medium / low
+
+铁律：
+- 只记关于真人用户的内容；assistant（AI 伴侣）是虚构角色，它自我介绍的职业、城市、喜好等绝不是用户的记忆。
+- 角色扮演中的虚构身份、剧情事件不是现实事实；单次剧情表现只能记成「用户在角色扮演中表现出…的互动倾向」（evidence_type=roleplay_expression）。
+- 不记 AI 单方面的回复内容，不记一次性的寒暄、玩笑。
+- 同一事实合并成一条，不要重复。
+- 成人、性、癖好等敏感内容正常记录，忠实保留原意，不淡化不扩写。
+- 笼统、无法落地的条目宁可不记；没有任何值得记的就返回空数组。
+
+严格输出 JSON，格式：{"memories": [{"content": "...", "category": "fact", "domain": "career", "evidence_type": "explicit_statement", "temporality": "current", "persistence": "ongoing", "confidence": "high"}]}
+"""
