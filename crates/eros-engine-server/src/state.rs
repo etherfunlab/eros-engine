@@ -280,6 +280,47 @@ pub(crate) fn parse_chat_queue_config(
     }
 }
 
+/// Knobs for the profile-rebuild sweeper, which flushes users whose ledger
+/// facts have sat unrebuilt for `idle`.
+#[derive(Clone, Debug)]
+pub struct ProfileRebuildConfig {
+    /// Sweep interval; `Duration::ZERO` keeps the sweeper from starting.
+    pub tick: Duration,
+    /// How long a user's last new fact must have sat before the sweeper rebuilds.
+    pub idle: Duration,
+    /// Age after which a rebuild claim is taken as a dead worker's and re-claimed.
+    pub claim_stale: Duration,
+    /// Users rebuilt per tick.
+    pub batch: i64,
+}
+
+/// Pure parser for the `PROFILE_REBUILD_*` env vars; unparseable values keep
+/// their defaults. A truthy `PROFILE_REBUILD_DISABLED` (or a zero tick) disables
+/// the sweeper; `batch` is clamped to at least 1 so a tick always makes progress.
+pub(crate) fn parse_profile_rebuild_config(
+    disabled: Option<&str>,
+    tick_secs: Option<&str>,
+    idle_secs: Option<&str>,
+    batch: Option<&str>,
+) -> ProfileRebuildConfig {
+    let secs = |raw: Option<&str>, default: u64| {
+        Duration::from_secs(raw.and_then(|v| v.parse().ok()).unwrap_or(default))
+    };
+    ProfileRebuildConfig {
+        tick: if parse_bool_flag(disabled) {
+            Duration::ZERO
+        } else {
+            secs(tick_secs, 300)
+        },
+        idle: secs(idle_secs, 3600),
+        claim_stale: Duration::from_secs(600),
+        batch: batch
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(20)
+            .max(1),
+    }
+}
+
 /// Per-user in-flight SSE stream counter. Used by the
 /// `send_message_stream` handler to enforce spec §1.9 (≤3 concurrent
 /// active streams per user, returning HTTP 429 over the cap).
@@ -524,6 +565,8 @@ pub struct ServerConfig {
     pub byoc: ByocConfig,
     /// Insights export admission (`INSIGHTS_EXPORT_SECRET`).
     pub insights_export: InsightsExportConfig,
+    /// Profile-rebuild idle-flush sweeper (`PROFILE_REBUILD_*` env vars).
+    pub profile_rebuild: ProfileRebuildConfig,
 }
 
 impl ServerConfig {
@@ -612,6 +655,12 @@ impl ServerConfig {
             insights_export: parse_insights_export_config(
                 std::env::var("INSIGHTS_EXPORT_SECRET").ok().as_deref(),
             )?,
+            profile_rebuild: parse_profile_rebuild_config(
+                std::env::var("PROFILE_REBUILD_DISABLED").ok().as_deref(),
+                std::env::var("PROFILE_REBUILD_TICK_SECS").ok().as_deref(),
+                std::env::var("PROFILE_REBUILD_IDLE_SECS").ok().as_deref(),
+                std::env::var("PROFILE_REBUILD_BATCH").ok().as_deref(),
+            ),
         })
     }
 }
@@ -1000,6 +1049,40 @@ mod tests {
     fn byok_config_debug_hides_the_secret() {
         let cfg = parse_byok_config(Some("THE-SECRET-VALUE-0123456789-abcdef"), None).unwrap();
         assert!(!format!("{cfg:?}").contains("THE-SECRET-VALUE"));
+    }
+
+    #[test]
+    fn parse_profile_rebuild_config_defaults_and_disabled() {
+        let d = parse_profile_rebuild_config(None, None, None, None);
+        assert_eq!(d.tick, Duration::from_secs(300));
+        assert_eq!(d.idle, Duration::from_secs(3600));
+        assert_eq!(d.claim_stale, Duration::from_secs(600));
+        assert_eq!(d.batch, 20);
+
+        for flag in ["1", "true"] {
+            let off = parse_profile_rebuild_config(Some(flag), Some("60"), None, None);
+            assert!(off.tick.is_zero(), "{flag} disables the sweeper");
+        }
+        let on = parse_profile_rebuild_config(Some("0"), Some("60"), None, None);
+        assert_eq!(on.tick, Duration::from_secs(60), "only 1/true disable");
+
+        let o = parse_profile_rebuild_config(None, Some("30"), Some("900"), Some("5"));
+        assert_eq!(
+            (o.tick, o.idle, o.batch),
+            (Duration::from_secs(30), Duration::from_secs(900), 5)
+        );
+        assert_eq!(o.claim_stale, Duration::from_secs(600), "not configurable");
+
+        let g = parse_profile_rebuild_config(None, Some("abc"), Some("-1"), Some("x"));
+        assert_eq!(
+            (g.tick, g.idle, g.batch),
+            (Duration::from_secs(300), Duration::from_secs(3600), 20),
+            "garbage keeps the defaults"
+        );
+        for raw in ["0", "-3"] {
+            let c = parse_profile_rebuild_config(None, None, None, Some(raw));
+            assert_eq!(c.batch, 1, "batch {raw} clamps to 1");
+        }
     }
 
     #[test]

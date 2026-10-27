@@ -1871,7 +1871,6 @@ pub fn memories_user_message(turns: &[String]) -> String {
 /// `PROFILE_REBUILD_SCHEMA`. The previous profile is deliberately not an
 /// input; the model's JSON replaces the row and is parsed by
 /// `human_insight::project_profile`.
-#[allow(dead_code)]
 pub fn profile_rebuild_prompt(ledger: &str) -> String {
     format!(
         "以下是【真人用户】的完整证据账本，按领域分组（## 领域）；每行是一条事实，\
