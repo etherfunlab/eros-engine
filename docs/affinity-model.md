@@ -379,6 +379,11 @@ moved (format in [Event rows](#event-rows)).
   bond) and the derived `patience` of the last three judged turns decide
   whether she asks for a break
   ([the choice](life-events-needs.md#the-ask-for-space-choice)).
+- The recall gate — the Bond and Chemistry tiers of the time-decayed row
+  decide which intimate 基础画像 fields and domain-tagged profile memories
+  reach the prompt, and how many memories each layer recalls; no row is tier 1
+  on both lines. Text, group, voice and the image-edit text half all read it
+  decayed ([memory-layers.md](memory-layers.md#affinity-gate)).
 - Ghost scoring —
   `score = (1−intrigue)·0.4 + (1−patience)·0.4 + tension·0.2`, with hard
   vetoes (first 10 messages, streak ≥ 2, 1 h cooldown) and threshold `0.65`

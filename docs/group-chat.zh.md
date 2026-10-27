@@ -80,6 +80,7 @@
 可选的 `mentions: [member_session_id]`（客户端 @ 用），以及可选的 `member_scopes`：以 `member_session_id`
 为键的对象，每个值是 `{memory_scope?, affinity_scope?}`，类型与 1:1 发送相同。每位发言人用自己那份；
 没给的成员，或份里缺的那个字段，走 engine 默认（`neutral_and_relationship`、`bond`），和以前每位发言人一样。
+在 scope 之内，每位发言人还会按自己和用户的亲密度再收窄（见[亲密度门控](memory-layers.zh.md#亲密度门控)）。
 这份映射不存储；1:1 发送给 scope 记什么，发言人那一行就记什么。
 
 ```json

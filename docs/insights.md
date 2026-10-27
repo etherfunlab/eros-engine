@@ -209,9 +209,24 @@ Off reads nothing. The renderer emits a bullet only for a non-blank value:
 
 A bullet is `{label}：{value}`, with array values joined by `、`. The order is fixed: `职业`, `教育`, `学历`, `MBTI`, `意识形态`, then the Full-only fields in the order of the table, then `作息`, `社交模式`, `性格特质`, `未来计划`. A failed read is logged and yields no bullets. See [memory-layers.md](memory-layers.md#retrieval-and-injection).
 
+**Affinity gate.** Under Full, each intimate field also has to clear the relationship's affinity: it reads one line and renders only from a minimum tier on that line (tiers 1–5 of the time-decayed affinity, see [affinity-model.md](affinity-model.md); a pair with no affinity row is tier 1 on both lines). The other line never unlocks it, so building friendship does not surface romance-side fields.
+
+| Field (label) | Line | From tier |
+|---------------|------|-----------|
+| `love_values` (`感情观`) | chemistry | 2 (flirtation) |
+| `relationship_history` (`感情经历`) | chemistry | 3 (crush) |
+| `kinks` (`性癖`) | chemistry | 4 (lover) |
+| `interests` (`兴趣`) | bond | 2 (friend) |
+| `emotional_needs` (`情感需求`) | bond | 3 (close_friend) |
+| `family` (`家庭`) | bond | 3 (close_friend) |
+| `finance_status` (`经济状况`) | bond | 4 (confidant) |
+| `mental_health` (`心理健康`) | bond | 4 (confidant) |
+
+The gate filters rendered bullets by their leading `{label}：`, and only ever removes: the neutral fields are never gated, and nothing outside `memory_scope` is added. The same table routes profile-layer memories by domain ([memory-layers.md](memory-layers.md#affinity-gate)).
+
 ### Voice
 
-On a voice session's first turn the bootstrap snapshot renders the same bullets with the same function, under `[关于他]`. The tier comes from that first turn's `memory_scope` (Neutral when omitted), and the snapshot is frozen into `chat_sessions.metadata.voice_bootstrap`, so later changes to the row do not reach that call. A failed read is not swallowed: the snapshot is not frozen and the next turn retries. See [memory-layers.md](memory-layers.md#voice-turns).
+On a voice session's first turn the bootstrap snapshot renders the same bullets with the same function, under `[关于他]`. The tier comes from that first turn's `memory_scope` (Neutral when omitted), and the snapshot is frozen into `chat_sessions.metadata.voice_bootstrap`, so later changes to the row do not reach that call. Each turn passes the frozen bullets through the affinity gate above with that turn's tiers, so the stored marker never changes but what reaches the prompt follows the pair's affinity. A failed read is not swallowed: the snapshot is not frozen and the next turn retries. See [memory-layers.md](memory-layers.md#voice-turns).
 
 ### Profile route
 

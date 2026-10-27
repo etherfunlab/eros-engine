@@ -298,6 +298,8 @@ values:
 
 The neutral profile is 职业, 教育, 学历, MBTI, 意识形态, 作息, 社交模式, 性格特质 and 未来计划. The full profile adds 感情观, 感情经历, 兴趣, 情感需求, 家庭, 经济状况, 性癖 and 心理健康. See [Insights](insights.md#chat-prompt).
 
+`memory_scope` is a ceiling. Within it, the relationship's affinity narrows what is injected: each intimate field needs a tier on its own affinity line, and how many profile-layer and relationship memories are recalled grows with the higher tier. A new relationship gets the neutral profile and one relationship memory. See [Memory layers → Affinity gate](memory-layers.md#affinity-gate).
+
 > **Important (#40 mitigation):** The default `neutral_and_relationship` is
 > intentionally narrower than the pre-#40 behavior (which injected everything).
 > Omitting `memory_scope` is **not** equivalent to the old behavior — it
@@ -1534,11 +1536,13 @@ last 8 messages rendered as a transcript, plus a `[身体状态]` block, the
 lingering effects of the text session the call reads its relationship line
 from and the persona's needs at the call's start. The call keeps that state and does not advance it. The four parts
 degrade independently and silently — a failed assembly leaves the marker unwritten
-so the next turn retries.
+so the next turn retries. Each turn filters the `[关于他]` bullets through the
+[affinity gate](memory-layers.md#affinity-gate) with that turn's tiers.
 
 **Per-turn recall** (every turn, read-only): a small vector-search pass over
 the same `companion_memories` layers the chat path uses, gated by
-`memory_scope` and budgeted at 300 ms — a timeout or search failure just
+`memory_scope` and the [affinity gate](memory-layers.md#affinity-gate), and
+budgeted at 300 ms — a timeout or search failure just
 drops the block for that turn, never an error. An utterance under 4
 alphanumeric characters after stripping whitespace/punctuation (嗯 / 好啊 /
 哈哈-style backchannels) skips recall entirely, with no embedding call.
