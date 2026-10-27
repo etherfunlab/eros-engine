@@ -174,15 +174,41 @@ impl<'a> HumanInsightRepo<'a> {
         user_id: Uuid,
         c: &ProjectedColumns,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query(
+        self.write_profile(user_id, c, false).await?;
+        Ok(())
+    }
+
+    /// `replace_profile` for a writer that holds the user's rebuild claim: the
+    /// row is written only while `human_profile_state` still has a claimed row
+    /// for the user. A user erased while the rebuild was running has no state
+    /// row left, so the write is refused instead of re-creating a profile the
+    /// erasure just removed. Returns whether the profile was written.
+    pub async fn replace_profile_if_claimed(
+        &self,
+        user_id: Uuid,
+        c: &ProjectedColumns,
+    ) -> Result<bool, sqlx::Error> {
+        Ok(self.write_profile(user_id, c, true).await? > 0)
+    }
+
+    async fn write_profile(
+        &self,
+        user_id: Uuid,
+        c: &ProjectedColumns,
+        require_claim: bool,
+    ) -> Result<u64, sqlx::Error> {
+        let res = sqlx::query(
             "INSERT INTO engine.human_insights \
                 (user_id, occupation, mbti_guess, love_values, emotional_needs, \
                  life_rhythm, interests, personality_traits, deal_breakers, education, \
                  education_level, education_status, family, relationship_history, \
                  social_pattern, future_plans, finance_status, kinks, ideology, \
                  mental_health) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
-                     $16, $17, $18, $19, $20) \
+             SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
+                    $16, $17, $18, $19, $20 \
+             WHERE NOT $21 OR EXISTS ( \
+                 SELECT 1 FROM engine.human_profile_state \
+                 WHERE user_id = $1 AND claimed_at IS NOT NULL) \
              ON CONFLICT (user_id) DO UPDATE SET \
                  occupation           = EXCLUDED.occupation, \
                  mbti_guess           = EXCLUDED.mbti_guess, \
@@ -225,9 +251,10 @@ impl<'a> HumanInsightRepo<'a> {
         .bind(&c.kinks)
         .bind(&c.ideology)
         .bind(&c.mental_health)
+        .bind(require_claim)
         .execute(self.pool)
         .await?;
-        Ok(())
+        Ok(res.rows_affected())
     }
 
     /// Rows changed strictly after the `(since, after_user)` keyset tuple, in
@@ -495,6 +522,72 @@ mod tests {
         assert_eq!(second.ideology, None);
         assert_eq!(second.mental_health, None);
         assert!(second.updated_at > first.updated_at, "updated_at advances");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn replace_profile_if_claimed_refuses_once_the_claim_is_gone(pool: PgPool) {
+        use crate::human_fact::{FactInput, FactSource, HumanFactRepo};
+        use crate::profile_state::ProfileStateRepo;
+
+        let repo = HumanInsightRepo { pool: &pool };
+        let state = ProfileStateRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let cols = project_profile(&serde_json::json!({ "occupation": "设计师" }));
+        let stale = std::time::Duration::from_secs(600);
+
+        HumanFactRepo { pool: &pool }
+            .upsert_run(
+                user_id,
+                &[FactInput::from_json(&serde_json::json!({ "content": "是设计师" })).unwrap()],
+                &FactSource {
+                    session_id: None,
+                    message_id: None,
+                    run_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        state.bump(user_id, 1).await.unwrap();
+
+        // A state row nobody has claimed is not a rebuild in flight.
+        assert!(!repo
+            .replace_profile_if_claimed(user_id, &cols)
+            .await
+            .unwrap());
+        assert!(repo.load(user_id).await.unwrap().is_none());
+
+        assert!(state.claim(user_id, stale).await.unwrap());
+        assert!(repo
+            .replace_profile_if_claimed(user_id, &cols)
+            .await
+            .unwrap());
+        assert_eq!(
+            repo.load(user_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .occupation
+                .as_deref(),
+            Some("设计师")
+        );
+
+        // The erase removes the profile and the state row while a rebuild still
+        // holds its reply: the late write must not bring the profile back.
+        sqlx::query("DELETE FROM engine.human_insights WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM engine.human_profile_state WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(!repo
+            .replace_profile_if_claimed(user_id, &cols)
+            .await
+            .unwrap());
+        assert!(repo.load(user_id).await.unwrap().is_none());
     }
 
     #[sqlx::test(migrations = "./migrations")]

@@ -92,12 +92,13 @@ pub struct FactInput {
 
 impl FactInput {
     /// Parse one element of the extractor's fact array. `None` when it is not
-    /// an object or its `content` is blank; a missing or unlisted label folds
-    /// to `other` (category, domain) or `unknown`, never rejects the fact.
+    /// an object or its `content` is blank or a placeholder such as `未知` or an
+    /// echoed `<…>` template slot; a missing or unlisted label folds to `other`
+    /// (category, domain) or `unknown`, never rejects the fact.
     pub fn from_json(v: &serde_json::Value) -> Option<FactInput> {
         let obj = v.as_object()?;
         let content = obj.get("content")?.as_str()?.trim();
-        if content.is_empty() {
+        if content.is_empty() || crate::human_insight::is_placeholder(content) {
             return None;
         }
         let label = |key: &str| obj.get(key).and_then(|x| x.as_str());
@@ -113,14 +114,13 @@ impl FactInput {
     }
 }
 
-/// Where and when one extraction run saw its facts. Each id is `None` when the
-/// run has no such anchor; a deleted session or message nulls the stored pointer.
+/// Where one extraction run saw its facts. Each id is `None` when the run has
+/// no such anchor; a deleted session or message nulls the stored pointer.
 #[derive(Debug, Clone)]
 pub struct FactSource {
     pub session_id: Option<Uuid>,
     pub message_id: Option<Uuid>,
     pub run_id: Option<Uuid>,
-    pub seen_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -191,6 +191,12 @@ impl HumanFactRepo<'_> {
     /// same function the dedup index hashes, so the batch and the index cannot
     /// disagree. One statement means a failed run changes nothing, so a retry
     /// cannot count a fact twice.
+    ///
+    /// `first_seen_at` / `last_seen_at` are the database clock at the write, not
+    /// the time the run started: the export keyset orders on `last_seen_at`, so a
+    /// stamp older than the commit would let a consumer that already advanced
+    /// past it skip the row for good. A recurrence never moves `last_seen_at`
+    /// backwards.
     pub async fn upsert_run(
         &self,
         user_id: Uuid,
@@ -215,7 +221,7 @@ impl HumanFactRepo<'_> {
                  first_session_id, first_message_id, first_run_id, \
                  last_session_id, last_message_id, last_run_id) \
              SELECT $1, content, category, domain, evidence_type, temporality, \
-                    persistence, confidence, $9, $9, $10, $11, $12, $10, $11, $12 \
+                    persistence, confidence, now(), now(), $9, $10, $11, $9, $10, $11 \
              FROM ( \
                  SELECT DISTINCT ON ((evidence_type = 'roleplay_expression'), \
                                      md5(engine.fact_norm(content))) \
@@ -233,7 +239,7 @@ impl HumanFactRepo<'_> {
                 session_count   = human_facts.session_count + CASE \
                     WHEN human_facts.last_session_id IS DISTINCT FROM EXCLUDED.last_session_id \
                     THEN 1 ELSE 0 END, \
-                last_seen_at    = EXCLUDED.last_seen_at, \
+                last_seen_at    = GREATEST(human_facts.last_seen_at, now()), \
                 last_session_id = EXCLUDED.last_session_id, \
                 last_message_id = EXCLUDED.last_message_id, \
                 last_run_id     = EXCLUDED.last_run_id",
@@ -246,7 +252,6 @@ impl HumanFactRepo<'_> {
         .bind(&temporalities)
         .bind(&persistences)
         .bind(&confidences)
-        .bind(src.seen_at)
         .bind(src.session_id)
         .bind(src.message_id)
         .bind(src.run_id)
@@ -310,17 +315,24 @@ mod tests {
         }
     }
 
-    fn src(
-        session_id: Option<Uuid>,
-        message_id: Option<Uuid>,
-        run_id: Option<Uuid>,
-        secs: i64,
-    ) -> FactSource {
+    fn src(session_id: Option<Uuid>, message_id: Option<Uuid>, run_id: Option<Uuid>) -> FactSource {
         FactSource {
             session_id,
             message_id,
             run_id,
-            seen_at: at(secs),
+        }
+    }
+
+    /// A ledger stamp is the database clock at the write: close to now, and
+    /// `first_seen_at` never after `last_seen_at`.
+    fn assert_stamped_now(r: &HumanFactRow) {
+        let now = Utc::now();
+        assert!(r.first_seen_at <= r.last_seen_at, "{r:?}");
+        for t in [r.first_seen_at, r.last_seen_at] {
+            assert!(
+                (now - t).num_seconds().abs() < 30,
+                "{t} is not a write-time stamp (now {now})"
+            );
         }
     }
 
@@ -392,6 +404,12 @@ mod tests {
         assert!(FactInput::from_json(&serde_json::json!({ "content": 7 })).is_none());
         assert!(FactInput::from_json(&serde_json::json!("用户喜欢爬山")).is_none());
         assert!(FactInput::from_json(&serde_json::json!(["a"])).is_none());
+        for slot in ["<用户事实>", "未知", "string"] {
+            assert!(
+                FactInput::from_json(&serde_json::json!({ "content": slot })).is_none(),
+                "{slot:?} is a placeholder, not a fact"
+            );
+        }
     }
 
     #[test]
@@ -424,16 +442,20 @@ mod tests {
             .upsert_run(
                 user,
                 &[fact("用户喜欢爬山。", "explicit_statement", "stable")],
-                &src(Some(s1), Some(m1), Some(r1), 0),
+                &src(Some(s1), Some(m1), Some(r1)),
             )
             .await
             .unwrap();
         assert_eq!(n, 1);
+        let before = repo.list_for_user(user).await.unwrap().remove(0);
+        assert_stamped_now(&before);
+        assert_eq!(before.first_seen_at, before.last_seen_at);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let n = repo
             .upsert_run(
                 user,
                 &[fact("用户喜欢爬山", "explicit_statement", "transient")],
-                &src(Some(s2), Some(m2), Some(r2), 60),
+                &src(Some(s2), Some(m2), Some(r2)),
             )
             .await
             .unwrap();
@@ -446,8 +468,15 @@ mod tests {
         assert_eq!(r.persistence, "stable", "first occurrence's labels win");
         assert_eq!(r.occurrences, 2);
         assert_eq!(r.session_count, 2);
-        assert_eq!(r.first_seen_at, at(0));
-        assert_eq!(r.last_seen_at, at(60));
+        assert_stamped_now(r);
+        assert_eq!(
+            r.first_seen_at, before.first_seen_at,
+            "a recurrence keeps first_seen_at"
+        );
+        assert!(
+            r.last_seen_at > before.last_seen_at,
+            "a recurrence moves last_seen_at forward to the write"
+        );
         assert_eq!(r.recurrence(), Recurrence::RepeatedAcrossSessions);
 
         #[allow(clippy::type_complexity)]
@@ -479,16 +508,45 @@ mod tests {
         let user = Uuid::new_v4();
         let s1 = crate::testutil::seed_chat_session(&pool, user).await;
         let f = [fact("用户养了一只猫", "explicit_statement", "stable")];
-        repo.upsert_run(user, &f, &src(Some(s1), None, None, 0))
+        repo.upsert_run(user, &f, &src(Some(s1), None, None))
             .await
             .unwrap();
-        repo.upsert_run(user, &f, &src(Some(s1), None, None, 30))
+        repo.upsert_run(user, &f, &src(Some(s1), None, None))
             .await
             .unwrap();
         let rows = repo.list_for_user(user).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!((rows[0].occurrences, rows[0].session_count), (2, 1));
         assert_eq!(rows[0].recurrence(), Recurrence::RepeatedInSession);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn upsert_stamps_at_write_time_and_never_moves_last_seen_backwards(pool: PgPool) {
+        let repo = HumanFactRepo { pool: &pool };
+        let user = Uuid::new_v4();
+        let f = [fact("用户养了一只猫", "explicit_statement", "stable")];
+        repo.upsert_run(user, &f, &src(None, None, None))
+            .await
+            .unwrap();
+        let first = repo.list_for_user(user).await.unwrap().remove(0);
+        assert_stamped_now(&first);
+
+        // A row stamped ahead of the database clock (a backfilled or skewed
+        // value) keeps its later stamp when the fact recurs.
+        let ahead = first.last_seen_at + chrono::Duration::days(1);
+        sqlx::query("UPDATE engine.human_facts SET last_seen_at = $1 WHERE id = $2")
+            .bind(ahead)
+            .bind(first.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        repo.upsert_run(user, &f, &src(None, None, None))
+            .await
+            .unwrap();
+        let again = repo.list_for_user(user).await.unwrap().remove(0);
+        assert_eq!(again.occurrences, 2);
+        assert_eq!(again.last_seen_at, ahead);
+        assert_eq!(again.first_seen_at, first.first_seen_at);
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -501,7 +559,7 @@ mod tests {
             fact("用户很喜欢爬山", "explicit_statement", "stable"),
         ];
         let n = repo
-            .upsert_run(user, &facts, &src(None, None, None, 0))
+            .upsert_run(user, &facts, &src(None, None, None))
             .await
             .unwrap();
         assert_eq!(n, 3);
@@ -519,14 +577,14 @@ mod tests {
                 fact("用户是一名医生", "roleplay_expression", "one_off"),
                 fact("用户是一名医生", "explicit_statement", "stable"),
             ],
-            &src(None, None, None, 0),
+            &src(None, None, None),
         )
         .await
         .unwrap();
         repo.upsert_run(
             user,
             &[fact("用户是一名医生", "roleplay_expression", "one_off")],
-            &src(None, None, None, 60),
+            &src(None, None, None),
         )
         .await
         .unwrap();
@@ -554,7 +612,7 @@ mod tests {
                     fact("用户喜欢爬山", "explicit_statement", "stable"),
                     fact(" 用户喜欢爬山 ", "explicit_statement", "transient"),
                 ],
-                &src(None, None, None, 0),
+                &src(None, None, None),
             )
             .await
             .unwrap();
@@ -576,7 +634,7 @@ mod tests {
                     fact("用户喜欢爬山。", "explicit_statement", "stable"),
                     fact("用户喜欢爬山", "explicit_statement", "transient"),
                 ],
-                &src(None, None, None, 0),
+                &src(None, None, None),
             )
             .await
             .unwrap();
@@ -596,7 +654,7 @@ mod tests {
         repo.upsert_run(
             user,
             &[fact("用户喜欢爬山", "explicit_statement", "stable")],
-            &src(None, None, None, 0),
+            &src(None, None, None),
         )
         .await
         .unwrap();
@@ -608,7 +666,7 @@ mod tests {
                     fact("用户在深圳工作", "explicit_statement", "stable"),
                     fact("用户有一个妹妹", "explicit_statement", "stable"),
                 ],
-                &src(None, None, None, 60),
+                &src(None, None, None),
             )
             .await
             .unwrap();
@@ -624,7 +682,7 @@ mod tests {
         repo.upsert_run(
             user,
             &[fact("用户喜欢爬山", "explicit_statement", "stable")],
-            &src(Some(s), Some(m), Some(Uuid::new_v4()), 0),
+            &src(Some(s), Some(m), Some(Uuid::new_v4())),
         )
         .await
         .unwrap();
@@ -651,7 +709,8 @@ mod tests {
     async fn list_changes_keyset_pages_without_skip_or_repeat(pool: PgPool) {
         let repo = HumanFactRepo { pool: &pool };
         let user = Uuid::new_v4();
-        // One run, one seen_at: all three rows tie on last_seen_at.
+        // One statement, one database clock reading: all three rows tie on
+        // last_seen_at.
         repo.upsert_run(
             user,
             &[
@@ -659,7 +718,7 @@ mod tests {
                 fact("用户在深圳工作", "explicit_statement", "stable"),
                 fact("用户有一个妹妹", "explicit_statement", "stable"),
             ],
-            &src(None, None, None, 0),
+            &src(None, None, None),
         )
         .await
         .unwrap();

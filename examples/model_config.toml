@@ -505,7 +505,7 @@ content 表达规则：第三人称、以「用户」开头；保留原始信息
 - 不得为填充数组编造信息，不得重复表达同一事实。一次最多 12 条。没有新的用户事实时返回空数组。
 
 严格输出 JSON，且只能是以下结构。facts 是对象数组，每个对象含 content 与上述六个元数据字段，取值只能来自词汇表；没有事实时输出 {"facts":[]}。不得输出说明、Markdown、代码围栏或任何其他文本：
-{"facts":[{"content":"用户养了一只猫","category":"fact","domain":"lifestyle","evidence_type":"explicit_statement","temporality":"current","persistence":"ongoing","confidence":"high"}]}
+{"facts":[{"content":"<一条用户事实>","category":"fact","domain":"lifestyle","evidence_type":"explicit_statement","temporality":"current","persistence":"ongoing","confidence":"high"}]}
 """
 
 # Scheduled profile rebuild: reads the user's whole fact ledger (16,000-character

@@ -23,6 +23,10 @@ use crate::state::AppState;
 /// are left out so the prompt stays inside the model's context.
 pub const LEDGER_BUDGET_CHARS: usize = 16_000;
 pub const PROFILE_REBUILD_TASK: &str = "profile_rebuild";
+/// Sentinel OpenRouter `user` for rebuild calls, so their spend is attributable
+/// apart from the other background subsystems (dreaming `…111`, world `…112`,
+/// stories `…113`). Not a real auth UUID; cannot collide with a real user.
+pub(crate) const PROFILE_REBUILD_AUDIT_USER: &str = "11111111-1111-1111-1111-111111111114";
 
 /// What a rebuild did to the profile row.
 #[derive(Debug, PartialEq)]
@@ -111,9 +115,13 @@ pub(crate) fn render_ledger(rows: &[HumanFactRow], budget: usize) -> String {
 ///
 /// The caller already holds the claim (`ProfileStateRepo::claim` /
 /// `claim_due`): claiming is what keeps two workers off the same user, and
-/// this function only settles the state row once it is done.
+/// this function only settles the state row once it is done. A user erased
+/// while the rebuild ran has no claim left to settle, so nothing is written
+/// and the outcome is `Empty`.
 pub(crate) async fn rebuild_user(state: &AppState, user_id: Uuid) -> RebuildOutcome {
-    let outcome = rebuild(state, user_id).await;
+    let Some(outcome) = rebuild(state, user_id).await else {
+        return RebuildOutcome::Empty;
+    };
     let repo = ProfileStateRepo { pool: &state.pool };
     let released = match outcome {
         RebuildOutcome::Failed => repo.finish_failed(user_id).await,
@@ -126,7 +134,10 @@ pub(crate) async fn rebuild_user(state: &AppState, user_id: Uuid) -> RebuildOutc
     outcome
 }
 
-async fn rebuild(state: &AppState, user_id: Uuid) -> RebuildOutcome {
+/// `None` when the claim was gone before the profile write (see
+/// `HumanInsightRepo::replace_profile_if_claimed`): the state row is then no
+/// longer this rebuild's to settle.
+async fn rebuild(state: &AppState, user_id: Uuid) -> Option<RebuildOutcome> {
     let rows = match (HumanFactRepo { pool: &state.pool })
         .list_for_user(user_id)
         .await
@@ -134,13 +145,13 @@ async fn rebuild(state: &AppState, user_id: Uuid) -> RebuildOutcome {
         Ok(rows) => rows,
         Err(e) => {
             tracing::warn!(%user_id, "profile rebuild: ledger read failed: {e}");
-            return RebuildOutcome::Failed;
+            return Some(RebuildOutcome::Failed);
         }
     };
     // Without facts there is nothing to ask the model, and the counter that
     // brought the user here would otherwise trigger the same empty rebuild again.
     if rows.is_empty() {
-        return RebuildOutcome::Empty;
+        return Some(RebuildOutcome::Empty);
     }
 
     let resolved = state.model_config.resolve_profile_rebuild();
@@ -157,7 +168,7 @@ async fn rebuild(state: &AppState, user_id: Uuid) -> RebuildOutcome {
         temperature: resolved.temperature as f32,
         max_tokens: resolved.max_tokens,
         sampling: resolved.sampling,
-        user: None,
+        user: Some(PROFILE_REBUILD_AUDIT_USER.into()),
         task: Some(PROFILE_REBUILD_TASK.into()),
         ..Default::default()
     };
@@ -167,7 +178,7 @@ async fn rebuild(state: &AppState, user_id: Uuid) -> RebuildOutcome {
         Ok(resp) => resp,
         Err(e) => {
             tracing::warn!(%user_id, "profile rebuild: LLM call failed: {e}");
-            return RebuildOutcome::Failed;
+            return Some(RebuildOutcome::Failed);
         }
     };
     let generation_id = super::record_generation(
@@ -196,7 +207,7 @@ async fn rebuild(state: &AppState, user_id: Uuid) -> RebuildOutcome {
             generation_id,
         )
         .await;
-        return RebuildOutcome::Failed;
+        return Some(RebuildOutcome::Failed);
     };
 
     let columns = project_profile(&profile);
@@ -205,22 +216,34 @@ async fn rebuild(state: &AppState, user_id: Uuid) -> RebuildOutcome {
     // fresh count.
     if columns.is_empty() {
         write_profile_event(&state.pool, user_id, "empty", Some(profile), generation_id).await;
-        return RebuildOutcome::Empty;
+        return Some(RebuildOutcome::Empty);
     }
-    if let Err(e) = (HumanInsightRepo { pool: &state.pool })
-        .replace_profile(user_id, &columns)
+    match (HumanInsightRepo { pool: &state.pool })
+        .replace_profile_if_claimed(user_id, &columns)
         .await
     {
-        tracing::warn!(%user_id, "profile rebuild: profile write failed: {e}");
-        return RebuildOutcome::Failed;
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::info!(
+                %user_id,
+                "profile rebuild: claim gone before the write, profile not written"
+            );
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!(%user_id, "profile rebuild: profile write failed: {e}");
+            return Some(RebuildOutcome::Failed);
+        }
     }
     write_profile_event(&state.pool, user_id, "ok", Some(profile), generation_id).await;
-    RebuildOutcome::Ok
+    Some(RebuildOutcome::Ok)
 }
 
 /// Append one `profile`-stage audit row. The rebuild belongs to the user, not
-/// to a session or message, so both pointers stay empty. Fail-open: a lost
-/// audit row must not undo a rebuild.
+/// to a session or message, so both pointers stay empty. The payload is the
+/// model's object as returned, not the projected columns, so a value the
+/// projection dropped stays visible to an operator. Fail-open: a lost audit
+/// row must not undo a rebuild.
 async fn write_profile_event(
     pool: &sqlx::PgPool,
     user_id: Uuid,
@@ -276,25 +299,58 @@ pub async fn sweeper(state: AppState) {
         if claimed.is_empty() {
             continue;
         }
-        let (mut ok, mut empty, mut failed) = (0, 0, 0);
-        for user_id in &claimed {
-            match rebuild_user(&state, *user_id).await {
-                RebuildOutcome::Ok => ok += 1,
-                RebuildOutcome::Empty => empty += 1,
-                RebuildOutcome::Failed => failed += 1,
+        let (ok, empty, failed, skipped) = rebuild_claimed(&state, &claimed).await;
+        tracing::info!(ok, empty, failed, skipped, "profile rebuild: users swept");
+    }
+}
+
+/// Rebuild a claimed batch one user at a time and tally the outcomes as
+/// `(ok, empty, failed, skipped)`.
+///
+/// The whole batch was claimed at once, so a user late in the line would
+/// otherwise reach its turn with a claim older than the stale window and be
+/// rebuilt a second time by another instance. Each claim is therefore
+/// refreshed just before its rebuild. A user whose claim cannot be refreshed
+/// is skipped: the state row is gone (erased) or the claim was released, and
+/// either way no model call should be spent on it.
+async fn rebuild_claimed(state: &AppState, claimed: &[Uuid]) -> (u32, u32, u32, u32) {
+    let repo = ProfileStateRepo { pool: &state.pool };
+    let (mut ok, mut empty, mut failed, mut skipped) = (0, 0, 0, 0);
+    for user_id in claimed {
+        match repo.refresh_claim(*user_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                skipped += 1;
+                continue;
+            }
+            Err(e) => {
+                // The claim stays as it was and goes stale into a later sweep.
+                tracing::warn!(%user_id, "profile rebuild: refreshing the claim failed: {e}");
+                skipped += 1;
+                continue;
             }
         }
-        tracing::info!(ok, empty, failed, "profile rebuild: users swept");
+        match rebuild_user(state, *user_id).await {
+            RebuildOutcome::Ok => ok += 1,
+            RebuildOutcome::Empty => empty += 1,
+            RebuildOutcome::Failed => failed += 1,
+        }
     }
+    (ok, empty, failed, skipped)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::dreaming::SYSTEM_AUDIT_USER;
+    use super::super::story::STORY_AUDIT_USER;
+    use super::super::world::WORLD_AUDIT_USER;
     use super::*;
     use chrono::{TimeZone, Utc};
+    use eros_engine_store::erasure::ErasureRepo;
     use eros_engine_store::human_fact::{FactInput, FactSource, HumanFactRepo};
     use eros_engine_store::profile_state::ProfileStateRepo;
     use sqlx::PgPool;
+    use std::time::Duration;
     use wiremock::matchers::{method, path as wm_path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -409,7 +465,6 @@ mod tests {
             session_id: None,
             message_id: None,
             run_id: None,
-            seen_at: Utc::now(),
         };
         HumanFactRepo { pool }
             .upsert_run(user_id, &[fact], &src)
@@ -419,13 +474,26 @@ mod tests {
 
     /// A state whose single LLM call is answered with `reply` verbatim.
     async fn state_replying(pool: PgPool, reply: &str) -> (AppState, MockServer) {
+        state_replying_after(pool, reply, Duration::ZERO).await
+    }
+
+    /// Like `state_replying`, with the reply held back for `delay`.
+    async fn state_replying_after(
+        pool: PgPool,
+        reply: &str,
+        delay: Duration,
+    ) -> (AppState, MockServer) {
         let mock = MockServer::start().await;
         Mock::given(method("POST"))
             .and(wm_path("/api/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "gen-profile", "model": "p/m",
-                "choices": [{"message": {"content": reply}}],
-            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({
+                        "id": "gen-profile", "model": "p/m",
+                        "choices": [{"message": {"content": reply}}],
+                    }))
+                    .set_delay(delay),
+            )
             .expect(1)
             .mount(&mock)
             .await;
@@ -444,6 +512,40 @@ mod tests {
             ),
         );
         (state, mock)
+    }
+
+    /// The state a rebuild starts from: one pending fact, claimed.
+    async fn seed_claim(pool: &PgPool, user_id: Uuid) {
+        let state_repo = ProfileStateRepo { pool };
+        state_repo.bump(user_id, 1).await.unwrap();
+        assert!(state_repo
+            .claim(user_id, Duration::from_secs(600))
+            .await
+            .unwrap());
+    }
+
+    async fn count(pool: &PgPool, sql: &str, user_id: Uuid) -> i64 {
+        sqlx::query_scalar(sql)
+            .bind(user_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    fn audit_users_are_pairwise_distinct() {
+        let all = [
+            SYSTEM_AUDIT_USER,
+            WORLD_AUDIT_USER,
+            STORY_AUDIT_USER,
+            PROFILE_REBUILD_AUDIT_USER,
+        ];
+        let distinct: std::collections::HashSet<_> = all.iter().collect();
+        assert_eq!(distinct.len(), all.len(), "{all:?}");
+        assert_eq!(
+            PROFILE_REBUILD_AUDIT_USER,
+            "11111111-1111-1111-1111-111111111114"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -507,14 +609,15 @@ mod tests {
     async fn rebuild_user_writes_profile_and_audits_ok(pool: PgPool) {
         let user = Uuid::new_v4();
         seed_fact(&pool, user, "是后端工程师", "career").await;
-        ProfileStateRepo { pool: &pool }
-            .bump(user, 1)
-            .await
-            .unwrap();
+        seed_claim(&pool, user).await;
 
         let reply = serde_json::json!({"occupation": "后端工程师"});
-        let (state, _mock) = state_replying(pool.clone(), &reply.to_string()).await;
+        let (state, mock) = state_replying(pool.clone(), &reply.to_string()).await;
         assert_eq!(rebuild_user(&state, user).await, RebuildOutcome::Ok);
+
+        let sent = mock.received_requests().await.unwrap();
+        let body: serde_json::Value = sent[0].body_json().unwrap();
+        assert_eq!(body["user"], PROFILE_REBUILD_AUDIT_USER);
 
         let occupation: Option<String> =
             sqlx::query_scalar("SELECT occupation FROM engine.human_insights WHERE user_id = $1")
@@ -615,5 +718,79 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(profiles, 0);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn rebuild_of_a_user_erased_mid_flight_writes_nothing(pool: PgPool) {
+        let user = Uuid::new_v4();
+        seed_fact(&pool, user, "是后端工程师", "career").await;
+        seed_claim(&pool, user).await;
+
+        let reply = serde_json::json!({"occupation": "后端工程师"});
+        let (state, mock) =
+            state_replying_after(pool.clone(), &reply.to_string(), Duration::from_millis(600))
+                .await;
+        let rebuild = tokio::spawn({
+            let state = state.clone();
+            async move { rebuild_user(&state, user).await }
+        });
+        // The erase lands after the model call left and before its reply does.
+        while mock.received_requests().await.unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        ErasureRepo { pool: &pool }.erase_user(user).await.unwrap();
+
+        assert_eq!(rebuild.await.unwrap(), RebuildOutcome::Empty);
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT count(*) FROM engine.human_insights WHERE user_id = $1",
+                user
+            )
+            .await,
+            0,
+            "the erased profile stays erased"
+        );
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT count(*) FROM engine.companion_insights_events \
+                 WHERE user_id = $1 AND stage = 'profile'",
+                user
+            )
+            .await,
+            0,
+            "no audit row for a profile that was never written"
+        );
+        assert!(ProfileStateRepo { pool: &pool }
+            .load(user)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn rebuild_claimed_skips_users_whose_claim_is_gone(pool: PgPool) {
+        let (kept, erased) = (Uuid::new_v4(), Uuid::new_v4());
+        for user in [kept, erased] {
+            seed_fact(&pool, user, "是后端工程师", "career").await;
+            seed_claim(&pool, user).await;
+        }
+        ErasureRepo { pool: &pool }
+            .erase_user(erased)
+            .await
+            .unwrap();
+
+        // The mock allows exactly one model call: the erased user costs none.
+        let reply = serde_json::json!({"occupation": "后端工程师"});
+        let (state, _mock) = state_replying(pool.clone(), &reply.to_string()).await;
+        assert_eq!(
+            rebuild_claimed(&state, &[erased, kept]).await,
+            (1, 0, 0, 1),
+            "(ok, empty, failed, skipped)"
+        );
+        let profiles = "SELECT count(*) FROM engine.human_insights WHERE user_id = $1";
+        assert_eq!(count(&pool, profiles, kept).await, 1);
+        assert_eq!(count(&pool, profiles, erased).await, 0);
     }
 }

@@ -15,7 +15,6 @@
 //!   crate's `AffinityRepo::persist_with_event` deliberately does not
 //!   touch `ghost_streak`.
 
-use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use eros_engine_core::persona::CompanionPersona;
@@ -1346,7 +1345,6 @@ async fn extract_insights(
     audit_user: Option<&str>,
 ) {
     let run_id = Uuid::new_v4();
-    let seen_at = Utc::now();
 
     let (facts, facts_audit) = extract_facts(
         &state.openrouter,
@@ -1374,10 +1372,7 @@ async fn extract_insights(
         return;
     }
 
-    let pending = record_facts(
-        state, user_id, session_id, message_id, run_id, seen_at, &facts,
-    )
-    .await;
+    let pending = record_facts(state, user_id, session_id, message_id, run_id, &facts).await;
     // The claim is taken before the rebuild so that overlapping turns and the
     // idle sweeper never rebuild the same user twice.
     if pending.is_some_and(|p| p >= REBUILD_K) {
@@ -1404,14 +1399,12 @@ async fn record_facts(
     session_id: Uuid,
     message_id: Uuid,
     run_id: Uuid,
-    seen_at: DateTime<Utc>,
     facts: &[FactInput],
 ) -> Option<i32> {
     let src = FactSource {
         session_id: Some(session_id),
         message_id: Some(message_id),
         run_id: Some(run_id),
-        seen_at,
     };
     let written = match (HumanFactRepo { pool: &state.pool })
         .upsert_run(user_id, facts, &src)
@@ -3188,7 +3181,6 @@ mod tests {
             session_id,
             message_id,
             Uuid::new_v4(),
-            Utc::now(),
             &facts,
         )
         .await;

@@ -391,7 +391,6 @@ mod tests {
                     session_id: Some(session),
                     message_id: Some(message),
                     run_id: Some(Uuid::new_v4()),
-                    seen_at: Utc::now(),
                 },
             )
             .await

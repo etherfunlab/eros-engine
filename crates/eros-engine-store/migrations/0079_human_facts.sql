@@ -12,15 +12,18 @@
 
 -- Normalisation lives here once; every writer and the dedup index call it, so
 -- no caller re-implements it. NFKC folds width and compatibility forms, then
--- case, whitespace and punctuation are dropped. The CJK punctuation is listed
--- by hand because [:punct:] covers non-ASCII punctuation only under some locales.
+-- case, whitespace and punctuation are dropped. The unique index stores the
+-- hashes, so the result must not depend on the database's ctype: [:punct:]
+-- misses non-ASCII punctuation under a C ctype, and the non-ASCII set is
+-- listed by hand — CJK stops, brackets and quotes, ellipsis, middle dot,
+-- curly quotes, guillemets, and the dash and hyphen family.
 -- It must stay IMMUTABLE: the generated column below calls it.
 CREATE FUNCTION engine.fact_norm(t TEXT) RETURNS TEXT
     LANGUAGE sql IMMUTABLE STRICT
 AS $$
     SELECT regexp_replace(
         lower(normalize(t, NFKC)),
-        '[[:space:][:punct:]，。！？、；：「」『』（）《》〈〉【】…—～·]',
+        '[[:space:][:punct:]，。！？、；：「」『』（）《》〈〉【】…—～·“”‘’–‐‑‒―«»‹›〝〞]',
         '', 'g')
 $$;
 

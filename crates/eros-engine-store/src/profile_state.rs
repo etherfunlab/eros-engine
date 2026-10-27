@@ -96,6 +96,24 @@ impl ProfileStateRepo<'_> {
         .await
     }
 
+    /// Restart the staleness clock of a claim the caller already holds. `claim`
+    /// and `claim_due` stamp every user of a batch at once, while the batch is
+    /// rebuilt one user after another, so a later user's claim would age past
+    /// the stale window before its turn and be taken over. `false` when the row
+    /// is gone (the user was erased) or the claim was released: there is
+    /// nothing left to rebuild.
+    pub async fn refresh_claim(&self, user_id: Uuid) -> Result<bool, sqlx::Error> {
+        let refreshed: Option<Uuid> = sqlx::query_scalar(
+            "UPDATE engine.human_profile_state SET claimed_at = now() \
+             WHERE user_id = $1 AND claimed_at IS NOT NULL \
+             RETURNING user_id",
+        )
+        .bind(user_id)
+        .fetch_optional(self.pool)
+        .await?;
+        Ok(refreshed.is_some())
+    }
+
     /// A rebuild succeeded: the counter restarts and the claim is released.
     pub async fn finish_ok(&self, user_id: Uuid) -> Result<(), sqlx::Error> {
         sqlx::query(
@@ -211,6 +229,42 @@ mod tests {
         assert!(
             repo.claim(user, TEN_MIN).await.unwrap(),
             "a stale claim is taken over"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn refresh_claim_restarts_a_held_claim_only(pool: PgPool) {
+        let repo = ProfileStateRepo { pool: &pool };
+        let user = Uuid::new_v4();
+        assert!(
+            !repo.refresh_claim(user).await.unwrap(),
+            "no row, nothing to refresh"
+        );
+
+        repo.bump(user, 5).await.unwrap();
+        assert!(
+            !repo.refresh_claim(user).await.unwrap(),
+            "an unclaimed row is not refreshed into a claim"
+        );
+        assert!(repo.load(user).await.unwrap().unwrap().claimed_at.is_none());
+
+        assert!(repo.claim(user, TEN_MIN).await.unwrap());
+        shift(&pool, user, "claimed_at", "9 minutes").await;
+        let aged = repo.load(user).await.unwrap().unwrap().claimed_at.unwrap();
+        assert!(repo.refresh_claim(user).await.unwrap());
+        let fresh = repo.load(user).await.unwrap().unwrap().claimed_at.unwrap();
+        assert!(fresh > aged, "the claim's clock restarts");
+        shift(&pool, user, "claimed_at", "11 minutes").await;
+        assert!(repo.refresh_claim(user).await.unwrap());
+        assert!(
+            !repo.claim(user, TEN_MIN).await.unwrap(),
+            "a refreshed claim is not stale, so a second worker cannot take it"
+        );
+
+        repo.finish_ok(user).await.unwrap();
+        assert!(
+            !repo.refresh_claim(user).await.unwrap(),
+            "a released claim is not refreshed"
         );
     }
 

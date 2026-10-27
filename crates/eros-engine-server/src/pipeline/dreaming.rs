@@ -40,7 +40,7 @@ const MEMORY_TASK: &str = "memory_extraction";
 /// under one id. All-ones (not the `0…1` nil-plus-one, which is already used
 /// in our database). Not a real auth UUID (v4) and not a hashed client id,
 /// so it cannot collide with a real user.
-const SYSTEM_AUDIT_USER: &str = "11111111-1111-1111-1111-111111111111";
+pub(crate) const SYSTEM_AUDIT_USER: &str = "11111111-1111-1111-1111-111111111111";
 const PICK_BATCH: i64 = 10;
 
 #[derive(Debug, Deserialize)]

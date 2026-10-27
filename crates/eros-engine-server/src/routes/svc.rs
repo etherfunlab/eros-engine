@@ -1165,13 +1165,34 @@ mod tests {
         }
     }
 
-    fn seen(at: chrono::DateTime<Utc>) -> FactSource {
+    fn seen() -> FactSource {
         FactSource {
             session_id: None,
             message_id: None,
             run_id: None,
-            seen_at: at,
         }
+    }
+
+    /// Ledger stamps are the database clock at the write; the export tests need
+    /// known instants, so they set the stamps by hand after seeding.
+    async fn stamp_seen(
+        pool: &sqlx::PgPool,
+        user: Uuid,
+        content: &str,
+        first: chrono::DateTime<Utc>,
+        last: chrono::DateTime<Utc>,
+    ) {
+        sqlx::query(
+            "UPDATE engine.human_facts SET first_seen_at = $3, last_seen_at = $4 \
+             WHERE user_id = $1 AND content = $2",
+        )
+        .bind(user)
+        .bind(content)
+        .bind(first)
+        .bind(last)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     async fn seed_erasure(pool: &sqlx::PgPool, at: chrono::DateTime<Utc>) -> Uuid {
@@ -1282,13 +1303,17 @@ mod tests {
                 fact("用户在深圳工作"),
                 fact("用户有一个妹妹"),
             ],
-            &seen(t0),
+            &seen(),
         )
         .await
         .unwrap();
-        repo.upsert_run(user, &[fact("用户有一个妹妹")], &seen(t1))
+        for content in ["用户喜欢爬山", "用户在深圳工作", "用户有一个妹妹"] {
+            stamp_seen(&pool, user, content, t0, t0).await;
+        }
+        repo.upsert_run(user, &[fact("用户有一个妹妹")], &seen())
             .await
             .unwrap();
+        stamp_seen(&pool, user, "用户有一个妹妹", t0, t1).await;
         let mut tied: Vec<Uuid> = repo
             .list_for_user(user)
             .await
@@ -1550,7 +1575,7 @@ mod tests {
 
         // Right secret: the user's rows go and the report says how many.
         HumanFactRepo { pool: &pool }
-            .upsert_run(user, &[fact("用户喜欢爬山")], &seen(Utc::now()))
+            .upsert_run(user, &[fact("用户喜欢爬山")], &seen())
             .await
             .unwrap();
         let (status, body) = post_with(app(), &uri, ERASE_SECRET_HEADER, Some(ERASE_SECRET)).await;
@@ -1582,7 +1607,11 @@ mod tests {
         }
         assert_eq!(again["deleted"].as_object().unwrap().len(), 17);
         assert_eq!(again["blanked"].as_object().unwrap().len(), 8);
-        assert!(again["erased_at"].as_str().unwrap() > erased_at.as_str());
+        let parse = |v: &str| chrono::DateTime::parse_from_rfc3339(v).unwrap();
+        assert!(
+            parse(again["erased_at"].as_str().unwrap()) > parse(&erased_at),
+            "a repeat moves the tombstone forward"
+        );
         assert_eq!(tombstone_count(&pool, user).await, 1);
 
         // A user the engine never saw is still a 200 with a tombstone.
