@@ -245,7 +245,11 @@ them, and `ProjectedColumns` is the new 19-field shape. New modules:
 
 ## Coming in v2.4.1
 
-The cleanup is a separate release, once `v2.4.0` has held:
+The cleanup is a separate release, once `v2.4.0` has held. **Upgrade to
+`v2.4.0` first and run it before taking `v2.4.1`; do not jump from `v2.3.x`
+straight to `v2.4.1`** (see
+[`v2-4-1-insights-cleanup.md`](v2-4-1-insights-cleanup.md#upgrade-path-v240-first-then-v241)).
+The cleanup:
 
 - It drops the seven retired columns from `engine.human_insights`.
 - It renames `engine.companion_insights_events` to `engine.human_insights_events`,

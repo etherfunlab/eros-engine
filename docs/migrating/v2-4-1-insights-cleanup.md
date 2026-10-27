@@ -10,12 +10,24 @@ the HTTP surface changes.
 name, in place so that a rollback to `v2.3.x` kept working. This release
 removes them.
 
-A deployment on `v2.3.x` goes through [`v2-4-0-insights-2-0.md`](v2-4-0-insights-2-0.md)
-first: the `filter_prompt` contract, the model-config block and the export
-shapes changed there. When it then jumps straight to `v2.4.1`, one `migrate` runs
-`0079`, `0080` and `0081` in order; the backfill reads the seven columns before
-`0081` drops them, so its seeding is unaffected, and the database has no
-`v2.3.x` rollback path from the moment `migrate` finishes.
+## Upgrade path: `v2.4.0` first, then `v2.4.1`
+
+**`v2.4.1` is only supported on a deployment that is already running
+`v2.4.0`.** A deployment on `v2.3.x` or earlier upgrades in two steps:
+
+1. Upgrade to `v2.4.0` by following
+   [`v2-4-0-insights-2-0.md`](v2-4-0-insights-2-0.md) (the `filter_prompt`
+   contract, the model-config block and the export shapes change there). Run its
+   `migrate`, serve it, and let it run until you have no reason to roll back to
+   `v2.3.x`. Its idle sweeper drains the one-time profile rebuild queue in the
+   meantime.
+2. Only then upgrade to `v2.4.1`.
+
+Do not jump from `v2.3.x` straight to `v2.4.1`. The migrations would apply in
+order, but the deployment would skip the only release that can still roll back
+to `v2.3.x`. `v2.4.0` is the step where the new extraction contract, the
+rebuilt profiles and the new routes are checked against production traffic while
+the old columns are still there to fall back to. After `0081`, they are not.
 
 ## What is dropped and renamed
 
