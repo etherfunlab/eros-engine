@@ -91,7 +91,7 @@ Relationship 层查询改为过滤 `instance_id = $2`，并多一条 `content NO
 1. **逐轮原文写入**（`write_turn`，post-process）——在**每一个**实质轮次都跑：用户话语非空，且至少有一条非空的助手消息。它只把**用户话语**embed 进两个层，不存助手的回复文本——助手回复经记忆召回重新进入模型自己的 prompt 会形成反馈回路，让后续回复反复出现同一句话（issue #113）。关系层那一份带 `用户：` 前缀，召回出来后仍能认出是用户原话。这些行的 `category` 和 `metadata` 都是 NULL。
 2. **Dreaming-lite 清扫器**（`[tasks.memory_extraction]`，`pipeline::dreaming`）——后台的、由 session 闲置触发的一遍，问 LLM 要值得长期保留的记忆候选。它**只写 profile 层**，带 `category ∈ {fact, preference, event, emotion, relation}`（模型自创的其它类别一律收敛成 `fact`），外加一份不透明的 `metadata`。
 
-`insight_extraction` 是**另一条**流水线，不往这张表写任何东西——它的结构化产出直接 UPSERT 进扁平的 `human_insights` 表（按列增量合并；见 [api-reference.zh.md](api-reference.zh.md#get-compuseruser_idprofile)），不在这里 embed。另外两条实验性、按关系分开的链（`character_insight_*`、`user_insight_*`）也是同样的写法，各自 UPSERT 进自己的扁平表——`character_insights`（见 [api-reference.zh.md](api-reference.zh.md#get-v2compinstanceinstance_idinsightcharacter)）和 `user_insights`（见 [api-reference.zh.md](api-reference.zh.md#get-v2compinstanceinstance_idinsightuser)）；跟 `human_insights` 一样，这两张表都不会 embed 进这张表。`user_insights` 不会被注入任何 chat、voice 或 PDE prompt；`character_insights` 会——它的四个字段渲染 chat prompt 里的 `[character_state]` 块，整行填得有多满还决定注入的历史窗口大小（见[部署 → 運維注意事項](deploying.zh.md#運維注意事項)）。
+`insight_extraction` 是**另一条**流水线，不往这张表写任何东西：它把关于用户的原子事实记进事实账本（`human_facts`），再由按计划的重建从账本派生出扁平的 `human_insights` 画像，这些都不在这里 embed（见 [insights.zh.md](insights.zh.md)）。另外两条实验性、按关系分开的链（`character_insight_*`、`user_insight_*`）各自 UPSERT 进自己的扁平表——`character_insights`（见 [api-reference.zh.md](api-reference.zh.md#get-v2compinstanceinstance_idinsightcharacter)）和 `user_insights`（见 [api-reference.zh.md](api-reference.zh.md#get-v2compinstanceinstance_idinsightuser)）；跟 `human_insights` 一样，这两张表都不会 embed 进这张表。`user_insights` 不会被注入任何 chat、voice 或 PDE prompt；`character_insights` 会——它的四个字段渲染 chat prompt 里的 `[character_state]` 块，整行填得有多满还决定注入的历史窗口大小（见[部署 → 運維注意事項](deploying.zh.md#運維注意事項)）。
 
 所以 embedding 是每个实质轮次生成一次，不是「只有 LLM 挑出来的高光才生成」。
 
@@ -108,8 +108,7 @@ Relationship 层查询改为过滤 `instance_id = $2`，并多一条 `content NO
 handler（`pipeline::handlers`）从两个来源拼出画像 / 关系上下文块：
 
 - **画像层** —— 由两个来源合并。基础画像 bullet 直接来自扁平的
-  **`human_insights`** 表——companion_insights 拆除（spec 2026-08-11）之后，
-  这是 insight 抽取器唯一的写入目标，不再有 JSONB blob 或镜像这一步；
+  **`human_insights`** 表，即从用户事实账本派生出的画像（[insights.zh.md](insights.zh.md#读取方)）；
   `memory_scope` 决定是否带上私密字段（`full` / `insights_only`）还是只带
   中性子集（`neutral_*`）。与之并列，画像层的 `companion_memories` 行也会按相似度
   检索出来并按 `category` 分组注入，但仅当 scope 保留画像记忆时才会跑（`full` /
@@ -174,7 +173,7 @@ handler（`pipeline::handlers`）从两个来源拼出画像 / 关系上下文�
 ## 源碼
 
 - `crates/eros-engine-store/src/memory.rs`——`MemoryRepo`（upsert + search，7 个 sqlx::test 集成测试）
-- `crates/eros-engine-store/src/human_insight.rs`——扁平类型化的 `human_insights` 存储；insight 抽取器的 `apply_extraction` 增量写入，回复 handler 在注入时读取
+- `crates/eros-engine-store/src/human_insight.rs`——扁平类型化的 `human_insights` 存储；画像重建的 `replace_profile` 写入，回复 handler 在注入时读取；事实账本在 `human_fact.rs`
 - `crates/eros-engine-llm/src/voyage.rs`——Voyage 原生客户端
 - `crates/eros-engine-llm/src/embedding.rs`——`EmbeddingRouter` + OpenRouter 兼容客户端
 - `crates/eros-engine-server/src/pipeline/post_process.rs`——逐轮原文写入路径

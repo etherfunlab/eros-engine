@@ -236,14 +236,15 @@ params = { reasoning = { enabled = false } }
 `chat` 才能使用 body 规则；保留名 `openrouter` 条目可以只声明规则而不覆盖
 端点。
 
-**升级风险：`tasks` 按精确字符串匹配，不按链匹配。** 人类链以前两个 stage
-共用同一个 wire 任务名（`insight_extraction`）；拆分 structuring 之后，
-stage 1 仍报 `insight_extraction`，stage 2 改报 `insight_structuring`
-（见下文任务名表）。一条拆分之前写的规则——`tasks = ["insight_extraction"]`
-——现在只限定到 stage 1，会悄悄不再作用于 stage 2：不会有启动警告，因为
-`insight_structuring` 是一个合法任务名，只是不在这条规则的列表里。如果一条
-规则本来是想覆盖人类链的两个 stage，就要把两个都列上：
-`tasks = ["insight_extraction", "insight_structuring"]`。
+**`tasks` 按精确字符串匹配，不按链匹配。** 人类链的两次调用带不同的任务名：
+事实抽取是 `insight_extraction`，按计划重建画像是 `profile_rebuild`（见下文
+任务名表）。`ChatRequest::task` 只用于配置路由：它限定 body 规则的作用范围、
+作为 `llm_generations.task` 的键，从不发给供应商。一条
+`tasks = ["insight_extraction"]` 的规则只限定到抽取，不作用于重建，而且不会有
+启动警告，因为 `profile_rebuild` 是一个合法任务名，只是不在这条规则的列表里。
+如果一条规则本来是想覆盖这两次调用，就要把两个都列上：
+`tasks = ["insight_extraction", "profile_rebuild"]`。指名了引擎不认识的任务的
+规则，启动时会警告，并且不作用于任何东西。
 
 在用 body 规则代替任务块之前先掂量一下取舍：规则是**按 provider 限定**的，
 而 `fallback` 链会跨 provider——一个 primary 和 fallback 分别落在不同
@@ -519,8 +520,8 @@ BYOK hop 使用其请求中 `byok` 块的 `output_regex` 规则，而不是这�
 | 名称 | 使用方 | 状态 |
 |---|---|---|
 | `chat_companion` | `pipeline::handlers`，通过 `resolve()`（chat completion） | live |
-| `insight_extraction` | `pipeline::post_process::extract_facts`（人类链 stage 1——逐轮事实挖掘。持有 prompt，与 `character_insight_extraction` / `user_insight_extraction` / `memory_extraction` 共用同一个必填-`filter_prompt` 闸门。这个块是整条链的总开关——任务块缺失即关闭） | live |
-| `insight_structuring` | `pipeline::post_process::extract_structured_insights`（人类链 stage 2——把 stage 1 挖掘出的事实加上已有的 `human_insights` 行，转成类型化的画像对象。**仅参数，不接受 `filter_prompt`**——它的 prompt 写在 `prompt.rs` 里，必须与它要填的 `human_insights` 列保持同步，所以设置该键会拒绝启动，**任何写法都算，包括显式留空**——与 `affinity_evaluation` 同样处理。块缺失时 stage 2 会退回到 stage 1 的模型/预算，绝不退到全局默认） | live |
+| `insight_extraction` | `pipeline::post_process::extract_facts`（人类链的事实抽取——1:1 聊天里每条产出的助手消息各一次调用，群聊每轮一次；它把原子事实写进用户的事实账本，不写画像。持有 prompt，与 `character_insight_extraction` / `user_insight_extraction` / `memory_extraction` 共用同一个必填-`filter_prompt` 闸门。这个块是抽取的总开关——任务块缺失即关闭。输出契约：[洞察 → 事实抽取](insights.zh.md#事实抽取)） | live |
+| `profile_rebuild` | `pipeline::profile_rebuild`（按计划用用户的整个事实账本重建 `human_insights` 画像——累积 20 条事实或闲置一段时间后触发，绝不逐轮；见[洞察](insights.zh.md#派生画像)。**仅参数，不接受 `filter_prompt`**——它的 prompt 写在 `prompt.rs` 里，必须与它要填的 `human_insights` 列保持同步，所以设置该键会拒绝启动，**任何写法都算，包括显式留空**——与 `affinity_evaluation` 同样处理。块缺失时重建会退回到 `insight_extraction` 的模型/预算（只有那个块也缺失时才落到全局默认）。`[tasks.insight_structuring]` 块会被忽略） | live |
 | `chat_output_filter` | `pipeline::stream`，通过 `resolve_output_filter()`（交付前对 chat 回复进行可选的二次改写） | live |
 | `pde_decision` | `pipeline::stream`（通过 `run_pde_decision` 实现的 opt-in LLM 判断器，由 `run_stream` 调用；缺少 `filter_prompt` 或 LLM 调用失败时使用规则引擎） | live（opt-in） |
 | `chat_image_prompt_compose` | `pipeline::stream`，以及生活事件的图走 `pipeline::proactive`（出图 prompt 合成器；**图片轮次必需** —— PDE judge 不再写种子，未配置该任务时引擎报 可发图=否 并把图片动作降级为纯文本。它从当轮上下文生成 prompt，返回 JSON `{prompt, caption}`；`caption` 落到 `metadata.image.caption`，是聊天历史与 judge transcript 实际读取的字段） | live（图片必需） |
@@ -547,7 +548,8 @@ BYOK hop 使用其请求中 `byok` 块的 `output_regex` 规则，而不是这�
 
 - `crates/eros-engine-server/src/pipeline/group_director.rs` → `group_director`，通过 `resolve_group_director()`（群聊导演，opt-in）
 - `crates/eros-engine-server/src/pipeline/handlers.rs` → `chat_companion`、`chat_output_filter`
-- `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`、`insight_structuring`、`affinity_evaluation`、`affinity_summary`、`character_insight_extraction`、`character_insight_structuring`、`user_insight_extraction`、`user_insight_structuring`
+- `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`、`affinity_evaluation`、`affinity_summary`、`character_insight_extraction`、`character_insight_structuring`、`user_insight_extraction`、`user_insight_structuring`
+- `crates/eros-engine-server/src/pipeline/profile_rebuild.rs` → `profile_rebuild`，通过 `resolve_profile_rebuild()`（按计划的画像重建）
 - `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision`，通过 `run_stream` 内的 `run_pde_decision`（仅当设置了 `filter_prompt`）；`chat_image_prompt_compose`，通过 `resolve_image_prompt_compose()`（出图 prompt 合成器，图片轮次必需，仅在图片轮次按需解析）；`chat_vision`，通过 `resolve_vision()`（视觉预处理阶段，opt-in）；`chat_product_qa`，通过 `resolve_product_qa()`（产品问答执行器，opt-in）；`chat_input_filter`，通过 `resolve_input_filter()`（输入改写，opt-in）；`memory_extraction`，通过 dreaming sweeper
 - `crates/eros-engine-server/src/pipeline/proactive.rs` → `chat_image_prompt_compose`，通过 `build_delegated_image_prompt_for`（`taking_selfie` 事件的图，events 请求带 `image` 时；审计 `source = event`）
 - `crates/eros-engine-server/src/routes/image_edit.rs` → `chat_image_edit_compose`，通过 `resolve_image_edit_compose()`（图片-EDIT 合成器，编辑端点每次请求都会解析；编辑块缺失时回退到 `[tasks.chat_image_prompt_compose]` 的模型链——详见下文）
@@ -940,9 +942,13 @@ write 全部路由离开 Voyage 的部署不再需要这个变量。
 / `dreaming.rs` / `world.rs` / `story.rs` 里的 `embed_query` /
 `embed_document` / `embed_documents` 提供服务，调用形态不变。
 
+### Insight 抽取的输出契约
+
+`[tasks.insight_extraction]` 的 prompt 归部署所有；输出契约归引擎。回复是一个 JSON 对象，其中 `facts` 是对象数组，每个对象含 `content` 和六个标签：`category`、`domain`、`evidence_type`、`temporality`、`persistence`、`confidence`。不是对象、或 `content` 为空白的项（包括裸字符串）会被忽略并记录警告，所以仍停留在字符串数组契约的 prompt 不会往账本写任何东西。引擎把每个标签对照它的词表（[列表](insights.zh.md#词表)）校验，不在词表里的值会收敛成 `other`（`category`、`domain`）或 `unknown`（其余），事实照样保留。随附的 `examples/model_config.toml` prompt 遵循这份契约。
+
 ### 启用/禁用 extraction
 
-`insight_extraction`（人类链 stage 1，每轮事实挖掘）、`memory_extraction`
+`insight_extraction`（人类链的事实抽取）、`memory_extraction`
 （会话结束时的 dreaming sweeper）、`character_insight_extraction`（实验性
 角色链的 stage 1，见上文"任务名"一节）和 `user_insight_extraction`（实验性
 用户链的 stage 1）都由各自 `[tasks.*_extraction]` **章节是否存在**控制——
@@ -950,12 +956,12 @@ write 全部路由离开 Voyage 的部署不再需要这个变量。
 
 - **章节存在** → `filter_prompt` **必填**；若为空白或缺失，服务器会拒绝启动。
 - **章节缺失** → 该 extraction **关闭**。引擎可以正常启动和运行（每轮跳过
-  `insight_extraction`；dreaming sweeper 保持不生效；角色链两个 stage 都不会
+  `insight_extraction`，事实账本不再增长；dreaming sweeper 保持不生效；角色链两个 stage 都不会
   跑；用户链两个 stage 都不会跑）。
 
-`insight_structuring`、`character_insight_structuring`、
-`user_insight_structuring`——三条链各自的 stage 2——**故意都不在这个闸门
-里**：因为这个闸门要求必须有 prompt，而任何 stage 2 都必须没有。它们各自
+`profile_rebuild`、`character_insight_structuring`、
+`user_insight_structuring`——三条链各自的第二次调用——**故意都不在这个闸门
+里**：因为这个闸门要求必须有 prompt，而这几个块都必须没有。它们各自
 被反方向的闸门管着：prompt 写死在 `prompt.rs` 里，所以给它设置
 `filter_prompt` 会拒绝启动（见上面的 `affinity_evaluation`，同一条死配置
 规则）。「不在这个闸门里」是「被另一个闸门管着」，不是「没人管」。

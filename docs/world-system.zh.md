@@ -202,10 +202,9 @@ Stories 需要**全部条件**同时成立——且按构造骑在 World Memorie
 | digest（1-2 句） | `persona_story_insights.digest`，常驻注入 |
 | events（category + content，每轮上限 6 条） | `persona_story_events`，并在同一回合/事务内原样嵌入 `persona_story_memories`（1:1） |
 
-insight 字段列表是 `human_insights` 类型列的**固定扁平超集**（提前应用了
-`human_insights` 的教训——从第一天起就是扁平类型列，没有不透明 JSONB 的阶段；
-companion 那边直到 companion_insights 拆除（spec 2026-08-11）才追上这个形状）：
-既有的每个 companion 字段（改写为描述角色本身），再加四个 story 专属栏位——
+insight 字段列表是**固定扁平的类型列集合**（从第一天起就是扁平类型列，没有
+不透明 JSONB 的阶段）：profile 式的各个字段（`city`、`hometown`、`occupation`、
+`interests` 等，改写为描述角色本身），再加四个 story 专属栏位——
 `work_history`（工作经历）、`romance_history`（感情史）、`family_of_origin`
 （与原生家庭的关系）、`user_relationship`（与用户的关系状态）。列表以引擎常量
 的形式交付；运营方的 `filter_prompt` 只能控制各栏位内容的*丰富程度*，不能改

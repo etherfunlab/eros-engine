@@ -287,12 +287,14 @@ values:
 
 | Value | Injected |
 |-------|----------|
-| `full` | Full user profile (including intimate fields) + relationship memory |
-| `neutral_and_relationship` | Neutral profile (city/occupation/MBTI only) + relationship memory **(default)** |
+| `full` | Full user profile (the neutral fields plus the intimate ones) + relationship memory |
+| `neutral_and_relationship` | Neutral user profile + relationship memory **(default)** |
 | `relationship_only` | Relationship memory only; no profile |
 | `neutral_only` | Neutral profile only; no relationship memory |
-| `insights_only` | Full user profile only (intimate fields included); no relationship memory |
+| `insights_only` | Full user profile only; no relationship memory |
 | `none` | No memory injection |
+
+The neutral profile is 职业, 教育, 学历, MBTI, 意识形态, 作息, 社交模式, 性格特质 and 未来计划. The full profile adds 感情观, 感情经历, 兴趣, 情感需求, 家庭, 经济状况, 性癖 and 心理健康. See [Insights](insights.md#chat-prompt).
 
 > **Important (#40 mitigation):** The default `neutral_and_relationship` is
 > intentionally narrower than the pre-#40 behavior (which injected everything).
@@ -1906,15 +1908,11 @@ All chat sessions for `user_id`. The path's `user_id` MUST match the JWT's user_
 
 ### `GET /comp/user/{user_id}/profile`
 
-The flat, typed `human_insights` row for this user — the same columns the insight extractor UPSERTs incrementally after each turn. Same `user_id` equality check as above.
+The flat, typed `human_insights` row for this user — the profile the engine derives from the user's fact ledger and rebuilds on a schedule (see [Insights](insights.md#the-derived-profile)). Same `user_id` equality check as above.
 
 ```json
 {
   "user_id": "8a1f0c2e-4b6d-4f8a-9c31-2d5e7f0a1b3c",
-  "city": "Hong Kong",
-  "location": null,
-  "hometown": null,
-  "nationality": null,
   "occupation": "graphic designer",
   "mbti_guess": "INFP",
   "love_values": null,
@@ -1922,21 +1920,23 @@ The flat, typed `human_insights` row for this user — the same columns the insi
   "life_rhythm": null,
   "interests": ["jazz", "long walks"],
   "personality_traits": [],
-  "preferred_gender": null,
-  "age_min": null,
-  "age_max": null,
   "deal_breakers": [],
   "education": null,
+  "education_level": "bachelor",
+  "education_status": "graduated",
   "family": null,
   "relationship_history": null,
   "social_pattern": null,
   "future_plans": null,
   "finance_status": null,
+  "kinks": [],
+  "ideology": null,
+  "mental_health": null,
   "updated_at": "2026-08-11T12:00:00Z"
 }
 ```
 
-`updated_at: null` means the user has no `human_insights` row yet — no extraction has landed — and every other field is `null`/`[]` in that response. There is no aggregate "training level" score anymore; `agent_training_level` and the raw `companion_insights` JSONB were removed with the companion_insights teardown (spec 2026-08-11) — the typed columns above are the whole surface now.
+`education_level` is one of `secondary_or_below`, `associate`, `bachelor`, `master`, `doctorate`, or `null`; `education_status` is `enrolled`, `graduated`, or `null`. `kinks`, `ideology` and `mental_health` are returned here because this is the user's own data; the service export never carries them. `updated_at` is when the last rebuild replaced the row. `updated_at: null` means the user has no `human_insights` row yet — no rebuild has landed — and every other field is `null`/`[]` in that response. There is no aggregate "training level" score anymore; `agent_training_level` and the raw `companion_insights` JSONB were removed with the companion_insights teardown (spec 2026-08-11) — the typed fields above are the whole surface now.
 
 ### `GET /comp/instance/{instance_id}/profile`
 
@@ -2421,7 +2421,15 @@ form of the route above, for a client rendering one row per companion. The
 
 ## Service endpoints
 
-Service-to-service routes under `/svc/v1/*`. They are admitted by a shared secret header, not a user JWT, and the whole sub-tree is **not mounted** unless the deployment configured the secret — an unconfigured deployment answers exactly as it does for any unknown path: never `403`, never `200`.
+Service-to-service routes under `/svc/v1/*`. They are admitted by a shared secret header, not a user JWT. The routes form three sub-trees, each behind its own secret so a consumer holds only the credential for the streams it reads, and each **not mounted** unless the deployment configured its secret — an unconfigured sub-tree answers exactly as it does for any unknown path: never `403`, never `200`. A secret is trimmed, blank counts as unset, and fewer than 32 bytes refuses to boot.
+
+| Secret | Header | Routes |
+|---|---|---|
+| `INSIGHTS_EXPORT_SECRET` | `x-insights-export-secret` | [`insights/changes`](#get-svcv1insightschanges), [`memories/changes`](#get-svcv1memorieschanges), [`insights/deletions`](#get-svcv1insightsdeletions) |
+| `FACTS_EXPORT_SECRET` | `x-facts-export-secret` | [`facts/changes`](#get-svcv1factschanges), [`facts/deletions`](#get-svcv1factsdeletions) |
+| `USER_ERASE_SECRET` | `x-user-erase-secret` | [`POST users/{user_id}/erase`](#post-svcv1usersuser_iderase) |
+
+All the streams are keyset-paged the same way; the pipeline behind them is in [Insights](insights.md#exports-and-deletions).
 
 ### `GET /svc/v1/insights/changes`
 
@@ -2443,12 +2451,12 @@ curl -H "x-insights-export-secret: $INSIGHTS_EXPORT_SECRET" \
   "profiles": [
     {
       "user_id": "8d1f…",
-      "city": "Singapore", "location": null, "hometown": null, "nationality": null,
       "occupation": null, "mbti_guess": null, "love_values": null,
       "emotional_needs": null, "life_rhythm": null,
       "interests": ["jazz", "hiking"], "personality_traits": ["calm"],
-      "preferred_gender": null, "age_min": 25, "age_max": 35, "deal_breakers": ["smoking"],
-      "education": null, "family": null, "relationship_history": null,
+      "deal_breakers": ["smoking"],
+      "education": null, "education_level": "master", "education_status": "enrolled",
+      "family": null, "relationship_history": null,
       "social_pattern": null, "future_plans": null, "finance_status": null,
       "updated_at": "2026-10-13T12:00:00Z"
     }
@@ -2456,6 +2464,8 @@ curl -H "x-insights-export-secret: $INSIGHTS_EXPORT_SECRET" \
   "next": { "updated_at": "2026-10-13T12:00:00Z", "user_id": "8d1f…" }
 }
 ```
+
+A row has the profile fields of [`GET /comp/user/{user_id}/profile`](#get-compuseruser_idprofile) **except `kinks`, `ideology` and `mental_health`, which are never exported**. `updated_at` moves when a rebuild replaces the profile. A user's erasure removes the row without a trace in this feed; read [`insights/deletions`](#get-svcv1insightsdeletions) to learn of it.
 
 Rows are ordered by `(updated_at, user_id)`. `next` is present iff the page is full; within one walk, pass both of its fields back verbatim as `since` and `after_user` — at full microsecond precision, URL-encoded — and stop when `next` is `null`. A client that truncates the timestamp (JavaScript `Date` keeps milliseconds) can re-fetch the same full page forever once 1000 rows share one `now()`.
 
@@ -2496,7 +2506,101 @@ curl -H "x-insights-export-secret: $INSIGHTS_EXPORT_SECRET" \
 
 **Resuming the next poll.** Keep the last row's `(created_at, id)`; start each new poll a few seconds before it, `since = last.created_at − 5s` with no `after_id`. `created_at` is the inserting transaction's start time and the row is visible only at its commit; the engine's insert transactions are short, so the overlap covers that gap. Re-returned rows are harmless: a row never changes, so deduplicate by `id`.
 
-**No deletions.** A row goes away only with its session (a hard delete cascades), and the export does not report it.
+**No deletions in this feed.** A row goes away with its session (a hard delete cascades) or with an erase of its user, and this export reports neither. A mirror drops erased users by reading [`insights/deletions`](#get-svcv1insightsdeletions) with the same secret.
+
+### `GET /svc/v1/insights/deletions`
+
+The users whose data the engine erased since a keyset cursor, for a mirror of profiles and memories to drop in turn. Requires `x-insights-export-secret` (403 when missing or wrong). It is the same stream as [`facts/deletions`](#get-svcv1factsdeletions), readable with the insights secret so that mirror needs no second credential. There is no per-fact deletion: the stream is user-level.
+
+| Query | Default | Meaning |
+|---|---|---|
+| `since` | Unix epoch | RFC 3339 timestamp; rows strictly after `(since, after_user)` |
+| `after_user` | nil UUID | tie-break within `since` — pass `next.user_id` |
+| `limit` | 500 | clamped to 1..=1000 |
+
+```json
+{
+  "erasures": [
+    { "user_id": "8d1f…", "erased_at": "2026-10-13T12:00:00.123456Z" }
+  ],
+  "next": { "erased_at": "2026-10-13T12:00:00.123456Z", "user_id": "8d1f…" }
+}
+```
+
+Rows are ordered by `(erased_at, user_id)`; `next` is present iff the page is full, and is passed back verbatim as `since` and `after_user` until it is `null`. **A mirror must drop everything it holds for each `user_id` it reads here**: an erase deletes the user's profile, memory and fact rows, which none of the changes feeds can report. A repeat erase of the same user moves `erased_at` forward, so a user can reappear in the stream; dropping an already-dropped user is a no-op. Resume as on the other feeds: keep the last `(erased_at, user_id)` and start the next poll a few seconds before it.
+
+### `GET /svc/v1/facts/changes`
+
+Ledger facts first seen or seen again since a keyset cursor, for a downstream service that mirrors what the engine mined about each user ([Insights](insights.md#the-fact-ledger)). Requires `x-facts-export-secret: <FACTS_EXPORT_SECRET>` (403 when missing or wrong).
+
+| Query | Default | Meaning |
+|---|---|---|
+| `since` | Unix epoch | RFC 3339 timestamp; rows strictly after `(since, after_id)` |
+| `after_id` | nil UUID | tie-break within `since` — pass `next.id` |
+| `limit` | 500 | clamped to 1..=1000 |
+
+```bash
+curl -H "x-facts-export-secret: $FACTS_EXPORT_SECRET" \
+  "http://localhost:8080/svc/v1/facts/changes?limit=1"
+```
+
+```json
+{
+  "facts": [
+    {
+      "id": "5b7e…",
+      "user_id": "8d1f…",
+      "content": "用户养了一只猫",
+      "category": "fact",
+      "domain": "lifestyle",
+      "evidence_type": "explicit_statement",
+      "temporality": "current",
+      "persistence": "ongoing",
+      "confidence": "high",
+      "occurrences": 3,
+      "session_count": 2,
+      "recurrence": "repeated_across_sessions",
+      "first_seen_at": "2026-10-13T12:00:00.123456Z",
+      "last_seen_at": "2026-10-20T09:30:00.654321Z"
+    }
+  ],
+  "next": { "last_seen_at": "2026-10-20T09:30:00.654321Z", "id": "5b7e…" }
+}
+```
+
+`recurrence` is `once`, `repeated_in_session` or `repeated_across_sessions`; the six labels are the engine's closed vocabularies. The session, message and run pointers stay inside the engine. Rows are ordered by `(last_seen_at, id)`, and paging works as on the insights export: `next` is present iff the page is full; pass both fields back verbatim as `since` and `after_id`, at full microsecond precision, until `next` is `null`.
+
+A repeat moves `last_seen_at`, so a row reappears each time its counters change; deduplicate by `id`, last one wins. Rows leave the ledger only through an erase; see [`facts/deletions`](#get-svcv1factsdeletions).
+
+**Resuming the next poll.** Keep the last row's `(last_seen_at, id)`; start each new poll *before* it with no `after_id`. `last_seen_at` is stamped by the ledger write itself (`now()`; a recurrence never moves it backwards), so it precedes the commit by one short statement: an overlap of a few seconds is enough.
+
+### `GET /svc/v1/facts/deletions`
+
+The same erasure stream as [`insights/deletions`](#get-svcv1insightsdeletions) — same query, same response, same meaning — admitted with `x-facts-export-secret`, for the mirror of facts. A mirror that holds facts must drop every `user_id` it reads here.
+
+### `POST /svc/v1/users/{user_id}/erase`
+
+Erase everything the engine derived about a user, and list the user on the deletion streams. For a deployment to call when the user deletes their account. Requires `x-user-erase-secret: <USER_ERASE_SECRET>` (403 when missing or wrong; 400 for a `user_id` that is not a UUID). The sub-tree is mounted under its own secret, so erasure works on a deployment that enables no export.
+
+```bash
+curl -X POST -H "x-user-erase-secret: $USER_ERASE_SECRET" \
+  "http://localhost:8080/svc/v1/users/8d1f…/erase"
+```
+
+```json
+{
+  "user_id": "8d1f…",
+  "erased_at": "2026-10-13T12:00:00.123456Z",
+  "deleted": { "human_facts": 41, "human_insights": 1, "human_profile_state": 1, "companion_memories": 63, "user_insights": 2, "…": 0 },
+  "blanked": { "companion_insights_events": 87, "companion_affinity": 2, "…": 0 }
+}
+```
+
+`deleted` counts rows removed and `blanked` counts rows kept with their content cleared (ids and timestamps stay), each by table name. Every covered table is listed (the example abbreviates), with `0` when it had nothing to do; `blanked` counts only rows that still carried content. The tables are listed in [Insights → Erasure](insights.md#erasure). Chat sessions and messages belong to the caller and are not touched.
+
+- **Idempotent.** A repeat finds nothing left, reports `0` everywhere, and moves `erased_at` forward.
+- **Call it before deleting the user's sessions or persona instances.** The per-relationship insight tables key on the instance alone and are reachable only while the instance row exists.
+- **Stop the user's traffic first.** A stage-1 extraction already in flight can write facts after the erase commits; call again to clean up. (A rebuild in flight cannot write a profile back.)
 
 ## Error responses
 
@@ -2518,7 +2622,7 @@ on whichever route it comes from. The table below covers the plain shape:
 |--------|------|------|
 | 400 | `bad_request` | Malformed body, invalid UUID, missing required field |
 | 401 | `unauthorized` | Missing / malformed / expired / wrong-secret JWT |
-| 403 | `forbidden` | Path-user vs JWT-user mismatch, or trying to read a session you don't own; or `x-insights-export-secret` missing or wrong on `/svc/v1/*` |
+| 403 | `forbidden` | Path-user vs JWT-user mismatch, or trying to read a session you don't own; or a `/svc/v1/*` secret header (`x-insights-export-secret`, `x-facts-export-secret`, `x-user-erase-secret`) missing or wrong |
 | 404 | `not_found` | Unknown session / persona / message id |
 | 409 | `conflict` | The resource's state does not permit the action. The reaction route and image edit return it for a group session, with a `message` containing `wrong_channel`. The 1:1 stream and async send routes, `/open`, `/events`, `/effects` and the life-choice route refuse a group session with the coded body instead (`code: wrong_channel`), as the group routes refuse a non-group session |
 | 500 | `internal` | Anything else (DB error, LLM API error, etc.) |

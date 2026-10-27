@@ -141,7 +141,7 @@ completed` tracing——落库是额外加的，不是取代那行日志。
 `chat_input_filter`、`chat_output_filter`、`chat_vision`、
 `chat_image_prompt_compose`、`chat_image_edit_compose`、`pde_decision`、
 `group_director`、`affinity_evaluation`、`affinity_summary`、`insight_extraction`、
-`insight_structuring`、`character_insight_extraction`、
+`profile_rebuild`、`character_insight_extraction`、
 `character_insight_structuring`、`user_insight_extraction`、
 `user_insight_structuring`、`memory_extraction`、`world_director`、
 `world_stories_director`、`world_comment`、`world_reply`。
@@ -307,8 +307,8 @@ material 会直接拒绝加载，而不是像以前那样在构造时 warn-and-d
   `generation_id` 三元组**是**会落库的——`model` 和 `usage` 落在
   `engine.llm_generations`，`generation_id` 落在那次调用产出的那一行：聊天
   补全落在 `chat_messages.generation_id`（好感度评估镜像在
-  `companion_affinity_events`，人类链每次 `insight_extraction` /
-  `insight_structuring` 调用落在
+  `companion_affinity_events`，人类链每次 `insight_extraction` 和
+  `profile_rebuild` 调用落在
   `companion_insights_events`，实验性角色链的每次调用落在
   `engine.character_insights_events`，实验性用户链的每次调用落在
   `engine.user_insights_events`（见下文"角色画像与用户画像"一节），每次 `pde_decision` judge 运行落在
@@ -317,12 +317,11 @@ material 会直接拒绝加载，而不是像以前那样在构造时 warn-and-d
   `chat_vision_events`——详见下面的[图片链路事件表](#图片链路事件表)；
   `chat_messages.metadata.image` 仍保留现有的 `compose_*` 键，只是多加了一个
   指向 `chat_images_events` 的 `compose_event_id` 指针）——参见上面 `usage`
-  过滤那节。companion_insights 拆除（spec 2026-08-11）之后，`companion_insights_events`
-  的行里可能出现类型化 `human_insights` 表从不落库的 key：抽取器的
-  `existing_insights` 上下文现在是从 `human_insights` 反向投影出来的（不再是
-  已废弃的 JSONB blob），LLM 吐出的任何 schema 之外的 key 仍然会进事件
-  payload，但不会落在其它任何地方——以后做 events↔store 对账时，要按
-  payload key 与 `human_insights` 列集合的交集比较，不能直接判等。自
+  过滤那节。`profile` 阶段的 `companion_insights_events` payload 是模型原样返回的
+  JSON 对象，所以可能出现类型化 `human_insights` 表从不落库的 key：LLM 吐出的
+  任何 schema 之外的 key 会进事件 payload，但不会落在其它任何地方——事件与
+  存储之间做对账时，要按 payload key 与 `human_insights` 列集合的交集比较，
+  不能直接判等。自
   migration `0059` 起，上面这些调用——加上 `chat_voice`、`chat_product_qa`、
   `chat_input_filter`、`chat_output_filter`，以及此前一行都不写的那五个
   后台 sweeper——现在也都会在 `engine.llm_generations` 里各落一行；见上面的
@@ -470,7 +469,8 @@ Venice 用 `429 MODEL_OVERLOADED` 和 `503 MODEL_AT_CAPACITY`，下一家又会�
 
 `engine.chat_messages` 用同一对列承载三个调用点，靠每个元素的 `task` 区分。
 它就是既有的 `[tasks.*]` 配置 key——同一套词表已经作为 `ChatRequest.task`
-走在协议上，也已经在为每个 task 解析模型——不是新造的判别符，而且比新造的
+存在（它限定 `[[providers.<name>.body]]` 规则的作用范围，从不发给供应商），
+也已经在为每个 task 解析模型——不是新造的判别符，而且比新造的
 更细：它能区分 `chat_companion`、`chat_voice` 和 `chat_product_qa`。
 
 | `task` | 表 | 行 |
@@ -525,15 +525,25 @@ OpenRouter 调用落一行：
   `stage='structuring'` 就知道该去调哪个 `[tasks.*]` 块，中间不需要查任何
   映射表。
 - **同一次抽取的两行共享同一个 `run_id`**——抽取调用和它喂给的结构化调用不
-  需要经过 `session_id`/`message_id` 就能直接关联。三条链都是如此。
+  需要经过 `session_id`/`message_id` 就能直接关联。
 
-**`companion_insights_events.stage` 是刻意保留的例外。** 人类链的两个
-stage 现在也各有自己的配置块了（`insight_extraction` /
-`insight_structuring`，来自 structuring 拆分那次改动），stage 2 的调用在
-wire 上报的任务名是 `insight_structuring`——但它落到的审计行仍然写
-`stage='structured'`，不是 `stage='structuring'`。`companion_insights_events`
-故意保留旧的 `'facts'`/`'structured'` 词汇：这张表是线上活表，下游消费方
-已经按这个 stage 取值在读，为了跟两张实验表对齐而改名不值当这次迁移。
+**`companion_insights_events.stage` 有自己的词汇。** 人类链每次抽取运行写一行
+`stage = 'facts'`，每次画像重建写一行 `stage = 'profile'`，不是上面两张表的
+`'extraction'` / `'structuring'`；这张表是线上活表，下游消费方就是按这些取值在读。
+`stage = 'structured'` 的行是此前两次调用流水线留下的历史，现在没有任何东西再写它们。
+
+- **`facts` payload。** `{"facts": [...]}`：数组原样保留模型输出的内容，包括引擎
+  忽略的项。至少有一项是可用事实时 `status` 为 `ok`，一项都没有时为 `empty`，
+  没有解析出 JSON 时为 `parse_error`（payload 为 `NULL`）。更早的行是
+  `{"facts": [字符串], "details": [对象]}`。
+- **`profile` payload。** 模型原样返回的 JSON 对象（`ok`；其中没有可写内容时为
+  `empty`），`parse_error` 时是 `{"raw": "<回复的前 2000 个字符>"}`。`profile` 行的
+  `session_id` 与 `message_id` 为 `NULL`：重建不是一个轮次。它的 `generation_id`
+  对应 `llm_generations` 里任务为 `profile_rebuild` 的行。
+- **抹除。** `POST /svc/v1/users/{user_id}/erase` 会把该用户每一行的 `payload` 置为
+  `NULL`，行的其余部分保留。
+
+完整的列与 payload 参考见 [insights.zh.md](insights.zh.md#审计)。
 
 ## 图片链路事件表
 

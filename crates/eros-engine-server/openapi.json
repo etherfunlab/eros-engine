@@ -1505,7 +1505,7 @@
         "tags": [
           "svc"
         ],
-        "summary": "Extracted profile-layer memories created since a keyset cursor, for a\ndownstream service that builds on the facts the engine extracted about a\nuser. Raw-turn rows and relationship-layer rows are not exported. The rows\nare insert-only; the export carries no deletions.",
+        "summary": "Extracted profile-layer memories created since a keyset cursor, for a\ndownstream service that builds on the facts the engine extracted about a\nuser. Raw-turn rows and relationship-layer rows are not exported. The rows\nare insert-only; this feed carries no deletions, so a mirror drops a user's\nrows when `GET /svc/v1/insights/deletions` names the user.",
         "operationId": "memories_changes",
         "parameters": [
           {
@@ -1567,7 +1567,7 @@
           "svc"
         ],
         "summary": "Erase everything the engine derived about a user, and list the user on the\ndeletion streams.",
-        "description": "For a deployment to call when the user deletes their account. Derived rows\n(facts, profile, memories, world and story content, and both sides'\nper-relationship insights) are deleted. Audit and event rows keep their ids\nand timestamps but lose their payloads and free text; relationship state\nkeeps its numbers and loses its generated summary. Chat sessions and\nmessages belong to the caller and are not touched.\n\nIdempotent: a repeat finds nothing left to erase, reports 0 everywhere and\nre-stamps the tombstone.",
+        "description": "For a deployment to call when the user deletes their account. Derived rows\n(facts, profile, memories, world and story content, and both sides'\nper-relationship insights) are deleted. Audit and event rows keep their ids\nand timestamps but lose their payloads and free text; relationship state\nkeeps its numbers and loses its generated summary. Chat sessions and\nmessages belong to the caller and are not touched.\n\nIdempotent: a repeat finds nothing left to erase, reports 0 everywhere and\nre-stamps the tombstone.\n\nCallers should quiesce the user's traffic first: a stage-1 extraction\nalready in flight can write facts after the commit, and a repeat call\ncleans them up (a rebuild in flight cannot: it writes under the state-row\nlock this erase takes first). Call this BEFORE deleting the user's sessions or persona instances: the\nper-relationship insight tables are keyed by instance alone and are reached\nonly while the instance row exists.",
         "operationId": "erase_user",
         "parameters": [
           {

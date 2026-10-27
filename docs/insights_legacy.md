@@ -1,6 +1,8 @@
 # Insights (legacy)
 
-Describes the insights pipeline as it shipped through v2.3.1. v2.4.0 replaces it; this document is removed after v2.4.1.
+The current pipeline is described in [insights.md](insights.md).
+
+Describes the insights pipeline as it shipped through v2.3.1. v2.4.0 replaces it; this document is removed in v2.4.1.
 
 The insights pipeline builds a profile of the real user from conversation. After a chat turn, up to two LLM calls turn what the user said into the typed columns of one row in `engine.human_insights`. The row is read back into the chat prompt and the voice opener, served by a profile route and an export route, and snapshotted daily. Every LLM call leaves an audit row in `engine.companion_insights_events`.
 

@@ -258,12 +258,14 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 | 值 | 注入内容 |
 |-------|----------|
-| `full` | 完整用户画像（含亲密字段）+ 关系记忆 |
-| `neutral_and_relationship` | 中性画像（仅城市/职业/MBTI）+ 关系记忆 **（默认）** |
+| `full` | 完整用户画像（中性字段加上亲密字段）+ 关系记忆 |
+| `neutral_and_relationship` | 中性用户画像 + 关系记忆 **（默认）** |
 | `relationship_only` | 仅关系记忆；不含画像 |
 | `neutral_only` | 仅中性画像；不含关系记忆 |
-| `insights_only` | 仅完整用户画像（含亲密字段）；不含关系记忆 |
+| `insights_only` | 仅完整用户画像；不含关系记忆 |
 | `none` | 不注入任何记忆 |
+
+中性画像是 职业、教育、学历、MBTI、意识形态、作息、社交模式、性格特质、未来计划。完整画像再加上 感情观、感情经历、兴趣、情感需求、家庭、经济状况、性癖、心理健康。见 [洞察](insights.zh.md#聊天-prompt)。
 
 > **重要（#40 缓解措施）：** 默认的 `neutral_and_relationship` 有意比
 > #40 之前的行为更窄（旧行为注入全部内容）。**省略 `memory_scope` 并不
@@ -1543,15 +1545,11 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 ### `GET /comp/user/{user_id}/profile`
 
-这个用户扁平化、类型化的 `human_insights` 行——insight 抽取器每轮增量 UPSERT 的那些列。`user_id` 等值检查同上。
+这个用户扁平化、类型化的 `human_insights` 行——引擎从用户的事实账本派生、并按计划重建的画像（见[洞察](insights.zh.md#派生画像)）。`user_id` 等值检查同上。
 
 ```json
 {
   "user_id": "8a1f0c2e-4b6d-4f8a-9c31-2d5e7f0a1b3c",
-  "city": "Hong Kong",
-  "location": null,
-  "hometown": null,
-  "nationality": null,
   "occupation": "graphic designer",
   "mbti_guess": "INFP",
   "love_values": null,
@@ -1559,21 +1557,23 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
   "life_rhythm": null,
   "interests": ["jazz", "long walks"],
   "personality_traits": [],
-  "preferred_gender": null,
-  "age_min": null,
-  "age_max": null,
   "deal_breakers": [],
   "education": null,
+  "education_level": "bachelor",
+  "education_status": "graduated",
   "family": null,
   "relationship_history": null,
   "social_pattern": null,
   "future_plans": null,
   "finance_status": null,
+  "kinks": [],
+  "ideology": null,
+  "mental_health": null,
   "updated_at": "2026-08-11T12:00:00Z"
 }
 ```
 
-`updated_at` 为 `null` 表示这个用户还没有 `human_insights` 行——还没跑过任何抽取——这时其余字段也都是 `null`/`[]`。现在没有汇总的"训练程度"分数了：`agent_training_level` 和原始的 `companion_insights` JSONB 都随 companion_insights 拆除（spec 2026-08-11）一起移除，上面这些类型化字段就是现在的全部返回内容。
+`education_level` 是 `secondary_or_below`、`associate`、`bachelor`、`master`、`doctorate` 之一，或 `null`；`education_status` 是 `enrolled`、`graduated` 或 `null`。`kinks`、`ideology`、`mental_health` 在这里会返回，因为这是用户自己的数据；服务导出从不携带它们。`updated_at` 是最近一次重建替换该行的时间。`updated_at` 为 `null` 表示这个用户还没有 `human_insights` 行——还没有任何一次重建落地——这时其余字段也都是 `null`/`[]`。现在没有汇总的"训练程度"分数了：`agent_training_level` 和原始的 `companion_insights` JSONB 都随 companion_insights 拆除（spec 2026-08-11）一起移除，上面这些类型化字段就是现在的全部返回内容。
 
 ### `GET /comp/instance/{instance_id}/profile`
 
@@ -2000,7 +2000,15 @@ session 403）。
 
 ## 服務端點
 
-`/svc/v1/*` 下是服務間路由。以共享 secret header 放行而非用戶 JWT，而且除非部署配置了該 secret，整棵子樹**不會掛載**——未配置的部署對該路徑的回應與任何未知路徑一致：不會是 `403`，也不會是 `200`。
+`/svc/v1/*` 下是服务间路由。以共享 secret header 放行而非用户 JWT。这些路由分成三棵子树，各自由自己的 secret 把守，消费方只持有它所读取的流对应的凭据；某棵子树的 secret 没有配置时，它**不会挂载**——未配置的子树对其路径的响应与任何未知路径一致：不会是 `403`，也不会是 `200`。secret 会 trim，空白视为未设置，少于 32 字节则拒绝启动。
+
+| Secret | Header | 路由 |
+|---|---|---|
+| `INSIGHTS_EXPORT_SECRET` | `x-insights-export-secret` | [`insights/changes`](#get-svcv1insightschanges)、[`memories/changes`](#get-svcv1memorieschanges)、[`insights/deletions`](#get-svcv1insightsdeletions) |
+| `FACTS_EXPORT_SECRET` | `x-facts-export-secret` | [`facts/changes`](#get-svcv1factschanges)、[`facts/deletions`](#get-svcv1factsdeletions) |
+| `USER_ERASE_SECRET` | `x-user-erase-secret` | [`POST users/{user_id}/erase`](#post-svcv1usersuser_iderase) |
+
+所有的流都用同样的方式 keyset 分页；它们背后的流水线见[洞察](insights.zh.md#导出与删除)。
 
 ### `GET /svc/v1/insights/changes`
 
@@ -2012,7 +2020,7 @@ session 403）。
 | `after_user` | nil UUID | `since` 內的 tie-break——傳 `next.user_id` |
 | `limit` | 500 | 夾在 1..=1000 |
 
-响应是 `{"profiles": [...], "next": {"updated_at": "…", "user_id": "…"}}`；`profiles` 每一项与 [`GET /comp/user/{user_id}/profile`](#get-compuseruser_idprofile) 同形，其中 `updated_at` 一定有值。
+响应是 `{"profiles": [...], "next": {"updated_at": "…", "user_id": "…"}}`；`profiles` 每一项带有 [`GET /comp/user/{user_id}/profile`](#get-compuseruser_idprofile) 的画像字段，**但不含 `kinks`、`ideology`、`mental_health`，这三个字段从不导出**，其中 `updated_at` 一定有值。`updated_at` 在一次重建替换画像时移动。用户被抹除后，该行会从这条流里无声消失；请读 [`insights/deletions`](#get-svcv1insightsdeletions) 得知这件事。
 
 行按 `(updated_at, user_id)` 排序。頁滿時才有 `next`；同一次遍歷內，把它的兩個字段原樣傳回 `since` 與 `after_user`——保留微秒精度、URL 編碼——`next` 為 `null` 即結束。截斷時間戳的客戶端（JavaScript `Date` 只到毫秒）在 1000 行共享同一個 `now()` 時會無限重取同一頁。
 
@@ -2053,7 +2061,101 @@ curl -H "x-insights-export-secret: $INSIGHTS_EXPORT_SECRET" \
 
 **下一次轮询从哪里开始。** 记住最后一行的 `(created_at, id)`；每次新轮询从它往前几秒开始，`since = last.created_at − 5s`，不传 `after_id`。`created_at` 是插入事务开始的时刻，行要到提交才可见；engine 的插入事务都很短，重叠窗口足以覆盖这段间隔。重复回来的行无害：行写入后不再变，按 `id` 去重即可。
 
-**不导出删除。** 行只会随它的 session 一起消失（硬删除级联），导出不会报告这件事。
+**这条流里没有删除信息。** 行会随它的 session 一起消失（硬删除级联），也会随其用户被抹除而消失，这个导出两者都不报告。镜像用同一个 secret 读 [`insights/deletions`](#get-svcv1insightsdeletions) 来丢弃被抹除的用户。
+
+### `GET /svc/v1/insights/deletions`
+
+自某个 keyset 游标以来，引擎抹除过数据的用户，供画像与记忆的镜像照着丢弃。需要 `x-insights-export-secret`（缺失或错误回 403）。它与 [`facts/deletions`](#get-svcv1factsdeletions) 是同一条流，可用 insights secret 读取，所以该镜像不需要第二份凭据。没有逐条事实的删除：这条流是用户级的。
+
+| Query | 默认 | 含义 |
+|---|---|---|
+| `since` | Unix epoch | RFC 3339；严格晚于 `(since, after_user)` 的行 |
+| `after_user` | nil UUID | `since` 内的 tie-break——传 `next.user_id` |
+| `limit` | 500 | 夹在 1..=1000 |
+
+```json
+{
+  "erasures": [
+    { "user_id": "8d1f…", "erased_at": "2026-10-13T12:00:00.123456Z" }
+  ],
+  "next": { "erased_at": "2026-10-13T12:00:00.123456Z", "user_id": "8d1f…" }
+}
+```
+
+行按 `(erased_at, user_id)` 排序；页满时才有 `next`，把它原样传回 `since` 与 `after_user`，直到它为 `null`。**镜像必须丢弃它在这里读到的每个 `user_id` 名下的全部内容**：抹除会删掉该用户的画像、记忆和事实行，任何 changes 流都无法报告这件事。对同一用户重复抹除会把 `erased_at` 往前移，所以用户可能在流里再次出现；丢弃一个已经丢弃过的用户是空操作。续接方式与其他流相同：记住最后的 `(erased_at, user_id)`，下一次轮询从它往前几秒开始。
+
+### `GET /svc/v1/facts/changes`
+
+自某个 keyset 游标以来首次出现或再次出现的账本事实，供镜像引擎对每个用户挖出的内容的下游服务使用（见[洞察](insights.zh.md#事实账本)）。需要 `x-facts-export-secret: <FACTS_EXPORT_SECRET>`（缺失或错误回 403）。
+
+| Query | 默认 | 含义 |
+|---|---|---|
+| `since` | Unix epoch | RFC 3339；严格晚于 `(since, after_id)` 的行 |
+| `after_id` | nil UUID | `since` 内的 tie-break——传 `next.id` |
+| `limit` | 500 | 夹在 1..=1000 |
+
+```bash
+curl -H "x-facts-export-secret: $FACTS_EXPORT_SECRET" \
+  "http://localhost:8080/svc/v1/facts/changes?limit=1"
+```
+
+```json
+{
+  "facts": [
+    {
+      "id": "5b7e…",
+      "user_id": "8d1f…",
+      "content": "用户养了一只猫",
+      "category": "fact",
+      "domain": "lifestyle",
+      "evidence_type": "explicit_statement",
+      "temporality": "current",
+      "persistence": "ongoing",
+      "confidence": "high",
+      "occurrences": 3,
+      "session_count": 2,
+      "recurrence": "repeated_across_sessions",
+      "first_seen_at": "2026-10-13T12:00:00.123456Z",
+      "last_seen_at": "2026-10-20T09:30:00.654321Z"
+    }
+  ],
+  "next": { "last_seen_at": "2026-10-20T09:30:00.654321Z", "id": "5b7e…" }
+}
+```
+
+`recurrence` 是 `once`、`repeated_in_session` 或 `repeated_across_sessions`；六个标签取自引擎的封闭词表。session、消息和 run 的指针留在引擎内部。行按 `(last_seen_at, id)` 排序，分页与画像导出相同：页满时才有 `next`；把它的两个字段原样传回 `since` 与 `after_id`，保留微秒精度，直到 `next` 为 `null`。
+
+一次复现会移动 `last_seen_at`，所以每当计数器变化，该行就会再出现一次；按 `id` 去重，以最后一次为准。行只会通过抹除离开账本，见 [`facts/deletions`](#get-svcv1factsdeletions)。
+
+**下一次轮询从哪里开始。** 记住最后一行的 `(last_seen_at, id)`；每次新轮询从它*之前*开始，不传 `after_id`。`last_seen_at` 由写账本的那条语句自己打上（`now()`；复现时只进不退），只比提交早一条短语句：重叠几秒就够。
+
+### `GET /svc/v1/facts/deletions`
+
+与 [`insights/deletions`](#get-svcv1insightsdeletions) 是同一条抹除流——相同的 query、相同的响应、相同的含义——用 `x-facts-export-secret` 放行，供事实的镜像使用。持有事实的镜像必须丢弃它在这里读到的每个 `user_id`。
+
+### `POST /svc/v1/users/{user_id}/erase`
+
+抹除引擎关于某个用户派生出的一切，并把该用户列入删除流。供部署在用户删除账号时调用。需要 `x-user-erase-secret: <USER_ERASE_SECRET>`（缺失或错误回 403；`user_id` 不是 UUID 回 400）。这棵子树挂在自己的 secret 之下，所以即使部署没有启用任何导出，抹除也能用。
+
+```bash
+curl -X POST -H "x-user-erase-secret: $USER_ERASE_SECRET" \
+  "http://localhost:8080/svc/v1/users/8d1f…/erase"
+```
+
+```json
+{
+  "user_id": "8d1f…",
+  "erased_at": "2026-10-13T12:00:00.123456Z",
+  "deleted": { "human_facts": 41, "human_insights": 1, "human_profile_state": 1, "companion_memories": 63, "user_insights": 2, "…": 0 },
+  "blanked": { "companion_insights_events": 87, "companion_affinity": 2, "…": 0 }
+}
+```
+
+`deleted` 统计被移除的行，`blanked` 统计内容被清空但保留的行（id 与时间戳保留），都按表名列出。每张覆盖到的表都会列出（示例做了省略），没有可做的就是 `0`；`blanked` 只统计仍然带有内容的行。这些表列在[洞察 → 抹除](insights.zh.md#抹除)。聊天 session 与消息归调用方，不会被触碰。
+
+- **幂等。** 重复调用什么都找不到，各处报 `0`，并把 `erased_at` 往前移。
+- **请在删除该用户的 session 或角色实例之前调用。** 按关系分开的 insight 表只以实例为键，只有实例行还在时才够得着它们。
+- **先停掉该用户的流量。** 已经在进行中的第一段抽取可能在抹除提交之后写入事实；再调用一次清理。（进行中的重建写不回画像。）
 
 ## 錯誤響應
 
@@ -2071,7 +2173,7 @@ curl -H "x-insights-export-secret: $INSIGHTS_EXPORT_SECRET" \
 |--------|------|------|
 | 400 | `bad_request` | 請求體格式錯、UUID 無效、缺必填字段 |
 | 401 | `unauthorized` | JWT 缺失 / 格式錯 / 過期 / 密鑰不符 |
-| 403 | `forbidden` | 路徑 user 跟 JWT user 不匹配，或想讀別人的 session；或 `/svc/v1/*` 上 `x-insights-export-secret` 缺失或錯誤 |
+| 403 | `forbidden` | 路徑 user 跟 JWT user 不匹配，或想讀別人的 session；或 `/svc/v1/*` 的某个 secret header（`x-insights-export-secret`、`x-facts-export-secret`、`x-user-erase-secret`）缺失或錯誤 |
 | 404 | `not_found` | session / 人格 / 消息 id 不存在 |
 | 409 | `conflict` | 资源当前的状态不允许这个操作。reaction 路由和改图在收到群 session 时返回它，`message` 里含 `wrong_channel`。1:1 的流式与异步发送、`/open`、`/events`、`/effects` 和生活选择路由拒绝群 session 时改用带代码的响应体（`code: wrong_channel`），群路由拒绝非群 session 时也一样 |
 | 500 | `internal` | 其餘一切（DB 錯、LLM API 錯等） |

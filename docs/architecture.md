@@ -63,8 +63,9 @@ spawn post_process     tokio::spawn — runs concurrent with response return:
                        - affinity persist (LLM judge grades the turn →
                          engine grade pipeline → DB)
                        - memory   (Voyage embed → pgvector upsert)
-                       - insight  (LLM extracts facts → human_insights UPSERT,
-                         per-column incremental)
+                       - insight  (LLM extracts facts → human_facts ledger;
+                         a scheduled rebuild derives the human_insights
+                         profile from it, never per turn)
                        - character insight (LLM extracts facts about the AI
                          persona → character_insights UPSERT, experimental)
                        - user insight (LLM extracts facts about the real user,
@@ -125,11 +126,14 @@ eros-engine-server :8080
                        companion_affinity / companion_affinity_events
                        companion_memories (vector(512))
                        persona_genomes / persona_instances / persona_instance_items
-                       human_insights
+                       human_facts / human_profile_state / human_insights
+                       user_erasures
                        companion_decision_events
                        chat_images_events / chat_vision_events
                        llm_generations (every LLM call, audit)
 ```
+
+The insight step records each turn's facts in a per-user ledger, and a scheduled profile rebuild (when 20 new facts have arrived, or after an idle period) derives the `human_insights` row from the ledger; see [insights.md](insights.md).
 
 The post-process spawn returns `()` and is fire-and-forget by design — the user-facing response doesn't block on the affinity / memory / insight writes. If any of them fail, the chat reply still lands; failures are logged but not surfaced.
 
@@ -201,7 +205,10 @@ crates/
 │       ├── affinity.rs       # AffinityRepo (persist_with_event, record_ghost, persist_life_choice_drop_in_tx)
 │       ├── memory.rs         # MemoryRepo (Profile/Relationship layers)
 │       ├── insight.rs        # InsightEventRepo (companion_insights_events audit rows)
-│       ├── human_insight.rs  # HumanInsightRepo (typed profile columns, per-field UPSERT)
+│       ├── human_fact.rs     # HumanFactRepo (the user's fact ledger: dedup upsert, export keyset)
+│       ├── profile_state.rs  # ProfileStateRepo (rebuild counter, claim, outcomes)
+│       ├── erasure.rs        # ErasureRepo (user erase, deletion stream)
+│       ├── human_insight.rs  # HumanInsightRepo (typed profile columns, full-row replace by the rebuild)
 │       ├── character_insight.rs # CharacterInsightRepo + event/snapshot repos (AI character's profile, experimental)
 │       ├── user_insight.rs   # UserInsightRepo + event/snapshot repos (the real user's per-relationship profile, experimental)
 │       └── persona.rs        # PersonaRepo (upsert_genome for seeding)

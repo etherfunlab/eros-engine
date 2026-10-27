@@ -55,11 +55,11 @@ backstory 是 canon，不可与之冲突。每轮输出更新后的完整 insigh
 current_background 是角色此刻所处的状态，会按 when 结束：digest 与 insight 不得与它矛盾；\
 写到它时写成有终点的事（这几天在外地出差），不要写成长期状态。";
 
-/// Persona-side life-base schema: superset of COMPANION_INSIGHTS_SCHEMA
-/// (prompt.rs), reworded for the persona, flat (matching preferences
-/// pre-flattened). The field LIST is the engine's contract — the operator
-/// filter_prompt may steer richness, never the list. Kept in lockstep with
-/// `STORY_INSIGHT_FIELDS` + the 0038 DDL (tested).
+/// Persona-side life-base schema: flat profile-style fields (city, hometown,
+/// occupation, interests, ...) written to describe the persona, plus the four
+/// story-exclusive columns. The field LIST is the engine's contract — the
+/// operator filter_prompt may steer richness, never the list. Kept in lockstep
+/// with `STORY_INSIGHT_FIELDS` + the 0038 DDL (tested).
 pub const PERSONA_STORY_INSIGHTS_SCHEMA: &str = r#"
 persona_story_insights schema（角色人生底座；所有字段可选；只输出下列字段，不要新增/编造字段名）：
 {
