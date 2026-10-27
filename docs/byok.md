@@ -41,10 +41,14 @@ greetings, event messages, voice turns, image edits and group turns do not take 
       "chat": "https://api.example.com/v1/chat/completions",
       "api_key": "sk-…",
       "headers": { "X-Org": "…" }
+    },
+    "demonroute": {
+      "chat": "https://api.demonroute.com/v1/chat/completions",
+      "api_key": "sk-…"
     }
   },
   "model": "gpt-x@mine",
-  "fallback": ["other-model@mine"],
+  "fallback": ["other-model@demonroute"],
   "retry_depth": 1,
   "output_regex": [{ "pattern": "\\s*\\[note:[^\\]]*\\]\\s*$" }],
   "fallback_to_platform": false

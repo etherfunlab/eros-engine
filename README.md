@@ -140,6 +140,12 @@ The personas in `examples/personas/` are adult character-chat examples. They may
 
 Per-request behavior can also be adjusted through [`prompt_traits`](docs/prompt-traits.md). The engine treats this text as opaque; your frontend or middleware owns its policy.
 
+## Partners
+
+- **[DemonRoute](https://demonroute.com/etherfun)** — Prepaid, privacy-first gateway to open-weight and uncensored models. No IP logs, prompts never retained. Works through `[providers]` and BYOK → [Model config](docs/model-config.md) · [BYOK](docs/byok.md)
+
+<sub>Partner links may earn eros-engine a referral commission.</sub>
+
 ## Contributing
 
 Read [`CONTRIBUTING.md`](CONTRIBUTING.md). Contributors accept the [`CLA`](CLA.md) through cla-assistant.io on their first PR.
