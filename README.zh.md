@@ -142,7 +142,7 @@ cargo run -p eros-engine-server -- serve
 
 ## 合作伙伴
 
-- **[DemonRoute](https://demonroute.com/etherfun)**——预付费、隐私优先的模型网关，提供开放权重模型与无审查模型。不记录 IP 日志，提示词从不留存。可通过 `[providers]` 与 BYOK 接入。→ [模型配置](docs/model-config.zh.md) · [BYOK](docs/byok.zh.md)
+- **[DemonRoute](https://demonroute.com/etherfun)**——预付费、隐私优先的模型网关，提供开放权重模型与无审查模型。不记录 IP 日志，提示词从不留存。可通过 `[providers]` 与 BYOK 接入。→ [模型配置](docs/model-config.md) · [BYOK](docs/byok.md)
 
 <sub>合作伙伴链接可能为 eros-engine 带来推荐佣金。</sub>
 
