@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsightMode {
     Off,
-    /// Drop the intimate fields: love_values / emotional_needs / interests.
+    /// Drop the intimate fields: love_values / relationship_history /
+    /// interests / emotional_needs / family / finance_status / kinks /
+    /// mental_health.
     Neutral,
     Full,
 }

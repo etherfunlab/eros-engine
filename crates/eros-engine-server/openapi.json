@@ -5434,7 +5434,7 @@
       },
       "InsightExportRow": {
         "type": "object",
-        "description": "One `human_insights` row as exported. All 21 data columns: the export does\nnot guess which ones a consumer wants.",
+        "description": "One `human_insights` row as exported: every profile column except the\nsensitive three (`kinks`, `ideology`, `mental_health`), which this export\nnever carries.",
         "required": [
           "user_id",
           "interests",
@@ -5443,26 +5443,6 @@
           "updated_at"
         ],
         "properties": {
-          "age_max": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int32"
-          },
-          "age_min": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int32"
-          },
-          "city": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "deal_breakers": {
             "type": "array",
             "items": {
@@ -5470,6 +5450,18 @@
             }
           },
           "education": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "education_level": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "education_status": {
             "type": [
               "string",
               "null"
@@ -5499,12 +5491,6 @@
               "null"
             ]
           },
-          "hometown": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "interests": {
             "type": "array",
             "items": {
@@ -5512,12 +5498,6 @@
             }
           },
           "life_rhythm": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "location": {
             "type": [
               "string",
               "null"
@@ -5535,12 +5515,6 @@
               "null"
             ]
           },
-          "nationality": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "occupation": {
             "type": [
               "string",
@@ -5552,12 +5526,6 @@
             "items": {
               "type": "string"
             }
-          },
-          "preferred_gender": {
-            "type": [
-              "string",
-              "null"
-            ]
           },
           "relationship_history": {
             "type": [
@@ -6197,29 +6165,10 @@
           "user_id",
           "interests",
           "personality_traits",
-          "deal_breakers"
+          "deal_breakers",
+          "kinks"
         ],
         "properties": {
-          "age_max": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int32"
-          },
-          "age_min": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int32"
-          },
-          "city": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "deal_breakers": {
             "type": "array",
             "items": {
@@ -6231,6 +6180,20 @@
               "string",
               "null"
             ]
+          },
+          "education_level": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "One of `secondary_or_below` / `associate` / `bachelor` / `master` /\n`doctorate`."
+          },
+          "education_status": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`enrolled` or `graduated`."
           },
           "emotional_needs": {
             "type": [
@@ -6256,7 +6219,7 @@
               "null"
             ]
           },
-          "hometown": {
+          "ideology": {
             "type": [
               "string",
               "null"
@@ -6268,13 +6231,13 @@
               "type": "string"
             }
           },
-          "life_rhythm": {
-            "type": [
-              "string",
-              "null"
-            ]
+          "kinks": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           },
-          "location": {
+          "life_rhythm": {
             "type": [
               "string",
               "null"
@@ -6292,7 +6255,7 @@
               "null"
             ]
           },
-          "nationality": {
+          "mental_health": {
             "type": [
               "string",
               "null"
@@ -6309,12 +6272,6 @@
             "items": {
               "type": "string"
             }
-          },
-          "preferred_gender": {
-            "type": [
-              "string",
-              "null"
-            ]
           },
           "relationship_history": {
             "type": [

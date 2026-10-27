@@ -28,15 +28,12 @@ pub(crate) const EXPORT_SECRET_HEADER: &str = "x-insights-export-secret";
 const DEFAULT_LIMIT: i64 = 500;
 const MAX_LIMIT: i64 = 1000;
 
-/// One `human_insights` row as exported. All 21 data columns: the export does
-/// not guess which ones a consumer wants.
+/// One `human_insights` row as exported: every profile column except the
+/// sensitive three (`kinks`, `ideology`, `mental_health`), which this export
+/// never carries.
 #[derive(Serialize, ToSchema)]
 pub struct InsightExportRow {
     pub user_id: Uuid,
-    pub city: Option<String>,
-    pub location: Option<String>,
-    pub hometown: Option<String>,
-    pub nationality: Option<String>,
     pub occupation: Option<String>,
     pub mbti_guess: Option<String>,
     pub love_values: Option<String>,
@@ -44,11 +41,10 @@ pub struct InsightExportRow {
     pub life_rhythm: Option<String>,
     pub interests: Vec<String>,
     pub personality_traits: Vec<String>,
-    pub preferred_gender: Option<String>,
-    pub age_min: Option<i32>,
-    pub age_max: Option<i32>,
     pub deal_breakers: Vec<String>,
     pub education: Option<String>,
+    pub education_level: Option<String>,
+    pub education_status: Option<String>,
     pub family: Option<String>,
     pub relationship_history: Option<String>,
     pub social_pattern: Option<String>,
@@ -61,10 +57,6 @@ impl From<HumanInsightsRow> for InsightExportRow {
     fn from(r: HumanInsightsRow) -> Self {
         Self {
             user_id: r.user_id,
-            city: r.city,
-            location: r.location,
-            hometown: r.hometown,
-            nationality: r.nationality,
             occupation: r.occupation,
             mbti_guess: r.mbti_guess,
             love_values: r.love_values,
@@ -72,11 +64,10 @@ impl From<HumanInsightsRow> for InsightExportRow {
             life_rhythm: r.life_rhythm,
             interests: r.interests,
             personality_traits: r.personality_traits,
-            preferred_gender: r.preferred_gender,
-            age_min: r.age_min,
-            age_max: r.age_max,
             deal_breakers: r.deal_breakers,
             education: r.education,
+            education_level: r.education_level,
+            education_status: r.education_status,
             family: r.family,
             relationship_history: r.relationship_history,
             social_pattern: r.social_pattern,
@@ -507,10 +498,6 @@ mod tests {
         let updated_at = Utc.with_ymd_and_hms(2026, 10, 13, 12, 0, 0).unwrap();
         let row = HumanInsightsRow {
             user_id,
-            city: Some("city".into()),
-            location: Some("location".into()),
-            hometown: Some("hometown".into()),
-            nationality: Some("nationality".into()),
             occupation: Some("occupation".into()),
             mbti_guess: Some("mbti_guess".into()),
             love_values: Some("love_values".into()),
@@ -518,25 +505,23 @@ mod tests {
             life_rhythm: Some("life_rhythm".into()),
             interests: vec!["interests_0".into(), "interests_1".into()],
             personality_traits: vec!["personality_traits_0".into()],
-            preferred_gender: Some("preferred_gender".into()),
-            age_min: Some(21),
-            age_max: Some(35),
             deal_breakers: vec!["deal_breakers_0".into(), "deal_breakers_1".into()],
             education: Some("education".into()),
+            education_level: Some("education_level".into()),
+            education_status: Some("education_status".into()),
             family: Some("family".into()),
             relationship_history: Some("relationship_history".into()),
             social_pattern: Some("social_pattern".into()),
             future_plans: Some("future_plans".into()),
             finance_status: Some("finance_status".into()),
+            kinks: vec!["kinks_0".into()],
+            ideology: Some("ideology".into()),
+            mental_health: Some("mental_health".into()),
             updated_at,
         };
 
         let out = InsightExportRow::from(row);
         assert_eq!(out.user_id, user_id);
-        assert_eq!(out.city.as_deref(), Some("city"));
-        assert_eq!(out.location.as_deref(), Some("location"));
-        assert_eq!(out.hometown.as_deref(), Some("hometown"));
-        assert_eq!(out.nationality.as_deref(), Some("nationality"));
         assert_eq!(out.occupation.as_deref(), Some("occupation"));
         assert_eq!(out.mbti_guess.as_deref(), Some("mbti_guess"));
         assert_eq!(out.love_values.as_deref(), Some("love_values"));
@@ -544,14 +529,13 @@ mod tests {
         assert_eq!(out.life_rhythm.as_deref(), Some("life_rhythm"));
         assert_eq!(out.interests, vec!["interests_0", "interests_1"]);
         assert_eq!(out.personality_traits, vec!["personality_traits_0"]);
-        assert_eq!(out.preferred_gender.as_deref(), Some("preferred_gender"));
-        assert_eq!(out.age_min, Some(21));
-        assert_eq!(out.age_max, Some(35));
         assert_eq!(
             out.deal_breakers,
             vec!["deal_breakers_0", "deal_breakers_1"]
         );
         assert_eq!(out.education.as_deref(), Some("education"));
+        assert_eq!(out.education_level.as_deref(), Some("education_level"));
+        assert_eq!(out.education_status.as_deref(), Some("education_status"));
         assert_eq!(out.family.as_deref(), Some("family"));
         assert_eq!(
             out.relationship_history.as_deref(),
@@ -561,6 +545,50 @@ mod tests {
         assert_eq!(out.future_plans.as_deref(), Some("future_plans"));
         assert_eq!(out.finance_status.as_deref(), Some("finance_status"));
         assert_eq!(out.updated_at, updated_at);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn exported_row_has_education_level_but_not_sensitive_or_retired_columns(
+        pool: sqlx::PgPool,
+    ) {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO engine.human_insights \
+               (user_id, occupation, education_level, education_status, \
+                kinks, ideology, mental_health, city, age_min) \
+             VALUES ($1, '设计师', 'bachelor', 'enrolled', '{\"k\"}', 'liberal', 'anxious', \
+                     '上海', 20)",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (status, body) = get(
+            app_with_secret(pool, Some(SECRET)),
+            "/svc/v1/insights/changes",
+            Some(SECRET),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let row = body["profiles"][0].as_object().expect("one exported row");
+        assert_eq!(row["education_level"], "bachelor");
+        assert_eq!(row["education_status"], "enrolled");
+        assert_eq!(row["occupation"], "设计师");
+        for key in [
+            "kinks",
+            "ideology",
+            "mental_health",
+            "city",
+            "location",
+            "hometown",
+            "nationality",
+            "preferred_gender",
+            "age_min",
+            "age_max",
+        ] {
+            assert!(!row.contains_key(key), "{key} must not be exported");
+        }
     }
 
     #[test]

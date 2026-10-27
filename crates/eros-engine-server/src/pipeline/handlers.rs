@@ -593,11 +593,10 @@ fn build_profile_groups(
     vec![]
 }
 
-/// Render a `human_insights` row as 基础画像 bullets. `InsightMode::Full`
-/// renders every field in canonical label order; `Neutral` drops the
-/// intimate fields (love_values / relationship_history / interests /
-/// emotional_needs / family / finance_status).
-/// Matching-only columns (preferred_gender / age / deal_breakers) are never
+/// Render a `human_insights` row as 基础画像 bullets in a fixed label order.
+/// `InsightMode::Full` renders every field; `Neutral` drops the intimate ones
+/// (love_values / relationship_history / interests / emotional_needs /
+/// family / finance_status / kinks / mental_health). `deal_breakers` is never
 /// rendered. `Off` → empty (defensive; loaders gate it before calling).
 pub(crate) fn human_insights_to_bullets(row: &HumanInsightsRow, mode: InsightMode) -> Vec<String> {
     if matches!(mode, InsightMode::Off) {
@@ -624,13 +623,22 @@ pub(crate) fn human_insights_to_bullets(row: &HumanInsightsRow, mode: InsightMod
     };
     let intimate = matches!(mode, InsightMode::Full);
 
-    push_str(&mut out, &row.city, "城市");
-    push_str(&mut out, &row.location, "所在地");
-    push_str(&mut out, &row.hometown, "老家");
-    push_str(&mut out, &row.nationality, "国籍");
     push_str(&mut out, &row.occupation, "职业");
     push_str(&mut out, &row.education, "教育");
+    if let Some(level) = row
+        .education_level
+        .as_deref()
+        .and_then(education_level_label)
+    {
+        let status = match row.education_status.as_deref() {
+            Some("enrolled") => "·在读",
+            Some("graduated") => "·已毕业",
+            _ => "",
+        };
+        out.push(format!("学历：{level}{status}"));
+    }
     push_str(&mut out, &row.mbti_guess, "MBTI");
+    push_str(&mut out, &row.ideology, "意识形态");
     if intimate {
         push_str(&mut out, &row.love_values, "感情观");
         push_str(&mut out, &row.relationship_history, "感情经历");
@@ -638,12 +646,26 @@ pub(crate) fn human_insights_to_bullets(row: &HumanInsightsRow, mode: InsightMod
         push_str(&mut out, &row.emotional_needs, "情感需求");
         push_str(&mut out, &row.family, "家庭");
         push_str(&mut out, &row.finance_status, "经济状况");
+        push_arr(&mut out, &row.kinks, "性癖");
+        push_str(&mut out, &row.mental_health, "心理健康");
     }
     push_str(&mut out, &row.life_rhythm, "作息");
     push_str(&mut out, &row.social_pattern, "社交模式");
     push_arr(&mut out, &row.personality_traits, "性格特质");
     push_str(&mut out, &row.future_plans, "未来计划");
     out
+}
+
+/// The 学历 label for a stored `education_level` code; an unknown code has none.
+fn education_level_label(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "secondary_or_below" => "中学及以下",
+        "associate" => "专科",
+        "bachelor" => "本科",
+        "master" => "硕士",
+        "doctorate" => "博士",
+        _ => return None,
+    })
 }
 
 /// The lingering effects of accepted gives on the session's last turns
@@ -1173,7 +1195,7 @@ mod tests {
     // doesn't justify its weight for a single thin function.
 
     use crate::routes::companion::testutil::seed_persona_instance;
-    use eros_engine_store::human_insight::HumanInsightRepo;
+    use eros_engine_store::human_insight::{project_profile, HumanInsightRepo};
     use eros_engine_store::memory::{MemoryLayer, MemoryRepo};
     use sqlx::PgPool;
 
@@ -1720,10 +1742,6 @@ mod tests {
     fn sample_human_row() -> HumanInsightsRow {
         HumanInsightsRow {
             user_id: Uuid::new_v4(),
-            city: Some("上海".into()),
-            location: None,
-            hometown: None,
-            nationality: None,
             occupation: Some("设计师".into()),
             mbti_guess: Some("INFP".into()),
             love_values: Some("慢热".into()),
@@ -1731,16 +1749,18 @@ mod tests {
             life_rhythm: Some("夜猫子".into()),
             interests: vec!["登山".into(), "摄影".into()],
             personality_traits: vec!["温柔".into()],
-            preferred_gender: Some("female".into()),
-            age_min: Some(25),
-            age_max: Some(35),
             deal_breakers: vec!["抽烟".into()],
-            education: Some("美院本科".into()),
+            education: Some("美院".into()),
+            education_level: Some("bachelor".into()),
+            education_status: Some("enrolled".into()),
             family: Some("独生女，父母在杭州".into()),
             relationship_history: Some("单身两年".into()),
             social_pattern: Some("小圈子聚会".into()),
             future_plans: Some("想开工作室".into()),
             finance_status: Some("攒钱中".into()),
+            kinks: vec!["束缚".into(), "角色扮演".into()],
+            ideology: Some("偏自由派".into()),
+            mental_health: Some("长期失眠".into()),
             updated_at: chrono::Utc::now(),
         }
     }
@@ -1751,16 +1771,19 @@ mod tests {
         assert_eq!(
             bullets,
             vec![
-                "城市：上海",
                 "职业：设计师",
-                "教育：美院本科",
+                "教育：美院",
+                "学历：本科·在读",
                 "MBTI：INFP",
+                "意识形态：偏自由派",
                 "感情观：慢热",
                 "感情经历：单身两年",
                 "兴趣：登山、摄影",
                 "情感需求：被理解",
                 "家庭：独生女，父母在杭州",
                 "经济状况：攒钱中",
+                "性癖：束缚、角色扮演",
+                "心理健康：长期失眠",
                 "作息：夜猫子",
                 "社交模式：小圈子聚会",
                 "性格特质：温柔",
@@ -1775,57 +1798,63 @@ mod tests {
         assert_eq!(
             bullets,
             vec![
-                "城市：上海",
                 "职业：设计师",
-                "教育：美院本科",
+                "教育：美院",
+                "学历：本科·在读",
                 "MBTI：INFP",
+                "意识形态：偏自由派",
                 "作息：夜猫子",
                 "社交模式：小圈子聚会",
                 "性格特质：温柔",
                 "未来计划：想开工作室",
             ]
         );
-        // Intimate additions (感情经历/家庭/经济状况) join love_values/interests/
-        // emotional_needs in the Full-only cluster; matching-only columns are
-        // never rendered in any mode — proven by the exact vec above.
-    }
-
-    fn sample_geo_row() -> HumanInsightsRow {
-        HumanInsightsRow {
-            user_id: Uuid::new_v4(),
-            city: Some("深圳".into()),
-            location: Some("台北".into()),
-            hometown: Some("新界".into()),
-            nationality: Some("中国香港".into()),
-            occupation: None,
-            mbti_guess: None,
-            love_values: None,
-            emotional_needs: None,
-            life_rhythm: None,
-            interests: vec![],
-            personality_traits: vec![],
-            preferred_gender: None,
-            age_min: None,
-            age_max: None,
-            deal_breakers: vec![],
-            education: None,
-            family: None,
-            relationship_history: None,
-            social_pattern: None,
-            future_plans: None,
-            finance_status: None,
-            updated_at: chrono::Utc::now(),
-        }
+        // deal_breakers is never rendered in any mode — proven by the exact
+        // vecs here and above.
     }
 
     #[test]
-    fn human_insights_renders_geo_cluster_in_both_modes() {
+    fn human_insights_education_level_labels_and_status() {
+        let render = |level: Option<&str>, status: Option<&str>| {
+            let mut row = sample_human_row();
+            row.education_level = level.map(String::from);
+            row.education_status = status.map(String::from);
+            human_insights_to_bullets(&row, InsightMode::Neutral)
+                .into_iter()
+                .find(|b| b.starts_with("学历："))
+        };
+        for (code, label) in [
+            ("secondary_or_below", "中学及以下"),
+            ("associate", "专科"),
+            ("bachelor", "本科"),
+            ("master", "硕士"),
+            ("doctorate", "博士"),
+        ] {
+            assert_eq!(render(Some(code), None), Some(format!("学历：{label}")));
+        }
+        assert_eq!(
+            render(Some("master"), Some("graduated")).as_deref(),
+            Some("学历：硕士·已毕业")
+        );
+        assert_eq!(
+            render(Some("master"), Some("bogus")).as_deref(),
+            Some("学历：硕士"),
+            "an unknown status adds no suffix"
+        );
+        assert_eq!(render(Some("phd"), Some("enrolled")), None);
+        assert_eq!(render(None, Some("enrolled")), None);
+    }
+
+    #[test]
+    fn human_insights_never_render_a_geo_line() {
         for mode in [InsightMode::Full, InsightMode::Neutral] {
-            let bullets = human_insights_to_bullets(&sample_geo_row(), mode);
-            assert_eq!(
-                bullets,
-                vec!["城市：深圳", "所在地：台北", "老家：新界", "国籍：中国香港"]
-            );
+            let bullets = human_insights_to_bullets(&sample_human_row(), mode);
+            for label in ["城市", "所在地", "老家", "国籍"] {
+                assert!(
+                    bullets.iter().all(|b| !b.starts_with(label)),
+                    "{label} must not render in {mode:?}: {bullets:?}"
+                );
+            }
         }
     }
 
@@ -1839,23 +1868,31 @@ mod tests {
     async fn load_human_insight_bullets_neutral_vs_full(pool: PgPool) {
         let user_id = Uuid::new_v4();
         let insights = serde_json::json!({
-            "city": "北京", "occupation": "工程师",
-            "love_values": "认真", "interests": ["爬山"], "emotional_needs": "陪伴"
+            "occupation": "工程师", "ideology": "偏自由派",
+            "education_level": { "level": "master", "status": "graduated" },
+            "love_values": "认真", "interests": ["爬山"], "emotional_needs": "陪伴",
+            "kinks": ["束缚"], "mental_health": "长期失眠"
         });
         HumanInsightRepo { pool: &pool }
-            .apply_extraction(user_id, &insights)
+            .replace_profile(user_id, &project_profile(&insights))
             .await
             .unwrap();
 
         let full = load_human_insight_bullets(&pool, user_id, InsightMode::Full).await;
         assert!(full.iter().any(|b| b == "感情观：认真"));
         assert!(full.iter().any(|b| b == "兴趣：爬山"));
+        assert!(full.iter().any(|b| b == "性癖：束缚"));
+        assert!(full.iter().any(|b| b == "心理健康：长期失眠"));
 
         let neutral = load_human_insight_bullets(&pool, user_id, InsightMode::Neutral).await;
-        assert!(neutral.iter().any(|b| b == "城市：北京"));
-        assert!(neutral
-            .iter()
-            .all(|b| !b.contains("认真") && !b.contains("爬山") && !b.contains("陪伴")));
+        assert!(neutral.iter().any(|b| b == "职业：工程师"));
+        assert!(neutral.iter().any(|b| b == "学历：硕士·已毕业"));
+        assert!(neutral.iter().any(|b| b == "意识形态：偏自由派"));
+        assert!(neutral.iter().all(|b| !b.contains("认真")
+            && !b.contains("爬山")
+            && !b.contains("陪伴")
+            && !b.contains("束缚")
+            && !b.contains("失眠")));
 
         let off = load_human_insight_bullets(&pool, user_id, InsightMode::Off).await;
         assert!(off.is_empty());
