@@ -129,7 +129,7 @@ Frame fields worth noting:
 - **`cast`**, **`speaker_error`** — group turns only; see [group-chat.md](group-chat.md#one-turn). A 1:1 stream never emits them.
 - **`reasoning`** — `content`: a piece of the PDE judge's reasoning text (`{"type":"reasoning","content":"…"}`). Zero or more, sent first, ahead of `action_response`, `body_state` and the first `meta`. They appear whenever the judge's model returns reasoning; a body rule can turn reasoning on, and `reasoning = { enabled = false }` or `{ exclude = true }` turns it off (see [model-config.md](model-config.md)). When the judge returns none, the 1:1 frame sequence is unchanged. The content is display-only and decides nothing; whether to show it in full, collapsed or as a "thinking" indicator is the client's choice. When the judge falls back to another model, that model's reasoning keeps appending; no reset frame is sent. A group turn's director streams the same frame before `cast`.
 - **`action_response`** — on a turn that carries an `action` only: `user_message_id` and `response` (`"accept"` | `"refuse"`). Sent once, before the first `meta`, and re-sent on an idempotent replay (`reasoning` frames are not persisted and are not re-sent). Clients must tolerate frame types they do not know. A turn that then ends in `error` did not take effect, and history carries no `response` for it.
-- **`body_state`** — the persona's state this turn's reply was written with: `user_message_id`; `effects`, the accepted gives still at work, newest first, each `{item, name?, quantity, level, phase, step, steps}` (`level` 1–4, `phase` `rising` | `peak` | `fading`, `step` of `steps`), `[]` when none; and `needs`, `{hunger, social, stamina, emotional}` each `low` | `mid` | `high`, or `null` when there is no rating (needs exist only with the LLM judge, see [model-config.md](model-config.md#taskspde_decision--opt-in-llm-pde-judge)). Sent once, when effects are at work or needs are known, after `action_response` (if any) and before the first `meta`, and re-sent on an idempotent replay.
+- **`body_state`** — the persona's state this turn's reply was written with: `user_message_id`; `effects`, the accepted gives still at work, newest first, each `{item, name?, quantity, level, phase, step, steps}` (`level` 1–4, `phase` `rising` | `peak` | `fading`, `step` of `steps`), `[]` when none; and `needs`, `{hunger, social, stamina, emotional, outing, indulgence}` each `low` | `mid` | `high`, or `null` when there is no rating (needs exist only with the LLM judge, see [model-config.md](model-config.md#taskspde_decision--opt-in-llm-pde-judge)). Sent once, when effects are at work or needs are known, after `action_response` (if any) and before the first `meta`, and re-sent on an idempotent replay.
 
 **A failed turn in history.** A turn that ends in `error` did not take effect: affinity did not move, and an action turn's user row carries no `response`. It usually also leaves a `system_error` notice whose `user_message_id` names that user row. It leaves none when a failed reply attempt was already saved before the turn failed: the reply chain ran out with no fallback phrase to serve (none is configured, or the chain is BYOK-only, see [byok.md](byok.md)), or the turn timed out after a hop had already failed. The queue row then settles `done`, and history keeps each failed attempt's assistant row: empty, or the partial text it streamed. An async turn runs the same pipeline but gets up to `CHAT_QUEUE_MAX_ATTEMPTS` attempts: one that fails before any reply attempt was saved is retried, and only its last attempt is settled as above. One that fails after a reply attempt was saved is not retried.
 
@@ -446,6 +446,8 @@ physical or custom action → chemistry), and a refused `tip` costs nothing (see
 | quantity > 5 | 4 3 3 2 1 | 1 2 3 4 4 | 1 3 4 2 1 |
 
 A turn is a user message of the text session; product-QA messages and voice calls do not count, and there is no time limit. The state reaches the judge, the reply prompt and the image composer, and the caller through the `body_state` frame and [`GET /v2/comp/session/{session_id}/effects`](#get-v2compsessionsession_ideffects). A refused give has no effect. Design: [lingering effects spec](superpowers/specs/2026-10-12-given-item-lingering-effects-design.md), [give categories spec](superpowers/specs/2026-10-13-give-categories-design.md).
+
+**A give of something she does not use.** The persona's `art_metadata.smoking`, `alcoholic` and `drug` say whether she smokes, drinks and uses weed (table [below](#post-v2compsessionsession_idevents)). A `give` of `cigarette`, `alcohol` or `herb` whose key is `false` is rolled once before the judge runs. One time in three the turn goes on as usual. Otherwise the response is `refuse`, whatever the judge answers and with or without the LLM judge: the `action_response` frame and the `response` the history routes return say `refuse`, the give leaves no effect, and it costs the bond line a tier like any refused give. The judge is told the outcome (see [model-config.md](model-config.md#taskspde_decision--opt-in-llm-pde-judge)). A key that is `true` or absent never rolls, nor does any other item or action.
 
 With an action, `content` may be empty, and it can be combined with
 `image_url` and `image`. Every value violation (bounds, missing
@@ -984,6 +986,8 @@ Kinds fall into four categories. `short` and `mid` are incidents; `body` and
 | `mid` | `watching_match` | 2–3 h | she is watching a match |
 | `mid` | `watching_show` | 2–3 h | she is at a show |
 | `mid` | `having_sex` | 1–2 h | she is having sex (offline, never announced) |
+| `mid` | `want_to_go_out` | 1–3 h | she badly wants to get out |
+| `mid` | `want_to_go_home` | 1–3 h | she badly wants to go home |
 | `body` | `sick` | 1–3 d | she is ill |
 | `body` | `period` | 3–7 d | her period |
 | `body` | `hospitalized` | 2–5 d | she is in hospital |
@@ -993,7 +997,7 @@ Kinds fall into four categories. `short` and `mid` are incidents; `body` and
 | `trip` | `long_trip` | 3–7 d | a long trip |
 | `trip` | `hometown_visit` | 72 h | a visit home |
 
-A range is drawn when the event starts. That is 50 drawable kinds. Both genders
+A range is drawn when the event starts. That is 52 drawable kinds. Both genders
 draw both gatherings, at the same weight; that is deliberate.
 
 Two more kinds are never drawn: `taking_space` (a separation she asked for and
@@ -1008,7 +1012,9 @@ a caller that serves them only to some users leaves them out with
 `{"disallow": ["sudden_desire", "having_sex", "pregnancy_scare"]}`. `scolded_by_superior` and
 `scolded_superior` assume someone above her; for a persona with no one above
 her, the caller disallows them. A `disallow` list leaves every other kind in,
-including kinds the engine adds later.
+including kinds the engine adds later. An array or an `allow` list draws only
+the kinds it names: a caller that allow-lists adds `want_to_go_out` and
+`want_to_go_home` to draw them.
 
 The draw:
 
@@ -1032,7 +1038,10 @@ The draw:
   at most once a week, and a `body` state at most once a fortnight, whichever
   kind. Any offline kind starts at most once every 12 hours, whichever kind.
 - **Her needs weight the pick** within a category, when the deployment runs the
-  LLM judge and the persona has a rating.
+  LLM judge and the persona has a rating: a high `outing` favours
+  `want_to_go_out`, a low one `want_to_go_home`, and a high `indulgence`
+  favours `want_to_go_out` and `irritable` (the full table is in
+  [life-events-needs.md](life-events-needs.md#1-needs-weight-the-kind-pick)).
 - **Closeness gates.** `ex_message` and `breakup` are not drawn for someone she
   barely knows (intimacy rung 2 and up); `sudden_desire` only at the closest
   rung (3). `period` is drawn only for a persona whose `art_metadata.gender` is
@@ -1050,6 +1059,7 @@ The draw:
   | `prefer_trip` | `true` / `false` (default) | trips come up three times as often; still once a week at most |
   | `homesick` | `true` / `false` / absent | where a trip goes: `true` favours `hometown_visit` and thins the leisure trips, `false` thins `hometown_visit`; `business_trip` untouched |
   | `is_virgin` | `true` / `false` (default) | `having_sex` is a fifth as likely until her first `having_sex` event, after which the key no longer applies |
+  | `smoking`, `alcoholic`, `drug` | each `true` / `false` / absent | whether she smokes, drinks, uses weed: the more are `true`, the sooner her `indulgence` comes back to `high` and weighs the pick; a `false` key can make her refuse a `give` of that thing ([above](#post-compchatsession_idmessagestream)) |
 
   A value of the wrong shape, an unknown kind or a kind outside `mid` is
   ignored. A preference never lifts a gate.
@@ -1181,7 +1191,7 @@ The persona's lingering state from accepted gives, her needs and the events unde
 
 ```json
 {"effects": [{"item": "alcohol", "name": "威士忌", "quantity": 3, "level": 2, "phase": "rising", "step": 2, "steps": 3}],
- "needs": {"hunger": "high", "social": "mid", "stamina": "low", "emotional": "mid"},
+ "needs": {"hunger": "high", "social": "mid", "stamina": "low", "emotional": "mid", "outing": "high", "indulgence": "mid"},
  "event": null,
  "background_event": {"kind": "short_trip", "category": "trip", "offline": false, "started_at": "2026-10-15T08:00:00Z", "ends_at": "2026-10-17T08:00:00Z", "message_id": "…"},
  "as_of": "2026-10-16T13:00:00Z",

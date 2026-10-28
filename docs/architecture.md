@@ -184,7 +184,7 @@ crates/
 │       ├── events.rs         # life event categories, kinds and the two-stage draw
 │       ├── ghost.rs          # score formula + 4-tier protection
 │       ├── group.rs          # group director normalization, fallback cast, transcript roles
-│       ├── needs.rs          # the persona's four needs (levels + time carry-forward)
+│       ├── needs.rs          # the persona's six needs and her habits (levels + time carry-forward)
 │       ├── pde.rs            # rules-based action decision
 │       ├── persona.rs        # PersonaGenome + Instance + CompanionPersona
 │       ├── scope.rs          # per-request injection scope (InsightMode / MemoryScope)

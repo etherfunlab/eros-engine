@@ -2,14 +2,14 @@
 
 [English](life-events-needs.md) · [中文](life-events-needs.zh.md)
 
-A persona has a day of her own, and two kinds of state follow it. **Needs** are four
-basic levels (hunger, social, stamina, emotional) that the PDE judge rates and the engine
-carries forward in time. **Life events** are things that happen to her, drawn when a
-caller asks: a trip, an illness, a stray cat, an hour away from her phone. Both reach the
-judge and the reply as plain facts in the present tense. Neither tells her how to behave;
-the exception is an event that is silence (the offline kinds). A third piece sits on top of
-both: when a relationship has worn thin she can ask for a break, the first *life choice*
-([the ask-for-space choice](#the-ask-for-space-choice)).
+A persona has a day of her own, and two kinds of state follow it. **Needs** are six
+basic levels (hunger, social, stamina, emotional, outing, indulgence) that the PDE judge
+rates and the engine carries forward in time. **Life events** are things that happen to
+her, drawn when a caller asks: a trip, an illness, a stray cat, an hour away from her
+phone. Both reach the judge and the reply as plain facts in the present tense. Neither
+tells her how to behave; the exception is an event that is silence (the offline kinds). A
+third piece sits on top of both: when a relationship has worn thin she can ask for a
+break, the first *life choice* ([the ask-for-space choice](#the-ask-for-space-choice)).
 
 Request and response shapes are in [api-reference.md](api-reference.md), the judge's
 context and verdict in
@@ -20,7 +20,7 @@ about how the pieces work and how they fit together.
 
 | | Needs | Life events |
 |---|---|---|
-| What it is | four levels: `hunger`, `social`, `stamina`, `emotional`, each `low` / `mid` / `high` | things that happen in her day, in four categories |
+| What it is | six levels: `hunger`, `social`, `stamina`, `emotional`, `outing`, `indulgence`, each `low` / `mid` / `high` | things that happen in her day, in four categories |
 | Written by | the PDE judge, on a judged text turn | a caller's `POST /v2/comp/session/{session_id}/events`; the engine picks the kind |
 | Stored in | `metadata.needs` of the rated user row | `engine.persona_events`, plus the message that tells it (none for an offline kind she does not announce) |
 | Scope | one state per persona instance, across all its sessions | the same |
@@ -34,7 +34,7 @@ Voice calls read needs and no events. Group turns read neither. Details follow.
 
 ## Needs
 
-### The four needs
+### The six needs
 
 | need | `low` | `high` | reply wording, `low` / `high` |
 |---|---|---|---|
@@ -42,6 +42,8 @@ Voice calls read needs and no events. Group turns read neither. Details follow.
 | `social` | wants no company | wants someone to talk to | 不想跟人打交道 / 想找人说说话 |
 | `stamina` | worn out | full of energy | 很累 / 精神很好 |
 | `emotional` | content | badly wants to be cared about | 心里挺满足 / 很想被在乎 |
+| `outing` | wants to stay in | wants to go out | 只想待在屋里 / 想出门走走 |
+| `indulgence` | no urge | wants to let loose: a smoke, a drink, weed | — / 很想抽根烟, 很想喝一杯, 很想抽口大麻 or 很想放纵一下 ([below](#where-needs-show-up)) |
 
 Levels are ordinals. The judge never reads or writes a number, and `mid` is the unremarkable
 middle.
@@ -52,10 +54,13 @@ Needs belong to the opt-in LLM judge (`[tasks.pde_decision].filter_prompt` set).
 there are no needs: no `[需求]` line, no reply line, `needs: null` on the frame and the
 effects route, no needs factor in the event draw, nothing in a voice call.
 
-- **The verdict.** The judge's JSON may carry `needs`: an object with all four keys, or `null`
+- **The verdict.** The judge's JSON may carry `needs`: an object with all six keys, or `null`
   for "no change, keep the previous rating". A value that does not parse reads as `null` and
-  never fails the verdict. The strict `response_format` requires all four keys inside a
-  non-null object.
+  never fails the verdict. The strict `response_format` requires all six keys inside a
+  non-null object. An object that has the first four but lacks `outing` or `indulgence` (a
+  judge prompt that does not ask for them, or a non-strict judge) keeps, for each missing
+  key, the level the judge was shown (`mid` before the first rating); one that lacks any of
+  the first four does not parse.
 - **What it rates.** The persona alone, never the relationship; the affinity evaluator rates
   that.
 - **Where it is stored.** On the user row of the turn the judge rated, as `metadata.needs`,
@@ -83,9 +88,20 @@ the rating, and stops there:
 | `social` | `high` | 12 h |
 | `stamina` | `mid` | 8 h |
 | `emotional` | `mid` | 12 h |
+| `outing` | `mid` | 8 h |
+| `indulgence`, no habit `true` | `mid` | 8 h |
+| `indulgence`, one habit `true` | `high` | 12 h |
+| `indulgence`, two habits `true` | `high` | 8 h |
+| `indulgence`, all three `true` | `high` | 4 h |
 
-Time away makes her hungry and wanting company; tiredness and emotional need settle toward
-the middle. A `low` hunger rated at noon reads `mid` at 16:00 and `high` from 20:00. The
+Time away makes her hungry and wanting company; tiredness, emotional need and the wish to go
+out or stay in settle toward the middle. A `low` hunger rated at noon reads `mid` at 16:00 and
+`high` from 20:00. The habits are the persona's `smoking`, `alcoholic` and `drug` keys
+([Persona settings](#persona-settings)); `false` and absent count alike. The more of them are
+`true`, the sooner the urge to let loose comes back after the judge rated it down. A rating
+stored without `outing` and `indulgence` reads both as `mid`. A BYOC persona's keys live on
+her card, which the engine opens only on a turn: outside a turn (`GET …/effects`, a replay that
+falls back to the carried levels) her `indulgence` drifts as for a persona with no habit. The
 constants are in `crates/eros-engine-core/src/needs.rs`.
 
 The moment the rating is carried to depends on the reader:
@@ -105,11 +121,16 @@ again shows the judge the same line.
   `[身体状态]`:
 
   ```
-  [需求] 饥饿=高 社交欲=低 体力=中 情感需求=中
+  [需求] 饥饿=高 社交欲=低 体力=中 情感需求=中 外出=中
+  [需求] 饥饿=高 社交欲=低 体力=中 情感需求=中 外出=中 享受=高
   ```
 
-  Before the first rating it reads `[需求] 尚未判定`. The line is never absent, because a
-  missing line would read as "all low".
+  `外出` is always on the line; `享受=高` is there only when `indulgence` is `high`, and its
+  absence reads as "not high" (the reference judge prompt says so). A strict judge still rates
+  `indulgence` on every judged turn without seeing whether it was `low` or `mid`, so in
+  continuous chat it re-guesses that level each turn, and the habit-count drift acts in the
+  gaps between ratings. Before the first rating it reads `[需求] 尚未判定`. The line is never
+  absent, because a missing line would read as "all low".
 - **The reply** gets the levels that are not `mid`, in the order of the table above, joined
   by `；`, as a line of `[character_state]`:
 
@@ -118,10 +139,13 @@ again shows the judge the same line.
   - 此刻的需要：饿了；很累
   ```
 
-  All four at `mid`, or no rating, adds nothing and leaves the prompt unchanged. A judged
-  turn's reply is written with the levels the turn ends with: the verdict's when it rated,
-  otherwise the carried levels the judge was shown. A rule-engine turn in a deployment that
-  has the judge uses the carried levels.
+  `indulgence` shows only at `high`. It names one thing she uses, picked at random each turn
+  among the habit keys set to `true`: `smoking` 很想抽根烟, `alcoholic` 很想喝一杯, `drug`
+  很想抽口大麻. With no key `true` it reads 很想放纵一下. Every need at `mid` (a `low`
+  `indulgence` counts the same), or no rating, adds nothing and leaves the prompt
+  unchanged. A judged turn's reply is written with the levels the turn ends with: the
+  verdict's when it rated, otherwise the carried levels the judge was shown. A rule-engine
+  turn in a deployment that has the judge uses the carried levels.
 - **The caller** gets the same levels on the `body_state` frame (`needs`, an object or `null`),
   sent when a give's effect is at work or needs are known, and re-sent on an idempotent
   replay. `GET …/effects` returns them carried to the moment of the call, or `null` with no
@@ -132,7 +156,9 @@ again shows the judge the same line.
   [the effects route](api-reference.md#get-v2compsessionsession_ideffects).
 - **A voice call** freezes the levels carried to its first turn into the bootstrap snapshot.
   They render as `此刻的需要：…` inside the `[身体状态]` block, and every turn's `body_state`
-  frame carries the frozen levels. The call never rates or advances them. See
+  frame carries the frozen levels. The call never rates or advances them, and a high
+  `indulgence` names the same thing for the whole call: the pick derives from the snapshot's
+  creation time. See
   [the voice turn](api-reference.md#post-compvoicesession_idturnstream).
 - **Not shown to:** `/open` greetings, event messages, image edit and group turns.
 
@@ -144,7 +170,7 @@ the levels and decides.
 
 ### Categories
 
-An event is one of 50 drawable kinds. Each kind belongs to a category, and the category sets its
+An event is one of 52 drawable kinds. Each kind belongs to a category, and the category sets its
 shape:
 
 | `category` | shape | lasts | category weight | category cooldown |
@@ -176,7 +202,7 @@ The draw is a pure function of the inputs plus three random numbers (one per sta
 the length).
 
 1. **Eligibility.** A kind is eligible when all of these hold:
-   - the caller's `kinds` allows it ([below](#the-callers-kinds); absent means all 50);
+   - the caller's `kinds` allows it ([below](#the-callers-kinds); absent means all 52);
    - it passes its gate (below);
    - its own cooldown has elapsed;
    - its category's cooldown has elapsed;
@@ -185,7 +211,7 @@ the length).
 2. **Category.** Each category with at least one eligible kind weighs its category weight
    times its persona factor. A roll picks one by cumulative weight.
 3. **Kind.** Each eligible kind in that category weighs its base weight times its
-   [needs factor](#1-needs-weight-the-kind-pick), its `prefer_events` factor, its
+   [needs factors](#1-needs-weight-the-kind-pick), its `prefer_events` factor, its
    [follow-on factor](#follow-on-factors) and, for a few kinds, a persona factor
    ([`is_virgin`](#persona-settings), [`homesick`](#persona-settings)). A second roll picks
    one.
@@ -264,7 +290,7 @@ The rung (1 to 3) is read from the session's affinity, time-decayed as in a chat
 
 ### Persona settings
 
-Five keys in the persona genome's `art_metadata`, read by the engine and written by whoever
+Eight keys in the persona genome's `art_metadata`, read by the engine and written by whoever
 authors the persona, sit beside `gender`, `birthday` and `timezone`:
 
 | key | value | effect |
@@ -274,6 +300,7 @@ authors the persona, sit beside `gender`, `birthday` and `timezone`:
 | `prefer_trip` | `true`, `false` (default) | the `trip` category weighs 3 times as much |
 | `homesick` | `true`, `false`, absent (default) | within `trip`: `true` weighs `hometown_visit` 3 times and `short_trip` / `long_trip` a third; `false` weighs `hometown_visit` a third; `business_trip` is work and untouched either way |
 | `is_virgin` | `true`, `false` (default) | while she is a virgin, `having_sex` weighs a fifth within `mid` |
+| `smoking`, `alcoholic`, `drug` | each `true`, `false`, absent (default) | whether she smokes, drinks, uses weed: how fast `indulgence` comes back ([drift](#drift-between-ratings)), what a high `indulgence` names in the reply, and how she takes a give of that thing (below) |
 
 `prefer_trip` says whether she moves at all; `homesick` says where she goes when she does. A
 flight attendant with both `true` travels often, works her trips as before, and spends her
@@ -289,6 +316,27 @@ is not a known `mid` kind is dropped and the rest are kept. `health` scales the 
 category, `period` included, and `period`'s own 28-day cooldown keeps it near monthly either
 way. `prefer_trip` raises the odds of a trip, not its frequency: the weekly category cooldown
 holds.
+
+The three habit keys reach the draw only through the drift of `indulgence`. The judge's
+persona block (`[角色人格]`) does not list them, so she does not bring up tobacco, alcohol or
+weed at every turn; a persona whose habits should colour her talk says so in her persona text. The engine
+never writes them.
+
+**A give of something she does not use.** When a turn's action is a `give` of `cigarette`,
+`alcohol` or `herb` and the matching key (`smoking`, `alcoholic`, `drug`) is `false`, the
+engine rolls once before the judge runs. One time in three the turn goes on as usual.
+Otherwise she refuses this give:
+
+- the judge's `[用户动作]` line ends with `，这次你不会收下`, so its `inner_state` is written for
+  a refusal; the line states the outcome, not a reason;
+- the response in effect is `refuse`, whatever the judge answers, and without the LLM judge the
+  rule engine's accept becomes `refuse` too.
+
+It is an ordinary refusal from there: the `action_response` frame and the stored `response`
+say `refuse`, the give leaves no lingering effect, the bond line drops one tier
+([refused actions](affinity-model.md#refused-actions)), and the reply is written for a
+refusal. The judge's own answer stays in its audit payload. `true` and absent never roll, nor
+does any other item or action. A re-driven turn rolls again, as the judge decides again.
 
 ### Follow-on factors
 
@@ -327,7 +375,7 @@ policy, rules a kind out without the engine losing it.
 
 | `kinds` | kinds that may be drawn |
 |---|---|
-| absent or `null` | all 50 |
+| absent or `null` | all 52 |
 | `[]` | none: the response is `{"event": null, "message": null}` |
 | `["reading", "quarrel"]` | the listed ones |
 | `{"allow": […], "disallow": […]}` | what `allow` allows, minus what `disallow` lists |
@@ -639,6 +687,21 @@ draws from them (see [api-reference](api-reference.md#post-v2compsessionsession_
 otherwise it is words only. `watching_match` and `taking_selfie` are drawn in hospital; the other
 four need her out and about.
 
+### Going out and going home
+
+Two told incidents put her `outing` need into her day:
+
+| kind | label | category | weight | cooldown | lasts | cue |
+|---|---|---|---|---|---|---|
+| `want_to_go_out` | 想出门 | `mid` | 1 | 24 h | 1 to 3 h | `（你现在很想出门走走。）` |
+| `want_to_go_home` | 想回家 | `mid` | 1 | 24 h | 1 to 3 h | `（你现在很想回家。）` |
+
+She is not offline and keeps replying. There is no gate, and both are drawn inside every
+background, hospital included, where the cue opens with the background as every incident's
+does: `（你正在住院。你现在很想出门走走。）`. Both join `prefer_events`' vocabulary like any
+`mid` kind. A high `outing` weighs `want_to_go_out` 3 times and a low one `want_to_go_home`;
+a high `indulgence` weighs `want_to_go_out` twice ([below](#1-needs-weight-the-kind-pick)).
+
 ### Next to `/open`
 
 An event's message counts as a message for the `/open` birthday and holiday check, so neither
@@ -675,14 +738,14 @@ above. Needs reach neither.
 
 ## How the two interact
 
-The needs factor below is one of the second-stage factors; the others ([follow-on
+The needs factors below are second-stage factors; the others ([follow-on
 factors](#follow-on-factors), `prefer_events`, `is_virgin`, `homesick`) read no need.
 
 ### 1. Needs weight the kind pick
 
 A needs factor scales a kind's weight within its category, in the second stage of the draw. It
 steers which kind comes up, never whether a category does. The factors, from
-`needs_factor` in `crates/eros-engine-core/src/events.rs`:
+`needs_factor` and `indulgence_factor` in `crates/eros-engine-core/src/events.rs`:
 
 | need level | kinds | factor |
 |---|---|---|
@@ -691,19 +754,25 @@ steers which kind comes up, never whether a category does. The factors, from
 | `hunger` is `high` | `grocery_shopping` | ×2 |
 | `emotional` is `high` | `ex_message` | ×3 |
 | `emotional` is `high` | `animal_encounter`, `irritable`, `quarrel` | ×2 |
+| `outing` is `high` | `want_to_go_out` | ×3 |
+| `outing` is `low` | `want_to_go_home` | ×3 |
+| `indulgence` is `high` | `want_to_go_out`, `irritable` | ×2 |
 
-`social` weights nothing. The factors apply only when the deployment runs the judge and the
-persona has a rating, carried to the moment of the call; otherwise every factor is 1. A
-factor is not a gate: a kind weighted ×3 still has to be eligible.
+The `indulgence` row is a factor of its own and multiplies with the rows above: `outing` and
+`indulgence` both `high` weigh `want_to_go_out` ×6, and `indulgence` and `emotional` both
+`high` weigh `irritable` ×4. `social` weights nothing. The factors apply only when the
+deployment runs the judge and the persona has a rating, carried to the moment of the call;
+otherwise every factor is 1. A factor is not a gate: a kind weighted ×3 still has to be
+eligible.
 
-### 2. Events never change a stored need
+### 2. Events and gives never change a stored need
 
-Nothing writes a need from an event. The judge reads the `[近期事件]` line on its next turn
-and rates the needs itself with the event in view; the reference judge prompt in
-`examples/model_config.toml` tells it to start from `[需求]` and to take the conversation,
-`[近期事件]`, `[身体状态]` and the elapsed time into account. If the judge abstains
-(`needs: null`), the previous rating keeps drifting whatever happened. Needs keep one
-source: the judge.
+Nothing writes a need from an event or a give. The judge reads the `[近期事件]` line, and a
+give's `[用户动作]` and later `[身体状态]` lines, and rates the needs itself with them in
+view; the reference judge prompt in `examples/model_config.toml` tells it to start from
+`[需求]` and to take the conversation, `[近期事件]`, `[身体状态]` and the elapsed time into
+account. If the judge abstains (`needs: null`), the previous rating keeps drifting whatever
+happened. Needs keep one source: the judge.
 
 ### 3. An offline stretch writes no rating
 
@@ -930,10 +999,13 @@ falling-out rows live in `engine.persona_events` like any event.
 | `[近期事件]` | not rendered: there is no judge to read it |
 | Offline kinds | silence turns as with the judge, since the check runs before it: the ghosting switch and the action and forced-image exemptions apply |
 | The ask for space | unchanged: the trigger reads the affinity evaluator's judged turns, not the PDE judge |
+| `smoking`, `alcoholic`, `drug` | a `false` key still rolls on a give and can turn it into a refusal; there is no `indulgence` to drift or name |
 
 ## Code pointers
 
-- `crates/eros-engine-core/src/needs.rs`: the levels, the drift constants, `carried`.
+- `crates/eros-engine-core/src/needs.rs`: the levels, the drift constants, `Habits`, `carried`.
+- `crates/eros-engine-core/src/pde.rs`: `refuses_give` and `UNUSED_SUBSTANCE_ACCEPT`, the give
+  roll.
 - `crates/eros-engine-core/src/events.rs`: categories and kinds, per-kind rules, gates, the
   needs and persona factors, `is_offline` and `is_told`, `draw`, `lookback`.
 - `crates/eros-engine-server/src/routes/session_events.rs`: the events route, the draw's
@@ -946,9 +1018,9 @@ falling-out rows live in `engine.persona_events` like any event.
   conversion, the slowdown read.
 - `crates/eros-engine-server/src/pipeline/stream.rs::run_stream`: the needs read and write, the
   `[需求]` and `[近期事件]` lines (`build_pde_ctx`), the offline branch ahead of the judge,
-  `body_state_frame`.
+  the give roll's refusal (`apply_give_refusal`), `body_state_frame`.
 - `crates/eros-engine-server/src/prompt.rs`: `needs_line`, `events_judge_text`,
-  `events_reply_text`, `just_now_text`, `persona_traits`, the `[character_state]` lines and the
+  `events_reply_text`, `just_now_text`, `persona_traits`, `persona_habits`, the `[character_state]` lines and the
   event lines under `[now]`.
 - `crates/eros-engine-server/src/routes/session_effects.rs`: `GET …/effects`.
 - `crates/eros-engine-server/src/pipeline/voice.rs`: the bootstrap's needs.
