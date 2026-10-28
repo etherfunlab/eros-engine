@@ -2787,6 +2787,14 @@ fn render_product_qa_pairs(pairs: &[(String, String)]) -> String {
         .join("\n")
 }
 
+/// A give the habit roll refused is refused, whatever the judge or the rule
+/// engine settled on.
+fn apply_give_refusal(plan: &mut eros_engine_core::types::ActionPlan, refused: bool) {
+    if refused && plan.action_response.is_some() {
+        plan.action_response = Some(eros_engine_core::types::ActionResponse::Refuse);
+    }
+}
+
 /// Build the judge's user payload from the shared transcript + the decision input.
 fn build_pde_ctx(
     t: &JudgeTranscript,
@@ -2796,6 +2804,7 @@ fn build_pde_ctx(
     body_state: Option<&str>,
     needs: Option<&eros_engine_core::needs::Needs>,
     event: Option<&str>,
+    give_refused: bool,
 ) -> String {
     let a = &input.affinity;
     let s = &input.signals;
@@ -2890,10 +2899,20 @@ fn build_pde_ctx(
         .map(|s| format!("[身体状态] {s}\n"))
         .unwrap_or_default();
     // The action the judge decides on (spec 2026-10-05 §4.2); absent otherwise.
+    // A give the habit roll refused (spec 2026-10-28-outing-indulgence-
+    // needs-and-habits-design.md §3.1) states the outcome, not the reason.
     let action_line = match &input.event {
         eros_engine_core::types::Event::UserMessage {
             action: Some(a), ..
-        } => format!("[用户动作] {}\n", crate::prompt::action_subject(a)),
+        } => format!(
+            "[用户动作] {}{}\n",
+            crate::prompt::action_subject(a),
+            if give_refused {
+                "，这次你不会收下"
+            } else {
+                ""
+            }
+        ),
         _ => String::new(),
     };
     // The outfit the caller named (spec 2026-10-12 §5.3); the plan wears it
@@ -4951,6 +4970,13 @@ pub(crate) fn run_stream_with(
             JudgeTranscript::default()
         };
         let mut killswitch_hints: Vec<String> = Vec::new();
+        // A give of something she does not use is rolled before the judge,
+        // so the judge writes for the outcome (spec 2026-10-28 §3.1).
+        let give_refused = pde::refuses_give(
+            &input.event,
+            crate::prompt::persona_habits(&input.persona),
+            rand::thread_rng().gen(),
+        );
         let (mut plan, pde_run): (eros_engine_core::types::ActionPlan, Option<PdeDecisionRun>) =
             match resolved_pde.as_ref() {
                 Some(p) => {
@@ -4962,6 +4988,7 @@ pub(crate) fn run_stream_with(
                         body_state.as_deref(),
                         prior_needs.as_ref(),
                         event_judge.as_deref(),
+                        give_refused,
                     );
                     // Read receipt (migration 0053): the judge is the first
                     // generative model to see this message, so this is the
@@ -5092,6 +5119,7 @@ pub(crate) fn run_stream_with(
                 plan.action_response,
             );
         }
+        apply_give_refusal(&mut plan, give_refused);
 
         // Dice roll at plan finalisation (spec 2026-09-13 §3.2): a definite
         // judge mode owns [this_turn], so the dice stay in the cup; a bare
@@ -7639,7 +7667,7 @@ mod tests {
             images_in_window: 2,
             last_assistant_is_image: true,
         };
-        let ctx = build_pde_ctx(&t, &input, true, None, None, None, None);
+        let ctx = build_pde_ctx(&t, &input, true, None, None, None, None, false);
         assert!(
             ctx.contains("[近期图片] 最近8条消息内已发图=2 张；上一条 AI 消息是图片=是"),
             "facts line must render with a message-based unit: {ctx}"
@@ -7660,7 +7688,7 @@ mod tests {
             images_in_window: 0,
             last_assistant_is_image: false,
         };
-        let ctx = build_pde_ctx(&t, &input, false, None, None, None, None);
+        let ctx = build_pde_ctx(&t, &input, false, None, None, None, None, false);
         assert!(
             ctx.contains("[近期图片] 最近8条消息内已发图=0 张；上一条 AI 消息是图片=否"),
             "the negative case is a signal too and must always render: {ctx}"
@@ -18779,7 +18807,7 @@ data: [DONE]\n\n";
         use eros_engine_core::types::ItemKind;
         let t = JudgeTranscript::default();
         let mut input = fixture_decision_input();
-        let bare = build_pde_ctx(&t, &input, false, None, None, None, None);
+        let bare = build_pde_ctx(&t, &input, false, None, None, None, None, false);
         assert!(
             !bare.contains("[你的物品]") && !bare.contains("[你的衣柜]"),
             "{bare}"
@@ -18790,7 +18818,7 @@ data: [DONE]\n\n";
             name: "红色旗袍".into(),
             gifted: true,
         }];
-        let ctx = build_pde_ctx(&t, &input, false, None, None, None, None);
+        let ctx = build_pde_ctx(&t, &input, false, None, None, None, None, false);
         assert!(!ctx.contains("[你的物品]"), "{ctx}");
         assert!(
             ctx.contains("[你的衣柜] 「红色旗袍」（对方送的）\n"),
@@ -18828,7 +18856,7 @@ data: [DONE]\n\n";
             transcript: "用户：hi\nMia：hey".into(),
             ..Default::default()
         };
-        let ctx = build_pde_ctx(&t, &input, true, None, None, None, None);
+        let ctx = build_pde_ctx(&t, &input, true, None, None, None, None, false);
         let persona_at = ctx.find("[角色人格]").expect("persona block present");
         let rel_at = ctx.find("[亲密度]").expect("relationship bucket present");
         assert!(
@@ -18879,6 +18907,7 @@ data: [DONE]\n\n";
             None,
             None,
             None,
+            false,
         );
         assert!(
             ctx.contains("[亲密度] 当前档位=第 3 档\n"),
@@ -18922,6 +18951,7 @@ data: [DONE]\n\n";
                 None,
                 None,
                 None,
+                false,
             );
             assert!(
                 ctx.contains(&format!("当前档位=第 {want} 档")),
@@ -18938,6 +18968,7 @@ data: [DONE]\n\n";
                 None,
                 None,
                 None,
+                false,
             );
             assert!(
                 ctx.contains(&format!("[耐心] 当前档位={want}")),
@@ -18966,6 +18997,7 @@ data: [DONE]\n\n";
             None,
             None,
             None,
+            false,
         );
         assert!(
             ctx.contains("[亲密度] 当前档位=第 1 档"),
@@ -19009,6 +19041,7 @@ data: [DONE]\n\n";
             None,
             None,
             None,
+            false,
         );
         assert!(!ctx.contains("[角色人格]"), "no persona block: {ctx}");
         assert!(
@@ -19034,16 +19067,16 @@ data: [DONE]\n\n";
             ..Default::default()
         };
         // feature off → no lines at all
-        let off = build_pde_ctx(&t, &input, true, None, None, None, None);
+        let off = build_pde_ctx(&t, &input, true, None, None, None, None, false);
         assert!(!off.contains("[产品咨询]"));
         assert!(!off.contains("[最近产品咨询]"));
         // on, no history → availability line only
-        let on_empty = build_pde_ctx(&t, &input, true, Some(""), None, None, None);
+        let on_empty = build_pde_ctx(&t, &input, true, Some(""), None, None, None, false);
         assert!(on_empty.contains("[产品咨询] 本轮可答产品问题=是"));
         assert!(!on_empty.contains("[最近产品咨询]"));
         // on, with history → both blocks, before [用户最新消息]
         let recent = render_product_qa_pairs(&[("这是什么".into(), "这是……".into())]);
-        let on_recent = build_pde_ctx(&t, &input, true, Some(&recent), None, None, None);
+        let on_recent = build_pde_ctx(&t, &input, true, Some(&recent), None, None, None, false);
         assert!(on_recent.contains("[最近产品咨询]\n用户: 这是什么\n回答: 这是……"));
         assert!(on_recent.find("[产品咨询]").unwrap() < on_recent.find("[用户最新消息]").unwrap());
     }
@@ -19148,7 +19181,7 @@ data: [DONE]\n\n";
     fn build_pde_ctx_states_the_body_state_before_the_action() {
         let t = JudgeTranscript::default();
         let mut input = fixture_decision_input();
-        let bare = build_pde_ctx(&t, &input, false, None, None, None, None);
+        let bare = build_pde_ctx(&t, &input, false, None, None, None, None, false);
         assert!(!bare.contains("[身体状态]"), "{bare}");
         if let Event::UserMessage { action, .. } = &mut input.event {
             *action = Some(eros_engine_core::types::UserAction::Kiss);
@@ -19161,6 +19194,7 @@ data: [DONE]\n\n";
             Some("1 支烟，烟劲很足，正在劲头上"),
             None,
             None,
+            false,
         );
         let body = ctx
             .find("[身体状态] 1 支烟，烟劲很足，正在劲头上\n")
@@ -19170,14 +19204,52 @@ data: [DONE]\n\n";
     }
 
     #[test]
+    fn the_judge_hears_a_refused_give() {
+        let t = JudgeTranscript::default();
+        let mut input = fixture_decision_input();
+        if let Event::UserMessage { action, .. } = &mut input.event {
+            *action = Some(eros_engine_core::types::UserAction::Give {
+                item: eros_engine_core::types::GivenItem::Cigarette,
+                name: None,
+                quantity: 1,
+            });
+        }
+        let refused = build_pde_ctx(&t, &input, false, None, None, None, None, true);
+        assert!(
+            refused.contains("[用户动作] 对方递给你 1 支烟，这次你不会收下\n"),
+            "{refused}"
+        );
+        let open = build_pde_ctx(&t, &input, false, None, None, None, None, false);
+        assert!(open.contains("[用户动作] 对方递给你 1 支烟\n"), "{open}");
+    }
+
+    #[test]
+    fn apply_give_refusal_turns_only_an_accept() {
+        use eros_engine_core::types::ActionResponse::{Accept, Refuse};
+        let mut plan = pde::decide(&fixture_decision_input());
+        for (before, refused, after) in [
+            (Some(Accept), true, Some(Refuse)),
+            (Some(Accept), false, Some(Accept)),
+            (Some(Refuse), true, Some(Refuse)),
+            (None, true, None),
+        ] {
+            plan.action_response = before;
+            apply_give_refusal(&mut plan, refused);
+            assert_eq!(plan.action_response, after, "{before:?} {refused}");
+        }
+    }
+
+    #[test]
     fn build_pde_ctx_states_a_named_outfit() {
         let t = JudgeTranscript::default();
         let mut input = fixture_decision_input();
-        assert!(!build_pde_ctx(&t, &input, false, None, None, None, None).contains("[指定穿着]"));
+        assert!(
+            !build_pde_ctx(&t, &input, false, None, None, None, None, false).contains("[指定穿着]")
+        );
         if let Event::UserMessage { outfit, .. } = &mut input.event {
             *outfit = Some("红色旗袍".into());
         }
-        let ctx = build_pde_ctx(&t, &input, false, None, None, None, None);
+        let ctx = build_pde_ctx(&t, &input, false, None, None, None, None, false);
         assert!(ctx.contains("[指定穿着] 「红色旗袍」\n"), "{ctx}");
         assert!(
             ctx.find("[指定穿着]").unwrap() < ctx.find("[用户最新消息]").unwrap(),
@@ -19212,12 +19284,12 @@ data: [DONE]\n\n";
     fn build_pde_ctx_states_the_action_line_only_on_action_turns() {
         let t = JudgeTranscript::default();
         let mut input = fixture_decision_input();
-        let plain = build_pde_ctx(&t, &input, false, None, None, None, None);
+        let plain = build_pde_ctx(&t, &input, false, None, None, None, None, false);
         assert!(!plain.contains("[用户动作]"), "{plain}");
         if let Event::UserMessage { action, .. } = &mut input.event {
             *action = Some(eros_engine_core::types::UserAction::Kiss);
         }
-        let ctx = build_pde_ctx(&t, &input, false, None, None, None, None);
+        let ctx = build_pde_ctx(&t, &input, false, None, None, None, None, false);
         assert!(ctx.contains("[用户动作] 对方凑过来想亲你\n"), "{ctx}");
         assert!(
             ctx.find("[用户动作]").unwrap() < ctx.find("[用户最新消息]").unwrap(),
@@ -19308,7 +19380,7 @@ data: [DONE]\n\n";
                 outing: NeedLevel::Mid,
                 indulgence,
             };
-            build_pde_ctx(&t, &input, false, None, None, Some(&n), None)
+            build_pde_ctx(&t, &input, false, None, None, Some(&n), None, false)
         };
         let high = line(NeedLevel::High);
         assert!(
@@ -19377,6 +19449,7 @@ data: [DONE]\n\n";
             Some("1 支烟，烟劲很足，正在劲头上"),
             None,
             None,
+            false,
         );
         assert!(none.contains("[需求] 尚未判定\n"), "{none}");
         let n = Needs {
@@ -19395,6 +19468,7 @@ data: [DONE]\n\n";
             Some("1 支烟，烟劲很足，正在劲头上"),
             Some(&n),
             None,
+            false,
         );
         let line = ctx
             .find("[需求] 饥饿=高 社交欲=低 体力=中 情感需求=中 外出=高\n")
@@ -19407,7 +19481,9 @@ data: [DONE]\n\n";
     fn build_pde_ctx_states_the_event_between_the_needs_and_the_body_state() {
         let input = fixture_decision_input();
         let t = JudgeTranscript::default();
-        assert!(!build_pde_ctx(&t, &input, false, None, None, None, None).contains("[近期事件]"));
+        assert!(
+            !build_pde_ctx(&t, &input, false, None, None, None, None, false).contains("[近期事件]")
+        );
         let ctx = build_pde_ctx(
             &t,
             &input,
@@ -19416,6 +19492,7 @@ data: [DONE]\n\n";
             Some("1 支烟，烟劲很足，正在劲头上"),
             None,
             Some("临时接到工作（1 小时前开始，约 3 小时后结束）"),
+            false,
         );
         let line = ctx
             .find("[近期事件] 临时接到工作（1 小时前开始，约 3 小时后结束）\n")
@@ -21827,16 +21904,29 @@ data: [DONE]\n\n"
         verdict: serde_json::Value,
         judge_status: u16,
     ) -> (Vec<ProtocolFrame>, wiremock::MockServer, Uuid) {
-        run_action_turn_in(pool, action, outfit, prior, &[], verdict, judge_status).await
+        run_action_turn_in(
+            pool,
+            action,
+            outfit,
+            prior,
+            &[],
+            None,
+            verdict,
+            judge_status,
+        )
+        .await
     }
 
-    /// [`run_action_turn_full`] with life events seeded for the persona.
+    /// [`run_action_turn_full`] with life events seeded for the persona and,
+    /// when given, the genome's `art_metadata`.
+    #[allow(clippy::too_many_arguments)]
     async fn run_action_turn_in(
         pool: &PgPool,
         action: eros_engine_core::types::UserAction,
         outfit: Option<String>,
         prior: &[serde_json::Value],
         events: &[EventSeed],
+        art: Option<serde_json::Value>,
         verdict: serde_json::Value,
         judge_status: u16,
     ) -> (Vec<ProtocolFrame>, wiremock::MockServer, Uuid) {
@@ -21872,7 +21962,15 @@ data: [DONE]\n\n"
             .await;
 
         let user_id = Uuid::new_v4();
-        let (_g, instance_id, session_id) = seed_persona_and_session(pool, user_id).await;
+        let (genome_id, instance_id, session_id) = seed_persona_and_session(pool, user_id).await;
+        if let Some(art) = art {
+            sqlx::query("UPDATE engine.persona_genomes SET art_metadata = $2 WHERE id = $1")
+                .bind(genome_id)
+                .bind(art)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
         let mut state = crate::routes::companion::test_state(pool.clone());
         state.model_config = std::sync::Arc::new(
             eros_engine_llm::model_config::ModelConfig::from_toml_str(
@@ -22012,6 +22110,57 @@ data: [DONE]\n\n"
             chat.contains("- 身上还带着：3 杯「威士忌」，有一点酒意，还在往上走"),
             "{chat}"
         );
+    }
+
+    /// The roll is random, so each turn checks that the judge's line and the
+    /// response in effect agree: told 「这次你不会收下」 exactly when the
+    /// turn refuses, whatever the judge answered.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_give_she_does_not_use_is_rolled_before_the_judge(pool: PgPool) {
+        let give = eros_engine_core::types::UserAction::Give {
+            item: eros_engine_core::types::GivenItem::Cigarette,
+            name: None,
+            quantity: 1,
+        };
+        for (art, can_refuse) in [
+            (serde_json::json!({"smoking": false}), true),
+            (serde_json::json!({"smoking": true}), false),
+        ] {
+            for _ in 0..8 {
+                let (frames, mock, umid) = run_action_turn_in(
+                    &pool,
+                    give.clone(),
+                    None,
+                    &[],
+                    &[],
+                    Some(art.clone()),
+                    serde_json::json!({"action": "reply_text", "inner_state": "", "action_response": "accept"}),
+                    200,
+                )
+                .await;
+                let reqs = mock.received_requests().await.unwrap();
+                let told = judge_request(&reqs).contains("这次你不会收下");
+                let sent = frames.iter().find_map(|f| match f {
+                    ProtocolFrame::ActionResponse { response, .. } => Some(*response),
+                    _ => None,
+                });
+                let stored: Option<String> = sqlx::query_scalar(
+                    "SELECT metadata->'action'->>'response' FROM engine.chat_messages WHERE id = $1",
+                )
+                .bind(umid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                let want = if told {
+                    eros_engine_core::types::ActionResponse::Refuse
+                } else {
+                    eros_engine_core::types::ActionResponse::Accept
+                };
+                assert!(can_refuse || !told, "{art}: a used substance never rolls");
+                assert_eq!(sent, Some(want), "{art} told={told}");
+                assert_eq!(stored.as_deref(), Some(want.as_str()), "{art} told={told}");
+            }
+        }
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -23087,6 +23236,7 @@ data: [DONE]\n\n"
             None,
             &[],
             &[agreed_separation(60, 300)],
+            None,
             routine_verdict(),
             200,
         )
@@ -23297,6 +23447,7 @@ data: [DONE]\n\n"
             None,
             &[],
             &[ev("away_from_phone", 5, 55)],
+            None,
             serde_json::json!({"action": "reply_text", "inner_state": ""}),
             200,
         )
@@ -23340,6 +23491,7 @@ data: [DONE]\n\n"
             None,
             &[],
             &[ev("asleep", 5, 55)],
+            None,
             serde_json::json!({"action": "reply_text", "inner_state": ""}),
             200,
         )

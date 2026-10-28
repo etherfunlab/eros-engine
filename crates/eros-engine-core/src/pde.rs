@@ -6,9 +6,10 @@
 
 use crate::affinity::AffinityDeltas;
 use crate::ghost::{self, GhostDecision, GhostSignals};
+use crate::needs::Habits;
 use crate::types::{
     ActionPlan, ActionResponse, ActionType, DecisionInput, Event, ImageRef, ReplyMode, ReplyStyle,
-    TurnNudges,
+    TurnNudges, UserAction,
 };
 
 // Decision thresholds — tune here rather than at call sites.
@@ -37,6 +38,25 @@ pub fn settle_action_response(
             action: Some(_), ..
         } => Some(judged.unwrap_or(ActionResponse::Accept)),
         _ => None,
+    }
+}
+
+/// How often she still takes tobacco, alcohol or weed whose habit key is
+/// `false`, of the times she would otherwise take it (spec 2026-10-28-
+/// outing-indulgence-needs-and-habits-design.md §3.1).
+pub const UNUSED_SUBSTANCE_ACCEPT: f64 = 1.0 / 3.0;
+
+/// Whether the habit roll refuses this turn's give: a `give` of tobacco,
+/// alcohol or weed whose key is explicitly `false`, with `roll` (uniform in
+/// [0, 1)) at or above `UNUSED_SUBSTANCE_ACCEPT`. Rolled before the judge,
+/// so the judge can be told.
+pub fn refuses_give(event: &Event, habits: Habits, roll: f64) -> bool {
+    match event {
+        Event::UserMessage {
+            action: Some(UserAction::Give { item, .. }),
+            ..
+        } => habits.uses(*item) == Some(false) && roll >= UNUSED_SUBSTANCE_ACCEPT,
+        _ => false,
     }
 }
 
@@ -918,5 +938,49 @@ mod tests {
             Some(ActionResponse::Refuse),
         );
         assert_eq!(image.action_response, Some(ActionResponse::Refuse));
+    }
+
+    #[test]
+    fn refuses_give_keys_on_the_give_item() {
+        use crate::needs::Habits;
+        use crate::types::{GivenItem, ItemKind};
+        let give = |item, name: Option<&str>| {
+            action_msg(UserAction::Give {
+                item,
+                name: name.map(Into::into),
+                quantity: 1,
+            })
+        };
+        let with = |smoking, drug| Habits {
+            smoking,
+            alcoholic: None,
+            drug,
+        };
+        let cig = give(GivenItem::Cigarette, None);
+        let no_smoke = with(Some(false), None);
+        assert!(!refuses_give(&cig, no_smoke, 0.0));
+        assert!(!refuses_give(
+            &cig,
+            no_smoke,
+            UNUSED_SUBSTANCE_ACCEPT - 1e-9
+        ));
+        assert!(refuses_give(&cig, no_smoke, UNUSED_SUBSTANCE_ACCEPT));
+        assert!(refuses_give(&cig, no_smoke, 0.99));
+        assert!(!refuses_give(&cig, with(Some(true), None), 0.99));
+        assert!(!refuses_give(&cig, with(None, None), 0.99));
+        let weed = give(GivenItem::Herb, Some("大麻"));
+        assert!(refuses_give(&weed, with(None, Some(false)), 0.99));
+        assert!(!refuses_give(
+            &give(GivenItem::Coffee, None),
+            no_smoke,
+            0.99
+        ));
+        let named_gift = action_msg(UserAction::Gift {
+            kind: ItemKind::Item,
+            name: "一条香烟".into(),
+        });
+        assert!(!refuses_give(&named_gift, no_smoke, 0.99));
+        assert!(!refuses_give(&action_msg(UserAction::Hug), no_smoke, 0.99));
+        assert!(!refuses_give(&user_msg("hi"), no_smoke, 0.99));
     }
 }
