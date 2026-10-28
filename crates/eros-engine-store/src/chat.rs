@@ -1107,11 +1107,19 @@ impl<'a> ChatRepo<'a> {
     /// adds one item, idempotent on the message; refused, it removes the item
     /// an earlier decision added. A stored gift whose kind or name is
     /// malformed adds nothing and does not fail the write.
+    ///
+    /// An accepted `give`, `gift`, `tip` or `kiss` also leaves a moment in the
+    /// relationship journal of `instance_id`, in the same transaction, dated in
+    /// `journal_tz` (UTC when absent); a repeat of the same message adds none.
     pub async fn set_action_response(
         &self,
         user_message_id: Uuid,
         response: eros_engine_core::types::ActionResponse,
+        instance_id: Uuid,
+        journal_tz: Option<chrono_tz::Tz>,
     ) -> Result<(), sqlx::Error> {
+        use eros_engine_core::types::ActionResponse;
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "WITH upd AS ( \
                  UPDATE engine.chat_messages \
@@ -1138,9 +1146,24 @@ impl<'a> ChatRepo<'a> {
         )
         .bind(user_message_id)
         .bind(response.as_str())
-        .execute(self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(())
+        if response == ActionResponse::Accept {
+            let action: Option<serde_json::Value> = sqlx::query_scalar(
+                "SELECT metadata -> 'action' FROM engine.chat_messages WHERE id = $1",
+            )
+            .bind(user_message_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .flatten();
+            let on = crate::journal::local_date(Utc::now(), journal_tz);
+            if let Some(moment) = action
+                .and_then(|a| crate::journal::accepted_moment(a, instance_id, user_message_id, on))
+            {
+                crate::journal::insert_journal(&mut *tx, &moment).await?;
+            }
+        }
+        tx.commit().await
     }
 
     /// Mark a user message as having received a `ghost` decision from the
@@ -3740,10 +3763,10 @@ mod tests {
         .await;
         let repo = ChatRepo { pool: &pool };
 
-        repo.set_action_response(id, ActionResponse::Accept)
+        repo.set_action_response(id, ActionResponse::Accept, s.instance_id.unwrap(), None)
             .await
             .unwrap();
-        repo.set_action_response(id, ActionResponse::Accept)
+        repo.set_action_response(id, ActionResponse::Accept, s.instance_id.unwrap(), None)
             .await
             .unwrap();
         assert_eq!(
@@ -3765,7 +3788,7 @@ mod tests {
         assert_eq!(meta["action"]["response"], "accept");
         assert_eq!(meta["tier"], "gold", "other metadata keys survive");
 
-        repo.set_action_response(id, ActionResponse::Refuse)
+        repo.set_action_response(id, ActionResponse::Refuse, s.instance_id.unwrap(), None)
             .await
             .unwrap();
         assert!(
@@ -3780,10 +3803,161 @@ mod tests {
         let s = throwaway_session(&pool).await;
         let id = gift_row(&pool, s.id, serde_json::json!({"type": "kiss"})).await;
         ChatRepo { pool: &pool }
-            .set_action_response(id, ActionResponse::Accept)
+            .set_action_response(id, ActionResponse::Accept, s.instance_id.unwrap(), None)
             .await
             .unwrap();
         assert!(items_of(&pool).await.is_empty());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn accepted_give_and_kiss_write_journal_rows_refuse_writes_none(pool: PgPool) {
+        use chrono_tz::Asia::Tokyo;
+        use eros_engine_core::types::ActionResponse::{Accept, Refuse};
+        let s = throwaway_session(&pool).await;
+        let instance = s.instance_id.unwrap();
+        let repo = ChatRepo { pool: &pool };
+        // (dedup key, kind, summary, message) in write order.
+        let journal = || async {
+            sqlx::query_as::<_, (String, String, String, Option<Uuid>)>(
+                "SELECT dedup_key, kind, summary, message_id \
+                 FROM engine.relationship_journal \
+                 WHERE instance_id = $1 ORDER BY created_at, id",
+            )
+            .bind(instance)
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+        };
+        let named_give = gift_row(
+            &pool,
+            s.id,
+            serde_json::json!({"type": "give", "item": "alcohol", "name": "威士忌", "quantity": 2}),
+        )
+        .await;
+        let plain_give = gift_row(
+            &pool,
+            s.id,
+            serde_json::json!({"type": "give", "item": "food", "quantity": 1}),
+        )
+        .await;
+        let dress = gift_row(
+            &pool,
+            s.id,
+            serde_json::json!({"type": "gift", "kind": "clothing", "name": "红色旗袍"}),
+        )
+        .await;
+        let tip = gift_row(
+            &pool,
+            s.id,
+            serde_json::json!({"type": "tip", "amount_usd": 5.0}),
+        )
+        .await;
+        let kiss = gift_row(&pool, s.id, serde_json::json!({"type": "kiss"})).await;
+        let later_kiss = gift_row(&pool, s.id, serde_json::json!({"type": "kiss"})).await;
+        let hug = gift_row(&pool, s.id, serde_json::json!({"type": "hug"})).await;
+        let custom = gift_row(
+            &pool,
+            s.id,
+            serde_json::json!({"type": "custom", "text": "wave"}),
+        )
+        .await;
+        let malformed = gift_row(
+            &pool,
+            s.id,
+            serde_json::json!({"type": "gift", "kind": "shoes", "name": "高跟鞋"}),
+        )
+        .await;
+        let no_action: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata) \
+             VALUES ($1, 'user', 'hi', '{\"tier\":\"gold\"}'::jsonb) RETURNING id",
+        )
+        .bind(s.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // A refusal, a gesture the journal skips, a malformed gift and a row
+        // without an action leave nothing.
+        for (id, response) in [
+            (named_give, Refuse),
+            (kiss, Refuse),
+            (hug, Accept),
+            (custom, Accept),
+            (malformed, Accept),
+            (no_action, Accept),
+        ] {
+            repo.set_action_response(id, response, instance, None)
+                .await
+                .unwrap();
+        }
+        assert!(journal().await.is_empty());
+
+        // A re-driven turn accepts the same give twice: one row.
+        for _ in 0..2 {
+            repo.set_action_response(named_give, Accept, instance, None)
+                .await
+                .unwrap();
+        }
+        repo.set_action_response(plain_give, Accept, instance, None)
+            .await
+            .unwrap();
+        repo.set_action_response(dress, Accept, instance, None)
+            .await
+            .unwrap();
+        repo.set_action_response(tip, Accept, instance, None)
+            .await
+            .unwrap();
+        let day_before = crate::journal::local_date(Utc::now(), Some(Tokyo));
+        repo.set_action_response(kiss, Accept, instance, Some(Tokyo))
+            .await
+            .unwrap();
+        let day_after = crate::journal::local_date(Utc::now(), Some(Tokyo));
+        // Only the first accepted kiss counts.
+        repo.set_action_response(later_kiss, Accept, instance, None)
+            .await
+            .unwrap();
+
+        let row = |key: String, kind: &str, summary: &str, message: Uuid| {
+            (key, kind.to_string(), summary.to_string(), Some(message))
+        };
+        assert_eq!(
+            journal().await,
+            vec![
+                row(
+                    format!("gift:{named_give}"),
+                    "gift",
+                    "用户送了你威士忌",
+                    named_give
+                ),
+                row(
+                    format!("gift:{plain_give}"),
+                    "gift",
+                    "用户送了你一份礼物",
+                    plain_give
+                ),
+                row(format!("gift:{dress}"), "gift", "用户送了你红色旗袍", dress),
+                row(format!("gift:{tip}"), "gift", "用户给了你打赏", tip),
+                row(
+                    "first_intimacy:real".to_string(),
+                    "first_intimacy",
+                    "用户亲了你，你接受了",
+                    kiss
+                ),
+            ]
+        );
+        let (on, source, realm, recurrence): (chrono::NaiveDate, String, String, String) =
+            sqlx::query_as(
+                "SELECT occurred_on, source, realm, recurrence \
+                 FROM engine.relationship_journal WHERE dedup_key = 'first_intimacy:real'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!((day_before..=day_after).contains(&on), "dated {on}");
+        assert_eq!(
+            (source.as_str(), realm.as_str(), recurrence.as_str()),
+            ("engine", "real", "none")
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -3796,7 +3970,7 @@ mod tests {
             serde_json::json!({"type": "gift", "kind": "item"}),
         ] {
             let id = gift_row(&pool, s.id, action).await;
-            repo.set_action_response(id, ActionResponse::Accept)
+            repo.set_action_response(id, ActionResponse::Accept, s.instance_id.unwrap(), None)
                 .await
                 .expect("a malformed gift must not fail the write");
             let r: Option<String> = sqlx::query_scalar(
@@ -3822,7 +3996,7 @@ mod tests {
         )
         .await;
         ChatRepo { pool: &pool }
-            .set_action_response(id, ActionResponse::Accept)
+            .set_action_response(id, ActionResponse::Accept, s.instance_id.unwrap(), None)
             .await
             .unwrap();
         sqlx::query("DELETE FROM engine.chat_messages WHERE id = $1")
@@ -5703,7 +5877,7 @@ mod tests {
         .await
         .unwrap();
         let repo = ChatRepo { pool: &pool };
-        repo.set_action_response(id, ActionResponse::Refuse)
+        repo.set_action_response(id, ActionResponse::Refuse, s.instance_id.unwrap(), None)
             .await
             .unwrap();
         let meta: serde_json::Value =
@@ -5731,7 +5905,7 @@ mod tests {
         .await
         .unwrap();
         ChatRepo { pool: &pool }
-            .set_action_response(id, ActionResponse::Accept)
+            .set_action_response(id, ActionResponse::Accept, s.instance_id.unwrap(), None)
             .await
             .unwrap();
         let meta: serde_json::Value =

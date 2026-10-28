@@ -5761,7 +5761,12 @@ pub(crate) fn run_stream_with(
                     // await between them. A failed write only loses the stored copy.
                     if let Some(response) = plan.action_response {
                         if let Err(e) = chat_repo
-                            .set_action_response(user_msg.user_message_id, response)
+                            .set_action_response(
+                                user_msg.user_message_id,
+                                response,
+                                user_msg.instance_id,
+                                user_msg.user_locale.timezone,
+                            )
                             .await
                         {
                             tracing::warn!("stream: action response write failed: {e}");
@@ -6286,7 +6291,12 @@ pub(crate) fn run_stream_with(
                 // await between them. A failed write only loses the stored copy.
                 if let Some(response) = plan.action_response {
                     if let Err(e) = chat_repo
-                        .set_action_response(user_msg.user_message_id, response)
+                        .set_action_response(
+                            user_msg.user_message_id,
+                            response,
+                            user_msg.instance_id,
+                            user_msg.user_locale.timezone,
+                        )
                         .await
                     {
                         tracing::warn!("stream: action response write failed: {e}");

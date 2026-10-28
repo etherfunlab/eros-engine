@@ -476,6 +476,7 @@ async fn persist_affinity(
                     user_message_id,
                     tier_drop,
                     growth_scale,
+                    None,
                 )
                 .await
             {

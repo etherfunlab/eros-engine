@@ -17,6 +17,7 @@ pub mod human_fact;
 pub mod human_insight;
 pub mod image_events;
 pub mod insight;
+pub mod journal;
 pub mod life_choices;
 pub mod memory;
 pub mod migrate;

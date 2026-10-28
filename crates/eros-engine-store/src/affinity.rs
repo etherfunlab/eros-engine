@@ -559,6 +559,12 @@ impl<'a> AffinityRepo<'a> {
     ///
     /// `user_message_id`: the user message that drove the turn; `None` for
     /// proactive / time-decay writes.
+    ///
+    /// `journal_tz`: the relationship journal takes this write's label moves
+    /// in the same transaction. A label first reached becomes a `tier_reached`
+    /// row dated in this timezone (UTC when `None`); a line that falls takes
+    /// back the rows of the labels it fell below, if they are under 24 hours
+    /// old.
     #[allow(clippy::too_many_arguments)] // each arg is a distinct persist concern
     pub async fn persist_with_event(
         &self,
@@ -585,6 +591,9 @@ impl<'a> AffinityRepo<'a> {
         // (the post-separation slowdown, spec 2026-10-19 §3.5); 1.0 = none.
         // Negatives and the two derived endpoints are never scaled.
         growth_scale: f64,
+        // The user's timezone, for dating the tier moments the relationship
+        // journal takes from this write; UTC when absent.
+        journal_tz: Option<chrono_tz::Tz>,
     ) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
 
@@ -791,12 +800,13 @@ impl<'a> AffinityRepo<'a> {
         // `state_after − state_before == effective_deltas`, and the gap to the
         // PREVIOUS row's `state_after` is the absence effect applied above —
         // which used to appear nowhere in the log (migration 0049).
-        sqlx::query(
+        let event_id: Uuid = sqlx::query_scalar(
             "INSERT INTO engine.companion_affinity_events \
                (affinity_id, event_type, deltas, effective_deltas, label_changes, effective_line_deltas, context, \
                 state_before, state_after, generation_id, \
                 llm_attempts, gateway_errors, user_message_id) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+             RETURNING id",
         )
         .bind(current.id)
         .bind(event_type)
@@ -811,7 +821,18 @@ impl<'a> AffinityRepo<'a> {
         .bind(llm_attempts)
         .bind(gateway_errors)
         .bind(user_message_id)
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        // The relationship journal's tier moments ride the same transaction as
+        // the event row they point at.
+        crate::journal::record_label_moves(
+            &mut tx,
+            &before_affinity,
+            &current,
+            event_id,
+            crate::journal::local_date(Utc::now(), journal_tz),
+        )
         .await?;
 
         tx.commit().await?;
@@ -1025,6 +1046,16 @@ mod tests {
     /// pays no penalty, so the rule values land 1:1 — which keeps the numeric
     /// expectations below identical to the direct-apply era.
     async fn persist_rule(repo: &AffinityRepo<'_>, a: &mut Affinity, rule: AffinityDeltas) {
+        persist_rule_in(repo, a, rule, None).await
+    }
+
+    /// [`persist_rule`], journaling in `journal_tz`.
+    async fn persist_rule_in(
+        repo: &AffinityRepo<'_>,
+        a: &mut Affinity,
+        rule: AffinityDeltas,
+        journal_tz: Option<chrono_tz::Tz>,
+    ) {
         repo.persist_with_event(
             a,
             &AxisGrades::default(),
@@ -1040,6 +1071,7 @@ mod tests {
             None,
             None,
             1.0,
+            journal_tz,
         )
         .await
         .unwrap()
@@ -1328,6 +1360,7 @@ mod tests {
                 None,
                 None,
                 1.0,
+                None,
             )
             .await
             .unwrap();
@@ -1388,6 +1421,7 @@ mod tests {
             None,
             None,
             1.0,
+            None,
         )
         .await
         .unwrap();
@@ -1443,6 +1477,7 @@ mod tests {
                 None,
                 None,
                 1.0,
+                None,
             )
             .await
             .unwrap();
@@ -1520,6 +1555,7 @@ mod tests {
             None,
             None,
             1.0,
+            None,
         )
         .await
         .unwrap();
@@ -1597,6 +1633,7 @@ mod tests {
             None,
             None,
             1.0,
+            None,
         )
         .await
         .unwrap();
@@ -1657,6 +1694,7 @@ mod tests {
             None,
             None,
             1.0,
+            None,
         )
         .await
         .unwrap();
@@ -1691,6 +1729,7 @@ mod tests {
             None,
             None,
             1.0,
+            None,
         )
         .await
         .unwrap();
@@ -1754,6 +1793,7 @@ mod tests {
                     None,
                     None,
                     1.0,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -1814,6 +1854,7 @@ mod tests {
                 None,
                 None,
                 1.0,
+                None,
             )
             .await
             .unwrap();
@@ -1874,6 +1915,7 @@ mod tests {
             None,
             None,
             1.0,
+            None,
         )
         .await
         .unwrap();
@@ -1999,6 +2041,7 @@ mod tests {
                 None,
                 None,
                 1.0,
+                None,
             )
             .await
             .unwrap();
@@ -2024,6 +2067,7 @@ mod tests {
                 None,
                 None,
                 1.0,
+                None,
             )
             .await
             .unwrap();
@@ -2658,6 +2702,7 @@ mod tests {
             None,
             None,
             1.0,
+            None,
         )
         .await
         .unwrap();
@@ -2766,6 +2811,200 @@ mod tests {
         assert!(rows[1].is_none(), "flat turn records NULL label_changes");
     }
 
+    /// The `tier_reached` journal rows of a relationship: (dedup key, summary,
+    /// affinity event, row id), by key.
+    async fn tier_rows(
+        pool: &PgPool,
+        instance_id: Uuid,
+    ) -> Vec<(String, String, Option<Uuid>, Uuid)> {
+        sqlx::query_as(
+            "SELECT dedup_key, summary, affinity_event_id, id \
+             FROM engine.relationship_journal \
+             WHERE instance_id = $1 AND kind = 'tier_reached' ORDER BY dedup_key",
+        )
+        .bind(instance_id)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn tier_up_writes_first_reach_only_and_down_within_24h_undoes_it(pool: PgPool) {
+        use crate::journal::local_date;
+        use chrono_tz::Asia::Tokyo;
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = make_session(&pool, user_id, instance_id).await;
+        let mut a = repo
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+        let up = || AffinityDeltas {
+            trust: 0.2,
+            intrigue: 0.2,
+            ..Default::default()
+        };
+        let down = || AffinityDeltas {
+            trust: -0.2,
+            intrigue: -0.2,
+            ..Default::default()
+        };
+
+        // acquaintance → friend: the first reach is journaled, pointing at the
+        // event row, dated in the user's timezone.
+        let day_before = local_date(Utc::now(), Some(Tokyo));
+        persist_rule_in(&repo, &mut a, up(), Some(Tokyo)).await;
+        let day_after = local_date(Utc::now(), Some(Tokyo));
+        assert_eq!(
+            a.bond_label(),
+            eros_engine_core::affinity::BondLabel::Friend
+        );
+        let event_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM engine.companion_affinity_events WHERE affinity_id = $1",
+        )
+        .bind(a.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let rows = tier_rows(&pool, instance_id).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            (rows[0].0.as_str(), rows[0].1.as_str(), rows[0].2),
+            ("bond:friend", "你们的关系到了「朋友」", Some(event_id))
+        );
+        let (on, source, realm, recurrence): (chrono::NaiveDate, String, String, String) =
+            sqlx::query_as(
+                "SELECT occurred_on, source, realm, recurrence \
+                 FROM engine.relationship_journal WHERE id = $1",
+            )
+            .bind(rows[0].3)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!((day_before..=day_after).contains(&on), "dated {on}");
+        assert_eq!(
+            (source.as_str(), realm.as_str(), recurrence.as_str()),
+            ("engine", "real", "none")
+        );
+
+        // Back down within 24 hours: the moment is undone.
+        persist_rule(&repo, &mut a, down()).await;
+        assert_eq!(
+            a.bond_label(),
+            eros_engine_core::affinity::BondLabel::Acquaintance
+        );
+        assert!(tier_rows(&pool, instance_id).await.is_empty());
+
+        // Reached again: the undone moment is celebrated afresh.
+        persist_rule(&repo, &mut a, up()).await;
+        let rows = tier_rows(&pool, instance_id).await;
+        assert_eq!(rows.len(), 1);
+        let kept_id = rows[0].3;
+
+        // A moment older than 24 hours survives a drop, and reaching the tier
+        // again writes no second row.
+        sqlx::query(
+            "UPDATE engine.relationship_journal SET created_at = now() - interval '25 hours' \
+             WHERE id = $1",
+        )
+        .bind(kept_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        persist_rule(&repo, &mut a, down()).await;
+        assert_eq!(
+            a.bond_label(),
+            eros_engine_core::affinity::BondLabel::Acquaintance
+        );
+        assert_eq!(tier_rows(&pool, instance_id).await[0].3, kept_id);
+        persist_rule(&repo, &mut a, up()).await;
+        let rows = tier_rows(&pool, instance_id).await;
+        assert_eq!(rows.len(), 1, "first reach only");
+        assert_eq!(rows[0].3, kept_id);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_fall_undoes_only_labels_above_it_on_its_own_line(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = make_session(&pool, user_id, instance_id).await;
+        let mut a = repo
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+
+        // bond: friend, then confidant; chemistry: crush.
+        persist_rule(
+            &repo,
+            &mut a,
+            AffinityDeltas {
+                trust: 0.2,
+                intrigue: 0.2,
+                ..Default::default()
+            },
+        )
+        .await;
+        persist_rule(
+            &repo,
+            &mut a,
+            AffinityDeltas {
+                trust: 0.6,
+                intrigue: 0.6,
+                intimacy: 0.5,
+                tension: 0.5,
+                ..Default::default()
+            },
+        )
+        .await;
+        let keys = |rows: Vec<(String, String, Option<Uuid>, Uuid)>| -> Vec<String> {
+            rows.into_iter().map(|r| r.0).collect()
+        };
+        assert_eq!(
+            keys(tier_rows(&pool, instance_id).await),
+            ["bond:confidant", "bond:friend", "chemistry:crush"]
+        );
+
+        // bond falls to close_friend: confidant goes; friend (below) and the
+        // other line's moment stay.
+        persist_rule(
+            &repo,
+            &mut a,
+            AffinityDeltas {
+                trust: -0.2,
+                intrigue: -0.2,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            a.bond_label(),
+            eros_engine_core::affinity::BondLabel::CloseFriend
+        );
+        assert_eq!(
+            keys(tier_rows(&pool, instance_id).await),
+            ["bond:friend", "chemistry:crush"]
+        );
+
+        // chemistry falls to flirtation: crush goes, the bond line is untouched.
+        persist_rule(
+            &repo,
+            &mut a,
+            AffinityDeltas {
+                intimacy: -0.3,
+                tension: -0.3,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            a.chemistry_label(),
+            eros_engine_core::affinity::ChemistryLabel::Flirtation
+        );
+        assert_eq!(keys(tier_rows(&pool, instance_id).await), ["bond:friend"]);
+    }
+
     #[sqlx::test(migrations = "./migrations")]
     async fn effective_line_deltas_are_exact(pool: PgPool) {
         let repo = AffinityRepo { pool: &pool };
@@ -2832,6 +3071,7 @@ mod tests {
             None,
             None,
             1.0,
+            None,
         )
         .await
         .unwrap();
@@ -3003,6 +3243,7 @@ mod tests {
             Some(umid),
             None,
             1.0,
+            None,
         )
         .await
         .unwrap();
@@ -3133,6 +3374,7 @@ mod tests {
             None,
             None,
             1.0,
+            None,
         )
         .await
         .unwrap()
@@ -3273,6 +3515,7 @@ mod tests {
             None,
             Some(AffinityLine::Chemistry),
             1.0,
+            None,
         )
         .await
         .unwrap();
@@ -3341,6 +3584,7 @@ mod tests {
             None,
             None,
             1.0,
+            None,
         )
         .await
         .unwrap();
@@ -3399,6 +3643,7 @@ mod tests {
             None,
             Some(AffinityLine::Chemistry),
             1.0,
+            None,
         )
         .await
         .unwrap();
@@ -3787,6 +4032,7 @@ mod tests {
                 None,
                 None,
                 growth_scale,
+                None,
             )
             .await
             .unwrap();

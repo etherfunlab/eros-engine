@@ -312,6 +312,28 @@ impl BondLabel {
         }
     }
 
+    /// Chinese display name, as the relationship journal words a tier moment.
+    pub fn zh(self) -> &'static str {
+        match self {
+            BondLabel::Acquaintance => "刚认识",
+            BondLabel::Friend => "朋友",
+            BondLabel::CloseFriend => "密友",
+            BondLabel::Confidant => "知己",
+            BondLabel::Soulmate => "灵魂伴侣",
+        }
+    }
+
+    /// Position on the ladder, 0 (lowest) ..= 4.
+    pub fn rank(self) -> u8 {
+        match self {
+            BondLabel::Acquaintance => 0,
+            BondLabel::Friend => 1,
+            BondLabel::CloseFriend => 2,
+            BondLabel::Confidant => 3,
+            BondLabel::Soulmate => 4,
+        }
+    }
+
     /// Name a tier index. Out-of-range clamps rather than panicking: the input
     /// can come from a stored column written by a NEWER engine, one whose
     /// ladder has more rungs than this build knows about.
@@ -351,6 +373,28 @@ impl ChemistryLabel {
             ChemistryLabel::Crush => "crush",
             ChemistryLabel::Lover => "lover",
             ChemistryLabel::Beloved => "beloved",
+        }
+    }
+
+    /// Chinese display name; see [`BondLabel::zh`].
+    pub fn zh(self) -> &'static str {
+        match self {
+            ChemistryLabel::Spark => "心动",
+            ChemistryLabel::Flirtation => "暧昧",
+            ChemistryLabel::Crush => "迷恋",
+            ChemistryLabel::Lover => "恋人",
+            ChemistryLabel::Beloved => "挚爱",
+        }
+    }
+
+    /// Position on the ladder, 0 (lowest) ..= 4.
+    pub fn rank(self) -> u8 {
+        match self {
+            ChemistryLabel::Spark => 0,
+            ChemistryLabel::Flirtation => 1,
+            ChemistryLabel::Crush => 2,
+            ChemistryLabel::Lover => 3,
+            ChemistryLabel::Beloved => 4,
         }
     }
 
@@ -1073,6 +1117,18 @@ mod tests {
         assert_eq!(a.chemistry_label(), ChemistryLabel::Beloved);
         assert_eq!(BondLabel::Soulmate.as_key(), "soulmate");
         assert_eq!(ChemistryLabel::Beloved.as_key(), "beloved");
+    }
+
+    #[test]
+    fn label_rank_follows_tier_and_zh_names_each_rung() {
+        for tier in 1..=5u8 {
+            assert_eq!(BondLabel::from_tier(tier).rank(), tier - 1);
+            assert_eq!(ChemistryLabel::from_tier(tier).rank(), tier - 1);
+        }
+        let bond: Vec<&str> = (1..=5).map(|t| BondLabel::from_tier(t).zh()).collect();
+        assert_eq!(bond, ["刚认识", "朋友", "密友", "知己", "灵魂伴侣"]);
+        let chem: Vec<&str> = (1..=5).map(|t| ChemistryLabel::from_tier(t).zh()).collect();
+        assert_eq!(chem, ["心动", "暧昧", "迷恋", "恋人", "挚爱"]);
     }
 
     #[test]
