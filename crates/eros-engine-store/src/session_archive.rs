@@ -139,6 +139,24 @@ impl<'a> SessionArchiveRepo<'a> {
             .execute(&mut *tx)
             .await?;
 
+        // The relationship scanner's products: cursor, episodes, arc and
+        // journal are this relationship's record, so the next conversation
+        // starts without them. `relationship_scan_events` stays: counts and ids
+        // only, the operator's audit trail.
+        for table in [
+            "relationship_scan_state",
+            "relationship_episodes",
+            "relationship_arcs",
+            "relationship_journal",
+        ] {
+            sqlx::query(&format!(
+                "DELETE FROM engine.{table} WHERE instance_id = $1"
+            ))
+            .bind(instance_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
         // UPDATE, not DELETE: this row also carries the persona's own typed
         // life base (occupation, city, ...), which lives only here — deleting
         // the row would take those with it. Only `digest` is this
@@ -421,6 +439,85 @@ mod tests {
         assert_eq!(
             snapshots, 1,
             "the user insights snapshot history must survive"
+        );
+    }
+
+    /// One row in each Memory 2.0 table for `instance_id`.
+    async fn seed_relationship_memory(pool: &PgPool, instance_id: Uuid) {
+        for sql in [
+            "INSERT INTO engine.relationship_scan_state (instance_id, scanned_through_at) \
+             VALUES ($1, '2026-10-01T00:00:00Z')",
+            "INSERT INTO engine.relationship_episodes (instance_id, summary, started_at, ended_at) \
+             VALUES ($1, 'a stretch', '2026-10-01T00:00:00Z', '2026-10-02T00:00:00Z')",
+            "INSERT INTO engine.relationship_arcs (instance_id, opening, arc, folded_through) \
+             VALUES ($1, 'they met', 'they grew close', '2026-10-02T00:00:00Z')",
+            "INSERT INTO engine.relationship_journal \
+                 (instance_id, occurred_on, kind, realm, summary, source, recurrence) \
+             VALUES ($1, '2026-10-01', 'first_date', 'real', 'a dinner', 'llm', 'none')",
+            "INSERT INTO engine.relationship_scan_events (instance_id, kind, status) \
+             VALUES ($1, 'scan', 'ok')",
+        ] {
+            sqlx::query(sql)
+                .bind(instance_id)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// The scanner's products are this relationship's record and go with it;
+    /// its scan events are counts and ids only, an operator's audit trail, and
+    /// stay. Another instance's products are not collateral.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn archive_removes_relationship_memory_products_and_keeps_scan_events(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let other_instance = seed_persona_instance(&pool, user_id).await;
+        seed_relationship(&pool, user_id, instance_id).await;
+        seed_relationship_memory(&pool, instance_id).await;
+        seed_relationship_memory(&pool, other_instance).await;
+
+        SessionArchiveRepo { pool: &pool }
+            .archive_relationship(user_id, instance_id)
+            .await
+            .unwrap();
+
+        for table in [
+            "relationship_scan_state",
+            "relationship_episodes",
+            "relationship_arcs",
+            "relationship_journal",
+        ] {
+            assert_eq!(
+                count(
+                    &pool,
+                    &format!("SELECT count(*) FROM engine.{table} WHERE instance_id = $1"),
+                    instance_id,
+                )
+                .await,
+                0,
+                "{table} is deleted"
+            );
+            assert_eq!(
+                count(
+                    &pool,
+                    &format!("SELECT count(*) FROM engine.{table} WHERE instance_id = $1"),
+                    other_instance,
+                )
+                .await,
+                1,
+                "{table} of the other instance survives"
+            );
+        }
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT count(*) FROM engine.relationship_scan_events WHERE instance_id = $1",
+                instance_id,
+            )
+            .await,
+            1,
+            "the scan events audit trail must survive"
         );
     }
 

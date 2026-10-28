@@ -70,6 +70,13 @@ const DERIVED: &[(&str, &str)] = &[
     // conversation.
     ("character_insights", BY_INSTANCE),
     ("character_insights_snapshot", BY_INSTANCE),
+    // The relationship scanner's products. The state row carries the scan
+    // claim the scanner's writes check, so it goes first among them.
+    // `relationship_scan_events` holds counts and ids only and is left alone.
+    ("relationship_scan_state", BY_INSTANCE),
+    ("relationship_episodes", BY_INSTANCE),
+    ("relationship_arcs", BY_INSTANCE),
+    ("relationship_journal", BY_INSTANCE),
 ];
 
 /// An audit or state row that survives an erasure with its content cleared.
@@ -256,6 +263,22 @@ mod tests {
             "character_insights_snapshot",
             "instance_id IN (SELECT id FROM engine.persona_instances WHERE owner_uid = $1)",
         ),
+        (
+            "relationship_scan_state",
+            "instance_id IN (SELECT id FROM engine.persona_instances WHERE owner_uid = $1)",
+        ),
+        (
+            "relationship_episodes",
+            "instance_id IN (SELECT id FROM engine.persona_instances WHERE owner_uid = $1)",
+        ),
+        (
+            "relationship_arcs",
+            "instance_id IN (SELECT id FROM engine.persona_instances WHERE owner_uid = $1)",
+        ),
+        (
+            "relationship_journal",
+            "instance_id IN (SELECT id FROM engine.persona_instances WHERE owner_uid = $1)",
+        ),
     ];
 
     /// Audit tables an erasure keeps and blanks: (table, scope to user `$1`,
@@ -366,6 +389,18 @@ mod tests {
         "INSERT INTO engine.companion_affinity_events (affinity_id, event_type, context) \
          SELECT (SELECT id FROM engine.companion_affinity WHERE session_id = p.s), 'message', \
                 '{\"said\":\"x\"}'",
+        "INSERT INTO engine.relationship_scan_state (instance_id, scanned_through_at) \
+         SELECT p.i, '2026-10-01T00:00:00Z'",
+        "INSERT INTO engine.relationship_episodes (instance_id, summary, started_at, ended_at) \
+         SELECT p.i, 'a stretch', '2026-10-01T00:00:00Z', '2026-10-02T00:00:00Z'",
+        "INSERT INTO engine.relationship_arcs (instance_id, opening, arc, folded_through) \
+         SELECT p.i, 'they met', 'they grew close', '2026-10-02T00:00:00Z'",
+        "INSERT INTO engine.relationship_journal \
+             (instance_id, occurred_on, kind, realm, summary, source, recurrence, embedding) \
+         SELECT p.i, '2026-10-01', 'first_date', 'real', 'a dinner', 'llm', 'none', NULL",
+        // Counts and ids only: an erasure leaves these rows alone.
+        "INSERT INTO engine.relationship_scan_events (instance_id, kind, status) \
+         SELECT p.i, 'scan', 'ok'",
     ];
 
     /// A profile write that holds the state row's lock when the erase starts is
@@ -523,6 +558,17 @@ mod tests {
         out
     }
 
+    /// Scan-event rows of the user's instances; the table is in neither list.
+    async fn scan_events(pool: &PgPool, user: Uuid) -> i64 {
+        count(
+            pool,
+            "relationship_scan_events",
+            "instance_id IN (SELECT id FROM engine.persona_instances WHERE owner_uid = $1)",
+            user,
+        )
+        .await
+    }
+
     async fn tombstones(pool: &PgPool, user: Uuid) -> Vec<DateTime<Utc>> {
         sqlx::query_scalar("SELECT erased_at FROM engine.user_erasures WHERE user_id = $1")
             .bind(user)
@@ -575,6 +621,10 @@ mod tests {
 
         // The other user is untouched.
         assert_eq!(footprint(&pool, kept).await, kept_before);
+
+        // Scan events hold counts and ids only: neither deleted nor blanked.
+        assert_eq!(scan_events(&pool, gone).await, 1);
+        assert_eq!(scan_events(&pool, kept).await, 1);
 
         // One tombstone, stamped with the report's time.
         assert_eq!(tombstones(&pool, gone).await, vec![report.erased_at]);
