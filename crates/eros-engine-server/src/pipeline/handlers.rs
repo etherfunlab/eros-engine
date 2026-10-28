@@ -842,12 +842,14 @@ pub(crate) async fn load_effects(
 /// The persona's needs carried to the reader's moment (spec
 /// 2026-10-13-persona-needs-design.md §5.2): the newest rating strictly before
 /// `before`, carried to that row's `sent_at`; with `None`, the newest rating
-/// carried to `now`. `Ok(None)` with no rating.
+/// carried to `now`. `habits` set how `indulgence` drifts. `Ok(None)` with no
+/// rating.
 pub(crate) async fn load_needs(
     pool: &PgPool,
     instance_id: Uuid,
     before: Option<Uuid>,
     now: chrono::DateTime<chrono::Utc>,
+    habits: eros_engine_core::needs::Habits,
 ) -> Result<Option<eros_engine_core::needs::Needs>, sqlx::Error> {
     let Some(r) = (ChatRepo { pool })
         .latest_needs(instance_id, before)
@@ -857,7 +859,23 @@ pub(crate) async fn load_needs(
     };
     let to = r.anchor_at.unwrap_or(now);
     let hours = (to - r.rated_at).num_milliseconds() as f64 / 3_600_000.0;
-    Ok(Some(eros_engine_core::needs::carried(r.needs, hours)))
+    Ok(Some(eros_engine_core::needs::carried(
+        r.needs, hours, habits,
+    )))
+}
+
+/// The instance's persona habits, for a reader that has not loaded the
+/// persona; none for an instance without one.
+pub(crate) async fn load_habits(
+    pool: &PgPool,
+    instance_id: Uuid,
+) -> Result<eros_engine_core::needs::Habits, sqlx::Error> {
+    Ok(eros_engine_store::persona::PersonaRepo { pool }
+        .load_companion(instance_id)
+        .await?
+        .as_ref()
+        .map(crate::prompt::persona_habits)
+        .unwrap_or_default())
 }
 
 /// Load + render 基础画像 from the flat `human_insights` mirror. `Off` → empty.
@@ -4618,6 +4636,14 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn load_habits_defaults_without_a_persona(pool: PgPool) {
+        assert_eq!(
+            load_habits(&pool, Uuid::new_v4()).await.unwrap(),
+            eros_engine_core::needs::Habits::default()
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn load_needs_carries_the_newest_rating_to_now(pool: PgPool) {
         use eros_engine_core::needs::NeedLevel;
         let owner = Uuid::new_v4();
@@ -4626,16 +4652,18 @@ mod tests {
             crate::routes::companion::testutil::seed_session(&pool, owner, instance_id).await;
         rated_row(&pool, session_id, "2026-10-01T00:00:00Z", "low").await;
         let now: chrono::DateTime<chrono::Utc> = "2026-10-01T08:30:00Z".parse().unwrap();
-        let got = load_needs(&pool, instance_id, None, now)
+        let got = load_needs(&pool, instance_id, None, now, Default::default())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(got.hunger, NeedLevel::High, "low + 8.5h → two steps up");
         assert_eq!(got.social, NeedLevel::Mid);
-        assert!(load_needs(&pool, Uuid::new_v4(), None, now)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            load_needs(&pool, Uuid::new_v4(), None, now, Default::default())
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -4648,7 +4676,7 @@ mod tests {
         rated_row(&pool, session_id, "2026-10-01T00:00:00Z", "low").await;
         let anchor = rated_row(&pool, session_id, "2026-10-01T04:30:00Z", "high").await;
         let far: chrono::DateTime<chrono::Utc> = "2026-10-05T00:00:00Z".parse().unwrap();
-        let got = load_needs(&pool, instance_id, Some(anchor), far)
+        let got = load_needs(&pool, instance_id, Some(anchor), far, Default::default())
             .await
             .unwrap()
             .unwrap();

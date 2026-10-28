@@ -83,14 +83,19 @@ impl From<eros_engine_core::needs::NeedLevel> for NeedLevelDto {
     }
 }
 
-/// The persona's four needs (spec 2026-10-13-persona-needs-design.md §3).
-/// Also the `needs` shape of the `body_state` stream frame.
+/// The persona's needs (spec 2026-10-13-persona-needs-design.md §3,
+/// 2026-10-28-outing-indulgence-needs-and-habits-design.md §2). Also the
+/// `needs` shape of the `body_state` stream frame.
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct NeedsView {
     pub hunger: NeedLevelDto,
     pub social: NeedLevelDto,
     pub stamina: NeedLevelDto,
     pub emotional: NeedLevelDto,
+    /// `high` wants to go out, `low` wants to stay in.
+    pub outing: NeedLevelDto,
+    /// `high` wants to let loose: a smoke, a drink, weed.
+    pub indulgence: NeedLevelDto,
 }
 
 impl From<&eros_engine_core::needs::Needs> for NeedsView {
@@ -100,6 +105,8 @@ impl From<&eros_engine_core::needs::Needs> for NeedsView {
             social: n.social.into(),
             stamina: n.stamina.into(),
             emotional: n.emotional.into(),
+            outing: n.outing.into(),
+            indulgence: n.indulgence.into(),
         }
     }
 }
@@ -159,31 +166,41 @@ async fn get_effects(
     } else {
         None
     };
+    let current = eros_engine_store::events::EventRepo { pool: &state.pool }
+        .current(instance_id, None, now)
+        .await?;
+    // How `indulgence` drifts, and whether an event keeps her offline, can
+    // depend on the persona. A BYOC instance has no genome, no events and no
+    // traits.
+    let persona =
+        if rating.is_some() || current.foreground.is_some() || current.background.is_some() {
+            eros_engine_store::persona::PersonaRepo { pool: &state.pool }
+                .load_companion(instance_id)
+                .await?
+        } else {
+            None
+        };
+    let traits = persona
+        .as_ref()
+        .map(crate::prompt::persona_traits)
+        .unwrap_or_default();
+    let habits = persona
+        .as_ref()
+        .map(crate::prompt::persona_habits)
+        .unwrap_or_default();
     // As `load_needs` carries them, plus when the carried levels next step.
     let (needs, needs_change) = match &rating {
         Some(r) => {
             let hours = (now - r.rated_at).num_milliseconds() as f64 / 3_600_000.0;
-            let next = eros_engine_core::needs::next_change(r.needs, hours).map(|h| {
+            let next = eros_engine_core::needs::next_change(r.needs, hours, habits).map(|h| {
                 r.rated_at + chrono::Duration::milliseconds((h * 3_600_000.0).round() as i64)
             });
-            (Some(eros_engine_core::needs::carried(r.needs, hours)), next)
+            (
+                Some(eros_engine_core::needs::carried(r.needs, hours, habits)),
+                next,
+            )
         }
         None => (None, None),
-    };
-    let current = eros_engine_store::events::EventRepo { pool: &state.pool }
-        .current(instance_id, None, now)
-        .await?;
-    // Whether an event keeps her offline can depend on the persona. A BYOC
-    // instance has no genome, no events and no traits.
-    let traits = if current.foreground.is_some() || current.background.is_some() {
-        eros_engine_store::persona::PersonaRepo { pool: &state.pool }
-            .load_companion(instance_id)
-            .await?
-            .as_ref()
-            .map(crate::prompt::persona_traits)
-            .unwrap_or_default()
-    } else {
-        Default::default()
     };
     let view = |e: &Option<eros_engine_store::events::EventRecord>| {
         e.as_ref()
@@ -513,6 +530,50 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn effects_carry_indulgence_by_habit_count(pool: sqlx::PgPool) {
+        // The original four at rest, so only `indulgence` can move.
+        let rated = || json!({"needs": {"hunger": "high", "social": "high", "stamina": "mid", "emotional": "mid"}});
+        let run = |art: serde_json::Value, mins_ago: i32| {
+            let pool = pool.clone();
+            async move {
+                let owner = Uuid::new_v4();
+                let instance_id = seed_persona_instance(&pool, owner).await;
+                sqlx::query(
+                    "UPDATE engine.persona_genomes g SET art_metadata = $2 \
+                     FROM engine.persona_instances i WHERE i.id = $1 AND g.id = i.genome_id",
+                )
+                .bind(instance_id)
+                .bind(art)
+                .execute(&pool)
+                .await
+                .unwrap();
+                let session_id = seed_session(&pool, owner, instance_id).await;
+                let rated_at = user_row(&pool, session_id, mins_ago, rated()).await;
+                let (s, body) = get_judged(pool, session_id, owner).await;
+                assert_eq!(s, StatusCode::OK);
+                (rated_at, body)
+            }
+        };
+        let two = json!({"smoking": true, "alcoholic": true});
+        let (_, body) = run(two.clone(), 9 * 60).await;
+        assert_eq!(
+            body["needs"],
+            json!({"hunger": "high", "social": "high", "stamina": "mid", "emotional": "mid",
+                "outing": "mid", "indulgence": "high"})
+        );
+        assert_eq!(body["changes_at"], serde_json::Value::Null);
+        let (rated_at, body) = run(two, 3 * 60).await;
+        assert_eq!(body["needs"]["indulgence"], "mid");
+        assert_eq!(
+            body["changes_at"],
+            json!(rated_at + chrono::Duration::hours(8))
+        );
+        let (_, body) = run(json!({}), 3 * 60).await;
+        assert_eq!(body["needs"]["indulgence"], "mid");
+        assert_eq!(body["changes_at"], serde_json::Value::Null);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn needs_are_carried_to_now(pool: sqlx::PgPool) {
         let owner = Uuid::new_v4();
         let instance_id = seed_persona_instance(&pool, owner).await;
@@ -524,7 +585,8 @@ mod tests {
         assert_eq!(s, StatusCode::OK);
         assert_eq!(
             body["needs"],
-            json!({"hunger": "mid", "social": "mid", "stamina": "high", "emotional": "mid"})
+            json!({"hunger": "mid", "social": "mid", "stamina": "high", "emotional": "mid",
+                "outing": "mid", "indulgence": "mid"})
         );
         // Hunger reaches high and stamina mid 8 hours after the rating.
         assert_eq!(
@@ -643,6 +705,8 @@ mod tests {
             social: NeedLevel::Low,
             stamina: NeedLevel::Mid,
             emotional: NeedLevel::Mid,
+            outing: NeedLevel::Mid,
+            indulgence: NeedLevel::Mid,
         };
         assert_eq!(
             serde_json::to_value(NeedsView::from(&n)).unwrap(),

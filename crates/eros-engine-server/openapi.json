@@ -6423,12 +6423,14 @@
       },
       "NeedsView": {
         "type": "object",
-        "description": "The persona's four needs (spec 2026-10-13-persona-needs-design.md §3).\nAlso the `needs` shape of the `body_state` stream frame.",
+        "description": "The persona's needs (spec 2026-10-13-persona-needs-design.md §3,\n2026-10-28-outing-indulgence-needs-and-habits-design.md §2). Also the\n`needs` shape of the `body_state` stream frame.",
         "required": [
           "hunger",
           "social",
           "stamina",
-          "emotional"
+          "emotional",
+          "outing",
+          "indulgence"
         ],
         "properties": {
           "emotional": {
@@ -6436,6 +6438,14 @@
           },
           "hunger": {
             "$ref": "#/components/schemas/NeedLevelDto"
+          },
+          "indulgence": {
+            "$ref": "#/components/schemas/NeedLevelDto",
+            "description": "`high` wants to let loose: a smoke, a drink, weed."
+          },
+          "outing": {
+            "$ref": "#/components/schemas/NeedLevelDto",
+            "description": "`high` wants to go out, `low` wants to stay in."
           },
           "social": {
             "$ref": "#/components/schemas/NeedLevelDto"

@@ -6176,6 +6176,8 @@ mod tests {
             social: NeedLevel::Low,
             stamina: NeedLevel::Mid,
             emotional: NeedLevel::Mid,
+            outing: NeedLevel::Mid,
+            indulgence: NeedLevel::Mid,
         };
         repo.set_needs(id, &n).await.unwrap();
         let meta: serde_json::Value =
@@ -6187,7 +6189,8 @@ mod tests {
         assert_eq!(meta["action"], json!({"type": "hug"}));
         assert_eq!(
             meta["needs"],
-            json!({"hunger": "high", "social": "low", "stamina": "mid", "emotional": "mid"})
+            json!({"hunger": "high", "social": "low", "stamina": "mid", "emotional": "mid",
+                "outing": "mid", "indulgence": "mid"})
         );
         repo.set_needs(
             id,
@@ -6225,6 +6228,8 @@ mod tests {
             social: NeedLevel::Mid,
             stamina: NeedLevel::Low,
             emotional: NeedLevel::Mid,
+            outing: NeedLevel::Mid,
+            indulgence: NeedLevel::Mid,
         };
         ChatRepo { pool: &pool }.set_needs(id, &n).await.unwrap();
         let stamina: Option<String> = sqlx::query_scalar(

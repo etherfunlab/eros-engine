@@ -4715,6 +4715,7 @@ pub(crate) fn run_stream_with(
                 user_msg.instance_id,
                 Some(user_msg.user_message_id),
                 chrono::Utc::now(),
+                crate::prompt::persona_habits(&input.persona),
             )
             .await
             .unwrap_or_else(|e| {
@@ -19251,6 +19252,8 @@ data: [DONE]\n\n";
             social: NeedLevel::Low,
             stamina: NeedLevel::Mid,
             emotional: NeedLevel::Mid,
+            outing: NeedLevel::Mid,
+            indulgence: NeedLevel::Mid,
         };
         let ctx = build_pde_ctx(
             &t,
@@ -19309,6 +19312,8 @@ data: [DONE]\n\n";
             social: NeedLevel::Mid,
             stamina: NeedLevel::Low,
             emotional: NeedLevel::Mid,
+            outing: NeedLevel::Mid,
+            indulgence: NeedLevel::Mid,
         };
         assert_eq!(
             pde_inputs_snapshot(&a, Some(&shown))["needs"]["stamina"],
@@ -22323,7 +22328,8 @@ data: [DONE]\n\n"
     }
 
     fn needs_json(h: &str, s: &str, st: &str, e: &str) -> serde_json::Value {
-        serde_json::json!({"hunger": h, "social": s, "stamina": st, "emotional": e})
+        serde_json::json!({"hunger": h, "social": s, "stamina": st, "emotional": e,
+            "outing": "mid", "indulgence": "mid"})
     }
 
     /// The judge call's raw request body: JSON, so a line break inside the
@@ -23942,13 +23948,16 @@ data: [DONE]\n\n"
             social: NeedLevel::Mid,
             stamina: NeedLevel::Mid,
             emotional: NeedLevel::Mid,
+            outing: NeedLevel::Mid,
+            indulgence: NeedLevel::Mid,
         };
         let f = body_state_frame(id, &[], Some(n)).expect("needs alone send a frame");
         assert_eq!(
             serde_json::to_value(&f).unwrap(),
             serde_json::json!({
                 "type": "body_state", "user_message_id": id, "effects": [],
-                "needs": {"hunger": "high", "social": "mid", "stamina": "mid", "emotional": "mid"},
+                "needs": {"hunger": "high", "social": "mid", "stamina": "mid", "emotional": "mid",
+                    "outing": "mid", "indulgence": "mid"},
             })
         );
     }

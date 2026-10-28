@@ -1238,6 +1238,18 @@ pub(crate) fn persona_traits(
     }
 }
 
+/// Whether the persona smokes, drinks, uses weed (spec 2026-10-28-outing-
+/// indulgence-needs-and-habits-design.md §3): `art_metadata.smoking`,
+/// `alcoholic`, `drug`; a key that is not a boolean reads as unset.
+pub(crate) fn persona_habits(persona: &CompanionPersona) -> eros_engine_core::needs::Habits {
+    let key = |k: &str| persona.genome.art_metadata.get(k).and_then(|v| v.as_bool());
+    eros_engine_core::needs::Habits {
+        smoking: key("smoking"),
+        alcoholic: key("alcoholic"),
+        drug: key("drug"),
+    }
+}
+
 /// Pluck an i32 field out of `art_metadata`: a JSON number, or a string
 /// holding one (forms that save numbers as text).
 pub(crate) fn meta_i32(persona: &CompanionPersona, key: &str) -> Option<i32> {
@@ -3988,6 +4000,8 @@ mod tests {
             social: l,
             stamina: l,
             emotional: l,
+            outing: Mid,
+            indulgence: Mid,
         };
         assert_eq!(needs_line(&all(Mid)), None);
         assert_eq!(
@@ -4003,6 +4017,8 @@ mod tests {
             social: Mid,
             stamina: Low,
             emotional: Mid,
+            outing: Mid,
+            indulgence: Mid,
         };
         assert_eq!(needs_line(&mixed).as_deref(), Some("饿了；很累"));
     }
@@ -4519,6 +4535,26 @@ mod tests {
         assert_eq!(persona_traits(&p), PersonaTraits::default());
         p.genome.art_metadata = serde_json::json!({});
         assert_eq!(persona_traits(&p), PersonaTraits::default());
+    }
+
+    #[test]
+    fn persona_habits_reads_three_states() {
+        use eros_engine_core::needs::Habits;
+        let with = |art: serde_json::Value| {
+            let mut p = fixture_persona();
+            p.genome.art_metadata = art;
+            persona_habits(&p)
+        };
+        assert_eq!(with(serde_json::json!({})), Habits::default());
+        assert_eq!(
+            with(serde_json::json!({"smoking": true, "alcoholic": false, "drug": "true"})),
+            Habits {
+                smoking: Some(true),
+                alcoholic: Some(false),
+                drug: None,
+            }
+        );
+        assert_eq!(with(serde_json::json!({"drug": 1})).drug, None);
     }
 
     #[test]

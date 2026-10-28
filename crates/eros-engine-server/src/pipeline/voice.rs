@@ -349,7 +349,8 @@ async fn load_bootstrap_needs(
     if !enabled {
         return Ok(None);
     }
-    crate::pipeline::handlers::load_needs(pool, instance_id, None, Utc::now()).await
+    let habits = crate::pipeline::handlers::load_habits(pool, instance_id).await?;
+    crate::pipeline::handlers::load_needs(pool, instance_id, None, Utc::now(), habits).await
 }
 
 /// Assemble a first-turn snapshot. The four parts degrade independently; the
@@ -1263,6 +1264,8 @@ mod tests {
             social: NeedLevel::Mid,
             stamina: NeedLevel::Low,
             emotional: NeedLevel::Mid,
+            outing: NeedLevel::Mid,
+            indulgence: NeedLevel::Mid,
         }
     }
 

@@ -834,6 +834,8 @@ mod tests {
             social: NeedLevel::Mid,
             stamina,
             emotional,
+            outing: NeedLevel::Mid,
+            indulgence: NeedLevel::Mid,
         })
     }
 
@@ -843,6 +845,8 @@ mod tests {
             social: NeedLevel::Mid,
             stamina: NeedLevel::Mid,
             emotional: NeedLevel::Mid,
+            outing: NeedLevel::Mid,
+            indulgence: NeedLevel::Mid,
         })
     }
 

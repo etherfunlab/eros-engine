@@ -619,7 +619,14 @@ pub(crate) async fn draw_event_at(
     }
 
     let needs = if state.model_config.pde_enabled() {
-        crate::pipeline::handlers::load_needs(&state.pool, instance_id, None, now).await?
+        crate::pipeline::handlers::load_needs(
+            &state.pool,
+            instance_id,
+            None,
+            now,
+            crate::prompt::persona_habits(&persona),
+        )
+        .await?
     } else {
         None
     };

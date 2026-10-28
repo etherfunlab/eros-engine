@@ -1145,15 +1145,23 @@ pub async fn send_message_stream(
                         .and_then(|v| serde_json::from_value(v.clone()).ok())
                     {
                         Some(n) => Some(n),
-                        None => crate::pipeline::handlers::load_needs(
-                            &state.pool,
-                            instance_id,
-                            Some(user_message_id),
-                            chrono::Utc::now(),
-                        )
-                        .await
-                        .ok()
-                        .flatten(),
+                        None => {
+                            match crate::pipeline::handlers::load_habits(&state.pool, instance_id)
+                                .await
+                            {
+                                Ok(habits) => crate::pipeline::handlers::load_needs(
+                                    &state.pool,
+                                    instance_id,
+                                    Some(user_message_id),
+                                    chrono::Utc::now(),
+                                    habits,
+                                )
+                                .await
+                                .ok()
+                                .flatten(),
+                                Err(_) => None,
+                            }
+                        }
                     }
                 } else {
                     None
@@ -2673,6 +2681,8 @@ data: [DONE]\n\n";
                     social: eros_engine_core::needs::NeedLevel::Mid,
                     stamina: eros_engine_core::needs::NeedLevel::Mid,
                     emotional: eros_engine_core::needs::NeedLevel::Mid,
+                    outing: eros_engine_core::needs::NeedLevel::Mid,
+                    indulgence: eros_engine_core::needs::NeedLevel::Mid,
                 },
             )
             .await
@@ -2745,7 +2755,7 @@ data: [DONE]\n\n";
         assert!(bs < meta, "body: {body_text}");
         assert!(
             body_text.contains(
-                "\"needs\":{\"hunger\":\"high\",\"social\":\"mid\",\"stamina\":\"mid\",\"emotional\":\"mid\"}"
+                "\"needs\":{\"hunger\":\"high\",\"social\":\"mid\",\"stamina\":\"mid\",\"emotional\":\"mid\",\"outing\":\"mid\",\"indulgence\":\"mid\"}"
             ),
             "{body_text}"
         );
