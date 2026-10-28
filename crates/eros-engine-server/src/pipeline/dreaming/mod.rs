@@ -33,6 +33,12 @@ use eros_engine_store::memory::{MemoryLayer, MemoryRepo};
 
 use crate::state::AppState;
 
+// The pure pieces of the per-relationship scan; the scan job is their caller.
+#[allow(dead_code)]
+mod parse;
+#[allow(dead_code)]
+mod render;
+
 const MEMORY_TASK: &str = eros_engine_llm::model_config::DREAMING_SCAN_TASK;
 /// Sentinel OpenRouter `user` for system-initiated (non-user-triggered) LLM
 /// calls. Dreaming runs in the background sweeper with no live request, so
@@ -44,15 +50,15 @@ pub(crate) const SYSTEM_AUDIT_USER: &str = "11111111-1111-1111-1111-111111111111
 const PICK_BATCH: i64 = 10;
 
 #[derive(Debug, Deserialize)]
-struct MemoryCandidate {
-    content: String,
-    category: String,
+pub(crate) struct MemoryCandidate {
+    pub(crate) content: String,
+    pub(crate) category: String,
     /// Everything else the extraction prompt emitted per memory (domain /
     /// evidence_type / temporality / persistence / confidence, plus whatever
     /// future prompts add). Captured opaquely — the engine never validates
     /// the vocabulary; it lands verbatim in companion_memories.metadata.
     #[serde(flatten)]
-    metadata: serde_json::Map<String, serde_json::Value>,
+    pub(crate) metadata: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Flattened remainder → the JSONB value to persist. Empty map ⇒ `None`
