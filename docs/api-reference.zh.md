@@ -120,7 +120,7 @@ data: {"type":"final","filtered":false,"prompt_injected":null,"tier":null,"retri
 - **`cast`**、**`speaker_error`** —— 仅群聊轮次，见 [group-chat.zh.md](group-chat.zh.md#一轮)。1:1 流不会发这两种帧。
 - **`reasoning`** —— `content`：PDE 判断器推理文本的一段（`{"type":"reasoning","content":"…"}`）。零条或多条，最先发出，排在 `action_response`、`body_state` 和第一个 `meta` 之前。只要判断器的模型返回了推理就会出现；body 规则可以打开推理，`reasoning = { enabled = false }` 或 `{ exclude = true }` 可以关闭（见 [model-config.zh.md](model-config.zh.md)）。判断器没有返回推理时，1:1 的帧序列不变。内容仅供展示，不决定任何事；完整显示、折叠还是做成“思考中”提示，由客户端自行决定。判断器回退到别的模型时，那个模型的推理接着往后追加，不发重置帧。群聊轮次的导演在 `cast` 之前发同样的帧。
 - **`action_response`** —— 只在带 `action` 的回合出现：`user_message_id` 和 `response`（`"accept"` | `"refuse"`）。在第一个 `meta` 之前发一次，幂等重放时会重发（`reasoning` 帧不落库，重放时不重发）。客户端必须容忍不认识的帧类型。之后若该回合以 `error` 结束，这一轮就没有生效，历史里也不带它的 `response`。
-- **`body_state`** —— 这一回合回复写成时角色的状态：`user_message_id`；`effects`，仍在起作用的被接受的 give，新的在前，每项 `{item, name?, quantity, level, phase, step, steps}`（`level` 1–4，`phase` 为 `rising` | `peak` | `fading`，`steps` 中的第 `step` 步），没有时为 `[]`；`needs`，`{hunger, social, stamina, emotional}`，各为 `low` | `mid` | `high`，没有判定时为 `null`（只有配置了 LLM 判官才有需求，见 [model-config.zh.md](model-config.zh.md)）。有余效或已知需求时发，只发一次，在 `action_response`（若有）之后、第一个 `meta` 之前，幂等重放时重发。
+- **`body_state`** —— 这一回合回复写成时角色的状态：`user_message_id`；`effects`，仍在起作用的被接受的 give，新的在前，每项 `{item, name?, quantity, level, phase, step, steps}`（`level` 1–4，`phase` 为 `rising` | `peak` | `fading`，`steps` 中的第 `step` 步），没有时为 `[]`；`needs`，`{hunger, social, stamina, emotional, outing, indulgence}`，各为 `low` | `mid` | `high`，没有判定时为 `null`（只有配置了 LLM 判官才有需求，见 [model-config.zh.md](model-config.zh.md)）。有余效或已知需求时发，只发一次，在 `action_response`（若有）之后、第一个 `meta` 之前，幂等重放时重发。
 
 **失败轮次在历史里的样子。** 以 `error` 结束的轮次没有生效：亲密度没有变化，动作轮次的用户行不带 `response`。通常还会留下一条 `system_error` 通知，它的 `user_message_id` 指向那条用户行。如果轮次失败之前已经有失败的回复尝试落库，就不留通知：回复链用尽时没有兜底话术可发（没有配置，或者整条链都是 BYOK，见 [byok.zh.md](byok.zh.md)），或者某一跳失败之后整轮超时。这时队列行按 `done` 结算，历史里保留每次失败尝试的 assistant 行，内容为空，或是它流出过的半截文本。async 端点的轮次走同一条管线，但最多可以尝试 `CHAT_QUEUE_MAX_ATTEMPTS` 次：还没有任何回复尝试落库就失败的会重试，只有最后一次尝试按上面的方式结算；已经有回复尝试落库之后才失败的不再重试。
 
@@ -397,6 +397,8 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 | 数量 > 5 | 4 3 3 2 1 | 1 2 3 4 4 | 1 3 4 2 1 |
 
 一个回合指文字 session 里的一条用户消息；产品咨询消息和语音通话不计数，也没有时间上限。这份状态会进判官、回复 prompt 和画图 composer，并经 `body_state` 帧和 [`GET /v2/comp/session/{session_id}/effects`](#get-v2compsessionsession_ideffects) 给到调用方。被拒绝的 give 没有余效。设计文档：[余效 spec](superpowers/specs/2026-10-12-given-item-lingering-effects-design.md)、[give 品类 spec](superpowers/specs/2026-10-13-give-categories-design.md)。
+
+**递来她不用的东西。** 角色的 `art_metadata.smoking`、`alcoholic`、`drug` 表示她抽不抽烟、喝不喝酒、用不用大麻（表在[下文](#post-v2compsessionsession_idevents)）。递 `cigarette`、`alcohol` 或 `herb` 而对应的键为 `false` 时，engine 在判官运行之前掷一次。三次里有一次，这一轮照常进行。其余情况回应就是 `refuse`，不管判官怎么答，也不管有没有 LLM 判官：`action_response` 帧和两套历史接口返回的 `response` 都是 `refuse`，这次 give 不留余效，并像任何被拒的 give 一样让 bond 线降一档。判官会被告知这个结果（见 [model-config.zh.md](model-config.zh.md#taskspde_decision--opt-in-llm-pde-判断器)）。键为 `true` 或不写时从不掷，其他物品和其他动作也不掷。
 
 带动作时 `content` 可以为空，也可以和 `image_url`、`image` 同时出现。取值不合规（超出范围、缺少 `item`/`text`/`amount_usd`/`kind`/`name`）一律返回 `422`，`code: "unprocessable"`；`type` 或 `item` 不在上表取值内时，请求体按无法解析的 JSON 拒绝（同样是 `422`）。动作存在用户行上，两套历史接口都以 `action` 字段返回，该回合生效之后带 `response`。
 
@@ -814,6 +816,8 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | `mid` | `watching_match` | 2–3 小时 | 在看比赛 |
 | `mid` | `watching_show` | 2–3 小时 | 在看表演 |
 | `mid` | `having_sex` | 1–2 小时 | 在做爱（离线，从不讲出来） |
+| `mid` | `want_to_go_out` | 1–3 小时 | 很想出门 |
+| `mid` | `want_to_go_home` | 1–3 小时 | 很想回家 |
 | `body` | `sick` | 1–3 天 | 生病中 |
 | `body` | `period` | 3–7 天 | 月经中 |
 | `body` | `hospitalized` | 2–5 天 | 住院 |
@@ -823,7 +827,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | `trip` | `long_trip` | 3–7 天 | 长途旅游 |
 | `trip` | `hometown_visit` | 72 小时 | 回老家 |
 
-时长写成区间的，在事件开始时从区间里抽定。以上共 50 种可抽取的种类。两种性别都会抽到两个聚会，权重相同，这是有意为之。
+时长写成区间的，在事件开始时从区间里抽定。以上共 52 种可抽取的种类。两种性别都会抽到两个聚会，权重相同，这是有意为之。
 
 另有两种永远不会被抽到：`taking_space`（她提出、用户同意的分开，12–24 小时，离线）和 `fell_out`（用户不理会她的请求时的那场不愉快，1 小时）。
 它们由 engine 为[生活选择流程](#post-v2compsessionsession_idlife-choiceschoice_id)写入，作为 `…/effects` 和生活选择响应里的 `event` 出现，
@@ -832,6 +836,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 `sudden_desire`、`having_sex` 与 `pregnancy_scare`（后者隐含性行为）带成人题材；只对部分用户提供这类内容的调用方，用
 `{"disallow": ["sudden_desire", "having_sex", "pregnancy_scare"]}` 把它们排除。`scolded_by_superior` 与 `scolded_superior`
 假定她有上级；角色没有上级时，由调用方排除。`disallow` 列表之外的种类都照常抽取，engine 以后新增的种类也一样。
+数组或 `allow` 列表只抽它点名的种类：用白名单的调用方要把 `want_to_go_out` 和 `want_to_go_home` 加进去才会抽到。
 
 抽取规则：
 
@@ -846,7 +851,9 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
   `{"event": null, "message": null}`。带着已经抽过的 `event_key` 来重复调用，照样返回那个事件。
 - **冷却。** 每种事件从开始起有各自的冷却。trip 类每周最多开始一次，body 类每两周最多开始一次，不论具体是哪一种。
   任何离线类种类每 12 小时最多开始一次，不论具体是哪一种。
-- **她的需求给类别内的种类加权**，前提是部署配置了 LLM 判官，并且角色有一次判定。
+- **她的需求给类别内的种类加权**，前提是部署配置了 LLM 判官，并且角色有一次判定：`high` 的 `outing` 偏向
+  `want_to_go_out`，`low` 的偏向 `want_to_go_home`，`high` 的 `indulgence` 偏向 `want_to_go_out` 和 `irritable`
+  （完整的表见 [life-events-needs.zh.md](life-events-needs.zh.md#1-需求给种类加权)）。
 - **亲近度门槛。** `ex_message` 与 `breakup` 不会向不太熟的人抽出（intimacy 档 2 及以上）；
   `sudden_desire` 只在最亲近的档（3）。`period` 只对 `art_metadata.gender` 为 `"female"` 的角色抽取；
   `period_scare`（档 2 及以上）与 `pregnancy_scare`（档 3）同样只对这样的角色抽取，`saw_bag` 和 `saw_clothes` 也是；
@@ -860,6 +867,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
   | `prefer_trip` | `true` / `false`（默认） | trip 类被抽到的概率是原来的三倍；仍然每周最多一次 |
   | `homesick` | `true` / `false` / 不写 | 出行往哪去：`true` 偏向 `hometown_visit`、压低游玩的两种；`false` 压低 `hometown_visit`；`business_trip` 不动 |
   | `is_virgin` | `true` / `false`（默认） | 第一次 `having_sex` 事件之前，`having_sex` 的概率是五分之一；之后这个键不再起作用 |
+  | `smoking`、`alcoholic`、`drug` | 各为 `true` / `false` / 不写 | 她抽不抽烟、喝不喝酒、用不用大麻：为 `true` 的越多，她的 `indulgence` 回到 `high` 越快，进而给抽取加权；为 `false` 的键可能让她拒收递来的这样东西（见[上文](#post-compchatsession_idmessagestream)） |
 
   取值形状不对、种类未知，或种类不在 `mid` 里，一律忽略。偏好不会绕过任何门槛。
 - **只要有符合条件的种类，抽取就一定得到一个事件。** 她的一天有多热闹，取决于调用方什么时候来要。
@@ -941,7 +949,7 @@ composer 失败时退回普通的人物肖像 prompt，跟聊天回合一样。�
 
 ```json
 {"effects": [{"item": "alcohol", "name": "威士忌", "quantity": 3, "level": 2, "phase": "rising", "step": 2, "steps": 3}],
- "needs": {"hunger": "high", "social": "mid", "stamina": "low", "emotional": "mid"},
+ "needs": {"hunger": "high", "social": "mid", "stamina": "low", "emotional": "mid", "outing": "high", "indulgence": "mid"},
  "event": null,
  "background_event": {"kind": "short_trip", "category": "trip", "offline": false, "started_at": "2026-10-15T08:00:00Z", "ends_at": "2026-10-17T08:00:00Z", "message_id": "…"},
  "as_of": "2026-10-16T13:00:00Z",

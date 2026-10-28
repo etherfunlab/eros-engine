@@ -2,7 +2,7 @@
 
 [English](life-events-needs.md) · [中文](life-events-needs.zh.md)
 
-角色有自己的一天，有两类状态跟着这一天走。**需求**是四项基本水平（饥饿、社交欲、体力、情感需求），
+角色有自己的一天，有两类状态跟着这一天走。**需求**是六项基本水平（饥饿、社交欲、体力、情感需求、外出、享受），
 由 PDE 判官评定，由 engine 随时间往前推。**生活事件**是发生在她身上的事，调用方来要的时候才抽：
 一趟出差、一场病、路上遇到的一只流浪猫、一个小时没看手机。两者都以平实的当前事实交给判官和回复，
 都不告诉她该怎么表现；例外是本身就是沉默的事件（离线类种类）。两者之上还有第三件事：关系磨薄了，她可以提出先分开一阵，
@@ -16,7 +16,7 @@
 
 | | 需求 | 生活事件 |
 |---|---|---|
-| 是什么 | 四项水平：`hunger`、`social`、`stamina`、`emotional`，各为 `low` / `mid` / `high` | 发生在她一天里的事，分四个类别 |
+| 是什么 | 六项水平：`hunger`、`social`、`stamina`、`emotional`、`outing`、`indulgence`，各为 `low` / `mid` / `high` | 发生在她一天里的事，分四个类别 |
 | 谁写入 | PDE 判官，在被判官评过的文字回合 | 调用方的 `POST /v2/comp/session/{session_id}/events`，种类由 engine 选 |
 | 存在哪 | 被评定那一行用户消息的 `metadata.needs` | `engine.persona_events`，外加讲述它的那条消息（她不讲的离线类种类没有） |
 | 范围 | 每个角色实例一份状态，跨它所有的 session | 同左 |
@@ -30,7 +30,7 @@
 
 ## 需求
 
-### 四项需求
+### 六项需求
 
 | 需求 | `low` | `high` | 回复里的措辞，`low` / `high` |
 |---|---|---|---|
@@ -38,6 +38,8 @@
 | `social` | 不想有人陪 | 想找人说话 | 不想跟人打交道 / 想找人说说话 |
 | `stamina` | 很累 | 精力充沛 | 很累 / 精神很好 |
 | `emotional` | 心里满足 | 很想被在乎 | 心里挺满足 / 很想被在乎 |
+| `outing` | 只想待在家里 | 想出门 | 只想待在屋里 / 想出门走走 |
+| `indulgence` | 没有这个念头 | 想放纵一下：抽根烟、喝一杯、来口大麻 | — / 很想抽根烟、很想喝一杯、很想抽口大麻或很想放纵一下（[见下](#需求出现在哪)） |
 
 水平是有序的档位。判官从不读也不写数字，`mid` 就是不值一提的中间。
 
@@ -47,8 +49,10 @@
 没有 `[需求]` 行，回复里没有对应的行，帧和 effects 路由上的 `needs` 为 `null`，事件抽取里没有需求加权，
 语音通话里也没有。
 
-- **verdict。** 判官的 JSON 可以带 `needs`：四个键齐全的对象，或 `null`，意思是“不变，沿用上次的判定”。
-  解析不了的值按 `null` 处理，永远不会让 verdict 失败。严格的 `response_format` 要求非空对象里四个键齐全。
+- **verdict。** 判官的 JSON 可以带 `needs`：六个键齐全的对象，或 `null`，意思是“不变，沿用上次的判定”。
+  解析不了的值按 `null` 处理，永远不会让 verdict 失败。严格的 `response_format` 要求非空对象里六个键齐全。
+  前四个键齐全、但缺 `outing` 或 `indulgence` 的对象（判官 prompt 没要这两项，或判官不走严格模式），缺的那一项沿用判官看到的水平（第一次评定之前为 `mid`）；
+  前四个键缺任何一个，整个对象解析不了。
 - **评谁。** 只评角色本人，不评你们之间的关系；关系由好感度评估器评。
 - **存在哪。** 存在判官评过的那个回合的用户消息行上，键为 `metadata.needs`，不管这一回合的结局是回复、
   图片、ghost 还是产品咨询。写入会等它完成，回合才继续。写入失败只记日志，回合带着 verdict 里的水平继续往下走。
@@ -70,9 +74,17 @@
 | `social` | `high` | 12 小时 |
 | `stamina` | `mid` | 8 小时 |
 | `emotional` | `mid` | 12 小时 |
+| `outing` | `mid` | 8 小时 |
+| `indulgence`，没有习惯为 `true` | `mid` | 8 小时 |
+| `indulgence`，一项习惯为 `true` | `high` | 12 小时 |
+| `indulgence`，两项习惯为 `true` | `high` | 8 小时 |
+| `indulgence`，三项都为 `true` | `high` | 4 小时 |
 
-离开得越久，她越饿、越想找人说话；疲惫和情感需求则向中间回落。中午评成 `low` 的饥饿，16:00 读作 `mid`，
-20:00 起读作 `high`。常量在 `crates/eros-engine-core/src/needs.rs`。
+离开得越久，她越饿、越想找人说话；疲惫、情感需求和想出门或想待着的念头则向中间回落。中午评成 `low` 的饥饿，16:00 读作 `mid`，
+20:00 起读作 `high`。习惯指角色的 `smoking`、`alcoholic`、`drug` 三个键（见[角色设置](#角色设置)）；`false` 和不写算作一样。
+为 `true` 的越多，判官把放纵的念头评低之后，它回来得越快。存下时没有 `outing` 和 `indulgence` 的评定，这两项都读作 `mid`。
+BYOC 角色的这三个键在她的卡片上，engine 只在一轮对话里才打开卡片：在对话之外（`GET …/effects`，以及回放时退回到推算水平的那一步），
+她的 `indulgence` 按没有习惯的角色漂移。常量在 `crates/eros-engine-core/src/needs.rs`。
 
 评定被推到哪个时刻，取决于谁在读：
 
@@ -89,10 +101,13 @@
 - **判官**在每个被判官评过的回合得到一行 `[需求]`，排在 `[近期事件]` 和 `[身体状态]` 之前：
 
   ```
-  [需求] 饥饿=高 社交欲=低 体力=中 情感需求=中
+  [需求] 饥饿=高 社交欲=低 体力=中 情感需求=中 外出=中
+  [需求] 饥饿=高 社交欲=低 体力=中 情感需求=中 外出=中 享受=高
   ```
 
-  第一次评定之前读作 `[需求] 尚未判定`。这一行永远在，因为缺这一行会被读成“全是低”。
+  `外出` 每次都在；`享受=高` 只在 `indulgence` 为 `high` 时出现，没有它就读作“不高”（参考判官 prompt 里写明了这一点）。
+  严格模式下的判官每个回合仍然要评 `indulgence`，却看不出它原来是 `low` 还是 `mid`，所以连续聊天时它每一轮都在重新猜这一项，
+  按习惯数目的漂移只在两次评定之间起作用。第一次评定之前读作 `[需求] 尚未判定`。这一行永远在，因为缺这一行会被读成“全是低”。
 - **回复**得到不是 `mid` 的那些水平，按上表的顺序，用 `；` 连起来，作为 `[character_state]` 里的一行：
 
   ```
@@ -100,7 +115,9 @@
   - 此刻的需要：饿了；很累
   ```
 
-  四项都是 `mid`，或还没有评定，就什么都不加，prompt 保持不变。被判官评过的回合，回复按这一回合最终的水平来写：
+  `indulgence` 只在 `high` 时出现。它点名一样她用的东西，每一轮从值为 `true` 的习惯键里随机挑一个：`smoking` 是很想抽根烟，
+  `alcoholic` 是很想喝一杯，`drug` 是很想抽口大麻；没有键为 `true` 时读作很想放纵一下。各项都是 `mid`（`low` 的 `indulgence` 在这里也按 `mid` 算），
+  或还没有评定，就什么都不加，prompt 保持不变。被判官评过的回合，回复按这一回合最终的水平来写：
   判官评了就用 verdict 里的，否则用判官看到的那组推算后的水平。配置了判官的部署里，规则引擎回合用推算后的水平。
 - **调用方**在 `body_state` 帧上拿到同样的水平（`needs`，对象或 `null`）。有 give 余效在起作用，或需求已知时发送，
   幂等重放时重发。`GET …/effects` 返回推到调用时刻的水平，没有评定或没有判官时为 `null`；
@@ -109,7 +126,8 @@
   [消息流](api-reference.zh.md#post-compchatsession_idmessagestream)和
   [effects 路由](api-reference.zh.md#get-v2compsessionsession_ideffects)。
 - **语音通话**把推到通话第一轮的水平冻结进 bootstrap 快照。它们渲染成 `[身体状态]` 块里的
-  `此刻的需要：…`，每一轮的 `body_state` 帧带的都是冻结的水平。通话不评定也不推进它们。见
+  `此刻的需要：…`，每一轮的 `body_state` 帧带的都是冻结的水平。通话不评定也不推进它们；`high` 的 `indulgence`
+  在整通电话里点名同一样东西：挑哪一样由快照的创建时刻推出。见
   [语音回合](api-reference.zh.md#post-compvoicesession_idturnstream)。
 - **看不到需求的地方：**`/open` 开场白、事件消息、改图和群聊轮次。
 
@@ -120,7 +138,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 
 ### 类别
 
-可抽取的事件共 50 种，每一种属于一个类别，类别决定它的形态：
+可抽取的事件共 52 种，每一种属于一个类别，类别决定它的形态：
 
 | `category` | 形态 | 持续 | 类别权重 | 类别冷却 |
 |---|---|---|---|---|
@@ -146,14 +164,14 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 抽取是输入加三个随机数（两段各一个，时长一个）的纯函数。
 
 1. **资格。** 一个种类同时满足下面几条才有资格：
-   - 调用方的 `kinds` 允许它（[见下](#调用方的-kinds)；不带表示全部 50 种）；
+   - 调用方的 `kinds` 允许它（[见下](#调用方的-kinds)；不带表示全部 52 种）；
    - 过了它的门槛（见下）；
    - 它自己的冷却已过；
    - 它所属类别的冷却已过；
    - 离线类种类还要过了共享的离线冷却（见下）；
    - 背景规则允许它（见下）。
 2. **类别。** 每个至少有一个合格种类的类别，权重是类别权重乘以角色系数。掷一次随机数，按累计权重选一个。
-3. **种类。** 该类别里每个合格种类的权重是基础权重乘以它的[需求系数](#1-需求给种类加权)、
+3. **种类。** 该类别里每个合格种类的权重是基础权重乘以它的各项[需求系数](#1-需求给种类加权)、
    `prefer_events` 系数、[关联系数](#关联系数)，少数种类再乘一个角色系数（[`is_virgin`](#角色设置)、
    [`homesick`](#角色设置)）。再掷一次，选一个。
 4. **时长。** 固定时长照用；区间则掷出来。
@@ -214,7 +232,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 
 ### 角色设置
 
-角色 genome 的 `art_metadata` 里有五个键，由 engine 读取，由写角色的人填写，和 `gender`、`birthday`、
+角色 genome 的 `art_metadata` 里有八个键，由 engine 读取，由写角色的人填写，和 `gender`、`birthday`、
 `timezone` 放在一起：
 
 | 键 | 取值 | 效果 |
@@ -224,6 +242,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 | `prefer_trip` | `true`、`false`（默认） | `trip` 类别权重为 3 倍 |
 | `homesick` | `true`、`false`、不写（默认） | `trip` 内部：`true` 时 `hometown_visit` 3 倍、`short_trip` / `long_trip` 三分之一；`false` 时 `hometown_visit` 三分之一；`business_trip` 是工作，两种情况都不动 |
 | `is_virgin` | `true`、`false`（默认） | 她还是处女期间，`having_sex` 在 `mid` 内权重为五分之一 |
+| `smoking`、`alcoholic`、`drug` | 各为 `true`、`false`、不写（默认） | 她抽不抽烟、喝不喝酒、用不用大麻：决定 `indulgence` 回来得多快（见[漂移](#两次评定之间的漂移)）、`high` 的 `indulgence` 在回复里点名什么，以及她怎么对待递来的这样东西（见下） |
 
 `prefer_trip` 管她动不动，`homesick` 管她动起来往哪去。两者都为 `true` 的空姐角色经常出行、照常出差，
 放假回家而不是去别处。
@@ -235,6 +254,19 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 读取是宽松的。类型不对的值按没写处理；`prefer_events` 里不是已知 `mid` 种类的条目被丢掉，其余保留。
 `health` 缩放整个 `body` 类别，`period` 也在内，`period` 自己 28 天的冷却让它不管怎样都大约每月一次。
 `prefer_trip` 提高的是出行的概率，不是频率：每周一次的类别冷却对它同样适用。
+
+三个习惯键只通过 `indulgence` 的漂移影响抽取。判官的角色块（`[角色人格]`）不列它们，所以她不会每一轮都提烟、酒或大麻；
+希望这些习惯带进她说话的角色，要在人设里自己写明。engine 从不写这三个键。
+
+**递来她不用的东西。** 一轮的动作是 `give`，递的是 `cigarette`、`alcohol` 或 `herb`，而对应的键（`smoking`、`alcoholic`、`drug`）
+为 `false` 时，engine 在判官运行之前掷一次。三次里有一次，这一轮照常进行。其余情况她这一次不收：
+
+- 判官的 `[用户动作]` 一行末尾加上 `，这次你不会收下`，判官的 `inner_state` 就按拒收来写；这一行只陈述结果，不给理由；
+- 不管判官怎么答，生效的回应都是 `refuse`；没有 LLM 判官时，规则引擎的接受同样变成 `refuse`。
+
+此后它就是一次普通的拒绝：`action_response` 帧和存下的 `response` 都是 `refuse`，这次 give 不留余效，bond 线降一档
+（见[被拒绝的动作](affinity-model.zh.md#被拒绝的动作)），回复也按拒收来写。判官自己的回答留在它的审计 payload 里。
+`true` 和不写从不掷，其他物品和其他动作也不掷。被重新驱动的回合会重新掷一次，就像判官也会重新判一次。
 
 ### 关联系数
 
@@ -266,7 +298,7 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 
 | `kinds` | 可以抽的种类 |
 |---|---|
-| 不带或 `null` | 全部 50 种 |
+| 不带或 `null` | 全部 52 种 |
 | `[]` | 一种都不抽：响应是 `{"event": null, "message": null}` |
 | `["reading", "quarrel"]` | 只抽列出的 |
 | `{"allow": […], "disallow": […]}` | `allow` 允许的，去掉 `disallow` 列出的 |
@@ -513,6 +545,20 @@ ghosting 开关关闭时，已经在进行的一段不会让任何轮次沉默�
 composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2compsessionsession_idevents)）；否则只有文字。`watching_match` 和 `taking_selfie`
 住院也抽；其余四种要她出门。
 
+### 想出门与想回家
+
+两种会讲出来的插曲，把她的 `outing` 需求带进这一天：
+
+| 种类 | 标签 | 类别 | 权重 | 冷却 | 持续 | 提示 |
+|---|---|---|---|---|---|---|
+| `want_to_go_out` | 想出门 | `mid` | 1 | 24 小时 | 1 到 3 小时 | `（你现在很想出门走走。）` |
+| `want_to_go_home` | 想回家 | `mid` | 1 | 24 小时 | 1 到 3 小时 | `（你现在很想回家。）` |
+
+她不离线，照常回复。没有门槛，在任何背景里都抽，住院也在内；和其他插曲一样，提示以背景的状态开头：
+`（你正在住院。你现在很想出门走走。）`。两者都和其他 `mid` 种类一样可以写进 `prefer_events`。`high` 的 `outing` 让
+`want_to_go_out` 权重乘 3，`low` 的让 `want_to_go_home` 乘 3；`high` 的 `indulgence` 让 `want_to_go_out` 乘 2
+（见[下文](#1-需求给种类加权)）。
+
 ### 与 `/open` 的关系
 
 事件消息算作会话里有人说过话，所以同一个当地日期里，生日和节日开场白都不会跟在它后面。事件消息落库时，
@@ -540,13 +586,13 @@ composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2com
 
 ## 两者如何互相影响
 
-下面的需求系数是第二段里的系数之一；其余几个（[关联系数](#关联系数)、`prefer_events`、`is_virgin`、`homesick`）
+下面的需求系数都是第二段里的系数；其余几个（[关联系数](#关联系数)、`prefer_events`、`is_virgin`、`homesick`）
 都不读需求。
 
 ### 1. 需求给种类加权
 
 需求系数在抽取的第二段，对一个种类在它所属类别内的权重做缩放。它只决定类别里*哪一种*出现，不决定某个类别出不出现。
-系数来自 `crates/eros-engine-core/src/events.rs` 里的 `needs_factor`：
+系数来自 `crates/eros-engine-core/src/events.rs` 里的 `needs_factor` 和 `indulgence_factor`：
 
 | 需求水平 | 种类 | 系数 |
 |---|---|---|
@@ -555,15 +601,20 @@ composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2com
 | `hunger` 为 `high` | `grocery_shopping` | ×2 |
 | `emotional` 为 `high` | `ex_message` | ×3 |
 | `emotional` 为 `high` | `animal_encounter`、`irritable`、`quarrel` | ×2 |
+| `outing` 为 `high` | `want_to_go_out` | ×3 |
+| `outing` 为 `low` | `want_to_go_home` | ×3 |
+| `indulgence` 为 `high` | `want_to_go_out`、`irritable` | ×2 |
 
+`indulgence` 那一行是单独的一个系数，和上面各行相乘：`outing` 与 `indulgence` 都为 `high` 时 `want_to_go_out` 为 ×6，
+`indulgence` 与 `emotional` 都为 `high` 时 `irritable` 为 ×4。
 `social` 不给任何种类加权。只有部署配置了判官、并且角色有一次评定时，系数才生效（评定推到调用时刻）；否则所有系数都是 1。
 系数不是门槛：权重 ×3 的种类仍然要先有资格。
 
-### 2. 事件从不改写已存的需求
+### 2. 事件和 give 从不改写已存的需求
 
-没有任何代码路径会因为事件去写需求。判官在下一轮读到 `[近期事件]`，自己在把事件放在眼前的前提下重新评定需求；
-`examples/model_config.toml` 里的参考判官 prompt 就是这样要求它的：以 `[需求]` 为起点，结合对话、`[近期事件]`、
-`[身体状态]` 和经过的时间重判。判官弃权（`needs: null`）时，不管发生了什么，上一次的评定继续往前漂。
+没有任何代码路径会因为事件或 give 去写需求。判官读到 `[近期事件]`，以及 give 带来的 `[用户动作]` 和之后的 `[身体状态]`，
+自己在把它们放在眼前的前提下重新评定需求；`examples/model_config.toml` 里的参考判官 prompt 就是这样要求它的：
+以 `[需求]` 为起点，结合对话、`[近期事件]`、`[身体状态]` 和经过的时间重判。判官弃权（`needs: null`）时，不管发生了什么，上一次的评定继续往前漂。
 需求只有一个来源：判官。
 
 ### 3. 离线的那一段不写评定
@@ -735,10 +786,12 @@ ghosting 开关关闭时它不让任何轮次沉默，和任何离线时段一�
 | `[近期事件]` | 不渲染：没有判官来读它 |
 | 离线类种类 | 和有判官时一样让轮次沉默，因为这个检查在判官之前：ghosting 开关以及动作、强制出图两种例外照样适用 |
 | 提出分开 | 不变：触发读的是 affinity 评估器评过的回合，不是 PDE 判官 |
+| `smoking`、`alcoholic`、`drug` | 为 `false` 的键在 give 时照样掷，可能把它变成拒收；没有 `indulgence` 可漂移、可点名 |
 
 ## 代码指引
 
-- `crates/eros-engine-core/src/needs.rs`：水平、漂移常量、`carried`。
+- `crates/eros-engine-core/src/needs.rs`：水平、漂移常量、`Habits`、`carried`。
+- `crates/eros-engine-core/src/pde.rs`：`refuses_give` 与 `UNUSED_SUBSTANCE_ACCEPT`，即 give 时掷的那一次。
 - `crates/eros-engine-core/src/events.rs`：类别和种类、每个种类的规则、门槛、需求与角色系数、`is_offline` 与 `is_told`、`draw`、`lookback`。
 - `crates/eros-engine-server/src/routes/session_events.rs`：events 路由、抽取的输入、离线类的两道门槛。
 - `crates/eros-engine-server/src/routes/life_choices.rs`：结算端点。
@@ -746,9 +799,9 @@ ghosting 开关关闭时它不让任何轮次沉默，和任何离线时段一�
 - `crates/eros-engine-server/src/pipeline/proactive.rs`：事件消息和选择相关的消息、它们的舞台提示和写入（`kind_cue`、`find_cue`）。
 - `crates/eros-engine-server/src/pipeline/life_choice.rs`：触发与她的请求、不理会的转换、放缓的读取。
 - `crates/eros-engine-server/src/pipeline/stream.rs::run_stream`：需求的读取与写入、`[需求]` 与 `[近期事件]` 两行
-  （`build_pde_ctx`）、判官之前的 offline 分支、`body_state_frame`。
+  （`build_pde_ctx`）、判官之前的 offline 分支、掷出拒收后的改判（`apply_give_refusal`）、`body_state_frame`。
 - `crates/eros-engine-server/src/prompt.rs`：`needs_line`、`events_judge_text`、`events_reply_text`、
-  `just_now_text`、`persona_traits`、`[character_state]` 里的各行，以及 `[now]` 里的事件行。
+  `just_now_text`、`persona_traits`、`persona_habits`、`[character_state]` 里的各行，以及 `[now]` 里的事件行。
 - `crates/eros-engine-server/src/routes/session_effects.rs`：`GET …/effects`。
 - `crates/eros-engine-server/src/pipeline/voice.rs`：bootstrap 里的需求。
 - `crates/eros-engine-store/src/events.rs::EventRepo`：`insert`、`insert_preempting_in_tx`、`by_key`、`recent`、`current`、`backgrounds_at`、`unexplained_offline`、`unreturned_separation`、`unresolved_scare`。

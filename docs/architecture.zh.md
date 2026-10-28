@@ -172,7 +172,7 @@ crates/
 │       ├── events.rs         # 生活事件的分类、种类与两段抽取
 │       ├── ghost.rs          # 評分公式 + 4 層保護
 │       ├── group.rs          # 群聊导演输出规整、兜底点名、转录角色映射
-│       ├── needs.rs          # 角色的四项需求（档位 + 按时间推算）
+│       ├── needs.rs          # 角色的六项需求与习惯（档位 + 按时间推算）
 │       ├── pde.rs            # 規則型動作決策
 │       ├── persona.rs        # PersonaGenome + Instance + CompanionPersona
 │       ├── scope.rs          # 逐请求注入范围（InsightMode / MemoryScope）
