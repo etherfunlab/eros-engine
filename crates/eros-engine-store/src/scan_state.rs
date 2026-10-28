@@ -192,7 +192,9 @@ impl ScanStateRepo<'_> {
     /// sweeper retries after `idle`, not at once; cursor and pending count stay.
     /// The failure that reaches `MAX_SCAN_FAILURES` gives up on the span
     /// instead and applies what `finish_scan_ok` would, with the failure streak
-    /// reset; the caller logs it.
+    /// reset; the caller logs it. A row whose claim is already released is left
+    /// alone, so a late failure from a worker that lost its claim cannot clear
+    /// another worker's claim or move the cursor under it.
     pub async fn finish_scan_failed(
         &self,
         instance_id: Uuid,
@@ -213,7 +215,7 @@ impl ScanStateRepo<'_> {
                 scan_failures = CASE WHEN scan_failures + 1 >= $4 \
                                      THEN 0 ELSE scan_failures + 1 END, \
                 claimed_at = NULL \
-             WHERE instance_id = $1",
+             WHERE instance_id = $1 AND claimed_at IS NOT NULL",
         )
         .bind(instance_id)
         .bind(cursor_to)
@@ -253,10 +255,10 @@ impl ScanStateRepo<'_> {
         Ok(())
     }
 
-    /// An arc rewrite failed; returns the stored `arc_failures`. The failure
-    /// that reaches `MAX_ARC_FAILURES` drops the episode count and the failure
-    /// streak instead, so it returns `0` (and so does a gone row); the next
-    /// episode starts a fresh count.
+    /// An arc rewrite failed; returns the failure count this call registered:
+    /// 1, 2, or `MAX_ARC_FAILURES` for the failure that strikes out, which also
+    /// drops the episode count and resets the streak so the next episode starts
+    /// a fresh count. `0` only when the row is gone.
     pub async fn arc_failed(&self, instance_id: Uuid) -> Result<i32, sqlx::Error> {
         let n: Option<i32> = sqlx::query_scalar(
             "UPDATE engine.relationship_scan_state SET \
@@ -265,7 +267,7 @@ impl ScanStateRepo<'_> {
                 arc_failures = CASE WHEN arc_failures + 1 >= $2 \
                                     THEN 0 ELSE arc_failures + 1 END \
              WHERE instance_id = $1 \
-             RETURNING arc_failures",
+             RETURNING CASE WHEN arc_failures = 0 THEN $2 ELSE arc_failures END",
         )
         .bind(instance_id)
         .bind(MAX_ARC_FAILURES)
@@ -649,11 +651,91 @@ mod tests {
         repo.arc_failed(instance).await.unwrap();
         assert_eq!(
             repo.arc_failed(instance).await.unwrap(),
-            0,
-            "the third failure zeroes the streak it reports"
+            MAX_ARC_FAILURES,
+            "the strike-out reports the count it registered, then resets"
         );
         let s = repo.load(instance).await.unwrap().unwrap();
         assert_eq!((s.episodes_since_arc, s.arc_failures), (0, 0));
+
+        assert_eq!(
+            repo.arc_failed(Uuid::new_v4()).await.unwrap(),
+            0,
+            "a gone row registers nothing"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn finish_scan_failed_leaves_an_unclaimed_row_alone(pool: PgPool) {
+        let repo = ScanStateRepo { pool: &pool };
+        let (instance, _) = seed_relationship(&pool).await;
+        bump_n(&repo, instance, 5).await;
+        sqlx::query(
+            "UPDATE engine.relationship_scan_state SET scan_failures = $2 WHERE instance_id = $1",
+        )
+        .bind(instance)
+        .bind(MAX_SCAN_FAILURES - 1)
+        .execute(&pool)
+        .await
+        .unwrap();
+        shift(&pool, instance, "last_turn_at", "2 hours").await;
+        let before = repo.load(instance).await.unwrap().unwrap();
+        assert!(before.claimed_at.is_none());
+
+        // A late failure from a worker whose claim was already released (or
+        // taken over and finished) must not strike out or move the cursor.
+        repo.finish_scan_failed(instance, at(5_000), 3)
+            .await
+            .unwrap();
+        let after = repo.load(instance).await.unwrap().unwrap();
+        assert_eq!(after.scanned_through_at, before.scanned_through_at);
+        assert_eq!(after.pending_turns, before.pending_turns);
+        assert_eq!(after.scan_failures, MAX_SCAN_FAILURES - 1);
+        assert_eq!(after.last_turn_at, before.last_turn_at);
+        assert_eq!(after.last_scanned_at, None);
+
+        repo.finish_scan_failed(Uuid::new_v4(), at(5_000), 3)
+            .await
+            .unwrap();
+    }
+
+    async fn insert_journal(
+        pool: &PgPool,
+        instance_id: Uuid,
+        dedup_key: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO engine.relationship_journal \
+                 (instance_id, occurred_on, kind, realm, summary, source, dedup_key, recurrence) \
+             VALUES ($1, current_date, 'seed', 'real', 'seed', 'engine', $2, 'none')",
+        )
+        .bind(instance_id)
+        .bind(dedup_key)
+        .execute(pool)
+        .await
+        .map(|_| ())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn journal_dedup_key_is_unique_per_instance_unless_null(pool: PgPool) {
+        let (instance, _) = seed_relationship(&pool).await;
+        let (other, _) = seed_relationship(&pool).await;
+
+        insert_journal(&pool, instance, Some("k")).await.unwrap();
+        let err = insert_journal(&pool, instance, Some("k"))
+            .await
+            .expect_err("same (instance_id, dedup_key) is a duplicate");
+        assert_eq!(
+            err.as_database_error().and_then(|e| e.constraint()),
+            Some("uq_relationship_journal_dedup")
+        );
+        insert_journal(&pool, other, Some("k"))
+            .await
+            .expect("the key is scoped to its instance");
+
+        insert_journal(&pool, instance, None).await.unwrap();
+        insert_journal(&pool, instance, None)
+            .await
+            .expect("a NULL dedup_key marks a repeatable kind");
     }
 
     #[sqlx::test(migrations = "./migrations")]
