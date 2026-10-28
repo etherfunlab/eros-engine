@@ -1922,6 +1922,59 @@ pub fn profile_rebuild_prompt(ledger: &str) -> String {
     )
 }
 
+/// System prompt of the relationship-arc rewrite (`arc_rewrite`). Engine-owned:
+/// the task block supplies only the model and its parameters. The engine
+/// guards what comes back (length, shrink, opening), so the prompt's length
+/// rule is a target, not the limit.
+pub(crate) fn arc_rewrite_prompt() -> &'static str {
+    "你负责维护一段关系的「关系弧线」：用连贯的文字讲清楚用户和 AI 之间发生了什么、\
+     关系是怎么一步步变化的。\n\
+     输入有三部分：这段关系的开头（若有）、上一版关系弧线（若有）、之后新发生的片段\
+     （按时间顺序，每条带日期）。请把新片段融进去，改写出新一版关系弧线。\n\
+     \n\
+     规则：\n\
+     - 只根据输入的材料改写，不补充、不推测材料里没有的事。\n\
+     - 按时间顺序写。\n\
+     - 后来的状态改变了先前的状态时，写成「曾经……后来……」，先前的状态仍留在叙述里，不要删掉。\n\
+     - 越早的事写得越简略，越近的事写得越具体。\n\
+     - 主语写清楚：用户说的话、做的事写「用户」，AI 说的话、做的事写「AI」，不要把一方的言行安到另一方身上。\n\
+     - 角色扮演里发生的事要明确写成角色扮演（例如「在角色扮演中……」），绝不能写成两人真实经历过的事。\n\
+     - 关系弧线写 400~600 字，写成连贯的段落，不分点、不加标题。\n\
+     - 输入里的开头是已经写好的内容，只供参考，不要在关系弧线里重复它。\n\
+     \n\
+     输出：\n\
+     - 只输出一个 JSON 对象：{\"arc\": \"新一版关系弧线\"}。\n\
+     - 输入注明「这是第一版」时，输出 {\"opening\": \"这段关系是怎么开始的\", \"arc\": \"关系弧线\"}；\
+     opening 不超过 150 字，只写这段关系是怎么开始的。\n\
+     - 不要 Markdown，不要代码块，不要任何解释。"
+}
+
+/// User message of the arc rewrite: the opening (read-only), the previous arc,
+/// and the unfolded episodes as `(date range, summary)`, oldest first. Without
+/// a previous arc this is the first version, and the message says so: that is
+/// what asks the model for an opening.
+pub(crate) fn arc_rewrite_user_message(
+    opening: Option<&str>,
+    previous: Option<&str>,
+    episodes: &[(String, String)],
+) -> String {
+    let mut out = String::new();
+    if let Some(opening) = opening {
+        out.push_str(&format!(
+            "【开头】（已经写好，只供参考，不要重复）\n{opening}\n\n"
+        ));
+    }
+    match previous {
+        Some(previous) => out.push_str(&format!("【上一版关系弧线】\n{previous}\n\n")),
+        None => out.push_str("这是第一版：还没有关系弧线，请同时写出 opening。\n\n"),
+    }
+    out.push_str("【新的片段】\n");
+    for (range, summary) in episodes {
+        out.push_str(&format!("[{range}] {summary}\n"));
+    }
+    out
+}
+
 /// Schema description used in `extract_character_insights_prompt`. Mirrors the
 /// JSON shape that `CharacterInsightRepo::apply_extraction` accepts (projected
 /// by `character_insight::project_columns`).

@@ -33,11 +33,12 @@ use eros_engine_store::memory::{MemoryLayer, MemoryRepo};
 
 use crate::state::AppState;
 
-// The pure pieces of the per-relationship scan; the scan job is their caller.
-#[allow(dead_code)]
 mod parse;
-#[allow(dead_code)]
 mod render;
+// No caller outside its tests: the sweeper and the K-trigger do not start
+// relationship scans.
+#[allow(dead_code)]
+mod scan;
 
 const MEMORY_TASK: &str = eros_engine_llm::model_config::DREAMING_SCAN_TASK;
 /// Sentinel OpenRouter `user` for system-initiated (non-user-triggered) LLM
