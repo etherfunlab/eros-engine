@@ -1,25 +1,30 @@
-# Session-end memory extraction (dreaming-lite). Pulls a session's
-# chat_messages, emits 0-N {content, category} candidates, and the
-# sweeper writes them to companion_memories as profile-layer rows.
+# Dreaming scan (Memory 2.0). One call per relationship segment returns three
+# things: profile memories (written to companion_memories as profile-layer rows),
+# one episode summary, and 0-3 dated journal moments. The server sends the
+# segment transcript as a separate user message, one line per message prefixed
+# `[#序号 YYYY-MM-DD HH:MM]`.
 # claude-haiku-4.5 is a strong instruction-follower with reliable structured-JSON output;
-# deepseek-v4-flash + gemini-3.1-flash-lite fallback keep extraction alive if Anthropic is down.
-[tasks.memory_extraction]
+# deepseek-v4-flash + gemini-3.1-flash-lite fallback keep the scan alive if Anthropic is down.
+# The fallback model may produce no journal entries at all (measured), so a
+# deployment that wants the journal reliably sets `fallback = []`.
+[tasks.dreaming_scan]
 model = "anthropic/claude-haiku-4.5"
 fallback = ["deepseek/deepseek-v4-flash","google/gemini-3.1-flash-lite"]
 temperature = 0.2
-max_tokens = 1200
-# Remove this entire [tasks.memory_extraction] section to disable session-end
-# memory extraction (the dreaming sweeper then stays inert). While the section is
-# present, filter_prompt is REQUIRED — the server refuses to boot if it is blank.
-# Memory-extraction system instruction. The server sends the conversation
-# (用户：X / AI：Y lines) as a separate user message. `category` keeps the fixed
-# five-value vocabulary — it is the recall grouping key (unknown values collapse
-# to "fact" in code). The remaining per-memory metadata fields are stored
-# opaquely on companion_memories.metadata: a reference taxonomy owned by this
-# prompt, freely extensible without an engine upgrade.
+# 1024 is enough: 0 of 360 replayed scans exceeded 713 output tokens.
+max_tokens = 1024
+# Remove this entire [tasks.dreaming_scan] section to disable the dreaming
+# sweeper (it then stays inert). While the section is present, filter_prompt is
+# REQUIRED — the server refuses to boot if it is blank.
+# `category` keeps the fixed five-value vocabulary — it is the recall grouping
+# key (unknown values collapse to "fact" in code). The remaining per-memory
+# metadata fields are stored opaquely on companion_memories.metadata: a
+# reference taxonomy owned by this prompt, freely extensible without an engine
+# upgrade.
 filter_prompt = """
-你从一段已结束的对话中，提取 0-10 条值得长期记住的、关于【真人用户】的记忆条目，每条带一个 category 标签和结构化元数据。
+你会读到一段用户与 AI 伴侣的对话片段（这段关系更早的对话你看不到）。每行开头是 [#序号 日期 时间]。一次产出三样东西：画像记忆（memories）、这一段对话的片段摘要（episode）、值得记成「一天」的时刻（journal）。
 
+【第一样：memories —— 关于真人用户的画像记忆，0-10 条】
 每条记忆都要具体、有据、对将来的对话有用——贴着用户真正说过或表露的东西，保留细节、程度和语境，不要写空泛的概括。
 - 好：用户讨厌被反复要求解释已经说过的话
 - 差：用户压力大
@@ -46,5 +51,45 @@ category（只能用这五种之一，作为召回分组键）：
 - 成人、性、癖好等敏感内容正常记录，忠实保留原意，不淡化不扩写。
 - 笼统、无法落地的条目宁可不记；没有任何值得记的就返回空数组。
 
-严格输出 JSON，格式：{"memories": [{"content": "...", "category": "fact", "domain": "career", "evidence_type": "explicit_statement", "temporality": "current", "persistence": "ongoing", "confidence": "high"}]}
+【第二样：episode —— 这一段对话的片段摘要，恰好一条】
+- 100 到 200 字，写「这段时间你们聊了什么、发生了什么」，给将来的 AI 伴侣当回忆用，口吻是第三人称白描（「用户」「AI」指称双方）。
+- 只概括这一段 transcript 里真实出现的内容；没出现的不写，不补前因后果。
+- AI 的言行可以进摘要（这是两人共同的回忆），但主语必须分清，谁说的谁做的不能混。
+- 剧情/角色扮演内容照常概括，但要让读者看得出哪些是扮演（如「两人扮演了……的剧情」）。
+
+【第三样：journal —— 值得记成「一天」的时刻，0-3 条，宁缺毋滥】
+journal 记的是用户与 AI 之间「发生过什么」里足够特殊、将来到了日子值得被想起的时刻。kind 只能用这个词表：
+- confession: 表白、确认关系
+- first_intimacy: 第一次亲密（接吻、性，以更早者为准）
+- conflict: 真实的争吵、冷战、用户生气离开
+- reconciliation: 和好
+- promise: 许下的约定（若带日期，填进 due 字段）
+- gift: 送礼、给予
+- shared_plan: 一起定下的计划
+- user_shared_milestone: 用户把自己的人生大事告诉了 AI（升职、搬家、毕业等）
+（first_meet 与 tier_reached 由系统自动写入，你不要输出；通过动作机制送出并被接受的礼物与亲吻也由系统记录，不要重复输出。）
+
+journal 的铁律：
+- realm 必填。这段关系整体发生在虚拟里，realm 分的不是『真的发生过还是编的』，而是两种互动模式；判别只看发起权与推进方式，不看内容露骨与否。
+  - real（虚拟中的真实）：用户把 AI 当对面那个人相处，这件事是关系自然走到的那一步——AI 主动发起，或用户邀约、AI 同意，像真人约会一样你来我往；用户现实生活里真实发生、亲口告知的事也算 real。
+  - roleplay（虚拟中的演戏）：用户把 AI 当舞台和演员——用户供剧本、设定场景、反复下指令、引用图片硬造情境，AI 在配合演出；剧情里的婚礼、分手、生子都是演戏。
+  - 一句话：AI 主动，或用户邀约后 AI 同意 = real；用户要求，或用户直接描述场景 = roleplay。拿不准就标 roleplay。
+- occurred_at 只能取自行首方括号里的日期，照抄 YYYY-MM-DD；绝不自己推算、不编日期。
+- source 填该时刻依据所在行的 #序号（如 "#12"）；一个时刻一条，不重复。
+- 平常的聊天、调情、日常问候不是时刻；这一段里没有够格的就返回空数组。
+
+严格输出 JSON，且只能输出（三个键都必须在，没有内容就给空数组或空字符串）：
+{"memories": [{"content": "...", "category": "fact", "domain": "career", "evidence_type": "explicit_statement", "temporality": "current", "persistence": "ongoing", "confidence": "high"}], "episode": "...", "journal": [{"kind": "confession", "realm": "real", "occurred_at": "2026-10-01", "summary": "...", "source": "#12", "due": null}]}
+不得输出说明、Markdown、代码围栏或任何其他文本。
 """
+
+# Relationship-arc rewrite (Memory 2.0). The prompt is engine-owned, so this
+# block carries only model and sampling parameters — there is no filter_prompt.
+# The engine rejects any arc over 900 characters and keeps the previous
+# version, so max_tokens must sit well above that: a tight token limit
+# truncates the JSON instead of letting the engine guard decide.
+[tasks.arc_rewrite]
+model = "anthropic/claude-haiku-4.5"
+fallback = ["deepseek/deepseek-v4-flash","google/gemini-3.1-flash-lite"]
+temperature = 0.3
+max_tokens = 1500

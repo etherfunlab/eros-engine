@@ -2,7 +2,7 @@
 //! Dreaming-lite: session-end memory extraction sweeper.
 //!
 //! Background tokio task that scans `engine.chat_sessions` for idle,
-//! unclassified sessions and runs the `memory_extraction` LLM task on
+//! unclassified sessions and runs the `dreaming_scan` LLM task on
 //! their `chat_messages`. Extracted candidates with category tags are
 //! written to `engine.companion_memories` as profile-layer rows; the
 //! session's `classified_at` is then stamped to suppress re-sweeps.
@@ -33,7 +33,7 @@ use eros_engine_store::memory::{MemoryLayer, MemoryRepo};
 
 use crate::state::AppState;
 
-const MEMORY_TASK: &str = "memory_extraction";
+const MEMORY_TASK: &str = eros_engine_llm::model_config::DREAMING_SCAN_TASK;
 /// Sentinel OpenRouter `user` for system-initiated (non-user-triggered) LLM
 /// calls. Dreaming runs in the background sweeper with no live request, so
 /// per-user attribution is meaningless; this buckets all dreaming spend
@@ -75,12 +75,12 @@ pub async fn sweeper(state: AppState) {
         tracing::info!("dreaming sweeper disabled (DREAMING_DISABLED=1 or tick=0)");
         return;
     }
-    // memory_extraction is omittable: a missing [tasks.memory_extraction] section
+    // dreaming_scan is omittable: a missing [tasks.dreaming_scan] section
     // (or a blank filter_prompt, which would have boot-failed) resolves to None.
     // Post-boot, None ⟺ the section is absent ⟺ the feature is off — go inert so
     // we never claim sessions and retry-loop the per-row no-stamp path.
-    if state.model_config.resolve_memory_extract().is_none() {
-        tracing::info!("memory_extraction not configured — dreaming sweeper inert");
+    if state.model_config.resolve_dreaming_scan().is_none() {
+        tracing::info!("dreaming_scan not configured — dreaming sweeper inert");
         return;
     }
     tracing::info!(?interval, ?idle, ?claim_stale, "dreaming sweeper starting");
@@ -228,11 +228,11 @@ async fn classify_session(
 
     // 2. Single LLM call, structured-JSON output. The instruction is the
     // configured system prompt; the conversation is a separate user message.
-    let Some(resolved) = state.model_config.resolve_memory_extract() else {
-        // Production configs always set memory_extraction.filter_prompt (enforced by
+    let Some(resolved) = state.model_config.resolve_dreaming_scan() else {
+        // Production configs always set dreaming_scan.filter_prompt (enforced by
         // the boot gate added in this change set — see main.rs). If somehow unset,
         // skip WITHOUT stamping classified_at so it retries and stays visible.
-        return Err("memory_extraction filter_prompt unset".to_string());
+        return Err("dreaming_scan filter_prompt unset".to_string());
     };
     let req = ChatRequest {
         model: resolved.model,
@@ -258,7 +258,7 @@ async fn classify_session(
         .openrouter
         .execute(req)
         .await
-        .map_err(|e| format!("memory_extraction LLM call failed: {e}"))?;
+        .map_err(|e| format!("dreaming_scan LLM call failed: {e}"))?;
 
     super::record_generation(
         &state.pool,
@@ -654,7 +654,7 @@ mod tests {
         let mut state = crate::routes::companion::test_state(pool.clone());
         state.model_config = std::sync::Arc::new(
             eros_engine_llm::model_config::ModelConfig::from_toml_str(
-                "[tasks.memory_extraction]\nmodel=\"mem/m\"\nfilter_prompt=\"memory-sys-prompt-sentinel\"\n",
+                "[tasks.dreaming_scan]\nmodel=\"mem/m\"\nfilter_prompt=\"memory-sys-prompt-sentinel\"\n",
             )
             .unwrap(),
         );
@@ -692,7 +692,7 @@ mod tests {
         // configured system prompt sentinel.
 
         let model: Option<String> = sqlx::query_scalar(
-            "SELECT model FROM engine.llm_generations WHERE task = 'memory_extraction'",
+            "SELECT model FROM engine.llm_generations WHERE task = 'dreaming_scan'",
         )
         .fetch_one(&pool)
         .await
@@ -803,7 +803,7 @@ mod tests {
         let mut state = crate::routes::companion::test_state(pool.clone());
         state.model_config = std::sync::Arc::new(
             eros_engine_llm::model_config::ModelConfig::from_toml_str(
-                "[tasks.memory_extraction]\nmodel = \"primary\"\nfilter_prompt = \"extract\"\n",
+                "[tasks.dreaming_scan]\nmodel = \"primary\"\nfilter_prompt = \"extract\"\n",
             )
             .unwrap(),
         );
@@ -868,7 +868,7 @@ mod tests {
         let mut state = crate::routes::companion::test_state(pool.clone());
         state.model_config = std::sync::Arc::new(
             eros_engine_llm::model_config::ModelConfig::from_toml_str(
-                "[tasks.memory_extraction]\nmodel = \"primary\"\nfilter_prompt = \"extract\"\n",
+                "[tasks.dreaming_scan]\nmodel = \"primary\"\nfilter_prompt = \"extract\"\n",
             )
             .unwrap(),
         );
@@ -938,7 +938,7 @@ mod tests {
         let mut state = crate::routes::companion::test_state(pool.clone());
         state.model_config = std::sync::Arc::new(
             eros_engine_llm::model_config::ModelConfig::from_toml_str(
-                "[tasks.memory_extraction]\nmodel = \"primary\"\nfilter_prompt = \"extract\"\n",
+                "[tasks.dreaming_scan]\nmodel = \"primary\"\nfilter_prompt = \"extract\"\n",
             )
             .unwrap(),
         );
@@ -1024,7 +1024,7 @@ mod tests {
         let mut state = crate::routes::companion::test_state(pool.clone());
         state.model_config = std::sync::Arc::new(
             eros_engine_llm::model_config::ModelConfig::from_toml_str(
-                "[tasks.memory_extraction]\nmodel = \"primary\"\nfilter_prompt = \"extract\"\n",
+                "[tasks.dreaming_scan]\nmodel = \"primary\"\nfilter_prompt = \"extract\"\n",
             )
             .unwrap(),
         );

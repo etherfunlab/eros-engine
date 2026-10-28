@@ -1900,7 +1900,7 @@ pub fn facts_user_message(user_msg: &str, assistant_msg: &str) -> String {
 /// Build the *user* message for the memory-extraction call: the chronologically
 /// ordered `用户：X / AI：Y` lines joined as the conversation. The instruction
 /// (categories, filter rules, anti-attribution clause, output format) is the
-/// system message, sourced from `memory_extraction.filter_prompt` in
+/// system message, sourced from `dreaming_scan.filter_prompt` in
 /// model_config.toml.
 pub fn memories_user_message(turns: &[String]) -> String {
     turns.join("\n")

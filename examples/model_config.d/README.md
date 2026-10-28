@@ -16,7 +16,7 @@ MODEL_CONFIG_PATH= MODEL_CONFIG_DIR=examples/model_config.d eros-engine serve
 | `insights.toml` | `insight_extraction`, `profile_rebuild` |
 | `character_insights.toml` | `character_insight_extraction`, `character_insight_structuring` |
 | `user_insights.toml` | `user_insight_extraction`, `user_insight_structuring` |
-| `memory.toml` | `memory_extraction` |
+| `memory.toml` | `dreaming_scan`, `arc_rewrite` |
 | `decision.toml` | `pde_decision`, and the optional `chat_product_qa` |
 | `affinity.toml` | `affinity_evaluation`, `affinity_summary` |
 | `group.toml` | `group_director` |
