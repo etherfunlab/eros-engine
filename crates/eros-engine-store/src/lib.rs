@@ -2,10 +2,12 @@
 //! Postgres + pgvector persistence layer.
 
 pub mod affinity;
+pub mod arc;
 pub mod character_insight;
 pub mod chat;
 pub mod chat_queue;
 pub mod decision;
+pub mod episode;
 pub mod erasure;
 pub mod error_handling;
 pub mod events;
