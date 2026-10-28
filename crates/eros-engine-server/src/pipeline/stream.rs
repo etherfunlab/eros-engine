@@ -2796,6 +2796,7 @@ fn apply_give_refusal(plan: &mut eros_engine_core::types::ActionPlan, refused: b
 }
 
 /// Build the judge's user payload from the shared transcript + the decision input.
+#[allow(clippy::too_many_arguments)]
 fn build_pde_ctx(
     t: &JudgeTranscript,
     input: &eros_engine_core::types::DecisionInput,
