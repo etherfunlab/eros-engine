@@ -804,20 +804,45 @@ pub(crate) fn body_state(effects: &[ActiveEffect]) -> Option<String> {
 }
 
 /// The persona's needs as the reply reads them (spec
-/// 2026-10-13-persona-needs-design.md §6.2): the levels that are not `mid`,
-/// in the order hunger, social, stamina, emotional, joined by 「；」. `None`
-/// when all four are `mid`.
-pub(crate) fn needs_line(n: &eros_engine_core::needs::Needs) -> Option<String> {
+/// 2026-10-13-persona-needs-design.md §6.2, 2026-10-28-outing-indulgence-
+/// needs-and-habits-design.md §4.2): the levels that are not `mid`, in the
+/// order hunger, social, stamina, emotional, outing, indulgence, joined by
+/// 「；」. `None` when nothing is said.
+///
+/// `indulgence` speaks only when high. It names one habit that is `true`,
+/// chosen by `pick` (uniform in [0, 1)), so she wants one thing rather than
+/// all of them; with none `true` it is a general urge.
+pub(crate) fn needs_line(
+    n: &eros_engine_core::needs::Needs,
+    habits: eros_engine_core::needs::Habits,
+    pick: f64,
+) -> Option<String> {
     use eros_engine_core::needs::NeedLevel;
+    let uses: Vec<&str> = [
+        (habits.smoking, "很想抽根烟"),
+        (habits.alcoholic, "很想喝一杯"),
+        (habits.drug, "很想抽口大麻"),
+    ]
+    .into_iter()
+    .filter_map(|(set, words)| (set == Some(true)).then_some(words))
+    .collect();
+    let craving = if uses.is_empty() {
+        "很想放纵一下"
+    } else {
+        let i = (pick.clamp(0.0, 1.0) * uses.len() as f64) as usize;
+        uses[i.min(uses.len() - 1)]
+    };
     let words: Vec<&str> = [
-        (n.hunger, "不饿", "饿了"),
-        (n.social, "不想跟人打交道", "想找人说说话"),
-        (n.stamina, "很累", "精神很好"),
-        (n.emotional, "心里挺满足", "很想被在乎"),
+        (n.hunger, Some("不饿"), "饿了"),
+        (n.social, Some("不想跟人打交道"), "想找人说说话"),
+        (n.stamina, Some("很累"), "精神很好"),
+        (n.emotional, Some("心里挺满足"), "很想被在乎"),
+        (n.outing, Some("只想待在屋里"), "想出门走走"),
+        (n.indulgence, None, craving),
     ]
     .into_iter()
     .filter_map(|(level, low, high)| match level {
-        NeedLevel::Low => Some(low),
+        NeedLevel::Low => low,
         NeedLevel::Mid => None,
         NeedLevel::High => Some(high),
     })
@@ -872,6 +897,8 @@ pub(crate) fn event_label(kind: eros_engine_core::events::EventKind) -> &'static
         WatchingMatch => "在看比赛",
         WatchingShow => "在看表演",
         HavingSex => "在做爱",
+        WantToGoOut => "想出门",
+        WantToGoHome => "想回家",
         Sick => "生病中",
         Period => "月经中",
         Hospitalized => "住院",
@@ -1235,6 +1262,18 @@ pub(crate) fn persona_traits(
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
         homesick: art.get("homesick").and_then(|v| v.as_bool()),
+    }
+}
+
+/// Whether the persona smokes, drinks, uses weed (spec 2026-10-28-outing-
+/// indulgence-needs-and-habits-design.md §3): `art_metadata.smoking`,
+/// `alcoholic`, `drug`; a key that is not a boolean reads as unset.
+pub(crate) fn persona_habits(persona: &CompanionPersona) -> eros_engine_core::needs::Habits {
+    let key = |k: &str| persona.genome.art_metadata.get(k).and_then(|v| v.as_bool());
+    eros_engine_core::needs::Habits {
+        smoking: key("smoking"),
+        alcoholic: key("alcoholic"),
+        drug: key("drug"),
     }
 }
 
@@ -3982,20 +4021,22 @@ mod tests {
 
     #[test]
     fn needs_line_words_and_order() {
-        use eros_engine_core::needs::{NeedLevel::*, Needs};
+        use eros_engine_core::needs::{Habits, NeedLevel::*, Needs};
         let all = |l| Needs {
             hunger: l,
             social: l,
             stamina: l,
             emotional: l,
+            outing: Mid,
+            indulgence: Mid,
         };
-        assert_eq!(needs_line(&all(Mid)), None);
+        assert_eq!(needs_line(&all(Mid), Habits::default(), 0.0), None);
         assert_eq!(
-            needs_line(&all(Low)).as_deref(),
+            needs_line(&all(Low), Habits::default(), 0.0).as_deref(),
             Some("不饿；不想跟人打交道；很累；心里挺满足")
         );
         assert_eq!(
-            needs_line(&all(High)).as_deref(),
+            needs_line(&all(High), Habits::default(), 0.0).as_deref(),
             Some("饿了；想找人说说话；精神很好；很想被在乎")
         );
         let mixed = Needs {
@@ -4003,8 +4044,95 @@ mod tests {
             social: Mid,
             stamina: Low,
             emotional: Mid,
+            outing: Mid,
+            indulgence: Mid,
         };
-        assert_eq!(needs_line(&mixed).as_deref(), Some("饿了；很累"));
+        assert_eq!(
+            needs_line(&mixed, Habits::default(), 0.0).as_deref(),
+            Some("饿了；很累")
+        );
+    }
+
+    #[test]
+    fn needs_line_outing_and_indulgence() {
+        use eros_engine_core::needs::{Habits, NeedLevel::*, Needs};
+        let with = |outing, indulgence| Needs {
+            hunger: High,
+            social: Mid,
+            stamina: Mid,
+            emotional: Mid,
+            outing,
+            indulgence,
+        };
+        let unset = Habits::default();
+        let all_false = Habits {
+            smoking: Some(false),
+            alcoholic: Some(false),
+            drug: Some(false),
+        };
+        let drinker = Habits {
+            alcoholic: Some(true),
+            ..unset
+        };
+        let cases = [
+            (with(Low, Mid), unset, "饿了；只想待在屋里"),
+            (with(High, Mid), unset, "饿了；想出门走走"),
+            (with(Mid, Low), unset, "饿了"),
+            (with(Mid, Low), drinker, "饿了"),
+            (with(Mid, High), unset, "饿了；很想放纵一下"),
+            (with(Mid, High), all_false, "饿了；很想放纵一下"),
+            (with(Mid, High), drinker, "饿了；很想喝一杯"),
+        ];
+        for (n, h, want) in cases {
+            for pick in [0.0, 0.5, 0.999, 1.0] {
+                assert_eq!(
+                    needs_line(&n, h, pick).as_deref(),
+                    Some(want),
+                    "{n:?} {h:?} {pick}"
+                );
+            }
+        }
+    }
+
+    /// A high `indulgence` names one habit that is `true`, `pick` choosing
+    /// in the order smoking, alcoholic, drug.
+    #[test]
+    fn a_craving_names_one_habit() {
+        use eros_engine_core::needs::{Habits, NeedLevel::*, Needs};
+        let n = Needs {
+            hunger: Mid,
+            social: Mid,
+            stamina: Mid,
+            emotional: Mid,
+            outing: Mid,
+            indulgence: High,
+        };
+        let all = Habits {
+            smoking: Some(true),
+            alcoholic: Some(true),
+            drug: Some(true),
+        };
+        let smoke_and_weed = Habits {
+            alcoholic: Some(false),
+            ..all
+        };
+        let cases = [
+            (all, 0.0, "很想抽根烟"),
+            (all, 0.33, "很想抽根烟"),
+            (all, 0.34, "很想喝一杯"),
+            (all, 0.66, "很想喝一杯"),
+            (all, 0.67, "很想抽口大麻"),
+            (all, 1.0, "很想抽口大麻"),
+            (smoke_and_weed, 0.49, "很想抽根烟"),
+            (smoke_and_weed, 0.5, "很想抽口大麻"),
+        ];
+        for (h, pick, want) in cases {
+            assert_eq!(
+                needs_line(&n, h, pick).as_deref(),
+                Some(want),
+                "{h:?} {pick}"
+            );
+        }
     }
 
     #[test]
@@ -4483,6 +4611,8 @@ mod tests {
                 "在看比赛",
                 "在看表演",
                 "在做爱",
+                "想出门",
+                "想回家",
                 "生病中",
                 "月经中",
                 "住院",
@@ -4519,6 +4649,26 @@ mod tests {
         assert_eq!(persona_traits(&p), PersonaTraits::default());
         p.genome.art_metadata = serde_json::json!({});
         assert_eq!(persona_traits(&p), PersonaTraits::default());
+    }
+
+    #[test]
+    fn persona_habits_reads_three_states() {
+        use eros_engine_core::needs::Habits;
+        let with = |art: serde_json::Value| {
+            let mut p = fixture_persona();
+            p.genome.art_metadata = art;
+            persona_habits(&p)
+        };
+        assert_eq!(with(serde_json::json!({})), Habits::default());
+        assert_eq!(
+            with(serde_json::json!({"smoking": true, "alcoholic": false, "drug": "true"})),
+            Habits {
+                smoking: Some(true),
+                alcoholic: Some(false),
+                drug: None,
+            }
+        );
+        assert_eq!(with(serde_json::json!({"drug": 1})).drug, None);
     }
 
     #[test]

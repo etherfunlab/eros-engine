@@ -201,8 +201,15 @@ fn plan_bootstrap(session_metadata: &serde_json::Value) -> BootstrapPlan {
 /// Render the bootstrap block: `[关于他]` bullets, the `[上次通话]`
 /// transcript, then the `[身体状态]` lines (effects, then needs). Each
 /// sub-block is omitted when its part is empty; `None` when all are — the
-/// caller then emits no block at all (no stray blank lines).
-fn render_bootstrap(b: &VoiceBootstrap, gate: RecallGate) -> Option<String> {
+/// caller then emits no block at all (no stray blank lines). `habits` word a
+/// craving, picked by the snapshot's `created_at` so the block stays
+/// byte-stable for the call.
+fn render_bootstrap(
+    b: &VoiceBootstrap,
+    gate: RecallGate,
+    habits: eros_engine_core::needs::Habits,
+) -> Option<String> {
+    let pick = f64::from(b.created_at.timestamp_subsec_micros()) / 1_000_000.0;
     let bullets: Vec<&str> = b
         .insights
         .iter()
@@ -219,7 +226,7 @@ fn render_bootstrap(b: &VoiceBootstrap, gate: RecallGate) -> Option<String> {
         .chain(
             b.needs
                 .as_ref()
-                .and_then(crate::prompt::needs_line)
+                .and_then(|n| crate::prompt::needs_line(n, habits, pick))
                 .map(|l| format!("此刻的需要：{l}")),
         )
         .collect();
@@ -349,7 +356,8 @@ async fn load_bootstrap_needs(
     if !enabled {
         return Ok(None);
     }
-    crate::pipeline::handlers::load_needs(pool, instance_id, None, Utc::now()).await
+    let habits = crate::pipeline::handlers::load_habits(pool, instance_id).await?;
+    crate::pipeline::handlers::load_needs(pool, instance_id, None, Utc::now(), habits).await
 }
 
 /// Assemble a first-turn snapshot. The four parts degrade independently; the
@@ -737,7 +745,10 @@ pub fn run_voice_turn(
                 None => None,
             },
         };
-        let bootstrap_block = bootstrap.as_ref().and_then(|b| render_bootstrap(b, gate));
+        let habits = crate::prompt::persona_habits(&persona);
+        let bootstrap_block = bootstrap
+            .as_ref()
+            .and_then(|b| render_bootstrap(b, gate, habits));
 
         // The call's frozen state for the caller (spec 2026-10-12-given-item-
         // lingering-effects-design.md §9.1), before the first `delta`.
@@ -1077,6 +1088,7 @@ pub fn run_voice_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eros_engine_core::needs::Habits;
 
     /// Every line at its top tier: the recall gate withholds nothing.
     const OPEN_GATE: RecallGate = RecallGate {
@@ -1181,7 +1193,7 @@ mod tests {
     fn bootstrap_block_filters_intimate_bullets_through_the_gate() {
         let s = snapshot(&["职业：设计师", "性癖：束缚", "家庭：独生女"], None);
         assert_eq!(
-            render_bootstrap(&s, RecallGate::STRANGER).as_deref(),
+            render_bootstrap(&s, RecallGate::STRANGER, Habits::default()).as_deref(),
             Some("[关于他]\n- 职业：设计师")
         );
         assert_eq!(
@@ -1190,7 +1202,8 @@ mod tests {
                 RecallGate {
                     bond_tier: 3,
                     chem_tier: 4
-                }
+                },
+                Habits::default()
             )
             .as_deref(),
             Some("[关于他]\n- 职业：设计师\n- 性癖：束缚\n- 家庭：独生女")
@@ -1206,7 +1219,7 @@ mod tests {
         let p = build_voice_prompt(
             &genome(),
             "DIRECTIVE",
-            render_bootstrap(&s, OPEN_GATE).as_deref(),
+            render_bootstrap(&s, OPEN_GATE, Habits::default()).as_deref(),
             None,
             AffinityScope::none(),
             None,
@@ -1236,13 +1249,13 @@ mod tests {
         let mut s = snapshot(&["城市：上海"], Some("用户：你好"));
         s.effects = vec![cigarette()];
         assert_eq!(
-            render_bootstrap(&s, OPEN_GATE).as_deref(),
+            render_bootstrap(&s, OPEN_GATE, Habits::default()).as_deref(),
             Some("[关于他]\n- 城市：上海\n\n[上次通话]\n用户：你好\n\n[身体状态]\n1 支烟，烟劲很足，正在劲头上")
         );
         let mut alone = snapshot(&[], None);
         alone.effects = vec![cigarette()];
         assert_eq!(
-            render_bootstrap(&alone, OPEN_GATE).as_deref(),
+            render_bootstrap(&alone, OPEN_GATE, Habits::default()).as_deref(),
             Some("[身体状态]\n1 支烟，烟劲很足，正在劲头上")
         );
     }
@@ -1263,6 +1276,8 @@ mod tests {
             social: NeedLevel::Mid,
             stamina: NeedLevel::Low,
             emotional: NeedLevel::Mid,
+            outing: NeedLevel::Mid,
+            indulgence: NeedLevel::Mid,
         }
     }
 
@@ -1272,13 +1287,63 @@ mod tests {
         s.effects = vec![cigarette()];
         s.needs = Some(hungry());
         assert_eq!(
-            render_bootstrap(&s, OPEN_GATE).as_deref(),
+            render_bootstrap(&s, OPEN_GATE, Habits::default()).as_deref(),
             Some("[身体状态]\n1 支烟，烟劲很足，正在劲头上\n此刻的需要：饿了；很累")
         );
         let mut alone = snapshot(&[], None);
         alone.needs = Some(hungry());
         assert_eq!(
-            render_bootstrap(&alone, OPEN_GATE).as_deref(),
+            render_bootstrap(&alone, OPEN_GATE, Habits::default()).as_deref(),
+            Some("[身体状态]\n此刻的需要：饿了；很累")
+        );
+    }
+
+    #[test]
+    fn the_voice_craving_holds_for_the_call() {
+        use eros_engine_core::needs::NeedLevel;
+        let all = Habits {
+            smoking: Some(true),
+            alcoholic: Some(true),
+            drug: Some(true),
+        };
+        let at_micros = |micros: i64| {
+            let mut s = snapshot(&[], None);
+            s.needs = Some(eros_engine_core::needs::Needs {
+                hunger: NeedLevel::Mid,
+                social: NeedLevel::Mid,
+                stamina: NeedLevel::Mid,
+                emotional: NeedLevel::Mid,
+                outing: NeedLevel::Mid,
+                indulgence: NeedLevel::High,
+            });
+            s.created_at = chrono::DateTime::from_timestamp_micros(1_790_000_000_000_000 + micros)
+                .expect("a valid instant");
+            s
+        };
+        let early = at_micros(100_000);
+        let first = render_bootstrap(&early, OPEN_GATE, all);
+        assert_eq!(first, render_bootstrap(&early, OPEN_GATE, all));
+        assert_eq!(first.as_deref(), Some("[身体状态]\n此刻的需要：很想抽根烟"));
+        assert_eq!(
+            render_bootstrap(&at_micros(900_000), OPEN_GATE, all).as_deref(),
+            Some("[身体状态]\n此刻的需要：很想抽口大麻")
+        );
+    }
+
+    #[test]
+    fn an_old_snapshot_renders_as_before() {
+        let b: VoiceBootstrap = serde_json::from_value(serde_json::json!({
+            "insights": [], "created_at": "2026-10-01T00:00:00Z",
+            "needs": {"hunger": "high", "social": "mid", "stamina": "low", "emotional": "mid"}
+        }))
+        .unwrap();
+        let all = Habits {
+            smoking: Some(true),
+            alcoholic: Some(true),
+            drug: Some(true),
+        };
+        assert_eq!(
+            render_bootstrap(&b, OPEN_GATE, all).as_deref(),
             Some("[身体状态]\n此刻的需要：饿了；很累")
         );
     }
@@ -1300,7 +1365,7 @@ mod tests {
         let p = build_voice_prompt(
             &genome(),
             "DIRECTIVE",
-            render_bootstrap(&s, OPEN_GATE).as_deref(),
+            render_bootstrap(&s, OPEN_GATE, Habits::default()).as_deref(),
             Some(&a),
             AffinityScope::full(),
             None,
@@ -1323,7 +1388,7 @@ mod tests {
         let p = build_voice_prompt(
             &genome(),
             "DIRECTIVE",
-            render_bootstrap(&s, OPEN_GATE).as_deref(),
+            render_bootstrap(&s, OPEN_GATE, Habits::default()).as_deref(),
             None,
             AffinityScope::none(),
             None,
@@ -1338,7 +1403,7 @@ mod tests {
         let p = build_voice_prompt(
             &genome(),
             "DIRECTIVE",
-            render_bootstrap(&s, OPEN_GATE).as_deref(),
+            render_bootstrap(&s, OPEN_GATE, Habits::default()).as_deref(),
             None,
             AffinityScope::none(),
             None,
@@ -1352,11 +1417,11 @@ mod tests {
     #[test]
     fn bootstrap_both_parts_empty_emits_no_block() {
         let empty = snapshot(&[], None);
-        assert!(render_bootstrap(&empty, OPEN_GATE).is_none());
+        assert!(render_bootstrap(&empty, OPEN_GATE, Habits::default()).is_none());
         let p = build_voice_prompt(
             &genome(),
             "DIRECTIVE",
-            render_bootstrap(&empty, OPEN_GATE).as_deref(),
+            render_bootstrap(&empty, OPEN_GATE, Habits::default()).as_deref(),
             None,
             AffinityScope::none(),
             None,
@@ -1364,7 +1429,7 @@ mod tests {
         assert_eq!(p, "You are Mia.\n\nDIRECTIVE");
         // A whitespace-only prev_call is empty too.
         let blank = snapshot(&["  "], Some("   \n "));
-        assert!(render_bootstrap(&blank, OPEN_GATE).is_none());
+        assert!(render_bootstrap(&blank, OPEN_GATE, Habits::default()).is_none());
     }
 
     // ─── per-turn recall block ──────────────────────────────────────────
@@ -1436,7 +1501,7 @@ mod tests {
         let p = build_voice_prompt(
             &genome(),
             "DIRECTIVE",
-            render_bootstrap(&s, OPEN_GATE).as_deref(),
+            render_bootstrap(&s, OPEN_GATE, Habits::default()).as_deref(),
             Some(&a),
             AffinityScope::full(),
             block.as_deref(),
@@ -1521,7 +1586,7 @@ mod tests {
                 let p = build_voice_prompt(
                     &genome(),
                     "DIRECTIVE",
-                    render_bootstrap(&s, OPEN_GATE).as_deref(),
+                    render_bootstrap(&s, OPEN_GATE, Habits::default()).as_deref(),
                     Some(&a),
                     AffinityScope::full(),
                     render_recall_block(groups.clone(), facts.clone()).as_deref(),

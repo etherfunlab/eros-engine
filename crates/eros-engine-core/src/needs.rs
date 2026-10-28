@@ -4,23 +4,64 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::types::GivenItem;
+
 /// One need's level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NeedLevel {
     Low,
+    #[default]
     Mid,
     High,
 }
 
-/// The four needs at one moment. Stored as a user row's `metadata.needs` and
-/// in a voice call's snapshot, so the serde shape is a persisted contract.
+/// The needs at one moment. Stored as a user row's `metadata.needs` and in a
+/// voice call's snapshot, so the serde shape is a persisted contract. A value
+/// stored before `outing` and `indulgence` existed reads them as `mid` (spec
+/// 2026-10-28-outing-indulgence-needs-and-habits-design.md §2.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Needs {
     pub hunger: NeedLevel,
     pub social: NeedLevel,
     pub stamina: NeedLevel,
     pub emotional: NeedLevel,
+    /// `high` wants to go out, `low` wants to stay in.
+    #[serde(default)]
+    pub outing: NeedLevel,
+    /// `high` wants to let loose: a smoke, a drink, weed.
+    #[serde(default)]
+    pub indulgence: NeedLevel,
+}
+
+/// Whether the persona smokes, drinks, uses weed: `art_metadata.smoking`,
+/// `alcoholic`, `drug`, each `None` when unset (spec 2026-10-28 §3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Habits {
+    pub smoking: Option<bool>,
+    pub alcoholic: Option<bool>,
+    pub drug: Option<bool>,
+}
+
+impl Habits {
+    /// How many of the three are `true`.
+    pub fn count_true(self) -> usize {
+        [self.smoking, self.alcoholic, self.drug]
+            .into_iter()
+            .filter(|h| *h == Some(true))
+            .count()
+    }
+
+    /// The key for what `item` is: tobacco, alcohol or weed. `None` for any
+    /// other item, or when the key is unset.
+    pub fn uses(self, item: GivenItem) -> Option<bool> {
+        match item {
+            GivenItem::Cigarette => self.smoking,
+            GivenItem::Alcohol => self.alcoholic,
+            GivenItem::Herb => self.drug,
+            _ => None,
+        }
+    }
 }
 
 /// Where each need settles with time, and the hours one step takes (§3.2).
@@ -28,6 +69,18 @@ const HUNGER_DRIFT: (NeedLevel, f64) = (NeedLevel::High, 4.0);
 const SOCIAL_DRIFT: (NeedLevel, f64) = (NeedLevel::High, 12.0);
 const STAMINA_DRIFT: (NeedLevel, f64) = (NeedLevel::Mid, 8.0);
 const EMOTIONAL_DRIFT: (NeedLevel, f64) = (NeedLevel::Mid, 12.0);
+const OUTING_DRIFT: (NeedLevel, f64) = (NeedLevel::Mid, 8.0);
+
+/// Where `indulgence` settles and how fast, by how many habits are `true`
+/// (spec 2026-10-28 §2.2): the more she uses, the sooner the urge returns.
+fn indulgence_drift(habits: Habits) -> (NeedLevel, f64) {
+    match habits.count_true() {
+        0 => (NeedLevel::Mid, 8.0),
+        1 => (NeedLevel::High, 12.0),
+        2 => (NeedLevel::High, 8.0),
+        _ => (NeedLevel::High, 4.0),
+    }
+}
 
 impl NeedLevel {
     fn rank(self) -> i8 {
@@ -64,12 +117,14 @@ fn drift(level: NeedLevel, (rest, period): (NeedLevel, f64), hours: f64) -> Need
 }
 
 /// Levels rated `hours` ago, carried forward to now (§3.2).
-pub fn carried(rated: Needs, hours: f64) -> Needs {
+pub fn carried(rated: Needs, hours: f64, habits: Habits) -> Needs {
     Needs {
         hunger: drift(rated.hunger, HUNGER_DRIFT, hours),
         social: drift(rated.social, SOCIAL_DRIFT, hours),
         stamina: drift(rated.stamina, STAMINA_DRIFT, hours),
         emotional: drift(rated.emotional, EMOTIONAL_DRIFT, hours),
+        outing: drift(rated.outing, OUTING_DRIFT, hours),
+        indulgence: drift(rated.indulgence, indulgence_drift(habits), hours),
     }
 }
 
@@ -85,12 +140,14 @@ fn next_step(level: NeedLevel, (rest, period): (NeedLevel, f64), hours: f64) -> 
 
 /// Hours after the rating at which levels rated `hours` ago next change under
 /// `carried`, or `None` when every need is at rest.
-pub fn next_change(rated: Needs, hours: f64) -> Option<f64> {
+pub fn next_change(rated: Needs, hours: f64, habits: Habits) -> Option<f64> {
     [
         next_step(rated.hunger, HUNGER_DRIFT, hours),
         next_step(rated.social, SOCIAL_DRIFT, hours),
         next_step(rated.stamina, STAMINA_DRIFT, hours),
         next_step(rated.emotional, EMOTIONAL_DRIFT, hours),
+        next_step(rated.outing, OUTING_DRIFT, hours),
+        next_step(rated.indulgence, indulgence_drift(habits), hours),
     ]
     .into_iter()
     .flatten()
@@ -100,6 +157,7 @@ pub fn next_change(rated: Needs, hours: f64) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::GivenItem;
     use NeedLevel::{High, Low, Mid};
 
     fn all(level: NeedLevel) -> Needs {
@@ -108,14 +166,25 @@ mod tests {
             social: level,
             stamina: level,
             emotional: level,
+            outing: Mid,
+            indulgence: Mid,
+        }
+    }
+
+    fn habits(true_keys: usize) -> Habits {
+        let set = |i: usize| Some(i < true_keys);
+        Habits {
+            smoking: set(0),
+            alcoholic: set(1),
+            drug: set(2),
         }
     }
 
     #[test]
     fn no_time_or_negative_time_changes_nothing() {
         for level in [Low, Mid, High] {
-            assert_eq!(carried(all(level), 0.0), all(level));
-            assert_eq!(carried(all(level), -5.0), all(level));
+            assert_eq!(carried(all(level), 0.0, Habits::default()), all(level));
+            assert_eq!(carried(all(level), -5.0, Habits::default()), all(level));
         }
     }
 
@@ -147,7 +216,7 @@ mod tests {
         ];
         for (name, pick, from, hours, want) in cases {
             assert_eq!(
-                pick(&carried(all(from), hours)),
+                pick(&carried(all(from), hours, Habits::default())),
                 want,
                 "{name} {from:?} +{hours}h"
             );
@@ -161,9 +230,15 @@ mod tests {
             social: High,
             stamina: Mid,
             emotional: Mid,
+            outing: Mid,
+            indulgence: Mid,
         };
         for hours in [0.0, 5.0, 1000.0] {
-            assert_eq!(next_change(rest, hours), None, "+{hours}h");
+            assert_eq!(
+                next_change(rest, hours, Habits::default()),
+                None,
+                "+{hours}h"
+            );
         }
     }
 
@@ -175,6 +250,8 @@ mod tests {
             social: High,
             stamina: Mid,
             emotional: Mid,
+            outing: Mid,
+            indulgence: Mid,
         };
         let hunger_low = Needs {
             hunger: Low,
@@ -201,7 +278,11 @@ mod tests {
             (hunger_and_social_low, 13.0, Some(24.0)),
         ];
         for (rated, hours, want) in cases {
-            assert_eq!(next_change(rated, hours), want, "{rated:?} +{hours}h");
+            assert_eq!(
+                next_change(rated, hours, Habits::default()),
+                want,
+                "{rated:?} +{hours}h"
+            );
         }
     }
 
@@ -214,14 +295,25 @@ mod tests {
             social: Mid,
             stamina: High,
             emotional: Low,
+            outing: High,
+            indulgence: Low,
         };
         let mut hours = 0.0;
-        while let Some(at) = next_change(rated, hours) {
-            assert_eq!(carried(rated, at - 0.001), carried(rated, hours));
-            assert_ne!(carried(rated, at), carried(rated, hours));
+        while let Some(at) = next_change(rated, hours, Habits::default()) {
+            assert_eq!(
+                carried(rated, at - 0.001, Habits::default()),
+                carried(rated, hours, Habits::default())
+            );
+            assert_ne!(
+                carried(rated, at, Habits::default()),
+                carried(rated, hours, Habits::default())
+            );
             hours = at;
         }
-        assert_eq!(carried(rated, hours), carried(rated, 1000.0));
+        assert_eq!(
+            carried(rated, hours, Habits::default()),
+            carried(rated, 1000.0, Habits::default())
+        );
     }
 
     #[test]
@@ -231,11 +323,14 @@ mod tests {
             social: Low,
             stamina: Mid,
             emotional: Mid,
+            outing: High,
+            indulgence: Low,
         };
         let v = serde_json::to_value(n).unwrap();
         assert_eq!(
             v,
-            serde_json::json!({"hunger": "high", "social": "low", "stamina": "mid", "emotional": "mid"})
+            serde_json::json!({"hunger": "high", "social": "low", "stamina": "mid", "emotional": "mid",
+                "outing": "high", "indulgence": "low"})
         );
         assert_eq!(serde_json::from_value::<Needs>(v).unwrap(), n);
         assert!(serde_json::from_value::<Needs>(
@@ -246,5 +341,106 @@ mod tests {
             serde_json::json!({"hunger": "medium", "social": "low", "stamina": "mid", "emotional": "mid"})
         )
         .is_err());
+    }
+
+    fn only(outing: NeedLevel, indulgence: NeedLevel) -> Needs {
+        Needs {
+            outing,
+            indulgence,
+            ..all(Mid)
+        }
+    }
+
+    #[test]
+    fn outing_drifts_to_mid_every_8h() {
+        for n in 0..=3 {
+            for (from, hours, want) in [
+                (Low, 7.9, Low),
+                (Low, 8.0, Mid),
+                (High, 8.0, Mid),
+                (High, 1000.0, Mid),
+            ] {
+                assert_eq!(
+                    carried(only(from, Mid), hours, habits(n)).outing,
+                    want,
+                    "{n} true, {from:?} +{hours}h"
+                );
+            }
+        }
+    }
+
+    /// (habits, start level, hours, expected level).
+    #[test]
+    fn indulgence_drift_follows_the_habit_count() {
+        let cases = [
+            (Habits::default(), High, 8.0, Mid),
+            (Habits::default(), Low, 1000.0, Mid),
+            (habits(0), High, 8.0, Mid),
+            (habits(0), Low, 1000.0, Mid),
+            (habits(1), Low, 11.9, Low),
+            (habits(1), Low, 12.0, Mid),
+            (habits(1), Low, 24.0, High),
+            (habits(2), Low, 8.0, Mid),
+            (habits(2), Low, 16.0, High),
+            (habits(3), Low, 4.0, Mid),
+            (habits(3), Mid, 4.0, High),
+            (habits(3), High, 1000.0, High),
+        ];
+        for (h, from, hours, want) in cases {
+            assert_eq!(
+                carried(only(Mid, from), hours, h).indulgence,
+                want,
+                "{h:?} {from:?} +{hours}h"
+            );
+        }
+    }
+
+    #[test]
+    fn next_change_follows_the_habit_count() {
+        let rested = Needs {
+            hunger: High,
+            social: High,
+            ..only(Mid, Low)
+        };
+        assert_eq!(next_change(rested, 0.0, habits(0)), Some(8.0));
+        assert_eq!(next_change(rested, 0.0, habits(1)), Some(12.0));
+        assert_eq!(next_change(rested, 5.0, habits(3)), Some(8.0));
+        assert_eq!(next_change(rested, 8.0, habits(3)), None);
+    }
+
+    #[test]
+    fn a_rating_stored_before_outing_and_indulgence_reads_them_as_mid() {
+        let old = serde_json::json!({"hunger": "high", "social": "low", "stamina": "mid", "emotional": "high"});
+        assert_eq!(
+            serde_json::from_value::<Needs>(old).unwrap(),
+            Needs {
+                hunger: High,
+                social: Low,
+                stamina: Mid,
+                emotional: High,
+                outing: Mid,
+                indulgence: Mid,
+            }
+        );
+        assert!(serde_json::from_value::<Needs>(serde_json::json!({
+            "hunger": "high", "social": "low", "stamina": "mid", "outing": "low", "indulgence": "low"
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn habits_count_and_uses() {
+        assert_eq!(Habits::default().count_true(), 0);
+        assert_eq!(habits(0).count_true(), 0);
+        assert_eq!(habits(2).count_true(), 2);
+        let h = Habits {
+            smoking: Some(true),
+            alcoholic: Some(false),
+            drug: None,
+        };
+        assert_eq!(h.uses(GivenItem::Cigarette), Some(true));
+        assert_eq!(h.uses(GivenItem::Alcohol), Some(false));
+        assert_eq!(h.uses(GivenItem::Herb), None);
+        assert_eq!(h.uses(GivenItem::Coffee), None);
     }
 }

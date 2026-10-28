@@ -101,6 +101,8 @@ pub enum EventKind {
     WatchingMatch,
     WatchingShow,
     HavingSex,
+    WantToGoOut,
+    WantToGoHome,
     Sick,
     Period,
     Hospitalized,
@@ -115,7 +117,7 @@ pub enum EventKind {
 
 impl EventKind {
     /// Every drawable kind, in draw order.
-    pub const ALL: [EventKind; 50] = [
+    pub const ALL: [EventKind; 52] = [
         EventKind::PoliceEncounter,
         EventKind::AnimalEncounter,
         EventKind::HitSomeone,
@@ -158,6 +160,8 @@ impl EventKind {
         EventKind::WatchingMatch,
         EventKind::WatchingShow,
         EventKind::HavingSex,
+        EventKind::WantToGoOut,
+        EventKind::WantToGoHome,
         EventKind::Sick,
         EventKind::Period,
         EventKind::Hospitalized,
@@ -213,6 +217,8 @@ impl EventKind {
             EventKind::WatchingMatch => "watching_match",
             EventKind::WatchingShow => "watching_show",
             EventKind::HavingSex => "having_sex",
+            EventKind::WantToGoOut => "want_to_go_out",
+            EventKind::WantToGoHome => "want_to_go_home",
             EventKind::AdmiringScenery => "admiring_scenery",
             EventKind::AdmiringArt => "admiring_art",
             EventKind::TakingSelfie => "taking_selfie",
@@ -248,7 +254,9 @@ impl EventKind {
             TempWork | ExMessage | WeatherChange | GotHit | Breakup | WorkingOut | Reading
             | Gaming | AwayFromPhone | Unwell | Irritable | Busy | InBattle | Asleep
             | OutShopping | BrosGathering | SisGathering | OnTheRoad | WatchingMatch
-            | WatchingShow | HavingSex | TakingSpace | FellOut => EventCategory::Mid,
+            | WatchingShow | HavingSex | WantToGoOut | WantToGoHome | TakingSpace | FellOut => {
+                EventCategory::Mid
+            }
             Sick | Period | Hospitalized | PostSurgery => EventCategory::Body,
             BusinessTrip | ShortTrip | LongTrip | HometownVisit => EventCategory::Trip,
         }
@@ -363,6 +371,8 @@ fn rule(kind: EventKind) -> Rule {
         WatchingMatch => (2.0, 24, Lasts::Hours(2, 3)),
         WatchingShow => (1.0, 72, Lasts::Hours(2, 3)),
         HavingSex => (1.0, 48, Lasts::Hours(1, 2)),
+        WantToGoOut => (1.0, 24, Lasts::Hours(1, 3)),
+        WantToGoHome => (1.0, 24, Lasts::Hours(1, 3)),
         Sick => (3.0, 14 * DAY, Lasts::Hours(DAY, 3 * DAY)),
         Period => (3.0, 28 * DAY, Lasts::Hours(3 * DAY, 7 * DAY)),
         Hospitalized => (0.5, 60 * DAY, Lasts::Hours(2 * DAY, 5 * DAY)),
@@ -467,6 +477,23 @@ fn needs_factor(kind: EventKind, needs: Option<&Needs>) -> f64 {
         GroceryShopping if n.hunger == NeedLevel::High => 2.0,
         ExMessage if n.emotional == NeedLevel::High => 3.0,
         AnimalEncounter | Irritable | Quarrel if n.emotional == NeedLevel::High => 2.0,
+        WantToGoOut if n.outing == NeedLevel::High => 3.0,
+        WantToGoHome if n.outing == NeedLevel::Low => 3.0,
+        _ => 1.0,
+    }
+}
+
+/// How the urge to let loose scales a kind within its category (spec
+/// 2026-10-28-outing-indulgence-needs-and-habits-design.md §5.2): it sends
+/// her out and frays her temper. Its own factor, so it multiplies with
+/// `needs_factor`. 1 without a rating.
+fn indulgence_factor(kind: EventKind, needs: Option<&Needs>) -> f64 {
+    match (kind, needs) {
+        (EventKind::WantToGoOut | EventKind::Irritable, Some(n))
+            if n.indulgence == NeedLevel::High =>
+        {
+            2.0
+        }
         _ => 1.0,
     }
 }
@@ -695,6 +722,7 @@ pub fn draw(input: &DrawInput, rolls: Rolls) -> Option<Drawn> {
         .map(|k| {
             let weight = rule(k).weight
                 * needs_factor(k, input.needs.as_ref())
+                * indulgence_factor(k, input.needs.as_ref())
                 * preference_factor(k, input.persona)
                 * follow_factor(k, input.history, input.now)
                 * prior_factor(k, input.persona, input.ever_had_sex)
@@ -834,6 +862,8 @@ mod tests {
             social: NeedLevel::Mid,
             stamina,
             emotional,
+            outing: NeedLevel::Mid,
+            indulgence: NeedLevel::Mid,
         })
     }
 
@@ -843,6 +873,8 @@ mod tests {
             social: NeedLevel::Mid,
             stamina: NeedLevel::Mid,
             emotional: NeedLevel::Mid,
+            outing: NeedLevel::Mid,
+            indulgence: NeedLevel::Mid,
         })
     }
 
@@ -1301,7 +1333,7 @@ mod tests {
         let count = |c| EventKind::ALL.iter().filter(|k| k.category() == c).count();
         assert_eq!(
             EventCategory::ALL.map(count),
-            [21, 21, 4, 4],
+            [21, 23, 4, 4],
             "short, mid, body, trip"
         );
         assert!(!EventCategory::Short.is_background());
@@ -1330,7 +1362,7 @@ mod tests {
 
     /// The kinds added after the 28 v2 kinds; tests pinned to the weights of
     /// those 28 draw from `earlier()`.
-    const ADDED: [EventKind; 22] = [
+    const ADDED: [EventKind; 24] = [
         PeriodScare,
         PregnancyScare,
         Busy,
@@ -1353,6 +1385,8 @@ mod tests {
         WatchingMatch,
         WatchingShow,
         HavingSex,
+        WantToGoOut,
+        WantToGoHome,
     ];
 
     fn earlier() -> Vec<EventKind> {
@@ -1581,7 +1615,7 @@ mod tests {
             assert_eq!(EventKind::parse(s), Some(k));
             assert!(EventKind::ALL.contains(&k), "{k:?}");
         }
-        assert_eq!(EventKind::ALL.len(), 50);
+        assert_eq!(EventKind::ALL.len(), 52);
     }
 
     #[test]
@@ -1590,7 +1624,7 @@ mod tests {
         assert_eq!(EventKind::parse("fell_out"), Some(FellOut));
         assert!(!EventKind::ALL.contains(&TakingSpace));
         assert!(!EventKind::ALL.contains(&FellOut));
-        assert_eq!(EventKind::ALL.len(), 50);
+        assert_eq!(EventKind::ALL.len(), 52);
         for k in EventKind::SPECIAL {
             assert_eq!(serde_json::to_value(k).unwrap(), k.as_str());
             assert_eq!(EventKind::parse(k.as_str()), Some(k));
@@ -2160,5 +2194,89 @@ mod tests {
         assert_eq!(at(&none, 0.4), Some(BusinessTrip));
         assert_eq!(at(&none, 0.6), Some(ShortTrip));
         assert_eq!(at(&none, 0.9), Some(HometownVisit));
+    }
+
+    fn rated(outing: NeedLevel, indulgence: NeedLevel, emotional: NeedLevel) -> Option<Needs> {
+        Some(Needs {
+            hunger: NeedLevel::Mid,
+            social: NeedLevel::Mid,
+            stamina: NeedLevel::Mid,
+            emotional,
+            outing,
+            indulgence,
+        })
+    }
+
+    #[test]
+    fn going_out_and_going_home_are_told_mid_kinds() {
+        for (k, s) in [
+            (WantToGoOut, "want_to_go_out"),
+            (WantToGoHome, "want_to_go_home"),
+        ] {
+            assert_eq!(k.as_str(), s);
+            assert_eq!(EventKind::parse(s), Some(k));
+            assert_eq!(k.category(), EventCategory::Mid);
+            let r = rule(k);
+            assert_eq!((r.weight, r.cooldown_hours), (1.0, 24), "{k:?}");
+            assert_eq!(max_hours(r.lasts), 3, "{k:?}");
+            assert!(!k.may_be_offline(), "{k:?}");
+            assert!(is_told(k, 1, &PersonaTraits::default()), "{k:?}");
+            for bg in [Hospitalized, PostSurgery, Period, LongTrip] {
+                assert_eq!(
+                    pick(&[past(bg, 1, 72)], &[k], rolls(0.0, 0.0)),
+                    Some(k),
+                    "{k:?} in {bg:?}"
+                );
+            }
+        }
+    }
+
+    /// Draw order is `ALL` order: Reading 2, WantToGoOut 1, WantToGoHome 1.
+    #[test]
+    fn outing_steers_going_out_and_going_home() {
+        use NeedLevel::{High, Low, Mid};
+        let allowed = [Reading, WantToGoOut, WantToGoHome];
+        let at = |n, k| {
+            pick_with(
+                &PersonaTraits::default(),
+                n,
+                3,
+                &[],
+                &allowed,
+                rolls(0.0, k),
+            )
+        };
+        // 2 : 1 : 1 — 0.6 → 2.4 → out; 0.8 → 3.2 → home.
+        assert_eq!(at(rated(Mid, Mid, Mid), 0.6), Some(WantToGoOut));
+        assert_eq!(at(rated(Mid, Mid, Mid), 0.8), Some(WantToGoHome));
+        // outing high: 2 : 3 : 1 — 0.8 → 4.8 → out.
+        assert_eq!(at(rated(High, Mid, Mid), 0.8), Some(WantToGoOut));
+        // outing low: 2 : 1 : 3 — 0.6 → 3.6 → home.
+        assert_eq!(at(rated(Low, Mid, Mid), 0.6), Some(WantToGoHome));
+    }
+
+    #[test]
+    fn the_urge_to_let_loose_sends_her_out_and_frays_her_temper() {
+        use NeedLevel::{High, Mid};
+        let none = PersonaTraits::default();
+        // Reading 2 : WantToGoOut 1 — 0.55 → 1.65 → reading; indulgence high
+        // ×2: 2 : 2 — 0.55 → 2.2 → out.
+        let out = [Reading, WantToGoOut];
+        let at = |n, k| pick_with(&none, n, 3, &[], &out, rolls(0.0, k));
+        assert_eq!(at(rated(Mid, Mid, Mid), 0.55), Some(Reading));
+        assert_eq!(at(rated(Mid, High, Mid), 0.55), Some(WantToGoOut));
+        // Outing too: 2 : 6 — 0.3 → 2.4 → out; outing alone 2 : 3 — 0.3 →
+        // 1.5 → reading.
+        assert_eq!(at(rated(High, High, Mid), 0.3), Some(WantToGoOut));
+        assert_eq!(at(rated(High, Mid, Mid), 0.3), Some(Reading));
+        // Irritable 1 : Busy 2 (ALL order) — 0.4 → 1.2 → busy; ×2: 2 : 2 —
+        // 0.4 → 1.6 → irritable; with emotional high ×4: 4 : 2 — 0.6 → 3.6
+        // → irritable; emotional alone 2 : 2 — 0.6 → 2.4 → busy.
+        let temper = [Irritable, Busy];
+        let at = |n, k| pick_with(&none, n, 3, &[], &temper, rolls(0.0, k));
+        assert_eq!(at(rated(Mid, Mid, Mid), 0.4), Some(Busy));
+        assert_eq!(at(rated(Mid, High, Mid), 0.4), Some(Irritable));
+        assert_eq!(at(rated(Mid, High, High), 0.6), Some(Irritable));
+        assert_eq!(at(rated(Mid, Mid, High), 0.6), Some(Busy));
     }
 }

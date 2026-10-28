@@ -236,6 +236,8 @@ fn kind_cue(
         OnTheRoad => "（你正在路上，这一趟要走好几个小时。）".into(),
         WatchingMatch => "（你正在看一场比赛。）".into(),
         WatchingShow => "（你正在看一场演出。）".into(),
+        WantToGoOut => "（你现在很想出门走走。）".into(),
+        WantToGoHome => "（你现在很想回家。）".into(),
         TempWork => "（你刚临时接到一份工作，得马上去处理。）".into(),
         ExMessage => "（你的前任刚给你发来消息。）".into(),
         WeatherChange => "（你那边的天气刚刚突然变了。）".into(),
@@ -804,6 +806,8 @@ mod tests {
             (EventKind::Gaming, "（你正在打游戏。）"),
             (EventKind::Unwell, "（你现在有点不舒服。）"),
             (EventKind::Irritable, "（你现在心里很烦躁。）"),
+            (EventKind::WantToGoOut, "（你现在很想出门走走。）"),
+            (EventKind::WantToGoHome, "（你现在很想回家。）"),
             (EventKind::Period, "（你的月经来了。）"),
             (
                 EventKind::PeriodScare,
@@ -860,6 +864,14 @@ mod tests {
         assert_eq!(
             cue(EventKind::AnimalEncounter, Some(EventKind::BusinessTrip)),
             "（你正在外地出差。你刚在路上遇到了一只小动物。）"
+        );
+        assert_eq!(
+            cue(EventKind::WantToGoOut, Some(EventKind::Hospitalized)),
+            "（你正在住院。你现在很想出门走走。）"
+        );
+        assert_eq!(
+            cue(EventKind::WantToGoHome, Some(EventKind::LongTrip)),
+            "（你正在长途旅行。你现在很想回家。）"
         );
         for (bg, state) in [
             (EventKind::Sick, "你正在生病"),

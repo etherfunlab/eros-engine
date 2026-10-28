@@ -91,6 +91,8 @@ pub enum EventKindDto {
     WatchingMatch,
     WatchingShow,
     HavingSex,
+    WantToGoOut,
+    WantToGoHome,
     Sick,
     Period,
     Hospitalized,
@@ -164,6 +166,8 @@ impl From<EventKindDto> for EventKind {
             EventKindDto::WatchingMatch => EventKind::WatchingMatch,
             EventKindDto::WatchingShow => EventKind::WatchingShow,
             EventKindDto::HavingSex => EventKind::HavingSex,
+            EventKindDto::WantToGoOut => EventKind::WantToGoOut,
+            EventKindDto::WantToGoHome => EventKind::WantToGoHome,
             EventKindDto::Sick => EventKind::Sick,
             EventKindDto::Period => EventKind::Period,
             EventKindDto::Hospitalized => EventKind::Hospitalized,
@@ -223,6 +227,8 @@ impl From<EventKind> for EventKindDto {
             EventKind::WatchingMatch => EventKindDto::WatchingMatch,
             EventKind::WatchingShow => EventKindDto::WatchingShow,
             EventKind::HavingSex => EventKindDto::HavingSex,
+            EventKind::WantToGoOut => EventKindDto::WantToGoOut,
+            EventKind::WantToGoHome => EventKindDto::WantToGoHome,
             EventKind::Sick => EventKindDto::Sick,
             EventKind::Period => EventKindDto::Period,
             EventKind::Hospitalized => EventKindDto::Hospitalized,
@@ -619,7 +625,14 @@ pub(crate) async fn draw_event_at(
     }
 
     let needs = if state.model_config.pde_enabled() {
-        crate::pipeline::handlers::load_needs(&state.pool, instance_id, None, now).await?
+        crate::pipeline::handlers::load_needs(
+            &state.pool,
+            instance_id,
+            None,
+            now,
+            crate::prompt::persona_habits(&persona),
+        )
+        .await?
     } else {
         None
     };
