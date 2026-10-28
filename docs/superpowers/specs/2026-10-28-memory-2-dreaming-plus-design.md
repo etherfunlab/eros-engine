@@ -60,7 +60,9 @@ Replay on production relationships (48 scan points × 2 models, 360 calls)
 settled the open prompt questions: one call producing memories, episode and
 journal together had zero truncation at 1024 output tokens and zero parse
 failures; journal candidates were 16/16 present and correctly attributed,
-15/16 correctly flagged real vs roleplay; splitting the journal into its own
+15/16 flagged real vs roleplay the way the judge read it under the earlier
+"actually happened" definition (not re-scored under the initiative rule in
+§5.1); splitting the journal into its own
 call was strictly worse. One of the two candidate models never produces
 journal entries at all, so a fallback to it silences the journal — the
 engine must make that visible. Sequential arc rewrites grew without bound
