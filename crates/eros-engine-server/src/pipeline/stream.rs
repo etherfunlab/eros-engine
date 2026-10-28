@@ -2427,11 +2427,50 @@ pub(crate) struct PdeVerdict {
     /// a value that does not parse also reads as `None` and never fails the
     /// verdict.
     #[serde(default, deserialize_with = "lenient_needs")]
-    needs: Option<eros_engine_core::needs::Needs>,
+    needs: Option<VerdictNeeds>,
+}
+
+/// The needs as the judge rated them. The original four are required; a
+/// judge that leaves out `outing` or `indulgence` (an older prompt, or a
+/// non-strict judge whose line did not show `享受`) keeps the levels it was
+/// shown for them (spec 2026-10-28-outing-indulgence-needs-and-habits-
+/// design.md §4.1).
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+struct VerdictNeeds {
+    hunger: eros_engine_core::needs::NeedLevel,
+    social: eros_engine_core::needs::NeedLevel,
+    stamina: eros_engine_core::needs::NeedLevel,
+    emotional: eros_engine_core::needs::NeedLevel,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    outing: Option<eros_engine_core::needs::NeedLevel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    indulgence: Option<eros_engine_core::needs::NeedLevel>,
+}
+
+impl VerdictNeeds {
+    /// The levels in effect: a key the judge left out takes the level it was
+    /// `shown`, `mid` when it was shown none.
+    fn resolve(
+        self,
+        shown: Option<&eros_engine_core::needs::Needs>,
+    ) -> eros_engine_core::needs::Needs {
+        eros_engine_core::needs::Needs {
+            hunger: self.hunger,
+            social: self.social,
+            stamina: self.stamina,
+            emotional: self.emotional,
+            outing: self
+                .outing
+                .unwrap_or_else(|| shown.map(|n| n.outing).unwrap_or_default()),
+            indulgence: self
+                .indulgence
+                .unwrap_or_else(|| shown.map(|n| n.indulgence).unwrap_or_default()),
+        }
+    }
 }
 
 /// `needs` as `Some` only when it parses; anything else is `None`.
-fn lenient_needs<'de, D>(d: D) -> Result<Option<eros_engine_core::needs::Needs>, D::Error>
+fn lenient_needs<'de, D>(d: D) -> Result<Option<VerdictNeeds>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -2546,12 +2585,14 @@ fn pde_response_format() -> serde_json::Value {
                         "enum": ["accept", "refuse", null] },
                     "needs": { "type": ["object", "null"],
                         "additionalProperties": false,
-                        "required": ["hunger", "social", "stamina", "emotional"],
+                        "required": ["hunger", "social", "stamina", "emotional", "outing", "indulgence"],
                         "properties": {
                             "hunger": { "type": "string", "enum": ["low", "mid", "high"] },
                             "social": { "type": "string", "enum": ["low", "mid", "high"] },
                             "stamina": { "type": "string", "enum": ["low", "mid", "high"] },
-                            "emotional": { "type": "string", "enum": ["low", "mid", "high"] }
+                            "emotional": { "type": "string", "enum": ["low", "mid", "high"] },
+                            "outing": { "type": "string", "enum": ["low", "mid", "high"] },
+                            "indulgence": { "type": "string", "enum": ["low", "mid", "high"] }
                         } }
                 }
             }
@@ -2822,11 +2863,19 @@ fn build_pde_ctx(
                 NeedLevel::High => "高",
             };
             format!(
-                "[需求] 饥饿={} 社交欲={} 体力={} 情感需求={}\n",
+                "[需求] 饥饿={} 社交欲={} 体力={} 情感需求={} 外出={}{}\n",
                 w(n.hunger),
                 w(n.social),
                 w(n.stamina),
-                w(n.emotional)
+                w(n.emotional),
+                w(n.outing),
+                // `享受` shows only when high; its absence reads as "not
+                // high" (spec 2026-10-28 §4.1).
+                if n.indulgence == NeedLevel::High {
+                    " 享受=高"
+                } else {
+                    ""
+                }
             )
         }
     };
@@ -2946,7 +2995,7 @@ struct VerdictAudit<'a> {
     action_response: Option<&'static str>,
     /// What the judge rated; absent when it gave no needs.
     #[serde(skip_serializing_if = "Option::is_none")]
-    needs: Option<eros_engine_core::needs::Needs>,
+    needs: Option<VerdictNeeds>,
 }
 
 impl<'a> VerdictAudit<'a> {
@@ -4949,7 +4998,12 @@ pub(crate) fn run_stream_with(
                     };
                     // The judge's rating describes the persona, not the reply,
                     // so it is stored whatever the turn's outcome (spec §5.1).
-                    if let Some(n) = run.verdict.as_ref().and_then(|v| v.needs) {
+                    if let Some(n) = run
+                        .verdict
+                        .as_ref()
+                        .and_then(|v| v.needs)
+                        .map(|r| r.resolve(prior_needs.as_ref()))
+                    {
                         if let Err(e) = chat_repo.set_needs(user_msg.user_message_id, &n).await {
                             tracing::warn!("stream: needs write failed: {e}");
                         }
@@ -5000,6 +5054,7 @@ pub(crate) fn run_stream_with(
             .as_ref()
             .and_then(|r| r.verdict.as_ref())
             .and_then(|v| v.needs)
+            .map(|r| r.resolve(prior_needs.as_ref()))
             .or(prior_needs);
         let needs_text = turn_needs.as_ref().and_then(crate::prompt::needs_line);
 
@@ -19226,9 +19281,80 @@ data: [DONE]\n\n";
             serde_json::json!({
                 "type": ["object", "null"],
                 "additionalProperties": false,
-                "required": ["hunger", "social", "stamina", "emotional"],
-                "properties": {"hunger": level, "social": level, "stamina": level, "emotional": level},
+                "required": ["hunger", "social", "stamina", "emotional", "outing", "indulgence"],
+                "properties": {"hunger": level, "social": level, "stamina": level, "emotional": level,
+                    "outing": level, "indulgence": level},
             })
+        );
+    }
+
+    #[test]
+    fn the_needs_line_shows_indulgence_only_when_high() {
+        use eros_engine_core::needs::{NeedLevel, Needs};
+        let input = fixture_decision_input();
+        let t = JudgeTranscript::default();
+        let line = |indulgence| {
+            let n = Needs {
+                hunger: NeedLevel::Mid,
+                social: NeedLevel::Mid,
+                stamina: NeedLevel::Mid,
+                emotional: NeedLevel::Mid,
+                outing: NeedLevel::Mid,
+                indulgence,
+            };
+            build_pde_ctx(&t, &input, false, None, None, Some(&n), None)
+        };
+        let high = line(NeedLevel::High);
+        assert!(
+            high.contains("[需求] 饥饿=中 社交欲=中 体力=中 情感需求=中 外出=中 享受=高\n"),
+            "{high}"
+        );
+        for l in [NeedLevel::Low, NeedLevel::Mid] {
+            let ctx = line(l);
+            assert!(
+                ctx.contains("[需求] 饥饿=中 社交欲=中 体力=中 情感需求=中 外出=中\n"),
+                "{ctx}"
+            );
+            assert!(!ctx.contains("享受"), "{ctx}");
+        }
+    }
+
+    #[test]
+    fn a_verdict_lacking_the_new_needs_keeps_what_it_was_shown() {
+        use eros_engine_core::needs::{NeedLevel, Needs};
+        let four = r#"{"action":"reply_text","inner_state":"x","needs":{"hunger":"high","social":"low","stamina":"mid","emotional":"mid"}}"#;
+        let rated = parse_pde_verdict(four).unwrap().needs.expect("parsed");
+        let shown = Needs {
+            hunger: NeedLevel::Low,
+            social: NeedLevel::Low,
+            stamina: NeedLevel::Low,
+            emotional: NeedLevel::Low,
+            outing: NeedLevel::Low,
+            indulgence: NeedLevel::High,
+        };
+        let kept = rated.resolve(Some(&shown));
+        assert_eq!(
+            (kept.hunger, kept.social),
+            (NeedLevel::High, NeedLevel::Low)
+        );
+        assert_eq!(
+            (kept.outing, kept.indulgence),
+            (NeedLevel::Low, NeedLevel::High)
+        );
+        let fresh = rated.resolve(None);
+        assert_eq!(
+            (fresh.outing, fresh.indulgence),
+            (NeedLevel::Mid, NeedLevel::Mid)
+        );
+        let six = r#"{"action":"reply_text","inner_state":"x","needs":{"hunger":"high","social":"low","stamina":"mid","emotional":"mid","outing":"high","indulgence":"low"}}"#;
+        let full = parse_pde_verdict(six)
+            .unwrap()
+            .needs
+            .unwrap()
+            .resolve(Some(&shown));
+        assert_eq!(
+            (full.outing, full.indulgence),
+            (NeedLevel::High, NeedLevel::Low)
         );
     }
 
@@ -19252,7 +19378,7 @@ data: [DONE]\n\n";
             social: NeedLevel::Low,
             stamina: NeedLevel::Mid,
             emotional: NeedLevel::Mid,
-            outing: NeedLevel::Mid,
+            outing: NeedLevel::High,
             indulgence: NeedLevel::Mid,
         };
         let ctx = build_pde_ctx(
@@ -19265,7 +19391,7 @@ data: [DONE]\n\n";
             None,
         );
         let line = ctx
-            .find("[需求] 饥饿=高 社交欲=低 体力=中 情感需求=中\n")
+            .find("[需求] 饥饿=高 社交欲=低 体力=中 情感需求=中 外出=高\n")
             .expect(&ctx);
         assert!(line < ctx.find("[身体状态]").unwrap(), "{ctx}");
         assert!(line < ctx.find("[用户最新消息]").unwrap(), "{ctx}");
@@ -19301,6 +19427,7 @@ data: [DONE]\n\n";
         .unwrap();
         let audit = serde_json::to_value(VerdictAudit::new(&v, None, None)).unwrap();
         assert_eq!(audit["needs"]["hunger"], "high");
+        assert!(audit["needs"].get("outing").is_none(), "{audit}");
         let bare = parse_pde_verdict(r#"{"action":"reply_text","inner_state":"x"}"#).unwrap();
         let audit = serde_json::to_value(VerdictAudit::new(&bare, None, None)).unwrap();
         assert!(audit.get("needs").is_none(), "{audit}");
@@ -22400,7 +22527,8 @@ data: [DONE]\n\n"
         let reqs = t.mock.received_requests().await.unwrap();
         // mid + 9h: hunger one step up (4h period), the rest unchanged.
         assert!(
-            judge_request(&reqs).contains("[需求] 饥饿=高 社交欲=中 体力=中 情感需求=中\\n"),
+            judge_request(&reqs)
+                .contains("[需求] 饥饿=高 社交欲=中 体力=中 情感需求=中 外出=中\\n"),
             "{}",
             judge_request(&reqs)
         );
@@ -22431,7 +22559,8 @@ data: [DONE]\n\n"
         .await;
         let reqs = t.mock.received_requests().await.unwrap();
         assert!(
-            judge_request(&reqs).contains("[需求] 饥饿=低 社交欲=中 体力=中 情感需求=中\\n"),
+            judge_request(&reqs)
+                .contains("[需求] 饥饿=低 社交欲=中 体力=中 情感需求=中 外出=中\\n"),
             "{}",
             judge_request(&reqs)
         );
