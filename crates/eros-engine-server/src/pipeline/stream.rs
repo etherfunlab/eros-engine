@@ -5056,7 +5056,13 @@ pub(crate) fn run_stream_with(
             .and_then(|v| v.needs)
             .map(|r| r.resolve(prior_needs.as_ref()))
             .or(prior_needs);
-        let needs_text = turn_needs.as_ref().and_then(crate::prompt::needs_line);
+        let needs_text = turn_needs.as_ref().and_then(|n| {
+            crate::prompt::needs_line(
+                n,
+                crate::prompt::persona_habits(&input.persona),
+                rand::thread_rng().gen(),
+            )
+        });
 
         // Ghosting kill-switch (§4.1) — path-wide final gate (LLM / fallback /
         // pure-rule / tip). Uses the in-scope sanitized hints, not plan.context_hints.
