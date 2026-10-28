@@ -22,6 +22,7 @@ pub use migrate::migrate;
 pub mod persona;
 pub mod pool;
 pub mod profile_state;
+pub mod scan_state;
 pub mod session_archive;
 pub mod story;
 pub mod user_insight;
