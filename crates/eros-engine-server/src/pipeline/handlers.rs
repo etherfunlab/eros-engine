@@ -1225,6 +1225,29 @@ pub(crate) async fn build_reply_request_with(
                 None
             });
 
+    // Spec 2026-10-28 memory-2-dreaming-plus §6: the relationship's arc,
+    // latest episodes and journal moments join the already gated and pruned
+    // raw rows in [shared_memories]. 1:1 prompts only; a group seat keeps
+    // its raw rows alone.
+    let relationship_ctx = match group {
+        Some(_) => None,
+        None => {
+            crate::relationship_context::load_relationship_context(
+                state,
+                instance_id,
+                query_embedding.as_deref(),
+                y_on,
+            )
+            .await
+        }
+    };
+    let shared_memories = crate::relationship_context::render_shared_memories(
+        relationship_ctx.as_ref(),
+        &relationship_facts,
+        now.user_timezone.unwrap_or(chrono_tz::UTC),
+        crate::relationship_context::SHARED_MEMORIES_BUDGET_CHARS,
+    );
+
     // CHAT_NOISE_CANCELLATION_DISABLED restores the pre-change prompt shape in
     // full: the insight lines were the [character_state] addition in that
     // change, so the flag suppresses them too, not just the strip and the
@@ -1256,6 +1279,8 @@ pub(crate) async fn build_reply_request_with(
         body_state,
         needs,
         event,
+        shared_memories.as_deref(),
+        &[],
     );
 
     if render_reactions {
@@ -4605,6 +4630,153 @@ mod tests {
         );
         let without = system(false).await;
         assert!(!without.contains("[reactions]"), "{without}");
+    }
+
+    // ─── build_reply_request: relationship memory in [shared_memories] ───
+
+    /// The system prompt of a 1:1 text turn on a relationship with a seeded
+    /// arc and episode, under `memory_scope`, the turn affinity adjusted by
+    /// `tune`, and the user in Taipei. The user row is blank, so recall makes
+    /// no Voyage call: what the block carries comes from the relationship
+    /// context alone.
+    async fn system_with_seeded_arc(
+        pool: &PgPool,
+        memory_scope: MemoryScope,
+        tune: fn(&mut eros_engine_core::affinity::Affinity),
+    ) -> String {
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(pool, owner).await;
+        let session_id = make_session(pool, owner, Some(instance_id)).await;
+        let user_message_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content) \
+             VALUES ($1, 'user', '') RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.relationship_arcs (instance_id, opening, arc, folded_through) \
+             VALUES ($1, '在咖啡店认识', '后来常常聊到深夜', now())",
+        )
+        .bind(instance_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.relationship_episodes (instance_id, summary, started_at, ended_at) \
+             VALUES ($1, '一起挑了猫粮', '2026-10-11T20:00:00Z', '2026-10-11T21:00:00Z')",
+        )
+        .bind(instance_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let state = crate::routes::companion::test_state(pool.clone());
+        let plan = ActionPlan {
+            action_type: eros_engine_core::types::ActionType::ReplyText,
+            reply_style: eros_engine_core::types::ReplyStyle::Neutral,
+            affinity_deltas: Default::default(),
+            energy_cost: 0.0,
+            context_hints: vec![],
+            reply_mode: None,
+            nudges: Default::default(),
+            clothing: None,
+            image_caption: None,
+            image_ref: eros_engine_core::types::ImageRef::Face,
+            aspect_ratio: None,
+            action_response: None,
+        };
+        let mut affinity = ladder_test_affinity(session_id, owner, instance_id);
+        tune(&mut affinity);
+        let input = DecisionInput {
+            event: Event::UserMessage {
+                content: String::new(),
+                message_id: user_message_id,
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope,
+                affinity_scope: Default::default(),
+                quote: Default::default(),
+                action: None,
+                outfit: None,
+            },
+            affinity,
+            persona: ladder_test_persona(instance_id, owner),
+            signals: eros_engine_core::types::ConversationSignals {
+                message_count: 1,
+                hours_since_last_message: 0.1,
+                ghost_streak: 0,
+                hours_since_last_ghost: None,
+            },
+        };
+        let now = crate::prompt::NowContext {
+            user_timezone: Some(chrono_tz::Asia::Taipei),
+            ..Default::default()
+        };
+        let (req, _tags) = build_reply_request(
+            &state,
+            &input,
+            &plan,
+            session_id,
+            owner,
+            instance_id,
+            user_message_id,
+            &now,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("build_reply_request succeeds");
+        req.messages[0].content.clone()
+    }
+
+    const NO_MEMORY_YET: &str = "（还没有专属记忆，慢慢来）";
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn shared_memories_block_carries_arc_for_text_turn(pool: PgPool) {
+        let system = system_with_seeded_arc(&pool, MemoryScope::default(), |_| {}).await;
+        assert!(
+            system.contains(
+                "[shared_memories]\n在咖啡店认识\n后来常常聊到深夜\n- 2026-10-12：一起挑了猫粮"
+            ),
+            "the arc paragraph, then the episode dated in the user's timezone: {system}"
+        );
+        assert!(!system.contains(NO_MEMORY_YET), "{system}");
+    }
+
+    /// The arc is this relationship's own memory: it renders with the
+    /// profile layer off and at the stranger tier, where the gate recalls no
+    /// raw row.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn relationship_only_scope_still_renders_arc(pool: PgPool) {
+        let system = system_with_seeded_arc(&pool, MemoryScope::RelationshipOnly, |a| {
+            a.warmth = 0.0;
+            a.trust = 0.0;
+            a.intrigue = 0.0;
+            a.intimacy = 0.0;
+            a.tension = 0.0;
+        })
+        .await;
+        assert!(
+            system.contains("[shared_memories]\n在咖啡店认识\n后来常常聊到深夜"),
+            "{system}"
+        );
+        assert!(!system.contains(NO_MEMORY_YET), "{system}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn neutral_only_scope_renders_no_arc(pool: PgPool) {
+        let system = system_with_seeded_arc(&pool, MemoryScope::NeutralOnly, |_| {}).await;
+        assert!(!system.contains("在咖啡店认识"), "{system}");
+        assert!(!system.contains("一起挑了猫粮"), "{system}");
+        assert!(
+            system.contains(&format!("[shared_memories]\n{NO_MEMORY_YET}")),
+            "{system}"
+        );
     }
 
     #[test]

@@ -13,6 +13,7 @@ mod pipeline;
 mod prompt;
 mod prompt_log;
 mod reaction;
+mod relationship_context;
 mod repetition;
 mod routes;
 mod state;

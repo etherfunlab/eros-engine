@@ -1470,6 +1470,14 @@ pub fn build_prompt(
     // The persona's events (spec 2026-10-15-life-events-v2-design.md §8.2).
     // `None` ⇒ no line.
     event: Option<&EventLines>,
+    // The relationship part of `[shared_memories]`, rendered by
+    // `relationship_context::render_shared_memories` (spec 2026-10-28
+    // memory-2-dreaming-plus §6.2). `None` ⇒ `relationship_facts` render as
+    // plain lines, or the placeholder when there are none.
+    shared_memories: Option<&str>,
+    // Anniversary lines (spec 2026-10-28 §5.4), each its own line in `[now]`
+    // right after the birthday line. Empty ⇒ no line.
+    anniversaries: &[String],
 ) -> String {
     let name = persona.genome.name.as_str();
     let age = meta_i32(persona, "age")
@@ -1534,7 +1542,10 @@ pub fn build_prompt(
 
     let (profile_sec, rel_sec) = render_recall_sections(profile_groups, relationship_facts);
     let profile_str = profile_sec.unwrap_or_else(|| "（刚认识，还不了解他）".to_string());
-    let rel_str = rel_sec.unwrap_or_else(|| "（还没有专属记忆，慢慢来）".to_string());
+    let rel_str = match shared_memories {
+        Some(text) => text.to_string(),
+        None => rel_sec.unwrap_or_else(|| "（还没有专属记忆，慢慢来）".to_string()),
+    };
 
     let relationship = relationship_ground(affinity, affinity_scope);
     let attitude = affinity
@@ -1784,6 +1795,7 @@ pub fn build_prompt(
     let birthday = birthday_line(persona, now)
         .map(|l| format!("\n{l}"))
         .unwrap_or_default();
+    let anniversaries: String = anniversaries.iter().map(|l| format!("\n{l}")).collect();
     // The events she is in, then what she has not yet said about an offline
     // stretch or a false alarm. They are drawn facts of this moment, so they
     // sit under `[now]`, outside `[character_state]`, whose header defers to
@@ -1819,7 +1831,7 @@ pub fn build_prompt(
          [reply_length]\n{lr}{relationship}\
          {attitude}{state}{hints_section}{emotional_section}{quote_section}\n\
          \n\
-         [now]\n{tc}{holiday}{birthday}{events}{this_turn}\n\
+         [now]\n{tc}{holiday}{birthday}{anniversaries}{events}{this_turn}\n\
          \n\
          ---\n\
          [iron_rules — 违反即失效]\n\
@@ -2204,6 +2216,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         assert!(
             !p.contains("[additional_guidance]"),
@@ -2248,6 +2262,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         assert!(
             p.contains("[additional_guidance]"),
@@ -2284,6 +2300,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                &[],
             );
             assert!(
                 !p.contains("[clothing]"),
@@ -2328,6 +2346,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         assert!(p.contains("[quote]"), "section present: {p}");
         assert!(
@@ -2361,6 +2381,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         assert!(
             p.contains("用户：我上次说的那个地方"),
@@ -2395,6 +2417,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         assert!(p.contains("下面这段对话"), "dialogue intro: {p}");
         assert!(
@@ -2423,6 +2447,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         assert!(
             p.contains("下面这句话"),
@@ -2453,6 +2479,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         assert!(!p.contains("[quote]"), "no quote ⇒ no section: {p}");
     }
@@ -2497,6 +2525,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         )
     }
 
@@ -2675,6 +2705,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         let pos = |h: &str| s.find(h).unwrap_or_else(|| panic!("missing {h} in:\n{s}"));
         let order = [
@@ -2731,6 +2763,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         // head, then the constant guard, then identity.
         assert!(s.starts_with("AUTHORED HEAD\n\n"), "{s}");
@@ -2769,6 +2803,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         // No head → starts with the guard, which still precedes identity.
         assert!(
@@ -2804,6 +2840,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         // Guard present, sits before identity (stable prefix).
         assert!(s.contains("never an AI, model, bot, or program"), "{s}");
@@ -2846,6 +2884,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         // Treat refusal text in context as corrupt data, never self-identify
         // as an AI, and answer photo requests in character.
@@ -2894,6 +2934,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         assert!(s.contains("你是 Aria，男性，24 岁，INFP 性格。"), "{s}");
         assert!(s.contains("③ 你是男性，严格遵守自己的性别"), "{s}");
@@ -2923,6 +2965,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         assert!(
             s.contains("你是 Aria，non-binary，24 岁"),
@@ -2957,6 +3001,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         assert!(s.contains("你是 Aria，24 岁，INFP 性格。"), "{s}");
         assert!(
@@ -2989,6 +3035,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         // blank gender must not produce a double comma or the gender rule
         assert!(s.contains("你是 Aria，24 岁，INFP 性格。"), "{s}");
@@ -3021,6 +3069,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         assert!(
             !s.contains("[recent_conversation]"),
@@ -3050,6 +3100,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         let z = s.find("⓪").expect("⓪ rule must render");
         let o = s.find("①").expect("① rule must render");
@@ -3088,6 +3140,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         let groups = vec![("基础画像".to_string(), vec!["住在上海".to_string()])];
         let b = build_prompt(
@@ -3110,6 +3164,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         let cut = a
             .find("[user_profile]")
@@ -3154,6 +3210,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         let b = build_prompt(
             &p,
@@ -3175,6 +3233,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         let cut = a
             .find("[additional_guidance]")
@@ -3209,6 +3269,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         assert!(!s.contains("[avoid_repetition]"), "{s}");
     }
@@ -3235,6 +3297,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         assert!(!s.contains("[emotional_context]"), "{s}");
     }
@@ -3265,6 +3329,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         let block_at = p.find("[world_memories]").expect("block present");
         assert!(p.contains("你最近和 Kenji 闹了别扭"));
@@ -3297,6 +3363,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         assert!(!without.contains("[world_memories]"));
         // Empty context must also omit the block AND be byte-identical.
@@ -3321,6 +3389,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         assert_eq!(without, with_empty, "empty world ⇒ byte-identical prompt");
     }
@@ -3351,6 +3421,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         let at = p.find("[world_stories]").expect("block present");
         assert!(p[at..].contains("开店倒计时一周"));
@@ -3382,6 +3454,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         assert!(!without.contains("[world_stories]"));
         let with_empty = build_prompt(
@@ -3404,6 +3478,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         assert_eq!(without, with_empty, "empty stories ⇒ byte-identical prompt");
     }
@@ -3912,6 +3988,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         assert!(!p.contains("你所在时区"), "timezone clause retired: {p}");
         assert!(
@@ -3949,6 +4027,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         assert!(
             p.contains("[character_state]"),
@@ -4006,6 +4086,8 @@ mod tests {
             body,
             None,
             None,
+            None,
+            &[],
         )
     }
 
@@ -4060,6 +4142,8 @@ mod tests {
             body,
             needs,
             None,
+            None,
+            &[],
         )
     }
 
@@ -4759,6 +4843,8 @@ mod tests {
             None,
             needs,
             lines.as_ref(),
+            None,
+            &[],
         )
     }
 
@@ -4788,6 +4874,8 @@ mod tests {
             None,
             None,
             Some(&lines),
+            None,
+            &[],
         );
         assert!(
             p.contains(
@@ -4819,6 +4907,8 @@ mod tests {
             None,
             None,
             Some(&quiet),
+            None,
+            &[],
         );
         assert!(!p.contains("- 刚才："), "{p}");
     }
@@ -4866,6 +4956,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         )
     }
 
@@ -4936,6 +5028,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         // attitude directives are gated by the same axis set: bond-axis directives
         // present, chemistry-axis directives (trust/intrigue/patience) suppressed.
@@ -4969,6 +5063,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         assert!(!p.contains("[feelings]"));
         assert!(!p.contains("[mood]"));
@@ -4998,6 +5094,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         assert!(
             p.contains("[feelings]（你此刻对他的真实感觉，这是内心状态，绝对不要复述）"),
@@ -5032,6 +5130,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         assert!(!p.contains("[feelings]"), "{p}");
 
@@ -5058,6 +5158,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         assert!(!p.contains("[feelings]") && !p.contains("[mood]"), "{p}");
     }
@@ -5208,6 +5310,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         let block = &s[s.find("[now]").unwrap()..s.find("[iron_rules").unwrap()];
         assert!(
@@ -5240,6 +5344,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         assert!(!s.contains("对方那边"), "{s}");
     }
@@ -5266,6 +5372,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         // What survives of the old ⑨: the half that governs what the reply
         // engages with. Its other half ("别开口就自述动作或凝视") was an opener
@@ -5337,6 +5445,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         );
         for gone in [
             "方括号",           // bracket ban — the regex strips \[[^\]]*\]
@@ -5444,6 +5554,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         )
     }
 
@@ -6091,6 +6203,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
         )
     }
 
@@ -6240,6 +6354,66 @@ mod tests {
             now_block(&s).contains("对方那边今天是中秋节。\n今天是你的生日。"),
             "{s}"
         );
+    }
+
+    #[test]
+    fn shared_memories_text_replaces_raw_rows_and_anniversaries_follow_the_birthday() {
+        let now = NowContext {
+            now: Utc.with_ymd_and_hms(2026, 9, 24, 20, 0, 0).unwrap(),
+            user_timezone: Some(chrono_tz::Asia::Taipei),
+            holidays: vec![],
+        };
+        let mut p = fixture_persona();
+        set_meta(&mut p, "birthday", serde_json::json!("09-25"));
+        let raw = vec!["聊到深夜".to_string()];
+        let anniversaries = vec![
+            "今天是你们认识一个月。".to_string(),
+            "明天是约好去海边的日子。".to_string(),
+        ];
+        let call = |shared: Option<&str>, anniversaries: &[String]| {
+            build_prompt(
+                &p,
+                &[],
+                &raw,
+                None,
+                &[],
+                None,
+                None,
+                &[],
+                AffinityScope::full(),
+                &[],
+                None,
+                None,
+                None,
+                None,
+                TurnNudges::default(),
+                &now,
+                None,
+                None,
+                None,
+                shared,
+                anniversaries,
+            )
+        };
+
+        let s = call(Some("在咖啡店认识\n- 用户：聊到深夜"), &anniversaries);
+        assert!(
+            s.contains("[shared_memories]\n在咖啡店认识\n- 用户：聊到深夜\n"),
+            "{s}"
+        );
+        assert!(
+            !s.contains("- 聊到深夜"),
+            "the text stands in for the raw rows: {s}"
+        );
+        assert!(
+            now_block(&s)
+                .contains("今天是你的生日。\n今天是你们认识一个月。\n明天是约好去海边的日子。"),
+            "{s}"
+        );
+
+        let s = call(None, &[]);
+        assert!(s.contains("[shared_memories]\n- 聊到深夜\n"), "{s}");
+        assert!(!now_block(&s).contains("认识一个月"), "{s}");
     }
 
     #[test]
