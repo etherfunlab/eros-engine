@@ -1248,6 +1248,16 @@ pub(crate) async fn build_reply_request_with(
         now.user_timezone.unwrap_or(chrono_tz::UTC),
         crate::relationship_context::SHARED_MEMORIES_BUDGET_CHARS,
     );
+    // Spec §5.4: the recurring journal rows that fall on the user's local
+    // day, under `[now]` whether or not `[shared_memories]` has new content.
+    // Needs the request timezone, like the holiday line.
+    let today = now
+        .user_timezone
+        .map(|tz| now.now.with_timezone(&tz).date_naive());
+    let anniversaries = relationship_ctx
+        .as_ref()
+        .map(|c| crate::anniversary::anniversary_lines(&c.recurring, today))
+        .unwrap_or_default();
 
     // CHAT_NOISE_CANCELLATION_DISABLED restores the pre-change prompt shape in
     // full: the insight lines were the [character_state] addition in that
@@ -1281,7 +1291,7 @@ pub(crate) async fn build_reply_request_with(
         needs,
         event,
         shared_memories.as_deref(),
-        &[],
+        &anniversaries,
     );
 
     if render_reactions {
@@ -4648,8 +4658,17 @@ mod tests {
         /// vector, so recall finds them in order; without any the user row is
         /// blank and recall embeds nothing.
         raw: &'a [String],
+        /// Seed a `first_meet` journal row one month before the request's
+        /// local date, and give the persona a birthday the next day.
+        met_a_month_ago: bool,
         /// Run the turn as a group seat.
         group: bool,
+    }
+
+    /// The request's instant: 2026-10-29 04:00 in Taipei, still the 28th in
+    /// UTC.
+    fn relationship_turn_now() -> chrono::DateTime<chrono::Utc> {
+        "2026-10-28T20:00:00Z".parse().unwrap()
     }
 
     /// The system prompt of `turn`, the user in Taipei.
@@ -4703,6 +4722,16 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
+        }
+
+        if turn.met_a_month_ago {
+            eros_engine_store::journal::JournalRepo { pool }
+                .insert(&eros_engine_store::journal::first_meet(
+                    instance_id,
+                    chrono::NaiveDate::from_ymd_opt(2026, 9, 29).unwrap(),
+                ))
+                .await
+                .unwrap();
         }
 
         let mut state = crate::routes::companion::test_state(pool.clone());
@@ -4771,6 +4800,10 @@ mod tests {
             affinity.intimacy = v;
             affinity.tension = v;
         }
+        let mut persona = ladder_test_persona(instance_id, owner);
+        if turn.met_a_month_ago {
+            persona.genome.art_metadata = serde_json::json!({ "birthday": "10-30" });
+        }
         let input = DecisionInput {
             event: Event::UserMessage {
                 content: user_text.into(),
@@ -4785,7 +4818,7 @@ mod tests {
                 outfit: None,
             },
             affinity,
-            persona: ladder_test_persona(instance_id, owner),
+            persona,
             signals: eros_engine_core::types::ConversationSignals {
                 message_count: 1,
                 hours_since_last_message: 0.1,
@@ -4800,6 +4833,7 @@ mod tests {
             block: String::new(),
         });
         let now = crate::prompt::NowContext {
+            now: relationship_turn_now(),
             user_timezone: Some(chrono_tz::Asia::Taipei),
             ..Default::default()
         };
@@ -4936,6 +4970,30 @@ mod tests {
         assert!(system.contains(&todays_block(&raw)), "{system}");
         assert!(!system.contains("在咖啡店认识"), "{system}");
         assert!(!system.contains("一起挑了猫粮"), "{system}");
+    }
+
+    /// The first meeting's monthly line lands in `[now]` right after the
+    /// birthday line, on the user's local date, with no relationship memory
+    /// to put in `[shared_memories]`.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn anniversary_line_renders_under_now(pool: PgPool) {
+        let system = relationship_turn_system(
+            &pool,
+            RelationshipTurn {
+                met_a_month_ago: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        let now_block = &system[system.find("[now]").unwrap()..system.find("[iron_rules").unwrap()];
+        assert!(
+            now_block.contains("明天是你的生日。\n今天是你们认识满 1 个月的日子。"),
+            "{now_block}"
+        );
+        assert!(
+            system.contains(&format!("[shared_memories]\n{NO_MEMORY_YET}")),
+            "{system}"
+        );
     }
 
     #[test]

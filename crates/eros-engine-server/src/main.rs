@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+mod anniversary;
 mod auth;
 mod birthday;
 mod byoc;
