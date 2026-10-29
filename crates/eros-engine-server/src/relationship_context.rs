@@ -100,14 +100,20 @@ pub(crate) async fn load_relationship_context(
 ///
 /// Over `budget` (characters of the joined text) lines go in this order:
 /// episodes oldest first, then raw rows last first, then journal rows last
-/// first. The arc paragraph always stays. `None` when nothing renders.
+/// first. The arc paragraph always stays.
+///
+/// `None` when the context adds nothing of its own (no context, or one with
+/// no arc row, episode or journal hit): the caller then renders the raw rows
+/// as it always has, unbudgeted, placeholder included.
 pub(crate) fn render_shared_memories(
     ctx: Option<&RelationshipContext>,
     raw: &[String],
     date_tz: Tz,
     budget: usize,
 ) -> Option<String> {
-    let arc: Option<String> = ctx.and_then(|c| c.arc.as_ref()).and_then(|a| {
+    let ctx =
+        ctx.filter(|c| c.arc.is_some() || !c.episodes.is_empty() || !c.journal_hits.is_empty())?;
+    let arc: Option<String> = ctx.arc.as_ref().and_then(|a| {
         let parts: Vec<&str> = [a.opening.as_str(), a.arc.as_str()]
             .into_iter()
             .filter(|s| !s.trim().is_empty())
@@ -115,31 +121,25 @@ pub(crate) fn render_shared_memories(
         (!parts.is_empty()).then(|| parts.join("\n"))
     });
     let mut episodes: Vec<String> = ctx
-        .map(|c| {
-            c.episodes
-                .iter()
-                .map(|e| {
-                    let day = e.started_at.with_timezone(&date_tz).format("%Y-%m-%d");
-                    format!("- {day}：{}", e.summary)
-                })
-                .collect()
+        .episodes
+        .iter()
+        .map(|e| {
+            let day = e.started_at.with_timezone(&date_tz).format("%Y-%m-%d");
+            format!("- {day}：{}", e.summary)
         })
-        .unwrap_or_default();
+        .collect();
     let mut journal: Vec<String> = ctx
-        .map(|c| {
-            c.journal_hits
-                .iter()
-                .map(|j| {
-                    let mark = if j.realm == "roleplay" {
-                        "（扮演）"
-                    } else {
-                        ""
-                    };
-                    format!("- {}{mark}：{}", j.occurred_on, j.summary)
-                })
-                .collect()
+        .journal_hits
+        .iter()
+        .map(|j| {
+            let mark = if j.realm == "roleplay" {
+                "（扮演）"
+            } else {
+                ""
+            };
+            format!("- {}{mark}：{}", j.occurred_on, j.summary)
         })
-        .unwrap_or_default();
+        .collect();
     let mut raw: Vec<String> = raw.iter().map(|f| format!("- {f}")).collect();
 
     loop {
@@ -156,7 +156,11 @@ pub(crate) fn render_shared_memories(
         }
         if !episodes.is_empty() {
             episodes.remove(0);
-        } else if raw.pop().is_none() && journal.pop().is_none() {
+        } else if !raw.is_empty() {
+            raw.pop();
+        } else if !journal.is_empty() {
+            journal.pop();
+        } else {
             // Only the arc is left.
             return Some(text);
         }
@@ -262,13 +266,6 @@ mod tests {
             render_shared_memories(Some(&ctx), &[], chrono_tz::UTC, 1_200).as_deref(),
             Some("后来常常聊到深夜")
         );
-
-        // Raw rows alone render exactly as the plain recall section does.
-        let (_, plain) = crate::prompt::render_recall_sections(&[], &raw);
-        assert_eq!(
-            render_shared_memories(None, &raw, chrono_tz::UTC, 1_200),
-            plain
-        );
     }
 
     #[test]
@@ -313,9 +310,23 @@ mod tests {
         let j1 = format!("- 2026-08-01：{}", "j".repeat(60));
         let j2 = format!("- 2026-08-02：{}", "k".repeat(60));
         let r1 = format!("- {}", "x".repeat(100));
+        let r2 = format!("- {}", "y".repeat(100));
+        let r3 = format!("- {}", "z".repeat(100));
         let render = |budget| render_shared_memories(Some(&ctx), &raw, chrono_tz::UTC, budget);
 
-        // 1,999 chars in all: every episode goes, then the last two raw rows.
+        // 1,999 chars in all. The two oldest episodes go first; the newest
+        // stays.
+        let ep3 = format!("- 2026-10-03：{}", "3".repeat(200));
+        assert_eq!(
+            render(1_600).as_deref(),
+            Some(
+                [paragraph.as_str(), &ep3, &j1, &j2, &r1, &r2, &r3]
+                    .join("\n")
+                    .as_str()
+            )
+        );
+
+        // Every episode goes, then the last two raw rows.
         let survivors = [paragraph.as_str(), &j1, &j2, &r1].join("\n");
         assert_eq!(survivors.chars().count(), 1_151);
         assert_eq!(
@@ -348,5 +359,20 @@ mod tests {
             render_shared_memories(Some(&empty), &[], chrono_tz::UTC, 1_200),
             None
         );
+
+        // Raw rows with nothing from the context are left to the caller's
+        // plain rendering, whatever their length; recurring rows add nothing
+        // to this block.
+        let raw = vec!["x".repeat(2_000)];
+        let recurring_only = RelationshipContext {
+            recurring: vec![journal(day(2026, 8, 1), "real", "第一次见面")],
+            ..Default::default()
+        };
+        for ctx in [None, Some(&empty), Some(&recurring_only)] {
+            assert_eq!(
+                render_shared_memories(ctx, &raw, chrono_tz::UTC, 1_200),
+                None
+            );
+        }
     }
 }
