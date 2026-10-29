@@ -89,15 +89,20 @@ pub(crate) async fn scan_instance(
     if rows.len() as i64 == MAX_ROWS_PER_SCAN {
         drop_trailing_tie(&mut rows);
     }
+    // A stretch with nothing readable clears the whole count: the turns it
+    // counted are unreadable (voice turns once `DREAMING_VOICE_DISABLED` is
+    // set, say), and a count left standing would re-claim this relationship on
+    // every tick. Rows that land later are still read: the cursor, not the
+    // count, decides what a scan covers.
     let (Some(first), Some(last)) = (rows.first(), rows.last()) else {
-        finish_ok(&scan, instance_id, bound, 0).await;
+        finish_ok(&scan, instance_id, bound, st.pending_turns).await;
         return ScanOutcome::Empty;
     };
     let covered = rows.iter().filter(|r| r.role == "user").count() as i32;
     let lines = render_transcript(&rows, tz);
     if lines.is_empty() {
         // Nothing left to read once audio tags are stripped: no call to spend.
-        finish_ok(&scan, instance_id, last.sent_at, covered).await;
+        finish_ok(&scan, instance_id, last.sent_at, st.pending_turns).await;
         return ScanOutcome::Empty;
     }
 

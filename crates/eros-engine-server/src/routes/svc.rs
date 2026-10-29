@@ -1612,7 +1612,7 @@ mod tests {
                 "{map}: {again}"
             );
         }
-        assert_eq!(again["deleted"].as_object().unwrap().len(), 17);
+        assert_eq!(again["deleted"].as_object().unwrap().len(), 21);
         assert_eq!(again["blanked"].as_object().unwrap().len(), 8);
         let parse = |v: &str| chrono::DateTime::parse_from_rfc3339(v).unwrap();
         assert!(

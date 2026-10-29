@@ -117,21 +117,17 @@ pub(crate) async fn bump_relationship(
     Some(bumped)
 }
 
-/// A 1:1 text turn: counted, and once `SCAN_K` turns wait, the relationship is
-/// claimed and scanned inline up to the turn's newest row (`produced` are its
-/// assistant rows), so a later turn in flight is never half-read. Inert past
-/// the count while `[tasks.dreaming_scan]` is absent.
-pub(crate) async fn count_text_turn(
+/// The K path of a 1:1 text turn that `bump_relationship` counted: once
+/// `SCAN_K` turns wait, the relationship is claimed and scanned inline up to
+/// the turn's newest row (`produced` are its assistant rows), so a later turn
+/// in flight is never half-read. Inert while `[tasks.dreaming_scan]` is absent.
+pub(crate) async fn scan_if_due(
     state: &AppState,
     instance_id: Uuid,
+    bumped: Bumped,
     user_message_id: Uuid,
     produced: &[Uuid],
-    user_timezone: Option<Tz>,
 ) {
-    let Some(bumped) = bump_relationship(state, instance_id, user_message_id, user_timezone).await
-    else {
-        return;
-    };
     if bumped.pending_turns < SCAN_K || state.model_config.resolve_dreaming_scan().is_none() {
         return;
     }
@@ -268,8 +264,9 @@ pub(crate) async fn sweep_once(state: &AppState) -> SweepTally {
 }
 
 /// Embed up to `EMBED_BATCH` journal rows still without a vector in one
-/// `embed_documents` call. Returns how many were stored; a failure is logged
-/// and the rows wait for the next tick.
+/// `embed_documents` call. Returns how many were stored; a failure, or a reply
+/// whose vector count does not match the rows, is logged and the rows wait for
+/// the next tick.
 async fn embed_pending_journal(state: &AppState) -> usize {
     let journal = JournalRepo { pool: &state.pool };
     let pending = match journal.pending_embeddings(EMBED_BATCH).await {
@@ -290,6 +287,14 @@ async fn embed_pending_journal(state: &AppState) -> usize {
             return 0;
         }
     };
+    if vectors.len() != pending.len() {
+        tracing::warn!(
+            rows = pending.len(),
+            vectors = vectors.len(),
+            "dreaming: journal embed returned a different count; nothing written"
+        );
+        return 0;
+    }
     let rows: Vec<(Uuid, Vec<f32>)> = pending.iter().map(|(id, _)| *id).zip(vectors).collect();
     match journal.set_embeddings(&rows).await {
         Ok(()) => rows.len(),
@@ -1047,6 +1052,81 @@ mod tests {
             1,
             "nothing left to embed"
         );
+    }
+
+    /// Turns counted but unreadable (voice turns, then the voice flag set)
+    /// leave nothing to scan: the empty scan clears the count, so the
+    /// relationship is not claimed again on the next tick.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn empty_segment_clears_unreadable_pending_turns(pool: PgPool) {
+        let llm = MockServer::start().await;
+        answer(&llm, r#"{"memories":[]}"#).await;
+        let (mut state, _embed) = state_with(pool.clone(), &llm, true).await;
+        let (_, instance, _) = voice_call(&pool, &state).await;
+        idle_for_two_hours(&pool, instance).await;
+        state.config.dreaming_voice_disabled = true;
+
+        let first = sweep_once(&state).await;
+        assert_eq!((first.empty, first.ok, first.failed), (1, 0, 0));
+        let s = ScanStateRepo { pool: &pool }
+            .load(instance)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((s.pending_turns, s.claimed_at), (0, None));
+        assert!(
+            s.scanned_through_at > at("2026-10-01T10:02:05Z"),
+            "the cursor moves to the scan's bound"
+        );
+
+        assert_eq!(
+            sweep_once(&state).await,
+            SweepTally::default(),
+            "nothing is claimed on the next tick"
+        );
+        assert!(request_bodies(&llm).await.is_empty(), "no call was spent");
+    }
+
+    /// An embedding reply whose vector count does not match the rows writes
+    /// nothing; the rows wait for the next tick.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn embed_count_mismatch_writes_no_vectors(pool: PgPool) {
+        let llm = MockServer::start().await;
+        let (mut state, _embed) = state_with(pool.clone(), &llm, true).await;
+        let short = MockServer::start().await;
+        Mock::given(wm_path("/v1/embeddings"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "data": [ { "embedding": unit_embedding() } ] })),
+            )
+            .mount(&short)
+            .await;
+        let cfg = eros_engine_llm::model_config::ModelConfig::from_toml_str(&format!(
+            "[providers.mockembed]\nembeddings = \"{}/v1/embeddings\"\n\
+             [tasks.embedding]\nmodel = \"mock-embed@mockembed\"\n",
+            short.uri()
+        ))
+        .unwrap();
+        state.embed = std::sync::Arc::new(
+            eros_engine_llm::embedding::EmbeddingRouter::from_config_with(&cfg, |k| {
+                (k == "MOCKEMBED_API_KEY").then(|| "test-key".to_string())
+            })
+            .unwrap(),
+        );
+        let journal = JournalRepo { pool: &pool };
+        let on = chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+        for _ in 0..2 {
+            let instance = seed_persona_instance(&pool, Uuid::new_v4()).await;
+            journal
+                .insert(&first_meet(instance, on))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        assert_eq!(sweep_once(&state).await.embedded, 0);
+        assert_eq!(request_bodies(&short).await.len(), 1);
+        assert_eq!(journal.pending_embeddings(10).await.unwrap().len(), 2);
     }
 
     /// Without `[tasks.dreaming_scan]` the sweeper returns at once: nothing is

@@ -106,6 +106,22 @@ pub async fn run(
         return;
     }
 
+    // A user turn counts toward the relationship's scan before anything else
+    // runs, so a relationship's first turn places the scan cursor ahead of any
+    // later turn of the same pair.
+    let bumped = match &event {
+        Event::UserMessage { message_id, .. } => {
+            super::dreaming::bump_relationship(
+                &state,
+                instance_id,
+                *message_id,
+                user_locale.timezone,
+            )
+            .await
+        }
+        _ => None,
+    };
+
     // The marker rides the user text into every consumer below — the affinity
     // judge, memory, insights — so an action-only turn is never empty to them
     // (spec 2026-10-05 §5.3).
@@ -239,18 +255,12 @@ pub async fn run(
         fut_user_insight
     );
 
-    // A user turn counts toward the relationship's scan, which may run here
-    // once enough turns wait; this task is already off the reply path.
-    if let Some(user_message_id) = user_message_id {
+    // The relationship's scan may run here once enough turns wait; this task
+    // is already off the reply path.
+    if let (Some(bumped), Some(user_message_id)) = (bumped, user_message_id) {
         let produced_ids: Vec<Uuid> = produced.iter().map(|m| m.message_id).collect();
-        super::dreaming::count_text_turn(
-            &state,
-            instance_id,
-            user_message_id,
-            &produced_ids,
-            user_locale.timezone,
-        )
-        .await;
+        super::dreaming::scan_if_due(&state, instance_id, bumped, user_message_id, &produced_ids)
+            .await;
     }
 }
 
