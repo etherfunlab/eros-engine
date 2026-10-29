@@ -1,46 +1,32 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Dreaming-lite: session-end memory extraction sweeper.
+//! Dreaming-plus: the relationship scanner's triggers and its sweeper.
 //!
-//! Background tokio task that scans `engine.chat_sessions` for idle,
-//! unclassified sessions and runs the `dreaming_scan` LLM task on
-//! their `chat_messages`. Extracted candidates with category tags are
-//! written to `engine.companion_memories` as profile-layer rows; the
-//! session's `classified_at` is then stamped to suppress re-sweeps.
-//!
-//! Multi-instance safety: the picker uses an atomic
-//! `UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED)
-//! RETURNING ...` to claim rows in one statement. Concurrent sweepers
-//! see disjoint sets and don't race on the same session. A separate
-//! `classification_claimed_at` column carries the claim sentinel; if a
-//! worker crashes after claiming but before stamping `classified_at`,
-//! the row is re-eligible after `DREAMING_CLAIM_STALE_SECS` (default
-//! 600s).
-//!
-//! Failure handling:
-//! - Network/DB error during pick or stamp → propagate, retry next tick.
-//! - LLM call error → propagate (no stamp), retry next tick.
-//! - LLM returns garbage / empty parse → stamp anyway so a poison-pill
-//!   session can't loop the sweeper forever.
+//! Every 1:1 user turn counts toward its relationship's scan
+//! (`engine.relationship_scan_state`): the text turn in post-process, the
+//! voice turn in its route. The turn that creates the relationship's row also
+//! journals the first meeting. A text turn that brings `SCAN_K` pending turns
+//! scans inline; the sweeper scans relationships that went idle with at least
+//! `FLUSH_MIN_TURNS` pending, after embedding the journal rows still waiting
+//! for a vector. Both trigger paths claim the relationship first, so two
+//! workers never scan one relationship at once; `scan::scan_instance` settles
+//! the claim.
 
-use std::time::Duration;
-
-use chrono::Utc;
+use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
 use serde::Deserialize;
 use uuid::Uuid;
 
-use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
-use eros_engine_store::memory::{MemoryLayer, MemoryRepo};
+use eros_engine_store::journal::{first_meet, local_date, JournalRepo};
+use eros_engine_store::scan_state::{Bumped, ScanStateRepo, SCAN_K};
 
 use crate::state::AppState;
 
 mod parse;
 mod render;
-// No caller outside its tests: the sweeper and the K-trigger do not start
-// relationship scans.
-#[allow(dead_code)]
 mod scan;
 
-const MEMORY_TASK: &str = eros_engine_llm::model_config::DREAMING_SCAN_TASK;
+use scan::{scan_instance, ScanOutcome};
+
 /// Sentinel OpenRouter `user` for system-initiated (non-user-triggered) LLM
 /// calls. Dreaming runs in the background sweeper with no live request, so
 /// per-user attribution is meaningless; this buckets all dreaming spend
@@ -48,7 +34,10 @@ const MEMORY_TASK: &str = eros_engine_llm::model_config::DREAMING_SCAN_TASK;
 /// in our database). Not a real auth UUID (v4) and not a hashed client id,
 /// so it cannot collide with a real user.
 pub(crate) const SYSTEM_AUDIT_USER: &str = "11111111-1111-1111-1111-111111111111";
+/// Relationships one sweeper tick claims.
 const PICK_BATCH: i64 = 10;
+/// Journal rows one sweeper tick embeds.
+const EMBED_BATCH: i64 = 100;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct MemoryCandidate {
@@ -72,280 +61,246 @@ fn candidate_metadata(cand: &MemoryCandidate) -> Option<serde_json::Value> {
     }
 }
 
-/// Run forever. Spawn this once at server startup. Returns immediately
-/// (and never spawns the loop) if `state.config.dreaming_tick` is zero.
+/// Count one 1:1 user turn toward its relationship's scan. Reads the user
+/// row's `sent_at` (no row in a live session, no count: an archive that
+/// landed since the turn is not undone) and, when the bump creates the
+/// relationship's row, journals the first meeting: dated by the pair's
+/// earliest chat row, else by this row, in `user_timezone` (UTC when none).
+/// `None` when nothing was counted; failures are logged, never raised.
+pub(crate) async fn bump_relationship(
+    state: &AppState,
+    instance_id: Uuid,
+    user_message_id: Uuid,
+    user_timezone: Option<Tz>,
+) -> Option<Bumped> {
+    let pool = &state.pool;
+    let sent_at: Option<DateTime<Utc>> = match sqlx::query_scalar(
+        "SELECT m.sent_at FROM engine.chat_messages m \
+             JOIN engine.chat_sessions s ON s.id = m.session_id \
+             WHERE m.id = $1 AND NOT s.archived",
+    )
+    .bind(user_message_id)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(at) => at,
+        Err(e) => {
+            tracing::warn!(%instance_id, "dreaming: user row read failed: {e}");
+            return None;
+        }
+    };
+    let sent_at = sent_at?;
+    let bumped = match (ScanStateRepo { pool })
+        .bump(instance_id, sent_at, user_timezone.map(|tz| tz.name()))
+        .await
+    {
+        Ok(bumped) => bumped,
+        Err(e) => {
+            tracing::warn!(%instance_id, "dreaming: turn count failed: {e}");
+            return None;
+        }
+    };
+    if bumped.created {
+        let journal = JournalRepo { pool };
+        let on = match journal.first_meet_date(instance_id, user_timezone).await {
+            Ok(on) => on,
+            Err(e) => {
+                tracing::warn!(%instance_id, "dreaming: first-meeting date read failed: {e}");
+                None
+            }
+        }
+        .unwrap_or_else(|| local_date(sent_at, user_timezone));
+        if let Err(e) = journal.insert(&first_meet(instance_id, on)).await {
+            tracing::warn!(%instance_id, "dreaming: first-meeting journal write failed: {e}");
+        }
+    }
+    Some(bumped)
+}
+
+/// A 1:1 text turn: counted, and once `SCAN_K` turns wait, the relationship is
+/// claimed and scanned inline up to the turn's newest row (`produced` are its
+/// assistant rows), so a later turn in flight is never half-read. Inert past
+/// the count while `[tasks.dreaming_scan]` is absent.
+pub(crate) async fn count_text_turn(
+    state: &AppState,
+    instance_id: Uuid,
+    user_message_id: Uuid,
+    produced: &[Uuid],
+    user_timezone: Option<Tz>,
+) {
+    let Some(bumped) = bump_relationship(state, instance_id, user_message_id, user_timezone).await
+    else {
+        return;
+    };
+    if bumped.pending_turns < SCAN_K || state.model_config.resolve_dreaming_scan().is_none() {
+        return;
+    }
+    let pool = &state.pool;
+    let ids: Vec<Uuid> = std::iter::once(user_message_id)
+        .chain(produced.iter().copied())
+        .collect();
+    let bound: Option<DateTime<Utc>> = match sqlx::query_scalar(
+        "SELECT max(sent_at) FROM engine.chat_messages WHERE id = ANY($1)",
+    )
+    .bind(&ids)
+    .fetch_one(pool)
+    .await
+    {
+        Ok(bound) => bound,
+        Err(e) => {
+            tracing::warn!(%instance_id, "dreaming: scan bound read failed: {e}");
+            return;
+        }
+    };
+    let Some(bound) = bound else {
+        return;
+    };
+    match (ScanStateRepo { pool })
+        .claim(instance_id, state.config.dreaming_claim_stale_threshold)
+        .await
+    {
+        Ok(true) => {
+            scan_instance(state, instance_id, bound, "scan").await;
+        }
+        Ok(false) => {}
+        Err(e) => tracing::warn!(%instance_id, "dreaming: scan claim failed: {e}"),
+    }
+}
+
+/// Run forever. Spawn this once at server startup. Returns at once when
+/// `state.config.dreaming_tick` is zero or `[tasks.dreaming_scan]` is absent.
 pub async fn sweeper(state: AppState) {
     let interval = state.config.dreaming_tick;
-    let idle = state.config.dreaming_idle_threshold;
-    let claim_stale = state.config.dreaming_claim_stale_threshold;
     if interval.is_zero() {
         tracing::info!("dreaming sweeper disabled (DREAMING_DISABLED=1 or tick=0)");
         return;
     }
-    // dreaming_scan is omittable: a missing [tasks.dreaming_scan] section
-    // (or a blank filter_prompt, which would have boot-failed) resolves to None.
-    // Post-boot, None ⟺ the section is absent ⟺ the feature is off — go inert so
-    // we never claim sessions and retry-loop the per-row no-stamp path.
+    // dreaming_scan is omittable: a missing [tasks.dreaming_scan] section (or
+    // a blank filter_prompt, which would have boot-failed) resolves to None,
+    // and the feature is off.
     if state.model_config.resolve_dreaming_scan().is_none() {
         tracing::info!("dreaming_scan not configured — dreaming sweeper inert");
         return;
     }
-    tracing::info!(?interval, ?idle, ?claim_stale, "dreaming sweeper starting");
+    tracing::info!(
+        ?interval,
+        idle = ?state.config.dreaming_idle_threshold,
+        claim_stale = ?state.config.dreaming_claim_stale_threshold,
+        "dreaming sweeper starting"
+    );
 
     let mut tick = tokio::time::interval(interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
-        match scan_and_classify(&state, idle, claim_stale).await {
-            Ok(0) => {} // quiet — common case on a low-traffic instance
-            Ok(n) => tracing::info!(processed = n, "dreaming: sessions classified"),
-            Err(e) => tracing::warn!("dreaming scan failed: {e}"),
+        let t = sweep_once(&state).await;
+        if t != SweepTally::default() {
+            tracing::info!(
+                embedded = t.embedded,
+                ok = t.ok,
+                empty = t.empty,
+                failed = t.failed,
+                skipped = t.skipped,
+                "dreaming: relationships swept"
+            );
         }
     }
 }
 
-/// Atomically claim eligible sessions and classify each in turn.
-///
-/// The picker fuses "find idle sessions" and "stamp them as claimed" into
-/// a single `UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED)
-/// RETURNING ...` statement so concurrent sweeper instances can't both
-/// pick the same row. The claim is set in this one quick statement — no
-/// transaction stays open across the LLM / Voyage HTTP calls that follow.
-///
-/// Stale claim recovery: rows with `classification_claimed_at < now() -
-/// claim_stale` are eligible again, so a worker that crashed mid-pass
-/// gets re-tried automatically.
-async fn scan_and_classify(
-    state: &AppState,
-    idle: Duration,
-    claim_stale: Duration,
-) -> Result<usize, sqlx::Error> {
-    let now = Utc::now();
-    let cutoff = now - chrono::Duration::from_std(idle).unwrap_or_default();
-    let stale_cutoff = now - chrono::Duration::from_std(claim_stale).unwrap_or_default();
-
-    let sessions: Vec<(Uuid, Uuid, Option<Uuid>)> = sqlx::query_as(
-        "UPDATE engine.chat_sessions \
-         SET classification_claimed_at = now() \
-         WHERE id IN ( \
-             SELECT id FROM engine.chat_sessions \
-             WHERE classified_at IS NULL \
-               AND NOT archived \
-               AND channel <> 'group' \
-               AND last_active_at < $1 \
-               AND (classification_claimed_at IS NULL \
-                    OR classification_claimed_at < $2) \
-             ORDER BY last_active_at \
-             LIMIT $3 \
-             FOR UPDATE SKIP LOCKED \
-         ) \
-         RETURNING id, user_id, instance_id",
-    )
-    .bind(cutoff)
-    .bind(stale_cutoff)
-    .bind(PICK_BATCH)
-    .fetch_all(&state.pool)
-    .await?;
-
-    let mut count = 0;
-    for (session_id, user_id, instance_id) in sessions {
-        match classify_session(state, session_id, user_id, instance_id).await {
-            Ok(written) => {
-                tracing::info!(%session_id, written, "dreaming: session classified");
-                count += 1;
-            }
-            Err(e) => tracing::warn!(%session_id, "dreaming: classify failed: {e}"),
-        }
-    }
-    Ok(count)
+/// What one sweeper tick did: journal rows embedded, and the claimed
+/// relationships by scan outcome (`skipped` lost their claim before the scan).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SweepTally {
+    pub(crate) embedded: usize,
+    pub(crate) ok: u32,
+    pub(crate) empty: u32,
+    pub(crate) failed: u32,
+    pub(crate) skipped: u32,
 }
 
-/// Classify one session. Returns the number of memory rows written.
-/// Stamps `classified_at` on a graceful pass (including empty extraction)
-/// so the picker doesn't see this session again. Network-level errors
-/// propagate and skip the stamp so they retry next tick.
-async fn classify_session(
-    state: &AppState,
-    session_id: Uuid,
-    user_id: Uuid,
-    instance_id: Option<Uuid>,
-) -> Result<usize, String> {
-    // 1. Pull the conversation log. We use chat_messages (the canonical
-    // turn record) rather than the formatted companion_memories rows so
-    // the LLM doesn't see the "用户：X\nAI：Y" wrapper twice.
-    //
-    // Channel filter: text rows (`channel IS NULL`) always; voice rows too
-    // unless `DREAMING_VOICE_DISABLED` is set. Eligibility is idle-based, so
-    // a voice session only reaches here after the call ended and went quiet
-    // for `DREAMING_IDLE_SECS` — this never reads a live call. `product_qa`
-    // rows stay excluded: out-of-character product asides are not memories.
-    let channel_filter = if state.config.dreaming_voice_disabled {
-        "AND channel IS NULL"
-    } else {
-        "AND (channel IS NULL OR channel = 'voice')"
-    };
-    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(&format!(
-        "SELECT role, content, channel FROM engine.chat_messages \
-         WHERE session_id = $1 AND role IN ('user', 'assistant') \
-           {channel_filter} \
-         ORDER BY sent_at"
-    ))
-    .bind(session_id)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|e| format!("load chat_messages failed: {e}"))?;
-
-    if rows.is_empty() {
-        mark_classified(&state.pool, session_id)
-            .await
-            .map_err(|e| format!("mark classified (empty session): {e}"))?;
-        return Ok(0);
-    }
-
-    // Voice assistant rows may carry inline TTS cues when the deployment runs
-    // `[tasks.chat_voice] tts_audio_tags = true`. Strip them here — they are
-    // stage directions, not memories. User rows and text rows pass through
-    // verbatim. A turn that strips to nothing is dropped entirely rather than
-    // contributing an empty "AI：" line.
-    let turns: Vec<String> = rows
-        .into_iter()
-        .filter_map(|(role, content, channel)| {
-            let is_voice_assistant = role == "assistant" && channel.as_deref() == Some("voice");
-            let content = if is_voice_assistant {
-                strip_audio_tags(&content)
-            } else {
-                content
-            };
-            if content.trim().is_empty() {
-                return None;
-            }
-            let label = if role == "user" { "用户" } else { "AI" };
-            Some(format!("{label}：{content}"))
-        })
-        .collect();
-
-    // Everything stripped away (a call of nothing but audio tags) reduces to
-    // the empty-session case: stamp, no LLM call.
-    if turns.is_empty() {
-        mark_classified(&state.pool, session_id)
-            .await
-            .map_err(|e| format!("mark classified (empty transcript): {e}"))?;
-        return Ok(0);
-    }
-
-    // 2. Single LLM call, structured-JSON output. The instruction is the
-    // configured system prompt; the conversation is a separate user message.
-    let Some(resolved) = state.model_config.resolve_dreaming_scan() else {
-        // Production configs always set dreaming_scan.filter_prompt (enforced by
-        // the boot gate added in this change set — see main.rs). If somehow unset,
-        // skip WITHOUT stamping classified_at so it retries and stays visible.
-        return Err("dreaming_scan filter_prompt unset".to_string());
-    };
-    let req = ChatRequest {
-        model: resolved.model,
-        fallback_model: resolved.fallback_model,
-        messages: vec![
-            ChatMessage {
-                role: "system".into(),
-                content: resolved.extract_prompt,
-            },
-            ChatMessage {
-                role: "user".into(),
-                content: crate::prompt::memories_user_message(&turns),
-            },
-        ],
-        temperature: resolved.temperature as f32,
-        max_tokens: resolved.max_tokens,
-        sampling: resolved.sampling,
-        user: Some(SYSTEM_AUDIT_USER.into()),
-        task: Some(MEMORY_TASK.into()),
+/// One sweeper tick: embed the journal rows waiting for a vector, then claim
+/// the relationships gone idle with turns pending and scan each up to now.
+///
+/// The whole batch is claimed at once, so each claim is refreshed just before
+/// its scan; a relationship whose claim is gone (erased, or released) is
+/// skipped without a model call.
+pub(crate) async fn sweep_once(state: &AppState) -> SweepTally {
+    let mut tally = SweepTally {
+        embedded: embed_pending_journal(state).await,
         ..Default::default()
     };
-    let raw = state
-        .openrouter
-        .execute(req)
+    let repo = ScanStateRepo { pool: &state.pool };
+    let claimed = match repo
+        .claim_due(
+            state.config.dreaming_idle_threshold,
+            state.config.dreaming_claim_stale_threshold,
+            PICK_BATCH,
+        )
         .await
-        .map_err(|e| format!("dreaming_scan LLM call failed: {e}"))?;
-
-    super::record_generation(
-        &state.pool,
-        super::GenerationRecord {
-            task: MEMORY_TASK,
-            session_id: Some(session_id),
-            generation_id: raw.generation_id.as_deref(),
-            model: raw.model.as_deref(),
-            usage: raw.usage.as_ref(),
-        },
-    )
-    .await;
-
-    let candidates = parse_memory_candidates(&raw.reply);
-
-    // 3. Embed + insert each candidate as a profile-layer row.
-    // Profile layer is the right home for these — they're stable facts
-    // about the user that should be visible across persona instances.
-    let repo = MemoryRepo { pool: &state.pool };
-    let mut written = 0;
-    for cand in &candidates {
-        let trimmed = cand.content.trim();
-        if trimmed.is_empty() {
-            continue;
+    {
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::warn!("dreaming: claim failed: {e}");
+            return tally;
         }
-        let category = normalise_category(&cand.category);
-        let metadata = candidate_metadata(cand);
-        match state.embed.embed_document(trimmed).await {
-            Ok(embedding) => {
-                if let Err(e) = repo
-                    .upsert(
-                        MemoryLayer::Profile,
-                        session_id,
-                        user_id,
-                        instance_id,
-                        trimmed,
-                        &embedding,
-                        Some(&category),
-                        metadata.as_ref(),
-                    )
-                    .await
-                {
-                    tracing::warn!(%session_id, "dreaming: insert failed: {e}");
-                } else {
-                    written += 1;
-                }
+    };
+    for instance_id in claimed {
+        match repo.refresh_claim(instance_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                tally.skipped += 1;
+                continue;
             }
             Err(e) => {
-                tracing::warn!(%session_id, "dreaming: embed failed: {e}");
+                // The claim stays as it was and goes stale into a later tick.
+                tracing::warn!(%instance_id, "dreaming: refreshing the claim failed: {e}");
+                tally.skipped += 1;
+                continue;
             }
         }
-    }
-
-    // 4. Stamp on graceful completion. Even when `written == 0` we stamp,
-    // because either the session genuinely had nothing memorable or the
-    // model returned junk — both cases should not loop the sweeper.
-    mark_classified(&state.pool, session_id)
-        .await
-        .map_err(|e| format!("mark classified (post-success): {e}"))?;
-    Ok(written)
-}
-
-async fn mark_classified(pool: &sqlx::PgPool, session_id: Uuid) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE engine.chat_sessions SET classified_at = now() WHERE id = $1")
-        .bind(session_id)
-        .execute(pool)
-        .await?;
-    Ok(())
-}
-
-fn parse_memory_candidates(raw: &str) -> Vec<MemoryCandidate> {
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
-        return extract_memory_array(&v);
-    }
-    if let Some(block) = super::find_json_block(raw) {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(block) {
-            return extract_memory_array(&v);
+        match scan_instance(state, instance_id, Utc::now(), "scan").await {
+            ScanOutcome::Ok => tally.ok += 1,
+            ScanOutcome::Empty => tally.empty += 1,
+            ScanOutcome::Failed => tally.failed += 1,
         }
     }
-    vec![]
+    tally
+}
+
+/// Embed up to `EMBED_BATCH` journal rows still without a vector in one
+/// `embed_documents` call. Returns how many were stored; a failure is logged
+/// and the rows wait for the next tick.
+async fn embed_pending_journal(state: &AppState) -> usize {
+    let journal = JournalRepo { pool: &state.pool };
+    let pending = match journal.pending_embeddings(EMBED_BATCH).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!("dreaming: pending journal read failed: {e}");
+            return 0;
+        }
+    };
+    if pending.is_empty() {
+        return 0;
+    }
+    let texts: Vec<&str> = pending.iter().map(|(_, s)| s.as_str()).collect();
+    let vectors = match state.embed.embed_documents(&texts).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(rows = pending.len(), "dreaming: journal embed failed: {e}");
+            return 0;
+        }
+    };
+    let rows: Vec<(Uuid, Vec<f32>)> = pending.iter().map(|(id, _)| *id).zip(vectors).collect();
+    match journal.set_embeddings(&rows).await {
+        Ok(()) => rows.len(),
+        Err(e) => {
+            tracing::warn!(
+                rows = rows.len(),
+                "dreaming: journal vectors write failed: {e}"
+            );
+            0
+        }
+    }
 }
 
 fn extract_memory_array(v: &serde_json::Value) -> Vec<MemoryCandidate> {
@@ -439,110 +394,59 @@ fn collapse_spaces(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::routes::companion::testutil::seed_persona_instance;
+    use eros_engine_store::journal::JournalInsert;
+    use serde_json::json;
+    use sqlx::PgPool;
+    use std::time::Duration;
+    use wiremock::matchers::{method, path as wm_path};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
-    /// An archived session must never be claimed. The sweep writes its
-    /// extraction into companion_memories and human_insights, so a claimable
-    /// archived session would spend a model call regrowing exactly the rows
-    /// the archive endpoint just deleted.
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn sweeper_skips_archived_sessions(pool: sqlx::PgPool) {
-        let state = crate::routes::companion::test_state(pool.clone());
-        let user_id = Uuid::new_v4();
-        let instance_id = seed_persona_instance(&pool, user_id).await;
-
-        // Idle for two hours and never classified — eligible on every count
-        // except `archived`.
-        let session_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO engine.chat_sessions (user_id, instance_id, last_active_at, archived) \
-             VALUES ($1, $2, now() - interval '2 hours', true) RETURNING id",
-        )
-        .bind(user_id)
-        .bind(instance_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO engine.chat_messages (session_id, role, content) VALUES \
-             ($1,'user','我住在上海'), ($1,'assistant','上海不错')",
-        )
-        .bind(session_id)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let processed = scan_and_classify(
-            &state,
-            std::time::Duration::from_secs(1800),
-            std::time::Duration::from_secs(600),
-        )
-        .await
-        .expect("sweep ok");
-        assert_eq!(processed, 0, "archived session must not be swept");
-
-        let claimed_at: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
-            "SELECT classification_claimed_at FROM engine.chat_sessions WHERE id = $1",
-        )
-        .bind(session_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert!(claimed_at.is_none(), "archived session must not be claimed");
+    fn memories(raw: &str) -> Vec<MemoryCandidate> {
+        extract_memory_array(&serde_json::from_str(raw).unwrap())
     }
 
     #[test]
-    fn parse_memory_candidates_handles_clean_json() {
-        let raw = r#"{"memories":[{"content":"住在上海","category":"fact"},
-                                  {"content":"喜欢咖啡","category":"preference"}]}"#;
-        let cands = parse_memory_candidates(raw);
+    fn extract_memory_array_reads_clean_json() {
+        let cands = memories(
+            r#"{"memories":[{"content":"住在上海","category":"fact"},
+                            {"content":"喜欢咖啡","category":"preference"}]}"#,
+        );
         assert_eq!(cands.len(), 2);
         assert_eq!(cands[0].content, "住在上海");
         assert_eq!(cands[0].category, "fact");
         assert_eq!(cands[1].content, "喜欢咖啡");
         assert_eq!(cands[1].category, "preference");
+        assert!(memories(r#"{"facts":[]}"#).is_empty());
     }
 
     #[test]
-    fn parse_memory_candidates_handles_fenced_block() {
-        let raw = "Sure, here you go:\n```json\n\
-                   {\"memories\":[{\"content\":\"养了一只猫\",\"category\":\"fact\"}]}\n\
-                   ```";
-        let cands = parse_memory_candidates(raw);
-        assert_eq!(cands.len(), 1);
-        assert_eq!(cands[0].content, "养了一只猫");
-    }
-
-    #[test]
-    fn parse_memory_candidates_returns_empty_on_garbage() {
-        assert!(parse_memory_candidates("nope, no json").is_empty());
-        assert!(parse_memory_candidates(r#"{"facts":[]}"#).is_empty());
-    }
-
-    #[test]
-    fn parse_memory_candidates_skips_malformed_items() {
+    fn extract_memory_array_skips_malformed_items() {
         // Missing `category` on second item — should drop just that one.
-        let raw = r#"{"memories":[
-            {"content":"a","category":"fact"},
-            {"content":"b"},
-            {"content":"c","category":"event"}
-        ]}"#;
-        let cands = parse_memory_candidates(raw);
+        let cands = memories(
+            r#"{"memories":[
+                {"content":"a","category":"fact"},
+                {"content":"b"},
+                {"content":"c","category":"event"}
+            ]}"#,
+        );
         assert_eq!(cands.len(), 2);
         assert_eq!(cands[0].content, "a");
         assert_eq!(cands[1].content, "c");
     }
 
     #[test]
-    fn parse_memory_candidates_captures_extra_keys_as_metadata() {
-        let raw = r#"{"memories":[{
-            "content": "用户目前正在找工作",
-            "category": "fact",
-            "domain": "career",
-            "evidence_type": "explicit_statement",
-            "temporality": "current",
-            "persistence": "ongoing",
-            "confidence": "high"
-        }]}"#;
-        let cands = parse_memory_candidates(raw);
+    fn extract_memory_array_captures_extra_keys_as_metadata() {
+        let cands = memories(
+            r#"{"memories":[{
+                "content": "用户目前正在找工作",
+                "category": "fact",
+                "domain": "career",
+                "evidence_type": "explicit_statement",
+                "temporality": "current",
+                "persistence": "ongoing",
+                "confidence": "high"
+            }]}"#,
+        );
         assert_eq!(cands.len(), 1);
         assert_eq!(cands[0].content, "用户目前正在找工作");
         assert_eq!(cands[0].category, "fact");
@@ -556,8 +460,7 @@ mod tests {
 
     #[test]
     fn candidate_metadata_is_none_for_bare_candidates() {
-        let raw = r#"{"memories":[{"content":"养了一只猫","category":"fact"}]}"#;
-        let cands = parse_memory_candidates(raw);
+        let cands = memories(r#"{"memories":[{"content":"养了一只猫","category":"fact"}]}"#);
         assert_eq!(cands.len(), 1);
         assert!(
             candidate_metadata(&cands[0]).is_none(),
@@ -637,196 +540,93 @@ mod tests {
         assert_eq!(SYSTEM_AUDIT_USER, "11111111-1111-1111-1111-111111111111");
     }
 
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn classify_session_sends_configured_system_prompt(pool: sqlx::PgPool) {
-        use wiremock::matchers::{body_string_contains, method, path as wm_path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+    // ─── Relationship triggers and the sweeper ───────────────────────
 
-        let mock = MockServer::start().await;
-        // Empty memories → no embedding/voyage calls; we only assert the request
-        // carried the configured system prompt (routed by a unique sentinel).
-        let body = serde_json::json!({
-            "id": "gen-mem", "model": "mem/m",
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-            "choices": [{"message": {"content": "{\"memories\":[]}"}}],
-        });
-        Mock::given(method("POST"))
-            .and(wm_path("/api/v1/chat/completions"))
-            .and(body_string_contains("memory-sys-prompt-sentinel"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(body))
-            .expect(1)
-            .mount(&mock)
+    const SCAN_MODEL: &str = "scan/m";
+
+    fn at(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    /// 512-dim unit vector — matches the column dimension the migrations set.
+    fn unit_embedding() -> Vec<f32> {
+        let mut v = vec![0.0_f32; 512];
+        v[1] = 1.0;
+        v
+    }
+
+    /// One vector per input, whatever the batch size.
+    struct VectorPerInput;
+
+    impl Respond for VectorPerInput {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            let n = serde_json::from_slice::<serde_json::Value>(&req.body)
+                .ok()
+                .and_then(|v| v["input"].as_array().map(Vec::len))
+                .unwrap_or(1);
+            let data: Vec<_> = (0..n)
+                .map(|_| json!({ "embedding": unit_embedding() }))
+                .collect();
+            ResponseTemplate::new(200).set_body_json(json!({ "data": data }))
+        }
+    }
+
+    /// A state whose chat calls go to `llm` and whose embeddings go to the
+    /// returned mock. `[tasks.dreaming_scan]` is configured unless `scan` is
+    /// false.
+    async fn state_with(pool: PgPool, llm: &MockServer, scan: bool) -> (AppState, MockServer) {
+        let embed = MockServer::start().await;
+        Mock::given(wm_path("/v1/embeddings"))
+            .respond_with(VectorPerInput)
+            .mount(&embed)
             .await;
+        let embed_cfg = eros_engine_llm::model_config::ModelConfig::from_toml_str(&format!(
+            "[providers.mockembed]\nembeddings = \"{}/v1/embeddings\"\n\
+             [tasks.embedding]\nmodel = \"mock-embed@mockembed\"\n",
+            embed.uri()
+        ))
+        .unwrap();
+        let router =
+            eros_engine_llm::embedding::EmbeddingRouter::from_config_with(&embed_cfg, |k| {
+                (k == "MOCKEMBED_API_KEY").then(|| "test-key".to_string())
+            })
+            .unwrap();
 
-        let mut state = crate::routes::companion::test_state(pool.clone());
-        state.model_config = std::sync::Arc::new(
-            eros_engine_llm::model_config::ModelConfig::from_toml_str(
-                "[tasks.dreaming_scan]\nmodel=\"mem/m\"\nfilter_prompt=\"memory-sys-prompt-sentinel\"\n",
+        let mut state = crate::routes::companion::test_state(pool);
+        let toml = if scan {
+            format!(
+                "[tasks.dreaming_scan]\nmodel = \"{SCAN_MODEL}\"\nfilter_prompt = \"extract\"\n"
             )
-            .unwrap(),
-        );
-        state.openrouter = std::sync::Arc::new(
-            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
-                "k".into(),
-                format!("{}/api/v1/chat/completions", mock.uri()),
-            ),
-        );
-
-        let user_id = uuid::Uuid::new_v4();
-        let instance_id = seed_persona_instance(&pool, user_id).await;
-        let session_id: uuid::Uuid = sqlx::query_scalar(
-            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
-        )
-        .bind(user_id)
-        .bind(instance_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO engine.chat_messages (session_id, role, content) \
-             VALUES ($1, 'user', '我在深圳工作'), ($1, 'assistant', '嗯嗯')",
-        )
-        .bind(session_id)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let written = classify_session(&state, session_id, user_id, Some(instance_id))
-            .await
-            .expect("classify ok");
-        assert_eq!(written, 0, "empty memories → no rows");
-        // mock.expect(1) is verified on MockServer drop: the request carried the
-        // configured system prompt sentinel.
-
-        let model: Option<String> = sqlx::query_scalar(
-            "SELECT model FROM engine.llm_generations WHERE task = 'dreaming_scan'",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("the sweeper must record its generation");
-        assert!(model.is_some());
-    }
-
-    /// Spec 2026-08-09-voice-dreaming-ingestion §1: voice rows now reach the
-    /// extraction transcript. This test REPLACES the old
-    /// `classify_session_excludes_voice_rows` lock — the inversion is
-    /// spec-mandated, not a weakened assertion. The boundary that must not
-    /// move is pinned by `classify_session_excludes_product_qa_rows` below.
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn classify_session_includes_voice_rows(pool: sqlx::PgPool) {
-        let (mock, state, session_id, user_id, instance_id) = seed_channel_case(&pool).await;
-
-        let _ = classify_session(&state, session_id, user_id, Some(instance_id)).await;
-
-        let joined = joined_request_bodies(&mock).await;
-        assert!(joined.contains("TEXTLINE"), "text turn must be extracted");
-        assert!(
-            joined.contains("VOICELINE"),
-            "voice turn must now be extracted (spec §1 flip)"
-        );
-    }
-
-    /// The boundary that must NOT move: `product_qa` is an out-of-character
-    /// product aside, never companion memory.
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn classify_session_excludes_product_qa_rows(pool: sqlx::PgPool) {
-        let (mock, state, session_id, user_id, instance_id) = seed_channel_case(&pool).await;
-
-        let _ = classify_session(&state, session_id, user_id, Some(instance_id)).await;
-
-        let joined = joined_request_bodies(&mock).await;
-        assert!(joined.contains("TEXTLINE"), "text turn must be extracted");
-        assert!(
-            !joined.contains("QALINE"),
-            "product_qa turn must stay excluded from memory extraction"
-        );
-    }
-
-    /// `DREAMING_VOICE_DISABLED=1` restores the pre-flip filter.
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn classify_session_excludes_voice_rows_when_flag_set(pool: sqlx::PgPool) {
-        let (mock, mut state, session_id, user_id, instance_id) = seed_channel_case(&pool).await;
-        state.config.dreaming_voice_disabled = true;
-
-        let _ = classify_session(&state, session_id, user_id, Some(instance_id)).await;
-
-        let joined = joined_request_bodies(&mock).await;
-        assert!(
-            joined.contains("TEXTLINE"),
-            "text turn must still be extracted"
-        );
-        assert!(
-            !joined.contains("VOICELINE"),
-            "flag on ⇒ voice turn excluded again"
-        );
-    }
-
-    /// Seed one session carrying a text turn, a voice turn, and a product_qa
-    /// turn, plus a state whose OpenRouter points at a mock returning an empty
-    /// memory list (so no embedding call is ever made).
-    async fn seed_channel_case(
-        pool: &sqlx::PgPool,
-    ) -> (
-        wiremock::MockServer,
-        crate::state::AppState,
-        Uuid,
-        Uuid,
-        Uuid,
-    ) {
-        use wiremock::matchers::path as wm_path;
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let mock = MockServer::start().await;
-        Mock::given(wm_path("/api/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "choices": [{ "message": { "content": "{\"memories\":[]}" } }],
-                "id": "gen-x", "model": "primary"
-            })))
-            .mount(&mock)
-            .await;
-
-        let user_id = Uuid::new_v4();
-        let instance_id = seed_persona_instance(pool, user_id).await;
-        let session_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1,$2) RETURNING id",
-        )
-        .bind(user_id)
-        .bind(instance_id)
-        .fetch_one(pool)
-        .await
-        .unwrap();
-
-        sqlx::query(
-            "INSERT INTO engine.chat_messages (session_id, role, content, channel) VALUES \
-             ($1,'user','TEXTLINE',NULL), \
-             ($1,'assistant','VOICELINE','voice'), \
-             ($1,'assistant','QALINE','product_qa')",
-        )
-        .bind(session_id)
-        .execute(pool)
-        .await
-        .unwrap();
-
-        let mut state = crate::routes::companion::test_state(pool.clone());
+        } else {
+            String::new()
+        };
         state.model_config = std::sync::Arc::new(
-            eros_engine_llm::model_config::ModelConfig::from_toml_str(
-                "[tasks.dreaming_scan]\nmodel = \"primary\"\nfilter_prompt = \"extract\"\n",
-            )
-            .unwrap(),
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(&toml).unwrap(),
         );
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "test-key".into(),
-                format!("{}/api/v1/chat/completions", mock.uri()),
+                format!("{}/api/v1/chat/completions", llm.uri()),
             ),
         );
-
-        (mock, state, session_id, user_id, instance_id)
+        state.embed = std::sync::Arc::new(router);
+        (state, embed)
     }
 
-    /// Every request body the mock saw, concatenated — enough to assert which
-    /// sentinel lines made it into the extraction prompt.
-    async fn joined_request_bodies(mock: &wiremock::MockServer) -> String {
+    /// Every chat call on `llm` answers `reply`.
+    async fn answer(llm: &MockServer, reply: &str) {
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "gen-scan", "model": SCAN_MODEL,
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "choices": [{ "message": { "content": reply } }],
+            })))
+            .mount(llm)
+            .await;
+    }
+
+    async fn request_bodies(mock: &MockServer) -> Vec<String> {
         mock.received_requests()
             .await
             .expect("recording enabled by default")
@@ -835,287 +635,461 @@ mod tests {
             .collect()
     }
 
-    /// Spec §4: bracketed TTS cues on voice assistant rows never reach the
-    /// extraction prompt; user rows and non-voice rows are untouched.
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn classify_session_strips_audio_tags_from_voice_assistant_rows(pool: sqlx::PgPool) {
-        use wiremock::matchers::path as wm_path;
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let mock = MockServer::start().await;
-        Mock::given(wm_path("/api/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "choices": [{ "message": { "content": "{\"memories\":[]}" } }],
-                "id": "gen-x", "model": "primary"
-            })))
-            .mount(&mock)
-            .await;
-
-        let user_id = Uuid::new_v4();
-        let instance_id = seed_persona_instance(&pool, user_id).await;
-        let session_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1,$2) RETURNING id",
+    async fn new_session(pool: &PgPool, owner: Uuid, instance: Uuid, channel: &str) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id, channel) \
+             VALUES ($1, $2, $3) RETURNING id",
         )
-        .bind(user_id)
-        .bind(instance_id)
-        .fetch_one(&pool)
+        .bind(owner)
+        .bind(instance)
+        .bind(channel)
+        .fetch_one(pool)
         .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO engine.chat_messages (session_id, role, content, channel) VALUES \
-             ($1,'user','我 [laughs] 住在上海','voice'), \
-             ($1,'assistant','[giggles] 上海真好 [sighs] 我也想去','voice'), \
-             ($1,'assistant','[chuckles] 文字轮次',NULL)",
-        )
-        .bind(session_id)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let mut state = crate::routes::companion::test_state(pool.clone());
-        state.model_config = std::sync::Arc::new(
-            eros_engine_llm::model_config::ModelConfig::from_toml_str(
-                "[tasks.dreaming_scan]\nmodel = \"primary\"\nfilter_prompt = \"extract\"\n",
-            )
-            .unwrap(),
-        );
-        state.openrouter = std::sync::Arc::new(
-            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
-                "test-key".into(),
-                format!("{}/api/v1/chat/completions", mock.uri()),
-            ),
-        );
-
-        let _ = classify_session(&state, session_id, user_id, Some(instance_id)).await;
-
-        let joined = joined_request_bodies(&mock).await;
-        assert!(
-            joined.contains("上海真好 我也想去"),
-            "voice assistant row must arrive tag-free and space-collapsed; got {joined}"
-        );
-        assert!(
-            !joined.contains("giggles"),
-            "no audio tag may survive on the voice assistant row"
-        );
-        assert!(
-            joined.contains("我 [laughs] 住在上海"),
-            "user rows are never stripped"
-        );
-        assert!(
-            joined.contains("[chuckles] 文字轮次"),
-            "non-voice assistant rows are never stripped"
-        );
+        .unwrap()
     }
 
-    /// A call whose every turn is tag-only leaves nothing to extract: stamp,
-    /// no LLM call — the same path a genuinely empty session takes.
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn classify_session_stamps_without_llm_when_all_turns_strip_empty(pool: sqlx::PgPool) {
-        use wiremock::matchers::path as wm_path;
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let mock = MockServer::start().await;
-        Mock::given(wm_path("/api/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "choices": [{ "message": { "content": "{\"memories\":[]}" } }],
-                "id": "gen-x", "model": "primary"
-            })))
-            .mount(&mock)
-            .await;
-
-        let user_id = Uuid::new_v4();
-        let instance_id = seed_persona_instance(&pool, user_id).await;
-        let session_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1,$2) RETURNING id",
+    async fn insert_row(
+        pool: &PgPool,
+        session: Uuid,
+        role: &str,
+        content: &str,
+        channel: Option<&str>,
+        sent_at: &str,
+    ) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, channel, sent_at) \
+             VALUES ($1, $2, $3, $4, $5) RETURNING id",
         )
-        .bind(user_id)
-        .bind(instance_id)
-        .fetch_one(&pool)
+        .bind(session)
+        .bind(role)
+        .bind(content)
+        .bind(channel)
+        .bind(at(sent_at))
+        .fetch_one(pool)
         .await
-        .unwrap();
+        .unwrap()
+    }
+
+    async fn idle_for_two_hours(pool: &PgPool, instance: Uuid) {
         sqlx::query(
-            "INSERT INTO engine.chat_messages (session_id, role, content, channel) VALUES \
-             ($1,'assistant','[laughs]','voice'), ($1,'assistant','[sighs] [giggles]','voice')",
+            "UPDATE engine.relationship_scan_state \
+             SET last_turn_at = now() - interval '2 hours' WHERE instance_id = $1",
         )
-        .bind(session_id)
-        .execute(&pool)
+        .bind(instance)
+        .execute(pool)
         .await
         .unwrap();
+    }
 
-        let mut state = crate::routes::companion::test_state(pool.clone());
-        state.model_config = std::sync::Arc::new(
-            eros_engine_llm::model_config::ModelConfig::from_toml_str(
-                "[tasks.dreaming_scan]\nmodel = \"primary\"\nfilter_prompt = \"extract\"\n",
+    /// One relationship's voice call: three user turns, each answered, every
+    /// turn counted through the voice path's bump.
+    async fn voice_call(pool: &PgPool, state: &AppState) -> (Uuid, Uuid, Uuid) {
+        let owner = Uuid::new_v4();
+        let instance = seed_persona_instance(pool, owner).await;
+        let session = new_session(pool, owner, instance, "voice").await;
+        for (user_at, reply_at) in [
+            ("2026-10-01T10:00:00Z", "2026-10-01T10:00:05Z"),
+            ("2026-10-01T10:01:00Z", "2026-10-01T10:01:05Z"),
+            ("2026-10-01T10:02:00Z", "2026-10-01T10:02:05Z"),
+        ] {
+            let id = insert_row(pool, session, "user", "我住在上海", Some("voice"), user_at).await;
+            insert_row(
+                pool,
+                session,
+                "assistant",
+                "[giggles] 上海不错",
+                Some("voice"),
+                reply_at,
             )
-            .unwrap(),
-        );
-        state.openrouter = std::sync::Arc::new(
-            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
-                "test-key".into(),
-                format!("{}/api/v1/chat/completions", mock.uri()),
-            ),
-        );
-
-        let written = classify_session(&state, session_id, user_id, Some(instance_id))
-            .await
-            .expect("classify ok");
-        assert_eq!(written, 0);
-        assert!(
-            joined_request_bodies(&mock).await.is_empty(),
-            "nothing left to extract ⇒ no LLM call"
-        );
-        let stamped: Option<chrono::DateTime<Utc>> =
-            sqlx::query_scalar("SELECT classified_at FROM engine.chat_sessions WHERE id = $1")
-                .bind(session_id)
-                .fetch_one(&pool)
+            .await;
+            bump_relationship(state, instance, id, None)
                 .await
-                .unwrap();
-        assert!(stamped.is_some(), "session must still be stamped");
+                .expect("the voice turn is counted");
+        }
+        (owner, instance, session)
     }
 
-    /// 512-dim unit vector — matches the column dimension the migrations set.
-    fn unit_embedding(seed: usize) -> Vec<f32> {
-        let mut v = vec![0.0_f32; 512];
-        v[seed % 512] = 1.0;
-        v
-    }
-
-    /// An `EmbeddingRouter` whose backend is a wiremock server, built through
-    /// the production `from_config_with` path (custom provider + its
-    /// `<NAME>_API_KEY`). Mirrors the helper in `pipeline::voice`'s tests.
-    async fn embed_router_mock() -> (
-        wiremock::MockServer,
-        eros_engine_llm::embedding::EmbeddingRouter,
-    ) {
-        use wiremock::matchers::path as wm_path;
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let server = MockServer::start().await;
-        Mock::given(wm_path("/v1/embeddings"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({ "data": [ { "embedding": unit_embedding(1) } ] }),
-            ))
-            .mount(&server)
-            .await;
-        let cfg = eros_engine_llm::model_config::ModelConfig::from_toml_str(&format!(
-            "[providers.mockembed]\nembeddings = \"{}/v1/embeddings\"\n\
-             [tasks.embedding]\nmodel = \"mock-embed@mockembed\"\n",
-            server.uri()
-        ))
-        .expect("embedding provider config parses");
-        let router = eros_engine_llm::embedding::EmbeddingRouter::from_config_with(&cfg, |k| {
-            (k == "MOCKEMBED_API_KEY").then(|| "test-key".to_string())
-        })
-        .expect("mock embedding router builds");
-        (server, router)
-    }
-
-    /// Full path: an ended (idle) voice call becomes categorized profile-layer
-    /// memories and is stamped; a call that is still warm is not swept.
+    /// A turn whose session was archived before its count ran stays
+    /// uncounted: the archive cleared the relationship's scan state and
+    /// journal, and the count must not grow them back.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn sweeper_ingests_idle_voice_session_and_skips_active_one(pool: sqlx::PgPool) {
-        use wiremock::matchers::path as wm_path;
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
+    async fn bump_skips_a_turn_whose_session_was_archived(pool: PgPool) {
         let llm = MockServer::start().await;
-        Mock::given(wm_path("/api/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "choices": [{ "message": { "content":
-                    "{\"memories\":[{\"content\":\"用户住在上海\",\"category\":\"fact\"}]}" } }],
-                "id": "gen-e2e", "model": "primary"
-            })))
-            .mount(&llm)
-            .await;
-        let (_embed_server, embed) = embed_router_mock().await;
-
-        let mut state = crate::routes::companion::test_state(pool.clone());
-        state.model_config = std::sync::Arc::new(
-            eros_engine_llm::model_config::ModelConfig::from_toml_str(
-                "[tasks.dreaming_scan]\nmodel = \"primary\"\nfilter_prompt = \"extract\"\n",
-            )
-            .unwrap(),
-        );
-        state.openrouter = std::sync::Arc::new(
-            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
-                "test-key".into(),
-                format!("{}/api/v1/chat/completions", llm.uri()),
-            ),
-        );
-        state.embed = std::sync::Arc::new(embed);
-
-        let user_id = Uuid::new_v4();
-        let instance_id = seed_persona_instance(&pool, user_id).await;
-
-        // Ended call: last_active_at two hours ago.
-        let ended: Uuid = sqlx::query_scalar(
-            "INSERT INTO engine.chat_sessions (user_id, instance_id, channel, last_active_at) \
-             VALUES ($1,$2,'voice', now() - interval '2 hours') RETURNING id",
-        )
-        .bind(user_id)
-        .bind(instance_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        // Live call: active right now.
-        let live: Uuid = sqlx::query_scalar(
-            "INSERT INTO engine.chat_sessions (user_id, instance_id, channel, last_active_at) \
-             VALUES ($1,$2,'voice', now()) RETURNING id",
-        )
-        .bind(user_id)
-        .bind(instance_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        for sid in [ended, live] {
-            sqlx::query(
-                "INSERT INTO engine.chat_messages (session_id, role, content, channel) VALUES \
-                 ($1,'user','我住在上海','voice'), ($1,'assistant','[giggles] 上海不错','voice')",
-            )
-            .bind(sid)
+        let (state, _embed) = state_with(pool.clone(), &llm, true).await;
+        let owner = Uuid::new_v4();
+        let instance = seed_persona_instance(&pool, owner).await;
+        let session = new_session(&pool, owner, instance, "text").await;
+        let user = insert_row(&pool, session, "user", "嗨", None, "2026-10-01T10:00:00Z").await;
+        sqlx::query("UPDATE engine.chat_sessions SET archived = true WHERE id = $1")
+            .bind(session)
             .execute(&pool)
             .await
             .unwrap();
-        }
 
-        let processed = scan_and_classify(
-            &state,
-            std::time::Duration::from_secs(1800),
-            std::time::Duration::from_secs(600),
+        assert_eq!(bump_relationship(&state, instance, user, None).await, None);
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT (SELECT count(*) FROM engine.relationship_scan_state) \
+                  + (SELECT count(*) FROM engine.relationship_journal)",
         )
+        .fetch_one(&pool)
         .await
-        .expect("sweep ok");
-        assert_eq!(processed, 1, "only the ended call is eligible");
+        .unwrap();
+        assert_eq!(rows, 0);
+    }
 
-        // Profile layer == `instance_id IS NULL` (there is no `layer` column;
-        // see `MemoryRepo::upsert`, which forces instance_id to NULL for
-        // MemoryLayer::Profile).
+    /// Full path: a voice call that went quiet becomes profile-layer memories
+    /// and an episode; a relationship still talking is not swept.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn sweeper_ingests_idle_voice_session_and_skips_active_one(pool: PgPool) {
+        let llm = MockServer::start().await;
+        answer(
+            &llm,
+            r#"{"memories":[{"content":"用户住在上海","category":"fact"}],
+                "episode":"用户在通话里说起自己住在上海。"}"#,
+        )
+        .await;
+        let (state, _embed) = state_with(pool.clone(), &llm, true).await;
+        let (owner, ended, ended_session) = voice_call(&pool, &state).await;
+        let (_, live, _) = voice_call(&pool, &state).await;
+        idle_for_two_hours(&pool, ended).await;
+
+        let tally = sweep_once(&state).await;
+        assert_eq!(
+            tally,
+            SweepTally {
+                embedded: 2,
+                ok: 1,
+                ..Default::default()
+            },
+            "both first meetings embedded; only the ended call is due"
+        );
+        assert_eq!(request_bodies(&llm).await.len(), 1);
+
+        // Profile layer == `instance_id IS NULL`.
         let rows: Vec<(String, Option<String>, Uuid, Option<Uuid>)> = sqlx::query_as(
             "SELECT content, category, session_id, instance_id \
              FROM engine.companion_memories WHERE user_id = $1",
         )
-        .bind(user_id)
+        .bind(owner)
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(rows.len(), 1, "one extracted candidate ⇒ one memory row");
-        assert_eq!(rows[0].0, "用户住在上海");
-        assert_eq!(rows[0].1.as_deref(), Some("fact"));
-        assert_eq!(rows[0].2, ended, "memory is attributed to the ended call");
-        assert!(rows[0].3.is_none(), "profile layer ⇒ instance_id NULL");
+        assert_eq!(
+            rows,
+            vec![(
+                "用户住在上海".to_string(),
+                Some("fact".to_string()),
+                ended_session,
+                None
+            )],
+            "one extracted candidate ⇒ one profile row on the call's session"
+        );
+        let episodes: Vec<Uuid> =
+            sqlx::query_scalar("SELECT instance_id FROM engine.relationship_episodes")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(episodes, vec![ended]);
 
-        let ended_stamp: Option<chrono::DateTime<Utc>> =
-            sqlx::query_scalar("SELECT classified_at FROM engine.chat_sessions WHERE id = $1")
-                .bind(ended)
-                .fetch_one(&pool)
+        let scan = ScanStateRepo { pool: &pool };
+        let s = scan.load(ended).await.unwrap().unwrap();
+        assert_eq!((s.pending_turns, s.claimed_at), (0, None));
+        assert_eq!(s.scanned_through_at, at("2026-10-01T10:02:05Z"));
+        let s = scan.load(live).await.unwrap().unwrap();
+        assert_eq!(
+            (s.pending_turns, s.claimed_at, s.last_scanned_at),
+            (3, None, None),
+            "a live call must not be swept mid-call"
+        );
+    }
+
+    /// One relationship holding a text session (a user turn and a product
+    /// Q&A aside) and a voice session (a tagged user turn and a tagged
+    /// reply), counted once and claimed.
+    async fn channel_case(pool: &PgPool) -> Uuid {
+        let owner = Uuid::new_v4();
+        let instance = seed_persona_instance(pool, owner).await;
+        let text = new_session(pool, owner, instance, "text").await;
+        let voice = new_session(pool, owner, instance, "voice").await;
+        let first = "2026-10-01T10:00:00Z";
+        insert_row(pool, text, "user", "TEXTLINE", None, first).await;
+        insert_row(
+            pool,
+            text,
+            "assistant",
+            "QALINE",
+            Some("product_qa"),
+            "2026-10-01T10:01:00Z",
+        )
+        .await;
+        insert_row(
+            pool,
+            voice,
+            "user",
+            "我 [laughs] VOICELINE",
+            Some("voice"),
+            "2026-10-01T11:00:00Z",
+        )
+        .await;
+        insert_row(
+            pool,
+            voice,
+            "assistant",
+            "[giggles] VOICEREPLY",
+            Some("voice"),
+            "2026-10-01T11:00:05Z",
+        )
+        .await;
+        let scan = ScanStateRepo { pool };
+        scan.bump(instance, at(first), None).await.unwrap();
+        assert!(scan
+            .claim(instance, Duration::from_secs(600))
+            .await
+            .unwrap());
+        instance
+    }
+
+    /// Voice rows reach the scan transcript unless `DREAMING_VOICE_DISABLED`;
+    /// product Q&A never does. Voice assistant rows lose their TTS tags, user
+    /// rows are never stripped.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn segment_includes_voice_rows_unless_disabled(pool: PgPool) {
+        for voice_disabled in [false, true] {
+            let llm = MockServer::start().await;
+            answer(&llm, r#"{"memories":[]}"#).await;
+            let (mut state, _embed) = state_with(pool.clone(), &llm, true).await;
+            state.config.dreaming_voice_disabled = voice_disabled;
+            let instance = channel_case(&pool).await;
+
+            scan_instance(&state, instance, at("2026-10-02T00:00:00Z"), "scan").await;
+
+            let bodies = request_bodies(&llm).await;
+            assert_eq!(bodies.len(), 1);
+            let body = &bodies[0];
+            assert!(body.contains("TEXTLINE"), "text turn is read");
+            assert!(!body.contains("QALINE"), "product_qa stays out");
+            if voice_disabled {
+                assert!(
+                    !body.contains("VOICELINE") && !body.contains("VOICEREPLY"),
+                    "flag on ⇒ voice rows stay out: {body}"
+                );
+            } else {
+                assert!(
+                    body.contains("我 [laughs] VOICELINE"),
+                    "voice user row read verbatim: {body}"
+                );
+                assert!(
+                    body.contains("AI：VOICEREPLY") && !body.contains("giggles"),
+                    "voice reply read without its audio tag: {body}"
+                );
+            }
+        }
+    }
+
+    /// A stretch of nothing but audio tags leaves nothing to read: the cursor
+    /// moves past it without a model call.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn tag_only_segment_advances_without_a_call(pool: PgPool) {
+        let llm = MockServer::start().await;
+        answer(&llm, r#"{"memories":[]}"#).await;
+        let (state, _embed) = state_with(pool.clone(), &llm, true).await;
+        let owner = Uuid::new_v4();
+        let instance = seed_persona_instance(&pool, owner).await;
+        let voice = new_session(&pool, owner, instance, "voice").await;
+        let (first, last) = ("2026-10-01T10:00:00Z", "2026-10-01T10:00:05Z");
+        insert_row(&pool, voice, "assistant", "[laughs]", Some("voice"), first).await;
+        insert_row(
+            &pool,
+            voice,
+            "assistant",
+            "[sighs] [giggles]",
+            Some("voice"),
+            last,
+        )
+        .await;
+        let scan = ScanStateRepo { pool: &pool };
+        scan.bump(instance, at(first), None).await.unwrap();
+        assert!(scan
+            .claim(instance, Duration::from_secs(600))
+            .await
+            .unwrap());
+
+        let outcome = scan_instance(&state, instance, at("2026-10-02T00:00:00Z"), "scan").await;
+        assert_eq!(outcome, ScanOutcome::Empty);
+        assert!(request_bodies(&llm).await.is_empty(), "no call to spend");
+        let s = scan.load(instance).await.unwrap().unwrap();
+        assert_eq!((s.scanned_through_at, s.claimed_at), (at(last), None));
+    }
+
+    /// Rows of an archived session and of a group chat never reach a scan,
+    /// even when they sit inside the relationship's unread stretch.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn sweeper_never_scans_archived_or_group_rows(pool: PgPool) {
+        let llm = MockServer::start().await;
+        answer(&llm, r#"{"memories":[]}"#).await;
+        let (state, _embed) = state_with(pool.clone(), &llm, true).await;
+        let owner = Uuid::new_v4();
+        let instance = seed_persona_instance(&pool, owner).await;
+        let live = new_session(&pool, owner, instance, "text").await;
+        let archived = new_session(&pool, owner, instance, "text").await;
+        sqlx::query("UPDATE engine.chat_sessions SET archived = true WHERE id = $1")
+            .bind(archived)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let group: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, channel) VALUES ($1, 'group') RETURNING id",
+        )
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.chat_session_members (group_session_id, member_session_id) \
+             VALUES ($1, $2)",
+        )
+        .bind(group)
+        .bind(live)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut user_rows = Vec::new();
+        for (minute, session, content) in [
+            (0, live, "TEXTLINE"),
+            (1, archived, "ARCHIVEDLINE"),
+            (2, group, "GROUPLINE"),
+            (3, live, "TEXTLINE"),
+            (4, live, "TEXTLINE"),
+        ] {
+            let id = insert_row(
+                &pool,
+                session,
+                "user",
+                content,
+                None,
+                &format!("2026-10-01T10:0{minute}:00Z"),
+            )
+            .await;
+            if session == live {
+                user_rows.push(id);
+            }
+        }
+        for id in user_rows {
+            bump_relationship(&state, instance, id, None).await.unwrap();
+        }
+        idle_for_two_hours(&pool, instance).await;
+
+        let tally = sweep_once(&state).await;
+        assert_eq!((tally.ok, tally.empty, tally.failed), (0, 1, 0));
+        let bodies = request_bodies(&llm).await;
+        assert_eq!(bodies.len(), 1);
+        assert!(bodies[0].contains("TEXTLINE"));
+        assert!(
+            !bodies[0].contains("ARCHIVEDLINE") && !bodies[0].contains("GROUPLINE"),
+            "{}",
+            bodies[0]
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn sweeper_embeds_pending_journal_rows(pool: PgPool) {
+        let llm = MockServer::start().await;
+        let (state, embed) = state_with(pool.clone(), &llm, true).await;
+        let journal = JournalRepo { pool: &pool };
+        for _ in 0..2 {
+            let instance = seed_persona_instance(&pool, Uuid::new_v4()).await;
+            let on = chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+            journal
+                .insert(&first_meet(instance, on))
                 .await
+                .unwrap()
                 .unwrap();
-        assert!(ended_stamp.is_some(), "ended call stamped");
-        let live_stamp: Option<chrono::DateTime<Utc>> =
-            sqlx::query_scalar("SELECT classified_at FROM engine.chat_sessions WHERE id = $1")
-                .bind(live)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert!(live_stamp.is_none(), "live call must not be swept mid-call");
+            let embedded = JournalInsert {
+                embedding: Some(unit_embedding()),
+                dedup_key: None,
+                ..first_meet(instance, on)
+            };
+            journal.insert(&embedded).await.unwrap().unwrap();
+        }
+
+        let tally = sweep_once(&state).await;
+        assert_eq!(
+            tally,
+            SweepTally {
+                embedded: 2,
+                ..Default::default()
+            }
+        );
+        let calls = request_bodies(&embed).await;
+        assert_eq!(calls.len(), 1, "one batch call for every pending row");
+        let inputs = serde_json::from_str::<serde_json::Value>(&calls[0]).unwrap()["input"]
+            .as_array()
+            .map(Vec::len);
+        assert_eq!(
+            inputs,
+            Some(2),
+            "rows that carry a vector are not re-embedded"
+        );
+        let still_pending: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.relationship_journal WHERE embedding IS NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(still_pending, 0);
+        assert!(journal.pending_embeddings(10).await.unwrap().is_empty());
+        assert!(request_bodies(&llm).await.is_empty(), "nothing was due");
+
+        assert_eq!(sweep_once(&state).await, SweepTally::default());
+        assert_eq!(
+            request_bodies(&embed).await.len(),
+            1,
+            "nothing left to embed"
+        );
+    }
+
+    /// Without `[tasks.dreaming_scan]` the sweeper returns at once: nothing is
+    /// claimed, embedded or called.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn sweeper_inert_without_dreaming_scan_task(pool: PgPool) {
+        let llm = MockServer::start().await;
+        answer(&llm, r#"{"memories":[]}"#).await;
+        let (mut state, embed) = state_with(pool.clone(), &llm, false).await;
+        state.config.dreaming_tick = Duration::from_millis(10);
+        let owner = Uuid::new_v4();
+        let instance = seed_persona_instance(&pool, owner).await;
+        let session = new_session(&pool, owner, instance, "text").await;
+        for minute in 0..3 {
+            let id = insert_row(
+                &pool,
+                session,
+                "user",
+                "TEXTLINE",
+                None,
+                &format!("2026-10-01T10:0{minute}:00Z"),
+            )
+            .await;
+            bump_relationship(&state, instance, id, None).await.unwrap();
+        }
+        idle_for_two_hours(&pool, instance).await;
+
+        tokio::time::timeout(Duration::from_secs(5), sweeper(state))
+            .await
+            .expect("an unconfigured sweeper returns instead of looping");
+
+        let s = ScanStateRepo { pool: &pool }
+            .load(instance)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((s.pending_turns, s.claimed_at), (3, None));
+        let pending = JournalRepo { pool: &pool }
+            .pending_embeddings(10)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1, "the first meeting stays unembedded");
+        assert!(request_bodies(&llm).await.is_empty());
+        assert!(request_bodies(&embed).await.is_empty());
     }
 }

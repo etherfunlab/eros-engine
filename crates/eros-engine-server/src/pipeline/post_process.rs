@@ -86,7 +86,8 @@ async fn session_still_live(state: &AppState, session_id: Uuid) -> bool {
 /// Spawned by `pipeline::run`. Owned `state` so the future is `'static`.
 /// `persona` is the persona the turn ran with. Nothing here reloads the
 /// persona by instance id: a BYOC instance's character lives only in the
-/// request's card.
+/// request's card. `user_locale` is the turn's: its timezone dates the
+/// journal rows the turn writes and is kept for the relationship's scans.
 #[allow(clippy::too_many_arguments)] // each arg is a distinct per-turn concern
 pub async fn run(
     state: AppState,
@@ -97,6 +98,7 @@ pub async fn run(
     event: Event,
     plan: ActionPlan,
     produced: Vec<ProducedMessage>,
+    user_locale: crate::holiday::UserLocale,
 ) {
     // The archive endpoint can land between the turn and this detached task —
     // the entry check documented on `session_still_live`.
@@ -188,6 +190,7 @@ pub async fn run(
             client_id.as_deref(),
             action_turn,
             tier_drop,
+            user_locale.timezone,
         )
         .await;
     };
@@ -235,6 +238,20 @@ pub async fn run(
         fut_character_insight,
         fut_user_insight
     );
+
+    // A user turn counts toward the relationship's scan, which may run here
+    // once enough turns wait; this task is already off the reply path.
+    if let Some(user_message_id) = user_message_id {
+        let produced_ids: Vec<Uuid> = produced.iter().map(|m| m.message_id).collect();
+        super::dreaming::count_text_turn(
+            &state,
+            instance_id,
+            user_message_id,
+            &produced_ids,
+            user_locale.timezone,
+        )
+        .await;
+    }
 }
 
 // ─── Affinity persistence ──────────────────────────────────────────
@@ -244,7 +261,8 @@ pub async fn run(
 /// rewrite. Shared by the chat pipeline's `run` above and the image-edit
 /// endpoint's opt-in `evaluate_affinity`; the caller owns building
 /// `eval_text` (see `affinity_eval_text`), choosing the scope, and passing the
-/// persona (a blank name skips the eval). After the persist, a judged turn may
+/// persona (a blank name skips the eval) and the user's timezone, which dates
+/// the tier rows the persist journals. After the persist, a judged turn may
 /// make her ask for space (`life_choice::maybe_ask_for_space`).
 #[allow(clippy::too_many_arguments)] // each arg is a distinct per-turn concern
 pub(crate) async fn run_affinity_turn(
@@ -262,6 +280,7 @@ pub(crate) async fn run_affinity_turn(
     client_id: Option<&str>,
     action_turn: bool,
     tier_drop: Option<eros_engine_core::affinity::AffinityLine>,
+    journal_tz: Option<chrono_tz::Tz>,
 ) {
     // Semantic eval gate: Reply turns only, with a non-trivial user message
     // and a non-empty produced assistant message (or image_caption proxy for
@@ -345,6 +364,7 @@ pub(crate) async fn run_affinity_turn(
         &eval_failures,
         user_message_id,
         tier_drop,
+        journal_tz,
     )
     .await;
 
@@ -377,7 +397,8 @@ pub(crate) async fn run_affinity_turn(
 /// responsibility because the streak reset is a pipeline-policy concern,
 /// not a row-update concern.
 ///
-/// `true` when the turn's event row committed.
+/// `true` when the turn's event row committed. `journal_tz` dates the tier
+/// rows the write journals (UTC when `None`).
 #[allow(clippy::too_many_arguments)] // each arg is a distinct affinity-persist concern
 async fn persist_affinity(
     state: &AppState,
@@ -393,6 +414,7 @@ async fn persist_affinity(
     eval_failures: &[eros_engine_llm::failure::AttemptFailure],
     user_message_id: Option<Uuid>,
     tier_drop: Option<eros_engine_core::affinity::AffinityLine>,
+    journal_tz: Option<chrono_tz::Tz>,
 ) -> bool {
     let repo = AffinityRepo { pool: &state.pool };
 
@@ -476,7 +498,7 @@ async fn persist_affinity(
                     user_message_id,
                     tier_drop,
                     growth_scale,
-                    None,
+                    journal_tz,
                 )
                 .await
             {
@@ -3739,6 +3761,7 @@ mod tests {
             event,
             plan,
             produced,
+            Default::default(),
         )
         .await;
 
@@ -3895,6 +3918,7 @@ mod tests {
             event,
             plan,
             produced,
+            Default::default(),
         )
         .await;
 
@@ -4030,6 +4054,7 @@ mod tests {
             event,
             plan,
             produced,
+            Default::default(),
         )
         .await;
 
@@ -4114,6 +4139,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         )
         .await;
 
@@ -4180,6 +4206,7 @@ mod tests {
                 patience: Some(3),
             },
             &[],
+            None,
             None,
             None,
         )
@@ -4699,6 +4726,7 @@ mod tests {
             event,
             plan,
             produced,
+            Default::default(),
         )
         .await;
 
@@ -4788,6 +4816,7 @@ mod tests {
             None,
             eros_engine_core::affinity::EndpointLevelReads::default(),
             &[],
+            None,
             None,
             None,
         )
@@ -5154,5 +5183,357 @@ mod tests {
             profiles, 0,
             "extract_character_insights' own recheck must stop apply_extraction from writing the profile"
         );
+    }
+
+    // ─── The relationship scan's trigger ────────────────────────────
+
+    fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
+        s.parse().unwrap()
+    }
+
+    async fn row_at(
+        pool: &sqlx::PgPool,
+        session_id: Uuid,
+        role: &str,
+        content: &str,
+        sent_at: &str,
+    ) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+             VALUES ($1, $2, $3, $4) RETURNING id",
+        )
+        .bind(session_id)
+        .bind(role)
+        .bind(content)
+        .bind(at(sent_at))
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    fn user_turn(content: &str, message_id: Uuid) -> Event {
+        Event::UserMessage {
+            content: content.into(),
+            message_id,
+            prompt_traits: Vec::new(),
+            audit: None,
+            tier: None,
+            memory_scope: Default::default(),
+            affinity_scope: Default::default(),
+            quote: Default::default(),
+            action: None,
+            outfit: None,
+        }
+    }
+
+    fn reply_plan() -> ActionPlan {
+        ActionPlan {
+            action_type: ActionType::ReplyText,
+            reply_style: eros_engine_core::types::ReplyStyle::Neutral,
+            affinity_deltas: Default::default(),
+            energy_cost: 0.0,
+            context_hints: Vec::new(),
+            reply_mode: None,
+            nudges: Default::default(),
+            clothing: None,
+            image_caption: None,
+            image_ref: eros_engine_core::types::ImageRef::Face,
+            aspect_ratio: None,
+            action_response: None,
+        }
+    }
+
+    fn produced(message_id: Uuid, text: &str) -> Vec<ProducedMessage> {
+        vec![ProducedMessage {
+            message_id,
+            full_text: text.into(),
+            action: ActionType::ReplyText,
+        }]
+    }
+
+    /// A relationship's live text session: `(owner, instance, session)`.
+    async fn text_relationship(pool: &sqlx::PgPool) -> (Uuid, Uuid, Uuid) {
+        let owner = Uuid::new_v4();
+        let instance = seed_persona_instance(pool, owner).await;
+        let session = ChatRepo { pool }
+            .create_session(owner, instance)
+            .await
+            .unwrap()
+            .id;
+        (owner, instance, session)
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn text_turn_bumps_state_and_writes_first_meet_on_creation(pool: sqlx::PgPool) {
+        use eros_engine_store::scan_state::ScanStateRepo;
+        let (owner, instance, session) = text_relationship(&pool).await;
+        // The pair's first row: 16:30Z on 10-01 is already 10-02 in Taipei.
+        let greeting = "2026-10-01T16:30:00Z";
+        row_at(&pool, session, "assistant", "你好呀", greeting).await;
+        let user = row_at(&pool, session, "user", "嗨", "2026-10-01T16:40:00Z").await;
+        let reply = row_at(&pool, session, "assistant", "在呢", "2026-10-01T16:41:00Z").await;
+        let taipei = crate::holiday::UserLocale {
+            timezone: Some(chrono_tz::Asia::Taipei),
+            ..Default::default()
+        };
+        let state = crate::routes::companion::test_state(pool.clone());
+
+        run(
+            state.clone(),
+            session,
+            owner,
+            instance,
+            persona_named("Aria"),
+            user_turn("嗨", user),
+            reply_plan(),
+            produced(reply, "在呢"),
+            taipei,
+        )
+        .await;
+
+        let scan = ScanStateRepo { pool: &pool };
+        let s = scan
+            .load(instance)
+            .await
+            .unwrap()
+            .expect("the turn is counted");
+        assert_eq!(s.pending_turns, 1);
+        assert_eq!(
+            s.scanned_through_at,
+            at(greeting),
+            "the cursor sits on the newest row before the turn"
+        );
+        assert_eq!(s.user_timezone.as_deref(), Some("Asia/Taipei"));
+        let journal: Vec<(String, chrono::NaiveDate, String, String, String, bool)> =
+            sqlx::query_as(
+                "SELECT kind, occurred_on, realm, source, recurrence, embedding IS NULL \
+                 FROM engine.relationship_journal WHERE instance_id = $1",
+            )
+            .bind(instance)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            journal,
+            vec![(
+                "first_meet".to_string(),
+                chrono::NaiveDate::from_ymd_opt(2026, 10, 2).unwrap(),
+                "real".to_string(),
+                "engine".to_string(),
+                "monthly_then_yearly".to_string(),
+                true,
+            )],
+            "dated by the pair's first row in the turn's timezone, embedded later"
+        );
+
+        let user2 = row_at(&pool, session, "user", "还在吗", "2026-10-02T01:00:00Z").await;
+        run(
+            state,
+            session,
+            owner,
+            instance,
+            persona_named("Aria"),
+            user_turn("还在吗", user2),
+            reply_plan(),
+            Vec::new(),
+            Default::default(),
+        )
+        .await;
+        let s = scan.load(instance).await.unwrap().unwrap();
+        assert_eq!(s.pending_turns, 2);
+        assert_eq!(
+            s.user_timezone.as_deref(),
+            Some("Asia/Taipei"),
+            "a turn without a timezone keeps the last one"
+        );
+        let meetings: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.relationship_journal WHERE instance_id = $1",
+        )
+        .bind(instance)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(meetings, 1, "only the creating turn journals the meeting");
+    }
+
+    /// A relationship whose state already counts `SCAN_K - 1` answered turns,
+    /// plus the next turn's user row and reply, and a later user row already
+    /// in flight. Returns `(owner, instance, session, user, reply)`.
+    async fn one_turn_before_k(pool: &sqlx::PgPool) -> (Uuid, Uuid, Uuid, Uuid, Uuid) {
+        use eros_engine_store::scan_state::{ScanStateRepo, SCAN_K};
+        let (owner, instance, session) = text_relationship(pool).await;
+        let scan = ScanStateRepo { pool };
+        for minute in 0..SCAN_K - 1 {
+            let user_at = format!("2026-10-01T10:{minute:02}:00Z");
+            row_at(pool, session, "user", "嗯", &user_at).await;
+            row_at(
+                pool,
+                session,
+                "assistant",
+                "嗯嗯",
+                &format!("2026-10-01T10:{minute:02}:30Z"),
+            )
+            .await;
+            scan.bump(instance, at(&user_at), None).await.unwrap();
+        }
+        let user = row_at(pool, session, "user", "今天好累", "2026-10-01T11:00:00Z").await;
+        let reply = row_at(pool, session, "assistant", "抱抱你", "2026-10-01T11:00:30Z").await;
+        row_at(pool, session, "user", "LATERLINE", "2026-10-01T11:05:00Z").await;
+        (owner, instance, session, user, reply)
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn twentieth_turn_scans_inline(pool: sqlx::PgPool) {
+        use eros_engine_store::episode::EpisodeRepo;
+        use eros_engine_store::scan_state::ScanStateRepo;
+        use wiremock::matchers::{body_partial_json, method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let llm = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({ "model": "scan/m" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen-scan", "model": "scan/m",
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "choices": [{"message": {"content":
+                    "{\"episode\":\"用户说今天很累，AI 安慰了他。\"}"}}],
+            })))
+            .expect(1)
+            .mount(&llm)
+            .await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.dreaming_scan]\nmodel = \"scan/m\"\nfilter_prompt = \"extract\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", llm.uri()),
+            ),
+        );
+        let (owner, instance, session, user, reply) = one_turn_before_k(&pool).await;
+
+        run(
+            state,
+            session,
+            owner,
+            instance,
+            persona_named("Aria"),
+            user_turn("今天好累", user),
+            reply_plan(),
+            produced(reply, "抱抱你"),
+            Default::default(),
+        )
+        .await;
+
+        let episodes = EpisodeRepo { pool: &pool }
+            .unfolded(instance)
+            .await
+            .unwrap();
+        assert_eq!(episodes.len(), 1, "the twentieth turn scanned inline");
+        assert_eq!(episodes[0].summary, "用户说今天很累，AI 安慰了他。");
+        assert_eq!(
+            (episodes[0].started_at, episodes[0].ended_at),
+            (at("2026-10-01T10:00:00Z"), at("2026-10-01T11:00:30Z")),
+            "read up to the turn's own reply"
+        );
+        let body =
+            String::from_utf8_lossy(&llm.received_requests().await.unwrap()[0].body).to_string();
+        assert!(body.contains("抱抱你"));
+        assert!(!body.contains("LATERLINE"), "a later turn is not half-read");
+        let s = ScanStateRepo { pool: &pool }
+            .load(instance)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.scanned_through_at, at("2026-10-01T11:00:30Z"));
+        assert_eq!((s.pending_turns, s.claimed_at), (0, None));
+        let events: Vec<(String, String)> = sqlx::query_as(
+            "SELECT kind, status FROM engine.relationship_scan_events WHERE instance_id = $1",
+        )
+        .bind(instance)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(events, vec![("scan".to_string(), "ok".to_string())]);
+    }
+
+    /// Without `[tasks.dreaming_scan]` the turn is still counted, but the
+    /// twentieth claims nothing.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn twentieth_turn_without_scan_task_claims_nothing(pool: sqlx::PgPool) {
+        use eros_engine_store::scan_state::{ScanStateRepo, SCAN_K};
+        let state = crate::routes::companion::test_state(pool.clone());
+        let (owner, instance, session, user, reply) = one_turn_before_k(&pool).await;
+
+        run(
+            state,
+            session,
+            owner,
+            instance,
+            persona_named("Aria"),
+            user_turn("今天好累", user),
+            reply_plan(),
+            produced(reply, "抱抱你"),
+            Default::default(),
+        )
+        .await;
+
+        let s = ScanStateRepo { pool: &pool }
+            .load(instance)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((s.pending_turns, s.claimed_at), (SCAN_K, None));
+        let episodes: i64 = sqlx::query_scalar("SELECT count(*) FROM engine.relationship_episodes")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(episodes, 0);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn group_turn_does_not_bump(pool: sqlx::PgPool) {
+        let user_id = Uuid::new_v4();
+        let (ia, ib) = (
+            seed_persona_instance(&pool, user_id).await,
+            seed_persona_instance(&pool, user_id).await,
+        );
+        let chat = ChatRepo { pool: &pool };
+        let (sa, sb) = (
+            chat.create_session(user_id, ia).await.unwrap().id,
+            chat.create_session(user_id, ib).await.unwrap().id,
+        );
+        let group: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, channel) VALUES ($1, 'group') RETURNING id",
+        )
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        row_at(&pool, group, "user", "大家好", "2026-10-01T10:00:00Z").await;
+        let state = crate::routes::companion::test_state(pool.clone());
+
+        run_group(
+            state,
+            group,
+            user_id,
+            "大家好".into(),
+            vec![(sa, ia), (sb, ib)],
+            vec![],
+        )
+        .await;
+
+        for table in ["relationship_scan_state", "relationship_journal"] {
+            let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM engine.{table}"))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(n, 0, "a group turn leaves no {table} row");
+        }
     }
 }

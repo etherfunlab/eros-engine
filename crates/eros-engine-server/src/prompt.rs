@@ -1897,15 +1897,6 @@ pub fn facts_user_message(user_msg: &str, assistant_msg: &str) -> String {
     format!("用户: {user_msg}\nAI:   {assistant_msg}")
 }
 
-/// Build the *user* message for the memory-extraction call: the chronologically
-/// ordered `用户：X / AI：Y` lines joined as the conversation. The instruction
-/// (categories, filter rules, anti-attribution clause, output format) is the
-/// system message, sourced from `dreaming_scan.filter_prompt` in
-/// model_config.toml.
-pub fn memories_user_message(turns: &[String]) -> String {
-    turns.join("\n")
-}
-
 /// Profile-rebuild prompt: a single user message holding the user's whole
 /// fact ledger (rendered by the caller, grouped by domain) and
 /// `PROFILE_REBUILD_SCHEMA`. The previous profile is deliberately not an

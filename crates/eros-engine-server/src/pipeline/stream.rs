@@ -5781,6 +5781,7 @@ pub(crate) fn run_stream_with(
                     let session_id_bg = user_msg.session_id;
                     let persona_bg = input.persona.clone();
                     let produced = image_only_produced;
+                    let locale_bg = user_msg.user_locale;
                     tokio::spawn(async move {
                         crate::pipeline::post_process::run(
                             state_bg,
@@ -5791,6 +5792,7 @@ pub(crate) fn run_stream_with(
                             event_bg,
                             plan_bg,
                             produced,
+                            locale_bg,
                         )
                         .await;
                     });
@@ -6318,6 +6320,7 @@ pub(crate) fn run_stream_with(
                 let instance_id_bg = user_msg.instance_id;
                 let session_id_bg = user_msg.session_id;
                 let persona_bg = input.persona.clone();
+                let locale_bg = user_msg.user_locale;
                 tokio::spawn(async move {
                     crate::pipeline::post_process::run(
                         state_bg,
@@ -6328,6 +6331,7 @@ pub(crate) fn run_stream_with(
                         event_bg,
                         plan_bg,
                         produced,
+                        locale_bg,
                     )
                     .await;
                 });

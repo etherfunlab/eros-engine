@@ -280,7 +280,18 @@ pub async fn voice_turn_stream(
         )
         .await?
     {
-        VoiceUserInsert::Inserted(id) => (id, req.content),
+        VoiceUserInsert::Inserted(id) => {
+            // A new voice turn counts toward the relationship's scan, off the
+            // reply path; only text turns start a scan.
+            if !state.config.dreaming_voice_disabled {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    crate::pipeline::dreaming::bump_relationship(&state, instance_id, id, None)
+                        .await;
+                });
+            }
+            (id, req.content)
+        }
         VoiceUserInsert::Duplicate(id) => {
             // `insert_voice_user_message`'s conflict lookup is deliberately
             // role-agnostic (see its doc comment) — the colliding row can be a
@@ -1559,5 +1570,162 @@ mod tests {
             n, 0,
             "no user row should be persisted when the instance is missing"
         );
+    }
+
+    // ─── The relationship scan's turn count ─────────────────────────
+
+    /// A router whose voice calls go to a streaming mock, with
+    /// `[tasks.dreaming_scan]` configured so a scan could run if one started.
+    async fn scan_ready_app(pool: &PgPool, voice_disabled: bool) -> (wiremock::MockServer, Router) {
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\
+                         \"id\":\"gen-voice\",\"model\":\"primary\"}\n\n\
+                         data: [DONE]\n\n",
+                        "text/event-stream",
+                    ),
+            )
+            .mount(&mock)
+            .await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = Arc::new(
+            ModelConfig::from_toml_str(
+                "[tasks.chat_voice]\nmodel = \"primary\"\n\
+                 [tasks.dreaming_scan]\nmodel = \"scan\"\nfilter_prompt = \"extract\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        state.config.dreaming_voice_disabled = voice_disabled;
+        (mock, build_router(state))
+    }
+
+    async fn voice_turn_ok(app: &mut Router, session_id: Uuid, user_id: Uuid, cmid: &str) {
+        let resp = post_voice(
+            app,
+            session_id,
+            &mint_jwt(user_id),
+            json!({"content": "我住在上海", "client_msg_id": cmid}),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        axum::body::to_bytes(resp.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+    }
+
+    async fn instance_of(pool: &PgPool, session_id: Uuid) -> Uuid {
+        sqlx::query_scalar("SELECT instance_id FROM engine.chat_sessions WHERE id = $1")
+            .bind(session_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn pending_turns(pool: &PgPool, instance_id: Uuid) -> Option<i32> {
+        sqlx::query_scalar(
+            "SELECT pending_turns FROM engine.relationship_scan_state WHERE instance_id = $1",
+        )
+        .bind(instance_id)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+    }
+
+    /// The count runs off the reply path: wait for it to land.
+    async fn wait_for_pending(pool: &PgPool, instance_id: Uuid, n: i32) {
+        for _ in 0..500 {
+            if pending_turns(pool, instance_id).await == Some(n) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("pending_turns never reached {n}");
+    }
+
+    /// A voice turn counts toward the relationship's scan, and the first one
+    /// journals the meeting, but a voice turn never starts a scan, even the
+    /// one that brings `SCAN_K` turns.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn voice_turn_bumps_without_scan(pool: PgPool) {
+        use eros_engine_store::scan_state::SCAN_K;
+        let user_id = Uuid::new_v4();
+        let session_id = seed(&pool, user_id).await;
+        let instance_id = instance_of(&pool, session_id).await;
+        let (mock, mut app) = scan_ready_app(&pool, false).await;
+
+        voice_turn_ok(&mut app, session_id, user_id, "01J9SCANV00000000000000001").await;
+        wait_for_pending(&pool, instance_id, 1).await;
+        let kinds: Vec<String> = sqlx::query_scalar(
+            "SELECT kind FROM engine.relationship_journal WHERE instance_id = $1",
+        )
+        .bind(instance_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(kinds, ["first_meet"]);
+
+        sqlx::query(
+            "UPDATE engine.relationship_scan_state SET pending_turns = $2 WHERE instance_id = $1",
+        )
+        .bind(instance_id)
+        .bind(SCAN_K - 1)
+        .execute(&pool)
+        .await
+        .unwrap();
+        voice_turn_ok(&mut app, session_id, user_id, "01J9SCANV00000000000000002").await;
+        wait_for_pending(&pool, instance_id, SCAN_K).await;
+
+        let claimed: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+            "SELECT claimed_at FROM engine.relationship_scan_state WHERE instance_id = $1",
+        )
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(claimed.is_none(), "no voice turn claims a scan");
+        let events: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM engine.relationship_scan_events")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(events, 0);
+        assert_eq!(
+            mock.received_requests().await.unwrap().len(),
+            2,
+            "the two voice replies are the only model calls"
+        );
+    }
+
+    /// `DREAMING_VOICE_DISABLED=1`: voice turns are not counted.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn voice_turn_does_not_bump_when_voice_disabled(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = seed(&pool, user_id).await;
+        let instance_id = instance_of(&pool, session_id).await;
+        let (_mock, mut app) = scan_ready_app(&pool, true).await;
+
+        voice_turn_ok(&mut app, session_id, user_id, "01J9SCANV00000000000000003").await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(pending_turns(&pool, instance_id).await, None);
+        let journal: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.relationship_journal WHERE instance_id = $1",
+        )
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(journal, 0);
     }
 }

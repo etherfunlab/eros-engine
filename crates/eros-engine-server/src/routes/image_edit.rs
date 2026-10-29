@@ -995,6 +995,7 @@ async fn edit_image(
                 edit_turn_event(instruction_bg, umid_bg, None, tier_bg, prompt_traits),
                 plan,
                 produced,
+                user_locale,
             )
             .await;
         });
@@ -1028,6 +1029,7 @@ async fn edit_image(
                 None,
                 false,
                 None,
+                user_locale.timezone,
             )
             .await;
         });

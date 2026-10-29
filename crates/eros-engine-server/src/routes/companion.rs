@@ -1190,7 +1190,7 @@ pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
             // Sweeper disabled in tests — unit tests don't spawn it
             // and the fields are just for AppState completeness.
             dreaming_tick: std::time::Duration::ZERO,
-            dreaming_idle_threshold: std::time::Duration::from_secs(1800),
+            dreaming_idle_threshold: std::time::Duration::from_secs(3600),
             dreaming_claim_stale_threshold: std::time::Duration::from_secs(600),
             // Voice ingestion ON in tests — matches the production default.
             dreaming_voice_disabled: false,
