@@ -47,8 +47,9 @@ pub(crate) enum ScanOutcome {
 /// Scan one relationship up to `bound`. The caller holds the claim, and every
 /// path settles it except a failed state read and an unconfigured
 /// `dreaming_scan`, which leave it to go stale. A scan that finds the claim
-/// gone writes nothing further and reports `Empty`. `kind` names the run in
-/// the event row.
+/// gone writes nothing further, records an `empty` event and reports `Empty`.
+/// Every scan that reached the model leaves one event row; `kind` names the
+/// run in it.
 pub(crate) async fn scan_instance(
     state: &AppState,
     instance_id: Uuid,
@@ -141,7 +142,7 @@ pub(crate) async fn scan_instance(
         Err(e) => {
             tracing::warn!(%instance_id, "dreaming scan: LLM call failed: {e}");
             release_failed(&scan, &st, last.sent_at, covered).await;
-            ScanEventRepo { pool }.record(event).await;
+            record_scan_event(pool, event).await;
             return ScanOutcome::Failed;
         }
     };
@@ -163,10 +164,22 @@ pub(crate) async fn scan_instance(
         tracing::warn!(%instance_id, "dreaming scan: reply holds no JSON object");
         release_failed(&scan, &st, last.sent_at, covered).await;
         event.status = "parse_error";
-        ScanEventRepo { pool }.record(event).await;
+        record_scan_event(pool, event).await;
         return ScanOutcome::Failed;
     };
 
+    // Profile memories have no claim guard of their own, so the claim is
+    // checked (and its clock restarted) before anything is written.
+    match scan.refresh_claim(instance_id).await {
+        Ok(true) => {}
+        Ok(false) => return discard(pool, event, "claim gone before the writes").await,
+        Err(e) => {
+            // Left to go stale: the segment is read again.
+            tracing::warn!(%instance_id, "dreaming scan: claim check failed: {e}");
+            record_scan_event(pool, event).await;
+            return ScanOutcome::Failed;
+        }
+    }
     event.memories_written =
         write_memories(state, instance_id, last.session_id, &out.memories).await;
     if let Some(summary) = out.episode {
@@ -181,10 +194,7 @@ pub(crate) async fn scan_instance(
         };
         match (EpisodeRepo { pool }).insert_if_claimed(&episode).await {
             Ok(Some(_)) => event.episode_written = true,
-            Ok(None) => {
-                tracing::info!(%instance_id, "dreaming scan: claim gone before the write, scan discarded");
-                return ScanOutcome::Empty;
-            }
+            Ok(None) => return discard(pool, event, "claim gone before the episode write").await,
             Err(e) => tracing::warn!(%instance_id, "dreaming scan: episode write failed: {e}"),
         }
     }
@@ -207,29 +217,19 @@ pub(crate) async fn scan_instance(
         .await
     {
         Ok(true) => {}
-        Ok(false) => {
-            tracing::info!(%instance_id, "dreaming scan: claim gone before the cursor moved, scan discarded");
-            return ScanOutcome::Empty;
-        }
+        Ok(false) => return discard(pool, event, "claim gone before the cursor moved").await,
         Err(e) => {
             // The claim goes stale and the segment is read again.
             tracing::warn!(%instance_id, "dreaming scan: cursor write failed: {e}");
+            record_scan_event(pool, event).await;
             return ScanOutcome::Failed;
         }
-    }
-    if event.served_fallback {
-        tracing::warn!(
-            %instance_id,
-            served_hop = ?event.model,
-            journal_written = event.journal_written,
-            "dreaming scan served by a fallback hop"
-        );
     }
     let wrote_any =
         event.memories_written > 0 || event.episode_written || event.journal_written > 0;
     let episode_written = event.episode_written;
     event.status = if wrote_any { "ok" } else { "empty" };
-    ScanEventRepo { pool }.record(event).await;
+    record_scan_event(pool, event).await;
 
     if episode_written {
         match scan.bump_episodes(instance_id).await {
@@ -245,9 +245,12 @@ pub(crate) async fn scan_instance(
     }
 }
 
-/// Fold the relationship's unfolded episodes into a new arc. A rewrite the
-/// guards reject, or a call that fails, counts against the arc; the strike-out
-/// marks the pending episodes folded and the previous arc keeps serving.
+/// Fold the relationship's unfolded episodes into a new arc. The episode count
+/// restarts before the call, so a scan landing during it cannot start a second
+/// rewrite; episodes a failed rewrite leaves unfolded ride into the next one.
+/// A rewrite the guards reject, or a call that fails, counts against the arc:
+/// the strike-out marks the pending episodes folded and the previous arc keeps
+/// serving. A relationship archived or erased during the call gets no arc.
 pub(crate) async fn rewrite_arc(state: &AppState, instance_id: Uuid) {
     let Some(resolved) = state.model_config.resolve_arc_rewrite() else {
         ARC_UNCONFIGURED
@@ -275,6 +278,10 @@ pub(crate) async fn rewrite_arc(state: &AppState, instance_id: Uuid) {
     let (Some(st), Some(folded_through)) = (st, episodes.iter().map(|e| e.ended_at).max()) else {
         return;
     };
+    if let Err(e) = scan.reserve_fold(instance_id).await {
+        tracing::warn!(%instance_id, "arc rewrite: reserving the fold failed: {e}");
+        return;
+    }
     let tz = state_tz(&st);
     let dated: Vec<(String, String)> = episodes
         .iter()
@@ -341,7 +348,7 @@ pub(crate) async fn rewrite_arc(state: &AppState, instance_id: Uuid) {
                         Ok(()) => {
                             let opening = opening.as_deref().filter(|_| first_rewrite);
                             match (ArcRepo { pool })
-                                .replace(
+                                .replace_if_live(
                                     instance_id,
                                     opening,
                                     &arc,
@@ -350,7 +357,14 @@ pub(crate) async fn rewrite_arc(state: &AppState, instance_id: Uuid) {
                                 )
                                 .await
                             {
-                                Ok(()) => "ok",
+                                Ok(true) => "ok",
+                                Ok(false) => {
+                                    tracing::debug!(
+                                        %instance_id,
+                                        "arc rewrite: relationship gone, arc not written"
+                                    );
+                                    "empty"
+                                }
                                 Err(e) => {
                                     tracing::warn!(%instance_id, "arc rewrite: arc write failed: {e}");
                                     "failed"
@@ -364,15 +378,18 @@ pub(crate) async fn rewrite_arc(state: &AppState, instance_id: Uuid) {
     }
 
     let ids: Vec<Uuid> = episodes.iter().map(|e| e.id).collect();
-    if event.status == "ok" {
-        if let Err(e) = episodes_repo.mark_folded(&ids).await {
-            tracing::warn!(%instance_id, "arc rewrite: folding episodes failed: {e}");
+    match event.status {
+        "ok" => {
+            if let Err(e) = episodes_repo.mark_folded(&ids).await {
+                tracing::warn!(%instance_id, "arc rewrite: folding episodes failed: {e}");
+            }
+            if let Err(e) = scan.fold_episodes(instance_id).await {
+                tracing::warn!(%instance_id, "arc rewrite: resetting arc counters failed: {e}");
+            }
         }
-        if let Err(e) = scan.fold_episodes(instance_id).await {
-            tracing::warn!(%instance_id, "arc rewrite: resetting arc counters failed: {e}");
-        }
-    } else {
-        match scan.arc_failed(instance_id).await {
+        // The relationship is gone: nothing left to count or fold.
+        "empty" => {}
+        _ => match scan.arc_failed(instance_id).await {
             Ok(n) if n >= MAX_ARC_FAILURES => {
                 tracing::warn!(
                     %instance_id,
@@ -386,9 +403,39 @@ pub(crate) async fn rewrite_arc(state: &AppState, instance_id: Uuid) {
             }
             Ok(_) => {}
             Err(e) => tracing::warn!(%instance_id, "arc rewrite: failure count failed: {e}"),
-        }
+        },
     }
     ScanEventRepo { pool }.record(event).await;
+}
+
+/// Record a scan's event row; a scan a fallback hop served warns, whatever
+/// its status, with the journal count that hop yielded.
+async fn record_scan_event(pool: &sqlx::PgPool, event: ScanEventInsert) {
+    if event.served_fallback {
+        tracing::warn!(
+            instance_id = ?event.instance_id,
+            status = event.status,
+            served_hop = ?event.model,
+            journal_written = event.journal_written,
+            "dreaming scan served by a fallback hop"
+        );
+    }
+    ScanEventRepo { pool }.record(event).await;
+}
+
+/// A scan whose claim went away after the call: whatever was not yet written
+/// is dropped, and the paid call still leaves an `empty` row.
+async fn discard(pool: &sqlx::PgPool, event: ScanEventInsert, why: &str) -> ScanOutcome {
+    tracing::info!(instance_id = ?event.instance_id, "dreaming scan: {why}, scan discarded");
+    record_scan_event(
+        pool,
+        ScanEventInsert {
+            status: "empty",
+            ..event
+        },
+    )
+    .await;
+    ScanOutcome::Empty
 }
 
 #[derive(Deserialize)]
@@ -743,6 +790,21 @@ mod tests {
         .unwrap()
     }
 
+    /// Return once `llm` has seen a request; fails when `job` ends first or
+    /// ten seconds pass without one.
+    async fn wait_for_call<T>(llm: &MockServer, job: &tokio::task::JoinHandle<T>) {
+        for waited in 0.. {
+            if !llm.received_requests().await.unwrap().is_empty() {
+                return;
+            }
+            assert!(
+                waited < 2_000 && !job.is_finished(),
+                "the job never called the model"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     async fn request_bodies(llm: &MockServer) -> Vec<String> {
         llm.received_requests()
             .await
@@ -882,15 +944,10 @@ mod tests {
         let rel = seed_rel(&pool).await;
         open_claim(&pool, rel.instance).await;
         let llm = MockServer::start().await;
-        let reply = json!({
-            "episode": "用户向 AI 表白。",
-            "journal": [{"kind": "confession", "realm": "real", "occurred_at": "2026-10-02",
-                         "summary": "用户向 AI 表白", "source": "#2"}],
-        });
         Mock::given(method("POST"))
             .and(wm_path("/api/v1/chat/completions"))
             .respond_with(
-                completion(SCAN_MODEL, "gen-scan", &reply.to_string())
+                completion(SCAN_MODEL, "gen-scan", &scan_reply())
                     .set_delay(Duration::from_millis(600)),
             )
             .expect(1)
@@ -904,16 +961,7 @@ mod tests {
             async move { scan_instance(&state, instance, at(T4), "scan").await }
         });
         // The relationship goes after the call left and before its reply lands.
-        for waited in 0.. {
-            if !llm.received_requests().await.unwrap().is_empty() {
-                break;
-            }
-            assert!(
-                waited < 2_000 && !scan.is_finished(),
-                "the scan never called the model"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        wait_for_call(&llm, &scan).await;
         sqlx::query("DELETE FROM engine.relationship_scan_state WHERE instance_id = $1")
             .bind(rel.instance)
             .execute(&pool)
@@ -921,6 +969,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(scan.await.unwrap(), ScanOutcome::Empty);
+        let memories: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM engine.companion_memories WHERE user_id = $1")
+                .bind(rel.owner)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(memories, 0, "profile memories are discarded with the rest");
         assert_eq!(count(&pool, "relationship_episodes", rel.instance).await, 0);
         assert_eq!(count(&pool, "relationship_journal", rel.instance).await, 0);
         assert_eq!(
@@ -928,7 +983,21 @@ mod tests {
             0,
             "the state row is not resurrected"
         );
-        assert!(events(&pool, rel.instance).await.is_empty());
+        assert_eq!(
+            events(&pool, rel.instance).await,
+            vec![(
+                "scan".to_string(),
+                "empty".to_string(),
+                Some(SCAN_MODEL.to_string()),
+                false,
+                4,
+                0,
+                false,
+                0,
+                Some("gen-scan".to_string()),
+            )],
+            "the paid call still leaves a row"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -1036,43 +1105,8 @@ mod tests {
         let rel = seed_rel(&pool).await;
         open_claim(&pool, rel.instance).await;
         // Three earlier episodes wait unfolded; the scan writes the fourth.
-        for (summary, started, ended) in [
-            (
-                "第一次聊天，聊了喜欢的电影。",
-                "2026-09-01T02:00:00Z",
-                "2026-09-01T03:00:00Z",
-            ),
-            (
-                "用户说工作压力大，AI 安慰了他。",
-                "2026-09-10T02:00:00Z",
-                "2026-09-11T03:00:00Z",
-            ),
-            (
-                "在角色扮演中两人去了海边。",
-                "2026-09-20T02:00:00Z",
-                "2026-09-20T03:00:00Z",
-            ),
-        ] {
-            sqlx::query(
-                "INSERT INTO engine.relationship_episodes \
-                     (instance_id, summary, started_at, ended_at) VALUES ($1, $2, $3, $4)",
-            )
-            .bind(rel.instance)
-            .bind(summary)
-            .bind(at(started))
-            .bind(at(ended))
-            .execute(&pool)
-            .await
-            .unwrap();
-        }
-        sqlx::query(
-            "UPDATE engine.relationship_scan_state SET episodes_since_arc = 3 \
-             WHERE instance_id = $1",
-        )
-        .bind(rel.instance)
-        .execute(&pool)
-        .await
-        .unwrap();
+        seed_episodes(&pool, rel.instance).await;
+        set_arc_counters(&pool, rel.instance, 3, 0).await;
 
         let llm = MockServer::start().await;
         let scan = json!({ "episode": "用户向 AI 表白，AI 接受了。" }).to_string();
@@ -1107,7 +1141,11 @@ mod tests {
         assert!(arcs.load(rel.instance).await.unwrap().is_none());
         let scan_repo = ScanStateRepo { pool: &pool };
         let s = scan_repo.load(rel.instance).await.unwrap().unwrap();
-        assert_eq!((s.episodes_since_arc, s.arc_failures), (4, 1));
+        assert_eq!(
+            (s.episodes_since_arc, s.arc_failures),
+            (0, 1),
+            "the fold was reserved before the call; the rejection counts"
+        );
         let episodes = EpisodeRepo { pool: &pool };
         assert_eq!(episodes.unfolded(rel.instance).await.unwrap().len(), 4);
         let evs = events(&pool, rel.instance).await;
@@ -1145,6 +1183,162 @@ mod tests {
         assert_eq!(
             (evs[2].0.as_str(), evs[2].1.as_str(), evs[2].8.as_deref()),
             ("arc", "ok", Some("gen-arc-2"))
+        );
+    }
+
+    /// Three earlier episodes of the relationship, unfolded.
+    async fn seed_episodes(pool: &PgPool, instance: Uuid) {
+        for (summary, started, ended) in [
+            (
+                "第一次聊天，聊了喜欢的电影。",
+                "2026-09-01T02:00:00Z",
+                "2026-09-01T03:00:00Z",
+            ),
+            (
+                "用户说工作压力大，AI 安慰了他。",
+                "2026-09-10T02:00:00Z",
+                "2026-09-11T03:00:00Z",
+            ),
+            (
+                "在角色扮演中两人去了海边。",
+                "2026-09-20T02:00:00Z",
+                "2026-09-20T03:00:00Z",
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO engine.relationship_episodes \
+                     (instance_id, summary, started_at, ended_at) VALUES ($1, $2, $3, $4)",
+            )
+            .bind(instance)
+            .bind(summary)
+            .bind(at(started))
+            .bind(at(ended))
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn set_arc_counters(pool: &PgPool, instance: Uuid, episodes: i32, failures: i32) {
+        sqlx::query(
+            "UPDATE engine.relationship_scan_state \
+             SET episodes_since_arc = $2, arc_failures = $3 WHERE instance_id = $1",
+        )
+        .bind(instance)
+        .bind(episodes)
+        .bind(failures)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// A relationship with three unfolded episodes and one failed rewrite
+    /// behind it, and a state whose arc call answers `reply` after a delay.
+    async fn delayed_rewrite(
+        pool: &PgPool,
+        reply: &str,
+    ) -> (Rel, AppState, MockServer, MockServer) {
+        let rel = seed_rel(pool).await;
+        open_claim(pool, rel.instance).await;
+        seed_episodes(pool, rel.instance).await;
+        set_arc_counters(pool, rel.instance, ARC_FOLD_EVERY, 1).await;
+        let llm = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .and(body_partial_json(json!({ "model": ARC_MODEL })))
+            .respond_with(
+                completion(ARC_MODEL, "gen-arc", reply).set_delay(Duration::from_millis(600)),
+            )
+            .expect(1)
+            .mount(&llm)
+            .await;
+        let (state, embed) = state_with(pool.clone(), &llm, "").await;
+        (rel, state, llm, embed)
+    }
+
+    fn fitting_arc() -> String {
+        json!({ "opening": "用户在一个雨夜第一次来找 AI 聊天。", "arc": "弧".repeat(500) })
+            .to_string()
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn rewrite_reserves_the_fold_before_the_call(pool: PgPool) {
+        let (rel, state, llm, _embed) = delayed_rewrite(&pool, &fitting_arc()).await;
+        let scan_repo = ScanStateRepo { pool: &pool };
+
+        let rewrite = tokio::spawn({
+            let state = state.clone();
+            let instance = rel.instance;
+            async move { rewrite_arc(&state, instance).await }
+        });
+        wait_for_call(&llm, &rewrite).await;
+        let s = scan_repo.load(rel.instance).await.unwrap().unwrap();
+        assert_eq!(
+            (s.episodes_since_arc, s.arc_failures),
+            (0, 1),
+            "the count restarts before the call; the failure streak is kept"
+        );
+
+        rewrite.await.unwrap();
+        assert!(ArcRepo { pool: &pool }
+            .load(rel.instance)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(EpisodeRepo { pool: &pool }
+            .unfolded(rel.instance)
+            .await
+            .unwrap()
+            .is_empty());
+        let s = scan_repo.load(rel.instance).await.unwrap().unwrap();
+        assert_eq!((s.episodes_since_arc, s.arc_failures), (0, 0));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn rewrite_writes_no_arc_once_the_relationship_is_gone(pool: PgPool) {
+        let (rel, state, llm, _embed) = delayed_rewrite(&pool, &fitting_arc()).await;
+
+        let rewrite = tokio::spawn({
+            let state = state.clone();
+            let instance = rel.instance;
+            async move { rewrite_arc(&state, instance).await }
+        });
+        // The relationship is archived while the call is out.
+        wait_for_call(&llm, &rewrite).await;
+        sqlx::query("DELETE FROM engine.relationship_scan_state WHERE instance_id = $1")
+            .bind(rel.instance)
+            .execute(&pool)
+            .await
+            .unwrap();
+        rewrite.await.unwrap();
+
+        assert!(ArcRepo { pool: &pool }
+            .load(rel.instance)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            EpisodeRepo { pool: &pool }
+                .unfolded(rel.instance)
+                .await
+                .unwrap()
+                .len(),
+            3,
+            "nothing is folded"
+        );
+        assert_eq!(
+            events(&pool, rel.instance).await,
+            vec![(
+                "arc".to_string(),
+                "empty".to_string(),
+                Some(ARC_MODEL.to_string()),
+                false,
+                0,
+                0,
+                false,
+                0,
+                Some("gen-arc".to_string()),
+            )]
         );
     }
 

@@ -242,6 +242,20 @@ impl ScanStateRepo<'_> {
         Ok(n.unwrap_or(0))
     }
 
+    /// An arc rewrite is starting: the episode count restarts so the scans that
+    /// land during it cannot start a second rewrite over the same episodes.
+    /// The failure streak stays; it ends only with a folded or struck-out arc.
+    pub async fn reserve_fold(&self, instance_id: Uuid) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE engine.relationship_scan_state SET episodes_since_arc = 0 \
+             WHERE instance_id = $1",
+        )
+        .bind(instance_id)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// The arc absorbed the pending episodes: both arc counters restart.
     pub async fn fold_episodes(&self, instance_id: Uuid) -> Result<(), sqlx::Error> {
         sqlx::query(
@@ -662,6 +676,29 @@ mod tests {
             0,
             "a gone row registers nothing"
         );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn reserve_fold_restarts_the_arc_count_and_keeps_the_streak(pool: PgPool) {
+        let repo = ScanStateRepo { pool: &pool };
+        let (instance, _) = seed_relationship(&pool).await;
+        repo.bump(instance, at(1_000), None).await.unwrap();
+        for _ in 0..4 {
+            repo.bump_episodes(instance).await.unwrap();
+        }
+        repo.arc_failed(instance).await.unwrap();
+        repo.arc_failed(instance).await.unwrap();
+
+        repo.reserve_fold(instance).await.unwrap();
+        let s = repo.load(instance).await.unwrap().unwrap();
+        assert_eq!((s.episodes_since_arc, s.arc_failures), (0, 2));
+        assert_eq!(
+            repo.arc_failed(instance).await.unwrap(),
+            MAX_ARC_FAILURES,
+            "a reserved fold still strikes out on the third failure"
+        );
+
+        repo.reserve_fold(Uuid::new_v4()).await.unwrap();
     }
 
     #[sqlx::test(migrations = "./migrations")]
