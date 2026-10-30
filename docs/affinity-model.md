@@ -270,28 +270,41 @@ Example: chemistry `0.80` (64% of tier 4) lands at 64% of tier 3, `≈ 0.524`.
 
 ### Life-choice drops and the slowdown
 
-When she asks for space the user answers, and either answer costs the
-relationship ([the choice](life-events-needs.md#the-ask-for-space-choice)).
-Nothing here is a chat turn: no judge runs.
+A life choice she puts to the user costs the relationship on some answers
+([the ask for space](life-events-needs.md#the-ask-for-space-choice), [the
+romantic choices](life-events-needs.md#the-romantic-choices)). Nothing here is
+a chat turn: no judge runs.
 
-- **The drop (accept and decline).** Bond and chemistry each fall one tier by
-  the landing rule of a refused action, applied to both lines at once: the
-  same relative position one tier down, both axes of each line scaled by the
-  same factor, a tier-1 line to `0`. Both lines' `pending_deltas` are cleared.
-  It is computed from the snapshot after time decay and the endpoint refresh
-  (with the deployment's affinity tuning), inside the row lock and in the
-  transaction that resolves the choice, so a rolled-back resolution leaves no
-  drop. On accept the drop is the state she comes back to; nothing further
-  happens at return.
-- **Its event row.** One row of its own non-turn `event_type`, `life_choice`.
-  `deltas` and
+- **The drop.** Which answer drops which line depends on the kind:
+
+  | kind | accept | decline |
+  |---|---|---|
+  | `ask_for_space` | bond and chemistry | bond and chemistry |
+  | `sleep_together` | no drop | chemistry |
+  | `propose` | no drop | bond and chemistry |
+
+  Each line named falls one tier by the landing rule of a refused action: the
+  same relative position one tier down, both axes of the line scaled by the
+  same factor, a tier-1 line to `0`. Its `pending_deltas` are cleared; a line
+  not named keeps its axes and its balance. It is computed from the snapshot
+  after time decay and the endpoint refresh (with the deployment's affinity
+  tuning), inside the row lock and in the transaction that resolves the
+  choice, so a rolled-back resolution leaves no drop. On an `ask_for_space`
+  accept the drop is the state she comes back to; nothing further happens at
+  return. An answer typed in words (`ignored`) and an expiry cost nothing, for
+  every kind.
+- **Its event row.** One row of its own non-turn `event_type`, `life_choice`,
+  for every drop. `deltas` and
   `effective_deltas` carry the same figures, because the drop is the whole raw
   change; `label_changes`, `effective_line_deltas` and the two state snapshots
   record the tier move. `context` holds `life_choice` (`accept` | `decline`)
-  and `choice_id`. The row has no `user_message_id`. The delta route
+  and `choice_id`. An accepted `sleep_together` or `propose` moves nothing and
+  writes no row, so `accept` appears only for `ask_for_space`. The row has no
+  `user_message_id`. The delta route
   `GET /bff/v1/comp/affinity/{session_id}/event` never returns it, like
   `time_decay`, and it is not a judged turn either.
-- **The slowdown (accept only).** For 72 hours after the separation ends, every
+- **The slowdown (an accepted ask for space only).** For 72 hours after the
+  separation ends, every
   positive committed delta on the four line axes is halved before it is
   applied. Negative deltas apply in full, and `warmth` and `patience` re-derive
   from the post-turn lines as always. The cut part is gone: it is not parked in
@@ -300,7 +313,7 @@ Nothing here is a chat turn: no judge runs.
   separation's `ends_at`, and the window is `ends_at` to `ends_at` plus 72
   hours, wall-clock. A slowed turn's event row carries `context.growth_scale`
   (`0.5`), absent at full speed, and its `effective_deltas` show the halved
-  values.
+  values. An accepted romantic choice never slows growth.
 
 ## Base-pair derivation details
 
@@ -383,6 +396,11 @@ moved (format in [Event rows](#event-rows)).
   bond) and the derived `patience` of the last three judged turns decide
   whether she asks for a break
   ([the choice](life-events-needs.md#the-ask-for-space-choice)).
+- The romantic choices — the chemistry tier (and, for `propose`, the bond
+  tier) and the derived `warmth` and `patience` of the newest judged turns
+  decide whether she asks to sleep together or proposes, for a pair the
+  caller's scopes mark as romantic
+  ([the choices](life-events-needs.md#the-romantic-choices)).
 - The recall gate — the Bond and Chemistry tiers of the time-decayed row
   decide which intimate 基础画像 fields and domain-tagged profile memories
   reach the prompt, and how many memories each layer recalls; no row is tier 1
@@ -400,9 +418,10 @@ itself: the state struct, the write pipeline (`grade_turn`), the base-pair
 derivation, time decay, the Bond/Chemistry scores, tiers, labels.
 `crates/eros-engine-core/src/scope.rs` is the per-request injection gate:
 `AffinityScope` — six booleans, which axes may influence *this* request's
-prompt — plus `MemoryScope`. It gates prompt injection and `length_score`
-only; post-process writes (insight extraction, memory writes, the six-axis
-eval) are unaffected.
+prompt — plus `MemoryScope`. It gates prompt injection and `length_score`,
+and the scopes a request records are what `romance_compatible` reads to decide
+whether a pair is eligible for the romantic life choices; post-process writes
+(insight extraction, memory writes, the six-axis eval) are unaffected.
 
 **What they share.** Both live in core. Both group the six axes into two
 named halves. The scope's veto/gating decisions and the model's cold
@@ -607,10 +626,11 @@ env override could break.
   pipeline, endpoint derivation, time decay, bond/chemistry scores, tiers,
   labels
 - `crates/eros-engine-core/src/scope.rs` — `AffinityScope` / `MemoryScope`,
-  `length_score` (see [`affinity.rs` vs `scope.rs`](#affinityrs-vs-scopers))
+  `length_score`, `romance_compatible` (see
+  [`affinity.rs` vs `scope.rs`](#affinityrs-vs-scopers))
 - `crates/eros-engine-store/src/affinity.rs` — `AffinityRepo`
   (persist_with_event, record_ghost, persist_life_choice_drop_in_tx,
-  last_judged_patiences); its tables are in `migrations/0000_baseline.sql`
+  last_judged_endpoints); its tables are in `migrations/0000_baseline.sql`
 - `crates/eros-engine-store/src/life_choices.rs` — `LifeChoiceRepo`
   (the choice rows; `growth_slowed` derives the slowdown window)
 - `crates/eros-engine-server/src/pipeline/post_process.rs` — LLM

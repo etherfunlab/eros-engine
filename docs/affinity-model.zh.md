@@ -202,24 +202,34 @@ PDE 判定的 ghost 回合从不进入 `persist_with_event`：只有 `ghost_stre
 
 ### 生活选择的降档与放缓
 
-她提出想先分开一阵，用户回答之后，不论接受还是拒绝，这段关系都要付出代价
-（见[选择](life-events-needs.zh.md#提出分开的选择)）。这里没有任何一步是聊天回合：不跑判官。
+她向用户提出一次生活选择，有些回答会让这段关系付出代价
+（见[提出分开](life-events-needs.zh.md#提出分开的选择)与[浪漫选择](life-events-needs.zh.md#浪漫选择)）。
+这里没有任何一步是聊天回合：不跑判官。
 
-- **降档（接受和拒绝）。** bond 与 chemistry 各降一档，用被拒动作的落点规则，同时作用在两条线上：
-  落在下一档内的相同相对位置，每条线的两个轴按同一比例缩放，第 1 档的线直接归 `0`。两条线的
-  `pending_deltas` 都清零。它按时间衰减和端点刷新之后的快照计算（用部署的 affinity 调参值），
-  在行锁内、与结算这次选择的同一个事务里完成，所以结算回滚时不会留下降档。接受之后，降档就是她归来时的状态，
-  归来时不再有别的事发生。
-- **它的事件行。** 一行自己类型的非回合事件，`event_type = 'life_choice'`。
+- **降档。** 哪种回答降哪条线，取决于种类：
+
+  | 种类 | 接受 | 拒绝 |
+  |---|---|---|
+  | `ask_for_space` | bond 和 chemistry | bond 和 chemistry |
+  | `sleep_together` | 不降 | chemistry |
+  | `propose` | 不降 | bond 和 chemistry |
+
+  被点名的每条线都用被拒动作的落点规则降一档：落在下一档内的相同相对位置，这条线的两个轴按同一比例缩放，
+  第 1 档的线直接归 `0`。它的 `pending_deltas` 清零；没被点名的线，轴和余额都保持不变。
+  它按时间衰减和端点刷新之后的快照计算（用部署的 affinity 调参值），在行锁内、与结算这次选择的同一个事务里完成，
+  所以结算回滚时不会留下降档。`ask_for_space` 接受之后，降档就是她归来时的状态，归来时不再有别的事发生。
+  用文字打出的回答（`ignored`）和过期，不论哪种选择都没有代价。
+- **它的事件行。** 每次降档写一行自己类型的非回合事件，`event_type = 'life_choice'`。
   `deltas` 与 `effective_deltas` 的数字相同，因为降档就是全部的原始变化；`label_changes`、
   `effective_line_deltas` 和前后两份状态快照记录档位的移动。`context` 里有 `life_choice`（`accept` | `decline`）
-  和 `choice_id`。这一行没有 `user_message_id`。逐轮 delta 路由
+  和 `choice_id`。被接受的 `sleep_together` 或 `propose` 什么都不挪动，也不写这一行，所以 `accept` 只会出现在 `ask_for_space` 上。
+  这一行没有 `user_message_id`。逐轮 delta 路由
   `GET /bff/v1/comp/affinity/{session_id}/event` 从不返回它，和 `time_decay` 一样，它也不算被判官评过的回合。
-- **放缓（只在接受时）。** 分开结束之后的 72 小时内，四个线轴上每一个为正的已提交增量，在应用前减半。负增量全额应用，
+- **放缓（只在接受 `ask_for_space` 时）。** 分开结束之后的 72 小时内，四个线轴上每一个为正的已提交增量，在应用前减半。负增量全额应用，
   `warmth` 与 `patience` 照常从回合后的线值重新派生。被削掉的部分就没了：不会存进门的余额里。它只作用于这次选择所在的
   session；窗口是推算出来的，没有新状态：选择的 `event_id` 指向分开那一行的 `ends_at`，窗口是 `ends_at` 到
   `ends_at` 加 72 小时，按墙钟算。被放缓的回合，事件行带 `context.growth_scale`（`0.5`），全速时没有这个键，
-  它的 `effective_deltas` 显示的是减半后的值。
+  它的 `effective_deltas` 显示的是减半后的值。被接受的浪漫选择从不放缓增长。
 
 ## 基础对派生细节
 
@@ -291,6 +301,9 @@ PDE 判定的 ghost 回合从不进入 `persist_with_event`：只有 `ghost_stre
   （见 [events 路由](api-reference.zh.md#post-v2compsessionsession_idevents)）。
 - 提出分开：两条档位阶梯（chemistry 比 bond 高出两档或更多）和最近三个被判官评过的回合推算出的 `patience`，
   决定她要不要提出先分开一阵（见[选择](life-events-needs.zh.md#提出分开的选择)）。
+- 浪漫选择：chemistry 档位（`propose` 还要 bond 档位）和最近几个被判官评过的回合推算出的 `warmth`、`patience`，
+  决定她要不要提出上床或求婚，前提是调用方的 scope 把这一对标明为浪漫相容
+  （见[这些选择](life-events-needs.zh.md#浪漫选择)）。
 - 召回门控：时间衰减后那行的 Bond 和 Chemistry 档位，决定哪些基础画像私密字段、哪些带 domain
   标签的画像层记忆能进 prompt，以及每一层召回多少条；没有记录的组合两条线都按第 1 档算。
   文字、群聊、语音和改图请求生成的文字回复都读衰减后的值（见 [memory-layers.zh.md](memory-layers.zh.md#亲密度门控)）。
@@ -304,7 +317,8 @@ PDE 判定的 ghost 回合从不进入 `persist_with_event`：只有 `ghost_stre
 结构体、写入管线（`grade_turn`）、基础对派生、时间衰减、Bond/Chemistry 分数、
 档位、标签。`crates/eros-engine-core/src/scope.rs` 是逐请求的注入闸门：
 `AffinityScope`（六个布尔量，决定哪些轴可以影响*这一次*请求的提示词）加
-`MemoryScope`；它只管提示词注入与 `length_score` 的门控。post-process 阶段
+`MemoryScope`；它管提示词注入与 `length_score` 的门控，请求记录下来的 scope 还是
+`romance_compatible` 判断一对关系有没有资格得到浪漫生活选择的依据。post-process 阶段
 的写入（insight 抽取、记忆写入、六轴评估）不受影响。
 
 **共享什么。** 两者都在 core 里；都把六轴分成两个命名的半区；scope 的否决与
@@ -468,9 +482,9 @@ PDE 判定的 ghost 回合从不进入 `persist_with_event`：只有 `ghost_stre
 - `crates/eros-engine-core/src/affinity.rs`：类型、`grade_turn` 写入管线、
   端点派生、时间衰减、bond/chemistry 分数、档位、标签、`diff_labels`
 - `crates/eros-engine-core/src/scope.rs`：`AffinityScope` / `MemoryScope`、
-  `length_score`（见「`affinity.rs` 与 `scope.rs`」）
+  `length_score`、`romance_compatible`（见「`affinity.rs` 与 `scope.rs`」）
 - `crates/eros-engine-store/src/affinity.rs`：`AffinityRepo`
-  （`persist_with_event`、`record_ghost`、`persist_life_choice_drop_in_tx`、`last_judged_patiences`）；表在 `migrations/0000_baseline.sql`
+  （`persist_with_event`、`record_ghost`、`persist_life_choice_drop_in_tx`、`last_judged_endpoints`）；表在 `migrations/0000_baseline.sql`
 - `crates/eros-engine-store/src/life_choices.rs`：`LifeChoiceRepo`
   （选择行；`growth_slowed` 推算放缓窗口）
 - `crates/eros-engine-server/src/pipeline/post_process.rs`：LLM 评估、
