@@ -274,7 +274,7 @@ mod tests {
     use eros_engine_core::events::EventKind;
     use eros_engine_core::types::ActionType;
     use eros_engine_store::events::{EventRepo, NewEvent};
-    use eros_engine_store::life_choices::LifeChoiceRepo;
+    use eros_engine_store::life_choices::{LifeChoiceKind, LifeChoiceRepo};
     use eros_engine_store::persona::PersonaRepo;
     use serde_json::json;
     use sqlx::PgPool;
@@ -480,11 +480,11 @@ mod tests {
         }
 
         /// (status, tier_gap, message_id) of every choice in the session.
-        async fn choices(&self) -> Vec<(String, i16, Option<Uuid>)> {
+        async fn choices(&self) -> Vec<(String, Option<i16>, Option<Uuid>)> {
             self.choices_in(self.session_id).await
         }
 
-        async fn choices_in(&self, session_id: Uuid) -> Vec<(String, i16, Option<Uuid>)> {
+        async fn choices_in(&self, session_id: Uuid) -> Vec<(String, Option<i16>, Option<Uuid>)> {
             sqlx::query_as(
                 "SELECT status, tier_gap, message_id FROM engine.life_choices \
                   WHERE session_id = $1 ORDER BY asked_at",
@@ -552,8 +552,8 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(tier_gap, chem - bond, "the gap at ask time");
-        assert_eq!(tier_gap, 3);
+        assert_eq!(tier_gap, Some(chem - bond), "the gap at ask time");
+        assert_eq!(tier_gap, Some(3));
 
         // Her words: an ordinary assistant row, proactive, written as the
         // choice's message.
@@ -781,7 +781,7 @@ mod tests {
             let asked = s.choices_in(session).await;
             assert_eq!(!asked.is_empty(), asks, "bond {bond}, chemistry {chem}");
             if asks {
-                assert_eq!(asked[0].1, 2, "the gap stored is the gap at ask time");
+                assert_eq!(asked[0].1, Some(2), "the gap stored is the gap at ask time");
             }
         }
     }
@@ -856,7 +856,13 @@ mod tests {
             gateway_errors: None,
         };
         let choice = repo
-            .insert_ask(session_id, 3, None, &message)
+            .insert_ask(
+                session_id,
+                LifeChoiceKind::AskForSpace,
+                Some(3),
+                None,
+                &message,
+            )
             .await
             .unwrap()
             .expect("written");

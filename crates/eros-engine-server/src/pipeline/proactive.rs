@@ -33,7 +33,7 @@ use eros_engine_llm::openrouter::ChatMessage as WireMessage;
 use eros_engine_llm::provider::bare_model_id;
 use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::{ChatMessage, ChatRepo, ProactiveInsert};
-use eros_engine_store::life_choices::LifeChoiceRepo;
+use eros_engine_store::life_choices::{LifeChoiceKind, LifeChoiceRepo};
 use ulid::Ulid;
 use uuid::Uuid;
 
@@ -641,7 +641,13 @@ pub(crate) async fn greet(
             anchor_seen,
         }) => {
             let asked = LifeChoiceRepo { pool: &state.pool }
-                .insert_ask(g.session_id, *tier_gap, *anchor_seen, &row)
+                .insert_ask(
+                    g.session_id,
+                    LifeChoiceKind::AskForSpace,
+                    Some(*tier_gap),
+                    *anchor_seen,
+                    &row,
+                )
                 .await?;
             match asked {
                 Some(_) => Ok(chat_repo

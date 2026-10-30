@@ -1499,7 +1499,8 @@ mod tests {
         eros_engine_store::life_choices::LifeChoiceRepo { pool: &pool }
             .insert_ask(
                 session_id,
-                3,
+                eros_engine_store::life_choices::LifeChoiceKind::AskForSpace,
+                Some(3),
                 None,
                 &eros_engine_store::chat::ProactiveInsert {
                     id: Uuid::new_v4(),

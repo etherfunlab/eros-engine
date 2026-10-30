@@ -19,8 +19,41 @@ const PENDING_HOURS: i32 = 24;
 /// derived: `ends_at` of the separation the accepted choice wrote, plus this.
 const SLOWDOWN_HOURS: i32 = 72;
 
-/// The kind of the one choice there is.
-pub(crate) const ASK_FOR_SPACE: &str = "ask_for_space";
+/// What a choice asks of the user (spec 2026-10-30 §4.2): the stored `kind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifeChoiceKind {
+    /// She asks for a separation; the only kind that carries a `tier_gap`.
+    AskForSpace,
+    /// She asks to spend the night together.
+    SleepTogether,
+    /// She proposes.
+    Propose,
+}
+
+impl LifeChoiceKind {
+    /// The wire string stored in `engine.life_choices.kind`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AskForSpace => "ask_for_space",
+            Self::SleepTogether => "sleep_together",
+            Self::Propose => "propose",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "ask_for_space" => Some(Self::AskForSpace),
+            "sleep_together" => Some(Self::SleepTogether),
+            "propose" => Some(Self::Propose),
+            _ => None,
+        }
+    }
+
+    /// `sleep_together` or `propose`.
+    pub fn is_romantic(self) -> bool {
+        matches!(self, Self::SleepTogether | Self::Propose)
+    }
+}
 
 /// A choice's columns, in `LifeChoiceRecord` order.
 const COLUMNS: &str = "id, session_id, kind, status, tier_gap, asked_at, resolved_at, \
@@ -36,8 +69,8 @@ pub struct LifeChoiceRecord {
     pub kind: String,
     /// `pending`, `accepted`, `declined` or `ignored`.
     pub status: String,
-    /// The tier gap at ask time.
-    pub tier_gap: i16,
+    /// The tier gap at ask time; `ask_for_space` alone carries one (0083).
+    pub tier_gap: Option<i16>,
     pub asked_at: DateTime<Utc>,
     pub resolved_at: Option<DateTime<Utc>>,
     pub message_id: Option<Uuid>,
@@ -79,11 +112,13 @@ impl LifeChoiceRepo<'_> {
     /// the trigger judged by before generation ran: another ask landed or was
     /// answered meanwhile, and the streak it counted is stale. Both are read
     /// under the instance's lock, so asks and event writes of one instance
-    /// queue here. `asked_at` is the message's `sent_at`.
+    /// queue here. `asked_at` is the message's `sent_at`. `tier_gap` is
+    /// `Some` for `ask_for_space` and `None` for the romantic kinds (0083).
     pub async fn insert_ask(
         &self,
         session_id: Uuid,
-        tier_gap: i16,
+        kind: LifeChoiceKind,
+        tier_gap: Option<i16>,
         anchor_seen: Option<DateTime<Utc>>,
         message: &ProactiveInsert,
     ) -> Result<Option<LifeChoiceRecord>, sqlx::Error> {
@@ -131,7 +166,7 @@ impl LifeChoiceRepo<'_> {
              RETURNING {COLUMNS}"
         ))
         .bind(session_id)
-        .bind(ASK_FOR_SPACE)
+        .bind(kind.as_str())
         .bind(tier_gap)
         .bind(sent_at)
         .bind(message.id)
@@ -253,10 +288,10 @@ impl LifeChoiceRepo<'_> {
     }
 
     /// Whether `now` falls in the slowdown window of the session's newest
-    /// accepted choice: from the end of its separation (`persona_events.
-    /// ends_at`, through `event_id`) for 72 hours. Older accepted choices and
-    /// every other session of the instance have no say, and a choice whose
-    /// separation row is gone carries no window.
+    /// accepted `ask_for_space`: from the end of its separation (`persona_events.
+    /// ends_at`, through `event_id`) for 72 hours. Older accepted choices,
+    /// accepted romantic choices and every other session of the instance have
+    /// no say, and a choice whose separation row is gone carries no window.
     pub async fn growth_slowed(
         &self,
         session_id: Uuid,
@@ -267,6 +302,7 @@ impl LifeChoiceRepo<'_> {
                SELECT 1 \
                  FROM (SELECT event_id FROM engine.life_choices \
                         WHERE session_id = $1 AND status = 'accepted' \
+                          AND kind = 'ask_for_space' \
                         ORDER BY asked_at DESC LIMIT 1) c \
                  JOIN engine.persona_events e ON e.id = c.event_id \
                 WHERE e.ends_at <= $2 \
@@ -275,6 +311,25 @@ impl LifeChoiceRepo<'_> {
         .bind(session_id)
         .bind(now)
         .bind(SLOWDOWN_HOURS)
+        .fetch_one(self.pool)
+        .await
+    }
+
+    /// Whether `kind` was ever `accepted` or `ignored` in the session: it has
+    /// had its answer, and is not asked again (spec 2026-10-30 §4.6). A decline
+    /// or a pending ask does not settle it.
+    pub async fn settled(
+        &self,
+        session_id: Uuid,
+        kind: LifeChoiceKind,
+    ) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM engine.life_choices \
+                             WHERE session_id = $1 AND kind = $2 \
+                               AND status IN ('accepted', 'ignored'))",
+        )
+        .bind(session_id)
+        .bind(kind.as_str())
         .fetch_one(self.pool)
         .await
     }
@@ -385,7 +440,7 @@ mod tests {
             session_id: Uuid::new_v4(),
             kind: "ask_for_space".into(),
             status: status.into(),
-            tier_gap: 3,
+            tier_gap: Some(3),
             asked_at,
             resolved_at: (status != "pending").then(|| asked_at + Duration::minutes(1)),
             message_id: None,
@@ -418,6 +473,141 @@ mod tests {
         );
     }
 
+    #[test]
+    fn kind_round_trips_its_wire_string() {
+        for (kind, wire, romantic) in [
+            (LifeChoiceKind::AskForSpace, "ask_for_space", false),
+            (LifeChoiceKind::SleepTogether, "sleep_together", true),
+            (LifeChoiceKind::Propose, "propose", true),
+        ] {
+            assert_eq!(kind.as_str(), wire);
+            assert_eq!(LifeChoiceKind::parse(wire), Some(kind));
+            assert_eq!(kind.is_romantic(), romantic, "{wire}");
+        }
+        assert_eq!(LifeChoiceKind::parse("x"), None);
+        assert_eq!(LifeChoiceKind::parse(""), None);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn insert_ask_writes_the_kind_and_no_gap_for_a_romantic_ask(pool: PgPool) {
+        let (_, _, romantic_session) = instance_and_session(&pool).await;
+        let (_, _, space_session) = instance_and_session(&pool).await;
+        let repo = LifeChoiceRepo { pool: &pool };
+
+        let row = ask_message("今晚留下来好吗");
+        let romantic = repo
+            .insert_ask(
+                romantic_session,
+                LifeChoiceKind::SleepTogether,
+                None,
+                None,
+                &row,
+            )
+            .await
+            .unwrap()
+            .expect("written");
+        assert_eq!(romantic.kind, "sleep_together");
+        assert_eq!(romantic.tier_gap, None);
+        assert_eq!(romantic.status, "pending");
+        assert_eq!(romantic.message_id, Some(row.id));
+
+        let row = ask_message("我想先分开一阵子");
+        let space = repo
+            .insert_ask(
+                space_session,
+                LifeChoiceKind::AskForSpace,
+                Some(3),
+                None,
+                &row,
+            )
+            .await
+            .unwrap()
+            .expect("written");
+        assert_eq!(space.kind, "ask_for_space");
+        assert_eq!(space.tier_gap, Some(3));
+    }
+
+    /// A choice of `kind` in `status` for `session`, written straight into the table.
+    async fn seed_choice(pool: &PgPool, session: Uuid, kind: LifeChoiceKind, status: &str) {
+        sqlx::query(
+            "INSERT INTO engine.life_choices (session_id, kind, status, tier_gap, asked_at) \
+             VALUES ($1, $2, $3, $4, now())",
+        )
+        .bind(session)
+        .bind(kind.as_str())
+        .bind(status)
+        .bind((kind == LifeChoiceKind::AskForSpace).then_some(3_i16))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn settled_is_true_after_an_accept_or_an_ignore_only(pool: PgPool) {
+        let (_, _, session) = instance_and_session(&pool).await;
+        let (_, _, other) = instance_and_session(&pool).await;
+        let repo = LifeChoiceRepo { pool: &pool };
+        let settled = |session, kind| repo.settled(session, kind);
+
+        assert!(!settled(session, LifeChoiceKind::SleepTogether)
+            .await
+            .unwrap());
+        seed_choice(&pool, session, LifeChoiceKind::SleepTogether, "declined").await;
+        assert!(
+            !settled(session, LifeChoiceKind::SleepTogether)
+                .await
+                .unwrap(),
+            "a decline leaves it open"
+        );
+        seed_choice(&pool, session, LifeChoiceKind::SleepTogether, "pending").await;
+        assert!(
+            !settled(session, LifeChoiceKind::SleepTogether)
+                .await
+                .unwrap(),
+            "so does a pending ask"
+        );
+        seed_choice(&pool, session, LifeChoiceKind::SleepTogether, "ignored").await;
+        assert!(settled(session, LifeChoiceKind::SleepTogether)
+            .await
+            .unwrap());
+
+        seed_choice(&pool, session, LifeChoiceKind::Propose, "accepted").await;
+        assert!(settled(session, LifeChoiceKind::Propose).await.unwrap());
+        assert!(
+            !settled(other, LifeChoiceKind::SleepTogether).await.unwrap(),
+            "another session has its own"
+        );
+        assert!(
+            !settled(other, LifeChoiceKind::Propose).await.unwrap(),
+            "and its own kinds"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn growth_slowed_ignores_an_accepted_romantic_choice(pool: PgPool) {
+        let (_, instance, session) = instance_and_session(&pool).await;
+        let repo = LifeChoiceRepo { pool: &pool };
+        let now = Utc::now();
+        let starts = now - Duration::hours(19);
+        let ends = now - Duration::hours(1);
+        accepted_with_separation(
+            &pool,
+            instance,
+            session,
+            Duration::hours(20),
+            starts,
+            ends,
+            "k1",
+        )
+        .await;
+        assert!(repo.growth_slowed(session, now).await.unwrap());
+
+        // A newer accepted proposal carries no separation; it does not take the
+        // window over from the separation behind it.
+        seed_choice(&pool, session, LifeChoiceKind::Propose, "accepted").await;
+        assert!(repo.growth_slowed(session, now).await.unwrap());
+    }
+
     #[sqlx::test(migrations = "./migrations")]
     async fn by_message_ids_returns_only_the_asked_rows(pool: PgPool) {
         let (owner, instance, s1) = instance_and_session(&pool).await;
@@ -428,10 +618,17 @@ mod tests {
             .id;
         let repo = LifeChoiceRepo { pool: &pool };
         let m1 = ask_message("one");
-        let c1 = repo.insert_ask(s1, 3, None, &m1).await.unwrap().unwrap();
+        let c1 = repo
+            .insert_ask(s1, LifeChoiceKind::AskForSpace, Some(3), None, &m1)
+            .await
+            .unwrap()
+            .unwrap();
         repo.resolve(c1.id, "declined", Utc::now()).await.unwrap();
         let m2 = ask_message("two");
-        repo.insert_ask(s2, 3, None, &m2).await.unwrap().unwrap();
+        repo.insert_ask(s2, LifeChoiceKind::AskForSpace, Some(3), None, &m2)
+            .await
+            .unwrap()
+            .unwrap();
         sqlx::query(
             "INSERT INTO engine.life_choices (session_id, kind, status, tier_gap, asked_at) \
              VALUES ($1, 'ask_for_space', 'ignored', 3, now())",
@@ -453,14 +650,14 @@ mod tests {
         let (_, _, session) = instance_and_session(&pool).await;
         let m = ask_message("我想先分开一阵子");
         let choice = LifeChoiceRepo { pool: &pool }
-            .insert_ask(session, 3, None, &m)
+            .insert_ask(session, LifeChoiceKind::AskForSpace, Some(3), None, &m)
             .await
             .unwrap()
             .expect("written");
         assert_eq!(choice.session_id, session);
         assert_eq!(choice.kind, "ask_for_space");
         assert_eq!(choice.status, "pending");
-        assert_eq!(choice.tier_gap, 3);
+        assert_eq!(choice.tier_gap, Some(3));
         assert_eq!(choice.resolved_at, None);
         assert_eq!(choice.message_id, Some(m.id));
         assert_eq!(choice.event_id, None);
@@ -497,14 +694,26 @@ mod tests {
         let (_, _, session) = instance_and_session(&pool).await;
         let repo = LifeChoiceRepo { pool: &pool };
         let first = repo
-            .insert_ask(session, 2, None, &ask_message("第一次"))
+            .insert_ask(
+                session,
+                LifeChoiceKind::AskForSpace,
+                Some(2),
+                None,
+                &ask_message("第一次"),
+            )
             .await
             .unwrap()
             .expect("written");
         let second = ask_message("第二次");
         let anchor = repo.streak_anchor(session).await.unwrap();
         assert!(repo
-            .insert_ask(session, 4, anchor, &second)
+            .insert_ask(
+                session,
+                LifeChoiceKind::AskForSpace,
+                Some(4),
+                anchor,
+                &second
+            )
             .await
             .unwrap()
             .is_none());
@@ -531,7 +740,13 @@ mod tests {
         let third = ask_message("过了一天再问");
         let anchor = repo.streak_anchor(session).await.unwrap();
         assert!(repo
-            .insert_ask(session, 4, anchor, &third)
+            .insert_ask(
+                session,
+                LifeChoiceKind::AskForSpace,
+                Some(4),
+                anchor,
+                &third
+            )
             .await
             .unwrap()
             .is_some());
@@ -547,7 +762,13 @@ mod tests {
             .expect("resolved");
         let anchor = repo.streak_anchor(session).await.unwrap();
         assert!(repo
-            .insert_ask(session, 2, anchor, &ask_message("再问"))
+            .insert_ask(
+                session,
+                LifeChoiceKind::AskForSpace,
+                Some(2),
+                anchor,
+                &ask_message("再问")
+            )
             .await
             .unwrap()
             .is_some());
@@ -558,7 +779,13 @@ mod tests {
         let (_, _, session) = instance_and_session(&pool).await;
         let repo = LifeChoiceRepo { pool: &pool };
         let choice = repo
-            .insert_ask(session, 3, None, &ask_message("想先分开"))
+            .insert_ask(
+                session,
+                LifeChoiceKind::AskForSpace,
+                Some(3),
+                None,
+                &ask_message("想先分开"),
+            )
             .await
             .unwrap()
             .expect("written");
@@ -594,7 +821,13 @@ mod tests {
             .await
             .unwrap();
         let lapsing = repo
-            .insert_ask(session, 3, None, &ask_message("再想想"))
+            .insert_ask(
+                session,
+                LifeChoiceKind::AskForSpace,
+                Some(3),
+                None,
+                &ask_message("再想想"),
+            )
             .await
             .unwrap()
             .expect("written");
@@ -624,7 +857,13 @@ mod tests {
         let (_, _, session) = instance_and_session(&pool).await;
         let repo = LifeChoiceRepo { pool: &pool };
         let choice = repo
-            .insert_ask(session, 2, None, &ask_message("想先分开"))
+            .insert_ask(
+                session,
+                LifeChoiceKind::AskForSpace,
+                Some(2),
+                None,
+                &ask_message("想先分开"),
+            )
             .await
             .unwrap()
             .expect("written");
@@ -669,7 +908,13 @@ mod tests {
         let (_, other_instance, _) = instance_and_session(&pool).await;
         let repo = LifeChoiceRepo { pool: &pool };
         let choice = repo
-            .insert_ask(asked_in, 3, None, &ask_message("想先分开"))
+            .insert_ask(
+                asked_in,
+                LifeChoiceKind::AskForSpace,
+                Some(3),
+                None,
+                &ask_message("想先分开"),
+            )
             .await
             .unwrap()
             .expect("written");
@@ -706,7 +951,13 @@ mod tests {
             let pool = pool.clone();
             async move {
                 LifeChoiceRepo { pool: &pool }
-                    .insert_ask(session, 3, None, &message)
+                    .insert_ask(
+                        session,
+                        LifeChoiceKind::AskForSpace,
+                        Some(3),
+                        None,
+                        &message,
+                    )
                     .await
                     .unwrap()
             }
@@ -770,7 +1021,7 @@ mod tests {
             let (pool, message) = (pool.clone(), waiting_message.clone());
             async move {
                 LifeChoiceRepo { pool: &pool }
-                    .insert_ask(second, 3, None, &message)
+                    .insert_ask(second, LifeChoiceKind::AskForSpace, Some(3), None, &message)
                     .await
                     .unwrap()
             }
@@ -799,7 +1050,13 @@ mod tests {
 
         // Meanwhile another ask landed and was answered.
         let earlier = repo
-            .insert_ask(session, 3, seen, &ask_message("想先分开"))
+            .insert_ask(
+                session,
+                LifeChoiceKind::AskForSpace,
+                Some(3),
+                seen,
+                &ask_message("想先分开"),
+            )
             .await
             .unwrap()
             .expect("written");
@@ -816,7 +1073,7 @@ mod tests {
 
         let stale = ask_message("又想分开");
         assert!(repo
-            .insert_ask(session, 3, seen, &stale)
+            .insert_ask(session, LifeChoiceKind::AskForSpace, Some(3), seen, &stale)
             .await
             .unwrap()
             .is_none());
@@ -826,7 +1083,13 @@ mod tests {
             "the stale ask leaves no message"
         );
         assert!(repo
-            .insert_ask(session, 3, moved, &ask_message("又想分开"))
+            .insert_ask(
+                session,
+                LifeChoiceKind::AskForSpace,
+                Some(3),
+                moved,
+                &ask_message("又想分开")
+            )
             .await
             .unwrap()
             .is_some());
@@ -840,7 +1103,13 @@ mod tests {
         let (_, instance, session) = instance_and_session(&pool).await;
         let repo = LifeChoiceRepo { pool: &pool };
         let choice = repo
-            .insert_ask(session, 3, None, &ask_message("想先分开"))
+            .insert_ask(
+                session,
+                LifeChoiceKind::AskForSpace,
+                Some(3),
+                None,
+                &ask_message("想先分开"),
+            )
             .await
             .unwrap()
             .expect("written");
@@ -907,7 +1176,13 @@ mod tests {
 
         // Asked and waiting: the ask itself.
         let choice = repo
-            .insert_ask(session, 3, None, &ask_message("想先分开"))
+            .insert_ask(
+                session,
+                LifeChoiceKind::AskForSpace,
+                Some(3),
+                None,
+                &ask_message("想先分开"),
+            )
             .await
             .unwrap()
             .expect("written");
@@ -957,7 +1232,13 @@ mod tests {
         // The newest choice speaks, and a sibling session's episode has no say.
         let anchor = repo.streak_anchor(session).await.unwrap();
         let later = repo
-            .insert_ask(session, 2, anchor, &ask_message("又来了"))
+            .insert_ask(
+                session,
+                LifeChoiceKind::AskForSpace,
+                Some(2),
+                anchor,
+                &ask_message("又来了"),
+            )
             .await
             .unwrap()
             .expect("written");
@@ -974,7 +1255,13 @@ mod tests {
         let repo = LifeChoiceRepo { pool: &pool };
         assert_eq!(repo.get(Uuid::new_v4()).await.unwrap(), None);
         let choice = repo
-            .insert_ask(session, 3, None, &ask_message("想先分开"))
+            .insert_ask(
+                session,
+                LifeChoiceKind::AskForSpace,
+                Some(3),
+                None,
+                &ask_message("想先分开"),
+            )
             .await
             .unwrap()
             .expect("written");
@@ -1002,7 +1289,13 @@ mod tests {
         let (_, instance, session) = instance_and_session(&pool).await;
         let repo = LifeChoiceRepo { pool: &pool };
         let choice = repo
-            .insert_ask(session, 3, None, &ask_message("想先分开"))
+            .insert_ask(
+                session,
+                LifeChoiceKind::AskForSpace,
+                Some(3),
+                None,
+                &ask_message("想先分开"),
+            )
             .await
             .unwrap()
             .expect("written");
@@ -1114,7 +1407,13 @@ mod tests {
         let (_, instance, session) = instance_and_session(&pool).await;
         let repo = LifeChoiceRepo { pool: &pool };
         let choice = repo
-            .insert_ask(session, 3, None, &ask_message("想先分开"))
+            .insert_ask(
+                session,
+                LifeChoiceKind::AskForSpace,
+                Some(3),
+                None,
+                &ask_message("想先分开"),
+            )
             .await
             .unwrap()
             .expect("written");
@@ -1167,7 +1466,13 @@ mod tests {
         let (_, instance, session) = instance_and_session(&pool).await;
         let repo = LifeChoiceRepo { pool: &pool };
         let choice = repo
-            .insert_ask(session, 3, None, &ask_message("想先分开"))
+            .insert_ask(
+                session,
+                LifeChoiceKind::AskForSpace,
+                Some(3),
+                None,
+                &ask_message("想先分开"),
+            )
             .await
             .unwrap()
             .expect("written");
@@ -1229,7 +1534,13 @@ mod tests {
         let (_, instance, session) = instance_and_session(&pool).await;
         let repo = LifeChoiceRepo { pool: &pool };
         let choice = repo
-            .insert_ask(session, 3, None, &ask_message("想先分开"))
+            .insert_ask(
+                session,
+                LifeChoiceKind::AskForSpace,
+                Some(3),
+                None,
+                &ask_message("想先分开"),
+            )
             .await
             .unwrap()
             .expect("written");
@@ -1257,10 +1568,16 @@ mod tests {
                 .execute(&pool)
                 .await
                 .unwrap();
-            repo.insert_ask(session, 3, None, &ask_message("再想想"))
-                .await
-                .unwrap()
-                .expect("written")
+            repo.insert_ask(
+                session,
+                LifeChoiceKind::AskForSpace,
+                Some(3),
+                None,
+                &ask_message("再想想"),
+            )
+            .await
+            .unwrap()
+            .expect("written")
         };
         assert!(
             convert_in_tx(&pool, &lapsing, instance, lapsing.expires_at(), true)
@@ -1278,7 +1595,13 @@ mod tests {
     async fn concurrent_resolves_in_transactions_first_writer_wins(pool: PgPool) {
         let (_, _, session) = instance_and_session(&pool).await;
         let choice = LifeChoiceRepo { pool: &pool }
-            .insert_ask(session, 3, None, &ask_message("想先分开"))
+            .insert_ask(
+                session,
+                LifeChoiceKind::AskForSpace,
+                Some(3),
+                None,
+                &ask_message("想先分开"),
+            )
             .await
             .unwrap()
             .expect("written");
@@ -1329,7 +1652,13 @@ mod tests {
         let repo = LifeChoiceRepo { pool };
         let anchor = repo.streak_anchor(session).await.unwrap();
         let choice = repo
-            .insert_ask(session, 3, anchor, &ask_message("想先分开"))
+            .insert_ask(
+                session,
+                LifeChoiceKind::AskForSpace,
+                Some(3),
+                anchor,
+                &ask_message("想先分开"),
+            )
             .await
             .unwrap()
             .expect("written");

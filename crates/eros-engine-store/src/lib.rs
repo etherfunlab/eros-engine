@@ -1468,4 +1468,38 @@ mod migration_tests {
             "engine.insights_2_backfill() must be dropped"
         );
     }
+
+    /// 0083. `tier_gap` belongs to `ask_for_space` alone: a romantic choice
+    /// carries none, an `ask_for_space` must carry one.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn migration_0083_ties_tier_gap_to_the_kind(pool: PgPool) {
+        let session = crate::testutil::seed_chat_session(&pool, uuid::Uuid::new_v4()).await;
+        let insert = |kind: &'static str, gap: Option<i16>| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO engine.life_choices (session_id, kind, tier_gap, asked_at) \
+                     VALUES ($1, $2, $3, now())",
+                )
+                .bind(session)
+                .bind(kind)
+                .bind(gap)
+                .execute(&pool)
+                .await
+            }
+        };
+
+        assert!(insert("sleep_together", None).await.is_ok());
+        assert!(insert("propose", None).await.is_ok());
+        assert!(insert("ask_for_space", Some(3)).await.is_ok());
+        assert!(
+            insert("ask_for_space", None).await.is_err(),
+            "an ask_for_space must carry its gap"
+        );
+        assert!(
+            insert("propose", Some(3)).await.is_err(),
+            "a romantic choice carries no gap"
+        );
+        assert!(insert("sleep_together", Some(3)).await.is_err());
+    }
 }

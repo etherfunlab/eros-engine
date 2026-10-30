@@ -257,7 +257,10 @@ pub(crate) async fn respond_at(
     };
     let separation = match req.response {
         LifeChoiceAnswer::Accept => {
-            let lasts = Duration::hours(SEPARATION_HOURS_PER_TIER * i64::from(choice.tier_gap));
+            let lasts = Duration::hours(
+                SEPARATION_HOURS_PER_TIER
+                    * i64::from(choice.tier_gap.expect("ask_for_space carries a gap (0083)")),
+            );
             let event = EventRepo::insert_preempting_in_tx(
                 &mut tx,
                 &NewEvent {
