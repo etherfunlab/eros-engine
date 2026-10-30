@@ -22,6 +22,8 @@
   holiday line and its timezone rule), `2026-08-09-voice-memory-bootstrap-
   recall-design.md` (the voice snapshot).
 - **Version:** v2.6.0.
+- **Amended:** to match the shipped code — §2 (11), §3.1, §3.4, §4.1–§4.4,
+  §5.2, §6.1, §6.2, §7, §8, §9, §10.
 
 ## 1. Motivation
 
@@ -135,8 +137,8 @@ marked as roleplay.
     voice path; the sweeper picks it up) and its rows enter the transcript
     with audio tags stripped, as today. `DREAMING_VOICE_DISABLED` stays as
     the exclusion switch. The relationship context (arc, episodes, journal)
-    is injected on 1:1 text turns and the voice bootstrap; group seats keep
-    raw recall only.
+    is injected on every 1:1 prompt (text turns, proactive messages, image
+    edits) and the voice bootstrap; group seats keep raw recall only.
 12. **Mechanism journal rows never call out to the embedding service.** The
     journal's `embedding` is nullable; engine rows are inserted inside the
     transaction that already knows the moment (the affinity event write, the
@@ -156,6 +158,7 @@ Names are the builder's to adjust.
 CREATE TABLE engine.relationship_scan_state (
     instance_id          UUID PRIMARY KEY REFERENCES engine.persona_instances(id) ON DELETE CASCADE,
     scanned_through_at   TIMESTAMPTZ NOT NULL,   -- exclusive cursor on chat_messages.sent_at
+    live_from_at         TIMESTAMPTZ NOT NULL,   -- the cursor at creation; never moves (§9)
     pending_turns        INT NOT NULL DEFAULT 0, -- user rows after the cursor
     last_turn_at         TIMESTAMPTZ,
     last_scanned_at      TIMESTAMPTZ,
@@ -174,9 +177,13 @@ CREATE TABLE engine.relationship_scan_state (
   anniversary line never renders for that user anyway (same rule as the
   holiday line).
 - Creation: on the first bump for an instance, `scanned_through_at` is set
-  to the `sent_at` of the newest text row older than the triggering user
-  row, or that user row's `sent_at` minus one microsecond when none exists.
-  History before the cursor is the backfill's job (§9).
+  to the `sent_at` of the instance's newest chat row older than the
+  triggering user row, or that user row's `sent_at` minus one microsecond
+  when none exists. `live_from_at` takes the same value and never moves: it
+  is where live scanning began. History up to it is the backfill's job (§9).
+  The backfill creates the row for a relationship that has not chatted since
+  the upgrade, with both at its newest row and nothing pending.
+- The cursor only moves forward (`GREATEST` on every settle).
 
 ### 3.2 Episodes
 
@@ -225,7 +232,7 @@ CREATE TABLE engine.relationship_journal (
     summary          TEXT NOT NULL,              -- one sentence, ≤ 200 chars
     source           TEXT NOT NULL CHECK (source IN ('llm','engine')),
     message_id       UUID REFERENCES engine.chat_messages(id) ON DELETE SET NULL,
-    affinity_event_id BIGINT REFERENCES engine.companion_affinity_events(id) ON DELETE SET NULL,
+    affinity_event_id UUID REFERENCES engine.companion_affinity_events(id) ON DELETE SET NULL,
     dedup_key        TEXT,                       -- §5.3; NULL = repeatable kind
     due_on           DATE,                       -- promise / shared_plan with a date
     recurrence       TEXT NOT NULL CHECK (recurrence IN ('none','monthly_then_yearly','on_due')),
@@ -272,29 +279,37 @@ the arc guards; it carries nothing erasure would need to blank.
 
 ### 4.1 Trigger and claim
 
-- **Bump.** `post_process::run` on a 1:1 text turn whose user row was
-  persisted (not group; ghost and proactive turns do not count) upserts the
-  state row: `pending_turns + 1`, `last_turn_at = now()`, `user_timezone`
-  refreshed when the turn carried a valid one (the locale rides on the
-  turn's `UserMsg`, so `run` gains a parameter for it). The voice route does
-  the same bump after persisting a voice user row, without the K-trigger
-  below. When the bump creates the row, the engine also writes the
-  `first_meet` journal row (§5.2).
+- **Bump.** `post_process::run`, before its other work, counts every 1:1 user turn
+  that reaches it with its user row in a live session (not group; proactive
+  turns are not user turns; a PDE ghost never reaches post-process; an
+  image-edit turn counts): it upserts the state row, `pending_turns + 1`,
+  `last_turn_at = now()`, `user_timezone` refreshed when the turn carried a
+  valid one (the locale rides on the turn's `UserMsg`, so `run` gains a
+  parameter for it). The voice route does the same bump after persisting a
+  voice user row, off the reply path, without a timezone and without the
+  K-trigger below, and skips it while `DREAMING_VOICE_DISABLED` is set. When
+  the bump creates the row or leaves exactly one pending turn, the engine
+  writes the `first_meet` journal row unless its dedup key is taken (§5.2).
 - **K-trigger.** When a text-turn bump returns `pending_turns ≥ 20`, the
-  post-process task claims the row and scans inline (off the reply path, as
-  the profile rebuild does).
+  post-process task, after the turn's other post-process work, claims the
+  row and scans inline (off the reply path, as the profile rebuild does).
+  The claim itself requires `pending_turns ≥ 20` on the row, so a count read
+  before another scan settled claims nothing.
 - **Idle flush.** The dreaming sweeper (existing envs `DREAMING_DISABLED`,
   `DREAMING_TICK_SECS` default 300, `DREAMING_IDLE_SECS` default now 3600,
   `DREAMING_CLAIM_STALE_SECS` default 600, `DREAMING_VOICE_DISABLED`
-  unchanged in meaning: voice rows leave the transcript and voice turns stop
-  bumping) first embeds pending journal rows (decision 12), then claims rows
-  with `pending_turns ≥ 3 AND last_turn_at < now() - idle AND (claimed_at IS
-  NULL OR stale)`, batch 10, `FOR UPDATE SKIP LOCKED`, refreshing the claim
-  before each relationship as `profile_rebuild` does. K, the floor and M are
-  code constants beside `REBUILD_K`.
-- The sweeper and the inline trigger are both inert when
-  `[tasks.dreaming_scan]` is absent from the model config (today's
-  behaviour for `memory_extraction`).
+  unchanged in meaning: voice sessions leave the transcript and voice turns
+  stop bumping) first embeds pending journal rows (decision 12), then claims
+  rows with `pending_turns ≥ 3 AND last_turn_at < now() - idle AND
+  (claimed_at IS NULL OR stale)`, batch 10, `FOR UPDATE SKIP LOCKED`,
+  refreshing the claim before each relationship as `profile_rebuild` does.
+  K, the floor and M are code constants beside `REBUILD_K`.
+- `DREAMING_DISABLED=1` (or a zero tick) stops the sweeper **and** the
+  inline K-path scans: the variable means "no dreaming spend". The sweeper
+  and the inline trigger are both inert when `[tasks.dreaming_scan]` is
+  absent from the model config (today's behaviour for `memory_extraction`).
+  Bumps, mechanism journal rows and the injection of what exists (context,
+  anniversary lines) run either way: they cost no LLM call.
 
 ### 4.2 What a scan reads
 
@@ -303,13 +318,19 @@ Rows of the pair's non-archived text and voice sessions
 instance; voice sessions dropped when `DREAMING_VOICE_DISABLED` is set) with
 `role IN ('user','assistant')`, `chat_messages.channel IS NULL OR 'voice'`,
 `sent_at > scanned_through_at AND sent_at <= bound`, ordered by `sent_at`
-across sessions, capped at **60 rows** per scan. `bound` is the triggering
-turn's assistant row `sent_at` on the K path (the user row's when the turn
-produced no assistant row) and `now()` on the idle path, so a turn in
-flight is never half-read. When the cap cuts, the cursor advances to the
-last row read, `pending_turns` is decremented by the user rows covered, and
-the remainder waits for the next claim (the row is still due). The owner id
-the profile-layer upsert needs comes from `persona_instances.owner_uid`.
+across sessions, capped at **60 rows** per scan. `bound` is the newest
+`sent_at` among the triggering turn's user row and the rows it produced on
+the K path, and `now()` on the idle path, so a turn in flight is never
+half-read. When the cap cuts, trailing rows that share the last `sent_at`
+are dropped from the read (the cursor is exclusive on `sent_at`; a segment
+that is one timestamp throughout is kept), the cursor advances to the last
+row kept, `pending_turns` is decremented by the user rows covered, and the
+remainder waits for the next claim (the row is still due). A segment with
+nothing readable (no rows, or nothing left once audio tags are stripped)
+settles without a call: the cursor moves to the bound (or the last row) and
+the whole pending count clears, so unreadable turns cannot re-claim the row
+on every tick. The owner id the profile-layer upsert needs comes from
+`persona_instances.owner_uid`.
 
 Each row renders as `[#<index> YYYY-MM-DD HH:MM] 用户：…` / `AI：…` in the
 state's timezone (UTC when none); the index is the journal source pointer.
@@ -321,9 +342,11 @@ render through `user_text_with_action`, and an action with a recorded
 what was offered and whether it was accepted.
 
 Writes at the end of a scan (episode, journal, cursor) are conditional on
-the state row still existing and carrying this job's claim, mirroring
+the state row still existing and carrying a claim, mirroring
 `replace_profile_if_claimed`: an archive landing mid-scan deletes the row
-and the scan's products are discarded.
+and the scan's products are discarded (the event row records `empty`). The
+profile memories, which have no guard of their own, are written only after
+a `refresh_claim` right before the writes succeeds.
 
 ### 4.3 The call
 
@@ -353,17 +376,27 @@ Contract (engine-parsed; the example prompt states it):
   `real`/`roleplay` → `roleplay`; `occurred_at` must equal the date of some
   covered row's stamp, else dropped; `source` must resolve to a covered row,
   else `message_id` NULL but the row is kept; `due` parsed into `due_on`
-  only for `promise`/`shared_plan`. Summary embedded with `embed_document`.
+  only for `promise`/`shared_plan`.
+- **Order after the call.** The owner is read (only when there are
+  memories), then every memory content and journal summary is embedded in
+  one `embed_documents` call, all before the claim re-check, so the check
+  and the writes it guards are only database round trips apart. Then the
+  writes: episode → profile memories → journal. The episode's claim guard is
+  the first to hold, so a lost claim or a failed episode insert leaves no
+  memory behind to be written twice on retry.
 - Outcome semantics mirror the profile rebuild: `ok`/`empty` → cursor
   advances, `pending_turns -= covered user rows`, `scan_failures = 0`,
-  `claimed_at = NULL`. `parse_error` / transport failure → cursor stays,
+  `claimed_at = NULL`. `parse_error`, a transport failure, a failed or
+  short embedding call, or a database error on the owner lookup or the
+  episode insert → the scan **fails**, it is not settled: cursor stays,
   `scan_failures + 1`, `last_turn_at = now()` (one idle period of backoff),
   `claimed_at = NULL`; at three consecutive failures the cursor advances past
   the segment with a warning (the segment is lost to the scan but its raw
   rows remain), `scan_failures = 0`.
-- Every scan writes one `relationship_scan_events` row (`kind = 'scan'`)
-  with `served_fallback = (served_hop != primary)`. A fallback-served scan
-  logs at warn with the journal count.
+- Every scan that reached the model writes one `relationship_scan_events`
+  row (`kind = 'scan'`) with `served_fallback = (served_hop != primary)`; a
+  scan that needed no call writes none. A fallback-served scan logs at warn
+  with the journal count, whatever its status.
 
 ### 4.4 Arc rewrite
 
@@ -393,13 +426,19 @@ Engine guards, checked in this order:
    **70%** of it → `rejected`.
 4. First rewrite: `opening` missing or over 150 chars → `rejected`.
 
-Accepted: `previous_arc = arc`, `arc = new`, `folded_through` = newest
-folded episode's `ended_at`, those episodes `folded = true`,
-`episodes_since_arc = 0`, `arc_failures = 0`. Rejected or failed:
-`arc_failures + 1`, nothing written; at three consecutive the pending
-episodes are marked folded anyway with a warning and the counter resets —
-the previous arc keeps serving. One `relationship_scan_events` row per
-attempt (`kind = 'arc'`).
+The fold is reserved before the call: `episodes_since_arc` resets to 0 when
+the rewrite starts (the failure streak stays), so scans landing during the
+call cannot start a second rewrite over the same episodes. Accepted: the arc
+is written through `ArcRepo::replace_if_live`, which writes only while the
+relationship's state row exists (checked under `FOR KEY SHARE`, §8) —
+`previous_arc = arc`, `arc = new`, `folded_through` = newest folded
+episode's `ended_at` — then those episodes `folded = true` and
+`arc_failures = 0`. A relationship archived or erased during the call gets
+no arc (status `empty`). Rejected or failed: `arc_failures + 1`, nothing
+written, and the waiting episodes ride into the rewrite at the next fourth
+episode; at three consecutive the pending episodes are marked folded anyway
+with a warning and the counter resets — the previous arc keeps serving. One
+`relationship_scan_events` row per attempt (`kind = 'arc'`).
 
 ## 5. Journal
 
@@ -444,15 +483,15 @@ uses, inserted without an embedding (decision 12), dated in the turn's user
 timezone (UTC when absent). The tier rows are inserted by the store inside
 `persist_with_event`'s transaction (it is where `label_changes` is known;
 the method gains the inputs it needs — a published-crate signature change
-covered by the release), the gift and kiss rows right after
-`set_action_response` in the same store call.
+covered by the release), the gift and kiss rows inside
+`set_action_response`'s transaction.
 
 | Moment | Where it is written | `kind` | `dedup_key` | `recurrence` |
 |---|---|---|---|---|
-| First message of the relationship | state-row creation (§4.1); `occurred_on` = date of the pair's earliest text row across non-archived sessions, so pre-existing relationships get their real date | `first_meet` | `first_meet` | `monthly_then_yearly` |
+| First message of the relationship | the bump that creates the state row or leaves exactly one pending turn (§4.1) — so after a backfill opened the row, the relationship's next live turn; `occurred_on` = date of the pair's earliest user/assistant row across non-archived text and voice sessions (product Q&A rows excluded), so pre-existing relationships get their real date | `first_meet` | `first_meet` | `monthly_then_yearly` |
 | A line's label moves up (`label_changes.bond.to` / `.chemistry.to` higher than `from`) | the affinity write in post-process, same transaction as the event row; `affinity_event_id` set | `tier_reached` | `bond:<label>` / `chemistry:<label>` | `none` |
-| A line's label moves down | same place: delete this instance's `tier_reached` rows on that line whose tier is above the new label **and** `created_at > now() - 24h` | — | — | — |
-| `give` / `gift` / `tip` action with `response = accept` | post-process, after `set_action_response` | `gift` | `gift:<user message id>` | `none` |
+| A line's label moves down | same place, and the life-choice tier drop's transaction: delete this instance's `tier_reached` rows on that line whose tier is above the new label **and** `created_at > now() - 24h` | — | — | — |
+| `give` / `gift` / `tip` action with `response = accept` | `set_action_response`'s transaction | `gift` | `gift:<user message id>` | `none` |
 | `kiss` action with `response = accept` | same | `first_intimacy` | `first_intimacy:real` | `none` |
 
 `hug`, `touch`, `lick` and `custom` actions are not journaled. First-reach
@@ -497,7 +536,8 @@ One new store call, `load_relationship_context(instance_id)`, returns the
 arc row, the three most recent episodes by `ended_at` (folded or not), and
 the recurring journal rows — a handful of indexed reads, run beside
 `character_insights` in the sequential chain of `build_reply_request_with`
-(1:1 text turns only; group passes `None`). Journal semantic recall reuses
+(every 1:1 caller: text turns, proactive messages, session events, image
+edits; group passes `None`). Journal semantic recall reuses
 the turn's query embedding (as world and stories do): top-2 by cosine over
 this instance's journal rows, only when the relationship layer is on.
 
@@ -522,7 +562,10 @@ this instance's journal rows, only when the relationship layer is on.
   follow under the same header are outside it). Cut order when over:
   episodes oldest-first, then raw rows lowest-ranked first, then journal
   rows. The arc is never cut here (it is capped on write).
-- Empty everything → today's placeholder. Any part present → no placeholder.
+- The new shape and its budget apply only when the context has an arc, an
+  episode or a journal hit. Otherwise (no context, group seats, a
+  relationship with none of the three yet) the block renders exactly as
+  today: raw rows with no budget, the placeholder when there are none.
 - The ordering test ("everything before `[user_profile]` is byte-identical
   across turns") is unaffected; the block already varies per turn.
 
@@ -542,8 +585,11 @@ unchanged; journal search does not run on voice.
   system (the dedup key enforces it regardless). Required for the scanner
   to run at all.
 - New `[tasks.arc_rewrite]`: model, `max_tokens`, sampling. No prompt field
-  (engine-owned). Missing block → arc rewrites are skipped with a one-time
-  warning; episodes and journal still run.
+  (engine-owned; a `filter_prompt` in any shape refuses boot). Missing block
+  → arc rewrites are skipped with a one-time warning; episodes and journal
+  still run, and episodes accumulate unfolded, so the first rewrite after
+  the block is added folds the whole backlog in one call. Deployments
+  configure it together with `dreaming_scan`.
 - Both names join `KNOWN_CHAT_TASKS`; `validate_extraction_prompts` covers
   `dreaming_scan`.
 
@@ -555,6 +601,13 @@ unchanged; journal search does not run on voice.
   `instance_id` set NULL only when the instance itself goes). A relationship
   restarted on the same instance gets a fresh `first_meet` from its first
   non-archived row.
+- The state row is deleted first in both, and every claim-guarded scanner
+  insert (episode, journal) and the arc's `replace_if_live` take
+  `FOR KEY SHARE` on it. A delete that has not committed holds such a write
+  until it does, and the write then finds no row and writes nothing; a write
+  already in flight lands before the deletes that follow remove it. Under
+  READ COMMITTED a plain `EXISTS` check would let the write race the
+  archive or erase.
 - `erasure.rs` `DERIVED` gains the same four tables under `BY_INSTANCE`;
   `relationship_scan_events` is listed as kept (no payload to blank). The
   erasure test's table lists and the docs' per-table report example are
@@ -566,33 +619,58 @@ unchanged; journal search does not run on voice.
 [--instance <uuid>]`, run by the operator against the same config and
 database as `serve`:
 
-- Candidates: instances whose non-archived text rows older than
-  `scanned_through_at` (or all rows, for instances with no state row yet —
-  the command creates the state row with the cursor at the newest row)
-  number at least `--min-rows`, excluding rows already before
-  `backfilled_through_at`.
-- Each instance's history is walked oldest-first in segments of at most 60
-  rows cut at user-turn boundaries, each segment through the normal scan
-  path (§4.2–4.4, `kind = 'backfill'` on the event row), advancing
-  `backfilled_through_at`. Arc rewrites fold as episodes accumulate.
-- Profile memories are written only from segments whose last row is later
-  than the covering session's `classified_at` (or whose session was never
-  stamped), so rows the retired sweeper already extracted are not extracted
-  twice; episode and journal are always written. This is the last reader of
+- The window: an instance's user/assistant rows of non-archived text and
+  voice sessions (voice unless `DREAMING_VOICE_DISABLED`) in
+  `(backfilled_through_at, live_from_at]` — not bounded by the moving live
+  cursor, so rows live scanning already read are never read again. An
+  instance with no state row yet has its whole history in the window; the
+  command creates the row with `scanned_through_at = live_from_at` at the
+  newest row and nothing pending.
+- Candidates: instances with at least `--min-rows` rows in the window
+  (default 20; `--instance` without `--min-rows` ⇒ 1), most rows first, at
+  most `--limit`.
+- Each instance's window is walked oldest-first in segments of at most 60
+  rows. When more rows follow, a segment ends after its last assistant row
+  that a later row follows (else after its last row a later row follows),
+  so no timestamp is split. Each segment takes its own claim
+  (`claim_for_backfill`, which needs no pending turns), runs through the
+  normal scan path (§4.2–4.4, `kind = 'backfill'` on the event row), and
+  releases the claim, so a live scan waits one segment at most; a
+  relationship a live scan holds is skipped and left to the next run. A
+  backfill segment settles only `backfilled_through_at` (claim-guarded) and
+  never touches the live cursor, `pending_turns` or `scan_failures`; a
+  failed or discarded segment stops that instance, and the next run starts
+  with it. Arc rewrites fold as episodes accumulate.
+- Profile memories are written only from segments holding a row later than
+  its session's `classified_at` (or whose session was never stamped), so
+  rows the retired sweeper already extracted are not extracted twice;
+  episode and journal are always written. This is the last reader of
   `classified_at`.
-- `--dry-run` prints per-instance segment counts and the total number of
-  scan calls (plus the implied arc rewrites) and exits. A real run prints
-  the same table, then runs, then prints per-status counts. Resumable: an
-  interrupted run restarts from each instance's `backfilled_through_at`.
+- The backfill does not journal `first_meet`: it knows no timezone. The
+  relationship's first live turn writes it (§5.2), dated in the user's
+  timezone, keyed by the dedup key.
+- `--dry-run` prints per-instance row and segment counts and the total
+  number of scan calls (plus the implied arc rewrites, `(episodes waiting +
+  segments) / 4` per instance) and exits; it reads the database and the
+  model config and needs no API key. A real run prints the same table, then
+  runs, then prints per-status counts. Resumable: an interrupted run
+  restarts from each instance's `backfilled_through_at`.
+- Without `[tasks.dreaming_scan]` the command exits 2, checked before any
+  client is built (dry run included).
 - The command is never scheduled; it is a manual operator step, like
-  `seed-personas`.
+  `seed-personas`. It does not read `DREAMING_DISABLED`.
 
 ## 10. Rollback and versioning
 
+- Deploy order: `migrate` before the new image serves. Journal inserts share
+  the affinity write's and the action response's transactions, so a missing
+  table would roll those writes back.
 - New tables are invisible to the previous image. `classified_at` is no
   longer written, so a rolled-back image re-sweeps unstamped sessions once
   under the old per-session rule — accepted. The old image must not run
-  `migrate`.
+  `migrate`. Its archive and erasure do not reach the four new tables;
+  relationships archived (or users erased) while rolled back are cleaned up
+  by instance before re-upgrading.
 - v2.6.1 drops `chat_sessions.classified_at` and
   `classification_claimed_at` once 2.6.0 has held.
 - **Version v2.6.0.** Migration guide covers: the retired
