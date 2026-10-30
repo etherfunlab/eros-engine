@@ -75,11 +75,13 @@ pub(crate) async fn growth_scale_for(
 const FELL_OUT_HOURS: i64 = 1;
 
 /// The ignore path (spec §3.4c): an ordinary text turn that arrives while she
-/// waits for an answer is the answer. The choice becomes `ignored` and a
-/// `fell_out` event starts at the user's row, in one transaction, so the turn
-/// that ignored her reads the falling-out in its events. An incident under
-/// way ends there, a background keeps running. No tier changes: the judge
-/// rates the turn itself.
+/// waits for an answer is the answer. The choice becomes `ignored`. For
+/// `ask_for_space` a `fell_out` event starts at the user's row in the same
+/// transaction, so the turn that ignored her reads the falling-out in its
+/// events; an incident under way ends there, a background keeps running. A
+/// romantic ask settles at no cost and writes no event: the judge reads the
+/// user's words like any other turn's (spec 2026-10-30 §4.5). No tier
+/// changes: the judge rates the turn itself.
 ///
 /// The clock is the user row's `sent_at`: whether the message arrived while
 /// the choice was pending is a fact about the message, so a turn that waited
@@ -126,20 +128,27 @@ pub(crate) async fn convert_ignored_ask(
     else {
         return Ok(false);
     };
-    EventRepo::insert_preempting_in_tx(
-        &mut tx,
-        &NewEvent {
-            instance_id,
-            session_id: choice.session_id,
-            event_key: &format!("life_choice:{}:fell_out", choice.id),
-            kind: EventKind::FellOut,
-            started_at: sent_at,
-            ends_at: sent_at + Duration::hours(FELL_OUT_HOURS),
-        },
-    )
-    .await?;
+    let falls_out = LifeChoiceKind::parse(&choice.kind) == Some(LifeChoiceKind::AskForSpace);
+    if falls_out {
+        EventRepo::insert_preempting_in_tx(
+            &mut tx,
+            &NewEvent {
+                instance_id,
+                session_id: choice.session_id,
+                event_key: &format!("life_choice:{}:fell_out", choice.id),
+                kind: EventKind::FellOut,
+                started_at: sent_at,
+                ends_at: sent_at + Duration::hours(FELL_OUT_HOURS),
+            },
+        )
+        .await?;
+    }
     tx.commit().await?;
-    tracing::info!(%session_id, choice_id = %choice.id, "her ask went unanswered: fell out");
+    if falls_out {
+        tracing::info!(%session_id, choice_id = %choice.id, "her ask went unanswered: fell out");
+    } else {
+        tracing::info!(%session_id, choice_id = %choice.id, "her romantic ask was answered in words");
+    }
     Ok(true)
 }
 
@@ -1415,6 +1424,45 @@ mod tests {
             .await;
         assert_eq!(s.instance_events().await, events);
         assert_eq!(s.status_of(choice).await, ("ignored".into(), Some(sent)));
+    }
+
+    /// A typed reply to a romantic ask settles it as ignored at the message,
+    /// and costs nothing: no falling-out. The judge rates the words like any
+    /// other turn's (spec 2026-10-30 §4.5).
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_typed_answer_to_a_romantic_ask_ignores_it_without_a_falling_out(pool: PgPool) {
+        let s = scene(&pool).await;
+        let mock = mock_llm(PATIENT, None).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+        s.seed_romantic(LifeChoiceKind::Propose, "pending", Duration::hours(1))
+            .await;
+
+        s.converting_turn(&state, "好啊").await;
+
+        let sent_at: DateTime<Utc> = sqlx::query_scalar(
+            "SELECT sent_at FROM engine.chat_messages WHERE session_id = $1 AND role = 'user'",
+        )
+        .bind(s.session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let (status, resolved_at): (String, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT status, resolved_at FROM engine.life_choices WHERE session_id = $1",
+        )
+        .bind(s.session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "ignored");
+        assert_eq!(
+            resolved_at,
+            Some(sent_at),
+            "resolved at the message that answered in words"
+        );
+        assert!(
+            s.instance_events().await.is_empty(),
+            "an ignored romantic ask starts no event"
+        );
     }
 
     /// A give, a tip or a kiss while she waits is an attempt to mend, not an
