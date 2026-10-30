@@ -38,7 +38,8 @@ World Memories 需要**三个条件同时**成立：
 1. 模型配置中存在 `[tasks.world_director]` 且 `filter_prompt` 非空白（导演的
    system instruction）。缺 section ⇒ 完全惰性：不起 sweeper、每回合零查询。
 2. 该 owner 在 `engine.world_enrollments` 中有一行。此表由**下游管理**：你的
-   产品通过 `service_role` 连接插入/删除行；引擎只读。有行即启用。
+   产品通过 `service_role` 连接插入/删除行；引擎只读，唯一的例外是用户抹除路由
+   会连同该 owner 的其余 world 数据删除这一行。有行即启用。
 3. 未设置 `WORLD_DISABLED`。
 
 World Town 额外需要**全部**满足：

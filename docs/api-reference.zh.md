@@ -85,8 +85,8 @@ session 时忽略。
 状态机（详见 [SSE streaming chat 0.2 设计文档](superpowers/specs/2026-05-19-sse-streaming-chat-0.2-design.md)）。
 
 请求体必须包含 `client_msg_id`（26..36 个 ASCII 可打印字符，任意 UUID 或
-ULID）。24 小时内同一对 `(session_id, client_msg_id)` 的重复请求将从
-数据库重放历史帧，不会再次调用 OpenRouter。
+ULID）。同一对 `(session_id, client_msg_id)` 的重复请求将从
+数据库重放历史帧，不会再次调用 OpenRouter；这个键永不过期。
 
 ```bash
 curl -N -X POST \
@@ -133,11 +133,11 @@ data: {"type":"final","filtered":false,"prompt_injected":null,"tier":null,"retri
 ```text
 data: {"type":"done","message_id":"01J...","truncated":true,"usage":null,"generation_id":null}
 
-data: {"type":"meta","message_id":"01K...","action_type":"reply","continues_from":null}
+data: {"type":"meta","message_id":"01K...","action_type":"reply"}
 ```
 
 ——紧接着是下一次尝试自己的 `delta*` → `done`：可能是下一个过滤模型，也可能
-在链路耗尽时是 fail-open 的原文。这里的 `continues_from` 是 `null`——跟上面
+在链路耗尽时是 fail-open 的原文。这里没有 `continues_from`——跟上面
 重试链的情形不同，被顶替的半截文本从未落库，也就没有行可续。被顶替的气泡
 本身在刷新历史时不会出现；只有最终生效的那条回复会留下来。只要客户端这一轮
 收到过任何改写文本——哪怕后来被顶替、最终 fail-open 成了原文——`final.filtered`
@@ -1054,16 +1054,16 @@ composer 失败时退回普通的人物肖像 prompt，跟聊天回合一样。�
 
 ### `GET /comp/chat/{session_id}/history?limit=20&offset=0`
 
-分頁讀消息歷史，最新在前。`limit` 默认 20（上限 50）。
+分页读消息历史：取最新的 `limit` 行（`offset` 往更早翻页），按从旧到新返回。`limit` 默认 20（上限 50）。
 
 ```json
 {
   "session_id": "…",
   "messages": [
-    { "id": "…", "role": "assistant", "content": "Bishop。", "sent_at": "…", "read_at": "…" },
-    { "id": "…", "role": "user",      "content": "嗨…",     "sent_at": "…", "read_at": "…" },
+    { "id": "…", "role": "assistant", "content": "",  "sent_at": "…", "image": true },
     { "id": "…", "role": "assistant", "content": "…", "sent_at": "…", "channel": "product_qa" },
-    { "id": "…", "role": "assistant", "content": "",  "sent_at": "…", "image": true }
+    { "id": "…", "role": "user",      "content": "嗨…",     "sent_at": "…", "read_at": "…" },
+    { "id": "…", "role": "assistant", "content": "Bishop。", "sent_at": "…", "read_at": "…" }
   ],
   "total": 4
 }
@@ -1167,7 +1167,8 @@ session 返回 404 的行为，与上面的 history 路由完全一致。
 | `POST` | `/v2/comp/group/{group_id}/message/stream` | SSE 轮次，见 [group-chat.zh.md](group-chat.zh.md#发送) |
 
 群 DTO：`group_id`、`title`（可空）、`members[]`（`member_session_id`、
-`instance_id`、`joined_at`）、`created_at`、`last_active_at`。
+`instance_id`、`joined_at`）、`created_at`、`last_active_at`，以及 `last_message`
+（群里还没有可见消息时为 `null`：`message_id`、`role`、`speaker_session_id`、截到 120 字的 `preview`、`is_image`、`sent_at`）。
 
 标题会先去掉首尾空白，长度须为 1 到 64 个字符且不含控制字符，否则 `422 invalid_title`。
 
@@ -1188,6 +1189,7 @@ session 返回 404 的行为，与上面的 history 路由完全一致。
 | 409 | `group_empty` | 向没有成员的群发送 |
 | 409 | `duplicate_in_progress` | 发送：同一个 `client_msg_id` 的轮次还在进行 |
 | 409 | `duplicate_failed` | 发送：该 `client_msg_id` 的轮次已终止性失败，需换一个新的 |
+| 409 | `members_changed` | 发送：`expected_members` 与群当前的活跃成员集合不一致 |
 | 422 | `invalid_title` | 标题为空白、过长或含控制字符 |
 | 422 | `unprocessable` | 创建时成员列表为空；发送时 `content` 为空白或过长、`image.aspect_ratio` 不支持，或点名的不是群成员 |
 | 429 | `rate_limited` | 发送：达到每用户并发流上限 |
@@ -1362,7 +1364,7 @@ Response `200`：
 |---|---|---|
 | 200 | — | 打断已记录（见上面的 body） |
 | 400 | `invalid_payload` | `client_msg_id` 不在 26..36 个 ASCII 可打印字符范围内 |
-| 401 | `unauthorized` | JWT 缺失 / 格式错 / 过期 / 密钥不符 |
+| 401 | — | JWT 缺失 / 格式错 / 过期 / 密钥不符（响应体为空） |
 | 403 | `session_forbidden` | session 不属于该 JWT 用户 |
 | 404 | `session_not_found` | `session_id` 不存在 |
 | 404 | `turn_not_found` | `client_msg_id` 在该 session 里找不到对应的 user 行 |
@@ -1784,6 +1786,7 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
 - `genome_id` / `instance_id` —— 標識人格（同 canonical）。
 - `is_demo` —— 可選，同 canonical。
 - `history_limit` —— 可選，打包歷史的頁大小；默認 50，上限 50。
+- `channel` —— 可选，与 canonical 相同（默认 `"text"`，或 `"voice"`）。
 - `force_new` —— 可选，同 canonical。透传给 `StartChatRequest::force_new`
   ——跳过恢复，总是创建一个全新 session（`is_new: true`）；语音通话推荐
   使用（见上面的[语音小节](#post-compvoicesession_idturnstream)）。
@@ -2188,13 +2191,16 @@ curl -X POST -H "x-user-erase-secret: $USER_ERASE_SECRET" \
 
 | 狀態碼 | code | 何時 |
 |--------|------|------|
-| 400 | `bad_request` | 請求體格式錯、UUID 無效、缺必填字段 |
-| 401 | `unauthorized` | JWT 缺失 / 格式錯 / 過期 / 密鑰不符 |
+| 400 | `bad_request` | handler 检查后拒绝的值（游标不对、`prompt_traits` 不对……）。无法解析的请求体或路径得到的是框架的纯文本拒绝 |
+| 401 | — | JWT 缺失 / 格式错 / 过期 / 密钥不符。响应体为空：认证层在任何 handler 之前就作答 |
 | 403 | `forbidden` | 路徑 user 跟 JWT user 不匹配，或想讀別人的 session；或 `/svc/v1/*` 的某个 secret header（`x-insights-export-secret`、`x-facts-export-secret`、`x-user-erase-secret`）缺失或錯誤 |
 | 404 | `not_found` | session / 人格 / 消息 id 不存在 |
 | 409 | `conflict` | 资源当前的状态不允许这个操作。reaction 路由和改图在收到群 session 时返回它，`message` 里含 `wrong_channel`。1:1 的流式与异步发送、`/open`、`/events`、`/effects` 和生活选择路由拒绝群 session 时改用带代码的响应体（`code: wrong_channel`），群路由拒绝非群 session 时也一样 |
+| 422 | `unprocessable` | 格式正确、但取值不可接受的请求 |
+| 429 | `too_many_requests` | 达到了每用户并发上限 |
 | 500 | `internal` | 其餘一切（DB 錯、LLM API 錯等） |
-| *provider 自己的状态码* | `upstream` | 上游供应商调用失败（目前仅 persona compose 端点——合成器链条全部失败）。自 v1.4.0 起**不再固定是 502**：provider 的状态码原样透传（`529`、`503`、`429`……），没有上游状态码的网关层失败则超时映射为 `504`、其余为 `502`。响应体带 `upstream_status` / `provider_code` / `error_type` 或 `gateway_kind`，以及 `retryable`——见 [compose 端点](#post-personainstance_idimagecompose)。请按 `"error": "upstream"` 这个 key 判断，不要按状态码。 |
+| 501 | `not_implemented` | 部署没有配置的能力 |
+| *provider 自己的状态码* | `upstream` | 上游供应商调用失败（persona compose 端点和改图在合成器链条全部失败时；`/open`、`/events` 和生活抉择路由在 companion 链条全部失败时）。自 v1.4.0 起**不再固定是 502**：provider 的状态码原样透传（`529`、`503`、`429`……），没有上游状态码的网关层失败则超时映射为 `504`、其余为 `502`。响应体带 `upstream_status` / `provider_code` / `error_type` 或 `gateway_kind`，以及 `retryable`——见 [compose 端点](#post-personainstance_idimagecompose)。请按 `"error": "upstream"` 这个 key 判断，不要按状态码。 |
 
 ## 源码
 

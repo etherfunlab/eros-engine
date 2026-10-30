@@ -79,7 +79,7 @@ spawn post_process     tokio::spawn——跟返回響應並行：
 
 **Ghost streak 重置** 由編排器在 spawn post-process 之前處理：Reply 動作會在一個冪等 UPDATE 裡把 streak 清零；Ghost 動作則調 `AffinityRepo::record_ghost`。倉儲方法 `persist_with_event` 自身永遠不碰 streak。
 
-**离线。** 角色的离线类生活事件（`away_from_phone`、`busy`、`in_battle`、`asleep`、两个聚会、`having_sex`、女性角色的 `out_shopping`，以及她提出的分开）进行期间，不带用户动作、也不带 `image.force` 的文字轮在 PDE 之前就被 ghost：该行被标记为已 ghost，发出 ghost 帧，判官和 `record_ghost` 都不运行。见 [ghost-mechanics.zh.md](ghost-mechanics.zh.md#engine-强制的-ghost)。
+**离线。** 角色的离线类生活事件（`away_from_phone`、`busy`、`in_battle`、`asleep`、两个聚会、`having_sex`、女性角色的 `out_shopping`，以及她提出的分开）进行期间，不带用户动作、也不带 `image.force` 的文字轮在 PDE 之前就被 ghost（除非部署关掉了 ghosting，即 `[tasks.pde_decision]` 上 `ghosting = false`）：该行被标记为已 ghost，发出 ghost 帧，判官和 `record_ghost` 都不运行。见 [ghost-mechanics.zh.md](ghost-mechanics.zh.md#engine-强制的-ghost)。
 
 **PDE 动作列表。** 判断器（或规则引擎）每轮给出的 action 是以下之一：
 `reply_text` | `ghost` | `reply_image` | `reply_text_image` | `product_qa`。
@@ -149,7 +149,7 @@ post-process spawn 返回 `()` 是 fire-and-forget 設計——用戶面前的�
 
 **一个语音轮次最多挂一条 assistant 回复**，由
 `(user_message_id) WHERE role='assistant' AND channel='voice'` 上的 partial
-unique index 保证（migration 0041）。文本路径没有这条约束——它本来就会通过
+unique index 保证（`chat_messages_voice_assistant_reply_uidx`，在 `0000_baseline.sql` 里）。文本路径没有这条约束——它本来就会通过
 `continues_from_message_id` 为同一个用户轮次写多条 assistant 行。这条索引存在
 是因为一个语音轮次有两个可能的写入方：流式生成器，以及上报客户端实际播出内容
 的 barge-in interrupt 端点。两者靠 user 行上共享的 `FOR UPDATE` 锁排序：
@@ -163,7 +163,7 @@ user 行上带 `metadata.voice_interrupt` 表示这一轮是用户主动打断�
 
 兩個原因：
 
-1. **思考負擔。** 好感度數學、ghost 決策、PDE 規則——這些是承重邏輯。把它們做成無 I/O 的，意味著 0 依賴的 cargo test 0ms 跑完，不會因為網絡抖動而 flake。`core` 的 89 個測試是上層所有東西的安全網。（可选 LLM 判断器层在 `server` 里，不在 `core` 里，所以 `core` 保持零 I/O。）
+1. **思考負擔。** 好感度數學、ghost 決策、PDE 規則——這些是承重邏輯。把它們做成無 I/O 的，意味著 0 依賴的 cargo test 0ms 跑完，不會因為網絡抖動而 flake。`core` 的测试是上层所有东西的安全网。（可选 LLM 判断器层在 `server` 里，不在 `core` 里，所以 `core` 保持零 I/O。）
 2. **可嵌入性。** 任何想在這個基礎上做別的產品的人——日記式 agent、語言教練、教練類陪伴——可以只拉 `core` 進來，不用繼承 HTTP 的形狀、Postgres schema、JWT auth。六維好感度模型才是別人最想拿走的部份；我們把這件事做成輕巧的。
 
 ## 文件結構

@@ -82,7 +82,7 @@
 
 ## 引擎连接到哪里
 
-BYOK 请求通过专用客户端发出：不跟随重定向，不使用代理，只允许 https。先解析主机名；loopback、私有、link-local、CGNAT、unique-local、未指定和多播地址（包括 IPv4-mapped 和 NAT64 形式）一律拒绝，连接只会发往通过检查的地址。被拒绝的主机会让该 hop 以 `transport` 网关错误失败。`BYOK_ALLOW_PRIVATE_NETWORK` 会解除以上全部限制。
+BYOK 请求通过专用客户端发出：不跟随重定向，不使用代理，只允许 https。先解析主机名；loopback、私有、link-local、CGNAT、unique-local、未指定和多播地址（包括 IPv4-mapped 和 NAT64 形式）一律拒绝，连接只会发往通过检查的地址。被拒绝的主机会让该 hop 以 `transport` 网关错误失败。`BYOK_ALLOW_PRIVATE_NETWORK` 解除只允许 https 的规则和地址防护；重定向和代理仍然关闭。
 
 引擎还限制从终端用户端点读取的数据量：
 

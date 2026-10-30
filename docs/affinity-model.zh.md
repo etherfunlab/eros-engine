@@ -185,7 +185,8 @@ penalty = κ_line × ((y − y₀)⁺ / (1 − y₀))² × (|g| / 4)
 delta 回退已退役。
 
 PDE 判定的 ghost 回合从不进入 `persist_with_event`：只有 `ghost_streak` / `total_ghosts` /
-`last_ghost_at` 移动；`record_ghost` 写全零 `effective_deltas`。离线期间由 engine
+`last_ghost_at` 和 `updated_at` 移动；`record_ghost` 写全零 `effective_deltas`，没有任何轴移动，
+但重置的 `updated_at` 会让衰减时钟从头算起。离线期间由 engine
 强制的 ghost 一个都不动（见 [ghost-mechanics.zh.md](ghost-mechanics.zh.md#engine-强制的-ghost)）。
 
 ### 被拒绝的动作
@@ -209,7 +210,7 @@ PDE 判定的 ghost 回合从不进入 `persist_with_event`：只有 `ghost_stre
   `pending_deltas` 都清零。它按时间衰减和端点刷新之后的快照计算（用部署的 affinity 调参值），
   在行锁内、与结算这次选择的同一个事务里完成，所以结算回滚时不会留下降档。接受之后，降档就是她归来时的状态，
   归来时不再有别的事发生。
-- **它的事件行。** 一行自己类型的非回合事件，`event_type = 'life_choice'`（migration `0077` 把类型检查放宽了这一个取值）。
+- **它的事件行。** 一行自己类型的非回合事件，`event_type = 'life_choice'`。
   `deltas` 与 `effective_deltas` 的数字相同，因为降档就是全部的原始变化；`label_changes`、
   `effective_line_deltas` 和前后两份状态快照记录档位的移动。`context` 里有 `life_choice`（`accept` | `decline`）
   和 `choice_id`。这一行没有 `user_message_id`。逐轮 delta 路由
@@ -337,7 +338,7 @@ PDE 判定的 ghost 回合从不进入 `persist_with_event`：只有 `ghost_stre
 
 ### 生成列
 
-Migration `0048` 把 `bond`、`chemistry` 重定义为 Postgres
+`bond`、`chemistry` 是 Postgres
 `GENERATED ALWAYS … STORED` 列，直接算在线轴上（`LEAST(1, GREATEST(0,
 (a+b)/2))`）；DB 在每次写入时重算，不可能漂移。公式在代码里镜像一份
 （`bond_score`/`chemistry_score`），两处要保持同步。
@@ -345,7 +346,7 @@ Migration `0048` 把 `bond`、`chemistry` 重定义为 Postgres
 ### 端点档位
 
 `warmth_grade` / `patience_grade` 是 `SMALLINT NOT NULL DEFAULT 2`，范围
-检查 `1..=3`（migration `0048`）；`warmth`/`patience` 两个缓存列用档 2 的
+检查 `1..=3`；`warmth`/`patience` 两个缓存列用档 2 的
 派生值回填。
 
 ### pending_deltas
@@ -368,12 +369,12 @@ Migration `0048` 把 `bond`、`chemistry` 重定义为 Postgres
   `decay_factor`、`units`）；被收税的回合另有 `cross_penalty_assessed`；动作被拒绝而降档的回合另有
   `tier_drop`（`bond` | `chemistry`），标明被降的那条线；分开之后的放缓减半了为正的增长时，另有 `growth_scale`（`0.5`）。
   生活选择自己的 `life_choice` 行，`context` 是 `life_choice` 与 `choice_id`（见[上文](#生活选择的降档与放缓)）。
-- `user_message_id`（migration `0056`）：对 `chat_messages` 的真外键，
+- `user_message_id`：对 `chat_messages` 的真外键，
   `ON DELETE SET NULL`；`proactive`/`time_decay` 行与迁移前写入的行为
   `NULL`，不回填。
 - `label_changes`（见「档位与标签」）、`effective_line_deltas`（本轮精确的
   bond/chemistry delta，API 上服务为 `effective_deltas_computed`）、
-  `state_after`（本轮结束时的整个向量，migration `0049`）。`state_before`
+  `state_after`（本轮结束时的整个向量）。`state_before`
   列存在但不对外服务，要重放请直接查表。
 
 `event_type` 取值为 `message`、`ghost`、`gift`、`proactive`、`time_decay` 或 `life_choice`。
@@ -469,7 +470,7 @@ Migration `0048` 把 `bond`、`chemistry` 重定义为 Postgres
 - `crates/eros-engine-core/src/scope.rs`：`AffinityScope` / `MemoryScope`、
   `length_score`（见「`affinity.rs` 与 `scope.rs`」）
 - `crates/eros-engine-store/src/affinity.rs`：`AffinityRepo`
-  （`persist_with_event`、`record_ghost`、`persist_life_choice_drop_in_tx`、`last_judged_patiences`）、migrations 0048–0049、0077
+  （`persist_with_event`、`record_ghost`、`persist_life_choice_drop_in_tx`、`last_judged_patiences`）；表在 `migrations/0000_baseline.sql`
 - `crates/eros-engine-store/src/life_choices.rs`：`LifeChoiceRepo`
   （选择行；`growth_slowed` 推算放缓窗口）
 - `crates/eros-engine-server/src/pipeline/post_process.rs`：LLM 评估、

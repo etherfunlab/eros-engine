@@ -93,9 +93,9 @@ Streaming chat turn. Returns `text/event-stream` with the
 [SSE streaming chat 0.2 design spec](superpowers/specs/2026-05-19-sse-streaming-chat-0.2-design.md).
 
 The body **must** include `client_msg_id` (26..36 ASCII-printable chars,
-any UUID or ULID). Replays of the same `(session_id, client_msg_id)` within
-24 h reconstruct the original frames from the database without re-calling
-OpenRouter.
+any UUID or ULID). Replays of the same `(session_id, client_msg_id)`
+reconstruct the original frames from the database without re-calling
+OpenRouter; the key never expires.
 
 ```bash
 curl -N -X POST \
@@ -144,12 +144,12 @@ continuing it:
 ```text
 data: {"type":"done","message_id":"01J...","truncated":true,"usage":null,"generation_id":null}
 
-data: {"type":"meta","message_id":"01K...","action_type":"reply","continues_from":null}
+data: {"type":"meta","message_id":"01K...","action_type":"reply"}
 ```
 
 — followed by a fresh `delta*` → `done` for the next attempt: either the next
 filter model, or, if the chain exhausts, the fail-open original. `continues_from`
-is `null` here — unlike the retry-chain case above, the superseded partial was
+is absent here — unlike the retry-chain case above, the superseded partial was
 never persisted, so there is no row to continue from. The superseded bubble
 itself never appears in history on reload; only the reply that finally serves
 does. `final.filtered` is `true` whenever the client received any rewritten
@@ -1331,16 +1331,16 @@ order; every skin tone of a listed emoji is allowed.
 
 ### `GET /comp/chat/{session_id}/history?limit=20&offset=0`
 
-Paginated message history, newest first. `limit` defaults to 20 (capped at 50).
+Paginated message history: the newest `limit` rows (`offset` pages further back), returned oldest first. `limit` defaults to 20 (capped at 50).
 
 ```json
 {
   "session_id": "…",
   "messages": [
-    { "id": "…", "role": "assistant", "content": "Bishop.", "sent_at": "…", "read_at": "…" },
-    { "id": "…", "role": "user",      "content": "hi…",     "sent_at": "…", "read_at": "…" },
+    { "id": "…", "role": "assistant", "content": "",  "sent_at": "…", "image": true },
     { "id": "…", "role": "assistant", "content": "…", "sent_at": "…", "channel": "product_qa" },
-    { "id": "…", "role": "assistant", "content": "",  "sent_at": "…", "image": true }
+    { "id": "…", "role": "user",      "content": "hi…",     "sent_at": "…", "read_at": "…" },
+    { "id": "…", "role": "assistant", "content": "Bishop.", "sent_at": "…", "read_at": "…" }
   ],
   "total": 4
 }
@@ -1467,7 +1467,9 @@ requires the JWT user to own the group; any other group id is
 | `POST` | `/v2/comp/group/{group_id}/message/stream` | SSE turn, see [group-chat.md](group-chat.md#send) |
 
 Group DTO: `group_id`, `title` (nullable), `members[]` (`member_session_id`,
-`instance_id`, `joined_at`), `created_at`, `last_active_at`.
+`instance_id`, `joined_at`), `created_at`, `last_active_at`, and `last_message`
+(`null` until the group has a visible message: `message_id`, `role`,
+`speaker_session_id`, `preview` cut to 120 characters, `is_image`, `sent_at`).
 
 A title is trimmed and must be 1 to 64 characters with no control character;
 otherwise `422 invalid_title`.
@@ -1489,6 +1491,7 @@ Every refusal below carries the pre-stream body `{code, message, user_message}`
 | 409 | `group_empty` | send to a group with no member |
 | 409 | `duplicate_in_progress` | send: the same `client_msg_id` is still running |
 | 409 | `duplicate_failed` | send: that `client_msg_id`'s turn failed terminally; send a fresh one |
+| 409 | `members_changed` | send: `expected_members` is not the group's set of active members |
 | 422 | `invalid_title` | blank, over-long or control-character title |
 | 422 | `unprocessable` | create with an empty member list; send with blank or over-long `content`, an unsupported `image.aspect_ratio`, or a mention that is not a member |
 | 429 | `rate_limited` | send: the per-user in-flight stream cap is reached |
@@ -1700,7 +1703,7 @@ Status ladder:
 |---|---|---|
 | 200 | — | interrupt recorded (see body above) |
 | 400 | `invalid_payload` | `client_msg_id` outside 26..36 ASCII-printable chars |
-| 401 | `unauthorized` | missing / malformed / expired / wrong-secret JWT |
+| 401 | — | missing / malformed / expired / wrong-secret JWT (empty body) |
 | 403 | `session_forbidden` | session not owned by the JWT user |
 | 404 | `session_not_found` | unknown `session_id` |
 | 404 | `turn_not_found` | `client_msg_id` names no user row in this session |
@@ -2176,6 +2179,7 @@ The body is the canonical start body plus one BFF-only field:
 - `genome_id` / `instance_id` — identify the persona (same as canonical).
 - `is_demo` — optional, same as canonical.
 - `history_limit` — optional bundled-history page size; default 50, capped at 50.
+- `channel` — optional, same as canonical (`"text"` by default, or `"voice"`).
 - `force_new` — optional, same as canonical. Passed through to
   `StartChatRequest::force_new` — skip resume and always create a fresh
   session (`is_new: true`); recommended for voice calls (see the
@@ -2646,13 +2650,16 @@ on whichever route it comes from, as does the caller-secret refusal
 
 | Status | Code | When |
 |--------|------|------|
-| 400 | `bad_request` | Malformed body, invalid UUID, missing required field |
-| 401 | `unauthorized` | Missing / malformed / expired / wrong-secret JWT |
+| 400 | `bad_request` | A value the handler checks and rejects (a bad cursor, bad `prompt_traits`, …). A body or path that fails to parse gets the framework's plain-text rejection instead |
+| 401 | — | Missing / malformed / expired / wrong-secret JWT. The body is empty: the auth layer answers before any handler |
 | 403 | `forbidden` | Path-user vs JWT-user mismatch, or trying to read a session you don't own; or a `/svc/v1/*` secret header (`x-insights-export-secret`, `x-facts-export-secret`, `x-user-erase-secret`) missing or wrong |
 | 404 | `not_found` | Unknown session / persona / message id |
 | 409 | `conflict` | The resource's state does not permit the action. The reaction route and image edit return it for a group session, with a `message` containing `wrong_channel`. The 1:1 stream and async send routes, `/open`, `/events`, `/effects` and the life-choice route refuse a group session with the coded body instead (`code: wrong_channel`), as the group routes refuse a non-group session |
+| 422 | `unprocessable` | A well-formed request whose values are not acceptable |
+| 429 | `too_many_requests` | A per-user concurrency cap was reached |
 | 500 | `internal` | Anything else (DB error, LLM API error, etc.) |
-| *the provider's own status* | `upstream` | The upstream provider failed the call (currently only the persona compose endpoint — its composer chain was exhausted). Since v1.4.0 this is **not always 502**: the provider's status passes through verbatim (`529`, `503`, `429`, …), and a gateway-layer failure with no upstream status maps to `504` for a timeout and `502` otherwise. The body carries `upstream_status` / `provider_code` / `error_type` or `gateway_kind`, plus `retryable` — see [the compose endpoint](#post-personainstance_idimagecompose). Branch on the `"error": "upstream"` key, not on the status. |
+| 501 | `not_implemented` | A capability the deployment did not configure |
+| *the provider's own status* | `upstream` | The upstream provider failed the call (the persona compose endpoint and image edit when their composer chain is exhausted; `/open`, `/events` and the life-choice route when their companion chain is). Since v1.4.0 this is **not always 502**: the provider's status passes through verbatim (`529`, `503`, `429`, …), and a gateway-layer failure with no upstream status maps to `504` for a timeout and `502` otherwise. The body carries `upstream_status` / `provider_code` / `error_type` or `gateway_kind`, plus `retryable` — see [the compose endpoint](#post-personainstance_idimagecompose). Branch on the `"error": "upstream"` key, not on the status. |
 
 ## Source
 

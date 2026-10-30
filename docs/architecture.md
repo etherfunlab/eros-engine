@@ -82,7 +82,7 @@ spawn post_process     tokio::spawn — runs concurrent with response return:
 
 **Ghost-streak reset** is handled by the orchestrator before spawning post-process: on Reply the streak is cleared in a single idempotent UPDATE; on Ghost the orchestrator calls `AffinityRepo::record_ghost` instead. The `persist_with_event` repo method itself never touches the streak.
 
-**Offline.** While an offline life event of the persona is under way (`away_from_phone`, `busy`, `in_battle`, `asleep`, the two gatherings, `having_sex`, a female persona's `out_shopping`, or the separation she asked for), a text turn without a user action or `image.force` ghosts before the PDE: the row is marked ghosted and the ghost frames are yielded, and neither the judge nor `record_ghost` runs. See [ghost-mechanics.md](ghost-mechanics.md#ghosting-the-engine-imposes).
+**Offline.** While an offline life event of the persona is under way (`away_from_phone`, `busy`, `in_battle`, `asleep`, the two gatherings, `having_sex`, a female persona's `out_shopping`, or the separation she asked for), a text turn without a user action or `image.force` ghosts before the PDE, unless the deployment turned ghosting off (`ghosting = false` in `[tasks.pde_decision]`): the row is marked ghosted and the ghost frames are yielded, and neither the judge nor `record_ghost` runs. See [ghost-mechanics.md](ghost-mechanics.md#ghosting-the-engine-imposes).
 
 **PDE action list.** The judge's (or rule engine's) per-turn action is one of
 `reply_text` | `ghost` | `reply_image` | `reply_text_image` | `product_qa`.
@@ -161,7 +161,7 @@ collide with the voice-turn lookups.
 
 **A voice turn holds at most one assistant reply**, enforced by a partial
 unique index on `(user_message_id) WHERE role='assistant' AND channel='voice'`
-(migration 0041). The text path has no such constraint — it legitimately
+(`chat_messages_voice_assistant_reply_uidx`, in `0000_baseline.sql`). The text path has no such constraint — it legitimately
 writes several assistant rows per user turn via `continues_from_message_id`.
 The index exists because a voice turn has two possible writers: the streaming
 generator, and the barge-in interrupt endpoint reporting what the client
@@ -177,7 +177,7 @@ See [voice barge-in](superpowers/specs/2026-08-11-voice-barge-in-interrupt-desig
 
 Two reasons:
 
-1. **Reasoning load.** Affinity math, ghost decisions, and PDE rules are the load-bearing logic. Keeping them I/O-free means a 0-dep cargo test runs in 0ms and never flakes on network. The 89 tests in `core` are the safety net for everything above. (The opt-in LLM judge layer lives in `server`, not `core`, so `core` stays zero-I/O.)
+1. **Reasoning load.** Affinity math, ghost decisions, and PDE rules are the load-bearing logic. Keeping them I/O-free means a 0-dep cargo test runs in 0ms and never flakes on network. The tests in `core` are the safety net for everything above. (The opt-in LLM judge layer lives in `server`, not `core`, so `core` stays zero-I/O.)
 2. **Embeddability.** Anyone wanting to build a different product on top — journaling agent, language tutor, coaching companion — can pull in `core` without inheriting the HTTP shape, the Postgres schema, or the JWT auth. The 6-dim affinity model is the part most worth lifting; we made that easy.
 
 ## File structure

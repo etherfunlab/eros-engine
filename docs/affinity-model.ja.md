@@ -156,7 +156,7 @@ penalty = κ_line × ((y − y₀)⁺ / (1 − y₀))² × (|g| / 4)
 
 eval がスキップされた場合(`eval_skip_reason`)や失敗した場合(`llm_attempts` / `gateway_errors` が空でない場合)は、保存済みレベルを保持し、現在のライン値と減衰からエンドポイントを再導出する。旧来のルールデルタへのフォールバックは廃止された。
 
-PDE が決めたゴーストターンは `persist_with_event` に到達しない。変化するのは `ghost_streak` / `total_ghosts` / `last_ghost_at` のみであり、`record_ghost` はすべてゼロの `effective_deltas` を書き込む。オフライン期間中にエンジンが課すゴーストは、これらのいずれも動かさない([ghost-mechanics.md](ghost-mechanics.md#ghosting-the-engine-imposes) を参照)。
+PDE が決めたゴーストターンは `persist_with_event` に到達しない。変化するのは `ghost_streak` / `total_ghosts` / `last_ghost_at` と `updated_at` のみであり、`record_ghost` はすべてゼロの `effective_deltas` を書き込む。軸は動かないが、リセットされた `updated_at` により減衰の時計がゼロから数え直される。オフライン期間中にエンジンが課すゴーストは、これらのいずれも動かさない([ghost-mechanics.md](ghost-mechanics.md#ghosting-the-engine-imposes) を参照)。
 
 ### 拒否されたアクション
 
@@ -174,7 +174,7 @@ PDE が決めたゴーストターンは `persist_with_event` に到達しない
 彼女が「少し距離を置きたい」と切り出し、ユーザーが答えると、どちらの答えでも関係に代償が生じる([選択](life-events-needs.md#the-ask-for-space-choice)を参照)。ここにチャットのターンはなく、ジャッジも動かない。
 
 - **降格(accept と decline)。** Bond と chemistry は、拒否されたアクションと同じ着地規則で、両方のラインが同時に 1 段階下がる。下の段階の中で同じ相対位置に着地し、各ラインの 2 軸は同じ係数で縮小され、段階 1 のラインは `0` になる。両ラインの `pending_deltas` はクリアされる。時間減衰とエンドポイント再計算(デプロイの affinity チューニングを使う)を済ませたスナップショットから、行ロック内で、選択を解決するトランザクションの中で計算されるため、解決がロールバックされれば降格も残らない。accept の場合、降格は彼女が戻ってきたときの状態であり、戻った時点でさらに何かが起きることはない。
-- **そのイベント行。** ターンではない専用の `event_type`、`life_choice` の 1 行(マイグレーション `0077` が型チェックにこの値を 1 つ加えた)。降格が生の変化のすべてなので、`deltas` と `effective_deltas` は同じ値を持つ。`label_changes`、`effective_line_deltas`、前後 2 つの状態スナップショットがティアの移動を記録する。`context` には `life_choice`(`accept` | `decline`)と `choice_id` が入る。この行に `user_message_id` はない。ターンごとの delta ルート `GET /bff/v1/comp/affinity/{session_id}/event` は `time_decay` と同様にこの行を返さず、ジャッジが採点したターンとしても数えられない。
+- **そのイベント行。** ターンではない専用の `event_type`、`life_choice` の 1 行。降格が生の変化のすべてなので、`deltas` と `effective_deltas` は同じ値を持つ。`label_changes`、`effective_line_deltas`、前後 2 つの状態スナップショットがティアの移動を記録する。`context` には `life_choice`(`accept` | `decline`)と `choice_id` が入る。この行に `user_message_id` はない。ターンごとの delta ルート `GET /bff/v1/comp/affinity/{session_id}/event` は `time_decay` と同様にこの行を返さず、ジャッジが採点したターンとしても数えられない。
 - **成長の鈍化(accept のみ)。** 別離が終わってから 72 時間、4 つのライン軸で確定した正のデルタはすべて、適用前に半分になる。負のデルタは全額適用され、`warmth` と `patience` は従来どおりターン後のライン値から再導出される。削られた分は失われ、ゲートの残高には積まれない。適用されるのは選択が行われたセッションだけである。ウィンドウは導出されるもので新しい状態はない。選択の `event_id` から別離の `ends_at` を引き、`ends_at` から `ends_at` + 72 時間までを実時間で数える。鈍化したターンのイベント行は `context.growth_scale`(`0.5`)を持ち、通常の速度ではこのキーは付かず、`effective_deltas` には半分になった値が出る。
 
 ## 4. 基礎ペア導出の詳細(定数とその根拠)
@@ -270,7 +270,7 @@ Chemistry: `spark` / `flirtation` / `crush` / `lover` / `beloved`
 
 ### 生成カラム
 
-マイグレーション 0048 により、`bond` / `chemistry` は、ライン軸を基に計算する Postgres の `GENERATED ALWAYS … STORED` カラムとして定義される。
+`bond` / `chemistry` は、ライン軸を基に計算する Postgres の `GENERATED ALWAYS … STORED` カラムである。
 
 ```sql
 bond      GENERATED ALWAYS AS (LEAST(1, GREATEST(0, (trust    + intrigue) / 2))) STORED
@@ -281,7 +281,7 @@ DB が書き込みのたびに再計算するため、ライン軸の値との�
 
 ### エンドポイントレベル
 
-`warmth_grade` / `patience_grade` は SMALLINT NOT NULL DEFAULT 2 であり、`1..=3` の範囲チェックが付く(マイグレーション 0048)。`warmth` / `patience` のキャッシュカラムは、レベル2の導出値でバックフィルされている。
+`warmth_grade` / `patience_grade` は SMALLINT NOT NULL DEFAULT 2 であり、`1..=3` の範囲チェックが付く。`warmth` / `patience` のキャッシュカラムは、レベル2の導出値でバックフィルされている。
 
 ### pending_deltas
 
@@ -297,9 +297,9 @@ DB が書き込みのたびに再計算するため、ライン軸の値との�
 
 - `context` = `affinity_reason`、`eval_skip_reason`、判定どおりの符号付き `grades`、`pending_after`、エンドポイント監査情報(読み取られた場合の `warmth_grade` / `patience_grade`、`boost_warmth` / `boost_patience`、`decay_factor`、`units`)、ペナルティが課された場合の `cross_penalty_assessed`、拒否されたアクションでラインが下がった場合の `tier_drop`(`bond` | `chemistry`)、別離後の鈍化で正の成長が半分になった場合の `growth_scale`(`0.5`)。生活選択自身の `life_choice` 行の `context` は、代わりに `life_choice` と `choice_id` になる([上記](#生活選択による降格と成長の鈍化)を参照)。
 
-- `user_message_id`(マイグレーション 0056): `chat_messages` への実際の FK、`ON DELETE SET NULL`。`proactive` / `time_decay` 行および移行前の行では NULL であり、バックフィルはされない。
+- `user_message_id`: `chat_messages` への実際の FK、`ON DELETE SET NULL`。`proactive` / `time_decay` 行および移行前の行では NULL であり、バックフィルはされない。
 
-- `label_changes`(§5参照)、`effective_line_deltas`(ターンごとの正確な bond/chemistry デルタ、`effective_deltas_computed` として提供される)、`state_after`(ターン後の全ベクトル、マイグレーション 0049)。`state_before` は存在するが提供されない。リプレイは直接クエリで行う。
+- `label_changes`(§5参照)、`effective_line_deltas`(ターンごとの正確な bond/chemistry デルタ、`effective_deltas_computed` として提供される)、`state_after`(ターン後の全ベクトル)。`state_before` は存在するが提供されない。リプレイは直接クエリで行う。
 
 `event_type` は `message`、`ghost`、`gift`、`proactive`、`time_decay`、`life_choice` のいずれかである。後ろの 2 つはターンではなく、ターンごとの delta ルートが読むのは `message`、`gift`、`proactive`、`ghost` だけである。
 
@@ -388,7 +388,7 @@ DB が書き込みのたびに再計算するため、ライン軸の値との�
 
 - `crates/eros-engine-core/src/affinity.rs` — 型定義、`grade_turn` 書き込みパイプライン、エンドポイント導出、時間減衰、bond/chemistry スコア、ティア、ラベル、`diff_labels`
 - `crates/eros-engine-core/src/scope.rs` — `AffinityScope` / `MemoryScope`、`length_score`(§7参照)
-- `crates/eros-engine-store/src/affinity.rs` — `AffinityRepo`(persist_with_event、record_ghost、persist_life_choice_drop_in_tx、last_judged_patiences)、マイグレーション 0048–0049、0077
+- `crates/eros-engine-store/src/affinity.rs` — `AffinityRepo`(persist_with_event、record_ghost、persist_life_choice_drop_in_tx、last_judged_patiences)。テーブルは `migrations/0000_baseline.sql`
 - `crates/eros-engine-store/src/life_choices.rs` — `LifeChoiceRepo`(選択の行。`growth_slowed` が鈍化ウィンドウを導出する)
 - `crates/eros-engine-server/src/pipeline/post_process.rs` — LLM 評価、grade/level のパース
 - `crates/eros-engine-server/src/prompt.rs` — affinity → attitude ディレクティブ + eval プロンプト

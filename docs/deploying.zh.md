@@ -158,9 +158,9 @@ impl AuthValidator for MyValidator {
 
 ## 自帶 Postgres
 
-任何 sqlx Postgres 驅動兼容的都能用——Supabase、Neon、RDS、Crunchy Bridge、純自托管都行。硬要求：裝了 pgvector extension（`CREATE EXTENSION vector;`）。引擎自己建 schema（`0000_baseline.sql` 開頭的 `CREATE SCHEMA IF NOT EXISTS engine;`），跟數據庫裡其他東西可以乾淨共存。
+任何 sqlx Postgres 驅動兼容的都能用——Supabase、Neon、RDS、Crunchy Bridge、純自托管都行。硬要求：裝了 pgvector extension（`CREATE EXTENSION vector;`）。引擎自己建 schema（`0000_baseline.sql` 里的 `CREATE SCHEMA engine;`），所以第一次 `migrate` 之前 `engine` 不能已经存在；除此之外跟数据库里其他东西可以干净共存。
 
-如果跟另一個服務共用一個數據庫，引擎的表都在 `engine.*` 下、永不寫 `public.*`——零衝突。
+如果跟另一个服务共用一个数据库，引擎的表都在 `engine.*` 下。它在 `public` 里唯一会写的是 sqlx 的迁移记录表 `_sqlx_migrations`，所以同样用 sqlx 跑迁移的共用方需要自己的数据库。
 
 ### Supabase 部署——schema 暴露地雷
 
@@ -175,17 +175,15 @@ curl "https://<project>.supabase.co/rest/v1/chat_messages?select=*&limit=5" \
 
 就能讀所有用戶的聊天記錄——如果 `anon` 曾經被授權對 `engine.chat_messages` 的 SELECT 的話。
 
-遷移 `0013_supabase_lockdown.sql`（eros-engine 0.2+ 起內建）通過三步堵這個洞：
+迁移通过三步堵这个洞——`0000_baseline.sql` 管它建的表，之后每个迁移管它新加的表：
 
 1. 對每張 `engine.*` 表執行 `REVOKE ALL FROM anon, authenticated`
 2. 對 schema 本身執行 `REVOKE USAGE ON SCHEMA engine FROM anon, authenticated`
 3. 對每張 `engine.*` 表執行 `ENABLE ROW LEVEL SECURITY`（無策略——縱深防禦；`postgres` 用戶和 `service_role` 都繞過 RLS，所以引擎本體和任何服務端的 Supabase client 都不受影響）
 
-遷移外面包了 `IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon')`，所以非 Supabase 的 Postgres 部署（Neon、RDS、自托管）會靜默跳過 REVOKE，只繼承無害的 RLS enable。
+REVOKE 外面包了 `IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon')`，所以非 Supabase 的 Postgres 部署（Neon、RDS、自托管）会静默跳过它们，只继承无害的 RLS enable。
 
-**如果你是從 0.2 之前的版本升上來、又跑在 Supabase 上，跑一次 `eros-engine migrate` 應用它就行——這個遷移是冪等的。**
-
-要獨立審計你的項目（與本遷移無關），以 `postgres` 角色執行：
+要独立于迁移审计你的项目，以 `postgres` 角色執行：
 
 ```sql
 -- engine.* 裡哪些表沒開 RLS？

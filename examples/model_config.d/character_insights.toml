@@ -5,8 +5,8 @@
 # the injected history window (docs/deploying.md -> Operational notes).
 # Downstream also reads the row at GET /comp/instance/{instance_id}/profile.
 #
-# COST: two extra OpenRouter calls per produced message per turn — roughly
-# doubles insight-side spend. It also grows engine.character_insights_snapshot
+# COST: two extra OpenRouter calls per produced message per turn, on top of the
+# human chain's one. It also grows engine.character_insights_snapshot
 # by one row per turn that yields insights (apply_extraction writes a snapshot
 # on every applied call) — the human side's equivalent is a daily sweeper, so
 # this is far more rows for the same information, and there is no retention

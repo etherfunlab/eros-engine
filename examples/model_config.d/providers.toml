@@ -13,9 +13,9 @@
 #
 # ── Custom providers (optional) ──────────────────────────────────────────────
 # Route model slugs to your own endpoints. Each entry is a table with up to
-# three keys — `chat` (an OpenAI-compatible chat-completions URL), `embeddings`
-# (an OpenRouter-compatible embeddings URL), and `headers` (sent verbatim on
-# every request to this entry's endpoints):
+# four keys — `chat` (an OpenAI-compatible chat-completions URL), `embeddings`
+# (an OpenRouter-compatible embeddings URL), `headers` (sent verbatim on every
+# request to this entry's endpoints), and `body` (rules below):
 #
 #   [providers.venice]
 #   chat    = "https://api.venice.ai/api/v1/chat/completions"
