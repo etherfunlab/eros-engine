@@ -4,7 +4,7 @@
 //!
 //! Ownership split (spec §1): `world_enrollments` is downstream-written and
 //! engine-read; `world_states` / `world_memories` are engine-private.
-//! Scheduling uses the dreaming-lite claim pattern — a single
+//! Scheduling claims owners in one
 //! `UPDATE ... WHERE ... IN (SELECT ... FOR UPDATE SKIP LOCKED)` statement so
 //! concurrent engine instances claim disjoint owners.
 
@@ -240,7 +240,7 @@ impl<'a> WorldRepo<'a> {
     }
 
     /// Memory feedback for the director: the owner's most recent extracted
-    /// profile-layer rows (dreaming-lite output; `category IS NOT NULL`).
+    /// profile-layer rows (the dreaming scan's output; `category IS NOT NULL`).
     /// Relationship-layer rows are raw user lines and are deliberately
     /// excluded (spec §0).
     pub async fn recent_extracted_memories(
