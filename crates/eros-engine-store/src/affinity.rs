@@ -940,8 +940,9 @@ impl<'a> AffinityRepo<'a> {
     /// [`Self::persist_with_event`], so `effective_deltas` is the drop alone.
     /// The event is the non-turn type `life_choice` — never a turn, so
     /// `latest_turn_event` does not return it. `resolution` (`accept` /
-    /// `decline`) and `choice_id` go in its `context`. Returns the post-drop
-    /// state.
+    /// `decline`) and `choice_id` go in its `context`. The `tier_reached`
+    /// journal rows of labels the drop fell below go too when under 24 hours
+    /// old, as on a falling turn. Returns the post-drop state.
     pub async fn persist_life_choice_drop_in_tx(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         session_id: Uuid,
@@ -1016,11 +1017,12 @@ impl<'a> AffinityRepo<'a> {
         // No judge ran: the drop is the whole raw change, so `deltas` carries
         // the same figures as `effective_deltas`.
         let effective_json = serde_json::to_value(&effective).unwrap_or_default();
-        sqlx::query(
+        let event_id: Uuid = sqlx::query_scalar(
             "INSERT INTO engine.companion_affinity_events \
                (affinity_id, event_type, deltas, effective_deltas, label_changes, \
                 effective_line_deltas, context, state_before, state_after) \
-             VALUES ($1, 'life_choice', $2, $2, $3, $4, $5, $6, $7)",
+             VALUES ($1, 'life_choice', $2, $2, $3, $4, $5, $6, $7) \
+             RETURNING id",
         )
         .bind(current.id)
         .bind(effective_json)
@@ -1029,7 +1031,18 @@ impl<'a> AffinityRepo<'a> {
         .bind(serde_json::json!({ "life_choice": resolution, "choice_id": choice_id }))
         .bind(state_snapshot(&before))
         .bind(state_snapshot(&current))
-        .execute(&mut **tx)
+        .fetch_one(&mut **tx)
+        .await?;
+
+        // A drop takes back tier moments under 24 hours old, as a falling turn
+        // does. It only deletes, so the date (which dates new rows) is moot.
+        crate::journal::record_label_moves(
+            tx,
+            &before,
+            &current,
+            event_id,
+            Utc::now().date_naive(),
+        )
         .await?;
 
         Ok(current)
@@ -3993,6 +4006,56 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    /// A tier reached within the last 24 hours and lost to a life choice is no
+    /// moment, the same as one lost to a falling turn.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn life_choice_drop_undoes_a_fresh_tier_moment(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session = make_session(&pool, user_id, instance_id).await;
+        let mut a = repo
+            .load_or_create(session, user_id, instance_id)
+            .await
+            .unwrap();
+        persist_rule(
+            &repo,
+            &mut a,
+            AffinityDeltas {
+                trust: 0.2,
+                intrigue: 0.2,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            tier_rows(&pool, instance_id)
+                .await
+                .into_iter()
+                .map(|r| r.0)
+                .collect::<Vec<_>>(),
+            ["bond:friend"]
+        );
+
+        let after = repo
+            .persist_life_choice_drop(
+                session,
+                Uuid::new_v4(),
+                "accept",
+                &AffinityTuning::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            after.bond_label(),
+            eros_engine_core::affinity::BondLabel::Acquaintance
+        );
+        assert!(
+            tier_rows(&pool, instance_id).await.is_empty(),
+            "the fresh moment is taken back"
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]

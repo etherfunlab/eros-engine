@@ -18,7 +18,6 @@ use uuid::Uuid;
 use eros_engine_llm::model_config::ModelConfig;
 use eros_engine_store::scan_state::{BackfillRow, ScanState, ScanStateRepo};
 
-use crate::pipeline::dreaming::journal_first_meet;
 use crate::pipeline::dreaming::scan::{
     scan_segment, ScanMode, ScanOutcome, SegmentPlan, ARC_FOLD_EVERY, MAX_ROWS_PER_SCAN,
 };
@@ -294,17 +293,13 @@ async fn backfill_instance(state: &AppState, instance_id: Uuid, tally: &mut Tall
 }
 
 /// The relationship's scan state. One that has none yet gets it here, the
-/// cursor at its newest row and its first meeting journaled, so a
-/// relationship that never chats again still has one. `None` when it has no
-/// rows to open on.
+/// cursor at its newest row. The first meeting is not journaled here: the
+/// backfill knows no timezone, so the relationship's next live turn journals
+/// it in the user's. `None` when it has no rows to open on.
 async fn open_state(state: &AppState, instance_id: Uuid) -> Result<Option<ScanState>, sqlx::Error> {
     let repo = ScanStateRepo { pool: &state.pool };
-    let created = repo.ensure_for_backfill(instance_id).await?;
-    let st = repo.load(instance_id).await?;
-    if let (true, Some(st)) = (created, &st) {
-        journal_first_meet(&state.pool, instance_id, st.scanned_through_at, None).await;
-    }
-    Ok(st)
+    repo.ensure_for_backfill(instance_id).await?;
+    repo.load(instance_id).await
 }
 
 #[cfg(test)]
@@ -670,7 +665,7 @@ mod tests {
         assert_eq!((plans[0].rows, plans[0].segments), (30, 1));
 
         assert!(repo
-            .claim(instance, std::time::Duration::from_secs(600))
+            .claim(instance, std::time::Duration::from_secs(600), 1)
             .await
             .unwrap());
         assert_eq!(
@@ -730,7 +725,7 @@ mod tests {
         answer(&llm, SCAN_MODEL, "gen-scan", &scan_reply()).await;
         let (state, _embed) = state_with(pool.clone(), &llm, "").await;
         assert!(repo
-            .claim(instance, Duration::from_secs(600))
+            .claim(instance, Duration::from_secs(600), 1)
             .await
             .unwrap());
         assert_eq!(
@@ -832,8 +827,19 @@ mod tests {
         );
     }
 
+    async fn first_meets(pool: &PgPool, instance: Uuid) -> Vec<chrono::NaiveDate> {
+        sqlx::query_scalar(
+            "SELECT occurred_on FROM engine.relationship_journal \
+             WHERE instance_id = $1 AND kind = 'first_meet'",
+        )
+        .bind(instance)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn ensure_for_backfill_writes_first_meet_once(pool: PgPool) {
+    async fn ensure_for_backfill_writes_no_first_meet(pool: PgPool) {
         let (_, instance, session) = seed_rel(&pool).await;
         seed_rows(&pool, session, 0, 30).await;
         let llm = MockServer::start().await;
@@ -843,18 +849,54 @@ mod tests {
             let st = open_state(&state, instance).await.unwrap().unwrap();
             assert_eq!((st.scanned_through_at, st.pending_turns), (minute(29), 0));
         }
-        let first_meet: Vec<chrono::NaiveDate> = sqlx::query_scalar(
-            "SELECT occurred_on FROM engine.relationship_journal \
-             WHERE instance_id = $1 AND kind = 'first_meet'",
+        assert!(
+            first_meets(&pool, instance).await.is_empty(),
+            "the backfill knows no timezone: the first live turn dates it"
+        );
+    }
+
+    /// The first live turn after a backfill opened the relationship journals
+    /// the first meeting, dated by the pair's first row in that turn's
+    /// timezone.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn first_live_turn_after_backfill_dates_first_meet_in_user_tz(pool: PgPool) {
+        let (_, instance, session) = seed_rel(&pool).await;
+        // `BASE` (00:00Z on 09-01) is still 08-31 in Los Angeles.
+        seed_rows(&pool, session, 0, 30).await;
+        let llm = MockServer::start().await;
+        answer(&llm, SCAN_MODEL, "gen-scan", &scan_reply()).await;
+        let (state, _embed) = state_with(pool.clone(), &llm, "").await;
+        let plans = plan(&state.pool, &args(false), true).await.unwrap();
+        assert_eq!(
+            run(&state, &plans).await,
+            Tally {
+                ok: 1,
+                ..Default::default()
+            }
+        );
+        assert!(first_meets(&pool, instance).await.is_empty());
+
+        let user: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+             VALUES ($1, 'user', '<30>', $2) RETURNING id",
         )
-        .bind(instance)
-        .fetch_all(&pool)
+        .bind(session)
+        .bind(minute(30))
+        .fetch_one(&pool)
         .await
         .unwrap();
+        let bumped = crate::pipeline::dreaming::bump_relationship(
+            &state,
+            instance,
+            user,
+            Some(chrono_tz::America::Los_Angeles),
+        )
+        .await
+        .expect("the turn is counted");
+        assert_eq!((bumped.pending_turns, bumped.created), (1, false));
         assert_eq!(
-            first_meet,
-            vec![at(BASE).date_naive()],
-            "dated by the first row, written once"
+            first_meets(&pool, instance).await,
+            vec![chrono::NaiveDate::from_ymd_opt(2026, 8, 31).unwrap()]
         );
     }
 

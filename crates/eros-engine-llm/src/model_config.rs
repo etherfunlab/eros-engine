@@ -2601,9 +2601,13 @@ impl ModelConfig {
         Ok(())
     }
 
-    /// Boot gate for `[tasks.affinity_evaluation].filter_prompt` and
-    /// `[tasks.affinity_summary].filter_prompt` — keys that parse but are
-    /// never read.
+    /// Boot gate for `[tasks.affinity_evaluation].filter_prompt`,
+    /// `[tasks.affinity_summary].filter_prompt` and
+    /// `[tasks.arc_rewrite].filter_prompt` — keys that parse but are never
+    /// read.
+    ///
+    /// The arc rewrite's prompt is engine-owned too: the reply it asks for is
+    /// the JSON shape the engine's arc guard parses and length-checks.
     ///
     /// Both affinity tasks' prompts are engine-owned by design: the evaluator
     /// (issue #210) interpolates per-turn context the config layer cannot
@@ -2626,8 +2630,9 @@ impl ModelConfig {
         // Both affinity tasks' prompts are engine-owned: the evaluator
         // (issue #210) and the feeling-clause summarizer (spec 2026-09-03),
         // whose first-person voice + reason hygiene are load-bearing — the
-        // clause is re-injected into later system prompts.
-        const ENGINE_OWNED_AFFINITY_TASKS: [(&str, &str); 2] = [
+        // clause is re-injected into later system prompts. So is the arc
+        // rewrite's (spec 2026-10-28), whose reply the arc guard parses.
+        const ENGINE_OWNED_TASKS: [(&str, &str); 3] = [
             (
                 "affinity_evaluation",
                 "https://github.com/etherfunlab/eros-engine/issues/210",
@@ -2636,8 +2641,12 @@ impl ModelConfig {
                 "affinity_summary",
                 "docs/superpowers/specs/2026-09-03-affinity-feeling-clause-design.md",
             ),
+            (
+                ARC_REWRITE_TASK,
+                "docs/superpowers/specs/2026-10-28-memory-2-dreaming-plus-design.md",
+            ),
         ];
-        for (task, rationale) in ENGINE_OWNED_AFFINITY_TASKS {
+        for (task, rationale) in ENGINE_OWNED_TASKS {
             let has_prompt = self
                 .tasks
                 .get(task)
@@ -7544,6 +7553,27 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
             err.contains("[tasks.affinity_summary].filter_prompt"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn arc_rewrite_filter_prompt_refuses_boot() {
+        let ok =
+            ModelConfig::from_toml_str("[tasks.arc_rewrite]\nmodel = \"m\"\nmax_tokens = 1500\n")
+                .unwrap();
+        assert!(ok.validate_affinity_prompt_unset().is_ok());
+
+        for prompt in ["\"rewrite the arc\"", "\"\""] {
+            let cfg = ModelConfig::from_toml_str(&format!(
+                "[tasks.arc_rewrite]\nmodel = \"m\"\nfilter_prompt = {prompt}\n"
+            ))
+            .unwrap();
+            let err = cfg
+                .validate_affinity_prompt_unset()
+                .expect_err("a set arc_rewrite prompt must refuse to boot");
+            assert!(err.contains("[tasks.arc_rewrite].filter_prompt"), "{err}");
+            assert!(err.contains("engine-owned"), "{err}");
+            assert!(err.contains("memory-2-dreaming-plus"), "{err}");
+        }
     }
 
     // ─── validate_tier_blocks ────────────────────────────────────────────

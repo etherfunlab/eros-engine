@@ -300,12 +300,12 @@ async fn build_state(cfg: &ServerConfig, with_auth: bool) -> Result<AppState> {
 
     let model_config = Arc::new(load_model_config()?);
 
-    // Dead-config gate for the affinity evaluator (#210). Runs before the
-    // variant-shape gate: this check is shape-independent (it only asks
-    // whether the key exists), so a table-shaped filter_prompt under
-    // [tasks.affinity_evaluation] gets the accurate "affinity's prompt is not
-    // configurable" message instead of the generic "only the composer reads
-    // variants" one.
+    // Dead-config gate for the engine-owned affinity (#210) and arc-rewrite
+    // prompts. Runs before the variant-shape gate: this check is
+    // shape-independent (it only asks whether the key exists), so a
+    // table-shaped filter_prompt under [tasks.affinity_evaluation] gets the
+    // accurate "affinity's prompt is not configurable" message instead of the
+    // generic "only the composer reads variants" one.
     if let Err(msg) = model_config.validate_affinity_prompt_unset() {
         anyhow::bail!(msg);
     }

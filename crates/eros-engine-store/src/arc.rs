@@ -38,7 +38,9 @@ impl ArcRepo<'_> {
 
     /// Store a rewritten arc while the relationship lives (its scan state row
     /// exists): an archive or erasure that lands during the rewrite leaves
-    /// nothing to write onto, and `false` comes back. The arc it replaces
+    /// nothing to write onto, and `false` comes back. The check takes
+    /// `FOR KEY SHARE` on the state row, so a delete of it that has not
+    /// committed holds the write until it does. The arc it replaces
     /// moves to `previous_arc`. The first write needs `opening`, which is then
     /// kept for good: later calls may omit it, and one that passes it again
     /// changes nothing.
@@ -56,7 +58,7 @@ impl ArcRepo<'_> {
                          (instance_id, opening, arc, folded_through, generation_id) \
                      SELECT $1::uuid, $2::text, $3::text, $4::timestamptz, $5::text \
                      WHERE EXISTS (SELECT 1 FROM engine.relationship_scan_state \
-                                   WHERE instance_id = $1) \
+                                   WHERE instance_id = $1 FOR KEY SHARE) \
                      ON CONFLICT (instance_id) DO UPDATE SET \
                         previous_arc   = relationship_arcs.arc, \
                         arc            = EXCLUDED.arc, \
@@ -82,7 +84,7 @@ impl ArcRepo<'_> {
                         updated_at     = now() \
                      WHERE instance_id = $1 \
                        AND EXISTS (SELECT 1 FROM engine.relationship_scan_state \
-                                   WHERE instance_id = $1)",
+                                   WHERE instance_id = $1 FOR KEY SHARE)",
                 )
                 .bind(instance_id)
                 .bind(arc)
@@ -104,7 +106,8 @@ impl ArcRepo<'_> {
 
     async fn live(&self, instance_id: Uuid) -> Result<bool, sqlx::Error> {
         sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM engine.relationship_scan_state WHERE instance_id = $1)",
+            "SELECT EXISTS (SELECT 1 FROM engine.relationship_scan_state \
+             WHERE instance_id = $1 FOR KEY SHARE)",
         )
         .bind(instance_id)
         .fetch_one(self.pool)
@@ -240,5 +243,37 @@ mod tests {
         }
         let a = repo.load(instance).await.unwrap().unwrap();
         assert_eq!((a.arc.as_str(), a.folded_through), ("arc one", at(1_000)));
+    }
+
+    /// An archive or erasure that has deleted the state row but not committed
+    /// holds the rewrite until it commits; the rewrite then writes nothing.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn replace_if_live_waits_for_an_uncommitted_state_delete(pool: PgPool) {
+        let instance = live_instance(&pool).await;
+        let mut erase = pool.begin().await.unwrap();
+        sqlx::query("DELETE FROM engine.relationship_scan_state WHERE instance_id = $1")
+            .bind(instance)
+            .execute(&mut *erase)
+            .await
+            .unwrap();
+
+        let write = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                ArcRepo { pool: &pool }
+                    .replace_if_live(instance, Some("how it began"), "arc", at(1_000), None)
+                    .await
+            }
+        });
+        crate::testutil::wait_for_lock_wait(&pool).await;
+        assert!(!write.is_finished(), "the rewrite waits for the delete");
+        erase.commit().await.unwrap();
+
+        assert!(!write.await.unwrap().unwrap());
+        assert!(ArcRepo { pool: &pool }
+            .load(instance)
+            .await
+            .unwrap()
+            .is_none());
     }
 }

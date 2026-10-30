@@ -64,7 +64,9 @@ pub fn local_date(at: DateTime<Utc>, tz: Option<Tz>) -> NaiveDate {
 
 /// The one INSERT behind every journal write. A row whose `dedup_key` is taken
 /// is dropped (`None`): whichever writer lands first wins. With `claimed_only`
-/// the row is written only while the relationship's scan claim is live.
+/// the row is written only while the relationship's scan claim is live; that
+/// guard takes `FOR KEY SHARE` on the state row, so an uncommitted delete of it
+/// holds the write until it commits and the write then finds no row.
 async fn insert_row<'e>(
     executor: impl PgExecutor<'e>,
     j: &JournalInsert,
@@ -78,7 +80,8 @@ async fn insert_row<'e>(
                 $8::uuid, $9::text, $10::date, $11::text, $12::vector \
          WHERE NOT $13::bool \
             OR EXISTS (SELECT 1 FROM engine.relationship_scan_state \
-                       WHERE instance_id = $1 AND claimed_at IS NOT NULL) \
+                       WHERE instance_id = $1 AND claimed_at IS NOT NULL \
+                       FOR KEY SHARE) \
          ON CONFLICT (instance_id, dedup_key) WHERE dedup_key IS NOT NULL DO NOTHING \
          RETURNING id",
     )
@@ -399,7 +402,8 @@ impl JournalRepo<'_> {
     }
 
     /// The date of the relationship's earliest chat row, in `tz` (UTC when
-    /// `None`), across its live text and voice sessions.
+    /// `None`), across its live text and voice sessions; product Q&A rows are
+    /// not chat.
     pub async fn first_meet_date(
         &self,
         instance_id: Uuid,
@@ -410,7 +414,8 @@ impl JournalRepo<'_> {
              JOIN engine.chat_sessions s ON s.id = m.session_id \
              WHERE s.instance_id = $1 AND NOT s.archived \
                AND s.channel IN ('text', 'voice') \
-               AND m.role IN ('user', 'assistant')",
+               AND m.role IN ('user', 'assistant') \
+               AND (m.channel IS NULL OR m.channel = 'voice')",
         )
         .bind(instance_id)
         .fetch_one(self.pool)
@@ -638,7 +643,7 @@ mod tests {
         );
 
         assert!(scan
-            .claim(instance, Duration::from_secs(600))
+            .claim(instance, Duration::from_secs(600), 1)
             .await
             .unwrap());
         let keyed = JournalInsert {
@@ -652,6 +657,41 @@ mod tests {
             "a claimed write still honours the dedup key"
         );
         assert_eq!(count(&pool, instance).await, 2);
+    }
+
+    /// An archive or erasure that has deleted the state row but not committed
+    /// holds the claimed write until it commits; the write then finds no row.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn insert_if_claimed_waits_for_an_uncommitted_state_delete(pool: PgPool) {
+        let scan = ScanStateRepo { pool: &pool };
+        let (_, instance) = seed_relationship(&pool).await;
+        scan.bump(instance, at(1_000), None).await.unwrap();
+        assert!(scan
+            .claim(instance, Duration::from_secs(600), 1)
+            .await
+            .unwrap());
+
+        let mut erase = pool.begin().await.unwrap();
+        sqlx::query("DELETE FROM engine.relationship_scan_state WHERE instance_id = $1")
+            .bind(instance)
+            .execute(&mut *erase)
+            .await
+            .unwrap();
+
+        let write = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                JournalRepo { pool: &pool }
+                    .insert_if_claimed(&llm_row(instance, "moved to Osaka", "real", "none"))
+                    .await
+            }
+        });
+        crate::testutil::wait_for_lock_wait(&pool).await;
+        assert!(!write.is_finished(), "the write waits for the delete");
+        erase.commit().await.unwrap();
+
+        assert_eq!(write.await.unwrap().unwrap(), None);
+        assert_eq!(count(&pool, instance).await, 0);
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -823,6 +863,34 @@ mod tests {
                 .await
                 .unwrap(),
             Some(day(2026, 3, 1))
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn first_meet_date_ignores_product_qa_rows(pool: PgPool) {
+        let repo = JournalRepo { pool: &pool };
+        let (owner, instance) = seed_relationship(&pool).await;
+        let session = seed_session(&pool, owner, instance, false).await;
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, channel, sent_at) \
+             VALUES ($1, 'assistant', 'qa', 'product_qa', $2)",
+        )
+        .bind(session)
+        .bind(at(0))
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            repo.first_meet_date(instance, None).await.unwrap(),
+            None,
+            "a product Q&A row alone is no meeting"
+        );
+
+        let first = at(10 * 86_400);
+        seed_msg(&pool, session, "user", first).await;
+        assert_eq!(
+            repo.first_meet_date(instance, None).await.unwrap(),
+            Some(first.date_naive())
         );
     }
 }

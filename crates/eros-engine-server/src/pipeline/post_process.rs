@@ -5392,10 +5392,9 @@ mod tests {
         (owner, instance, session, user, reply)
     }
 
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn twentieth_turn_scans_inline(pool: sqlx::PgPool) {
-        use eros_engine_store::episode::EpisodeRepo;
-        use eros_engine_store::scan_state::ScanStateRepo;
+    /// A state whose `[tasks.dreaming_scan]` calls go to a mock that answers
+    /// one episode, once, with dreaming enabled.
+    async fn k_path_state(pool: &sqlx::PgPool) -> (AppState, wiremock::MockServer) {
         use wiremock::matchers::{body_partial_json, method, path as wm_path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -5413,6 +5412,7 @@ mod tests {
             .mount(&llm)
             .await;
         let mut state = crate::routes::companion::test_state(pool.clone());
+        state.config.dreaming_tick = std::time::Duration::from_secs(300);
         state.model_config = std::sync::Arc::new(
             eros_engine_llm::model_config::ModelConfig::from_toml_str(
                 "[tasks.dreaming_scan]\nmodel = \"scan/m\"\nfilter_prompt = \"extract\"\n",
@@ -5425,6 +5425,15 @@ mod tests {
                 format!("{}/api/v1/chat/completions", llm.uri()),
             ),
         );
+        (state, llm)
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn twentieth_turn_scans_inline(pool: sqlx::PgPool) {
+        use eros_engine_store::episode::EpisodeRepo;
+        use eros_engine_store::scan_state::ScanStateRepo;
+
+        let (state, llm) = k_path_state(&pool).await;
         let (owner, instance, session, user, reply) = one_turn_before_k(&pool).await;
 
         run(
@@ -5472,12 +5481,58 @@ mod tests {
         assert_eq!(events, vec![("scan".to_string(), "ok".to_string())]);
     }
 
+    /// A twentieth turn that produced no assistant row scans up to its own
+    /// user row.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn k_scan_bound_falls_back_to_the_user_row(pool: sqlx::PgPool) {
+        use eros_engine_store::episode::EpisodeRepo;
+        use eros_engine_store::scan_state::ScanStateRepo;
+
+        let (state, llm) = k_path_state(&pool).await;
+        let (owner, instance, session, user, _reply) = one_turn_before_k(&pool).await;
+
+        run(
+            state,
+            session,
+            owner,
+            instance,
+            persona_named("Aria"),
+            user_turn("今天好累", user),
+            reply_plan(),
+            Vec::new(),
+            Default::default(),
+        )
+        .await;
+
+        let episodes = EpisodeRepo { pool: &pool }
+            .unfolded(instance)
+            .await
+            .unwrap();
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(episodes[0].ended_at, at("2026-10-01T11:00:00Z"));
+        let body =
+            String::from_utf8_lossy(&llm.received_requests().await.unwrap()[0].body).to_string();
+        assert!(body.contains("今天好累"));
+        assert!(
+            !body.contains("抱抱你"),
+            "the reply after the user row is not read: {body}"
+        );
+        let s = ScanStateRepo { pool: &pool }
+            .load(instance)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.scanned_through_at, at("2026-10-01T11:00:00Z"));
+        assert_eq!((s.pending_turns, s.claimed_at), (0, None));
+    }
+
     /// Without `[tasks.dreaming_scan]` the turn is still counted, but the
     /// twentieth claims nothing.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn twentieth_turn_without_scan_task_claims_nothing(pool: sqlx::PgPool) {
         use eros_engine_store::scan_state::{ScanStateRepo, SCAN_K};
-        let state = crate::routes::companion::test_state(pool.clone());
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.config.dreaming_tick = std::time::Duration::from_secs(300);
         let (owner, instance, session, user, reply) = one_turn_before_k(&pool).await;
 
         run(

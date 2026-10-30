@@ -124,19 +124,27 @@ impl ScanStateRepo<'_> {
     }
 
     /// Take the scan for one relationship. `true` only for the caller that sets
-    /// `claimed_at`: the relationship must have pending turns and no live
-    /// claim, where a claim older than `stale` belongs to a worker presumed
-    /// dead. This is the `SCAN_K` path; the idle sweeper uses `claim_due`.
-    pub async fn claim(&self, instance_id: Uuid, stale: Duration) -> Result<bool, sqlx::Error> {
+    /// `claimed_at`: the relationship must have at least `min_pending` pending
+    /// turns, read on the row itself, and no live claim, where a claim older
+    /// than `stale` belongs to a worker presumed dead. The `SCAN_K` path passes
+    /// `SCAN_K`, so a count read before another scan settled cannot claim; the
+    /// idle sweeper uses `claim_due`.
+    pub async fn claim(
+        &self,
+        instance_id: Uuid,
+        stale: Duration,
+        min_pending: i32,
+    ) -> Result<bool, sqlx::Error> {
         let claimed: Option<Uuid> = sqlx::query_scalar(
             "UPDATE engine.relationship_scan_state SET claimed_at = now() \
-             WHERE instance_id = $1 AND pending_turns > 0 \
+             WHERE instance_id = $1 AND pending_turns >= $3 \
                AND (claimed_at IS NULL \
                     OR claimed_at < now() - make_interval(secs => $2::float8)) \
              RETURNING instance_id",
         )
         .bind(instance_id)
         .bind(stale.as_secs() as i64)
+        .bind(min_pending)
         .fetch_optional(self.pool)
         .await?;
         Ok(claimed.is_some())
@@ -191,10 +199,10 @@ impl ScanStateRepo<'_> {
         Ok(refreshed.is_some())
     }
 
-    /// A scan succeeded: the cursor moves to `cursor_to`, the `covered_user_rows`
-    /// it read leave the pending count, and the claim is released. `false` when
-    /// the row is gone or the claim was already released, in which case nothing
-    /// changed.
+    /// A scan succeeded: the cursor moves to `cursor_to` (never back), the
+    /// `covered_user_rows` it read leave the pending count, and the claim is
+    /// released. `false` when the row is gone or the claim was already
+    /// released, in which case nothing changed.
     pub async fn finish_scan_ok(
         &self,
         instance_id: Uuid,
@@ -203,7 +211,7 @@ impl ScanStateRepo<'_> {
     ) -> Result<bool, sqlx::Error> {
         let finished: Option<Uuid> = sqlx::query_scalar(
             "UPDATE engine.relationship_scan_state SET \
-                scanned_through_at = $2, \
+                scanned_through_at = GREATEST(scanned_through_at, $2), \
                 pending_turns = GREATEST(pending_turns - $3, 0), \
                 last_scanned_at = now(), \
                 scan_failures = 0, claimed_at = NULL \
@@ -222,9 +230,10 @@ impl ScanStateRepo<'_> {
     /// sweeper retries after `idle`, not at once; cursor and pending count stay.
     /// The failure that reaches `MAX_SCAN_FAILURES` gives up on the span
     /// instead and applies what `finish_scan_ok` would, with the failure streak
-    /// reset; the caller logs it. A row whose claim is already released is left
-    /// alone, so a late failure from a worker that lost its claim cannot clear
-    /// another worker's claim or move the cursor under it.
+    /// reset; the caller logs it. Only a released claim protects the row: one
+    /// whose claim is already released is left alone, but a claim another
+    /// worker took over once this one went stale is not told apart from the
+    /// caller's own and is cleared. The cursor never moves back either way.
     pub async fn finish_scan_failed(
         &self,
         instance_id: Uuid,
@@ -234,7 +243,8 @@ impl ScanStateRepo<'_> {
         sqlx::query(
             "UPDATE engine.relationship_scan_state SET \
                 scanned_through_at = CASE WHEN scan_failures + 1 >= $4 \
-                                          THEN $2 ELSE scanned_through_at END, \
+                                          THEN GREATEST(scanned_through_at, $2) \
+                                          ELSE scanned_through_at END, \
                 pending_turns = CASE WHEN scan_failures + 1 >= $4 \
                                      THEN GREATEST(pending_turns - $3, 0) \
                                      ELSE pending_turns END, \
@@ -351,7 +361,8 @@ impl ScanStateRepo<'_> {
         Ok(claimed.is_some())
     }
 
-    /// Release the claim a backfill segment held.
+    /// Release a claim without settling anything: a backfill segment's, or a
+    /// live scan's that found nothing past the cursor.
     pub async fn release_claim(&self, instance_id: Uuid) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE engine.relationship_scan_state SET claimed_at = NULL WHERE instance_id = $1",
@@ -590,32 +601,95 @@ mod tests {
         let repo = ScanStateRepo { pool: &pool };
         let (instance, _) = seed_relationship(&pool).await;
         assert!(
-            !repo.claim(instance, TEN_MIN).await.unwrap(),
+            !repo.claim(instance, TEN_MIN, 1).await.unwrap(),
             "no row, nothing to claim"
         );
 
         repo.bump(instance, at(1_000), None).await.unwrap();
         assert!(
-            repo.claim(instance, TEN_MIN).await.unwrap(),
-            "the K path claims on one pending turn"
+            repo.claim(instance, TEN_MIN, 1).await.unwrap(),
+            "one pending turn is enough at a floor of one"
         );
         assert!(
-            !repo.claim(instance, TEN_MIN).await.unwrap(),
+            !repo.claim(instance, TEN_MIN, 1).await.unwrap(),
             "a live claim blocks the second worker"
         );
 
         shift(&pool, instance, "claimed_at", "9 minutes").await;
-        assert!(!repo.claim(instance, TEN_MIN).await.unwrap());
+        assert!(!repo.claim(instance, TEN_MIN, 1).await.unwrap());
         shift(&pool, instance, "claimed_at", "11 minutes").await;
         assert!(
-            repo.claim(instance, TEN_MIN).await.unwrap(),
+            repo.claim(instance, TEN_MIN, 1).await.unwrap(),
             "a stale claim is taken over"
         );
 
         assert!(repo.finish_scan_ok(instance, at(1_000), 1).await.unwrap());
         assert!(
-            !repo.claim(instance, TEN_MIN).await.unwrap(),
+            !repo.claim(instance, TEN_MIN, 1).await.unwrap(),
             "nothing pending, nothing to claim"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn k_path_claim_needs_scan_k_pending_turns(pool: PgPool) {
+        let repo = ScanStateRepo { pool: &pool };
+        let (instance, _) = seed_relationship(&pool).await;
+        repo.bump(instance, at(1_000), None).await.unwrap();
+        assert!(
+            !repo.claim(instance, TEN_MIN, SCAN_K).await.unwrap(),
+            "one pending turn is not a K-path scan"
+        );
+        assert!(repo
+            .load(instance)
+            .await
+            .unwrap()
+            .unwrap()
+            .claimed_at
+            .is_none());
+
+        bump_n(&repo, instance, SCAN_K - 2).await;
+        assert!(!repo.claim(instance, TEN_MIN, SCAN_K).await.unwrap());
+        repo.bump(instance, at(1_000), None).await.unwrap();
+        assert!(
+            repo.claim(instance, TEN_MIN, SCAN_K).await.unwrap(),
+            "the K-th pending turn makes it claimable"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn cursor_never_moves_back(pool: PgPool) {
+        let repo = ScanStateRepo { pool: &pool };
+        let (instance, _) = seed_relationship(&pool).await;
+        bump_n(&repo, instance, 5).await;
+        assert!(repo.claim(instance, TEN_MIN, 1).await.unwrap());
+        assert!(repo.finish_scan_ok(instance, at(5_000), 1).await.unwrap());
+
+        assert!(repo.claim(instance, TEN_MIN, 1).await.unwrap());
+        assert!(repo.finish_scan_ok(instance, at(3_000), 1).await.unwrap());
+        let s = repo.load(instance).await.unwrap().unwrap();
+        assert_eq!(
+            (s.scanned_through_at, s.pending_turns),
+            (at(5_000), 3),
+            "an older bound settles the count but keeps the cursor"
+        );
+
+        sqlx::query(
+            "UPDATE engine.relationship_scan_state SET scan_failures = $2 WHERE instance_id = $1",
+        )
+        .bind(instance)
+        .bind(MAX_SCAN_FAILURES - 1)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(repo.claim(instance, TEN_MIN, 1).await.unwrap());
+        repo.finish_scan_failed(instance, at(3_000), 1)
+            .await
+            .unwrap();
+        let s = repo.load(instance).await.unwrap().unwrap();
+        assert_eq!(
+            (s.scanned_through_at, s.pending_turns, s.scan_failures),
+            (at(5_000), 2, 0),
+            "a strike-out on an older bound keeps the cursor too"
         );
     }
 
@@ -630,11 +704,11 @@ mod tests {
             !repo.refresh_claim(instance).await.unwrap(),
             "an unclaimed row is not refreshed into a claim"
         );
-        assert!(repo.claim(instance, TEN_MIN).await.unwrap());
+        assert!(repo.claim(instance, TEN_MIN, 1).await.unwrap());
         shift(&pool, instance, "claimed_at", "11 minutes").await;
         assert!(repo.refresh_claim(instance).await.unwrap());
         assert!(
-            !repo.claim(instance, TEN_MIN).await.unwrap(),
+            !repo.claim(instance, TEN_MIN, 1).await.unwrap(),
             "a refreshed claim is not stale"
         );
 
@@ -686,7 +760,7 @@ mod tests {
         let repo = ScanStateRepo { pool: &pool };
         let (instance, _) = seed_relationship(&pool).await;
         bump_n(&repo, instance, 25).await;
-        assert!(repo.claim(instance, TEN_MIN).await.unwrap());
+        assert!(repo.claim(instance, TEN_MIN, 1).await.unwrap());
         sqlx::query(
             "UPDATE engine.relationship_scan_state SET scan_failures = 2 WHERE instance_id = $1",
         )
@@ -719,7 +793,7 @@ mod tests {
             "a gone row is not finished"
         );
 
-        assert!(repo.claim(instance, TEN_MIN).await.unwrap());
+        assert!(repo.claim(instance, TEN_MIN, 1).await.unwrap());
         assert!(repo.finish_scan_ok(instance, at(9_000), 99).await.unwrap());
         assert_eq!(
             repo.load(instance).await.unwrap().unwrap().pending_turns,
@@ -743,7 +817,7 @@ mod tests {
 
         for failures in 1..MAX_SCAN_FAILURES {
             shift(&pool, instance, "last_turn_at", "2 hours").await;
-            assert!(repo.claim(instance, TEN_MIN).await.unwrap());
+            assert!(repo.claim(instance, TEN_MIN, 1).await.unwrap());
             repo.finish_scan_failed(instance, cursor, 3).await.unwrap();
 
             let s = repo.load(instance).await.unwrap().unwrap();
@@ -770,7 +844,7 @@ mod tests {
             );
         }
 
-        assert!(repo.claim(instance, TEN_MIN).await.unwrap());
+        assert!(repo.claim(instance, TEN_MIN, 1).await.unwrap());
         repo.finish_scan_failed(instance, cursor, 3).await.unwrap();
         let s = repo.load(instance).await.unwrap().unwrap();
         assert_eq!(
@@ -956,9 +1030,9 @@ mod tests {
         );
 
         repo.bump(instance, at(1_000), None).await.unwrap();
-        assert!(repo.claim(instance, TEN_MIN).await.unwrap());
+        assert!(repo.claim(instance, TEN_MIN, 1).await.unwrap());
         assert!(repo.finish_scan_ok(instance, at(1_000), 1).await.unwrap());
-        assert!(!repo.claim(instance, TEN_MIN).await.unwrap());
+        assert!(!repo.claim(instance, TEN_MIN, 1).await.unwrap());
         assert!(
             repo.claim_for_backfill(instance, TEN_MIN).await.unwrap(),
             "the backfill claims with nothing pending"
@@ -966,14 +1040,14 @@ mod tests {
         assert!(!repo.claim_for_backfill(instance, TEN_MIN).await.unwrap());
         repo.bump(instance, at(2_000), None).await.unwrap();
         assert!(
-            !repo.claim(instance, TEN_MIN).await.unwrap(),
+            !repo.claim(instance, TEN_MIN, 1).await.unwrap(),
             "a live scan waits for the backfill's segment"
         );
 
         repo.release_claim(instance).await.unwrap();
         let s = repo.load(instance).await.unwrap().unwrap();
         assert_eq!((s.claimed_at, s.pending_turns), (None, 1));
-        assert!(repo.claim(instance, TEN_MIN).await.unwrap());
+        assert!(repo.claim(instance, TEN_MIN, 1).await.unwrap());
         assert!(
             !repo.claim_for_backfill(instance, TEN_MIN).await.unwrap(),
             "the backfill waits for a live claim"

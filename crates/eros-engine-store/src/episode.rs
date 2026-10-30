@@ -53,6 +53,19 @@ pub struct EpisodeInsert {
     pub generation_id: Option<String>,
 }
 
+/// `s` on one line: line breaks become spaces, runs of spaces close up, and
+/// the ends are trimmed. Model-written summaries are stored this way.
+pub fn one_line(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let c = if matches!(c, '\n' | '\r') { ' ' } else { c };
+        if !(c == ' ' && out.ends_with(' ')) {
+            out.push(c);
+        }
+    }
+    out.trim().to_string()
+}
+
 pub struct EpisodeRepo<'a> {
     pub pool: &'a PgPool,
 }
@@ -92,12 +105,18 @@ impl EpisodeRepo<'_> {
         .await
     }
 
-    /// Store an episode, cutting the summary to `EPISODE_MAX_CHARS`. Only the
-    /// scan's claim holder may write: the insert is one statement guarded by
-    /// the relationship's live claim, so a worker that lost it writes nothing.
-    /// `None` when nothing was inserted.
+    /// Store an episode on one line, cutting the summary to
+    /// `EPISODE_MAX_CHARS`. Only the scan's claim holder may write: the insert
+    /// is one statement guarded by the relationship's live claim, so a worker
+    /// that lost it writes nothing. The guard takes `FOR KEY SHARE` on the
+    /// state row, so an archive or erasure that has deleted the row but not
+    /// committed holds the insert until it does, and the insert then finds no
+    /// row. `None` when nothing was inserted.
     pub async fn insert_if_claimed(&self, e: &EpisodeInsert) -> Result<Option<Uuid>, sqlx::Error> {
-        let summary: String = e.summary.chars().take(EPISODE_MAX_CHARS).collect();
+        let summary: String = one_line(&e.summary)
+            .chars()
+            .take(EPISODE_MAX_CHARS)
+            .collect();
         sqlx::query_scalar(
             "INSERT INTO engine.relationship_episodes \
                  (instance_id, summary, started_at, ended_at, \
@@ -105,7 +124,8 @@ impl EpisodeRepo<'_> {
              SELECT $1::uuid, $2::text, $3::timestamptz, $4::timestamptz, \
                     $5::uuid, $6::uuid, $7::text \
              WHERE EXISTS (SELECT 1 FROM engine.relationship_scan_state \
-                           WHERE instance_id = $1 AND claimed_at IS NOT NULL) \
+                           WHERE instance_id = $1 AND claimed_at IS NOT NULL \
+                           FOR KEY SHARE) \
              RETURNING id",
         )
         .bind(e.instance_id)
@@ -218,7 +238,7 @@ mod tests {
         let scan = ScanStateRepo { pool };
         scan.bump(instance, at(1_000), None).await.unwrap();
         assert!(scan
-            .claim(instance, Duration::from_secs(600))
+            .claim(instance, Duration::from_secs(600), 1)
             .await
             .unwrap());
     }
@@ -373,7 +393,7 @@ mod tests {
         assert_eq!(count().await, 0);
 
         assert!(scan
-            .claim(instance, Duration::from_secs(600))
+            .claim(instance, Duration::from_secs(600), 1)
             .await
             .unwrap());
         let id = repo
@@ -425,6 +445,63 @@ mod tests {
         assert_eq!(rows[0].summary.chars().count(), EPISODE_MAX_CHARS);
         assert_eq!(rows[0].summary, "汉".repeat(400));
         assert_eq!(rows[1].summary, "short", "a short summary is kept whole");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn episode_summary_is_stored_on_one_line(pool: PgPool) {
+        let repo = EpisodeRepo { pool: &pool };
+        let (_, instance) = seed_relationship(&pool).await;
+        hold_claim(&pool, instance).await;
+
+        repo.insert_if_claimed(&episode(
+            instance,
+            "\n两人聊了搬家。\r\n用户说  要去大阪。\n",
+            2_000,
+        ))
+        .await
+        .unwrap()
+        .expect("inserted");
+        assert_eq!(
+            repo.unfolded(instance).await.unwrap()[0].summary,
+            "两人聊了搬家。 用户说 要去大阪。"
+        );
+    }
+
+    /// An archive or erasure that has deleted the state row but not committed
+    /// holds the claimed write until it commits; the write then finds no row.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn episode_insert_waits_for_an_uncommitted_state_delete(pool: PgPool) {
+        let (_, instance) = seed_relationship(&pool).await;
+        hold_claim(&pool, instance).await;
+
+        let mut erase = pool.begin().await.unwrap();
+        sqlx::query("DELETE FROM engine.relationship_scan_state WHERE instance_id = $1")
+            .bind(instance)
+            .execute(&mut *erase)
+            .await
+            .unwrap();
+
+        let write = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                EpisodeRepo { pool: &pool }
+                    .insert_if_claimed(&episode(instance, "talked", 2_000))
+                    .await
+            }
+        });
+        crate::testutil::wait_for_lock_wait(&pool).await;
+        assert!(!write.is_finished(), "the write waits for the delete");
+        erase.commit().await.unwrap();
+
+        assert_eq!(write.await.unwrap().unwrap(), None);
+        let episodes: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.relationship_episodes WHERE instance_id = $1",
+        )
+        .bind(instance)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(episodes, 0);
     }
 
     #[sqlx::test(migrations = "./migrations")]

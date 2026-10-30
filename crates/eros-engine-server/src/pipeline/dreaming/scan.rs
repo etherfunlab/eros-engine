@@ -77,7 +77,9 @@ pub(crate) struct SegmentPlan {
 
 /// Scan one relationship from its live cursor up to `bound`. The caller holds
 /// the claim, and every path settles it except a failed state read and an
-/// unconfigured `dreaming_scan`, which leave it to go stale. A scan that finds
+/// unconfigured `dreaming_scan`, which leave it to go stale. A `bound` at or
+/// behind the cursor (another scan read past it since the caller looked) only
+/// releases the claim: nothing is read and nothing settles. A scan that finds
 /// the claim gone writes nothing further, records an `empty` event and reports
 /// `Empty`. Every scan that reached the model leaves one event row.
 pub(crate) async fn scan_instance(
@@ -85,10 +87,8 @@ pub(crate) async fn scan_instance(
     instance_id: Uuid,
     bound: DateTime<Utc>,
 ) -> ScanOutcome {
-    let st = match (ScanStateRepo { pool: &state.pool })
-        .load(instance_id)
-        .await
-    {
+    let scan = ScanStateRepo { pool: &state.pool };
+    let st = match scan.load(instance_id).await {
         Ok(Some(st)) => st,
         Ok(None) => return ScanOutcome::Empty,
         Err(e) => {
@@ -96,6 +96,12 @@ pub(crate) async fn scan_instance(
             return ScanOutcome::Failed;
         }
     };
+    if bound <= st.scanned_through_at {
+        if let Err(e) = scan.release_claim(instance_id).await {
+            tracing::warn!(%instance_id, "dreaming scan: releasing the claim failed: {e}");
+        }
+        return ScanOutcome::Empty;
+    }
     let seg = SegmentPlan {
         after: st.scanned_through_at,
         bound,
@@ -230,6 +236,53 @@ pub(crate) async fn scan_segment(
         return ScanOutcome::Failed;
     };
 
+    // Everything the writes need from outside the database comes first: the
+    // owner the memories are filed under, and every vector in one embedding
+    // call. The claim check below and the writes it guards are then only
+    // database round trips apart. A backfill segment the retired sweeper
+    // already extracted keeps its memories out: they are in the profile layer
+    // once.
+    let keep_memories = !matches!(
+        seg.mode,
+        ScanMode::Backfill {
+            write_memories: false
+        }
+    );
+    let owner = if keep_memories && !out.memories.is_empty() {
+        match (PersonaRepo { pool }).instance_owner(instance_id).await {
+            Ok(owner) => owner,
+            Err(e) => {
+                tracing::warn!(%instance_id, "dreaming scan: owner read failed: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let memories: Vec<(&MemoryCandidate, &str)> = match owner {
+        Some(_) => out
+            .memories
+            .iter()
+            .map(|c| (c, c.content.trim()))
+            .filter(|(_, content)| !content.is_empty())
+            .collect(),
+        None => Vec::new(),
+    };
+    let mut journal_rows = validate_journal(&out.journal, &rows, tz, instance_id);
+    let texts: Vec<&str> = memories
+        .iter()
+        .map(|(_, content)| *content)
+        .chain(journal_rows.iter().map(|j| j.summary.as_str()))
+        .collect();
+    let mut vectors = embed_all(state, instance_id, &texts).await;
+    // A journal row without a vector is still written: the sweeper embeds it.
+    for (row, v) in journal_rows
+        .iter_mut()
+        .zip(vectors.split_off(memories.len()))
+    {
+        row.embedding = v;
+    }
+
     // Profile memories have no claim guard of their own, so the claim is
     // checked (and its clock restarted) before anything is written.
     match scan.refresh_claim(instance_id).await {
@@ -242,16 +295,16 @@ pub(crate) async fn scan_segment(
             return ScanOutcome::Failed;
         }
     }
-    // A backfill segment the retired sweeper already extracted keeps its
-    // memories out: they are in the profile layer once.
-    if !matches!(
-        seg.mode,
-        ScanMode::Backfill {
-            write_memories: false
-        }
-    ) {
-        event.memories_written =
-            write_memories(state, instance_id, last.session_id, &out.memories).await;
+    if let Some(owner) = owner {
+        event.memories_written = write_memories(
+            pool,
+            instance_id,
+            last.session_id,
+            owner,
+            &memories,
+            vectors,
+        )
+        .await;
     }
     if let Some(summary) = out.episode {
         let episode = EpisodeInsert {
@@ -272,13 +325,8 @@ pub(crate) async fn scan_segment(
         }
     }
     let journal = JournalRepo { pool };
-    for mut row in validate_journal(&out.journal, &rows, tz, instance_id) {
-        match state.embed.embed_document(&row.summary).await {
-            Ok(v) => row.embedding = Some(v),
-            // Written without a vector: the sweeper embeds such rows.
-            Err(e) => tracing::warn!(%instance_id, "dreaming scan: journal embed failed: {e}"),
-        }
-        match journal.insert_if_claimed(&row).await {
+    for row in &journal_rows {
+        match journal.insert_if_claimed(row).await {
             Ok(Some(_)) => event.journal_written += 1,
             Ok(None) => {}
             Err(e) => tracing::warn!(%instance_id, "dreaming scan: journal write failed: {e}"),
@@ -549,39 +597,49 @@ fn parse_arc_reply(raw: &str) -> Option<(Option<String>, String)> {
     Some((opening, arc))
 }
 
-/// Profile-layer memories from one scan, filed on `session_id` under the
-/// instance's owner. Returns how many were written.
+/// One vector per text from a single `embed_documents` call, in order; every
+/// slot is `None` when the call fails or answers with a different count. No
+/// call for no texts.
+async fn embed_all(state: &AppState, instance_id: Uuid, texts: &[&str]) -> Vec<Option<Vec<f32>>> {
+    if texts.is_empty() {
+        return Vec::new();
+    }
+    match state.embed.embed_documents(texts).await {
+        Ok(vectors) if vectors.len() == texts.len() => vectors.into_iter().map(Some).collect(),
+        Ok(vectors) => {
+            tracing::warn!(
+                %instance_id,
+                texts = texts.len(),
+                vectors = vectors.len(),
+                "dreaming scan: embed returned a different count"
+            );
+            vec![None; texts.len()]
+        }
+        Err(e) => {
+            tracing::warn!(%instance_id, texts = texts.len(), "dreaming scan: embed failed: {e}");
+            vec![None; texts.len()]
+        }
+    }
+}
+
+/// Profile-layer memories from one scan, `(candidate, trimmed content)`, filed
+/// on `session_id` under `owner`, each with its vector from `vectors` in the
+/// same order; a candidate without one is skipped. Returns how many were
+/// written.
 async fn write_memories(
-    state: &AppState,
+    pool: &sqlx::PgPool,
     instance_id: Uuid,
     session_id: Uuid,
-    cands: &[MemoryCandidate],
+    owner: Uuid,
+    cands: &[(&MemoryCandidate, &str)],
+    vectors: Vec<Option<Vec<f32>>>,
 ) -> i32 {
-    if cands.is_empty() {
-        return 0;
-    }
-    let pool = &state.pool;
-    let owner = match (PersonaRepo { pool }).instance_owner(instance_id).await {
-        Ok(Some(owner)) => owner,
-        Ok(None) => return 0,
-        Err(e) => {
-            tracing::warn!(%instance_id, "dreaming scan: owner read failed: {e}");
-            return 0;
-        }
-    };
     let repo = MemoryRepo { pool };
     let mut written = 0;
-    for cand in cands {
-        let content = cand.content.trim();
-        if content.is_empty() {
+    for (&(cand, content), embedding) in cands.iter().zip(vectors) {
+        let Some(embedding) = embedding else {
+            tracing::warn!(%instance_id, "dreaming scan: memory without a vector skipped");
             continue;
-        }
-        let embedding = match state.embed.embed_document(content).await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(%instance_id, "dreaming scan: memory embed failed: {e}");
-                continue;
-            }
         };
         match repo
             .upsert(
@@ -778,7 +836,7 @@ pub(crate) mod tests {
                 .unwrap();
         }
         assert!(repo
-            .claim(instance, Duration::from_secs(600))
+            .claim(instance, Duration::from_secs(600), 1)
             .await
             .unwrap());
     }
@@ -811,6 +869,32 @@ pub(crate) mod tests {
         v
     }
 
+    /// An embeddings reply with one vector per input, whatever the batch size.
+    fn vector_per_input(req: &wiremock::Request) -> ResponseTemplate {
+        let n = serde_json::from_slice::<serde_json::Value>(&req.body)
+            .ok()
+            .and_then(|v| v["input"].as_array().map(Vec::len))
+            .unwrap_or(1);
+        let data: Vec<_> = (0..n)
+            .map(|_| json!({ "embedding": unit_embedding() }))
+            .collect();
+        ResponseTemplate::new(200).set_body_json(json!({ "data": data }))
+    }
+
+    /// An embedding router whose calls go to `embed`.
+    fn embed_router(embed: &MockServer) -> eros_engine_llm::embedding::EmbeddingRouter {
+        let embed_cfg = eros_engine_llm::model_config::ModelConfig::from_toml_str(&format!(
+            "[providers.mockembed]\nembeddings = \"{}/v1/embeddings\"\n\
+             [tasks.embedding]\nmodel = \"mock-embed@mockembed\"\n",
+            embed.uri()
+        ))
+        .unwrap();
+        eros_engine_llm::embedding::EmbeddingRouter::from_config_with(&embed_cfg, |k| {
+            (k == "MOCKEMBED_API_KEY").then(|| "test-key".to_string())
+        })
+        .unwrap()
+    }
+
     /// A state whose chat calls go to `llm` and whose embeddings go to a mock.
     /// `scan_extra` lands inside the `[tasks.dreaming_scan]` block.
     pub(crate) async fn state_with(
@@ -820,23 +904,10 @@ pub(crate) mod tests {
     ) -> (AppState, MockServer) {
         let embed = MockServer::start().await;
         Mock::given(wm_path("/v1/embeddings"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({ "data": [ { "embedding": unit_embedding() } ] })),
-            )
+            .respond_with(vector_per_input)
             .mount(&embed)
             .await;
-        let embed_cfg = eros_engine_llm::model_config::ModelConfig::from_toml_str(&format!(
-            "[providers.mockembed]\nembeddings = \"{}/v1/embeddings\"\n\
-             [tasks.embedding]\nmodel = \"mock-embed@mockembed\"\n",
-            embed.uri()
-        ))
-        .unwrap();
-        let router =
-            eros_engine_llm::embedding::EmbeddingRouter::from_config_with(&embed_cfg, |k| {
-                (k == "MOCKEMBED_API_KEY").then(|| "test-key".to_string())
-            })
-            .unwrap();
+        let router = embed_router(&embed);
 
         let mut state = crate::routes::companion::test_state(pool);
         state.model_config = std::sync::Arc::new(
@@ -1112,6 +1183,66 @@ pub(crate) mod tests {
         );
     }
 
+    /// Every text a scan writes is embedded in one call, before the claim is
+    /// checked: a claim lost during that call drops the writes, profile
+    /// memories included.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn scan_embeds_in_one_call_before_the_claim_check(pool: PgPool) {
+        let rel = seed_rel(&pool).await;
+        open_claim(&pool, rel.instance).await;
+        let llm = MockServer::start().await;
+        answer(&llm, SCAN_MODEL, "gen-scan", &scan_reply()).await;
+        let (mut state, _embed) = state_with(pool.clone(), &llm, "").await;
+        let embed = MockServer::start().await;
+        Mock::given(wm_path("/v1/embeddings"))
+            .respond_with(|req: &wiremock::Request| {
+                vector_per_input(req).set_delay(Duration::from_millis(600))
+            })
+            .expect(1)
+            .mount(&embed)
+            .await;
+        state.embed = std::sync::Arc::new(embed_router(&embed));
+
+        let scan = tokio::spawn({
+            let state = state.clone();
+            let instance = rel.instance;
+            async move { scan_instance(&state, instance, at(T4)).await }
+        });
+        // The claim goes while the embedding call is out.
+        wait_for_call(&embed, &scan).await;
+        ScanStateRepo { pool: &pool }
+            .release_claim(rel.instance)
+            .await
+            .unwrap();
+
+        assert_eq!(scan.await.unwrap(), ScanOutcome::Empty);
+        let bodies = request_bodies(&embed).await;
+        let inputs = serde_json::from_str::<serde_json::Value>(&bodies[0]).unwrap()["input"]
+            .as_array()
+            .map(Vec::len);
+        assert_eq!(
+            inputs,
+            Some(2),
+            "the memory and the journal moment in one call"
+        );
+        let memories: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM engine.companion_memories WHERE user_id = $1")
+                .bind(rel.owner)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(memories, 0, "no memory is written past a lost claim");
+        assert_eq!(count(&pool, "relationship_episodes", rel.instance).await, 0);
+        assert_eq!(count(&pool, "relationship_journal", rel.instance).await, 0);
+        let evs = events(&pool, rel.instance).await;
+        assert_eq!(
+            evs.iter()
+                .map(|e| (e.0.as_str(), e.1.as_str()))
+                .collect::<Vec<_>>(),
+            [("scan", "empty")]
+        );
+    }
+
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn scan_parse_error_backs_off_and_third_failure_advances(pool: PgPool) {
         let rel = seed_rel(&pool).await;
@@ -1129,7 +1260,7 @@ pub(crate) mod tests {
         for failures in 1..=2 {
             if failures > 1 {
                 assert!(repo
-                    .claim(rel.instance, Duration::from_secs(600))
+                    .claim(rel.instance, Duration::from_secs(600), 1)
                     .await
                     .unwrap());
             }
@@ -1145,7 +1276,7 @@ pub(crate) mod tests {
         }
 
         assert!(repo
-            .claim(rel.instance, Duration::from_secs(600))
+            .claim(rel.instance, Duration::from_secs(600), 1)
             .await
             .unwrap());
         assert_eq!(

@@ -3,7 +3,7 @@
 
 use chrono::NaiveDate;
 use chrono_tz::Tz;
-use eros_engine_store::episode::ScanRow;
+use eros_engine_store::episode::{one_line, ScanRow};
 use eros_engine_store::journal::JournalInsert;
 use serde::Deserialize;
 use uuid::Uuid;
@@ -89,9 +89,10 @@ fn episode_text(v: Option<&serde_json::Value>) -> Option<String> {
     (!s.is_empty()).then(|| s.to_string())
 }
 
-/// The candidates that survive validation, as rows ready to embed and insert.
-/// `rows` is the stretch the transcript was rendered from: a date must be the
-/// local date of one of its stamps, and `#n` names `rows[n - 1]`.
+/// The candidates that survive validation, as rows ready to embed and insert,
+/// each summary on one line. `rows` is the stretch the transcript was rendered
+/// from: a date must be the local date of one of its stamps, and `#n` names
+/// `rows[n - 1]`.
 pub(crate) fn validate_journal(
     cands: &[JournalCandidate],
     rows: &[ScanRow],
@@ -112,9 +113,7 @@ pub(crate) fn validate_journal(
             {
                 return None;
             }
-            let summary: String = c
-                .summary
-                .trim()
+            let summary: String = one_line(&c.summary)
                 .chars()
                 .take(JOURNAL_SUMMARY_MAX_CHARS)
                 .collect();
@@ -361,6 +360,13 @@ mod tests {
         let out = validate(&[blank, long]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].summary.chars().count(), JOURNAL_SUMMARY_MAX_CHARS);
+    }
+
+    #[test]
+    fn journal_summary_is_kept_on_one_line() {
+        let mut c = cand("confession", "2026-10-02");
+        c.summary = "用户表白了，\r\n  AI 接受了。\n".to_string();
+        assert_eq!(validate(&[c])[0].summary, "用户表白了， AI 接受了。");
     }
 
     #[test]

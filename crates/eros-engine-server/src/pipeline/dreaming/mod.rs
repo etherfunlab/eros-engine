@@ -3,13 +3,14 @@
 //!
 //! Every 1:1 user turn counts toward its relationship's scan
 //! (`engine.relationship_scan_state`): the text turn in post-process, the
-//! voice turn in its route. The turn that creates the relationship's row also
-//! journals the first meeting. A text turn that brings `SCAN_K` pending turns
-//! scans inline; the sweeper scans relationships that went idle with at least
-//! `FLUSH_MIN_TURNS` pending, after embedding the journal rows still waiting
-//! for a vector. Both trigger paths claim the relationship first, so two
-//! workers never scan one relationship at once; `scan::scan_instance` settles
-//! the claim.
+//! voice turn in its route. A turn that leaves one pending turn (the one that
+//! creates the relationship's row among them) journals the first meeting
+//! unless it is already journaled. A text turn that brings `SCAN_K` pending
+//! turns scans inline; the sweeper scans relationships that went idle with at
+//! least `FLUSH_MIN_TURNS` pending, after embedding the journal rows still
+//! waiting for a vector. Both trigger paths claim the relationship first, so
+//! two workers never scan one relationship at once; `scan::scan_instance`
+//! settles the claim. `DREAMING_DISABLED` stops both.
 
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
@@ -64,9 +65,12 @@ fn candidate_metadata(cand: &MemoryCandidate) -> Option<serde_json::Value> {
 /// Count one 1:1 user turn toward its relationship's scan. Reads the user
 /// row's `sent_at` (no row in a live session, no count: an archive that
 /// landed since the turn is not undone) and, when the bump creates the
-/// relationship's row, journals the first meeting: dated by the pair's
-/// earliest chat row, else by this row, in `user_timezone` (UTC when none).
-/// `None` when nothing was counted; failures are logged, never raised.
+/// relationship's row or leaves one pending turn, journals the first meeting:
+/// dated by the pair's earliest chat row, else by this row, in `user_timezone`
+/// (UTC when none). The first live turn after a backfill opened the row is
+/// such a turn, so the meeting is dated in the user's timezone; the key keeps
+/// the first row written. `None` when nothing was counted; failures are
+/// logged, never raised.
 pub(crate) async fn bump_relationship(
     state: &AppState,
     instance_id: Uuid,
@@ -100,16 +104,16 @@ pub(crate) async fn bump_relationship(
             return None;
         }
     };
-    if bumped.created {
+    if bumped.created || bumped.pending_turns == 1 {
         journal_first_meet(pool, instance_id, sent_at, user_timezone).await;
     }
     Some(bumped)
 }
 
-/// Journal the first meeting of a relationship whose scan state was just
-/// created: dated by the pair's earliest chat row, else by `fallback`, in
-/// `tz` (UTC when none). Failures are logged, never raised.
-pub(crate) async fn journal_first_meet(
+/// Journal the relationship's first meeting unless it is journaled already:
+/// dated by the pair's earliest chat row, else by `fallback`, in `tz` (UTC
+/// when none). Failures are logged, never raised.
+async fn journal_first_meet(
     pool: &sqlx::PgPool,
     instance_id: Uuid,
     fallback: DateTime<Utc>,
@@ -131,8 +135,11 @@ pub(crate) async fn journal_first_meet(
 
 /// The K path of a 1:1 text turn that `bump_relationship` counted: once
 /// `SCAN_K` turns wait, the relationship is claimed and scanned inline up to
-/// the turn's newest row (`produced` are its assistant rows), so a later turn
-/// in flight is never half-read. Inert while `[tasks.dreaming_scan]` is absent.
+/// the turn's newest row (`produced` are its assistant rows; the user row when
+/// there are none), so a later turn in flight is never half-read. The claim
+/// re-reads the count, so a `bumped` that another scan has since settled
+/// claims nothing. Inert while `DREAMING_DISABLED` is set or
+/// `[tasks.dreaming_scan]` is absent.
 pub(crate) async fn scan_if_due(
     state: &AppState,
     instance_id: Uuid,
@@ -140,7 +147,10 @@ pub(crate) async fn scan_if_due(
     user_message_id: Uuid,
     produced: &[Uuid],
 ) {
-    if bumped.pending_turns < SCAN_K || state.model_config.resolve_dreaming_scan().is_none() {
+    if state.config.dreaming_tick.is_zero()
+        || bumped.pending_turns < SCAN_K
+        || state.model_config.resolve_dreaming_scan().is_none()
+    {
         return;
     }
     let pool = &state.pool;
@@ -164,7 +174,11 @@ pub(crate) async fn scan_if_due(
         return;
     };
     match (ScanStateRepo { pool })
-        .claim(instance_id, state.config.dreaming_claim_stale_threshold)
+        .claim(
+            instance_id,
+            state.config.dreaming_claim_stale_threshold,
+            SCAN_K,
+        )
         .await
     {
         Ok(true) => {
@@ -860,7 +874,7 @@ mod tests {
         let scan = ScanStateRepo { pool };
         scan.bump(instance, at(first), None).await.unwrap();
         assert!(scan
-            .claim(instance, Duration::from_secs(600))
+            .claim(instance, Duration::from_secs(600), 1)
             .await
             .unwrap());
         instance
@@ -927,7 +941,7 @@ mod tests {
         let scan = ScanStateRepo { pool: &pool };
         scan.bump(instance, at(first), None).await.unwrap();
         assert!(scan
-            .claim(instance, Duration::from_secs(600))
+            .claim(instance, Duration::from_secs(600), 1)
             .await
             .unwrap());
 
@@ -936,6 +950,131 @@ mod tests {
         assert!(request_bodies(&llm).await.is_empty(), "no call to spend");
         let s = scan.load(instance).await.unwrap().unwrap();
         assert_eq!((s.scanned_through_at, s.claimed_at), (at(last), None));
+        assert_eq!(s.pending_turns, 0);
+    }
+
+    /// `n` answered text turns, a minute apart from 10:00 plus `from`
+    /// minutes, each counted through the text path's bump; returns each
+    /// turn's `(user row, reply, count)`.
+    async fn counted_turns(
+        state: &AppState,
+        instance: Uuid,
+        session: Uuid,
+        from: i32,
+        n: i32,
+    ) -> Vec<(Uuid, Uuid, Bumped)> {
+        let pool = &state.pool;
+        let mut turns = Vec::new();
+        for minute in from..from + n {
+            let user = insert_row(
+                pool,
+                session,
+                "user",
+                "嗯",
+                None,
+                &format!("2026-10-01T10:{minute:02}:00Z"),
+            )
+            .await;
+            let reply = insert_row(
+                pool,
+                session,
+                "assistant",
+                "嗯嗯",
+                None,
+                &format!("2026-10-01T10:{minute:02}:30Z"),
+            )
+            .await;
+            let bumped = bump_relationship(state, instance, user, None)
+                .await
+                .unwrap();
+            turns.push((user, reply, bumped));
+        }
+        turns
+    }
+
+    /// Turn A brings `SCAN_K` pending, but turn B's scan settles before A's
+    /// inline scan runs, and turn C counts one more. A's stale count claims
+    /// nothing, and a scan bounded before the cursor settles nothing: the
+    /// cursor stays at B's bound and C's count survives.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn stale_bump_cannot_regress_the_cursor(pool: PgPool) {
+        let llm = MockServer::start().await;
+        answer(&llm, r#"{"episode":"两人聊了一会儿。"}"#).await;
+        let (mut state, _embed) = state_with(pool.clone(), &llm, true).await;
+        state.config.dreaming_tick = Duration::from_secs(300);
+        let owner = Uuid::new_v4();
+        let instance = seed_persona_instance(&pool, owner).await;
+        let session = new_session(&pool, owner, instance, "text").await;
+        let scan = ScanStateRepo { pool: &pool };
+
+        let turns = counted_turns(&state, instance, session, 0, SCAN_K + 1).await;
+        let (user_a, reply_a, bumped_a) = turns[SCAN_K as usize - 1];
+        let (user_b, reply_b, bumped_b) = turns[SCAN_K as usize];
+        assert_eq!(bumped_a.pending_turns, SCAN_K);
+        let bound_a = at("2026-10-01T10:19:30Z");
+        let bound_b = at("2026-10-01T10:20:30Z");
+
+        scan_if_due(&state, instance, bumped_b, user_b, &[reply_b]).await;
+        let s = scan.load(instance).await.unwrap().unwrap();
+        assert_eq!((s.scanned_through_at, s.pending_turns), (bound_b, 0));
+
+        counted_turns(&state, instance, session, SCAN_K + 1, 1).await;
+        scan_if_due(&state, instance, bumped_a, user_a, &[reply_a]).await;
+        let s = scan.load(instance).await.unwrap().unwrap();
+        assert_eq!(
+            (s.scanned_through_at, s.pending_turns, s.claimed_at),
+            (bound_b, 1, None),
+            "the stale count claims nothing"
+        );
+
+        // A scan that does get a claim with a bound behind the cursor reads
+        // and settles nothing; it only lets the claim go.
+        assert!(scan
+            .claim(instance, Duration::from_secs(600), 1)
+            .await
+            .unwrap());
+        assert_eq!(
+            scan_instance(&state, instance, bound_a).await,
+            ScanOutcome::Empty
+        );
+        let s = scan.load(instance).await.unwrap().unwrap();
+        assert_eq!(
+            (s.scanned_through_at, s.pending_turns, s.claimed_at),
+            (bound_b, 1, None)
+        );
+        assert_eq!(request_bodies(&llm).await.len(), 1, "only B's scan called");
+    }
+
+    /// `DREAMING_DISABLED=1` stops the K path too: the turn that brings
+    /// `SCAN_K` pending claims and calls nothing.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn k_path_is_inert_when_dreaming_disabled(pool: PgPool) {
+        let llm = MockServer::start().await;
+        answer(&llm, r#"{"episode":"两人聊了一会儿。"}"#).await;
+        let (mut state, embed) = state_with(pool.clone(), &llm, true).await;
+        state.config.dreaming_tick = Duration::ZERO;
+        let owner = Uuid::new_v4();
+        let instance = seed_persona_instance(&pool, owner).await;
+        let session = new_session(&pool, owner, instance, "text").await;
+
+        let turns = counted_turns(&state, instance, session, 0, SCAN_K).await;
+        let (user, reply, bumped) = turns[SCAN_K as usize - 1];
+        assert_eq!(bumped.pending_turns, SCAN_K);
+        scan_if_due(&state, instance, bumped, user, &[reply]).await;
+
+        let s = ScanStateRepo { pool: &pool }
+            .load(instance)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((s.pending_turns, s.claimed_at), (SCAN_K, None));
+        assert!(request_bodies(&llm).await.is_empty());
+        assert!(request_bodies(&embed).await.is_empty());
+        let episodes: i64 = sqlx::query_scalar("SELECT count(*) FROM engine.relationship_episodes")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(episodes, 0);
     }
 
     /// Rows of an archived session and of a group chat never reach a scan,

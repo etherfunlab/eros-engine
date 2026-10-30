@@ -70,8 +70,11 @@ const DERIVED: &[(&str, &str)] = &[
     // conversation.
     ("character_insights", BY_INSTANCE),
     ("character_insights_snapshot", BY_INSTANCE),
-    // The relationship scanner's products. The state row carries the scan
-    // claim the scanner's writes check, so it goes first among them.
+    // The relationship scanner's products. The state row goes first among
+    // them: every claim-guarded scanner write (episode, journal, arc) reads it
+    // `FOR KEY SHARE`, so this delete waits for a write in flight and the
+    // deletes below remove what it wrote, while a write that reaches the row
+    // after the delete waits for this transaction and then writes nothing.
     // `relationship_scan_events` holds counts and ids only and is left alone.
     ("relationship_scan_state", BY_INSTANCE),
     ("relationship_episodes", BY_INSTANCE),
