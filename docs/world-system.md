@@ -105,7 +105,7 @@ structured LLM call:
 |-------|--------|
 | Previous world seed | `world_states.seed` (opaque JSONB; the engine never interprets it) |
 | Active roster (cap 8) | `persona_instances` with `status = 'active'` and a genome, earliest-created first — a [BYOC](byoc.md) instance has none and never joins |
-| Memory feedback (K=15) | Most recent **extracted** profile-layer `companion_memories` (dreaming-lite output — never raw chat) |
+| Memory feedback (K=15) | Most recent **extracted** profile-layer `companion_memories` (the relationship scan's memories — never raw chat) |
 
 | Output | Where it goes |
 |--------|---------------|

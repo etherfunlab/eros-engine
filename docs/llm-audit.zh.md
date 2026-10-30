@@ -143,12 +143,14 @@ completed` tracing——落库是额外加的，不是取代那行日志。
 `group_director`、`affinity_evaluation`、`affinity_summary`、`insight_extraction`、
 `profile_rebuild`、`character_insight_extraction`、
 `character_insight_structuring`、`user_insight_extraction`、
-`user_insight_structuring`、`memory_extraction`、`world_director`、
-`world_stories_director`、`world_comment`、`world_reply`。
+`user_insight_structuring`、`dreaming_scan`、`arc_rewrite`、`world_director`、
+`world_stories_director`、`world_comment`、`world_reply`。关系扫描取代按 session
+清扫器之前写下的行，task 是已退役的 `memory_extraction`。
 
-**其中五个此前在数据库里完全没有留下任何痕迹**——`world_director`、
-`world_stories_director`、`world_comment`、`world_reply`、
-`memory_extraction`。`engine.llm_generations` 现在是它们唯一的记录。
+**其中四个在数据库里不留任何别的记录**——`world_director`、
+`world_stories_director`、`world_comment`、`world_reply`。`engine.llm_generations`
+是它们唯一的记录。`dreaming_scan` 和 `arc_rewrite` 另外还会在
+`engine.relationship_scan_events` 里留一行只含计数的记录（[见下文](#关系扫描)）。
 
 ### 怎么读
 
@@ -214,9 +216,8 @@ provider 响应——所以一次降级的父行写入，连同这一轮客户�
 **子表已经没有这两列了**——一次 generation 的模型和花费只有
 `engine.llm_generations` 一份，靠 `generation_id` join 过去取。父行写入降级时，
 子行存 `NULL`，也就没有东西可 join，剩下的只有上面那行 tracing 和 provider
-自己的日志。五个后台 sweeper（`world_director`、`world_stories_director`、
-`world_comment`、`world_reply`、`memory_extraction`）本来就没有子表行，一直
-是这样；现在所有任务都一样。
+自己的日志。四个世界 sweeper（`world_director`、`world_stories_director`、
+`world_comment`、`world_reply`）本来就没有子表行，一直是这样；现在所有任务都一样。
 
 **响应里没有 `generation_id` 时同理。** `record_generation` 打完日志就短路，
 因为这个 id 就是主键——所以一个不回 id 的 provider，会产生一次计过费、却在
@@ -242,6 +243,10 @@ provider 响应——所以一次降级的父行写入，连同这一轮客户�
 id，跟上面的 `chat_messages.generation_id` 是两回事——由另一条 `mark_filtered`
 `UPDATE` 路径写入，加约束就得给这条路径单独配一条降级分支，而生产环境里这一列
 非空值只有一个。这是一个永久性决定（设计 spec §7.2），不是疏漏。
+
+关系扫描的 `generation_id` 列（`relationship_scan_events`、`relationship_episodes`、
+`relationship_arcs`）同样没有外键：它们是关联 id，存的是 `record_generation`
+返回的值。
 
 ### 记的单位是「每一次计过费的响应」，不是「每一轮」
 
@@ -545,6 +550,50 @@ OpenRouter 调用落一行：
   `NULL`，行的其余部分保留。
 
 完整的列与 payload 参考见 [insights.zh.md](insights.zh.md#审计)。
+
+## 关系扫描
+
+`engine.relationship_scan_events` 是关系扫描（[记忆层 → 关系记忆](memory-layers.zh.md#关系记忆)）的读数：每次真正调用了模型的扫描或弧线改写记一行，只有计数和 id。不需要调用的扫描（这一截里没有可读的内容）不留行。
+
+| 列 | 含义 |
+|----|------|
+| `instance_id` | 这段关系。`ON DELETE SET NULL`：行比实例活得久。 |
+| `kind` | `scan`（实时扫描）、`arc`（弧线改写）或 `backfill`（`backfill-dreaming` 的一段）。 |
+| `status` | 见下表。 |
+| `model` | 实际服务这次调用的那一跳（配置链里的条目）；没有拿到响应时为 `NULL`。 |
+| `served_fallback` | 由 fallback 而非主模型服务时为 `true`。 |
+| `rows_covered` | 这次扫描读到的聊天行数（`arc` 行为 0）。 |
+| `memories_written`、`episode_written`、`journal_written` | 这次扫描写了什么：画像记忆条数、是否写了片段、纪事行数。 |
+| `generation_id` | 关联到 `engine.llm_generations`（task 为 `dreaming_scan` 或 `arc_rewrite`）的 id；没有外键。 |
+| `created_at` | 这次尝试结束的时间。 |
+
+| `status` | `scan` / `backfill` | `arc` |
+|----------|---------------------|-------|
+| `ok` | 写入了东西。 | 新弧线已存下，片段已折入。 |
+| `empty` | 调用成功但什么都没写；或扫描途中关系被归档或抹除，这次扫描的写入被丢弃。 | 调用期间关系被归档或抹除。 |
+| `parse_error` | 回复里没有 JSON 对象。 | 回复里没有带非空 `arc` 的对象。 |
+| `rejected` | — | 弧线校验拒绝了这次改写（过长、缩水、缺开头或开头过长）。 |
+| `failed` | 调用失败，或调用之后的 embedding 调用、主人读取、片段写入、认领检查、游标写入失败。 | 调用失败，或弧线写入失败。 |
+
+`failed` 或 `parse_error` 的实时扫描游标不动，隔一个闲置周期重试；连续第三次跳过这一截。不是 `ok` 也不是 `empty` 的 `arc` 行计入这段关系的三振上限。
+
+**fallback 的沉默。** 在一个生产部署上实测，有一个候选模型完全不产出纪事，所以要盯着 fallback 服务的扫描写出了多少纪事。由 fallback 服务的扫描不论状态如何，都会打一条带纪事条数的 warn 日志。
+
+```sql
+SELECT model, served_fallback,
+       count(*)             AS scans,
+       sum(journal_written) AS journal_rows,
+       sum(memories_written) AS memories
+FROM engine.relationship_scan_events
+WHERE kind IN ('scan', 'backfill') AND status IN ('ok', 'empty')
+  AND created_at >= now() - interval '7 days'
+GROUP BY model, served_fallback
+ORDER BY scans DESC;
+```
+
+在 `[tasks.dreaming_scan]` 上设 `fallback = []` 能让纪事始终由主模型产出，代价是主模型故障期间扫描会失败。
+
+这张表不存文本，所以归档关系和抹除用户都不动它。它的写入是 fail-open 的：丢一行只打 warn，绝不会撤销它所描述的那次扫描。
 
 ## 图片链路事件表
 

@@ -125,7 +125,7 @@ instance 解析已离群发言者的名字。
 `/events` 和 `/effects` 的响应带 `code: wrong_channel`。reaction 路由和改图用它们的普通响应体
 `{"error": "conflict", "message": …}`，`message` 里含 `wrong_channel`。
 `GET /comp/chat/{user_id}/sessions` 不列出群，群由 `/v2/comp/groups` 返回。
-dreaming 清扫器跳过群 session。
+dreaming（关系扫描）跳过群 session，群聊轮次也不计入扫描。
 
 ## 一轮
 

@@ -160,12 +160,16 @@ call now writes here: `chat_companion`, `chat_voice`, `chat_product_qa`,
 `group_director`, `affinity_evaluation`, `affinity_summary`, `insight_extraction`,
 `profile_rebuild`, `character_insight_extraction`,
 `character_insight_structuring`, `user_insight_extraction`,
-`user_insight_structuring`, `memory_extraction`, `world_director`,
-`world_stories_director`, `world_comment`, `world_reply`.
+`user_insight_structuring`, `dreaming_scan`, `arc_rewrite`, `world_director`,
+`world_stories_director`, `world_comment`, `world_reply`. Rows written before
+the relationship scan replaced the per-session sweeper carry its retired task,
+`memory_extraction`.
 
-**Five of those previously wrote nothing to the database at all** —
-`world_director`, `world_stories_director`, `world_comment`, `world_reply`,
-`memory_extraction`. `engine.llm_generations` is now their only record.
+**Four of those write nothing else to the database** — `world_director`,
+`world_stories_director`, `world_comment`, `world_reply`.
+`engine.llm_generations` is their only record. `dreaming_scan` and
+`arc_rewrite` also leave a counts-only row in
+`engine.relationship_scan_events` ([below](#relationship-scanner)).
 
 ### Reading it
 
@@ -246,10 +250,10 @@ longer carry those columns at all** — `engine.llm_generations` is the one
 place a generation's model and spend live, reached by joining on
 `generation_id`. So when the parent write degrades, the child row stores
 `NULL` and there is nothing to join to; the tracing line above and the
-provider's own log are what is left. That was already true of the five
-background sweepers (`world_director`, `world_stories_director`,
-`world_comment`, `world_reply`, `memory_extraction`), which write no child
-row at all. It is now true of everything.
+provider's own log are what is left. That was already true of the four
+world sweepers (`world_director`, `world_stories_director`, `world_comment`,
+`world_reply`), which write no child row at all. It is now true of
+everything.
 
 **The same applies to a response that carries no `generation_id`.**
 `record_generation` logs the line and then short-circuits, because the id is
@@ -283,6 +287,11 @@ column — the filter generation, distinct from `chat_messages.generation_id`
 above — written by a separate `mark_filtered` `UPDATE` path that would need
 its own degrade branch, and production carries exactly one non-null value in
 it. This is a permanent decision (design spec §7.2), not an oversight.
+
+The relationship scanner's `generation_id` columns
+(`relationship_scan_events`, `relationship_episodes`, `relationship_arcs`)
+carry no foreign key either: they are correlation ids, holding whatever
+`record_generation` returned.
 
 ### One row per billed response, not one per turn
 
@@ -632,6 +641,61 @@ two-call pipeline, and nothing writes them now.
   every row of the user and keeps the rest of the row.
 
 The full column and payload reference is in [insights.md](insights.md#audit).
+
+## Relationship scanner
+
+`engine.relationship_scan_events` is the readout of the relationship scan
+([Memory layers → Relationship memory](memory-layers.md#relationship-memory)):
+one row per scan or arc rewrite that reached the model, counts and ids only.
+A scan that needed no call (nothing readable in its stretch) leaves none.
+
+| Column | Meaning |
+|--------|---------|
+| `instance_id` | The relationship. `ON DELETE SET NULL`: the row outlives its instance. |
+| `kind` | `scan` (a live scan), `arc` (an arc rewrite) or `backfill` (a `backfill-dreaming` segment). |
+| `status` | See below. |
+| `model` | The configured chain entry that served the call; `NULL` when no response came back. |
+| `served_fallback` | `true` when a fallback hop, not the primary, served it. |
+| `rows_covered` | Chat rows the scan read (0 on `arc` rows). |
+| `memories_written`, `episode_written`, `journal_written` | What the scan wrote: profile memories, whether an episode, journal rows. |
+| `generation_id` | Correlation id into `engine.llm_generations` (task `dreaming_scan` or `arc_rewrite`); no foreign key. |
+| `created_at` | When the attempt finished. |
+
+| `status` | `scan` / `backfill` | `arc` |
+|----------|---------------------|-------|
+| `ok` | Something was written. | The new arc was stored and the episodes folded. |
+| `empty` | The call succeeded but nothing was written, or an archive or erasure took the relationship mid-scan and the scan's writes were dropped. | The relationship was archived or erased during the call. |
+| `parse_error` | The reply held no JSON object. | The reply held no object with a non-blank `arc`. |
+| `rejected` | — | The arc guard refused the rewrite (too long, shrunk, missing or overlong opening). |
+| `failed` | The call failed, or the embedding call, the owner read, the episode write, the claim check or the cursor write failed after it. | The call or the arc write failed. |
+
+A failed or `parse_error` live scan keeps its cursor and retries after one
+idle period; the third in a row skips the stretch. An arc row that is not
+`ok` or `empty` counts toward the relationship's three-strike limit.
+
+**Fallback silence.** One candidate model produced no journal entries at all
+when measured on a production deployment, so watch the journal yield of
+fallback-served scans. A scan a fallback hop served also logs at warn with its
+journal count, whatever its status.
+
+```sql
+SELECT model, served_fallback,
+       count(*)             AS scans,
+       sum(journal_written) AS journal_rows,
+       sum(memories_written) AS memories
+FROM engine.relationship_scan_events
+WHERE kind IN ('scan', 'backfill') AND status IN ('ok', 'empty')
+  AND created_at >= now() - interval '7 days'
+GROUP BY model, served_fallback
+ORDER BY scans DESC;
+```
+
+`fallback = []` on `[tasks.dreaming_scan]` keeps the journal on the primary
+at the cost of failing the scan during a primary outage.
+
+The table holds no text, so archiving a relationship and erasing a user leave
+it as it is. Its writes are fail-open: a lost row is logged at warn and never
+undoes the scan it describes.
 
 ## Image-path event tables
 

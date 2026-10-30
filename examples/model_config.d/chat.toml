@@ -188,9 +188,10 @@ model_name_display_override = true
 # an outage retry chain (tried sequentially; NOT rotation). `filter_prompt` is
 # OPTIONAL: it overrides the built-in, product-identity-free voice directive
 # (short, spoken, no markdown/emoji/stage-directions). Voice turns persist on a
-# `channel = 'voice'` column. An ended call is swept into profile-layer memories
-# by dreaming-lite, same as a text session — set DREAMING_VOICE_DISABLED=1 to
-# keep calls out of memory. A live turn itself still writes nothing.
+# `channel = 'voice'` column. Each voice turn counts toward its relationship's
+# scan ([tasks.dreaming_scan]), which reads the call with the text rows of the
+# same relationship — set DREAMING_VOICE_DISABLED=1 to keep calls out of
+# memory. A live turn itself still writes no memory.
 #[tasks.chat_voice]
 #model        = "vendor/fast-voice-model"
 #fallback     = ["vendor/backup-model"]

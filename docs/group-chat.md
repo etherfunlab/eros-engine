@@ -157,7 +157,8 @@ send routes, `/v2/comp/session/{id}/open`, `/events` and `/effects` answer with
 `code: wrong_channel`. The reaction route and image edit answer with their
 plain body, `{"error": "conflict", "message": …}`, whose `message` contains
 `wrong_channel`. `GET /comp/chat/{user_id}/sessions` leaves groups out;
-`/v2/comp/groups` lists them. The dreaming sweeper skips group sessions.
+`/v2/comp/groups` lists them. Dreaming (the relationship scan) skips group
+sessions, and group turns do not count toward it.
 
 ## One turn
 

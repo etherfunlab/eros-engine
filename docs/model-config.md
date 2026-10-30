@@ -37,7 +37,7 @@ model = "provider/chat-model"
 # extraction.toml
 [tasks.insight_extraction]
 model = "provider/extract-model"
-[tasks.memory_extraction]
+[tasks.dreaming_scan]
 model = "provider/extract-model"
 ```
 
@@ -603,7 +603,7 @@ input filter has no triggers, timing, or tiers).
 | Name | Consumed by | Status |
 |---|---|---|
 | `chat_companion` | `pipeline::handlers` via `resolve()` (chat completions) | live |
-| `insight_extraction` | `pipeline::post_process::extract_facts` (fact extraction for the human chain — one call per produced assistant message in 1:1 chat and one per group turn; it writes atomic facts to the user's fact ledger, not the profile. Prompt-bearing; joins the required-`filter_prompt` gate alongside `character_insight_extraction` / `user_insight_extraction` / `memory_extraction`. This block is the extraction's on/off switch — off when the task block is absent. Output contract: [Insights → Fact extraction](insights.md#fact-extraction)) | live |
+| `insight_extraction` | `pipeline::post_process::extract_facts` (fact extraction for the human chain — one call per produced assistant message in 1:1 chat and one per group turn; it writes atomic facts to the user's fact ledger, not the profile. Prompt-bearing; joins the required-`filter_prompt` gate alongside `character_insight_extraction` / `user_insight_extraction` / `dreaming_scan`. This block is the extraction's on/off switch — off when the task block is absent. Output contract: [Insights → Fact extraction](insights.md#fact-extraction)) | live |
 | `profile_rebuild` | `pipeline::profile_rebuild` (the scheduled rebuild of the `human_insights` profile from the user's whole fact ledger — when 20 facts have accumulated or after an idle period, never per turn; see [Insights](insights.md#the-derived-profile). **Parameters-only, takes no `filter_prompt`** — its prompt is built in `prompt.rs` and must stay in lockstep with the `human_insights` columns it fills, so setting the key refuses to boot, **in any shape, an explicit blank included** — same treatment as `affinity_evaluation`. Absent block ⇒ the rebuild resolves on `insight_extraction`'s model/budget (and on the global defaults only when that block is absent too). A `[tasks.insight_structuring]` block is ignored) | live |
 | `chat_output_filter` | `pipeline::stream` via `resolve_output_filter()` (optional second-pass rewrite of the chat reply before delivery) | live |
 | `pde_decision` | `pipeline::stream` (opt-in LLM judge via `run_pde_decision`, called from `run_stream`; rules engine used when `filter_prompt` is absent or the LLM call fails) | live (opt-in) |
@@ -614,11 +614,13 @@ input filter has no triggers, timing, or tiers).
 | `chat_product_qa` | `pipeline::stream` via `resolve_product_qa()` (out-of-character product-QA executor for the PDE `product_qa` action; off when task block absent or `filter_prompt` blank; also requires the LLM PDE) | live (opt-in) |
 | `affinity_evaluation` | `pipeline::post_process` (per-turn affinity verdict — four graded line axes plus two absolute 1..3 endpoint levels, converted engine-side; runs after each Reply turn, fire-and-forget; **takes no `filter_prompt`** — the prompt is engine-owned and setting the key refuses to boot — **in any form, an explicit blank included**. Unlike every other task here, blank does not mean "off", so omit the key entirely. See issue #210) | live |
 | `affinity_summary` | `pipeline::post_process::summarize_feeling` (rewrites `companion_affinity.feeling_clause` — the `[feelings]` block's first-person narrative — from band labels and recent judge reasons; runs after the affinity write, movement turns only (any judge grade, an endpoint level off baseline, a ghost, or a refused action's tier drop) and only when the request actually injects an affinity axis; request-scoped and billed to the turn's user, not a sweeper. **Takes no `filter_prompt`** — the prompt is engine-owned, same policy as `affinity_evaluation`, and setting the key refuses to boot. Block absent ⇒ `feeling_clause` stays `NULL` and `[feelings]` never renders) | live (opt-in) |
-| `character_insight_extraction` | `pipeline::post_process` (stage 1 of the character chain — experimental, EXPERIMENTAL — per-turn fact miner for the AI **character**, the mirror of `insight_extraction`'s human-side mining. Prompt-bearing; joins the required-`filter_prompt` gate alongside `insight_extraction` / `memory_extraction`. This block is the whole chain's on/off switch — off when the task block is absent) | experimental (opt-in) |
+| `character_insight_extraction` | `pipeline::post_process` (stage 1 of the character chain — experimental, EXPERIMENTAL — per-turn fact miner for the AI **character**, the mirror of `insight_extraction`'s human-side mining. Prompt-bearing; joins the required-`filter_prompt` gate alongside `insight_extraction` / `dreaming_scan`. This block is the whole chain's on/off switch — off when the task block is absent) | experimental (opt-in) |
 | `character_insight_structuring` | `pipeline::post_process` (stage 2 of the character chain — experimental — turns stage 1's mined facts plus the existing `character_insights` row into the typed ten-column object. **Parameters-only, takes no `filter_prompt`** — its prompt is built in `prompt.rs` and must stay in lockstep with the `character_insights` columns it fills, so setting the key refuses to boot, **in any shape, an explicit blank included** — same treatment as `affinity_evaluation`. Absent block ⇒ stage 2 resolves on stage 1's model/budget, never the global default) | experimental (opt-in) |
-| `user_insight_extraction` | `pipeline::post_process` (stage 1 of the user chain — experimental — per-turn fact miner for the real **user**, but scoped to one relationship rather than the global `insight_extraction`. Prompt-bearing; joins the required-`filter_prompt` gate alongside `insight_extraction` / `character_insight_extraction` / `memory_extraction`. This block is the whole chain's on/off switch — off when the task block is absent) | experimental (opt-in) |
+| `user_insight_extraction` | `pipeline::post_process` (stage 1 of the user chain — experimental — per-turn fact miner for the real **user**, but scoped to one relationship rather than the global `insight_extraction`. Prompt-bearing; joins the required-`filter_prompt` gate alongside `insight_extraction` / `character_insight_extraction` / `dreaming_scan`. This block is the whole chain's on/off switch — off when the task block is absent) | experimental (opt-in) |
 | `user_insight_structuring` | `pipeline::post_process` (stage 2 of the user chain — experimental — turns stage 1's mined facts plus the existing `user_insights` row into the typed ten-column object. **Parameters-only, takes no `filter_prompt`** — its prompt is built in `prompt.rs` and must stay in lockstep with the `user_insights` columns it fills, so setting the key refuses to boot, **in any shape, an explicit blank included** — same treatment as `affinity_evaluation`. Absent block ⇒ stage 2 resolves on stage 1's model/budget, never the global default) | experimental (opt-in) |
-| `memory_extraction` | dreaming sweeper (session-end memory consolidation; off when task block absent). The per-memory `domain` label the prompt emits gates recall: `sexuality` / `kink`, `romance`, `family`, `finance`, `health` / `mental_health` rows reach the prompt only once the relationship's affinity reaches the matching tier ([Memory layers → Affinity gate](memory-layers.md#affinity-gate)) | live (opt-in) |
+| `dreaming_scan` | `pipeline::dreaming::scan` via `resolve_dreaming_scan()` (the relationship scan: one call per stretch of a relationship's conversation returns profile memories, an episode summary and journal moments; run inline at 20 pending turns, by the dreaming sweeper and by `backfill-dreaming`. Prompt-bearing; joins the required-`filter_prompt` gate. This block is the scan's on/off switch — off when the task block is absent. The per-memory `domain` label the prompt emits gates recall: `sexuality` / `kink`, `romance`, `family`, `finance`, `health` / `mental_health` rows reach the prompt only once the relationship's affinity reaches the matching tier ([Memory layers → Affinity gate](memory-layers.md#affinity-gate)). Contract: [below](#tasksdreaming_scan--relationship-scan-opt-in)) | live (opt-in) |
+| `arc_rewrite` | `pipeline::dreaming::scan` via `resolve_arc_rewrite()` (folds every fourth episode into the relationship arc. **Parameters-only, takes no `filter_prompt`** — the prompt is engine-owned and the arc guard parses its reply, so setting the key refuses to boot, **in any shape, an explicit blank included**. Absent block ⇒ arc rewrites are skipped with one warning and episodes stay unfolded. See [below](#tasksarc_rewrite--relationship-arc-rewrite)) | live (opt-in) |
+| `memory_extraction` | nothing — retired. A present block is ignored with a boot warning naming `dreaming_scan` | retired |
 | `chat_input_filter` | `pipeline::stream` (user-input rewrite filter; activated by `input_filter` on `[tasks.chat_companion]` and this task block; off by default) | live (opt-in) |
 | `chat_voice` | `pipeline::voice::run_voice_turn`, reached from `routes::voice` (`POST /comp/voice/{session_id}/turn/stream`) via `resolve_voice()` (voice-channel companion reply; a blank `filter_prompt` does NOT disable it — falls back to the built-in directive; off when the task block is absent) | live (opt-in) |
 | `world_director` | `pipeline::world::sweeper` via `resolve_world_director()` (background per-owner world-state director round; off when the task block is absent/blank, `WORLD_DISABLED` is set, or `WORLD_TICK_SECS=0`) | live (opt-in) |
@@ -633,7 +635,8 @@ A `[tasks.<name>]` entry is only meaningful if the engine actually calls `model_
 - `crates/eros-engine-server/src/pipeline/handlers.rs` → `chat_companion`, `chat_output_filter`
 - `crates/eros-engine-server/src/pipeline/profile_rebuild.rs` → `profile_rebuild` via `resolve_profile_rebuild()` (the scheduled profile rebuild)
 - `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`, `affinity_evaluation`, `affinity_summary`, `character_insight_extraction`, `character_insight_structuring`, `user_insight_extraction`, `user_insight_structuring`
-- `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision` via `run_pde_decision` inside `run_stream` (only when `filter_prompt` is set); `chat_image_prompt_compose` via `resolve_image_prompt_compose()` (image-prompt composer, required for image turns, resolved lazily only on image turns); `chat_vision` via `resolve_vision()` (vision pre-stage, opt-in); `chat_product_qa` via `resolve_product_qa()` (product-QA executor, opt-in); `chat_input_filter` via `resolve_input_filter()` (input rewrite, opt-in); `memory_extraction` via the dreaming sweeper
+- `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision` via `run_pde_decision` inside `run_stream` (only when `filter_prompt` is set); `chat_image_prompt_compose` via `resolve_image_prompt_compose()` (image-prompt composer, required for image turns, resolved lazily only on image turns); `chat_vision` via `resolve_vision()` (vision pre-stage, opt-in); `chat_product_qa` via `resolve_product_qa()` (product-QA executor, opt-in); `chat_input_filter` via `resolve_input_filter()` (input rewrite, opt-in)
+- `crates/eros-engine-server/src/pipeline/dreaming/scan.rs` → `dreaming_scan` via `resolve_dreaming_scan()` and `arc_rewrite` via `resolve_arc_rewrite()` (the relationship scan and the arc rewrite it starts; reached from post-process at 20 pending turns, from the dreaming sweeper, and from the `backfill-dreaming` subcommand)
 - `crates/eros-engine-server/src/pipeline/proactive.rs` → `chat_image_prompt_compose` via `build_delegated_image_prompt_for` (a `taking_selfie` event's picture, when the events request carries `image`; audit `source = event`)
 - `crates/eros-engine-server/src/routes/image_edit.rs` → `chat_image_edit_compose` via `resolve_image_edit_compose()` (image-EDIT composer, resolved on every request to the edit endpoint; falls back to `[tasks.chat_image_prompt_compose]`'s chain when the edit block is absent — see below)
 
@@ -1009,7 +1012,7 @@ folded in, the companion steps fully out of character for the turn.
 | --- | --- | --- |
 | `[tasks.pde_decision].filter_prompt` set | off | The rule engine never emits `product_qa` — the action is unreachable without the LLM judge. If `[tasks.chat_product_qa]` is configured anyway, boot logs one WARN (`"model_config: [tasks.chat_product_qa] is configured but the LLM PDE ([tasks.pde_decision].filter_prompt) is disabled — product_qa is inert"`) and the block stays inert. |
 | `[tasks.chat_product_qa]` block present | absent | Feature off. The judge context carries no product-QA lines; a hallucinated `product_qa` verdict degrades to `reply_text`. |
-| `chat_product_qa.filter_prompt` non-blank | blank | **Refuses to boot** — the same required-prompt contract as `insight_extraction` / `memory_extraction`. Set a prompt, or remove the `[tasks.chat_product_qa]` section entirely to disable the feature. |
+| `chat_product_qa.filter_prompt` non-blank | blank | **Refuses to boot** — the same required-prompt contract as `insight_extraction` / `dreaming_scan`. Set a prompt, or remove the `[tasks.chat_product_qa]` section entirely to disable the feature. |
 
 ```toml
 [tasks.chat_product_qa]
@@ -1057,7 +1060,7 @@ brain: conversation signals
 (`compute_signals_for_session`), the judge's own shared companion transcript
 (`build_input_filter_transcript`), and the companion's live message window
 (`model_facing_history`) all filter `channel IS NOT NULL` rows out. The
-dreaming sweeper excludes it too, but not via a blanket non-NULL filter — by
+relationship scan excludes it too, but not via a blanket non-NULL filter — by
 default it also reads `'voice'` rows (see
 [memory-layers.md](memory-layers.md#voice-turns)), so only `product_qa`
 stays out — while the row stays fully visible on the live SSE stream,
@@ -1160,31 +1163,131 @@ Call site: `crates/eros-engine-server/src/main.rs` builds
 `eros_engine_llm::embedding::EmbeddingRouter::from_config(&model_config)`
 once at boot; `AppState.embed: Arc<EmbeddingRouter>` serves `embed_query` /
 `embed_document` / `embed_documents` from `handlers.rs` / `post_process.rs`
-/ `dreaming.rs` / `world.rs` / `story.rs`, unchanged call shapes.
+/ `dreaming/` / `world.rs` / `story.rs`, unchanged call shapes.
 
 ### Insight extraction output contract
 
 The `[tasks.insight_extraction]` prompt is the deployment's; the output contract is the engine's. The reply is one JSON object whose `facts` is an array of objects, each with `content` and six labels: `category`, `domain`, `evidence_type`, `temporality`, `persistence` and `confidence`. Items that are not objects with a non-blank, non-placeholder `content`, a bare string included, are ignored with a warning, so a prompt still on a string-array contract writes nothing to the ledger. The engine validates each label against its vocabulary ([lists](insights.md#vocabularies)) and folds an unlisted value to `other` (`category`, `domain`) or `unknown` (the rest); the fact is kept. The shipped `examples/model_config.toml` prompt follows the contract.
 
+### `[tasks.dreaming_scan]` — relationship scan (opt-in)
+
+One call per stretch of a relationship's conversation (at most 60 rows) returns
+profile memories, an episode summary and journal moments ([Memory layers →
+Relationship memory](memory-layers.md#relationship-memory)). The prompt is the
+deployment's; the output contract is the engine's. The shipped block in
+`examples/model_config.toml` (and `examples/model_config.d/memory.toml`) holds
+the full reference prompt.
+
+```toml
+[tasks.dreaming_scan]
+model = "anthropic/claude-haiku-4.5"
+fallback = ["deepseek/deepseek-v4-flash","google/gemini-3.1-flash-lite"]
+temperature = 0.2
+max_tokens = 1024
+filter_prompt = """…three-output contract…"""
+```
+
+The transcript arrives as the user message, one line per chat row:
+`[#12 2026-10-01 21:04] 用户：…` or `AI：…`, stamped in the user's timezone
+(the last valid one a text turn of the relationship carried; UTC without). The
+reply is one JSON object:
+
+```json
+{"memories": [{"content": "...", "category": "fact", "domain": "career"}],
+ "episode": "...",
+ "journal": [{"kind": "confession", "realm": "real", "occurred_at": "2026-10-01",
+              "summary": "...", "source": "#12", "due": null}]}
+```
+
+- **`memories`** — objects with `content` and `category` (`fact`,
+  `preference`, `event`, `emotion`, `relation`; anything else becomes
+  `fact`). Every other key is stored verbatim in `companion_memories.metadata`;
+  `domain` drives the [affinity gate](memory-layers.md#affinity-gate). Written
+  to the profile layer under the instance's owner.
+- **`episode`** — one string (an object with a `summary` key is read the same).
+  Blank or missing writes no episode and the rest is still used. Stored on one
+  line, cut to 400 characters.
+- **`journal`** — an array of moments; an item missing `kind`, `occurred_at`
+  or `summary` is dropped.
+  - `kind`: `confession`, `first_intimacy`, `conflict`, `reconciliation`,
+    `promise`, `gift`, `shared_plan` or `user_shared_milestone`; anything else
+    drops the item.
+  - `realm`: `real` or `roleplay`; missing or anything else is stored as
+    `roleplay`. It follows initiative, never physical reality: `real` when the
+    character initiates, or the user invites and the character agrees;
+    `roleplay` when the user supplies the script, sets the scene or narrates
+    the moment and the character performs it.
+  - `occurred_at`: `YYYY-MM-DD`, the date of a stamp in this transcript, or
+    the item is dropped.
+  - `summary`: one sentence, stored on one line and cut to 200 characters;
+    blank drops the item.
+  - `source`: `#n` of the line the moment rests on; one that names no line
+    keeps the item without a message pointer.
+  - `due`: `YYYY-MM-DD`, read for `promise` and `shared_plan` only; the moment
+    then comes back as an anniversary line on that day.
+
+A reply with no JSON object counts as a parse failure; the scan retries after
+one idle period and skips the stretch on the third consecutive failure. With
+the section present, `filter_prompt` is required (see below); absent, the
+scan never runs.
+
+**The fallback and the journal.** Measured on a production deployment, one
+candidate model produced no journal entries at all, so a scan a fallback hop
+serves may write no journal rows. Each scan's row in
+`engine.relationship_scan_events` records the hop that served it and
+`served_fallback`, and a fallback-served scan logs at warn with its journal
+count ([LLM audit → Relationship scanner](llm-audit.md#relationship-scanner)).
+`fallback = []` trades availability for a dependable journal: a primary outage
+then fails the scan.
+
+**Retired: `[tasks.memory_extraction]`.** The block is ignored; a present one
+logs `[tasks.memory_extraction] is retired and ignored; configure
+[tasks.dreaming_scan] instead` at boot and never fails it. A body rule that
+lists `memory_extraction` warns as an unknown task.
+
+### `[tasks.arc_rewrite]` — relationship arc rewrite
+
+Every fourth episode the scan rewrites the relationship arc. The prompt is
+engine-owned (`prompt.rs`), and the block carries only `model`, `fallback`,
+`temperature`, `max_tokens` and the sampling knobs; a `filter_prompt` in any
+shape, blank included, refuses to boot.
+
+```toml
+[tasks.arc_rewrite]
+model = "anthropic/claude-haiku-4.5"
+fallback = ["deepseek/deepseek-v4-flash","google/gemini-3.1-flash-lite"]
+temperature = 0.3
+max_tokens = 1500
+```
+
+The engine rejects an arc over 900 characters, one under 70% of a previous arc
+longer than 300 characters, and a first version without an opening or with one
+over 150 characters; the previous arc keeps serving. Keep `max_tokens` well
+above the 900-character cap: a tight limit cuts the JSON off and the rewrite
+counts as a parse failure. Without the block, rewrites are skipped with one
+warning and episodes stay unfolded; the first rewrite after the block is added
+folds every waiting episode in one call, so configure it together with
+`dreaming_scan`.
+
 ### Enabling / disabling extraction
 
 `insight_extraction` (fact extraction for the human chain),
-`memory_extraction` (session-end dreaming sweeper), `character_insight_extraction`
+`dreaming_scan` (the relationship scan), `character_insight_extraction`
 (stage 1 of the experimental character chain, §"Task names" above), and
 `user_insight_extraction` (stage 1 of the experimental user chain) are
-controlled by the **presence of their `[tasks.*_extraction]` section** — this
+controlled by the **presence of their `[tasks.<name>]` section** — this
 is `validate_extraction_prompts()`'s gate, and all four names are in it:
 
 - **Section present** → `filter_prompt` is **required**; the server refuses to boot
   if it is blank or absent.
 - **Section absent** → that extraction is **off**. The engine boots and runs without
-  it (`insight_extraction` is skipped per turn, so the fact ledger stops growing; the dreaming sweeper stays inert;
+  it (`insight_extraction` is skipped per turn, so the fact ledger stops growing; the relationship scan never runs, neither inline nor from the sweeper, while turn counting, the engine's own journal rows and the anniversary lines carry on;
   the character chain — both stages — never runs; the user chain — both
   stages — never runs).
 
 `profile_rebuild`, `character_insight_structuring`, and
-`user_insight_structuring` — the second call of each chain — are
-**deliberately NOT in this gate**, because this gate *requires* a prompt and
+`user_insight_structuring` — the second call of each chain — and
+`arc_rewrite` are **deliberately NOT in this gate**, because this gate *requires* a prompt and
 none of these blocks may have one. Each is gated in the opposite direction
 instead: its prompt is built in `prompt.rs`, so setting `filter_prompt` on it
 refuses to boot (see `affinity_evaluation` above — same dead-config rule).

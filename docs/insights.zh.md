@@ -269,6 +269,7 @@ Off 什么都不读。渲染器只对非空白的值输出 bullet：
 | `companion_memories` | `user_id`（画像层与关系层） |
 | `world_memories`、`world_states`、`world_enrollments`、`world_posts`（评论随帖子一起走）、`persona_story_insights`、`persona_story_memories`、`persona_story_events` | `owner_uid` |
 | `user_insights`、`user_insights_snapshot`、`character_insights`、`character_insights_snapshot` | 该用户的角色实例（`persona_instances.owner_uid`） |
+| `relationship_scan_state`（四张里最先删：关系扫描的写入会在行锁下检查它，所以进行中的写入先落地、再被后面的删除删掉，之后才到的写入什么都不写）、`relationship_episodes`、`relationship_arcs`、`relationship_journal` | 该用户的角色实例 |
 
 **清空**（行保留 id 和时间戳，内容清除）：
 
@@ -287,9 +288,9 @@ Off 什么都不读。渲染器只对非空白的值输出 bullet：
 响应是 `{user_id, erased_at, deleted: {table: n}, blanked: {table: n}}`；上面每张表都会列出，没有可做的就是 0。`blanked` 只统计仍然带有内容的行。
 
 - **幂等。** 重复调用什么都找不到，各处报 0，并把 `erased_at` 往前移，让错过第一次的镜像在删除流上再次收到通知。
-- **顺序。** 在删除该用户的 session 或角色实例**之前**调用。几条 insight 链只以实例为键，所以只有实例行还在时才够得着它们。
+- **顺序。** 在删除该用户的 session 或角色实例**之前**调用。几条 insight 链和关系扫描的表只以实例为键，所以只有实例行还在时才够得着它们。
 - **先静默流量。** 已经在进行中的第一段抽取可能在抹除提交之后写入事实；调用前先停掉该用户的流量，若仍有漏网，再调用一次清理。进行中的重建写不回画像：它在状态行的锁下写入，而抹除最先拿这把锁，之后它会发现用户已不在。
-- **不触碰。** 聊天历史（`chat_messages`、session、实例）属于调用方自己的删除流程。
+- **不触碰。** 聊天历史（`chat_messages`、session、实例）属于调用方自己的删除流程。`relationship_scan_events` 只有计数和 id，保持原样。
 
 之后新增的、带用户归属的表，会在新增它的那次改动里加入抹除。
 
