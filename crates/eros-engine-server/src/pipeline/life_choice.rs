@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The ask-for-space choice on the pipeline side: when a judged turn makes her
-//! ask, her generated request, and the slowdown after an accepted separation.
-//! The answer, its costs and the ignore path live in the resolution route and
-//! the turn entry.
+//! The life choices on the pipeline side: when a judged turn makes her ask
+//! for space, to sleep together or to marry, her generated request, and the
+//! slowdown after an accepted separation. The answer, its costs and the
+//! ignore path live in the resolution route and the turn entry.
 //!
 //! Spec: docs/superpowers/specs/2026-10-19-life-events-shopping-gatherings-and-ask-for-space-design.md
-//! §3.1 (trigger), §3.2 (the ask), §3.5 (the slowdown).
+//! §3.1 (trigger), §3.2 (the ask), §3.5 (the slowdown); the romantic kinds:
+//! docs/superpowers/specs/2026-10-30-give-needs-romantic-choices-and-answer-receipts-design.md
+//! §4.3 (triggers), §4.4 (the ask).
 
 use chrono::{DateTime, Duration, Utc};
 use sqlx::PgPool;
@@ -13,7 +15,8 @@ use uuid::Uuid;
 
 use eros_engine_core::events::EventKind;
 use eros_engine_core::persona::CompanionPersona;
-use eros_engine_store::affinity::AffinityRepo;
+use eros_engine_core::scope::romance_compatible;
+use eros_engine_store::affinity::{AffinityRepo, JudgedEndpoints};
 use eros_engine_store::chat::ChatRepo;
 use eros_engine_store::events::{EventRepo, NewEvent};
 use eros_engine_store::life_choices::{LifeChoiceKind, LifeChoiceRepo};
@@ -34,6 +37,18 @@ const STREAK: i64 = 3;
 const LOW_PATIENCE: f64 = 0.5;
 /// Positive line growth while the slowdown lasts.
 const SLOWED_GROWTH: f64 = 0.5;
+/// A judged turn counts toward a romantic choice when its warmth and its
+/// patience are both above this. A rule threshold of the engine, not a judge
+/// band (spec 2026-10-30 §4.3).
+const WARM: f64 = 0.7;
+/// `sleep_together`: the newest judged turns that must all be warm (spec
+/// 2026-10-30 §4.3).
+const ROMANCE_STREAK: usize = 3;
+/// `propose`: how many of the newest judged turns it looks at (spec
+/// 2026-10-30 §4.3).
+const PROPOSE_WINDOW: i64 = 8;
+/// `propose`: the warm turns the window must hold (spec 2026-10-30 §4.3).
+const PROPOSE_HITS: usize = 5;
 
 /// The scale on every positive line delta of a commit in `session_id` at
 /// `now`: [`SLOWED_GROWTH`] in the 72 hours after a separation she asked for
@@ -143,10 +158,10 @@ async fn separated(
         .is_some_and(|e| e.kind == EventKind::TakingSpace))
 }
 
-/// After a judged turn's affinity committed: ask for space if the
-/// relationship has worn thin. Every failure is logged and swallowed; the
-/// turn is already answered and its affinity written.
-pub(crate) async fn maybe_ask_for_space(
+/// After a judged turn's affinity committed: ask for space, or a romantic
+/// choice, whichever the relationship calls for. Every failure is logged and
+/// swallowed; the turn is already answered and its affinity written.
+pub(crate) async fn maybe_ask(
     state: &AppState,
     session_id: Uuid,
     user_id: Uuid,
@@ -156,6 +171,49 @@ pub(crate) async fn maybe_ask_for_space(
     if let Err(e) = try_ask(state, session_id, user_id, instance_id, persona).await {
         tracing::warn!(%session_id, "ask for space failed: {e}");
     }
+    // An ask written just now is pending, which closes the runway here.
+    if let Err(e) = try_romance(state, session_id, user_id, instance_id, persona).await {
+        tracing::warn!(%session_id, "romantic choice failed: {e}");
+    }
+}
+
+/// Whether she is free to put a choice to the user at all (spec 2026-10-19
+/// §3.1, spec 2026-10-30 §4.3): nothing pending on the instance, no
+/// separation under way, a 1:1 text session of a genome instance.
+async fn runway_clear(
+    state: &AppState,
+    session_id: Uuid,
+    instance_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<bool, AppError> {
+    // She has one life: one pending ask at a time across the instance's
+    // sessions, and none while she is apart from the user.
+    if (LifeChoiceRepo { pool: &state.pool })
+        .pending_for_instance(instance_id, now)
+        .await?
+    {
+        return Ok(false);
+    }
+    if separated(&state.pool, instance_id, None, now).await? {
+        return Ok(false);
+    }
+
+    // 1:1 text only: the image-edit route also runs the affinity pass, and it
+    // serves a voice session too.
+    match (ChatRepo { pool: &state.pool })
+        .get_session(session_id)
+        .await?
+    {
+        Some(s) if s.channel == "text" => {}
+        _ => return Ok(false),
+    }
+
+    // A genome instance only: the resolution route refuses BYOC, so an ask to
+    // a BYOC session could never be answered.
+    Ok(matches!(
+        crate::byoc::load_instance(state, instance_id).await?,
+        Some(LoadedInstance::Genome(_))
+    ))
 }
 
 /// The trigger (spec §3.1), then her ask (§3.2): her words first, then the
@@ -179,20 +237,15 @@ async fn try_ask(
     if tier_gap < MIN_TIER_GAP {
         return Ok(());
     }
-
-    // She has one life: one pending ask at a time across the instance's
-    // sessions, and none while she is apart from the user.
-    let choices = LifeChoiceRepo { pool: &state.pool };
-    if choices.pending_for_instance(instance_id, now).await? {
-        return Ok(());
-    }
-    if separated(&state.pool, instance_id, None, now).await? {
+    if !runway_clear(state, session_id, instance_id, now).await? {
         return Ok(());
     }
 
     // Three judged turns, this one included, all after the last episode: the
     // ask, its answer and any separation it started.
-    let since = choices.streak_anchor(session_id).await?;
+    let since = (LifeChoiceRepo { pool: &state.pool })
+        .streak_anchor(session_id)
+        .await?;
     let judged = affinity_repo
         .last_judged_endpoints(session_id, since, STREAK)
         .await?;
@@ -200,26 +253,128 @@ async fn try_ask(
         return Ok(());
     }
 
-    // 1:1 text only: the image-edit route also runs the affinity pass, and it
-    // serves a voice session too.
-    let chat_repo = ChatRepo { pool: &state.pool };
-    match chat_repo.get_session(session_id).await? {
-        Some(s) if s.channel == "text" => {}
+    let cue = LifeChoiceCue::Ask {
+        kind: LifeChoiceKind::AskForSpace,
+        tier_gap: Some(tier_gap),
+        anchor_seen: since,
+    };
+    if ask(state, session_id, user_id, instance_id, persona, now, cue).await? {
+        tracing::info!(%session_id, tier_gap, "she asked for space");
+    }
+    Ok(())
+}
+
+/// The romantic trigger (spec 2026-10-30 §4.3), then her ask (§4.4), written
+/// as [`try_ask`] writes hers. Only a pair the caller's recorded scopes mark
+/// as romantic qualifies; the ask itself is generated with the engine's
+/// default scopes.
+async fn try_romance(
+    state: &AppState,
+    session_id: Uuid,
+    user_id: Uuid,
+    instance_id: Uuid,
+    persona: &CompanionPersona,
+) -> Result<(), AppError> {
+    let now = Utc::now();
+    let affinity_repo = AffinityRepo { pool: &state.pool };
+    let Some(mut affinity) = affinity_repo.load(session_id).await? else {
+        return Ok(());
+    };
+    affinity.apply_time_decay();
+    affinity.refresh_endpoints(&state.config.affinity_tuning);
+
+    // The scopes the session's newest reply recorded; none reads as not
+    // romantic.
+    match (ChatRepo { pool: &state.pool })
+        .latest_scopes(session_id)
+        .await?
+    {
+        Some((memory, scope)) if romance_compatible(memory, scope) => {}
         _ => return Ok(()),
     }
 
-    // A genome instance only: the resolution route refuses BYOC, so an ask to
-    // a BYOC session could never be answered.
-    if !matches!(
-        crate::byoc::load_instance(state, instance_id).await?,
-        Some(LoadedInstance::Genome(_))
-    ) {
+    // The judged turns after the last episode of any kind, newest first.
+    let choices = LifeChoiceRepo { pool: &state.pool };
+    let since = choices.streak_anchor(session_id).await?;
+    let judged = affinity_repo
+        .last_judged_endpoints(session_id, since, PROPOSE_WINDOW)
+        .await?;
+    let Some(kind) = romantic_kind(
+        affinity.chem_tier(),
+        affinity.bond_tier(),
+        &judged,
+        choices
+            .settled(session_id, LifeChoiceKind::SleepTogether)
+            .await?,
+        choices.settled(session_id, LifeChoiceKind::Propose).await?,
+    ) else {
+        return Ok(());
+    };
+    if !runway_clear(state, session_id, instance_id, now).await? {
         return Ok(());
     }
 
+    let cue = LifeChoiceCue::Ask {
+        kind,
+        tier_gap: None,
+        anchor_seen: since,
+    };
+    if ask(state, session_id, user_id, instance_id, persona, now, cue).await? {
+        tracing::info!(%session_id, kind = kind.as_str(), "she made a romantic choice");
+    }
+    Ok(())
+}
+
+/// The kind the window qualifies for, `propose` first (spec 2026-10-30
+/// §4.3). `endpoints` newest first: the judged turns after the streak anchor,
+/// at most [`PROPOSE_WINDOW`]. A turn is warm when its warmth and its
+/// patience are both above [`WARM`]. `propose` needs both tiers at 4 or more
+/// and [`PROPOSE_HITS`] warm turns in the window; `sleep_together` needs
+/// chemistry tier 3 or more and the newest [`ROMANCE_STREAK`] all warm. A
+/// settled kind is never chosen.
+fn romantic_kind(
+    chem_tier: u8,
+    bond_tier: u8,
+    endpoints: &[JudgedEndpoints],
+    settled_sleep: bool,
+    settled_propose: bool,
+) -> Option<LifeChoiceKind> {
+    let warm = |e: &JudgedEndpoints| e.warmth > WARM && e.patience > WARM;
+    if !settled_propose
+        && chem_tier >= 4
+        && bond_tier >= 4
+        && endpoints.iter().filter(|&e| warm(e)).count() >= PROPOSE_HITS
+    {
+        return Some(LifeChoiceKind::Propose);
+    }
+    if !settled_sleep
+        && chem_tier >= 3
+        && endpoints
+            .get(..ROMANCE_STREAK)
+            .is_some_and(|newest| newest.iter().all(warm))
+    {
+        return Some(LifeChoiceKind::SleepTogether);
+    }
+    None
+}
+
+/// Her ask (spec 2026-10-19 §3.2, spec 2026-10-30 §4.4) through the
+/// proactive path, generated with the engine's default scopes; the choice
+/// row is written beside her words. `true` when both were written.
+async fn ask(
+    state: &AppState,
+    session_id: Uuid,
+    user_id: Uuid,
+    instance_id: Uuid,
+    persona: &CompanionPersona,
+    now: DateTime<Utc>,
+    cue: LifeChoiceCue,
+) -> Result<bool, AppError> {
     // The turn's own request fields are not carried here; the locale and the
     // tier are read back from the user row that recorded them.
-    let latest = chat_repo.latest_user_message(session_id).await?;
+    let latest = (ChatRepo { pool: &state.pool })
+        .latest_user_message(session_id)
+        .await?;
     let raw = |key: &str| {
         latest
             .as_ref()
@@ -238,7 +393,7 @@ async fn try_ask(
     let tier = raw("tier").map(String::from);
     let recall_query = latest.as_ref().map(recall_query_text).unwrap_or_default();
 
-    let ask = greet(
+    let asked = greet(
         state,
         Greeting {
             session_id,
@@ -246,11 +401,7 @@ async fn try_ask(
             instance_id,
             persona,
             now: &NowContext::for_user(&locale, now),
-            occasion: Occasion::LifeChoice(LifeChoiceCue::Ask {
-                kind: LifeChoiceKind::AskForSpace,
-                tier_gap: Some(tier_gap),
-                anchor_seen: since,
-            }),
+            occasion: Occasion::LifeChoice(cue),
             recall_query,
             since: now,
             tier,
@@ -262,10 +413,7 @@ async fn try_ask(
         },
     )
     .await?;
-    if ask.is_some() {
-        tracing::info!(%session_id, tier_gap, "she asked for space");
-    }
-    Ok(())
+    Ok(asked.is_some())
 }
 
 #[cfg(test)]
@@ -273,6 +421,7 @@ mod tests {
     use super::*;
     use chrono::{DateTime, Duration, TimeZone, Utc};
     use eros_engine_core::events::EventKind;
+    use eros_engine_core::scope::AffinityScope;
     use eros_engine_core::types::ActionType;
     use eros_engine_store::events::{EventRepo, NewEvent};
     use eros_engine_store::life_choices::{LifeChoiceKind, LifeChoiceRepo};
@@ -1670,5 +1819,345 @@ mod tests {
             "three since the return ask again"
         );
         assert_eq!(companion_calls(&mock).await.len(), 1);
+    }
+
+    // ---- The romantic choices (spec 2026-10-30 §4.3–§4.6) ----
+
+    const SLEEP_CUE: &str = "（你们最近越来越亲密，你很想和对方更进一步。你决定主动开口，问对方愿不愿意和你上床，希望对方给你一个答复。）";
+    const PROPOSE_CUE: &str =
+        "（你越来越确定想和对方共度一生。你决定郑重地向对方求婚，希望对方给你一个答复。）";
+    const SLEEP_TEXT: &str = "今晚留下来陪我，好不好？";
+    const PROPOSE_TEXT: &str = "你愿意和我结婚吗？";
+    /// Nothing moved, warmth and patience both at the top level.
+    const WARM: &str = r#"{"warmth":3,"trust":{"grade":0,"direction":"up"},"intimacy":{"grade":0,"direction":"up"},"intrigue":{"grade":0,"direction":"up"},"tension":{"grade":0,"direction":"up"},"patience":3,"reason":"很好"}"#;
+
+    impl Scene {
+        /// The pair's scopes as the caller sent them, recorded on an ordinary
+        /// reply of hers.
+        async fn record_scopes(&self, memory: &str, affinity: AffinityScope) {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content, metadata) \
+                 VALUES ($1, 'assistant', '嗯，我在听。', $2)",
+            )
+            .bind(self.session_id)
+            .bind(json!({
+                "memory_scope": memory,
+                "affinity_scope": serde_json::to_value(affinity).unwrap(),
+            }))
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        }
+
+        /// A `kind` choice asked `ago` ago, in `status`. A romantic kind
+        /// carries no tier gap.
+        async fn seed_romantic(&self, kind: LifeChoiceKind, status: &str, ago: Duration) {
+            sqlx::query(
+                "INSERT INTO engine.life_choices (session_id, kind, status, asked_at, \
+                                                  resolved_at) \
+                 VALUES ($1, $2, $3, now() - make_interval(secs => $4), \
+                         CASE WHEN $3 = 'pending' THEN NULL \
+                              ELSE now() - make_interval(secs => $4) + interval '1 minute' END)",
+            )
+            .bind(self.session_id)
+            .bind(kind.as_str())
+            .bind(status)
+            .bind(ago.num_seconds() as f64)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        }
+
+        /// (kind, status, tier_gap) of every choice in the session, oldest first.
+        async fn kinds(&self) -> Vec<(String, String, Option<i16>)> {
+            sqlx::query_as(
+                "SELECT kind, status, tier_gap FROM engine.life_choices \
+                  WHERE session_id = $1 ORDER BY asked_at",
+            )
+            .bind(self.session_id)
+            .fetch_all(&self.pool)
+            .await
+            .unwrap()
+        }
+
+        /// The stored (bond_tier, chem_tier).
+        async fn tiers(&self) -> (i16, i16) {
+            sqlx::query_as(
+                "SELECT bond_tier, chem_tier FROM engine.companion_affinity WHERE session_id = $1",
+            )
+            .bind(self.session_id)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+        }
+    }
+
+    fn pending(kind: &str) -> (String, String, Option<i16>) {
+        (kind.into(), "pending".into(), None)
+    }
+
+    /// The cue of her one ask: the request's last `user` turn.
+    async fn only_cue(mock: &MockServer) -> serde_json::Value {
+        let calls = companion_calls(mock).await;
+        assert_eq!(calls.len(), 1, "one ask, one generation");
+        let last = calls[0]["messages"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        assert_eq!(last["role"], json!("user"));
+        last["content"].clone()
+    }
+
+    #[test]
+    fn romantic_kind_table() {
+        let hot = |n| {
+            vec![
+                JudgedEndpoints {
+                    warmth: 0.8,
+                    patience: 0.8
+                };
+                n
+            ]
+        };
+        let mut mixed = hot(8);
+        mixed[1].patience = 0.5;
+        mixed[4].warmth = 0.1;
+        mixed[7].warmth = 0.1; // 5 hits of 8
+        assert_eq!(
+            romantic_kind(3, 3, &hot(3), false, false),
+            Some(LifeChoiceKind::SleepTogether)
+        );
+        assert_eq!(
+            romantic_kind(3, 3, &hot(2), false, false),
+            None,
+            "two is not three"
+        );
+        assert_eq!(
+            romantic_kind(2, 5, &hot(3), false, false),
+            None,
+            "chem below 3"
+        );
+        assert_eq!(
+            romantic_kind(4, 4, &hot(8), false, false),
+            Some(LifeChoiceKind::Propose),
+            "propose wins the tie"
+        );
+        assert_eq!(
+            romantic_kind(4, 4, &hot(8), false, true),
+            Some(LifeChoiceKind::SleepTogether),
+            "propose settled"
+        );
+        assert_eq!(
+            romantic_kind(4, 4, &mixed, true, false),
+            Some(LifeChoiceKind::Propose),
+            "5 of 8"
+        );
+        {
+            let mut four = mixed.clone();
+            four[0].patience = 0.69;
+            assert_eq!(romantic_kind(4, 4, &four, true, false), None, "4 of 8");
+        }
+        assert_eq!(
+            romantic_kind(4, 3, &hot(8), true, false),
+            None,
+            "bond below 4"
+        );
+        assert_eq!(
+            romantic_kind(5, 5, &hot(8), true, true),
+            None,
+            "both settled"
+        );
+    }
+
+    /// Lines at 0.5 (tiers 3/3), where a level-3 verdict reads about 0.74 on
+    /// both endpoints: on a compatible pair the third warm judged turn asks.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn three_warm_turns_on_a_compatible_pair_ask_to_sleep_together(pool: PgPool) {
+        let s = scene_with_lines(&pool, 0.5, 0.5).await;
+        s.record_scopes("full", AffinityScope::chemistry()).await;
+        let mock = mock_llm(WARM, Some(SLEEP_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+
+        s.turn(&state, SEEN).await;
+        s.turn(&state, SEEN).await;
+        assert!(s.kinds().await.is_empty(), "two warm turns are not three");
+        assert!(companion_calls(&mock).await.is_empty(), "and cost nothing");
+
+        s.turn(&state, SEEN).await;
+        assert_eq!(s.tiers().await, (3, 3));
+        assert_eq!(s.kinds().await, vec![pending("sleep_together")]);
+
+        // Her words: an ordinary assistant row, proactive, written as the
+        // choice's message.
+        let rows = s.ask_rows().await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(s.choices().await[0].2, Some(rows[0].0));
+        assert_eq!(rows[0].1, SLEEP_TEXT);
+        assert_eq!(rows[0].2.as_deref(), Some("proactive"));
+        assert_eq!(only_cue(&mock).await, json!(SLEEP_CUE));
+    }
+
+    /// No recorded scopes, or scopes without a chemistry axis, read as an
+    /// incompatible pair: the same warm streak asks nothing until the caller's
+    /// scopes allow it.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn without_compatible_scopes_nothing_fires(pool: PgPool) {
+        let s = scene_with_lines(&pool, 0.5, 0.5).await;
+        let mock = mock_llm(WARM, Some(SLEEP_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+
+        for _ in 0..3 {
+            s.turn(&state, SEEN).await;
+        }
+        assert!(s.kinds().await.is_empty(), "no scopes recorded");
+
+        s.record_scopes("neutral_and_relationship", AffinityScope::bond())
+            .await;
+        s.turn(&state, SEEN).await;
+        assert!(s.kinds().await.is_empty(), "bond axes only");
+        assert!(companion_calls(&mock).await.is_empty());
+
+        s.record_scopes("full", AffinityScope::chemistry()).await;
+        s.turn(&state, SEEN).await;
+        assert_eq!(s.kinds().await, vec![pending("sleep_together")]);
+    }
+
+    /// Lines at 0.7 (tiers 4/4): five warm judged turns among the newest
+    /// eight propose, four do not. The cold turns (warmth level 2) keep any
+    /// three in a row from asking to sleep together first.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn five_of_eight_warm_turns_at_tier_four_propose(pool: PgPool) {
+        let warm = mock_llm(WARM, Some(PROPOSE_TEXT)).await;
+        let cold = mock_llm(PATIENT, Some(PROPOSE_TEXT)).await;
+        let warm_state = with_models(test_state(pool.clone()), &warm.uri());
+        let cold_state = with_models(test_state(pool.clone()), &cold.uri());
+        let state = |is_warm: bool| if is_warm { &warm_state } else { &cold_state };
+
+        let s = scene_with_lines(&pool, 0.7, 0.7).await;
+        s.record_scopes("full", AffinityScope::chemistry()).await;
+        for (i, is_warm) in [false, true, true, false, true, true, false, true]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(s.kinds().await.is_empty(), "nothing before turn {}", i + 1);
+            s.turn(state(is_warm), SEEN).await;
+        }
+        assert_eq!(s.tiers().await, (4, 4));
+        assert_eq!(s.kinds().await, vec![pending("propose")]);
+        assert_eq!(only_cue(&warm).await, json!(PROPOSE_CUE));
+        assert!(companion_calls(&cold).await.is_empty());
+
+        let four = scene_with_lines(&pool, 0.7, 0.7).await;
+        four.record_scopes("full", AffinityScope::chemistry()).await;
+        for is_warm in [true, false, true, true, false, true, false, false] {
+            four.turn(state(is_warm), SEEN).await;
+        }
+        assert!(four.kinds().await.is_empty(), "four of eight");
+        assert_eq!(companion_calls(&warm).await.len(), 1, "the first ask only");
+    }
+
+    /// When both kinds qualify on one turn, she proposes. The warm turns run
+    /// while the pair is not yet compatible, so the turn the scopes allow is
+    /// the first where either could fire, and both do.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn propose_wins_when_both_qualify(pool: PgPool) {
+        let s = scene_with_lines(&pool, 0.7, 0.7).await;
+        let mock = mock_llm(WARM, Some(PROPOSE_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+
+        for _ in 0..7 {
+            s.turn(&state, SEEN).await;
+        }
+        assert!(s.kinds().await.is_empty());
+        s.record_scopes("full", AffinityScope::chemistry()).await;
+        s.turn(&state, SEEN).await;
+        assert_eq!(s.kinds().await, vec![pending("propose")]);
+        assert_eq!(only_cue(&mock).await, json!(PROPOSE_CUE));
+    }
+
+    /// A kind once ignored (or accepted) has had its answer: however warm the
+    /// turns, it is not asked again in the session.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_ignored_kind_is_settled(pool: PgPool) {
+        let mock = mock_llm(WARM, Some(SLEEP_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+        for status in ["ignored", "accepted"] {
+            let s = scene_with_lines(&pool, 0.5, 0.5).await;
+            s.record_scopes("full", AffinityScope::chemistry()).await;
+            s.seed_romantic(LifeChoiceKind::SleepTogether, status, Duration::hours(1))
+                .await;
+            for _ in 0..4 {
+                s.turn(&state, SEEN).await;
+            }
+            assert_eq!(s.kinds().await.len(), 1, "{status}");
+        }
+        assert!(companion_calls(&mock).await.is_empty());
+    }
+
+    /// One pending ask at a time: an `ask_for_space` waiting for its answer
+    /// holds the romantic ask back; once answered, the same streak asks.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_pending_ask_for_space_blocks_a_romantic_ask(pool: PgPool) {
+        let s = scene_with_lines(&pool, 0.5, 0.5).await;
+        s.record_scopes("full", AffinityScope::chemistry()).await;
+        let mock = mock_llm(WARM, Some(SLEEP_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+        s.seed_choice("pending", Duration::minutes(1)).await;
+
+        for _ in 0..3 {
+            s.turn(&state, SEEN).await;
+        }
+        assert_eq!(
+            s.kinds().await,
+            vec![("ask_for_space".into(), "pending".into(), Some(3))]
+        );
+        assert!(companion_calls(&mock).await.is_empty());
+
+        sqlx::query(
+            "UPDATE engine.life_choices \
+                SET status = 'declined', resolved_at = asked_at + interval '1 second' \
+              WHERE session_id = $1",
+        )
+        .bind(s.session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        s.turn(&state, SEEN).await;
+        assert_eq!(s.kinds().await[1], pending("sleep_together"));
+    }
+
+    /// A decline settles nothing: the kind re-arms once a fresh streak has
+    /// run after the answer. Warm turns from before it belong to the episode.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_declined_kind_re_arms_after_a_fresh_streak(pool: PgPool) {
+        let s = scene_with_lines(&pool, 0.5, 0.5).await;
+        s.record_scopes("full", AffinityScope::chemistry()).await;
+        let mock = mock_llm(WARM, Some(SLEEP_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+
+        s.turn(&state, SEEN).await;
+        s.turn(&state, SEEN).await;
+        s.age_events(Duration::hours(2)).await;
+        s.seed_romantic(
+            LifeChoiceKind::SleepTogether,
+            "declined",
+            Duration::hours(1),
+        )
+        .await;
+
+        s.turn(&state, SEEN).await;
+        s.turn(&state, SEEN).await;
+        assert_eq!(s.kinds().await.len(), 1, "two fresh turns are not three");
+        assert!(companion_calls(&mock).await.is_empty());
+        s.turn(&state, SEEN).await;
+        assert_eq!(
+            s.kinds().await,
+            vec![
+                ("sleep_together".into(), "declined".into(), None),
+                pending("sleep_together"),
+            ]
+        );
     }
 }
