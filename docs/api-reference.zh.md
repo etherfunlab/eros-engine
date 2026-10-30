@@ -734,7 +734,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 { "greeting": { "message_id": "01J…", "content": "好久不见，最近忙什么呢", "sent_at": "…", "occasion": "returning" } }
 ```
 
-响应里的 `occasion` 取值为 `birthday`、`holiday`、`first_meet`、`returning` 或 `just_opened`。同样形状的消息在生活事件的消息上带 `event`（见下面的 events 路由），在她提出分开的请求和对用户回答的回应上带 `life_choice`（见下面的生活选择路由）。
+响应里的 `occasion` 取值为 `birthday`、`holiday`、`first_meet`、`returning` 或 `just_opened`。同样形状的消息在生活事件的消息上带 `event`（见下面的 events 路由），在她提出分开或浪漫选择的请求、以及对用户回答的回应上带 `life_choice`（见下面的生活选择路由）。
 
 - **同步：** 一次非流式生成，需要几秒，不要阻塞 UI。
 - **幂等：** 生日和节日开场白按会话加当地日期（生日用角色那边的日期，节日用用户那边的日期），场合按会话加 `open_key`。写入过之后，重复调用返回那一条，不会再生成；返回 `null` 的调用什么都没写，同一个 key 再调仍可能生成。
@@ -751,7 +751,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 
 让角色的一天里发生点什么。什么时候要，由调用方决定；发不发生、发生什么，由 engine 决定。
 engine 抽一种事件，或者什么都不抽，然后角色用一条主动消息告诉用户——离线类种类除外，它们让她联系不上，只讲出一部分（见下）。
-她在等用户回答自己提出的分开请求时什么都不抽（见[生活选择路由](#post-v2compsessionsession_idlife-choiceschoice_id)）。
+她在等用户回答自己提出的某次生活选择时什么都不抽（见[生活选择路由](#post-v2compsessionsession_idlife-choiceschoice_id)）。
 事件持续期间，判官和回复都知道她正在经历它
 （见 [model-config.zh.md](model-config.zh.md#taskspde_decision--opt-in-llm-pde-判断器)）。
 抽取怎么运转、事件和角色的需求怎么配合，见 [life-events-needs.zh.md](life-events-needs.zh.md)。
@@ -832,7 +832,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 
 时长写成区间的，在事件开始时从区间里抽定。以上共 52 种可抽取的种类。两种性别都会抽到两个聚会，权重相同，这是有意为之。
 
-另有两种永远不会被抽到：`taking_space`（她提出、用户同意的分开，12–24 小时，离线）和 `fell_out`（用户不理会她的请求时的那场不愉快，1 小时）。
+另有两种永远不会被抽到：`taking_space`（她提出、用户同意的分开，12–24 小时，离线）和 `fell_out`（用户不理会她提出的分开请求时的那场不愉快，1 小时）。
 它们由 engine 为[生活选择流程](#post-v2compsessionsession_idlife-choiceschoice_id)写入，作为 `…/effects` 和生活选择响应里的 `event` 出现，
 不能写进 `kinds`。
 
@@ -850,7 +850,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
   `got_bumped`、`bumped_someone`、`saw_bag`、`saw_clothes`、`out_shopping`、`bros_gathering`、`sis_gathering`、
   `admiring_scenery`、`admiring_art`、`watching_show`、`on_the_road`、`having_sex`）；
   `period` 期间，`period_scare` 与 `pregnancy_scare` 都不抽。
-- **她在等回答时什么都不抽。** 从她提出分开的请求起，到它被回答或过期（24 小时）为止，角色任何一个 session 的抽取都返回
+- **她在等回答时什么都不抽。** 从她提出请求（不论哪一种生活选择）起，到它被回答或过期（24 小时）为止，角色任何一个 session 的抽取都返回
   `{"event": null, "message": null}`。带着已经抽过的 `event_key` 来重复调用，照样返回那个事件。
 - **冷却。** 每种事件从开始起有各自的冷却。trip 类每周最多开始一次，body 类每两周最多开始一次，不论具体是哪一种。
   任何离线类种类每 12 小时最多开始一次，不论具体是哪一种。
@@ -964,17 +964,36 @@ composer 失败时退回普通的人物肖像 prompt，跟聊天回合一样。�
 
 ### `POST /v2/comp/session/{session_id}/life-choices/{choice_id}`
 
-回答她提出的分开请求。chemistry 比 bond 高出两档、她的耐心连续三个被判官评过的回合都很低时，角色会用一条主动消息
-（`metadata.proactive = "life_choice"`）向用户提出想先分开一阵，这个 session 随之带着一次待回答的选择，有效期 24 小时；
-她在与该用户的所有 session 里同一时间最多只有一个这样的请求待回答。
-用户可以在这里回答、用文字回复，或者什么都不说。她怎么提出、什么时候提出、每条路各付什么代价，见
-[life-events-needs.zh.md](life-events-needs.zh.md#提出分开的选择)。
+回答她提出的一次生活选择。她用一条主动消息（`metadata.proactive = "life_choice"`）向用户提出一个选择，
+这个 session 随之带着一次待回答的选择，有效期 24 小时；她在与该用户的所有 session 里同一时间最多只有一个这样的选择待回答。
+用户可以在这里回答、用文字回复，或者什么都不说。选择共有三种：
+
+| `kind` | 她提出 | 何时 |
+|---|---|---|
+| `ask_for_space` | 先分开一阵 | chemistry 比 bond 高出两档，且她的耐心连续三个被判官评过的回合都很低 |
+| `sleep_together` | 问用户愿不愿意和她上床 | 这一对在浪漫上相容（见下），chemistry 在第 3 档或以上，且最新的 3 个被判官评过的回合 warmth 和 patience 都高于 0.7 |
+| `propose` | 向用户求婚 | 这一对在浪漫上相容，chemistry 和 bond 都在第 4 档或以上，且最新的 8 个被判官评过的回合里至少 5 个 warmth 和 patience 都高于 0.7 |
+
+只有该 session 最新一次选择（不论哪一种）之后的、被判官评过的回合才计数。两种浪漫选择同一轮都满足时，触发 `propose`。
+在一个 session 里被用户接受或不理会过的种类，在那里不会再次提出；被拒绝或过期的，等出现新的连续后会再次提出。她怎么提出、什么时候提出、
+每条路各付什么代价，见 [life-events-needs.zh.md](life-events-needs.zh.md#提出分开的选择)和
+[浪漫选择](life-events-needs.zh.md#浪漫选择)。
+
+**浪漫相容。** 只有调用方的 scope 标明为浪漫上相容的一对，她才会提出 `sleep_together` 或 `propose`：
+关系记忆开着（`memory_scope` 为 `full`、`neutral_and_relationship` 或 `relationship_only`），并且 `affinity_scope` 里至少有
+trust、intrigue、patience 之一（`"chemistry"`、`"full"`、`"bond_and_chemistry"`，或点名了这三者之一的轴数组）。
+`memory_scope: "full"` 配 `affinity_scope: "chemistry"` 满足，`memory_scope: "neutral_and_relationship"` 配
+`affinity_scope: "full"` 也满足；engine 的默认值（`neutral_and_relationship` 配 `bond`）永远不满足。
+engine 从这个 session 里最新一条同时记录了这两个 scope 的 assistant 回复读出这一对，她自己的生活选择消息不算；
+没有这样的回复，或值解析不了，这一对就不相容。调用方在自己的回合里发来满足这条判据的 scope，这一对就有了资格。
+engine 不接收也不保存用户的性别或性取向。
 
 客户端从
 [`GET /bff/v1/comp/affinity/{session_id}/event`](#get-bffv1compaffinitysession_idevent)
-的 `life_choice` 字段得知这次选择，字段里有选择的 `id` 和它接受的回答。请求落在触发它的那一轮之后几秒，所以那一轮放行的 delta
+的 `life_choice` 字段得知这次选择，字段里有选择的 `id`、`kind` 和它接受的回答。请求落在触发它的那一轮之后几秒，所以那一轮放行的 delta
 通常赶不上它：**历史里某一行带 `occasion: "life_choice"` 时，应当重新拉一次 delta**（两个历史路由都把这一行的
-`metadata.proactive` 作为 `occasion` 给出）。没有适配的客户端什么都不会损失：
+`metadata.proactive` 作为 `occasion` 给出）。两个历史路由里她那条请求所在的行，还带一个
+[`life_choice` 回执](#get-compchatsession_idhistorylimit20offset0)，说明这次选择现在处于什么状态、最后怎么收场。没有适配的客户端什么都不会损失：
 它把请求当成一条普通消息显示，用户用文字回复，走的就是下面的“不理会”那条路。
 
 ```json
@@ -988,16 +1007,19 @@ composer 失败时退回普通的人物肖像 prompt，跟聊天回合一样。�
 | 字段 | 规则 |
 |---|---|
 | `response` | 必填：`"accept"` 或 `"decline"`；其他取值返回 `422` |
-| `user_timezone`、`user_country`、`user_region`、`tier`、`prompt_traits`、`memory_scope`、`affinity_scope`、`audit` | 与 `/open` 相同，用于生成她的回应。engine 在两次调用之间不保存任何东西 |
+| `user_timezone`、`user_country`、`user_region`、`tier`、`prompt_traits`、`memory_scope`、`affinity_scope`、`audit` | 与 `/open` 相同，用于生成她的回应。她那条请求本身用的是 engine 默认的 scope。engine 在两次调用之间不保存任何东西 |
 
-只服务 1:1 文字 session。一个事务里完成回答并付清代价：
+只服务 1:1 文字 session。一个事务里完成回答并付清代价。回答带来什么，取决于 `kind`：
 
-- **`accept`：** 选择变为 `accepted`。一段 `taking_space` 分开从此刻开始，持续时长是她提出时的档位差距每一档 6 小时
-  （差距 2、3、4 对应 12、18、24 小时）；期间她在所有 session 里都离线，正在进行的插曲在这一刻结束。
-  bond 和 chemistry 各降一档，分开结束后的 72 小时内，这个 session 里为正的增长减半。
-- **`decline`：** 选择变为 `declined`。同样的降档；没有分开，也没有放缓。
+| | `ask_for_space` | `sleep_together` | `propose` |
+|---|---|---|---|
+| **`accept`** | 状态 `accepted`。一段 `taking_space` 分开从此刻开始，持续时长是她提出时的档位差距每一档 6 小时（差距 2、3、4 对应 12、18、24 小时）；期间她在所有 session 里都离线，正在进行的插曲在这一刻结束。bond 和 chemistry 各降一档，分开结束后的 72 小时内，这个 session 里为正的增长减半 | 状态 `accepted`；别的都不变 | 状态 `accepted`；别的都不变 |
+| **`decline`** | 状态 `declined`。同样的降档；没有分开，也没有放缓 | 状态 `declined`；chemistry 降一档 | 状态 `declined`；bond 和 chemistry 各降一档 |
+| **不理会**（用户改为打字） | 状态 `ignored`；一场一小时的 `fell_out` 插曲；不改任何档位 | 状态 `ignored`；没有代价，没有 `fell_out` | 状态 `ignored`；没有代价，没有 `fell_out` |
+| **过期**（24 小时） | 没有代价 | 没有代价 | 没有代价 |
 
-然后她用一条主动消息回应（接受之后是道别，拒绝之后是受伤的回应），与普通回复一样落库并返回：
+然后她用一条主动消息回应，与普通回复一样落库并返回。`ask_for_space` 接受之后是道别，拒绝之后是受伤的回应；
+浪漫选择则是她对用户答“好”或“不”的回应。生成时用的是这次请求带的 scope。
 
 ```json
 {"status": "accepted",
@@ -1006,16 +1028,19 @@ composer 失败时退回普通的人物肖像 prompt，跟聊天回合一样。�
  "event": {"kind": "taking_space", "category": "mid", "offline": true, "started_at": "2026-10-20T12:00:00Z", "ends_at": "2026-10-21T06:00:00Z", "message_id": null}}
 ```
 
-`status` 为 `accepted` 或 `declined`。`affinity` 是降档之后的关系，形状同
-[`GET /bff/v1/comp/affinity/{session_id}`](#get-bffv1compaffinitysession_id) 里的 `affinity`。`event` 是接受时开始的分开，拒绝时为 `null`。
+`status` 为 `accepted` 或 `declined`。`affinity` 是回答之后的关系：任何拒绝以及 `ask_for_space` 的接受之后是降档后的，
+浪漫选择的接受则保持原样；形状同
+[`GET /bff/v1/comp/affinity/{session_id}`](#get-bffv1compaffinitysession_id) 里的 `affinity`。`event` 是 `ask_for_space` 接受时开始的分开，
+任何拒绝以及所有浪漫选择的回答都为 `null`。
 她的生成失败、回复为空，或用户有更新的消息先落库时，`message` 为 `null`：回答、分开和降档照样生效。
 
 用户不调用这个路由时，还有两件事会让选择结算：
 
-- **不理会。** 选择待回答期间到达的第一条普通用户文字消息（不带 `action` 的轮次）会转换它：状态变为 `ignored`，并从那条消息起开始一场一小时的
-  `fell_out` 插曲，所以正是这一条不理会她的消息，回复时她的上下文里已经带着这场不愉快。不改任何档位。
+- **不理会。** 选择待回答期间到达的第一条普通用户文字消息（不带 `action` 的轮次）会转换它：状态变为 `ignored`。
+  `ask_for_space` 还会从那条消息起开始一场一小时的 `fell_out` 插曲，所以正是这一条不理会她的消息，回复时她的上下文里已经带着这场不愉快；
+  浪漫的请求则没有代价，也没有 `fell_out`，这一轮照常运行。不改任何档位。
   只有在她提出之后发出的消息才会触发。动作轮次不会结算它，`/open` 和 reaction 也不会。分开期间的消息一律只是 ghost，不会转化任何挂起的请求。
-- **过期。** 她提出 24 小时后，这次选择处处读作已过期：`life_choice` 不再附带，这个路由返回 `409`，之后的消息什么都不转换，也没有任何代价。
+- **过期。** 她提出 24 小时后，这次选择处处读作已过期：delta 上的 `life_choice` 不再附带，这个路由返回 `409`，之后的消息什么都不转换，也没有任何代价。
 
 结算和一条进来的消息按事务竞争；先写入的赢，输的一方得到这个路由的 `409`。
 
@@ -1092,7 +1117,16 @@ SSE 帧是整轮最后一帧且只走线上——在它发出前断线，光看 
 
 `speaker_session_id`（只出现在群 session 的 assistant 行上，其余省略）是说这句话的成员 session；已离群的发言者，其名字通过 session 再到 instance 解析。
 
-`occasion`（只出现在角色主动写下的 assistant 行上，其余省略）说明她为什么开口：这一行的 `metadata.proactive`，取值为 `birthday`、`holiday`、`first_meet`、`returning`、`just_opened`、`event` 或 `life_choice`。适配了[生活选择](#post-v2compsessionsession_idlife-choiceschoice_id)的客户端读到 `life_choice` 时，应当重新拉一次好感度 delta。
+`occasion`（只出现在角色主动写下的 assistant 行上，其余省略）说明她为什么开口：这一行的 `metadata.proactive`，取值为 `birthday`、`holiday`、`first_meet`、`returning`、`just_opened`、`event` 或 `life_choice`（她提出分开或浪漫选择的请求，以及她对回答的回应）。适配了[生活选择](#post-v2compsessionsession_idlife-choiceschoice_id)的客户端读到 `life_choice` 时，应当重新拉一次好感度 delta。
+
+`life_choice`（只出现在她提出请求的那条 assistant 行上，其余行省略）是这一行向用户提出的选择，以及它现在的状态，这样重新加载的客户端或第二台设备也能在她的请求与她的回应之间画出用户的回答：
+
+```json
+{ "id": "…", "role": "assistant", "content": "…", "sent_at": "…", "occasion": "life_choice",
+  "life_choice": { "id": "…", "kind": "propose", "status": "accepted", "resolved_at": "2026-10-30T12:00:00Z" } }
+```
+
+`kind` 为 `ask_for_space`、`sleep_together` 或 `propose`。`status` 为 `pending`、`accepted`、`declined`、`ignored` 或 `expired`；`expired` 是超过 24 小时的 `pending` 选择，在这一页返回时现算，不落库。`resolved_at` 在状态为 `pending` 或 `expired` 时是 `null`；`accepted` 和 `declined` 时是回答落库的时刻，`ignored` 时是用文字回答她的那条用户消息的 `sent_at`。后面她的回应行照常带 `occasion: "life_choice"`。好感度 delta 里的 `life_choice` 字段是另一个对象，仍然只在待回答时出现。
 
 `user_message_id` 指向产生这一行的那一轮的 `role='user'` 行。assistant 行和
 `system_error` 通知行上都有，user 行本身省略。通知行最要紧：队列 worker 和
@@ -1805,7 +1839,8 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
 }
 ```
 
-`persona_name` 始终存在，BYOC 实例上为 `null`，因为名字只在它的卡片里。
+`persona_name` 始终存在，BYOC 实例上为 `null`，因为名字只在它的卡片里。`history` 的条目与
+[BFF 历史路由](#get-bffv1compchatsession_idhistorylimit50offset0)的形状相同，所以她那条请求所在的行在这里同样带 `life_choice` 回执。
 
 這裡 **不會** 打包 affinity——前端單獨讀取（见下面两条 affinity 路由），
 所以不需要关系数据的冷启动不必为它付代价。
@@ -1826,7 +1861,8 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
 `user_message_id` 指向产生这一行的那一轮的 `role='user'` 行 —— assistant 行和
 `system_error` 通知行上都有，user 行省略。`speaker_session_id` 标出群 session 里 assistant 行的发言者，其余行省略。
 `occasion`（只出现在角色主动写下的 assistant 行上，其余省略）与上面 canonical history 里的同名字段相同，包括 `life_choice`；
-`start` 打包的历史同样带它。
+`start` 打包的历史同样带它。`life_choice`（只出现在她提出请求的那条 assistant 行上，其余省略）是 canonical 路由里同名的回执，
+`{id, kind, status, resolved_at}`，五种状态和 `resolved_at` 的规则都一样；`start` 打包的历史同样带它。
 `reply_to_message_id` 回显 `user` 行发送时带的引用（见 stream 路由的**可选：引用**
 一节）——它引用的那条消息的 id，一定在同一个 session 里；
 普通轮次、以及锚点没解析成功的轮次都省略该字段，这样冷启动不必自己存状态
@@ -1937,7 +1973,7 @@ time-decay），或最近一次事件早于 affinity migration `0014`。`event_t
   或它的回复（`chat_messages.user_message_id`）上。`proactive` / `time_decay` 事件
   以及 migration `0056` 之前写入的行没有这个键。
 - `life_choice` —— 该 session 待回答的选择，在响应时现场拼出，只要有一次选择未被回答、也没过 24 小时，就附在 `event` 上；
-  没有时不带。`options` 列出
+  没有时不带。`kind` 为 `ask_for_space`、`sleep_together` 或 `propose`。`options` 列出
   [生活选择路由](#post-v2compsessionsession_idlife-choiceschoice_id)接受的回答；`message_id` 是提出它的那条聊天消息
   （那一行没了就不带）。请求落在触发它的那一轮之后几秒，所以历史里某一行带 `occasion: "life_choice"` 时，
   应当重新拉一次 delta。忽略这个字段的客户端会降级成那里描述的“不理会”。
@@ -2211,7 +2247,7 @@ curl -X POST -H "x-user-erase-secret: $USER_ERASE_SECRET" \
 - `crates/eros-engine-server/src/routes/session_open.rs`——角色先开口：生日、节日开场白与调用方指定的场合（`v2/comp/session/{session_id}/open`）
 - `crates/eros-engine-server/src/routes/session_events.rs`——角色讲述的生活事件：抽取，以及讲述它的那条主动消息（她不讲的离线类种类没有）（`v2/comp/session/{session_id}/events`）
 - `crates/eros-engine-server/src/routes/session_effects.rs`——角色因被接受的 give 而带着的余效、她的需求和正在经历的事件（`v2/comp/session/{session_id}/effects`）
-- `crates/eros-engine-server/src/routes/life_choices.rs`——用户对她提出分开的回答：接受或拒绝（`v2/comp/session/{session_id}/life-choices/{choice_id}`）
+- `crates/eros-engine-server/src/routes/life_choices.rs`——用户对她提出的某次生活选择的回答：接受或拒绝（`v2/comp/session/{session_id}/life-choices/{choice_id}`）
 - `crates/eros-engine-server/src/routes/group.rs`——群管理与群发送路由（`v2/comp/group*`）
 - `crates/eros-engine-server/src/routes/reaction.rs`——消息 reaction：设置、撤销与允许列表（`v2/comp/session/{session_id}/message/{message_id}/reaction`、`v2/comp/reactions`）
 - `crates/eros-engine-server/src/routes/insight.rs`——按关系分开的 v2 画像端点（`v2/comp/instance/{instance_id}/insight/character`、`.../insight/user`）

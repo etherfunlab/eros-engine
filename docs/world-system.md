@@ -214,7 +214,7 @@ Per `persona_instance`, every `interval_hours` (default 8), behind an
 (default 72) get a round. A quiet instance's life simply pauses and resumes
 the moment chat activity resumes — no catch-up rounds. A message the persona
 sends on her own (a [life event](life-events-needs.md#life-events), a greeting,
-her ask for space) counts as activity like a reply does: something happening to
+her ask of a life choice) counts as activity like a reply does: something happening to
 her keeps her life moving. Turns in a
 [group](group-chat.md) do not count: they leave the member sessions' activity
 untouched. A [BYOC](byoc.md) instance gets no round and no story row, and
@@ -227,7 +227,7 @@ takes no roster slot from an instance that has a genome.
 | Current insight + digest | `persona_story_insights` row (`last_run_at IS NULL` ⇒ first-round init) |
 | Recent events (12) | `persona_story_events`, chronological — continuity + repetition guard |
 | Affinity snapshot | latest session's six axes + bond + chemistry + both tier labels — advisory only |
-| Chat evidence | user→reply pairs of this (owner, instance), last `context_days` (default 7), capped by turn count; messages the persona sent on her own (event and ask-for-space messages, greetings) are not evidence |
+| Chat evidence | user→reply pairs of this (owner, instance), last `context_days` (default 7), capped by turn count; messages the persona sent on her own (event and life-choice messages, greetings) are not evidence |
 | Life events (30) | `persona_events` of the instance started in the same window, plus any under way: label, category, relative time (`3 天前开始，持续 2 小时`), and the message she told it in, if any. `taking_space` / `fell_out` only from unarchived sessions; the narration of an event told in an archived session is left out; a false alarm only once it has ended, with its outcome |
 | Background under way | the one of those life events that is a background under way, repeated on its own |
 | Ask-for-space choices (10) | `life_choices` of the pair's unarchived sessions in the window: her ask and its outcome (accepted with the separation's length, declined, ignored, unanswered, still waiting) |

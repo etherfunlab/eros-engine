@@ -194,7 +194,7 @@ crates/
 │       ├── chat.rs           # ChatRepo
 │       ├── events.rs         # EventRepo（persona_events：进行中的事件、历史、离线时段、虚惊）
 │       ├── group.rs          # GroupRepo（群聊会话、成员关系）
-│       ├── life_choices.rs   # LifeChoiceRepo（角色提出分开的选择：选择行、待回答、结算、放缓窗口）
+│       ├── life_choices.rs   # LifeChoiceRepo（角色的生活选择：选择行、待回答、结算、放缓窗口）
 │       ├── affinity.rs       # AffinityRepo（persist_with_event、record_ghost、persist_life_choice_drop_in_tx）
 │       ├── memory.rs         # MemoryRepo（Profile / Relationship 兩層）
 │       ├── insight.rs        # InsightEventRepo（human_insights_events 审计行）
@@ -227,7 +227,7 @@ crates/
 - [好感度模型](affinity-model.zh.md)——6 個維度、档位写入管线、時間衰退、關係標籤
 - [Ghost 機制](ghost-mechanics.zh.md)——評分公式 + 保護規則 + 實例計算
 - [群聊](group-chat.zh.md)——一位用户加至多三位角色、导演、发言者接力
-- [生活事件与需求](life-events-needs.zh.md)——角色的需求及其漂移、事件抽取、背景事件、离线类、虚惊、提出分开的选择
+- [生活事件与需求](life-events-needs.zh.md)——角色的需求及其漂移、事件抽取、背景事件、离线类、虚惊、提出分开与浪漫选择
 - [記憶層](memory-layers.zh.md)——profile vs relationship、Voyage、pgvector 檢索
 - [部署](deploying.zh.md)——Docker、自带 Postgres / IdP
 - [API 參考](api-reference.zh.md)——每個 `/comp/*` 端點

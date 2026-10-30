@@ -5,8 +5,8 @@
 角色有自己的一天，有两类状态跟着这一天走。**需求**是六项基本水平（饥饿、社交欲、体力、情感需求、外出、享受），
 由 PDE 判官评定，由 engine 随时间往前推，被接受的 give 也会改动它。**生活事件**是发生在她身上的事，调用方来要的时候才抽：
 一趟出差、一场病、路上遇到的一只流浪猫、一个小时没看手机。两者都以平实的当前事实交给判官和回复，
-都不告诉她该怎么表现；例外是本身就是沉默的事件（离线类种类）。两者之上还有第三件事：关系磨薄了，她可以提出先分开一阵，
-这是第一个**生活选择**（见[提出分开的选择](#提出分开的选择)）。
+都不告诉她该怎么表现；例外是本身就是沉默的事件（离线类种类）。两者之上还有第三件事：**生活选择**。关系磨薄了，她可以提出先分开一阵
+（见[提出分开的选择](#提出分开的选择)）；关系升温了，她可以提出和用户上床，或者求婚（见[浪漫选择](#浪漫选择)）。
 
 请求与响应的形状见 [api-reference.zh.md](api-reference.zh.md)，判官的上下文和 verdict 见
 [model-config.zh.md](model-config.zh.md#taskspde_decision--opt-in-llm-pde-判断器)。
@@ -229,7 +229,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
   `admiring_scenery`、`admiring_art`、`watching_show`、`on_the_road`、`having_sex`。
   `period` 期间，
   不抽 `period_scare` 与 `pregnancy_scare`。
-- 她在等用户回答自己提出的分开请求时，同样完全不抽，角色的任何一个 session 都一样：这个请求本身就是前台戏，
+- 她在等用户回答自己提出的某次生活选择时，同样完全不抽，角色的任何一个 session 都一样：这个请求本身就是前台戏，
   也免得一段离线时段在问话中间开始。带着已经抽过的 `event_key` 来重复调用，照样返回那个事件。
 - 一件插曲和一个背景可以同时进行。背景里抽到的插曲，是从背景里讲出来的。
 - 这以角色实例为单位，跨它所有的 session：她只有一段人生。抽取会读该实例最近 90 天的事件，也就是最长的那个冷却。
@@ -665,9 +665,9 @@ composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2com
 ## 提出分开的选择
 
 chemistry 比 bond 高出两档、她的耐心又连续三个被判官评过的回合被磨低，这段关系就失衡了：心动跑在交情前面，而她累了。
-她提出想先分开一阵。这是第一个**生活选择**：一个真实的请求，每一条路都有真实的代价，由上面那套机制搭起来：
-她的请求是一条主动消息，分开是一段离线事件，用户的回答走一个端点。更完整的 `life_choices` 系统
-（更多种类的选择、可配置的后果）不在这个流程之内。
+她提出想先分开一阵。这是一种**生活选择**：一个真实的请求，每一条路都有真实的代价，由上面那套机制搭起来：
+她的请求是一条主动消息，分开是一段离线事件，用户的回答走一个端点。另有两种浪漫选择共用这套机制
+（见[浪漫选择](#浪漫选择)）；本章讲的是提出分开，另有说明的地方除外。
 
 ### 她什么时候提出
 
@@ -677,7 +677,7 @@ engine 在每一轮 affinity 评估已经落库的 1:1 文字回合结束时检�
 - **差距。** chemistry 的档位减去 bond 的档位至少为 2，按两条五档的阶梯算。有符号：只有 chemistry 高于 bond 才算。
 - **耐心。** 推算出的 `patience` 在这一轮和之前两个被判官评过的回合都低于 0.5。评估被跳过或失败的回合既不计数也不打断。
   各轮的值读自该 session 的好感度回合事件（`state_after.patience`），不另存；0.5 是 engine 自己的规则阈值，不是判官的档。
-- **新的连续。** 三个回合都在该 session 最新一段经过之后：她的请求、它的结算，以及它开启的分开
+- **新的连续。** 三个回合都在该 session 最新一段经过（不论哪一种选择）之后：她的请求、它的结算，以及它开启的分开
   （取 `asked_at`、`resolved_at`，接受的选择再加上分开的 `ends_at`，三者最晚的那个）。她等待期间或分开期间发生的、
   被判官评过的动作回合属于这段经过，不计数；转换了不理会的请求的那一轮，是新连续的第一轮。提出一次就用掉这段连续：
   下一次要三个新的被判官评过的回合。
@@ -730,7 +730,7 @@ post-process 的最后，在好感度落库和 feeling 摘要之后，所以它�
 ### 用户的回答
 
 回答是 `POST /v2/comp/session/{session_id}/life-choices/{choice_id}`，带 `{"response": "accept" | "decline"}`
-（[接口参考](api-reference.zh.md#post-v2compsessionsession_idlife-choiceschoice_id)），也可以是用户自己的话，或者沉默。
+（[接口参考](api-reference.zh.md#post-v2compsessionsession_idlife-choiceschoice_id)），也可以是用户自己的话，或者沉默。提出分开的情形是：
 
 | 路径 | 怎么发生 | 选择的状态 | 降档 | 分开 | 她说的话 |
 |---|---|---|---|---|---|
@@ -761,7 +761,7 @@ post-process 的最后，在好感度落库和 feeling 摘要之后，所以它�
 一次一件插曲的规则不破。不改任何档位；判官看到这个上下文，自己给这一轮打分。时钟看的是用户那一行的 `sent_at`：
 只有在她提出之后发出的消息才会触发（提出时已经在路上的那条不算回答），排队或被重新驱动的回合读到的结果相同。
 **动作轮次**（give、打赏、亲吻）不算回答：它按自己的规则回复，请求仍然待回答，因为她等着的时候收到礼物，是在示好，不是在回答。
-`/open` 开场白和 reaction 都不会让它结算。
+`/open` 开场白和 reaction 都不会让它结算。浪漫的请求同样这样转成不理会，但没有代价：没有 `fell_out`，也没有事件（见[浪漫选择](#浪漫选择)）。
 
 **过期。** 24 小时内既没有回答、也没有消息，选择就此失效。它在表里的状态仍是 `pending`，但处处读作已过期：delta 上的字段不再附带，
 端点返回 `409`，之后的消息也不会转成 `fell_out`。没有任何代价；之后再提出，需要重新满足完整的触发条件。
@@ -806,10 +806,54 @@ ghosting 开关关闭时它不让任何轮次沉默，和任何离线时段一�
 | 窗口内发过消息 | `你们之前说好分开一阵，现在时间到了；对方那时发来的消息你现在才看到` | `说好暂时分开（{span}前结束，期间对方的消息你没有回）` |
 | 守约 | `你们之前说好分开一阵，现在时间到了，你们重新开始联系` | `说好暂时分开（{span}前结束，对方等到了约定之后）` |
 
+### 浪漫选择
+
+上面那套机制还承载另外两种选择：`sleep_together`，她问用户愿不愿意和她上床；`propose`，她求婚。
+它们是提出分开的暖色对应物：关系亲近、她一直温暖又有耐心时才触发，只有用户拒绝才有代价。
+
+**谁有资格。** 调用方通过它发来的 `memory_scope` 和 `affinity_scope` 标明为浪漫上相容的一对
+（判据见[接口参考](api-reference.zh.md#post-v2compsessionsession_idlife-choiceschoice_id)）。不满足这条判据、或没有记录到 scope 的一对，永远不会被问到。
+engine 不接收性别或性取向，也不判断谁会被谁吸引。
+
+**她什么时候提出。** 检查和提出分开在同一个位置，在每个被判官评过的 1:1 文字回合之后，读的是同样已落库、做过时间衰减的状态，
+跑道和 session 的条件也相同。一个被判官评过的回合，在推算出的 `warmth` 和 `patience` 都高于 0.7 时算*温暖*，
+值读自该回合的 `state_after`；0.7 是 engine 自己的规则阈值，不是判官的档。
+
+| 种类 | 档位 | 温暖回合 |
+|---|---|---|
+| `sleep_together` | chemistry 在第 3 档或以上 | 最新的 3 个被判官评过的回合全都温暖 |
+| `propose` | chemistry 和 bond 都在第 4 档或以上 | 最新的 8 个被判官评过的回合里至少 5 个温暖 |
+
+只有该 session 最新一段选择经过（不论哪一种）之后的、被判官评过的回合才计数。两种同一轮都满足时，触发 `propose`。
+两者都不会和提出分开撞上，后者要求 patience 低于 0.5。
+
+在一个 session 里被接受或被不理会过的种类，在那里不会再触发：用户已经被问过一次，用文字打出的回答也是回答。
+被拒绝或过期之后，等该 session 出现新的连续，这个种类才会再次触发。
+
+**她的请求。** 送达方式和提出分开一样：先是她的话，一行普通的 assistant 消息，`metadata.proactive = 'life_choice'`，
+再在它旁边写入选择这一行（种类 `sleep_together` 或 `propose`，没有档位差距），窗口同样是 24 小时，
+affinity delta 上也是同一个 `life_choice` 字段。她的请求用 engine 默认的 scope 生成，和提出分开一样；
+她在结算时的回复，用结算请求自己带的 scope。这一对记录下来的 scope 只决定有没有资格，别的什么都不决定。
+舞台提示见 [model-config.zh.md](model-config.zh.md#taskspde_decision--opt-in-llm-pde-判断器)。
+
+**回答。** 同一个端点，同样的 `409` 规则，同样的响应形状；`event` 永远是 `null`。
+
+| 路径 | 选择的状态 | 代价 | 她说的话 |
+|---|---|---|---|
+| 接受 | `accepted` | 无：没有事件，不降档，不放缓 | 生成的、对这声“好”的回应 |
+| 拒绝 | `declined` | `sleep_together`：chemistry 降一档。`propose`：bond 和 chemistry 各降一档 | 生成的、对这声“不”的回应 |
+| 不理会 | `ignored` | 无：没有 `fell_out`，没有事件 | 没有专门的一条：这一轮照常运行，判官读用户写的话 |
+| 过期 | 仍为 `pending`，读作已过期 | 无 | 无 |
+
+拒绝的降档，是提出分开用的那套落点规则作用在被点名的那几条线上，与结算在同一个事务里，这几条线的 `pending_deltas` 也清零
+（见 [affinity-model.zh.md](affinity-model.zh.md#生活选择的降档与放缓)）。动作轮次不会结算它，和提出分开一样。
+放缓只属于提出分开：被接受的浪漫选择从不放缓增长。故事导演只读提出分开，所以浪漫选择的结果只留在对话里，不会在她的世界故事里留下痕迹。
+
 ### 选择存在哪
 
-`engine.life_choices` 每次选择一行：`session_id`（非空，随 session 级联删除）、`kind`、`status`（`pending`、`accepted`、
-`declined`、`ignored`）、`tier_gap`、`asked_at`、`resolved_at`、`message_id`（那条请求；消息没了就置为 NULL）和
+`engine.life_choices` 每次选择一行：`session_id`（非空，随 session 级联删除）、`kind`（`ask_for_space`、`sleep_together` 或 `propose`）、
+`status`（`pending`、`accepted`、`declined`、`ignored`）、`tier_gap`（提出时的档位差距；`ask_for_space` 有值，浪漫种类为 NULL）、
+`asked_at`、`resolved_at`、`message_id`（那条请求；消息没了就置为 NULL）和
 `event_id`（接受时写下的 `taking_space` 行，其他路径为 NULL；事件没了就置为 NULL）。过期和放缓的窗口都是推算出来的，不存。
 分开和不愉快那两行和其他事件一样在 `engine.persona_events` 里。
 
@@ -823,7 +867,7 @@ ghosting 开关关闭时它不让任何轮次沉默，和任何离线时段一�
 | `正在经历` 与 `刚才` | 照常进入回复、`/open` 开场白和事件消息 |
 | `[近期事件]` | 不渲染：没有判官来读它 |
 | 离线类种类 | 和有判官时一样让轮次沉默，因为这个检查在判官之前：ghosting 开关以及动作、强制出图两种例外照样适用 |
-| 提出分开 | 不变：触发读的是 affinity 评估器评过的回合，不是 PDE 判官 |
+| 提出分开与浪漫选择 | 不变：触发读的是 affinity 评估器评过的回合，不是 PDE 判官 |
 | `smoking`、`alcoholic`、`drug`、`coffee` | 为 `false` 的键在 give 时照样掷，可能把它变成拒收；没有 `indulgence` 可漂移、可点名 |
 
 ## 代码指引
@@ -835,7 +879,8 @@ ghosting 开关关闭时它不让任何轮次沉默，和任何离线时段一�
 - `crates/eros-engine-server/src/routes/life_choices.rs`：结算端点。
 - `crates/eros-engine-server/src/routes/bff/affinity.rs`：delta 上的 `life_choice` 字段。
 - `crates/eros-engine-server/src/pipeline/proactive.rs`：事件消息和选择相关的消息、它们的舞台提示和写入（`kind_cue`、`find_cue`）。
-- `crates/eros-engine-server/src/pipeline/life_choice.rs`：触发与她的请求、不理会的转换、放缓的读取。
+- `crates/eros-engine-server/src/pipeline/life_choice.rs`：各种触发与她的请求、不理会的转换、放缓的读取。
+- `crates/eros-engine-core/src/scope.rs`：`romance_compatible`，浪漫选择读的那条判据。
 - `crates/eros-engine-server/src/pipeline/stream.rs::run_stream`：需求的读取与写入（被接受的 give 的挪动走 `after_give`）、`[需求]` 与 `[近期事件]` 两行
   （`build_pde_ctx`）、判官之前的 offline 分支、掷出拒收后的改判（`apply_give_refusal`）、`body_state_frame`。
 - `crates/eros-engine-server/src/prompt.rs`：`needs_line`、`events_judge_text`、`events_reply_text`、
@@ -845,7 +890,7 @@ ghosting 开关关闭时它不让任何轮次沉默，和任何离线时段一�
 - `crates/eros-engine-store/src/events.rs::EventRepo`：`insert`、`insert_preempting_in_tx`、`by_key`、`recent`、`current`、`backgrounds_at`、`unexplained_offline`、`unreturned_separation`、`unresolved_scare`。
 - `crates/eros-engine-store/src/story.rs::StoryRepo`：`life_events`、`life_choices`，以及不含 proactive 行的 `chat_evidence`。
 - `crates/eros-engine-server/src/pipeline/story.rs`：`load_evidence` 与故事 payload 的 `life_events`、`current_background`、`life_choices`；`pipeline/world.rs::direct_world`：世界导演的 `current_background`；`prompt.rs::event_when_text`：两者共用的相对时间。
-- `crates/eros-engine-store/src/life_choices.rs::LifeChoiceRepo`：选择行、`pending`、`resolve_in_tx`、`growth_slowed`。
+- `crates/eros-engine-store/src/life_choices.rs::LifeChoiceRepo`：选择行、`pending`、`resolve_in_tx`、`settled`、`growth_slowed`。
 - `crates/eros-engine-store/src/affinity.rs::AffinityRepo`：`persist_life_choice_drop_in_tx`、`last_judged_endpoints`。
-- `crates/eros-engine-store/src/chat.rs::ChatRepo`：`set_needs` 与 `latest_needs`。
+- `crates/eros-engine-store/src/chat.rs::ChatRepo`：`set_needs` 与 `latest_needs`；`latest_scopes`，浪漫选择据以判断一对关系的 scope。
 - `crates/eros-engine-store/migrations/0000_baseline.sql`：事件表与选择表、needs 索引，以及放宽后的 affinity `event_type` 检查（由 baseline 之前的迁移链折叠而来）。
