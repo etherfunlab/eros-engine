@@ -322,6 +322,13 @@ impl AffinityScope {
     }
 }
 
+/// Whether the caller's scopes mark the pair as romantically compatible
+/// (spec 2026-10-30 §4.1): relationship memory on, and at least one
+/// chemistry axis (trust / intrigue / patience) in scope.
+pub fn romance_compatible(memory: MemoryScope, affinity: AffinityScope) -> bool {
+    memory.resolve().2 && affinity.any_chemistry_axis()
+}
+
 fn clamp01(x: f64) -> f64 {
     x.clamp(0.0, 1.0)
 }
@@ -599,5 +606,35 @@ mod tests {
         assert!(w.any_bond_axis() && !w.any_chemistry_axis());
         let t = AffinityScope::from_axes(&[AffinityAxis::Trust]);
         assert!(t.any_chemistry_axis() && !t.any_bond_axis());
+    }
+
+    #[test]
+    fn romance_compatible_truth_table() {
+        use MemoryScope::*;
+        let cases = [
+            (Full, AffinityScope::chemistry(), true),
+            (NeutralAndRelationship, AffinityScope::full(), true),
+            (NeutralOnly, AffinityScope::bond(), false),
+            (NeutralAndRelationship, AffinityScope::bond(), false),
+            (NeutralOnly, AffinityScope::full(), false),
+            (RelationshipOnly, AffinityScope::full(), true),
+            (NeutralAndRelationship, AffinityScope::default(), false), // engine defaults
+            (
+                Full,
+                AffinityScope::from_axes(&[AffinityAxis::Patience]),
+                true,
+            ),
+            (
+                Full,
+                AffinityScope::from_axes(&[AffinityAxis::Warmth]),
+                false,
+            ),
+            (Full, AffinityScope::none(), false),
+            (None, AffinityScope::full(), false),
+            (InsightsOnly, AffinityScope::full(), false),
+        ];
+        for (m, a, want) in cases {
+            assert_eq!(romance_compatible(m, a), want, "{m:?} {a:?}");
+        }
     }
 }

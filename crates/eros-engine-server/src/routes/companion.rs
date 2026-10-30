@@ -166,11 +166,11 @@ pub struct ChatHistoryEntry {
     pub reaction: Option<crate::routes::reaction::ReactionView>,
     /// Why the persona spoke on her own — set on the assistant rows she wrote
     /// unprompted (the row's `metadata.proactive`): a greeting, a life event,
-    /// or `life_choice` for her ask for space and what she says about the
-    /// answer. A client that has adapted to the choice re-fetches the affinity
-    /// delta on reading `life_choice`. Omitted on every other row; same
-    /// key-presence contract as `read_at`. The BFF history entry carries the
-    /// same field.
+    /// or `life_choice` for her ask of a life choice (any kind) and what she
+    /// says about the answer. A client that has adapted to the choice
+    /// re-fetches the affinity delta on reading `life_choice`. Omitted on
+    /// every other row; same key-presence contract as `read_at`. The BFF
+    /// history entry carries the same field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub occasion: Option<crate::routes::session_open::GreetingOccasion>,
     /// The choice her ask row put to the user and how it stands — set on
@@ -2690,7 +2690,8 @@ mod tests {
         eros_engine_store::life_choices::LifeChoiceRepo { pool: &pool }
             .insert_ask(
                 session_id,
-                3,
+                eros_engine_store::life_choices::LifeChoiceKind::AskForSpace,
+                Some(3),
                 None,
                 &eros_engine_store::chat::ProactiveInsert {
                     id: Uuid::new_v4(),

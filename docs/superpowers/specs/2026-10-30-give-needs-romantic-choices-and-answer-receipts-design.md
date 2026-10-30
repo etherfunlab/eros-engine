@@ -155,7 +155,9 @@ and the engine only reads the result.
 
 **Input.** The input is the resolved `memory_scope` and `affinity_scope`
 recorded on the session's newest assistant row that carries both keys (the
-`build_metadata` bag). If that row is missing, or a value fails to parse,
+`build_metadata` bag), skipping rows whose `metadata.proactive` is
+`life_choice`: rows her own choice flow writes are not a turn of the caller's.
+If no such row exists, or a value fails to parse,
 the pair is incompatible.
 
 **Public contract.** `docs/api-reference.md` documents the criterion as the
@@ -218,10 +220,10 @@ same re-checks. A blank or failed generation writes nothing. Delivery works
 as in v1 §3.3: the same `life_choice` field on the affinity delta, with the
 new `kind` values.
 
-The ask, and both replies at resolution, are generated with the engine's
-default scopes, exactly as v1 does: no intimate profile fields, bond axes
-only. The pair's recorded scopes decide eligibility (§4.1) and nothing
-else.
+Her ask is generated with the engine's default scopes, as v1's ask is: no
+intimate profile fields, bond axes only. Her replies at resolution use the
+resolution request's own scopes, as v1's replies do. The pair's recorded
+scopes (§4.1) decide eligibility only.
 
 **Stage cues.** These are drafts and the wording is the owner's to adjust:
 
@@ -357,7 +359,7 @@ Existing rows are all `ask_for_space` with a gap, so the check validates.
 - **No repeat.** An accepted **or ignored** `sleep_together` or `propose`
   never fires again in the session. Declined and expired re-arm.
 - **Story director.** It does not read the romantic kinds.
-- **Generation scopes.** Her ask and replies use the engine defaults, as v1.
+- **Generation scopes.** As v1: her ask uses the engine defaults, her replies use the resolution request's scopes.
 - **Compatibility.** It is judged only from the two scopes the caller sent.
   The criterion is general: relationship memory is on and the affinity
   scope has a 暧昧感 axis (§4.1). Not found means incompatible. The engine
@@ -377,7 +379,7 @@ Existing rows are all `ask_for_space` with a gap, so the check validates.
 - **Same-turn tie.** `propose` wins.
 - **Ignoring a romantic choice.** It costs nothing and writes no `fell_out`.
 - **Compatibility source.** It is the newest assistant row recording both
-  scopes.
+  scopes, skipping rows whose `metadata.proactive` is `life_choice`.
 - **`ever_had_sex`.** The new kinds don't touch it.
 - **The six cues.** They are drafts (§4.4).
 

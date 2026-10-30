@@ -1544,6 +1544,42 @@ impl<'a> ChatRepo<'a> {
         .await
     }
 
+    /// The resolved scopes recorded on the session's newest assistant row that
+    /// carries both (`metadata.memory_scope`, `metadata.affinity_scope`); `None`
+    /// when there is none or either fails to parse. The persona's own
+    /// life-choice rows (`metadata.proactive = 'life_choice'`) are skipped:
+    /// they are not a turn of the caller's, so they say nothing about the
+    /// caller's scopes (spec 2026-10-30 §4.1). Other proactive rows carry the
+    /// caller's request scopes and stay eligible.
+    pub async fn latest_scopes(
+        &self,
+        session_id: Uuid,
+    ) -> Result<
+        Option<(
+            eros_engine_core::scope::MemoryScope,
+            eros_engine_core::scope::AffinityScope,
+        )>,
+        sqlx::Error,
+    > {
+        let row: Option<(serde_json::Value, serde_json::Value)> = sqlx::query_as(
+            "SELECT metadata->'memory_scope', metadata->'affinity_scope' \
+             FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant' \
+               AND metadata ? 'memory_scope' AND metadata ? 'affinity_scope' \
+               AND metadata->>'proactive' IS DISTINCT FROM 'life_choice' \
+             ORDER BY sent_at DESC, id DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_optional(self.pool)
+        .await?;
+        Ok(row.and_then(|(memory, affinity)| {
+            Some((
+                serde_json::from_value(memory).ok()?,
+                serde_json::from_value(affinity).ok()?,
+            ))
+        }))
+    }
+
     /// Whether any row other than a dated greeting (holiday or birthday)
     /// landed in this session at or after `since`. Dated greetings are
     /// excluded so one written for a different local date (e.g. the user's
@@ -5858,6 +5894,100 @@ mod tests {
         assert_eq!(
             repo.latest_user_message(s.id).await.unwrap().unwrap().id,
             second
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn latest_scopes_reads_the_newest_assistant_row_carrying_both(pool: PgPool) {
+        use eros_engine_core::scope::{AffinityScope, MemoryScope};
+        let repo = ChatRepo { pool: &pool };
+        let s = throwaway_session(&pool).await;
+        // Inserts a row `age_secs` seconds in the past, so a larger age is older.
+        let put = |role: &'static str, age_secs: i64, metadata: serde_json::Value| {
+            let pool = pool.clone();
+            let session_id = s.id;
+            async move {
+                sqlx::query(
+                    "INSERT INTO engine.chat_messages (session_id, role, content, sent_at, metadata) \
+                     VALUES ($1, $2, '', now() - make_interval(secs => $3), $4)",
+                )
+                .bind(session_id)
+                .bind(role)
+                .bind(age_secs as f64)
+                .bind(metadata)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        };
+        let chemistry = serde_json::to_value(AffinityScope::chemistry()).unwrap();
+        let bond = serde_json::to_value(AffinityScope::bond()).unwrap();
+
+        assert!(
+            repo.latest_scopes(s.id).await.unwrap().is_none(),
+            "no assistant rows"
+        );
+
+        // A string where the object belongs does not parse.
+        put(
+            "assistant",
+            60,
+            serde_json::json!({"memory_scope": "full", "affinity_scope": "bond"}),
+        )
+        .await;
+        assert!(repo.latest_scopes(s.id).await.unwrap().is_none());
+
+        // The newest complete pair wins over newer rows that lack one half or
+        // are not assistant rows.
+        put(
+            "assistant",
+            50,
+            serde_json::json!({"memory_scope": "full", "affinity_scope": chemistry}),
+        )
+        .await;
+        put(
+            "user",
+            40,
+            serde_json::json!({"memory_scope": "none", "affinity_scope": bond}),
+        )
+        .await;
+        put("assistant", 30, serde_json::json!({"memory_scope": "none"})).await;
+        assert_eq!(
+            repo.latest_scopes(s.id).await.unwrap(),
+            Some((MemoryScope::Full, AffinityScope::chemistry()))
+        );
+
+        // The persona's own life-choice rows are her choice rows, not a caller
+        // turn; they never stand in for the caller.
+        put(
+            "assistant",
+            20,
+            serde_json::json!({
+                "proactive": "life_choice",
+                "memory_scope": "neutral_and_relationship",
+                "affinity_scope": bond,
+            }),
+        )
+        .await;
+        assert_eq!(
+            repo.latest_scopes(s.id).await.unwrap(),
+            Some((MemoryScope::Full, AffinityScope::chemistry()))
+        );
+
+        // Other proactive rows carry the caller's request scopes and count.
+        put(
+            "assistant",
+            10,
+            serde_json::json!({
+                "proactive": "event",
+                "memory_scope": "none",
+                "affinity_scope": bond,
+            }),
+        )
+        .await;
+        assert_eq!(
+            repo.latest_scopes(s.id).await.unwrap(),
+            Some((MemoryScope::None, AffinityScope::bond()))
         );
     }
 

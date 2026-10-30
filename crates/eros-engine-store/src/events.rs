@@ -1821,14 +1821,20 @@ mod tests {
     /// the one that closes the gap.
     #[sqlx::test(migrations = "./migrations")]
     async fn a_draw_is_refused_while_an_ask_is_pending_in_a_sibling_session(pool: PgPool) {
-        use crate::life_choices::LifeChoiceRepo;
+        use crate::life_choices::{LifeChoiceKind, LifeChoiceRepo};
 
         let (owner, i, s) = instance_and_session(&pool).await;
         let sibling = another_session(&pool, owner, i).await;
         let (_, other_i, other_s) = instance_and_session(&pool).await;
         let asks = LifeChoiceRepo { pool: &pool };
         let ask = asks
-            .insert_ask(sibling, 3, None, &message("想先分开"))
+            .insert_ask(
+                sibling,
+                LifeChoiceKind::AskForSpace,
+                Some(3),
+                None,
+                &message("想先分开"),
+            )
             .await
             .unwrap()
             .expect("asked");

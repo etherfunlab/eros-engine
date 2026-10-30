@@ -273,7 +273,7 @@ pub async fn run(
 /// `eval_text` (see `affinity_eval_text`), choosing the scope, and passing the
 /// persona (a blank name skips the eval) and the user's timezone, which dates
 /// the tier rows the persist journals. After the persist, a judged turn may
-/// make her ask for space (`life_choice::maybe_ask_for_space`).
+/// make her put a life choice to the user (`life_choice::maybe_ask`).
 #[allow(clippy::too_many_arguments)] // each arg is a distinct per-turn concern
 pub(crate) async fn run_affinity_turn(
     state: &AppState,
@@ -393,8 +393,7 @@ pub(crate) async fn run_affinity_turn(
 
     // Last, so the ask's own generation never delays the feeling clause.
     if committed && judged {
-        super::life_choice::maybe_ask_for_space(state, session_id, user_id, instance_id, persona)
-            .await;
+        super::life_choice::maybe_ask(state, session_id, user_id, instance_id, persona).await;
     }
 }
 

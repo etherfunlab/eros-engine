@@ -205,7 +205,11 @@ mod tests {
 
         let rows = bookkeeping(&pool).await;
         let versions: Vec<i64> = rows.iter().map(|r| r.0).collect();
-        assert_eq!(versions, [0, 78, 79, 80, 81, 82], "collapsed + increments");
+        assert_eq!(
+            versions,
+            [0, 78, 79, 80, 81, 82, 83],
+            "collapsed + increments"
+        );
         let baseline = MIGRATOR.iter().find(|m| m.version == 0).unwrap();
         assert_eq!(
             rows[0].1,
@@ -234,7 +238,7 @@ mod tests {
     async fn fresh_database_applies_baseline_and_increments(pool: PgPool) {
         migrate(&pool).await.unwrap();
         let versions: Vec<i64> = bookkeeping(&pool).await.iter().map(|r| r.0).collect();
-        assert_eq!(versions, [0, 78, 79, 80, 81, 82]);
+        assert_eq!(versions, [0, 78, 79, 80, 81, 82, 83]);
         let phrases: i32 = sqlx::query_scalar(
             "SELECT jsonb_array_length(payload) FROM engine.error_handling_config \
               WHERE kind = 'chat_stream_failure_fallback_phrases'",

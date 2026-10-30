@@ -624,7 +624,7 @@ mod tests {
                 session_id: Uuid::new_v4(),
                 kind: "ask_for_space".into(),
                 status: status.into(),
-                tier_gap: 2,
+                tier_gap: Some(2),
                 asked_at,
                 resolved_at: None,
                 message_id: None,
@@ -787,7 +787,7 @@ mod tests {
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn event_and_choice_reach_the_story_payload_not_the_chat_evidence(pool: sqlx::PgPool) {
         use eros_engine_store::events::{EventRepo, NewEvent};
-        use eros_engine_store::life_choices::LifeChoiceRepo;
+        use eros_engine_store::life_choices::{LifeChoiceKind, LifeChoiceRepo};
         let owner = Uuid::new_v4();
         let genome: Uuid = sqlx::query_scalar(
             "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
@@ -844,7 +844,8 @@ mod tests {
         let ask = choices
             .insert_ask(
                 session,
-                2,
+                LifeChoiceKind::AskForSpace,
+                Some(2),
                 None,
                 &proactive("我们先分开一阵子好吗", "life_choice"),
             )

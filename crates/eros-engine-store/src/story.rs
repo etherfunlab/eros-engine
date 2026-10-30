@@ -14,7 +14,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::events::EventRecord;
-use crate::life_choices::{LifeChoiceRecord, ASK_FOR_SPACE};
+use crate::life_choices::{LifeChoiceKind, LifeChoiceRecord};
 
 /// The fixed insight column list, DDL order. Single source for the
 /// full-column UPDATE and the prompt-schema lockstep test (server side).
@@ -467,7 +467,7 @@ impl<'a> StoryRepo<'a> {
             Uuid,
             String,
             String,
-            i16,
+            Option<i16>,
             DateTime<Utc>,
             Option<DateTime<Utc>>,
             Option<Uuid>,
@@ -489,7 +489,7 @@ impl<'a> StoryRepo<'a> {
         )
         .bind(owner_uid)
         .bind(instance_id)
-        .bind(ASK_FOR_SPACE)
+        .bind(LifeChoiceKind::AskForSpace.as_str())
         .bind(since)
         .bind(cap)
         .fetch_all(self.pool)
@@ -1504,7 +1504,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO engine.life_choices \
                  (session_id, kind, status, tier_gap, asked_at, resolved_at, message_id, event_id) \
-             VALUES ($1, $2, $3, 2, $4, \
+             VALUES ($1, $2, $3, CASE WHEN $2 = 'ask_for_space' THEN 2 END, $4, \
                      CASE WHEN $3 = 'pending' THEN NULL ELSE $4 + interval '1 hour' END, $5, $6)",
         )
         .bind(session)
@@ -1571,7 +1571,16 @@ mod tests {
             .await
             .unwrap();
         seed_choice(&pool, s, "ask_for_space", "ignored", now - d(8), None, None).await;
-        seed_choice(&pool, s, "other_kind", "declined", now - d(3), None, None).await;
+        seed_choice(
+            &pool,
+            s,
+            "sleep_together",
+            "declined",
+            now - d(3),
+            None,
+            None,
+        )
+        .await;
         seed_choice(&pool, a, "ask_for_space", "pending", now - h(1), None, None).await;
         seed_choice(&pool, x, "ask_for_space", "pending", now - h(1), None, None).await;
         sqlx::query("UPDATE engine.chat_sessions SET archived = true WHERE id = $1")
