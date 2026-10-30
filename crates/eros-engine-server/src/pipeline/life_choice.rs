@@ -193,10 +193,10 @@ async fn try_ask(
     // Three judged turns, this one included, all after the last episode: the
     // ask, its answer and any separation it started.
     let since = choices.streak_anchor(session_id).await?;
-    let patiences = affinity_repo
-        .last_judged_patiences(session_id, since, STREAK)
+    let judged = affinity_repo
+        .last_judged_endpoints(session_id, since, STREAK)
         .await?;
-    if patiences.len() < STREAK as usize || patiences.iter().any(|p| *p >= LOW_PATIENCE) {
+    if judged.len() < STREAK as usize || judged.iter().any(|j| j.patience >= LOW_PATIENCE) {
         return Ok(());
     }
 

@@ -149,6 +149,14 @@ pub struct AffinityEventRow {
     pub created_at: DateTime<Utc>,
 }
 
+/// The endpoints of one judged turn: the `warmth` and `patience` its
+/// affinity evaluation committed (spec 2026-10-30 §4.3).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct JudgedEndpoints {
+    pub warmth: f64,
+    pub patience: f64,
+}
+
 pub struct AffinityRepo<'a> {
     pub pool: &'a PgPool,
 }
@@ -403,28 +411,31 @@ impl<'a> AffinityRepo<'a> {
         .await
     }
 
-    /// The post-turn `patience` of the session's judged turns, newest first
-    /// (spec 2026-10-19 §3.1). A judged turn is a `message` event whose eval
-    /// committed: no `eval_skip_reason`, and the judge's generation came back
-    /// (a failed call leaves none). Every other row — skipped or failed
-    /// evals, gifts, ghosts, proactive, `time_decay`, `life_choice`, a
-    /// pre-4.1 row with no `state_after` — is not one, so it neither counts
-    /// nor sits between two that do. `since` keeps only turns written
+    /// The post-turn `warmth` and `patience` of the session's judged turns,
+    /// newest first (spec 2026-10-19 §3.1, spec 2026-10-30 §4.3). A judged
+    /// turn is a `message` event whose eval committed: no `eval_skip_reason`,
+    /// and the judge's generation came back (a failed call leaves none).
+    /// Every other row — skipped or failed evals, gifts, ghosts, proactive,
+    /// `time_decay`, `life_choice`, a pre-4.1 row with no `state_after`, a row
+    /// whose `state_after` lacks either endpoint — is not one, so it neither
+    /// counts nor sits between two that do. `since` keeps only turns written
     /// strictly after it.
-    pub async fn last_judged_patiences(
+    pub async fn last_judged_endpoints(
         &self,
         session_id: Uuid,
         since: Option<DateTime<Utc>>,
         limit: i64,
-    ) -> Result<Vec<f64>, sqlx::Error> {
-        sqlx::query_scalar(
-            "SELECT (e.state_after->>'patience')::float8 \
+    ) -> Result<Vec<JudgedEndpoints>, sqlx::Error> {
+        let rows: Vec<(f64, f64)> = sqlx::query_as(
+            "SELECT (e.state_after->>'warmth')::float8, \
+                    (e.state_after->>'patience')::float8 \
                FROM engine.companion_affinity_events e \
                JOIN engine.companion_affinity a ON a.id = e.affinity_id \
               WHERE a.session_id = $1 \
                 AND e.event_type = 'message' \
                 AND e.generation_id IS NOT NULL \
                 AND e.context->>'eval_skip_reason' IS NULL \
+                AND e.state_after->>'warmth' IS NOT NULL \
                 AND e.state_after->>'patience' IS NOT NULL \
                 AND ($2::timestamptz IS NULL OR e.created_at > $2) \
               ORDER BY e.created_at DESC, e.id DESC \
@@ -434,7 +445,11 @@ impl<'a> AffinityRepo<'a> {
         .bind(since)
         .bind(limit)
         .fetch_all(self.pool)
-        .await
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(warmth, patience)| JudgedEndpoints { warmth, patience })
+            .collect())
     }
 
     /// Most-recent `affinity_reason` strings (newest-first) from `message` /
@@ -3691,13 +3706,16 @@ mod tests {
         }
     }
 
-    /// One turn event with an explicit `created_at`, a `state_after.patience`
-    /// (`None` leaves `state_after` NULL, as on a pre-4.1 row), an optional
+    /// One turn event with an explicit `created_at`, a `state_after` carrying
+    /// the given `warmth` and `patience` (a `None` leaves its key out; both
+    /// `None` leaves `state_after` NULL, as on a pre-4.1 row), an optional
     /// audit generation and an optional skip marker.
+    #[allow(clippy::too_many_arguments)]
     async fn seed_patience_event(
         pool: &PgPool,
         affinity_id: Uuid,
         event_type: &str,
+        warmth: Option<f64>,
         patience: Option<f64>,
         generation: Option<&str>,
         skip: Option<&str>,
@@ -3717,6 +3735,14 @@ mod tests {
             Some(s) => serde_json::json!({ "eval_skip_reason": s }),
             None => serde_json::json!({}),
         };
+        let mut endpoints = serde_json::Map::new();
+        if let Some(w) = warmth {
+            endpoints.insert("warmth".into(), w.into());
+        }
+        if let Some(p) = patience {
+            endpoints.insert("patience".into(), p.into());
+        }
+        let state_after = (!endpoints.is_empty()).then_some(serde_json::Value::Object(endpoints));
         sqlx::query(
             "INSERT INTO engine.companion_affinity_events \
                (affinity_id, event_type, deltas, effective_deltas, context, \
@@ -3726,7 +3752,7 @@ mod tests {
         .bind(affinity_id)
         .bind(event_type)
         .bind(context)
-        .bind(patience.map(|p| serde_json::json!({ "patience": p })))
+        .bind(state_after)
         .bind(generation)
         .bind(at)
         .execute(pool)
@@ -3735,7 +3761,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn last_judged_patiences_reads_judged_message_turns_newest_first(pool: PgPool) {
+    async fn last_judged_endpoints_reads_judged_message_turns_newest_first(pool: PgPool) {
         use chrono::TimeZone;
         let repo = AffinityRepo { pool: &pool };
         let user_id = Uuid::new_v4();
@@ -3747,17 +3773,60 @@ mod tests {
             .unwrap();
         let t0 = Utc.with_ymd_and_hms(2026, 3, 1, 12, 0, 0).unwrap();
         let at = |mins: i64| t0 + chrono::Duration::minutes(mins);
+        let ends = |warmth: f64, patience: f64| JudgedEndpoints { warmth, patience };
 
-        // Judged turns: patience 0.10 (t+1), 0.20 (t+3), 0.30 (t+6), 0.40 (t+8).
-        seed_patience_event(&pool, a.id, "message", Some(0.10), Some("g1"), None, at(1)).await;
-        seed_patience_event(&pool, a.id, "message", Some(0.20), Some("g2"), None, at(3)).await;
-        seed_patience_event(&pool, a.id, "message", Some(0.30), Some("g3"), None, at(6)).await;
-        seed_patience_event(&pool, a.id, "message", Some(0.40), Some("g4"), None, at(8)).await;
+        // Judged turns: (warmth, patience) 0.60/0.10 (t+1), 0.70/0.20 (t+3),
+        // 0.80/0.30 (t+6), 0.90/0.40 (t+8).
+        seed_patience_event(
+            &pool,
+            a.id,
+            "message",
+            Some(0.60),
+            Some(0.10),
+            Some("g1"),
+            None,
+            at(1),
+        )
+        .await;
+        seed_patience_event(
+            &pool,
+            a.id,
+            "message",
+            Some(0.70),
+            Some(0.20),
+            Some("g2"),
+            None,
+            at(3),
+        )
+        .await;
+        seed_patience_event(
+            &pool,
+            a.id,
+            "message",
+            Some(0.80),
+            Some(0.30),
+            Some("g3"),
+            None,
+            at(6),
+        )
+        .await;
+        seed_patience_event(
+            &pool,
+            a.id,
+            "message",
+            Some(0.90),
+            Some(0.40),
+            Some("g4"),
+            None,
+            at(8),
+        )
+        .await;
         // Not judged: the eval was skipped.
         seed_patience_event(
             &pool,
             a.id,
             "message",
+            Some(0.51),
             Some(0.91),
             None,
             Some("short_user_msg"),
@@ -3766,17 +3835,59 @@ mod tests {
         .await;
         // Not judged: the eval failed, so no generation came back and no skip
         // was stamped.
-        seed_patience_event(&pool, a.id, "message", Some(0.92), None, None, at(5)).await;
+        seed_patience_event(
+            &pool,
+            a.id,
+            "message",
+            Some(0.52),
+            Some(0.92),
+            None,
+            None,
+            at(5),
+        )
+        .await;
         // Not turns of this kind, whatever they carry.
         for (i, kind) in ["gift", "ghost", "proactive", "time_decay", "life_choice"]
             .into_iter()
             .enumerate()
         {
             let g = format!("other-{i}");
-            seed_patience_event(&pool, a.id, kind, Some(0.93), Some(&g), None, at(7)).await;
+            seed_patience_event(
+                &pool,
+                a.id,
+                kind,
+                Some(0.53),
+                Some(0.93),
+                Some(&g),
+                None,
+                at(7),
+            )
+            .await;
         }
         // A pre-4.1 row carries no state to read.
-        seed_patience_event(&pool, a.id, "message", None, Some("g-old"), None, at(9)).await;
+        seed_patience_event(
+            &pool,
+            a.id,
+            "message",
+            None,
+            None,
+            Some("g-old"),
+            None,
+            at(9),
+        )
+        .await;
+        // A judged row whose state has no warmth is no endpoint pair.
+        seed_patience_event(
+            &pool,
+            a.id,
+            "message",
+            None,
+            Some(0.15),
+            Some("g-no-warmth"),
+            None,
+            at(2),
+        )
+        .await;
         // Another session's judged turn never leaks in.
         let other = make_session(&pool, user_id, instance_id).await;
         let b = repo
@@ -3787,6 +3898,7 @@ mod tests {
             &pool,
             b.id,
             "message",
+            Some(0.54),
             Some(0.94),
             Some("g-b"),
             None,
@@ -3795,27 +3907,32 @@ mod tests {
         .await;
 
         assert_eq!(
-            repo.last_judged_patiences(session, None, 10).await.unwrap(),
-            vec![0.40, 0.30, 0.20, 0.10]
+            repo.last_judged_endpoints(session, None, 10).await.unwrap(),
+            vec![
+                ends(0.90, 0.40),
+                ends(0.80, 0.30),
+                ends(0.70, 0.20),
+                ends(0.60, 0.10)
+            ]
         );
         assert_eq!(
-            repo.last_judged_patiences(session, None, 3).await.unwrap(),
-            vec![0.40, 0.30, 0.20],
+            repo.last_judged_endpoints(session, None, 3).await.unwrap(),
+            vec![ends(0.90, 0.40), ends(0.80, 0.30), ends(0.70, 0.20)],
             "newest first, limited"
         );
         // `since` is exclusive: a turn written at the ask's own instant is
         // before it.
         assert_eq!(
-            repo.last_judged_patiences(session, Some(at(3)), 10)
+            repo.last_judged_endpoints(session, Some(at(3)), 10)
                 .await
                 .unwrap(),
-            vec![0.40, 0.30]
+            vec![ends(0.90, 0.40), ends(0.80, 0.30)]
         );
         assert_eq!(
-            repo.last_judged_patiences(session, Some(at(8)), 10)
+            repo.last_judged_endpoints(session, Some(at(8)), 10)
                 .await
                 .unwrap(),
-            Vec::<f64>::new()
+            Vec::<JudgedEndpoints>::new()
         );
     }
 
