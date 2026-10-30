@@ -26,9 +26,9 @@ use crate::state::AppState;
 /// (`profile=4`, `relationship=3`). Tunable later if recall quality drifts.
 const PROFILE_RECALL_K: i32 = 4;
 const RELATIONSHIP_RECALL_K: i32 = 3;
-/// Per-category top-K for the dreaming-lite categorised profile rows.
-/// Five categories × 2 = at most 10 lines of grouped profile context;
-/// kept small so the prompt doesn't bloat once classification fills in.
+/// Per-category top-K for the categorised profile rows the dreaming scan
+/// writes. Five categories × 2 = at most 10 lines of grouped profile context;
+/// kept small so the prompt doesn't bloat once the scan fills them in.
 const K_PER_CATEGORY: i32 = 2;
 
 /// Recall fan-out sizes for one call site of `recall_memory` /
@@ -572,7 +572,7 @@ pub(crate) async fn recall_memory(
 /// layer-enable flags and returns the rows found, ungated: the profile
 /// layer's grouped and raw searches (empty when `x_on` is false) and the
 /// relationship layer's contents (empty when `y_on` is false). Relationship
-/// rows are full turn dumps and not categorised by the dreaming-lite pass.
+/// rows are the user's raw lines and never categorised.
 ///
 /// Hot path (`x_on` ⇒ `y_on`): the three profile + relationship searches run
 /// in parallel via `tokio::join!`. Relationship-only (`!x_on && y_on`): only
@@ -653,7 +653,7 @@ pub(crate) async fn recall_memory_with_embedding(
 
 /// Map a raw category tag (`fact` / `preference` / ...) to its Chinese
 /// section label as it should appear in the prompt. Unknown tags fall
-/// back to "其他" — the dreaming-lite classifier already normalises to a
+/// back to "其他" — the dreaming scan already normalises categories to a
 /// fixed vocabulary, so this branch should be unreachable in practice.
 fn category_label(category: &str) -> &'static str {
     match category {

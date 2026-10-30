@@ -1418,7 +1418,7 @@ pub(crate) fn render_recall_sections(
 /// as labeled sub-sections under `[user_profile]`. Caller
 /// decides labels — typically `("基础画像", insight_bullets)` first, then
 /// one entry per memory category (`客观事实` / `偏好` / `最近发生` / etc.)
-/// from the dreaming-lite classifier. Empty groups are dropped.
+/// from the dreaming scan's profile memories. Empty groups are dropped.
 #[allow(clippy::too_many_arguments)] // signature mirrors the gateway's port-of-origin
 pub fn build_prompt(
     persona: &CompanionPersona,

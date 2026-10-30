@@ -177,8 +177,8 @@ impl<'a> MemoryRepo<'a> {
     }
 
     /// Top-K profile-layer rows per category, for rows with `category` set
-    /// (i.e. produced by the dreaming-lite classifier — not raw write_turn
-    /// dumps). Single SQL using `ROW_NUMBER() OVER (PARTITION BY category
+    /// (i.e. written by the dreaming scan — not raw write_turn
+    /// rows). Single SQL using `ROW_NUMBER() OVER (PARTITION BY category
     /// ORDER BY embedding <=> $emb)` so the database picks the per-category
     /// nearest neighbours in one round-trip.
     ///
