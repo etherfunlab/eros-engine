@@ -29,36 +29,39 @@ pub struct Needs {
     /// `high` wants to go out, `low` wants to stay in.
     #[serde(default)]
     pub outing: NeedLevel,
-    /// `high` wants to let loose: a smoke, a drink, weed.
+    /// `high` craves what she's hooked on: a smoke, a drink, weed, a coffee.
     #[serde(default)]
     pub indulgence: NeedLevel,
 }
 
-/// Whether the persona smokes, drinks, uses weed: `art_metadata.smoking`,
-/// `alcoholic`, `drug`, each `None` when unset (spec 2026-10-28 §3).
+/// Whether the persona smokes, drinks, uses weed, drinks coffee:
+/// `art_metadata.smoking`, `alcoholic`, `drug`, `coffee`, each `None` when
+/// unset (spec 2026-10-28 §3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Habits {
     pub smoking: Option<bool>,
     pub alcoholic: Option<bool>,
     pub drug: Option<bool>,
+    pub coffee: Option<bool>,
 }
 
 impl Habits {
-    /// How many of the three are `true`.
+    /// How many of the four are `true`.
     pub fn count_true(self) -> usize {
-        [self.smoking, self.alcoholic, self.drug]
+        [self.smoking, self.alcoholic, self.drug, self.coffee]
             .into_iter()
             .filter(|h| *h == Some(true))
             .count()
     }
 
-    /// The key for what `item` is: tobacco, alcohol or weed. `None` for any
-    /// other item, or when the key is unset.
+    /// The key for what `item` is: tobacco, alcohol, weed or coffee. `None`
+    /// for any other item, or when the key is unset.
     pub fn uses(self, item: GivenItem) -> Option<bool> {
         match item {
             GivenItem::Cigarette => self.smoking,
             GivenItem::Alcohol => self.alcoholic,
             GivenItem::Herb => self.drug,
+            GivenItem::Coffee => self.coffee,
             _ => None,
         }
     }
@@ -73,6 +76,7 @@ const OUTING_DRIFT: (NeedLevel, f64) = (NeedLevel::Mid, 8.0);
 
 /// Where `indulgence` settles and how fast, by how many habits are `true`
 /// (spec 2026-10-28 §2.2): the more she uses, the sooner the urge returns.
+/// Three or four share the fastest pace.
 fn indulgence_drift(habits: Habits) -> (NeedLevel, f64) {
     match habits.count_true() {
         0 => (NeedLevel::Mid, 8.0),
@@ -177,6 +181,7 @@ mod tests {
             smoking: set(0),
             alcoholic: set(1),
             drug: set(2),
+            coffee: set(3),
         }
     }
 
@@ -385,6 +390,8 @@ mod tests {
             (habits(3), Low, 4.0, Mid),
             (habits(3), Mid, 4.0, High),
             (habits(3), High, 1000.0, High),
+            (habits(4), Low, 4.0, Mid),
+            (habits(4), Mid, 4.0, High),
         ];
         for (h, from, hours, want) in cases {
             assert_eq!(
@@ -433,14 +440,17 @@ mod tests {
         assert_eq!(Habits::default().count_true(), 0);
         assert_eq!(habits(0).count_true(), 0);
         assert_eq!(habits(2).count_true(), 2);
+        assert_eq!(habits(4).count_true(), 4);
         let h = Habits {
             smoking: Some(true),
             alcoholic: Some(false),
             drug: None,
+            coffee: Some(false),
         };
         assert_eq!(h.uses(GivenItem::Cigarette), Some(true));
         assert_eq!(h.uses(GivenItem::Alcohol), Some(false));
         assert_eq!(h.uses(GivenItem::Herb), None);
-        assert_eq!(h.uses(GivenItem::Coffee), None);
+        assert_eq!(h.uses(GivenItem::Coffee), Some(false));
+        assert_eq!(h.uses(GivenItem::Tea), None);
     }
 }

@@ -41,13 +41,13 @@ pub fn settle_action_response(
     }
 }
 
-/// How often she still takes tobacco, alcohol or weed whose habit key is
-/// `false`, of the times she would otherwise take it (spec 2026-10-28-
+/// How often she still takes tobacco, alcohol, weed or coffee whose habit key
+/// is `false`, of the times she would otherwise take it (spec 2026-10-28-
 /// outing-indulgence-needs-and-habits-design.md §3.1).
 pub const UNUSED_SUBSTANCE_ACCEPT: f64 = 1.0 / 3.0;
 
 /// Whether the habit roll refuses this turn's give: a `give` of tobacco,
-/// alcohol or weed whose key is explicitly `false`, with `roll` (uniform in
+/// alcohol, weed or coffee whose key is explicitly `false`, with `roll` (uniform in
 /// [0, 1)) at or above `UNUSED_SUBSTANCE_ACCEPT`. Rolled before the judge,
 /// so the judge can be told.
 pub fn refuses_give(event: &Event, habits: Habits, roll: f64) -> bool {
@@ -955,6 +955,7 @@ mod tests {
             smoking,
             alcoholic: None,
             drug,
+            coffee: None,
         };
         let cig = give(GivenItem::Cigarette, None);
         let no_smoke = with(Some(false), None);
@@ -970,11 +971,14 @@ mod tests {
         assert!(!refuses_give(&cig, with(None, None), 0.99));
         let weed = give(GivenItem::Herb, Some("大麻"));
         assert!(refuses_give(&weed, with(None, Some(false)), 0.99));
-        assert!(!refuses_give(
-            &give(GivenItem::Coffee, None),
-            no_smoke,
-            0.99
-        ));
+        let coffee = give(GivenItem::Coffee, None);
+        assert!(!refuses_give(&coffee, no_smoke, 0.99));
+        let no_coffee = Habits {
+            coffee: Some(false),
+            ..Habits::default()
+        };
+        assert!(refuses_give(&coffee, no_coffee, 0.99));
+        assert!(!refuses_give(&give(GivenItem::Tea, None), no_coffee, 0.99));
         let named_gift = action_msg(UserAction::Gift {
             kind: ItemKind::Item,
             name: "一条香烟".into(),
