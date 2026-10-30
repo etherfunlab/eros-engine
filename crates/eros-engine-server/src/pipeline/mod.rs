@@ -217,21 +217,29 @@ pub(super) fn parse_llm_json<T: serde::de::DeserializeOwned>(raw: &str) -> Optio
         .or_else(|| find_json_block(raw).and_then(|b| serde_json::from_str::<T>(b).ok()))
 }
 
+/// `before` is the user row driving the turn, when one is already written: the
+/// signals then cover only the user rows strictly before it, so the turn is
+/// neither counted nor read as a gap of zero. Callers that compute before
+/// writing anything pass `None`.
 pub async fn compute_signals_for_session(
     pool: &sqlx::PgPool,
     session_id: Uuid,
     affinity: &Affinity,
+    before: Option<Uuid>,
 ) -> Result<ConversationSignals, AppError> {
     // One aggregate roundtrip instead of two separate scans of the same rows.
     // Fail-open matches the previous per-query behavior: any error collapses to
     // count 0 / last_time None (→ 0.0 hours). `COUNT(*)` is never NULL;
     // `MAX(sent_at)` is NULL for an empty session.
     let (message_count, last_time): (i64, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
-        "SELECT COUNT(*), MAX(sent_at) FROM engine.chat_messages \
-             WHERE session_id = $1 AND role = 'user' \
-               AND channel IS NULL",
+        "SELECT COUNT(*), MAX(c.sent_at) FROM engine.chat_messages c \
+             WHERE c.session_id = $1 AND c.role = 'user' \
+               AND c.channel IS NULL \
+               AND ($2::uuid IS NULL OR (c.sent_at, c.id) < \
+                    (SELECT a.sent_at, a.id FROM engine.chat_messages a WHERE a.id = $2))",
     )
     .bind(session_id)
+    .bind(before)
     .fetch_one(pool)
     .await
     .unwrap_or((0, None));
@@ -331,7 +339,7 @@ mod tests {
         .unwrap();
 
         let aff = fixture_affinity(session_id, user_id, instance_id);
-        let signals = compute_signals_for_session(&pool, session_id, &aff)
+        let signals = compute_signals_for_session(&pool, session_id, &aff, None)
             .await
             .unwrap();
 
@@ -354,7 +362,7 @@ mod tests {
         .unwrap();
 
         let aff = fixture_affinity(session_id, user_id, _instance_id);
-        let signals = compute_signals_for_session(&pool, session_id, &aff)
+        let signals = compute_signals_for_session(&pool, session_id, &aff, None)
             .await
             .unwrap();
 
@@ -382,7 +390,7 @@ mod tests {
         .unwrap();
 
         let aff = fixture_affinity(session_id, user_id, instance_id);
-        let signals = compute_signals_for_session(&pool, session_id, &aff)
+        let signals = compute_signals_for_session(&pool, session_id, &aff, None)
             .await
             .unwrap();
 
@@ -390,6 +398,46 @@ mod tests {
         assert!(
             (signals.hours_since_last_message - 1.0).abs() < 0.1,
             "hours_since_last_message must track MAX(sent_at) (~1.0), got {}",
+            signals.hours_since_last_message
+        );
+    }
+
+    /// With the driving row as the anchor, the signals cover only the user
+    /// rows before it: the driving row itself, and a newer row a queued turn
+    /// can already see, are neither counted nor the gap's end.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn signals_before_the_driving_row_skip_it_and_newer_rows(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_genome_id, instance_id, session_id) = seed_session(&pool, user_id).await;
+
+        let mut ids = Vec::new();
+        for (content, ago) in [
+            ("older", "3 hours"),
+            ("driving", "5 minutes"),
+            ("newer", "1 minute"),
+        ] {
+            let id: Uuid = sqlx::query_scalar(
+                "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+                 VALUES ($1, 'user', $2, now() - $3::interval) RETURNING id",
+            )
+            .bind(session_id)
+            .bind(content)
+            .bind(ago)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            ids.push(id);
+        }
+
+        let aff = fixture_affinity(session_id, user_id, instance_id);
+        let signals = compute_signals_for_session(&pool, session_id, &aff, Some(ids[1]))
+            .await
+            .unwrap();
+
+        assert_eq!(signals.message_count, 1);
+        assert!(
+            (signals.hours_since_last_message - 3.0).abs() < 0.1,
+            "the gap runs from the newest row before the driving one (~3.0), got {}",
             signals.hours_since_last_message
         );
     }
@@ -403,7 +451,7 @@ mod tests {
         let (_genome_id, instance_id, session_id) = seed_session(&pool, user_id).await;
 
         let aff = fixture_affinity(session_id, user_id, instance_id);
-        let signals = compute_signals_for_session(&pool, session_id, &aff)
+        let signals = compute_signals_for_session(&pool, session_id, &aff, None)
             .await
             .unwrap();
 
@@ -432,7 +480,7 @@ mod tests {
         }
 
         let aff = fixture_affinity(session_id, user_id, instance_id);
-        let signals = compute_signals_for_session(&pool, session_id, &aff)
+        let signals = compute_signals_for_session(&pool, session_id, &aff, None)
             .await
             .unwrap();
 

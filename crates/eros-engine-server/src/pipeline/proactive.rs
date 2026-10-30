@@ -392,7 +392,7 @@ pub(crate) async fn greet(
     affinity.refresh_endpoints(&state.config.affinity_tuning);
     let rung = affinity.intimacy_rung();
     let traits = crate::prompt::persona_traits(g.persona);
-    let signals = compute_signals_for_session(&state.pool, g.session_id, &affinity).await?;
+    let signals = compute_signals_for_session(&state.pool, g.session_id, &affinity, None).await?;
 
     // Prompt assembly only. The event's content is the memory-recall query;
     // the nil driving id makes history fall back to newest-N.

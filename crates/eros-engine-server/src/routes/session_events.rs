@@ -651,7 +651,8 @@ pub(crate) async fn draw_event_at(
     // An offline kind is silence: it follows the ghost protection (the
     // deployment's ghosting switch and the session's message floor).
     let signals =
-        crate::pipeline::compute_signals_for_session(&state.pool, session_id, &affinity).await?;
+        crate::pipeline::compute_signals_for_session(&state.pool, session_id, &affinity, None)
+            .await?;
     if !state.model_config.pde_ghosting_enabled()
         || signals.message_count < eros_engine_core::ghost::GHOST_MIN_MESSAGES
     {

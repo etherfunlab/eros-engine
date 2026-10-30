@@ -264,6 +264,7 @@ pub(crate) fn run_group_turn(
                 &state.pool,
                 m.member_session_id,
                 &affinity,
+                None,
             )
             .await
             {
