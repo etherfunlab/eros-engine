@@ -69,7 +69,7 @@ pub struct BffAffinityDelta {
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct LifeChoiceDto {
     pub id: Uuid,
-    /// `ask_for_space`.
+    /// `ask_for_space`, `sleep_together` or `propose`.
     pub kind: String,
     /// The answers the resolution endpoint takes: `["accept", "decline"]`.
     pub options: Vec<String>,
@@ -1415,6 +1415,46 @@ mod tests {
         assert_eq!(lc["kind"], "ask_for_space");
         assert_eq!(lc["options"], json!(["accept", "decline"]));
         assert_eq!(at(&lc["asked_at"]), asked_at);
+        assert_eq!(at(&lc["expires_at"]), asked_at + Duration::hours(24));
+        assert_eq!(lc["message_id"], json!(ask.to_string()));
+    }
+
+    /// The romantic kinds ride the delta like `ask_for_space`: the route does
+    /// not read the kind. A `sleep_together` carries no `tier_gap`.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_pending_sleep_together_rides_the_delta(pool: PgPool) {
+        let (user_id, session_id, _aid, turn) = session_with_turn(&pool).await;
+        let ask: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content) \
+             VALUES ($1, 'assistant', 'ask') RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let asked_at = recent(30);
+        let choice: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.life_choices \
+               (session_id, kind, status, tier_gap, asked_at, message_id) \
+             VALUES ($1, 'sleep_together', 'pending', NULL, $2, $3) RETURNING id",
+        )
+        .bind(session_id)
+        .bind(asked_at)
+        .bind(ask)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let mut app = build_router(test_state(pool));
+        let token = mint_test_jwt(user_id);
+        let (status, body) = send_request(&mut app, req(&token, session_id)).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+
+        assert_eq!(body["event"]["event_id"], json!(turn.to_string()));
+        let lc = &body["event"]["life_choice"];
+        assert_eq!(lc["id"], json!(choice.to_string()));
+        assert_eq!(lc["kind"], "sleep_together");
+        assert_eq!(lc["options"], json!(["accept", "decline"]));
         assert_eq!(at(&lc["expires_at"]), asked_at + Duration::hours(24));
         assert_eq!(lc["message_id"], json!(ask.to_string()));
     }

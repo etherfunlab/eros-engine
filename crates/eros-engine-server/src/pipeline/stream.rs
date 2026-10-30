@@ -4794,11 +4794,12 @@ pub(crate) fn run_stream_with(
         } else {
             None
         };
-        // An ordinary message that arrives while she waits for an answer to
-        // her ask for space is the answer (spec 2026-10-19 §3.4c): the choice
-        // is ignored and the falling-out starts at this row, before the read
-        // below, so this very turn is answered with it. A give, a tip or a
-        // kiss does not answer her.
+        // An ordinary message that arrives while a choice of hers is pending
+        // answers it, before the read below, so this very turn already sees
+        // the result. Only an ask for space that goes unanswered starts a
+        // falling-out, at this row; `sleep_together` and `propose` settle at
+        // no cost (spec 2026-10-30 §4.5). A give, a tip or a kiss does not
+        // answer her.
         if user_msg.action.is_none() {
             if let Err(e) = crate::pipeline::life_choice::convert_ignored_ask(
                 &state,

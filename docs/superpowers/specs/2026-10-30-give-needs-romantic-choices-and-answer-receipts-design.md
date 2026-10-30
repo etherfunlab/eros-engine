@@ -155,7 +155,9 @@ and the engine only reads the result.
 
 **Input.** The input is the resolved `memory_scope` and `affinity_scope`
 recorded on the session's newest assistant row that carries both keys (the
-`build_metadata` bag). If that row is missing, or a value fails to parse,
+`build_metadata` bag), skipping rows whose `metadata.proactive` is
+`life_choice`: her own choice rows are generated with the engine's default
+scopes, not the caller's. If no such row exists, or a value fails to parse,
 the pair is incompatible.
 
 **Public contract.** `docs/api-reference.md` documents the criterion as the
@@ -377,7 +379,7 @@ Existing rows are all `ask_for_space` with a gap, so the check validates.
 - **Same-turn tie.** `propose` wins.
 - **Ignoring a romantic choice.** It costs nothing and writes no `fell_out`.
 - **Compatibility source.** It is the newest assistant row recording both
-  scopes.
+  scopes, skipping rows whose `metadata.proactive` is `life_choice`.
 - **`ever_had_sex`.** The new kinds don't touch it.
 - **The six cues.** They are drafts (§4.4).
 

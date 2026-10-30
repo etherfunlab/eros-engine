@@ -116,8 +116,9 @@ pub enum GreetingOccasion {
     JustOpened,
     /// A life event the persona tells about (`POST …/events`).
     Event,
-    /// What she says about her ask for space: the ask, the goodbye after an
-    /// accept, the hurt reply after a decline (`POST …/life-choices/{id}`).
+    /// What she says about a life choice, of any kind (`ask_for_space`,
+    /// `sleep_together`, `propose`): her ask, and her reply after the answer
+    /// (`POST …/life-choices/{id}`).
     LifeChoice,
 }
 

@@ -117,7 +117,7 @@ pub struct LifeChoiceRespondResponse {
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct LifeChoiceReceiptDto {
     pub id: Uuid,
-    /// `ask_for_space`.
+    /// `ask_for_space`, `sleep_together` or `propose`.
     pub kind: String,
     /// `pending`, `accepted`, `declined`, `ignored`, or `expired` for a
     /// `pending` choice past its 24 hours.
