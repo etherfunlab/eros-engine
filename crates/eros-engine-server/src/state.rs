@@ -613,8 +613,9 @@ pub struct ServerConfig {
     pub bind_addr: String,
     /// How often the dreaming sweeper wakes up to embed pending journal rows
     /// and scan idle relationships. Set to `Duration::ZERO` (env
-    /// `DREAMING_DISABLED=1`) to skip spawning the sweeper entirely — useful
-    /// for unit-test runs.
+    /// `DREAMING_DISABLED=1`) to skip spawning the sweeper entirely and keep
+    /// the `SCAN_K` path from scanning inline, so no dreaming call is made —
+    /// useful for unit-test runs.
     pub dreaming_tick: Duration,
     /// How long a relationship must have been idle since its last counted
     /// turn before the sweeper scans its pending turns (`DREAMING_IDLE_SECS`,
@@ -622,8 +623,9 @@ pub struct ServerConfig {
     pub dreaming_idle_threshold: Duration,
     /// How long a relationship's scan claim is considered fresh. Older than
     /// this and a worker treats it as crashed and re-claims the row. Should
-    /// comfortably exceed the worst-case scan (the scan call, its embeddings,
-    /// and an arc rewrite).
+    /// comfortably exceed the worst-case scan: the scan call and its one
+    /// embedding call. A live scan releases its claim before the arc rewrite
+    /// it may start; a backfill segment still holds its claim through one.
     pub dreaming_claim_stale_threshold: Duration,
     /// Opt out of voice memory ingestion (`DREAMING_VOICE_DISABLED`). Default
     /// `false` ⇒ voice turns count toward their relationship's scan and the

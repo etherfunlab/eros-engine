@@ -77,6 +77,15 @@ impl<'a> SessionArchiveRepo<'a> {
     /// its owner for the entire life of the row and there is no window in
     /// which `instance_id` alone could resolve to the wrong relationship.
     ///
+    /// The relationship scanner's products go too: the scan state (cursor,
+    /// pending count, claim), the episodes, the arc and the journal, all keyed
+    /// on `instance_id` alone, which is safe for the reason above. The state
+    /// row is deleted
+    /// first: the scanner's claim-guarded writes read it `FOR KEY SHARE`, so a
+    /// write in flight finishes before the deletes after it, and one that comes
+    /// later finds no row and writes nothing. `relationship_scan_events` stays,
+    /// counts and ids only.
+    ///
     /// `persona_instances.status` is deliberately not written: the user still
     /// owns the persona, and ownership is the client's business.
     pub async fn archive_relationship(
