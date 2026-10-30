@@ -4738,7 +4738,7 @@ pub(crate) fn run_stream_with(
             }
         };
         let signals = match super::compute_signals_for_session(
-            &state.pool, user_msg.session_id, &affinity,
+            &state.pool, user_msg.session_id, &affinity, Some(user_msg.user_message_id),
         ).await {
             Ok(s) => s,
             Err(e) => {
@@ -15270,6 +15270,112 @@ data: [DONE]\n\n";
         .await
         .unwrap();
         assert_eq!(ghost_umid, Some(umid));
+    }
+
+    /// The judge's `[信号]` line counts the user rows before the one driving
+    /// the turn, and measures the gap from the newest of them: the driving row
+    /// is already written when the stream runs, and must not read as a gap of
+    /// zero or as one more message.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_stream_judge_signals_exclude_the_driving_row(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer};
+
+        let mock = MockServer::start().await;
+        let verdict =
+            serde_json::json!({ "action": "ghost", "inner_state": "想一个人静静" }).to_string();
+        let judge_body = serde_json::json!({
+            "id": "gj", "model": "pde/judge",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": verdict}}],
+        });
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("pde/judge"))
+            .respond_with(crate::pipeline::reasoning_call::test_support::sse_completion(judge_body))
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        for i in 0..12 {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+                 VALUES ($1, 'user', $2, now() - interval '3 hours')",
+            )
+            .bind(session_id)
+            .bind(format!("prior {i}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide the action and inner_state.\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let umid = match (ChatRepo { pool: &pool })
+            .upsert_user_message_idempotent(
+                session_id,
+                "在吗",
+                "01JPDESIGNALS0000000000000",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let _: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "在吗".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                image_url: None,
+                image: None,
+                quote: Default::default(),
+                user_locale: Default::default(),
+                action: None,
+                outfit: None,
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        let reqs = mock.received_requests().await.unwrap();
+        let judge_sent = reqs
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .find(|b| b.contains("pde/judge"))
+            .expect("the judge ran");
+        assert!(
+            judge_sent.contains("message_count=12 hours_since_last_message=3.0"),
+            "signals must cover the 12 rows before the driving one; got {judge_sent}",
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

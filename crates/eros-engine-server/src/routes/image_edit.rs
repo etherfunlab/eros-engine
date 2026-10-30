@@ -382,6 +382,7 @@ async fn generate_reply_text(
         &state.pool,
         session_id,
         &affinity,
+        None,
     )
     .await
     {
