@@ -19,9 +19,10 @@ Accepted on `POST /comp/chat/{session_id}/message/stream`, on
 `POST /v2/comp/session/{session_id}/message/async`, where the traits ride the
 queue and are re-validated in the worker, on
 `POST /v2/comp/group/{group_id}/message/stream`, where they apply to every
-speaker's reply, on `POST /v2/comp/session/{session_id}/open` and
-`POST /v2/comp/session/{session_id}/events`, where they apply to the message the
-call generates, and on
+speaker's reply, on `POST /v2/comp/session/{session_id}/open`,
+`POST /v2/comp/session/{session_id}/events` and
+`POST /v2/comp/session/{session_id}/life-choices/{choice_id}`, where they apply
+to the message the call generates, and on
 `POST /v2/comp/session/{session_id}/message/{message_id}/image/edit`, where
 they apply to the `reply_with_text` text half.
 

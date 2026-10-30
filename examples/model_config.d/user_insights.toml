@@ -8,7 +8,7 @@
 # reads it at GET /v2/comp/instance/{instance_id}/insight/user.
 #
 # COST: two extra OpenRouter calls per produced message per turn, on top of the
-# human and character chains — six insight-side calls per produced message in
+# human and character chains — five insight-side calls per produced message in
 # total. It also grows engine.user_insights_snapshot by one row per turn that
 # yields insights, with no retention policy yet (v1.6.0).
 #

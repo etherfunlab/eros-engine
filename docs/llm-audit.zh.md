@@ -2,7 +2,7 @@
 
 eros-engine 在流式 chat 路由上暴露一个不透明的 OpenRouter 透传层。
 三个 caller 提供的字段原样发给
-`openrouter.ai/api/v1/chat/completions`，三个 OpenRouter 的 wire 回显
+`openrouter.ai/api/v1/chat/completions`，两个 OpenRouter 的 wire 回显
 在 SSE `done` 帧里带回来，一个 deployer 声明的 `headers` 表会给每次出站
 调用都带上 app-attribution headers。
 
@@ -52,15 +52,14 @@ message 行。
 
 ## Outbound：SSE `done` 帧里的 `usage` 回显
 
-流式端点的 `done` 帧带三个可选字段：
+流式端点的 `done` 帧带两个可选字段：
 
 | 字段            | 类型      | 含义                                                                                       |
 |-----------------|-----------|--------------------------------------------------------------------------------------------|
-| `usage`         | `object?` | OpenRouter 的 `usage` 块原样（tokens / cost / cached / reasoning）。引擎不展平。           |
+| `usage`         | `object?` | 解析后的 OpenRouter `usage` 块：`prompt_tokens`、`completion_tokens`、`total_tokens`，provider 给了 `cost` 时再加 `cost`。 |
 | `generation_id` | `string?` | OpenRouter `response.id`。之后可以用它查 `/api/v1/generation` 拿完整 metadata。          |
-| `model`         | `string?` | OpenRouter 实际服务的模型。`fallback_model` 命中时，这里是 fallback。                    |
 
-这三个字段出现在 `done` 帧（`final` 之前的 per-turn 终止帧）。后台路径
+这两个字段出现在 `done` 帧（`final` 之前的 per-turn 终止帧）。实际服务的模型在更早的 `meta` 帧里，字段是 `model`（[接口参考](api-reference.zh.md#post-compchatsession_idmessagestream)）。后台路径
 （dreaming / post_process）**不**把它们返回给 client。
 
 ### 从响应里剔除字段
@@ -328,8 +327,8 @@ material 会直接拒绝加载，而不是像以前那样在构造时 warn-and-d
   存储之间做对账时，要按 payload key 与 `human_insights` 列集合的交集比较，
   不能直接判等。自
   migration `0059` 起，上面这些调用——加上 `chat_voice`、`chat_product_qa`、
-  `chat_input_filter`、`chat_output_filter`，以及此前一行都不写的那五个
-  后台 sweeper——现在也都会在 `engine.llm_generations` 里各落一行；见上面的
+  `chat_input_filter`、`chat_output_filter`，以及此前一行都不写的后台任务（`world_director`、
+  `world_stories_director`、`world_comment`、`world_reply`、`dreaming_scan`、`arc_rewrite`）——现在也都会在 `engine.llm_generations` 里各落一行；见上面的
   [LLM 生成记录表](#llm-生成记录表)。
 - **不 hash。**引擎不会变换 `user` —— caller 负责送 hash。
 - **不消毒。**`metadata` 的 key / value 只检查 size / shape，不查内容。
@@ -615,8 +614,9 @@ ORDER BY scans DESC;
 因为审计表的意义正在于线索比它指向的东西活得久。两张表都保存着原文用户文本
 （`chat_images_events.inputs.latest_user_msg` / `.recent_scene`；
 `chat_vision_events.image_url`，往往是带签名、带 token 的 URL）。
-**deployer 必须把这两张表纳入自己的用户数据擦除流程**——引擎不会替你做这件
-事；擦除策略是 deployer 的责任，不是引擎的 —— 删除账号同样不会波及这两张表。
+删除账号同样不会波及这两张表：抹除路由（`POST /svc/v1/users/{user_id}/erase`，
+挂在 `USER_ERASE_SECRET` 之下）会清空这些文本、保留行（[Insights → 抹除](insights.zh.md#抹除)），
+所以 deployer 的擦除流程要调用它。
 两张表也都没有配套的清理策略：
 只要部署一直跑着，行数就会无限增长，如果这对你的部署有影响，请自行规划
 分区方案或清理 cron。

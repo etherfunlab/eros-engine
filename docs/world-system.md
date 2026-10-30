@@ -48,7 +48,9 @@ World Memories turns on only when **all three** hold:
    completely inert: no sweeper, no per-turn DB queries.
 2. The owner has a row in `engine.world_enrollments`. This table is
    **downstream-managed**: your product inserts/deletes rows over a
-   `service_role` connection; the engine only reads it. Row present = enabled.
+   `service_role` connection; the engine only reads it, except that the user
+   erase route deletes the owner's row with the rest of their world data. Row
+   present = enabled.
 3. `WORLD_DISABLED` is not set.
 
 World Town additionally needs **all** of:

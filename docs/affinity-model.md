@@ -235,8 +235,9 @@ simply re-derive with the current lines and decay. The old rule-delta
 fallback is retired.
 
 A ghost the PDE decides never reaches `persist_with_event`: only
-`ghost_streak` / `total_ghosts` / `last_ghost_at` move. `record_ghost` writes an
-all-zero `effective_deltas`; no axis moves at all. The ghost the engine imposes
+`ghost_streak` / `total_ghosts` / `last_ghost_at` and `updated_at` move.
+`record_ghost` writes an all-zero `effective_deltas`; no axis moves at all, but
+the reset `updated_at` restarts the decay clock of [Time](#time). The ghost the engine imposes
 during an offline stretch moves none of them (see
 [ghost-mechanics.md](ghost-mechanics.md#ghosting-the-engine-imposes)).
 
@@ -282,8 +283,8 @@ Nothing here is a chat turn: no judge runs.
   transaction that resolves the choice, so a rolled-back resolution leaves no
   drop. On accept the drop is the state she comes back to; nothing further
   happens at return.
-- **Its event row.** One row of its own non-turn `event_type`, `life_choice`
-  (migration `0077` widened the type check by this one value). `deltas` and
+- **Its event row.** One row of its own non-turn `event_type`, `life_choice`.
+  `deltas` and
   `effective_deltas` carry the same figures, because the drop is the whole raw
   change; `label_changes`, `effective_line_deltas` and the two state snapshots
   record the tier move. `context` holds `life_choice` (`accept` | `decline`)
@@ -439,9 +440,8 @@ story.
 
 ### Generated columns
 
-Migration `0048` redefines `bond` and `chemistry` as Postgres `GENERATED
-ALWAYS … STORED` columns over the line axes (drop + re-add: Postgres cannot
-alter a generation expression in place):
+`bond` and `chemistry` are Postgres `GENERATED ALWAYS … STORED` columns over
+the line axes:
 
 ```sql
 bond      GENERATED ALWAYS AS (LEAST(1, GREATEST(0, (trust    + intrigue) / 2))) STORED
@@ -455,7 +455,7 @@ in sync.
 ### Endpoint levels
 
 `warmth_grade`/`patience_grade` are `SMALLINT NOT NULL DEFAULT 2`, checked
-`1..=3` (migration `0048`): these are the authoritative judge levels. The
+`1..=3`: these are the authoritative judge levels. The
 `warmth`/`patience` cache columns are backfilled with the level-2
 derivation over each row's lines.
 
@@ -484,7 +484,7 @@ Each delta turn appends one row to `engine.companion_affinity_events`:
   separation. A life choice's own `life_choice` row has a `context` of
   `life_choice` and `choice_id` instead (see
   [above](#life-choice-drops-and-the-slowdown)).
-- `user_message_id` (migration `0056`) — a real FK to `chat_messages`,
+- `user_message_id` — a real FK to `chat_messages`,
   `ON DELETE SET NULL`. `NULL` on `proactive`/`time_decay` rows and on
   pre-migration rows; never backfilled. Assistant rows point at the same
   message through `chat_messages.user_message_id`, so the replies for an
@@ -501,7 +501,7 @@ Each delta turn appends one row to `engine.companion_affinity_events`:
 
 - `effective_line_deltas` — the exact per-turn bond/chemistry delta, served
   as `effective_deltas_computed`.
-- `state_after` — the whole post-turn vector (migration `0049`).
+- `state_after` — the whole post-turn vector.
   `state_before` exists but is not served; replay is a direct query
   against `engine.companion_affinity_events`.
 
@@ -610,7 +610,7 @@ env override could break.
   `length_score` (see [`affinity.rs` vs `scope.rs`](#affinityrs-vs-scopers))
 - `crates/eros-engine-store/src/affinity.rs` — `AffinityRepo`
   (persist_with_event, record_ghost, persist_life_choice_drop_in_tx,
-  last_judged_patiences), migrations 0048–0049, 0077
+  last_judged_patiences); its tables are in `migrations/0000_baseline.sql`
 - `crates/eros-engine-store/src/life_choices.rs` — `LifeChoiceRepo`
   (the choice rows; `growth_slowed` derives the slowdown window)
 - `crates/eros-engine-server/src/pipeline/post_process.rs` — LLM

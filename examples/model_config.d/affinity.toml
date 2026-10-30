@@ -20,8 +20,8 @@ max_tokens = 400
 # Affinity feeling summarizer (spec 2026-09-03-affinity-feeling-clause-design.md).
 # Absent section = feature off: companion_affinity.feeling_clause stays NULL and
 # the [feelings] prompt block never renders. When present, runs after the
-# post-process affinity write on movement turns only (any judge grade ≥ 1, an
-# endpoint level ≠ 2, a ghost, or a refused action's tier drop) and rewrites the session's first-person
+# post-process affinity write on movement turns only (any nonzero judge grade,
+# an endpoint level ≠ 2, or a refused action's tier drop) and rewrites the session's first-person
 # feeling clause from band labels + recent judge reasons.
 #
 # NOTE: this task takes NO filter_prompt. The summarizer's prompt is

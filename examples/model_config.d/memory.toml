@@ -1,4 +1,4 @@
-# Dreaming scan (Memory 2.0). One call per relationship segment returns three
+# Dreaming scan. One call per relationship segment returns three
 # things: profile memories (written to companion_memories as profile-layer rows),
 # one episode summary, and 0-3 dated journal moments. The server sends the
 # segment transcript as a separate user message, one line per message prefixed
@@ -84,7 +84,7 @@ journal 的铁律：
 不得输出说明、Markdown、代码围栏或任何其他文本。
 """
 
-# Relationship-arc rewrite (Memory 2.0). The prompt is engine-owned, so this
+# Relationship-arc rewrite. The prompt is engine-owned, so this
 # block carries only model and sampling parameters — there is no filter_prompt.
 # The engine rejects any arc over 900 characters and keeps the previous
 # version, so max_tokens must sit well above that: a tight token limit

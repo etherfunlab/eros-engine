@@ -726,7 +726,7 @@ database as `serve`:
 - `docs/deploying.md` + `.zh.md`: env changes, backfill command.
 - `docs/llm-audit.md` + `.zh.md`: `relationship_scan_events`.
 - `docs/api-reference.md` + `.zh.md`: archive semantics, erase report.
-- `.env.example`; `docs/migrating/v2-6-0-memory-2-0.md`.
+- `.env.example`; `docs/migrating/v2-6-0-memory.md`.
 
 ## 14. Left to the builder
 

@@ -130,8 +130,8 @@ proxies are not used, and only https is allowed. Host names are resolved
 first; loopback, private, link-local, CGNAT, unique-local, unspecified and
 multicast addresses (IPv4-mapped and NAT64 forms included) are refused, and
 the connection goes to an address that passed. A refused host fails its hop
-as a `transport` gateway error. `BYOK_ALLOW_PRIVATE_NETWORK` lifts all of
-this.
+as a `transport` gateway error. `BYOK_ALLOW_PRIVATE_NETWORK` lifts the
+https-only rule and the address guard; redirects and proxies stay off.
 
 The engine also bounds how much it reads from an end user's endpoint:
 

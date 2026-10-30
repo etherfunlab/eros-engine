@@ -549,8 +549,9 @@ Two kinds of turn are exempt and take the normal path:
   which needs no phone, so it is answered. Its `正在经历` line still lists the offline stretch.
 - **A forced-image turn** (`image.force = true`), which is always an image.
 
-With the ghosting switch off, a stretch that is under way silences nothing; turns take the
-normal path and the `正在经历` line still lists it. The rest of the mechanics are in
+With the ghosting switch off, a stretch that is under way silences no turn; turns take the
+normal path and the `正在经历` line still lists it. `/open` still returns no greeting while it
+lasts. The rest of the mechanics are in
 [ghost-mechanics.md](ghost-mechanics.md#ghosting-the-engine-imposes).
 
 **Afterwards.** The explanation is derived, not flagged. In a session `S`, an offline event
@@ -959,8 +960,8 @@ machinery](#offline-kinds) wholesale:
 - It is instance-scoped like every `persona_events` row: she has one life, and taking space
   means her phone is down everywhere.
 
-With the ghosting switch off it silences nothing, like any offline stretch; the drop, the
-slowdown and the return line do not depend on the switch. During a separation a message only
+With the ghosting switch off it silences no turn, like any offline stretch, though `/open`
+still returns `null`; the drop, the slowdown and the return line do not depend on the switch. During a separation a message only
 ghosts and never converts any pending ask.
 While it lasts, `正在经历` and the exempt action turns read it as 说好暂时分开.
 

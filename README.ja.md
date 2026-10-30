@@ -17,7 +17,7 @@
 
 土台となるのは次の 9 つです。
 
-- 🧠 **2 層の記憶** — 安定したユーザー情報と、共有した出来事、過去への言及、続きのある話題をそれぞれ保持します。→ [Memory layers](docs/memory-layers.md)
+- 🧠 **2 層の記憶** — 安定したユーザー情報に加えて、関係ごとの物語を保持します。書き直され続けるアーク、日付つきのエピソード、そして記念日に戻ってくる出来事のジャーナルです。→ [Memory layers](docs/memory-layers.md)
 - 💞 **変化する親密度** — 6 つの関係軸が段階評価にもとづく減衰付きの書き込みで動き、時間とともに減衰します。口調や会話の深さ、返信するかどうかにも影響します。→ [Affinity model](docs/affinity-model.md) · [Ghost mechanics](docs/ghost-mechanics.md)
 - 🎭 **Persona Decision Engine（PDE）** — 生成前に、そのターンの行動と内面状態を選びます。標準はルールベースで、任意の LLM judge はペルソナの基本的な欲求も評価し、その推論をクライアントへストリーミングできます。→ [Model config](docs/model-config.md)
 - 🧩 **構造化されたユーザー理解** — ユーザーに関する原子的な事実を台帳に記録し、そこから検索可能なプロフィールを定期的に導出します。導入体験、パーソナライズ、分析などに活用できます。任意の keyset エクスポートにより、ダウンストリームは読み取り専用のミラーを保て、1 回の呼び出しでエンジンが導出したそのユーザーのデータをすべて消去できます。→ [Insights](docs/insights.md) · [API reference](docs/api-reference.md)
@@ -88,7 +88,7 @@ Postgres と `.env` は利用者側で用意してください。同じ `docker/
 - [Architecture](docs/architecture.md) — crate の境界、処理段階、データフロー。
 - [Affinity model](docs/affinity-model.md) — 関係軸、段階評価によるスコアリング、減衰、関係ラベル。
 - [Ghost mechanics](docs/ghost-mechanics.md) — コンパニオンが沈黙する条件と理由。
-- [Memory layers](docs/memory-layers.md) — プロフィール記憶と関係記憶、embedding、検索。
+- [Memory layers](docs/memory-layers.md) — プロフィール記憶と関係記憶、dreaming、embedding、検索。
 - [Group chat](docs/group-chat.md) — 最大 3 人のペルソナのグループ、ディレクター、話者のリレー。
 - [World system](docs/world-system.md) — 実験的な World Memories、World Town、World Stories のシミュレーション。
 - [Model config](docs/model-config.md) — タスク、モデル選択、フォールバック、`[providers]` による複数提供元へのルーティング。

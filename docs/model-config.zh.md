@@ -120,11 +120,11 @@ chat    = "https://proxy.internal/v1/chat/completions"
 headers = { "X-Team" = "companion", "X-Env" = "prod" }
 ```
 
-每个条目都是一张表，最多三个 key——`chat`（OpenAI 兼容的
+每个条目都是一张表，最多四个 key——`chat`（OpenAI 兼容的
 chat-completions URL）、`embeddings`（OpenRouter 兼容的 embeddings
 URL，wire 形态见
 [`https://openrouter.ai/docs/api_reference/embeddings`](https://openrouter.ai/docs/api_reference/embeddings)）、
-以及 `headers`（原样发到该条目所有端点的每个请求上）。**字符串值会被拒绝**：
+`headers`（原样发到该条目所有端点的每个请求上），以及 `body`（见下文的规则）。**字符串值会被拒绝**：
 0.9.4 之前的写法（`venice = "https://…"`）已彻底移除、无兼容层，启动报错
 会指出正确的表写法。适用 `deny_unknown_fields`——未知 key、空表、空
 URL 字符串同样拒绝加载。
@@ -375,7 +375,7 @@ filter_prompt = "..."            # any field is optional; falls back to the defa
 **`chat_output_filter` 推荐模型：**
 
 - **Primary**：`openai/gpt-5.4-nano`——速度快，过滤后的输出稳定。
-- **不要**使用 `openai/gpt-4.1-nano` 作为 filter 模型——根据实际测试，它会返回类似 `"对不起，无法满足你的要求"` 的拒绝文本和 HTTP 200；引擎无法将其与成功的过滤改写区分，因此 fail-open 路径不会触发，用户会看到拒绝文本。
+- **不要**使用 `openai/gpt-4.1-nano` 作为 filter 模型——根据实际测试，它会返回类似 `"对不起，无法满足你的要求"` 的拒绝文本和 HTTP 200。下文的有效性检查会拦下它们并换下一个模型，所以每次拒绝都白白多花一跳。
 - **推荐 fallback**：`google/gemini-3.1-flash`——成功率高；失败时会返回正确的错误响应（非 200），使引擎的 fail-open 路径生效并输出原始回复。
 - **节省成本的 fallback**：`zhipuai/zlm-4.7-flash`——成本更低，失败模式与 gemini-3.1-flash 类似。
 - **不要**使用 `anthropic/claude-haiku-4.5` 作为 filter——它对 NSFW 输入的容忍度（非常适合 extraction）并未延伸至输出；输出侧的安全对齐足够严格，导致 filter LLM 经常完全拒绝生成改写文本。
@@ -424,7 +424,7 @@ Per-tier 子表（`[tasks.chat_output_filter.tiers.<tier>]`）可以覆盖 `mode
 [api-reference.zh.md](api-reference.zh.md#post-compchatsession_idmessagestream)。
 这套攒字与顶替都是内部机制；客户端体验不到过滤轮次和普通流式回复有什么区别。
 
-**Fail-open：**如果 filter LLM 调用超时或返回错误，引擎会原样交付**原始**回复（filter 绝不会阻塞 chat 响应）。
+**Fail-open：**链上每个模型有 15 秒。超时、出错，或没通过有效性检查（回复为空、`finish_reason = content_filter`、前 120 个字符里出现拒绝用语，或总长不足 80 个字符）的尝试会换下一个模型；整条链用完时，引擎原样交付**原始**回复（filter 绝不会阻塞 chat 响应）。所以不足 80 个字符的回复总是不经过滤送出。
 
 #### 存储和显示的内容
 
@@ -515,7 +515,7 @@ BYOK hop 使用其请求中 `byok` 块的 `output_regex` 规则，而不是这�
 
 #### `[tasks.chat_input_filter]` 字段
 
-复用标准任务结构：`model`、`fallback`、`retry_depth`（默认 1）、`temperature`、`max_tokens`、`filter_prompt`。`trigger`、`timing`、`tiers` 和 `allow_traits` 会被忽略（input filter 没有 trigger、timing 或 tier）。
+复用标准任务结构：`model`、`fallback`、`retry_depth`（默认 1）、`temperature`、`max_tokens`、`filter_prompt`。`trigger`、`timing` 和 `allow_traits` 会被忽略（input filter 没有 trigger 或 timing）；`tiers` 块会拒绝启动，因为 tier 块只允许出现在 `chat_companion` 和 `chat_output_filter` 上。
 
 ## 任务名
 
@@ -532,7 +532,7 @@ BYOK hop 使用其请求中 `byok` 块的 `output_regex` 规则，而不是这�
 | `group_director` | `pipeline::group`，通过 `resolve_group_director()`（群聊导演：一次流式调用为群聊轮次选出发言者；缺失 ⇒ 所有成员按加入顺序依次发言；任务块存在但 `filter_prompt` 为空白则拒绝启动） | live（opt-in） |
 | `chat_product_qa` | `pipeline::stream`，通过 `resolve_product_qa()`（PDE `product_qa` 动作的出戏产品问答执行器；任务块缺失或 `filter_prompt` 为空白时关闭；还需要 LLM PDE 已启用） | live（opt-in） |
 | `affinity_evaluation` | `pipeline::post_process`（每轮好感度裁决——四个档位线轴加 warmth/patience 两个 1..3 绝对档，由引擎侧换算；每个 Reply 轮次后以 fire-and-forget 方式运行；**不接受 `filter_prompt`** —— 该 prompt 由引擎持有，设置该键会拒绝启动——**任何写法都算，包括显式留空**。与这里其它任务不同，空白在这里不等于"关闭"，请直接不写这个键。见 issue #210） | live |
-| `affinity_summary` | `pipeline::post_process::summarize_feeling`（改写 `companion_affinity.feeling_clause`——即 `[feelings]` 块的第一人称叙述——依据档位标签与近期判官理由；仅在好感度写入之后、"移动回合"上运行（任意判官档位有变化、端点档位偏离基线，ghost，或动作被拒绝而降档），且仅当本次请求确实注入了好感度轴；按当轮请求计费给当前用户，不是 sweeper。**不接受 `filter_prompt`**——该 prompt 由引擎持有，与 `affinity_evaluation` 同样处理，设置该键会拒绝启动。块缺失 ⇒ `feeling_clause` 保持 `NULL`，`[feelings]` 永不渲染） | live（opt-in） |
+| `affinity_summary` | `pipeline::post_process::summarize_feeling`（改写 `companion_affinity.feeling_clause`——即 `[feelings]` 块的第一人称叙述——依据档位标签与近期判官理由；仅在好感度写入之后、"移动回合"上运行（任意判官档位不为零、端点档位偏离基线，或动作被拒绝而降档；ghost 轮次不会进入 post-process），且仅当本次请求确实注入了好感度轴；按当轮请求计费给当前用户，不是 sweeper。**不接受 `filter_prompt`**——该 prompt 由引擎持有，与 `affinity_evaluation` 同样处理，设置该键会拒绝启动。块缺失 ⇒ `feeling_clause` 保持 `NULL`，`[feelings]` 永不渲染） | live（opt-in） |
 | `character_insight_extraction` | `pipeline::post_process`（角色链 stage 1 —— 实验特性 —— 针对 AI **角色**的逐轮事实挖掘，是 `insight_extraction` 人类侧挖掘的镜像。持有 prompt，与 `insight_extraction` / `dreaming_scan` 共用同一个必填-`filter_prompt` 闸门。这个块是整条链（两个 stage）的总开关——任务块缺失即关闭） | experimental（opt-in） |
 | `character_insight_structuring` | `pipeline::post_process`（角色链 stage 2 —— 实验特性 —— 把 stage 1 挖掘出的事实加上已有的 `character_insights` 行，转成类型化的十列对象。**仅参数，不接受 `filter_prompt`** —— 它的 prompt 写在 `prompt.rs` 里，必须与它要填的 `character_insights` 列保持同步，所以设置该键会拒绝启动，**任何写法都算，包括显式留空**——与 `affinity_evaluation` 同样处理。块缺失时 stage 2 会退回到 stage 1 的模型/预算，绝不退到全局默认） | experimental（opt-in） |
 | `user_insight_extraction` | `pipeline::post_process`（用户链 stage 1 —— 实验特性 —— 针对真人**用户**的逐轮事实挖掘，但按关系分开，而不是全局的 `insight_extraction`。持有 prompt，与 `insight_extraction` / `character_insight_extraction` / `dreaming_scan` 共用同一个必填-`filter_prompt` 闸门。这个块是整条链的总开关——任务块缺失即关闭） | experimental（opt-in） |
@@ -550,11 +550,13 @@ BYOK hop 使用其请求中 `byok` 块的 `output_regex` 规则，而不是这�
 
 只有当引擎确实在某处调用 `model_config.resolve("<name>", ...)` 时，`[tasks.<name>]` 条目才有意义。当前调用点如下：
 
-- `crates/eros-engine-server/src/pipeline/group_director.rs` → `group_director`，通过 `resolve_group_director()`（群聊导演，opt-in）
-- `crates/eros-engine-server/src/pipeline/handlers.rs` → `chat_companion`、`chat_output_filter`
+- `crates/eros-engine-server/src/pipeline/group.rs` → `group_director`，通过 `resolve_group_director()`（群聊导演，opt-in）；`chat_output_filter`，通过 `resolve_output_filter()`，每位发言者各一次
+- `crates/eros-engine-server/src/pipeline/handlers.rs` → `chat_companion`
 - `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`、`affinity_evaluation`、`affinity_summary`、`character_insight_extraction`、`character_insight_structuring`、`user_insight_extraction`、`user_insight_structuring`
 - `crates/eros-engine-server/src/pipeline/profile_rebuild.rs` → `profile_rebuild`，通过 `resolve_profile_rebuild()`（按计划的画像重建）
-- `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision`，通过 `run_stream` 内的 `run_pde_decision`（仅当设置了 `filter_prompt`）；`chat_image_prompt_compose`，通过 `resolve_image_prompt_compose()`（出图 prompt 合成器，图片轮次必需，仅在图片轮次按需解析）；`chat_vision`，通过 `resolve_vision()`（视觉预处理阶段，opt-in）；`chat_product_qa`，通过 `resolve_product_qa()`（产品问答执行器，opt-in）；`chat_input_filter`，通过 `resolve_input_filter()`（输入改写，opt-in）
+- `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision`，通过 `run_stream` 内的 `run_pde_decision`（仅当设置了 `filter_prompt`）；`chat_image_prompt_compose`，通过 `resolve_image_prompt_compose()`（出图 prompt 合成器，图片轮次必需，仅在图片轮次按需解析）；`chat_vision`，通过 `resolve_vision()`（视觉预处理阶段，opt-in）；`chat_product_qa`，通过 `resolve_product_qa()`（产品问答执行器，opt-in）；`chat_input_filter`，通过 `resolve_input_filter()`（输入改写，opt-in）；`chat_output_filter`，通过 `resolve_output_filter()`
+- `crates/eros-engine-server/src/routes/voice.rs` → `chat_voice`，通过 `resolve_voice()`
+- `crates/eros-engine-server/src/pipeline/world.rs`、`story.rs`、`world_town.rs` → `world_director`、`world_stories_director`、`world_comment`、`world_reply`（world 各 sweeper，opt-in）
 - `crates/eros-engine-server/src/pipeline/dreaming/scan.rs` → `dreaming_scan`，通过 `resolve_dreaming_scan()`；`arc_rewrite`，通过 `resolve_arc_rewrite()`（关系扫描和它发起的弧线改写；入口有三个：待扫轮数到 20 时的 post-process、dreaming 清扫器、`backfill-dreaming` 子命令）
 - `crates/eros-engine-server/src/pipeline/proactive.rs` → `chat_image_prompt_compose`，通过 `build_delegated_image_prompt_for`（`taking_selfie` 事件的图，events 请求带 `image` 时；审计 `source = event`）
 - `crates/eros-engine-server/src/routes/image_edit.rs` → `chat_image_edit_compose`，通过 `resolve_image_edit_compose()`（图片-EDIT 合成器，编辑端点每次请求都会解析；编辑块缺失时回退到 `[tasks.chat_image_prompt_compose]` 的模型链——详见下文）
@@ -891,8 +893,8 @@ model = "voyage-4-lite"                       # ≡ "voyage-4-lite@voyage"
 #model_write = "voyage-4"        # 存储路径：embed_document(s)，input_type "document"
 ```
 
-**维度固定为 512，没有配置开关。** pgvector 的三个列都是
-`VECTOR(512) NOT NULL`，client 在 wire 上请求的也是 512，且每次响应都会
+**维度固定为 512，没有配置开关。** pgvector 的四个列都是
+`VECTOR(512)`（除 `relationship_journal.embedding` 外都是 `NOT NULL`：引擎写入的纪事行要等清扫器补向量），client 在 wire 上请求的也是 512，且每次响应都会
 做长度校验。以前 `[tasks.<name>]` 上有一个 `dimensions` 字段——它从未被
 消费，现已移除；已有配置里残留的 `dimensions = 512` 行，现在只是一个被
 静默忽略的未知 key（和其他过期 key 一样，serde 直接忽略）。
@@ -1105,7 +1107,7 @@ model = { "x-ai/grok-4.20" = 0.8, "z-ai/glm-4.7-flash" = 0.2 }  # weighted rando
 以下承诺立于 `0.x` 期间，并**原样延续到 `1.x`**。在 `1.x` 期间，OSS 引擎承诺：
 
 1. **不删除字段。** `[defaults]` 和 `[tasks.<name>]` 中现有的字段名不会消失。
-   （目前的例外，均已在上文记录：`[tasks.embedding].dimensions`——已移除，
+   （目前的例外，均已在上文记录：`[tasks.*].reasoning`——已移除，残留 key 会拒绝启动并指出取代它的 body 规则；`[tasks.embedding].dimensions`——已移除，
    现在是被静默忽略的未知 key；`[defaults].ignore_providers` /
    `.provider_sort`——已移除，残留 key 会拒绝启动并给出迁移提示。）
 2. **不重命名字段。** `fallback` 不会变为 `fallback_model`，`model` 不会变为 `primary_model`，以此类推。
@@ -1160,7 +1162,7 @@ model = { "x-ai/grok-4.20" = 0.8, "z-ai/glm-4.7-flash" = 0.2 }  # weighted rando
 - **Voyage 自己的 base URL**——原生 Voyage wire 始终打到 Voyage 的官方端点；只有模型 id 可以配置，通过 `[tasks.embedding]`。要完全绕开 Voyage，改用 `@openrouter` 或自定义 `[providers]` 后缀。
 - **PDE 决策（默认路径）**——未设置 `filter_prompt` 时，`eros-engine-core/src/pde.rs` 中的规则引擎无条件运行。设置 `[tasks.pde_decision].filter_prompt` 可激活 opt-in LLM 判断器；此时规则引擎充当 fallback + 硬安全 guardrail。
 - **OpenRouter API key**——直接从 `OPENROUTER_API_KEY` 读取，而非从配置文件读取。
-- **每次调用的 streaming / response format 标志**——在 `OpenRouterClient` 中固定。
+- **每次调用的 streaming**——在 `OpenRouterClient` 中固定。JSON-schema 的 `response_format` 是唯一的例外：`structured_output` 可以按任务关掉它（见上文）。
 
 ## 完整示例：基于 tier 的解析
 

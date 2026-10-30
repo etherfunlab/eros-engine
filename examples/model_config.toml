@@ -13,9 +13,9 @@
 #
 # ── Custom providers (optional) ──────────────────────────────────────────────
 # Route model slugs to your own endpoints. Each entry is a table with up to
-# three keys — `chat` (an OpenAI-compatible chat-completions URL), `embeddings`
-# (an OpenRouter-compatible embeddings URL), and `headers` (sent verbatim on
-# every request to this entry's endpoints):
+# four keys — `chat` (an OpenAI-compatible chat-completions URL), `embeddings`
+# (an OpenRouter-compatible embeddings URL), `headers` (sent verbatim on every
+# request to this entry's endpoints), and `body` (rules below):
 #
 #   [providers.venice]
 #   chat    = "https://api.venice.ai/api/v1/chat/completions"
@@ -218,9 +218,9 @@ model_name_display_override = true
 # Primary: openai/gpt-5.4-nano — fast, stable filtered output.
 #
 # DO NOT use openai/gpt-4.1-nano as the filter model — it empirically returns
-# "对不起，无法满足你的要求"-style refusals with HTTP 200, which the engine
-# cannot distinguish from a successful filtered rewrite, so the fail-open path
-# never triggers and the user sees the refusal text.
+# "对不起，无法满足你的要求"-style refusals with HTTP 200. The engine's validity
+# gate catches them and walks to the next model, so each refusal costs a wasted
+# hop.
 #
 # Recommended fallback: google/gemini-3.1-flash — high success rate; when it
 # does fail it surfaces a proper error response (non-200), letting the engine's
@@ -538,8 +538,8 @@ max_tokens = 1200
 # the injected history window (docs/deploying.md -> Operational notes).
 # Downstream also reads the row at GET /comp/instance/{instance_id}/profile.
 #
-# COST: two extra OpenRouter calls per produced message per turn — roughly
-# doubles insight-side spend. It also grows engine.character_insights_snapshot
+# COST: two extra OpenRouter calls per produced message per turn, on top of the
+# human chain's one. It also grows engine.character_insights_snapshot
 # by one row per turn that yields insights (apply_extraction writes a snapshot
 # on every applied call) — the human side's equivalent is a daily sweeper, so
 # this is far more rows for the same information, and there is no retention
@@ -621,7 +621,7 @@ max_tokens = 600
 # reads it at GET /v2/comp/instance/{instance_id}/insight/user.
 #
 # COST: two extra OpenRouter calls per produced message per turn, on top of the
-# human and character chains — six insight-side calls per produced message in
+# human and character chains — five insight-side calls per produced message in
 # total. It also grows engine.user_insights_snapshot by one row per turn that
 # yields insights, with no retention policy yet (v1.6.0).
 #
@@ -676,7 +676,7 @@ fallback = ["deepseek/deepseek-v4-flash","google/gemini-3.1-flash-lite"]
 temperature = 0.2
 max_tokens = 600
 
-# Dreaming scan (Memory 2.0). One call per relationship segment returns three
+# Dreaming scan. One call per relationship segment returns three
 # things: profile memories (written to companion_memories as profile-layer rows),
 # one episode summary, and 0-3 dated journal moments. The server sends the
 # segment transcript as a separate user message, one line per message prefixed
@@ -762,7 +762,7 @@ journal 的铁律：
 不得输出说明、Markdown、代码围栏或任何其他文本。
 """
 
-# Relationship-arc rewrite (Memory 2.0). The prompt is engine-owned, so this
+# Relationship-arc rewrite. The prompt is engine-owned, so this
 # block carries only model and sampling parameters — there is no filter_prompt.
 # The engine rejects any arc over 900 characters and keeps the previous
 # version, so max_tokens must sit well above that: a tight token limit
@@ -874,8 +874,8 @@ max_tokens = 400
 # Affinity feeling summarizer (spec 2026-09-03-affinity-feeling-clause-design.md).
 # Absent section = feature off: companion_affinity.feeling_clause stays NULL and
 # the [feelings] prompt block never renders. When present, runs after the
-# post-process affinity write on movement turns only (any judge grade ≥ 1, an
-# endpoint level ≠ 2, a ghost, or a refused action's tier drop) and rewrites the session's first-person
+# post-process affinity write on movement turns only (any nonzero judge grade,
+# an endpoint level ≠ 2, or a refused action's tier drop) and rewrites the session's first-person
 # feeling clause from band labels + recent judge reasons.
 #
 # NOTE: this task takes NO filter_prompt. The summarizer's prompt is

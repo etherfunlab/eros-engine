@@ -35,7 +35,7 @@ The binary has five modes (dispatched by `argv[1]`):
 - **What it writes.** Episodes, journal rows and arc rewrites. Profile memories only from segments holding a row newer than its session's `classified_at` (or from a never-stamped session), since the retired per-session sweeper extracted the rest. It never moves the live cursor; its progress is `backfilled_through_at`, so an interrupted run resumes where it stopped, and a failed segment stops that relationship until the next run.
 - **Beside live traffic.** Each segment holds the relationship's scan claim, so a live scan waits at most one segment; a relationship a live scan holds is skipped and reported as `relationships skipped`. A real run ends with `segments: X ok, Y empty, Z failed; relationships skipped: S`.
 
-The [v2.6.0 migration guide](migrating/v2-6-0-memory-2-0.md#backfill-dreaming) covers when to run it.
+The [v2.6.0 migration guide](migrating/v2-6-0-memory.md#backfill-dreaming) covers when to run it.
 
 ## Path 1: Docker self-host
 
@@ -158,9 +158,9 @@ Then inject your impl into `AppState.auth: Arc<dyn AuthValidator>`. The middlewa
 
 ## Bring-your-own Postgres
 
-Anything compatible with the sqlx Postgres driver works — Supabase, Neon, RDS, Crunchy Bridge, plain self-hosted. Hard requirement: pgvector extension installed (`CREATE EXTENSION vector;`). The engine creates its own schema (`CREATE SCHEMA IF NOT EXISTS engine;` at the top of `0000_baseline.sql`) so it coexists cleanly with whatever else is in the database.
+Anything compatible with the sqlx Postgres driver works — Supabase, Neon, RDS, Crunchy Bridge, plain self-hosted. Hard requirement: pgvector extension installed (`CREATE EXTENSION vector;`). The engine creates its own schema (`CREATE SCHEMA engine;` in `0000_baseline.sql`), so `engine` must not exist before the first `migrate`; apart from that it coexists cleanly with whatever else is in the database.
 
-If you're sharing a database with another service, the engine's tables stay in `engine.*` and never write to `public.*` — collision-free.
+If you're sharing a database with another service, the engine's tables stay in `engine.*`. The one thing it writes in `public` is sqlx's `_sqlx_migrations` history table, so a co-tenant that also migrates with sqlx needs its own database.
 
 ### Supabase deployments — schema-exposure footgun
 
@@ -175,17 +175,15 @@ curl "https://<project>.supabase.co/rest/v1/chat_messages?select=*&limit=5" \
 
 …and read every user's chat history if `anon` was ever granted SELECT on `engine.chat_messages`.
 
-Migration `0013_supabase_lockdown.sql` (shipped with eros-engine 0.2+) closes this by:
+The migrations close this — `0000_baseline.sql` for the tables it creates, and each later migration for the tables it adds — by:
 
 1. `REVOKE ALL` on every `engine.*` table from `anon` and `authenticated`
 2. `REVOKE USAGE ON SCHEMA engine` from `anon` and `authenticated`
 3. `ENABLE ROW LEVEL SECURITY` on every `engine.*` table (no policies — defense in depth; the `postgres` owner and `service_role` bypass RLS, which covers the engine binary and any server-side Supabase client)
 
-The migration is guarded by `IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon')`, so non-Supabase Postgres deployments (Neon, RDS, plain self-hosted) skip the REVOKEs silently and only inherit the harmless RLS enable.
+The REVOKEs are guarded by `IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon')`, so non-Supabase Postgres deployments (Neon, RDS, plain self-hosted) skip them silently and only inherit the harmless RLS enable.
 
-**If you upgraded from a pre-0.2 release on Supabase, run `eros-engine migrate` once to apply this — it's idempotent.**
-
-To audit your project independently of this migration, run as the `postgres` role:
+To audit your project independently of the migrations, run as the `postgres` role:
 
 ```sql
 -- Which tables in engine.* are missing RLS?

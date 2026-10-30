@@ -2,7 +2,7 @@
 
 eros-engine exposes an opaque OpenRouter passthrough on the streaming
 chat endpoint. Three caller-supplied fields ride to
-`openrouter.ai/api/v1/chat/completions` unchanged, three OpenRouter wire
+`openrouter.ai/api/v1/chat/completions` unchanged, two OpenRouter wire
 echoes come back on the SSE `done` frame, and a deployer-declared
 `headers` table adds app-attribution headers to every outbound call.
 
@@ -54,16 +54,16 @@ counts, latency) but not prompts / responses by default.
 
 ## Outbound: the `usage` echo on the SSE `done` frame
 
-The streaming endpoint's `done` frame carries three optional fields:
+The streaming endpoint's `done` frame carries two optional fields:
 
 | Field           | Type      | Meaning                                                                                       |
 |-----------------|-----------|-----------------------------------------------------------------------------------------------|
-| `usage`         | `object?` | OpenRouter `usage` block verbatim (tokens / cost / cached / reasoning). Engine does not flatten. |
+| `usage`         | `object?` | The parsed OpenRouter `usage` block: `prompt_tokens`, `completion_tokens`, `total_tokens`, and `cost` when the provider sent one. |
 | `generation_id` | `string?` | OpenRouter `response.id`. Query `/api/v1/generation` with it for full request metadata later. |
-| `model`         | `string?` | Model OpenRouter actually served. When `fallback_model` was hit, this is the fallback.        |
 
 These fields appear on the `done` frame (the per-turn terminal frame
-before `final`). Background paths (dreaming / post_process) do **not**
+before `final`). The served model rides the earlier `meta` frame as `model`
+([API reference](api-reference.md#post-compchatsession_idmessagestream)). Background paths (dreaming / post_process) do **not**
 surface them to clients.
 
 ### Hiding fields from the response
@@ -384,8 +384,9 @@ as shown above.
   reconciliation between events and store has to compare on payload keys ∩
   `human_insights` column set, not full equality. Since migration `0059`, every one of the calls
   above — plus `chat_voice`, `chat_product_qa`, `chat_input_filter`,
-  `chat_output_filter`, and the five background sweepers that wrote none of
-  the above — also lands one row in `engine.llm_generations`; see [LLM
+  `chat_output_filter`, and the background tasks that wrote none of the above
+  (`world_director`, `world_stories_director`, `world_comment`, `world_reply`,
+  `dreaming_scan`, `arc_rewrite`) — also lands one row in `engine.llm_generations`; see [LLM
   generations ledger](#llm-generations-ledger) above.
 - **Hash.** The engine does not transform `user` — callers are
   responsible for sending a hash.
@@ -719,11 +720,12 @@ session does not reach either table — it blanks the `session_id` pointer and
 leaves the row, since the point of an audit table is that the trail outlives
 what it points at. Both persist verbatim user text
 (`chat_images_events.inputs.latest_user_msg` / `.recent_scene`;
-`chat_vision_events.image_url`, often a signed, token-bearing URL). **Deployers
-must include both tables in their own user-data erasure routine** — the
-engine does not do this for you; erasure policy is the deployer's
-responsibility, not the engine's — deleting the account does not reach these
-tables either. Neither table ships with a pruning policy
+`chat_vision_events.image_url`, often a signed, token-bearing URL). Deleting the
+account does not reach them either: the erase route
+(`POST /svc/v1/users/{user_id}/erase`, mounted under `USER_ERASE_SECRET`)
+blanks that text and keeps the rows
+([Insights → Erasure](insights.md#erasure)), so a deployer's erasure routine
+calls it. Neither table ships with a pruning policy
 either: both grow without bound for as long as the deployment runs, so plan a
 partition scheme or a pruning cron yourselves if that matters for your
 deployment.

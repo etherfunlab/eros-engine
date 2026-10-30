@@ -124,11 +124,11 @@ chat    = "https://proxy.internal/v1/chat/completions"
 headers = { "X-Team" = "companion", "X-Env" = "prod" }
 ```
 
-Each entry is a table with up to three keys — `chat` (an OpenAI-compatible
+Each entry is a table with up to four keys — `chat` (an OpenAI-compatible
 chat-completions URL), `embeddings` (an OpenRouter-compatible embeddings
 URL — see [`https://openrouter.ai/docs/api_reference/embeddings`](https://openrouter.ai/docs/api_reference/embeddings)
-for the wire shape), and `headers` (sent verbatim on every request to this
-entry's endpoints). **A plain-string value is rejected**: the pre-0.9.4
+for the wire shape), `headers` (sent verbatim on every request to this
+entry's endpoints), and `body` (the rules below). **A plain-string value is rejected**: the pre-0.9.4
 shape (`venice = "https://…"`) was dropped with no compatibility layer, and
 the boot error names the table form. `deny_unknown_fields` applies — an
 unknown key, an empty table, or an empty URL string also refuses the load.
@@ -415,7 +415,7 @@ filter_prompt = "..."            # any field is optional; falls back to the defa
 **Recommended models for `chat_output_filter`:**
 
 - **Primary**: `openai/gpt-5.4-nano` — fast, stable filtered output.
-- **DO NOT** use `openai/gpt-4.1-nano` as the filter model — empirically returns `"对不起，无法满足你的要求"`-style refusals with HTTP 200, which the engine cannot distinguish from a successful filtered rewrite, so the fail-open path never triggers and the user sees the refusal text.
+- **DO NOT** use `openai/gpt-4.1-nano` as the filter model — empirically returns `"对不起，无法满足你的要求"`-style refusals with HTTP 200. The validity gate below catches them and walks to the next model, so each refusal costs a wasted hop.
 - **Recommended fallback**: `google/gemini-3.1-flash` — high success rate; when it does fail it surfaces a proper error response (non-200), letting the engine's fail-open path kick in and emit the original reply.
 - **Cost-saving fallback**: `zhipuai/zlm-4.7-flash` — cheaper, similar fail-mode profile to gemini-3.1-flash.
 - **DO NOT** use `anthropic/claude-haiku-4.5` for the filter — its input tolerance for NSFW (great for extraction) does NOT extend to output; the safety alignment on the output side is strict enough that the filter LLM often refuses to produce rewritten text at all.
@@ -473,7 +473,7 @@ holdback and any superseded text are internal; a client's user-facing
 experience does not distinguish a filtered turn from an ordinary streamed
 reply.
 
-**Fail-open:** if the filter LLM call times out or returns an error the engine delivers the **original** reply unchanged (the filter never blocks the chat response).
+**Fail-open:** each model in the chain gets 15 seconds. An attempt that times out, errors, or fails the validity gate — an empty reply, `finish_reason = content_filter`, a refusal phrase in its first 120 characters, or under 80 characters in all — walks to the next model; when the chain runs out the engine delivers the **original** reply unchanged (the filter never blocks the chat response). A reply shorter than 80 characters therefore always comes through unfiltered.
 
 #### What is stored / shown
 
@@ -595,8 +595,9 @@ generation.
 #### `[tasks.chat_input_filter]` fields
 
 Reuses the standard task shape: `model`, `fallback`, `retry_depth` (default 1),
-`temperature`, `max_tokens`, `filter_prompt`. `trigger`, `timing`, `tiers`, and `allow_traits` are ignored (the
-input filter has no triggers, timing, or tiers).
+`temperature`, `max_tokens`, `filter_prompt`. `trigger`, `timing` and `allow_traits` are ignored (the input
+filter has no triggers or timing); a `tiers` block refuses to boot, since tier
+blocks are limited to `chat_companion` and `chat_output_filter`.
 
 ## Task names
 
@@ -613,7 +614,7 @@ input filter has no triggers, timing, or tiers).
 | `group_director` | `pipeline::group` via `resolve_group_director()` (the group chat director: one streamed call casts the speakers of a group turn; absent ⇒ every member speaks in join order; a present section with a blank `filter_prompt` refuses to boot) | live (opt-in) |
 | `chat_product_qa` | `pipeline::stream` via `resolve_product_qa()` (out-of-character product-QA executor for the PDE `product_qa` action; off when task block absent or `filter_prompt` blank; also requires the LLM PDE) | live (opt-in) |
 | `affinity_evaluation` | `pipeline::post_process` (per-turn affinity verdict — four graded line axes plus two absolute 1..3 endpoint levels, converted engine-side; runs after each Reply turn, fire-and-forget; **takes no `filter_prompt`** — the prompt is engine-owned and setting the key refuses to boot — **in any form, an explicit blank included**. Unlike every other task here, blank does not mean "off", so omit the key entirely. See issue #210) | live |
-| `affinity_summary` | `pipeline::post_process::summarize_feeling` (rewrites `companion_affinity.feeling_clause` — the `[feelings]` block's first-person narrative — from band labels and recent judge reasons; runs after the affinity write, movement turns only (any judge grade, an endpoint level off baseline, a ghost, or a refused action's tier drop) and only when the request actually injects an affinity axis; request-scoped and billed to the turn's user, not a sweeper. **Takes no `filter_prompt`** — the prompt is engine-owned, same policy as `affinity_evaluation`, and setting the key refuses to boot. Block absent ⇒ `feeling_clause` stays `NULL` and `[feelings]` never renders) | live (opt-in) |
+| `affinity_summary` | `pipeline::post_process::summarize_feeling` (rewrites `companion_affinity.feeling_clause` — the `[feelings]` block's first-person narrative — from band labels and recent judge reasons; runs after the affinity write, movement turns only (any nonzero judge grade, an endpoint level off baseline, or a refused action's tier drop; a ghost turn never reaches post-process) and only when the request actually injects an affinity axis; request-scoped and billed to the turn's user, not a sweeper. **Takes no `filter_prompt`** — the prompt is engine-owned, same policy as `affinity_evaluation`, and setting the key refuses to boot. Block absent ⇒ `feeling_clause` stays `NULL` and `[feelings]` never renders) | live (opt-in) |
 | `character_insight_extraction` | `pipeline::post_process` (stage 1 of the character chain — experimental, EXPERIMENTAL — per-turn fact miner for the AI **character**, the mirror of `insight_extraction`'s human-side mining. Prompt-bearing; joins the required-`filter_prompt` gate alongside `insight_extraction` / `dreaming_scan`. This block is the whole chain's on/off switch — off when the task block is absent) | experimental (opt-in) |
 | `character_insight_structuring` | `pipeline::post_process` (stage 2 of the character chain — experimental — turns stage 1's mined facts plus the existing `character_insights` row into the typed ten-column object. **Parameters-only, takes no `filter_prompt`** — its prompt is built in `prompt.rs` and must stay in lockstep with the `character_insights` columns it fills, so setting the key refuses to boot, **in any shape, an explicit blank included** — same treatment as `affinity_evaluation`. Absent block ⇒ stage 2 resolves on stage 1's model/budget, never the global default) | experimental (opt-in) |
 | `user_insight_extraction` | `pipeline::post_process` (stage 1 of the user chain — experimental — per-turn fact miner for the real **user**, but scoped to one relationship rather than the global `insight_extraction`. Prompt-bearing; joins the required-`filter_prompt` gate alongside `insight_extraction` / `character_insight_extraction` / `dreaming_scan`. This block is the whole chain's on/off switch — off when the task block is absent) | experimental (opt-in) |
@@ -631,11 +632,13 @@ input filter has no triggers, timing, or tiers).
 
 A `[tasks.<name>]` entry is only meaningful if the engine actually calls `model_config.resolve("<name>", ...)` somewhere. The current call sites are:
 
-- `crates/eros-engine-server/src/pipeline/group_director.rs` → `group_director` via `resolve_group_director()` (group chat director, opt-in)
-- `crates/eros-engine-server/src/pipeline/handlers.rs` → `chat_companion`, `chat_output_filter`
+- `crates/eros-engine-server/src/pipeline/group.rs` → `group_director` via `resolve_group_director()` (group chat director, opt-in); `chat_output_filter` via `resolve_output_filter()` for each speaker
+- `crates/eros-engine-server/src/pipeline/handlers.rs` → `chat_companion`
 - `crates/eros-engine-server/src/pipeline/profile_rebuild.rs` → `profile_rebuild` via `resolve_profile_rebuild()` (the scheduled profile rebuild)
 - `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`, `affinity_evaluation`, `affinity_summary`, `character_insight_extraction`, `character_insight_structuring`, `user_insight_extraction`, `user_insight_structuring`
-- `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision` via `run_pde_decision` inside `run_stream` (only when `filter_prompt` is set); `chat_image_prompt_compose` via `resolve_image_prompt_compose()` (image-prompt composer, required for image turns, resolved lazily only on image turns); `chat_vision` via `resolve_vision()` (vision pre-stage, opt-in); `chat_product_qa` via `resolve_product_qa()` (product-QA executor, opt-in); `chat_input_filter` via `resolve_input_filter()` (input rewrite, opt-in)
+- `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision` via `run_pde_decision` inside `run_stream` (only when `filter_prompt` is set); `chat_image_prompt_compose` via `resolve_image_prompt_compose()` (image-prompt composer, required for image turns, resolved lazily only on image turns); `chat_vision` via `resolve_vision()` (vision pre-stage, opt-in); `chat_product_qa` via `resolve_product_qa()` (product-QA executor, opt-in); `chat_input_filter` via `resolve_input_filter()` (input rewrite, opt-in); `chat_output_filter` via `resolve_output_filter()`
+- `crates/eros-engine-server/src/routes/voice.rs` → `chat_voice` via `resolve_voice()`
+- `crates/eros-engine-server/src/pipeline/world.rs`, `story.rs`, `world_town.rs` → `world_director`, `world_stories_director`, `world_comment`, `world_reply` (the world sweepers, opt-in)
 - `crates/eros-engine-server/src/pipeline/dreaming/scan.rs` → `dreaming_scan` via `resolve_dreaming_scan()` and `arc_rewrite` via `resolve_arc_rewrite()` (the relationship scan and the arc rewrite it starts; reached from post-process at 20 pending turns, from the dreaming sweeper, and from the `backfill-dreaming` subcommand)
 - `crates/eros-engine-server/src/pipeline/proactive.rs` → `chat_image_prompt_compose` via `build_delegated_image_prompt_for` (a `taking_selfie` event's picture, when the events request carries `image`; audit `source = event`)
 - `crates/eros-engine-server/src/routes/image_edit.rs` → `chat_image_edit_compose` via `resolve_image_edit_compose()` (image-EDIT composer, resolved on every request to the edit endpoint; falls back to `[tasks.chat_image_prompt_compose]`'s chain when the edit block is absent — see below)
@@ -1101,8 +1104,9 @@ model = "voyage-4-lite"                       # ≡ "voyage-4-lite@voyage"
 #model_write = "voyage-4"        # storage path: embed_document(s), input_type "document"
 ```
 
-**Dimensions are fixed at 512, with no config knob.** The three pgvector
-columns are `VECTOR(512) NOT NULL`, the clients request 512 on the wire, and
+**Dimensions are fixed at 512, with no config knob.** The four pgvector
+columns are `VECTOR(512)` (`NOT NULL` except `relationship_journal.embedding`,
+whose engine-written rows wait for the sweeper), the clients request 512 on the wire, and
 every response is length-checked. There used to be a `dimensions` field on
 `[tasks.<name>]` — it was never consumed and has been removed; a leftover
 `dimensions = 512` line in an existing config is now an inert unknown key
@@ -1381,7 +1385,9 @@ These commitments were made during `0.x` and **carry forward unchanged into
 `1.x`**. For the duration of `1.x`, the OSS engine commits to:
 
 1. **No removed fields.** Existing field names in `[defaults]` and `[tasks.<name>]` will not disappear.
-   (Exceptions to date, both documented above: `[tasks.embedding].dimensions`
+   (Exceptions to date, all documented above: `[tasks.*].reasoning` — removed,
+   a leftover key refuses to boot naming the body rule that replaces it;
+   `[tasks.embedding].dimensions`
    — removed, now a silently-ignored inert unknown key; `[defaults].ignore_providers`
    / `.provider_sort` — removed, a leftover key refuses to boot with a
    migration message.)
@@ -1452,7 +1458,7 @@ What may still change without notice:
 - **Voyage's own base URL** — the native Voyage wire always posts to Voyage's canonical endpoint; only the model id is configurable, via `[tasks.embedding]`. Route around Voyage entirely with an `@openrouter` or custom `[providers]` suffix instead.
 - **PDE decisions (default path)** — the rule engine in `eros-engine-core/src/pde.rs` runs unconditionally when no `filter_prompt` is set. Set `[tasks.pde_decision].filter_prompt` to activate the opt-in LLM judge; the rule engine then serves as fallback + hard-safety guardrails.
 - **OpenRouter API key** — read directly from `OPENROUTER_API_KEY`, not the config file.
-- **Per-call streaming / response format flags** — fixed in `OpenRouterClient`.
+- **Per-call streaming** — fixed in `OpenRouterClient`. The JSON-schema `response_format` is the one exception: `structured_output` turns it off per task (see above).
 
 ## Worked example: tier-based resolution
 
