@@ -93,38 +93,79 @@ pub(crate) enum Occasion {
         /// What she wears (§3a), already validated.
         outfit: Option<String>,
     },
-    /// What she says about the ask-for-space choice (spec
+    /// What she says about a life choice (spec
     /// 2026-10-19-life-events-shopping-gatherings-and-ask-for-space-design.md
-    /// §3.2, §3.4).
+    /// §3.2, §3.4; romantic kinds: spec
+    /// 2026-10-30-give-needs-romantic-choices-and-answer-receipts-design.md §4.4).
     LifeChoice(LifeChoiceCue),
 }
 
-/// One thing she says about the choice. The ask is written with its choice
-/// row; the goodbye and the hurt reply are plain proactive rows.
+/// One thing she says about a life choice. The ask is written with its choice
+/// row; every other cue is a plain proactive row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LifeChoiceCue {
-    /// She asks to take a break. `tier_gap` is the gap at this moment, stored
-    /// with the choice; `anchor_seen` is the session's streak anchor the
-    /// trigger judged by, which the write checks is still current.
+    /// She asks. `tier_gap` is the gap at this moment, stored with the choice
+    /// (`Some` for `AskForSpace` only); `anchor_seen` is the session's streak
+    /// anchor the trigger judged by, which the write checks is still current.
     Ask {
-        tier_gap: i16,
+        kind: LifeChoiceKind,
+        tier_gap: Option<i16>,
         anchor_seen: Option<DateTime<Utc>>,
     },
-    /// The user agreed: they do not talk for `hours`.
+    /// Ask-for-space accepted: they do not talk for `hours`.
     Goodbye { hours: i64 },
-    /// The user declined.
+    /// Ask-for-space declined.
     Hurt,
+    /// A romantic kind answered.
+    // Built by the resolution route once it answers romantic kinds; drop the
+    // allow then.
+    #[allow(dead_code)]
+    Answered {
+        kind: LifeChoiceKind,
+        accepted: bool,
+    },
 }
 
 impl LifeChoiceCue {
     /// The stage cue: states a fact, carries no instruction.
     fn cue(self) -> String {
         match self {
-            Self::Ask { .. } => "（这段关系最近让你很累：心动还在，但交情和耐心都被磨薄了。你决定郑重地告诉对方：你想先分开一阵子，希望对方给你一个答复。）".into(),
+            Self::Ask {
+                kind: LifeChoiceKind::AskForSpace,
+                ..
+            } => "（这段关系最近让你很累：心动还在，但交情和耐心都被磨薄了。你决定郑重地告诉对方：你想先分开一阵子，希望对方给你一个答复。）".into(),
+            Self::Ask {
+                kind: LifeChoiceKind::SleepTogether,
+                ..
+            } => "（你们最近越来越亲密，你很想和对方更进一步。你决定主动开口，问对方愿不愿意和你上床，希望对方给你一个答复。）".into(),
+            Self::Ask {
+                kind: LifeChoiceKind::Propose,
+                ..
+            } => "（你越来越确定想和对方共度一生。你决定郑重地向对方求婚，希望对方给你一个答复。）".into(),
             Self::Goodbye { hours } => format!(
                 "（对方同意了你提出的分开请求，接下来 {hours} 小时你们不联系。你跟对方道别。）"
             ),
             Self::Hurt => "（对方不同意你提出的分开请求，你心里不好受。）".into(),
+            Self::Answered {
+                kind: LifeChoiceKind::SleepTogether,
+                accepted: true,
+            } => "（对方答应了你的邀请。）".into(),
+            Self::Answered {
+                kind: LifeChoiceKind::SleepTogether,
+                accepted: false,
+            } => "（对方拒绝了你的邀请，你有点失落。）".into(),
+            Self::Answered {
+                kind: LifeChoiceKind::Propose,
+                accepted: true,
+            } => "（对方答应了你的求婚。）".into(),
+            Self::Answered {
+                kind: LifeChoiceKind::Propose,
+                accepted: false,
+            } => "（对方拒绝了你的求婚，你心里很难受。）".into(),
+            Self::Answered {
+                kind: LifeChoiceKind::AskForSpace,
+                ..
+            } => unreachable!("ask_for_space answers are Goodbye / Hurt"),
         }
     }
 }
@@ -637,17 +678,12 @@ pub(crate) async fn greet(
         // choice already in the instance (a concurrent ask won) or a streak
         // anchor that moved since the trigger read it leaves nothing.
         Occasion::LifeChoice(LifeChoiceCue::Ask {
+            kind,
             tier_gap,
             anchor_seen,
         }) => {
             let asked = LifeChoiceRepo { pool: &state.pool }
-                .insert_ask(
-                    g.session_id,
-                    LifeChoiceKind::AskForSpace,
-                    Some(*tier_gap),
-                    *anchor_seen,
-                    &row,
-                )
+                .insert_ask(g.session_id, *kind, *tier_gap, *anchor_seen, &row)
                 .await?;
             match asked {
                 Some(_) => Ok(chat_repo
@@ -658,7 +694,9 @@ pub(crate) async fn greet(
         }
         // No key to dedupe on: the row yields only to a message that landed
         // at or after `since`.
-        Occasion::LifeChoice(LifeChoiceCue::Goodbye { .. } | LifeChoiceCue::Hurt) => Ok(chat_repo
+        Occasion::LifeChoice(
+            LifeChoiceCue::Goodbye { .. } | LifeChoiceCue::Hurt | LifeChoiceCue::Answered { .. },
+        ) => Ok(chat_repo
             .insert_open_message(g.session_id, g.since, &row)
             .await?),
     }
@@ -967,7 +1005,8 @@ mod tests {
         let cue = |c| Occasion::LifeChoice(c).cue(1, &PersonaTraits::default(), None);
         assert_eq!(
             cue(LifeChoiceCue::Ask {
-                tier_gap: 3,
+                kind: LifeChoiceKind::AskForSpace,
+                tier_gap: Some(3),
                 anchor_seen: None
             }),
             "（这段关系最近让你很累：心动还在，但交情和耐心都被磨薄了。你决定郑重地告诉对方：你想先分开一阵子，希望对方给你一个答复。）"
@@ -982,14 +1021,59 @@ mod tests {
         );
         for c in [
             LifeChoiceCue::Ask {
-                tier_gap: 2,
+                kind: LifeChoiceKind::AskForSpace,
+                tier_gap: Some(2),
                 anchor_seen: None,
             },
             LifeChoiceCue::Goodbye { hours: 12 },
             LifeChoiceCue::Hurt,
+            LifeChoiceCue::Ask {
+                kind: LifeChoiceKind::Propose,
+                tier_gap: None,
+                anchor_seen: None,
+            },
+            LifeChoiceCue::Answered {
+                kind: LifeChoiceKind::SleepTogether,
+                accepted: true,
+            },
         ] {
             assert_eq!(Occasion::LifeChoice(c).name(), "life_choice");
         }
+    }
+
+    #[test]
+    fn the_romantic_life_choice_cues_are_exact() {
+        let cue = |c| Occasion::LifeChoice(c).cue(1, &PersonaTraits::default(), None);
+        let ask = |kind| LifeChoiceCue::Ask {
+            kind,
+            tier_gap: None,
+            anchor_seen: None,
+        };
+        let answered = |kind, accepted| LifeChoiceCue::Answered { kind, accepted };
+        assert_eq!(
+            cue(ask(LifeChoiceKind::SleepTogether)),
+            "（你们最近越来越亲密，你很想和对方更进一步。你决定主动开口，问对方愿不愿意和你上床，希望对方给你一个答复。）"
+        );
+        assert_eq!(
+            cue(answered(LifeChoiceKind::SleepTogether, true)),
+            "（对方答应了你的邀请。）"
+        );
+        assert_eq!(
+            cue(answered(LifeChoiceKind::SleepTogether, false)),
+            "（对方拒绝了你的邀请，你有点失落。）"
+        );
+        assert_eq!(
+            cue(ask(LifeChoiceKind::Propose)),
+            "（你越来越确定想和对方共度一生。你决定郑重地向对方求婚，希望对方给你一个答复。）"
+        );
+        assert_eq!(
+            cue(answered(LifeChoiceKind::Propose, true)),
+            "（对方答应了你的求婚。）"
+        );
+        assert_eq!(
+            cue(answered(LifeChoiceKind::Propose, false)),
+            "（对方拒绝了你的求婚，你心里很难受。）"
+        );
     }
 
     #[test]

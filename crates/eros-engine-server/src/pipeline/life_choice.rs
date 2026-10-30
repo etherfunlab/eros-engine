@@ -16,7 +16,7 @@ use eros_engine_core::persona::CompanionPersona;
 use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::ChatRepo;
 use eros_engine_store::events::{EventRepo, NewEvent};
-use eros_engine_store::life_choices::LifeChoiceRepo;
+use eros_engine_store::life_choices::{LifeChoiceKind, LifeChoiceRepo};
 
 use crate::byoc::LoadedInstance;
 use crate::error::AppError;
@@ -247,7 +247,8 @@ async fn try_ask(
             persona,
             now: &NowContext::for_user(&locale, now),
             occasion: Occasion::LifeChoice(LifeChoiceCue::Ask {
-                tier_gap,
+                kind: LifeChoiceKind::AskForSpace,
+                tier_gap: Some(tier_gap),
                 anchor_seen: since,
             }),
             recall_query,
