@@ -67,14 +67,16 @@ effects route, no needs factor in the event draw, nothing in a voice call.
   that.
 - **Where it is stored.** On the user row of the turn the judge rated, as `metadata.needs`,
   whatever the turn's outcome: reply, image, ghost or product question. On a turn with an
-  accepted give the engine writes the stored levels: the needs the item moves come from the
-  baseline, and the rest come from the judge. This holds even when the judge abstained
-  ([below](#gives-move-needs)). The write is awaited before the turn goes on. A failed write is
+  accepted give the engine writes the stored levels, even when the judge abstained: the needs
+  the item moves come from the baseline, and the rest from the judge, or from the baseline when
+  it abstained ([below](#gives-move-needs)). The write is awaited before the turn goes on. A failed write is
   logged and the turn carries on with the levels it meant to write.
 - **What writes nothing.** A rule-engine turn (the judge is off or failed), a `needs: null`
   verdict, a turn silenced by an offline stretch (it runs no judge), and every group
-  or voice turn. The exception is an accepted give that moves a need: it writes on a
-  rule-engine turn or a `needs: null` verdict too, once a rating precedes it.
+  or voice turn. The exception is an accepted give that moves a need, in a deployment that
+  runs the judge: it writes on a turn whose judge failed or returned `needs: null` too, once a
+  rating precedes it. A deployment without the judge reads no baseline, so a give there writes
+  nothing.
 - **Whose state.** The persona instance's. The newest rated row is read across all the
   instance's sessions, so a second session does not reset her hunger.
 
@@ -83,7 +85,8 @@ The judge's `needs` and the levels it was shown are audited with the rest of the
 
 ### Gives move needs
 
-On a 1:1 text turn whose `give` is accepted, the engine moves three needs by one level each:
+In a deployment that runs the judge, on a 1:1 text turn whose `give` is accepted, the engine
+moves up to three needs by one level each:
 
 | `give` item | `hunger` | `social` | `indulgence` |
 |---|---|---|---|
@@ -97,7 +100,7 @@ quantity is ignored: one give moves one level.
 
 *Accepted* means the turn's effective response is accept. A judge refusal, or the habit roll
 forcing a refusal ([the habit roll](model-config.md#taskspde_decision--opt-in-llm-pde-judge)),
-moves nothing. A fail-open turn (the judge failed) accepts the give under the existing rule, so
+moves nothing. A fail-open turn (the judge failed) accepts the give, since a failed judge means accept, so
 the move applies there too.
 
 What gets written:
@@ -189,7 +192,7 @@ again shows the judge the same line.
   很想抽口大麻, `coffee` 很想喝杯咖啡. With no key `true` it reads 很想放纵一下. Every need at `mid` (a `low`
   `indulgence` counts the same), or no rating, adds nothing and leaves the prompt
   unchanged. A judged turn's reply is written with the levels the turn ends with: the
-  levels written to its row (the verdict's, except the needs an accepted give moved), otherwise the
+  levels written to its row (with the needs an accepted give moved taken from the baseline), otherwise the
   carried levels the judge was shown. A rule-engine turn in a deployment that has the judge
   uses the carried levels, moved by an accepted give.
 - **The caller** gets the same levels on the `body_state` frame (`needs`, an object or `null`),
@@ -860,10 +863,10 @@ committed, time-decayed state:
 - **Fresh streak.** All three turns come after the session's newest episode, of any kind of
   choice: her ask, its resolution, and any separation it started (the latest of `asked_at`,
   `resolved_at` and, for an accepted choice, the separation's `ends_at`). A judged action turn
-  that fell while she waited
-  or during the separation belongs to the episode and counts for nothing; the turn that converts
-  an ignored ask is the first of the new streak. Asking consumes the streak: the next ask needs
-  three fresh judged turns.
+  that fell while she waited for an answer that came, or during the separation, belongs to the
+  episode and counts for nothing; a lapsed ask anchors at `asked_at`, so action turns during its
+  wait do count. The turn that converts an ignored ask is the first of the new streak. Asking
+  consumes the streak: the next ask needs three fresh judged turns.
 - **Clear runway.** No session of the persona has a pending choice, and the persona has no
   separation (`taking_space`) under way. She has one life, so at most one ask is pending at a
   time.
@@ -914,7 +917,9 @@ commits, so the fetch the turn itself releases usually misses it: an adapted cli
 the delta when a history row carries `occasion: "life_choice"`. Both history routes
 ([canonical](api-reference.md#get-compchatsession_idhistorylimit20offset0) and
 [BFF](api-reference.md#get-bffv1compchatsession_idhistorylimit50offset0)) expose a proactive
-assistant row's `metadata.proactive` as an optional `occasion`, omitted on every other row. The
+assistant row's `metadata.proactive` as an optional `occasion`, omitted on every other row. Her
+ask row also carries a `life_choice` receipt (`id`, `kind`, `status`, `resolved_at`) on both
+history routes and in the BFF start bundle, so a reload shows how the choice ended. The
 tier-drop affinity event is not served on this route, so a client never meets an unknown
 `event_type`; the new state comes back in the resolution response, and any other device reads
 it from the absolute affinity route.
@@ -1056,8 +1061,9 @@ the turn's `state_after`; 0.7 is a rule threshold the engine owns, not a judge b
 | `propose` | chemistry and bond tier 4 or more | at least 5 of the newest 8 judged turns are warm |
 
 Only judged turns after the session's newest choice episode, of any kind, count. When both kinds
-qualify on one turn, `propose` fires. Neither can meet the ask for space, which needs patience
-below 0.5.
+qualify on one turn, `propose` fires. Neither can fire together with the ask for space:
+`sleep_together` needs its three newest turns above 0.7 patience where the ask needs them below
+0.5, and `propose` needs both tiers at 4 or more, which leaves no two-tier gap.
 
 A kind that was accepted or ignored in the session never fires again there: the user was asked
 once, and an answer typed in words is an answer. After a decline or a lapse the kind fires again

@@ -181,7 +181,7 @@ PDE が決めたゴーストターンは `persist_with_event` に到達しない
   | `sleep_together` | 降格なし | chemistry |
   | `propose` | 降格なし | bond と chemistry |
 
-  名前の挙がったラインは、拒否されたアクションと同じ着地規則で 1 段階下がる。下の段階の中で同じ相対位置に着地し、ラインの 2 軸は同じ係数で縮小され、段階 1 のラインは `0` になる。そのラインの `pending_deltas` はクリアされ、名前の挙がらないラインは軸も残高もそのままである。時間減衰とエンドポイント再計算(デプロイの affinity チューニングを使う)を済ませたスナップショットから、行ロック内で、選択を解決するトランザクションの中で計算されるため、解決がロールバックされれば降格も残らない。`ask_for_space` の accept の場合、降格は彼女が戻ってきたときの状態であり、戻った時点でさらに何かが起きることはない。言葉で打った答え(`ignored`)と期限切れは、どの種別でも代償がない。
+  名前の挙がったラインは、拒否されたアクションと同じ着地規則で 1 段階下がる。下の段階の中で同じ相対位置に着地し、ラインの 2 軸は同じ係数で縮小され、段階 1 のラインは `0` になる。そのラインの `pending_deltas` はクリアされ、名前の挙がらないラインは軸も残高もそのままである。時間減衰とエンドポイント再計算(デプロイの affinity チューニングを使う)を済ませたスナップショットから、行ロック内で、選択を解決するトランザクションの中で計算されるため、解決がロールバックされれば降格も残らない。`ask_for_space` の accept の場合、降格は彼女が戻ってきたときの状態であり、戻った時点でさらに何かが起きることはない。言葉で打った答え(`ignored`)と期限切れは、どの種別でもラインを下げない。
 - **そのイベント行。** 降格ごとに、ターンではない専用の `event_type`、`life_choice` の 1 行が書かれる。降格が生の変化のすべてなので、`deltas` と `effective_deltas` は同じ値を持つ。`label_changes`、`effective_line_deltas`、前後 2 つの状態スナップショットがティアの移動を記録する。`context` には `life_choice`(`accept` | `decline`)と `choice_id` が入る。accept された `sleep_together` や `propose` は何も動かさず行も書かれないため、`accept` が現れるのは `ask_for_space` だけである。この行に `user_message_id` はない。ターンごとの delta ルート `GET /bff/v1/comp/affinity/{session_id}/event` は `time_decay` と同様にこの行を返さず、ジャッジが採点したターンとしても数えられない。
 - **成長の鈍化(accept された `ask_for_space` のみ)。** 別離が終わってから 72 時間、4 つのライン軸で確定した正のデルタはすべて、適用前に半分になる。負のデルタは全額適用され、`warmth` と `patience` は従来どおりターン後のライン値から再導出される。削られた分は失われ、ゲートの残高には積まれない。適用されるのは選択が行われたセッションだけである。ウィンドウは導出されるもので新しい状態はない。選択の `event_id` から別離の `ends_at` を引き、`ends_at` から `ends_at` + 72 時間までを実時間で数える。鈍化したターンのイベント行は `context.growth_scale`(`0.5`)を持ち、通常の速度ではこのキーは付かず、`effective_deltas` には半分になった値が出る。accept されたロマンチックな選択が成長を鈍らせることはない。
 
@@ -244,6 +244,7 @@ Chemistry: `spark` / `flirtation` / `crush` / `lover` / `beloved`
 - ライフイベントの抽選 — intimacy rung が `ex_message`、`breakup`、`period_scare`(rung 1 では抽選されない)、`sudden_desire`、`pregnancy_scare`(rung 3 のみ)の可否と、`busy`、`in_battle`、女性ペルソナの `out_shopping` を告げるかどうか(rung 2 から)を決める。rung 2 からは、ショッピングの小さな発見(`saw_bag`、`saw_clothes`)で目に留まったものを「欲しい」と口に出すようにもなる(events ルートの説明は [API reference](api-reference.md#post-v2compsessionsession_idevents) を参照)。
 
 - 距離を置きたいという切り出し — 2 本のティア階段(chemistry が bond より 2 段階以上高い)と、直近 3 回のジャッジ採点ターンから導出された `patience` が、彼女が休みを切り出すかどうかを決める([選択](life-events-needs.md#the-ask-for-space-choice)を参照)。
+- ロマンチックな選択 — chemistry のティア(`propose` では bond のティアも)と、直近のジャッジ採点ターンから導出された `warmth` と `patience` が、彼女が一緒に寝ようと誘うか、プロポーズするかを決める。呼び出し側の scope がこのペアをロマンチックと示している場合に限る([選択](life-events-needs.md#the-romantic-choices)を参照)。
 - リコールゲート — 時間減衰後の行の Bond と Chemistry のティアが、どの基礎プロフィールの親密フィールドとどの domain 付きプロフィール層メモリーがプロンプトに入るか、そして各層から何件リコールするかを決める。行がないペアは両ラインともティア 1 とみなす。テキスト、グループ、音声、画像編集のテキスト返信はいずれも減衰後の値を読む([memory-layers.md](memory-layers.md#affinity-gate)を参照)。
 
 - ゴーストスコアリング — `score = (1−intrigue)·0.4 + (1−patience)·0.4 + tension·0.2` を使い、ハード veto(最初の10メッセージ、streak ≥ 2、1時間クールダウン)と閾値 0.65(セッションが一度ゴーストした後は 0.85)を適用する。
@@ -256,7 +257,7 @@ Chemistry: `spark` / `flirtation` / `crush` / `lover` / `beloved`
 
 `crates/eros-engine-core/src/affinity.rs` はモデルそのものである。状態構造体、書き込みパイプライン(`grade_turn`)、基礎ペアの導出、時間減衰、Bond/Chemistry のスコア、ティア、ラベルを持つ。
 
-`crates/eros-engine-core/src/scope.rs` はリクエストごとの注入ゲートである。`AffinityScope`(6つの真偽値で、どの軸が「このリクエスト」のプロンプトに影響してよいかを表す)と `MemoryScope` を持つ。プロンプト注入と `length_score` のみを制御し、後処理の書き込み(インサイト抽出、メモリ書き込み、6軸評価)には影響しない。
+`crates/eros-engine-core/src/scope.rs` はリクエストごとの注入ゲートである。`AffinityScope`(6つの真偽値で、どの軸が「このリクエスト」のプロンプトに影響してよいかを表す)と `MemoryScope` を持つ。プロンプト注入と `length_score` を制御し、リクエストが記録した scope は、ペアがロマンチックな生活選択の対象になるかを `romance_compatible` が判定する材料にもなる。後処理の書き込み(インサイト抽出、メモリ書き込み、6軸評価)には影響しない。
 
 ### 共通点
 
@@ -395,7 +396,7 @@ DB が書き込みのたびに再計算するため、ライン軸の値との�
 実装を直接確認する場合の参照先は、次のとおりである。
 
 - `crates/eros-engine-core/src/affinity.rs` — 型定義、`grade_turn` 書き込みパイプライン、エンドポイント導出、時間減衰、bond/chemistry スコア、ティア、ラベル、`diff_labels`
-- `crates/eros-engine-core/src/scope.rs` — `AffinityScope` / `MemoryScope`、`length_score`(§7参照)
+- `crates/eros-engine-core/src/scope.rs` — `AffinityScope` / `MemoryScope`、`length_score`、`romance_compatible`(§7参照)
 - `crates/eros-engine-store/src/affinity.rs` — `AffinityRepo`(persist_with_event、record_ghost、persist_life_choice_drop_in_tx、last_judged_endpoints)。テーブルは `migrations/0000_baseline.sql`
 - `crates/eros-engine-store/src/life_choices.rs` — `LifeChoiceRepo`(選択の行。`growth_slowed` が鈍化ウィンドウを導出する)
 - `crates/eros-engine-server/src/pipeline/post_process.rs` — LLM 評価、grade/level のパース

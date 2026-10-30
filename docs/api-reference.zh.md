@@ -288,8 +288,9 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 > 更窄（旧行为注入全部六轴）。**省略 `affinity_scope` 并不等同于旧行为**。
 > 如需全轴注入，请显式指定 `"bond_and_chemistry"` 或 `"full"`。
 
-> **1.3.0 起该字段重新只管注入。** 3.1 的写侧调向（1.2.1）已退役：
-> `affinity_scope` 只门控提示注入与 `length_score`，对计分没有任何影响。详见
+> **1.3.0 起该字段不再影响计分。** 3.1 的写侧调向（1.2.1）已退役：
+> `affinity_scope` 门控提示注入与 `length_score`，对计分没有任何影响。一轮记录下来的 scope 连同 `memory_scope`，
+> 还决定这一对能不能被问到浪漫生活选择（见[浪漫相容](#post-v2compsessionsession_idlife-choiceschoice_id)）。详见
 > [好感度模型 → Scope 调向：已退役](affinity-model.zh.md#affinityrs-与-scopers)。
 
 同时使用两个字段的示例：
@@ -974,7 +975,7 @@ composer 失败时退回普通的人物肖像 prompt，跟聊天回合一样。�
 | `sleep_together` | 问用户愿不愿意和她上床 | 这一对在浪漫上相容（见下），chemistry 在第 3 档或以上，且最新的 3 个被判官评过的回合 warmth 和 patience 都高于 0.7 |
 | `propose` | 向用户求婚 | 这一对在浪漫上相容，chemistry 和 bond 都在第 4 档或以上，且最新的 8 个被判官评过的回合里至少 5 个 warmth 和 patience 都高于 0.7 |
 
-只有该 session 最新一次选择（不论哪一种）之后的、被判官评过的回合才计数。两种浪漫选择同一轮都满足时，触发 `propose`。
+只有该 session 最新一段选择经过（她的请求、它的结算以及它开启的分开，不论哪一种选择）之后的、被判官评过的回合才计数。两种浪漫选择同一轮都满足时，触发 `propose`。
 在一个 session 里被用户接受或不理会过的种类，在那里不会再次提出；被拒绝或过期的，等出现新的连续后会再次提出。她怎么提出、什么时候提出、
 每条路各付什么代价，见 [life-events-needs.zh.md](life-events-needs.zh.md#提出分开的选择)和
 [浪漫选择](life-events-needs.zh.md#浪漫选择)。

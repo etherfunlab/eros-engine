@@ -296,11 +296,13 @@ the context from these sources:
   `neutral_and_relationship` / `relationship_only`).
 
 `memory_scope = none` skips memory injection entirely. **`memory_scope` gates
-the prompt only, never writes:** under `none` the raw-turn writer still
+the prompt, never memory writes:** under `none` the raw-turn writer still
 stores the turn, the turn still counts toward dreaming, and insight
 extraction and the affinity evaluation still run. The
 `/comp/user/{user_id}/profile` endpoint returns the `human_insights` row as a
-readable view of what has been collected.
+readable view of what has been collected. The scopes a turn records also decide
+whether the pair can be asked a romantic life choice
+([life-events-needs.md](life-events-needs.md#the-romantic-choices)).
 
 ### Recall
 

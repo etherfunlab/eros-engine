@@ -13,7 +13,7 @@ Pure-domain types and rules for the [`eros-engine`](https://github.com/etherfunl
 - `pde` — the Persona Decision Engine: rules that decide *how* a persona responds before the LLM call.
 - `ghost` — proactive (unsolicited) message scheduling logic.
 - `group` — group chat's pure half: the director's output, how it becomes an ordered cast, and how a transcript line reads to one speaker.
-- `needs` — the persona's four basic needs and how they carry forward in time.
+- `needs` — the persona's six basic needs, how they carry forward in time, and how an accepted give moves them.
 - `events` — life event categories and kinds, and the two-stage draw that picks one.
 - `types` — shared IDs, timestamps, and enums.
 

@@ -218,7 +218,7 @@ PDE 判定的 ghost 回合从不进入 `persist_with_event`：只有 `ghost_stre
   第 1 档的线直接归 `0`。它的 `pending_deltas` 清零；没被点名的线，轴和余额都保持不变。
   它按时间衰减和端点刷新之后的快照计算（用部署的 affinity 调参值），在行锁内、与结算这次选择的同一个事务里完成，
   所以结算回滚时不会留下降档。`ask_for_space` 接受之后，降档就是她归来时的状态，归来时不再有别的事发生。
-  用文字打出的回答（`ignored`）和过期，不论哪种选择都没有代价。
+  用文字打出的回答（`ignored`）和过期，不论哪种选择都不降档。
 - **它的事件行。** 每次降档写一行自己类型的非回合事件，`event_type = 'life_choice'`。
   `deltas` 与 `effective_deltas` 的数字相同，因为降档就是全部的原始变化；`label_changes`、
   `effective_line_deltas` 和前后两份状态快照记录档位的移动。`context` 里有 `life_choice`（`accept` | `decline`）

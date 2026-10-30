@@ -291,8 +291,8 @@ a chat turn: no judge runs.
   tuning), inside the row lock and in the transaction that resolves the
   choice, so a rolled-back resolution leaves no drop. On an `ask_for_space`
   accept the drop is the state she comes back to; nothing further happens at
-  return. An answer typed in words (`ignored`) and an expiry cost nothing, for
-  every kind.
+  return. An answer typed in words (`ignored`) and an expiry drop no line, for
+  any kind.
 - **Its event row.** One row of its own non-turn `event_type`, `life_choice`,
   for every drop. `deltas` and
   `effective_deltas` carry the same figures, because the drop is the whole raw

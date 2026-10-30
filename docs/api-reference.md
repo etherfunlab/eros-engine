@@ -321,10 +321,12 @@ into the prompt. Accepted values:
 > `affinity_scope` is **not** equivalent to the old behavior. Use
 > `"bond_and_chemistry"` or `"full"` explicitly if you need all axes.
 
-> **Since 1.3.0 the field is injection-only again.** The 3.1 write-side
+> **Since 1.3.0 the field does not steer scoring.** The 3.1 write-side
 > steering (1.2.1) is retired: `affinity_scope` gates prompt injection and
-> `length_score` and has no effect on scoring. See
-> [Affinity model → Scope steering: retired](affinity-model.md#affinityrs-vs-scopers).
+> `length_score` and has no effect on scoring. With `memory_scope`, the scopes a
+> turn records also decide whether the pair can be asked a romantic life choice
+> ([romantic compatibility](#post-v2compsessionsession_idlife-choiceschoice_id)).
+> See [Affinity model → Scope steering: retired](affinity-model.md#affinityrs-vs-scopers).
 
 Example using both fields:
 
@@ -1222,7 +1224,8 @@ says nothing. There are three kinds:
 | `sleep_together` | the user to sleep with her | the pair is romantically compatible (below), chemistry is at tier 3 or more, and the 3 newest judged turns all have warmth and patience above 0.7 |
 | `propose` | the user to marry her | the pair is romantically compatible, chemistry and bond are both at tier 4 or more, and at least 5 of the newest 8 judged turns have warmth and patience above 0.7 |
 
-Only judged turns after the session's newest choice, of any kind, count.
+Only judged turns after the session's newest choice episode count, whatever its kind: her
+ask, its answer and any separation it started.
 `propose` wins when both romantic kinds qualify on one turn. A kind the user
 accepted or ignored in a session is never asked again there; one that was
 declined or lapsed is asked again after a fresh streak. How and when she asks,
