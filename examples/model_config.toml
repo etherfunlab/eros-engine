@@ -691,9 +691,9 @@ fallback = ["deepseek/deepseek-v4-flash","google/gemini-3.1-flash-lite"]
 temperature = 0.2
 # 1024 is enough: 0 of 360 replayed scans exceeded 713 output tokens.
 max_tokens = 1024
-# Remove this entire [tasks.dreaming_scan] section to disable the dreaming
-# sweeper (it then stays inert). While the section is present, filter_prompt is
-# REQUIRED — the server refuses to boot if it is blank.
+# Remove this entire [tasks.dreaming_scan] section to turn the relationship scan
+# off (neither the sweeper nor the inline scan then runs). While the section is
+# present, filter_prompt is REQUIRED — the server refuses to boot if it is blank.
 # `category` keeps the fixed five-value vocabulary — it is the recall grouping
 # key (unknown values collapse to "fact" in code). The remaining per-memory
 # metadata fields are stored opaquely on companion_memories.metadata: a
@@ -1028,9 +1028,10 @@ model = "voyage-4-lite"
 # an outage retry chain (tried sequentially; NOT rotation). `filter_prompt` is
 # OPTIONAL: it overrides the built-in, product-identity-free voice directive
 # (short, spoken, no markdown/emoji/stage-directions). Voice turns persist on a
-# `channel = 'voice'` column. An ended call is swept into profile-layer memories
-# by dreaming-lite, same as a text session — set DREAMING_VOICE_DISABLED=1 to
-# keep calls out of memory. A live turn itself still writes nothing.
+# `channel = 'voice'` column. Each voice turn counts toward its relationship's
+# scan ([tasks.dreaming_scan]), which reads the call with the text rows of the
+# same relationship — set DREAMING_VOICE_DISABLED=1 to keep calls out of
+# memory. A live turn itself still writes no memory.
 #[tasks.chat_voice]
 #model        = "vendor/fast-voice-model"
 #fallback     = ["vendor/backup-model"]

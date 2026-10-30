@@ -71,6 +71,8 @@ spawn post_process     tokio::spawn——跟返回響應並行：
                           → user_insights UPSERT，实验特性——不是
                           human_insights，不会被注入任何 prompt）
                         （五个 future 经 tokio::join! 并发执行）
+                        - 关系扫描：本轮先于这五个计入所在关系；待扫轮数到
+                          20 时，在它们之后就地扫描（dreaming）
 ```
 
 **群聊轮次**（`pipeline::group::run_group_turn`）通过 `[tasks.group_director]` 调用选出发言者，再让每位发言者走同一条回复路径；详见 [group-chat.zh.md](group-chat.zh.md)。
@@ -119,6 +121,9 @@ eros-engine-server :8080
                        chat_sessions / chat_messages / chat_session_members
                        companion_affinity / companion_affinity_events
                        companion_memories（vector(512)）
+                       relationship_scan_state / relationship_episodes /
+                       relationship_arcs / relationship_journal /
+                       relationship_scan_events
                        persona_genomes / persona_instances / persona_instance_items
                        human_facts / human_profile_state / human_insights
                        user_erasures
@@ -134,7 +139,7 @@ post-process spawn 返回 `()` 是 fire-and-forget 設計——用戶面前的�
 **`chat_messages.channel`**：`NULL` = 普通文本；`'voice'` = 语音频道；
 `'product_qa'` = 出戏产品问答——非 NULL 的行会被排除在短期回忆、对话信号、
 好感度评估、insight 抽取之外，但在实时流、重放和客户端历史记录里完全可见。
-dreaming 是例外：它默认也会读 `'voice'` 的行（通话空闲后才读；可用
+关系扫描（dreaming）是例外：它默认也会读 `'voice'` 的行，和同一段关系的文字行一起读（可用
 `DREAMING_VOICE_DISABLED` 关掉），但仍然排除 `'product_qa'`。
 
 **频道归属在写入侧双向强制。** `companion_stream` 拒绝语音或群 session，`voice`
@@ -199,10 +204,15 @@ crates/
 │       ├── human_insight.rs  # HumanInsightRepo（类型化画像列，由重建整行替换）
 │       ├── character_insight.rs # CharacterInsightRepo + 事件/快照 repo（AI 角色自己的画像，实验特性）
 │       ├── user_insight.rs   # UserInsightRepo + 事件/快照 repo（真人用户按关系分开的画像，实验特性）
+│       ├── scan_state.rs     # ScanStateRepo（关系扫描的游标、待扫轮数、认领、回填窗口）
+│       ├── episode.rs        # EpisodeRepo（片段摘要、扫描的分段读取）
+│       ├── arc.rs            # ArcRepo（关系弧线）
+│       ├── journal.rs        # JournalRepo（带日期的时刻；引擎自己写的行）
+│       ├── scan_event.rs     # ScanEventRepo（relationship_scan_events 读数）
 │       └── persona.rs        # PersonaRepo（upsert_genome 給 seed 用）
 └── eros-engine-server/
     └── src/
-        ├── main.rs           # serve | migrate | seed-personas | print-openapi 子命令
+        ├── main.rs           # serve | migrate | seed-personas | print-openapi | backfill-dreaming 子命令
         ├── state.rs          # AppState（pool / auth / openrouter / embed / config）
         ├── error.rs          # AppError → axum IntoResponse
         ├── auth/             # AuthValidator trait + Supabase 實現 + 中間件

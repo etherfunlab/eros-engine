@@ -87,7 +87,7 @@ LOCKED` 加 30 分钟过期回收，并以认领所有权 token 守卫，卡死�
 |------|------|
 | 上一轮世界种子 | `world_states.seed`（不透明 JSONB；引擎从不解读） |
 | 活跃角色名单（上限 8） | `persona_instances` 中 `status = 'active'` 且有 genome 的实例，最早创建优先——[BYOC](byoc.zh.md) 实例没有 genome，从不入选 |
-| 记忆回流（K=15） | 最近的**抽取版**画像层 `companion_memories`（dreaming-lite 的产物——绝非原始聊天） |
+| 记忆回流（K=15） | 最近的**抽取版**画像层 `companion_memories`（关系扫描写下的画像记忆——绝非原始聊天） |
 
 | 输出 | 去向 |
 |------|------|

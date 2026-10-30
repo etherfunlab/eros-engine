@@ -269,6 +269,7 @@ All streams are keyset-paged with `since`, a tie-break id, and `limit` (default 
 | `companion_memories` | `user_id` (profile and relationship layers) |
 | `world_memories`, `world_states`, `world_enrollments`, `world_posts` (comments go with their post), `persona_story_insights`, `persona_story_memories`, `persona_story_events` | `owner_uid` |
 | `user_insights`, `user_insights_snapshot`, `character_insights`, `character_insights_snapshot` | the user's persona instances (`persona_instances.owner_uid`) |
+| `relationship_scan_state` (first of the four: the relationship scan's writes check it under a row lock, so a write in flight lands before the deletes that remove it, and a later one writes nothing), `relationship_episodes`, `relationship_arcs`, `relationship_journal` | the user's persona instances |
 
 **Blanked** (rows kept with ids and timestamps, content cleared):
 
@@ -287,9 +288,9 @@ All streams are keyset-paged with `since`, a tie-break id, and `limit` (default 
 The response is `{user_id, erased_at, deleted: {table: n}, blanked: {table: n}}`; every table above is listed, with 0 when it had nothing to do. `blanked` counts only rows that still carried content.
 
 - **Idempotent.** A repeat finds nothing left, reports 0 everywhere, and moves `erased_at` forward, which re-announces the erasure on the deletion streams for a mirror that missed the first.
-- **Order.** Call it **before** deleting the user's sessions or persona instances. The insight chains key on the instance alone, so they are reachable only while the instance row exists.
+- **Order.** Call it **before** deleting the user's sessions or persona instances. The insight chains and the relationship scan's tables key on the instance alone, so they are reachable only while the instance row exists.
 - **Quiesce first.** A stage-1 extraction already in flight can write facts after the erase commits; stop the user's traffic before calling, and call again to clean up if one slipped through. A rebuild in flight cannot write a profile back: it writes under the state row's lock, which the erase takes first, and then finds the user gone.
-- **Not touched.** Chat history (`chat_messages`, sessions, instances) belongs to the caller's own deletion flow.
+- **Not touched.** Chat history (`chat_messages`, sessions, instances) belongs to the caller's own deletion flow. `relationship_scan_events` holds counts and ids only and is left as it is.
 
 A table added later that carries a user attribution joins the erase in the change that adds it.
 

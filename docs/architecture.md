@@ -73,6 +73,9 @@ spawn post_process     tokio::spawn — runs concurrent with response return:
                          experimental — NOT human_insights, not injected into
                          any prompt)
                        (the five run concurrently via tokio::join!)
+                       - relationship scan: the turn counts toward its
+                         relationship before the five; once 20 turns wait,
+                         the scan runs inline after them (dreaming)
 ```
 
 **Group turns** (`pipeline::group::run_group_turn`) cast speakers through the `[tasks.group_director]` call and relay each through the same reply path; see [group-chat.md](group-chat.md).
@@ -125,6 +128,9 @@ eros-engine-server :8080
                        chat_sessions / chat_messages / chat_session_members
                        companion_affinity / companion_affinity_events
                        companion_memories (vector(512))
+                       relationship_scan_state / relationship_episodes /
+                       relationship_arcs / relationship_journal /
+                       relationship_scan_events
                        persona_genomes / persona_instances / persona_instance_items
                        human_facts / human_profile_state / human_insights
                        user_erasures
@@ -141,9 +147,10 @@ The post-process spawn returns `()` and is fire-and-forget by design — the use
 `'product_qa'` = out-of-character product answer — non-NULL rows are
 excluded from short-term recall, conversation signals, affinity evaluation,
 and insight extraction while staying fully visible on the live stream,
-replay, and client history. Dreaming is the exception: it also reads
-`'voice'` rows by default (once a call goes idle; opt out with
-`DREAMING_VOICE_DISABLED`), but still excludes `'product_qa'`.
+replay, and client history. The relationship scan (dreaming) is the
+exception: it also reads `'voice'` rows by default, with the text rows of the
+same relationship (opt out with `DREAMING_VOICE_DISABLED`), but still excludes
+`'product_qa'`.
 
 **Channel ownership is enforced on writes, both ways.** `companion_stream`
 refuses a voice or group session, `voice` refuses a non-voice one, and the group
@@ -211,10 +218,15 @@ crates/
 │       ├── human_insight.rs  # HumanInsightRepo (typed profile columns, full-row replace by the rebuild)
 │       ├── character_insight.rs # CharacterInsightRepo + event/snapshot repos (AI character's profile, experimental)
 │       ├── user_insight.rs   # UserInsightRepo + event/snapshot repos (the real user's per-relationship profile, experimental)
+│       ├── scan_state.rs     # ScanStateRepo (relationship scan cursor, pending count, claims, backfill window)
+│       ├── episode.rs        # EpisodeRepo (episode summaries, the scan's segment read)
+│       ├── arc.rs            # ArcRepo (the relationship arc)
+│       ├── journal.rs        # JournalRepo (dated moments; the engine-written rows)
+│       ├── scan_event.rs     # ScanEventRepo (relationship_scan_events readout)
 │       └── persona.rs        # PersonaRepo (upsert_genome for seeding)
 └── eros-engine-server/
     └── src/
-        ├── main.rs           # serve | migrate | seed-personas | print-openapi subcommands
+        ├── main.rs           # serve | migrate | seed-personas | print-openapi | backfill-dreaming subcommands
         ├── state.rs          # AppState (pool/auth/openrouter/embed/config)
         ├── error.rs          # AppError → axum IntoResponse
         ├── auth/             # AuthValidator trait + Supabase impl + middleware

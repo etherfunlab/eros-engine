@@ -16,7 +16,7 @@
 
 ## 子命令
 
-二進制文件有四種模式（按 `argv[1]` 分派）：
+二进制文件有五种模式（按 `argv[1]` 分派）：
 
 | 子命令 | 用途 |
 |---|---|
@@ -24,8 +24,18 @@
 | `migrate` | 應用待處理的 sqlx migrations 然後退出 |
 | `seed-personas [dir]` | 读 `[dir]` 里每个 `*.toml` 文件（默认 `/etc/eros-engine/personas`——Docker 镜像里烧的示例），upsert 为人格基因 |
 | `print-openapi` | 把 OpenAPI 规范打到 stdout 后退出（不连 DB、不读 env；CI 漂移检查用） |
+| `backfill-dreaming [--dry-run] [--min-rows N] [--limit N] [--instance UUID]` | 对实时扫描开始之前的历史跑一遍关系扫描（按调用计费），然后退出 |
 
 `seed-personas` 是冪等的——再跑會 update 原有行（按 `name` 匹配），保持 UUID 跟 `persona_instances` 裡的 FK 引用穩定。
+
+`backfill-dreaming` 读取每段关系在其实时扫描起点游标之前的历史（[记忆层 → 关系记忆](memory-layers.zh.md#关系记忆)），从旧到新，每段最多 60 行，每段走一遍正常的扫描，事件行记 `kind = 'backfill'`。它和 `serve` 用同一套环境变量、数据库和模型配置，可以在服务运行时并行跑；没有任何东西会替你运行它：它从不排进计划任务，`serve` 从不启动它，它也不读 `DREAMING_DISABLED`。
+
+- **先看计划。** `--dry-run` 每段关系打印一行（`instance_id`、`rows`、`segments`），再打印合计——`N relationships, R rows: C scan calls, about A arc rewrites`——然后退出。它只读数据库和模型配置，不需要 API key，也不发任何调用。每一段就是一次扫描调用；弧线改写约为段数除以四（按关系计，连同已在等待改写的片段）；写入了记忆或纪事的段再多一次 embedding 调用。
+- **参数。** `--min-rows N` 跳过剩余行数不足的关系（默认 20；给了 `--instance` 时为 1）；`--limit N` 最多处理 `N` 段关系，行数多的优先；`--instance UUID` 只处理这一段关系。没有 `[tasks.dreaming_scan]` 时命令在构建任何客户端之前以 2 退出；未知参数也以 2 退出并打印用法。
+- **写什么。** 片段、纪事和弧线改写。画像记忆只从这样的段写入：段内有某行晚于其 session 的 `classified_at`（或 session 从未被盖戳）——其余部分已被退役的按 session 清扫器抽取过。它从不移动实时游标；它的进度是 `backfilled_through_at`，所以中断后的运行从停下的地方继续，失败的段会让这段关系停到下一次运行。
+- **与线上流量并行。** 每一段都持有这段关系的扫描认领，所以实时扫描最多等一段；被实时扫描占着的关系会被跳过，计入 `relationships skipped`。正式运行以 `segments: X ok, Y empty, Z failed; relationships skipped: S` 结束。
+
+什么时候运行它，见 [v2.6.0 迁移指南](migrating/v2-6-0-memory-2-0.md#backfill-dreaming)。
 
 ## 路径 1：Docker 自托管
 
@@ -263,7 +273,7 @@ World Stories 按实例生活模拟）默认完全关闭：模型配置里没有
 - **好感度调参：**写入管线的旋钮——`AFFINITY_GRADE_UNIT_BOND`、`AFFINITY_GRADE_UNIT_CHEM`、`AFFINITY_NEG_FACTOR`、`AFFINITY_TIER_DECAY`、`AFFINITY_CROSS_PENALTY_RATIO`、`AFFINITY_CROSS_PENALTY_START`、`AFFINITY_DELTA_THRESHOLD`、`AFFINITY_DEMO_BOOST`，以及端点派生三件套 `AFFINITY_FLOOR_RATIO` / `AFFINITY_TIME_DECAY_RATE` / `AFFINITY_TIME_DECAY_FLOOR`——全部可选，回退到 4.0 默认值。见[好感度模型 → 写入管线](affinity-model.zh.md#写入管线仅线轴基础对从不进入)。
 - **回声消除：** 每个 text 轮会注入该 session 最近消息的一个窗口（窗口大小见下面的**噪声消除**），而模型会复读 —— 线上七个模型实测 0.57%–15.38% 的 assistant 轮命中，没有一个是零。留在窗口里的重复会推高下一份拷贝的概率，那份拷贝又被存下来、又被注入。因此在单轮注入的消息里，任何出现超过一次的非空字符串，其所有出现都不注入，唯一例外是当前轮自己的用户消息，它永远保留。被丢掉的位置不回补。比较是逐字节的，且不区分角色。`CHAT_ECHO_CANCELLATION_DISABLED=1` 可以关掉；voice 路径有自己的窗口，不受影响。有丢弃的轮次会打一行 `INFO`，只含计数，不含消息内容。设计文档：[回声消除](superpowers/specs/2026-08-19-chat-echo-cancellation-design.md)。
 - **噪声消除：** 一个 text 轮仍然取一个以本轮用户消息收尾的 20 条窗口（不是单纯的会话最新 20 条——异步队列路径上它上方可能已有更新的消息），但只注入其中一部分（至少 3 条，通常不超过 17 条，上限只取决于取到的行数，见下），并且会把每条注入的 assistant 行的首句剥掉 —— 首句承载的是模型模仿自己的那部分语气（`唔` / `啊` / `嗯啊`），几乎不承载信息。同时剥掉这些行里的括号动作块（`（凑近）`这类舞台指示）并折叠剩下的空白 —— 动作块会自我传染：模型在自己近几条回复里看到什么，接下来就会写更多，光靠指令压不住历史示范出来的东西，所以让历史不再展示它们；自发出现的那部分由 `[output]` 行的标注禁令兜住。落库的 `content` 保留原文，剥的只是注入的副本。剥完为空的 assistant 行整行丢弃，不会以空内容送出（部分供应商会拒绝）；user 行不剥。每轮的 `[reactions]` 片段（用户上一条消息之后新点的 reaction）引用消息时做同样的剥离（首句与括号动作块，剥完为空则用原文），噪声消除关闭时不剥；不论那条消息在窗口内外，点在比窗口更早的消息上的 reaction 也会送到模型。注入几条取决于这段关系的 `character_insights` 行填得有多满：十个字段里非空达到 7 个，稳态下只注入 3 条 —— 当前轮永远保留，再加上上一轮的问答（上一条用户消息 + 它的助手回复）—— 每少一个字段多注入 2 条，行缺失或全空时多注入 14 条（稳态下共 17 条）。保护的是上一轮问答本身，不是固定两条，但设了下限：两条相邻的 user 行（用户连发两句、一轮被鬼、或某条 assistant 行被剥空后在上游被丢弃）不会顶掉角色真正的上一句回复 —— 下限兜住 2 条。如果那一轮助手侧留了不止一条（比如文字回复之外又插了一条图片行），保护范围会跟着扩大——总数因此可能超过 17，上限只取决于剥完之后还剩多少行。`CHAT_NOISE_CANCELLATION_DISABLED=1` 完整恢复改动前的形状：固定 20 条窗口，assistant 行整条注入，且 prompt 里的 `[character_state]` 块不再注入 `character_insights` 的那几行（物品、衣柜、穿着、余效和需求照常渲染，`[now]` 里正在经历的事件也照常渲染）（见[接口参考](api-reference.zh.md#get-v2compinstanceinstance_idinsightcharacter)）。剥空过行或收窄过窗口的轮次会打一行 `INFO`，只含计数，不含消息内容。设计文档：[噪声消除](superpowers/specs/2026-09-02-echo-cancellation-plus-design.md)。
-- **后台 sweeper：**`serve` 还会跑 dreaming-lite（会话结束记忆分类器）、insight 快照和画像重建三个 sweeper。都可选：`DREAMING_DISABLED=1` / `SNAPSHOT_DISABLED=1` / `PROFILE_REBUILD_DISABLED=1` 关掉，不影响聊天路径。dreaming 每 `DREAMING_TICK_SECS`（默认 300）秒醒一次，分类空闲至少 `DREAMING_IDLE_SECS`（默认 1800）秒的会话；分类认领超过 `DREAMING_CLAIM_STALE_SECS`（默认 600）秒视为 worker 崩溃、可被重新认领。`DREAMING_VOICE_DISABLED=1` 会把清扫器收回到只扫文字 session（默认结束的语音通话也会被蒸馏成记忆——见 [memory-layers.zh.md](memory-layers.zh.md#语音轮次)）。快照 sweeper 按 6 段 cron `SNAPSHOT_CRON`（默认 `0 0 23 * * *`）在 `SNAPSHOT_TZ`（默认 `Asia/Singapore`）时区运行；cron 解析失败则 sweeper 不启动（聊天路径不受影响），时区解析失败回退默认值。画像重建 sweeper 每 `PROFILE_REBUILD_TICK_SECS`（默认 300；`0` 同样关停）秒醒一次，重建至多 `PROFILE_REBUILD_BATCH`（默认 20）个新抽取的事实已搁置至少 `PROFILE_REBUILD_IDLE_SECS`（默认 3600）秒的用户，每个用户一次 LLM 调用；超过 600 秒的重建认领视为 worker 崩溃、可被重新认领。sweeper 关闭时，用户仍会在抽取他事实的那次运行使待处理数达到 20 时被重建。见[洞察](insights.zh.md#派生画像)。
+- **后台 sweeper：**`serve` 还会跑 dreaming（关系扫描）、insight 快照和画像重建三个 sweeper。都可选：`DREAMING_DISABLED=1` / `SNAPSHOT_DISABLED=1` / `PROFILE_REBUILD_DISABLED=1` 关掉，不影响聊天路径。每个 1:1 轮次都计入所在关系的扫描，文字轮次发现已有 20 轮待扫时就地扫描这段关系。dreaming 清扫器每 `DREAMING_TICK_SECS`（默认 300）秒醒一次，先为引擎写下的、还没有向量的纪事行补上 embedding，再扫描最多 10 段待扫轮数至少 3、最后一次被计入的轮次早于 `DREAMING_IDLE_SECS`（默认 3600）秒的关系；扫描认领超过 `DREAMING_CLAIM_STALE_SECS`（默认 600）秒视为 worker 崩溃、可被重新认领。`DREAMING_DISABLED=1`（或 `DREAMING_TICK_SECS=0`）同时停掉就地扫描和清扫器；没有 `[tasks.dreaming_scan]` 时两者都不运行；轮次照样计数，引擎自己的纪事行照样写入。`DREAMING_VOICE_DISABLED=1` 让扫描不读语音 session，语音轮次也不再计入（默认通话会和同一段关系的文字行一起被扫描——见 [memory-layers.zh.md](memory-layers.zh.md#语音轮次)）。一段关系第一个被计入的轮次之前的历史，只由 `backfill-dreaming` 子命令读取（[子命令](#子命令)）。快照 sweeper 按 6 段 cron `SNAPSHOT_CRON`（默认 `0 0 23 * * *`）在 `SNAPSHOT_TZ`（默认 `Asia/Singapore`）时区运行；cron 解析失败则 sweeper 不启动（聊天路径不受影响），时区解析失败回退默认值。画像重建 sweeper 每 `PROFILE_REBUILD_TICK_SECS`（默认 300；`0` 同样关停）秒醒一次，重建至多 `PROFILE_REBUILD_BATCH`（默认 20）个新抽取的事实已搁置至少 `PROFILE_REBUILD_IDLE_SECS`（默认 3600）秒的用户，每个用户一次 LLM 调用；超过 600 秒的重建认领视为 worker 崩溃、可被重新认领。sweeper 关闭时，用户仍会在抽取他事实的那次运行使待处理数达到 20 时被重建。见[洞察](insights.zh.md#派生画像)。
 - **异步对话队列（可选）：**`POST /v2/comp/session/{session_id}/message/async`（见 [API 参考](api-reference.zh.md#post-v2compsessionsession_idmessageasync)）把一轮对话交给后台 worker 处理，而不是流式返回——回复落在 `engine.chat_messages`，从历史接口或 Supabase Realtime 读取。这是第五个启动期 sweeper；`CHAT_QUEUE_DISABLED=1` 只停 worker（跟其他 sweeper 一致）——入队照样成功，只是会一直 `pending` 到重新开启。（worker 关闭时 stream 轮次仍由请求自己驱动，但回收器也停了：崩溃遗留的 `claimed` 行不会被回收，会一直挡住该会话的异步轮次，直到重新开启。）worker 每 `CHAT_QUEUE_TICK_SECS`（默认 5）秒醒一次，外加每次入队的即时唤醒；同时最多跑 `CHAT_QUEUE_CONCURRENCY`（默认 4）轮；认领超过 `CHAT_QUEUE_GEN_TIMEOUT_SECS` + `CHAT_QUEUE_CLAIM_STALE_SECS`（默认 300 + 300）秒视为 worker 崩溃、可被重新认领——stale 窗口是生成截止线**之后**的宽限，还在跑的轮次不会被中途回收；一轮总共最多跑 `CHAT_QUEUE_MAX_ATTEMPTS`（默认 3）次，用完标记为 `failed`；单次生成上限 `CHAT_QUEUE_GEN_TIMEOUT_SECS`（默认 300）秒；`CHAT_QUEUE_PENDING_CAP`（默认 20）是单会话入队深度上限，超过返回 `429 rate_limited`。这些参数填零或负值时回退默认值——只有 `CHAT_QUEUE_CONCURRENCY=0` 有含义：worker 不认领任何轮次（只做回收），等于第二个开关。队列顺序是严格的单会话 LIFO——会话里最新的消息最先处理，不会被丢弃或合并。stream 轮次以 born-claimed 行的形式共用这张表（单次尝试，由请求自己的 drive task 结算）；只有进程半途死亡、行被回收后，worker 才会接手。被回收器释放的群聊轮次会被结算为失败并附一条通知，不会再当作 1:1 轮次重新驱动（见[群聊](group-chat.zh.md#失败与结算)）。设计文档：[async chat endpoint spec](superpowers/specs/2026-08-20-async-chat-endpoint-design.md)。
 - **消息 reaction：** `CHAT_REACTION_EMOJI` 限定用户可以点哪些 emoji，逗号分隔，例如 `👍,❤️,😂,🔥`。不设置或为空时允许全部标准 emoji。按基础形匹配，列出 `👍` 就允许它的所有肤色。有一项不是恰好一个标准 emoji 时拒绝启动，并报出是哪一项。客户端从 `GET /v2/comp/reactions` 读取实际范围。
 - **OpenRouter 归因（可选）：**在模型配置的 `[providers.openrouter]` 下声明一个 `headers` 表——`HTTP-Referer` / `X-OpenRouter-Title` / `X-OpenRouter-Categories`——给每个出站 OpenRouter 调用加归因头，让部署出现在 OpenRouter 的应用面板上；不写这个条目（或不写它的 `headers` key）就保持匿名。见 [model-config.zh.md → 通过 `[providers].openrouter` 覆盖内置端点](model-config.zh.md#通过-providersopenrouter-覆盖内置端点)。旧的 `OPENROUTER_APP_REFERER` / `OPENROUTER_APP_TITLE` / `OPENROUTER_APP_CATEGORIES` 环境变量已软废弃：仍然设置也只会被静默忽略，不是启动报错；`OPENROUTER_BASE_URL` 则彻底移除——改用 `[providers].openrouter.chat` / `.embeddings` 覆盖端点 URL。
@@ -291,5 +301,6 @@ World Stories 按实例生活模拟）默认完全关闭：模型配置里没有
 ## 源碼
 
 - `docker/Dockerfile`——多阶段构建（Rust 1.98 构建器 → debian:bookworm-slim 运行时）；`ghcr.io/etherfunlab/eros-engine` 就是用它构建的同一份产物
-- `crates/eros-engine-server/src/main.rs`——子命令分派（上面那四种模式）
+- `crates/eros-engine-server/src/main.rs`——子命令分派（上面那五种模式）
+- `crates/eros-engine-server/src/backfill.rs`——`backfill-dreaming`
 - [`.env.example`](../.env.example)——运维环境变量清单（细节见本指南）

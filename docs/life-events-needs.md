@@ -458,7 +458,7 @@ on, the story and world directors read them too ([Beyond the chat](#beyond-the-c
   Chinese name per kind (`reading` is `在看书`, `long_trip` is `长途旅游`). The line is absent
   when nothing is under way, no offline stretch is unexplained, no separation awaits its return
   mark and no false alarm is unresolved (below).
-- **The reply** gets `- 正在经历：` under `[now]`, after the time, holiday and birthday lines,
+- **The reply** gets `- 正在经历：` under `[now]`, after the time, holiday, birthday and anniversary lines,
   listing the same two events with only the end. The `- 刚才：` line below follows it. Both sit
   outside `[character_state]`, whose header defers to the blocks above it, so a story digest
   written before an event started does not override the event:

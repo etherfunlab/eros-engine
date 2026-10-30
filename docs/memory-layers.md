@@ -2,14 +2,14 @@
 
 [English](memory-layers.md) · [中文](memory-layers.zh.md)
 
-Two pgvector tables hold what the persona remembers about you. They serve different recall needs and are queried separately.
+Two layers hold what the persona remembers about you. They serve different recall needs and are queried separately.
 
 ## Profile vs Relationship
 
 | Layer | `instance_id` | What it holds | Lifetime |
 |-------|---------------|---------------|----------|
 | **Profile** | `NULL` | Cross-session facts about the user — things any persona can come to know as it gets close to the user. | Permanent |
-| **Relationship** | `<uuid>` | Per-session callbacks — the small things this specific persona shared with this user. | Per session |
+| **Relationship** | `<uuid>` | What passed between this specific persona and this user: what the user said to it, plus the arc, episodes and journal the [relationship scan](#relationship-memory) draws from the conversation. | Until the relationship is archived |
 
 The distinction matters because **persona stability across personas** is different from **intimacy within a relationship**. If you tell Aria you're allergic to peanuts, that's a profile fact — Kenji can know it too, once he and the user are past strangers (see [Affinity gate](#affinity-gate)). If Aria mentioned she's reading Bishop tonight, that's a relationship memory — Kenji shouldn't pretend to know.
 
@@ -42,6 +42,8 @@ CREATE INDEX idx_memories_session
   ON engine.companion_memories(session_id)
   WHERE instance_id IS NOT NULL;
 ```
+
+The relationship scan's own products live in separate tables keyed by the persona instance; see [Relationship memory](#relationship-memory).
 
 ## Embedding
 
@@ -89,7 +91,7 @@ Relationship-layer search filters on `instance_id = $2` instead and adds `conten
 Two independent writers, on different schedules:
 
 1. **Raw-turn writer** (`write_turn`, post-process) — runs on **every** substantive turn (non-empty user utterance and at least one non-empty assistant message). It embeds **the user's utterance only** into *both* layers — never the assistant's prose, which fed back into the model's own prompt via recall and collapsed replies to a repeated line (issue #113). The relationship-layer copy is prefixed `用户：` so a recalled line stays readable as "what the user said." These rows carry `category = NULL` and `metadata = NULL`.
-2. **Dreaming-lite sweeper** (`[tasks.memory_extraction]`, `pipeline::dreaming`) — a background, idle-session-triggered pass that asks an LLM for durable memory candidates. It writes **profile-layer rows only**, tagged `category ∈ {fact, preference, event, emotion, relation}` (anything else the model invents collapses to `fact`) plus an opaque `metadata` payload.
+2. **Relationship scan** (`[tasks.dreaming_scan]`, `pipeline::dreaming`) — a per-relationship pass over the conversation after its cursor ([Relationship memory](#relationship-memory)). Of its three outputs only the profile memories land in this table: **profile-layer rows**, tagged `category ∈ {fact, preference, event, emotion, relation}` (anything else the model invents collapses to `fact`) plus an opaque `metadata` payload. Its episodes and journal moments go to their own tables.
 
 `insight_extraction` is a **separate** pipeline and writes nothing to this table: it records atomic facts about the user in a fact ledger (`human_facts`), and a scheduled rebuild derives the flat `human_insights` profile from that ledger; none of it is embedded here (see [insights.md](insights.md)). Two further experimental, per-relationship chains (`character_insight_*`, `user_insight_*`) UPSERT into their own flat tables — `character_insights` (see [api-reference.md](api-reference.md#get-v2compinstanceinstance_idinsightcharacter)) and `user_insights` (see [api-reference.md](api-reference.md#get-v2compinstanceinstance_idinsightuser)); like `human_insights`, neither table is embedded into this one. `user_insights` is not injected into any chat, voice, or PDE prompt; `character_insights` is — four of its fields render the chat prompt's `[character_state]` block, and how completely the row is filled sizes the injected history window (see [deploying.md](deploying.md#operational-notes)).
 
@@ -100,6 +102,87 @@ So embeddings *are* generated once per substantive turn, not only for LLM-surfac
 ## What doesn't get stored
 
 Raw chat messages live in `engine.chat_messages` (full transcript, plain text). They are **not** embedded. The memory tables hold *summaries* and *facts*, not the full message log. If you want to retrieve the actual transcript, query `chat_messages` directly — that's the source of truth for what was said.
+
+## Relationship memory
+
+The relationship scan (`[tasks.dreaming_scan]`, `pipeline::dreaming`) reads one relationship's conversation — one persona instance and its owner — and writes three products besides the profile memories. All of them are extracted from the conversation; the user never writes them.
+
+| Table | One row per | What it holds |
+|-------|-------------|---------------|
+| `relationship_episodes` | scanned stretch | A summary of that stretch, at most 400 characters, with `started_at` / `ended_at` taken from the first and last row it covers. Append-only. |
+| `relationship_arcs` | relationship | `opening` (how it began, at most 150 characters, written by the first rewrite and never again), `arc` (the story so far, at most 900 characters) and `previous_arc`. |
+| `relationship_journal` | moment | `occurred_on` (the user's local day), `kind`, `realm`, a one-sentence `summary` (at most 200 characters) and an embedding for semantic recall. |
+
+`relationship_scan_state` holds each relationship's cursor, pending-turn count and claim, and `relationship_scan_events` one counts-only row per scan or arc attempt ([LLM audit](llm-audit.md#relationship-scanner)). None of these tables has a `user_id`: the instance determines the owner.
+
+### When a relationship is scanned
+
+- Every 1:1 text turn counts toward its relationship's pending turns, and so does a voice turn unless `DREAMING_VOICE_DISABLED` is set. Group turns do not count. The first counted turn creates the relationship's scan state with the cursor just before that turn; earlier history is the [backfill](deploying.md#subcommands)'s.
+- At **20** pending turns the text turn's post-processing scans inline, after the turn's other writes, up to the turn's own newest row. A voice turn never scans inline.
+- The dreaming sweeper wakes every `DREAMING_TICK_SECS` (default 300) and scans up to 10 relationships with at least **3** pending turns whose last counted turn is older than `DREAMING_IDLE_SECS` (default 3600), longest-waiting first. A relationship under 3 pending turns waits until it reaches 3.
+- Both paths claim the relationship first, so two workers never scan it at once. `DREAMING_DISABLED=1` (or `DREAMING_TICK_SECS=0`) stops both, and neither runs without `[tasks.dreaming_scan]`.
+
+### What a scan reads and writes
+
+A scan reads at most **60** rows after the cursor: the user and assistant rows of the pair's non-archived text and voice sessions, in time order, never product-QA rows. They go to the model as one transcript, a line per row stamped `[#n YYYY-MM-DD HH:MM]` in the user's timezone (the last valid one a text turn of the relationship carried; UTC without). Voice assistant rows lose their TTS audio tags; a user row that carried an action shows its marker and, once answered, the outcome. One call returns profile memories, one episode summary and journal moments; the contract is in [Model config](model-config.md#tasksdreaming_scan--relationship-scan-opt-in).
+
+The memories and journal summaries are embedded in one batch call; then the episode is written, then the memories, then the journal rows, and the cursor moves to the last row read. Rows past the 60-row cap wait for the next scan. A stretch with nothing readable moves the cursor without a call.
+
+A failed call, an unparsable reply, a failed embedding call or a database error before the writes leaves the cursor in place, and the sweeper retries after one idle period. The third consecutive failure skips the stretch with a warning; its raw rows stay. An archive or erasure that lands during a scan wins: the scan writes nothing further.
+
+### The arc
+
+Every fourth episode triggers a rewrite (`[tasks.arc_rewrite]`, engine-owned prompt) from the opening, the previous arc and the episodes not yet folded, each with its dates. The prompt asks for 400–600 characters in time order, with an earlier state kept as 曾经……后来……, older events more compressed, each act attributed to the right side, and roleplay written as roleplay. The engine rejects a rewrite that does not parse, runs over 900 characters, comes in under 70% of a previous arc longer than 300 characters, or, on the first rewrite, lacks an opening or has one over 150 characters. A rejected or failed rewrite leaves the previous arc serving and is retried at the next fourth episode, with the waiting episodes carried along; after three in a row they are marked folded without a new arc. Without `[tasks.arc_rewrite]` episodes stay unfolded.
+
+### The journal
+
+The engine writes some rows itself, with no LLM call and `realm = real`:
+
+| Moment | `kind` | Comes back |
+|--------|--------|------------|
+| The relationship's first chat, journaled when its first turn is counted and dated by its earliest chat row | `first_meet` | monthly, then yearly |
+| A bond or chemistry label reached for the first time, in the affinity write's transaction | `tier_reached` | no |
+| An accepted `give`, `gift` or `tip` action (a tip never states its amount) | `gift` | no |
+| The first accepted `kiss` action | `first_intimacy` | no |
+
+A label already journaled for the relationship is not journaled again, even when a later session reaches it anew. A line that falls takes back its `tier_reached` rows for the labels it fell below while they are under 24 hours old, whether the drop came from a judged turn, a refused action or a life choice. `hug`, `touch`, `lick` and `custom` actions are not journaled.
+
+The scan's model writes the rest: `confession`, `first_intimacy`, `conflict`, `reconciliation`, `promise`, `gift`, `shared_plan` and `user_shared_milestone`, each dated by a stamp of the transcript it came from. `realm` follows initiative, never physical reality: `real` when the character initiates, or the user invites and the character agrees; `roleplay` when the user supplies the script, sets the scene or narrates the moment and the character performs it. A `promise` or `shared_plan` with a due date comes back on that day. Where only one row makes sense, a key keeps the first writer: one `first_meet`, one `first_intimacy` per realm, one `gift` per message, one `tier_reached` per line and label.
+
+Engine rows are written without a vector, and the sweeper embeds them at its next tick, up to 100 per tick in one call. Until then, and on a deployment whose sweeper does not run, they are left out of semantic recall; the anniversary lines do not need a vector.
+
+### In the prompt
+
+On a 1:1 prompt (text turns, proactive messages, image-edit replies) the relationship part of `[shared_memories]` becomes:
+
+```
+[shared_memories]
+{opening}
+{arc}
+- 2026-10-12：{episode summary}
+- 2026-10-20：{episode summary}
+- 2026-08-15（扮演）：{journal summary}
+- 用户：…
+```
+
+- The arc paragraph: the opening and the arc, each on its own line.
+- Up to three episodes, the latest by end time, oldest first, each dated by its start in the request's timezone (UTC without one).
+- Up to two journal moments, the nearest to the turn's query embedding first, dated by `occurred_on`; a `roleplay` moment is marked `（扮演）`.
+- The raw recalled rows, as before.
+- **Budget: 1,200 characters** for this part; the `[world_memories]`, `[world_stories]` and `[character_state]` sections under the same header are outside it. Over budget, lines go in this order: episodes oldest first, then raw rows from the lowest-ranked, then journal moments from the farthest. The arc is never cut.
+- **Nothing new, nothing changed.** A relationship with no arc, no episode and no journal moment near the turn gets the block exactly as before: the raw rows with no budget, or the placeholder when there are none.
+
+**Anniversary lines** go under `[now]`, after the birthday line, at most two per turn, the first meeting's first. They read the relationship's recurring `real` journal rows and need the request's `user_timezone`, like the holiday line:
+
+- `first_meet`, months 1–11: on the same day of the month (clamped to the month's end) and only that day, `今天是你们认识满 N 个月的日子。`
+- `first_meet`, from 12 months: the yearly date, from six days before it, `今天` / `明天` / `N 天后是你们认识满 Y 年的日子。`
+- A due `promise` or `shared_plan`: on its day, `今天是你们约好的日子：{summary}。`
+
+All of it, anniversary lines included, follows `memory_scope`'s relationship flag: none under `neutral_only`, `insights_only` or `none`. The [affinity gate](#affinity-gate) does not trim it — the arc, episodes and journal render at every tier, being this relationship's own memory. Group seats get none of it. The voice bootstrap carries the opening and arc as `[你们的故事]` ([Voice turns](#voice-turns)); per-turn voice recall does not search the journal.
+
+### Earlier history
+
+The scan starts at each relationship's first counted turn. The `backfill-dreaming` subcommand reads what came before ([Deploying → Subcommands](deploying.md#subcommands)); it is a manual, paid operator step that `serve` never runs.
 
 ## Retrieval and injection
 
@@ -121,7 +204,9 @@ builds a profile/relationship context block from two sources:
 - **Relationship layer** — `companion_memories` rows pulled by semantic
   (embedding) similarity search against the current turn, included when the
   scope keeps relationship memory (`full` / `neutral_and_relationship` /
-  `relationship_only`).
+  `relationship_only`). On 1:1 prompts the relationship's arc, latest
+  episodes and nearest journal moments join them under the same flag
+  ([Relationship memory → In the prompt](#in-the-prompt)).
 
 `memory_scope = none` skips memory injection entirely. **`memory_scope` gates
 prompt injection only — never writes.** Even under `none`, the raw-turn writer
@@ -158,16 +243,16 @@ edit.
   | `finance` | bond | 4 | `finance_status` |
   | `health`, `mental_health` | bond | 4 | `mental_health` |
 
-  The domain is the label the `memory_extraction` prompt writes
+  The domain is the label the `dreaming_scan` prompt writes on each memory
   ([model-config.md](model-config.md)); it is matched trimmed and
   case-insensitively. Any other value, a non-string, or no domain at all
-  passes on the K ramp alone. Uncategorized rows (raw turns, before the
-  dreaming sweeper reaches a user) carry no domain, so they are only
-  K-limited. Withheld rows still count toward their category's fetched K:
+  passes on the K ramp alone. Uncategorized rows (raw turns) carry no
+  domain, so they are only K-limited. Withheld rows still count toward their category's fetched K:
   the search runs once at the usual K and the gate trims its result.
 - **Relationship layer** — K is the usual K capped at the higher tier
   (text: 1 / 2 / 3 at tiers 1 / 2 / 3+; voice: 1 / 2). Content is not
-  filtered: it is what the user said to this persona.
+  filtered: it is what the user said to this persona. The arc, episodes and
+  journal are not gated at all; they render at every tier.
 
 ### Voice turns
 
@@ -180,9 +265,11 @@ the request shape and [model-config.md](model-config.md) for the
 - **Bootstrap snapshot** — assembled once, on a session's first turn, and
   frozen into `chat_sessions.metadata.voice_bootstrap`; re-injected verbatim
   on every later turn (OpenRouter is stateless, so there is no "inject once"
-  on the wire — later turns cannot change it). Four parts: `human_insights`
+  on the wire — later turns cannot change it). Five parts: `human_insights`
   bullets at Neutral tier by default (tunable via that first turn's
-  `memory_scope`); the previous voice call's last 8 messages rendered as a
+  `memory_scope`); the relationship's opening and arc as `[你们的故事]`,
+  when it has an arc and that first turn's `memory_scope` keeps relationship
+  memory; the previous voice call's last 8 messages rendered as a
   plain transcript; the lingering effects of the text session the call
   reads its relationship line from (see
   [API reference](api-reference.md#get-v2compsessionsession_ideffects));
@@ -203,22 +290,24 @@ the request shape and [model-config.md](model-config.md) for the
   backchannels) skips recall entirely, with no embedding call. Deployment
   kill-switch: `[tasks.chat_voice] recall = false` (default `true`) always
   wins over the request's `memory_scope`.
-- **Post-call writes only** — a live voice turn never writes: no raw-turn
-  embed, no insight extraction, no affinity eval. What a call *does* leave
-  behind is written after it ends: once the session has been idle for
-  `DREAMING_IDLE_SECS`, the dreaming-lite sweeper reads its transcript and
-  distills categorized profile-layer `companion_memories` rows, exactly as it
-  does for text sessions. Those rows are ordinary memories — later calls and
+- **Writes go through the scan** — a live voice turn writes no memory: no
+  raw-turn embed, no insight extraction, no affinity eval. It counts toward
+  its relationship's [scan](#relationship-memory) but never scans inline;
+  the sweeper scans the relationship once it has gone idle with at least 3
+  pending turns, and a text turn's inline scan reads any voice rows in its
+  range. The scan reads the call together with the text rows of the same
+  relationship and writes profile memories, an episode and journal moments
+  from it, exactly as for text. Those are ordinary memories — later calls and
   text chats both recall them. Inline TTS audio tags (`[laughs]`, `[sighs]`,
   when `tts_audio_tags` is on) are stripped from voice assistant rows first,
-  so stage directions never become memory text. Operators can turn the whole
-  behavior off with `DREAMING_VOICE_DISABLED=1`, which restores the earlier
-  text-only sweeper filter; note that a call swept while the flag was on is
-  never re-swept after turning it off (`classified_at` is stamped once).
-  Relationship-layer rows are still never written from voice.
+  so stage directions never become memory text. `DREAMING_VOICE_DISABLED=1`
+  leaves voice sessions out of the scan and stops voice turns from counting.
+  The cursor moves by time, so voice rows passed over while the flag is set
+  are not read after it is cleared. No raw relationship-layer row is ever
+  written from voice.
 - **What a barge-in leaves behind** — an interrupted turn contributes the text
   the client reported as actually spoken, not the full generation, so the
-  sweeper distills what the user *heard*. A turn cut off before the first
+  scan reads what the user *heard*. A turn cut off before the first
   audible word contributes only the user's line, because no assistant row is
   written at all. Either way the transcript matches the call, which is the
   whole point of recording the interrupt.
@@ -227,16 +316,22 @@ Design specs:
 [2026-08-09-voice-memory-bootstrap-recall-design.md](superpowers/specs/2026-08-09-voice-memory-bootstrap-recall-design.md)
 (bootstrap + recall) and
 [2026-08-09-voice-dreaming-ingestion-design.md](superpowers/specs/2026-08-09-voice-dreaming-ingestion-design.md)
-(post-call ingestion).
+(voice rows in dreaming). The relationship scan:
+[2026-10-28-memory-2-dreaming-plus-design.md](superpowers/specs/2026-10-28-memory-2-dreaming-plus-design.md).
 
 ## Source
 
 - `crates/eros-engine-store/src/memory.rs` — `MemoryRepo` (upsert + search, 7 sqlx::test integration tests)
 - `crates/eros-engine-store/src/human_insight.rs` — flat, typed `human_insights` store; the profile rebuild's `replace_profile` writes it, the reply handler reads it at injection; the fact ledger is in `human_fact.rs`
+- `crates/eros-engine-store/src/scan_state.rs`, `episode.rs`, `arc.rs`, `journal.rs`, `scan_event.rs` — the relationship scan's tables: cursor and claims, episodes and the segment read, the arc, the journal (including the engine-written rows), the event rows
 - `crates/eros-engine-llm/src/voyage.rs` — native Voyage client
 - `crates/eros-engine-llm/src/embedding.rs` — `EmbeddingRouter` + OpenRouter-compatible client
-- `crates/eros-engine-server/src/pipeline/post_process.rs` — raw-turn write path
-- `crates/eros-engine-server/src/pipeline/dreaming.rs` — dreaming-lite sweeper
+- `crates/eros-engine-server/src/pipeline/post_process.rs` — raw-turn write path; counts each text turn toward its relationship's scan
+- `crates/eros-engine-server/src/pipeline/dreaming/` — the relationship scan: triggers and sweeper (`mod.rs`), the scan and the arc rewrite (`scan.rs`), the reply's parsing and guards (`parse.rs`), the transcript (`render.rs`)
+- `crates/eros-engine-server/src/relationship_context.rs` — loads the arc, episodes and journal for a turn and renders the relationship part of `[shared_memories]`
+- `crates/eros-engine-server/src/anniversary.rs` — the anniversary lines under `[now]`
+- `crates/eros-engine-server/src/backfill.rs` — the `backfill-dreaming` subcommand
 - `crates/eros-engine-server/src/pipeline/handlers.rs` — retrieval + prompt injection
 - `crates/eros-engine-server/src/pipeline/voice.rs` — voice-turn bootstrap snapshot + per-turn recall
 - `crates/eros-engine-store/migrations/0000_baseline.sql` — the table, its indexes, and the `category` / `metadata` columns (folded from the pre-baseline chain)
+- `crates/eros-engine-store/migrations/0082_relationship_memory.sql` — the relationship scan's five tables

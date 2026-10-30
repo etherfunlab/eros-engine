@@ -37,7 +37,7 @@ model = "provider/chat-model"
 # extraction.toml
 [tasks.insight_extraction]
 model = "provider/extract-model"
-[tasks.memory_extraction]
+[tasks.dreaming_scan]
 model = "provider/extract-model"
 ```
 
@@ -522,7 +522,7 @@ BYOK hop 使用其请求中 `byok` 块的 `output_regex` 规则，而不是这�
 | 名称 | 使用方 | 状态 |
 |---|---|---|
 | `chat_companion` | `pipeline::handlers`，通过 `resolve()`（chat completion） | live |
-| `insight_extraction` | `pipeline::post_process::extract_facts`（人类链的事实抽取——1:1 聊天里每条产出的助手消息各一次调用，群聊每轮一次；它把原子事实写进用户的事实账本，不写画像。持有 prompt，与 `character_insight_extraction` / `user_insight_extraction` / `memory_extraction` 共用同一个必填-`filter_prompt` 闸门。这个块是抽取的总开关——任务块缺失即关闭。输出契约：[洞察 → 事实抽取](insights.zh.md#事实抽取)） | live |
+| `insight_extraction` | `pipeline::post_process::extract_facts`（人类链的事实抽取——1:1 聊天里每条产出的助手消息各一次调用，群聊每轮一次；它把原子事实写进用户的事实账本，不写画像。持有 prompt，与 `character_insight_extraction` / `user_insight_extraction` / `dreaming_scan` 共用同一个必填-`filter_prompt` 闸门。这个块是抽取的总开关——任务块缺失即关闭。输出契约：[洞察 → 事实抽取](insights.zh.md#事实抽取)） | live |
 | `profile_rebuild` | `pipeline::profile_rebuild`（按计划用用户的整个事实账本重建 `human_insights` 画像——累积 20 条事实或闲置一段时间后触发，绝不逐轮；见[洞察](insights.zh.md#派生画像)。**仅参数，不接受 `filter_prompt`**——它的 prompt 写在 `prompt.rs` 里，必须与它要填的 `human_insights` 列保持同步，所以设置该键会拒绝启动，**任何写法都算，包括显式留空**——与 `affinity_evaluation` 同样处理。块缺失时重建会退回到 `insight_extraction` 的模型/预算（只有那个块也缺失时才落到全局默认）。`[tasks.insight_structuring]` 块会被忽略） | live |
 | `chat_output_filter` | `pipeline::stream`，通过 `resolve_output_filter()`（交付前对 chat 回复进行可选的二次改写） | live |
 | `pde_decision` | `pipeline::stream`（通过 `run_pde_decision` 实现的 opt-in LLM 判断器，由 `run_stream` 调用；缺少 `filter_prompt` 或 LLM 调用失败时使用规则引擎） | live（opt-in） |
@@ -533,11 +533,13 @@ BYOK hop 使用其请求中 `byok` 块的 `output_regex` 规则，而不是这�
 | `chat_product_qa` | `pipeline::stream`，通过 `resolve_product_qa()`（PDE `product_qa` 动作的出戏产品问答执行器；任务块缺失或 `filter_prompt` 为空白时关闭；还需要 LLM PDE 已启用） | live（opt-in） |
 | `affinity_evaluation` | `pipeline::post_process`（每轮好感度裁决——四个档位线轴加 warmth/patience 两个 1..3 绝对档，由引擎侧换算；每个 Reply 轮次后以 fire-and-forget 方式运行；**不接受 `filter_prompt`** —— 该 prompt 由引擎持有，设置该键会拒绝启动——**任何写法都算，包括显式留空**。与这里其它任务不同，空白在这里不等于"关闭"，请直接不写这个键。见 issue #210） | live |
 | `affinity_summary` | `pipeline::post_process::summarize_feeling`（改写 `companion_affinity.feeling_clause`——即 `[feelings]` 块的第一人称叙述——依据档位标签与近期判官理由；仅在好感度写入之后、"移动回合"上运行（任意判官档位有变化、端点档位偏离基线，ghost，或动作被拒绝而降档），且仅当本次请求确实注入了好感度轴；按当轮请求计费给当前用户，不是 sweeper。**不接受 `filter_prompt`**——该 prompt 由引擎持有，与 `affinity_evaluation` 同样处理，设置该键会拒绝启动。块缺失 ⇒ `feeling_clause` 保持 `NULL`，`[feelings]` 永不渲染） | live（opt-in） |
-| `character_insight_extraction` | `pipeline::post_process`（角色链 stage 1 —— 实验特性 —— 针对 AI **角色**的逐轮事实挖掘，是 `insight_extraction` 人类侧挖掘的镜像。持有 prompt，与 `insight_extraction` / `memory_extraction` 共用同一个必填-`filter_prompt` 闸门。这个块是整条链（两个 stage）的总开关——任务块缺失即关闭） | experimental（opt-in） |
+| `character_insight_extraction` | `pipeline::post_process`（角色链 stage 1 —— 实验特性 —— 针对 AI **角色**的逐轮事实挖掘，是 `insight_extraction` 人类侧挖掘的镜像。持有 prompt，与 `insight_extraction` / `dreaming_scan` 共用同一个必填-`filter_prompt` 闸门。这个块是整条链（两个 stage）的总开关——任务块缺失即关闭） | experimental（opt-in） |
 | `character_insight_structuring` | `pipeline::post_process`（角色链 stage 2 —— 实验特性 —— 把 stage 1 挖掘出的事实加上已有的 `character_insights` 行，转成类型化的十列对象。**仅参数，不接受 `filter_prompt`** —— 它的 prompt 写在 `prompt.rs` 里，必须与它要填的 `character_insights` 列保持同步，所以设置该键会拒绝启动，**任何写法都算，包括显式留空**——与 `affinity_evaluation` 同样处理。块缺失时 stage 2 会退回到 stage 1 的模型/预算，绝不退到全局默认） | experimental（opt-in） |
-| `user_insight_extraction` | `pipeline::post_process`（用户链 stage 1 —— 实验特性 —— 针对真人**用户**的逐轮事实挖掘，但按关系分开，而不是全局的 `insight_extraction`。持有 prompt，与 `insight_extraction` / `character_insight_extraction` / `memory_extraction` 共用同一个必填-`filter_prompt` 闸门。这个块是整条链的总开关——任务块缺失即关闭） | experimental（opt-in） |
+| `user_insight_extraction` | `pipeline::post_process`（用户链 stage 1 —— 实验特性 —— 针对真人**用户**的逐轮事实挖掘，但按关系分开，而不是全局的 `insight_extraction`。持有 prompt，与 `insight_extraction` / `character_insight_extraction` / `dreaming_scan` 共用同一个必填-`filter_prompt` 闸门。这个块是整条链的总开关——任务块缺失即关闭） | experimental（opt-in） |
 | `user_insight_structuring` | `pipeline::post_process`（用户链 stage 2 —— 实验特性 —— 把 stage 1 挖掘出的事实加上已有的 `user_insights` 行，转成类型化的十列对象。**仅参数，不接受 `filter_prompt`** —— 它的 prompt 写在 `prompt.rs` 里，必须与它要填的 `user_insights` 列保持同步，所以设置该键会拒绝启动，**任何写法都算，包括显式留空**——与 `affinity_evaluation` 同样处理。块缺失时 stage 2 会退回到 stage 1 的模型/预算，绝不退到全局默认） | experimental（opt-in） |
-| `memory_extraction` | dreaming sweeper（会话结束时进行 memory 整合；任务块缺失时关闭）。prompt 给每条记忆打的 `domain` 标签决定召回：`sexuality` / `kink`、`romance`、`family`、`finance`、`health` / `mental_health` 的记忆，要等这段关系的亲密度到了对应档位才进 prompt（[记忆层 → 亲密度门控](memory-layers.zh.md#亲密度门控)） | live（opt-in） |
+| `dreaming_scan` | `pipeline::dreaming::scan`，通过 `resolve_dreaming_scan()`（关系扫描：一段关系的一截对话一次调用，返回画像记忆、片段摘要和纪事时刻；待扫轮数到 20 时就地运行，也由 dreaming 清扫器和 `backfill-dreaming` 运行。持有 prompt，加入必填-`filter_prompt` 闸门。这个块是扫描的总开关——任务块缺失即关闭。prompt 给每条记忆打的 `domain` 标签决定召回：`sexuality` / `kink`、`romance`、`family`、`finance`、`health` / `mental_health` 的记忆，要等这段关系的亲密度到了对应档位才进 prompt（[记忆层 → 亲密度门控](memory-layers.zh.md#亲密度门控)）。契约见[下文](#tasksdreaming_scan--关系扫描opt-in)） | live（opt-in） |
+| `arc_rewrite` | `pipeline::dreaming::scan`，通过 `resolve_arc_rewrite()`（每满四个片段折入一次关系弧线。**仅参数，不接受 `filter_prompt`**——prompt 由引擎持有，回复由弧线校验解析，所以设置该键会拒绝启动，**任何写法都算，包括显式留空**。块缺失 ⇒ 跳过弧线改写并警告一次，片段一直不折入。见[下文](#tasksarc_rewrite--关系弧线改写)） | live（opt-in） |
+| `memory_extraction` | 无——已退役。仍存在的块会被忽略，启动时打一条警告，指向 `dreaming_scan` | 已退役 |
 | `chat_input_filter` | `pipeline::stream`（用户输入改写 filter；由 `[tasks.chat_companion]` 上的 `input_filter` 和此任务块共同激活；默认关闭） | live（opt-in） |
 | `chat_voice` | `pipeline::voice::run_voice_turn`，由 `routes::voice`（`POST /comp/voice/{session_id}/turn/stream`）经 `resolve_voice()` 到达（语音通道的伴侣回复；`filter_prompt` 为空白**不会**关闭该任务——会回退到内置 directive；任务块缺失时关闭） | live（opt-in） |
 | `world_director` | `pipeline::world::sweeper`，经由 `resolve_world_director()`（后台按 owner 逐一执行的世界状态 director 轮次；任务块缺失/空白、设置了 `WORLD_DISABLED`，或 `WORLD_TICK_SECS=0` 时关闭） | live（opt-in） |
@@ -552,7 +554,8 @@ BYOK hop 使用其请求中 `byok` 块的 `output_regex` 规则，而不是这�
 - `crates/eros-engine-server/src/pipeline/handlers.rs` → `chat_companion`、`chat_output_filter`
 - `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`、`affinity_evaluation`、`affinity_summary`、`character_insight_extraction`、`character_insight_structuring`、`user_insight_extraction`、`user_insight_structuring`
 - `crates/eros-engine-server/src/pipeline/profile_rebuild.rs` → `profile_rebuild`，通过 `resolve_profile_rebuild()`（按计划的画像重建）
-- `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision`，通过 `run_stream` 内的 `run_pde_decision`（仅当设置了 `filter_prompt`）；`chat_image_prompt_compose`，通过 `resolve_image_prompt_compose()`（出图 prompt 合成器，图片轮次必需，仅在图片轮次按需解析）；`chat_vision`，通过 `resolve_vision()`（视觉预处理阶段，opt-in）；`chat_product_qa`，通过 `resolve_product_qa()`（产品问答执行器，opt-in）；`chat_input_filter`，通过 `resolve_input_filter()`（输入改写，opt-in）；`memory_extraction`，通过 dreaming sweeper
+- `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision`，通过 `run_stream` 内的 `run_pde_decision`（仅当设置了 `filter_prompt`）；`chat_image_prompt_compose`，通过 `resolve_image_prompt_compose()`（出图 prompt 合成器，图片轮次必需，仅在图片轮次按需解析）；`chat_vision`，通过 `resolve_vision()`（视觉预处理阶段，opt-in）；`chat_product_qa`，通过 `resolve_product_qa()`（产品问答执行器，opt-in）；`chat_input_filter`，通过 `resolve_input_filter()`（输入改写，opt-in）
+- `crates/eros-engine-server/src/pipeline/dreaming/scan.rs` → `dreaming_scan`，通过 `resolve_dreaming_scan()`；`arc_rewrite`，通过 `resolve_arc_rewrite()`（关系扫描和它发起的弧线改写；入口有三个：待扫轮数到 20 时的 post-process、dreaming 清扫器、`backfill-dreaming` 子命令）
 - `crates/eros-engine-server/src/pipeline/proactive.rs` → `chat_image_prompt_compose`，通过 `build_delegated_image_prompt_for`（`taking_selfie` 事件的图，events 请求带 `image` 时；审计 `source = event`）
 - `crates/eros-engine-server/src/routes/image_edit.rs` → `chat_image_edit_compose`，通过 `resolve_image_edit_compose()`（图片-EDIT 合成器，编辑端点每次请求都会解析；编辑块缺失时回退到 `[tasks.chat_image_prompt_compose]` 的模型链——详见下文）
 
@@ -808,7 +811,7 @@ prompt，而不是聊天合成器自己的 `filter_prompt`（那个是为从对�
 | --- | --- | --- |
 | `[tasks.pde_decision].filter_prompt` 已设置 | 关闭 | 规则引擎永不产生 `product_qa`——没有 LLM 判断器这个动作就不可达。若此时仍配置了 `[tasks.chat_product_qa]`，启动时记录一条 WARN（日志原文为英文，按原样 grep）：`"model_config: [tasks.chat_product_qa] is configured but the LLM PDE ([tasks.pde_decision].filter_prompt) is disabled — product_qa is inert"`，该块保持不生效。 |
 | `[tasks.chat_product_qa]` 块存在 | 缺失 | 功能关闭。判断器上下文不带任何产品问答相关行；幻觉出的 `product_qa` verdict 会降级为 `reply_text`。 |
-| `chat_product_qa.filter_prompt` 非空白 | 空白 | **拒绝启动**——与 `insight_extraction` / `memory_extraction` 相同的必填 prompt 契约。请设置 prompt，或直接删除 `[tasks.chat_product_qa]` 整个章节以关闭该功能。 |
+| `chat_product_qa.filter_prompt` 非空白 | 空白 | **拒绝启动**——与 `insight_extraction` / `dreaming_scan` 相同的必填 prompt 契约。请设置 prompt，或直接删除 `[tasks.chat_product_qa]` 整个章节以关闭该功能。 |
 
 ```toml
 [tasks.chat_product_qa]
@@ -853,7 +856,7 @@ filter_prompt = """
 （`compute_signals_for_session`）、判断器自己共用的伴侣 transcript
 （`build_input_filter_transcript`），以及伴侣的实时消息窗口
 （`model_facing_history`），都会过滤掉 `channel IS NOT NULL` 的行。
-dreaming sweeper 也会排除它，但不是靠一刀切的非 NULL 过滤——它默认也会读
+关系扫描也会排除它，但不是靠一刀切的非 NULL 过滤——它默认也会读
 `'voice'` 的行（见 [memory-layers.zh.md](memory-layers.zh.md#语音轮次)），
 所以只有 `product_qa` 会被排除在外——同时这一行在实时 SSE 流、断线重放和
 客户端历史记录里完全可见（两个历史投影都会带出 `channel`）。完整的
@@ -943,28 +946,80 @@ write 全部路由离开 Voyage 的部署不再需要这个变量。
 调用点：`crates/eros-engine-server/src/main.rs` 在启动时构建一次
 `eros_engine_llm::embedding::EmbeddingRouter::from_config(&model_config)`；
 `AppState.embed: Arc<EmbeddingRouter>` 为 `handlers.rs` / `post_process.rs`
-/ `dreaming.rs` / `world.rs` / `story.rs` 里的 `embed_query` /
+/ `dreaming/` / `world.rs` / `story.rs` 里的 `embed_query` /
 `embed_document` / `embed_documents` 提供服务，调用形态不变。
 
 ### Insight 抽取的输出契约
 
 `[tasks.insight_extraction]` 的 prompt 归部署所有；输出契约归引擎。回复是一个 JSON 对象，其中 `facts` 是对象数组，每个对象含 `content` 和六个标签：`category`、`domain`、`evidence_type`、`temporality`、`persistence`、`confidence`。不是对象、或 `content` 为空白的项（包括裸字符串）会被忽略并记录警告，所以仍停留在字符串数组契约的 prompt 不会往账本写任何东西。引擎把每个标签对照它的词表（[列表](insights.zh.md#词表)）校验，不在词表里的值会收敛成 `other`（`category`、`domain`）或 `unknown`（其余），事实照样保留。随附的 `examples/model_config.toml` prompt 遵循这份契约。
 
+### `[tasks.dreaming_scan]` — 关系扫描（opt-in）
+
+一段关系的一截对话（最多 60 行）一次调用，返回画像记忆、片段摘要和纪事时刻（[记忆层 → 关系记忆](memory-layers.zh.md#关系记忆)）。prompt 归部署所有；输出契约归引擎。`examples/model_config.toml`（以及 `examples/model_config.d/memory.toml`）里随附的块就是完整的参考 prompt。
+
+```toml
+[tasks.dreaming_scan]
+model = "anthropic/claude-haiku-4.5"
+fallback = ["deepseek/deepseek-v4-flash","google/gemini-3.1-flash-lite"]
+temperature = 0.2
+max_tokens = 1024
+filter_prompt = """…三样产出的契约…"""
+```
+
+对话记录作为 user 消息发出，每行一句聊天：`[#12 2026-10-01 21:04] 用户：…` 或 `AI：…`，按用户时区记时（取这段关系的文字轮次最近带来的有效时区；没有就用 UTC）。回复是一个 JSON 对象：
+
+```json
+{"memories": [{"content": "...", "category": "fact", "domain": "career"}],
+ "episode": "...",
+ "journal": [{"kind": "confession", "realm": "real", "occurred_at": "2026-10-01",
+              "summary": "...", "source": "#12", "due": null}]}
+```
+
+- **`memories`** —— 带 `content` 和 `category` 的对象（`fact`、`preference`、`event`、`emotion`、`relation`；其它值一律变成 `fact`）。其余每个键原样存进 `companion_memories.metadata`；`domain` 决定[亲密度门控](memory-layers.zh.md#亲密度门控)。写进画像层，归在实例主人名下。
+- **`episode`** —— 一个字符串（带 `summary` 键的对象也照样读）。空白或缺失就不写片段，其余照常使用。存成一行，截到 400 字。
+- **`journal`** —— 时刻数组；缺 `kind`、`occurred_at` 或 `summary` 的项丢弃。
+  - `kind`：`confession`、`first_intimacy`、`conflict`、`reconciliation`、`promise`、`gift`、`shared_plan` 或 `user_shared_milestone`；其它值丢弃该项。
+  - `realm`：`real` 或 `roleplay`；缺失或其它值一律存为 `roleplay`。它看发起权，与是否真实发生无关：角色主动，或用户邀约、角色同意，是 `real`；用户提供剧本、设定场景或直接描述这一刻、角色配合演出，是 `roleplay`。
+  - `occurred_at`：`YYYY-MM-DD`，必须是这份对话记录里某个时间戳的日期，否则丢弃该项。
+  - `summary`：一句话，存成一行，截到 200 字；空白丢弃该项。
+  - `source`：这一时刻所依据那行的 `#n`；指不到任何一行时保留该项，只是不带消息指针。
+  - `due`：`YYYY-MM-DD`，只对 `promise` 和 `shared_plan` 读取；有了它，这一时刻会在那一天以纪念日行回归。
+
+回复里没有 JSON 对象算作解析失败；扫描隔一个闲置周期重试，连续第三次失败时跳过这一段。章节存在时 `filter_prompt` 必填（见下文）；章节缺失时扫描从不运行。
+
+**fallback 与纪事。** 在一个生产部署上实测，有一个候选模型完全不产出纪事，所以由 fallback 服务的扫描可能一行纪事都不写。每次扫描在 `engine.relationship_scan_events` 里的那一行记下实际服务的那一跳和 `served_fallback`，由 fallback 服务的扫描还会打一条带纪事条数的 warn 日志（[LLM 审计 → 关系扫描](llm-audit.zh.md#关系扫描)）。`fallback = []` 用可用性换一份可靠的纪事：主模型一出故障，扫描就失败。
+
+**已退役：`[tasks.memory_extraction]`。** 这个块会被忽略；仍存在时启动日志打出 `[tasks.memory_extraction] is retired and ignored; configure [tasks.dreaming_scan] instead`，但从不导致启动失败。列出 `memory_extraction` 的 body 规则会按未知任务警告。
+
+### `[tasks.arc_rewrite]` — 关系弧线改写
+
+每满四个片段，扫描改写一次关系弧线。prompt 由引擎持有（`prompt.rs`），这个块只带 `model`、`fallback`、`temperature`、`max_tokens` 和采样参数；任何写法的 `filter_prompt`（包括留空）都会拒绝启动。
+
+```toml
+[tasks.arc_rewrite]
+model = "anthropic/claude-haiku-4.5"
+fallback = ["deepseek/deepseek-v4-flash","google/gemini-3.1-flash-lite"]
+temperature = 0.3
+max_tokens = 1500
+```
+
+引擎会拒绝超过 900 字的弧线、上一版超过 300 字而新版不到它 70% 的弧线，以及缺少开头或开头超过 150 字的第一版；被拒时上一版继续生效。`max_tokens` 要远高于 900 字的上限：上限卡得太紧会把 JSON 截断，这次改写算作解析失败。缺少这个块时跳过改写并警告一次，片段一直不折入；补上这个块之后的第一次改写会在一次调用里折入所有等待中的片段，所以要和 `dreaming_scan` 一起配置。
+
 ### 启用/禁用 extraction
 
-`insight_extraction`（人类链的事实抽取）、`memory_extraction`
-（会话结束时的 dreaming sweeper）、`character_insight_extraction`（实验性
+`insight_extraction`（人类链的事实抽取）、`dreaming_scan`
+（关系扫描）、`character_insight_extraction`（实验性
 角色链的 stage 1，见上文"任务名"一节）和 `user_insight_extraction`（实验性
-用户链的 stage 1）都由各自 `[tasks.*_extraction]` **章节是否存在**控制——
+用户链的 stage 1）都由各自 `[tasks.<name>]` **章节是否存在**控制——
 这就是 `validate_extraction_prompts()` 的闸门，四个名字都在这个闸门里：
 
 - **章节存在** → `filter_prompt` **必填**；若为空白或缺失，服务器会拒绝启动。
 - **章节缺失** → 该 extraction **关闭**。引擎可以正常启动和运行（每轮跳过
-  `insight_extraction`，事实账本不再增长；dreaming sweeper 保持不生效；角色链两个 stage 都不会
+  `insight_extraction`，事实账本不再增长；关系扫描既不就地运行也不由清扫器运行，而轮次计数、引擎自己写的纪事行和纪念日行照常；角色链两个 stage 都不会
   跑；用户链两个 stage 都不会跑）。
 
 `profile_rebuild`、`character_insight_structuring`、
-`user_insight_structuring`——三条链各自的第二次调用——**故意都不在这个闸门
+`user_insight_structuring`——三条链各自的第二次调用——以及 `arc_rewrite` **故意都不在这个闸门
 里**：因为这个闸门要求必须有 prompt，而这几个块都必须没有。它们各自
 被反方向的闸门管着：prompt 写死在 `prompt.rs` 里，所以给它设置
 `filter_prompt` 会拒绝启动（见上面的 `affinity_evaluation`，同一条死配置

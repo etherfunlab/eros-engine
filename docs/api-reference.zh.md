@@ -267,9 +267,11 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 | `insights_only` | 仅完整用户画像；不含关系记忆 |
 | `none` | 不注入任何记忆 |
 
+关系记忆指召回的关系层原话行，在 1:1 prompt 上还包括这段关系的弧线、最新的片段、最相近的纪事和纪念日行（[记忆层 → 关系记忆](memory-layers.zh.md#关系记忆)）。
+
 中性画像是 职业、教育、学历、MBTI、意识形态、作息、社交模式、性格特质、未来计划。完整画像再加上 感情观、感情经历、兴趣、情感需求、家庭、经济状况、性癖、心理健康。见 [洞察](insights.zh.md#聊天-prompt)。
 
-`memory_scope` 是上限。在它之内，这段关系的亲密度会再收窄注入的内容：每个私密字段要在自己那条亲密度线上达到某一档，画像层和关系层召回多少条也随较高的那一档增加。刚开始的关系只拿到中性画像和一条关系记忆。见 [记忆层 → 亲密度门控](memory-layers.zh.md#亲密度门控)。
+`memory_scope` 是上限。在它之内，这段关系的亲密度会再收窄注入的内容：每个私密字段要在自己那条亲密度线上达到某一档，画像层和关系层召回多少条也随较高的那一档增加。刚开始的关系只拿到中性画像和一条关系记忆。弧线、片段和纪事不受门控，在任何档位都会渲染。见 [记忆层 → 亲密度门控](memory-layers.zh.md#亲密度门控)。
 
 > **重要（#40 缓解措施）：** 默认的 `neutral_and_relationship` 有意比
 > #40 之前的行为更窄（旧行为注入全部内容）。**省略 `memory_scope` 并不
@@ -327,11 +329,12 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
   http://localhost:8080/comp/chat/<session_id>/message/stream
 ```
 
-**可选：用户所在地。** 三个可选字符串告诉 engine 用户在哪里。engine 不会在两轮之间记住它们，每一轮都要带上。
+**可选：用户所在地。** 三个可选字符串告诉 engine 用户在哪里。prompt 只读本轮带来的值，每一轮都要带上。（关系扫描会记住文字轮次最近带来的有效 `user_timezone`，用来给对话记录和纪事定日期；见[记忆层 → 关系记忆](memory-layers.zh.md#关系记忆)。）
 
 - `user_timezone` — IANA 时区（`Asia/Taipei`）。prompt 中 `[now]` 的时钟先取角色自己的
   `art_metadata.timezone`，没有再取它，都没有才用 `Asia/Singapore`。它也决定用户那边的节日行：
-  用户当地今天和之后六天的节日（`对方那边今天是平安夜；明天是Christmas Day。`），只陈述事实。
+  用户当地今天和之后六天的节日（`对方那边今天是平安夜；明天是Christmas Day。`），只陈述事实；
+  这段关系的纪念日行（`今天是你们认识满 3 个月的日子。`）也由它决定，没有它就不出现。
   角色的生日行（`3 天后是你的生日。`）也按同一个角色时钟计日。
 - `user_country` — ISO 3166-1 alpha-2（`TW`），客户端拿到什么就传什么。缺省时由
   `user_timezone` 推出；不认识就没有法定假日。
@@ -1222,18 +1225,19 @@ prompt 精简但不再失忆：人格 + 语音指令 + 首轮生成、此后每�
 **引导快照（bootstrap snapshot）** + 一行由该 session 好感度推导出的关系描述
 （bond/chemistry 档位）+ 本轮的**召回块**。历史窗口是以本轮用户消息收尾的
 8 条消息（4 个来回）——比聊天路径的窗口短，因为更长程的记忆改由引导快照和召回承担。语音
-**单轮**不写入任何记忆（没有 insight 抽取，也没有向量写入），但一通结束
-的**通话**会写：session 空闲之后，dreaming-lite 清扫器会把它的通话记录蒸馏成
-画像层记忆，之后的语音通话和文字聊天都能召回。部署方可以用
+**单轮**不写入任何记忆（没有 insight 抽取，也没有向量写入），但它计入所在关系的
+扫描：扫描把通话和同一段关系的文字行一起读，从中写出画像记忆、片段和纪事，
+之后的语音通话和文字聊天都能召回。部署方可以用
 `DREAMING_VOICE_DISABLED=1` 关掉——见
 [memory-layers.zh.md](memory-layers.zh.md#语音轮次)。
 
 **引导快照**（仅首轮组装，随后冻结进 `chat_sessions.metadata.voice_bootstrap`，
 此后每轮原样重新注入——provider 是无状态的，线路上不存在"只注入一次"这回事）：
 一个 `[关于他]` 块（`human_insights` bullets，默认中性档，见下面的
-`memory_scope`）加一个 `[上次通话]` 块（上一通语音通话最后 8 条消息渲染出的
+`memory_scope`）加一个 `[你们的故事]` 块（这段关系的开头和弧线；仅当已经有弧线、且
+首轮的 `memory_scope` 保留关系记忆时才有）加一个 `[上次通话]` 块（上一通语音通话最后 8 条消息渲染出的
 文字记录）加一个 `[身体状态]` 块（通话所读亲密度那条记录所属的文字 session 的余效，以及通话开始时角色的需求；
-整通电话保持这份状态、不推进）。四部分各自独立、静默降级——组装失败时标记位不落，下一轮重试。
+整通电话保持这份状态、不推进）。五部分各自独立、静默降级——组装失败时标记位不落，下一轮重试。
 每一轮都用当轮的档位让 `[关于他]` 的 bullets 过一遍[亲密度门控](memory-layers.zh.md#亲密度门控)。
 
 **每轮召回**（每轮都跑，只读）：对聊天路径同样的 `companion_memories` 分层
@@ -1690,7 +1694,7 @@ genome 预设（`art_metadata.possessions` / `art_metadata.wardrobe`）排最前
 
 `archived_sessions` 只算**这一次调用**翻掉的 session 数，所以重复调用返回 `200` 加 `0`。所有 channel 一起归档，语音也在内 —— 单位是这段关系，不是某一个客户端看到的那部分。
 
-**会删掉的：** `companion_affinity`（连同它的 events，走 cascade）、`companion_memories` 的关系层、`character_insights`、`user_insights`，以及这位角色在每个[群](group-chat.zh.md)里的席位；角色的故事摘要（`persona_story_insights.digest`）会被清空 —— 这些留着会渗进下一段对话。归档请求到达时仍在运行的回合不会把它们写回去：它对好感度、关系层记忆以及 character 与 user insight 的写入发现 session 已归档，什么都不写。**不会删的：** `chat_messages`。聊天记录留着，所以那些按 session id 引用的审计表（`companion_decision_events`、`character_insights_events`、`chat_vision_events`、`chat_images_events`）仍然指得到可读的东西。`companion_memories` 的画像层（`instance_id IS NULL`）也留着 —— 那是关于这个用户的跨角色事实。
+**会删掉的：** `companion_affinity`（连同它的 events，走 cascade）、`companion_memories` 的关系层、`character_insights`、`user_insights`、关系扫描的状态、片段、弧线和纪事（`relationship_scan_state`、`relationship_episodes`、`relationship_arcs`、`relationship_journal`），以及这位角色在每个[群](group-chat.zh.md)里的席位；角色的故事摘要（`persona_story_insights.digest`）会被清空 —— 这些留着会渗进下一段对话。归档请求到达时仍在运行的回合不会把它们写回去：它对好感度、关系层记忆以及 character 与 user insight 的写入发现 session 已归档，什么都不写；进行中的关系扫描发现扫描状态已不在，不再写入任何东西。**不会删的：** `chat_messages`。聊天记录留着，所以那些按 session id 引用的审计表（`companion_decision_events`、`character_insights_events`、`chat_vision_events`、`chat_images_events`）仍然指得到可读的东西。`relationship_scan_events` 也留着（只有计数和 id）。`companion_memories` 的画像层（`instance_id IS NULL`）也留着 —— 那是关于这个用户的跨角色事实。之后在同一个实例上开始的对话会从新的扫描状态和新的初识开始，初识日期取它第一行未归档的聊天。
 
 调用之后这些 session 在各处都不可见：history、affinity、session 列表、chat 与语音 turn 路由要么 404 要么直接不返回，`POST /comp/chat/start` 会新建 session 而不是恢复已归档的那个。
 
@@ -2041,7 +2045,7 @@ session 403）。
 
 ### `GET /svc/v1/memories/changes`
 
-自某个 keyset 游标以来新写入的画像层抽取记忆，即记忆抽取写下的关于某个用户的事实，供基于这些事实构建的下游服务使用。导出的是 `companion_memories` 里没有角色实例、带 `category` 的行；原始对话行和关系层的行不导出，embedding 也不导出。密钥与画像导出相同（`x-insights-export-secret`，缺失或错误回 403）。
+自某个 keyset 游标以来新写入的画像层抽取记忆，即关系扫描写下的关于某个用户的事实，供基于这些事实构建的下游服务使用。导出的是 `companion_memories` 里没有角色实例、带 `category` 的行；原始对话行和关系层的行不导出，embedding 也不导出。关系扫描的片段、弧线和纪事从不导出。密钥与画像导出相同（`x-insights-export-secret`，缺失或错误回 403）。
 
 | Query | 默认 | 含义 |
 |---|---|---|
@@ -2159,7 +2163,7 @@ curl -X POST -H "x-user-erase-secret: $USER_ERASE_SECRET" \
 {
   "user_id": "8d1f…",
   "erased_at": "2026-10-13T12:00:00.123456Z",
-  "deleted": { "human_facts": 41, "human_insights": 1, "human_profile_state": 1, "companion_memories": 63, "user_insights": 2, "…": 0 },
+  "deleted": { "human_facts": 41, "human_insights": 1, "human_profile_state": 1, "companion_memories": 63, "user_insights": 2, "relationship_journal": 9, "…": 0 },
   "blanked": { "human_insights_events": 87, "companion_affinity": 2, "…": 0 }
 }
 ```
@@ -2167,7 +2171,7 @@ curl -X POST -H "x-user-erase-secret: $USER_ERASE_SECRET" \
 `deleted` 统计被移除的行，`blanked` 统计内容被清空但保留的行（id 与时间戳保留），都按表名列出。每张覆盖到的表都会列出（示例做了省略），没有可做的就是 `0`；`blanked` 只统计仍然带有内容的行。这些表列在[洞察 → 抹除](insights.zh.md#抹除)。聊天 session 与消息归调用方，不会被触碰。
 
 - **幂等。** 重复调用什么都找不到，各处报 `0`，并把 `erased_at` 往前移。
-- **请在删除该用户的 session 或角色实例之前调用。** 按关系分开的 insight 表只以实例为键，只有实例行还在时才够得着它们。
+- **请在删除该用户的 session 或角色实例之前调用。** 按关系分开的 insight 表和关系扫描的表只以实例为键，只有实例行还在时才够得着它们。
 - **先停掉该用户的流量。** 已经在进行中的第一段抽取可能在抹除提交之后写入事实；再调用一次清理。（进行中的重建写不回画像。）
 
 ## 錯誤響應

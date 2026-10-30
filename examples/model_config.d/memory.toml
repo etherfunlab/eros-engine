@@ -13,9 +13,9 @@ fallback = ["deepseek/deepseek-v4-flash","google/gemini-3.1-flash-lite"]
 temperature = 0.2
 # 1024 is enough: 0 of 360 replayed scans exceeded 713 output tokens.
 max_tokens = 1024
-# Remove this entire [tasks.dreaming_scan] section to disable the dreaming
-# sweeper (it then stays inert). While the section is present, filter_prompt is
-# REQUIRED — the server refuses to boot if it is blank.
+# Remove this entire [tasks.dreaming_scan] section to turn the relationship scan
+# off (neither the sweeper nor the inline scan then runs). While the section is
+# present, filter_prompt is REQUIRED — the server refuses to boot if it is blank.
 # `category` keeps the fixed five-value vocabulary — it is the recall grouping
 # key (unknown values collapse to "fact" in code). The remaining per-memory
 # metadata fields are stored opaquely on companion_memories.metadata: a

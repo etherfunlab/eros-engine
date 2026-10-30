@@ -296,9 +296,11 @@ values:
 | `insights_only` | Full user profile only; no relationship memory |
 | `none` | No memory injection |
 
+Relationship memory means the recalled relationship-layer lines plus, on 1:1 prompts, the relationship's arc, latest episodes, nearest journal moments and anniversary lines ([Memory layers → Relationship memory](memory-layers.md#relationship-memory)).
+
 The neutral profile is 职业, 教育, 学历, MBTI, 意识形态, 作息, 社交模式, 性格特质 and 未来计划. The full profile adds 感情观, 感情经历, 兴趣, 情感需求, 家庭, 经济状况, 性癖 and 心理健康. See [Insights](insights.md#chat-prompt).
 
-`memory_scope` is a ceiling. Within it, the relationship's affinity narrows what is injected: each intimate field needs a tier on its own affinity line, and how many profile-layer and relationship memories are recalled grows with the higher tier. A new relationship gets the neutral profile and one relationship memory. See [Memory layers → Affinity gate](memory-layers.md#affinity-gate).
+`memory_scope` is a ceiling. Within it, the relationship's affinity narrows what is injected: each intimate field needs a tier on its own affinity line, and how many profile-layer and relationship memories are recalled grows with the higher tier. A new relationship gets the neutral profile and one relationship memory. The arc, episodes and journal are not gated: they render at every tier. See [Memory layers → Affinity gate](memory-layers.md#affinity-gate).
 
 > **Important (#40 mitigation):** The default `neutral_and_relationship` is
 > intentionally narrower than the pre-#40 behavior (which injected everything).
@@ -365,14 +367,18 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 ```
 
 **Optional: user locale.** Three optional strings tell the engine where the
-user is. The engine does not keep them between turns; send them on every turn.
+user is. The prompt reads them from the turn alone; send them on every turn.
+(The relationship scan keeps the last valid `user_timezone` a text turn
+carried, to date its transcript and journal; see
+[Memory layers → Relationship memory](memory-layers.md#relationship-memory).)
 
 - `user_timezone` — IANA timezone (`Asia/Taipei`). The prompt's `[now]` clock
   uses the persona's own `art_metadata.timezone` first, then this, then
   `Asia/Singapore`. It also dates the user-side holiday line: holidays on the
   user's local date and the six days after it
-  (`对方那边今天是平安夜；明天是Christmas Day。`), stated as facts.
-  The persona's birthday line (`3 天后是你的生日。`) is dated on the same
+  (`对方那边今天是平安夜；明天是Christmas Day。`), stated as facts, and the
+  relationship's anniversary lines (`今天是你们认识满 3 个月的日子。`),
+  which render only with it. The persona's birthday line (`3 天后是你的生日。`) is dated on the same
   persona clock as `[now]`.
 - `user_country` — ISO 3166-1 alpha-2 (`TW`), as the client received it. Absent
   ⇒ derived from `user_timezone`. Unknown ⇒ no public holidays.
@@ -1531,20 +1537,23 @@ the 8 messages (4 exchanges) ending at this turn's own user row — shorter
 than the chat path's window,
 since the bootstrap and recall carry the longer-range memory instead. A
 voice **turn** writes no memories (no insight extraction, no vector
-writes), but a finished **call** does: once the session goes idle, the
-dreaming-lite sweeper distills its transcript into profile-layer memories,
-so later calls and text chats can recall it. Operators opt out with
-`DREAMING_VOICE_DISABLED=1` — see
+writes), but it counts toward its relationship's scan, which reads the call
+with the text rows of the same relationship and writes profile memories, an
+episode and journal moments from it, so later calls and text chats can recall
+it. Operators opt out with `DREAMING_VOICE_DISABLED=1` — see
 [memory-layers.md](memory-layers.md#voice-turns).
 
 **Bootstrap snapshot** (first turn only, then frozen into
 `chat_sessions.metadata.voice_bootstrap` and replayed on every later turn —
 the provider is stateless, so there is no "inject once" on the wire): a
 `[关于他]` block of `human_insights` bullets (Neutral tier by default; see
-`memory_scope` below) plus a `[上次通话]` block, the previous voice call's
-last 8 messages rendered as a transcript, plus a `[身体状态]` block, the
-lingering effects of the text session the call reads its relationship line
-from and the persona's needs at the call's start. The call keeps that state and does not advance it. The four parts
+`memory_scope` below) plus a `[你们的故事]` block, the relationship's opening
+and arc (only once the relationship has an arc, and only when that turn's
+`memory_scope` keeps relationship memory), plus a `[上次通话]` block, the
+previous voice call's last 8 messages rendered as a transcript, plus a
+`[身体状态]` block, the lingering effects of the text session the call reads
+its relationship line from and the persona's needs at the call's start. The
+call keeps that state and does not advance it. The five parts
 degrade independently and silently — a failed assembly leaves the marker unwritten
 so the next turn retries. Each turn filters the `[关于他]` bullets through the
 [affinity gate](memory-layers.md#affinity-gate) with that turn's tiers.
@@ -2072,7 +2081,7 @@ Soft-delete every session this user holds with one persona instance. The instanc
 
 `archived_sessions` counts the sessions flipped by *this* call, so a repeat call returns `200` with `0`. Every channel is archived, voice included — the unit is the relationship, not one client's view of it.
 
-**What is deleted:** `companion_affinity` (and its events, by cascade), the relationship layer of `companion_memories`, `character_insights`, `user_insights`, and the persona's seat in every [group](group-chat.md); the persona's story digest (`persona_story_insights.digest`) is cleared — the state that would otherwise carry into the next conversation. A turn still running when the archive request arrives writes none of it back: its affinity, relationship-memory and character and user insight writes find the session archived and write nothing. **What is not:** `chat_messages`. The transcript stays, so the audit tables that reference a session by id (`companion_decision_events`, `character_insights_events`, `chat_vision_events`, `chat_images_events`) still point at something readable. The profile layer of `companion_memories` (`instance_id IS NULL`) also stays — those are cross-persona facts about the user.
+**What is deleted:** `companion_affinity` (and its events, by cascade), the relationship layer of `companion_memories`, `character_insights`, `user_insights`, the relationship scan's state, episodes, arc and journal (`relationship_scan_state`, `relationship_episodes`, `relationship_arcs`, `relationship_journal`), and the persona's seat in every [group](group-chat.md); the persona's story digest (`persona_story_insights.digest`) is cleared — the state that would otherwise carry into the next conversation. A turn still running when the archive request arrives writes none of it back: its affinity, relationship-memory and character and user insight writes find the session archived and write nothing, and a relationship scan in flight finds its scan state gone and writes nothing further. **What is not:** `chat_messages`. The transcript stays, so the audit tables that reference a session by id (`companion_decision_events`, `character_insights_events`, `chat_vision_events`, `chat_images_events`) still point at something readable. `relationship_scan_events` stays too (counts and ids only). The profile layer of `companion_memories` (`instance_id IS NULL`) also stays — those are cross-persona facts about the user. A conversation started on the same instance later begins a new scan state and a new first meeting, dated by its first non-archived row.
 
 Afterwards the sessions are invisible everywhere: history, affinity, the session list, the chat and voice turn routes all return 404 or omit them, and `POST /comp/chat/start` creates a new session rather than resuming an archived one.
 
@@ -2489,7 +2498,7 @@ Rows are ordered by `(updated_at, user_id)`. `next` is present iff the page is f
 
 ### `GET /svc/v1/memories/changes`
 
-The extracted profile-layer memories created since a keyset cursor: the facts the memory extraction wrote about a user, for a downstream service that builds on them. These are the `companion_memories` rows with no persona instance and a `category`; raw-turn rows and relationship-layer rows are not exported, and neither are embeddings. Same secret as the insights export (`x-insights-export-secret`, 403 when missing or wrong).
+The extracted profile-layer memories created since a keyset cursor: the facts the relationship scan wrote about a user, for a downstream service that builds on them. These are the `companion_memories` rows with no persona instance and a `category`; raw-turn rows and relationship-layer rows are not exported, and neither are embeddings. The relationship scan's episodes, arcs and journal are never exported. Same secret as the insights export (`x-insights-export-secret`, 403 when missing or wrong).
 
 | Query | Default | Meaning |
 |---|---|---|
@@ -2607,7 +2616,7 @@ curl -X POST -H "x-user-erase-secret: $USER_ERASE_SECRET" \
 {
   "user_id": "8d1f…",
   "erased_at": "2026-10-13T12:00:00.123456Z",
-  "deleted": { "human_facts": 41, "human_insights": 1, "human_profile_state": 1, "companion_memories": 63, "user_insights": 2, "…": 0 },
+  "deleted": { "human_facts": 41, "human_insights": 1, "human_profile_state": 1, "companion_memories": 63, "user_insights": 2, "relationship_journal": 9, "…": 0 },
   "blanked": { "human_insights_events": 87, "companion_affinity": 2, "…": 0 }
 }
 ```
@@ -2615,7 +2624,7 @@ curl -X POST -H "x-user-erase-secret: $USER_ERASE_SECRET" \
 `deleted` counts rows removed and `blanked` counts rows kept with their content cleared (ids and timestamps stay), each by table name. Every covered table is listed (the example abbreviates), with `0` when it had nothing to do; `blanked` counts only rows that still carried content. The tables are listed in [Insights → Erasure](insights.md#erasure). Chat sessions and messages belong to the caller and are not touched.
 
 - **Idempotent.** A repeat finds nothing left, reports `0` everywhere, and moves `erased_at` forward.
-- **Call it before deleting the user's sessions or persona instances.** The per-relationship insight tables key on the instance alone and are reachable only while the instance row exists.
+- **Call it before deleting the user's sessions or persona instances.** The per-relationship insight tables and the relationship scan's tables key on the instance alone and are reachable only while the instance row exists.
 - **Stop the user's traffic first.** A stage-1 extraction already in flight can write facts after the erase commits; call again to clean up. (A rebuild in flight cannot write a profile back.)
 
 ## Error responses
