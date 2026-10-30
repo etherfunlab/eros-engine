@@ -26,18 +26,22 @@ Her ask row in history now says how the choice ended. An accepted give of food, 
   - Typing an answer instead settles the ask with no cost.
   - An accepted or ignored kind is not asked again in that session.
 - **The answer stays visible.** A client that draws the user's answer between her ask and her reply can redraw it on a reload or a second device.
-- **Gives change how she feels.** After an accepted meal, hunger drops one level. After a cigarette, a drink or herb, hunger drops and her social and indulgence needs rise. After medicine or coffee, all three drop.
-- **A streamed turn now sees how long the user was away.** The judge and the 24-hour stale rule read the real gap instead of zero. The first 10 user messages of a session are never ghosted. Before, the 10th could be.
+- **Gives change how she feels** (in a deployment that runs the judge). After an accepted meal, hunger drops one level. After a cigarette, a drink or herb, hunger drops and her social and indulgence needs rise. After medicine or coffee, all three drop.
+- **A streamed turn now sees how long the user was away.** The judge and the 24-hour stale rule read the real gap instead of zero. Neither the judge nor the rule engine ghosts the first 10 user messages of a session. Before, the 10th could be ghosted. An offline stretch still silences them.
 
 ## What to change
 
-- **Branch on `kind` before showing choice controls.** The `life_choice` field of `GET /bff/v1/comp/affinity/{session_id}/event` now carries `kind`: `ask_for_space`, `sleep_together` or `propose`. A client that shows its separation controls whenever `life_choice` is present will show separation wording on a proposal. Do one of these before deploying:
+- **Branch on `kind` before showing choice controls.** The `kind` of the `life_choice` field of `GET /bff/v1/comp/affinity/{session_id}/event` can now be `sleep_together` or `propose` as well as `ask_for_space`. A client that shows its separation controls whenever `life_choice` is present will show separation wording on a proposal. Do one of these before deploying:
   - add wording for the two new kinds;
   - stop showing choice controls.
 
   A client without controls sees an ordinary proactive message, and a typed answer settles it at no cost. The answer route and its `accept` / `decline` body are unchanged.
-- **Opt pairs in through the scopes.** She asks `sleep_together` or `propose` only when relationship memory is on and the affinity scope includes trust, intrigue or patience. For example, send `memory_scope: "full"` with `affinity_scope: "chemistry"` or `"full"`. The defaults (`neutral_and_relationship` with `bond`) never qualify.
-  - The engine reads the pair from the scopes recorded on the session's newest assistant reply, so a caller that sends qualifying scopes on its turns opts that pair in.
+- **Check which pairs your scopes already opt in.** She asks `sleep_together` or `propose` only when both of these hold:
+  - relationship memory is on: `memory_scope` is `full`, `neutral_and_relationship` or `relationship_only`;
+  - the affinity scope includes trust, intrigue or patience: `affinity_scope` is `"chemistry"`, `"full"`, `"bond_and_chemistry"`, or an axis array naming one of them.
+
+  A caller that already sends such scopes has opted those pairs in with no change on its side, from their first judged turn after deploy. `affinity_scope: "full"` alone qualifies, because the default `memory_scope` keeps relationship memory. The defaults (`neutral_and_relationship` with `bond`) never qualify. To keep a pair out, send no trust, intrigue or patience axis, or a `memory_scope` without relationship memory. Either change also affects what reaches her prompt.
+  - The engine reads the pair from the scopes recorded on the session's newest assistant reply.
   - The engine takes no gender or orientation. Whether a pair should be compatible is decided by the caller, through the scopes it sends.
 - **Read the receipt (optional).** On both history routes, and in the start bundle's `history`, her ask row carries `life_choice: {id, kind, status, resolved_at}`.
   - `status` is one of `pending`, `accepted`, `declined`, `ignored` or `expired`.
@@ -46,12 +50,12 @@ Her ask row in history now says how the choice ended. An accepted give of food, 
 ## What to check
 
 - **Established pairs can be asked on their first judged turn after deploy.** A session that was never asked has no earlier choice to count from, so judged turns from before the deploy count toward the streak.
-- **Clients that display needs** see `hunger`, `social` and `indulgence` move on an accepted consumable give. The `needs` shape is unchanged. On such a turn, the engine moves those three needs one level from the pre-turn ratings, in place of the judge's rating for them.
+- **Clients that display needs** see them move on an accepted give of food, a cigarette, alcohol, herb, medicine or coffee. `soft_drink` and `tea` move none. The `needs` shape is unchanged. On such a turn, the engine moves the needs that item touches one level from the levels the judge was shown, in place of the judge's rating for them.
 - **Your judge prompt** needs no change.
 - **Persona authors.**
   - `art_metadata.coffee` works like `smoking`, `alcoholic` and `drug`. It counts toward the habit total. An explicit `false` refuses a `give` of `coffee` two times in three.
   - `art_metadata.sex_addict` weighs `sudden_desire` three times when `true`, and a third when `false`. Its rung gate holds either way.
-  - Absent keys keep today's behavior, and neither key reaches a prompt.
+  - Absent keys keep today's behavior, and neither key is shown to the judge. `coffee: true` reaches the reply only as the craving 很想喝杯咖啡 when `indulgence` is `high`. `sex_addict` reaches no prompt.
 
 ## Migration `0083` and deploy order
 
@@ -61,11 +65,12 @@ Her ask row in history now says how the choice ended. An accepted give of food, 
 
 ## Rollback
 
-The `v2.6.0` image decodes `tier_gap` as non-null. Once a `sleep_together` or `propose` row exists, rolling back breaks two things:
-- history pages that contain that ask fail with `500`;
-- the affinity delta fails the same way while such an ask is pending.
+The `v2.6.0` image decodes `tier_gap` as non-null. Once a `sleep_together` or `propose` row exists, rolling back breaks three things:
+- the affinity delta answers `500` for a session while such an ask is pending in it;
+- the life-choice route answers `500` for such a choice;
+- a typed answer cannot settle such an ask: the ignore conversion fails and is logged. The ask stays pending for its 24 hours, and in the meantime no event is drawn and she asks for nothing in any of her sessions.
 
-Before deploying the `v2.6.0` image, run:
+Once the new image has stopped serving, and before the `v2.6.0` image starts, run:
 
 ```sql
 DELETE FROM engine.life_choices WHERE kind <> 'ask_for_space';
