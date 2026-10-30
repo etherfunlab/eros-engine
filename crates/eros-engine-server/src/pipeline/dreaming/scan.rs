@@ -115,7 +115,9 @@ pub(crate) async fn scan_instance(
 /// its last row when it succeeds or reads nothing and settles nothing when it
 /// fails, so the next run reads it again, and its caller releases the claim.
 /// A backfill's `bound` is already a cut that splits no timestamp, so its read
-/// is never trimmed.
+/// is never trimmed. After the model call, an owner read, an embedding call or
+/// an episode write that errors fails the scan like a failed call does, so
+/// what the segment yielded is read again instead of dropped.
 pub(crate) async fn scan_segment(
     state: &AppState,
     st: &ScanState,
@@ -205,11 +207,7 @@ pub(crate) async fn scan_segment(
         Ok(resp) => resp,
         Err(e) => {
             tracing::warn!(%instance_id, "dreaming scan: LLM call failed: {e}");
-            if live {
-                release_failed(&scan, st, last.sent_at, covered).await;
-            }
-            record_scan_event(pool, event).await;
-            return ScanOutcome::Failed;
+            return fail_scan(&scan, st, seg, last.sent_at, covered, event).await;
         }
     };
     event.generation_id = record_generation(
@@ -228,20 +226,17 @@ pub(crate) async fn scan_segment(
 
     let Some(out) = parse_scan_output(&resp.reply) else {
         tracing::warn!(%instance_id, "dreaming scan: reply holds no JSON object");
-        if live {
-            release_failed(&scan, st, last.sent_at, covered).await;
-        }
         event.status = "parse_error";
-        record_scan_event(pool, event).await;
-        return ScanOutcome::Failed;
+        return fail_scan(&scan, st, seg, last.sent_at, covered, event).await;
     };
 
     // Everything the writes need from outside the database comes first: the
     // owner the memories are filed under, and every vector in one embedding
     // call. The claim check below and the writes it guards are then only
-    // database round trips apart. A backfill segment the retired sweeper
-    // already extracted keeps its memories out: they are in the profile layer
-    // once.
+    // database round trips apart. An owner read or an embedding call that
+    // fails fails the scan: settling past it would drop what the segment
+    // yielded for good. A backfill segment the retired sweeper already
+    // extracted keeps its memories out: they are in the profile layer once.
     let keep_memories = !matches!(
         seg.mode,
         ScanMode::Backfill {
@@ -253,7 +248,7 @@ pub(crate) async fn scan_segment(
             Ok(owner) => owner,
             Err(e) => {
                 tracing::warn!(%instance_id, "dreaming scan: owner read failed: {e}");
-                None
+                return fail_scan(&scan, st, seg, last.sent_at, covered, event).await;
             }
         }
     } else {
@@ -274,13 +269,14 @@ pub(crate) async fn scan_segment(
         .map(|(_, content)| *content)
         .chain(journal_rows.iter().map(|j| j.summary.as_str()))
         .collect();
-    let mut vectors = embed_all(state, instance_id, &texts).await;
-    // A journal row without a vector is still written: the sweeper embeds it.
+    let Some(mut vectors) = embed_all(state, instance_id, &texts).await else {
+        return fail_scan(&scan, st, seg, last.sent_at, covered, event).await;
+    };
     for (row, v) in journal_rows
         .iter_mut()
         .zip(vectors.split_off(memories.len()))
     {
-        row.embedding = v;
+        row.embedding = Some(v);
     }
 
     // Profile memories have no claim guard of their own, so the claim is
@@ -321,7 +317,10 @@ pub(crate) async fn scan_segment(
             Ok(None) => {
                 return discard(pool, event, seg.mode, "claim gone before the episode write").await
             }
-            Err(e) => tracing::warn!(%instance_id, "dreaming scan: episode write failed: {e}"),
+            Err(e) => {
+                tracing::warn!(%instance_id, "dreaming scan: episode write failed: {e}");
+                return fail_scan(&scan, st, seg, last.sent_at, covered, event).await;
+            }
         }
     }
     let journal = JournalRepo { pool };
@@ -597,15 +596,15 @@ fn parse_arc_reply(raw: &str) -> Option<(Option<String>, String)> {
     Some((opening, arc))
 }
 
-/// One vector per text from a single `embed_documents` call, in order; every
-/// slot is `None` when the call fails or answers with a different count. No
-/// call for no texts.
-async fn embed_all(state: &AppState, instance_id: Uuid, texts: &[&str]) -> Vec<Option<Vec<f32>>> {
+/// One vector per text from a single `embed_documents` call, in order; `None`
+/// when the call fails or answers with a different count. No call for no
+/// texts.
+async fn embed_all(state: &AppState, instance_id: Uuid, texts: &[&str]) -> Option<Vec<Vec<f32>>> {
     if texts.is_empty() {
-        return Vec::new();
+        return Some(Vec::new());
     }
     match state.embed.embed_documents(texts).await {
-        Ok(vectors) if vectors.len() == texts.len() => vectors.into_iter().map(Some).collect(),
+        Ok(vectors) if vectors.len() == texts.len() => Some(vectors),
         Ok(vectors) => {
             tracing::warn!(
                 %instance_id,
@@ -613,34 +612,29 @@ async fn embed_all(state: &AppState, instance_id: Uuid, texts: &[&str]) -> Vec<O
                 vectors = vectors.len(),
                 "dreaming scan: embed returned a different count"
             );
-            vec![None; texts.len()]
+            None
         }
         Err(e) => {
             tracing::warn!(%instance_id, texts = texts.len(), "dreaming scan: embed failed: {e}");
-            vec![None; texts.len()]
+            None
         }
     }
 }
 
 /// Profile-layer memories from one scan, `(candidate, trimmed content)`, filed
 /// on `session_id` under `owner`, each with its vector from `vectors` in the
-/// same order; a candidate without one is skipped. Returns how many were
-/// written.
+/// same order. Returns how many were written.
 async fn write_memories(
     pool: &sqlx::PgPool,
     instance_id: Uuid,
     session_id: Uuid,
     owner: Uuid,
     cands: &[(&MemoryCandidate, &str)],
-    vectors: Vec<Option<Vec<f32>>>,
+    vectors: Vec<Vec<f32>>,
 ) -> i32 {
     let repo = MemoryRepo { pool };
     let mut written = 0;
     for (&(cand, content), embedding) in cands.iter().zip(vectors) {
-        let Some(embedding) = embedding else {
-            tracing::warn!(%instance_id, "dreaming scan: memory without a vector skipped");
-            continue;
-        };
         match repo
             .upsert(
                 MemoryLayer::Profile,
@@ -727,6 +721,25 @@ async fn release_failed(
     {
         tracing::warn!(%instance_id, "dreaming scan: releasing the claim failed: {e}");
     }
+}
+
+/// A scan that failed after its model call: a live scan backs off through
+/// `release_failed` (a backfill segment settles nothing, so the next run reads
+/// it again), and the paid call leaves `event` as its row. Nothing is written
+/// past this point.
+async fn fail_scan(
+    scan: &ScanStateRepo<'_>,
+    st: &ScanState,
+    seg: SegmentPlan,
+    cursor_to: DateTime<Utc>,
+    covered: i32,
+    event: ScanEventInsert,
+) -> ScanOutcome {
+    if seg.mode == ScanMode::Live {
+        release_failed(scan, st, cursor_to, covered).await;
+    }
+    record_scan_event(scan.pool, event).await;
+    ScanOutcome::Failed
 }
 
 /// A read cut by the row cap may have split rows that share a `sent_at`; the
@@ -1241,6 +1254,167 @@ pub(crate) mod tests {
                 .collect::<Vec<_>>(),
             [("scan", "empty")]
         );
+    }
+
+    /// A failed scan after the call leaves the relationship as it found it,
+    /// one failure on the streak and the claim released, and no episode or
+    /// journal row behind it.
+    async fn assert_failed_not_settled(pool: &PgPool, rel: &Rel) {
+        let s = ScanStateRepo { pool }
+            .load(rel.instance)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.scanned_through_at, initial_cursor(), "the cursor stays");
+        assert_eq!(s.pending_turns, 3);
+        assert_eq!(s.scan_failures, 1);
+        assert!(s.claimed_at.is_none(), "the claim is released");
+        assert_eq!(count(pool, "relationship_episodes", rel.instance).await, 0);
+        assert_eq!(count(pool, "relationship_journal", rel.instance).await, 0);
+    }
+
+    async fn memory_rows(pool: &PgPool, rel: &Rel) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM engine.companion_memories WHERE user_id = $1")
+            .bind(rel.owner)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    fn failed_event(memories: i32) -> EventRow {
+        (
+            "scan".to_string(),
+            "failed".to_string(),
+            Some(SCAN_MODEL.to_string()),
+            false,
+            4,
+            memories,
+            false,
+            0,
+            Some("gen-scan".to_string()),
+        )
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn scan_embed_failure_is_a_failed_scan_not_a_settled_one(pool: PgPool) {
+        let rel = seed_rel(&pool).await;
+        open_claim(&pool, rel.instance).await;
+        let llm = MockServer::start().await;
+        answer(&llm, SCAN_MODEL, "gen-scan", &scan_reply()).await;
+        let (mut state, _embed) = state_with(pool.clone(), &llm, "").await;
+        let embed = MockServer::start().await;
+        Mock::given(wm_path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&embed)
+            .await;
+        state.embed = std::sync::Arc::new(embed_router(&embed));
+
+        assert_eq!(
+            scan_instance(&state, rel.instance, at(T4)).await,
+            ScanOutcome::Failed
+        );
+        assert!(
+            !embed.received_requests().await.unwrap().is_empty(),
+            "the embedding call was made"
+        );
+        assert_eq!(memory_rows(&pool, &rel).await, 0, "no memory is written");
+        assert_failed_not_settled(&pool, &rel).await;
+        assert_eq!(
+            events(&pool, rel.instance).await,
+            vec![failed_event(0)],
+            "the paid call leaves a failed row"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn scan_embed_count_mismatch_is_a_failed_scan(pool: PgPool) {
+        let rel = seed_rel(&pool).await;
+        open_claim(&pool, rel.instance).await;
+        let llm = MockServer::start().await;
+        answer(&llm, SCAN_MODEL, "gen-scan", &scan_reply()).await;
+        let (mut state, _embed) = state_with(pool.clone(), &llm, "").await;
+        // Two texts go out (the memory and the journal moment); one vector comes back.
+        let embed = MockServer::start().await;
+        Mock::given(wm_path("/v1/embeddings"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "data": [{ "embedding": unit_embedding() }] })),
+            )
+            .mount(&embed)
+            .await;
+        state.embed = std::sync::Arc::new(embed_router(&embed));
+
+        assert_eq!(
+            scan_instance(&state, rel.instance, at(T4)).await,
+            ScanOutcome::Failed
+        );
+        assert_eq!(memory_rows(&pool, &rel).await, 0, "no memory is written");
+        assert_failed_not_settled(&pool, &rel).await;
+        assert_eq!(events(&pool, rel.instance).await, vec![failed_event(0)]);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn scan_episode_insert_error_is_a_failed_scan(pool: PgPool) {
+        let rel = seed_rel(&pool).await;
+        open_claim(&pool, rel.instance).await;
+        // The private test database refuses every episode: the insert errors.
+        sqlx::query(
+            "ALTER TABLE engine.relationship_episodes \
+             ADD CONSTRAINT refuse_episodes CHECK (false) NOT VALID",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let llm = MockServer::start().await;
+        answer(&llm, SCAN_MODEL, "gen-scan", &scan_reply()).await;
+        let (state, _embed) = state_with(pool.clone(), &llm, "").await;
+
+        assert_eq!(
+            scan_instance(&state, rel.instance, at(T4)).await,
+            ScanOutcome::Failed
+        );
+        assert_failed_not_settled(&pool, &rel).await;
+        let evs = events(&pool, rel.instance).await;
+        assert_eq!(evs.len(), 1);
+        assert_eq!(
+            (evs[0].1.as_str(), evs[0].6, evs[0].7),
+            ("failed", false, 0),
+            "failed, no episode, and the journal write never started"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn scan_owner_read_error_is_a_failed_scan(pool: PgPool) {
+        let rel = seed_rel(&pool).await;
+        open_claim(&pool, rel.instance).await;
+        let llm = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                completion(SCAN_MODEL, "gen-scan", &scan_reply())
+                    .set_delay(Duration::from_millis(600)),
+            )
+            .expect(1)
+            .mount(&llm)
+            .await;
+        let (state, _embed) = state_with(pool.clone(), &llm, "").await;
+
+        let scan = tokio::spawn({
+            let state = state.clone();
+            let instance = rel.instance;
+            async move { scan_instance(&state, instance, at(T4)).await }
+        });
+        // The owner table goes after the call left: the owner read errors.
+        wait_for_call(&llm, &scan).await;
+        sqlx::query("ALTER TABLE engine.persona_instances RENAME TO persona_instances_gone")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(scan.await.unwrap(), ScanOutcome::Failed);
+        assert_eq!(memory_rows(&pool, &rel).await, 0);
+        assert_failed_not_settled(&pool, &rel).await;
+        assert_eq!(events(&pool, rel.instance).await, vec![failed_event(0)]);
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

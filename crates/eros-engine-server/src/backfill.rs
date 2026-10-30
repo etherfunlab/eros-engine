@@ -98,19 +98,18 @@ pub(crate) struct Tally {
 }
 
 /// The subcommand: print the plan, then, unless `--dry-run`, scan. Exits 2
-/// when `[tasks.dreaming_scan]` is not configured. A dry run reads the
-/// database and the model config and needs no API key.
+/// when `[tasks.dreaming_scan]` is not configured, before any client is built.
+/// A dry run reads the database and the model config and needs no API key.
 pub(crate) async fn run_backfill(args: BackfillArgs) -> anyhow::Result<()> {
     let cfg = ServerConfig::from_env().map_err(anyhow::Error::msg)?;
     let include_voice = !cfg.dreaming_voice_disabled;
+    require_scan_task(&crate::load_model_config()?);
     if args.dry_run {
-        require_scan_task(&crate::load_model_config()?);
         let plans = plan(&crate::connect_pool().await?, &args, include_voice).await?;
         print!("{}", render_plan(&plans));
         return Ok(());
     }
     let state = crate::build_state(&cfg, false).await?;
-    require_scan_task(&state.model_config);
     let plans = plan(&state.pool, &args, include_voice).await?;
     print!("{}", render_plan(&plans));
     let t = run(&state, &plans).await;
@@ -935,5 +934,49 @@ mod tests {
         assert!(parse(&["--limit"]).is_err());
         assert!(parse(&["--limit", "-1"]).is_err());
         assert!(parse(&["--instance", "nope"]).is_err());
+    }
+
+    const CHILD_FLAG: &str = "EROS_TEST_BACKFILL_CHILD";
+
+    /// The child half of `real_run_without_a_scan_task_exits_2_before_building_clients`:
+    /// a real run that, if it got past the task check, would fail on the
+    /// missing API key instead of exiting. Does nothing in a normal test run.
+    #[tokio::test]
+    async fn real_run_child() {
+        if std::env::var_os(CHILD_FLAG).is_some() {
+            let _ = run_backfill(args(false)).await;
+            panic!("run_backfill returned instead of exiting 2");
+        }
+    }
+
+    /// `run_backfill` exits the process, so the real-run path is driven in a
+    /// child of this test binary: a config without `[tasks.dreaming_scan]`,
+    /// no `OPENROUTER_API_KEY` and a database nobody listens on. Exit 2 with the
+    /// task message means the check ran before any client or pool was built.
+    #[test]
+    fn real_run_without_a_scan_task_exits_2_before_building_clients() {
+        let cfg_path = std::env::temp_dir().join(format!("eros-backfill-{}.toml", Uuid::new_v4()));
+        std::fs::write(&cfg_path, "[tasks.arc_rewrite]\nmodel = \"arc/m\"\n").unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "backfill::tests::real_run_child",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_FLAG, "1")
+            .env("MODEL_CONFIG_PATH", &cfg_path)
+            .env("DATABASE_URL", "postgres://nobody@127.0.0.1:1/none")
+            .env_remove("MODEL_CONFIG_DIR")
+            .env_remove("OPENROUTER_API_KEY")
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_file(&cfg_path);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{stderr}");
+        assert!(
+            stderr.contains("[tasks.dreaming_scan] is not configured"),
+            "{stderr}"
+        );
     }
 }
