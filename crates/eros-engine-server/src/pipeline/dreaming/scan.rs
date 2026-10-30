@@ -44,21 +44,51 @@ pub(crate) enum ScanOutcome {
     Failed,
 }
 
-/// Scan one relationship up to `bound`. The caller holds the claim, and every
-/// path settles it except a failed state read and an unconfigured
-/// `dreaming_scan`, which leave it to go stale. A scan that finds the claim
-/// gone writes nothing further, records an `empty` event and reports `Empty`.
-/// Every scan that reached the model leaves one event row; `kind` names the
-/// run in it.
+/// Which run a segment belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScanMode {
+    /// The scanner proper: settles on the live cursor and the pending count.
+    Live,
+    /// The operator's backfill of history before the live cursor: settles on
+    /// `backfilled_through_at` only and leaves the live cursor, the pending
+    /// count and the failure streak alone. Profile memories are written only
+    /// with `write_memories`.
+    Backfill { write_memories: bool },
+}
+
+impl ScanMode {
+    /// The run's name on its event rows.
+    fn kind(self) -> &'static str {
+        match self {
+            ScanMode::Live => "scan",
+            ScanMode::Backfill { .. } => "backfill",
+        }
+    }
+}
+
+/// The stretch one scan reads: rows in `(after, bound]`, at most
+/// `MAX_ROWS_PER_SCAN`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SegmentPlan {
+    pub(crate) after: DateTime<Utc>,
+    pub(crate) bound: DateTime<Utc>,
+    pub(crate) mode: ScanMode,
+}
+
+/// Scan one relationship from its live cursor up to `bound`. The caller holds
+/// the claim, and every path settles it except a failed state read and an
+/// unconfigured `dreaming_scan`, which leave it to go stale. A scan that finds
+/// the claim gone writes nothing further, records an `empty` event and reports
+/// `Empty`. Every scan that reached the model leaves one event row.
 pub(crate) async fn scan_instance(
     state: &AppState,
     instance_id: Uuid,
     bound: DateTime<Utc>,
-    kind: &'static str,
 ) -> ScanOutcome {
-    let pool = &state.pool;
-    let scan = ScanStateRepo { pool };
-    let st = match scan.load(instance_id).await {
+    let st = match (ScanStateRepo { pool: &state.pool })
+        .load(instance_id)
+        .await
+    {
         Ok(Some(st)) => st,
         Ok(None) => return ScanOutcome::Empty,
         Err(e) => {
@@ -66,12 +96,35 @@ pub(crate) async fn scan_instance(
             return ScanOutcome::Failed;
         }
     };
-    let tz = state_tz(&st);
+    let seg = SegmentPlan {
+        after: st.scanned_through_at,
+        bound,
+        mode: ScanMode::Live,
+    };
+    scan_segment(state, &st, seg).await
+}
+
+/// Scan one segment of the relationship `st` describes. A live segment settles
+/// as `scan_instance` says; a backfill segment moves `backfilled_through_at` to
+/// its last row when it succeeds or reads nothing and settles nothing when it
+/// fails, so the next run reads it again, and its caller releases the claim.
+/// A backfill's `bound` is already a cut that splits no timestamp, so its read
+/// is never trimmed.
+pub(crate) async fn scan_segment(
+    state: &AppState,
+    st: &ScanState,
+    seg: SegmentPlan,
+) -> ScanOutcome {
+    let pool = &state.pool;
+    let scan = ScanStateRepo { pool };
+    let instance_id = st.instance_id;
+    let live = seg.mode == ScanMode::Live;
+    let tz = state_tz(st);
     let mut rows = match (EpisodeRepo { pool })
         .read_segment(
             instance_id,
-            st.scanned_through_at,
-            bound,
+            seg.after,
+            seg.bound,
             !state.config.dreaming_voice_disabled,
             MAX_ROWS_PER_SCAN,
         )
@@ -82,11 +135,13 @@ pub(crate) async fn scan_instance(
             tracing::warn!(%instance_id, "dreaming scan: segment read failed: {e}");
             // Released at the cursor it has, so even a third failure skips
             // nothing that was never read.
-            release_failed(&scan, &st, st.scanned_through_at, 0).await;
+            if live {
+                release_failed(&scan, st, st.scanned_through_at, 0).await;
+            }
             return ScanOutcome::Failed;
         }
     };
-    if rows.len() as i64 == MAX_ROWS_PER_SCAN {
+    if live && rows.len() as i64 == MAX_ROWS_PER_SCAN {
         drop_trailing_tie(&mut rows);
     }
     // A stretch with nothing readable clears the whole count: the turns it
@@ -95,14 +150,14 @@ pub(crate) async fn scan_instance(
     // every tick. Rows that land later are still read: the cursor, not the
     // count, decides what a scan covers.
     let (Some(first), Some(last)) = (rows.first(), rows.last()) else {
-        finish_ok(&scan, instance_id, bound, st.pending_turns).await;
+        settle_empty(&scan, st, seg, seg.bound).await;
         return ScanOutcome::Empty;
     };
     let covered = rows.iter().filter(|r| r.role == "user").count() as i32;
     let lines = render_transcript(&rows, tz);
     if lines.is_empty() {
         // Nothing left to read once audio tags are stripped: no call to spend.
-        finish_ok(&scan, instance_id, last.sent_at, st.pending_turns).await;
+        settle_empty(&scan, st, seg, last.sent_at).await;
         return ScanOutcome::Empty;
     }
 
@@ -137,7 +192,7 @@ pub(crate) async fn scan_instance(
     };
     let mut event = ScanEventInsert {
         instance_id: Some(instance_id),
-        kind,
+        kind: seg.mode.kind(),
         status: "failed",
         rows_covered: rows.len() as i32,
         ..Default::default()
@@ -146,7 +201,9 @@ pub(crate) async fn scan_instance(
         Ok(resp) => resp,
         Err(e) => {
             tracing::warn!(%instance_id, "dreaming scan: LLM call failed: {e}");
-            release_failed(&scan, &st, last.sent_at, covered).await;
+            if live {
+                release_failed(&scan, st, last.sent_at, covered).await;
+            }
             record_scan_event(pool, event).await;
             return ScanOutcome::Failed;
         }
@@ -167,7 +224,9 @@ pub(crate) async fn scan_instance(
 
     let Some(out) = parse_scan_output(&resp.reply) else {
         tracing::warn!(%instance_id, "dreaming scan: reply holds no JSON object");
-        release_failed(&scan, &st, last.sent_at, covered).await;
+        if live {
+            release_failed(&scan, st, last.sent_at, covered).await;
+        }
         event.status = "parse_error";
         record_scan_event(pool, event).await;
         return ScanOutcome::Failed;
@@ -185,8 +244,17 @@ pub(crate) async fn scan_instance(
             return ScanOutcome::Failed;
         }
     }
-    event.memories_written =
-        write_memories(state, instance_id, last.session_id, &out.memories).await;
+    // A backfill segment the retired sweeper already extracted keeps its
+    // memories out: they are in the profile layer once.
+    if !matches!(
+        seg.mode,
+        ScanMode::Backfill {
+            write_memories: false
+        }
+    ) {
+        event.memories_written =
+            write_memories(state, instance_id, last.session_id, &out.memories).await;
+    }
     if let Some(summary) = out.episode {
         let episode = EpisodeInsert {
             instance_id,
@@ -217,10 +285,15 @@ pub(crate) async fn scan_instance(
         }
     }
 
-    match scan
-        .finish_scan_ok(instance_id, last.sent_at, covered)
-        .await
-    {
+    let settled = if live {
+        scan.finish_scan_ok(instance_id, last.sent_at, covered)
+            .await
+    } else {
+        scan.set_backfilled_through(instance_id, last.sent_at)
+            .await
+            .map(|()| true)
+    };
+    match settled {
         Ok(true) => {}
         Ok(false) => return discard(pool, event, "claim gone before the cursor moved").await,
         Err(e) => {
@@ -528,14 +601,24 @@ fn state_tz(st: &ScanState) -> Tz {
         .unwrap_or(chrono_tz::UTC)
 }
 
-/// Settle a successful (or empty) scan; a lost claim leaves nothing to settle.
-async fn finish_ok(
+/// Settle a segment that needed no call through `through`: a live scan clears
+/// the whole pending count (a lost claim leaves nothing to settle), a backfill
+/// moves its own mark.
+async fn settle_empty(
     scan: &ScanStateRepo<'_>,
-    instance_id: Uuid,
-    cursor_to: DateTime<Utc>,
-    covered: i32,
+    st: &ScanState,
+    seg: SegmentPlan,
+    through: DateTime<Utc>,
 ) {
-    if let Err(e) = scan.finish_scan_ok(instance_id, cursor_to, covered).await {
+    let instance_id = st.instance_id;
+    let settled = match seg.mode {
+        ScanMode::Live => scan
+            .finish_scan_ok(instance_id, through, st.pending_turns)
+            .await
+            .map(drop),
+        ScanMode::Backfill { .. } => scan.set_backfilled_through(instance_id, through).await,
+    };
+    if let Err(e) = settled {
         tracing::warn!(%instance_id, "dreaming scan: cursor write failed: {e}");
     }
 }
@@ -588,7 +671,7 @@ fn date_range(started: DateTime<Utc>, ended: DateTime<Utc>, tz: Tz) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::routes::companion::testutil::seed_persona_instance;
     use eros_engine_store::arc::ArcRepo;
@@ -600,7 +683,7 @@ mod tests {
     use wiremock::matchers::{body_partial_json, method, path as wm_path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    const SCAN_MODEL: &str = "scan/m";
+    pub(crate) const SCAN_MODEL: &str = "scan/m";
     const ARC_MODEL: &str = "arc/m";
     const SCAN_PROMPT: &str = "scan-system-prompt";
 
@@ -680,7 +763,7 @@ mod tests {
         at(T1) - chrono::Duration::microseconds(1)
     }
 
-    fn completion(model: &str, generation: &str, content: &str) -> ResponseTemplate {
+    pub(crate) fn completion(model: &str, generation: &str, content: &str) -> ResponseTemplate {
         ResponseTemplate::new(200).set_body_json(json!({
             "id": generation, "model": model,
             "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
@@ -689,7 +772,7 @@ mod tests {
     }
 
     /// Calls to `model` on `llm` answer `reply`.
-    async fn answer(llm: &MockServer, model: &str, generation: &str, reply: &str) {
+    pub(crate) async fn answer(llm: &MockServer, model: &str, generation: &str, reply: &str) {
         Mock::given(method("POST"))
             .and(wm_path("/api/v1/chat/completions"))
             .and(body_partial_json(json!({ "model": model })))
@@ -706,7 +789,7 @@ mod tests {
 
     /// A state whose chat calls go to `llm` and whose embeddings go to a mock.
     /// `scan_extra` lands inside the `[tasks.dreaming_scan]` block.
-    async fn state_with(
+    pub(crate) async fn state_with(
         pool: PgPool,
         llm: &MockServer,
         scan_extra: &str,
@@ -761,7 +844,7 @@ mod tests {
         .to_string()
     }
 
-    async fn count(pool: &PgPool, table: &str, instance: Uuid) -> i64 {
+    pub(crate) async fn count(pool: &PgPool, table: &str, instance: Uuid) -> i64 {
         sqlx::query_scalar(&format!(
             "SELECT count(*) FROM engine.{table} WHERE instance_id = $1"
         ))
@@ -771,7 +854,7 @@ mod tests {
         .unwrap()
     }
 
-    type EventRow = (
+    pub(crate) type EventRow = (
         String,
         String,
         Option<String>,
@@ -783,7 +866,7 @@ mod tests {
         Option<String>,
     );
 
-    async fn events(pool: &PgPool, instance: Uuid) -> Vec<EventRow> {
+    pub(crate) async fn events(pool: &PgPool, instance: Uuid) -> Vec<EventRow> {
         sqlx::query_as(
             "SELECT kind, status, model, served_fallback, rows_covered, memories_written, \
                     episode_written, journal_written, generation_id \
@@ -810,7 +893,7 @@ mod tests {
         }
     }
 
-    async fn request_bodies(llm: &MockServer) -> Vec<String> {
+    pub(crate) async fn request_bodies(llm: &MockServer) -> Vec<String> {
         llm.received_requests()
             .await
             .unwrap()
@@ -827,7 +910,7 @@ mod tests {
         answer(&llm, SCAN_MODEL, "gen-scan", &scan_reply()).await;
         let (state, _embed) = state_with(pool.clone(), &llm, "").await;
 
-        let outcome = scan_instance(&state, rel.instance, at(T4), "scan").await;
+        let outcome = scan_instance(&state, rel.instance, at(T4)).await;
         assert_eq!(outcome, ScanOutcome::Ok);
 
         let bodies = request_bodies(&llm).await;
@@ -963,7 +1046,7 @@ mod tests {
         let scan = tokio::spawn({
             let state = state.clone();
             let instance = rel.instance;
-            async move { scan_instance(&state, instance, at(T4), "scan").await }
+            async move { scan_instance(&state, instance, at(T4)).await }
         });
         // The relationship goes after the call left and before its reply lands.
         wait_for_call(&llm, &scan).await;
@@ -1027,7 +1110,7 @@ mod tests {
                     .unwrap());
             }
             assert_eq!(
-                scan_instance(&state, rel.instance, at(T4), "scan").await,
+                scan_instance(&state, rel.instance, at(T4)).await,
                 ScanOutcome::Failed
             );
             let s = repo.load(rel.instance).await.unwrap().unwrap();
@@ -1042,7 +1125,7 @@ mod tests {
             .await
             .unwrap());
         assert_eq!(
-            scan_instance(&state, rel.instance, at(T4), "scan").await,
+            scan_instance(&state, rel.instance, at(T4)).await,
             ScanOutcome::Failed
         );
         let s = repo.load(rel.instance).await.unwrap().unwrap();
@@ -1086,7 +1169,7 @@ mod tests {
         let (state, _embed) = state_with(pool.clone(), &llm, "fallback = [\"scan/f\"]").await;
 
         assert_eq!(
-            scan_instance(&state, rel.instance, at(T4), "scan").await,
+            scan_instance(&state, rel.instance, at(T4)).await,
             ScanOutcome::Ok
         );
         assert_eq!(
@@ -1130,7 +1213,7 @@ mod tests {
         let (state, _embed) = state_with(pool.clone(), &llm, "").await;
 
         assert_eq!(
-            scan_instance(&state, rel.instance, at(T4), "scan").await,
+            scan_instance(&state, rel.instance, at(T4)).await,
             ScanOutcome::Ok
         );
         let arc_body = request_bodies(&llm)

@@ -23,7 +23,7 @@ use crate::state::AppState;
 
 mod parse;
 mod render;
-mod scan;
+pub(crate) mod scan;
 
 use scan::{scan_instance, ScanOutcome};
 
@@ -101,20 +101,32 @@ pub(crate) async fn bump_relationship(
         }
     };
     if bumped.created {
-        let journal = JournalRepo { pool };
-        let on = match journal.first_meet_date(instance_id, user_timezone).await {
-            Ok(on) => on,
-            Err(e) => {
-                tracing::warn!(%instance_id, "dreaming: first-meeting date read failed: {e}");
-                None
-            }
-        }
-        .unwrap_or_else(|| local_date(sent_at, user_timezone));
-        if let Err(e) = journal.insert(&first_meet(instance_id, on)).await {
-            tracing::warn!(%instance_id, "dreaming: first-meeting journal write failed: {e}");
-        }
+        journal_first_meet(pool, instance_id, sent_at, user_timezone).await;
     }
     Some(bumped)
+}
+
+/// Journal the first meeting of a relationship whose scan state was just
+/// created: dated by the pair's earliest chat row, else by `fallback`, in
+/// `tz` (UTC when none). Failures are logged, never raised.
+pub(crate) async fn journal_first_meet(
+    pool: &sqlx::PgPool,
+    instance_id: Uuid,
+    fallback: DateTime<Utc>,
+    tz: Option<Tz>,
+) {
+    let journal = JournalRepo { pool };
+    let on = match journal.first_meet_date(instance_id, tz).await {
+        Ok(on) => on,
+        Err(e) => {
+            tracing::warn!(%instance_id, "dreaming: first-meeting date read failed: {e}");
+            None
+        }
+    }
+    .unwrap_or_else(|| local_date(fallback, tz));
+    if let Err(e) = journal.insert(&first_meet(instance_id, on)).await {
+        tracing::warn!(%instance_id, "dreaming: first-meeting journal write failed: {e}");
+    }
 }
 
 /// The K path of a 1:1 text turn that `bump_relationship` counted: once
@@ -156,7 +168,7 @@ pub(crate) async fn scan_if_due(
         .await
     {
         Ok(true) => {
-            scan_instance(state, instance_id, bound, "scan").await;
+            scan_instance(state, instance_id, bound).await;
         }
         Ok(false) => {}
         Err(e) => tracing::warn!(%instance_id, "dreaming: scan claim failed: {e}"),
@@ -254,7 +266,7 @@ pub(crate) async fn sweep_once(state: &AppState) -> SweepTally {
                 continue;
             }
         }
-        match scan_instance(state, instance_id, Utc::now(), "scan").await {
+        match scan_instance(state, instance_id, Utc::now()).await {
             ScanOutcome::Ok => tally.ok += 1,
             ScanOutcome::Empty => tally.empty += 1,
             ScanOutcome::Failed => tally.failed += 1,
@@ -866,7 +878,7 @@ mod tests {
             state.config.dreaming_voice_disabled = voice_disabled;
             let instance = channel_case(&pool).await;
 
-            scan_instance(&state, instance, at("2026-10-02T00:00:00Z"), "scan").await;
+            scan_instance(&state, instance, at("2026-10-02T00:00:00Z")).await;
 
             let bodies = request_bodies(&llm).await;
             assert_eq!(bodies.len(), 1);
@@ -919,7 +931,7 @@ mod tests {
             .await
             .unwrap());
 
-        let outcome = scan_instance(&state, instance, at("2026-10-02T00:00:00Z"), "scan").await;
+        let outcome = scan_instance(&state, instance, at("2026-10-02T00:00:00Z")).await;
         assert_eq!(outcome, ScanOutcome::Empty);
         assert!(request_bodies(&llm).await.is_empty(), "no call to spend");
         let s = scan.load(instance).await.unwrap().unwrap();

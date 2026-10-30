@@ -42,6 +42,31 @@ const COLUMNS: &str = "instance_id, scanned_through_at, pending_turns, last_turn
                        last_scanned_at, scan_failures, claimed_at, user_timezone, \
                        episodes_since_arc, arc_failures, backfilled_through_at";
 
+/// The rows a scan reads (live text and voice sessions, voice only while `$1`,
+/// user and assistant rows) that the backfill has not covered: after
+/// `backfilled_through_at`, up to the live cursor. A relationship without a
+/// state row has its whole history here.
+const BACKFILL_ROWS: &str = "FROM engine.chat_messages m \
+     JOIN engine.chat_sessions s ON s.id = m.session_id \
+     LEFT JOIN engine.relationship_scan_state st ON st.instance_id = s.instance_id \
+     WHERE s.instance_id IS NOT NULL AND NOT s.archived \
+       AND s.channel IN ('text', 'voice') AND ($1 OR s.channel = 'text') \
+       AND m.role IN ('user', 'assistant') \
+       AND (m.channel IS NULL OR m.channel = 'voice') \
+       AND m.sent_at > COALESCE(st.backfilled_through_at, '-infinity') \
+       AND m.sent_at <= COALESCE(st.scanned_through_at, 'infinity')";
+
+/// One row of a backfill window: what the backfill needs to cut segments and
+/// decide whether a segment's profile memories are still unextracted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
+pub struct BackfillRow {
+    pub sent_at: DateTime<Utc>,
+    pub assistant: bool,
+    /// The retired memory sweeper never stamped the row's session, or stamped
+    /// it before this row was said.
+    pub unextracted: bool,
+}
+
 /// What `bump` reports: the new pending count, and whether this turn created
 /// the relationship's row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -296,6 +321,108 @@ impl ScanStateRepo<'_> {
         ))
         .bind(instance_id)
         .fetch_optional(self.pool)
+        .await
+    }
+
+    /// Take the relationship for one backfill segment: unlike `claim`, it
+    /// needs no pending turns, only no live claim (one older than `stale` is
+    /// taken over). `false` when the row is gone or a scan holds it.
+    pub async fn claim_for_backfill(
+        &self,
+        instance_id: Uuid,
+        stale: Duration,
+    ) -> Result<bool, sqlx::Error> {
+        let claimed: Option<Uuid> = sqlx::query_scalar(
+            "UPDATE engine.relationship_scan_state SET claimed_at = now() \
+             WHERE instance_id = $1 \
+               AND (claimed_at IS NULL \
+                    OR claimed_at < now() - make_interval(secs => $2::float8)) \
+             RETURNING instance_id",
+        )
+        .bind(instance_id)
+        .bind(stale.as_secs() as i64)
+        .fetch_optional(self.pool)
+        .await?;
+        Ok(claimed.is_some())
+    }
+
+    /// Release the claim a backfill segment held.
+    pub async fn release_claim(&self, instance_id: Uuid) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE engine.relationship_scan_state SET claimed_at = NULL WHERE instance_id = $1",
+        )
+        .bind(instance_id)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Open the scan state of a relationship that has history but has not
+    /// chatted since the scanner shipped: the cursor sits at its newest row,
+    /// so everything it said so far is the backfill's and nothing is pending.
+    /// `true` when this call created the row; `false` when one exists or the
+    /// relationship has no rows.
+    pub async fn ensure_for_backfill(&self, instance_id: Uuid) -> Result<bool, sqlx::Error> {
+        let created: Option<Uuid> = sqlx::query_scalar(
+            "INSERT INTO engine.relationship_scan_state (instance_id, scanned_through_at) \
+             SELECT $1, max(m.sent_at) FROM engine.chat_messages m \
+             JOIN engine.chat_sessions s ON s.id = m.session_id \
+             WHERE s.instance_id = $1 AND NOT s.archived \
+               AND s.channel IN ('text', 'voice') \
+               AND m.role IN ('user', 'assistant') \
+               AND (m.channel IS NULL OR m.channel = 'voice') \
+             HAVING max(m.sent_at) IS NOT NULL \
+             ON CONFLICT (instance_id) DO NOTHING \
+             RETURNING instance_id",
+        )
+        .bind(instance_id)
+        .fetch_optional(self.pool)
+        .await?;
+        Ok(created.is_some())
+    }
+
+    /// Relationships with at least `min_rows` rows left for the backfill, most
+    /// first, at most `limit` (all when `None`), only `only` when given. A
+    /// relationship without a state row counts its whole history.
+    pub async fn instances_with_history(
+        &self,
+        min_rows: i64,
+        limit: Option<i64>,
+        only: Option<Uuid>,
+        include_voice: bool,
+    ) -> Result<Vec<(Uuid, i64)>, sqlx::Error> {
+        sqlx::query_as(&format!(
+            "SELECT s.instance_id, count(*) {BACKFILL_ROWS} \
+               AND ($2::uuid IS NULL OR s.instance_id = $2) \
+             GROUP BY s.instance_id \
+             HAVING count(*) >= $3 \
+             ORDER BY count(*) DESC, s.instance_id \
+             LIMIT $4"
+        ))
+        .bind(include_voice)
+        .bind(only)
+        .bind(min_rows)
+        .bind(limit)
+        .fetch_all(self.pool)
+        .await
+    }
+
+    /// The rows the backfill has left for one relationship, oldest first, in
+    /// the order a scan reads them.
+    pub async fn backfill_window(
+        &self,
+        instance_id: Uuid,
+        include_voice: bool,
+    ) -> Result<Vec<BackfillRow>, sqlx::Error> {
+        sqlx::query_as(&format!(
+            "SELECT m.sent_at, m.role = 'assistant' AS assistant, \
+                    (s.classified_at IS NULL OR s.classified_at < m.sent_at) AS unextracted \
+             {BACKFILL_ROWS} AND s.instance_id = $2 \
+             ORDER BY m.sent_at, m.id"
+        ))
+        .bind(include_voice)
+        .bind(instance_id)
+        .fetch_all(self.pool)
         .await
     }
 
@@ -786,6 +913,197 @@ mod tests {
             .unwrap();
         let s = repo.load(instance).await.unwrap().unwrap();
         assert_eq!(s.backfilled_through_at, Some(at(500)));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn claim_for_backfill_ignores_pending_and_respects_live_claim(pool: PgPool) {
+        let repo = ScanStateRepo { pool: &pool };
+        let (instance, _) = seed_relationship(&pool).await;
+        assert!(
+            !repo.claim_for_backfill(instance, TEN_MIN).await.unwrap(),
+            "no row, nothing to claim"
+        );
+
+        repo.bump(instance, at(1_000), None).await.unwrap();
+        assert!(repo.claim(instance, TEN_MIN).await.unwrap());
+        assert!(repo.finish_scan_ok(instance, at(1_000), 1).await.unwrap());
+        assert!(!repo.claim(instance, TEN_MIN).await.unwrap());
+        assert!(
+            repo.claim_for_backfill(instance, TEN_MIN).await.unwrap(),
+            "the backfill claims with nothing pending"
+        );
+        assert!(!repo.claim_for_backfill(instance, TEN_MIN).await.unwrap());
+        repo.bump(instance, at(2_000), None).await.unwrap();
+        assert!(
+            !repo.claim(instance, TEN_MIN).await.unwrap(),
+            "a live scan waits for the backfill's segment"
+        );
+
+        repo.release_claim(instance).await.unwrap();
+        let s = repo.load(instance).await.unwrap().unwrap();
+        assert_eq!((s.claimed_at, s.pending_turns), (None, 1));
+        assert!(repo.claim(instance, TEN_MIN).await.unwrap());
+        assert!(
+            !repo.claim_for_backfill(instance, TEN_MIN).await.unwrap(),
+            "the backfill waits for a live claim"
+        );
+        shift(&pool, instance, "claimed_at", "11 minutes").await;
+        assert!(
+            repo.claim_for_backfill(instance, TEN_MIN).await.unwrap(),
+            "a stale claim is taken over"
+        );
+
+        repo.release_claim(Uuid::new_v4()).await.unwrap();
+    }
+
+    /// A session of `channel` on the relationship, archived or not.
+    async fn seed_channel_session(
+        pool: &PgPool,
+        instance: Uuid,
+        channel: &str,
+        archived: bool,
+    ) -> Uuid {
+        let owner: Uuid =
+            sqlx::query_scalar("SELECT owner_uid FROM engine.persona_instances WHERE id = $1")
+                .bind(instance)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        let session = seed_session(pool, owner, instance, archived).await;
+        sqlx::query("UPDATE engine.chat_sessions SET channel = $2 WHERE id = $1")
+            .bind(session)
+            .bind(channel)
+            .execute(pool)
+            .await
+            .unwrap();
+        session
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn ensure_for_backfill_places_cursor_at_newest_live_row(pool: PgPool) {
+        let repo = ScanStateRepo { pool: &pool };
+        let (instance, session) = seed_relationship(&pool).await;
+        let voice = seed_channel_session(&pool, instance, "voice", false).await;
+        let archived = seed_channel_session(&pool, instance, "text", true).await;
+        seed_row(&pool, session, "user", at(1_000)).await;
+        seed_row(&pool, voice, "assistant", at(2_000)).await;
+        seed_row(&pool, archived, "user", at(3_000)).await;
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, channel, sent_at) \
+             VALUES ($1, 'assistant', 'qa', 'product_qa', $2)",
+        )
+        .bind(session)
+        .bind(at(4_000))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(repo.ensure_for_backfill(instance).await.unwrap());
+        let s = repo.load(instance).await.unwrap().unwrap();
+        assert_eq!(
+            s.scanned_through_at,
+            at(2_000),
+            "archived and product Q&A rows are not history"
+        );
+        assert_eq!((s.pending_turns, s.last_turn_at), (0, None));
+        assert_eq!(s.backfilled_through_at, None);
+
+        seed_row(&pool, session, "user", at(5_000)).await;
+        assert!(!repo.ensure_for_backfill(instance).await.unwrap());
+        assert_eq!(
+            repo.load(instance)
+                .await
+                .unwrap()
+                .unwrap()
+                .scanned_through_at,
+            at(2_000),
+            "an existing row keeps its cursor"
+        );
+
+        let (silent, _) = seed_relationship(&pool).await;
+        assert!(
+            !repo.ensure_for_backfill(silent).await.unwrap(),
+            "no rows, no state"
+        );
+        assert!(repo.load(silent).await.unwrap().is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn instances_with_history_counts_the_unscanned_window(pool: PgPool) {
+        let repo = ScanStateRepo { pool: &pool };
+        // Five rows, no state yet: the whole history is the window.
+        let (fresh, fresh_session) = seed_relationship(&pool).await;
+        for t in 1..=5 {
+            seed_row(&pool, fresh_session, "user", at(t * 1_000)).await;
+        }
+        // Six rows; live scanning started at the fifth, the backfill has read
+        // the first: rows two to four remain, one of them in a voice session.
+        let (started, started_session) = seed_relationship(&pool).await;
+        let voice = seed_channel_session(&pool, started, "voice", false).await;
+        for t in 1..=6 {
+            let session = if t == 3 { voice } else { started_session };
+            let role = if t % 2 == 0 { "assistant" } else { "user" };
+            seed_row(&pool, session, role, at(t * 1_000)).await;
+        }
+        repo.bump(started, at(5_000), None).await.unwrap();
+        repo.set_backfilled_through(started, at(1_000))
+            .await
+            .unwrap();
+        // One row: under the floor.
+        let (short, short_session) = seed_relationship(&pool).await;
+        seed_row(&pool, short_session, "user", at(1_000)).await;
+
+        assert_eq!(
+            repo.instances_with_history(2, None, None, true)
+                .await
+                .unwrap(),
+            vec![(fresh, 5), (started, 3)]
+        );
+        assert_eq!(
+            repo.instances_with_history(2, None, None, false)
+                .await
+                .unwrap(),
+            vec![(fresh, 5), (started, 2)],
+            "voice rows count only while voice is read"
+        );
+        assert_eq!(
+            repo.instances_with_history(2, Some(1), None, true)
+                .await
+                .unwrap(),
+            vec![(fresh, 5)]
+        );
+        assert_eq!(
+            repo.instances_with_history(1, None, Some(short), true)
+                .await
+                .unwrap(),
+            vec![(short, 1)]
+        );
+
+        // The session was stamped by the retired sweeper between rows two and
+        // four; the voice session never was.
+        sqlx::query("UPDATE engine.chat_sessions SET classified_at = $2 WHERE id = $1")
+            .bind(started_session)
+            .bind(at(3_000))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let window = repo.backfill_window(started, true).await.unwrap();
+        assert_eq!(
+            window
+                .iter()
+                .map(|r| (r.sent_at, r.assistant, r.unextracted))
+                .collect::<Vec<_>>(),
+            [
+                (at(2_000), true, false),
+                (at(3_000), false, true),
+                (at(4_000), true, true),
+            ]
+        );
+        assert_eq!(
+            repo.backfill_window(fresh, true).await.unwrap().len(),
+            5,
+            "no state row: every row"
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]
