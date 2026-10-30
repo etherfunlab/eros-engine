@@ -1065,7 +1065,7 @@ The draw:
   | `prefer_trip` | `true` / `false` (default) | trips come up three times as often; still once a week at most |
   | `homesick` | `true` / `false` / absent | where a trip goes: `true` favours `hometown_visit` and thins the leisure trips, `false` thins `hometown_visit`; `business_trip` untouched |
   | `is_virgin` | `true` / `false` (default) | `having_sex` is a fifth as likely until her first `having_sex` event, after which the key no longer applies |
-  | `sex_addict` | `true` / `false` / absent | `sudden_desire` comes up three times / a third as often; still only at the closest rung |
+  | `sex_addict` | `true` / `false` / absent | `sudden_desire` comes up three times / a third as often within `short`; still only at the closest rung |
   | `smoking`, `alcoholic`, `drug`, `coffee` | each `true` / `false` / absent | whether she smokes, drinks, uses weed, drinks coffee: the more are `true`, the sooner her `indulgence` comes back to `high` and weighs the pick; a `false` key can make her refuse a `give` of that thing ([above](#post-compchatsession_idmessagestream)) |
 
   A value of the wrong shape, an unknown kind or a kind outside `mid` is

@@ -870,7 +870,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
   | `prefer_trip` | `true` / `false`（默认） | trip 类被抽到的概率是原来的三倍；仍然每周最多一次 |
   | `homesick` | `true` / `false` / 不写 | 出行往哪去：`true` 偏向 `hometown_visit`、压低游玩的两种；`false` 压低 `hometown_visit`；`business_trip` 不动 |
   | `is_virgin` | `true` / `false`（默认） | 第一次 `having_sex` 事件之前，`having_sex` 的概率是五分之一；之后这个键不再起作用 |
-  | `sex_addict` | `true` / `false` / 不写 | `sudden_desire` 被抽到的概率是原来的三倍 / 三分之一；仍然只在最亲近的档 |
+  | `sex_addict` | `true` / `false` / 不写 | `sudden_desire` 在 `short` 内被抽到的概率是原来的三倍 / 三分之一；仍然只在最亲近的档 |
   | `smoking`、`alcoholic`、`drug`、`coffee` | 各为 `true` / `false` / 不写 | 她抽不抽烟、喝不喝酒、用不用大麻、喝不喝咖啡：为 `true` 的越多，她的 `indulgence` 回到 `high` 越快，进而给抽取加权；为 `false` 的键可能让她拒收递来的这样东西（见[上文](#post-compchatsession_idmessagestream)） |
 
   取值形状不对、种类未知，或种类不在 `mid` 里，一律忽略。偏好不会绕过任何门槛。
