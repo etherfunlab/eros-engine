@@ -3,7 +3,7 @@
 [English](life-events-needs.md) · [中文](life-events-needs.zh.md)
 
 角色有自己的一天，有两类状态跟着这一天走。**需求**是六项基本水平（饥饿、社交欲、体力、情感需求、外出、享受），
-由 PDE 判官评定，由 engine 随时间往前推。**生活事件**是发生在她身上的事，调用方来要的时候才抽：
+由 PDE 判官评定，由 engine 随时间往前推，被接受的 give 也会改动它。**生活事件**是发生在她身上的事，调用方来要的时候才抽：
 一趟出差、一场病、路上遇到的一只流浪猫、一个小时没看手机。两者都以平实的当前事实交给判官和回复，
 都不告诉她该怎么表现；例外是本身就是沉默的事件（离线类种类）。两者之上还有第三件事：关系磨薄了，她可以提出先分开一阵，
 这是第一个**生活选择**（见[提出分开的选择](#提出分开的选择)）。
@@ -17,7 +17,7 @@
 | | 需求 | 生活事件 |
 |---|---|---|
 | 是什么 | 六项水平：`hunger`、`social`、`stamina`、`emotional`、`outing`、`indulgence`，各为 `low` / `mid` / `high` | 发生在她一天里的事，分四个类别 |
-| 谁写入 | PDE 判官，在被判官评过的文字回合 | 调用方的 `POST /v2/comp/session/{session_id}/events`，种类由 engine 选 |
+| 谁写入 | PDE 判官，在被判官评过的文字回合；被接受的 give 上 engine 也写（见[give 会改动需求](#give-会改动需求)） | 调用方的 `POST /v2/comp/session/{session_id}/events`，种类由 engine 选 |
 | 存在哪 | 被评定那一行用户消息的 `metadata.needs` | `engine.persona_events`，外加讲述它的那条消息（她不讲的离线类种类没有） |
 | 范围 | 每个角色实例一份状态，跨它所有的 session | 同左 |
 | 时间 | 两次评定之间漂移，读取时现算 | `started_at` 与 `ends_at`；冷却从开始时刻算起 |
@@ -55,13 +55,49 @@
   前四个键缺任何一个，整个对象解析不了。
 - **评谁。** 只评角色本人，不评你们之间的关系；关系由好感度评估器评。
 - **存在哪。** 存在判官评过的那个回合的用户消息行上，键为 `metadata.needs`，不管这一回合的结局是回复、
-  图片、ghost 还是产品咨询。写入会等它完成，回合才继续。写入失败只记日志，回合带着 verdict 里的水平继续往下走。
+  图片、ghost 还是产品咨询。如果这一回合有被接受的 give，由 engine 写入存下的水平：give 改动的那几项取自基线，
+  其余各项取自判官。判官弃权时同样如此（见[下文](#give-会改动需求)）。写入会等它完成，回合才继续。
+  写入失败只记日志，回合带着本来要写的水平继续往下走。
 - **什么情况不写。** 规则引擎回合（判官关闭或失败）、`needs: null` 的 verdict、被离线类种类
-  压成沉默的回合（它不跑判官），以及所有群聊和语音回合。
+  压成沉默的回合（它不跑判官），以及所有群聊和语音回合。例外是改动了某项需求的被接受的 give：
+  只要此前已有一次评定，规则引擎回合和 `needs: null` 的 verdict 也照写。
 - **谁的状态。** 角色实例的。读取时跨该实例的所有 session 找最新一次评定，所以再开一个会话不会让她的饥饿清零。
 
 判官给出的 `needs` 和它看到的水平，会随 verdict 一起进审计；见
 [llm-audit.zh.md](llm-audit.zh.md#pde-判官的-payload)。
+
+### give 会改动需求
+
+1:1 文字回合里，`give` 一旦被接受，engine 把三项需求各挪动一档：
+
+| `give` 的物品 | `hunger` | `social` | `indulgence` |
+|---|---|---|---|
+| `food` | −1 | | |
+| `cigarette`、`alcohol`、`herb` | −1 | +1 | +1 |
+| `medicine`、`coffee` | −1 | −1 | −1 |
+| 其他任何物品 | | | |
+
+−1 是朝 `low` 方向一档，+1 是朝 `high` 方向一档，到头就停。数量不计：一次 give 只挪一档。
+
+*被接受*指这一回合实际生效的回应是接受。判官拒绝，或习惯掷骰强制拒收
+（见[习惯掷骰](model-config.zh.md#taskspde_decision--opt-in-llm-pde-判断器)），都不挪动任何需求。
+失败放行的回合（判官失败）按现有规则接受 give，所以挪动在那里同样生效。
+
+写入的内容：
+
+- **基线。** 判官看到的那组水平：这一行用户消息之前最新的一次评定，推到这一行的 `sent_at`。
+- **被挪动的需求。** 物品挪动的每一项，存下的水平是基线再挪一档。判官这一回合对该项的评定丢弃：
+  它在 `[用户动作]` 里看到了这次 give，常常自己就把饥饿评低了，再在它的评定上挪一次，这顿饭就算了两遍。
+- **其余需求。** 取判官的评定，和任何回合一样相对基线解析。判官弃权或失败时，保留基线。
+- **没有基线。** 还没有任何评定时，判官的评定原样写入；判官也没有评定，就什么都不写。
+  engine 从不凭空编造水平。
+- **一次写入。** 结果写到这一行用户消息上，只写一次，用的就是上面那次写入。give 的回合里，
+  判官弃权时也会写，因为 engine 自己有评定的理由。
+- **读取方。** 回复、`body_state` 帧和 `GET …/effects` 和读任何评定一样读这组写下的水平。
+  判官的审计里保留的仍是判官说的。
+
+表里没有的物品什么都不挪，这一回合判官的评定照常写入。语音和群聊回合不论有没有 give 都不写需求。
+生活事件只通过判官影响需求（见[下文](#2-事件从不改写已存的需求)）。
 
 ### 两次评定之间的漂移
 
@@ -118,7 +154,8 @@ BYOC 角色的这四个键在她的卡片上，engine 只在一轮对话里才�
   `indulgence` 只在 `high` 时出现。它点名一样她用的东西，每一轮从值为 `true` 的习惯键里随机挑一个：`smoking` 是很想抽根烟，
   `alcoholic` 是很想喝一杯，`drug` 是很想抽口大麻，`coffee` 是很想喝杯咖啡；没有键为 `true` 时读作很想放纵一下。各项都是 `mid`（`low` 的 `indulgence` 在这里也按 `mid` 算），
   或还没有评定，就什么都不加，prompt 保持不变。被判官评过的回合，回复按这一回合最终的水平来写：
-  判官评了就用 verdict 里的，否则用判官看到的那组推算后的水平。配置了判官的部署里，规则引擎回合用推算后的水平。
+  写在这一行上的水平（verdict 里的，被接受的 give 挪动过的那几项除外），否则用判官看到的那组推算后的水平。
+  配置了判官的部署里，规则引擎回合用推算后的水平，再加上被接受的 give 的挪动。
 - **调用方**在 `body_state` 帧上拿到同样的水平（`needs`，对象或 `null`）。有 give 余效在起作用，或需求已知时发送，
   幂等重放时重发。`GET …/effects` 返回推到调用时刻的水平，没有评定或没有判官时为 `null`；
   它的 `changes_at` 给出这份响应下一次自己变化的时刻：某项需求的下一步，或进行中事件的结束；`as_of` 是计算它的时刻，
@@ -611,12 +648,12 @@ composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2com
 `social` 不给任何种类加权。只有部署配置了判官、并且角色有一次评定时，系数才生效（评定推到调用时刻）；否则所有系数都是 1。
 系数不是门槛：权重 ×3 的种类仍然要先有资格。
 
-### 2. 事件和 give 从不改写已存的需求
+### 2. 事件从不改写已存的需求
 
-没有任何代码路径会因为事件或 give 去写需求。判官读到 `[近期事件]`，以及 give 带来的 `[用户动作]` 和之后的 `[身体状态]`，
+没有任何代码路径会因为事件去写需求。判官读到 `[近期事件]`，以及 give 带来的 `[用户动作]` 和之后的 `[身体状态]`，
 自己在把它们放在眼前的前提下重新评定需求；`examples/model_config.toml` 里的参考判官 prompt 就是这样要求它的：
 以 `[需求]` 为起点，结合对话、`[近期事件]`、`[身体状态]` 和经过的时间重判。判官弃权（`needs: null`）时，不管发生了什么，上一次的评定继续往前漂。
-需求只有一个来源：判官。
+唯一不是判官写的，是被接受的 give 对最多三项需求的挪动（见[give 会改动需求](#give-会改动需求)），它只替换判官对这几项的评定。
 
 ### 3. 离线的那一段不写评定
 
@@ -791,7 +828,7 @@ ghosting 开关关闭时它不让任何轮次沉默，和任何离线时段一�
 
 ## 代码指引
 
-- `crates/eros-engine-core/src/needs.rs`：水平、漂移常量、`Habits`、`carried`。
+- `crates/eros-engine-core/src/needs.rs`：水平、漂移常量、`Habits`、`carried`、`after_give`（give 的挪动）。
 - `crates/eros-engine-core/src/pde.rs`：`refuses_give` 与 `UNUSED_SUBSTANCE_ACCEPT`，即 give 时掷的那一次。
 - `crates/eros-engine-core/src/events.rs`：类别和种类、每个种类的规则、门槛、需求与角色系数、`is_offline` 与 `is_told`、`draw`、`lookback`。
 - `crates/eros-engine-server/src/routes/session_events.rs`：events 路由、抽取的输入、离线类的两道门槛。
@@ -799,7 +836,7 @@ ghosting 开关关闭时它不让任何轮次沉默，和任何离线时段一�
 - `crates/eros-engine-server/src/routes/bff/affinity.rs`：delta 上的 `life_choice` 字段。
 - `crates/eros-engine-server/src/pipeline/proactive.rs`：事件消息和选择相关的消息、它们的舞台提示和写入（`kind_cue`、`find_cue`）。
 - `crates/eros-engine-server/src/pipeline/life_choice.rs`：触发与她的请求、不理会的转换、放缓的读取。
-- `crates/eros-engine-server/src/pipeline/stream.rs::run_stream`：需求的读取与写入、`[需求]` 与 `[近期事件]` 两行
+- `crates/eros-engine-server/src/pipeline/stream.rs::run_stream`：需求的读取与写入（被接受的 give 的挪动走 `after_give`）、`[需求]` 与 `[近期事件]` 两行
   （`build_pde_ctx`）、判官之前的 offline 分支、掷出拒收后的改判（`apply_give_refusal`）、`body_state_frame`。
 - `crates/eros-engine-server/src/prompt.rs`：`needs_line`、`events_judge_text`、`events_reply_text`、
   `just_now_text`、`persona_traits`、`persona_habits`、`[character_state]` 里的各行，以及 `[now]` 里的事件行。
@@ -809,6 +846,6 @@ ghosting 开关关闭时它不让任何轮次沉默，和任何离线时段一�
 - `crates/eros-engine-store/src/story.rs::StoryRepo`：`life_events`、`life_choices`，以及不含 proactive 行的 `chat_evidence`。
 - `crates/eros-engine-server/src/pipeline/story.rs`：`load_evidence` 与故事 payload 的 `life_events`、`current_background`、`life_choices`；`pipeline/world.rs::direct_world`：世界导演的 `current_background`；`prompt.rs::event_when_text`：两者共用的相对时间。
 - `crates/eros-engine-store/src/life_choices.rs::LifeChoiceRepo`：选择行、`pending`、`resolve_in_tx`、`growth_slowed`。
-- `crates/eros-engine-store/src/affinity.rs::AffinityRepo`：`persist_life_choice_drop_in_tx`、`last_judged_patiences`。
+- `crates/eros-engine-store/src/affinity.rs::AffinityRepo`：`persist_life_choice_drop_in_tx`、`last_judged_endpoints`。
 - `crates/eros-engine-store/src/chat.rs::ChatRepo`：`set_needs` 与 `latest_needs`。
 - `crates/eros-engine-store/migrations/0000_baseline.sql`：事件表与选择表、needs 索引，以及放宽后的 affinity `event_type` 检查（由 baseline 之前的迁移链折叠而来）。

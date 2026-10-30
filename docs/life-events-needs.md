@@ -4,10 +4,11 @@
 
 A persona has a day of her own, and two kinds of state follow it. **Needs** are six
 basic levels (hunger, social, stamina, emotional, outing, indulgence) that the PDE judge
-rates and the engine carries forward in time. **Life events** are things that happen to
-her, drawn when a caller asks: a trip, an illness, a stray cat, an hour away from her
-phone. Both reach the judge and the reply as plain facts in the present tense. Neither
-tells her how to behave; the exception is an event that is silence (the offline kinds). A
+rates, the engine carries forward in time, and an accepted give moves. **Life events** are
+things that happen to her, drawn when a caller asks: a trip, an illness, a stray cat, an
+hour away from her phone. Both reach the judge and the reply as plain facts in the present
+tense. Neither tells her how to behave; the exception is an event that is silence (the
+offline kinds). A
 third piece sits on top of both: when a relationship has worn thin she can ask for a
 break, the first *life choice* ([the ask-for-space choice](#the-ask-for-space-choice)).
 
@@ -21,7 +22,7 @@ about how the pieces work and how they fit together.
 | | Needs | Life events |
 |---|---|---|
 | What it is | six levels: `hunger`, `social`, `stamina`, `emotional`, `outing`, `indulgence`, each `low` / `mid` / `high` | things that happen in her day, in four categories |
-| Written by | the PDE judge, on a judged text turn | a caller's `POST /v2/comp/session/{session_id}/events`; the engine picks the kind |
+| Written by | the PDE judge, on a judged text turn; the engine too, on an accepted give ([Gives move needs](#gives-move-needs)) | a caller's `POST /v2/comp/session/{session_id}/events`; the engine picks the kind |
 | Stored in | `metadata.needs` of the rated user row | `engine.persona_events`, plus the message that tells it (none for an offline kind she does not announce) |
 | Scope | one state per persona instance, across all its sessions | the same |
 | Time | drifts between ratings, computed on read | `started_at` and `ends_at`; cooldowns count from the start |
@@ -64,17 +65,60 @@ effects route, no needs factor in the event draw, nothing in a voice call.
 - **What it rates.** The persona alone, never the relationship; the affinity evaluator rates
   that.
 - **Where it is stored.** On the user row of the turn the judge rated, as `metadata.needs`,
-  whatever the turn's outcome: reply, image, ghost or product question. The write is awaited
-  before the turn goes on. A failed write is logged and the turn carries on with the verdict's
-  levels in memory.
+  whatever the turn's outcome: reply, image, ghost or product question. On a turn with an
+  accepted give the engine writes the stored levels: the needs the item moves come from the
+  baseline, and the rest come from the judge. This holds even when the judge abstained
+  ([below](#gives-move-needs)). The write is awaited before the turn goes on. A failed write is
+  logged and the turn carries on with the levels it meant to write.
 - **What writes nothing.** A rule-engine turn (the judge is off or failed), a `needs: null`
   verdict, a turn silenced by an offline stretch (it runs no judge), and every group
-  or voice turn.
+  or voice turn. The exception is an accepted give that moves a need: it writes on a
+  rule-engine turn or a `needs: null` verdict too, once a rating precedes it.
 - **Whose state.** The persona instance's. The newest rated row is read across all the
   instance's sessions, so a second session does not reset her hunger.
 
 The judge's `needs` and the levels it was shown are audited with the rest of the verdict; see
 [llm-audit.md](llm-audit.md#pde-judge-payload).
+
+### Gives move needs
+
+On a 1:1 text turn whose `give` is accepted, the engine moves three needs by one level each:
+
+| `give` item | `hunger` | `social` | `indulgence` |
+|---|---|---|---|
+| `food` | −1 | | |
+| `cigarette`, `alcohol`, `herb` | −1 | +1 | +1 |
+| `medicine`, `coffee` | −1 | −1 | −1 |
+| any other item | | | |
+
+−1 is one level toward `low` and +1 one level toward `high`, stopping at the ends. The
+quantity is ignored: one give moves one level.
+
+*Accepted* means the turn's effective response is accept. A judge refusal, or the habit roll
+forcing a refusal ([the habit roll](model-config.md#taskspde_decision--opt-in-llm-pde-judge)),
+moves nothing. A fail-open turn (the judge failed) accepts the give under the existing rule, so
+the move applies there too.
+
+What gets written:
+
+- **The baseline.** The levels the judge was shown: the newest rating before this user row,
+  carried to its `sent_at`.
+- **The moved needs.** For each need the item moves, the stored level is the baseline moved by
+  one. The judge's rating of that need this turn is discarded: it sees the give in
+  `[用户动作]` and often lowers hunger itself, and shifting on top of its rating would count the
+  meal twice.
+- **The other needs.** The judge's rating, resolved against the baseline as on any turn. If the
+  judge abstained or failed, they keep the baseline.
+- **No baseline.** With no rating yet, the judge's rating is written unshifted; with no judge
+  rating either, nothing is written. The engine never invents levels from nothing.
+- **One write.** The result goes to the user row once, with the write above. On a give turn it
+  is written even when the judge abstained, because the engine has its own reason to rate.
+- **Readers.** The reply, the `body_state` frame and `GET …/effects` read the written levels as
+  they do any rating. The judge's audit keeps what the judge said.
+
+An item that is not in the table moves nothing, and the judge's rating of that turn is written
+as on any other. Voice and group turns write no needs, give or not. Life events move needs only
+through the judge ([below](#2-events-never-change-a-stored-need)).
 
 ### Drift between ratings
 
@@ -144,8 +188,9 @@ again shows the judge the same line.
   很想抽口大麻, `coffee` 很想喝杯咖啡. With no key `true` it reads 很想放纵一下. Every need at `mid` (a `low`
   `indulgence` counts the same), or no rating, adds nothing and leaves the prompt
   unchanged. A judged turn's reply is written with the levels the turn ends with: the
-  verdict's when it rated, otherwise the carried levels the judge was shown. A rule-engine
-  turn in a deployment that has the judge uses the carried levels.
+  levels written to its row (the verdict's, except the needs an accepted give moved), otherwise the
+  carried levels the judge was shown. A rule-engine turn in a deployment that has the judge
+  uses the carried levels, moved by an accepted give.
 - **The caller** gets the same levels on the `body_state` frame (`needs`, an object or `null`),
   sent when a give's effect is at work or needs are known, and re-sent on an idempotent
   replay. `GET …/effects` returns them carried to the moment of the call, or `null` with no
@@ -768,14 +813,15 @@ deployment runs the judge and the persona has a rating, carried to the moment of
 otherwise every factor is 1. A factor is not a gate: a kind weighted ×3 still has to be
 eligible.
 
-### 2. Events and gives never change a stored need
+### 2. Events never change a stored need
 
-Nothing writes a need from an event or a give. The judge reads the `[近期事件]` line, and a
-give's `[用户动作]` and later `[身体状态]` lines, and rates the needs itself with them in
-view; the reference judge prompt in `examples/model_config.toml` tells it to start from
-`[需求]` and to take the conversation, `[近期事件]`, `[身体状态]` and the elapsed time into
-account. If the judge abstains (`needs: null`), the previous rating keeps drifting whatever
-happened. Needs keep one source: the judge.
+Nothing writes a need from an event. The judge reads the `[近期事件]` line, and a give's
+`[用户动作]` and later `[身体状态]` lines, and rates the needs itself with them in view; the
+reference judge prompt in `examples/model_config.toml` tells it to start from `[需求]` and to
+take the conversation, `[近期事件]`, `[身体状态]` and the elapsed time into account. If the
+judge abstains (`needs: null`), the previous rating keeps drifting whatever happened. The one
+write that is not the judge's is an accepted give's move of up to three needs
+([Gives move needs](#gives-move-needs)), and it replaces the judge's rating of just those.
 
 ### 3. An offline stretch writes no rating
 
@@ -1006,7 +1052,8 @@ falling-out rows live in `engine.persona_events` like any event.
 
 ## Code pointers
 
-- `crates/eros-engine-core/src/needs.rs`: the levels, the drift constants, `Habits`, `carried`.
+- `crates/eros-engine-core/src/needs.rs`: the levels, the drift constants, `Habits`, `carried`,
+  `after_give` (the give's move).
 - `crates/eros-engine-core/src/pde.rs`: `refuses_give` and `UNUSED_SUBSTANCE_ACCEPT`, the give
   roll.
 - `crates/eros-engine-core/src/events.rs`: categories and kinds, per-kind rules, gates, the
@@ -1019,9 +1066,10 @@ falling-out rows live in `engine.persona_events` like any event.
   messages, their cues and their write (`kind_cue`, `find_cue`).
 - `crates/eros-engine-server/src/pipeline/life_choice.rs`: the trigger and her ask, the ignore
   conversion, the slowdown read.
-- `crates/eros-engine-server/src/pipeline/stream.rs::run_stream`: the needs read and write, the
-  `[需求]` and `[近期事件]` lines (`build_pde_ctx`), the offline branch ahead of the judge,
-  the give roll's refusal (`apply_give_refusal`), `body_state_frame`.
+- `crates/eros-engine-server/src/pipeline/stream.rs::run_stream`: the needs read and write (the
+  accepted give's move goes through `after_give`), the `[需求]` and `[近期事件]` lines
+  (`build_pde_ctx`), the offline branch ahead of the judge, the give roll's refusal
+  (`apply_give_refusal`), `body_state_frame`.
 - `crates/eros-engine-server/src/prompt.rs`: `needs_line`, `events_judge_text`,
   `events_reply_text`, `just_now_text`, `persona_traits`, `persona_habits`, the `[character_state]` lines and the
   event lines under `[now]`.
@@ -1039,7 +1087,7 @@ falling-out rows live in `engine.persona_events` like any event.
 - `crates/eros-engine-store/src/life_choices.rs::LifeChoiceRepo`: the choice rows, `pending`,
   `resolve_in_tx`, `growth_slowed`.
 - `crates/eros-engine-store/src/affinity.rs::AffinityRepo`: `persist_life_choice_drop_in_tx`,
-  `last_judged_patiences`.
+  `last_judged_endpoints`.
 - `crates/eros-engine-store/src/chat.rs::ChatRepo`: `set_needs` and `latest_needs`.
 - `crates/eros-engine-store/migrations/0000_baseline.sql`: the events and choices
   tables, the needs index, and the widened affinity `event_type` check (folded
