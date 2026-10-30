@@ -97,6 +97,11 @@ pub struct BffHistoryEntry {
     /// key-presence contract as `read_at`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub occasion: Option<crate::routes::session_open::GreetingOccasion>,
+    /// The choice her ask row put to the user and how it stands — set on
+    /// that one row, omitted on every other (same key-presence contract as
+    /// `occasion`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub life_choice: Option<crate::routes::life_choices::LifeChoiceReceiptDto>,
     /// The member session that spoke this line (group sessions only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speaker_session_id: Option<Uuid>,
@@ -220,11 +225,15 @@ async fn bff_get_history(
         }
     };
     let rows = page.ok_or_else(|| AppError::NotFound("no such message".into()))?;
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+    let mut receipts =
+        crate::routes::life_choices::receipts_for(&state.pool, &ids, chrono::Utc::now()).await?;
 
     let messages: Vec<BffHistoryEntry> =
         rows.into_iter()
             .map(|r| BffHistoryEntry {
                 id: r.id,
+                life_choice: receipts.remove(&r.id),
                 client_msg_id: r.client_msg_id,
                 role: r.role,
                 content: r.content,
@@ -291,9 +300,14 @@ async fn bff_start_chat(
         let rows = ChatRepo { pool: &state.pool }
             .history_slim(resolved.session_id, history_limit, 0)
             .await?;
+        let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+        let mut receipts =
+            crate::routes::life_choices::receipts_for(&state.pool, &ids, chrono::Utc::now())
+                .await?;
         rows.into_iter()
             .map(|r| BffHistoryEntry {
                 id: r.id,
+                life_choice: receipts.remove(&r.id),
                 client_msg_id: r.client_msg_id,
                 role: r.role,
                 content: r.content,
@@ -1519,6 +1533,96 @@ mod tests {
             "an ordinary reply omits the key rather than sending null"
         );
         assert!(by("hello").get("occasion").is_none());
+    }
+
+    /// Her ask (a declined choice) and her reply, 2 and 1 seconds ago;
+    /// returns the ask row's id.
+    async fn seed_declined_ask(pool: &PgPool, session_id: Uuid) -> Uuid {
+        let ask_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, assistant_action_type, \
+                                               metadata, sent_at) \
+             VALUES ($1, 'assistant', '我想先分开一阵子', 'proactive', \
+                     '{\"proactive\":\"life_choice\"}', now() - interval '2 seconds') RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.life_choices \
+               (session_id, kind, status, tier_gap, asked_at, resolved_at, message_id) \
+             VALUES ($1, 'ask_for_space', 'declined', 3, now() - interval '2 seconds', \
+                     now() - interval '1 second', $2)",
+        )
+        .bind(session_id)
+        .bind(ask_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, assistant_action_type, \
+                                               metadata, sent_at) \
+             VALUES ($1, 'assistant', '你不同意，我很难过', 'proactive', \
+                     '{\"proactive\":\"life_choice\"}', now() - interval '1 second')",
+        )
+        .bind(session_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        ask_id
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_history_carries_the_receipt_even_on_a_one_row_page(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let ask_id = seed_declined_ask(&pool, session_id).await;
+
+        let mut app = build_router(test_state(pool));
+        let token = mint_test_jwt(user_id);
+        let (status, body) = send_request(
+            &mut app,
+            bff_history_request(&token, session_id, &format!("?limit=1&around={ask_id}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "got body: {body}");
+        let messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 1, "{body}");
+        assert_eq!(messages[0]["id"], json!(ask_id.to_string()));
+        assert_eq!(messages[0]["life_choice"]["status"], json!("declined"));
+        assert_eq!(messages[0]["life_choice"]["kind"], json!("ask_for_space"));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_start_carries_the_receipt(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        seed_declined_ask(&pool, session_id).await;
+
+        let mut app = build_router(test_state(pool));
+        let token = mint_test_jwt(user_id);
+        let (status, body) = send_request(
+            &mut app,
+            bff_start_request(&token, json!({ "genome_id": genome_id })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["session_id"], json!(session_id.to_string()));
+        let history = body["history"].as_array().expect("history array");
+        let ask = history
+            .iter()
+            .find(|m| m["content"] == "我想先分开一阵子")
+            .unwrap_or_else(|| panic!("{body}"));
+        assert_eq!(ask["life_choice"]["status"], json!("declined"));
+        let reply = history
+            .iter()
+            .find(|m| m["content"] == "你不同意，我很难过")
+            .unwrap();
+        assert!(reply.get("life_choice").is_none(), "her reply carries none");
     }
 
     #[test]
