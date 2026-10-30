@@ -158,6 +158,52 @@ pub fn next_change(rated: Needs, hours: f64, habits: Habits) -> Option<f64> {
     .min_by(f64::total_cmp)
 }
 
+/// What an accepted give of `item` does to (hunger, social, indulgence), in
+/// levels (spec 2026-10-30 §2.1): food fills her; tobacco, drink and weed
+/// loosen her up; medicine and coffee do the opposite. `None` for an item
+/// that moves nothing.
+fn give_move(item: GivenItem) -> Option<(i8, i8, i8)> {
+    use GivenItem::*;
+    Some(match item {
+        Food => (-1, 0, 0),
+        Cigarette | Alcohol | Herb => (-1, 1, 1),
+        Medicine | Coffee => (-1, -1, -1),
+        _ => return None,
+    })
+}
+
+/// `base` moved `by` levels, stopping at the ends; `rest` when the item does
+/// not move this need at all.
+fn step(base: NeedLevel, rest: NeedLevel, by: i8) -> NeedLevel {
+    if by == 0 {
+        rest
+    } else {
+        NeedLevel::from_rank(base.rank() + by)
+    }
+}
+
+/// The levels to store after an accepted give of `item` (spec 2026-10-30
+/// §2.2): the needs the item moves are `baseline` (the levels the judge was
+/// shown) moved one level, whatever the judge rated them; the rest are
+/// `judged`, else `baseline`. `None` when there is nothing to write: no
+/// baseline and no rating, or an item that moves nothing and no rating.
+pub fn after_give(
+    baseline: Option<Needs>,
+    judged: Option<Needs>,
+    item: GivenItem,
+) -> Option<Needs> {
+    let (Some(base), Some((h, s, i))) = (baseline, give_move(item)) else {
+        return judged;
+    };
+    let rest = judged.unwrap_or(base);
+    Some(Needs {
+        hunger: step(base.hunger, rest.hunger, h),
+        social: step(base.social, rest.social, s),
+        indulgence: step(base.indulgence, rest.indulgence, i),
+        ..rest
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,6 +479,103 @@ mod tests {
             "hunger": "high", "social": "low", "stamina": "mid", "outing": "low", "indulgence": "low"
         }))
         .is_err());
+    }
+
+    /// (item, expected hunger / social / indulgence after the move), the judge
+    /// abstaining.
+    #[test]
+    fn each_item_moves_its_needs_one_level_from_the_baseline() {
+        use GivenItem::*;
+        let base = all(Mid);
+        let cases = [
+            (Food, (Low, Mid, Mid)),
+            (Cigarette, (Low, High, High)),
+            (Alcohol, (Low, High, High)),
+            (Herb, (Low, High, High)),
+            (Medicine, (Low, Low, Low)),
+            (Coffee, (Low, Low, Low)),
+        ];
+        for (item, (h, s, i)) in cases {
+            let got = after_give(Some(base), None, item).unwrap();
+            assert_eq!(
+                (got.hunger, got.social, got.indulgence),
+                (h, s, i),
+                "{item:?}"
+            );
+            assert_eq!(
+                (got.stamina, got.emotional, got.outing),
+                (Mid, Mid, Mid),
+                "{item:?} leaves the rest"
+            );
+        }
+    }
+
+    #[test]
+    fn moves_clamp_at_the_ends() {
+        let floor = Needs {
+            hunger: Low,
+            social: Low,
+            indulgence: Low,
+            ..all(Mid)
+        };
+        let got = after_give(Some(floor), None, GivenItem::Medicine).unwrap();
+        assert_eq!((got.hunger, got.social, got.indulgence), (Low, Low, Low));
+        let ceiling = Needs {
+            social: High,
+            indulgence: High,
+            ..all(Mid)
+        };
+        let got = after_give(Some(ceiling), None, GivenItem::Alcohol).unwrap();
+        assert_eq!((got.social, got.indulgence), (High, High));
+    }
+
+    #[test]
+    fn the_judge_is_overridden_on_moved_needs_and_kept_on_the_rest() {
+        // The judge saw the meal and already lowered hunger high → mid.
+        let baseline = Needs {
+            hunger: High,
+            ..all(Mid)
+        };
+        let judged = Needs {
+            hunger: Mid,
+            social: High,
+            stamina: High,
+            emotional: Low,
+            outing: High,
+            indulgence: High,
+        };
+        let got = after_give(Some(baseline), Some(judged), GivenItem::Food).unwrap();
+        assert_eq!(
+            got.hunger, Mid,
+            "baseline high −1; the judge's mid −1 would count the meal twice"
+        );
+        assert_eq!(got.social, High, "the judge's");
+        assert_eq!(got.indulgence, High, "the judge's");
+        assert_eq!((got.stamina, got.emotional, got.outing), (High, Low, High));
+    }
+
+    #[test]
+    fn a_valuable_passes_the_judge_through() {
+        let judged = all(High);
+        assert_eq!(
+            after_give(Some(all(Mid)), Some(judged), GivenItem::Watch),
+            Some(judged)
+        );
+        assert_eq!(
+            after_give(Some(all(Mid)), None, GivenItem::Watch),
+            None,
+            "nothing to write"
+        );
+    }
+
+    #[test]
+    fn without_a_baseline_the_judge_is_written_unshifted_or_nothing() {
+        let judged = all(High);
+        assert_eq!(
+            after_give(None, Some(judged), GivenItem::Food),
+            Some(judged)
+        );
+        assert_eq!(after_give(None, None, GivenItem::Food), None);
     }
 
     #[test]

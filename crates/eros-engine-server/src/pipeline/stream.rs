@@ -5024,18 +5024,6 @@ pub(crate) fn run_stream_with(
                         }
                         finished.expect("the judge call always finishes")
                     };
-                    // The judge's rating describes the persona, not the reply,
-                    // so it is stored whatever the turn's outcome (spec §5.1).
-                    if let Some(n) = run
-                        .verdict
-                        .as_ref()
-                        .and_then(|v| v.needs)
-                        .map(|r| r.resolve(prior_needs.as_ref()))
-                    {
-                        if let Err(e) = chat_repo.set_needs(user_msg.user_message_id, &n).await {
-                            tracing::warn!("stream: needs write failed: {e}");
-                        }
-                    }
                     let plan = match (&run.status, &run.verdict) {
                         (PdeStatus::Ok, Some(v)) => {
                             let action = guard_action(
@@ -5077,20 +5065,12 @@ pub(crate) fn run_stream_with(
                 }
                 None => (pde::decide(&input), None), // feature off
             };
-        // The needs this turn's reply is written with (spec §6.1).
-        let turn_needs = pde_run
+        // The judge's rating, resolved against what it was shown.
+        let judged_needs = pde_run
             .as_ref()
             .and_then(|r| r.verdict.as_ref())
             .and_then(|v| v.needs)
-            .map(|r| r.resolve(prior_needs.as_ref()))
-            .or(prior_needs);
-        let needs_text = turn_needs.as_ref().and_then(|n| {
-            crate::prompt::needs_line(
-                n,
-                crate::prompt::persona_habits(&input.persona),
-                rand::thread_rng().gen(),
-            )
-        });
+            .map(|r| r.resolve(prior_needs.as_ref()));
 
         // Ghosting kill-switch (§4.1) — path-wide final gate (LLM / fallback /
         // pure-rule / tip). Uses the in-scope sanitized hints, not plan.context_hints.
@@ -5121,6 +5101,40 @@ pub(crate) fn run_stream_with(
             );
         }
         apply_give_refusal(&mut plan, give_refused);
+
+        // The needs stored on this row (spec 2026-10-13 §5.1, 2026-10-30
+        // §2.2): the judge's rating, or, once a give is accepted for good,
+        // the baseline moved by what she took. The rating describes the
+        // persona, not the reply, so it is written whatever the turn's
+        // outcome, before any frame.
+        let accepted_give = match (&input.event, plan.action_response) {
+            (
+                eros_engine_core::types::Event::UserMessage {
+                    action: Some(eros_engine_core::types::UserAction::Give { item, .. }),
+                    ..
+                },
+                Some(eros_engine_core::types::ActionResponse::Accept),
+            ) => Some(*item),
+            _ => None,
+        };
+        let written_needs = match accepted_give {
+            Some(item) => eros_engine_core::needs::after_give(prior_needs, judged_needs, item),
+            None => judged_needs,
+        };
+        if let Some(n) = &written_needs {
+            if let Err(e) = chat_repo.set_needs(user_msg.user_message_id, n).await {
+                tracing::warn!("stream: needs write failed: {e}");
+            }
+        }
+        // The needs this turn's reply is written with (spec §6.1).
+        let turn_needs = written_needs.or(prior_needs);
+        let needs_text = turn_needs.as_ref().and_then(|n| {
+            crate::prompt::needs_line(
+                n,
+                crate::prompt::persona_habits(&input.persona),
+                rand::thread_rng().gen(),
+            )
+        });
 
         // Dice roll at plan finalisation (spec 2026-09-13 §3.2): a definite
         // judge mode owns [this_turn], so the dice stay in the cup; a bare
@@ -22176,6 +22190,132 @@ data: [DONE]\n\n"
                 assert_eq!(stored.as_deref(), Some(want.as_str()), "{art} told={told}");
             }
         }
+    }
+
+    /// A baseline rating for the give→needs tests: every need `mid`.
+    fn rated_mid() -> serde_json::Value {
+        serde_json::json!({"needs": {"hunger": "mid", "social": "mid", "stamina": "mid",
+            "emotional": "mid", "outing": "mid", "indulgence": "mid"}})
+    }
+
+    fn give_of(item: eros_engine_core::types::GivenItem) -> eros_engine_core::types::UserAction {
+        eros_engine_core::types::UserAction::Give {
+            item,
+            name: None,
+            quantity: 1,
+        }
+    }
+
+    async fn stored_levels(pool: &PgPool, umid: Uuid) -> Option<eros_engine_core::needs::Needs> {
+        stored_needs(pool, umid)
+            .await
+            .map(|v| serde_json::from_value(v).unwrap())
+    }
+
+    /// The baseline says hunger high; the judge saw the meal and already says
+    /// mid. The stored row and the frame say mid, baseline −1, not the
+    /// judge's mid −1 (spec 2026-10-30 §2.2: the meal counts once). The other
+    /// needs are the judge's.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_accepted_food_give_moves_hunger_from_the_baseline(pool: PgPool) {
+        use eros_engine_core::needs::NeedLevel::{High, Mid};
+        let mut hungry = rated_mid();
+        hungry["needs"]["hunger"] = serde_json::json!("high");
+        let (frames, _, umid) = run_action_turn_in(
+            &pool,
+            give_of(eros_engine_core::types::GivenItem::Food),
+            None,
+            &[hungry],
+            &[],
+            None,
+            serde_json::json!({"action": "reply_text", "inner_state": "", "action_response": "accept",
+                "needs": {"hunger": "mid", "social": "high", "stamina": "mid", "emotional": "mid",
+                          "outing": "mid", "indulgence": "mid"}}),
+            200,
+        )
+        .await;
+        let stored = stored_levels(&pool, umid).await.expect("written");
+        assert_eq!(
+            (stored.hunger, stored.social, stored.stamina),
+            (Mid, High, Mid)
+        );
+        let framed = body_state_needs(&frames);
+        assert_eq!(
+            framed.last().copied().flatten().map(|n| n.hunger),
+            Some(Mid),
+            "{frames:?}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_accepted_cigarette_raises_social_and_indulgence(pool: PgPool) {
+        use eros_engine_core::needs::NeedLevel::{High, Low, Mid};
+        let (_, _, umid) = run_action_turn_in(
+            &pool,
+            give_of(eros_engine_core::types::GivenItem::Cigarette),
+            None,
+            &[rated_mid()],
+            &[],
+            Some(serde_json::json!({"smoking": true})),
+            serde_json::json!({"action": "reply_text", "inner_state": "", "action_response": "accept",
+                "needs": null}),
+            200,
+        )
+        .await;
+        let stored = stored_levels(&pool, umid)
+            .await
+            .expect("written from the baseline");
+        assert_eq!(
+            (
+                stored.hunger,
+                stored.social,
+                stored.indulgence,
+                stored.stamina
+            ),
+            (Low, High, High, Mid)
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_refused_give_moves_no_need(pool: PgPool) {
+        use eros_engine_core::needs::NeedLevel::{High, Mid};
+        let (_, _, umid) = run_action_turn_in(
+            &pool,
+            give_of(eros_engine_core::types::GivenItem::Food),
+            None,
+            &[rated_mid()],
+            &[],
+            None,
+            serde_json::json!({"action": "reply_text", "inner_state": "", "action_response": "refuse",
+                "needs": {"hunger": "high", "social": "mid", "stamina": "mid", "emotional": "mid",
+                          "outing": "mid", "indulgence": "mid"}}),
+            200,
+        )
+        .await;
+        let stored = stored_levels(&pool, umid)
+            .await
+            .expect("the judge's rating");
+        assert_eq!(
+            (stored.hunger, stored.social, stored.indulgence),
+            (High, Mid, Mid)
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_give_with_an_abstaining_judge_and_no_baseline_writes_nothing(pool: PgPool) {
+        let (_, _, umid) = run_action_turn_in(
+            &pool,
+            give_of(eros_engine_core::types::GivenItem::Food),
+            None,
+            &[],
+            &[],
+            None,
+            serde_json::json!({"action": "reply_text", "inner_state": "", "action_response": "accept",
+                "needs": null}),
+            200,
+        )
+        .await;
+        assert_eq!(stored_levels(&pool, umid).await, None);
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
