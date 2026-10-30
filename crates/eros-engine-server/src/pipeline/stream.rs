@@ -22212,17 +22212,20 @@ data: [DONE]\n\n"
             .map(|v| serde_json::from_value(v).unwrap())
     }
 
-    /// The judge says hunger is still mid; the stored row and the frame say
-    /// low, from the baseline, and the other needs are the judge's (spec
-    /// 2026-10-30 §2.2).
+    /// The baseline says hunger high; the judge saw the meal and already says
+    /// mid. The stored row and the frame say mid, baseline −1, not the
+    /// judge's mid −1 (spec 2026-10-30 §2.2: the meal counts once). The other
+    /// needs are the judge's.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn an_accepted_food_give_moves_hunger_from_the_baseline(pool: PgPool) {
-        use eros_engine_core::needs::NeedLevel::{High, Low, Mid};
+        use eros_engine_core::needs::NeedLevel::{High, Mid};
+        let mut hungry = rated_mid();
+        hungry["needs"]["hunger"] = serde_json::json!("high");
         let (frames, _, umid) = run_action_turn_in(
             &pool,
             give_of(eros_engine_core::types::GivenItem::Food),
             None,
-            &[rated_mid()],
+            &[hungry],
             &[],
             None,
             serde_json::json!({"action": "reply_text", "inner_state": "", "action_response": "accept",
@@ -22234,12 +22237,12 @@ data: [DONE]\n\n"
         let stored = stored_levels(&pool, umid).await.expect("written");
         assert_eq!(
             (stored.hunger, stored.social, stored.stamina),
-            (Low, High, Mid)
+            (Mid, High, Mid)
         );
         let framed = body_state_needs(&frames);
         assert_eq!(
             framed.last().copied().flatten().map(|n| n.hunger),
-            Some(Low),
+            Some(Mid),
             "{frames:?}"
         );
     }

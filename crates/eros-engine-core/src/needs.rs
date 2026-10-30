@@ -531,18 +531,23 @@ mod tests {
 
     #[test]
     fn the_judge_is_overridden_on_moved_needs_and_kept_on_the_rest() {
+        // The judge saw the meal and already lowered hunger high → mid.
+        let baseline = Needs {
+            hunger: High,
+            ..all(Mid)
+        };
         let judged = Needs {
-            hunger: Low,
+            hunger: Mid,
             social: High,
             stamina: High,
             emotional: Low,
             outing: High,
             indulgence: High,
         };
-        let got = after_give(Some(all(Mid)), Some(judged), GivenItem::Food).unwrap();
+        let got = after_give(Some(baseline), Some(judged), GivenItem::Food).unwrap();
         assert_eq!(
-            got.hunger, Low,
-            "baseline mid −1, not the judge's low again"
+            got.hunger, Mid,
+            "baseline high −1; the judge's mid −1 would count the meal twice"
         );
         assert_eq!(got.social, High, "the judge's");
         assert_eq!(got.indulgence, High, "the judge's");
