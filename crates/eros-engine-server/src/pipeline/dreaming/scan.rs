@@ -280,7 +280,8 @@ pub(crate) async fn scan_segment(
     }
 
     // Profile memories have no claim guard of their own, so the claim is
-    // checked (and its clock restarted) before anything is written.
+    // checked (and its clock restarted) before anything is written, and the
+    // episode, which is guarded, goes in ahead of them.
     match scan.refresh_claim(instance_id).await {
         Ok(true) => {}
         Ok(false) => return discard(pool, event, seg.mode, "claim gone before the writes").await,
@@ -290,17 +291,6 @@ pub(crate) async fn scan_segment(
             record_scan_event(pool, event).await;
             return ScanOutcome::Failed;
         }
-    }
-    if let Some(owner) = owner {
-        event.memories_written = write_memories(
-            pool,
-            instance_id,
-            last.session_id,
-            owner,
-            &memories,
-            vectors,
-        )
-        .await;
     }
     if let Some(summary) = out.episode {
         let episode = EpisodeInsert {
@@ -322,6 +312,19 @@ pub(crate) async fn scan_segment(
                 return fail_scan(&scan, st, seg, last.sent_at, covered, event).await;
             }
         }
+    }
+    // After the episode, whose claim guard is the first to hold: a lost claim
+    // or a failed insert leaves no memory behind to be written twice on retry.
+    if let Some(owner) = owner {
+        event.memories_written = write_memories(
+            pool,
+            instance_id,
+            last.session_id,
+            owner,
+            &memories,
+            vectors,
+        )
+        .await;
     }
     let journal = JournalRepo { pool };
     for row in &journal_rows {
@@ -1373,14 +1376,13 @@ pub(crate) mod tests {
             scan_instance(&state, rel.instance, at(T4)).await,
             ScanOutcome::Failed
         );
-        assert_failed_not_settled(&pool, &rel).await;
-        let evs = events(&pool, rel.instance).await;
-        assert_eq!(evs.len(), 1);
         assert_eq!(
-            (evs[0].1.as_str(), evs[0].6, evs[0].7),
-            ("failed", false, 0),
-            "failed, no episode, and the journal write never started"
+            memory_rows(&pool, &rel).await,
+            0,
+            "the episode goes first: a failed insert leaves no memory to repeat on retry"
         );
+        assert_failed_not_settled(&pool, &rel).await;
+        assert_eq!(events(&pool, rel.instance).await, vec![failed_event(0)]);
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
