@@ -17,6 +17,7 @@ use eros_engine_core::scope::{AffinityScope, InsightMode, MemoryScope, RecallGat
 use eros_engine_llm::model_config::ResolvedVoice;
 use eros_engine_llm::openrouter::{ChatMessage as WireMessage, ChatRequest, UsageBlock};
 use eros_engine_store::affinity::AffinityRepo;
+use eros_engine_store::arc::ArcRepo;
 use eros_engine_store::chat::{ChatMessageSlim, ChatRepo};
 use eros_engine_store::human_insight::HumanInsightRepo;
 use eros_engine_store::persona::PersonaRepo;
@@ -172,6 +173,12 @@ pub struct VoiceBootstrap {
     /// the deployment runs no LLM judge.
     #[serde(default)]
     pub needs: Option<eros_engine_core::needs::Needs>,
+    /// The relationship's opening and arc at the call's first turn (spec
+    /// 2026-10-28-memory-2-dreaming-plus-design.md §6.3), `\n`-joined. `None`
+    /// with no arc yet or with the relationship layer off. Constant text, so
+    /// it is stored rendered like the parts above.
+    #[serde(default)]
+    pub story: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -198,8 +205,8 @@ fn plan_bootstrap(session_metadata: &serde_json::Value) -> BootstrapPlan {
     }
 }
 
-/// Render the bootstrap block: `[关于他]` bullets, the `[上次通话]`
-/// transcript, then the `[身体状态]` lines (effects, then needs). Each
+/// Render the bootstrap block: `[关于他]` bullets, the `[你们的故事]` arc, the
+/// `[上次通话]` transcript, then the `[身体状态]` lines (effects, then needs). Each
 /// sub-block is omitted when its part is empty; `None` when all are — the
 /// caller then emits no block at all (no stray blank lines). `habits` word a
 /// craving, picked by the snapshot's `created_at` so the block stays
@@ -216,6 +223,7 @@ fn render_bootstrap(
         .map(|s| s.trim())
         .filter(|s| !s.is_empty() && insight_bullet_allowed(s, gate))
         .collect();
+    let story = b.story.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let prev = b
         .prev_call
         .as_deref()
@@ -230,7 +238,7 @@ fn render_bootstrap(
                 .map(|l| format!("此刻的需要：{l}")),
         )
         .collect();
-    if bullets.is_empty() && prev.is_none() && body.is_empty() {
+    if bullets.is_empty() && story.is_none() && prev.is_none() && body.is_empty() {
         return None;
     }
     let mut s = String::new();
@@ -240,6 +248,13 @@ fn render_bootstrap(
             s.push_str("\n- ");
             s.push_str(b);
         }
+    }
+    if let Some(t) = story {
+        if !s.is_empty() {
+            s.push_str("\n\n");
+        }
+        s.push_str("[你们的故事]\n");
+        s.push_str(t);
     }
     if let Some(t) = prev {
         if !s.is_empty() {
@@ -360,7 +375,34 @@ async fn load_bootstrap_needs(
     crate::pipeline::handlers::load_needs(pool, instance_id, None, Utc::now(), habits).await
 }
 
-/// Assemble a first-turn snapshot. The four parts degrade independently; the
+/// `opening` and `arc` joined by `\n`, blank parts omitted; `None` when both
+/// are blank.
+fn story_from_arc(opening: &str, arc: &str) -> Option<String> {
+    let parts: Vec<&str> = [opening, arc]
+        .into_iter()
+        .filter(|s| !s.trim().is_empty())
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("\n"))
+}
+
+/// The relationship's story for the snapshot: its arc row, if any. With the
+/// relationship layer off (`memory_scope`'s Y flag) nothing is read — an empty
+/// part, still a success. No arc yet is an empty part too.
+async fn load_bootstrap_story(
+    pool: &PgPool,
+    instance_id: Uuid,
+    relationship_on: bool,
+) -> Result<Option<String>, sqlx::Error> {
+    if !relationship_on {
+        return Ok(None);
+    }
+    Ok((ArcRepo { pool })
+        .load(instance_id)
+        .await?
+        .and_then(|row| story_from_arc(&row.opening, &row.arc)))
+}
+
+/// Assemble a first-turn snapshot. The five parts degrade independently; the
 /// returned flag is `true` only when every part succeeded — a partial snapshot is
 /// injected in memory for this turn but must not be frozen, so the next turn
 /// retries.
@@ -371,12 +413,14 @@ async fn assemble_bootstrap(
     session_id: Uuid,
     insight_mode: InsightMode,
     needs_enabled: bool,
+    relationship_on: bool,
 ) -> (VoiceBootstrap, bool) {
-    let (insights_res, prev_res, effects_res, needs_res) = tokio::join!(
+    let (insights_res, prev_res, effects_res, needs_res, story_res) = tokio::join!(
         load_bootstrap_insights(pool, user_id, insight_mode),
         load_bootstrap_prev_call(pool, user_id, instance_id, session_id),
         load_bootstrap_effects(pool, user_id, instance_id),
         load_bootstrap_needs(pool, instance_id, needs_enabled),
+        load_bootstrap_story(pool, instance_id, relationship_on),
     );
     let mut complete = true;
     let insights = match insights_res {
@@ -411,6 +455,14 @@ async fn assemble_bootstrap(
             None
         }
     };
+    let story = match story_res {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "voice: bootstrap story read failed");
+            complete = false;
+            None
+        }
+    };
     (
         VoiceBootstrap {
             insights,
@@ -418,6 +470,7 @@ async fn assemble_bootstrap(
             prev_session_id,
             effects,
             needs,
+            story,
             created_at: Utc::now(),
         },
         complete,
@@ -575,9 +628,10 @@ pub fn run_voice_turn(
             );
         }
         let assemble_bootstrap_now = matches!(plan, BootstrapPlan::Assemble);
-        // The FIRST turn's scope decides the snapshot's insight tier; later
-        // turns can't change it (the snapshot is frozen). `x_on`/`y_on` are
-        // per-turn and drive the recall gate below.
+        // The FIRST turn's scope decides the snapshot's insight tier and
+        // whether it carries the relationship's story (`y_on`); later turns
+        // can't change either (the snapshot is frozen). `x_on`/`y_on` are
+        // also per-turn and drive the recall gate below.
         let (insight_mode, x_on, y_on) = turn.memory_scope.resolve();
 
         // Recall gate — settled BEFORE any embedding work, in this order:
@@ -624,6 +678,7 @@ pub fn run_voice_turn(
                         turn.session_id,
                         insight_mode,
                         state.model_config.pde_enabled(),
+                        y_on,
                     ).await)
                 } else {
                     None
@@ -1148,6 +1203,7 @@ mod tests {
             prev_session_id: None,
             effects: Vec::new(),
             needs: None,
+            story: None,
             created_at: Utc::now(),
         }
     }
@@ -1230,6 +1286,106 @@ mod tests {
              [关于他]\n- 城市：上海\n- 职业：设计师\n\n\
              [上次通话]\n用户：你好\n她：嗨呀"
         );
+    }
+
+    const STORY: &str = "我们在一个夏夜的聊天里认识。\n后来他搬来了上海，常常深夜还在聊。";
+
+    #[test]
+    fn bootstrap_renders_story_section_when_arc_exists() {
+        let mut s = snapshot(&["城市：上海"], Some("用户：你好"));
+        s.story = Some(STORY.into());
+        s.effects = vec![cigarette()];
+        assert_eq!(
+            render_bootstrap(&s, OPEN_GATE, Habits::default()).as_deref(),
+            Some(
+                "[关于他]\n- 城市：上海\n\n\
+                 [你们的故事]\n我们在一个夏夜的聊天里认识。\n后来他搬来了上海，常常深夜还在聊。\n\n\
+                 [上次通话]\n用户：你好\n\n\
+                 [身体状态]\n1 支烟，烟劲很足，正在劲头上"
+            )
+        );
+
+        let mut alone = snapshot(&[], None);
+        alone.story = Some(STORY.into());
+        assert_eq!(
+            render_bootstrap(&alone, OPEN_GATE, Habits::default()).as_deref(),
+            Some("[你们的故事]\n我们在一个夏夜的聊天里认识。\n后来他搬来了上海，常常深夜还在聊。")
+        );
+
+        // The whole prompt: the story sits between the profile and the last call.
+        let mut s = snapshot(&["城市：上海"], Some("用户：你好\n她：嗨呀"));
+        s.story = Some("开场。\n弧线。".into());
+        let p = build_voice_prompt(
+            &genome(),
+            "DIRECTIVE",
+            render_bootstrap(&s, OPEN_GATE, Habits::default()).as_deref(),
+            None,
+            AffinityScope::none(),
+            None,
+        );
+        assert_eq!(
+            p,
+            "You are Mia.\n\nDIRECTIVE\n\n\
+             [关于他]\n- 城市：上海\n\n\
+             [你们的故事]\n开场。\n弧线。\n\n\
+             [上次通话]\n用户：你好\n她：嗨呀"
+        );
+    }
+
+    #[test]
+    fn bootstrap_without_arc_is_byte_identical() {
+        let pinned = "[关于他]\n- 城市：上海\n- 职业：设计师\n\n[上次通话]\n用户：你好\n她：嗨呀";
+        let base = snapshot(
+            &["城市：上海", "职业：设计师"],
+            Some("用户：你好\n她：嗨呀"),
+        );
+        assert_eq!(base.story, None);
+        assert_eq!(
+            render_bootstrap(&base, OPEN_GATE, Habits::default()).as_deref(),
+            Some(pinned)
+        );
+        for blank in ["", "  \n "] {
+            let mut s = base.clone();
+            s.story = Some(blank.into());
+            assert_eq!(
+                render_bootstrap(&s, OPEN_GATE, Habits::default()).as_deref(),
+                Some(pinned),
+                "a blank story adds nothing: {blank:?}"
+            );
+        }
+        // A blank story is not a part: with nothing else there is no block.
+        let mut only = snapshot(&[], None);
+        only.story = Some(" \n".into());
+        assert_eq!(render_bootstrap(&only, OPEN_GATE, Habits::default()), None);
+    }
+
+    #[test]
+    fn frozen_bootstrap_without_story_field_deserializes() {
+        let meta = serde_json::json!({
+            VOICE_BOOTSTRAP_KEY: {
+                "insights": ["职业：设计师"],
+                "prev_call": "用户：你好",
+                "created_at": "2026-10-01T00:00:00Z",
+            }
+        });
+        match plan_bootstrap(&meta) {
+            BootstrapPlan::Frozen(b) => {
+                assert_eq!(b.story, None);
+                assert_eq!(b.insights, vec!["职业：设计师".to_string()]);
+            }
+            other => panic!("a pre-story snapshot stays Frozen, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_story_is_opening_then_arc_without_blank_parts() {
+        assert_eq!(
+            story_from_arc("开场。", "弧线。").as_deref(),
+            Some("开场。\n弧线。")
+        );
+        assert_eq!(story_from_arc("开场。", " ").as_deref(), Some("开场。"));
+        assert_eq!(story_from_arc("", "弧线。").as_deref(), Some("弧线。"));
+        assert_eq!(story_from_arc("", "  \n"), None);
     }
 
     fn cigarette() -> eros_engine_core::effects::ActiveEffect {
@@ -3535,13 +3691,168 @@ data: [DONE]\n\n";
         .await
         .unwrap();
         let voice = seed_session(&pool, user_id, instance_id, "voice").await;
-        let (on, complete) =
-            assemble_bootstrap(&pool, user_id, instance_id, voice, InsightMode::Off, true).await;
+        let (on, complete) = assemble_bootstrap(
+            &pool,
+            user_id,
+            instance_id,
+            voice,
+            InsightMode::Off,
+            true,
+            true,
+        )
+        .await;
         assert!(complete);
         assert_eq!(on.needs, Some(hungry()));
-        let (off, _) =
-            assemble_bootstrap(&pool, user_id, instance_id, voice, InsightMode::Off, false).await;
+        let (off, _) = assemble_bootstrap(
+            &pool,
+            user_id,
+            instance_id,
+            voice,
+            InsightMode::Off,
+            false,
+            true,
+        )
+        .await;
         assert_eq!(off.needs, None);
+    }
+
+    async fn seed_arc(pool: &sqlx::PgPool, instance_id: Uuid, opening: &str, arc: &str) {
+        sqlx::query(
+            "INSERT INTO engine.relationship_arcs (instance_id, opening, arc, folded_through) \
+             VALUES ($1, $2, $3, now())",
+        )
+        .bind(instance_id)
+        .bind(opening)
+        .bind(arc)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_bootstrap_carries_the_arc_only_with_the_relationship_layer(pool: sqlx::PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+        let voice = seed_session(&pool, user_id, instance_id, "voice").await;
+
+        let (none_yet, complete) = assemble_bootstrap(
+            &pool,
+            user_id,
+            instance_id,
+            voice,
+            InsightMode::Off,
+            true,
+            false,
+        )
+        .await;
+        assert!(complete);
+        assert_eq!(none_yet.story, None, "no arc row ⇒ no story");
+        let (none_yet, _) = assemble_bootstrap(
+            &pool,
+            user_id,
+            instance_id,
+            voice,
+            InsightMode::Off,
+            true,
+            true,
+        )
+        .await;
+        assert_eq!(none_yet.story, None, "no arc row ⇒ no story");
+
+        seed_arc(&pool, instance_id, "开场。", "弧线。").await;
+        let (on, complete) = assemble_bootstrap(
+            &pool,
+            user_id,
+            instance_id,
+            voice,
+            InsightMode::Off,
+            true,
+            true,
+        )
+        .await;
+        assert!(complete);
+        assert_eq!(on.story.as_deref(), Some("开场。\n弧线。"));
+        let (off, complete) = assemble_bootstrap(
+            &pool,
+            user_id,
+            instance_id,
+            voice,
+            InsightMode::Off,
+            true,
+            false,
+        )
+        .await;
+        assert!(complete, "a skipped layer is still a success");
+        assert_eq!(off.story, None, "relationship layer off ⇒ no story");
+    }
+
+    /// The story freezes into the session marker on the first turn and reaches
+    /// the prompt; a call whose first turn runs with the relationship layer off
+    /// carries none.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_voice_turn_freezes_the_story_with_the_first_turn(pool: sqlx::PgPool) {
+        let mock = bootstrap_mock().await;
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+        seed_arc(&pool, instance_id, "开场。", "弧线。").await;
+
+        let with = seed_session(&pool, user_id, instance_id, "voice").await;
+        let frames = run_bootstrap_turn(
+            &pool,
+            &mock,
+            with,
+            instance_id,
+            user_id,
+            "01J9STORY000000000000001",
+            MemoryScope::default(),
+        )
+        .await;
+        assert_no_error_frame(&frames);
+        let marker = read_marker(&pool, with).await.expect("marker written");
+        assert_eq!(marker["story"], serde_json::json!("开场。\n弧线。"));
+        let sys = system_prompt_of(&last_request_body(&mock).await);
+        assert!(sys.contains("[你们的故事]\n开场。\n弧线。"), "{sys}");
+
+        // The arc moves on; the next turn of the same call still sends the
+        // frozen text.
+        sqlx::query(
+            "UPDATE engine.relationship_arcs SET arc = '新的弧线。' WHERE instance_id = $1",
+        )
+        .bind(instance_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let frames = run_bootstrap_turn(
+            &pool,
+            &mock,
+            with,
+            instance_id,
+            user_id,
+            "01J9STORY000000000000002",
+            MemoryScope::default(),
+        )
+        .await;
+        assert_no_error_frame(&frames);
+        let sys = system_prompt_of(&last_request_body(&mock).await);
+        assert!(sys.contains("[你们的故事]\n开场。\n弧线。"), "{sys}");
+        assert!(!sys.contains("新的弧线"), "{sys}");
+
+        let without = seed_session(&pool, user_id, instance_id, "voice").await;
+        let frames = run_bootstrap_turn(
+            &pool,
+            &mock,
+            without,
+            instance_id,
+            user_id,
+            "01J9STORY000000000000003",
+            MemoryScope::NeutralOnly,
+        )
+        .await;
+        assert_no_error_frame(&frames);
+        let marker = read_marker(&pool, without).await.expect("marker written");
+        assert_eq!(marker["story"], serde_json::Value::Null);
+        let sys = system_prompt_of(&last_request_body(&mock).await);
+        assert!(!sys.contains("[你们的故事]"), "{sys}");
     }
 
     /// First turn freezes the snapshot into `metadata.voice_bootstrap` and

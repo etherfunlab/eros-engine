@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+mod anniversary;
 mod auth;
+mod backfill;
 mod birthday;
 mod byoc;
 mod byok;
@@ -13,6 +15,7 @@ mod pipeline;
 mod prompt;
 mod prompt_log;
 mod reaction;
+mod relationship_context;
 mod repetition;
 mod routes;
 mod state;
@@ -55,6 +58,9 @@ async fn main() -> Result<()> {
     //   eros-engine print-openapi         dump the OpenAPI spec to stdout and
     //                                     exit (no DB, no env). Used by the
     //                                     CI drift check.
+    //   eros-engine backfill-dreaming     scan the relationship history that
+    //                                     predates live scanning (paid calls;
+    //                                     --dry-run counts them first)
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("migrate") => run_migrations().await,
@@ -65,10 +71,21 @@ async fn main() -> Result<()> {
             run_seed_personas(&dir).await
         }
         Some("print-openapi") => run_print_openapi(),
+        Some("backfill-dreaming") => match backfill::BackfillArgs::parse(args) {
+            Ok(args) => backfill::run_backfill(args).await,
+            Err(msg) => {
+                eprintln!("{msg}");
+                eprintln!("{}", backfill::USAGE);
+                std::process::exit(2);
+            }
+        },
         Some("serve") | None => run_server().await,
         Some(other) => {
             eprintln!("unknown subcommand: {other}");
-            eprintln!("usage: eros-engine [serve|migrate|seed-personas <dir>|print-openapi]");
+            eprintln!(
+                "usage: eros-engine [serve|migrate|seed-personas <dir>|print-openapi|\
+                 backfill-dreaming [--dry-run] [--min-rows N] [--limit N] [--instance UUID]]"
+            );
             std::process::exit(2);
         }
     }
@@ -180,59 +197,80 @@ async fn run_server() -> Result<()> {
             "prompt logging ENABLED — writing raw assembled chat prompts to disk (operator-only)");
     }
 
+    let state = build_state(&cfg, true).await?;
+
+    // Compose the OpenAPI-aware router. routes::router applies the auth
+    // middleware to /comp/* internally; healthz stays public. We seed
+    // the spec with `ApiDoc::openapi()` so the title/servers/tags from
+    // `openapi.rs` show up at /docs alongside the per-route paths.
+    let (open_router, api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
+        .merge(routes::router(state.clone()))
+        .split_for_parts();
+
+    // Spawn the dreaming sweeper alongside the HTTP service. Returns
+    // immediately when DREAMING_DISABLED=1 (or tick=0) is set or
+    // [tasks.dreaming_scan] is absent, so unit tests and self-hosters who want
+    // only synchronous behaviour can opt out.
+    // Cloned because the next line moves `state` into the router.
+    tokio::spawn(crate::pipeline::dreaming::sweeper(state.clone()));
+
+    // human_insights_snapshot sweeper. Returns immediately when
+    // SNAPSHOT_DISABLED=1 or the cron expression fails to parse, so the
+    // chat path is unaffected by snapshot misconfig.
+    tokio::spawn(crate::pipeline::snapshot::sweeper(state.clone()));
+
+    // World Memories director sweeper. Inert when WORLD_DISABLED=1/true or
+    // [tasks.world_director] is absent/blank (spec §2.1).
+    tokio::spawn(crate::pipeline::world::sweeper(state.clone()));
+
+    // World Town sweeper (posts feed). Inert when the world subsystem is off,
+    // WORLD_TOWN_DISABLED is set, or [tasks.world_director] is absent — no
+    // posts can exist without the director (town spec §3).
+    tokio::spawn(crate::pipeline::world_town::sweeper(state.clone()));
+
+    // Chat-queue worker: drives async-endpoint turns (spec
+    // 2026-08-20-async-chat-endpoint-design). Inert when CHAT_QUEUE_DISABLED.
+    tokio::spawn(crate::pipeline::chat_queue::worker(state.clone()));
+
+    // Profile rebuild sweeper: regenerates the derived profile for users whose
+    // new facts have sat idle. Inert when PROFILE_REBUILD_DISABLED=1 or tick=0.
+    tokio::spawn(crate::pipeline::profile_rebuild::sweeper(state.clone()));
+
+    let app: Router = open_router
+        .with_state(state)
+        .merge(Scalar::with_url("/docs", api))
+        .layer(crate::middleware::SseHeadersLayer)
+        .layer(tower_http::trace::TraceLayer::new_for_http());
+
+    let listener = tokio::net::TcpListener::bind(&cfg.bind_addr).await?;
+    tracing::info!(
+        addr = %cfg.bind_addr,
+        "eros-engine starting"
+    );
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn connect_pool() -> Result<sqlx::PgPool> {
     let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL is required")?;
-    let pool = eros_engine_store::pool::build(&database_url)
+    eros_engine_store::pool::build(&database_url)
         .await
-        .context("failed to connect to DATABASE_URL")?;
+        .context("failed to connect to DATABASE_URL")
+}
 
-    let openrouter_key =
-        std::env::var("OPENROUTER_API_KEY").context("OPENROUTER_API_KEY is required")?;
-
-    // Auth: prefer JWKS (asymmetric, the post-2025 Supabase default) and
-    // fall back to a legacy HS256 shared secret if one is configured. At
-    // least one source must be wired or the server boots with a validator
-    // that rejects every token (fail-closed).
-    //
-    // - SUPABASE_JWKS_URL: explicit override.
-    // - SUPABASE_URL: derive `${SUPABASE_URL}/auth/v1/.well-known/jwks.json`.
-    // - SUPABASE_JWT_SECRET: legacy HS256 shared secret (optional).
-    let jwks_url = std::env::var("SUPABASE_JWKS_URL").ok().or_else(|| {
-        std::env::var("SUPABASE_URL")
-            .ok()
-            .map(|u| format!("{}/auth/v1/.well-known/jwks.json", u.trim_end_matches('/')))
-    });
-    // Resolve+validate the sources before wiring anything: an empty
-    // SUPABASE_JWT_SECRET counts as absent, so `SUPABASE_JWT_SECRET=""` with no
-    // JWKS source fails fast here instead of booting a validator that silently
-    // rejects every request.
-    let legacy_secret = resolve_legacy_secret(
-        jwks_url.is_some(),
-        std::env::var("SUPABASE_JWT_SECRET").ok(),
-    )?;
-
-    let mut validator = SupabaseJwtValidator::new();
-    if let Some(url) = jwks_url.as_deref() {
-        validator = validator
-            .with_jwks_url(url)
-            .await
-            .with_context(|| format!("failed to load Supabase JWKS from {url}"))?;
-    }
-    if let Some(secret) = legacy_secret {
-        validator = validator.with_legacy_secret(secret);
-    }
-    let auth: Arc<dyn AuthValidator> = Arc::new(validator);
-
-    // model_config: env override > examples/model_config.toml dev default.
-    // The committed example is sanitized; the real config is opted into via
-    // MODEL_CONFIG_PATH (single file — the docker/Dockerfile.fly image bakes
-    // it in for prod) or MODEL_CONFIG_DIR (a directory of .toml fragments
-    // merged at boot; duplicate sections are boot errors). Mutually exclusive.
+/// model_config: env override > examples/model_config.toml dev default.
+/// The committed example is sanitized; the real config is opted into via
+/// MODEL_CONFIG_PATH (single file — the docker/Dockerfile.fly image bakes
+/// it in for prod) or MODEL_CONFIG_DIR (a directory of .toml fragments
+/// merged at boot; duplicate sections are boot errors). Mutually exclusive.
+/// Parsed only: `build_state` runs the boot gates.
+fn load_model_config() -> Result<eros_engine_llm::model_config::ModelConfig> {
     let source = eros_engine_llm::model_config::resolve_config_source(
         std::env::var("MODEL_CONFIG_PATH").ok(),
         std::env::var("MODEL_CONFIG_DIR").ok(),
     )
     .context("model_config source resolution failed")?;
-    let model_config = Arc::new(match &source {
+    Ok(match &source {
         eros_engine_llm::model_config::ConfigSource::File(p) => {
             eros_engine_llm::model_config::ModelConfig::from_toml_file(std::path::Path::new(p))
                 .with_context(|| format!("model_config load failed: {p}"))?
@@ -241,14 +279,33 @@ async fn run_server() -> Result<()> {
             eros_engine_llm::model_config::ModelConfig::from_toml_dir(std::path::Path::new(d))
                 .with_context(|| format!("model_config load failed from dir: {d}"))?
         }
-    });
+    })
+}
 
-    // Dead-config gate for the affinity evaluator (#210). Runs before the
-    // variant-shape gate: this check is shape-independent (it only asks
-    // whether the key exists), so a table-shaped filter_prompt under
-    // [tasks.affinity_evaluation] gets the accurate "affinity's prompt is not
-    // configurable" message instead of the generic "only the composer reads
-    // variants" one.
+/// Everything `serve` runs on, built and checked in boot order: the pool, the
+/// JWT validator, the model config through every boot gate, and the clients
+/// built from it. Without `with_auth` the validator has no source and rejects
+/// every token, for subcommands that serve no requests.
+async fn build_state(cfg: &ServerConfig, with_auth: bool) -> Result<AppState> {
+    let pool = connect_pool().await?;
+
+    let openrouter_key =
+        std::env::var("OPENROUTER_API_KEY").context("OPENROUTER_API_KEY is required")?;
+
+    let auth: Arc<dyn AuthValidator> = if with_auth {
+        build_auth().await?
+    } else {
+        Arc::new(SupabaseJwtValidator::new())
+    };
+
+    let model_config = Arc::new(load_model_config()?);
+
+    // Dead-config gate for the engine-owned affinity (#210) and arc-rewrite
+    // prompts. Runs before the variant-shape gate: this check is
+    // shape-independent (it only asks whether the key exists), so a
+    // table-shaped filter_prompt under [tasks.affinity_evaluation] gets the
+    // accurate "affinity's prompt is not configurable" message instead of the
+    // generic "only the composer reads variants" one.
     if let Err(msg) = model_config.validate_affinity_prompt_unset() {
         anyhow::bail!(msg);
     }
@@ -385,7 +442,7 @@ async fn run_server() -> Result<()> {
     let world_configured = model_config.resolve_world_director().is_some();
     let stories_configured = model_config.resolve_world_stories_director().is_some();
 
-    let state = AppState {
+    Ok(AppState {
         pool,
         auth,
         config: cfg.clone(),
@@ -398,57 +455,43 @@ async fn run_server() -> Result<()> {
         stories_configured,
         chat_queue_notify: Arc::new(tokio::sync::Notify::new()),
         byok: crate::byok::ByokRuntime::new(cfg.byok.allow_private_network),
-    };
+    })
+}
 
-    // Compose the OpenAPI-aware router. routes::router applies the auth
-    // middleware to /comp/* internally; healthz stays public. We seed
-    // the spec with `ApiDoc::openapi()` so the title/servers/tags from
-    // `openapi.rs` show up at /docs alongside the per-route paths.
-    let (open_router, api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
-        .merge(routes::router(state.clone()))
-        .split_for_parts();
+/// Auth: prefer JWKS (asymmetric, the post-2025 Supabase default) and fall
+/// back to a legacy HS256 shared secret if one is configured. At least one
+/// source must be wired or the server boots with a validator that rejects
+/// every token (fail-closed).
+///
+/// - SUPABASE_JWKS_URL: explicit override.
+/// - SUPABASE_URL: derive `${SUPABASE_URL}/auth/v1/.well-known/jwks.json`.
+/// - SUPABASE_JWT_SECRET: legacy HS256 shared secret (optional).
+async fn build_auth() -> Result<Arc<dyn AuthValidator>> {
+    let jwks_url = std::env::var("SUPABASE_JWKS_URL").ok().or_else(|| {
+        std::env::var("SUPABASE_URL")
+            .ok()
+            .map(|u| format!("{}/auth/v1/.well-known/jwks.json", u.trim_end_matches('/')))
+    });
+    // Resolve+validate the sources before wiring anything: an empty
+    // SUPABASE_JWT_SECRET counts as absent, so `SUPABASE_JWT_SECRET=""` with no
+    // JWKS source fails fast here instead of booting a validator that silently
+    // rejects every request.
+    let legacy_secret = resolve_legacy_secret(
+        jwks_url.is_some(),
+        std::env::var("SUPABASE_JWT_SECRET").ok(),
+    )?;
 
-    // Spawn the dreaming-lite sweeper alongside the HTTP service. Returns
-    // immediately when DREAMING_DISABLED=1 (or tick=0) is set, so unit
-    // tests and self-hosters who want only synchronous behaviour can opt out.
-    // Cloned because the next line moves `state` into the router.
-    tokio::spawn(crate::pipeline::dreaming::sweeper(state.clone()));
-
-    // human_insights_snapshot sweeper. Returns immediately when
-    // SNAPSHOT_DISABLED=1 or the cron expression fails to parse, so the
-    // chat path is unaffected by snapshot misconfig.
-    tokio::spawn(crate::pipeline::snapshot::sweeper(state.clone()));
-
-    // World Memories director sweeper. Inert when WORLD_DISABLED=1/true or
-    // [tasks.world_director] is absent/blank (spec §2.1).
-    tokio::spawn(crate::pipeline::world::sweeper(state.clone()));
-
-    // World Town sweeper (posts feed). Inert when the world subsystem is off,
-    // WORLD_TOWN_DISABLED is set, or [tasks.world_director] is absent — no
-    // posts can exist without the director (town spec §3).
-    tokio::spawn(crate::pipeline::world_town::sweeper(state.clone()));
-
-    // Chat-queue worker: drives async-endpoint turns (spec
-    // 2026-08-20-async-chat-endpoint-design). Inert when CHAT_QUEUE_DISABLED.
-    tokio::spawn(crate::pipeline::chat_queue::worker(state.clone()));
-
-    // Profile rebuild sweeper: regenerates the derived profile for users whose
-    // new facts have sat idle. Inert when PROFILE_REBUILD_DISABLED=1 or tick=0.
-    tokio::spawn(crate::pipeline::profile_rebuild::sweeper(state.clone()));
-
-    let app: Router = open_router
-        .with_state(state)
-        .merge(Scalar::with_url("/docs", api))
-        .layer(crate::middleware::SseHeadersLayer)
-        .layer(tower_http::trace::TraceLayer::new_for_http());
-
-    let listener = tokio::net::TcpListener::bind(&cfg.bind_addr).await?;
-    tracing::info!(
-        addr = %cfg.bind_addr,
-        "eros-engine starting"
-    );
-    axum::serve(listener, app).await?;
-    Ok(())
+    let mut validator = SupabaseJwtValidator::new();
+    if let Some(url) = jwks_url.as_deref() {
+        validator = validator
+            .with_jwks_url(url)
+            .await
+            .with_context(|| format!("failed to load Supabase JWKS from {url}"))?;
+    }
+    if let Some(secret) = legacy_secret {
+        validator = validator.with_legacy_secret(secret);
+    }
+    Ok(Arc::new(validator))
 }
 
 /// Validates the configured JWT sources and returns the legacy HS256 secret to

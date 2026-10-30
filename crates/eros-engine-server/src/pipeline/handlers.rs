@@ -1225,6 +1225,40 @@ pub(crate) async fn build_reply_request_with(
                 None
             });
 
+    // Spec 2026-10-28 memory-2-dreaming-plus §6: the relationship's arc,
+    // latest episodes and journal moments join the already gated and pruned
+    // raw rows in [shared_memories]. 1:1 prompts only. A group seat, a turn
+    // with the layer off, or a relationship with none of the three yet gets
+    // `None` and renders the block as before.
+    let relationship_ctx = match group {
+        Some(_) => None,
+        None => {
+            crate::relationship_context::load_relationship_context(
+                state,
+                instance_id,
+                query_embedding.as_deref(),
+                y_on,
+            )
+            .await
+        }
+    };
+    let shared_memories = crate::relationship_context::render_shared_memories(
+        relationship_ctx.as_ref(),
+        &relationship_facts,
+        now.user_timezone.unwrap_or(chrono_tz::UTC),
+        crate::relationship_context::SHARED_MEMORIES_BUDGET_CHARS,
+    );
+    // Spec §5.4: the recurring journal rows that fall on the user's local
+    // day, under `[now]` whether or not `[shared_memories]` has new content.
+    // Needs the request timezone, like the holiday line.
+    let today = now
+        .user_timezone
+        .map(|tz| now.now.with_timezone(&tz).date_naive());
+    let anniversaries = relationship_ctx
+        .as_ref()
+        .map(|c| crate::anniversary::anniversary_lines(&c.recurring, today))
+        .unwrap_or_default();
+
     // CHAT_NOISE_CANCELLATION_DISABLED restores the pre-change prompt shape in
     // full: the insight lines were the [character_state] addition in that
     // change, so the flag suppresses them too, not just the strip and the
@@ -1256,6 +1290,8 @@ pub(crate) async fn build_reply_request_with(
         body_state,
         needs,
         event,
+        shared_memories.as_deref(),
+        &anniversaries,
     );
 
     if render_reactions {
@@ -4605,6 +4641,359 @@ mod tests {
         );
         let without = system(false).await;
         assert!(!without.contains("[reactions]"), "{without}");
+    }
+
+    // ─── build_reply_request: relationship memory in [shared_memories] ───
+
+    /// One turn on a relationship, for the [shared_memories] tests.
+    #[derive(Default)]
+    struct RelationshipTurn<'a> {
+        memory_scope: MemoryScope,
+        /// Every affinity axis at this value (0 is the stranger tier).
+        axes: Option<f64>,
+        /// Seed an arc row and one episode.
+        arc: bool,
+        /// Seed these raw relationship rows, nearest first. The user row then
+        /// carries text and a mock embedder hands back the first row's
+        /// vector, so recall finds them in order; without any the user row is
+        /// blank and recall embeds nothing.
+        raw: &'a [String],
+        /// Seed a `first_meet` journal row one month before the request's
+        /// local date, and give the persona a birthday the next day.
+        met_a_month_ago: bool,
+        /// Run the turn as a group seat.
+        group: bool,
+    }
+
+    /// The request's instant: 2026-10-29 04:00 in Taipei, still the 28th in
+    /// UTC.
+    fn relationship_turn_now() -> chrono::DateTime<chrono::Utc> {
+        "2026-10-28T20:00:00Z".parse().unwrap()
+    }
+
+    /// The system prompt of `turn`, the user in Taipei.
+    async fn relationship_turn_system(pool: &PgPool, turn: RelationshipTurn<'_>) -> String {
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(pool, owner).await;
+        let session_id = make_session(pool, owner, Some(instance_id)).await;
+        // A group seat's driving row lives in the group session.
+        let group_session_id: Option<Uuid> = if turn.group {
+            Some(
+                sqlx::query_scalar(
+                    "INSERT INTO engine.chat_sessions (user_id, channel) \
+                     VALUES ($1, 'group') RETURNING id",
+                )
+                .bind(owner)
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+            )
+        } else {
+            None
+        };
+        let user_text = if turn.raw.is_empty() {
+            ""
+        } else {
+            "还记得吗"
+        };
+        let user_message_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content) \
+             VALUES ($1, 'user', $2) RETURNING id",
+        )
+        .bind(group_session_id.unwrap_or(session_id))
+        .bind(user_text)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if turn.arc {
+            sqlx::query(
+                "INSERT INTO engine.relationship_arcs (instance_id, opening, arc, folded_through) \
+                 VALUES ($1, '在咖啡店认识', '后来常常聊到深夜', now())",
+            )
+            .bind(instance_id)
+            .execute(pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO engine.relationship_episodes (instance_id, summary, started_at, ended_at) \
+                 VALUES ($1, '一起挑了猫粮', '2026-10-11T20:00:00Z', '2026-10-11T21:00:00Z')",
+            )
+            .bind(instance_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        if turn.met_a_month_ago {
+            eros_engine_store::journal::JournalRepo { pool }
+                .insert(&eros_engine_store::journal::first_meet(
+                    instance_id,
+                    chrono::NaiveDate::from_ymd_opt(2026, 9, 29).unwrap(),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        // Held until the request is built.
+        let _embedder = if turn.raw.is_empty() {
+            None
+        } else {
+            for (i, raw) in turn.raw.iter().enumerate() {
+                MemoryRepo { pool }
+                    .upsert(
+                        MemoryLayer::Relationship,
+                        session_id,
+                        owner,
+                        Some(instance_id),
+                        raw,
+                        &unit_embedding(3 + i),
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+            {
+                let server = wiremock::MockServer::start().await;
+                wiremock::Mock::given(wiremock::matchers::any())
+                    .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                        serde_json::json!({ "data": [ { "embedding": unit_embedding(3) } ] }),
+                    ))
+                    .mount(&server)
+                    .await;
+                let cfg = eros_engine_llm::model_config::ModelConfig::from_toml_str(&format!(
+                    "[providers.mockembed]\nembeddings = \"{}/v1/embeddings\"\n\
+                     [tasks.embedding]\nmodel = \"mock-embed@mockembed\"\n",
+                    server.uri()
+                ))
+                .expect("embedding provider config parses");
+                state.embed = std::sync::Arc::new(
+                    eros_engine_llm::embedding::EmbeddingRouter::from_config_with(&cfg, |k| {
+                        (k == "MOCKEMBED_API_KEY").then(|| "test-key".to_string())
+                    })
+                    .expect("mock embedding router builds"),
+                );
+                Some(server)
+            }
+        };
+
+        let plan = ActionPlan {
+            action_type: eros_engine_core::types::ActionType::ReplyText,
+            reply_style: eros_engine_core::types::ReplyStyle::Neutral,
+            affinity_deltas: Default::default(),
+            energy_cost: 0.0,
+            context_hints: vec![],
+            reply_mode: None,
+            nudges: Default::default(),
+            clothing: None,
+            image_caption: None,
+            image_ref: eros_engine_core::types::ImageRef::Face,
+            aspect_ratio: None,
+            action_response: None,
+        };
+        let mut affinity = ladder_test_affinity(session_id, owner, instance_id);
+        if let Some(v) = turn.axes {
+            affinity.warmth = v;
+            affinity.trust = v;
+            affinity.intrigue = v;
+            affinity.intimacy = v;
+            affinity.tension = v;
+        }
+        let mut persona = ladder_test_persona(instance_id, owner);
+        if turn.met_a_month_ago {
+            persona.genome.art_metadata = serde_json::json!({ "birthday": "10-30" });
+        }
+        let input = DecisionInput {
+            event: Event::UserMessage {
+                content: user_text.into(),
+                message_id: user_message_id,
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: turn.memory_scope,
+                affinity_scope: Default::default(),
+                quote: Default::default(),
+                action: None,
+                outfit: None,
+            },
+            affinity,
+            persona,
+            signals: eros_engine_core::types::ConversationSignals {
+                message_count: 1,
+                hours_since_last_message: 0.1,
+                ghost_streak: 0,
+                hours_since_last_ghost: None,
+            },
+        };
+        let view = group_session_id.map(|g| crate::pipeline::group::GroupSpeakerView {
+            group_session_id: g,
+            speaker_session_id: session_id,
+            names: std::collections::HashMap::from([(session_id, "小美".to_string())]),
+            block: String::new(),
+        });
+        let now = crate::prompt::NowContext {
+            now: relationship_turn_now(),
+            user_timezone: Some(chrono_tz::Asia::Taipei),
+            ..Default::default()
+        };
+        let (req, _tags) = build_reply_request_with(
+            &state,
+            &input,
+            &plan,
+            session_id,
+            owner,
+            instance_id,
+            user_message_id,
+            &now,
+            false,
+            None,
+            None,
+            None,
+            view.as_ref(),
+        )
+        .await
+        .expect("build_reply_request_with succeeds");
+        req.messages[0].content.clone()
+    }
+
+    const NO_MEMORY_YET: &str = "（还没有专属记忆，慢慢来）";
+
+    /// Two raw rows, 702 rendered characters each: either fits the
+    /// relationship budget alone, together they run over it.
+    fn raw_rows_over_budget() -> Vec<String> {
+        ["想", "念"]
+            .iter()
+            .map(|c| format!("用户：{}", c.repeat(697)))
+            .collect()
+    }
+
+    /// Today's block for `raw`: every row, in recall order, unbudgeted.
+    fn todays_block(raw: &[String]) -> String {
+        let lines: Vec<String> = raw.iter().map(|r| format!("- {r}")).collect();
+        format!("[shared_memories]\n{}\n", lines.join("\n"))
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn shared_memories_block_carries_arc_for_text_turn(pool: PgPool) {
+        let system = relationship_turn_system(
+            &pool,
+            RelationshipTurn {
+                arc: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(
+            system.contains(
+                "[shared_memories]\n在咖啡店认识\n后来常常聊到深夜\n- 2026-10-12：一起挑了猫粮"
+            ),
+            "the arc paragraph, then the episode dated in the user's timezone: {system}"
+        );
+        assert!(!system.contains(NO_MEMORY_YET), "{system}");
+    }
+
+    /// The arc is this relationship's own memory: it renders with the
+    /// profile layer off and at the stranger tier.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn relationship_only_scope_still_renders_arc(pool: PgPool) {
+        let system = relationship_turn_system(
+            &pool,
+            RelationshipTurn {
+                memory_scope: MemoryScope::RelationshipOnly,
+                axes: Some(0.0),
+                arc: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(
+            system.contains("[shared_memories]\n在咖啡店认识\n后来常常聊到深夜"),
+            "{system}"
+        );
+        assert!(!system.contains(NO_MEMORY_YET), "{system}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn neutral_only_scope_renders_no_arc(pool: PgPool) {
+        let system = relationship_turn_system(
+            &pool,
+            RelationshipTurn {
+                memory_scope: MemoryScope::NeutralOnly,
+                arc: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(!system.contains("在咖啡店认识"), "{system}");
+        assert!(!system.contains("一起挑了猫粮"), "{system}");
+        assert!(
+            system.contains(&format!("[shared_memories]\n{NO_MEMORY_YET}")),
+            "{system}"
+        );
+    }
+
+    /// No arc, episode or journal hit: the raw rows render as they always
+    /// have, unbudgeted, even when together they run over the budget.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn no_relationship_context_keeps_todays_block(pool: PgPool) {
+        let raw = raw_rows_over_budget();
+        let system = relationship_turn_system(
+            &pool,
+            RelationshipTurn {
+                axes: Some(0.9),
+                raw: &raw,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(system.contains(&todays_block(&raw)), "{system}");
+        assert!(!system.contains(NO_MEMORY_YET), "{system}");
+    }
+
+    /// A group seat loads no relationship context: its raw rows render as
+    /// before, unbudgeted, and the seat's arc stays out.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn group_seat_shared_memories_unchanged(pool: PgPool) {
+        let raw = raw_rows_over_budget();
+        let system = relationship_turn_system(
+            &pool,
+            RelationshipTurn {
+                axes: Some(0.9),
+                arc: true,
+                raw: &raw,
+                group: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(system.contains(&todays_block(&raw)), "{system}");
+        assert!(!system.contains("在咖啡店认识"), "{system}");
+        assert!(!system.contains("一起挑了猫粮"), "{system}");
+    }
+
+    /// The first meeting's monthly line lands in `[now]` right after the
+    /// birthday line, on the user's local date, with no relationship memory
+    /// to put in `[shared_memories]`.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn anniversary_line_renders_under_now(pool: PgPool) {
+        let system = relationship_turn_system(
+            &pool,
+            RelationshipTurn {
+                met_a_month_ago: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        let now_block = &system[system.find("[now]").unwrap()..system.find("[iron_rules").unwrap()];
+        assert!(
+            now_block.contains("明天是你的生日。\n今天是你们认识满 1 个月的日子。"),
+            "{now_block}"
+        );
+        assert!(
+            system.contains(&format!("[shared_memories]\n{NO_MEMORY_YET}")),
+            "{system}"
+        );
     }
 
     #[test]

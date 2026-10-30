@@ -5761,7 +5761,12 @@ pub(crate) fn run_stream_with(
                     // await between them. A failed write only loses the stored copy.
                     if let Some(response) = plan.action_response {
                         if let Err(e) = chat_repo
-                            .set_action_response(user_msg.user_message_id, response)
+                            .set_action_response(
+                                user_msg.user_message_id,
+                                response,
+                                user_msg.instance_id,
+                                user_msg.user_locale.timezone,
+                            )
                             .await
                         {
                             tracing::warn!("stream: action response write failed: {e}");
@@ -5776,6 +5781,7 @@ pub(crate) fn run_stream_with(
                     let session_id_bg = user_msg.session_id;
                     let persona_bg = input.persona.clone();
                     let produced = image_only_produced;
+                    let locale_bg = user_msg.user_locale;
                     tokio::spawn(async move {
                         crate::pipeline::post_process::run(
                             state_bg,
@@ -5786,6 +5792,7 @@ pub(crate) fn run_stream_with(
                             event_bg,
                             plan_bg,
                             produced,
+                            locale_bg,
                         )
                         .await;
                     });
@@ -6286,7 +6293,12 @@ pub(crate) fn run_stream_with(
                 // await between them. A failed write only loses the stored copy.
                 if let Some(response) = plan.action_response {
                     if let Err(e) = chat_repo
-                        .set_action_response(user_msg.user_message_id, response)
+                        .set_action_response(
+                            user_msg.user_message_id,
+                            response,
+                            user_msg.instance_id,
+                            user_msg.user_locale.timezone,
+                        )
                         .await
                     {
                         tracing::warn!("stream: action response write failed: {e}");
@@ -6308,6 +6320,7 @@ pub(crate) fn run_stream_with(
                 let instance_id_bg = user_msg.instance_id;
                 let session_id_bg = user_msg.session_id;
                 let persona_bg = input.persona.clone();
+                let locale_bg = user_msg.user_locale;
                 tokio::spawn(async move {
                     crate::pipeline::post_process::run(
                         state_bg,
@@ -6318,6 +6331,7 @@ pub(crate) fn run_stream_with(
                         event_bg,
                         plan_bg,
                         produced,
+                        locale_bg,
                     )
                     .await;
                 });

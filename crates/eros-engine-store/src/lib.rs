@@ -2,10 +2,12 @@
 //! Postgres + pgvector persistence layer.
 
 pub mod affinity;
+pub mod arc;
 pub mod character_insight;
 pub mod chat;
 pub mod chat_queue;
 pub mod decision;
+pub mod episode;
 pub mod erasure;
 pub mod error_handling;
 pub mod events;
@@ -15,6 +17,7 @@ pub mod human_fact;
 pub mod human_insight;
 pub mod image_events;
 pub mod insight;
+pub mod journal;
 pub mod life_choices;
 pub mod memory;
 pub mod migrate;
@@ -22,6 +25,8 @@ pub use migrate::migrate;
 pub mod persona;
 pub mod pool;
 pub mod profile_state;
+pub mod scan_event;
+pub mod scan_state;
 pub mod session_archive;
 pub mod story;
 pub mod user_insight;

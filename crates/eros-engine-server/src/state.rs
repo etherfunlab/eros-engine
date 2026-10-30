@@ -611,26 +611,27 @@ pub struct ServerConfig {
     /// `eros_engine_core::affinity::AffinityTuning`.
     pub affinity_tuning: eros_engine_core::affinity::AffinityTuning,
     pub bind_addr: String,
-    /// How often the dreaming-lite sweeper wakes up to look for idle
-    /// sessions. Set to `Duration::ZERO` (env `DREAMING_DISABLED=1`) to
-    /// skip spawning the sweeper entirely — useful for unit-test runs.
+    /// How often the dreaming sweeper wakes up to embed pending journal rows
+    /// and scan idle relationships. Set to `Duration::ZERO` (env
+    /// `DREAMING_DISABLED=1`) to skip spawning the sweeper entirely and keep
+    /// the `SCAN_K` path from scanning inline, so no dreaming call is made —
+    /// useful for unit-test runs.
     pub dreaming_tick: Duration,
-    /// Minimum idle time on `chat_sessions.last_active_at` before a
-    /// session becomes eligible for classification.
+    /// How long a relationship must have been idle since its last counted
+    /// turn before the sweeper scans its pending turns (`DREAMING_IDLE_SECS`,
+    /// default 3600).
     pub dreaming_idle_threshold: Duration,
-    /// How long a `classification_claimed_at` claim is considered fresh.
-    /// Older than this and the picker treats it as a crashed worker and
-    /// re-claims the row. Should comfortably exceed the worst-case
-    /// processing time (one LLM call + N calls to the embedding router).
+    /// How long a relationship's scan claim is considered fresh. Older than
+    /// this and a worker treats it as crashed and re-claims the row. Should
+    /// comfortably exceed the worst-case scan: the scan call and its one
+    /// embedding call. A live scan releases its claim before the arc rewrite
+    /// it may start; a backfill segment still holds its claim through one.
     pub dreaming_claim_stale_threshold: Duration,
-    /// Opt out of post-call voice memory ingestion (`DREAMING_VOICE_DISABLED`).
-    /// Default `false` ⇒ ended voice sessions ARE swept and distilled into
-    /// profile-layer memories. Set to `1`/`true` to restore the pre-#236
-    /// text-only behavior: voice sessions are still claimed and stamped, but
-    /// their messages are never read. Exists because this is a
-    /// privacy-relevant behavior change — deployments keep a zero-code way
-    /// back. Note that `classified_at` is stamped once: calls swept while
-    /// this flag was on are never re-swept after turning it off.
+    /// Opt out of voice memory ingestion (`DREAMING_VOICE_DISABLED`). Default
+    /// `false` ⇒ voice turns count toward their relationship's scan and the
+    /// scan reads voice rows. Set to `1`/`true` and voice rows leave the scan
+    /// transcript and voice turns stop counting. Exists because this is a
+    /// privacy-relevant behavior — deployments keep a zero-code way back.
     pub dreaming_voice_disabled: bool,
     /// Top-level keys removed from the `usage` object before it leaves the
     /// engine — both `CompanionReplyResponse.usage` (sync) and the SSE
@@ -704,7 +705,7 @@ impl ServerConfig {
             std::env::var("DREAMING_IDLE_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(1800),
+                .unwrap_or(3600),
         );
         let dreaming_claim_stale_threshold = Duration::from_secs(
             std::env::var("DREAMING_CLAIM_STALE_SECS")

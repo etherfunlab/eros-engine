@@ -1295,7 +1295,7 @@ pub struct ResolvedProductQa {
     pub sampling: Sampling,
 }
 
-/// Resolved extraction task (`insight_extraction` facts stage / `memory_extraction`).
+/// Resolved extraction task (`insight_extraction` facts stage / `dreaming_scan`).
 /// The configured `filter_prompt` is the system instruction; the server assembles
 /// the conversation as a separate user message. Model selection mirrors the generic
 /// `resolve()` exactly (this only adds the prompt), so call-site behaviour is unchanged
@@ -2319,10 +2319,19 @@ impl ModelConfig {
         self.resolve_extract("insight_extraction")
     }
 
-    /// Resolve the memory-extraction prompt bundle. `None` when
-    /// `[tasks.memory_extraction]` is absent OR its `filter_prompt` is blank.
-    pub fn resolve_memory_extract(&self) -> Option<ResolvedExtract> {
-        self.resolve_extract("memory_extraction")
+    /// Resolve the dreaming-scan prompt bundle (profile memories + episode
+    /// summary + journal moments in one call). `None` when
+    /// `[tasks.dreaming_scan]` is absent OR its `filter_prompt` is blank.
+    pub fn resolve_dreaming_scan(&self) -> Option<ResolvedExtract> {
+        self.resolve_extract(DREAMING_SCAN_TASK)
+    }
+
+    /// Parameters for the relationship-arc rewrite. The prompt is engine-owned,
+    /// so only the model parameters resolve here. `None` when
+    /// `[tasks.arc_rewrite]` is absent.
+    pub fn resolve_arc_rewrite(&self) -> Option<ResolvedModel> {
+        self.has_task(ARC_REWRITE_TASK)
+            .then(|| self.resolve(ARC_REWRITE_TASK, None))
     }
 
     /// Shared resolver for the config-driven extraction prompts. Mirrors
@@ -2525,7 +2534,7 @@ impl ModelConfig {
     pub fn validate_extraction_prompts(&self) -> Result<(), String> {
         for name in [
             "insight_extraction",
-            "memory_extraction",
+            DREAMING_SCAN_TASK,
             "character_insight_extraction",
             "user_insight_extraction",
         ] {
@@ -2592,9 +2601,13 @@ impl ModelConfig {
         Ok(())
     }
 
-    /// Boot gate for `[tasks.affinity_evaluation].filter_prompt` and
-    /// `[tasks.affinity_summary].filter_prompt` — keys that parse but are
-    /// never read.
+    /// Boot gate for `[tasks.affinity_evaluation].filter_prompt`,
+    /// `[tasks.affinity_summary].filter_prompt` and
+    /// `[tasks.arc_rewrite].filter_prompt` — keys that parse but are never
+    /// read.
+    ///
+    /// The arc rewrite's prompt is engine-owned too: the reply it asks for is
+    /// the JSON shape the engine's arc guard parses and length-checks.
     ///
     /// Both affinity tasks' prompts are engine-owned by design: the evaluator
     /// (issue #210) interpolates per-turn context the config layer cannot
@@ -2617,8 +2630,9 @@ impl ModelConfig {
         // Both affinity tasks' prompts are engine-owned: the evaluator
         // (issue #210) and the feeling-clause summarizer (spec 2026-09-03),
         // whose first-person voice + reason hygiene are load-bearing — the
-        // clause is re-injected into later system prompts.
-        const ENGINE_OWNED_AFFINITY_TASKS: [(&str, &str); 2] = [
+        // clause is re-injected into later system prompts. So is the arc
+        // rewrite's (spec 2026-10-28), whose reply the arc guard parses.
+        const ENGINE_OWNED_TASKS: [(&str, &str); 3] = [
             (
                 "affinity_evaluation",
                 "https://github.com/etherfunlab/eros-engine/issues/210",
@@ -2627,8 +2641,12 @@ impl ModelConfig {
                 "affinity_summary",
                 "docs/superpowers/specs/2026-09-03-affinity-feeling-clause-design.md",
             ),
+            (
+                ARC_REWRITE_TASK,
+                "docs/superpowers/specs/2026-10-28-memory-2-dreaming-plus-design.md",
+            ),
         ];
-        for (task, rationale) in ENGINE_OWNED_AFFINITY_TASKS {
+        for (task, rationale) in ENGINE_OWNED_TASKS {
             let has_prompt = self
                 .tasks
                 .get(task)
@@ -2830,6 +2848,21 @@ const EMBEDDING_TASK: &str = "embedding";
 /// If a future task starts resolving with a tier, add its name here.
 pub const TIER_CONSUMING_TASKS: &[&str] = &["chat_companion", "chat_output_filter"];
 
+/// Memory 2.0 scan: one call per relationship segment returns profile
+/// memories, an episode summary and journal moments.
+pub const DREAMING_SCAN_TASK: &str = "dreaming_scan";
+
+/// Memory 2.0 arc rewrite. The prompt is engine-owned; the block carries only
+/// model and sampling parameters.
+pub const ARC_REWRITE_TASK: &str = "arc_rewrite";
+
+/// Task blocks that no longer do anything, with the boot warning each earns.
+/// A present block is ignored (it never fails boot) but must not stay silent.
+const RETIRED_TASKS: &[(&str, &str)] = &[(
+    "memory_extraction",
+    "[tasks.memory_extraction] is retired and ignored; configure [tasks.dreaming_scan] instead",
+)];
+
 /// Every task name the chat/completions pipeline can present to the
 /// body-rules matcher (`ChatRequest.task`). Used ONLY for the boot-time typo
 /// warning on `[[providers.*.body]].tasks` — matching itself is plain string
@@ -2847,7 +2880,8 @@ pub const KNOWN_CHAT_TASKS: &[&str] = &[
     "chat_product_qa",
     "pde_decision",
     "insight_extraction",
-    "memory_extraction",
+    DREAMING_SCAN_TASK,
+    ARC_REWRITE_TASK,
     "character_insight_extraction",
     "character_insight_structuring",
     "profile_rebuild",
@@ -2894,6 +2928,15 @@ fn body_rule_task_warning(task: &str) -> Option<BodyTaskWarning> {
 }
 
 impl ModelConfig {
+    /// Boot warnings for present task blocks the engine no longer reads.
+    fn retired_task_notices(&self) -> Vec<&'static str> {
+        RETIRED_TASKS
+            .iter()
+            .filter(|(task, _)| self.tasks.contains_key(*task))
+            .map(|(_, notice)| *notice)
+            .collect()
+    }
+
     /// Boot gate for the `[providers]` block and every `@provider` model slug
     /// (spec 2026-08-01-embedding-providers §2/§4/§6/§7). Checks, in order:
     /// provider-table shape (charset, reserved name, non-empty URL);
@@ -2909,6 +2952,7 @@ impl ModelConfig {
     /// model_read/model_write exclusivity, no fallback/tiers, voyage-4+ gate
     /// on the read/write pair); and finally VOYAGE_API_KEY, required iff the
     /// resolved embedding config routes through the built-in Voyage client.
+    /// Also warns (never fails) for each retired task block still present.
     pub fn validate_providers(&self) -> Result<(), String> {
         self.validate_providers_with(|k| std::env::var(k).ok())
     }
@@ -3012,6 +3056,12 @@ impl ModelConfig {
                     }
                 }
             }
+        }
+
+        // Retired task blocks warn here, beside the unknown-task typo warning
+        // above: present-but-ignored config the operator should clean up.
+        for notice in self.retired_task_notices() {
+            tracing::warn!("{notice}");
         }
 
         // 1.5. Removed [defaults] keys (spec 2026-08-02-provider-body-params):
@@ -4102,11 +4152,13 @@ fallback = ""
         assert!(cfg.has_task("profile_rebuild"));
         assert!(!cfg.has_task("insight_structuring"));
         assert_eq!(cfg.resolve_profile_rebuild().max_tokens, 1200);
-        let mem = cfg.resolve_memory_extract().expect("memory task present");
-        assert_eq!(mem.max_tokens, 1200);
+        let mem = cfg
+            .resolve_dreaming_scan()
+            .expect("dreaming_scan task present");
+        assert_eq!(mem.max_tokens, 1024);
         assert!(
             mem.extract_prompt.contains("evidence_type"),
-            "memory prompt must carry the metadata taxonomy"
+            "scan prompt must carry the memory metadata taxonomy"
         );
     }
 
@@ -5135,18 +5187,69 @@ retry_depth = 0
     }
 
     #[test]
-    fn resolve_memory_extract_some_and_none() {
-        let none =
-            ModelConfig::from_toml_str("[tasks.memory_extraction]\nmodel = \"m\"\n").unwrap();
-        assert!(none.resolve_memory_extract().is_none());
+    fn dreaming_scan_resolves_only_with_prompt() {
+        let none = ModelConfig::from_toml_str("[tasks.dreaming_scan]\nmodel = \"m\"\n").unwrap();
+        assert!(none.resolve_dreaming_scan().is_none());
 
         let cfg = ModelConfig::from_toml_str(
-            "[tasks.memory_extraction]\nmodel = \"mem/m\"\nfilter_prompt = \"extract memories\"\n",
+            "[tasks.dreaming_scan]\nmodel = \"scan/m\"\nmax_tokens = 1024\nfilter_prompt = \"scan the segment\"\n",
         )
         .unwrap();
-        let r = cfg.resolve_memory_extract().expect("resolves");
-        assert_eq!(r.model, "mem/m");
-        assert_eq!(r.extract_prompt, "extract memories");
+        let r = cfg.resolve_dreaming_scan().expect("resolves");
+        assert_eq!(r.model, "scan/m");
+        assert_eq!(r.max_tokens, 1024);
+        assert_eq!(r.extract_prompt, "scan the segment");
+
+        // Present without a usable prompt is a boot refusal naming the task.
+        let err = none.validate_extraction_prompts().unwrap_err();
+        assert!(err.contains("dreaming_scan"), "msg names the task: {err}");
+        assert!(KNOWN_CHAT_TASKS.contains(&DREAMING_SCAN_TASK));
+    }
+
+    #[test]
+    fn arc_rewrite_resolves_params_without_prompt() {
+        let absent = ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel = \"m\"\n").unwrap();
+        assert!(absent.resolve_arc_rewrite().is_none());
+
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.arc_rewrite]\nmodel = \"arc/m\"\nfallback = [\"arc/f\"]\ntemperature = 0.3\nmax_tokens = 1500\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_arc_rewrite().expect("block present resolves");
+        assert_eq!(r.model, "arc/m");
+        assert_eq!(r.fallback_model, vec!["arc/f".to_string()]);
+        assert_eq!(r.temperature, 0.3);
+        assert_eq!(r.max_tokens, 1500);
+        // Engine-owned prompt: no filter_prompt needed, none gated.
+        assert!(cfg.validate_extraction_prompts().is_ok());
+        assert!(KNOWN_CHAT_TASKS.contains(&ARC_REWRITE_TASK));
+    }
+
+    #[test]
+    fn memory_extraction_block_is_ignored() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.memory_extraction]\nmodel = \"mem/m\"\nfilter_prompt = \"old prompt\"\n",
+        )
+        .unwrap();
+        // Nothing resolves from the retired block, and nothing refuses to boot.
+        assert!(cfg.resolve_dreaming_scan().is_none());
+        assert!(cfg.validate_extraction_prompts().is_ok());
+        assert!(cfg.validate_removed_tasks().is_ok());
+        assert!(cfg
+            .validate_providers_with(|_| Some("k".to_string()))
+            .is_ok());
+        assert!(!KNOWN_CHAT_TASKS.contains(&"memory_extraction"));
+        // One boot warning, in the exact words the operator should act on.
+        assert_eq!(
+            cfg.retired_task_notices(),
+            vec![
+                "[tasks.memory_extraction] is retired and ignored; configure \
+                 [tasks.dreaming_scan] instead"
+            ]
+        );
+        // A config without the block says nothing.
+        let clean = ModelConfig::from_toml_str("[tasks.dreaming_scan]\nmodel = \"m\"\n").unwrap();
+        assert!(clean.retired_task_notices().is_empty());
     }
 
     #[test]
@@ -5183,7 +5286,7 @@ model = "m"
 model = "m"
 filter_prompt = "extract facts"
 
-[tasks.memory_extraction]
+[tasks.dreaming_scan]
 model = "m"
 filter_prompt = "extract memories"
 "#;
@@ -5208,23 +5311,20 @@ model = "m"
     #[test]
     fn validate_extraction_present_blank_prompt_errors() {
         let toml = r#"
-[tasks.memory_extraction]
+[tasks.dreaming_scan]
 model = "m"
 filter_prompt = "   "
 "#;
         let cfg = ModelConfig::from_toml_str(toml).unwrap();
         let err = cfg.validate_extraction_prompts().unwrap_err();
-        assert!(
-            err.contains("memory_extraction"),
-            "msg names the task: {err}"
-        );
+        assert!(err.contains("dreaming_scan"), "msg names the task: {err}");
     }
 
     #[test]
-    fn resolve_memory_extract_none_when_section_absent() {
+    fn resolve_dreaming_scan_none_when_section_absent() {
         // Guards the dreaming sweeper's early-return condition (a later task).
         let cfg = ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel = \"m\"\n").unwrap();
-        assert!(cfg.resolve_memory_extract().is_none());
+        assert!(cfg.resolve_dreaming_scan().is_none());
     }
 
     #[test]
@@ -6125,7 +6225,7 @@ model = "m"
 filter_prompt = "extract"
 top_p = 0.68
 
-[tasks.memory_extraction]
+[tasks.dreaming_scan]
 model = "m"
 filter_prompt = "extract"
 top_p = 0.69
@@ -6180,7 +6280,7 @@ top_p = 0.73
             Some(0.68)
         );
         assert_eq!(
-            cfg.resolve_memory_extract().unwrap().sampling.top_p,
+            cfg.resolve_dreaming_scan().unwrap().sampling.top_p,
             Some(0.69)
         );
         assert_eq!(
@@ -6250,8 +6350,8 @@ presence_penalty = -0.5
         let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml must parse");
 
         let mem = cfg
-            .resolve_memory_extract()
-            .expect("memory_extraction resolves from the committed config");
+            .resolve_dreaming_scan()
+            .expect("dreaming_scan resolves from the committed config");
         // Five-category vocabulary preserved.
         for cat in ["fact", "preference", "event", "emotion", "relation"] {
             assert!(mem.extract_prompt.contains(cat), "missing category `{cat}`");
@@ -6261,6 +6361,27 @@ presence_penalty = -0.5
         assert!(
             mem.extract_prompt.contains("用户压力大"),
             "bad-example anchor"
+        );
+        // Three-output contract: the scan also returns an episode and journal.
+        assert!(mem.extract_prompt.contains("\"episode\""), "episode key");
+        assert!(mem.extract_prompt.contains("\"journal\""), "journal key");
+        assert!(
+            !mem.extract_prompt.contains("真实发生在用户与 AI 之间"),
+            "realm wording must not read as physical reality"
+        );
+        assert_eq!(mem.max_tokens, 1024);
+
+        let arc = cfg
+            .resolve_arc_rewrite()
+            .expect("arc_rewrite resolves from the committed config");
+        assert_eq!(arc.max_tokens, 1500);
+        assert_eq!(
+            arc.model, mem.model,
+            "arc_rewrite shares the scan's primary"
+        );
+        assert!(
+            cfg.tasks["arc_rewrite"].filter_prompt.is_none(),
+            "arc_rewrite's prompt is engine-owned"
         );
 
         let ins = cfg
@@ -7432,6 +7553,27 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
             err.contains("[tasks.affinity_summary].filter_prompt"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn arc_rewrite_filter_prompt_refuses_boot() {
+        let ok =
+            ModelConfig::from_toml_str("[tasks.arc_rewrite]\nmodel = \"m\"\nmax_tokens = 1500\n")
+                .unwrap();
+        assert!(ok.validate_affinity_prompt_unset().is_ok());
+
+        for prompt in ["\"rewrite the arc\"", "\"\""] {
+            let cfg = ModelConfig::from_toml_str(&format!(
+                "[tasks.arc_rewrite]\nmodel = \"m\"\nfilter_prompt = {prompt}\n"
+            ))
+            .unwrap();
+            let err = cfg
+                .validate_affinity_prompt_unset()
+                .expect_err("a set arc_rewrite prompt must refuse to boot");
+            assert!(err.contains("[tasks.arc_rewrite].filter_prompt"), "{err}");
+            assert!(err.contains("engine-owned"), "{err}");
+            assert!(err.contains("memory-2-dreaming-plus"), "{err}");
+        }
     }
 
     // ─── validate_tier_blocks ────────────────────────────────────────────
