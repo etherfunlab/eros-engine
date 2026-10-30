@@ -43,7 +43,7 @@ Voice calls read needs and no events. Group turns read neither. Details follow.
 | `stamina` | worn out | full of energy | 很累 / 精神很好 |
 | `emotional` | content | badly wants to be cared about | 心里挺满足 / 很想被在乎 |
 | `outing` | wants to stay in | wants to go out | 只想待在屋里 / 想出门走走 |
-| `indulgence` | no urge | wants to let loose: a smoke, a drink, weed | — / 很想抽根烟, 很想喝一杯, 很想抽口大麻 or 很想放纵一下 ([below](#where-needs-show-up)) |
+| `indulgence` | no urge | craves what she's hooked on: a smoke, a drink, weed, a coffee | — / 很想抽根烟, 很想喝一杯, 很想抽口大麻, 很想喝杯咖啡 or 很想放纵一下 ([below](#where-needs-show-up)) |
 
 Levels are ordinals. The judge never reads or writes a number, and `mid` is the unremarkable
 middle.
@@ -92,13 +92,13 @@ the rating, and stops there:
 | `indulgence`, no habit `true` | `mid` | 8 h |
 | `indulgence`, one habit `true` | `high` | 12 h |
 | `indulgence`, two habits `true` | `high` | 8 h |
-| `indulgence`, all three `true` | `high` | 4 h |
+| `indulgence`, three or four habits `true` | `high` | 4 h |
 
 Time away makes her hungry and wanting company; tiredness, emotional need and the wish to go
 out or stay in settle toward the middle. A `low` hunger rated at noon reads `mid` at 16:00 and
-`high` from 20:00. The habits are the persona's `smoking`, `alcoholic` and `drug` keys
+`high` from 20:00. The habits are the persona's `smoking`, `alcoholic`, `drug` and `coffee` keys
 ([Persona settings](#persona-settings)); `false` and absent count alike. The more of them are
-`true`, the sooner the urge to let loose comes back after the judge rated it down. A rating
+`true`, the sooner the craving comes back after the judge rated it down. A rating
 stored without `outing` and `indulgence` reads both as `mid`. A BYOC persona's keys live on
 her card, which the engine opens only on a turn: outside a turn (`GET …/effects`, a replay that
 falls back to the carried levels) her `indulgence` drifts as for a persona with no habit. The
@@ -141,7 +141,7 @@ again shows the judge the same line.
 
   `indulgence` shows only at `high`. It names one thing she uses, picked at random each turn
   among the habit keys set to `true`: `smoking` 很想抽根烟, `alcoholic` 很想喝一杯, `drug`
-  很想抽口大麻. With no key `true` it reads 很想放纵一下. Every need at `mid` (a `low`
+  很想抽口大麻, `coffee` 很想喝杯咖啡. With no key `true` it reads 很想放纵一下. Every need at `mid` (a `low`
   `indulgence` counts the same), or no rating, adds nothing and leaves the prompt
   unchanged. A judged turn's reply is written with the levels the turn ends with: the
   verdict's when it rated, otherwise the carried levels the judge was shown. A rule-engine
@@ -213,7 +213,8 @@ the length).
 3. **Kind.** Each eligible kind in that category weighs its base weight times its
    [needs factors](#1-needs-weight-the-kind-pick), its `prefer_events` factor, its
    [follow-on factor](#follow-on-factors) and, for a few kinds, a persona factor
-   ([`is_virgin`](#persona-settings), [`homesick`](#persona-settings)). A second roll picks
+   ([`is_virgin`](#persona-settings), [`homesick`](#persona-settings),
+   [`sex_addict`](#persona-settings)). A second roll picks
    one.
 4. **Duration.** A fixed length is taken as is; a range is rolled.
 
@@ -290,7 +291,7 @@ The rung (1 to 3) is read from the session's affinity, time-decayed as in a chat
 
 ### Persona settings
 
-Eight keys in the persona genome's `art_metadata`, read by the engine and written by whoever
+Ten keys in the persona genome's `art_metadata`, read by the engine and written by whoever
 authors the persona, sit beside `gender`, `birthday` and `timezone`:
 
 | key | value | effect |
@@ -300,7 +301,8 @@ authors the persona, sit beside `gender`, `birthday` and `timezone`:
 | `prefer_trip` | `true`, `false` (default) | the `trip` category weighs 3 times as much |
 | `homesick` | `true`, `false`, absent (default) | within `trip`: `true` weighs `hometown_visit` 3 times and `short_trip` / `long_trip` a third; `false` weighs `hometown_visit` a third; `business_trip` is work and untouched either way |
 | `is_virgin` | `true`, `false` (default) | while she is a virgin, `having_sex` weighs a fifth within `mid` |
-| `smoking`, `alcoholic`, `drug` | each `true`, `false`, absent (default) | whether she smokes, drinks, uses weed: how fast `indulgence` comes back ([drift](#drift-between-ratings)), what a high `indulgence` names in the reply, and how she takes a give of that thing (below) |
+| `sex_addict` | `true`, `false`, absent (default) | within `short`: `true` weighs `sudden_desire` 3 times, `false` a third; its rung gate holds either way |
+| `smoking`, `alcoholic`, `drug`, `coffee` | each `true`, `false`, absent (default) | whether she smokes, drinks, uses weed, drinks coffee: how fast `indulgence` comes back ([drift](#drift-between-ratings)), what a high `indulgence` names in the reply, and how she takes a give of that thing (below) |
 
 `prefer_trip` says whether she moves at all; `homesick` says where she goes when she does. A
 flight attendant with both `true` travels often, works her trips as before, and spends her
@@ -309,7 +311,7 @@ leave at home rather than elsewhere.
 Her virginity as the draw sees it is derived: the card says `is_virgin` and the instance has
 no `having_sex` event, ever. The first `having_sex` row ends it, with no write anywhere: the
 next draw reads the row. The key reaches no prompt; what she is like is written into her
-persona by its author, as every other persona fact.
+persona by its author, as every other persona fact. `sex_addict` reaches no prompt either.
 
 Reads are lenient. A value of the wrong type reads as absent; in `prefer_events`, an entry that
 is not a known `mid` kind is dropped and the rest are kept. `health` scales the whole `body`
@@ -317,13 +319,13 @@ category, `period` included, and `period`'s own 28-day cooldown keeps it near mo
 way. `prefer_trip` raises the odds of a trip, not its frequency: the weekly category cooldown
 holds.
 
-The three habit keys reach the draw only through the drift of `indulgence`. The judge's
-persona block (`[角色人格]`) does not list them, so she does not bring up tobacco, alcohol or
-weed at every turn; a persona whose habits should colour her talk says so in her persona text. The engine
+The four habit keys reach the draw only through the drift of `indulgence`. The judge's
+persona block (`[角色人格]`) does not list them, so she does not bring up tobacco, alcohol,
+weed or coffee at every turn; a persona whose habits should colour her talk says so in her persona text. The engine
 never writes them.
 
 **A give of something she does not use.** When a turn's action is a `give` of `cigarette`,
-`alcohol` or `herb` and the matching key (`smoking`, `alcoholic`, `drug`) is `false`, the
+`alcohol`, `herb` or `coffee` and the matching key (`smoking`, `alcoholic`, `drug`, `coffee`) is `false`, the
 engine rolls once before the judge runs. One time in three the turn goes on as usual.
 Otherwise she refuses this give:
 
@@ -740,7 +742,7 @@ above. Needs reach neither.
 ## How the two interact
 
 The needs factors below are second-stage factors; the others ([follow-on
-factors](#follow-on-factors), `prefer_events`, `is_virgin`, `homesick`) read no need.
+factors](#follow-on-factors), `prefer_events`, `is_virgin`, `homesick`, `sex_addict`) read no need.
 
 ### 1. Needs weight the kind pick
 
@@ -1000,7 +1002,7 @@ falling-out rows live in `engine.persona_events` like any event.
 | `[近期事件]` | not rendered: there is no judge to read it |
 | Offline kinds | silence turns as with the judge, since the check runs before it: the ghosting switch and the action and forced-image exemptions apply |
 | The ask for space | unchanged: the trigger reads the affinity evaluator's judged turns, not the PDE judge |
-| `smoking`, `alcoholic`, `drug` | a `false` key still rolls on a give and can turn it into a refusal; there is no `indulgence` to drift or name |
+| `smoking`, `alcoholic`, `drug`, `coffee` | a `false` key still rolls on a give and can turn it into a refusal; there is no `indulgence` to drift or name |
 
 ## Code pointers
 

@@ -401,7 +401,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 一个回合指文字 session 里的一条用户消息；产品咨询消息和语音通话不计数，也没有时间上限。这份状态会进判官、回复 prompt 和画图 composer，并经 `body_state` 帧和 [`GET /v2/comp/session/{session_id}/effects`](#get-v2compsessionsession_ideffects) 给到调用方。被拒绝的 give 没有余效。设计文档：[余效 spec](superpowers/specs/2026-10-12-given-item-lingering-effects-design.md)、[give 品类 spec](superpowers/specs/2026-10-13-give-categories-design.md)。
 
-**递来她不用的东西。** 角色的 `art_metadata.smoking`、`alcoholic`、`drug` 表示她抽不抽烟、喝不喝酒、用不用大麻（表在[下文](#post-v2compsessionsession_idevents)）。递 `cigarette`、`alcohol` 或 `herb` 而对应的键为 `false` 时，engine 在判官运行之前掷一次。三次里有一次，这一轮照常进行。其余情况回应就是 `refuse`，不管判官怎么答，也不管有没有 LLM 判官：`action_response` 帧和两套历史接口返回的 `response` 都是 `refuse`，这次 give 不留余效，并像任何被拒的 give 一样让 bond 线降一档。判官会被告知这个结果（见 [model-config.zh.md](model-config.zh.md#taskspde_decision--opt-in-llm-pde-判断器)）。键为 `true` 或不写时从不掷，其他物品和其他动作也不掷。
+**递来她不用的东西。** 角色的 `art_metadata.smoking`、`alcoholic`、`drug`、`coffee` 表示她抽不抽烟、喝不喝酒、用不用大麻、喝不喝咖啡（表在[下文](#post-v2compsessionsession_idevents)）。递 `cigarette`、`alcohol`、`herb` 或 `coffee` 而对应的键为 `false` 时，engine 在判官运行之前掷一次。三次里有一次，这一轮照常进行。其余情况回应就是 `refuse`，不管判官怎么答，也不管有没有 LLM 判官：`action_response` 帧和两套历史接口返回的 `response` 都是 `refuse`，这次 give 不留余效，并像任何被拒的 give 一样让 bond 线降一档。判官会被告知这个结果（见 [model-config.zh.md](model-config.zh.md#taskspde_decision--opt-in-llm-pde-判断器)）。键为 `true` 或不写时从不掷，其他物品和其他动作也不掷。
 
 带动作时 `content` 可以为空，也可以和 `image_url`、`image` 同时出现。取值不合规（超出范围、缺少 `item`/`text`/`amount_usd`/`kind`/`name`）一律返回 `422`，`code: "unprocessable"`；`type` 或 `item` 不在上表取值内时，请求体按无法解析的 JSON 拒绝（同样是 `422`）。动作存在用户行上，两套历史接口都以 `action` 字段返回，该回合生效之后带 `response`。
 
@@ -870,7 +870,8 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
   | `prefer_trip` | `true` / `false`（默认） | trip 类被抽到的概率是原来的三倍；仍然每周最多一次 |
   | `homesick` | `true` / `false` / 不写 | 出行往哪去：`true` 偏向 `hometown_visit`、压低游玩的两种；`false` 压低 `hometown_visit`；`business_trip` 不动 |
   | `is_virgin` | `true` / `false`（默认） | 第一次 `having_sex` 事件之前，`having_sex` 的概率是五分之一；之后这个键不再起作用 |
-  | `smoking`、`alcoholic`、`drug` | 各为 `true` / `false` / 不写 | 她抽不抽烟、喝不喝酒、用不用大麻：为 `true` 的越多，她的 `indulgence` 回到 `high` 越快，进而给抽取加权；为 `false` 的键可能让她拒收递来的这样东西（见[上文](#post-compchatsession_idmessagestream)） |
+  | `sex_addict` | `true` / `false` / 不写 | `sudden_desire` 在 `short` 内被抽到的概率是原来的三倍 / 三分之一；仍然只在最亲近的档 |
+  | `smoking`、`alcoholic`、`drug`、`coffee` | 各为 `true` / `false` / 不写 | 她抽不抽烟、喝不喝酒、用不用大麻、喝不喝咖啡：为 `true` 的越多，她的 `indulgence` 回到 `high` 越快，进而给抽取加权；为 `false` 的键可能让她拒收递来的这样东西（见[上文](#post-compchatsession_idmessagestream)） |
 
   取值形状不对、种类未知，或种类不在 `mid` 里，一律忽略。偏好不会绕过任何门槛。
 - **只要有符合条件的种类，抽取就一定得到一个事件。** 她的一天有多热闹，取决于调用方什么时候来要。

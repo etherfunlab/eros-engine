@@ -65,14 +65,15 @@ value of the wrong shape reads as absent.
 | `appearance` | string | Visual description seeded into image prompts. |
 | `possessions` | array of strings | Things she owns, merged with the instance's item rows. |
 | `wardrobe` | array of strings | Clothes she can wear, merged with the instance's item rows. |
-| `smoking`, `alcoholic`, `drug` | boolean | Whether she smokes, drinks, uses weed: how she takes a `give` of each, how fast her urge to let loose builds, and what it names. See [life-events-needs.md](life-events-needs.md#persona-settings). |
+| `smoking`, `alcoholic`, `drug`, `coffee` | boolean | Whether she smokes, drinks, uses weed, drinks coffee: how she takes a `give` of each, how fast her craving for what she's hooked on builds, and what it names. See [life-events-needs.md](life-events-needs.md#persona-settings). |
 | `health` | string | `weak`, `normal` or `strong`. Read by life events. |
 | `prefer_trip` | boolean | Read by life events. |
 | `prefer_events` | array of strings | Read by life events. |
 | `homesick` | boolean | Read by life events. |
 | `is_virgin` | boolean | Read by life events. |
+| `sex_addict` | boolean | Read by life events. |
 
-The last five are accepted in v1 and have no effect on a BYOC instance, since
+The last six are accepted in v1 and have no effect on a BYOC instance, since
 BYOC does not serve life events yet.
 
 ## Versions
