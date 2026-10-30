@@ -55,6 +55,16 @@ impl LifeChoiceRecord {
     pub fn is_pending(&self, now: DateTime<Utc>) -> bool {
         self.status == "pending" && now < self.expires_at()
     }
+
+    /// How the choice stands at `now` (spec 2026-10-30 §3): the stored
+    /// status, except that a lapsed `pending` reads `expired`.
+    pub fn status_at(&self, now: DateTime<Utc>) -> &str {
+        if self.status == "pending" && now >= self.expires_at() {
+            "expired"
+        } else {
+            &self.status
+        }
+    }
 }
 
 pub struct LifeChoiceRepo<'a> {
@@ -129,6 +139,23 @@ impl LifeChoiceRepo<'_> {
         .await?;
         tx.commit().await?;
         Ok(Some(choice))
+    }
+
+    /// The choices asked by any of `message_ids`, in no particular order
+    /// (spec 2026-10-30 §3): one lookup per history page.
+    pub async fn by_message_ids(
+        &self,
+        message_ids: &[Uuid],
+    ) -> Result<Vec<LifeChoiceRecord>, sqlx::Error> {
+        if message_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_as(&format!(
+            "SELECT {COLUMNS} FROM engine.life_choices WHERE message_id = ANY($1)"
+        ))
+        .bind(message_ids)
+        .fetch_all(self.pool)
+        .await
     }
 
     /// One choice by id, in whatever state it is in.
@@ -349,6 +376,76 @@ mod tests {
             .fetch_one(pool)
             .await
             .unwrap()
+    }
+
+    fn record(status: &str, asked_ago: Duration) -> LifeChoiceRecord {
+        let asked_at = Utc::now() - asked_ago;
+        LifeChoiceRecord {
+            id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            kind: "ask_for_space".into(),
+            status: status.into(),
+            tier_gap: 3,
+            asked_at,
+            resolved_at: (status != "pending").then(|| asked_at + Duration::minutes(1)),
+            message_id: None,
+            event_id: None,
+        }
+    }
+
+    #[test]
+    fn status_at_reads_a_lapsed_pending_as_expired() {
+        let now = Utc::now();
+        assert_eq!(
+            record("pending", Duration::hours(25)).status_at(now),
+            "expired"
+        );
+        assert_eq!(
+            record("pending", Duration::hours(1)).status_at(now),
+            "pending"
+        );
+        assert_eq!(
+            record("accepted", Duration::hours(25)).status_at(now),
+            "accepted"
+        );
+        assert_eq!(
+            record("declined", Duration::hours(1)).status_at(now),
+            "declined"
+        );
+        assert_eq!(
+            record("ignored", Duration::hours(25)).status_at(now),
+            "ignored"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn by_message_ids_returns_only_the_asked_rows(pool: PgPool) {
+        let (owner, instance, s1) = instance_and_session(&pool).await;
+        let s2 = ChatRepo { pool: &pool }
+            .create_session(owner, instance)
+            .await
+            .unwrap()
+            .id;
+        let repo = LifeChoiceRepo { pool: &pool };
+        let m1 = ask_message("one");
+        let c1 = repo.insert_ask(s1, 3, None, &m1).await.unwrap().unwrap();
+        repo.resolve(c1.id, "declined", Utc::now()).await.unwrap();
+        let m2 = ask_message("two");
+        repo.insert_ask(s2, 3, None, &m2).await.unwrap().unwrap();
+        sqlx::query(
+            "INSERT INTO engine.life_choices (session_id, kind, status, tier_gap, asked_at) \
+             VALUES ($1, 'ask_for_space', 'ignored', 3, now())",
+        )
+        .bind(s1)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let got = repo.by_message_ids(&[m1.id, Uuid::new_v4()]).await.unwrap();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].id, c1.id);
+        assert_eq!(got[0].message_id, Some(m1.id));
+        assert!(repo.by_message_ids(&[]).await.unwrap().is_empty());
     }
 
     #[sqlx::test(migrations = "./migrations")]
