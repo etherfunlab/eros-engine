@@ -94,7 +94,7 @@ pub struct NeedsView {
     pub emotional: NeedLevelDto,
     /// `high` wants to go out, `low` wants to stay in.
     pub outing: NeedLevelDto,
-    /// `high` wants to let loose: a smoke, a drink, weed.
+    /// `high` craves what she's hooked on: a smoke, a drink, weed, a coffee.
     pub indulgence: NeedLevelDto,
 }
 

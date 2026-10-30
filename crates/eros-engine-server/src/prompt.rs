@@ -822,6 +822,7 @@ pub(crate) fn needs_line(
         (habits.smoking, "很想抽根烟"),
         (habits.alcoholic, "很想喝一杯"),
         (habits.drug, "很想抽口大麻"),
+        (habits.coffee, "很想喝杯咖啡"),
     ]
     .into_iter()
     .filter_map(|(set, words)| (set == Some(true)).then_some(words))
@@ -1262,18 +1263,21 @@ pub(crate) fn persona_traits(
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
         homesick: art.get("homesick").and_then(|v| v.as_bool()),
+        sex_addict: art.get("sex_addict").and_then(|v| v.as_bool()),
     }
 }
 
-/// Whether the persona smokes, drinks, uses weed (spec 2026-10-28-outing-
-/// indulgence-needs-and-habits-design.md §3): `art_metadata.smoking`,
-/// `alcoholic`, `drug`; a key that is not a boolean reads as unset.
+/// Whether the persona smokes, drinks, uses weed, drinks coffee (spec
+/// 2026-10-28-outing-indulgence-needs-and-habits-design.md §3):
+/// `art_metadata.smoking`, `alcoholic`, `drug`, `coffee`; a key that is not a
+/// boolean reads as unset.
 pub(crate) fn persona_habits(persona: &CompanionPersona) -> eros_engine_core::needs::Habits {
     let key = |k: &str| persona.genome.art_metadata.get(k).and_then(|v| v.as_bool());
     eros_engine_core::needs::Habits {
         smoking: key("smoking"),
         alcoholic: key("alcoholic"),
         drug: key("drug"),
+        coffee: key("coffee"),
     }
 }
 
@@ -4197,6 +4201,7 @@ mod tests {
             smoking: Some(false),
             alcoholic: Some(false),
             drug: Some(false),
+            coffee: Some(false),
         };
         let drinker = Habits {
             alcoholic: Some(true),
@@ -4223,7 +4228,7 @@ mod tests {
     }
 
     /// A high `indulgence` names one habit that is `true`, `pick` choosing
-    /// in the order smoking, alcoholic, drug.
+    /// in the order smoking, alcoholic, drug, coffee.
     #[test]
     fn a_craving_names_one_habit() {
         use eros_engine_core::needs::{Habits, NeedLevel::*, Needs};
@@ -4239,20 +4244,29 @@ mod tests {
             smoking: Some(true),
             alcoholic: Some(true),
             drug: Some(true),
+            coffee: Some(true),
         };
         let smoke_and_weed = Habits {
             alcoholic: Some(false),
+            coffee: None,
             ..all
+        };
+        let coffee_only = Habits {
+            coffee: Some(true),
+            ..Habits::default()
         };
         let cases = [
             (all, 0.0, "很想抽根烟"),
-            (all, 0.33, "很想抽根烟"),
-            (all, 0.34, "很想喝一杯"),
-            (all, 0.66, "很想喝一杯"),
-            (all, 0.67, "很想抽口大麻"),
-            (all, 1.0, "很想抽口大麻"),
+            (all, 0.24, "很想抽根烟"),
+            (all, 0.25, "很想喝一杯"),
+            (all, 0.49, "很想喝一杯"),
+            (all, 0.5, "很想抽口大麻"),
+            (all, 0.74, "很想抽口大麻"),
+            (all, 0.75, "很想喝杯咖啡"),
+            (all, 1.0, "很想喝杯咖啡"),
             (smoke_and_weed, 0.49, "很想抽根烟"),
             (smoke_and_weed, 0.5, "很想抽口大麻"),
+            (coffee_only, 0.0, "很想喝杯咖啡"),
         ];
         for (h, pick, want) in cases {
             assert_eq!(
@@ -4760,7 +4774,7 @@ mod tests {
         p.genome.art_metadata = serde_json::json!({
             "gender": "female", "health": "weak", "prefer_trip": true,
             "prefer_events": ["gaming", "reading"],
-            "is_virgin": true, "homesick": false
+            "is_virgin": true, "homesick": false, "sex_addict": true
         });
         assert_eq!(
             persona_traits(&p),
@@ -4771,9 +4785,11 @@ mod tests {
                 prefer_events: vec![EventKind::Gaming, EventKind::Reading],
                 is_virgin: true,
                 homesick: Some(false),
+                sex_addict: Some(true),
             }
         );
-        p.genome.art_metadata = serde_json::json!({"is_virgin": "yes", "homesick": "home"});
+        p.genome.art_metadata =
+            serde_json::json!({"is_virgin": "yes", "homesick": "home", "sex_addict": 1});
         assert_eq!(persona_traits(&p), PersonaTraits::default());
         p.genome.art_metadata = serde_json::json!({});
         assert_eq!(persona_traits(&p), PersonaTraits::default());
@@ -4789,11 +4805,14 @@ mod tests {
         };
         assert_eq!(with(serde_json::json!({})), Habits::default());
         assert_eq!(
-            with(serde_json::json!({"smoking": true, "alcoholic": false, "drug": "true"})),
+            with(
+                serde_json::json!({"smoking": true, "alcoholic": false, "drug": "true", "coffee": true})
+            ),
             Habits {
                 smoking: Some(true),
                 alcoholic: Some(false),
                 drug: None,
+                coffee: Some(true),
             }
         );
         assert_eq!(with(serde_json::json!({"drug": 1})).drug, None);

@@ -6443,7 +6443,7 @@
           },
           "indulgence": {
             "$ref": "#/components/schemas/NeedLevelDto",
-            "description": "`high` wants to let loose: a smoke, a drink, weed."
+            "description": "`high` craves what she's hooked on: a smoke, a drink, weed, a coffee."
           },
           "outing": {
             "$ref": "#/components/schemas/NeedLevelDto",

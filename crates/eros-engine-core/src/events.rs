@@ -451,6 +451,9 @@ pub struct PersonaTraits {
     /// `art_metadata.homesick`: `true`, her home is her base; `false`, she
     /// roams; `None`, no preference. Steers where a trip goes (§5).
     pub homesick: Option<bool>,
+    /// `art_metadata.sex_addict`: `true` or `false` scales `sudden_desire`;
+    /// `None` leaves it be.
+    pub sex_addict: Option<bool>,
 }
 
 fn passes_gate(kind: EventKind, rung: u8, persona: &PersonaTraits) -> bool {
@@ -483,10 +486,10 @@ fn needs_factor(kind: EventKind, needs: Option<&Needs>) -> f64 {
     }
 }
 
-/// How the urge to let loose scales a kind within its category (spec
-/// 2026-10-28-outing-indulgence-needs-and-habits-design.md §5.2): it sends
-/// her out and frays her temper. Its own factor, so it multiplies with
-/// `needs_factor`. 1 without a rating.
+/// How the craving for what she's hooked on scales a kind within its
+/// category (spec 2026-10-28-outing-indulgence-needs-and-habits-design.md
+/// §5.2): it sends her out and frays her temper. Its own factor, so it
+/// multiplies with `needs_factor`. 1 without a rating.
 fn indulgence_factor(kind: EventKind, needs: Option<&Needs>) -> f64 {
     match (kind, needs) {
         (EventKind::WantToGoOut | EventKind::Irritable, Some(n))
@@ -576,6 +579,16 @@ fn homesick_factor(kind: EventKind, persona: &PersonaTraits) -> f64 {
         (HometownVisit, Some(false)) | (ShortTrip | LongTrip, Some(true)) => {
             1.0 / PREFERENCE_FACTOR
         }
+        _ => 1.0,
+    }
+}
+
+/// How `sex_addict` scales `sudden_desire` within its category: three times
+/// or a third as likely. Its rung gate holds either way.
+fn sex_addict_factor(kind: EventKind, persona: &PersonaTraits) -> f64 {
+    match (kind, persona.sex_addict) {
+        (EventKind::SuddenDesire, Some(true)) => PREFERENCE_FACTOR,
+        (EventKind::SuddenDesire, Some(false)) => 1.0 / PREFERENCE_FACTOR,
         _ => 1.0,
     }
 }
@@ -726,7 +739,8 @@ pub fn draw(input: &DrawInput, rolls: Rolls) -> Option<Drawn> {
                 * preference_factor(k, input.persona)
                 * follow_factor(k, input.history, input.now)
                 * prior_factor(k, input.persona, input.ever_had_sex)
-                * homesick_factor(k, input.persona);
+                * homesick_factor(k, input.persona)
+                * sex_addict_factor(k, input.persona);
             (k, weight)
         })
         .collect();
@@ -2194,6 +2208,34 @@ mod tests {
         assert_eq!(at(&none, 0.4), Some(BusinessTrip));
         assert_eq!(at(&none, 0.6), Some(ShortTrip));
         assert_eq!(at(&none, 0.9), Some(HometownVisit));
+    }
+
+    #[test]
+    fn sex_addict_scales_sudden_desire() {
+        let both = [SuddenDesire, GroceryShopping];
+        let with = |sex_addict| PersonaTraits {
+            sex_addict,
+            ..Default::default()
+        };
+        let at = |p: &PersonaTraits, k| pick_ever(p, false, &both, rolls(0.0, k));
+        // Draw order is `ALL` order: SuddenDesire, GroceryShopping.
+        // true: 6, 2 (8) — spans [0, .75), [.75, 1].
+        let addict = with(Some(true));
+        assert_eq!(at(&addict, 0.7), Some(SuddenDesire));
+        assert_eq!(at(&addict, 0.8), Some(GroceryShopping));
+        // false: 2/3, 2 (8/3) — spans [0, .25), [.25, 1].
+        let not = with(Some(false));
+        assert_eq!(at(&not, 0.2), Some(SuddenDesire));
+        assert_eq!(at(&not, 0.3), Some(GroceryShopping));
+        // absent: 2, 2 (4) — spans [0, .5), [.5, 1].
+        let none = with(None);
+        assert_eq!(at(&none, 0.45), Some(SuddenDesire));
+        assert_eq!(at(&none, 0.55), Some(GroceryShopping));
+        // The rung gate holds for an addict.
+        assert_eq!(
+            pick_with(&addict, None, 2, &[], &[SuddenDesire], rolls(0.0, 0.0)),
+            None
+        );
     }
 
     fn rated(outing: NeedLevel, indulgence: NeedLevel, emotional: NeedLevel) -> Option<Needs> {
