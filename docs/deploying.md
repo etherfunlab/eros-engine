@@ -35,7 +35,7 @@ The binary has five modes (dispatched by `argv[1]`):
 - **What it writes.** Episodes, journal rows and arc rewrites. Profile memories only from segments holding a row newer than its session's `classified_at` (or from a never-stamped session), since the retired per-session sweeper extracted the rest. It never moves the live cursor; its progress is `backfilled_through_at`, so an interrupted run resumes where it stopped, and a failed segment stops that relationship until the next run.
 - **Beside live traffic.** Each segment holds the relationship's scan claim, so a live scan waits at most one segment; a relationship a live scan holds is skipped and reported as `relationships skipped`. A real run ends with `segments: X ok, Y empty, Z failed; relationships skipped: S`.
 
-The [v2.6.0 migration guide](migrating/v2-6-0-memory-2-0.md#backfill-dreaming) covers when to run it.
+The [v2.6.0 migration guide](migrating/v2-6-0-memory.md#backfill-dreaming) covers when to run it.
 
 ## Path 1: Docker self-host
 

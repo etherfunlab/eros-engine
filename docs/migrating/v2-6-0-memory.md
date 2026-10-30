@@ -1,4 +1,4 @@
-# Migrating to v2.6.0: Memory 2.0, the relationship scan
+# Migrating to v2.6.0: memory and the relationship scan
 
 **Applies to:** operators upgrading from `v2.5.2` to `v2.6.0`, deployments
 that run their own `[tasks.memory_extraction]` prompt, deployments that erase
@@ -6,7 +6,8 @@ users or mirror memories through `/svc/v1/*`, and code that depends on the
 `eros-engine-store` or `eros-engine-llm` crates.
 **Design:** [`2026-10-28-memory-2-dreaming-plus-design.md`](../superpowers/specs/2026-10-28-memory-2-dreaming-plus-design.md)
 
-The per-session dreaming sweeper is gone. In its place each relationship (one
+The per-session sweeper of [memory (legacy)](../memory-layers_legacy.md) is
+gone. In its place each relationship (one
 persona instance) has a scan cursor, and one call per stretch of conversation
 returns three things: the profile memories the sweeper used to write, a dated
 **episode** summary, and dated **journal** moments. Every fourth episode is

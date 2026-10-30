@@ -17,7 +17,7 @@
 
 引擎建立在九项基础能力之上：
 
-- 🧠 **双层记忆**——稳定的用户事实与共同经历、前情呼应、未完话题各有其位。→ [记忆分层](docs/memory-layers.zh.md)
+- 🧠 **双层记忆**——稳定的用户事实之外，每段关系还有自己的故事：一条持续改写的弧线、带日期的片段，和一本会在纪念日回到眼前的纪事。→ [记忆分层](docs/memory-layers.zh.md)
 - 💞 **演变的亲密度**——六个关系维度按档位写入、经衰减落库，也会随时间回落，逐渐影响语气、深度，甚至是否回复。→ [亲密度模型](docs/affinity-model.zh.md) · [ghost 机制](docs/ghost-mechanics.zh.md)
 - 🎭 **人设决策引擎（PDE）**——生成回复前，先选择行为与内在状态。默认规则即可运行；可选的 LLM 评判还会评估角色的基本需求，并可把它的推理流式送到客户端。→ [模型配置](docs/model-config.zh.md)
 - 🧩 **结构化用户洞察**——把关于用户的原子事实记进账本，并按计划从账本派生出可查询的画像，供下游产品用于引导、个性化和分析；可选的 keyset 导出让下游服务维护只读镜像，一次调用即可抹除引擎关于某个用户派生出的一切。→ [洞察](docs/insights.zh.md) · [API 参考](docs/api-reference.zh.md)
@@ -88,7 +88,7 @@ docker run --rm -p 8080:8080 --env-file .env \
 - [架构](docs/architecture.zh.md)——crate 边界、pipeline 阶段和数据流。
 - [亲密度模型](docs/affinity-model.zh.md)——关系维度、档位评分、衰减和标签。
 - [ghost 机制](docs/ghost-mechanics.zh.md)——伴侣何时以及为何保持沉默。
-- [记忆分层](docs/memory-layers.zh.md)——画像与关系记忆、embedding 和检索。
+- [记忆分层](docs/memory-layers.zh.md)——画像与关系记忆、dreaming、embedding 和检索。
 - [群聊](docs/group-chat.zh.md)——至多三位人设的群、导演与发言者接力。
 - [世界系统](docs/world-system.zh.md)——实验性的 World Memories、World Town 与 World Stories 模拟。
 - [模型配置](docs/model-config.zh.md)——任务、模型选择、故障回退及通过 `[providers]` 实现的多提供方路由。

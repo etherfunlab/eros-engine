@@ -35,7 +35,7 @@
 - **写什么。** 片段、纪事和弧线改写。画像记忆只从这样的段写入：段内有某行晚于其 session 的 `classified_at`（或 session 从未被盖戳）——其余部分已被退役的按 session 清扫器抽取过。它从不移动实时游标；它的进度是 `backfilled_through_at`，所以中断后的运行从停下的地方继续，失败的段会让这段关系停到下一次运行。
 - **与线上流量并行。** 每一段都持有这段关系的扫描认领，所以实时扫描最多等一段；被实时扫描占着的关系会被跳过，计入 `relationships skipped`。正式运行以 `segments: X ok, Y empty, Z failed; relationships skipped: S` 结束。
 
-什么时候运行它，见 [v2.6.0 迁移指南](migrating/v2-6-0-memory-2-0.md#backfill-dreaming)。
+什么时候运行它，见 [v2.6.0 迁移指南](migrating/v2-6-0-memory.md#backfill-dreaming)。
 
 ## 路径 1：Docker 自托管
 
