@@ -117,9 +117,6 @@ pub(crate) enum LifeChoiceCue {
     /// Ask-for-space declined.
     Hurt,
     /// A romantic kind answered.
-    // Built by the resolution route once it answers romantic kinds; drop the
-    // allow then.
-    #[allow(dead_code)]
     Answered {
         kind: LifeChoiceKind,
         accepted: bool,

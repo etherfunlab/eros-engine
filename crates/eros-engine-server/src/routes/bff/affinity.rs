@@ -450,7 +450,7 @@ mod tests {
         http::{header, Request, StatusCode},
     };
     use chrono::{DateTime, Duration, SubsecRound, Utc};
-    use eros_engine_core::affinity::AffinityTuning;
+    use eros_engine_core::affinity::{AffinityLine, AffinityTuning};
     use eros_engine_store::affinity::AffinityRepo;
     use eros_engine_store::life_choices::LifeChoiceRepo;
     use serde_json::json;
@@ -1457,7 +1457,13 @@ mod tests {
             .unwrap()
             .expect("resolved");
         AffinityRepo { pool: &pool }
-            .persist_life_choice_drop(session_id, choice, "decline", &AffinityTuning::default())
+            .persist_life_choice_drop(
+                session_id,
+                choice,
+                "decline",
+                &[AffinityLine::Bond, AffinityLine::Chemistry],
+                &AffinityTuning::default(),
+            )
             .await
             .unwrap();
         let dropped: i64 = sqlx::query_scalar(

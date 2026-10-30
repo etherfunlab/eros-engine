@@ -1,11 +1,21 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! POST /v2/comp/session/{session_id}/life-choices/{choice_id} — the user
-//! answers the persona's ask for space: accept or decline. Either way the
-//! relationship drops one tier on both lines; an accept also starts a
-//! separation. The persona answers in one proactive message, and the cost is
-//! applied with the answer, not with the message (spec
+//! answers what the persona asked: accept or decline. What an answer does
+//! depends on the choice's kind.
+//!
+//! - `ask_for_space`: either answer drops the relationship one tier on both
+//!   lines; an accept also starts a separation.
+//! - `sleep_together`: an accept changes nothing; a decline drops chemistry
+//!   one tier.
+//! - `propose`: an accept changes nothing; a decline drops both lines one
+//!   tier.
+//!
+//! The persona answers in one proactive message, and the cost is applied with
+//! the answer, not with the message (spec
 //! docs/superpowers/specs/2026-10-19-life-events-shopping-gatherings-and-ask-for-space-design.md
-//! §3.4a, §3.4b, §3.5).
+//! §3.4a, §3.4b, §3.5; romantic kinds:
+//! docs/superpowers/specs/2026-10-30-give-needs-romantic-choices-and-answer-receipts-design.md
+//! §4.5).
 
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
@@ -15,13 +25,14 @@ use serde::{Deserialize, Serialize};
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
+use eros_engine_core::affinity::{Affinity, AffinityLine};
 use eros_engine_core::events::EventKind;
 use eros_engine_core::persona::CompanionPersona;
 use eros_engine_core::scope::MemoryScope;
 use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::{ChatMessage, ChatRepo};
 use eros_engine_store::events::{EventRepo, NewEvent};
-use eros_engine_store::life_choices::{LifeChoiceRecord, LifeChoiceRepo};
+use eros_engine_store::life_choices::{LifeChoiceKind, LifeChoiceRecord, LifeChoiceRepo};
 use std::collections::HashMap;
 
 use crate::auth::middleware::AuthUser;
@@ -52,7 +63,7 @@ const SEPARATION_HOURS_PER_TIER: i64 = 6;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum LifeChoiceAnswer {
-    /// Agree to the separation.
+    /// Agree to what she asked.
     Accept,
     /// Refuse it.
     Decline,
@@ -85,13 +96,18 @@ pub struct LifeChoiceRespondRequest {
 pub struct LifeChoiceRespondResponse {
     /// The choice's new status: `accepted` or `declined`.
     pub status: String,
-    /// What she says back: the goodbye after an accept, the hurt reply after
-    /// a decline. `null` when the generation failed, came back blank or a
-    /// newer message landed first; the answer and its costs stand either way.
+    /// What she says back: for `ask_for_space`, the goodbye after an accept
+    /// and the hurt reply after a decline; for `sleep_together` and `propose`,
+    /// her answer to the user's yes or no. `null` when the generation failed,
+    /// came back blank or a newer message landed first; the answer and its
+    /// costs stand either way.
     pub message: Option<GreetingDto>,
-    /// The relationship after the drop.
+    /// The relationship after the answer: dropped for any decline and for an
+    /// `ask_for_space` accept, as it stands for a `sleep_together` or
+    /// `propose` accept.
     pub affinity: AffinitySnapshot,
-    /// The separation an accept started; `null` after a decline.
+    /// The separation an `ask_for_space` accept started. `null` after any
+    /// decline and for every `sleep_together` and `propose` answer.
     pub event: Option<EventView>,
 }
 
@@ -167,16 +183,28 @@ fn invalid_payload(message: String) -> AppError {
     })
 }
 
-/// Answer her ask for space.
+/// Answer what she asked.
 ///
-/// One transaction answers the choice and pays for it. Accept: the choice
-/// becomes `accepted`, a `taking_space` separation starts now and lasts 6 hours
-/// per tier of the gap she asked at (12, 18 or 24 hours; she is offline for
-/// it, and an incident under way ends), and bond and chemistry each drop one
-/// tier. Decline: the choice becomes `declined` and the two lines drop one
-/// tier, with no separation. Either way she then answers in one proactive
-/// message, persisted like any reply and returned; if that generation fails
-/// the call still succeeds with `message: null`.
+/// One transaction answers the choice and pays for it; what an answer does
+/// depends on the choice's `kind`.
+///
+/// `ask_for_space`: an accept makes the choice `accepted`, starts a
+/// `taking_space` separation now that lasts 6 hours per tier of the gap she
+/// asked at (12, 18 or 24 hours; she is offline for it, and an incident under
+/// way ends), and drops bond and chemistry one tier each. A decline makes it
+/// `declined` and drops the same two lines, with no separation.
+///
+/// `sleep_together`: an accept makes the choice `accepted` and costs nothing:
+/// no event, no tier change. A decline makes it `declined` and drops chemistry
+/// one tier.
+///
+/// `propose`: an accept makes the choice `accepted` and costs nothing. A
+/// decline makes it `declined` and drops bond and chemistry one tier each.
+///
+/// Either way she then answers in one proactive message, persisted like any
+/// reply and returned; if that generation fails the call still succeeds with
+/// `message: null`. `event` is `null` for every answer but an `ask_for_space`
+/// accept.
 ///
 /// `409` when the choice is no longer pending: answered already (an ordinary
 /// message from the user counts, and the first writer wins), or lapsed 24
@@ -231,11 +259,15 @@ pub(crate) async fn respond_at(
     let (_session, persona, instance_id) =
         resolve_text_turn(state, session_id, user_id, "life choices").await?;
 
-    (LifeChoiceRepo { pool: &state.pool })
+    let asked = (LifeChoiceRepo { pool: &state.pool })
         .get(choice_id)
         .await?
         .filter(|c| c.session_id == session_id)
         .ok_or_else(not_found)?;
+    // The kind is fixed at ask time; one this build cannot read is a fault in
+    // the stored data, refused before anything is written.
+    let kind = LifeChoiceKind::parse(&asked.kind)
+        .ok_or_else(|| AppError::Internal("stored life choice kind unreadable".into()))?;
 
     // Taken before anything is written: a call over the cap is refused with
     // the choice still open, not answered and then left without her reply.
@@ -255,8 +287,9 @@ pub(crate) async fn respond_at(
     let Some(choice) = LifeChoiceRepo::resolve_in_tx(&mut tx, choice_id, status, now).await? else {
         return Err(closed());
     };
-    let separation = match req.response {
-        LifeChoiceAnswer::Accept => {
+    // Only asking for space starts a separation, and only it carries a gap.
+    let separation = match (kind, req.response) {
+        (LifeChoiceKind::AskForSpace, LifeChoiceAnswer::Accept) => {
             let lasts = Duration::hours(
                 SEPARATION_HOURS_PER_TIER
                     * i64::from(choice.tier_gap.expect("ask_for_space carries a gap (0083)")),
@@ -276,26 +309,62 @@ pub(crate) async fn respond_at(
             LifeChoiceRepo::set_event_in_tx(&mut tx, choice.id, event.id).await?;
             Some((event, lasts))
         }
-        LifeChoiceAnswer::Decline => None,
+        _ => None,
     };
-    let affinity = AffinityRepo::persist_life_choice_drop_in_tx(
-        &mut tx,
-        session_id,
-        choice.id,
-        resolution,
-        &state.config.affinity_tuning,
-    )
-    .await?;
+    // The lines a decline costs; a romantic accept costs none and drops nothing.
+    let lines: Option<&[AffinityLine]> = match (kind, req.response) {
+        (LifeChoiceKind::SleepTogether | LifeChoiceKind::Propose, LifeChoiceAnswer::Accept) => None,
+        (LifeChoiceKind::SleepTogether, LifeChoiceAnswer::Decline) => {
+            Some(&[AffinityLine::Chemistry])
+        }
+        (LifeChoiceKind::AskForSpace | LifeChoiceKind::Propose, _) => {
+            Some(&[AffinityLine::Bond, AffinityLine::Chemistry])
+        }
+    };
+    let dropped = match lines {
+        Some(lines) => Some(
+            AffinityRepo::persist_life_choice_drop_in_tx(
+                &mut tx,
+                session_id,
+                choice.id,
+                resolution,
+                lines,
+                &state.config.affinity_tuning,
+            )
+            .await?,
+        ),
+        None => None,
+    };
     tx.commit().await?;
+    let affinity = match dropped {
+        Some(a) => a,
+        // Nothing changed: the relationship as it stands, read the way every
+        // snapshot is. A choice is asked only once the row exists.
+        None => match (AffinityRepo { pool: &state.pool })
+            .load(session_id)
+            .await?
+        {
+            Some(mut a) => {
+                a.apply_time_decay();
+                a.refresh_endpoints(&state.config.affinity_tuning);
+                a
+            }
+            None => Affinity::unrecorded(),
+        },
+    };
 
     // Her reply is the last step and cannot undo the answer: whatever goes
     // wrong here (the provider, a blank reply, a newer message) leaves the
     // resolution, the separation and the drop in place, and she says nothing.
-    let cue = match &separation {
-        Some((_, lasts)) => LifeChoiceCue::Goodbye {
+    let cue = match (kind, &separation) {
+        (LifeChoiceKind::AskForSpace, Some((_, lasts))) => LifeChoiceCue::Goodbye {
             hours: lasts.num_hours(),
         },
-        None => LifeChoiceCue::Hurt,
+        (LifeChoiceKind::AskForSpace, None) => LifeChoiceCue::Hurt,
+        (kind, _) => LifeChoiceCue::Answered {
+            kind,
+            accepted: req.response == LifeChoiceAnswer::Accept,
+        },
     };
     let message = match say(
         state,
@@ -413,6 +482,10 @@ mod tests {
     const GOODBYE_CUE_18: &str =
         "（对方同意了你提出的分开请求，接下来 18 小时你们不联系。你跟对方道别。）";
     const HURT_CUE: &str = "（对方不同意你提出的分开请求，你心里不好受。）";
+    const SLEEP_ACCEPT_CUE: &str = "（对方答应了你的邀请。）";
+    const SLEEP_DECLINE_CUE: &str = "（对方拒绝了你的邀请，你有点失落。）";
+    const PROPOSE_ACCEPT_CUE: &str = "（对方答应了你的求婚。）";
+    const PROPOSE_DECLINE_CUE: &str = "（对方拒绝了你的求婚，你心里很难受。）";
 
     fn with_companion(mut state: AppState, mock_uri: &str) -> AppState {
         state.model_config = Arc::new(
@@ -525,6 +598,46 @@ mod tests {
             .bind(self.session_id)
             .bind(tier_gap)
             .bind(asked_at)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+        }
+
+        /// A pending choice of a kind that carries no gap (the 0083 CHECK
+        /// wants it NULL); returns its id.
+        async fn ask_kind(&self, kind: &str, asked_at: DateTime<Utc>) -> Uuid {
+            sqlx::query_scalar(
+                "INSERT INTO engine.life_choices (session_id, kind, tier_gap, asked_at) \
+                 VALUES ($1, $2, NULL, $3) RETURNING id",
+            )
+            .bind(self.session_id)
+            .bind(kind)
+            .bind(asked_at)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+        }
+
+        /// (trust, intrigue, intimacy, tension) as stored.
+        async fn axes(&self) -> (f64, f64, f64, f64) {
+            sqlx::query_as(
+                "SELECT trust, intrigue, intimacy, tension \
+                   FROM engine.companion_affinity WHERE session_id = $1",
+            )
+            .bind(self.session_id)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+        }
+
+        /// How many affinity events of any type the session has.
+        async fn affinity_event_count(&self) -> i64 {
+            sqlx::query_scalar(
+                "SELECT count(*) FROM engine.companion_affinity_events e \
+                   JOIN engine.companion_affinity a ON a.id = e.affinity_id \
+                  WHERE a.session_id = $1",
+            )
+            .bind(self.session_id)
             .fetch_one(&self.pool)
             .await
             .unwrap()
@@ -784,6 +897,164 @@ mod tests {
         assert_eq!(c.len(), 1);
         let last = c[0]["messages"].as_array().unwrap().last().unwrap().clone();
         assert_eq!(last["content"], json!(HURT_CUE));
+    }
+
+    /// The last `user` turn of the companion request: the stage cue.
+    fn last_user_turn(call: &serde_json::Value) -> serde_json::Value {
+        let last = call["messages"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(last["role"], json!("user"));
+        last["content"].clone()
+    }
+
+    /// A romantic accept is only an answer: no event, no tier change, nothing
+    /// written to the affinity row or its log. She says yes-cue back and the
+    /// response carries the relationship as it stands.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_romantic_accept_costs_nothing(pool: PgPool) {
+        let mock = companion_mock(Some("好呀。")).await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let repo = AffinityRepo { pool: &pool };
+
+        for kind in ["sleep_together", "propose"] {
+            let s = scene(&pool).await;
+            let choice = s.ask_kind(kind, recent(30)).await;
+            let stored = repo.load(s.session_id).await.unwrap().expect("row");
+            let events_before = s.affinity_event_count().await;
+            let now = recent(0);
+
+            let out = s
+                .respond(&state, choice, LifeChoiceAnswer::Accept, now)
+                .await
+                .unwrap();
+
+            assert_eq!(out.status, "accepted", "{kind}");
+            assert!(out.event.is_none(), "{kind}: no separation");
+            assert!(s.events().await.is_empty(), "{kind}: no persona event");
+            assert_eq!(s.row(choice).await, ("accepted".into(), Some(now), None));
+            assert_eq!(s.affinity_event_count().await, events_before, "{kind}");
+            assert!(s.drops().await.is_empty(), "{kind}");
+
+            // The row is untouched, `updated_at` included.
+            let after = repo.load(s.session_id).await.unwrap().expect("row");
+            assert_eq!(s.tiers().await, (3, 4), "{kind}");
+            assert_eq!(s.axes().await, (0.45, 0.45, 0.70, 0.70), "{kind}");
+            assert_eq!(after.updated_at, stored.updated_at, "{kind}");
+
+            // The response is the relationship as it was, read the way every
+            // snapshot is: decayed, endpoints refreshed.
+            let mut expected = stored.clone();
+            expected.apply_time_decay();
+            expected.refresh_endpoints(&state.config.affinity_tuning);
+            assert_eq!(
+                serde_json::to_value(&out.affinity).unwrap(),
+                serde_json::to_value(AffinitySnapshot::from(expected)).unwrap(),
+                "{kind}"
+            );
+
+            let said = out.message.expect("a reply");
+            assert_eq!(said.content, "好呀。");
+            assert_eq!(said.occasion, GreetingOccasion::LifeChoice);
+            assert_eq!(s.life_choice_rows().await.len(), 1, "{kind}");
+        }
+
+        let c = calls(&mock).await;
+        assert_eq!(c.len(), 2);
+        assert_eq!(last_user_turn(&c[0]), json!(SLEEP_ACCEPT_CUE));
+        assert_eq!(last_user_turn(&c[1]), json!(PROPOSE_ACCEPT_CUE));
+    }
+
+    /// Declining the invitation costs chemistry one tier and nothing else:
+    /// the bond line keeps its axes, to the bit.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn declining_sleep_together_drops_chemistry_only(pool: PgPool) {
+        let mock = companion_mock(Some(HURT)).await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let s = scene(&pool).await;
+        let choice = s.ask_kind("sleep_together", recent(30)).await;
+        let (trust, intrigue, intimacy, tension) = s.axes().await;
+        let now = recent(0);
+
+        let out = s
+            .respond(&state, choice, LifeChoiceAnswer::Decline, now)
+            .await
+            .unwrap();
+
+        assert_eq!(out.status, "declined");
+        assert!(out.event.is_none());
+        assert!(s.events().await.is_empty());
+        assert_eq!(s.row(choice).await, ("declined".into(), Some(now), None));
+        let (t, i, m, n) = s.axes().await;
+        assert_eq!((t, i), (trust, intrigue), "the bond axes did not move");
+        assert!(m < intimacy && n < tension, "chemistry fell");
+        assert_eq!(
+            s.tiers().await,
+            (3, 3),
+            "chemistry one tier lower, bond kept"
+        );
+        assert_eq!((out.affinity.bond_tier, out.affinity.chem_tier), (3, 3));
+        assert_eq!(
+            s.drops().await,
+            vec![json!({"life_choice": "decline", "choice_id": choice})]
+        );
+
+        assert_eq!(out.message.expect("a reply").content, HURT);
+        let c = calls(&mock).await;
+        assert_eq!(c.len(), 1);
+        assert_eq!(last_user_turn(&c[0]), json!(SLEEP_DECLINE_CUE));
+    }
+
+    /// Declining a proposal costs what v1's decline costs: both lines, one
+    /// tier each.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn declining_a_proposal_drops_both_lines(pool: PgPool) {
+        let mock = companion_mock(Some(HURT)).await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let s = scene(&pool).await;
+        let choice = s.ask_kind("propose", recent(30)).await;
+        let now = recent(0);
+
+        let out = s
+            .respond(&state, choice, LifeChoiceAnswer::Decline, now)
+            .await
+            .unwrap();
+
+        assert_eq!(out.status, "declined");
+        assert!(out.event.is_none());
+        assert!(s.events().await.is_empty());
+        assert_eq!(s.row(choice).await, ("declined".into(), Some(now), None));
+        assert_eq!(s.tiers().await, (2, 3));
+        assert_eq!((out.affinity.bond_tier, out.affinity.chem_tier), (2, 3));
+        assert_eq!(
+            s.drops().await,
+            vec![json!({"life_choice": "decline", "choice_id": choice})]
+        );
+        assert_eq!(out.message.expect("a reply").content, HURT);
+        let c = calls(&mock).await;
+        assert_eq!(c.len(), 1);
+        assert_eq!(last_user_turn(&c[0]), json!(PROPOSE_DECLINE_CUE));
+    }
+
+    /// A stored kind this build does not know is refused as a server fault
+    /// before anything is written: the choice stays pending, no cost lands.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_unknown_kind_is_a_500_and_writes_nothing(pool: PgPool) {
+        let mock = companion_mock(Some(HURT)).await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let s = scene(&pool).await;
+        let choice = s.ask_kind("mystery", recent(30)).await;
+
+        for response in [LifeChoiceAnswer::Accept, LifeChoiceAnswer::Decline] {
+            let err = s
+                .respond(&state, choice, response, recent(0))
+                .await
+                .expect_err("an unreadable kind");
+            assert!(matches!(err, AppError::Internal(_)), "{err:?}");
+        }
+        assert_eq!(s.row(choice).await, ("pending".into(), None, None));
+        assert_eq!(s.tiers().await, (3, 4));
+        assert!(s.events().await.is_empty());
+        assert!(s.drops().await.is_empty());
+        assert!(calls(&mock).await.is_empty());
     }
 
     /// The first writer wins: a choice an ordinary message already converted

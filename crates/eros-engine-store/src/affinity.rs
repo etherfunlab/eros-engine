@@ -6,8 +6,8 @@
 
 use chrono::{DateTime, Utc};
 use eros_engine_core::affinity::{
-    grade_turn, Affinity, AffinityDeltas, AffinityTuning, AxisGrades, EndpointLevelReads,
-    PendingDeltas,
+    grade_turn, Affinity, AffinityDeltas, AffinityLine, AffinityTuning, AxisGrades,
+    EndpointLevelReads, PendingDeltas,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -934,21 +934,23 @@ impl<'a> AffinityRepo<'a> {
         session_id: Uuid,
         choice_id: Uuid,
         resolution: &str,
+        lines: &[AffinityLine],
         tuning: &AffinityTuning,
     ) -> Result<Affinity, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         let after = Self::persist_life_choice_drop_in_tx(
-            &mut tx, session_id, choice_id, resolution, tuning,
+            &mut tx, session_id, choice_id, resolution, lines, tuning,
         )
         .await?;
         tx.commit().await?;
         Ok(after)
     }
 
-    /// Bond and chemistry each drop one tier, by the rejected-action landing
-    /// rule, and both lines' threshold-gate balances are cleared. Runs inside
-    /// the caller's transaction so the drop commits or rolls back together with
-    /// the choice's resolution; nothing here commits.
+    /// Each of `lines` drops one tier, by the rejected-action landing rule,
+    /// and its threshold-gate balance is cleared; a line not named keeps its
+    /// axes and its balance. Runs inside the caller's transaction so the drop
+    /// commits or rolls back together with the choice's resolution; nothing
+    /// here commits.
     ///
     /// Row-locked by `session_id`; time decay and the endpoint refresh run
     /// before the `state_before` snapshot, exactly as in
@@ -963,24 +965,30 @@ impl<'a> AffinityRepo<'a> {
         session_id: Uuid,
         choice_id: Uuid,
         resolution: &str,
+        lines: &[AffinityLine],
         tuning: &AffinityTuning,
     ) -> Result<Affinity, sqlx::Error> {
-        use eros_engine_core::affinity::AffinityLine;
-
-        let mut current = sqlx::query_as::<_, AffinityRow>(
+        let locked = sqlx::query_as::<_, AffinityRow>(
             "SELECT * FROM engine.companion_affinity WHERE session_id = $1 FOR UPDATE",
         )
         .bind(session_id)
         .fetch_one(&mut **tx)
-        .await?
-        .into_domain();
+        .await?;
+        let mut pending_after: PendingDeltas = locked
+            .pending_deltas
+            .as_ref()
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        let mut current = locked.into_domain();
 
         current.apply_time_decay();
         current.refresh_endpoints(tuning);
         let before = current.clone();
 
-        current.drop_line_tier(&before, AffinityLine::Bond);
-        current.drop_line_tier(&before, AffinityLine::Chemistry);
+        for line in lines {
+            current.drop_line_tier(&before, *line);
+            pending_after.clear_line(*line);
+        }
         // The endpoints follow the dropped lines at decay ≈ 1: the absence gap
         // is already in `before`, the same as after `apply_deltas` on a turn.
         current.updated_at = Utc::now();
@@ -1022,7 +1030,7 @@ impl<'a> AffinityRepo<'a> {
         .bind(current.patience_grade)
         .bind(i16::from(current.bond_tier()))
         .bind(i16::from(current.chem_tier()))
-        .bind(serde_json::to_value(PendingDeltas::default()).ok())
+        .bind(serde_json::to_value(pending_after).ok())
         .fetch_one(&mut **tx)
         .await?;
         // As in `persist_with_event`: the snapshot's `updated_at` is the value
@@ -3967,7 +3975,13 @@ mod tests {
         let choice_id = Uuid::new_v4();
 
         let after = repo
-            .persist_life_choice_drop(session, choice_id, "accept", &AffinityTuning::default())
+            .persist_life_choice_drop(
+                session,
+                choice_id,
+                "accept",
+                &[AffinityLine::Bond, AffinityLine::Chemistry],
+                &AffinityTuning::default(),
+            )
             .await
             .unwrap();
 
@@ -4044,6 +4058,80 @@ mod tests {
         assert_eq!(context["choice_id"], choice_id.to_string());
     }
 
+    /// A caller can name just one line: the other keeps its axes and its
+    /// buffer, and the drop is still the one `life_choice` event.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn life_choice_drop_can_lower_chemistry_alone(pool: PgPool) {
+        use eros_engine_core::affinity::tier_drop_target;
+        let repo = AffinityRepo { pool: &pool };
+        let (session, a) = seed_drop_relationship(&pool).await;
+        let choice_id = Uuid::new_v4();
+
+        let after = repo
+            .persist_life_choice_drop(
+                session,
+                choice_id,
+                "decline",
+                &[AffinityLine::Chemistry],
+                &AffinityTuning::default(),
+            )
+            .await
+            .unwrap();
+
+        // Chemistry one tier down; the tier-1 bond line is exactly as seeded.
+        assert!((after.chemistry_score() - tier_drop_target(0.80)).abs() < 1e-3);
+        assert_eq!(after.chem_tier(), 3);
+        assert_eq!((after.trust, after.intrigue), (0.10, 0.10));
+        assert_eq!(after.bond_tier(), 1);
+
+        // Stored: the same, and only chemistry's buffer is cleared.
+        let (trust, intrigue, bond_tier, chem_tier, pending): (
+            f64,
+            f64,
+            i16,
+            i16,
+            serde_json::Value,
+        ) = sqlx::query_as(
+            "SELECT trust, intrigue, bond_tier, chem_tier, pending_deltas \
+                 FROM engine.companion_affinity WHERE id = $1",
+        )
+        .bind(a.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((trust, intrigue), (0.10, 0.10));
+        assert_eq!((bond_tier, chem_tier), (1, 3));
+        for axis in ["trust", "intrigue"] {
+            assert_eq!(pending[axis].as_f64(), Some(0.01), "{axis}: {pending}");
+        }
+        for axis in ["intimacy", "tension"] {
+            assert_eq!(pending[axis].as_f64(), Some(0.0), "{axis}: {pending}");
+        }
+
+        let events = repo
+            .list_events(session, 10, 0, Some("life_choice"))
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        let e = &events[0];
+        let lines = e.effective_line_deltas.as_ref().expect("line deltas");
+        assert_eq!(
+            lines["bond"].as_f64(),
+            Some(0.0),
+            "the bond line did not move"
+        );
+        assert!(lines["chemistry"].as_f64().unwrap() < 0.0);
+        let context: serde_json::Value = sqlx::query_scalar(
+            "SELECT context FROM engine.companion_affinity_events WHERE id = $1",
+        )
+        .bind(e.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(context["life_choice"], "decline");
+        assert_eq!(context["choice_id"], choice_id.to_string());
+    }
+
     #[sqlx::test(migrations = "./migrations")]
     async fn life_choice_drop_is_not_a_turn_event(pool: PgPool) {
         let repo = AffinityRepo { pool: &pool };
@@ -4067,6 +4155,7 @@ mod tests {
             session,
             Uuid::new_v4(),
             "decline",
+            &[AffinityLine::Bond, AffinityLine::Chemistry],
             &AffinityTuning::default(),
         )
         .await
@@ -4102,6 +4191,7 @@ mod tests {
             session,
             Uuid::new_v4(),
             "accept",
+            &[AffinityLine::Bond, AffinityLine::Chemistry],
             &AffinityTuning::default(),
         )
         .await
@@ -4161,6 +4251,7 @@ mod tests {
                 session,
                 Uuid::new_v4(),
                 "accept",
+                &[AffinityLine::Bond, AffinityLine::Chemistry],
                 &AffinityTuning::default(),
             )
             .await
