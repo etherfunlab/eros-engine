@@ -191,7 +191,7 @@ PDE 判定的 ghost 回合从不进入 `persist_with_event`：只有 `ghost_stre
 
 ### 被拒绝的动作
 
-聊天回合可以带用户动作（见 [api-reference.zh.md](api-reference.zh.md) 的 `action` 字段）。PDE 判官在生成回复之前决定角色接不接受；没有明确拒绝时，engine 按接受处理。例外是递来角色不用的烟、酒或大麻：掷一次可能就拒收，不管判官怎么说（见[角色设置](life-events-needs.zh.md#角色设置)）。
+聊天回合可以带用户动作（见 [api-reference.zh.md](api-reference.zh.md) 的 `action` 字段）。PDE 判官在生成回复之前决定角色接不接受；没有明确拒绝时，engine 按接受处理。例外是递来角色不用的烟、酒、大麻或咖啡：掷一次可能就拒收，不管判官怎么说（见[角色设置](life-events-needs.zh.md#角色设置)）。
 
 - **接受：** 没有额外机制。affinity 判官从用户文本里看到这个动作，照常给这一轮打分。
 - **拒绝：** 动作对应的那条线（`give` 与 `gift` 动 Bond，身体动作动 Chemistry）降一档，落在下一档内的相同相对位置；第 1 档的线直接归 `0`。这条线的两个轴按同一比例缩放，比例保持不变。落点在行锁内按本轮之前的快照计算，取代判官本轮对这条线的打分；另一条线和 warmth / patience 档照判官走。这条线的 `pending_deltas` 清零，事件行的 `context.tier_drop` 记下是哪条线。affinity 判官被跳过或调用失败时照样降档。

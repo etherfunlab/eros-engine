@@ -39,7 +39,7 @@
 | `stamina` | 很累 | 精力充沛 | 很累 / 精神很好 |
 | `emotional` | 心里满足 | 很想被在乎 | 心里挺满足 / 很想被在乎 |
 | `outing` | 只想待在家里 | 想出门 | 只想待在屋里 / 想出门走走 |
-| `indulgence` | 没有这个念头 | 想放纵一下：抽根烟、喝一杯、来口大麻 | — / 很想抽根烟、很想喝一杯、很想抽口大麻或很想放纵一下（[见下](#需求出现在哪)） |
+| `indulgence` | 没有这个念头 | 对成瘾物的渴求：抽根烟、喝一杯、来口大麻、喝杯咖啡 | — / 很想抽根烟、很想喝一杯、很想抽口大麻、很想喝杯咖啡或很想放纵一下（[见下](#需求出现在哪)） |
 
 水平是有序的档位。判官从不读也不写数字，`mid` 就是不值一提的中间。
 
@@ -78,12 +78,12 @@
 | `indulgence`，没有习惯为 `true` | `mid` | 8 小时 |
 | `indulgence`，一项习惯为 `true` | `high` | 12 小时 |
 | `indulgence`，两项习惯为 `true` | `high` | 8 小时 |
-| `indulgence`，三项都为 `true` | `high` | 4 小时 |
+| `indulgence`，三项或四项习惯为 `true` | `high` | 4 小时 |
 
 离开得越久，她越饿、越想找人说话；疲惫、情感需求和想出门或想待着的念头则向中间回落。中午评成 `low` 的饥饿，16:00 读作 `mid`，
-20:00 起读作 `high`。习惯指角色的 `smoking`、`alcoholic`、`drug` 三个键（见[角色设置](#角色设置)）；`false` 和不写算作一样。
-为 `true` 的越多，判官把放纵的念头评低之后，它回来得越快。存下时没有 `outing` 和 `indulgence` 的评定，这两项都读作 `mid`。
-BYOC 角色的这三个键在她的卡片上，engine 只在一轮对话里才打开卡片：在对话之外（`GET …/effects`，以及回放时退回到推算水平的那一步），
+20:00 起读作 `high`。习惯指角色的 `smoking`、`alcoholic`、`drug`、`coffee` 四个键（见[角色设置](#角色设置)）；`false` 和不写算作一样。
+为 `true` 的越多，判官把这份渴求评低之后，它回来得越快。存下时没有 `outing` 和 `indulgence` 的评定，这两项都读作 `mid`。
+BYOC 角色的这四个键在她的卡片上，engine 只在一轮对话里才打开卡片：在对话之外（`GET …/effects`，以及回放时退回到推算水平的那一步），
 她的 `indulgence` 按没有习惯的角色漂移。常量在 `crates/eros-engine-core/src/needs.rs`。
 
 评定被推到哪个时刻，取决于谁在读：
@@ -116,7 +116,7 @@ BYOC 角色的这三个键在她的卡片上，engine 只在一轮对话里才�
   ```
 
   `indulgence` 只在 `high` 时出现。它点名一样她用的东西，每一轮从值为 `true` 的习惯键里随机挑一个：`smoking` 是很想抽根烟，
-  `alcoholic` 是很想喝一杯，`drug` 是很想抽口大麻；没有键为 `true` 时读作很想放纵一下。各项都是 `mid`（`low` 的 `indulgence` 在这里也按 `mid` 算），
+  `alcoholic` 是很想喝一杯，`drug` 是很想抽口大麻，`coffee` 是很想喝杯咖啡；没有键为 `true` 时读作很想放纵一下。各项都是 `mid`（`low` 的 `indulgence` 在这里也按 `mid` 算），
   或还没有评定，就什么都不加，prompt 保持不变。被判官评过的回合，回复按这一回合最终的水平来写：
   判官评了就用 verdict 里的，否则用判官看到的那组推算后的水平。配置了判官的部署里，规则引擎回合用推算后的水平。
 - **调用方**在 `body_state` 帧上拿到同样的水平（`needs`，对象或 `null`）。有 give 余效在起作用，或需求已知时发送，
@@ -173,7 +173,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 2. **类别。** 每个至少有一个合格种类的类别，权重是类别权重乘以角色系数。掷一次随机数，按累计权重选一个。
 3. **种类。** 该类别里每个合格种类的权重是基础权重乘以它的各项[需求系数](#1-需求给种类加权)、
    `prefer_events` 系数、[关联系数](#关联系数)，少数种类再乘一个角色系数（[`is_virgin`](#角色设置)、
-   [`homesick`](#角色设置)）。再掷一次，选一个。
+   [`homesick`](#角色设置)、[`sex_addict`](#角色设置)）。再掷一次，选一个。
 4. **时长。** 固定时长照用；区间则掷出来。
 
 没有合格种类就没有事件，响应是 `{"event": null, "message": null}`。只要有合格种类，抽取就一定得到事件。
@@ -232,7 +232,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 
 ### 角色设置
 
-角色 genome 的 `art_metadata` 里有八个键，由 engine 读取，由写角色的人填写，和 `gender`、`birthday`、
+角色 genome 的 `art_metadata` 里有十个键，由 engine 读取，由写角色的人填写，和 `gender`、`birthday`、
 `timezone` 放在一起：
 
 | 键 | 取值 | 效果 |
@@ -242,23 +242,24 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 | `prefer_trip` | `true`、`false`（默认） | `trip` 类别权重为 3 倍 |
 | `homesick` | `true`、`false`、不写（默认） | `trip` 内部：`true` 时 `hometown_visit` 3 倍、`short_trip` / `long_trip` 三分之一；`false` 时 `hometown_visit` 三分之一；`business_trip` 是工作，两种情况都不动 |
 | `is_virgin` | `true`、`false`（默认） | 她还是处女期间，`having_sex` 在 `mid` 内权重为五分之一 |
-| `smoking`、`alcoholic`、`drug` | 各为 `true`、`false`、不写（默认） | 她抽不抽烟、喝不喝酒、用不用大麻：决定 `indulgence` 回来得多快（见[漂移](#两次评定之间的漂移)）、`high` 的 `indulgence` 在回复里点名什么，以及她怎么对待递来的这样东西（见下） |
+| `sex_addict` | `true`、`false`、不写（默认） | `short` 内部：`true` 时 `sudden_desire` 3 倍，`false` 时三分之一；它的亲密度档门槛两种情况都照旧 |
+| `smoking`、`alcoholic`、`drug`、`coffee` | 各为 `true`、`false`、不写（默认） | 她抽不抽烟、喝不喝酒、用不用大麻、喝不喝咖啡：决定 `indulgence` 回来得多快（见[漂移](#两次评定之间的漂移)）、`high` 的 `indulgence` 在回复里点名什么，以及她怎么对待递来的这样东西（见下） |
 
 `prefer_trip` 管她动不动，`homesick` 管她动起来往哪去。两者都为 `true` 的空姐角色经常出行、照常出差，
 放假回家而不是去别处。
 
 抽取看到的「是否处女」是推导出来的：卡上写了 `is_virgin`，并且这个实例从来没有过 `having_sex` 事件。
 第一条 `having_sex` 行写下之后就不再是了，不需要任何写入：下一次抽取读到那一行就行。这个键不进任何
-prompt；她是什么样的人由写角色的人写进人设，和其他人设事实一样。
+prompt；她是什么样的人由写角色的人写进人设，和其他人设事实一样。`sex_addict` 同样不进任何 prompt。
 
 读取是宽松的。类型不对的值按没写处理；`prefer_events` 里不是已知 `mid` 种类的条目被丢掉，其余保留。
 `health` 缩放整个 `body` 类别，`period` 也在内，`period` 自己 28 天的冷却让它不管怎样都大约每月一次。
 `prefer_trip` 提高的是出行的概率，不是频率：每周一次的类别冷却对它同样适用。
 
-三个习惯键只通过 `indulgence` 的漂移影响抽取。判官的角色块（`[角色人格]`）不列它们，所以她不会每一轮都提烟、酒或大麻；
-希望这些习惯带进她说话的角色，要在人设里自己写明。engine 从不写这三个键。
+四个习惯键只通过 `indulgence` 的漂移影响抽取。判官的角色块（`[角色人格]`）不列它们，所以她不会每一轮都提烟、酒、大麻或咖啡；
+希望这些习惯带进她说话的角色，要在人设里自己写明。engine 从不写这四个键。
 
-**递来她不用的东西。** 一轮的动作是 `give`，递的是 `cigarette`、`alcohol` 或 `herb`，而对应的键（`smoking`、`alcoholic`、`drug`）
+**递来她不用的东西。** 一轮的动作是 `give`，递的是 `cigarette`、`alcohol`、`herb` 或 `coffee`，而对应的键（`smoking`、`alcoholic`、`drug`、`coffee`）
 为 `false` 时，engine 在判官运行之前掷一次。三次里有一次，这一轮照常进行。其余情况她这一次不收：
 
 - 判官的 `[用户动作]` 一行末尾加上 `，这次你不会收下`，判官的 `inner_state` 就按拒收来写；这一行只陈述结果，不给理由；
@@ -586,7 +587,7 @@ composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2com
 
 ## 两者如何互相影响
 
-下面的需求系数都是第二段里的系数；其余几个（[关联系数](#关联系数)、`prefer_events`、`is_virgin`、`homesick`）
+下面的需求系数都是第二段里的系数；其余几个（[关联系数](#关联系数)、`prefer_events`、`is_virgin`、`homesick`、`sex_addict`）
 都不读需求。
 
 ### 1. 需求给种类加权
@@ -786,7 +787,7 @@ ghosting 开关关闭时它不让任何轮次沉默，和任何离线时段一�
 | `[近期事件]` | 不渲染：没有判官来读它 |
 | 离线类种类 | 和有判官时一样让轮次沉默，因为这个检查在判官之前：ghosting 开关以及动作、强制出图两种例外照样适用 |
 | 提出分开 | 不变：触发读的是 affinity 评估器评过的回合，不是 PDE 判官 |
-| `smoking`、`alcoholic`、`drug` | 为 `false` 的键在 give 时照样掷，可能把它变成拒收；没有 `indulgence` 可漂移、可点名 |
+| `smoking`、`alcoholic`、`drug`、`coffee` | 为 `false` 的键在 give 时照样掷，可能把它变成拒收；没有 `indulgence` 可漂移、可点名 |
 
 ## 代码指引
 

@@ -246,7 +246,7 @@ during an offline stretch moves none of them (see
 A chat turn can carry a user action (see the `action` field in
 [api-reference.md](api-reference.md)). The PDE judge decides before the reply
 whether the persona accepts it; without a definite refusal the engine accepts,
-except for a give of tobacco, alcohol or weed her persona does not use, which a
+except for a give of tobacco, alcohol, weed or coffee her persona does not use, which a
 roll can refuse whatever the judge says
 ([persona settings](life-events-needs.md#persona-settings)).
 
