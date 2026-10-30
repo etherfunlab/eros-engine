@@ -14,10 +14,12 @@
 
 -- scanned_through_at is an exclusive cursor on chat_messages.sent_at;
 -- pending_turns counts user rows after it. claimed_at marks a scan in flight
--- so two workers do not scan one relationship.
+-- so two workers do not scan one relationship. live_from_at is the cursor the
+-- row was created with and never moves: rows up to it are the backfill's.
 CREATE TABLE engine.relationship_scan_state (
     instance_id           UUID PRIMARY KEY REFERENCES engine.persona_instances(id) ON DELETE CASCADE,
     scanned_through_at    TIMESTAMPTZ NOT NULL,
+    live_from_at          TIMESTAMPTZ NOT NULL,
     pending_turns         INT NOT NULL DEFAULT 0,
     last_turn_at          TIMESTAMPTZ,
     last_scanned_at       TIMESTAMPTZ,

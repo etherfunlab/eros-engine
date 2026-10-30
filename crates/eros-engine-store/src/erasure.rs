@@ -389,8 +389,9 @@ mod tests {
         "INSERT INTO engine.companion_affinity_events (affinity_id, event_type, context) \
          SELECT (SELECT id FROM engine.companion_affinity WHERE session_id = p.s), 'message', \
                 '{\"said\":\"x\"}'",
-        "INSERT INTO engine.relationship_scan_state (instance_id, scanned_through_at) \
-         SELECT p.i, '2026-10-01T00:00:00Z'",
+        "INSERT INTO engine.relationship_scan_state \
+             (instance_id, scanned_through_at, live_from_at) \
+         SELECT p.i, '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z'",
         "INSERT INTO engine.relationship_episodes (instance_id, summary, started_at, ended_at) \
          SELECT p.i, 'a stretch', '2026-10-01T00:00:00Z', '2026-10-02T00:00:00Z'",
         "INSERT INTO engine.relationship_arcs (instance_id, opening, arc, folded_through) \

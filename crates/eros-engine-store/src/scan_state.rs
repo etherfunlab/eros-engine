@@ -24,6 +24,9 @@ pub struct ScanState {
     pub instance_id: Uuid,
     /// Exclusive cursor on `chat_messages.sent_at`.
     pub scanned_through_at: DateTime<Utc>,
+    /// The cursor the row was created with; it never moves. Rows up to it are
+    /// the backfill's, rows after it live scanning's.
+    pub live_from_at: DateTime<Utc>,
     /// User rows after the cursor.
     pub pending_turns: i32,
     pub last_turn_at: Option<DateTime<Utc>>,
@@ -38,14 +41,15 @@ pub struct ScanState {
     pub backfilled_through_at: Option<DateTime<Utc>>,
 }
 
-const COLUMNS: &str = "instance_id, scanned_through_at, pending_turns, last_turn_at, \
+const COLUMNS: &str =
+    "instance_id, scanned_through_at, live_from_at, pending_turns, last_turn_at, \
                        last_scanned_at, scan_failures, claimed_at, user_timezone, \
                        episodes_since_arc, arc_failures, backfilled_through_at";
 
 /// The rows a scan reads (live text and voice sessions, voice only while `$1`,
 /// user and assistant rows) that the backfill has not covered: after
-/// `backfilled_through_at`, up to the live cursor. A relationship without a
-/// state row has its whole history here.
+/// `backfilled_through_at`, up to `live_from_at`, where live scanning took
+/// over. A relationship without a state row has its whole history here.
 const BACKFILL_ROWS: &str = "FROM engine.chat_messages m \
      JOIN engine.chat_sessions s ON s.id = m.session_id \
      LEFT JOIN engine.relationship_scan_state st ON st.instance_id = s.instance_id \
@@ -54,7 +58,7 @@ const BACKFILL_ROWS: &str = "FROM engine.chat_messages m \
        AND m.role IN ('user', 'assistant') \
        AND (m.channel IS NULL OR m.channel = 'voice') \
        AND m.sent_at > COALESCE(st.backfilled_through_at, '-infinity') \
-       AND m.sent_at <= COALESCE(st.scanned_through_at, 'infinity')";
+       AND m.sent_at <= COALESCE(st.live_from_at, 'infinity')";
 
 /// One row of a backfill window: what the backfill needs to cut segments and
 /// decide whether a segment's profile memories are still unextracted.
@@ -93,13 +97,14 @@ impl ScanStateRepo<'_> {
     ) -> Result<Bumped, sqlx::Error> {
         let (pending_turns, created): (i32, bool) = sqlx::query_as(
             "INSERT INTO engine.relationship_scan_state \
-                 (instance_id, scanned_through_at, pending_turns, last_turn_at, user_timezone) \
-             VALUES ($1, \
-                 COALESCE((SELECT max(m.sent_at) FROM engine.chat_messages m \
-                           JOIN engine.chat_sessions s ON s.id = m.session_id \
-                           WHERE s.instance_id = $1 AND m.sent_at < $2::timestamptz), \
-                          $2::timestamptz - interval '1 microsecond'), \
-                 1, now(), $3::text) \
+                 (instance_id, scanned_through_at, live_from_at, pending_turns, last_turn_at, \
+                  user_timezone) \
+             SELECT $1, c.at, c.at, 1, now(), $3::text \
+             FROM (SELECT COALESCE( \
+                       (SELECT max(m.sent_at) FROM engine.chat_messages m \
+                        JOIN engine.chat_sessions s ON s.id = m.session_id \
+                        WHERE s.instance_id = $1 AND m.sent_at < $2::timestamptz), \
+                       $2::timestamptz - interval '1 microsecond') AS at) c \
              ON CONFLICT (instance_id) DO UPDATE SET \
                 pending_turns = relationship_scan_state.pending_turns + 1, \
                 last_turn_at  = now(), \
@@ -364,8 +369,9 @@ impl ScanStateRepo<'_> {
     /// relationship has no rows.
     pub async fn ensure_for_backfill(&self, instance_id: Uuid) -> Result<bool, sqlx::Error> {
         let created: Option<Uuid> = sqlx::query_scalar(
-            "INSERT INTO engine.relationship_scan_state (instance_id, scanned_through_at) \
-             SELECT $1, max(m.sent_at) FROM engine.chat_messages m \
+            "INSERT INTO engine.relationship_scan_state \
+                 (instance_id, scanned_through_at, live_from_at) \
+             SELECT $1, max(m.sent_at), max(m.sent_at) FROM engine.chat_messages m \
              JOIN engine.chat_sessions s ON s.id = m.session_id \
              WHERE s.instance_id = $1 AND NOT s.archived \
                AND s.channel IN ('text', 'voice') \
@@ -426,21 +432,24 @@ impl ScanStateRepo<'_> {
         .await
     }
 
-    /// Record how far the backfill has read.
+    /// Record how far the backfill has read. Only the claim holder settles:
+    /// `false` when the row is gone or its claim was released, in which case
+    /// nothing changed.
     pub async fn set_backfilled_through(
         &self,
         instance_id: Uuid,
         at: DateTime<Utc>,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
+    ) -> Result<bool, sqlx::Error> {
+        let set: Option<Uuid> = sqlx::query_scalar(
             "UPDATE engine.relationship_scan_state SET backfilled_through_at = $2 \
-             WHERE instance_id = $1",
+             WHERE instance_id = $1 AND claimed_at IS NOT NULL \
+             RETURNING instance_id",
         )
         .bind(instance_id)
         .bind(at)
-        .execute(self.pool)
+        .fetch_optional(self.pool)
         .await?;
-        Ok(())
+        Ok(set.is_some())
     }
 }
 
@@ -515,6 +524,10 @@ mod tests {
         );
         let s = repo.load(instance).await.unwrap().expect("row exists");
         assert_eq!(s.scanned_through_at, t0);
+        assert_eq!(
+            s.live_from_at, t0,
+            "live scanning starts at the first cursor"
+        );
         assert_eq!(s.pending_turns, 1);
         assert!(s.last_turn_at.is_some());
         assert_eq!((s.scan_failures, s.claimed_at), (0, None));
@@ -534,6 +547,7 @@ mod tests {
             s.scanned_through_at, t0,
             "only the first bump places the cursor"
         );
+        assert_eq!(s.live_from_at, t0);
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -908,9 +922,26 @@ mod tests {
         let (instance, _) = seed_relationship(&pool).await;
         repo.bump(instance, at(1_000), None).await.unwrap();
 
-        repo.set_backfilled_through(instance, at(500))
+        assert!(
+            !repo
+                .set_backfilled_through(instance, at(500))
+                .await
+                .unwrap(),
+            "only the claim holder settles"
+        );
+        assert_eq!(
+            repo.load(instance)
+                .await
+                .unwrap()
+                .unwrap()
+                .backfilled_through_at,
+            None
+        );
+        assert!(repo.claim_for_backfill(instance, TEN_MIN).await.unwrap());
+        assert!(repo
+            .set_backfilled_through(instance, at(500))
             .await
-            .unwrap();
+            .unwrap());
         let s = repo.load(instance).await.unwrap().unwrap();
         assert_eq!(s.backfilled_through_at, Some(at(500)));
     }
@@ -1005,6 +1036,7 @@ mod tests {
             at(2_000),
             "archived and product Q&A rows are not history"
         );
+        assert_eq!(s.live_from_at, at(2_000));
         assert_eq!((s.pending_turns, s.last_turn_at), (0, None));
         assert_eq!(s.backfilled_through_at, None);
 
@@ -1046,9 +1078,14 @@ mod tests {
             seed_row(&pool, session, role, at(t * 1_000)).await;
         }
         repo.bump(started, at(5_000), None).await.unwrap();
-        repo.set_backfilled_through(started, at(1_000))
+        assert!(repo.claim_for_backfill(started, TEN_MIN).await.unwrap());
+        assert!(repo
+            .set_backfilled_through(started, at(1_000))
             .await
-            .unwrap();
+            .unwrap());
+        // A live scan has since read past the sixth row: that progress is not
+        // the backfill's window.
+        assert!(repo.finish_scan_ok(started, at(6_000), 1).await.unwrap());
         // One row: under the floor.
         let (short, short_session) = seed_relationship(&pool).await;
         seed_row(&pool, short_session, "user", at(1_000)).await;

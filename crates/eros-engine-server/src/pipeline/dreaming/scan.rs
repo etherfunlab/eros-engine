@@ -150,15 +150,13 @@ pub(crate) async fn scan_segment(
     // every tick. Rows that land later are still read: the cursor, not the
     // count, decides what a scan covers.
     let (Some(first), Some(last)) = (rows.first(), rows.last()) else {
-        settle_empty(&scan, st, seg, seg.bound).await;
-        return ScanOutcome::Empty;
+        return settle_empty(&scan, st, seg, seg.bound).await;
     };
     let covered = rows.iter().filter(|r| r.role == "user").count() as i32;
     let lines = render_transcript(&rows, tz);
     if lines.is_empty() {
         // Nothing left to read once audio tags are stripped: no call to spend.
-        settle_empty(&scan, st, seg, last.sent_at).await;
-        return ScanOutcome::Empty;
+        return settle_empty(&scan, st, seg, last.sent_at).await;
     }
 
     let Some(resolved) = state.model_config.resolve_dreaming_scan() else {
@@ -236,7 +234,7 @@ pub(crate) async fn scan_segment(
     // checked (and its clock restarted) before anything is written.
     match scan.refresh_claim(instance_id).await {
         Ok(true) => {}
-        Ok(false) => return discard(pool, event, "claim gone before the writes").await,
+        Ok(false) => return discard(pool, event, seg.mode, "claim gone before the writes").await,
         Err(e) => {
             // Left to go stale: the segment is read again.
             tracing::warn!(%instance_id, "dreaming scan: claim check failed: {e}");
@@ -267,7 +265,9 @@ pub(crate) async fn scan_segment(
         };
         match (EpisodeRepo { pool }).insert_if_claimed(&episode).await {
             Ok(Some(_)) => event.episode_written = true,
-            Ok(None) => return discard(pool, event, "claim gone before the episode write").await,
+            Ok(None) => {
+                return discard(pool, event, seg.mode, "claim gone before the episode write").await
+            }
             Err(e) => tracing::warn!(%instance_id, "dreaming scan: episode write failed: {e}"),
         }
     }
@@ -289,13 +289,13 @@ pub(crate) async fn scan_segment(
         scan.finish_scan_ok(instance_id, last.sent_at, covered)
             .await
     } else {
-        scan.set_backfilled_through(instance_id, last.sent_at)
-            .await
-            .map(|()| true)
+        scan.set_backfilled_through(instance_id, last.sent_at).await
     };
     match settled {
         Ok(true) => {}
-        Ok(false) => return discard(pool, event, "claim gone before the cursor moved").await,
+        Ok(false) => {
+            return discard(pool, event, seg.mode, "claim gone before the cursor moved").await
+        }
         Err(e) => {
             // The claim goes stale and the segment is read again.
             tracing::warn!(%instance_id, "dreaming scan: cursor write failed: {e}");
@@ -502,8 +502,15 @@ async fn record_scan_event(pool: &sqlx::PgPool, event: ScanEventInsert) {
 }
 
 /// A scan whose claim went away after the call: whatever was not yet written
-/// is dropped, and the paid call still leaves an `empty` row.
-async fn discard(pool: &sqlx::PgPool, event: ScanEventInsert, why: &str) -> ScanOutcome {
+/// is dropped, and the paid call still leaves an `empty` row. A live scan has
+/// nothing left to do (`Empty`); a backfill segment reports `Failed`, so its
+/// run stops there and the next run reads the segment again.
+async fn discard(
+    pool: &sqlx::PgPool,
+    event: ScanEventInsert,
+    mode: ScanMode,
+    why: &str,
+) -> ScanOutcome {
     tracing::info!(instance_id = ?event.instance_id, "dreaming scan: {why}, scan discarded");
     record_scan_event(
         pool,
@@ -513,7 +520,10 @@ async fn discard(pool: &sqlx::PgPool, event: ScanEventInsert, why: &str) -> Scan
         },
     )
     .await;
-    ScanOutcome::Empty
+    match mode {
+        ScanMode::Live => ScanOutcome::Empty,
+        ScanMode::Backfill { .. } => ScanOutcome::Failed,
+    }
 }
 
 #[derive(Deserialize)]
@@ -602,24 +612,38 @@ fn state_tz(st: &ScanState) -> Tz {
 }
 
 /// Settle a segment that needed no call through `through`: a live scan clears
-/// the whole pending count (a lost claim leaves nothing to settle), a backfill
-/// moves its own mark.
+/// the whole pending count (a lost claim leaves nothing to settle) and reports
+/// `Empty`; a backfill moves its own mark and reports `Failed` when it could
+/// not, so its run stops before skipping past the segment.
 async fn settle_empty(
     scan: &ScanStateRepo<'_>,
     st: &ScanState,
     seg: SegmentPlan,
     through: DateTime<Utc>,
-) {
+) -> ScanOutcome {
     let instance_id = st.instance_id;
-    let settled = match seg.mode {
-        ScanMode::Live => scan
-            .finish_scan_ok(instance_id, through, st.pending_turns)
+    let live = seg.mode == ScanMode::Live;
+    let settled = if live {
+        scan.finish_scan_ok(instance_id, through, st.pending_turns)
             .await
-            .map(drop),
-        ScanMode::Backfill { .. } => scan.set_backfilled_through(instance_id, through).await,
+            .map(|_| true)
+    } else {
+        scan.set_backfilled_through(instance_id, through).await
     };
-    if let Err(e) = settled {
-        tracing::warn!(%instance_id, "dreaming scan: cursor write failed: {e}");
+    match settled {
+        Ok(moved) if moved || live => ScanOutcome::Empty,
+        Ok(_) => {
+            tracing::info!(%instance_id, "backfill: claim gone before the mark moved");
+            ScanOutcome::Failed
+        }
+        Err(e) => {
+            tracing::warn!(%instance_id, "dreaming scan: cursor write failed: {e}");
+            if live {
+                ScanOutcome::Empty
+            } else {
+                ScanOutcome::Failed
+            }
+        }
     }
 }
 
@@ -880,7 +904,7 @@ pub(crate) mod tests {
 
     /// Return once `llm` has seen a request; fails when `job` ends first or
     /// ten seconds pass without one.
-    async fn wait_for_call<T>(llm: &MockServer, job: &tokio::task::JoinHandle<T>) {
+    pub(crate) async fn wait_for_call<T>(llm: &MockServer, job: &tokio::task::JoinHandle<T>) {
         for waited in 0.. {
             if !llm.received_requests().await.unwrap().is_empty() {
                 return;

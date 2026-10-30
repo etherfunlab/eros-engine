@@ -445,8 +445,9 @@ mod tests {
     /// One row in each Memory 2.0 table for `instance_id`.
     async fn seed_relationship_memory(pool: &PgPool, instance_id: Uuid) {
         for sql in [
-            "INSERT INTO engine.relationship_scan_state (instance_id, scanned_through_at) \
-             VALUES ($1, '2026-10-01T00:00:00Z')",
+            "INSERT INTO engine.relationship_scan_state \
+                 (instance_id, scanned_through_at, live_from_at) \
+             VALUES ($1, '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z')",
             "INSERT INTO engine.relationship_episodes (instance_id, summary, started_at, ended_at) \
              VALUES ($1, 'a stretch', '2026-10-01T00:00:00Z', '2026-10-02T00:00:00Z')",
             "INSERT INTO engine.relationship_arcs (instance_id, opening, arc, folded_through) \

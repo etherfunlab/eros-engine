@@ -30,7 +30,8 @@ pub(crate) const USAGE: &str =
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BackfillArgs {
     pub(crate) dry_run: bool,
-    /// Relationships with fewer rows left are passed over.
+    /// Relationships with fewer rows left are passed over; 20 by default, 1
+    /// with `--instance`.
     pub(crate) min_rows: i64,
     /// At most this many relationships, most history first.
     pub(crate) limit: Option<i64>,
@@ -41,30 +42,31 @@ pub(crate) struct BackfillArgs {
 impl BackfillArgs {
     /// The flags after the subcommand; `Err` names the one refused.
     pub(crate) fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
-        let mut out = BackfillArgs {
-            dry_run: false,
-            min_rows: 20,
-            limit: None,
-            instance: None,
-        };
+        let (mut dry_run, mut min_rows, mut limit, mut instance) = (false, None, None, None);
         let mut args = args.into_iter();
         while let Some(flag) = args.next() {
             let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
             match flag.as_str() {
-                "--dry-run" => out.dry_run = true,
-                "--min-rows" => out.min_rows = parse_count(&flag, &value()?)?,
-                "--limit" => out.limit = Some(parse_count(&flag, &value()?)?),
+                "--dry-run" => dry_run = true,
+                "--min-rows" => min_rows = Some(parse_count(&flag, &value()?)?),
+                "--limit" => limit = Some(parse_count(&flag, &value()?)?),
                 "--instance" => {
                     let v = value()?;
                     let id = v
                         .parse()
                         .map_err(|_| format!("--instance: not a UUID: {v}"))?;
-                    out.instance = Some(id);
+                    instance = Some(id);
                 }
                 _ => return Err(format!("unknown flag: {flag}")),
             }
         }
-        Ok(out)
+        Ok(BackfillArgs {
+            dry_run,
+            // A relationship named on its own is backfilled however short.
+            min_rows: min_rows.unwrap_or(if instance.is_some() { 1 } else { 20 }),
+            limit,
+            instance,
+        })
     }
 }
 
@@ -308,14 +310,16 @@ async fn open_state(state: &AppState, instance_id: Uuid) -> Result<Option<ScanSt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::dreaming::scan::scan_instance;
     use crate::pipeline::dreaming::scan::tests::{
-        answer, completion, count, events, request_bodies, state_with, SCAN_MODEL,
+        answer, completion, count, events, request_bodies, state_with, wait_for_call, SCAN_MODEL,
     };
     use crate::routes::companion::testutil::seed_persona_instance;
     use chrono::{DateTime, Utc};
     use eros_engine_store::scan_state::{BackfillRow, ScanStateRepo};
     use serde_json::json;
     use sqlx::PgPool;
+    use std::time::Duration;
     use uuid::Uuid;
     use wiremock::matchers::{any, body_partial_json, method, path as wm_path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -714,6 +718,121 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn backfill_window_ignores_live_progress(pool: PgPool) {
+        let (_, instance, session) = seed_rel(&pool).await;
+        // Thirty rows of history, then two turns after the upgrade that a
+        // live scan reads before the backfill runs.
+        seed_rows(&pool, session, 0, 34).await;
+        let repo = ScanStateRepo { pool: &pool };
+        repo.bump(instance, minute(30), None).await.unwrap();
+        repo.bump(instance, minute(32), None).await.unwrap();
+        let llm = MockServer::start().await;
+        answer(&llm, SCAN_MODEL, "gen-scan", &scan_reply()).await;
+        let (state, _embed) = state_with(pool.clone(), &llm, "").await;
+        assert!(repo
+            .claim(instance, Duration::from_secs(600))
+            .await
+            .unwrap());
+        assert_eq!(
+            scan_instance(&state, instance, minute(33)).await,
+            ScanOutcome::Ok
+        );
+        let s = repo.load(instance).await.unwrap().unwrap();
+        assert_eq!(
+            (s.scanned_through_at, s.live_from_at),
+            (minute(33), minute(29))
+        );
+
+        let plans = plan(&state.pool, &args(false), true).await.unwrap();
+        assert_eq!(
+            (plans[0].rows, plans[0].segments),
+            (30, 1),
+            "the live-scanned turns are not counted"
+        );
+        assert_eq!(
+            run(&state, &plans).await,
+            Tally {
+                ok: 1,
+                ..Default::default()
+            }
+        );
+        let bodies = request_bodies(&llm).await;
+        assert_eq!(bodies.len(), 2, "one live scan, one backfill segment");
+        assert!(
+            bodies[1].contains("<29>") && !bodies[1].contains("<30>"),
+            "{}",
+            bodies[1]
+        );
+        let ended: Vec<DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT ended_at FROM engine.relationship_episodes \
+             WHERE instance_id = $1 ORDER BY ended_at",
+        )
+        .bind(instance)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            ended,
+            [minute(29), minute(33)],
+            "no live turn gets a second episode"
+        );
+        assert_eq!(backfilled_through(&pool, instance).await, Some(minute(29)));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn backfill_segment_fails_when_its_claim_goes(pool: PgPool) {
+        let (_, instance, session) = seed_rel(&pool).await;
+        seed_rows(&pool, session, 0, 70).await;
+        let llm = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                completion(SCAN_MODEL, "gen-scan", &scan_reply())
+                    .set_delay(Duration::from_millis(600)),
+            )
+            .mount(&llm)
+            .await;
+        let (state, _embed) = state_with(pool.clone(), &llm, "").await;
+        let plans = plan(&state.pool, &args(false), true).await.unwrap();
+        assert_eq!(plans[0].segments, 2);
+
+        let job = tokio::spawn({
+            let state = state.clone();
+            async move { run(&state, &plans).await }
+        });
+        // The claim goes while the first segment's call is out.
+        wait_for_call(&llm, &job).await;
+        ScanStateRepo { pool: &pool }
+            .release_claim(instance)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            job.await.unwrap(),
+            Tally {
+                failed: 1,
+                ..Default::default()
+            },
+            "the run stops at the segment it lost"
+        );
+        assert_eq!(
+            request_bodies(&llm).await.len(),
+            1,
+            "the rest waits for the next run"
+        );
+        assert_eq!(backfilled_through(&pool, instance).await, None);
+        assert_eq!(count(&pool, "relationship_episodes", instance).await, 0);
+        let evs = events(&pool, instance).await;
+        assert_eq!(
+            evs.iter()
+                .map(|e| (e.0.as_str(), e.1.as_str()))
+                .collect::<Vec<_>>(),
+            [("backfill", "empty")],
+            "the paid call still leaves a row"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn ensure_for_backfill_writes_first_meet_once(pool: PgPool) {
         let (_, instance, session) = seed_rel(&pool).await;
         seed_rows(&pool, session, 0, 30).await;
@@ -744,6 +863,15 @@ mod tests {
         let parse = |a: &[&str]| BackfillArgs::parse(a.iter().map(|s| s.to_string()));
         assert_eq!(parse(&[]), Ok(args(false)));
         let id = Uuid::new_v4();
+        assert_eq!(
+            parse(&["--instance", &id.to_string()]),
+            Ok(BackfillArgs {
+                min_rows: 1,
+                instance: Some(id),
+                ..args(false)
+            }),
+            "one named relationship needs no floor"
+        );
         assert_eq!(
             parse(&[
                 "--dry-run",
