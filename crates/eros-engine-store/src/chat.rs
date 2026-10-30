@@ -1548,8 +1548,8 @@ impl<'a> ChatRepo<'a> {
     /// carries both (`metadata.memory_scope`, `metadata.affinity_scope`); `None`
     /// when there is none or either fails to parse. The persona's own
     /// life-choice rows (`metadata.proactive = 'life_choice'`) are skipped:
-    /// they run on the engine's default scopes, so they say nothing about what
-    /// the caller allows (spec 2026-10-30 §4.1). Other proactive rows carry the
+    /// they are not a turn of the caller's, so they say nothing about the
+    /// caller's scopes (spec 2026-10-30 §4.1). Other proactive rows carry the
     /// caller's request scopes and stay eligible.
     pub async fn latest_scopes(
         &self,
@@ -5957,8 +5957,8 @@ mod tests {
             Some((MemoryScope::Full, AffinityScope::chemistry()))
         );
 
-        // The persona's own life-choice rows run on the engine's default
-        // scopes, not the caller's; they never stand in for the caller.
+        // The persona's own life-choice rows are her choice rows, not a caller
+        // turn; they never stand in for the caller.
         put(
             "assistant",
             20,
