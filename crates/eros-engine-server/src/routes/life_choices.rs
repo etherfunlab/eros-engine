@@ -21,7 +21,8 @@ use eros_engine_core::scope::MemoryScope;
 use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::{ChatMessage, ChatRepo};
 use eros_engine_store::events::{EventRepo, NewEvent};
-use eros_engine_store::life_choices::LifeChoiceRepo;
+use eros_engine_store::life_choices::{LifeChoiceRecord, LifeChoiceRepo};
+use std::collections::HashMap;
 
 use crate::auth::middleware::AuthUser;
 use crate::error::{AppError, StreamPreError};
@@ -92,6 +93,47 @@ pub struct LifeChoiceRespondResponse {
     pub affinity: AffinitySnapshot,
     /// The separation an accept started; `null` after a decline.
     pub event: Option<EventView>,
+}
+
+/// The choice a proactive row asked and how it stands (spec 2026-10-30 §3),
+/// carried on her ask row in both history routes so any client can draw the
+/// user's answer between her ask and her reply.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct LifeChoiceReceiptDto {
+    pub id: Uuid,
+    /// `ask_for_space`.
+    pub kind: String,
+    /// `pending`, `accepted`, `declined`, `ignored`, or `expired` for a
+    /// `pending` choice past its 24 hours.
+    pub status: String,
+    /// `null` unless the choice was answered, converted or lapsed into a
+    /// stored resolution.
+    pub resolved_at: Option<DateTime<Utc>>,
+}
+
+impl LifeChoiceReceiptDto {
+    fn at(c: &LifeChoiceRecord, now: DateTime<Utc>) -> Self {
+        Self {
+            id: c.id,
+            kind: c.kind.clone(),
+            status: c.status_at(now).to_owned(),
+            resolved_at: c.resolved_at,
+        }
+    }
+}
+
+/// `message_id → receipt` for the rows of one history page: one lookup.
+pub(crate) async fn receipts_for(
+    pool: &sqlx::PgPool,
+    message_ids: &[Uuid],
+    now: DateTime<Utc>,
+) -> Result<HashMap<Uuid, LifeChoiceReceiptDto>, sqlx::Error> {
+    Ok((LifeChoiceRepo { pool })
+        .by_message_ids(message_ids)
+        .await?
+        .iter()
+        .filter_map(|c| Some((c.message_id?, LifeChoiceReceiptDto::at(c, now))))
+        .collect())
 }
 
 fn not_found() -> AppError {

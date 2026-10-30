@@ -173,6 +173,11 @@ pub struct ChatHistoryEntry {
     /// same field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub occasion: Option<crate::routes::session_open::GreetingOccasion>,
+    /// The choice her ask row put to the user and how it stands — set on
+    /// that one row, omitted on every other (same key-presence contract as
+    /// `occasion`). The BFF history entry carries the same field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub life_choice: Option<crate::routes::life_choices::LifeChoiceReceiptDto>,
     /// The member session that spoke this line (group sessions only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speaker_session_id: Option<Uuid>,
@@ -784,11 +789,15 @@ async fn get_history(
 
     let chat_repo = ChatRepo { pool: &state.pool };
     let rows = chat_repo.history(session_id, limit, offset).await?;
+    let ids: Vec<Uuid> = rows.iter().map(|m| m.id).collect();
+    let mut receipts =
+        crate::routes::life_choices::receipts_for(&state.pool, &ids, chrono::Utc::now()).await?;
 
     let entries: Vec<ChatHistoryEntry> = rows
         .into_iter()
         .map(|m| ChatHistoryEntry {
             id: m.id,
+            life_choice: receipts.remove(&m.id),
             user_message_id: m.user_message_id,
             image: m.metadata.as_ref().and_then(|md| md.get("image")).is_some(),
             reply_to_message_id: m
@@ -2737,6 +2746,138 @@ mod tests {
             None,
             "a name this build does not know is left out, never sent as null"
         );
+    }
+
+    /// A proactive `life_choice` row and its choice in `status`, asked
+    /// `asked_ago` ago; returns (message id, choice id).
+    async fn seed_ask(
+        pool: &PgPool,
+        session_id: Uuid,
+        content: &str,
+        status: Option<&str>,
+        asked_ago: &str,
+    ) -> (Uuid, Option<Uuid>) {
+        let message_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, assistant_action_type, \
+                                               metadata, sent_at) \
+             VALUES ($1, 'assistant', $2, 'proactive', '{\"proactive\":\"life_choice\"}', \
+                     now() - $3::interval) RETURNING id",
+        )
+        .bind(session_id)
+        .bind(content)
+        .bind(asked_ago)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let choice_id = match status {
+            Some(status) => Some(
+                sqlx::query_scalar(
+                    "INSERT INTO engine.life_choices \
+                       (session_id, kind, status, tier_gap, asked_at, resolved_at, message_id) \
+                     VALUES ($1, 'ask_for_space', $2, 3, now() - $3::interval, \
+                             CASE WHEN $2 = 'pending' THEN NULL \
+                                  ELSE now() - $3::interval + interval '1 minute' END, $4) \
+                     RETURNING id",
+                )
+                .bind(session_id)
+                .bind(status)
+                .bind(asked_ago)
+                .bind(message_id)
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+            ),
+            None => None,
+        };
+        (message_id, choice_id)
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn history_carries_the_receipt_on_her_ask_row(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Nova").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+             VALUES ($1, 'user', 'hey', now() - interval '3 hours')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let (_, a) = seed_ask(&pool, session_id, "A", Some("accepted"), "2 hours").await;
+        let (_, _) = seed_ask(&pool, session_id, "B", Some("pending"), "25 hours").await;
+        let (_, _) = seed_ask(&pool, session_id, "C", None, "1 hour").await;
+        let jwt = mint_test_jwt(user_id);
+        let mut router = build_router(test_state(pool.clone()));
+
+        let (status, body) = send_request(
+            &mut router,
+            Request::builder()
+                .uri(format!("/comp/chat/{session_id}/history"))
+                .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let row = |content: &str| {
+            body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["content"] == content)
+                .unwrap_or_else(|| panic!("no row {content}: {body}"))
+                .clone()
+        };
+        let a_receipt = &row("A")["life_choice"];
+        assert_eq!(a_receipt["id"], json!(a.unwrap().to_string()));
+        assert_eq!(a_receipt["kind"], json!("ask_for_space"));
+        assert_eq!(a_receipt["status"], json!("accepted"));
+        assert!(a_receipt["resolved_at"].is_string(), "{a_receipt}");
+        let b_receipt = &row("B")["life_choice"];
+        assert_eq!(b_receipt["status"], json!("expired"));
+        assert!(b_receipt["resolved_at"].is_null(), "{b_receipt}");
+        assert!(row("C").get("life_choice").is_none(), "no choice, no key");
+        assert!(
+            row("hey").get("life_choice").is_none(),
+            "a user row has none"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_choice_whose_message_is_gone_annotates_nothing(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Nova").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        seed_ask(&pool, session_id, "ask", None, "1 hour").await;
+        sqlx::query(
+            "INSERT INTO engine.life_choices (session_id, kind, status, tier_gap, asked_at) \
+             VALUES ($1, 'ask_for_space', 'declined', 3, now())",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let jwt = mint_test_jwt(user_id);
+        let mut router = build_router(test_state(pool.clone()));
+        let (status, body) = send_request(
+            &mut router,
+            Request::builder()
+                .uri(format!("/comp/chat/{session_id}/history"))
+                .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m.get("life_choice").is_none()));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

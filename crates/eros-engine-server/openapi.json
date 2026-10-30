@@ -3764,6 +3764,17 @@
             "type": "boolean",
             "description": "Present (always `true`) only on assistant rows whose turn delegated an\nimage to the consumer (`metadata.image` marker recorded) — key-presence\ncontract like `read_at`. Recover the payload via\n`GET /comp/chat/{session_id}/messages/{message_id}/image-request`; a 404\nthere on a flagged row means the composed prompt was never recorded\n(fail-open audit) — genuinely unrecoverable. Spec:\ndocs/superpowers/specs/2026-08-21-image-turn-discovery-design.md."
           },
+          "life_choice": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LifeChoiceReceiptDto",
+                "description": "The choice her ask row put to the user and how it stands — set on\nthat one row, omitted on every other (same key-presence contract as\n`occasion`)."
+              }
+            ]
+          },
           "occasion": {
             "oneOf": [
               {
@@ -4387,6 +4398,17 @@
           "image": {
             "type": "boolean",
             "description": "Present (always `true`) only on assistant rows whose turn delegated an\nimage to the consumer (`metadata.image` marker recorded) — key-presence\ncontract like `read_at`. Recover the payload via the `image-request`\nendpoint; a 404 there on a flagged row means the composed prompt was\nnever recorded (fail-open audit) — genuinely unrecoverable."
+          },
+          "life_choice": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LifeChoiceReceiptDto",
+                "description": "The choice her ask row put to the user and how it stands — set on\nthat one row, omitted on every other (same key-presence contract as\n`occasion`). The BFF history entry carries the same field."
+              }
+            ]
           },
           "occasion": {
             "oneOf": [
@@ -6130,6 +6152,37 @@
               "type": "string"
             },
             "description": "The answers the resolution endpoint takes: `[\"accept\", \"decline\"]`."
+          }
+        }
+      },
+      "LifeChoiceReceiptDto": {
+        "type": "object",
+        "description": "The choice a proactive row asked and how it stands (spec 2026-10-30 §3),\ncarried on her ask row in both history routes so any client can draw the\nuser's answer between her ask and her reply.",
+        "required": [
+          "id",
+          "kind",
+          "status"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "kind": {
+            "type": "string",
+            "description": "`ask_for_space`."
+          },
+          "resolved_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "`null` unless the choice was answered, converted or lapsed into a\nstored resolution."
+          },
+          "status": {
+            "type": "string",
+            "description": "`pending`, `accepted`, `declined`, `ignored`, or `expired` for a\n`pending` choice past its 24 hours."
           }
         }
       },
