@@ -570,6 +570,14 @@ mod tests {
         assert!(settled(session, LifeChoiceKind::SleepTogether)
             .await
             .unwrap());
+        assert!(
+            !settled(session, LifeChoiceKind::Propose).await.unwrap(),
+            "an ignored sleep_together does not settle propose"
+        );
+        assert!(
+            !settled(session, LifeChoiceKind::AskForSpace).await.unwrap(),
+            "nor ask_for_space"
+        );
 
         seed_choice(&pool, session, LifeChoiceKind::Propose, "accepted").await;
         assert!(settled(session, LifeChoiceKind::Propose).await.unwrap());
