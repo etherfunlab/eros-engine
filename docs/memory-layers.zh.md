@@ -156,7 +156,7 @@ Dreaming 就是关系扫描，`pipeline::dreaming`。它为每段关系保留一
 - **画像层。** 基础画像 bullets 来自 `human_insights`（[insights.zh.md](insights.zh.md#读取方)）；`memory_scope` 决定是否带上私密字段（`full` / `insights_only`）还是只带中性子集（`neutral_*`）。与之并列，画像层的 `companion_memories` 行按相似度召回、按 `category` 分组，但仅当 scope 保留画像记忆时才会跑（`full` / `neutral_and_relationship`）。`relationship_only`、`neutral_only`、`insights_only` 和 `none` 跳过这一半，只剩 scope 仍允许的 bullets。
 - **关系层。** 按与当前轮的相似度召回的关系层 `companion_memories` 行；在 1:1 prompt 上再加这段关系的弧线、最近的片段、最相近的纪事和纪念日行。这些都要求 scope 保留关系记忆（`full` / `neutral_and_relationship` / `relationship_only`）。
 
-`memory_scope = none` 完全跳过记忆注入。**`memory_scope` 只管 prompt，不管写入：**即使是 `none`，逐轮原文写入照样存下这一轮，这一轮照样计入 dreaming，insight 抽取和好感度评估也照常跑。`/comp/user/{user_id}/profile` 端点返回 `human_insights` 行，作为已收集内容的可读视图。
+`memory_scope = none` 完全跳过记忆注入。**`memory_scope` 只管 prompt，不管记忆写入：**即使是 `none`，逐轮原文写入照样存下这一轮，这一轮照样计入 dreaming，insight 抽取和好感度评估也照常跑。`/comp/user/{user_id}/profile` 端点返回 `human_insights` 行，作为已收集内容的可读视图。一轮记录下来的 scope 还决定这一对能不能被问到浪漫生活选择（见 [life-events-needs.zh.md](life-events-needs.zh.md#浪漫选择)）。
 
 ### 召回
 

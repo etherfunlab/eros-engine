@@ -4,12 +4,14 @@
 
 A persona has a day of her own, and two kinds of state follow it. **Needs** are six
 basic levels (hunger, social, stamina, emotional, outing, indulgence) that the PDE judge
-rates and the engine carries forward in time. **Life events** are things that happen to
-her, drawn when a caller asks: a trip, an illness, a stray cat, an hour away from her
-phone. Both reach the judge and the reply as plain facts in the present tense. Neither
-tells her how to behave; the exception is an event that is silence (the offline kinds). A
-third piece sits on top of both: when a relationship has worn thin she can ask for a
-break, the first *life choice* ([the ask-for-space choice](#the-ask-for-space-choice)).
+rates, the engine carries forward in time, and an accepted give moves. **Life events** are
+things that happen to her, drawn when a caller asks: a trip, an illness, a stray cat, an
+hour away from her phone. Both reach the judge and the reply as plain facts in the present
+tense. Neither tells her how to behave; the exception is an event that is silence (the
+offline kinds). A
+third piece sits on top of both: *life choices*. When a relationship has worn thin she can
+ask for a break ([the ask-for-space choice](#the-ask-for-space-choice)); when it has grown
+warm she can ask to sleep together or propose ([the romantic choices](#the-romantic-choices)).
 
 Request and response shapes are in [api-reference.md](api-reference.md), the judge's
 context and verdict in
@@ -21,7 +23,7 @@ about how the pieces work and how they fit together.
 | | Needs | Life events |
 |---|---|---|
 | What it is | six levels: `hunger`, `social`, `stamina`, `emotional`, `outing`, `indulgence`, each `low` / `mid` / `high` | things that happen in her day, in four categories |
-| Written by | the PDE judge, on a judged text turn | a caller's `POST /v2/comp/session/{session_id}/events`; the engine picks the kind |
+| Written by | the PDE judge, on a judged text turn; the engine too, on an accepted give ([Gives move needs](#gives-move-needs)) | a caller's `POST /v2/comp/session/{session_id}/events`; the engine picks the kind |
 | Stored in | `metadata.needs` of the rated user row | `engine.persona_events`, plus the message that tells it (none for an offline kind she does not announce) |
 | Scope | one state per persona instance, across all its sessions | the same |
 | Time | drifts between ratings, computed on read | `started_at` and `ends_at`; cooldowns count from the start |
@@ -64,17 +66,63 @@ effects route, no needs factor in the event draw, nothing in a voice call.
 - **What it rates.** The persona alone, never the relationship; the affinity evaluator rates
   that.
 - **Where it is stored.** On the user row of the turn the judge rated, as `metadata.needs`,
-  whatever the turn's outcome: reply, image, ghost or product question. The write is awaited
-  before the turn goes on. A failed write is logged and the turn carries on with the verdict's
-  levels in memory.
+  whatever the turn's outcome: reply, image, ghost or product question. On a turn with an
+  accepted give the engine writes the stored levels, even when the judge abstained: the needs
+  the item moves come from the baseline, and the rest from the judge, or from the baseline when
+  it abstained ([below](#gives-move-needs)). The write is awaited before the turn goes on. A failed write is
+  logged and the turn carries on with the levels it meant to write.
 - **What writes nothing.** A rule-engine turn (the judge is off or failed), a `needs: null`
   verdict, a turn silenced by an offline stretch (it runs no judge), and every group
-  or voice turn.
+  or voice turn. The exception is an accepted give that moves a need, in a deployment that
+  runs the judge: it writes on a turn whose judge failed or returned `needs: null` too, once a
+  rating precedes it. A deployment without the judge reads no baseline, so a give there writes
+  nothing.
 - **Whose state.** The persona instance's. The newest rated row is read across all the
   instance's sessions, so a second session does not reset her hunger.
 
 The judge's `needs` and the levels it was shown are audited with the rest of the verdict; see
 [llm-audit.md](llm-audit.md#pde-judge-payload).
+
+### Gives move needs
+
+In a deployment that runs the judge, on a 1:1 text turn whose `give` is accepted, the engine
+moves up to three needs by one level each:
+
+| `give` item | `hunger` | `social` | `indulgence` |
+|---|---|---|---|
+| `food` | −1 | | |
+| `cigarette`, `alcohol`, `herb` | −1 | +1 | +1 |
+| `medicine`, `coffee` | −1 | −1 | −1 |
+| any other item | | | |
+
+−1 is one level toward `low` and +1 one level toward `high`, stopping at the ends. The
+quantity is ignored: one give moves one level.
+
+*Accepted* means the turn's effective response is accept. A judge refusal, or the habit roll
+forcing a refusal ([the habit roll](model-config.md#taskspde_decision--opt-in-llm-pde-judge)),
+moves nothing. A fail-open turn (the judge failed) accepts the give, since a failed judge means accept, so
+the move applies there too.
+
+What gets written:
+
+- **The baseline.** The levels the judge was shown: the newest rating before this user row,
+  carried to its `sent_at`.
+- **The moved needs.** For each need the item moves, the stored level is the baseline moved by
+  one. The judge's rating of that need this turn is discarded: it sees the give in
+  `[用户动作]` and often lowers hunger itself, and shifting on top of its rating would count the
+  meal twice.
+- **The other needs.** The judge's rating, resolved against the baseline as on any turn. If the
+  judge abstained or failed, they keep the baseline.
+- **No baseline.** With no rating yet, the judge's rating is written unshifted; with no judge
+  rating either, nothing is written. The engine never invents levels from nothing.
+- **One write.** The result goes to the user row once, with the write above. On a give turn it
+  is written even when the judge abstained, because the engine has its own reason to rate.
+- **Readers.** The reply, the `body_state` frame and `GET …/effects` read the written levels as
+  they do any rating. The judge's audit keeps what the judge said.
+
+An item that is not in the table moves nothing, and the judge's rating of that turn is written
+as on any other. Voice and group turns write no needs, give or not. Life events move needs only
+through the judge ([below](#2-events-never-change-a-stored-need)).
 
 ### Drift between ratings
 
@@ -144,8 +192,9 @@ again shows the judge the same line.
   很想抽口大麻, `coffee` 很想喝杯咖啡. With no key `true` it reads 很想放纵一下. Every need at `mid` (a `low`
   `indulgence` counts the same), or no rating, adds nothing and leaves the prompt
   unchanged. A judged turn's reply is written with the levels the turn ends with: the
-  verdict's when it rated, otherwise the carried levels the judge was shown. A rule-engine
-  turn in a deployment that has the judge uses the carried levels.
+  levels written to its row (with the needs an accepted give moved taken from the baseline), otherwise the
+  carried levels the judge was shown. A rule-engine turn in a deployment that has the judge
+  uses the carried levels, moved by an accepted give.
 - **The caller** gets the same levels on the `body_state` frame (`needs`, an object or `null`),
   sent when a give's effect is at work or needs are known, and re-sent on an idempotent
   replay. `GET …/effects` returns them carried to the moment of the call, or `null` with no
@@ -240,7 +289,7 @@ eligible kind drops out of the first stage and the others share its weight.
   `period_scare` and `pregnancy_scare` are not drawn.
 - One incident and one background can run together. An incident drawn inside a background is
   told from inside it.
-- While she waits for the user's answer to her ask for space, no draw happens either, in any
+- While she waits for the user's answer to one of her life choices, no draw happens either, in any
   session of the persona: the ask is the foreground drama, and it keeps an offline stretch from
   starting mid-question. A repeat of an `event_key` that already drew still returns its event.
 - This is per persona instance across all its sessions: she has one life. A draw reads the
@@ -768,14 +817,15 @@ deployment runs the judge and the persona has a rating, carried to the moment of
 otherwise every factor is 1. A factor is not a gate: a kind weighted ×3 still has to be
 eligible.
 
-### 2. Events and gives never change a stored need
+### 2. Events never change a stored need
 
-Nothing writes a need from an event or a give. The judge reads the `[近期事件]` line, and a
-give's `[用户动作]` and later `[身体状态]` lines, and rates the needs itself with them in
-view; the reference judge prompt in `examples/model_config.toml` tells it to start from
-`[需求]` and to take the conversation, `[近期事件]`, `[身体状态]` and the elapsed time into
-account. If the judge abstains (`needs: null`), the previous rating keeps drifting whatever
-happened. Needs keep one source: the judge.
+Nothing writes a need from an event. The judge reads the `[近期事件]` line, and a give's
+`[用户动作]` and later `[身体状态]` lines, and rates the needs itself with them in view; the
+reference judge prompt in `examples/model_config.toml` tells it to start from `[需求]` and to
+take the conversation, `[近期事件]`, `[身体状态]` and the elapsed time into account. If the
+judge abstains (`needs: null`), the previous rating keeps drifting whatever happened. The one
+write that is not the judge's is an accepted give's move of up to three needs
+([Gives move needs](#gives-move-needs)), and it replaces the judge's rating of just those.
 
 ### 3. An offline stretch writes no rating
 
@@ -791,10 +841,11 @@ again.
 
 When chemistry has run two tiers past bond and her patience has been worn low for three judged
 turns running, the relationship is lopsided: passion ahead of friendship, and she is tired. She
-asks for a break. It is the first *life choice*, a real request with a real cost on every path,
+asks for a break. It is a *life choice*, a real request with a real cost on every path,
 and it is built from the machinery above: her ask is a proactive message, the break is an
-offline event, and the user answers through one endpoint. The fuller `life_choices` system (more
-kinds of choice, configurable consequences) is not part of this flow.
+offline event, and the user answers through one endpoint. Two romantic choices share that
+machinery ([the romantic choices](#the-romantic-choices)); this chapter describes the ask for
+space unless it says otherwise.
 
 ### When she asks
 
@@ -809,12 +860,13 @@ committed, time-decayed state:
   before it. A turn whose evaluation was skipped or failed neither counts nor breaks the run.
   The values are read from the session's affinity turn events (`state_after.patience`), not
   stored anew; 0.5 is a rule threshold the engine owns, not a judge band.
-- **Fresh streak.** All three turns come after the session's newest episode: her ask, its
-  resolution, and any separation it started (the latest of `asked_at`, `resolved_at` and, for an
-  accepted choice, the separation's `ends_at`). A judged action turn that fell while she waited
-  or during the separation belongs to the episode and counts for nothing; the turn that converts
-  an ignored ask is the first of the new streak. Asking consumes the streak: the next ask needs
-  three fresh judged turns.
+- **Fresh streak.** All three turns come after the session's newest episode, of any kind of
+  choice: her ask, its resolution, and any separation it started (the latest of `asked_at`,
+  `resolved_at` and, for an accepted choice, the separation's `ends_at`). A judged action turn
+  that fell while she waited for an answer that came, or during the separation, belongs to the
+  episode and counts for nothing; a lapsed ask anchors at `asked_at`, so action turns during its
+  wait do count. The turn that converts an ignored ask is the first of the new streak. Asking
+  consumes the streak: the next ask needs three fresh judged turns.
 - **Clear runway.** No session of the persona has a pending choice, and the persona has no
   separation (`taking_space`) under way. She has one life, so at most one ask is pending at a
   time.
@@ -865,7 +917,9 @@ commits, so the fetch the turn itself releases usually misses it: an adapted cli
 the delta when a history row carries `occasion: "life_choice"`. Both history routes
 ([canonical](api-reference.md#get-compchatsession_idhistorylimit20offset0) and
 [BFF](api-reference.md#get-bffv1compchatsession_idhistorylimit50offset0)) expose a proactive
-assistant row's `metadata.proactive` as an optional `occasion`, omitted on every other row. The
+assistant row's `metadata.proactive` as an optional `occasion`, omitted on every other row. Her
+ask row also carries a `life_choice` receipt (`id`, `kind`, `status`, `resolved_at`) on both
+history routes and in the BFF start bundle, so a reload shows how the choice ended. The
 tier-drop affinity event is not served on this route, so a client never meets an unknown
 `event_type`; the new state comes back in the resolution response, and any other device reads
 it from the absolute affinity route.
@@ -879,7 +933,7 @@ ignore path below. Nothing breaks; the choice UI is strictly additive.
 The answer is `POST /v2/comp/session/{session_id}/life-choices/{choice_id}` with
 `{"response": "accept" | "decline"}`
 ([API reference](api-reference.md#post-v2compsessionsession_idlife-choiceschoice_id)),
-or the user's own words, or silence.
+or the user's own words, or silence. For the ask for space:
 
 | path | how it happens | choice status | tier drop | separation | her words |
 |---|---|---|---|---|---|
@@ -920,7 +974,8 @@ message sent after her ask converts it (one already in flight when the ask lande
 nothing), and a queued or re-driven turn reads the same. An **action turn** (a give, a tip, a
 kiss) does not resolve the choice: it is answered by its own rules and the ask stays pending, as
 a gift while she waits is an attempt to mend, not an answer. `/open` greetings and reactions
-resolve nothing.
+resolve nothing. A romantic ask is ignored the same way but costs nothing: no `fell_out`, no event
+([the romantic choices](#the-romantic-choices)).
 
 **Lapse.** With no answer and no message for 24 hours the choice simply lapses. Its status stays
 `pending` in the table and reads as expired everywhere: the delta field stops being attached,
@@ -982,13 +1037,71 @@ standard ghosted-row rule with the first wording.
 | wrote during the window | `你们之前说好分开一阵，现在时间到了；对方那时发来的消息你现在才看到` | `说好暂时分开（{span}前结束，期间对方的消息你没有回）` |
 | honoured the break | `你们之前说好分开一阵，现在时间到了，你们重新开始联系` | `说好暂时分开（{span}前结束，对方等到了约定之后）` |
 
+### The romantic choices
+
+Two more kinds of choice share the machinery above: `sleep_together`, where she asks the user to
+sleep with her, and `propose`, where she proposes. They are the warm counterparts of the ask for
+space: they fire when the relationship is close and she has been warm and patient, and only a
+decline costs anything.
+
+**Who qualifies.** A pair the caller has marked romantically compatible through the
+`memory_scope` and `affinity_scope` it sends (the criterion is in the [API
+reference](api-reference.md#post-v2compsessionsession_idlife-choiceschoice_id)). A pair that
+does not meet it, or has no recorded scopes, is never asked. The engine takes no gender or
+orientation and decides nothing about who is attracted to whom.
+
+**When she asks.** The check runs where the ask for space's does, after every judged 1:1 text
+turn, over the same committed, time-decayed state and the same clear runway and right session.
+A judged turn is *warm* when its derived `warmth` and `patience` are both above 0.7, read from
+the turn's `state_after`; 0.7 is a rule threshold the engine owns, not a judge band.
+
+| kind | tiers | warm turns |
+|---|---|---|
+| `sleep_together` | chemistry tier 3 or more | the 3 newest judged turns are all warm |
+| `propose` | chemistry and bond tier 4 or more | at least 5 of the newest 8 judged turns are warm |
+
+Only judged turns after the session's newest choice episode, of any kind, count. When both kinds
+qualify on one turn, `propose` fires. Neither can fire together with the ask for space:
+`sleep_together` needs its three newest turns above 0.7 patience where the ask needs them below
+0.5, and `propose` needs both tiers at 4 or more, which leaves no two-tier gap.
+
+A kind that was accepted or ignored in the session never fires again there: the user was asked
+once, and an answer typed in words is an answer. After a decline or a lapse the kind fires again
+once the session has a fresh streak.
+
+**Her ask.** It is delivered like the ask for space: her words first, as an ordinary assistant
+row with `metadata.proactive = 'life_choice'`, then the choice row beside them (kind
+`sleep_together` or `propose`, no tier gap), the same 24-hour window, and the same `life_choice`
+field on the affinity delta. Her ask is generated with the engine's default scopes, as the ask
+for space is; her replies at resolution use the resolution request's own scopes. The pair's
+recorded scopes decide eligibility and nothing else. The stage cues are in
+[model-config.md](model-config.md#taskspde_decision--opt-in-llm-pde-judge).
+
+**The answer.** The same endpoint, the same `409` rules and the same response shape; `event` is
+always `null`.
+
+| path | choice status | cost | her words |
+|---|---|---|---|
+| accept | `accepted` | none: no event, no tier change, no slowdown | a generated reply to the yes |
+| decline | `declined` | `sleep_together`: chemistry drops one tier. `propose`: bond and chemistry each drop one tier | a generated reply to the no |
+| ignore | `ignored` | none: no `fell_out`, no event | none of its own: the turn runs as any other and the judge reads the user's words |
+| lapse | stays `pending`, reads as expired | none | none |
+
+A decline's drop is the ask for space's landing rule applied to the lines named, in the same
+transaction as the resolution, and its pending deltas are cleared
+([affinity-model.md](affinity-model.md#life-choice-drops-and-the-slowdown)). An action turn resolves
+nothing, as for the ask for space. The slowdown belongs to the ask for space alone: an accepted
+romantic choice never slows growth. The story director reads only the ask for space, so a
+romantic choice's outcome lives in the conversation and leaves no trace in her world story.
+
 ### Where the choice is stored
 
 `engine.life_choices` holds one row per choice: `session_id` (non-null, cascades with the
-session), `kind`, `status` (`pending`, `accepted`, `declined`, `ignored`), `tier_gap`,
-`asked_at`, `resolved_at`, `message_id` (the ask; set to NULL if the message goes) and
-`event_id` (the `taking_space` row an accept wrote, NULL on every other path; set to NULL if
-the event goes). Expiry and the slowdown window are derived, never stored. The separation and
+session), `kind` (`ask_for_space`, `sleep_together` or `propose`), `status` (`pending`,
+`accepted`, `declined`, `ignored`), `tier_gap` (the gap at ask time; set for `ask_for_space`
+and NULL for the romantic kinds), `asked_at`, `resolved_at`, `message_id` (the ask; set to
+NULL if the message goes) and `event_id` (the `taking_space` row an accept wrote, NULL on every
+other path; set to NULL if the event goes). Expiry and the slowdown window are derived, never stored. The separation and
 falling-out rows live in `engine.persona_events` like any event.
 
 ## Without the LLM judge
@@ -1001,12 +1114,13 @@ falling-out rows live in `engine.persona_events` like any event.
 | `正在经历` and `刚才` | reach replies, `/open` greetings and event messages |
 | `[近期事件]` | not rendered: there is no judge to read it |
 | Offline kinds | silence turns as with the judge, since the check runs before it: the ghosting switch and the action and forced-image exemptions apply |
-| The ask for space | unchanged: the trigger reads the affinity evaluator's judged turns, not the PDE judge |
+| The ask for space and the romantic choices | unchanged: the trigger reads the affinity evaluator's judged turns, not the PDE judge |
 | `smoking`, `alcoholic`, `drug`, `coffee` | a `false` key still rolls on a give and can turn it into a refusal; there is no `indulgence` to drift or name |
 
 ## Code pointers
 
-- `crates/eros-engine-core/src/needs.rs`: the levels, the drift constants, `Habits`, `carried`.
+- `crates/eros-engine-core/src/needs.rs`: the levels, the drift constants, `Habits`, `carried`,
+  `after_give` (the give's move).
 - `crates/eros-engine-core/src/pde.rs`: `refuses_give` and `UNUSED_SUBSTANCE_ACCEPT`, the give
   roll.
 - `crates/eros-engine-core/src/events.rs`: categories and kinds, per-kind rules, gates, the
@@ -1017,11 +1131,14 @@ falling-out rows live in `engine.persona_events` like any event.
 - `crates/eros-engine-server/src/routes/bff/affinity.rs`: the `life_choice` field on the delta.
 - `crates/eros-engine-server/src/pipeline/proactive.rs`: the event message and the choice's
   messages, their cues and their write (`kind_cue`, `find_cue`).
-- `crates/eros-engine-server/src/pipeline/life_choice.rs`: the trigger and her ask, the ignore
+- `crates/eros-engine-server/src/pipeline/life_choice.rs`: the triggers and her ask, the ignore
   conversion, the slowdown read.
-- `crates/eros-engine-server/src/pipeline/stream.rs::run_stream`: the needs read and write, the
-  `[需求]` and `[近期事件]` lines (`build_pde_ctx`), the offline branch ahead of the judge,
-  the give roll's refusal (`apply_give_refusal`), `body_state_frame`.
+- `crates/eros-engine-core/src/scope.rs`: `romance_compatible`, the criterion the romantic
+  choices read.
+- `crates/eros-engine-server/src/pipeline/stream.rs::run_stream`: the needs read and write (the
+  accepted give's move goes through `after_give`), the `[需求]` and `[近期事件]` lines
+  (`build_pde_ctx`), the offline branch ahead of the judge, the give roll's refusal
+  (`apply_give_refusal`), `body_state_frame`.
 - `crates/eros-engine-server/src/prompt.rs`: `needs_line`, `events_judge_text`,
   `events_reply_text`, `just_now_text`, `persona_traits`, `persona_habits`, the `[character_state]` lines and the
   event lines under `[now]`.
@@ -1037,10 +1154,11 @@ falling-out rows live in `engine.persona_events` like any event.
   world director's `current_background`; `prompt.rs::event_when_text`: the relative times both
   read.
 - `crates/eros-engine-store/src/life_choices.rs::LifeChoiceRepo`: the choice rows, `pending`,
-  `resolve_in_tx`, `growth_slowed`.
+  `resolve_in_tx`, `settled`, `growth_slowed`.
 - `crates/eros-engine-store/src/affinity.rs::AffinityRepo`: `persist_life_choice_drop_in_tx`,
-  `last_judged_patiences`.
-- `crates/eros-engine-store/src/chat.rs::ChatRepo`: `set_needs` and `latest_needs`.
+  `last_judged_endpoints`.
+- `crates/eros-engine-store/src/chat.rs::ChatRepo`: `set_needs` and `latest_needs`; `latest_scopes`,
+  the scopes the romantic choices judge a pair by.
 - `crates/eros-engine-store/migrations/0000_baseline.sql`: the events and choices
   tables, the needs index, and the widened affinity `event_type` check (folded
   from the pre-baseline chain).

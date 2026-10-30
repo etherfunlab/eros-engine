@@ -208,7 +208,7 @@ crates/
 │       ├── chat.rs           # ChatRepo
 │       ├── events.rs         # EventRepo (persona_events: life events under way, history, offline stretches, false alarms)
 │       ├── group.rs          # GroupRepo (group sessions, membership)
-│       ├── life_choices.rs   # LifeChoiceRepo (the persona's ask-for-space choice: rows, pending, resolve, slowdown window)
+│       ├── life_choices.rs   # LifeChoiceRepo (the persona's life choices: rows, pending, resolve, slowdown window)
 │       ├── affinity.rs       # AffinityRepo (persist_with_event, record_ghost, persist_life_choice_drop_in_tx)
 │       ├── memory.rs         # MemoryRepo (Profile/Relationship layers)
 │       ├── insight.rs        # InsightEventRepo (human_insights_events audit rows)
@@ -241,7 +241,7 @@ crates/
 - [Affinity model](affinity-model.md) — 6 dimensions, graded write pipeline, time decay, relationship labels
 - [Ghost mechanics](ghost-mechanics.md) — score formula + protection rules + worked examples
 - [Group chat](group-chat.md) — one user, up to three personas, the director, the speaker relay
-- [Life events and needs](life-events-needs.md) — the persona's needs and their drift, the event draw, backgrounds, offline kinds, false alarms, the ask-for-space choice
+- [Life events and needs](life-events-needs.md) — the persona's needs and their drift, the event draw, backgrounds, offline kinds, false alarms, the ask-for-space and romantic choices
 - [Memory layers](memory-layers.md) — profile vs relationship, Voyage, pgvector retrieval
 - [Deploying](deploying.md) — Docker, bring-your-own Postgres / IdP
 - [API reference](api-reference.md) — every `/comp/*` endpoint

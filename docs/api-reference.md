@@ -321,10 +321,12 @@ into the prompt. Accepted values:
 > `affinity_scope` is **not** equivalent to the old behavior. Use
 > `"bond_and_chemistry"` or `"full"` explicitly if you need all axes.
 
-> **Since 1.3.0 the field is injection-only again.** The 3.1 write-side
+> **Since 1.3.0 the field does not steer scoring.** The 3.1 write-side
 > steering (1.2.1) is retired: `affinity_scope` gates prompt injection and
-> `length_score` and has no effect on scoring. See
-> [Affinity model → Scope steering: retired](affinity-model.md#affinityrs-vs-scopers).
+> `length_score` and has no effect on scoring. With `memory_scope`, the scopes a
+> turn records also decide whether the pair can be asked a romantic life choice
+> ([romantic compatibility](#post-v2compsessionsession_idlife-choiceschoice_id)).
+> See [Affinity model → Scope steering: retired](affinity-model.md#affinityrs-vs-scopers).
 
 Example using both fields:
 
@@ -890,7 +892,8 @@ occasion that is not true of the session returns `null` without generating.
 `occasion` in the response is `birthday`, `holiday`, `first_meet`,
 `returning` or `just_opened`. The same message shape carries `event` on a life
 event's message (see the events route below) and `life_choice` on her ask for
-space and her answer to the user's reply (see the life-choice route below).
+space or a romantic choice and on her answer to the user's reply (see the
+life-choice route below).
 
 - **Synchronous:** one non-streaming generation, a few seconds. Don't block UI on it.
 - **Idempotent:** per session and local date for a birthday or holiday
@@ -921,7 +924,7 @@ Ask for something to happen in the persona's day. The caller decides when to
 ask; the engine decides whether and what. It draws one kind of event, or none,
 and the persona tells the user in one proactive message — except the offline
 kinds, which make her unreachable and are announced only in part (below). Nothing
-is drawn while she waits for the user's answer to her ask for space (see
+is drawn while she waits for the user's answer to one of her life choices (see
 [the life-choice route](#post-v2compsessionsession_idlife-choiceschoice_id)). While
 an event lasts, the judge and the reply know she is in it (see
 [model-config.md](model-config.md#taskspde_decision--opt-in-llm-pde-judge)).
@@ -1008,7 +1011,7 @@ draw both gatherings, at the same weight; that is deliberate.
 
 Two more kinds are never drawn: `taking_space` (a separation she asked for and
 the user agreed to, 12–24 h, offline) and `fell_out` (the falling-out when the
-user ignores her ask, 1 h). The engine writes them for the
+user ignores her ask for space, 1 h). The engine writes them for the
 [life-choice flow](#post-v2compsessionsession_idlife-choiceschoice_id). They
 show up as the `event` of `…/effects` and of the life-choice response, and
 cannot be listed in `kinds`.
@@ -1036,8 +1039,8 @@ The draw:
   `bros_gathering`, `sis_gathering`, `admiring_scenery`, `admiring_art`,
   `watching_show`, `on_the_road`, `having_sex`); during `period`,
   neither `period_scare` nor `pregnancy_scare`.
-- **While she waits for an answer, nothing is drawn.** From her ask for space
-  until it is answered or lapses (24 h), the draw returns `{"event": null,
+- **While she waits for an answer, nothing is drawn.** From her ask (of any
+  life choice) until it is answered or lapses (24 h), the draw returns `{"event": null,
   "message": null}` for every session of the persona. A repeat of an
   `event_key` that already drew still returns its event.
 - **Cooldowns.** Each kind has a cooldown from when it started. A trip starts
@@ -1209,23 +1212,53 @@ The persona's lingering state from accepted gives, her needs and the events unde
 
 ### `POST /v2/comp/session/{session_id}/life-choices/{choice_id}`
 
-Answer her ask for space. When chemistry runs two tiers past bond and her
-patience stays low for three judged turns, the persona asks the user for a
-break in a proactive message (`metadata.proactive = "life_choice"`) and the
-session carries a pending choice for 24 hours; she has one such ask pending at
-a time across all her sessions with the user. The user answers here, answers
-in words, or says nothing. How and when she asks, and what each path costs, is
-in [life-events-needs.md](life-events-needs.md#the-ask-for-space-choice).
+Answer one of her life choices. She puts a choice to the user in a proactive
+message (`metadata.proactive = "life_choice"`) and the session carries a
+pending choice for 24 hours; she has one such choice pending at a time across
+all her sessions with the user. The user answers here, answers in words, or
+says nothing. There are three kinds:
+
+| `kind` | She asks | When |
+|---|---|---|
+| `ask_for_space` | for a break | chemistry runs two tiers past bond and her patience stays low for three judged turns |
+| `sleep_together` | the user to sleep with her | the pair is romantically compatible (below), chemistry is at tier 3 or more, and the 3 newest judged turns all have warmth and patience above 0.7 |
+| `propose` | the user to marry her | the pair is romantically compatible, chemistry and bond are both at tier 4 or more, and at least 5 of the newest 8 judged turns have warmth and patience above 0.7 |
+
+Only judged turns after the session's newest choice episode count, whatever its kind: her
+ask, its answer and any separation it started.
+`propose` wins when both romantic kinds qualify on one turn. A kind the user
+accepted or ignored in a session is never asked again there; one that was
+declined or lapsed is asked again after a fresh streak. How and when she asks,
+and what each path costs, is in
+[life-events-needs.md](life-events-needs.md#the-ask-for-space-choice) and
+[the romantic choices](life-events-needs.md#the-romantic-choices).
+
+**Romantic compatibility.** She asks `sleep_together` or `propose` only of a
+pair the caller's scopes mark as romantically compatible: relationship memory
+is on (`memory_scope` is `full`, `neutral_and_relationship` or
+`relationship_only`) and at least one of trust, intrigue or patience is in
+`affinity_scope` (`"chemistry"`, `"full"`, `"bond_and_chemistry"`, or an axis
+array naming one of the three). `memory_scope: "full"` with
+`affinity_scope: "chemistry"` qualifies, and so does
+`memory_scope: "neutral_and_relationship"` with `affinity_scope: "full"`. The
+defaults (`neutral_and_relationship` with `bond`) never qualify. The engine
+reads the pair from the scopes recorded on the session's newest assistant
+reply that carries both, skipping her own life-choice messages; with no such
+reply, or a value that does not parse, the pair is not compatible. A caller
+makes a pair eligible by sending scopes that meet this criterion on its turns.
+The engine neither takes nor stores the user's gender or orientation.
 
 A client learns of the choice from the `life_choice` field of
 [`GET /bff/v1/comp/affinity/{session_id}/event`](#get-bffv1compaffinitysession_idevent),
-which carries the choice's `id` and the answers it accepts. The ask lands
-seconds after the turn that triggered it, so the delta that turn releases
-usually misses it: **re-fetch the delta when a history row carries
+which carries the choice's `id`, its `kind` and the answers it accepts. The ask
+lands seconds after the turn that triggered it, so the delta that turn
+releases usually misses it: **re-fetch the delta when a history row carries
 `occasion: "life_choice"`** (both history routes expose the row's
-`metadata.proactive` as `occasion`). A client that never adapts loses
-nothing. It shows the ask as an ordinary message, the user replies in words,
-and that is the ignore path (below).
+`metadata.proactive` as `occasion`). Her ask row in both history routes also
+carries a [`life_choice` receipt](#get-compchatsession_idhistorylimit20offset0)
+that says how the choice stands, and how it ended. A client that never adapts
+loses nothing. It shows the ask as an ordinary message, the user replies in
+words, and that is the ignore path (below).
 
 ```json
 {
@@ -1238,20 +1271,22 @@ and that is the ignore path (below).
 | Field | Rules |
 |---|---|
 | `response` | required: `"accept"` or `"decline"`; anything else is a `422` |
-| `user_timezone`, `user_country`, `user_region`, `tier`, `prompt_traits`, `memory_scope`, `affinity_scope`, `audit` | as on `/open`, for generating her reply. The engine keeps nothing between calls |
+| `user_timezone`, `user_country`, `user_region`, `tier`, `prompt_traits`, `memory_scope`, `affinity_scope`, `audit` | as on `/open`, for generating her reply. Her ask itself was generated with the engine's default scopes. The engine keeps nothing between calls |
 
-1:1 text sessions only. One transaction answers the choice and pays for it:
+1:1 text sessions only. One transaction answers the choice and pays for it.
+What an answer does depends on `kind`:
 
-- **`accept`:** the choice becomes `accepted`. A `taking_space` separation
-  starts now and lasts 6 hours per tier of the gap she asked at (gap 2, 3, 4:
-  12, 18, 24 hours); she is offline for all her sessions while it lasts, and an
-  incident under way ends. Bond and chemistry each drop one tier, and for 72
-  hours after the separation ends positive growth in this session is halved.
-- **`decline`:** the choice becomes `declined`. The same tier drop; no
-  separation and no slowdown.
+| | `ask_for_space` | `sleep_together` | `propose` |
+|---|---|---|---|
+| **`accept`** | status `accepted`. A `taking_space` separation starts now and lasts 6 hours per tier of the gap she asked at (gap 2, 3, 4: 12, 18, 24 hours); she is offline for all her sessions while it lasts, and an incident under way ends. Bond and chemistry each drop one tier, and for 72 hours after the separation ends positive growth in this session is halved | status `accepted`; nothing else changes | status `accepted`; nothing else changes |
+| **`decline`** | status `declined`. The same tier drop; no separation and no slowdown | status `declined`; chemistry drops one tier | status `declined`; bond and chemistry each drop one tier |
+| **ignore** (the user types instead) | status `ignored`; a one-hour `fell_out` incident; no tier change | status `ignored`; no cost, no `fell_out` | status `ignored`; no cost, no `fell_out` |
+| **expiry** (24 h) | no cost | no cost | no cost |
 
-Then she answers in one proactive message (a goodbye after an accept, a hurt
-reply after a decline), persisted like any reply and returned:
+Then she answers in one proactive message, persisted like any reply and
+returned. For `ask_for_space` it is a goodbye after an accept and a hurt reply
+after a decline; for the romantic kinds it is her answer to the user's yes or
+no. It is generated with the scopes of this request.
 
 ```json
 {"status": "accepted",
@@ -1261,25 +1296,28 @@ reply after a decline), persisted like any reply and returned:
 ```
 
 `status` is `accepted` or `declined`. `affinity` is the relationship after the
-drop, in the shape of
+answer: dropped for any decline and for an `ask_for_space` accept, as it stands
+for a romantic accept, in the shape of
 [`GET /bff/v1/comp/affinity/{session_id}`](#get-bffv1compaffinitysession_id)'s
-`affinity`. `event` is the separation an accept started and `null` after a
-decline. `message` is `null` when her generation failed, came back blank, or a
-newer message of the user's landed first: the answer, the separation and the
-drop stand either way.
+`affinity`. `event` is the separation an `ask_for_space` accept started and
+`null` after any decline and for every romantic answer. `message` is `null`
+when her generation failed, came back blank, or a newer message of the user's
+landed first: the answer, the separation and the drop stand either way.
 
 If the user does not call this route, two other things resolve the choice:
 
 - **Ignore.** The first ordinary user text message that arrives while it is
-  pending (a turn without an `action`) converts it: status `ignored`, and a
-  one-hour `fell_out` incident starts at that message, so the very turn that
-  ignored her is answered with the falling-out in her context. No tier changes.
-  Only a message sent after her ask converts it. An action turn does not
-  resolve it, and neither does `/open` or a reaction. During a separation a
-  message only ghosts and never converts a pending ask.
+  pending (a turn without an `action`) converts it: status `ignored`. For
+  `ask_for_space` a one-hour `fell_out` incident starts at that message, so
+  the very turn that ignored her is answered with the falling-out in her
+  context. A romantic ask settles at no cost and with no `fell_out`, and the
+  turn runs as any other. No tier changes. Only a message sent after her ask
+  converts it. An action turn does not resolve it, and neither does `/open` or
+  a reaction. During a separation a message only ghosts and never converts a
+  pending ask.
 - **Lapse.** 24 hours after her ask the choice reads as expired everywhere:
-  `life_choice` is no longer attached, this route answers `409`, a later
-  message converts nothing, and it costs nothing.
+  `life_choice` is no longer attached to the delta, this route answers `409`,
+  a later message converts nothing, and it costs nothing.
 
 A resolution and an incoming message race transactionally; the first writer
 wins and this route answers the loser `409`.
@@ -1377,7 +1415,16 @@ with, plus `response` (`"accept"` | `"refuse"`) once the turn took effect.
 
 `speaker_session_id` (assistant rows of a group session only, omitted otherwise) is the member session that spoke the line; resolve a departed speaker's name through session, then instance.
 
-`occasion` (assistant rows the persona wrote on her own only, omitted otherwise) says why she spoke: the row's `metadata.proactive`, one of `birthday`, `holiday`, `first_meet`, `returning`, `just_opened`, `event` or `life_choice`. A client adapted to the [life choice](#post-v2compsessionsession_idlife-choiceschoice_id) re-fetches the affinity delta when it reads `life_choice`.
+`occasion` (assistant rows the persona wrote on her own only, omitted otherwise) says why she spoke: the row's `metadata.proactive`, one of `birthday`, `holiday`, `first_meet`, `returning`, `just_opened`, `event` or `life_choice` (her ask for space or a romantic choice, and what she says about the answer). A client adapted to the [life choice](#post-v2compsessionsession_idlife-choiceschoice_id) re-fetches the affinity delta when it reads `life_choice`.
+
+`life_choice` (the assistant row of her ask only, omitted on every other row) is the choice that row put to the user and how it stands, so any client, on a reload or a second device, can draw the user's answer between her ask and her reply:
+
+```json
+{ "id": "…", "role": "assistant", "content": "…", "sent_at": "…", "occasion": "life_choice",
+  "life_choice": { "id": "…", "kind": "propose", "status": "accepted", "resolved_at": "2026-10-30T12:00:00Z" } }
+```
+
+`kind` is `ask_for_space`, `sleep_together` or `propose`. `status` is `pending`, `accepted`, `declined`, `ignored` or `expired`; `expired` is a `pending` choice past its 24 hours, derived when the page is served and never stored. `resolved_at` is `null` while the status is `pending` or `expired`; for `accepted` and `declined` it is when the answer landed, and for `ignored` it is the `sent_at` of the user message that answered her in words. The reply rows that follow carry `occasion: "life_choice"` as usual. The affinity delta's `life_choice` field is a different object and stays pending-only.
 
 `user_message_id` names the `role='user'` row whose turn produced this row. It
 is present on assistant rows and on `system_error` notices, and omitted on the
@@ -2200,7 +2247,9 @@ The body is the canonical start body plus one BFF-only field:
 ```
 
 `persona_name` is always present and is `null` for a BYOC instance, whose
-name only its card holds.
+name only its card holds. `history` entries are the shape of the
+[BFF history route](#get-bffv1compchatsession_idhistorylimit50offset0)'s, so
+her ask row carries its `life_choice` receipt here too.
 
 Affinity is intentionally **not** bundled here — the frontend reads it
 separately via the two affinity routes below, so a cold mount that does not
@@ -2230,7 +2279,7 @@ echoes the quote a `user` row was sent with (see the stream route's
 session; omitted on ordinary turns and on turns whose anchor failed to resolve,
 so a cold mount can re-render the quote without keeping local state.
 `action` (user rows only, omitted otherwise) is the action the row was sent
-with, plus `response` (`"accept"` | `"refuse"`) once the turn took effect. `reaction` (assistant rows only, omitted otherwise) is `{emoji, reacted_at}`. `occasion` (assistant rows the persona wrote on her own only, omitted otherwise) is the canonical route's field of the same name, `life_choice` included; the start bundle carries it too. Same auth, ownership check, and
+with, plus `response` (`"accept"` | `"refuse"`) once the turn took effect. `reaction` (assistant rows only, omitted otherwise) is `{emoji, reacted_at}`. `occasion` (assistant rows the persona wrote on her own only, omitted otherwise) is the canonical route's field of the same name, `life_choice` included; the start bundle carries it too. `life_choice` (the assistant row of her ask only, omitted otherwise) is the canonical route's receipt of the same name, `{id, kind, status, resolved_at}`, with the same five statuses and the same `resolved_at` rule; the start bundle carries it too. Same auth, ownership check, and
 `limit ∈ [1, 50]` clamp as the canonical history route. **Intentional
 divergence:** the default `limit` is 50 (the canonical route defaults to 20),
 because the BFF exists for a cold mount that wants a full backscroll in one
@@ -2354,7 +2403,8 @@ from the absolute route below on any other device.
   events and on rows written before migration `0056`.
 - `life_choice` — the session's pending choice, composed at serve time and
   attached to `event` whenever one is unanswered and not past its 24 hours;
-  absent otherwise. `options` lists the answers the
+  absent otherwise. `kind` is `ask_for_space`, `sleep_together` or `propose`.
+  `options` lists the answers the
   [life-choice route](#post-v2compsessionsession_idlife-choiceschoice_id)
   takes; `message_id` is the chat message that asked it (absent once that row
   is gone). The ask lands seconds after the turn that triggered it, so re-fetch
@@ -2670,7 +2720,7 @@ on whichever route it comes from, as does the caller-secret refusal
 - `crates/eros-engine-server/src/routes/session_open.rs` — the persona speaking first: birthday and holiday greetings and caller-named occasions (`v2/comp/session/{session_id}/open`)
 - `crates/eros-engine-server/src/routes/session_events.rs` — life events the persona tells: the draw, and the proactive message that tells it (none for an offline kind she does not announce) (`v2/comp/session/{session_id}/events`)
 - `crates/eros-engine-server/src/routes/session_effects.rs` — the persona's lingering state from accepted gives, her needs and the events under way (`v2/comp/session/{session_id}/effects`)
-- `crates/eros-engine-server/src/routes/life_choices.rs` — the user's answer to her ask for space: accept or decline (`v2/comp/session/{session_id}/life-choices/{choice_id}`)
+- `crates/eros-engine-server/src/routes/life_choices.rs` — the user's answer to one of her life choices: accept or decline (`v2/comp/session/{session_id}/life-choices/{choice_id}`)
 - `crates/eros-engine-server/src/routes/group.rs` — group management and the group send route (`v2/comp/group*`)
 - `crates/eros-engine-server/src/routes/reaction.rs` — message reactions: set, clear and the allowlist (`v2/comp/session/{session_id}/message/{message_id}/reaction`, `v2/comp/reactions`)
 - `crates/eros-engine-server/src/routes/insight.rs` — v2 relationship-scoped insight profiles (`v2/comp/instance/{instance_id}/insight/character`, `.../insight/user`)
