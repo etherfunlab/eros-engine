@@ -6178,7 +6178,7 @@
               "null"
             ],
             "format": "date-time",
-            "description": "`null` unless the choice was answered, converted or lapsed into a\nstored resolution."
+            "description": "`null` while `pending` or `expired`. For `accepted` / `declined`,\nwhen the answer landed; for `ignored`, the `sent_at` of the user\nmessage that answered her in words."
           },
           "status": {
             "type": "string",

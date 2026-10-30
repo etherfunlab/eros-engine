@@ -106,8 +106,9 @@ pub struct LifeChoiceReceiptDto {
     /// `pending`, `accepted`, `declined`, `ignored`, or `expired` for a
     /// `pending` choice past its 24 hours.
     pub status: String,
-    /// `null` unless the choice was answered, converted or lapsed into a
-    /// stored resolution.
+    /// `null` while `pending` or `expired`. For `accepted` / `declined`,
+    /// when the answer landed; for `ignored`, the `sent_at` of the user
+    /// message that answered her in words.
     pub resolved_at: Option<DateTime<Utc>>,
 }
 
