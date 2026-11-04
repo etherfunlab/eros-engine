@@ -641,6 +641,9 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
         UserAction::Hug => "想抱你".into(),
         UserAction::Touch => "伸手想摸你".into(),
         UserAction::Lick => "想舔你".into(),
+        UserAction::FrenchKiss => "凑过来想和你舌吻".into(),
+        UserAction::HugFromBehind => "悄悄走到你身后，想抱住你".into(),
+        UserAction::Tease => "伸手想挑逗你".into(),
         UserAction::Custom { text } => text.clone(),
         UserAction::Tip { amount_usd } => {
             format!("给你发了一个红包，相当于{}", tip_value_noun(*amount_usd))
@@ -5838,6 +5841,9 @@ mod tests {
             UserAction::Hug,
             UserAction::Touch,
             UserAction::Lick,
+            UserAction::FrenchKiss,
+            UserAction::HugFromBehind,
+            UserAction::Tease,
             UserAction::Custom {
                 text: "捏了捏你的脸".into(),
             },
@@ -5857,6 +5863,9 @@ mod tests {
                 "想抱你",
                 "伸手想摸你",
                 "想舔你",
+                "凑过来想和你舌吻",
+                "悄悄走到你身后，想抱住你",
+                "伸手想挑逗你",
                 "捏了捏你的脸",
             ]
         );

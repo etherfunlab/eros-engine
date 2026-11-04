@@ -246,13 +246,14 @@ The engine writes some rows itself, with no LLM call and `realm = real`:
 | The relationship's first chat, journaled when its first turn is counted and dated by its earliest chat row | `first_meet` | monthly, then yearly |
 | A bond or chemistry label reached for the first time, in the affinity write's transaction | `tier_reached` | no |
 | An accepted `give`, `gift` or `tip` action (a tip never states its amount) | `gift` | no |
-| The first accepted `kiss` action | `first_intimacy` | no |
+| The first accepted `kiss` or `french_kiss` action | `first_intimacy` | no |
 
 A label already journaled for the relationship is not journaled again, even
 when a later session reaches it anew. When a line falls, its `tier_reached`
 rows for the labels it fell below are taken back while they are under 24
 hours old, whether the drop came from a judged turn, a refused action or a
-life choice. `hug`, `touch`, `lick` and `custom` actions are not journaled.
+life choice. `hug`, `touch`, `lick`, `hug_from_behind`, `tease` and `custom`
+actions are not journaled.
 
 The scan's model writes the rest: `confession`, `first_intimacy`, `conflict`,
 `reconciliation`, `promise`, `gift`, `shared_plan` and

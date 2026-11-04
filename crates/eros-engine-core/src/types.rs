@@ -122,6 +122,9 @@ pub enum UserAction {
     Hug,
     Touch,
     Lick,
+    FrenchKiss,
+    HugFromBehind,
+    Tease,
     Custom {
         text: String,
     },
@@ -575,6 +578,15 @@ mod tests {
         );
         let back: UserAction = serde_json::from_value(serde_json::json!({"type": "lick"})).unwrap();
         assert_eq!(back, UserAction::Lick);
+        for (a, wire) in [
+            (UserAction::FrenchKiss, "french_kiss"),
+            (UserAction::HugFromBehind, "hug_from_behind"),
+            (UserAction::Tease, "tease"),
+        ] {
+            let v = serde_json::json!({ "type": wire });
+            assert_eq!(serde_json::to_value(&a).unwrap(), v);
+            assert_eq!(serde_json::from_value::<UserAction>(v).unwrap(), a);
+        }
     }
 
     #[test]
@@ -591,6 +603,9 @@ mod tests {
             UserAction::Hug,
             UserAction::Touch,
             UserAction::Lick,
+            UserAction::FrenchKiss,
+            UserAction::HugFromBehind,
+            UserAction::Tease,
             UserAction::Custom { text: "x".into() },
         ] {
             assert_eq!(a.refusal_line().unwrap(), AffinityLine::Chemistry, "{a:?}");

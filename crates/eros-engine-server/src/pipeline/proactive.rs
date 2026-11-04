@@ -54,6 +54,8 @@ use crate::state::AppState;
 pub(crate) const OPEN_CUE: &str = "（对方刚打开和你的聊天，还没说话。）";
 const FIRST_MEET_CUE: &str = "（你们还没聊过。对方刚打开和你的聊天，还没说话。）";
 const RETURNING_SAME_DAY_CUE: &str = "（对方隔了不到一天又打开和你的聊天，还没说话。）";
+pub(crate) const CHECK_IN_CUE: &str =
+    "（你还记挂着对方上次聊到的事，想关心一下后来怎么样了。对方刚打开和你的聊天，还没说话。）";
 
 /// Why the persona speaks first. The holiday and the birthday are the
 /// engine's own call; the other occasions are named by the caller and carry
@@ -76,6 +78,10 @@ pub(crate) enum Occasion {
         gap_days: i64,
     },
     JustOpened {
+        open_key: String,
+    },
+    /// She asks after what the user last talked about.
+    CheckIn {
         open_key: String,
     },
     /// A life event the persona tells about (spec
@@ -176,6 +182,7 @@ impl Occasion {
             Self::FirstMeet { .. } => "first_meet",
             Self::Returning { .. } => "returning",
             Self::JustOpened { .. } => "just_opened",
+            Self::CheckIn { .. } => "check_in",
             Self::Event { .. } => "event",
             Self::LifeChoice(_) => "life_choice",
         }
@@ -190,6 +197,7 @@ impl Occasion {
                 OPEN_CUE.into()
             }
             Self::FirstMeet { .. } => FIRST_MEET_CUE.into(),
+            Self::CheckIn { .. } => CHECK_IN_CUE.into(),
             Self::Returning { gap_days: 0, .. } => RETURNING_SAME_DAY_CUE.into(),
             Self::Returning { gap_days, .. } => {
                 format!("（对方隔了 {gap_days} 天又打开和你的聊天，还没说话。）")
@@ -599,7 +607,9 @@ pub(crate) async fn greet(
             metadata.insert("open_key".into(), open_key.as_str().into());
             metadata.insert("gap_days".into(), (*gap_days).into());
         }
-        Occasion::FirstMeet { open_key } | Occasion::JustOpened { open_key } => {
+        Occasion::FirstMeet { open_key }
+        | Occasion::JustOpened { open_key }
+        | Occasion::CheckIn { open_key } => {
             metadata.insert("open_key".into(), open_key.as_str().into());
         }
         Occasion::Event { outfit, .. } => {
@@ -643,7 +653,8 @@ pub(crate) async fn greet(
         },
         Occasion::FirstMeet { open_key }
         | Occasion::Returning { open_key, .. }
-        | Occasion::JustOpened { open_key } => {
+        | Occasion::JustOpened { open_key }
+        | Occasion::CheckIn { open_key } => {
             match chat_repo
                 .insert_open_message(g.session_id, g.since, &row)
                 .await?

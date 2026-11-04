@@ -198,7 +198,7 @@ pub fn gift(
     }
 }
 
-/// The first kiss the persona accepted.
+/// The first kiss the persona accepted, a `kiss` or a `french_kiss`.
 pub fn first_kiss(instance_id: Uuid, message_id: Uuid, on: NaiveDate) -> JournalInsert {
     JournalInsert {
         message_id: Some(message_id),
@@ -215,7 +215,7 @@ pub fn first_kiss(instance_id: Uuid, message_id: Uuid, on: NaiveDate) -> Journal
 
 /// The moment an accepted action leaves in the journal, read from the row's
 /// stored `metadata.action` (which also holds the decided `response`, no part
-/// of the action). A hug, touch, lick or custom action leaves none, and an
+/// of the action). Any other physical action or a custom one leaves none, and an
 /// action that does not parse reads as no action.
 pub(crate) fn accepted_moment(
     action: serde_json::Value,
@@ -243,7 +243,7 @@ pub(crate) fn accepted_moment(
             Some(gift(instance_id, message_id, on, named(Some(&name)), false))
         }
         UserAction::Tip { .. } => Some(gift(instance_id, message_id, on, None, true)),
-        UserAction::Kiss => Some(first_kiss(instance_id, message_id, on)),
+        UserAction::Kiss | UserAction::FrenchKiss => Some(first_kiss(instance_id, message_id, on)),
         _ => None,
     }
 }
@@ -500,6 +500,22 @@ mod tests {
 
     fn summaries(rows: &[JournalRow]) -> Vec<&str> {
         rows.iter().map(|r| r.summary.as_str()).collect()
+    }
+
+    #[test]
+    fn a_french_kiss_is_a_first_kiss_and_the_other_new_gestures_leave_none() {
+        let (i, m, on) = (Uuid::new_v4(), Uuid::new_v4(), day(2026, 3, 1));
+        let moment = |a: serde_json::Value| accepted_moment(a, i, m, on);
+        let r = moment(serde_json::json!({"type": "french_kiss", "response": "accept"}))
+            .expect("a first kiss");
+        assert_eq!(r.dedup_key.as_deref(), Some("first_intimacy:real"));
+        assert_eq!(r.message_id, Some(m));
+        for kind in ["hug_from_behind", "tease"] {
+            assert!(
+                moment(serde_json::json!({"type": kind, "response": "accept"})).is_none(),
+                "{kind}"
+            );
+        }
     }
 
     #[test]

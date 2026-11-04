@@ -5362,6 +5362,7 @@
           "first_meet",
           "returning",
           "just_opened",
+          "check_in",
           "event",
           "life_choice"
         ]
@@ -6516,7 +6517,8 @@
         "enum": [
           "first_meet",
           "returning",
-          "just_opened"
+          "just_opened",
+          "check_in"
         ]
       },
       "OpenSessionRequest": {
@@ -7286,6 +7288,9 @@
           "hug",
           "touch",
           "lick",
+          "french_kiss",
+          "hug_from_behind",
+          "tease",
           "custom",
           "tip",
           "gift"

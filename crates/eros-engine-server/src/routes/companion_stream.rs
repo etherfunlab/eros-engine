@@ -153,6 +153,9 @@ pub enum UserActionKind {
     Hug,
     Touch,
     Lick,
+    FrenchKiss,
+    HugFromBehind,
+    Tease,
     Custom,
     Tip,
     Gift,
@@ -338,6 +341,9 @@ impl UserActionDto {
             UserActionKind::Hug => UserAction::Hug,
             UserActionKind::Touch => UserAction::Touch,
             UserActionKind::Lick => UserAction::Lick,
+            UserActionKind::FrenchKiss => UserAction::FrenchKiss,
+            UserActionKind::HugFromBehind => UserAction::HugFromBehind,
+            UserActionKind::Tease => UserAction::Tease,
             UserActionKind::Custom => UserAction::Custom {
                 text: free_text(self.text.as_deref(), "text", MAX_ACTION_TEXT_CHARS)?
                     .ok_or("action.text is required for custom")?,
