@@ -430,7 +430,7 @@ physical or custom action → chemistry), and a refused `tip` costs nothing (see
 | `type` | fields |
 |---|---|
 | `give` | `item`: one of the categories below (required); `name`: optional, 1–32 chars; `quantity`: optional, 1–99, default 1 |
-| `kiss`, `hug`, `touch`, `lick` | none |
+| `kiss`, `hug`, `touch`, `lick`, `french_kiss`, `hug_from_behind`, `tease` | none |
 | `custom` | `text`: required, 1–100 chars |
 | `tip` | `amount_usd`: required, finite, `> 0` and `≤ 1_000_000_000` |
 | `gift` | `kind`: `item` \| `clothing` (required); `name`: required, 1–64 chars |
@@ -875,6 +875,7 @@ does not. Without `occasion`, on a day that is neither, the call returns
 | `first_meet` | the session has no messages at all | you have not talked before |
 | `returning` | the user has sent at least one message in the session | how many days since the user's last message |
 | `just_opened` | always | the user just opened the chat |
+| `check_in` | the user has sent at least one message in the session | you still have on your mind what the user last talked about and want to ask how it went |
 
 `open_key` is required with `occasion` and rejected without it: 1–128
 characters of `[A-Za-z0-9_.:-]`, scoped to the session. The same key returns
@@ -890,7 +891,7 @@ occasion that is not true of the session returns `null` without generating.
 ```
 
 `occasion` in the response is `birthday`, `holiday`, `first_meet`,
-`returning` or `just_opened`. The same message shape carries `event` on a life
+`returning`, `just_opened` or `check_in`. The same message shape carries `event` on a life
 event's message (see the events route below) and `life_choice` on her ask for
 space or a romantic choice and on her answer to the user's reply (see the
 life-choice route below).
@@ -1132,7 +1133,7 @@ While one lasts, every text turn in any session of the persona ghosts, without
 the judge and without counting towards the ghost streak, and `/open` returns
 `null`. An announced `busy`, `in_battle` or `out_shopping` still ghosts. A turn that carries a
 user `action` (any `type`: `give`, `gift`, `tip`, `kiss`, `hug`, `touch`,
-`lick`, `custom`) or `image.force = true` is the exception: it takes the normal
+`lick`, `french_kiss`, `hug_from_behind`, `tease`, `custom`) or `image.force = true` is the exception: it takes the normal
 path and is answered, because an action is interaction in person, which needs
 no phone, and a forced image turn is always `reply_image`. The persona goes
 silent this way only where the ghost protection allows it, so with the
@@ -1415,7 +1416,7 @@ with, plus `response` (`"accept"` | `"refuse"`) once the turn took effect.
 
 `speaker_session_id` (assistant rows of a group session only, omitted otherwise) is the member session that spoke the line; resolve a departed speaker's name through session, then instance.
 
-`occasion` (assistant rows the persona wrote on her own only, omitted otherwise) says why she spoke: the row's `metadata.proactive`, one of `birthday`, `holiday`, `first_meet`, `returning`, `just_opened`, `event` or `life_choice` (her ask for space or a romantic choice, and what she says about the answer). A client adapted to the [life choice](#post-v2compsessionsession_idlife-choiceschoice_id) re-fetches the affinity delta when it reads `life_choice`.
+`occasion` (assistant rows the persona wrote on her own only, omitted otherwise) says why she spoke: the row's `metadata.proactive`, one of `birthday`, `holiday`, `first_meet`, `returning`, `just_opened`, `check_in`, `event` or `life_choice` (her ask for space or a romantic choice, and what she says about the answer). A client adapted to the [life choice](#post-v2compsessionsession_idlife-choiceschoice_id) re-fetches the affinity delta when it reads `life_choice`.
 
 `life_choice` (the assistant row of her ask only, omitted on every other row) is the choice that row put to the user and how it stands, so any client, on a reload or a second device, can draw the user's answer between her ask and her reply:
 

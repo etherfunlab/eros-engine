@@ -137,9 +137,9 @@ Dreaming 就是关系扫描，`pipeline::dreaming`。它为每段关系保留一
 | 这段关系的第一次聊天，在它的第一个轮次被计入时记下，日期取最早的一行聊天 | `first_meet` | 先按月，后按年 |
 | 第一次达到某个 bond 或 chemistry 标签，与好感度写入同一个事务 | `tier_reached` | 否 |
 | 被接受的 `give`、`gift` 或 `tip` 动作（打赏从不写金额） | `gift` | 否 |
-| 第一次被接受的 `kiss` 动作 | `first_intimacy` | 否 |
+| 第一次被接受的 `kiss` 或 `french_kiss` 动作 | `first_intimacy` | 否 |
 
-这段关系已经记过的标签不会再记，哪怕之后的 session 再次达到。某条线下降时，它掉到之下的那些标签的 `tier_reached` 行若不满 24 小时就一并撤回，不论下降来自判官评估的轮次、被拒绝的动作，还是生活抉择。`hug`、`touch`、`lick` 和 `custom` 动作不记。
+这段关系已经记过的标签不会再记，哪怕之后的 session 再次达到。某条线下降时，它掉到之下的那些标签的 `tier_reached` 行若不满 24 小时就一并撤回，不论下降来自判官评估的轮次、被拒绝的动作，还是生活抉择。`hug`、`touch`、`lick`、`hug_from_behind`、`tease` 和 `custom` 动作不记。
 
 其余由扫描的模型写入：`confession`、`first_intimacy`、`conflict`、`reconciliation`、`promise`、`gift`、`shared_plan` 和 `user_shared_milestone`，日期取自它所出自的那份对话记录里的时间戳。带到期日的 `promise` 或 `shared_plan` 会在那一天回归。只该有一行的地方由一个键保留先写入的那一行：一个 `first_meet`，每种 realm 一个 `first_intimacy`，每条消息一个 `gift`，每条线的每个标签一个 `tier_reached`。
 

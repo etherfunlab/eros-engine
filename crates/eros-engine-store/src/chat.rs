@@ -1105,7 +1105,7 @@ impl<'a> ChatRepo<'a> {
     /// an earlier decision added. A stored gift whose kind or name is
     /// malformed adds nothing and does not fail the write.
     ///
-    /// An accepted `give`, `gift`, `tip` or `kiss` also leaves a moment in the
+    /// An accepted `give`, `gift`, `tip`, `kiss` or `french_kiss` also leaves a moment in the
     /// relationship journal of `instance_id`, in the same transaction, dated in
     /// `journal_tz` (UTC when absent); a repeat of the same message adds none.
     pub async fn set_action_response(

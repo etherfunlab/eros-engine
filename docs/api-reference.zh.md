@@ -377,7 +377,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 | `type` | 字段 |
 |---|---|
 | `give` | `item`：下表中的一类，必填；`name`：可选，1–32 字符；`quantity`：可选，1–99，默认 1 |
-| `kiss`、`hug`、`touch`、`lick` | 无 |
+| `kiss`、`hug`、`touch`、`lick`、`french_kiss`、`hug_from_behind`、`tease` | 无 |
 | `custom` | `text`：必填，1–100 字符 |
 | `tip` | `amount_usd`：必填，有限数值，`> 0` 且 `≤ 1_000_000_000` |
 | `gift` | `kind`：`item` \| `clothing`（必填）；`name`：必填，1–64 字 |
@@ -726,6 +726,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 | `first_meet` | 会话里一条消息都没有 | 你们还没聊过 |
 | `returning` | 用户在这个会话里至少发过一条消息 | 距用户上一条消息过了几天 |
 | `just_opened` | 无 | 对方刚打开聊天 |
+| `check_in` | 用户在这个会话里至少发过一条消息 | 你还记挂着上次聊到的事，想问问后来怎么样了 |
 
 带 `occasion` 时必须带 `open_key`，不带 `occasion` 时不能带：1–128 个 `[A-Za-z0-9_.:-]` 字符，
 只在本会话内有效。同一个 key 重复调用返回同一条消息，不论这次传的是哪个 `occasion`；换新 key 可以再生成一条。
@@ -735,7 +736,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 { "greeting": { "message_id": "01J…", "content": "好久不见，最近忙什么呢", "sent_at": "…", "occasion": "returning" } }
 ```
 
-响应里的 `occasion` 取值为 `birthday`、`holiday`、`first_meet`、`returning` 或 `just_opened`。同样形状的消息在生活事件的消息上带 `event`（见下面的 events 路由），在她提出分开或浪漫选择的请求、以及对用户回答的回应上带 `life_choice`（见下面的生活选择路由）。
+响应里的 `occasion` 取值为 `birthday`、`holiday`、`first_meet`、`returning`、`just_opened` 或 `check_in`。同样形状的消息在生活事件的消息上带 `event`（见下面的 events 路由），在她提出分开或浪漫选择的请求、以及对用户回答的回应上带 `life_choice`（见下面的生活选择路由）。
 
 - **同步：** 一次非流式生成，需要几秒，不要阻塞 UI。
 - **幂等：** 生日和节日开场白按会话加当地日期（生日用角色那边的日期，节日用用户那边的日期），场合按会话加 `open_key`。写入过之后，重复调用返回那一条，不会再生成；返回 `null` 的调用什么都没写，同一个 key 再调仍可能生成。
@@ -916,7 +917,7 @@ composer 失败时退回普通的人物肖像 prompt，跟聊天回合一样。�
 
 它们持续期间，角色任何一个 session 里的每一轮文字消息都会被 ghost，不经过判官，也不计入 ghost 连续次数，
 `/open` 返回 `null`。已经讲出来的 `busy`、`in_battle` 或 `out_shopping` 同样让轮次沉默。
-带用户 `action` 的轮次（任何 `type`：`give`、`gift`、`tip`、`kiss`、`hug`、`touch`、`lick`、`custom`）或 `image.force = true` 是例外：
+带用户 `action` 的轮次（任何 `type`：`give`、`gift`、`tip`、`kiss`、`hug`、`touch`、`lick`、`french_kiss`、`hug_from_behind`、`tease`、`custom`）或 `image.force = true` 是例外：
 它走正常路径并得到回复，因为动作在语义上是线下互动，用不着手机，强制出图的轮次永远是 `reply_image`。
 角色只在 ghost 保护允许的地方才会这样沉默：部署的 ghosting 开关关闭（`ghosting = false`）时不会抽到任何离线类种类，已经在进行的一段也不再让轮次沉默，
 用户消息不足 10 条的会话里也不会抽到；调用方完全不想要它们，就在 `kinds` 里不写。这样被 ghost 的消息没有回执（没有判官读过它），
@@ -1118,7 +1119,7 @@ SSE 帧是整轮最后一帧且只走线上——在它发出前断线，光看 
 
 `speaker_session_id`（只出现在群 session 的 assistant 行上，其余省略）是说这句话的成员 session；已离群的发言者，其名字通过 session 再到 instance 解析。
 
-`occasion`（只出现在角色主动写下的 assistant 行上，其余省略）说明她为什么开口：这一行的 `metadata.proactive`，取值为 `birthday`、`holiday`、`first_meet`、`returning`、`just_opened`、`event` 或 `life_choice`（她提出分开或浪漫选择的请求，以及她对回答的回应）。适配了[生活选择](#post-v2compsessionsession_idlife-choiceschoice_id)的客户端读到 `life_choice` 时，应当重新拉一次好感度 delta。
+`occasion`（只出现在角色主动写下的 assistant 行上，其余省略）说明她为什么开口：这一行的 `metadata.proactive`，取值为 `birthday`、`holiday`、`first_meet`、`returning`、`just_opened`、`check_in`、`event` 或 `life_choice`（她提出分开或浪漫选择的请求，以及她对回答的回应）。适配了[生活选择](#post-v2compsessionsession_idlife-choiceschoice_id)的客户端读到 `life_choice` 时，应当重新拉一次好感度 delta。
 
 `life_choice`（只出现在她提出请求的那条 assistant 行上，其余行省略）是这一行向用户提出的选择，以及它现在的状态，这样重新加载的客户端或第二台设备也能在她的请求与她的回应之间画出用户的回答：
 

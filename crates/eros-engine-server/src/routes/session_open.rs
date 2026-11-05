@@ -89,6 +89,9 @@ pub enum OpenOccasion {
     Returning,
     /// No particular reason.
     JustOpened,
+    /// The user has spoken in this session before; the persona asks after
+    /// what they last talked about.
+    CheckIn,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -114,6 +117,7 @@ pub enum GreetingOccasion {
     FirstMeet,
     Returning,
     JustOpened,
+    CheckIn,
     /// A life event the persona tells about (`POST …/events`).
     Event,
     /// What she says about a life choice, of any kind (`ask_for_space`,
@@ -447,6 +451,12 @@ async fn caller_occasion(
             }
         }
         OpenOccasion::JustOpened => Occasion::JustOpened { open_key },
+        OpenOccasion::CheckIn => {
+            if last_user.is_none() {
+                return Ok(answer(chat_repo.open_message(session_id, &open_key).await?));
+            }
+            Occasion::CheckIn { open_key }
+        }
     };
     Ok(Next::Speak {
         occasion,
@@ -1541,6 +1551,39 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn check_in_takes_its_own_cue(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let now = Utc::now();
+        let session_id =
+            session_with_history(&pool, user_id, now - chrono::Duration::days(2)).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "昨晚睡得好吗").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+
+        let g = open_at(
+            &state,
+            session_id,
+            user_id,
+            opener(OpenOccasion::CheckIn, "visit-1"),
+            now,
+        )
+        .await
+        .unwrap()
+        .greeting
+        .expect("an opener");
+        assert_eq!(g.occasion, GreetingOccasion::CheckIn);
+        let meta = row_metadata(&pool, g.message_id).await;
+        assert_eq!(meta["proactive"], json!("check_in"));
+        assert_eq!(meta["open_key"], json!("visit-1"));
+        assert!(meta.get("gap_days").is_none());
+        let calls = companion_calls(&mock).await;
+        assert_eq!(
+            last_message(&calls[0])["content"],
+            json!(crate::pipeline::proactive::CHECK_IN_CUE)
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn an_occasion_that_is_not_true_means_no_opener_and_no_call(pool: PgPool) {
         let user_id = Uuid::new_v4();
         let now = Utc::now();
@@ -1568,6 +1611,8 @@ mod tests {
             (empty, OpenOccasion::Returning),
             (greeted_only, OpenOccasion::FirstMeet),
             (greeted_only, OpenOccasion::Returning),
+            (empty, OpenOccasion::CheckIn),
+            (greeted_only, OpenOccasion::CheckIn),
         ] {
             let out = open_at(
                 &state,
