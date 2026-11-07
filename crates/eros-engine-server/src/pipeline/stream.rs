@@ -2792,8 +2792,8 @@ fn render_product_qa_pairs(pairs: &[(String, String)]) -> String {
 /// The action type a `photo` turn changes to, or `None` when the plan stands
 /// (spec 2026-11-08-five-actions-two-items-gluttony-card-1-1-design.md §2.3):
 /// an accepted photo with an image executor shows her picture after her
-/// words; any other photo is text only, even when the judge proposed a
-/// picture.
+/// words, always of her face; any other photo is text only, even when the
+/// judge proposed a picture.
 fn photo_action(
     event: &eros_engine_core::types::Event,
     plan: &eros_engine_core::types::ActionPlan,
@@ -2820,7 +2820,10 @@ fn photo_action(
     } else {
         return None;
     };
-    (plan.action_type != target).then_some(target)
+    let stands = plan.action_type == target
+        && (target == ActionType::ReplyText
+            || plan.image_ref == eros_engine_core::types::ImageRef::Face);
+    (!stands).then_some(target)
 }
 
 fn apply_give_refusal(plan: &mut eros_engine_core::types::ActionPlan, refused: bool) {
@@ -5137,9 +5140,12 @@ pub(crate) fn run_stream_with(
         // forced-image override, which still wins.
         if let Some(action) = photo_action(&input.event, &plan, image_executor_available) {
             let aspect = (action == ActionType::ReplyTextImage
-                && plan.action_type == ActionType::ReplyImage)
-                .then(|| plan.aspect_ratio.clone())
-                .flatten();
+                && matches!(
+                    plan.action_type,
+                    ActionType::ReplyImage | ActionType::ReplyTextImage
+                ))
+            .then(|| plan.aspect_ratio.clone())
+            .flatten();
             plan = pde::plan_for(
                 &input,
                 action,
@@ -19619,6 +19625,20 @@ data: [DONE]\n\n";
                 "{a:?} {response:?} {ty:?} {available}"
             );
         }
+        // The judge's own text+image plan is rebuilt when it builds on the
+        // previous picture: a photo is always of her face.
+        let mut input = fixture_decision_input();
+        if let Event::UserMessage { action, .. } = &mut input.event {
+            *action = Some(Photo);
+        }
+        let mut plan = pde::decide(&input);
+        plan.action_response = Some(Accept);
+        plan.action_type = ReplyTextImage;
+        plan.image_ref = eros_engine_core::types::ImageRef::Previous;
+        assert_eq!(
+            photo_action(&input.event, &plan, true),
+            Some(ReplyTextImage)
+        );
     }
 
     #[test]
