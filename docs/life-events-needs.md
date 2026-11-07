@@ -326,6 +326,7 @@ weight and never lifts a gate.
 |---|---|
 | `ex_message`, `breakup` | intimacy rung 2 or higher |
 | `sudden_desire` | intimacy rung 3 |
+| `strip` | intimacy rung 3, and the session's newest recorded `memory_scope` and `affinity_scope` are romance-compatible (relationship memory on, a chemistry axis in scope); none recorded is not compatible |
 | `period`, `saw_bag`, `saw_clothes` | the persona's `art_metadata.gender` is `"female"` |
 | `period_scare` | the persona's `art_metadata.gender` is `"female"`, and intimacy rung 2 or higher |
 | `pregnancy_scare` | the persona's `art_metadata.gender` is `"female"`, and intimacy rung 3 |
@@ -350,7 +351,8 @@ authors the persona, sit beside `gender`, `birthday` and `timezone`:
 | `prefer_trip` | `true`, `false` (default) | the `trip` category weighs 3 times as much |
 | `homesick` | `true`, `false`, absent (default) | within `trip`: `true` weighs `hometown_visit` 3 times and `short_trip` / `long_trip` a third; `false` weighs `hometown_visit` a third; `business_trip` is work and untouched either way |
 | `is_virgin` | `true`, `false` (default) | while she is a virgin, `having_sex` weighs a fifth within `mid` |
-| `sex_addict` | `true`, `false`, absent (default) | within `short`: `true` weighs `sudden_desire` 3 times, `false` a third; its rung gate holds either way |
+| `sex_addict` | `true`, `false`, absent (default) | within `short`: `true` weighs `sudden_desire` and `strip` 3 times, `false` a third; their gates hold either way |
+| `setting` | `"modern"` (default), `"fantasy"` | the world she lives in ([below](#her-world)); any other value reads as `modern` |
 | `smoking`, `alcoholic`, `drug`, `coffee`, `gluttony` | each `true`, `false`, absent (default) | whether she smokes, drinks, uses weed, drinks coffee, loves good food (`false`: she keeps off rich food): how fast `indulgence` comes back ([drift](#drift-between-ratings)), what a high `indulgence` names in the reply, and how she takes a give of that thing (below) |
 
 `prefer_trip` says whether she moves at all; `homesick` says where she goes when she does. A
@@ -400,7 +402,8 @@ the first stage, and does not shorten a cooldown.
 
 | live prior | kinds weighed 3 times |
 |---|---|
-| `ex_message`, `sudden_desire` | `having_sex` |
+| `ex_message`, `sudden_desire`, `strip` | `having_sex` |
+| `sudden_desire` | `strip` |
 | `sick` | `period_scare` |
 | `having_sex` | `pregnancy_scare` |
 | `business_trip` | `on_the_road`, `on_the_way`, `busy`, `temp_work` |
@@ -738,6 +741,31 @@ composer, a `taking_selfie` message carries the selfie: her words come first and
 draws from them (see [api-reference](api-reference.md#post-v2compsessionsession_idevents));
 otherwise it is words only. `watching_match` and `taking_selfie` are drawn in hospital; the other
 four need her out and about.
+
+### She undresses for you
+
+`strip` (`short`, 30 min, weight 1, 48 h cooldown) is her undressing for the user. It needs
+intimacy rung 3 and a romance-compatible pair ([gates](#gates)). Sudden desire makes it likelier,
+it makes having sex likelier, and `sex_addict` scales it as it scales `sudden_desire`. With
+`image` in the request and the composer configured, the message carries her picture, as a
+selfie does; her cue says she just undressed and sent it, otherwise that she wants the user to
+see. Her clothing in the message is 刚把衣服脱了, or 刚把「{outfit}」脱了 over the request's
+`outfit`, so the picture never shows her dressed. It carries adult themes, like
+`sudden_desire`; a caller that serves those only to some users disallows it.
+
+### Her world
+
+`art_metadata.setting` says which world she lives in: `modern` (the default, and what any other
+value reads as) or `fantasy`. A kind that needs modern life is never drawn for a `fantasy`
+persona, whatever the request's `kinds` or her `prefer_events` say:
+
+| fits | kinds |
+|---|---|
+| `modern` only | `police_encounter`, `showering`, `taking_selfie`, `gaming`, `watching_match`, `watching_show`, `business_trip`, `hospitalized`, `post_surgery` |
+| both | every other kind |
+
+No kind is `fantasy` only yet, so a `fantasy` persona draws from a smaller set and a persona with
+no `setting` draws exactly as before.
 
 ### Going out and going home
 

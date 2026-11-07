@@ -265,6 +265,9 @@ roll can refuse whatever the judge says
   verdict; the turn is graded like any other.
 - **Social actions:** a refused `bluff`, `threaten` or `trick` means she saw
   through it, and drops no line either; the turn is graded like any other.
+- **Strip:** a `strip` from a pair whose scopes are not romance-compatible is
+  refused whatever the judge says, and drops Chemistry like any refused
+  physical action.
 - **Gift:** accepted, the gift also joins the persona's items or wardrobe;
   refused, it joins nothing and drops Bond like a refused `give`.
 

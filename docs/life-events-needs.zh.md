@@ -257,6 +257,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 |---|---|
 | `ex_message`、`breakup` | 亲密度档 2 及以上 |
 | `sudden_desire` | 亲密度档 3 |
+| `strip` | 亲密度档 3，且会话最新记录的 `memory_scope` 与 `affinity_scope` 性向相容（开了关系记忆、scope 里有暧昧感轴）；没有记录算不相容 |
 | `period`、`saw_bag`、`saw_clothes` | 角色的 `art_metadata.gender` 为 `"female"` |
 | `period_scare` | 角色的 `art_metadata.gender` 为 `"female"`，并且亲密度档 2 及以上 |
 | `pregnancy_scare` | 角色的 `art_metadata.gender` 为 `"female"`，并且亲密度档 3 |
@@ -279,7 +280,8 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 | `prefer_trip` | `true`、`false`（默认） | `trip` 类别权重为 3 倍 |
 | `homesick` | `true`、`false`、不写（默认） | `trip` 内部：`true` 时 `hometown_visit` 3 倍、`short_trip` / `long_trip` 三分之一；`false` 时 `hometown_visit` 三分之一；`business_trip` 是工作，两种情况都不动 |
 | `is_virgin` | `true`、`false`（默认） | 她还是处女期间，`having_sex` 在 `mid` 内权重为五分之一 |
-| `sex_addict` | `true`、`false`、不写（默认） | `short` 内部：`true` 时 `sudden_desire` 3 倍，`false` 时三分之一；它的亲密度档门槛两种情况都照旧 |
+| `sex_addict` | `true`、`false`、不写（默认） | `short` 内部：`true` 时 `sudden_desire` 与 `strip` 3 倍，`false` 时三分之一；它们的门槛两种情况都照旧 |
+| `setting` | `"modern"`（默认）、`"fantasy"` | 她生活的世界（见[下文](#她的世界)）；其他值按 `modern` 读 |
 | `smoking`、`alcoholic`、`drug`、`coffee`、`gluttony` | 各为 `true`、`false`、不写（默认） | 她抽不抽烟、喝不喝酒、用不用大麻、喝不喝咖啡、贪不贪吃（`false` 表示她忌口、节食）：决定 `indulgence` 回来得多快（见[漂移](#两次评定之间的漂移)）、`high` 的 `indulgence` 在回复里点名什么，以及她怎么对待递来的这样东西（见下） |
 
 `prefer_trip` 管她动不动，`homesick` 管她动起来往哪去。两者都为 `true` 的空姐角色经常出行、照常出差，
@@ -314,7 +316,8 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 
 | 在线的先行事件 | 权重乘 3 的种类 |
 |---|---|
-| `ex_message`、`sudden_desire` | `having_sex` |
+| `ex_message`、`sudden_desire`、`strip` | `having_sex` |
+| `sudden_desire` | `strip` |
 | `sick` | `period_scare` |
 | `having_sex` | `pregnancy_scare` |
 | `business_trip` | `on_the_road`、`on_the_way`、`busy`、`temp_work` |
@@ -582,6 +585,26 @@ ghosting 开关关闭时，已经在进行的一段不会让任何轮次沉默�
 哪件作品、什么比赛、坐的什么。请求带 `image`、部署配了 composer 时，`taking_selfie` 的消息带上这张自拍：先写她的话，
 composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2compsessionsession_idevents)）；否则只有文字。`watching_match` 和 `taking_selfie`
 住院也抽；其余四种要她出门。
+
+### 脱给你看
+
+`strip`（`short`，30 分钟，权重 1，冷却 48 小时）是她脱衣服给对方看。它要亲密度档 3，并且这一对性向相容
+（见门槛表）。突然很想要会让它更容易出现，它又会让做爱更容易出现，`sex_addict` 对它的缩放与 `sudden_desire` 相同。
+请求带 `image`、部署配了 composer 时，消息会像自拍一样带上她的图；提示句说她刚脱了衣服拍了一张发过去，否则说她想让对方看看。
+消息里的穿着写成刚把衣服脱了，请求带 `outfit` 时写成刚把「{outfit}」脱了，所以图里不会是穿着衣服的她。它和 `sudden_desire`
+一样带成人题材，只对部分用户提供这类内容的调用方把它排除。
+
+### 她的世界
+
+`art_metadata.setting` 说她生活在哪个世界：`modern`（默认，其他值也按它读）或 `fantasy`。需要现代生活的种类不会对
+`fantasy` 的角色抽出，不管请求的 `kinds` 或她的 `prefer_events` 怎么写：
+
+| 适用 | 种类 |
+|---|---|
+| 只限 `modern` | `police_encounter`、`showering`、`taking_selfie`、`gaming`、`watching_match`、`watching_show`、`business_trip`、`hospitalized`、`post_surgery` |
+| 两者都可 | 其余所有种类 |
+
+目前还没有只限 `fantasy` 的种类，所以 `fantasy` 的角色从更小的集合里抽，没有 `setting` 的角色抽取和以前完全一样。
 
 ### 想出门与想回家
 
