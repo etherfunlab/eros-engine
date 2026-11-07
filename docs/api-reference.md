@@ -430,7 +430,7 @@ physical or custom action → chemistry), and a refused `tip`, `bluff`, `threate
 | `type` | fields |
 |---|---|
 | `give` | `item`: one of the categories below (required); `name`: optional, 1–32 chars; `quantity`: optional, 1–99, default 1 |
-| `kiss`, `hug`, `touch`, `lick`, `french_kiss`, `hug_from_behind`, `tease`, `pat`, `photo` | none |
+| `kiss`, `hug`, `touch`, `lick`, `french_kiss`, `hug_from_behind`, `tease`, `pat`, `photo`, `strip` | none |
 | `bluff`, `threaten`, `trick` | none |
 | `custom` | `text`: required, 1–100 chars |
 | `tip` | `amount_usd`: required, finite, `> 0` and `≤ 1_000_000_000` |
@@ -460,7 +460,9 @@ A turn is a user message of the text session; product-QA messages and voice call
 
 **Social actions.** For `bluff`, `threaten` and `trick` the response says whether she falls for it: `accept` is 信了, 被吓到了 or 上当了, and `refuse` is 没信, 没吃这一套 or 识破了. As for every action, an undecided response is `accept`. Seeing through one costs nothing; the affinity judge grades the turn as it grades any other.
 
-**A photo she lets you take.** An accepted `photo` on a turn whose request carries `image`, in a deployment with `[tasks.chat_image_prompt_compose]` configured, is answered as `reply_text_image`: her words, then one `image_request` built on her face reference, composed from the scene. This holds with or without the LLM judge. A refused `photo`, or one without that image capability, is a text reply, even when the judge proposed a picture. `image.force = true` still makes the turn `reply_image`.
+**Strip.** `strip` is the user undressing her, and only a romance-compatible pair can have it accepted: relationship memory on in `memory_scope` and a chemistry axis in `affinity_scope` on this turn. Any other pair's `strip` is refused before the judge runs, whatever it answers and with or without the LLM judge, and drops the chemistry line a tier like any refused physical action. An accepted `strip` undresses her this turn: her clothing reads 衣服被对方脱掉了, or 「{outfit}」被对方脱掉了 over a named `outfit`, in her reply and in the picture. With image capability it comes back as her picture, like a photo (below).
+
+**A photo she lets you take.** An accepted `photo` on a turn whose request carries `image`, in a deployment with `[tasks.chat_image_prompt_compose]` configured, is answered as `reply_text_image`: her words, then one `image_request` built on her face reference, composed from the scene. This holds with or without the LLM judge. An accepted `strip` is answered the same way. A refused `photo` or `strip`, or one without that image capability, is a text reply, even when the judge proposed a picture. `image.force = true` still makes the turn `reply_image`, and on a refusal the picture follows the refusal.
 
 With an action, `content` may be empty, and it can be combined with
 `image_url` and `image`. Every value violation (bounds, missing
@@ -618,7 +620,7 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 - `ghost`: `meta(action_type=ghost) → done → final` — no `delta`, no `model` in `meta`, `usage` and `generation_id` are `null` in `done`. The companion stayed silent this turn; no chat model was called.
 - reasoning: when the judge returned reasoning, `reasoning*` precedes every shape in this list, ahead of `action_response` and `body_state`: `reasoning* → meta(reply) → delta* → done → final`
 - action turn: the same shapes with `action_response` ahead of the first `meta` — `action_response → meta(reply) → delta* → done → final`; never `ghost` or `product_qa`
-- an accepted `photo` with image capability: `action_response → meta(reply_text_image) → delta* → done → image_request → final`
+- an accepted `photo` or `strip` with image capability: `action_response → meta(reply_text_image) → delta* → done → image_request → final`
 - a turn with lingering effects or known needs: `body_state` sits ahead of the first `meta`, after `action_response` when both are sent — e.g. `action_response → body_state → meta(reply) → delta* → done → final`
 - `product_qa`: `meta(action_type=product_qa) → delta* → done → final` — same shape as a normal text reply, streamed by an independent model chain (`[tasks.chat_product_qa]`) instead of `chat_companion`; persisted with `channel='product_qa'` and reported as `product_qa` again on replay.
 
@@ -952,8 +954,8 @@ How the draw works and how events and the persona's needs fit together is in
 | `event_key` | required: 1–128 characters of `[A-Za-z0-9_.:-]`, scoped to the session. The same key returns the same event |
 | `kinds` | optional. Absent or `null`: every kind. An array allows the listed kinds (`[]`: nothing is drawn). An object `{"allow": […], "disallow": […]}` allows what `allow` lists (absent or `null`: every kind; `[]`: none) minus what `disallow` lists; a kind in both is not drawn, and `{}` allows every kind. An unknown key in the object or an unknown kind is a `422`, and so is `taking_space` or `fell_out`: the engine places those itself and never draws them |
 | `user_timezone`, `user_country`, `user_region`, `tier`, `prompt_traits`, `memory_scope`, `affinity_scope`, `audit` | as on `/open`, for generating the message |
-| `image` | optional: `{"style", "aspect_ratio", "prompt_variant"}`, each as on a chat turn's `image` (no `force`; an unsupported `aspect_ratio` is a `422`). The caller handles images: a `taking_selfie` message then carries her picture, when `[tasks.chat_image_prompt_compose]` is configured (below). Absent, or no composer: words only. Every other kind ignores it |
-| `outfit` | optional: what she wears, as on a chat turn — typically one of her wardrobe entries, not checked against it; 1–64 characters after trim, blank reads as absent, longer is a `422`. Her words follow it, and so does her picture. Absent: no outfit in her prompt, and the composer dresses her from the scene |
+| `image` | optional: `{"style", "aspect_ratio", "prompt_variant"}`, each as on a chat turn's `image` (no `force`; an unsupported `aspect_ratio` is a `422`). The caller handles images: a `taking_selfie` or `strip` message then carries her picture, when `[tasks.chat_image_prompt_compose]` is configured (below). Absent, or no composer: words only. Every other kind ignores it |
+| `outfit` | optional: what she wears, as on a chat turn — typically one of her wardrobe entries, not checked against it; 1–64 characters after trim, blank reads as absent, longer is a `422`. Her words follow it, and so does her picture. On a `strip` she has just taken it off: 刚把「{outfit}」脱了, or 刚把衣服脱了 without one. Absent: no outfit in her prompt, and the composer dresses her from the scene |
 
 Kinds fall into four categories. `short` and `mid` are incidents; `body` and
 `trip` are backgrounds that last days, during which incidents still happen.
@@ -981,6 +983,7 @@ Kinds fall into four categories. `short` and `mid` are incidents; `body` and
 | `short` | `admiring_scenery` | 1 h | she is taking in a view |
 | `short` | `admiring_art` | 1 h | she is at an exhibition, in front of a piece |
 | `short` | `taking_selfie` | 30 min | she has just taken a selfie and wants to show it; with `image` in the request, the message carries it |
+| `short` | `strip` | 30 min | she has just undressed for the user (rung 3, a romance-compatible pair); with `image` in the request, the message carries her picture |
 | `mid` | `temp_work` | 4 h | she is called in to work |
 | `mid` | `ex_message` | 3 h | her ex texts her |
 | `mid` | `weather_change` | 4 h | the weather turns |
@@ -1023,9 +1026,9 @@ user ignores her ask for space, 1 h). The engine writes them for the
 show up as the `event` of `…/effects` and of the life-choice response, and
 cannot be listed in `kinds`.
 
-`sudden_desire`, `having_sex` and `pregnancy_scare`, which implies sex, carry adult themes;
+`sudden_desire`, `strip`, `having_sex` and `pregnancy_scare`, which implies sex, carry adult themes;
 a caller that serves them only to some users leaves them out with
-`{"disallow": ["sudden_desire", "having_sex", "pregnancy_scare"]}`. `scolded_by_superior` and
+`{"disallow": ["sudden_desire", "strip", "having_sex", "pregnancy_scare"]}`. `scolded_by_superior` and
 `scolded_superior` assume someone above her; for a persona with no one above
 her, the caller disallows them. A `disallow` list leaves every other kind in,
 including kinds the engine adds later. An array or an `allow` list draws only
@@ -1060,7 +1063,8 @@ The draw:
   [life-events-needs.md](life-events-needs.md#1-needs-weight-the-kind-pick)).
 - **Closeness gates.** `ex_message` and `breakup` are not drawn for someone she
   barely knows (intimacy rung 2 and up); `sudden_desire` only at the closest
-  rung (3). `period` is drawn only for a persona whose `art_metadata.gender` is
+  rung (3), and `strip` at rung 3 only when the session's newest recorded
+  `memory_scope` and `affinity_scope` are romance-compatible (none recorded: not drawn). `period` is drawn only for a persona whose `art_metadata.gender` is
   `"female"`. `period_scare` (rung 2 and up) and `pregnancy_scare` (rung 3) are
   also drawn only for such a persona, and so are `saw_bag` and `saw_clothes`;
   from rung 2 she says she wants what she found, in her `tip_personality`'s
@@ -1075,7 +1079,8 @@ The draw:
   | `prefer_trip` | `true` / `false` (default) | trips come up three times as often; still once a week at most |
   | `homesick` | `true` / `false` / absent | where a trip goes: `true` favours `hometown_visit` and thins the leisure trips, `false` thins `hometown_visit`; `business_trip` untouched |
   | `is_virgin` | `true` / `false` (default) | `having_sex` is a fifth as likely until her first `having_sex` event, after which the key no longer applies |
-  | `sex_addict` | `true` / `false` / absent | `sudden_desire` comes up three times / a third as often within `short`; still only at the closest rung |
+  | `sex_addict` | `true` / `false` / absent | `sudden_desire` and `strip` come up three times / a third as often within `short`; their gates hold |
+  | `setting` | `"modern"` (default), `"fantasy"` | the world she lives in: a `fantasy` persona never draws `police_encounter`, `showering`, `taking_selfie`, `gaming`, `watching_match`, `watching_show`, `business_trip`, `hospitalized` or `post_surgery`, whatever `kinds` or `prefer_events` say; any other value reads as `modern` |
   | `smoking`, `alcoholic`, `drug`, `coffee`, `gluttony` | each `true` / `false` / absent | whether she smokes, drinks, uses weed, drinks coffee, loves good food: the more are `true`, the sooner her `indulgence` comes back to `high` and weighs the pick; a `false` key can make her refuse a `give` of that thing ([above](#post-compchatsession_idmessagestream)) |
 
   A value of the wrong shape, an unknown kind or a kind outside `mid` is
@@ -1098,7 +1103,7 @@ drawn length. An incident drawn during a background is told from inside it
 (「出差途中遇到一只小猫」). `offline` is `true` for the offline kinds (below)
 and `false` for every other kind.
 
-**Her picture.** A `taking_selfie` drawn with `image` in the request, on a
+**Her picture.** A `taking_selfie` or `strip` drawn with `image` in the request, on a
 deployment that configures `[tasks.chat_image_prompt_compose]`, is told in
 words plus one delegated picture, like a chat turn's `reply_text_image`. Her
 message is written first; the composer then reads it as the end of the recent
@@ -1139,7 +1144,7 @@ While one lasts, every text turn in any session of the persona ghosts, without
 the judge and without counting towards the ghost streak, and `/open` returns
 `null`. An announced `busy`, `in_battle` or `out_shopping` still ghosts. A turn that carries a
 user `action` (any `type`: `give`, `gift`, `tip`, `kiss`, `hug`, `touch`,
-`lick`, `french_kiss`, `hug_from_behind`, `tease`, `pat`, `photo`, `bluff`, `threaten`, `trick`, `custom`) or `image.force = true` is the exception: it takes the normal
+`lick`, `french_kiss`, `hug_from_behind`, `tease`, `pat`, `photo`, `strip`, `bluff`, `threaten`, `trick`, `custom`) or `image.force = true` is the exception: it takes the normal
 path and is answered, because an action is interaction in person, which needs
 no phone, and a forced image turn is always `reply_image`. The persona goes
 silent this way only where the ghost protection allows it, so with the

@@ -377,7 +377,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 | `type` | 字段 |
 |---|---|
 | `give` | `item`：下表中的一类，必填；`name`：可选，1–32 字符；`quantity`：可选，1–99，默认 1 |
-| `kiss`、`hug`、`touch`、`lick`、`french_kiss`、`hug_from_behind`、`tease`、`pat`、`photo` | 无 |
+| `kiss`、`hug`、`touch`、`lick`、`french_kiss`、`hug_from_behind`、`tease`、`pat`、`photo`、`strip` | 无 |
 | `bluff`、`threaten`、`trick` | 无 |
 | `custom` | `text`：必填，1–100 字符 |
 | `tip` | `amount_usd`：必填，有限数值，`> 0` 且 `≤ 1_000_000_000` |
@@ -407,7 +407,9 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 **社交动作。** `bluff`、`threaten`、`trick` 的回应表示她有没有中招：`accept` 是信了、被吓到了、上当了，`refuse` 是没信、没吃这一套、识破了。和所有动作一样，没有判定时算 `accept`。识破不降档，这一轮由亲密度判官照常评。
 
-**让你拍照。** 请求带 `image`、部署配置了 `[tasks.chat_image_prompt_compose]` 时，被接受的 `photo` 以 `reply_text_image` 回复：先是她的话，再是一条以她的脸部参考为基础、按当前场景组出来的 `image_request`。有没有 LLM 判官都一样。被拒的 `photo`，或没有这项出图能力的 `photo`，只回文字，即使判官提议了出图。`image.force = true` 仍让这一轮是 `reply_image`。
+**脱衣服。** `strip` 是用户脱她的衣服，只有性向相容的一对才可能被接受：这一轮的 `memory_scope` 开了关系记忆，`affinity_scope` 含暧昧感轴。其他组合的 `strip` 在判官运行之前就判为拒绝，不管判官怎么答，也不管有没有 LLM 判官，并像任何被拒的身体动作一样让 chemistry 线降一档。被接受的 `strip` 让她这一轮没穿衣服：穿着写成衣服被对方脱掉了，有指定 `outfit` 时写成「{outfit}」被对方脱掉了，进回复也进图。有出图能力时它像拍照一样回她的图（见下）。
+
+**让你拍照。** 请求带 `image`、部署配置了 `[tasks.chat_image_prompt_compose]` 时，被接受的 `photo` 以 `reply_text_image` 回复：先是她的话，再是一条以她的脸部参考为基础、按当前场景组出来的 `image_request`。有没有 LLM 判官都一样。被接受的 `strip` 也这样回复。被拒的 `photo` 或 `strip`，或没有这项出图能力的，只回文字，即使判官提议了出图。`image.force = true` 仍让这一轮是 `reply_image`，被拒时图按拒绝的结果来画。
 
 带动作时 `content` 可以为空，也可以和 `image_url`、`image` 同时出现。取值不合规（超出范围、缺少 `item`/`text`/`amount_usd`/`kind`/`name`）一律返回 `422`，`code: "unprocessable"`；`type` 或 `item` 不在上表取值内时，请求体按无法解析的 JSON 拒绝（同样是 `422`）。动作存在用户行上，两套历史接口都以 `action` 字段返回，该回合生效之后带 `response`。
 
@@ -521,7 +523,7 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 - `ghost`：`meta(action_type=ghost) → done → final` — 无 `delta`，`meta` 中无 `model`，`done` 的 `usage` 和 `generation_id` 均为 `null`。该轮伴侣保持沉默，未调用聊天模型。
 - 带推理的回合：判官返回了推理时，`reasoning*` 排在这份列表里每种形状的最前面，在 `action_response` 和 `body_state` 之前：`reasoning* → meta(reply) → delta* → done → final`
 - 动作轮次：形状相同，只是 `action_response` 排在第一个 `meta` 之前——`action_response → meta(reply) → delta* → done → final`；不会是 `ghost` 或 `product_qa`
-- 有出图能力时被接受的 `photo`：`action_response → meta(reply_text_image) → delta* → done → image_request → final`
+- 有出图能力时被接受的 `photo` 或 `strip`：`action_response → meta(reply_text_image) → delta* → done → image_request → final`
 - 带余效或已知需求的回合：`body_state` 位于第一个 `meta` 之前，两者都发时排在 `action_response` 之后——例如 `action_response → body_state → meta(reply) → delta* → done → final`
 - `product_qa`：`meta(action_type=product_qa) → delta* → done → final` — 形状与普通文本回复相同，由独立的模型链（`[tasks.chat_product_qa]`）流式生成，而非 `chat_companion`；落库时带 `channel='product_qa'`，重放时同样报告为 `product_qa`。
 
@@ -778,8 +780,8 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | `event_key` | 必填：1–128 个 `[A-Za-z0-9_.:-]` 字符，只在本会话内有效。同一个 key 返回同一个事件 |
 | `kinds` | 选填。不带或 `null`：全部种类。数组：只抽列出的种类（`[]`：什么都不抽）。对象 `{"allow": […], "disallow": […]}`：`allow` 允许的种类（不带或 `null`：全部；`[]`：一种都没有）去掉 `disallow` 列出的种类；两边都列了的种类不抽，`{}` 等于全部种类。对象里出现未知的键，或出现未知种类，返回 `422`；写了 `taking_space` 或 `fell_out` 同样返回 `422`：它们由 engine 自己写入，从不抽取 |
 | `user_timezone`、`user_country`、`user_region`、`tier`、`prompt_traits`、`memory_scope`、`affinity_scope`、`audit` | 与 `/open` 相同，用于生成这条消息 |
-| `image` | 选填：`{"style", "aspect_ratio", "prompt_variant"}`，各字段与聊天回合的 `image` 相同（没有 `force`；不支持的 `aspect_ratio` 返回 `422`）。表示调用方能处理图：部署配了 `[tasks.chat_image_prompt_compose]` 时，`taking_selfie` 的消息会带上她的图（见下）。不带、或没配 composer：只有文字。其他种类忽略它 |
-| `outfit` | 选填：她穿什么，与聊天回合相同——通常是她衣橱里的一项，不做核对；去掉首尾空白后 1–64 个字符，空白等于不带，超长返回 `422`。她的话会跟着这身衣服，图也会。不带：prompt 里没有穿着，composer 按场景给她穿 |
+| `image` | 选填：`{"style", "aspect_ratio", "prompt_variant"}`，各字段与聊天回合的 `image` 相同（没有 `force`；不支持的 `aspect_ratio` 返回 `422`）。表示调用方能处理图：部署配了 `[tasks.chat_image_prompt_compose]` 时，`taking_selfie` 或 `strip` 的消息会带上她的图（见下）。不带、或没配 composer：只有文字。其他种类忽略它 |
+| `outfit` | 选填：她穿什么，与聊天回合相同——通常是她衣橱里的一项，不做核对；去掉首尾空白后 1–64 个字符，空白等于不带，超长返回 `422`。她的话会跟着这身衣服，图也会。`strip` 时她刚把它脱了：刚把「{outfit}」脱了，不带时是刚把衣服脱了。不带：prompt 里没有穿着，composer 按场景给她穿 |
 
 种类分四个类别（`category`）。`short` 与 `mid` 是插曲；`body` 与 `trip` 是持续数天的背景，背景进行期间插曲照样会发生。
 
@@ -806,6 +808,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | `short` | `admiring_scenery` | 1 小时 | 在看风景 |
 | `short` | `admiring_art` | 1 小时 | 在看展，停在一件作品前 |
 | `short` | `taking_selfie` | 30 分钟 | 刚拍了张自拍，想给对方看；请求带 `image` 时，消息会带上这张图 |
+| `short` | `strip` | 30 分钟 | 刚脱了衣服给对方看（档 3、性向相容的一对）；请求带 `image` 时，消息会带上她的图 |
 | `mid` | `temp_work` | 4 小时 | 临时接到工作 |
 | `mid` | `ex_message` | 3 小时 | 前任发来消息 |
 | `mid` | `weather_change` | 4 小时 | 天气突然变了 |
@@ -844,8 +847,8 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 它们由 engine 为[生活选择流程](#post-v2compsessionsession_idlife-choiceschoice_id)写入，作为 `…/effects` 和生活选择响应里的 `event` 出现，
 不能写进 `kinds`。
 
-`sudden_desire`、`having_sex` 与 `pregnancy_scare`（后者隐含性行为）带成人题材；只对部分用户提供这类内容的调用方，用
-`{"disallow": ["sudden_desire", "having_sex", "pregnancy_scare"]}` 把它们排除。`scolded_by_superior` 与 `scolded_superior`
+`sudden_desire`、`strip`、`having_sex` 与 `pregnancy_scare`（后者隐含性行为）带成人题材；只对部分用户提供这类内容的调用方，用
+`{"disallow": ["sudden_desire", "strip", "having_sex", "pregnancy_scare"]}` 把它们排除。`scolded_by_superior` 与 `scolded_superior`
 假定她有上级；角色没有上级时，由调用方排除。`disallow` 列表之外的种类都照常抽取，engine 以后新增的种类也一样。
 数组或 `allow` 列表只抽它点名的种类：用白名单的调用方要把 `want_to_go_out` 和 `want_to_go_home` 加进去才会抽到。
 
@@ -866,7 +869,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
   `want_to_go_out`，`low` 的偏向 `want_to_go_home`，`high` 的 `indulgence` 偏向 `want_to_go_out` 和 `irritable`
   （完整的表见 [life-events-needs.zh.md](life-events-needs.zh.md#1-需求给种类加权)）。
 - **亲近度门槛。** `ex_message` 与 `breakup` 不会向不太熟的人抽出（intimacy 档 2 及以上）；
-  `sudden_desire` 只在最亲近的档（3）。`period` 只对 `art_metadata.gender` 为 `"female"` 的角色抽取；
+  `sudden_desire` 只在最亲近的档（3）；`strip` 在档 3、且会话最新记录的 `memory_scope` 与 `affinity_scope` 性向相容时才抽（没有记录就不抽）。`period` 只对 `art_metadata.gender` 为 `"female"` 的角色抽取；
   `period_scare`（档 2 及以上）与 `pregnancy_scare`（档 3）同样只对这样的角色抽取，`saw_bag` 和 `saw_clothes` 也是；
   从档 2 起，她会说自己想要看中的东西，有 `tip_personality` 的角色用那份人格的口吻说。离线类种类遵循两道 ghost 门槛（见下）。
 - **角色设置**，写在 genome 的 `art_metadata` 里，影响抽取：
@@ -878,7 +881,8 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
   | `prefer_trip` | `true` / `false`（默认） | trip 类被抽到的概率是原来的三倍；仍然每周最多一次 |
   | `homesick` | `true` / `false` / 不写 | 出行往哪去：`true` 偏向 `hometown_visit`、压低游玩的两种；`false` 压低 `hometown_visit`；`business_trip` 不动 |
   | `is_virgin` | `true` / `false`（默认） | 第一次 `having_sex` 事件之前，`having_sex` 的概率是五分之一；之后这个键不再起作用 |
-  | `sex_addict` | `true` / `false` / 不写 | `sudden_desire` 在 `short` 内被抽到的概率是原来的三倍 / 三分之一；仍然只在最亲近的档 |
+  | `sex_addict` | `true` / `false` / 不写 | `sudden_desire` 与 `strip` 在 `short` 内被抽到的概率是原来的三倍 / 三分之一；门槛照旧 |
+  | `setting` | `"modern"`（默认）、`"fantasy"` | 她生活的世界：`fantasy` 的角色不会抽到 `police_encounter`、`showering`、`taking_selfie`、`gaming`、`watching_match`、`watching_show`、`business_trip`、`hospitalized`、`post_surgery`，不管 `kinds` 或 `prefer_events` 怎么写；其他值按 `modern` 读 |
   | `smoking`、`alcoholic`、`drug`、`coffee`、`gluttony` | 各为 `true` / `false` / 不写 | 她抽不抽烟、喝不喝酒、用不用大麻、喝不喝咖啡、贪不贪吃：为 `true` 的越多，她的 `indulgence` 回到 `high` 越快，进而给抽取加权；为 `false` 的键可能让她拒收递来的这样东西（见[上文](#post-compchatsession_idmessagestream)） |
 
   取值形状不对、种类未知，或种类不在 `mid` 里，一律忽略。偏好不会绕过任何门槛。
@@ -895,7 +899,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 `ends_at` 是那一刻加上抽到的时长。背景进行期间抽到的插曲，从背景里讲出来（「出差途中遇到一只小猫」）。
 `offline` 对离线类种类（见下）为 `true`，其他种类为 `false`。
 
-**她的图。** 请求带 `image`、部署配了 `[tasks.chat_image_prompt_compose]` 时，抽到的 `taking_selfie`
+**她的图。** 请求带 `image`、部署配了 `[tasks.chat_image_prompt_compose]` 时，抽到的 `taking_selfie` 或 `strip`
 用一段文字加一张委托出去的图讲出来，跟聊天回合的 `reply_text_image` 一样。先写她的话；composer 再把这句话当作
 最近场景的最后一行来读，所以图里画的就是她说的。没有用户消息要这张图，所以 composer 的「对方最新消息」槽位为空。
 composer 失败时退回普通的人物肖像 prompt，跟聊天回合一样。响应多出 `image_request`，内容与
@@ -923,7 +927,7 @@ composer 失败时退回普通的人物肖像 prompt，跟聊天回合一样。�
 
 它们持续期间，角色任何一个 session 里的每一轮文字消息都会被 ghost，不经过判官，也不计入 ghost 连续次数，
 `/open` 返回 `null`。已经讲出来的 `busy`、`in_battle` 或 `out_shopping` 同样让轮次沉默。
-带用户 `action` 的轮次（任何 `type`：`give`、`gift`、`tip`、`kiss`、`hug`、`touch`、`lick`、`french_kiss`、`hug_from_behind`、`tease`、`pat`、`photo`、`bluff`、`threaten`、`trick`、`custom`）或 `image.force = true` 是例外：
+带用户 `action` 的轮次（任何 `type`：`give`、`gift`、`tip`、`kiss`、`hug`、`touch`、`lick`、`french_kiss`、`hug_from_behind`、`tease`、`pat`、`photo`、`strip`、`bluff`、`threaten`、`trick`、`custom`）或 `image.force = true` 是例外：
 它走正常路径并得到回复，因为动作在语义上是线下互动，用不着手机，强制出图的轮次永远是 `reply_image`。
 角色只在 ghost 保护允许的地方才会这样沉默：部署的 ghosting 开关关闭（`ghosting = false`）时不会抽到任何离线类种类，已经在进行的一段也不再让轮次沉默，
 用户消息不足 10 条的会话里也不会抽到；调用方完全不想要它们，就在 `kinds` 里不写。这样被 ghost 的消息没有回执（没有判官读过它），
