@@ -2789,6 +2789,40 @@ fn render_product_qa_pairs(pairs: &[(String, String)]) -> String {
 
 /// A give the habit roll refused is refused, whatever the judge or the rule
 /// engine settled on.
+/// The action type a `photo` turn changes to, or `None` when the plan stands
+/// (spec 2026-11-08-five-actions-two-items-gluttony-card-1-1-design.md §2.3):
+/// an accepted photo with an image executor shows her picture after her
+/// words; any other photo is text only, even when the judge proposed a
+/// picture.
+fn photo_action(
+    event: &eros_engine_core::types::Event,
+    plan: &eros_engine_core::types::ActionPlan,
+    image_executor_available: bool,
+) -> Option<ActionType> {
+    use eros_engine_core::types::{ActionResponse, Event, UserAction};
+    if !matches!(
+        event,
+        Event::UserMessage {
+            action: Some(UserAction::Photo),
+            ..
+        }
+    ) {
+        return None;
+    }
+    let shows = plan.action_response == Some(ActionResponse::Accept) && image_executor_available;
+    let target = if shows {
+        ActionType::ReplyTextImage
+    } else if matches!(
+        plan.action_type,
+        ActionType::ReplyImage | ActionType::ReplyTextImage
+    ) {
+        ActionType::ReplyText
+    } else {
+        return None;
+    };
+    (plan.action_type != target).then_some(target)
+}
+
 fn apply_give_refusal(plan: &mut eros_engine_core::types::ActionPlan, refused: bool) {
     if refused && plan.action_response.is_some() {
         plan.action_response = Some(eros_engine_core::types::ActionResponse::Refuse);
@@ -4969,8 +5003,20 @@ pub(crate) fn run_stream_with(
         // forced image turn. The composer generates from the recent scene now
         // that no seed exists, so a forced image with the judge disabled must
         // not lose that context; rule-based `pde::decide` never picks image
-        // actions, so `force_image` is the only judge-less image path.
-        let pde_transcript: JudgeTranscript = if resolved_pde.is_some() || force_image {
+        // actions, so `force_image` and a photo turn's picture (spec
+        // 2026-11-08 §2.3) are the judge-less image paths.
+        let photo_picture = image_executor_available
+            && matches!(
+                &input.event,
+                Event::UserMessage {
+                    action: Some(eros_engine_core::types::UserAction::Photo),
+                    ..
+                }
+            );
+        let pde_transcript: JudgeTranscript = if resolved_pde.is_some()
+            || force_image
+            || photo_picture
+        {
             build_input_filter_transcript(&chat_repo, user_msg.session_id, user_msg.user_message_id).await
         } else {
             JudgeTranscript::default()
@@ -5085,6 +5131,26 @@ pub(crate) fn run_stream_with(
             &input,
             std::mem::take(&mut killswitch_hints),
         );
+
+        // A photo she let the user take comes back as her picture after her
+        // words; a refused one is text only (spec 2026-11-08 §2.3). Before the
+        // forced-image override, which still wins.
+        if let Some(action) = photo_action(&input.event, &plan, image_executor_available) {
+            let aspect = (action == ActionType::ReplyTextImage
+                && plan.action_type == ActionType::ReplyImage)
+                .then(|| plan.aspect_ratio.clone())
+                .flatten();
+            plan = pde::plan_for(
+                &input,
+                action,
+                plan.context_hints.clone(),
+                plan.reply_mode,
+                plan.clothing.clone(),
+                eros_engine_core::types::ImageRef::Face,
+                aspect,
+                plan.action_response,
+            );
+        }
 
         // Forced-image override — wins over the PDE/ghost result. Applied AFTER
         // the kill-switch so a client-forced image is never suppressed to ghost.
@@ -10500,6 +10566,147 @@ data: [DONE]\n\n";
             "task-scoped body rule must reach the composer wire"
         );
         assert_eq!(body["messages"][0]["role"], "system", "engine body intact");
+    }
+
+    /// One photo turn with the judge off: the composer is configured and
+    /// fails (500), the chat model streams a reply. `force` forces the image.
+    async fn run_photo_turn(pool: &PgPool, force: bool) -> (Vec<ProtocolFrame>, String) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let body = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"Okay, okay, take it quickly before I change my mind, \"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"and make sure you get my good side this time please\"}}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":9,\"total_tokens\":11},\"id\":\"gen-p\",\"model\":\"primary\"}\n\n\
+data: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"primary\""))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"composer\""))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"primary\"\n\
+                 [tasks.chat_image_prompt_compose]\nmodel = \"composer\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(session_id, "", "01J9222222222222222222222P", "user", None)
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                image_url: None,
+                image: Some(crate::routes::companion_stream::ImageReplyParams {
+                    force,
+                    ..Default::default()
+                }),
+                quote: Default::default(),
+                user_locale: Default::default(),
+                action: Some(eros_engine_core::types::UserAction::Photo),
+                outfit: None,
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        let composer_body = mock
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .filter(|b| b.contains("\"model\":\"composer\""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (frames, composer_body)
+    }
+
+    fn frame_type_names(frames: &[ProtocolFrame]) -> Vec<String> {
+        frames
+            .iter()
+            .map(|f| serde_json::to_value(f).unwrap()["type"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn meta_action_type(frames: &[ProtocolFrame]) -> FrameActionType {
+        frames
+            .iter()
+            .find_map(|f| match f {
+                ProtocolFrame::Meta { action_type, .. } => Some(*action_type),
+                _ => None,
+            })
+            .expect("meta present")
+    }
+
+    /// The rule engine accepts the photo, so her words come first and one
+    /// `image_request` follows, composed from the scene (spec 2026-11-08 §2.3).
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_accepted_photo_without_the_judge_shows_her_picture(pool: PgPool) {
+        let (frames, composer_body) = run_photo_turn(&pool, false).await;
+        let types = frame_type_names(&frames);
+        assert_eq!(types.first().map(String::as_str), Some("action_response"), "{types:?}");
+        assert_eq!(meta_action_type(&frames), FrameActionType::ReplyTextImage);
+        assert!(types.iter().any(|t| t == "delta"), "{types:?}");
+        let ir = types.iter().position(|t| t == "image_request").expect("image_request");
+        let done = types.iter().position(|t| t == "done").expect("done");
+        assert!(done < ir, "{types:?}");
+        assert_eq!(types[ir + 1], "final", "{types:?}");
+        assert_eq!(types.iter().filter(|t| *t == "image_request").count(), 1);
+        assert!(
+            composer_body.contains("举起手机想给你拍张照"),
+            "the composer reads the photo turn: {composer_body}"
+        );
+    }
+
+    /// `image.force` still wins on a photo turn: image only.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_forced_image_still_wins_on_a_photo(pool: PgPool) {
+        let (frames, _) = run_photo_turn(&pool, true).await;
+        let types = frame_type_names(&frames);
+        assert_eq!(meta_action_type(&frames), FrameActionType::ReplyImage);
+        assert!(!types.iter().any(|t| t == "delta"), "{types:?}");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -19361,6 +19568,39 @@ data: [DONE]\n\n";
         );
         let open = build_pde_ctx(&t, &input, false, None, None, None, None, false);
         assert!(open.contains("[用户动作] 对方递给你 1 支烟\n"), "{open}");
+    }
+
+    /// An accepted photo with an image executor shows her picture after her
+    /// words; any other photo is text only (spec 2026-11-08 §2.3).
+    #[test]
+    fn photo_action_shows_the_picture_only_when_accepted() {
+        use eros_engine_core::types::ActionResponse::{Accept, Refuse};
+        use eros_engine_core::types::ActionType::{ReplyImage, ReplyText, ReplyTextImage};
+        use eros_engine_core::types::UserAction::{Kiss, Photo};
+        let cases = [
+            (Kiss, Accept, ReplyText, true, None),
+            (Photo, Accept, ReplyText, true, Some(ReplyTextImage)),
+            (Photo, Accept, ReplyImage, true, Some(ReplyTextImage)),
+            (Photo, Accept, ReplyTextImage, true, None),
+            (Photo, Accept, ReplyText, false, None),
+            (Photo, Refuse, ReplyTextImage, true, Some(ReplyText)),
+            (Photo, Refuse, ReplyImage, true, Some(ReplyText)),
+            (Photo, Refuse, ReplyText, true, None),
+        ];
+        for (a, response, ty, available, want) in cases {
+            let mut input = fixture_decision_input();
+            if let Event::UserMessage { action, .. } = &mut input.event {
+                *action = Some(a.clone());
+            }
+            let mut plan = pde::decide(&input);
+            plan.action_response = Some(response);
+            plan.action_type = ty;
+            assert_eq!(
+                photo_action(&input.event, &plan, available),
+                want,
+                "{a:?} {response:?} {ty:?} {available}"
+            );
+        }
     }
 
     #[test]
