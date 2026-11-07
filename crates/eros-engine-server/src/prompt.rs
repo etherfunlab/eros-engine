@@ -723,6 +723,7 @@ pub(crate) fn given_phrase(item: GivenItem, name: Option<&str>, quantity: u8) ->
         GivenItem::Tea => ("杯", "茶"),
         GivenItem::Coffee => ("杯", "咖啡"),
         GivenItem::Herb => ("包", "药草"),
+        GivenItem::Cuisine => ("道", "菜"),
         GivenItem::Watch => ("块", "手表"),
         GivenItem::Gem => ("颗", "宝石"),
         GivenItem::Gold => ("块", "黄金"),
@@ -733,6 +734,7 @@ pub(crate) fn given_phrase(item: GivenItem, name: Option<&str>, quantity: u8) ->
         GivenItem::Handmade => ("份", "手作礼物"),
         GivenItem::CreditCard => ("张", "信用卡"),
         GivenItem::Flower => ("朵", "花"),
+        GivenItem::Jewelry => ("件", "首饰"),
     };
     match name {
         Some(name) => format!("{quantity} {unit}「{name}」"),
@@ -753,6 +755,7 @@ fn effect_word(item: GivenItem, level: u8) -> &'static str {
     const TEA: [&str; 4] = ["茶香还在", "心静了些", "神清气爽", "喝得有点心慌"];
     const COFFEE: [&str; 4] = ["提了点神", "精神起来了", "精神很足", "心跳得有点快"];
     const HERB: [&str; 4] = ["药草劲还轻", "药草见效了", "药草劲很足", "药草劲太冲"];
+    const CUISINE: [&str; 4] = ["回味还在", "吃得挺满足", "吃得正香", "吃撑了"];
     let words = match item {
         GivenItem::Cigarette => &CIGARETTE,
         GivenItem::Alcohol => &ALCOHOL,
@@ -762,6 +765,7 @@ fn effect_word(item: GivenItem, level: u8) -> &'static str {
         GivenItem::Tea => &TEA,
         GivenItem::Coffee => &COFFEE,
         GivenItem::Herb => &HERB,
+        GivenItem::Cuisine => &CUISINE,
         // A valuable has an empty curve, so no effect ever names one.
         GivenItem::Watch
         | GivenItem::Gem
@@ -772,7 +776,8 @@ fn effect_word(item: GivenItem, level: u8) -> &'static str {
         | GivenItem::Artwork
         | GivenItem::Handmade
         | GivenItem::CreditCard
-        | GivenItem::Flower => return "",
+        | GivenItem::Flower
+        | GivenItem::Jewelry => return "",
     };
     words[usize::from(level.clamp(1, 4)) - 1]
 }
@@ -6518,6 +6523,15 @@ mod tests {
     }
 
     #[test]
+    fn a_dish_has_its_own_effect_words_and_jewelry_none() {
+        let words: Vec<&str> = (1..=4)
+            .map(|l| effect_word(GivenItem::Cuisine, l))
+            .collect();
+        assert_eq!(words, ["回味还在", "吃得挺满足", "吃得正香", "吃撑了"]);
+        assert_eq!(effect_word(GivenItem::Jewelry, 2), "");
+    }
+
+    #[test]
     fn given_phrase_covers_the_new_categories() {
         for (item, unit, word) in [
             (GivenItem::Food, "份", "吃的"),
@@ -6535,6 +6549,8 @@ mod tests {
             (GivenItem::Handmade, "份", "手作礼物"),
             (GivenItem::CreditCard, "张", "信用卡"),
             (GivenItem::Flower, "朵", "花"),
+            (GivenItem::Cuisine, "道", "菜"),
+            (GivenItem::Jewelry, "件", "首饰"),
         ] {
             assert_eq!(given_phrase(item, None, 2), format!("2 {unit}{word}"));
             assert_eq!(

@@ -34,9 +34,11 @@ enum Shape {
 /// linger.
 fn shape(item: GivenItem) -> Option<Shape> {
     match item {
-        GivenItem::Cigarette | GivenItem::Food | GivenItem::SoftDrink | GivenItem::Tea => {
-            Some(Shape::Front)
-        }
+        GivenItem::Cigarette
+        | GivenItem::Food
+        | GivenItem::SoftDrink
+        | GivenItem::Tea
+        | GivenItem::Cuisine => Some(Shape::Front),
         GivenItem::Alcohol => Some(Shape::Back),
         GivenItem::Medicine | GivenItem::Coffee | GivenItem::Herb => Some(Shape::Middle),
         GivenItem::Watch
@@ -48,7 +50,8 @@ fn shape(item: GivenItem) -> Option<Shape> {
         | GivenItem::Artwork
         | GivenItem::Handmade
         | GivenItem::CreditCard
-        | GivenItem::Flower => None,
+        | GivenItem::Flower
+        | GivenItem::Jewelry => None,
     }
 }
 
@@ -305,7 +308,7 @@ mod tests {
     }
 
     /// Every valuable (spec 2026-10-13-give-categories-design.md §2).
-    const VALUABLES: [GivenItem; 10] = [
+    const VALUABLES: [GivenItem; 11] = [
         GivenItem::Watch,
         GivenItem::Gem,
         GivenItem::Gold,
@@ -316,6 +319,7 @@ mod tests {
         GivenItem::Handmade,
         GivenItem::CreditCard,
         GivenItem::Flower,
+        GivenItem::Jewelry,
     ];
 
     /// Each new consumable takes the rows of the existing item that has its
@@ -328,6 +332,7 @@ mod tests {
             (GivenItem::Tea, GivenItem::Cigarette),
             (GivenItem::Coffee, GivenItem::Medicine),
             (GivenItem::Herb, GivenItem::Medicine),
+            (GivenItem::Cuisine, GivenItem::Cigarette),
         ] {
             for q in (0..=7u8).chain([99]) {
                 assert_eq!(curve(item, q), curve(like, q), "{item:?} ×{q}");

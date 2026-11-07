@@ -161,8 +161,9 @@ pub enum UserActionKind {
     Gift,
 }
 
-/// What a `give` action hands over. Consumables (`cigarette` through `herb`)
-/// linger on the persona; valuables (`watch` through `flower`) do not.
+/// What a `give` action hands over. Consumables (`cigarette` through
+/// `cuisine`) linger on the persona; valuables (`watch` through `jewelry`) do
+/// not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GivenItemDto {
@@ -174,6 +175,7 @@ pub enum GivenItemDto {
     Tea,
     Coffee,
     Herb,
+    Cuisine,
     Watch,
     Gem,
     Gold,
@@ -184,6 +186,7 @@ pub enum GivenItemDto {
     Handmade,
     CreditCard,
     Flower,
+    Jewelry,
 }
 
 impl From<GivenItemDto> for eros_engine_core::types::GivenItem {
@@ -198,6 +201,7 @@ impl From<GivenItemDto> for eros_engine_core::types::GivenItem {
             GivenItemDto::Tea => GivenItem::Tea,
             GivenItemDto::Coffee => GivenItem::Coffee,
             GivenItemDto::Herb => GivenItem::Herb,
+            GivenItemDto::Cuisine => GivenItem::Cuisine,
             GivenItemDto::Watch => GivenItem::Watch,
             GivenItemDto::Gem => GivenItem::Gem,
             GivenItemDto::Gold => GivenItem::Gold,
@@ -208,6 +212,7 @@ impl From<GivenItemDto> for eros_engine_core::types::GivenItem {
             GivenItemDto::Handmade => GivenItem::Handmade,
             GivenItemDto::CreditCard => GivenItem::CreditCard,
             GivenItemDto::Flower => GivenItem::Flower,
+            GivenItemDto::Jewelry => GivenItem::Jewelry,
         }
     }
 }
@@ -224,6 +229,7 @@ impl From<eros_engine_core::types::GivenItem> for GivenItemDto {
             GivenItem::Tea => GivenItemDto::Tea,
             GivenItem::Coffee => GivenItemDto::Coffee,
             GivenItem::Herb => GivenItemDto::Herb,
+            GivenItem::Cuisine => GivenItemDto::Cuisine,
             GivenItem::Watch => GivenItemDto::Watch,
             GivenItem::Gem => GivenItemDto::Gem,
             GivenItem::Gold => GivenItemDto::Gold,
@@ -234,6 +240,7 @@ impl From<eros_engine_core::types::GivenItem> for GivenItemDto {
             GivenItem::Handmade => GivenItemDto::Handmade,
             GivenItem::CreditCard => GivenItemDto::CreditCard,
             GivenItem::Flower => GivenItemDto::Flower,
+            GivenItem::Jewelry => GivenItemDto::Jewelry,
         }
     }
 }
@@ -4163,6 +4170,8 @@ mod validate_payload_tests {
             ("handmade", GivenItem::Handmade),
             ("credit_card", GivenItem::CreditCard),
             ("flower", GivenItem::Flower),
+            ("cuisine", GivenItem::Cuisine),
+            ("jewelry", GivenItem::Jewelry),
         ] {
             let dto: UserActionDto =
                 serde_json::from_value(serde_json::json!({"type": "give", "item": wire}))

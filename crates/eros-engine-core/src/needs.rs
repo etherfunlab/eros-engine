@@ -159,14 +159,15 @@ pub fn next_change(rated: Needs, hours: f64, habits: Habits) -> Option<f64> {
 }
 
 /// What an accepted give of `item` does to (hunger, social, indulgence), in
-/// levels (spec 2026-10-30 §2.1): food fills her; tobacco, drink and weed
-/// loosen her up; medicine and coffee do the opposite. `None` for an item
-/// that moves nothing.
+/// levels (spec 2026-10-30 §2.1, 2026-11-08 §3): food fills her; tobacco,
+/// drink and weed loosen her up, and a dish fills her and loosens her up the
+/// same way; medicine and coffee do the opposite. `None` for an item that
+/// moves nothing.
 fn give_move(item: GivenItem) -> Option<(i8, i8, i8)> {
     use GivenItem::*;
     Some(match item {
         Food => (-1, 0, 0),
-        Cigarette | Alcohol | Herb => (-1, 1, 1),
+        Cigarette | Alcohol | Herb | Cuisine => (-1, 1, 1),
         Medicine | Coffee => (-1, -1, -1),
         _ => return None,
     })
@@ -508,6 +509,19 @@ mod tests {
                 "{item:?} leaves the rest"
             );
         }
+    }
+
+    /// A dish fills her and loosens her up, like what she is hooked on
+    /// (spec 2026-11-08 §3); jewelry moves nothing.
+    #[test]
+    fn a_cuisine_fills_her_and_loosens_her_up() {
+        let got = after_give(Some(all(Mid)), None, GivenItem::Cuisine).unwrap();
+        assert_eq!(
+            (got.hunger, got.social, got.indulgence),
+            (Low, High, High)
+        );
+        assert_eq!((got.stamina, got.emotional, got.outing), (Mid, Mid, Mid));
+        assert_eq!(after_give(Some(all(Mid)), None, GivenItem::Jewelry), None);
     }
 
     #[test]

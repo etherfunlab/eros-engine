@@ -170,6 +170,8 @@ pub enum GivenItem {
     Tea,
     Coffee,
     Herb,
+    /// A proper dish or meal; `food` is something to eat.
+    Cuisine,
     Watch,
     Gem,
     Gold,
@@ -180,6 +182,7 @@ pub enum GivenItem {
     Handmade,
     CreditCard,
     Flower,
+    Jewelry,
 }
 
 /// Which of the persona's lists an item belongs to (spec
@@ -688,6 +691,8 @@ mod tests {
             (GivenItem::Handmade, "handmade"),
             (GivenItem::CreditCard, "credit_card"),
             (GivenItem::Flower, "flower"),
+            (GivenItem::Cuisine, "cuisine"),
+            (GivenItem::Jewelry, "jewelry"),
         ] {
             assert_eq!(serde_json::to_value(item).unwrap(), wire);
             assert_eq!(
