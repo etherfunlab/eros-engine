@@ -134,6 +134,9 @@ pub enum UserAction {
     Bluff,
     Threaten,
     Trick,
+    /// The user undresses her; only a romance-compatible pair can have it
+    /// accepted (spec 2026-11-08-strip-and-world-setting-design.md §2).
+    Strip,
     Custom {
         text: String,
     },
@@ -603,6 +606,7 @@ mod tests {
             (UserAction::Bluff, "bluff"),
             (UserAction::Threaten, "threaten"),
             (UserAction::Trick, "trick"),
+            (UserAction::Strip, "strip"),
         ] {
             let v = serde_json::json!({ "type": wire });
             assert_eq!(serde_json::to_value(&a).unwrap(), v);
@@ -629,6 +633,7 @@ mod tests {
             UserAction::Tease,
             UserAction::Pat,
             UserAction::Photo,
+            UserAction::Strip,
             UserAction::Custom { text: "x".into() },
         ] {
             assert_eq!(a.refusal_line().unwrap(), AffinityLine::Chemistry, "{a:?}");

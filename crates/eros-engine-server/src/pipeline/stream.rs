@@ -2787,14 +2787,13 @@ fn render_product_qa_pairs(pairs: &[(String, String)]) -> String {
         .join("\n")
 }
 
-/// A give the habit roll refused is refused, whatever the judge or the rule
-/// engine settled on.
-/// The action type a `photo` turn changes to, or `None` when the plan stands
-/// (spec 2026-11-08-five-actions-two-items-gluttony-card-1-1-design.md §2.3):
-/// an accepted photo with an image executor shows her picture after her
-/// words, always of her face; any other photo is text only, even when the
-/// judge proposed a picture.
-fn photo_action(
+/// The action type a `photo` or `strip` turn changes to, or `None` when the
+/// plan stands (spec 2026-11-08-five-actions-two-items-gluttony-card-1-1-
+/// design.md §2.3, 2026-11-08-strip-and-world-setting-design.md §2.2): an
+/// accepted one with an image executor shows her picture after her words,
+/// always of her face; any other is text only, even when the judge proposed a
+/// picture.
+fn picture_action(
     event: &eros_engine_core::types::Event,
     plan: &eros_engine_core::types::ActionPlan,
     image_executor_available: bool,
@@ -2803,7 +2802,7 @@ fn photo_action(
     if !matches!(
         event,
         Event::UserMessage {
-            action: Some(UserAction::Photo),
+            action: Some(UserAction::Photo | UserAction::Strip),
             ..
         }
     ) {
@@ -2826,7 +2825,10 @@ fn photo_action(
     (!stands).then_some(target)
 }
 
-fn apply_give_refusal(plan: &mut eros_engine_core::types::ActionPlan, refused: bool) {
+/// An action refused before the judge (a give the habit roll refused, a strip
+/// an incompatible pair cannot have) is refused, whatever the judge or the
+/// rule engine settled on.
+fn apply_forced_refusal(plan: &mut eros_engine_core::types::ActionPlan, refused: bool) {
     if refused && plan.action_response.is_some() {
         plan.action_response = Some(eros_engine_core::types::ActionResponse::Refuse);
     }
@@ -2842,7 +2844,7 @@ fn build_pde_ctx(
     body_state: Option<&str>,
     needs: Option<&eros_engine_core::needs::Needs>,
     event: Option<&str>,
-    give_refused: bool,
+    refused_before_judge: bool,
 ) -> String {
     let a = &input.affinity;
     let s = &input.signals;
@@ -2937,9 +2939,11 @@ fn build_pde_ctx(
         .map(|s| format!("[身体状态] {s}\n"))
         .unwrap_or_default();
     // The action the judge decides on (spec 2026-10-05 §4.2); absent otherwise.
-    // A social action says what each answer means (spec 2026-11-08 §2.2). A
-    // give the habit roll refused (spec 2026-10-28-outing-indulgence-
-    // needs-and-habits-design.md §3.1) states the outcome, not the reason.
+    // A social action says what each answer means (spec 2026-11-08 §2.2). An
+    // action refused before the judge (a give the habit roll refused, spec
+    // 2026-10-28-outing-indulgence-needs-and-habits-design.md §3.1; a strip an
+    // incompatible pair cannot have, spec 2026-11-08-strip-and-world-setting-
+    // design.md §2.1) states the outcome, not the reason.
     let action_line = match &input.event {
         eros_engine_core::types::Event::UserMessage {
             action: Some(a), ..
@@ -2949,10 +2953,10 @@ fn build_pde_ctx(
             crate::prompt::social_outcomes(a)
                 .map(|(yes, no)| format!("（accept：{yes}；refuse：{no}）"))
                 .unwrap_or_default(),
-            if give_refused {
-                "，这次你不会收下"
-            } else {
-                ""
+            match (refused_before_judge, a) {
+                (false, _) => "",
+                (true, eros_engine_core::types::UserAction::Strip) => "，这次你不会让对方这样做",
+                (true, _) => "，这次你不会收下",
             }
         ),
         _ => String::new(),
@@ -5008,17 +5012,20 @@ pub(crate) fn run_stream_with(
         // not lose that context; rule-based `pde::decide` never picks image
         // actions, so `force_image` and a photo turn's picture (spec
         // 2026-11-08 §2.3) are the judge-less image paths.
-        let photo_picture = image_executor_available
+        let picture_turn = image_executor_available
             && matches!(
                 &input.event,
                 Event::UserMessage {
-                    action: Some(eros_engine_core::types::UserAction::Photo),
+                    action: Some(
+                        eros_engine_core::types::UserAction::Photo
+                            | eros_engine_core::types::UserAction::Strip
+                    ),
                     ..
                 }
             );
         let pde_transcript: JudgeTranscript = if resolved_pde.is_some()
             || force_image
-            || photo_picture
+            || picture_turn
         {
             build_input_filter_transcript(&chat_repo, user_msg.session_id, user_msg.user_message_id).await
         } else {
@@ -5032,6 +5039,10 @@ pub(crate) fn run_stream_with(
             crate::prompt::persona_habits(&input.persona),
             rand::thread_rng().gen(),
         );
+        // A strip an incompatible pair cannot have (spec 2026-11-08-strip-and-
+        // world-setting-design.md §2.1): decided here too, so the judge writes
+        // for the outcome.
+        let strip_refused = pde::strip_ruled_out(&input.event);
         let (mut plan, pde_run): (eros_engine_core::types::ActionPlan, Option<PdeDecisionRun>) =
             match resolved_pde.as_ref() {
                 Some(p) => {
@@ -5043,7 +5054,7 @@ pub(crate) fn run_stream_with(
                         body_state.as_deref(),
                         prior_needs.as_ref(),
                         event_judge.as_deref(),
-                        give_refused,
+                        give_refused || strip_refused,
                     );
                     // Read receipt (migration 0053): the judge is the first
                     // generative model to see this message, so this is the
@@ -5135,10 +5146,15 @@ pub(crate) fn run_stream_with(
             std::mem::take(&mut killswitch_hints),
         );
 
-        // A photo she let the user take comes back as her picture after her
-        // words; a refused one is text only (spec 2026-11-08 §2.3). Before the
-        // forced-image override, which still wins.
-        if let Some(action) = photo_action(&input.event, &plan, image_executor_available) {
+        // An action refused before the judge is refused before anything reads
+        // the response.
+        apply_forced_refusal(&mut plan, give_refused || strip_refused);
+
+        // A photo she let the user take, or a strip she let happen, comes back
+        // as her picture after her words; a refused one is text only (spec
+        // 2026-11-08 §2.3, 2026-11-08-strip-and-world-setting-design.md §2.2).
+        // Before the forced-image override, which still wins.
+        if let Some(action) = picture_action(&input.event, &plan, image_executor_available) {
             let aspect = (action == ActionType::ReplyTextImage
                 && matches!(
                     plan.action_type,
@@ -5177,7 +5193,20 @@ pub(crate) fn run_stream_with(
                 plan.action_response,
             );
         }
-        apply_give_refusal(&mut plan, give_refused);
+        // An accepted strip undresses her this turn (spec 2026-11-08-strip-and-
+        // world-setting-design.md §2.2), over the judge and a named outfit:
+        // after every `plan_for`, which would put a named outfit back.
+        if let (
+            Event::UserMessage {
+                action: Some(eros_engine_core::types::UserAction::Strip),
+                outfit,
+                ..
+            },
+            Some(eros_engine_core::types::ActionResponse::Accept),
+        ) = (&input.event, plan.action_response)
+        {
+            plan.clothing = Some(crate::prompt::stripped_clothing(outfit.as_deref()));
+        }
 
         // The needs stored on this row (spec 2026-10-13 §5.1, 2026-10-30
         // §2.2): the judge's rating, or, once a give is accepted for good,
@@ -10576,7 +10605,14 @@ data: [DONE]\n\n";
 
     /// One photo turn with the judge off: the composer is configured and
     /// fails (500), the chat model streams a reply. `force` forces the image.
-    async fn run_photo_turn(pool: &PgPool, force: bool) -> (Vec<ProtocolFrame>, String) {
+    async fn run_picture_turn(
+        pool: &PgPool,
+        action: eros_engine_core::types::UserAction,
+        memory_scope: eros_engine_core::scope::MemoryScope,
+        affinity_scope: eros_engine_core::scope::AffinityScope,
+        outfit: Option<&str>,
+        force: bool,
+    ) -> (Vec<ProtocolFrame>, String) {
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
         use futures_util::StreamExt;
         use wiremock::matchers::{body_string_contains, path as wm_path};
@@ -10646,8 +10682,8 @@ data: [DONE]\n\n";
                 prompt_traits: vec![],
                 audit: None,
                 tier: None,
-                memory_scope: Default::default(),
-                affinity_scope: Default::default(),
+                memory_scope,
+                affinity_scope,
                 image_url: None,
                 image: Some(crate::routes::companion_stream::ImageReplyParams {
                     force,
@@ -10655,8 +10691,8 @@ data: [DONE]\n\n";
                 }),
                 quote: Default::default(),
                 user_locale: Default::default(),
-                action: Some(eros_engine_core::types::UserAction::Photo),
-                outfit: None,
+                action: Some(action),
+                outfit: outfit.map(String::from),
             },
             None,
         )
@@ -10701,7 +10737,15 @@ data: [DONE]\n\n";
     /// `image_request` follows, composed from the scene (spec 2026-11-08 §2.3).
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn an_accepted_photo_without_the_judge_shows_her_picture(pool: PgPool) {
-        let (frames, composer_body) = run_photo_turn(&pool, false).await;
+        let (frames, composer_body) = run_picture_turn(
+            &pool,
+            eros_engine_core::types::UserAction::Photo,
+            Default::default(),
+            Default::default(),
+            None,
+            false,
+        )
+        .await;
         let types = frame_type_names(&frames);
         assert_eq!(
             types.first().map(String::as_str),
@@ -10727,10 +10771,84 @@ data: [DONE]\n\n";
     /// `image.force` still wins on a photo turn: image only.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn a_forced_image_still_wins_on_a_photo(pool: PgPool) {
-        let (frames, _) = run_photo_turn(&pool, true).await;
+        let (frames, _) = run_picture_turn(
+            &pool,
+            eros_engine_core::types::UserAction::Photo,
+            Default::default(),
+            Default::default(),
+            None,
+            true,
+        )
+        .await;
         let types = frame_type_names(&frames);
         assert_eq!(meta_action_type(&frames), FrameActionType::ReplyImage);
         assert!(!types.iter().any(|t| t == "delta"), "{types:?}");
+    }
+
+    fn action_response_of(frames: &[ProtocolFrame]) -> serde_json::Value {
+        frames
+            .iter()
+            .map(|f| serde_json::to_value(f).unwrap())
+            .find(|v| v["type"] == "action_response")
+            .expect("action_response present")["response"]
+            .clone()
+    }
+
+    /// An incompatible pair's strip is refused before the judge and gets no
+    /// picture (spec 2026-11-08 §2.1).
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_incompatible_strip_is_refused_without_the_judge(pool: PgPool) {
+        let (frames, _) = run_picture_turn(
+            &pool,
+            eros_engine_core::types::UserAction::Strip,
+            Default::default(),
+            Default::default(),
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "refuse");
+        assert_eq!(meta_action_type(&frames), FrameActionType::Reply);
+        assert!(!frame_type_names(&frames)
+            .iter()
+            .any(|t| t == "image_request"));
+    }
+
+    /// A compatible pair's accepted strip shows her undressed, over a named
+    /// outfit (spec 2026-11-08 §2.2).
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_accepted_strip_shows_her_undressed(pool: PgPool) {
+        let (frames, composer_body) = run_picture_turn(
+            &pool,
+            eros_engine_core::types::UserAction::Strip,
+            eros_engine_core::scope::MemoryScope::Full,
+            eros_engine_core::scope::AffinityScope::full(),
+            Some("红色旗袍"),
+            false,
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        assert_eq!(meta_action_type(&frames), FrameActionType::ReplyTextImage);
+        assert!(
+            composer_body.contains("「红色旗袍」被对方脱掉了"),
+            "the composer dresses her as undressed: {composer_body}"
+        );
+    }
+
+    /// `image.force` still makes an image turn of a refused strip.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_forced_image_on_an_incompatible_strip_is_still_an_image(pool: PgPool) {
+        let (frames, _) = run_picture_turn(
+            &pool,
+            eros_engine_core::types::UserAction::Strip,
+            Default::default(),
+            Default::default(),
+            None,
+            true,
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "refuse");
+        assert_eq!(meta_action_type(&frames), FrameActionType::ReplyImage);
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -19597,10 +19715,10 @@ data: [DONE]\n\n";
     /// An accepted photo with an image executor shows her picture after her
     /// words; any other photo is text only (spec 2026-11-08 §2.3).
     #[test]
-    fn photo_action_shows_the_picture_only_when_accepted() {
+    fn picture_action_shows_the_picture_only_when_accepted() {
         use eros_engine_core::types::ActionResponse::{Accept, Refuse};
         use eros_engine_core::types::ActionType::{ReplyImage, ReplyText, ReplyTextImage};
-        use eros_engine_core::types::UserAction::{Kiss, Photo};
+        use eros_engine_core::types::UserAction::{Kiss, Photo, Strip};
         let cases = [
             (Kiss, Accept, ReplyText, true, None),
             (Photo, Accept, ReplyText, true, Some(ReplyTextImage)),
@@ -19610,6 +19728,10 @@ data: [DONE]\n\n";
             (Photo, Refuse, ReplyTextImage, true, Some(ReplyText)),
             (Photo, Refuse, ReplyImage, true, Some(ReplyText)),
             (Photo, Refuse, ReplyText, true, None),
+            (Strip, Accept, ReplyText, true, Some(ReplyTextImage)),
+            (Strip, Accept, ReplyText, false, None),
+            (Strip, Refuse, ReplyTextImage, true, Some(ReplyText)),
+            (Strip, Refuse, ReplyText, true, None),
         ];
         for (a, response, ty, available, want) in cases {
             let mut input = fixture_decision_input();
@@ -19620,7 +19742,7 @@ data: [DONE]\n\n";
             plan.action_response = Some(response);
             plan.action_type = ty;
             assert_eq!(
-                photo_action(&input.event, &plan, available),
+                picture_action(&input.event, &plan, available),
                 want,
                 "{a:?} {response:?} {ty:?} {available}"
             );
@@ -19636,13 +19758,13 @@ data: [DONE]\n\n";
         plan.action_type = ReplyTextImage;
         plan.image_ref = eros_engine_core::types::ImageRef::Previous;
         assert_eq!(
-            photo_action(&input.event, &plan, true),
+            picture_action(&input.event, &plan, true),
             Some(ReplyTextImage)
         );
     }
 
     #[test]
-    fn apply_give_refusal_turns_only_an_accept() {
+    fn apply_forced_refusal_turns_only_an_accept() {
         use eros_engine_core::types::ActionResponse::{Accept, Refuse};
         let mut plan = pde::decide(&fixture_decision_input());
         for (before, refused, after) in [
@@ -19652,7 +19774,7 @@ data: [DONE]\n\n";
             (None, true, None),
         ] {
             plan.action_response = before;
-            apply_give_refusal(&mut plan, refused);
+            apply_forced_refusal(&mut plan, refused);
             assert_eq!(plan.action_response, after, "{before:?} {refused}");
         }
     }
@@ -19672,6 +19794,35 @@ data: [DONE]\n\n";
         assert!(
             ctx.find("[指定穿着]").unwrap() < ctx.find("[用户最新消息]").unwrap(),
             "{ctx}"
+        );
+    }
+
+    /// A strip ruled out before the judge states the outcome with its own
+    /// words; a refused give keeps its own (spec 2026-11-08 §2.1).
+    #[test]
+    fn build_pde_ctx_states_a_strip_refusal() {
+        use eros_engine_core::types::{GivenItem, UserAction};
+        let t = JudgeTranscript::default();
+        let mut input = fixture_decision_input();
+        let mut ctx_for = |a: UserAction| {
+            if let Event::UserMessage { action, .. } = &mut input.event {
+                *action = Some(a);
+            }
+            build_pde_ctx(&t, &input, false, None, None, None, None, true)
+        };
+        let strip = ctx_for(UserAction::Strip);
+        assert!(
+            strip.contains("[用户动作] 对方伸手想脱你的衣服，这次你不会让对方这样做\n"),
+            "{strip}"
+        );
+        let give = ctx_for(UserAction::Give {
+            item: GivenItem::Cigarette,
+            name: None,
+            quantity: 1,
+        });
+        assert!(
+            give.contains("[用户动作] 对方递给你 1 支烟，这次你不会收下\n"),
+            "{give}"
         );
     }
 

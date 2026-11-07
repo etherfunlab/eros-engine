@@ -518,6 +518,7 @@ mod tests {
             "bluff",
             "threaten",
             "trick",
+            "strip",
         ] {
             assert!(
                 moment(serde_json::json!({"type": kind, "response": "accept"})).is_none(),

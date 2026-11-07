@@ -649,6 +649,7 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
         UserAction::Bluff => "在你面前虚张声势，想唬住你".into(),
         UserAction::Threaten => "威胁你".into(),
         UserAction::Trick => "想捉弄你".into(),
+        UserAction::Strip => "伸手想脱你的衣服".into(),
         UserAction::Custom { text } => text.clone(),
         UserAction::Tip { amount_usd } => {
             format!("给你发了一个红包，相当于{}", tip_value_noun(*amount_usd))
@@ -924,6 +925,7 @@ pub(crate) fn event_label(kind: eros_engine_core::events::EventKind) -> &'static
         HometownVisit => "回老家",
         TakingSpace => "说好暂时分开",
         FellOut => "为分开的事闹得不愉快",
+        Strip => "刚脱了衣服",
     }
 }
 
@@ -1248,6 +1250,25 @@ pub(crate) fn composer_user_text(
     }
 }
 
+/// Her clothing on a turn whose `strip` she accepted (spec 2026-11-08-strip-
+/// and-world-setting-design.md §2.2): 「衣服被对方脱掉了」, or
+/// 「「{outfit}」被对方脱掉了」 over a named outfit.
+pub(crate) fn stripped_clothing(outfit: Option<&str>) -> String {
+    match outfit {
+        Some(o) => format!("「{o}」被对方脱掉了"),
+        None => "衣服被对方脱掉了".to_string(),
+    }
+}
+
+/// Her clothing on a `strip` event (spec 2026-11-08-strip-and-world-setting-
+/// design.md §3): 「刚把衣服脱了」, or 「刚把「{outfit}」脱了」.
+pub(crate) fn undressed_clothing(outfit: Option<&str>) -> String {
+    match outfit {
+        Some(o) => format!("刚把「{o}」脱了"),
+        None => "刚把衣服脱了".to_string(),
+    }
+}
+
 /// Pluck a string field out of `art_metadata`.
 pub(crate) fn meta_str<'a>(persona: &'a CompanionPersona, key: &str) -> Option<&'a str> {
     persona
@@ -1263,7 +1284,7 @@ pub(crate) fn meta_str<'a>(persona: &'a CompanionPersona, key: &str) -> Option<&
 pub(crate) fn persona_traits(
     persona: &CompanionPersona,
 ) -> eros_engine_core::events::PersonaTraits {
-    use eros_engine_core::events::{EventCategory, EventKind, Health, PersonaTraits};
+    use eros_engine_core::events::{EventCategory, EventKind, Health, PersonaTraits, Setting};
     let art = &persona.genome.art_metadata;
     PersonaTraits {
         female: meta_str(persona, "gender") == Some("female"),
@@ -1291,6 +1312,9 @@ pub(crate) fn persona_traits(
             .unwrap_or(false),
         homesick: art.get("homesick").and_then(|v| v.as_bool()),
         sex_addict: art.get("sex_addict").and_then(|v| v.as_bool()),
+        setting: meta_str(persona, "setting")
+            .and_then(Setting::parse)
+            .unwrap_or_default(),
     }
 }
 
@@ -4833,6 +4857,7 @@ mod tests {
                 "短途旅游",
                 "长途旅游",
                 "回老家",
+                "刚脱了衣服",
             ]
         );
     }
@@ -4856,6 +4881,7 @@ mod tests {
                 is_virgin: true,
                 homesick: Some(false),
                 sex_addict: Some(true),
+                setting: Default::default(),
             }
         );
         p.genome.art_metadata =
@@ -4891,6 +4917,20 @@ mod tests {
             with(serde_json::json!({"gluttony": false})).gluttony,
             Some(false)
         );
+    }
+
+    #[test]
+    fn persona_traits_reads_the_setting() {
+        use eros_engine_core::events::Setting;
+        let mut p = fixture_persona();
+        for (art, want) in [
+            (serde_json::json!({"setting": "fantasy"}), Setting::Fantasy),
+            (serde_json::json!({}), Setting::Modern),
+            (serde_json::json!({"setting": "space"}), Setting::Modern),
+        ] {
+            p.genome.art_metadata = art;
+            assert_eq!(persona_traits(&p).setting, want);
+        }
     }
 
     #[test]
@@ -5921,6 +5961,7 @@ mod tests {
             UserAction::Bluff,
             UserAction::Threaten,
             UserAction::Trick,
+            UserAction::Strip,
             UserAction::Custom {
                 text: "捏了捏你的脸".into(),
             },
@@ -5948,8 +5989,18 @@ mod tests {
                 "在你面前虚张声势，想唬住你",
                 "威胁你",
                 "想捉弄你",
+                "伸手想脱你的衣服",
                 "捏了捏你的脸",
             ]
+        );
+    }
+
+    #[test]
+    fn a_stripped_turn_says_what_came_off() {
+        assert_eq!(stripped_clothing(None), "衣服被对方脱掉了");
+        assert_eq!(
+            stripped_clothing(Some("红色旗袍")),
+            "「红色旗袍」被对方脱掉了"
         );
     }
 
