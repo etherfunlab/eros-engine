@@ -161,6 +161,7 @@ pub enum UserActionKind {
     Bluff,
     Threaten,
     Trick,
+    Strip,
     Custom,
     Tip,
     Gift,
@@ -361,6 +362,7 @@ impl UserActionDto {
             UserActionKind::Bluff => UserAction::Bluff,
             UserActionKind::Threaten => UserAction::Threaten,
             UserActionKind::Trick => UserAction::Trick,
+            UserActionKind::Strip => UserAction::Strip,
             UserActionKind::Custom => UserAction::Custom {
                 text: free_text(self.text.as_deref(), "text", MAX_ACTION_TEXT_CHARS)?
                     .ok_or("action.text is required for custom")?,
@@ -4230,6 +4232,7 @@ mod validate_payload_tests {
             ("bluff", UserAction::Bluff),
             ("threaten", UserAction::Threaten),
             ("trick", UserAction::Trick),
+            ("strip", UserAction::Strip),
         ] {
             let dto: UserActionDto = serde_json::from_value(serde_json::json!({"type": wire}))
                 .unwrap_or_else(|e| panic!("{wire}: {e}"));

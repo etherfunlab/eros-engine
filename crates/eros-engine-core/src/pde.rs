@@ -60,6 +60,21 @@ pub fn refuses_give(event: &Event, habits: Habits, roll: f64) -> bool {
     }
 }
 
+/// Whether this turn's `strip` is ruled out before the judge (spec
+/// 2026-11-08-strip-and-world-setting-design.md §2.1): the turn's scopes are
+/// not romance-compatible. Not a roll: such a pair always refuses.
+pub fn strip_ruled_out(event: &Event) -> bool {
+    match event {
+        Event::UserMessage {
+            action: Some(UserAction::Strip),
+            memory_scope,
+            affinity_scope,
+            ..
+        } => !crate::scope::romance_compatible(*memory_scope, *affinity_scope),
+        _ => false,
+    }
+}
+
 /// The outfit the caller named for this turn, if any (spec
 /// 2026-10-12-persona-items-and-gift-design.md §6.2).
 fn named_outfit(event: &Event) -> Option<String> {
@@ -938,6 +953,29 @@ mod tests {
             Some(ActionResponse::Refuse),
         );
         assert_eq!(image.action_response, Some(ActionResponse::Refuse));
+    }
+
+    /// A strip is ruled out before the judge for a pair whose scopes are not
+    /// romance-compatible (spec 2026-11-08-strip-and-world-setting-design.md
+    /// §2.1).
+    #[test]
+    fn strip_needs_a_compatible_pair() {
+        use crate::scope::{AffinityScope, MemoryScope};
+        let strip = action_msg(UserAction::Strip);
+        assert!(strip_ruled_out(&strip), "engine defaults are not compatible");
+        let mut romantic = strip.clone();
+        if let Event::UserMessage {
+            memory_scope,
+            affinity_scope,
+            ..
+        } = &mut romantic
+        {
+            *memory_scope = MemoryScope::Full;
+            *affinity_scope = AffinityScope::full();
+        }
+        assert!(!strip_ruled_out(&romantic));
+        assert!(!strip_ruled_out(&action_msg(UserAction::Kiss)));
+        assert!(!strip_ruled_out(&user_msg("hi")));
     }
 
     #[test]

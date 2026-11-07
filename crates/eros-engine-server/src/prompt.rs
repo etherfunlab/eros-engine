@@ -649,6 +649,7 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
         UserAction::Bluff => "在你面前虚张声势，想唬住你".into(),
         UserAction::Threaten => "威胁你".into(),
         UserAction::Trick => "想捉弄你".into(),
+        UserAction::Strip => "伸手想脱你的衣服".into(),
         UserAction::Custom { text } => text.clone(),
         UserAction::Tip { amount_usd } => {
             format!("给你发了一个红包，相当于{}", tip_value_noun(*amount_usd))
@@ -1246,6 +1247,16 @@ pub(crate) fn composer_user_text(
     match (action, response) {
         (Some(a), Some(r)) => format!("{base}\n{}", action_outcome(a, r)),
         _ => base,
+    }
+}
+
+/// Her clothing on a turn whose `strip` she accepted (spec 2026-11-08-strip-
+/// and-world-setting-design.md §2.2): 「衣服被对方脱掉了」, or
+/// 「「{outfit}」被对方脱掉了」 over a named outfit.
+pub(crate) fn stripped_clothing(outfit: Option<&str>) -> String {
+    match outfit {
+        Some(o) => format!("「{o}」被对方脱掉了"),
+        None => "衣服被对方脱掉了".to_string(),
     }
 }
 
@@ -5950,6 +5961,7 @@ mod tests {
             UserAction::Bluff,
             UserAction::Threaten,
             UserAction::Trick,
+            UserAction::Strip,
             UserAction::Custom {
                 text: "捏了捏你的脸".into(),
             },
@@ -5977,9 +5989,16 @@ mod tests {
                 "在你面前虚张声势，想唬住你",
                 "威胁你",
                 "想捉弄你",
+                "伸手想脱你的衣服",
                 "捏了捏你的脸",
             ]
         );
+    }
+
+    #[test]
+    fn a_stripped_turn_says_what_came_off() {
+        assert_eq!(stripped_clothing(None), "衣服被对方脱掉了");
+        assert_eq!(stripped_clothing(Some("红色旗袍")), "「红色旗袍」被对方脱掉了");
     }
 
     /// A social action's two answers say whether she fell for it (spec
