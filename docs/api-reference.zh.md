@@ -372,26 +372,27 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 ≤ 16 个 key，key 满足 `[A-Za-z0-9_.-]{1,64}`，value 必须是 string
 且 ≤ 512 字符。违反作为 pre-stream 错误返回 `400 BadRequest`。
 
-**可选：动作。** 请求体可以带 `action`，表示用户在说话之外对角色做的事。角色可能接受，也可能不接受；不接受时，这段关系在动作对应的那条线上降一档（`give` 和 `gift` 动 bond，身体动作和自定义动作动 chemistry），被拒的 `tip` 不降档（见 [affinity-model.zh.md](affinity-model.zh.md)）。
+**可选：动作。** 请求体可以带 `action`，表示用户在说话之外对角色做的事。角色可能接受，也可能不接受；不接受时，这段关系在动作对应的那条线上降一档（`give` 和 `gift` 动 bond，身体动作和自定义动作动 chemistry），被拒的 `tip`、`bluff`、`threaten`、`trick` 不降档（见 [affinity-model.zh.md](affinity-model.zh.md)）。
 
 | `type` | 字段 |
 |---|---|
 | `give` | `item`：下表中的一类，必填；`name`：可选，1–32 字符；`quantity`：可选，1–99，默认 1 |
-| `kiss`、`hug`、`touch`、`lick`、`french_kiss`、`hug_from_behind`、`tease` | 无 |
+| `kiss`、`hug`、`touch`、`lick`、`french_kiss`、`hug_from_behind`、`tease`、`pat`、`photo` | 无 |
+| `bluff`、`threaten`、`trick` | 无 |
 | `custom` | `text`：必填，1–100 字符 |
 | `tip` | `amount_usd`：必填，有限数值，`> 0` 且 `≤ 1_000_000_000` |
 | `gift` | `kind`：`item` \| `clothing`（必填）；`name`：必填，1–64 字 |
 
-**`give` 能递什么。** 消耗品会在角色身上留下余效（见下）。贵重物没有余效，也不会进她的物品清单；想让她收着，用 `gift`。`cash` 是当面递过去的现金，按张数计；带金额的是 `tip`。
+**`give` 能递什么。** 消耗品会在角色身上留下余效（见下）。贵重物没有余效，也不会进她的物品清单；想让她收着，用 `gift`。`cash` 是当面递过去的现金，按张数计；带金额的是 `tip`。`cuisine` 是一道正经的菜或一顿饭，`food` 是吃的东西。
 
 | 分组 | `item`（单位） |
 |---|---|
-| 消耗品 | `cigarette`（支）、`alcohol`（杯）、`medicine`（片）、`food`（份）、`soft_drink`（瓶）、`tea`（杯）、`coffee`（杯）、`herb`（包） |
-| 贵重物 | `watch`（块）、`gem`（颗）、`gold`（块）、`camera`（台）、`cash`（张）、`antique`（件）、`artwork`（件）、`handmade`（份）、`credit_card`（张）、`flower`（朵） |
+| 消耗品 | `cigarette`（支）、`alcohol`（杯）、`medicine`（片）、`food`（份）、`soft_drink`（瓶）、`tea`（杯）、`coffee`（杯）、`herb`（包）、`cuisine`（道） |
+| 贵重物 | `watch`（块）、`gem`（颗）、`gold`（块）、`camera`（台）、`cash`（张）、`antique`（件）、`artwork`（件）、`handmade`（份）、`credit_card`（张）、`flower`（朵）、`jewelry`（件） |
 
 **`give` 的余效。** 被接受的消耗品会在这个 session 之后的 `min(quantity, 5)` 个文字回合里继续影响角色；接受它的那一回合不算在内。每个回合角色处在曲线上的某一步，档位 1–4：
 
-| 回合数 | 前强：`cigarette`、`food`、`soft_drink`、`tea` | 后强：`alcohol` | 中间强：`medicine`、`coffee`、`herb` |
+| 回合数 | 前强：`cigarette`、`food`、`soft_drink`、`tea`、`cuisine` | 后强：`alcohol` | 中间强：`medicine`、`coffee`、`herb` |
 |---|---|---|---|
 | 1 | 3 | 1 | 3 |
 | 2 | 3 1 | 1 3 | 3 3 |
@@ -402,7 +403,11 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 一个回合指文字 session 里的一条用户消息；产品咨询消息和语音通话不计数，也没有时间上限。这份状态会进判官、回复 prompt 和画图 composer，并经 `body_state` 帧和 [`GET /v2/comp/session/{session_id}/effects`](#get-v2compsessionsession_ideffects) 给到调用方。被拒绝的 give 没有余效。设计文档：[余效 spec](superpowers/specs/2026-10-12-given-item-lingering-effects-design.md)、[give 品类 spec](superpowers/specs/2026-10-13-give-categories-design.md)。
 
-**递来她不用的东西。** 角色的 `art_metadata.smoking`、`alcoholic`、`drug`、`coffee` 表示她抽不抽烟、喝不喝酒、用不用大麻、喝不喝咖啡（表在[下文](#post-v2compsessionsession_idevents)）。递 `cigarette`、`alcohol`、`herb` 或 `coffee` 而对应的键为 `false` 时，engine 在判官运行之前掷一次。三次里有一次，这一轮照常进行。其余情况回应就是 `refuse`，不管判官怎么答，也不管有没有 LLM 判官：`action_response` 帧和两套历史接口返回的 `response` 都是 `refuse`，这次 give 不留余效，并像任何被拒的 give 一样让 bond 线降一档。判官会被告知这个结果（见 [model-config.zh.md](model-config.zh.md#taskspde_decision--opt-in-llm-pde-判断器)）。键为 `true` 或不写时从不掷，其他物品和其他动作也不掷。
+**递来她不用的东西。** 角色的 `art_metadata.smoking`、`alcoholic`、`drug`、`coffee`、`gluttony` 表示她抽不抽烟、喝不喝酒、用不用大麻、喝不喝咖啡、贪不贪吃（表在[下文](#post-v2compsessionsession_idevents)）。递 `cigarette`、`alcohol`、`herb`、`coffee` 或 `cuisine` 而对应的键为 `false` 时，engine 在判官运行之前掷一次。三次里有一次，这一轮照常进行。其余情况回应就是 `refuse`，不管判官怎么答，也不管有没有 LLM 判官：`action_response` 帧和两套历史接口返回的 `response` 都是 `refuse`，这次 give 不留余效，并像任何被拒的 give 一样让 bond 线降一档。判官会被告知这个结果（见 [model-config.zh.md](model-config.zh.md#taskspde_decision--opt-in-llm-pde-判断器)）。键为 `true` 或不写时从不掷，其他物品和其他动作也不掷。
+
+**社交动作。** `bluff`、`threaten`、`trick` 的回应表示她有没有中招：`accept` 是信了、被吓到了、上当了，`refuse` 是没信、没吃这一套、识破了。和所有动作一样，没有判定时算 `accept`。识破不降档，这一轮由亲密度判官照常评。
+
+**让你拍照。** 请求带 `image`、部署配置了 `[tasks.chat_image_prompt_compose]` 时，被接受的 `photo` 以 `reply_text_image` 回复：先是她的话，再是一条以她的脸部参考为基础、按当前场景组出来的 `image_request`。有没有 LLM 判官都一样。被拒的 `photo`，或没有这项出图能力的 `photo`，只回文字，即使判官提议了出图。`image.force = true` 仍让这一轮是 `reply_image`。
 
 带动作时 `content` 可以为空，也可以和 `image_url`、`image` 同时出现。取值不合规（超出范围、缺少 `item`/`text`/`amount_usd`/`kind`/`name`）一律返回 `422`，`code: "unprocessable"`；`type` 或 `item` 不在上表取值内时，请求体按无法解析的 JSON 拒绝（同样是 `422`）。动作存在用户行上，两套历史接口都以 `action` 字段返回，该回合生效之后带 `response`。
 
@@ -516,6 +521,7 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 - `ghost`：`meta(action_type=ghost) → done → final` — 无 `delta`，`meta` 中无 `model`，`done` 的 `usage` 和 `generation_id` 均为 `null`。该轮伴侣保持沉默，未调用聊天模型。
 - 带推理的回合：判官返回了推理时，`reasoning*` 排在这份列表里每种形状的最前面，在 `action_response` 和 `body_state` 之前：`reasoning* → meta(reply) → delta* → done → final`
 - 动作轮次：形状相同，只是 `action_response` 排在第一个 `meta` 之前——`action_response → meta(reply) → delta* → done → final`；不会是 `ghost` 或 `product_qa`
+- 有出图能力时被接受的 `photo`：`action_response → meta(reply_text_image) → delta* → done → image_request → final`
 - 带余效或已知需求的回合：`body_state` 位于第一个 `meta` 之前，两者都发时排在 `action_response` 之后——例如 `action_response → body_state → meta(reply) → delta* → done → final`
 - `product_qa`：`meta(action_type=product_qa) → delta* → done → final` — 形状与普通文本回复相同，由独立的模型链（`[tasks.chat_product_qa]`）流式生成，而非 `chat_companion`；落库时带 `channel='product_qa'`，重放时同样报告为 `product_qa`。
 
@@ -873,7 +879,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
   | `homesick` | `true` / `false` / 不写 | 出行往哪去：`true` 偏向 `hometown_visit`、压低游玩的两种；`false` 压低 `hometown_visit`；`business_trip` 不动 |
   | `is_virgin` | `true` / `false`（默认） | 第一次 `having_sex` 事件之前，`having_sex` 的概率是五分之一；之后这个键不再起作用 |
   | `sex_addict` | `true` / `false` / 不写 | `sudden_desire` 在 `short` 内被抽到的概率是原来的三倍 / 三分之一；仍然只在最亲近的档 |
-  | `smoking`、`alcoholic`、`drug`、`coffee` | 各为 `true` / `false` / 不写 | 她抽不抽烟、喝不喝酒、用不用大麻、喝不喝咖啡：为 `true` 的越多，她的 `indulgence` 回到 `high` 越快，进而给抽取加权；为 `false` 的键可能让她拒收递来的这样东西（见[上文](#post-compchatsession_idmessagestream)） |
+  | `smoking`、`alcoholic`、`drug`、`coffee`、`gluttony` | 各为 `true` / `false` / 不写 | 她抽不抽烟、喝不喝酒、用不用大麻、喝不喝咖啡、贪不贪吃：为 `true` 的越多，她的 `indulgence` 回到 `high` 越快，进而给抽取加权；为 `false` 的键可能让她拒收递来的这样东西（见[上文](#post-compchatsession_idmessagestream)） |
 
   取值形状不对、种类未知，或种类不在 `mid` 里，一律忽略。偏好不会绕过任何门槛。
 - **只要有符合条件的种类，抽取就一定得到一个事件。** 她的一天有多热闹，取决于调用方什么时候来要。
@@ -917,7 +923,7 @@ composer 失败时退回普通的人物肖像 prompt，跟聊天回合一样。�
 
 它们持续期间，角色任何一个 session 里的每一轮文字消息都会被 ghost，不经过判官，也不计入 ghost 连续次数，
 `/open` 返回 `null`。已经讲出来的 `busy`、`in_battle` 或 `out_shopping` 同样让轮次沉默。
-带用户 `action` 的轮次（任何 `type`：`give`、`gift`、`tip`、`kiss`、`hug`、`touch`、`lick`、`french_kiss`、`hug_from_behind`、`tease`、`custom`）或 `image.force = true` 是例外：
+带用户 `action` 的轮次（任何 `type`：`give`、`gift`、`tip`、`kiss`、`hug`、`touch`、`lick`、`french_kiss`、`hug_from_behind`、`tease`、`pat`、`photo`、`bluff`、`threaten`、`trick`、`custom`）或 `image.force = true` 是例外：
 它走正常路径并得到回复，因为动作在语义上是线下互动，用不着手机，强制出图的轮次永远是 `reply_image`。
 角色只在 ghost 保护允许的地方才会这样沉默：部署的 ghosting 开关关闭（`ghosting = false`）时不会抽到任何离线类种类，已经在进行的一段也不再让轮次沉默，
 用户消息不足 10 条的会话里也不会抽到；调用方完全不想要它们，就在 `kinds` 里不写。这样被 ghost 的消息没有回执（没有判官读过它），
@@ -1417,7 +1423,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 
 ## 自带角色（BYOC）
 
-BYOC 实例是一个角色引擎从不存储的角色实例。两个路由负责创建；之后 stream、compose 和图片编辑路由在 `character` 字段里接受封装好的角色卡（见上面 stream 端点的「自带角色」段落）。两个路由都需要 bearer token 和 `X-Byoc-Caller-Secret`，后者必须与部署的 `BYOC_CALLER_SECRET` 相符。它们的拒绝响应使用流前错误的响应体 `{code, message, user_message}`。流程、封装格式和记录的内容见 [byoc.zh.md](byoc.zh.md)；卡片格式见 [eros-character-v1.md](eros-character-v1.md)。
+BYOC 实例是一个角色引擎从不存储的角色实例。两个路由负责创建；之后 stream、compose 和图片编辑路由在 `character` 字段里接受封装好的角色卡（见上面 stream 端点的「自带角色」段落）。两个路由都需要 bearer token 和 `X-Byoc-Caller-Secret`，后者必须与部署的 `BYOC_CALLER_SECRET` 相符。它们的拒绝响应使用流前错误的响应体 `{code, message, user_message}`。流程、封装格式和记录的内容见 [byoc.zh.md](byoc.zh.md)；卡片格式见 [eros-character-v1.1.md](eros-character-v1.1.md)。
 
 ### `POST /v2/comp/byoc/init`
 

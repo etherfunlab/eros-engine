@@ -45,7 +45,7 @@ Voice calls read needs and no events. Group turns read neither. Details follow.
 | `stamina` | worn out | full of energy | 很累 / 精神很好 |
 | `emotional` | content | badly wants to be cared about | 心里挺满足 / 很想被在乎 |
 | `outing` | wants to stay in | wants to go out | 只想待在屋里 / 想出门走走 |
-| `indulgence` | no urge | craves what she's hooked on: a smoke, a drink, weed, a coffee | — / 很想抽根烟, 很想喝一杯, 很想抽口大麻, 很想喝杯咖啡 or 很想放纵一下 ([below](#where-needs-show-up)) |
+| `indulgence` | no urge | craves what she's hooked on: a smoke, a drink, weed, a coffee, a good meal | — / 很想抽根烟, 很想喝一杯, 很想抽口大麻, 很想喝杯咖啡, 很想吃顿好的 or 很想放纵一下 ([below](#where-needs-show-up)) |
 
 Levels are ordinals. The judge never reads or writes a number, and `mid` is the unremarkable
 middle.
@@ -91,7 +91,7 @@ moves up to three needs by one level each:
 | `give` item | `hunger` | `social` | `indulgence` |
 |---|---|---|---|
 | `food` | −1 | | |
-| `cigarette`, `alcohol`, `herb` | −1 | +1 | +1 |
+| `cigarette`, `alcohol`, `herb`, `cuisine` | −1 | +1 | +1 |
 | `medicine`, `coffee` | −1 | −1 | −1 |
 | any other item | | | |
 
@@ -140,11 +140,11 @@ the rating, and stops there:
 | `indulgence`, no habit `true` | `mid` | 8 h |
 | `indulgence`, one habit `true` | `high` | 12 h |
 | `indulgence`, two habits `true` | `high` | 8 h |
-| `indulgence`, three or four habits `true` | `high` | 4 h |
+| `indulgence`, three or more habits `true` | `high` | 4 h |
 
 Time away makes her hungry and wanting company; tiredness, emotional need and the wish to go
 out or stay in settle toward the middle. A `low` hunger rated at noon reads `mid` at 16:00 and
-`high` from 20:00. The habits are the persona's `smoking`, `alcoholic`, `drug` and `coffee` keys
+`high` from 20:00. The habits are the persona's `smoking`, `alcoholic`, `drug`, `coffee` and `gluttony` keys
 ([Persona settings](#persona-settings)); `false` and absent count alike. The more of them are
 `true`, the sooner the craving comes back after the judge rated it down. A rating
 stored without `outing` and `indulgence` reads both as `mid`. A BYOC persona's keys live on
@@ -189,7 +189,7 @@ again shows the judge the same line.
 
   `indulgence` shows only at `high`. It names one thing she uses, picked at random each turn
   among the habit keys set to `true`: `smoking` 很想抽根烟, `alcoholic` 很想喝一杯, `drug`
-  很想抽口大麻, `coffee` 很想喝杯咖啡. With no key `true` it reads 很想放纵一下. Every need at `mid` (a `low`
+  很想抽口大麻, `coffee` 很想喝杯咖啡, `gluttony` 很想吃顿好的. With no key `true` it reads 很想放纵一下. Every need at `mid` (a `low`
   `indulgence` counts the same), or no rating, adds nothing and leaves the prompt
   unchanged. A judged turn's reply is written with the levels the turn ends with: the
   levels written to its row (with the needs an accepted give moved taken from the baseline), otherwise the
@@ -351,7 +351,7 @@ authors the persona, sit beside `gender`, `birthday` and `timezone`:
 | `homesick` | `true`, `false`, absent (default) | within `trip`: `true` weighs `hometown_visit` 3 times and `short_trip` / `long_trip` a third; `false` weighs `hometown_visit` a third; `business_trip` is work and untouched either way |
 | `is_virgin` | `true`, `false` (default) | while she is a virgin, `having_sex` weighs a fifth within `mid` |
 | `sex_addict` | `true`, `false`, absent (default) | within `short`: `true` weighs `sudden_desire` 3 times, `false` a third; its rung gate holds either way |
-| `smoking`, `alcoholic`, `drug`, `coffee` | each `true`, `false`, absent (default) | whether she smokes, drinks, uses weed, drinks coffee: how fast `indulgence` comes back ([drift](#drift-between-ratings)), what a high `indulgence` names in the reply, and how she takes a give of that thing (below) |
+| `smoking`, `alcoholic`, `drug`, `coffee`, `gluttony` | each `true`, `false`, absent (default) | whether she smokes, drinks, uses weed, drinks coffee, loves good food (`false`: she keeps off rich food): how fast `indulgence` comes back ([drift](#drift-between-ratings)), what a high `indulgence` names in the reply, and how she takes a give of that thing (below) |
 
 `prefer_trip` says whether she moves at all; `homesick` says where she goes when she does. A
 flight attendant with both `true` travels often, works her trips as before, and spends her
@@ -368,13 +368,13 @@ category, `period` included, and `period`'s own 28-day cooldown keeps it near mo
 way. `prefer_trip` raises the odds of a trip, not its frequency: the weekly category cooldown
 holds.
 
-The four habit keys reach the draw only through the drift of `indulgence`. The judge's
+The five habit keys reach the draw only through the drift of `indulgence`. The judge's
 persona block (`[角色人格]`) does not list them, so she does not bring up tobacco, alcohol,
-weed or coffee at every turn; a persona whose habits should colour her talk says so in her persona text. The engine
+weed, coffee or food at every turn; a persona whose habits should colour her talk says so in her persona text. The engine
 never writes them.
 
 **A give of something she does not use.** When a turn's action is a `give` of `cigarette`,
-`alcohol`, `herb` or `coffee` and the matching key (`smoking`, `alcoholic`, `drug`, `coffee`) is `false`, the
+`alcohol`, `herb`, `coffee` or `cuisine` and the matching key (`smoking`, `alcoholic`, `drug`, `coffee`, `gluttony`) is `false`, the
 engine rolls once before the judge runs. One time in three the turn goes on as usual.
 Otherwise she refuses this give:
 
@@ -1115,7 +1115,7 @@ falling-out rows live in `engine.persona_events` like any event.
 | `[近期事件]` | not rendered: there is no judge to read it |
 | Offline kinds | silence turns as with the judge, since the check runs before it: the ghosting switch and the action and forced-image exemptions apply |
 | The ask for space and the romantic choices | unchanged: the trigger reads the affinity evaluator's judged turns, not the PDE judge |
-| `smoking`, `alcoholic`, `drug`, `coffee` | a `false` key still rolls on a give and can turn it into a refusal; there is no `indulgence` to drift or name |
+| `smoking`, `alcoholic`, `drug`, `coffee`, `gluttony` | a `false` key still rolls on a give and can turn it into a refusal; there is no `indulgence` to drift or name |
 
 ## Code pointers
 

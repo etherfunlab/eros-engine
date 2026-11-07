@@ -6,7 +6,7 @@
 
 导入的卡片永远是一个新角色：一个新实例，不带任何其他实例的历史。引擎不知道卡片从哪里来。
 
-设计文档：[BYOC design](superpowers/specs/2026-10-16-byoc-design.md)。卡片格式：[Eros 角色卡 v1](eros-character-v1.md)。
+设计文档：[BYOC design](superpowers/specs/2026-10-16-byoc-design.md)。卡片格式：[Eros 角色卡 v1.1](eros-character-v1.1.md)。
 
 ## 开启方式
 
@@ -82,7 +82,7 @@ create 之后，用 `POST /comp/chat/start` 加上新的 `instance_id` 开会话
 
 ## 封装卡片
 
-明文是 [Eros 角色卡 v1](eros-character-v1.md) 的 UTF-8 JSON，最多 64 KiB。第三方格式由下游在封装之前转换。
+明文是 [Eros 角色卡 v1.1](eros-character-v1.1.md) 的 UTF-8 JSON，最多 64 KiB。第三方格式由下游在封装之前转换。
 
 ```
 character = base64url( nonce[12] ‖ AES-256-GCM(key, nonce, plaintext) ‖ tag[16] )

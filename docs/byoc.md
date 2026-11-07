@@ -12,7 +12,7 @@ An imported card always starts a new character: a new instance with no history
 from any other instance. The engine does not know where a card came from.
 
 Design: [BYOC design](superpowers/specs/2026-10-16-byoc-design.md). Card
-format: [Eros character card v1](eros-character-v1.md).
+format: [Eros character card v1.1](eros-character-v1.1.md).
 
 ## Turning it on
 
@@ -127,7 +127,7 @@ After create, open sessions with `POST /comp/chat/start` and the new
 ## Sealing a card
 
 The plaintext is the UTF-8 JSON of an
-[Eros character card v1](eros-character-v1.md), at most 64 KiB. Third-party
+[Eros character card v1.1](eros-character-v1.1.md), at most 64 KiB. Third-party
 formats are converted by the downstream before sealing.
 
 ```
