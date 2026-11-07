@@ -2900,14 +2900,18 @@ fn build_pde_ctx(
         .map(|s| format!("[身体状态] {s}\n"))
         .unwrap_or_default();
     // The action the judge decides on (spec 2026-10-05 §4.2); absent otherwise.
-    // A give the habit roll refused (spec 2026-10-28-outing-indulgence-
+    // A social action says what each answer means (spec 2026-11-08 §2.2). A
+    // give the habit roll refused (spec 2026-10-28-outing-indulgence-
     // needs-and-habits-design.md §3.1) states the outcome, not the reason.
     let action_line = match &input.event {
         eros_engine_core::types::Event::UserMessage {
             action: Some(a), ..
         } => format!(
-            "[用户动作] {}{}\n",
+            "[用户动作] {}{}{}\n",
             crate::prompt::action_subject(a),
+            crate::prompt::social_outcomes(a)
+                .map(|(yes, no)| format!("（accept：{yes}；refuse：{no}）"))
+                .unwrap_or_default(),
             if give_refused {
                 "，这次你不会收下"
             } else {
@@ -19391,6 +19395,28 @@ data: [DONE]\n\n";
             ctx.find("[指定穿着]").unwrap() < ctx.find("[用户最新消息]").unwrap(),
             "{ctx}"
         );
+    }
+
+    /// A social action's `[用户动作]` line says what each answer means (spec
+    /// 2026-11-08 §2.2); a physical one stays bare.
+    #[test]
+    fn build_pde_ctx_states_what_a_social_answer_means() {
+        use eros_engine_core::types::UserAction;
+        let t = JudgeTranscript::default();
+        let mut input = fixture_decision_input();
+        let mut ctx_for = |a: UserAction| {
+            if let Event::UserMessage { action, .. } = &mut input.event {
+                *action = Some(a);
+            }
+            build_pde_ctx(&t, &input, false, None, None, None, None, false)
+        };
+        let threat = ctx_for(UserAction::Threaten);
+        assert!(
+            threat.contains("[用户动作] 对方威胁你（accept：你被吓到了；refuse：你没吃这一套）\n"),
+            "{threat}"
+        );
+        let pat = ctx_for(UserAction::Pat);
+        assert!(pat.contains("[用户动作] 对方伸手想拍拍你\n"), "{pat}");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

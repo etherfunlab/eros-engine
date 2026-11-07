@@ -644,6 +644,11 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
         UserAction::FrenchKiss => "凑过来想和你舌吻".into(),
         UserAction::HugFromBehind => "悄悄走到你身后，想抱住你".into(),
         UserAction::Tease => "伸手想挑逗你".into(),
+        UserAction::Pat => "伸手想拍拍你".into(),
+        UserAction::Photo => "举起手机想给你拍张照".into(),
+        UserAction::Bluff => "在你面前虚张声势，想唬住你".into(),
+        UserAction::Threaten => "威胁你".into(),
+        UserAction::Trick => "想捉弄你".into(),
         UserAction::Custom { text } => text.clone(),
         UserAction::Tip { amount_usd } => {
             format!("给你发了一个红包，相当于{}", tip_value_noun(*amount_usd))
@@ -1205,12 +1210,25 @@ pub(crate) fn reactions_context(lines: &[ReactionLine<'_>]) -> String {
     }
 }
 
+/// What `accept` and `refuse` mean on a social action (spec 2026-11-08
+/// §2.2): whether she fell for it. `None` on every other action, whose
+/// answers are 你接受了 / 你没有接受.
+pub(crate) fn social_outcomes(a: &UserAction) -> Option<(&'static str, &'static str)> {
+    match a {
+        UserAction::Bluff => Some(("你信了", "你没信")),
+        UserAction::Threaten => Some(("你被吓到了", "你没吃这一套")),
+        UserAction::Trick => Some(("你上当了", "你识破了")),
+        _ => None,
+    }
+}
+
 /// The action and the decided response as one sentence:
-/// 「对方凑过来想亲你，你没有接受。」
+/// 「对方凑过来想亲你，你没有接受。」「对方威胁你，你没吃这一套。」
 pub(crate) fn action_outcome(a: &UserAction, response: ActionResponse) -> String {
+    let (yes, no) = social_outcomes(a).unwrap_or(("你接受了", "你没有接受"));
     let outcome = match response {
-        ActionResponse::Accept => "你接受了",
-        ActionResponse::Refuse => "你没有接受",
+        ActionResponse::Accept => yes,
+        ActionResponse::Refuse => no,
     };
     format!("{}，{outcome}。", action_subject(a))
 }
@@ -5898,6 +5916,11 @@ mod tests {
             UserAction::FrenchKiss,
             UserAction::HugFromBehind,
             UserAction::Tease,
+            UserAction::Pat,
+            UserAction::Photo,
+            UserAction::Bluff,
+            UserAction::Threaten,
+            UserAction::Trick,
             UserAction::Custom {
                 text: "捏了捏你的脸".into(),
             },
@@ -5920,9 +5943,50 @@ mod tests {
                 "凑过来想和你舌吻",
                 "悄悄走到你身后，想抱住你",
                 "伸手想挑逗你",
+                "伸手想拍拍你",
+                "举起手机想给你拍张照",
+                "在你面前虚张声势，想唬住你",
+                "威胁你",
+                "想捉弄你",
                 "捏了捏你的脸",
             ]
         );
+    }
+
+    /// A social action's two answers say whether she fell for it (spec
+    /// 2026-11-08 §2.2); a physical one keeps 接受 / 没有接受.
+    #[test]
+    fn social_actions_state_whether_she_fell_for_it() {
+        use ActionResponse::{Accept, Refuse};
+        assert_eq!(
+            user_action_context(&UserAction::Threaten, Refuse, None),
+            "\n\n[user_action]\n对方威胁你，你没吃这一套。用你自己的话回应。"
+        );
+        assert_eq!(
+            action_outcome(&UserAction::Threaten, Accept),
+            "对方威胁你，你被吓到了。"
+        );
+        assert_eq!(
+            action_outcome(&UserAction::Bluff, Accept),
+            "对方在你面前虚张声势，想唬住你，你信了。"
+        );
+        assert_eq!(
+            action_outcome(&UserAction::Bluff, Refuse),
+            "对方在你面前虚张声势，想唬住你，你没信。"
+        );
+        assert_eq!(
+            action_outcome(&UserAction::Trick, Accept),
+            "对方想捉弄你，你上当了。"
+        );
+        assert_eq!(
+            action_outcome(&UserAction::Trick, Refuse),
+            "对方想捉弄你，你识破了。"
+        );
+        assert_eq!(
+            action_outcome(&UserAction::Photo, Refuse),
+            "对方举起手机想给你拍张照，你没有接受。"
+        );
+        assert_eq!(social_outcomes(&UserAction::Kiss), None);
     }
 
     #[test]
