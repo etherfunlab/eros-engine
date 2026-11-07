@@ -831,6 +831,7 @@ pub(crate) fn needs_line(
         (habits.alcoholic, "很想喝一杯"),
         (habits.drug, "很想抽口大麻"),
         (habits.coffee, "很想喝杯咖啡"),
+        (habits.gluttony, "很想吃顿好的"),
     ]
     .into_iter()
     .filter_map(|(set, words)| (set == Some(true)).then_some(words))
@@ -1275,10 +1276,10 @@ pub(crate) fn persona_traits(
     }
 }
 
-/// Whether the persona smokes, drinks, uses weed, drinks coffee (spec
-/// 2026-10-28-outing-indulgence-needs-and-habits-design.md §3):
-/// `art_metadata.smoking`, `alcoholic`, `drug`, `coffee`; a key that is not a
-/// boolean reads as unset.
+/// Whether the persona smokes, drinks, uses weed, drinks coffee, loves good
+/// food (spec 2026-10-28-outing-indulgence-needs-and-habits-design.md §3,
+/// 2026-11-08 §4): `art_metadata.smoking`, `alcoholic`, `drug`, `coffee`,
+/// `gluttony`; a key that is not a boolean reads as unset.
 pub(crate) fn persona_habits(persona: &CompanionPersona) -> eros_engine_core::needs::Habits {
     let key = |k: &str| persona.genome.art_metadata.get(k).and_then(|v| v.as_bool());
     eros_engine_core::needs::Habits {
@@ -1286,6 +1287,7 @@ pub(crate) fn persona_habits(persona: &CompanionPersona) -> eros_engine_core::ne
         alcoholic: key("alcoholic"),
         drug: key("drug"),
         coffee: key("coffee"),
+        gluttony: key("gluttony"),
     }
 }
 
@@ -4210,6 +4212,7 @@ mod tests {
             alcoholic: Some(false),
             drug: Some(false),
             coffee: Some(false),
+            gluttony: Some(false),
         };
         let drinker = Habits {
             alcoholic: Some(true),
@@ -4253,6 +4256,7 @@ mod tests {
             alcoholic: Some(true),
             drug: Some(true),
             coffee: Some(true),
+            gluttony: None,
         };
         let smoke_and_weed = Habits {
             alcoholic: Some(false),
@@ -4283,6 +4287,46 @@ mod tests {
                 "{h:?} {pick}"
             );
         }
+    }
+
+    /// With all five habits `true` each takes a fifth of `pick`, `gluttony`
+    /// last (spec 2026-11-08 §4).
+    #[test]
+    fn a_craving_can_be_for_good_food() {
+        use eros_engine_core::needs::{Habits, NeedLevel::*, Needs};
+        let n = Needs {
+            hunger: Mid,
+            social: Mid,
+            stamina: Mid,
+            emotional: Mid,
+            outing: Mid,
+            indulgence: High,
+        };
+        let five = Habits {
+            smoking: Some(true),
+            alcoholic: Some(true),
+            drug: Some(true),
+            coffee: Some(true),
+            gluttony: Some(true),
+        };
+        for (pick, want) in [
+            (0.0, "很想抽根烟"),
+            (0.2, "很想喝一杯"),
+            (0.4, "很想抽口大麻"),
+            (0.6, "很想喝杯咖啡"),
+            (0.8, "很想吃顿好的"),
+            (1.0, "很想吃顿好的"),
+        ] {
+            assert_eq!(needs_line(&n, five, pick).as_deref(), Some(want), "{pick}");
+        }
+        let glutton = Habits {
+            gluttony: Some(true),
+            ..Habits::default()
+        };
+        assert_eq!(
+            needs_line(&n, glutton, 0.0).as_deref(),
+            Some("很想吃顿好的")
+        );
     }
 
     #[test]
@@ -4814,16 +4858,21 @@ mod tests {
         assert_eq!(with(serde_json::json!({})), Habits::default());
         assert_eq!(
             with(
-                serde_json::json!({"smoking": true, "alcoholic": false, "drug": "true", "coffee": true})
+                serde_json::json!({"smoking": true, "alcoholic": false, "drug": "true", "coffee": true, "gluttony": "true"})
             ),
             Habits {
                 smoking: Some(true),
                 alcoholic: Some(false),
                 drug: None,
                 coffee: Some(true),
+                gluttony: None,
             }
         );
         assert_eq!(with(serde_json::json!({"drug": 1})).drug, None);
+        assert_eq!(
+            with(serde_json::json!({"gluttony": false})).gluttony,
+            Some(false)
+        );
     }
 
     #[test]
