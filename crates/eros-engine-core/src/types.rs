@@ -125,6 +125,15 @@ pub enum UserAction {
     FrenchKiss,
     HugFromBehind,
     Tease,
+    Pat,
+    /// The user takes her picture; accepted, the turn shows it (spec
+    /// 2026-11-08-five-actions-two-items-gluttony-card-1-1-design.md §2.3).
+    Photo,
+    /// The three social actions: the response says whether she falls for it
+    /// (spec 2026-11-08 §2.2).
+    Bluff,
+    Threaten,
+    Trick,
     Custom {
         text: String,
     },
@@ -145,11 +154,15 @@ pub enum UserAction {
 impl UserAction {
     /// The line a refusal of this action drops: handing something over or
     /// giving something to keep is friendship, every physical gesture is
-    /// romance. A refused tip drops nothing (spec 2026-10-11 §6).
+    /// romance. A refused tip drops nothing (spec 2026-10-11 §6), nor does
+    /// seeing through a bluff, a threat or a trick (spec 2026-11-08 §2.2).
     pub fn refusal_line(&self) -> Option<AffinityLine> {
         match self {
             UserAction::Give { .. } | UserAction::Gift { .. } => Some(AffinityLine::Bond),
-            UserAction::Tip { .. } => None,
+            UserAction::Tip { .. }
+            | UserAction::Bluff
+            | UserAction::Threaten
+            | UserAction::Trick => None,
             _ => Some(AffinityLine::Chemistry),
         }
     }
@@ -170,6 +183,8 @@ pub enum GivenItem {
     Tea,
     Coffee,
     Herb,
+    /// A proper dish or meal; `food` is something to eat.
+    Cuisine,
     Watch,
     Gem,
     Gold,
@@ -180,6 +195,7 @@ pub enum GivenItem {
     Handmade,
     CreditCard,
     Flower,
+    Jewelry,
 }
 
 /// Which of the persona's lists an item belongs to (spec
@@ -582,6 +598,11 @@ mod tests {
             (UserAction::FrenchKiss, "french_kiss"),
             (UserAction::HugFromBehind, "hug_from_behind"),
             (UserAction::Tease, "tease"),
+            (UserAction::Pat, "pat"),
+            (UserAction::Photo, "photo"),
+            (UserAction::Bluff, "bluff"),
+            (UserAction::Threaten, "threaten"),
+            (UserAction::Trick, "trick"),
         ] {
             let v = serde_json::json!({ "type": wire });
             assert_eq!(serde_json::to_value(&a).unwrap(), v);
@@ -606,6 +627,8 @@ mod tests {
             UserAction::FrenchKiss,
             UserAction::HugFromBehind,
             UserAction::Tease,
+            UserAction::Pat,
+            UserAction::Photo,
             UserAction::Custom { text: "x".into() },
         ] {
             assert_eq!(a.refusal_line().unwrap(), AffinityLine::Chemistry, "{a:?}");
@@ -688,6 +711,8 @@ mod tests {
             (GivenItem::Handmade, "handmade"),
             (GivenItem::CreditCard, "credit_card"),
             (GivenItem::Flower, "flower"),
+            (GivenItem::Cuisine, "cuisine"),
+            (GivenItem::Jewelry, "jewelry"),
         ] {
             assert_eq!(serde_json::to_value(item).unwrap(), wire);
             assert_eq!(
@@ -716,6 +741,13 @@ mod tests {
         let back: UserAction =
             serde_json::from_value(serde_json::json!({"type": "tip", "amount_usd": 9.99})).unwrap();
         assert_eq!(back, UserAction::Tip { amount_usd: 9.99 });
+    }
+
+    #[test]
+    fn a_refused_social_action_drops_no_line() {
+        for a in [UserAction::Bluff, UserAction::Threaten, UserAction::Trick] {
+            assert_eq!(a.refusal_line(), None, "{a:?}");
+        }
     }
 
     #[test]

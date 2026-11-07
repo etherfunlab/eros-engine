@@ -5306,7 +5306,7 @@
       },
       "GivenItemDto": {
         "type": "string",
-        "description": "What a `give` action hands over. Consumables (`cigarette` through `herb`)\nlinger on the persona; valuables (`watch` through `flower`) do not.",
+        "description": "What a `give` action hands over. Consumables (`cigarette` through\n`cuisine`) linger on the persona; valuables (`watch` through `jewelry`) do\nnot.",
         "enum": [
           "cigarette",
           "alcohol",
@@ -5316,6 +5316,7 @@
           "tea",
           "coffee",
           "herb",
+          "cuisine",
           "watch",
           "gem",
           "gold",
@@ -5325,7 +5326,8 @@
           "artwork",
           "handmade",
           "credit_card",
-          "flower"
+          "flower",
+          "jewelry"
         ]
       },
       "GreetingDto": {
@@ -7213,7 +7215,7 @@
       },
       "UserActionDto": {
         "type": "object",
-        "description": "An action the user does to the persona this turn, besides talking. The\npersona accepts or does not; a refusal costs the relationship one tier on\nthe line the action touches (`give` and `gift` → bond, every physical or custom action →\nchemistry); a refused `tip` costs nothing. An accepted `gift` joins the\npersona's items or wardrobe.",
+        "description": "An action the user does to the persona this turn, besides talking. The\npersona accepts or does not; a refusal costs the relationship one tier on\nthe line the action touches (`give` and `gift` → bond, every physical or custom action →\nchemistry); a refused `tip`, `bluff`, `threaten` or `trick` costs nothing.\nAn accepted `gift` joins the persona's items or wardrobe.",
         "required": [
           "type"
         ],
@@ -7291,6 +7293,11 @@
           "french_kiss",
           "hug_from_behind",
           "tease",
+          "pat",
+          "photo",
+          "bluff",
+          "threaten",
+          "trick",
           "custom",
           "tip",
           "gift"

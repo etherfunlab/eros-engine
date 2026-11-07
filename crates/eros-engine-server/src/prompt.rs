@@ -644,6 +644,11 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
         UserAction::FrenchKiss => "凑过来想和你舌吻".into(),
         UserAction::HugFromBehind => "悄悄走到你身后，想抱住你".into(),
         UserAction::Tease => "伸手想挑逗你".into(),
+        UserAction::Pat => "伸手想拍拍你".into(),
+        UserAction::Photo => "举起手机想给你拍张照".into(),
+        UserAction::Bluff => "在你面前虚张声势，想唬住你".into(),
+        UserAction::Threaten => "威胁你".into(),
+        UserAction::Trick => "想捉弄你".into(),
         UserAction::Custom { text } => text.clone(),
         UserAction::Tip { amount_usd } => {
             format!("给你发了一个红包，相当于{}", tip_value_noun(*amount_usd))
@@ -723,6 +728,7 @@ pub(crate) fn given_phrase(item: GivenItem, name: Option<&str>, quantity: u8) ->
         GivenItem::Tea => ("杯", "茶"),
         GivenItem::Coffee => ("杯", "咖啡"),
         GivenItem::Herb => ("包", "药草"),
+        GivenItem::Cuisine => ("道", "菜"),
         GivenItem::Watch => ("块", "手表"),
         GivenItem::Gem => ("颗", "宝石"),
         GivenItem::Gold => ("块", "黄金"),
@@ -733,6 +739,7 @@ pub(crate) fn given_phrase(item: GivenItem, name: Option<&str>, quantity: u8) ->
         GivenItem::Handmade => ("份", "手作礼物"),
         GivenItem::CreditCard => ("张", "信用卡"),
         GivenItem::Flower => ("朵", "花"),
+        GivenItem::Jewelry => ("件", "首饰"),
     };
     match name {
         Some(name) => format!("{quantity} {unit}「{name}」"),
@@ -753,6 +760,7 @@ fn effect_word(item: GivenItem, level: u8) -> &'static str {
     const TEA: [&str; 4] = ["茶香还在", "心静了些", "神清气爽", "喝得有点心慌"];
     const COFFEE: [&str; 4] = ["提了点神", "精神起来了", "精神很足", "心跳得有点快"];
     const HERB: [&str; 4] = ["药草劲还轻", "药草见效了", "药草劲很足", "药草劲太冲"];
+    const CUISINE: [&str; 4] = ["回味还在", "吃得挺满足", "吃得正香", "吃撑了"];
     let words = match item {
         GivenItem::Cigarette => &CIGARETTE,
         GivenItem::Alcohol => &ALCOHOL,
@@ -762,6 +770,7 @@ fn effect_word(item: GivenItem, level: u8) -> &'static str {
         GivenItem::Tea => &TEA,
         GivenItem::Coffee => &COFFEE,
         GivenItem::Herb => &HERB,
+        GivenItem::Cuisine => &CUISINE,
         // A valuable has an empty curve, so no effect ever names one.
         GivenItem::Watch
         | GivenItem::Gem
@@ -772,7 +781,8 @@ fn effect_word(item: GivenItem, level: u8) -> &'static str {
         | GivenItem::Artwork
         | GivenItem::Handmade
         | GivenItem::CreditCard
-        | GivenItem::Flower => return "",
+        | GivenItem::Flower
+        | GivenItem::Jewelry => return "",
     };
     words[usize::from(level.clamp(1, 4)) - 1]
 }
@@ -826,6 +836,7 @@ pub(crate) fn needs_line(
         (habits.alcoholic, "很想喝一杯"),
         (habits.drug, "很想抽口大麻"),
         (habits.coffee, "很想喝杯咖啡"),
+        (habits.gluttony, "很想吃顿好的"),
     ]
     .into_iter()
     .filter_map(|(set, words)| (set == Some(true)).then_some(words))
@@ -1199,12 +1210,25 @@ pub(crate) fn reactions_context(lines: &[ReactionLine<'_>]) -> String {
     }
 }
 
+/// What `accept` and `refuse` mean on a social action (spec 2026-11-08
+/// §2.2): whether she fell for it. `None` on every other action, whose
+/// answers are 你接受了 / 你没有接受.
+pub(crate) fn social_outcomes(a: &UserAction) -> Option<(&'static str, &'static str)> {
+    match a {
+        UserAction::Bluff => Some(("你信了", "你没信")),
+        UserAction::Threaten => Some(("你被吓到了", "你没吃这一套")),
+        UserAction::Trick => Some(("你上当了", "你识破了")),
+        _ => None,
+    }
+}
+
 /// The action and the decided response as one sentence:
-/// 「对方凑过来想亲你，你没有接受。」
+/// 「对方凑过来想亲你，你没有接受。」「对方威胁你，你没吃这一套。」
 pub(crate) fn action_outcome(a: &UserAction, response: ActionResponse) -> String {
+    let (yes, no) = social_outcomes(a).unwrap_or(("你接受了", "你没有接受"));
     let outcome = match response {
-        ActionResponse::Accept => "你接受了",
-        ActionResponse::Refuse => "你没有接受",
+        ActionResponse::Accept => yes,
+        ActionResponse::Refuse => no,
     };
     format!("{}，{outcome}。", action_subject(a))
 }
@@ -1270,10 +1294,10 @@ pub(crate) fn persona_traits(
     }
 }
 
-/// Whether the persona smokes, drinks, uses weed, drinks coffee (spec
-/// 2026-10-28-outing-indulgence-needs-and-habits-design.md §3):
-/// `art_metadata.smoking`, `alcoholic`, `drug`, `coffee`; a key that is not a
-/// boolean reads as unset.
+/// Whether the persona smokes, drinks, uses weed, drinks coffee, loves good
+/// food (spec 2026-10-28-outing-indulgence-needs-and-habits-design.md §3,
+/// 2026-11-08 §4): `art_metadata.smoking`, `alcoholic`, `drug`, `coffee`,
+/// `gluttony`; a key that is not a boolean reads as unset.
 pub(crate) fn persona_habits(persona: &CompanionPersona) -> eros_engine_core::needs::Habits {
     let key = |k: &str| persona.genome.art_metadata.get(k).and_then(|v| v.as_bool());
     eros_engine_core::needs::Habits {
@@ -1281,6 +1305,7 @@ pub(crate) fn persona_habits(persona: &CompanionPersona) -> eros_engine_core::ne
         alcoholic: key("alcoholic"),
         drug: key("drug"),
         coffee: key("coffee"),
+        gluttony: key("gluttony"),
     }
 }
 
@@ -4205,6 +4230,7 @@ mod tests {
             alcoholic: Some(false),
             drug: Some(false),
             coffee: Some(false),
+            gluttony: Some(false),
         };
         let drinker = Habits {
             alcoholic: Some(true),
@@ -4248,6 +4274,7 @@ mod tests {
             alcoholic: Some(true),
             drug: Some(true),
             coffee: Some(true),
+            gluttony: None,
         };
         let smoke_and_weed = Habits {
             alcoholic: Some(false),
@@ -4278,6 +4305,46 @@ mod tests {
                 "{h:?} {pick}"
             );
         }
+    }
+
+    /// With all five habits `true` each takes a fifth of `pick`, `gluttony`
+    /// last (spec 2026-11-08 §4).
+    #[test]
+    fn a_craving_can_be_for_good_food() {
+        use eros_engine_core::needs::{Habits, NeedLevel::*, Needs};
+        let n = Needs {
+            hunger: Mid,
+            social: Mid,
+            stamina: Mid,
+            emotional: Mid,
+            outing: Mid,
+            indulgence: High,
+        };
+        let five = Habits {
+            smoking: Some(true),
+            alcoholic: Some(true),
+            drug: Some(true),
+            coffee: Some(true),
+            gluttony: Some(true),
+        };
+        for (pick, want) in [
+            (0.0, "很想抽根烟"),
+            (0.2, "很想喝一杯"),
+            (0.4, "很想抽口大麻"),
+            (0.6, "很想喝杯咖啡"),
+            (0.8, "很想吃顿好的"),
+            (1.0, "很想吃顿好的"),
+        ] {
+            assert_eq!(needs_line(&n, five, pick).as_deref(), Some(want), "{pick}");
+        }
+        let glutton = Habits {
+            gluttony: Some(true),
+            ..Habits::default()
+        };
+        assert_eq!(
+            needs_line(&n, glutton, 0.0).as_deref(),
+            Some("很想吃顿好的")
+        );
     }
 
     #[test]
@@ -4809,16 +4876,21 @@ mod tests {
         assert_eq!(with(serde_json::json!({})), Habits::default());
         assert_eq!(
             with(
-                serde_json::json!({"smoking": true, "alcoholic": false, "drug": "true", "coffee": true})
+                serde_json::json!({"smoking": true, "alcoholic": false, "drug": "true", "coffee": true, "gluttony": "true"})
             ),
             Habits {
                 smoking: Some(true),
                 alcoholic: Some(false),
                 drug: None,
                 coffee: Some(true),
+                gluttony: None,
             }
         );
         assert_eq!(with(serde_json::json!({"drug": 1})).drug, None);
+        assert_eq!(
+            with(serde_json::json!({"gluttony": false})).gluttony,
+            Some(false)
+        );
     }
 
     #[test]
@@ -5844,6 +5916,11 @@ mod tests {
             UserAction::FrenchKiss,
             UserAction::HugFromBehind,
             UserAction::Tease,
+            UserAction::Pat,
+            UserAction::Photo,
+            UserAction::Bluff,
+            UserAction::Threaten,
+            UserAction::Trick,
             UserAction::Custom {
                 text: "捏了捏你的脸".into(),
             },
@@ -5866,9 +5943,50 @@ mod tests {
                 "凑过来想和你舌吻",
                 "悄悄走到你身后，想抱住你",
                 "伸手想挑逗你",
+                "伸手想拍拍你",
+                "举起手机想给你拍张照",
+                "在你面前虚张声势，想唬住你",
+                "威胁你",
+                "想捉弄你",
                 "捏了捏你的脸",
             ]
         );
+    }
+
+    /// A social action's two answers say whether she fell for it (spec
+    /// 2026-11-08 §2.2); a physical one keeps 接受 / 没有接受.
+    #[test]
+    fn social_actions_state_whether_she_fell_for_it() {
+        use ActionResponse::{Accept, Refuse};
+        assert_eq!(
+            user_action_context(&UserAction::Threaten, Refuse, None),
+            "\n\n[user_action]\n对方威胁你，你没吃这一套。用你自己的话回应。"
+        );
+        assert_eq!(
+            action_outcome(&UserAction::Threaten, Accept),
+            "对方威胁你，你被吓到了。"
+        );
+        assert_eq!(
+            action_outcome(&UserAction::Bluff, Accept),
+            "对方在你面前虚张声势，想唬住你，你信了。"
+        );
+        assert_eq!(
+            action_outcome(&UserAction::Bluff, Refuse),
+            "对方在你面前虚张声势，想唬住你，你没信。"
+        );
+        assert_eq!(
+            action_outcome(&UserAction::Trick, Accept),
+            "对方想捉弄你，你上当了。"
+        );
+        assert_eq!(
+            action_outcome(&UserAction::Trick, Refuse),
+            "对方想捉弄你，你识破了。"
+        );
+        assert_eq!(
+            action_outcome(&UserAction::Photo, Refuse),
+            "对方举起手机想给你拍张照，你没有接受。"
+        );
+        assert_eq!(social_outcomes(&UserAction::Kiss), None);
     }
 
     #[test]
@@ -6518,6 +6636,15 @@ mod tests {
     }
 
     #[test]
+    fn a_dish_has_its_own_effect_words_and_jewelry_none() {
+        let words: Vec<&str> = (1..=4)
+            .map(|l| effect_word(GivenItem::Cuisine, l))
+            .collect();
+        assert_eq!(words, ["回味还在", "吃得挺满足", "吃得正香", "吃撑了"]);
+        assert_eq!(effect_word(GivenItem::Jewelry, 2), "");
+    }
+
+    #[test]
     fn given_phrase_covers_the_new_categories() {
         for (item, unit, word) in [
             (GivenItem::Food, "份", "吃的"),
@@ -6535,6 +6662,8 @@ mod tests {
             (GivenItem::Handmade, "份", "手作礼物"),
             (GivenItem::CreditCard, "张", "信用卡"),
             (GivenItem::Flower, "朵", "花"),
+            (GivenItem::Cuisine, "道", "菜"),
+            (GivenItem::Jewelry, "件", "首饰"),
         ] {
             assert_eq!(given_phrase(item, None, 2), format!("2 {unit}{word}"));
             assert_eq!(

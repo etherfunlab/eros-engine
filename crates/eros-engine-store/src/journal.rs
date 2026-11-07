@@ -510,7 +510,15 @@ mod tests {
             .expect("a first kiss");
         assert_eq!(r.dedup_key.as_deref(), Some("first_intimacy:real"));
         assert_eq!(r.message_id, Some(m));
-        for kind in ["hug_from_behind", "tease"] {
+        for kind in [
+            "hug_from_behind",
+            "tease",
+            "pat",
+            "photo",
+            "bluff",
+            "threaten",
+            "trick",
+        ] {
             assert!(
                 moment(serde_json::json!({"type": kind, "response": "accept"})).is_none(),
                 "{kind}"

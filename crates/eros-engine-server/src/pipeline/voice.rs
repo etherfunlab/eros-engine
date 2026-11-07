@@ -1462,6 +1462,7 @@ mod tests {
             alcoholic: Some(true),
             drug: Some(true),
             coffee: None,
+            gluttony: None,
         };
         let at_micros = |micros: i64| {
             let mut s = snapshot(&[], None);
@@ -1499,6 +1500,7 @@ mod tests {
             alcoholic: Some(true),
             drug: Some(true),
             coffee: Some(true),
+            gluttony: None,
         };
         assert_eq!(
             render_bootstrap(&b, OPEN_GATE, all).as_deref(),

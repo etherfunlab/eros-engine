@@ -139,7 +139,8 @@ fn non_blank<'a>(data: &'a serde_json::Map<String, Value>, field: &str) -> Optio
         .filter(|s| !s.trim().is_empty())
 }
 
-/// Validate a card (docs/eros-character-v1.md) on a `serde_json::Value`.
+/// Validate a card (docs/eros-character-v1.1.md; `spec_version` `"1"` or
+/// `"1.1"`, read the same) on a `serde_json::Value`.
 /// serde's own error text quotes the input, so it is never surfaced: every
 /// `Err` is one of the fixed messages below.
 pub(crate) fn parse_card_v1(plaintext: &[u8]) -> Result<Card, String> {
@@ -150,7 +151,10 @@ pub(crate) fn parse_card_v1(plaintext: &[u8]) -> Result<Card, String> {
     if top.get("spec").and_then(Value::as_str) != Some("eros-character") {
         return Err("spec must be \"eros-character\"".into());
     }
-    if top.get("spec_version").and_then(Value::as_str) != Some("1") {
+    if !matches!(
+        top.get("spec_version").and_then(Value::as_str),
+        Some("1" | "1.1")
+    ) {
         return Err("unsupported spec_version".into());
     }
     if top
@@ -479,6 +483,16 @@ mod tests {
             serde_json::json!({"spec":"eros-character","spec_version":"2","data":{"name":"A","system_prompt":"p"}})
         )
         .is_err());
+        assert!(ok(
+            serde_json::json!({"spec":"eros-character","spec_version":"1.1","data":{"name":"A","system_prompt":"p"}})
+        )
+        .is_ok());
+        assert_eq!(
+            ok(serde_json::json!({"spec":"eros-character","spec_version":"1.2","data":{"name":"A","system_prompt":"p"}}))
+                .err()
+                .as_deref(),
+            Some("unsupported spec_version")
+        );
         assert!(ok(
             serde_json::json!({"spec":"eros-character","spec_version":"1","data":{"name":"A","system_prompt":"p"},"x":1})
         )

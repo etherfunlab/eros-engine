@@ -156,13 +156,19 @@ pub enum UserActionKind {
     FrenchKiss,
     HugFromBehind,
     Tease,
+    Pat,
+    Photo,
+    Bluff,
+    Threaten,
+    Trick,
     Custom,
     Tip,
     Gift,
 }
 
-/// What a `give` action hands over. Consumables (`cigarette` through `herb`)
-/// linger on the persona; valuables (`watch` through `flower`) do not.
+/// What a `give` action hands over. Consumables (`cigarette` through
+/// `cuisine`) linger on the persona; valuables (`watch` through `jewelry`) do
+/// not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GivenItemDto {
@@ -174,6 +180,7 @@ pub enum GivenItemDto {
     Tea,
     Coffee,
     Herb,
+    Cuisine,
     Watch,
     Gem,
     Gold,
@@ -184,6 +191,7 @@ pub enum GivenItemDto {
     Handmade,
     CreditCard,
     Flower,
+    Jewelry,
 }
 
 impl From<GivenItemDto> for eros_engine_core::types::GivenItem {
@@ -198,6 +206,7 @@ impl From<GivenItemDto> for eros_engine_core::types::GivenItem {
             GivenItemDto::Tea => GivenItem::Tea,
             GivenItemDto::Coffee => GivenItem::Coffee,
             GivenItemDto::Herb => GivenItem::Herb,
+            GivenItemDto::Cuisine => GivenItem::Cuisine,
             GivenItemDto::Watch => GivenItem::Watch,
             GivenItemDto::Gem => GivenItem::Gem,
             GivenItemDto::Gold => GivenItem::Gold,
@@ -208,6 +217,7 @@ impl From<GivenItemDto> for eros_engine_core::types::GivenItem {
             GivenItemDto::Handmade => GivenItem::Handmade,
             GivenItemDto::CreditCard => GivenItem::CreditCard,
             GivenItemDto::Flower => GivenItem::Flower,
+            GivenItemDto::Jewelry => GivenItem::Jewelry,
         }
     }
 }
@@ -224,6 +234,7 @@ impl From<eros_engine_core::types::GivenItem> for GivenItemDto {
             GivenItem::Tea => GivenItemDto::Tea,
             GivenItem::Coffee => GivenItemDto::Coffee,
             GivenItem::Herb => GivenItemDto::Herb,
+            GivenItem::Cuisine => GivenItemDto::Cuisine,
             GivenItem::Watch => GivenItemDto::Watch,
             GivenItem::Gem => GivenItemDto::Gem,
             GivenItem::Gold => GivenItemDto::Gold,
@@ -234,6 +245,7 @@ impl From<eros_engine_core::types::GivenItem> for GivenItemDto {
             GivenItem::Handmade => GivenItemDto::Handmade,
             GivenItem::CreditCard => GivenItemDto::CreditCard,
             GivenItem::Flower => GivenItemDto::Flower,
+            GivenItem::Jewelry => GivenItemDto::Jewelry,
         }
     }
 }
@@ -268,8 +280,8 @@ impl From<eros_engine_core::types::ItemKind> for ItemKindDto {
 /// An action the user does to the persona this turn, besides talking. The
 /// persona accepts or does not; a refusal costs the relationship one tier on
 /// the line the action touches (`give` and `gift` → bond, every physical or custom action →
-/// chemistry); a refused `tip` costs nothing. An accepted `gift` joins the
-/// persona's items or wardrobe.
+/// chemistry); a refused `tip`, `bluff`, `threaten` or `trick` costs nothing.
+/// An accepted `gift` joins the persona's items or wardrobe.
 #[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct UserActionDto {
     #[serde(rename = "type")]
@@ -344,6 +356,11 @@ impl UserActionDto {
             UserActionKind::FrenchKiss => UserAction::FrenchKiss,
             UserActionKind::HugFromBehind => UserAction::HugFromBehind,
             UserActionKind::Tease => UserAction::Tease,
+            UserActionKind::Pat => UserAction::Pat,
+            UserActionKind::Photo => UserAction::Photo,
+            UserActionKind::Bluff => UserAction::Bluff,
+            UserActionKind::Threaten => UserAction::Threaten,
+            UserActionKind::Trick => UserAction::Trick,
             UserActionKind::Custom => UserAction::Custom {
                 text: free_text(self.text.as_deref(), "text", MAX_ACTION_TEXT_CHARS)?
                     .ok_or("action.text is required for custom")?,
@@ -4163,6 +4180,8 @@ mod validate_payload_tests {
             ("handmade", GivenItem::Handmade),
             ("credit_card", GivenItem::CreditCard),
             ("flower", GivenItem::Flower),
+            ("cuisine", GivenItem::Cuisine),
+            ("jewelry", GivenItem::Jewelry),
         ] {
             let dto: UserActionDto =
                 serde_json::from_value(serde_json::json!({"type": "give", "item": wire}))
@@ -4201,6 +4220,27 @@ mod validate_payload_tests {
         );
         c.text = Some("x".repeat(101));
         assert!(c.to_core().is_err());
+    }
+
+    #[test]
+    fn the_five_new_actions_map_one_to_one() {
+        for (wire, want) in [
+            ("pat", UserAction::Pat),
+            ("photo", UserAction::Photo),
+            ("bluff", UserAction::Bluff),
+            ("threaten", UserAction::Threaten),
+            ("trick", UserAction::Trick),
+        ] {
+            let dto: UserActionDto = serde_json::from_value(serde_json::json!({"type": wire}))
+                .unwrap_or_else(|e| panic!("{wire}: {e}"));
+            assert_eq!(dto.to_core().unwrap(), want, "{wire}");
+        }
+        let view = UserActionView::from_metadata_action(
+            &serde_json::json!({"type": "threaten", "response": "refuse"}),
+        )
+        .expect("history parses a stored threaten");
+        assert_eq!(view.response, Some(ActionResponseDto::Refuse));
+        assert_eq!(view.action.kind, UserActionKind::Threaten);
     }
 
     #[test]

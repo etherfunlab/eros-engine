@@ -29,39 +29,48 @@ pub struct Needs {
     /// `high` wants to go out, `low` wants to stay in.
     #[serde(default)]
     pub outing: NeedLevel,
-    /// `high` craves what she's hooked on: a smoke, a drink, weed, a coffee.
+    /// `high` craves what she's hooked on: a smoke, a drink, weed, a coffee,
+    /// a good meal.
     #[serde(default)]
     pub indulgence: NeedLevel,
 }
 
-/// Whether the persona smokes, drinks, uses weed, drinks coffee:
-/// `art_metadata.smoking`, `alcoholic`, `drug`, `coffee`, each `None` when
-/// unset (spec 2026-10-28 §3).
+/// Whether the persona smokes, drinks, uses weed, drinks coffee, loves good
+/// food: `art_metadata.smoking`, `alcoholic`, `drug`, `coffee`, `gluttony`,
+/// each `None` when unset (spec 2026-10-28 §3, 2026-11-08 §4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Habits {
     pub smoking: Option<bool>,
     pub alcoholic: Option<bool>,
     pub drug: Option<bool>,
     pub coffee: Option<bool>,
+    pub gluttony: Option<bool>,
 }
 
 impl Habits {
-    /// How many of the four are `true`.
+    /// How many of the five are `true`.
     pub fn count_true(self) -> usize {
-        [self.smoking, self.alcoholic, self.drug, self.coffee]
-            .into_iter()
-            .filter(|h| *h == Some(true))
-            .count()
+        [
+            self.smoking,
+            self.alcoholic,
+            self.drug,
+            self.coffee,
+            self.gluttony,
+        ]
+        .into_iter()
+        .filter(|h| *h == Some(true))
+        .count()
     }
 
-    /// The key for what `item` is: tobacco, alcohol, weed or coffee. `None`
-    /// for any other item, or when the key is unset.
+    /// The key for what `item` is: tobacco, alcohol, weed, coffee or a dish.
+    /// `None` for any other item, or when the key is unset.
     pub fn uses(self, item: GivenItem) -> Option<bool> {
         match item {
             GivenItem::Cigarette => self.smoking,
             GivenItem::Alcohol => self.alcoholic,
             GivenItem::Herb => self.drug,
             GivenItem::Coffee => self.coffee,
+            GivenItem::Cuisine => self.gluttony,
             _ => None,
         }
     }
@@ -76,7 +85,7 @@ const OUTING_DRIFT: (NeedLevel, f64) = (NeedLevel::Mid, 8.0);
 
 /// Where `indulgence` settles and how fast, by how many habits are `true`
 /// (spec 2026-10-28 §2.2): the more she uses, the sooner the urge returns.
-/// Three or four share the fastest pace.
+/// Three or more share the fastest pace.
 fn indulgence_drift(habits: Habits) -> (NeedLevel, f64) {
     match habits.count_true() {
         0 => (NeedLevel::Mid, 8.0),
@@ -159,14 +168,15 @@ pub fn next_change(rated: Needs, hours: f64, habits: Habits) -> Option<f64> {
 }
 
 /// What an accepted give of `item` does to (hunger, social, indulgence), in
-/// levels (spec 2026-10-30 §2.1): food fills her; tobacco, drink and weed
-/// loosen her up; medicine and coffee do the opposite. `None` for an item
-/// that moves nothing.
+/// levels (spec 2026-10-30 §2.1, 2026-11-08 §3): food fills her; tobacco,
+/// drink and weed loosen her up, and a dish fills her and loosens her up the
+/// same way; medicine and coffee do the opposite. `None` for an item that
+/// moves nothing.
 fn give_move(item: GivenItem) -> Option<(i8, i8, i8)> {
     use GivenItem::*;
     Some(match item {
         Food => (-1, 0, 0),
-        Cigarette | Alcohol | Herb => (-1, 1, 1),
+        Cigarette | Alcohol | Herb | Cuisine => (-1, 1, 1),
         Medicine | Coffee => (-1, -1, -1),
         _ => return None,
     })
@@ -228,6 +238,7 @@ mod tests {
             alcoholic: set(1),
             drug: set(2),
             coffee: set(3),
+            gluttony: set(4),
         }
     }
 
@@ -510,6 +521,16 @@ mod tests {
         }
     }
 
+    /// A dish fills her and loosens her up, like what she is hooked on
+    /// (spec 2026-11-08 §3); jewelry moves nothing.
+    #[test]
+    fn a_cuisine_fills_her_and_loosens_her_up() {
+        let got = after_give(Some(all(Mid)), None, GivenItem::Cuisine).unwrap();
+        assert_eq!((got.hunger, got.social, got.indulgence), (Low, High, High));
+        assert_eq!((got.stamina, got.emotional, got.outing), (Mid, Mid, Mid));
+        assert_eq!(after_give(Some(all(Mid)), None, GivenItem::Jewelry), None);
+    }
+
     #[test]
     fn moves_clamp_at_the_ends() {
         let floor = Needs {
@@ -589,11 +610,30 @@ mod tests {
             alcoholic: Some(false),
             drug: None,
             coffee: Some(false),
+            gluttony: None,
         };
         assert_eq!(h.uses(GivenItem::Cigarette), Some(true));
         assert_eq!(h.uses(GivenItem::Alcohol), Some(false));
         assert_eq!(h.uses(GivenItem::Herb), None);
         assert_eq!(h.uses(GivenItem::Coffee), Some(false));
         assert_eq!(h.uses(GivenItem::Tea), None);
+    }
+
+    #[test]
+    fn five_habits_drift_at_the_fastest_pace() {
+        assert_eq!(habits(5).count_true(), 5);
+        assert_eq!(indulgence_drift(habits(5)), indulgence_drift(habits(3)));
+    }
+
+    /// `gluttony` is the habit for a dish; plain food has none (spec
+    /// 2026-11-08 §4).
+    #[test]
+    fn cuisine_is_the_gluttony_habit() {
+        let h = Habits {
+            gluttony: Some(false),
+            ..Habits::default()
+        };
+        assert_eq!(h.uses(GivenItem::Cuisine), Some(false));
+        assert_eq!(h.uses(GivenItem::Food), None);
     }
 }
