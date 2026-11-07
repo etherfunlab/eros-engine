@@ -1263,7 +1263,7 @@ pub(crate) fn meta_str<'a>(persona: &'a CompanionPersona, key: &str) -> Option<&
 pub(crate) fn persona_traits(
     persona: &CompanionPersona,
 ) -> eros_engine_core::events::PersonaTraits {
-    use eros_engine_core::events::{EventCategory, EventKind, Health, PersonaTraits};
+    use eros_engine_core::events::{EventCategory, EventKind, Health, PersonaTraits, Setting};
     let art = &persona.genome.art_metadata;
     PersonaTraits {
         female: meta_str(persona, "gender") == Some("female"),
@@ -1291,6 +1291,9 @@ pub(crate) fn persona_traits(
             .unwrap_or(false),
         homesick: art.get("homesick").and_then(|v| v.as_bool()),
         sex_addict: art.get("sex_addict").and_then(|v| v.as_bool()),
+        setting: meta_str(persona, "setting")
+            .and_then(Setting::parse)
+            .unwrap_or_default(),
     }
 }
 
@@ -4856,6 +4859,7 @@ mod tests {
                 is_virgin: true,
                 homesick: Some(false),
                 sex_addict: Some(true),
+                setting: Default::default(),
             }
         );
         p.genome.art_metadata =
@@ -4891,6 +4895,20 @@ mod tests {
             with(serde_json::json!({"gluttony": false})).gluttony,
             Some(false)
         );
+    }
+
+    #[test]
+    fn persona_traits_reads_the_setting() {
+        use eros_engine_core::events::Setting;
+        let mut p = fixture_persona();
+        for (art, want) in [
+            (serde_json::json!({"setting": "fantasy"}), Setting::Fantasy),
+            (serde_json::json!({}), Setting::Modern),
+            (serde_json::json!({"setting": "space"}), Setting::Modern),
+        ] {
+            p.genome.art_metadata = art;
+            assert_eq!(persona_traits(&p).setting, want);
+        }
     }
 
     #[test]

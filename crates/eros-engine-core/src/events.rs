@@ -302,6 +302,26 @@ impl EventKind {
         )
     }
 
+    /// Whether the kind belongs in a persona's world (spec
+    /// 2026-11-08-strip-and-world-setting-design.md §4): the kinds that need
+    /// modern life fit only `modern`; every other kind fits both.
+    pub fn fits(self, setting: Setting) -> bool {
+        use EventKind::*;
+        let modern_only = matches!(
+            self,
+            PoliceEncounter
+                | Showering
+                | TakingSelfie
+                | Gaming
+                | WatchingMatch
+                | WatchingShow
+                | BusinessTrip
+                | Hospitalized
+                | PostSurgery
+        );
+        !modern_only || setting == Setting::Modern
+    }
+
     /// A scare that turns out to be nothing once it ends (spec
     /// 2026-10-16-life-events-offline-and-scares-design.md §5).
     pub fn is_false_alarm(self) -> bool {
@@ -433,6 +453,26 @@ impl Health {
     }
 }
 
+/// The world a persona lives in, `art_metadata.setting` (spec
+/// 2026-11-08-strip-and-world-setting-design.md §4). Absent or unknown reads
+/// as `Modern`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Setting {
+    #[default]
+    Modern,
+    Fantasy,
+}
+
+impl Setting {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "modern" => Some(Setting::Modern),
+            "fantasy" => Some(Setting::Fantasy),
+            _ => None,
+        }
+    }
+}
+
 /// The persona's settings the draw reads (§4). `Default` is a persona with
 /// none of them.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -454,6 +494,9 @@ pub struct PersonaTraits {
     /// `art_metadata.sex_addict`: `true` or `false` scales `sudden_desire`;
     /// `None` leaves it be.
     pub sex_addict: Option<bool>,
+    /// `art_metadata.setting`: the kinds that do not fit her world are never
+    /// drawn.
+    pub setting: Setting,
 }
 
 fn passes_gate(kind: EventKind, rung: u8, persona: &PersonaTraits) -> bool {
@@ -694,6 +737,7 @@ pub fn draw(input: &DrawInput, rolls: Rolls) -> Option<Drawn> {
         .into_iter()
         .filter(|k| input.allowed.contains(k))
         .filter(|k| passes_gate(*k, input.intimacy_rung, input.persona))
+        .filter(|k| k.fits(input.persona.setting))
         .filter(|k| {
             !input
                 .history
@@ -2320,5 +2364,64 @@ mod tests {
         assert_eq!(at(rated(Mid, High, Mid), 0.4), Some(Irritable));
         assert_eq!(at(rated(Mid, High, High), 0.6), Some(Irritable));
         assert_eq!(at(rated(Mid, Mid, High), 0.6), Some(Busy));
+    }
+
+    #[test]
+    fn setting_parses_two_words() {
+        assert_eq!(Setting::parse("modern"), Some(Setting::Modern));
+        assert_eq!(Setting::parse("fantasy"), Some(Setting::Fantasy));
+        assert_eq!(Setting::parse("space"), None);
+    }
+
+    /// Spec 2026-11-08-strip-and-world-setting-design.md §4.
+    const MODERN_ONLY: [EventKind; 9] = [
+        PoliceEncounter,
+        Showering,
+        TakingSelfie,
+        Gaming,
+        WatchingMatch,
+        WatchingShow,
+        BusinessTrip,
+        Hospitalized,
+        PostSurgery,
+    ];
+
+    #[test]
+    fn modern_only_kinds_never_fit_fantasy() {
+        for k in EventKind::ALL.into_iter().chain(EventKind::SPECIAL) {
+            assert!(k.fits(Setting::Modern), "{k:?}");
+            assert_eq!(
+                k.fits(Setting::Fantasy),
+                !MODERN_ONLY.contains(&k),
+                "{k:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fantasy_persona_never_draws_a_modern_only_kind() {
+        let fantasy = PersonaTraits {
+            setting: Setting::Fantasy,
+            ..female()
+        };
+        assert_eq!(
+            pick_with(&fantasy, None, 3, &[], &[TakingSelfie], rolls(0.5, 0.5)),
+            None
+        );
+        assert_eq!(
+            pick_with(&female(), None, 3, &[], &[TakingSelfie], rolls(0.5, 0.5)),
+            Some(TakingSelfie)
+        );
+        let fan = PersonaTraits {
+            prefer_events: vec![WatchingMatch],
+            ..fantasy
+        };
+        for r in [0.0, 0.5, 0.99] {
+            assert_eq!(
+                pick_with(&fan, None, 3, &[], &[WatchingMatch, Reading], rolls(r, r)),
+                Some(Reading),
+                "{r}"
+            );
+        }
     }
 }
