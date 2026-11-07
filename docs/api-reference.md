@@ -424,27 +424,28 @@ chars. Violations return `400 BadRequest` as a pre-stream error.
 **Optional: action.** The body may include `action` — something the user does to
 the persona besides talking. The persona accepts it or not; a refusal costs the
 relationship one tier on the line the action touches (`give` and `gift` → bond, every
-physical or custom action → chemistry), and a refused `tip` costs nothing (see
+physical or custom action → chemistry), and a refused `tip`, `bluff`, `threaten` or `trick` costs nothing (see
 [affinity-model.md](affinity-model.md#refused-actions)).
 
 | `type` | fields |
 |---|---|
 | `give` | `item`: one of the categories below (required); `name`: optional, 1–32 chars; `quantity`: optional, 1–99, default 1 |
-| `kiss`, `hug`, `touch`, `lick`, `french_kiss`, `hug_from_behind`, `tease` | none |
+| `kiss`, `hug`, `touch`, `lick`, `french_kiss`, `hug_from_behind`, `tease`, `pat`, `photo` | none |
+| `bluff`, `threaten`, `trick` | none |
 | `custom` | `text`: required, 1–100 chars |
 | `tip` | `amount_usd`: required, finite, `> 0` and `≤ 1_000_000_000` |
 | `gift` | `kind`: `item` \| `clothing` (required); `name`: required, 1–64 chars |
 
-**What `give` hands over.** Consumables linger on the persona (below). Valuables do not, and they do not join her items: `gift` is the action for something she keeps. `cash` is money handed over in person, counted in notes; `tip` is the action that carries an amount.
+**What `give` hands over.** Consumables linger on the persona (below). Valuables do not, and they do not join her items: `gift` is the action for something she keeps. `cash` is money handed over in person, counted in notes; `tip` is the action that carries an amount. `cuisine` is a proper dish or meal; `food` is something to eat.
 
 | group | `item` (unit) |
 |---|---|
-| consumable | `cigarette` (支), `alcohol` (杯), `medicine` (片), `food` (份), `soft_drink` (瓶), `tea` (杯), `coffee` (杯), `herb` (包) |
-| valuable | `watch` (块), `gem` (颗), `gold` (块), `camera` (台), `cash` (张), `antique` (件), `artwork` (件), `handmade` (份), `credit_card` (张), `flower` (朵) |
+| consumable | `cigarette` (支), `alcohol` (杯), `medicine` (片), `food` (份), `soft_drink` (瓶), `tea` (杯), `coffee` (杯), `herb` (包), `cuisine` (道) |
+| valuable | `watch` (块), `gem` (颗), `gold` (块), `camera` (台), `cash` (张), `antique` (件), `artwork` (件), `handmade` (份), `credit_card` (张), `flower` (朵), `jewelry` (件) |
 
 **Lingering effects of a `give`.** An accepted consumable keeps affecting the persona on the next `min(quantity, 5)` text turns of the session; the turn that accepts it is not one of them. Each turn the persona is at one step of a curve, at a level from 1 to 4:
 
-| turns | front: `cigarette`, `food`, `soft_drink`, `tea` | back: `alcohol` | middle: `medicine`, `coffee`, `herb` |
+| turns | front: `cigarette`, `food`, `soft_drink`, `tea`, `cuisine` | back: `alcohol` | middle: `medicine`, `coffee`, `herb` |
 |---|---|---|---|
 | 1 | 3 | 1 | 3 |
 | 2 | 3 1 | 1 3 | 3 3 |
@@ -455,7 +456,11 @@ physical or custom action → chemistry), and a refused `tip` costs nothing (see
 
 A turn is a user message of the text session; product-QA messages and voice calls do not count, and there is no time limit. The state reaches the judge, the reply prompt and the image composer, and the caller through the `body_state` frame and [`GET /v2/comp/session/{session_id}/effects`](#get-v2compsessionsession_ideffects). A refused give has no effect. Design: [lingering effects spec](superpowers/specs/2026-10-12-given-item-lingering-effects-design.md), [give categories spec](superpowers/specs/2026-10-13-give-categories-design.md).
 
-**A give of something she does not use.** The persona's `art_metadata.smoking`, `alcoholic`, `drug` and `coffee` say whether she smokes, drinks, uses weed and drinks coffee (table [below](#post-v2compsessionsession_idevents)). A `give` of `cigarette`, `alcohol`, `herb` or `coffee` whose key is `false` is rolled once before the judge runs. One time in three the turn goes on as usual. Otherwise the response is `refuse`, whatever the judge answers and with or without the LLM judge: the `action_response` frame and the `response` the history routes return say `refuse`, the give leaves no effect, and it costs the bond line a tier like any refused give. The judge is told the outcome (see [model-config.md](model-config.md#taskspde_decision--opt-in-llm-pde-judge)). A key that is `true` or absent never rolls, nor does any other item or action.
+**A give of something she does not use.** The persona's `art_metadata.smoking`, `alcoholic`, `drug`, `coffee` and `gluttony` say whether she smokes, drinks, uses weed, drinks coffee and loves good food (table [below](#post-v2compsessionsession_idevents)). A `give` of `cigarette`, `alcohol`, `herb`, `coffee` or `cuisine` whose key is `false` is rolled once before the judge runs. One time in three the turn goes on as usual. Otherwise the response is `refuse`, whatever the judge answers and with or without the LLM judge: the `action_response` frame and the `response` the history routes return say `refuse`, the give leaves no effect, and it costs the bond line a tier like any refused give. The judge is told the outcome (see [model-config.md](model-config.md#taskspde_decision--opt-in-llm-pde-judge)). A key that is `true` or absent never rolls, nor does any other item or action.
+
+**Social actions.** For `bluff`, `threaten` and `trick` the response says whether she falls for it: `accept` is 信了, 被吓到了 or 上当了, and `refuse` is 没信, 没吃这一套 or 识破了. As for every action, an undecided response is `accept`. Seeing through one costs nothing; the affinity judge grades the turn as it grades any other.
+
+**A photo she lets you take.** An accepted `photo` on a turn whose request carries `image`, in a deployment with `[tasks.chat_image_prompt_compose]` configured, is answered as `reply_text_image`: her words, then one `image_request` built on her face reference, composed from the scene. This holds with or without the LLM judge. A refused `photo`, or one without that image capability, is a text reply, even when the judge proposed a picture. `image.force = true` still makes the turn `reply_image`.
 
 With an action, `content` may be empty, and it can be combined with
 `image_url` and `image`. Every value violation (bounds, missing
@@ -613,6 +618,7 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 - `ghost`: `meta(action_type=ghost) → done → final` — no `delta`, no `model` in `meta`, `usage` and `generation_id` are `null` in `done`. The companion stayed silent this turn; no chat model was called.
 - reasoning: when the judge returned reasoning, `reasoning*` precedes every shape in this list, ahead of `action_response` and `body_state`: `reasoning* → meta(reply) → delta* → done → final`
 - action turn: the same shapes with `action_response` ahead of the first `meta` — `action_response → meta(reply) → delta* → done → final`; never `ghost` or `product_qa`
+- an accepted `photo` with image capability: `action_response → meta(reply_text_image) → delta* → done → image_request → final`
 - a turn with lingering effects or known needs: `body_state` sits ahead of the first `meta`, after `action_response` when both are sent — e.g. `action_response → body_state → meta(reply) → delta* → done → final`
 - `product_qa`: `meta(action_type=product_qa) → delta* → done → final` — same shape as a normal text reply, streamed by an independent model chain (`[tasks.chat_product_qa]`) instead of `chat_companion`; persisted with `channel='product_qa'` and reported as `product_qa` again on replay.
 
@@ -1070,7 +1076,7 @@ The draw:
   | `homesick` | `true` / `false` / absent | where a trip goes: `true` favours `hometown_visit` and thins the leisure trips, `false` thins `hometown_visit`; `business_trip` untouched |
   | `is_virgin` | `true` / `false` (default) | `having_sex` is a fifth as likely until her first `having_sex` event, after which the key no longer applies |
   | `sex_addict` | `true` / `false` / absent | `sudden_desire` comes up three times / a third as often within `short`; still only at the closest rung |
-  | `smoking`, `alcoholic`, `drug`, `coffee` | each `true` / `false` / absent | whether she smokes, drinks, uses weed, drinks coffee: the more are `true`, the sooner her `indulgence` comes back to `high` and weighs the pick; a `false` key can make her refuse a `give` of that thing ([above](#post-compchatsession_idmessagestream)) |
+  | `smoking`, `alcoholic`, `drug`, `coffee`, `gluttony` | each `true` / `false` / absent | whether she smokes, drinks, uses weed, drinks coffee, loves good food: the more are `true`, the sooner her `indulgence` comes back to `high` and weighs the pick; a `false` key can make her refuse a `give` of that thing ([above](#post-compchatsession_idmessagestream)) |
 
   A value of the wrong shape, an unknown kind or a kind outside `mid` is
   ignored. A preference never lifts a gate.
@@ -1133,7 +1139,7 @@ While one lasts, every text turn in any session of the persona ghosts, without
 the judge and without counting towards the ghost streak, and `/open` returns
 `null`. An announced `busy`, `in_battle` or `out_shopping` still ghosts. A turn that carries a
 user `action` (any `type`: `give`, `gift`, `tip`, `kiss`, `hug`, `touch`,
-`lick`, `french_kiss`, `hug_from_behind`, `tease`, `custom`) or `image.force = true` is the exception: it takes the normal
+`lick`, `french_kiss`, `hug_from_behind`, `tease`, `pat`, `photo`, `bluff`, `threaten`, `trick`, `custom`) or `image.force = true` is the exception: it takes the normal
 path and is answered, because an action is interaction in person, which needs
 no phone, and a forced image turn is always `reply_image`. The persona goes
 silent this way only where the ghost protection allows it, so with the
@@ -1776,7 +1782,7 @@ bearer token and `X-Byoc-Caller-Secret`, which must match the deployment's
 `BYOC_CALLER_SECRET`. Their refusals use the pre-stream body
 `{code, message, user_message}`. The flow, the sealing format and what is
 stored are in [byoc.md](byoc.md); the card format is in
-[eros-character-v1.md](eros-character-v1.md).
+[eros-character-v1.1.md](eros-character-v1.1.md).
 
 ### `POST /v2/comp/byoc/init`
 

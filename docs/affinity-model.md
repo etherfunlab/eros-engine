@@ -246,7 +246,7 @@ during an offline stretch moves none of them (see
 A chat turn can carry a user action (see the `action` field in
 [api-reference.md](api-reference.md)). The PDE judge decides before the reply
 whether the persona accepts it; without a definite refusal the engine accepts,
-except for a give of tobacco, alcohol, weed or coffee her persona does not use, which a
+except for a give of tobacco, alcohol, weed, coffee or a dish her persona does not take, which a
 roll can refuse whatever the judge says
 ([persona settings](life-events-needs.md#persona-settings)).
 
@@ -263,6 +263,8 @@ roll can refuse whatever the judge says
   eval is skipped or fails.
 - **Refused tip:** a `tip` drops no line. The persona's reply follows the
   verdict; the turn is graded like any other.
+- **Social actions:** a refused `bluff`, `threaten` or `trick` means she saw
+  through it, and drops no line either; the turn is graded like any other.
 - **Gift:** accepted, the gift also joins the persona's items or wardrobe;
   refused, it joins nothing and drops Bond like a refused `give`.
 
