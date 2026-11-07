@@ -10615,7 +10615,13 @@ data: [DONE]\n\n";
 
         let chat_repo = ChatRepo { pool };
         let user_message_id = match chat_repo
-            .upsert_user_message_idempotent(session_id, "", "01J9222222222222222222222P", "user", None)
+            .upsert_user_message_idempotent(
+                session_id,
+                "",
+                "01J9222222222222222222222P",
+                "user",
+                None,
+            )
             .await
             .unwrap()
         {
@@ -10666,7 +10672,12 @@ data: [DONE]\n\n";
     fn frame_type_names(frames: &[ProtocolFrame]) -> Vec<String> {
         frames
             .iter()
-            .map(|f| serde_json::to_value(f).unwrap()["type"].as_str().unwrap().to_string())
+            .map(|f| {
+                serde_json::to_value(f).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
             .collect()
     }
 
@@ -10686,10 +10697,17 @@ data: [DONE]\n\n";
     async fn an_accepted_photo_without_the_judge_shows_her_picture(pool: PgPool) {
         let (frames, composer_body) = run_photo_turn(&pool, false).await;
         let types = frame_type_names(&frames);
-        assert_eq!(types.first().map(String::as_str), Some("action_response"), "{types:?}");
+        assert_eq!(
+            types.first().map(String::as_str),
+            Some("action_response"),
+            "{types:?}"
+        );
         assert_eq!(meta_action_type(&frames), FrameActionType::ReplyTextImage);
         assert!(types.iter().any(|t| t == "delta"), "{types:?}");
-        let ir = types.iter().position(|t| t == "image_request").expect("image_request");
+        let ir = types
+            .iter()
+            .position(|t| t == "image_request")
+            .expect("image_request");
         let done = types.iter().position(|t| t == "done").expect("done");
         assert!(done < ir, "{types:?}");
         assert_eq!(types[ir + 1], "final", "{types:?}");

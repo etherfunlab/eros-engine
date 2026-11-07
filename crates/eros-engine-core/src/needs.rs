@@ -526,10 +526,7 @@ mod tests {
     #[test]
     fn a_cuisine_fills_her_and_loosens_her_up() {
         let got = after_give(Some(all(Mid)), None, GivenItem::Cuisine).unwrap();
-        assert_eq!(
-            (got.hunger, got.social, got.indulgence),
-            (Low, High, High)
-        );
+        assert_eq!((got.hunger, got.social, got.indulgence), (Low, High, High));
         assert_eq!((got.stamina, got.emotional, got.outing), (Mid, Mid, Mid));
         assert_eq!(after_give(Some(all(Mid)), None, GivenItem::Jewelry), None);
     }
