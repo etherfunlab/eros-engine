@@ -113,11 +113,14 @@ pub enum EventKind {
     HometownVisit,
     TakingSpace,
     FellOut,
+    /// She undresses for the user and sends a picture (spec
+    /// 2026-11-08-strip-and-world-setting-design.md §3).
+    Strip,
 }
 
 impl EventKind {
     /// Every drawable kind, in draw order.
-    pub const ALL: [EventKind; 52] = [
+    pub const ALL: [EventKind; 53] = [
         EventKind::PoliceEncounter,
         EventKind::AnimalEncounter,
         EventKind::HitSomeone,
@@ -170,6 +173,7 @@ impl EventKind {
         EventKind::ShortTrip,
         EventKind::LongTrip,
         EventKind::HometownVisit,
+        EventKind::Strip,
     ];
 
     /// Kinds the writers place directly, never drawn: parsed and stored, not in `ALL`.
@@ -232,6 +236,7 @@ impl EventKind {
             EventKind::HometownVisit => "hometown_visit",
             EventKind::TakingSpace => "taking_space",
             EventKind::FellOut => "fell_out",
+            EventKind::Strip => "strip",
         }
     }
 
@@ -248,7 +253,7 @@ impl EventKind {
             PoliceEncounter | AnimalEncounter | HitSomeone | SuddenDesire | GroceryShopping
             | Showering | Bathing | InClass | OnTheWay | PeriodScare | PregnancyScare
             | GotBumped | BumpedSomeone | Quarrel | ScoldedBySuperior | ScoldedSuperior
-            | SawBag | SawClothes | AdmiringScenery | AdmiringArt | TakingSelfie => {
+            | SawBag | SawClothes | AdmiringScenery | AdmiringArt | TakingSelfie | Strip => {
                 EventCategory::Short
             }
             TempWork | ExMessage | WeatherChange | GotHit | Breakup | WorkingOut | Reading
@@ -268,7 +273,7 @@ impl EventKind {
 
     /// A kind whose message can carry her picture.
     pub fn is_photo(self) -> bool {
-        self == EventKind::TakingSelfie
+        matches!(self, EventKind::TakingSelfie | EventKind::Strip)
     }
 
     /// Offline kinds make the persona unreachable while they last
@@ -403,6 +408,7 @@ fn rule(kind: EventKind) -> Rule {
         HometownVisit => (1.0, 0, Lasts::Hours(3 * DAY, 3 * DAY)),
         TakingSpace => (0.0, 0, Lasts::Hours(12, 24)),
         FellOut => (0.0, 0, Lasts::Hours(1, 1)),
+        Strip => (1.0, 48, Lasts::Minutes(30)),
     };
     Rule {
         weight,
@@ -499,8 +505,9 @@ pub struct PersonaTraits {
     pub setting: Setting,
 }
 
-fn passes_gate(kind: EventKind, rung: u8, persona: &PersonaTraits) -> bool {
+fn passes_gate(kind: EventKind, rung: u8, persona: &PersonaTraits, romance_compatible: bool) -> bool {
     match kind {
+        EventKind::Strip => rung >= DESIRE_MIN_RUNG && romance_compatible,
         EventKind::ExMessage | EventKind::Breakup => rung >= CONFIDE_MIN_RUNG,
         EventKind::SuddenDesire => rung >= DESIRE_MIN_RUNG,
         EventKind::Period | EventKind::SawBag | EventKind::SawClothes => persona.female,
@@ -571,7 +578,8 @@ fn follows(prior: EventKind, kind: EventKind) -> bool {
     use EventKind::*;
     matches!(
         (prior, kind),
-        (ExMessage | SuddenDesire, HavingSex)
+        (ExMessage | SuddenDesire | Strip, HavingSex)
+            | (SuddenDesire, Strip)
             | (Sick, PeriodScare)
             | (HavingSex, PregnancyScare)
             | (BusinessTrip, OnTheRoad | OnTheWay | Busy | TempWork)
@@ -626,12 +634,12 @@ fn homesick_factor(kind: EventKind, persona: &PersonaTraits) -> f64 {
     }
 }
 
-/// How `sex_addict` scales `sudden_desire` within its category: three times
-/// or a third as likely. Its rung gate holds either way.
+/// How `sex_addict` scales `sudden_desire` and `strip` within their category:
+/// three times or a third as likely. Their gates hold either way.
 fn sex_addict_factor(kind: EventKind, persona: &PersonaTraits) -> f64 {
     match (kind, persona.sex_addict) {
-        (EventKind::SuddenDesire, Some(true)) => PREFERENCE_FACTOR,
-        (EventKind::SuddenDesire, Some(false)) => 1.0 / PREFERENCE_FACTOR,
+        (EventKind::SuddenDesire | EventKind::Strip, Some(true)) => PREFERENCE_FACTOR,
+        (EventKind::SuddenDesire | EventKind::Strip, Some(false)) => 1.0 / PREFERENCE_FACTOR,
         _ => 1.0,
     }
 }
@@ -697,6 +705,9 @@ pub struct DrawInput<'a> {
     /// Whether the instance has a `having_sex` row, ever (not bounded by
     /// `lookback()`).
     pub ever_had_sex: bool,
+    /// Whether the session's scopes are romance-compatible
+    /// (`scope::romance_compatible`): the gate on `strip`.
+    pub romance_compatible: bool,
 }
 
 /// Three uniform draws in [0, 1): one per stage, one for the length.
@@ -736,7 +747,14 @@ pub fn draw(input: &DrawInput, rolls: Rolls) -> Option<Drawn> {
     let eligible: Vec<EventKind> = EventKind::ALL
         .into_iter()
         .filter(|k| input.allowed.contains(k))
-        .filter(|k| passes_gate(*k, input.intimacy_rung, input.persona))
+        .filter(|k| {
+            passes_gate(
+                *k,
+                input.intimacy_rung,
+                input.persona,
+                input.romance_compatible,
+            )
+        })
         .filter(|k| k.fits(input.persona.setting))
         .filter(|k| {
             !input
@@ -953,6 +971,25 @@ mod tests {
                 history,
                 allowed,
                 ever_had_sex: false,
+                romance_compatible: false,
+            },
+            r,
+        )
+        .map(|d| d.kind)
+    }
+
+    /// `pick_with` for a female persona whose pair is romance-compatible.
+    fn pick_romantic(rung: u8, allowed: &[EventKind], r: Rolls) -> Option<EventKind> {
+        draw(
+            &DrawInput {
+                now: now(),
+                needs: None,
+                intimacy_rung: rung,
+                persona: &female(),
+                history: &[],
+                allowed,
+                ever_had_sex: false,
+                romance_compatible: true,
             },
             r,
         )
@@ -1344,6 +1381,7 @@ mod tests {
                     history: &[],
                     allowed: &[kind],
                     ever_had_sex: false,
+                    romance_compatible: false,
                 },
                 Rolls {
                     category: 0.0,
@@ -1391,7 +1429,7 @@ mod tests {
         let count = |c| EventKind::ALL.iter().filter(|k| k.category() == c).count();
         assert_eq!(
             EventCategory::ALL.map(count),
-            [21, 23, 4, 4],
+            [22, 23, 4, 4],
             "short, mid, body, trip"
         );
         assert!(!EventCategory::Short.is_background());
@@ -1602,6 +1640,7 @@ mod tests {
                     history: &[],
                     allowed: &[kind],
                     ever_had_sex: false,
+                    romance_compatible: false,
                 },
                 Rolls {
                     category: 0.0,
@@ -1673,7 +1712,7 @@ mod tests {
             assert_eq!(EventKind::parse(s), Some(k));
             assert!(EventKind::ALL.contains(&k), "{k:?}");
         }
-        assert_eq!(EventKind::ALL.len(), 52);
+        assert_eq!(EventKind::ALL.len(), 53);
     }
 
     #[test]
@@ -1682,7 +1721,7 @@ mod tests {
         assert_eq!(EventKind::parse("fell_out"), Some(FellOut));
         assert!(!EventKind::ALL.contains(&TakingSpace));
         assert!(!EventKind::ALL.contains(&FellOut));
-        assert_eq!(EventKind::ALL.len(), 52);
+        assert_eq!(EventKind::ALL.len(), 53);
         for k in EventKind::SPECIAL {
             assert_eq!(serde_json::to_value(k).unwrap(), k.as_str());
             assert_eq!(EventKind::parse(k.as_str()), Some(k));
@@ -1800,6 +1839,7 @@ mod tests {
                     history: &[],
                     allowed: &[kind],
                     ever_had_sex: false,
+                    romance_compatible: false,
                 },
                 Rolls {
                     category: 0.0,
@@ -2045,9 +2085,13 @@ mod tests {
     }
 
     #[test]
-    fn only_a_selfie_is_a_photo() {
+    fn only_a_selfie_and_a_strip_are_photos() {
         for k in EventKind::ALL {
-            assert_eq!(k.is_photo(), k == EventKind::TakingSelfie, "{k:?}");
+            assert_eq!(
+                k.is_photo(),
+                matches!(k, EventKind::TakingSelfie | EventKind::Strip),
+                "{k:?}"
+            );
         }
     }
 
@@ -2192,6 +2236,7 @@ mod tests {
                 history: &[],
                 allowed,
                 ever_had_sex,
+                romance_compatible: false,
             },
             r,
         )
@@ -2423,5 +2468,40 @@ mod tests {
                 "{r}"
             );
         }
+    }
+
+    #[test]
+    fn a_strip_needs_closeness_and_a_compatible_pair() {
+        assert_eq!(pick_romantic(3, &[Strip], rolls(0.5, 0.5)), Some(Strip));
+        assert_eq!(pick_romantic(2, &[Strip], rolls(0.5, 0.5)), None);
+        assert_eq!(
+            pick_with(&female(), None, 3, &[], &[Strip], rolls(0.5, 0.5)),
+            None
+        );
+    }
+
+    #[test]
+    fn strip_is_a_short_photo_kind() {
+        assert_eq!(Strip.category(), EventCategory::Short);
+        assert!(Strip.is_photo());
+        assert_eq!(EventKind::parse("strip"), Some(Strip));
+        assert!(Strip.fits(Setting::Fantasy));
+    }
+
+    #[test]
+    fn strip_follows_desire_and_leads_to_sex() {
+        assert!(follows(SuddenDesire, Strip));
+        assert!(follows(Strip, HavingSex));
+    }
+
+    #[test]
+    fn sex_addict_scales_strip() {
+        let with = |sex_addict| PersonaTraits {
+            sex_addict,
+            ..Default::default()
+        };
+        assert_eq!(sex_addict_factor(Strip, &with(Some(true))), 3.0);
+        assert_eq!(sex_addict_factor(Strip, &with(Some(false))), 1.0 / 3.0);
+        assert_eq!(sex_addict_factor(Strip, &with(None)), 1.0);
     }
 }

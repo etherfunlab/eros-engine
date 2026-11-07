@@ -103,6 +103,7 @@ pub enum EventKindDto {
     HometownVisit,
     TakingSpace,
     FellOut,
+    Strip,
 }
 
 /// Reads the drawable kinds only: a request names kinds to draw, and the
@@ -178,6 +179,7 @@ impl From<EventKindDto> for EventKind {
             EventKindDto::HometownVisit => EventKind::HometownVisit,
             EventKindDto::TakingSpace => EventKind::TakingSpace,
             EventKindDto::FellOut => EventKind::FellOut,
+            EventKindDto::Strip => EventKind::Strip,
         }
     }
 }
@@ -239,6 +241,7 @@ impl From<EventKind> for EventKindDto {
             EventKind::HometownVisit => EventKindDto::HometownVisit,
             EventKind::TakingSpace => EventKindDto::TakingSpace,
             EventKind::FellOut => EventKindDto::FellOut,
+            EventKind::Strip => EventKindDto::Strip,
         }
     }
 }
@@ -659,6 +662,12 @@ pub(crate) async fn draw_event_at(
         allowed.retain(|k| !k.is_offline(&traits));
     }
     let rung = affinity.intimacy_rung();
+    // The gate on `strip` (spec 2026-11-08 §3): the session's newest
+    // recorded scopes; none recorded reads as not compatible.
+    let romance_compatible = matches!(
+        (ChatRepo { pool: &state.pool }).latest_scopes(session_id).await?,
+        Some((memory, scope)) if eros_engine_core::scope::romance_compatible(memory, scope)
+    );
     let ever_had_sex = event_repo
         .ever(instance_id, events::EventKind::HavingSex)
         .await?;
@@ -671,6 +680,7 @@ pub(crate) async fn draw_event_at(
             history: &history,
             allowed: &allowed,
             ever_had_sex,
+            romance_compatible,
         },
         rolls,
     ) else {
@@ -1145,6 +1155,61 @@ mod tests {
         assert!(out.event.is_none() && out.message.is_none());
         assert!(calls(&mock).await.is_empty());
         assert_eq!(event_rows(&pool, session_id).await, 0);
+    }
+
+    /// A strip needs rung 3 and a romance-compatible pair, read from the
+    /// session's newest recorded scopes (spec 2026-11-08 §3).
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_strip_event_needs_a_compatible_pair(pool: PgPool) {
+        use eros_engine_core::scope::{AffinityScope, MemoryScope};
+        let user_id = Uuid::new_v4();
+        let (instance_id, session_id) = setup(&pool, user_id).await;
+        AffinityRepo { pool: &pool }
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE engine.companion_affinity SET trust = 0.9, intrigue = 0.9, updated_at = now() \
+             WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "刚把衣服脱了").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let draw = |key: &'static str| {
+            draw_event_at(
+                &state,
+                session_id,
+                user_id,
+                req(key, Some(vec![EventKindDto::Strip])),
+                Utc::now(),
+                rolls(0.5),
+            )
+        };
+        let out = draw("s1").await.unwrap();
+        assert!(out.event.is_none(), "no recorded scopes reads as not compatible");
+
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata) \
+             VALUES ($1, 'assistant', '嗯', $2)",
+        )
+        .bind(session_id)
+        .bind(serde_json::json!({
+            "memory_scope": serde_json::to_value(MemoryScope::Full).unwrap(),
+            "affinity_scope": serde_json::to_value(AffinityScope::full()).unwrap(),
+        }))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let out = draw("s2").await.unwrap();
+        assert_eq!(
+            out.event.map(|e| e.kind),
+            Some(EventKindDto::Strip),
+            "a compatible pair at rung 3 can draw it"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

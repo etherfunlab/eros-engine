@@ -246,6 +246,16 @@ fn find_cue(measure: &str, noun: &str, rung: u8, tip_personality: Option<&str>) 
 /// its length. A kind that is never told (`events::is_told`) has no cue.
 /// `picture`: the message carries her picture (spec 2026-10-26-event-message-
 /// image-design.md §4), so a selfie's cue says she sent it.
+/// What she wears in an event's message: the request's outfit, except on a
+/// `strip`, where she has just taken it off (spec 2026-11-08-strip-and-world-
+/// setting-design.md §3).
+fn event_clothing(kind: EventKind, outfit: Option<&str>) -> Option<String> {
+    match kind {
+        EventKind::Strip => Some(crate::prompt::undressed_clothing(outfit)),
+        _ => outfit.map(String::from),
+    }
+}
+
 fn kind_cue(
     kind: EventKind,
     lasts: chrono::Duration,
@@ -278,6 +288,8 @@ fn kind_cue(
         AdmiringScenery => "（你正在看眼前的风景，看得有点出神。）".into(),
         AdmiringArt => "（你正在看展，眼前有一件作品让你停了下来。）".into(),
         TakingSelfie if picture => "（你刚拍了一张自拍，发给了对方。）".into(),
+        Strip if picture => "（你刚脱掉衣服拍了一张，发给了对方。）".into(),
+        Strip => "（你刚脱了衣服，想让对方看看。）".into(),
         TakingSelfie => "（你刚拍了一张自拍，想发给对方看看。）".into(),
         OnTheRoad => "（你正在路上，这一趟要走好几个小时。）".into(),
         WatchingMatch => "（你正在看一场比赛。）".into(),
@@ -432,7 +444,7 @@ pub(crate) async fn greet(
         // An event's outfit, as a chat turn's named outfit: in the reply
         // prompt and, with a picture, the composer's `[此刻穿着]`.
         clothing: match &g.occasion {
-            Occasion::Event { outfit, .. } => outfit.clone(),
+            Occasion::Event { kind, outfit, .. } => event_clothing(*kind, outfit.as_deref()),
             _ => None,
         },
         image_caption: None,
@@ -941,6 +953,34 @@ mod tests {
             );
         }
         assert_eq!(cue(EventKind::Reading, None), "（你正在看书。）");
+    }
+
+    /// Spec 2026-11-08-strip-and-world-setting-design.md §3.
+    #[test]
+    fn a_strip_event_reads_undressed() {
+        assert_eq!(
+            event_clothing(EventKind::Strip, None).as_deref(),
+            Some("刚把衣服脱了")
+        );
+        assert_eq!(
+            event_clothing(EventKind::Strip, Some("红色旗袍")).as_deref(),
+            Some("刚把「红色旗袍」脱了")
+        );
+        assert_eq!(
+            event_clothing(EventKind::Reading, Some("睡衣")).as_deref(),
+            Some("睡衣")
+        );
+        assert_eq!(event_clothing(EventKind::Reading, None), None);
+        let h = Duration::minutes(30);
+        let d = PersonaTraits::default();
+        assert_eq!(
+            kind_cue(EventKind::Strip, h, 3, &d, None, true),
+            "（你刚脱掉衣服拍了一张，发给了对方。）"
+        );
+        assert_eq!(
+            kind_cue(EventKind::Strip, h, 3, &d, None, false),
+            "（你刚脱了衣服，想让对方看看。）"
+        );
     }
 
     #[test]

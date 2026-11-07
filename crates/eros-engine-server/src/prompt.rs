@@ -924,6 +924,7 @@ pub(crate) fn event_label(kind: eros_engine_core::events::EventKind) -> &'static
         HometownVisit => "回老家",
         TakingSpace => "说好暂时分开",
         FellOut => "为分开的事闹得不愉快",
+        Strip => "刚脱了衣服",
     }
 }
 
@@ -1245,6 +1246,15 @@ pub(crate) fn composer_user_text(
     match (action, response) {
         (Some(a), Some(r)) => format!("{base}\n{}", action_outcome(a, r)),
         _ => base,
+    }
+}
+
+/// Her clothing on a `strip` event (spec 2026-11-08-strip-and-world-setting-
+/// design.md §3): 「刚把衣服脱了」, or 「刚把「{outfit}」脱了」.
+pub(crate) fn undressed_clothing(outfit: Option<&str>) -> String {
+    match outfit {
+        Some(o) => format!("刚把「{o}」脱了"),
+        None => "刚把衣服脱了".to_string(),
     }
 }
 
@@ -4836,6 +4846,7 @@ mod tests {
                 "短途旅游",
                 "长途旅游",
                 "回老家",
+                "刚脱了衣服",
             ]
         );
     }
