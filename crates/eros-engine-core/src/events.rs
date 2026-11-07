@@ -505,7 +505,12 @@ pub struct PersonaTraits {
     pub setting: Setting,
 }
 
-fn passes_gate(kind: EventKind, rung: u8, persona: &PersonaTraits, romance_compatible: bool) -> bool {
+fn passes_gate(
+    kind: EventKind,
+    rung: u8,
+    persona: &PersonaTraits,
+    romance_compatible: bool,
+) -> bool {
     match kind {
         EventKind::Strip => rung >= DESIRE_MIN_RUNG && romance_compatible,
         EventKind::ExMessage | EventKind::Breakup => rung >= CONFIDE_MIN_RUNG,
@@ -2435,11 +2440,7 @@ mod tests {
     fn modern_only_kinds_never_fit_fantasy() {
         for k in EventKind::ALL.into_iter().chain(EventKind::SPECIAL) {
             assert!(k.fits(Setting::Modern), "{k:?}");
-            assert_eq!(
-                k.fits(Setting::Fantasy),
-                !MODERN_ONLY.contains(&k),
-                "{k:?}"
-            );
+            assert_eq!(k.fits(Setting::Fantasy), !MODERN_ONLY.contains(&k), "{k:?}");
         }
     }
 

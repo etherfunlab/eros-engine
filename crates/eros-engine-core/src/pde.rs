@@ -962,7 +962,10 @@ mod tests {
     fn strip_needs_a_compatible_pair() {
         use crate::scope::{AffinityScope, MemoryScope};
         let strip = action_msg(UserAction::Strip);
-        assert!(strip_ruled_out(&strip), "engine defaults are not compatible");
+        assert!(
+            strip_ruled_out(&strip),
+            "engine defaults are not compatible"
+        );
         let mut romantic = strip.clone();
         if let Event::UserMessage {
             memory_scope,

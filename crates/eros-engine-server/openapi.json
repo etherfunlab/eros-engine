@@ -5051,7 +5051,8 @@
           "long_trip",
           "hometown_visit",
           "taking_space",
-          "fell_out"
+          "fell_out",
+          "strip"
         ]
       },
       "EventView": {
@@ -7298,6 +7299,7 @@
           "bluff",
           "threaten",
           "trick",
+          "strip",
           "custom",
           "tip",
           "gift"

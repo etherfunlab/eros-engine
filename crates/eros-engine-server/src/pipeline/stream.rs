@@ -10744,7 +10744,8 @@ data: [DONE]\n\n";
             Default::default(),
             None,
             false,
-        ).await;
+        )
+        .await;
         let types = frame_type_names(&frames);
         assert_eq!(
             types.first().map(String::as_str),
@@ -10808,7 +10809,9 @@ data: [DONE]\n\n";
         .await;
         assert_eq!(action_response_of(&frames), "refuse");
         assert_eq!(meta_action_type(&frames), FrameActionType::Reply);
-        assert!(!frame_type_names(&frames).iter().any(|t| t == "image_request"));
+        assert!(!frame_type_names(&frames)
+            .iter()
+            .any(|t| t == "image_request"));
     }
 
     /// A compatible pair's accepted strip shows her undressed, over a named
@@ -19817,7 +19820,10 @@ data: [DONE]\n\n";
             name: None,
             quantity: 1,
         });
-        assert!(give.contains("[用户动作] 对方递给你 1 支烟，这次你不会收下\n"), "{give}");
+        assert!(
+            give.contains("[用户动作] 对方递给你 1 支烟，这次你不会收下\n"),
+            "{give}"
+        );
     }
 
     /// A social action's `[用户动作]` line says what each answer means (spec

@@ -1190,7 +1190,10 @@ mod tests {
             )
         };
         let out = draw("s1").await.unwrap();
-        assert!(out.event.is_none(), "no recorded scopes reads as not compatible");
+        assert!(
+            out.event.is_none(),
+            "no recorded scopes reads as not compatible"
+        );
 
         sqlx::query(
             "INSERT INTO engine.chat_messages (session_id, role, content, metadata) \

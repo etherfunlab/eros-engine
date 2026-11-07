@@ -5998,7 +5998,10 @@ mod tests {
     #[test]
     fn a_stripped_turn_says_what_came_off() {
         assert_eq!(stripped_clothing(None), "衣服被对方脱掉了");
-        assert_eq!(stripped_clothing(Some("红色旗袍")), "「红色旗袍」被对方脱掉了");
+        assert_eq!(
+            stripped_clothing(Some("红色旗袍")),
+            "「红色旗袍」被对方脱掉了"
+        );
     }
 
     /// A social action's two answers say whether she fell for it (spec
