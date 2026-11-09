@@ -289,7 +289,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 > 如需全轴注入，请显式指定 `"bond_and_chemistry"` 或 `"full"`。
 
 > **1.3.0 起该字段不再影响计分。** 3.1 的写侧调向（1.2.1）已退役：
-> `affinity_scope` 门控提示注入与 `length_score`，对计分没有任何影响。一轮记录下来的 scope 连同 `memory_scope`，
+> `affinity_scope` 门控提示注入与 `length_score`，对计分没有任何影响。一轮记录下来的 `affinity_scope`
 > 还决定这一对能不能被问到浪漫生活选择（见[浪漫相容](#post-v2compsessionsession_idlife-choiceschoice_id)）。详见
 > [好感度模型 → Scope 调向：已退役](affinity-model.zh.md#affinityrs-与-scopers)。
 
@@ -407,7 +407,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 **社交动作。** `bluff`、`threaten`、`trick` 的回应表示她有没有中招：`accept` 是信了、被吓到了、上当了，`refuse` 是没信、没吃这一套、识破了。和所有动作一样，没有判定时算 `accept`。识破不降档，这一轮由亲密度判官照常评。
 
-**脱衣服。** `strip` 是用户脱她的衣服，只有性向相容的一对才可能被接受：这一轮的 `memory_scope` 开了关系记忆，`affinity_scope` 含暧昧感轴。其他组合的 `strip` 在判官运行之前就判为拒绝，不管判官怎么答，也不管有没有 LLM 判官，并像任何被拒的身体动作一样让 chemistry 线降一档。被接受的 `strip` 让她这一轮没穿衣服：穿着写成衣服被对方脱掉了，有指定 `outfit` 时写成「{outfit}」被对方脱掉了，进回复也进图。有出图能力时它像拍照一样回她的图（见下）。
+**脱衣服。** `strip` 是用户脱她的衣服，只有性向相容的一对才可能被接受：这一轮的 `affinity_scope` 含暧昧感轴，`memory_scope` 是什么都不影响。其余的 `strip` 在判官运行之前就判为拒绝，不管判官怎么答，也不管有没有 LLM 判官，并像任何被拒的身体动作一样让 chemistry 线降一档。被接受的 `strip` 让她这一轮没穿衣服：穿着写成衣服被对方脱掉了，有指定 `outfit` 时写成「{outfit}」被对方脱掉了，进回复也进图。有出图能力时它像拍照一样回她的图（见下）。
 
 **让你拍照。** 请求带 `image`、部署配置了 `[tasks.chat_image_prompt_compose]` 时，被接受的 `photo` 以 `reply_text_image` 回复：先是她的话，再是一条以她的脸部参考为基础、按当前场景组出来的 `image_request`。有没有 LLM 判官都一样。被接受的 `strip` 也这样回复。被拒的 `photo` 或 `strip`，或没有这项出图能力的，只回文字，即使判官提议了出图。`image.force = true` 仍让这一轮是 `reply_image`，被拒时图按拒绝的结果来画。
 
@@ -869,7 +869,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
   `want_to_go_out`，`low` 的偏向 `want_to_go_home`，`high` 的 `indulgence` 偏向 `want_to_go_out` 和 `irritable`
   （完整的表见 [life-events-needs.zh.md](life-events-needs.zh.md#1-需求给种类加权)）。
 - **亲近度门槛。** `ex_message` 与 `breakup` 不会向不太熟的人抽出（intimacy 档 2 及以上）；
-  `sudden_desire` 只在最亲近的档（3）；`strip` 在档 3、且会话最新记录的 `memory_scope` 与 `affinity_scope` 性向相容时才抽（没有记录就不抽）。`period` 只对 `art_metadata.gender` 为 `"female"` 的角色抽取；
+  `sudden_desire` 只在最亲近的档（3）；`strip` 在档 3、且会话最新记录的 `affinity_scope` 性向相容时才抽（没有记录就不抽）。`period` 只对 `art_metadata.gender` 为 `"female"` 的角色抽取；
   `period_scare`（档 2 及以上）与 `pregnancy_scare`（档 3）同样只对这样的角色抽取，`saw_bag` 和 `saw_clothes` 也是；
   从档 2 起，她会说自己想要看中的东西，有 `tip_personality` 的角色用那份人格的口吻说。离线类种类遵循两道 ghost 门槛（见下）。
 - **角色设置**，写在 genome 的 `art_metadata` 里，影响抽取：
@@ -992,11 +992,9 @@ composer 失败时退回普通的人物肖像 prompt，跟聊天回合一样。�
 [浪漫选择](life-events-needs.zh.md#浪漫选择)。
 
 **浪漫相容。** 只有调用方的 scope 标明为浪漫上相容的一对，她才会提出 `sleep_together` 或 `propose`：
-关系记忆开着（`memory_scope` 为 `full`、`neutral_and_relationship` 或 `relationship_only`），并且 `affinity_scope` 里至少有
-trust、intrigue、patience 之一（`"chemistry"`、`"full"`、`"bond_and_chemistry"`，或点名了这三者之一的轴数组）。
-`memory_scope: "full"` 配 `affinity_scope: "chemistry"` 满足，`memory_scope: "neutral_and_relationship"` 配
-`affinity_scope: "full"` 也满足；engine 的默认值（`neutral_and_relationship` 配 `bond`）永远不满足。
-engine 从这个 session 里最新一条同时记录了这两个 scope 的 assistant 回复读出这一对，她自己的生活选择消息不算；
+`affinity_scope` 里至少有 trust、intrigue、patience 之一（`"chemistry"`、`"full"`、`"bond_and_chemistry"`，或点名了这三者之一的轴数组），
+`memory_scope` 是什么都不影响。默认的 `"bond"` 永远不满足。
+engine 读的是这个 session 里最新一条同时记录了 `memory_scope` 和 `affinity_scope` 的 assistant 回复上的 scope，她自己的生活选择消息不算；
 没有这样的回复，或值解析不了，这一对就不相容。调用方在自己的回合里发来满足这条判据的 scope，这一对就有了资格。
 engine 不接收也不保存用户的性别或性取向。
 

@@ -265,7 +265,7 @@ roll can refuse whatever the judge says
   verdict; the turn is graded like any other.
 - **Social actions:** a refused `bluff`, `threaten` or `trick` means she saw
   through it, and drops no line either; the turn is graded like any other.
-- **Strip:** a `strip` from a pair whose scopes are not romance-compatible is
+- **Strip:** a `strip` from a pair whose `affinity_scope` is not romance-compatible is
   refused whatever the judge says, and drops Chemistry like any refused
   physical action.
 - **Gift:** accepted, the gift also joins the persona's items or wardrobe;
@@ -424,7 +424,7 @@ derivation, time decay, the Bond/Chemistry scores, tiers, labels.
 `crates/eros-engine-core/src/scope.rs` is the per-request injection gate:
 `AffinityScope` — six booleans, which axes may influence *this* request's
 prompt — plus `MemoryScope`. It gates prompt injection and `length_score`,
-and the scopes a request records are what `romance_compatible` reads to decide
+and the `affinity_scope` a request records is what `romance_compatible` reads to decide
 whether a pair is eligible for the romantic life choices; post-process writes
 (insight extraction, memory writes, the six-axis eval) are unaffected.
 
