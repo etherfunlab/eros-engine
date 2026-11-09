@@ -778,7 +778,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | 字段 | 规则 |
 |---|---|
 | `event_key` | 必填：1–128 个 `[A-Za-z0-9_.:-]` 字符，只在本会话内有效。同一个 key 返回同一个事件 |
-| `kinds` | 选填。不带或 `null`：全部种类。数组：只抽列出的种类（`[]`：什么都不抽）。对象 `{"allow": […], "disallow": […]}`：`allow` 允许的种类（不带或 `null`：全部；`[]`：一种都没有）去掉 `disallow` 列出的种类；两边都列了的种类不抽，`{}` 等于全部种类。对象里出现未知的键，或出现未知种类，返回 `422`；写了 `taking_space` 或 `fell_out` 同样返回 `422`：它们由 engine 自己写入，从不抽取 |
+| `kinds` | 选填。不带或 `null`：全部种类。数组：只抽列出的种类（`[]`：什么都不抽）。对象 `{"allow": […], "disallow": […]}`：`allow` 允许的种类（不带或 `null`：全部；`[]`：一种都没有）去掉 `disallow` 列出的种类；两边都列了的种类不抽，`{}` 等于全部种类。对象里出现未知的键，或出现未知种类，返回 `422`；写了 `taking_space`、`fell_out` 或 `traveling_together` 同样返回 `422`：它们由 engine 自己写入，从不抽取 |
 | `user_timezone`、`user_country`、`user_region`、`tier`、`prompt_traits`、`memory_scope`、`affinity_scope`、`audit` | 与 `/open` 相同，用于生成这条消息 |
 | `image` | 选填：`{"style", "aspect_ratio", "prompt_variant"}`，各字段与聊天回合的 `image` 相同（没有 `force`；不支持的 `aspect_ratio` 返回 `422`）。表示调用方能处理图：部署配了 `[tasks.chat_image_prompt_compose]` 时，`taking_selfie` 或 `strip` 的消息会带上她的图（见下）。不带、或没配 composer：只有文字。其他种类忽略它 |
 | `outfit` | 选填：她穿什么，与聊天回合相同——通常是她衣橱里的一项，不做核对；去掉首尾空白后 1–64 个字符，空白等于不带，超长返回 `422`。她的话会跟着这身衣服，图也会。`strip` 时她刚把它脱了：刚把「{outfit}」脱了，不带时是刚把衣服脱了。不带：prompt 里没有穿着，composer 按场景给她穿 |
@@ -843,7 +843,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 
 时长写成区间的，在事件开始时从区间里抽定。以上共 52 种可抽取的种类。两种性别都会抽到两个聚会，权重相同，这是有意为之。
 
-另有两种永远不会被抽到：`taking_space`（她提出、用户同意的分开，12–24 小时，离线）和 `fell_out`（用户不理会她提出的分开请求时的那场不愉快，1 小时）。
+另有三种永远不会被抽到：`taking_space`（她提出、用户同意的分开，12–24 小时，离线）、`fell_out`（用户不理会她提出的分开请求时的那场不愉快，1 小时）和 `traveling_together`（她提议、用户同意的旅行，48–72 小时，`trip` 类背景，不离线）。
 它们由 engine 为[生活选择流程](#post-v2compsessionsession_idlife-choiceschoice_id)写入，作为 `…/effects` 和生活选择响应里的 `event` 出现，
 不能写进 `kinds`。
 
@@ -952,7 +952,7 @@ composer 失败时退回普通的人物肖像 prompt，跟聊天回合一样。�
   各自列出正在进行的背景和插曲；`/open` 开场白同样带 `- 正在经历：…` 这一行。`GET …/effects` 两者都会列出。
   一段离线类事件结束之后（在被它 ghost 过消息的会话里），或一场虚惊结束之后（在讲出它的那个会话里），`[近期事件]` 行多出一项，回复多出一行 `- 刚才：…`，直到她在那里写过一次为止（一条带文字的消息；
   见 [model-config.zh.md](model-config.zh.md#taskspde_decision--opt-in-llm-pde-判断器)）。
-- **错误：** `event_key` 格式不对返回 `400`，`code: "invalid_payload"`；未知的 `kind`，或 `taking_space`、`fell_out`，返回 `422`。会话检查与 `/open` 相同
+- **错误：** `event_key` 格式不对返回 `400`，`code: "invalid_payload"`；未知的 `kind`，或 `taking_space`、`fell_out`、`traveling_together`，返回 `422`。会话检查与 `/open` 相同
   （`403`、`404`，语音或群会话 `409`），达到单用户并发上限 `429`。BYOC 实例的会话返回 `400 byoc_unsupported`。
   生成失败时返回与图片接口相同的上游错误，不写入任何内容。
   回复为空时不写入任何内容，返回空值。
@@ -978,18 +978,19 @@ composer 失败时退回普通的人物肖像 prompt，跟聊天回合一样。�
 
 回答她提出的一次生活选择。她用一条主动消息（`metadata.proactive = "life_choice"`）向用户提出一个选择，
 这个 session 随之带着一次待回答的选择，有效期 24 小时；她在与该用户的所有 session 里同一时间最多只有一个这样的选择待回答。
-用户可以在这里回答、用文字回复，或者什么都不说。选择共有三种：
+用户可以在这里回答、用文字回复，或者什么都不说。选择共有四种：
 
 | `kind` | 她提出 | 何时 |
 |---|---|---|
 | `ask_for_space` | 先分开一阵 | chemistry 比 bond 高出两档，且她的耐心连续三个被判官评过的回合都很低 |
 | `sleep_together` | 问用户愿不愿意和她上床 | 这一对在浪漫上相容（见下），chemistry 在第 3 档或以上，且最新的 3 个被判官评过的回合 warmth 和 patience 都高于 0.7 |
 | `propose` | 向用户求婚 | 这一对在浪漫上相容，chemistry 和 bond 都在第 4 档或以上，且最新的 8 个被判官评过的回合里至少 5 个 warmth 和 patience 都高于 0.7 |
+| `travel_together` | 提议一起去旅行 | bond 在第 3 档或以上，最新的 3 个被判官评过的回合 warmth 和 patience 都高于 0.7，且没有背景事件在进行。不读这一对的 scope |
 
-只有该 session 最新一段选择经过（她的请求、它的结算以及它开启的分开，不论哪一种选择）之后的、被判官评过的回合才计数。两种浪漫选择同一轮都满足时，触发 `propose`。
-在一个 session 里被用户接受或不理会过的种类，在那里不会再次提出；被拒绝或过期的，等出现新的连续后会再次提出。她怎么提出、什么时候提出、
-每条路各付什么代价，见 [life-events-needs.zh.md](life-events-needs.zh.md#提出分开的选择)和
-[浪漫选择](life-events-needs.zh.md#浪漫选择)。
+只有该 session 最新一段选择经过（她的请求、它的结算以及它开启的分开，不论哪一种选择）之后的、被判官评过的回合才计数。两种浪漫选择同一轮都满足时，触发 `propose`；浪漫选择优先于 `travel_together`。
+在一个 session 里被用户接受或不理会过的浪漫种类，在那里不会再次提出，`travel_together` 则 14 天内不再提出；被拒绝或过期的，等出现新的连续后会再次提出。她怎么提出、什么时候提出、
+每条路各付什么代价，见 [life-events-needs.zh.md](life-events-needs.zh.md#提出分开的选择)、
+[浪漫选择](life-events-needs.zh.md#浪漫选择)和[一起去旅行](life-events-needs.zh.md#一起去旅行)。
 
 **浪漫相容。** 只有调用方的 scope 标明为浪漫上相容的一对，她才会提出 `sleep_together` 或 `propose`：
 `affinity_scope` 里至少有 trust、intrigue、patience 之一（`"chemistry"`、`"full"`、`"bond_and_chemistry"`，或点名了这三者之一的轴数组），
@@ -1021,15 +1022,15 @@ engine 不接收也不保存用户的性别或性取向。
 
 只服务 1:1 文字 session。一个事务里完成回答并付清代价。回答带来什么，取决于 `kind`：
 
-| | `ask_for_space` | `sleep_together` | `propose` |
-|---|---|---|---|
-| **`accept`** | 状态 `accepted`。一段 `taking_space` 分开从此刻开始，持续时长是她提出时的档位差距每一档 6 小时（差距 2、3、4 对应 12、18、24 小时）；期间她在所有 session 里都离线，正在进行的插曲在这一刻结束。bond 和 chemistry 各降一档，分开结束后的 72 小时内，这个 session 里为正的增长减半 | 状态 `accepted`；别的都不变 | 状态 `accepted`；别的都不变 |
-| **`decline`** | 状态 `declined`。同样的降档；没有分开，也没有放缓 | 状态 `declined`；chemistry 降一档 | 状态 `declined`；bond 和 chemistry 各降一档 |
-| **不理会**（用户改为打字） | 状态 `ignored`；一场一小时的 `fell_out` 插曲；不改任何档位 | 状态 `ignored`；没有代价，没有 `fell_out` | 状态 `ignored`；没有代价，没有 `fell_out` |
-| **过期**（24 小时） | 没有代价 | 没有代价 | 没有代价 |
+| | `ask_for_space` | `sleep_together` | `propose` | `travel_together` |
+|---|---|---|---|---|
+| **`accept`** | 状态 `accepted`。一段 `taking_space` 分开从此刻开始，持续时长是她提出时的档位差距每一档 6 小时（差距 2、3、4 对应 12、18、24 小时）；期间她在所有 session 里都离线，正在进行的插曲在这一刻结束。bond 和 chemistry 各降一档，分开结束后的 72 小时内，这个 session 里为正的增长减半 | 状态 `accepted`；别的都不变 | 状态 `accepted`；别的都不变 | 状态 `accepted`。一段 `traveling_together` 背景从此刻开始，持续 48 到 72 小时；她照常回复，正在进行的插曲在这一刻结束。别的都不变 |
+| **`decline`** | 状态 `declined`。同样的降档；没有分开，也没有放缓 | 状态 `declined`；chemistry 降一档 | 状态 `declined`；bond 和 chemistry 各降一档 | 状态 `declined`；别的都不变 |
+| **不理会**（用户改为打字） | 状态 `ignored`；一场一小时的 `fell_out` 插曲；不改任何档位 | 状态 `ignored`；没有代价，没有 `fell_out` | 状态 `ignored`；没有代价，没有 `fell_out` | 状态 `ignored`；没有代价，没有 `fell_out` |
+| **过期**（24 小时） | 没有代价 | 没有代价 | 没有代价 | 没有代价 |
 
 然后她用一条主动消息回应，与普通回复一样落库并返回。`ask_for_space` 接受之后是道别，拒绝之后是受伤的回应；
-浪漫选择则是她对用户答“好”或“不”的回应。生成时用的是这次请求带的 scope。
+其他种类则是她对用户答“好”或“不”的回应。生成时用的是这次请求带的 scope。
 
 ```json
 {"status": "accepted",
@@ -1038,9 +1039,9 @@ engine 不接收也不保存用户的性别或性取向。
  "event": {"kind": "taking_space", "category": "mid", "offline": true, "started_at": "2026-10-20T12:00:00Z", "ends_at": "2026-10-21T06:00:00Z", "message_id": null}}
 ```
 
-`status` 为 `accepted` 或 `declined`。`affinity` 是回答之后的关系：任何拒绝以及 `ask_for_space` 的接受之后是降档后的，
-浪漫选择的接受则保持原样；形状同
-[`GET /bff/v1/comp/affinity/{session_id}`](#get-bffv1compaffinitysession_id) 里的 `affinity`。`event` 是 `ask_for_space` 接受时开始的分开，
+`status` 为 `accepted` 或 `declined`。`affinity` 是回答之后的关系：`ask_for_space` 的接受以及除 `travel_together` 外任何种类的拒绝之后是降档后的，
+其他情况保持原样；形状同
+[`GET /bff/v1/comp/affinity/{session_id}`](#get-bffv1compaffinitysession_id) 里的 `affinity`。`event` 是 `ask_for_space` 接受时开始的分开，或 `travel_together` 接受时开始的旅行，
 任何拒绝以及所有浪漫选择的回答都为 `null`。
 她的生成失败、回复为空，或用户有更新的消息先落库时，`message` 为 `null`：回答、分开和降档照样生效。
 
@@ -1048,7 +1049,7 @@ engine 不接收也不保存用户的性别或性取向。
 
 - **不理会。** 选择待回答期间到达的第一条普通用户文字消息（不带 `action` 的轮次）会转换它：状态变为 `ignored`。
   `ask_for_space` 还会从那条消息起开始一场一小时的 `fell_out` 插曲，所以正是这一条不理会她的消息，回复时她的上下文里已经带着这场不愉快；
-  浪漫的请求则没有代价，也没有 `fell_out`，这一轮照常运行。不改任何档位。
+  其他请求则没有代价，也没有 `fell_out`，这一轮照常运行。不改任何档位。
   只有在她提出之后发出的消息才会触发。动作轮次不会结算它，`/open` 和 reaction 也不会。分开期间的消息一律只是 ghost，不会转化任何挂起的请求。
 - **过期。** 她提出 24 小时后，这次选择处处读作已过期：delta 上的 `life_choice` 不再附带，这个路由返回 `409`，之后的消息什么都不转换，也没有任何代价。
 
@@ -1136,7 +1137,7 @@ SSE 帧是整轮最后一帧且只走线上——在它发出前断线，光看 
   "life_choice": { "id": "…", "kind": "propose", "status": "accepted", "resolved_at": "2026-10-30T12:00:00Z" } }
 ```
 
-`kind` 为 `ask_for_space`、`sleep_together` 或 `propose`。`status` 为 `pending`、`accepted`、`declined`、`ignored` 或 `expired`；`expired` 是超过 24 小时的 `pending` 选择，在这一页返回时现算，不落库。`resolved_at` 在状态为 `pending` 或 `expired` 时是 `null`；`accepted` 和 `declined` 时是回答落库的时刻，`ignored` 时是用文字回答她的那条用户消息的 `sent_at`。后面她的回应行照常带 `occasion: "life_choice"`。好感度 delta 里的 `life_choice` 字段是另一个对象，仍然只在待回答时出现。
+`kind` 为 `ask_for_space`、`sleep_together`、`propose` 或 `travel_together`。`status` 为 `pending`、`accepted`、`declined`、`ignored` 或 `expired`；`expired` 是超过 24 小时的 `pending` 选择，在这一页返回时现算，不落库。`resolved_at` 在状态为 `pending` 或 `expired` 时是 `null`；`accepted` 和 `declined` 时是回答落库的时刻，`ignored` 时是用文字回答她的那条用户消息的 `sent_at`。后面她的回应行照常带 `occasion: "life_choice"`。好感度 delta 里的 `life_choice` 字段是另一个对象，仍然只在待回答时出现。
 
 `user_message_id` 指向产生这一行的那一轮的 `role='user'` 行。assistant 行和
 `system_error` 通知行上都有，user 行本身省略。通知行最要紧：队列 worker 和
@@ -1983,7 +1984,7 @@ time-decay），或最近一次事件早于 affinity migration `0014`。`event_t
   或它的回复（`chat_messages.user_message_id`）上。`proactive` / `time_decay` 事件
   以及 migration `0056` 之前写入的行没有这个键。
 - `life_choice` —— 该 session 待回答的选择，在响应时现场拼出，只要有一次选择未被回答、也没过 24 小时，就附在 `event` 上；
-  没有时不带。`kind` 为 `ask_for_space`、`sleep_together` 或 `propose`。`options` 列出
+  没有时不带。`kind` 为 `ask_for_space`、`sleep_together`、`propose` 或 `travel_together`。`options` 列出
   [生活选择路由](#post-v2compsessionsession_idlife-choiceschoice_id)接受的回答；`message_id` 是提出它的那条聊天消息
   （那一行没了就不带）。请求落在触发它的那一轮之后几秒，所以历史里某一行带 `occasion: "life_choice"` 时，
   应当重新拉一次 delta。忽略这个字段的客户端会降级成那里描述的“不理会”。

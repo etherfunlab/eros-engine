@@ -306,6 +306,8 @@ PDE 判定的 ghost 回合从不进入 `persist_with_event`：只有 `ghost_stre
 - 浪漫选择：chemistry 档位（`propose` 还要 bond 档位）和最近几个被判官评过的回合推算出的 `warmth`、`patience`，
   决定她要不要提出上床或求婚，前提是调用方的 scope 把这一对标明为浪漫相容
   （见[这些选择](life-events-needs.zh.md#浪漫选择)）。
+- 一起旅行：bond 档位和最近几个被判官评过的回合推算出的 `warmth`、`patience`，决定她要不要提议一起去旅行
+  （见[一起去旅行](life-events-needs.zh.md#一起去旅行)）。
 - 召回门控：时间衰减后那行的 Bond 和 Chemistry 档位，决定哪些基础画像私密字段、哪些带 domain
   标签的画像层记忆能进 prompt，以及每一层召回多少条；没有记录的组合两条线都按第 1 档算。
   文字、群聊、语音和改图请求生成的文字回复都读衰减后的值（见 [memory-layers.zh.md](memory-layers.zh.md#亲密度门控)）。

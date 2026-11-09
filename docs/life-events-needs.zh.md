@@ -191,10 +191,11 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 
 时长写成区间的，在事件开始时按整小时均匀抽定。
 
-另有两种永远不会被抽到：`taking_space`（说好暂时分开）和 `fell_out`（为分开的事闹得不愉快）。
-她提出先分开一阵、用户作答或不作答时，由 engine 自己写入（见[提出分开的选择](#提出分开的选择)）。
+另有三种永远不会被抽到：`taking_space`（说好暂时分开）、`fell_out`（为分开的事闹得不愉快）和 `traveling_together`（和对方一起旅行）。
+前两种在她提出先分开一阵、用户作答或不作答时，由 engine 自己写入（见[提出分开的选择](#提出分开的选择)）。
 它们按形态是 `mid` 插曲，其中 `taking_space` 超出了这个类别的 4 小时：它持续 12 到 24 小时。
-它们没有抽取规则，调用方的 `kinds` 也拒绝它们。
+`traveling_together` 是 `trip` 类的背景，用户接受她的提议时由 engine 写入（见[一起去旅行](#一起去旅行)）。
+这三种都没有抽取规则，调用方的 `kinds` 也拒绝它们。
 
 ### 抽取
 
@@ -228,7 +229,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
   `bumped_someone`、`saw_bag`、`saw_clothes`、`out_shopping`、`bros_gathering`、`sis_gathering`、
   `admiring_scenery`、`admiring_art`、`watching_show`、`on_the_road`、`having_sex`。
   `period` 期间，
-  不抽 `period_scare` 与 `pregnancy_scare`。
+  不抽 `period_scare` 与 `pregnancy_scare`。`traveling_together` 期间，不抽任何可能让她离线的种类：她和用户在一起。
 - 她在等用户回答自己提出的某次生活选择时，同样完全不抽，角色的任何一个 session 都一样：这个请求本身就是前台戏，
   也免得一段离线时段在问话中间开始。带着已经抽过的 `event_key` 来重复调用，照样返回那个事件。
 - 一件插曲和一个背景可以同时进行。背景里抽到的插曲，是从背景里讲出来的。
@@ -321,7 +322,7 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 | `sick` | `period_scare` |
 | `having_sex` | `pregnancy_scare` |
 | `business_trip` | `on_the_road`、`on_the_way`、`busy`、`temp_work` |
-| `short_trip`、`long_trip`、`hometown_visit` | `on_the_road`、`admiring_scenery`、`taking_selfie` |
+| `short_trip`、`long_trip`、`hometown_visit`、`traveling_together` | `on_the_road`、`admiring_scenery`、`taking_selfie` |
 | `hometown_visit` | `bros_gathering`、`sis_gathering` |
 | `hospitalized`、`post_surgery` | `reading`、`gaming` |
 | `period` | `irritable`、`unwell` |
@@ -347,7 +348,7 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 对象里，`allow` 不带或为 `null` 表示全部允许，`[]` 表示一种都不允许；`disallow` 不带、为 `null` 或 `[]` 都不去掉任何种类；
 两边都列了的种类不抽。只写 `{"disallow": […]}` 就能排除种类而不冻结其余种类，engine 以后新增的种类也会照常抽取。
 对象里出现未知的键，或任何地方出现未知种类，请求都会被拒绝，所以拼错的 `disallow` 不会悄悄放出本想排除的种类；
-代价是调用方要等 engine 认识某个新种类之后才能列它。`taking_space` 和 `fell_out` 永远不会被抽到，
+代价是调用方要等 engine 认识某个新种类之后才能列它。`taking_space`、`fell_out` 和 `traveling_together` 永远不会被抽到，
 所以在 `kinds` 的任何位置写它们，都按同样的方式被拒绝。
 
 有三种带成人题材：`sudden_desire`、`having_sex`，以及隐含性行为的 `pregnancy_scare`。engine 不内建这类分组；只对部分用户提供这类内容的调用方，
@@ -873,12 +874,39 @@ affinity delta 上也是同一个 `life_choice` 字段。她的请求用 engine 
 （见 [affinity-model.zh.md](affinity-model.zh.md#生活选择的降档与放缓)）。动作轮次不会结算它，和提出分开一样。
 放缓只属于提出分开：被接受的浪漫选择从不放缓增长。故事导演只读提出分开，所以浪漫选择的结果只留在对话里，不会在她的世界故事里留下痕迹。
 
+### 一起去旅行
+
+`travel_together` 是第四种选择：她提议两个人一起去旅行。它和浪漫选择一样是暖向的，但不读这一对的 scope，所以浪漫选择碰不到的一对也可能被问到。
+
+**她什么时候提出。** 在每个被判官评过的 1:1 文字回合之后、浪漫选择的检查之后进行，读的是同样已落库、做过时间衰减的状态，跑道和 session 条件也一样。
+它要 bond 在第 3 档或以上、最新 3 个被判官评过的回合全都温暖，并且没有背景事件在进行。
+被接受或不理会过的 `travel_together`，从结算时起 14 天内不再提出；被拒绝或过期后，等这个 session 有了新的连续就可以再提。
+同一轮浪漫选择也满足时，浪漫选择先走，它待回答的请求会占住跑道。
+
+**她的请求。** 交付方式和浪漫选择一样：先是她的话，再在旁边写入选择这一行，没有档位差距，窗口同样是 24 小时，affinity delta 上同样带 `life_choice` 字段。
+请求用 engine 的默认 scope 生成；结算时她的回应用结算请求自己的 scope。
+
+**回答。** 同一个端点，同样的 `409` 规则，同样的响应形状。
+
+| 路径 | 选择状态 | 代价 | 发生什么 | 她说的话 |
+|---|---|---|---|---|
+| 接受 | `accepted` | 无 | `traveling_together` 事件从此刻开始，作为 `event` 返回 | 生成的回应，知道这趟要玩多久 |
+| 拒绝 | `declined` | 无 | 无 | 生成的、有点失落的回应 |
+| 不理会 | `ignored` | 无：没有 `fell_out`，没有事件 | 无 | 没有单独的话：这一轮照常运行 |
+| 过期 | 仍为 `pending`，读作已过期 | 无 | 无 | 无 |
+
+**这趟旅行。** `traveling_together`（和对方一起旅行）是 `trip` 类、不可抽取的背景，持续 48 到 72 小时，在用户接受时按整小时均匀抽取。
+开始时结束正在进行的插曲。它不作为事件讲述，因为她对“好”的回应已经说了；全程她照常回复，不算离线。`正在经历` 和判官像读其他背景一样读它。
+期间不抽第二个背景，也不抽任何可能让她离线的种类；`on_the_road`、`admiring_scenery` 和 `taking_selfie` 像跟随她自己的旅行一样跟随它。和所有事件一样，它以角色实例为单位。
+
+**旅行中的其他请求。** 只有提出分开的那段分开，才把连续的起算点推到事件结束。被接受的旅行以结算时刻为起算点，所以旅途中她也可能提出浪漫选择。旅行期间她不会提出分开。
+
 ### 选择存在哪
 
-`engine.life_choices` 每次选择一行：`session_id`（非空，随 session 级联删除）、`kind`（`ask_for_space`、`sleep_together` 或 `propose`）、
-`status`（`pending`、`accepted`、`declined`、`ignored`）、`tier_gap`（提出时的档位差距；`ask_for_space` 有值，浪漫种类为 NULL）、
+`engine.life_choices` 每次选择一行：`session_id`（非空，随 session 级联删除）、`kind`（`ask_for_space`、`sleep_together`、`propose` 或 `travel_together`）、
+`status`（`pending`、`accepted`、`declined`、`ignored`）、`tier_gap`（提出时的档位差距；`ask_for_space` 有值，其他种类为 NULL）、
 `asked_at`、`resolved_at`、`message_id`（那条请求；消息没了就置为 NULL）和
-`event_id`（接受时写下的 `taking_space` 行，其他路径为 NULL；事件没了就置为 NULL）。过期和放缓的窗口都是推算出来的，不存。
+`event_id`（接受时写下的 `taking_space` 或 `traveling_together` 行，其他路径为 NULL；事件没了就置为 NULL）。过期和放缓的窗口都是推算出来的，不存。
 分开和不愉快那两行和其他事件一样在 `engine.persona_events` 里。
 
 ## 没有 LLM 判官时
@@ -891,7 +919,7 @@ affinity delta 上也是同一个 `life_choice` 字段。她的请求用 engine 
 | `正在经历` 与 `刚才` | 照常进入回复、`/open` 开场白和事件消息 |
 | `[近期事件]` | 不渲染：没有判官来读它 |
 | 离线类种类 | 和有判官时一样让轮次沉默，因为这个检查在判官之前：ghosting 开关以及动作、强制出图两种例外照样适用 |
-| 提出分开与浪漫选择 | 不变：触发读的是 affinity 评估器评过的回合，不是 PDE 判官 |
+| 生活选择 | 不变：触发读的是 affinity 评估器评过的回合，不是 PDE 判官 |
 | `smoking`、`alcoholic`、`drug`、`coffee`、`gluttony` | 为 `false` 的键在 give 时照样掷，可能把它变成拒收；没有 `indulgence` 可漂移、可点名 |
 
 ## 代码指引
