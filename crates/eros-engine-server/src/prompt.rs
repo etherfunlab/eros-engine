@@ -925,6 +925,7 @@ pub(crate) fn event_label(kind: eros_engine_core::events::EventKind) -> &'static
         HometownVisit => "回老家",
         TakingSpace => "说好暂时分开",
         FellOut => "为分开的事闹得不愉快",
+        TravelingTogether => "和对方一起旅行",
         Strip => "刚脱了衣服",
     }
 }

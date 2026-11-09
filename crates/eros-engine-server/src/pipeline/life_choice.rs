@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The life choices on the pipeline side: when a judged turn makes her ask
-//! for space, to sleep together or to marry, her generated request, and the
-//! slowdown after an accepted separation. The answer, its costs and the
-//! ignore path live in the resolution route and the turn entry.
+//! for space, to sleep together, to marry or to go away together, her
+//! generated request, and the slowdown after an accepted separation. The
+//! answer, its costs and the ignore path live in the resolution route and the
+//! turn entry.
 //!
 //! Spec: docs/superpowers/specs/2026-10-19-life-events-shopping-gatherings-and-ask-for-space-design.md
 //! §3.1 (trigger), §3.2 (the ask), §3.5 (the slowdown); the romantic kinds:
@@ -41,9 +42,13 @@ const SLOWED_GROWTH: f64 = 0.5;
 /// patience are both above this. A rule threshold of the engine, not a judge
 /// band (spec 2026-10-30 §4.3).
 const WARM: f64 = 0.7;
-/// `sleep_together`: the newest judged turns that must all be warm (spec
-/// 2026-10-30 §4.3).
-const ROMANCE_STREAK: usize = 3;
+/// `sleep_together` and `travel_together`: the newest judged turns that must
+/// all be warm.
+const WARM_STREAK: usize = 3;
+/// `travel_together`: the bond tier it needs.
+const TRAVEL_MIN_BOND_TIER: u8 = 3;
+/// `travel_together`: days after an accept or an ignore before she asks again.
+const TRAVEL_COOLDOWN_DAYS: i64 = 14;
 /// `propose`: how many of the newest judged turns it looks at (spec
 /// 2026-10-30 §4.3).
 const PROPOSE_WINDOW: i64 = 8;
@@ -184,6 +189,9 @@ pub(crate) async fn maybe_ask(
     if let Err(e) = try_romance(state, session_id, user_id, instance_id, persona).await {
         tracing::warn!(%session_id, "romantic choice failed: {e}");
     }
+    if let Err(e) = try_travel(state, session_id, user_id, instance_id, persona).await {
+        tracing::warn!(%session_id, "travel choice failed: {e}");
+    }
 }
 
 /// Whether she is free to put a choice to the user at all (spec 2026-10-19
@@ -244,6 +252,15 @@ async fn try_ask(
     affinity.refresh_endpoints(&state.config.affinity_tuning);
     let tier_gap = i16::from(affinity.chem_tier()) - i16::from(affinity.bond_tier());
     if tier_gap < MIN_TIER_GAP {
+        return Ok(());
+    }
+    // While they are away together she does not ask to be apart.
+    let away_together = (EventRepo { pool: &state.pool })
+        .current(instance_id, None, now)
+        .await?
+        .background
+        .is_some_and(|e| e.kind == EventKind::TravelingTogether);
+    if away_together {
         return Ok(());
     }
     if !runway_clear(state, session_id, instance_id, now).await? {
@@ -339,7 +356,7 @@ async fn try_romance(
 /// at most [`PROPOSE_WINDOW`]. A turn is warm when its warmth and its
 /// patience are both above [`WARM`]. `propose` needs both tiers at 4 or more
 /// and [`PROPOSE_HITS`] warm turns in the window; `sleep_together` needs
-/// chemistry tier 3 or more and the newest [`ROMANCE_STREAK`] all warm. A
+/// chemistry tier 3 or more and the newest [`WARM_STREAK`] all warm. A
 /// settled kind is never chosen.
 fn romantic_kind(
     chem_tier: u8,
@@ -348,23 +365,85 @@ fn romantic_kind(
     settled_sleep: bool,
     settled_propose: bool,
 ) -> Option<LifeChoiceKind> {
-    let warm = |e: &JudgedEndpoints| e.warmth > WARM && e.patience > WARM;
     if !settled_propose
         && chem_tier >= 4
         && bond_tier >= 4
-        && endpoints.iter().filter(|&e| warm(e)).count() >= PROPOSE_HITS
+        && endpoints.iter().filter(|e| is_warm(e)).count() >= PROPOSE_HITS
     {
         return Some(LifeChoiceKind::Propose);
     }
-    if !settled_sleep
-        && chem_tier >= 3
-        && endpoints
-            .get(..ROMANCE_STREAK)
-            .is_some_and(|newest| newest.iter().all(warm))
-    {
+    if !settled_sleep && chem_tier >= 3 && newest_streak_warm(endpoints) {
         return Some(LifeChoiceKind::SleepTogether);
     }
     None
+}
+
+fn is_warm(e: &JudgedEndpoints) -> bool {
+    e.warmth > WARM && e.patience > WARM
+}
+
+/// `endpoints` newest first: the newest [`WARM_STREAK`] are all warm.
+fn newest_streak_warm(endpoints: &[JudgedEndpoints]) -> bool {
+    endpoints
+        .get(..WARM_STREAK)
+        .is_some_and(|newest| newest.iter().all(is_warm))
+}
+
+fn travel_qualifies(bond_tier: u8, endpoints: &[JudgedEndpoints]) -> bool {
+    bond_tier >= TRAVEL_MIN_BOND_TIER && newest_streak_warm(endpoints)
+}
+
+/// She suggests going away together: a close, warm stretch, whatever the
+/// pair's scopes. Not while a background is under way, and not within
+/// [`TRAVEL_COOLDOWN_DAYS`] of the last accept or ignore. It runs after the
+/// romantic trigger, whose pending ask closes the runway.
+async fn try_travel(
+    state: &AppState,
+    session_id: Uuid,
+    user_id: Uuid,
+    instance_id: Uuid,
+    persona: &CompanionPersona,
+) -> Result<(), AppError> {
+    let now = Utc::now();
+    let affinity_repo = AffinityRepo { pool: &state.pool };
+    let Some(mut affinity) = affinity_repo.load(session_id).await? else {
+        return Ok(());
+    };
+    affinity.apply_time_decay();
+    affinity.refresh_endpoints(&state.config.affinity_tuning);
+
+    let choices = LifeChoiceRepo { pool: &state.pool };
+    let since = choices.streak_anchor(session_id).await?;
+    let judged = affinity_repo
+        .last_judged_endpoints(session_id, since, WARM_STREAK as i64)
+        .await?;
+    if !travel_qualifies(affinity.bond_tier(), &judged) {
+        return Ok(());
+    }
+    let cooled = now - Duration::days(TRAVEL_COOLDOWN_DAYS);
+    if choices
+        .settled_since(session_id, LifeChoiceKind::TravelTogether, cooled)
+        .await?
+    {
+        return Ok(());
+    }
+    let background = (EventRepo { pool: &state.pool })
+        .current(instance_id, None, now)
+        .await?
+        .background;
+    if background.is_some() || !runway_clear(state, session_id, instance_id, now).await? {
+        return Ok(());
+    }
+
+    let cue = LifeChoiceCue::Ask {
+        kind: LifeChoiceKind::TravelTogether,
+        tier_gap: None,
+        anchor_seen: since,
+    };
+    if ask(state, session_id, user_id, instance_id, persona, now, cue).await? {
+        tracing::info!(%session_id, "she suggested going away together");
+    }
+    Ok(())
 }
 
 /// Her ask (spec 2026-10-19 §3.2, spec 2026-10-30 §4.4) through the
@@ -2053,6 +2132,8 @@ mod tests {
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn without_compatible_scopes_nothing_fires(pool: PgPool) {
         let s = scene_with_lines(&pool, 0.5, 0.5).await;
+        // A background keeps the trip ask, which needs no scopes, out of it.
+        s.event_under_way(EventKind::ShortTrip).await;
         let mock = mock_llm(WARM, Some(SLEEP_TEXT)).await;
         let state = with_models(test_state(pool.clone()), &mock.uri());
 
@@ -2112,6 +2193,8 @@ mod tests {
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn propose_wins_when_both_qualify(pool: PgPool) {
         let s = scene_with_lines(&pool, 0.7, 0.7).await;
+        // A background keeps the trip ask, which needs no scopes, out of it.
+        s.event_under_way(EventKind::ShortTrip).await;
         let mock = mock_llm(WARM, Some(PROPOSE_TEXT)).await;
         let state = with_models(test_state(pool.clone()), &mock.uri());
 
@@ -2134,6 +2217,8 @@ mod tests {
         for status in ["ignored", "accepted"] {
             let s = scene_with_lines(&pool, 0.5, 0.5).await;
             s.record_scopes("full", AffinityScope::chemistry()).await;
+            // A background keeps the trip ask out of it.
+            s.event_under_way(EventKind::ShortTrip).await;
             s.seed_romantic(LifeChoiceKind::SleepTogether, status, Duration::hours(1))
                 .await;
             for _ in 0..4 {
@@ -2207,5 +2292,157 @@ mod tests {
                 pending("sleep_together"),
             ]
         );
+    }
+
+    // ---- Traveling together ----
+
+    const TRAVEL_TEXT: &str = "这周末我们一起出去玩吧？";
+
+    impl Scene {
+        /// An event of `kind` under way on the instance for the next day.
+        async fn event_under_way(&self, kind: EventKind) {
+            let now = Utc::now();
+            EventRepo { pool: &self.pool }
+                .insert_preempting(&NewEvent {
+                    instance_id: self.instance_id,
+                    session_id: self.session_id,
+                    event_key: "under-way",
+                    kind,
+                    started_at: now - Duration::hours(1),
+                    ends_at: now + Duration::hours(24),
+                })
+                .await
+                .unwrap();
+        }
+
+        /// The scopes of a pair with no chemistry axis, so no romantic ask
+        /// gets in first.
+        async fn record_bond_only(&self) {
+            self.record_scopes("neutral_and_relationship", AffinityScope::bond())
+                .await;
+        }
+    }
+
+    #[test]
+    fn travel_qualifies_table() {
+        let hot = |n| {
+            vec![
+                JudgedEndpoints {
+                    warmth: 0.8,
+                    patience: 0.8
+                };
+                n
+            ]
+        };
+        assert!(travel_qualifies(3, &hot(3)));
+        assert!(travel_qualifies(5, &hot(3)));
+        assert!(!travel_qualifies(2, &hot(3)), "bond below 3");
+        assert!(!travel_qualifies(3, &hot(2)), "two is not three");
+        let mut cool = hot(3);
+        cool[2].patience = 0.7;
+        assert!(!travel_qualifies(3, &cool), "0.7 is not above 0.7");
+    }
+
+    /// The trip needs no chemistry axis in scope: a pair the romantic kinds
+    /// never reach is asked on its third warm turn.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn three_warm_turns_ask_a_bond_only_pair_to_travel(pool: PgPool) {
+        let s = scene_with_lines(&pool, 0.5, 0.5).await;
+        s.record_bond_only().await;
+        let mock = mock_llm(WARM, Some(TRAVEL_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+
+        s.turn(&state, SEEN).await;
+        s.turn(&state, SEEN).await;
+        assert!(s.kinds().await.is_empty(), "two warm turns are not three");
+
+        s.turn(&state, SEEN).await;
+        assert_eq!(s.kinds().await, vec![pending("travel_together")]);
+        let rows = s.ask_rows().await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].1, TRAVEL_TEXT);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_romantic_ask_goes_before_a_trip(pool: PgPool) {
+        let s = scene_with_lines(&pool, 0.5, 0.5).await;
+        s.record_scopes("full", AffinityScope::chemistry()).await;
+        let mock = mock_llm(WARM, Some(SLEEP_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+
+        for _ in 0..3 {
+            s.turn(&state, SEEN).await;
+        }
+        assert_eq!(s.kinds().await, vec![pending("sleep_together")]);
+    }
+
+    /// Accepted or ignored holds the next ask back fourteen days; a decline
+    /// holds it only until a fresh streak.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_answered_trip_waits_fourteen_days(pool: PgPool) {
+        let mock = mock_llm(WARM, Some(TRAVEL_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+        for (status, days, asks) in [
+            ("accepted", 13, false),
+            ("ignored", 13, false),
+            ("accepted", 15, true),
+            ("declined", 1, true),
+        ] {
+            let s = scene_with_lines(&pool, 0.5, 0.5).await;
+            s.record_bond_only().await;
+            s.seed_romantic(LifeChoiceKind::TravelTogether, status, Duration::days(days))
+                .await;
+            for _ in 0..3 {
+                s.turn(&state, SEEN).await;
+            }
+            assert_eq!(
+                s.kinds().await.contains(&pending("travel_together")),
+                asks,
+                "{status} {days} days ago"
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn she_does_not_ask_to_travel_during_a_background(pool: PgPool) {
+        let s = scene_with_lines(&pool, 0.5, 0.5).await;
+        s.record_bond_only().await;
+        s.event_under_way(EventKind::ShortTrip).await;
+        let mock = mock_llm(WARM, Some(TRAVEL_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+
+        for _ in 0..3 {
+            s.turn(&state, SEEN).await;
+        }
+        assert!(s.kinds().await.is_empty());
+    }
+
+    /// The trip keeps her romantic asks open.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_trip_together_leaves_a_romantic_ask_open(pool: PgPool) {
+        let s = scene_with_lines(&pool, 0.5, 0.5).await;
+        s.record_scopes("full", AffinityScope::chemistry()).await;
+        s.event_under_way(EventKind::TravelingTogether).await;
+        let mock = mock_llm(WARM, Some(SLEEP_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+
+        for _ in 0..3 {
+            s.turn(&state, SEEN).await;
+        }
+        assert_eq!(s.kinds().await, vec![pending("sleep_together")]);
+    }
+
+    /// She does not ask for space while they are away together.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn she_does_not_ask_for_space_on_a_trip_together(pool: PgPool) {
+        let s = scene(&pool).await;
+        s.event_under_way(EventKind::TravelingTogether).await;
+        let mock = mock_llm(LOW_PATIENCE, Some(ASK_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+
+        for _ in 0..3 {
+            s.turn(&state, SEEN).await;
+        }
+        assert!(s.choices().await.is_empty());
     }
 }

@@ -28,6 +28,8 @@ pub enum LifeChoiceKind {
     SleepTogether,
     /// She proposes.
     Propose,
+    /// She suggests going away together.
+    TravelTogether,
 }
 
 impl LifeChoiceKind {
@@ -37,6 +39,7 @@ impl LifeChoiceKind {
             Self::AskForSpace => "ask_for_space",
             Self::SleepTogether => "sleep_together",
             Self::Propose => "propose",
+            Self::TravelTogether => "travel_together",
         }
     }
 
@@ -45,6 +48,7 @@ impl LifeChoiceKind {
             "ask_for_space" => Some(Self::AskForSpace),
             "sleep_together" => Some(Self::SleepTogether),
             "propose" => Some(Self::Propose),
+            "travel_together" => Some(Self::TravelTogether),
             _ => None,
         }
     }
@@ -60,7 +64,7 @@ const COLUMNS: &str = "id, session_id, kind, status, tier_gap, asked_at, resolve
                        message_id, event_id";
 
 /// One choice. `message_id` is the message that asked it, `event_id` the
-/// separation an accept wrote; either is `None` once its row is gone, and
+/// separation or trip an accept wrote; either is `None` once its row is gone, and
 /// `event_id` on every path but accept.
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct LifeChoiceRecord {
@@ -276,8 +280,10 @@ impl LifeChoiceRepo<'_> {
 
     /// Where the session's next streak of judged turns starts: the latest of
     /// its newest choice's `asked_at`, its `resolved_at` and, for an accepted
-    /// one, the end of the separation it wrote (`persona_events.ends_at`,
-    /// through `event_id`). Turns up to that instant belong to the episode,
+    /// `ask_for_space`, the end of the separation it wrote
+    /// (`persona_events.ends_at`, through `event_id`). An accepted trip anchors
+    /// at its answer, so a new streak can build while they are away. Turns up
+    /// to that instant belong to the episode,
     /// not to the streak. `None` when the session was never asked; a choice
     /// whose separation row is gone anchors at its answer.
     pub async fn streak_anchor(
@@ -330,6 +336,26 @@ impl LifeChoiceRepo<'_> {
         )
         .bind(session_id)
         .bind(kind.as_str())
+        .fetch_one(self.pool)
+        .await
+    }
+
+    /// Whether `kind` was `accepted` or `ignored` in the session after `since`.
+    pub async fn settled_since(
+        &self,
+        session_id: Uuid,
+        kind: LifeChoiceKind,
+        since: DateTime<Utc>,
+    ) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM engine.life_choices \
+                             WHERE session_id = $1 AND kind = $2 \
+                               AND status IN ('accepted', 'ignored') \
+                               AND resolved_at > $3)",
+        )
+        .bind(session_id)
+        .bind(kind.as_str())
+        .bind(since)
         .fetch_one(self.pool)
         .await
     }
@@ -387,7 +413,8 @@ async fn streak_anchor_on<'e, E: sqlx::PgExecutor<'e>>(
     sqlx::query_scalar(
         "SELECT GREATEST(c.asked_at, c.resolved_at, e.ends_at) \
            FROM engine.life_choices c \
-           LEFT JOIN engine.persona_events e ON e.id = c.event_id \
+           LEFT JOIN engine.persona_events e \
+                  ON e.id = c.event_id AND c.kind = 'ask_for_space' \
           WHERE c.session_id = $1 \
           ORDER BY c.asked_at DESC LIMIT 1",
     )
@@ -479,6 +506,7 @@ mod tests {
             (LifeChoiceKind::AskForSpace, "ask_for_space", false),
             (LifeChoiceKind::SleepTogether, "sleep_together", true),
             (LifeChoiceKind::Propose, "propose", true),
+            (LifeChoiceKind::TravelTogether, "travel_together", false),
         ] {
             assert_eq!(kind.as_str(), wire);
             assert_eq!(LifeChoiceKind::parse(wire), Some(kind));
@@ -525,6 +553,86 @@ mod tests {
             .expect("written");
         assert_eq!(space.kind, "ask_for_space");
         assert_eq!(space.tier_gap, Some(3));
+    }
+
+    /// An answered choice of `kind`, resolved at `resolved_at`.
+    async fn seed_resolved(
+        pool: &PgPool,
+        session: Uuid,
+        kind: LifeChoiceKind,
+        status: &str,
+        resolved_at: DateTime<Utc>,
+    ) {
+        sqlx::query(
+            "INSERT INTO engine.life_choices (session_id, kind, status, asked_at, resolved_at) \
+             VALUES ($1, $2, $3, $4, $4)",
+        )
+        .bind(session)
+        .bind(kind.as_str())
+        .bind(status)
+        .bind(resolved_at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn settled_since_counts_accepts_and_ignores_inside_the_window(pool: PgPool) {
+        let now: DateTime<Utc> = "2026-11-10T12:00:00Z".parse().unwrap();
+        let since = now - Duration::days(14);
+        let travel = LifeChoiceKind::TravelTogether;
+        for (kind, status, days_ago, want) in [
+            (travel, "accepted", 13, true),
+            (travel, "ignored", 13, true),
+            (travel, "accepted", 15, false),
+            (travel, "declined", 1, false),
+            (LifeChoiceKind::Propose, "accepted", 1, false),
+        ] {
+            let (_, _, session) = instance_and_session(&pool).await;
+            seed_resolved(&pool, session, kind, status, now - Duration::days(days_ago)).await;
+            let got = LifeChoiceRepo { pool: &pool }
+                .settled_since(session, travel, since)
+                .await
+                .unwrap();
+            assert_eq!(got, want, "{kind:?} {status} {days_ago}d ago");
+        }
+    }
+
+    /// A trip does not hold the streak back: only a separation owns the time
+    /// until its event ends.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_accepted_trip_anchors_at_its_answer(pool: PgPool) {
+        let (_, instance, session) = instance_and_session(&pool).await;
+        let resolved: DateTime<Utc> = "2026-11-10T12:00:00Z".parse().unwrap();
+        let event: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_events \
+                 (instance_id, session_id, event_key, kind, started_at, ends_at) \
+             VALUES ($1, $2, 'trip', 'traveling_together', $3, $3 + interval '48 hours') \
+             RETURNING id",
+        )
+        .bind(instance)
+        .bind(session)
+        .bind(resolved)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.life_choices \
+                 (session_id, kind, status, asked_at, resolved_at, event_id) \
+             VALUES ($1, 'travel_together', 'accepted', $2 - interval '1 hour', $2, $3)",
+        )
+        .bind(session)
+        .bind(resolved)
+        .bind(event)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let anchor = LifeChoiceRepo { pool: &pool }
+            .streak_anchor(session)
+            .await
+            .unwrap();
+        assert_eq!(anchor, Some(resolved));
     }
 
     /// A choice of `kind` in `status` for `session`, written straight into the table.
