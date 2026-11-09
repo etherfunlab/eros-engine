@@ -122,7 +122,9 @@ pub(crate) enum LifeChoiceCue {
     Goodbye { hours: i64 },
     /// Ask-for-space declined.
     Hurt,
-    /// A romantic kind answered.
+    /// `travel_together` accepted: they are away together for `hours`.
+    TravelAgreed { hours: i64 },
+    /// A romantic kind answered, or `travel_together` declined.
     Answered {
         kind: LifeChoiceKind,
         accepted: bool,
@@ -145,6 +147,14 @@ impl LifeChoiceCue {
                 kind: LifeChoiceKind::Propose,
                 ..
             } => "（你越来越确定想和对方共度一生。你决定郑重地向对方求婚，希望对方给你一个答复。）".into(),
+            Self::Ask {
+                kind: LifeChoiceKind::TravelTogether,
+                ..
+            } => "（你们最近相处得很舒服，你很想和对方一起出去走走。你决定主动开口，提议一起去旅行，希望对方给你一个答复。）".into(),
+            Self::TravelAgreed { hours } => format!(
+                "（对方答应了和你一起去旅行，你们接下来要一起玩 {}。）",
+                crate::prompt::span_text(chrono::Duration::hours(hours))
+            ),
             Self::Goodbye { hours } => format!(
                 "（对方同意了你提出的分开请求，接下来 {hours} 小时你们不联系。你跟对方道别。）"
             ),
@@ -165,6 +175,14 @@ impl LifeChoiceCue {
                 kind: LifeChoiceKind::Propose,
                 accepted: false,
             } => "（对方拒绝了你的求婚，你心里很难受。）".into(),
+            Self::Answered {
+                kind: LifeChoiceKind::TravelTogether,
+                accepted: true,
+            } => unreachable!("an accepted trip is TravelAgreed"),
+            Self::Answered {
+                kind: LifeChoiceKind::TravelTogether,
+                accepted: false,
+            } => "（对方没有答应和你一起去旅行，你有点失落。）".into(),
             Self::Answered {
                 kind: LifeChoiceKind::AskForSpace,
                 ..
@@ -313,7 +331,7 @@ fn kind_cue(
         OutShopping if traits.female => "（你接下来要出门逛街，这段时间顾不上看手机。）".into(),
         OutShopping => "（你正在外面逛街。）".into(),
         AwayFromPhone | Asleep | BrosGathering | SisGathering | HavingSex | TakingSpace
-        | FellOut => {
+        | FellOut | TravelingTogether => {
             unreachable!("{kind:?} is never told")
         }
         Sick => format!("（你生病了，大概要 {span}才会好。）"),
@@ -715,7 +733,10 @@ pub(crate) async fn greet(
         // No key to dedupe on: the row yields only to a message that landed
         // at or after `since`.
         Occasion::LifeChoice(
-            LifeChoiceCue::Goodbye { .. } | LifeChoiceCue::Hurt | LifeChoiceCue::Answered { .. },
+            LifeChoiceCue::Goodbye { .. }
+            | LifeChoiceCue::Hurt
+            | LifeChoiceCue::TravelAgreed { .. }
+            | LifeChoiceCue::Answered { .. },
         ) => Ok(chat_repo
             .insert_open_message(g.session_id, g.since, &row)
             .await?),

@@ -103,6 +103,7 @@ pub enum EventKindDto {
     HometownVisit,
     TakingSpace,
     FellOut,
+    TravelingTogether,
     Strip,
 }
 
@@ -179,6 +180,7 @@ impl From<EventKindDto> for EventKind {
             EventKindDto::HometownVisit => EventKind::HometownVisit,
             EventKindDto::TakingSpace => EventKind::TakingSpace,
             EventKindDto::FellOut => EventKind::FellOut,
+            EventKindDto::TravelingTogether => EventKind::TravelingTogether,
             EventKindDto::Strip => EventKind::Strip,
         }
     }
@@ -241,6 +243,7 @@ impl From<EventKind> for EventKindDto {
             EventKind::HometownVisit => EventKindDto::HometownVisit,
             EventKind::TakingSpace => EventKindDto::TakingSpace,
             EventKind::FellOut => EventKindDto::FellOut,
+            EventKind::TravelingTogether => EventKindDto::TravelingTogether,
             EventKind::Strip => EventKindDto::Strip,
         }
     }

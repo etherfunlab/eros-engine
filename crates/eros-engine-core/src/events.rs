@@ -113,6 +113,9 @@ pub enum EventKind {
     HometownVisit,
     TakingSpace,
     FellOut,
+    /// She and the user are away together: written when the user accepts her
+    /// `travel_together` ask.
+    TravelingTogether,
     /// She undresses for the user and sends a picture (spec
     /// 2026-11-08-strip-and-world-setting-design.md §3).
     Strip,
@@ -177,7 +180,11 @@ impl EventKind {
     ];
 
     /// Kinds the writers place directly, never drawn: parsed and stored, not in `ALL`.
-    pub const SPECIAL: [EventKind; 2] = [EventKind::TakingSpace, EventKind::FellOut];
+    pub const SPECIAL: [EventKind; 3] = [
+        EventKind::TakingSpace,
+        EventKind::FellOut,
+        EventKind::TravelingTogether,
+    ];
 
     /// The stored and wire value.
     pub fn as_str(self) -> &'static str {
@@ -236,6 +243,7 @@ impl EventKind {
             EventKind::HometownVisit => "hometown_visit",
             EventKind::TakingSpace => "taking_space",
             EventKind::FellOut => "fell_out",
+            EventKind::TravelingTogether => "traveling_together",
             EventKind::Strip => "strip",
         }
     }
@@ -263,7 +271,9 @@ impl EventKind {
                 EventCategory::Mid
             }
             Sick | Period | Hospitalized | PostSurgery => EventCategory::Body,
-            BusinessTrip | ShortTrip | LongTrip | HometownVisit => EventCategory::Trip,
+            BusinessTrip | ShortTrip | LongTrip | HometownVisit | TravelingTogether => {
+                EventCategory::Trip
+            }
         }
     }
 
@@ -408,6 +418,7 @@ fn rule(kind: EventKind) -> Rule {
         HometownVisit => (1.0, 0, Lasts::Hours(3 * DAY, 3 * DAY)),
         TakingSpace => (0.0, 0, Lasts::Hours(12, 24)),
         FellOut => (0.0, 0, Lasts::Hours(1, 1)),
+        TravelingTogether => (0.0, 0, Lasts::Hours(2 * DAY, 3 * DAY)),
         Strip => (1.0, 48, Lasts::Minutes(30)),
     };
     Rule {
@@ -589,7 +600,7 @@ fn follows(prior: EventKind, kind: EventKind) -> bool {
             | (HavingSex, PregnancyScare)
             | (BusinessTrip, OnTheRoad | OnTheWay | Busy | TempWork)
             | (
-                ShortTrip | LongTrip | HometownVisit,
+                ShortTrip | LongTrip | HometownVisit | TravelingTogether,
                 OnTheRoad | AdmiringScenery | TakingSelfie
             )
             | (HometownVisit, BrosGathering | SisGathering)
@@ -684,6 +695,8 @@ fn rules_out(background: EventKind, kind: EventKind) -> bool {
                 | HavingSex
         ),
         Period => kind.is_false_alarm(),
+        // She is with the user: nothing takes her out of reach.
+        TravelingTogether => kind.may_be_offline(),
         _ => false,
     }
 }
@@ -835,7 +848,8 @@ fn pick<T: Copy>(weighted: &[(T, f64)], roll: f64) -> Option<T> {
     weighted.last().map(|(item, _)| *item)
 }
 
-fn lasts(kind: EventKind, roll: f64) -> Duration {
+/// How long `kind` lasts for a uniform `roll` in [0, 1).
+pub fn lasts(kind: EventKind, roll: f64) -> Duration {
     match rule(kind).lasts {
         Lasts::Minutes(m) => Duration::minutes(m),
         Lasts::Hours(lo, hi) => {
@@ -870,6 +884,7 @@ pub fn lookback() -> Duration {
 pub fn background_kinds() -> Vec<EventKind> {
     EventKind::ALL
         .into_iter()
+        .chain(EventKind::SPECIAL)
         .filter(|k| k.is_background())
         .collect()
 }
@@ -891,10 +906,10 @@ pub fn offline_kinds(persona: &PersonaTraits) -> Vec<EventKind> {
 /// away only to someone she is close to, and so does a female persona's
 /// `out_shopping` (spec 2026-10-19-life-events-shopping-gatherings-and-ask-for-
 /// space-design.md §2.1); never `asleep`, `away_from_phone`, a gathering, or
-/// the storage-only `taking_space` and `fell_out`.
+/// the storage-only `taking_space`, `fell_out` and `traveling_together`.
 pub fn is_told(kind: EventKind, rung: u8, persona: &PersonaTraits) -> bool {
     match kind {
-        EventKind::TakingSpace | EventKind::FellOut => false,
+        EventKind::TakingSpace | EventKind::FellOut | EventKind::TravelingTogether => false,
         EventKind::Busy | EventKind::InBattle => rung >= CONFIDE_MIN_RUNG,
         EventKind::OutShopping if persona.female => rung >= CONFIDE_MIN_RUNG,
         k => !k.is_offline(persona),
@@ -1424,7 +1439,8 @@ mod tests {
                 BusinessTrip,
                 ShortTrip,
                 LongTrip,
-                HometownVisit
+                HometownVisit,
+                TravelingTogether
             ]
         );
     }
@@ -2202,6 +2218,9 @@ mod tests {
             (ShortTrip, OnTheRoad),
             (LongTrip, AdmiringScenery),
             (HometownVisit, TakingSelfie),
+            (TravelingTogether, OnTheRoad),
+            (TravelingTogether, AdmiringScenery),
+            (TravelingTogether, TakingSelfie),
             (HometownVisit, BrosGathering),
             (HometownVisit, SisGathering),
             (Hospitalized, Reading),
@@ -2365,6 +2384,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn traveling_together_is_a_placed_background_she_does_not_tell() {
+        let t = TravelingTogether;
+        assert!(EventKind::SPECIAL.contains(&t) && !EventKind::ALL.contains(&t));
+        assert_eq!(EventKind::parse("traveling_together"), Some(t));
+        assert_eq!(t.category(), EventCategory::Trip);
+        assert!(!t.may_be_offline());
+        for rung in 1..=3 {
+            assert!(!is_told(t, rung, &PersonaTraits::default()), "rung {rung}");
+        }
+    }
+
+    #[test]
+    fn a_trip_together_lasts_two_to_three_days() {
+        assert_eq!(lasts(TravelingTogether, 0.0), Duration::hours(48));
+        assert_eq!(lasts(TravelingTogether, 1.0), Duration::hours(72));
+    }
+
+    /// She is with the user, so nothing may take her out of reach.
+    #[test]
+    fn no_offline_kind_is_drawn_on_a_trip_together() {
+        let persona = PersonaTraits::default();
+        let at = |bg| {
+            pick_with(
+                &persona,
+                None,
+                3,
+                &[past(bg, 1, 48)],
+                &[Asleep],
+                rolls(0.0, 0.0),
+            )
+        };
+        assert_eq!(at(ShortTrip), Some(Asleep), "alone on a trip she can sleep");
+        assert_eq!(at(TravelingTogether), None);
     }
 
     /// Draw order is `ALL` order: Reading 2, WantToGoOut 1, WantToGoHome 1.

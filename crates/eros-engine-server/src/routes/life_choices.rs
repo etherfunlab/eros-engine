@@ -9,6 +9,7 @@
 //!   one tier.
 //! - `propose`: an accept changes nothing; a decline drops both lines one
 //!   tier.
+//! - `travel_together`: an accept starts a trip; a decline changes nothing.
 //!
 //! The persona answers in one proactive message, and the cost is applied with
 //! the answer, not with the message (spec
@@ -26,7 +27,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use eros_engine_core::affinity::{Affinity, AffinityLine};
-use eros_engine_core::events::EventKind;
+use eros_engine_core::events::{self, EventKind};
 use eros_engine_core::persona::CompanionPersona;
 use eros_engine_core::scope::MemoryScope;
 use eros_engine_store::affinity::AffinityRepo;
@@ -97,17 +98,18 @@ pub struct LifeChoiceRespondResponse {
     /// The choice's new status: `accepted` or `declined`.
     pub status: String,
     /// What she says back: for `ask_for_space`, the goodbye after an accept
-    /// and the hurt reply after a decline; for `sleep_together` and `propose`,
-    /// her answer to the user's yes or no. `null` when the generation failed,
+    /// and the hurt reply after a decline; for the other kinds, her answer to
+    /// the user's yes or no. `null` when the generation failed,
     /// came back blank or a newer message landed first; the answer and its
     /// costs stand either way.
     pub message: Option<GreetingDto>,
-    /// The relationship after the answer: dropped for any decline and for an
-    /// `ask_for_space` accept, as it stands for a `sleep_together` or
-    /// `propose` accept.
+    /// The relationship after the answer: dropped for an `ask_for_space`
+    /// accept and for a decline of any kind but `travel_together`, as it
+    /// stands otherwise.
     pub affinity: AffinitySnapshot,
-    /// The separation an `ask_for_space` accept started. `null` after any
-    /// decline and for every `sleep_together` and `propose` answer.
+    /// The separation an `ask_for_space` accept started, or the trip a
+    /// `travel_together` accept started. `null` after any decline and for
+    /// every `sleep_together` and `propose` answer.
     pub event: Option<EventView>,
 }
 
@@ -117,7 +119,7 @@ pub struct LifeChoiceRespondResponse {
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct LifeChoiceReceiptDto {
     pub id: Uuid,
-    /// `ask_for_space`, `sleep_together` or `propose`.
+    /// `ask_for_space`, `sleep_together`, `propose` or `travel_together`.
     pub kind: String,
     /// `pending`, `accepted`, `declined`, `ignored`, or `expired` for a
     /// `pending` choice past its 24 hours.
@@ -201,10 +203,15 @@ fn invalid_payload(message: String) -> AppError {
 /// `propose`: an accept makes the choice `accepted` and costs nothing. A
 /// decline makes it `declined` and drops bond and chemistry one tier each.
 ///
+/// `travel_together`: an accept makes the choice `accepted` and starts a
+/// `traveling_together` background of two to three days now; she keeps
+/// replying, and an incident under way ends. A decline makes it `declined`.
+/// Neither costs anything.
+///
 /// Either way she then answers in one proactive message, persisted like any
 /// reply and returned; if that generation fails the call still succeeds with
 /// `message: null`. `event` is `null` for every answer but an `ask_for_space`
-/// accept.
+/// or `travel_together` accept.
 ///
 /// `409` when the choice is no longer pending: answered already (an ordinary
 /// message from the user counts, and the first writer wins), or lapsed 24
@@ -287,20 +294,31 @@ pub(crate) async fn respond_at(
     let Some(choice) = LifeChoiceRepo::resolve_in_tx(&mut tx, choice_id, status, now).await? else {
         return Err(closed());
     };
-    // Only asking for space starts a separation, and only it carries a gap.
-    let separation = match (kind, req.response) {
-        (LifeChoiceKind::AskForSpace, LifeChoiceAnswer::Accept) => {
-            let lasts = Duration::hours(
+    // The event an accept starts: a separation, whose length is the gap she
+    // asked at, or a trip. A running incident ends; a background keeps going.
+    let placed = match (kind, req.response) {
+        (LifeChoiceKind::AskForSpace, LifeChoiceAnswer::Accept) => Some((
+            EventKind::TakingSpace,
+            Duration::hours(
                 SEPARATION_HOURS_PER_TIER
                     * i64::from(choice.tier_gap.expect("ask_for_space carries a gap (0083)")),
-            );
+            ),
+        )),
+        (LifeChoiceKind::TravelTogether, LifeChoiceAnswer::Accept) => Some((
+            EventKind::TravelingTogether,
+            events::lasts(EventKind::TravelingTogether, rand::random()),
+        )),
+        _ => None,
+    };
+    let started = match placed {
+        Some((event_kind, lasts)) => {
             let event = EventRepo::insert_preempting_in_tx(
                 &mut tx,
                 &NewEvent {
                     instance_id,
                     session_id,
-                    event_key: &format!("life_choice:{}:taking_space", choice.id),
-                    kind: EventKind::TakingSpace,
+                    event_key: &format!("life_choice:{}:{}", choice.id, event_kind.as_str()),
+                    kind: event_kind,
                     started_at: now,
                     ends_at: now + lasts,
                 },
@@ -309,11 +327,12 @@ pub(crate) async fn respond_at(
             LifeChoiceRepo::set_event_in_tx(&mut tx, choice.id, event.id).await?;
             Some((event, lasts))
         }
-        _ => None,
+        None => None,
     };
     // The lines a decline costs; a romantic accept costs none and drops nothing.
     let lines: Option<&[AffinityLine]> = match (kind, req.response) {
         (LifeChoiceKind::SleepTogether | LifeChoiceKind::Propose, LifeChoiceAnswer::Accept) => None,
+        (LifeChoiceKind::TravelTogether, _) => None,
         (LifeChoiceKind::SleepTogether, LifeChoiceAnswer::Decline) => {
             Some(&[AffinityLine::Chemistry])
         }
@@ -356,11 +375,14 @@ pub(crate) async fn respond_at(
     // Her reply is the last step and cannot undo the answer: whatever goes
     // wrong here (the provider, a blank reply, a newer message) leaves the
     // resolution, the separation and the drop in place, and she says nothing.
-    let cue = match (kind, &separation) {
+    let cue = match (kind, &started) {
         (LifeChoiceKind::AskForSpace, Some((_, lasts))) => LifeChoiceCue::Goodbye {
             hours: lasts.num_hours(),
         },
         (LifeChoiceKind::AskForSpace, None) => LifeChoiceCue::Hurt,
+        (LifeChoiceKind::TravelTogether, Some((_, lasts))) => LifeChoiceCue::TravelAgreed {
+            hours: lasts.num_hours(),
+        },
         (kind, _) => LifeChoiceCue::Answered {
             kind,
             accepted: req.response == LifeChoiceAnswer::Accept,
@@ -392,7 +414,7 @@ pub(crate) async fn respond_at(
         status: status.into(),
         message,
         affinity: AffinitySnapshot::from(affinity),
-        event: separation.map(|(e, _)| EventView::new(&e, &traits)),
+        event: started.map(|(e, _)| EventView::new(&e, &traits)),
     })
 }
 
@@ -961,6 +983,74 @@ mod tests {
         assert_eq!(c.len(), 2);
         assert_eq!(last_user_turn(&c[0]), json!(SLEEP_ACCEPT_CUE));
         assert_eq!(last_user_turn(&c[1]), json!(PROPOSE_ACCEPT_CUE));
+    }
+
+    /// An accepted trip starts now, lasts two to three days and costs nothing.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn accepting_a_trip_starts_it_and_costs_nothing(pool: PgPool) {
+        let mock = companion_mock(Some("太好了！")).await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let s = scene(&pool).await;
+        let choice = s.ask_kind("travel_together", recent(30)).await;
+        let axes = s.axes().await;
+        let now = recent(0);
+
+        let out = s
+            .respond(&state, choice, LifeChoiceAnswer::Accept, now)
+            .await
+            .unwrap();
+
+        assert_eq!(out.status, "accepted");
+        let event = serde_json::to_value(out.event.expect("the trip")).unwrap();
+        assert_eq!(event["kind"], json!("traveling_together"));
+        assert_eq!(event["offline"], json!(false));
+        let events = s.events().await;
+        assert_eq!(events.len(), 1);
+        let (id, kind, key, _, started_at, ends_at, message_id) = events[0].clone();
+        assert_eq!(kind, "traveling_together");
+        assert_eq!(key, format!("life_choice:{choice}:traveling_together"));
+        assert_eq!(started_at, now);
+        assert_eq!(message_id, None);
+        let hours = (ends_at - started_at).num_hours();
+        assert!((48..=72).contains(&hours), "{hours} hours");
+        assert_eq!(
+            s.row(choice).await,
+            ("accepted".into(), Some(now), Some(id))
+        );
+
+        assert_eq!(s.axes().await, axes);
+        assert_eq!(s.tiers().await, (3, 4));
+        assert!(s.drops().await.is_empty());
+
+        assert_eq!(out.message.expect("a reply").content, "太好了！");
+        let span = crate::prompt::span_text(Duration::hours(hours));
+        let cue = last_user_turn(&calls(&mock).await[0]);
+        assert!(cue.as_str().unwrap().contains(&span), "{cue}");
+    }
+
+    /// Turning a trip down costs nothing: she is only disappointed.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn declining_a_trip_costs_nothing(pool: PgPool) {
+        let mock = companion_mock(Some("好吧。")).await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let s = scene(&pool).await;
+        let choice = s.ask_kind("travel_together", recent(30)).await;
+        let axes = s.axes().await;
+        let now = recent(0);
+
+        let out = s
+            .respond(&state, choice, LifeChoiceAnswer::Decline, now)
+            .await
+            .unwrap();
+
+        assert_eq!(out.status, "declined");
+        assert!(out.event.is_none());
+        assert!(s.events().await.is_empty());
+        assert_eq!(s.row(choice).await, ("declined".into(), Some(now), None));
+        assert_eq!(s.axes().await, axes);
+        assert_eq!(s.tiers().await, (3, 4));
+        assert!(s.drops().await.is_empty());
+        assert_eq!(out.message.expect("a reply").content, "好吧。");
     }
 
     /// Declining the invitation costs chemistry one tier and nothing else:
