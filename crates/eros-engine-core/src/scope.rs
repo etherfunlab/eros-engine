@@ -322,11 +322,12 @@ impl AffinityScope {
     }
 }
 
-/// Whether the caller's scopes mark the pair as romantically compatible
-/// (spec 2026-10-30 §4.1): relationship memory on, and at least one
-/// chemistry axis (trust / intrigue / patience) in scope.
-pub fn romance_compatible(memory: MemoryScope, affinity: AffinityScope) -> bool {
-    memory.resolve().2 && affinity.any_chemistry_axis()
+/// Whether the caller's scope marks the pair as romantically compatible: at
+/// least one chemistry axis (trust / intrigue / patience) in scope.
+/// `memory_scope` plays no part: it says what is recalled for the pair, not
+/// whether romance is possible.
+pub fn romance_compatible(affinity: AffinityScope) -> bool {
+    affinity.any_chemistry_axis()
 }
 
 fn clamp01(x: f64) -> f64 {
@@ -610,31 +611,17 @@ mod tests {
 
     #[test]
     fn romance_compatible_truth_table() {
-        use MemoryScope::*;
         let cases = [
-            (Full, AffinityScope::chemistry(), true),
-            (NeutralAndRelationship, AffinityScope::full(), true),
-            (NeutralOnly, AffinityScope::bond(), false),
-            (NeutralAndRelationship, AffinityScope::bond(), false),
-            (NeutralOnly, AffinityScope::full(), false),
-            (RelationshipOnly, AffinityScope::full(), true),
-            (NeutralAndRelationship, AffinityScope::default(), false), // engine defaults
-            (
-                Full,
-                AffinityScope::from_axes(&[AffinityAxis::Patience]),
-                true,
-            ),
-            (
-                Full,
-                AffinityScope::from_axes(&[AffinityAxis::Warmth]),
-                false,
-            ),
-            (Full, AffinityScope::none(), false),
-            (None, AffinityScope::full(), false),
-            (InsightsOnly, AffinityScope::full(), false),
+            (AffinityScope::chemistry(), true),
+            (AffinityScope::full(), true),
+            (AffinityScope::from_axes(&[AffinityAxis::Patience]), true),
+            (AffinityScope::bond(), false),
+            (AffinityScope::default(), false), // engine defaults
+            (AffinityScope::from_axes(&[AffinityAxis::Warmth]), false),
+            (AffinityScope::none(), false),
         ];
-        for (m, a, want) in cases {
-            assert_eq!(romance_compatible(m, a), want, "{m:?} {a:?}");
+        for (a, want) in cases {
+            assert_eq!(romance_compatible(a), want, "{a:?}");
         }
     }
 }
