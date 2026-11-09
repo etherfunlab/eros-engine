@@ -326,7 +326,7 @@ weight and never lifts a gate.
 |---|---|
 | `ex_message`, `breakup` | intimacy rung 2 or higher |
 | `sudden_desire` | intimacy rung 3 |
-| `strip` | intimacy rung 3, and the session's newest recorded `memory_scope` and `affinity_scope` are romance-compatible (relationship memory on, a chemistry axis in scope); none recorded is not compatible |
+| `strip` | intimacy rung 3, and the session's newest recorded `affinity_scope` is romance-compatible (a chemistry axis in scope); none recorded is not compatible |
 | `period`, `saw_bag`, `saw_clothes` | the persona's `art_metadata.gender` is `"female"` |
 | `period_scare` | the persona's `art_metadata.gender` is `"female"`, and intimacy rung 2 or higher |
 | `pregnancy_scare` | the persona's `art_metadata.gender` is `"female"`, and intimacy rung 3 |
@@ -1073,7 +1073,7 @@ space: they fire when the relationship is close and she has been warm and patien
 decline costs anything.
 
 **Who qualifies.** A pair the caller has marked romantically compatible through the
-`memory_scope` and `affinity_scope` it sends (the criterion is in the [API
+`affinity_scope` it sends (the criterion is in the [API
 reference](api-reference.md#post-v2compsessionsession_idlife-choiceschoice_id)). A pair that
 does not meet it, or has no recorded scopes, is never asked. The engine takes no gender or
 orientation and decides nothing about who is attracted to whom.

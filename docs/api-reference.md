@@ -323,8 +323,8 @@ into the prompt. Accepted values:
 
 > **Since 1.3.0 the field does not steer scoring.** The 3.1 write-side
 > steering (1.2.1) is retired: `affinity_scope` gates prompt injection and
-> `length_score` and has no effect on scoring. With `memory_scope`, the scopes a
-> turn records also decide whether the pair can be asked a romantic life choice
+> `length_score` and has no effect on scoring. The `affinity_scope` a turn
+> records also decides whether the pair can be asked a romantic life choice
 > ([romantic compatibility](#post-v2compsessionsession_idlife-choiceschoice_id)).
 > See [Affinity model → Scope steering: retired](affinity-model.md#affinityrs-vs-scopers).
 
@@ -460,7 +460,7 @@ A turn is a user message of the text session; product-QA messages and voice call
 
 **Social actions.** For `bluff`, `threaten` and `trick` the response says whether she falls for it: `accept` is 信了, 被吓到了 or 上当了, and `refuse` is 没信, 没吃这一套 or 识破了. As for every action, an undecided response is `accept`. Seeing through one costs nothing; the affinity judge grades the turn as it grades any other.
 
-**Strip.** `strip` is the user undressing her, and only a romance-compatible pair can have it accepted: relationship memory on in `memory_scope` and a chemistry axis in `affinity_scope` on this turn. Any other pair's `strip` is refused before the judge runs, whatever it answers and with or without the LLM judge, and drops the chemistry line a tier like any refused physical action. An accepted `strip` undresses her this turn: her clothing reads 衣服被对方脱掉了, or 「{outfit}」被对方脱掉了 over a named `outfit`, in her reply and in the picture. With image capability it comes back as her picture, like a photo (below).
+**Strip.** `strip` is the user undressing her, and only a romance-compatible pair can have it accepted: a chemistry axis in `affinity_scope` on this turn, whatever `memory_scope` says. Any other pair's `strip` is refused before the judge runs, whatever it answers and with or without the LLM judge, and drops the chemistry line a tier like any refused physical action. An accepted `strip` undresses her this turn: her clothing reads 衣服被对方脱掉了, or 「{outfit}」被对方脱掉了 over a named `outfit`, in her reply and in the picture. With image capability it comes back as her picture, like a photo (below).
 
 **A photo she lets you take.** An accepted `photo` on a turn whose request carries `image`, in a deployment with `[tasks.chat_image_prompt_compose]` configured, is answered as `reply_text_image`: her words, then one `image_request` built on her face reference, composed from the scene. This holds with or without the LLM judge. An accepted `strip` is answered the same way. A refused `photo` or `strip`, or one without that image capability, is a text reply, even when the judge proposed a picture. `image.force = true` still makes the turn `reply_image`, and on a refusal the picture follows the refusal.
 
@@ -1064,7 +1064,7 @@ The draw:
 - **Closeness gates.** `ex_message` and `breakup` are not drawn for someone she
   barely knows (intimacy rung 2 and up); `sudden_desire` only at the closest
   rung (3), and `strip` at rung 3 only when the session's newest recorded
-  `memory_scope` and `affinity_scope` are romance-compatible (none recorded: not drawn). `period` is drawn only for a persona whose `art_metadata.gender` is
+  `affinity_scope` is romance-compatible (none recorded: not drawn). `period` is drawn only for a persona whose `art_metadata.gender` is
   `"female"`. `period_scare` (rung 2 and up) and `pregnancy_scare` (rung 3) are
   also drawn only for such a persona, and so are `saw_bag` and `saw_clothes`;
   from rung 2 she says she wants what she found, in her `tip_personality`'s
@@ -1246,18 +1246,15 @@ and what each path costs, is in
 [the romantic choices](life-events-needs.md#the-romantic-choices).
 
 **Romantic compatibility.** She asks `sleep_together` or `propose` only of a
-pair the caller's scopes mark as romantically compatible: relationship memory
-is on (`memory_scope` is `full`, `neutral_and_relationship` or
-`relationship_only`) and at least one of trust, intrigue or patience is in
-`affinity_scope` (`"chemistry"`, `"full"`, `"bond_and_chemistry"`, or an axis
-array naming one of the three). `memory_scope: "full"` with
-`affinity_scope: "chemistry"` qualifies, and so does
-`memory_scope: "neutral_and_relationship"` with `affinity_scope: "full"`. The
-defaults (`neutral_and_relationship` with `bond`) never qualify. The engine
-reads the pair from the scopes recorded on the session's newest assistant
-reply that carries both, skipping her own life-choice messages; with no such
-reply, or a value that does not parse, the pair is not compatible. A caller
-makes a pair eligible by sending scopes that meet this criterion on its turns.
+pair the caller's scope marks as romantically compatible: at least one of
+trust, intrigue or patience is in `affinity_scope` (`"chemistry"`, `"full"`,
+`"bond_and_chemistry"`, or an axis array naming one of the three), whatever
+`memory_scope` says. `"bond"`, the default, never qualifies. The engine reads
+the scope recorded on the session's newest assistant reply that carries both
+`memory_scope` and `affinity_scope`, skipping her own life-choice messages;
+with no such reply, or a value that does not parse, the pair is not
+compatible. A caller makes a pair eligible by sending a scope that meets this
+criterion on its turns.
 The engine neither takes nor stores the user's gender or orientation.
 
 A client learns of the choice from the `life_choice` field of

@@ -619,7 +619,7 @@ BYOK hop 使用其请求中 `byok` 块的 `output_regex` 规则，而不是这�
 
 只要还有被接受的 give 在起作用，引擎还会在 `[用户动作]` 之前加一行 `[身体状态]`，写明角色身上带着的余效（例如 `[身体状态] 3 杯「威士忌」，微醺，还在往上走`；见[接口参考](api-reference.zh.md#post-compchatsession_idmessagestream)）；没有时这一行不出现。
 
-**give 时掷的那一次。** 一轮的 `give` 是 `cigarette`、`alcohol`、`herb`、`coffee` 或 `cuisine`，而角色对应的 `art_metadata` 键（`smoking`、`alcoholic`、`drug`、`coffee`、`gluttony`）为 `false` 时，引擎在判官运行之前掷一次。三次里有一次什么都不变。其余情况 `[用户动作]` 一行末尾加上 `，这次你不会收下`（例如 `[用户动作] 对方递给你 1 支烟，这次你不会收下`），判官就按拒收来写 `inner_state`，而不管它的 `action_response` 怎么填，生效的回应都是 `refuse`；规则引擎的接受同样变成 `refuse`。这一行只陈述结果，不给理由。审计 payload 留的是判官自己的回答。键为 `true` 或不写时从不掷。这一轮 scope 组合性向不相容的 `strip` 也这样处理，只是不掷：这一行末尾加上 `，这次你不会让对方这样做`，生效的回应是 `refuse`。判官的 `[角色人格]` 块不列这些键。见 [life-events-needs.zh.md](life-events-needs.zh.md#角色设置)。
+**give 时掷的那一次。** 一轮的 `give` 是 `cigarette`、`alcohol`、`herb`、`coffee` 或 `cuisine`，而角色对应的 `art_metadata` 键（`smoking`、`alcoholic`、`drug`、`coffee`、`gluttony`）为 `false` 时，引擎在判官运行之前掷一次。三次里有一次什么都不变。其余情况 `[用户动作]` 一行末尾加上 `，这次你不会收下`（例如 `[用户动作] 对方递给你 1 支烟，这次你不会收下`），判官就按拒收来写 `inner_state`，而不管它的 `action_response` 怎么填，生效的回应都是 `refuse`；规则引擎的接受同样变成 `refuse`。这一行只陈述结果，不给理由。审计 payload 留的是判官自己的回答。键为 `true` 或不写时从不掷。这一轮 `affinity_scope` 性向不相容的 `strip` 也这样处理，只是不掷：这一行末尾加上 `，这次你不会让对方这样做`，生效的回应是 `refuse`。判官的 `[角色人格]` 块不列这些键。见 [life-events-needs.zh.md](life-events-needs.zh.md#角色设置)。
 
 **需求上下文行。** 每个有判官的回合，上下文里都有一行 `[需求]`，位于 `[身体状态]` 之前：`[需求] 饥饿=高 社交欲=低 体力=中 情感需求=中 外出=中`，即上一次判定推算到本回合的结果；第一次判定之前为 `[需求] 尚未判定`。`外出` 每次都在；只有 `indulgence` 为 `high` 时才在末尾加上 ` 享受=高`（`[需求] 饥饿=高 社交欲=低 体力=中 情感需求=中 外出=中 享受=高`），没有它就读作“不高”，参考 prompt 里也这样告诉判官。严格模式下的判官每个回合仍然要评 `indulgence`，却看不出它原来是 `low` 还是 `mid`，所以连续聊天时它每一轮都在重新猜这一项，按习惯数目的漂移只在两次评定之间起作用。
 

@@ -257,7 +257,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 |---|---|
 | `ex_message`、`breakup` | 亲密度档 2 及以上 |
 | `sudden_desire` | 亲密度档 3 |
-| `strip` | 亲密度档 3，且会话最新记录的 `memory_scope` 与 `affinity_scope` 性向相容（开了关系记忆、scope 里有暧昧感轴）；没有记录算不相容 |
+| `strip` | 亲密度档 3，且会话最新记录的 `affinity_scope` 性向相容（scope 里有暧昧感轴）；没有记录算不相容 |
 | `period`、`saw_bag`、`saw_clothes` | 角色的 `art_metadata.gender` 为 `"female"` |
 | `period_scare` | 角色的 `art_metadata.gender` 为 `"female"`，并且亲密度档 2 及以上 |
 | `pregnancy_scare` | 角色的 `art_metadata.gender` 为 `"female"`，并且亲密度档 3 |
@@ -835,7 +835,7 @@ ghosting 开关关闭时它不让任何轮次沉默，和任何离线时段一�
 上面那套机制还承载另外两种选择：`sleep_together`，她问用户愿不愿意和她上床；`propose`，她求婚。
 它们是提出分开的暖色对应物：关系亲近、她一直温暖又有耐心时才触发，只有用户拒绝才有代价。
 
-**谁有资格。** 调用方通过它发来的 `memory_scope` 和 `affinity_scope` 标明为浪漫上相容的一对
+**谁有资格。** 调用方通过它发来的 `affinity_scope` 标明为浪漫上相容的一对
 （判据见[接口参考](api-reference.zh.md#post-v2compsessionsession_idlife-choiceschoice_id)）。不满足这条判据、或没有记录到 scope 的一对，永远不会被问到。
 engine 不接收性别或性取向，也不判断谁会被谁吸引。
 
