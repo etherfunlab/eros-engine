@@ -239,11 +239,14 @@ cooldowns and ranges are in `rule`, and the category values in `category_rule`, 
 
 A duration written as a range is drawn uniformly in whole hours when the event starts.
 
-Two more kinds are never drawn: `taking_space` (说好暂时分开) and `fell_out`
-(为分开的事闹得不愉快). The engine writes them itself when she asks for space and the
+Three more kinds are never drawn: `taking_space` (说好暂时分开), `fell_out`
+(为分开的事闹得不愉快) and `traveling_together` (和对方一起旅行). The engine writes the first
+two itself when she asks for space and the
 user answers or ignores her ([the ask-for-space choice](#the-ask-for-space-choice)). They are
 `mid` incidents by shape, and `taking_space` is the one that outlasts the category's four
-hours: it lasts 12 to 24. They have no draw rule and the caller's `kinds` rejects them.
+hours: it lasts 12 to 24. `traveling_together` is a `trip` background the engine writes when the
+user accepts her suggestion ([going away together](#going-away-together)). None of the three has
+a draw rule, and the caller's `kinds` rejects them.
 
 ### The draw
 
@@ -286,7 +289,8 @@ eligible kind drops out of the first stage and the others share its weight.
   `bumped_someone`, `saw_bag`, `saw_clothes`, `out_shopping`, `bros_gathering`,
   `sis_gathering`, `admiring_scenery`, `admiring_art`, `watching_show`, `on_the_road`,
   `having_sex`. During `period`,
-  `period_scare` and `pregnancy_scare` are not drawn.
+  `period_scare` and `pregnancy_scare` are not drawn. During `traveling_together` no kind that
+  can take her offline is drawn: she is with the user.
 - One incident and one background can run together. An incident drawn inside a background is
   told from inside it.
 - While she waits for the user's answer to one of her life choices, no draw happens either, in any
@@ -407,7 +411,7 @@ the first stage, and does not shorten a cooldown.
 | `sick` | `period_scare` |
 | `having_sex` | `pregnancy_scare` |
 | `business_trip` | `on_the_road`, `on_the_way`, `busy`, `temp_work` |
-| `short_trip`, `long_trip`, `hometown_visit` | `on_the_road`, `admiring_scenery`, `taking_selfie` |
+| `short_trip`, `long_trip`, `hometown_visit`, `traveling_together` | `on_the_road`, `admiring_scenery`, `taking_selfie` |
 | `hometown_visit` | `bros_gathering`, `sis_gathering` |
 | `hospitalized`, `post_surgery` | `reading`, `gaming` |
 | `period` | `irritable`, `unwell` |
@@ -439,7 +443,7 @@ In the object, `allow` absent or `null` allows every kind and `[]` none; `disall
 kinds out without freezing the rest, so a kind the engine adds later is drawn too. An unknown
 key in the object or an unknown kind anywhere rejects the request, so a misspelt `disallow`
 cannot quietly serve a kind it meant to exclude; a caller lists a new kind only once the
-engine knows it. `taking_space` and `fell_out` are never drawn, so naming one anywhere in
+engine knows it. `taking_space`, `fell_out` and `traveling_together` are never drawn, so naming one anywhere in
 `kinds` is rejected the same way.
 
 Three kinds carry adult themes: `sudden_desire`, `having_sex`, and `pregnancy_scare`, which implies sex. The
@@ -1122,13 +1126,52 @@ nothing, as for the ask for space. The slowdown belongs to the ask for space alo
 romantic choice never slows growth. The story director reads only the ask for space, so a
 romantic choice's outcome lives in the conversation and leaves no trace in her world story.
 
+### Going away together
+
+`travel_together` is the fourth choice: she suggests that the two of them go away together. It
+is warm like the romantic choices, but it does not read the pair's scopes, so a pair they never
+reach can be asked.
+
+**When she asks.** The check runs after the romantic one, after every judged 1:1 text turn, over
+the same committed, time-decayed state and the same clear runway and right session. It needs
+bond tier 3 or more and the 3 newest judged turns warm, and no background may be under way. An
+accepted or ignored `travel_together` holds the next ask back for 14 days from its answer; after
+a decline or a lapse she asks again once the session has a fresh streak. When a romantic kind
+qualifies on the same turn it goes first, and its pending ask closes the runway.
+
+**Her ask.** It is delivered like the romantic asks: her words first, then the choice row beside
+them, no tier gap, the same 24-hour window and the same `life_choice` field on the affinity
+delta. Her ask is generated with the engine's default scopes; her replies at resolution use the
+resolution request's own scopes.
+
+**The answer.** The same endpoint, the same `409` rules and the same response shape.
+
+| path | choice status | cost | what happens | her words |
+|---|---|---|---|---|
+| accept | `accepted` | none | a `traveling_together` event starts now, returned as `event` | a generated reply that knows how long the trip is |
+| decline | `declined` | none | nothing | a generated, disappointed reply |
+| ignore | `ignored` | none: no `fell_out`, no event | nothing | none of its own: the turn runs as any other |
+| lapse | stays `pending`, reads as expired | none | nothing | none |
+
+**The trip.** `traveling_together` (和对方一起旅行) is a non-drawable background in the `trip`
+category, lasting 48 to 72 hours, drawn uniformly in whole hours when the user accepts. Starting
+it ends an incident under way. She does not tell it as an event, since her reply to the yes
+already does, and she keeps replying throughout: it is not offline. `正在经历` and the judge read
+it like any background. While it lasts no second background and no kind that can take her offline
+is drawn, and `on_the_road`, `admiring_scenery` and `taking_selfie` follow it as they follow her
+own trips. It is instance-scoped like every event.
+
+**Other asks during the trip.** Only the separation of an ask for space holds the streak until
+its event ends. An accepted trip anchors the streak at the answer, so a romantic ask can come
+while they are away. She does not ask for space during a trip.
+
 ### Where the choice is stored
 
 `engine.life_choices` holds one row per choice: `session_id` (non-null, cascades with the
-session), `kind` (`ask_for_space`, `sleep_together` or `propose`), `status` (`pending`,
+session), `kind` (`ask_for_space`, `sleep_together`, `propose` or `travel_together`), `status` (`pending`,
 `accepted`, `declined`, `ignored`), `tier_gap` (the gap at ask time; set for `ask_for_space`
-and NULL for the romantic kinds), `asked_at`, `resolved_at`, `message_id` (the ask; set to
-NULL if the message goes) and `event_id` (the `taking_space` row an accept wrote, NULL on every
+and NULL for the other kinds), `asked_at`, `resolved_at`, `message_id` (the ask; set to
+NULL if the message goes) and `event_id` (the `taking_space` or `traveling_together` row an accept wrote, NULL on every
 other path; set to NULL if the event goes). Expiry and the slowdown window are derived, never stored. The separation and
 falling-out rows live in `engine.persona_events` like any event.
 
@@ -1142,7 +1185,7 @@ falling-out rows live in `engine.persona_events` like any event.
 | `正在经历` and `刚才` | reach replies, `/open` greetings and event messages |
 | `[近期事件]` | not rendered: there is no judge to read it |
 | Offline kinds | silence turns as with the judge, since the check runs before it: the ghosting switch and the action and forced-image exemptions apply |
-| The ask for space and the romantic choices | unchanged: the trigger reads the affinity evaluator's judged turns, not the PDE judge |
+| The life choices | unchanged: the trigger reads the affinity evaluator's judged turns, not the PDE judge |
 | `smoking`, `alcoholic`, `drug`, `coffee`, `gluttony` | a `false` key still rolls on a give and can turn it into a refusal; there is no `indulgence` to drift or name |
 
 ## Code pointers

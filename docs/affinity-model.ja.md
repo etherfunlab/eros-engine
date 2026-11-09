@@ -247,6 +247,7 @@ Chemistry: `spark` / `flirtation` / `crush` / `lover` / `beloved`
 
 - 距離を置きたいという切り出し — 2 本のティア階段(chemistry が bond より 2 段階以上高い)と、直近 3 回のジャッジ採点ターンから導出された `patience` が、彼女が休みを切り出すかどうかを決める([選択](life-events-needs.md#the-ask-for-space-choice)を参照)。
 - ロマンチックな選択 — chemistry のティア(`propose` では bond のティアも)と、直近のジャッジ採点ターンから導出された `warmth` と `patience` が、彼女が一緒に寝ようと誘うか、プロポーズするかを決める。呼び出し側の scope がこのペアをロマンチックと示している場合に限る([選択](life-events-needs.md#the-romantic-choices)を参照)。
+- 一緒に旅行 — bond のティアと、直近のジャッジ採点ターンから導出された `warmth` と `patience` が、彼女が一緒に旅行しようと持ちかけるかを決める([一緒に旅行](life-events-needs.md#going-away-together)を参照)。
 - リコールゲート — 時間減衰後の行の Bond と Chemistry のティアが、どの基礎プロフィールの親密フィールドとどの domain 付きプロフィール層メモリーがプロンプトに入るか、そして各層から何件リコールするかを決める。行がないペアは両ラインともティア 1 とみなす。テキスト、グループ、音声、画像編集のテキスト返信はいずれも減衰後の値を読む([memory-layers.md](memory-layers.md#affinity-gate)を参照)。
 
 - ゴーストスコアリング — `score = (1−intrigue)·0.4 + (1−patience)·0.4 + tension·0.2` を使い、ハード veto(最初の10メッセージ、streak ≥ 2、1時間クールダウン)と閾値 0.65(セッションが一度ゴーストした後は 0.85)を適用する。

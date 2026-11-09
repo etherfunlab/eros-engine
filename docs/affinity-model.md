@@ -406,6 +406,9 @@ moved (format in [Event rows](#event-rows)).
   decide whether she asks to sleep together or proposes, for a pair the
   caller's scopes mark as romantic
   ([the choices](life-events-needs.md#the-romantic-choices)).
+- The trip — the bond tier and the derived `warmth` and `patience` of the
+  newest judged turns decide whether she suggests going away together
+  ([going away together](life-events-needs.md#going-away-together)).
 - The recall gate — the Bond and Chemistry tiers of the time-decayed row
   decide which intimate 基础画像 fields and domain-tagged profile memories
   reach the prompt, and how many memories each layer recalls; no row is tier 1
