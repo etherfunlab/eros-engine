@@ -666,7 +666,7 @@ pub(crate) async fn draw_event_at(
     // recorded scopes; none recorded reads as not compatible.
     let romance_compatible = matches!(
         (ChatRepo { pool: &state.pool }).latest_scopes(session_id).await?,
-        Some((memory, scope)) if eros_engine_core::scope::romance_compatible(memory, scope)
+        Some((_, scope)) if eros_engine_core::scope::romance_compatible(scope)
     );
     let ever_had_sex = event_repo
         .ever(instance_id, events::EventKind::HavingSex)

@@ -298,7 +298,7 @@ async fn try_romance(
         .latest_scopes(session_id)
         .await?
     {
-        Some((memory, scope)) if romance_compatible(memory, scope) => {}
+        Some((_, scope)) if romance_compatible(scope) => {}
         _ => return Ok(()),
     }
 

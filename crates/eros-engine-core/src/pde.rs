@@ -67,10 +67,9 @@ pub fn strip_ruled_out(event: &Event) -> bool {
     match event {
         Event::UserMessage {
             action: Some(UserAction::Strip),
-            memory_scope,
             affinity_scope,
             ..
-        } => !crate::scope::romance_compatible(*memory_scope, *affinity_scope),
+        } => !crate::scope::romance_compatible(*affinity_scope),
         _ => false,
     }
 }
@@ -977,6 +976,17 @@ mod tests {
             *affinity_scope = AffinityScope::full();
         }
         assert!(!strip_ruled_out(&romantic));
+        let mut neutral_fallback = strip.clone();
+        if let Event::UserMessage {
+            memory_scope,
+            affinity_scope,
+            ..
+        } = &mut neutral_fallback
+        {
+            *memory_scope = MemoryScope::NeutralOnly;
+            *affinity_scope = AffinityScope::full();
+        }
+        assert!(!strip_ruled_out(&neutral_fallback));
         assert!(!strip_ruled_out(&action_msg(UserAction::Kiss)));
         assert!(!strip_ruled_out(&user_msg("hi")));
     }
