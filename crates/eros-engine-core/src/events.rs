@@ -522,6 +522,28 @@ impl Setting {
     }
 }
 
+/// How much of her day is work, `art_metadata.employed` (spec
+/// 2026-11-11-eight-short-events-and-hygienic-design.md §4). Absent or
+/// unknown reads as `PartTime`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Employment {
+    Free,
+    #[default]
+    PartTime,
+    FullTime,
+}
+
+impl Employment {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "free" => Some(Employment::Free),
+            "part_time" => Some(Employment::PartTime),
+            "full_time" => Some(Employment::FullTime),
+            _ => None,
+        }
+    }
+}
+
 /// The persona's settings the draw reads (§4). `Default` is a persona with
 /// none of them.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -546,6 +568,12 @@ pub struct PersonaTraits {
     /// `art_metadata.setting`: the kinds that do not fit her world are never
     /// drawn.
     pub setting: Setting,
+    /// `art_metadata.hygienic`: `true` or `false` scales the bathing kinds;
+    /// `None` leaves them be.
+    pub hygienic: Option<bool>,
+    /// `art_metadata.employed`: scales the work kinds; `Free` never wants to
+    /// quit a job.
+    pub employed: Employment,
 }
 
 fn passes_gate(
@@ -560,6 +588,7 @@ fn passes_gate(
             rung >= CONFIDE_MIN_RUNG
         }
         EventKind::SuddenDesire => rung >= DESIRE_MIN_RUNG,
+        EventKind::WantToQuitJob => persona.employed != Employment::Free,
         EventKind::Period | EventKind::SawBag | EventKind::SawClothes => persona.female,
         EventKind::PeriodScare => persona.female && rung >= CONFIDE_MIN_RUNG,
         EventKind::PregnancyScare => persona.female && rung >= DESIRE_MIN_RUNG,
@@ -703,6 +732,32 @@ fn sex_addict_factor(kind: EventKind, persona: &PersonaTraits) -> f64 {
         }
         (EventKind::SuddenDesire | EventKind::Strip | EventKind::Streaking, Some(false)) => {
             1.0 / PREFERENCE_FACTOR
+        }
+        _ => 1.0,
+    }
+}
+
+/// How `hygienic` scales the bathing kinds within their category: three
+/// times or a third as likely.
+fn hygienic_factor(kind: EventKind, persona: &PersonaTraits) -> f64 {
+    use EventKind::*;
+    match (kind, persona.hygienic) {
+        (Showering | Bathing | WantHotSpring | WantSauna, Some(true)) => PREFERENCE_FACTOR,
+        (Showering | Bathing | WantHotSpring | WantSauna, Some(false)) => 1.0 / PREFERENCE_FACTOR,
+        _ => 1.0,
+    }
+}
+
+/// How `employed` scales the work kinds within their category: a third as
+/// likely for a persona with no job, three times for a full-time one.
+fn employed_factor(kind: EventKind, persona: &PersonaTraits) -> f64 {
+    use EventKind::*;
+    match (kind, persona.employed) {
+        (TempWork | ScoldedBySuperior | ScoldedSuperior | BusinessTrip, Employment::Free) => {
+            1.0 / PREFERENCE_FACTOR
+        }
+        (TempWork | ScoldedBySuperior | ScoldedSuperior | BusinessTrip, Employment::FullTime) => {
+            PREFERENCE_FACTOR
         }
         _ => 1.0,
     }
@@ -870,7 +925,9 @@ pub fn draw(input: &DrawInput, rolls: Rolls) -> Option<Drawn> {
                 * follow_factor(k, input.history, input.now)
                 * prior_factor(k, input.persona, input.ever_had_sex)
                 * homesick_factor(k, input.persona)
-                * sex_addict_factor(k, input.persona);
+                * sex_addict_factor(k, input.persona)
+                * hygienic_factor(k, input.persona)
+                * employed_factor(k, input.persona);
             (k, weight)
         })
         .collect();
@@ -2720,5 +2777,95 @@ mod tests {
                 assert!(!rules_out(bg, k), "{bg:?} {k:?}");
             }
         }
+    }
+
+    fn with_hygienic(hygienic: Option<bool>) -> PersonaTraits {
+        PersonaTraits {
+            hygienic,
+            ..Default::default()
+        }
+    }
+
+    fn with_employed(employed: Employment) -> PersonaTraits {
+        PersonaTraits {
+            employed,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn hygienic_scales_the_bathing_kinds() {
+        for k in [Showering, Bathing, WantHotSpring, WantSauna] {
+            assert_eq!(hygienic_factor(k, &with_hygienic(Some(true))), 3.0);
+            assert_eq!(hygienic_factor(k, &with_hygienic(Some(false))), 1.0 / 3.0);
+            assert_eq!(hygienic_factor(k, &with_hygienic(None)), 1.0);
+        }
+        assert_eq!(
+            hygienic_factor(GroceryShopping, &with_hygienic(Some(true))),
+            1.0
+        );
+        // Draw order is `ALL` order: GroceryShopping, Showering, both 2.
+        let both = [GroceryShopping, Showering];
+        let at = |p: &PersonaTraits, k| pick_ever(p, false, &both, rolls(0.0, k));
+        // true: 2, 6 — GroceryShopping below .25.
+        assert_eq!(at(&with_hygienic(Some(true)), 0.2), Some(GroceryShopping));
+        assert_eq!(at(&with_hygienic(Some(true)), 0.3), Some(Showering));
+        // false: 2, 2/3 — GroceryShopping below .75.
+        assert_eq!(at(&with_hygienic(Some(false)), 0.7), Some(GroceryShopping));
+        assert_eq!(at(&with_hygienic(Some(false)), 0.8), Some(Showering));
+        // unset: 2, 2 — GroceryShopping below .5.
+        assert_eq!(at(&with_hygienic(None), 0.45), Some(GroceryShopping));
+        assert_eq!(at(&with_hygienic(None), 0.55), Some(Showering));
+    }
+
+    #[test]
+    fn employed_scales_the_work_kinds() {
+        for k in [TempWork, ScoldedBySuperior, ScoldedSuperior, BusinessTrip] {
+            assert_eq!(
+                employed_factor(k, &with_employed(Employment::Free)),
+                1.0 / 3.0
+            );
+            assert_eq!(
+                employed_factor(k, &with_employed(Employment::PartTime)),
+                1.0
+            );
+            assert_eq!(
+                employed_factor(k, &with_employed(Employment::FullTime)),
+                3.0
+            );
+        }
+        assert_eq!(
+            employed_factor(InClass, &with_employed(Employment::Free)),
+            1.0
+        );
+        // Draw order is `ALL` order: Quarrel, ScoldedBySuperior; both weigh 1.
+        let both = [Quarrel, ScoldedBySuperior];
+        let at = |p: &PersonaTraits, k| pick_ever(p, false, &both, rolls(0.0, k));
+        // full_time: 1, 3 — Quarrel below .25.
+        let full = with_employed(Employment::FullTime);
+        assert_eq!(at(&full, 0.2), Some(Quarrel));
+        assert_eq!(at(&full, 0.3), Some(ScoldedBySuperior));
+        // free: 1, 1/3 — Quarrel below .75.
+        let free = with_employed(Employment::Free);
+        assert_eq!(at(&free, 0.7), Some(Quarrel));
+        assert_eq!(at(&free, 0.8), Some(ScoldedBySuperior));
+    }
+
+    #[test]
+    fn a_free_persona_never_wants_to_quit() {
+        let only = [WantToQuitJob];
+        let at = |e| pick_ever(&with_employed(e), false, &only, rolls(0.0, 0.0));
+        assert_eq!(at(Employment::Free), None);
+        assert_eq!(at(Employment::PartTime), Some(WantToQuitJob));
+        assert_eq!(at(Employment::FullTime), Some(WantToQuitJob));
+    }
+
+    #[test]
+    fn employment_parses_its_three_values() {
+        assert_eq!(Employment::parse("free"), Some(Employment::Free));
+        assert_eq!(Employment::parse("part_time"), Some(Employment::PartTime));
+        assert_eq!(Employment::parse("full_time"), Some(Employment::FullTime));
+        assert_eq!(Employment::parse("retired"), None);
+        assert_eq!(Employment::default(), Employment::PartTime);
     }
 }
