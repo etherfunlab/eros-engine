@@ -1778,7 +1778,7 @@ pub(crate) fn drive_chat_burst_for(
 
 /// `meta.model` for one hop (spec 2026-10-08 §6.4): a BYOK hop always shows
 /// its real id; a platform hop follows `model_name_display_override`.
-fn hop_display(
+pub(crate) fn hop_display(
     hop: &crate::byok::ChatHop,
     display: Option<&eros_engine_llm::model_config::DisplayOverride>,
     bare_model_id: &str,
