@@ -244,6 +244,7 @@ LIMIT $3;
 ## 归档与抹除
 
 - **`DELETE /comp/instance/{instance_id}/sessions`** 归档这段关系：它的 session 标为已归档，关系层的 `companion_memories` 行，以及它在 `relationship_scan_state`、`relationship_episodes`、`relationship_arcs`、`relationship_journal` 里的行都被删除。画像记忆保留。同一个实例上重新开始的关系会有新的扫描状态和新的初识。
+- **`DELETE /v2/comp/user/{user_id}/memories/{memory_id}`** 让用户本人删除一条抽取出的画像记忆（`instance_id` 为 NULL、`category` 有值），即 `GET /svc/v1/memories/changes` 导出、`GET /v2/comp/user/{user_id}/memories` 列出的那些行。删除会在 `GET /svc/v1/rows/deletions` 上给镜像留一条墓碑（[Insights → 逐条删除事实或记忆](insights.zh.md#逐条删除事实或记忆)）。逐轮原文行（`category` 为 NULL）原样保存用户的消息，它和关系层的行都不能逐条删除；逐轮原文行仍可能被召回。
 - **`POST /svc/v1/users/{user_id}/erase`** 删除用户在两层里的记忆，以及其角色实例在四张关系表里的行（[Insights → 抹除](insights.zh.md#抹除)）。
 - `relationship_scan_events` 两种情况下都保留：它只有计数和 id。
 

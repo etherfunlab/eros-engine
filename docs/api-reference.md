@@ -2135,6 +2135,70 @@ The flat, typed `human_insights` row for this user — the profile the engine de
 
 `education_level` is one of `secondary_or_below`, `associate`, `bachelor`, `master`, `doctorate`, or `null`; `education_status` is `enrolled`, `graduated`, or `null`. `kinks`, `ideology` and `mental_health` are returned here because this is the user's own data; the service export never carries them. `updated_at` is when the last rebuild replaced the row. `updated_at: null` means the user has no `human_insights` row yet — no rebuild has landed — and every other field is `null`/`[]` in that response. There is no aggregate "training level" score anymore; `agent_training_level` and the raw `companion_insights` JSONB were removed with the companion_insights teardown (spec 2026-08-11) — the typed fields above are the whole surface now.
 
+### `GET /v2/comp/user/{user_id}/facts`
+
+The user's ledger facts ([Insights](insights.md#the-fact-ledger)), newest first, so the user can see what the engine mined and delete a row. Same `user_id` equality check as above.
+
+| Query | Default | Meaning |
+|---|---|---|
+| `limit` | 100 | clamped to 1..=500 |
+| `before` | none | RFC 3339; rows strictly before `(before, before_id)` |
+| `before_id` | none | comes with `before` — pass `next.id` |
+
+```json
+{
+  "facts": [
+    {
+      "id": "5b7e…",
+      "content": "用户养了一只猫",
+      "category": "fact",
+      "domain": "lifestyle",
+      "evidence_type": "explicit_statement",
+      "temporality": "current",
+      "persistence": "ongoing",
+      "confidence": "high",
+      "occurrences": 3,
+      "session_count": 2,
+      "recurrence": "repeated_across_sessions",
+      "first_seen_at": "2026-10-13T12:00:00.123456Z",
+      "last_seen_at": "2026-10-20T09:30:00.654321Z"
+    }
+  ],
+  "next": { "first_seen_at": "2026-10-13T12:00:00.123456Z", "id": "5b7e…" }
+}
+```
+
+A row has the fields of [`GET /svc/v1/facts/changes`](#get-svcv1factschanges) without `user_id`. Rows are ordered by `(first_seen_at, id)` descending; `first_seen_at` never changes, so a walk neither repeats nor skips a row that exists throughout it. `next` is present iff the page is full; pass both fields back verbatim as `before` and `before_id`, at full microsecond precision, until `next` is `null`. Sending one of `before` and `before_id` without the other is `400 bad_request`.
+
+### `GET /v2/comp/user/{user_id}/memories`
+
+The user's extracted profile-layer memories: the rows [`GET /svc/v1/memories/changes`](#get-svcv1memorieschanges) exports, with its fields minus `user_id` (`id`, `content`, `category`, `metadata`, `created_at`). Raw-turn and relationship-layer rows are not listed. Same query, ownership check and paging as the facts list, ordered by `(created_at, id)` descending.
+
+```json
+{
+  "memories": [
+    {
+      "id": "3c2a…",
+      "content": "用户目前正在找工作",
+      "category": "fact",
+      "metadata": { "domain": "career", "confidence": "high" },
+      "created_at": "2026-10-13T12:00:00.123456Z"
+    }
+  ],
+  "next": null
+}
+```
+
+### `DELETE /v2/comp/user/{user_id}/facts/{fact_id}`
+
+Delete one ledger fact. `204` when it went; `404 not_found` when no such fact belongs to the user (an unknown id, another user's fact, or one already deleted, so a repeat is `404`). Same `user_id` equality check as above.
+
+The delete writes a tombstone to [`GET /svc/v1/rows/deletions`](#get-svcv1rowsdeletions) and marks the user's profile due: the next profile-rebuild sweep (every five minutes by default) rebuilds it without the fact, and clears it when what is left supports no profile. The fact's wording stays in the extraction audit and the daily snapshots until the user is erased. If the same statement is extracted again later, it comes back as a new row with a new id. See [Insights → Deleting one fact or memory](insights.md#deleting-one-fact-or-memory).
+
+### `DELETE /v2/comp/user/{user_id}/memories/{memory_id}`
+
+Delete one extracted profile memory, a row the memories list returns. `204` or `404 not_found`, as for facts; a raw-turn or relationship-layer row is also `404`. The delete writes a tombstone to [`GET /svc/v1/rows/deletions`](#get-svcv1rowsdeletions); the memory is no longer recalled.
+
 ### `GET /comp/instance/{instance_id}/profile`
 
 The flat, typed `character_insights` row for one relationship (`persona_instances.id`) — the AI character's own conversation-derived profile, the mirror of the human profile above. The instance's `owner_uid` MUST match the JWT's user_id; otherwise 403. An unknown or archived (`status <> 'active'`) instance is 404. Experimental (v1.3.0) — see [2026-08-15-character-insights-design.md](superpowers/specs/2026-08-15-character-insights-design.md).
@@ -2628,6 +2692,7 @@ Service-to-service routes under `/svc/v1/*`. They are admitted by a shared secre
 |---|---|---|
 | `INSIGHTS_EXPORT_SECRET` | `x-insights-export-secret` | [`insights/changes`](#get-svcv1insightschanges), [`memories/changes`](#get-svcv1memorieschanges), [`insights/deletions`](#get-svcv1insightsdeletions) |
 | `FACTS_EXPORT_SECRET` | `x-facts-export-secret` | [`facts/changes`](#get-svcv1factschanges), [`facts/deletions`](#get-svcv1factsdeletions) |
+| either of the two above | either header | [`rows/deletions`](#get-svcv1rowsdeletions) |
 | `USER_ERASE_SECRET` | `x-user-erase-secret` | [`POST users/{user_id}/erase`](#post-svcv1usersuser_iderase) |
 
 All the streams are keyset-paged the same way; the pipeline behind them is in [Insights](insights.md#exports-and-deletions).
@@ -2707,11 +2772,11 @@ curl -H "x-insights-export-secret: $INSIGHTS_EXPORT_SECRET" \
 
 **Resuming the next poll.** Keep the last row's `(created_at, id)`; start each new poll a few seconds before it, `since = last.created_at − 5s` with no `after_id`. `created_at` is the inserting transaction's start time and the row is visible only at its commit; the engine's insert transactions are short, so the overlap covers that gap. Re-returned rows are harmless: a row never changes, so deduplicate by `id`.
 
-**No deletions in this feed.** A row goes away with its session (a hard delete cascades) or with an erase of its user, and this export reports neither. A mirror drops erased users by reading [`insights/deletions`](#get-svcv1insightsdeletions) with the same secret.
+**Rows can leave.** The owner can delete a row ([`DELETE …/memories/{memory_id}`](#delete-v2compuseruser_idmemoriesmemory_id)), and the row then appears on [`rows/deletions`](#get-svcv1rowsdeletions) with `kind: memory`. An erase removes all of a user's rows and appears on [`insights/deletions`](#get-svcv1insightsdeletions). A row that goes away with its session (a hard delete cascades) is reported on neither.
 
 ### `GET /svc/v1/insights/deletions`
 
-The users whose data the engine erased since a keyset cursor, for a mirror of profiles and memories to drop in turn. Requires `x-insights-export-secret` (403 when missing or wrong). It is the same stream as [`facts/deletions`](#get-svcv1factsdeletions), readable with the insights secret so that mirror needs no second credential. There is no per-fact deletion: the stream is user-level.
+The users whose data the engine erased since a keyset cursor, for a mirror of profiles and memories to drop in turn. Requires `x-insights-export-secret` (403 when missing or wrong). It is the same stream as [`facts/deletions`](#get-svcv1factsdeletions), readable with the insights secret so that mirror needs no second credential. The stream is user-level; single rows the owner deletes are on [`rows/deletions`](#get-svcv1rowsdeletions).
 
 | Query | Default | Meaning |
 |---|---|---|
@@ -2771,13 +2836,43 @@ curl -H "x-facts-export-secret: $FACTS_EXPORT_SECRET" \
 
 `recurrence` is `once`, `repeated_in_session` or `repeated_across_sessions`; the six labels are the engine's closed vocabularies. The session, message and run pointers stay inside the engine. Rows are ordered by `(last_seen_at, id)`, and paging works as on the insights export: `next` is present iff the page is full; pass both fields back verbatim as `since` and `after_id`, at full microsecond precision, until `next` is `null`.
 
-A repeat moves `last_seen_at`, so a row reappears each time its counters change; deduplicate by `id`, last one wins. Rows leave the ledger only through an erase; see [`facts/deletions`](#get-svcv1factsdeletions).
+A repeat moves `last_seen_at`, so a row reappears each time its counters change; deduplicate by `id`, last one wins. A row leaves the ledger when its owner deletes it ([`rows/deletions`](#get-svcv1rowsdeletions), `kind: fact`) or when the user is erased ([`facts/deletions`](#get-svcv1factsdeletions)).
 
 **Resuming the next poll.** Keep the last row's `(last_seen_at, id)`; start each new poll *before* it with no `after_id`. `last_seen_at` is stamped by the ledger write itself (`now()`; a recurrence never moves it backwards), so it precedes the commit by one short statement: an overlap of a few seconds is enough.
 
 ### `GET /svc/v1/facts/deletions`
 
 The same erasure stream as [`insights/deletions`](#get-svcv1insightsdeletions) — same query, same response, same meaning — admitted with `x-facts-export-secret`, for the mirror of facts. A mirror that holds facts must drop every `user_id` it reads here.
+
+### `GET /svc/v1/rows/deletions`
+
+Single rows that left the memories or facts export because their owner deleted them, since a keyset cursor. Admitted by either read secret: `x-insights-export-secret` matching `INSIGHTS_EXPORT_SECRET`, or `x-facts-export-secret` matching `FACTS_EXPORT_SECRET` (403 when neither header matches its own secret). Mounted when at least one of the two is configured.
+
+| Query | Default | Meaning |
+|---|---|---|
+| `since` | Unix epoch | RFC 3339 timestamp; rows strictly after `(since, after_id)` |
+| `after_id` | nil UUID | tie-break within `since` — pass `next.id` |
+| `limit` | 500 | clamped to 1..=1000 |
+
+```bash
+curl -H "x-facts-export-secret: $FACTS_EXPORT_SECRET" \
+  "http://localhost:8080/svc/v1/rows/deletions?limit=1"
+```
+
+```json
+{
+  "deletions": [
+    { "kind": "fact", "id": "5b7e…", "deleted_at": "2026-11-10T12:00:00.123456Z" }
+  ],
+  "next": { "deleted_at": "2026-11-10T12:00:00.123456Z", "id": "5b7e…" }
+}
+```
+
+`kind` is `memory` (a row [`memories/changes`](#get-svcv1memorieschanges) exported) or `fact` (a row [`facts/changes`](#get-svcv1factschanges) exported); skip a `kind` you do not know. `id` is the deleted row's id. Rows are ordered by `(deleted_at, id)`; paging works as on the other streams.
+
+**A mirror drops the row with that id and keeps the id.** A changes page fetched just before a delete can arrive after its tombstone; a mirror that remembers tombstoned ids does not re-insert the row. A deleted id never comes back: the same statement extracted again is a new row with a new id.
+
+**Resuming the next poll.** Keep the last row's `(deleted_at, id)`; start each new poll a few seconds before it, `since = last.deleted_at − 5s` with no `after_id`. `deleted_at` is the deleting transaction's start and the row is visible only at its commit, so the overlap covers that gap. Re-returned rows are harmless: dropping a dropped row is a no-op.
 
 ### `POST /svc/v1/users/{user_id}/erase`
 
@@ -2853,5 +2948,6 @@ on whichever route it comes from, as does the caller-secret refusal
 - `crates/eros-engine-server/src/routes/bff/companion.rs` — BFF `/bff/v1/comp/chat/*`
 - `crates/eros-engine-server/src/routes/bff/affinity.rs` — BFF `/bff/v1/comp/affinity/*`
 - `crates/eros-engine-server/src/routes/svc.rs` — service-to-service export (`/svc/v1/*`)
+- `crates/eros-engine-server/src/routes/user_rows.rs` — the owner's fact and memory lists and deletes
 - `crates/eros-engine-server/src/routes/health.rs` — `/healthz`
 - `crates/eros-engine-server/src/openapi.rs` — Scalar UI spec metadata

@@ -213,8 +213,9 @@ crates/
 │       ├── memory.rs         # MemoryRepo (Profile/Relationship layers)
 │       ├── insight.rs        # InsightEventRepo (human_insights_events audit rows)
 │       ├── human_fact.rs     # HumanFactRepo (the user's fact ledger: dedup upsert, export keyset)
-│       ├── profile_state.rs  # ProfileStateRepo (rebuild counter, claim, outcomes)
+│       ├── profile_state.rs  # ProfileStateRepo (rebuild counter, due mark, claim tokens, outcomes)
 │       ├── erasure.rs        # ErasureRepo (user erase, deletion stream)
+│       ├── row_deletion.rs   # RowDeletionRepo (tombstones of single deleted memories and facts, their stream)
 │       ├── human_insight.rs  # HumanInsightRepo (typed profile columns, full-row replace by the rebuild)
 │       ├── character_insight.rs # CharacterInsightRepo + event/snapshot repos (AI character's profile, experimental)
 │       ├── user_insight.rs   # UserInsightRepo + event/snapshot repos (the real user's per-relationship profile, experimental)
@@ -232,7 +233,7 @@ crates/
         ├── auth/             # AuthValidator trait + Supabase impl + middleware
         ├── pipeline/         # stream (run_stream) / group + group_director / reasoning_call / handlers / post_process / dreaming / …
         ├── prompt.rs         # system-prompt builder (affinity → directives)
-        ├── routes/           # health / companion / companion_stream / companion_async / insight / image_edit / voice / persona / session_open / session_events / session_effects / life_choices / persona_items / reaction / group / world_town / svc (service-to-service export, `/svc/v1/*`) / bff / dto / mod
+        ├── routes/           # health / companion / companion_stream / companion_async / insight / image_edit / voice / persona / session_open / session_events / session_effects / life_choices / persona_items / user_rows / reaction / group / world_town / svc (service-to-service export, `/svc/v1/*`) / bff / dto / mod
         └── openapi.rs        # utoipa ApiDoc spec metadata
 ```
 

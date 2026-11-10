@@ -477,6 +477,15 @@ the request and [model-config.md](model-config.md) for `[tasks.chat_voice]`.
   `relationship_episodes`, `relationship_arcs` and `relationship_journal` are
   deleted. Profile memories stay. A relationship restarted on the same
   instance starts a new scan state and a new first meeting.
+- **`DELETE /v2/comp/user/{user_id}/memories/{memory_id}`** lets the owner
+  delete one extracted profile memory (`instance_id` NULL, `category` set),
+  the rows `GET /svc/v1/memories/changes` exports and
+  `GET /v2/comp/user/{user_id}/memories` lists. It leaves a tombstone on
+  `GET /svc/v1/rows/deletions` for mirrors
+  ([Insights → Deleting one fact or memory](insights.md#deleting-one-fact-or-memory)).
+  The raw-turn rows (`category` NULL), which hold the user's messages
+  verbatim, and the relationship layer's rows cannot be deleted one at a
+  time; the raw-turn rows can still be recalled.
 - **`POST /svc/v1/users/{user_id}/erase`** deletes the user's memories in both
   layers and the four relationship tables of their persona instances
   ([Insights → Erasure](insights.md#erasure)).
