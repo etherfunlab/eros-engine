@@ -926,7 +926,16 @@ pub(crate) fn event_label(kind: eros_engine_core::events::EventKind) -> &'static
         TakingSpace => "说好暂时分开",
         FellOut => "为分开的事闹得不愉快",
         TravelingTogether => "和对方一起旅行",
+        BathingTogether => "和对方一起洗澡",
         Strip => "刚脱了衣服",
+        BirdEncounter => "遇到一只鸟",
+        ExWantsBack => "前任来求复合",
+        WantToQuitJob => "想辞职",
+        PonderingLife => "在思考人生",
+        Streaking => "刚裸奔了一圈",
+        WantToSeeSea => "想去看海",
+        WantHotSpring => "想去泡温泉",
+        WantSauna => "想去洗桑拿",
     }
 }
 
@@ -1285,7 +1294,9 @@ pub(crate) fn meta_str<'a>(persona: &'a CompanionPersona, key: &str) -> Option<&
 pub(crate) fn persona_traits(
     persona: &CompanionPersona,
 ) -> eros_engine_core::events::PersonaTraits {
-    use eros_engine_core::events::{EventCategory, EventKind, Health, PersonaTraits, Setting};
+    use eros_engine_core::events::{
+        Employment, EventCategory, EventKind, Health, PersonaTraits, Setting,
+    };
     let art = &persona.genome.art_metadata;
     PersonaTraits {
         female: meta_str(persona, "gender") == Some("female"),
@@ -1315,6 +1326,10 @@ pub(crate) fn persona_traits(
         sex_addict: art.get("sex_addict").and_then(|v| v.as_bool()),
         setting: meta_str(persona, "setting")
             .and_then(Setting::parse)
+            .unwrap_or_default(),
+        hygienic: art.get("hygienic").and_then(|v| v.as_bool()),
+        employed: meta_str(persona, "employed")
+            .and_then(Employment::parse)
             .unwrap_or_default(),
     }
 }
@@ -4859,6 +4874,14 @@ mod tests {
                 "长途旅游",
                 "回老家",
                 "刚脱了衣服",
+                "遇到一只鸟",
+                "前任来求复合",
+                "想辞职",
+                "在思考人生",
+                "刚裸奔了一圈",
+                "想去看海",
+                "想去泡温泉",
+                "想去洗桑拿",
             ]
         );
     }
@@ -4883,6 +4906,8 @@ mod tests {
                 homesick: Some(false),
                 sex_addict: Some(true),
                 setting: Default::default(),
+                hygienic: None,
+                employed: Default::default(),
             }
         );
         p.genome.art_metadata =
@@ -4931,6 +4956,39 @@ mod tests {
         ] {
             p.genome.art_metadata = art;
             assert_eq!(persona_traits(&p).setting, want);
+        }
+    }
+
+    #[test]
+    fn persona_traits_read_hygienic_and_employed() {
+        use eros_engine_core::events::Employment;
+        let mut p = fixture_persona();
+        for (art, hygienic, employed) in [
+            (
+                serde_json::json!({"hygienic": true, "employed": "full_time"}),
+                Some(true),
+                Employment::FullTime,
+            ),
+            (
+                serde_json::json!({"hygienic": false, "employed": "free"}),
+                Some(false),
+                Employment::Free,
+            ),
+            (serde_json::json!({}), None, Employment::PartTime),
+            (
+                serde_json::json!({"hygienic": "true", "employed": true}),
+                None,
+                Employment::PartTime,
+            ),
+            (
+                serde_json::json!({"employed": "retired"}),
+                None,
+                Employment::PartTime,
+            ),
+        ] {
+            p.genome.art_metadata = art;
+            let t = persona_traits(&p);
+            assert_eq!((t.hygienic, t.employed), (hygienic, employed));
         }
     }
 

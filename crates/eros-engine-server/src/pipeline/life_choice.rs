@@ -49,6 +49,15 @@ const WARM_STREAK: usize = 3;
 const TRAVEL_MIN_BOND_TIER: u8 = 3;
 /// `travel_together`: days after an accept or an ignore before she asks again.
 const TRAVEL_COOLDOWN_DAYS: i64 = 14;
+/// `bathe_together`: how many of the newest judged turns it looks at.
+const BATHE_WINDOW: i64 = 7;
+/// `bathe_together`: the turns in the window whose warmth must reach
+/// [`BATHE_WARMTH`].
+const BATHE_HITS: usize = 3;
+/// `bathe_together`: a rule threshold of the engine, not a judge band.
+const BATHE_WARMTH: f64 = 0.5;
+/// `bathe_together`: days after an accept or an ignore before she asks again.
+const BATHE_COOLDOWN_DAYS: i64 = 7;
 /// `propose`: how many of the newest judged turns it looks at (spec
 /// 2026-10-30 §4.3).
 const PROPOSE_WINDOW: i64 = 8;
@@ -188,6 +197,9 @@ pub(crate) async fn maybe_ask(
     // An ask written just now is pending, which closes the runway here.
     if let Err(e) = try_romance(state, session_id, user_id, instance_id, persona).await {
         tracing::warn!(%session_id, "romantic choice failed: {e}");
+    }
+    if let Err(e) = try_bathe(state, session_id, user_id, instance_id, persona).await {
+        tracing::warn!(%session_id, "bath choice failed: {e}");
     }
     if let Err(e) = try_travel(state, session_id, user_id, instance_id, persona).await {
         tracing::warn!(%session_id, "travel choice failed: {e}");
@@ -387,6 +399,80 @@ fn newest_streak_warm(endpoints: &[JudgedEndpoints]) -> bool {
     endpoints
         .get(..WARM_STREAK)
         .is_some_and(|newest| newest.iter().all(is_warm))
+}
+
+/// Whether the pair qualifies for a bath together: chemistry tier 2 or more
+/// for a hygienic persona, 3 or more for one with no `hygienic`, never for
+/// one who is not hygienic; and [`BATHE_HITS`] of `endpoints` (the newest
+/// judged turns, at most [`BATHE_WINDOW`]) at [`BATHE_WARMTH`] or more.
+fn bathe_qualifies(chem_tier: u8, hygienic: Option<bool>, endpoints: &[JudgedEndpoints]) -> bool {
+    let floor = match hygienic {
+        Some(true) => 2,
+        None => 3,
+        Some(false) => return false,
+    };
+    chem_tier >= floor
+        && endpoints
+            .iter()
+            .filter(|e| e.warmth >= BATHE_WARMTH)
+            .count()
+            >= BATHE_HITS
+}
+
+/// She asks the user to take a bath with her: a romance-compatible pair that
+/// [`bathe_qualifies`], not within [`BATHE_COOLDOWN_DAYS`] of the last
+/// accept or ignore. Its own trigger, independent of the bed: it runs after
+/// the romantic trigger, whose pending ask closes the runway.
+async fn try_bathe(
+    state: &AppState,
+    session_id: Uuid,
+    user_id: Uuid,
+    instance_id: Uuid,
+    persona: &CompanionPersona,
+) -> Result<(), AppError> {
+    let now = Utc::now();
+    let affinity_repo = AffinityRepo { pool: &state.pool };
+    let Some(mut affinity) = affinity_repo.load(session_id).await? else {
+        return Ok(());
+    };
+    affinity.apply_time_decay();
+    affinity.refresh_endpoints(&state.config.affinity_tuning);
+
+    match (ChatRepo { pool: &state.pool })
+        .latest_scopes(session_id)
+        .await?
+    {
+        Some((_, scope)) if romance_compatible(scope) => {}
+        _ => return Ok(()),
+    }
+
+    let choices = LifeChoiceRepo { pool: &state.pool };
+    let since = choices.streak_anchor(session_id).await?;
+    let judged = affinity_repo
+        .last_judged_endpoints(session_id, since, BATHE_WINDOW)
+        .await?;
+    let hygienic = crate::prompt::persona_traits(persona).hygienic;
+    if !bathe_qualifies(affinity.chem_tier(), hygienic, &judged) {
+        return Ok(());
+    }
+    let cooled = now - Duration::days(BATHE_COOLDOWN_DAYS);
+    if choices
+        .settled_since(session_id, LifeChoiceKind::BatheTogether, cooled)
+        .await?
+        || !runway_clear(state, session_id, instance_id, now).await?
+    {
+        return Ok(());
+    }
+
+    let cue = LifeChoiceCue::Ask {
+        kind: LifeChoiceKind::BatheTogether,
+        tier_gap: None,
+        anchor_seen: since,
+    };
+    if ask(state, session_id, user_id, instance_id, persona, now, cue).await? {
+        tracing::info!(%session_id, "she asked for a bath together");
+    }
+    Ok(())
 }
 
 fn travel_qualifies(bond_tier: u8, endpoints: &[JudgedEndpoints]) -> bool {
@@ -1955,6 +2041,8 @@ mod tests {
     const PROPOSE_CUE: &str =
         "（你越来越确定想和对方共度一生。你决定郑重地向对方求婚，希望对方给你一个答复。）";
     const SLEEP_TEXT: &str = "今晚留下来陪我，好不好？";
+    const BATHE_CUE: &str = "（你们最近越来越亲密，你很想和对方一起洗个澡。你决定主动开口，问对方愿不愿意和你一起洗，希望对方给你一个答复。）";
+    const BATHE_TEXT: &str = "要不要一起洗澡？";
     const PROPOSE_TEXT: &str = "你愿意和我结婚吗？";
     /// Nothing moved, warmth and patience both at the top level.
     const WARM: &str = r#"{"warmth":3,"trust":{"grade":0,"direction":"up"},"intimacy":{"grade":0,"direction":"up"},"intrigue":{"grade":0,"direction":"up"},"tension":{"grade":0,"direction":"up"},"patience":3,"reason":"很好"}"#;
@@ -1975,6 +2063,25 @@ mod tests {
             .execute(&self.pool)
             .await
             .unwrap();
+        }
+
+        /// The persona's `art_metadata`, read by the next turn.
+        async fn set_art(&mut self, art: serde_json::Value) {
+            sqlx::query(
+                "UPDATE engine.persona_genomes g SET art_metadata = $2 \
+                   FROM engine.persona_instances i \
+                  WHERE i.id = $1 AND g.id = i.genome_id",
+            )
+            .bind(self.instance_id)
+            .bind(art)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+            self.persona = PersonaRepo { pool: &self.pool }
+                .load_companion(self.instance_id)
+                .await
+                .unwrap()
+                .expect("the persona");
         }
 
         /// A `kind` choice asked `ago` ago, in `status`. A romantic kind
@@ -2099,6 +2206,89 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_bath_rule() {
+        let e = |warmth| JudgedEndpoints {
+            warmth,
+            patience: 0.1,
+        };
+        // Newest first; three of five reach 0.5.
+        let three = [e(0.5), e(0.2), e(0.6), e(0.1), e(0.9)];
+        let two = [e(0.5), e(0.49), e(0.6), e(0.1)];
+        assert!(bathe_qualifies(2, Some(true), &three), "hygienic at 2");
+        assert!(!bathe_qualifies(1, Some(true), &three), "hygienic at 1");
+        assert!(!bathe_qualifies(2, None, &three), "neutral at 2");
+        assert!(bathe_qualifies(3, None, &three), "neutral at 3");
+        assert!(
+            !bathe_qualifies(5, Some(false), &three),
+            "never if not hygienic"
+        );
+        assert!(!bathe_qualifies(5, Some(true), &two), "two warm turns");
+    }
+
+    /// A hygienic persona at chemistry tier 2: her third warm-enough judged
+    /// turn asks for a bath, where the bed (tier 3) and a trip (warmth above
+    /// 0.7) cannot.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_hygienic_persona_asks_for_a_bath_at_chemistry_2(pool: PgPool) {
+        let mut s = scene_with_lines(&pool, 0.5, 0.25).await;
+        s.set_art(json!({"hygienic": true})).await;
+        s.record_scopes("full", AffinityScope::chemistry()).await;
+        let mock = mock_llm(WARM, Some(BATHE_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+
+        s.turn(&state, SEEN).await;
+        s.turn(&state, SEEN).await;
+        assert!(s.kinds().await.is_empty(), "two turns are not three");
+
+        s.turn(&state, SEEN).await;
+        assert_eq!(s.tiers().await.1, 2, "chemistry tier 2");
+        assert_eq!(s.kinds().await, vec![pending("bathe_together")]);
+        assert_eq!(s.ask_rows().await[0].1, BATHE_TEXT);
+        assert_eq!(only_cue(&mock).await, json!(BATHE_CUE));
+    }
+
+    /// The same streak at tier 2 asks nothing of a persona with no
+    /// `hygienic`.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_neutral_persona_waits_for_chemistry_3(pool: PgPool) {
+        let s = scene_with_lines(&pool, 0.5, 0.25).await;
+        s.record_scopes("full", AffinityScope::chemistry()).await;
+        let mock = mock_llm(WARM, Some(BATHE_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+        for _ in 0..4 {
+            s.turn(&state, SEEN).await;
+        }
+        assert!(s.kinds().await.is_empty());
+        assert!(companion_calls(&mock).await.is_empty());
+    }
+
+    /// An accepted or ignored bath holds the next ask back for 7 days.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_bath_cools_down_for_7_days(pool: PgPool) {
+        let mock = mock_llm(WARM, Some(BATHE_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+        for (days, asks) in [(6, false), (8, true)] {
+            let mut s = scene_with_lines(&pool, 0.5, 0.25).await;
+            s.set_art(json!({"hygienic": true})).await;
+            s.record_scopes("full", AffinityScope::chemistry()).await;
+            s.seed_romantic(
+                LifeChoiceKind::BatheTogether,
+                "ignored",
+                Duration::days(days),
+            )
+            .await;
+            for _ in 0..3 {
+                s.turn(&state, SEEN).await;
+            }
+            assert_eq!(
+                s.kinds().await.contains(&pending("bathe_together")),
+                asks,
+                "{days} days"
+            );
+        }
+    }
+
     /// Lines at 0.5 (tiers 3/3), where a level-3 verdict reads about 0.74 on
     /// both endpoints: on a compatible pair the third warm judged turn asks.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -2165,7 +2355,9 @@ mod tests {
         let cold_state = with_models(test_state(pool.clone()), &cold.uri());
         let state = |is_warm: bool| if is_warm { &warm_state } else { &cold_state };
 
-        let s = scene_with_lines(&pool, 0.7, 0.7).await;
+        // Not hygienic: the bath, whose bar is lower, never asks.
+        let mut s = scene_with_lines(&pool, 0.7, 0.7).await;
+        s.set_art(json!({"hygienic": false})).await;
         s.record_scopes("full", AffinityScope::chemistry()).await;
         for (i, is_warm) in [false, true, true, false, true, true, false, true]
             .into_iter()
@@ -2179,7 +2371,8 @@ mod tests {
         assert_eq!(only_cue(&warm).await, json!(PROPOSE_CUE));
         assert!(companion_calls(&cold).await.is_empty());
 
-        let four = scene_with_lines(&pool, 0.7, 0.7).await;
+        let mut four = scene_with_lines(&pool, 0.7, 0.7).await;
+        four.set_art(json!({"hygienic": false})).await;
         four.record_scopes("full", AffinityScope::chemistry()).await;
         for is_warm in [true, false, true, true, false, true, false, false] {
             four.turn(state(is_warm), SEEN).await;
@@ -2220,12 +2413,15 @@ mod tests {
             s.record_scopes("full", AffinityScope::chemistry()).await;
             // A background keeps the trip ask out of it.
             s.event_under_way(EventKind::ShortTrip).await;
+            // A bath taken yesterday keeps the bath ask out of it.
+            s.seed_romantic(LifeChoiceKind::BatheTogether, "accepted", Duration::days(1))
+                .await;
             s.seed_romantic(LifeChoiceKind::SleepTogether, status, Duration::hours(1))
                 .await;
             for _ in 0..4 {
                 s.turn(&state, SEEN).await;
             }
-            assert_eq!(s.kinds().await.len(), 1, "{status}");
+            assert_eq!(s.kinds().await.len(), 2, "{status}");
         }
         assert!(companion_calls(&mock).await.is_empty());
     }

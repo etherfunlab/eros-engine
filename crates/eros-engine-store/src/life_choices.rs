@@ -30,6 +30,8 @@ pub enum LifeChoiceKind {
     Propose,
     /// She suggests going away together.
     TravelTogether,
+    /// She asks the user to take a bath with her.
+    BatheTogether,
 }
 
 impl LifeChoiceKind {
@@ -40,6 +42,7 @@ impl LifeChoiceKind {
             Self::SleepTogether => "sleep_together",
             Self::Propose => "propose",
             Self::TravelTogether => "travel_together",
+            Self::BatheTogether => "bathe_together",
         }
     }
 
@@ -49,13 +52,17 @@ impl LifeChoiceKind {
             "sleep_together" => Some(Self::SleepTogether),
             "propose" => Some(Self::Propose),
             "travel_together" => Some(Self::TravelTogether),
+            "bathe_together" => Some(Self::BatheTogether),
             _ => None,
         }
     }
 
-    /// `sleep_together` or `propose`.
+    /// `sleep_together`, `propose` or `bathe_together`.
     pub fn is_romantic(self) -> bool {
-        matches!(self, Self::SleepTogether | Self::Propose)
+        matches!(
+            self,
+            Self::SleepTogether | Self::Propose | Self::BatheTogether
+        )
     }
 }
 
@@ -507,6 +514,7 @@ mod tests {
             (LifeChoiceKind::SleepTogether, "sleep_together", true),
             (LifeChoiceKind::Propose, "propose", true),
             (LifeChoiceKind::TravelTogether, "travel_together", false),
+            (LifeChoiceKind::BatheTogether, "bathe_together", true),
         ] {
             assert_eq!(kind.as_str(), wire);
             assert_eq!(LifeChoiceKind::parse(wire), Some(kind));

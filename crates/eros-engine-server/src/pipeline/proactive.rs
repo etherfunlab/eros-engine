@@ -152,6 +152,10 @@ impl LifeChoiceCue {
                 ..
             } => "（你越来越确定想和对方共度一生。你决定郑重地向对方求婚，希望对方给你一个答复。）".into(),
             Self::Ask {
+                kind: LifeChoiceKind::BatheTogether,
+                ..
+            } => "（你们最近越来越亲密，你很想和对方一起洗个澡。你决定主动开口，问对方愿不愿意和你一起洗，希望对方给你一个答复。）".into(),
+            Self::Ask {
                 kind: LifeChoiceKind::TravelTogether,
                 ..
             } => "（你们最近相处得很舒服，你很想和对方一起出去走走。你决定主动开口，提议一起去旅行，希望对方给你一个答复。）".into(),
@@ -179,6 +183,14 @@ impl LifeChoiceCue {
                 kind: LifeChoiceKind::Propose,
                 accepted: false,
             } => "（对方拒绝了你的求婚，你心里很难受。）".into(),
+            Self::Answered {
+                kind: LifeChoiceKind::BatheTogether,
+                accepted: true,
+            } => "（对方答应了和你一起洗澡，你们现在一起泡在浴缸里。）".into(),
+            Self::Answered {
+                kind: LifeChoiceKind::BatheTogether,
+                accepted: false,
+            } => "（对方没有答应和你一起洗澡，你有点失落。）".into(),
             Self::Answered {
                 kind: LifeChoiceKind::TravelTogether,
                 accepted: true,
@@ -316,6 +328,14 @@ fn kind_cue(
         OnTheRoad => "（你正在路上，这一趟要走好几个小时。）".into(),
         WatchingMatch => "（你正在看一场比赛。）".into(),
         WatchingShow => "（你正在看一场演出。）".into(),
+        BirdEncounter => "（你刚看到一只鸟停在不远处。）".into(),
+        ExWantsBack => "（你的前任刚来找你，说想复合。）".into(),
+        WantToQuitJob => "（你刚冒出想辞职的念头。）".into(),
+        PonderingLife => "（你刚一个人发呆，在想人生的事。）".into(),
+        Streaking => "（你刚一时兴起，脱光了跑了一圈。）".into(),
+        WantToSeeSea => "（你现在很想去看海。）".into(),
+        WantHotSpring => "（你现在很想去泡温泉。）".into(),
+        WantSauna => "（你现在很想去洗桑拿。）".into(),
         WantToGoOut => "（你现在很想出门走走。）".into(),
         WantToGoHome => "（你现在很想回家。）".into(),
         TempWork => "（你刚临时接到一份工作，得马上去处理。）".into(),
@@ -335,7 +355,7 @@ fn kind_cue(
         OutShopping if traits.female => "（你接下来要出门逛街，这段时间顾不上看手机。）".into(),
         OutShopping => "（你正在外面逛街。）".into(),
         AwayFromPhone | Asleep | BrosGathering | SisGathering | HavingSex | TakingSpace
-        | FellOut | TravelingTogether => {
+        | FellOut | TravelingTogether | BathingTogether => {
             unreachable!("{kind:?} is never told")
         }
         Sick => format!("（你生病了，大概要 {span}才会好。）"),
@@ -1018,6 +1038,17 @@ mod tests {
             ),
             (EventKind::WatchingMatch, "（你正在看一场比赛。）"),
             (EventKind::WatchingShow, "（你正在看一场演出。）"),
+            (EventKind::BirdEncounter, "（你刚看到一只鸟停在不远处。）"),
+            (EventKind::ExWantsBack, "（你的前任刚来找你，说想复合。）"),
+            (EventKind::WantToQuitJob, "（你刚冒出想辞职的念头。）"),
+            (
+                EventKind::PonderingLife,
+                "（你刚一个人发呆，在想人生的事。）",
+            ),
+            (EventKind::Streaking, "（你刚一时兴起，脱光了跑了一圈。）"),
+            (EventKind::WantToSeeSea, "（你现在很想去看海。）"),
+            (EventKind::WantHotSpring, "（你现在很想去泡温泉。）"),
+            (EventKind::WantSauna, "（你现在很想去洗桑拿。）"),
         ] {
             assert_eq!(
                 kind_cue(kind, h, 1, &PersonaTraits::default(), None, false),
@@ -1219,6 +1250,18 @@ mod tests {
         assert_eq!(
             cue(ask(LifeChoiceKind::Propose)),
             "（你越来越确定想和对方共度一生。你决定郑重地向对方求婚，希望对方给你一个答复。）"
+        );
+        assert_eq!(
+            cue(ask(LifeChoiceKind::BatheTogether)),
+            "（你们最近越来越亲密，你很想和对方一起洗个澡。你决定主动开口，问对方愿不愿意和你一起洗，希望对方给你一个答复。）"
+        );
+        assert_eq!(
+            cue(answered(LifeChoiceKind::BatheTogether, true)),
+            "（对方答应了和你一起洗澡，你们现在一起泡在浴缸里。）"
+        );
+        assert_eq!(
+            cue(answered(LifeChoiceKind::BatheTogether, false)),
+            "（对方没有答应和你一起洗澡，你有点失落。）"
         );
         assert_eq!(
             cue(answered(LifeChoiceKind::Propose, true)),

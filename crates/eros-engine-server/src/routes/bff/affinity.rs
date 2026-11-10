@@ -69,7 +69,8 @@ pub struct BffAffinityDelta {
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct LifeChoiceDto {
     pub id: Uuid,
-    /// `ask_for_space`, `sleep_together`, `propose` or `travel_together`.
+    /// `ask_for_space`, `sleep_together`, `propose`, `travel_together` or
+    /// `bathe_together`.
     pub kind: String,
     /// The answers the resolution endpoint takes: `["accept", "decline"]`.
     pub options: Vec<String>,

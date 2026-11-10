@@ -119,11 +119,22 @@ pub enum EventKind {
     /// She undresses for the user and sends a picture (spec
     /// 2026-11-08-strip-and-world-setting-design.md §3).
     Strip,
+    BirdEncounter,
+    ExWantsBack,
+    WantToQuitJob,
+    PonderingLife,
+    Streaking,
+    WantToSeeSea,
+    WantHotSpring,
+    WantSauna,
+    /// She and the user take a bath together: written when the user accepts
+    /// her `bathe_together` ask.
+    BathingTogether,
 }
 
 impl EventKind {
     /// Every drawable kind, in draw order.
-    pub const ALL: [EventKind; 53] = [
+    pub const ALL: [EventKind; 61] = [
         EventKind::PoliceEncounter,
         EventKind::AnimalEncounter,
         EventKind::HitSomeone,
@@ -177,13 +188,22 @@ impl EventKind {
         EventKind::LongTrip,
         EventKind::HometownVisit,
         EventKind::Strip,
+        EventKind::BirdEncounter,
+        EventKind::ExWantsBack,
+        EventKind::WantToQuitJob,
+        EventKind::PonderingLife,
+        EventKind::Streaking,
+        EventKind::WantToSeeSea,
+        EventKind::WantHotSpring,
+        EventKind::WantSauna,
     ];
 
     /// Kinds the writers place directly, never drawn: parsed and stored, not in `ALL`.
-    pub const SPECIAL: [EventKind; 3] = [
+    pub const SPECIAL: [EventKind; 4] = [
         EventKind::TakingSpace,
         EventKind::FellOut,
         EventKind::TravelingTogether,
+        EventKind::BathingTogether,
     ];
 
     /// The stored and wire value.
@@ -245,6 +265,15 @@ impl EventKind {
             EventKind::FellOut => "fell_out",
             EventKind::TravelingTogether => "traveling_together",
             EventKind::Strip => "strip",
+            EventKind::BirdEncounter => "bird_encounter",
+            EventKind::ExWantsBack => "ex_wants_back",
+            EventKind::WantToQuitJob => "want_to_quit_job",
+            EventKind::PonderingLife => "pondering_life",
+            EventKind::Streaking => "streaking",
+            EventKind::WantToSeeSea => "want_to_see_sea",
+            EventKind::WantHotSpring => "want_hot_spring",
+            EventKind::WantSauna => "want_sauna",
+            EventKind::BathingTogether => "bathing_together",
         }
     }
 
@@ -261,9 +290,9 @@ impl EventKind {
             PoliceEncounter | AnimalEncounter | HitSomeone | SuddenDesire | GroceryShopping
             | Showering | Bathing | InClass | OnTheWay | PeriodScare | PregnancyScare
             | GotBumped | BumpedSomeone | Quarrel | ScoldedBySuperior | ScoldedSuperior
-            | SawBag | SawClothes | AdmiringScenery | AdmiringArt | TakingSelfie | Strip => {
-                EventCategory::Short
-            }
+            | SawBag | SawClothes | AdmiringScenery | AdmiringArt | TakingSelfie | Strip
+            | BirdEncounter | ExWantsBack | WantToQuitJob | PonderingLife | Streaking
+            | WantToSeeSea | WantHotSpring | WantSauna | BathingTogether => EventCategory::Short,
             TempWork | ExMessage | WeatherChange | GotHit | Breakup | WorkingOut | Reading
             | Gaming | AwayFromPhone | Unwell | Irritable | Busy | InBattle | Asleep
             | OutShopping | BrosGathering | SisGathering | OnTheRoad | WatchingMatch
@@ -420,6 +449,15 @@ fn rule(kind: EventKind) -> Rule {
         FellOut => (0.0, 0, Lasts::Hours(1, 1)),
         TravelingTogether => (0.0, 0, Lasts::Hours(2 * DAY, 3 * DAY)),
         Strip => (1.0, 48, Lasts::Minutes(30)),
+        BirdEncounter => (2.0, 12, Lasts::Minutes(30)),
+        ExWantsBack => (0.5, 30 * DAY, Lasts::Hours(1, 1)),
+        WantToQuitJob => (1.0, 7 * DAY, Lasts::Hours(1, 1)),
+        PonderingLife => (2.0, 48, Lasts::Hours(1, 1)),
+        Streaking => (0.5, 30 * DAY, Lasts::Minutes(30)),
+        WantToSeeSea => (2.0, 72, Lasts::Hours(1, 1)),
+        WantHotSpring => (1.0, 72, Lasts::Hours(1, 1)),
+        WantSauna => (1.0, 72, Lasts::Hours(1, 1)),
+        BathingTogether => (0.0, 0, Lasts::Minutes(30)),
     };
     Rule {
         weight,
@@ -490,6 +528,28 @@ impl Setting {
     }
 }
 
+/// How much of her day is work, `art_metadata.employed` (spec
+/// 2026-11-11-eight-short-events-and-hygienic-design.md §4). Absent or
+/// unknown reads as `PartTime`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Employment {
+    Free,
+    #[default]
+    PartTime,
+    FullTime,
+}
+
+impl Employment {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "free" => Some(Employment::Free),
+            "part_time" => Some(Employment::PartTime),
+            "full_time" => Some(Employment::FullTime),
+            _ => None,
+        }
+    }
+}
+
 /// The persona's settings the draw reads (§4). `Default` is a persona with
 /// none of them.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -514,6 +574,12 @@ pub struct PersonaTraits {
     /// `art_metadata.setting`: the kinds that do not fit her world are never
     /// drawn.
     pub setting: Setting,
+    /// `art_metadata.hygienic`: `true` or `false` scales the bathing kinds;
+    /// `None` leaves them be.
+    pub hygienic: Option<bool>,
+    /// `art_metadata.employed`: scales the work kinds; `Free` never wants to
+    /// quit a job.
+    pub employed: Employment,
 }
 
 fn passes_gate(
@@ -523,9 +589,12 @@ fn passes_gate(
     romance_compatible: bool,
 ) -> bool {
     match kind {
-        EventKind::Strip => rung >= DESIRE_MIN_RUNG && romance_compatible,
-        EventKind::ExMessage | EventKind::Breakup => rung >= CONFIDE_MIN_RUNG,
+        EventKind::Strip | EventKind::Streaking => rung >= DESIRE_MIN_RUNG && romance_compatible,
+        EventKind::ExMessage | EventKind::Breakup | EventKind::ExWantsBack => {
+            rung >= CONFIDE_MIN_RUNG
+        }
         EventKind::SuddenDesire => rung >= DESIRE_MIN_RUNG,
+        EventKind::WantToQuitJob => persona.employed != Employment::Free,
         EventKind::Period | EventKind::SawBag | EventKind::SawClothes => persona.female,
         EventKind::PeriodScare => persona.female && rung >= CONFIDE_MIN_RUNG,
         EventKind::PregnancyScare => persona.female && rung >= DESIRE_MIN_RUNG,
@@ -542,11 +611,16 @@ fn needs_factor(kind: EventKind, needs: Option<&Needs>) -> f64 {
     };
     match kind {
         TempWork | WorkingOut if n.stamina == NeedLevel::Low => 0.5,
-        Unwell | Sick | Bathing | Asleep if n.stamina == NeedLevel::Low => 2.0,
+        Unwell | Sick | Bathing | Asleep | WantHotSpring | WantSauna
+            if n.stamina == NeedLevel::Low =>
+        {
+            2.0
+        }
         GroceryShopping if n.hunger == NeedLevel::High => 2.0,
         ExMessage if n.emotional == NeedLevel::High => 3.0,
         AnimalEncounter | Irritable | Quarrel if n.emotional == NeedLevel::High => 2.0,
         WantToGoOut if n.outing == NeedLevel::High => 3.0,
+        WantToSeeSea if n.outing == NeedLevel::High => 2.0,
         WantToGoHome if n.outing == NeedLevel::Low => 3.0,
         _ => 1.0,
     }
@@ -609,6 +683,10 @@ fn follows(prior: EventKind, kind: EventKind) -> bool {
             | (Breakup | Quarrel | ScoldedBySuperior | InBattle, Irritable)
             | (GotHit | GotBumped | WeatherChange, Unwell)
             | (WorkingOut, Showering | Bathing)
+            | (ExMessage | Breakup, ExWantsBack)
+            | (ScoldedBySuperior | TempWork, WantToQuitJob)
+            | (Breakup | Quarrel | WantToQuitJob, PonderingLife)
+            | (PonderingLife, WantToSeeSea)
     )
 }
 
@@ -650,12 +728,43 @@ fn homesick_factor(kind: EventKind, persona: &PersonaTraits) -> f64 {
     }
 }
 
-/// How `sex_addict` scales `sudden_desire` and `strip` within their category:
+/// How `sex_addict` scales `sudden_desire`, `strip` and `streaking` within
+/// their category:
 /// three times or a third as likely. Their gates hold either way.
 fn sex_addict_factor(kind: EventKind, persona: &PersonaTraits) -> f64 {
     match (kind, persona.sex_addict) {
-        (EventKind::SuddenDesire | EventKind::Strip, Some(true)) => PREFERENCE_FACTOR,
-        (EventKind::SuddenDesire | EventKind::Strip, Some(false)) => 1.0 / PREFERENCE_FACTOR,
+        (EventKind::SuddenDesire | EventKind::Strip | EventKind::Streaking, Some(true)) => {
+            PREFERENCE_FACTOR
+        }
+        (EventKind::SuddenDesire | EventKind::Strip | EventKind::Streaking, Some(false)) => {
+            1.0 / PREFERENCE_FACTOR
+        }
+        _ => 1.0,
+    }
+}
+
+/// How `hygienic` scales the bathing kinds within their category: three
+/// times or a third as likely.
+fn hygienic_factor(kind: EventKind, persona: &PersonaTraits) -> f64 {
+    use EventKind::*;
+    match (kind, persona.hygienic) {
+        (Showering | Bathing | WantHotSpring | WantSauna, Some(true)) => PREFERENCE_FACTOR,
+        (Showering | Bathing | WantHotSpring | WantSauna, Some(false)) => 1.0 / PREFERENCE_FACTOR,
+        _ => 1.0,
+    }
+}
+
+/// How `employed` scales the work kinds within their category: a third as
+/// likely for a persona with no job, three times for a full-time one.
+fn employed_factor(kind: EventKind, persona: &PersonaTraits) -> f64 {
+    use EventKind::*;
+    match (kind, persona.employed) {
+        (TempWork | ScoldedBySuperior | ScoldedSuperior | BusinessTrip, Employment::Free) => {
+            1.0 / PREFERENCE_FACTOR
+        }
+        (TempWork | ScoldedBySuperior | ScoldedSuperior | BusinessTrip, Employment::FullTime) => {
+            PREFERENCE_FACTOR
+        }
         _ => 1.0,
     }
 }
@@ -693,6 +802,8 @@ fn rules_out(background: EventKind, kind: EventKind) -> bool {
                 | WatchingShow
                 | OnTheRoad
                 | HavingSex
+                | BirdEncounter
+                | Streaking
         ),
         Period => kind.is_false_alarm(),
         // She is with the user: nothing takes her out of reach.
@@ -820,7 +931,9 @@ pub fn draw(input: &DrawInput, rolls: Rolls) -> Option<Drawn> {
                 * follow_factor(k, input.history, input.now)
                 * prior_factor(k, input.persona, input.ever_had_sex)
                 * homesick_factor(k, input.persona)
-                * sex_addict_factor(k, input.persona);
+                * sex_addict_factor(k, input.persona)
+                * hygienic_factor(k, input.persona)
+                * employed_factor(k, input.persona);
             (k, weight)
         })
         .collect();
@@ -909,7 +1022,10 @@ pub fn offline_kinds(persona: &PersonaTraits) -> Vec<EventKind> {
 /// the storage-only `taking_space`, `fell_out` and `traveling_together`.
 pub fn is_told(kind: EventKind, rung: u8, persona: &PersonaTraits) -> bool {
     match kind {
-        EventKind::TakingSpace | EventKind::FellOut | EventKind::TravelingTogether => false,
+        EventKind::TakingSpace
+        | EventKind::FellOut
+        | EventKind::TravelingTogether
+        | EventKind::BathingTogether => false,
         EventKind::Busy | EventKind::InBattle => rung >= CONFIDE_MIN_RUNG,
         EventKind::OutShopping if persona.female => rung >= CONFIDE_MIN_RUNG,
         k => !k.is_offline(persona),
@@ -1450,7 +1566,7 @@ mod tests {
         let count = |c| EventKind::ALL.iter().filter(|k| k.category() == c).count();
         assert_eq!(
             EventCategory::ALL.map(count),
-            [22, 23, 4, 4],
+            [30, 23, 4, 4],
             "short, mid, body, trip"
         );
         assert!(!EventCategory::Short.is_background());
@@ -1479,7 +1595,15 @@ mod tests {
 
     /// The kinds added after the 28 v2 kinds; tests pinned to the weights of
     /// those 28 draw from `earlier()`.
-    const ADDED: [EventKind; 24] = [
+    const ADDED: [EventKind; 32] = [
+        BirdEncounter,
+        ExWantsBack,
+        WantToQuitJob,
+        PonderingLife,
+        Streaking,
+        WantToSeeSea,
+        WantHotSpring,
+        WantSauna,
         PeriodScare,
         PregnancyScare,
         Busy,
@@ -1733,7 +1857,7 @@ mod tests {
             assert_eq!(EventKind::parse(s), Some(k));
             assert!(EventKind::ALL.contains(&k), "{k:?}");
         }
-        assert_eq!(EventKind::ALL.len(), 53);
+        assert_eq!(EventKind::ALL.len(), 61);
     }
 
     #[test]
@@ -1742,7 +1866,7 @@ mod tests {
         assert_eq!(EventKind::parse("fell_out"), Some(FellOut));
         assert!(!EventKind::ALL.contains(&TakingSpace));
         assert!(!EventKind::ALL.contains(&FellOut));
-        assert_eq!(EventKind::ALL.len(), 53);
+        assert_eq!(EventKind::ALL.len(), 61);
         for k in EventKind::SPECIAL {
             assert_eq!(serde_json::to_value(k).unwrap(), k.as_str());
             assert_eq!(EventKind::parse(k.as_str()), Some(k));
@@ -2399,6 +2523,20 @@ mod tests {
     }
 
     #[test]
+    fn bathing_together_is_a_placed_incident_she_does_not_tell() {
+        let b = BathingTogether;
+        assert!(EventKind::SPECIAL.contains(&b) && !EventKind::ALL.contains(&b));
+        assert_eq!(EventKind::parse("bathing_together"), Some(b));
+        assert_eq!(b.category(), EventCategory::Short);
+        assert!(!b.may_be_offline());
+        assert!(b.fits(Setting::Fantasy));
+        assert_eq!(lasts(b, 0.5), Duration::minutes(30));
+        for rung in 1..=5 {
+            assert!(!is_told(b, rung, &PersonaTraits::default()), "rung {rung}");
+        }
+    }
+
+    #[test]
     fn a_trip_together_lasts_two_to_three_days() {
         assert_eq!(lasts(TravelingTogether, 0.0), Duration::hours(48));
         assert_eq!(lasts(TravelingTogether, 1.0), Duration::hours(72));
@@ -2559,5 +2697,198 @@ mod tests {
         assert_eq!(sex_addict_factor(Strip, &with(Some(true))), 3.0);
         assert_eq!(sex_addict_factor(Strip, &with(Some(false))), 1.0 / 3.0);
         assert_eq!(sex_addict_factor(Strip, &with(None)), 1.0);
+    }
+
+    #[test]
+    fn the_eight_short_kinds() {
+        for (k, w, cd, want) in [
+            (BirdEncounter, 2.0, 12, Duration::minutes(30)),
+            (ExWantsBack, 0.5, 30 * DAY, Duration::hours(1)),
+            (WantToQuitJob, 1.0, 7 * DAY, Duration::hours(1)),
+            (PonderingLife, 2.0, 48, Duration::hours(1)),
+            (Streaking, 0.5, 30 * DAY, Duration::minutes(30)),
+            (WantToSeeSea, 2.0, 72, Duration::hours(1)),
+            (WantHotSpring, 1.0, 72, Duration::hours(1)),
+            (WantSauna, 1.0, 72, Duration::hours(1)),
+        ] {
+            assert_eq!(k.category(), EventCategory::Short, "{k:?}");
+            assert_eq!(rule(k).weight, w, "{k:?}");
+            assert_eq!(rule(k).cooldown_hours, cd, "{k:?}");
+            assert_eq!(lasts(k, 0.5), want, "{k:?}");
+            assert!(!k.may_be_offline() && !k.is_photo(), "{k:?}");
+            assert!(k.fits(Setting::Fantasy), "{k:?}");
+            assert!(is_told(k, 0, &PersonaTraits::default()), "{k:?}");
+            assert!(EventKind::ALL.contains(&k), "{k:?}");
+            assert_eq!(EventKind::parse(k.as_str()), Some(k));
+        }
+        assert_eq!(BirdEncounter.as_str(), "bird_encounter");
+        assert_eq!(ExWantsBack.as_str(), "ex_wants_back");
+        assert_eq!(WantToQuitJob.as_str(), "want_to_quit_job");
+        assert_eq!(PonderingLife.as_str(), "pondering_life");
+        assert_eq!(Streaking.as_str(), "streaking");
+        assert_eq!(WantToSeeSea.as_str(), "want_to_see_sea");
+        assert_eq!(WantHotSpring.as_str(), "want_hot_spring");
+        assert_eq!(WantSauna.as_str(), "want_sauna");
+    }
+
+    #[test]
+    fn the_eight_gates() {
+        let p = PersonaTraits::default();
+        assert!(!passes_gate(ExWantsBack, 1, &p, false));
+        assert!(passes_gate(ExWantsBack, 2, &p, false));
+        assert!(!passes_gate(Streaking, 3, &p, false));
+        assert!(!passes_gate(Streaking, 2, &p, true));
+        assert!(passes_gate(Streaking, 3, &p, true));
+        assert!(passes_gate(PonderingLife, 0, &p, false));
+        // Not compatible at rung 3: never drawn.
+        assert_eq!(pick_ever(&p, false, &[Streaking], rolls(0.0, 0.0)), None);
+    }
+
+    #[test]
+    fn the_eight_factors_follows_and_rule_outs() {
+        let mid = Needs {
+            hunger: NeedLevel::Mid,
+            social: NeedLevel::Mid,
+            stamina: NeedLevel::Mid,
+            emotional: NeedLevel::Mid,
+            outing: NeedLevel::Mid,
+            indulgence: NeedLevel::Mid,
+        };
+        let outing_high = Needs {
+            outing: NeedLevel::High,
+            ..mid
+        };
+        let stamina_low = Needs {
+            stamina: NeedLevel::Low,
+            ..mid
+        };
+        assert_eq!(needs_factor(WantToSeeSea, Some(&outing_high)), 2.0);
+        assert_eq!(needs_factor(WantToSeeSea, Some(&mid)), 1.0);
+        assert_eq!(needs_factor(WantHotSpring, Some(&stamina_low)), 2.0);
+        assert_eq!(needs_factor(WantSauna, Some(&stamina_low)), 2.0);
+        let addict = |sex_addict| PersonaTraits {
+            sex_addict,
+            ..Default::default()
+        };
+        assert_eq!(sex_addict_factor(Streaking, &addict(Some(true))), 3.0);
+        assert_eq!(
+            sex_addict_factor(Streaking, &addict(Some(false))),
+            1.0 / 3.0
+        );
+        for (prior, kind) in [
+            (ExMessage, ExWantsBack),
+            (Breakup, ExWantsBack),
+            (ScoldedBySuperior, WantToQuitJob),
+            (TempWork, WantToQuitJob),
+            (Breakup, PonderingLife),
+            (Quarrel, PonderingLife),
+            (WantToQuitJob, PonderingLife),
+            (PonderingLife, WantToSeeSea),
+        ] {
+            assert!(follows(prior, kind), "{prior:?} -> {kind:?}");
+        }
+        for bg in [Hospitalized, PostSurgery] {
+            assert!(rules_out(bg, BirdEncounter) && rules_out(bg, Streaking));
+            for k in [
+                ExWantsBack,
+                WantToQuitJob,
+                PonderingLife,
+                WantToSeeSea,
+                WantHotSpring,
+                WantSauna,
+            ] {
+                assert!(!rules_out(bg, k), "{bg:?} {k:?}");
+            }
+        }
+    }
+
+    fn with_hygienic(hygienic: Option<bool>) -> PersonaTraits {
+        PersonaTraits {
+            hygienic,
+            ..Default::default()
+        }
+    }
+
+    fn with_employed(employed: Employment) -> PersonaTraits {
+        PersonaTraits {
+            employed,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn hygienic_scales_the_bathing_kinds() {
+        for k in [Showering, Bathing, WantHotSpring, WantSauna] {
+            assert_eq!(hygienic_factor(k, &with_hygienic(Some(true))), 3.0);
+            assert_eq!(hygienic_factor(k, &with_hygienic(Some(false))), 1.0 / 3.0);
+            assert_eq!(hygienic_factor(k, &with_hygienic(None)), 1.0);
+        }
+        assert_eq!(
+            hygienic_factor(GroceryShopping, &with_hygienic(Some(true))),
+            1.0
+        );
+        // Draw order is `ALL` order: GroceryShopping, Showering, both 2.
+        let both = [GroceryShopping, Showering];
+        let at = |p: &PersonaTraits, k| pick_ever(p, false, &both, rolls(0.0, k));
+        // true: 2, 6 — GroceryShopping below .25.
+        assert_eq!(at(&with_hygienic(Some(true)), 0.2), Some(GroceryShopping));
+        assert_eq!(at(&with_hygienic(Some(true)), 0.3), Some(Showering));
+        // false: 2, 2/3 — GroceryShopping below .75.
+        assert_eq!(at(&with_hygienic(Some(false)), 0.7), Some(GroceryShopping));
+        assert_eq!(at(&with_hygienic(Some(false)), 0.8), Some(Showering));
+        // unset: 2, 2 — GroceryShopping below .5.
+        assert_eq!(at(&with_hygienic(None), 0.45), Some(GroceryShopping));
+        assert_eq!(at(&with_hygienic(None), 0.55), Some(Showering));
+    }
+
+    #[test]
+    fn employed_scales_the_work_kinds() {
+        for k in [TempWork, ScoldedBySuperior, ScoldedSuperior, BusinessTrip] {
+            assert_eq!(
+                employed_factor(k, &with_employed(Employment::Free)),
+                1.0 / 3.0
+            );
+            assert_eq!(
+                employed_factor(k, &with_employed(Employment::PartTime)),
+                1.0
+            );
+            assert_eq!(
+                employed_factor(k, &with_employed(Employment::FullTime)),
+                3.0
+            );
+        }
+        assert_eq!(
+            employed_factor(InClass, &with_employed(Employment::Free)),
+            1.0
+        );
+        // Draw order is `ALL` order: Quarrel, ScoldedBySuperior; both weigh 1.
+        let both = [Quarrel, ScoldedBySuperior];
+        let at = |p: &PersonaTraits, k| pick_ever(p, false, &both, rolls(0.0, k));
+        // full_time: 1, 3 — Quarrel below .25.
+        let full = with_employed(Employment::FullTime);
+        assert_eq!(at(&full, 0.2), Some(Quarrel));
+        assert_eq!(at(&full, 0.3), Some(ScoldedBySuperior));
+        // free: 1, 1/3 — Quarrel below .75.
+        let free = with_employed(Employment::Free);
+        assert_eq!(at(&free, 0.7), Some(Quarrel));
+        assert_eq!(at(&free, 0.8), Some(ScoldedBySuperior));
+    }
+
+    #[test]
+    fn a_free_persona_never_wants_to_quit() {
+        let only = [WantToQuitJob];
+        let at = |e| pick_ever(&with_employed(e), false, &only, rolls(0.0, 0.0));
+        assert_eq!(at(Employment::Free), None);
+        assert_eq!(at(Employment::PartTime), Some(WantToQuitJob));
+        assert_eq!(at(Employment::FullTime), Some(WantToQuitJob));
+    }
+
+    #[test]
+    fn employment_parses_its_three_values() {
+        assert_eq!(Employment::parse("free"), Some(Employment::Free));
+        assert_eq!(Employment::parse("part_time"), Some(Employment::PartTime));
+        assert_eq!(Employment::parse("full_time"), Some(Employment::FullTime));
+        assert_eq!(Employment::parse("retired"), None);
+        assert_eq!(Employment::default(), Employment::PartTime);
     }
 }
