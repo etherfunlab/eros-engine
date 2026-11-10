@@ -496,7 +496,6 @@ Then:
   `last_active_at`.
 - **The user does not win a race.** An event does not yield to a user message that lands while
   it is generated: it happened whether or not the user spoke.
-
 - **Streamed, on request.** The route can answer as a server-sent event stream: the drawn
   event first, then her message as it is generated. The event is still written with the
   message, so the client keeps it only once the message's `done` arrives. See
