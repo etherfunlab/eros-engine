@@ -375,8 +375,9 @@ impl<'a> StoryRepo<'a> {
     /// `[since, now]` plus any still under way at `now`. The cap keeps the
     /// `cap` newest, and a row under way survives it. Left out: a
     /// `taking_space` / `fell_out` whose session is gone or archived (it
-    /// belongs to that relationship), and a false alarm still under way (she
-    /// does not know yet). The narration is dropped when its session is
+    /// belongs to that relationship), a false alarm still under way (she
+    /// does not know yet), and every `bathing_together`: a romantic choice's
+    /// outcome lives in the conversation only (spec 2026-10-30 §4.7). The narration is dropped when its session is
     /// archived; the event stays, as her own life.
     pub async fn life_events(
         &self,
@@ -417,6 +418,7 @@ impl<'a> StoryRepo<'a> {
                     AND (p.started_at >= $2 OR p.ends_at > $3) \
                     AND NOT (p.kind = ANY($5) AND (es.id IS NULL OR es.archived)) \
                     AND NOT (p.kind = ANY($6) AND p.ends_at > $3) \
+                    AND p.kind <> $7 \
              ) \
              SELECT id, kind, session_id, started_at, ends_at, message_id, told \
                FROM e WHERE rn <= $4 OR ends_at > $3 \
@@ -428,6 +430,7 @@ impl<'a> StoryRepo<'a> {
         .bind(cap)
         .bind(&special)
         .bind(&scares)
+        .bind(EventKind::BathingTogether.as_str())
         .fetch_all(self.pool)
         .await?;
         Ok(rows
@@ -1450,6 +1453,31 @@ mod tests {
             .await
             .unwrap();
         assert!(got.is_empty(), "no false alarm under way reaches the story");
+    }
+
+    /// A bath together is a romantic choice's outcome: it lives in the
+    /// conversation only, never in her story (spec 2026-10-30 §4.7).
+    #[sqlx::test(migrations = "./migrations")]
+    async fn life_events_leave_out_a_bath_together(pool: PgPool) {
+        let repo = StoryRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        let inst = seed_instance(&pool, owner, "A", "active").await;
+        let s = seed_session(&pool, owner, inst).await;
+        let now = Utc::now();
+        let m = chrono::Duration::minutes;
+        for (key, kind, from, to) in [
+            ("over", "bathing_together", now - m(90), now - m(60)),
+            ("now", "bathing_together", now - m(10), now + m(20)),
+            ("read", "reading", now - m(200), now - m(100)),
+        ] {
+            seed_event(&pool, inst, Some(s), key, kind, from, to, None).await;
+        }
+        let got = repo
+            .life_events(inst, now - chrono::Duration::days(7), now, 30)
+            .await
+            .unwrap();
+        let kinds: Vec<EventKind> = got.iter().map(|e| e.event.kind).collect();
+        assert_eq!(kinds, vec![EventKind::Reading]);
     }
 
     #[sqlx::test(migrations = "./migrations")]
