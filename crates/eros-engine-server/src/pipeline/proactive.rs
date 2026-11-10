@@ -4,8 +4,9 @@
 //! route (`routes::session_open`, `routes::session_events`) or the pipeline
 //! (`pipeline::life_choice`) decides whether the persona speaks first; this
 //! module generates and persists it. Modelled on
-//! the image-edit text half: no PDE, no streaming, no user row, no
-//! post-process.
+//! the image-edit text half: no PDE, no user row, no post-process. `greet`
+//! answers once the message is stored; `greet_stream` sends it as the chat
+//! stream's frames while it is generated.
 //!
 //! A greeting or opener is checked against its `since` cutoff and yields to
 //! any message that landed at or after it. An event is written at the moment
@@ -18,7 +19,8 @@
 //! Specs: docs/superpowers/specs/2026-09-26-user-locale-and-holiday-greeting-design.md §6,
 //! docs/superpowers/specs/2026-10-03-open-occasions-design.md §5–§6,
 //! docs/superpowers/specs/2026-10-15-life-events-v2-design.md §6,
-//! docs/superpowers/specs/2026-10-19-life-events-shopping-gatherings-and-ask-for-space-design.md §3.2
+//! docs/superpowers/specs/2026-10-19-life-events-shopping-gatherings-and-ask-for-space-design.md §3.2,
+//! docs/superpowers/specs/2026-11-10-proactive-reply-streaming-design.md
 
 use chrono::{DateTime, NaiveDate, Utc};
 use eros_engine_core::events::{offline_kinds, EventKind, PersonaTraits};

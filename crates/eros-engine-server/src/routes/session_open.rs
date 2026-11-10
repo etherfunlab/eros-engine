@@ -262,6 +262,8 @@ fn validate_opener(
 }
 
 /// The request, decided: everything the route does before generating.
+// Built once per request and consumed at once: not worth a box.
+#[allow(clippy::large_enum_variant)]
 enum OpenPlan {
     /// Answer without generating: an existing message, or none.
     Answer(Option<ChatMessage>),
