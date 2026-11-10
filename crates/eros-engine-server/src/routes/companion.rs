@@ -1292,6 +1292,65 @@ pub(crate) mod testutil {
         axum_router.with_state(state)
     }
 
+    /// A response that may be an SSE stream: its status, its content type,
+    /// and the JSON of every `data:` line (empty for a non-stream body).
+    pub(crate) async fn send_sse(
+        router: &mut Router,
+        req: Request<Body>,
+    ) -> (StatusCode, String, Vec<Value>) {
+        let resp = router.call(req).await.expect("router call infallible");
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("read body");
+        let frames = String::from_utf8_lossy(&bytes)
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter_map(|d| serde_json::from_str(d).ok())
+            .collect();
+        (status, content_type, frames)
+    }
+
+    /// The frames of an SSE response a handler returned.
+    pub(crate) async fn read_sse(resp: axum::response::Response) -> Vec<Value> {
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("read body");
+        String::from_utf8_lossy(&bytes)
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter_map(|d| serde_json::from_str(d).ok())
+            .collect()
+    }
+
+    /// A streamed upstream completion: one content chunk per entry.
+    pub(crate) fn upstream_sse(chunks: &[&str]) -> wiremock::ResponseTemplate {
+        let mut body = String::new();
+        for c in chunks {
+            body.push_str(&format!(
+                "data: {}\n\n",
+                serde_json::json!({"id": "gen-s", "model": "served",
+                    "choices": [{"delta": {"content": c}}]})
+            ));
+        }
+        body.push_str("data: [DONE]\n\n");
+        wiremock::ResponseTemplate::new(200).set_body_raw(body, "text/event-stream")
+    }
+
+    /// The `type` of each frame.
+    pub(crate) fn frame_types(frames: &[Value]) -> Vec<&str> {
+        frames
+            .iter()
+            .map(|f| f["type"].as_str().unwrap_or_default())
+            .collect()
+    }
+
     pub(crate) async fn send_request(
         router: &mut Router,
         req: Request<Body>,

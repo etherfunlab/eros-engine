@@ -19,7 +19,8 @@
 //! §4.5).
 
 use axum::extract::{Extension, Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse as _, Response};
 use axum::Json;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -31,7 +32,7 @@ use eros_engine_core::events::{self, EventKind};
 use eros_engine_core::persona::CompanionPersona;
 use eros_engine_core::scope::MemoryScope;
 use eros_engine_store::affinity::AffinityRepo;
-use eros_engine_store::chat::{ChatMessage, ChatRepo};
+use eros_engine_store::chat::ChatRepo;
 use eros_engine_store::events::{EventRepo, NewEvent};
 use eros_engine_store::life_choices::{LifeChoiceKind, LifeChoiceRecord, LifeChoiceRepo};
 use std::collections::HashMap;
@@ -40,7 +41,8 @@ use crate::auth::middleware::AuthUser;
 use crate::error::{AppError, StreamPreError};
 use crate::holiday::{self, UserLocale};
 use crate::pipeline::handlers::recall_query_text;
-use crate::pipeline::proactive::{greet, Greeting, LifeChoiceCue, Occasion};
+use crate::pipeline::proactive::{greet, greet_stream, Greeting, LifeChoiceCue, Occasion};
+use crate::pipeline::stream::{ProtocolFrame, StreamErrorCode};
 use crate::prompt::NowContext;
 use crate::routes::companion::{
     validate_llm_audit, validate_prompt_traits, LlmAuditDto, PromptTraitDto,
@@ -48,7 +50,7 @@ use crate::routes::companion::{
 use crate::routes::companion_stream::{
     resolve_text_turn, validate_tier, AffinityScopeDto, StreamPreErrorBody,
 };
-use crate::routes::dto::AffinitySnapshot;
+use crate::routes::dto::{sse_response, wants_stream, AffinitySnapshot};
 use crate::routes::session_events::EventView;
 use crate::routes::session_open::GreetingDto;
 use crate::state::AppState;
@@ -91,6 +93,10 @@ pub struct LifeChoiceRespondRequest {
     pub affinity_scope: Option<AffinityScopeDto>,
     #[serde(default)]
     pub audit: Option<LlmAuditDto>,
+    /// Answer as a server-sent event stream instead of JSON; an
+    /// `Accept: text/event-stream` header asks for the same.
+    #[serde(default)]
+    pub stream: bool,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -226,7 +232,16 @@ fn invalid_payload(message: String) -> AppError {
     ),
     request_body = LifeChoiceRespondRequest,
     responses(
-        (status = 200, body = LifeChoiceRespondResponse),
+        (status = 200, description = "The answer and her reply. With `stream: true` in the body \
+            or `Accept: text/event-stream`, a server-sent event stream instead: a `resolved` \
+            frame first (`{type, status, affinity, event?}`, sent once the answer is \
+            committed), then the chat stream's frames for her reply: `meta` → `delta`… → \
+            `done` → `final`, or `final` alone when she says nothing. An `error` frame after \
+            `resolved` leaves the answer in place and is never retryable.",
+            content(
+                (LifeChoiceRespondResponse = "application/json"),
+                (String = "text/event-stream")
+            )),
         (status = 400, body = StreamPreErrorBody),
         (status = 401, description = "missing or invalid bearer"),
         (status = 403, body = StreamPreErrorBody),
@@ -242,14 +257,29 @@ async fn respond_to_life_choice(
     State(state): State<AppState>,
     Path((session_id, choice_id)): Path<(Uuid, Uuid)>,
     Extension(AuthUser(user_id)): Extension<AuthUser>,
+    headers: HeaderMap,
     Json(req): Json<LifeChoiceRespondRequest>,
-) -> Result<Json<LifeChoiceRespondResponse>, AppError> {
-    respond_at(&state, session_id, choice_id, user_id, req, Utc::now())
-        .await
-        .map(Json)
+) -> Result<Response, AppError> {
+    let now = Utc::now();
+    if wants_stream(&headers, req.stream) {
+        return respond_stream_at(&state, session_id, choice_id, user_id, req, now).await;
+    }
+    Ok(Json(respond_at(&state, session_id, choice_id, user_id, req, now).await?).into_response())
 }
 
-/// The handler with its clock injected, for tests.
+/// The answer, committed, and what she is about to say about it.
+struct Resolved {
+    /// The user's in-flight slot.
+    guard: crate::state::StreamSlotGuard,
+    choice_id: Uuid,
+    status: &'static str,
+    affinity: AffinitySnapshot,
+    event: Option<EventView>,
+    /// `None` when her reply could not even be set up; the answer stands.
+    greeting: Option<Greeting>,
+}
+
+/// The JSON handler with its clock injected, for tests.
 pub(crate) async fn respond_at(
     state: &AppState,
     session_id: Uuid,
@@ -258,6 +288,79 @@ pub(crate) async fn respond_at(
     req: LifeChoiceRespondRequest,
     now: DateTime<Utc>,
 ) -> Result<LifeChoiceRespondResponse, AppError> {
+    let r = resolve_choice(state, session_id, choice_id, user_id, req, now).await?;
+    let _guard = r.guard;
+    // Her reply is the last step and cannot undo the answer: whatever goes
+    // wrong here (the provider, a blank reply, a newer message) leaves the
+    // resolution, the separation and the drop in place, and she says nothing.
+    let message = match r.greeting {
+        Some(g) => match greet(state, g).await {
+            Ok(m) => m.map(GreetingDto::from),
+            Err(e) => {
+                tracing::warn!(%session_id, choice_id = %r.choice_id, "life-choice reply failed: {e}");
+                None
+            }
+        },
+        None => None,
+    };
+    Ok(LifeChoiceRespondResponse {
+        status: r.status.into(),
+        message,
+        affinity: r.affinity,
+        event: r.event,
+    })
+}
+
+/// The SSE handler (spec 2026-11-10-proactive-reply-streaming-design.md
+/// §4): `resolved` first, then her reply as it is generated. A failure after
+/// `resolved` is an `error` frame that is never retryable: the answer is in.
+pub(crate) async fn respond_stream_at(
+    state: &AppState,
+    session_id: Uuid,
+    choice_id: Uuid,
+    user_id: Uuid,
+    req: LifeChoiceRespondRequest,
+    now: DateTime<Utc>,
+) -> Result<Response, AppError> {
+    let r = resolve_choice(state, session_id, choice_id, user_id, req, now).await?;
+    let state = state.clone();
+    Ok(sse_response(async_stream::stream! {
+        // Held while she speaks; a dropped connection drops it with the stream.
+        let _guard = r.guard;
+        yield ProtocolFrame::Resolved {
+            status: r.status.into(),
+            affinity: Box::new(r.affinity),
+            event: r.event,
+        };
+        match r.greeting {
+            Some(g) => {
+                for await frame in greet_stream(state, g, Some(false)) {
+                    yield frame;
+                }
+            }
+            None => {
+                yield ProtocolFrame::Error {
+                    code: StreamErrorCode::Internal,
+                    retryable: false,
+                    message: "internal error".into(),
+                    user_message: "服务出现问题，请稍后再试".into(),
+                    upstream_status: None,
+                    provider_code: None,
+                };
+            }
+        }
+    }))
+}
+
+/// Validate the request and commit the answer with its costs.
+async fn resolve_choice(
+    state: &AppState,
+    session_id: Uuid,
+    choice_id: Uuid,
+    user_id: Uuid,
+    req: LifeChoiceRespondRequest,
+    now: DateTime<Utc>,
+) -> Result<Resolved, AppError> {
     validate_tier(req.tier.as_deref())?;
     let prompt_traits = validate_prompt_traits(req.prompt_traits.as_deref().unwrap_or(&[]))
         .map_err(|e| invalid_payload(e.to_string()))?;
@@ -278,7 +381,7 @@ pub(crate) async fn respond_at(
 
     // Taken before anything is written: a call over the cap is refused with
     // the choice still open, not answered and then left without her reply.
-    let _guard = state
+    let guard = state
         .stream_slots
         .try_acquire(user_id, CONCURRENT_STREAMS_PER_USER)
         .ok_or_else(|| AppError::TooManyRequests("per-user in-flight cap reached".into()))?;
@@ -372,9 +475,6 @@ pub(crate) async fn respond_at(
         },
     };
 
-    // Her reply is the last step and cannot undo the answer: whatever goes
-    // wrong here (the provider, a blank reply, a newer message) leaves the
-    // resolution, the separation and the drop in place, and she says nothing.
     let cue = match (kind, &started) {
         (LifeChoiceKind::AskForSpace, Some((_, lasts))) => LifeChoiceCue::Goodbye {
             hours: lasts.num_hours(),
@@ -388,7 +488,7 @@ pub(crate) async fn respond_at(
             accepted: req.response == LifeChoiceAnswer::Accept,
         },
     };
-    let message = match say(
+    let greeting = match say(
         state,
         session_id,
         user_id,
@@ -402,7 +502,7 @@ pub(crate) async fn respond_at(
     )
     .await
     {
-        Ok(m) => m.map(GreetingDto::from),
+        Ok(g) => Some(g),
         Err(e) => {
             tracing::warn!(%session_id, choice_id = %choice.id, "life-choice reply failed: {e}");
             None
@@ -410,15 +510,17 @@ pub(crate) async fn respond_at(
     };
 
     let traits = crate::prompt::persona_traits(&persona);
-    Ok(LifeChoiceRespondResponse {
-        status: status.into(),
-        message,
+    Ok(Resolved {
+        guard,
+        choice_id: choice.id,
+        status,
         affinity: AffinitySnapshot::from(affinity),
         event: started.map(|(e, _)| EventView::new(&e, &traits)),
+        greeting,
     })
 }
 
-/// Generate and persist what she says about the answer. It yields to a
+/// What she says about the answer, ready to generate. Its insert yields to a
 /// message the user sent since the request began.
 #[allow(clippy::too_many_arguments)]
 async fn say(
@@ -432,7 +534,7 @@ async fn say(
     now: DateTime<Utc>,
     prompt_traits: Vec<eros_engine_core::types::PromptTrait>,
     audit: Option<eros_engine_core::types::LlmAudit>,
-) -> Result<Option<ChatMessage>, AppError> {
+) -> Result<Greeting, AppError> {
     let locale = UserLocale::resolve(
         req.user_timezone.as_deref(),
         req.user_country.as_deref(),
@@ -451,30 +553,27 @@ async fn say(
         .as_ref()
         .map(recall_query_text)
         .unwrap_or_default();
-    greet(
-        state,
-        Greeting {
-            session_id,
-            user_id,
-            instance_id,
-            persona,
-            now: &NowContext::for_user(&locale, now),
-            occasion: Occasion::LifeChoice(cue),
-            recall_query,
-            since: now,
-            tier: req.tier.clone(),
-            prompt_traits,
-            memory_scope: req.memory_scope.unwrap_or_default(),
-            affinity_scope: req
-                .affinity_scope
-                .as_ref()
-                .map(AffinityScopeDto::resolve)
-                .unwrap_or_default(),
-            audit,
-            metadata,
-        },
-    )
-    .await
+    Ok(Greeting {
+        session_id,
+        user_id,
+        instance_id,
+        persona: persona.clone(),
+        now: NowContext::for_user(&locale, now),
+        occasion: Occasion::LifeChoice(cue),
+        recall_query,
+        since: now,
+        tier: req.tier.clone(),
+        prompt_traits,
+        memory_scope: req.memory_scope.unwrap_or_default(),
+        affinity_scope: req
+            .affinity_scope
+            .as_ref()
+            .map(AffinityScopeDto::resolve)
+            .unwrap_or_default(),
+        audit,
+        metadata,
+        message_id: None,
+    })
 }
 
 pub fn router() -> OpenApiRouter<AppState> {
@@ -493,8 +592,8 @@ mod tests {
 
     use crate::routes::companion::test_state;
     use crate::routes::companion::testutil::{
-        seed_byoc_session, seed_genome, seed_group_session, seed_instance, seed_session,
-        session_footprint,
+        frame_types, read_sse, seed_byoc_session, seed_genome, seed_group_session, seed_instance,
+        seed_session, session_footprint, upstream_sse,
     };
     use crate::routes::session_events::EventKindDto;
     use crate::routes::session_open::GreetingOccasion;
@@ -571,6 +670,7 @@ mod tests {
             memory_scope: None,
             affinity_scope: None,
             audit: None,
+            stream: false,
         }
     }
 
@@ -1267,6 +1367,132 @@ mod tests {
 
     /// A failed goodbye does not undo the answer: the resolution, the
     /// separation and the drop are committed before she speaks.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn life_choice_stream_leads_with_resolved(pool: PgPool) {
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("you are a companion"))
+            .respond_with(upstream_sse(&["好，那我们", "先各自安静一下。"]))
+            .mount(&mock)
+            .await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let s = scene(&pool).await;
+        let choice = s.ask(3, recent(30)).await;
+        let now = recent(0);
+
+        let resp = respond_stream_at(
+            &state,
+            s.session_id,
+            choice,
+            s.user_id,
+            answer(LifeChoiceAnswer::Accept),
+            now,
+        )
+        .await
+        .unwrap();
+        let frames = read_sse(resp).await;
+        assert_eq!(
+            frame_types(&frames),
+            ["resolved", "meta", "delta", "delta", "done", "final"]
+        );
+        let resolved = &frames[0];
+        assert_eq!(resolved["status"], "accepted");
+        assert_eq!(resolved["event"]["kind"], "taking_space");
+        assert_eq!(
+            resolved["affinity"]["bond_tier"], 2,
+            "the drop is in the frame"
+        );
+        assert_eq!(frames[4]["occasion"], "life_choice");
+        assert_eq!(s.row(choice).await.0, "accepted");
+        let rows = s.life_choice_rows().await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, GOODBYE);
+    }
+
+    /// A decline starts no event: `resolved` has no `event` key.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn life_choice_stream_decline_has_no_event(pool: PgPool) {
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(upstream_sse(&[HURT]))
+            .mount(&mock)
+            .await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let s = scene(&pool).await;
+        let choice = s.ask(3, recent(30)).await;
+
+        let resp = respond_stream_at(
+            &state,
+            s.session_id,
+            choice,
+            s.user_id,
+            answer(LifeChoiceAnswer::Decline),
+            recent(0),
+        )
+        .await
+        .unwrap();
+        let frames = read_sse(resp).await;
+        assert_eq!(
+            frame_types(&frames),
+            ["resolved", "meta", "delta", "done", "final"]
+        );
+        assert_eq!(frames[0]["status"], "declined");
+        assert!(frames[0].get("event").is_none());
+    }
+
+    /// Her reply failing cannot undo the answer, and the request cannot be
+    /// made again: the error is never retryable.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn life_choice_stream_reply_failure_keeps_answer(pool: PgPool) {
+        let failing = companion_mock(None).await;
+        let state = with_companion(test_state(pool.clone()), &failing.uri());
+        let s = scene(&pool).await;
+        let choice = s.ask(3, recent(30)).await;
+
+        let resp = respond_stream_at(
+            &state,
+            s.session_id,
+            choice,
+            s.user_id,
+            answer(LifeChoiceAnswer::Accept),
+            recent(0),
+        )
+        .await
+        .unwrap();
+        let frames = read_sse(resp).await;
+        assert_eq!(frame_types(&frames), ["resolved", "error"]);
+        assert_eq!(frames[1]["retryable"], false);
+        assert_eq!(s.row(choice).await.0, "accepted");
+        assert_eq!(s.tiers().await, (2, 3));
+        assert!(s.life_choice_rows().await.is_empty(), "no message row");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn life_choice_stream_closed_is_409(pool: PgPool) {
+        let mock = companion_mock(Some(GOODBYE)).await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let s = scene(&pool).await;
+        let choice = s.ask(3, recent(30)).await;
+        s.respond(&state, choice, LifeChoiceAnswer::Accept, recent(0))
+            .await
+            .unwrap();
+
+        let err = respond_stream_at(
+            &state,
+            s.session_id,
+            choice,
+            s.user_id,
+            answer(LifeChoiceAnswer::Accept),
+            recent(0),
+        )
+        .await
+        .expect_err("a plain status, not a stream");
+        assert!(
+            matches!(&err, AppError::StreamPre(e) if e.status == StatusCode::CONFLICT),
+            "{err:?}"
+        );
+    }
+
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn a_failed_goodbye_keeps_the_resolution(pool: PgPool) {
         let failing = companion_mock(None).await;

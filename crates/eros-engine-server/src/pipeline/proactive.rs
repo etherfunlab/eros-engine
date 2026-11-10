@@ -4,8 +4,9 @@
 //! route (`routes::session_open`, `routes::session_events`) or the pipeline
 //! (`pipeline::life_choice`) decides whether the persona speaks first; this
 //! module generates and persists it. Modelled on
-//! the image-edit text half: no PDE, no streaming, no user row, no
-//! post-process.
+//! the image-edit text half: no PDE, no user row, no post-process. `greet`
+//! answers once the message is stored; `greet_stream` sends it as the chat
+//! stream's frames while it is generated.
 //!
 //! A greeting or opener is checked against its `since` cutoff and yields to
 //! any message that landed at or after it. An event is written at the moment
@@ -18,7 +19,8 @@
 //! Specs: docs/superpowers/specs/2026-09-26-user-locale-and-holiday-greeting-design.md §6,
 //! docs/superpowers/specs/2026-10-03-open-occasions-design.md §5–§6,
 //! docs/superpowers/specs/2026-10-15-life-events-v2-design.md §6,
-//! docs/superpowers/specs/2026-10-19-life-events-shopping-gatherings-and-ask-for-space-design.md §3.2
+//! docs/superpowers/specs/2026-10-19-life-events-shopping-gatherings-and-ask-for-space-design.md §3.2,
+//! docs/superpowers/specs/2026-11-10-proactive-reply-streaming-design.md
 
 use chrono::{DateTime, NaiveDate, Utc};
 use eros_engine_core::events::{offline_kinds, EventKind, PersonaTraits};
@@ -40,8 +42,10 @@ use uuid::Uuid;
 use crate::error::AppError;
 use crate::pipeline::handlers::{build_reply_request, load_effects, CHAT_TASK};
 use crate::pipeline::stream::{
-    build_delegated_image_marker, build_delegated_image_prompt_for, recent_transcript,
-    split_failures,
+    build_delegated_image_marker, build_delegated_image_prompt_for, build_final_frame,
+    build_image_request_frame, error_frame_fields_from_last, hop_display, recent_transcript,
+    split_failures, split_failures_typed, ulid_string, FrameActionType, ProtocolFrame,
+    StreamErrorCode, STREAM_OPEN_TIMEOUT, STREAM_TOTAL_TIMEOUT,
 };
 use crate::pipeline::{compute_signals_for_session, record_generation, GenerationRecord};
 use crate::prompt::NowContext;
@@ -385,12 +389,12 @@ fn event_cue(
 
 /// One proactive message to generate. `metadata` arrives holding the caller's
 /// audit copy of the request (the raw locale); `greet` adds the rest.
-pub(crate) struct Greeting<'a> {
+pub(crate) struct Greeting {
     pub session_id: Uuid,
     pub user_id: Uuid,
     pub instance_id: Uuid,
-    pub persona: &'a CompanionPersona,
-    pub now: &'a NowContext,
+    pub persona: CompanionPersona,
+    pub now: NowContext,
     pub occasion: Occasion,
     /// The memory-recall query: the holiday names, `生日` for a birthday, or
     /// the latest user row.
@@ -407,39 +411,50 @@ pub(crate) struct Greeting<'a> {
     pub affinity_scope: AffinityScope,
     pub audit: Option<LlmAudit>,
     pub metadata: serde_json::Map<String, serde_json::Value>,
+    /// The id a streamed message is stored under, when the caller has
+    /// already told the client (`/events`); `greet_stream` mints one
+    /// otherwise, and `greet` always does.
+    pub message_id: Option<Uuid>,
 }
 
-/// Generate and persist the message. `Ok(None)`: the model returned a blank
-/// reply and nothing was written; or, for a greeting or opener, the insert
-/// yielded to a message that landed first; or, for an event, another event
-/// under way for the persona blocked the insert, or a concurrent call with
-/// the same `event_key` won it (the caller reads the event by key); or, for
-/// the ask, the session already held a pending choice. When a
-/// concurrent call for the same local date or `open_key` won the insert,
-/// returns that call's row. An event is stamped with one instant taken after
-/// generation: its message's `sent_at`, its `started_at` and the start of its
-/// `ends_at` span.
-pub(crate) async fn greet(
-    state: &AppState,
-    g: Greeting<'_>,
-) -> Result<Option<ChatMessage>, AppError> {
+/// The request for her message, ready to send.
+struct Prepared {
+    chat_req: eros_engine_llm::openrouter::ChatRequest,
+    plan: ActionPlan,
+    injected_tags: Vec<String>,
+}
+
+/// What `store` wrote. `row` is `None` when the insert yielded: for a
+/// greeting or opener, to a message that landed first or a concurrent call
+/// for the same local date or `open_key`; for an event, to another event
+/// under way for the persona or a concurrent call with the same `event_key`;
+/// for the ask, to a pending choice the session already held.
+struct Stored {
+    row: Option<ChatMessage>,
+    /// Her picture's composed prompt and aspect ratio, on an event that
+    /// carries one.
+    picture: Option<(String, Option<String>)>,
+}
+
+/// Prompt assembly, up to the cue.
+async fn prepare(state: &AppState, g: &Greeting) -> Result<Prepared, AppError> {
     let mut affinity = AffinityRepo { pool: &state.pool }
         .load_or_create(g.session_id, g.user_id, g.instance_id)
         .await?;
     affinity.apply_time_decay();
     affinity.refresh_endpoints(&state.config.affinity_tuning);
     let rung = affinity.intimacy_rung();
-    let traits = crate::prompt::persona_traits(g.persona);
+    let traits = crate::prompt::persona_traits(&g.persona);
     let signals = compute_signals_for_session(&state.pool, g.session_id, &affinity, None).await?;
 
     // Prompt assembly only. The event's content is the memory-recall query;
     // the nil driving id makes history fall back to newest-N.
     let input = DecisionInput {
         event: Event::UserMessage {
-            content: g.recall_query,
+            content: g.recall_query.clone(),
             message_id: Uuid::nil(),
-            prompt_traits: g.prompt_traits,
-            audit: g.audit,
+            prompt_traits: g.prompt_traits.clone(),
+            audit: g.audit.clone(),
             tier: g.tier.clone(),
             memory_scope: g.memory_scope,
             affinity_scope: g.affinity_scope,
@@ -506,7 +521,7 @@ pub(crate) async fn greet(
         g.user_id,
         g.instance_id,
         Uuid::nil(),
-        g.now,
+        &g.now,
         false,
         None,
         None,
@@ -520,8 +535,217 @@ pub(crate) async fn greet(
             .cue(rung, &traits, g.persona.genome.tip_personality.as_deref()),
     });
 
-    let model_for_audit = chat_req.model.clone();
-    let resp = match state.openrouter.execute(chat_req).await {
+    Ok(Prepared {
+        chat_req,
+        plan,
+        injected_tags,
+    })
+}
+
+/// Persist `content` as her message under `id`, with everything that goes
+/// with it: an event's picture and its event row, the ask's choice row. An
+/// event is stamped with one instant taken here, after generation: its
+/// message's `sent_at`, its `started_at` and the start of its `ends_at` span.
+async fn store(
+    state: &AppState,
+    g: Greeting,
+    prep: &Prepared,
+    id: Uuid,
+    content: &str,
+    generation_id: Option<String>,
+    failures: &[AttemptFailure],
+) -> Result<Stored, AppError> {
+    let (llm_attempts, gateway_errors) = split_failures(failures);
+    let mut picture = None;
+    let mut metadata = g.metadata;
+    // Her picture is composed from what she just said (spec 2026-10-26-event-
+    // message-image-design.md §4): the recent scene ends with her message, and
+    // no user message asked for it. Fail-open, as on a chat turn.
+    if let Occasion::Event {
+        image: Some(image), ..
+    } = &g.occasion
+    {
+        let effects = load_effects(&state.pool, g.session_id, None)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(session_id = %g.session_id, "proactive message: lingering effects read failed: {e}");
+                Vec::new()
+            });
+        let body_state = crate::prompt::body_state(&effects);
+        let transcript = recent_transcript(&ChatRepo { pool: &state.pool }, g.session_id).await;
+        let her_line = format!("AI: {content}");
+        let scene = if transcript.is_empty() {
+            her_line
+        } else {
+            format!("{transcript}\n{her_line}")
+        };
+        let img = build_delegated_image_prompt_for(
+            state,
+            &g.persona,
+            &prep.plan,
+            Some(image),
+            &scene,
+            "",
+            g.user_id,
+            g.session_id,
+            body_state.as_deref(),
+            None,
+            "event",
+        )
+        .await;
+        metadata.insert(
+            "image".into(),
+            build_delegated_image_marker(
+                &img.subject,
+                img.caption.as_deref(),
+                img.aspect_ratio.as_deref(),
+                img.compose_variant.as_deref(),
+                img.compose_model.as_deref(),
+                img.compose_generation_id.as_deref(),
+                img.compose_event_id,
+                ImageRef::Face,
+                None,
+            ),
+        );
+        picture = Some((img.composed_prompt, img.aspect_ratio));
+    }
+
+    // An event is written when its message is, not when the request began.
+    let event_at = Utc::now();
+    metadata.insert("proactive".into(), g.occasion.name().into());
+    match &g.occasion {
+        Occasion::Holiday {
+            local_date,
+            holidays,
+        } => {
+            metadata.insert("local_date".into(), local_date.to_string().into());
+            metadata.insert("holidays".into(), serde_json::json!(holidays));
+        }
+        Occasion::Birthday { local_date } => {
+            metadata.insert("local_date".into(), local_date.to_string().into());
+        }
+        Occasion::Returning { open_key, gap_days } => {
+            metadata.insert("open_key".into(), open_key.as_str().into());
+            metadata.insert("gap_days".into(), (*gap_days).into());
+        }
+        Occasion::FirstMeet { open_key }
+        | Occasion::JustOpened { open_key }
+        | Occasion::CheckIn { open_key } => {
+            metadata.insert("open_key".into(), open_key.as_str().into());
+        }
+        Occasion::Event { outfit, .. } => {
+            if let Some(o) = outfit {
+                metadata.insert("outfit".into(), o.as_str().into());
+            }
+        }
+        Occasion::LifeChoice(_) => {}
+    }
+    metadata.insert(
+        "prompt_traits".into(),
+        serde_json::json!(prep.injected_tags),
+    );
+    metadata.insert(
+        "memory_scope".into(),
+        serde_json::to_value(g.memory_scope).expect("MemoryScope serializes"),
+    );
+    metadata.insert(
+        "affinity_scope".into(),
+        serde_json::to_value(g.affinity_scope).expect("AffinityScope serializes"),
+    );
+    if let Some(t) = g.tier {
+        metadata.insert("tier".into(), t.into());
+    }
+
+    let chat_repo = ChatRepo { pool: &state.pool };
+    let row = ProactiveInsert {
+        id,
+        content: content.to_string(),
+        generation_id,
+        metadata: serde_json::Value::Object(metadata),
+        llm_attempts,
+        gateway_errors,
+    };
+    let written = match &g.occasion {
+        Occasion::Holiday { .. } | Occasion::Birthday { .. } => {
+            chat_repo
+                .insert_proactive_message(g.session_id, g.since, &row)
+                .await?
+        }
+        Occasion::FirstMeet { .. }
+        | Occasion::Returning { .. }
+        | Occasion::JustOpened { .. }
+        | Occasion::CheckIn { .. } => {
+            chat_repo
+                .insert_open_message(g.session_id, g.since, &row)
+                .await?
+        }
+        Occasion::Event {
+            event_key,
+            kind,
+            lasts,
+            ..
+        } => eros_engine_store::events::EventRepo { pool: &state.pool }
+            .insert(
+                &eros_engine_store::events::NewEvent {
+                    instance_id: g.instance_id,
+                    session_id: g.session_id,
+                    event_key,
+                    kind: *kind,
+                    started_at: event_at,
+                    ends_at: event_at + *lasts,
+                },
+                Some(&row),
+            )
+            .await?
+            .and_then(|i| i.message),
+        // The ask lands with its choice row, in one transaction; a pending
+        // choice already in the instance (a concurrent ask won) or a streak
+        // anchor that moved since the trigger read it leaves nothing.
+        Occasion::LifeChoice(LifeChoiceCue::Ask {
+            kind,
+            tier_gap,
+            anchor_seen,
+        }) => {
+            let asked = LifeChoiceRepo { pool: &state.pool }
+                .insert_ask(g.session_id, *kind, *tier_gap, *anchor_seen, &row)
+                .await?;
+            match asked {
+                Some(_) => {
+                    chat_repo
+                        .message_by_id_in_session(g.session_id, row.id)
+                        .await?
+                }
+                None => None,
+            }
+        }
+        // No key to dedupe on: the row yields only to a message that landed
+        // at or after `since`.
+        Occasion::LifeChoice(
+            LifeChoiceCue::Goodbye { .. }
+            | LifeChoiceCue::Hurt
+            | LifeChoiceCue::TravelAgreed { .. }
+            | LifeChoiceCue::Answered { .. },
+        ) => {
+            chat_repo
+                .insert_open_message(g.session_id, g.since, &row)
+                .await?
+        }
+    };
+    Ok(Stored {
+        row: written,
+        picture,
+    })
+}
+
+/// Generate and persist the message. `Ok(None)`: the model returned a blank
+/// reply and nothing was written, or the insert yielded (see [`Stored`]).
+/// When a concurrent call for the same local date or `open_key` won the
+/// insert, returns that call's row; for an event the caller reads the event
+/// by key.
+pub(crate) async fn greet(state: &AppState, g: Greeting) -> Result<Option<ChatMessage>, AppError> {
+    let prep = prepare(state, &g).await?;
+    let model_for_audit = prep.chat_req.model.clone();
+    let resp = match state.openrouter.execute(prep.chat_req.clone()).await {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(
@@ -565,182 +789,43 @@ pub(crate) async fn greet(
         );
         return Ok(None);
     }
-    let (llm_attempts, gateway_errors) = split_failures(&resp.failures);
 
-    let mut metadata = g.metadata;
-    // Her picture is composed from what she just said (spec 2026-10-26-event-
-    // message-image-design.md §4): the recent scene ends with her message, and
-    // no user message asked for it. Fail-open, as on a chat turn.
-    if let Occasion::Event {
-        image: Some(image), ..
-    } = &g.occasion
-    {
-        let effects = load_effects(&state.pool, g.session_id, None)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(session_id = %g.session_id, "proactive message: lingering effects read failed: {e}");
-                Vec::new()
-            });
-        let body_state = crate::prompt::body_state(&effects);
-        let transcript = recent_transcript(&ChatRepo { pool: &state.pool }, g.session_id).await;
-        let her_line = format!("AI: {content}");
-        let scene = if transcript.is_empty() {
-            her_line
-        } else {
-            format!("{transcript}\n{her_line}")
-        };
-        let img = build_delegated_image_prompt_for(
-            state,
-            g.persona,
-            &plan,
-            Some(image),
-            &scene,
-            "",
-            g.user_id,
-            g.session_id,
-            body_state.as_deref(),
-            None,
-            "event",
-        )
-        .await;
-        metadata.insert(
-            "image".into(),
-            build_delegated_image_marker(
-                &img.subject,
-                img.caption.as_deref(),
-                img.aspect_ratio.as_deref(),
-                img.compose_variant.as_deref(),
-                img.compose_model.as_deref(),
-                img.compose_generation_id.as_deref(),
-                img.compose_event_id,
-                ImageRef::Face,
-                None,
-            ),
-        );
+    // Where a concurrent winner's row is found when the insert yields.
+    enum Winner {
+        Date(String),
+        OpenKey(String),
+        Nowhere,
     }
-
-    // An event is written when its message is, not when the request began.
-    let event_at = Utc::now();
-    metadata.insert("proactive".into(), g.occasion.name().into());
-    match &g.occasion {
-        Occasion::Holiday {
-            local_date,
-            holidays,
-        } => {
-            metadata.insert("local_date".into(), local_date.to_string().into());
-            metadata.insert("holidays".into(), serde_json::json!(holidays));
+    let winner = match &g.occasion {
+        Occasion::Holiday { local_date, .. } | Occasion::Birthday { local_date } => {
+            Winner::Date(local_date.to_string())
         }
-        Occasion::Birthday { local_date } => {
-            metadata.insert("local_date".into(), local_date.to_string().into());
-        }
-        Occasion::Returning { open_key, gap_days } => {
-            metadata.insert("open_key".into(), open_key.as_str().into());
-            metadata.insert("gap_days".into(), (*gap_days).into());
-        }
-        Occasion::FirstMeet { open_key }
-        | Occasion::JustOpened { open_key }
-        | Occasion::CheckIn { open_key } => {
-            metadata.insert("open_key".into(), open_key.as_str().into());
-        }
-        Occasion::Event { outfit, .. } => {
-            if let Some(o) = outfit {
-                metadata.insert("outfit".into(), o.as_str().into());
-            }
-        }
-        Occasion::LifeChoice(_) => {}
-    }
-    metadata.insert("prompt_traits".into(), serde_json::json!(injected_tags));
-    metadata.insert(
-        "memory_scope".into(),
-        serde_json::to_value(g.memory_scope).expect("MemoryScope serializes"),
-    );
-    metadata.insert(
-        "affinity_scope".into(),
-        serde_json::to_value(g.affinity_scope).expect("AffinityScope serializes"),
-    );
-    if let Some(t) = g.tier {
-        metadata.insert("tier".into(), t.into());
-    }
-
-    let chat_repo = ChatRepo { pool: &state.pool };
-    let row = ProactiveInsert {
-        id: Ulid::new().into(),
-        content: content.to_string(),
-        generation_id,
-        metadata: serde_json::Value::Object(metadata),
-        llm_attempts,
-        gateway_errors,
-    };
-    match &g.occasion {
-        Occasion::Holiday { local_date, .. } | Occasion::Birthday { local_date } => match chat_repo
-            .insert_proactive_message(g.session_id, g.since, &row)
-            .await?
-        {
-            Some(written) => Ok(Some(written)),
-            None => Ok(chat_repo
-                .proactive_greeting_on(g.session_id, &local_date.to_string())
-                .await?),
-        },
         Occasion::FirstMeet { open_key }
         | Occasion::Returning { open_key, .. }
         | Occasion::JustOpened { open_key }
-        | Occasion::CheckIn { open_key } => {
-            match chat_repo
-                .insert_open_message(g.session_id, g.since, &row)
-                .await?
-            {
-                Some(written) => Ok(Some(written)),
-                None => Ok(chat_repo.open_message(g.session_id, open_key).await?),
-            }
-        }
-        Occasion::Event {
-            event_key,
-            kind,
-            lasts,
-            ..
-        } => Ok(eros_engine_store::events::EventRepo { pool: &state.pool }
-            .insert(
-                &eros_engine_store::events::NewEvent {
-                    instance_id: g.instance_id,
-                    session_id: g.session_id,
-                    event_key,
-                    kind: *kind,
-                    started_at: event_at,
-                    ends_at: event_at + *lasts,
-                },
-                Some(&row),
-            )
-            .await?
-            .and_then(|i| i.message)),
-        // The ask lands with its choice row, in one transaction; a pending
-        // choice already in the instance (a concurrent ask won) or a streak
-        // anchor that moved since the trigger read it leaves nothing.
-        Occasion::LifeChoice(LifeChoiceCue::Ask {
-            kind,
-            tier_gap,
-            anchor_seen,
-        }) => {
-            let asked = LifeChoiceRepo { pool: &state.pool }
-                .insert_ask(g.session_id, *kind, *tier_gap, *anchor_seen, &row)
-                .await?;
-            match asked {
-                Some(_) => Ok(chat_repo
-                    .message_by_id_in_session(g.session_id, row.id)
-                    .await?),
-                None => Ok(None),
-            }
-        }
-        // No key to dedupe on: the row yields only to a message that landed
-        // at or after `since`.
-        Occasion::LifeChoice(
-            LifeChoiceCue::Goodbye { .. }
-            | LifeChoiceCue::Hurt
-            | LifeChoiceCue::TravelAgreed { .. }
-            | LifeChoiceCue::Answered { .. },
-        ) => Ok(chat_repo
-            .insert_open_message(g.session_id, g.since, &row)
-            .await?),
+        | Occasion::CheckIn { open_key } => Winner::OpenKey(open_key.clone()),
+        Occasion::Event { .. } | Occasion::LifeChoice(_) => Winner::Nowhere,
+    };
+    let session_id = g.session_id;
+    let stored = store(
+        state,
+        g,
+        &prep,
+        Ulid::new().into(),
+        content,
+        generation_id,
+        &resp.failures,
+    )
+    .await?;
+    if stored.row.is_some() {
+        return Ok(stored.row);
     }
+    let chat_repo = ChatRepo { pool: &state.pool };
+    Ok(match winner {
+        Winner::Date(date) => chat_repo.proactive_greeting_on(session_id, &date).await?,
+        Winner::OpenKey(key) => chat_repo.open_message(session_id, &key).await?,
+        Winner::Nowhere => None,
+    })
 }
 
 #[cfg(test)]
@@ -1185,5 +1270,698 @@ mod tests {
             cue(EventKind::HometownVisit, 72),
             "（你刚动身回老家，要待 3 天。）"
         );
+    }
+}
+
+/// A stored row's id as the frames carry it: the ULID string of the same
+/// 128 bits.
+pub(crate) fn frame_message_id(id: Uuid) -> String {
+    ulid_string(Ulid::from(id))
+}
+
+/// The `done` of a stored proactive row.
+fn done_frame(
+    row: &ChatMessage,
+    usage: Option<serde_json::Value>,
+    generation_id: Option<String>,
+) -> ProtocolFrame {
+    ProtocolFrame::ProactiveDone {
+        message_id: frame_message_id(row.id),
+        truncated: false,
+        usage,
+        generation_id,
+        sent_at: row.sent_at,
+        occasion: crate::routes::session_open::GreetingDto::from(row.clone()).occasion,
+    }
+}
+
+/// The frames for a proactive row that is already stored (a replayed key):
+/// `meta`, its whole content as one `delta`, `done`, `image_request` when
+/// given, `final`.
+pub(crate) fn replay_frames(
+    row: &ChatMessage,
+    image_request: Option<ProtocolFrame>,
+) -> Vec<ProtocolFrame> {
+    let message_id = frame_message_id(row.id);
+    let meta = row.metadata.as_ref();
+    let mut frames = vec![
+        ProtocolFrame::Meta {
+            message_id: message_id.clone(),
+            action_type: FrameActionType::Proactive,
+            model: None,
+            continues_from: None,
+            speaker_session_id: None,
+        },
+        ProtocolFrame::Delta {
+            message_id,
+            content: row.content.clone(),
+        },
+        done_frame(row, None, row.generation_id.clone()),
+    ];
+    frames.extend(image_request);
+    frames.push(build_final_frame(
+        false,
+        meta.and_then(|m| m.get("prompt_traits"))
+            .and_then(|v| serde_json::from_value(v.clone()).ok()),
+        meta.and_then(|m| m.get("tier"))
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+        0,
+        0,
+        Vec::new(),
+        Vec::new(),
+    ));
+    frames
+}
+
+/// The `final` of a stream that generated nothing and replays nothing.
+pub(crate) fn bare_final(tier: Option<String>) -> ProtocolFrame {
+    build_final_frame(false, None, tier, 0, 0, Vec::new(), Vec::new())
+}
+
+fn error_frame(
+    code: StreamErrorCode,
+    retryable: bool,
+    message: &str,
+    upstream_status: Option<u16>,
+    provider_code: Option<String>,
+) -> ProtocolFrame {
+    ProtocolFrame::Error {
+        code,
+        retryable,
+        message: message.into(),
+        user_message: match code {
+            StreamErrorCode::Internal => "服务出现问题，请稍后再试",
+            StreamErrorCode::Superseded => "已有更新的消息",
+            _ => "AI 服务暂时不可用，稍后再试",
+        }
+        .into(),
+        upstream_status,
+        provider_code,
+    }
+}
+
+/// [`greet`] as a stream of frames (spec
+/// 2026-11-10-proactive-reply-streaming-design.md §4–§5): `meta` → `delta`…
+/// → `done` → `image_request`? → `final`; `final` alone for a blank reply; a
+/// terminal `error` when the chain fails or the insert yields. Same prompt,
+/// same chain and same inserts as `greet`; the row is stored before `done`,
+/// under the id `meta` announced. Nothing here outlives the stream: dropping
+/// it drops the generation.
+///
+/// `fixed_retryable` pins every error's `retryable`, for a caller whose
+/// request cannot be made again.
+pub(crate) fn greet_stream(
+    state: AppState,
+    g: Greeting,
+    fixed_retryable: Option<bool>,
+) -> impl futures_util::Stream<Item = ProtocolFrame> + Send + 'static {
+    async_stream::stream! {
+        let retryable = |r: bool| fixed_retryable.unwrap_or(r);
+        let prep = match prepare(&state, &g).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(session_id = %g.session_id, "proactive stream: prepare failed: {e}");
+                yield error_frame(StreamErrorCode::Internal, retryable(false), "internal error", None, None);
+                return;
+            }
+        };
+        let id: Uuid = g.message_id.unwrap_or_else(|| Ulid::new().into());
+        let message_id = frame_message_id(id);
+        let display = state.model_config.display_override(CHAT_TASK);
+        let chain = crate::byok::reply_chain(&prep.chat_req, None);
+        let mut failures: Vec<AttemptFailure> = Vec::new();
+        // The hop that served: its index, raw text, usage and generation id.
+        let mut served = None;
+
+        for (idx, hop) in chain.iter().enumerate() {
+            let bare = bare_model_id(&hop.slug);
+            let mut scrubber = eros_engine_llm::stream_scrub::StreamScrubber::new(
+                &state.output_regex,
+                &bare,
+            );
+            let mut acc = String::new();
+            // Scrubbed text not yet sent: `meta` waits for its first
+            // non-whitespace character.
+            let mut held = String::new();
+            let mut meta_sent = false;
+            let mut usage = None;
+            let mut generation_id = None;
+            let mut failed = false;
+
+            match tokio::time::timeout(
+                STREAM_OPEN_TIMEOUT,
+                state.openrouter.execute_stream_as(&prep.chat_req, &hop.slug),
+            )
+            .await
+            {
+                Ok(Ok(mut upstream)) => {
+                    use futures_util::StreamExt as _;
+                    let deadline = tokio::time::Instant::now() + STREAM_TOTAL_TIMEOUT;
+                    loop {
+                        let chunk = match tokio::time::timeout_at(deadline, upstream.next()).await {
+                            Ok(Some(Ok(c))) => c,
+                            Ok(Some(Err(e))) => {
+                                tracing::warn!("proactive stream: upstream chunk err: {e}");
+                                failures.push(AttemptFailure::from_llm_error(CHAT_TASK, &hop.audit, &e));
+                                failed = true;
+                                break;
+                            }
+                            Ok(None) => break,
+                            Err(_) => {
+                                failures.push(gateway_timeout(
+                                    &hop.audit,
+                                    eros_engine_llm::failure::GatewayKind::TotalTimeout,
+                                ));
+                                failed = true;
+                                break;
+                            }
+                        };
+                        if let Some(content) = chunk.content {
+                            acc.push_str(&content);
+                            held.push_str(&scrubber.push(&content));
+                            if !held.trim().is_empty() {
+                                if !meta_sent {
+                                    meta_sent = true;
+                                    yield ProtocolFrame::Meta {
+                                        message_id: message_id.clone(),
+                                        action_type: FrameActionType::Proactive,
+                                        model: hop_display(hop, display.as_ref(), &bare),
+                                        continues_from: None,
+                                        speaker_session_id: None,
+                                    };
+                                }
+                                yield ProtocolFrame::Delta {
+                                    message_id: message_id.clone(),
+                                    content: std::mem::take(&mut held),
+                                };
+                            } else if meta_sent && !held.is_empty() {
+                                yield ProtocolFrame::Delta {
+                                    message_id: message_id.clone(),
+                                    content: std::mem::take(&mut held),
+                                };
+                            }
+                        }
+                        if chunk.usage.is_some() {
+                            usage = chunk.usage;
+                        }
+                        if chunk.generation_id.is_some() {
+                            generation_id = chunk.generation_id;
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("proactive stream: upstream open err: {e}");
+                    failures.push(AttemptFailure::from_llm_error(CHAT_TASK, &hop.audit, &e));
+                    failed = true;
+                }
+                Err(_) => {
+                    failures.push(gateway_timeout(
+                        &hop.audit,
+                        eros_engine_llm::failure::GatewayKind::OpenTimeout,
+                    ));
+                    failed = true;
+                }
+            }
+            // Undecoded byte-level BPE (issue #84) is a failed hop, as in
+            // `execute`.
+            let garbled = !failed && eros_engine_llm::byte_bpe::looks_byte_garbled(&acc);
+            if garbled {
+                tracing::error!(model = %hop.audit, "proactive stream: byte-BPE garbled completion");
+            }
+            if failed || garbled {
+                if !meta_sent {
+                    continue;
+                }
+                // Her text has gone out: no other model may take over.
+                let (code, r, upstream_status, provider_code) = if garbled {
+                    (StreamErrorCode::UpstreamUnavailable, true, None, None)
+                } else {
+                    error_frame_fields_from_last(&failures)
+                };
+                yield error_frame(code, retryable(r), "generation failed mid-reply", upstream_status, provider_code);
+                return;
+            }
+
+            held.push_str(&scrubber.finish());
+            if !held.trim().is_empty() && !meta_sent {
+                meta_sent = true;
+                yield ProtocolFrame::Meta {
+                    message_id: message_id.clone(),
+                    action_type: FrameActionType::Proactive,
+                    model: hop_display(hop, display.as_ref(), &bare),
+                    continues_from: None,
+                    speaker_session_id: None,
+                };
+            }
+            if meta_sent && !held.is_empty() {
+                yield ProtocolFrame::Delta {
+                    message_id: message_id.clone(),
+                    content: held,
+                };
+            }
+            served = Some((idx, bare, hop.audit.clone(), acc, usage, generation_id));
+            break;
+        }
+
+        let Some((idx, bare, model, acc, usage, generation_id)) = served else {
+            tracing::warn!(
+                session_id = %g.session_id,
+                occasion = g.occasion.name(),
+                "proactive stream: companion chain exhausted"
+            );
+            let (code, r, upstream_status, provider_code) = error_frame_fields_from_last(&failures);
+            yield error_frame(code, retryable(r), "all models failed", upstream_status, provider_code);
+            return;
+        };
+        let usage_full = usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
+        let generation_id = record_generation(
+            &state.pool,
+            GenerationRecord {
+                task: CHAT_TASK,
+                session_id: Some(g.session_id),
+                generation_id: generation_id.as_deref(),
+                model: Some(model.as_str()),
+                usage: usage_full.as_ref(),
+            },
+        )
+        .await;
+        let (llm_attempts, gateway_errors) = split_failures_typed(&failures);
+        let final_frame = build_final_frame(
+            false,
+            Some(prep.injected_tags.clone()),
+            g.tier.clone(),
+            idx as u32,
+            0,
+            llm_attempts,
+            gateway_errors,
+        );
+        let stripped = apply_output_regex(&state.output_regex, &bare, &acc);
+        let content = stripped.cleaned.trim();
+        if content.is_empty() {
+            tracing::warn!(
+                session_id = %g.session_id,
+                occasion = g.occasion.name(),
+                "proactive stream: blank reply, nothing written"
+            );
+            yield final_frame;
+            return;
+        }
+
+        let session_id = g.session_id;
+        let stored = match store(&state, g, &prep, id, content, generation_id.clone(), &failures).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(%session_id, "proactive stream: store failed: {e}");
+                yield error_frame(StreamErrorCode::Internal, retryable(false), "internal error", None, None);
+                return;
+            }
+        };
+        let Some(row) = stored.row else {
+            yield error_frame(
+                StreamErrorCode::Superseded,
+                false,
+                "a newer message landed first",
+                None,
+                None,
+            );
+            return;
+        };
+        let mut wire_usage = usage_full;
+        crate::routes::companion::filter_usage_keys(
+            &mut wire_usage,
+            &state.config.openrouter_usage_hidden_keys,
+        );
+        yield done_frame(&row, wire_usage, generation_id);
+        if let Some((composed_prompt, aspect_ratio)) = stored.picture {
+            yield build_image_request_frame(
+                message_id,
+                &composed_prompt,
+                ImageRef::Face,
+                aspect_ratio.as_deref(),
+            );
+        }
+        yield final_frame;
+    }
+}
+
+fn gateway_timeout(model: &str, kind: eros_engine_llm::failure::GatewayKind) -> AttemptFailure {
+    AttemptFailure::Gateway(eros_engine_llm::failure::GatewayError {
+        task: CHAT_TASK.to_string(),
+        model: Some(model.to_string()),
+        kind,
+        message: "stream timeout".into(),
+    })
+}
+
+/// `greet_stream` against a streamed upstream (spec
+/// 2026-11-10-proactive-reply-streaming-design.md §4–§5).
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    use futures_util::StreamExt as _;
+    use serde_json::{json, Value};
+    use sqlx::PgPool;
+    use std::sync::Arc;
+    use wiremock::matchers::{body_partial_json, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use crate::pipeline::stream::ProtocolFrame;
+    use crate::routes::companion::test_state;
+    use crate::routes::companion::testutil::{seed_genome, seed_instance, seed_session};
+    use crate::routes::companion_stream::resolve_text_turn;
+
+    /// An upstream SSE body: one content chunk per entry, then `[DONE]`.
+    fn sse(chunks: &[&str]) -> String {
+        let mut body = String::new();
+        for c in chunks {
+            body.push_str(&format!(
+                "data: {}\n\n",
+                json!({"id": "gen-s", "model": "served", "choices": [{"delta": {"content": c}}]})
+            ));
+        }
+        body.push_str("data: [DONE]\n\n");
+        body
+    }
+
+    async fn mount(mock: &MockServer, model: &str, template: ResponseTemplate) {
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_partial_json(json!({"model": model})))
+            .respond_with(template)
+            .mount(mock)
+            .await;
+    }
+
+    fn streamed(body: String) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_raw(body, "text/event-stream")
+    }
+
+    fn state_for(pool: PgPool, mock_uri: &str) -> AppState {
+        let mut state = test_state(pool);
+        state.model_config = Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"primary\"\nfallback = [\"backup\"]\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{mock_uri}/api/v1/chat/completions"),
+            ),
+        );
+        state
+    }
+
+    /// A `just_opened` greeting for a fresh session, `since` an hour ago.
+    async fn greeting(state: &AppState) -> Greeting {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&state.pool, "Aria").await;
+        let instance_id = seed_instance(&state.pool, genome_id, user_id).await;
+        let session_id = seed_session(&state.pool, user_id, instance_id).await;
+        let (_s, persona, _i) = resolve_text_turn(state, session_id, user_id, "test")
+            .await
+            .unwrap();
+        Greeting {
+            session_id,
+            user_id,
+            instance_id,
+            persona,
+            now: NowContext::default(),
+            occasion: Occasion::JustOpened {
+                open_key: "k1".into(),
+            },
+            recall_query: String::new(),
+            since: Utc::now() - chrono::Duration::hours(1),
+            tier: None,
+            prompt_traits: Vec::new(),
+            memory_scope: Default::default(),
+            affinity_scope: Default::default(),
+            audit: None,
+            metadata: serde_json::Map::new(),
+            message_id: None,
+        }
+    }
+
+    async fn run(state: &AppState, g: Greeting, fixed: Option<bool>) -> Vec<Value> {
+        greet_stream(state.clone(), g, fixed)
+            .map(|f: ProtocolFrame| serde_json::to_value(f).unwrap())
+            .collect()
+            .await
+    }
+
+    fn types(frames: &[Value]) -> Vec<&str> {
+        frames.iter().map(|f| f["type"].as_str().unwrap()).collect()
+    }
+
+    fn deltas(frames: &[Value]) -> String {
+        frames
+            .iter()
+            .filter(|f| f["type"] == "delta")
+            .map(|f| f["content"].as_str().unwrap())
+            .collect()
+    }
+
+    async fn proactive_rows(pool: &PgPool, session_id: Uuid) -> Vec<(Uuid, String)> {
+        sqlx::query_as(
+            "SELECT id, content FROM engine.chat_messages \
+             WHERE session_id = $1 AND assistant_action_type = 'proactive'",
+        )
+        .bind(session_id)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn stream_happy_path_orders_frames_and_stores_under_meta_id(pool: PgPool) {
+        let mock = MockServer::start().await;
+        mount(&mock, "primary", streamed(sse(&["你来", "啦", "～"]))).await;
+        let state = state_for(pool.clone(), &mock.uri());
+        let g = greeting(&state).await;
+        let session_id = g.session_id;
+
+        let frames = run(&state, g, None).await;
+        assert_eq!(
+            types(&frames),
+            ["meta", "delta", "delta", "delta", "done", "final"]
+        );
+        assert_eq!(frames[0]["action_type"], "proactive");
+        let meta_id = frames[0]["message_id"].as_str().unwrap();
+        let rows = proactive_rows(&pool, session_id).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].0,
+            Uuid::from(Ulid::from_string(meta_id).unwrap()),
+            "stored under the id meta announced"
+        );
+        assert_eq!(rows[0].1, "你来啦～");
+        assert_eq!(deltas(&frames).trim(), rows[0].1);
+        let done = &frames[4];
+        assert_eq!(done["message_id"], meta_id);
+        assert_eq!(done["occasion"], "just_opened");
+        assert_eq!(done["truncated"], false);
+        assert!(done["sent_at"].is_string());
+        assert_eq!(frames[5]["retries_chat"], 0);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn stream_whitespace_first_chunk_delays_meta(pool: PgPool) {
+        let mock = MockServer::start().await;
+        mount(&mock, "primary", streamed(sse(&["\n", "hi"]))).await;
+        let state = state_for(pool.clone(), &mock.uri());
+        let g = greeting(&state).await;
+
+        let frames = run(&state, g, None).await;
+        assert_eq!(types(&frames), ["meta", "delta", "done", "final"]);
+        assert_eq!(deltas(&frames), "\nhi");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn stream_blank_reply_is_final_alone(pool: PgPool) {
+        let mock = MockServer::start().await;
+        mount(&mock, "primary", streamed(sse(&[" ", "\n"]))).await;
+        let state = state_for(pool.clone(), &mock.uri());
+        let g = greeting(&state).await;
+        let session_id = g.session_id;
+
+        let frames = run(&state, g, None).await;
+        assert_eq!(types(&frames), ["final"]);
+        assert!(proactive_rows(&pool, session_id).await.is_empty());
+        assert_eq!(
+            mock.received_requests().await.unwrap().len(),
+            1,
+            "a blank reply does not try the next model"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn stream_falls_back_before_first_delta(pool: PgPool) {
+        let mock = MockServer::start().await;
+        mount(&mock, "primary", ResponseTemplate::new(500)).await;
+        mount(&mock, "backup", streamed(sse(&["在呢"]))).await;
+        let state = state_for(pool.clone(), &mock.uri());
+        let g = greeting(&state).await;
+        let session_id = g.session_id;
+
+        let frames = run(&state, g, None).await;
+        assert_eq!(types(&frames), ["meta", "delta", "done", "final"]);
+        let last = frames.last().unwrap();
+        assert_eq!(last["retries_chat"], 1);
+        assert_eq!(last["llm_attempts"].as_array().unwrap().len(), 1);
+        assert_eq!(proactive_rows(&pool, session_id).await.len(), 1);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn stream_error_after_delta_stores_nothing(pool: PgPool) {
+        let mock = MockServer::start().await;
+        let body = format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            json!({"choices": [{"delta": {"content": "我刚"}}]}),
+            json!({"choices": [{"delta": {}, "finish_reason": "error"}],
+                   "error": {"code": 502, "message": "upstream died"}}),
+        );
+        mount(&mock, "primary", streamed(body)).await;
+        mount(&mock, "backup", streamed(sse(&["不该用到"]))).await;
+        let state = state_for(pool.clone(), &mock.uri());
+        let g = greeting(&state).await;
+        let session_id = g.session_id;
+
+        let frames = run(&state, g, None).await;
+        assert_eq!(types(&frames), ["meta", "delta", "error"]);
+        assert!(proactive_rows(&pool, session_id).await.is_empty());
+        assert_eq!(
+            mock.received_requests().await.unwrap().len(),
+            1,
+            "no fallback once text has gone out"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn stream_chain_exhausted_is_error(pool: PgPool) {
+        let mock = MockServer::start().await;
+        mount(&mock, "primary", ResponseTemplate::new(500)).await;
+        mount(&mock, "backup", ResponseTemplate::new(503)).await;
+        let state = state_for(pool.clone(), &mock.uri());
+        let g = greeting(&state).await;
+        let session_id = g.session_id;
+
+        let frames = run(&state, g, None).await;
+        assert_eq!(types(&frames), ["error"]);
+        assert_eq!(frames[0]["code"], "upstream_unavailable");
+        assert_eq!(frames[0]["upstream_status"], 503);
+        assert_eq!(frames[0]["retryable"], true);
+        assert!(proactive_rows(&pool, session_id).await.is_empty());
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn stream_fixed_retryable_pins_error(pool: PgPool) {
+        let mock = MockServer::start().await;
+        mount(&mock, "primary", ResponseTemplate::new(500)).await;
+        mount(&mock, "backup", ResponseTemplate::new(503)).await;
+        let state = state_for(pool.clone(), &mock.uri());
+        let g = greeting(&state).await;
+
+        let frames = run(&state, g, Some(false)).await;
+        assert_eq!(types(&frames), ["error"]);
+        assert_eq!(frames[0]["retryable"], false);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn stream_superseded_when_insert_yields(pool: PgPool) {
+        let mock = MockServer::start().await;
+        mount(&mock, "primary", streamed(sse(&["你来啦"]))).await;
+        let state = state_for(pool.clone(), &mock.uri());
+        let g = greeting(&state).await;
+        let session_id = g.session_id;
+        // A user message landed after the request began.
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+             VALUES ($1, 'user', '在吗', $2)",
+        )
+        .bind(session_id)
+        .bind(g.since + chrono::Duration::minutes(1))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let frames = run(&state, g, None).await;
+        assert_eq!(types(&frames), ["meta", "delta", "error"]);
+        let err = frames.last().unwrap();
+        assert_eq!(err["code"], "superseded");
+        assert_eq!(err["retryable"], false);
+        assert!(proactive_rows(&pool, session_id).await.is_empty());
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn stream_uses_the_callers_message_id(pool: PgPool) {
+        let mock = MockServer::start().await;
+        mount(&mock, "primary", streamed(sse(&["你来啦"]))).await;
+        let state = state_for(pool.clone(), &mock.uri());
+        let mut g = greeting(&state).await;
+        let id: Uuid = Ulid::new().into();
+        g.message_id = Some(id);
+        let session_id = g.session_id;
+
+        let frames = run(&state, g, None).await;
+        assert_eq!(frames[0]["message_id"], frame_message_id(id));
+        assert_eq!(proactive_rows(&pool, session_id).await[0].0, id);
+    }
+
+    /// A rule that can only be judged on the whole reply makes the scrubber
+    /// hold everything until the stream ends: the text still goes out, after
+    /// `meta` and before `done`.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn stream_sends_text_the_scrubber_held_to_the_end(pool: PgPool) {
+        let mock = MockServer::start().await;
+        mount(&mock, "primary", streamed(sse(&["想", "你了"]))).await;
+        let mut state = state_for(pool.clone(), &mock.uri());
+        let cfg = eros_engine_llm::model_config::ModelConfig::from_toml_str(
+            r#"
+            [tasks.chat_companion]
+            model = "primary"
+
+            [[tasks.chat_companion.output_regex]]
+            models = ["primary"]
+            pattern = '^\s*\[[^\]]*\]\s*$'
+            "#,
+        )
+        .unwrap();
+        state.output_regex = Arc::new(cfg.compile_output_regex().unwrap());
+        state.model_config = Arc::new(cfg);
+        let g = greeting(&state).await;
+        let session_id = g.session_id;
+
+        let frames = run(&state, g, None).await;
+        let kinds = types(&frames);
+        assert_eq!(kinds.first(), Some(&"meta"));
+        assert_eq!(&kinds[kinds.len() - 2..], ["done", "final"]);
+        assert_eq!(deltas(&frames), "想你了");
+        assert_eq!(proactive_rows(&pool, session_id).await[0].1, "想你了");
+    }
+
+    #[test]
+    fn replay_frames_carry_the_stored_row() {
+        let id: Uuid = Ulid::new().into();
+        let sent_at = Utc::now();
+        let row: ChatMessage = serde_json::from_value(json!({
+            "id": id,
+            "session_id": Uuid::new_v4(),
+            "role": "assistant",
+            "content": "中秋快乐",
+            "sent_at": sent_at,
+            "metadata": {"proactive": "holiday", "tier": "plus"},
+        }))
+        .unwrap();
+        let frames: Vec<Value> = replay_frames(&row, None)
+            .into_iter()
+            .map(|f| serde_json::to_value(f).unwrap())
+            .collect();
+        assert_eq!(types(&frames), ["meta", "delta", "done", "final"]);
+        assert_eq!(frames[0]["message_id"], frame_message_id(id));
+        assert_eq!(frames[0]["action_type"], "proactive");
+        assert_eq!(frames[1]["content"], "中秋快乐");
+        assert_eq!(frames[2]["occasion"], "holiday");
+        assert_eq!(frames[3]["tier"], "plus");
     }
 }

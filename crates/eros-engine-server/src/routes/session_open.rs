@@ -9,7 +9,8 @@
 //! docs/superpowers/specs/2026-10-10-persona-origin-and-birthday-design.md §5
 
 use axum::extract::{Extension, Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse as _, Response};
 use axum::Json;
 use chrono::{DateTime, NaiveDate, Utc};
 use chrono_tz::Tz;
@@ -26,7 +27,9 @@ use crate::birthday::Birthday;
 use crate::error::{AppError, StreamPreError};
 use crate::holiday::{self, UserLocale};
 use crate::pipeline::handlers::recall_query_text;
-use crate::pipeline::proactive::{greet, Greeting, Occasion};
+use crate::pipeline::proactive::{
+    bare_final, greet, greet_stream, replay_frames, Greeting, Occasion,
+};
 use crate::prompt::{meta_str, persona_clock_tz, NowContext};
 use crate::routes::companion::{
     validate_llm_audit, validate_prompt_traits, LlmAuditDto, PromptTraitDto,
@@ -34,6 +37,7 @@ use crate::routes::companion::{
 use crate::routes::companion_stream::{
     resolve_text_turn, validate_tier, AffinityScopeDto, StreamPreErrorBody,
 };
+use crate::routes::dto::{sse_response, wants_stream};
 use crate::state::AppState;
 
 /// Same per-user in-flight cap as every other LLM entry point.
@@ -76,6 +80,10 @@ pub struct OpenSessionRequest {
     /// 1–128 chars of `[A-Za-z0-9_.:-]`.
     #[serde(default)]
     pub open_key: Option<String>,
+    /// Answer as a server-sent event stream instead of JSON; an
+    /// `Accept: text/event-stream` header asks for the same.
+    #[serde(default)]
+    pub stream: bool,
 }
 
 /// A caller-named reason for the persona to speak first.
@@ -170,7 +178,14 @@ impl From<ChatMessage> for GreetingDto {
     params(("session_id" = Uuid, Path, description = "Chat session id")),
     request_body = OpenSessionRequest,
     responses(
-        (status = 200, body = OpenSessionResponse),
+        (status = 200, description = "The greeting. With `stream: true` in the body or \
+            `Accept: text/event-stream`, a server-sent event stream of the chat stream's frames \
+            instead: `meta` → `delta`… → `done` → `final`, or `final` alone when she does not \
+            speak first; `done` also carries `sent_at` and `occasion`.",
+            content(
+                (OpenSessionResponse = "application/json"),
+                (String = "text/event-stream")
+            )),
         (status = 400, body = StreamPreErrorBody),
         (status = 401, description = "missing or invalid bearer"),
         (status = 403, body = StreamPreErrorBody),
@@ -187,11 +202,29 @@ async fn open_session(
     State(state): State<AppState>,
     Path(session_id): Path<Uuid>,
     Extension(AuthUser(user_id)): Extension<AuthUser>,
+    headers: HeaderMap,
     Json(req): Json<OpenSessionRequest>,
-) -> Result<Json<OpenSessionResponse>, AppError> {
-    open_at(&state, session_id, user_id, req, Utc::now())
-        .await
-        .map(Json)
+) -> Result<Response, AppError> {
+    let now = Utc::now();
+    if !wants_stream(&headers, req.stream) {
+        return Ok(Json(open_at(&state, session_id, user_id, req, now).await?).into_response());
+    }
+    let tier = req.tier.clone();
+    Ok(
+        match plan_open(&state, session_id, user_id, req, now).await? {
+            OpenPlan::Answer(Some(row)) => {
+                sse_response(futures_util::stream::iter(replay_frames(&row, None)))
+            }
+            OpenPlan::Answer(None) => sse_response(futures_util::stream::iter([bare_final(tier)])),
+            OpenPlan::Speak { guard, greeting } => sse_response(async_stream::stream! {
+                // Held while she speaks; a dropped connection drops it with the stream.
+                let _guard = guard;
+                for await frame in greet_stream(state, greeting, None) {
+                    yield frame;
+                }
+            }),
+        },
+    )
 }
 
 fn invalid_payload(message: String) -> AppError {
@@ -228,10 +261,23 @@ fn validate_opener(
     }
 }
 
+/// The request, decided: everything the route does before generating.
+// Built once per request and consumed at once: not worth a box.
+#[allow(clippy::large_enum_variant)]
+enum OpenPlan {
+    /// Answer without generating: an existing message, or none.
+    Answer(Option<ChatMessage>),
+    /// Generate. The guard is the user's in-flight slot.
+    Speak {
+        guard: crate::state::StreamSlotGuard,
+        greeting: Greeting,
+    },
+}
+
 /// What the route does once it has decided whether the persona speaks.
 enum Next {
     /// Answer without generating: an existing message, or `null`.
-    Answer(OpenSessionResponse),
+    Answer(Option<ChatMessage>),
     /// Generate for this occasion; `since` is the cutoff the insert re-checks.
     Speak {
         occasion: Occasion,
@@ -241,12 +287,10 @@ enum Next {
 }
 
 fn answer(row: Option<ChatMessage>) -> Next {
-    Next::Answer(OpenSessionResponse {
-        greeting: row.map(Into::into),
-    })
+    Next::Answer(row)
 }
 
-/// The handler with its clock injected, so tests can pin a holiday.
+/// The JSON handler with its clock injected, so tests can pin a holiday.
 pub(crate) async fn open_at(
     state: &AppState,
     session_id: Uuid,
@@ -254,6 +298,26 @@ pub(crate) async fn open_at(
     req: OpenSessionRequest,
     now: DateTime<Utc>,
 ) -> Result<OpenSessionResponse, AppError> {
+    let greeting = match plan_open(state, session_id, user_id, req, now).await? {
+        OpenPlan::Answer(row) => row,
+        OpenPlan::Speak { guard, greeting } => {
+            let _guard = guard;
+            greet(state, greeting).await?
+        }
+    };
+    Ok(OpenSessionResponse {
+        greeting: greeting.map(Into::into),
+    })
+}
+
+/// Validate the request and decide whether she speaks.
+async fn plan_open(
+    state: &AppState,
+    session_id: Uuid,
+    user_id: Uuid,
+    req: OpenSessionRequest,
+    now: DateTime<Utc>,
+) -> Result<OpenPlan, AppError> {
     validate_tier(req.tier.as_deref())?;
     let prompt_traits = validate_prompt_traits(req.prompt_traits.as_deref().unwrap_or(&[]))
         .map_err(|e| invalid_payload(e.to_string()))?;
@@ -276,7 +340,7 @@ pub(crate) async fn open_at(
         }
     };
     let (occasion, recall_query, since) = match next {
-        Next::Answer(resp) => return Ok(resp),
+        Next::Answer(row) => return Ok(OpenPlan::Answer(row)),
         Next::Speak {
             occasion,
             recall_query,
@@ -292,10 +356,10 @@ pub(crate) async fn open_at(
         .foreground
         .is_some_and(|e| e.kind.is_offline(&crate::prompt::persona_traits(&persona)));
     if away {
-        return Ok(OpenSessionResponse { greeting: None });
+        return Ok(OpenPlan::Answer(None));
     }
 
-    let _guard = state
+    let guard = state
         .stream_slots
         .try_acquire(user_id, CONCURRENT_STREAMS_PER_USER)
         .ok_or_else(|| AppError::TooManyRequests("per-user in-flight cap reached".into()))?;
@@ -307,14 +371,14 @@ pub(crate) async fn open_at(
         req.user_region.as_deref(),
     );
     let now_ctx = NowContext::for_user(&locale, now);
-    let greeting = greet(
-        state,
-        Greeting {
+    Ok(OpenPlan::Speak {
+        guard,
+        greeting: Greeting {
             session_id,
             user_id,
             instance_id,
-            persona: &persona,
-            now: &now_ctx,
+            persona,
+            now: now_ctx,
             occasion,
             recall_query,
             since,
@@ -328,11 +392,8 @@ pub(crate) async fn open_at(
                 .unwrap_or_default(),
             audit,
             metadata,
+            message_id: None,
         },
-    )
-    .await?;
-    Ok(OpenSessionResponse {
-        greeting: greeting.map(Into::into),
     })
 }
 
@@ -486,8 +547,8 @@ mod tests {
 
     use crate::routes::companion::test_state;
     use crate::routes::companion::testutil::{
-        build_router, mint_test_jwt, seed_byoc_session, seed_genome, seed_instance, seed_session,
-        send_request, session_footprint,
+        build_router, frame_types, mint_test_jwt, seed_byoc_session, seed_genome, seed_instance,
+        seed_session, send_request, send_sse, session_footprint, upstream_sse,
     };
 
     /// 2026-09-25 04:00 in Taipei: 中秋节, and TW's Mid-Autumn Festival.
@@ -2144,8 +2205,8 @@ mod tests {
                 .await
                 .unwrap();
                 match next {
-                    Next::Answer(OpenSessionResponse { greeting: Some(_) }) => break,
-                    Next::Answer(OpenSessionResponse { greeting: None }) => nulls += 1,
+                    Next::Answer(Some(_)) => break,
+                    Next::Answer(None) => nulls += 1,
                     Next::Speak { .. } if writer_done => break,
                     Next::Speak { .. } => tokio::task::yield_now().await,
                 }
@@ -2308,6 +2369,229 @@ mod tests {
             StatusCode::UNPROCESSABLE_ENTITY,
             "the holiday is the engine's call"
         );
+    }
+
+    // ── The SSE response (spec 2026-11-10-proactive-reply-streaming-design.md) ──
+
+    /// The companion answering a streamed call, keyed on `stream: true`.
+    async fn mount_streamed(mock: &MockServer, chunks: &[&str]) {
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_partial_json(json!({"stream": true})))
+            .respond_with(upstream_sse(chunks))
+            .mount(mock)
+            .await;
+    }
+
+    async fn fresh_session(pool: &PgPool, user_id: Uuid) -> Uuid {
+        let genome_id = seed_genome(pool, "Aria").await;
+        let instance_id = seed_instance(pool, genome_id, user_id).await;
+        seed_session(pool, user_id, instance_id).await
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn open_streams_with_body_flag(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = fresh_session(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        mount_streamed(&mock, &["你来", "啦"]).await;
+        let mut app = build_router(with_companion(test_state(pool.clone()), &mock.uri()));
+
+        let (status, content_type, frames) = send_sse(
+            &mut app,
+            open_req(
+                session_id,
+                &mint_test_jwt(user_id),
+                json!({"occasion": "just_opened", "open_key": "k1", "stream": true}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            content_type.starts_with("text/event-stream"),
+            "{content_type}"
+        );
+        assert_eq!(
+            frame_types(&frames),
+            ["meta", "delta", "delta", "done", "final"]
+        );
+        assert_eq!(frames[3]["occasion"], "just_opened");
+        assert_eq!(proactive_rows(&pool, session_id).await, 1);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn open_streams_with_accept_header(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = fresh_session(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        mount_streamed(&mock, &["你来啦"]).await;
+        let mut app = build_router(with_companion(test_state(pool.clone()), &mock.uri()));
+
+        let mut req = open_req(
+            session_id,
+            &mint_test_jwt(user_id),
+            json!({"occasion": "just_opened", "open_key": "k1"}),
+        );
+        req.headers_mut().insert(
+            header::ACCEPT,
+            header::HeaderValue::from_static("text/event-stream"),
+        );
+        let (status, content_type, frames) = send_sse(&mut app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            content_type.starts_with("text/event-stream"),
+            "{content_type}"
+        );
+        assert_eq!(frame_types(&frames), ["meta", "delta", "done", "final"]);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn open_without_either_is_json(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = fresh_session(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "你来啦").await;
+        let mut app = build_router(with_companion(test_state(pool.clone()), &mock.uri()));
+
+        let resp = tower::ServiceExt::oneshot(
+            app.clone(),
+            open_req(
+                session_id,
+                &mint_test_jwt(user_id),
+                json!({"occasion": "just_opened", "open_key": "k1"}),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()[header::CONTENT_TYPE],
+            "application/json",
+            "no stream asked for: today's JSON"
+        );
+        let (_, body) = send_request(
+            &mut app,
+            open_req(
+                session_id,
+                &mint_test_jwt(user_id),
+                json!({"occasion": "just_opened", "open_key": "k1"}),
+            ),
+        )
+        .await;
+        assert_eq!(body["greeting"]["content"], "你来啦");
+        let calls = companion_calls(&mock).await;
+        assert_eq!(calls.len(), 1);
+        assert_ne!(calls[0]["stream"], json!(true), "the non-streaming call");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn open_stream_replays_the_key(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = fresh_session(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        mount_streamed(&mock, &["你来", "啦"]).await;
+        let mut app = build_router(with_companion(test_state(pool.clone()), &mock.uri()));
+        let body = json!({"occasion": "just_opened", "open_key": "k1", "stream": true});
+
+        let (_, _, first) = send_sse(
+            &mut app,
+            open_req(session_id, &mint_test_jwt(user_id), body.clone()),
+        )
+        .await;
+        let (status, _, second) = send_sse(
+            &mut app,
+            open_req(session_id, &mint_test_jwt(user_id), body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(frame_types(&second), ["meta", "delta", "done", "final"]);
+        assert_eq!(second[0]["message_id"], first[0]["message_id"]);
+        assert_eq!(second[1]["content"], "你来啦");
+        assert_eq!(second[2]["sent_at"], first[3]["sent_at"]);
+        assert_eq!(companion_calls(&mock).await.len(), 1, "nothing regenerated");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn open_stream_no_occasion_is_final_alone(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id =
+            session_with_history(&pool, user_id, Utc::now() - chrono::Duration::days(1)).await;
+        let mut app = build_router(test_state(pool.clone()));
+
+        let (status, content_type, frames) = send_sse(
+            &mut app,
+            open_req(
+                session_id,
+                &mint_test_jwt(user_id),
+                json!({"occasion": "first_meet", "open_key": "k1", "stream": true, "tier": "plus"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            content_type.starts_with("text/event-stream"),
+            "{content_type}"
+        );
+        assert_eq!(frame_types(&frames), ["final"]);
+        assert_eq!(frames[0]["tier"], "plus");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn open_stream_over_cap_is_429(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = fresh_session(&pool, user_id).await;
+        let state = test_state(pool.clone());
+        let _held: Vec<_> = (0..CONCURRENT_STREAMS_PER_USER)
+            .map(|_| {
+                state
+                    .stream_slots
+                    .try_acquire(user_id, CONCURRENT_STREAMS_PER_USER)
+                    .unwrap()
+            })
+            .collect();
+        let mut app = build_router(state);
+
+        let (status, content_type, frames) = send_sse(
+            &mut app,
+            open_req(
+                session_id,
+                &mint_test_jwt(user_id),
+                json!({"occasion": "just_opened", "open_key": "k1", "stream": true}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(!content_type.starts_with("text/event-stream"));
+        assert!(frames.is_empty());
+    }
+
+    /// The slot is held while she is speaking and released when the stream
+    /// ends.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn open_stream_releases_its_slot(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = fresh_session(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        mount_streamed(&mock, &["你来啦"]).await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let mut app = build_router(state.clone());
+
+        send_sse(
+            &mut app,
+            open_req(
+                session_id,
+                &mint_test_jwt(user_id),
+                json!({"occasion": "just_opened", "open_key": "k1", "stream": true}),
+            ),
+        )
+        .await;
+        let all: Vec<_> = (0..CONCURRENT_STREAMS_PER_USER)
+            .filter_map(|_| {
+                state
+                    .stream_slots
+                    .try_acquire(user_id, CONCURRENT_STREAMS_PER_USER)
+            })
+            .collect();
+        assert_eq!(all.len() as u32, CONCURRENT_STREAMS_PER_USER);
     }
 
     #[test]

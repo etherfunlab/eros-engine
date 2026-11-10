@@ -6,7 +6,8 @@
 //! docs/superpowers/specs/2026-10-16-life-events-offline-and-scares-design.md).
 
 use axum::extract::{Extension, Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse as _, Response};
 use axum::Json;
 use chrono::{DateTime, Utc};
 use rand::Rng;
@@ -25,7 +26,10 @@ use crate::auth::middleware::AuthUser;
 use crate::error::{AppError, StreamPreError};
 use crate::holiday::{self, UserLocale};
 use crate::pipeline::handlers::recall_query_text;
-use crate::pipeline::proactive::{greet, Greeting, Occasion};
+use crate::pipeline::proactive::{
+    bare_final, frame_message_id, greet, greet_stream, replay_frames, Greeting, Occasion,
+};
+use crate::pipeline::stream::ProtocolFrame;
 use crate::prompt::NowContext;
 use crate::routes::companion::{
     image_request_payload, validate_llm_audit, validate_prompt_traits, ImageRequestPayloadResponse,
@@ -35,6 +39,7 @@ use crate::routes::companion_stream::{
     resolve_text_turn, validate_image_params, validate_tier, validated_outfit, AffinityScopeDto,
     ImageReplyParams, StreamPreErrorBody,
 };
+use crate::routes::dto::{sse_response, wants_stream};
 use crate::routes::session_open::GreetingDto;
 use crate::state::AppState;
 use eros_engine_llm::model_config::StyleKey;
@@ -412,6 +417,10 @@ pub struct DrawEventRequest {
     #[serde(default)]
     #[schema(max_length = 64)]
     pub outfit: Option<String>,
+    /// Answer as a server-sent event stream instead of JSON; an
+    /// `Accept: text/event-stream` header asks for the same.
+    #[serde(default)]
+    pub stream: bool,
 }
 
 /// How her picture is composed; each field as on a chat turn's `image`.
@@ -472,11 +481,33 @@ async fn respond(
     event_key: &str,
     traits: &events::PersonaTraits,
 ) -> Result<DrawEventResponse, AppError> {
+    let (event, message, image_request) = stored(state, session_id, event_key, traits).await?;
+    Ok(DrawEventResponse {
+        event,
+        message: message.map(Into::into),
+        image_request,
+    })
+}
+
+/// [`respond`]'s parts: the event, the row that told it, her picture.
+async fn stored(
+    state: &AppState,
+    session_id: Uuid,
+    event_key: &str,
+    traits: &events::PersonaTraits,
+) -> Result<
+    (
+        Option<EventView>,
+        Option<eros_engine_store::chat::ChatMessage>,
+        Option<ImageRequestPayloadResponse>,
+    ),
+    AppError,
+> {
     let Some(event) = EventRepo { pool: &state.pool }
         .by_key(session_id, event_key)
         .await?
     else {
-        return Ok(DrawEventResponse::none());
+        return Ok((None, None, None));
     };
     let message = match event.message_id {
         Some(id) => {
@@ -494,11 +525,7 @@ async fn respond(
         },
         None => None,
     };
-    Ok(DrawEventResponse {
-        event: Some(EventView::new(&event, traits)),
-        message: message.map(Into::into),
-        image_request,
-    })
+    Ok((Some(EventView::new(&event, traits)), message, image_request))
 }
 
 /// Ask for something to happen in the persona's day.
@@ -532,7 +559,16 @@ async fn respond(
     params(("session_id" = Uuid, Path, description = "Chat session id")),
     request_body = DrawEventRequest,
     responses(
-        (status = 200, body = DrawEventResponse),
+        (status = 200, description = "The event and her message. With `stream: true` in the \
+            body or `Accept: text/event-stream`, a server-sent event stream instead: an `event` \
+            frame first (`{type, event}`, the event or `null`), then the chat stream's frames \
+            for her message: `meta` → `delta`… → `done` → `image_request`? → `final`, or \
+            `final` alone when she tells nothing. An `event` that names a `message_id` is not \
+            stored until that message's `done` arrives, and then starts at `done.sent_at`.",
+            content(
+                (DrawEventResponse = "application/json"),
+                (String = "text/event-stream")
+            )),
         (status = 400, body = StreamPreErrorBody),
         (status = 401, description = "missing or invalid bearer"),
         (status = 403, body = StreamPreErrorBody),
@@ -551,8 +587,9 @@ async fn draw_event(
     State(state): State<AppState>,
     Path(session_id): Path<Uuid>,
     Extension(AuthUser(user_id)): Extension<AuthUser>,
+    headers: HeaderMap,
     Json(req): Json<DrawEventRequest>,
-) -> Result<Json<DrawEventResponse>, AppError> {
+) -> Result<Response, AppError> {
     // The generator is not `Send`: it is dropped before the first await.
     let rolls = {
         let mut rng = rand::thread_rng();
@@ -562,9 +599,13 @@ async fn draw_event(
             duration: rng.gen(),
         }
     };
-    draw_event_at(&state, session_id, user_id, req, Utc::now(), rolls)
-        .await
-        .map(Json)
+    if wants_stream(&headers, req.stream) {
+        return draw_event_stream_at(&state, session_id, user_id, req, Utc::now(), rolls).await;
+    }
+    Ok(
+        Json(draw_event_at(&state, session_id, user_id, req, Utc::now(), rolls).await?)
+            .into_response(),
+    )
 }
 
 fn invalid_payload(message: String) -> AppError {
@@ -577,7 +618,23 @@ fn invalid_payload(message: String) -> AppError {
     })
 }
 
-/// The handler with its clock and rolls injected, for tests.
+/// The request, decided: everything the route does before generating.
+enum EventPlan {
+    /// The key holds an event, or holds one now: an earlier call's, or a kind
+    /// she does not tell, just written. Answer by reading the key.
+    Stored,
+    /// Nothing happens.
+    Nothing,
+    /// Generate her message. The guard is the user's in-flight slot; `view`
+    /// is the event as drawn, not yet stored.
+    Tell {
+        guard: crate::state::StreamSlotGuard,
+        greeting: Box<Greeting>,
+        view: EventView,
+    },
+}
+
+/// The JSON handler with its clock and rolls injected, for tests.
 pub(crate) async fn draw_event_at(
     state: &AppState,
     session_id: Uuid,
@@ -586,6 +643,88 @@ pub(crate) async fn draw_event_at(
     now: DateTime<Utc>,
     rolls: events::Rolls,
 ) -> Result<DrawEventResponse, AppError> {
+    let key = req.event_key.clone();
+    let (plan, traits) = plan_event(state, session_id, user_id, req, now, rolls).await?;
+    match plan {
+        EventPlan::Nothing => return Ok(DrawEventResponse::none()),
+        EventPlan::Stored => {}
+        EventPlan::Tell {
+            guard, greeting, ..
+        } => {
+            let _guard = guard;
+            greet(state, *greeting).await?;
+        }
+    }
+    respond(state, session_id, &key, &traits).await
+}
+
+/// The SSE handler (spec 2026-11-10-proactive-reply-streaming-design.md
+/// §4): `event` first, then her message as it is generated.
+pub(crate) async fn draw_event_stream_at(
+    state: &AppState,
+    session_id: Uuid,
+    user_id: Uuid,
+    req: DrawEventRequest,
+    now: DateTime<Utc>,
+    rolls: events::Rolls,
+) -> Result<Response, AppError> {
+    let key = req.event_key.clone();
+    let tier = req.tier.clone();
+    let (plan, traits) = plan_event(state, session_id, user_id, req, now, rolls).await?;
+    Ok(match plan {
+        EventPlan::Nothing => sse_response(futures_util::stream::iter([
+            ProtocolFrame::Event { event: None },
+            bare_final(tier),
+        ])),
+        EventPlan::Stored => {
+            let (event, message, image_request) = stored(state, session_id, &key, &traits).await?;
+            let mut frames = vec![ProtocolFrame::Event { event }];
+            match message {
+                Some(row) => frames.extend(replay_frames(
+                    &row,
+                    image_request.map(|p| ProtocolFrame::ImageRequest {
+                        message_id: frame_message_id(p.message_id),
+                        composed_prompt: p.composed_prompt,
+                        image_ref: p
+                            .image_ref
+                            .and_then(|r| serde_json::from_value(r.into()).ok())
+                            .unwrap_or(eros_engine_core::types::ImageRef::Face),
+                        aspect_ratio: p.aspect_ratio,
+                        companion: p.companion,
+                    }),
+                )),
+                None => frames.push(bare_final(tier)),
+            }
+            sse_response(futures_util::stream::iter(frames))
+        }
+        EventPlan::Tell {
+            guard,
+            greeting,
+            view,
+        } => {
+            let state = state.clone();
+            sse_response(async_stream::stream! {
+                // Held while she speaks; a dropped connection drops it with the stream.
+                let _guard = guard;
+                yield ProtocolFrame::Event { event: Some(view) };
+                for await frame in greet_stream(state, *greeting, None) {
+                    yield frame;
+                }
+            })
+        }
+    })
+}
+
+/// Validate the request, draw, and decide what the route does next. Also
+/// returns the persona's traits, which the answer is read with.
+async fn plan_event(
+    state: &AppState,
+    session_id: Uuid,
+    user_id: Uuid,
+    req: DrawEventRequest,
+    now: DateTime<Utc>,
+    rolls: events::Rolls,
+) -> Result<(EventPlan, events::PersonaTraits), AppError> {
     validate_tier(req.tier.as_deref())?;
     let prompt_traits = validate_prompt_traits(req.prompt_traits.as_deref().unwrap_or(&[]))
         .map_err(|e| invalid_payload(e.to_string()))?;
@@ -618,7 +757,7 @@ pub(crate) async fn draw_event_at(
     let event_repo = EventRepo { pool: &state.pool };
     let traits = crate::prompt::persona_traits(&persona);
     if event_repo.by_key(session_id, &key).await?.is_some() {
-        return respond(state, session_id, &key, &traits).await;
+        return Ok((EventPlan::Stored, traits));
     }
     // She has asked for space and waits for an answer: the ask is the
     // foreground drama, and it keeps an offline stretch from starting
@@ -627,7 +766,7 @@ pub(crate) async fn draw_event_at(
         .pending_for_instance(instance_id, now)
         .await?;
     if waiting {
-        return Ok(DrawEventResponse::none());
+        return Ok((EventPlan::Nothing, traits));
     }
 
     let needs = if state.model_config.pde_enabled() {
@@ -687,7 +826,7 @@ pub(crate) async fn draw_event_at(
         },
         rolls,
     ) else {
-        return Ok(DrawEventResponse::none());
+        return Ok((EventPlan::Nothing, traits));
     };
 
     // A kind she does not tell is written without a message (spec
@@ -706,7 +845,7 @@ pub(crate) async fn draw_event_at(
                 None,
             )
             .await?;
-        return respond(state, session_id, &key, &traits).await;
+        return Ok((EventPlan::Stored, traits));
     }
 
     let background = history
@@ -723,7 +862,7 @@ pub(crate) async fn draw_event_at(
         })
         .map(ImageReplyParams::from);
 
-    let _guard = state
+    let guard = state
         .stream_slots
         .try_acquire(user_id, CONCURRENT_STREAMS_PER_USER)
         .ok_or_else(|| AppError::TooManyRequests("per-user in-flight cap reached".into()))?;
@@ -746,14 +885,26 @@ pub(crate) async fn draw_event_at(
         .map(recall_query_text)
         .unwrap_or_default();
     let now_ctx = NowContext::for_user(&locale, now);
-    greet(
-        state,
-        Greeting {
+    // The id her message is stored under on the streamed path, where the
+    // `event` frame names it before she speaks.
+    let message_id: Uuid = ulid::Ulid::new().into();
+    let view = EventView {
+        kind: drawn.kind.into(),
+        category: drawn.kind.category().into(),
+        offline: drawn.kind.is_offline(&traits),
+        started_at: now,
+        ends_at: now + drawn.lasts,
+        message_id: Some(message_id),
+    };
+    let plan = EventPlan::Tell {
+        guard,
+        view,
+        greeting: Box::new(Greeting {
             session_id,
             user_id,
             instance_id,
-            persona: &persona,
-            now: &now_ctx,
+            persona: persona.clone(),
+            now: now_ctx,
             occasion: Occasion::Event {
                 event_key: key.clone(),
                 kind: drawn.kind,
@@ -774,10 +925,10 @@ pub(crate) async fn draw_event_at(
                 .unwrap_or_default(),
             audit,
             metadata,
-        },
-    )
-    .await?;
-    respond(state, session_id, &key, &traits).await
+            message_id: Some(message_id),
+        }),
+    };
+    Ok((plan, traits))
 }
 
 pub fn router() -> OpenApiRouter<AppState> {
@@ -795,7 +946,8 @@ mod tests {
 
     use crate::routes::companion::test_state;
     use crate::routes::companion::testutil::{
-        seed_byoc_session, seed_genome, seed_instance, seed_session, session_footprint,
+        frame_types, read_sse, seed_byoc_session, seed_genome, seed_instance, seed_session,
+        session_footprint, upstream_sse,
     };
 
     fn with_companion(mut state: AppState, mock_uri: &str) -> AppState {
@@ -911,6 +1063,211 @@ mod tests {
         let instance_id = seed_instance(pool, genome_id, user_id).await;
         let session_id = seed_session(pool, user_id, instance_id).await;
         (instance_id, session_id)
+    }
+
+    // ── The SSE response (spec 2026-11-10-proactive-reply-streaming-design.md) ──
+
+    async fn mount_streamed(mock: &MockServer, chunks: &[&str]) {
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("you are a companion"))
+            .respond_with(upstream_sse(chunks))
+            .mount(mock)
+            .await;
+    }
+
+    async fn stream_frames(
+        state: &AppState,
+        session_id: Uuid,
+        user_id: Uuid,
+        req: DrawEventRequest,
+        r: f64,
+    ) -> Vec<serde_json::Value> {
+        let resp = draw_event_stream_at(state, session_id, user_id, req, Utc::now(), rolls(r))
+            .await
+            .unwrap();
+        assert!(resp.headers()[axum::http::header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/event-stream"));
+        read_sse(resp).await
+    }
+
+    fn weather(key: &str) -> DrawEventRequest {
+        req(key, Some(vec![EventKindDto::WeatherChange]))
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn events_stream_leads_with_event(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        mount_streamed(&mock, &["外面突然", "下大雨了"]).await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+
+        let frames = stream_frames(&state, session_id, user_id, weather("k1"), 0.1).await;
+        assert_eq!(
+            frame_types(&frames),
+            ["event", "meta", "delta", "delta", "done", "final"]
+        );
+        let event = &frames[0]["event"];
+        assert_eq!(event["kind"], "weather_change");
+        let announced: Uuid = event["message_id"].as_str().unwrap().parse().unwrap();
+        assert_eq!(
+            frames[1]["message_id"],
+            crate::pipeline::proactive::frame_message_id(announced),
+            "the event names the message meta opens"
+        );
+        assert_eq!(frames[4]["occasion"], "event");
+
+        // The stored event starts when the narration was stored, and keeps
+        // the length the frame announced.
+        let stored = EventRepo { pool: &pool }
+            .by_key(session_id, "k1")
+            .await
+            .unwrap()
+            .expect("stored");
+        assert_eq!(stored.message_id, Some(announced));
+        let sent_at: DateTime<Utc> = frames[4]["sent_at"].as_str().unwrap().parse().unwrap();
+        assert_eq!(stored.started_at, sent_at);
+        let started: DateTime<Utc> = event["started_at"].as_str().unwrap().parse().unwrap();
+        let ends: DateTime<Utc> = event["ends_at"].as_str().unwrap().parse().unwrap();
+        assert_eq!(stored.ends_at - stored.started_at, ends - started);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn events_stream_not_told(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        seed_user_messages(&pool, session_id, 10).await;
+        let state = test_state(pool.clone());
+
+        let frames = stream_frames(
+            &state,
+            session_id,
+            user_id,
+            req("a1", Some(vec![EventKindDto::AwayFromPhone])),
+            0.1,
+        )
+        .await;
+        assert_eq!(frame_types(&frames), ["event", "final"]);
+        assert_eq!(frames[0]["event"]["kind"], "away_from_phone");
+        assert!(frames[0]["event"]["message_id"].is_null());
+        assert_eq!(
+            event_count(&pool, session_id).await,
+            1,
+            "stored before the frame"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn events_stream_nothing_drawn(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        sqlx::query(
+            "INSERT INTO engine.life_choices (session_id, kind, tier_gap, asked_at) \
+             VALUES ($1, 'ask_for_space', 3, now() - interval '1 hour')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let state = test_state(pool.clone());
+
+        let frames = stream_frames(&state, session_id, user_id, weather("k1"), 0.5).await;
+        assert_eq!(frame_types(&frames), ["event", "final"]);
+        assert!(frames[0]["event"].is_null());
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn events_stream_replay(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        mount_streamed(&mock, &["外面突然", "下大雨了"]).await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+
+        let first = stream_frames(&state, session_id, user_id, weather("same"), 0.1).await;
+        let again = stream_frames(&state, session_id, user_id, weather("same"), 0.9).await;
+        assert_eq!(
+            frame_types(&again),
+            ["event", "meta", "delta", "done", "final"]
+        );
+        assert_eq!(again[1]["message_id"], first[1]["message_id"]);
+        assert_eq!(again[2]["content"], "外面突然下大雨了");
+        // A replayed event is the stored one: it starts where `done` said.
+        assert_eq!(again[0]["event"]["started_at"], first[4]["sent_at"]);
+        assert_eq!(calls(&mock).await.len(), 1, "no second generation");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn events_stream_selfie_carries_image_request(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        mount_streamed(&mock, &["刚拍的，好看吗"]).await;
+        mount_composer(&mock, "在海边对着镜头笑", "海边自拍").await;
+        let state = with_companion_and_composer(test_state(pool.clone()), &mock.uri());
+
+        let frames = stream_frames(&state, session_id, user_id, selfie_req("k1", true), 0.5).await;
+        assert_eq!(
+            frame_types(&frames),
+            ["event", "meta", "delta", "done", "image_request", "final"]
+        );
+        let img = &frames[4];
+        assert_eq!(img["message_id"], frames[1]["message_id"]);
+        assert_eq!(img["image_ref"], "face");
+        assert_eq!(img["aspect_ratio"], "3:4");
+        assert!(!img["composed_prompt"].as_str().unwrap().is_empty());
+
+        // A replay carries the same picture.
+        let again = stream_frames(&state, session_id, user_id, selfie_req("k1", true), 0.5).await;
+        assert_eq!(
+            frame_types(&again),
+            ["event", "meta", "delta", "done", "image_request", "final"]
+        );
+        assert_eq!(again[4]["composed_prompt"], img["composed_prompt"]);
+        assert_eq!(again[4]["message_id"], img["message_id"]);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn events_stream_failure_stores_no_event(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        let body = format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            json!({"choices": [{"delta": {"content": "外面"}}]}),
+            json!({"choices": [{"delta": {}, "finish_reason": "error"}],
+                   "error": {"code": 502, "message": "upstream died"}}),
+        );
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+            .mount(&mock)
+            .await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+
+        let frames = stream_frames(&state, session_id, user_id, weather("k1"), 0.1).await;
+        assert_eq!(frame_types(&frames), ["event", "meta", "delta", "error"]);
+        assert!(frames[0]["event"]["message_id"].is_string());
+        assert_eq!(event_count(&pool, session_id).await, 0);
+        assert_eq!(event_rows(&pool, session_id).await, 0);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn events_stream_blank_stores_no_event(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        mount_streamed(&mock, &["  "]).await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+
+        let frames = stream_frames(&state, session_id, user_id, weather("k1"), 0.1).await;
+        assert_eq!(frame_types(&frames), ["event", "final"]);
+        assert!(
+            frames[0]["event"]["message_id"].is_string(),
+            "announced with a message that never reached done: withdrawn"
+        );
+        assert_eq!(event_count(&pool, session_id).await, 0);
     }
 
     fn req(key: &str, kinds: Option<Vec<EventKindDto>>) -> DrawEventRequest {

@@ -2572,11 +2572,16 @@
         },
         "responses": {
           "200": {
-            "description": "",
+            "description": "The event and her message. With `stream: true` in the body or `Accept: text/event-stream`, a server-sent event stream instead: an `event` frame first (`{type, event}`, the event or `null`), then the chat stream's frames for her message: `meta` → `delta`… → `done` → `image_request`? → `final`, or `final` alone when she tells nothing. An `event` that names a `message_id` is not stored until that message's `done` arrives, and then starts at `done.sent_at`.",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DrawEventResponse"
+                }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -2683,11 +2688,16 @@
         },
         "responses": {
           "200": {
-            "description": "",
+            "description": "The answer and her reply. With `stream: true` in the body or `Accept: text/event-stream`, a server-sent event stream instead: a `resolved` frame first (`{type, status, affinity, event?}`, sent once the answer is committed), then the chat stream's frames for her reply: `meta` → `delta`… → `done` → `final`, or `final` alone when she says nothing. An `error` frame after `resolved` leaves the answer in place and is never retryable.",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/LifeChoiceRespondResponse"
+                }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -3123,11 +3133,16 @@
         },
         "responses": {
           "200": {
-            "description": "",
+            "description": "The greeting. With `stream: true` in the body or `Accept: text/event-stream`, a server-sent event stream of the chat stream's frames instead: `meta` → `delta`… → `done` → `final`, or `final` alone when she does not speak first; `done` also carries `sent_at` and `occasion`.",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/OpenSessionResponse"
+                }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -4669,6 +4684,10 @@
             "items": {
               "$ref": "#/components/schemas/PromptTraitDto"
             }
+          },
+          "stream": {
+            "type": "boolean",
+            "description": "Answer as a server-sent event stream instead of JSON; an\n`Accept: text/event-stream` header asks for the same."
           },
           "tier": {
             "type": [
@@ -6235,6 +6254,10 @@
           "response": {
             "$ref": "#/components/schemas/LifeChoiceAnswer"
           },
+          "stream": {
+            "type": "boolean",
+            "description": "Answer as a server-sent event stream instead of JSON; an\n`Accept: text/event-stream` header asks for the same."
+          },
           "tier": {
             "type": [
               "string",
@@ -6580,6 +6603,10 @@
             "items": {
               "$ref": "#/components/schemas/PromptTraitDto"
             }
+          },
+          "stream": {
+            "type": "boolean",
+            "description": "Answer as a server-sent event stream instead of JSON; an\n`Accept: text/event-stream` header asks for the same."
           },
           "tier": {
             "type": [
