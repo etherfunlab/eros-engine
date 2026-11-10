@@ -65,13 +65,13 @@ value of the wrong shape reads as absent.
 | `appearance` | string | Visual description seeded into image prompts. |
 | `possessions` | array of strings | Things she owns, merged with the instance's item rows. |
 | `wardrobe` | array of strings | Clothes she can wear, merged with the instance's item rows. |
-| `smoking`, `alcoholic`, `drug`, `coffee`, `gluttony` | boolean | Whether she smokes, drinks, uses weed, drinks coffee, loves good food: how she takes a `give` of each, how fast her craving for what she's hooked on builds, and what it names. See [life-events-needs.md](life-events-needs.md#persona-settings). |
+| `smoking`, `alcoholic`, `drug`, `coffee`, `gluttony` | boolean | Whether she smokes, drinks, uses weed, drinks coffee, loves good food: how she takes a `give` of each, how fast her craving for what she's hooked on builds, and what it names. `smoking`, `alcoholic` and `drug` set to `true` also let life events draw her smoking, drinking and smoking weed. See [life-events-needs.md](life-events-needs.md#persona-settings). |
 | `health` | string | `weak`, `normal` or `strong`. Read by life events. |
 | `prefer_trip` | boolean | Read by life events. |
 | `prefer_events` | array of strings | Read by life events. |
 | `homesick` | boolean | Read by life events. |
 | `is_virgin` | boolean | Read by life events. |
-| `sex_addict` | boolean | Read by life events. |
+| `sex_addict` | boolean | Read by life events: only `true` draws `having_sex` and `masturbating`. |
 | `hygienic` | boolean | Whether she loves being clean. Read by life events, and by when she asks the user to take a bath together. |
 | `employed` | string | `free`, `part_time` or `full_time`: how much of her day is work. Absent or any other value reads as `part_time`. Read by life events. |
 | `setting` | string | `modern` or `fantasy`: the world she lives in, which decides the life events that fit her. Absent or any other value reads as `modern`. Read by life events. |
