@@ -123,17 +123,22 @@ All of:
 
 - the session's newest recorded scopes are romance-compatible
   (`romance_compatible`), as for `sleep_together`;
-- chemistry tier ≥ 2, or ≥ 1 when the persona's `hygienic` is `true`;
-- the newest 3 judged turns after the streak anchor are all warm
-  (`newest_streak_warm`);
+- chemistry tier ≥ 2 when the persona's `hygienic` is `true`, ≥ 3 when it
+  is unset; never when it is `false`;
+- at least 3 of the newest 7 judged turns after the streak anchor have
+  warmth ≥ 0.5 (patience is not read);
 - no `bathe_together` accepted or ignored in the session within the last
-  7 days. A decline or a lapse re-arms on a fresh streak;
+  7 days. A decline or a lapse re-arms on the next qualifying turn;
 - the usual runway (`runway_clear`).
 
-It is decided in `romantic_kind`, after `propose` and `sleep_together`: when
-a turn qualifies for more than one, the bigger ask goes first. Because its
-chemistry floor is lower, it is usually the first romantic ask a pair sees.
-A trip under way does not hold it back, as for the other romantic kinds.
+It is its own trigger (`try_bathe`), not a branch of `romantic_kind`: the
+bath and the bed are independent asks, and neither waits for the other to
+settle. Some people go to bed easily but not into a bath together; a couple
+can wash apart and then sleep together, while a shared bath asks for more
+warmth over time. The only coupling is the shared runway: one pending ask
+per instance. When both qualify on the same turn, the romantic trigger runs
+first and its pending ask closes the runway. A trip under way does not hold
+the bath back.
 
 ### 5.2 Her ask and the answers
 
