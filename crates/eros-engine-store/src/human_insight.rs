@@ -267,6 +267,42 @@ impl<'a> HumanInsightRepo<'a> {
         .await?;
         Ok(res.rows_affected() as usize)
     }
+
+    /// Empty the user's existing profile for a rebuild that found the ledger
+    /// supports none: every field null or an empty array, `updated_at`
+    /// advanced so the change reaches `insights/changes`. Writes nothing for a
+    /// user with no profile row; never creates one. Guarded on `token` as
+    /// `replace_profile_if_claimed` is. Returns whether the claim held.
+    pub async fn clear_profile_if_claimed(
+        &self,
+        user_id: Uuid,
+        token: crate::profile_state::ClaimToken,
+    ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let claimed: Option<Uuid> = sqlx::query_scalar(
+            "SELECT user_id FROM engine.human_profile_state \
+             WHERE user_id = $1 AND claimed_at = $2 FOR UPDATE",
+        )
+        .bind(user_id)
+        .bind(token)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if claimed.is_none() {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let exists: Option<Uuid> = sqlx::query_scalar(
+            "SELECT user_id FROM engine.human_insights WHERE user_id = $1 FOR UPDATE",
+        )
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if exists.is_some() {
+            write_profile(&mut *tx, user_id, &ProjectedColumns::default()).await?;
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
 }
 
 /// The profile upsert shared by `replace_profile` and
