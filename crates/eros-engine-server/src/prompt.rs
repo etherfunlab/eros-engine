@@ -926,6 +926,7 @@ pub(crate) fn event_label(kind: eros_engine_core::events::EventKind) -> &'static
         TakingSpace => "说好暂时分开",
         FellOut => "为分开的事闹得不愉快",
         TravelingTogether => "和对方一起旅行",
+        BathingTogether => "和对方一起洗澡",
         Strip => "刚脱了衣服",
         BirdEncounter => "遇到一只鸟",
         ExWantsBack => "前任来求复合",

@@ -48,9 +48,9 @@ use eros_engine_llm::model_config::StyleKey;
 const CONCURRENT_STREAMS_PER_USER: u32 = 3;
 const MAX_EVENT_KEY_CHARS: usize = 128;
 
-/// A kind of life event. `taking_space` and `fell_out` are placed by the
-/// engine, never drawn: they appear in responses only, and a `kinds` filter
-/// that lists one is rejected.
+/// A kind of life event. `taking_space`, `fell_out`, `traveling_together`
+/// and `bathing_together` are placed by the engine, never drawn: they appear
+/// in responses only, and a `kinds` filter that lists one is rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKindDto {
@@ -118,6 +118,7 @@ pub enum EventKindDto {
     WantToSeeSea,
     WantHotSpring,
     WantSauna,
+    BathingTogether,
 }
 
 /// Reads the drawable kinds only: a request names kinds to draw, and the
@@ -203,6 +204,7 @@ impl From<EventKindDto> for EventKind {
             EventKindDto::WantToSeeSea => EventKind::WantToSeeSea,
             EventKindDto::WantHotSpring => EventKind::WantHotSpring,
             EventKindDto::WantSauna => EventKind::WantSauna,
+            EventKindDto::BathingTogether => EventKind::BathingTogether,
         }
     }
 }
@@ -274,6 +276,7 @@ impl From<EventKind> for EventKindDto {
             EventKind::WantToSeeSea => EventKindDto::WantToSeeSea,
             EventKind::WantHotSpring => EventKindDto::WantHotSpring,
             EventKind::WantSauna => EventKindDto::WantSauna,
+            EventKind::BathingTogether => EventKindDto::BathingTogether,
         }
     }
 }
@@ -2412,6 +2415,7 @@ mod tests {
             json!({"allow": ["reading", "fell_out"]}),
             json!({"disallow": ["taking_space"]}),
             json!({"disallow": ["fell_out"]}),
+            json!(["bathing_together"]),
         ] {
             assert!(
                 serde_json::from_value::<DrawEventRequest>(

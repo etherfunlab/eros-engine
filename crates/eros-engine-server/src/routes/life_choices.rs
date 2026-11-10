@@ -10,6 +10,8 @@
 //! - `propose`: an accept changes nothing; a decline drops both lines one
 //!   tier.
 //! - `travel_together`: an accept starts a trip; a decline changes nothing.
+//! - `bathe_together`: an accept starts a 30-minute bath together; a decline
+//!   drops chemistry one tier.
 //!
 //! The persona answers in one proactive message, and the cost is applied with
 //! the answer, not with the message (spec
@@ -113,9 +115,10 @@ pub struct LifeChoiceRespondResponse {
     /// accept and for a decline of any kind but `travel_together`, as it
     /// stands otherwise.
     pub affinity: AffinitySnapshot,
-    /// The separation an `ask_for_space` accept started, or the trip a
-    /// `travel_together` accept started. `null` after any decline and for
-    /// every `sleep_together` and `propose` answer.
+    /// The separation an `ask_for_space` accept started, the trip a
+    /// `travel_together` accept started, or the bath a `bathe_together`
+    /// accept started. `null` after any decline and for every
+    /// `sleep_together` and `propose` answer.
     pub event: Option<EventView>,
 }
 
@@ -125,7 +128,8 @@ pub struct LifeChoiceRespondResponse {
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct LifeChoiceReceiptDto {
     pub id: Uuid,
-    /// `ask_for_space`, `sleep_together`, `propose` or `travel_together`.
+    /// `ask_for_space`, `sleep_together`, `propose`, `travel_together` or
+    /// `bathe_together`.
     pub kind: String,
     /// `pending`, `accepted`, `declined`, `ignored`, or `expired` for a
     /// `pending` choice past its 24 hours.
@@ -214,10 +218,15 @@ fn invalid_payload(message: String) -> AppError {
 /// replying, and an incident under way ends. A decline makes it `declined`.
 /// Neither costs anything.
 ///
+/// `bathe_together`: an accept makes the choice `accepted` and starts a
+/// `bathing_together` incident of 30 minutes now, costing nothing; an
+/// incident under way ends. A decline makes it `declined` and drops
+/// chemistry one tier.
+///
 /// Either way she then answers in one proactive message, persisted like any
 /// reply and returned; if that generation fails the call still succeeds with
-/// `message: null`. `event` is `null` for every answer but an `ask_for_space`
-/// or `travel_together` accept.
+/// `message: null`. `event` is `null` for every answer but an `ask_for_space`,
+/// `travel_together` or `bathe_together` accept.
 ///
 /// `409` when the choice is no longer pending: answered already (an ordinary
 /// message from the user counts, and the first writer wins), or lapsed 24
@@ -411,6 +420,10 @@ async fn resolve_choice(
             EventKind::TravelingTogether,
             events::lasts(EventKind::TravelingTogether, rand::random()),
         )),
+        (LifeChoiceKind::BatheTogether, LifeChoiceAnswer::Accept) => Some((
+            EventKind::BathingTogether,
+            events::lasts(EventKind::BathingTogether, rand::random()),
+        )),
         _ => None,
     };
     let started = match placed {
@@ -434,11 +447,15 @@ async fn resolve_choice(
     };
     // The lines a decline costs; a romantic accept costs none and drops nothing.
     let lines: Option<&[AffinityLine]> = match (kind, req.response) {
-        (LifeChoiceKind::SleepTogether | LifeChoiceKind::Propose, LifeChoiceAnswer::Accept) => None,
+        (
+            LifeChoiceKind::SleepTogether | LifeChoiceKind::Propose | LifeChoiceKind::BatheTogether,
+            LifeChoiceAnswer::Accept,
+        ) => None,
         (LifeChoiceKind::TravelTogether, _) => None,
-        (LifeChoiceKind::SleepTogether, LifeChoiceAnswer::Decline) => {
-            Some(&[AffinityLine::Chemistry])
-        }
+        (
+            LifeChoiceKind::SleepTogether | LifeChoiceKind::BatheTogether,
+            LifeChoiceAnswer::Decline,
+        ) => Some(&[AffinityLine::Chemistry]),
         (LifeChoiceKind::AskForSpace | LifeChoiceKind::Propose, _) => {
             Some(&[AffinityLine::Bond, AffinityLine::Chemistry])
         }
@@ -1151,6 +1168,76 @@ mod tests {
         assert_eq!(s.tiers().await, (3, 4));
         assert!(s.drops().await.is_empty());
         assert_eq!(out.message.expect("a reply").content, "好吧。");
+    }
+
+    /// An accepted bath places a 30-minute `bathing_together` and costs
+    /// nothing.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn accepting_a_bath_places_bathing_together(pool: PgPool) {
+        let mock = companion_mock(Some("来吧。")).await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let s = scene(&pool).await;
+        let choice = s.ask_kind("bathe_together", recent(30)).await;
+        let axes = s.axes().await;
+        let now = recent(0);
+
+        let out = s
+            .respond(&state, choice, LifeChoiceAnswer::Accept, now)
+            .await
+            .unwrap();
+
+        assert_eq!(out.status, "accepted");
+        let event = serde_json::to_value(out.event.expect("the bath")).unwrap();
+        assert_eq!(event["kind"], json!("bathing_together"));
+        assert_eq!(event["offline"], json!(false));
+        let events = s.events().await;
+        assert_eq!(events.len(), 1);
+        let (id, kind, key, _, started_at, ends_at, _) = events[0].clone();
+        assert_eq!(kind, "bathing_together");
+        assert_eq!(key, format!("life_choice:{choice}:bathing_together"));
+        assert_eq!(started_at, now);
+        assert_eq!(ends_at - started_at, Duration::minutes(30));
+        assert_eq!(
+            s.row(choice).await,
+            ("accepted".into(), Some(now), Some(id))
+        );
+        assert_eq!(s.axes().await, axes);
+        assert!(s.drops().await.is_empty());
+        assert_eq!(
+            last_user_turn(&calls(&mock).await[0]),
+            json!("（对方答应了和你一起洗澡，你们现在一起泡在浴缸里。）")
+        );
+    }
+
+    /// Turning the bath down costs chemistry one tier, as the bed does.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn declining_a_bath_drops_chemistry(pool: PgPool) {
+        let mock = companion_mock(Some(HURT)).await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let s = scene(&pool).await;
+        let choice = s.ask_kind("bathe_together", recent(30)).await;
+        let (trust, intrigue, _, _) = s.axes().await;
+        let now = recent(0);
+
+        let out = s
+            .respond(&state, choice, LifeChoiceAnswer::Decline, now)
+            .await
+            .unwrap();
+
+        assert_eq!(out.status, "declined");
+        assert!(out.event.is_none());
+        assert!(s.events().await.is_empty());
+        let (t, i, _, _) = s.axes().await;
+        assert_eq!((t, i), (trust, intrigue), "the bond axes did not move");
+        assert_eq!(s.tiers().await, (3, 3), "chemistry one tier lower");
+        assert_eq!(
+            s.drops().await,
+            vec![json!({"life_choice": "decline", "choice_id": choice})]
+        );
+        assert_eq!(
+            last_user_turn(&calls(&mock).await[0]),
+            json!("（对方没有答应和你一起洗澡，你有点失落。）")
+        );
     }
 
     /// Declining the invitation costs chemistry one tier and nothing else:

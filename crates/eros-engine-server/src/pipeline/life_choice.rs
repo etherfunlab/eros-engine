@@ -49,6 +49,11 @@ const WARM_STREAK: usize = 3;
 const TRAVEL_MIN_BOND_TIER: u8 = 3;
 /// `travel_together`: days after an accept or an ignore before she asks again.
 const TRAVEL_COOLDOWN_DAYS: i64 = 14;
+/// `bathe_together`: the chemistry tier it needs; one lower for a hygienic
+/// persona.
+const BATHE_MIN_CHEM_TIER: u8 = 2;
+/// `bathe_together`: days after an accept or an ignore before she asks again.
+const BATHE_COOLDOWN_DAYS: i64 = 7;
 /// `propose`: how many of the newest judged turns it looks at (spec
 /// 2026-10-30 §4.3).
 const PROPOSE_WINDOW: i64 = 8;
@@ -333,6 +338,14 @@ async fn try_romance(
             .settled(session_id, LifeChoiceKind::SleepTogether)
             .await?,
         choices.settled(session_id, LifeChoiceKind::Propose).await?,
+        choices
+            .settled_since(
+                session_id,
+                LifeChoiceKind::BatheTogether,
+                now - Duration::days(BATHE_COOLDOWN_DAYS),
+            )
+            .await?,
+        crate::prompt::persona_traits(persona).hygienic == Some(true),
     ) else {
         return Ok(());
     };
@@ -357,13 +370,18 @@ async fn try_romance(
 /// patience are both above [`WARM`]. `propose` needs both tiers at 4 or more
 /// and [`PROPOSE_HITS`] warm turns in the window; `sleep_together` needs
 /// chemistry tier 3 or more and the newest [`WARM_STREAK`] all warm. A
-/// settled kind is never chosen.
+/// settled kind is never chosen. `bathe_together` comes last: chemistry tier
+/// [`BATHE_MIN_CHEM_TIER`] or more (one less when `hygienic`), the same warm
+/// streak, and not `bathe_cooled` (accepted or ignored within
+/// [`BATHE_COOLDOWN_DAYS`]).
 fn romantic_kind(
     chem_tier: u8,
     bond_tier: u8,
     endpoints: &[JudgedEndpoints],
     settled_sleep: bool,
     settled_propose: bool,
+    bathe_cooled: bool,
+    hygienic: bool,
 ) -> Option<LifeChoiceKind> {
     if !settled_propose
         && chem_tier >= 4
@@ -374,6 +392,12 @@ fn romantic_kind(
     }
     if !settled_sleep && chem_tier >= 3 && newest_streak_warm(endpoints) {
         return Some(LifeChoiceKind::SleepTogether);
+    }
+    if !bathe_cooled
+        && chem_tier >= BATHE_MIN_CHEM_TIER - u8::from(hygienic)
+        && newest_streak_warm(endpoints)
+    {
+        return Some(LifeChoiceKind::BatheTogether);
     }
     None
 }
@@ -2054,48 +2078,106 @@ mod tests {
         mixed[4].warmth = 0.1;
         mixed[7].warmth = 0.1; // 5 hits of 8
         assert_eq!(
-            romantic_kind(3, 3, &hot(3), false, false),
+            romantic_kind(3, 3, &hot(3), false, false, false, false),
             Some(LifeChoiceKind::SleepTogether)
         );
         assert_eq!(
-            romantic_kind(3, 3, &hot(2), false, false),
+            romantic_kind(3, 3, &hot(2), false, false, false, false),
             None,
             "two is not three"
         );
         assert_eq!(
-            romantic_kind(2, 5, &hot(3), false, false),
+            romantic_kind(2, 5, &hot(3), false, false, true, false),
             None,
-            "chem below 3"
+            "chem below 3, the bath cooling down"
         );
         assert_eq!(
-            romantic_kind(4, 4, &hot(8), false, false),
+            romantic_kind(4, 4, &hot(8), false, false, false, false),
             Some(LifeChoiceKind::Propose),
             "propose wins the tie"
         );
         assert_eq!(
-            romantic_kind(4, 4, &hot(8), false, true),
+            romantic_kind(4, 4, &hot(8), false, true, false, false),
             Some(LifeChoiceKind::SleepTogether),
             "propose settled"
         );
         assert_eq!(
-            romantic_kind(4, 4, &mixed, true, false),
+            romantic_kind(4, 4, &mixed, true, false, false, false),
             Some(LifeChoiceKind::Propose),
             "5 of 8"
         );
         {
             let mut four = mixed.clone();
             four[0].patience = 0.69;
-            assert_eq!(romantic_kind(4, 4, &four, true, false), None, "4 of 8");
+            assert_eq!(
+                romantic_kind(4, 4, &four, true, false, false, false),
+                None,
+                "4 of 8"
+            );
         }
         assert_eq!(
-            romantic_kind(4, 3, &hot(8), true, false),
+            romantic_kind(4, 3, &hot(8), true, false, true, false),
             None,
             "bond below 4"
         );
         assert_eq!(
-            romantic_kind(5, 5, &hot(8), true, true),
+            romantic_kind(5, 5, &hot(8), true, true, true, false),
             None,
-            "both settled"
+            "all three settled"
+        );
+    }
+
+    #[test]
+    fn bathe_together_in_the_romantic_table() {
+        let hot = |n| {
+            vec![
+                JudgedEndpoints {
+                    warmth: 0.8,
+                    patience: 0.8
+                };
+                n
+            ]
+        };
+        let bathe = Some(LifeChoiceKind::BatheTogether);
+        assert_eq!(
+            romantic_kind(2, 1, &hot(3), false, false, false, false),
+            bathe,
+            "chem 2: the bath, not the bed"
+        );
+        assert_eq!(
+            romantic_kind(1, 1, &hot(3), false, false, false, false),
+            None,
+            "chem 1"
+        );
+        assert_eq!(
+            romantic_kind(1, 1, &hot(3), false, false, false, true),
+            bathe,
+            "chem 1 for a hygienic persona"
+        );
+        assert_eq!(
+            romantic_kind(0, 1, &hot(3), false, false, false, true),
+            None,
+            "chem 0 even for a hygienic persona"
+        );
+        assert_eq!(
+            romantic_kind(2, 1, &hot(3), false, false, true, false),
+            None,
+            "cooling down"
+        );
+        assert_eq!(
+            romantic_kind(3, 1, &hot(3), false, false, false, false),
+            Some(LifeChoiceKind::SleepTogether),
+            "the bed goes first"
+        );
+        assert_eq!(
+            romantic_kind(3, 1, &hot(3), true, false, false, false),
+            bathe,
+            "the bed settled"
+        );
+        assert_eq!(
+            romantic_kind(2, 1, &hot(2), false, false, false, false),
+            None,
+            "two is not three"
         );
     }
 
@@ -2220,12 +2302,15 @@ mod tests {
             s.record_scopes("full", AffinityScope::chemistry()).await;
             // A background keeps the trip ask out of it.
             s.event_under_way(EventKind::ShortTrip).await;
+            // A bath taken yesterday keeps the bath ask out of it.
+            s.seed_romantic(LifeChoiceKind::BatheTogether, "accepted", Duration::days(1))
+                .await;
             s.seed_romantic(LifeChoiceKind::SleepTogether, status, Duration::hours(1))
                 .await;
             for _ in 0..4 {
                 s.turn(&state, SEEN).await;
             }
-            assert_eq!(s.kinds().await.len(), 1, "{status}");
+            assert_eq!(s.kinds().await.len(), 2, "{status}");
         }
         assert!(companion_calls(&mock).await.is_empty());
     }

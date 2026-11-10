@@ -127,6 +127,9 @@ pub enum EventKind {
     WantToSeeSea,
     WantHotSpring,
     WantSauna,
+    /// She and the user take a bath together: written when the user accepts
+    /// her `bathe_together` ask.
+    BathingTogether,
 }
 
 impl EventKind {
@@ -196,10 +199,11 @@ impl EventKind {
     ];
 
     /// Kinds the writers place directly, never drawn: parsed and stored, not in `ALL`.
-    pub const SPECIAL: [EventKind; 3] = [
+    pub const SPECIAL: [EventKind; 4] = [
         EventKind::TakingSpace,
         EventKind::FellOut,
         EventKind::TravelingTogether,
+        EventKind::BathingTogether,
     ];
 
     /// The stored and wire value.
@@ -269,6 +273,7 @@ impl EventKind {
             EventKind::WantToSeeSea => "want_to_see_sea",
             EventKind::WantHotSpring => "want_hot_spring",
             EventKind::WantSauna => "want_sauna",
+            EventKind::BathingTogether => "bathing_together",
         }
     }
 
@@ -287,7 +292,7 @@ impl EventKind {
             | GotBumped | BumpedSomeone | Quarrel | ScoldedBySuperior | ScoldedSuperior
             | SawBag | SawClothes | AdmiringScenery | AdmiringArt | TakingSelfie | Strip
             | BirdEncounter | ExWantsBack | WantToQuitJob | PonderingLife | Streaking
-            | WantToSeeSea | WantHotSpring | WantSauna => EventCategory::Short,
+            | WantToSeeSea | WantHotSpring | WantSauna | BathingTogether => EventCategory::Short,
             TempWork | ExMessage | WeatherChange | GotHit | Breakup | WorkingOut | Reading
             | Gaming | AwayFromPhone | Unwell | Irritable | Busy | InBattle | Asleep
             | OutShopping | BrosGathering | SisGathering | OnTheRoad | WatchingMatch
@@ -452,6 +457,7 @@ fn rule(kind: EventKind) -> Rule {
         WantToSeeSea => (2.0, 72, Lasts::Hours(1, 1)),
         WantHotSpring => (1.0, 72, Lasts::Hours(1, 1)),
         WantSauna => (1.0, 72, Lasts::Hours(1, 1)),
+        BathingTogether => (0.0, 0, Lasts::Minutes(30)),
     };
     Rule {
         weight,
@@ -1016,7 +1022,10 @@ pub fn offline_kinds(persona: &PersonaTraits) -> Vec<EventKind> {
 /// the storage-only `taking_space`, `fell_out` and `traveling_together`.
 pub fn is_told(kind: EventKind, rung: u8, persona: &PersonaTraits) -> bool {
     match kind {
-        EventKind::TakingSpace | EventKind::FellOut | EventKind::TravelingTogether => false,
+        EventKind::TakingSpace
+        | EventKind::FellOut
+        | EventKind::TravelingTogether
+        | EventKind::BathingTogether => false,
         EventKind::Busy | EventKind::InBattle => rung >= CONFIDE_MIN_RUNG,
         EventKind::OutShopping if persona.female => rung >= CONFIDE_MIN_RUNG,
         k => !k.is_offline(persona),
@@ -2510,6 +2519,20 @@ mod tests {
         assert!(!t.may_be_offline());
         for rung in 1..=3 {
             assert!(!is_told(t, rung, &PersonaTraits::default()), "rung {rung}");
+        }
+    }
+
+    #[test]
+    fn bathing_together_is_a_placed_incident_she_does_not_tell() {
+        let b = BathingTogether;
+        assert!(EventKind::SPECIAL.contains(&b) && !EventKind::ALL.contains(&b));
+        assert_eq!(EventKind::parse("bathing_together"), Some(b));
+        assert_eq!(b.category(), EventCategory::Short);
+        assert!(!b.may_be_offline());
+        assert!(b.fits(Setting::Fantasy));
+        assert_eq!(lasts(b, 0.5), Duration::minutes(30));
+        for rung in 1..=5 {
+            assert!(!is_told(b, rung, &PersonaTraits::default()), "rung {rung}");
         }
     }
 
