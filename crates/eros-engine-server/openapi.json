@@ -1261,7 +1261,7 @@
         "tags": [
           "svc"
         ],
-        "summary": "Ledger facts first seen or seen again since a keyset cursor, for a\ndownstream service that mirrors what was mined about each user. A repeat\nmoves `last_seen_at`, so a row reappears in the stream each time its\ncounters change. Rows leave the ledger only through erasure; see\n`/svc/v1/facts/deletions`.",
+        "summary": "Ledger facts first seen or seen again since a keyset cursor, for a\ndownstream service that mirrors what was mined about each user. A repeat\nmoves `last_seen_at`, so a row reappears in the stream each time its\ncounters change. A row its owner deletes is named in\n`/svc/v1/rows/deletions`; a whole user's rows go with erasure, see\n`/svc/v1/facts/deletions`.",
         "operationId": "facts_changes",
         "parameters": [
           {
@@ -1505,7 +1505,7 @@
         "tags": [
           "svc"
         ],
-        "summary": "Extracted profile-layer memories created since a keyset cursor, for a\ndownstream service that builds on the facts the engine extracted about a\nuser. Raw-turn rows and relationship-layer rows are not exported. The rows\nare insert-only; this feed carries no deletions, so a mirror drops a user's\nrows when `GET /svc/v1/insights/deletions` names the user.",
+        "summary": "Extracted profile-layer memories created since a keyset cursor, for a\ndownstream service that builds on the facts the engine extracted about a\nuser. Raw-turn rows and relationship-layer rows are not exported. A row its\nowner deletes is named in `GET /svc/v1/rows/deletions`; a mirror drops a\nuser's rows when `GET /svc/v1/insights/deletions` names the user.",
         "operationId": "memories_changes",
         "parameters": [
           {
@@ -1557,6 +1557,70 @@
         "security": [
           {
             "insights_export_secret": []
+          }
+        ]
+      }
+    },
+    "/svc/v1/rows/deletions": {
+      "get": {
+        "tags": [
+          "svc"
+        ],
+        "summary": "Single rows their owner deleted: an extracted profile memory or a ledger\nfact, ids only. A deleted id never reappears in a changes stream; the same\nstatement extracted again later is a new row. User erasure is not reported\nhere: see `/svc/v1/insights/deletions` (or `/svc/v1/facts/deletions`).\n`deleted_at` is the deleting transaction's start, so re-read with the same\noverlap the other streams advise. Opened by either read secret.",
+        "operationId": "rows_deletions",
+        "parameters": [
+          {
+            "name": "since",
+            "in": "query",
+            "description": "RFC 3339. Default: Unix epoch (walk everything).",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "after_id",
+            "in": "query",
+            "description": "Tie-break within `since`. Default: nil UUID. Pass `next.id`.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Default 500, clamped to 1..=1000.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RowDeletionsResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "neither read secret matched its header"
+          }
+        },
+        "security": [
+          {
+            "insights_export_secret": []
+          },
+          {
+            "facts_export_secret": []
           }
         ]
       }
@@ -3198,6 +3262,260 @@
           },
           "5XX": {
             "description": "companion chain exhausted; the provider's own status passes through, same body as the image endpoints. Nothing is persisted."
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v2/comp/user/{user_id}/facts": {
+      "get": {
+        "tags": [
+          "companion"
+        ],
+        "summary": "The user's ledger facts, newest first by when each was first seen. These\nare the rows `GET /svc/v1/facts/changes` exports.",
+        "operationId": "list_facts",
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "description": "Owner user id (must equal JWT sub)",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Default 100, clamped to 1..=500.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "description": "RFC 3339; with `before_id`, the `next` of the previous page. Absent:\nstart at the newest row.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "before_id",
+            "in": "query",
+            "description": "Comes with `before`.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OwnedFactsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`before` without `before_id`, or the reverse"
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "user_id does not match JWT"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v2/comp/user/{user_id}/facts/{fact_id}": {
+      "delete": {
+        "tags": [
+          "companion"
+        ],
+        "summary": "Delete one ledger fact. Its tombstone goes to `GET /svc/v1/rows/deletions`,\nand the derived profile is rebuilt without it on the next sweep. The fact's\nwording in the extraction audit and in past profile snapshots stays until\nthe user is erased.",
+        "operationId": "delete_fact",
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "description": "Owner user id (must equal JWT sub)",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "fact_id",
+            "in": "path",
+            "description": "The fact's id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "deleted"
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "user_id does not match JWT"
+          },
+          "404": {
+            "description": "no such fact of this user (including one already deleted)"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v2/comp/user/{user_id}/memories": {
+      "get": {
+        "tags": [
+          "companion"
+        ],
+        "summary": "The user's extracted profile memories, newest first. These are the rows\n`GET /svc/v1/memories/changes` exports.",
+        "operationId": "list_memories",
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "description": "Owner user id (must equal JWT sub)",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Default 100, clamped to 1..=500.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "description": "RFC 3339; with `before_id`, the `next` of the previous page. Absent:\nstart at the newest row.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "before_id",
+            "in": "query",
+            "description": "Comes with `before`.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OwnedMemoriesResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`before` without `before_id`, or the reverse"
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "user_id does not match JWT"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v2/comp/user/{user_id}/memories/{memory_id}": {
+      "delete": {
+        "tags": [
+          "companion"
+        ],
+        "summary": "Delete one extracted profile memory. Its tombstone goes to\n`GET /svc/v1/rows/deletions`.",
+        "operationId": "delete_memory",
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "description": "Owner user id (must equal JWT sub)",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "memory_id",
+            "in": "path",
+            "description": "The memory's id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "deleted"
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "user_id does not match JWT"
+          },
+          "404": {
+            "description": "no such extracted profile memory of this user (including one already deleted)"
           }
         },
         "security": [
@@ -6654,6 +6972,191 @@
           }
         }
       },
+      "OwnedFact": {
+        "type": "object",
+        "description": "One ledger fact, as `GET /svc/v1/facts/changes` exports it, without the\nowner's id.",
+        "required": [
+          "id",
+          "content",
+          "category",
+          "domain",
+          "evidence_type",
+          "temporality",
+          "persistence",
+          "confidence",
+          "occurrences",
+          "session_count",
+          "recurrence",
+          "first_seen_at",
+          "last_seen_at"
+        ],
+        "properties": {
+          "category": {
+            "type": "string"
+          },
+          "confidence": {
+            "type": "string"
+          },
+          "content": {
+            "type": "string"
+          },
+          "domain": {
+            "type": "string"
+          },
+          "evidence_type": {
+            "type": "string"
+          },
+          "first_seen_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "last_seen_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "occurrences": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "persistence": {
+            "type": "string"
+          },
+          "recurrence": {
+            "type": "string",
+            "description": "`once`, `repeated_in_session` or `repeated_across_sessions`."
+          },
+          "session_count": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "temporality": {
+            "type": "string"
+          }
+        }
+      },
+      "OwnedFactsCursor": {
+        "type": "object",
+        "description": "Pass both fields back as `before` + `before_id`.",
+        "required": [
+          "first_seen_at",
+          "id"
+        ],
+        "properties": {
+          "first_seen_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "OwnedFactsResponse": {
+        "type": "object",
+        "required": [
+          "facts"
+        ],
+        "properties": {
+          "facts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OwnedFact"
+            }
+          },
+          "next": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OwnedFactsCursor",
+                "description": "Present iff the page is full; `null` means the walk is complete."
+              }
+            ]
+          }
+        }
+      },
+      "OwnedMemoriesCursor": {
+        "type": "object",
+        "description": "Pass both fields back as `before` + `before_id`.",
+        "required": [
+          "created_at",
+          "id"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "OwnedMemoriesResponse": {
+        "type": "object",
+        "required": [
+          "memories"
+        ],
+        "properties": {
+          "memories": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OwnedMemory"
+            }
+          },
+          "next": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OwnedMemoriesCursor",
+                "description": "Present iff the page is full; `null` means the walk is complete."
+              }
+            ]
+          }
+        }
+      },
+      "OwnedMemory": {
+        "type": "object",
+        "description": "One extracted profile memory, as `GET /svc/v1/memories/changes` exports\nit, without the owner's id.",
+        "required": [
+          "id",
+          "content",
+          "category",
+          "created_at"
+        ],
+        "properties": {
+          "category": {
+            "type": "string"
+          },
+          "content": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "metadata": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "The extraction metadata, verbatim; `null` when the extraction wrote none."
+          }
+        }
+      },
       "PersonaItemView": {
         "type": "object",
         "description": "One entry of the persona's lists.",
@@ -6945,6 +7448,73 @@
             ],
             "description": "`null` clears the title.",
             "maxLength": 64
+          }
+        }
+      },
+      "RowDeletionCursor": {
+        "type": "object",
+        "description": "Keyset position. Pass both fields back as `since` + `after_id`.",
+        "required": [
+          "deleted_at",
+          "id"
+        ],
+        "properties": {
+          "deleted_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "RowDeletionExportRow": {
+        "type": "object",
+        "description": "One tombstone of `GET /svc/v1/rows/deletions`.",
+        "required": [
+          "kind",
+          "id",
+          "deleted_at"
+        ],
+        "properties": {
+          "deleted_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The id the deleted row had in its changes stream."
+          },
+          "kind": {
+            "type": "string",
+            "description": "`memory` (a row `memories/changes` exported) or `fact` (a row\n`facts/changes` exported). Skip a kind you do not know."
+          }
+        }
+      },
+      "RowDeletionsResponse": {
+        "type": "object",
+        "required": [
+          "deletions"
+        ],
+        "properties": {
+          "deletions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RowDeletionExportRow"
+            }
+          },
+          "next": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RowDeletionCursor",
+                "description": "Present iff the page is full; `null` means the walk is complete."
+              }
+            ]
           }
         }
       },

@@ -22,6 +22,9 @@ use crate::state::AppState;
 const DEFAULT_LIMIT: i64 = 100;
 const MAX_LIMIT: i64 = 500;
 
+/// A page position: the timestamp the list is ordered by, and the row id.
+type Cursor = (DateTime<Utc>, Uuid);
+
 #[derive(Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct OwnedRowsQuery {
@@ -36,7 +39,7 @@ pub struct OwnedRowsQuery {
 
 impl OwnedRowsQuery {
     /// The page size and the cursor; half a cursor is a 400.
-    fn page(&self) -> Result<(i64, Option<(DateTime<Utc>, Uuid)>), AppError> {
+    fn page(&self) -> Result<(i64, Option<Cursor>), AppError> {
         let limit = self.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
         match (self.before, self.before_id) {
             (Some(at), Some(id)) => Ok((limit, Some((at, id)))),
