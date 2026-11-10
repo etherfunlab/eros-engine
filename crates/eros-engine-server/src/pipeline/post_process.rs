@@ -1413,10 +1413,10 @@ async fn extract_insights(
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!(%user_id, "profile rebuild claim failed: {e}");
-                false
+                None
             });
-        if claimed {
-            crate::pipeline::profile_rebuild::rebuild_user(state, user_id).await;
+        if let Some(token) = claimed {
+            crate::pipeline::profile_rebuild::rebuild_user(state, user_id, token).await;
         }
     }
 }
@@ -3320,7 +3320,8 @@ mod tests {
         assert!(repo
             .claim(user_id, state.config.profile_rebuild.claim_stale)
             .await
-            .unwrap());
+            .unwrap()
+            .is_some());
 
         extract_insights(
             &state,

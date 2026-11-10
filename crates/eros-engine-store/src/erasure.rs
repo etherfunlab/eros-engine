@@ -418,7 +418,8 @@ mod tests {
         assert!(state
             .claim(user, std::time::Duration::from_secs(600))
             .await
-            .unwrap());
+            .unwrap()
+            .is_some());
 
         // The rebuild's side: the claimed row locked, the profile not yet committed.
         let mut write = pool.begin().await.unwrap();
