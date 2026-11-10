@@ -33,6 +33,9 @@ pub enum StreamErrorCode {
     Internal,
     Timeout,
     GenerationTimeout,
+    /// A streamed proactive reply (`/open`, `/events`, `/life-choices`) whose
+    /// insert yielded to something that landed first. Never retryable.
+    Superseded,
 }
 
 /// Action type tag carried by the `meta` frame's `action_type` field.
@@ -53,6 +56,9 @@ pub enum FrameActionType {
     ReplyImage,
     ReplyTextImage,
     ProductQa,
+    /// A message she sends unprompted: a greeting, an event's narration, her
+    /// reply to a life-choice answer.
+    Proactive,
 }
 
 /// One wire frame in the SSE protocol.
@@ -176,6 +182,30 @@ pub enum ProtocolFrame {
         speaker_session_id: Uuid,
         code: StreamErrorCode,
         message: String,
+    },
+    /// `/events`, first frame: the event drawn, or `null`. With a
+    /// `message_id` it is not stored yet and stands once that message's
+    /// `done` arrives; without one it is stored.
+    Event {
+        event: Option<crate::routes::session_events::EventView>,
+    },
+    /// `/life-choices`, first frame: the committed answer.
+    Resolved {
+        status: String,
+        affinity: Box<crate::routes::dto::AffinitySnapshot>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        event: Option<crate::routes::session_events::EventView>,
+    },
+    /// The `done` of a proactive message: a chat turn's, plus when the row
+    /// was stored and why she spoke.
+    #[serde(rename = "done")]
+    ProactiveDone {
+        message_id: String,
+        truncated: bool,
+        usage: Option<serde_json::Value>,
+        generation_id: Option<String>,
+        sent_at: chrono::DateTime<chrono::Utc>,
+        occasion: crate::routes::session_open::GreetingOccasion,
     },
 }
 
@@ -6645,6 +6675,59 @@ pub fn replay_stream(
 mod tests {
     use super::*;
 
+    /// The frames only the proactive routes send (spec
+    /// 2026-11-10-proactive-reply-streaming-design.md §4).
+    #[test]
+    fn proactive_frames_serialize() {
+        let sent_at = chrono::DateTime::parse_from_rfc3339("2026-11-10T08:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let done = serde_json::to_value(ProtocolFrame::ProactiveDone {
+            message_id: "01J".into(),
+            truncated: false,
+            usage: None,
+            generation_id: None,
+            sent_at,
+            occasion: crate::routes::session_open::GreetingOccasion::Event,
+        })
+        .unwrap();
+        assert_eq!(
+            done,
+            serde_json::json!({
+                "type": "done",
+                "message_id": "01J",
+                "truncated": false,
+                "usage": null,
+                "generation_id": null,
+                "sent_at": "2026-11-10T08:00:00Z",
+                "occasion": "event",
+            })
+        );
+
+        let event = serde_json::to_value(ProtocolFrame::Event { event: None }).unwrap();
+        assert_eq!(event, serde_json::json!({"type": "event", "event": null}));
+
+        let resolved = serde_json::to_value(ProtocolFrame::Resolved {
+            status: "declined".into(),
+            affinity: Box::new(eros_engine_core::affinity::Affinity::unrecorded().into()),
+            event: None,
+        })
+        .unwrap();
+        assert_eq!(resolved["type"], "resolved");
+        assert_eq!(resolved["status"], "declined");
+        assert!(resolved["affinity"].is_object());
+        assert!(resolved.get("event").is_none());
+
+        assert_eq!(
+            serde_json::to_value(StreamErrorCode::Superseded).unwrap(),
+            "superseded"
+        );
+        assert_eq!(
+            serde_json::to_value(FrameActionType::Proactive).unwrap(),
+            "proactive"
+        );
+    }
+
     #[test]
     fn chunk_err_outcome_reports_the_layer_not_a_fuzzy_label() {
         use eros_engine_llm::openrouter::ParsedErrorBody;
@@ -12878,7 +12961,9 @@ data: [DONE]\n\n";
             let kind = match f {
                 ProtocolFrame::Meta { .. } => "meta",
                 ProtocolFrame::Delta { .. } => "delta",
-                ProtocolFrame::Done { .. } => "done",
+                ProtocolFrame::Done { .. } | ProtocolFrame::ProactiveDone { .. } => "done",
+                ProtocolFrame::Event { .. } => "event",
+                ProtocolFrame::Resolved { .. } => "resolved",
                 ProtocolFrame::Final { .. } => "final",
                 ProtocolFrame::Error { .. } => "error",
                 ProtocolFrame::ImageRequest { .. } => "image_request",
