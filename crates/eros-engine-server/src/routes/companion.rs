@@ -1317,6 +1317,18 @@ pub(crate) mod testutil {
         (status, content_type, frames)
     }
 
+    /// The frames of an SSE response a handler returned.
+    pub(crate) async fn read_sse(resp: axum::response::Response) -> Vec<Value> {
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("read body");
+        String::from_utf8_lossy(&bytes)
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter_map(|d| serde_json::from_str(d).ok())
+            .collect()
+    }
+
     /// A streamed upstream completion: one content chunk per entry.
     pub(crate) fn upstream_sse(chunks: &[&str]) -> wiremock::ResponseTemplate {
         let mut body = String::new();
