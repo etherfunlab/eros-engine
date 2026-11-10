@@ -5399,7 +5399,15 @@
           "want_to_see_sea",
           "want_hot_spring",
           "want_sauna",
-          "bathing_together"
+          "bathing_together",
+          "watching_stocks",
+          "trading",
+          "got_lost",
+          "drinking",
+          "smoking",
+          "smoking_weed",
+          "just_have_sex",
+          "masturbating"
         ]
       },
       "EventView": {

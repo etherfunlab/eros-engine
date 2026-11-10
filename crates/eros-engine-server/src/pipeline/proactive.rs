@@ -336,6 +336,14 @@ fn kind_cue(
         WantToSeeSea => "（你现在很想去看海。）".into(),
         WantHotSpring => "（你现在很想去泡温泉。）".into(),
         WantSauna => "（你现在很想去洗桑拿。）".into(),
+        WatchingStocks => "（你正在看股票行情。）".into(),
+        Trading => "（你正在和人谈一笔买卖。）".into(),
+        GotLost => "（你刚迷了路，找不到要去的地方。）".into(),
+        Drinking => "（你正在喝酒。）".into(),
+        Smoking => "（你正在抽烟。）".into(),
+        SmokingWeed => "（你正在吃草。）".into(),
+        JustHaveSex => "（你刚和人做完爱。）".into(),
+        Masturbating => "（你正在自慰。）".into(),
         WantToGoOut => "（你现在很想出门走走。）".into(),
         WantToGoHome => "（你现在很想回家。）".into(),
         TempWork => "（你刚临时接到一份工作，得马上去处理。）".into(),
@@ -397,6 +405,9 @@ fn event_cue(
     tip_personality: Option<&str>,
     picture: bool,
 ) -> String {
+    if kind == EventKind::GotLost && background == Some(EventKind::TravelingTogether) {
+        return "（你们一起出来玩，刚迷了路。）".into();
+    }
     let cue = kind_cue(kind, lasts, rung, traits, tip_personality, picture);
     match background.and_then(background_state) {
         Some(state) => format!(
@@ -1049,6 +1060,14 @@ mod tests {
             (EventKind::WantToSeeSea, "（你现在很想去看海。）"),
             (EventKind::WantHotSpring, "（你现在很想去泡温泉。）"),
             (EventKind::WantSauna, "（你现在很想去洗桑拿。）"),
+            (EventKind::WatchingStocks, "（你正在看股票行情。）"),
+            (EventKind::Trading, "（你正在和人谈一笔买卖。）"),
+            (EventKind::GotLost, "（你刚迷了路，找不到要去的地方。）"),
+            (EventKind::Drinking, "（你正在喝酒。）"),
+            (EventKind::Smoking, "（你正在抽烟。）"),
+            (EventKind::SmokingWeed, "（你正在吃草。）"),
+            (EventKind::JustHaveSex, "（你刚和人做完爱。）"),
+            (EventKind::Masturbating, "（你正在自慰。）"),
         ] {
             assert_eq!(
                 kind_cue(kind, h, 1, &PersonaTraits::default(), None, false),
@@ -1056,6 +1075,30 @@ mod tests {
                 "{kind:?}"
             );
         }
+    }
+
+    #[test]
+    fn she_gets_lost_alone_or_with_the_user() {
+        let h = Duration::hours(1);
+        let cue = |bg| {
+            event_cue(
+                EventKind::GotLost,
+                h,
+                bg,
+                1,
+                &PersonaTraits::default(),
+                None,
+                false,
+            )
+        };
+        assert_eq!(
+            cue(Some(EventKind::ShortTrip)),
+            "（你正在短途旅行。你刚迷了路，找不到要去的地方。）"
+        );
+        assert_eq!(
+            cue(Some(EventKind::TravelingTogether)),
+            "（你们一起出来玩，刚迷了路。）"
+        );
     }
 
     #[test]

@@ -936,6 +936,14 @@ pub(crate) fn event_label(kind: eros_engine_core::events::EventKind) -> &'static
         WantToSeeSea => "想去看海",
         WantHotSpring => "想去泡温泉",
         WantSauna => "想去洗桑拿",
+        WatchingStocks => "在看股票",
+        Trading => "在交易",
+        GotLost => "迷路了",
+        Drinking => "在喝酒",
+        Smoking => "在抽烟",
+        SmokingWeed => "在吃草",
+        JustHaveSex => "刚做完爱",
+        Masturbating => "自慰中",
     }
 }
 
@@ -1331,6 +1339,7 @@ pub(crate) fn persona_traits(
         employed: meta_str(persona, "employed")
             .and_then(Employment::parse)
             .unwrap_or_default(),
+        habits: persona_habits(persona),
     }
 }
 
@@ -4882,6 +4891,14 @@ mod tests {
                 "想去看海",
                 "想去泡温泉",
                 "想去洗桑拿",
+                "在看股票",
+                "在交易",
+                "迷路了",
+                "在喝酒",
+                "在抽烟",
+                "在吃草",
+                "刚做完爱",
+                "自慰中",
             ]
         );
     }
@@ -4908,6 +4925,7 @@ mod tests {
                 setting: Default::default(),
                 hygienic: None,
                 employed: Default::default(),
+                habits: Default::default(),
             }
         );
         p.genome.art_metadata =
