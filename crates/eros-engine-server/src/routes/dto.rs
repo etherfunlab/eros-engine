@@ -155,6 +155,26 @@ mod tests {
     }
 }
 
+/// Frames as an SSE response, the way the chat stream sends them: one
+/// `data:` line of JSON per frame, a `ping` comment every 15 seconds.
+pub(crate) fn sse_response(
+    frames: impl futures_util::Stream<Item = crate::pipeline::stream::ProtocolFrame> + Send + 'static,
+) -> axum::response::Response {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use axum::response::IntoResponse as _;
+    use futures_util::StreamExt as _;
+    Sse::new(frames.map(|frame| {
+        let json = serde_json::to_string(&frame).expect("ProtocolFrame serialization is infallible");
+        Ok::<_, std::convert::Infallible>(Event::default().data(json))
+    }))
+    .keep_alive(
+        KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("ping"),
+    )
+    .into_response()
+}
+
 /// Whether a request asks for the SSE response of a route that can answer
 /// either way: `stream: true` in its body, or `text/event-stream` in
 /// `Accept`. A range with `q=0` and `*/*` do not ask for it.
