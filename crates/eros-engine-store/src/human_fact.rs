@@ -292,6 +292,72 @@ impl HumanFactRepo<'_> {
         .fetch_all(self.pool)
         .await
     }
+
+    /// The user's facts, newest first by `first_seen_at` (which never
+    /// changes, so a walk through the pages neither repeats nor skips a row),
+    /// strictly before the `before` keyset tuple when given.
+    pub async fn list_owned(
+        &self,
+        user_id: Uuid,
+        before: Option<(DateTime<Utc>, Uuid)>,
+        limit: i64,
+    ) -> Result<Vec<HumanFactRow>, sqlx::Error> {
+        let (at, id) = before.unzip();
+        sqlx::query_as::<_, HumanFactRow>(&format!(
+            "SELECT {COLUMNS} FROM engine.human_facts \
+             WHERE user_id = $1 AND ($2::timestamptz IS NULL OR (first_seen_at, id) < ($2, $3)) \
+             ORDER BY first_seen_at DESC, id DESC \
+             LIMIT $4"
+        ))
+        .bind(user_id)
+        .bind(at)
+        .bind(id)
+        .bind(limit)
+        .fetch_all(self.pool)
+        .await
+    }
+
+    /// Delete one of the user's facts (spec 2026-11-10-row-deletion §3.2,
+    /// §5.2). One transaction, in the lock order user erasure uses: the
+    /// user's profile state row first, upserted so it exists and is locked
+    /// (any in-flight rebuild loses its claim; the profile is marked due),
+    /// then the fact, then its tombstone. `false` when the user has no such
+    /// fact; nothing is written then.
+    pub async fn delete_owned(&self, user_id: Uuid, fact_id: Uuid) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO engine.human_profile_state \
+                (user_id, pending_facts, last_fact_at, rebuild_due) \
+             VALUES ($1, 1, now(), true) \
+             ON CONFLICT (user_id) DO UPDATE SET \
+                claimed_at = NULL, \
+                pending_facts = human_profile_state.pending_facts + 1, \
+                last_fact_at = now(), \
+                rebuild_failures = 0, \
+                rebuild_due = true",
+        )
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        let deleted = sqlx::query("DELETE FROM engine.human_facts WHERE id = $1 AND user_id = $2")
+            .bind(fact_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if deleted == 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        crate::row_deletion::RowDeletionRepo::insert_in_tx(
+            &mut tx,
+            crate::row_deletion::KIND_FACT,
+            fact_id,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
@@ -747,5 +813,155 @@ mod tests {
             walked, expected,
             "every row once, in (last_seen_at, id) order"
         );
+    }
+
+    // ── The owner's list and delete (spec 2026-11-10-row-deletion) ──
+
+    async fn seed_at(pool: &PgPool, user: Uuid, content: &str, first_seen: DateTime<Utc>) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO engine.human_facts \
+               (user_id, content, category, domain, evidence_type, temporality, \
+                persistence, confidence, first_seen_at, last_seen_at) \
+             VALUES ($1, $2, 'other', 'other', 'explicit_statement', 'current', 'stable', \
+                     'high', $3, $3) RETURNING id",
+        )
+        .bind(user)
+        .bind(content)
+        .bind(first_seen)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn list_owned_pages_newest_first_by_first_seen(pool: PgPool) {
+        let repo = HumanFactRepo { pool: &pool };
+        let (user, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let t = |h| Utc.with_ymd_and_hms(2026, 11, 10, h, 0, 0).unwrap();
+        let old = seed_at(&pool, user, "是工程师", t(1)).await;
+        let mid = seed_at(&pool, user, "喜欢爬山", t(2)).await;
+        let new = seed_at(&pool, user, "养了一只猫", t(3)).await;
+        seed_at(&pool, other, "别人的事", t(4)).await;
+        // A recurrence moves last_seen_at, not the list order.
+        sqlx::query("UPDATE engine.human_facts SET last_seen_at = $2 WHERE id = $1")
+            .bind(old)
+            .bind(t(9))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let page = repo.list_owned(user, None, 2).await.unwrap();
+        assert_eq!(
+            page.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![new, mid]
+        );
+        let last = page.last().unwrap();
+        let rest = repo
+            .list_owned(user, Some((last.first_seen_at, last.id)), 2)
+            .await
+            .unwrap();
+        assert_eq!(rest.iter().map(|r| r.id).collect::<Vec<_>>(), vec![old]);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn delete_owned_removes_tombstones_and_marks_the_profile_due(pool: PgPool) {
+        let repo = HumanFactRepo { pool: &pool };
+        let (user, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let t = Utc.with_ymd_and_hms(2026, 11, 10, 8, 0, 0).unwrap();
+        let mine = seed_at(&pool, user, "是工程师", t).await;
+        let theirs = seed_at(&pool, other, "是工程师", t).await;
+        let states = crate::profile_state::ProfileStateRepo { pool: &pool };
+        states.bump(user, 2).await.unwrap();
+        let claimed = states
+            .claim(user, std::time::Duration::from_secs(600))
+            .await
+            .unwrap()
+            .expect("an in-flight rebuild");
+        sqlx::query(
+            "UPDATE engine.human_profile_state SET rebuild_failures = 2 WHERE user_id = $1",
+        )
+        .bind(user)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            !repo.delete_owned(user, theirs).await.unwrap(),
+            "not the owner's"
+        );
+        assert!(repo.delete_owned(user, mine).await.unwrap());
+        assert!(
+            !repo.delete_owned(user, mine).await.unwrap(),
+            "already gone"
+        );
+
+        let left: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM engine.human_facts")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, vec![theirs]);
+        let tombs: Vec<(String, Uuid)> =
+            sqlx::query_as("SELECT kind, id FROM engine.row_deletions")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(tombs, vec![("fact".to_string(), mine)]);
+
+        let s = states.load(user).await.unwrap().unwrap();
+        assert_eq!(s.claimed_at, None, "the in-flight rebuild lost its claim");
+        assert_eq!(s.pending_facts, 3);
+        assert_eq!(s.rebuild_failures, 0);
+        assert!(s.rebuild_due);
+        states.finish_ok(user, claimed).await.unwrap();
+        assert_eq!(
+            states.load(user).await.unwrap().unwrap().pending_facts,
+            3,
+            "the old claim settles nothing"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn delete_owned_creates_a_due_state_row_and_a_miss_leaves_none(pool: PgPool) {
+        let repo = HumanFactRepo { pool: &pool };
+        let user = Uuid::new_v4();
+        let states = crate::profile_state::ProfileStateRepo { pool: &pool };
+
+        assert!(!repo.delete_owned(user, Uuid::new_v4()).await.unwrap());
+        assert!(
+            states.load(user).await.unwrap().is_none(),
+            "a miss rolls back"
+        );
+
+        let id = seed_at(&pool, user, "是工程师", Utc::now()).await;
+        assert!(repo.delete_owned(user, id).await.unwrap());
+        let s = states.load(user).await.unwrap().expect("created");
+        assert_eq!((s.pending_facts, s.rebuild_due), (1, true));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_restated_fact_after_a_delete_is_a_new_row(pool: PgPool) {
+        let repo = HumanFactRepo { pool: &pool };
+        let user = Uuid::new_v4();
+        let none = src(None, None, None);
+        repo.upsert_run(
+            user,
+            &[fact("用户喜欢爬山", "explicit_statement", "stable")],
+            &none,
+        )
+        .await
+        .unwrap();
+        let first = repo.list_for_user(user).await.unwrap()[0].id;
+        assert!(repo.delete_owned(user, first).await.unwrap());
+        repo.upsert_run(
+            user,
+            &[fact("用户喜欢爬山", "explicit_statement", "stable")],
+            &none,
+        )
+        .await
+        .unwrap();
+        let again = repo.list_for_user(user).await.unwrap();
+        assert_eq!(again.len(), 1);
+        assert_ne!(again[0].id, first);
+        assert_eq!(again[0].occurrences, 1, "a fresh count");
     }
 }
