@@ -38,6 +38,7 @@ pub mod session_effects;
 pub mod session_events;
 pub mod session_open;
 pub mod svc;
+pub mod user_rows;
 pub mod voice;
 pub mod world_town;
 
@@ -67,6 +68,7 @@ pub fn router(state: AppState) -> OpenApiRouter<AppState> {
         .merge(life_choices::router())
         .merge(reaction::router())
         .merge(group::router())
+        .merge(user_rows::router())
         .layer(from_fn_with_state(state.clone(), require_auth))
         .layer(from_fn_with_state(state.clone(), require_caller_secret));
 
@@ -113,6 +115,7 @@ pub fn router_for_openapi() -> OpenApiRouter<AppState> {
         .merge(life_choices::router())
         .merge(reaction::router())
         .merge(group::router())
+        .merge(user_rows::router())
         .merge(svc::router())
         .merge(svc::facts_router())
         .merge(svc::erase_router())
