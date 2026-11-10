@@ -154,3 +154,67 @@ mod tests {
         assert_eq!(snap.chemistry_label, "spark");
     }
 }
+
+/// Whether a request asks for the SSE response of a route that can answer
+/// either way: `stream: true` in its body, or `text/event-stream` in
+/// `Accept`. A range with `q=0` and `*/*` do not ask for it.
+pub(crate) fn wants_stream(headers: &axum::http::HeaderMap, body_flag: bool) -> bool {
+    body_flag
+        || headers
+            .get_all(axum::http::header::ACCEPT)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .any(|range| {
+                let mut parts = range.split(';').map(str::trim);
+                let is_sse = parts
+                    .next()
+                    .is_some_and(|t| t.eq_ignore_ascii_case("text/event-stream"));
+                let refused = parts.any(|p| {
+                    p.split_once('=').is_some_and(|(k, v)| {
+                        k.trim().eq_ignore_ascii_case("q")
+                            && v.trim().parse::<f32>().is_ok_and(|q| q == 0.0)
+                    })
+                });
+                is_sse && !refused
+            })
+}
+
+#[cfg(test)]
+mod stream_negotiation_tests {
+    use super::wants_stream;
+    use axum::http::{header::ACCEPT, HeaderMap, HeaderValue};
+
+    fn accept(values: &[&'static str]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for v in values {
+            h.append(ACCEPT, HeaderValue::from_static(v));
+        }
+        h
+    }
+
+    #[test]
+    fn wants_stream_reads_body_flag_or_accept() {
+        assert!(!wants_stream(&HeaderMap::new(), false));
+        assert!(wants_stream(&HeaderMap::new(), true));
+        assert!(wants_stream(&accept(&["text/event-stream"]), false));
+        assert!(wants_stream(&accept(&["TEXT/Event-Stream"]), false));
+        assert!(wants_stream(
+            &accept(&["application/json, text/event-stream;q=0.9"]),
+            false
+        ));
+        assert!(wants_stream(
+            &accept(&["application/json", "text/event-stream"]),
+            false
+        ));
+        assert!(!wants_stream(&accept(&["text/event-stream;q=0"]), false));
+        assert!(!wants_stream(
+            &accept(&["text/event-stream; q=0.0"]),
+            false
+        ));
+        assert!(!wants_stream(&accept(&["*/*"]), false));
+        assert!(!wants_stream(&accept(&["application/json"]), false));
+        // The two are OR-ed: a body `false` does not veto the header.
+        assert!(wants_stream(&accept(&["text/event-stream"]), false));
+    }
+}
