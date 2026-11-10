@@ -287,6 +287,7 @@ a chat turn: no judge runs.
   | `ask_for_space` | bond and chemistry | bond and chemistry |
   | `sleep_together` | no drop | chemistry |
   | `propose` | no drop | bond and chemistry |
+  | `bathe_together` | no drop | chemistry |
 
   Each line named falls one tier by the landing rule of a refused action: the
   same relative position one tier down, both axes of the line scaled by the
@@ -303,7 +304,7 @@ a chat turn: no judge runs.
   `effective_deltas` carry the same figures, because the drop is the whole raw
   change; `label_changes`, `effective_line_deltas` and the two state snapshots
   record the tier move. `context` holds `life_choice` (`accept` | `decline`)
-  and `choice_id`. An accepted `sleep_together` or `propose` moves nothing and
+  and `choice_id`. An accepted `sleep_together`, `propose` or `bathe_together` moves nothing and
   writes no row, so `accept` appears only for `ask_for_space`. The row has no
   `user_message_id`. The delta route
   `GET /bff/v1/comp/affinity/{session_id}/event` never returns it, like

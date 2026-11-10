@@ -215,6 +215,7 @@ PDE 判定的 ghost 回合从不进入 `persist_with_event`：只有 `ghost_stre
   | `ask_for_space` | bond 和 chemistry | bond 和 chemistry |
   | `sleep_together` | 不降 | chemistry |
   | `propose` | 不降 | bond 和 chemistry |
+  | `bathe_together` | 不降 | chemistry |
 
   被点名的每条线都用被拒动作的落点规则降一档：落在下一档内的相同相对位置，这条线的两个轴按同一比例缩放，
   第 1 档的线直接归 `0`。它的 `pending_deltas` 清零；没被点名的线，轴和余额都保持不变。
@@ -224,7 +225,7 @@ PDE 判定的 ghost 回合从不进入 `persist_with_event`：只有 `ghost_stre
 - **它的事件行。** 每次降档写一行自己类型的非回合事件，`event_type = 'life_choice'`。
   `deltas` 与 `effective_deltas` 的数字相同，因为降档就是全部的原始变化；`label_changes`、
   `effective_line_deltas` 和前后两份状态快照记录档位的移动。`context` 里有 `life_choice`（`accept` | `decline`）
-  和 `choice_id`。被接受的 `sleep_together` 或 `propose` 什么都不挪动，也不写这一行，所以 `accept` 只会出现在 `ask_for_space` 上。
+  和 `choice_id`。被接受的 `sleep_together`、`propose` 或 `bathe_together` 什么都不挪动，也不写这一行，所以 `accept` 只会出现在 `ask_for_space` 上。
   这一行没有 `user_message_id`。逐轮 delta 路由
   `GET /bff/v1/comp/affinity/{session_id}/event` 从不返回它，和 `time_decay` 一样，它也不算被判官评过的回合。
 - **放缓（只在接受 `ask_for_space` 时）。** 分开结束之后的 72 小时内，四个线轴上每一个为正的已提交增量，在应用前减半。负增量全额应用，

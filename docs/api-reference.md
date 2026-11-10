@@ -1053,7 +1053,7 @@ How the draw works and how events and the persona's needs fit together is in
 | Field | Rules |
 |---|---|
 | `event_key` | required: 1–128 characters of `[A-Za-z0-9_.:-]`, scoped to the session. The same key returns the same event |
-| `kinds` | optional. Absent or `null`: every kind. An array allows the listed kinds (`[]`: nothing is drawn). An object `{"allow": […], "disallow": […]}` allows what `allow` lists (absent or `null`: every kind; `[]`: none) minus what `disallow` lists; a kind in both is not drawn, and `{}` allows every kind. An unknown key in the object or an unknown kind is a `422`, and so is `taking_space`, `fell_out` or `traveling_together`: the engine places those itself and never draws them |
+| `kinds` | optional. Absent or `null`: every kind. An array allows the listed kinds (`[]`: nothing is drawn). An object `{"allow": […], "disallow": […]}` allows what `allow` lists (absent or `null`: every kind; `[]`: none) minus what `disallow` lists; a kind in both is not drawn, and `{}` allows every kind. An unknown key in the object or an unknown kind is a `422`, and so is `taking_space`, `fell_out`, `traveling_together` or `bathing_together`: the engine places those itself and never draws them |
 | `user_timezone`, `user_country`, `user_region`, `tier`, `prompt_traits`, `memory_scope`, `affinity_scope`, `audit` | as on `/open`, for generating the message |
 | `image` | optional: `{"style", "aspect_ratio", "prompt_variant"}`, each as on a chat turn's `image` (no `force`; an unsupported `aspect_ratio` is a `422`). The caller handles images: a `taking_selfie` or `strip` message then carries her picture, when `[tasks.chat_image_prompt_compose]` is configured (below). Absent, or no composer: words only. Every other kind ignores it |
 | `outfit` | optional: what she wears, as on a chat turn — typically one of her wardrobe entries, not checked against it; 1–64 characters after trim, blank reads as absent, longer is a `422`. Her words follow it, and so does her picture. On a `strip` she has just taken it off: 刚把「{outfit}」脱了, or 刚把衣服脱了 without one. Absent: no outfit in her prompt, and the composer dresses her from the scene |
@@ -1085,6 +1085,14 @@ Kinds fall into four categories. `short` and `mid` are incidents; `body` and
 | `short` | `admiring_art` | 1 h | she is at an exhibition, in front of a piece |
 | `short` | `taking_selfie` | 30 min | she has just taken a selfie and wants to show it; with `image` in the request, the message carries it |
 | `short` | `strip` | 30 min | she has just undressed for the user (rung 3, a romance-compatible pair); with `image` in the request, the message carries her picture |
+| `short` | `bird_encounter` | 30 min | a bird has landed near her |
+| `short` | `ex_wants_back` | 1 h | her ex wants to get back together |
+| `short` | `want_to_quit_job` | 1 h | she is thinking of quitting her job (a persona with a job) |
+| `short` | `pondering_life` | 1 h | she is lost in thought about her life |
+| `short` | `streaking` | 30 min | on a whim, she has just run a lap naked (rung 3, a romance-compatible pair) |
+| `short` | `want_to_see_sea` | 1 h | she badly wants to see the sea |
+| `short` | `want_hot_spring` | 1 h | she badly wants a hot spring |
+| `short` | `want_sauna` | 1 h | she badly wants a sauna |
 | `mid` | `temp_work` | 4 h | she is called in to work |
 | `mid` | `ex_message` | 3 h | her ex texts her |
 | `mid` | `weather_change` | 4 h | the weather turns |
@@ -1117,20 +1125,22 @@ Kinds fall into four categories. `short` and `mid` are incidents; `body` and
 | `trip` | `long_trip` | 3–7 d | a long trip |
 | `trip` | `hometown_visit` | 72 h | a visit home |
 
-A range is drawn when the event starts. That is 52 drawable kinds. Both genders
+A range is drawn when the event starts. That is 61 drawable kinds. Both genders
 draw both gatherings, at the same weight; that is deliberate.
 
-Three more kinds are never drawn: `taking_space` (a separation she asked for and
+Four more kinds are never drawn: `taking_space` (a separation she asked for and
 the user agreed to, 12–24 h, offline), `fell_out` (the falling-out when the
-user ignores her ask for space, 1 h) and `traveling_together` (a trip she
-suggested and the user agreed to, 48–72 h, a `trip` background, not offline). The engine writes them for the
+user ignores her ask for space, 1 h), `traveling_together` (a trip she
+suggested and the user agreed to, 48–72 h, a `trip` background, not offline)
+and `bathing_together` (a bath she suggested and the user agreed to, 30 min, a
+`short` incident, not offline). The engine writes them for the
 [life-choice flow](#post-v2compsessionsession_idlife-choiceschoice_id). They
 show up as the `event` of `…/effects` and of the life-choice response, and
 cannot be listed in `kinds`.
 
-`sudden_desire`, `strip`, `having_sex` and `pregnancy_scare`, which implies sex, carry adult themes;
+`sudden_desire`, `strip`, `streaking`, `having_sex` and `pregnancy_scare`, which implies sex, carry adult themes;
 a caller that serves them only to some users leaves them out with
-`{"disallow": ["sudden_desire", "strip", "having_sex", "pregnancy_scare"]}`. `scolded_by_superior` and
+`{"disallow": ["sudden_desire", "strip", "streaking", "having_sex", "pregnancy_scare"]}`. `scolded_by_superior` and
 `scolded_superior` assume someone above her; for a persona with no one above
 her, the caller disallows them. A `disallow` list leaves every other kind in,
 including kinds the engine adds later. An array or an `allow` list draws only
@@ -1149,7 +1159,8 @@ The draw:
   `grocery_shopping`, `in_class`, `on_the_way`, `in_battle`, `got_bumped`,
   `bumped_someone`, `saw_bag`, `saw_clothes`, `out_shopping`,
   `bros_gathering`, `sis_gathering`, `admiring_scenery`, `admiring_art`,
-  `watching_show`, `on_the_road`, `having_sex`); during `period`,
+  `watching_show`, `on_the_road`, `having_sex`, `bird_encounter`,
+  `streaking`); during `period`,
   neither `period_scare` nor `pregnancy_scare`.
 - **While she waits for an answer, nothing is drawn.** From her ask (of any
   life choice) until it is answered or lapses (24 h), the draw returns `{"event": null,
@@ -1160,12 +1171,12 @@ The draw:
   kind. Any offline kind starts at most once every 12 hours, whichever kind.
 - **Her needs weight the pick** within a category, when the deployment runs the
   LLM judge and the persona has a rating: a high `outing` favours
-  `want_to_go_out`, a low one `want_to_go_home`, and a high `indulgence`
+  `want_to_go_out` and `want_to_see_sea`, a low one `want_to_go_home`, and a high `indulgence`
   favours `want_to_go_out` and `irritable` (the full table is in
   [life-events-needs.md](life-events-needs.md#1-needs-weight-the-kind-pick)).
-- **Closeness gates.** `ex_message` and `breakup` are not drawn for someone she
+- **Closeness gates.** `ex_message`, `breakup` and `ex_wants_back` are not drawn for someone she
   barely knows (intimacy rung 2 and up); `sudden_desire` only at the closest
-  rung (3), and `strip` at rung 3 only when the session's newest recorded
+  rung (3), and `strip` and `streaking` at rung 3 only when the session's newest recorded
   `affinity_scope` is romance-compatible (none recorded: not drawn). `period` is drawn only for a persona whose `art_metadata.gender` is
   `"female"`. `period_scare` (rung 2 and up) and `pregnancy_scare` (rung 3) are
   also drawn only for such a persona, and so are `saw_bag` and `saw_clothes`;
@@ -1181,7 +1192,9 @@ The draw:
   | `prefer_trip` | `true` / `false` (default) | trips come up three times as often; still once a week at most |
   | `homesick` | `true` / `false` / absent | where a trip goes: `true` favours `hometown_visit` and thins the leisure trips, `false` thins `hometown_visit`; `business_trip` untouched |
   | `is_virgin` | `true` / `false` (default) | `having_sex` is a fifth as likely until her first `having_sex` event, after which the key no longer applies |
-  | `sex_addict` | `true` / `false` / absent | `sudden_desire` and `strip` come up three times / a third as often within `short`; their gates hold |
+  | `sex_addict` | `true` / `false` / absent | `sudden_desire`, `strip` and `streaking` come up three times / a third as often within `short`; their gates hold |
+  | `hygienic` | `true` / `false` / absent | `showering`, `bathing`, `want_hot_spring` and `want_sauna` come up three times / a third as often within `short`; it also sets when she asks for a bath together ([below](#post-v2compsessionsession_idlife-choiceschoice_id)) |
+  | `employed` | `"free"`, `"part_time"` (default), `"full_time"` | how much of her day is work: `temp_work`, `scolded_by_superior`, `scolded_superior` and `business_trip` come up a third as often / as they are / three times as often within their categories, and a `free` persona never draws `want_to_quit_job`; any other value reads as `part_time` |
   | `setting` | `"modern"` (default), `"fantasy"` | the world she lives in: a `fantasy` persona never draws `police_encounter`, `showering`, `taking_selfie`, `gaming`, `watching_match`, `watching_show`, `business_trip`, `hospitalized` or `post_surgery`, whatever `kinds` or `prefer_events` say; any other value reads as `modern` |
   | `smoking`, `alcoholic`, `drug`, `coffee`, `gluttony` | each `true` / `false` / absent | whether she smokes, drinks, uses weed, drinks coffee, loves good food: the more are `true`, the sooner her `indulgence` comes back to `high` and weighs the pick; a `false` key can make her refuse a `give` of that thing ([above](#post-compchatsession_idmessagestream)) |
 
@@ -1301,7 +1314,7 @@ reply does not count. Her other sessions never carry it.
   with text; see
   [model-config.md](model-config.md#taskspde_decision--opt-in-llm-pde-judge)).
 - **Errors:** `400` with `code: "invalid_payload"` for a malformed
-  `event_key`; `422` for an unknown `kind`, or for `taking_space`, `fell_out` or `traveling_together`. Session checks as on `/open`
+  `event_key`; `422` for an unknown `kind`, or for `taking_space`, `fell_out`, `traveling_together` or `bathing_together`. Session checks as on `/open`
   (`403`, `404`, `409` for a voice or group session), `429` at the per-user
   in-flight cap. A BYOC instance's session is `400 byoc_unsupported`. A failed
   generation returns the upstream error the image endpoints return and
@@ -1332,7 +1345,7 @@ Answer one of her life choices. She puts a choice to the user in a proactive
 message (`metadata.proactive = "life_choice"`) and the session carries a
 pending choice for 24 hours; she has one such choice pending at a time across
 all her sessions with the user. The user answers here, answers in words, or
-says nothing. There are four kinds:
+says nothing. There are five kinds:
 
 | `kind` | She asks | When |
 |---|---|---|
@@ -1340,20 +1353,25 @@ says nothing. There are four kinds:
 | `sleep_together` | the user to sleep with her | the pair is romantically compatible (below), chemistry is at tier 3 or more, and the 3 newest judged turns all have warmth and patience above 0.7 |
 | `propose` | the user to marry her | the pair is romantically compatible, chemistry and bond are both at tier 4 or more, and at least 5 of the newest 8 judged turns have warmth and patience above 0.7 |
 | `travel_together` | the user to go away with her | bond is at tier 3 or more, the 3 newest judged turns all have warmth and patience above 0.7, and no background event is under way. It does not read the pair's scopes |
+| `bathe_together` | the user to take a bath with her | the pair is romantically compatible, chemistry is at tier 2 or more for a persona whose `hygienic` is `true` and at tier 3 or more when it is absent (never when it is `false`), and at least 3 of the newest 7 judged turns have warmth 0.5 or more. It does not read patience |
 
 Only judged turns after the session's newest choice episode count, whatever its kind: her
 ask, its answer and any separation it started.
-`propose` wins when both romantic kinds qualify on one turn, and a romantic kind
-wins over `travel_together`. A romantic kind the user
-accepted or ignored in a session is never asked again there, and
-`travel_together` is not asked again for 14 days; one that was
-declined or lapsed is asked again after a fresh streak. How and when she asks,
-and what each path costs, is in
+`propose` wins when both `sleep_together` and `propose` qualify on one turn.
+`bathe_together` has a trigger of its own, independent of those two and of a
+trip under way. She has one ask pending at a time, so on a turn where several
+qualify the order is `sleep_together` or `propose`, then `bathe_together`, then
+`travel_together`. A `sleep_together` or
+`propose` the user accepted or ignored in a session is never asked again
+there, `travel_together` is not asked again for 14 days and `bathe_together`
+for 7; one that was declined or lapsed is asked again after a fresh streak.
+How and when she asks, and what each path costs, is in
 [life-events-needs.md](life-events-needs.md#the-ask-for-space-choice),
-[the romantic choices](life-events-needs.md#the-romantic-choices) and
-[going away together](life-events-needs.md#going-away-together).
+[the romantic choices](life-events-needs.md#the-romantic-choices),
+[going away together](life-events-needs.md#going-away-together) and
+[a bath together](life-events-needs.md#a-bath-together).
 
-**Romantic compatibility.** She asks `sleep_together` or `propose` only of a
+**Romantic compatibility.** She asks `sleep_together`, `propose` or `bathe_together` only of a
 pair the caller's scope marks as romantically compatible: at least one of
 trust, intrigue or patience is in `affinity_scope` (`"chemistry"`, `"full"`,
 `"bond_and_chemistry"`, or an axis array naming one of the three), whatever
@@ -1393,12 +1411,12 @@ words, and that is the ignore path (below).
 1:1 text sessions only. One transaction answers the choice and pays for it.
 What an answer does depends on `kind`:
 
-| | `ask_for_space` | `sleep_together` | `propose` | `travel_together` |
-|---|---|---|---|---|
-| **`accept`** | status `accepted`. A `taking_space` separation starts now and lasts 6 hours per tier of the gap she asked at (gap 2, 3, 4: 12, 18, 24 hours); she is offline for all her sessions while it lasts, and an incident under way ends. Bond and chemistry each drop one tier, and for 72 hours after the separation ends positive growth in this session is halved | status `accepted`; nothing else changes | status `accepted`; nothing else changes | status `accepted`. A `traveling_together` background starts now and lasts 48 to 72 hours; she keeps replying, and an incident under way ends. Nothing else changes |
-| **`decline`** | status `declined`. The same tier drop; no separation and no slowdown | status `declined`; chemistry drops one tier | status `declined`; bond and chemistry each drop one tier | status `declined`; nothing else changes |
-| **ignore** (the user types instead) | status `ignored`; a one-hour `fell_out` incident; no tier change | status `ignored`; no cost, no `fell_out` | status `ignored`; no cost, no `fell_out` | status `ignored`; no cost, no `fell_out` |
-| **expiry** (24 h) | no cost | no cost | no cost | no cost |
+| | `ask_for_space` | `sleep_together` | `propose` | `travel_together` | `bathe_together` |
+|---|---|---|---|---|---|
+| **`accept`** | status `accepted`. A `taking_space` separation starts now and lasts 6 hours per tier of the gap she asked at (gap 2, 3, 4: 12, 18, 24 hours); she is offline for all her sessions while it lasts, and an incident under way ends. Bond and chemistry each drop one tier, and for 72 hours after the separation ends positive growth in this session is halved | status `accepted`; nothing else changes | status `accepted`; nothing else changes | status `accepted`. A `traveling_together` background starts now and lasts 48 to 72 hours; she keeps replying, and an incident under way ends. Nothing else changes | status `accepted`. A `bathing_together` incident starts now and lasts 30 minutes; she keeps replying, and an incident under way ends. Nothing else changes |
+| **`decline`** | status `declined`. The same tier drop; no separation and no slowdown | status `declined`; chemistry drops one tier | status `declined`; bond and chemistry each drop one tier | status `declined`; nothing else changes | status `declined`; chemistry drops one tier |
+| **ignore** (the user types instead) | status `ignored`; a one-hour `fell_out` incident; no tier change | status `ignored`; no cost, no `fell_out` | status `ignored`; no cost, no `fell_out` | status `ignored`; no cost, no `fell_out` | status `ignored`; no cost, no `fell_out` |
+| **expiry** (24 h) | no cost | no cost | no cost | no cost | no cost |
 
 Then she answers in one proactive message, persisted like any reply and
 returned. For `ask_for_space` it is a goodbye after an accept and a hurt reply
@@ -1416,9 +1434,10 @@ no. It is generated with the scopes of this request.
 answer: dropped for an `ask_for_space` accept and for a decline of any kind but
 `travel_together`, as it stands otherwise, in the shape of
 [`GET /bff/v1/comp/affinity/{session_id}`](#get-bffv1compaffinitysession_id)'s
-`affinity`. `event` is the separation an `ask_for_space` accept started or the
-trip a `travel_together` accept started, and
-`null` after any decline and for every romantic answer. `message` is `null`
+`affinity`. `event` is the separation an `ask_for_space` accept started, the
+trip a `travel_together` accept started or the bath a `bathe_together` accept
+started, and `null` after any decline and for every `sleep_together` and
+`propose` answer. `message` is `null`
 when her generation failed, came back blank, or a newer message of the user's
 landed first: the answer, the separation and the drop stand either way.
 
@@ -1545,7 +1564,7 @@ with, plus `response` (`"accept"` | `"refuse"`) once the turn took effect.
   "life_choice": { "id": "…", "kind": "propose", "status": "accepted", "resolved_at": "2026-10-30T12:00:00Z" } }
 ```
 
-`kind` is `ask_for_space`, `sleep_together`, `propose` or `travel_together`. `status` is `pending`, `accepted`, `declined`, `ignored` or `expired`; `expired` is a `pending` choice past its 24 hours, derived when the page is served and never stored. `resolved_at` is `null` while the status is `pending` or `expired`; for `accepted` and `declined` it is when the answer landed, and for `ignored` it is the `sent_at` of the user message that answered her in words. The reply rows that follow carry `occasion: "life_choice"` as usual. The affinity delta's `life_choice` field is a different object and stays pending-only.
+`kind` is `ask_for_space`, `sleep_together`, `propose`, `travel_together` or `bathe_together`. `status` is `pending`, `accepted`, `declined`, `ignored` or `expired`; `expired` is a `pending` choice past its 24 hours, derived when the page is served and never stored. `resolved_at` is `null` while the status is `pending` or `expired`; for `accepted` and `declined` it is when the answer landed, and for `ignored` it is the `sent_at` of the user message that answered her in words. The reply rows that follow carry `occasion: "life_choice"` as usual. The affinity delta's `life_choice` field is a different object and stays pending-only.
 
 `user_message_id` names the `role='user'` row whose turn produced this row. It
 is present on assistant rows and on `system_error` notices, and omitted on the
@@ -2588,7 +2607,7 @@ from the absolute route below on any other device.
   events and on rows written before migration `0056`.
 - `life_choice` — the session's pending choice, composed at serve time and
   attached to `event` whenever one is unanswered and not past its 24 hours;
-  absent otherwise. `kind` is `ask_for_space`, `sleep_together`, `propose` or `travel_together`.
+  absent otherwise. `kind` is `ask_for_space`, `sleep_together`, `propose`, `travel_together` or `bathe_together`.
   `options` lists the answers the
   [life-choice route](#post-v2compsessionsession_idlife-choiceschoice_id)
   takes; `message_id` is the chat message that asked it (absent once that row

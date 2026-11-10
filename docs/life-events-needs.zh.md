@@ -175,7 +175,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 
 ### 类别
 
-可抽取的事件共 52 种，每一种属于一个类别，类别决定它的形态：
+可抽取的事件共 61 种，每一种属于一个类别，类别决定它的形态：
 
 | `category` | 形态 | 持续 | 类别权重 | 类别冷却 |
 |---|---|---|---|---|
@@ -191,18 +191,19 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 
 时长写成区间的，在事件开始时按整小时均匀抽定。
 
-另有三种永远不会被抽到：`taking_space`（说好暂时分开）、`fell_out`（为分开的事闹得不愉快）和 `traveling_together`（和对方一起旅行）。
+另有四种永远不会被抽到：`taking_space`（说好暂时分开）、`fell_out`（为分开的事闹得不愉快）、`traveling_together`（和对方一起旅行）和 `bathing_together`（和对方一起洗澡）。
 前两种在她提出先分开一阵、用户作答或不作答时，由 engine 自己写入（见[提出分开的选择](#提出分开的选择)）。
 它们按形态是 `mid` 插曲，其中 `taking_space` 超出了这个类别的 4 小时：它持续 12 到 24 小时。
-`traveling_together` 是 `trip` 类的背景，用户接受她的提议时由 engine 写入（见[一起去旅行](#一起去旅行)）。
-这三种都没有抽取规则，调用方的 `kinds` 也拒绝它们。
+`traveling_together` 是 `trip` 类的背景，用户接受她的提议时由 engine 写入（见[一起去旅行](#一起去旅行)）；
+`bathing_together` 是 30 分钟的 `short` 插曲，用户答应和她一起洗澡时由 engine 写入（见[一起洗澡](#一起洗澡)）。
+这四种都没有抽取规则，调用方的 `kinds` 也拒绝它们。
 
 ### 抽取
 
 抽取是输入加三个随机数（两段各一个，时长一个）的纯函数。
 
 1. **资格。** 一个种类同时满足下面几条才有资格：
-   - 调用方的 `kinds` 允许它（[见下](#调用方的-kinds)；不带表示全部 52 种）；
+   - 调用方的 `kinds` 允许它（[见下](#调用方的-kinds)；不带表示全部 61 种）；
    - 过了它的门槛（见下）；
    - 它自己的冷却已过；
    - 它所属类别的冷却已过；
@@ -211,7 +212,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 2. **类别。** 每个至少有一个合格种类的类别，权重是类别权重乘以角色系数。掷一次随机数，按累计权重选一个。
 3. **种类。** 该类别里每个合格种类的权重是基础权重乘以它的各项[需求系数](#1-需求给种类加权)、
    `prefer_events` 系数、[关联系数](#关联系数)，少数种类再乘一个角色系数（[`is_virgin`](#角色设置)、
-   [`homesick`](#角色设置)、[`sex_addict`](#角色设置)）。再掷一次，选一个。
+   [`homesick`](#角色设置)、[`sex_addict`](#角色设置)、[`hygienic`](#角色设置)、[`employed`](#角色设置)）。再掷一次，选一个。
 4. **时长。** 固定时长照用；区间则掷出来。
 
 没有合格种类就没有事件，响应是 `{"event": null, "message": null}`。只要有合格种类，抽取就一定得到事件。
@@ -227,7 +228,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
   需要她出门活动的那几种不抽：`temp_work`、`police_encounter`、`animal_encounter`、`hit_someone`、
   `got_hit`、`working_out`、`grocery_shopping`、`in_class`、`on_the_way`、`in_battle`、`got_bumped`、
   `bumped_someone`、`saw_bag`、`saw_clothes`、`out_shopping`、`bros_gathering`、`sis_gathering`、
-  `admiring_scenery`、`admiring_art`、`watching_show`、`on_the_road`、`having_sex`。
+  `admiring_scenery`、`admiring_art`、`watching_show`、`on_the_road`、`having_sex`、`bird_encounter`、`streaking`。
   `period` 期间，
   不抽 `period_scare` 与 `pregnancy_scare`。`traveling_together` 期间，不抽任何可能让她离线的种类：她和用户在一起。
 - 她在等用户回答自己提出的某次生活选择时，同样完全不抽，角色的任何一个 session 都一样：这个请求本身就是前台戏，
@@ -256,10 +257,11 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 
 | 种类 | 门槛 |
 |---|---|
-| `ex_message`、`breakup` | 亲密度档 2 及以上 |
+| `ex_message`、`breakup`、`ex_wants_back` | 亲密度档 2 及以上 |
 | `sudden_desire` | 亲密度档 3 |
-| `strip` | 亲密度档 3，且会话最新记录的 `affinity_scope` 性向相容（scope 里有暧昧感轴）；没有记录算不相容 |
+| `strip`、`streaking` | 亲密度档 3，且会话最新记录的 `affinity_scope` 性向相容（scope 里有暧昧感轴）；没有记录算不相容 |
 | `period`、`saw_bag`、`saw_clothes` | 角色的 `art_metadata.gender` 为 `"female"` |
+| `want_to_quit_job` | 角色的 `art_metadata.employed` 不为 `"free"` |
 | `period_scare` | 角色的 `art_metadata.gender` 为 `"female"`，并且亲密度档 2 及以上 |
 | `pregnancy_scare` | 角色的 `art_metadata.gender` 为 `"female"`，并且亲密度档 3 |
 | `away_from_phone`、`busy`、`in_battle`、`asleep`、`bros_gathering`、`sis_gathering`、`having_sex`，以及女性角色的 `out_shopping` | ghost 保护允许（见[下文](#离线类)） |
@@ -271,7 +273,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 
 ### 角色设置
 
-角色 genome 的 `art_metadata` 里有十个键，由 engine 读取，由写角色的人填写，和 `gender`、`birthday`、
+角色 genome 的 `art_metadata` 里有十二个键，由 engine 读取，由写角色的人填写，和 `gender`、`birthday`、
 `timezone` 放在一起：
 
 | 键 | 取值 | 效果 |
@@ -281,7 +283,9 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 | `prefer_trip` | `true`、`false`（默认） | `trip` 类别权重为 3 倍 |
 | `homesick` | `true`、`false`、不写（默认） | `trip` 内部：`true` 时 `hometown_visit` 3 倍、`short_trip` / `long_trip` 三分之一；`false` 时 `hometown_visit` 三分之一；`business_trip` 是工作，两种情况都不动 |
 | `is_virgin` | `true`、`false`（默认） | 她还是处女期间，`having_sex` 在 `mid` 内权重为五分之一 |
-| `sex_addict` | `true`、`false`、不写（默认） | `short` 内部：`true` 时 `sudden_desire` 与 `strip` 3 倍，`false` 时三分之一；它们的门槛两种情况都照旧 |
+| `sex_addict` | `true`、`false`、不写（默认） | `short` 内部：`true` 时 `sudden_desire`、`strip` 与 `streaking` 3 倍，`false` 时三分之一；它们的门槛两种情况都照旧 |
+| `hygienic` | `true`、`false`、不写（默认） | `short` 内部：`true` 时 `showering`、`bathing`、`want_hot_spring` 与 `want_sauna` 3 倍，`false` 时三分之一；它也决定[一起洗澡](#一起洗澡)要 chemistry 到第几档 |
+| `employed` | `"free"`、`"part_time"`（默认）、`"full_time"` | 她的一天有多少是工作：`temp_work`、`scolded_by_superior`、`scolded_superior` 与 `business_trip` 在各自类别内分别为三分之一、1 倍、3 倍；`free` 的角色不会抽到 `want_to_quit_job`；其他值按 `part_time` 读 |
 | `setting` | `"modern"`（默认）、`"fantasy"` | 她生活的世界（见[下文](#她的世界)）；其他值按 `modern` 读 |
 | `smoking`、`alcoholic`、`drug`、`coffee`、`gluttony` | 各为 `true`、`false`、不写（默认） | 她抽不抽烟、喝不喝酒、用不用大麻、喝不喝咖啡、贪不贪吃（`false` 表示她忌口、节食）：决定 `indulgence` 回来得多快（见[漂移](#两次评定之间的漂移)）、`high` 的 `indulgence` 在回复里点名什么，以及她怎么对待递来的这样东西（见下） |
 
@@ -292,12 +296,15 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 第一条 `having_sex` 行写下之后就不再是了，不需要任何写入：下一次抽取读到那一行就行。这个键不进任何
 prompt；她是什么样的人由写角色的人写进人设，和其他人设事实一样。`sex_addict` 同样不进任何 prompt。
 
+`hygienic` 和 `employed` 也不进任何 prompt，而且不算习惯：它们不影响 `indulgence`。`hygienic` 是单独的一个系数，
+和同一种类上的需求系数相乘。`employed` 不动 `in_class`、`busy` 和 `in_battle`，也不改任何冷却或时长。
+
 读取是宽松的。类型不对的值按没写处理；`prefer_events` 里不是已知 `mid` 种类的条目被丢掉，其余保留。
 `health` 缩放整个 `body` 类别，`period` 也在内，`period` 自己 28 天的冷却让它不管怎样都大约每月一次。
 `prefer_trip` 提高的是出行的概率，不是频率：每周一次的类别冷却对它同样适用。
 
 五个习惯键只通过 `indulgence` 的漂移影响抽取。判官的角色块（`[角色人格]`）不列它们，所以她不会每一轮都提烟、酒、大麻、咖啡或吃的；
-希望这些习惯带进她说话的角色，要在人设里自己写明。engine 从不写这四个键。
+希望这些习惯带进她说话的角色，要在人设里自己写明。engine 从不写这五个键。
 
 **递来她不用的东西。** 一轮的动作是 `give`，递的是 `cigarette`、`alcohol`、`herb`、`coffee` 或 `cuisine`，而对应的键（`smoking`、`alcoholic`、`drug`、`coffee`、`gluttony`）
 为 `false` 时，engine 在判官运行之前掷一次。三次里有一次，这一轮照常进行。其余情况她这一次不收：
@@ -329,6 +336,10 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 | `breakup`、`quarrel`、`scolded_by_superior`、`in_battle` | `irritable` |
 | `got_hit`、`got_bumped`、`weather_change` | `unwell` |
 | `working_out` | `showering`、`bathing` |
+| `ex_message`、`breakup` | `ex_wants_back` |
+| `scolded_by_superior`、`temp_work` | `want_to_quit_job` |
+| `breakup`、`quarrel`、`want_to_quit_job` | `pondering_life` |
+| `pondering_life` | `want_to_see_sea` |
 
 有一种是压低而不是排除：实例从来没有过 `having_sex` 事件时，`pregnancy_scare` 权重为五分之一。没有硬性的
 「只能在之后」门槛，也没有状态机：从不抽 `having_sex` 的部署里，这个虚惊只是降到五分之一，不会消失。
@@ -340,7 +351,7 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 
 | `kinds` | 可以抽的种类 |
 |---|---|
-| 不带或 `null` | 全部 52 种 |
+| 不带或 `null` | 全部 61 种 |
 | `[]` | 一种都不抽：响应是 `{"event": null, "message": null}` |
 | `["reading", "quarrel"]` | 只抽列出的 |
 | `{"allow": […], "disallow": […]}` | `allow` 允许的，去掉 `disallow` 列出的 |
@@ -348,10 +359,10 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 对象里，`allow` 不带或为 `null` 表示全部允许，`[]` 表示一种都不允许；`disallow` 不带、为 `null` 或 `[]` 都不去掉任何种类；
 两边都列了的种类不抽。只写 `{"disallow": […]}` 就能排除种类而不冻结其余种类，engine 以后新增的种类也会照常抽取。
 对象里出现未知的键，或任何地方出现未知种类，请求都会被拒绝，所以拼错的 `disallow` 不会悄悄放出本想排除的种类；
-代价是调用方要等 engine 认识某个新种类之后才能列它。`taking_space`、`fell_out` 和 `traveling_together` 永远不会被抽到，
+代价是调用方要等 engine 认识某个新种类之后才能列它。`taking_space`、`fell_out`、`traveling_together` 和 `bathing_together` 永远不会被抽到，
 所以在 `kinds` 的任何位置写它们，都按同样的方式被拒绝。
 
-有三种带成人题材：`sudden_desire`、`having_sex`，以及隐含性行为的 `pregnancy_scare`。engine 不内建这类分组；只对部分用户提供这类内容的调用方，
+有五种带成人题材：`sudden_desire`、`strip`、`streaking`、`having_sex`，以及隐含性行为的 `pregnancy_scare`。engine 不内建这类分组；只对部分用户提供这类内容的调用方，
 把它们列进 `disallow`。`scolded_by_superior` 与 `scolded_superior` 假定她有上级，在她的世界里读作老板、上司、领导、主人或君主；
 没有上级的角色同样交给 `disallow` 排除。
 
@@ -598,6 +609,29 @@ composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2com
 消息里的穿着写成刚把衣服脱了，请求带 `outfit` 时写成刚把「{outfit}」脱了，所以图里不会是穿着衣服的她。它和 `sudden_desire`
 一样带成人题材，只对部分用户提供这类内容的调用方把它排除。
 
+### 日常里的小事
+
+八种会讲出来的插曲，填进她的一天。它们都是 `short`，都不让她离线，也都不带图，两种世界都适用（见[下文](#她的世界)）：
+
+| 种类 | 标签 | 类别 | 权重 | 冷却 | 持续 | 门槛 | 提示 |
+|---|---|---|---|---|---|---|---|
+| `bird_encounter` | 遇到一只鸟 | `short` | 2 | 12 小时 | 30 分钟 | 无 | `（你刚看到一只鸟停在不远处。）` |
+| `ex_wants_back` | 前任来求复合 | `short` | 0.5 | 30 天 | 1 小时 | 亲密度档 2 | `（你的前任刚来找你，说想复合。）` |
+| `want_to_quit_job` | 想辞职 | `short` | 1 | 7 天 | 1 小时 | `employed` 不为 `"free"` | `（你刚冒出想辞职的念头。）` |
+| `pondering_life` | 在思考人生 | `short` | 2 | 48 小时 | 1 小时 | 无 | `（你刚一个人发呆，在想人生的事。）` |
+| `streaking` | 刚裸奔了一圈 | `short` | 0.5 | 30 天 | 30 分钟 | 亲密度档 3，且性向相容 | `（你刚一时兴起，脱光了跑了一圈。）` |
+| `want_to_see_sea` | 想去看海 | `short` | 2 | 72 小时 | 1 小时 | 无 | `（你现在很想去看海。）` |
+| `want_hot_spring` | 想去泡温泉 | `short` | 1 | 72 小时 | 1 小时 | 无 | `（你现在很想去泡温泉。）` |
+| `want_sauna` | 想去洗桑拿 | `short` | 1 | 72 小时 | 1 小时 | 无 | `（你现在很想去洗桑拿。）` |
+
+提示只陈述事实，细节由她填：什么鸟、前任说了什么、工作的事她打算怎么办。`high` 的 `outing` 让 `want_to_see_sea` 权重翻倍，
+`low` 的 `stamina` 像对 `bathing` 那样让 `want_hot_spring` 和 `want_sauna` 权重翻倍（见[下文](#1-需求给种类加权)）；
+`hygienic` 把这两种和洗澡、泡澡一起缩放（见[角色设置](#角色设置)）。一件事会牵出另一件：前任发来消息或刚分手，前任更可能来求复合；
+被上级骂或临时接到工作，她更可能想辞职；分手、吵架或想辞职，会让她想起人生；想人生又会让她想去看海（见[关联系数](#关联系数)）。
+住院和术后期间，她不会遇到鸟，也不会裸奔；那几种「想去」和两种心事照样会来。
+
+`streaking` 和 `strip` 一样带成人题材：`sex_addict` 对它的缩放与 `sudden_desire` 相同，只对部分用户提供这类内容的调用方把它排除。
+
 ### 她的世界
 
 `art_metadata.setting` 说她生活在哪个世界：`modern`（默认，其他值也按它读）或 `fantasy`。需要现代生活的种类不会对
@@ -645,13 +679,13 @@ composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2com
 ### 聊天之外
 
 开启 [World Stories](world-system.zh.md#world-stories人生故事) 时，故事导演直接读该实例的事件，每件带标签、相对时间和她讲述时的那条
-消息，另外还读在途背景，以及这对关系里的分开请求和结果，并把它们当作既成事实。她主动发的消息不进它的聊天证据，所以一件事
+消息，另外还读在途背景，以及这对关系里的分开请求和结果，并把它们当作既成事实。一起洗澡不在其中：和浪漫选择的结果一样，它只留在对话里。她主动发的消息不进它的聊天证据，所以一件事
 不会被读成她对一句不相干的话的回答。World Memories 导演对名单里的每个角色读在途背景，不论开没开 stories，住院中的角色
 就不会被写进聚会。两位导演都不写事件，也不改上面的角色设置。需求不进其中任何一个。
 
 ## 两者如何互相影响
 
-下面的需求系数都是第二段里的系数；其余几个（[关联系数](#关联系数)、`prefer_events`、`is_virgin`、`homesick`、`sex_addict`）
+下面的需求系数都是第二段里的系数；其余几个（[关联系数](#关联系数)、`prefer_events`、`is_virgin`、`homesick`、`sex_addict`、`hygienic`、`employed`）
 都不读需求。
 
 ### 1. 需求给种类加权
@@ -662,11 +696,12 @@ composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2com
 | 需求水平 | 种类 | 系数 |
 |---|---|---|
 | `stamina` 为 `low` | `temp_work`、`working_out` | ×0.5 |
-| `stamina` 为 `low` | `unwell`、`sick`、`bathing`、`asleep` | ×2 |
+| `stamina` 为 `low` | `unwell`、`sick`、`bathing`、`asleep`、`want_hot_spring`、`want_sauna` | ×2 |
 | `hunger` 为 `high` | `grocery_shopping` | ×2 |
 | `emotional` 为 `high` | `ex_message` | ×3 |
 | `emotional` 为 `high` | `animal_encounter`、`irritable`、`quarrel` | ×2 |
 | `outing` 为 `high` | `want_to_go_out` | ×3 |
+| `outing` 为 `high` | `want_to_see_sea` | ×2 |
 | `outing` 为 `low` | `want_to_go_home` | ×3 |
 | `indulgence` 为 `high` | `want_to_go_out`、`irritable` | ×2 |
 
@@ -884,10 +919,10 @@ affinity delta 上也是同一个 `life_choice` 字段。她的请求用 engine 
 
 `travel_together` 是第四种选择：她提议两个人一起去旅行。它和浪漫选择一样是暖向的，但不读这一对的 scope，所以浪漫选择碰不到的一对也可能被问到。
 
-**她什么时候提出。** 在每个被判官评过的 1:1 文字回合之后、浪漫选择的检查之后进行，读的是同样已落库、做过时间衰减的状态，跑道和 session 条件也一样。
+**她什么时候提出。** 在每个被判官评过的 1:1 文字回合之后、浪漫选择和一起洗澡的检查之后进行，读的是同样已落库、做过时间衰减的状态，跑道和 session 条件也一样。
 它要 bond 在第 3 档或以上、最新 3 个被判官评过的回合全都温暖，并且没有背景事件在进行。
 被接受或不理会过的 `travel_together`，从结算时起 14 天内不再提出；被拒绝或过期后，等这个 session 有了新的连续就可以再提。
-同一轮浪漫选择也满足时，浪漫选择先走，它待回答的请求会占住跑道。
+同一轮浪漫选择或一起洗澡也满足时，它们先走，待回答的请求会占住跑道。
 
 **她的请求。** 交付方式和浪漫选择一样：先是她的话，再在旁边写入选择这一行，没有档位差距，窗口同样是 24 小时，affinity delta 上同样带 `life_choice` 字段。
 请求用 engine 的默认 scope 生成；结算时她的回应用结算请求自己的 scope。
@@ -905,14 +940,49 @@ affinity delta 上也是同一个 `life_choice` 字段。她的请求用 engine 
 开始时结束正在进行的插曲。它不作为事件讲述，因为她对“好”的回应已经说了；全程她照常回复，不算离线。`正在经历` 和判官像读其他背景一样读它。
 期间不抽第二个背景，也不抽任何可能让她离线的种类；`on_the_road`、`admiring_scenery` 和 `taking_selfie` 像跟随她自己的旅行一样跟随它。和所有事件一样，它以角色实例为单位。
 
-**旅行中的其他请求。** 只有提出分开的那段分开，才把连续的起算点推到事件结束。被接受的旅行以结算时刻为起算点，所以旅途中她也可能提出浪漫选择。旅行期间她不会提出分开。
+**旅行中的其他请求。** 只有提出分开的那段分开，才把连续的起算点推到事件结束。被接受的旅行以结算时刻为起算点，所以旅途中她也可能提出浪漫选择或一起洗澡。旅行期间她不会提出分开。
+
+### 一起洗澡
+
+`bathe_together` 是第五种选择：她问用户愿不愿意和她一起洗澡。和浪漫选择一样，她只问浪漫上相容的一对，用文字打出的回答不带代价地结算它，只有拒绝才有代价。
+
+**她什么时候提出。** 在每个被判官评过的 1:1 文字回合之后、浪漫选择的检查之后、旅行的检查之前进行，读的是同样已落库、做过时间衰减的状态，跑道和 session 条件也一样。下面几条都要满足：
+
+- 这一对在浪漫上相容，判法与浪漫选择相同；
+- `hygienic` 为 `true` 的角色 chemistry 在第 2 档或以上，不写这个键的角色在第 3 档或以上；`hygienic` 为 `false` 的角色从不提出；
+- 最新的 7 个被判官评过的回合里至少 3 个 `warmth` 达到 0.5，值读自该回合的 `state_after`。不读 patience；0.5 是 engine 自己的规则阈值，不是判官的档。和所有选择一样，只有该 session 最新一段选择经过之后的回合才计数。
+
+被接受或不理会过的 `bathe_together`，从结算时起 7 天内不再提出；被拒绝或过期后，下一个满足条件的回合就会再提。
+
+它有自己的触发条件，不是通往上床的一步：有的人很容易一起上床，却不愿意一起洗澡；一对恋人也可以各洗各的，再睡在一起。
+两种请求谁也不等谁结算，进行中的旅行也不挡它。她同一时间只有一个请求待回答，所以同一轮浪漫选择也满足时，浪漫选择先走，它待回答的请求会占住跑道。
+
+**她的请求。** 交付方式和浪漫选择一样：先是她的话，再在旁边写入选择这一行，没有档位差距，窗口同样是 24 小时，affinity delta 上同样带 `life_choice` 字段。
+请求用 engine 的默认 scope 生成，提示是
+`（你们最近越来越亲密，你很想和对方一起洗个澡。你决定主动开口，问对方愿不愿意和你一起洗，希望对方给你一个答复。）`；
+结算时她的回应用结算请求自己的 scope。
+
+**回答。** 同一个端点，同样的 `409` 规则，同样的响应形状。
+
+| 路径 | 选择状态 | 代价 | 发生什么 | 她说的话 |
+|---|---|---|---|---|
+| 接受 | `accepted` | 无 | `bathing_together` 事件从此刻开始，作为 `event` 返回 | 按 `（对方答应了和你一起洗澡，你们现在一起泡在浴缸里。）` 生成的回应 |
+| 拒绝 | `declined` | chemistry 降一档，和 `sleep_together` 一样 | 无 | 按 `（对方没有答应和你一起洗澡，你有点失落。）` 生成的回应 |
+| 不理会 | `ignored` | 无：没有 `fell_out`，没有事件 | 无 | 没有单独的话：这一轮照常运行 |
+| 过期 | 仍为 `pending`，读作已过期 | 无 | 无 | 无 |
+
+**这次洗澡。** `bathing_together`（和对方一起洗澡）是 `short` 类、不可抽取的插曲，从用户接受时起持续 30 分钟。
+开始时结束正在进行的插曲，在途的背景照常继续。它不作为事件讲述，因为她对“好”的回应已经说了；她和用户在一起，不算离线。
+期间它就是正在进行的插曲，所以不抽别的插曲；`正在经历` 和判官像读其他插曲一样读它。和所有事件一样，它以角色实例为单位。接受时不带图。
+
+一起洗澡不进她的世界故事：故事导演读的事件里没有任何 `bathing_together`，所以和浪漫选择一样，它的结果只留在对话里。
 
 ### 选择存在哪
 
-`engine.life_choices` 每次选择一行：`session_id`（非空，随 session 级联删除）、`kind`（`ask_for_space`、`sleep_together`、`propose` 或 `travel_together`）、
+`engine.life_choices` 每次选择一行：`session_id`（非空，随 session 级联删除）、`kind`（`ask_for_space`、`sleep_together`、`propose`、`travel_together` 或 `bathe_together`）、
 `status`（`pending`、`accepted`、`declined`、`ignored`）、`tier_gap`（提出时的档位差距；`ask_for_space` 有值，其他种类为 NULL）、
 `asked_at`、`resolved_at`、`message_id`（那条请求；消息没了就置为 NULL）和
-`event_id`（接受时写下的 `taking_space` 或 `traveling_together` 行，其他路径为 NULL；事件没了就置为 NULL）。过期和放缓的窗口都是推算出来的，不存。
+`event_id`（接受时写下的 `taking_space`、`traveling_together` 或 `bathing_together` 行，其他路径为 NULL；事件没了就置为 NULL）。过期和放缓的窗口都是推算出来的，不存。
 分开和不愉快那两行和其他事件一样在 `engine.persona_events` 里。
 
 ## 没有 LLM 判官时
