@@ -30,7 +30,6 @@ use crate::pipeline::handlers::recall_query_text;
 use crate::pipeline::proactive::{
     bare_final, greet, greet_stream, replay_frames, Greeting, Occasion,
 };
-use crate::routes::dto::{sse_response, wants_stream};
 use crate::prompt::{meta_str, persona_clock_tz, NowContext};
 use crate::routes::companion::{
     validate_llm_audit, validate_prompt_traits, LlmAuditDto, PromptTraitDto,
@@ -38,6 +37,7 @@ use crate::routes::companion::{
 use crate::routes::companion_stream::{
     resolve_text_turn, validate_tier, AffinityScopeDto, StreamPreErrorBody,
 };
+use crate::routes::dto::{sse_response, wants_stream};
 use crate::state::AppState;
 
 /// Same per-user in-flight cap as every other LLM entry point.
@@ -210,19 +210,21 @@ async fn open_session(
         return Ok(Json(open_at(&state, session_id, user_id, req, now).await?).into_response());
     }
     let tier = req.tier.clone();
-    Ok(match plan_open(&state, session_id, user_id, req, now).await? {
-        OpenPlan::Answer(Some(row)) => {
-            sse_response(futures_util::stream::iter(replay_frames(&row, None)))
-        }
-        OpenPlan::Answer(None) => sse_response(futures_util::stream::iter([bare_final(tier)])),
-        OpenPlan::Speak { guard, greeting } => sse_response(async_stream::stream! {
-            // Held while she speaks; a dropped connection drops it with the stream.
-            let _guard = guard;
-            for await frame in greet_stream(state, greeting, None) {
-                yield frame;
+    Ok(
+        match plan_open(&state, session_id, user_id, req, now).await? {
+            OpenPlan::Answer(Some(row)) => {
+                sse_response(futures_util::stream::iter(replay_frames(&row, None)))
             }
-        }),
-    })
+            OpenPlan::Answer(None) => sse_response(futures_util::stream::iter([bare_final(tier)])),
+            OpenPlan::Speak { guard, greeting } => sse_response(async_stream::stream! {
+                // Held while she speaks; a dropped connection drops it with the stream.
+                let _guard = guard;
+                for await frame in greet_stream(state, greeting, None) {
+                    yield frame;
+                }
+            }),
+        },
+    )
 }
 
 fn invalid_payload(message: String) -> AppError {
@@ -2402,7 +2404,10 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert!(content_type.starts_with("text/event-stream"), "{content_type}");
+        assert!(
+            content_type.starts_with("text/event-stream"),
+            "{content_type}"
+        );
         assert_eq!(
             frame_types(&frames),
             ["meta", "delta", "delta", "done", "final"]
@@ -2430,7 +2435,10 @@ mod tests {
         );
         let (status, content_type, frames) = send_sse(&mut app, req).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(content_type.starts_with("text/event-stream"), "{content_type}");
+        assert!(
+            content_type.starts_with("text/event-stream"),
+            "{content_type}"
+        );
         assert_eq!(frame_types(&frames), ["meta", "delta", "done", "final"]);
     }
 
@@ -2517,7 +2525,10 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert!(content_type.starts_with("text/event-stream"), "{content_type}");
+        assert!(
+            content_type.starts_with("text/event-stream"),
+            "{content_type}"
+        );
         assert_eq!(frame_types(&frames), ["final"]);
         assert_eq!(frames[0]["tier"], "plus");
     }

@@ -638,7 +638,10 @@ async fn store(
         }
         Occasion::LifeChoice(_) => {}
     }
-    metadata.insert("prompt_traits".into(), serde_json::json!(prep.injected_tags));
+    metadata.insert(
+        "prompt_traits".into(),
+        serde_json::json!(prep.injected_tags),
+    );
     metadata.insert(
         "memory_scope".into(),
         serde_json::to_value(g.memory_scope).expect("MemoryScope serializes"),

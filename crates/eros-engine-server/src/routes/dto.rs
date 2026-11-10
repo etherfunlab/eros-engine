@@ -164,7 +164,8 @@ pub(crate) fn sse_response(
     use axum::response::IntoResponse as _;
     use futures_util::StreamExt as _;
     Sse::new(frames.map(|frame| {
-        let json = serde_json::to_string(&frame).expect("ProtocolFrame serialization is infallible");
+        let json =
+            serde_json::to_string(&frame).expect("ProtocolFrame serialization is infallible");
         Ok::<_, std::convert::Infallible>(Event::default().data(json))
     }))
     .keep_alive(
@@ -228,10 +229,7 @@ mod stream_negotiation_tests {
             false
         ));
         assert!(!wants_stream(&accept(&["text/event-stream;q=0"]), false));
-        assert!(!wants_stream(
-            &accept(&["text/event-stream; q=0.0"]),
-            false
-        ));
+        assert!(!wants_stream(&accept(&["text/event-stream; q=0.0"]), false));
         assert!(!wants_stream(&accept(&["*/*"]), false));
         assert!(!wants_stream(&accept(&["application/json"]), false));
         // The two are OR-ed: a body `false` does not veto the header.

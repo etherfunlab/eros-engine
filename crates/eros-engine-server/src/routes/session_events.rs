@@ -30,7 +30,6 @@ use crate::pipeline::proactive::{
     bare_final, frame_message_id, greet, greet_stream, replay_frames, Greeting, Occasion,
 };
 use crate::pipeline::stream::ProtocolFrame;
-use crate::routes::dto::{sse_response, wants_stream};
 use crate::prompt::NowContext;
 use crate::routes::companion::{
     image_request_payload, validate_llm_audit, validate_prompt_traits, ImageRequestPayloadResponse,
@@ -40,6 +39,7 @@ use crate::routes::companion_stream::{
     resolve_text_turn, validate_image_params, validate_tier, validated_outfit, AffinityScopeDto,
     ImageReplyParams, StreamPreErrorBody,
 };
+use crate::routes::dto::{sse_response, wants_stream};
 use crate::routes::session_open::GreetingDto;
 use crate::state::AppState;
 use eros_engine_llm::model_config::StyleKey;
@@ -602,7 +602,10 @@ async fn draw_event(
     if wants_stream(&headers, req.stream) {
         return draw_event_stream_at(&state, session_id, user_id, req, Utc::now(), rolls).await;
     }
-    Ok(Json(draw_event_at(&state, session_id, user_id, req, Utc::now(), rolls).await?).into_response())
+    Ok(
+        Json(draw_event_at(&state, session_id, user_id, req, Utc::now(), rolls).await?)
+            .into_response(),
+    )
 }
 
 fn invalid_payload(message: String) -> AppError {
@@ -1149,7 +1152,11 @@ mod tests {
         assert_eq!(frame_types(&frames), ["event", "final"]);
         assert_eq!(frames[0]["event"]["kind"], "away_from_phone");
         assert!(frames[0]["event"]["message_id"].is_null());
-        assert_eq!(event_count(&pool, session_id).await, 1, "stored before the frame");
+        assert_eq!(
+            event_count(&pool, session_id).await,
+            1,
+            "stored before the frame"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
