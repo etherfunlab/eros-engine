@@ -4910,7 +4910,7 @@ mod tests {
         p.genome.art_metadata = serde_json::json!({
             "gender": "female", "health": "weak", "prefer_trip": true,
             "prefer_events": ["gaming", "reading"],
-            "is_virgin": true, "homesick": false, "sex_addict": true
+            "is_virgin": true, "homesick": false, "sex_addict": true, "alcoholic": true
         });
         assert_eq!(
             persona_traits(&p),
@@ -4925,7 +4925,10 @@ mod tests {
                 setting: Default::default(),
                 hygienic: None,
                 employed: Default::default(),
-                habits: Default::default(),
+                habits: eros_engine_core::needs::Habits {
+                    alcoholic: Some(true),
+                    ..Default::default()
+                },
             }
         );
         p.genome.art_metadata =

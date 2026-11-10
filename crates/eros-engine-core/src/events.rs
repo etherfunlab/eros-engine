@@ -598,14 +598,15 @@ pub struct PersonaTraits {
     /// Weighs only `mid` kinds; any other kind listed has no effect.
     pub prefer_events: Vec<EventKind>,
     /// `art_metadata.is_virgin`. Her virginity as the draw sees it is this
-    /// and no `having_sex` row ever (`DrawInput::ever_had_sex`); the first
-    /// row ends it with no write.
+    /// and no `having_sex` or `just_have_sex` row ever
+    /// (`DrawInput::ever_had_sex`); the first such row ends it with no write.
     pub is_virgin: bool,
     /// `art_metadata.homesick`: `true`, her home is her base; `false`, she
     /// roams; `None`, no preference. Steers where a trip goes (§5).
     pub homesick: Option<bool>,
-    /// `art_metadata.sex_addict`: `true` or `false` scales `sudden_desire`;
-    /// `None` leaves it be.
+    /// `art_metadata.sex_addict`: `true` or `false` scales `sudden_desire`,
+    /// `strip`, `streaking` and `just_have_sex`; `None` leaves them be. Only
+    /// `true` draws `having_sex` and `masturbating`.
     pub sex_addict: Option<bool>,
     /// `art_metadata.setting`: the kinds that do not fit her world are never
     /// drawn.
@@ -753,7 +754,7 @@ fn follow_factor(kind: EventKind, history: &[PastEvent], now: DateTime<Utc>) -> 
     FOLLOW_FACTOR.powi(live.len() as i32)
 }
 
-/// `UNLIKELY_FACTOR` for `having_sex` while she is a virgin, and for
+/// `UNLIKELY_FACTOR` for `having_sex` and `just_have_sex` while she is a virgin, and for
 /// `pregnancy_scare` while she has never had sex (spec §3, §4).
 fn prior_factor(kind: EventKind, persona: &PersonaTraits, ever_had_sex: bool) -> f64 {
     match kind {
@@ -779,8 +780,8 @@ fn homesick_factor(kind: EventKind, persona: &PersonaTraits) -> f64 {
     }
 }
 
-/// How `sex_addict` scales `sudden_desire`, `strip` and `streaking` within
-/// their category:
+/// How `sex_addict` scales `sudden_desire`, `strip`, `streaking` and
+/// `just_have_sex` within their category:
 /// three times or a third as likely. Their gates hold either way.
 fn sex_addict_factor(kind: EventKind, persona: &PersonaTraits) -> f64 {
     match (kind, persona.sex_addict) {
@@ -907,8 +908,8 @@ pub struct DrawInput<'a> {
     pub history: &'a [PastEvent],
     /// The kinds the caller allows.
     pub allowed: &'a [EventKind],
-    /// Whether the instance has a `having_sex` row, ever (not bounded by
-    /// `lookback()`).
+    /// Whether the instance has a `having_sex` or `just_have_sex` row, ever
+    /// (not bounded by `lookback()`).
     pub ever_had_sex: bool,
     /// Whether the session's scopes are romance-compatible
     /// (`scope::romance_compatible`): the gate on `strip`.
