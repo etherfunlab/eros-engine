@@ -497,6 +497,11 @@ Then:
 - **The user does not win a race.** An event does not yield to a user message that lands while
   it is generated: it happened whether or not the user spoke.
 
+- **Streamed, on request.** The route can answer as a server-sent event stream: the drawn
+  event first, then her message as it is generated. The event is still written with the
+  message, so the client keeps it only once the message's `done` arrives. See
+  [the API reference](api-reference.md#streaming-open-events-and-life-choices).
+
 ### While it lasts
 
 The events under way at a moment are the background and the incident whose
@@ -1016,6 +1021,10 @@ cost; a later ask needs the full trigger again.
 
 A resolution and an incoming user message race transactionally. The first writer wins and the
 loser writes nothing (the endpoint answers `409`).
+
+The endpoint can answer as a server-sent event stream: a `resolved` frame with the committed
+answer and the new affinity first, then her reply as it is generated. See
+[the API reference](api-reference.md#streaming-open-events-and-life-choices).
 
 ### The costs
 

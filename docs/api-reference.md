@@ -835,6 +835,105 @@ Requires `[tasks.chat_image_edit_compose]` **or** `[tasks.chat_image_prompt_comp
 with only the latter, edits run on the chat composer's chain using the engine's
 built-in edit prompt.
 
+### Streaming `/open`, `/events` and `/life-choices`
+
+The three routes below each generate one of her messages. By default they
+answer with one JSON body once the message is stored. Each can instead answer
+as a server-sent event stream, in the frames of
+[the chat stream](#post-compchatsession_idmessagestream), so her words arrive
+as they are generated and what is known before generation arrives first.
+
+**Asking for it.** Either is enough:
+
+- `"stream": true` in the request body, or
+- an `Accept` header that lists `text/event-stream` (`*/*` and a range with
+  `q=0` do not count).
+
+Everything a route refuses before generating (`400`, `403`, `404`, `409`,
+`422`, `429`) is still a plain HTTP status with its usual body. Past those
+checks the response is `200 text/event-stream`, and any later failure is a
+frame.
+
+**Frames.**
+
+| Route | Frames |
+|---|---|
+| `/open` | `meta` → `delta`… → `done` → `final`. When she does not speak first: `final` alone. |
+| `/events` | `event` → `meta` → `delta`… → `done` → `image_request`? → `final`. When nothing is drawn, or the event is one she does not tell: `event` → `final`. |
+| `/life-choices/{choice_id}` | `resolved` → `meta` → `delta`… → `done` → `final`. When she says nothing: `resolved` → `final`. |
+
+Any of these can end early in a terminal `error`.
+
+```text
+data: {"type":"event","event":{"kind":"weather_change","category":"mid","offline":false,"started_at":"2026-11-10T08:00:00Z","ends_at":"2026-11-10T12:00:00Z","message_id":"019a6c1e-7f3a-7c0e-9d51-2b8f4f0f6a11"}}
+
+data: {"type":"meta","message_id":"01KA...","action_type":"proactive"}
+
+data: {"type":"delta","message_id":"01KA...","content":"外面突然"}
+
+data: {"type":"delta","message_id":"01KA...","content":"下大雨了"}
+
+data: {"type":"done","message_id":"01KA...","truncated":false,"usage":null,"generation_id":"gen-abc","sent_at":"2026-11-10T08:00:04.512Z","occasion":"event"}
+
+data: {"type":"final","filtered":false,"prompt_injected":[],"tier":null,"retries_chat":0,"retries_filter":0}
+```
+
+- **`event`** (`/events`, always first): `event` is the response's `event`
+  object, or `null` when nothing was drawn. With a `message_id` it is the
+  event as drawn and **not stored yet**: it is stored together with her
+  message, so keep it only once the `done` for that message arrives, and
+  then move its start to `done.sent_at`, keeping its length. Without a
+  `message_id` (an event she does not tell) it is already stored. The
+  frame's `message_id` is the row's UUID; `meta.message_id` is the same id as
+  a ULID string.
+- **`resolved`** (`/life-choices`, always first): `status`, `affinity` and
+  `event` as in the JSON response (`event` omitted when the answer started
+  none), sent once the answer is committed. Nothing after it can undo it.
+- **`meta`**: `action_type` is `proactive`. `message_id` is the id the row
+  is stored under, so the streamed message can be matched against the same
+  row from history or a change feed. It is sent when her first text is ready,
+  so a blank reply has no `meta`.
+- **`done`**: sent after the row is stored. Besides the chat stream's
+  fields it carries `sent_at` (the row's) and `occasion` (as in the JSON
+  `greeting` / `message` object). `truncated` is always `false`.
+- **`image_request`**: on an event that carries her picture, after `done`,
+  as on a chat turn.
+- **`final`**: as on a chat turn; `retries_chat` is the index of the model
+  that served.
+- **`error`**: the chat stream's frame, plus one code of its own,
+  `superseded` (never retryable): she was speaking when something else
+  landed first (a newer message, another event, a concurrent call that won
+  the same key), and her message was not stored.
+
+**What exists.** Whatever way the stream ends, in `final`, in `error` or by
+the connection dropping:
+
+- A message exists once its `done` has arrived. Drop a `meta` whose `done`
+  never came.
+- On `/events`, an `event` that named a `message_id` exists once that `done`
+  has arrived; otherwise withdraw it. This covers a blank narration
+  (`event` → `final`) as well as an `error`.
+- On `/life-choices`, the answer in `resolved` stands whatever follows. An
+  `error` after it is always `retryable: false`: a second answer is `409`.
+
+To learn what did land after an `error` or a dropped connection, call
+`/open` or `/events` again with the same key: a key that holds a stored
+message replays it (below), and otherwise the call is a fresh one. For
+`/life-choices`, read the session's history.
+
+**Replays.** A key that already holds a message (`event_key`, `open_key`, or
+the day of a birthday or holiday greeting) streams the stored row and
+generates nothing: `meta`, one `delta` with the whole content, `done`,
+`image_request` if the row has a picture, `final`; on `/events` the `event`
+frame comes first and is the stored event.
+
+**Differences from the chat stream.** The generation runs inside the
+response: if the connection drops, generation stops and nothing is stored (on
+`/life-choices` the answer is already in; only her reply is lost). Once her
+text has started, no other model takes over: a failure mid-reply is an
+`error`. A reply the model cut short (`length`, `content_filter`) is stored
+as it is.
+
 ### `POST /v2/comp/session/{session_id}/open`
 
 Tell the engine the user just entered a session. The persona can speak first
@@ -904,7 +1003,9 @@ event's message (see the events route below) and `life_choice` on her ask for
 space or a romantic choice and on her answer to the user's reply (see the
 life-choice route below).
 
-- **Synchronous:** one non-streaming generation, a few seconds. Don't block UI on it.
+- **Synchronous:** one generation, a few seconds. Don't block UI on it. To
+  receive her words as they are generated, ask for the stream: see
+  [Streaming `/open`, `/events` and `/life-choices`](#streaming-open-events-and-life-choices).
 - **Idempotent:** per session and local date for a birthday or holiday
   greeting (the persona's date for a birthday, the user's for a holiday), per
   session and `open_key` for an occasion. Once a message is written, a
@@ -1205,6 +1306,8 @@ reply does not count. Her other sessions never carry it.
   in-flight cap. A BYOC instance's session is `400 byoc_unsupported`. A failed
   generation returns the upstream error the image endpoints return and
   persists nothing. A blank reply persists nothing and returns nulls.
+- **Streaming:** the event first, then her message as it is generated: see
+  [Streaming `/open`, `/events` and `/life-choices`](#streaming-open-events-and-life-choices).
 
 ### `GET /v2/comp/session/{session_id}/effects`
 
@@ -1352,6 +1455,9 @@ Errors. These refusals carry the pre-stream body `{code, message, user_message}`
 `422` for a `response` that is not `accept` or `decline`, or another malformed
 field; `429` at the per-user in-flight cap, taken before anything is written, so
 the choice stays open.
+
+Streaming: the committed answer first, then her reply as it is generated. See
+[Streaming `/open`, `/events` and `/life-choices`](#streaming-open-events-and-life-choices).
 
 ### `PUT /v2/comp/session/{session_id}/message/{message_id}/reaction`
 

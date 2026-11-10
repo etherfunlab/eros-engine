@@ -701,6 +701,77 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 需要 `[tasks.chat_image_edit_compose]` **或** `[tasks.chat_image_prompt_compose]`：
 只配后者时，编辑走聊天合成器的模型链，用引擎内置的编辑提示词。
 
+### `/open`、`/events`、`/life-choices` 的流式响应
+
+下面三个路由各生成一条她的消息。默认在消息落库后返回一个 JSON。它们也可以改用 server-sent event 流回答，
+帧与[聊天流](#post-compchatsession_idmessagestream)相同：她的话边生成边到，生成之前就已确定的内容最先到。
+
+**怎么要流。** 满足任一条即可：
+
+- 请求体里带 `"stream": true`；
+- `Accept` 请求头里列了 `text/event-stream`（`*/*` 和带 `q=0` 的不算）。
+
+路由在生成之前拒绝的请求（`400`、`403`、`404`、`409`、`422`、`429`）仍是普通的 HTTP 状态码和原来的响应体。
+过了这些检查，响应就是 `200 text/event-stream`，之后的失败都以帧的形式给出。
+
+**帧序。**
+
+| 路由 | 帧 |
+|---|---|
+| `/open` | `meta` → `delta`… → `done` → `final`。她不先开口时只有 `final`。 |
+| `/events` | `event` → `meta` → `delta`… → `done` → `image_request`? → `final`。什么都没抽到，或抽到的是她不讲的事件：`event` → `final`。 |
+| `/life-choices/{choice_id}` | `resolved` → `meta` → `delta`… → `done` → `final`。她什么都没说时：`resolved` → `final`。 |
+
+任何一种都可能提前以终止帧 `error` 结束。
+
+```text
+data: {"type":"event","event":{"kind":"weather_change","category":"mid","offline":false,"started_at":"2026-11-10T08:00:00Z","ends_at":"2026-11-10T12:00:00Z","message_id":"019a6c1e-7f3a-7c0e-9d51-2b8f4f0f6a11"}}
+
+data: {"type":"meta","message_id":"01KA...","action_type":"proactive"}
+
+data: {"type":"delta","message_id":"01KA...","content":"外面突然"}
+
+data: {"type":"delta","message_id":"01KA...","content":"下大雨了"}
+
+data: {"type":"done","message_id":"01KA...","truncated":false,"usage":null,"generation_id":"gen-abc","sent_at":"2026-11-10T08:00:04.512Z","occasion":"event"}
+
+data: {"type":"final","filtered":false,"prompt_injected":[],"tier":null,"retries_chat":0,"retries_filter":0}
+```
+
+- **`event`**（仅 `/events`，总是第一帧）：`event` 就是 JSON 响应里的 `event` 对象，什么都没抽到时为 `null`。
+  带 `message_id` 时，它是刚抽出的事件，**还没有落库**：事件和她的消息一起落库，所以要等到那条消息的 `done`
+  到了才能保留它，并把它的开始时间挪到 `done.sent_at`，时长不变。不带 `message_id`（她不讲的事件）时已经落库。
+  这一帧里的 `message_id` 是行的 UUID；`meta.message_id` 是同一个 id 的 ULID 字符串。
+- **`resolved`**（仅 `/life-choices`，总是第一帧）：`status`、`affinity`、`event` 与 JSON 响应相同
+  （这次回答没有开启事件时不带 `event`），在回答提交之后发出。之后发生的任何事都不会撤销它。
+- **`meta`**：`action_type` 为 `proactive`。`message_id` 就是这一行落库用的 id，
+  可以拿来和 history 或变更推送里的同一行对上。它在她的第一段文字就绪时才发，所以空回复没有 `meta`。
+- **`done`**：行落库之后才发。除聊天流的字段外，还带 `sent_at`（行的）和 `occasion`
+  （与 JSON 里 `greeting` / `message` 对象的相同）。`truncated` 恒为 `false`。
+- **`image_request`**：事件带她的照片时，在 `done` 之后，与聊天轮相同。
+- **`final`**：与聊天轮相同；`retries_chat` 是实际出字的那个模型在链上的序号。
+- **`error`**：聊天流的帧，另加一个专属的 code `superseded`（永不可重试）：她正说着，别的东西先落了库
+  （一条更新的消息、另一个事件、同一个 key 的并发调用），她这条消息没有保存。
+
+**什么算存在。** 不管流以哪种方式结束（`final`、`error`、连接断开）：
+
+- 一条消息要等它的 `done` 到了才算存在。`meta` 之后没等到 `done`，就丢掉这条。
+- `/events` 上，带 `message_id` 的 `event` 要等那个 `done` 到了才算存在，否则撤掉它。
+  空旁白（`event` → `final`）和 `error` 都是这种情况。
+- `/life-choices` 上，`resolved` 里的回答不管后面发生什么都成立。它之后的 `error` 恒为 `retryable: false`：
+  再答一次只会得到 `409`。
+
+在 `error` 或断线之后想知道到底落了什么：用同一个 key 再调一次 `/open` 或 `/events`，
+key 下已有消息就重放它（见下），否则就是一次新的调用。`/life-choices` 则读会话的 history。
+
+**重放。** key 下已经有消息时（`event_key`、`open_key`，或生日 / 节日开场白的那一天），流式响应重放已存的行，
+不再生成：`meta`、一个带全文的 `delta`、`done`、有照片时的 `image_request`、`final`；
+`/events` 上 `event` 帧在最前，内容是已存的事件。
+
+**与聊天流的不同。** 生成跑在响应里：连接断开，生成就停，什么都不保存（`/life-choices` 的回答已经提交，
+丢的只是她的回话）。她的文字一旦开始，就不会换别的模型接手：中途失败就是 `error`。
+被模型截断的回复（`length`、`content_filter`）按原样保存。
+
 ### `POST /v2/comp/session/{session_id}/open`
 
 告诉 engine 用户刚进入会话。角色先开口有三种来由：
@@ -746,7 +817,8 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 
 响应里的 `occasion` 取值为 `birthday`、`holiday`、`first_meet`、`returning`、`just_opened` 或 `check_in`。同样形状的消息在生活事件的消息上带 `event`（见下面的 events 路由），在她提出分开或浪漫选择的请求、以及对用户回答的回应上带 `life_choice`（见下面的生活选择路由）。
 
-- **同步：** 一次非流式生成，需要几秒，不要阻塞 UI。
+- **同步：** 一次生成，需要几秒，不要阻塞 UI。想让她的话边生成边到，就要流式响应：见
+  [`/open`、`/events`、`/life-choices` 的流式响应](#openeventslife-choices-的流式响应)。
 - **幂等：** 生日和节日开场白按会话加当地日期（生日用角色那边的日期，节日用用户那边的日期），场合按会话加 `open_key`。写入过之后，重复调用返回那一条，不会再生成；返回 `null` 的调用什么都没写，同一个 key 再调仍可能生成。
 - **竞态时用户优先：** 场合消息生成期间会话里只要落了生日、节日开场白以外的消息，就不写入，返回 `null`；如果落的是同一个 key 的并发调用写的开场白，就返回那一条。
 - **与普通回复一样落库：** 这条消息是一条普通的 assistant 行（`assistant_action_type = 'proactive'`，
@@ -956,6 +1028,8 @@ composer 失败时退回普通的人物肖像 prompt，跟聊天回合一样。�
   （`403`、`404`，语音或群会话 `409`），达到单用户并发上限 `429`。BYOC 实例的会话返回 `400 byoc_unsupported`。
   生成失败时返回与图片接口相同的上游错误，不写入任何内容。
   回复为空时不写入任何内容，返回空值。
+- **流式：** 先给事件，再边生成边给她的消息：见
+  [`/open`、`/events`、`/life-choices` 的流式响应](#openeventslife-choices-的流式响应)。
 
 ### `GET /v2/comp/session/{session_id}/effects`
 
@@ -1068,6 +1142,9 @@ engine 不接收也不保存用户的性别或性取向。
 | 409 | `life_choice_closed` | 选择已经结算（被这个路由，或被用户的消息），或已过期 |
 
 `response` 不是 `accept` 或 `decline`、或其他字段格式不对返回 `422`；达到单用户并发上限返回 `429`，这一步发生在写入任何东西之前，所以选择仍然开着。
+
+流式：先给已提交的回答，再边生成边给她的回话。见
+[`/open`、`/events`、`/life-choices` 的流式响应](#openeventslife-choices-的流式响应)。
 
 ### `PUT /v2/comp/session/{session_id}/message/{message_id}/reaction`
 
