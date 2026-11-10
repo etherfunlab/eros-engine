@@ -313,8 +313,8 @@ pub(crate) async fn open_at(
             session_id,
             user_id,
             instance_id,
-            persona: &persona,
-            now: &now_ctx,
+            persona,
+            now: now_ctx,
             occasion,
             recall_query,
             since,
@@ -328,6 +328,7 @@ pub(crate) async fn open_at(
                 .unwrap_or_default(),
             audit,
             metadata,
+            message_id: None,
         },
     )
     .await?;

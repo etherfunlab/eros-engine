@@ -385,12 +385,12 @@ fn event_cue(
 
 /// One proactive message to generate. `metadata` arrives holding the caller's
 /// audit copy of the request (the raw locale); `greet` adds the rest.
-pub(crate) struct Greeting<'a> {
+pub(crate) struct Greeting {
     pub session_id: Uuid,
     pub user_id: Uuid,
     pub instance_id: Uuid,
-    pub persona: &'a CompanionPersona,
-    pub now: &'a NowContext,
+    pub persona: CompanionPersona,
+    pub now: NowContext,
     pub occasion: Occasion,
     /// The memory-recall query: the holiday names, `生日` for a birthday, or
     /// the latest user row.
@@ -407,39 +407,50 @@ pub(crate) struct Greeting<'a> {
     pub affinity_scope: AffinityScope,
     pub audit: Option<LlmAudit>,
     pub metadata: serde_json::Map<String, serde_json::Value>,
+    /// The id a streamed message is stored under, when the caller has
+    /// already told the client (`/events`); `greet_stream` mints one
+    /// otherwise, and `greet` always does.
+    pub message_id: Option<Uuid>,
 }
 
-/// Generate and persist the message. `Ok(None)`: the model returned a blank
-/// reply and nothing was written; or, for a greeting or opener, the insert
-/// yielded to a message that landed first; or, for an event, another event
-/// under way for the persona blocked the insert, or a concurrent call with
-/// the same `event_key` won it (the caller reads the event by key); or, for
-/// the ask, the session already held a pending choice. When a
-/// concurrent call for the same local date or `open_key` won the insert,
-/// returns that call's row. An event is stamped with one instant taken after
-/// generation: its message's `sent_at`, its `started_at` and the start of its
-/// `ends_at` span.
-pub(crate) async fn greet(
-    state: &AppState,
-    g: Greeting<'_>,
-) -> Result<Option<ChatMessage>, AppError> {
+/// The request for her message, ready to send.
+struct Prepared {
+    chat_req: eros_engine_llm::openrouter::ChatRequest,
+    plan: ActionPlan,
+    injected_tags: Vec<String>,
+}
+
+/// What `store` wrote. `row` is `None` when the insert yielded: for a
+/// greeting or opener, to a message that landed first or a concurrent call
+/// for the same local date or `open_key`; for an event, to another event
+/// under way for the persona or a concurrent call with the same `event_key`;
+/// for the ask, to a pending choice the session already held.
+struct Stored {
+    row: Option<ChatMessage>,
+    /// Her picture's composed prompt and aspect ratio, on an event that
+    /// carries one.
+    picture: Option<(String, Option<String>)>,
+}
+
+/// Prompt assembly, up to the cue.
+async fn prepare(state: &AppState, g: &Greeting) -> Result<Prepared, AppError> {
     let mut affinity = AffinityRepo { pool: &state.pool }
         .load_or_create(g.session_id, g.user_id, g.instance_id)
         .await?;
     affinity.apply_time_decay();
     affinity.refresh_endpoints(&state.config.affinity_tuning);
     let rung = affinity.intimacy_rung();
-    let traits = crate::prompt::persona_traits(g.persona);
+    let traits = crate::prompt::persona_traits(&g.persona);
     let signals = compute_signals_for_session(&state.pool, g.session_id, &affinity, None).await?;
 
     // Prompt assembly only. The event's content is the memory-recall query;
     // the nil driving id makes history fall back to newest-N.
     let input = DecisionInput {
         event: Event::UserMessage {
-            content: g.recall_query,
+            content: g.recall_query.clone(),
             message_id: Uuid::nil(),
-            prompt_traits: g.prompt_traits,
-            audit: g.audit,
+            prompt_traits: g.prompt_traits.clone(),
+            audit: g.audit.clone(),
             tier: g.tier.clone(),
             memory_scope: g.memory_scope,
             affinity_scope: g.affinity_scope,
@@ -506,7 +517,7 @@ pub(crate) async fn greet(
         g.user_id,
         g.instance_id,
         Uuid::nil(),
-        g.now,
+        &g.now,
         false,
         None,
         None,
@@ -520,8 +531,214 @@ pub(crate) async fn greet(
             .cue(rung, &traits, g.persona.genome.tip_personality.as_deref()),
     });
 
-    let model_for_audit = chat_req.model.clone();
-    let resp = match state.openrouter.execute(chat_req).await {
+    Ok(Prepared {
+        chat_req,
+        plan,
+        injected_tags,
+    })
+}
+
+/// Persist `content` as her message under `id`, with everything that goes
+/// with it: an event's picture and its event row, the ask's choice row. An
+/// event is stamped with one instant taken here, after generation: its
+/// message's `sent_at`, its `started_at` and the start of its `ends_at` span.
+async fn store(
+    state: &AppState,
+    g: Greeting,
+    prep: &Prepared,
+    id: Uuid,
+    content: &str,
+    generation_id: Option<String>,
+    failures: &[AttemptFailure],
+) -> Result<Stored, AppError> {
+    let (llm_attempts, gateway_errors) = split_failures(failures);
+    let mut picture = None;
+    let mut metadata = g.metadata;
+    // Her picture is composed from what she just said (spec 2026-10-26-event-
+    // message-image-design.md §4): the recent scene ends with her message, and
+    // no user message asked for it. Fail-open, as on a chat turn.
+    if let Occasion::Event {
+        image: Some(image), ..
+    } = &g.occasion
+    {
+        let effects = load_effects(&state.pool, g.session_id, None)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(session_id = %g.session_id, "proactive message: lingering effects read failed: {e}");
+                Vec::new()
+            });
+        let body_state = crate::prompt::body_state(&effects);
+        let transcript = recent_transcript(&ChatRepo { pool: &state.pool }, g.session_id).await;
+        let her_line = format!("AI: {content}");
+        let scene = if transcript.is_empty() {
+            her_line
+        } else {
+            format!("{transcript}\n{her_line}")
+        };
+        let img = build_delegated_image_prompt_for(
+            state,
+            &g.persona,
+            &prep.plan,
+            Some(image),
+            &scene,
+            "",
+            g.user_id,
+            g.session_id,
+            body_state.as_deref(),
+            None,
+            "event",
+        )
+        .await;
+        metadata.insert(
+            "image".into(),
+            build_delegated_image_marker(
+                &img.subject,
+                img.caption.as_deref(),
+                img.aspect_ratio.as_deref(),
+                img.compose_variant.as_deref(),
+                img.compose_model.as_deref(),
+                img.compose_generation_id.as_deref(),
+                img.compose_event_id,
+                ImageRef::Face,
+                None,
+            ),
+        );
+        picture = Some((img.composed_prompt, img.aspect_ratio));
+    }
+
+    // An event is written when its message is, not when the request began.
+    let event_at = Utc::now();
+    metadata.insert("proactive".into(), g.occasion.name().into());
+    match &g.occasion {
+        Occasion::Holiday {
+            local_date,
+            holidays,
+        } => {
+            metadata.insert("local_date".into(), local_date.to_string().into());
+            metadata.insert("holidays".into(), serde_json::json!(holidays));
+        }
+        Occasion::Birthday { local_date } => {
+            metadata.insert("local_date".into(), local_date.to_string().into());
+        }
+        Occasion::Returning { open_key, gap_days } => {
+            metadata.insert("open_key".into(), open_key.as_str().into());
+            metadata.insert("gap_days".into(), (*gap_days).into());
+        }
+        Occasion::FirstMeet { open_key }
+        | Occasion::JustOpened { open_key }
+        | Occasion::CheckIn { open_key } => {
+            metadata.insert("open_key".into(), open_key.as_str().into());
+        }
+        Occasion::Event { outfit, .. } => {
+            if let Some(o) = outfit {
+                metadata.insert("outfit".into(), o.as_str().into());
+            }
+        }
+        Occasion::LifeChoice(_) => {}
+    }
+    metadata.insert("prompt_traits".into(), serde_json::json!(prep.injected_tags));
+    metadata.insert(
+        "memory_scope".into(),
+        serde_json::to_value(g.memory_scope).expect("MemoryScope serializes"),
+    );
+    metadata.insert(
+        "affinity_scope".into(),
+        serde_json::to_value(g.affinity_scope).expect("AffinityScope serializes"),
+    );
+    if let Some(t) = g.tier {
+        metadata.insert("tier".into(), t.into());
+    }
+
+    let chat_repo = ChatRepo { pool: &state.pool };
+    let row = ProactiveInsert {
+        id,
+        content: content.to_string(),
+        generation_id,
+        metadata: serde_json::Value::Object(metadata),
+        llm_attempts,
+        gateway_errors,
+    };
+    let written = match &g.occasion {
+        Occasion::Holiday { .. } | Occasion::Birthday { .. } => {
+            chat_repo
+                .insert_proactive_message(g.session_id, g.since, &row)
+                .await?
+        }
+        Occasion::FirstMeet { .. }
+        | Occasion::Returning { .. }
+        | Occasion::JustOpened { .. }
+        | Occasion::CheckIn { .. } => {
+            chat_repo
+                .insert_open_message(g.session_id, g.since, &row)
+                .await?
+        }
+        Occasion::Event {
+            event_key,
+            kind,
+            lasts,
+            ..
+        } => eros_engine_store::events::EventRepo { pool: &state.pool }
+            .insert(
+                &eros_engine_store::events::NewEvent {
+                    instance_id: g.instance_id,
+                    session_id: g.session_id,
+                    event_key,
+                    kind: *kind,
+                    started_at: event_at,
+                    ends_at: event_at + *lasts,
+                },
+                Some(&row),
+            )
+            .await?
+            .and_then(|i| i.message),
+        // The ask lands with its choice row, in one transaction; a pending
+        // choice already in the instance (a concurrent ask won) or a streak
+        // anchor that moved since the trigger read it leaves nothing.
+        Occasion::LifeChoice(LifeChoiceCue::Ask {
+            kind,
+            tier_gap,
+            anchor_seen,
+        }) => {
+            let asked = LifeChoiceRepo { pool: &state.pool }
+                .insert_ask(g.session_id, *kind, *tier_gap, *anchor_seen, &row)
+                .await?;
+            match asked {
+                Some(_) => {
+                    chat_repo
+                        .message_by_id_in_session(g.session_id, row.id)
+                        .await?
+                }
+                None => None,
+            }
+        }
+        // No key to dedupe on: the row yields only to a message that landed
+        // at or after `since`.
+        Occasion::LifeChoice(
+            LifeChoiceCue::Goodbye { .. }
+            | LifeChoiceCue::Hurt
+            | LifeChoiceCue::TravelAgreed { .. }
+            | LifeChoiceCue::Answered { .. },
+        ) => {
+            chat_repo
+                .insert_open_message(g.session_id, g.since, &row)
+                .await?
+        }
+    };
+    Ok(Stored {
+        row: written,
+        picture,
+    })
+}
+
+/// Generate and persist the message. `Ok(None)`: the model returned a blank
+/// reply and nothing was written, or the insert yielded (see [`Stored`]).
+/// When a concurrent call for the same local date or `open_key` won the
+/// insert, returns that call's row; for an event the caller reads the event
+/// by key.
+pub(crate) async fn greet(state: &AppState, g: Greeting) -> Result<Option<ChatMessage>, AppError> {
+    let prep = prepare(state, &g).await?;
+    let model_for_audit = prep.chat_req.model.clone();
+    let resp = match state.openrouter.execute(prep.chat_req.clone()).await {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(
@@ -565,182 +782,43 @@ pub(crate) async fn greet(
         );
         return Ok(None);
     }
-    let (llm_attempts, gateway_errors) = split_failures(&resp.failures);
 
-    let mut metadata = g.metadata;
-    // Her picture is composed from what she just said (spec 2026-10-26-event-
-    // message-image-design.md §4): the recent scene ends with her message, and
-    // no user message asked for it. Fail-open, as on a chat turn.
-    if let Occasion::Event {
-        image: Some(image), ..
-    } = &g.occasion
-    {
-        let effects = load_effects(&state.pool, g.session_id, None)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(session_id = %g.session_id, "proactive message: lingering effects read failed: {e}");
-                Vec::new()
-            });
-        let body_state = crate::prompt::body_state(&effects);
-        let transcript = recent_transcript(&ChatRepo { pool: &state.pool }, g.session_id).await;
-        let her_line = format!("AI: {content}");
-        let scene = if transcript.is_empty() {
-            her_line
-        } else {
-            format!("{transcript}\n{her_line}")
-        };
-        let img = build_delegated_image_prompt_for(
-            state,
-            g.persona,
-            &plan,
-            Some(image),
-            &scene,
-            "",
-            g.user_id,
-            g.session_id,
-            body_state.as_deref(),
-            None,
-            "event",
-        )
-        .await;
-        metadata.insert(
-            "image".into(),
-            build_delegated_image_marker(
-                &img.subject,
-                img.caption.as_deref(),
-                img.aspect_ratio.as_deref(),
-                img.compose_variant.as_deref(),
-                img.compose_model.as_deref(),
-                img.compose_generation_id.as_deref(),
-                img.compose_event_id,
-                ImageRef::Face,
-                None,
-            ),
-        );
+    // Where a concurrent winner's row is found when the insert yields.
+    enum Winner {
+        Date(String),
+        OpenKey(String),
+        Nowhere,
     }
-
-    // An event is written when its message is, not when the request began.
-    let event_at = Utc::now();
-    metadata.insert("proactive".into(), g.occasion.name().into());
-    match &g.occasion {
-        Occasion::Holiday {
-            local_date,
-            holidays,
-        } => {
-            metadata.insert("local_date".into(), local_date.to_string().into());
-            metadata.insert("holidays".into(), serde_json::json!(holidays));
+    let winner = match &g.occasion {
+        Occasion::Holiday { local_date, .. } | Occasion::Birthday { local_date } => {
+            Winner::Date(local_date.to_string())
         }
-        Occasion::Birthday { local_date } => {
-            metadata.insert("local_date".into(), local_date.to_string().into());
-        }
-        Occasion::Returning { open_key, gap_days } => {
-            metadata.insert("open_key".into(), open_key.as_str().into());
-            metadata.insert("gap_days".into(), (*gap_days).into());
-        }
-        Occasion::FirstMeet { open_key }
-        | Occasion::JustOpened { open_key }
-        | Occasion::CheckIn { open_key } => {
-            metadata.insert("open_key".into(), open_key.as_str().into());
-        }
-        Occasion::Event { outfit, .. } => {
-            if let Some(o) = outfit {
-                metadata.insert("outfit".into(), o.as_str().into());
-            }
-        }
-        Occasion::LifeChoice(_) => {}
-    }
-    metadata.insert("prompt_traits".into(), serde_json::json!(injected_tags));
-    metadata.insert(
-        "memory_scope".into(),
-        serde_json::to_value(g.memory_scope).expect("MemoryScope serializes"),
-    );
-    metadata.insert(
-        "affinity_scope".into(),
-        serde_json::to_value(g.affinity_scope).expect("AffinityScope serializes"),
-    );
-    if let Some(t) = g.tier {
-        metadata.insert("tier".into(), t.into());
-    }
-
-    let chat_repo = ChatRepo { pool: &state.pool };
-    let row = ProactiveInsert {
-        id: Ulid::new().into(),
-        content: content.to_string(),
-        generation_id,
-        metadata: serde_json::Value::Object(metadata),
-        llm_attempts,
-        gateway_errors,
-    };
-    match &g.occasion {
-        Occasion::Holiday { local_date, .. } | Occasion::Birthday { local_date } => match chat_repo
-            .insert_proactive_message(g.session_id, g.since, &row)
-            .await?
-        {
-            Some(written) => Ok(Some(written)),
-            None => Ok(chat_repo
-                .proactive_greeting_on(g.session_id, &local_date.to_string())
-                .await?),
-        },
         Occasion::FirstMeet { open_key }
         | Occasion::Returning { open_key, .. }
         | Occasion::JustOpened { open_key }
-        | Occasion::CheckIn { open_key } => {
-            match chat_repo
-                .insert_open_message(g.session_id, g.since, &row)
-                .await?
-            {
-                Some(written) => Ok(Some(written)),
-                None => Ok(chat_repo.open_message(g.session_id, open_key).await?),
-            }
-        }
-        Occasion::Event {
-            event_key,
-            kind,
-            lasts,
-            ..
-        } => Ok(eros_engine_store::events::EventRepo { pool: &state.pool }
-            .insert(
-                &eros_engine_store::events::NewEvent {
-                    instance_id: g.instance_id,
-                    session_id: g.session_id,
-                    event_key,
-                    kind: *kind,
-                    started_at: event_at,
-                    ends_at: event_at + *lasts,
-                },
-                Some(&row),
-            )
-            .await?
-            .and_then(|i| i.message)),
-        // The ask lands with its choice row, in one transaction; a pending
-        // choice already in the instance (a concurrent ask won) or a streak
-        // anchor that moved since the trigger read it leaves nothing.
-        Occasion::LifeChoice(LifeChoiceCue::Ask {
-            kind,
-            tier_gap,
-            anchor_seen,
-        }) => {
-            let asked = LifeChoiceRepo { pool: &state.pool }
-                .insert_ask(g.session_id, *kind, *tier_gap, *anchor_seen, &row)
-                .await?;
-            match asked {
-                Some(_) => Ok(chat_repo
-                    .message_by_id_in_session(g.session_id, row.id)
-                    .await?),
-                None => Ok(None),
-            }
-        }
-        // No key to dedupe on: the row yields only to a message that landed
-        // at or after `since`.
-        Occasion::LifeChoice(
-            LifeChoiceCue::Goodbye { .. }
-            | LifeChoiceCue::Hurt
-            | LifeChoiceCue::TravelAgreed { .. }
-            | LifeChoiceCue::Answered { .. },
-        ) => Ok(chat_repo
-            .insert_open_message(g.session_id, g.since, &row)
-            .await?),
+        | Occasion::CheckIn { open_key } => Winner::OpenKey(open_key.clone()),
+        Occasion::Event { .. } | Occasion::LifeChoice(_) => Winner::Nowhere,
+    };
+    let session_id = g.session_id;
+    let stored = store(
+        state,
+        g,
+        &prep,
+        Ulid::new().into(),
+        content,
+        generation_id,
+        &resp.failures,
+    )
+    .await?;
+    if stored.row.is_some() {
+        return Ok(stored.row);
     }
+    let chat_repo = ChatRepo { pool: &state.pool };
+    Ok(match winner {
+        Winner::Date(date) => chat_repo.proactive_greeting_on(session_id, &date).await?,
+        Winner::OpenKey(key) => chat_repo.open_message(session_id, &key).await?,
+        Winner::Nowhere => None,
+    })
 }
 
 #[cfg(test)]

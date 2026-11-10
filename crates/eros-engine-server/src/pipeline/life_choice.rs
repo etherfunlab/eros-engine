@@ -487,8 +487,8 @@ async fn ask(
             session_id,
             user_id,
             instance_id,
-            persona,
-            now: &NowContext::for_user(&locale, now),
+            persona: persona.clone(),
+            now: NowContext::for_user(&locale, now),
             occasion: Occasion::LifeChoice(cue),
             recall_query,
             since: now,
@@ -498,6 +498,7 @@ async fn ask(
             affinity_scope: Default::default(),
             audit: None,
             metadata,
+            message_id: None,
         },
     )
     .await?;

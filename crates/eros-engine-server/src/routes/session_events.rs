@@ -752,8 +752,8 @@ pub(crate) async fn draw_event_at(
             session_id,
             user_id,
             instance_id,
-            persona: &persona,
-            now: &now_ctx,
+            persona: persona.clone(),
+            now: now_ctx,
             occasion: Occasion::Event {
                 event_key: key.clone(),
                 kind: drawn.kind,
@@ -774,6 +774,7 @@ pub(crate) async fn draw_event_at(
                 .unwrap_or_default(),
             audit,
             metadata,
+            message_id: None,
         },
     )
     .await?;

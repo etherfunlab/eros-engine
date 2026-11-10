@@ -457,8 +457,8 @@ async fn say(
             session_id,
             user_id,
             instance_id,
-            persona,
-            now: &NowContext::for_user(&locale, now),
+            persona: persona.clone(),
+            now: NowContext::for_user(&locale, now),
             occasion: Occasion::LifeChoice(cue),
             recall_query,
             since: now,
@@ -472,6 +472,7 @@ async fn say(
                 .unwrap_or_default(),
             audit,
             metadata,
+            message_id: None,
         },
     )
     .await
