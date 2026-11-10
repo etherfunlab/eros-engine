@@ -34,6 +34,7 @@ use eros_engine_store::erasure::ErasureRepo;
 use eros_engine_store::human_fact::{HumanFactRepo, HumanFactRow};
 use eros_engine_store::human_insight::{HumanInsightRepo, HumanInsightsRow};
 use eros_engine_store::memory::{MemoryRepo, ProfileMemoryChange};
+use eros_engine_store::row_deletion::RowDeletionRepo;
 
 use crate::byok::constant_time_eq;
 use crate::error::AppError;
@@ -168,6 +169,12 @@ fn admit_facts(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
     )
 }
 
+/// Either read secret, each under its own header: the rows tombstones carry
+/// ids only. A header is never compared with the other sub-tree's secret.
+fn admit_either_read(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
+    admit(state, headers).or_else(|_| admit_facts(state, headers))
+}
+
 fn admit_erase(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
     admit_with(
         headers,
@@ -276,9 +283,9 @@ pub struct MemoryChangesQuery {
 
 /// Extracted profile-layer memories created since a keyset cursor, for a
 /// downstream service that builds on the facts the engine extracted about a
-/// user. Raw-turn rows and relationship-layer rows are not exported. The rows
-/// are insert-only; this feed carries no deletions, so a mirror drops a user's
-/// rows when `GET /svc/v1/insights/deletions` names the user.
+/// user. Raw-turn rows and relationship-layer rows are not exported. A row its
+/// owner deletes is named in `GET /svc/v1/rows/deletions`; a mirror drops a
+/// user's rows when `GET /svc/v1/insights/deletions` names the user.
 #[utoipa::path(
     get,
     path = "/svc/v1/memories/changes",
@@ -481,7 +488,8 @@ pub struct FactChangesQuery {
 /// Ledger facts first seen or seen again since a keyset cursor, for a
 /// downstream service that mirrors what was mined about each user. A repeat
 /// moves `last_seen_at`, so a row reappears in the stream each time its
-/// counters change. Rows leave the ledger only through erasure; see
+/// counters change. A row its owner deletes is named in
+/// `/svc/v1/rows/deletions`; a whole user's rows go with erasure, see
 /// `/svc/v1/facts/deletions`.
 #[utoipa::path(
     get,
@@ -629,6 +637,99 @@ pub fn facts_router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(facts_changes))
         .routes(routes!(facts_deletions))
+}
+
+/// One tombstone of `GET /svc/v1/rows/deletions`.
+#[derive(Serialize, ToSchema)]
+pub struct RowDeletionExportRow {
+    /// `memory` (a row `memories/changes` exported) or `fact` (a row
+    /// `facts/changes` exported). Skip a kind you do not know.
+    pub kind: String,
+    /// The id the deleted row had in its changes stream.
+    pub id: Uuid,
+    pub deleted_at: DateTime<Utc>,
+}
+
+/// Keyset position. Pass both fields back as `since` + `after_id`.
+#[derive(Serialize, ToSchema)]
+pub struct RowDeletionCursor {
+    pub deleted_at: DateTime<Utc>,
+    pub id: Uuid,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct RowDeletionsResponse {
+    pub deletions: Vec<RowDeletionExportRow>,
+    /// Present iff the page is full; `null` means the walk is complete.
+    pub next: Option<RowDeletionCursor>,
+}
+
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct RowDeletionsQuery {
+    /// RFC 3339. Default: Unix epoch (walk everything).
+    pub since: Option<DateTime<Utc>>,
+    /// Tie-break within `since`. Default: nil UUID. Pass `next.id`.
+    pub after_id: Option<Uuid>,
+    /// Default 500, clamped to 1..=1000.
+    pub limit: Option<i64>,
+}
+
+/// Single rows their owner deleted: an extracted profile memory or a ledger
+/// fact, ids only. A deleted id never reappears in a changes stream; the same
+/// statement extracted again later is a new row. User erasure is not reported
+/// here: see `/svc/v1/insights/deletions` (or `/svc/v1/facts/deletions`).
+/// `deleted_at` is the deleting transaction's start, so re-read with the same
+/// overlap the other streams advise. Opened by either read secret.
+#[utoipa::path(
+    get,
+    path = "/svc/v1/rows/deletions",
+    tag = "svc",
+    params(RowDeletionsQuery),
+    responses(
+        (status = 200, body = RowDeletionsResponse),
+        (status = 403, description = "neither read secret matched its header")
+    ),
+    security(("insights_export_secret" = []), ("facts_export_secret" = []))
+)]
+async fn rows_deletions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    q: Result<Query<RowDeletionsQuery>, QueryRejection>,
+) -> Result<Json<RowDeletionsResponse>, AppError> {
+    admit_either_read(&state, &headers)?;
+    let Query(q) = q.map_err(|e| AppError::BadRequest(e.body_text()))?;
+    let since = q.since.unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
+    let after_id = q.after_id.unwrap_or(Uuid::nil());
+    let limit = clamp_limit(q.limit);
+
+    let rows = RowDeletionRepo { pool: &state.pool }
+        .list_changes(since, after_id, limit)
+        .await?;
+    let next = if rows.len() as i64 == limit {
+        rows.last().map(|r| RowDeletionCursor {
+            deleted_at: r.deleted_at,
+            id: r.id,
+        })
+    } else {
+        None
+    };
+    Ok(Json(RowDeletionsResponse {
+        deletions: rows
+            .into_iter()
+            .map(|r| RowDeletionExportRow {
+                kind: r.kind,
+                id: r.id,
+                deleted_at: r.deleted_at,
+            })
+            .collect(),
+        next,
+    }))
+}
+
+/// Row-deletion stream: mounted when either read secret is set.
+pub fn rows_router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new().routes(routes!(rows_deletions))
 }
 
 /// User-erase sub-tree: mounted under `USER_ERASE_SECRET`.
@@ -1664,6 +1765,7 @@ mod tests {
             ("/svc/v1/facts/changes", "facts_export_secret"),
             ("/svc/v1/facts/deletions", "facts_export_secret"),
             ("/svc/v1/insights/deletions", "insights_export_secret"),
+            ("/svc/v1/rows/deletions", "insights_export_secret"),
         ] {
             let op = &api["paths"][path]["get"];
             assert!(op.is_object(), "{path}");
@@ -1689,5 +1791,160 @@ mod tests {
         assert_eq!(schemes["facts_export_secret"]["in"], "header");
         assert_eq!(schemes["user_erase_secret"]["name"], "x-user-erase-secret");
         assert_eq!(schemes["user_erase_secret"]["in"], "header");
+    }
+
+    // ── /svc/v1/rows/deletions (spec 2026-11-10-row-deletion §4.2) ──
+
+    async fn tombstone(pool: &sqlx::PgPool, kind: &str, at: chrono::DateTime<Utc>) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO engine.row_deletions (kind, id, deleted_at) VALUES ($1, $2, $3)")
+            .bind(kind)
+            .bind(id)
+            .bind(at)
+            .execute(pool)
+            .await
+            .unwrap();
+        id
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn rows_deletions_pages_by_deleted_at_then_id(pool: sqlx::PgPool) {
+        let t = Utc.with_ymd_and_hms(2026, 11, 10, 8, 0, 0).unwrap();
+        let mut early = [
+            tombstone(&pool, "fact", t).await,
+            tombstone(&pool, "memory", t).await,
+        ];
+        early.sort();
+        let late = tombstone(&pool, "fact", t + chrono::Duration::hours(1)).await;
+        let app = || app_with_secrets(pool.clone(), Some(SECRET), None, None);
+
+        let (status, body) = get(app(), "/svc/v1/rows/deletions?limit=2", Some(SECRET)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let ids: Vec<&str> = body["deletions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec![early[0].to_string(), early[1].to_string()]);
+        assert!(body["deletions"][0]["kind"].is_string());
+        assert!(body["deletions"][0]["deleted_at"].is_string());
+        let next = &body["next"];
+        assert_eq!(next["id"], early[1].to_string());
+
+        let uri = format!(
+            "/svc/v1/rows/deletions?limit=2&since={}&after_id={}",
+            next["deleted_at"]
+                .as_str()
+                .unwrap()
+                .replace(':', "%3A")
+                .replace('+', "%2B"),
+            next["id"].as_str().unwrap()
+        );
+        let (status, body) = get(app(), &uri, Some(SECRET)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["deletions"][0]["id"], late.to_string());
+        assert_eq!(body["deletions"].as_array().unwrap().len(), 1);
+        assert!(body["next"].is_null());
+    }
+
+    /// Either read secret opens the route; a header is only ever compared
+    /// with its own secret.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn rows_deletions_admits_either_read_secret(pool: sqlx::PgPool) {
+        let uri = "/svc/v1/rows/deletions";
+        let both = || app_with_secrets(pool.clone(), Some(SECRET), Some(FACTS_SECRET), None);
+        assert_eq!(
+            get_with(both(), uri, EXPORT_SECRET_HEADER, Some(SECRET))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            get_with(both(), uri, FACTS_SECRET_HEADER, Some(FACTS_SECRET))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            get_with(both(), uri, EXPORT_SECRET_HEADER, None).await.0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            get_with(both(), uri, EXPORT_SECRET_HEADER, Some(FACTS_SECRET))
+                .await
+                .0,
+            StatusCode::FORBIDDEN,
+            "the facts secret under the insights header"
+        );
+
+        let facts_only = || app_with_secrets(pool.clone(), None, Some(FACTS_SECRET), None);
+        assert_eq!(
+            get_with(facts_only(), uri, FACTS_SECRET_HEADER, Some(FACTS_SECRET))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            get_with(facts_only(), uri, EXPORT_SECRET_HEADER, Some(SECRET))
+                .await
+                .0,
+            StatusCode::FORBIDDEN,
+            "an unconfigured secret admits nothing"
+        );
+        let insights_only = || app_with_secrets(pool.clone(), Some(SECRET), None, None);
+        assert_eq!(
+            get_with(
+                insights_only(),
+                uri,
+                FACTS_SECRET_HEADER,
+                Some(FACTS_SECRET)
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+
+        // Admission before the query error.
+        assert_eq!(
+            get_with(
+                both(),
+                "/svc/v1/rows/deletions?limit=x",
+                EXPORT_SECRET_HEADER,
+                None
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            get_with(
+                both(),
+                "/svc/v1/rows/deletions?limit=x",
+                EXPORT_SECRET_HEADER,
+                Some(SECRET)
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn rows_deletions_is_unmounted_without_either_read_secret(pool: sqlx::PgPool) {
+        let (status, _) = get_with(
+            app_with_secrets(pool.clone(), None, None, Some(SECRET)),
+            "/svc/v1/rows/deletions",
+            EXPORT_SECRET_HEADER,
+            Some(SECRET),
+        )
+        .await;
+        let (unknown, _) = get(
+            app_with_secrets(pool, None, None, Some(SECRET)),
+            "/svc-does-not-exist/zzz",
+            Some(SECRET),
+        )
+        .await;
+        assert_eq!(status, unknown);
     }
 }

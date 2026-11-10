@@ -184,8 +184,10 @@ impl<'a> HumanInsightRepo<'a> {
     }
 
     /// `replace_profile` for a writer that holds the user's rebuild claim: the
-    /// profile is written only while `human_profile_state` still has a claimed
-    /// row for the user, and the write runs under that row's lock. The erase
+    /// profile is written only while `token` is still the claim on the user's
+    /// `human_profile_state` row, and the write runs under that row's lock. A
+    /// claim released by a deleted fact, or taken over as stale, refuses the
+    /// write. The erase
     /// deletes the state row before the profile, so with the lock it either
     /// waits for this write and then deletes the row written here, or has
     /// already removed the state row, in which case this write is refused
@@ -194,14 +196,16 @@ impl<'a> HumanInsightRepo<'a> {
     pub async fn replace_profile_if_claimed(
         &self,
         user_id: Uuid,
+        token: crate::profile_state::ClaimToken,
         c: &ProjectedColumns,
     ) -> Result<bool, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         let claimed: Option<Uuid> = sqlx::query_scalar(
             "SELECT user_id FROM engine.human_profile_state \
-             WHERE user_id = $1 AND claimed_at IS NOT NULL FOR UPDATE",
+             WHERE user_id = $1 AND claimed_at = $2 FOR UPDATE",
         )
         .bind(user_id)
+        .bind(token)
         .fetch_optional(&mut *tx)
         .await?;
         if claimed.is_none() {
@@ -262,6 +266,42 @@ impl<'a> HumanInsightRepo<'a> {
         .execute(self.pool)
         .await?;
         Ok(res.rows_affected() as usize)
+    }
+
+    /// Empty the user's existing profile for a rebuild that found the ledger
+    /// supports none: every field null or an empty array, `updated_at`
+    /// advanced so the change reaches `insights/changes`. Writes nothing for a
+    /// user with no profile row; never creates one. Guarded on `token` as
+    /// `replace_profile_if_claimed` is. Returns whether the claim held.
+    pub async fn clear_profile_if_claimed(
+        &self,
+        user_id: Uuid,
+        token: crate::profile_state::ClaimToken,
+    ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let claimed: Option<Uuid> = sqlx::query_scalar(
+            "SELECT user_id FROM engine.human_profile_state \
+             WHERE user_id = $1 AND claimed_at = $2 FOR UPDATE",
+        )
+        .bind(user_id)
+        .bind(token)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if claimed.is_none() {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let exists: Option<Uuid> = sqlx::query_scalar(
+            "SELECT user_id FROM engine.human_insights WHERE user_id = $1 FOR UPDATE",
+        )
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if exists.is_some() {
+            write_profile(&mut *tx, user_id, &ProjectedColumns::default()).await?;
+        }
+        tx.commit().await?;
+        Ok(true)
     }
 }
 
@@ -584,14 +624,14 @@ mod tests {
 
         // A state row nobody has claimed is not a rebuild in flight.
         assert!(!repo
-            .replace_profile_if_claimed(user_id, &cols)
+            .replace_profile_if_claimed(user_id, chrono::Utc::now(), &cols)
             .await
             .unwrap());
         assert!(repo.load(user_id).await.unwrap().is_none());
 
-        assert!(state.claim(user_id, stale).await.unwrap());
+        let token = state.claim(user_id, stale).await.unwrap().expect("claimed");
         assert!(repo
-            .replace_profile_if_claimed(user_id, &cols)
+            .replace_profile_if_claimed(user_id, token, &cols)
             .await
             .unwrap());
         assert_eq!(
@@ -617,7 +657,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!repo
-            .replace_profile_if_claimed(user_id, &cols)
+            .replace_profile_if_claimed(user_id, token, &cols)
             .await
             .unwrap());
         assert!(repo.load(user_id).await.unwrap().is_none());
@@ -632,10 +672,11 @@ mod tests {
         let user_id = Uuid::new_v4();
         let state = ProfileStateRepo { pool: &pool };
         state.bump(user_id, 1).await.unwrap();
-        assert!(state
+        let token = state
             .claim(user_id, std::time::Duration::from_secs(600))
             .await
-            .unwrap());
+            .unwrap()
+            .expect("claimed");
 
         let mut erase = pool.begin().await.unwrap();
         sqlx::query("DELETE FROM engine.human_profile_state WHERE user_id = $1")
@@ -649,7 +690,7 @@ mod tests {
             async move {
                 let cols = project_profile(&serde_json::json!({ "occupation": "设计师" }));
                 HumanInsightRepo { pool: &pool }
-                    .replace_profile_if_claimed(user_id, &cols)
+                    .replace_profile_if_claimed(user_id, token, &cols)
                     .await
             }
         });
@@ -905,5 +946,43 @@ mod tests {
         assert_eq!(r.ideology.as_deref(), Some("liberal"));
         assert_eq!(r.mental_health.as_deref(), Some("anxious"));
         assert_eq!(r.updated_at, t);
+    }
+
+    /// Only the worker holding the current claim writes (spec
+    /// 2026-11-10-row-deletion §5.2).
+    #[sqlx::test(migrations = "./migrations")]
+    async fn replace_profile_if_claimed_needs_the_current_token(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let states = crate::profile_state::ProfileStateRepo { pool: &pool };
+        states.bump(user_id, 1).await.unwrap();
+        let stale = states
+            .claim(user_id, std::time::Duration::from_secs(600))
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query("UPDATE engine.human_profile_state SET claimed_at = NULL WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let current = states
+            .claim(user_id, std::time::Duration::from_secs(600))
+            .await
+            .unwrap()
+            .unwrap();
+        let repo = HumanInsightRepo { pool: &pool };
+        let cols = ProjectedColumns {
+            occupation: Some("工程师".into()),
+            ..Default::default()
+        };
+        assert!(!repo
+            .replace_profile_if_claimed(user_id, stale, &cols)
+            .await
+            .unwrap());
+        assert!(repo.load(user_id).await.unwrap().is_none());
+        assert!(repo
+            .replace_profile_if_claimed(user_id, current, &cols)
+            .await
+            .unwrap());
     }
 }

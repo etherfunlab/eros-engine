@@ -25,6 +25,7 @@ pub use migrate::migrate;
 pub mod persona;
 pub mod pool;
 pub mod profile_state;
+pub mod row_deletion;
 pub mod scan_event;
 pub mod scan_state;
 pub mod session_archive;
@@ -1193,6 +1194,71 @@ mod migration_tests {
             norm(&pool, "用户很喜欢爬山").await,
             norm(&pool, "用户喜欢爬山").await
         );
+    }
+
+    /// 0084. The row tombstones (one per deleted row, ids only) and the
+    /// profile queue's due mark.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn migration_0084_shapes(pool: PgPool) {
+        let id = uuid::Uuid::new_v4();
+        let insert = |kind: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query("INSERT INTO engine.row_deletions (kind, id) VALUES ($1, $2)")
+                    .bind(kind)
+                    .bind(id)
+                    .execute(&pool)
+                    .await
+            }
+        };
+        insert("fact").await.expect("a fact tombstone");
+        insert("memory")
+            .await
+            .expect("the same id of another kind is its own row");
+        let dup = insert("fact").await;
+        assert!(
+            matches!(&dup, Err(sqlx::Error::Database(e)) if e.is_unique_violation()),
+            "one tombstone per (kind, id): {dup:?}"
+        );
+        let bad = insert("episode").await;
+        assert!(
+            matches!(&bad, Err(sqlx::Error::Database(e)) if e.is_check_violation()),
+            "kind is memory or fact: {bad:?}"
+        );
+        let stamped: bool = sqlx::query_scalar(
+            "SELECT deleted_at IS NOT NULL FROM engine.row_deletions WHERE kind = 'fact' AND id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(stamped);
+        let rls: bool = sqlx::query_scalar(
+            "SELECT relrowsecurity FROM pg_class WHERE oid = 'engine.row_deletions'::regclass",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(rls, "RLS must be enabled on engine.row_deletions");
+        let has_user_id: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+              WHERE table_schema = 'engine' AND table_name = 'row_deletions' \
+                AND column_name = 'user_id')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!has_user_id, "tombstones carry no external identity");
+
+        let user_id = uuid::Uuid::new_v4();
+        let due: bool = sqlx::query_scalar(
+            "INSERT INTO engine.human_profile_state (user_id) VALUES ($1) RETURNING rebuild_due",
+        )
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!due, "rebuild_due defaults to false");
     }
 
     /// 0079. Pins the three new tables, the dedup key's shape (roleplay is part

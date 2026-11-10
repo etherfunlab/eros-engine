@@ -15,7 +15,7 @@ use eros_engine_store::human_fact::{HumanFactRepo, HumanFactRow, Recurrence};
 use eros_engine_store::human_insight::{project_profile, HumanInsightRepo, ProjectedColumns};
 use eros_engine_store::insight::{InsightEventInsert, InsightEventRepo};
 use eros_engine_store::parse_error_payload;
-use eros_engine_store::profile_state::ProfileStateRepo;
+use eros_engine_store::profile_state::{ClaimToken, ProfileStateRepo};
 
 use crate::state::AppState;
 
@@ -114,18 +114,26 @@ pub(crate) fn render_ledger(rows: &[HumanFactRow], budget: usize) -> String {
 /// Rebuild one user's profile from their ledger and release their claim.
 ///
 /// The caller already holds the claim (`ProfileStateRepo::claim` /
-/// `claim_due`): claiming is what keeps two workers off the same user, and
-/// this function only settles the state row once it is done. A user erased
-/// while the rebuild ran has no claim left to settle, so nothing is written
-/// and the outcome is `Empty`.
-pub(crate) async fn rebuild_user(state: &AppState, user_id: Uuid) -> RebuildOutcome {
-    let Some(outcome) = rebuild(state, user_id).await else {
+/// `claim_due`) and passes its token: claiming is what keeps two workers off
+/// the same user, and this function only settles the state row once it is
+/// done. A rebuild whose token is no longer the claim (the user was erased, a
+/// fact was deleted, or a stale claim was taken over) writes and settles
+/// nothing, and the outcome is `Empty`.
+pub(crate) async fn rebuild_user(
+    state: &AppState,
+    user_id: Uuid,
+    token: ClaimToken,
+) -> RebuildOutcome {
+    let Some(outcome) = rebuild(state, user_id, token).await else {
         return RebuildOutcome::Empty;
     };
     let repo = ProfileStateRepo { pool: &state.pool };
+    if outcome == RebuildOutcome::Failed {
+        strike_out_clear(state, user_id, token).await;
+    }
     let released = match outcome {
-        RebuildOutcome::Failed => repo.finish_failed(user_id).await,
-        RebuildOutcome::Ok | RebuildOutcome::Empty => repo.finish_ok(user_id).await,
+        RebuildOutcome::Failed => repo.finish_failed(user_id, token).await,
+        RebuildOutcome::Ok | RebuildOutcome::Empty => repo.finish_ok(user_id, token).await,
     };
     // An unreleased claim is not lost work: it goes stale and is re-claimed.
     if let Err(e) = released {
@@ -134,10 +142,38 @@ pub(crate) async fn rebuild_user(state: &AppState, user_id: Uuid) -> RebuildOutc
     outcome
 }
 
+/// A rebuild owed to a deleted fact that is about to strike out (its last
+/// allowed failure) clears the profile, so the deleted fact does not stay in it
+/// until the next new fact (spec 2026-11-10-row-deletion §5.1). Any other
+/// failure keeps the profile. Fail-open: a read or clear error leaves the
+/// profile as it was.
+async fn strike_out_clear(state: &AppState, user_id: Uuid, token: ClaimToken) {
+    let striking = match (ProfileStateRepo { pool: &state.pool }).load(user_id).await {
+        Ok(Some(s)) => {
+            s.rebuild_due
+                && s.rebuild_failures + 1 >= eros_engine_store::profile_state::MAX_REBUILD_FAILURES
+        }
+        Ok(None) => false,
+        Err(e) => {
+            tracing::warn!(%user_id, "profile rebuild: reading the state row failed: {e}");
+            false
+        }
+    };
+    if !striking {
+        return;
+    }
+    if let Err(e) = (HumanInsightRepo { pool: &state.pool })
+        .clear_profile_if_claimed(user_id, token)
+        .await
+    {
+        tracing::warn!(%user_id, "profile rebuild: clearing a struck-out profile failed: {e}");
+    }
+}
+
 /// `None` when the claim was gone before the profile write (see
 /// `HumanInsightRepo::replace_profile_if_claimed`): the state row is then no
 /// longer this rebuild's to settle.
-async fn rebuild(state: &AppState, user_id: Uuid) -> Option<RebuildOutcome> {
+async fn rebuild(state: &AppState, user_id: Uuid, token: ClaimToken) -> Option<RebuildOutcome> {
     let rows = match (HumanFactRepo { pool: &state.pool })
         .list_for_user(user_id)
         .await
@@ -150,8 +186,9 @@ async fn rebuild(state: &AppState, user_id: Uuid) -> Option<RebuildOutcome> {
     };
     // Without facts there is nothing to ask the model, and the counter that
     // brought the user here would otherwise trigger the same empty rebuild again.
+    // A profile the ledger no longer supports is cleared.
     if rows.is_empty() {
-        return Some(RebuildOutcome::Empty);
+        return clear(state, user_id, token).await;
     }
     // A ledger of nothing but transient facts that never recurred across
     // sessions supports no field (the prompt's transient rule), so the correct
@@ -160,7 +197,7 @@ async fn rebuild(state: &AppState, user_id: Uuid) -> Option<RebuildOutcome> {
         r.persistence != "transient" || r.recurrence() == Recurrence::RepeatedAcrossSessions
     });
     if !usable {
-        return Some(RebuildOutcome::Empty);
+        return clear(state, user_id, token).await;
     }
 
     let resolved = state.model_config.resolve_profile_rebuild();
@@ -251,10 +288,10 @@ async fn rebuild(state: &AppState, user_id: Uuid) -> Option<RebuildOutcome> {
     // fresh count.
     if columns.is_empty() {
         write_profile_event(&state.pool, user_id, "empty", Some(profile), generation_id).await;
-        return Some(RebuildOutcome::Empty);
+        return clear(state, user_id, token).await;
     }
     match (HumanInsightRepo { pool: &state.pool })
-        .replace_profile_if_claimed(user_id, &columns)
+        .replace_profile_if_claimed(user_id, token, &columns)
         .await
     {
         Ok(true) => {}
@@ -272,6 +309,24 @@ async fn rebuild(state: &AppState, user_id: Uuid) -> Option<RebuildOutcome> {
     }
     write_profile_event(&state.pool, user_id, "ok", Some(profile), generation_id).await;
     Some(RebuildOutcome::Ok)
+}
+
+/// The `Empty` outcome of a ledger that supports no profile: an existing
+/// profile is emptied (spec 2026-11-10-row-deletion-and-deletion-stream-
+/// design.md §5.4), so a deleted fact never outlives its rebuild. `None` when
+/// the claim was gone, as for the profile write.
+async fn clear(state: &AppState, user_id: Uuid, token: ClaimToken) -> Option<RebuildOutcome> {
+    match (HumanInsightRepo { pool: &state.pool })
+        .clear_profile_if_claimed(user_id, token)
+        .await
+    {
+        Ok(true) => Some(RebuildOutcome::Empty),
+        Ok(false) => None,
+        Err(e) => {
+            tracing::warn!(%user_id, "profile rebuild: clearing the profile failed: {e}");
+            Some(RebuildOutcome::Failed)
+        }
+    }
 }
 
 /// Append one `profile`-stage audit row. The rebuild belongs to the user, not
@@ -348,13 +403,13 @@ pub async fn sweeper(state: AppState) {
 /// refreshed just before its rebuild. A user whose claim cannot be refreshed
 /// is skipped: the state row is gone (erased) or the claim was released, and
 /// either way no model call should be spent on it.
-async fn rebuild_claimed(state: &AppState, claimed: &[Uuid]) -> (u32, u32, u32, u32) {
+async fn rebuild_claimed(state: &AppState, claimed: &[(Uuid, ClaimToken)]) -> (u32, u32, u32, u32) {
     let repo = ProfileStateRepo { pool: &state.pool };
     let (mut ok, mut empty, mut failed, mut skipped) = (0, 0, 0, 0);
-    for user_id in claimed {
-        match repo.refresh_claim(*user_id).await {
-            Ok(true) => {}
-            Ok(false) => {
+    for (user_id, token) in claimed {
+        let token = match repo.refresh_claim(*user_id, *token).await {
+            Ok(Some(token)) => token,
+            Ok(None) => {
                 skipped += 1;
                 continue;
             }
@@ -364,8 +419,8 @@ async fn rebuild_claimed(state: &AppState, claimed: &[Uuid]) -> (u32, u32, u32, 
                 skipped += 1;
                 continue;
             }
-        }
-        match rebuild_user(state, *user_id).await {
+        };
+        match rebuild_user(state, *user_id, token).await {
             RebuildOutcome::Ok => ok += 1,
             RebuildOutcome::Empty => empty += 1,
             RebuildOutcome::Failed => failed += 1,
@@ -574,14 +629,26 @@ mod tests {
         (state, mock)
     }
 
-    /// The state a rebuild starts from: one pending fact, claimed.
-    async fn seed_claim(pool: &PgPool, user_id: Uuid) {
+    /// The state a rebuild starts from: one pending fact, claimed. Returns the
+    /// claim's token.
+    async fn seed_claim(pool: &PgPool, user_id: Uuid) -> ClaimToken {
         let state_repo = ProfileStateRepo { pool };
         state_repo.bump(user_id, 1).await.unwrap();
-        assert!(state_repo
+        state_repo
             .claim(user_id, Duration::from_secs(600))
             .await
-            .unwrap());
+            .unwrap()
+            .expect("claimed")
+    }
+
+    /// The user's current claim token.
+    async fn token_of(pool: &PgPool, user_id: Uuid) -> ClaimToken {
+        ProfileStateRepo { pool }
+            .load(user_id)
+            .await
+            .unwrap()
+            .and_then(|s| s.claimed_at)
+            .expect("a claim")
     }
 
     async fn count(pool: &PgPool, sql: &str, user_id: Uuid) -> i64 {
@@ -613,9 +680,17 @@ mod tests {
         let user = Uuid::new_v4();
         let state_repo = ProfileStateRepo { pool: &pool };
         state_repo.bump(user, 20).await.unwrap();
+        state_repo
+            .claim(user, Duration::from_secs(600))
+            .await
+            .unwrap()
+            .expect("claimed");
 
         let state = crate::routes::companion::test_state(pool.clone());
-        assert_eq!(rebuild_user(&state, user).await, RebuildOutcome::Empty);
+        assert_eq!(
+            rebuild_user(&state, user, token_of(&state.pool, user).await).await,
+            RebuildOutcome::Empty
+        );
 
         let s = state_repo.load(user).await.unwrap().unwrap();
         assert_eq!((s.pending_facts, s.claimed_at), (0, None));
@@ -673,7 +748,10 @@ mod tests {
 
         let reply = serde_json::json!({"occupation": "后端工程师"});
         let (state, mock) = state_replying(pool.clone(), &reply.to_string()).await;
-        assert_eq!(rebuild_user(&state, user).await, RebuildOutcome::Ok);
+        assert_eq!(
+            rebuild_user(&state, user, token_of(&state.pool, user).await).await,
+            RebuildOutcome::Ok
+        );
 
         let sent = mock.received_requests().await.unwrap();
         let body: serde_json::Value = sent[0].body_json().unwrap();
@@ -708,13 +786,13 @@ mod tests {
     async fn rebuild_user_unparseable_reply_fails_and_audits_parse_error(pool: PgPool) {
         let user = Uuid::new_v4();
         seed_fact(&pool, user, "是后端工程师", "career").await;
-        ProfileStateRepo { pool: &pool }
-            .bump(user, 1)
-            .await
-            .unwrap();
+        seed_claim(&pool, user).await;
 
         let (state, _mock) = state_replying(pool.clone(), "抱歉，我无法完成这个请求。").await;
-        assert_eq!(rebuild_user(&state, user).await, RebuildOutcome::Failed);
+        assert_eq!(
+            rebuild_user(&state, user, token_of(&state.pool, user).await).await,
+            RebuildOutcome::Failed
+        );
 
         let status: String = sqlx::query_scalar(
             "SELECT status FROM engine.human_insights_events \
@@ -748,13 +826,13 @@ mod tests {
     async fn rebuild_user_reply_with_no_supported_field_is_empty_and_zeroes_counter(pool: PgPool) {
         let user = Uuid::new_v4();
         seed_fact(&pool, user, "今天心情一般", "lifestyle").await;
-        ProfileStateRepo { pool: &pool }
-            .bump(user, 1)
-            .await
-            .unwrap();
+        seed_claim(&pool, user).await;
 
         let (state, _mock) = state_replying(pool.clone(), "{}").await;
-        assert_eq!(rebuild_user(&state, user).await, RebuildOutcome::Empty);
+        assert_eq!(
+            rebuild_user(&state, user, token_of(&state.pool, user).await).await,
+            RebuildOutcome::Empty
+        );
 
         let status: String = sqlx::query_scalar(
             "SELECT status FROM engine.human_insights_events \
@@ -804,7 +882,10 @@ mod tests {
             .mount(&mock)
             .await;
         let state = state_pointing_at(pool.clone(), &mock);
-        assert_eq!(rebuild_user(&state, user).await, RebuildOutcome::Empty);
+        assert_eq!(
+            rebuild_user(&state, user, token_of(&state.pool, user).await).await,
+            RebuildOutcome::Empty
+        );
 
         let s = ProfileStateRepo { pool: &pool }
             .load(user)
@@ -857,7 +938,10 @@ mod tests {
         seed_claim(&pool, user).await;
 
         let (state, mock) = state_replying(pool.clone(), "{}").await;
-        assert_eq!(rebuild_user(&state, user).await, RebuildOutcome::Empty);
+        assert_eq!(
+            rebuild_user(&state, user, token_of(&state.pool, user).await).await,
+            RebuildOutcome::Empty
+        );
         assert_eq!(mock.received_requests().await.unwrap().len(), 1);
     }
 
@@ -883,7 +967,10 @@ mod tests {
             "mental_health": "焦虑",
         });
         let (state, _mock) = state_replying(pool.clone(), &reply.to_string()).await;
-        assert_eq!(rebuild_user(&state, user).await, RebuildOutcome::Ok);
+        assert_eq!(
+            rebuild_user(&state, user, token_of(&state.pool, user).await).await,
+            RebuildOutcome::Ok
+        );
 
         let (occupation, kinks, mental_health): (Option<String>, Vec<String>, Option<String>) =
             sqlx::query_as(
@@ -924,7 +1011,10 @@ mod tests {
 
         for user in [without, with] {
             seed_claim(&pool, user).await;
-            assert_eq!(rebuild_user(&state, user).await, RebuildOutcome::Ok);
+            assert_eq!(
+                rebuild_user(&state, user, token_of(&state.pool, user).await).await,
+                RebuildOutcome::Ok
+            );
         }
         const MH: &str = "SELECT mental_health FROM engine.human_insights WHERE user_id = $1";
         let dropped: Option<String> = sqlx::query_scalar(MH)
@@ -964,7 +1054,10 @@ mod tests {
             .mount(&mock)
             .await;
         let state = state_pointing_at(pool.clone(), &mock);
-        assert_eq!(rebuild_user(&state, user).await, RebuildOutcome::Failed);
+        assert_eq!(
+            rebuild_user(&state, user, token_of(&state.pool, user).await).await,
+            RebuildOutcome::Failed
+        );
 
         let (status, payload): (String, serde_json::Value) = sqlx::query_as(
             "SELECT status, payload FROM engine.human_insights_events \
@@ -998,7 +1091,7 @@ mod tests {
                 .await;
         let rebuild = tokio::spawn({
             let state = state.clone();
-            async move { rebuild_user(&state, user).await }
+            async move { rebuild_user(&state, user, token_of(&state.pool, user).await).await }
         });
         // The erase lands after the model call left and before its reply does.
         while mock.received_requests().await.unwrap().is_empty() {
@@ -1038,9 +1131,10 @@ mod tests {
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn rebuild_claimed_skips_users_whose_claim_is_gone(pool: PgPool) {
         let (kept, erased) = (Uuid::new_v4(), Uuid::new_v4());
-        for user in [kept, erased] {
+        let mut claimed = Vec::new();
+        for user in [erased, kept] {
             seed_fact(&pool, user, "是后端工程师", "career").await;
-            seed_claim(&pool, user).await;
+            claimed.push((user, seed_claim(&pool, user).await));
         }
         ErasureRepo { pool: &pool }
             .erase_user(erased)
@@ -1051,12 +1145,277 @@ mod tests {
         let reply = serde_json::json!({"occupation": "后端工程师"});
         let (state, _mock) = state_replying(pool.clone(), &reply.to_string()).await;
         assert_eq!(
-            rebuild_claimed(&state, &[erased, kept]).await,
+            rebuild_claimed(&state, &claimed).await,
             (1, 0, 0, 1),
             "(ok, empty, failed, skipped)"
         );
         let profiles = "SELECT count(*) FROM engine.human_insights WHERE user_id = $1";
         assert_eq!(count(&pool, profiles, kept).await, 1);
         assert_eq!(count(&pool, profiles, erased).await, 0);
+    }
+
+    /// A rebuild whose claim was released and taken again while its model
+    /// call was out writes nothing and settles nothing: the newer claim owns
+    /// the user (spec 2026-11-10-row-deletion §5.2).
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_rebuild_outliving_its_claim_writes_and_settles_nothing(pool: PgPool) {
+        let user = Uuid::new_v4();
+        seed_fact(&pool, user, "是后端工程师", "career").await;
+        let first = seed_claim(&pool, user).await;
+
+        let reply = serde_json::json!({"occupation": "后端工程师"});
+        let (state, mock) =
+            state_replying_after(pool.clone(), &reply.to_string(), Duration::from_millis(600))
+                .await;
+        let rebuild = tokio::spawn({
+            let state = state.clone();
+            async move { rebuild_user(&state, user, first).await }
+        });
+        while mock.received_requests().await.unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // While the reply is out: the claim is released (as a deleted fact
+        // does) and another worker takes it.
+        sqlx::query(
+            "UPDATE engine.human_profile_state \
+                SET claimed_at = NULL, pending_facts = pending_facts + 1 \
+              WHERE user_id = $1",
+        )
+        .bind(user)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let second = ProfileStateRepo { pool: &pool }
+            .claim(user, Duration::from_secs(600))
+            .await
+            .unwrap()
+            .expect("re-claimed");
+
+        assert_eq!(rebuild.await.unwrap(), RebuildOutcome::Empty);
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT count(*) FROM engine.human_insights WHERE user_id = $1",
+                user
+            )
+            .await,
+            0,
+            "the stale rebuild wrote no profile"
+        );
+        let s = ProfileStateRepo { pool: &pool }
+            .load(user)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.claimed_at, Some(second), "the newer claim stands");
+        assert_eq!(s.pending_facts, 2, "and its count was not zeroed");
+        assert!(s.last_rebuilt_at.is_none());
+    }
+
+    // ── A ledger that supports no profile clears it (spec 2026-11-10-row-
+    //    deletion §5.4) ──
+
+    /// A profile written a day ago, with one field set.
+    async fn seed_profile(pool: &PgPool, user_id: Uuid) {
+        eros_engine_store::human_insight::HumanInsightRepo { pool }
+            .replace_profile(
+                user_id,
+                &crate::pipeline::profile_rebuild::project_profile(
+                    &serde_json::json!({"occupation": "后端工程师", "interests": ["爬山"]}),
+                ),
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE engine.human_insights SET updated_at = now() - interval '1 day' \
+             WHERE user_id = $1",
+        )
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// (occupation, interests, updated within the last minute).
+    async fn profile_now(pool: &PgPool, user_id: Uuid) -> (Option<String>, Vec<String>, bool) {
+        sqlx::query_as(
+            "SELECT occupation, interests, updated_at > now() - interval '1 minute' \
+             FROM engine.human_insights WHERE user_id = $1",
+        )
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_emptied_ledger_clears_the_profile(pool: PgPool) {
+        let user = Uuid::new_v4();
+        seed_profile(&pool, user).await;
+        let token = seed_claim(&pool, user).await;
+        let state = crate::routes::companion::test_state(pool.clone());
+
+        assert_eq!(
+            rebuild_user(&state, user, token).await,
+            RebuildOutcome::Empty
+        );
+        assert_eq!(profile_now(&pool, user).await, (None, vec![], true));
+        let s = ProfileStateRepo { pool: &pool }
+            .load(user)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((s.pending_facts, s.claimed_at), (0, None));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_transient_only_ledger_clears_the_profile(pool: PgPool) {
+        let user = Uuid::new_v4();
+        seed_profile(&pool, user).await;
+        seed_fact_as(
+            &pool,
+            user,
+            "今天有点累",
+            "lifestyle",
+            "explicit_self_report",
+            "transient",
+        )
+        .await;
+        let token = seed_claim(&pool, user).await;
+        let state = crate::routes::companion::test_state(pool.clone());
+
+        assert_eq!(
+            rebuild_user(&state, user, token).await,
+            RebuildOutcome::Empty
+        );
+        assert_eq!(profile_now(&pool, user).await, (None, vec![], true));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_empty_projection_clears_the_profile(pool: PgPool) {
+        let user = Uuid::new_v4();
+        seed_profile(&pool, user).await;
+        seed_fact(&pool, user, "今天心情一般", "lifestyle").await;
+        let token = seed_claim(&pool, user).await;
+        let (state, _mock) = state_replying(pool.clone(), "{}").await;
+
+        assert_eq!(
+            rebuild_user(&state, user, token).await,
+            RebuildOutcome::Empty
+        );
+        assert_eq!(profile_now(&pool, user).await, (None, vec![], true));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn clearing_never_creates_a_profile(pool: PgPool) {
+        let user = Uuid::new_v4();
+        let token = seed_claim(&pool, user).await;
+        let state = crate::routes::companion::test_state(pool.clone());
+
+        assert_eq!(
+            rebuild_user(&state, user, token).await,
+            RebuildOutcome::Empty
+        );
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT count(*) FROM engine.human_insights WHERE user_id = $1",
+                user
+            )
+            .await,
+            0
+        );
+    }
+
+    /// A failed call or an unreadable reply says nothing about the ledger:
+    /// the profile stays.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_failed_or_unreadable_reply_keeps_the_profile(pool: PgPool) {
+        let user = Uuid::new_v4();
+        seed_profile(&pool, user).await;
+        seed_fact(&pool, user, "是后端工程师", "career").await;
+
+        let token = seed_claim(&pool, user).await;
+        let (state, _mock) = state_replying(pool.clone(), "抱歉，我无法完成这个请求。").await;
+        assert_eq!(
+            rebuild_user(&state, user, token).await,
+            RebuildOutcome::Failed
+        );
+        assert_eq!(
+            profile_now(&pool, user).await,
+            (Some("后端工程师".into()), vec!["爬山".into()], false)
+        );
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+        let state = state_pointing_at(pool.clone(), &mock);
+        let token = ProfileStateRepo { pool: &pool }
+            .claim(user, Duration::ZERO)
+            .await
+            .unwrap()
+            .expect("claimed");
+        assert_eq!(
+            rebuild_user(&state, user, token).await,
+            RebuildOutcome::Failed
+        );
+        assert_eq!(
+            profile_now(&pool, user).await,
+            (Some("后端工程师".into()), vec!["爬山".into()], false)
+        );
+    }
+
+    /// The model refused for good: a rebuild owed to a deleted fact that
+    /// strikes out clears the profile rather than leave the fact in it; any
+    /// other strike-out keeps the profile, as before.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_due_rebuild_that_strikes_out_clears_the_profile(pool: PgPool) {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+        let state = state_pointing_at(pool.clone(), &mock);
+        let strike = eros_engine_store::profile_state::MAX_REBUILD_FAILURES - 1;
+        let (due, plain) = (Uuid::new_v4(), Uuid::new_v4());
+        for user in [due, plain] {
+            seed_profile(&pool, user).await;
+            seed_fact(&pool, user, "是后端工程师", "career").await;
+            sqlx::query(
+                "INSERT INTO engine.human_profile_state \
+                    (user_id, pending_facts, last_fact_at, rebuild_failures, rebuild_due) \
+                 VALUES ($1, 1, now(), $2, $3)",
+            )
+            .bind(user)
+            .bind(strike)
+            .bind(user == due)
+            .execute(&pool)
+            .await
+            .unwrap();
+            let token = ProfileStateRepo { pool: &pool }
+                .claim(user, Duration::from_secs(600))
+                .await
+                .unwrap()
+                .expect("claimed");
+            assert_eq!(
+                rebuild_user(&state, user, token).await,
+                RebuildOutcome::Failed
+            );
+            let s = ProfileStateRepo { pool: &pool }
+                .load(user)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!((s.pending_facts, s.rebuild_due), (0, false), "struck out");
+        }
+        assert_eq!(profile_now(&pool, due).await, (None, vec![], true));
+        assert_eq!(
+            profile_now(&pool, plain).await,
+            (Some("后端工程师".into()), vec!["爬山".into()], false)
+        );
     }
 }

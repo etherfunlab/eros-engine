@@ -38,6 +38,7 @@ pub mod session_effects;
 pub mod session_events;
 pub mod session_open;
 pub mod svc;
+pub mod user_rows;
 pub mod voice;
 pub mod world_town;
 
@@ -67,6 +68,7 @@ pub fn router(state: AppState) -> OpenApiRouter<AppState> {
         .merge(life_choices::router())
         .merge(reaction::router())
         .merge(group::router())
+        .merge(user_rows::router())
         .layer(from_fn_with_state(state.clone(), require_auth))
         .layer(from_fn_with_state(state.clone(), require_caller_secret));
 
@@ -85,6 +87,10 @@ pub fn router(state: AppState) -> OpenApiRouter<AppState> {
     }
     if state.config.user_erase.secret.is_some() {
         app = app.merge(svc::erase_router());
+    }
+    // Tombstones carry ids only: either read secret opens them.
+    if state.config.insights_export.secret.is_some() || state.config.facts_export.secret.is_some() {
+        app = app.merge(svc::rows_router());
     }
     app
 }
@@ -113,9 +119,11 @@ pub fn router_for_openapi() -> OpenApiRouter<AppState> {
         .merge(life_choices::router())
         .merge(reaction::router())
         .merge(group::router())
+        .merge(user_rows::router())
         .merge(svc::router())
         .merge(svc::facts_router())
         .merge(svc::erase_router())
+        .merge(svc::rows_router())
 }
 
 /// The generated OpenAPI document as JSON, for tests that assert on the wire

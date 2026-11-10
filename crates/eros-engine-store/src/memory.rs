@@ -242,6 +242,65 @@ impl<'a> MemoryRepo<'a> {
         .await
     }
 
+    /// The user's extracted profile memories (the rows `list_profile_changes`
+    /// exports), newest first, strictly before the `before` keyset tuple
+    /// when given. `created_at` never changes, so pages are stable.
+    pub async fn list_profile_owned(
+        &self,
+        user_id: Uuid,
+        before: Option<(DateTime<Utc>, Uuid)>,
+        limit: i64,
+    ) -> Result<Vec<ProfileMemoryChange>, sqlx::Error> {
+        let (at, id) = before.unzip();
+        sqlx::query_as::<_, ProfileMemoryChange>(
+            "SELECT id, user_id, content, category, metadata, created_at \
+             FROM engine.companion_memories \
+             WHERE user_id = $1 AND instance_id IS NULL AND category IS NOT NULL \
+               AND ($2::timestamptz IS NULL OR (created_at, id) < ($2, $3)) \
+             ORDER BY created_at DESC, id DESC \
+             LIMIT $4",
+        )
+        .bind(user_id)
+        .bind(at)
+        .bind(id)
+        .bind(limit)
+        .fetch_all(self.pool)
+        .await
+    }
+
+    /// Delete one of the user's extracted profile memories and record its
+    /// tombstone, in one transaction (spec 2026-11-10-row-deletion §3.2).
+    /// `false` when the user has no such row: the raw-turn row and the
+    /// relationship layer are not deletable here.
+    pub async fn delete_profile_owned(
+        &self,
+        user_id: Uuid,
+        memory_id: Uuid,
+    ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let deleted = sqlx::query(
+            "DELETE FROM engine.companion_memories \
+             WHERE id = $1 AND user_id = $2 AND instance_id IS NULL AND category IS NOT NULL",
+        )
+        .bind(memory_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if deleted == 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        crate::row_deletion::RowDeletionRepo::insert_in_tx(
+            &mut tx,
+            crate::row_deletion::KIND_MEMORY,
+            memory_id,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     /// Cosine-distance nearest-neighbour search.
     ///
     /// `instance_id = None` → profile layer (cross-persona).
@@ -768,5 +827,97 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].metadata.is_some());
+    }
+
+    // ── The owner's list and delete (spec 2026-11-10-row-deletion) ──
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn profile_memories_list_and_delete_for_their_owner_only(pool: PgPool) {
+        let repo = MemoryRepo { pool: &pool };
+        let (user, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let instance_id = seed_persona_instance(&pool, user).await;
+        let session_id = make_session(&pool, user, Some(instance_id)).await;
+        let other_session = make_session(&pool, other, None).await;
+        let profile = |content: &'static str, category: Option<&'static str>| {
+            let repo = MemoryRepo { pool: &pool };
+            async move {
+                repo.upsert(
+                    MemoryLayer::Profile,
+                    session_id,
+                    user,
+                    None,
+                    content,
+                    &unit_embedding(1),
+                    category,
+                    None,
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let older = profile("养了一只猫", Some("fact")).await;
+        let newer = profile("喜欢爬山", Some("preference")).await;
+        let raw = profile("我昨天去爬山了", None).await;
+        let relationship = repo
+            .upsert(
+                MemoryLayer::Relationship,
+                session_id,
+                user,
+                Some(instance_id),
+                "用户：我们第一次聊天",
+                &unit_embedding(2),
+                Some("event"),
+                None,
+            )
+            .await
+            .unwrap();
+        let theirs = repo
+            .upsert(
+                MemoryLayer::Profile,
+                other_session,
+                other,
+                None,
+                "别人的事",
+                &unit_embedding(3),
+                Some("fact"),
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE engine.companion_memories SET created_at = now() - interval '1 hour' WHERE id = $1")
+            .bind(older)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let page = repo.list_profile_owned(user, None, 1).await.unwrap();
+        assert_eq!(page.iter().map(|m| m.id).collect::<Vec<_>>(), vec![newer]);
+        let last = page.last().unwrap();
+        let rest = repo
+            .list_profile_owned(user, Some((last.created_at, last.id)), 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            rest.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![older],
+            "only extracted profile rows, the owner's"
+        );
+
+        for refused in [raw, relationship, theirs] {
+            assert!(!repo.delete_profile_owned(user, refused).await.unwrap());
+        }
+        assert!(repo.delete_profile_owned(user, newer).await.unwrap());
+        assert!(!repo.delete_profile_owned(user, newer).await.unwrap());
+        let tombs: Vec<(String, Uuid)> =
+            sqlx::query_as("SELECT kind, id FROM engine.row_deletions")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(tombs, vec![("memory".to_string(), newer)]);
+        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM engine.companion_memories")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 4);
     }
 }
