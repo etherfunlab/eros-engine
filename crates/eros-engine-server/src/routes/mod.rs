@@ -88,6 +88,10 @@ pub fn router(state: AppState) -> OpenApiRouter<AppState> {
     if state.config.user_erase.secret.is_some() {
         app = app.merge(svc::erase_router());
     }
+    // Tombstones carry ids only: either read secret opens them.
+    if state.config.insights_export.secret.is_some() || state.config.facts_export.secret.is_some() {
+        app = app.merge(svc::rows_router());
+    }
     app
 }
 
@@ -119,6 +123,7 @@ pub fn router_for_openapi() -> OpenApiRouter<AppState> {
         .merge(svc::router())
         .merge(svc::facts_router())
         .merge(svc::erase_router())
+        .merge(svc::rows_router())
 }
 
 /// The generated OpenAPI document as JSON, for tests that assert on the wire
