@@ -5390,7 +5390,15 @@
           "taking_space",
           "fell_out",
           "traveling_together",
-          "strip"
+          "strip",
+          "bird_encounter",
+          "ex_wants_back",
+          "want_to_quit_job",
+          "pondering_life",
+          "streaking",
+          "want_to_see_sea",
+          "want_hot_spring",
+          "want_sauna"
         ]
       },
       "EventView": {

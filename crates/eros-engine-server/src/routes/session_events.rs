@@ -110,6 +110,14 @@ pub enum EventKindDto {
     FellOut,
     TravelingTogether,
     Strip,
+    BirdEncounter,
+    ExWantsBack,
+    WantToQuitJob,
+    PonderingLife,
+    Streaking,
+    WantToSeeSea,
+    WantHotSpring,
+    WantSauna,
 }
 
 /// Reads the drawable kinds only: a request names kinds to draw, and the
@@ -187,6 +195,14 @@ impl From<EventKindDto> for EventKind {
             EventKindDto::FellOut => EventKind::FellOut,
             EventKindDto::TravelingTogether => EventKind::TravelingTogether,
             EventKindDto::Strip => EventKind::Strip,
+            EventKindDto::BirdEncounter => EventKind::BirdEncounter,
+            EventKindDto::ExWantsBack => EventKind::ExWantsBack,
+            EventKindDto::WantToQuitJob => EventKind::WantToQuitJob,
+            EventKindDto::PonderingLife => EventKind::PonderingLife,
+            EventKindDto::Streaking => EventKind::Streaking,
+            EventKindDto::WantToSeeSea => EventKind::WantToSeeSea,
+            EventKindDto::WantHotSpring => EventKind::WantHotSpring,
+            EventKindDto::WantSauna => EventKind::WantSauna,
         }
     }
 }
@@ -250,6 +266,14 @@ impl From<EventKind> for EventKindDto {
             EventKind::FellOut => EventKindDto::FellOut,
             EventKind::TravelingTogether => EventKindDto::TravelingTogether,
             EventKind::Strip => EventKindDto::Strip,
+            EventKind::BirdEncounter => EventKindDto::BirdEncounter,
+            EventKind::ExWantsBack => EventKindDto::ExWantsBack,
+            EventKind::WantToQuitJob => EventKindDto::WantToQuitJob,
+            EventKind::PonderingLife => EventKindDto::PonderingLife,
+            EventKind::Streaking => EventKindDto::Streaking,
+            EventKind::WantToSeeSea => EventKindDto::WantToSeeSea,
+            EventKind::WantHotSpring => EventKindDto::WantHotSpring,
+            EventKind::WantSauna => EventKindDto::WantSauna,
         }
     }
 }

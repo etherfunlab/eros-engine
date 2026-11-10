@@ -927,6 +927,14 @@ pub(crate) fn event_label(kind: eros_engine_core::events::EventKind) -> &'static
         FellOut => "为分开的事闹得不愉快",
         TravelingTogether => "和对方一起旅行",
         Strip => "刚脱了衣服",
+        BirdEncounter => "遇到一只鸟",
+        ExWantsBack => "前任来求复合",
+        WantToQuitJob => "想辞职",
+        PonderingLife => "在思考人生",
+        Streaking => "刚裸奔了一圈",
+        WantToSeeSea => "想去看海",
+        WantHotSpring => "想去泡温泉",
+        WantSauna => "想去洗桑拿",
     }
 }
 
@@ -4859,6 +4867,14 @@ mod tests {
                 "长途旅游",
                 "回老家",
                 "刚脱了衣服",
+                "遇到一只鸟",
+                "前任来求复合",
+                "想辞职",
+                "在思考人生",
+                "刚裸奔了一圈",
+                "想去看海",
+                "想去泡温泉",
+                "想去洗桑拿",
             ]
         );
     }
