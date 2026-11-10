@@ -192,8 +192,12 @@ ALTER TABLE engine.human_profile_state
 - The sweeper's `claim_due` takes a user that has pending facts and is
   either idle (as today) or `rebuild_due`, due users first.
 - A successful settle clears `rebuild_due`, as it zeroes `pending_facts`.
-  The failure that reaches `MAX_REBUILD_FAILURES` clears it too, with the
-  count it drops.
+- A due rebuild that fails backs off like any failed rebuild: the next try
+  waits out the idle window instead of the next tick.
+- The failure that reaches `MAX_REBUILD_FAILURES` drops the count and the
+  mark, as for any rebuild; when the rebuild was a due one, it first clears
+  the profile (§5.4's empty write), so a deleted fact never stays in the
+  profile because the model kept failing.
 - On a deployment whose sweeper is off, the mark waits for the next
   count-triggered rebuild.
 
@@ -344,6 +348,7 @@ Made by the owner:
   ledger no longer supports.
 - After a delete the sweeper's next tick rebuilds the profile; the delete
   does not call the model.
+- A rebuild owed to a delete that strikes out clears the profile.
 
 Made in this design:
 

@@ -128,6 +128,9 @@ pub(crate) async fn rebuild_user(
         return RebuildOutcome::Empty;
     };
     let repo = ProfileStateRepo { pool: &state.pool };
+    if outcome == RebuildOutcome::Failed {
+        strike_out_clear(state, user_id, token).await;
+    }
     let released = match outcome {
         RebuildOutcome::Failed => repo.finish_failed(user_id, token).await,
         RebuildOutcome::Ok | RebuildOutcome::Empty => repo.finish_ok(user_id, token).await,
@@ -137,6 +140,34 @@ pub(crate) async fn rebuild_user(
         tracing::warn!(%user_id, "profile rebuild: releasing the claim failed: {e}");
     }
     outcome
+}
+
+/// A rebuild owed to a deleted fact that is about to strike out (its last
+/// allowed failure) clears the profile, so the deleted fact does not stay in it
+/// until the next new fact (spec 2026-11-10-row-deletion §5.1). Any other
+/// failure keeps the profile. Fail-open: a read or clear error leaves the
+/// profile as it was.
+async fn strike_out_clear(state: &AppState, user_id: Uuid, token: ClaimToken) {
+    let striking = match (ProfileStateRepo { pool: &state.pool }).load(user_id).await {
+        Ok(Some(s)) => {
+            s.rebuild_due
+                && s.rebuild_failures + 1 >= eros_engine_store::profile_state::MAX_REBUILD_FAILURES
+        }
+        Ok(None) => false,
+        Err(e) => {
+            tracing::warn!(%user_id, "profile rebuild: reading the state row failed: {e}");
+            false
+        }
+    };
+    if !striking {
+        return;
+    }
+    if let Err(e) = (HumanInsightRepo { pool: &state.pool })
+        .clear_profile_if_claimed(user_id, token)
+        .await
+    {
+        tracing::warn!(%user_id, "profile rebuild: clearing a struck-out profile failed: {e}");
+    }
 }
 
 /// `None` when the claim was gone before the profile write (see
@@ -1333,6 +1364,57 @@ mod tests {
         );
         assert_eq!(
             profile_now(&pool, user).await,
+            (Some("后端工程师".into()), vec!["爬山".into()], false)
+        );
+    }
+
+    /// The model refused for good: a rebuild owed to a deleted fact that
+    /// strikes out clears the profile rather than leave the fact in it; any
+    /// other strike-out keeps the profile, as before.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_due_rebuild_that_strikes_out_clears_the_profile(pool: PgPool) {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+        let state = state_pointing_at(pool.clone(), &mock);
+        let strike = eros_engine_store::profile_state::MAX_REBUILD_FAILURES - 1;
+        let (due, plain) = (Uuid::new_v4(), Uuid::new_v4());
+        for user in [due, plain] {
+            seed_profile(&pool, user).await;
+            seed_fact(&pool, user, "是后端工程师", "career").await;
+            sqlx::query(
+                "INSERT INTO engine.human_profile_state \
+                    (user_id, pending_facts, last_fact_at, rebuild_failures, rebuild_due) \
+                 VALUES ($1, 1, now(), $2, $3)",
+            )
+            .bind(user)
+            .bind(strike)
+            .bind(user == due)
+            .execute(&pool)
+            .await
+            .unwrap();
+            let token = ProfileStateRepo { pool: &pool }
+                .claim(user, Duration::from_secs(600))
+                .await
+                .unwrap()
+                .expect("claimed");
+            assert_eq!(
+                rebuild_user(&state, user, token).await,
+                RebuildOutcome::Failed
+            );
+            let s = ProfileStateRepo { pool: &pool }
+                .load(user)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!((s.pending_facts, s.rebuild_due), (0, false), "struck out");
+        }
+        assert_eq!(profile_now(&pool, due).await, (None, vec![], true));
+        assert_eq!(
+            profile_now(&pool, plain).await,
             (Some("后端工程师".into()), vec!["爬山".into()], false)
         );
     }

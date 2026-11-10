@@ -80,8 +80,9 @@ impl ProfileStateRepo<'_> {
     }
 
     /// Claim up to `limit` users that are due: marked `rebuild_due` by a
-    /// deleted fact, or with pending facts that have sat for `idle` with no
-    /// new arrivals. Marked users first, then the longest-waiting. Claims
+    /// deleted fact (until a rebuild of it fails; it then backs off like any
+    /// failure), or with pending facts that have sat for `idle` with no new
+    /// arrivals. Marked users first, then the longest-waiting. Claims
     /// follow the same rules as `claim`; rows another sweeper has locked are
     /// skipped, not waited on. Each user comes with its claim's token.
     pub async fn claim_due(
@@ -95,7 +96,7 @@ impl ProfileStateRepo<'_> {
              WHERE user_id IN ( \
                  SELECT user_id FROM engine.human_profile_state \
                  WHERE pending_facts > 0 \
-                   AND (rebuild_due \
+                   AND ((rebuild_due AND rebuild_failures = 0) \
                         OR last_fact_at < now() - make_interval(secs => $1::float8)) \
                    AND (claimed_at IS NULL \
                         OR claimed_at < now() - make_interval(secs => $2::float8)) \
@@ -465,5 +466,37 @@ mod tests {
         repo.finish_failed(due_user, token).await.unwrap();
         let s = repo.load(due_user).await.unwrap().unwrap();
         assert_eq!((s.pending_facts, s.rebuild_due), (0, false));
+    }
+
+    /// A due rebuild that failed waits out the idle window like any other
+    /// failure, instead of being retried on every tick.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_failed_due_rebuild_waits_out_the_idle_window(pool: PgPool) {
+        let repo = ProfileStateRepo { pool: &pool };
+        let user = Uuid::new_v4();
+        repo.bump(user, 1).await.unwrap();
+        sqlx::query("UPDATE engine.human_profile_state SET rebuild_due = true WHERE user_id = $1")
+            .bind(user)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let token = repo.claim(user, TEN_MIN).await.unwrap().expect("claimed");
+        repo.finish_failed(user, token).await.unwrap();
+        assert!(
+            repo.load(user).await.unwrap().unwrap().rebuild_due,
+            "still due"
+        );
+        assert!(
+            repo.claim_due(ONE_HOUR, TEN_MIN, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "not on the next tick"
+        );
+        shift(&pool, user, "last_fact_at", "2 hours").await;
+        assert_eq!(
+            repo.claim_due(ONE_HOUR, TEN_MIN, 10).await.unwrap().len(),
+            1
+        );
     }
 }
