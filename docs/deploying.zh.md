@@ -289,6 +289,7 @@ World Stories 按实例生活模拟）默认完全关闭：模型配置里没有
 - **服务端点（可选）：**`/svc/v1/*` 是三棵子树，各自只在设置了自己的 secret 时才挂载。每个 secret 至少 32 字节（更短会导致启动失败），保存在下游的服务器上，以下面列出的 header 发送。未设置 ⇒ 对应子树不挂载，这些路径与任何未知路径表现一致。契约见 [API 参考 → 服務端點](api-reference.zh.md#服務端點)。
   - `INSIGHTS_EXPORT_SECRET`（`x-insights-export-secret`）挂载 `GET /svc/v1/insights/changes`，把自某个 keyset 游标以来有变动的 `human_insights` 行交给下游服务，让它不碰数据库就能维护一份对话推导画像的只读镜像；挂载 `GET /svc/v1/memories/changes`，以同样的方式交出画像层的抽取记忆；还挂载 `GET /svc/v1/insights/deletions`，即这两种镜像都必须读取的已抹除用户流。
   - `FACTS_EXPORT_SECRET`（`x-facts-export-secret`）挂载 `GET /svc/v1/facts/changes`，即以 keyset 流形式交出的事实账本，以及 `GET /svc/v1/facts/deletions`，供事实镜像使用的同一条已抹除用户流。
+  - 两个导出 secret 任设一个，还会挂载 `GET /svc/v1/rows/deletions`：用户本人逐条删除的记忆与事实，这两种镜像也都必须读取。任一 header 都能打开它。
   - `USER_ERASE_SECRET`（`x-user-erase-secret`）挂载 `POST /svc/v1/users/{user_id}/erase`，删除引擎关于某个用户派生出的一切。即使部署没有启用任何导出，它也能用。请在删除该用户的 session 之前、并先停掉该用户的流量再调用（[洞察 → 抹除](insights.zh.md#抹除)）。
 - **健康探針：** `GET /healthz` 返 200，響應 `{ status: "ok", service, version, timestamp }`。把這個接到平台的健康檢查上。
 - **OpenAPI / Scalar：** `GET /docs` 提供實時的 Scalar 參考。原始 OpenAPI JSON 不走 HTTP——用 `print-openapi` 子命令导出。

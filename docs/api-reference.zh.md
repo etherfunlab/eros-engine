@@ -1717,6 +1717,70 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 `education_level` 是 `secondary_or_below`、`associate`、`bachelor`、`master`、`doctorate` 之一，或 `null`；`education_status` 是 `enrolled`、`graduated` 或 `null`。`kinks`、`ideology`、`mental_health` 在这里会返回，因为这是用户自己的数据；服务导出从不携带它们。`updated_at` 是最近一次重建替换该行的时间。`updated_at` 为 `null` 表示这个用户还没有 `human_insights` 行——还没有任何一次重建落地——这时其余字段也都是 `null`/`[]`。现在没有汇总的"训练程度"分数了：`agent_training_level` 和原始的 `companion_insights` JSONB 都随 companion_insights 拆除（spec 2026-08-11）一起移除，上面这些类型化字段就是现在的全部返回内容。
 
+### `GET /v2/comp/user/{user_id}/facts`
+
+这个用户的账本事实（见[洞察](insights.zh.md#事实账本)），从新到旧，让用户看得到引擎挖出了什么，并能删掉某一行。`user_id` 等值检查同上。
+
+| Query | 默认 | 含义 |
+|---|---|---|
+| `limit` | 100 | 夹在 1..=500 |
+| `before` | 无 | RFC 3339；返回严格早于 `(before, before_id)` 的行 |
+| `before_id` | 无 | 与 `before` 一起传——传 `next.id` |
+
+```json
+{
+  "facts": [
+    {
+      "id": "5b7e…",
+      "content": "用户养了一只猫",
+      "category": "fact",
+      "domain": "lifestyle",
+      "evidence_type": "explicit_statement",
+      "temporality": "current",
+      "persistence": "ongoing",
+      "confidence": "high",
+      "occurrences": 3,
+      "session_count": 2,
+      "recurrence": "repeated_across_sessions",
+      "first_seen_at": "2026-10-13T12:00:00.123456Z",
+      "last_seen_at": "2026-10-20T09:30:00.654321Z"
+    }
+  ],
+  "next": { "first_seen_at": "2026-10-13T12:00:00.123456Z", "id": "5b7e…" }
+}
+```
+
+每行的字段与 [`GET /svc/v1/facts/changes`](#get-svcv1factschanges) 相同，只是不带 `user_id`。行按 `(first_seen_at, id)` 降序排列；`first_seen_at` 不会变，所以一次遍历中始终存在的行既不会重复也不会漏掉。页满时才有 `next`；把它的两个字段原样传回 `before` 与 `before_id`，保留微秒精度，直到 `next` 为 `null`。`before` 与 `before_id` 只传其中一个时回 `400 bad_request`。
+
+### `GET /v2/comp/user/{user_id}/memories`
+
+这个用户抽取出的画像层记忆：即 [`GET /svc/v1/memories/changes`](#get-svcv1memorieschanges) 导出的那些行，字段与它相同，只是不带 `user_id`（`id`、`content`、`category`、`metadata`、`created_at`）。逐轮原文行与关系层的行不列出。query、归属检查和分页与事实列表相同，按 `(created_at, id)` 降序排列。
+
+```json
+{
+  "memories": [
+    {
+      "id": "3c2a…",
+      "content": "用户目前正在找工作",
+      "category": "fact",
+      "metadata": { "domain": "career", "confidence": "high" },
+      "created_at": "2026-10-13T12:00:00.123456Z"
+    }
+  ],
+  "next": null
+}
+```
+
+### `DELETE /v2/comp/user/{user_id}/facts/{fact_id}`
+
+删除一条账本事实。删掉了回 `204`；这个用户没有这条事实时回 `404 not_found`（未知 id、别人的事实，或已经删过的，所以重复删除也是 `404`）。`user_id` 等值检查同上。
+
+删除会在 [`GET /svc/v1/rows/deletions`](#get-svcv1rowsdeletions) 写一条墓碑，并把用户的画像标为到期：下一次画像重建清扫（默认每五分钟）会在没有这条事实的情况下重建画像，剩下的事实不再支持任何画像时则清空它。事实的原文仍留在抽取审计与每日快照里，直到用户被抹除。之后再次抽取出同一句话，会作为新 id 的新行回来。见[洞察 → 逐条删除事实或记忆](insights.zh.md#逐条删除事实或记忆)。
+
+### `DELETE /v2/comp/user/{user_id}/memories/{memory_id}`
+
+删除一条抽取出的画像记忆，即记忆列表返回的那种行。`204` 或 `404 not_found`，与事实相同；逐轮原文行或关系层的行也是 `404`。删除会在 [`GET /svc/v1/rows/deletions`](#get-svcv1rowsdeletions) 写一条墓碑；这条记忆不再被召回。
+
 ### `GET /comp/instance/{instance_id}/profile`
 
 某一段关系（`persona_instances.id`）扁平化、类型化的 `character_insights` 行——AI 角色自己那份从对话中抽取出来的画像，是上面人类画像的镜像。该 instance 的 `owner_uid` **必须**等于 JWT 的 user_id；否则 403。未知或已归档（`status <> 'active'`）的 instance 返回 404。实验特性（v1.3.0）——详见 [2026-08-15-character-insights-design.md](superpowers/specs/2026-08-15-character-insights-design.md)。
@@ -2151,6 +2215,7 @@ session 403）。
 |---|---|---|
 | `INSIGHTS_EXPORT_SECRET` | `x-insights-export-secret` | [`insights/changes`](#get-svcv1insightschanges)、[`memories/changes`](#get-svcv1memorieschanges)、[`insights/deletions`](#get-svcv1insightsdeletions) |
 | `FACTS_EXPORT_SECRET` | `x-facts-export-secret` | [`facts/changes`](#get-svcv1factschanges)、[`facts/deletions`](#get-svcv1factsdeletions) |
+| 以上两者任一 | 任一对应 header | [`rows/deletions`](#get-svcv1rowsdeletions) |
 | `USER_ERASE_SECRET` | `x-user-erase-secret` | [`POST users/{user_id}/erase`](#post-svcv1usersuser_iderase) |
 
 所有的流都用同样的方式 keyset 分页；它们背后的流水线见[洞察](insights.zh.md#导出与删除)。
@@ -2206,11 +2271,11 @@ curl -H "x-insights-export-secret: $INSIGHTS_EXPORT_SECRET" \
 
 **下一次轮询从哪里开始。** 记住最后一行的 `(created_at, id)`；每次新轮询从它往前几秒开始，`since = last.created_at − 5s`，不传 `after_id`。`created_at` 是插入事务开始的时刻，行要到提交才可见；engine 的插入事务都很短，重叠窗口足以覆盖这段间隔。重复回来的行无害：行写入后不再变，按 `id` 去重即可。
 
-**这条流里没有删除信息。** 行会随它的 session 一起消失（硬删除级联），也会随其用户被抹除而消失，这个导出两者都不报告。镜像用同一个 secret 读 [`insights/deletions`](#get-svcv1insightsdeletions) 来丢弃被抹除的用户。
+**行会离开。** 用户本人可以删除一行（[`DELETE …/memories/{memory_id}`](#delete-v2compuseruser_idmemoriesmemory_id)），之后它以 `kind: memory` 出现在 [`rows/deletions`](#get-svcv1rowsdeletions)。抹除会删掉用户的全部行，出现在 [`insights/deletions`](#get-svcv1insightsdeletions)。随 session 一起消失的行（硬删除级联）两边都不报告。
 
 ### `GET /svc/v1/insights/deletions`
 
-自某个 keyset 游标以来，引擎抹除过数据的用户，供画像与记忆的镜像照着丢弃。需要 `x-insights-export-secret`（缺失或错误回 403）。它与 [`facts/deletions`](#get-svcv1factsdeletions) 是同一条流，可用 insights secret 读取，所以该镜像不需要第二份凭据。没有逐条事实的删除：这条流是用户级的。
+自某个 keyset 游标以来，引擎抹除过数据的用户，供画像与记忆的镜像照着丢弃。需要 `x-insights-export-secret`（缺失或错误回 403）。它与 [`facts/deletions`](#get-svcv1factsdeletions) 是同一条流，可用 insights secret 读取，所以该镜像不需要第二份凭据。这条流是用户级的；用户本人逐条删除的行在 [`rows/deletions`](#get-svcv1rowsdeletions)。
 
 | Query | 默认 | 含义 |
 |---|---|---|
@@ -2270,13 +2335,43 @@ curl -H "x-facts-export-secret: $FACTS_EXPORT_SECRET" \
 
 `recurrence` 是 `once`、`repeated_in_session` 或 `repeated_across_sessions`；六个标签取自引擎的封闭词表。session、消息和 run 的指针留在引擎内部。行按 `(last_seen_at, id)` 排序，分页与画像导出相同：页满时才有 `next`；把它的两个字段原样传回 `since` 与 `after_id`，保留微秒精度，直到 `next` 为 `null`。
 
-一次复现会移动 `last_seen_at`，所以每当计数器变化，该行就会再出现一次；按 `id` 去重，以最后一次为准。行只会通过抹除离开账本，见 [`facts/deletions`](#get-svcv1factsdeletions)。
+一次复现会移动 `last_seen_at`，所以每当计数器变化，该行就会再出现一次；按 `id` 去重，以最后一次为准。行在用户本人删除它时（[`rows/deletions`](#get-svcv1rowsdeletions)，`kind: fact`）或用户被抹除时（[`facts/deletions`](#get-svcv1factsdeletions)）离开账本。
 
 **下一次轮询从哪里开始。** 记住最后一行的 `(last_seen_at, id)`；每次新轮询从它*之前*开始，不传 `after_id`。`last_seen_at` 由写账本的那条语句自己打上（`now()`；复现时只进不退），只比提交早一条短语句：重叠几秒就够。
 
 ### `GET /svc/v1/facts/deletions`
 
 与 [`insights/deletions`](#get-svcv1insightsdeletions) 是同一条抹除流——相同的 query、相同的响应、相同的含义——用 `x-facts-export-secret` 放行，供事实的镜像使用。持有事实的镜像必须丢弃它在这里读到的每个 `user_id`。
+
+### `GET /svc/v1/rows/deletions`
+
+自某个 keyset 游标以来，因用户本人删除而离开记忆导出或事实导出的单行。两个读取 secret 任一都能放行：`x-insights-export-secret` 对上 `INSIGHTS_EXPORT_SECRET`，或 `x-facts-export-secret` 对上 `FACTS_EXPORT_SECRET`（没有任何一个 header 对上它自己的 secret 时回 403）。两者至少配置一个时挂载。
+
+| Query | 默认 | 含义 |
+|---|---|---|
+| `since` | Unix epoch | RFC 3339 时间戳；返回严格晚于 `(since, after_id)` 的行 |
+| `after_id` | nil UUID | `since` 相同时的平局 id——传 `next.id` |
+| `limit` | 500 | 夹在 1..=1000 |
+
+```bash
+curl -H "x-facts-export-secret: $FACTS_EXPORT_SECRET" \
+  "http://localhost:8080/svc/v1/rows/deletions?limit=1"
+```
+
+```json
+{
+  "deletions": [
+    { "kind": "fact", "id": "5b7e…", "deleted_at": "2026-11-10T12:00:00.123456Z" }
+  ],
+  "next": { "deleted_at": "2026-11-10T12:00:00.123456Z", "id": "5b7e…" }
+}
+```
+
+`kind` 是 `memory`（[`memories/changes`](#get-svcv1memorieschanges) 导出过的行）或 `fact`（[`facts/changes`](#get-svcv1factschanges) 导出过的行）；不认识的 `kind` 跳过即可。`id` 是被删行的 id。行按 `(deleted_at, id)` 排序，分页与其他流相同。
+
+**镜像删掉该 id 的行，并记住这个 id。** 删除前一刻取到的 changes 页可能晚于墓碑到达；记得墓碑 id 的镜像就不会把这行再插回去。被删的 id 不会再出现：再次抽取出同一句话，是一条新 id 的新行。
+
+**下一次轮询从哪里开始。** 记住最后一行的 `(deleted_at, id)`；每次新轮询从它往前几秒开始，`since = last.deleted_at − 5s`，不传 `after_id`。`deleted_at` 是删除事务开始的时刻，行要到提交才可见，重叠窗口足以覆盖这段间隔。重复回来的行无害：再删一次已删的行什么都不会发生。
 
 ### `POST /svc/v1/users/{user_id}/erase`
 
@@ -2347,5 +2442,6 @@ curl -X POST -H "x-user-erase-secret: $USER_ERASE_SECRET" \
 - `crates/eros-engine-server/src/routes/bff/companion.rs`——BFF `/bff/v1/comp/chat/*`
 - `crates/eros-engine-server/src/routes/bff/affinity.rs`——BFF `/bff/v1/comp/affinity/*`
 - `crates/eros-engine-server/src/routes/svc.rs`——服務間導出（`/svc/v1/*`）
+- `crates/eros-engine-server/src/routes/user_rows.rs`——用户本人的事实与记忆列表和删除
 - `crates/eros-engine-server/src/routes/health.rs`——`/healthz`
 - `crates/eros-engine-server/src/openapi.rs`——Scalar UI spec 元数据

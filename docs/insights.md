@@ -2,7 +2,7 @@
 
 [English](insights.md) · [中文](insights.zh.md)
 
-The insights pipeline builds what the engine knows about the real user from conversation, in two layers. A **fact ledger** (`engine.human_facts`) records atomic facts the extraction call mines from each turn, one row per distinct fact with recurrence counters. A **profile** (`engine.human_insights`, one row per user) is derived from the ledger on a schedule, not per turn; the chat prompt, the voice opener, the profile route and the profile export read it. Every LLM call leaves an audit row in `engine.human_insights_events`. A user's data can be erased in one call, and exports carry the erasure to downstream mirrors.
+The insights pipeline builds what the engine knows about the real user from conversation, in two layers. A **fact ledger** (`engine.human_facts`) records atomic facts the extraction call mines from each turn, one row per distinct fact with recurrence counters. A **profile** (`engine.human_insights`, one row per user) is derived from the ledger on a schedule, not per turn; the chat prompt, the voice opener, the profile route and the profile export read it. Every LLM call leaves an audit row in `engine.human_insights_events`. The owner can delete one fact or one extracted memory at a time, a user's data can be erased in one call, and exports carry both kinds of deletion to downstream mirrors.
 
 The per-relationship chains `character_insights` and `user_insights` are separate pipelines with their own tables; see [llm-audit.md](llm-audit.md#character-and-user-insights-experimental). Upgrade steps for deployments coming from v2.3.1 or earlier are in [migrating/v2-4-0-insights-2-0.md](migrating/v2-4-0-insights-2-0.md) and [migrating/v2-4-1-insights-cleanup.md](migrating/v2-4-1-insights-cleanup.md).
 
@@ -138,14 +138,15 @@ Indexes: GIN on `interests` and `personality_traits` and a btree on `(updated_at
 | `last_fact_at` | When the counter last moved (or a failure last pushed it back). |
 | `last_rebuilt_at` | When a rebuild last settled. |
 | `rebuild_failures` | Consecutive failed rebuilds. |
-| `claimed_at` | Set while a rebuild is in flight. |
+| `claimed_at` | Set while a rebuild is in flight; its value is the claim's token. |
+| `rebuild_due` | Set by a fact deletion: the next sweeper tick rebuilds this user. |
 
 After each extraction run that wrote or bumped N ≥ 1 ledger rows, `pending_facts` grows by N and `last_fact_at` is set to now. A rebuild starts in one of two ways:
 
 - **Count.** When `pending_facts` reaches 20 after a run, that run's post-process task rebuilds inline. It is already off the reply path.
-- **Idle flush.** A sweeper wakes every `PROFILE_REBUILD_TICK_SECS`, claims up to `PROFILE_REBUILD_BATCH` users whose `pending_facts > 0` and whose `last_fact_at` is older than `PROFILE_REBUILD_IDLE_SECS`, longest-waiting first, and rebuilds them one after another. With the sweeper off, only the count trigger fires.
+- **Sweeper.** A sweeper wakes every `PROFILE_REBUILD_TICK_SECS` and claims up to `PROFILE_REBUILD_BATCH` users with `pending_facts > 0` that are either idle (`last_fact_at` older than `PROFILE_REBUILD_IDLE_SECS`) or due after a [fact deletion](#deleting-one-fact-or-memory). Due users come first, then the longest-waiting; it rebuilds them one after another. With the sweeper off, only the count trigger fires, and a due user waits for it.
 
-A rebuild first claims the state row, so overlapping turns and the sweeper never rebuild one user twice. A claim older than 600 seconds is taken as a dead worker's and can be claimed again; the sweeper refreshes each claim right before that user's rebuild, so a long batch does not age its own tail into re-claimable claims.
+A rebuild first claims the state row, so overlapping turns and the sweeper never rebuild one user twice. A claim older than 600 seconds is taken as a dead worker's and can be claimed again; the sweeper refreshes each claim right before that user's rebuild, so a long batch does not age its own tail into re-claimable claims. The claim is a token: the rebuild writes the profile and settles the state row only while `claimed_at` still holds the value its claim wrote. A rebuild whose claim was released (a fact deletion releases it) or taken over writes nothing and settles nothing.
 
 ### What a rebuild reads
 
@@ -183,8 +184,10 @@ The write is a **full replace** of the 19 fields in one statement: a field the r
 | Outcome | When | Profile row | Counter |
 |---------|------|-------------|---------|
 | `ok` | The object projected to at least one field and the write succeeded. | Replaced. | `pending_facts = 0`, `last_rebuilt_at = now`, `rebuild_failures = 0`. |
-| `empty` | The user has no ledger rows, or only `transient` facts that never recurred across sessions (no call is made in either case — the correct reply is always `{}`), or the reply is a JSON object with nothing writable (including `{}`). | Untouched. | Settled like `ok`: the batch is accepted as a residual, and the user's next facts arm the trigger again. |
-| `failed` | The ledger read failed, the call returned no reply, the reply is not a JSON object, or the write failed. | Untouched; the old row keeps serving. | `pending_facts` is kept and `last_fact_at = now`, so the idle flush waits another full idle period (`PROFILE_REBUILD_IDLE_SECS`, one hour by default); `rebuild_failures` goes up by one. The third consecutive failure instead zeroes `pending_facts` and `rebuild_failures`. |
+| `empty` | The user has no ledger rows, or only `transient` facts that never recurred across sessions (no call is made in either case — the correct reply is always `{}`), or the reply is a JSON object with nothing writable after the projection and the guards (including `{}`). | Cleared, when the user has one: every field `null` or `[]`, `updated_at` moved. A user with no row still has none. | Settled like `ok`: the batch is accepted as a residual, and the user's next facts arm the trigger again. |
+| `failed` | The ledger read failed, the call returned no reply, the reply is not a JSON object, or the write failed. | Untouched; the old row keeps serving. | `pending_facts` is kept and `last_fact_at = now`, so the next try waits another full idle period (`PROFILE_REBUILD_IDLE_SECS`, one hour by default), a due one included; `rebuild_failures` goes up by one. The third consecutive failure instead zeroes `pending_facts`, `rebuild_failures` and `rebuild_due`; when the rebuild was due after a deletion, it first clears the profile as `empty` does. |
+
+`empty` clears the row because the same ledger always gives the same answer: a profile the ledger no longer supports would otherwise keep serving for good. The row is cleared rather than deleted so that `GET /svc/v1/insights/changes` carries the cleared profile to a mirror. A model reply of `{}` for a rich ledger therefore empties the profile until the next rebuild.
 
 A user with an unrebuildable ledger therefore costs at most three calls per burst of activity, never a call per tick. The claim is released in every outcome.
 
@@ -248,14 +251,40 @@ Three sub-trees of `/svc/v1/*`, each mounted only when its own secret is set, so
 |--------|--------|--------|
 | `INSIGHTS_EXPORT_SECRET` | `x-insights-export-secret` | `GET /svc/v1/insights/changes`, `GET /svc/v1/memories/changes`, `GET /svc/v1/insights/deletions` |
 | `FACTS_EXPORT_SECRET` | `x-facts-export-secret` | `GET /svc/v1/facts/changes`, `GET /svc/v1/facts/deletions` |
+| either of the two above | either header | `GET /svc/v1/rows/deletions` |
 | `USER_ERASE_SECRET` | `x-user-erase-secret` | `POST /svc/v1/users/{user_id}/erase` |
+
+`rows/deletions` carries ids only, so either read secret opens it. It is mounted when at least one of the two is set, and each header is compared only with its own secret.
 
 All streams are keyset-paged with `since`, a tie-break id, and `limit` (default 500, clamped to 1..=1000); `next` is present only when the page is full and `null` means the walk is complete. Request and response shapes and polling guidance are in [api-reference.md](api-reference.md#service-endpoints).
 
 - **Profile export.** `GET /svc/v1/insights/changes` walks `human_insights` by `(updated_at, user_id)`. A row carries `user_id`, `updated_at` and every profile field **except `kinks`, `ideology` and `mental_health`: those three are never exported.**
 - **Facts export.** `GET /svc/v1/facts/changes` walks the ledger by `(last_seen_at, id)`. A row carries `id`, `user_id`, `content`, the six labels, `occurrences`, `session_count`, `recurrence`, `first_seen_at` and `last_seen_at`; the session, message and run pointers stay inside the engine. A repeat moves `last_seen_at`, so a row reappears in the stream each time its counters change. `first_seen_at` and `last_seen_at` are stamped by the ledger write itself (`now()`, and a recurrence never moves `last_seen_at` backwards), so a stamp precedes its commit by one short statement; a resuming poller overlaps by a few seconds.
-- **Deletions.** `GET /svc/v1/insights/deletions` and `GET /svc/v1/facts/deletions` are the same stream, one route per secret: user-level tombstones `{user_id, erased_at}` from `engine.user_erasures`, keyset-paged by `(erased_at, user_id)`. There is no per-fact deletion. **A consumer that mirrors profiles, memories or facts must honor this stream**: an erase deletes the rows it mirrors, and none of the changes feeds can report a row that is gone.
-- **Memories export.** `GET /svc/v1/memories/changes` is unchanged and carries no deletions of its own; its mirror learns about erased users from `insights/deletions`.
+- **Memories export.** `GET /svc/v1/memories/changes` walks the extracted profile-layer memories by `(created_at, id)`.
+- **User erasures.** `GET /svc/v1/insights/deletions` and `GET /svc/v1/facts/deletions` are the same stream, one route per secret: user-level tombstones `{user_id, erased_at}` from `engine.user_erasures`, keyset-paged by `(erased_at, user_id)`. A mirror drops everything it holds for each user it reads here.
+- **Row deletions.** `GET /svc/v1/rows/deletions` walks `engine.row_deletions` by `(deleted_at, id)`: one tombstone `{kind, id, deleted_at}` per memory (`kind: memory`) or fact (`kind: fact`) its owner [deleted](#deleting-one-fact-or-memory). A mirror drops the row with that id and keeps the id, so a changes page fetched before the delete that arrives after its tombstone does not bring the row back.
+
+**A consumer that mirrors profiles, memories or facts must honor both deletion streams**: none of the changes feeds can report a row that is gone.
+
+## Deleting one fact or memory
+
+The owner can list and delete their ledger facts and their extracted profile memories, one row at a time, through four routes in the JWT tree (the path's `user_id` must be the token's, else 403):
+
+- `GET /v2/comp/user/{user_id}/facts` and `GET /v2/comp/user/{user_id}/memories` list the rows that `facts/changes` and `memories/changes` export, newest first by `first_seen_at` and `created_at`.
+- `DELETE /v2/comp/user/{user_id}/facts/{fact_id}` and `DELETE /v2/comp/user/{user_id}/memories/{memory_id}` delete one row: `204`, or `404` for an id that is not such a row of this user, a repeat included.
+
+Shapes are in [api-reference.md](api-reference.md#get-v2compuseruser_idfacts). Each delete runs in one transaction that removes the row and writes its tombstone to `engine.row_deletions` (`kind`, the row's old `id`, `deleted_at`; no `user_id`, and erasure leaves the table alone). The same statement extracted again later is a new row with a new id.
+
+A fact deletion also hands the profile to the next rebuild, without calling the model itself. In the same transaction, before the ledger row goes, it upserts the user's `human_profile_state` row: `claimed_at` cleared, so a rebuild in flight that read the old ledger [writes nothing](#state-and-triggers); `pending_facts` up by one; `last_fact_at = now`; `rebuild_failures = 0`; `rebuild_due = true`. The sweeper rebuilds the user on its next tick (every five minutes by default), and several deletes before that tick cost one rebuild. If what is left supports no profile, the rebuild [clears it](#outcomes).
+
+Deleting a memory needs nothing more: recall reads the table, and nothing is derived from it.
+
+What a deletion does not reach:
+
+- A fact's wording also sits in the extraction audit (`human_insights_events.payload`) and in the daily snapshots (`human_insights_snapshot`). Only an erase removes those.
+- The world director reads recent extracted memories into its prompt; what it wrote before the delete can still restate the memory.
+- The raw-turn memory row, which holds the user's message verbatim, is not listed or deletable here, and can still be recalled. Neither are the relationship layer's rows. See [memory-layers.md](memory-layers.md#archive-and-erasure).
+- A memory that cascades away with a hard-deleted session gets no tombstone.
 
 ## Erasure
 
@@ -359,7 +388,7 @@ The count (20) and the 600-second claim staleness are constants, not settings. S
 - **The upgrade backfills the ledger and queues one rebuild per profile row.** The backfill migration reports its counts as a Postgres `NOTICE` of the form `events=<n> seeds=<n> pending=<n>`. `events` is the number of ledger rows built from audit events; `seeds` is the number of rows seeded from current profile values (evidence type `legacy_profile`); `pending` is the number of users queued for a rebuild. Only users that currently have a profile row are touched, so a deployment with none backfills nothing.
 - **The rebuild drain costs one LLM call per queued user**, so expect `pending` calls after the deploy, drained by the idle sweeper at `PROFILE_REBUILD_BATCH` users per `PROFILE_REBUILD_TICK_SECS`. Until a user's first rebuild their previous profile row keeps serving injection. With the sweeper off, each queued user is rebuilt at their next extraction run, since the queue is seeded at the count threshold. Size `[tasks.profile_rebuild]` before the deploy: with extraction turned off and no `[tasks.profile_rebuild]` block, the drain runs on the global default model. `PROFILE_REBUILD_DISABLED=1` keeps the drain from running, and with extraction off nothing else triggers a rebuild.
 - **Domain reclassification is the deployment's.** Backfilled rows keep the old `sexuality` and `health` domains; the split into `kink` and `mental_health` applies to new facts. The engine ships no reclassifier: an operator who wants old rows split runs an offline pass that updates `engine.human_facts.domain`, which needs nothing beyond `UPDATE` access. A relabel does not queue a rebuild; the corrected domains are read at the user's next rebuild. To queue one by hand, set `pending_facts` above 0 and `last_fact_at` older than the idle period on the user's `human_profile_state` row.
-- **A deployment that mirrors profiles, memories or facts must consume the deletion stream**, and call erase before deleting a user's sessions.
+- **A deployment that mirrors profiles, memories or facts must consume both deletion streams**, and call erase before deleting a user's sessions.
 
 ## Known limits
 
@@ -368,16 +397,17 @@ The count (20) and the 600-second claim staleness are constants, not settings. S
 - A fact keeps the first occurrence's labels even when a later occurrence would label it differently.
 - The profile is as fresh as its last rebuild: after the last new fact, up to the idle period.
 - A ledger larger than the 16,000-character budget feeds each rebuild its top-ranked prefix.
-- A rebuild that returns nothing writable accepts its batch as a residual rather than retrying.
-- There is no per-fact deletion; erasure is per user.
+- A rebuild that returns nothing writable accepts its batch as a residual rather than retrying, and clears the profile.
+- Deleting a fact leaves its wording in the audit and the snapshots until an erase.
 - No code path prunes `engine.human_insights_snapshot` or `engine.human_insights_events`.
 
 ## Source
 
 - `crates/eros-engine-store/src/human_fact.rs` — vocabularies, `FactInput`, `HumanFactRepo::upsert_run`, the recurrence tier
-- `crates/eros-engine-store/src/profile_state.rs` — `REBUILD_K`, `MAX_REBUILD_FAILURES`, `bump`, `claim`, `claim_due`, `finish_ok`, `finish_failed`
-- `crates/eros-engine-store/src/human_insight.rs` — the 19 fields, `project_profile`, `is_placeholder`, `replace_profile`, `list_changes`
+- `crates/eros-engine-store/src/profile_state.rs` — `REBUILD_K`, `MAX_REBUILD_FAILURES`, `bump`, `claim`, `claim_due`, `refresh_claim`, `finish_ok`, `finish_failed` (all token-guarded)
+- `crates/eros-engine-store/src/human_insight.rs` — the 19 fields, `project_profile`, `is_placeholder`, `replace_profile_if_claimed`, `clear_profile_if_claimed`, `list_changes`
 - `crates/eros-engine-store/src/erasure.rs` — `erase_user`, the deleted and blanked table lists, the deletion stream
+- `crates/eros-engine-store/src/row_deletion.rs` — `engine.row_deletions`, the row-deletion stream
 - `crates/eros-engine-store/src/insight.rs` — `InsightEventRepo`
 - `crates/eros-engine-server/src/pipeline/post_process.rs` — `extract_insights`, `extract_facts`, `parse_fact_objects`, `record_facts`
 - `crates/eros-engine-server/src/pipeline/profile_rebuild.rs` — `render_ledger`, `rebuild_user`, the sweeper, `LEDGER_BUDGET_CHARS`
@@ -385,9 +415,10 @@ The count (20) and the 600-second claim staleness are constants, not settings. S
 - `crates/eros-engine-server/src/pipeline/handlers.rs` — `human_insights_to_bullets`
 - `crates/eros-engine-server/src/pipeline/voice.rs` — bootstrap snapshot
 - `crates/eros-engine-server/src/pipeline/snapshot.rs` — snapshot sweeper
-- `crates/eros-engine-server/src/routes/svc.rs` — the three `/svc/v1/*` sub-trees; `routes/mod.rs` mounts each under its secret
+- `crates/eros-engine-server/src/routes/svc.rs` — the three `/svc/v1/*` sub-trees and `rows/deletions`; `routes/mod.rs` mounts each under its secret
+- `crates/eros-engine-server/src/routes/user_rows.rs` — the owner's fact and memory lists and deletes
 - `crates/eros-engine-server/src/routes/companion.rs` — `GET /comp/user/{user_id}/profile`
 - `crates/eros-engine-llm/src/model_config.rs` — `resolve_insight_extract`, `resolve_profile_rebuild`, `validate_structuring_prompt_unset`
-- `crates/eros-engine-store/migrations/0079_human_facts.sql`, `0080_human_facts_backfill.sql`, `0081_insights_2_cleanup.sql`
+- `crates/eros-engine-store/migrations/0079_human_facts.sql`, `0080_human_facts_backfill.sql`, `0081_insights_2_cleanup.sql`, `0084_row_deletions.sql`
 - `examples/model_config.toml` — `[tasks.insight_extraction]` and `[tasks.profile_rebuild]`
-- Design: [2026-10-26-insights-2-fact-ledger-design.md](superpowers/specs/2026-10-26-insights-2-fact-ledger-design.md)
+- Design: [2026-10-26-insights-2-fact-ledger-design.md](superpowers/specs/2026-10-26-insights-2-fact-ledger-design.md), [2026-11-10-row-deletion-and-deletion-stream-design.md](superpowers/specs/2026-11-10-row-deletion-and-deletion-stream-design.md)

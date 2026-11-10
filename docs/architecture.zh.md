@@ -199,8 +199,9 @@ crates/
 │       ├── memory.rs         # MemoryRepo（Profile / Relationship 兩層）
 │       ├── insight.rs        # InsightEventRepo（human_insights_events 审计行）
 │       ├── human_fact.rs     # HumanFactRepo（用户的事实账本：去重写入、导出 keyset）
-│       ├── profile_state.rs  # ProfileStateRepo（重建计数器、认领、结果）
+│       ├── profile_state.rs  # ProfileStateRepo（重建计数器、到期标记、认领令牌、结果）
 │       ├── erasure.rs        # ErasureRepo（用户抹除、删除流）
+│       ├── row_deletion.rs   # RowDeletionRepo（逐条删除的记忆与事实的墓碑及其流）
 │       ├── human_insight.rs  # HumanInsightRepo（类型化画像列，由重建整行替换）
 │       ├── character_insight.rs # CharacterInsightRepo + 事件/快照 repo（AI 角色自己的画像，实验特性）
 │       ├── user_insight.rs   # UserInsightRepo + 事件/快照 repo（真人用户按关系分开的画像，实验特性）
@@ -218,7 +219,7 @@ crates/
         ├── auth/             # AuthValidator trait + Supabase 實現 + 中間件
         ├── pipeline/         # stream（run_stream）/ group + group_director / reasoning_call / handlers / post_process / dreaming / …
         ├── prompt.rs         # system prompt 構造（affinity → 行為指令）
-        ├── routes/           # health / companion / companion_stream / companion_async / insight / image_edit / voice / persona / session_open / session_events / session_effects / life_choices / persona_items / reaction / group / world_town / svc（服务间导出，`/svc/v1/*`）/ bff / dto / mod
+        ├── routes/           # health / companion / companion_stream / companion_async / insight / image_edit / voice / persona / session_open / session_events / session_effects / life_choices / persona_items / user_rows / reaction / group / world_town / svc（服务间导出，`/svc/v1/*`）/ bff / dto / mod
         └── openapi.rs        # utoipa ApiDoc 元數據
 ```
 

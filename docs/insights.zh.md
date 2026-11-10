@@ -2,7 +2,7 @@
 
 [English](insights.md) · [中文](insights.zh.md)
 
-洞察流水线从对话里建立引擎对真人用户的了解，分两层。**事实账本**（`engine.human_facts`）记录抽取调用从每一轮挖出的原子事实，每条不同的事实一行，附复现计数器。**画像**（`engine.human_insights`，每个用户一行）按计划从账本派生，不是逐轮更新；聊天 prompt、语音开场、画像端点和画像导出都读它。每次 LLM 调用都在 `engine.human_insights_events` 留一行审计。用户的数据可以一次调用抹除，导出会把抹除传达给下游镜像。
+洞察流水线从对话里建立引擎对真人用户的了解，分两层。**事实账本**（`engine.human_facts`）记录抽取调用从每一轮挖出的原子事实，每条不同的事实一行，附复现计数器。**画像**（`engine.human_insights`，每个用户一行）按计划从账本派生，不是逐轮更新；聊天 prompt、语音开场、画像端点和画像导出都读它。每次 LLM 调用都在 `engine.human_insights_events` 留一行审计。用户本人可以逐条删除事实或抽取出的记忆，用户的数据也可以一次调用抹除，导出会把这两种删除都传达给下游镜像。
 
 按关系分开的 `character_insights` 与 `user_insights` 两条链是另外的流水线，各有自己的表，见 [llm-audit.zh.md](llm-audit.zh.md#角色画像与用户画像实验特性)。从 v2.3.1 或更早版本升级的部署，升级步骤见 [migrating/v2-4-0-insights-2-0.md](migrating/v2-4-0-insights-2-0.md) 与 [migrating/v2-4-1-insights-cleanup.md](migrating/v2-4-1-insights-cleanup.md)（仅英文）。
 
@@ -138,14 +138,15 @@ AI:   {assistant message}
 | `last_fact_at` | 计数器上次变动的时间（或失败上次把它往后推的时间）。 |
 | `last_rebuilt_at` | 上次重建落定的时间。 |
 | `rebuild_failures` | 连续失败的重建次数。 |
-| `claimed_at` | 重建进行中时设置。 |
+| `claimed_at` | 重建进行中时设置；它的值就是这次认领的令牌。 |
+| `rebuild_due` | 由删除事实设置：清扫器下一个 tick 就重建这个用户。 |
 
 每次抽取运行写入或累加了 N ≥ 1 条账本行之后，`pending_facts` 增加 N，`last_fact_at` 设为当前时间。重建有两种启动方式：
 
 - **计数。** 一次运行之后 `pending_facts` 达到 20，该运行的 post-process 任务就地重建。它本来就在回复路径之外。
-- **闲置清扫。** 清扫器每隔 `PROFILE_REBUILD_TICK_SECS` 醒来，认领至多 `PROFILE_REBUILD_BATCH` 个 `pending_facts > 0` 且 `last_fact_at` 早于 `PROFILE_REBUILD_IDLE_SECS` 的用户，等得最久的优先，然后逐个重建。清扫器关闭时，只有计数触发。
+- **清扫。** 清扫器每隔 `PROFILE_REBUILD_TICK_SECS` 醒来，认领至多 `PROFILE_REBUILD_BATCH` 个 `pending_facts > 0` 的用户，条件是已闲置（`last_fact_at` 早于 `PROFILE_REBUILD_IDLE_SECS`）或因[删除事实](#逐条删除事实或记忆)而到期。到期的用户优先，其次是等得最久的，然后逐个重建。清扫器关闭时，只有计数触发，到期的用户也要等它。
 
-重建先认领状态行，所以重叠的轮次与清扫器不会把同一个用户重建两次。超过 600 秒的认领被视为已死亡的 worker 留下的，可以被再次认领；清扫器在每个用户重建前刷新其认领，所以一个长批次不会把自己批尾的认领拖到可被再次认领。
+重建先认领状态行，所以重叠的轮次与清扫器不会把同一个用户重建两次。超过 600 秒的认领被视为已死亡的 worker 留下的，可以被再次认领；清扫器在每个用户重建前刷新其认领，所以一个长批次不会把自己批尾的认领拖到可被再次认领。认领是令牌：只有 `claimed_at` 仍是这次认领写下的值时，重建才会写画像、落定状态行。认领已被释放（删除事实会释放它）或被别人接手的重建，什么都不写，也不落定。
 
 ### 重建读什么
 
@@ -183,8 +184,10 @@ AI:   {assistant message}
 | 结果 | 何时 | 画像行 | 计数器 |
 |------|------|--------|--------|
 | `ok` | 对象至少投影出一个字段，且写入成功。 | 被替换。 | `pending_facts = 0`，`last_rebuilt_at = now`，`rebuild_failures = 0`。 |
-| `empty` | 用户没有账本行，或只有从未跨 session 复现的 `transient` 事实（两种情况都不发起调用——正确的回复必然是 `{}`），或回复是没有可写内容的 JSON 对象（包括 `{}`）。 | 不动。 | 与 `ok` 一样落定：这批事实作为残余被接受，用户的下一批事实重新武装触发器。 |
-| `failed` | 账本读取失败、调用没有返回回复、回复不是 JSON 对象，或写入失败。 | 不动；旧行继续服务。 | 保留 `pending_facts`，并设 `last_fact_at = now`，于是闲置清扫再等一个完整的闲置时长（`PROFILE_REBUILD_IDLE_SECS`，默认一小时）；`rebuild_failures` 加一。第三次连续失败则改为把 `pending_facts` 与 `rebuild_failures` 清零。 |
+| `empty` | 用户没有账本行，或只有从未跨 session 复现的 `transient` 事实（两种情况都不发起调用——正确的回复必然是 `{}`），或回复经投影与两道闸之后没有可写内容（包括 `{}`）。 | 用户有画像行时清空：每个字段为 `null` 或 `[]`，`updated_at` 前移。没有画像行的用户仍然没有。 | 与 `ok` 一样落定：这批事实作为残余被接受，用户的下一批事实重新武装触发器。 |
+| `failed` | 账本读取失败、调用没有返回回复、回复不是 JSON 对象，或写入失败。 | 不动；旧行继续服务。 | 保留 `pending_facts`，并设 `last_fact_at = now`，于是下一次尝试再等一个完整的闲置时长（`PROFILE_REBUILD_IDLE_SECS`，默认一小时），到期的用户也一样；`rebuild_failures` 加一。第三次连续失败则改为把 `pending_facts`、`rebuild_failures` 与 `rebuild_due` 清零；若这次重建是删除之后到期的那次，先像 `empty` 一样清空画像。 |
+
+`empty` 会清空画像行，因为同一份账本总是得出同一个答案：账本已不再支持的画像，否则会一直留着服务。清空而不删除这一行，是为了让 `GET /svc/v1/insights/changes` 把清空后的画像带给镜像。因此模型对一份丰富的账本回了 `{}` 时，画像会空到下一次重建为止。
 
 所以账本无法重建的用户，每一波活动至多花三次调用，绝不会每个 tick 一次。无论哪种结果，认领都会释放。
 
@@ -248,14 +251,40 @@ Off 什么都不读。渲染器只对非空白的值输出 bullet：
 |--------|--------|------|
 | `INSIGHTS_EXPORT_SECRET` | `x-insights-export-secret` | `GET /svc/v1/insights/changes`、`GET /svc/v1/memories/changes`、`GET /svc/v1/insights/deletions` |
 | `FACTS_EXPORT_SECRET` | `x-facts-export-secret` | `GET /svc/v1/facts/changes`、`GET /svc/v1/facts/deletions` |
+| 以上两者任一 | 任一对应请求头 | `GET /svc/v1/rows/deletions` |
 | `USER_ERASE_SECRET` | `x-user-erase-secret` | `POST /svc/v1/users/{user_id}/erase` |
+
+`rows/deletions` 只带 id，所以两个读取 secret 任一都能打开它。两者至少设置一个时挂载，每个请求头只与它自己的 secret 比较。
 
 所有流都用 keyset 分页：`since`、一个平局 id 和 `limit`（默认 500，夹在 1..=1000）；`next` 仅在页满时出现，`null` 表示遍历结束。请求与响应形状及轮询建议见 [api-reference.zh.md](api-reference.zh.md#服務端點)。
 
 - **画像导出。** `GET /svc/v1/insights/changes` 按 `(updated_at, user_id)` 遍历 `human_insights`。一行包含 `user_id`、`updated_at` 和除 `kinks`、`ideology`、`mental_health` 之外的每个画像字段：**这三个字段从不导出。**
 - **事实导出。** `GET /svc/v1/facts/changes` 按 `(last_seen_at, id)` 遍历账本。一行包含 `id`、`user_id`、`content`、六个标签、`occurrences`、`session_count`、`recurrence`、`first_seen_at` 和 `last_seen_at`；session、消息和 run 的指针留在引擎内部。一次复现会移动 `last_seen_at`，所以每当计数器变化，该行就会在流里再出现一次。`first_seen_at` 与 `last_seen_at` 由写账本的那条语句自己打上（`now()`，复现时 `last_seen_at` 只进不退），时间戳只比提交早一条短语句，所以续接的轮询方重叠几秒即可。
-- **删除。** `GET /svc/v1/insights/deletions` 与 `GET /svc/v1/facts/deletions` 是同一条流，每个 secret 一条路由：来自 `engine.user_erasures` 的用户级墓碑 `{user_id, erased_at}`，按 `(erased_at, user_id)` keyset 分页。没有逐条事实的删除。**镜像画像、记忆或事实的消费方必须遵守这条流**：抹除会删掉它所镜像的行，而任何 changes 流都无法报告一行已经不存在。
-- **记忆导出。** `GET /svc/v1/memories/changes` 不变，自己不带删除信息；它的镜像通过 `insights/deletions` 得知哪些用户被抹除。
+- **记忆导出。** `GET /svc/v1/memories/changes` 按 `(created_at, id)` 遍历抽取出的画像层记忆。
+- **用户抹除。** `GET /svc/v1/insights/deletions` 与 `GET /svc/v1/facts/deletions` 是同一条流，每个 secret 一条路由：来自 `engine.user_erasures` 的用户级墓碑 `{user_id, erased_at}`，按 `(erased_at, user_id)` keyset 分页。镜像读到一个用户，就删掉它为该用户保存的一切。
+- **行删除。** `GET /svc/v1/rows/deletions` 按 `(deleted_at, id)` 遍历 `engine.row_deletions`：用户本人[删除](#逐条删除事实或记忆)的每条记忆（`kind: memory`）或事实（`kind: fact`）各有一条墓碑 `{kind, id, deleted_at}`。镜像删掉该 id 的行并记住这个 id，这样删除之前取到、却晚于墓碑到达的 changes 页不会把这行带回来。
+
+**镜像画像、记忆或事实的消费方必须遵守这两条删除流**：任何 changes 流都无法报告一行已经不存在。
+
+## 逐条删除事实或记忆
+
+用户本人可以通过 JWT 树下的四条路由，逐条列出并删除自己的账本事实和抽取出的画像记忆（路径里的 `user_id` 必须与 token 一致，否则 403）：
+
+- `GET /v2/comp/user/{user_id}/facts` 与 `GET /v2/comp/user/{user_id}/memories` 列出 `facts/changes` 与 `memories/changes` 导出的那些行，分别按 `first_seen_at` 与 `created_at` 从新到旧。
+- `DELETE /v2/comp/user/{user_id}/facts/{fact_id}` 与 `DELETE /v2/comp/user/{user_id}/memories/{memory_id}` 删除一行：`204`；id 不是该用户的这类行时 `404`，重复删除也是。
+
+形状见 [api-reference.zh.md](api-reference.zh.md#get-v2compuseruser_idfacts)。每次删除在一个事务里删掉该行，并往 `engine.row_deletions` 写一条墓碑（`kind`、该行原来的 `id`、`deleted_at`；没有 `user_id`，抹除也不碰这张表）。之后再次抽取出同一句话，是一条新 id 的新行。
+
+删除事实还会把画像交给下一次重建，自己不调用模型。在同一个事务里、删掉账本行之前，它先 upsert 该用户的 `human_profile_state` 行：清空 `claimed_at`，让读过旧账本、仍在进行中的重建[什么都写不进去](#状态与触发)；`pending_facts` 加一；`last_fact_at = now`；`rebuild_failures = 0`；`rebuild_due = true`。清扫器在下一个 tick（默认每五分钟）重建这个用户，这之前的多次删除只花一次重建。剩下的事实若不再支持任何画像，重建会[清空它](#结果)。
+
+删除记忆不需要更多动作：召回直接读表，也没有从它派生出的东西。
+
+删除覆盖不到的地方：
+
+- 事实的原文还留在抽取审计（`human_insights_events.payload`）和每日快照（`human_insights_snapshot`）里，只有抹除会删掉它们。
+- 世界导演把近期抽取的记忆读进 prompt；它在删除之前写下的内容仍可能复述这条记忆。
+- 逐轮原文记忆行原样保存用户的消息，这里既不列出也不能删除，仍可能被召回；关系层的行也一样。见 [memory-layers.zh.md](memory-layers.zh.md#归档与抹除)。
+- 随 session 硬删除而级联消失的记忆没有墓碑。
 
 ## 抹除
 
@@ -359,7 +388,7 @@ ORDER BY e.created_at DESC, e.stage;
 - **升级会回填账本，并为每个画像行排一次重建。** 回填迁移以 Postgres `NOTICE` 报告计数，形如 `events=<n> seeds=<n> pending=<n>`。`events` 是由审计事件建出的账本行数；`seeds` 是由当前画像值播种的行数（证据类型 `legacy_profile`）；`pending` 是排队等重建的用户数。只有当前有画像行的用户会被处理，所以没有画像行的部署什么都不回填。
 - **重建排空的成本是每个排队用户一次 LLM 调用**，所以部署之后预计有 `pending` 次调用，由闲置清扫器按每 `PROFILE_REBUILD_TICK_SECS` 处理 `PROFILE_REBUILD_BATCH` 个用户的节奏排空。在用户首次重建之前，他原来的画像行继续服务注入。清扫器关闭时，每个排队用户会在他下一次抽取运行时被重建，因为队列是按计数阈值播下的。请在部署前为 `[tasks.profile_rebuild]` 定好规格：抽取已关闭且没有 `[tasks.profile_rebuild]` 块时，排空会跑在全局默认模型上。`PROFILE_REBUILD_DISABLED=1` 可以阻止排空运行，而抽取关闭时再没有别的东西会触发重建。
 - **领域重分类归部署负责。** 回填的行保留旧的 `sexuality` 与 `health` 领域；拆出 `kink` 与 `mental_health` 只作用于新事实。引擎不带重分类器：想把旧行拆开的运维方，自己跑一遍离线流程去更新 `engine.human_facts.domain`，除 `UPDATE` 权限外不需要别的。重新打标签不会排队重建；更正后的领域会在该用户下一次重建时被读到。要手动排一次，把该用户 `human_profile_state` 行的 `pending_facts` 设为大于 0，并把 `last_fact_at` 设成早于闲置时长。
-- **镜像画像、记忆或事实的部署必须消费删除流**，并且在删除用户的 session 之前先调用抹除。
+- **镜像画像、记忆或事实的部署必须消费两条删除流**，并且在删除用户的 session 之前先调用抹除。
 
 ## 已知限制
 
@@ -368,16 +397,17 @@ ORDER BY e.created_at DESC, e.stage;
 - 一条事实始终保留首次出现时的标签，即使之后的出现会给它打别的标签。
 - 画像的新鲜度等于它上一次重建：最后一条新事实之后，最长可滞后一个闲置时长。
 - 账本超过 16,000 字符的预算时，每次重建只读它排名靠前的前缀。
-- 重建返回了没有可写内容的结果时，这批事实作为残余被接受，不会重试。
-- 没有逐条事实的删除；抹除以用户为单位。
+- 重建返回了没有可写内容的结果时，这批事实作为残余被接受，不会重试，画像被清空。
+- 删除一条事实后，它的原文仍留在审计与快照里，直到抹除。
 - 没有任何代码路径清理 `engine.human_insights_snapshot` 或 `engine.human_insights_events`。
 
 ## 源码
 
 - `crates/eros-engine-store/src/human_fact.rs` —— 词表、`FactInput`、`HumanFactRepo::upsert_run`、复现档位
-- `crates/eros-engine-store/src/profile_state.rs` —— `REBUILD_K`、`MAX_REBUILD_FAILURES`、`bump`、`claim`、`claim_due`、`finish_ok`、`finish_failed`
-- `crates/eros-engine-store/src/human_insight.rs` —— 19 个字段、`project_profile`、`is_placeholder`、`replace_profile`、`list_changes`
+- `crates/eros-engine-store/src/profile_state.rs` —— `REBUILD_K`、`MAX_REBUILD_FAILURES`、`bump`、`claim`、`claim_due`、`refresh_claim`、`finish_ok`、`finish_failed`（全部按令牌守卫）
+- `crates/eros-engine-store/src/human_insight.rs` —— 19 个字段、`project_profile`、`is_placeholder`、`replace_profile_if_claimed`、`clear_profile_if_claimed`、`list_changes`
 - `crates/eros-engine-store/src/erasure.rs` —— `erase_user`、删除与清空的表清单、删除流
+- `crates/eros-engine-store/src/row_deletion.rs` —— `engine.row_deletions`、行删除流
 - `crates/eros-engine-store/src/insight.rs` —— `InsightEventRepo`
 - `crates/eros-engine-server/src/pipeline/post_process.rs` —— `extract_insights`、`extract_facts`、`parse_fact_objects`、`record_facts`
 - `crates/eros-engine-server/src/pipeline/profile_rebuild.rs` —— `render_ledger`、`rebuild_user`、清扫器、`LEDGER_BUDGET_CHARS`
@@ -385,9 +415,10 @@ ORDER BY e.created_at DESC, e.stage;
 - `crates/eros-engine-server/src/pipeline/handlers.rs` —— `human_insights_to_bullets`
 - `crates/eros-engine-server/src/pipeline/voice.rs` —— 引导快照
 - `crates/eros-engine-server/src/pipeline/snapshot.rs` —— 快照清扫器
-- `crates/eros-engine-server/src/routes/svc.rs` —— 三棵 `/svc/v1/*` 子树；`routes/mod.rs` 按各自的 secret 挂载
+- `crates/eros-engine-server/src/routes/svc.rs` —— 三棵 `/svc/v1/*` 子树与 `rows/deletions`；`routes/mod.rs` 按各自的 secret 挂载
+- `crates/eros-engine-server/src/routes/user_rows.rs` —— 用户本人的事实与记忆列表和删除
 - `crates/eros-engine-server/src/routes/companion.rs` —— `GET /comp/user/{user_id}/profile`
 - `crates/eros-engine-llm/src/model_config.rs` —— `resolve_insight_extract`、`resolve_profile_rebuild`、`validate_structuring_prompt_unset`
-- `crates/eros-engine-store/migrations/0079_human_facts.sql`、`0080_human_facts_backfill.sql`、`0081_insights_2_cleanup.sql`
+- `crates/eros-engine-store/migrations/0079_human_facts.sql`、`0080_human_facts_backfill.sql`、`0081_insights_2_cleanup.sql`、`0084_row_deletions.sql`
 - `examples/model_config.toml` —— `[tasks.insight_extraction]` 与 `[tasks.profile_rebuild]`
-- 设计：[2026-10-26-insights-2-fact-ledger-design.md](superpowers/specs/2026-10-26-insights-2-fact-ledger-design.md)
+- 设计：[2026-10-26-insights-2-fact-ledger-design.md](superpowers/specs/2026-10-26-insights-2-fact-ledger-design.md)、[2026-11-10-row-deletion-and-deletion-stream-design.md](superpowers/specs/2026-11-10-row-deletion-and-deletion-stream-design.md)
