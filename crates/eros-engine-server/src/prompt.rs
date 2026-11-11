@@ -1304,7 +1304,7 @@ pub(crate) fn persona_traits(
     persona: &CompanionPersona,
 ) -> eros_engine_core::events::PersonaTraits {
     use eros_engine_core::events::{
-        Employment, EventCategory, EventKind, Health, PersonaTraits, Setting,
+        Employment, EventCategory, EventKind, Health, Outdoorsy, PersonaTraits, Setting,
     };
     let art = &persona.genome.art_metadata;
     PersonaTraits {
@@ -1341,6 +1341,9 @@ pub(crate) fn persona_traits(
             .and_then(Employment::parse)
             .unwrap_or_default(),
         habits: persona_habits(persona),
+        outdoorsy: meta_str(persona, "outdoorsy")
+            .and_then(Outdoorsy::parse)
+            .unwrap_or_default(),
     }
 }
 
@@ -4931,6 +4934,7 @@ mod tests {
                     alcoholic: Some(true),
                     ..Default::default()
                 },
+                outdoorsy: Default::default(),
             }
         );
         p.genome.art_metadata =
@@ -5012,6 +5016,32 @@ mod tests {
             p.genome.art_metadata = art;
             let t = persona_traits(&p);
             assert_eq!((t.hygienic, t.employed), (hygienic, employed));
+        }
+    }
+
+    #[test]
+    fn persona_traits_read_outdoorsy() {
+        use eros_engine_core::events::Outdoorsy;
+        let mut p = fixture_persona();
+        for (art, outdoorsy) in [
+            (
+                serde_json::json!({"outdoorsy": "outdoor"}),
+                Outdoorsy::Outdoor,
+            ),
+            (
+                serde_json::json!({"outdoorsy": "indoor"}),
+                Outdoorsy::Indoor,
+            ),
+            (
+                serde_json::json!({"outdoorsy": "neutral"}),
+                Outdoorsy::Neutral,
+            ),
+            (serde_json::json!({"outdoorsy": "yes"}), Outdoorsy::Neutral),
+            (serde_json::json!({"outdoorsy": true}), Outdoorsy::Neutral),
+            (serde_json::json!({}), Outdoorsy::Neutral),
+        ] {
+            p.genome.art_metadata = art;
+            assert_eq!(persona_traits(&p).outdoorsy, outdoorsy);
         }
     }
 
