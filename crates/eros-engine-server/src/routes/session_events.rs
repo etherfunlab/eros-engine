@@ -119,6 +119,14 @@ pub enum EventKindDto {
     WantHotSpring,
     WantSauna,
     BathingTogether,
+    WatchingStocks,
+    Trading,
+    GotLost,
+    Drinking,
+    Smoking,
+    SmokingWeed,
+    JustHaveSex,
+    Masturbating,
 }
 
 /// Reads the drawable kinds only: a request names kinds to draw, and the
@@ -205,6 +213,14 @@ impl From<EventKindDto> for EventKind {
             EventKindDto::WantHotSpring => EventKind::WantHotSpring,
             EventKindDto::WantSauna => EventKind::WantSauna,
             EventKindDto::BathingTogether => EventKind::BathingTogether,
+            EventKindDto::WatchingStocks => EventKind::WatchingStocks,
+            EventKindDto::Trading => EventKind::Trading,
+            EventKindDto::GotLost => EventKind::GotLost,
+            EventKindDto::Drinking => EventKind::Drinking,
+            EventKindDto::Smoking => EventKind::Smoking,
+            EventKindDto::SmokingWeed => EventKind::SmokingWeed,
+            EventKindDto::JustHaveSex => EventKind::JustHaveSex,
+            EventKindDto::Masturbating => EventKind::Masturbating,
         }
     }
 }
@@ -277,6 +293,14 @@ impl From<EventKind> for EventKindDto {
             EventKind::WantHotSpring => EventKindDto::WantHotSpring,
             EventKind::WantSauna => EventKindDto::WantSauna,
             EventKind::BathingTogether => EventKindDto::BathingTogether,
+            EventKind::WatchingStocks => EventKindDto::WatchingStocks,
+            EventKind::Trading => EventKindDto::Trading,
+            EventKind::GotLost => EventKindDto::GotLost,
+            EventKind::Drinking => EventKindDto::Drinking,
+            EventKind::Smoking => EventKindDto::Smoking,
+            EventKind::SmokingWeed => EventKindDto::SmokingWeed,
+            EventKind::JustHaveSex => EventKindDto::JustHaveSex,
+            EventKind::Masturbating => EventKindDto::Masturbating,
         }
     }
 }
@@ -837,9 +861,14 @@ async fn plan_event(
         (ChatRepo { pool: &state.pool }).latest_scopes(session_id).await?,
         Some((_, scope)) if eros_engine_core::scope::romance_compatible(scope)
     );
+    // Either kind of sex ends her virginity (spec 2026-11-11-stocks-lost-
+    // habit-events-and-just-have-sex-design.md §4).
     let ever_had_sex = event_repo
         .ever(instance_id, events::EventKind::HavingSex)
-        .await?;
+        .await?
+        || event_repo
+            .ever(instance_id, events::EventKind::JustHaveSex)
+            .await?;
     let Some(drawn) = events::draw(
         &DrawInput {
             now,
@@ -2029,6 +2058,8 @@ mod tests {
         let user_id = Uuid::new_v4();
         let (instance_id, session_id) = setup(&pool, user_id).await;
         seed_user_messages(&pool, session_id, 10).await;
+        // `having_sex` is drawn for a sex addict only.
+        set_art(&pool, instance_id, json!({"sex_addict": true})).await;
         let only = |key: &str| req(key, Some(vec![EventKindDto::HavingSex]));
         let mut off = test_state(pool.clone());
         off.model_config = Arc::new(
@@ -2077,7 +2108,12 @@ mod tests {
         let user_id = Uuid::new_v4();
         let (instance_id, session_id) = setup(&pool, user_id).await;
         seed_user_messages(&pool, session_id, 10).await;
-        set_art(&pool, instance_id, json!({"is_virgin": true})).await;
+        set_art(
+            &pool,
+            instance_id,
+            json!({"is_virgin": true, "sex_addict": true}),
+        )
+        .await;
         let long_ago = Utc::now() - chrono::Duration::days(200);
         eros_engine_store::events::EventRepo { pool: &pool }
             .insert_preempting(&eros_engine_store::events::NewEvent {
@@ -2113,6 +2149,55 @@ mod tests {
             out.event.map(|e| e.kind),
             Some(EventKindDto::HavingSex),
             "the ever-had-sex read reaches the draw"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_just_have_sex_row_ends_her_virginity_too(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (instance_id, session_id) = setup(&pool, user_id).await;
+        seed_user_messages(&pool, session_id, 10).await;
+        set_art(
+            &pool,
+            instance_id,
+            json!({"is_virgin": true, "sex_addict": true}),
+        )
+        .await;
+        let long_ago = Utc::now() - chrono::Duration::days(200);
+        eros_engine_store::events::EventRepo { pool: &pool }
+            .insert_preempting(&eros_engine_store::events::NewEvent {
+                instance_id,
+                session_id,
+                event_key: "old",
+                kind: EventKind::JustHaveSex,
+                started_at: long_ago,
+                ends_at: long_ago + chrono::Duration::hours(1),
+            })
+            .await
+            .unwrap();
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "在看书").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            req(
+                "x1",
+                Some(vec![EventKindDto::HavingSex, EventKindDto::Reading]),
+            ),
+            Utc::now(),
+            rolls(0.8),
+        )
+        .await
+        .unwrap();
+        // Draw order is Reading 2 then HavingSex: 1 once she has (0.8 × 3 =
+        // 2.4 lands on HavingSex), 0.2 if the read were not wired (0.8 × 2.2
+        // = 1.76 would land on Reading).
+        assert_eq!(
+            out.event.map(|e| e.kind),
+            Some(EventKindDto::HavingSex),
+            "a just_have_sex row counts as having had sex"
         );
     }
 
