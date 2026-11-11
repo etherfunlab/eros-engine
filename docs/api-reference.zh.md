@@ -889,6 +889,14 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | `short` | `want_to_see_sea` | 1 小时 | 想去看海 |
 | `short` | `want_hot_spring` | 1 小时 | 想去泡温泉 |
 | `short` | `want_sauna` | 1 小时 | 想去洗桑拿 |
+| `short` | `watching_stocks` | 30 分钟 | 在看股票 |
+| `short` | `trading` | 1 小时 | 在和人谈一笔买卖 |
+| `short` | `got_lost` | 1 小时 | 迷路了（只在旅行中，她自己的或和用户一起的） |
+| `short` | `drinking` | 30 分钟 | 在喝酒（`alcoholic` 为 `true` 的角色） |
+| `short` | `smoking` | 30 分钟 | 在抽烟（`smoking` 为 `true` 的角色） |
+| `short` | `smoking_weed` | 30 分钟 | 在抽大麻（`drug` 为 `true` 的角色） |
+| `short` | `just_have_sex` | 30 分钟 | 刚做完爱，讲给对方听（档 3） |
+| `short` | `masturbating` | 30 分钟 | 自慰中（性瘾角色，档 3） |
 | `mid` | `temp_work` | 4 小时 | 临时接到工作 |
 | `mid` | `ex_message` | 3 小时 | 前任发来消息 |
 | `mid` | `weather_change` | 4 小时 | 天气突然变了 |
@@ -909,7 +917,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | `mid` | `on_the_road` | 2–4 小时 | 在路上：长途通勤、坐车、坐火车、坐飞机 |
 | `mid` | `watching_match` | 2–3 小时 | 在看比赛 |
 | `mid` | `watching_show` | 2–3 小时 | 在看表演 |
-| `mid` | `having_sex` | 1–2 小时 | 在做爱（离线，从不讲出来） |
+| `mid` | `having_sex` | 1–2 小时 | 在做爱（性瘾角色；离线，从不讲出来） |
 | `mid` | `want_to_go_out` | 1–3 小时 | 很想出门 |
 | `mid` | `want_to_go_home` | 1–3 小时 | 很想回家 |
 | `body` | `sick` | 1–3 天 | 生病中 |
@@ -921,14 +929,14 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | `trip` | `long_trip` | 3–7 天 | 长途旅游 |
 | `trip` | `hometown_visit` | 72 小时 | 回老家 |
 
-时长写成区间的，在事件开始时从区间里抽定。以上共 61 种可抽取的种类。两种性别都会抽到两个聚会，权重相同，这是有意为之。
+时长写成区间的，在事件开始时从区间里抽定。以上共 69 种可抽取的种类。两种性别都会抽到两个聚会，权重相同，这是有意为之。
 
 另有四种永远不会被抽到：`taking_space`（她提出、用户同意的分开，12–24 小时，离线）、`fell_out`（用户不理会她提出的分开请求时的那场不愉快，1 小时）、`traveling_together`（她提议、用户同意的旅行，48–72 小时，`trip` 类背景，不离线）和 `bathing_together`（她提议、用户同意的一起洗澡，30 分钟，`short` 类插曲，不离线）。
 它们由 engine 为[生活选择流程](#post-v2compsessionsession_idlife-choiceschoice_id)写入，作为 `…/effects` 和生活选择响应里的 `event` 出现，
 不能写进 `kinds`。
 
-`sudden_desire`、`strip`、`streaking`、`having_sex` 与 `pregnancy_scare`（后者隐含性行为）带成人题材；只对部分用户提供这类内容的调用方，用
-`{"disallow": ["sudden_desire", "strip", "streaking", "having_sex", "pregnancy_scare"]}` 把它们排除。`scolded_by_superior` 与 `scolded_superior`
+`sudden_desire`、`strip`、`streaking`、`having_sex`、`just_have_sex`、`masturbating` 与 `pregnancy_scare`（后者隐含性行为）带成人题材；只对部分用户提供这类内容的调用方，用
+`{"disallow": ["sudden_desire", "strip", "streaking", "having_sex", "just_have_sex", "masturbating", "pregnancy_scare"]}` 把它们排除。`scolded_by_superior` 与 `scolded_superior`
 假定她有上级；角色没有上级时，由调用方排除。`disallow` 列表之外的种类都照常抽取，engine 以后新增的种类也一样。
 数组或 `allow` 列表只抽它点名的种类：用白名单的调用方要把 `want_to_go_out` 和 `want_to_go_home` 加进去才会抽到。
 
@@ -936,20 +944,25 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 
 - **两段抽取。** engine 先按权重抽类别，再在类别内按权重抽种类。往一个类别里加种类，不会改变其他类别的占比。
 - **一次一件插曲，一个背景。** 角色的任何一个 session 里有插曲在进行时，不再抽取。背景进行期间只抽插曲；
-  住院和术后期间，不抽需要她出门活动的那二十四种（`temp_work`、`police_encounter`、`animal_encounter`、
+  住院和术后期间，不抽需要她出门活动的那三十种（`temp_work`、`police_encounter`、`animal_encounter`、
   `hit_someone`、`got_hit`、`working_out`、`grocery_shopping`、`in_class`、`on_the_way`、`in_battle`、
   `got_bumped`、`bumped_someone`、`saw_bag`、`saw_clothes`、`out_shopping`、`bros_gathering`、`sis_gathering`、
-  `admiring_scenery`、`admiring_art`、`watching_show`、`on_the_road`、`having_sex`、`bird_encounter`、`streaking`）；
-  `period` 期间，`period_scare` 与 `pregnancy_scare` 都不抽。
+  `admiring_scenery`、`admiring_art`、`watching_show`、`on_the_road`、`having_sex`、`bird_encounter`、`streaking`、
+  `got_lost`、`trading`、`drinking`、`smoking`、`smoking_weed`、`just_have_sex`）；
+  `period` 期间，`period_scare` 与 `pregnancy_scare` 都不抽；`traveling_together` 期间，不抽任何可能让她离线的种类，
+  也不抽 `just_have_sex`：她和用户在一起。`got_lost` 只在 `short_trip`、`long_trip`、`hometown_visit` 或
+  `traveling_together` 进行期间抽取。
 - **她在等回答时什么都不抽。** 从她提出请求（不论哪一种生活选择）起，到它被回答或过期（24 小时）为止，角色任何一个 session 的抽取都返回
   `{"event": null, "message": null}`。带着已经抽过的 `event_key` 来重复调用，照样返回那个事件。
 - **冷却。** 每种事件从开始起有各自的冷却。trip 类每周最多开始一次，body 类每两周最多开始一次，不论具体是哪一种。
   任何离线类种类每 12 小时最多开始一次，不论具体是哪一种。
 - **她的需求给类别内的种类加权**，前提是部署配置了 LLM 判官，并且角色有一次判定：`high` 的 `outing` 偏向
-  `want_to_go_out` 和 `want_to_see_sea`，`low` 的偏向 `want_to_go_home`，`high` 的 `indulgence` 偏向 `want_to_go_out` 和 `irritable`
-  （完整的表见 [life-events-needs.zh.md](life-events-needs.zh.md#1-需求给种类加权)）。
+  `want_to_go_out` 和 `want_to_see_sea`，`low` 的偏向 `want_to_go_home`，`high` 的 `indulgence` 偏向 `want_to_go_out` 和 `irritable`，
+  更强地偏向 `drinking`、`smoking` 和 `smoking_weed`（完整的表见 [life-events-needs.zh.md](life-events-needs.zh.md#1-需求给种类加权)）。
 - **亲近度门槛。** `ex_message`、`breakup` 与 `ex_wants_back` 不会向不太熟的人抽出（intimacy 档 2 及以上）；
-  `sudden_desire` 只在最亲近的档（3）；`strip` 与 `streaking` 在档 3、且会话最新记录的 `affinity_scope` 性向相容时才抽（没有记录就不抽）。`period` 只对 `art_metadata.gender` 为 `"female"` 的角色抽取；
+  `sudden_desire` 与 `just_have_sex` 只在最亲近的档（3）；`strip` 与 `streaking` 在档 3、且会话最新记录的 `affinity_scope` 性向相容时才抽（没有记录就不抽）。
+  `having_sex` 只对 `art_metadata.sex_addict` 为 `true` 的角色抽取，`masturbating` 只对这样的角色在档 3 抽取。
+  `drinking`、`smoking`、`smoking_weed` 分别只对 `alcoholic`、`smoking`、`drug` 为 `true` 的角色抽取。`period` 只对 `art_metadata.gender` 为 `"female"` 的角色抽取；
   `period_scare`（档 2 及以上）与 `pregnancy_scare`（档 3）同样只对这样的角色抽取，`saw_bag` 和 `saw_clothes` 也是；
   从档 2 起，她会说自己想要看中的东西，有 `tip_personality` 的角色用那份人格的口吻说。离线类种类遵循两道 ghost 门槛（见下）。
 - **角色设置**，写在 genome 的 `art_metadata` 里，影响抽取：
@@ -960,12 +973,12 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
   | `health` | `"weak"`、`"normal"`（默认）、`"strong"` | body 类被抽到的概率分别是原来的两倍 / 一倍 / 一半 |
   | `prefer_trip` | `true` / `false`（默认） | trip 类被抽到的概率是原来的三倍；仍然每周最多一次 |
   | `homesick` | `true` / `false` / 不写 | 出行往哪去：`true` 偏向 `hometown_visit`、压低游玩的两种；`false` 压低 `hometown_visit`；`business_trip` 不动 |
-  | `is_virgin` | `true` / `false`（默认） | 第一次 `having_sex` 事件之前，`having_sex` 的概率是五分之一；之后这个键不再起作用 |
-  | `sex_addict` | `true` / `false` / 不写 | `sudden_desire`、`strip` 与 `streaking` 在 `short` 内被抽到的概率是原来的三倍 / 三分之一；门槛照旧 |
+  | `is_virgin` | `true` / `false`（默认） | 第一次 `having_sex` 或 `just_have_sex` 事件之前，`having_sex` 与 `just_have_sex` 的概率是五分之一；之后这个键不再起作用 |
+  | `sex_addict` | `true` / `false` / 不写 | `sudden_desire`、`strip`、`streaking` 与 `just_have_sex` 在 `short` 内被抽到的概率是原来的三倍 / 三分之一；门槛照旧。只有 `true` 才会抽到 `having_sex` 和 `masturbating` |
   | `hygienic` | `true` / `false` / 不写 | `showering`、`bathing`、`want_hot_spring` 与 `want_sauna` 在 `short` 内被抽到的概率是原来的三倍 / 三分之一；也决定她什么时候提出一起洗澡（见[下文](#post-v2compsessionsession_idlife-choiceschoice_id)） |
   | `employed` | `"free"`、`"part_time"`（默认）、`"full_time"` | 她的一天有多少是工作：`temp_work`、`scolded_by_superior`、`scolded_superior` 与 `business_trip` 在各自类别内被抽到的概率分别是原来的三分之一 / 一倍 / 三倍，`free` 的角色不会抽到 `want_to_quit_job`；其他值按 `part_time` 读 |
-  | `setting` | `"modern"`（默认）、`"fantasy"` | 她生活的世界：`fantasy` 的角色不会抽到 `police_encounter`、`showering`、`taking_selfie`、`gaming`、`watching_match`、`watching_show`、`business_trip`、`hospitalized`、`post_surgery`，不管 `kinds` 或 `prefer_events` 怎么写；其他值按 `modern` 读 |
-  | `smoking`、`alcoholic`、`drug`、`coffee`、`gluttony` | 各为 `true` / `false` / 不写 | 她抽不抽烟、喝不喝酒、用不用大麻、喝不喝咖啡、贪不贪吃：为 `true` 的越多，她的 `indulgence` 回到 `high` 越快，进而给抽取加权；为 `false` 的键可能让她拒收递来的这样东西（见[上文](#post-compchatsession_idmessagestream)） |
+  | `setting` | `"modern"`（默认）、`"fantasy"` | 她生活的世界：`fantasy` 的角色不会抽到 `police_encounter`、`showering`、`taking_selfie`、`gaming`、`watching_match`、`watching_show`、`business_trip`、`hospitalized`、`post_surgery`、`watching_stocks`，不管 `kinds` 或 `prefer_events` 怎么写；其他值按 `modern` 读 |
+  | `smoking`、`alcoholic`、`drug`、`coffee`、`gluttony` | 各为 `true` / `false` / 不写 | 她抽不抽烟、喝不喝酒、用不用大麻、喝不喝咖啡、贪不贪吃：为 `true` 的越多，她的 `indulgence` 回到 `high` 越快，进而给抽取加权；为 `false` 的键可能让她拒收递来的这样东西（见[上文](#post-compchatsession_idmessagestream)）；`smoking`、`alcoholic`、`drug` 为 `true` 时她才会抽到 `smoking`、`drinking`、`smoking_weed` |
 
   取值形状不对、种类未知，或种类不在 `mid` 里，一律忽略。偏好不会绕过任何门槛。
 - **只要有符合条件的种类，抽取就一定得到一个事件。** 她的一天有多热闹，取决于调用方什么时候来要。

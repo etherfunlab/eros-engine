@@ -1093,6 +1093,14 @@ Kinds fall into four categories. `short` and `mid` are incidents; `body` and
 | `short` | `want_to_see_sea` | 1 h | she badly wants to see the sea |
 | `short` | `want_hot_spring` | 1 h | she badly wants a hot spring |
 | `short` | `want_sauna` | 1 h | she badly wants a sauna |
+| `short` | `watching_stocks` | 30 min | she is watching the market |
+| `short` | `trading` | 1 h | she is making a deal with someone |
+| `short` | `got_lost` | 1 h | she has lost her way (only on a trip, her own or one with the user) |
+| `short` | `drinking` | 30 min | she is drinking (a persona whose `alcoholic` is `true`) |
+| `short` | `smoking` | 30 min | she is smoking (a persona whose `smoking` is `true`) |
+| `short` | `smoking_weed` | 30 min | she is smoking weed (a persona whose `drug` is `true`) |
+| `short` | `just_have_sex` | 30 min | she has just had sex, and tells the user (rung 3) |
+| `short` | `masturbating` | 30 min | she is masturbating (a sex addict, rung 3) |
 | `mid` | `temp_work` | 4 h | she is called in to work |
 | `mid` | `ex_message` | 3 h | her ex texts her |
 | `mid` | `weather_change` | 4 h | the weather turns |
@@ -1113,7 +1121,7 @@ Kinds fall into four categories. `short` and `mid` are incidents; `body` and
 | `mid` | `on_the_road` | 2–4 h | she is on a long stretch of travel: a commute, a coach, a train, a flight |
 | `mid` | `watching_match` | 2–3 h | she is watching a match |
 | `mid` | `watching_show` | 2–3 h | she is at a show |
-| `mid` | `having_sex` | 1–2 h | she is having sex (offline, never announced) |
+| `mid` | `having_sex` | 1–2 h | she is having sex (a sex addict; offline, never announced) |
 | `mid` | `want_to_go_out` | 1–3 h | she badly wants to get out |
 | `mid` | `want_to_go_home` | 1–3 h | she badly wants to go home |
 | `body` | `sick` | 1–3 d | she is ill |
@@ -1125,7 +1133,7 @@ Kinds fall into four categories. `short` and `mid` are incidents; `body` and
 | `trip` | `long_trip` | 3–7 d | a long trip |
 | `trip` | `hometown_visit` | 72 h | a visit home |
 
-A range is drawn when the event starts. That is 61 drawable kinds. Both genders
+A range is drawn when the event starts. That is 69 drawable kinds. Both genders
 draw both gatherings, at the same weight; that is deliberate.
 
 Four more kinds are never drawn: `taking_space` (a separation she asked for and
@@ -1138,9 +1146,9 @@ and `bathing_together` (a bath she suggested and the user agreed to, 30 min, a
 show up as the `event` of `…/effects` and of the life-choice response, and
 cannot be listed in `kinds`.
 
-`sudden_desire`, `strip`, `streaking`, `having_sex` and `pregnancy_scare`, which implies sex, carry adult themes;
+`sudden_desire`, `strip`, `streaking`, `having_sex`, `just_have_sex`, `masturbating` and `pregnancy_scare`, which implies sex, carry adult themes;
 a caller that serves them only to some users leaves them out with
-`{"disallow": ["sudden_desire", "strip", "streaking", "having_sex", "pregnancy_scare"]}`. `scolded_by_superior` and
+`{"disallow": ["sudden_desire", "strip", "streaking", "having_sex", "just_have_sex", "masturbating", "pregnancy_scare"]}`. `scolded_by_superior` and
 `scolded_superior` assume someone above her; for a persona with no one above
 her, the caller disallows them. A `disallow` list leaves every other kind in,
 including kinds the engine adds later. An array or an `allow` list draws only
@@ -1160,8 +1168,12 @@ The draw:
   `bumped_someone`, `saw_bag`, `saw_clothes`, `out_shopping`,
   `bros_gathering`, `sis_gathering`, `admiring_scenery`, `admiring_art`,
   `watching_show`, `on_the_road`, `having_sex`, `bird_encounter`,
-  `streaking`); during `period`,
-  neither `period_scare` nor `pregnancy_scare`.
+  `streaking`, `got_lost`, `trading`, `drinking`, `smoking`, `smoking_weed`,
+  `just_have_sex`); during `period`,
+  neither `period_scare` nor `pregnancy_scare`; during `traveling_together`,
+  no kind that can take her offline and not `just_have_sex`, since she is with
+  the user. `got_lost` is drawn only while a `short_trip`, `long_trip`,
+  `hometown_visit` or `traveling_together` is under way.
 - **While she waits for an answer, nothing is drawn.** From her ask (of any
   life choice) until it is answered or lapses (24 h), the draw returns `{"event": null,
   "message": null}` for every session of the persona. A repeat of an
@@ -1172,12 +1184,16 @@ The draw:
 - **Her needs weight the pick** within a category, when the deployment runs the
   LLM judge and the persona has a rating: a high `outing` favours
   `want_to_go_out` and `want_to_see_sea`, a low one `want_to_go_home`, and a high `indulgence`
-  favours `want_to_go_out` and `irritable` (the full table is in
+  favours `want_to_go_out` and `irritable`, and `drinking`, `smoking` and
+  `smoking_weed` more strongly (the full table is in
   [life-events-needs.md](life-events-needs.md#1-needs-weight-the-kind-pick)).
 - **Closeness gates.** `ex_message`, `breakup` and `ex_wants_back` are not drawn for someone she
-  barely knows (intimacy rung 2 and up); `sudden_desire` only at the closest
+  barely knows (intimacy rung 2 and up); `sudden_desire` and `just_have_sex` only at the closest
   rung (3), and `strip` and `streaking` at rung 3 only when the session's newest recorded
-  `affinity_scope` is romance-compatible (none recorded: not drawn). `period` is drawn only for a persona whose `art_metadata.gender` is
+  `affinity_scope` is romance-compatible (none recorded: not drawn). `having_sex` is drawn only
+  for a persona whose `art_metadata.sex_addict` is `true`, and `masturbating` only for such a
+  persona at rung 3. `drinking`, `smoking` and `smoking_weed` are drawn only for a persona whose
+  `alcoholic`, `smoking` or `drug` key, in that order, is `true`. `period` is drawn only for a persona whose `art_metadata.gender` is
   `"female"`. `period_scare` (rung 2 and up) and `pregnancy_scare` (rung 3) are
   also drawn only for such a persona, and so are `saw_bag` and `saw_clothes`;
   from rung 2 she says she wants what she found, in her `tip_personality`'s
@@ -1191,12 +1207,12 @@ The draw:
   | `health` | `"weak"`, `"normal"` (default), `"strong"` | `body` states come up twice / once / half as often |
   | `prefer_trip` | `true` / `false` (default) | trips come up three times as often; still once a week at most |
   | `homesick` | `true` / `false` / absent | where a trip goes: `true` favours `hometown_visit` and thins the leisure trips, `false` thins `hometown_visit`; `business_trip` untouched |
-  | `is_virgin` | `true` / `false` (default) | `having_sex` is a fifth as likely until her first `having_sex` event, after which the key no longer applies |
-  | `sex_addict` | `true` / `false` / absent | `sudden_desire`, `strip` and `streaking` come up three times / a third as often within `short`; their gates hold |
+  | `is_virgin` | `true` / `false` (default) | `having_sex` and `just_have_sex` are a fifth as likely until her first `having_sex` or `just_have_sex` event, after which the key no longer applies |
+  | `sex_addict` | `true` / `false` / absent | `sudden_desire`, `strip`, `streaking` and `just_have_sex` come up three times / a third as often within `short`; their gates hold. Only `true` draws `having_sex` and `masturbating` |
   | `hygienic` | `true` / `false` / absent | `showering`, `bathing`, `want_hot_spring` and `want_sauna` come up three times / a third as often within `short`; it also sets when she asks for a bath together ([below](#post-v2compsessionsession_idlife-choiceschoice_id)) |
   | `employed` | `"free"`, `"part_time"` (default), `"full_time"` | how much of her day is work: `temp_work`, `scolded_by_superior`, `scolded_superior` and `business_trip` come up a third as often / as they are / three times as often within their categories, and a `free` persona never draws `want_to_quit_job`; any other value reads as `part_time` |
-  | `setting` | `"modern"` (default), `"fantasy"` | the world she lives in: a `fantasy` persona never draws `police_encounter`, `showering`, `taking_selfie`, `gaming`, `watching_match`, `watching_show`, `business_trip`, `hospitalized` or `post_surgery`, whatever `kinds` or `prefer_events` say; any other value reads as `modern` |
-  | `smoking`, `alcoholic`, `drug`, `coffee`, `gluttony` | each `true` / `false` / absent | whether she smokes, drinks, uses weed, drinks coffee, loves good food: the more are `true`, the sooner her `indulgence` comes back to `high` and weighs the pick; a `false` key can make her refuse a `give` of that thing ([above](#post-compchatsession_idmessagestream)) |
+  | `setting` | `"modern"` (default), `"fantasy"` | the world she lives in: a `fantasy` persona never draws `police_encounter`, `showering`, `taking_selfie`, `gaming`, `watching_match`, `watching_show`, `business_trip`, `hospitalized`, `post_surgery` or `watching_stocks`, whatever `kinds` or `prefer_events` say; any other value reads as `modern` |
+  | `smoking`, `alcoholic`, `drug`, `coffee`, `gluttony` | each `true` / `false` / absent | whether she smokes, drinks, uses weed, drinks coffee, loves good food: the more are `true`, the sooner her `indulgence` comes back to `high` and weighs the pick; a `false` key can make her refuse a `give` of that thing ([above](#post-compchatsession_idmessagestream)); `smoking`, `alcoholic` and `drug` set to `true` let her draw `smoking`, `drinking` and `smoking_weed` |
 
   A value of the wrong shape, an unknown kind or a kind outside `mid` is
   ignored. A preference never lifts a gate.

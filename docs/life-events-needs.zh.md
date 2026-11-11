@@ -175,7 +175,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 
 ### 类别
 
-可抽取的事件共 61 种，每一种属于一个类别，类别决定它的形态：
+可抽取的事件共 69 种，每一种属于一个类别，类别决定它的形态：
 
 | `category` | 形态 | 持续 | 类别权重 | 类别冷却 |
 |---|---|---|---|---|
@@ -203,12 +203,13 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 抽取是输入加三个随机数（两段各一个，时长一个）的纯函数。
 
 1. **资格。** 一个种类同时满足下面几条才有资格：
-   - 调用方的 `kinds` 允许它（[见下](#调用方的-kinds)；不带表示全部 61 种）；
+   - 调用方的 `kinds` 允许它（[见下](#调用方的-kinds)；不带表示全部 69 种）；
    - 过了它的门槛（见下）；
    - 它自己的冷却已过；
    - 它所属类别的冷却已过；
    - 离线类种类还要过了共享的离线冷却（见下）；
-   - 背景规则允许它（见下）。
+   - 背景规则允许它（见下）；
+   - 对 `got_lost` 这唯一一种需要背景的种类，它的某个背景正在进行（见下）。
 2. **类别。** 每个至少有一个合格种类的类别，权重是类别权重乘以角色系数。掷一次随机数，按累计权重选一个。
 3. **种类。** 该类别里每个合格种类的权重是基础权重乘以它的各项[需求系数](#1-需求给种类加权)、
    `prefer_events` 系数、[关联系数](#关联系数)，少数种类再乘一个角色系数（[`is_virgin`](#角色设置)、
@@ -228,9 +229,12 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
   需要她出门活动的那几种不抽：`temp_work`、`police_encounter`、`animal_encounter`、`hit_someone`、
   `got_hit`、`working_out`、`grocery_shopping`、`in_class`、`on_the_way`、`in_battle`、`got_bumped`、
   `bumped_someone`、`saw_bag`、`saw_clothes`、`out_shopping`、`bros_gathering`、`sis_gathering`、
-  `admiring_scenery`、`admiring_art`、`watching_show`、`on_the_road`、`having_sex`、`bird_encounter`、`streaking`。
+  `admiring_scenery`、`admiring_art`、`watching_show`、`on_the_road`、`having_sex`、`bird_encounter`、`streaking`、
+  `got_lost`、`trading`、`drinking`、`smoking`、`smoking_weed`、`just_have_sex`。
   `period` 期间，
-  不抽 `period_scare` 与 `pregnancy_scare`。`traveling_together` 期间，不抽任何可能让她离线的种类：她和用户在一起。
+  不抽 `period_scare` 与 `pregnancy_scare`。`traveling_together` 期间，不抽任何可能让她离线的种类，也不抽 `just_have_sex`：她和用户在一起。
+- 有一种是需要背景，而不是被背景排除：`got_lost` 只在 `short_trip`、`long_trip`、`hometown_visit` 或 `traveling_together`
+  进行期间抽取，出差时和不在旅途中都不抽。
 - 她在等用户回答自己提出的某次生活选择时，同样完全不抽，角色的任何一个 session 都一样：这个请求本身就是前台戏，
   也免得一段离线时段在问话中间开始。带着已经抽过的 `event_key` 来重复调用，照样返回那个事件。
 - 一件插曲和一个背景可以同时进行。背景里抽到的插曲，是从背景里讲出来的。
@@ -258,13 +262,19 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 | 种类 | 门槛 |
 |---|---|
 | `ex_message`、`breakup`、`ex_wants_back` | 亲密度档 2 及以上 |
-| `sudden_desire` | 亲密度档 3 |
+| `sudden_desire`、`just_have_sex` | 亲密度档 3 |
+| `masturbating` | 角色的 `art_metadata.sex_addict` 为 `true`，并且亲密度档 3 |
+| `drinking`、`smoking`、`smoking_weed` | 角色的 `art_metadata.alcoholic`、`smoking`、`drug` 分别为 `true` |
+| `got_lost` | 有 `short_trip`、`long_trip`、`hometown_visit` 或 `traveling_together` 正在进行（见[上文](#同一时间一件插曲一个背景)） |
 | `strip`、`streaking` | 亲密度档 3，且会话最新记录的 `affinity_scope` 性向相容（scope 里有暧昧感轴）；没有记录算不相容 |
 | `period`、`saw_bag`、`saw_clothes` | 角色的 `art_metadata.gender` 为 `"female"` |
 | `want_to_quit_job` | 角色的 `art_metadata.employed` 不为 `"free"` |
 | `period_scare` | 角色的 `art_metadata.gender` 为 `"female"`，并且亲密度档 2 及以上 |
 | `pregnancy_scare` | 角色的 `art_metadata.gender` 为 `"female"`，并且亲密度档 3 |
+| `having_sex` | 角色的 `art_metadata.sex_addict` 为 `true` |
 | `away_from_phone`、`busy`、`in_battle`、`asleep`、`bros_gathering`、`sis_gathering`、`having_sex`，以及女性角色的 `out_shopping` | ghost 保护允许（见[下文](#离线类)） |
+
+`just_have_sex` 只看档位：它和 `strip` 不同，不查性向是否相容。
 
 `out_shopping` 和两个聚会没有性别门槛：谁会因此离线、为什么两种性别都会抽到两个聚会，见
 [逛街与聚会](#逛街与聚会)。
@@ -282,18 +292,18 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 | `health` | `"weak"`、`"normal"`（默认）、`"strong"` | `body` 类别权重分别为 2 倍、1 倍、一半 |
 | `prefer_trip` | `true`、`false`（默认） | `trip` 类别权重为 3 倍 |
 | `homesick` | `true`、`false`、不写（默认） | `trip` 内部：`true` 时 `hometown_visit` 3 倍、`short_trip` / `long_trip` 三分之一；`false` 时 `hometown_visit` 三分之一；`business_trip` 是工作，两种情况都不动 |
-| `is_virgin` | `true`、`false`（默认） | 她还是处女期间，`having_sex` 在 `mid` 内权重为五分之一 |
-| `sex_addict` | `true`、`false`、不写（默认） | `short` 内部：`true` 时 `sudden_desire`、`strip` 与 `streaking` 3 倍，`false` 时三分之一；它们的门槛两种情况都照旧 |
+| `is_virgin` | `true`、`false`（默认） | 她还是处女期间，`having_sex` 在 `mid` 内、`just_have_sex` 在 `short` 内权重为五分之一 |
+| `sex_addict` | `true`、`false`、不写（默认） | `short` 内部：`true` 时 `sudden_desire`、`strip`、`streaking` 与 `just_have_sex` 3 倍，`false` 时三分之一；它们的门槛两种情况都照旧。只有 `true` 才会抽到 `having_sex` 和 `masturbating` |
 | `hygienic` | `true`、`false`、不写（默认） | `short` 内部：`true` 时 `showering`、`bathing`、`want_hot_spring` 与 `want_sauna` 3 倍，`false` 时三分之一；它也决定[一起洗澡](#一起洗澡)要 chemistry 到第几档 |
 | `employed` | `"free"`、`"part_time"`（默认）、`"full_time"` | 她的一天有多少是工作：`temp_work`、`scolded_by_superior`、`scolded_superior` 与 `business_trip` 在各自类别内分别为三分之一、1 倍、3 倍；`free` 的角色不会抽到 `want_to_quit_job`；其他值按 `part_time` 读 |
 | `setting` | `"modern"`（默认）、`"fantasy"` | 她生活的世界（见[下文](#她的世界)）；其他值按 `modern` 读 |
-| `smoking`、`alcoholic`、`drug`、`coffee`、`gluttony` | 各为 `true`、`false`、不写（默认） | 她抽不抽烟、喝不喝酒、用不用大麻、喝不喝咖啡、贪不贪吃（`false` 表示她忌口、节食）：决定 `indulgence` 回来得多快（见[漂移](#两次评定之间的漂移)）、`high` 的 `indulgence` 在回复里点名什么，以及她怎么对待递来的这样东西（见下） |
+| `smoking`、`alcoholic`、`drug`、`coffee`、`gluttony` | 各为 `true`、`false`、不写（默认） | 她抽不抽烟、喝不喝酒、用不用大麻、喝不喝咖啡、贪不贪吃（`false` 表示她忌口、节食）：决定 `indulgence` 回来得多快（见[漂移](#两次评定之间的漂移)）、`high` 的 `indulgence` 在回复里点名什么，以及她怎么对待递来的这样东西（见下）；`smoking`、`alcoholic`、`drug` 为 `true` 时，她才会抽到 `smoking`、`drinking`、`smoking_weed` |
 
 `prefer_trip` 管她动不动，`homesick` 管她动起来往哪去。两者都为 `true` 的空姐角色经常出行、照常出差，
 放假回家而不是去别处。
 
-抽取看到的「是否处女」是推导出来的：卡上写了 `is_virgin`，并且这个实例从来没有过 `having_sex` 事件。
-第一条 `having_sex` 行写下之后就不再是了，不需要任何写入：下一次抽取读到那一行就行。这个键不进任何
+抽取看到的「是否处女」是推导出来的：卡上写了 `is_virgin`，并且这个实例从来没有过 `having_sex` 或 `just_have_sex` 事件。
+两种里任何一种的第一条行写下之后就不再是了，不需要任何写入：下一次抽取读到那一行就行。这个键不进任何
 prompt；她是什么样的人由写角色的人写进人设，和其他人设事实一样。`sex_addict` 同样不进任何 prompt。
 
 `hygienic` 和 `employed` 也不进任何 prompt，而且不算习惯：它们不影响 `indulgence`。`hygienic` 是单独的一个系数，
@@ -303,7 +313,7 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 `health` 缩放整个 `body` 类别，`period` 也在内，`period` 自己 28 天的冷却让它不管怎样都大约每月一次。
 `prefer_trip` 提高的是出行的概率，不是频率：每周一次的类别冷却对它同样适用。
 
-五个习惯键只通过 `indulgence` 的漂移影响抽取。判官的角色块（`[角色人格]`）不列它们，所以她不会每一轮都提烟、酒、大麻、咖啡或吃的；
+五个习惯键通过 `indulgence` 的漂移影响抽取，其中三个（`smoking`、`alcoholic`、`drug`）还是习惯类事件的门槛（见[下文](#股票迷路习惯与性)）。判官的角色块（`[角色人格]`）不列它们，所以她不会每一轮都提烟、酒、大麻、咖啡或吃的；
 希望这些习惯带进她说话的角色，要在人设里自己写明。engine 从不写这五个键。
 
 **递来她不用的东西。** 一轮的动作是 `give`，递的是 `cigarette`、`alcohol`、`herb`、`coffee` 或 `cuisine`，而对应的键（`smoking`、`alcoholic`、`drug`、`coffee`、`gluttony`）
@@ -324,10 +334,10 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 
 | 在线的先行事件 | 权重乘 3 的种类 |
 |---|---|
-| `ex_message`、`sudden_desire`、`strip` | `having_sex` |
-| `sudden_desire` | `strip` |
+| `ex_message`、`sudden_desire`、`strip` | `having_sex`、`just_have_sex` |
+| `sudden_desire` | `strip`、`masturbating` |
 | `sick` | `period_scare` |
-| `having_sex` | `pregnancy_scare` |
+| `having_sex`、`just_have_sex` | `pregnancy_scare` |
 | `business_trip` | `on_the_road`、`on_the_way`、`busy`、`temp_work` |
 | `short_trip`、`long_trip`、`hometown_visit`、`traveling_together` | `on_the_road`、`admiring_scenery`、`taking_selfie` |
 | `hometown_visit` | `bros_gathering`、`sis_gathering` |
@@ -341,8 +351,8 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 | `breakup`、`quarrel`、`want_to_quit_job` | `pondering_life` |
 | `pondering_life` | `want_to_see_sea` |
 
-有一种是压低而不是排除：实例从来没有过 `having_sex` 事件时，`pregnancy_scare` 权重为五分之一。没有硬性的
-「只能在之后」门槛，也没有状态机：从不抽 `having_sex` 的部署里，这个虚惊只是降到五分之一，不会消失。
+有一种是压低而不是排除：实例从来没有过 `having_sex` 或 `just_have_sex` 事件时，`pregnancy_scare` 权重为五分之一。没有硬性的
+「只能在之后」门槛，也没有状态机：两种都从不抽的部署里，这个虚惊只是降到五分之一，不会消失。
 表和常量（`FOLLOW_FACTOR`、`FOLLOW_WINDOW_HOURS`、`UNLIKELY_FACTOR`）在 `crates/eros-engine-core/src/events.rs`。
 
 ### 调用方的 `kinds`
@@ -351,7 +361,7 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 
 | `kinds` | 可以抽的种类 |
 |---|---|
-| 不带或 `null` | 全部 61 种 |
+| 不带或 `null` | 全部 69 种 |
 | `[]` | 一种都不抽：响应是 `{"event": null, "message": null}` |
 | `["reading", "quarrel"]` | 只抽列出的 |
 | `{"allow": […], "disallow": […]}` | `allow` 允许的，去掉 `disallow` 列出的 |
@@ -362,7 +372,7 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 代价是调用方要等 engine 认识某个新种类之后才能列它。`taking_space`、`fell_out`、`traveling_together` 和 `bathing_together` 永远不会被抽到，
 所以在 `kinds` 的任何位置写它们，都按同样的方式被拒绝。
 
-有五种带成人题材：`sudden_desire`、`strip`、`streaking`、`having_sex`，以及隐含性行为的 `pregnancy_scare`。engine 不内建这类分组；只对部分用户提供这类内容的调用方，
+有七种带成人题材：`sudden_desire`、`strip`、`streaking`、`having_sex`、`just_have_sex`、`masturbating`，以及隐含性行为的 `pregnancy_scare`。engine 不内建这类分组；只对部分用户提供这类内容的调用方，
 把它们列进 `disallow`。`scolded_by_superior` 与 `scolded_superior` 假定她有上级，在她的世界里读作老板、上司、领导、主人或君主；
 没有上级的角色同样交给 `disallow` 排除。
 
@@ -449,7 +459,7 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 | `busy`、`in_battle` | 所有角色 | 亲密度档 2 起讲；以下沉默 |
 | `out_shopping` | 女性角色；其他角色照常回复 | 女性角色档 2 起讲、以下沉默；其他角色每一档都讲，是一件普通的插曲 |
 | `bros_gathering`、`sis_gathering` | 所有角色 | 从不讲；事后由她解释 |
-| `having_sex` | 所有角色 | 从不讲；事后直说（`在做爱，对方那时发来的消息你现在才看到`），跟谁由她自己说 |
+| `having_sex` | 性瘾角色（只对她抽取） | 从不讲；事后直说（`在做爱，对方那时发来的消息你现在才看到`），跟谁由她自己说 |
 | `taking_space` | 所有角色 | 不由抽取产生；分开的流程里由她道别 |
 
 亲密度档 2 及以上，`busy`、`in_battle` 和女性角色的 `out_shopping` 像其他种类一样用一条主动消息讲出来，
@@ -632,6 +642,39 @@ composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2com
 
 `streaking` 和 `strip` 一样带成人题材：`sex_addict` 对它的缩放与 `sudden_desire` 相同，只对部分用户提供这类内容的调用方把它排除。
 
+### 股票、迷路、习惯与性
+
+另外八种会讲出来的插曲。它们都是 `short`，都不让她离线，也都不带图；除了 `watching_stocks`，两种世界都适用（见[下文](#她的世界)）：
+
+| 种类 | 标签 | 类别 | 权重 | 冷却 | 持续 | 门槛 | 提示 |
+|---|---|---|---|---|---|---|---|
+| `watching_stocks` | 在看股票 | `short` | 2 | 24 小时 | 30 分钟 | 无（只限 `modern`） | `（你正在看股票行情。）` |
+| `trading` | 在交易 | `short` | 1 | 24 小时 | 1 小时 | 无 | `（你正在和人谈一笔买卖。）` |
+| `got_lost` | 迷路了 | `short` | 3 | 48 小时 | 1 小时 | 有 `short_trip`、`long_trip`、`hometown_visit` 或 `traveling_together` 正在进行 | `（你刚迷了路，找不到要去的地方。）`；`traveling_together` 期间是 `（你们一起出来玩，刚迷了路。）` |
+| `drinking` | 在喝酒 | `short` | 2 | 12 小时 | 30 分钟 | `alcoholic` 为 `true` | `（你正在喝酒。）` |
+| `smoking` | 在抽烟 | `short` | 2 | 12 小时 | 30 分钟 | `smoking` 为 `true` | `（你正在抽烟。）` |
+| `smoking_weed` | 在抽大麻 | `short` | 2 | 12 小时 | 30 分钟 | `drug` 为 `true` | `（你正在抽大麻。）` |
+| `just_have_sex` | 刚做完爱 | `short` | 1 | 48 小时 | 30 分钟 | 亲密度档 3 | `（你刚和人做完爱。）` |
+| `masturbating` | 自慰中 | `short` | 1 | 24 小时 | 30 分钟 | `sex_addict` 为 `true`，并且亲密度档 3 | `（你正在自慰。）` |
+
+`trading` 是和人谈一笔买卖，不是炒股，所以奇幻世界也适用。`got_lost` 是唯一一种需要背景的种类（见[上文](#同一时间一件插曲一个背景)）：
+在她自己的旅行里，提示像背景里抽到的任何插曲一样，先说旅行的状态（`（你正在短途旅行。你刚迷了路，找不到要去的地方。）`）；
+和用户一起旅行时，迷路的是他们两个人。
+
+习惯类事件跟着习惯键走（见[角色设置](#角色设置)）：卡上写了她喝酒、抽烟或抽大麻，她才会抽到对应的那一种；`high` 的
+`indulgence` 让这三种各自权重乘 3（见[下文](#1-需求给种类加权)）。咖啡和美食没有对应的事件。
+
+`just_have_sex` 是她生活里的性，事后讲出来：跟谁由她自己说。它只看档位，不查性向是否相容。`having_sex` 是她事后才解释的那段离线，
+只对 `sex_addict` 为 `true` 的角色抽取；其他角色只有 `just_have_sex`，从档 3 起。`sex_addict` 让 `just_have_sex` 权重为 3 倍或三分之一，
+和对 `sudden_desire` 一样；她还是处女期间，它的权重为五分之一，和 `having_sex` 一样，两种里任何一种的第一条行都会结束她的处女身份
+（见[角色设置](#角色设置)）。前任发来消息、突然很想要、脱给对方看，都会让它更容易出现；它又和 `having_sex` 一样让验孕虚惊更容易出现；
+突然很想要也会让 `masturbating` 更容易出现（见[关联系数](#关联系数)）。
+
+住院和术后期间，她不谈买卖、不喝酒、不抽烟、不抽大麻、不做爱，也不在旅途中，所以不会迷路；看股票和自慰照样会有。
+和用户一起旅行期间不抽 `just_have_sex`：她和用户在一起。
+
+`just_have_sex` 和 `masturbating` 带成人题材，只对部分用户提供这类内容的调用方把它们排除。
+
 ### 她的世界
 
 `art_metadata.setting` 说她生活在哪个世界：`modern`（默认，其他值也按它读）或 `fantasy`。需要现代生活的种类不会对
@@ -639,7 +682,7 @@ composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2com
 
 | 适用 | 种类 |
 |---|---|
-| 只限 `modern` | `police_encounter`、`showering`、`taking_selfie`、`gaming`、`watching_match`、`watching_show`、`business_trip`、`hospitalized`、`post_surgery` |
+| 只限 `modern` | `police_encounter`、`showering`、`taking_selfie`、`gaming`、`watching_match`、`watching_show`、`business_trip`、`hospitalized`、`post_surgery`、`watching_stocks` |
 | 两者都可 | 其余所有种类 |
 
 目前还没有只限 `fantasy` 的种类，所以 `fantasy` 的角色从更小的集合里抽，没有 `setting` 的角色抽取和以前完全一样。
@@ -704,8 +747,9 @@ composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2com
 | `outing` 为 `high` | `want_to_see_sea` | ×2 |
 | `outing` 为 `low` | `want_to_go_home` | ×3 |
 | `indulgence` 为 `high` | `want_to_go_out`、`irritable` | ×2 |
+| `indulgence` 为 `high` | `drinking`、`smoking`、`smoking_weed` | ×3 |
 
-`indulgence` 那一行是单独的一个系数，和上面各行相乘：`outing` 与 `indulgence` 都为 `high` 时 `want_to_go_out` 为 ×6，
+`indulgence` 那两行是单独的一个系数，和上面各行相乘：`outing` 与 `indulgence` 都为 `high` 时 `want_to_go_out` 为 ×6，
 `indulgence` 与 `emotional` 都为 `high` 时 `irritable` 为 ×4。
 `social` 不给任何种类加权。只有部署配置了判官、并且角色有一次评定时，系数才生效（评定推到调用时刻）；否则所有系数都是 1。
 系数不是门槛：权重 ×3 的种类仍然要先有资格。
@@ -996,7 +1040,7 @@ affinity delta 上也是同一个 `life_choice` 字段。她的请求用 engine 
 | `[近期事件]` | 不渲染：没有判官来读它 |
 | 离线类种类 | 和有判官时一样让轮次沉默，因为这个检查在判官之前：ghosting 开关以及动作、强制出图两种例外照样适用 |
 | 生活选择 | 不变：触发读的是 affinity 评估器评过的回合，不是 PDE 判官 |
-| `smoking`、`alcoholic`、`drug`、`coffee`、`gluttony` | 为 `false` 的键在 give 时照样掷，可能把它变成拒收；没有 `indulgence` 可漂移、可点名 |
+| `smoking`、`alcoholic`、`drug`、`coffee`、`gluttony` | 为 `false` 的键在 give 时照样掷，可能把它变成拒收；`smoking`、`alcoholic`、`drug` 照样是习惯类事件的门槛；没有 `indulgence` 可漂移、可点名、可加权 |
 
 ## 代码指引
 
