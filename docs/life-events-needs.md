@@ -219,7 +219,7 @@ the levels and decides.
 
 ### Categories
 
-An event is one of 69 drawable kinds. Each kind belongs to a category, and the category sets its
+An event is one of 70 drawable kinds. Each kind belongs to a category, and the category sets its
 shape:
 
 | `category` | shape | lasts | category weight | category cooldown |
@@ -257,14 +257,14 @@ The draw is a pure function of the inputs plus three random numbers (one per sta
 the length).
 
 1. **Eligibility.** A kind is eligible when all of these hold:
-   - the caller's `kinds` allows it ([below](#the-callers-kinds); absent means all 69);
+   - the caller's `kinds` allows it ([below](#the-callers-kinds); absent means all 70);
    - it passes its gate (below);
    - its own cooldown has elapsed;
    - its category's cooldown has elapsed;
    - for an offline kind, the shared offline cooldown has elapsed (below);
    - the background rules allow it (below);
-   - for `got_lost`, the one kind that needs a background, one of its backgrounds is under way
-     (below).
+   - for `got_lost` and `missed_ride`, the two kinds that need a background, one of their
+     backgrounds is under way (below).
 2. **Category.** Each category with at least one eligible kind weighs its category weight
    times its persona factor. A roll picks one by cumulative weight.
 3. **Kind.** Each eligible kind in that category weighs its base weight times its
@@ -272,7 +272,7 @@ the length).
    [follow-on factor](#follow-on-factors) and, for a few kinds, a persona factor
    ([`is_virgin`](#persona-settings), [`homesick`](#persona-settings),
    [`sex_addict`](#persona-settings), [`hygienic`](#persona-settings),
-   [`employed`](#persona-settings)). A second roll picks
+   [`employed`](#persona-settings), [`outdoorsy`](#outdoors-or-in)). A second roll picks
    one.
 4. **Duration.** A fixed length is taken as is; a range is rolled.
 
@@ -298,9 +298,10 @@ eligible kind drops out of the first stage and the others share its weight.
   `smoking_weed`, `just_have_sex`. During `period`,
   `period_scare` and `pregnancy_scare` are not drawn. During `traveling_together` no kind that
   can take her offline is drawn, nor `just_have_sex`: she is with the user.
-- One kind needs a background rather than being ruled out by one: `got_lost` is drawn only while
+- Two kinds need a background rather than being ruled out by one. `got_lost` is drawn only while
   a `short_trip`, `long_trip`, `hometown_visit` or `traveling_together` is under way, never on a
-  `business_trip` or outside a trip.
+  `business_trip` or outside a trip. `missed_ride` is drawn only while one of those or a
+  `business_trip` is under way.
 - One incident and one background can run together. An incident drawn inside a background is
   told from inside it.
 - While she waits for the user's answer to one of her life choices, no draw happens either, in any
@@ -343,6 +344,7 @@ weight and never lifts a gate.
 | `masturbating` | the persona's `art_metadata.sex_addict` is `true`, and intimacy rung 3 |
 | `drinking`, `smoking`, `smoking_weed` | the persona's `art_metadata.alcoholic`, `smoking`, `drug` respectively is `true` |
 | `got_lost` | a `short_trip`, `long_trip`, `hometown_visit` or `traveling_together` under way ([above](#one-incident-and-one-background-at-a-time)) |
+| `missed_ride` | a `business_trip`, `short_trip`, `long_trip`, `hometown_visit` or `traveling_together` under way |
 | `strip`, `streaking` | intimacy rung 3, and the session's newest recorded `affinity_scope` is romance-compatible (a chemistry axis in scope); none recorded is not compatible |
 | `period`, `saw_bag`, `saw_clothes` | the persona's `art_metadata.gender` is `"female"` |
 | `want_to_quit_job` | the persona's `art_metadata.employed` is not `"free"` |
@@ -362,7 +364,7 @@ The rung (1 to 3) is read from the session's affinity, time-decayed as in a chat
 
 ### Persona settings
 
-Twelve keys in the persona genome's `art_metadata`, read by the engine and written by whoever
+Thirteen keys in the persona genome's `art_metadata`, read by the engine and written by whoever
 authors the persona, sit beside `gender`, `birthday` and `timezone`:
 
 | key | value | effect |
@@ -375,6 +377,7 @@ authors the persona, sit beside `gender`, `birthday` and `timezone`:
 | `sex_addict` | `true`, `false`, absent (default) | within `short`: `true` weighs `sudden_desire`, `strip`, `streaking` and `just_have_sex` 3 times, `false` a third; their gates hold either way. Only `true` lets her draw `having_sex` and `masturbating` |
 | `hygienic` | `true`, `false`, absent (default) | within `short`: `true` weighs `showering`, `bathing`, `want_hot_spring` and `want_sauna` 3 times, `false` a third; it also sets the chemistry tier [a bath together](#a-bath-together) needs |
 | `employed` | `"free"`, `"part_time"` (default), `"full_time"` | how much of her day is work: `temp_work`, `scolded_by_superior`, `scolded_superior` and `business_trip` weigh a third, 1 time, 3 times within their categories; a `free` persona never draws `want_to_quit_job`; any other value reads as `part_time` |
+| `outdoorsy` | `"outdoor"`, `"neutral"` (default), `"indoor"` | within each category, `outdoor` weighs the outdoor kinds 3 times and the indoor kinds a third, `indoor` the reverse; neutral kinds are untouched ([below](#outdoors-or-in)); any other value reads as `neutral` |
 | `setting` | `"modern"` (default), `"fantasy"` | the world she lives in ([below](#her-world)); any other value reads as `modern` |
 | `smoking`, `alcoholic`, `drug`, `coffee`, `gluttony` | each `true`, `false`, absent (default) | whether she smokes, drinks, uses weed, drinks coffee, loves good food (`false`: she keeps off rich food): how fast `indulgence` comes back ([drift](#drift-between-ratings)), what a high `indulgence` names in the reply, and how she takes a give of that thing (below); `smoking`, `alcoholic` and `drug` set to `true` also let her draw `smoking`, `drinking` and `smoking_weed` |
 
@@ -387,9 +390,25 @@ no `having_sex` or `just_have_sex` event, ever. The first row of either kind end
 write anywhere: the next draw reads the row. The key reaches no prompt; what she is like is written into her
 persona by its author, as every other persona fact. `sex_addict` reaches no prompt either.
 
-`hygienic` and `employed` reach no prompt and are not habits: they do not move `indulgence`.
+`hygienic`, `employed` and `outdoorsy` reach no prompt and are not habits: they do not move `indulgence`.
 `hygienic` is its own factor, so it multiplies with a needs factor on the same kind. `employed`
 leaves `in_class`, `busy` and `in_battle` alone, and changes no cooldown or length.
+
+#### Outdoors or in
+
+Every incident kind is outdoor, indoor or neutral, and `outdoorsy` reads only that. Outdoor
+means out in the open air: a shop, a class, an office or a gallery is not outdoor.
+
+| place | `short` | `mid` |
+|---|---|---|
+| outdoor | `police_encounter`, `animal_encounter`, `on_the_way`, `got_bumped`, `bumped_someone`, `admiring_scenery`, `bird_encounter`, `want_to_see_sea`, `want_hot_spring`, `got_lost`, `missed_ride` | `on_the_road`, `want_to_go_out` |
+| indoor | `showering`, `bathing`, `in_class`, `scolded_by_superior`, `scolded_superior`, `admiring_art`, `want_sauna`, `watching_stocks` | `reading`, `gaming`, `want_to_go_home` |
+| neutral | every other `short` kind, the sex kinds and `streaking` among them | every other `mid` kind |
+
+Every kind that can take her offline (`asleep`, `in_battle`, `busy`, `away_from_phone`,
+`out_shopping`, the gatherings, `having_sex`) is neutral, so `outdoorsy` never changes how
+often she is out of reach. It multiplies with the other factors on the same kind and changes
+no gate, cooldown or length, nor how often each category comes up.
 
 Reads are lenient. A value of the wrong type reads as absent; in `prefer_events`, an entry that
 is not a known `mid` kind is dropped and the rest are kept. `health` scales the whole `body`
@@ -462,7 +481,7 @@ policy, rules a kind out without the engine losing it.
 
 | `kinds` | kinds that may be drawn |
 |---|---|
-| absent or `null` | all 69 |
+| absent or `null` | all 70 |
 | `[]` | none: the response is `{"event": null, "message": null}` |
 | `["reading", "quarrel"]` | the listed ones |
 | `{"allow": […], "disallow": […]}` | what `allow` allows, minus what `disallow` lists |
@@ -861,6 +880,15 @@ the user she does not draw `just_have_sex`: she is away with the user.
 `just_have_sex` and `masturbating` carry adult themes; a caller that serves those only to some
 users disallows them.
 
+### Missing her ride
+
+| kind | label | category | weight | cooldown | lasts | gate | cue |
+|---|---|---|---|---|---|---|---|
+| `missed_ride` | 没赶上车 | `short` | 3 | 48 h | 1 h | a `business_trip`, `short_trip`, `long_trip`, `hometown_visit` or `traveling_together` under way | `（你刚没赶上车。）`; during `traveling_together`, `（你们一起出来玩，刚没赶上车。）` |
+
+Told, never offline, no picture, both worlds (a carriage is a ride too). Unlike `got_lost`, a
+business trip counts.
+
 ### Her world
 
 `art_metadata.setting` says which world she lives in: `modern` (the default, and what any other
@@ -1225,7 +1253,7 @@ always `null`.
 
 | path | choice status | cost | her words |
 |---|---|---|---|
-| accept | `accepted` | none: no event, no tier change, no slowdown | a generated reply to the yes |
+| accept | `accepted` | none: no tier change, no slowdown, no new event; an incident under way ends there, a background keeps running | a generated reply to the yes |
 | decline | `declined` | `sleep_together`: chemistry drops one tier. `propose`: bond and chemistry each drop one tier | a generated reply to the no |
 | ignore | `ignored` | none: no `fell_out`, no event | none of its own: the turn runs as any other and the judge reads the user's words |
 | lapse | stays `pending`, reads as expired | none | none |

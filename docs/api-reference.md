@@ -1101,6 +1101,7 @@ Kinds fall into four categories. `short` and `mid` are incidents; `body` and
 | `short` | `smoking_weed` | 30 min | she is smoking weed (a persona whose `drug` is `true`) |
 | `short` | `just_have_sex` | 30 min | she has just had sex, and tells the user (rung 3) |
 | `short` | `masturbating` | 30 min | she is masturbating (a sex addict, rung 3) |
+| `short` | `missed_ride` | 1 h | she has missed her ride (only on a trip, a business trip included) |
 | `mid` | `temp_work` | 4 h | she is called in to work |
 | `mid` | `ex_message` | 3 h | her ex texts her |
 | `mid` | `weather_change` | 4 h | the weather turns |
@@ -1133,7 +1134,7 @@ Kinds fall into four categories. `short` and `mid` are incidents; `body` and
 | `trip` | `long_trip` | 3–7 d | a long trip |
 | `trip` | `hometown_visit` | 72 h | a visit home |
 
-A range is drawn when the event starts. That is 69 drawable kinds. Both genders
+A range is drawn when the event starts. That is 70 drawable kinds. Both genders
 draw both gatherings, at the same weight; that is deliberate.
 
 Four more kinds are never drawn: `taking_space` (a separation she asked for and
@@ -1173,7 +1174,8 @@ The draw:
   neither `period_scare` nor `pregnancy_scare`; during `traveling_together`,
   no kind that can take her offline and not `just_have_sex`, since she is with
   the user. `got_lost` is drawn only while a `short_trip`, `long_trip`,
-  `hometown_visit` or `traveling_together` is under way.
+  `hometown_visit` or `traveling_together` is under way; `missed_ride` only
+  while one of those or a `business_trip` is.
 - **While she waits for an answer, nothing is drawn.** From her ask (of any
   life choice) until it is answered or lapses (24 h), the draw returns `{"event": null,
   "message": null}` for every session of the persona. A repeat of an
@@ -1211,6 +1213,7 @@ The draw:
   | `sex_addict` | `true` / `false` / absent | `sudden_desire`, `strip`, `streaking` and `just_have_sex` come up three times / a third as often within `short`; their gates hold. Only `true` draws `having_sex` and `masturbating` |
   | `hygienic` | `true` / `false` / absent | `showering`, `bathing`, `want_hot_spring` and `want_sauna` come up three times / a third as often within `short`; it also sets when she asks for a bath together ([below](#post-v2compsessionsession_idlife-choiceschoice_id)) |
   | `employed` | `"free"`, `"part_time"` (default), `"full_time"` | how much of her day is work: `temp_work`, `scolded_by_superior`, `scolded_superior` and `business_trip` come up a third as often / as they are / three times as often within their categories, and a `free` persona never draws `want_to_quit_job`; any other value reads as `part_time` |
+  | `outdoorsy` | `"outdoor"`, `"neutral"` (default), `"indoor"` | `outdoor`: the outdoor kinds come up three times as often and the indoor kinds a third as often within their categories; `indoor` the reverse. Kinds that can take her offline are neutral and untouched; the place of each kind is listed in [life-events-needs.md](life-events-needs.md#outdoors-or-in); any other value reads as `neutral` |
   | `setting` | `"modern"` (default), `"fantasy"` | the world she lives in: a `fantasy` persona never draws `police_encounter`, `showering`, `taking_selfie`, `gaming`, `watching_match`, `watching_show`, `business_trip`, `hospitalized`, `post_surgery` or `watching_stocks`, whatever `kinds` or `prefer_events` say; any other value reads as `modern` |
   | `smoking`, `alcoholic`, `drug`, `coffee`, `gluttony` | each `true` / `false` / absent | whether she smokes, drinks, uses weed, drinks coffee, loves good food: the more are `true`, the sooner her `indulgence` comes back to `high` and weighs the pick; a `false` key can make her refuse a `give` of that thing ([above](#post-compchatsession_idmessagestream)); `smoking`, `alcoholic` and `drug` set to `true` let her draw `smoking`, `drinking` and `smoking_weed` |
 
@@ -1429,7 +1432,7 @@ What an answer does depends on `kind`:
 
 | | `ask_for_space` | `sleep_together` | `propose` | `travel_together` | `bathe_together` |
 |---|---|---|---|---|---|
-| **`accept`** | status `accepted`. A `taking_space` separation starts now and lasts 6 hours per tier of the gap she asked at (gap 2, 3, 4: 12, 18, 24 hours); she is offline for all her sessions while it lasts, and an incident under way ends. Bond and chemistry each drop one tier, and for 72 hours after the separation ends positive growth in this session is halved | status `accepted`; nothing else changes | status `accepted`; nothing else changes | status `accepted`. A `traveling_together` background starts now and lasts 48 to 72 hours; she keeps replying, and an incident under way ends. Nothing else changes | status `accepted`. A `bathing_together` incident starts now and lasts 30 minutes; she keeps replying, and an incident under way ends. Nothing else changes |
+| **`accept`** | status `accepted`. A `taking_space` separation starts now and lasts 6 hours per tier of the gap she asked at (gap 2, 3, 4: 12, 18, 24 hours); she is offline for all her sessions while it lasts, and an incident under way ends. Bond and chemistry each drop one tier, and for 72 hours after the separation ends positive growth in this session is halved | status `accepted`; an incident under way ends, a background keeps running; nothing else changes | status `accepted`; an incident under way ends, a background keeps running; nothing else changes | status `accepted`. A `traveling_together` background starts now and lasts 48 to 72 hours; she keeps replying, and an incident under way ends. Nothing else changes | status `accepted`. A `bathing_together` incident starts now and lasts 30 minutes; she keeps replying, and an incident under way ends. Nothing else changes |
 | **`decline`** | status `declined`. The same tier drop; no separation and no slowdown | status `declined`; chemistry drops one tier | status `declined`; bond and chemistry each drop one tier | status `declined`; nothing else changes | status `declined`; chemistry drops one tier |
 | **ignore** (the user types instead) | status `ignored`; a one-hour `fell_out` incident; no tier change | status `ignored`; no cost, no `fell_out` | status `ignored`; no cost, no `fell_out` | status `ignored`; no cost, no `fell_out` | status `ignored`; no cost, no `fell_out` |
 | **expiry** (24 h) | no cost | no cost | no cost | no cost | no cost |
