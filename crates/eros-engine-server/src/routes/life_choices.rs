@@ -5,10 +5,10 @@
 //!
 //! - `ask_for_space`: either answer drops the relationship one tier on both
 //!   lines; an accept also starts a separation.
-//! - `sleep_together`: an accept changes nothing; a decline drops chemistry
-//!   one tier.
-//! - `propose`: an accept changes nothing; a decline drops both lines one
-//!   tier.
+//! - `sleep_together`: an accept ends the incident under way and costs
+//!   nothing; a decline drops chemistry one tier.
+//! - `propose`: an accept ends the incident under way and costs nothing; a
+//!   decline drops both lines one tier.
 //! - `travel_together`: an accept starts a trip; a decline changes nothing.
 //! - `bathe_together`: an accept starts a 30-minute bath together; a decline
 //!   drops chemistry one tier.
@@ -207,11 +207,11 @@ fn invalid_payload(message: String) -> AppError {
 /// `declined` and drops the same two lines, with no separation.
 ///
 /// `sleep_together`: an accept makes the choice `accepted` and costs nothing:
-/// no event, no tier change. A decline makes it `declined` and drops chemistry
+/// no new event, no tier change; an incident under way ends. A decline makes it `declined` and drops chemistry
 /// one tier.
 ///
-/// `propose`: an accept makes the choice `accepted` and costs nothing. A
-/// decline makes it `declined` and drops bond and chemistry one tier each.
+/// `propose`: an accept makes the choice `accepted` and costs nothing; an
+/// incident under way ends. A decline makes it `declined` and drops bond and chemistry one tier each.
 ///
 /// `travel_together`: an accept makes the choice `accepted` and starts a
 /// `traveling_together` background of two to three days now; she keeps
@@ -445,6 +445,12 @@ async fn resolve_choice(
         }
         None => None,
     };
+    // An accept that places nothing still ends what she was doing.
+    if let (LifeChoiceKind::SleepTogether | LifeChoiceKind::Propose, LifeChoiceAnswer::Accept) =
+        (kind, req.response)
+    {
+        EventRepo::end_foreground_in_tx(&mut tx, instance_id, now).await?;
+    }
     // The lines a decline costs; a romantic accept costs none and drops nothing.
     let lines: Option<&[AffinityLine]> = match (kind, req.response) {
         (
@@ -838,6 +844,33 @@ mod tests {
         /// (id, kind, event_key, session_id, started_at, ends_at, message_id)
         /// of the instance's events, oldest first.
         #[allow(clippy::type_complexity)]
+        /// One event of `kind` under way from `started_at` to `ends_at`.
+        async fn put(&self, kind: &str, started_at: DateTime<Utc>, ends_at: DateTime<Utc>) {
+            sqlx::query(
+                "INSERT INTO engine.persona_events \
+                   (instance_id, session_id, event_key, kind, started_at, ends_at) \
+                 VALUES ($1, $2, $3, $3, $4, $5)",
+            )
+            .bind(self.instance_id)
+            .bind(self.session_id)
+            .bind(kind)
+            .bind(started_at)
+            .bind(ends_at)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        }
+
+        /// When the event of `kind` ends.
+        async fn ends_at(&self, kind: &str) -> DateTime<Utc> {
+            self.events()
+                .await
+                .into_iter()
+                .find(|e| e.1 == kind)
+                .unwrap_or_else(|| panic!("no {kind}"))
+                .5
+        }
+
         async fn events(
             &self,
         ) -> Vec<(
@@ -1100,6 +1133,82 @@ mod tests {
         assert_eq!(c.len(), 2);
         assert_eq!(last_user_turn(&c[0]), json!(SLEEP_ACCEPT_CUE));
         assert_eq!(last_user_turn(&c[1]), json!(PROPOSE_ACCEPT_CUE));
+    }
+
+    /// A romantic accept that places nothing still ends the incident under
+    /// way; a background keeps running.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_romantic_accept_ends_the_incident_but_not_the_trip(pool: PgPool) {
+        let mock = companion_mock(Some("好呀。")).await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        for kind in ["sleep_together", "propose"] {
+            let s = scene(&pool).await;
+            let choice = s.ask_kind(kind, recent(30)).await;
+            let now = recent(0);
+            let trip_ends = now + Duration::days(1);
+            s.put(
+                "reading",
+                now - Duration::minutes(20),
+                now + Duration::minutes(100),
+            )
+            .await;
+            s.put("short_trip", now - Duration::days(1), trip_ends)
+                .await;
+
+            let out = s
+                .respond(&state, choice, LifeChoiceAnswer::Accept, now)
+                .await
+                .unwrap();
+
+            assert!(out.event.is_none(), "{kind}: nothing placed");
+            assert_eq!(s.ends_at("reading").await, now, "{kind}: the incident ends");
+            assert_eq!(
+                s.ends_at("short_trip").await,
+                trip_ends,
+                "{kind}: the trip goes on"
+            );
+        }
+    }
+
+    /// A decline leaves the incident under way alone.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn declining_sleep_together_leaves_the_incident(pool: PgPool) {
+        let mock = companion_mock(Some(HURT)).await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let s = scene(&pool).await;
+        let choice = s.ask_kind("sleep_together", recent(30)).await;
+        let now = recent(0);
+        let reading_ends = now + Duration::minutes(100);
+        s.put("reading", now - Duration::minutes(20), reading_ends)
+            .await;
+
+        s.respond(&state, choice, LifeChoiceAnswer::Decline, now)
+            .await
+            .unwrap();
+
+        assert_eq!(s.ends_at("reading").await, reading_ends);
+    }
+
+    /// A bath together is an incident too: going to bed ends it.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn accepting_sleep_together_ends_a_bath_together(pool: PgPool) {
+        let mock = companion_mock(Some("好呀。")).await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let s = scene(&pool).await;
+        let choice = s.ask_kind("sleep_together", recent(30)).await;
+        let now = recent(0);
+        s.put(
+            "bathing_together",
+            now - Duration::minutes(10),
+            now + Duration::minutes(20),
+        )
+        .await;
+
+        s.respond(&state, choice, LifeChoiceAnswer::Accept, now)
+            .await
+            .unwrap();
+
+        assert_eq!(s.ends_at("bathing_together").await, now);
     }
 
     /// An accepted trip starts now, lasts two to three days and costs nothing.

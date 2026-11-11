@@ -209,18 +209,15 @@ impl EventRepo<'_> {
         Ok(event)
     }
 
-    /// [`Self::insert_preempting`] inside the caller's transaction, so the
-    /// event commits or rolls back together with whatever else the caller
-    /// writes; nothing here commits. An error leaves the transaction unusable:
-    /// drop it, and the cap goes with it.
-    pub async fn insert_preempting_in_tx(
+    /// End every foreground of the instance under way at `at` there; a
+    /// background keeps running. Takes the instance lock, held to the
+    /// caller's commit; nothing here commits.
+    pub async fn end_foreground_in_tx(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        e: &NewEvent<'_>,
-    ) -> Result<EventRecord, sqlx::Error> {
-        // The cap and the insert are two statements: no other writer of the
-        // instance may land between them. The lock is held to the caller's
-        // commit.
-        lock_instance(tx, e.instance_id).await?;
+        instance_id: Uuid,
+        at: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        lock_instance(tx, instance_id).await?;
         let background: Vec<String> = events::background_kinds()
             .into_iter()
             .map(|k| k.as_str().to_string())
@@ -232,11 +229,26 @@ impl EventRepo<'_> {
               WHERE instance_id = $1 AND started_at < $2 AND ends_at > $2 \
                 AND NOT (kind = ANY($3))",
         )
-        .bind(e.instance_id)
-        .bind(e.started_at)
+        .bind(instance_id)
+        .bind(at)
         .bind(&background)
         .execute(&mut **tx)
         .await?;
+        Ok(())
+    }
+
+    /// [`Self::insert_preempting`] inside the caller's transaction, so the
+    /// event commits or rolls back together with whatever else the caller
+    /// writes; nothing here commits. An error leaves the transaction unusable:
+    /// drop it, and the cap goes with it.
+    pub async fn insert_preempting_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        e: &NewEvent<'_>,
+    ) -> Result<EventRecord, sqlx::Error> {
+        // The cap and the insert are two statements: no other writer of the
+        // instance may land between them. The lock is held to the caller's
+        // commit.
+        Self::end_foreground_in_tx(tx, e.instance_id, e.started_at).await?;
         let id: Uuid = sqlx::query_scalar(
             "INSERT INTO engine.persona_events \
                (instance_id, session_id, event_key, kind, started_at, ends_at) \
