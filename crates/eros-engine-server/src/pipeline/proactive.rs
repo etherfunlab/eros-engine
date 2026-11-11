@@ -344,6 +344,7 @@ fn kind_cue(
         SmokingWeed => "（你正在抽大麻。）".into(),
         JustHaveSex => "（你刚和人做完爱。）".into(),
         Masturbating => "（你正在自慰。）".into(),
+        MissedRide => "（你刚没赶上车。）".into(),
         WantToGoOut => "（你现在很想出门走走。）".into(),
         WantToGoHome => "（你现在很想回家。）".into(),
         TempWork => "（你刚临时接到一份工作，得马上去处理。）".into(),
@@ -405,8 +406,12 @@ fn event_cue(
     tip_personality: Option<&str>,
     picture: bool,
 ) -> String {
-    if kind == EventKind::GotLost && background == Some(EventKind::TravelingTogether) {
-        return "（你们一起出来玩，刚迷了路。）".into();
+    if background == Some(EventKind::TravelingTogether) {
+        match kind {
+            EventKind::GotLost => return "（你们一起出来玩，刚迷了路。）".into(),
+            EventKind::MissedRide => return "（你们一起出来玩，刚没赶上车。）".into(),
+            _ => {}
+        }
     }
     let cue = kind_cue(kind, lasts, rung, traits, tip_personality, picture);
     match background.and_then(background_state) {
@@ -1068,6 +1073,7 @@ mod tests {
             (EventKind::SmokingWeed, "（你正在抽大麻。）"),
             (EventKind::JustHaveSex, "（你刚和人做完爱。）"),
             (EventKind::Masturbating, "（你正在自慰。）"),
+            (EventKind::MissedRide, "（你刚没赶上车。）"),
         ] {
             assert_eq!(
                 kind_cue(kind, h, 1, &PersonaTraits::default(), None, false),
@@ -1098,6 +1104,30 @@ mod tests {
         assert_eq!(
             cue(Some(EventKind::TravelingTogether)),
             "（你们一起出来玩，刚迷了路。）"
+        );
+    }
+
+    #[test]
+    fn she_misses_a_ride_alone_or_with_the_user() {
+        let h = Duration::hours(1);
+        let cue = |bg| {
+            event_cue(
+                EventKind::MissedRide,
+                h,
+                bg,
+                1,
+                &PersonaTraits::default(),
+                None,
+                false,
+            )
+        };
+        assert_eq!(
+            cue(Some(EventKind::ShortTrip)),
+            "（你正在短途旅行。你刚没赶上车。）"
+        );
+        assert_eq!(
+            cue(Some(EventKind::TravelingTogether)),
+            "（你们一起出来玩，刚没赶上车。）"
         );
     }
 

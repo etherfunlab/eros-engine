@@ -127,6 +127,7 @@ pub enum EventKindDto {
     SmokingWeed,
     JustHaveSex,
     Masturbating,
+    MissedRide,
 }
 
 /// Reads the drawable kinds only: a request names kinds to draw, and the
@@ -221,6 +222,7 @@ impl From<EventKindDto> for EventKind {
             EventKindDto::SmokingWeed => EventKind::SmokingWeed,
             EventKindDto::JustHaveSex => EventKind::JustHaveSex,
             EventKindDto::Masturbating => EventKind::Masturbating,
+            EventKindDto::MissedRide => EventKind::MissedRide,
         }
     }
 }
@@ -301,6 +303,7 @@ impl From<EventKind> for EventKindDto {
             EventKind::SmokingWeed => EventKindDto::SmokingWeed,
             EventKind::JustHaveSex => EventKindDto::JustHaveSex,
             EventKind::Masturbating => EventKindDto::Masturbating,
+            EventKind::MissedRide => EventKindDto::MissedRide,
         }
     }
 }
