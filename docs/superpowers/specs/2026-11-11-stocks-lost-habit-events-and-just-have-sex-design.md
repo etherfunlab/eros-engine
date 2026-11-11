@@ -33,7 +33,7 @@ All `short`, told when they start, never offline, no picture.
 | `got_lost` | 迷路了 | 3 | 48 h | 1 h | both | （你刚迷了路，找不到要去的地方。） |
 | `drinking` | 在喝酒 | 2 | 12 h | 30 min | both | （你正在喝酒。） |
 | `smoking` | 在抽烟 | 2 | 12 h | 30 min | both | （你正在抽烟。） |
-| `smoking_weed` | 在吃草 | 2 | 12 h | 30 min | both | （你正在吃草。） |
+| `smoking_weed` | 在抽大麻 | 2 | 12 h | 30 min | both | （你正在抽大麻。） |
 | `just_have_sex` | 刚做完爱 | 1 | 48 h | 30 min | both | （你刚和人做完爱。） |
 | `masturbating` | 自慰中 | 1 | 24 h | 30 min | both | （你正在自慰。） |
 

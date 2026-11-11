@@ -341,7 +341,7 @@ fn kind_cue(
         GotLost => "（你刚迷了路，找不到要去的地方。）".into(),
         Drinking => "（你正在喝酒。）".into(),
         Smoking => "（你正在抽烟。）".into(),
-        SmokingWeed => "（你正在吃草。）".into(),
+        SmokingWeed => "（你正在抽大麻。）".into(),
         JustHaveSex => "（你刚和人做完爱。）".into(),
         Masturbating => "（你正在自慰。）".into(),
         WantToGoOut => "（你现在很想出门走走。）".into(),
@@ -1065,7 +1065,7 @@ mod tests {
             (EventKind::GotLost, "（你刚迷了路，找不到要去的地方。）"),
             (EventKind::Drinking, "（你正在喝酒。）"),
             (EventKind::Smoking, "（你正在抽烟。）"),
-            (EventKind::SmokingWeed, "（你正在吃草。）"),
+            (EventKind::SmokingWeed, "（你正在抽大麻。）"),
             (EventKind::JustHaveSex, "（你刚和人做完爱。）"),
             (EventKind::Masturbating, "（你正在自慰。）"),
         ] {

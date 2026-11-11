@@ -941,7 +941,7 @@ pub(crate) fn event_label(kind: eros_engine_core::events::EventKind) -> &'static
         GotLost => "迷路了",
         Drinking => "在喝酒",
         Smoking => "在抽烟",
-        SmokingWeed => "在吃草",
+        SmokingWeed => "在抽大麻",
         JustHaveSex => "刚做完爱",
         Masturbating => "自慰中",
     }
@@ -4896,7 +4896,7 @@ mod tests {
                 "迷路了",
                 "在喝酒",
                 "在抽烟",
-                "在吃草",
+                "在抽大麻",
                 "刚做完爱",
                 "自慰中",
             ]
