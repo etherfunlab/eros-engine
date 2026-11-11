@@ -850,7 +850,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | 字段 | 规则 |
 |---|---|
 | `event_key` | 必填：1–128 个 `[A-Za-z0-9_.:-]` 字符，只在本会话内有效。同一个 key 返回同一个事件 |
-| `kinds` | 选填。不带或 `null`：全部种类。数组：只抽列出的种类（`[]`：什么都不抽）。对象 `{"allow": […], "disallow": […]}`：`allow` 允许的种类（不带或 `null`：全部；`[]`：一种都没有）去掉 `disallow` 列出的种类；两边都列了的种类不抽，`{}` 等于全部种类。对象里出现未知的键，或出现未知种类，返回 `422`；写了 `taking_space`、`fell_out` 或 `traveling_together` 同样返回 `422`：它们由 engine 自己写入，从不抽取 |
+| `kinds` | 选填。不带或 `null`：全部种类。数组：只抽列出的种类（`[]`：什么都不抽）。对象 `{"allow": […], "disallow": […]}`：`allow` 允许的种类（不带或 `null`：全部；`[]`：一种都没有）去掉 `disallow` 列出的种类；两边都列了的种类不抽，`{}` 等于全部种类。对象里出现未知的键，或出现未知种类，返回 `422`；写了 `taking_space`、`fell_out`、`traveling_together` 或 `bathing_together` 同样返回 `422`：它们由 engine 自己写入，从不抽取 |
 | `user_timezone`、`user_country`、`user_region`、`tier`、`prompt_traits`、`memory_scope`、`affinity_scope`、`audit` | 与 `/open` 相同，用于生成这条消息 |
 | `image` | 选填：`{"style", "aspect_ratio", "prompt_variant"}`，各字段与聊天回合的 `image` 相同（没有 `force`；不支持的 `aspect_ratio` 返回 `422`）。表示调用方能处理图：部署配了 `[tasks.chat_image_prompt_compose]` 时，`taking_selfie` 或 `strip` 的消息会带上她的图（见下）。不带、或没配 composer：只有文字。其他种类忽略它 |
 | `outfit` | 选填：她穿什么，与聊天回合相同——通常是她衣橱里的一项，不做核对；去掉首尾空白后 1–64 个字符，空白等于不带，超长返回 `422`。她的话会跟着这身衣服，图也会。`strip` 时她刚把它脱了：刚把「{outfit}」脱了，不带时是刚把衣服脱了。不带：prompt 里没有穿着，composer 按场景给她穿 |
@@ -881,6 +881,14 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | `short` | `admiring_art` | 1 小时 | 在看展，停在一件作品前 |
 | `short` | `taking_selfie` | 30 分钟 | 刚拍了张自拍，想给对方看；请求带 `image` 时，消息会带上这张图 |
 | `short` | `strip` | 30 分钟 | 刚脱了衣服给对方看（档 3、性向相容的一对）；请求带 `image` 时，消息会带上她的图 |
+| `short` | `bird_encounter` | 30 分钟 | 遇到一只鸟 |
+| `short` | `ex_wants_back` | 1 小时 | 前任来求复合 |
+| `short` | `want_to_quit_job` | 1 小时 | 想辞职（有工作的角色） |
+| `short` | `pondering_life` | 1 小时 | 在思考人生 |
+| `short` | `streaking` | 30 分钟 | 一时兴起，刚裸奔了一圈（档 3、性向相容的一对） |
+| `short` | `want_to_see_sea` | 1 小时 | 想去看海 |
+| `short` | `want_hot_spring` | 1 小时 | 想去泡温泉 |
+| `short` | `want_sauna` | 1 小时 | 想去洗桑拿 |
 | `mid` | `temp_work` | 4 小时 | 临时接到工作 |
 | `mid` | `ex_message` | 3 小时 | 前任发来消息 |
 | `mid` | `weather_change` | 4 小时 | 天气突然变了 |
@@ -913,14 +921,14 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | `trip` | `long_trip` | 3–7 天 | 长途旅游 |
 | `trip` | `hometown_visit` | 72 小时 | 回老家 |
 
-时长写成区间的，在事件开始时从区间里抽定。以上共 52 种可抽取的种类。两种性别都会抽到两个聚会，权重相同，这是有意为之。
+时长写成区间的，在事件开始时从区间里抽定。以上共 61 种可抽取的种类。两种性别都会抽到两个聚会，权重相同，这是有意为之。
 
-另有三种永远不会被抽到：`taking_space`（她提出、用户同意的分开，12–24 小时，离线）、`fell_out`（用户不理会她提出的分开请求时的那场不愉快，1 小时）和 `traveling_together`（她提议、用户同意的旅行，48–72 小时，`trip` 类背景，不离线）。
+另有四种永远不会被抽到：`taking_space`（她提出、用户同意的分开，12–24 小时，离线）、`fell_out`（用户不理会她提出的分开请求时的那场不愉快，1 小时）、`traveling_together`（她提议、用户同意的旅行，48–72 小时，`trip` 类背景，不离线）和 `bathing_together`（她提议、用户同意的一起洗澡，30 分钟，`short` 类插曲，不离线）。
 它们由 engine 为[生活选择流程](#post-v2compsessionsession_idlife-choiceschoice_id)写入，作为 `…/effects` 和生活选择响应里的 `event` 出现，
 不能写进 `kinds`。
 
-`sudden_desire`、`strip`、`having_sex` 与 `pregnancy_scare`（后者隐含性行为）带成人题材；只对部分用户提供这类内容的调用方，用
-`{"disallow": ["sudden_desire", "strip", "having_sex", "pregnancy_scare"]}` 把它们排除。`scolded_by_superior` 与 `scolded_superior`
+`sudden_desire`、`strip`、`streaking`、`having_sex` 与 `pregnancy_scare`（后者隐含性行为）带成人题材；只对部分用户提供这类内容的调用方，用
+`{"disallow": ["sudden_desire", "strip", "streaking", "having_sex", "pregnancy_scare"]}` 把它们排除。`scolded_by_superior` 与 `scolded_superior`
 假定她有上级；角色没有上级时，由调用方排除。`disallow` 列表之外的种类都照常抽取，engine 以后新增的种类也一样。
 数组或 `allow` 列表只抽它点名的种类：用白名单的调用方要把 `want_to_go_out` 和 `want_to_go_home` 加进去才会抽到。
 
@@ -928,20 +936,20 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 
 - **两段抽取。** engine 先按权重抽类别，再在类别内按权重抽种类。往一个类别里加种类，不会改变其他类别的占比。
 - **一次一件插曲，一个背景。** 角色的任何一个 session 里有插曲在进行时，不再抽取。背景进行期间只抽插曲；
-  住院和术后期间，不抽需要她出门活动的那二十二种（`temp_work`、`police_encounter`、`animal_encounter`、
+  住院和术后期间，不抽需要她出门活动的那二十四种（`temp_work`、`police_encounter`、`animal_encounter`、
   `hit_someone`、`got_hit`、`working_out`、`grocery_shopping`、`in_class`、`on_the_way`、`in_battle`、
   `got_bumped`、`bumped_someone`、`saw_bag`、`saw_clothes`、`out_shopping`、`bros_gathering`、`sis_gathering`、
-  `admiring_scenery`、`admiring_art`、`watching_show`、`on_the_road`、`having_sex`）；
+  `admiring_scenery`、`admiring_art`、`watching_show`、`on_the_road`、`having_sex`、`bird_encounter`、`streaking`）；
   `period` 期间，`period_scare` 与 `pregnancy_scare` 都不抽。
 - **她在等回答时什么都不抽。** 从她提出请求（不论哪一种生活选择）起，到它被回答或过期（24 小时）为止，角色任何一个 session 的抽取都返回
   `{"event": null, "message": null}`。带着已经抽过的 `event_key` 来重复调用，照样返回那个事件。
 - **冷却。** 每种事件从开始起有各自的冷却。trip 类每周最多开始一次，body 类每两周最多开始一次，不论具体是哪一种。
   任何离线类种类每 12 小时最多开始一次，不论具体是哪一种。
 - **她的需求给类别内的种类加权**，前提是部署配置了 LLM 判官，并且角色有一次判定：`high` 的 `outing` 偏向
-  `want_to_go_out`，`low` 的偏向 `want_to_go_home`，`high` 的 `indulgence` 偏向 `want_to_go_out` 和 `irritable`
+  `want_to_go_out` 和 `want_to_see_sea`，`low` 的偏向 `want_to_go_home`，`high` 的 `indulgence` 偏向 `want_to_go_out` 和 `irritable`
   （完整的表见 [life-events-needs.zh.md](life-events-needs.zh.md#1-需求给种类加权)）。
-- **亲近度门槛。** `ex_message` 与 `breakup` 不会向不太熟的人抽出（intimacy 档 2 及以上）；
-  `sudden_desire` 只在最亲近的档（3）；`strip` 在档 3、且会话最新记录的 `affinity_scope` 性向相容时才抽（没有记录就不抽）。`period` 只对 `art_metadata.gender` 为 `"female"` 的角色抽取；
+- **亲近度门槛。** `ex_message`、`breakup` 与 `ex_wants_back` 不会向不太熟的人抽出（intimacy 档 2 及以上）；
+  `sudden_desire` 只在最亲近的档（3）；`strip` 与 `streaking` 在档 3、且会话最新记录的 `affinity_scope` 性向相容时才抽（没有记录就不抽）。`period` 只对 `art_metadata.gender` 为 `"female"` 的角色抽取；
   `period_scare`（档 2 及以上）与 `pregnancy_scare`（档 3）同样只对这样的角色抽取，`saw_bag` 和 `saw_clothes` 也是；
   从档 2 起，她会说自己想要看中的东西，有 `tip_personality` 的角色用那份人格的口吻说。离线类种类遵循两道 ghost 门槛（见下）。
 - **角色设置**，写在 genome 的 `art_metadata` 里，影响抽取：
@@ -953,7 +961,9 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
   | `prefer_trip` | `true` / `false`（默认） | trip 类被抽到的概率是原来的三倍；仍然每周最多一次 |
   | `homesick` | `true` / `false` / 不写 | 出行往哪去：`true` 偏向 `hometown_visit`、压低游玩的两种；`false` 压低 `hometown_visit`；`business_trip` 不动 |
   | `is_virgin` | `true` / `false`（默认） | 第一次 `having_sex` 事件之前，`having_sex` 的概率是五分之一；之后这个键不再起作用 |
-  | `sex_addict` | `true` / `false` / 不写 | `sudden_desire` 与 `strip` 在 `short` 内被抽到的概率是原来的三倍 / 三分之一；门槛照旧 |
+  | `sex_addict` | `true` / `false` / 不写 | `sudden_desire`、`strip` 与 `streaking` 在 `short` 内被抽到的概率是原来的三倍 / 三分之一；门槛照旧 |
+  | `hygienic` | `true` / `false` / 不写 | `showering`、`bathing`、`want_hot_spring` 与 `want_sauna` 在 `short` 内被抽到的概率是原来的三倍 / 三分之一；也决定她什么时候提出一起洗澡（见[下文](#post-v2compsessionsession_idlife-choiceschoice_id)） |
+  | `employed` | `"free"`、`"part_time"`（默认）、`"full_time"` | 她的一天有多少是工作：`temp_work`、`scolded_by_superior`、`scolded_superior` 与 `business_trip` 在各自类别内被抽到的概率分别是原来的三分之一 / 一倍 / 三倍，`free` 的角色不会抽到 `want_to_quit_job`；其他值按 `part_time` 读 |
   | `setting` | `"modern"`（默认）、`"fantasy"` | 她生活的世界：`fantasy` 的角色不会抽到 `police_encounter`、`showering`、`taking_selfie`、`gaming`、`watching_match`、`watching_show`、`business_trip`、`hospitalized`、`post_surgery`，不管 `kinds` 或 `prefer_events` 怎么写；其他值按 `modern` 读 |
   | `smoking`、`alcoholic`、`drug`、`coffee`、`gluttony` | 各为 `true` / `false` / 不写 | 她抽不抽烟、喝不喝酒、用不用大麻、喝不喝咖啡、贪不贪吃：为 `true` 的越多，她的 `indulgence` 回到 `high` 越快，进而给抽取加权；为 `false` 的键可能让她拒收递来的这样东西（见[上文](#post-compchatsession_idmessagestream)） |
 
@@ -1024,7 +1034,7 @@ composer 失败时退回普通的人物肖像 prompt，跟聊天回合一样。�
   各自列出正在进行的背景和插曲；`/open` 开场白同样带 `- 正在经历：…` 这一行。`GET …/effects` 两者都会列出。
   一段离线类事件结束之后（在被它 ghost 过消息的会话里），或一场虚惊结束之后（在讲出它的那个会话里），`[近期事件]` 行多出一项，回复多出一行 `- 刚才：…`，直到她在那里写过一次为止（一条带文字的消息；
   见 [model-config.zh.md](model-config.zh.md#taskspde_decision--opt-in-llm-pde-判断器)）。
-- **错误：** `event_key` 格式不对返回 `400`，`code: "invalid_payload"`；未知的 `kind`，或 `taking_space`、`fell_out`、`traveling_together`，返回 `422`。会话检查与 `/open` 相同
+- **错误：** `event_key` 格式不对返回 `400`，`code: "invalid_payload"`；未知的 `kind`，或 `taking_space`、`fell_out`、`traveling_together`、`bathing_together`，返回 `422`。会话检查与 `/open` 相同
   （`403`、`404`，语音或群会话 `409`），达到单用户并发上限 `429`。BYOC 实例的会话返回 `400 byoc_unsupported`。
   生成失败时返回与图片接口相同的上游错误，不写入任何内容。
   回复为空时不写入任何内容，返回空值。
@@ -1052,7 +1062,7 @@ composer 失败时退回普通的人物肖像 prompt，跟聊天回合一样。�
 
 回答她提出的一次生活选择。她用一条主动消息（`metadata.proactive = "life_choice"`）向用户提出一个选择，
 这个 session 随之带着一次待回答的选择，有效期 24 小时；她在与该用户的所有 session 里同一时间最多只有一个这样的选择待回答。
-用户可以在这里回答、用文字回复，或者什么都不说。选择共有四种：
+用户可以在这里回答、用文字回复，或者什么都不说。选择共有五种：
 
 | `kind` | 她提出 | 何时 |
 |---|---|---|
@@ -1060,13 +1070,16 @@ composer 失败时退回普通的人物肖像 prompt，跟聊天回合一样。�
 | `sleep_together` | 问用户愿不愿意和她上床 | 这一对在浪漫上相容（见下），chemistry 在第 3 档或以上，且最新的 3 个被判官评过的回合 warmth 和 patience 都高于 0.7 |
 | `propose` | 向用户求婚 | 这一对在浪漫上相容，chemistry 和 bond 都在第 4 档或以上，且最新的 8 个被判官评过的回合里至少 5 个 warmth 和 patience 都高于 0.7 |
 | `travel_together` | 提议一起去旅行 | bond 在第 3 档或以上，最新的 3 个被判官评过的回合 warmth 和 patience 都高于 0.7，且没有背景事件在进行。不读这一对的 scope |
+| `bathe_together` | 问用户愿不愿意和她一起洗澡 | 这一对在浪漫上相容；chemistry 在第 2 档或以上（`hygienic` 为 `true` 的角色）或第 3 档或以上（不写 `hygienic` 的角色），`hygienic` 为 `false` 时从不提出；且最新的 7 个被判官评过的回合里至少 3 个 warmth 达到 0.5。不读 patience |
 
-只有该 session 最新一段选择经过（她的请求、它的结算以及它开启的分开，不论哪一种选择）之后的、被判官评过的回合才计数。两种浪漫选择同一轮都满足时，触发 `propose`；浪漫选择优先于 `travel_together`。
-在一个 session 里被用户接受或不理会过的浪漫种类，在那里不会再次提出，`travel_together` 则 14 天内不再提出；被拒绝或过期的，等出现新的连续后会再次提出。她怎么提出、什么时候提出、
+只有该 session 最新一段选择经过（她的请求、它的结算以及它开启的分开，不论哪一种选择）之后的、被判官评过的回合才计数。`sleep_together` 与 `propose` 同一轮都满足时，触发 `propose`。
+`bathe_together` 有自己的触发条件，和这两种无关，也不受进行中的旅行影响。她同一时间只有一个请求待回答，所以一轮里有几种同时满足时，
+先轮到 `sleep_together` 或 `propose`，再到 `bathe_together`，最后是 `travel_together`。
+在一个 session 里被用户接受或不理会过的 `sleep_together` 或 `propose`，在那里不会再次提出，`travel_together` 则 14 天内不再提出，`bathe_together` 7 天内不再提出；被拒绝或过期的，等出现新的连续后会再次提出。她怎么提出、什么时候提出、
 每条路各付什么代价，见 [life-events-needs.zh.md](life-events-needs.zh.md#提出分开的选择)、
-[浪漫选择](life-events-needs.zh.md#浪漫选择)和[一起去旅行](life-events-needs.zh.md#一起去旅行)。
+[浪漫选择](life-events-needs.zh.md#浪漫选择)、[一起去旅行](life-events-needs.zh.md#一起去旅行)和[一起洗澡](life-events-needs.zh.md#一起洗澡)。
 
-**浪漫相容。** 只有调用方的 scope 标明为浪漫上相容的一对，她才会提出 `sleep_together` 或 `propose`：
+**浪漫相容。** 只有调用方的 scope 标明为浪漫上相容的一对，她才会提出 `sleep_together`、`propose` 或 `bathe_together`：
 `affinity_scope` 里至少有 trust、intrigue、patience 之一（`"chemistry"`、`"full"`、`"bond_and_chemistry"`，或点名了这三者之一的轴数组），
 `memory_scope` 是什么都不影响。默认的 `"bond"` 永远不满足。
 engine 读的是这个 session 里最新一条同时记录了 `memory_scope` 和 `affinity_scope` 的 assistant 回复上的 scope，她自己的生活选择消息不算；
@@ -1096,12 +1109,12 @@ engine 不接收也不保存用户的性别或性取向。
 
 只服务 1:1 文字 session。一个事务里完成回答并付清代价。回答带来什么，取决于 `kind`：
 
-| | `ask_for_space` | `sleep_together` | `propose` | `travel_together` |
-|---|---|---|---|---|
-| **`accept`** | 状态 `accepted`。一段 `taking_space` 分开从此刻开始，持续时长是她提出时的档位差距每一档 6 小时（差距 2、3、4 对应 12、18、24 小时）；期间她在所有 session 里都离线，正在进行的插曲在这一刻结束。bond 和 chemistry 各降一档，分开结束后的 72 小时内，这个 session 里为正的增长减半 | 状态 `accepted`；别的都不变 | 状态 `accepted`；别的都不变 | 状态 `accepted`。一段 `traveling_together` 背景从此刻开始，持续 48 到 72 小时；她照常回复，正在进行的插曲在这一刻结束。别的都不变 |
-| **`decline`** | 状态 `declined`。同样的降档；没有分开，也没有放缓 | 状态 `declined`；chemistry 降一档 | 状态 `declined`；bond 和 chemistry 各降一档 | 状态 `declined`；别的都不变 |
-| **不理会**（用户改为打字） | 状态 `ignored`；一场一小时的 `fell_out` 插曲；不改任何档位 | 状态 `ignored`；没有代价，没有 `fell_out` | 状态 `ignored`；没有代价，没有 `fell_out` | 状态 `ignored`；没有代价，没有 `fell_out` |
-| **过期**（24 小时） | 没有代价 | 没有代价 | 没有代价 | 没有代价 |
+| | `ask_for_space` | `sleep_together` | `propose` | `travel_together` | `bathe_together` |
+|---|---|---|---|---|---|
+| **`accept`** | 状态 `accepted`。一段 `taking_space` 分开从此刻开始，持续时长是她提出时的档位差距每一档 6 小时（差距 2、3、4 对应 12、18、24 小时）；期间她在所有 session 里都离线，正在进行的插曲在这一刻结束。bond 和 chemistry 各降一档，分开结束后的 72 小时内，这个 session 里为正的增长减半 | 状态 `accepted`；别的都不变 | 状态 `accepted`；别的都不变 | 状态 `accepted`。一段 `traveling_together` 背景从此刻开始，持续 48 到 72 小时；她照常回复，正在进行的插曲在这一刻结束。别的都不变 | 状态 `accepted`。一段 `bathing_together` 插曲从此刻开始，持续 30 分钟；她照常回复，正在进行的插曲在这一刻结束。别的都不变 |
+| **`decline`** | 状态 `declined`。同样的降档；没有分开，也没有放缓 | 状态 `declined`；chemistry 降一档 | 状态 `declined`；bond 和 chemistry 各降一档 | 状态 `declined`；别的都不变 | 状态 `declined`；chemistry 降一档 |
+| **不理会**（用户改为打字） | 状态 `ignored`；一场一小时的 `fell_out` 插曲；不改任何档位 | 状态 `ignored`；没有代价，没有 `fell_out` | 状态 `ignored`；没有代价，没有 `fell_out` | 状态 `ignored`；没有代价，没有 `fell_out` | 状态 `ignored`；没有代价，没有 `fell_out` |
+| **过期**（24 小时） | 没有代价 | 没有代价 | 没有代价 | 没有代价 | 没有代价 |
 
 然后她用一条主动消息回应，与普通回复一样落库并返回。`ask_for_space` 接受之后是道别，拒绝之后是受伤的回应；
 其他种类则是她对用户答“好”或“不”的回应。生成时用的是这次请求带的 scope。
@@ -1115,8 +1128,8 @@ engine 不接收也不保存用户的性别或性取向。
 
 `status` 为 `accepted` 或 `declined`。`affinity` 是回答之后的关系：`ask_for_space` 的接受以及除 `travel_together` 外任何种类的拒绝之后是降档后的，
 其他情况保持原样；形状同
-[`GET /bff/v1/comp/affinity/{session_id}`](#get-bffv1compaffinitysession_id) 里的 `affinity`。`event` 是 `ask_for_space` 接受时开始的分开，或 `travel_together` 接受时开始的旅行，
-任何拒绝以及所有浪漫选择的回答都为 `null`。
+[`GET /bff/v1/comp/affinity/{session_id}`](#get-bffv1compaffinitysession_id) 里的 `affinity`。`event` 是 `ask_for_space` 接受时开始的分开、`travel_together` 接受时开始的旅行，或 `bathe_together` 接受时开始的一起洗澡，
+任何拒绝以及 `sleep_together`、`propose` 的所有回答都为 `null`。
 她的生成失败、回复为空，或用户有更新的消息先落库时，`message` 为 `null`：回答、分开和降档照样生效。
 
 用户不调用这个路由时，还有两件事会让选择结算：
@@ -1214,7 +1227,7 @@ SSE 帧是整轮最后一帧且只走线上——在它发出前断线，光看 
   "life_choice": { "id": "…", "kind": "propose", "status": "accepted", "resolved_at": "2026-10-30T12:00:00Z" } }
 ```
 
-`kind` 为 `ask_for_space`、`sleep_together`、`propose` 或 `travel_together`。`status` 为 `pending`、`accepted`、`declined`、`ignored` 或 `expired`；`expired` 是超过 24 小时的 `pending` 选择，在这一页返回时现算，不落库。`resolved_at` 在状态为 `pending` 或 `expired` 时是 `null`；`accepted` 和 `declined` 时是回答落库的时刻，`ignored` 时是用文字回答她的那条用户消息的 `sent_at`。后面她的回应行照常带 `occasion: "life_choice"`。好感度 delta 里的 `life_choice` 字段是另一个对象，仍然只在待回答时出现。
+`kind` 为 `ask_for_space`、`sleep_together`、`propose`、`travel_together` 或 `bathe_together`。`status` 为 `pending`、`accepted`、`declined`、`ignored` 或 `expired`；`expired` 是超过 24 小时的 `pending` 选择，在这一页返回时现算，不落库。`resolved_at` 在状态为 `pending` 或 `expired` 时是 `null`；`accepted` 和 `declined` 时是回答落库的时刻，`ignored` 时是用文字回答她的那条用户消息的 `sent_at`。后面她的回应行照常带 `occasion: "life_choice"`。好感度 delta 里的 `life_choice` 字段是另一个对象，仍然只在待回答时出现。
 
 `user_message_id` 指向产生这一行的那一轮的 `role='user'` 行。assistant 行和
 `system_error` 通知行上都有，user 行本身省略。通知行最要紧：队列 worker 和
@@ -2125,7 +2138,7 @@ time-decay），或最近一次事件早于 affinity migration `0014`。`event_t
   或它的回复（`chat_messages.user_message_id`）上。`proactive` / `time_decay` 事件
   以及 migration `0056` 之前写入的行没有这个键。
 - `life_choice` —— 该 session 待回答的选择，在响应时现场拼出，只要有一次选择未被回答、也没过 24 小时，就附在 `event` 上；
-  没有时不带。`kind` 为 `ask_for_space`、`sleep_together`、`propose` 或 `travel_together`。`options` 列出
+  没有时不带。`kind` 为 `ask_for_space`、`sleep_together`、`propose`、`travel_together` 或 `bathe_together`。`options` 列出
   [生活选择路由](#post-v2compsessionsession_idlife-choiceschoice_id)接受的回答；`message_id` 是提出它的那条聊天消息
   （那一行没了就不带）。请求落在触发它的那一轮之后几秒，所以历史里某一行带 `occasion: "life_choice"` 时，
   应当重新拉一次 delta。忽略这个字段的客户端会降级成那里描述的“不理会”。

@@ -72,17 +72,19 @@ value of the wrong shape reads as absent.
 | `homesick` | boolean | Read by life events. |
 | `is_virgin` | boolean | Read by life events. |
 | `sex_addict` | boolean | Read by life events. |
+| `hygienic` | boolean | Whether she loves being clean. Read by life events, and by when she asks the user to take a bath together. |
+| `employed` | string | `free`, `part_time` or `full_time`: how much of her day is work. Absent or any other value reads as `part_time`. Read by life events. |
 | `setting` | string | `modern` or `fantasy`: the world she lives in, which decides the life events that fit her. Absent or any other value reads as `modern`. Read by life events. |
 
-The last seven are accepted and have no effect on a BYOC instance, since
+The last nine are accepted and have no effect on a BYOC instance, since
 BYOC does not serve life events yet.
 
 ## Versions
 
-- **1.1** adds the `gluttony` habit key and the `setting` key. Nothing else
-  about the document changes.
+- **1.1** adds the `gluttony` habit key and the `setting`, `hygienic` and
+  `employed` keys. Nothing else about the document changes.
 - **1** is the first version, documented in [eros-character-v1.md](eros-character-v1.md).
-  The engine still accepts it, and reads both keys on a `"1"` card too, since
+  The engine still accepts it, and reads these keys on a `"1"` card too, since
   `art_metadata` is an open object.
 
 The engine reads `spec` and `spec_version` first and rejects a pair it does

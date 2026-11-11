@@ -182,9 +182,10 @@ PDE が決めたゴーストターンは `persist_with_event` に到達しない
   | `ask_for_space` | bond と chemistry | bond と chemistry |
   | `sleep_together` | 降格なし | chemistry |
   | `propose` | 降格なし | bond と chemistry |
+  | `bathe_together` | 降格なし | chemistry |
 
   名前の挙がったラインは、拒否されたアクションと同じ着地規則で 1 段階下がる。下の段階の中で同じ相対位置に着地し、ラインの 2 軸は同じ係数で縮小され、段階 1 のラインは `0` になる。そのラインの `pending_deltas` はクリアされ、名前の挙がらないラインは軸も残高もそのままである。時間減衰とエンドポイント再計算(デプロイの affinity チューニングを使う)を済ませたスナップショットから、行ロック内で、選択を解決するトランザクションの中で計算されるため、解決がロールバックされれば降格も残らない。`ask_for_space` の accept の場合、降格は彼女が戻ってきたときの状態であり、戻った時点でさらに何かが起きることはない。言葉で打った答え(`ignored`)と期限切れは、どの種別でもラインを下げない。
-- **そのイベント行。** 降格ごとに、ターンではない専用の `event_type`、`life_choice` の 1 行が書かれる。降格が生の変化のすべてなので、`deltas` と `effective_deltas` は同じ値を持つ。`label_changes`、`effective_line_deltas`、前後 2 つの状態スナップショットがティアの移動を記録する。`context` には `life_choice`(`accept` | `decline`)と `choice_id` が入る。accept された `sleep_together` や `propose` は何も動かさず行も書かれないため、`accept` が現れるのは `ask_for_space` だけである。この行に `user_message_id` はない。ターンごとの delta ルート `GET /bff/v1/comp/affinity/{session_id}/event` は `time_decay` と同様にこの行を返さず、ジャッジが採点したターンとしても数えられない。
+- **そのイベント行。** 降格ごとに、ターンではない専用の `event_type`、`life_choice` の 1 行が書かれる。降格が生の変化のすべてなので、`deltas` と `effective_deltas` は同じ値を持つ。`label_changes`、`effective_line_deltas`、前後 2 つの状態スナップショットがティアの移動を記録する。`context` には `life_choice`(`accept` | `decline`)と `choice_id` が入る。accept された `sleep_together`、`propose`、`bathe_together` は何も動かさず行も書かれないため、`accept` が現れるのは `ask_for_space` だけである。この行に `user_message_id` はない。ターンごとの delta ルート `GET /bff/v1/comp/affinity/{session_id}/event` は `time_decay` と同様にこの行を返さず、ジャッジが採点したターンとしても数えられない。
 - **成長の鈍化(accept された `ask_for_space` のみ)。** 別離が終わってから 72 時間、4 つのライン軸で確定した正のデルタはすべて、適用前に半分になる。負のデルタは全額適用され、`warmth` と `patience` は従来どおりターン後のライン値から再導出される。削られた分は失われ、ゲートの残高には積まれない。適用されるのは選択が行われたセッションだけである。ウィンドウは導出されるもので新しい状態はない。選択の `event_id` から別離の `ends_at` を引き、`ends_at` から `ends_at` + 72 時間までを実時間で数える。鈍化したターンのイベント行は `context.growth_scale`(`0.5`)を持ち、通常の速度ではこのキーは付かず、`effective_deltas` には半分になった値が出る。accept されたロマンチックな選択が成長を鈍らせることはない。
 
 ## 4. 基礎ペア導出の詳細(定数とその根拠)

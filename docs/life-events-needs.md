@@ -219,7 +219,7 @@ the levels and decides.
 
 ### Categories
 
-An event is one of 52 drawable kinds. Each kind belongs to a category, and the category sets its
+An event is one of 61 drawable kinds. Each kind belongs to a category, and the category sets its
 shape:
 
 | `category` | shape | lasts | category weight | category cooldown |
@@ -239,14 +239,17 @@ cooldowns and ranges are in `rule`, and the category values in `category_rule`, 
 
 A duration written as a range is drawn uniformly in whole hours when the event starts.
 
-Three more kinds are never drawn: `taking_space` (说好暂时分开), `fell_out`
-(为分开的事闹得不愉快) and `traveling_together` (和对方一起旅行). The engine writes the first
+Four more kinds are never drawn: `taking_space` (说好暂时分开), `fell_out`
+(为分开的事闹得不愉快), `traveling_together` (和对方一起旅行) and `bathing_together`
+(和对方一起洗澡). The engine writes the first
 two itself when she asks for space and the
 user answers or ignores her ([the ask-for-space choice](#the-ask-for-space-choice)). They are
 `mid` incidents by shape, and `taking_space` is the one that outlasts the category's four
 hours: it lasts 12 to 24. `traveling_together` is a `trip` background the engine writes when the
-user accepts her suggestion ([going away together](#going-away-together)). None of the three has
-a draw rule, and the caller's `kinds` rejects them.
+user accepts her suggestion ([going away together](#going-away-together)), and
+`bathing_together` a 30-minute `short` incident it writes when the user accepts her ask for a
+bath ([a bath together](#a-bath-together)). None of the four has a draw rule, and the caller's
+`kinds` rejects them.
 
 ### The draw
 
@@ -254,7 +257,7 @@ The draw is a pure function of the inputs plus three random numbers (one per sta
 the length).
 
 1. **Eligibility.** A kind is eligible when all of these hold:
-   - the caller's `kinds` allows it ([below](#the-callers-kinds); absent means all 52);
+   - the caller's `kinds` allows it ([below](#the-callers-kinds); absent means all 61);
    - it passes its gate (below);
    - its own cooldown has elapsed;
    - its category's cooldown has elapsed;
@@ -266,7 +269,8 @@ the length).
    [needs factors](#1-needs-weight-the-kind-pick), its `prefer_events` factor, its
    [follow-on factor](#follow-on-factors) and, for a few kinds, a persona factor
    ([`is_virgin`](#persona-settings), [`homesick`](#persona-settings),
-   [`sex_addict`](#persona-settings)). A second roll picks
+   [`sex_addict`](#persona-settings), [`hygienic`](#persona-settings),
+   [`employed`](#persona-settings)). A second roll picks
    one.
 4. **Duration.** A fixed length is taken as is; a range is rolled.
 
@@ -288,7 +292,7 @@ eligible kind drops out of the first stage and the others share its weight.
   `working_out`, `grocery_shopping`, `in_class`, `on_the_way`, `in_battle`, `got_bumped`,
   `bumped_someone`, `saw_bag`, `saw_clothes`, `out_shopping`, `bros_gathering`,
   `sis_gathering`, `admiring_scenery`, `admiring_art`, `watching_show`, `on_the_road`,
-  `having_sex`. During `period`,
+  `having_sex`, `bird_encounter`, `streaking`. During `period`,
   `period_scare` and `pregnancy_scare` are not drawn. During `traveling_together` no kind that
   can take her offline is drawn: she is with the user.
 - One incident and one background can run together. An incident drawn inside a background is
@@ -328,10 +332,11 @@ weight and never lifts a gate.
 
 | kind | gate |
 |---|---|
-| `ex_message`, `breakup` | intimacy rung 2 or higher |
+| `ex_message`, `breakup`, `ex_wants_back` | intimacy rung 2 or higher |
 | `sudden_desire` | intimacy rung 3 |
-| `strip` | intimacy rung 3, and the session's newest recorded `affinity_scope` is romance-compatible (a chemistry axis in scope); none recorded is not compatible |
+| `strip`, `streaking` | intimacy rung 3, and the session's newest recorded `affinity_scope` is romance-compatible (a chemistry axis in scope); none recorded is not compatible |
 | `period`, `saw_bag`, `saw_clothes` | the persona's `art_metadata.gender` is `"female"` |
+| `want_to_quit_job` | the persona's `art_metadata.employed` is not `"free"` |
 | `period_scare` | the persona's `art_metadata.gender` is `"female"`, and intimacy rung 2 or higher |
 | `pregnancy_scare` | the persona's `art_metadata.gender` is `"female"`, and intimacy rung 3 |
 | `away_from_phone`, `busy`, `in_battle`, `asleep`, `bros_gathering`, `sis_gathering`, `having_sex`, and `out_shopping` for a female persona | the ghost protections allow it (see [below](#offline-kinds)) |
@@ -345,7 +350,7 @@ The rung (1 to 3) is read from the session's affinity, time-decayed as in a chat
 
 ### Persona settings
 
-Ten keys in the persona genome's `art_metadata`, read by the engine and written by whoever
+Twelve keys in the persona genome's `art_metadata`, read by the engine and written by whoever
 authors the persona, sit beside `gender`, `birthday` and `timezone`:
 
 | key | value | effect |
@@ -355,7 +360,9 @@ authors the persona, sit beside `gender`, `birthday` and `timezone`:
 | `prefer_trip` | `true`, `false` (default) | the `trip` category weighs 3 times as much |
 | `homesick` | `true`, `false`, absent (default) | within `trip`: `true` weighs `hometown_visit` 3 times and `short_trip` / `long_trip` a third; `false` weighs `hometown_visit` a third; `business_trip` is work and untouched either way |
 | `is_virgin` | `true`, `false` (default) | while she is a virgin, `having_sex` weighs a fifth within `mid` |
-| `sex_addict` | `true`, `false`, absent (default) | within `short`: `true` weighs `sudden_desire` and `strip` 3 times, `false` a third; their gates hold either way |
+| `sex_addict` | `true`, `false`, absent (default) | within `short`: `true` weighs `sudden_desire`, `strip` and `streaking` 3 times, `false` a third; their gates hold either way |
+| `hygienic` | `true`, `false`, absent (default) | within `short`: `true` weighs `showering`, `bathing`, `want_hot_spring` and `want_sauna` 3 times, `false` a third; it also sets the chemistry tier [a bath together](#a-bath-together) needs |
+| `employed` | `"free"`, `"part_time"` (default), `"full_time"` | how much of her day is work: `temp_work`, `scolded_by_superior`, `scolded_superior` and `business_trip` weigh a third, 1 time, 3 times within their categories; a `free` persona never draws `want_to_quit_job`; any other value reads as `part_time` |
 | `setting` | `"modern"` (default), `"fantasy"` | the world she lives in ([below](#her-world)); any other value reads as `modern` |
 | `smoking`, `alcoholic`, `drug`, `coffee`, `gluttony` | each `true`, `false`, absent (default) | whether she smokes, drinks, uses weed, drinks coffee, loves good food (`false`: she keeps off rich food): how fast `indulgence` comes back ([drift](#drift-between-ratings)), what a high `indulgence` names in the reply, and how she takes a give of that thing (below) |
 
@@ -367,6 +374,10 @@ Her virginity as the draw sees it is derived: the card says `is_virgin` and the 
 no `having_sex` event, ever. The first `having_sex` row ends it, with no write anywhere: the
 next draw reads the row. The key reaches no prompt; what she is like is written into her
 persona by its author, as every other persona fact. `sex_addict` reaches no prompt either.
+
+`hygienic` and `employed` reach no prompt and are not habits: they do not move `indulgence`.
+`hygienic` is its own factor, so it multiplies with a needs factor on the same kind. `employed`
+leaves `in_class`, `busy` and `in_battle` alone, and changes no cooldown or length.
 
 Reads are lenient. A value of the wrong type reads as absent; in `prefer_events`, an entry that
 is not a known `mid` kind is dropped and the rest are kept. `health` scales the whole `body`
@@ -418,6 +429,10 @@ the first stage, and does not shorten a cooldown.
 | `breakup`, `quarrel`, `scolded_by_superior`, `in_battle` | `irritable` |
 | `got_hit`, `got_bumped`, `weather_change` | `unwell` |
 | `working_out` | `showering`, `bathing` |
+| `ex_message`, `breakup` | `ex_wants_back` |
+| `scolded_by_superior`, `temp_work` | `want_to_quit_job` |
+| `breakup`, `quarrel`, `want_to_quit_job` | `pondering_life` |
+| `pondering_life` | `want_to_see_sea` |
 
 One kind is weighed down rather than ruled out while what leads to it has never happened:
 `pregnancy_scare` weighs a fifth while the instance has no `having_sex` event, ever. There is
@@ -433,7 +448,7 @@ policy, rules a kind out without the engine losing it.
 
 | `kinds` | kinds that may be drawn |
 |---|---|
-| absent or `null` | all 52 |
+| absent or `null` | all 61 |
 | `[]` | none: the response is `{"event": null, "message": null}` |
 | `["reading", "quarrel"]` | the listed ones |
 | `{"allow": […], "disallow": […]}` | what `allow` allows, minus what `disallow` lists |
@@ -443,10 +458,10 @@ In the object, `allow` absent or `null` allows every kind and `[]` none; `disall
 kinds out without freezing the rest, so a kind the engine adds later is drawn too. An unknown
 key in the object or an unknown kind anywhere rejects the request, so a misspelt `disallow`
 cannot quietly serve a kind it meant to exclude; a caller lists a new kind only once the
-engine knows it. `taking_space`, `fell_out` and `traveling_together` are never drawn, so naming one anywhere in
+engine knows it. `taking_space`, `fell_out`, `traveling_together` and `bathing_together` are never drawn, so naming one anywhere in
 `kinds` is rejected the same way.
 
-Three kinds carry adult themes: `sudden_desire`, `having_sex`, and `pregnancy_scare`, which implies sex. The
+Five kinds carry adult themes: `sudden_desire`, `strip`, `streaking`, `having_sex`, and `pregnancy_scare`, which implies sex. The
 engine keeps no group of them; a caller that serves them only to some users lists them under
 `disallow`. `scolded_by_superior` and `scolded_superior` assume someone above her, read in her
 world as a boss, a manager, a master or a sovereign; a persona with no one above her is a
@@ -761,6 +776,35 @@ see. Her clothing in the message is 刚把衣服脱了, or 刚把「{outfit}」�
 `outfit`, so the picture never shows her dressed. It carries adult themes, like
 `sudden_desire`; a caller that serves those only to some users disallows it.
 
+### Small things in her day
+
+Eight told incidents fill in her day. All are `short`; none takes her offline or carries a
+picture, and all fit both worlds ([below](#her-world)):
+
+| kind | label | category | weight | cooldown | lasts | gate | cue |
+|---|---|---|---|---|---|---|---|
+| `bird_encounter` | 遇到一只鸟 | `short` | 2 | 12 h | 30 min | none | `（你刚看到一只鸟停在不远处。）` |
+| `ex_wants_back` | 前任来求复合 | `short` | 0.5 | 30 days | 1 h | intimacy rung 2 | `（你的前任刚来找你，说想复合。）` |
+| `want_to_quit_job` | 想辞职 | `short` | 1 | 7 days | 1 h | `employed` is not `"free"` | `（你刚冒出想辞职的念头。）` |
+| `pondering_life` | 在思考人生 | `short` | 2 | 48 h | 1 h | none | `（你刚一个人发呆，在想人生的事。）` |
+| `streaking` | 刚裸奔了一圈 | `short` | 0.5 | 30 days | 30 min | intimacy rung 3, a romance-compatible pair | `（你刚一时兴起，脱光了跑了一圈。）` |
+| `want_to_see_sea` | 想去看海 | `short` | 2 | 72 h | 1 h | none | `（你现在很想去看海。）` |
+| `want_hot_spring` | 想去泡温泉 | `short` | 1 | 72 h | 1 h | none | `（你现在很想去泡温泉。）` |
+| `want_sauna` | 想去洗桑拿 | `short` | 1 | 72 h | 1 h | none | `（你现在很想去洗桑拿。）` |
+
+The cue states the fact and the details are hers: which bird, what the ex said, what she does
+about the job. A high `outing` weighs `want_to_see_sea` twice, and a low `stamina` weighs
+`want_hot_spring` and `want_sauna` twice, as it does `bathing`
+([below](#1-needs-weight-the-kind-pick)); `hygienic` scales those two with the shower and the
+bath ([persona settings](#persona-settings)). One thing leads to another: her ex texting or a
+breakup makes the ex likelier to want her back, a scolding or a work call makes her want to
+quit, a breakup, a quarrel or the wish to quit sets her thinking about her life, and that makes
+her want to see the sea ([follow-on factors](#follow-on-factors)). In hospital or after surgery
+she meets no bird and does not streak; the wants and the thoughts come there too.
+
+`streaking` carries adult themes, like `strip`: `sex_addict` scales it as it scales
+`sudden_desire`, and a caller that serves those only to some users disallows it.
+
 ### Her world
 
 `art_metadata.setting` says which world she lives in: `modern` (the default, and what any other
@@ -818,7 +862,8 @@ offline kind is under way.
 With [World Stories](world-system.md#world-stories) enabled, the story director reads the
 instance's events directly, each with its label, a relative time and the message she told it
 in, plus the background under way and the pair's asks for space with their outcome. It takes
-them as settled fact. The messages she sends on her own are not part of its chat evidence, so
+them as settled fact. A bath together is left out: like a romantic choice's outcome, it lives in
+the conversation only. The messages she sends on her own are not part of its chat evidence, so
 an event is never read as her answer to an unrelated line. The World Memories director reads a
 background under way for every persona in the roster, stories or not, so a persona in hospital
 is not scripted into a party. Neither director writes events or changes the persona settings
@@ -827,7 +872,7 @@ above. Needs reach neither.
 ## How the two interact
 
 The needs factors below are second-stage factors; the others ([follow-on
-factors](#follow-on-factors), `prefer_events`, `is_virgin`, `homesick`, `sex_addict`) read no need.
+factors](#follow-on-factors), `prefer_events`, `is_virgin`, `homesick`, `sex_addict`, `hygienic`, `employed`) read no need.
 
 ### 1. Needs weight the kind pick
 
@@ -838,11 +883,12 @@ steers which kind comes up, never whether a category does. The factors, from
 | need level | kinds | factor |
 |---|---|---|
 | `stamina` is `low` | `temp_work`, `working_out` | ×0.5 |
-| `stamina` is `low` | `unwell`, `sick`, `bathing`, `asleep` | ×2 |
+| `stamina` is `low` | `unwell`, `sick`, `bathing`, `asleep`, `want_hot_spring`, `want_sauna` | ×2 |
 | `hunger` is `high` | `grocery_shopping` | ×2 |
 | `emotional` is `high` | `ex_message` | ×3 |
 | `emotional` is `high` | `animal_encounter`, `irritable`, `quarrel` | ×2 |
 | `outing` is `high` | `want_to_go_out` | ×3 |
+| `outing` is `high` | `want_to_see_sea` | ×2 |
 | `outing` is `low` | `want_to_go_home` | ×3 |
 | `indulgence` is `high` | `want_to_go_out`, `irritable` | ×2 |
 
@@ -1140,12 +1186,12 @@ romantic choice's outcome lives in the conversation and leaves no trace in her w
 is warm like the romantic choices, but it does not read the pair's scopes, so a pair they never
 reach can be asked.
 
-**When she asks.** The check runs after the romantic one, after every judged 1:1 text turn, over
+**When she asks.** The check runs after the romantic one and the bath's, after every judged 1:1 text turn, over
 the same committed, time-decayed state and the same clear runway and right session. It needs
 bond tier 3 or more and the 3 newest judged turns warm, and no background may be under way. An
 accepted or ignored `travel_together` holds the next ask back for 14 days from its answer; after
-a decline or a lapse she asks again once the session has a fresh streak. When a romantic kind
-qualifies on the same turn it goes first, and its pending ask closes the runway.
+a decline or a lapse she asks again once the session has a fresh streak. When a romantic kind or
+the bath qualifies on the same turn it goes first, and its pending ask closes the runway.
 
 **Her ask.** It is delivered like the romantic asks: her words first, then the choice row beside
 them, no tier gap, the same 24-hour window and the same `life_choice` field on the affinity
@@ -1170,16 +1216,67 @@ is drawn, and `on_the_road`, `admiring_scenery` and `taking_selfie` follow it as
 own trips. It is instance-scoped like every event.
 
 **Other asks during the trip.** Only the separation of an ask for space holds the streak until
-its event ends. An accepted trip anchors the streak at the answer, so a romantic ask can come
-while they are away. She does not ask for space during a trip.
+its event ends. An accepted trip anchors the streak at the answer, so a romantic ask or a bath
+can come while they are away. She does not ask for space during a trip.
+
+### A bath together
+
+`bathe_together` is the fifth choice: she asks the user to take a bath with her. Like the
+romantic choices, she asks it only of a romantically compatible pair, a reply typed in words
+settles it at no cost, and only a decline costs anything.
+
+**When she asks.** The check runs after the romantic one and before the trip's, after every
+judged 1:1 text turn, over the same committed, time-decayed state and the same clear runway and
+right session. It needs all of:
+
+- a romantically compatible pair, read as for the romantic choices;
+- chemistry tier 2 or more for a persona whose `hygienic` is `true`, tier 3 or more when the key
+  is absent; a persona whose `hygienic` is `false` never asks;
+- at least 3 of the newest 7 judged turns with `warmth` 0.5 or more, read from the turn's
+  `state_after`. Patience is not read, and 0.5 is a rule threshold the engine owns, not a judge
+  band. As for every choice, only judged turns after the session's newest choice episode count.
+
+An accepted or ignored `bathe_together` holds the next ask back for 7 days from its answer;
+after a decline or a lapse she asks again on the next turn that qualifies.
+
+It is a trigger of its own, not a step on the way to the bed: some people go to bed together
+easily but not into a bath, and a couple can wash apart and still sleep together. Neither ask
+waits for the other to settle, and a trip under way does not hold the bath back. She has one ask
+pending at a time, so when a romantic kind qualifies on the same turn it goes first and its
+pending ask closes the runway.
+
+**Her ask.** It is delivered like the romantic asks: her words first, then the choice row beside
+them, no tier gap, the same 24-hour window and the same `life_choice` field on the affinity
+delta. Her ask is generated with the engine's default scopes, on the cue
+`（你们最近越来越亲密，你很想和对方一起洗个澡。你决定主动开口，问对方愿不愿意和你一起洗，希望对方给你一个答复。）`;
+her replies at resolution use the resolution request's own scopes.
+
+**The answer.** The same endpoint, the same `409` rules and the same response shape.
+
+| path | choice status | cost | what happens | her words |
+|---|---|---|---|---|
+| accept | `accepted` | none | a `bathing_together` event starts now, returned as `event` | a generated reply on `（对方答应了和你一起洗澡，你们现在一起泡在浴缸里。）` |
+| decline | `declined` | chemistry drops one tier, as for `sleep_together` | nothing | a generated reply on `（对方没有答应和你一起洗澡，你有点失落。）` |
+| ignore | `ignored` | none: no `fell_out`, no event | nothing | none of its own: the turn runs as any other |
+| lapse | stays `pending`, reads as expired | none | nothing | none |
+
+**The bath.** `bathing_together` (和对方一起洗澡) is a non-drawable incident in the `short`
+category, lasting 30 minutes from the accept. Starting it ends an incident under way; a
+background under way goes on. She does not tell it as an event, since her reply to the yes
+already does, and she is with the user: it is not offline. While it lasts it is the incident
+under way, so no other incident is drawn, and `正在经历` and the judge read it like any incident.
+It is instance-scoped like every event. No picture comes with the accept.
+
+The bath stays out of her world story: the story director's events leave out every
+`bathing_together`, so, as with the romantic choices, its outcome lives in the conversation only.
 
 ### Where the choice is stored
 
 `engine.life_choices` holds one row per choice: `session_id` (non-null, cascades with the
-session), `kind` (`ask_for_space`, `sleep_together`, `propose` or `travel_together`), `status` (`pending`,
+session), `kind` (`ask_for_space`, `sleep_together`, `propose`, `travel_together` or `bathe_together`), `status` (`pending`,
 `accepted`, `declined`, `ignored`), `tier_gap` (the gap at ask time; set for `ask_for_space`
 and NULL for the other kinds), `asked_at`, `resolved_at`, `message_id` (the ask; set to
-NULL if the message goes) and `event_id` (the `taking_space` or `traveling_together` row an accept wrote, NULL on every
+NULL if the message goes) and `event_id` (the `taking_space`, `traveling_together` or `bathing_together` row an accept wrote, NULL on every
 other path; set to NULL if the event goes). Expiry and the slowdown window are derived, never stored. The separation and
 falling-out rows live in `engine.persona_events` like any event.
 
