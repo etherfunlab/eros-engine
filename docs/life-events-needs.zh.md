@@ -175,7 +175,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 
 ### 类别
 
-可抽取的事件共 69 种，每一种属于一个类别，类别决定它的形态：
+可抽取的事件共 70 种，每一种属于一个类别，类别决定它的形态：
 
 | `category` | 形态 | 持续 | 类别权重 | 类别冷却 |
 |---|---|---|---|---|
@@ -203,17 +203,17 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 抽取是输入加三个随机数（两段各一个，时长一个）的纯函数。
 
 1. **资格。** 一个种类同时满足下面几条才有资格：
-   - 调用方的 `kinds` 允许它（[见下](#调用方的-kinds)；不带表示全部 69 种）；
+   - 调用方的 `kinds` 允许它（[见下](#调用方的-kinds)；不带表示全部 70 种）；
    - 过了它的门槛（见下）；
    - 它自己的冷却已过；
    - 它所属类别的冷却已过；
    - 离线类种类还要过了共享的离线冷却（见下）；
    - 背景规则允许它（见下）；
-   - 对 `got_lost` 这唯一一种需要背景的种类，它的某个背景正在进行（见下）。
+   - 对 `got_lost` 和 `missed_ride` 这两种需要背景的种类，它们的某个背景正在进行（见下）。
 2. **类别。** 每个至少有一个合格种类的类别，权重是类别权重乘以角色系数。掷一次随机数，按累计权重选一个。
 3. **种类。** 该类别里每个合格种类的权重是基础权重乘以它的各项[需求系数](#1-需求给种类加权)、
    `prefer_events` 系数、[关联系数](#关联系数)，少数种类再乘一个角色系数（[`is_virgin`](#角色设置)、
-   [`homesick`](#角色设置)、[`sex_addict`](#角色设置)、[`hygienic`](#角色设置)、[`employed`](#角色设置)）。再掷一次，选一个。
+   [`homesick`](#角色设置)、[`sex_addict`](#角色设置)、[`hygienic`](#角色设置)、[`employed`](#角色设置)、[`outdoorsy`](#户外还是室内)）。再掷一次，选一个。
 4. **时长。** 固定时长照用；区间则掷出来。
 
 没有合格种类就没有事件，响应是 `{"event": null, "message": null}`。只要有合格种类，抽取就一定得到事件。
@@ -233,8 +233,8 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
   `got_lost`、`trading`、`drinking`、`smoking`、`smoking_weed`、`just_have_sex`。
   `period` 期间，
   不抽 `period_scare` 与 `pregnancy_scare`。`traveling_together` 期间，不抽任何可能让她离线的种类，也不抽 `just_have_sex`：她和用户在一起。
-- 有一种是需要背景，而不是被背景排除：`got_lost` 只在 `short_trip`、`long_trip`、`hometown_visit` 或 `traveling_together`
-  进行期间抽取，出差时和不在旅途中都不抽。
+- 有两种是需要背景，而不是被背景排除。`got_lost` 只在 `short_trip`、`long_trip`、`hometown_visit` 或 `traveling_together`
+  进行期间抽取，出差时和不在旅途中都不抽。`missed_ride` 在这几种或 `business_trip` 进行期间抽取。
 - 她在等用户回答自己提出的某次生活选择时，同样完全不抽，角色的任何一个 session 都一样：这个请求本身就是前台戏，
   也免得一段离线时段在问话中间开始。带着已经抽过的 `event_key` 来重复调用，照样返回那个事件。
 - 一件插曲和一个背景可以同时进行。背景里抽到的插曲，是从背景里讲出来的。
@@ -266,6 +266,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 | `masturbating` | 角色的 `art_metadata.sex_addict` 为 `true`，并且亲密度档 3 |
 | `drinking`、`smoking`、`smoking_weed` | 角色的 `art_metadata.alcoholic`、`smoking`、`drug` 分别为 `true` |
 | `got_lost` | 有 `short_trip`、`long_trip`、`hometown_visit` 或 `traveling_together` 正在进行（见[上文](#同一时间一件插曲一个背景)） |
+| `missed_ride` | 有 `business_trip`、`short_trip`、`long_trip`、`hometown_visit` 或 `traveling_together` 正在进行 |
 | `strip`、`streaking` | 亲密度档 3，且会话最新记录的 `affinity_scope` 性向相容（scope 里有暧昧感轴）；没有记录算不相容 |
 | `period`、`saw_bag`、`saw_clothes` | 角色的 `art_metadata.gender` 为 `"female"` |
 | `want_to_quit_job` | 角色的 `art_metadata.employed` 不为 `"free"` |
@@ -283,7 +284,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 
 ### 角色设置
 
-角色 genome 的 `art_metadata` 里有十二个键，由 engine 读取，由写角色的人填写，和 `gender`、`birthday`、
+角色 genome 的 `art_metadata` 里有十三个键，由 engine 读取，由写角色的人填写，和 `gender`、`birthday`、
 `timezone` 放在一起：
 
 | 键 | 取值 | 效果 |
@@ -296,6 +297,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 | `sex_addict` | `true`、`false`、不写（默认） | `short` 内部：`true` 时 `sudden_desire`、`strip`、`streaking` 与 `just_have_sex` 3 倍，`false` 时三分之一；它们的门槛两种情况都照旧。只有 `true` 才会抽到 `having_sex` 和 `masturbating` |
 | `hygienic` | `true`、`false`、不写（默认） | `short` 内部：`true` 时 `showering`、`bathing`、`want_hot_spring` 与 `want_sauna` 3 倍，`false` 时三分之一；它也决定[一起洗澡](#一起洗澡)要 chemistry 到第几档 |
 | `employed` | `"free"`、`"part_time"`（默认）、`"full_time"` | 她的一天有多少是工作：`temp_work`、`scolded_by_superior`、`scolded_superior` 与 `business_trip` 在各自类别内分别为三分之一、1 倍、3 倍；`free` 的角色不会抽到 `want_to_quit_job`；其他值按 `part_time` 读 |
+| `outdoorsy` | `"outdoor"`、`"neutral"`（默认）、`"indoor"` | 每个类别内部：`outdoor` 时户外种类 3 倍、室内种类三分之一，`indoor` 反过来；中性种类不动（见[下文](#户外还是室内)）；其他值按 `neutral` 读 |
 | `setting` | `"modern"`（默认）、`"fantasy"` | 她生活的世界（见[下文](#她的世界)）；其他值按 `modern` 读 |
 | `smoking`、`alcoholic`、`drug`、`coffee`、`gluttony` | 各为 `true`、`false`、不写（默认） | 她抽不抽烟、喝不喝酒、用不用大麻、喝不喝咖啡、贪不贪吃（`false` 表示她忌口、节食）：决定 `indulgence` 回来得多快（见[漂移](#两次评定之间的漂移)）、`high` 的 `indulgence` 在回复里点名什么，以及她怎么对待递来的这样东西（见下）；`smoking`、`alcoholic`、`drug` 为 `true` 时，她才会抽到 `smoking`、`drinking`、`smoking_weed` |
 
@@ -306,8 +308,21 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 两种里任何一种的第一条行写下之后就不再是了，不需要任何写入：下一次抽取读到那一行就行。这个键不进任何
 prompt；她是什么样的人由写角色的人写进人设，和其他人设事实一样。`sex_addict` 同样不进任何 prompt。
 
-`hygienic` 和 `employed` 也不进任何 prompt，而且不算习惯：它们不影响 `indulgence`。`hygienic` 是单独的一个系数，
+`hygienic`、`employed` 和 `outdoorsy` 也不进任何 prompt，而且不算习惯：它们不影响 `indulgence`。`hygienic` 是单独的一个系数，
 和同一种类上的需求系数相乘。`employed` 不动 `in_class`、`busy` 和 `in_battle`，也不改任何冷却或时长。
+
+#### 户外还是室内
+
+每种插曲要么在户外，要么在室内，要么中性；`outdoorsy` 只读这一点。户外指露天：商店、教室、办公室、美术馆都不算户外。
+
+| 场所 | `short` | `mid` |
+|---|---|---|
+| 户外 | `police_encounter`、`animal_encounter`、`on_the_way`、`got_bumped`、`bumped_someone`、`admiring_scenery`、`bird_encounter`、`want_to_see_sea`、`want_hot_spring`、`got_lost`、`missed_ride` | `on_the_road`、`want_to_go_out` |
+| 室内 | `showering`、`bathing`、`in_class`、`scolded_by_superior`、`scolded_superior`、`admiring_art`、`want_sauna`、`watching_stocks` | `reading`、`gaming`、`want_to_go_home` |
+| 中性 | 其余 `short` 种类，性相关的种类与 `streaking` 都在其中 | 其余 `mid` 种类 |
+
+可能让她离线的种类（`asleep`、`in_battle`、`busy`、`away_from_phone`、`out_shopping`、两个聚会、`having_sex`）一律中性，
+所以 `outdoorsy` 不会改变她联系不上的频率。它和同一种类上的其他系数相乘，不改门槛、冷却、时长，也不改各类别出现的比例。
 
 读取是宽松的。类型不对的值按没写处理；`prefer_events` 里不是已知 `mid` 种类的条目被丢掉，其余保留。
 `health` 缩放整个 `body` 类别，`period` 也在内，`period` 自己 28 天的冷却让它不管怎样都大约每月一次。
@@ -361,7 +376,7 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 
 | `kinds` | 可以抽的种类 |
 |---|---|
-| 不带或 `null` | 全部 69 种 |
+| 不带或 `null` | 全部 70 种 |
 | `[]` | 一种都不抽：响应是 `{"event": null, "message": null}` |
 | `["reading", "quarrel"]` | 只抽列出的 |
 | `{"allow": […], "disallow": […]}` | `allow` 允许的，去掉 `disallow` 列出的 |
@@ -675,6 +690,14 @@ composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2com
 
 `just_have_sex` 和 `masturbating` 带成人题材，只对部分用户提供这类内容的调用方把它们排除。
 
+### 没赶上车
+
+| 种类 | 标签 | 类别 | 权重 | 冷却 | 时长 | 门槛 | 提示 |
+|---|---|---|---|---|---|---|---|
+| `missed_ride` | 没赶上车 | `short` | 3 | 48 小时 | 1 小时 | 有 `business_trip`、`short_trip`、`long_trip`、`hometown_visit` 或 `traveling_together` 正在进行 | `（你刚没赶上车。）`；`traveling_together` 期间为 `（你们一起出来玩，刚没赶上车。）` |
+
+会讲出来，不离线，不带图，两种世界都有（马车也是车）。和 `got_lost` 不同，出差也算。
+
 ### 她的世界
 
 `art_metadata.setting` 说她生活在哪个世界：`modern`（默认，其他值也按它读）或 `fantasy`。需要现代生活的种类不会对
@@ -950,7 +973,7 @@ affinity delta 上也是同一个 `life_choice` 字段。她的请求用 engine 
 
 | 路径 | 选择的状态 | 代价 | 她说的话 |
 |---|---|---|---|
-| 接受 | `accepted` | 无：没有事件，不降档，不放缓 | 生成的、对这声“好”的回应 |
+| 接受 | `accepted` | 无：不降档，不放缓，不新增事件；正在进行的插曲就此结束，背景照旧 | 生成的、对这声“好”的回应 |
 | 拒绝 | `declined` | `sleep_together`：chemistry 降一档。`propose`：bond 和 chemistry 各降一档 | 生成的、对这声“不”的回应 |
 | 不理会 | `ignored` | 无：没有 `fell_out`，没有事件 | 没有专门的一条：这一轮照常运行，判官读用户写的话 |
 | 过期 | 仍为 `pending`，读作已过期 | 无 | 无 |

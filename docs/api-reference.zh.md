@@ -897,6 +897,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | `short` | `smoking_weed` | 30 分钟 | 在抽大麻（`drug` 为 `true` 的角色） |
 | `short` | `just_have_sex` | 30 分钟 | 刚做完爱，讲给对方听（档 3） |
 | `short` | `masturbating` | 30 分钟 | 自慰中（性瘾角色，档 3） |
+| `short` | `missed_ride` | 1 小时 | 没赶上车（只在旅行中，出差也算） |
 | `mid` | `temp_work` | 4 小时 | 临时接到工作 |
 | `mid` | `ex_message` | 3 小时 | 前任发来消息 |
 | `mid` | `weather_change` | 4 小时 | 天气突然变了 |
@@ -929,7 +930,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | `trip` | `long_trip` | 3–7 天 | 长途旅游 |
 | `trip` | `hometown_visit` | 72 小时 | 回老家 |
 
-时长写成区间的，在事件开始时从区间里抽定。以上共 69 种可抽取的种类。两种性别都会抽到两个聚会，权重相同，这是有意为之。
+时长写成区间的，在事件开始时从区间里抽定。以上共 70 种可抽取的种类。两种性别都会抽到两个聚会，权重相同，这是有意为之。
 
 另有四种永远不会被抽到：`taking_space`（她提出、用户同意的分开，12–24 小时，离线）、`fell_out`（用户不理会她提出的分开请求时的那场不愉快，1 小时）、`traveling_together`（她提议、用户同意的旅行，48–72 小时，`trip` 类背景，不离线）和 `bathing_together`（她提议、用户同意的一起洗澡，30 分钟，`short` 类插曲，不离线）。
 它们由 engine 为[生活选择流程](#post-v2compsessionsession_idlife-choiceschoice_id)写入，作为 `…/effects` 和生活选择响应里的 `event` 出现，
@@ -951,7 +952,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
   `got_lost`、`trading`、`drinking`、`smoking`、`smoking_weed`、`just_have_sex`）；
   `period` 期间，`period_scare` 与 `pregnancy_scare` 都不抽；`traveling_together` 期间，不抽任何可能让她离线的种类，
   也不抽 `just_have_sex`：她和用户在一起。`got_lost` 只在 `short_trip`、`long_trip`、`hometown_visit` 或
-  `traveling_together` 进行期间抽取。
+  `traveling_together` 进行期间抽取；`missed_ride` 在这几种或 `business_trip` 进行期间抽取。
 - **她在等回答时什么都不抽。** 从她提出请求（不论哪一种生活选择）起，到它被回答或过期（24 小时）为止，角色任何一个 session 的抽取都返回
   `{"event": null, "message": null}`。带着已经抽过的 `event_key` 来重复调用，照样返回那个事件。
 - **冷却。** 每种事件从开始起有各自的冷却。trip 类每周最多开始一次，body 类每两周最多开始一次，不论具体是哪一种。
@@ -977,6 +978,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
   | `sex_addict` | `true` / `false` / 不写 | `sudden_desire`、`strip`、`streaking` 与 `just_have_sex` 在 `short` 内被抽到的概率是原来的三倍 / 三分之一；门槛照旧。只有 `true` 才会抽到 `having_sex` 和 `masturbating` |
   | `hygienic` | `true` / `false` / 不写 | `showering`、`bathing`、`want_hot_spring` 与 `want_sauna` 在 `short` 内被抽到的概率是原来的三倍 / 三分之一；也决定她什么时候提出一起洗澡（见[下文](#post-v2compsessionsession_idlife-choiceschoice_id)） |
   | `employed` | `"free"`、`"part_time"`（默认）、`"full_time"` | 她的一天有多少是工作：`temp_work`、`scolded_by_superior`、`scolded_superior` 与 `business_trip` 在各自类别内被抽到的概率分别是原来的三分之一 / 一倍 / 三倍，`free` 的角色不会抽到 `want_to_quit_job`；其他值按 `part_time` 读 |
+  | `outdoorsy` | `"outdoor"`、`"neutral"`（默认）、`"indoor"` | `outdoor`：户外种类在各自类别内被抽到的概率是原来的 3 倍，室内种类是三分之一；`indoor` 反过来。可能让她离线的种类算中性，不受影响；每种的场所见 [life-events-needs.zh.md](life-events-needs.zh.md#户外还是室内)；其他值按 `neutral` 读 |
   | `setting` | `"modern"`（默认）、`"fantasy"` | 她生活的世界：`fantasy` 的角色不会抽到 `police_encounter`、`showering`、`taking_selfie`、`gaming`、`watching_match`、`watching_show`、`business_trip`、`hospitalized`、`post_surgery`、`watching_stocks`，不管 `kinds` 或 `prefer_events` 怎么写；其他值按 `modern` 读 |
   | `smoking`、`alcoholic`、`drug`、`coffee`、`gluttony` | 各为 `true` / `false` / 不写 | 她抽不抽烟、喝不喝酒、用不用大麻、喝不喝咖啡、贪不贪吃：为 `true` 的越多，她的 `indulgence` 回到 `high` 越快，进而给抽取加权；为 `false` 的键可能让她拒收递来的这样东西（见[上文](#post-compchatsession_idmessagestream)）；`smoking`、`alcoholic`、`drug` 为 `true` 时她才会抽到 `smoking`、`drinking`、`smoking_weed` |
 
@@ -1124,7 +1126,7 @@ engine 不接收也不保存用户的性别或性取向。
 
 | | `ask_for_space` | `sleep_together` | `propose` | `travel_together` | `bathe_together` |
 |---|---|---|---|---|---|
-| **`accept`** | 状态 `accepted`。一段 `taking_space` 分开从此刻开始，持续时长是她提出时的档位差距每一档 6 小时（差距 2、3、4 对应 12、18、24 小时）；期间她在所有 session 里都离线，正在进行的插曲在这一刻结束。bond 和 chemistry 各降一档，分开结束后的 72 小时内，这个 session 里为正的增长减半 | 状态 `accepted`；别的都不变 | 状态 `accepted`；别的都不变 | 状态 `accepted`。一段 `traveling_together` 背景从此刻开始，持续 48 到 72 小时；她照常回复，正在进行的插曲在这一刻结束。别的都不变 | 状态 `accepted`。一段 `bathing_together` 插曲从此刻开始，持续 30 分钟；她照常回复，正在进行的插曲在这一刻结束。别的都不变 |
+| **`accept`** | 状态 `accepted`。一段 `taking_space` 分开从此刻开始，持续时长是她提出时的档位差距每一档 6 小时（差距 2、3、4 对应 12、18、24 小时）；期间她在所有 session 里都离线，正在进行的插曲在这一刻结束。bond 和 chemistry 各降一档，分开结束后的 72 小时内，这个 session 里为正的增长减半 | 状态 `accepted`；正在进行的插曲在这一刻结束，背景照旧；别的都不变 | 状态 `accepted`；正在进行的插曲在这一刻结束，背景照旧；别的都不变 | 状态 `accepted`。一段 `traveling_together` 背景从此刻开始，持续 48 到 72 小时；她照常回复，正在进行的插曲在这一刻结束。别的都不变 | 状态 `accepted`。一段 `bathing_together` 插曲从此刻开始，持续 30 分钟；她照常回复，正在进行的插曲在这一刻结束。别的都不变 |
 | **`decline`** | 状态 `declined`。同样的降档；没有分开，也没有放缓 | 状态 `declined`；chemistry 降一档 | 状态 `declined`；bond 和 chemistry 各降一档 | 状态 `declined`；别的都不变 | 状态 `declined`；chemistry 降一档 |
 | **不理会**（用户改为打字） | 状态 `ignored`；一场一小时的 `fell_out` 插曲；不改任何档位 | 状态 `ignored`；没有代价，没有 `fell_out` | 状态 `ignored`；没有代价，没有 `fell_out` | 状态 `ignored`；没有代价，没有 `fell_out` | 状态 `ignored`；没有代价，没有 `fell_out` |
 | **过期**（24 小时） | 没有代价 | 没有代价 | 没有代价 | 没有代价 | 没有代价 |

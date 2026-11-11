@@ -79,7 +79,8 @@ BYOC does not serve life events yet.
 ## Versions
 
 The current version is [1.1](eros-character-v1.1.md), which adds the
-`gluttony` habit key and the `setting`, `hygienic` and `employed` keys.
+`gluttony` habit key and the `setting`, `hygienic`, `employed` and
+`outdoorsy` keys.
 
 The engine reads `spec` and `spec_version` first and rejects a pair it does
 not know. A later version of this format raises `spec_version`; a card in
