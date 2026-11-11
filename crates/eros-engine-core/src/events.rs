@@ -135,6 +135,8 @@ pub enum EventKind {
     SmokingWeed,
     JustHaveSex,
     Masturbating,
+    /// She missed her ride: only on a trip.
+    MissedRide,
     /// She and the user take a bath together: written when the user accepts
     /// her `bathe_together` ask.
     BathingTogether,
@@ -142,7 +144,7 @@ pub enum EventKind {
 
 impl EventKind {
     /// Every drawable kind, in draw order.
-    pub const ALL: [EventKind; 69] = [
+    pub const ALL: [EventKind; 70] = [
         EventKind::PoliceEncounter,
         EventKind::AnimalEncounter,
         EventKind::HitSomeone,
@@ -212,6 +214,7 @@ impl EventKind {
         EventKind::SmokingWeed,
         EventKind::JustHaveSex,
         EventKind::Masturbating,
+        EventKind::MissedRide,
     ];
 
     /// Kinds the writers place directly, never drawn: parsed and stored, not in `ALL`.
@@ -298,6 +301,7 @@ impl EventKind {
             EventKind::SmokingWeed => "smoking_weed",
             EventKind::JustHaveSex => "just_have_sex",
             EventKind::Masturbating => "masturbating",
+            EventKind::MissedRide => "missed_ride",
         }
     }
 
@@ -317,9 +321,8 @@ impl EventKind {
             | SawBag | SawClothes | AdmiringScenery | AdmiringArt | TakingSelfie | Strip
             | BirdEncounter | ExWantsBack | WantToQuitJob | PonderingLife | Streaking
             | WantToSeeSea | WantHotSpring | WantSauna | BathingTogether | WatchingStocks
-            | Trading | GotLost | Drinking | Smoking | SmokingWeed | JustHaveSex | Masturbating => {
-                EventCategory::Short
-            }
+            | Trading | GotLost | Drinking | Smoking | SmokingWeed | JustHaveSex | Masturbating
+            | MissedRide => EventCategory::Short,
             TempWork | ExMessage | WeatherChange | GotHit | Breakup | WorkingOut | Reading
             | Gaming | AwayFromPhone | Unwell | Irritable | Busy | InBattle | Asleep
             | OutShopping | BrosGathering | SisGathering | OnTheRoad | WatchingMatch
@@ -494,6 +497,7 @@ fn rule(kind: EventKind) -> Rule {
         SmokingWeed => (2.0, 12, Lasts::Minutes(30)),
         JustHaveSex => (1.0, 48, Lasts::Minutes(30)),
         Masturbating => (1.0, 24, Lasts::Minutes(30)),
+        MissedRide => (3.0, 48, Lasts::Hours(1, 1)),
     };
     Rule {
         weight,
@@ -831,11 +835,20 @@ fn employed_factor(kind: EventKind, persona: &PersonaTraits) -> f64 {
 
 /// The backgrounds a kind can happen only during, or `None` for a kind
 /// that needs none (spec 2026-11-11-stocks-lost-habit-events-and-just-have-
-/// sex-design.md §2.1): she gets lost only on a trip.
+/// sex-design.md §2.1): she gets lost only on a trip; she misses a ride on
+/// any trip, a business trip included (spec 2026-11-11-outdoorsy-missed-
+/// ride-and-accept-ends-incident-design.md §3).
 fn needs_background(kind: EventKind) -> Option<&'static [EventKind]> {
     use EventKind::*;
     match kind {
         GotLost => Some(&[ShortTrip, LongTrip, HometownVisit, TravelingTogether]),
+        MissedRide => Some(&[
+            BusinessTrip,
+            ShortTrip,
+            LongTrip,
+            HometownVisit,
+            TravelingTogether,
+        ]),
         _ => None,
     }
 }
@@ -1651,7 +1664,7 @@ mod tests {
         let count = |c| EventKind::ALL.iter().filter(|k| k.category() == c).count();
         assert_eq!(
             EventCategory::ALL.map(count),
-            [38, 23, 4, 4],
+            [39, 23, 4, 4],
             "short, mid, body, trip"
         );
         assert!(!EventCategory::Short.is_background());
@@ -1680,7 +1693,8 @@ mod tests {
 
     /// The kinds added after the 28 v2 kinds; tests pinned to the weights of
     /// those 28 draw from `earlier()`.
-    const ADDED: [EventKind; 40] = [
+    const ADDED: [EventKind; 41] = [
+        MissedRide,
         WatchingStocks,
         Trading,
         GotLost,
@@ -1950,7 +1964,7 @@ mod tests {
             assert_eq!(EventKind::parse(s), Some(k));
             assert!(EventKind::ALL.contains(&k), "{k:?}");
         }
-        assert_eq!(EventKind::ALL.len(), 69);
+        assert_eq!(EventKind::ALL.len(), 70);
     }
 
     #[test]
@@ -1959,7 +1973,7 @@ mod tests {
         assert_eq!(EventKind::parse("fell_out"), Some(FellOut));
         assert!(!EventKind::ALL.contains(&TakingSpace));
         assert!(!EventKind::ALL.contains(&FellOut));
-        assert_eq!(EventKind::ALL.len(), 69);
+        assert_eq!(EventKind::ALL.len(), 70);
         for k in EventKind::SPECIAL {
             assert_eq!(serde_json::to_value(k).unwrap(), k.as_str());
             assert_eq!(EventKind::parse(k.as_str()), Some(k));
@@ -3013,6 +3027,7 @@ mod tests {
             (SmokingWeed, "smoking_weed", 2.0, 12, Duration::minutes(30)),
             (JustHaveSex, "just_have_sex", 1.0, 48, Duration::minutes(30)),
             (Masturbating, "masturbating", 1.0, 24, Duration::minutes(30)),
+            (MissedRide, "missed_ride", 3.0, 48, Duration::hours(1)),
         ] {
             assert_eq!(k.as_str(), wire);
             assert_eq!(EventKind::parse(wire), Some(k));
@@ -3150,5 +3165,24 @@ mod tests {
             assert_eq!(at(&[past(bg, 1, 48)]), None, "{bg:?}");
         }
         assert_eq!(at(&[past(ShortTrip, 72, 48)]), None, "the trip is over");
+    }
+
+    #[test]
+    fn she_misses_a_ride_only_on_a_trip() {
+        let only = [MissedRide];
+        let p = PersonaTraits::default();
+        let at = |history: &[PastEvent]| pick_with(&p, None, 1, history, &only, rolls(0.0, 0.0));
+        assert_eq!(at(&[]), None, "no background");
+        for bg in [
+            BusinessTrip,
+            ShortTrip,
+            LongTrip,
+            HometownVisit,
+            TravelingTogether,
+        ] {
+            assert_eq!(at(&[past(bg, 1, 48)]), Some(MissedRide), "{bg:?}");
+        }
+        assert_eq!(at(&[past(Sick, 1, 48)]), None, "not a trip");
+        assert_eq!(at(&[past(BusinessTrip, 72, 48)]), None, "the trip is over");
     }
 }

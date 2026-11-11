@@ -5407,7 +5407,8 @@
           "smoking",
           "smoking_weed",
           "just_have_sex",
-          "masturbating"
+          "masturbating",
+          "missed_ride"
         ]
       },
       "EventView": {

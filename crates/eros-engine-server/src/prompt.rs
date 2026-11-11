@@ -944,6 +944,7 @@ pub(crate) fn event_label(kind: eros_engine_core::events::EventKind) -> &'static
         SmokingWeed => "在抽大麻",
         JustHaveSex => "刚做完爱",
         Masturbating => "自慰中",
+        MissedRide => "没赶上车",
     }
 }
 
@@ -4899,6 +4900,7 @@ mod tests {
                 "在抽大麻",
                 "刚做完爱",
                 "自慰中",
+                "没赶上车",
             ]
         );
     }
