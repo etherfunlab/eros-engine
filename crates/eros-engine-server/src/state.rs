@@ -152,6 +152,28 @@ pub(crate) fn affinity_tuning_from(
         knob("AFFINITY_TIME_DECAY_FLOOR", &mut t.time_decay_floor, |v| {
             (0.0..=1.0).contains(&v)
         });
+        knob(
+            "AFFINITY_ACTIVITY_TURN_SHARE",
+            &mut t.activity_turn_share,
+            |v| v >= 0.0,
+        );
+    }
+    {
+        let cap = |name: &str, slot: &mut u32| {
+            let Some(raw) = get(name) else { return };
+            match raw.trim().parse::<u32>() {
+                Ok(v) => *slot = v,
+                Err(_) => tracing::warn!("invalid {name}={raw:?}; keeping default {}", *slot),
+            }
+        };
+        cap(
+            "AFFINITY_ACTIVITY_TURN_CAP_SHORT",
+            &mut t.activity_turn_cap_short,
+        );
+        cap(
+            "AFFINITY_ACTIVITY_TURN_CAP_MID",
+            &mut t.activity_turn_cap_mid,
+        );
     }
     if let Some(raw) = get("AFFINITY_TIER_DECAY") {
         match parse_tier_decay(&raw) {
@@ -832,6 +854,32 @@ mod tests {
         assert_eq!(t.tier_decay, [1.0, 0.8, 0.6, 0.4, 0.2]);
     }
 
+    #[test]
+    fn affinity_tuning_activity_knobs_apply_and_default() {
+        let t = tuning_with(&[
+            ("AFFINITY_ACTIVITY_TURN_SHARE", "0.5"),
+            ("AFFINITY_ACTIVITY_TURN_CAP_SHORT", "6"),
+            ("AFFINITY_ACTIVITY_TURN_CAP_MID", "20"),
+        ]);
+        assert_eq!(t.activity_turn_share, 0.5);
+        assert_eq!(t.activity_turn_cap_short, 6);
+        assert_eq!(t.activity_turn_cap_mid, 20);
+
+        let d = tuning_with(&[]);
+        assert_eq!(d.activity_turn_share, 0.25);
+        assert_eq!(d.activity_turn_cap_short, 12);
+        assert_eq!(d.activity_turn_cap_mid, 32);
+
+        // Each knob stands alone: setting one leaves the others at default.
+        let one = tuning_with(&[("AFFINITY_ACTIVITY_TURN_CAP_MID", "0")]);
+        assert_eq!(
+            one.activity_turn_cap_mid, 0,
+            "0 turns = a date moves nothing"
+        );
+        assert_eq!(one.activity_turn_share, 0.25);
+        assert_eq!(one.activity_turn_cap_short, 12);
+    }
+
     /// The one-typo NaN factory: κ start = 1 makes the penalty ramp divide by
     /// zero, and NaN survives the axis clamp into stored state. Out-of-domain
     /// or non-finite values must keep the default, never apply.
@@ -856,6 +904,13 @@ mod tests {
             ("AFFINITY_FLOOR_RATIO", "-0.1"),
             ("AFFINITY_TIME_DECAY_RATE", "-0.02"),
             ("AFFINITY_TIME_DECAY_FLOOR", "1.5"),
+            ("AFFINITY_ACTIVITY_TURN_SHARE", "-0.25"),
+            ("AFFINITY_ACTIVITY_TURN_SHARE", "NaN"),
+            ("AFFINITY_ACTIVITY_TURN_SHARE", "abc"),
+            ("AFFINITY_ACTIVITY_TURN_CAP_SHORT", "-1"),
+            ("AFFINITY_ACTIVITY_TURN_CAP_SHORT", "1.5"),
+            ("AFFINITY_ACTIVITY_TURN_CAP_MID", "abc"),
+            ("AFFINITY_ACTIVITY_TURN_CAP_MID", "4294967296"),
         ] {
             let t = tuning_with(&[(name, bad)]);
             assert_eq!(t, d, "{name}={bad} must keep every default");

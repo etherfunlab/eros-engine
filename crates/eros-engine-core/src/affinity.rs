@@ -3,6 +3,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::types::DateDuration;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Affinity {
     pub id: Uuid,
@@ -289,6 +291,21 @@ pub fn tier_drop_target(score: f64) -> f64 {
         .clamp(lower_lo + TIER_DROP_EPS, lower_hi - TIER_DROP_EPS)
 }
 
+/// Where a line scored `score` stands after rising one tier: the same relative
+/// position inside the tier above. Tier 5 has nothing above it and goes to 1.0,
+/// so the axis clamp alone bounds it. The mirror of `tier_drop_target`.
+pub fn tier_raise_target(score: f64) -> f64 {
+    let k = usize::from(tier_index(score));
+    if k == 5 {
+        return 1.0;
+    }
+    let (lo, hi) = TIER_BOUNDS[k - 1];
+    let (upper_lo, upper_hi) = TIER_BOUNDS[k];
+    let pos = ((score - lo) / (hi - lo)).clamp(0.0, 1.0);
+    (upper_lo + pos * (upper_hi - upper_lo))
+        .clamp(upper_lo + TIER_DROP_EPS, upper_hi - TIER_DROP_EPS)
+}
+
 /// Friendship-line tier (pure function of `bond_score`). Serialised snake_case
 /// key is the frontend's lookup; Chinese display lives in the frontend.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -525,6 +542,42 @@ impl Affinity {
         }
     }
 
+    /// Hold `line` to a one-tier shift from `before`. When `self` has the line
+    /// above `tier_raise_target` or below `tier_drop_target` of its `before`
+    /// score, both its axes are pulled back along their own deltas by one ratio
+    /// so the line lands on that cap, and the result is `true`; a shift inside
+    /// the band changes nothing and is `false` (spec
+    /// 2026-11-12-activity-sub-session-design.md §6.3).
+    pub fn cap_line_shift(&mut self, before: &Affinity, line: AffinityLine) -> bool {
+        let (s0, s1) = match line {
+            AffinityLine::Bond => (before.bond_score(), self.bond_score()),
+            AffinityLine::Chemistry => (before.chemistry_score(), self.chemistry_score()),
+        };
+        let (up, down) = (tier_raise_target(s0), tier_drop_target(s0));
+        let target = if s1 > up {
+            up
+        } else if s1 < down {
+            down
+        } else {
+            return false;
+        };
+        // `s1` lies strictly past a cap that sits on the far side of `s0`, so
+        // the divisor is never zero.
+        let k = (target - s0) / (s1 - s0);
+        let scale = |from: f64, now: f64| clamp(from + (now - from) * k, 0.0, 1.0);
+        match line {
+            AffinityLine::Bond => {
+                self.trust = scale(before.trust, self.trust);
+                self.intrigue = scale(before.intrigue, self.intrigue);
+            }
+            AffinityLine::Chemistry => {
+                self.intimacy = scale(before.intimacy, self.intimacy);
+                self.tension = scale(before.tension, self.tension);
+            }
+        }
+        true
+    }
+
     /// Coarse 1..=3 intimacy rung for the PDE image gate, taken over whichever
     /// line is further along. Rung 1 = both lines still tier 1; rung 3 = at or
     /// above `INTIMACY_RUNG3_LO`; rung 2 = everything between. `max` rather than
@@ -608,6 +661,25 @@ pub struct AffinityTuning {
     pub time_decay_rate: f64,
     /// Endpoint absence decay floor (`AFFINITY_TIME_DECAY_FLOOR`).
     pub time_decay_floor: f64,
+    /// Weight of one substantive turn of a date's verdict
+    /// (`AFFINITY_ACTIVITY_TURN_SHARE`); see `activity_weight`.
+    pub activity_turn_share: f64,
+    /// Turns that count toward a `short` date (`AFFINITY_ACTIVITY_TURN_CAP_SHORT`).
+    pub activity_turn_cap_short: u32,
+    /// Turns that count toward a `mid` date (`AFFINITY_ACTIVITY_TURN_CAP_MID`).
+    pub activity_turn_cap_mid: u32,
+}
+
+impl AffinityTuning {
+    /// How many per-turn verdicts a date's single verdict is worth:
+    /// `min(turns, cap) × share`, the cap set by the date's duration.
+    pub fn activity_weight(&self, turns: u32, duration: DateDuration) -> f64 {
+        let cap = match duration {
+            DateDuration::Short => self.activity_turn_cap_short,
+            DateDuration::Mid => self.activity_turn_cap_mid,
+        };
+        f64::from(turns.min(cap)) * self.activity_turn_share
+    }
 }
 
 impl Default for AffinityTuning {
@@ -628,6 +700,9 @@ impl Default for AffinityTuning {
             floor_ratio: 0.2,
             time_decay_rate: 0.02,
             time_decay_floor: 0.5,
+            activity_turn_share: 0.25,
+            activity_turn_cap_short: 12,
+            activity_turn_cap_mid: 32,
         }
     }
 }
@@ -730,6 +805,45 @@ pub fn grade_turn(
     boost: f64,
     t: &AffinityTuning,
 ) -> GradeTurnOutcome {
+    grade_scaled(a, grades, rule, pending, boost, t, 1.0)
+}
+
+/// A date's one verdict through the same pipeline as a turn, worth `weight`
+/// turns (`AffinityTuning::activity_weight`): no rule nudges, and `raw`, the
+/// real score and the assessed cross penalty all scale by `weight` before the
+/// threshold gate, so `committed` is `grade_turn`'s times `weight` whenever the
+/// gate is open. Pure; the caller owns the one-tier cap and persistence.
+pub fn grade_weighted(
+    a: &Affinity,
+    grades: &AxisGrades,
+    pending: &PendingDeltas,
+    boost: f64,
+    t: &AffinityTuning,
+    weight: f64,
+) -> GradeTurnOutcome {
+    grade_scaled(
+        a,
+        grades,
+        &AffinityDeltas::default(),
+        pending,
+        boost,
+        t,
+        weight,
+    )
+}
+
+/// The pipeline behind `grade_turn` (`weight` 1.0) and `grade_weighted`.
+/// `weight` scales each axis's raw score, real score ρ and assessed penalty
+/// ahead of the threshold gate; the grades themselves stay in −4..=4.
+fn grade_scaled(
+    a: &Affinity,
+    grades: &AxisGrades,
+    rule: &AffinityDeltas,
+    pending: &PendingDeltas,
+    boost: f64,
+    t: &AffinityTuning,
+    weight: f64,
+) -> GradeTurnOutcome {
     // Pre-turn snapshot: every axis reads the same tiers and counterparts.
     let bond = a.bond_score();
     let chem = a.chemistry_score();
@@ -801,8 +915,9 @@ pub fn grade_turn(
         let r = raw(g, rule_d, unit);
         let kappa = t.cross_penalty_ratio * unit;
         let (rho, charged) = real(r, own_tier, counterpart, kappa, g);
+        let (rho, charged) = (rho * weight, charged * weight);
         let (committed, pend) = gate(rho, pend);
-        (r, committed, pend, charged)
+        (r * weight, committed, pend, charged)
     };
 
     let (t_raw, t_com, t_pend, t_pen) = axis(
@@ -1794,6 +1909,200 @@ mod tests {
             );
             s += 0.01;
         }
+    }
+
+    #[test]
+    fn tier_raise_target_mirrors_the_drop() {
+        // tier 2 = [0.15, 0.35): 25% in → 25% into tier 3 = [0.35, 0.62)
+        assert!((tier_raise_target(0.20) - (0.35 + 0.25 * 0.27)).abs() < 1e-9);
+        assert_eq!(tier_index(tier_raise_target(0.0)), 2);
+        assert_eq!(tier_raise_target(0.95), 1.0); // tier 5 is bounded by the clamp only
+    }
+
+    #[test]
+    fn tier_raise_target_lands_exactly_one_tier_up_at_every_edge() {
+        for score in [
+            0.0, 0.149999, 0.15, 0.349999, 0.35, 0.619999, 0.62, 0.899999,
+        ] {
+            let t = tier_raise_target(score);
+            assert_eq!(
+                tier_index(t),
+                tier_index(score) + 1,
+                "score {score} → target {t}"
+            );
+        }
+    }
+
+    #[test]
+    fn cap_line_shift_holds_a_rise_to_one_tier() {
+        let before = line_affinity(0.2, 0.2, 0.3, 0.1); // bond 0.20, tier 2
+        let mut after = before.clone();
+        // trust +0.8, intrigue +0.4: bond 0.80, tier 4.
+        after.trust = 1.0;
+        after.intrigue = 0.6;
+        assert_eq!(after.bond_tier(), 4);
+
+        assert!(after.cap_line_shift(&before, AffinityLine::Bond));
+
+        let target = tier_raise_target(0.20);
+        assert!((after.bond_score() - target).abs() < 1e-9);
+        assert_eq!(after.bond_tier(), 3);
+        // Both axes moved by one ratio of their own deltas: the 2:1 split holds.
+        let (dt, di) = (after.trust - 0.2, after.intrigue - 0.2);
+        assert!((dt / di - 2.0).abs() < 1e-9, "dt {dt}, di {di}");
+        assert!((dt - 0.8 * (target - 0.2) / 0.6).abs() < 1e-9);
+        assert_eq!(
+            (after.intimacy, after.tension),
+            (0.3, 0.1),
+            "the other line is not this call's business"
+        );
+    }
+
+    #[test]
+    fn cap_line_shift_holds_a_fall_to_one_tier() {
+        let before = line_affinity(0.2, 0.2, 0.0, 0.0); // bond 0.20, tier 2
+        let mut after = before.clone();
+        after.trust = 0.0;
+        after.intrigue = 0.0;
+
+        // Falling to 0.0 is further than one tier: it stops at the drop target.
+        assert!(after.cap_line_shift(&before, AffinityLine::Bond));
+        assert!((after.bond_score() - tier_drop_target(0.20)).abs() < 1e-9);
+        assert_eq!(after.bond_tier(), 1);
+        assert!((after.trust - after.intrigue).abs() < 1e-12);
+    }
+
+    #[test]
+    fn cap_line_shift_leaves_a_shift_inside_the_band_alone() {
+        let before = line_affinity(0.2, 0.2, 0.2, 0.2);
+        // Up within the tier above, down within the tier below, and no change.
+        for (trust, intrigue) in [(0.4, 0.4), (0.1, 0.1), (0.2, 0.2), (0.5, 0.3)] {
+            let mut after = before.clone();
+            after.trust = trust;
+            after.intrigue = intrigue;
+            let snapshot = after.clone();
+            assert!(
+                !after.cap_line_shift(&before, AffinityLine::Bond),
+                "bond {} is inside [{}, {}]",
+                snapshot.bond_score(),
+                tier_drop_target(0.20),
+                tier_raise_target(0.20)
+            );
+            assert_eq!(after, snapshot, "nothing changes");
+        }
+    }
+
+    #[test]
+    fn cap_line_shift_works_the_chemistry_line_and_edge_tiers() {
+        // Chemistry, tier 5: bounded by the clamp, never above the raise target.
+        let before = line_affinity(0.0, 0.0, 0.92, 0.92);
+        let mut after = before.clone();
+        after.intimacy = 1.0;
+        after.tension = 1.0;
+        assert!(!after.cap_line_shift(&before, AffinityLine::Chemistry));
+        // A fall from tier 5 stops one tier down.
+        after.intimacy = 0.0;
+        after.tension = 0.0;
+        assert!(after.cap_line_shift(&before, AffinityLine::Chemistry));
+        assert_eq!(after.chem_tier(), 4);
+        assert!((after.chemistry_score() - tier_drop_target(0.92)).abs() < 1e-9);
+        assert_eq!((after.trust, after.intrigue), (0.0, 0.0));
+        // A tier-1 line rises into tier 2 and no further.
+        let low = line_affinity(0.0, 0.0, 0.05, 0.05);
+        let mut up = low.clone();
+        up.intimacy = 0.9;
+        up.tension = 0.9;
+        assert!(up.cap_line_shift(&low, AffinityLine::Chemistry));
+        assert_eq!(up.chem_tier(), 2);
+    }
+
+    fn line_deltas(d: &AffinityDeltas) -> [f64; 4] {
+        [d.trust, d.intrigue, d.intimacy, d.tension]
+    }
+
+    fn mixed_grades() -> AxisGrades {
+        AxisGrades {
+            trust: 2,
+            intrigue: -1,
+            intimacy: 3,
+            tension: -2,
+        }
+    }
+
+    #[test]
+    fn grade_weighted_is_grade_turn_times_weight() {
+        // Bond tier 4 against chemistry tier 5: the cross penalty is live.
+        let a = line_affinity(0.8, 0.8, 0.95, 0.95);
+        let t = AffinityTuning::default();
+        let pending = PendingDeltas::default();
+        let base = grade_turn(
+            &a,
+            &mixed_grades(),
+            &AffinityDeltas::default(),
+            &pending,
+            1.0,
+            &t,
+        );
+        let one = grade_weighted(&a, &mixed_grades(), &pending, 1.0, &t, 1.0);
+        let three = grade_weighted(&a, &mixed_grades(), &pending, 1.0, &t, 3.0);
+
+        let axes = |o: &GradeTurnOutcome| line_deltas(&o.committed);
+        let pens = |o: &GradeTurnOutcome| {
+            let p = o.cross_penalty_assessed;
+            [p.trust, p.intrigue, p.intimacy, p.tension]
+        };
+        assert_eq!(axes(&one), axes(&base));
+        assert_eq!(pens(&one), pens(&base));
+        assert!(axes(&base).iter().all(|c| *c != 0.0), "{:?}", axes(&base));
+        assert!(pens(&base).iter().any(|p| *p > 0.0), "penalty is live");
+        for i in 0..4 {
+            assert!((axes(&three)[i] - 3.0 * axes(&base)[i]).abs() < 1e-12);
+            assert!((pens(&three)[i] - 3.0 * pens(&base)[i]).abs() < 1e-12);
+        }
+        assert_eq!(line_deltas(&one.raw), line_deltas(&base.raw));
+        for i in 0..4 {
+            let (r1, r3) = (line_deltas(&base.raw)[i], line_deltas(&three.raw)[i]);
+            assert!((r3 - 3.0 * r1).abs() < 1e-12, "raw is the weighted raw");
+        }
+    }
+
+    #[test]
+    fn grade_weighted_scales_before_the_threshold_gate() {
+        let a = zeroed();
+        let t = AffinityTuning {
+            delta_threshold: 0.1,
+            ..Default::default()
+        };
+        let grades = AxisGrades {
+            trust: 1,
+            ..Default::default()
+        };
+        let pending = PendingDeltas::default();
+        // One grade step is 0.0786: under the gate on a turn, over it at ×3.
+        let held = grade_weighted(&a, &grades, &pending, 1.0, &t, 1.0);
+        assert_eq!(held.committed.trust, 0.0);
+        assert!(held.pending.trust > 0.0);
+        let through = grade_weighted(&a, &grades, &pending, 1.0, &t, 3.0);
+        assert!((through.committed.trust - 3.0 * 0.0786).abs() < 1e-9);
+        assert_eq!(through.pending.trust, 0.0);
+    }
+
+    #[test]
+    fn grade_weighted_of_zero_weight_commits_nothing() {
+        let a = line_affinity(0.8, 0.8, 0.95, 0.95);
+        let t = AffinityTuning::default();
+        let o = grade_weighted(&a, &mixed_grades(), &PendingDeltas::default(), 1.0, &t, 0.0);
+        assert_eq!(line_deltas(&o.committed), [0.0; 4]);
+        assert!(o.cross_penalty_assessed.is_zero());
+    }
+
+    #[test]
+    fn activity_weight_caps_turns_per_duration() {
+        let t = AffinityTuning::default();
+        assert_eq!(t.activity_weight(1, DateDuration::Short), 0.25);
+        assert_eq!(t.activity_weight(40, DateDuration::Short), 3.0);
+        assert_eq!(t.activity_weight(40, DateDuration::Mid), 8.0);
+        assert_eq!(t.activity_weight(0, DateDuration::Mid), 0.0);
     }
 
     #[test]
