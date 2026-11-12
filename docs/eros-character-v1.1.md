@@ -65,6 +65,7 @@ value of the wrong shape reads as absent.
 | `appearance` | string | Visual description seeded into image prompts. |
 | `possessions` | array of strings | Things she owns, merged with the instance's item rows. |
 | `wardrobe` | array of strings | Clothes she can wear, merged with the instance's item rows. |
+| `moody` | boolean | Whether her moods run high: `true` makes an emotional reply three times as likely, `false` a third as likely. Read only by the chat tone draw ([model-config.md](model-config.md#tones--chat-tones-chat-task-only)); it reaches no prompt. |
 | `smoking`, `alcoholic`, `drug`, `coffee`, `gluttony` | boolean | Whether she smokes, drinks, uses weed, drinks coffee, loves good food: how she takes a `give` of each, how fast her craving for what she's hooked on builds, and what it names. `smoking`, `alcoholic` and `drug` set to `true` also let life events draw her smoking, drinking and smoking weed. See [life-events-needs.md](life-events-needs.md#persona-settings). |
 | `health` | string | `weak`, `normal` or `strong`. Read by life events. |
 | `prefer_trip` | boolean | Read by life events. |
@@ -83,7 +84,7 @@ BYOC does not serve life events yet.
 ## Versions
 
 - **1.1** adds the `gluttony` habit key and the `setting`, `hygienic`,
-  `employed` and `outdoorsy` keys. Nothing else about the document changes.
+  `employed`, `outdoorsy` and `moody` keys. Nothing else about the document changes.
 - **1** is the first version, documented in [eros-character-v1.md](eros-character-v1.md).
   The engine still accepts it, and reads these keys on a `"1"` card too, since
   `art_metadata` is an open object.

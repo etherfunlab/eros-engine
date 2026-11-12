@@ -414,6 +414,12 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 - 背景的提示带上抽到的时长（`period` 的不带）：`（你刚出发去外地出差，要待 24 小时。）`。
 - 背景期间抽到的插曲，提示以背景的状态开头：`（你正在外地出差。你刚在路上遇到了一只小动物。）`。
 
+**情绪化语气。** 部署打开 [`tones.emotional`](model-config.zh.md#tones--聊天语气仅限-chat-任务)（大于 0）时，
+十六种事件用 `emotional` 语气讲出来：`quarrel`、`scolded_by_superior`、`scolded_superior`、`got_hit`、`hit_someone`、`police_encounter`、`ex_wants_back`、`irritable`、`want_to_quit_job`、`unwell`、`sick`、`period`、`sudden_desire`、`drinking`、`smoking_weed`、`just_have_sex`。这时请求只有情绪化的 system prompt 和提示：没有历史窗口、
+没有记忆召回、没有用户画像，也没有亲密度结论；`[shared_memories]` 放这段关系最近的三个 episode，`[now]`
+保留正在进行的事件。这条消息的行带 `metadata.tone = "emotional"`。其余事件，以及语气关闭时的所有事件，
+照上面的方式讲。
+
 然后：
 
 - 输出正则规则照常生效。回复为空，或被规则剥到一无所剩，什么都不写，响应的 `event` 和 `message` 都是 `null`。生成失败返回上游错误，什么都不写。
