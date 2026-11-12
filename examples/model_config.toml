@@ -177,7 +177,7 @@ model_name_display_override = true
 #   kinds, are ALWAYS emotional, whatever the value (see docs/model-config.md,
 #   "tones").
 # An emotional reply is written without the chat history, the user profile or
-# the affinity conclusions, in at most one sentence of 40 characters.
+# the affinity conclusions, in at most one sentence and 40 characters.
 # Task-level; absent or 0 = off.
 #tones = { emotional = 0.05 }
 
