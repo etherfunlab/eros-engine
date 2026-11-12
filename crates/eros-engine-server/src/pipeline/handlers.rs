@@ -5317,7 +5317,15 @@ mod tests {
         let instance_id = seed_persona_instance(&pool, owner).await;
         let session_id = make_session(&pool, owner, Some(instance_id)).await;
         emotional_row(&pool, session_id, "user", "早", 0.0, None).await;
-        emotional_row(&pool, session_id, "assistant", "早呀。今天也要加油。", 1.0, None).await;
+        emotional_row(
+            &pool,
+            session_id,
+            "assistant",
+            "早呀。今天也要加油。",
+            1.0,
+            None,
+        )
+        .await;
         let driving = emotional_row(&pool, session_id, "user", "今天好累", 2.0, None).await;
 
         let state = crate::routes::companion::test_state(pool.clone());
@@ -5475,7 +5483,10 @@ mod tests {
             .pop()
             .expect("the driving row");
         let want = model_facing_user_text(&row);
-        assert!(want.contains("一只猫"), "the fixture has a preamble: {want}");
+        assert!(
+            want.contains("一只猫"),
+            "the fixture has a preamble: {want}"
+        );
 
         let state = crate::routes::companion::test_state(pool.clone());
         let req = emotional_request(

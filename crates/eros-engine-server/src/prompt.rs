@@ -7201,7 +7201,10 @@ mod tests {
                 p.contains("[reply_length]\n最多 1 句，不超过 40 字"),
                 "{mode:?}: {p}"
             );
-            assert!(p.contains(rule_one(mode)), "rule ① follows the mode: {mode:?}");
+            assert!(
+                p.contains(rule_one(mode)),
+                "rule ① follows the mode: {mode:?}"
+            );
         }
     }
 
@@ -7233,7 +7236,9 @@ mod tests {
             None,
             &[],
         );
-        let cut = d.find("[user_profile]").expect("the default prompt has the block");
+        let cut = d
+            .find("[user_profile]")
+            .expect("the default prompt has the block");
         assert_eq!(&e[..cut], &d[..cut]);
         assert!(e[cut..].starts_with("[shared_memories]"), "{}", &e[cut..]);
     }

@@ -492,6 +492,10 @@ pub struct BurstOutcome {
 /// (live=false), the burst buffers the chat-generation attempt whole, then
 /// streams the filter LLM's rewrite and emits its deltas (never the original).
 /// Otherwise it streams live per-chunk exactly as before.
+///
+/// This form is the 1:1 burst of a turn that drew no tone, as the tests
+/// drive it; the pipeline calls [`drive_chat_burst_for`].
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn drive_chat_burst(
     state: Arc<AppState>,
@@ -25118,9 +25122,9 @@ data: [DONE]\n\n"
             });
             Mock::given(wm_path("/api/v1/chat/completions"))
                 .and(body_string_contains("pde/judge"))
-                .respond_with(crate::pipeline::reasoning_call::test_support::sse_completion(
-                    judge_body,
-                ))
+                .respond_with(
+                    crate::pipeline::reasoning_call::test_support::sse_completion(judge_body),
+                )
                 .mount(&mock)
                 .await;
         }
@@ -25177,7 +25181,10 @@ data: [DONE]\n\n"
             ),
         );
 
-        for (role, content, mins) in [("user", "EARLIER-USER", 2), ("assistant", "EARLIER-REPLY。还有一句。", 1)] {
+        for (role, content, mins) in [
+            ("user", "EARLIER-USER", 2),
+            ("assistant", "EARLIER-REPLY。还有一句。", 1),
+        ] {
             sqlx::query(
                 "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
                  VALUES ($1, $2, $3, now() - make_interval(mins => $4))",
@@ -25193,7 +25200,11 @@ data: [DONE]\n\n"
         let meta = action
             .as_ref()
             .map(|a| serde_json::json!({"action": serde_json::to_value(a).unwrap()}));
-        let content = if action.is_some() { "" } else { "你今天怎么样" };
+        let content = if action.is_some() {
+            ""
+        } else {
+            "你今天怎么样"
+        };
         let umid = match (ChatRepo { pool })
             .upsert_user_message_idempotent(
                 session_id,
@@ -25233,7 +25244,9 @@ data: [DONE]\n\n"
         .collect()
         .await;
         assert!(
-            !frames.iter().any(|f| matches!(f, ProtocolFrame::Error { .. })),
+            !frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Error { .. })),
             "the turn must not error: {frames:?}"
         );
         (mock, session_id)
@@ -25305,7 +25318,10 @@ data: [DONE]\n\n"
             system.contains("对方刚说的话你不全买账：挑出你不认同的那一点，反问回去"),
             "the judge's reply_mode still writes rule ①: {system}"
         );
-        assert_eq!(tone_reply_metadata(&pool, session_id).await["tone"], "emotional");
+        assert_eq!(
+            tone_reply_metadata(&pool, session_id).await["tone"],
+            "emotional"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -25321,8 +25337,14 @@ data: [DONE]\n\n"
         )
         .await;
         let payload = tone_decision_payload(&pool, session_id).await;
-        assert!(payload["nudges"].is_null(), "no dice on an emotional turn: {payload}");
-        assert!(payload.get("tone").is_none(), "the tone is not on the audit row: {payload}");
+        assert!(
+            payload["nudges"].is_null(),
+            "no dice on an emotional turn: {payload}"
+        );
+        assert!(
+            payload.get("tone").is_none(),
+            "the tone is not on the audit row: {payload}"
+        );
         let messages = tone_chat_messages(&mock).await;
         let system = messages[0]["content"].as_str().unwrap();
         assert!(!system.contains("[this_turn]"), "{system}");
@@ -25333,10 +25355,16 @@ data: [DONE]\n\n"
         let (mock, session_id) =
             run_tone_turn(&pool, "tones = { emotional = 1e-12 }", None, None, false).await;
         let messages = tone_chat_messages(&mock).await;
-        assert!(messages.len() > 2, "the default request keeps history: {messages:?}");
+        assert!(
+            messages.len() > 2,
+            "the default request keeps history: {messages:?}"
+        );
         let system = messages[0]["content"].as_str().unwrap();
         assert!(system.contains("[user_profile]"), "{system}");
-        assert_eq!(tone_reply_metadata(&pool, session_id).await["tone"], "default");
+        assert_eq!(
+            tone_reply_metadata(&pool, session_id).await["tone"],
+            "default"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -25378,7 +25406,13 @@ data: [DONE]\n\n"
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert!(content.contains("FILTERED-REPLY"), "the filter ran: {content}");
-        assert_eq!(tone_reply_metadata(&pool, session_id).await["tone"], "emotional");
+        assert!(
+            content.contains("FILTERED-REPLY"),
+            "the filter ran: {content}"
+        );
+        assert_eq!(
+            tone_reply_metadata(&pool, session_id).await["tone"],
+            "emotional"
+        );
     }
 }
