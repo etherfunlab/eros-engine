@@ -135,6 +135,9 @@ pub(crate) struct Settlement {
 /// stamp; a failed call writes the event with no movement and the `date` row
 /// alone. An archive that lands while the judge runs is found under the
 /// parent's row lock, and the date is then marked settled with nothing else.
+/// The write locks the activity's row first: a caller whose stale claim was
+/// taken over and settled meanwhile finds the stamp there, writes nothing,
+/// and returns the stored result.
 #[cfg_attr(not(test), expect(dead_code, reason = "no caller outside tests"))]
 pub(crate) async fn settle(
     state: &AppState,
@@ -149,16 +152,7 @@ pub(crate) async fn settle(
     {
         SettleClaim::Claimed(a) => a,
         SettleClaim::Held => return Err(settling()),
-        SettleClaim::Settled(activity) => {
-            let effective_deltas = AffinityRepo { pool }
-                .activity_event_deltas(activity.session_id, activity.id)
-                .await?;
-            return Ok(Settlement {
-                affinity: current_affinity(state, activity.session_id).await?,
-                activity,
-                effective_deltas,
-            });
-        }
+        SettleClaim::Settled(activity) => return stored_result(state, activity).await,
     };
 
     let turns = activities
@@ -244,6 +238,22 @@ pub(crate) async fn settle(
     };
 
     let mut tx = pool.begin().await?;
+    // A caller that took over a claim this one held past the stale window may
+    // have settled the date meanwhile. The row lock orders the two writes, and
+    // the later one writes nothing.
+    let stamped: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT settled_at FROM engine.activities WHERE id = $1 FOR UPDATE")
+            .bind(activity.id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if stamped.is_some() {
+        tx.rollback().await?;
+        let stored = activities
+            .get(activity.id)
+            .await?
+            .ok_or(sqlx::Error::RowNotFound)?;
+        return stored_result(state, stored).await;
+    }
     let moved = if lock_live_session(&mut tx, activity.session_id).await? {
         let moved =
             AffinityRepo::persist_activity_in_tx(&mut tx, activity.session_id, &settled, tuning)
@@ -294,6 +304,19 @@ fn settling() -> AppError {
         message: "another request is settling this date".into(),
         user_message: "约会正在收尾，请稍后再试".into(),
         original_user_message_id: None,
+    })
+}
+
+/// A settled date's stored result: the activity as stored, the affinity as it
+/// stands, and the deltas its event wrote.
+async fn stored_result(state: &AppState, activity: ActivityRecord) -> Result<Settlement, AppError> {
+    let effective_deltas = AffinityRepo { pool: &state.pool }
+        .activity_event_deltas(activity.session_id, activity.id)
+        .await?;
+    Ok(Settlement {
+        affinity: current_affinity(state, activity.session_id).await?,
+        activity,
+        effective_deltas,
     })
 }
 
@@ -1234,6 +1257,53 @@ mod tests {
         );
         assert_eq!(s.activity_events().await, 1);
         assert_eq!(s.episodes().await, 1);
+    }
+
+    /// A caller that holds its claim past the stale window is taken over, and
+    /// both then reach their write: whichever commits second finds the date
+    /// settled under the activity's row lock, writes nothing, and returns the
+    /// stored result.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_takeover_of_a_stale_claim_writes_one_settlement(pool: PgPool) {
+        let mock = judge_mock(
+            judged(JUDGE_REPLY).set_delay(std::time::Duration::from_millis(500)),
+            2,
+        )
+        .await;
+        let s = scene(with_judge(test_state(pool), &mock), 3).await;
+        let past_stale = t(NOW) + Duration::seconds(SETTLE_CLAIM_STALE_SECS + 1);
+
+        let (first, second) = tokio::join!(settle(&s.state, s.activity.id, t(NOW)), async {
+            // The first caller holds the claim once it is waiting on the judge.
+            while mock.received_requests().await.unwrap().is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            settle(&s.state, s.activity.id, past_stale).await
+        });
+        let (first, second) = (first.unwrap(), second.unwrap());
+        assert_eq!(
+            mock.received_requests().await.unwrap().len(),
+            2,
+            "a takeover"
+        );
+
+        let a = first.effective_deltas.expect("the first caller's deltas");
+        let b = second.effective_deltas.expect("the second caller's deltas");
+        assert!(same_deltas(&a, &b), "{a:?} vs {b:?}");
+        assert!(first.activity.settled_at.is_some());
+        assert_eq!(first.activity.settled_at, second.activity.settled_at);
+
+        assert_eq!(s.activity_events().await, 1);
+        assert_eq!(s.episodes().await, 1);
+        assert_eq!(
+            s.count(
+                "SELECT count(*) FROM engine.relationship_journal \
+                  WHERE instance_id = $1 AND kind IN ('promise', 'confession')"
+            )
+            .await,
+            2,
+            "one set of moments"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
