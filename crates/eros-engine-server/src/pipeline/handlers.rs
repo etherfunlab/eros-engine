@@ -1550,13 +1550,28 @@ pub(crate) async fn build_emotional_reply_request(
         event,
     )
     .await?;
-    let content = match &input.event {
-        Event::UserMessage { content, .. } => content.as_str(),
-        _ => "",
+    let (content, action) = match &input.event {
+        Event::UserMessage {
+            content, action, ..
+        } => (content.as_str(), action.as_ref()),
+        _ => ("", None),
     };
-    // The driving row in its model-facing form (image preamble included). A
-    // driving row that is not in this session falls back to the event's text,
-    // so the request never goes out without the user's line.
+    // An action turn tells her what the user did and what she decided, as
+    // the default request does (spec
+    // 2026-11-12-emotional-action-replies-design.md §4).
+    if let (Some(a), Some(response)) = (action, plan.action_response) {
+        req.messages[0]
+            .content
+            .push_str(&crate::prompt::user_action_context(
+                a,
+                response,
+                input.persona.genome.tip_personality.as_deref(),
+            ));
+    }
+    // The driving row in its model-facing form (image preamble and action
+    // marker included). A driving row that is not in this session falls back
+    // to the event's text behind the same marker, so the request never goes
+    // out without the user's line.
     let rows = ChatRepo { pool: &state.pool }
         .history_up_to(session_id, user_message_id, 1)
         .await?;
@@ -1568,7 +1583,7 @@ pub(crate) async fn build_emotional_reply_request(
         injected.push(crate::repetition::Injected {
             id: user_message_id,
             role: "user".to_string(),
-            text: content.to_string(),
+            text: crate::prompt::user_text_with_action(action, content),
         });
     }
 
@@ -5664,5 +5679,172 @@ mod tests {
         assert_eq!(system_only.messages.len(), 1, "{:?}", system_only.messages);
         assert_eq!(system_only.messages[0].role, "system");
         assert_eq!(system_only.messages[0].content, full.messages[0].content);
+    }
+
+    // ─── The emotional reply to a user action (spec 2026-11-12-emotional-action-replies-design.md §4) ───
+
+    #[allow(clippy::too_many_arguments)]
+    async fn emotional_action_request(
+        state: &AppState,
+        session_id: Uuid,
+        owner: Uuid,
+        instance_id: Uuid,
+        driving: Uuid,
+        content: &str,
+        action: eros_engine_core::types::UserAction,
+        response: eros_engine_core::types::ActionResponse,
+        tip_personality: Option<&str>,
+    ) -> ChatRequest {
+        let plan = ActionPlan {
+            action_type: eros_engine_core::types::ActionType::ReplyText,
+            reply_style: eros_engine_core::types::ReplyStyle::Neutral,
+            affinity_deltas: Default::default(),
+            energy_cost: 0.0,
+            context_hints: vec![],
+            reply_mode: None,
+            nudges: Default::default(),
+            clothing: None,
+            image_caption: None,
+            image_ref: eros_engine_core::types::ImageRef::Face,
+            aspect_ratio: None,
+            action_response: Some(response),
+        };
+        let mut persona = ladder_test_persona(instance_id, owner);
+        persona.genome.tip_personality = tip_personality.map(str::to_string);
+        let input = DecisionInput {
+            event: Event::UserMessage {
+                content: content.into(),
+                message_id: driving,
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: MemoryScope::default(),
+                affinity_scope: Default::default(),
+                quote: Default::default(),
+                action: Some(action),
+                outfit: None,
+            },
+            affinity: ladder_test_affinity(session_id, owner, instance_id),
+            persona,
+            signals: eros_engine_core::types::ConversationSignals {
+                message_count: 2,
+                hours_since_last_message: 0.1,
+                ghost_streak: 0,
+                hours_since_last_ghost: None,
+            },
+        };
+        let (req, _tags) = build_emotional_reply_request(
+            state,
+            &input,
+            &plan,
+            session_id,
+            owner,
+            instance_id,
+            driving,
+            &crate::prompt::NowContext::default(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("build_emotional_reply_request succeeds");
+        req
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn emotional_request_tells_her_what_she_decided(pool: PgPool) {
+        use eros_engine_core::types::{ActionResponse, UserAction};
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, owner).await;
+        let session_id = make_session(&pool, owner, Some(instance_id)).await;
+        emotional_row(&pool, session_id, "user", "早", 0.0, None).await;
+        let driving = emotional_row(
+            &pool,
+            session_id,
+            "user",
+            "",
+            1.0,
+            Some(serde_json::json!({"action": {"type": "touch"}})),
+        )
+        .await;
+
+        let state = crate::routes::companion::test_state(pool.clone());
+        let req = emotional_action_request(
+            &state,
+            session_id,
+            owner,
+            instance_id,
+            driving,
+            "",
+            UserAction::Touch,
+            ActionResponse::Refuse,
+            None,
+        )
+        .await;
+        assert_eq!(req.messages.len(), 2, "{:?}", req.messages);
+        assert_eq!(req.messages[1].content, "（伸手想摸你）");
+        let system = &req.messages[0].content;
+        assert!(
+            system.contains("[user_action]\n对方伸手想摸你，你没有接受。用你自己的话回应。"),
+            "{system}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn emotional_request_keeps_the_tip_personality(pool: PgPool) {
+        use eros_engine_core::types::{ActionResponse, UserAction};
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, owner).await;
+        let session_id = make_session(&pool, owner, Some(instance_id)).await;
+        let driving = emotional_row(
+            &pool,
+            session_id,
+            "user",
+            "",
+            0.0,
+            Some(serde_json::json!({"action": {"type": "tip", "amount_usd": 5.0}})),
+        )
+        .await;
+
+        let state = crate::routes::companion::test_state(pool.clone());
+        let req = emotional_action_request(
+            &state,
+            session_id,
+            owner,
+            instance_id,
+            driving,
+            "",
+            UserAction::Tip { amount_usd: 5.0 },
+            ActionResponse::Accept,
+            Some("傲娇"),
+        )
+        .await;
+        let system = &req.messages[0].content;
+        assert!(system.contains("[user_action]\n"), "{system}");
+        assert!(system.contains("代入你「傲娇」的打赏人格"), "{system}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn emotional_request_fallback_keeps_the_marker(pool: PgPool) {
+        use eros_engine_core::types::{ActionResponse, UserAction};
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, owner).await;
+        let session_id = make_session(&pool, owner, Some(instance_id)).await;
+
+        let state = crate::routes::companion::test_state(pool.clone());
+        let req = emotional_action_request(
+            &state,
+            session_id,
+            owner,
+            instance_id,
+            Uuid::new_v4(),
+            "在吗",
+            UserAction::Touch,
+            ActionResponse::Accept,
+            None,
+        )
+        .await;
+        assert_eq!(req.messages.len(), 2, "{:?}", req.messages);
+        assert_eq!(req.messages[1].content, "（伸手想摸你）在吗");
     }
 }
