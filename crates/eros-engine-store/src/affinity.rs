@@ -6,7 +6,7 @@
 
 use chrono::{DateTime, Utc};
 use eros_engine_core::affinity::{
-    grade_turn, Affinity, AffinityDeltas, AffinityLine, AffinityTuning, AxisGrades,
+    grade_turn, grade_weighted, Affinity, AffinityDeltas, AffinityLine, AffinityTuning, AxisGrades,
     EndpointLevelReads, PendingDeltas,
 };
 use serde::{Deserialize, Serialize};
@@ -157,6 +157,33 @@ pub struct JudgedEndpoints {
     pub patience: f64,
 }
 
+/// A date's one verdict, as settlement hands it to
+/// [`AffinityRepo::persist_activity_in_tx`] (spec
+/// 2026-11-12-activity-sub-session-design.md §6.3–6.4).
+#[derive(Debug, Clone)]
+pub struct ActivityVerdict<'a> {
+    pub activity_id: Uuid,
+    /// The judge's grades for the date as a whole.
+    pub grades: AxisGrades,
+    /// The judge's absolute endpoint reads; a `None` holds the stored level.
+    pub levels: EndpointLevelReads,
+    /// How many turns the verdict is worth (`AffinityTuning::activity_weight`).
+    pub weight: f64,
+    /// The date's substantive turns, recorded beside `weight`.
+    pub turns: i64,
+    /// The judge's `reason`, recorded on the event.
+    pub reason: &'a str,
+    /// Demo boost on positive grades; 1.0 = none.
+    pub boost: f64,
+    /// The post-separation slowdown on positive line deltas; 1.0 = none.
+    pub growth_scale: f64,
+    pub generation_id: Option<&'a str>,
+    pub llm_attempts: Option<serde_json::Value>,
+    pub gateway_errors: Option<serde_json::Value>,
+    /// Dates the `tier_reached` rows the settlement writes; UTC when `None`.
+    pub journal_tz: Option<chrono_tz::Tz>,
+}
+
 pub struct AffinityRepo<'a> {
     pub pool: &'a PgPool,
 }
@@ -224,6 +251,311 @@ async fn load_or_create_on(
             .await?
             .ok_or(sqlx::Error::RowNotFound),
     }
+}
+
+/// How a graded write turns its verdict into line movement.
+enum Grading<'a> {
+    /// One chat turn: the grades plus the rule nudges at full weight. A
+    /// refused action's line (`tier_drop`) lands one tier below the pre-turn
+    /// position.
+    Turn {
+        rule_deltas: &'a AffinityDeltas,
+        tier_drop: Option<AffinityLine>,
+    },
+    /// A date's verdict worth `weight` turns, with no rule nudges; each line
+    /// moves at most one tier.
+    Activity { weight: f64 },
+}
+
+/// One graded write, as [`AffinityRepo::persist_with_event`] and
+/// [`AffinityRepo::persist_activity_in_tx`] hand it to [`write_graded`].
+struct GradedWrite<'a> {
+    grades: &'a AxisGrades,
+    grading: Grading<'a>,
+    boost: f64,
+    growth_scale: f64,
+    levels: EndpointLevelReads,
+    event_type: &'a str,
+    context: serde_json::Value,
+    generation_id: Option<&'a str>,
+    llm_attempts: Option<serde_json::Value>,
+    gateway_errors: Option<serde_json::Value>,
+    user_message_id: Option<Uuid>,
+    journal_tz: Option<chrono_tz::Tz>,
+}
+
+/// The graded write behind [`AffinityRepo::persist_with_event`] and
+/// [`AffinityRepo::persist_activity_in_tx`], on the row the caller locked:
+/// time decay, the grade pipeline, the row UPDATE, the event INSERT and the
+/// journal's label moves, all on `conn`; nothing here commits. Returns the
+/// persisted state and the effective deltas.
+async fn write_graded(
+    conn: &mut sqlx::PgConnection,
+    locked: AffinityRow,
+    w: GradedWrite<'_>,
+    tuning: &AffinityTuning,
+) -> Result<(Affinity, AffinityDeltas), sqlx::Error> {
+    let pending: PendingDeltas = locked
+        .pending_deltas
+        .as_ref()
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let mut current = locked.into_domain();
+
+    // Decay from the locked row, then snapshot the pre-delta baseline so
+    // effective_deltas captures only the delta application, not decay —
+    // for the endpoints that means refreshing them (old levels, decayed)
+    // BEFORE the snapshot, so their effective delta attributes this turn's
+    // judgment and coupling change, never the absence gap.
+    let days = (chrono::Utc::now() - current.updated_at).num_minutes() as f64 / (60.0 * 24.0);
+    let decay_factor = eros_engine_core::affinity::endpoint_time_decay(
+        days,
+        tuning.time_decay_rate,
+        tuning.time_decay_floor,
+    );
+    current.apply_time_decay();
+    current.refresh_endpoints(tuning);
+    let before_affinity = current.clone();
+    let before = AffinityDeltas {
+        warmth: current.warmth,
+        trust: current.trust,
+        intrigue: current.intrigue,
+        intimacy: current.intimacy,
+        patience: current.patience,
+        tension: current.tension,
+    };
+
+    let outcome = match w.grading {
+        Grading::Turn { rule_deltas, .. } => {
+            grade_turn(&current, w.grades, rule_deltas, &pending, w.boost, tuning)
+        }
+        Grading::Activity { weight } => {
+            grade_weighted(&current, w.grades, &pending, w.boost, tuning, weight)
+        }
+    };
+    // The damper trims growth that would land, it does not defer it: the
+    // cut part is gone, not parked in the gate's balance.
+    let mut committed = outcome.committed.clone();
+    scale_positive_line_deltas(&mut committed, w.growth_scale);
+    current.apply_deltas(&committed);
+    let mut pending_after = outcome.pending;
+    let mut capped: Vec<&str> = Vec::new();
+    let tier_drop = match w.grading {
+        // A refused action: its line lands one tier below the pre-turn
+        // position, replacing whatever the judge's grades did to it, and
+        // keeps nothing buffered on its axes to land later.
+        Grading::Turn { tier_drop, .. } => {
+            if let Some(line) = tier_drop {
+                current.drop_line_tier(&before_affinity, line);
+                pending_after.clear_line(line);
+            }
+            tier_drop
+        }
+        // A date moves each line at most one tier from where it stood. The
+        // cap reads the clamped axes `apply_deltas` left, and what it cuts
+        // off is discarded, not buffered.
+        Grading::Activity { .. } => {
+            for line in [AffinityLine::Bond, AffinityLine::Chemistry] {
+                if current.cap_line_shift(&before_affinity, line) {
+                    pending_after.clear_line(line);
+                    capped.push(line.as_str());
+                }
+            }
+            None
+        }
+    };
+
+    // Judge-owned absolute levels: a `Some` overwrites the stored level, a
+    // `None` (omitted / skipped eval) holds it. The endpoints themselves
+    // are then recomputed from the post-turn lines; apply_deltas just
+    // bumped updated_at, so this refresh runs at decay ≈ 1.
+    if let Some(l) = w.levels.warmth {
+        current.warmth_grade = l.clamp(1, 3);
+    }
+    if let Some(l) = w.levels.patience {
+        current.patience_grade = l.clamp(1, 3);
+    }
+    current.refresh_endpoints(tuning);
+
+    let label_changes = eros_engine_core::affinity::diff_labels(&before_affinity, &current)
+        .and_then(|c| serde_json::to_value(&c).ok());
+
+    // Exact per-turn line delta from the floored before/after scores
+    // (the absolute bond/chemistry formulas use max(warmth,0), so a raw axis
+    // fold would misreport when warmth < 0). Always written for delta events.
+    let effective_line_deltas = serde_json::json!({
+        "bond": current.bond_score() - before_affinity.bond_score(),
+        "chemistry": current.chemistry_score() - before_affinity.chemistry_score(),
+    });
+
+    // Effective change = after − before (captures gating + clamping).
+    let effective = AffinityDeltas {
+        warmth: current.warmth - before.warmth,
+        trust: current.trust - before.trust,
+        intrigue: current.intrigue - before.intrigue,
+        intimacy: current.intimacy - before.intimacy,
+        patience: current.patience - before.patience,
+        tension: current.tension - before.tension,
+    };
+
+    // The tier columns are the engine's own result projected for SQL
+    // consumers — written here, never read back (see `AffinityRow`).
+    let (returned_updated_at,): (chrono::DateTime<Utc>,) = sqlx::query_as(
+        "UPDATE engine.companion_affinity \
+         SET warmth = $2, trust = $3, intrigue = $4, intimacy = $5, \
+             patience = $6, tension = $7, \
+             warmth_grade = $8, patience_grade = $9, \
+             bond_tier = $10, chem_tier = $11, \
+             pending_deltas = $12, updated_at = now() \
+         WHERE id = $1 \
+         RETURNING updated_at",
+    )
+    .bind(current.id)
+    .bind(current.warmth)
+    .bind(current.trust)
+    .bind(current.intrigue)
+    .bind(current.intimacy)
+    .bind(current.patience)
+    .bind(current.tension)
+    .bind(current.warmth_grade)
+    .bind(current.patience_grade)
+    .bind(i16::from(current.bond_tier()))
+    .bind(i16::from(current.chem_tier()))
+    .bind(serde_json::to_value(pending_after).ok())
+    .fetch_one(&mut *conn)
+    .await?;
+    // The row's own `now()`, not `apply_deltas`' Rust-side one: the
+    // snapshot's `updated_at` is the decay baseline a replay measures the
+    // next gap from, so it has to be the value the table actually holds.
+    current.updated_at = returned_updated_at;
+
+    // The audit trail keeps the judge's verdict verbatim and the gate's
+    // new balance next to whatever context the caller supplied.
+    // The engine owns these keys, so they are written unconditionally — a
+    // caller that supplied a non-object context (this is a published crate;
+    // the caller is not necessarily us) keeps its value under `caller`
+    // rather than silently costing the turn its audit trail.
+    let mut context = match w.context {
+        v @ serde_json::Value::Object(_) => v,
+        serde_json::Value::Null => serde_json::json!({}),
+        other => serde_json::json!({ "caller": other }),
+    };
+    if let Some(obj) = context.as_object_mut() {
+        if let Ok(g) = serde_json::to_value(w.grades) {
+            obj.insert("grades".into(), g);
+        }
+        // The 3.1 ladder is retired: no key may claim a steered grade.
+        // Its absence from new events is the retirement's cleanest proof.
+        obj.remove("effective_grades");
+        if let Ok(p) = serde_json::to_value(pending_after) {
+            obj.insert("pending_after".into(), p);
+        }
+        // Which line a refused action dropped, so a reader can see why the
+        // stored `grades` and that line's movement disagree.
+        match tier_drop {
+            Some(line) => {
+                obj.insert("tier_drop".into(), serde_json::json!(line.as_str()));
+            }
+            None => {
+                obj.remove("tier_drop");
+            }
+        }
+        // Which lines a date's one-tier cap held, for the same reason.
+        if !capped.is_empty() {
+            obj.insert("capped".into(), serde_json::json!(capped));
+        }
+        // A slowed turn's effective deltas sit below what the gate
+        // committed; say why. Absent at full speed.
+        if w.growth_scale != 1.0 {
+            obj.insert("growth_scale".into(), serde_json::json!(w.growth_scale));
+        } else {
+            obj.remove("growth_scale");
+        }
+        // 4.0 endpoint audit: judge levels (only when actually read this
+        // turn), the boosts and decay in force, and the per-line units —
+        // the derivation is reproducible from these plus the axis values.
+        if let Some(l) = w.levels.warmth {
+            obj.insert("warmth_grade".into(), serde_json::json!(l));
+        }
+        if let Some(l) = w.levels.patience {
+            obj.insert("patience_grade".into(), serde_json::json!(l));
+        }
+        obj.insert(
+            "boost_warmth".into(),
+            serde_json::json!(eros_engine_core::affinity::endpoint_boost(
+                current.chemistry_score()
+            )),
+        );
+        obj.insert(
+            "boost_patience".into(),
+            serde_json::json!(eros_engine_core::affinity::endpoint_boost(
+                current.bond_score()
+            )),
+        );
+        obj.insert("decay_factor".into(), serde_json::json!(decay_factor));
+        obj.insert(
+            "units".into(),
+            serde_json::json!({
+                "bond": tuning.grade_unit_bond,
+                "chem": tuning.grade_unit_chem
+            }),
+        );
+        // The cross-line penalty now scales with the applied grade, so how
+        // much a turn was taxed is no longer recoverable from the grades and
+        // the stored scores alone. ASSESSED, not applied: on a gated turn it
+        // rides in `pending_after` rather than reaching the axis. Written
+        // only when non-zero, so it stays absent on the common quiet turn.
+        if !outcome.cross_penalty_assessed.is_zero() {
+            if let Ok(p) = serde_json::to_value(outcome.cross_penalty_assessed) {
+                obj.insert("cross_penalty_assessed".into(), p);
+            }
+        } else {
+            obj.remove("cross_penalty_assessed");
+        }
+    }
+
+    let deltas_json = serde_json::to_value(&outcome.raw).unwrap_or_default();
+    let effective_json = serde_json::to_value(&effective).unwrap_or_default();
+    // `before_affinity` is post-decay/pre-delta, so within a row
+    // `state_after − state_before == effective_deltas`, and the gap to the
+    // PREVIOUS row's `state_after` is the absence effect applied above —
+    // which used to appear nowhere in the log (migration 0049).
+    let event_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO engine.companion_affinity_events \
+           (affinity_id, event_type, deltas, effective_deltas, label_changes, effective_line_deltas, context, \
+            state_before, state_after, generation_id, \
+            llm_attempts, gateway_errors, user_message_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+         RETURNING id",
+    )
+    .bind(current.id)
+    .bind(w.event_type)
+    .bind(deltas_json)
+    .bind(effective_json)
+    .bind(label_changes)
+    .bind(effective_line_deltas)
+    .bind(context)
+    .bind(state_snapshot(&before_affinity))
+    .bind(state_snapshot(&current))
+    .bind(w.generation_id)
+    .bind(w.llm_attempts)
+    .bind(w.gateway_errors)
+    .bind(w.user_message_id)
+    .fetch_one(&mut *conn)
+    .await?;
+
+    // The relationship journal's tier moments ride the same transaction as
+    // the event row they point at.
+    crate::journal::record_label_moves(
+        conn,
+        &before_affinity,
+        &current,
+        event_id,
+        crate::journal::local_date(Utc::now(), w.journal_tz),
+    )
+    .await?;
+
+    Ok((current, effective))
 }
 
 impl<'a> AffinityRepo<'a> {
@@ -619,237 +951,29 @@ impl<'a> AffinityRepo<'a> {
         .bind(affinity.id)
         .fetch_one(&mut *tx)
         .await?;
-        let pending: PendingDeltas = locked
-            .pending_deltas
-            .as_ref()
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-        let mut current = locked.into_domain();
-
-        // Decay from the locked row, then snapshot the pre-delta baseline so
-        // effective_deltas captures only the delta application, not decay —
-        // for the endpoints that means refreshing them (old levels, decayed)
-        // BEFORE the snapshot, so their effective delta attributes this turn's
-        // judgment and coupling change, never the absence gap.
-        let days = (chrono::Utc::now() - current.updated_at).num_minutes() as f64 / (60.0 * 24.0);
-        let decay_factor = eros_engine_core::affinity::endpoint_time_decay(
-            days,
-            tuning.time_decay_rate,
-            tuning.time_decay_floor,
-        );
-        current.apply_time_decay();
-        current.refresh_endpoints(tuning);
-        let before_affinity = current.clone();
-        let before = AffinityDeltas {
-            warmth: current.warmth,
-            trust: current.trust,
-            intrigue: current.intrigue,
-            intimacy: current.intimacy,
-            patience: current.patience,
-            tension: current.tension,
-        };
-
-        let outcome = grade_turn(&current, grades, rule_deltas, &pending, boost, tuning);
-        // The damper trims growth that would land, it does not defer it: the
-        // cut part is gone, not parked in the gate's balance.
-        let mut committed = outcome.committed.clone();
-        scale_positive_line_deltas(&mut committed, growth_scale);
-        current.apply_deltas(&committed);
-        // A refused action: its line lands one tier below the pre-turn
-        // position, replacing whatever the judge's grades did to it, and
-        // keeps nothing buffered on its axes to land later.
-        let mut pending_after = outcome.pending;
-        if let Some(line) = tier_drop {
-            current.drop_line_tier(&before_affinity, line);
-            pending_after.clear_line(line);
-        }
-
-        // Judge-owned absolute levels: a `Some` overwrites the stored level, a
-        // `None` (omitted / skipped eval) holds it. The endpoints themselves
-        // are then recomputed from the post-turn lines; apply_deltas just
-        // bumped updated_at, so this refresh runs at decay ≈ 1.
-        if let Some(l) = levels.warmth {
-            current.warmth_grade = l.clamp(1, 3);
-        }
-        if let Some(l) = levels.patience {
-            current.patience_grade = l.clamp(1, 3);
-        }
-        current.refresh_endpoints(tuning);
-
-        let label_changes = eros_engine_core::affinity::diff_labels(&before_affinity, &current)
-            .and_then(|c| serde_json::to_value(&c).ok());
-
-        // Exact per-turn line delta from the floored before/after scores
-        // (the absolute bond/chemistry formulas use max(warmth,0), so a raw axis
-        // fold would misreport when warmth < 0). Always written for delta events.
-        let effective_line_deltas = serde_json::json!({
-            "bond": current.bond_score() - before_affinity.bond_score(),
-            "chemistry": current.chemistry_score() - before_affinity.chemistry_score(),
-        });
-
-        // Effective change = after − before (captures gating + clamping).
-        let effective = AffinityDeltas {
-            warmth: current.warmth - before.warmth,
-            trust: current.trust - before.trust,
-            intrigue: current.intrigue - before.intrigue,
-            intimacy: current.intimacy - before.intimacy,
-            patience: current.patience - before.patience,
-            tension: current.tension - before.tension,
-        };
-
-        // The tier columns are the engine's own result projected for SQL
-        // consumers — written here, never read back (see `AffinityRow`).
-        let (returned_updated_at,): (chrono::DateTime<Utc>,) = sqlx::query_as(
-            "UPDATE engine.companion_affinity \
-             SET warmth = $2, trust = $3, intrigue = $4, intimacy = $5, \
-                 patience = $6, tension = $7, \
-                 warmth_grade = $8, patience_grade = $9, \
-                 bond_tier = $10, chem_tier = $11, \
-                 pending_deltas = $12, updated_at = now() \
-             WHERE id = $1 \
-             RETURNING updated_at",
-        )
-        .bind(current.id)
-        .bind(current.warmth)
-        .bind(current.trust)
-        .bind(current.intrigue)
-        .bind(current.intimacy)
-        .bind(current.patience)
-        .bind(current.tension)
-        .bind(current.warmth_grade)
-        .bind(current.patience_grade)
-        .bind(i16::from(current.bond_tier()))
-        .bind(i16::from(current.chem_tier()))
-        .bind(serde_json::to_value(pending_after).ok())
-        .fetch_one(&mut *tx)
-        .await?;
-        // The row's own `now()`, not `apply_deltas`' Rust-side one: the
-        // snapshot's `updated_at` is the decay baseline a replay measures the
-        // next gap from, so it has to be the value the table actually holds.
-        current.updated_at = returned_updated_at;
-
-        // The audit trail keeps the judge's verdict verbatim and the gate's
-        // new balance next to whatever context the caller supplied.
-        // The engine owns these keys, so they are written unconditionally — a
-        // caller that supplied a non-object context (this is a published crate;
-        // the caller is not necessarily us) keeps its value under `caller`
-        // rather than silently costing the turn its audit trail.
-        let mut context = match context {
-            v @ serde_json::Value::Object(_) => v,
-            serde_json::Value::Null => serde_json::json!({}),
-            other => serde_json::json!({ "caller": other }),
-        };
-        if let Some(obj) = context.as_object_mut() {
-            if let Ok(g) = serde_json::to_value(grades) {
-                obj.insert("grades".into(), g);
-            }
-            // The 3.1 ladder is retired: no key may claim a steered grade.
-            // Its absence from new events is the retirement's cleanest proof.
-            obj.remove("effective_grades");
-            if let Ok(p) = serde_json::to_value(pending_after) {
-                obj.insert("pending_after".into(), p);
-            }
-            // Which line a refused action dropped, so a reader can see why the
-            // stored `grades` and that line's movement disagree.
-            match tier_drop {
-                Some(line) => {
-                    obj.insert("tier_drop".into(), serde_json::json!(line.as_str()));
-                }
-                None => {
-                    obj.remove("tier_drop");
-                }
-            }
-            // A slowed turn's effective deltas sit below what the gate
-            // committed; say why. Absent at full speed.
-            if growth_scale != 1.0 {
-                obj.insert("growth_scale".into(), serde_json::json!(growth_scale));
-            } else {
-                obj.remove("growth_scale");
-            }
-            // 4.0 endpoint audit: judge levels (only when actually read this
-            // turn), the boosts and decay in force, and the per-line units —
-            // the derivation is reproducible from these plus the axis values.
-            if let Some(l) = levels.warmth {
-                obj.insert("warmth_grade".into(), serde_json::json!(l));
-            }
-            if let Some(l) = levels.patience {
-                obj.insert("patience_grade".into(), serde_json::json!(l));
-            }
-            obj.insert(
-                "boost_warmth".into(),
-                serde_json::json!(eros_engine_core::affinity::endpoint_boost(
-                    current.chemistry_score()
-                )),
-            );
-            obj.insert(
-                "boost_patience".into(),
-                serde_json::json!(eros_engine_core::affinity::endpoint_boost(
-                    current.bond_score()
-                )),
-            );
-            obj.insert("decay_factor".into(), serde_json::json!(decay_factor));
-            obj.insert(
-                "units".into(),
-                serde_json::json!({
-                    "bond": tuning.grade_unit_bond,
-                    "chem": tuning.grade_unit_chem
-                }),
-            );
-            // The cross-line penalty now scales with the applied grade, so how
-            // much a turn was taxed is no longer recoverable from the grades and
-            // the stored scores alone. ASSESSED, not applied: on a gated turn it
-            // rides in `pending_after` rather than reaching the axis. Written
-            // only when non-zero, so it stays absent on the common quiet turn.
-            if !outcome.cross_penalty_assessed.is_zero() {
-                if let Ok(p) = serde_json::to_value(outcome.cross_penalty_assessed) {
-                    obj.insert("cross_penalty_assessed".into(), p);
-                }
-            } else {
-                obj.remove("cross_penalty_assessed");
-            }
-        }
-
-        let deltas_json = serde_json::to_value(&outcome.raw).unwrap_or_default();
-        let effective_json = serde_json::to_value(&effective).unwrap_or_default();
-        // `before_affinity` is post-decay/pre-delta, so within a row
-        // `state_after − state_before == effective_deltas`, and the gap to the
-        // PREVIOUS row's `state_after` is the absence effect applied above —
-        // which used to appear nowhere in the log (migration 0049).
-        let event_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO engine.companion_affinity_events \
-               (affinity_id, event_type, deltas, effective_deltas, label_changes, effective_line_deltas, context, \
-                state_before, state_after, generation_id, \
-                llm_attempts, gateway_errors, user_message_id) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
-             RETURNING id",
-        )
-        .bind(current.id)
-        .bind(event_type)
-        .bind(deltas_json)
-        .bind(effective_json)
-        .bind(label_changes)
-        .bind(effective_line_deltas)
-        .bind(context)
-        .bind(state_snapshot(&before_affinity))
-        .bind(state_snapshot(&current))
-        .bind(generation_id)
-        .bind(llm_attempts)
-        .bind(gateway_errors)
-        .bind(user_message_id)
-        .fetch_one(&mut *tx)
-        .await?;
-
-        // The relationship journal's tier moments ride the same transaction as
-        // the event row they point at.
-        crate::journal::record_label_moves(
+        let (current, _) = write_graded(
             &mut tx,
-            &before_affinity,
-            &current,
-            event_id,
-            crate::journal::local_date(Utc::now(), journal_tz),
+            locked,
+            GradedWrite {
+                grades,
+                grading: Grading::Turn {
+                    rule_deltas,
+                    tier_drop,
+                },
+                boost,
+                growth_scale,
+                levels,
+                event_type,
+                context,
+                generation_id,
+                llm_attempts,
+                gateway_errors,
+                user_message_id,
+                journal_tz,
+            },
+            tuning,
         )
         .await?;
-
         tx.commit().await?;
 
         // Reflect the persisted state back to the caller.
@@ -1069,6 +1193,96 @@ impl<'a> AffinityRepo<'a> {
         .await?;
 
         Ok(current)
+    }
+
+    /// Fold a date's one verdict into the parent session's affinity (spec
+    /// 2026-11-12-activity-sub-session-design.md §6.3–6.4), inside the
+    /// caller's transaction; nothing here commits. `None` when the session has
+    /// no affinity row.
+    ///
+    /// Row-locked by `session_id` and run through the same write as
+    /// [`Self::persist_with_event`]: time decay first, so the verdict starts
+    /// from the stored state and a tier a refused action dropped during the
+    /// date stays dropped; then the grades at `weight` turns with no rule
+    /// nudges, the post-separation slowdown and the clamp. Each line is then
+    /// held to a one-tier shift from where it stood, and a capped line keeps
+    /// nothing buffered. The endpoint levels overwrite as on a turn.
+    ///
+    /// One `activity` event records it, with no `user_message_id`: never a
+    /// turn, so `latest_turn_event` and `last_judged_endpoints` skip it, and
+    /// its `reason` never reaches `[emotional_context]`. Its `context` carries
+    /// `activity_id`, `turns`, `weight`, `reason`, and `capped` naming the
+    /// lines the cap held (absent when none). A label first reached becomes a
+    /// `tier_reached` journal row in the same transaction. Returns the state
+    /// after and the effective deltas.
+    pub async fn persist_activity_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        session_id: Uuid,
+        v: &ActivityVerdict<'_>,
+        tuning: &AffinityTuning,
+    ) -> Result<Option<(Affinity, AffinityDeltas)>, sqlx::Error> {
+        let Some(locked) = sqlx::query_as::<_, AffinityRow>(
+            "SELECT * FROM engine.companion_affinity WHERE session_id = $1 FOR UPDATE",
+        )
+        .bind(session_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        else {
+            return Ok(None);
+        };
+        let context = serde_json::json!({
+            "activity_id": v.activity_id,
+            "turns": v.turns,
+            "weight": v.weight,
+            "reason": v.reason,
+        });
+        write_graded(
+            tx,
+            locked,
+            GradedWrite {
+                grades: &v.grades,
+                grading: Grading::Activity { weight: v.weight },
+                boost: v.boost,
+                growth_scale: v.growth_scale,
+                levels: v.levels,
+                event_type: "activity",
+                context,
+                generation_id: v.generation_id,
+                llm_attempts: v.llm_attempts.clone(),
+                gateway_errors: v.gateway_errors.clone(),
+                user_message_id: None,
+                journal_tz: v.journal_tz,
+            },
+            tuning,
+        )
+        .await
+        .map(Some)
+    }
+
+    /// The effective deltas a settled date wrote: the `effective_deltas` of
+    /// the session's `activity` event for `activity_id`. `None` when there is
+    /// no such event.
+    pub async fn activity_event_deltas(
+        &self,
+        session_id: Uuid,
+        activity_id: Uuid,
+    ) -> Result<Option<AffinityDeltas>, sqlx::Error> {
+        let deltas: Option<Option<serde_json::Value>> = sqlx::query_scalar(
+            "SELECT e.effective_deltas \
+             FROM engine.companion_affinity_events e \
+             JOIN engine.companion_affinity a ON a.id = e.affinity_id \
+             WHERE a.session_id = $1 \
+               AND e.event_type = 'activity' \
+               AND e.context->>'activity_id' = $2::uuid::text \
+             LIMIT 1",
+        )
+        .bind(session_id)
+        .bind(activity_id)
+        .fetch_optional(self.pool)
+        .await?;
+        Ok(deltas
+            .flatten()
+            .and_then(|v| serde_json::from_value(v).ok()))
     }
 }
 
@@ -4362,5 +4576,507 @@ mod tests {
         rederived.refresh_endpoints(&AffinityTuning::default());
         assert!((rederived.warmth - damped.warmth).abs() < 1e-9);
         assert!((rederived.patience - damped.patience).abs() < 1e-9);
+    }
+
+    /// A relationship whose four line axes hold the given values, with nothing
+    /// buffered: its session and its row.
+    async fn seed_axes(
+        pool: &PgPool,
+        trust: f64,
+        intrigue: f64,
+        intimacy: f64,
+        tension: f64,
+    ) -> (Uuid, Affinity) {
+        let repo = AffinityRepo { pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(pool, user_id).await;
+        let session = make_session(pool, user_id, instance_id).await;
+        let a = repo
+            .load_or_create(session, user_id, instance_id)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE engine.companion_affinity \
+             SET trust = $2, intrigue = $3, intimacy = $4, tension = $5 WHERE id = $1",
+        )
+        .bind(a.id)
+        .bind(trust)
+        .bind(intrigue)
+        .bind(intimacy)
+        .bind(tension)
+        .execute(pool)
+        .await
+        .unwrap();
+        let a = repo.load(session).await.unwrap().unwrap();
+        (session, a)
+    }
+
+    /// A date's verdict with `grades` at `weight`, nothing else set.
+    fn verdict(grades: AxisGrades, weight: f64) -> ActivityVerdict<'static> {
+        ActivityVerdict {
+            activity_id: Uuid::new_v4(),
+            grades,
+            levels: EndpointLevelReads::default(),
+            weight,
+            turns: 4,
+            reason: "约会很愉快",
+            boost: 1.0,
+            growth_scale: 1.0,
+            generation_id: None,
+            llm_attempts: None,
+            gateway_errors: None,
+            journal_tz: None,
+        }
+    }
+
+    /// Settle `v` on `session` in a transaction of its own.
+    async fn settle(
+        pool: &PgPool,
+        session: Uuid,
+        v: &ActivityVerdict<'_>,
+        tuning: &AffinityTuning,
+    ) -> Option<(Affinity, AffinityDeltas)> {
+        let mut tx = pool.begin().await.unwrap();
+        let out = AffinityRepo::persist_activity_in_tx(&mut tx, session, v, tuning)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        out
+    }
+
+    /// The session's one `activity` event.
+    async fn activity_event(pool: &PgPool, session: Uuid) -> AffinityEventRow {
+        let events = AffinityRepo { pool }
+            .list_events(session, 10, 0, Some("activity"))
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1, "one activity event");
+        events.into_iter().next().unwrap()
+    }
+
+    async fn event_context(pool: &PgPool, id: Uuid) -> serde_json::Value {
+        sqlx::query_scalar("SELECT context FROM engine.companion_affinity_events WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn stored_pending(pool: &PgPool, session: Uuid) -> serde_json::Value {
+        sqlx::query_scalar(
+            "SELECT pending_deltas FROM engine.companion_affinity WHERE session_id = $1",
+        )
+        .bind(session)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn activity_verdict_writes_one_activity_row(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let tuning = AffinityTuning::default();
+
+        // A session with no affinity row settles nothing.
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let bare = make_session(&pool, user_id, instance_id).await;
+        assert!(
+            settle(&pool, bare, &verdict(AxisGrades::default(), 1.0), &tuning)
+                .await
+                .is_none()
+        );
+        assert!(repo.load(bare).await.unwrap().is_none());
+
+        let (session, mut a) = seed_axes(&pool, 0.2, 0.2, 0.1, 0.1).await;
+        persist_rule(
+            &repo,
+            &mut a,
+            AffinityDeltas {
+                trust: 0.01,
+                ..Default::default()
+            },
+        )
+        .await;
+        let turn = repo.latest_turn_event(session).await.unwrap().unwrap();
+
+        crate::testutil::seed_generation(&pool, "gen-date").await;
+        let v = ActivityVerdict {
+            turns: 6,
+            generation_id: Some("gen-date"),
+            ..verdict(
+                AxisGrades {
+                    trust: 1,
+                    intimacy: 1,
+                    ..Default::default()
+                },
+                1.5,
+            )
+        };
+        let (after, effective) = settle(&pool, session, &v, &tuning)
+            .await
+            .expect("a row to settle");
+
+        // jsonb keeps numbers as `numeric`, so the last bit of an f64 may not
+        // survive the round trip.
+        let same = |stored: &serde_json::Value| {
+            let effective = serde_json::to_value(&effective).unwrap();
+            for axis in [
+                "warmth", "trust", "intrigue", "intimacy", "patience", "tension",
+            ] {
+                let (s, e) = (
+                    stored[axis].as_f64().unwrap(),
+                    effective[axis].as_f64().unwrap(),
+                );
+                assert!((s - e).abs() < 1e-12, "{axis}: stored {s} vs returned {e}");
+            }
+        };
+
+        let e = activity_event(&pool, session).await;
+        assert_eq!(e.user_message_id, None);
+        same(e.effective_deltas.as_ref().unwrap());
+        assert!(effective.trust > 0.0 && effective.intimacy > 0.0);
+        let stored = repo.load(session).await.unwrap().unwrap();
+        assert_eq!(
+            (stored.trust, stored.intimacy, stored.warmth),
+            (after.trust, after.intimacy, after.warmth)
+        );
+
+        let context = event_context(&pool, e.id).await;
+        assert_eq!(context["activity_id"], v.activity_id.to_string());
+        assert_eq!(context["turns"], 6);
+        assert_eq!(context["weight"], 1.5);
+        assert_eq!(context["reason"], "约会很愉快");
+        assert_eq!(context["grades"]["trust"], 1);
+        assert!(context.get("capped").is_none(), "no line reached its cap");
+
+        // The stored deltas are found by the activity; another one has none.
+        let found = repo
+            .activity_event_deltas(session, v.activity_id)
+            .await
+            .unwrap()
+            .expect("the activity's deltas");
+        same(&serde_json::to_value(&found).unwrap());
+        assert!(repo
+            .activity_event_deltas(session, Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_none());
+
+        // Not a turn: the delta route and the judged-turn streak skip it, even
+        // with a generation and no skip marker.
+        assert_eq!(
+            repo.latest_turn_event(session).await.unwrap().unwrap().id,
+            turn.id
+        );
+        assert!(repo
+            .last_judged_endpoints(session, None, 10)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn activity_verdict_caps_each_line_at_one_tier(pool: PgPool) {
+        use eros_engine_core::affinity::tier_raise_target;
+        let (session, before) = seed_axes(&pool, 0.25, 0.25, 0.0, 0.0).await;
+        assert_eq!(before.bond_tier(), 2);
+
+        let (after, _) = settle(
+            &pool,
+            session,
+            &verdict(
+                AxisGrades {
+                    trust: 2,
+                    intrigue: 2,
+                    ..Default::default()
+                },
+                8.0,
+            ),
+            &AffinityTuning::default(),
+        )
+        .await
+        .unwrap();
+
+        let target = tier_raise_target(before.bond_score());
+        assert!(
+            (after.bond_score() - target).abs() < 1e-9,
+            "bond {} vs {target}",
+            after.bond_score()
+        );
+        assert_eq!(after.bond_tier(), 3);
+        assert_eq!(after.chemistry_score(), 0.0);
+
+        let e = activity_event(&pool, session).await;
+        let context = event_context(&pool, e.id).await;
+        assert_eq!(context["capped"], serde_json::json!(["bond"]));
+        let pending = stored_pending(&pool, session).await;
+        for (where_, p) in [("row", &pending), ("event", &context["pending_after"])] {
+            assert_eq!(p["trust"].as_f64(), Some(0.0), "{where_}: {p}");
+            assert_eq!(p["intrigue"].as_f64(), Some(0.0), "{where_}: {p}");
+        }
+    }
+
+    /// What the cap cuts off is not kept: a capped line's buffered axis is
+    /// cleared, while the other line keeps its buffer.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_capped_line_keeps_nothing_buffered(pool: PgPool) {
+        let (session, _) = seed_axes(&pool, 0.25, 0.25, 0.2, 0.2).await;
+        sqlx::query(
+            "UPDATE engine.companion_affinity \
+             SET pending_deltas = '{\"trust\":0,\"intrigue\":0.02,\"intimacy\":0.02,\"tension\":0}'::jsonb \
+             WHERE session_id = $1",
+        )
+        .bind(session)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let tuning = AffinityTuning {
+            delta_threshold: 0.05,
+            ..AffinityTuning::default()
+        };
+
+        let (after, _) = settle(
+            &pool,
+            session,
+            &verdict(
+                AxisGrades {
+                    trust: 4,
+                    ..Default::default()
+                },
+                8.0,
+            ),
+            &tuning,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(after.bond_tier(), 3);
+        let context = event_context(&pool, activity_event(&pool, session).await.id).await;
+        assert_eq!(context["capped"], serde_json::json!(["bond"]));
+        let pending = stored_pending(&pool, session).await;
+        assert_eq!(pending["intrigue"].as_f64(), Some(0.0), "{pending}");
+        assert_eq!(pending["intimacy"].as_f64(), Some(0.02), "{pending}");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn activity_verdict_weight_one_matches_a_turn(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let tuning = AffinityTuning::default();
+        let grades = AxisGrades {
+            trust: 1,
+            intrigue: -1,
+            intimacy: 2,
+            tension: 1,
+        };
+        let levels = EndpointLevelReads {
+            warmth: Some(3),
+            patience: Some(1),
+        };
+
+        let (turn_session, mut turned) = seed_axes(&pool, 0.3, 0.2, 0.2, 0.3).await;
+        repo.persist_with_event(
+            &mut turned,
+            &grades,
+            &AffinityDeltas::default(),
+            1.0,
+            &tuning,
+            "message",
+            serde_json::json!({}),
+            None,
+            levels,
+            None,
+            None,
+            None,
+            None,
+            1.0,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let (date_session, before) = seed_axes(&pool, 0.3, 0.2, 0.2, 0.3).await;
+        let (settled, _) = settle(
+            &pool,
+            date_session,
+            &ActivityVerdict {
+                levels,
+                ..verdict(grades, 1.0)
+            },
+            &tuning,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            settled.bond_score() != before.bond_score()
+                && settled.chemistry_score() != before.chemistry_score()
+        );
+        let (turned, settled) = (
+            repo.load(turn_session).await.unwrap().unwrap(),
+            repo.load(date_session).await.unwrap().unwrap(),
+        );
+        for (axis, t, d) in [
+            ("trust", turned.trust, settled.trust),
+            ("intrigue", turned.intrigue, settled.intrigue),
+            ("intimacy", turned.intimacy, settled.intimacy),
+            ("tension", turned.tension, settled.tension),
+            ("warmth", turned.warmth, settled.warmth),
+            ("patience", turned.patience, settled.patience),
+        ] {
+            assert!((t - d).abs() < 1e-12, "{axis}: turn {t} vs date {d}");
+        }
+        assert_eq!(
+            (settled.warmth_grade, settled.patience_grade),
+            (turned.warmth_grade, turned.patience_grade)
+        );
+        assert!(
+            event_context(&pool, activity_event(&pool, date_session).await.id)
+                .await
+                .get("capped")
+                .is_none()
+        );
+    }
+
+    /// A tier a refused action dropped during the date stays dropped: the
+    /// verdict lifts the line one tier from where the drop left it.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn settlement_starts_from_the_state_a_drop_left(pool: PgPool) {
+        use eros_engine_core::affinity::tier_raise_target;
+        let repo = AffinityRepo { pool: &pool };
+        let tuning = AffinityTuning::default();
+        let (session, mut a) = seed_axes(&pool, 0.5, 0.5, 0.0, 0.0).await;
+        let original = a.bond_score();
+        assert_eq!(a.bond_tier(), 3);
+
+        repo.persist_with_event(
+            &mut a,
+            &AxisGrades::default(),
+            &AffinityDeltas::default(),
+            1.0,
+            &tuning,
+            "message",
+            serde_json::json!({}),
+            None,
+            EndpointLevelReads::default(),
+            None,
+            None,
+            None,
+            Some(AffinityLine::Bond),
+            1.0,
+            None,
+        )
+        .await
+        .unwrap();
+        let dropped = a.bond_score();
+        assert_eq!(a.bond_tier(), 2);
+
+        let (after, _) = settle(
+            &pool,
+            session,
+            &verdict(
+                AxisGrades {
+                    trust: 4,
+                    intrigue: 4,
+                    ..Default::default()
+                },
+                8.0,
+            ),
+            &tuning,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            (after.bond_score() - tier_raise_target(dropped)).abs() < 1e-9,
+            "bond {} vs {}",
+            after.bond_score(),
+            tier_raise_target(dropped)
+        );
+        assert_eq!(after.bond_tier(), 3);
+        assert!(after.bond_score() < tier_raise_target(original) - 0.1);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_rejected_verdict_moves_nothing_but_records_the_attempt(pool: PgPool) {
+        let (session, _) = seed_axes(&pool, 0.3, 0.3, 0.2, 0.2).await;
+        sqlx::query(
+            "UPDATE engine.companion_affinity SET updated_at = now() - interval '2 days' \
+             WHERE session_id = $1",
+        )
+        .bind(session)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let attempts = serde_json::json!([{ "model": "m", "error": "parse" }]);
+
+        let (after, effective) = settle(
+            &pool,
+            session,
+            &ActivityVerdict {
+                llm_attempts: Some(attempts.clone()),
+                ..verdict(AxisGrades::default(), 2.0)
+            },
+            &AffinityTuning::default(),
+        )
+        .await
+        .unwrap();
+
+        // Trust and intimacy do not decay; intrigue and tension only decay.
+        assert_eq!((after.trust, after.intimacy), (0.3, 0.2));
+        let e = activity_event(&pool, session).await;
+        let state_before = e.state_before.as_ref().unwrap();
+        for (axis, v) in [("intrigue", after.intrigue), ("tension", after.tension)] {
+            assert_eq!(state_before[axis].as_f64(), Some(v), "{axis}");
+        }
+        assert!(after.intrigue < 0.3 && after.tension < 0.2);
+        for d in [
+            effective.trust,
+            effective.intrigue,
+            effective.intimacy,
+            effective.tension,
+        ] {
+            assert_eq!(d, 0.0);
+        }
+        assert_eq!((after.warmth_grade, after.patience_grade), (2, 2));
+
+        let stored: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT llm_attempts FROM engine.companion_affinity_events WHERE id = $1",
+        )
+        .bind(e.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, Some(attempts));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_first_label_reached_by_a_date_is_journaled(pool: PgPool) {
+        let (session, a) = seed_axes(&pool, 0.1, 0.1, 0.0, 0.0).await;
+
+        let (after, _) = settle(
+            &pool,
+            session,
+            &verdict(
+                AxisGrades {
+                    trust: 2,
+                    intrigue: 2,
+                    ..Default::default()
+                },
+                2.0,
+            ),
+            &AffinityTuning::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            after.bond_label(),
+            eros_engine_core::affinity::BondLabel::Friend
+        );
+        let e = activity_event(&pool, session).await;
+        let rows = tier_rows(&pool, a.instance_id).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].0.as_str(), rows[0].2), ("bond:friend", Some(e.id)));
     }
 }

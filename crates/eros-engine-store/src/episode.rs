@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Episodes of the relationship scanner (`engine.relationship_episodes`): one
-//! short summary per scanned stretch of chat, and the reader that hands the
-//! scanner its next stretch of rows.
+//! Relationship episodes (`engine.relationship_episodes`): one short summary
+//! per scanned stretch of chat or per settled date, and the reader that hands
+//! the scanner its next stretch of rows.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
+use sqlx::{PgExecutor, PgPool};
 use uuid::Uuid;
 
 /// Characters an episode summary keeps; the rest is cut on write.
@@ -66,6 +66,44 @@ pub fn one_line(s: &str) -> String {
     out.trim().to_string()
 }
 
+/// The one INSERT behind every episode write: the summary on one line, cut to
+/// `EPISODE_MAX_CHARS`. With `claimed_only` the row is written only while the
+/// relationship's scan claim is live; that guard takes `FOR KEY SHARE` on the
+/// state row, so an uncommitted delete of it holds the write until it commits
+/// and the write then finds no row.
+async fn insert_row<'e>(
+    executor: impl PgExecutor<'e>,
+    e: &EpisodeInsert,
+    claimed_only: bool,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    let summary: String = one_line(&e.summary)
+        .chars()
+        .take(EPISODE_MAX_CHARS)
+        .collect();
+    sqlx::query_scalar(
+        "INSERT INTO engine.relationship_episodes \
+             (instance_id, summary, started_at, ended_at, \
+              first_message_id, last_message_id, generation_id) \
+         SELECT $1::uuid, $2::text, $3::timestamptz, $4::timestamptz, \
+                $5::uuid, $6::uuid, $7::text \
+         WHERE NOT $8::bool \
+            OR EXISTS (SELECT 1 FROM engine.relationship_scan_state \
+                       WHERE instance_id = $1 AND claimed_at IS NOT NULL \
+                       FOR KEY SHARE) \
+         RETURNING id",
+    )
+    .bind(e.instance_id)
+    .bind(summary)
+    .bind(e.started_at)
+    .bind(e.ended_at)
+    .bind(e.first_message_id)
+    .bind(e.last_message_id)
+    .bind(e.generation_id.as_deref())
+    .bind(claimed_only)
+    .fetch_optional(executor)
+    .await
+}
+
 pub struct EpisodeRepo<'a> {
     pub pool: &'a PgPool,
 }
@@ -113,30 +151,19 @@ impl EpisodeRepo<'_> {
     /// committed holds the insert until it does, and the insert then finds no
     /// row. `None` when nothing was inserted.
     pub async fn insert_if_claimed(&self, e: &EpisodeInsert) -> Result<Option<Uuid>, sqlx::Error> {
-        let summary: String = one_line(&e.summary)
-            .chars()
-            .take(EPISODE_MAX_CHARS)
-            .collect();
-        sqlx::query_scalar(
-            "INSERT INTO engine.relationship_episodes \
-                 (instance_id, summary, started_at, ended_at, \
-                  first_message_id, last_message_id, generation_id) \
-             SELECT $1::uuid, $2::text, $3::timestamptz, $4::timestamptz, \
-                    $5::uuid, $6::uuid, $7::text \
-             WHERE EXISTS (SELECT 1 FROM engine.relationship_scan_state \
-                           WHERE instance_id = $1 AND claimed_at IS NOT NULL \
-                           FOR KEY SHARE) \
-             RETURNING id",
-        )
-        .bind(e.instance_id)
-        .bind(summary)
-        .bind(e.started_at)
-        .bind(e.ended_at)
-        .bind(e.first_message_id)
-        .bind(e.last_message_id)
-        .bind(e.generation_id.as_deref())
-        .fetch_optional(self.pool)
-        .await
+        insert_row(self.pool, e, true).await
+    }
+
+    /// Store an episode inside the caller's transaction, cut as
+    /// [`Self::insert_if_claimed`] cuts it but with no claim to hold: a
+    /// settled date writes its one episode this way.
+    pub async fn insert_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        e: &EpisodeInsert,
+    ) -> Result<Uuid, sqlx::Error> {
+        insert_row(&mut **tx, e, false)
+            .await?
+            .ok_or(sqlx::Error::RowNotFound)
     }
 
     /// The newest `n` episodes by `ended_at`, returned oldest first.
@@ -464,6 +491,38 @@ mod tests {
         assert_eq!(
             repo.unfolded(instance).await.unwrap()[0].summary,
             "两人聊了搬家。 用户说 要去大阪。"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn insert_in_tx_needs_no_claim(pool: PgPool) {
+        let repo = EpisodeRepo { pool: &pool };
+        let (_, instance) = seed_relationship(&pool).await;
+        let scan_states: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.relationship_scan_state WHERE instance_id = $1",
+        )
+        .bind(instance)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(scan_states, 0);
+
+        let mut tx = pool.begin().await.unwrap();
+        let id = EpisodeRepo::insert_in_tx(
+            &mut tx,
+            &episode(instance, &format!("\n{}", "汉".repeat(450)), 2_000),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let rows = repo.unfolded(instance).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, id);
+        assert_eq!(rows[0].summary, "汉".repeat(EPISODE_MAX_CHARS));
+        assert_eq!(
+            (rows[0].started_at, rows[0].ended_at),
+            (at(1_900), at(2_000))
         );
     }
 
