@@ -152,6 +152,45 @@ pub enum UserAction {
         kind: ItemKind,
         name: String,
     },
+    /// The user invites her out; accepted, the date runs as an activity (spec
+    /// 2026-11-12-activity-sub-session-design.md).
+    Date {
+        duration: DateDuration,
+        place: String,
+        content: String,
+    },
+}
+
+/// How long a date the user proposes lasts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DateDuration {
+    Short,
+    Mid,
+}
+
+impl DateDuration {
+    pub fn hours(self) -> i64 {
+        match self {
+            DateDuration::Short => 1,
+            DateDuration::Mid => 4,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DateDuration::Short => "short",
+            DateDuration::Mid => "mid",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "short" => Some(DateDuration::Short),
+            "mid" => Some(DateDuration::Mid),
+            _ => None,
+        }
+    }
 }
 
 impl UserAction {
@@ -174,14 +213,16 @@ impl UserAction {
     /// The line a refusal of this action drops: handing something over or
     /// giving something to keep is friendship, every physical gesture is
     /// romance. A refused tip drops nothing (spec 2026-10-11 §6), nor does
-    /// seeing through a bluff, a threat or a trick (spec 2026-11-08 §2.2).
+    /// seeing through a bluff, a threat or a trick (spec 2026-11-08 §2.2), nor
+    /// does turning down a date.
     pub fn refusal_line(&self) -> Option<AffinityLine> {
         match self {
             UserAction::Give { .. } | UserAction::Gift { .. } => Some(AffinityLine::Bond),
             UserAction::Tip { .. }
             | UserAction::Bluff
             | UserAction::Threaten
-            | UserAction::Trick => None,
+            | UserAction::Trick
+            | UserAction::Date { .. } => None,
             _ => Some(AffinityLine::Chemistry),
         }
     }
@@ -476,6 +517,31 @@ mod tests {
                 &UserAction::Tip { amount_usd: 5.0 },
             ]
         );
+    }
+
+    #[test]
+    fn date_action_round_trips_and_drops_no_line() {
+        let a: UserAction = serde_json::from_value(serde_json::json!({
+            "type": "date", "duration": "mid", "place": "海边", "content": "看海"
+        }))
+        .unwrap();
+        assert_eq!(
+            a,
+            UserAction::Date {
+                duration: DateDuration::Mid,
+                place: "海边".into(),
+                content: "看海".into()
+            }
+        );
+        assert_eq!(serde_json::to_value(&a).unwrap()["duration"], "mid");
+        assert_eq!(a.refusal_line(), None);
+        assert!(!a.speaks_emotionally());
+        assert_eq!(DateDuration::Short.hours(), 1);
+        assert_eq!(DateDuration::Mid.hours(), 4);
+        for d in [DateDuration::Short, DateDuration::Mid] {
+            assert_eq!(DateDuration::parse(d.as_str()), Some(d));
+        }
+        assert_eq!(DateDuration::parse("long"), None);
     }
 
     #[test]

@@ -5333,7 +5333,7 @@
       },
       "EventKindDto": {
         "type": "string",
-        "description": "A kind of life event. `taking_space`, `fell_out`, `traveling_together`\nand `bathing_together` are placed by the engine, never drawn: they appear\nin responses only, and a `kinds` filter that lists one is rejected.",
+        "description": "A kind of life event. `taking_space`, `fell_out`, `traveling_together`,\n`bathing_together` and `on_a_date` are placed by the engine, never drawn:\nthey appear in responses only, and a `kinds` filter that lists one is\nrejected.",
         "enum": [
           "police_encounter",
           "animal_encounter",
@@ -5400,6 +5400,7 @@
           "want_hot_spring",
           "want_sauna",
           "bathing_together",
+          "on_a_date",
           "watching_stocks",
           "trading",
           "got_lost",

@@ -366,7 +366,7 @@ fn kind_cue(
         OutShopping if traits.female => "（你接下来要出门逛街，这段时间顾不上看手机。）".into(),
         OutShopping => "（你正在外面逛街。）".into(),
         AwayFromPhone | Asleep | BrosGathering | SisGathering | HavingSex | TakingSpace
-        | FellOut | TravelingTogether | BathingTogether => {
+        | FellOut | TravelingTogether | BathingTogether | OnADate => {
             unreachable!("{kind:?} is never told")
         }
         Sick => format!("（你生病了，大概要 {span}才会好。）"),

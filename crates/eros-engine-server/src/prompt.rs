@@ -655,6 +655,9 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
             format!("给你发了一个红包，相当于{}", tip_value_noun(*amount_usd))
         }
         UserAction::Gift { name, .. } => format!("送你「{name}」"),
+        UserAction::Date { place, content, .. } => {
+            format!("邀请你去约会（{place}，{content}）")
+        }
     }
 }
 
@@ -670,6 +673,14 @@ pub(crate) fn action_subject(a: &UserAction) -> String {
             "对方{}，对你来说算「{}」的一笔",
             action_phrase(a),
             tip_tier_adjective(*amount_usd)
+        ),
+        UserAction::Date {
+            duration,
+            place,
+            content,
+        } => format!(
+            "对方邀请你去约会：地点「{place}」，安排「{content}」，大约 {} 小时",
+            duration.hours()
         ),
         _ => format!("对方{}", action_phrase(a)),
     }
@@ -927,6 +938,7 @@ pub(crate) fn event_label(kind: eros_engine_core::events::EventKind) -> &'static
         FellOut => "为分开的事闹得不愉快",
         TravelingTogether => "和对方一起旅行",
         BathingTogether => "和对方一起洗澡",
+        OnADate => "和对方约会",
         Strip => "刚脱了衣服",
         BirdEncounter => "遇到一只鸟",
         ExWantsBack => "前任来求复合",
@@ -6280,6 +6292,32 @@ mod tests {
                 text: "捏了捏你的脸".into()
             }),
             "对方的动作：「捏了捏你的脸」"
+        );
+    }
+
+    #[test]
+    fn a_date_reads_as_an_invitation_with_its_length() {
+        use eros_engine_core::types::DateDuration;
+        let date = |duration| UserAction::Date {
+            duration,
+            place: "海边".into(),
+            content: "看海".into(),
+        };
+        let short = date(DateDuration::Short);
+        let mid = date(DateDuration::Mid);
+        assert_eq!(action_phrase(&mid), "邀请你去约会（海边，看海）");
+        assert_eq!(action_marker(&mid), "（邀请你去约会（海边，看海））");
+        assert_eq!(
+            action_subject(&short),
+            "对方邀请你去约会：地点「海边」，安排「看海」，大约 1 小时"
+        );
+        assert_eq!(
+            action_subject(&mid),
+            "对方邀请你去约会：地点「海边」，安排「看海」，大约 4 小时"
+        );
+        assert_eq!(
+            event_label(eros_engine_core::events::EventKind::OnADate),
+            "和对方约会"
         );
     }
 

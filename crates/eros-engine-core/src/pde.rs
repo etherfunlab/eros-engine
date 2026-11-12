@@ -8,8 +8,8 @@ use crate::affinity::AffinityDeltas;
 use crate::ghost::{self, GhostDecision, GhostSignals};
 use crate::needs::Habits;
 use crate::types::{
-    ActionPlan, ActionResponse, ActionType, DecisionInput, Event, ImageRef, ReplyMode, ReplyStyle,
-    TurnNudges, UserAction,
+    ActionPlan, ActionResponse, ActionType, DateDuration, DecisionInput, Event, ImageRef,
+    ReplyMode, ReplyStyle, TurnNudges, UserAction,
 };
 
 // Decision thresholds — tune here rather than at call sites.
@@ -70,6 +70,20 @@ pub fn strip_ruled_out(event: &Event) -> bool {
             affinity_scope,
             ..
         } => !crate::scope::romance_compatible(*affinity_scope),
+        _ => false,
+    }
+}
+
+/// Whether this turn's `date` is ruled out before the judge (spec
+/// 2026-11-12-activity-sub-session-design.md): she is out of reach, or the
+/// date is a `mid` one and the bond is below tier 2. Not a roll: such an
+/// invitation is always turned down.
+pub fn date_ruled_out(event: &Event, bond_tier: u8, offline_now: bool) -> bool {
+    match event {
+        Event::UserMessage {
+            action: Some(UserAction::Date { duration, .. }),
+            ..
+        } => offline_now || (*duration == DateDuration::Mid && bond_tier < 2),
         _ => false,
     }
 }
@@ -989,6 +1003,32 @@ mod tests {
         assert!(!strip_ruled_out(&neutral_fallback));
         assert!(!strip_ruled_out(&action_msg(UserAction::Kiss)));
         assert!(!strip_ruled_out(&user_msg("hi")));
+    }
+
+    #[test]
+    fn date_gate_by_duration_bond_and_offline() {
+        use crate::types::DateDuration;
+        let date = |duration| {
+            action_msg(UserAction::Date {
+                duration,
+                place: "海边".into(),
+                content: "看海".into(),
+            })
+        };
+        let short = date(DateDuration::Short);
+        assert!(!date_ruled_out(&short, 1, false));
+        assert!(date_ruled_out(&short, 1, true));
+        let mid = date(DateDuration::Mid);
+        assert!(date_ruled_out(&mid, 1, false));
+        assert!(!date_ruled_out(&mid, 2, false));
+        assert!(date_ruled_out(&mid, 5, true));
+        let kiss = action_msg(UserAction::Kiss);
+        for tier in 0..=5 {
+            for offline in [false, true] {
+                assert!(!date_ruled_out(&kiss, tier, offline));
+            }
+        }
+        assert!(!date_ruled_out(&user_msg("hi"), 1, true));
     }
 
     #[test]

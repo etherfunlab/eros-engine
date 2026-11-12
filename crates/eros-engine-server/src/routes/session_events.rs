@@ -48,9 +48,10 @@ use eros_engine_llm::model_config::StyleKey;
 const CONCURRENT_STREAMS_PER_USER: u32 = 3;
 const MAX_EVENT_KEY_CHARS: usize = 128;
 
-/// A kind of life event. `taking_space`, `fell_out`, `traveling_together`
-/// and `bathing_together` are placed by the engine, never drawn: they appear
-/// in responses only, and a `kinds` filter that lists one is rejected.
+/// A kind of life event. `taking_space`, `fell_out`, `traveling_together`,
+/// `bathing_together` and `on_a_date` are placed by the engine, never drawn:
+/// they appear in responses only, and a `kinds` filter that lists one is
+/// rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKindDto {
@@ -119,6 +120,7 @@ pub enum EventKindDto {
     WantHotSpring,
     WantSauna,
     BathingTogether,
+    OnADate,
     WatchingStocks,
     Trading,
     GotLost,
@@ -214,6 +216,7 @@ impl From<EventKindDto> for EventKind {
             EventKindDto::WantHotSpring => EventKind::WantHotSpring,
             EventKindDto::WantSauna => EventKind::WantSauna,
             EventKindDto::BathingTogether => EventKind::BathingTogether,
+            EventKindDto::OnADate => EventKind::OnADate,
             EventKindDto::WatchingStocks => EventKind::WatchingStocks,
             EventKindDto::Trading => EventKind::Trading,
             EventKindDto::GotLost => EventKind::GotLost,
@@ -295,6 +298,7 @@ impl From<EventKind> for EventKindDto {
             EventKind::WantHotSpring => EventKindDto::WantHotSpring,
             EventKind::WantSauna => EventKindDto::WantSauna,
             EventKind::BathingTogether => EventKindDto::BathingTogether,
+            EventKind::OnADate => EventKindDto::OnADate,
             EventKind::WatchingStocks => EventKindDto::WatchingStocks,
             EventKind::Trading => EventKindDto::Trading,
             EventKind::GotLost => EventKindDto::GotLost,
@@ -2504,6 +2508,7 @@ mod tests {
             json!({"disallow": ["taking_space"]}),
             json!({"disallow": ["fell_out"]}),
             json!(["bathing_together"]),
+            json!(["on_a_date"]),
         ] {
             assert!(
                 serde_json::from_value::<DrawEventRequest>(
