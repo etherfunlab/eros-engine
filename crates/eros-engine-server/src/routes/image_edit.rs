@@ -1031,6 +1031,7 @@ async fn edit_image(
                 false,
                 None,
                 user_locale.timezone,
+                false,
             )
             .await;
         });

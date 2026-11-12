@@ -139,6 +139,17 @@ pub async fn run(
         _ => (String::new(), None, false),
     };
     let tier_drop = tier_drop_for(&event, &plan);
+    // An accepted invitation belongs to the date it opens: settlement reads
+    // it, the per-turn judge does not (spec 2026-11-12-activity-sub-session-
+    // design.md §4.6).
+    let activity_turn = matches!(
+        &event,
+        Event::UserMessage {
+            action: Some(eros_engine_core::types::UserAction::Date { .. }),
+            ..
+        }
+    ) && plan.action_response
+        == Some(eros_engine_core::types::ActionResponse::Accept);
     // As of 4.0 the request's affinity scope is read-side (prompt injection
     // gating) AND consumed here by the feeling-clause summarizer, which only
     // narrates axes the request actually asked for.
@@ -207,6 +218,7 @@ pub async fn run(
             action_turn,
             tier_drop,
             user_locale.timezone,
+            activity_turn,
         )
         .await;
     };
@@ -274,6 +286,10 @@ pub async fn run(
 /// persona (a blank name skips the eval) and the user's timezone, which dates
 /// the tier rows the persist journals. After the persist, a judged turn may
 /// make her put a life choice to the user (`life_choice::maybe_ask`).
+///
+/// An `activity_turn` belongs to a date, which settlement scores (spec
+/// 2026-11-12-activity-sub-session-design.md §4.6): it persists as a skipped
+/// evaluation (`activity`) with no rule nudges.
 #[allow(clippy::too_many_arguments)] // each arg is a distinct per-turn concern
 pub(crate) async fn run_affinity_turn(
     state: &AppState,
@@ -291,6 +307,7 @@ pub(crate) async fn run_affinity_turn(
     action_turn: bool,
     tier_drop: Option<eros_engine_core::affinity::AffinityLine>,
     journal_tz: Option<chrono_tz::Tz>,
+    activity_turn: bool,
 ) {
     // Semantic eval gate: Reply turns only, with a non-trivial user message
     // and a non-empty produced assistant message (or image_caption proxy for
@@ -298,12 +315,21 @@ pub(crate) async fn run_affinity_turn(
     // in v1. `pre_skip == None` ⇒ the gate passes and an eval call is
     // attempted; otherwise it carries the reason the trio will be NULL
     // (stamped into `context`).
-    let pre_skip = eval_skip_reason(
-        action,
-        user_msg.chars().count(),
-        eval_text.trim().is_empty(),
-        action_turn,
-    );
+    let pre_skip = if activity_turn {
+        Some("activity")
+    } else {
+        eval_skip_reason(
+            action,
+            user_msg.chars().count(),
+            eval_text.trim().is_empty(),
+            action_turn,
+        )
+    };
+    let rule_deltas = if activity_turn {
+        eros_engine_core::affinity::AffinityDeltas::default()
+    } else {
+        rule_deltas
+    };
 
     // The feeling clause gets the name only on a turn whose eval was
     // attempted; a skipped turn hands it an empty name, which it declines.
@@ -4150,6 +4176,7 @@ mod tests {
             false,
             None,
             None,
+            false,
         )
         .await;
 

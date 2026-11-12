@@ -117,6 +117,10 @@ pub enum ProtocolFrame {
         llm_attempts: Vec<eros_engine_llm::failure::UpstreamAttempt>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         gateway_errors: Vec<eros_engine_llm::failure::GatewayError>,
+        /// The date an accepted invitation opened this turn (spec
+        /// 2026-11-12-activity-sub-session-design.md §4.6); absent otherwise.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        activity: Option<crate::routes::dto::ActivityView>,
     },
     Error {
         code: StreamErrorCode,
@@ -2868,8 +2872,8 @@ fn picture_action(
 }
 
 /// An action refused before the judge (a give the habit roll refused, a strip
-/// an incompatible pair cannot have) is refused, whatever the judge or the
-/// rule engine settled on.
+/// an incompatible pair cannot have, a date the gate turns down) is refused,
+/// whatever the judge or the rule engine settled on.
 fn apply_forced_refusal(plan: &mut eros_engine_core::types::ActionPlan, refused: bool) {
     if refused && plan.action_response.is_some() {
         plan.action_response = Some(eros_engine_core::types::ActionResponse::Refuse);
@@ -2985,7 +2989,8 @@ fn build_pde_ctx(
     // action refused before the judge (a give the habit roll refused, spec
     // 2026-10-28-outing-indulgence-needs-and-habits-design.md §3.1; a strip an
     // incompatible pair cannot have, spec 2026-11-08-strip-and-world-setting-
-    // design.md §2.1) states the outcome, not the reason.
+    // design.md §2.1; a date the gate turns down, spec 2026-11-12-activity-sub-
+    // session-design.md §4.3) states the outcome, not the reason.
     let action_line = match &input.event {
         eros_engine_core::types::Event::UserMessage {
             action: Some(a), ..
@@ -2998,6 +3003,7 @@ fn build_pde_ctx(
             match (refused_before_judge, a) {
                 (false, _) => "",
                 (true, eros_engine_core::types::UserAction::Strip) => "，这次你不会让对方这样做",
+                (true, eros_engine_core::types::UserAction::Date { .. }) => "，这次你不会答应",
                 (true, _) => "，这次你不会收下",
             }
         ),
@@ -4922,6 +4928,10 @@ pub(crate) fn run_stream_with(
         let action_turn = user_msg.action.is_some();
         let force_image = user_msg.image.as_ref().is_some_and(|i| i.force);
         let traits = crate::prompt::persona_traits(&input.persona);
+        let offline_now = current
+            .foreground
+            .as_ref()
+            .is_some_and(|e| e.kind.is_offline(&traits));
         // While she is offline (spec 2026-10-16-life-events-offline-and-scares-
         // design.md §4.2) a text turn ghosts without the judge. The silence is
         // circumstance, so the ghost accounting is left alone. A deployment
@@ -4930,10 +4940,7 @@ pub(crate) fn run_stream_with(
         if !action_turn
             && !force_image
             && state.model_config.pde_ghosting_enabled()
-            && current
-                .foreground
-                .as_ref()
-                .is_some_and(|e| e.kind.is_offline(&traits))
+            && offline_now
         {
             if let Err(e) = chat_repo
                 .mark_user_message_ghosted(user_msg.user_message_id)
@@ -5085,6 +5092,11 @@ pub(crate) fn run_stream_with(
         // world-setting-design.md §2.1): decided here too, so the judge writes
         // for the outcome.
         let strip_refused = pde::strip_ruled_out(&input.event);
+        // A date she cannot go on (spec 2026-11-12-activity-sub-session-
+        // design.md §4.3): she is offline, or a `mid` one is asked below bond
+        // tier 2. On the decayed affinity this turn reads.
+        let date_refused = pde::date_ruled_out(&input.event, affinity.bond_tier(), offline_now);
+        let refused_before_judge = give_refused || strip_refused || date_refused;
         let (mut plan, pde_run): (eros_engine_core::types::ActionPlan, Option<PdeDecisionRun>) =
             match resolved_pde.as_ref() {
                 Some(p) => {
@@ -5096,7 +5108,7 @@ pub(crate) fn run_stream_with(
                         body_state.as_deref(),
                         prior_needs.as_ref(),
                         event_judge.as_deref(),
-                        give_refused || strip_refused,
+                        refused_before_judge,
                     );
                     // Read receipt (migration 0053): the judge is the first
                     // generative model to see this message, so this is the
@@ -5190,7 +5202,7 @@ pub(crate) fn run_stream_with(
 
         // An action refused before the judge is refused before anything reads
         // the response.
-        apply_forced_refusal(&mut plan, give_refused || strip_refused);
+        apply_forced_refusal(&mut plan, refused_before_judge);
 
         // A photo she let the user take, or a strip she let happen, comes back
         // as her picture after her words; a refused one is text only (spec
@@ -6484,7 +6496,7 @@ pub(crate) fn run_stream_with(
                 turn_failures.extend(burst_failures);
                 turn_failures.extend(compose_failures);
                 let (turn_attempts, turn_gateways) = split_failures_typed(&turn_failures);
-                let final_frame = build_final_frame(
+                let mut final_frame = build_final_frame(
                     did_filter,
                     prompt_injected.clone(),
                     user_msg.tier.clone(),
@@ -6493,11 +6505,54 @@ pub(crate) fn run_stream_with(
                     turn_attempts,
                     turn_gateways,
                 );
+
+                // An accepted invitation opens its date now that her reply is
+                // stored, so `final` can carry it (spec 2026-11-12-activity-
+                // sub-session-design.md §4.6). The same transaction stores her
+                // answer, opened or not: only a failed one leaves it to the
+                // write below.
+                let mut answer_stored = false;
+                if let (
+                    Some(eros_engine_core::types::UserAction::Date {
+                        duration,
+                        place,
+                        content,
+                    }),
+                    Some(eros_engine_core::types::ActionResponse::Accept),
+                ) = (user_msg.action.as_ref(), plan.action_response)
+                {
+                    let now = chrono::Utc::now();
+                    let opened = eros_engine_store::activity::ActivityRepo { pool: &state.pool }
+                        .accept(
+                            &eros_engine_store::activity::NewActivity {
+                                session_id: user_msg.session_id,
+                                user_id: user_msg.user_id,
+                                instance_id: user_msg.instance_id,
+                                message_id: user_msg.user_message_id,
+                                duration: *duration,
+                                place,
+                                content,
+                            },
+                            now,
+                        )
+                        .await;
+                    match opened {
+                        Ok(record) => {
+                            answer_stored = true;
+                            if let (Some(r), ProtocolFrame::Final { activity, .. }) =
+                                (record, &mut final_frame)
+                            {
+                                *activity = Some(crate::routes::dto::ActivityView::from_record(&r, now));
+                            }
+                        }
+                        Err(e) => tracing::warn!("stream: date open failed: {e}"),
+                    }
+                }
                 yield final_frame;
 
                 // Stored right before post-process is spawned, with no other
                 // await between them. A failed write only loses the stored copy.
-                if let Some(response) = plan.action_response {
+                if let Some(response) = plan.action_response.filter(|_| !answer_stored) {
                     if let Err(e) = chat_repo
                         .set_action_response(
                             user_msg.user_message_id,
@@ -6571,6 +6626,8 @@ pub(crate) fn run_stream_with(
 /// chain at all (replay). Affinity eval is excluded by design: it is fail-open
 /// and runs after the response is out, so "no affinity judgment this turn" is
 /// a normal state a consumer cannot act on.
+///
+/// `activity` is `None`; the one turn that opens a date sets it on the frame.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_final_frame(
     filtered: bool,
@@ -6589,6 +6646,7 @@ pub(crate) fn build_final_frame(
         retries_filter,
         llm_attempts,
         gateway_errors,
+        activity: None,
     }
 }
 
@@ -7257,6 +7315,7 @@ mod tests {
             retries_filter: 0,
             llm_attempts: vec![],
             gateway_errors: vec![],
+            activity: None,
         };
         let v: serde_json::Value = serde_json::to_value(&f).unwrap();
         assert_eq!(v["type"], "final");
@@ -7274,6 +7333,7 @@ mod tests {
             retries_filter: 0,
             llm_attempts: vec![],
             gateway_errors: vec![],
+            activity: None,
         };
         let v2: serde_json::Value = serde_json::to_value(&f2).unwrap();
         assert!(v2["prompt_injected"].is_null());
@@ -7356,6 +7416,7 @@ mod tests {
             retries_filter: 0,
             llm_attempts: vec![],
             gateway_errors: vec![],
+            activity: None,
         };
         let v = serde_json::to_value(&f).unwrap();
         let obj = v.as_object().unwrap();
@@ -7388,6 +7449,7 @@ mod tests {
                 kind: GatewayKind::ChainExhausted,
                 message: "all 2 candidates failed".into(),
             }],
+            activity: None,
         };
         let v = serde_json::to_value(&f).unwrap();
         assert_eq!(v["llm_attempts"][0]["http_status"], 529);
@@ -25477,5 +25539,352 @@ data: [DONE]\n\n"
         assert!(tone_chat_messages(&mock).await.len() > 2);
         let meta = tone_reply_metadata(&pool, session_id).await;
         assert!(meta.get("tone").is_none(), "{meta}");
+    }
+
+    // ─── Date invitations (spec 2026-11-12-activity-sub-session-design.md §4) ───
+
+    /// A date to 「海边」 to 「看海」.
+    fn date_of(
+        duration: eros_engine_core::types::DateDuration,
+    ) -> eros_engine_core::types::UserAction {
+        eros_engine_core::types::UserAction::Date {
+            duration,
+            place: "海边".into(),
+            content: "看海".into(),
+        }
+    }
+
+    /// An invitation turn on a fresh persona (bond tier 1): the user writes
+    /// `content`, `gap_hours` after an earlier message of theirs when given,
+    /// with `events` under way; the judge answers `response`. Returns the
+    /// frames, the mock and the invitation's id.
+    async fn run_date_turn(
+        pool: &PgPool,
+        duration: eros_engine_core::types::DateDuration,
+        content: &str,
+        gap_hours: Option<i32>,
+        events: &[EventSeed],
+        response: &str,
+    ) -> (Vec<ProtocolFrame>, wiremock::MockServer, Uuid) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let verdict = serde_json::json!({
+            "action": "reply_text", "inner_state": "", "action_response": response
+        });
+        let judge_body = serde_json::json!({
+            "id": "gj", "model": "pde/judge",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": verdict.to_string()}}],
+        });
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("pde/judge"))
+            .respond_with(crate::pipeline::reasoning_call::test_support::sse_completion(judge_body))
+            .mount(&mock)
+            .await;
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"REPLY\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"deepseek/x\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_genome_id, instance_id, session_id) = seed_persona_and_session(pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide.\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        // Embeddings go to the mock too, which mounts none: recall and the
+        // memory write fail at once instead of reaching a real endpoint.
+        state.embed = std::sync::Arc::new(
+            eros_engine_llm::embedding::EmbeddingRouter::from_config_with(
+                &eros_engine_llm::model_config::ModelConfig::from_toml_str(&format!(
+                    "[providers.mockembed]\nembeddings = \"{}/v1/embeddings\"\n\
+                     [tasks.embedding]\nmodel = \"mock-embed@mockembed\"\n",
+                    mock.uri()
+                ))
+                .unwrap(),
+                |k| (k == "MOCKEMBED_API_KEY").then(|| "test-key".to_string()),
+            )
+            .unwrap(),
+        );
+        seed_events(pool, user_id, instance_id, session_id, events).await;
+        if let Some(hours) = gap_hours {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+                 VALUES ($1, 'user', '在吗', now() - make_interval(hours => $2))",
+            )
+            .bind(session_id)
+            .bind(hours)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        let action = date_of(duration);
+        let meta = serde_json::json!({"action": serde_json::to_value(&action).unwrap()});
+        let umid = match (ChatRepo { pool })
+            .upsert_user_message_idempotent(
+                session_id,
+                content,
+                "01JDATE0000000000000000000",
+                "user",
+                Some(&meta),
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: content.to_string(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                image_url: None,
+                image: None,
+                quote: Default::default(),
+                user_locale: Default::default(),
+                action: Some(action),
+                outfit: None,
+            },
+            None,
+        )
+        .collect()
+        .await;
+        (frames, mock, umid)
+    }
+
+    /// The `final` frame as the wire carries it.
+    fn final_json(frames: &[ProtocolFrame]) -> serde_json::Value {
+        frames
+            .iter()
+            .find(|f| matches!(f, ProtocolFrame::Final { .. }))
+            .map(|f| serde_json::to_value(f).unwrap())
+            .unwrap_or_else(|| panic!("a final frame: {frames:?}"))
+    }
+
+    async fn activities_for(pool: &PgPool, invitation: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM engine.activities WHERE message_id = $1")
+            .bind(invitation)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// The turn's affinity row `(context, effective_deltas)`, once the
+    /// spawned post-process has written it.
+    async fn turn_affinity_row(
+        pool: &PgPool,
+        umid: Uuid,
+    ) -> (serde_json::Value, serde_json::Value) {
+        for _ in 0..200 {
+            let row: Option<(serde_json::Value, Option<serde_json::Value>)> = sqlx::query_as(
+                "SELECT context, effective_deltas FROM engine.companion_affinity_events \
+                 WHERE user_message_id = $1",
+            )
+            .bind(umid)
+            .fetch_optional(pool)
+            .await
+            .unwrap();
+            if let Some((context, effective)) = row {
+                return (context, effective.unwrap_or_default());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("the turn's affinity row never landed");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_mid_date_below_bond_two_is_refused_before_the_judge(pool: PgPool) {
+        let (frames, mock, umid) = run_date_turn(
+            &pool,
+            eros_engine_core::types::DateDuration::Mid,
+            "",
+            None,
+            &[],
+            "accept",
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "refuse");
+        let reqs = mock.received_requests().await.unwrap();
+        assert!(
+            judge_request(&reqs).contains(
+                "[用户动作] 对方邀请你去约会：地点「海边」，安排「看海」，大约 4 小时，这次你不会答应\\n"
+            ),
+            "{}",
+            judge_request(&reqs)
+        );
+        assert_eq!(activities_for(&pool, umid).await, 0);
+        let (context, _) = turn_affinity_row(&pool, umid).await;
+        assert!(context.get("tier_drop").is_none(), "{context}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_short_date_is_up_to_the_judge(pool: PgPool) {
+        let short = eros_engine_core::types::DateDuration::Short;
+        let (frames, mock, umid) = run_date_turn(&pool, short, "", None, &[], "refuse").await;
+        assert_eq!(action_response_of(&frames), "refuse");
+        let judge = judge_request(&mock.received_requests().await.unwrap());
+        assert!(
+            judge.contains(
+                "[用户动作] 对方邀请你去约会：地点「海边」，安排「看海」，大约 1 小时\\n"
+            ),
+            "{judge}"
+        );
+        assert_eq!(activities_for(&pool, umid).await, 0);
+
+        let (frames, mock, _) = run_date_turn(&pool, short, "", None, &[], "accept").await;
+        assert_eq!(action_response_of(&frames), "accept");
+        let judge = judge_request(&mock.received_requests().await.unwrap());
+        assert!(!judge.contains("这次你不会答应"), "{judge}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_date_while_she_is_offline_is_refused(pool: PgPool) {
+        let (frames, mock, umid) = run_date_turn(
+            &pool,
+            eros_engine_core::types::DateDuration::Short,
+            "",
+            None,
+            &[ev("asleep", 5, 55)],
+            "accept",
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "refuse");
+        let judge = judge_request(&mock.received_requests().await.unwrap());
+        assert!(judge.contains("大约 1 小时，这次你不会答应"), "{judge}");
+        assert_eq!(activities_for(&pool, umid).await, 0);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_accepted_date_opens_the_activity_on_the_final_frame(pool: PgPool) {
+        let (frames, _, umid) = run_date_turn(
+            &pool,
+            eros_engine_core::types::DateDuration::Short,
+            "",
+            None,
+            &[],
+            "accept",
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        let (id, sub_session_id): (Uuid, Uuid) = sqlx::query_as(
+            "SELECT id, sub_session_id FROM engine.activities WHERE message_id = $1",
+        )
+        .bind(umid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let total: i64 = sqlx::query_scalar("SELECT count(*) FROM engine.activities")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(total, 1);
+
+        let activity = final_json(&frames)["activity"].clone();
+        assert_eq!(activity["id"], id.to_string(), "{activity}");
+        assert_eq!(activity["sub_session_id"], sub_session_id.to_string());
+        assert_eq!(activity["status"], "ongoing");
+        assert_eq!(activity["duration"], "short");
+        assert_eq!(activity["place"], "海边");
+        assert_eq!(activity["content"], "看海");
+        let at = |k: &str| -> chrono::DateTime<chrono::Utc> {
+            serde_json::from_value(activity[k].clone()).unwrap()
+        };
+        assert_eq!(at("ends_at") - at("started_at"), chrono::Duration::hours(1));
+
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT metadata->'action'->>'response' FROM engine.chat_messages WHERE id = $1",
+        )
+        .bind(umid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored.as_deref(), Some("accept"));
+    }
+
+    /// A 40-character message after a 30-hour gap would earn both rule
+    /// nudges on an ordinary turn.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_accepted_invitation_is_not_scored(pool: PgPool) {
+        let text =
+            "今天天气真好，我们一起去海边走走吧，看看日落，吹吹海风，聊聊最近发生的事情好不好呀";
+        assert!(text.chars().count() >= 40);
+        let (frames, _, umid) = run_date_turn(
+            &pool,
+            eros_engine_core::types::DateDuration::Short,
+            text,
+            Some(30),
+            &[],
+            "accept",
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        let (context, effective) = turn_affinity_row(&pool, umid).await;
+        assert_eq!(context["eval_skip_reason"], "activity", "{context}");
+        let axes = effective.as_object().expect("effective deltas");
+        assert!(!axes.is_empty(), "{effective}");
+        assert!(
+            axes.values().all(|v| v.as_f64() == Some(0.0)),
+            "{effective}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_refused_invitation_is_an_ordinary_judged_turn(pool: PgPool) {
+        let (frames, _, umid) = run_date_turn(
+            &pool,
+            eros_engine_core::types::DateDuration::Short,
+            "",
+            None,
+            &[],
+            "refuse",
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "refuse");
+        assert!(final_json(&frames).get("activity").is_none());
+        let (context, _) = turn_affinity_row(&pool, umid).await;
+        assert!(context.get("eval_skip_reason").is_none(), "{context}");
+        assert!(context.get("tier_drop").is_none(), "{context}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn no_activity_on_ordinary_final_frames(pool: PgPool) {
+        let (frames, _, _) = run_action_turn(
+            &pool,
+            serde_json::json!({"action": "reply_text", "inner_state": "", "action_response": "accept"}),
+            200,
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        let fin = final_json(&frames);
+        assert!(fin.get("activity").is_none(), "{fin}");
     }
 }
