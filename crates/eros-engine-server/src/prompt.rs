@@ -1362,6 +1362,17 @@ pub(crate) fn persona_habits(persona: &CompanionPersona) -> eros_engine_core::ne
     }
 }
 
+/// Whether the persona is moody (spec
+/// 2026-11-12-chat-tone-emotional-design.md §3.3): `art_metadata.moody`; a
+/// value that is not a boolean reads as unset. Read by the tone draw alone.
+pub(crate) fn persona_moody(persona: &CompanionPersona) -> Option<bool> {
+    persona
+        .genome
+        .art_metadata
+        .get("moody")
+        .and_then(|v| v.as_bool())
+}
+
 /// Pluck an i32 field out of `art_metadata`: a JSON number, or a string
 /// holding one (forms that save numbers as text).
 pub(crate) fn meta_i32(persona: &CompanionPersona, key: &str) -> Option<i32> {
@@ -1504,8 +1515,11 @@ pub(crate) fn render_recall_sections(
 /// decides labels — typically `("基础画像", insight_bullets)` first, then
 /// one entry per memory category (`客观事实` / `偏好` / `最近发生` / etc.)
 /// from the dreaming scan's profile memories. Empty groups are dropped.
+///
+/// `user_profile = false` leaves the `[user_profile]` block out, header and
+/// placeholder included (the `emotional` tone).
 #[allow(clippy::too_many_arguments)] // signature mirrors the gateway's port-of-origin
-pub fn build_prompt(
+fn render_prompt(
     persona: &CompanionPersona,
     profile_groups: &[(String, Vec<String>)],
     relationship_facts: &[String],
@@ -1563,6 +1577,7 @@ pub fn build_prompt(
     // Anniversary lines (spec 2026-10-28 §5.4), each its own line in `[now]`
     // right after the birthday line. Empty ⇒ no line.
     anniversaries: &[String],
+    user_profile: bool,
 ) -> String {
     let name = persona.genome.name.as_str();
     let age = meta_i32(persona, "age")
@@ -1626,7 +1641,12 @@ pub fn build_prompt(
     };
 
     let (profile_sec, rel_sec) = render_recall_sections(profile_groups, relationship_facts);
-    let profile_str = profile_sec.unwrap_or_else(|| "（刚认识，还不了解他）".to_string());
+    let profile_section = if user_profile {
+        let profile_str = profile_sec.unwrap_or_else(|| "（刚认识，还不了解他）".to_string());
+        format!("[user_profile]\n{profile_str}\n\n")
+    } else {
+        String::new()
+    };
     let rel_str = match shared_memories {
         Some(text) => text.to_string(),
         None => rel_sec.unwrap_or_else(|| "（还没有专属记忆，慢慢来）".to_string()),
@@ -1910,9 +1930,7 @@ pub fn build_prompt(
          [quirks]{quirks_str}\n\
          [topics]{topics_str}{traits_section}\n\
          \n\
-         [user_profile]\n{profile_str}\n\
-         \n\
-         [shared_memories]\n{rel_str}{world_section}{stories_section}{character_section}\n\
+         {profile_section}[shared_memories]\n{rel_str}{world_section}{stories_section}{character_section}\n\
          [reply_length]\n{lr}{relationship}\
          {attitude}{state}{hints_section}{emotional_section}{quote_section}\n\
          \n\
@@ -1928,6 +1946,108 @@ pub fn build_prompt(
         tc = now_context_at(now.now, timezone, now.user_timezone),
         lr = length_rule(affinity, affinity_scope, reply_mode),
         rule1 = rule_one(reply_mode),
+    )
+}
+
+/// The default tone's system prompt. Every parameter is documented on
+/// `render_prompt`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_prompt(
+    persona: &CompanionPersona,
+    profile_groups: &[(String, Vec<String>)],
+    relationship_facts: &[String],
+    affinity: Option<&Affinity>,
+    hints: &[String],
+    reply_mode: Option<ReplyMode>,
+    clothing: Option<&str>,
+    prompt_traits: &[PromptTrait],
+    affinity_scope: AffinityScope,
+    emotional_context: &[String],
+    world: Option<&WorldContext>,
+    stories: Option<&StoriesContext>,
+    quote: Option<&QuotedMessage>,
+    character_state: Option<&eros_engine_store::character_insight::CharacterInsightsRow>,
+    nudges: TurnNudges,
+    now: &NowContext,
+    body_state: Option<&str>,
+    needs: Option<&str>,
+    event: Option<&EventLines>,
+    shared_memories: Option<&str>,
+    anniversaries: &[String],
+) -> String {
+    render_prompt(
+        persona,
+        profile_groups,
+        relationship_facts,
+        affinity,
+        hints,
+        reply_mode,
+        clothing,
+        prompt_traits,
+        affinity_scope,
+        emotional_context,
+        world,
+        stories,
+        quote,
+        character_state,
+        nudges,
+        now,
+        body_state,
+        needs,
+        event,
+        shared_memories,
+        anniversaries,
+        true,
+    )
+}
+
+/// The `emotional` tone's system prompt (spec
+/// 2026-11-12-chat-tone-emotional-design.md §4.2): the default prompt with
+/// what the engine concludes about the user and the relationship left out.
+/// No `[user_profile]`; no affinity, so `[reply_length]` is the lowest tier
+/// and `[relationship]`, `[mood]` and `[feelings]` are absent; no judge
+/// hints, no `[emotional_context]`, no nudges, no anniversary line.
+/// `shared_memories` is the block's whole body; `None` renders its
+/// placeholder.
+#[allow(clippy::too_many_arguments)]
+pub fn build_emotional_prompt(
+    persona: &CompanionPersona,
+    reply_mode: Option<ReplyMode>,
+    clothing: Option<&str>,
+    prompt_traits: &[PromptTrait],
+    world: Option<&WorldContext>,
+    stories: Option<&StoriesContext>,
+    quote: Option<&QuotedMessage>,
+    character_state: Option<&eros_engine_store::character_insight::CharacterInsightsRow>,
+    now: &NowContext,
+    body_state: Option<&str>,
+    needs: Option<&str>,
+    event: Option<&EventLines>,
+    shared_memories: Option<&str>,
+) -> String {
+    render_prompt(
+        persona,
+        &[],
+        &[],
+        None,
+        &[],
+        reply_mode,
+        clothing,
+        prompt_traits,
+        AffinityScope::default(),
+        &[],
+        world,
+        stories,
+        quote,
+        character_state,
+        TurnNudges::default(),
+        now,
+        body_state,
+        needs,
+        event,
+        shared_memories,
+        &[],
+        false,
     )
 }
 
@@ -6992,5 +7112,163 @@ mod tests {
             Some(json!({"action": {"type": "hug", "response": "accept"}})),
         ];
         assert!(effects_from_metadata(&rows).is_empty());
+    }
+
+    // ─── The `emotional` tone (spec 2026-11-12-chat-tone-emotional-design.md) ───
+
+    fn emotional_traits() -> Vec<PromptTrait> {
+        vec![PromptTrait {
+            tag: "t".into(),
+            text: "TRAIT-TEXT".into(),
+        }]
+    }
+
+    fn emotional(reply_mode: Option<ReplyMode>, shared: Option<&str>) -> String {
+        build_emotional_prompt(
+            &fixture_persona(),
+            reply_mode,
+            Some("白衬衫"),
+            &emotional_traits(),
+            Some(&WorldContext {
+                digest: "WORLD-DIGEST".into(),
+                fragments: vec![],
+            }),
+            Some(&StoriesContext {
+                digest: "STORY-DIGEST".into(),
+                episodes: vec![],
+            }),
+            None,
+            None,
+            &NowContext::default(),
+            Some("微醺"),
+            Some("饿了"),
+            None,
+            shared,
+        )
+    }
+
+    #[test]
+    fn emotional_prompt_drops_the_conclusions_and_the_profile() {
+        let p = emotional(None, None);
+        for gone in [
+            "[user_profile]",
+            "刚认识",
+            "[relationship]",
+            "[mood]",
+            "[feelings]",
+            "[inner_state]",
+            "[emotional_context]",
+            "[this_turn]",
+            "[reactions]",
+        ] {
+            assert!(!p.contains(gone), "{gone} must not render: {p}");
+        }
+    }
+
+    #[test]
+    fn emotional_prompt_keeps_persona_state_world_and_traits() {
+        let p = emotional(None, Some("- 2026-11-01：EPISODE-A"));
+        for kept in [
+            "[backstory]",
+            "[speech_style]",
+            "[additional_guidance]\n- TRAIT-TEXT",
+            "[shared_memories]\n- 2026-11-01：EPISODE-A",
+            "WORLD-DIGEST",
+            "STORY-DIGEST",
+            "- 此刻的穿着：白衬衫",
+            "- 身上还带着：微醺",
+            "- 此刻的需要：饿了",
+            "[now]",
+            "[iron_rules",
+            "[output]",
+        ] {
+            assert!(p.contains(kept), "{kept} must render: {p}");
+        }
+        assert!(emotional(None, None).contains("[shared_memories]\n（还没有专属记忆，慢慢来）"));
+    }
+
+    #[test]
+    fn emotional_prompt_length_is_the_lowest_tier_in_every_mode() {
+        for mode in [
+            None,
+            Some(ReplyMode::Listen),
+            Some(ReplyMode::Follow),
+            Some(ReplyMode::Ask),
+            Some(ReplyMode::Judge),
+        ] {
+            let p = emotional(mode, None);
+            assert!(
+                p.contains("[reply_length]\n最多 1 句，不超过 40 字"),
+                "{mode:?}: {p}"
+            );
+            assert!(p.contains(rule_one(mode)), "rule ① follows the mode: {mode:?}");
+        }
+    }
+
+    /// Everything ahead of the first block the tone changes is byte-identical
+    /// to the default prompt, so the two share their cache prefix.
+    #[test]
+    fn emotional_prompt_shares_the_default_prefix() {
+        let e = emotional(None, None);
+        let d = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            &[],
+            None,
+            None,
+            &emotional_traits(),
+            AffinityScope::default(),
+            &[],
+            None,
+            None,
+            None,
+            None,
+            TurnNudges::default(),
+            &NowContext::default(),
+            None,
+            None,
+            None,
+            None,
+            &[],
+        );
+        let cut = d.find("[user_profile]").expect("the default prompt has the block");
+        assert_eq!(&e[..cut], &d[..cut]);
+        assert!(e[cut..].starts_with("[shared_memories]"), "{}", &e[cut..]);
+    }
+
+    #[test]
+    fn emotional_prompt_renders_the_quote() {
+        let q = quoted("assistant", "QUOTED-LINE", 5);
+        let p = build_emotional_prompt(
+            &fixture_persona(),
+            None,
+            None,
+            &[],
+            None,
+            None,
+            Some(&q),
+            None,
+            &NowContext::default(),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(p.contains("[quote]") && p.contains("QUOTED-LINE"), "{p}");
+    }
+
+    #[test]
+    fn persona_moody_reads_three_states() {
+        let with = |art: serde_json::Value| {
+            let mut p = fixture_persona();
+            p.genome.art_metadata = art;
+            persona_moody(&p)
+        };
+        assert_eq!(with(serde_json::json!({})), None);
+        assert_eq!(with(serde_json::json!({"moody": true})), Some(true));
+        assert_eq!(with(serde_json::json!({"moody": false})), Some(false));
+        assert_eq!(with(serde_json::json!({"moody": "true"})), None);
     }
 }
