@@ -40,7 +40,9 @@ use ulid::Ulid;
 use uuid::Uuid;
 
 use crate::error::AppError;
-use crate::pipeline::handlers::{build_reply_request, load_effects, CHAT_TASK};
+use crate::pipeline::handlers::{
+    build_emotional_system_request, build_reply_request, load_effects, CHAT_TASK,
+};
 use crate::pipeline::stream::{
     build_delegated_image_marker, build_delegated_image_prompt_for, build_final_frame,
     build_image_request_frame, error_frame_fields_from_last, hop_display, recent_transcript,
@@ -458,6 +460,9 @@ struct Prepared {
     chat_req: eros_engine_llm::openrouter::ChatRequest,
     plan: ActionPlan,
     injected_tags: Vec<String>,
+    /// `Some(Emotional)` on an event message written in the `emotional`
+    /// tone, stored as the row's `metadata.tone`; `None` otherwise.
+    tone: Option<eros_engine_core::tone::Tone>,
 }
 
 /// What `store` wrote. `row` is `None` when the insert yielded: for a
@@ -549,21 +554,42 @@ async fn prepare(state: &AppState, g: &Greeting) -> Result<Prepared, AppError> {
             scare.as_ref(),
         ),
     };
-    let (mut chat_req, injected_tags) = build_reply_request(
-        state,
-        &input,
-        &plan,
-        g.session_id,
-        g.user_id,
-        g.instance_id,
-        Uuid::nil(),
-        &g.now,
-        false,
-        None,
-        None,
-        Some(&event_lines),
-    )
-    .await?;
+    // A listed event kind speaks in the `emotional` tone while the
+    // deployment has the tone on (spec
+    // 2026-11-12-emotional-event-messages-design.md §3): the system prompt
+    // alone, and the cue below as the one user message.
+    let emotional = state.model_config.tone_emotional_probability() > 0.0
+        && matches!(&g.occasion, Occasion::Event { kind, .. } if kind.speaks_emotionally());
+    let (mut chat_req, injected_tags) = if emotional {
+        build_emotional_system_request(
+            state,
+            &input,
+            &plan,
+            g.user_id,
+            g.instance_id,
+            &g.now,
+            None,
+            None,
+            Some(&event_lines),
+        )
+        .await?
+    } else {
+        build_reply_request(
+            state,
+            &input,
+            &plan,
+            g.session_id,
+            g.user_id,
+            g.instance_id,
+            Uuid::nil(),
+            &g.now,
+            false,
+            None,
+            None,
+            Some(&event_lines),
+        )
+        .await?
+    };
     chat_req.messages.push(WireMessage {
         role: "user".into(),
         content: g
@@ -575,6 +601,7 @@ async fn prepare(state: &AppState, g: &Greeting) -> Result<Prepared, AppError> {
         chat_req,
         plan,
         injected_tags,
+        tone: emotional.then_some(eros_engine_core::tone::Tone::Emotional),
     })
 }
 
@@ -680,6 +707,9 @@ async fn store(
         "prompt_traits".into(),
         serde_json::json!(prep.injected_tags),
     );
+    if let Some(t) = prep.tone {
+        metadata.insert("tone".into(), t.as_str().into());
+    }
     metadata.insert(
         "memory_scope".into(),
         serde_json::to_value(g.memory_scope).expect("MemoryScope serializes"),

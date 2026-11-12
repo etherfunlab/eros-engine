@@ -357,6 +357,32 @@ impl EventKind {
         }
     }
 
+    /// Whether the message this kind sends when it starts is written in the
+    /// `emotional` tone, when the deployment has the tone on (spec
+    /// 2026-11-12-emotional-event-messages-design.md §2).
+    pub fn speaks_emotionally(self) -> bool {
+        use EventKind::*;
+        matches!(
+            self,
+            Quarrel
+                | ScoldedBySuperior
+                | ScoldedSuperior
+                | GotHit
+                | HitSomeone
+                | PoliceEncounter
+                | ExWantsBack
+                | Irritable
+                | WantToQuitJob
+                | Unwell
+                | Sick
+                | Period
+                | SuddenDesire
+                | Drinking
+                | SmokingWeed
+                | JustHaveSex
+        )
+    }
+
     /// A kind whose message can carry her picture.
     pub fn is_photo(self) -> bool {
         matches!(self, EventKind::TakingSelfie | EventKind::Strip)
@@ -2245,6 +2271,32 @@ mod tests {
             for k in EventKind::ALL.into_iter().chain(EventKind::SPECIAL) {
                 assert_eq!(kinds.contains(&k), k.is_offline(&traits), "{k:?}");
             }
+        }
+    }
+
+    #[test]
+    fn sixteen_kinds_speak_emotionally() {
+        let listed = [
+            Quarrel,
+            ScoldedBySuperior,
+            ScoldedSuperior,
+            GotHit,
+            HitSomeone,
+            PoliceEncounter,
+            ExWantsBack,
+            Irritable,
+            WantToQuitJob,
+            Unwell,
+            Sick,
+            Period,
+            SuddenDesire,
+            Drinking,
+            SmokingWeed,
+            JustHaveSex,
+        ];
+        assert_eq!(listed.len(), 16);
+        for k in EventKind::ALL.into_iter().chain(EventKind::SPECIAL) {
+            assert_eq!(k.speaks_emotionally(), listed.contains(&k), "{k:?}");
         }
     }
 

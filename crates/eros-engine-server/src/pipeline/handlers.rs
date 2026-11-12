@@ -1413,41 +1413,38 @@ pub(crate) async fn build_reply_request_with(
     ))
 }
 
-/// The reply request of an `emotional` turn (spec
+/// The `emotional` request without its user line (spec
 /// 2026-11-12-chat-tone-emotional-design.md §4): the least-hint system prompt
-/// and the driving user message, with no earlier row of the session. It reads
-/// no profile, recalls no memory and makes no embedding call; what it shows
-/// of the relationship is its latest episodes.
+/// alone. It reads no profile, recalls no memory and makes no embedding call;
+/// what it shows of the relationship is its latest episodes. The caller adds
+/// the one user message: the driving line of a chat turn, or an event's cue
+/// (spec 2026-11-12-emotional-event-messages-design.md §4).
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn build_emotional_reply_request(
+pub(crate) async fn build_emotional_system_request(
     state: &AppState,
     input: &DecisionInput,
     plan: &ActionPlan,
-    session_id: Uuid,
     user_id: Uuid,
     instance_id: Uuid,
-    user_message_id: Uuid,
     now: &crate::prompt::NowContext,
     body_state: Option<&str>,
     needs: Option<&str>,
     event: Option<&crate::prompt::EventLines>,
 ) -> Result<(ChatRequest, Vec<String>), AppError> {
-    let (quote, tier, requested_traits, memory_scope, content) = match &input.event {
+    let (quote, tier, requested_traits, memory_scope) = match &input.event {
         Event::UserMessage {
             quote,
             tier,
             prompt_traits,
             memory_scope,
-            content,
             ..
         } => (
             quote.as_ref(),
             tier.as_deref(),
             prompt_traits.as_slice(),
             *memory_scope,
-            content.as_str(),
         ),
-        _ => (None, None, &[][..], MemoryScope::default(), ""),
+        _ => (None, None, &[][..], MemoryScope::default()),
     };
 
     let resolved = state.model_config.resolve(CHAT_TASK, tier);
@@ -1511,6 +1508,52 @@ pub(crate) async fn build_emotional_reply_request(
         shared_memories.as_deref(),
     );
 
+    let injected_tags: Vec<String> = kept_traits.iter().map(|t| t.tag.clone()).collect();
+    Ok((
+        assemble_chat_request(
+            resolved,
+            system_prompt,
+            Vec::new(),
+            audit_from_event(&input.event),
+        ),
+        injected_tags,
+    ))
+}
+
+/// The reply request of an `emotional` turn (spec
+/// 2026-11-12-chat-tone-emotional-design.md §4): the system-only request of
+/// [`build_emotional_system_request`] and the driving user message, with no
+/// earlier row of the session.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn build_emotional_reply_request(
+    state: &AppState,
+    input: &DecisionInput,
+    plan: &ActionPlan,
+    session_id: Uuid,
+    user_id: Uuid,
+    instance_id: Uuid,
+    user_message_id: Uuid,
+    now: &crate::prompt::NowContext,
+    body_state: Option<&str>,
+    needs: Option<&str>,
+    event: Option<&crate::prompt::EventLines>,
+) -> Result<(ChatRequest, Vec<String>), AppError> {
+    let (mut req, injected_tags) = build_emotional_system_request(
+        state,
+        input,
+        plan,
+        user_id,
+        instance_id,
+        now,
+        body_state,
+        needs,
+        event,
+    )
+    .await?;
+    let content = match &input.event {
+        Event::UserMessage { content, .. } => content.as_str(),
+        _ => "",
+    };
     // The driving row in its model-facing form (image preamble included). A
     // driving row that is not in this session falls back to the event's text,
     // so the request never goes out without the user's line.
@@ -1529,16 +1572,12 @@ pub(crate) async fn build_emotional_reply_request(
         });
     }
 
-    let injected_tags: Vec<String> = kept_traits.iter().map(|t| t.tag.clone()).collect();
-    Ok((
-        assemble_chat_request(
-            resolved,
-            system_prompt,
-            injected,
-            audit_from_event(&input.event),
-        ),
-        injected_tags,
-    ))
+    req.messages
+        .extend(injected.into_iter().map(|m| ChatMessage {
+            role: m.role,
+            content: m.text,
+        }));
+    Ok((req, injected_tags))
 }
 
 #[cfg(test)]
@@ -5550,5 +5589,80 @@ mod tests {
             "{}",
             off.messages[0].content
         );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn emotional_system_request_holds_the_system_message_alone(pool: PgPool) {
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, owner).await;
+        let session_id = make_session(&pool, owner, Some(instance_id)).await;
+        emotional_row(&pool, session_id, "user", "早", 0.0, None).await;
+        let driving = emotional_row(&pool, session_id, "user", "今天好累", 1.0, None).await;
+
+        let state = crate::routes::companion::test_state(pool.clone());
+        let full = emotional_request(
+            &state,
+            session_id,
+            owner,
+            instance_id,
+            driving,
+            "今天好累",
+            MemoryScope::default(),
+        )
+        .await;
+
+        let plan = ActionPlan {
+            action_type: eros_engine_core::types::ActionType::ReplyText,
+            reply_style: eros_engine_core::types::ReplyStyle::Neutral,
+            affinity_deltas: Default::default(),
+            energy_cost: 0.0,
+            context_hints: vec!["JUDGE-HINT".into()],
+            reply_mode: None,
+            nudges: Default::default(),
+            clothing: None,
+            image_caption: None,
+            image_ref: eros_engine_core::types::ImageRef::Face,
+            aspect_ratio: None,
+            action_response: None,
+        };
+        let input = DecisionInput {
+            event: Event::UserMessage {
+                content: "今天好累".into(),
+                message_id: driving,
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: MemoryScope::default(),
+                affinity_scope: Default::default(),
+                quote: Default::default(),
+                action: None,
+                outfit: None,
+            },
+            affinity: ladder_test_affinity(session_id, owner, instance_id),
+            persona: ladder_test_persona(instance_id, owner),
+            signals: eros_engine_core::types::ConversationSignals {
+                message_count: 2,
+                hours_since_last_message: 0.1,
+                ghost_streak: 0,
+                hours_since_last_ghost: None,
+            },
+        };
+        let (system_only, _tags) = build_emotional_system_request(
+            &state,
+            &input,
+            &plan,
+            owner,
+            instance_id,
+            &crate::prompt::NowContext::default(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("build_emotional_system_request succeeds");
+
+        assert_eq!(system_only.messages.len(), 1, "{:?}", system_only.messages);
+        assert_eq!(system_only.messages[0].role, "system");
+        assert_eq!(system_only.messages[0].content, full.messages[0].content);
     }
 }
