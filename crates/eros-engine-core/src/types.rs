@@ -155,6 +155,22 @@ pub enum UserAction {
 }
 
 impl UserAction {
+    /// Whether her reply to this action is written in the `emotional` tone,
+    /// accepted or refused, when the deployment has the tone on (spec
+    /// 2026-11-12-emotional-action-replies-design.md §2).
+    pub fn speaks_emotionally(&self) -> bool {
+        matches!(
+            self,
+            UserAction::FrenchKiss
+                | UserAction::Tease
+                | UserAction::HugFromBehind
+                | UserAction::Touch
+                | UserAction::Strip
+                | UserAction::Threaten
+                | UserAction::Tip { .. }
+        )
+    }
+
     /// The line a refusal of this action drops: handing something over or
     /// giving something to keep is friendship, every physical gesture is
     /// romance. A refused tip drops nothing (spec 2026-10-11 §6), nor does
@@ -418,6 +434,49 @@ pub struct DecisionInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seven_actions_speak_emotionally() {
+        let every = [
+            UserAction::Give {
+                item: GivenItem::Food,
+                name: None,
+                quantity: 1,
+            },
+            UserAction::Kiss,
+            UserAction::Hug,
+            UserAction::Touch,
+            UserAction::Lick,
+            UserAction::FrenchKiss,
+            UserAction::HugFromBehind,
+            UserAction::Tease,
+            UserAction::Pat,
+            UserAction::Photo,
+            UserAction::Bluff,
+            UserAction::Threaten,
+            UserAction::Trick,
+            UserAction::Strip,
+            UserAction::Custom { text: "x".into() },
+            UserAction::Tip { amount_usd: 5.0 },
+            UserAction::Gift {
+                kind: ItemKind::Item,
+                name: "x".into(),
+            },
+        ];
+        let listed: Vec<&UserAction> = every.iter().filter(|a| a.speaks_emotionally()).collect();
+        assert_eq!(
+            listed,
+            [
+                &UserAction::Touch,
+                &UserAction::FrenchKiss,
+                &UserAction::HugFromBehind,
+                &UserAction::Tease,
+                &UserAction::Threaten,
+                &UserAction::Strip,
+                &UserAction::Tip { amount_usd: 5.0 },
+            ]
+        );
+    }
 
     #[test]
     fn event_user_message_defaults_prompt_traits_to_empty_vec() {
