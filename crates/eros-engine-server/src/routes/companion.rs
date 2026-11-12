@@ -1470,6 +1470,44 @@ pub(crate) mod testutil {
         )
     }
 
+    /// The one-hour date the instance's invitation in `session_id` opened, its
+    /// event starting at `at`: the date runs until `at` plus an hour.
+    pub(crate) async fn seed_date(
+        pool: &PgPool,
+        session_id: Uuid,
+        user_id: Uuid,
+        instance_id: Uuid,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> eros_engine_store::activity::ActivityRecord {
+        let invitation: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata) \
+             VALUES ($1, 'user', '去海边走走吧', $2) RETURNING id",
+        )
+        .bind(session_id)
+        .bind(json!({"action": {
+            "type": "date", "duration": "short", "place": "海边", "content": "散步"
+        }}))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        eros_engine_store::activity::ActivityRepo { pool }
+            .accept(
+                &eros_engine_store::activity::NewActivity {
+                    session_id,
+                    user_id,
+                    instance_id,
+                    message_id: invitation,
+                    duration: eros_engine_core::types::DateDuration::Short,
+                    place: "海边",
+                    content: "散步",
+                },
+                at,
+            )
+            .await
+            .unwrap()
+            .expect("the date opened")
+    }
+
     /// A v1 card sealed under `key`, as a downstream sends it.
     pub(crate) fn sealed_card(
         key: &[u8; 32],

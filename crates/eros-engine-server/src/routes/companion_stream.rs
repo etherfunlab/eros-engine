@@ -39,6 +39,8 @@ const MAX_IMAGE_URL_LEN: usize = 2048;
 const MAX_TIP_USD: f64 = 1_000_000_000.0;
 const MAX_ACTION_NAME_CHARS: usize = 32;
 const MAX_ACTION_TEXT_CHARS: usize = 100;
+const MAX_DATE_PLACE_CHARS: usize = 40;
+const MAX_DATE_CONTENT_CHARS: usize = 120;
 const MAX_ACTION_QUANTITY: u32 = 99;
 /// An item name or an outfit (spec 2026-10-12-persona-items-and-gift-design.md §3.2).
 pub(crate) const MAX_ITEM_NAME_CHARS: usize = 64;
@@ -165,6 +167,7 @@ pub enum UserActionKind {
     Custom,
     Tip,
     Gift,
+    Date,
 }
 
 /// What a `give` action hands over. Consumables (`cigarette` through
@@ -278,11 +281,30 @@ impl From<eros_engine_core::types::ItemKind> for ItemKindDto {
     }
 }
 
+/// How long a `date` lasts: `short` is one hour, `mid` four.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DateDurationDto {
+    Short,
+    Mid,
+}
+
+impl From<DateDurationDto> for eros_engine_core::types::DateDuration {
+    fn from(d: DateDurationDto) -> Self {
+        match d {
+            DateDurationDto::Short => Self::Short,
+            DateDurationDto::Mid => Self::Mid,
+        }
+    }
+}
+
 /// An action the user does to the persona this turn, besides talking. The
 /// persona accepts or does not; a refusal costs the relationship one tier on
 /// the line the action touches (`give` and `gift` → bond, every physical or custom action →
 /// chemistry); a refused `tip`, `bluff`, `threaten` or `trick` costs nothing.
-/// An accepted `gift` joins the persona's items or wardrobe.
+/// An accepted `gift` joins the persona's items or wardrobe. A `date` asks her
+/// out; accepted, it runs in a session of its own for its `duration`, and
+/// nothing else is sent to the persona's text sessions meanwhile.
 #[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct UserActionDto {
     #[serde(rename = "type")]
@@ -312,6 +334,17 @@ pub struct UserActionDto {
     /// caller is the payment authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub amount_usd: Option<f64>,
+    /// `date` only, and required there: how long the date lasts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration: Option<DateDurationDto>,
+    /// `date` only, and required there: where, 1–40 chars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 40)]
+    pub place: Option<String>,
+    /// `date` only, and required there: what the two do, 1–120 chars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 120)]
+    pub content: Option<String>,
 }
 
 impl UserActionDto {
@@ -389,6 +422,16 @@ impl UserActionDto {
                         .ok_or("action.name is required for gift")?,
                     "action.name",
                 )?,
+            },
+            UserActionKind::Date => UserAction::Date {
+                duration: self
+                    .duration
+                    .ok_or("action.duration is required for date")?
+                    .into(),
+                place: free_text(self.place.as_deref(), "place", MAX_DATE_PLACE_CHARS)?
+                    .ok_or("action.place is required for date")?,
+                content: free_text(self.content.as_deref(), "content", MAX_DATE_CONTENT_CHARS)?
+                    .ok_or("action.content is required for date")?,
             },
         })
     }
@@ -683,6 +726,26 @@ pub(crate) async fn resolve_text_session(
     session_id: Uuid,
     user_id: Uuid,
 ) -> Result<(ChatSession, Uuid), AppError> {
+    resolve_session(state, session_id, user_id, false).await
+}
+
+/// [`resolve_text_session`] for the send routes, which also take a date's
+/// sub-session (`channel = 'activity'`); whether it may be sent to is
+/// [`crate::pipeline::activity::admit_send`]'s to say.
+pub(crate) async fn resolve_send_session(
+    state: &AppState,
+    session_id: Uuid,
+    user_id: Uuid,
+) -> Result<(ChatSession, Uuid), AppError> {
+    resolve_session(state, session_id, user_id, true).await
+}
+
+async fn resolve_session(
+    state: &AppState,
+    session_id: Uuid,
+    user_id: Uuid,
+    admit_activity: bool,
+) -> Result<(ChatSession, Uuid), AppError> {
     let chat_repo = ChatRepo { pool: &state.pool };
     let session = chat_repo.get_session(session_id).await?.ok_or_else(|| {
         AppError::StreamPre(StreamPreError {
@@ -710,7 +773,8 @@ pub(crate) async fn resolve_text_session(
     // (2026-08-11-voice-barge-in-interrupt-design.md). Those lookups now filter
     // `channel = 'voice'` themselves, so this is defence in depth on the
     // writing side rather than the only guard.
-    if session.channel != "text" {
+    let admitted = session.channel == "text" || (admit_activity && session.channel == "activity");
+    if !admitted {
         let user_message = match session.channel.as_str() {
             "voice" => "该会话是语音会话",
             "group" => "该会话是群聊",
@@ -747,7 +811,29 @@ pub(crate) async fn resolve_text_turn(
     user_id: Uuid,
     route: &'static str,
 ) -> Result<(ChatSession, CompanionPersona, Uuid), AppError> {
-    let (session, instance_id) = resolve_text_session(state, session_id, user_id).await?;
+    resolve_turn(state, session_id, user_id, route, false).await
+}
+
+/// [`resolve_text_turn`] for the send routes, which also take a date's
+/// sub-session; see [`resolve_send_session`].
+pub(crate) async fn resolve_send_turn(
+    state: &AppState,
+    session_id: Uuid,
+    user_id: Uuid,
+    route: &'static str,
+) -> Result<(ChatSession, CompanionPersona, Uuid), AppError> {
+    resolve_turn(state, session_id, user_id, route, true).await
+}
+
+async fn resolve_turn(
+    state: &AppState,
+    session_id: Uuid,
+    user_id: Uuid,
+    route: &'static str,
+    admit_activity: bool,
+) -> Result<(ChatSession, CompanionPersona, Uuid), AppError> {
+    let (session, instance_id) =
+        resolve_session(state, session_id, user_id, admit_activity).await?;
     match crate::byoc::load_instance(state, instance_id).await? {
         Some(LoadedInstance::Genome(persona)) => Ok((session, persona, instance_id)),
         Some(LoadedInstance::Byoc(_)) => Err(crate::byoc::unsupported(route)),
@@ -935,14 +1021,27 @@ pub async fn send_message_stream(
         )?)),
     };
 
-    let (_session, instance_id) = resolve_text_session(&state, session_id, user_id).await?;
+    let (session, instance_id) = resolve_send_session(&state, session_id, user_id).await?;
     // The turn's persona: the genome's, or a BYOC instance's opened from the
     // request's card, before any row is written (spec 2026-10-16-byoc §6.2).
     // It travels in memory into the drive task and is never stored.
-    let persona = crate::byoc::load_instance(&state, instance_id)
+    let loaded = crate::byoc::load_instance(&state, instance_id)
         .await?
-        .ok_or_else(|| AppError::NotFound("instance not found".into()))?
-        .into_persona(req.character.as_deref())?;
+        .ok_or_else(|| AppError::NotFound("instance not found".into()))?;
+    let byoc = matches!(loaded, LoadedInstance::Byoc(_));
+    let persona = loaded.into_persona(req.character.as_deref())?;
+    // Who may send now (spec 2026-11-12-activity-sub-session-design.md §4.2,
+    // §5.3, §6.1): a failure writes nothing, and an ended date is settled
+    // before this turn does anything else.
+    crate::pipeline::activity::admit_send(
+        &state,
+        &session,
+        instance_id,
+        req.action.as_ref().and_then(|a| a.to_core().ok()).as_ref(),
+        byoc,
+        chrono::Utc::now(),
+    )
+    .await?;
     let chat_repo = ChatRepo { pool: &state.pool };
     // Acquire a stream slot. `StreamSlotGuard` is now `'static` (holds Arc),
     // so it can be moved into the SSE body below.
@@ -3887,6 +3986,371 @@ data: [DONE]\n\n";
             byok_bodies[0]
         );
     }
+
+    // ─── the date action, and who may send during a date ───────────
+
+    fn msg_id(n: u32) -> String {
+        format!("01JD{n:022}")
+    }
+
+    /// A send on the async route: an admitted turn is 202 with nothing generated.
+    fn async_send(session_id: Uuid, token: &str, body: Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(format!("/v2/comp/session/{session_id}/message/async"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    }
+
+    fn chat(n: u32) -> Value {
+        json!({"content": "hi", "client_msg_id": msg_id(n)})
+    }
+
+    fn invite(n: u32, place: &str, content: &str) -> Value {
+        json!({
+            "content": "",
+            "client_msg_id": msg_id(n),
+            "action": {"type": "date", "duration": "short", "place": place, "content": content},
+        })
+    }
+
+    /// A user, its instance and the instance's text session.
+    async fn home(pool: &PgPool) -> (Uuid, Uuid, Uuid) {
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(pool, user_id).await;
+        let session_id =
+            crate::routes::companion::testutil::seed_session(pool, user_id, instance_id).await;
+        (user_id, instance_id, session_id)
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn date_action_is_validated(pool: PgPool) {
+        use crate::routes::companion::testutil::{send_request, session_footprint};
+        let (user_id, _, session_id) = home(&pool).await;
+        let mut app = build_router(crate::routes::companion::test_state(pool.clone()));
+        let token = mint_jwt(user_id);
+
+        let bad = [
+            ("blank place", invite(1, "   ", "吃饭")),
+            ("place of 41 chars", invite(2, &"a".repeat(41), "吃饭")),
+            ("content of 121 chars", invite(3, "海边", &"a".repeat(121))),
+            (
+                "no duration",
+                json!({"content": "", "client_msg_id": msg_id(4),
+                       "action": {"type": "date", "place": "海边", "content": "吃饭"}}),
+            ),
+            (
+                "an unknown duration",
+                json!({"content": "", "client_msg_id": msg_id(5),
+                       "action": {"type": "date", "duration": "long", "place": "海边", "content": "吃饭"}}),
+            ),
+            ("a line break", invite(6, "海边", "吃饭\n喝酒")),
+        ];
+        for (why, body) in bad {
+            let (status, resp) = send_request(&mut app, async_send(session_id, &token, body)).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{why}: {resp}");
+            // An unknown duration never reaches the validator: the body fails
+            // to deserialize, a plain-text 422.
+            if why != "an unknown duration" {
+                assert_eq!(resp["code"], "unprocessable", "{why}: {resp}");
+            }
+        }
+        assert_eq!(session_footprint(&pool, session_id).await, (0, 0, 0));
+
+        // The limits themselves are accepted, counted in characters.
+        for (n, place, content) in [
+            (7, "a".repeat(40), "b".repeat(120)),
+            (8, "海".repeat(40), "饭".repeat(120)),
+        ] {
+            let (status, resp) = send_request(
+                &mut app,
+                async_send(session_id, &token, invite(n, &place, &content)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{place}: {resp}");
+            assert_eq!(resp["status"], "queued");
+        }
+        let (messages, queued, _) = session_footprint(&pool, session_id).await;
+        assert_eq!((messages, queued), (2, 2));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_date_in_a_voice_or_group_session_is_wrong_channel(pool: PgPool) {
+        use crate::routes::companion::testutil::{seed_group_session, send_request};
+        let (user_id, instance_id, _) = home(&pool).await;
+        let voice: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id, channel) \
+             VALUES ($1, $2, 'voice') RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let group = seed_group_session(&pool, user_id).await;
+        let mut app = build_router(crate::routes::companion::test_state(pool.clone()));
+        let token = mint_jwt(user_id);
+        for (n, session_id) in [(1, voice), (2, group)] {
+            let (status, resp) = send_request(
+                &mut app,
+                stream_send(session_id, &token, invite(n, "海边", "吃饭"), &[]),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT, "{resp}");
+            assert_eq!(resp["code"], "wrong_channel");
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_date_on_a_byoc_session_is_refused(pool: PgPool) {
+        use crate::routes::companion::testutil::{send_request, session_footprint};
+        let user_id = Uuid::new_v4();
+        let (session_id, key) = byoc_session(&pool, user_id).await;
+        let mut app = build_router(byoc_state(pool.clone(), "http://127.0.0.1:1"));
+        let mut body = invite(1, "海边", "吃饭");
+        body["character"] = json!(marker_card(&key));
+        let (status, resp) = send_request(
+            &mut app,
+            stream_send(session_id, &mint_jwt(user_id), body, &WITH_BYOC_SECRET),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+        assert_eq!(resp["code"], "byoc_unsupported");
+        assert_eq!(session_footprint(&pool, session_id).await, (0, 0, 0));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_date_while_a_choice_waits_is_refused(pool: PgPool) {
+        use crate::routes::companion::testutil::{seed_session, send_request, session_footprint};
+        let (user_id, instance_id, session_id) = home(&pool).await;
+        // The question waits in another session of the instance.
+        let other = seed_session(&pool, user_id, instance_id).await;
+        sqlx::query(
+            "INSERT INTO engine.life_choices (session_id, kind, tier_gap, asked_at) \
+             VALUES ($1, 'ask_for_space', 3, now() - interval '1 hour')",
+        )
+        .bind(other)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut app = build_router(crate::routes::companion::test_state(pool.clone()));
+        let token = mint_jwt(user_id);
+
+        let (status, resp) = send_request(
+            &mut app,
+            async_send(session_id, &token, invite(1, "海边", "吃饭")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{resp}");
+        assert_eq!(resp["code"], "choice_pending");
+        assert_eq!(resp["user_message"], "对方还在等你回答之前的事");
+        assert_eq!(session_footprint(&pool, session_id).await, (0, 0, 0));
+
+        // Only the invitation waits: she can still be talked to.
+        let (status, resp) = send_request(&mut app, async_send(session_id, &token, chat(2))).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{resp}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn main_chat_sends_are_refused_during_a_date(pool: PgPool) {
+        use crate::routes::companion::testutil::{
+            seed_date, seed_session, send_request, session_footprint,
+        };
+        let (user_id, instance_id, session_id) = home(&pool).await;
+        let second = seed_session(&pool, user_id, instance_id).await;
+        let voice: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id, channel) \
+             VALUES ($1, $2, 'voice') RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        seed_date(&pool, session_id, user_id, instance_id, chrono::Utc::now()).await;
+        let before = (
+            session_footprint(&pool, session_id).await,
+            session_footprint(&pool, second).await,
+        );
+        let mut app = build_router(crate::routes::companion::test_state(pool.clone()));
+        let token = mint_jwt(user_id);
+
+        for (n, to) in [(1, session_id), (2, second)] {
+            let (status, resp) = send_request(&mut app, async_send(to, &token, chat(n))).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{resp}");
+            assert_eq!(resp["code"], "activity_in_progress");
+            assert_eq!(resp["user_message"], "你们正在约会中");
+            let (status, resp) =
+                send_request(&mut app, stream_send(to, &token, chat(n + 10), &[])).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{resp}");
+            assert_eq!(resp["code"], "activity_in_progress");
+        }
+        assert_eq!(
+            before,
+            (
+                session_footprint(&pool, session_id).await,
+                session_footprint(&pool, second).await
+            ),
+            "a refused send writes nothing"
+        );
+
+        // A voice session is not paused: the text route turns it away for its
+        // channel, not for the date.
+        let (status, resp) = send_request(&mut app, async_send(voice, &token, chat(3))).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{resp}");
+        assert_eq!(resp["code"], "wrong_channel");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_sub_session_accepts_sends_only_while_the_date_runs(pool: PgPool) {
+        use crate::routes::companion::testutil::{seed_date, send_request, session_footprint};
+        let mut app = build_router(crate::routes::companion::test_state(pool.clone()));
+
+        // Running: a plain send is queued; a second invitation is refused.
+        let (user_id, instance_id, session_id) = home(&pool).await;
+        let token = mint_jwt(user_id);
+        let date = seed_date(&pool, session_id, user_id, instance_id, chrono::Utc::now()).await;
+        let (status, resp) =
+            send_request(&mut app, async_send(date.sub_session_id, &token, chat(1))).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{resp}");
+        assert_eq!(resp["status"], "queued");
+        assert_eq!(
+            session_footprint(&pool, date.sub_session_id).await,
+            (1, 1, 0)
+        );
+        let (status, resp) = send_request(
+            &mut app,
+            async_send(date.sub_session_id, &token, invite(2, "海边", "吃饭")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{resp}");
+        assert_eq!(resp["code"], "activity_in_progress");
+        assert_eq!(
+            session_footprint(&pool, date.sub_session_id).await,
+            (1, 1, 0)
+        );
+
+        // Over on the clock: nothing is taken, and the send does not settle it.
+        let (user_id, instance_id, session_id) = home(&pool).await;
+        let token = mint_jwt(user_id);
+        let over = seed_date(
+            &pool,
+            session_id,
+            user_id,
+            instance_id,
+            chrono::Utc::now() - chrono::Duration::hours(3),
+        )
+        .await;
+        let (status, resp) =
+            send_request(&mut app, async_send(over.sub_session_id, &token, chat(3))).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{resp}");
+        assert_eq!(resp["code"], "activity_ended");
+        assert_eq!(resp["user_message"], "这次约会已经结束");
+        assert_eq!(
+            session_footprint(&pool, over.sub_session_id).await,
+            (0, 0, 0)
+        );
+        let settled: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT settled_at FROM engine.activities WHERE id = $1")
+                .bind(over.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(settled, None);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_main_chat_send_after_the_clock_settles_then_runs(pool: PgPool) {
+        use crate::pipeline::activity::tests::{
+            judge_mock, judged, scene, with_judge, JUDGE_REPLY,
+        };
+        use crate::routes::companion::testutil::send_request;
+        // One judge call: the second send finds the date already settled.
+        let mock = judge_mock(judged(JUDGE_REPLY), 1).await;
+        let s = scene(
+            with_judge(crate::routes::companion::test_state(pool.clone()), &mock),
+            2,
+        )
+        .await;
+        // The date ended two hours ago on this clock, whatever it reads now.
+        sqlx::query(
+            "UPDATE engine.persona_events \
+                SET started_at = now() - interval '3 hours', ends_at = now() - interval '2 hours' \
+              WHERE id = $1",
+        )
+        .bind(s.activity.event_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut app = build_router(s.state.clone());
+        let token = mint_jwt(s.user_id);
+
+        let (status, resp) =
+            send_request(&mut app, async_send(s.session_id, &token, chat(1))).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{resp}");
+        let turn: Uuid = resp["user_message_id"].as_str().unwrap().parse().unwrap();
+
+        let settled_at: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT settled_at FROM engine.activities WHERE id = $1")
+                .bind(s.activity.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(settled_at.is_some(), "the send settled the date");
+        // Settled first: the date's affinity row predates the turn's own row.
+        let (settled_row, turn_row): (
+            chrono::DateTime<chrono::Utc>,
+            chrono::DateTime<chrono::Utc>,
+        ) = sqlx::query_as(
+            "SELECT (SELECT e.created_at FROM engine.companion_affinity_events e \
+                           JOIN engine.companion_affinity a ON a.id = e.affinity_id \
+                          WHERE a.session_id = $1 AND e.event_type = 'activity'), \
+                        (SELECT sent_at FROM engine.chat_messages WHERE id = $2)",
+        )
+        .bind(s.session_id)
+        .bind(turn)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(settled_row < turn_row, "{settled_row} < {turn_row}");
+
+        // Settled once: the next send is an ordinary turn.
+        let (status, resp) =
+            send_request(&mut app, async_send(s.session_id, &token, chat(2))).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{resp}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_send_while_the_ended_date_is_being_settled_is_refused(pool: PgPool) {
+        use crate::routes::companion::testutil::{seed_date, send_request, session_footprint};
+        let (user_id, instance_id, session_id) = home(&pool).await;
+        let date = seed_date(
+            &pool,
+            session_id,
+            user_id,
+            instance_id,
+            chrono::Utc::now() - chrono::Duration::hours(3),
+        )
+        .await;
+        // Another caller holds the claim.
+        sqlx::query("UPDATE engine.activities SET settle_claimed_at = now() WHERE id = $1")
+            .bind(date.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let before = session_footprint(&pool, session_id).await;
+        let mut app = build_router(crate::routes::companion::test_state(pool.clone()));
+        let (status, resp) = send_request(
+            &mut app,
+            async_send(session_id, &mint_jwt(user_id), chat(1)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{resp}");
+        assert_eq!(resp["code"], "activity_settling");
+        assert_eq!(session_footprint(&pool, session_id).await, before);
+    }
 }
 
 #[cfg(test)]
@@ -4091,6 +4555,9 @@ mod validate_payload_tests {
             quantity,
             text: None,
             amount_usd: None,
+            duration: None,
+            place: None,
+            content: None,
         }
     }
 
@@ -4103,6 +4570,9 @@ mod validate_payload_tests {
             quantity: None,
             text: None,
             amount_usd: None,
+            duration: None,
+            place: None,
+            content: None,
         }
     }
 
@@ -4307,6 +4777,9 @@ mod validate_payload_tests {
             quantity: None,
             text: None,
             amount_usd: amount,
+            duration: None,
+            place: None,
+            content: None,
         }
     }
 
@@ -4336,6 +4809,9 @@ mod validate_payload_tests {
             quantity: None,
             text: None,
             amount_usd: None,
+            duration: None,
+            place: None,
+            content: None,
         }
     }
 
@@ -4466,5 +4942,92 @@ mod validate_payload_tests {
             meta["action"],
             serde_json::json!({"type": "tip", "amount_usd": 20.0})
         );
+    }
+
+    // ─── the date action, and who may send during a date ───────────
+
+    fn date_dto(duration: Option<DateDurationDto>, place: &str, content: &str) -> UserActionDto {
+        UserActionDto {
+            duration,
+            place: Some(place.into()),
+            content: Some(content.into()),
+            ..bare(UserActionKind::Date)
+        }
+    }
+
+    #[test]
+    fn a_date_converts_with_trimmed_place_and_content() {
+        assert_eq!(
+            date_dto(
+                Some(DateDurationDto::Mid),
+                "  海边的餐厅 ",
+                " 吃一顿大餐\u{3000}"
+            )
+            .to_core()
+            .unwrap(),
+            UserAction::Date {
+                duration: eros_engine_core::types::DateDuration::Mid,
+                place: "海边的餐厅".into(),
+                content: "吃一顿大餐".into(),
+            }
+        );
+        let dto: UserActionDto = serde_json::from_value(serde_json::json!({
+            "type": "date", "duration": "short", "place": "公园", "content": "散步"
+        }))
+        .unwrap();
+        assert_eq!(dto.kind, UserActionKind::Date);
+        assert_eq!(dto.duration, Some(DateDurationDto::Short));
+    }
+
+    #[test]
+    fn a_date_needs_its_three_fields_within_bounds() {
+        let ok = |place: &str, content: &str| {
+            date_dto(Some(DateDurationDto::Short), place, content)
+                .to_core()
+                .is_ok()
+        };
+        assert!(ok("p", "c"));
+        // Characters, not bytes: 40 and 120 CJK characters are 120 and 360 bytes.
+        assert!(ok(&"海".repeat(40), &"饭".repeat(120)));
+        assert!(!ok(&"海".repeat(41), "c"), "place over 40 chars");
+        assert!(!ok("p", &"饭".repeat(121)), "content over 120 chars");
+        assert!(!ok("   ", "c"), "blank place");
+        assert!(!ok("p", "\u{3000} "), "blank content");
+        assert!(date_dto(None, "p", "c").to_core().is_err(), "no duration");
+        let mut no_place = date_dto(Some(DateDurationDto::Short), "p", "c");
+        no_place.place = None;
+        assert!(no_place.to_core().is_err(), "no place");
+        let mut no_content = date_dto(Some(DateDurationDto::Short), "p", "c");
+        no_content.content = None;
+        assert!(no_content.to_core().is_err(), "no content");
+    }
+
+    /// `place` and `content` reach the judge's line, the `[now]` line and the
+    /// journal unescaped, so a line break or any control character is refused.
+    #[test]
+    fn a_date_refuses_control_characters_in_place_and_content() {
+        for bad in ["a\nb", "a\r\nb", "a\tb", "a\u{7}b", "a\u{0}b", "a\u{2028}b"] {
+            let dur = Some(DateDurationDto::Short);
+            assert!(date_dto(dur, bad, "c").to_core().is_err(), "place {bad:?}");
+            assert!(
+                date_dto(dur, "p", bad).to_core().is_err(),
+                "content {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_date_is_stored_on_the_invitation_row_in_the_engines_shape() {
+        let mut r = base();
+        r.content = String::new();
+        r.action = Some(date_dto(Some(DateDurationDto::Mid), "海边", "散步"));
+        let meta = build_user_row_metadata(&r, None).unwrap();
+        let want = serde_json::json!({"type": "date", "duration": "mid", "place": "海边", "content": "散步"});
+        assert_eq!(meta["action"], want);
+        let view =
+            UserActionView::from_metadata_action(&meta["action"]).expect("history parses it");
+        assert_eq!(view.action.kind, UserActionKind::Date);
+        assert_eq!(view.action.duration, Some(DateDurationDto::Mid));
+        assert_eq!(view.action.place.as_deref(), Some("海边"));
     }
 }

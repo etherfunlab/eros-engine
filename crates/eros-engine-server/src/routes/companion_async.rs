@@ -25,7 +25,7 @@ use crate::routes::companion::{
     validate_llm_audit, validate_prompt_traits, LlmAuditDto, PromptTraitDto,
 };
 use crate::routes::companion_stream::{
-    build_user_row_metadata, resolve_quote, resolve_text_turn, validate_image_capability,
+    build_user_row_metadata, resolve_quote, resolve_send_turn, validate_image_capability,
     validate_payload, AffinityScopeDto, ImageReplyParams, StreamPreErrorBody, StreamSendRequest,
 };
 use crate::state::AppState;
@@ -171,8 +171,20 @@ pub async fn send_message_async(
         })
     })?;
 
-    let (_session, _persona, _instance_id) =
-        resolve_text_turn(&state, session_id, user_id, "the async send route").await?;
+    let (session, _persona, instance_id) =
+        resolve_send_turn(&state, session_id, user_id, "the async send route").await?;
+    // Who may send now: the same admission as the stream route. A BYOC
+    // instance is refused above, so `byoc` is false (spec
+    // 2026-11-12-activity-sub-session-design.md §4.2, §5.3).
+    crate::pipeline::activity::admit_send(
+        &state,
+        &session,
+        instance_id,
+        req.action.as_ref().and_then(|a| a.to_core().ok()).as_ref(),
+        false,
+        chrono::Utc::now(),
+    )
+    .await?;
 
     let chat_repo = ChatRepo { pool: &state.pool };
     let quote = resolve_quote(&chat_repo, session_id, req.reply_to_message_id).await?;
@@ -279,8 +291,8 @@ mod tests {
 
     use crate::routes::companion::test_state;
     use crate::routes::companion::testutil::{
-        build_router, mint_test_jwt, seed_byoc_session, seed_genome, seed_instance, seed_session,
-        session_footprint,
+        build_router, mint_test_jwt, seed_byoc_session, seed_date, seed_genome, seed_instance,
+        seed_session, session_footprint,
     };
 
     fn async_uri(session_id: Uuid) -> String {
@@ -691,6 +703,9 @@ mod tests {
                 quantity: None,
                 text: Some("捏了捏你的脸".into()),
                 amount_usd: None,
+                duration: None,
+                place: None,
+                content: None,
             }),
             ..Default::default()
         };
@@ -740,5 +755,48 @@ mod tests {
             serde_json::from_value(json!({"tips_amount_usd": 20.0, "tier": "gold"})).unwrap();
         assert_eq!(params.tier.as_deref(), Some("gold"));
         assert!(params.action.is_none());
+    }
+
+    #[test]
+    fn queued_params_rebuild_a_date() {
+        let params: super::QueuedTurnParams = serde_json::from_value(json!({"action": {
+            "type": "date", "duration": "mid", "place": "海边", "content": "散步"
+        }}))
+        .unwrap();
+        assert_eq!(
+            params.action.unwrap().to_core().unwrap(),
+            eros_engine_core::types::UserAction::Date {
+                duration: eros_engine_core::types::DateDuration::Mid,
+                place: "海边".into(),
+                content: "散步".into(),
+            }
+        );
+    }
+
+    // The stream route's admission rules apply to the async route too: while a
+    // date runs, a send to the instance's text session is refused and writes
+    // nothing.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn async_send_applies_the_same_admission(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        seed_date(&pool, session_id, user_id, instance_id, chrono::Utc::now()).await;
+        let before = session_footprint(&pool, session_id).await;
+
+        let mut app = build_router(test_state(pool.clone()));
+        let token = mint_test_jwt(user_id);
+        let (status, body) = post_json(
+            &mut app,
+            &async_uri(session_id),
+            &token,
+            json!({"content":"hi","client_msg_id":"01JV000000000000000000020A"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+        assert_eq!(body["code"], "activity_in_progress");
+        assert_eq!(body["user_message"], "你们正在约会中");
+        assert_eq!(session_footprint(&pool, session_id).await, before);
     }
 }

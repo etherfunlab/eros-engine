@@ -10,14 +10,16 @@ use chrono_tz::Tz;
 use uuid::Uuid;
 
 use eros_engine_core::affinity::{Affinity, AffinityDeltas, AxisGrades, EndpointLevelReads};
+use eros_engine_core::types::UserAction;
 use eros_engine_llm::failure::{AttemptFailure, GatewayError, GatewayKind};
 use eros_engine_llm::model_config::ACTIVITY_JUDGE_TASK;
 use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
-use eros_engine_store::activity::{ActivityRecord, ActivityRepo, SettleClaim};
+use eros_engine_store::activity::{ActivityRecord, ActivityRepo, ActivityStatus, SettleClaim};
 use eros_engine_store::affinity::{ActivityVerdict, AffinityRepo};
-use eros_engine_store::chat::{self, ChatRepo};
+use eros_engine_store::chat::{self, ChatRepo, ChatSession};
 use eros_engine_store::episode::{one_line, EpisodeInsert, EpisodeRepo, EPISODE_MAX_CHARS};
 use eros_engine_store::journal::{self, JOURNAL_SUMMARY_MAX_CHARS};
+use eros_engine_store::life_choices::LifeChoiceRepo;
 use eros_engine_store::persona::PersonaRepo;
 use eros_engine_store::scan_state::ScanStateRepo;
 use eros_engine_store::session_archive::lock_live_session;
@@ -112,6 +114,91 @@ fn date_moment(v: &serde_json::Value) -> Option<DateMoment> {
     })
 }
 
+/// Whether a send may go ahead, checked before it writes anything (spec
+/// §4.2, §5.3, §6.1). A date's own session takes sends while the date runs and
+/// not once its clock is out, and takes no invitation; for the instance's text
+/// sessions an invitation also needs a genome persona and no unanswered life
+/// choice, and nothing is sent while a date runs. A date whose clock ran out
+/// is settled here first, so the send then runs as an ordinary turn; the
+/// settlement's own `409 activity_settling` passes through.
+pub(crate) async fn admit_send(
+    state: &AppState,
+    session: &ChatSession,
+    instance_id: Uuid,
+    action: Option<&UserAction>,
+    byoc: bool,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let activities = ActivityRepo { pool: &state.pool };
+    let invites = matches!(action, Some(UserAction::Date { .. }));
+
+    if session.channel == "activity" {
+        let ongoing = activities
+            .by_sub_session(session.id)
+            .await?
+            .is_some_and(|a| a.status_at(now) == ActivityStatus::Ongoing);
+        return match (ongoing, invites) {
+            (true, false) => Ok(()),
+            (true, true) => Err(in_progress()),
+            (false, _) => Err(ended()),
+        };
+    }
+
+    if invites {
+        if byoc {
+            return Err(crate::byoc::unsupported("date invitations"));
+        }
+        if (LifeChoiceRepo { pool: &state.pool })
+            .pending_for_instance(instance_id, now)
+            .await?
+        {
+            return Err(choice_pending());
+        }
+    }
+
+    match activities.unsettled_for_instance(instance_id).await? {
+        Some(a) => match a.status_at(now) {
+            ActivityStatus::Ongoing => Err(in_progress()),
+            ActivityStatus::Ended => settle(state, a.id, now).await.map(drop),
+            ActivityStatus::Settled => Ok(()),
+        },
+        None => Ok(()),
+    }
+}
+
+/// `409 activity_in_progress`: a date of the instance is running.
+fn in_progress() -> AppError {
+    AppError::StreamPre(StreamPreError {
+        status: StatusCode::CONFLICT,
+        code: "activity_in_progress",
+        message: "a date of this persona is in progress".into(),
+        user_message: "你们正在约会中".into(),
+        original_user_message_id: None,
+    })
+}
+
+/// `409 activity_ended`: the date's clock ran out.
+fn ended() -> AppError {
+    AppError::StreamPre(StreamPreError {
+        status: StatusCode::CONFLICT,
+        code: "activity_ended",
+        message: "this date has ended".into(),
+        user_message: "这次约会已经结束".into(),
+        original_user_message_id: None,
+    })
+}
+
+/// `409 choice_pending`: she waits for an answer before a date is asked.
+fn choice_pending() -> AppError {
+    AppError::StreamPre(StreamPreError {
+        status: StatusCode::CONFLICT,
+        code: "choice_pending",
+        message: "a life choice of this persona awaits an answer".into(),
+        user_message: "对方还在等你回答之前的事".into(),
+        original_user_message_id: None,
+    })
+}
+
 /// A settled date: the activity as stored, the parent's affinity after it
 /// (`None` when the parent has no row) and the deltas its event committed
 /// (`None` when it wrote none).
@@ -138,7 +225,6 @@ pub(crate) struct Settlement {
 /// The write locks the activity's row first: a caller whose stale claim was
 /// taken over and settled meanwhile finds the stamp there, writes nothing,
 /// and returns the stored result.
-#[cfg_attr(not(test), expect(dead_code, reason = "no caller outside tests"))]
 pub(crate) async fn settle(
     state: &AppState,
     activity_id: Uuid,
@@ -520,8 +606,9 @@ async fn judge(
     }
 }
 
+/// The fixtures are shared with the send routes' tests.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::Arc;
 
@@ -700,7 +787,7 @@ mod tests {
     /// After the date ended.
     const NOW: &str = "2026-11-12T18:45:00Z";
 
-    const JUDGE_REPLY: &str = r#"{"warmth": 3,
+    pub(crate) const JUDGE_REPLY: &str = r#"{"warmth": 3,
         "trust": {"grade": 2, "direction": "up"}, "intrigue": {"grade": 1, "direction": "up"},
         "intimacy": {"grade": 2, "direction": "up"}, "tension": {"grade": 0, "direction": "up"},
         "patience": 3, "reason": "他今天很用心",
@@ -712,7 +799,7 @@ mod tests {
 
     /// The judge on `mock`: `[tasks.affinity_evaluation]` only, so the date is
     /// judged by the evaluator's model.
-    fn with_judge(mut state: AppState, mock: &MockServer) -> AppState {
+    pub(crate) fn with_judge(mut state: AppState, mock: &MockServer) -> AppState {
         state.model_config = Arc::new(
             eros_engine_llm::model_config::ModelConfig::from_toml_str(
                 "[tasks.affinity_evaluation]\nmodel = \"judge\"\n",
@@ -728,7 +815,10 @@ mod tests {
         state
     }
 
-    async fn judge_mock(template: ResponseTemplate, calls: impl Into<Times>) -> MockServer {
+    pub(crate) async fn judge_mock(
+        template: ResponseTemplate,
+        calls: impl Into<Times>,
+    ) -> MockServer {
         let mock = MockServer::start().await;
         Mock::given(wm_path("/api/v1/chat/completions"))
             .respond_with(template)
@@ -738,7 +828,7 @@ mod tests {
         mock
     }
 
-    fn judged(reply: &str) -> ResponseTemplate {
+    pub(crate) fn judged(reply: &str) -> ResponseTemplate {
         ResponseTemplate::new(200).set_body_json(json!({
             "id": "gen-date",
             "model": "served/judge",
@@ -771,14 +861,14 @@ mod tests {
         .unwrap()
     }
 
-    struct Scene {
-        state: AppState,
+    pub(crate) struct Scene {
+        pub(crate) state: AppState,
         pool: PgPool,
-        user_id: Uuid,
+        pub(crate) user_id: Uuid,
         instance_id: Uuid,
-        session_id: Uuid,
+        pub(crate) session_id: Uuid,
         invite: Uuid,
-        activity: ActivityRecord,
+        pub(crate) activity: ActivityRecord,
         /// The sub-session's rows, oldest first, with their stamps.
         rows: Vec<(Uuid, DateTime<Utc>)>,
     }
@@ -786,7 +876,7 @@ mod tests {
     /// A text session with an affinity row and the user's timezone (Taipei),
     /// the invitation and her two-row answer, the short date it opened, and
     /// `turns` answered turns in the sub-session.
-    async fn scene(state: AppState, turns: u32) -> Scene {
+    pub(crate) async fn scene(state: AppState, turns: u32) -> Scene {
         let pool = state.pool.clone();
         let user_id = Uuid::new_v4();
         let genome_id = seed_genome(&pool, "Aria").await;

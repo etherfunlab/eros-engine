@@ -4928,6 +4928,14 @@
           }
         }
       },
+      "DateDurationDto": {
+        "type": "string",
+        "description": "How long a `date` lasts: `short` is one hour, `mid` four.",
+        "enum": [
+          "short",
+          "mid"
+        ]
+      },
       "DrawEventRequest": {
         "type": "object",
         "required": [
@@ -7833,7 +7841,7 @@
       },
       "UserActionDto": {
         "type": "object",
-        "description": "An action the user does to the persona this turn, besides talking. The\npersona accepts or does not; a refusal costs the relationship one tier on\nthe line the action touches (`give` and `gift` → bond, every physical or custom action →\nchemistry); a refused `tip`, `bluff`, `threaten` or `trick` costs nothing.\nAn accepted `gift` joins the persona's items or wardrobe.",
+        "description": "An action the user does to the persona this turn, besides talking. The\npersona accepts or does not; a refusal costs the relationship one tier on\nthe line the action touches (`give` and `gift` → bond, every physical or custom action →\nchemistry); a refused `tip`, `bluff`, `threaten` or `trick` costs nothing.\nAn accepted `gift` joins the persona's items or wardrobe. A `date` asks her\nout; accepted, it runs in a session of its own for its `duration`, and\nnothing else is sent to the persona's text sessions meanwhile.",
         "required": [
           "type"
         ],
@@ -7845,6 +7853,25 @@
             ],
             "format": "double",
             "description": "`tip` only, and required there: the amount in USD, finite, in\n`(0, 1_000_000_000]`. The engine records it and never verifies it; the\ncaller is the payment authority."
+          },
+          "content": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`date` only, and required there: what the two do, 1–120 chars.",
+            "maxLength": 120
+          },
+          "duration": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DateDurationDto",
+                "description": "`date` only, and required there: how long the date lasts."
+              }
+            ]
           },
           "item": {
             "oneOf": [
@@ -7875,6 +7902,14 @@
             ],
             "description": "`give`: optional, a short name for what is handed over, 1–32 chars.\n`gift`: required, what is given, 1–64 chars.",
             "maxLength": 64
+          },
+          "place": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`date` only, and required there: where, 1–40 chars.",
+            "maxLength": 40
           },
           "quantity": {
             "type": [
@@ -7919,7 +7954,8 @@
           "strip",
           "custom",
           "tip",
-          "gift"
+          "gift",
+          "date"
         ]
       },
       "UserActionView": {
