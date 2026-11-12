@@ -5297,9 +5297,20 @@ pub(crate) fn run_stream_with(
         // the engine's, never the judge's. A text-bearing turn without an
         // action draws once the deployment sets a base probability; `None`
         // is a turn that did not draw, and it records no tone.
+        // A listed user action is answered in the `emotional` tone, accepted
+        // or refused, without a draw (spec
+        // 2026-11-12-emotional-action-replies-design.md §3); any other action
+        // turn never draws.
         let tone_base = state.model_config.tone_emotional_probability();
-        let tone: Option<eros_engine_core::tone::Tone> =
-            (tone_base > 0.0 && plan.action_type.bears_text() && !action_turn).then(|| {
+        let tone_on = tone_base > 0.0 && plan.action_type.bears_text();
+        let listed_action = user_msg
+            .action
+            .as_ref()
+            .is_some_and(|a| a.speaks_emotionally());
+        let tone: Option<eros_engine_core::tone::Tone> = if tone_on && listed_action {
+            Some(eros_engine_core::tone::Tone::Emotional)
+        } else {
+            (tone_on && !action_turn).then(|| {
                 let p = eros_engine_core::tone::emotional_probability(
                     tone_base,
                     crate::prompt::persona_moody(&input.persona),
@@ -5307,7 +5318,8 @@ pub(crate) fn run_stream_with(
                     eros_engine_core::scope::romance_compatible(affinity_scope),
                 );
                 eros_engine_core::tone::draw(p, rand::thread_rng().gen())
-            });
+            })
+        };
         let emotional = tone == Some(eros_engine_core::tone::Tone::Emotional);
         // An action turn rolls no dice: the action already fixes what the turn
         // is about (spec 2026-10-05 §5.2). Neither does an emotional turn: its
@@ -25414,5 +25426,56 @@ data: [DONE]\n\n"
             tone_reply_metadata(&pool, session_id).await["tone"],
             "emotional"
         );
+    }
+
+    // ─── Listed user actions (spec 2026-11-12-emotional-action-replies-design.md) ───
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_listed_action_speaks_emotionally_accepted_or_refused(pool: PgPool) {
+        for (response, sentence) in [("accept", "你接受了"), ("refuse", "你没有接受")] {
+            // A base this small never wins the draw: only the list can make
+            // the turn emotional.
+            let (mock, session_id) = run_tone_turn(
+                &pool,
+                "tones = { emotional = 1e-12 }",
+                Some(serde_json::json!({
+                    "action": "reply_text", "inner_state": "", "action_response": response
+                })),
+                Some(eros_engine_core::types::UserAction::Touch),
+                false,
+            )
+            .await;
+            let messages = tone_chat_messages(&mock).await;
+            assert_eq!(messages.len(), 2, "{response}: {messages:?}");
+            assert_eq!(messages[1]["content"], "（伸手想摸你）", "{response}");
+            let system = messages[0]["content"].as_str().unwrap();
+            assert!(
+                system.contains(&format!("对方伸手想摸你，{sentence}。")),
+                "{response}: {system}"
+            );
+            assert!(!system.contains("[user_profile]"), "{response}: {system}");
+            assert_eq!(
+                tone_reply_metadata(&pool, session_id).await["tone"],
+                "emotional",
+                "{response}"
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_listed_action_without_tones_keeps_its_history(pool: PgPool) {
+        let (mock, session_id) = run_tone_turn(
+            &pool,
+            "",
+            Some(serde_json::json!({
+                "action": "reply_text", "inner_state": "", "action_response": "accept"
+            })),
+            Some(eros_engine_core::types::UserAction::Touch),
+            false,
+        )
+        .await;
+        assert!(tone_chat_messages(&mock).await.len() > 2);
+        let meta = tone_reply_metadata(&pool, session_id).await;
+        assert!(meta.get("tone").is_none(), "{meta}");
     }
 }
