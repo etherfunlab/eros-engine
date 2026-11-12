@@ -3285,4 +3285,161 @@ mod tests {
         );
         assert!(calls(&mock).await.is_empty());
     }
+
+    // ── Emotional event messages (spec 2026-11-12-emotional-event-messages-design.md) ──
+
+    fn with_tones(mut state: AppState) -> AppState {
+        state.model_config = Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"companion\"\ntones = { emotional = 0.05 }\n",
+            )
+            .unwrap(),
+        );
+        state
+    }
+
+    /// `metadata.tone` of the session's event message.
+    async fn event_tone(pool: &PgPool, session_id: Uuid) -> Option<String> {
+        sqlx::query_scalar(
+            "SELECT metadata->>'tone' FROM engine.chat_messages \
+             WHERE session_id = $1 AND metadata->>'proactive' = 'event'",
+        )
+        .bind(session_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// The ghost floor's ten rows plus one exchange that survives echo
+    /// cancellation, so the default request carries history.
+    async fn seed_history(pool: &PgPool, session_id: Uuid) {
+        seed_user_messages(pool, session_id, 10).await;
+        for (role, content) in [("user", "EARLIER-USER"), ("assistant", "EARLIER-REPLY。还有一句。")] {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content) VALUES ($1, $2, $3)",
+            )
+            .bind(session_id)
+            .bind(role)
+            .bind(content)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    /// The companion call's messages.
+    async fn companion_messages(mock: &MockServer) -> Vec<serde_json::Value> {
+        let c = calls(mock).await;
+        assert_eq!(c.len(), 1, "one companion call");
+        c[0]["messages"].as_array().unwrap().clone()
+    }
+
+    async fn draw_one(
+        state: &AppState,
+        session_id: Uuid,
+        user_id: Uuid,
+        kind: EventKindDto,
+    ) {
+        let out = draw_event_at(
+            state,
+            session_id,
+            user_id,
+            req("k", Some(vec![kind])),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        assert!(out.event.is_some() && out.message.is_some(), "{kind:?} told");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_listed_kind_speaks_emotionally_when_tones_are_on(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (instance_id, session_id) = setup(&pool, user_id).await;
+        seed_history(&pool, session_id).await;
+        let started = Utc::now() - chrono::Duration::hours(2);
+        EventRepo { pool: &pool }
+            .insert(
+                &eros_engine_store::events::NewEvent {
+                    instance_id,
+                    session_id,
+                    event_key: "trip",
+                    kind: EventKind::BusinessTrip,
+                    started_at: started,
+                    ends_at: started + chrono::Duration::hours(24),
+                },
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "气死我了").await;
+        let state = with_tones(with_companion(test_state(pool.clone()), &mock.uri()));
+        draw_one(&state, session_id, user_id, EventKindDto::Quarrel).await;
+
+        let msgs = companion_messages(&mock).await;
+        assert_eq!(msgs.len(), 2, "system + the cue: {msgs:?}");
+        let cue = msgs[1]["content"].as_str().unwrap();
+        assert!(cue.starts_with("（你正在外地出差。"), "{cue}");
+        let system = msgs[0]["content"].as_str().unwrap();
+        assert!(!system.contains("EARLIER-"), "{system}");
+        assert!(!system.contains("[user_profile]"), "{system}");
+        assert!(system.contains("- 正在经历：出差"), "{system}");
+        assert_eq!(event_tone(&pool, session_id).await.as_deref(), Some("emotional"));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_unlisted_kind_keeps_its_history_when_tones_are_on(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        seed_history(&pool, session_id).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "下雨了").await;
+        let state = with_tones(with_companion(test_state(pool.clone()), &mock.uri()));
+        draw_one(&state, session_id, user_id, EventKindDto::WeatherChange).await;
+
+        assert!(companion_messages(&mock).await.len() > 2);
+        assert_eq!(event_tone(&pool, session_id).await, None);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_listed_kind_keeps_its_history_without_tones(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        seed_history(&pool, session_id).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "气死我了").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        draw_one(&state, session_id, user_id, EventKindDto::Quarrel).await;
+
+        let msgs = companion_messages(&mock).await;
+        assert!(msgs.len() > 2, "{msgs:?}");
+        assert!(msgs[0]["content"].as_str().unwrap().contains("[user_profile]"));
+        assert_eq!(event_tone(&pool, session_id).await, None);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_streamed_listed_kind_speaks_emotionally(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        seed_history(&pool, session_id).await;
+        let mock = MockServer::start().await;
+        mount_streamed(&mock, &["气死", "我了"]).await;
+        let state = with_tones(with_companion(test_state(pool.clone()), &mock.uri()));
+        let frames = stream_frames(
+            &state,
+            session_id,
+            user_id,
+            req("k", Some(vec![EventKindDto::Quarrel])),
+            0.1,
+        )
+        .await;
+        assert_eq!(frames[0]["event"]["kind"], "quarrel", "{frames:?}");
+
+        let msgs = companion_messages(&mock).await;
+        assert_eq!(msgs.len(), 2, "system + the cue: {msgs:?}");
+        assert_eq!(event_tone(&pool, session_id).await.as_deref(), Some("emotional"));
+    }
 }
