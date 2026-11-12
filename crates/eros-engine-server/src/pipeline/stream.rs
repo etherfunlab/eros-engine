@@ -2838,23 +2838,35 @@ fn render_product_qa_pairs(pairs: &[(String, String)]) -> String {
 /// design.md §2.3, 2026-11-08-strip-and-world-setting-design.md §2.2): an
 /// accepted one with an image executor shows her picture after her words,
 /// always of her face; any other is text only, even when the judge proposed a
-/// picture.
+/// picture. A `date` turn is always text only, whatever her answer (spec
+/// 2026-11-12-activity-sub-session-design.md §4.6), so an accepted one reaches
+/// the text reply, where the date opens.
 fn picture_action(
     event: &eros_engine_core::types::Event,
     plan: &eros_engine_core::types::ActionPlan,
     image_executor_available: bool,
 ) -> Option<ActionType> {
     use eros_engine_core::types::{ActionResponse, Event, UserAction};
-    if !matches!(
+    let date = matches!(
         event,
         Event::UserMessage {
-            action: Some(UserAction::Photo | UserAction::Strip),
+            action: Some(UserAction::Date { .. }),
             ..
         }
-    ) {
+    );
+    if !date
+        && !matches!(
+            event,
+            Event::UserMessage {
+                action: Some(UserAction::Photo | UserAction::Strip),
+                ..
+            }
+        )
+    {
         return None;
     }
-    let shows = plan.action_response == Some(ActionResponse::Accept) && image_executor_available;
+    let shows =
+        !date && plan.action_response == Some(ActionResponse::Accept) && image_executor_available;
     let target = if shows {
         ActionType::ReplyTextImage
     } else if matches!(
@@ -5207,7 +5219,13 @@ pub(crate) fn run_stream_with(
         // A photo she let the user take, or a strip she let happen, comes back
         // as her picture after her words; a refused one is text only (spec
         // 2026-11-08 §2.3, 2026-11-08-strip-and-world-setting-design.md §2.2).
-        // Before the forced-image override, which still wins.
+        // Before the forced-image override, which still wins, except on a
+        // date turn: that one never produces a picture (spec 2026-11-12-
+        // activity-sub-session-design.md §4.6).
+        let date_turn = matches!(
+            user_msg.action,
+            Some(eros_engine_core::types::UserAction::Date { .. })
+        );
         if let Some(action) = picture_action(&input.event, &plan, image_executor_available) {
             let aspect = (action == ActionType::ReplyTextImage
                 && matches!(
@@ -5235,7 +5253,7 @@ pub(crate) fn run_stream_with(
         // consumer has overridden by forcing. There is no subject to carry
         // through here — the composer decides what the picture shows from turn
         // context alone (`resolve_image_turn_inputs`).
-        if force_image {
+        if force_image && !date_turn {
             plan = pde::plan_for(
                 &input,
                 ActionType::ReplyImage,
@@ -19921,6 +19939,7 @@ data: [DONE]\n\n";
     fn picture_action_shows_the_picture_only_when_accepted() {
         use eros_engine_core::types::ActionResponse::{Accept, Refuse};
         use eros_engine_core::types::ActionType::{ReplyImage, ReplyText, ReplyTextImage};
+        use eros_engine_core::types::DateDuration;
         use eros_engine_core::types::UserAction::{Kiss, Photo, Strip};
         let cases = [
             (Kiss, Accept, ReplyText, true, None),
@@ -19935,6 +19954,28 @@ data: [DONE]\n\n";
             (Strip, Accept, ReplyText, false, None),
             (Strip, Refuse, ReplyTextImage, true, Some(ReplyText)),
             (Strip, Refuse, ReplyText, true, None),
+            (
+                date_of(DateDuration::Short),
+                Accept,
+                ReplyImage,
+                true,
+                Some(ReplyText),
+            ),
+            (
+                date_of(DateDuration::Short),
+                Accept,
+                ReplyTextImage,
+                true,
+                Some(ReplyText),
+            ),
+            (date_of(DateDuration::Short), Accept, ReplyText, true, None),
+            (
+                date_of(DateDuration::Mid),
+                Refuse,
+                ReplyImage,
+                true,
+                Some(ReplyText),
+            ),
         ];
         for (a, response, ty, available, want) in cases {
             let mut input = fixture_decision_input();
@@ -25556,8 +25597,8 @@ data: [DONE]\n\n"
 
     /// An invitation turn on a fresh persona (bond tier 1): the user writes
     /// `content`, `gap_hours` after an earlier message of theirs when given,
-    /// with `events` under way; the judge answers `response`. Returns the
-    /// frames, the mock and the invitation's id.
+    /// with `events` under way; the judge answers `response` with a text
+    /// reply. Returns the frames, the mock and the invitation's id.
     async fn run_date_turn(
         pool: &PgPool,
         duration: eros_engine_core::types::DateDuration,
@@ -25566,15 +25607,36 @@ data: [DONE]\n\n"
         events: &[EventSeed],
         response: &str,
     ) -> (Vec<ProtocolFrame>, wiremock::MockServer, Uuid) {
+        let verdict = serde_json::json!({
+            "action": "reply_text", "inner_state": "", "action_response": response
+        });
+        run_date_turn_with(pool, duration, content, gap_hours, events, verdict, None).await
+    }
+
+    /// [`run_date_turn`] with the judge's whole `verdict` and the request's
+    /// `image` block. A composer is configured, so the block makes pictures
+    /// available; its mock expects no call.
+    async fn run_date_turn_with(
+        pool: &PgPool,
+        duration: eros_engine_core::types::DateDuration,
+        content: &str,
+        gap_hours: Option<i32>,
+        events: &[EventSeed],
+        verdict: serde_json::Value,
+        image: Option<crate::routes::companion_stream::ImageReplyParams>,
+    ) -> (Vec<ProtocolFrame>, wiremock::MockServer, Uuid) {
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
         use futures_util::StreamExt;
         use wiremock::matchers::{body_string_contains, path as wm_path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock = MockServer::start().await;
-        let verdict = serde_json::json!({
-            "action": "reply_text", "inner_state": "", "action_response": response
-        });
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"composer\""))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock)
+            .await;
         let judge_body = serde_json::json!({
             "id": "gj", "model": "pde/judge",
             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
@@ -25602,7 +25664,8 @@ data: [DONE]\n\n"
         state.model_config = std::sync::Arc::new(
             eros_engine_llm::model_config::ModelConfig::from_toml_str(
                 "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
-                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide.\"\n",
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide.\"\n\
+                 [tasks.chat_image_prompt_compose]\nmodel=\"composer\"\n",
             )
             .unwrap(),
         );
@@ -25668,7 +25731,7 @@ data: [DONE]\n\n"
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 image_url: None,
-                image: None,
+                image,
                 quote: Default::default(),
                 user_locale: Default::default(),
                 action: Some(action),
@@ -25886,5 +25949,82 @@ data: [DONE]\n\n"
         assert_eq!(action_response_of(&frames), "accept");
         let fin = final_json(&frames);
         assert!(fin.get("activity").is_none(), "{fin}");
+    }
+
+    /// A date turn answered in words only: a text reply, no picture frame,
+    /// no composer call.
+    async fn assert_text_only(frames: &[ProtocolFrame], mock: &wiremock::MockServer) {
+        assert_eq!(
+            meta_action_type(frames),
+            FrameActionType::Reply,
+            "{frames:?}"
+        );
+        let types = frame_type_names(frames);
+        assert!(!types.iter().any(|t| t == "image_request"), "{types:?}");
+        assert!(
+            frames.iter().any(
+                |f| matches!(f, ProtocolFrame::Delta { content, .. } if content.contains("REPLY"))
+            ),
+            "{frames:?}"
+        );
+        mock.verify().await;
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_picture_the_judge_picks_for_an_accepted_date_is_text(pool: PgPool) {
+        let (frames, mock, _) = run_date_turn_with(
+            &pool,
+            eros_engine_core::types::DateDuration::Short,
+            "",
+            None,
+            &[],
+            serde_json::json!({"action": "reply_image", "inner_state": "", "action_response": "accept"}),
+            Some(Default::default()),
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        assert_text_only(&frames, &mock).await;
+        assert_eq!(final_json(&frames)["activity"]["status"], "ongoing");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_forced_image_on_an_accepted_date_is_ignored(pool: PgPool) {
+        let (frames, mock, _) = run_date_turn_with(
+            &pool,
+            eros_engine_core::types::DateDuration::Short,
+            "",
+            None,
+            &[],
+            serde_json::json!({"action": "reply_text", "inner_state": "", "action_response": "accept"}),
+            Some(crate::routes::companion_stream::ImageReplyParams {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        assert_text_only(&frames, &mock).await;
+        assert_eq!(final_json(&frames)["activity"]["status"], "ongoing");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_forced_image_on_a_refused_date_is_ignored(pool: PgPool) {
+        let (frames, mock, umid) = run_date_turn_with(
+            &pool,
+            eros_engine_core::types::DateDuration::Short,
+            "",
+            None,
+            &[],
+            serde_json::json!({"action": "reply_text", "inner_state": "", "action_response": "refuse"}),
+            Some(crate::routes::companion_stream::ImageReplyParams {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "refuse");
+        assert_text_only(&frames, &mock).await;
+        assert!(final_json(&frames).get("activity").is_none());
+        assert_eq!(activities_for(&pool, umid).await, 0);
     }
 }
