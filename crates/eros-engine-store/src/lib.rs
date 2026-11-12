@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Postgres + pgvector persistence layer.
 
+pub mod activity;
 pub mod affinity;
 pub mod arc;
 pub mod character_insight;
@@ -1194,6 +1195,164 @@ mod migration_tests {
             norm(&pool, "用户很喜欢爬山").await,
             norm(&pool, "用户喜欢爬山").await
         );
+    }
+
+    /// 0085. The `activity` channel and affinity-event type, and the
+    /// `engine.activities` table: its CHECK, its three foreign keys and their
+    /// actions, and the lockdown.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn migration_0085_shapes(pool: PgPool) {
+        let user_id = uuid::Uuid::new_v4();
+        let instance_id = crate::testutil::seed_persona_instance(&pool, user_id).await;
+        let session = |channel: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, uuid::Uuid>(
+                    "INSERT INTO engine.chat_sessions (user_id, instance_id, channel) \
+                     VALUES ($1, $2, $3) RETURNING id",
+                )
+                .bind(user_id)
+                .bind(instance_id)
+                .bind(channel)
+                .fetch_one(&pool)
+                .await
+            }
+        };
+        let parent = session("text").await.unwrap();
+        let sub = session("activity")
+            .await
+            .expect("'activity' is a session channel");
+        let bogus = session("bogus").await;
+        assert!(
+            matches!(&bogus, Err(sqlx::Error::Database(e)) if e.is_check_violation()),
+            "other channels stay refused: {bogus:?}"
+        );
+
+        let affinity: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.companion_affinity (session_id, user_id, instance_id) \
+             VALUES ($1, $2, $3) RETURNING id",
+        )
+        .bind(parent)
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let event = |event_type: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO engine.companion_affinity_events (affinity_id, event_type) \
+                     VALUES ($1, $2)",
+                )
+                .bind(affinity)
+                .bind(event_type)
+                .execute(&pool)
+                .await
+            }
+        };
+        event("activity")
+            .await
+            .expect("'activity' is an affinity event type");
+        event("life_choice").await.expect("the old types stay");
+        let bogus = event("bogus").await;
+        assert!(
+            matches!(&bogus, Err(sqlx::Error::Database(e)) if e.is_check_violation()),
+            "other types stay refused: {bogus:?}"
+        );
+
+        let invite: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content) \
+             VALUES ($1, 'user', 'invite') RETURNING id",
+        )
+        .bind(parent)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let activity = |duration: &'static str, sub_session: uuid::Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, uuid::Uuid>(
+                    "INSERT INTO engine.activities \
+                       (session_id, sub_session_id, message_id, duration, place, content) \
+                     VALUES ($1, $2, $3, $4, 'sea', 'walk') RETURNING id",
+                )
+                .bind(parent)
+                .bind(sub_session)
+                .bind(invite)
+                .bind(duration)
+                .fetch_one(&pool)
+                .await
+            }
+        };
+        let long = activity("long", sub).await;
+        assert!(
+            matches!(&long, Err(sqlx::Error::Database(e)) if e.is_check_violation()),
+            "duration is short or mid: {long:?}"
+        );
+        let id = activity("mid", sub).await.expect("a mid date");
+        let spare = session("activity").await.unwrap();
+        let again = activity("short", spare).await;
+        assert!(
+            matches!(&again, Err(sqlx::Error::Database(e)) if e.is_unique_violation()),
+            "one date per invitation: {again:?}"
+        );
+        let twice = sqlx::query(
+            "INSERT INTO engine.activities (session_id, sub_session_id, duration, place, content) \
+             VALUES ($1, $2, 'short', 'sea', 'walk')",
+        )
+        .bind(parent)
+        .bind(sub)
+        .execute(&pool)
+        .await;
+        assert!(
+            matches!(&twice, Err(sqlx::Error::Database(e)) if e.is_unique_violation()),
+            "one date per sub-session: {twice:?}"
+        );
+
+        sqlx::query("DELETE FROM engine.chat_messages WHERE id = $1")
+            .bind(invite)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let message_id: Option<uuid::Uuid> =
+            sqlx::query_scalar("SELECT message_id FROM engine.activities WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            message_id, None,
+            "the invitation row going blanks the pointer"
+        );
+
+        sqlx::query("DELETE FROM engine.chat_sessions WHERE id = $1")
+            .bind(parent)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM engine.activities")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0, "the parent session going takes the date with it");
+
+        let rls: bool = sqlx::query_scalar(
+            "SELECT relrowsecurity FROM pg_class WHERE oid = 'engine.activities'::regclass",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(rls, "RLS must be enabled on engine.activities");
+        let has_identity: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+              WHERE table_schema = 'engine' AND table_name = 'activities' \
+                AND column_name IN ('user_id', 'instance_id'))",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!has_identity, "the parent session determines both");
     }
 
     /// 0084. The row tombstones (one per deleted row, ids only) and the
