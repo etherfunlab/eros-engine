@@ -375,6 +375,12 @@ async fn build_state(cfg: &ServerConfig, with_auth: bool) -> Result<AppState> {
         anyhow::bail!(msg);
     }
 
+    // Chat tones (spec 2026-11-12-chat-tone-emotional-design.md §5): a
+    // probability outside [0, 1] is refused rather than clamped.
+    if let Err(msg) = model_config.validate_tones() {
+        anyhow::bail!(msg);
+    }
+
     // Embedding routing (spec 2026-08-01): read/write backends resolved from
     // [tasks.embedding] + [providers]. validate_providers has already gated
     // every failure mode; from_config re-checks keys defensively.

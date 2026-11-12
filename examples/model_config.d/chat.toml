@@ -44,6 +44,14 @@ model_name_display_override = true
 # Optional prompt-trait allow-list (three-state). Commented out here means no
 # gating. See docs/prompt-traits.md.
 #allow_traits = ["nsfw_boost","politics_open"]
+# Chat tones (optional). The engine draws a tone per 1:1 text turn; the judge
+# does not pick it. `emotional` is this base probability, times 3 for a persona
+# whose art_metadata.moody is true (a third when false), times 3 when she is
+# hungry, tired, craving or wants to be cared about, times 2 when the pair is
+# romantically compatible, capped at 1. An emotional reply is written without
+# the chat history, the user profile or the affinity conclusions. Task-level;
+# absent or 0 = off.
+#tones = { emotional = 0.05 }
 
 # Per-tier overrides are OPTIONAL and downstream-defined: `tier` is whatever
 # your product sends per request. The OSS template enables none — with no tier
