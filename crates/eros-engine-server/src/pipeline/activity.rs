@@ -121,14 +121,26 @@ fn date_moment(v: &serde_json::Value) -> Option<DateMoment> {
 /// choice, and nothing is sent while a date runs. A date whose clock ran out
 /// is settled here first, so the send then runs as an ordinary turn; the
 /// settlement's own `409 activity_settling` passes through.
+///
+/// A send whose `client_msg_id` the session already holds is a retry, and the
+/// enqueue answers it from what is stored without writing: it is admitted
+/// whatever the date's state, so the invitation's own retry still gets her
+/// reply once the date it opened is running.
 pub(crate) async fn admit_send(
     state: &AppState,
     session: &ChatSession,
     instance_id: Uuid,
+    client_msg_id: &str,
     action: Option<&UserAction>,
     byoc: bool,
     now: DateTime<Utc>,
 ) -> Result<(), AppError> {
+    if (ChatRepo { pool: &state.pool })
+        .has_user_message(session.id, client_msg_id)
+        .await?
+    {
+        return Ok(());
+    }
     let activities = ActivityRepo { pool: &state.pool };
     let invites = matches!(action, Some(UserAction::Date { .. }));
 

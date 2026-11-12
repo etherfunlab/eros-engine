@@ -1041,6 +1041,25 @@ async fn insert_assistant_row_in_tx(
     Ok(())
 }
 
+/// The user row stored under `(session_id, client_msg_id)`: what makes a send
+/// a retry of an earlier one rather than a new message.
+async fn user_row_by_client_msg_id<'e, E: sqlx::PgExecutor<'e>>(
+    ex: E,
+    session_id: Uuid,
+    client_msg_id: &str,
+) -> Result<Option<ChatMessage>, sqlx::Error> {
+    sqlx::query_as::<_, ChatMessage>(
+        "SELECT * FROM engine.chat_messages \
+         WHERE session_id = $1 AND client_msg_id = $2 \
+           AND role = 'user' \
+         LIMIT 1",
+    )
+    .bind(session_id)
+    .bind(client_msg_id)
+    .fetch_optional(ex)
+    .await
+}
+
 pub(crate) async fn upsert_user_message_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     session_id: Uuid,
@@ -1049,16 +1068,7 @@ pub(crate) async fn upsert_user_message_in_tx(
     role: &str,
     metadata: Option<&serde_json::Value>,
 ) -> Result<UpsertUserOutcome, sqlx::Error> {
-    let existing: Option<ChatMessage> = sqlx::query_as::<_, ChatMessage>(
-        "SELECT * FROM engine.chat_messages \
-         WHERE session_id = $1 AND client_msg_id = $2 \
-           AND role = 'user' \
-         LIMIT 1",
-    )
-    .bind(session_id)
-    .bind(client_msg_id)
-    .fetch_optional(&mut **tx)
-    .await?;
+    let existing = user_row_by_client_msg_id(&mut **tx, session_id, client_msg_id).await?;
 
     if let Some(row) = existing {
         let assistant_chain: Vec<ReplayMessage> =
@@ -1106,6 +1116,22 @@ pub(crate) async fn upsert_user_message_in_tx(
 }
 
 impl<'a> ChatRepo<'a> {
+    /// Whether `session_id` already holds a user row sent under
+    /// `client_msg_id`: the test `upsert_user_message_idempotent` and the
+    /// enqueues apply, so a send that passes it is answered from what is
+    /// stored and writes nothing.
+    pub async fn has_user_message(
+        &self,
+        session_id: Uuid,
+        client_msg_id: &str,
+    ) -> Result<bool, sqlx::Error> {
+        Ok(
+            user_row_by_client_msg_id(self.pool, session_id, client_msg_id)
+                .await?
+                .is_some(),
+        )
+    }
+
     /// Insert a user message keyed by `client_msg_id` with permanent
     /// idempotency. The partial unique index on `(session_id, client_msg_id)`
     /// has no time component, so deduplication is permanent: any prior row
@@ -2932,6 +2958,30 @@ mod tests {
             }
             other => panic!("expected Inserted, got {other:?}"),
         }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn has_user_message_is_the_enqueues_own_test_for_a_retry(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let s = repo.create_session(user_id, instance_id).await.unwrap();
+        let other = repo.create_session(user_id, instance_id).await.unwrap();
+        let id = "01J0000000000000000000000A";
+        assert!(!repo.has_user_message(s.id, id).await.unwrap());
+
+        repo.upsert_user_message_idempotent(s.id, "hello", id, "user", None)
+            .await
+            .unwrap();
+        assert!(repo.has_user_message(s.id, id).await.unwrap());
+        assert!(
+            !repo.has_user_message(other.id, id).await.unwrap(),
+            "the key is per session"
+        );
+        assert!(!repo
+            .has_user_message(s.id, "01J0000000000000000000000B")
+            .await
+            .unwrap());
     }
 
     #[sqlx::test(migrations = "./migrations")]

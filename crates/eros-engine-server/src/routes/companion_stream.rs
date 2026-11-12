@@ -1037,6 +1037,7 @@ pub async fn send_message_stream(
         &state,
         &session,
         instance_id,
+        &req.client_msg_id,
         req.action.as_ref().and_then(|a| a.to_core().ok()).as_ref(),
         byoc,
         chrono::Utc::now(),
@@ -4201,6 +4202,101 @@ data: [DONE]\n\n";
         let (status, resp) = send_request(&mut app, async_send(voice, &token, chat(3))).await;
         assert_eq!(status, StatusCode::CONFLICT, "{resp}");
         assert_eq!(resp["code"], "wrong_channel");
+    }
+
+    /// The invitation's own retry: the date her accept opened is running, and
+    /// the send under the same `client_msg_id` still gets what was stored.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_retry_of_the_invitation_is_replayed_while_the_date_runs(pool: PgPool) {
+        use crate::routes::companion::testutil::{
+            read_sse, seed_accepted_invitation, send_request, session_footprint,
+        };
+        let (user_id, instance_id, session_id) = home(&pool).await;
+        seed_accepted_invitation(&pool, session_id, user_id, instance_id, &msg_id(1)).await;
+        let before = session_footprint(&pool, session_id).await;
+        let mut app = build_router(crate::routes::companion::test_state(pool.clone()));
+        let token = mint_jwt(user_id);
+
+        let resp = app
+            .call(stream_send(
+                session_id,
+                &token,
+                invite(1, "海边", "散步"),
+                &[],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let frames = read_sse(resp).await;
+        assert!(
+            frames.iter().any(|f| f.to_string().contains("好呀")),
+            "{frames:?}"
+        );
+        assert_eq!(
+            frames.last().map(|f| f["type"].clone()),
+            Some(json!("final")),
+            "{frames:?}"
+        );
+        assert_eq!(session_footprint(&pool, session_id).await, before);
+
+        // A message of its own is still turned away.
+        let (status, resp) =
+            send_request(&mut app, stream_send(session_id, &token, chat(2), &[])).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{resp}");
+        assert_eq!(resp["code"], "activity_in_progress");
+    }
+
+    /// A retry reads what is stored whatever state the date is in: the clock
+    /// ran out, and neither the sub-session's nor the parent's retry is
+    /// refused or settles anything.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_retry_is_replayed_after_the_date_ran_out(pool: PgPool) {
+        use crate::routes::companion::testutil::{
+            seed_answered_turn, seed_date, send_request, session_footprint,
+        };
+        let (user_id, instance_id, session_id) = home(&pool).await;
+        let date = seed_date(
+            &pool,
+            session_id,
+            user_id,
+            instance_id,
+            chrono::Utc::now() - chrono::Duration::hours(3),
+        )
+        .await;
+        seed_answered_turn(&pool, date.sub_session_id, &msg_id(1), None).await;
+        seed_answered_turn(&pool, session_id, &msg_id(2), None).await;
+        let before = (
+            session_footprint(&pool, date.sub_session_id).await,
+            session_footprint(&pool, session_id).await,
+        );
+        let mut app = build_router(crate::routes::companion::test_state(pool.clone()));
+        let token = mint_jwt(user_id);
+
+        for (id, to) in [(1, date.sub_session_id), (2, session_id)] {
+            let (status, resp) = send_request(&mut app, async_send(to, &token, chat(id))).await;
+            assert_eq!(status, StatusCode::OK, "{resp}");
+            assert_eq!(resp["status"], "already_completed");
+        }
+        assert_eq!(
+            before,
+            (
+                session_footprint(&pool, date.sub_session_id).await,
+                session_footprint(&pool, session_id).await
+            )
+        );
+        let settled: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT settled_at FROM engine.activities WHERE id = $1")
+                .bind(date.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(settled, None, "a retry settles nothing");
+
+        // A new message to the sub-session is still refused.
+        let (status, resp) =
+            send_request(&mut app, async_send(date.sub_session_id, &token, chat(3))).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{resp}");
+        assert_eq!(resp["code"], "activity_ended");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

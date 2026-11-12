@@ -1508,6 +1508,83 @@ pub(crate) mod testutil {
             .expect("the date opened")
     }
 
+    /// A user turn sent under `client_msg_id` in `session_id`, with her reply
+    /// stored: what a retry of that send is answered from. Returns the user row.
+    pub(crate) async fn seed_answered_turn(
+        pool: &PgPool,
+        session_id: Uuid,
+        client_msg_id: &str,
+        metadata: Option<&Value>,
+    ) -> Uuid {
+        use eros_engine_store::chat::{AssistantInsert, ChatRepo, UpsertUserOutcome};
+        let chat = ChatRepo { pool };
+        let user_row = match chat
+            .upsert_user_message_idempotent(session_id, "", client_msg_id, "user", metadata)
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+        chat.insert_assistant_batch(
+            session_id,
+            user_row,
+            &[AssistantInsert {
+                llm_attempts: None,
+                gateway_errors: None,
+                id: Uuid::new_v4(),
+                content: "好呀".into(),
+                assistant_action_type: "reply".into(),
+                continues_from_message_id: None,
+                truncated: false,
+                generation_id: None,
+                filter_audit: None,
+                metadata: None,
+                speaker_session_id: None,
+            }],
+        )
+        .await
+        .unwrap();
+        user_row
+    }
+
+    /// A one-hour date opened by an invitation sent under `client_msg_id` in
+    /// `session_id` and answered, as the stream route leaves a turn her accept
+    /// opened: the date is running, and the client may retry the send.
+    pub(crate) async fn seed_accepted_invitation(
+        pool: &PgPool,
+        session_id: Uuid,
+        user_id: Uuid,
+        instance_id: Uuid,
+        client_msg_id: &str,
+    ) -> eros_engine_store::activity::ActivityRecord {
+        let invitation = seed_answered_turn(
+            pool,
+            session_id,
+            client_msg_id,
+            Some(&json!({"action": {
+                "type": "date", "duration": "short", "place": "海边", "content": "散步"
+            }})),
+        )
+        .await;
+        eros_engine_store::activity::ActivityRepo { pool }
+            .accept(
+                &eros_engine_store::activity::NewActivity {
+                    session_id,
+                    user_id,
+                    instance_id,
+                    message_id: invitation,
+                    duration: eros_engine_core::types::DateDuration::Short,
+                    place: "海边",
+                    content: "散步",
+                },
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap()
+            .expect("the date opened")
+    }
+
     /// A v1 card sealed under `key`, as a downstream sends it.
     pub(crate) fn sealed_card(
         key: &[u8; 32],
