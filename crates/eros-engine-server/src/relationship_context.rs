@@ -92,6 +92,30 @@ pub(crate) async fn load_relationship_context(
     Some(ctx)
 }
 
+/// The latest episodes of `instance_id` and nothing else: no arc, no journal
+/// (spec 2026-11-12-chat-tone-emotional-design.md §4.3). `None` when the
+/// relationship layer is off. A store error reads as no episode, with a warn.
+pub(crate) async fn load_recent_episodes(
+    state: &AppState,
+    instance_id: Uuid,
+    relationship_layer_on: bool,
+) -> Option<RelationshipContext> {
+    if !relationship_layer_on {
+        return None;
+    }
+    let episodes = EpisodeRepo { pool: &state.pool }
+        .recent(instance_id, RECENT_EPISODES)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, instance_id = %instance_id, "relationship episodes load failed; episodes omitted");
+            Vec::new()
+        });
+    Some(RelationshipContext {
+        episodes,
+        ..Default::default()
+    })
+}
+
 /// Render the relationship part of `[shared_memories]` (§6.2): the arc
 /// paragraph (`{opening}\n{arc}`), then one `- {date}：{summary}` line per
 /// episode (oldest first, dated by `started_at` in `date_tz`), then the

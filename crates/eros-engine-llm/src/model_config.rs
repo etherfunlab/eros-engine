@@ -779,6 +779,18 @@ pub fn apply_output_regex(
     }
 }
 
+/// Per-turn base probabilities of the chat tones (`tones` on
+/// `[tasks.chat_companion]`). An unknown tone name fails the parse.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Tones {
+    /// Base probability that a 1:1 text turn is written in the `emotional`
+    /// tone, before the engine's factors. Legal range `[0.0, 1.0]`, enforced
+    /// by `validate_tones`; `0.0` is off.
+    #[serde(default)]
+    pub emotional: f64,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct TaskConfig {
     #[serde(default = "default_model_spec")]
@@ -936,6 +948,11 @@ pub struct TaskConfig {
     /// to each story round. Default 7, floor 1.
     #[serde(default)]
     pub context_days: Option<u32>,
+    /// Chat tones the engine draws per turn. Read ONLY on
+    /// `[tasks.chat_companion]`; task-level, no per-tier override, like
+    /// `input_filter`. Absent ⇒ no turn draws. See `Tones`.
+    #[serde(default)]
+    pub tones: Option<Tones>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -1748,6 +1765,16 @@ impl ModelConfig {
             .get("chat_companion")
             .and_then(|t| t.input_filter)
             .map(|t| t.0)
+            .unwrap_or(0.0)
+    }
+
+    /// chat_companion task-level `tones.emotional` base probability; no tier
+    /// override. Absent → 0.0, which means no turn draws a tone.
+    pub fn tone_emotional_probability(&self) -> f64 {
+        self.tasks
+            .get("chat_companion")
+            .and_then(|t| t.tones)
+            .map(|t| t.emotional)
             .unwrap_or(0.0)
     }
 
@@ -2827,6 +2854,27 @@ impl ModelConfig {
                         "[tasks].{name}.{field}: must be in {open}{low:.1}, {high:.1}], got {v}"
                     ));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Boot gate for `tones`: every probability must be a finite number in
+    /// `[0.0, 1.0]`. Checked on every task that carries the key, so a typo'd
+    /// value is refused wherever it sits. Task names are visited in sorted
+    /// order, like `validate_sampling`.
+    pub fn validate_tones(&self) -> Result<(), String> {
+        let mut names: Vec<&String> = self.tasks.keys().collect();
+        names.sort();
+        for name in names {
+            let Some(tones) = self.tasks[name].tones else {
+                continue;
+            };
+            let v = tones.emotional;
+            if !v.is_finite() || !(0.0..=1.0).contains(&v) {
+                return Err(format!(
+                    "[tasks].{name}.tones.emotional: must be in [0.0, 1.0], got {v}"
+                ));
             }
         }
         Ok(())
@@ -6108,6 +6156,64 @@ temperature = 0.8
         let cfg = ModelConfig::from_toml_str(toml).unwrap();
         let r = cfg.resolve("chat_companion", None);
         assert_eq!(r.sampling, Sampling::default());
+    }
+
+    #[test]
+    fn tones_absent_is_off() {
+        let cfg = ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel = \"m\"\n").unwrap();
+        assert_eq!(cfg.tone_emotional_probability(), 0.0);
+        cfg.validate_tones().unwrap();
+    }
+
+    #[test]
+    fn tones_emotional_is_read_from_chat_companion_only() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel = \"m\"\ntones = { emotional = 0.05 }\n\
+             [tasks.pde_decision]\nmodel = \"j\"\ntones = { emotional = 0.9 }\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.tone_emotional_probability(), 0.05);
+        cfg.validate_tones().unwrap();
+        for edge in ["0.0", "1.0", "1"] {
+            ModelConfig::from_toml_str(&format!(
+                "[tasks.chat_companion]\nmodel = \"m\"\ntones = {{ emotional = {edge} }}\n"
+            ))
+            .unwrap_or_else(|e| panic!("{edge} must parse: {e}"))
+            .validate_tones()
+            .unwrap_or_else(|e| panic!("{edge} must pass: {e}"));
+        }
+    }
+
+    #[test]
+    fn tones_refuses_out_of_range_and_unknown_names() {
+        for bad in ["1.5", "-0.1", "nan", "inf"] {
+            let cfg = ModelConfig::from_toml_str(&format!(
+                "[tasks.chat_companion]\nmodel = \"m\"\ntones = {{ emotional = {bad} }}\n"
+            ))
+            .unwrap();
+            let err = cfg.validate_tones().unwrap_err();
+            assert!(
+                err.contains("chat_companion") && err.contains("tones.emotional"),
+                "{bad}: {err}"
+            );
+        }
+        assert!(
+            ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"m\"\ntones = { sulky = 0.1 }\n"
+            )
+            .is_err(),
+            "an unknown tone name fails the parse"
+        );
+    }
+
+    /// The shipped example must pass the tones boot gate, with the key
+    /// commented out: off by default.
+    #[test]
+    fn shipped_model_config_ships_tones_off() {
+        let text = include_str!("../../../examples/model_config.toml");
+        let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml parses");
+        cfg.validate_tones().unwrap();
+        assert_eq!(cfg.tone_emotional_probability(), 0.0);
     }
 
     #[test]

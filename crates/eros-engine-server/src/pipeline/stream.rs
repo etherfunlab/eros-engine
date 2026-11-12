@@ -492,6 +492,10 @@ pub struct BurstOutcome {
 /// (live=false), the burst buffers the chat-generation attempt whole, then
 /// streams the filter LLM's rewrite and emits its deltas (never the original).
 /// Otherwise it streams live per-chunk exactly as before.
+///
+/// This form is the 1:1 burst of a turn that drew no tone, as the tests
+/// drive it; the pipeline calls [`drive_chat_burst_for`].
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn drive_chat_burst(
     state: Arc<AppState>,
@@ -529,12 +533,14 @@ fn drive_chat_burst(
         outcome,
         chain,
         None,
+        None,
     )
 }
 
 /// [`drive_chat_burst`] for one group speaker: `speaker_session_id` is
 /// stamped on every assistant row the burst persists and on every `meta`
-/// frame it yields. `None` is the 1:1 burst.
+/// frame it yields. `None` is the 1:1 burst. `tone` is the turn's drawn tone,
+/// written as `metadata.tone` on those rows; `None` writes no key.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn drive_chat_burst_for(
     state: Arc<AppState>,
@@ -554,6 +560,7 @@ pub(crate) fn drive_chat_burst_for(
     outcome: std::sync::Arc<std::sync::Mutex<BurstOutcome>>,
     chain: Vec<crate::byok::ChatHop>,
     speaker_session_id: Option<Uuid>,
+    tone: Option<eros_engine_core::tone::Tone>,
 ) -> impl futures_util::Stream<Item = ProtocolFrame> + Send + 'static {
     async_stream::stream! {
         let chat_repo = ChatRepo { pool: &state.pool };
@@ -617,6 +624,11 @@ pub(crate) fn drive_chat_burst_for(
             );
             if let Some(t) = tier.as_deref() {
                 m.insert("tier".into(), serde_json::json!(t));
+            }
+            // The drawn tone (spec 2026-11-12-chat-tone-emotional-design.md
+            // §6), `default` included; absent on a turn that did not draw.
+            if let Some(t) = tone {
+                m.insert("tone".into(), serde_json::json!(t.as_str()));
             }
             if !filter_attempts.is_empty() {
                 m.insert("filter_attempts".into(), serde_json::json!(filter_attempts));
@@ -5281,9 +5293,29 @@ pub(crate) fn run_stream_with(
             Event::UserMessage { affinity_scope, .. } => *affinity_scope,
             _ => eros_engine_core::scope::AffinityScope::default(),
         };
+        // The tone draw (spec 2026-11-12-chat-tone-emotional-design.md §3):
+        // the engine's, never the judge's. A text-bearing turn without an
+        // action draws once the deployment sets a base probability; `None`
+        // is a turn that did not draw, and it records no tone.
+        let tone_base = state.model_config.tone_emotional_probability();
+        let tone: Option<eros_engine_core::tone::Tone> =
+            (tone_base > 0.0 && plan.action_type.bears_text() && !action_turn).then(|| {
+                let p = eros_engine_core::tone::emotional_probability(
+                    tone_base,
+                    crate::prompt::persona_moody(&input.persona),
+                    turn_needs.as_ref(),
+                    eros_engine_core::scope::romance_compatible(affinity_scope),
+                );
+                eros_engine_core::tone::draw(p, rand::thread_rng().gen())
+            });
+        let emotional = tone == Some(eros_engine_core::tone::Tone::Emotional);
         // An action turn rolls no dice: the action already fixes what the turn
-        // is about (spec 2026-10-05 §5.2).
-        let roll = plan.reply_mode.is_none() && plan.action_type.bears_text() && !action_turn;
+        // is about (spec 2026-10-05 §5.2). Neither does an emotional turn: its
+        // prompt carries no `[this_turn]`.
+        let roll = plan.reply_mode.is_none()
+            && plan.action_type.bears_text()
+            && !action_turn
+            && !emotional;
         if roll {
             plan.nudges = crate::prompt::roll_nudges(
                 Some(&input.affinity),
@@ -6197,13 +6229,23 @@ pub(crate) fn run_stream_with(
                     &user_msg.user_locale,
                     chrono::Utc::now(),
                 );
-                let req_res = crate::pipeline::handlers::build_reply_request(
-                    &state, &input, &plan,
-                    user_msg.session_id, user_msg.user_id, user_msg.instance_id,
-                    user_msg.user_message_id, &now_ctx, true,
-                    body_state.as_deref(), needs_text.as_deref(),
-                    Some(&event_lines),
-                ).await;
+                let req_res = if emotional {
+                    crate::pipeline::handlers::build_emotional_reply_request(
+                        &state, &input, &plan,
+                        user_msg.session_id, user_msg.user_id, user_msg.instance_id,
+                        user_msg.user_message_id, &now_ctx,
+                        body_state.as_deref(), needs_text.as_deref(),
+                        Some(&event_lines),
+                    ).await
+                } else {
+                    crate::pipeline::handlers::build_reply_request(
+                        &state, &input, &plan,
+                        user_msg.session_id, user_msg.user_id, user_msg.instance_id,
+                        user_msg.user_message_id, &now_ctx, true,
+                        body_state.as_deref(), needs_text.as_deref(),
+                        Some(&event_lines),
+                    ).await
+                };
                 let (req, injected_tags) = match req_res {
                     Ok(r) => r,
                     Err(e) => {
@@ -6277,7 +6319,7 @@ pub(crate) fn run_stream_with(
                 let outcome = std::sync::Arc::new(std::sync::Mutex::new(
                     crate::pipeline::stream::BurstOutcome::default(),
                 ));
-                let burst = drive_chat_burst(
+                let burst = drive_chat_burst_for(
                     state.clone(),
                     user_msg.session_id,
                     user_msg.user_message_id,
@@ -6294,6 +6336,8 @@ pub(crate) fn run_stream_with(
                     random_draw,
                     outcome.clone(),
                     chain,
+                    None,
+                    tone,
                 );
                 {
                     use futures_util::StreamExt as _;
@@ -25048,6 +25092,327 @@ data: [DONE]\n\n"
                 "needs": {"hunger": "high", "social": "mid", "stamina": "mid", "emotional": "mid",
                     "outing": "mid", "indulgence": "mid"},
             })
+        );
+    }
+
+    // ─── The tone draw (spec 2026-11-12-chat-tone-emotional-design.md) ───
+
+    /// One 1:1 turn after an earlier exchange (`EARLIER-USER` /
+    /// `EARLIER-REPLY`), with `tones` appended to `[tasks.chat_companion]`.
+    /// `verdict = None` runs without the judge. Returns the mock server and
+    /// the session.
+    async fn run_tone_turn(
+        pool: &PgPool,
+        tones: &str,
+        verdict: Option<serde_json::Value>,
+        action: Option<eros_engine_core::types::UserAction>,
+        filtered: bool,
+    ) -> (wiremock::MockServer, Uuid) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        if let Some(verdict) = &verdict {
+            let judge_body = serde_json::json!({
+                "id": "gj", "model": "pde/judge",
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "choices": [{"message": {"content": verdict.to_string()}}],
+            });
+            Mock::given(wm_path("/api/v1/chat/completions"))
+                .and(body_string_contains("pde/judge"))
+                .respond_with(
+                    crate::pipeline::reasoning_call::test_support::sse_completion(judge_body),
+                )
+                .mount(&mock)
+                .await;
+        }
+        if filtered {
+            Mock::given(wm_path("/api/v1/chat/completions"))
+                .and(body_string_contains("fast/m"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_raw(
+                            filter_sse(
+                                "fast/m",
+                                &[(
+                                    "FILTERED-REPLY 她轻轻地望向窗外，思绪飘向了远方。阳光洒在她的脸上，温柔而明亮。她记得那个夏天的每一天，岁月如流水般逝去，带走了所有的悲欢离合。她把这一切都收进了心里，谁也没有告诉。",
+                                    None,
+                                )],
+                            ),
+                            "text/event-stream",
+                        ),
+                )
+                .mount(&mock)
+                .await;
+        }
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"REPLY\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"deepseek/x\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(pool, user_id).await;
+        let mut toml = format!("[tasks.chat_companion]\nmodel=\"deepseek/x\"\n{tones}\n");
+        if filtered {
+            toml.push_str(
+                "output_filter=true\n[tasks.chat_output_filter]\nmodel=\"fast/m\"\nfilter_prompt=\"REWRITE\"\n",
+            );
+        }
+        if verdict.is_some() {
+            toml.push_str("[tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide.\"\n");
+        }
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(&toml).unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        for (role, content, mins) in [
+            ("user", "EARLIER-USER", 2),
+            ("assistant", "EARLIER-REPLY。还有一句。", 1),
+        ] {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+                 VALUES ($1, $2, $3, now() - make_interval(mins => $4))",
+            )
+            .bind(session_id)
+            .bind(role)
+            .bind(content)
+            .bind(mins)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        let meta = action
+            .as_ref()
+            .map(|a| serde_json::json!({"action": serde_json::to_value(a).unwrap()}));
+        let content = if action.is_some() {
+            ""
+        } else {
+            "你今天怎么样"
+        };
+        let umid = match (ChatRepo { pool })
+            .upsert_user_message_idempotent(
+                session_id,
+                content,
+                "01JTONEDRAW000000000000000",
+                "user",
+                meta.as_ref(),
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: content.into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                image_url: None,
+                image: None,
+                quote: Default::default(),
+                user_locale: Default::default(),
+                action,
+                outfit: None,
+            },
+            None,
+        )
+        .collect()
+        .await;
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Error { .. })),
+            "the turn must not error: {frames:?}"
+        );
+        (mock, session_id)
+    }
+
+    /// The chat call's `messages`, as sent.
+    async fn tone_chat_messages(mock: &wiremock::MockServer) -> Vec<serde_json::Value> {
+        let reqs = mock.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&chat_request_body(&reqs)).unwrap();
+        body["messages"].as_array().expect("messages").clone()
+    }
+
+    /// The newest assistant row's metadata.
+    async fn tone_reply_metadata(pool: &PgPool, session_id: Uuid) -> serde_json::Value {
+        sqlx::query_scalar::<_, Option<serde_json::Value>>(
+            "SELECT metadata FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant' \
+             ORDER BY sent_at DESC, id DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        .expect("the reply row carries metadata")
+    }
+
+    async fn tone_decision_payload(pool: &PgPool, session_id: Uuid) -> serde_json::Value {
+        for _ in 0..50 {
+            if let Ok((Some(p),)) = sqlx::query_as::<_, (Option<serde_json::Value>,)>(
+                "SELECT payload FROM engine.companion_decision_events \
+                 WHERE session_id = $1 ORDER BY created_at DESC LIMIT 1",
+            )
+            .bind(session_id)
+            .fetch_one(pool)
+            .await
+            {
+                return p;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("companion_decision_events row must land within timeout");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_emotional_turn_sends_no_history_and_records_its_tone(pool: PgPool) {
+        let (mock, session_id) = run_tone_turn(
+            &pool,
+            "tones = { emotional = 1.0 }",
+            Some(serde_json::json!({
+                "action": "reply_text", "inner_state": "有点开心", "reply_mode": "judge"
+            })),
+            None,
+            false,
+        )
+        .await;
+        let messages = tone_chat_messages(&mock).await;
+        assert_eq!(messages.len(), 2, "system + the driving line: {messages:?}");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "你今天怎么样");
+        let system = messages[0]["content"].as_str().unwrap();
+        for gone in ["[inner_state]", "有点开心", "[user_profile]", "EARLIER-"] {
+            assert!(!system.contains(gone), "{gone} must not render: {system}");
+        }
+        assert!(
+            system.contains("[reply_length]\n最多 1 句，不超过 40 字"),
+            "{system}"
+        );
+        assert!(
+            system.contains("对方刚说的话你不全买账：挑出你不认同的那一点，反问回去"),
+            "the judge's reply_mode still writes rule ①: {system}"
+        );
+        assert_eq!(
+            tone_reply_metadata(&pool, session_id).await["tone"],
+            "emotional"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_emotional_turn_rolls_no_nudges(pool: PgPool) {
+        let (mock, session_id) = run_tone_turn(
+            &pool,
+            "tones = { emotional = 1.0 }",
+            Some(serde_json::json!({
+                "action": "reply_text", "inner_state": "", "reply_mode": null
+            })),
+            None,
+            false,
+        )
+        .await;
+        let payload = tone_decision_payload(&pool, session_id).await;
+        assert!(
+            payload["nudges"].is_null(),
+            "no dice on an emotional turn: {payload}"
+        );
+        assert!(
+            payload.get("tone").is_none(),
+            "the tone is not on the audit row: {payload}"
+        );
+        let messages = tone_chat_messages(&mock).await;
+        let system = messages[0]["content"].as_str().unwrap();
+        assert!(!system.contains("[this_turn]"), "{system}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_lost_draw_records_the_default_tone(pool: PgPool) {
+        let (mock, session_id) =
+            run_tone_turn(&pool, "tones = { emotional = 1e-12 }", None, None, false).await;
+        let messages = tone_chat_messages(&mock).await;
+        assert!(
+            messages.len() > 2,
+            "the default request keeps history: {messages:?}"
+        );
+        let system = messages[0]["content"].as_str().unwrap();
+        assert!(system.contains("[user_profile]"), "{system}");
+        assert_eq!(
+            tone_reply_metadata(&pool, session_id).await["tone"],
+            "default"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn without_the_key_no_tone_is_recorded(pool: PgPool) {
+        let (mock, session_id) = run_tone_turn(&pool, "", None, None, false).await;
+        assert!(tone_chat_messages(&mock).await.len() > 2);
+        let meta = tone_reply_metadata(&pool, session_id).await;
+        assert!(meta.get("tone").is_none(), "{meta}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_action_turn_does_not_draw(pool: PgPool) {
+        let (mock, session_id) = run_tone_turn(
+            &pool,
+            "tones = { emotional = 1.0 }",
+            Some(serde_json::json!({
+                "action": "reply_text", "inner_state": "", "action_response": "accept"
+            })),
+            Some(eros_engine_core::types::UserAction::Hug),
+            false,
+        )
+        .await;
+        assert!(tone_chat_messages(&mock).await.len() > 2);
+        let meta = tone_reply_metadata(&pool, session_id).await;
+        assert!(meta.get("tone").is_none(), "{meta}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_filtered_emotional_reply_records_its_tone(pool: PgPool) {
+        let (mock, session_id) =
+            run_tone_turn(&pool, "tones = { emotional = 1.0 }", None, None, true).await;
+        assert_eq!(tone_chat_messages(&mock).await.len(), 2);
+        let content: String = sqlx::query_scalar(
+            "SELECT content FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant' \
+             ORDER BY sent_at DESC, id DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            content.contains("FILTERED-REPLY"),
+            "the filter ran: {content}"
+        );
+        assert_eq!(
+            tone_reply_metadata(&pool, session_id).await["tone"],
+            "emotional"
         );
     }
 }

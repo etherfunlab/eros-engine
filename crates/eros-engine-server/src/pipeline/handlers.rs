@@ -1413,6 +1413,134 @@ pub(crate) async fn build_reply_request_with(
     ))
 }
 
+/// The reply request of an `emotional` turn (spec
+/// 2026-11-12-chat-tone-emotional-design.md §4): the least-hint system prompt
+/// and the driving user message, with no earlier row of the session. It reads
+/// no profile, recalls no memory and makes no embedding call; what it shows
+/// of the relationship is its latest episodes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn build_emotional_reply_request(
+    state: &AppState,
+    input: &DecisionInput,
+    plan: &ActionPlan,
+    session_id: Uuid,
+    user_id: Uuid,
+    instance_id: Uuid,
+    user_message_id: Uuid,
+    now: &crate::prompt::NowContext,
+    body_state: Option<&str>,
+    needs: Option<&str>,
+    event: Option<&crate::prompt::EventLines>,
+) -> Result<(ChatRequest, Vec<String>), AppError> {
+    let (quote, tier, requested_traits, memory_scope, content) = match &input.event {
+        Event::UserMessage {
+            quote,
+            tier,
+            prompt_traits,
+            memory_scope,
+            content,
+            ..
+        } => (
+            quote.as_ref(),
+            tier.as_deref(),
+            prompt_traits.as_slice(),
+            *memory_scope,
+            content.as_str(),
+        ),
+        _ => (None, None, &[][..], MemoryScope::default(), ""),
+    };
+
+    let resolved = state.model_config.resolve(CHAT_TASK, tier);
+    let (kept_traits, dropped_tags) =
+        filter_traits(requested_traits, resolved.allow_traits.as_deref());
+    if !dropped_tags.is_empty() {
+        tracing::info!(
+            tier = tier.unwrap_or("<none>"),
+            kept = kept_traits.len(),
+            dropped_tags = ?dropped_tags,
+            "prompt_traits: dropped tags not allowed for tier"
+        );
+    }
+
+    let (_, _, y_on) = memory_scope.resolve();
+    let episodes =
+        crate::relationship_context::load_recent_episodes(state, instance_id, y_on).await;
+    let shared_memories = crate::relationship_context::render_shared_memories(
+        episodes.as_ref(),
+        &[],
+        now.user_timezone.unwrap_or(chrono_tz::UTC),
+        crate::relationship_context::SHARED_MEMORIES_BUDGET_CHARS,
+    );
+
+    // Digest only: fragment and episode recall ride on a query embedding,
+    // and this turn has none.
+    let world = fetch_world_context(state, user_id, instance_id, None).await;
+    let stories = fetch_stories_context(state, user_id, instance_id, None).await;
+
+    // The insight lines follow CHAT_NOISE_CANCELLATION_DISABLED, as on the
+    // default path.
+    let character_state = if state.config.chat_noise_cancellation_disabled {
+        None
+    } else {
+        eros_engine_store::character_insight::CharacterInsightRepo { pool: &state.pool }
+            .load(instance_id)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    error = %e,
+                    instance_id = %instance_id,
+                    "character_insights load failed; [character_state] omitted"
+                );
+                None
+            })
+    };
+
+    let system_prompt = crate::prompt::build_emotional_prompt(
+        &input.persona,
+        plan.reply_mode,
+        plan.clothing.as_deref(),
+        &kept_traits,
+        world.as_ref(),
+        stories.as_ref(),
+        quote,
+        character_state.as_ref(),
+        now,
+        body_state,
+        needs,
+        event,
+        shared_memories.as_deref(),
+    );
+
+    // The driving row in its model-facing form (image preamble included). A
+    // driving row that is not in this session falls back to the event's text,
+    // so the request never goes out without the user's line.
+    let rows = ChatRepo { pool: &state.pool }
+        .history_up_to(session_id, user_message_id, 1)
+        .await?;
+    let mut injected: Vec<crate::repetition::Injected> = model_facing_history(rows, false)
+        .into_iter()
+        .filter(|m| m.id == user_message_id && m.role == "user")
+        .collect();
+    if injected.is_empty() {
+        injected.push(crate::repetition::Injected {
+            id: user_message_id,
+            role: "user".to_string(),
+            text: content.to_string(),
+        });
+    }
+
+    let injected_tags: Vec<String> = kept_traits.iter().map(|t| t.tag.clone()).collect();
+    Ok((
+        assemble_chat_request(
+            resolved,
+            system_prompt,
+            injected,
+            audit_from_event(&input.event),
+        ),
+        injected_tags,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5073,6 +5201,354 @@ mod tests {
             got.hunger,
             NeedLevel::Mid,
             "low + 4.5h to the anchor → one step"
+        );
+    }
+
+    // ─── build_emotional_reply_request (spec 2026-11-12-chat-tone-emotional-design.md §4) ───
+
+    async fn emotional_row(
+        pool: &PgPool,
+        session_id: Uuid,
+        role: &str,
+        content: &str,
+        secs: f64,
+        metadata: Option<serde_json::Value>,
+    ) -> Uuid {
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata, sent_at) \
+             VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5::float8)) \
+             RETURNING id",
+        )
+        .bind(session_id)
+        .bind(role)
+        .bind(content)
+        .bind(metadata)
+        .bind(secs)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Four episodes, `EP-1` the oldest.
+    async fn emotional_episodes(pool: &PgPool, instance_id: Uuid) {
+        for i in 1..=4i32 {
+            sqlx::query(
+                "INSERT INTO engine.relationship_episodes \
+                     (instance_id, summary, started_at, ended_at) \
+                 VALUES ($1, $2, \
+                         '2026-11-01T00:00:00Z'::timestamptz + make_interval(days => $3), \
+                         '2026-11-01T01:00:00Z'::timestamptz + make_interval(days => $3))",
+            )
+            .bind(instance_id)
+            .bind(format!("EP-{i}"))
+            .bind(i)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn emotional_request(
+        state: &AppState,
+        session_id: Uuid,
+        owner: Uuid,
+        instance_id: Uuid,
+        user_message_id: Uuid,
+        content: &str,
+        memory_scope: MemoryScope,
+    ) -> ChatRequest {
+        let plan = ActionPlan {
+            action_type: eros_engine_core::types::ActionType::ReplyText,
+            reply_style: eros_engine_core::types::ReplyStyle::Neutral,
+            affinity_deltas: Default::default(),
+            energy_cost: 0.0,
+            context_hints: vec!["JUDGE-HINT".into()],
+            reply_mode: None,
+            nudges: Default::default(),
+            clothing: None,
+            image_caption: None,
+            image_ref: eros_engine_core::types::ImageRef::Face,
+            aspect_ratio: None,
+            action_response: None,
+        };
+        let input = DecisionInput {
+            event: Event::UserMessage {
+                content: content.into(),
+                message_id: user_message_id,
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope,
+                affinity_scope: Default::default(),
+                quote: Default::default(),
+                action: None,
+                outfit: None,
+            },
+            affinity: ladder_test_affinity(session_id, owner, instance_id),
+            persona: ladder_test_persona(instance_id, owner),
+            signals: eros_engine_core::types::ConversationSignals {
+                message_count: 3,
+                hours_since_last_message: 0.1,
+                ghost_streak: 0,
+                hours_since_last_ghost: None,
+            },
+        };
+        let (req, _tags) = build_emotional_reply_request(
+            state,
+            &input,
+            &plan,
+            session_id,
+            owner,
+            instance_id,
+            user_message_id,
+            &crate::prompt::NowContext::default(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("build_emotional_reply_request succeeds");
+        req
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn emotional_request_is_the_system_prompt_and_the_driving_line(pool: PgPool) {
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, owner).await;
+        let session_id = make_session(&pool, owner, Some(instance_id)).await;
+        emotional_row(&pool, session_id, "user", "早", 0.0, None).await;
+        emotional_row(
+            &pool,
+            session_id,
+            "assistant",
+            "早呀。今天也要加油。",
+            1.0,
+            None,
+        )
+        .await;
+        let driving = emotional_row(&pool, session_id, "user", "今天好累", 2.0, None).await;
+
+        let state = crate::routes::companion::test_state(pool.clone());
+        let req = emotional_request(
+            &state,
+            session_id,
+            owner,
+            instance_id,
+            driving,
+            "今天好累",
+            MemoryScope::default(),
+        )
+        .await;
+
+        assert_eq!(req.messages.len(), 2, "{:?}", req.messages);
+        assert_eq!(req.messages[0].role, "system");
+        assert_eq!(req.messages[1].role, "user");
+        assert_eq!(req.messages[1].content, "今天好累");
+        let system = &req.messages[0].content;
+        for gone in ["早呀", "[user_profile]", "JUDGE-HINT", "[inner_state]"] {
+            assert!(!system.contains(gone), "{gone} must not render: {system}");
+        }
+        assert!(
+            system.contains("[reply_length]\n最多 1 句，不超过 40 字"),
+            "{system}"
+        );
+        assert_eq!(req.task.as_deref(), Some(CHAT_TASK));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn emotional_request_shows_the_three_latest_episodes(pool: PgPool) {
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, owner).await;
+        let session_id = make_session(&pool, owner, Some(instance_id)).await;
+        let driving = emotional_row(&pool, session_id, "user", "在吗", 0.0, None).await;
+        emotional_episodes(&pool, instance_id).await;
+        sqlx::query(
+            "INSERT INTO engine.relationship_arcs (instance_id, opening, arc, folded_through) \
+             VALUES ($1, 'ARC-OPENING', 'ARC-BODY', now())",
+        )
+        .bind(instance_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        MemoryRepo { pool: &pool }
+            .upsert(
+                MemoryLayer::Relationship,
+                session_id,
+                owner,
+                Some(instance_id),
+                "用户：RAW-ROW",
+                &unit_embedding(3),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let state = crate::routes::companion::test_state(pool.clone());
+        let req = emotional_request(
+            &state,
+            session_id,
+            owner,
+            instance_id,
+            driving,
+            "在吗",
+            MemoryScope::default(),
+        )
+        .await;
+        let system = &req.messages[0].content;
+
+        let at = |needle: &str| {
+            system
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} must render: {system}"))
+        };
+        assert!(at("[shared_memories]") < at("EP-2"));
+        assert!(at("EP-2") < at("EP-3") && at("EP-3") < at("EP-4"));
+        for gone in ["EP-1", "ARC-OPENING", "ARC-BODY", "RAW-ROW"] {
+            assert!(!system.contains(gone), "{gone} must not render: {system}");
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn emotional_request_reads_no_episode_with_the_relationship_layer_off(pool: PgPool) {
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, owner).await;
+        let session_id = make_session(&pool, owner, Some(instance_id)).await;
+        let driving = emotional_row(&pool, session_id, "user", "在吗", 0.0, None).await;
+        emotional_episodes(&pool, instance_id).await;
+
+        let state = crate::routes::companion::test_state(pool.clone());
+        let req = emotional_request(
+            &state,
+            session_id,
+            owner,
+            instance_id,
+            driving,
+            "在吗",
+            MemoryScope::NeutralOnly,
+        )
+        .await;
+        let system = &req.messages[0].content;
+        assert!(!system.contains("EP-"), "{system}");
+        assert!(
+            system.contains("[shared_memories]\n（还没有专属记忆，慢慢来）"),
+            "{system}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn emotional_request_survives_a_driving_row_outside_the_session(pool: PgPool) {
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, owner).await;
+        let session_id = make_session(&pool, owner, Some(instance_id)).await;
+        emotional_row(&pool, session_id, "user", "别的话", 0.0, None).await;
+
+        let state = crate::routes::companion::test_state(pool.clone());
+        let req = emotional_request(
+            &state,
+            session_id,
+            owner,
+            instance_id,
+            Uuid::new_v4(),
+            "在吗",
+            MemoryScope::default(),
+        )
+        .await;
+        assert_eq!(req.messages.len(), 2, "{:?}", req.messages);
+        assert_eq!(req.messages[1].role, "user");
+        assert_eq!(req.messages[1].content, "在吗");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn emotional_request_keeps_the_image_preamble(pool: PgPool) {
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, owner).await;
+        let session_id = make_session(&pool, owner, Some(instance_id)).await;
+        let driving = emotional_row(
+            &pool,
+            session_id,
+            "user",
+            "",
+            0.0,
+            Some(serde_json::json!({
+                "image_url": "https://example.test/cat.png",
+                "vision": { "description": "一只猫" }
+            })),
+        )
+        .await;
+        let row = ChatRepo { pool: &pool }
+            .history_up_to(session_id, driving, 1)
+            .await
+            .unwrap()
+            .pop()
+            .expect("the driving row");
+        let want = model_facing_user_text(&row);
+        assert!(
+            want.contains("一只猫"),
+            "the fixture has a preamble: {want}"
+        );
+
+        let state = crate::routes::companion::test_state(pool.clone());
+        let req = emotional_request(
+            &state,
+            session_id,
+            owner,
+            instance_id,
+            driving,
+            "",
+            MemoryScope::default(),
+        )
+        .await;
+        assert_eq!(req.messages.len(), 2, "{:?}", req.messages);
+        assert_eq!(req.messages[1].content, want);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn emotional_request_honours_the_noise_cancellation_switch(pool: PgPool) {
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, owner).await;
+        let session_id = make_session(&pool, owner, Some(instance_id)).await;
+        let driving = emotional_row(&pool, session_id, "user", "在吗", 0.0, None).await;
+        eros_engine_store::character_insight::CharacterInsightRepo { pool: &pool }
+            .apply_extraction(
+                instance_id,
+                &serde_json::json!({ "current_situation": "SITUATION-X" }),
+            )
+            .await
+            .unwrap();
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        let on = emotional_request(
+            &state,
+            session_id,
+            owner,
+            instance_id,
+            driving,
+            "在吗",
+            MemoryScope::default(),
+        )
+        .await;
+        assert!(
+            on.messages[0].content.contains("SITUATION-X"),
+            "{}",
+            on.messages[0].content
+        );
+
+        state.config.chat_noise_cancellation_disabled = true;
+        let off = emotional_request(
+            &state,
+            session_id,
+            owner,
+            instance_id,
+            driving,
+            "在吗",
+            MemoryScope::default(),
+        )
+        .await;
+        assert!(
+            !off.messages[0].content.contains("SITUATION-X"),
+            "{}",
+            off.messages[0].content
         );
     }
 }

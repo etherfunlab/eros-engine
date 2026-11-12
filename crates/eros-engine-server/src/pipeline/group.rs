@@ -704,6 +704,8 @@ pub(crate) fn run_group_turn(
                 outcome.clone(),
                 chain,
                 Some(seat.member_session_id),
+                // A group turn draws no tone.
+                None,
             );
             futures_util::pin_mut!(burst);
             let mut failed = false;
