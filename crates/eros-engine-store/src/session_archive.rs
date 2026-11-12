@@ -19,7 +19,7 @@ use uuid::Uuid;
 /// `tx` to commit and its deletes then take the new row with the rest; and a
 /// lock requested once the archive has updated the row waits for it and then
 /// finds the session archived. An unknown id reads back as not live too.
-pub(crate) async fn lock_live_session(
+pub async fn lock_live_session(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     session_id: Uuid,
 ) -> Result<bool, sqlx::Error> {

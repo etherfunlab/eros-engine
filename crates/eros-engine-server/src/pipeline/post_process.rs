@@ -850,7 +850,7 @@ fn fold_level(v: &serde_json::Value) -> Result<Option<i16>, ()> {
 /// rejects the whole verdict: all-zero grades, no level reads, empty reason,
 /// so the rule deltas still persist and the affinity write never fails
 /// because the evaluator failed. Returns (grades, levels, reason).
-fn parse_affinity_eval(
+pub(crate) fn parse_affinity_eval(
     raw: &str,
 ) -> (
     eros_engine_core::affinity::AxisGrades,

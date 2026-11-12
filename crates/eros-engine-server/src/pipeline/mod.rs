@@ -3,6 +3,7 @@
 //! `record_generation`) plus the chat / post-process / dreaming
 //! submodules. The streaming chat entry point is `stream::run_stream`.
 
+pub mod activity;
 pub mod chat_queue;
 pub mod dreaming;
 pub mod group;
