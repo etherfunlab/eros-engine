@@ -123,7 +123,9 @@ impl ActivityRepo<'_> {
     /// runs for the duration; it ends any incident under way and leaves a
     /// background running. An invitation that already has its date gets that
     /// date back, so a re-driven turn opens one. `None` while a date of the
-    /// instance is on at `now`: nothing is written but her answer.
+    /// instance has not ended at `now`, one that starts after `now` included
+    /// (its start is a stored `sent_at`, which can be later than the caller's
+    /// clock): nothing is written but her answer.
     pub async fn accept(
         &self,
         a: &NewActivity<'_>,
@@ -152,8 +154,7 @@ impl ActivityRepo<'_> {
         }
         let on: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM engine.persona_events \
-                             WHERE instance_id = $1 AND kind = $2 \
-                               AND started_at <= $3 AND ends_at > $3)",
+                             WHERE instance_id = $1 AND kind = $2 AND ends_at > $3)",
         )
         .bind(a.instance_id)
         .bind(EventKind::OnADate.as_str())
@@ -719,6 +720,39 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(response, "accept", "her reply stands");
+    }
+
+    /// A date's start is her reply's stored `sent_at`, which can be later than
+    /// the caller's clock: a date yet to start still holds the instance.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn accept_refuses_while_a_date_of_the_instance_is_about_to_start(pool: PgPool) {
+        let s = scene(&pool).await;
+        let elsewhere = ChatRepo { pool: &pool }
+            .create_session(s.owner, s.instance)
+            .await
+            .unwrap()
+            .id;
+        EventRepo { pool: &pool }
+            .insert_preempting(&NewEvent {
+                instance_id: s.instance,
+                session_id: elsewhere,
+                event_key: "activity:another",
+                kind: EventKind::OnADate,
+                started_at: t(NOW) + Duration::seconds(1),
+                ends_at: t(NOW) + Duration::hours(1),
+            })
+            .await
+            .unwrap();
+
+        let refused = ActivityRepo { pool: &pool }
+            .accept(&invitation(&s, DateDuration::Short), t(NOW))
+            .await
+            .unwrap();
+        assert!(refused.is_none(), "a date about to start is on");
+        assert_eq!(
+            count(&pool, "SELECT count(*) FROM engine.activities").await,
+            0
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]

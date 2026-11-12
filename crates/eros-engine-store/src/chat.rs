@@ -225,7 +225,9 @@ pub struct ReactedMessage {
 }
 
 /// The sessions a parent session's reads span: itself (`$1`) and the
-/// sub-sessions of its dates. A relation, to follow `IN`.
+/// sub-sessions of its dates. A parenthesized relation: read each session
+/// through its own `LATERAL ... ORDER BY ... LIMIT` so the early-stopping index
+/// scan is kept, never as `session_id IN (...)`, which reads the whole session.
 const WITH_SUB_SESSIONS: &str = "(SELECT $1::uuid UNION ALL \
      SELECT d.sub_session_id FROM engine.activities d WHERE d.session_id = $1)";
 
@@ -597,13 +599,16 @@ impl<'a> ChatRepo<'a> {
         limit: i64,
     ) -> Result<Vec<Option<serde_json::Value>>, sqlx::Error> {
         sqlx::query_scalar::<_, Option<serde_json::Value>>(&format!(
-            "SELECT m.metadata FROM engine.chat_messages m \
-             WHERE m.session_id IN {WITH_SUB_SESSIONS} \
-               AND m.role = 'user' AND m.channel IS NULL \
-               AND ($2::uuid IS NULL OR (m.sent_at, m.id) < \
-                    (SELECT a.sent_at, a.id FROM engine.chat_messages a \
-                      WHERE a.id = $2 AND a.session_id IN {WITH_SUB_SESSIONS})) \
-             ORDER BY m.sent_at DESC, m.id DESC \
+            "SELECT x.metadata FROM {WITH_SUB_SESSIONS} s(id) \
+             CROSS JOIN LATERAL ( \
+                 SELECT m.metadata, m.sent_at, m.id FROM engine.chat_messages m \
+                  WHERE m.session_id = s.id AND m.role = 'user' AND m.channel IS NULL \
+                    AND ($2::uuid IS NULL OR (m.sent_at, m.id) < \
+                         (SELECT a.sent_at, a.id FROM engine.chat_messages a \
+                           WHERE a.id = $2 AND a.session_id IN {WITH_SUB_SESSIONS})) \
+                  ORDER BY m.sent_at DESC, m.id DESC \
+                  LIMIT $3) x \
+             ORDER BY x.sent_at DESC, x.id DESC \
              LIMIT $3"
         ))
         .bind(session_id)
@@ -1593,12 +1598,16 @@ impl<'a> ChatRepo<'a> {
         sqlx::Error,
     > {
         let row: Option<(serde_json::Value, serde_json::Value)> = sqlx::query_as(&format!(
-            "SELECT metadata->'memory_scope', metadata->'affinity_scope' \
-             FROM engine.chat_messages \
-             WHERE session_id IN {WITH_SUB_SESSIONS} AND role = 'assistant' \
-               AND metadata ? 'memory_scope' AND metadata ? 'affinity_scope' \
-               AND metadata->>'proactive' IS DISTINCT FROM 'life_choice' \
-             ORDER BY sent_at DESC, id DESC LIMIT 1"
+            "SELECT x.memory_scope, x.affinity_scope FROM {WITH_SUB_SESSIONS} s(id) \
+             CROSS JOIN LATERAL ( \
+                 SELECT m.metadata->'memory_scope' AS memory_scope, \
+                        m.metadata->'affinity_scope' AS affinity_scope, m.sent_at, m.id \
+                   FROM engine.chat_messages m \
+                  WHERE m.session_id = s.id AND m.role = 'assistant' \
+                    AND m.metadata ? 'memory_scope' AND m.metadata ? 'affinity_scope' \
+                    AND m.metadata->>'proactive' IS DISTINCT FROM 'life_choice' \
+                  ORDER BY m.sent_at DESC, m.id DESC LIMIT 1) x \
+             ORDER BY x.sent_at DESC, x.id DESC LIMIT 1"
         ))
         .bind(session_id)
         .fetch_optional(self.pool)
