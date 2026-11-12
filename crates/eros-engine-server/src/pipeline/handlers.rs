@@ -1572,10 +1572,11 @@ pub(crate) async fn build_emotional_reply_request(
         });
     }
 
-    req.messages.extend(injected.into_iter().map(|m| ChatMessage {
-        role: m.role,
-        content: m.text,
-    }));
+    req.messages
+        .extend(injected.into_iter().map(|m| ChatMessage {
+            role: m.role,
+            content: m.text,
+        }));
     Ok((req, injected_tags))
 }
 

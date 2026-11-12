@@ -3314,7 +3314,10 @@ mod tests {
     /// cancellation, so the default request carries history.
     async fn seed_history(pool: &PgPool, session_id: Uuid) {
         seed_user_messages(pool, session_id, 10).await;
-        for (role, content) in [("user", "EARLIER-USER"), ("assistant", "EARLIER-REPLY。还有一句。")] {
+        for (role, content) in [
+            ("user", "EARLIER-USER"),
+            ("assistant", "EARLIER-REPLY。还有一句。"),
+        ] {
             sqlx::query(
                 "INSERT INTO engine.chat_messages (session_id, role, content) VALUES ($1, $2, $3)",
             )
@@ -3334,12 +3337,7 @@ mod tests {
         c[0]["messages"].as_array().unwrap().clone()
     }
 
-    async fn draw_one(
-        state: &AppState,
-        session_id: Uuid,
-        user_id: Uuid,
-        kind: EventKindDto,
-    ) {
+    async fn draw_one(state: &AppState, session_id: Uuid, user_id: Uuid, kind: EventKindDto) {
         let out = draw_event_at(
             state,
             session_id,
@@ -3350,7 +3348,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(out.event.is_some() && out.message.is_some(), "{kind:?} told");
+        assert!(
+            out.event.is_some() && out.message.is_some(),
+            "{kind:?} told"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -3387,7 +3388,10 @@ mod tests {
         assert!(!system.contains("EARLIER-"), "{system}");
         assert!(!system.contains("[user_profile]"), "{system}");
         assert!(system.contains("- 正在经历：出差"), "{system}");
-        assert_eq!(event_tone(&pool, session_id).await.as_deref(), Some("emotional"));
+        assert_eq!(
+            event_tone(&pool, session_id).await.as_deref(),
+            Some("emotional")
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -3416,7 +3420,10 @@ mod tests {
 
         let msgs = companion_messages(&mock).await;
         assert!(msgs.len() > 2, "{msgs:?}");
-        assert!(msgs[0]["content"].as_str().unwrap().contains("[user_profile]"));
+        assert!(msgs[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("[user_profile]"));
         assert_eq!(event_tone(&pool, session_id).await, None);
     }
 
@@ -3440,6 +3447,9 @@ mod tests {
 
         let msgs = companion_messages(&mock).await;
         assert_eq!(msgs.len(), 2, "system + the cue: {msgs:?}");
-        assert_eq!(event_tone(&pool, session_id).await.as_deref(), Some("emotional"));
+        assert_eq!(
+            event_tone(&pool, session_id).await.as_deref(),
+            Some("emotional")
+        );
     }
 }
