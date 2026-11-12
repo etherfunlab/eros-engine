@@ -101,6 +101,7 @@ allow_traits = ["tag_a"]                    # optional, overrides task-level all
 | `tasks.<name>.allow_traits` | `Array<String>` | 否 | 此任务的 prompt-trait allow-list（三态：缺失 = 不设门控；`[]` = 丢弃所有 trait；`["a","b"]` = 白名单）。找不到匹配的 tier 块时使用。 |
 | `tasks.<name>.tiers.<tier>` | 子表 | 否 | Per-tier 覆盖。可设置 `model`、`fallback`、`allow_traits` 和/或 `retry_depth`。不覆盖 `temperature`、`max_tokens`、`top_p`、`frequency_penalty`、`presence_penalty` 或 `repetition_penalty`——这六个都只在任务级生效。**`<name>` 只能是 `chat_companion` 或 `chat_output_filter`**——其余任务都按无 tier 解析，在它们下面写 tier 块会拒绝启动（见上）。 |
 | `tasks.chat_companion.input_filter` | `bool` \| `f64` | 否 | 用户输入改写 filter 的全局 trigger。仅可在 `chat_companion` 的任务级配置中设置（无 per-tier 覆盖）。`false`/缺失 = 关闭，`true` = 每轮执行，`0.8` = 约 80% 的轮次执行（超出 `[0.0, 1.0]` 的数字会被拒绝）。参见“`input_filter`”。 |
+| `tasks.chat_companion.tones` | table | 否 | 聊天语气：`{ emotional = <f64> }`，`[0.0, 1.0]` 内的基础概率。仅可在 `chat_companion` 的任务级配置中设置（无 per-tier 覆盖）。缺失或 `0` = 关闭；超出范围的值、或 `emotional` 以外的语气名会拒绝启动。参见“`tones`”。 |
 | `tasks.<name>.description` | `String` | 否 | 文档字段，代码忽略。 |
 
 **`defaults.ignore_providers` 和 `defaults.provider_sort` 已移除。** 残留
@@ -516,6 +517,54 @@ BYOK hop 使用其请求中 `byok` 块的 `output_regex` 规则，而不是这�
 #### `[tasks.chat_input_filter]` 字段
 
 复用标准任务结构：`model`、`fallback`、`retry_depth`（默认 1）、`temperature`、`max_tokens`、`filter_prompt`。`trigger`、`timing` 和 `allow_traits` 会被忽略（input filter 没有 trigger 或 timing）；`tiers` 块会拒绝启动，因为 tier 块只允许出现在 `chat_companion` 和 `chat_output_filter` 上。
+
+### `tones` — 聊天语气（仅限 chat 任务）
+
+`[tasks.chat_companion]` 上的 `tones` 打开 engine 的聊天语气。它只在任务级设置，没有 per-tier
+覆盖。缺失（默认）或 `emotional = 0` 即关闭，这时每个 prompt、请求和落库的行都和没有这个键时一样。
+超出 `[0.0, 1.0]` 的值、或 `emotional` 以外的语气名，会拒绝启动。
+
+```toml
+[tasks.chat_companion]
+tones = { emotional = 0.05 }
+```
+
+判官决定回复和用户这句话的关系（`reply_mode`），从不决定语气。语气由 engine 在这一轮定稿的计划上决定，
+只有带文字的回复才有语气：
+
+- **不带用户动作的 1:1 文字回合**，以概率 `min(1, emotional × moody × needs × compatible)` 用 `emotional`：
+
+  | 系数 | 取值 |
+  |---|---|
+  | `moody` | 角色的 `art_metadata.moody`：`true` ×3，`false` ×⅓，不写或不是布尔值 ×1 |
+  | `needs` | 她很想被在乎（`emotional` 高）、很累（`stamina` 低）、饿了（`hunger` 高）或瘾上来了（`indulgence` 高）时 ×3；四项任一即可，不叠加；还没有评级时 ×1 |
+  | `compatible` | 这一轮的 `affinity_scope` 含暧昧感轴时 ×2 |
+
+  `emotional = 0.05` 时，性向相容、又有一项需求成立，是 0.30；角色再是 `moody`，就是 0.90。
+- **带七种用户动作之一的 1:1 回合**（`french_kiss`、`tease`、`hug_from_behind`、`touch`、`strip`、
+  `threaten`、`tip`）一律用 `emotional`，接受、拒绝都一样。其余带动作的回合从不用 `emotional`。
+- **生活事件开始时发的那条消息**，有十六种事件用 `emotional`（[life-events-needs.zh.md](life-events-needs.zh.md#她怎么讲出来)）。
+
+群聊回合、`/open` 和其他主动消息、编辑与改图回合、语音通话从不带语气。
+
+**`emotional` 回复**只凭人设和用户刚说的话、做的事来写，模型面前几乎没有别的东西：
+
+- 请求是 system prompt 加一条 user 消息：这一轮自己那句话（带图片说明和动作标记），或事件的提示。
+  会话里更早的行一条都不发。
+- system prompt 去掉 `[user_profile]`、亲密度结论（`[relationship]`、`[mood]`、`[feelings]`）、
+  判官的 `[inner_state]`、`[emotional_context]`、`[reactions]` 和纪念日那一行，也不掷每轮的 nudge。
+  `[reply_length]` 固定在最低一档（最多 1 句，不超过 40 字）。
+- 它保留人设各块、prompt traits、`[character_state]`（穿着、身上还带着的、需要）、带她的事件的
+  `[now]`、`[quote]`、动作回合的 `[user_action]`，以及按 `reply_mode` 写出的铁律 ①。
+  `[world_memories]` 和 `[world_stories]` 只出 digest：这一轮不调 embedding。
+- `[shared_memories]` 只放这段关系最近的三个 episode；这一轮的 `memory_scope` 关掉关系层时一个都没有。
+
+post-process（记忆、insights、亲密度）照常跑；模型、采样、输出 filter 和各帧都和 chat 任务一样。
+
+**记录。** 抽过签的回合，它的每一行 assistant 消息都带 `metadata.tone`，值为 `"emotional"` 或
+`"default"`。名单内动作回合的行、名单内事件消息的行也带 `"emotional"`；用户行的 `metadata.action`
+和消息的 `metadata.proactive` 能把它们和抽签的回合区分开。语气没碰到的回合没有 `tone` 这个键。
+语气不存别处：判官的决策行上没有，任何帧里也没有。
 
 ## 任务名
 

@@ -411,6 +411,8 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 **让你拍照。** 请求带 `image`、部署配置了 `[tasks.chat_image_prompt_compose]` 时，被接受的 `photo` 以 `reply_text_image` 回复：先是她的话，再是一条以她的脸部参考为基础、按当前场景组出来的 `image_request`。有没有 LLM 判官都一样。被接受的 `strip` 也这样回复。被拒的 `photo` 或 `strip`，或没有这项出图能力的，只回文字，即使判官提议了出图。`image.force = true` 仍让这一轮是 `reply_image`，被拒时图按拒绝的结果来画。
 
+**情绪化回复。** 部署打开 [`tones.emotional`](model-config.zh.md#tones--聊天语气仅限-chat-任务)（大于 0）时，带 `french_kiss`、`tease`、`hug_from_behind`、`touch`、`strip`、`threaten` 或 `tip` 的回合用 `emotional` 语气回复，接受、拒绝都一样：回复只凭人设、这个动作和她的决定来写，不看聊天历史、用户画像和亲密度结论。接受还是拒绝仍照上面的方式决定。回复的行带 `metadata.tone = "emotional"`。
+
 带动作时 `content` 可以为空，也可以和 `image_url`、`image` 同时出现。取值不合规（超出范围、缺少 `item`/`text`/`amount_usd`/`kind`/`name`）一律返回 `422`，`code: "unprocessable"`；`type` 或 `item` 不在上表取值内时，请求体按无法解析的 JSON 拒绝（同样是 `422`）。动作存在用户行上，两套历史接口都以 `action` 字段返回，该回合生效之后带 `response`。
 
 ```bash

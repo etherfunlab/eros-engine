@@ -530,6 +530,14 @@ world. Two cue variants:
 - An incident drawn during a background opens with the background's state:
   `（你正在外地出差。你刚在路上遇到了一只小动物。）`.
 
+**In the emotional tone.** While the deployment has
+[`tones.emotional`](model-config.md#tones--chat-tones-chat-task-only) above 0, sixteen kinds
+are told in the `emotional` tone: `quarrel`, `scolded_by_superior`, `scolded_superior`, `got_hit`, `hit_someone`, `police_encounter`, `ex_wants_back`, `irritable`, `want_to_quit_job`, `unwell`, `sick`, `period`, `sudden_desire`, `drinking`, `smoking_weed` and `just_have_sex`. Their request is then the emotional system prompt
+and the cue alone: no history window, no memory recall, no user profile and no affinity
+conclusions; `[shared_memories]` holds the relationship's three latest episodes, and `[now]`
+keeps the events under way. The message's row carries `metadata.tone = "emotional"`. Every
+other kind, and every kind while the tone is off, is told as above.
+
 Then:
 
 - Output regex rules apply as on any reply. A blank reply, or one the rules strip to empty,

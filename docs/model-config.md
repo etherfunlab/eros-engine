@@ -103,6 +103,7 @@ Field details:
 | `tasks.<name>.allow_traits` | `Array<String>` | no | Prompt-trait allow-list for this task (three-state: absent = no gating; `[]` = drop all traits; `["a","b"]` = whitelist). Used when no matching tier block is found. |
 | `tasks.<name>.tiers.<tier>` | sub-table | no | Per-tier overrides. May set `model`, `fallback`, `allow_traits`, and/or `retry_depth`. Does not override `temperature`, `max_tokens`, `top_p`, `frequency_penalty`, `presence_penalty`, or `repetition_penalty` — all six are task-level only. **`<name>` may only be `chat_companion` or `chat_output_filter`** — every other task resolves without a tier, and a tier block under one refuses to boot (see above). |
 | `tasks.chat_companion.input_filter` | `bool` \| `f64` | no | Global trigger for the user-input rewrite filter. Task-level only on `chat_companion` (no per-tier override). `false`/absent = off, `true` = every turn, `0.8` = ~80% of turns (a number outside `[0.0, 1.0]` is rejected). See "`input_filter`". |
+| `tasks.chat_companion.tones` | table | no | Chat tones: `{ emotional = <f64> }`, a base probability in `[0.0, 1.0]`. Task-level only on `chat_companion` (no per-tier override). Absent or `0` = off; a value out of range or a tone name other than `emotional` refuses to boot. See "`tones`". |
 | `tasks.<name>.description` | `String` | no | Documentation field, ignored by code. |
 
 **`defaults.ignore_providers` and `defaults.provider_sort` are removed.** A
@@ -598,6 +599,73 @@ Reuses the standard task shape: `model`, `fallback`, `retry_depth` (default 1),
 `temperature`, `max_tokens`, `filter_prompt`. `trigger`, `timing` and `allow_traits` are ignored (the input
 filter has no triggers or timing); a `tiers` block refuses to boot, since tier
 blocks are limited to `chat_companion` and `chat_output_filter`.
+
+### `tones` — chat tones (chat task only)
+
+`tones` on `[tasks.chat_companion]` turns on the engine's chat tones. It is
+task-level only, with no per-tier override. Absent (the default) or
+`emotional = 0` is off, and every prompt, request and stored row is then what it
+is without the key. A value outside `[0.0, 1.0]`, or a tone name other than
+`emotional`, refuses to boot.
+
+```toml
+[tasks.chat_companion]
+tones = { emotional = 0.05 }
+```
+
+The judge picks how a reply relates to the user's message (`reply_mode`); it
+never picks the tone. The engine decides the tone on the turn's final plan, and
+only a reply that bears text has one:
+
+- **A 1:1 text turn without a user action** is `emotional` with probability
+  `min(1, emotional × moody × needs × compatible)`:
+
+  | factor | value |
+  |---|---|
+  | `moody` | the persona's `art_metadata.moody`: `true` ×3, `false` ×⅓, absent or not a boolean ×1 |
+  | `needs` | ×3 when she badly wants to be cared about (`emotional` high), is tired (`stamina` low), is hungry (`hunger` high) or is craving (`indulgence` high); any one of the four, not stacking; no rating yet ×1 |
+  | `compatible` | ×2 when the turn's `affinity_scope` has a chemistry axis |
+
+  With `emotional = 0.05`, a compatible pair and one of the needs give 0.30,
+  and a `moody` persona then 0.90.
+- **A 1:1 turn carrying one of seven user actions** (`french_kiss`, `tease`,
+  `hug_from_behind`, `touch`, `strip`, `threaten`, `tip`) is always
+  `emotional`, accepted or refused. Any other action turn is never `emotional`.
+- **The message a life event sends when it starts** is `emotional` for sixteen
+  kinds ([life-events-needs.md](life-events-needs.md#how-she-tells-it)).
+
+Group turns, `/open` and the other proactive messages, edit and image-edit turns
+and voice calls never take a tone.
+
+**An `emotional` reply** is written from the persona and what the user just said
+or did, with little else in front of the model:
+
+- The request is the system prompt and one user message: the turn's own line
+  (with its image preamble and action marker), or the event's cue. No earlier
+  row of the session is sent.
+- The system prompt leaves out `[user_profile]`, the affinity conclusions
+  (`[relationship]`, `[mood]`, `[feelings]`), the judge's `[inner_state]`,
+  `[emotional_context]`, `[reactions]` and the anniversary line, and no
+  per-turn nudge is rolled. `[reply_length]` is fixed at its lowest tier
+  (最多 1 句，不超过 40 字).
+- It keeps the persona blocks, prompt traits, `[character_state]` (outfit,
+  lingering effects, needs), `[now]` with her events, `[quote]`, `[user_action]`
+  on an action turn, and iron rule ① as `reply_mode` writes it.
+  `[world_memories]` and `[world_stories]` render from their digests only:
+  no embedding call is made.
+- `[shared_memories]` holds the relationship's three latest episodes and
+  nothing else; none when the turn's `memory_scope` turns the relationship
+  layer off.
+
+Post-processing (memory, insights, affinity) runs as on any turn, and the model,
+sampling, output filter and frames are those of the chat task.
+
+**The record.** Every assistant row of a turn that drew carries `metadata.tone`,
+`"emotional"` or `"default"`. The rows of a listed action turn and of a listed
+event message carry `"emotional"` too; the user row's `metadata.action` and the
+message's `metadata.proactive` tell those apart from a drawn turn. A turn the
+tone did not touch has no `tone` key. The tone is stored nowhere else: not on
+the judge's decision row and not in any frame.
 
 ## Task names
 

@@ -464,6 +464,13 @@ A turn is a user message of the text session; product-QA messages and voice call
 
 **A photo she lets you take.** An accepted `photo` on a turn whose request carries `image`, in a deployment with `[tasks.chat_image_prompt_compose]` configured, is answered as `reply_text_image`: her words, then one `image_request` built on her face reference, composed from the scene. This holds with or without the LLM judge. An accepted `strip` is answered the same way. A refused `photo` or `strip`, or one without that image capability, is a text reply, even when the judge proposed a picture. `image.force = true` still makes the turn `reply_image`, and on a refusal the picture follows the refusal.
 
+**Emotional replies.** While the deployment has
+[`tones.emotional`](model-config.md#tones--chat-tones-chat-task-only) above 0, a turn carrying
+`french_kiss`, `tease`, `hug_from_behind`, `touch`, `strip`, `threaten` or `tip` is answered in
+the `emotional` tone, accepted or refused: the reply is written from the persona, the action and
+her response, without the chat history, the user profile or the affinity conclusions. The
+response itself is decided as above. The reply's rows carry `metadata.tone = "emotional"`.
+
 With an action, `content` may be empty, and it can be combined with
 `image_url` and `image`. Every value violation (bounds, missing
 `item`/`text`/`amount_usd`/`kind`/`name`) is a `422` with `code: "unprocessable"`; a body whose `type` or `item` is not one of the
