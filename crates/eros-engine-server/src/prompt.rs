@@ -1185,6 +1185,15 @@ pub struct EventLines {
     /// wrote during it) and a false alarm not yet resolved here, rendered by
     /// `just_now_text`.
     pub just_now: Option<String>,
+    /// `约会`: on a date turn, where the date is and what it is for, rendered
+    /// by `date_line`.
+    pub date: Option<String>,
+}
+
+/// The `约会` line of a date turn (spec 2026-11-12-activity-sub-session-
+/// design.md §5.2).
+pub(crate) fn date_line(place: &str, content: &str) -> String {
+    format!("地点「{place}」；安排「{content}」")
 }
 
 /// A separation that ended while the user wrote into its silence (spec
@@ -2006,16 +2015,17 @@ fn render_prompt(
         .unwrap_or_default();
     let anniversaries: String = anniversaries.iter().map(|l| format!("\n{l}")).collect();
     // The events she is in, then what she has not yet said about an offline
-    // stretch or a false alarm. They are drawn facts of this moment, so they
-    // sit under `[now]`, outside `[character_state]`, whose header defers to
-    // the blocks above it: a story digest written before an event started
-    // must not override it.
+    // stretch or a false alarm, then the date she is on. They are drawn facts
+    // of this moment, so they sit under `[now]`, outside `[character_state]`,
+    // whose header defers to the blocks above it: a story digest written
+    // before an event started must not override it.
     let events: String = event
         .into_iter()
         .flat_map(|ev| {
             [
                 ("正在经历", ev.under_way.as_deref()),
                 ("刚才", ev.just_now.as_deref()),
+                ("约会", ev.date.as_deref()),
             ]
         })
         .filter_map(|(label, v)| {
@@ -5347,7 +5357,7 @@ mod tests {
     fn prompt_with_event(needs: Option<&str>, event: Option<&str>) -> String {
         let lines = event.map(|s| EventLines {
             under_way: Some(s.into()),
-            just_now: None,
+            ..Default::default()
         });
         build_prompt(
             &fixture_persona(),
@@ -5379,6 +5389,7 @@ mod tests {
         let lines = EventLines {
             under_way: Some("出差（约 1 天后结束）".into()),
             just_now: Some("有段时间没看手机，对方那时发来的消息你现在才看到".into()),
+            date: None,
         };
         let p = build_prompt(
             &fixture_persona(),
@@ -5437,6 +5448,46 @@ mod tests {
             &[],
         );
         assert!(!p.contains("- 刚才："), "{p}");
+    }
+
+    #[test]
+    fn the_date_line_follows_what_just_happened() {
+        let lines = EventLines {
+            under_way: Some("和对方约会（约 50 分钟后结束）".into()),
+            just_now: Some("有段时间没看手机，对方那时发来的消息你现在才看到".into()),
+            date: Some(date_line("海边", "看海")),
+        };
+        let p = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            &[],
+            None,
+            None,
+            &[],
+            AffinityScope::full(),
+            &[],
+            None,
+            None,
+            None,
+            None,
+            TurnNudges::default(),
+            &NowContext::default(),
+            None,
+            None,
+            Some(&lines),
+            None,
+            &[],
+        );
+        assert!(
+            p.contains(
+                "- 正在经历：和对方约会（约 50 分钟后结束）\n\
+                 - 刚才：有段时间没看手机，对方那时发来的消息你现在才看到\n\
+                 - 约会：地点「海边」；安排「看海」"
+            ),
+            "{p}"
+        );
     }
 
     #[test]

@@ -4820,8 +4820,27 @@ pub(crate) fn run_stream_with(
                 }
             },
         };
+        // A date's sub-session reads and writes the relationship's state on
+        // its parent; its messages stay its own (spec 2026-11-12-activity-
+        // sub-session-design.md §5.1).
+        let turn = match crate::pipeline::activity::turn_session(&state.pool, user_msg.session_id).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("stream: turn session read failed: {e}");
+                yield ProtocolFrame::Error {
+                    code: StreamErrorCode::Internal,
+                    retryable: false,
+                    message: format!("turn session read failed: {e}"),
+                    user_message: "服务出现问题，请稍后再试".into(),
+                    upstream_status: None,
+                    provider_code: None,
+                };
+                return;
+            }
+        };
+        let on_date = turn.activity.is_some();
         let mut affinity = match affinity_repo
-            .load_or_create(user_msg.session_id, user_msg.user_id, user_msg.instance_id)
+            .load_or_create(turn.relationship, user_msg.user_id, user_msg.instance_id)
             .await
         {
             Ok(mut a) => {
@@ -4871,7 +4890,7 @@ pub(crate) fn run_stream_with(
         // judge, the reply and the composer see the same text.
         let given_effects = crate::pipeline::handlers::load_effects(
             &state.pool,
-            user_msg.session_id,
+            turn.relationship,
             Some(user_msg.user_message_id),
         )
         .await
@@ -4904,8 +4923,8 @@ pub(crate) fn run_stream_with(
         // the result. Only an ask for space that goes unanswered starts a
         // falling-out, at this row; `sleep_together` and `propose` settle at
         // no cost (spec 2026-10-30 §4.5). A give, a tip or a kiss does not
-        // answer her.
-        if user_msg.action.is_none() {
+        // answer her, and neither does a date turn.
+        if user_msg.action.is_none() && !on_date {
             if let Err(e) = crate::pipeline::life_choice::convert_ignored_ask(
                 &state,
                 user_msg.session_id,
@@ -4944,16 +4963,13 @@ pub(crate) fn run_stream_with(
             .foreground
             .as_ref()
             .is_some_and(|e| e.kind.is_offline(&traits));
+        // A deployment with the ghosting switch off never goes silent, and
+        // neither does she on a date: she is with the user.
+        let ghosting = state.model_config.pde_ghosting_enabled() && !on_date;
         // While she is offline (spec 2026-10-16-life-events-offline-and-scares-
         // design.md §4.2) a text turn ghosts without the judge. The silence is
-        // circumstance, so the ghost accounting is left alone. A deployment
-        // with the ghosting switch off never goes silent, a stretch under way
-        // included.
-        if !action_turn
-            && !force_image
-            && state.model_config.pde_ghosting_enabled()
-            && offline_now
-        {
+        // circumstance, so the ghost accounting is left alone.
+        if !action_turn && !force_image && ghosting && offline_now {
             if let Err(e) = chat_repo
                 .mark_user_message_ghosted(user_msg.user_message_id)
                 .await
@@ -5027,6 +5043,10 @@ pub(crate) fn run_stream_with(
                 separation.as_ref(),
                 scare.as_ref(),
             ),
+            date: turn
+                .activity
+                .as_ref()
+                .map(|a| crate::prompt::date_line(&a.place, &a.content)),
         };
         // ── PDE decision (judge-first) ────────────────────────────────────────
         // The judge runs before vision/input-filter/chat so a `ghost` verdict
@@ -5205,9 +5225,10 @@ pub(crate) fn run_stream_with(
 
         // Ghosting kill-switch (§4.1) — path-wide final gate (LLM / fallback /
         // pure-rule / tip). Uses the in-scope sanitized hints, not plan.context_hints.
+        // On a date a ghost verdict becomes a reply here too.
         plan = apply_ghosting_killswitch(
             plan,
-            state.model_config.pde_ghosting_enabled(),
+            ghosting,
             &input,
             std::mem::take(&mut killswitch_hints),
         );
@@ -5959,7 +5980,7 @@ pub(crate) fn run_stream_with(
                         "UPDATE engine.companion_affinity SET ghost_streak = 0, updated_at = now() \
                          WHERE session_id = $1 AND ghost_streak <> 0",
                     )
-                    .bind(user_msg.session_id)
+                    .bind(turn.relationship)
                     .execute(&state.pool)
                     .await
                     {
@@ -6412,7 +6433,7 @@ pub(crate) fn run_stream_with(
                         "UPDATE engine.companion_affinity SET ghost_streak = 0, updated_at = now() \
                          WHERE session_id = $1 AND ghost_streak <> 0",
                     )
-                    .bind(user_msg.session_id)
+                    .bind(turn.relationship)
                     .execute(&state.pool)
                     .await
                     {
@@ -26026,5 +26047,695 @@ data: [DONE]\n\n"
         assert_text_only(&frames, &mock).await;
         assert!(final_json(&frames).get("activity").is_none());
         assert_eq!(activities_for(&pool, umid).await, 0);
+    }
+
+    // ─── Date turns (spec 2026-11-12-activity-sub-session-design.md §5) ───
+
+    const INVITATION: &str = "去海边走走吧";
+    const HER_YES: &str = "好呀，我们走吧。我正好想看看日落。";
+    /// What the reply's history keeps of `HER_YES`: an assistant row's
+    /// leading sentence is stripped there.
+    const HER_YES_KEPT: &str = "我正好想看看日落";
+
+    /// A date to 「海边」 to 「看海」 under way: the parent's invitation ten
+    /// minutes ago and her accepting reply nine minutes ago opened it, so it
+    /// runs another 51 minutes. The parent has an affinity row. On `mock`,
+    /// the judge answers `verdict`, the companion streams `REPLY` and
+    /// embeddings succeed; `tasks` adds config sections.
+    struct DateScene {
+        pool: PgPool,
+        state: AppState,
+        mock: wiremock::MockServer,
+        user_id: Uuid,
+        instance_id: Uuid,
+        parent: Uuid,
+        activity: eros_engine_store::activity::ActivityRecord,
+    }
+
+    fn reply_text_verdict() -> serde_json::Value {
+        serde_json::json!({"action": "reply_text", "inner_state": ""})
+    }
+
+    async fn date_scene(pool: &PgPool, verdict: serde_json::Value, tasks: &str) -> DateScene {
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let judge_body = serde_json::json!({
+            "id": "gj", "model": "pde/judge",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": verdict.to_string()}}],
+        });
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("pde/judge"))
+            .respond_with(crate::pipeline::reasoning_call::test_support::sse_completion(judge_body))
+            .mount(&mock)
+            .await;
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"REPLY\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"deepseek/x\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .and(body_string_contains("\"stream\":true"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(chat_body, "text/event-stream"))
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"embedding": vec![0.1_f32; 512]}]
+            })))
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_genome_id, instance_id, parent) = seed_persona_and_session(pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(&format!(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide.\"\n{tasks}"
+            ))
+            .unwrap(),
+        );
+        state.openrouter = Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        state.embed = Arc::new(
+            eros_engine_llm::embedding::EmbeddingRouter::from_config_with(
+                &eros_engine_llm::model_config::ModelConfig::from_toml_str(&format!(
+                    "[providers.mockembed]\nembeddings = \"{}/v1/embeddings\"\n\
+                     [tasks.embedding]\nmodel = \"mock-embed@mockembed\"\n",
+                    mock.uri()
+                ))
+                .unwrap(),
+                |k| (k == "MOCKEMBED_API_KEY").then(|| "test-key".to_string()),
+            )
+            .unwrap(),
+        );
+
+        AffinityRepo { pool }
+            .load_or_create(parent, user_id, instance_id)
+            .await
+            .unwrap();
+        let invitation: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata, sent_at) \
+             VALUES ($1, 'user', $2, $3, now() - interval '10 minutes') RETURNING id",
+        )
+        .bind(parent)
+        .bind(INVITATION)
+        .bind(serde_json::json!({"action": {
+            "type": "date", "duration": "short", "place": "海边", "content": "看海"
+        }}))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, user_message_id, sent_at) \
+             VALUES ($1, 'assistant', $2, $3, now() - interval '9 minutes')",
+        )
+        .bind(parent)
+        .bind(HER_YES)
+        .bind(invitation)
+        .execute(pool)
+        .await
+        .unwrap();
+        let activity = eros_engine_store::activity::ActivityRepo { pool }
+            .accept(
+                &eros_engine_store::activity::NewActivity {
+                    session_id: parent,
+                    user_id,
+                    instance_id,
+                    message_id: invitation,
+                    duration: eros_engine_core::types::DateDuration::Short,
+                    place: "海边",
+                    content: "看海",
+                },
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap()
+            .expect("the date opened");
+        DateScene {
+            pool: pool.clone(),
+            state,
+            mock,
+            user_id,
+            instance_id,
+            parent,
+            activity,
+        }
+    }
+
+    impl DateScene {
+        fn sub(&self) -> Uuid {
+            self.activity.sub_session_id
+        }
+
+        /// Send `body` to the date's sub-session on the stream route under
+        /// client message id `n`: the frames, and the user row.
+        async fn send(
+            &self,
+            n: u32,
+            mut body: serde_json::Value,
+        ) -> (Vec<serde_json::Value>, Uuid) {
+            use axum::body::Body;
+            use axum::http::{header, Request, StatusCode};
+            use tower::Service as _;
+
+            let client_msg_id = format!("01JT{n:022}");
+            body["client_msg_id"] = serde_json::json!(client_msg_id);
+            let token = crate::routes::companion::testutil::mint_test_jwt(self.user_id);
+            let mut app = crate::routes::companion::testutil::build_router(self.state.clone());
+            let resp = app
+                .call(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/comp/chat/{}/message/stream", self.sub()))
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let frames = crate::routes::companion::testutil::read_sse(resp).await;
+            let umid: Uuid = sqlx::query_scalar(
+                "SELECT id FROM engine.chat_messages \
+                  WHERE session_id = $1 AND client_msg_id = $2 AND role = 'user'",
+            )
+            .bind(self.sub())
+            .bind(&client_msg_id)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap();
+            (frames, umid)
+        }
+
+        /// `n` earlier user rows of the date, the newest a second old.
+        async fn earlier_rows(&self, n: i32) {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+                 SELECT $1, 'user', '嗯' || i, now() - make_interval(secs => ($2 - i + 1)::float8) \
+                   FROM generate_series(1, $2) i",
+            )
+            .bind(self.sub())
+            .bind(n)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        }
+
+        /// The parent's bond and chemistry lines at these scores.
+        async fn set_lines(&self, bond: f64, chem: f64) {
+            sqlx::query(
+                "UPDATE engine.companion_affinity \
+                    SET trust = $2, intrigue = $2, intimacy = $3, tension = $3, updated_at = now() \
+                  WHERE session_id = $1",
+            )
+            .bind(self.parent)
+            .bind(bond)
+            .bind(chem)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        }
+
+        /// The affinity event of the turn whose user row is `umid`, once
+        /// post-process wrote it: the session its affinity row belongs to,
+        /// its type, `context` and `effective_deltas`.
+        async fn turn_event(
+            &self,
+            umid: Uuid,
+        ) -> (Uuid, String, serde_json::Value, serde_json::Value) {
+            for _ in 0..200 {
+                let row: Option<(Uuid, String, serde_json::Value, Option<serde_json::Value>)> =
+                    sqlx::query_as(
+                        "SELECT a.session_id, e.event_type, e.context, e.effective_deltas \
+                           FROM engine.companion_affinity_events e \
+                           JOIN engine.companion_affinity a ON a.id = e.affinity_id \
+                          WHERE e.user_message_id = $1",
+                    )
+                    .bind(umid)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .unwrap();
+                if let Some((session, kind, context, effective)) = row {
+                    return (session, kind, context, effective.unwrap_or_default());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            panic!("the turn's affinity event never landed");
+        }
+
+        /// Affinity rows of the date's own session.
+        async fn sub_affinity_rows(&self) -> i64 {
+            sqlx::query_scalar(
+                "SELECT count(*) FROM engine.companion_affinity WHERE session_id = $1",
+            )
+            .bind(self.sub())
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+        }
+
+        /// The date runs out now.
+        async fn end(&self) {
+            sqlx::query("UPDATE engine.persona_events SET ends_at = now() WHERE id = $1")
+                .bind(self.activity.event_id)
+                .execute(&self.pool)
+                .await
+                .unwrap();
+        }
+
+        /// A main-chat text turn through the whole affinity pass, judged by
+        /// whatever `[tasks.affinity_evaluation]` answers.
+        async fn judged_main_chat_turn(&self) {
+            let umid: Uuid = sqlx::query_scalar(
+                "INSERT INTO engine.chat_messages (session_id, role, content) \
+                 VALUES ($1, 'user', '今天过得怎么样呀') RETURNING id",
+            )
+            .bind(self.parent)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap();
+            let persona = PersonaRepo { pool: &self.pool }
+                .load_companion(self.instance_id)
+                .await
+                .unwrap()
+                .expect("the persona");
+            crate::pipeline::post_process::run_affinity_turn(
+                &self.state,
+                self.parent,
+                self.user_id,
+                self.instance_id,
+                &persona,
+                ActionType::ReplyText,
+                "今天过得怎么样呀",
+                "嗯，我在听。",
+                Default::default(),
+                eros_engine_core::scope::AffinityScope::full(),
+                Some(umid),
+                None,
+                false,
+                None,
+                None,
+                false,
+            )
+            .await;
+        }
+
+        /// (kind, status) of every life choice of the parent or the date.
+        async fn life_choices(&self) -> Vec<(String, String)> {
+            sqlx::query_as(
+                "SELECT kind, status FROM engine.life_choices \
+                  WHERE session_id = ANY($1) ORDER BY asked_at",
+            )
+            .bind(vec![self.parent, self.sub()])
+            .fetch_all(&self.pool)
+            .await
+            .unwrap()
+        }
+    }
+
+    /// Every streamed companion request, oldest first.
+    async fn companion_requests(mock: &wiremock::MockServer) -> Vec<serde_json::Value> {
+        mock.received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .filter(|b| b.contains("deepseek/x") && b.contains("\"stream\":true"))
+            .map(|b| serde_json::from_str(&b).unwrap())
+            .collect()
+    }
+
+    /// A companion request's system prompt.
+    fn system_prompt_of(req: &serde_json::Value) -> String {
+        req["messages"][0]["content"].as_str().unwrap().to_string()
+    }
+
+    /// A companion request's history and user line, in order.
+    fn turn_texts(req: &serde_json::Value) -> Vec<String> {
+        req["messages"].as_array().unwrap()[1..]
+            .iter()
+            .map(|m| m["content"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// What post-process writes after a turn's affinity event lands in a
+    /// skipped turn is nothing; this is long enough for a write that would.
+    async fn post_process_settles() {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    /// What the reply, the judge and the turn's row see of the relationship
+    /// is the parent's: its lingering effects and its last reason going in,
+    /// its affinity row coming out.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_date_turn_keeps_the_parent_state(pool: PgPool) {
+        let s = date_scene(&pool, reply_text_verdict(), "").await;
+        // Before the date, in the main chat: coffee she took, and the reason
+        // of its last judged turn.
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata, sent_at) \
+             VALUES ($1, 'user', '', $2, now() - interval '11 minutes')",
+        )
+        .bind(s.parent)
+        .bind(accepted_give("coffee", 5, None))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.companion_affinity_events \
+               (affinity_id, event_type, deltas, context, created_at) \
+             SELECT id, 'message', '{}'::jsonb, $2, now() - interval '9 minutes' \
+               FROM engine.companion_affinity WHERE session_id = $1",
+        )
+        .bind(s.parent)
+        .bind(serde_json::json!({"affinity_reason": "对方记得我说过的话，心里一暖"}))
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Long enough to earn the long-message nudge on an ordinary turn.
+        let text =
+            "今天天气真好，我们一起去海边走走吧，看看日落，吹吹海风，聊聊最近发生的事情好不好呀";
+        assert!(text.chars().count() >= 40);
+
+        let (frames, umid) = s.send(1, serde_json::json!({"content": text})).await;
+
+        let body = frames
+            .iter()
+            .find(|f| f["type"] == "body_state")
+            .unwrap_or_else(|| panic!("a body_state frame: {frames:?}"));
+        assert_eq!(body["effects"][0]["item"], "coffee", "{body}");
+        let system = system_prompt_of(&companion_requests(&s.mock).await[0]);
+        assert!(system.contains("对方记得我说过的话，心里一暖"), "{system}");
+
+        let (session, kind, context, effective) = s.turn_event(umid).await;
+        assert_eq!(session, s.parent);
+        assert_eq!(kind, "message");
+        assert_eq!(context["eval_skip_reason"], "activity", "{context}");
+        let axes = effective.as_object().expect("effective deltas");
+        assert!(!axes.is_empty(), "{effective}");
+        assert!(
+            axes.values().all(|v| v.as_f64() == Some(0.0)),
+            "{effective}"
+        );
+        assert_eq!(s.sub_affinity_rows().await, 0);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_date_turn_is_never_ghosted(pool: PgPool) {
+        let s = date_scene(
+            &pool,
+            serde_json::json!({"action": "ghost", "inner_state": ""}),
+            "",
+        )
+        .await;
+        // Enough of the date said for the ghost guard to let a silence through.
+        s.earlier_rows(10).await;
+
+        let (frames, umid) = s.send(1, serde_json::json!({"content": "在吗"})).await;
+
+        let meta = frames
+            .iter()
+            .find(|f| f["type"] == "meta")
+            .unwrap_or_else(|| panic!("a meta frame: {frames:?}"));
+        assert_eq!(meta["action_type"], "reply", "{frames:?}");
+        assert!(
+            frames
+                .iter()
+                .any(|f| f["type"] == "delta" && f["content"] == "REPLY"),
+            "{frames:?}"
+        );
+        let replies: Vec<String> = sqlx::query_scalar(
+            "SELECT content FROM engine.chat_messages \
+              WHERE user_message_id = $1 AND role = 'assistant'",
+        )
+        .bind(umid)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(replies, vec!["REPLY".to_string()]);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_date_turn_writes_no_memory_and_no_dreaming_count(pool: PgPool) {
+        use eros_engine_store::scan_state::ScanStateRepo;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let mut s = date_scene(
+            &pool,
+            reply_text_verdict(),
+            "[tasks.dreaming_scan]\nmodel = \"scan/m\"\nfilter_prompt = \"extract\"\n",
+        )
+        .await;
+        s.state.config.dreaming_tick = std::time::Duration::from_secs(300);
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("scan/m"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .named("dreaming_scan")
+            .mount(&s.mock)
+            .await;
+        // One turn short of the relationship's in-place scan.
+        let scan = ScanStateRepo { pool: &pool };
+        scan.bump(
+            s.instance_id,
+            chrono::Utc::now() - chrono::Duration::minutes(30),
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE engine.relationship_scan_state SET pending_turns = 19 WHERE instance_id = $1",
+        )
+        .bind(s.instance_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (_, umid) = s
+            .send(1, serde_json::json!({"content": "我最喜欢的颜色是蓝色"}))
+            .await;
+        s.turn_event(umid).await;
+        post_process_settles().await;
+
+        let memories: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM engine.companion_memories WHERE user_id = $1")
+                .bind(s.user_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(memories, 0);
+        let state = scan.load(s.instance_id).await.unwrap().expect("scan state");
+        assert_eq!(state.pending_turns, 19);
+        s.mock.verify().await;
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_date_turn_reads_the_scene(pool: PgPool) {
+        let s = date_scene(&pool, reply_text_verdict(), "").await;
+        // A mid date: with an hour or more left, its end reads 「约 …」.
+        sqlx::query("UPDATE engine.activities SET duration = 'mid' WHERE id = $1")
+            .bind(s.activity.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE engine.persona_events SET ends_at = started_at + interval '4 hours' \
+              WHERE id = $1",
+        )
+        .bind(s.activity.event_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        s.send(1, serde_json::json!({"content": "到了！"})).await;
+
+        let system = system_prompt_of(&companion_requests(&s.mock).await[0]);
+        assert!(system.contains("- 正在经历：和对方约会（约"), "{system}");
+        assert!(
+            system.contains("- 约会：地点「海边」；安排「看海」"),
+            "{system}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_first_date_turn_sees_the_invitation(pool: PgPool) {
+        let s = date_scene(&pool, reply_text_verdict(), "").await;
+
+        s.send(1, serde_json::json!({"content": "我们到了"})).await;
+        let texts = turn_texts(&companion_requests(&s.mock).await[0]);
+        let at = |needle: &str| {
+            texts
+                .iter()
+                .position(|t| t.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} in {texts:?}"))
+        };
+        assert!(at(INVITATION) < at(HER_YES_KEPT), "{texts:?}");
+        assert!(at(HER_YES_KEPT) < at("我们到了"), "{texts:?}");
+
+        // A window the date fills on its own reads nothing of the parent.
+        s.earlier_rows(20).await;
+        s.send(2, serde_json::json!({"content": "回去吧"})).await;
+        let reqs = companion_requests(&s.mock).await;
+        let texts = turn_texts(reqs.last().unwrap());
+        assert!(texts.iter().any(|t| t.contains("回去吧")), "{texts:?}");
+        assert!(
+            !texts
+                .iter()
+                .any(|t| t.contains(INVITATION) || t.contains(HER_YES_KEPT)),
+            "{texts:?}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_refused_give_on_a_date_drops_the_parent_tier(pool: PgPool) {
+        let s = date_scene(
+            &pool,
+            serde_json::json!({"action": "reply_text", "inner_state": "", "action_response": "refuse"}),
+            "",
+        )
+        .await;
+        s.set_lines(0.5, 0.0).await; // bond tier 3
+
+        let (frames, umid) = s
+            .send(
+                1,
+                serde_json::json!({
+                    "content": "",
+                    "action": {"type": "give", "item": "coffee", "quantity": 1},
+                }),
+            )
+            .await;
+        assert!(
+            frames
+                .iter()
+                .any(|f| f["type"] == "action_response" && f["response"] == "refuse"),
+            "{frames:?}"
+        );
+
+        let (session, _, context, _) = s.turn_event(umid).await;
+        assert_eq!(session, s.parent);
+        assert_eq!(context["tier_drop"], "bond", "{context}");
+        let bond_tier: i16 = sqlx::query_scalar(
+            "SELECT bond_tier FROM engine.companion_affinity WHERE session_id = $1",
+        )
+        .bind(s.parent)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(bond_tier, 2);
+        assert_eq!(s.sub_affinity_rows().await, 0);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_give_on_a_date_lingers_back_in_the_main_chat(pool: PgPool) {
+        use crate::routes::companion::testutil::{build_router, mint_test_jwt, send_request};
+        use axum::body::Body;
+        use axum::http::{header, Request, StatusCode};
+
+        let s = date_scene(
+            &pool,
+            serde_json::json!({"action": "reply_text", "inner_state": "", "action_response": "accept"}),
+            "",
+        )
+        .await;
+        let (frames, _) = s
+            .send(
+                1,
+                serde_json::json!({
+                    "content": "",
+                    "action": {"type": "give", "item": "coffee", "quantity": 3},
+                }),
+            )
+            .await;
+        assert!(
+            frames
+                .iter()
+                .any(|f| f["type"] == "action_response" && f["response"] == "accept"),
+            "{frames:?}"
+        );
+        s.end().await;
+
+        let mut app = build_router(s.state.clone());
+        let (status, resp) = send_request(
+            &mut app,
+            Request::builder()
+                .uri(format!("/v2/comp/session/{}/effects", s.parent))
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", mint_test_jwt(s.user_id)),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+        assert_eq!(resp["effects"][0]["item"], "coffee", "{resp}");
+    }
+
+    /// Lines at 0.5 (tiers 3/3) and two warm judged turns in the main chat:
+    /// on a compatible pair, a third warm judged turn asks her to sleep
+    /// together. A date turn is not judged, so it asks nothing, and leaves
+    /// the streak for the main chat after the date.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn no_life_choice_is_asked_on_a_date(pool: PgPool) {
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let s = date_scene(
+            &pool,
+            reply_text_verdict(),
+            "[tasks.affinity_evaluation]\nmodel = \"aff/judge\"\n",
+        )
+        .await;
+        s.set_lines(0.5, 0.5).await;
+        let warm = r#"{"warmth":3,"trust":{"grade":0,"direction":"up"},"intimacy":{"grade":0,"direction":"up"},"intrigue":{"grade":0,"direction":"up"},"tension":{"grade":0,"direction":"up"},"patience":3,"reason":"很好"}"#;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("aff/judge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen-aff", "model": "aff/judge",
+                "choices": [{"message": {"content": warm}}],
+            })))
+            .mount(&s.mock)
+            .await;
+        // Her ask, a call that is not streamed.
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen-ask", "model": "deepseek/x",
+                "choices": [{"message": {"content": "今晚留下来陪我，好不好？"}}],
+            })))
+            .mount(&s.mock)
+            .await;
+        s.judged_main_chat_turn().await;
+        s.judged_main_chat_turn().await;
+        assert!(
+            s.life_choices().await.is_empty(),
+            "two warm turns are not three"
+        );
+
+        let (_, umid) = s
+            .send(
+                1,
+                serde_json::json!({"content": "今天好开心", "affinity_scope": "full"}),
+            )
+            .await;
+        let (_, _, context, _) = s.turn_event(umid).await;
+        assert_eq!(context["eval_skip_reason"], "activity", "{context}");
+        post_process_settles().await;
+        assert!(s.life_choices().await.is_empty());
+
+        s.end().await;
+        s.judged_main_chat_turn().await;
+        assert_eq!(
+            s.life_choices().await,
+            vec![("sleep_together".to_string(), "pending".to_string())]
+        );
     }
 }

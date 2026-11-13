@@ -1291,13 +1291,19 @@ pub async fn send_message_stream(
                 } else {
                     None
                 };
-                let body_frame = match crate::pipeline::handlers::load_effects(
-                    &state.pool,
-                    session_id,
-                    Some(user_message_id),
-                )
-                .await
-                {
+                // A date's effects are its parent's, as the live turn read them.
+                let effects = async {
+                    let turn =
+                        crate::pipeline::activity::turn_session(&state.pool, session_id).await?;
+                    crate::pipeline::handlers::load_effects(
+                        &state.pool,
+                        turn.relationship,
+                        Some(user_message_id),
+                    )
+                    .await
+                }
+                .await;
+                let body_frame = match effects {
                     Ok(effects) => {
                         crate::pipeline::stream::body_state_frame(user_message_id, &effects, needs)
                     }
@@ -4297,6 +4303,41 @@ data: [DONE]\n\n";
             send_request(&mut app, async_send(date.sub_session_id, &token, chat(3))).await;
         assert_eq!(status, StatusCode::CONFLICT, "{resp}");
         assert_eq!(resp["code"], "activity_ended");
+    }
+
+    /// A date turn's replay carries the lingering state the live turn read:
+    /// the parent's, here coffee she took in the main chat before the date.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_date_turn_replays_the_parents_effects(pool: PgPool) {
+        use crate::routes::companion::testutil::{read_sse, seed_answered_turn, seed_date};
+        let (user_id, instance_id, session_id) = home(&pool).await;
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata, sent_at) \
+             VALUES ($1, 'user', '', $2, now() - interval '1 minute')",
+        )
+        .bind(session_id)
+        .bind(json!({"action": {
+            "type": "give", "item": "coffee", "quantity": 5, "response": "accept"
+        }}))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let date = seed_date(&pool, session_id, user_id, instance_id, chrono::Utc::now()).await;
+        seed_answered_turn(&pool, date.sub_session_id, &msg_id(1), None).await;
+        let mut app = build_router(crate::routes::companion::test_state(pool.clone()));
+        let token = mint_jwt(user_id);
+
+        let resp = app
+            .call(stream_send(date.sub_session_id, &token, chat(1), &[]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let frames = read_sse(resp).await;
+        let body = frames
+            .iter()
+            .find(|f| f["type"] == "body_state")
+            .unwrap_or_else(|| panic!("a body_state frame: {frames:?}"));
+        assert_eq!(body["effects"][0]["item"], "coffee", "{body}");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

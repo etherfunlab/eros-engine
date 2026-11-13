@@ -553,6 +553,7 @@ async fn prepare(state: &AppState, g: &Greeting) -> Result<Prepared, AppError> {
             separation.as_ref(),
             scare.as_ref(),
         ),
+        date: None,
     };
     // A listed event kind speaks in the `emotional` tone while the
     // deployment has the tone on (spec

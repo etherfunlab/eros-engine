@@ -105,12 +105,24 @@ pub async fn run(
     if !session_still_live(&state, session_id).await {
         return;
     }
+    // A date turn's affinity is its parent's; the date leaves nothing in
+    // relationship memory while it runs, so it writes no verbatim row and the
+    // scan neither counts nor runs on it (spec 2026-11-12-activity-sub-
+    // session-design.md §5.1, §7).
+    let turn = match super::activity::turn_session(&state.pool, session_id).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(%session_id, "post-process: turn session read failed: {e}");
+            return;
+        }
+    };
+    let on_date = turn.activity.is_some();
 
     // A user turn counts toward the relationship's scan before anything else
     // runs, so a relationship's first turn places the scan cursor ahead of any
     // later turn of the same pair.
     let bumped = match &event {
-        Event::UserMessage { message_id, .. } => {
+        Event::UserMessage { message_id, .. } if !on_date => {
             super::dreaming::bump_relationship(
                 &state,
                 instance_id,
@@ -139,17 +151,17 @@ pub async fn run(
         _ => (String::new(), None, false),
     };
     let tier_drop = tier_drop_for(&event, &plan);
-    // An accepted invitation belongs to the date it opens: settlement reads
-    // it, the per-turn judge does not (spec 2026-11-12-activity-sub-session-
-    // design.md §4.6).
-    let activity_turn = matches!(
-        &event,
-        Event::UserMessage {
-            action: Some(eros_engine_core::types::UserAction::Date { .. }),
-            ..
-        }
-    ) && plan.action_response
-        == Some(eros_engine_core::types::ActionResponse::Accept);
+    // A date turn, and the accepted invitation that opens a date, belong to
+    // the date: settlement reads them, the per-turn judge does not (spec
+    // 2026-11-12-activity-sub-session-design.md §4.6, §5.1).
+    let activity_turn = on_date
+        || (matches!(
+            &event,
+            Event::UserMessage {
+                action: Some(eros_engine_core::types::UserAction::Date { .. }),
+                ..
+            }
+        ) && plan.action_response == Some(eros_engine_core::types::ActionResponse::Accept));
     // As of 4.0 the request's affinity scope is read-side (prompt injection
     // gating) AND consumed here by the feeling-clause summarizer, which only
     // narrates axes the request actually asked for.
@@ -177,7 +189,7 @@ pub async fn run(
     };
 
     let fut_memory = async {
-        if should_write_user_turn(&user_msg, &produced) {
+        if !on_date && should_write_user_turn(&user_msg, &produced) {
             write_turn(&state, session_id, user_id, instance_id, &user_msg).await;
         }
     };
@@ -204,7 +216,7 @@ pub async fn run(
 
         run_affinity_turn(
             &state,
-            session_id,
+            turn.relationship,
             user_id,
             instance_id,
             &persona,

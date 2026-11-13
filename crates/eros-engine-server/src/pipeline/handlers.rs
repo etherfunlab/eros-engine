@@ -1056,14 +1056,19 @@ pub(crate) async fn build_reply_request_with(
         eros_engine_core::types::Event::UserMessage { quote, .. } => quote.as_ref(),
         _ => None,
     };
-    let history = match group {
+    // `relationship` is the session holding the relationship's state: a
+    // date's parent for its sub-session (spec 2026-11-12-activity-sub-session-
+    // design.md §5.1), else the session itself.
+    let (history, relationship) = match group {
         // The group transcript, bounded to this turn (spec §5.5).
-        Some(g) => {
+        Some(g) => (
             chat_repo
                 .group_history_for_turn(g.group_session_id, user_message_id, HISTORY_WINDOW)
-                .await?
-        }
+                .await?,
+            session_id,
+        ),
         None => {
+            let turn = crate::pipeline::activity::turn_session(&state.pool, session_id).await?;
             // The window is anchored at the driving row, not at "now": it is
             // the last row, with nothing newer around it. On the stream path
             // the driving row IS the newest row, so this equals a newest-N
@@ -1072,17 +1077,29 @@ pub(crate) async fn build_reply_request_with(
             // prompt, and the model answers whatever comes last (#330). Rows
             // the burst's own turns will see are simply not this turn's
             // context yet.
-            let rows = chat_repo
+            let mut rows = chat_repo
                 .history_up_to(session_id, user_message_id, HISTORY_WINDOW)
                 .await?;
             if rows.is_empty() {
                 // Driving row not in this session at all — degrade to
                 // newest-N, matching the pre-anchor behavior for an absent
                 // driving row.
-                chat_repo.history(session_id, HISTORY_WINDOW, 0).await?
-            } else {
-                rows
+                rows = chat_repo.history(session_id, HISTORY_WINDOW, 0).await?;
             }
+            // A date opens knowing what was just said: the slots its own rows
+            // leave are filled with the parent's, up to and including her
+            // accepting reply (spec §5.2).
+            if let Some(a) = &turn.activity {
+                let room = HISTORY_WINDOW - rows.len() as i64;
+                if room > 0 {
+                    let mut earlier = chat_repo
+                        .history_through(a.session_id, a.started_at.unwrap_or(a.created_at), room)
+                        .await?;
+                    earlier.append(&mut rows);
+                    rows = earlier;
+                }
+            }
+            (rows, turn.relationship)
         }
     };
 
@@ -1190,12 +1207,12 @@ pub(crate) async fn build_reply_request_with(
 
     // Most recent affinity reason for [emotional_context] (single row, not a trajectory).
     let emotional_context = AffinityRepo { pool: &state.pool }
-        .recent_emotional_reasons(session_id, user_message_id, 1)
+        .recent_emotional_reasons(relationship, user_message_id, 1)
         .await
         .unwrap_or_else(|e| {
             tracing::warn!(
                 error = %e,
-                session_id = %session_id,
+                session_id = %relationship,
                 "recent_emotional_reasons fetch failed; [emotional_context] omitted"
             );
             Vec::new()

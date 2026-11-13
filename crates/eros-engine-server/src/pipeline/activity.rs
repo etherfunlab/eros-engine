@@ -114,6 +114,28 @@ fn date_moment(v: &serde_json::Value) -> Option<DateMoment> {
     })
 }
 
+/// Where a turn's relationship state lives (spec §5.1): the affinity row, the
+/// lingering effects, the reasons and the ghost streak of a date's
+/// sub-session are its parent's. Messages stay in the session itself.
+pub(crate) struct TurnSession {
+    /// The parent for a date's sub-session; any other session itself.
+    pub relationship: Uuid,
+    /// The date played in the session, if it is a sub-session.
+    pub activity: Option<ActivityRecord>,
+}
+
+/// A sub-session maps to its parent, any other session to itself.
+pub(crate) async fn turn_session(
+    pool: &sqlx::PgPool,
+    session_id: Uuid,
+) -> Result<TurnSession, sqlx::Error> {
+    let activity = ActivityRepo { pool }.by_sub_session(session_id).await?;
+    Ok(TurnSession {
+        relationship: activity.as_ref().map_or(session_id, |a| a.session_id),
+        activity,
+    })
+}
+
 /// Whether a send may go ahead, checked before it writes anything (spec
 /// §4.2, §5.3, §6.1). A date's own session takes sends while the date runs and
 /// not once its clock is out, and takes no invitation; for the instance's text
