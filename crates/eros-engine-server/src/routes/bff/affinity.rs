@@ -132,7 +132,9 @@ const LONG_POLL_TICK: std::time::Duration = std::time::Duration::from_millis(250
 /// Latest user-turn affinity delta as committed. For per-turn FE observation;
 /// JWT + ownership checked. With `?after=<event_id>` the request long-polls (see
 /// [`BffAffinityDeltaQuery`]), collapsing the per-turn short-poll loop into
-/// one held request.
+/// one held request. A date's own session answers with the relationship's
+/// latest turn, which during the date is the date's last turn: it moves
+/// nothing, since a date is judged once when it is settled.
 #[utoipa::path(
     get,
     path = "/bff/v1/comp/affinity/{session_id}/event",
@@ -156,9 +158,15 @@ async fn bff_get_affinity_delta(
     Extension(AuthUser(user_id)): Extension<AuthUser>,
 ) -> Result<Json<BffAffinityDeltaResponse>, AppError> {
     require_session_for_user(&state, session_id, user_id).await?;
+    // A date's turns are written on its parent's affinity (spec
+    // 2026-11-12-activity-sub-session-design.md §5.1): asked by the date's
+    // own session, this answers from there.
+    let relationship = crate::pipeline::activity::turn_session(&state.pool, session_id)
+        .await?
+        .relationship;
 
     let repo = AffinityRepo { pool: &state.pool };
-    let mut row = repo.latest_turn_event(session_id).await?;
+    let mut row = repo.latest_turn_event(relationship).await?;
 
     if let Some(after) = query.after {
         let wait = query
@@ -174,7 +182,7 @@ async fn bff_get_affinity_delta(
                 break;
             }
             tokio::time::sleep(LONG_POLL_TICK.min(deadline - now)).await;
-            row = repo.latest_turn_event(session_id).await?;
+            row = repo.latest_turn_event(relationship).await?;
         }
     }
 

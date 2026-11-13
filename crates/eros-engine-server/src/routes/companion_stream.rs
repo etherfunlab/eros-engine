@@ -966,7 +966,11 @@ pub(crate) fn build_user_row_metadata(
             `reply_text` on the wire), while the text+image variant keeps its full \
             `reply_text_image` name. `product_qa` marks an out-of-character product answer \
             (excluded from companion context; also reported on replay). Clients must tolerate \
-            unknown `action_type` values.", content_type = "text/event-stream"),
+            unknown `action_type` values. The `final` frame of a turn whose date invitation \
+            she accepted carries `activity` (`id`, `sub_session_id`, `duration`, `place`, \
+            `content`, `status`, `started_at`, `ends_at`): the date it opened, whose turns are \
+            sent to `sub_session_id`. It is absent on every other turn.",
+            content_type = "text/event-stream"),
         (status = 400, body = StreamPreErrorBody),
         (status = 401, description = "missing or invalid bearer"),
         (status = 403, body = StreamPreErrorBody),

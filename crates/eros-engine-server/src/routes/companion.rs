@@ -178,6 +178,12 @@ pub struct ChatHistoryEntry {
     /// `occasion`). The BFF history entry carries the same field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub life_choice: Option<crate::routes::life_choices::LifeChoiceReceiptDto>,
+    /// The date a `user` row's invitation opened, when she accepted it: its
+    /// `sub_session_id` (whose rows this route serves under that id) and its
+    /// `status` as of the response. Omitted on every other row, a refused
+    /// invitation included. The BFF history entry carries the same field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity: Option<crate::routes::dto::ActivityView>,
     /// The member session that spoke this line (group sessions only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speaker_session_id: Option<Uuid>,
@@ -790,14 +796,16 @@ async fn get_history(
     let chat_repo = ChatRepo { pool: &state.pool };
     let rows = chat_repo.history(session_id, limit, offset).await?;
     let ids: Vec<Uuid> = rows.iter().map(|m| m.id).collect();
-    let mut receipts =
-        crate::routes::life_choices::receipts_for(&state.pool, &ids, chrono::Utc::now()).await?;
+    let now = chrono::Utc::now();
+    let mut receipts = crate::routes::life_choices::receipts_for(&state.pool, &ids, now).await?;
+    let mut dates = crate::pipeline::activity::receipts_for(&state.pool, &ids, now).await?;
 
     let entries: Vec<ChatHistoryEntry> = rows
         .into_iter()
         .map(|m| ChatHistoryEntry {
             id: m.id,
             life_choice: receipts.remove(&m.id),
+            activity: dates.remove(&m.id),
             user_message_id: m.user_message_id,
             image: m.metadata.as_ref().and_then(|md| md.get("image")).is_some(),
             reply_to_message_id: m

@@ -4,6 +4,8 @@
 //! its verdict folded into the parent's affinity, the date's episode, and its
 //! journal rows. The activity's claim keeps a second caller out.
 
+use std::collections::HashMap;
+
 use axum::http::StatusCode;
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use chrono_tz::Tz;
@@ -27,6 +29,7 @@ use eros_engine_store::session_archive::lock_live_session;
 use super::dreaming::parse::LLM_KINDS;
 use crate::error::{AppError, StreamPreError};
 use crate::prompt::{action_from_metadata, action_subject, user_text_with_action};
+use crate::routes::dto::ActivityView;
 use crate::state::AppState;
 
 /// A settlement claim older than this belongs to a caller presumed gone, and
@@ -136,6 +139,21 @@ pub(crate) async fn turn_session(
     })
 }
 
+/// `invitation message_id → receipt` for the rows of one history page, one
+/// lookup: the date each accepted invitation opened (spec §10).
+pub(crate) async fn receipts_for(
+    pool: &sqlx::PgPool,
+    message_ids: &[Uuid],
+    now: DateTime<Utc>,
+) -> Result<HashMap<Uuid, ActivityView>, sqlx::Error> {
+    Ok(ActivityRepo { pool }
+        .by_message_ids(message_ids)
+        .await?
+        .iter()
+        .filter_map(|a| Some((a.message_id?, ActivityView::from_record(a, now))))
+        .collect())
+}
+
 /// Whether a send may go ahead, checked before it writes anything (spec
 /// §4.2, §5.3, §6.1). A date's own session takes sends while the date runs and
 /// not once its clock is out, and takes no invitation; for the instance's text
@@ -237,7 +255,6 @@ fn choice_pending() -> AppError {
 /// (`None` when the parent has no row) and the deltas its event committed
 /// (`None` when it wrote none).
 #[derive(Debug)]
-#[cfg_attr(not(test), expect(dead_code, reason = "no reader outside tests"))]
 pub(crate) struct Settlement {
     pub activity: ActivityRecord,
     pub affinity: Option<Affinity>,

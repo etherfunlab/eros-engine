@@ -170,7 +170,9 @@ impl From<ChatMessage> for GreetingDto {
 /// occasion is true of the session. Either way one assistant message is
 /// generated, persisted (unread, like any reply) and returned; otherwise
 /// `greeting` is `null`. Idempotent per session and local date for a
-/// birthday or holiday, per session and `open_key` for an occasion.
+/// birthday or holiday, per session and `open_key` for an occasion. While a
+/// date of the persona is under way she speaks first in none of its
+/// sessions; a date's own session is `409 wrong_channel`.
 #[utoipa::path(
     post,
     path = "/v2/comp/session/{session_id}/open",
@@ -356,6 +358,15 @@ async fn plan_open(
         .foreground
         .is_some_and(|e| e.kind.is_offline(&crate::prompt::persona_traits(&persona)));
     if away {
+        return Ok(OpenPlan::Answer(None));
+    }
+    // She is with the user on a date (spec 2026-11-12-activity-sub-session-
+    // design.md §5.3): no greeting in any session of the instance.
+    let on_a_date = eros_engine_store::activity::ActivityRepo { pool: &state.pool }
+        .unsettled_for_instance(instance_id)
+        .await?
+        .is_some_and(|a| a.status_at(now) == eros_engine_store::activity::ActivityStatus::Ongoing);
+    if on_a_date {
         return Ok(OpenPlan::Answer(None));
     }
 
@@ -1321,6 +1332,80 @@ mod tests {
         assert!(out.greeting.is_none());
         assert!(companion_calls(&mock).await.is_empty());
         assert_eq!(proactive_rows(&pool, session_id).await, 0);
+    }
+
+    /// While a date of the instance runs she is with the user and opens
+    /// nothing in the main chat; once it is settled she speaks as before.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn open_is_null_during_a_date(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let seeded = Utc::now();
+        let session_id =
+            session_with_history(&pool, user_id, seeded - chrono::Duration::days(2)).await;
+        let instance_id: Uuid =
+            sqlx::query_scalar("SELECT instance_id FROM engine.chat_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let date = crate::routes::companion::testutil::seed_date(
+            &pool,
+            session_id,
+            user_id,
+            instance_id,
+            seeded - chrono::Duration::minutes(10),
+        )
+        .await;
+        // After the invitation row, which the database stamps: an opener
+        // yields to any row since its request began.
+        let now = Utc::now();
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "在干嘛呢").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+
+        let out = open_at(
+            &state,
+            session_id,
+            user_id,
+            opener(OpenOccasion::JustOpened, "visit-1"),
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(out.greeting.is_none());
+        assert!(companion_calls(&mock).await.is_empty());
+
+        let ended = now - chrono::Duration::minutes(5);
+        sqlx::query("UPDATE engine.persona_events SET ends_at = $2 WHERE id = $1")
+            .bind(date.event_id)
+            .bind(ended)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE engine.activities SET settled_at = $2 WHERE id = $1")
+            .bind(date.id)
+            .bind(ended)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let out = open_at(
+            &state,
+            session_id,
+            user_id,
+            opener(OpenOccasion::JustOpened, "visit-2"),
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.greeting.expect("an opener").content, "在干嘛呢");
+        let calls = companion_calls(&mock).await;
+        assert!(
+            calls[0]
+                .to_string()
+                .contains("- 刚才：你们刚约会回来（海边，散步）"),
+            "{}",
+            calls[0]
+        );
     }
 
     /// The user honoured a separation agreed in this session: the opener is

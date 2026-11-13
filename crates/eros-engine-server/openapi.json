@@ -142,7 +142,7 @@
         "tags": [
           "bff-companion"
         ],
-        "summary": "Latest user-turn affinity delta as committed. For per-turn FE observation;\nJWT + ownership checked. With `?after=<event_id>` the request long-polls (see\n[`BffAffinityDeltaQuery`]), collapsing the per-turn short-poll loop into\none held request.",
+        "summary": "Latest user-turn affinity delta as committed. For per-turn FE observation;\nJWT + ownership checked. With `?after=<event_id>` the request long-polls (see\n[`BffAffinityDeltaQuery`]), collapsing the per-turn short-poll loop into\none held request. A date's own session answers with the relationship's\nlatest turn, which during the date is the date's last turn: it moves\nnothing, since a date is judged once when it is settled.",
         "operationId": "bff_get_affinity_delta",
         "parameters": [
           {
@@ -531,7 +531,7 @@
         },
         "responses": {
           "200": {
-            "description": "SSE event stream (text/event-stream). The `meta` frame's `action_type` is one of `reply` | `ghost` | `reply_image` | `reply_text_image` | `product_qa`. Note the asymmetry: a plain-text `reply_text` turn is reported as `reply` (there is no `reply_text` on the wire), while the text+image variant keeps its full `reply_text_image` name. `product_qa` marks an out-of-character product answer (excluded from companion context; also reported on replay). Clients must tolerate unknown `action_type` values.",
+            "description": "SSE event stream (text/event-stream). The `meta` frame's `action_type` is one of `reply` | `ghost` | `reply_image` | `reply_text_image` | `product_qa`. Note the asymmetry: a plain-text `reply_text` turn is reported as `reply` (there is no `reply_text` on the wire), while the text+image variant keeps its full `reply_text_image` name. `product_qa` marks an out-of-character product answer (excluded from companion context; also reported on replay). Clients must tolerate unknown `action_type` values. The `final` frame of a turn whose date invitation she accepted carries `activity` (`id`, `sub_session_id`, `duration`, `place`, `content`, `status`, `started_at`, `ends_at`): the date it opened, whose turns are sent to `sub_session_id`. It is absent on every other turn.",
             "content": {
               "text/event-stream": {}
             }
@@ -2533,12 +2533,94 @@
         ]
       }
     },
+    "/v2/comp/session/{session_id}/activities/{activity_id}/end": {
+      "post": {
+        "tags": [
+          "companion"
+        ],
+        "summary": "End a date and settle it.",
+        "description": "`session_id` is the session the invitation was sent in. A date still under\nway ends now; one whose clock ran out keeps the end it had. The date is\nthen settled in this call: the activity judge reads it once, its verdict\nmoves the relationship (each line by at most one tier), and the date goes\ninto the relationship's memory. A date already settled answers with the\nresult it stored, so a repeat call changes nothing.\n\n`404 activity_not_found` when the activity is not this session's. `409\nactivity_settling` while another request settles the date; nothing waits.\n`409 wrong_channel` for a date's own session id.",
+        "operationId": "end_activity",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "The session the invitation was sent in",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "activity_id",
+            "in": "path",
+            "description": "The activity's id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivityEndResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v2/comp/session/{session_id}/effects": {
       "get": {
         "tags": [
           "companion"
         ],
-        "summary": "The persona's lingering state from accepted gives, her needs and the\nincident and the background under way, as a text turn sent now would carry\nthem.",
+        "summary": "The persona's lingering state from accepted gives, her needs and the\nincident and the background under way, as a text turn sent now would carry\nthem, and her date until it is settled.",
         "operationId": "get_effects",
         "parameters": [
           {
@@ -3171,7 +3253,7 @@
           "companion"
         ],
         "summary": "Tell the engine the user just entered this session.",
-        "description": "Without `occasion` the engine decides: on the persona's birthday (persona\nclock), or else a holiday in the user's timezone, when nobody has spoken\nin the session since that local midnight, the persona speaks first. With\n`occasion` the caller decides, and the persona speaks first when the\noccasion is true of the session. Either way one assistant message is\ngenerated, persisted (unread, like any reply) and returned; otherwise\n`greeting` is `null`. Idempotent per session and local date for a\nbirthday or holiday, per session and `open_key` for an occasion.",
+        "description": "Without `occasion` the engine decides: on the persona's birthday (persona\nclock), or else a holiday in the user's timezone, when nobody has spoken\nin the session since that local midnight, the persona speaks first. With\n`occasion` the caller decides, and the persona speaks first when the\noccasion is true of the session. Either way one assistant message is\ngenerated, persisted (unread, like any reply) and returned; otherwise\n`greeting` is `null`. Idempotent per session and local date for a\nbirthday or holiday, per session and `open_key` for an occasion. While a\ndate of the persona is under way she speaks first in none of its\nsessions; a date's own session is `409 wrong_channel`.",
         "operationId": "open_session",
         "parameters": [
           {
@@ -3672,6 +3754,84 @@
           "refuse"
         ]
       },
+      "ActivityEndResponse": {
+        "type": "object",
+        "required": [
+          "activity",
+          "affinity"
+        ],
+        "properties": {
+          "activity": {
+            "$ref": "#/components/schemas/ActivityView",
+            "description": "The date, `settled`; `ends_at` is when it ended."
+          },
+          "affinity": {
+            "$ref": "#/components/schemas/AffinitySnapshot",
+            "description": "The relationship after the date."
+          },
+          "effective_deltas": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AffinityDeltasDto",
+                "description": "What the date moved, as its settlement's affinity event committed it.\n`null` when the settlement wrote no event: no turn of the date was\nanswered, or the relationship was archived meanwhile."
+              }
+            ]
+          }
+        }
+      },
+      "ActivityView": {
+        "type": "object",
+        "description": "A date (spec 2026-11-12-activity-sub-session-design.md §4.6, §10): the\nsub-session it is played in and its span, `null` once its event row is gone.",
+        "required": [
+          "id",
+          "sub_session_id",
+          "duration",
+          "place",
+          "content",
+          "status"
+        ],
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "duration": {
+            "type": "string",
+            "description": "`short` (1 hour) | `mid` (4 hours)."
+          },
+          "ends_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "place": {
+            "type": "string"
+          },
+          "started_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "status": {
+            "type": "string",
+            "description": "`ongoing` | `ended` | `settled`, as of the response."
+          },
+          "sub_session_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
       "AddItemRequest": {
         "type": "object",
         "required": [
@@ -4068,6 +4228,17 @@
               {
                 "$ref": "#/components/schemas/UserActionView",
                 "description": "The action a user row carried and, once the turn took effect, the persona's response. Omitted on rows without an action."
+              }
+            ]
+          },
+          "activity": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ActivityView",
+                "description": "The date a `user` row's invitation opened, when she accepted it: its\n`sub_session_id` (whose rows this route serves under that id) and its\n`status` as of the response. Omitted on every other row, a refused\ninvitation included."
               }
             ]
           },
@@ -4710,6 +4881,17 @@
               }
             ]
           },
+          "activity": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ActivityView",
+                "description": "The date a `user` row's invitation opened, when she accepted it: its\n`sub_session_id` (whose rows this route serves under that id) and its\n`status` as of the response. Omitted on every other row, a refused\ninvitation included. The BFF history entry carries the same field."
+              }
+            ]
+          },
           "channel": {
             "type": [
               "string",
@@ -5145,6 +5327,17 @@
           "as_of"
         ],
         "properties": {
+          "activity": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ActivityView",
+                "description": "The persona's date that is `ongoing`, or `ended` and not yet settled\n(spec 2026-11-12-activity-sub-session-design.md §10): its\n`sub_session_id` is where its turns are sent. Omitted otherwise."
+              }
+            ]
+          },
           "as_of": {
             "type": "string",
             "format": "date-time",

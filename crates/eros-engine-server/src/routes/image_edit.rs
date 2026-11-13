@@ -344,14 +344,17 @@ fn edit_turn_plan(action: ActionType) -> ActionPlan {
 /// the image row lands, so this is the only way it sees either side of the
 /// revision. `tier` and `prompt_traits` reach the prompt builder the way a
 /// chat request's do: the tier picks the companion model and gates the
-/// traits. Fail-open everywhere: any failure (affinity load, request build,
-/// LLM error, blank reply) returns a text-less outcome and the turn degrades
-/// to `reply_image` — the picture is the turn's substance.
+/// traits. `relationship` is where the affinity lives: the parent of a
+/// date's session, else `session_id` itself. Fail-open everywhere: any
+/// failure (affinity load, request build, LLM error, blank reply) returns a
+/// text-less outcome and the turn degrades to `reply_image` — the picture is
+/// the turn's substance.
 #[allow(clippy::too_many_arguments)]
 async fn generate_reply_text(
     state: &AppState,
     persona: &CompanionPersona,
     session_id: Uuid,
+    relationship: Uuid,
     user_id: Uuid,
     instance_id: Uuid,
     instruction_row_id: Uuid,
@@ -365,7 +368,7 @@ async fn generate_reply_text(
     // Decayed in memory as the chat turn does, so the prompt (recall gate
     // included) reads the same tiers a text turn would.
     let affinity = match (AffinityRepo { pool: &state.pool })
-        .load_or_create(session_id, user_id, instance_id)
+        .load_or_create(relationship, user_id, instance_id)
         .await
     {
         Ok(mut a) => {
@@ -702,6 +705,11 @@ async fn edit_image(
         .await?
         .ok_or_else(|| AppError::NotFound("no such instance".into()))?
         .into_persona(req.character.as_deref())?;
+    // A picture from a date: the relationship's state is the parent's (spec
+    // 2026-11-12-activity-sub-session-design.md §5.1), and its turns are not
+    // judged one by one. Messages stay in `session_id`.
+    let turn = crate::pipeline::activity::turn_session(&state.pool, session_id).await?;
+    let (relationship, on_date) = (turn.relationship, turn.activity.is_some());
 
     // Same per-user in-flight pool as chat, voice and the compose endpoint:
     // this is one more user-triggered LLM call.
@@ -871,6 +879,7 @@ async fn edit_image(
             &state,
             &persona,
             session_id,
+            relationship,
             user_id,
             instance_id,
             umid,
@@ -978,7 +987,7 @@ async fn edit_image(
                 "UPDATE engine.companion_affinity SET ghost_streak = 0, updated_at = now() \
                  WHERE session_id = $1 AND ghost_streak <> 0",
             )
-            .bind(session_id)
+            .bind(relationship)
             .execute(&state_bg.pool)
             .await
             {
@@ -1005,7 +1014,8 @@ async fn edit_image(
         // detached like post_process — the response never waits on the judge.
         // Zero rule deltas (no PDE ran) and a zero-axis scope (this request
         // injects no affinity, so no feeling-clause rewrite). Unreachable in
-        // full-turn mode, whose pipeline already includes the judge.
+        // full-turn mode, whose pipeline already includes the judge. On a
+        // date the turn is recorded unjudged, as every date turn is.
         let eval_text = crate::pipeline::post_process::affinity_eval_text(
             ActionType::ReplyImage,
             "",
@@ -1017,7 +1027,7 @@ async fn edit_image(
         tokio::spawn(async move {
             crate::pipeline::post_process::run_affinity_turn(
                 &task_state,
-                session_id,
+                relationship,
                 user_id,
                 instance_id,
                 &persona,
@@ -1031,7 +1041,7 @@ async fn edit_image(
                 false,
                 None,
                 user_locale.timezone,
-                false,
+                on_date,
             )
             .await;
         });
@@ -2017,6 +2027,107 @@ mod tests {
             Some(instruction_id),
             "the event anchors to the instruction row when one exists"
         );
+    }
+
+    /// A picture from a date, edited: the relationship's state is the
+    /// parent's (spec 2026-11-12-activity-sub-session-design.md §5.1). Both
+    /// the judged slice and a full turn land their event on the parent's row
+    /// as unjudged date turns, the full turn resets the parent's ghost
+    /// streak, and the sub-session never gets an affinity row.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_edit_on_a_date_keeps_the_relationship_on_the_parent(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let parent = seed_session(&pool, user_id, instance_id).await;
+        seed_affinity(&pool, parent, user_id, instance_id).await;
+        sqlx::query("UPDATE engine.companion_affinity SET ghost_streak = 2 WHERE session_id = $1")
+            .bind(parent)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let date = crate::routes::companion::testutil::seed_date(
+            &pool,
+            parent,
+            user_id,
+            instance_id,
+            chrono::Utc::now() - chrono::Duration::minutes(10),
+        )
+        .await;
+        let sub = date.sub_session_id;
+        let (_, mid) = seed_image_turn(&pool, sub).await;
+
+        let mock = MockServer::start().await;
+        mount_editor_and_judge(&mock).await;
+        mount_companion(&mock).await;
+        Mock::given(wm_path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"embedding": vec![0.1_f32; 512]}]
+            })))
+            .mount(&mock)
+            .await;
+        let mut state = with_composer(test_state(pool.clone()), &mock.uri(), FULL_TURN_TOML);
+        state.embed = Arc::new(
+            eros_engine_llm::embedding::EmbeddingRouter::from_config_with(
+                &eros_engine_llm::model_config::ModelConfig::from_toml_str(&format!(
+                    "[providers.mockembed]\nembeddings = \"{}/v1/embeddings\"\n\
+                     [tasks.embedding]\nmodel = \"mock-embed@mockembed\"\n",
+                    mock.uri()
+                ))
+                .unwrap(),
+                |k| (k == "MOCKEMBED_API_KEY").then(|| "test-key".to_string()),
+            )
+            .unwrap(),
+        );
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        for body in [
+            json!({"instruction": "换套衣服", "evaluate_affinity": true}),
+            json!({"instruction": "再换一套", "persist_instruction": true,
+                   "reply_with_text": 1.0}),
+        ] {
+            let (status, resp) =
+                send_request(&mut app, edit_req(sub, mid, &token, body.clone())).await;
+            assert_eq!(status, StatusCode::OK, "{body}: {resp}");
+        }
+
+        let mut contexts: Vec<serde_json::Value> = Vec::new();
+        for _ in 0..100 {
+            contexts = sqlx::query_scalar(
+                "SELECT e.context FROM engine.companion_affinity_events e \
+                   JOIN engine.companion_affinity a ON a.id = e.affinity_id \
+                  WHERE a.session_id = $1 AND e.event_type = 'message'",
+            )
+            .bind(parent)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            if contexts.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(contexts.len(), 2, "{contexts:?}");
+        for c in &contexts {
+            assert_eq!(c["eval_skip_reason"], json!("activity"), "{c}");
+        }
+        let sub_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.companion_affinity WHERE session_id = $1",
+        )
+        .bind(sub)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(sub_rows, 0);
+        let ghost_streak: i32 = sqlx::query_scalar(
+            "SELECT ghost_streak FROM engine.companion_affinity WHERE session_id = $1",
+        )
+        .bind(parent)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(ghost_streak, 0);
     }
 
     /// Everything the full-turn (`reply_with_text`) tests need: the edit

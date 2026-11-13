@@ -5030,11 +5030,22 @@ pub(crate) fn run_stream_with(
                 tracing::warn!("stream: scare read failed: {e}");
                 None
             });
+        // The date this main chat is just back from, until her first line
+        // after it (spec 2026-11-12-activity-sub-session-design.md §8). A
+        // date's own session is back from none.
+        let date_back = eros_engine_store::activity::ActivityRepo { pool: &state.pool }
+            .returned_from(user_msg.session_id, current.at)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("stream: date return read failed: {e}");
+                None
+            });
         let event_judge = crate::prompt::events_judge_text(
             &current,
             offline.as_ref(),
             separation.as_ref(),
             scare.as_ref(),
+            date_back.as_ref(),
         );
         let event_lines = crate::prompt::EventLines {
             under_way: crate::prompt::events_reply_text(&current),
@@ -5042,6 +5053,7 @@ pub(crate) fn run_stream_with(
                 offline.as_ref(),
                 separation.as_ref(),
                 scare.as_ref(),
+                date_back.as_ref(),
             ),
             date: turn
                 .activity
@@ -26194,8 +26206,14 @@ data: [DONE]\n\n"
 
         /// Send `body` to the date's sub-session on the stream route under
         /// client message id `n`: the frames, and the user row.
-        async fn send(
+        async fn send(&self, n: u32, body: serde_json::Value) -> (Vec<serde_json::Value>, Uuid) {
+            self.send_to(self.sub(), n, body).await
+        }
+
+        /// [`Self::send`] to `session`.
+        async fn send_to(
             &self,
+            session: Uuid,
             n: u32,
             mut body: serde_json::Value,
         ) -> (Vec<serde_json::Value>, Uuid) {
@@ -26211,7 +26229,7 @@ data: [DONE]\n\n"
                 .call(
                     Request::builder()
                         .method("POST")
-                        .uri(format!("/comp/chat/{}/message/stream", self.sub()))
+                        .uri(format!("/comp/chat/{session}/message/stream"))
                         .header(header::AUTHORIZATION, format!("Bearer {token}"))
                         .header(header::CONTENT_TYPE, "application/json")
                         .body(Body::from(serde_json::to_vec(&body).unwrap()))
@@ -26225,7 +26243,7 @@ data: [DONE]\n\n"
                 "SELECT id FROM engine.chat_messages \
                   WHERE session_id = $1 AND client_msg_id = $2 AND role = 'user'",
             )
-            .bind(self.sub())
+            .bind(session)
             .bind(&client_msg_id)
             .fetch_one(&self.pool)
             .await
@@ -26737,5 +26755,58 @@ data: [DONE]\n\n"
             s.life_choices().await,
             vec![("sleep_together".to_string(), "pending".to_string())]
         );
+    }
+
+    /// Back in the main chat (spec §8): from the date's end until her first
+    /// line after it, the reply hears that they just got back and the judge
+    /// when the date ended.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_main_chat_hears_they_are_back(pool: PgPool) {
+        let s = date_scene(&pool, reply_text_verdict(), "").await;
+        s.end().await;
+
+        // The send settles the date before its turn runs.
+        s.send_to(s.parent, 1, serde_json::json!({"content": "回来啦"}))
+            .await;
+        let settled: bool = sqlx::query_scalar(
+            "SELECT settled_at IS NOT NULL FROM engine.activities WHERE id = $1",
+        )
+        .bind(s.activity.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(settled);
+        s.send_to(s.parent, 2, serde_json::json!({"content": "今天开心吗"}))
+            .await;
+
+        let systems: Vec<String> = companion_requests(&s.mock)
+            .await
+            .iter()
+            .map(system_prompt_of)
+            .collect();
+        assert_eq!(systems.len(), 2);
+        assert!(
+            systems[0].contains("- 刚才：你们刚约会回来（海边，看海）"),
+            "{}",
+            systems[0]
+        );
+        assert!(!systems[1].contains("约会回来"), "{}", systems[1]);
+
+        let judges: Vec<String> = s
+            .mock
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .filter(|b| b.contains("pde/judge"))
+            .collect();
+        assert_eq!(judges.len(), 2);
+        assert!(
+            judges[0].contains("[近期事件] 和对方约会（不到 1 小时前结束）\\n"),
+            "{}",
+            judges[0]
+        );
+        assert!(!judges[1].contains("和对方约会（"), "{}", judges[1]);
     }
 }

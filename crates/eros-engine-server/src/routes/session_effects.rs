@@ -132,11 +132,16 @@ pub struct EffectsResponse {
     /// no new event: the next drift step of a need, or the end of `event` or
     /// `background_event`. `null` when nothing changes on its own.
     pub changes_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The persona's date that is `ongoing`, or `ended` and not yet settled
+    /// (spec 2026-11-12-activity-sub-session-design.md §10): its
+    /// `sub_session_id` is where its turns are sent. Omitted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity: Option<crate::routes::dto::ActivityView>,
 }
 
 /// The persona's lingering state from accepted gives, her needs and the
 /// incident and the background under way, as a text turn sent now would carry
-/// them.
+/// them, and her date until it is settled.
 #[utoipa::path(
     get,
     path = "/v2/comp/session/{session_id}/effects",
@@ -206,6 +211,10 @@ async fn get_effects(
         e.as_ref()
             .map(|e| crate::routes::session_events::EventView::new(e, &traits))
     };
+    let activity = eros_engine_store::activity::ActivityRepo { pool: &state.pool }
+        .unsettled_for_instance(instance_id)
+        .await?
+        .map(|a| crate::routes::dto::ActivityView::from_record(&a, now));
     let changes_at = [
         needs_change,
         current.foreground.as_ref().map(|e| e.ends_at),
@@ -221,6 +230,7 @@ async fn get_effects(
         background_event: view(&current.background),
         as_of: now,
         changes_at,
+        activity,
     }))
 }
 
@@ -471,6 +481,48 @@ mod tests {
             assert_eq!(body["event"]["kind"], json!("out_shopping"), "{art}");
             assert_eq!(body["event"]["offline"], json!(offline), "{art}");
         }
+    }
+
+    /// A date of the instance shows on the session's effects while it runs
+    /// and once it has ended, until it is settled.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn effects_show_the_date_until_settled(pool: sqlx::PgPool) {
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, owner).await;
+        let session_id = seed_session(&pool, owner, instance_id).await;
+        let date = crate::routes::companion::testutil::seed_date(
+            &pool,
+            session_id,
+            owner,
+            instance_id,
+            chrono::Utc::now() - chrono::Duration::minutes(10),
+        )
+        .await;
+
+        let (s, body) = get(pool.clone(), session_id, owner).await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+        assert_eq!(body["activity"]["status"], json!("ongoing"), "{body}");
+        assert_eq!(body["activity"]["id"], json!(date.id));
+        assert_eq!(
+            body["activity"]["sub_session_id"],
+            json!(date.sub_session_id)
+        );
+
+        sqlx::query("UPDATE engine.persona_events SET ends_at = now() WHERE id = $1")
+            .bind(date.event_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (_, body) = get(pool.clone(), session_id, owner).await;
+        assert_eq!(body["activity"]["status"], json!("ended"), "{body}");
+
+        sqlx::query("UPDATE engine.activities SET settled_at = now() WHERE id = $1")
+            .bind(date.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (_, body) = get(pool, session_id, owner).await;
+        assert!(body.get("activity").is_none(), "{body}");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

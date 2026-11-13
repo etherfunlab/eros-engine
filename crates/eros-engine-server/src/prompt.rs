@@ -1097,18 +1097,22 @@ pub(crate) fn event_when_text(
 /// `[近期事件]` (spec 2026-10-15-life-events-v2-design.md §8.2; 2026-10-16-
 /// life-events-offline-and-scares-design.md §4.2, §5.2): the background, the
 /// foreground, an offline stretch she has not explained, a separation that
-/// ended and has not been marked, then a false alarm not yet resolved, each
-/// 「临时接到工作（1 小时前开始，约 3 小时后结束）」, 「睡着了（2 小时前结束，
-/// 期间对方的消息你没有回）」, 「说好暂时分开（2 小时前结束，对方等到了约定
-/// 之后）」 or 「月经没来（1 小时前结束，结果是虚惊一场）」; a false alarm under
-/// way is its label alone, with no span; `None` when there is nothing.
-/// `separation` is `EventRepo::unreturned_separation`: it speaks for its
-/// event in place of `offline`'s entry for the same one.
+/// ended and has not been marked, a false alarm not yet resolved, then the
+/// date they are just back from, each 「临时接到工作（1 小时前开始，约 3 小时
+/// 后结束）」, 「睡着了（2 小时前结束，期间对方的消息你没有回）」, 「说好暂时
+/// 分开（2 小时前结束，对方等到了约定之后）」, 「月经没来（1 小时前结束，结果
+/// 是虚惊一场）」 or 「和对方约会（1 小时前结束）」; a false alarm under way is
+/// its label alone, with no span; `None` when there is nothing. `separation`
+/// is `EventRepo::unreturned_separation`: it speaks for its event in place of
+/// `offline`'s entry for the same one. `date_back` is
+/// `ActivityRepo::returned_from` (spec 2026-11-12-activity-sub-session-
+/// design.md §8).
 pub(crate) fn events_judge_text(
     c: &eros_engine_store::events::CurrentEvents,
     offline: Option<&eros_engine_store::events::EventRecord>,
     separation: Option<&(eros_engine_store::events::EventRecord, bool)>,
     scare: Option<&eros_engine_store::events::EventRecord>,
+    date_back: Option<&eros_engine_store::activity::ActivityRecord>,
 ) -> Option<String> {
     let mut items: Vec<String> = [c.background.as_ref(), c.foreground.as_ref()]
         .into_iter()
@@ -1151,6 +1155,13 @@ pub(crate) fn events_judge_text(
             span_text(c.at - s.ends_at)
         ));
     }
+    if let Some(ends_at) = date_back.and_then(|a| a.ends_at) {
+        items.push(format!(
+            "{}（{}前结束）",
+            event_label(eros_engine_core::events::EventKind::OnADate),
+            span_text(c.at - ends_at)
+        ));
+    }
     (!items.is_empty()).then(|| items.join("；"))
 }
 
@@ -1182,8 +1193,8 @@ pub struct EventLines {
     pub under_way: Option<String>,
     /// `刚才`: an offline stretch this session has not been told about, the
     /// return of a separation she asked for (marked whether or not the user
-    /// wrote during it) and a false alarm not yet resolved here, rendered by
-    /// `just_now_text`.
+    /// wrote during it), a false alarm not yet resolved here and the date
+    /// they are just back from, rendered by `just_now_text`.
     pub just_now: Option<String>,
     /// `约会`: on a date turn, where the date is and what it is for, rendered
     /// by `date_line`.
@@ -1235,26 +1246,35 @@ fn standard_entry<'a>(
     offline.filter(|o| !separation.is_some_and(|(s, _)| s.id == o.id))
 }
 
-/// `刚才` (§5.3): the offline text, the separation's, then the false alarm's,
-/// joined by `；`. `separation` is `EventRepo::unreturned_separation`: its
-/// words follow whether the user wrote while it lasted.
+/// `刚才` (§5.3): the offline text, the separation's, the false alarm's, then
+/// the date they are just back from, joined by `；`. `separation` is
+/// `EventRepo::unreturned_separation`: its words follow whether the user
+/// wrote while it lasted. `date_back` is `ActivityRepo::returned_from` (spec
+/// 2026-11-12-activity-sub-session-design.md §8).
 pub(crate) fn just_now_text(
     offline: Option<&eros_engine_store::events::EventRecord>,
     separation: Option<&(eros_engine_store::events::EventRecord, bool)>,
     scare: Option<&eros_engine_store::events::EventRecord>,
+    date_back: Option<&eros_engine_store::activity::ActivityRecord>,
 ) -> Option<String> {
-    let mut items: Vec<&str> = standard_entry(offline, separation)
+    let mut items: Vec<String> = standard_entry(offline, separation)
         .and_then(|e| aftermath_text(e.kind))
+        .map(str::to_owned)
         .into_iter()
         .collect();
     items.extend(separation.map(|(_, wrote)| {
         if *wrote {
-            SEPARATION_UNREAD
+            SEPARATION_UNREAD.to_owned()
         } else {
-            SEPARATION_HONOURED
+            SEPARATION_HONOURED.to_owned()
         }
     }));
-    items.extend(scare.and_then(|e| aftermath_text(e.kind)));
+    items.extend(
+        scare
+            .and_then(|e| aftermath_text(e.kind))
+            .map(str::to_owned),
+    );
+    items.extend(date_back.map(|a| format!("你们刚约会回来（{}，{}）", a.place, a.content)));
     (!items.is_empty()).then(|| items.join("；"))
 }
 
@@ -4761,7 +4781,7 @@ mod tests {
         use eros_engine_core::events::EventKind;
         let c = only(event_at(EventKind::TempWork, 120, 120));
         assert_eq!(
-            events_judge_text(&c, None, None, None).unwrap(),
+            events_judge_text(&c, None, None, None, None).unwrap(),
             "临时接到工作（2 小时前开始，约 2 小时后结束）"
         );
         assert_eq!(
@@ -4770,7 +4790,7 @@ mod tests {
         );
         let c = only(event_at(EventKind::AnimalEncounter, 20, 40));
         assert_eq!(
-            events_judge_text(&c, None, None, None).unwrap(),
+            events_judge_text(&c, None, None, None, None).unwrap(),
             "路上遇到小动物（不到 1 小时前开始，不到 1 小时后结束）"
         );
         assert_eq!(
@@ -4780,7 +4800,7 @@ mod tests {
         // Rounded to whole hours: 89 minutes → 1, 151 minutes → 3.
         let c = only(event_at(EventKind::WeatherChange, 89, 151));
         assert_eq!(
-            events_judge_text(&c, None, None, None).unwrap(),
+            events_judge_text(&c, None, None, None, None).unwrap(),
             "天气突然变了（1 小时前开始，约 3 小时后结束）"
         );
         for (kind, label) in [
@@ -4806,7 +4826,7 @@ mod tests {
             at,
         };
         assert_eq!(
-            events_judge_text(&c, None, None, None).unwrap(),
+            events_judge_text(&c, None, None, None, None).unwrap(),
             "长途旅游（2 天前开始，约 3 天后结束）；在看书（不到 1 小时前开始，约 2 小时后结束）"
         );
         assert_eq!(
@@ -4818,7 +4838,7 @@ mod tests {
             background: None,
             at,
         };
-        assert_eq!(events_judge_text(&nothing, None, None, None), None);
+        assert_eq!(events_judge_text(&nothing, None, None, None, None), None);
         assert_eq!(events_reply_text(&nothing), None);
     }
 
@@ -4848,7 +4868,7 @@ mod tests {
             at,
         };
         assert_eq!(
-            events_judge_text(&nothing, Some(&sex), None, None).unwrap(),
+            events_judge_text(&nothing, Some(&sex), None, None, None).unwrap(),
             "在做爱（2 小时前结束，期间对方的消息你没有回）"
         );
     }
@@ -4864,7 +4884,7 @@ mod tests {
             at,
         };
         assert_eq!(
-            events_judge_text(&c, Some(&away), None, None).unwrap(),
+            events_judge_text(&c, Some(&away), None, None, None).unwrap(),
             "出差（10 小时前开始，约 14 小时后结束）；没看手机（不到 1 小时前结束，期间对方的消息你没有回）"
         );
         let (long_ago, _) = event_at(EventKind::AwayFromPhone, 240, -120);
@@ -4874,7 +4894,7 @@ mod tests {
             at,
         };
         assert_eq!(
-            events_judge_text(&nothing, Some(&long_ago), None, None).unwrap(),
+            events_judge_text(&nothing, Some(&long_ago), None, None, None).unwrap(),
             "没看手机（2 小时前结束，期间对方的消息你没有回）"
         );
     }
@@ -4894,13 +4914,16 @@ mod tests {
             "出差（约 14 小时后结束）；月经没来"
         );
         assert_eq!(
-            events_judge_text(&c, None, None, None).unwrap(),
+            events_judge_text(&c, None, None, None, None).unwrap(),
             "出差（10 小时前开始，约 14 小时后结束）；月经没来"
         );
         let (scare, at) = event_at(EventKind::PregnancyScare, 30, 90);
         let c = only((scare, at));
         assert_eq!(events_reply_text(&c).unwrap(), "验出怀孕");
-        assert_eq!(events_judge_text(&c, None, None, None).unwrap(), "验出怀孕");
+        assert_eq!(
+            events_judge_text(&c, None, None, None, None).unwrap(),
+            "验出怀孕"
+        );
     }
 
     #[test]
@@ -4908,7 +4931,7 @@ mod tests {
         use eros_engine_core::events::EventKind;
         for kind in EventKind::ALL {
             let (rec, _) = event_at(kind, 70, -10);
-            let text = just_now_text(Some(&rec), None, None);
+            let text = just_now_text(Some(&rec), None, None, None);
             if kind.may_be_offline() || kind.is_false_alarm() {
                 assert!(text.is_some(), "{kind:?}");
             } else if kind == EventKind::TempWork {
@@ -4935,23 +4958,23 @@ mod tests {
             (HavingSex, "在做爱，对方那时发来的消息你现在才看到"),
         ] {
             assert_eq!(
-                just_now_text(Some(&rec(kind)), None, None).as_deref(),
+                just_now_text(Some(&rec(kind)), None, None, None).as_deref(),
                 Some(text)
             );
         }
         assert_eq!(
-            just_now_text(None, None, Some(&rec(PeriodScare))).as_deref(),
+            just_now_text(None, None, Some(&rec(PeriodScare)), None).as_deref(),
             Some("以为月经没来，后来来了，是虚惊一场")
         );
         assert_eq!(
-            just_now_text(None, None, Some(&rec(PregnancyScare))).as_deref(),
+            just_now_text(None, None, Some(&rec(PregnancyScare)), None).as_deref(),
             Some("验出两条杠，后来复查是虚惊一场")
         );
         assert_eq!(
-            just_now_text(Some(&rec(Asleep)), None, Some(&rec(PeriodScare))).as_deref(),
+            just_now_text(Some(&rec(Asleep)), None, Some(&rec(PeriodScare)), None).as_deref(),
             Some("睡着了，对方那时发来的消息你现在才看到；以为月经没来，后来来了，是虚惊一场")
         );
-        assert_eq!(just_now_text(None, None, None), None);
+        assert_eq!(just_now_text(None, None, None, None), None);
     }
 
     #[test]
@@ -4985,13 +5008,13 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                just_now_text(Some(&rec(kind)), None, None).as_deref(),
+                just_now_text(Some(&rec(kind)), None, None, None).as_deref(),
                 Some(text)
             );
         }
         for kind in [SawBag, SawClothes, FellOut] {
             assert_eq!(
-                just_now_text(Some(&rec(kind)), None, None),
+                just_now_text(Some(&rec(kind)), None, None, None),
                 None,
                 "{kind:?}"
             );
@@ -5009,7 +5032,7 @@ mod tests {
             at,
         };
         assert_eq!(
-            events_judge_text(&none, Some(&asleep), None, Some(&scare)).as_deref(),
+            events_judge_text(&none, Some(&asleep), None, Some(&scare), None).as_deref(),
             Some("睡着了（2 小时前结束，期间对方的消息你没有回）；验出怀孕（不到 1 小时前结束，结果是虚惊一场）")
         );
     }
@@ -5026,25 +5049,25 @@ mod tests {
         let wrote = (space.clone(), true);
         let honoured = (space, false);
         assert_eq!(
-            just_now_text(None, Some(&wrote), None).as_deref(),
+            just_now_text(None, Some(&wrote), None, None).as_deref(),
             Some("你们之前说好分开一阵，现在时间到了；对方那时发来的消息你现在才看到")
         );
         assert_eq!(
-            just_now_text(None, Some(&honoured), None).as_deref(),
+            just_now_text(None, Some(&honoured), None, None).as_deref(),
             Some("你们之前说好分开一阵，现在时间到了，你们重新开始联系")
         );
         assert_eq!(
-            events_judge_text(&none, None, Some(&wrote), None).as_deref(),
+            events_judge_text(&none, None, Some(&wrote), None, None).as_deref(),
             Some("说好暂时分开（2 小时前结束，期间对方的消息你没有回）")
         );
         assert_eq!(
-            events_judge_text(&none, None, Some(&honoured), None).as_deref(),
+            events_judge_text(&none, None, Some(&honoured), None, None).as_deref(),
             Some("说好暂时分开（2 小时前结束，对方等到了约定之后）")
         );
         // The wording of the user who wrote is the standard one: one text.
         assert_eq!(
-            just_now_text(None, Some(&wrote), None).as_deref(),
-            just_now_text(Some(&wrote.0), None, None).as_deref()
+            just_now_text(None, Some(&wrote), None, None).as_deref(),
+            just_now_text(Some(&wrote.0), None, None, None).as_deref()
         );
     }
 
@@ -5062,22 +5085,68 @@ mod tests {
         let honoured = (space.clone(), false);
         // The standard entry for the same event gives way: said once.
         assert_eq!(
-            just_now_text(Some(&space), Some(&honoured), None).as_deref(),
+            just_now_text(Some(&space), Some(&honoured), None, None).as_deref(),
             Some("你们之前说好分开一阵，现在时间到了，你们重新开始联系")
         );
         assert_eq!(
-            events_judge_text(&none, Some(&space), Some(&honoured), None).as_deref(),
+            events_judge_text(&none, Some(&space), Some(&honoured), None, None).as_deref(),
             Some("说好暂时分开（2 小时前结束，对方等到了约定之后）")
         );
         // Another stretch's entry stays: the standard one first, then the
         // separation, then a false alarm, joined by 「；」.
         assert_eq!(
-            just_now_text(Some(&asleep), Some(&honoured), Some(&scare)).as_deref(),
+            just_now_text(Some(&asleep), Some(&honoured), Some(&scare), None).as_deref(),
             Some("睡着了，对方那时发来的消息你现在才看到；你们之前说好分开一阵，现在时间到了，你们重新开始联系；验出两条杠，后来复查是虚惊一场")
         );
         assert_eq!(
-            events_judge_text(&none, Some(&asleep), Some(&honoured), Some(&scare)).as_deref(),
+            events_judge_text(&none, Some(&asleep), Some(&honoured), Some(&scare), None).as_deref(),
             Some("睡着了（不到 1 小时前结束，期间对方的消息你没有回）；说好暂时分开（2 小时前结束，对方等到了约定之后）；验出怀孕（不到 1 小时前结束，结果是虚惊一场）")
+        );
+    }
+
+    /// Back from a date (spec 2026-11-12-activity-sub-session-design.md §8):
+    /// the reply hears where they went, the judge when it ended; either is
+    /// the last entry.
+    #[test]
+    fn back_from_a_date_names_the_place_and_when_it_ended() {
+        use eros_engine_core::events::EventKind::*;
+        let (asleep, at) = event_at(Asleep, 400, -300);
+        let ended = at - chrono::Duration::minutes(130);
+        let date = eros_engine_store::activity::ActivityRecord {
+            id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            sub_session_id: Uuid::new_v4(),
+            message_id: None,
+            event_id: None,
+            duration: "mid".into(),
+            place: "海边".into(),
+            content: "看海".into(),
+            started_at: Some(ended - chrono::Duration::hours(4)),
+            ends_at: Some(ended),
+            settle_claimed_at: None,
+            settled_at: Some(ended),
+            created_at: ended - chrono::Duration::hours(4),
+        };
+        let none = eros_engine_store::events::CurrentEvents {
+            foreground: None,
+            background: None,
+            at,
+        };
+        assert_eq!(
+            just_now_text(None, None, None, Some(&date)).as_deref(),
+            Some("你们刚约会回来（海边，看海）")
+        );
+        assert_eq!(
+            events_judge_text(&none, None, None, None, Some(&date)).as_deref(),
+            Some("和对方约会（2 小时前结束）")
+        );
+        assert_eq!(
+            just_now_text(Some(&asleep), None, None, Some(&date)).as_deref(),
+            Some("睡着了，对方那时发来的消息你现在才看到；你们刚约会回来（海边，看海）")
+        );
+        assert_eq!(
+            events_judge_text(&none, Some(&asleep), None, None, Some(&date)).as_deref(),
+            Some("睡着了（5 小时前结束，期间对方的消息你没有回）；和对方约会（2 小时前结束）")
         );
     }
 
