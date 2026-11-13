@@ -5,8 +5,9 @@
 --
 -- chat_sessions.channel gains 'activity' (the sub-session's own rows), and
 -- companion_affinity_events.event_type gains 'activity' (the one event a
--- settled date writes). Each widening swaps a CHECK constraint; every existing
--- row still satisfies the wider one.
+-- settled date writes). Each widening swaps a CHECK constraint, added NOT
+-- VALID: every existing row satisfies the narrower one it replaces, so the
+-- table is not scanned under the lock, and new rows are checked as before.
 --
 -- engine.activities: one row per accepted date. The parent session, the
 -- sub-session, the invitation message and the on_a_date event are each
@@ -24,13 +25,13 @@ ALTER TABLE engine.chat_sessions
     DROP CONSTRAINT chat_sessions_channel_check;
 ALTER TABLE engine.chat_sessions
     ADD CONSTRAINT chat_sessions_channel_check
-    CHECK (channel IN ('text', 'voice', 'group', 'activity'));
+    CHECK (channel IN ('text', 'voice', 'group', 'activity')) NOT VALID;
 
 ALTER TABLE engine.companion_affinity_events
     DROP CONSTRAINT companion_affinity_events_event_type_check;
 ALTER TABLE engine.companion_affinity_events
     ADD CONSTRAINT companion_affinity_events_event_type_check
-    CHECK (event_type IN ('message', 'ghost', 'gift', 'proactive', 'time_decay', 'life_choice', 'activity'));
+    CHECK (event_type IN ('message', 'ghost', 'gift', 'proactive', 'time_decay', 'life_choice', 'activity')) NOT VALID;
 
 CREATE TABLE engine.activities (
     id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),

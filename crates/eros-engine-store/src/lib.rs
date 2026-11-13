@@ -1227,6 +1227,28 @@ mod migration_tests {
             matches!(&bogus, Err(sqlx::Error::Database(e)) if e.is_check_violation()),
             "other channels stay refused: {bogus:?}"
         );
+        // Both widenings are added NOT VALID: every existing row satisfies the
+        // narrower check, so the migration does not scan the table under its
+        // ACCESS EXCLUSIVE lock.
+        let validated: Vec<(String, bool)> = sqlx::query_as(
+            "SELECT conname::text, convalidated FROM pg_constraint \
+              WHERE conname IN ('chat_sessions_channel_check', \
+                                'companion_affinity_events_event_type_check') \
+              ORDER BY conname",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            validated,
+            vec![
+                ("chat_sessions_channel_check".to_string(), false),
+                (
+                    "companion_affinity_events_event_type_check".to_string(),
+                    false
+                ),
+            ]
+        );
 
         let affinity: uuid::Uuid = sqlx::query_scalar(
             "INSERT INTO engine.companion_affinity (session_id, user_id, instance_id) \

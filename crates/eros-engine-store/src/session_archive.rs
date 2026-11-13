@@ -86,6 +86,9 @@ impl<'a> SessionArchiveRepo<'a> {
     /// later finds no row and writes nothing. `relationship_scan_events` stays,
     /// counts and ids only.
     ///
+    /// A date under way ends now: its `on_a_date` event is cut at the
+    /// archive's clock.
+    ///
     /// `persona_instances.status` is deliberately not written: the user still
     /// owns the persona, and ownership is the client's business.
     pub async fn archive_relationship(
@@ -104,6 +107,20 @@ impl<'a> SessionArchiveRepo<'a> {
         .execute(&mut *tx)
         .await?
         .rows_affected();
+
+        // A date under way ends with the relationship it was a part of, so a
+        // new session of the instance finds her out on none (spec 2026-11-12-
+        // activity-sub-session-design.md). Its sub-session is archived above
+        // with the rest.
+        sqlx::query(
+            "UPDATE engine.persona_events SET ends_at = now() \
+              WHERE instance_id = $1 AND kind = $2 \
+                AND started_at < now() AND ends_at > now()",
+        )
+        .bind(instance_id)
+        .bind(eros_engine_core::events::EventKind::OnADate.as_str())
+        .execute(&mut *tx)
+        .await?;
 
         // The persona leaves every group with the relationship (spec §7.3).
         sqlx::query(
@@ -532,6 +549,55 @@ mod tests {
     }
 
     /// Every channel goes, and a second call is a no-op that still succeeds.
+    /// A date under way ends with the relationship: a new session of the
+    /// instance finds her out on no date, and a new invitation is not held
+    /// back by it. Any other event runs on.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn archive_ends_a_date_under_way(pool: PgPool) {
+        use crate::activity::ActivityRepo;
+        use crate::events::EventRepo;
+
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session = ChatRepo { pool: &pool }
+            .create_session(user_id, instance_id)
+            .await
+            .unwrap()
+            .id;
+        for (key, kind) in [("date", "on_a_date"), ("trip", "traveling_together")] {
+            sqlx::query(
+                "INSERT INTO engine.persona_events \
+                   (instance_id, session_id, event_key, kind, started_at, ends_at) \
+                 VALUES ($1, $2, $3, $4, now() - interval '10 minutes', \
+                         now() + interval '50 minutes')",
+            )
+            .bind(instance_id)
+            .bind(session)
+            .bind(key)
+            .bind(kind)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let now = chrono::Utc::now();
+        let activities = ActivityRepo { pool: &pool };
+        assert!(activities.date_on(instance_id, None, now).await.unwrap());
+
+        SessionArchiveRepo { pool: &pool }
+            .archive_relationship(user_id, instance_id)
+            .await
+            .unwrap();
+
+        let later = chrono::Utc::now();
+        let current = EventRepo { pool: &pool }
+            .current(instance_id, None, later)
+            .await
+            .unwrap();
+        assert!(current.foreground.is_none(), "{:?}", current.foreground);
+        assert!(current.background.is_some(), "the trip runs on");
+        assert!(!activities.date_on(instance_id, None, later).await.unwrap());
+    }
+
     #[sqlx::test(migrations = "./migrations")]
     async fn archives_every_channel_and_is_idempotent(pool: PgPool) {
         let user_id = Uuid::new_v4();

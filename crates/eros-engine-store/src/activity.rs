@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::chat::ChatMessage;
 use crate::events::{lock_instance, EventRepo, NewEvent};
+use crate::session_archive::lock_live_session;
 
 /// An activity's columns, in `ActivityRecord` order; `started_at` and
 /// `ends_at` come from the event.
@@ -148,13 +149,19 @@ impl ActivityRepo<'_> {
     /// date back, so a re-driven turn opens one. `None` while a date of the
     /// instance has not ended at `now`, one that starts after `now` included
     /// (its start is a stored `sent_at`, which can be later than the caller's
-    /// clock): nothing is written but her answer.
+    /// clock), or once the parent is archived: nothing is written but her
+    /// answer.
+    ///
+    /// The parent's row is locked first, as settlement locks it before it
+    /// writes, so an archive waits for the date to open (and then ends it) or
+    /// is seen here.
     pub async fn accept(
         &self,
         a: &NewActivity<'_>,
         now: DateTime<Utc>,
     ) -> Result<Option<ActivityRecord>, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
+        let live = lock_live_session(&mut tx, a.session_id).await?;
         sqlx::query(
             "UPDATE engine.chat_messages \
                 SET metadata = jsonb_set(metadata, '{action,response}', to_jsonb('accept'::text)) \
@@ -163,6 +170,10 @@ impl ActivityRepo<'_> {
         .bind(a.message_id)
         .execute(&mut *tx)
         .await?;
+        if !live {
+            tx.commit().await?;
+            return Ok(None);
+        }
 
         // The lookup and the insert are separate statements: a second driver
         // of the same turn must wait here and then find the first's row.
@@ -975,6 +986,48 @@ mod tests {
             done.status_at(t1 + Duration::hours(1)),
             ActivityStatus::Settled
         );
+    }
+
+    /// An invitation accepted after its relationship was archived opens no
+    /// date; her answer is still stored on the invitation.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn accept_on_an_archived_parent_opens_nothing(pool: PgPool) {
+        let s = scene(&pool).await;
+        sqlx::query("UPDATE engine.chat_sessions SET archived = true WHERE id = $1")
+            .bind(s.session)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let opened = ActivityRepo { pool: &pool }
+            .accept(&invitation(&s, DateDuration::Short), t(NOW))
+            .await
+            .unwrap();
+        assert_eq!(opened, None);
+        assert_eq!(
+            count(&pool, "SELECT count(*) FROM engine.activities").await,
+            0
+        );
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT count(*) FROM engine.chat_sessions WHERE channel = 'activity'"
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            count(&pool, "SELECT count(*) FROM engine.persona_events").await,
+            0
+        );
+        let response: Option<String> = sqlx::query_scalar(
+            "SELECT metadata->'action'->>'response' FROM engine.chat_messages WHERE id = $1",
+        )
+        .bind(s.invite)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(response.as_deref(), Some("accept"));
     }
 
     #[sqlx::test(migrations = "./migrations")]

@@ -5055,9 +5055,15 @@ pub(crate) fn run_stream_with(
                 scare.as_ref(),
                 date_back.as_ref(),
             ),
+            // Only while the date runs: a turn driven after its end (revived
+            // from the queue, or still generating) is not told it as under way.
             date: turn
                 .activity
                 .as_ref()
+                .filter(|a| {
+                    a.status_at(chrono::Utc::now())
+                        == eros_engine_store::activity::ActivityStatus::Ongoing
+                })
                 .map(|a| crate::prompt::date_line(&a.place, &a.content)),
         };
         // ── PDE decision (judge-first) ────────────────────────────────────────
@@ -26626,6 +26632,59 @@ data: [DONE]\n\n"
             system.contains("- 约会：地点「海边」；安排「看海」"),
             "{system}"
         );
+    }
+
+    /// A turn sent while the date ran but driven once it is over (a queued
+    /// turn revived late) is not told the date's scene as under way.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_date_turn_driven_after_the_end_has_no_date_line(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+
+        let s = date_scene(&pool, reply_text_verdict(), "").await;
+        let umid = match (ChatRepo { pool: &pool })
+            .upsert_user_message_idempotent(
+                s.sub(),
+                "还在吗",
+                "01JLATE0000000000000000000",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+        s.end().await;
+
+        let _: Vec<ProtocolFrame> = run_stream(
+            Arc::new(s.state.clone()),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id: s.sub(),
+                user_id: s.user_id,
+                instance_id: s.instance_id,
+                content: "还在吗".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                image_url: None,
+                image: None,
+                quote: Default::default(),
+                user_locale: Default::default(),
+                action: None,
+                outfit: None,
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        let system = system_prompt_of(&companion_requests(&s.mock).await[0]);
+        assert!(!system.contains("- 约会："), "{system}");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
