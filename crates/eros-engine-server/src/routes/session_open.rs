@@ -20,12 +20,14 @@ use uuid::Uuid;
 
 use eros_engine_core::persona::CompanionPersona;
 use eros_engine_core::scope::MemoryScope;
+use eros_engine_store::activity::{ActivityRepo, ActivityStatus};
 use eros_engine_store::chat::{ChatMessage, ChatRepo};
 
 use crate::auth::middleware::AuthUser;
 use crate::birthday::Birthday;
 use crate::error::{AppError, StreamPreError};
 use crate::holiday::{self, UserLocale};
+use crate::pipeline::activity::settle;
 use crate::pipeline::handlers::recall_query_text;
 use crate::pipeline::proactive::{
     bare_final, greet, greet_stream, replay_frames, Greeting, Occasion,
@@ -172,7 +174,9 @@ impl From<ChatMessage> for GreetingDto {
 /// `greeting` is `null`. Idempotent per session and local date for a
 /// birthday or holiday, per session and `open_key` for an occasion. While a
 /// date of the persona is under way she speaks first in none of its
-/// sessions; a date's own session is `409 wrong_channel`.
+/// sessions; a date whose clock ran out is settled first, and while another
+/// request settles it `greeting` is `null`. A date's own session is `409
+/// wrong_channel`.
 #[utoipa::path(
     post,
     path = "/v2/comp/session/{session_id}/open",
@@ -329,6 +333,29 @@ async fn plan_open(
     let (_session, persona, instance_id) =
         resolve_text_turn(state, session_id, user_id, "session open").await?;
 
+    // A date of hers not yet settled (spec 2026-11-12-activity-sub-session-
+    // design.md §5.3, §8). One whose clock ran out is settled before anything
+    // else, so its memory is written before she speaks; while another request
+    // settles it she speaks first in none of the instance's sessions, nor
+    // while it runs (checked once the occasion is decided).
+    let on_a_date = match (ActivityRepo { pool: &state.pool })
+        .unsettled_for_instance(instance_id)
+        .await?
+    {
+        Some(a) => match a.status_at(now) {
+            ActivityStatus::Ongoing => true,
+            ActivityStatus::Ended => match settle(state, a.id, now).await {
+                Ok(_) => false,
+                Err(AppError::StreamPre(e)) if e.code == "activity_settling" => {
+                    return Ok(OpenPlan::Answer(None));
+                }
+                Err(e) => return Err(e),
+            },
+            ActivityStatus::Settled => false,
+        },
+        None => false,
+    };
+
     let locale = UserLocale::resolve(
         req.user_timezone.as_deref(),
         req.user_country.as_deref(),
@@ -360,12 +387,8 @@ async fn plan_open(
     if away {
         return Ok(OpenPlan::Answer(None));
     }
-    // She is with the user on a date (spec 2026-11-12-activity-sub-session-
-    // design.md §5.3): no greeting in any session of the instance.
-    let on_a_date = eros_engine_store::activity::ActivityRepo { pool: &state.pool }
-        .unsettled_for_instance(instance_id)
-        .await?
-        .is_some_and(|a| a.status_at(now) == eros_engine_store::activity::ActivityStatus::Ongoing);
+    // She is with the user on a date: no greeting in any session of the
+    // instance.
     if on_a_date {
         return Ok(OpenPlan::Answer(None));
     }
@@ -1406,6 +1429,151 @@ mod tests {
             "{}",
             calls[0]
         );
+    }
+
+    /// A date that ended an hour after it started, 90 minutes ago, with one
+    /// answered turn, in a session last spoken in two days ago; the companion
+    /// answers 「在干嘛呢」 and the activity judge (`judge`) its verdict on
+    /// the same mock. Returns the state, the session and the date.
+    async fn ended_date(
+        pool: &PgPool,
+        user_id: Uuid,
+        mock: &MockServer,
+    ) -> (AppState, Uuid, eros_engine_store::activity::ActivityRecord) {
+        let seeded = Utc::now();
+        let session_id =
+            session_with_history(pool, user_id, seeded - chrono::Duration::days(2)).await;
+        let instance_id: Uuid =
+            sqlx::query_scalar("SELECT instance_id FROM engine.chat_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        let date = crate::routes::companion::testutil::seed_date(
+            pool,
+            session_id,
+            user_id,
+            instance_id,
+            seeded - chrono::Duration::minutes(90),
+        )
+        .await;
+        let asked: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+             VALUES ($1, 'user', '到了', $2) RETURNING id",
+        )
+        .bind(date.sub_session_id)
+        .bind(seeded - chrono::Duration::minutes(80))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, sent_at, user_message_id) \
+             VALUES ($1, 'assistant', '海风好舒服', $2, $3)",
+        )
+        .bind(date.sub_session_id)
+        .bind(seeded - chrono::Duration::minutes(79))
+        .bind(asked)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        mount_companion(mock, "在干嘛呢").await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"judge\""))
+            .respond_with(crate::pipeline::activity::tests::judged(
+                crate::pipeline::activity::tests::JUDGE_REPLY,
+            ))
+            .mount(mock)
+            .await;
+        let mut state = with_companion(test_state(pool.clone()), &mock.uri());
+        state.model_config = Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"companion\"\n\
+                 [tasks.affinity_evaluation]\nmodel = \"judge\"\n",
+            )
+            .unwrap(),
+        );
+        (state, session_id, date)
+    }
+
+    async fn settled_at(pool: &PgPool, activity_id: Uuid) -> Option<DateTime<Utc>> {
+        sqlx::query_scalar("SELECT settled_at FROM engine.activities WHERE id = $1")
+            .bind(activity_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Back from a date nobody has settled yet: the opener settles it first,
+    /// so its memory is written before she speaks, and she still speaks as
+    /// just back from it.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_opener_after_a_date_settles_it_first(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let mock = MockServer::start().await;
+        let (state, session_id, date) = ended_date(&pool, user_id, &mock).await;
+
+        let out = open_at(
+            &state,
+            session_id,
+            user_id,
+            opener(OpenOccasion::JustOpened, "visit-1"),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.greeting.expect("an opener").content, "在干嘛呢");
+
+        assert!(settled_at(&pool, date.id).await.is_some());
+        let episodes: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.relationship_episodes e \
+               JOIN engine.chat_sessions s ON s.instance_id = e.instance_id WHERE s.id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(episodes, 1);
+        let calls = companion_calls(&mock).await;
+        assert_eq!(calls.len(), 2, "the judge, then the opener");
+        assert_eq!(calls[0]["model"], "judge");
+        assert_eq!(calls[1]["model"], "companion");
+        assert!(
+            calls[1]
+                .to_string()
+                .contains("- 刚才：你们刚约会回来（海边，散步）"),
+            "{}",
+            calls[1]
+        );
+    }
+
+    /// While another request settles the date, the opener says nothing.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn no_opener_while_the_date_is_being_settled(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let mock = MockServer::start().await;
+        let (state, session_id, date) = ended_date(&pool, user_id, &mock).await;
+        let now = Utc::now();
+        sqlx::query("UPDATE engine.activities SET settle_claimed_at = $2 WHERE id = $1")
+            .bind(date.id)
+            .bind(now - chrono::Duration::seconds(5))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let out = open_at(
+            &state,
+            session_id,
+            user_id,
+            opener(OpenOccasion::JustOpened, "visit-1"),
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(out.greeting.is_none());
+        assert!(companion_calls(&mock).await.is_empty());
+        assert_eq!(settled_at(&pool, date.id).await, None);
+        assert_eq!(proactive_rows(&pool, session_id).await, 0);
     }
 
     /// The user honoured a separation agreed in this session: the opener is

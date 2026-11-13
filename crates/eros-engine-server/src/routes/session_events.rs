@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 use eros_engine_core::events::{self, DrawInput, EventKind};
 use eros_engine_core::scope::MemoryScope;
+use eros_engine_store::activity::ActivityRepo;
 use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::ChatRepo;
 use eros_engine_store::events::EventRepo;
@@ -589,9 +590,10 @@ async fn stored(
 /// Ask for something to happen in the persona's day.
 ///
 /// The engine draws one kind of event, or none (a short or mid-length
-/// incident is under way, every allowed kind is cooling down, or she has asked
+/// incident is under way, every allowed kind is cooling down, she has asked
 /// the user for space and waits for the answer, in any session of the persona,
-/// until it is answered or lapses). During a background event (a trip or a
+/// until it is answered or lapses, or a date of the persona has not been
+/// settled yet). During a background event (a trip or a
 /// body state) only incidents are drawn. The
 /// persona then tells the user in one proactive message, persisted like any
 /// reply and returned with the event. The offline kinds (`away_from_phone`,
@@ -824,6 +826,16 @@ async fn plan_event(
         .pending_for_instance(instance_id, now)
         .await?;
     if waiting {
+        return Ok((EventPlan::Nothing, traits));
+    }
+    // A date of hers not yet settled (spec 2026-11-12-activity-sub-session-
+    // design.md §5.3, §8): she is out with the user, or back with the date
+    // not yet in her memory. Any session of the instance.
+    if (ActivityRepo { pool: &state.pool })
+        .unsettled_for_instance(instance_id)
+        .await?
+        .is_some()
+    {
         return Ok((EventPlan::Nothing, traits));
     }
 
@@ -2721,6 +2733,66 @@ mod tests {
         .unwrap();
         assert_eq!(drawn.event.map(|e| e.kind), Some(EventKindDto::TempWork));
         assert!(drawn.message.is_some());
+    }
+
+    /// Back from a date nobody has settled yet: nothing is drawn, generated
+    /// or written until it is settled; then the draw works again.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn no_draw_while_a_date_awaits_its_settlement(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (instance_id, session_id) = setup(&pool, user_id).await;
+        let date = crate::routes::companion::testutil::seed_date(
+            &pool,
+            session_id,
+            user_id,
+            instance_id,
+            Utc::now() - chrono::Duration::minutes(90),
+        )
+        .await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "刚被老板叫去加班，晚点聊").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let temp_work = |key: &str| req(key, Some(vec![EventKindDto::TempWork]));
+
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            temp_work("k1"),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&out).unwrap(),
+            json!({"event": null, "message": null})
+        );
+        assert!(calls(&mock).await.is_empty(), "no generation");
+        assert_eq!(event_rows(&pool, session_id).await, 0);
+        let keyed: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM engine.persona_events WHERE event_key = 'k1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(keyed, 0);
+
+        sqlx::query("UPDATE engine.activities SET settled_at = now() WHERE id = $1")
+            .bind(date.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let drawn = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            temp_work("k2"),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(drawn.event.map(|e| e.kind), Some(EventKindDto::TempWork));
     }
 
     /// A key that already drew its event returns it even when a choice is
