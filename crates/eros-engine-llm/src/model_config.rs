@@ -2430,8 +2430,11 @@ impl ModelConfig {
     /// `[tasks.activity_judge]` when present, else `[tasks.affinity_evaluation]`'s
     /// — never the global defaults (see [`Self::resolve_structuring`]). The
     /// judge's prompt is engine-owned, so only the model parameters resolve here.
+    /// `max_tokens` is at least [`ACTIVITY_JUDGE_MIN_TOKENS`], from either block.
     pub fn resolve_activity_judge(&self) -> ResolvedModel {
-        self.resolve_structuring(ACTIVITY_JUDGE_TASK, "affinity_evaluation")
+        let mut resolved = self.resolve_structuring(ACTIVITY_JUDGE_TASK, "affinity_evaluation");
+        resolved.max_tokens = resolved.max_tokens.max(ACTIVITY_JUDGE_MIN_TOKENS);
+        resolved
     }
 
     /// Resolve the world-director bundle. `None` when `[tasks.world_director]`
@@ -2924,6 +2927,11 @@ pub const ARC_REWRITE_TASK: &str = "arc_rewrite";
 /// engine-owned; the block is optional and falls back to
 /// `[tasks.affinity_evaluation]`'s parameters.
 pub const ACTIVITY_JUDGE_TASK: &str = "activity_judge";
+
+/// The least `max_tokens` the activity judge is given: its reply carries an
+/// episode and moments on top of the per-turn verdict, and a truncated reply
+/// parses as nothing.
+pub const ACTIVITY_JUDGE_MIN_TOKENS: u32 = 1200;
 
 /// Task blocks that no longer do anything, with the boot warning each earns.
 /// A present block is ignored (it never fails boot) but must not stay silent.
@@ -7709,22 +7717,50 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         // No block of its own: the evaluator's model, never the global defaults.
         let shared = ModelConfig::from_toml_str(
             "[defaults]\nfallback_model = \"global/default\"\n\n\
-             [tasks.affinity_evaluation]\nmodel = \"eval/m\"\nmax_tokens = 300\n",
+             [tasks.affinity_evaluation]\nmodel = \"eval/m\"\nmax_tokens = 1500\n",
         )
         .unwrap();
         let r = shared.resolve_activity_judge();
         assert_eq!(r.model, "eval/m");
-        assert_eq!(r.max_tokens, 300);
+        assert_eq!(r.max_tokens, 1500);
 
         let own = ModelConfig::from_toml_str(
             "[tasks.affinity_evaluation]\nmodel = \"eval/m\"\n\n\
-             [tasks.activity_judge]\nmodel = \"date/m\"\nmax_tokens = 900\n",
+             [tasks.activity_judge]\nmodel = \"date/m\"\nmax_tokens = 1800\n",
         )
         .unwrap();
         let r = own.resolve_activity_judge();
         assert_eq!(r.model, "date/m");
-        assert_eq!(r.max_tokens, 900);
+        assert_eq!(r.max_tokens, 1800);
         assert!(KNOWN_CHAT_TASKS.contains(&ACTIVITY_JUDGE_TASK));
+    }
+
+    /// The judge's reply (verdict, episode, moments) does not fit the
+    /// per-turn evaluator's budget: a smaller one, inherited or set, is
+    /// raised to the floor.
+    #[test]
+    fn activity_judge_max_tokens_has_a_floor() {
+        let inherited = ModelConfig::from_toml_str(
+            "[tasks.affinity_evaluation]\nmodel = \"eval/m\"\nmax_tokens = 400\n",
+        )
+        .unwrap();
+        assert_eq!(
+            inherited.resolve_activity_judge().max_tokens,
+            ACTIVITY_JUDGE_MIN_TOKENS
+        );
+        assert_eq!(ACTIVITY_JUDGE_MIN_TOKENS, 1200);
+
+        let own = |max_tokens: u32| {
+            ModelConfig::from_toml_str(&format!(
+                "[tasks.affinity_evaluation]\nmodel = \"eval/m\"\nmax_tokens = 400\n\n\
+                 [tasks.activity_judge]\nmodel = \"date/m\"\nmax_tokens = {max_tokens}\n"
+            ))
+            .unwrap()
+            .resolve_activity_judge()
+            .max_tokens
+        };
+        assert_eq!(own(2000), 2000);
+        assert_eq!(own(500), 1200);
     }
 
     #[test]
