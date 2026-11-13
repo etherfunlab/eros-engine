@@ -548,7 +548,6 @@ mod tests {
         );
     }
 
-    /// Every channel goes, and a second call is a no-op that still succeeds.
     /// A date under way ends with the relationship: a new session of the
     /// instance finds her out on no date, and a new invitation is not held
     /// back by it. Any other event runs on.
@@ -598,6 +597,7 @@ mod tests {
         assert!(!activities.date_on(instance_id, None, later).await.unwrap());
     }
 
+    /// Every channel goes, and a second call is a no-op that still succeeds.
     #[sqlx::test(migrations = "./migrations")]
     async fn archives_every_channel_and_is_idempotent(pool: PgPool) {
         let user_id = Uuid::new_v4();

@@ -152,15 +152,17 @@ impl ActivityRepo<'_> {
     /// clock), or once the parent is archived: nothing is written but her
     /// answer.
     ///
-    /// The parent's row is locked first, as settlement locks it before it
-    /// writes, so an archive waits for the date to open (and then ends it) or
-    /// is seen here.
+    /// The instance's lock comes first and the parent's row second, the order
+    /// of the writers that hold the instance lock and then update the session;
+    /// settlement locks the row before it writes. So an archive waits for the
+    /// date to open (and then ends it) or is seen here.
     pub async fn accept(
         &self,
         a: &NewActivity<'_>,
         now: DateTime<Utc>,
     ) -> Result<Option<ActivityRecord>, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
+        lock_instance(&mut tx, a.instance_id).await?;
         let live = lock_live_session(&mut tx, a.session_id).await?;
         sqlx::query(
             "UPDATE engine.chat_messages \
@@ -176,8 +178,8 @@ impl ActivityRepo<'_> {
         }
 
         // The lookup and the insert are separate statements: a second driver
-        // of the same turn must wait here and then find the first's row.
-        lock_instance(&mut tx, a.instance_id).await?;
+        // of the same turn waits at the instance's lock above and then finds
+        // the first's row.
         let existing: Option<ActivityRecord> = sqlx::query_as(&select("WHERE a.message_id = $1"))
             .bind(a.message_id)
             .fetch_optional(&mut *tx)
@@ -727,6 +729,52 @@ mod tests {
             )
             .await,
             1
+        );
+    }
+
+    /// `accept` takes the instance's lock before the parent's row, the order
+    /// of the writers that hold the instance lock and then update the
+    /// session. Held the other way round, a share lock on the row would wait
+    /// for the instance lock while those writers waited for the row.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn accept_waits_for_the_instance_lock_without_the_parents_row(pool: PgPool) {
+        use std::time::Duration as Wait;
+
+        let s = scene(&pool).await;
+        let mut holder = pool.begin().await.unwrap();
+        lock_instance(&mut holder, s.instance).await.unwrap();
+
+        let n = invitation(&s, DateDuration::Mid);
+        let repo = ActivityRepo { pool: &pool };
+        let accept = repo.accept(&n, t(NOW));
+        tokio::pin!(accept);
+        assert!(
+            tokio::time::timeout(Wait::from_millis(300), &mut accept)
+                .await
+                .is_err(),
+            "accept runs on while another transaction holds the instance lock"
+        );
+
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_locks l JOIN pg_database d ON d.oid = l.database \
+              WHERE l.locktype = 'advisory' AND NOT l.granted \
+                AND d.datname = current_database()",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(waiting, 1, "accept waits on the instance lock");
+        sqlx::query("SELECT 1 FROM engine.chat_sessions WHERE id = $1 FOR UPDATE NOWAIT")
+            .bind(s.session)
+            .fetch_one(&pool)
+            .await
+            .expect("the parent's row is free while accept waits for the instance lock");
+
+        holder.commit().await.unwrap();
+        let opened = accept.await.unwrap();
+        assert!(
+            opened.is_some(),
+            "accept opens the date once the lock is free"
         );
     }
 
