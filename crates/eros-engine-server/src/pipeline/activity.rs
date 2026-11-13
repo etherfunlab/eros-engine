@@ -276,14 +276,31 @@ pub(crate) struct Settlement {
 /// The write locks the activity's row first: a caller whose stale claim was
 /// taken over and settled meanwhile finds the stamp there, writes nothing,
 /// and returns the stored result.
+///
+/// The settlement runs in a task of its own that the caller awaits, so a
+/// caller that goes away (a dropped connection, a proxy timeout) does not
+/// take it down with the claim held. An error after the claim gives the
+/// claim back.
 pub(crate) async fn settle(
     state: &AppState,
     activity_id: Uuid,
     now: DateTime<Utc>,
 ) -> Result<Settlement, AppError> {
-    let pool = &state.pool;
-    let activities = ActivityRepo { pool };
-    let mut activity = match activities
+    let state = state.clone();
+    tokio::spawn(async move { claim_and_settle(&state, activity_id, now).await })
+        .await
+        .map_err(|e| AppError::Internal(format!("activity settlement task failed: {e}")))?
+}
+
+/// [`settle`]'s body: claim the date, settle it, and release the claim when
+/// settling fails.
+async fn claim_and_settle(
+    state: &AppState,
+    activity_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<Settlement, AppError> {
+    let activities = ActivityRepo { pool: &state.pool };
+    let activity = match activities
         .claim_settlement(activity_id, now, Duration::seconds(SETTLE_CLAIM_STALE_SECS))
         .await?
     {
@@ -291,7 +308,24 @@ pub(crate) async fn settle(
         SettleClaim::Held => return Err(settling()),
         SettleClaim::Settled(activity) => return stored_result(state, activity).await,
     };
+    let settled = settle_claimed(state, activity, now).await;
+    if let Err(e) = &settled {
+        tracing::warn!(%activity_id, "activity settlement failed: {e}");
+        if let Err(e) = activities.release_claim(activity_id, now).await {
+            tracing::warn!(%activity_id, "activity settlement claim release failed: {e}");
+        }
+    }
+    settled
+}
 
+/// Settle a date this caller has claimed at `now`.
+async fn settle_claimed(
+    state: &AppState,
+    mut activity: ActivityRecord,
+    now: DateTime<Utc>,
+) -> Result<Settlement, AppError> {
+    let pool = &state.pool;
+    let activities = ActivityRepo { pool };
     let turns = activities
         .substantive_turns(activity.sub_session_id)
         .await?;
@@ -1445,6 +1479,82 @@ pub(crate) mod tests {
             2,
             "one set of moments"
         );
+    }
+
+    /// A caller that goes away while the judge answers (a dropped connection,
+    /// a proxy timeout) does not take the settlement with it.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_settlement_outlives_its_dropped_caller(pool: PgPool) {
+        let mock = judge_mock(
+            judged(JUDGE_REPLY).set_delay(std::time::Duration::from_millis(500)),
+            1,
+        )
+        .await;
+        let s = scene(with_judge(test_state(pool), &mock), 3).await;
+
+        tokio::select! {
+            _ = settle(&s.state, s.activity.id, t(NOW)) => panic!("the judge is still answering"),
+            _ = async {
+                while mock.received_requests().await.unwrap().is_empty() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            } => {}
+        }
+
+        for _ in 0..100 {
+            if s.settled_at().await.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(s.settled_at().await, Some(t(NOW)));
+        assert_eq!(s.activity_events().await, 1);
+        assert_eq!(s.episodes().await, 1);
+    }
+
+    /// A settlement that fails after its claim gives the claim back, so the
+    /// next caller settles at once instead of answering `activity_settling`.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_failed_settlement_releases_its_claim(pool: PgPool) {
+        let mock = judge_mock(judged(JUDGE_REPLY), 2).await;
+        let s = scene(with_judge(test_state(pool), &mock), 3).await;
+        // The episode write fails inside the settlement's transaction.
+        sqlx::query(
+            "CREATE FUNCTION engine.refuse_row() RETURNS trigger LANGUAGE plpgsql \
+             AS $$ BEGIN RAISE EXCEPTION 'refused'; END $$",
+        )
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER refuse_episode BEFORE INSERT ON engine.relationship_episodes \
+             FOR EACH ROW EXECUTE FUNCTION engine.refuse_row()",
+        )
+        .execute(&s.pool)
+        .await
+        .unwrap();
+
+        let failed = settle(&s.state, s.activity.id, t(NOW)).await;
+        assert!(matches!(failed, Err(AppError::Sqlx(_))), "{failed:?}");
+        let (claimed, settled): (Option<DateTime<Utc>>, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT settle_claimed_at, settled_at FROM engine.activities WHERE id = $1",
+        )
+        .bind(s.activity.id)
+        .fetch_one(&s.pool)
+        .await
+        .unwrap();
+        assert_eq!((claimed, settled), (None, None));
+        assert_eq!(s.activity_events().await, 0, "the transaction rolled back");
+
+        sqlx::query("DROP TRIGGER refuse_episode ON engine.relationship_episodes")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        let later = t(NOW) + Duration::minutes(1);
+        let out = settle(&s.state, s.activity.id, later).await.unwrap();
+        assert_eq!(out.activity.settled_at, Some(later));
+        assert_eq!(s.activity_events().await, 1);
+        assert_eq!(s.episodes().await, 1);
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

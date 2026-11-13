@@ -42,10 +42,7 @@ pub enum AppError {
     /// chain, pseudo-ghost) and must not be rerouted here.
     #[error("upstream failure: {0}")]
     Upstream(Box<eros_engine_llm::failure::AttemptFailure>),
-    // Reserved for handler-level 500s; constructed nowhere right now (its only
-    // user, the legacy event_gift route, was removed). Still mapped to a 500 via
-    // the `_` arm in IntoResponse.
-    #[allow(dead_code)]
+    /// A handler-level 500, mapped by the `_` arm in IntoResponse.
     #[error("internal: {0}")]
     Internal(String),
     #[error(transparent)]

@@ -339,6 +339,25 @@ impl ActivityRepo<'_> {
         })
     }
 
+    /// Give back the claim a caller took at `claimed_at`, so the next caller
+    /// settles at once. A claim taken over since, or a settled date, is left
+    /// as it is.
+    pub async fn release_claim(
+        &self,
+        id: Uuid,
+        claimed_at: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE engine.activities SET settle_claimed_at = NULL \
+              WHERE id = $1 AND settle_claimed_at = $2 AND settled_at IS NULL",
+        )
+        .bind(id)
+        .bind(claimed_at)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// The newest `limit` rows of the sub-session, oldest first, and how many
     /// earlier rows were left out.
     pub async fn transcript(
@@ -929,6 +948,43 @@ mod tests {
         assert_eq!(
             done.status_at(t1 + Duration::hours(1)),
             ActivityStatus::Settled
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn release_claim_gives_back_only_the_callers_own_claim(pool: PgPool) {
+        let s = scene(&pool).await;
+        let a = open(&pool, &s, DateDuration::Mid).await;
+        let repo = ActivityRepo { pool: &pool };
+        let stale = Duration::minutes(10);
+        let t0 = t("2026-11-12T14:05:00Z");
+
+        assert!(matches!(
+            repo.claim_settlement(a.id, t0, stale).await.unwrap(),
+            SettleClaim::Claimed(_)
+        ));
+        repo.release_claim(a.id, t0 - Duration::minutes(11))
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.get(a.id).await.unwrap().unwrap().settle_claimed_at,
+            Some(t0),
+            "a claim taken over stays"
+        );
+
+        repo.release_claim(a.id, t0).await.unwrap();
+        assert_eq!(
+            repo.get(a.id).await.unwrap().unwrap().settle_claimed_at,
+            None
+        );
+        assert!(
+            matches!(
+                repo.claim_settlement(a.id, t0 + Duration::minutes(1), stale)
+                    .await
+                    .unwrap(),
+                SettleClaim::Claimed(_)
+            ),
+            "the next caller claims at once"
         );
     }
 
