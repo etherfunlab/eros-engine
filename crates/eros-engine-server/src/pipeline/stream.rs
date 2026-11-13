@@ -5138,8 +5138,31 @@ pub(crate) fn run_stream_with(
         let strip_refused = pde::strip_ruled_out(&input.event);
         // A date she cannot go on (spec 2026-11-12-activity-sub-session-
         // design.md §4.3): she is offline, or a `mid` one is asked below bond
-        // tier 2. On the decayed affinity this turn reads.
-        let date_refused = pde::date_ruled_out(&input.event, affinity.bond_tier(), offline_now);
+        // tier 2. On the decayed affinity this turn reads. Another date of
+        // hers that has not ended takes her out of reach too: read here, at
+        // drive time, for an invitation queued or sent while the one that
+        // opened that date was still generating (the open's own guard).
+        let date_turn = matches!(
+            user_msg.action,
+            Some(eros_engine_core::types::UserAction::Date { .. })
+        );
+        let other_date_on = date_turn
+            && eros_engine_store::activity::ActivityRepo { pool: &state.pool }
+                .date_on(
+                    user_msg.instance_id,
+                    Some(user_msg.user_message_id),
+                    chrono::Utc::now(),
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!("stream: date read failed: {e}");
+                    false
+                });
+        let date_refused = pde::date_ruled_out(
+            &input.event,
+            affinity.bond_tier(),
+            offline_now || other_date_on,
+        );
         let refused_before_judge = give_refused || strip_refused || date_refused;
         let (mut plan, pde_run): (eros_engine_core::types::ActionPlan, Option<PdeDecisionRun>) =
             match resolved_pde.as_ref() {
@@ -5255,10 +5278,6 @@ pub(crate) fn run_stream_with(
         // Before the forced-image override, which still wins, except on a
         // date turn: that one never produces a picture (spec 2026-11-12-
         // activity-sub-session-design.md §4.6).
-        let date_turn = matches!(
-            user_msg.action,
-            Some(eros_engine_core::types::UserAction::Date { .. })
-        );
         if let Some(action) = picture_action(&input.event, &plan, image_executor_available) {
             let aspect = (action == ActionType::ReplyTextImage
                 && matches!(
@@ -25879,6 +25898,33 @@ data: [DONE]\n\n"
         assert_eq!(activities_for(&pool, umid).await, 0);
     }
 
+    /// An invitation that reaches the judge while another date of hers runs
+    /// (queued, or sent while the one that opened it was generating) is
+    /// turned down before the judge, and judged as any refused one.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_date_while_another_date_runs_is_refused(pool: PgPool) {
+        let (frames, mock, umid) = run_date_turn(
+            &pool,
+            eros_engine_core::types::DateDuration::Short,
+            "",
+            None,
+            &[ev("on_a_date", 5, 55)],
+            "accept",
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "refuse");
+        let judge = judge_request(&mock.received_requests().await.unwrap());
+        assert!(judge.contains("大约 1 小时，这次你不会答应"), "{judge}");
+        assert!(final_json(&frames).get("activity").is_none());
+        let total: i64 = sqlx::query_scalar("SELECT count(*) FROM engine.activities")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(total, 0);
+        let (context, _) = turn_affinity_row(&pool, umid).await;
+        assert!(context.get("eval_skip_reason").is_none(), "{context}");
+    }
+
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn an_accepted_date_opens_the_activity_on_the_final_frame(pool: PgPool) {
         let (frames, _, umid) = run_date_turn(
@@ -26754,6 +26800,57 @@ data: [DONE]\n\n"
         assert_eq!(
             s.life_choices().await,
             vec![("sleep_together".to_string(), "pending".to_string())]
+        );
+    }
+
+    /// A judged main-chat turn that lands while the date runs (one sent
+    /// before it opened) puts no choice to the user: she is out with them.
+    /// The same streak asks once the date is over (no scopes recorded, so not
+    /// a romantic choice: going away together).
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn no_life_choice_is_asked_while_a_date_runs(pool: PgPool) {
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let s = date_scene(
+            &pool,
+            reply_text_verdict(),
+            "[tasks.affinity_evaluation]\nmodel = \"aff/judge\"\n",
+        )
+        .await;
+        s.set_lines(0.5, 0.5).await;
+        let warm = r#"{"warmth":3,"trust":{"grade":0,"direction":"up"},"intimacy":{"grade":0,"direction":"up"},"intrigue":{"grade":0,"direction":"up"},"tension":{"grade":0,"direction":"up"},"patience":3,"reason":"很好"}"#;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("aff/judge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen-aff", "model": "aff/judge",
+                "choices": [{"message": {"content": warm}}],
+            })))
+            .mount(&s.mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen-ask", "model": "deepseek/x",
+                "choices": [{"message": {"content": "今晚留下来陪我，好不好？"}}],
+            })))
+            .mount(&s.mock)
+            .await;
+
+        for _ in 0..3 {
+            s.judged_main_chat_turn().await;
+        }
+        assert!(
+            s.life_choices().await.is_empty(),
+            "{:?}",
+            s.life_choices().await
+        );
+
+        s.end().await;
+        s.judged_main_chat_turn().await;
+        assert_eq!(
+            s.life_choices().await,
+            vec![("travel_together".to_string(), "pending".to_string())]
         );
     }
 

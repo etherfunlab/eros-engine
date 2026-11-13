@@ -113,6 +113,29 @@ pub struct ActivityRepo<'a> {
     pub pool: &'a PgPool,
 }
 
+/// [`ActivityRepo::date_on`] on any executor, so `accept` reads it under the
+/// instance's lock.
+async fn date_on<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    instance_id: Uuid,
+    invitation: Option<Uuid>,
+    now: DateTime<Utc>,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM engine.persona_events e \
+              WHERE e.instance_id = $1 AND e.kind = $2 AND e.ends_at > $3 \
+                AND NOT EXISTS (SELECT 1 FROM engine.activities a \
+                                 WHERE a.event_id = e.id AND a.message_id = $4))",
+    )
+    .bind(instance_id)
+    .bind(EventKind::OnADate.as_str())
+    .bind(now)
+    .bind(invitation)
+    .fetch_one(executor)
+    .await
+}
+
 impl ActivityRepo<'_> {
     /// Open the date `a` for an accepted invitation, in one transaction: store
     /// her answer on the invitation row (`metadata.action.response = accept`),
@@ -152,16 +175,7 @@ impl ActivityRepo<'_> {
             tx.commit().await?;
             return Ok(existing);
         }
-        let on: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM engine.persona_events \
-                             WHERE instance_id = $1 AND kind = $2 AND ends_at > $3)",
-        )
-        .bind(a.instance_id)
-        .bind(EventKind::OnADate.as_str())
-        .bind(now)
-        .fetch_one(&mut *tx)
-        .await?;
-        if on {
+        if date_on(&mut *tx, a.instance_id, None, now).await? {
             tx.commit().await?;
             return Ok(None);
         }
@@ -216,6 +230,18 @@ impl ActivityRepo<'_> {
             .await?;
         tx.commit().await?;
         Ok(Some(record))
+    }
+
+    /// Whether a date of the instance has not ended at `now`, one that starts
+    /// after `now` included: [`Self::accept`]'s guard. The date `invitation`
+    /// opened, if any, does not count, as `accept` hands that one back.
+    pub async fn date_on(
+        &self,
+        instance_id: Uuid,
+        invitation: Option<Uuid>,
+        now: DateTime<Utc>,
+    ) -> Result<bool, sqlx::Error> {
+        date_on(self.pool, instance_id, invitation, now).await
     }
 
     pub async fn get(&self, id: Uuid) -> Result<Option<ActivityRecord>, sqlx::Error> {
@@ -949,6 +975,32 @@ mod tests {
             done.status_at(t1 + Duration::hours(1)),
             ActivityStatus::Settled
         );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn date_on_until_the_end_leaving_out_the_invitations_own(pool: PgPool) {
+        let s = scene(&pool).await;
+        let repo = ActivityRepo { pool: &pool };
+        assert!(!repo.date_on(s.instance, None, t(NOW)).await.unwrap());
+
+        let a = open(&pool, &s, DateDuration::Mid).await;
+        assert!(repo.date_on(s.instance, None, t(NOW)).await.unwrap());
+        assert!(
+            repo.date_on(s.instance, Some(Uuid::new_v4()), t(NOW))
+                .await
+                .unwrap(),
+            "another invitation sees it"
+        );
+        assert!(
+            !repo
+                .date_on(s.instance, Some(s.invite), t(NOW))
+                .await
+                .unwrap(),
+            "the invitation that opened it does not"
+        );
+        let ends = a.ends_at.expect("the event's end");
+        assert!(!repo.date_on(s.instance, None, ends).await.unwrap());
+        assert!(!repo.date_on(Uuid::new_v4(), None, t(NOW)).await.unwrap());
     }
 
     #[sqlx::test(migrations = "./migrations")]
