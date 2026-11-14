@@ -8,8 +8,9 @@ Affinity is a six-axis vector, one per relationship (one per session). Every
 axis is bounded to `[0, 1]` and clamped on every update. It moves only on
 text-channel, non-`product_qa` chat turns; voice turns and `product_qa`
 turns never write an affinity event, and neither do group turns (a group
-reads each member's affinity and writes none). The one move that is not a turn
-is the tier drop of an answered life choice ([below](#life-choice-drops-and-the-slowdown)).
+reads each member's affinity and writes none). Two moves are not turns: the
+tier drop of an answered life choice ([below](#life-choice-drops-and-the-slowdown)),
+and the one verdict on a settled date ([below](#dates)).
 
 The judge (the LLM evaluator) only ever outputs ordinal buckets: a grade
 or a level, never a continuous number. The engine owns every score, every
@@ -232,7 +233,9 @@ retired.
 A skipped eval (`eval_skip_reason`) or a failed one (non-empty
 `llm_attempts` / `gateway_errors`) holds the stored levels; the endpoints
 simply re-derive with the current lines and decay. The old rule-delta
-fallback is retired.
+fallback is retired. The turns of a [date](#dates), and the turn whose
+invitation opened it, are skipped evals with `eval_skip_reason = "activity"`,
+and their rule nudges are zeroed as well.
 
 A ghost the PDE decides never reaches `persist_with_event`: only
 `ghost_streak` / `total_ghosts` / `last_ghost_at` and `updated_at` move.
@@ -270,6 +273,9 @@ roll can refuse whatever the judge says
   physical action.
 - **Gift:** accepted, the gift also joins the persona's items or wardrobe;
   refused, it joins nothing and drops Bond like a refused `give`.
+- **Date:** a refused `date` invitation drops no line; the turn is graded like
+  any other. An accepted one is not graded at all: it opens the date, which is
+  judged once when it is settled ([below](#dates)).
 
 Example: chemistry `0.80` (64% of tier 4) lands at 64% of tier 3, `≈ 0.524`.
 
@@ -320,6 +326,45 @@ a chat turn: no judge runs.
   hours, wall-clock. A slowed turn's event row carries `context.growth_scale`
   (`0.5`), absent at full speed, and its `effective_deltas` show the halved
   values. An accepted romantic choice never slows growth.
+
+### Dates
+
+A [date](activities.md) is judged once, when it is settled, and its verdict
+reaches affinity as one write on the session the invitation was sent in. A date
+turn is written on that session's row too, as a skipped eval
+([above](#turns-that-do-not-move)); a refused action inside the date still drops
+its line.
+
+- **The weighted verdict.** The activity judge returns one verdict in the
+  per-turn shape: a grade per line axis and a level per endpoint. It goes
+  through the write pipeline once (`grade_weighted`), from the stored state
+  after time decay and with no rule nudges, worth `weight` turns:
+
+  ```
+  weight = min(turns, cap) × AFFINITY_ACTIVITY_TURN_SHARE
+  ```
+
+  `turns` counts the date's substantive turns, and `cap` is
+  `AFFINITY_ACTIVITY_TURN_CAP_SHORT` or `AFFINITY_ACTIVITY_TURN_CAP_MID` by the
+  date's length ([Tuning knobs](#tuning-knobs)). Each axis's raw score, its
+  real score and the assessed cross-line penalty scale by `weight` ahead of the
+  threshold gate; tier decay, `AFFINITY_NEG_FACTOR`, the demo boost, the clamp
+  and the slowdown after a separation apply as on a turn. The levels, when the
+  verdict parsed, overwrite the stored ones, and both endpoints re-derive.
+- **The one-tier cap.** Each line then lands no further than one tier from
+  where it stood before the write: up to the same relative position in the
+  tier above, the mirror of the refused-action landing rule, and down to the
+  same relative position in the tier below. A line past the cap has its two
+  axes pulled back along their own deltas by one ratio, so it lands on the
+  cap. A tier-1 line can fall to `0`, and a tier-5 line is bounded by the
+  clamp. What the cap cuts off is gone: the capped line's `pending_deltas` are
+  cleared.
+- **Its event row.** One row of the non-turn `event_type` `activity`, with no
+  `user_message_id`. `context` carries `activity_id`, `turns`, `weight`, the
+  judge's `reason` and `capped` (the lines the cap held, absent when none)
+  beside the usual audit keys. The delta route never returns it, it is not a
+  judged turn for the life-choice triggers, and its `reason` does not feed
+  `[emotional_context]`.
 
 ## Base-pair derivation details
 
@@ -497,7 +542,8 @@ drains naturally. `NULL` reads as all-zero.
 
 Each delta turn appends one row to `engine.companion_affinity_events`:
 
-- `deltas` — raw scores: grade conversion plus rule nudges, pre-decay.
+- `deltas` — raw scores: grade conversion plus rule nudges, pre-decay; on an
+  `activity` row, times its `weight`.
   `warmth`/`patience` are always `0.0` here, except on a `life_choice` row,
   whose `deltas` equal its `effective_deltas` ([above](#life-choice-drops-and-the-slowdown)).
 - `effective_deltas` — the applied change, `after − before`; for the base
@@ -511,10 +557,12 @@ Each delta turn appends one row to `engine.companion_affinity_events`:
   on a turn whose positive growth was halved by the slowdown after a
   separation. A life choice's own `life_choice` row has a `context` of
   `life_choice` and `choice_id` instead (see
-  [above](#life-choice-drops-and-the-slowdown)).
+  [above](#life-choice-drops-and-the-slowdown)). A date's `activity` row adds
+  `activity_id`, `turns`, `weight`, the judge's `reason` and, when the cap held
+  a line, `capped` ([above](#dates)).
 - `user_message_id` — a real FK to `chat_messages`,
-  `ON DELETE SET NULL`. `NULL` on `proactive`/`time_decay` rows and on
-  pre-migration rows; never backfilled. Assistant rows point at the same
+  `ON DELETE SET NULL`. `NULL` on `proactive`/`time_decay`/`life_choice`/`activity`
+  rows and on pre-migration rows; never backfilled. Assistant rows point at the same
   message through `chat_messages.user_message_id`, so the replies for an
   event are a join.
 - `label_changes` — the engine-authoritative tier transition for the turn:
@@ -533,9 +581,9 @@ Each delta turn appends one row to `engine.companion_affinity_events`:
   `state_before` exists but is not served; replay is a direct query
   against `engine.companion_affinity_events`.
 
-`event_type` is `message`, `ghost`, `gift`, `proactive`, `time_decay` or
-`life_choice`. The last two are not turns: the per-turn delta route reads
-`message`, `gift`, `proactive` and `ghost` only.
+`event_type` is `message`, `ghost`, `gift`, `proactive`, `time_decay`,
+`life_choice` or `activity`. The last three are not turns: the per-turn delta
+route reads `message`, `gift`, `proactive` and `ghost` only.
 
 ### API surfaces
 
@@ -622,6 +670,9 @@ Server-side env vars, each falling back per-knob to a default:
 | `AFFINITY_FLOOR_RATIO` | `0.2` | Endpoint floor φ; domain-capped at `0.24` so it can never override a non-cold verdict |
 | `AFFINITY_TIME_DECAY_RATE` | `0.02` | Endpoint absence decay per day |
 | `AFFINITY_TIME_DECAY_FLOOR` | `0.5` | Endpoint absence decay floor |
+| `AFFINITY_ACTIVITY_TURN_SHARE` | `0.25` | A date's weight per substantive turn ([Dates](#dates)); `0` or more |
+| `AFFINITY_ACTIVITY_TURN_CAP_SHORT` | `12` | Most turns that count on a `short` date; a non-negative integer, `0` = the date moves nothing |
+| `AFFINITY_ACTIVITY_TURN_CAP_MID` | `32` | Most turns that count on a `mid` date; same domain |
 
 Every scalar is domain-checked at boot: a non-finite or out-of-domain value
 keeps its default and logs a warning, so an env typo degrades to defaults
@@ -633,13 +684,18 @@ env override could break.
 
 - `crates/eros-engine-core/src/affinity.rs` — types, `grade_turn` write
   pipeline, endpoint derivation, time decay, bond/chemistry scores, tiers,
-  labels
+  labels; a date's `grade_weighted`, `cap_line_shift` and
+  `AffinityTuning::activity_weight`
 - `crates/eros-engine-core/src/scope.rs` — `AffinityScope` / `MemoryScope`,
   `length_score`, `romance_compatible` (see
   [`affinity.rs` vs `scope.rs`](#affinityrs-vs-scopers))
 - `crates/eros-engine-store/src/affinity.rs` — `AffinityRepo`
   (persist_with_event, record_ghost, persist_life_choice_drop_in_tx,
-  last_judged_endpoints); its tables are in `migrations/0000_baseline.sql`
+  persist_activity_in_tx, last_judged_endpoints); its tables are in
+  `migrations/0000_baseline.sql`, and the `activity` event type in
+  `migrations/0085_activities.sql`
+- `crates/eros-engine-server/src/pipeline/activity.rs` — a date's settlement
+  and the activity judge call
 - `crates/eros-engine-store/src/life_choices.rs` — `LifeChoiceRepo`
   (the choice rows; `growth_slowed` derives the slowdown window)
 - `crates/eros-engine-server/src/pipeline/post_process.rs` — LLM
@@ -658,3 +714,5 @@ env override could break.
   user actions, the judge's response, the tier drop
 - Design spec: `docs/superpowers/specs/2026-10-19-life-events-shopping-gatherings-and-ask-for-space-design.md` —
   the ask-for-space choice, its double tier drop and the growth slowdown
+- Design spec: `docs/superpowers/specs/2026-11-12-activity-sub-session-design.md` —
+  a date as a sub-session, its weighted verdict and the one-tier cap

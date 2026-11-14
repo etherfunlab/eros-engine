@@ -18,7 +18,7 @@ MODEL_CONFIG_PATH= MODEL_CONFIG_DIR=examples/model_config.d eros-engine serve
 | `user_insights.toml` | `user_insight_extraction`, `user_insight_structuring` |
 | `memory.toml` | `dreaming_scan`, `arc_rewrite` |
 | `decision.toml` | `pde_decision`, and the optional `chat_product_qa` |
-| `affinity.toml` | `affinity_evaluation`, `affinity_summary` |
+| `affinity.toml` | `affinity_evaluation`, `activity_judge`, `affinity_summary` |
 | `group.toml` | `group_director` |
 | `world.toml` | `world_director`, `world_stories_director`, `world_comment`, `world_reply` |
 | `embedding.toml` | `embedding` |

@@ -62,6 +62,7 @@ anything; the message names the route:
 - `POST /comp/voice/{session_id}/turn/stream`
 - `POST /v2/comp/session/{session_id}/events` (life events)
 - `POST /v2/comp/session/{session_id}/life-choices/{choice_id}` (the answer to one of her life choices; a BYOC session never triggers one)
+- A `date` action on the stream route ([a date](activities.md)): the rest of the stream turn works, but a BYOC instance is never asked out.
 - Group chat: creating a group with a BYOC member, or adding one.
 
 World Memories, World Town and World Stories never include a BYOC instance.

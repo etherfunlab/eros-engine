@@ -139,7 +139,7 @@ completed` tracing——落库是额外加的，不是取代那行日志。
 现在都会写这张表：`chat_companion`、`chat_voice`、`chat_product_qa`、
 `chat_input_filter`、`chat_output_filter`、`chat_vision`、
 `chat_image_prompt_compose`、`chat_image_edit_compose`、`pde_decision`、
-`group_director`、`affinity_evaluation`、`affinity_summary`、`insight_extraction`、
+`group_director`、`affinity_evaluation`、`affinity_summary`、`activity_judge`、`insight_extraction`、
 `profile_rebuild`、`character_insight_extraction`、
 `character_insight_structuring`、`user_insight_extraction`、
 `user_insight_structuring`、`dreaming_scan`、`arc_rewrite`、`world_director`、
@@ -310,7 +310,7 @@ material 会直接拒绝加载，而不是像以前那样在构造时 warn-and-d
   字段，转发上游之后就丢弃。但 OpenRouter 的 `model` / `usage` /
   `generation_id` 三元组**是**会落库的——`model` 和 `usage` 落在
   `engine.llm_generations`，`generation_id` 落在那次调用产出的那一行：聊天
-  补全落在 `chat_messages.generation_id`（好感度评估镜像在
+  补全落在 `chat_messages.generation_id`（好感度评估和约会判官镜像在
   `companion_affinity_events`，人类链每次 `insight_extraction` 和
   `profile_rebuild` 调用落在
   `human_insights_events`，实验性角色链的每次调用落在
@@ -346,7 +346,7 @@ material 会直接拒绝加载，而不是像以前那样在构造时 warn-and-d
 | `engine.chat_vision_events` | `chat_vision` describe |
 | `engine.chat_images_events` | 图片 prompt 合成器 |
 | `engine.companion_decision_events` | PDE 判官、群聊导演 |
-| `engine.companion_affinity_events` | 好感度评估 |
+| `engine.companion_affinity_events` | 好感度评估、约会判官 |
 
 五张表形状完全一致，全量错误视图一个 `UNION ALL` 就够。列是新增的、可空的，
 不回填、不建索引。**`NULL` 表示「没什么可记的」**——空数组永远不会写入，
@@ -487,6 +487,7 @@ Venice 用 `429 MODEL_OVERLOADED` 和 `503 MODEL_AT_CAPACITY`，下一家又会�
 | `pde_decision` | `companion_decision_events` | — |
 | `group_director` | `companion_decision_events` | — |
 | `affinity_evaluation` | `companion_affinity_events` | — |
+| `activity_judge` | `companion_affinity_events` | 约会的 `activity` 行 |
 
 输入过滤器是 v1.4.0 之前**完全没有任何失败记录**的那个调用点。它的失败落在
 `role='user'` 行上，与该行早就在记录的成功审计

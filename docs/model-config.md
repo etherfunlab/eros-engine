@@ -683,6 +683,7 @@ the judge's decision row and not in any frame.
 | `chat_product_qa` | `pipeline::stream` via `resolve_product_qa()` (out-of-character product-QA executor for the PDE `product_qa` action; off when task block absent or `filter_prompt` blank; also requires the LLM PDE) | live (opt-in) |
 | `affinity_evaluation` | `pipeline::post_process` (per-turn affinity verdict — four graded line axes plus two absolute 1..3 endpoint levels, converted engine-side; runs after each Reply turn, fire-and-forget; **takes no `filter_prompt`** — the prompt is engine-owned and setting the key refuses to boot — **in any form, an explicit blank included**. Unlike every other task here, blank does not mean "off", so omit the key entirely. See issue #210) | live |
 | `affinity_summary` | `pipeline::post_process::summarize_feeling` (rewrites `companion_affinity.feeling_clause` — the `[feelings]` block's first-person narrative — from band labels and recent judge reasons; runs after the affinity write, movement turns only (any nonzero judge grade, an endpoint level off baseline, or a refused action's tier drop; a ghost turn never reaches post-process) and only when the request actually injects an affinity axis; request-scoped and billed to the turn's user, not a sweeper. **Takes no `filter_prompt`** — the prompt is engine-owned, same policy as `affinity_evaluation`, and setting the key refuses to boot. Block absent ⇒ `feeling_clause` stays `NULL` and `[feelings]` never renders) | live (opt-in) |
+| `activity_judge` | `pipeline::activity` via `resolve_activity_judge()` (settles a [date](activities.md): one call after the date ends returns the verdict on the whole date in the per-turn evaluator's ordinal shape, the date's episode and its journal moments. **Parameters-only, takes no `filter_prompt`** — the prompt is engine-owned, so setting the key refuses to boot, **in any shape, an explicit blank included** — same treatment as `affinity_evaluation`. Absent block ⇒ the judge resolves on `affinity_evaluation`'s model/budget (and on the global defaults only when that block is absent too); `max_tokens` is raised to at least 1200 either way. See [below](#tasksactivity_judge--the-dates-judge)) | live |
 | `character_insight_extraction` | `pipeline::post_process` (stage 1 of the character chain — experimental, EXPERIMENTAL — per-turn fact miner for the AI **character**, the mirror of `insight_extraction`'s human-side mining. Prompt-bearing; joins the required-`filter_prompt` gate alongside `insight_extraction` / `dreaming_scan`. This block is the whole chain's on/off switch — off when the task block is absent) | experimental (opt-in) |
 | `character_insight_structuring` | `pipeline::post_process` (stage 2 of the character chain — experimental — turns stage 1's mined facts plus the existing `character_insights` row into the typed ten-column object. **Parameters-only, takes no `filter_prompt`** — its prompt is built in `prompt.rs` and must stay in lockstep with the `character_insights` columns it fills, so setting the key refuses to boot, **in any shape, an explicit blank included** — same treatment as `affinity_evaluation`. Absent block ⇒ stage 2 resolves on stage 1's model/budget, never the global default) | experimental (opt-in) |
 | `user_insight_extraction` | `pipeline::post_process` (stage 1 of the user chain — experimental — per-turn fact miner for the real **user**, but scoped to one relationship rather than the global `insight_extraction`. Prompt-bearing; joins the required-`filter_prompt` gate alongside `insight_extraction` / `character_insight_extraction` / `dreaming_scan`. This block is the whole chain's on/off switch — off when the task block is absent) | experimental (opt-in) |
@@ -707,6 +708,7 @@ A `[tasks.<name>]` entry is only meaningful if the engine actually calls `model_
 - `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision` via `run_pde_decision` inside `run_stream` (only when `filter_prompt` is set); `chat_image_prompt_compose` via `resolve_image_prompt_compose()` (image-prompt composer, required for image turns, resolved lazily only on image turns); `chat_vision` via `resolve_vision()` (vision pre-stage, opt-in); `chat_product_qa` via `resolve_product_qa()` (product-QA executor, opt-in); `chat_input_filter` via `resolve_input_filter()` (input rewrite, opt-in); `chat_output_filter` via `resolve_output_filter()`
 - `crates/eros-engine-server/src/routes/voice.rs` → `chat_voice` via `resolve_voice()`
 - `crates/eros-engine-server/src/pipeline/world.rs`, `story.rs`, `world_town.rs` → `world_director`, `world_stories_director`, `world_comment`, `world_reply` (the world sweepers, opt-in)
+- `crates/eros-engine-server/src/pipeline/activity.rs` → `activity_judge` via `resolve_activity_judge()` (a date's settlement, from the end route, a send or `/open`)
 - `crates/eros-engine-server/src/pipeline/dreaming/scan.rs` → `dreaming_scan` via `resolve_dreaming_scan()` and `arc_rewrite` via `resolve_arc_rewrite()` (the relationship scan and the arc rewrite it starts; reached from post-process at 20 pending turns, from the dreaming sweeper, and from the `backfill-dreaming` subcommand)
 - `crates/eros-engine-server/src/pipeline/proactive.rs` → `chat_image_prompt_compose` via `build_delegated_image_prompt_for` (a `taking_selfie` event's picture, when the events request carries `image`; audit `source = event`)
 - `crates/eros-engine-server/src/routes/image_edit.rs` → `chat_image_edit_compose` via `resolve_image_edit_compose()` (image-EDIT composer, resolved on every request to the edit endpoint; falls back to `[tasks.chat_image_prompt_compose]`'s chain when the edit block is absent — see below)
@@ -774,11 +776,11 @@ By default the engine uses the built-in rule engine (`eros-engine-core/src/pde.r
 
 When any accepted `give` is still at work, the engine also adds a `[身体状态]` line with the persona's lingering state (e.g. `[身体状态] 3 杯「威士忌」，微醺，还在往上走`; see [API reference](api-reference.md#post-compchatsession_idmessagestream)), before `[用户动作]`; the line is absent otherwise.
 
-**The habit roll on a give.** When a turn's `give` is `cigarette`, `alcohol`, `herb`, `coffee` or `cuisine` and the persona's matching `art_metadata` key (`smoking`, `alcoholic`, `drug`, `coffee`, `gluttony`) is `false`, the engine rolls once before the judge runs. One time in three nothing changes. Otherwise the `[用户动作]` line ends with `，这次你不会收下` (e.g. `[用户动作] 对方递给你 1 支烟，这次你不会收下`), so the judge writes its `inner_state` for a refusal, and the response in effect is `refuse` whatever its `action_response` says; the rule engine's accept becomes `refuse` too. The line states the outcome, not a reason. The audit payload keeps the judge's own answer. A key that is `true` or absent never rolls. A `strip` whose turn `affinity_scope` is not romance-compatible is decided the same way, without a roll: the line ends with `，这次你不会让对方这样做` and the response in effect is `refuse`. The judge's `[角色人格]` block does not list these keys. See [life-events-needs.md](life-events-needs.md#persona-settings).
+**The habit roll on a give.** When a turn's `give` is `cigarette`, `alcohol`, `herb`, `coffee` or `cuisine` and the persona's matching `art_metadata` key (`smoking`, `alcoholic`, `drug`, `coffee`, `gluttony`) is `false`, the engine rolls once before the judge runs. One time in three nothing changes. Otherwise the `[用户动作]` line ends with `，这次你不会收下` (e.g. `[用户动作] 对方递给你 1 支烟，这次你不会收下`), so the judge writes its `inner_state` for a refusal, and the response in effect is `refuse` whatever its `action_response` says; the rule engine's accept becomes `refuse` too. The line states the outcome, not a reason. The audit payload keeps the judge's own answer. A key that is `true` or absent never rolls. A `strip` whose turn `affinity_scope` is not romance-compatible is decided the same way, without a roll: the line ends with `，这次你不会让对方这样做` and the response in effect is `refuse`. So is a `date` the [gate](activities.md#the-gate) turns down (a `mid` date below bond tier 2, or any date while she is offline or on another date): the line ends with `，这次你不会答应`, as in `[用户动作] 对方邀请你去约会：地点「海边」，安排「看海」，大约 4 小时，这次你不会答应`. The judge's `[角色人格]` block does not list these keys. See [life-events-needs.md](life-events-needs.md#persona-settings).
 
 **Needs context line.** On every judged turn the context carries one `[需求]` line, before `[身体状态]`: `[需求] 饥饿=高 社交欲=低 体力=中 情感需求=中 外出=中`, the previous rating carried to this turn, or `[需求] 尚未判定` before the first rating. `外出` is always on it; ` 享受=高` is appended only when `indulgence` is `high` (`[需求] 饥饿=高 社交欲=低 体力=中 情感需求=中 外出=中 享受=高`), and its absence reads as "not high", as the reference prompt tells the judge. A strict judge still rates `indulgence` on every judged turn without seeing whether it was `low` or `mid`, so in continuous chat it re-guesses that level each turn, and the habit-count drift acts in the gaps between ratings.
 
-**Event context line.** While an event drawn through the [events route](api-reference.md#post-v2compsessionsession_idevents) is under way, the judge context carries one `[近期事件]` line, after `[需求]` and before `[身体状态]`. It lists the background, then the incident, joined by `；`: `[近期事件] 长途旅游（2 天前开始，约 3 天后结束）；在看书（不到 1 小时前开始，约 2 小时后结束）`. Spans under an hour read `不到 1 小时`, under 48 hours whole hours, from 48 hours whole days. After an offline stretch (`away_from_phone`, `busy`, `in_battle`, `asleep`, `bros_gathering`, `sis_gathering`, `having_sex`, and `out_shopping` for a female persona), in a session whose messages it ghosted and before the persona has written a message with text there, the line ends with `{label}（{span}前结束，期间对方的消息你没有回）`. After a separation she asked for (`taking_space`), in the session of that choice and until the persona has written a message with text there, the line ends with `说好暂时分开（{span}前结束，期间对方的消息你没有回）` when the user wrote during it, or `说好暂时分开（{span}前结束，对方等到了约定之后）` when they honoured it; the reply's `- 刚才：` text follows the same split (the two `taking_space` rows below). After a false alarm (`period_scare`, `pregnancy_scare`), in the session that told it and before the persona has written a message with text there, it ends with `{label}（{span}前结束，结果是虚惊一场）`. With both, the offline item comes first. `{label}` and `{text}` are given per kind in the table below. A text turn's reply carries `- 正在经历：…` under `[now]` (background and incident) and, after such a stretch or false alarm, a `- 刚才：{text}` line, with or without the LLM judge; `/open` greetings and event messages carry the same lines. With both, the two texts share the line, the offline text first, joined by `；`: `- 刚才：睡着了，对方那时发来的消息你现在才看到；以为月经没来，后来来了，是虚惊一场`. The lines are absent when there is nothing to say. Events change no stored need: the judge reads the line and rates the needs itself.
+**Event context line.** While an event drawn through the [events route](api-reference.md#post-v2compsessionsession_idevents) is under way, the judge context carries one `[近期事件]` line, after `[需求]` and before `[身体状态]`. It lists the background, then the incident, joined by `；`: `[近期事件] 长途旅游（2 天前开始，约 3 天后结束）；在看书（不到 1 小时前开始，约 2 小时后结束）`. Spans under an hour read `不到 1 小时`, under 48 hours whole hours, from 48 hours whole days. After an offline stretch (`away_from_phone`, `busy`, `in_battle`, `asleep`, `bros_gathering`, `sis_gathering`, `having_sex`, and `out_shopping` for a female persona), in a session whose messages it ghosted and before the persona has written a message with text there, the line ends with `{label}（{span}前结束，期间对方的消息你没有回）`. After a separation she asked for (`taking_space`), in the session of that choice and until the persona has written a message with text there, the line ends with `说好暂时分开（{span}前结束，期间对方的消息你没有回）` when the user wrote during it, or `说好暂时分开（{span}前结束，对方等到了约定之后）` when they honoured it; the reply's `- 刚才：` text follows the same split (the two `taking_space` rows below). After a false alarm (`period_scare`, `pregnancy_scare`), in the session that told it and before the persona has written a message with text there, it ends with `{label}（{span}前结束，结果是虚惊一场）`. With both, the offline item comes first. After a [date](activities.md#back-in-the-main-chat), in the session the invitation was sent in and until the persona has written a message with text there, the line ends with `和对方约会（{span}前结束）`, after any of the above. `{label}` and `{text}` are given per kind in the table below. A text turn's reply carries `- 正在经历：…` under `[now]` (background and incident) and, after such a stretch or false alarm, a `- 刚才：{text}` line, with or without the LLM judge; `/open` greetings and event messages carry the same lines. With both, the two texts share the line, the offline text first, joined by `；`: `- 刚才：睡着了，对方那时发来的消息你现在才看到；以为月经没来，后来来了，是虚惊一场`. The lines are absent when there is nothing to say. On a date's own turns, `- 正在经历：` reads the date as an incident (`和对方约会（约 3 小时后结束）`), and a `- 约会：地点「{place}」；安排「{content}」` line follows it. Events change no stored need: the judge reads the line and rates the needs itself.
 
 | Kind | `{label}` | `{text}` |
 |---|---|---|
@@ -794,6 +796,7 @@ When any accepted `give` is still at work, the engine also adds a `[身体状态
 | `taking_space` (the user honoured it) | `说好暂时分开` | `你们之前说好分开一阵，现在时间到了，你们重新开始联系` |
 | `period_scare` | `月经没来` | `以为月经没来，后来来了，是虚惊一场` |
 | `pregnancy_scare` | `验出怀孕` | `验出两条杠，后来复查是虚惊一场` |
+| `on_a_date` (after a date, in the session the invitation was sent in) | `和对方约会` | `你们刚约会回来（{place}，{content}）` |
 
 The kinds with no aftermath text have no row above: `看中了一个包` (`saw_bag`), `看中了一件衣服` (`saw_clothes`) and `为分开的事闹得不愉快` (`fell_out`, the one-hour falling-out when the user ignores her ask for space). While they last, their label appears in the usual `[近期事件]` and `- 正在经历：` lines.
 
@@ -1353,6 +1356,34 @@ warning and episodes stay unfolded; the first rewrite after the block is added
 folds every waiting episode in one call, so configure it together with
 `dreaming_scan`.
 
+### `[tasks.activity_judge]` — the date's judge
+
+One call settles a [date](activities.md#the-judge-call) after it ends: the
+verdict on the whole date, in the per-turn evaluator's ordinal shape, plus the
+date's episode and its journal moments. The prompt is engine-owned
+(`prompt.rs`), and the block carries only `model`, `fallback`, `temperature`,
+`max_tokens` and the sampling knobs; a `filter_prompt` in any shape, blank
+included, refuses to boot.
+
+```toml
+[tasks.activity_judge]
+model = "anthropic/claude-haiku-4.5"
+fallback = ["deepseek/deepseek-v4-flash", "google/gemini-3.1-flash-lite"]
+temperature = 0.3
+max_tokens = 1200
+```
+
+The block is optional. Without it the call resolves on
+`[tasks.affinity_evaluation]`'s model chain and parameters (and on the global
+defaults only when that block is absent too). `max_tokens` is at least 1200
+either way: a smaller value, set here or inherited from the per-turn
+evaluator's budget, is raised to it, because the reply carries an episode and
+moments on top of the verdict, and a reply cut short parses as nothing. Each
+call has 45 seconds; a failed or timed-out call settles the date with no
+movement and is not retried. The call is recorded in `engine.llm_generations`
+under the task `activity_judge`, and its failed attempts on the date's
+`activity` affinity event ([LLM audit](llm-audit.md)).
+
 ### Enabling / disabling extraction
 
 `insight_extraction` (fact extraction for the human chain),
@@ -1371,7 +1402,7 @@ is `validate_extraction_prompts()`'s gate, and all four names are in it:
 
 `profile_rebuild`, `character_insight_structuring`, and
 `user_insight_structuring` — the second call of each chain — and
-`arc_rewrite` are **deliberately NOT in this gate**, because this gate *requires* a prompt and
+`arc_rewrite` and `activity_judge` are **deliberately NOT in this gate**, because this gate *requires* a prompt and
 none of these blocks may have one. Each is gated in the opposite direction
 instead: its prompt is built in `prompt.rs`, so setting `filter_prompt` on it
 refuses to boot (see `affinity_evaluation` above — same dead-config rule).

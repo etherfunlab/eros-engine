@@ -239,17 +239,18 @@ cooldowns and ranges are in `rule`, and the category values in `category_rule`, 
 
 A duration written as a range is drawn uniformly in whole hours when the event starts.
 
-Four more kinds are never drawn: `taking_space` (说好暂时分开), `fell_out`
-(为分开的事闹得不愉快), `traveling_together` (和对方一起旅行) and `bathing_together`
-(和对方一起洗澡). The engine writes the first
+Five more kinds are never drawn: `taking_space` (说好暂时分开), `fell_out`
+(为分开的事闹得不愉快), `traveling_together` (和对方一起旅行), `bathing_together`
+(和对方一起洗澡) and `on_a_date` (和对方约会). The engine writes the first
 two itself when she asks for space and the
 user answers or ignores her ([the ask-for-space choice](#the-ask-for-space-choice)). They are
 `mid` incidents by shape, and `taking_space` is the one that outlasts the category's four
 hours: it lasts 12 to 24. `traveling_together` is a `trip` background the engine writes when the
-user accepts her suggestion ([going away together](#going-away-together)), and
+user accepts her suggestion ([going away together](#going-away-together)),
 `bathing_together` a 30-minute `short` incident it writes when the user accepts her ask for a
-bath ([a bath together](#a-bath-together)). None of the four has a draw rule, and the caller's
-`kinds` rejects them.
+bath ([a bath together](#a-bath-together)), and `on_a_date` a `short` incident of 1 or 4 hours it
+writes when she accepts the user's date invitation ([activities.md](activities.md#the-event)).
+None of the five has a draw rule, and the caller's `kinds` rejects them.
 
 ### The draw
 
@@ -307,6 +308,10 @@ eligible kind drops out of the first stage and the others share its weight.
 - While she waits for the user's answer to one of her life choices, no draw happens either, in any
   session of the persona: the ask is the foreground drama, and it keeps an offline stretch from
   starting mid-question. A repeat of an `event_key` that already drew still returns its event.
+- While a date of hers is not settled yet, under way or ended, no draw happens either, in any
+  session of the persona: she is out with the user, or back with the date not yet in her memory
+  ([activities.md](activities.md#what-pauses)). A repeat of an `event_key` still returns its
+  event.
 - This is per persona instance across all its sessions: she has one life. A draw reads the
   instance's events of the last 90 days, the longest cooldown there is.
 
@@ -491,7 +496,7 @@ In the object, `allow` absent or `null` allows every kind and `[]` none; `disall
 kinds out without freezing the rest, so a kind the engine adds later is drawn too. An unknown
 key in the object or an unknown kind anywhere rejects the request, so a misspelt `disallow`
 cannot quietly serve a kind it meant to exclude; a caller lists a new kind only once the
-engine knows it. `taking_space`, `fell_out`, `traveling_together` and `bathing_together` are never drawn, so naming one anywhere in
+engine knows it. `taking_space`, `fell_out`, `traveling_together`, `bathing_together` and `on_a_date` are never drawn, so naming one anywhere in
 `kinds` is rejected the same way.
 
 Seven kinds carry adult themes: `sudden_desire`, `strip`, `streaking`, `having_sex`, `just_have_sex`, `masturbating`, and `pregnancy_scare`, which implies sex. The
@@ -932,7 +937,7 @@ An event's message counts as a message for the `/open` birthday and holiday chec
 greeting follows it on the same local day. An opener that is being generated when an event
 message lands yields and returns `null`; an event does not yield to an opener. A greeting
 carries the `正在经历` and `刚才` lines and no needs line, and `/open` returns `null` while an
-offline kind is under way.
+offline kind or a date is under way.
 
 ### Storage
 
@@ -954,8 +959,8 @@ offline kind is under way.
 With [World Stories](world-system.md#world-stories) enabled, the story director reads the
 instance's events directly, each with its label, a relative time and the message she told it
 in, plus the background under way and the pair's asks for space with their outcome. It takes
-them as settled fact. A bath together is left out: like a romantic choice's outcome, it lives in
-the conversation only. The messages she sends on her own are not part of its chat evidence, so
+them as settled fact. A bath together and a date are left out: like a romantic choice's outcome,
+they live in the conversation only. The messages she sends on her own are not part of its chat evidence, so
 an event is never read as her answer to an unrelated line. The World Memories director reads a
 background under way for every persona in the roster, stories or not, so a persona in hospital
 is not scripted into a party. Neither director writes events or changes the persona settings
@@ -1043,8 +1048,9 @@ committed, time-decayed state:
   wait do count. The turn that converts an ignored ask is the first of the new streak. Asking
   consumes the streak: the next ask needs three fresh judged turns.
 - **Clear runway.** No session of the persona has a pending choice, and the persona has no
-  separation (`taking_space`) under way. She has one life, so at most one ask is pending at a
-  time.
+  separation (`taking_space`) and no [date](activities.md) under way. She has one life, so at
+  most one ask is pending at a time. A date's own turns are never judged turns, so they never
+  trigger one.
 - **The right session.** A 1:1 text session of a genome persona. A voice session never
   triggers, delivers or resolves a choice, and a group session writes no affinity at all. A BYOC
   session never triggers one, because the resolution endpoint refuses BYOC.
