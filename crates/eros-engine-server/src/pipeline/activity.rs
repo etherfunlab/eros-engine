@@ -230,7 +230,7 @@ fn in_progress() -> AppError {
 }
 
 /// `409 activity_ended`: the date's clock ran out.
-fn ended() -> AppError {
+pub(crate) fn ended() -> AppError {
     AppError::StreamPre(StreamPreError {
         status: StatusCode::CONFLICT,
         code: "activity_ended",

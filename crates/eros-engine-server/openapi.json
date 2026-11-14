@@ -3103,7 +3103,7 @@
             "description": "session or message not found"
           },
           "409": {
-            "description": "the message is not an image turn"
+            "description": "the message is not an image turn; or `activity_ended` (the session is a date that has ended)"
           },
           "422": {
             "description": "blank instruction or unsupported aspect_ratio"
