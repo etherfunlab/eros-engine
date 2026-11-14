@@ -2426,6 +2426,17 @@ impl ModelConfig {
         self.resolve_structuring("profile_rebuild", "insight_extraction")
     }
 
+    /// Parameters for the activity judge, which settles a date: its own
+    /// `[tasks.activity_judge]` when present, else `[tasks.affinity_evaluation]`'s
+    /// — never the global defaults (see [`Self::resolve_structuring`]). The
+    /// judge's prompt is engine-owned, so only the model parameters resolve here.
+    /// `max_tokens` is at least [`ACTIVITY_JUDGE_MIN_TOKENS`], from either block.
+    pub fn resolve_activity_judge(&self) -> ResolvedModel {
+        let mut resolved = self.resolve_structuring(ACTIVITY_JUDGE_TASK, "affinity_evaluation");
+        resolved.max_tokens = resolved.max_tokens.max(ACTIVITY_JUDGE_MIN_TOKENS);
+        resolved
+    }
+
     /// Resolve the world-director bundle. `None` when `[tasks.world_director]`
     /// is absent OR its `filter_prompt` is blank — the sweeper goes inert.
     pub fn resolve_world_director(&self) -> Option<ResolvedWorldDirector> {
@@ -2629,12 +2640,15 @@ impl ModelConfig {
     }
 
     /// Boot gate for `[tasks.affinity_evaluation].filter_prompt`,
-    /// `[tasks.affinity_summary].filter_prompt` and
-    /// `[tasks.arc_rewrite].filter_prompt` — keys that parse but are never
+    /// `[tasks.affinity_summary].filter_prompt`,
+    /// `[tasks.arc_rewrite].filter_prompt` and
+    /// `[tasks.activity_judge].filter_prompt` — keys that parse but are never
     /// read.
     ///
     /// The arc rewrite's prompt is engine-owned too: the reply it asks for is
-    /// the JSON shape the engine's arc guard parses and length-checks.
+    /// the JSON shape the engine's arc guard parses and length-checks. So is
+    /// the activity judge's: it is the per-turn evaluator's verdict over a
+    /// whole date, plus the episode and journal moments the engine writes.
     ///
     /// Both affinity tasks' prompts are engine-owned by design: the evaluator
     /// (issue #210) interpolates per-turn context the config layer cannot
@@ -2658,8 +2672,9 @@ impl ModelConfig {
         // (issue #210) and the feeling-clause summarizer (spec 2026-09-03),
         // whose first-person voice + reason hygiene are load-bearing — the
         // clause is re-injected into later system prompts. So is the arc
-        // rewrite's (spec 2026-10-28), whose reply the arc guard parses.
-        const ENGINE_OWNED_TASKS: [(&str, &str); 3] = [
+        // rewrite's (spec 2026-10-28), whose reply the arc guard parses, and
+        // the activity judge's (spec 2026-11-12), the evaluator over a date.
+        const ENGINE_OWNED_TASKS: [(&str, &str); 4] = [
             (
                 "affinity_evaluation",
                 "https://github.com/etherfunlab/eros-engine/issues/210",
@@ -2671,6 +2686,10 @@ impl ModelConfig {
             (
                 ARC_REWRITE_TASK,
                 "docs/superpowers/specs/2026-10-28-memory-2-dreaming-plus-design.md",
+            ),
+            (
+                ACTIVITY_JUDGE_TASK,
+                "docs/superpowers/specs/2026-11-12-activity-sub-session-design.md",
             ),
         ];
         for (task, rationale) in ENGINE_OWNED_TASKS {
@@ -2904,6 +2923,16 @@ pub const DREAMING_SCAN_TASK: &str = "dreaming_scan";
 /// model and sampling parameters.
 pub const ARC_REWRITE_TASK: &str = "arc_rewrite";
 
+/// The activity judge, which settles a date in one call. The prompt is
+/// engine-owned; the block is optional and falls back to
+/// `[tasks.affinity_evaluation]`'s parameters.
+pub const ACTIVITY_JUDGE_TASK: &str = "activity_judge";
+
+/// The least `max_tokens` the activity judge is given: its reply carries an
+/// episode and moments on top of the per-turn verdict, and a truncated reply
+/// parses as nothing.
+pub const ACTIVITY_JUDGE_MIN_TOKENS: u32 = 1200;
+
 /// Task blocks that no longer do anything, with the boot warning each earns.
 /// A present block is ignored (it never fails boot) but must not stay silent.
 const RETIRED_TASKS: &[(&str, &str)] = &[(
@@ -2937,6 +2966,7 @@ pub const KNOWN_CHAT_TASKS: &[&str] = &[
     "user_insight_structuring",
     "affinity_evaluation",
     "affinity_summary",
+    ACTIVITY_JUDGE_TASK,
     "world_director",
     "world_stories_director",
     "world_comment",
@@ -7679,6 +7709,79 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
             assert!(err.contains("[tasks.arc_rewrite].filter_prompt"), "{err}");
             assert!(err.contains("engine-owned"), "{err}");
             assert!(err.contains("memory-2-dreaming-plus"), "{err}");
+        }
+    }
+
+    #[test]
+    fn activity_judge_falls_back_to_affinity_evaluation() {
+        // No block of its own: the evaluator's model, never the global defaults.
+        let shared = ModelConfig::from_toml_str(
+            "[defaults]\nfallback_model = \"global/default\"\n\n\
+             [tasks.affinity_evaluation]\nmodel = \"eval/m\"\nmax_tokens = 1500\n",
+        )
+        .unwrap();
+        let r = shared.resolve_activity_judge();
+        assert_eq!(r.model, "eval/m");
+        assert_eq!(r.max_tokens, 1500);
+
+        let own = ModelConfig::from_toml_str(
+            "[tasks.affinity_evaluation]\nmodel = \"eval/m\"\n\n\
+             [tasks.activity_judge]\nmodel = \"date/m\"\nmax_tokens = 1800\n",
+        )
+        .unwrap();
+        let r = own.resolve_activity_judge();
+        assert_eq!(r.model, "date/m");
+        assert_eq!(r.max_tokens, 1800);
+        assert!(KNOWN_CHAT_TASKS.contains(&ACTIVITY_JUDGE_TASK));
+    }
+
+    /// The judge's reply (verdict, episode, moments) does not fit the
+    /// per-turn evaluator's budget: a smaller one, inherited or set, is
+    /// raised to the floor.
+    #[test]
+    fn activity_judge_max_tokens_has_a_floor() {
+        let inherited = ModelConfig::from_toml_str(
+            "[tasks.affinity_evaluation]\nmodel = \"eval/m\"\nmax_tokens = 400\n",
+        )
+        .unwrap();
+        assert_eq!(
+            inherited.resolve_activity_judge().max_tokens,
+            ACTIVITY_JUDGE_MIN_TOKENS
+        );
+        assert_eq!(ACTIVITY_JUDGE_MIN_TOKENS, 1200);
+
+        let own = |max_tokens: u32| {
+            ModelConfig::from_toml_str(&format!(
+                "[tasks.affinity_evaluation]\nmodel = \"eval/m\"\nmax_tokens = 400\n\n\
+                 [tasks.activity_judge]\nmodel = \"date/m\"\nmax_tokens = {max_tokens}\n"
+            ))
+            .unwrap()
+            .resolve_activity_judge()
+            .max_tokens
+        };
+        assert_eq!(own(2000), 2000);
+        assert_eq!(own(500), 1200);
+    }
+
+    #[test]
+    fn activity_judge_refuses_a_filter_prompt() {
+        let ok = ModelConfig::from_toml_str("[tasks.activity_judge]\nmodel = \"m\"\n").unwrap();
+        assert!(ok.validate_affinity_prompt_unset().is_ok());
+
+        for prompt in ["\"judge the date\"", "\"\""] {
+            let cfg = ModelConfig::from_toml_str(&format!(
+                "[tasks.activity_judge]\nmodel = \"m\"\nfilter_prompt = {prompt}\n"
+            ))
+            .unwrap();
+            let err = cfg
+                .validate_affinity_prompt_unset()
+                .expect_err("a set activity_judge prompt must refuse to boot");
+            assert!(
+                err.contains("[tasks.activity_judge].filter_prompt"),
+                "{err}"
+            );
+            assert!(err.contains("engine-owned"), "{err}");
+            assert!(err.contains("activity-sub-session"), "{err}");
         }
     }
 

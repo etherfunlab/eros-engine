@@ -366,7 +366,7 @@ fn kind_cue(
         OutShopping if traits.female => "（你接下来要出门逛街，这段时间顾不上看手机。）".into(),
         OutShopping => "（你正在外面逛街。）".into(),
         AwayFromPhone | Asleep | BrosGathering | SisGathering | HavingSex | TakingSpace
-        | FellOut | TravelingTogether | BathingTogether => {
+        | FellOut | TravelingTogether | BathingTogether | OnADate => {
             unreachable!("{kind:?} is never told")
         }
         Sick => format!("（你生病了，大概要 {span}才会好。）"),
@@ -546,13 +546,19 @@ async fn prepare(state: &AppState, g: &Greeting) -> Result<Prepared, AppError> {
     let scare = repo
         .unresolved_scare(g.session_id, g.instance_id, g.now.now)
         .await?;
+    // The date this session is just back from, until her first line after it.
+    let date_back = eros_engine_store::activity::ActivityRepo { pool: &state.pool }
+        .returned_from(g.session_id, g.now.now)
+        .await?;
     let event_lines = crate::prompt::EventLines {
         under_way: crate::prompt::events_reply_text(&current),
         just_now: crate::prompt::just_now_text(
             offline.as_ref(),
             separation.as_ref(),
             scare.as_ref(),
+            date_back.as_ref(),
         ),
+        date: None,
     };
     // A listed event kind speaks in the `emotional` tone while the
     // deployment has the tone on (spec

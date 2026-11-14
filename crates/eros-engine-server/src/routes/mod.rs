@@ -20,6 +20,7 @@ use utoipa_axum::router::OpenApiRouter;
 use crate::auth::middleware::{require_auth, require_caller_secret};
 use crate::state::AppState;
 
+pub mod activities;
 pub mod bff;
 pub mod byoc;
 pub mod companion;
@@ -66,6 +67,7 @@ pub fn router(state: AppState) -> OpenApiRouter<AppState> {
         .merge(session_open::router())
         .merge(session_events::router())
         .merge(life_choices::router())
+        .merge(activities::router())
         .merge(reaction::router())
         .merge(group::router())
         .merge(user_rows::router())
@@ -117,6 +119,7 @@ pub fn router_for_openapi() -> OpenApiRouter<AppState> {
         .merge(session_open::router())
         .merge(session_events::router())
         .merge(life_choices::router())
+        .merge(activities::router())
         .merge(reaction::router())
         .merge(group::router())
         .merge(user_rows::router())

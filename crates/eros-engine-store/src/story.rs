@@ -376,9 +376,10 @@ impl<'a> StoryRepo<'a> {
     /// `cap` newest, and a row under way survives it. Left out: a
     /// `taking_space` / `fell_out` whose session is gone or archived (it
     /// belongs to that relationship), a false alarm still under way (she
-    /// does not know yet), and every `bathing_together`: a romantic choice's
-    /// outcome lives in the conversation only (spec 2026-10-30 §4.7). The narration is dropped when its session is
-    /// archived; the event stays, as her own life.
+    /// does not know yet), and every `bathing_together` and `on_a_date`: a
+    /// romantic choice's outcome lives in the conversation only (spec
+    /// 2026-10-30 §4.7), and a date in its own sub-session. The narration is
+    /// dropped when its session is archived; the event stays, as her own life.
     pub async fn life_events(
         &self,
         instance_id: Uuid,
@@ -393,6 +394,10 @@ impl<'a> StoryRepo<'a> {
         let scares: Vec<&str> = EventKind::ALL
             .into_iter()
             .filter(|k| k.is_false_alarm())
+            .map(EventKind::as_str)
+            .collect();
+        let kept_out: Vec<&str> = [EventKind::BathingTogether, EventKind::OnADate]
+            .into_iter()
             .map(EventKind::as_str)
             .collect();
         #[allow(clippy::type_complexity)] // sqlx tuple query — type alias would add noise
@@ -418,7 +423,7 @@ impl<'a> StoryRepo<'a> {
                     AND (p.started_at >= $2 OR p.ends_at > $3) \
                     AND NOT (p.kind = ANY($5) AND (es.id IS NULL OR es.archived)) \
                     AND NOT (p.kind = ANY($6) AND p.ends_at > $3) \
-                    AND p.kind <> $7 \
+                    AND p.kind <> ALL($7) \
              ) \
              SELECT id, kind, session_id, started_at, ends_at, message_id, told \
                FROM e WHERE rn <= $4 OR ends_at > $3 \
@@ -430,7 +435,7 @@ impl<'a> StoryRepo<'a> {
         .bind(cap)
         .bind(&special)
         .bind(&scares)
-        .bind(EventKind::BathingTogether.as_str())
+        .bind(&kept_out)
         .fetch_all(self.pool)
         .await?;
         Ok(rows
@@ -1468,6 +1473,31 @@ mod tests {
         for (key, kind, from, to) in [
             ("over", "bathing_together", now - m(90), now - m(60)),
             ("now", "bathing_together", now - m(10), now + m(20)),
+            ("read", "reading", now - m(200), now - m(100)),
+        ] {
+            seed_event(&pool, inst, Some(s), key, kind, from, to, None).await;
+        }
+        let got = repo
+            .life_events(inst, now - chrono::Duration::days(7), now, 30)
+            .await
+            .unwrap();
+        let kinds: Vec<EventKind> = got.iter().map(|e| e.event.kind).collect();
+        assert_eq!(kinds, vec![EventKind::Reading]);
+    }
+
+    /// A date is its own sub-session's affair: it never reaches her story,
+    /// whether over or under way.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn life_events_leave_out_a_date(pool: PgPool) {
+        let repo = StoryRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        let inst = seed_instance(&pool, owner, "A", "active").await;
+        let s = seed_session(&pool, owner, inst).await;
+        let now = Utc::now();
+        let m = chrono::Duration::minutes;
+        for (key, kind, from, to) in [
+            ("over", "on_a_date", now - m(300), now - m(60)),
+            ("now", "on_a_date", now - m(10), now + m(50)),
             ("read", "reading", now - m(200), now - m(100)),
         ] {
             seed_event(&pool, inst, Some(s), key, kind, from, to, None).await;

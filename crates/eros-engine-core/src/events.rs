@@ -140,6 +140,9 @@ pub enum EventKind {
     /// She and the user take a bath together: written when the user accepts
     /// her `bathe_together` ask.
     BathingTogether,
+    /// She is out on a date with the user: written when the user's `date`
+    /// invitation is accepted, and ended when the activity does.
+    OnADate,
 }
 
 impl EventKind {
@@ -218,11 +221,12 @@ impl EventKind {
     ];
 
     /// Kinds the writers place directly, never drawn: parsed and stored, not in `ALL`.
-    pub const SPECIAL: [EventKind; 4] = [
+    pub const SPECIAL: [EventKind; 5] = [
         EventKind::TakingSpace,
         EventKind::FellOut,
         EventKind::TravelingTogether,
         EventKind::BathingTogether,
+        EventKind::OnADate,
     ];
 
     /// The stored and wire value.
@@ -293,6 +297,7 @@ impl EventKind {
             EventKind::WantHotSpring => "want_hot_spring",
             EventKind::WantSauna => "want_sauna",
             EventKind::BathingTogether => "bathing_together",
+            EventKind::OnADate => "on_a_date",
             EventKind::WatchingStocks => "watching_stocks",
             EventKind::Trading => "trading",
             EventKind::GotLost => "got_lost",
@@ -320,9 +325,9 @@ impl EventKind {
             | GotBumped | BumpedSomeone | Quarrel | ScoldedBySuperior | ScoldedSuperior
             | SawBag | SawClothes | AdmiringScenery | AdmiringArt | TakingSelfie | Strip
             | BirdEncounter | ExWantsBack | WantToQuitJob | PonderingLife | Streaking
-            | WantToSeeSea | WantHotSpring | WantSauna | BathingTogether | WatchingStocks
-            | Trading | GotLost | Drinking | Smoking | SmokingWeed | JustHaveSex | Masturbating
-            | MissedRide => EventCategory::Short,
+            | WantToSeeSea | WantHotSpring | WantSauna | BathingTogether | OnADate
+            | WatchingStocks | Trading | GotLost | Drinking | Smoking | SmokingWeed
+            | JustHaveSex | Masturbating | MissedRide => EventCategory::Short,
             TempWork | ExMessage | WeatherChange | GotHit | Breakup | WorkingOut | Reading
             | Gaming | AwayFromPhone | Unwell | Irritable | Busy | InBattle | Asleep
             | OutShopping | BrosGathering | SisGathering | OnTheRoad | WatchingMatch
@@ -532,6 +537,8 @@ fn rule(kind: EventKind) -> Rule {
         WantHotSpring => (1.0, 72, Lasts::Hours(1, 1)),
         WantSauna => (1.0, 72, Lasts::Hours(1, 1)),
         BathingTogether => (0.0, 0, Lasts::Minutes(30)),
+        // Never drawn: the activity sets its own end.
+        OnADate => (0.0, 0, Lasts::Hours(1, 4)),
         WatchingStocks => (2.0, 24, Lasts::Minutes(30)),
         Trading => (1.0, 24, Lasts::Hours(1, 1)),
         GotLost => (3.0, 48, Lasts::Hours(1, 1)),
@@ -1215,7 +1222,8 @@ pub fn is_told(kind: EventKind, rung: u8, persona: &PersonaTraits) -> bool {
         EventKind::TakingSpace
         | EventKind::FellOut
         | EventKind::TravelingTogether
-        | EventKind::BathingTogether => false,
+        | EventKind::BathingTogether
+        | EventKind::OnADate => false,
         EventKind::Busy | EventKind::InBattle => rung >= CONFIDE_MIN_RUNG,
         EventKind::OutShopping if persona.female => rung >= CONFIDE_MIN_RUNG,
         k => !k.is_offline(persona),
@@ -2066,6 +2074,7 @@ mod tests {
         assert!(!EventKind::ALL.contains(&TakingSpace));
         assert!(!EventKind::ALL.contains(&FellOut));
         assert_eq!(EventKind::ALL.len(), 70);
+        assert_eq!(EventKind::SPECIAL.len(), 5);
         for k in EventKind::SPECIAL {
             assert_eq!(serde_json::to_value(k).unwrap(), k.as_str());
             assert_eq!(EventKind::parse(k.as_str()), Some(k));
@@ -2761,6 +2770,22 @@ mod tests {
         assert_eq!(lasts(b, 0.5), Duration::minutes(30));
         for rung in 1..=5 {
             assert!(!is_told(b, rung, &PersonaTraits::default()), "rung {rung}");
+        }
+    }
+
+    #[test]
+    fn on_a_date_is_a_placed_incident_she_does_not_tell() {
+        let d = OnADate;
+        assert!(EventKind::SPECIAL.contains(&d) && !EventKind::ALL.contains(&d));
+        assert_eq!(EventKind::parse("on_a_date"), Some(OnADate));
+        assert_eq!(d.as_str(), "on_a_date");
+        assert_eq!(d.category(), EventCategory::Short);
+        assert!(!d.may_be_offline());
+        assert!(!d.is_offline(&PersonaTraits::default()));
+        assert!(!d.is_offline(&female()));
+        assert_eq!(d.place(), Place::Neutral);
+        for rung in 1..=5 {
+            assert!(!is_told(d, rung, &PersonaTraits::default()), "rung {rung}");
         }
     }
 

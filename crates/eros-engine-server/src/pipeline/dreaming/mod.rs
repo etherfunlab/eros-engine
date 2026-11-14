@@ -22,7 +22,7 @@ use eros_engine_store::scan_state::{Bumped, ScanStateRepo, SCAN_K};
 
 use crate::state::AppState;
 
-mod parse;
+pub(crate) mod parse;
 mod render;
 pub(crate) mod scan;
 

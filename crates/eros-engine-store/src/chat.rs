@@ -224,6 +224,13 @@ pub struct ReactedMessage {
     pub reaction: String,
 }
 
+/// The sessions a parent session's reads span: itself (`$1`) and the
+/// sub-sessions of its dates. A parenthesized relation: read each session
+/// through its own `LATERAL ... ORDER BY ... LIMIT` so the early-stopping index
+/// scan is kept, never as `session_id IN (...)`, which reads the whole session.
+const WITH_SUB_SESSIONS: &str = "(SELECT $1::uuid UNION ALL \
+     SELECT d.sub_session_id FROM engine.activities d WHERE d.session_id = $1)";
+
 pub struct ChatRepo<'a> {
     pub pool: &'a PgPool,
 }
@@ -434,6 +441,29 @@ impl<'a> ChatRepo<'a> {
         Ok(rows)
     }
 
+    /// The newest `limit` rows stamped at or before `at`, chronological: what
+    /// the session held at that instant. Ties on `sent_at` break by `id`.
+    pub async fn history_through(
+        &self,
+        session_id: Uuid,
+        at: DateTime<Utc>,
+        limit: i64,
+    ) -> Result<Vec<ChatMessage>, sqlx::Error> {
+        let mut rows = sqlx::query_as::<_, ChatMessage>(
+            "SELECT * FROM engine.chat_messages \
+             WHERE session_id = $1 AND sent_at <= $2 \
+             ORDER BY sent_at DESC, id DESC \
+             LIMIT $3",
+        )
+        .bind(session_id)
+        .bind(at)
+        .bind(limit)
+        .fetch_all(self.pool)
+        .await?;
+        rows.reverse();
+        Ok(rows)
+    }
+
     /// A group turn's transcript for one speaker, chronological: the newest
     /// `limit` rows at or before the turn's user row, then the assistant rows
     /// earlier speakers of THIS turn already persisted. A newer user row that
@@ -555,27 +585,32 @@ impl<'a> ChatRepo<'a> {
         .await
     }
 
-    /// `metadata` of the session's newest `limit` text-channel user rows,
-    /// newest first: the turns a given item's lingering effect counts (spec
-    /// 2026-10-12-given-item-lingering-effects-design.md §3, §5). `before`
+    /// `metadata` of the newest `limit` text-channel user rows of the session
+    /// and of its dates' sub-sessions (a date's turns count where the parent's
+    /// do), newest first: the turns a given item's lingering effect counts
+    /// (spec 2026-10-12-given-item-lingering-effects-design.md §3, §5). `before`
     /// keeps only rows strictly before that row, in `history_up_to`'s
-    /// `(sent_at, id)` order; an anchor outside the session yields nothing.
-    /// `None` reads the newest rows.
+    /// `(sent_at, id)` order; the anchor may sit in any of those sessions, and
+    /// one outside them yields nothing. `None` reads the newest rows.
     pub async fn user_action_metadata(
         &self,
         session_id: Uuid,
         before: Option<Uuid>,
         limit: i64,
     ) -> Result<Vec<Option<serde_json::Value>>, sqlx::Error> {
-        sqlx::query_scalar::<_, Option<serde_json::Value>>(
-            "SELECT m.metadata FROM engine.chat_messages m \
-             WHERE m.session_id = $1 AND m.role = 'user' AND m.channel IS NULL \
-               AND ($2::uuid IS NULL OR (m.sent_at, m.id) < \
-                    (SELECT a.sent_at, a.id FROM engine.chat_messages a \
-                      WHERE a.id = $2 AND a.session_id = $1)) \
-             ORDER BY m.sent_at DESC, m.id DESC \
-             LIMIT $3",
-        )
+        sqlx::query_scalar::<_, Option<serde_json::Value>>(&format!(
+            "SELECT x.metadata FROM {WITH_SUB_SESSIONS} s(id) \
+             CROSS JOIN LATERAL ( \
+                 SELECT m.metadata, m.sent_at, m.id FROM engine.chat_messages m \
+                  WHERE m.session_id = s.id AND m.role = 'user' AND m.channel IS NULL \
+                    AND ($2::uuid IS NULL OR (m.sent_at, m.id) < \
+                         (SELECT a.sent_at, a.id FROM engine.chat_messages a \
+                           WHERE a.id = $2 AND a.session_id IN {WITH_SUB_SESSIONS})) \
+                  ORDER BY m.sent_at DESC, m.id DESC \
+                  LIMIT $3) x \
+             ORDER BY x.sent_at DESC, x.id DESC \
+             LIMIT $3"
+        ))
         .bind(session_id)
         .bind(before)
         .bind(limit)
@@ -795,11 +830,12 @@ impl<'a> ChatRepo<'a> {
         .await
     }
 
-    /// A user's 1:1 sessions (text and voice), most-recently-active first. Groups are listed by GroupRepo.
+    /// A user's 1:1 sessions (text and voice), most-recently-active first. Groups are listed by GroupRepo;
+    /// a date's sub-session (`activity`) is reached through its parent and never listed.
     pub async fn list_sessions(&self, user_id: Uuid) -> Result<Vec<ChatSession>, sqlx::Error> {
         sqlx::query_as::<_, ChatSession>(
             "SELECT * FROM engine.chat_sessions \
-             WHERE user_id = $1 AND NOT archived AND channel <> 'group' \
+             WHERE user_id = $1 AND NOT archived AND channel NOT IN ('group', 'activity') \
              ORDER BY last_active_at DESC",
         )
         .bind(user_id)
@@ -1005,6 +1041,25 @@ async fn insert_assistant_row_in_tx(
     Ok(())
 }
 
+/// The user row stored under `(session_id, client_msg_id)`: what makes a send
+/// a retry of an earlier one rather than a new message.
+async fn user_row_by_client_msg_id<'e, E: sqlx::PgExecutor<'e>>(
+    ex: E,
+    session_id: Uuid,
+    client_msg_id: &str,
+) -> Result<Option<ChatMessage>, sqlx::Error> {
+    sqlx::query_as::<_, ChatMessage>(
+        "SELECT * FROM engine.chat_messages \
+         WHERE session_id = $1 AND client_msg_id = $2 \
+           AND role = 'user' \
+         LIMIT 1",
+    )
+    .bind(session_id)
+    .bind(client_msg_id)
+    .fetch_optional(ex)
+    .await
+}
+
 pub(crate) async fn upsert_user_message_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     session_id: Uuid,
@@ -1013,16 +1068,7 @@ pub(crate) async fn upsert_user_message_in_tx(
     role: &str,
     metadata: Option<&serde_json::Value>,
 ) -> Result<UpsertUserOutcome, sqlx::Error> {
-    let existing: Option<ChatMessage> = sqlx::query_as::<_, ChatMessage>(
-        "SELECT * FROM engine.chat_messages \
-         WHERE session_id = $1 AND client_msg_id = $2 \
-           AND role = 'user' \
-         LIMIT 1",
-    )
-    .bind(session_id)
-    .bind(client_msg_id)
-    .fetch_optional(&mut **tx)
-    .await?;
+    let existing = user_row_by_client_msg_id(&mut **tx, session_id, client_msg_id).await?;
 
     if let Some(row) = existing {
         let assistant_chain: Vec<ReplayMessage> =
@@ -1070,6 +1116,22 @@ pub(crate) async fn upsert_user_message_in_tx(
 }
 
 impl<'a> ChatRepo<'a> {
+    /// Whether `session_id` already holds a user row sent under
+    /// `client_msg_id`: the test `upsert_user_message_idempotent` and the
+    /// enqueues apply, so a send that passes it is answered from what is
+    /// stored and writes nothing.
+    pub async fn has_user_message(
+        &self,
+        session_id: Uuid,
+        client_msg_id: &str,
+    ) -> Result<bool, sqlx::Error> {
+        Ok(
+            user_row_by_client_msg_id(self.pool, session_id, client_msg_id)
+                .await?
+                .is_some(),
+        )
+    }
+
     /// Insert a user message keyed by `client_msg_id` with permanent
     /// idempotency. The partial unique index on `(session_id, client_msg_id)`
     /// has no time component, so deduplication is permanent: any prior row
@@ -1544,13 +1606,13 @@ impl<'a> ChatRepo<'a> {
         .await
     }
 
-    /// The resolved scopes recorded on the session's newest assistant row that
-    /// carries both (`metadata.memory_scope`, `metadata.affinity_scope`); `None`
-    /// when there is none or either fails to parse. The persona's own
-    /// life-choice rows (`metadata.proactive = 'life_choice'`) are skipped:
-    /// they are not a turn of the caller's, so they say nothing about the
-    /// caller's scopes (spec 2026-10-30 §4.1). Other proactive rows carry the
-    /// caller's request scopes and stay eligible.
+    /// The resolved scopes recorded on the newest assistant row, of the session
+    /// or of its dates' sub-sessions, that carries both (`metadata.memory_scope`,
+    /// `metadata.affinity_scope`); `None` when there is none or either fails to
+    /// parse. The persona's own life-choice rows (`metadata.proactive =
+    /// 'life_choice'`) are skipped: they are not a turn of the caller's, so they
+    /// say nothing about the caller's scopes (spec 2026-10-30 §4.1). Other
+    /// proactive rows carry the caller's request scopes and stay eligible.
     pub async fn latest_scopes(
         &self,
         session_id: Uuid,
@@ -1561,14 +1623,18 @@ impl<'a> ChatRepo<'a> {
         )>,
         sqlx::Error,
     > {
-        let row: Option<(serde_json::Value, serde_json::Value)> = sqlx::query_as(
-            "SELECT metadata->'memory_scope', metadata->'affinity_scope' \
-             FROM engine.chat_messages \
-             WHERE session_id = $1 AND role = 'assistant' \
-               AND metadata ? 'memory_scope' AND metadata ? 'affinity_scope' \
-               AND metadata->>'proactive' IS DISTINCT FROM 'life_choice' \
-             ORDER BY sent_at DESC, id DESC LIMIT 1",
-        )
+        let row: Option<(serde_json::Value, serde_json::Value)> = sqlx::query_as(&format!(
+            "SELECT x.memory_scope, x.affinity_scope FROM {WITH_SUB_SESSIONS} s(id) \
+             CROSS JOIN LATERAL ( \
+                 SELECT m.metadata->'memory_scope' AS memory_scope, \
+                        m.metadata->'affinity_scope' AS affinity_scope, m.sent_at, m.id \
+                   FROM engine.chat_messages m \
+                  WHERE m.session_id = s.id AND m.role = 'assistant' \
+                    AND m.metadata ? 'memory_scope' AND m.metadata ? 'affinity_scope' \
+                    AND m.metadata->>'proactive' IS DISTINCT FROM 'life_choice' \
+                  ORDER BY m.sent_at DESC, m.id DESC LIMIT 1) x \
+             ORDER BY x.sent_at DESC, x.id DESC LIMIT 1"
+        ))
         .bind(session_id)
         .fetch_optional(self.pool)
         .await?;
@@ -2278,6 +2344,43 @@ mod tests {
         );
     }
 
+    /// A date's sub-session of `parent`, linked by an `engine.activities` row.
+    async fn seed_sub_session(pool: &PgPool, parent: &ChatSession) -> Uuid {
+        let sub: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id, channel) \
+             VALUES ($1, $2, 'activity') RETURNING id",
+        )
+        .bind(parent.user_id)
+        .bind(parent.instance_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.activities (session_id, sub_session_id, duration, place, content) \
+             VALUES ($1, $2, 'mid', '海边', '散步')",
+        )
+        .bind(parent.id)
+        .bind(sub)
+        .execute(pool)
+        .await
+        .unwrap();
+        sub
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn list_sessions_omits_activity_sessions(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let text = repo.create_session(user_id, instance_id).await.unwrap();
+        seed_sub_session(&pool, &text).await;
+        let listed = repo.list_sessions(user_id).await.unwrap();
+        assert_eq!(
+            listed.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![text.id]
+        );
+    }
+
     #[sqlx::test(migrations = "./migrations")]
     async fn group_history_for_turn_bounds_to_this_turn(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
@@ -2855,6 +2958,30 @@ mod tests {
             }
             other => panic!("expected Inserted, got {other:?}"),
         }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn has_user_message_is_the_enqueues_own_test_for_a_retry(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let s = repo.create_session(user_id, instance_id).await.unwrap();
+        let other = repo.create_session(user_id, instance_id).await.unwrap();
+        let id = "01J0000000000000000000000A";
+        assert!(!repo.has_user_message(s.id, id).await.unwrap());
+
+        repo.upsert_user_message_idempotent(s.id, "hello", id, "user", None)
+            .await
+            .unwrap();
+        assert!(repo.has_user_message(s.id, id).await.unwrap());
+        assert!(
+            !repo.has_user_message(other.id, id).await.unwrap(),
+            "the key is per session"
+        );
+        assert!(!repo
+            .has_user_message(s.id, "01J0000000000000000000000B")
+            .await
+            .unwrap());
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -5992,6 +6119,124 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn latest_scopes_reads_through_sub_sessions(pool: PgPool) {
+        use eros_engine_core::scope::{AffinityScope, MemoryScope};
+        let repo = ChatRepo { pool: &pool };
+        let s = throwaway_session(&pool).await;
+        let sub = seed_sub_session(&pool, &s).await;
+        let other = throwaway_session(&pool).await;
+        let other_sub = seed_sub_session(&pool, &other).await;
+        let put = |session: Uuid, at: &'static str, metadata: serde_json::Value| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO engine.chat_messages (session_id, role, content, sent_at, metadata) \
+                     VALUES ($1, 'assistant', '', $2::timestamptz, $3)",
+                )
+                .bind(session)
+                .bind(at)
+                .bind(metadata)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        };
+        let scopes = |memory: &str, affinity: AffinityScope| serde_json::json!({"memory_scope": memory, "affinity_scope": affinity});
+
+        put(
+            s.id,
+            "2026-10-01T09:00:00Z",
+            scopes("full", AffinityScope::bond()),
+        )
+        .await;
+        assert_eq!(
+            repo.latest_scopes(s.id).await.unwrap(),
+            Some((MemoryScope::Full, AffinityScope::bond()))
+        );
+
+        // The date's newer row wins for the parent.
+        put(
+            sub,
+            "2026-10-01T09:30:00Z",
+            scopes("none", AffinityScope::chemistry()),
+        )
+        .await;
+        assert_eq!(
+            repo.latest_scopes(s.id).await.unwrap(),
+            Some((MemoryScope::None, AffinityScope::chemistry()))
+        );
+
+        // A parent row after the date takes over again.
+        put(
+            s.id,
+            "2026-10-01T10:00:00Z",
+            scopes("full", AffinityScope::bond()),
+        )
+        .await;
+        assert_eq!(
+            repo.latest_scopes(s.id).await.unwrap(),
+            Some((MemoryScope::Full, AffinityScope::bond()))
+        );
+
+        // Another relationship's date is nobody's but its own.
+        put(
+            other_sub,
+            "2026-10-01T11:00:00Z",
+            scopes("none", AffinityScope::chemistry()),
+        )
+        .await;
+        assert_eq!(
+            repo.latest_scopes(s.id).await.unwrap(),
+            Some((MemoryScope::Full, AffinityScope::bond()))
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn history_through_stops_at_the_instant(pool: PgPool) {
+        let s = throwaway_session(&pool).await;
+        let other = throwaway_session(&pool).await;
+        for (n, at) in [
+            "2026-10-01T09:00:00Z",
+            "2026-10-01T09:01:00Z",
+            "2026-10-01T09:02:00Z",
+            "2026-10-01T09:03:00Z",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            insert_row(&pool, s.id, "user", &format!("m{n}"), at).await;
+        }
+        insert_row(&pool, other.id, "user", "elsewhere", "2026-10-01T09:01:30Z").await;
+        let repo = ChatRepo { pool: &pool };
+        let contents =
+            |rows: Vec<ChatMessage>| rows.into_iter().map(|m| m.content).collect::<Vec<_>>();
+
+        // A row stamped exactly at the instant is in; later ones are out.
+        assert_eq!(
+            contents(
+                repo.history_through(s.id, at("2026-10-01T09:02:00Z"), 10)
+                    .await
+                    .unwrap()
+            ),
+            ["m0", "m1", "m2"]
+        );
+        // The newest `limit` of them, oldest first.
+        assert_eq!(
+            contents(
+                repo.history_through(s.id, at("2026-10-01T09:02:30Z"), 2)
+                    .await
+                    .unwrap()
+            ),
+            ["m1", "m2"]
+        );
+        assert!(repo
+            .history_through(s.id, at("2026-10-01T08:59:00Z"), 10)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn set_action_response_writes_into_the_action_and_keeps_other_keys(pool: PgPool) {
         use eros_engine_core::types::ActionResponse;
         let s = throwaway_session(&pool).await;
@@ -6445,6 +6690,78 @@ mod tests {
             .is_empty());
         assert!(repo
             .user_action_metadata(s.id, Some(Uuid::new_v4()), 5)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn user_action_metadata_reads_the_parent_and_its_sub_sessions(pool: PgPool) {
+        use serde_json::json;
+        let s = throwaway_session(&pool).await;
+        let sub = seed_sub_session(&pool, &s).await;
+        let other = throwaway_session(&pool).await;
+        let other_sub = seed_sub_session(&pool, &other).await;
+        insert_user_row(&pool, s.id, "2026-10-01T09:00:00Z", json!({"n": 1}), None).await;
+        let in_date = insert_user_row(
+            &pool,
+            sub,
+            "2026-10-01T09:30:00Z",
+            json!({"n": 2, "action": {"type": "give"}}),
+            None,
+        )
+        .await;
+        let after =
+            insert_user_row(&pool, s.id, "2026-10-01T10:00:00Z", json!({"n": 3}), None).await;
+        insert_user_row(
+            &pool,
+            other_sub,
+            "2026-10-01T09:45:00Z",
+            json!({"n": 9}),
+            None,
+        )
+        .await;
+        let repo = ChatRepo { pool: &pool };
+
+        // The date's rows interleave with the parent's by time.
+        assert_eq!(
+            repo.user_action_metadata(s.id, None, 5).await.unwrap(),
+            vec![
+                Some(json!({"n": 3})),
+                Some(json!({"n": 2, "action": {"type": "give"}})),
+                Some(json!({"n": 1})),
+            ]
+        );
+        // An anchor in the sub-session pages the parent's view.
+        assert_eq!(
+            repo.user_action_metadata(s.id, Some(in_date), 5)
+                .await
+                .unwrap(),
+            vec![Some(json!({"n": 1}))]
+        );
+        assert_eq!(
+            repo.user_action_metadata(s.id, Some(after), 5)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        // The sub-session's own id reads only itself.
+        assert_eq!(
+            repo.user_action_metadata(sub, None, 5).await.unwrap(),
+            vec![Some(json!({"n": 2, "action": {"type": "give"}}))]
+        );
+        // Another relationship's sub-session is not an anchor here.
+        let foreign = insert_user_row(
+            &pool,
+            other_sub,
+            "2026-10-01T09:50:00Z",
+            json!({"n": 10}),
+            None,
+        )
+        .await;
+        assert!(repo
+            .user_action_metadata(s.id, Some(foreign), 5)
             .await
             .unwrap()
             .is_empty());

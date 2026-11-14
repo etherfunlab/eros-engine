@@ -102,6 +102,12 @@ pub struct BffHistoryEntry {
     /// `occasion`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub life_choice: Option<crate::routes::life_choices::LifeChoiceReceiptDto>,
+    /// The date a `user` row's invitation opened, when she accepted it: its
+    /// `sub_session_id` (whose rows this route serves under that id) and its
+    /// `status` as of the response. Omitted on every other row, a refused
+    /// invitation included.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity: Option<crate::routes::dto::ActivityView>,
     /// The member session that spoke this line (group sessions only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speaker_session_id: Option<Uuid>,
@@ -226,14 +232,16 @@ async fn bff_get_history(
     };
     let rows = page.ok_or_else(|| AppError::NotFound("no such message".into()))?;
     let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
-    let mut receipts =
-        crate::routes::life_choices::receipts_for(&state.pool, &ids, chrono::Utc::now()).await?;
+    let now = chrono::Utc::now();
+    let mut receipts = crate::routes::life_choices::receipts_for(&state.pool, &ids, now).await?;
+    let mut dates = crate::pipeline::activity::receipts_for(&state.pool, &ids, now).await?;
 
     let messages: Vec<BffHistoryEntry> =
         rows.into_iter()
             .map(|r| BffHistoryEntry {
                 id: r.id,
                 life_choice: receipts.remove(&r.id),
+                activity: dates.remove(&r.id),
                 client_msg_id: r.client_msg_id,
                 role: r.role,
                 content: r.content,
@@ -301,13 +309,15 @@ async fn bff_start_chat(
             .history_slim(resolved.session_id, history_limit, 0)
             .await?;
         let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+        let now = chrono::Utc::now();
         let mut receipts =
-            crate::routes::life_choices::receipts_for(&state.pool, &ids, chrono::Utc::now())
-                .await?;
+            crate::routes::life_choices::receipts_for(&state.pool, &ids, now).await?;
+        let mut dates = crate::pipeline::activity::receipts_for(&state.pool, &ids, now).await?;
         rows.into_iter()
             .map(|r| BffHistoryEntry {
                 id: r.id,
                 life_choice: receipts.remove(&r.id),
+                activity: dates.remove(&r.id),
                 client_msg_id: r.client_msg_id,
                 role: r.role,
                 content: r.content,

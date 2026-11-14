@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The relationship journal (`engine.relationship_journal`): dated moments of
 //! one relationship, written by the engine's own mechanisms (first meeting, a
-//! tier first reached, an accepted gift or kiss) and by the scanner's LLM.
+//! tier first reached, an accepted gift or kiss, a date) and by an LLM (the
+//! scanner, the activity judge).
 
 use chrono::{DateTime, NaiveDate, Utc};
 use chrono_tz::Tz;
@@ -11,7 +12,11 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgConnection, PgExecutor, PgPool};
 use uuid::Uuid;
 
+use crate::episode::one_line;
 use crate::memory::format_vector;
+
+/// Characters a model-written journal summary keeps.
+pub const JOURNAL_SUMMARY_MAX_CHARS: usize = 200;
 
 /// One journal row, every column but the embedding.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -210,6 +215,58 @@ pub fn first_kiss(instance_id: Uuid, message_id: Uuid, on: NaiveDate) -> Journal
             "first_intimacy:real".to_string(),
             "none",
         )
+    }
+}
+
+/// That a date took place: one row per activity, pointing at the invitation.
+pub fn date(
+    instance_id: Uuid,
+    activity_id: Uuid,
+    message_id: Option<Uuid>,
+    on: NaiveDate,
+    place: &str,
+    content: &str,
+) -> JournalInsert {
+    JournalInsert {
+        message_id,
+        ..engine_row(
+            instance_id,
+            on,
+            "date",
+            format!("约会：在{place}，{content}"),
+            format!("date:{activity_id}"),
+            "none",
+        )
+    }
+}
+
+/// A milestone the activity judge read in a date. A date is `real` by
+/// construction, so a `first_intimacy` competes for `first_intimacy:real`;
+/// every other kind is repeatable. A `due_on` brings it back on that day. The
+/// summary is stored on one line, cut to `JOURNAL_SUMMARY_MAX_CHARS`.
+pub fn date_moment(
+    instance_id: Uuid,
+    on: NaiveDate,
+    kind: &str,
+    summary: &str,
+    due_on: Option<NaiveDate>,
+) -> JournalInsert {
+    JournalInsert {
+        instance_id,
+        occurred_on: on,
+        kind: kind.to_string(),
+        realm: "real".to_string(),
+        summary: one_line(summary)
+            .chars()
+            .take(JOURNAL_SUMMARY_MAX_CHARS)
+            .collect(),
+        source: "llm".to_string(),
+        message_id: None,
+        affinity_event_id: None,
+        dedup_key: (kind == "first_intimacy").then(|| "first_intimacy:real".to_string()),
+        due_on,
+        recurrence: if due_on.is_some() { "on_due" } else { "none" }.to_string(),
+        embedding: None,
     }
 }
 
@@ -641,6 +698,109 @@ mod tests {
                 .is_some());
         }
         assert_eq!(count(&pool, instance).await, 3);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn date_rows_are_real_and_keyed(pool: PgPool) {
+        let repo = JournalRepo { pool: &pool };
+        let (owner, instance) = seed_relationship(&pool).await;
+        let invitation = seed_message_of(&pool, owner, instance).await;
+        let activity = Uuid::new_v4();
+        let on = day(2026, 11, 12);
+
+        let r = date(
+            instance,
+            activity,
+            Some(invitation),
+            on,
+            "海边的餐厅",
+            "吃一顿大餐",
+        );
+        let key = format!("date:{activity}");
+        assert_eq!(
+            (r.kind.as_str(), r.summary.as_str(), r.dedup_key.as_deref()),
+            ("date", "约会：在海边的餐厅，吃一顿大餐", Some(key.as_str()))
+        );
+        assert_eq!(
+            (r.realm.as_str(), r.source.as_str(), r.recurrence.as_str()),
+            ("real", "engine", "none")
+        );
+        assert_eq!(
+            (r.instance_id, r.occurred_on, r.message_id),
+            (instance, on, Some(invitation))
+        );
+        assert!(r.affinity_event_id.is_none() && r.due_on.is_none() && r.embedding.is_none());
+
+        assert!(repo.insert(&r).await.unwrap().is_some());
+        assert_eq!(
+            repo.insert(&date(instance, activity, None, on, "别处", "别的"))
+                .await
+                .unwrap(),
+            None,
+            "one row per activity"
+        );
+        assert!(repo
+            .insert(&date(
+                instance,
+                Uuid::new_v4(),
+                None,
+                on,
+                "海边的餐厅",
+                "吃一顿大餐"
+            ))
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(count(&pool, instance).await, 2);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn date_moment_keys_first_intimacy_only(pool: PgPool) {
+        let repo = JournalRepo { pool: &pool };
+        let (owner, instance) = seed_relationship(&pool).await;
+        let kiss = seed_message_of(&pool, owner, instance).await;
+        let on = day(2026, 11, 12);
+        repo.insert(&first_kiss(instance, kiss, day(2026, 3, 1)))
+            .await
+            .unwrap()
+            .expect("the earlier first kiss");
+
+        let m = date_moment(instance, on, "first_intimacy", "第一次牵手", None);
+        assert_eq!(m.dedup_key.as_deref(), Some("first_intimacy:real"));
+        assert_eq!(repo.insert(&m).await.unwrap(), None, "the earlier row wins");
+
+        let p = date_moment(
+            instance,
+            on,
+            "promise",
+            " 下周\n一起去看海 ",
+            Some(day(2026, 11, 19)),
+        );
+        assert_eq!(
+            (p.kind.as_str(), p.summary.as_str(), p.dedup_key.as_deref()),
+            ("promise", "下周 一起去看海", None)
+        );
+        assert_eq!(
+            (p.realm.as_str(), p.source.as_str(), p.recurrence.as_str()),
+            ("real", "llm", "on_due")
+        );
+        assert_eq!(
+            (p.instance_id, p.occurred_on, p.due_on),
+            (instance, on, Some(day(2026, 11, 19)))
+        );
+        assert!(p.message_id.is_none() && p.affinity_event_id.is_none() && p.embedding.is_none());
+
+        let c = date_moment(instance, on, "confession", &"爱".repeat(250), None);
+        assert_eq!(c.summary, "爱".repeat(JOURNAL_SUMMARY_MAX_CHARS));
+        assert_eq!(
+            (c.dedup_key.as_deref(), c.recurrence.as_str()),
+            (None, "none")
+        );
+
+        for row in [&p, &c, &c] {
+            assert!(repo.insert(row).await.unwrap().is_some());
+        }
+        assert_eq!(count(&pool, instance).await, 4);
     }
 
     #[sqlx::test(migrations = "./migrations")]

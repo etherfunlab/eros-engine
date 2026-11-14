@@ -117,6 +117,10 @@ pub enum ProtocolFrame {
         llm_attempts: Vec<eros_engine_llm::failure::UpstreamAttempt>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         gateway_errors: Vec<eros_engine_llm::failure::GatewayError>,
+        /// The date an accepted invitation opened this turn (spec
+        /// 2026-11-12-activity-sub-session-design.md §4.6); absent otherwise.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        activity: Option<crate::routes::dto::ActivityView>,
     },
     Error {
         code: StreamErrorCode,
@@ -2834,23 +2838,35 @@ fn render_product_qa_pairs(pairs: &[(String, String)]) -> String {
 /// design.md §2.3, 2026-11-08-strip-and-world-setting-design.md §2.2): an
 /// accepted one with an image executor shows her picture after her words,
 /// always of her face; any other is text only, even when the judge proposed a
-/// picture.
+/// picture. A `date` turn is always text only, whatever her answer (spec
+/// 2026-11-12-activity-sub-session-design.md §4.6), so an accepted one reaches
+/// the text reply, where the date opens.
 fn picture_action(
     event: &eros_engine_core::types::Event,
     plan: &eros_engine_core::types::ActionPlan,
     image_executor_available: bool,
 ) -> Option<ActionType> {
     use eros_engine_core::types::{ActionResponse, Event, UserAction};
-    if !matches!(
+    let date = matches!(
         event,
         Event::UserMessage {
-            action: Some(UserAction::Photo | UserAction::Strip),
+            action: Some(UserAction::Date { .. }),
             ..
         }
-    ) {
+    );
+    if !date
+        && !matches!(
+            event,
+            Event::UserMessage {
+                action: Some(UserAction::Photo | UserAction::Strip),
+                ..
+            }
+        )
+    {
         return None;
     }
-    let shows = plan.action_response == Some(ActionResponse::Accept) && image_executor_available;
+    let shows =
+        !date && plan.action_response == Some(ActionResponse::Accept) && image_executor_available;
     let target = if shows {
         ActionType::ReplyTextImage
     } else if matches!(
@@ -2868,8 +2884,8 @@ fn picture_action(
 }
 
 /// An action refused before the judge (a give the habit roll refused, a strip
-/// an incompatible pair cannot have) is refused, whatever the judge or the
-/// rule engine settled on.
+/// an incompatible pair cannot have, a date the gate turns down) is refused,
+/// whatever the judge or the rule engine settled on.
 fn apply_forced_refusal(plan: &mut eros_engine_core::types::ActionPlan, refused: bool) {
     if refused && plan.action_response.is_some() {
         plan.action_response = Some(eros_engine_core::types::ActionResponse::Refuse);
@@ -2985,7 +3001,8 @@ fn build_pde_ctx(
     // action refused before the judge (a give the habit roll refused, spec
     // 2026-10-28-outing-indulgence-needs-and-habits-design.md §3.1; a strip an
     // incompatible pair cannot have, spec 2026-11-08-strip-and-world-setting-
-    // design.md §2.1) states the outcome, not the reason.
+    // design.md §2.1; a date the gate turns down, spec 2026-11-12-activity-sub-
+    // session-design.md §4.3) states the outcome, not the reason.
     let action_line = match &input.event {
         eros_engine_core::types::Event::UserMessage {
             action: Some(a), ..
@@ -2998,6 +3015,7 @@ fn build_pde_ctx(
             match (refused_before_judge, a) {
                 (false, _) => "",
                 (true, eros_engine_core::types::UserAction::Strip) => "，这次你不会让对方这样做",
+                (true, eros_engine_core::types::UserAction::Date { .. }) => "，这次你不会答应",
                 (true, _) => "，这次你不会收下",
             }
         ),
@@ -4802,8 +4820,27 @@ pub(crate) fn run_stream_with(
                 }
             },
         };
+        // A date's sub-session reads and writes the relationship's state on
+        // its parent; its messages stay its own (spec 2026-11-12-activity-
+        // sub-session-design.md §5.1).
+        let turn = match crate::pipeline::activity::turn_session(&state.pool, user_msg.session_id).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("stream: turn session read failed: {e}");
+                yield ProtocolFrame::Error {
+                    code: StreamErrorCode::Internal,
+                    retryable: false,
+                    message: format!("turn session read failed: {e}"),
+                    user_message: "服务出现问题，请稍后再试".into(),
+                    upstream_status: None,
+                    provider_code: None,
+                };
+                return;
+            }
+        };
+        let on_date = turn.activity.is_some();
         let mut affinity = match affinity_repo
-            .load_or_create(user_msg.session_id, user_msg.user_id, user_msg.instance_id)
+            .load_or_create(turn.relationship, user_msg.user_id, user_msg.instance_id)
             .await
         {
             Ok(mut a) => {
@@ -4853,7 +4890,7 @@ pub(crate) fn run_stream_with(
         // judge, the reply and the composer see the same text.
         let given_effects = crate::pipeline::handlers::load_effects(
             &state.pool,
-            user_msg.session_id,
+            turn.relationship,
             Some(user_msg.user_message_id),
         )
         .await
@@ -4886,8 +4923,8 @@ pub(crate) fn run_stream_with(
         // the result. Only an ask for space that goes unanswered starts a
         // falling-out, at this row; `sleep_together` and `propose` settle at
         // no cost (spec 2026-10-30 §4.5). A give, a tip or a kiss does not
-        // answer her.
-        if user_msg.action.is_none() {
+        // answer her, and neither does a date turn.
+        if user_msg.action.is_none() && !on_date {
             if let Err(e) = crate::pipeline::life_choice::convert_ignored_ask(
                 &state,
                 user_msg.session_id,
@@ -4922,19 +4959,17 @@ pub(crate) fn run_stream_with(
         let action_turn = user_msg.action.is_some();
         let force_image = user_msg.image.as_ref().is_some_and(|i| i.force);
         let traits = crate::prompt::persona_traits(&input.persona);
+        let offline_now = current
+            .foreground
+            .as_ref()
+            .is_some_and(|e| e.kind.is_offline(&traits));
+        // A deployment with the ghosting switch off never goes silent, and
+        // neither does she on a date: she is with the user.
+        let ghosting = state.model_config.pde_ghosting_enabled() && !on_date;
         // While she is offline (spec 2026-10-16-life-events-offline-and-scares-
         // design.md §4.2) a text turn ghosts without the judge. The silence is
-        // circumstance, so the ghost accounting is left alone. A deployment
-        // with the ghosting switch off never goes silent, a stretch under way
-        // included.
-        if !action_turn
-            && !force_image
-            && state.model_config.pde_ghosting_enabled()
-            && current
-                .foreground
-                .as_ref()
-                .is_some_and(|e| e.kind.is_offline(&traits))
-        {
+        // circumstance, so the ghost accounting is left alone.
+        if !action_turn && !force_image && ghosting && offline_now {
             if let Err(e) = chat_repo
                 .mark_user_message_ghosted(user_msg.user_message_id)
                 .await
@@ -4995,11 +5030,22 @@ pub(crate) fn run_stream_with(
                 tracing::warn!("stream: scare read failed: {e}");
                 None
             });
+        // The date this main chat is just back from, until her first line
+        // after it (spec 2026-11-12-activity-sub-session-design.md §8). A
+        // date's own session is back from none.
+        let date_back = eros_engine_store::activity::ActivityRepo { pool: &state.pool }
+            .returned_from(user_msg.session_id, current.at)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("stream: date return read failed: {e}");
+                None
+            });
         let event_judge = crate::prompt::events_judge_text(
             &current,
             offline.as_ref(),
             separation.as_ref(),
             scare.as_ref(),
+            date_back.as_ref(),
         );
         let event_lines = crate::prompt::EventLines {
             under_way: crate::prompt::events_reply_text(&current),
@@ -5007,7 +5053,18 @@ pub(crate) fn run_stream_with(
                 offline.as_ref(),
                 separation.as_ref(),
                 scare.as_ref(),
+                date_back.as_ref(),
             ),
+            // Only while the date runs: a turn driven after its end (revived
+            // from the queue, or still generating) is not told it as under way.
+            date: turn
+                .activity
+                .as_ref()
+                .filter(|a| {
+                    a.status_at(chrono::Utc::now())
+                        == eros_engine_store::activity::ActivityStatus::Ongoing
+                })
+                .map(|a| crate::prompt::date_line(&a.place, &a.content)),
         };
         // ── PDE decision (judge-first) ────────────────────────────────────────
         // The judge runs before vision/input-filter/chat so a `ghost` verdict
@@ -5085,6 +5142,34 @@ pub(crate) fn run_stream_with(
         // world-setting-design.md §2.1): decided here too, so the judge writes
         // for the outcome.
         let strip_refused = pde::strip_ruled_out(&input.event);
+        // A date she cannot go on (spec 2026-11-12-activity-sub-session-
+        // design.md §4.3): she is offline, or a `mid` one is asked below bond
+        // tier 2. On the decayed affinity this turn reads. Another date of
+        // hers that has not ended takes her out of reach too: read here, at
+        // drive time, for an invitation queued or sent while the one that
+        // opened that date was still generating (the open's own guard).
+        let date_turn = matches!(
+            user_msg.action,
+            Some(eros_engine_core::types::UserAction::Date { .. })
+        );
+        let other_date_on = date_turn
+            && eros_engine_store::activity::ActivityRepo { pool: &state.pool }
+                .date_on(
+                    user_msg.instance_id,
+                    Some(user_msg.user_message_id),
+                    chrono::Utc::now(),
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!("stream: date read failed: {e}");
+                    false
+                });
+        let date_refused = pde::date_ruled_out(
+            &input.event,
+            affinity.bond_tier(),
+            offline_now || other_date_on,
+        );
+        let refused_before_judge = give_refused || strip_refused || date_refused;
         let (mut plan, pde_run): (eros_engine_core::types::ActionPlan, Option<PdeDecisionRun>) =
             match resolved_pde.as_ref() {
                 Some(p) => {
@@ -5096,7 +5181,7 @@ pub(crate) fn run_stream_with(
                         body_state.as_deref(),
                         prior_needs.as_ref(),
                         event_judge.as_deref(),
-                        give_refused || strip_refused,
+                        refused_before_judge,
                     );
                     // Read receipt (migration 0053): the judge is the first
                     // generative model to see this message, so this is the
@@ -5181,21 +5266,24 @@ pub(crate) fn run_stream_with(
 
         // Ghosting kill-switch (§4.1) — path-wide final gate (LLM / fallback /
         // pure-rule / tip). Uses the in-scope sanitized hints, not plan.context_hints.
+        // On a date a ghost verdict becomes a reply here too.
         plan = apply_ghosting_killswitch(
             plan,
-            state.model_config.pde_ghosting_enabled(),
+            ghosting,
             &input,
             std::mem::take(&mut killswitch_hints),
         );
 
         // An action refused before the judge is refused before anything reads
         // the response.
-        apply_forced_refusal(&mut plan, give_refused || strip_refused);
+        apply_forced_refusal(&mut plan, refused_before_judge);
 
         // A photo she let the user take, or a strip she let happen, comes back
         // as her picture after her words; a refused one is text only (spec
         // 2026-11-08 §2.3, 2026-11-08-strip-and-world-setting-design.md §2.2).
-        // Before the forced-image override, which still wins.
+        // Before the forced-image override, which still wins, except on a
+        // date turn: that one never produces a picture (spec 2026-11-12-
+        // activity-sub-session-design.md §4.6).
         if let Some(action) = picture_action(&input.event, &plan, image_executor_available) {
             let aspect = (action == ActionType::ReplyTextImage
                 && matches!(
@@ -5223,7 +5311,7 @@ pub(crate) fn run_stream_with(
         // consumer has overridden by forcing. There is no subject to carry
         // through here — the composer decides what the picture shows from turn
         // context alone (`resolve_image_turn_inputs`).
-        if force_image {
+        if force_image && !date_turn {
             plan = pde::plan_for(
                 &input,
                 ActionType::ReplyImage,
@@ -5929,7 +6017,7 @@ pub(crate) fn run_stream_with(
                         "UPDATE engine.companion_affinity SET ghost_streak = 0, updated_at = now() \
                          WHERE session_id = $1 AND ghost_streak <> 0",
                     )
-                    .bind(user_msg.session_id)
+                    .bind(turn.relationship)
                     .execute(&state.pool)
                     .await
                     {
@@ -6382,7 +6470,7 @@ pub(crate) fn run_stream_with(
                         "UPDATE engine.companion_affinity SET ghost_streak = 0, updated_at = now() \
                          WHERE session_id = $1 AND ghost_streak <> 0",
                     )
-                    .bind(user_msg.session_id)
+                    .bind(turn.relationship)
                     .execute(&state.pool)
                     .await
                     {
@@ -6484,7 +6572,7 @@ pub(crate) fn run_stream_with(
                 turn_failures.extend(burst_failures);
                 turn_failures.extend(compose_failures);
                 let (turn_attempts, turn_gateways) = split_failures_typed(&turn_failures);
-                let final_frame = build_final_frame(
+                let mut final_frame = build_final_frame(
                     did_filter,
                     prompt_injected.clone(),
                     user_msg.tier.clone(),
@@ -6493,11 +6581,54 @@ pub(crate) fn run_stream_with(
                     turn_attempts,
                     turn_gateways,
                 );
+
+                // An accepted invitation opens its date now that her reply is
+                // stored, so `final` can carry it (spec 2026-11-12-activity-
+                // sub-session-design.md §4.6). The same transaction stores her
+                // answer, opened or not: only a failed one leaves it to the
+                // write below.
+                let mut answer_stored = false;
+                if let (
+                    Some(eros_engine_core::types::UserAction::Date {
+                        duration,
+                        place,
+                        content,
+                    }),
+                    Some(eros_engine_core::types::ActionResponse::Accept),
+                ) = (user_msg.action.as_ref(), plan.action_response)
+                {
+                    let now = chrono::Utc::now();
+                    let opened = eros_engine_store::activity::ActivityRepo { pool: &state.pool }
+                        .accept(
+                            &eros_engine_store::activity::NewActivity {
+                                session_id: user_msg.session_id,
+                                user_id: user_msg.user_id,
+                                instance_id: user_msg.instance_id,
+                                message_id: user_msg.user_message_id,
+                                duration: *duration,
+                                place,
+                                content,
+                            },
+                            now,
+                        )
+                        .await;
+                    match opened {
+                        Ok(record) => {
+                            answer_stored = true;
+                            if let (Some(r), ProtocolFrame::Final { activity, .. }) =
+                                (record, &mut final_frame)
+                            {
+                                *activity = Some(crate::routes::dto::ActivityView::from_record(&r, now));
+                            }
+                        }
+                        Err(e) => tracing::warn!("stream: date open failed: {e}"),
+                    }
+                }
                 yield final_frame;
 
                 // Stored right before post-process is spawned, with no other
                 // await between them. A failed write only loses the stored copy.
-                if let Some(response) = plan.action_response {
+                if let Some(response) = plan.action_response.filter(|_| !answer_stored) {
                     if let Err(e) = chat_repo
                         .set_action_response(
                             user_msg.user_message_id,
@@ -6571,6 +6702,8 @@ pub(crate) fn run_stream_with(
 /// chain at all (replay). Affinity eval is excluded by design: it is fail-open
 /// and runs after the response is out, so "no affinity judgment this turn" is
 /// a normal state a consumer cannot act on.
+///
+/// `activity` is `None`; the one turn that opens a date sets it on the frame.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_final_frame(
     filtered: bool,
@@ -6589,6 +6722,7 @@ pub(crate) fn build_final_frame(
         retries_filter,
         llm_attempts,
         gateway_errors,
+        activity: None,
     }
 }
 
@@ -7257,6 +7391,7 @@ mod tests {
             retries_filter: 0,
             llm_attempts: vec![],
             gateway_errors: vec![],
+            activity: None,
         };
         let v: serde_json::Value = serde_json::to_value(&f).unwrap();
         assert_eq!(v["type"], "final");
@@ -7274,6 +7409,7 @@ mod tests {
             retries_filter: 0,
             llm_attempts: vec![],
             gateway_errors: vec![],
+            activity: None,
         };
         let v2: serde_json::Value = serde_json::to_value(&f2).unwrap();
         assert!(v2["prompt_injected"].is_null());
@@ -7356,6 +7492,7 @@ mod tests {
             retries_filter: 0,
             llm_attempts: vec![],
             gateway_errors: vec![],
+            activity: None,
         };
         let v = serde_json::to_value(&f).unwrap();
         let obj = v.as_object().unwrap();
@@ -7388,6 +7525,7 @@ mod tests {
                 kind: GatewayKind::ChainExhausted,
                 message: "all 2 candidates failed".into(),
             }],
+            activity: None,
         };
         let v = serde_json::to_value(&f).unwrap();
         assert_eq!(v["llm_attempts"][0]["http_status"], 529);
@@ -19859,6 +19997,7 @@ data: [DONE]\n\n";
     fn picture_action_shows_the_picture_only_when_accepted() {
         use eros_engine_core::types::ActionResponse::{Accept, Refuse};
         use eros_engine_core::types::ActionType::{ReplyImage, ReplyText, ReplyTextImage};
+        use eros_engine_core::types::DateDuration;
         use eros_engine_core::types::UserAction::{Kiss, Photo, Strip};
         let cases = [
             (Kiss, Accept, ReplyText, true, None),
@@ -19873,6 +20012,28 @@ data: [DONE]\n\n";
             (Strip, Accept, ReplyText, false, None),
             (Strip, Refuse, ReplyTextImage, true, Some(ReplyText)),
             (Strip, Refuse, ReplyText, true, None),
+            (
+                date_of(DateDuration::Short),
+                Accept,
+                ReplyImage,
+                true,
+                Some(ReplyText),
+            ),
+            (
+                date_of(DateDuration::Short),
+                Accept,
+                ReplyTextImage,
+                true,
+                Some(ReplyText),
+            ),
+            (date_of(DateDuration::Short), Accept, ReplyText, true, None),
+            (
+                date_of(DateDuration::Mid),
+                Refuse,
+                ReplyImage,
+                true,
+                Some(ReplyText),
+            ),
         ];
         for (a, response, ty, available, want) in cases {
             let mut input = fixture_decision_input();
@@ -25477,5 +25638,1331 @@ data: [DONE]\n\n"
         assert!(tone_chat_messages(&mock).await.len() > 2);
         let meta = tone_reply_metadata(&pool, session_id).await;
         assert!(meta.get("tone").is_none(), "{meta}");
+    }
+
+    // ─── Date invitations (spec 2026-11-12-activity-sub-session-design.md §4) ───
+
+    /// A date to 「海边」 to 「看海」.
+    fn date_of(
+        duration: eros_engine_core::types::DateDuration,
+    ) -> eros_engine_core::types::UserAction {
+        eros_engine_core::types::UserAction::Date {
+            duration,
+            place: "海边".into(),
+            content: "看海".into(),
+        }
+    }
+
+    /// An invitation turn on a fresh persona (bond tier 1): the user writes
+    /// `content`, `gap_hours` after an earlier message of theirs when given,
+    /// with `events` under way; the judge answers `response` with a text
+    /// reply. Returns the frames, the mock and the invitation's id.
+    async fn run_date_turn(
+        pool: &PgPool,
+        duration: eros_engine_core::types::DateDuration,
+        content: &str,
+        gap_hours: Option<i32>,
+        events: &[EventSeed],
+        response: &str,
+    ) -> (Vec<ProtocolFrame>, wiremock::MockServer, Uuid) {
+        let verdict = serde_json::json!({
+            "action": "reply_text", "inner_state": "", "action_response": response
+        });
+        run_date_turn_with(pool, duration, content, gap_hours, events, verdict, None).await
+    }
+
+    /// [`run_date_turn`] with the judge's whole `verdict` and the request's
+    /// `image` block. A composer is configured, so the block makes pictures
+    /// available; its mock expects no call.
+    async fn run_date_turn_with(
+        pool: &PgPool,
+        duration: eros_engine_core::types::DateDuration,
+        content: &str,
+        gap_hours: Option<i32>,
+        events: &[EventSeed],
+        verdict: serde_json::Value,
+        image: Option<crate::routes::companion_stream::ImageReplyParams>,
+    ) -> (Vec<ProtocolFrame>, wiremock::MockServer, Uuid) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"composer\""))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock)
+            .await;
+        let judge_body = serde_json::json!({
+            "id": "gj", "model": "pde/judge",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": verdict.to_string()}}],
+        });
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("pde/judge"))
+            .respond_with(crate::pipeline::reasoning_call::test_support::sse_completion(judge_body))
+            .mount(&mock)
+            .await;
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"REPLY\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"deepseek/x\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_genome_id, instance_id, session_id) = seed_persona_and_session(pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide.\"\n\
+                 [tasks.chat_image_prompt_compose]\nmodel=\"composer\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        // Embeddings go to the mock too, which mounts none: recall and the
+        // memory write fail at once instead of reaching a real endpoint.
+        state.embed = std::sync::Arc::new(
+            eros_engine_llm::embedding::EmbeddingRouter::from_config_with(
+                &eros_engine_llm::model_config::ModelConfig::from_toml_str(&format!(
+                    "[providers.mockembed]\nembeddings = \"{}/v1/embeddings\"\n\
+                     [tasks.embedding]\nmodel = \"mock-embed@mockembed\"\n",
+                    mock.uri()
+                ))
+                .unwrap(),
+                |k| (k == "MOCKEMBED_API_KEY").then(|| "test-key".to_string()),
+            )
+            .unwrap(),
+        );
+        seed_events(pool, user_id, instance_id, session_id, events).await;
+        if let Some(hours) = gap_hours {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+                 VALUES ($1, 'user', '在吗', now() - make_interval(hours => $2))",
+            )
+            .bind(session_id)
+            .bind(hours)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        let action = date_of(duration);
+        let meta = serde_json::json!({"action": serde_json::to_value(&action).unwrap()});
+        let umid = match (ChatRepo { pool })
+            .upsert_user_message_idempotent(
+                session_id,
+                content,
+                "01JDATE0000000000000000000",
+                "user",
+                Some(&meta),
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: content.to_string(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                image_url: None,
+                image,
+                quote: Default::default(),
+                user_locale: Default::default(),
+                action: Some(action),
+                outfit: None,
+            },
+            None,
+        )
+        .collect()
+        .await;
+        (frames, mock, umid)
+    }
+
+    /// The `final` frame as the wire carries it.
+    fn final_json(frames: &[ProtocolFrame]) -> serde_json::Value {
+        frames
+            .iter()
+            .find(|f| matches!(f, ProtocolFrame::Final { .. }))
+            .map(|f| serde_json::to_value(f).unwrap())
+            .unwrap_or_else(|| panic!("a final frame: {frames:?}"))
+    }
+
+    async fn activities_for(pool: &PgPool, invitation: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM engine.activities WHERE message_id = $1")
+            .bind(invitation)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// The turn's affinity row `(context, effective_deltas)`, once the
+    /// spawned post-process has written it.
+    async fn turn_affinity_row(
+        pool: &PgPool,
+        umid: Uuid,
+    ) -> (serde_json::Value, serde_json::Value) {
+        for _ in 0..200 {
+            let row: Option<(serde_json::Value, Option<serde_json::Value>)> = sqlx::query_as(
+                "SELECT context, effective_deltas FROM engine.companion_affinity_events \
+                 WHERE user_message_id = $1",
+            )
+            .bind(umid)
+            .fetch_optional(pool)
+            .await
+            .unwrap();
+            if let Some((context, effective)) = row {
+                return (context, effective.unwrap_or_default());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("the turn's affinity row never landed");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_mid_date_below_bond_two_is_refused_before_the_judge(pool: PgPool) {
+        let (frames, mock, umid) = run_date_turn(
+            &pool,
+            eros_engine_core::types::DateDuration::Mid,
+            "",
+            None,
+            &[],
+            "accept",
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "refuse");
+        let reqs = mock.received_requests().await.unwrap();
+        assert!(
+            judge_request(&reqs).contains(
+                "[用户动作] 对方邀请你去约会：地点「海边」，安排「看海」，大约 4 小时，这次你不会答应\\n"
+            ),
+            "{}",
+            judge_request(&reqs)
+        );
+        assert_eq!(activities_for(&pool, umid).await, 0);
+        let (context, _) = turn_affinity_row(&pool, umid).await;
+        assert!(context.get("tier_drop").is_none(), "{context}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_short_date_is_up_to_the_judge(pool: PgPool) {
+        let short = eros_engine_core::types::DateDuration::Short;
+        let (frames, mock, umid) = run_date_turn(&pool, short, "", None, &[], "refuse").await;
+        assert_eq!(action_response_of(&frames), "refuse");
+        let judge = judge_request(&mock.received_requests().await.unwrap());
+        assert!(
+            judge.contains(
+                "[用户动作] 对方邀请你去约会：地点「海边」，安排「看海」，大约 1 小时\\n"
+            ),
+            "{judge}"
+        );
+        assert_eq!(activities_for(&pool, umid).await, 0);
+
+        let (frames, mock, _) = run_date_turn(&pool, short, "", None, &[], "accept").await;
+        assert_eq!(action_response_of(&frames), "accept");
+        let judge = judge_request(&mock.received_requests().await.unwrap());
+        assert!(!judge.contains("这次你不会答应"), "{judge}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_date_while_she_is_offline_is_refused(pool: PgPool) {
+        let (frames, mock, umid) = run_date_turn(
+            &pool,
+            eros_engine_core::types::DateDuration::Short,
+            "",
+            None,
+            &[ev("asleep", 5, 55)],
+            "accept",
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "refuse");
+        let judge = judge_request(&mock.received_requests().await.unwrap());
+        assert!(judge.contains("大约 1 小时，这次你不会答应"), "{judge}");
+        assert_eq!(activities_for(&pool, umid).await, 0);
+    }
+
+    /// An invitation that reaches the judge while another date of hers runs
+    /// (queued, or sent while the one that opened it was generating) is
+    /// turned down before the judge, and judged as any refused one.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_date_while_another_date_runs_is_refused(pool: PgPool) {
+        let (frames, mock, umid) = run_date_turn(
+            &pool,
+            eros_engine_core::types::DateDuration::Short,
+            "",
+            None,
+            &[ev("on_a_date", 5, 55)],
+            "accept",
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "refuse");
+        let judge = judge_request(&mock.received_requests().await.unwrap());
+        assert!(judge.contains("大约 1 小时，这次你不会答应"), "{judge}");
+        assert!(final_json(&frames).get("activity").is_none());
+        let total: i64 = sqlx::query_scalar("SELECT count(*) FROM engine.activities")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(total, 0);
+        let (context, _) = turn_affinity_row(&pool, umid).await;
+        assert!(context.get("eval_skip_reason").is_none(), "{context}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_accepted_date_opens_the_activity_on_the_final_frame(pool: PgPool) {
+        let (frames, _, umid) = run_date_turn(
+            &pool,
+            eros_engine_core::types::DateDuration::Short,
+            "",
+            None,
+            &[],
+            "accept",
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        let (id, sub_session_id): (Uuid, Uuid) = sqlx::query_as(
+            "SELECT id, sub_session_id FROM engine.activities WHERE message_id = $1",
+        )
+        .bind(umid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let total: i64 = sqlx::query_scalar("SELECT count(*) FROM engine.activities")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(total, 1);
+
+        let activity = final_json(&frames)["activity"].clone();
+        assert_eq!(activity["id"], id.to_string(), "{activity}");
+        assert_eq!(activity["sub_session_id"], sub_session_id.to_string());
+        assert_eq!(activity["status"], "ongoing");
+        assert_eq!(activity["duration"], "short");
+        assert_eq!(activity["place"], "海边");
+        assert_eq!(activity["content"], "看海");
+        let at = |k: &str| -> chrono::DateTime<chrono::Utc> {
+            serde_json::from_value(activity[k].clone()).unwrap()
+        };
+        assert_eq!(at("ends_at") - at("started_at"), chrono::Duration::hours(1));
+
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT metadata->'action'->>'response' FROM engine.chat_messages WHERE id = $1",
+        )
+        .bind(umid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored.as_deref(), Some("accept"));
+    }
+
+    /// A 40-character message after a 30-hour gap would earn both rule
+    /// nudges on an ordinary turn.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_accepted_invitation_is_not_scored(pool: PgPool) {
+        let text =
+            "今天天气真好，我们一起去海边走走吧，看看日落，吹吹海风，聊聊最近发生的事情好不好呀";
+        assert!(text.chars().count() >= 40);
+        let (frames, _, umid) = run_date_turn(
+            &pool,
+            eros_engine_core::types::DateDuration::Short,
+            text,
+            Some(30),
+            &[],
+            "accept",
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        let (context, effective) = turn_affinity_row(&pool, umid).await;
+        assert_eq!(context["eval_skip_reason"], "activity", "{context}");
+        let axes = effective.as_object().expect("effective deltas");
+        assert!(!axes.is_empty(), "{effective}");
+        assert!(
+            axes.values().all(|v| v.as_f64() == Some(0.0)),
+            "{effective}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_refused_invitation_is_an_ordinary_judged_turn(pool: PgPool) {
+        let (frames, _, umid) = run_date_turn(
+            &pool,
+            eros_engine_core::types::DateDuration::Short,
+            "",
+            None,
+            &[],
+            "refuse",
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "refuse");
+        assert!(final_json(&frames).get("activity").is_none());
+        let (context, _) = turn_affinity_row(&pool, umid).await;
+        assert!(context.get("eval_skip_reason").is_none(), "{context}");
+        assert!(context.get("tier_drop").is_none(), "{context}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn no_activity_on_ordinary_final_frames(pool: PgPool) {
+        let (frames, _, _) = run_action_turn(
+            &pool,
+            serde_json::json!({"action": "reply_text", "inner_state": "", "action_response": "accept"}),
+            200,
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        let fin = final_json(&frames);
+        assert!(fin.get("activity").is_none(), "{fin}");
+    }
+
+    /// A date turn answered in words only: a text reply, no picture frame,
+    /// no composer call.
+    async fn assert_text_only(frames: &[ProtocolFrame], mock: &wiremock::MockServer) {
+        assert_eq!(
+            meta_action_type(frames),
+            FrameActionType::Reply,
+            "{frames:?}"
+        );
+        let types = frame_type_names(frames);
+        assert!(!types.iter().any(|t| t == "image_request"), "{types:?}");
+        assert!(
+            frames.iter().any(
+                |f| matches!(f, ProtocolFrame::Delta { content, .. } if content.contains("REPLY"))
+            ),
+            "{frames:?}"
+        );
+        mock.verify().await;
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_picture_the_judge_picks_for_an_accepted_date_is_text(pool: PgPool) {
+        let (frames, mock, _) = run_date_turn_with(
+            &pool,
+            eros_engine_core::types::DateDuration::Short,
+            "",
+            None,
+            &[],
+            serde_json::json!({"action": "reply_image", "inner_state": "", "action_response": "accept"}),
+            Some(Default::default()),
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        assert_text_only(&frames, &mock).await;
+        assert_eq!(final_json(&frames)["activity"]["status"], "ongoing");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_forced_image_on_an_accepted_date_is_ignored(pool: PgPool) {
+        let (frames, mock, _) = run_date_turn_with(
+            &pool,
+            eros_engine_core::types::DateDuration::Short,
+            "",
+            None,
+            &[],
+            serde_json::json!({"action": "reply_text", "inner_state": "", "action_response": "accept"}),
+            Some(crate::routes::companion_stream::ImageReplyParams {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        assert_text_only(&frames, &mock).await;
+        assert_eq!(final_json(&frames)["activity"]["status"], "ongoing");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_forced_image_on_a_refused_date_is_ignored(pool: PgPool) {
+        let (frames, mock, umid) = run_date_turn_with(
+            &pool,
+            eros_engine_core::types::DateDuration::Short,
+            "",
+            None,
+            &[],
+            serde_json::json!({"action": "reply_text", "inner_state": "", "action_response": "refuse"}),
+            Some(crate::routes::companion_stream::ImageReplyParams {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "refuse");
+        assert_text_only(&frames, &mock).await;
+        assert!(final_json(&frames).get("activity").is_none());
+        assert_eq!(activities_for(&pool, umid).await, 0);
+    }
+
+    // ─── Date turns (spec 2026-11-12-activity-sub-session-design.md §5) ───
+
+    const INVITATION: &str = "去海边走走吧";
+    const HER_YES: &str = "好呀，我们走吧。我正好想看看日落。";
+    /// What the reply's history keeps of `HER_YES`: an assistant row's
+    /// leading sentence is stripped there.
+    const HER_YES_KEPT: &str = "我正好想看看日落";
+
+    /// A date to 「海边」 to 「看海」 under way: the parent's invitation ten
+    /// minutes ago and her accepting reply nine minutes ago opened it, so it
+    /// runs another 51 minutes. The parent has an affinity row. On `mock`,
+    /// the judge answers `verdict`, the companion streams `REPLY` and
+    /// embeddings succeed; `tasks` adds config sections.
+    struct DateScene {
+        pool: PgPool,
+        state: AppState,
+        mock: wiremock::MockServer,
+        user_id: Uuid,
+        instance_id: Uuid,
+        parent: Uuid,
+        activity: eros_engine_store::activity::ActivityRecord,
+    }
+
+    fn reply_text_verdict() -> serde_json::Value {
+        serde_json::json!({"action": "reply_text", "inner_state": ""})
+    }
+
+    async fn date_scene(pool: &PgPool, verdict: serde_json::Value, tasks: &str) -> DateScene {
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let judge_body = serde_json::json!({
+            "id": "gj", "model": "pde/judge",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": verdict.to_string()}}],
+        });
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("pde/judge"))
+            .respond_with(crate::pipeline::reasoning_call::test_support::sse_completion(judge_body))
+            .mount(&mock)
+            .await;
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"REPLY\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"deepseek/x\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .and(body_string_contains("\"stream\":true"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(chat_body, "text/event-stream"))
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"embedding": vec![0.1_f32; 512]}]
+            })))
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_genome_id, instance_id, parent) = seed_persona_and_session(pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(&format!(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide.\"\n{tasks}"
+            ))
+            .unwrap(),
+        );
+        state.openrouter = Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        state.embed = Arc::new(
+            eros_engine_llm::embedding::EmbeddingRouter::from_config_with(
+                &eros_engine_llm::model_config::ModelConfig::from_toml_str(&format!(
+                    "[providers.mockembed]\nembeddings = \"{}/v1/embeddings\"\n\
+                     [tasks.embedding]\nmodel = \"mock-embed@mockembed\"\n",
+                    mock.uri()
+                ))
+                .unwrap(),
+                |k| (k == "MOCKEMBED_API_KEY").then(|| "test-key".to_string()),
+            )
+            .unwrap(),
+        );
+
+        AffinityRepo { pool }
+            .load_or_create(parent, user_id, instance_id)
+            .await
+            .unwrap();
+        let invitation: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata, sent_at) \
+             VALUES ($1, 'user', $2, $3, now() - interval '10 minutes') RETURNING id",
+        )
+        .bind(parent)
+        .bind(INVITATION)
+        .bind(serde_json::json!({"action": {
+            "type": "date", "duration": "short", "place": "海边", "content": "看海"
+        }}))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, user_message_id, sent_at) \
+             VALUES ($1, 'assistant', $2, $3, now() - interval '9 minutes')",
+        )
+        .bind(parent)
+        .bind(HER_YES)
+        .bind(invitation)
+        .execute(pool)
+        .await
+        .unwrap();
+        let activity = eros_engine_store::activity::ActivityRepo { pool }
+            .accept(
+                &eros_engine_store::activity::NewActivity {
+                    session_id: parent,
+                    user_id,
+                    instance_id,
+                    message_id: invitation,
+                    duration: eros_engine_core::types::DateDuration::Short,
+                    place: "海边",
+                    content: "看海",
+                },
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap()
+            .expect("the date opened");
+        DateScene {
+            pool: pool.clone(),
+            state,
+            mock,
+            user_id,
+            instance_id,
+            parent,
+            activity,
+        }
+    }
+
+    impl DateScene {
+        fn sub(&self) -> Uuid {
+            self.activity.sub_session_id
+        }
+
+        /// Send `body` to the date's sub-session on the stream route under
+        /// client message id `n`: the frames, and the user row.
+        async fn send(&self, n: u32, body: serde_json::Value) -> (Vec<serde_json::Value>, Uuid) {
+            self.send_to(self.sub(), n, body).await
+        }
+
+        /// [`Self::send`] to `session`.
+        async fn send_to(
+            &self,
+            session: Uuid,
+            n: u32,
+            mut body: serde_json::Value,
+        ) -> (Vec<serde_json::Value>, Uuid) {
+            use axum::body::Body;
+            use axum::http::{header, Request, StatusCode};
+            use tower::Service as _;
+
+            let client_msg_id = format!("01JT{n:022}");
+            body["client_msg_id"] = serde_json::json!(client_msg_id);
+            let token = crate::routes::companion::testutil::mint_test_jwt(self.user_id);
+            let mut app = crate::routes::companion::testutil::build_router(self.state.clone());
+            let resp = app
+                .call(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/comp/chat/{session}/message/stream"))
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let frames = crate::routes::companion::testutil::read_sse(resp).await;
+            let umid: Uuid = sqlx::query_scalar(
+                "SELECT id FROM engine.chat_messages \
+                  WHERE session_id = $1 AND client_msg_id = $2 AND role = 'user'",
+            )
+            .bind(session)
+            .bind(&client_msg_id)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap();
+            (frames, umid)
+        }
+
+        /// `n` earlier user rows of the date, the newest a second old.
+        async fn earlier_rows(&self, n: i32) {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+                 SELECT $1, 'user', '嗯' || i, now() - make_interval(secs => ($2 - i + 1)::float8) \
+                   FROM generate_series(1, $2) i",
+            )
+            .bind(self.sub())
+            .bind(n)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        }
+
+        /// The parent's bond and chemistry lines at these scores.
+        async fn set_lines(&self, bond: f64, chem: f64) {
+            sqlx::query(
+                "UPDATE engine.companion_affinity \
+                    SET trust = $2, intrigue = $2, intimacy = $3, tension = $3, updated_at = now() \
+                  WHERE session_id = $1",
+            )
+            .bind(self.parent)
+            .bind(bond)
+            .bind(chem)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        }
+
+        /// The affinity event of the turn whose user row is `umid`, once
+        /// post-process wrote it: the session its affinity row belongs to,
+        /// its type, `context` and `effective_deltas`.
+        async fn turn_event(
+            &self,
+            umid: Uuid,
+        ) -> (Uuid, String, serde_json::Value, serde_json::Value) {
+            for _ in 0..200 {
+                let row: Option<(Uuid, String, serde_json::Value, Option<serde_json::Value>)> =
+                    sqlx::query_as(
+                        "SELECT a.session_id, e.event_type, e.context, e.effective_deltas \
+                           FROM engine.companion_affinity_events e \
+                           JOIN engine.companion_affinity a ON a.id = e.affinity_id \
+                          WHERE e.user_message_id = $1",
+                    )
+                    .bind(umid)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .unwrap();
+                if let Some((session, kind, context, effective)) = row {
+                    return (session, kind, context, effective.unwrap_or_default());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            panic!("the turn's affinity event never landed");
+        }
+
+        /// Affinity rows of the date's own session.
+        async fn sub_affinity_rows(&self) -> i64 {
+            sqlx::query_scalar(
+                "SELECT count(*) FROM engine.companion_affinity WHERE session_id = $1",
+            )
+            .bind(self.sub())
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+        }
+
+        /// The date runs out now.
+        async fn end(&self) {
+            sqlx::query("UPDATE engine.persona_events SET ends_at = now() WHERE id = $1")
+                .bind(self.activity.event_id)
+                .execute(&self.pool)
+                .await
+                .unwrap();
+        }
+
+        /// A main-chat text turn through the whole affinity pass, judged by
+        /// whatever `[tasks.affinity_evaluation]` answers.
+        async fn judged_main_chat_turn(&self) {
+            let umid: Uuid = sqlx::query_scalar(
+                "INSERT INTO engine.chat_messages (session_id, role, content) \
+                 VALUES ($1, 'user', '今天过得怎么样呀') RETURNING id",
+            )
+            .bind(self.parent)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap();
+            let persona = PersonaRepo { pool: &self.pool }
+                .load_companion(self.instance_id)
+                .await
+                .unwrap()
+                .expect("the persona");
+            crate::pipeline::post_process::run_affinity_turn(
+                &self.state,
+                self.parent,
+                self.user_id,
+                self.instance_id,
+                &persona,
+                ActionType::ReplyText,
+                "今天过得怎么样呀",
+                "嗯，我在听。",
+                Default::default(),
+                eros_engine_core::scope::AffinityScope::full(),
+                Some(umid),
+                None,
+                false,
+                None,
+                None,
+                false,
+            )
+            .await;
+        }
+
+        /// (kind, status) of every life choice of the parent or the date.
+        async fn life_choices(&self) -> Vec<(String, String)> {
+            sqlx::query_as(
+                "SELECT kind, status FROM engine.life_choices \
+                  WHERE session_id = ANY($1) ORDER BY asked_at",
+            )
+            .bind(vec![self.parent, self.sub()])
+            .fetch_all(&self.pool)
+            .await
+            .unwrap()
+        }
+    }
+
+    /// Every streamed companion request, oldest first.
+    async fn companion_requests(mock: &wiremock::MockServer) -> Vec<serde_json::Value> {
+        mock.received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .filter(|b| b.contains("deepseek/x") && b.contains("\"stream\":true"))
+            .map(|b| serde_json::from_str(&b).unwrap())
+            .collect()
+    }
+
+    /// A companion request's system prompt.
+    fn system_prompt_of(req: &serde_json::Value) -> String {
+        req["messages"][0]["content"].as_str().unwrap().to_string()
+    }
+
+    /// A companion request's history and user line, in order.
+    fn turn_texts(req: &serde_json::Value) -> Vec<String> {
+        req["messages"].as_array().unwrap()[1..]
+            .iter()
+            .map(|m| m["content"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// What post-process writes after a turn's affinity event lands in a
+    /// skipped turn is nothing; this is long enough for a write that would.
+    async fn post_process_settles() {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    /// What the reply, the judge and the turn's row see of the relationship
+    /// is the parent's: its lingering effects and its last reason going in,
+    /// its affinity row coming out.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_date_turn_keeps_the_parent_state(pool: PgPool) {
+        let s = date_scene(&pool, reply_text_verdict(), "").await;
+        // Before the date, in the main chat: coffee she took, and the reason
+        // of its last judged turn.
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata, sent_at) \
+             VALUES ($1, 'user', '', $2, now() - interval '11 minutes')",
+        )
+        .bind(s.parent)
+        .bind(accepted_give("coffee", 5, None))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.companion_affinity_events \
+               (affinity_id, event_type, deltas, context, created_at) \
+             SELECT id, 'message', '{}'::jsonb, $2, now() - interval '9 minutes' \
+               FROM engine.companion_affinity WHERE session_id = $1",
+        )
+        .bind(s.parent)
+        .bind(serde_json::json!({"affinity_reason": "对方记得我说过的话，心里一暖"}))
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Long enough to earn the long-message nudge on an ordinary turn.
+        let text =
+            "今天天气真好，我们一起去海边走走吧，看看日落，吹吹海风，聊聊最近发生的事情好不好呀";
+        assert!(text.chars().count() >= 40);
+
+        let (frames, umid) = s.send(1, serde_json::json!({"content": text})).await;
+
+        let body = frames
+            .iter()
+            .find(|f| f["type"] == "body_state")
+            .unwrap_or_else(|| panic!("a body_state frame: {frames:?}"));
+        assert_eq!(body["effects"][0]["item"], "coffee", "{body}");
+        let system = system_prompt_of(&companion_requests(&s.mock).await[0]);
+        assert!(system.contains("对方记得我说过的话，心里一暖"), "{system}");
+
+        let (session, kind, context, effective) = s.turn_event(umid).await;
+        assert_eq!(session, s.parent);
+        assert_eq!(kind, "message");
+        assert_eq!(context["eval_skip_reason"], "activity", "{context}");
+        let axes = effective.as_object().expect("effective deltas");
+        assert!(!axes.is_empty(), "{effective}");
+        assert!(
+            axes.values().all(|v| v.as_f64() == Some(0.0)),
+            "{effective}"
+        );
+        assert_eq!(s.sub_affinity_rows().await, 0);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_date_turn_is_never_ghosted(pool: PgPool) {
+        let s = date_scene(
+            &pool,
+            serde_json::json!({"action": "ghost", "inner_state": ""}),
+            "",
+        )
+        .await;
+        // Enough of the date said for the ghost guard to let a silence through.
+        s.earlier_rows(10).await;
+
+        let (frames, umid) = s.send(1, serde_json::json!({"content": "在吗"})).await;
+
+        let meta = frames
+            .iter()
+            .find(|f| f["type"] == "meta")
+            .unwrap_or_else(|| panic!("a meta frame: {frames:?}"));
+        assert_eq!(meta["action_type"], "reply", "{frames:?}");
+        assert!(
+            frames
+                .iter()
+                .any(|f| f["type"] == "delta" && f["content"] == "REPLY"),
+            "{frames:?}"
+        );
+        let replies: Vec<String> = sqlx::query_scalar(
+            "SELECT content FROM engine.chat_messages \
+              WHERE user_message_id = $1 AND role = 'assistant'",
+        )
+        .bind(umid)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(replies, vec!["REPLY".to_string()]);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_date_turn_writes_no_memory_and_no_dreaming_count(pool: PgPool) {
+        use eros_engine_store::scan_state::ScanStateRepo;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let mut s = date_scene(
+            &pool,
+            reply_text_verdict(),
+            "[tasks.dreaming_scan]\nmodel = \"scan/m\"\nfilter_prompt = \"extract\"\n",
+        )
+        .await;
+        s.state.config.dreaming_tick = std::time::Duration::from_secs(300);
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("scan/m"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .named("dreaming_scan")
+            .mount(&s.mock)
+            .await;
+        // One turn short of the relationship's in-place scan.
+        let scan = ScanStateRepo { pool: &pool };
+        scan.bump(
+            s.instance_id,
+            chrono::Utc::now() - chrono::Duration::minutes(30),
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE engine.relationship_scan_state SET pending_turns = 19 WHERE instance_id = $1",
+        )
+        .bind(s.instance_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (_, umid) = s
+            .send(1, serde_json::json!({"content": "我最喜欢的颜色是蓝色"}))
+            .await;
+        s.turn_event(umid).await;
+        post_process_settles().await;
+
+        let memories: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM engine.companion_memories WHERE user_id = $1")
+                .bind(s.user_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(memories, 0);
+        let state = scan.load(s.instance_id).await.unwrap().expect("scan state");
+        assert_eq!(state.pending_turns, 19);
+        s.mock.verify().await;
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_date_turn_reads_the_scene(pool: PgPool) {
+        let s = date_scene(&pool, reply_text_verdict(), "").await;
+        // A mid date: with an hour or more left, its end reads 「约 …」.
+        sqlx::query("UPDATE engine.activities SET duration = 'mid' WHERE id = $1")
+            .bind(s.activity.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE engine.persona_events SET ends_at = started_at + interval '4 hours' \
+              WHERE id = $1",
+        )
+        .bind(s.activity.event_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        s.send(1, serde_json::json!({"content": "到了！"})).await;
+
+        let system = system_prompt_of(&companion_requests(&s.mock).await[0]);
+        assert!(system.contains("- 正在经历：和对方约会（约"), "{system}");
+        assert!(
+            system.contains("- 约会：地点「海边」；安排「看海」"),
+            "{system}"
+        );
+    }
+
+    /// A turn sent while the date ran but driven once it is over (a queued
+    /// turn revived late) is not told the date's scene as under way.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_date_turn_driven_after_the_end_has_no_date_line(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+
+        let s = date_scene(&pool, reply_text_verdict(), "").await;
+        let umid = match (ChatRepo { pool: &pool })
+            .upsert_user_message_idempotent(
+                s.sub(),
+                "还在吗",
+                "01JLATE0000000000000000000",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+        s.end().await;
+
+        let _: Vec<ProtocolFrame> = run_stream(
+            Arc::new(s.state.clone()),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id: s.sub(),
+                user_id: s.user_id,
+                instance_id: s.instance_id,
+                content: "还在吗".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                image_url: None,
+                image: None,
+                quote: Default::default(),
+                user_locale: Default::default(),
+                action: None,
+                outfit: None,
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        let system = system_prompt_of(&companion_requests(&s.mock).await[0]);
+        assert!(!system.contains("- 约会："), "{system}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_first_date_turn_sees_the_invitation(pool: PgPool) {
+        let s = date_scene(&pool, reply_text_verdict(), "").await;
+
+        s.send(1, serde_json::json!({"content": "我们到了"})).await;
+        let texts = turn_texts(&companion_requests(&s.mock).await[0]);
+        let at = |needle: &str| {
+            texts
+                .iter()
+                .position(|t| t.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} in {texts:?}"))
+        };
+        assert!(at(INVITATION) < at(HER_YES_KEPT), "{texts:?}");
+        assert!(at(HER_YES_KEPT) < at("我们到了"), "{texts:?}");
+
+        // A window the date fills on its own reads nothing of the parent.
+        s.earlier_rows(20).await;
+        s.send(2, serde_json::json!({"content": "回去吧"})).await;
+        let reqs = companion_requests(&s.mock).await;
+        let texts = turn_texts(reqs.last().unwrap());
+        assert!(texts.iter().any(|t| t.contains("回去吧")), "{texts:?}");
+        assert!(
+            !texts
+                .iter()
+                .any(|t| t.contains(INVITATION) || t.contains(HER_YES_KEPT)),
+            "{texts:?}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_refused_give_on_a_date_drops_the_parent_tier(pool: PgPool) {
+        let s = date_scene(
+            &pool,
+            serde_json::json!({"action": "reply_text", "inner_state": "", "action_response": "refuse"}),
+            "",
+        )
+        .await;
+        s.set_lines(0.5, 0.0).await; // bond tier 3
+
+        let (frames, umid) = s
+            .send(
+                1,
+                serde_json::json!({
+                    "content": "",
+                    "action": {"type": "give", "item": "coffee", "quantity": 1},
+                }),
+            )
+            .await;
+        assert!(
+            frames
+                .iter()
+                .any(|f| f["type"] == "action_response" && f["response"] == "refuse"),
+            "{frames:?}"
+        );
+
+        let (session, _, context, _) = s.turn_event(umid).await;
+        assert_eq!(session, s.parent);
+        assert_eq!(context["tier_drop"], "bond", "{context}");
+        let bond_tier: i16 = sqlx::query_scalar(
+            "SELECT bond_tier FROM engine.companion_affinity WHERE session_id = $1",
+        )
+        .bind(s.parent)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(bond_tier, 2);
+        assert_eq!(s.sub_affinity_rows().await, 0);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_give_on_a_date_lingers_back_in_the_main_chat(pool: PgPool) {
+        use crate::routes::companion::testutil::{build_router, mint_test_jwt, send_request};
+        use axum::body::Body;
+        use axum::http::{header, Request, StatusCode};
+
+        let s = date_scene(
+            &pool,
+            serde_json::json!({"action": "reply_text", "inner_state": "", "action_response": "accept"}),
+            "",
+        )
+        .await;
+        let (frames, _) = s
+            .send(
+                1,
+                serde_json::json!({
+                    "content": "",
+                    "action": {"type": "give", "item": "coffee", "quantity": 3},
+                }),
+            )
+            .await;
+        assert!(
+            frames
+                .iter()
+                .any(|f| f["type"] == "action_response" && f["response"] == "accept"),
+            "{frames:?}"
+        );
+        s.end().await;
+
+        let mut app = build_router(s.state.clone());
+        let (status, resp) = send_request(
+            &mut app,
+            Request::builder()
+                .uri(format!("/v2/comp/session/{}/effects", s.parent))
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", mint_test_jwt(s.user_id)),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+        assert_eq!(resp["effects"][0]["item"], "coffee", "{resp}");
+    }
+
+    /// Lines at 0.5 (tiers 3/3) and two warm judged turns in the main chat:
+    /// on a compatible pair, a third warm judged turn asks her to sleep
+    /// together. A date turn is not judged, so it asks nothing, and leaves
+    /// the streak for the main chat after the date.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn no_life_choice_is_asked_on_a_date(pool: PgPool) {
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let s = date_scene(
+            &pool,
+            reply_text_verdict(),
+            "[tasks.affinity_evaluation]\nmodel = \"aff/judge\"\n",
+        )
+        .await;
+        s.set_lines(0.5, 0.5).await;
+        let warm = r#"{"warmth":3,"trust":{"grade":0,"direction":"up"},"intimacy":{"grade":0,"direction":"up"},"intrigue":{"grade":0,"direction":"up"},"tension":{"grade":0,"direction":"up"},"patience":3,"reason":"很好"}"#;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("aff/judge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen-aff", "model": "aff/judge",
+                "choices": [{"message": {"content": warm}}],
+            })))
+            .mount(&s.mock)
+            .await;
+        // Her ask, a call that is not streamed.
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen-ask", "model": "deepseek/x",
+                "choices": [{"message": {"content": "今晚留下来陪我，好不好？"}}],
+            })))
+            .mount(&s.mock)
+            .await;
+        s.judged_main_chat_turn().await;
+        s.judged_main_chat_turn().await;
+        assert!(
+            s.life_choices().await.is_empty(),
+            "two warm turns are not three"
+        );
+
+        let (_, umid) = s
+            .send(
+                1,
+                serde_json::json!({"content": "今天好开心", "affinity_scope": "full"}),
+            )
+            .await;
+        let (_, _, context, _) = s.turn_event(umid).await;
+        assert_eq!(context["eval_skip_reason"], "activity", "{context}");
+        post_process_settles().await;
+        assert!(s.life_choices().await.is_empty());
+
+        s.end().await;
+        s.judged_main_chat_turn().await;
+        assert_eq!(
+            s.life_choices().await,
+            vec![("sleep_together".to_string(), "pending".to_string())]
+        );
+    }
+
+    /// A judged main-chat turn that lands while the date runs (one sent
+    /// before it opened) puts no choice to the user: she is out with them.
+    /// The same streak asks once the date is over (no scopes recorded, so not
+    /// a romantic choice: going away together).
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn no_life_choice_is_asked_while_a_date_runs(pool: PgPool) {
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let s = date_scene(
+            &pool,
+            reply_text_verdict(),
+            "[tasks.affinity_evaluation]\nmodel = \"aff/judge\"\n",
+        )
+        .await;
+        s.set_lines(0.5, 0.5).await;
+        let warm = r#"{"warmth":3,"trust":{"grade":0,"direction":"up"},"intimacy":{"grade":0,"direction":"up"},"intrigue":{"grade":0,"direction":"up"},"tension":{"grade":0,"direction":"up"},"patience":3,"reason":"很好"}"#;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("aff/judge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen-aff", "model": "aff/judge",
+                "choices": [{"message": {"content": warm}}],
+            })))
+            .mount(&s.mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen-ask", "model": "deepseek/x",
+                "choices": [{"message": {"content": "今晚留下来陪我，好不好？"}}],
+            })))
+            .mount(&s.mock)
+            .await;
+
+        for _ in 0..3 {
+            s.judged_main_chat_turn().await;
+        }
+        assert!(
+            s.life_choices().await.is_empty(),
+            "{:?}",
+            s.life_choices().await
+        );
+
+        s.end().await;
+        s.judged_main_chat_turn().await;
+        assert_eq!(
+            s.life_choices().await,
+            vec![("travel_together".to_string(), "pending".to_string())]
+        );
+    }
+
+    /// Back in the main chat (spec §8): from the date's end until her first
+    /// line after it, the reply hears that they just got back and the judge
+    /// when the date ended.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_main_chat_hears_they_are_back(pool: PgPool) {
+        let s = date_scene(&pool, reply_text_verdict(), "").await;
+        s.end().await;
+
+        // The send settles the date before its turn runs.
+        s.send_to(s.parent, 1, serde_json::json!({"content": "回来啦"}))
+            .await;
+        let settled: bool = sqlx::query_scalar(
+            "SELECT settled_at IS NOT NULL FROM engine.activities WHERE id = $1",
+        )
+        .bind(s.activity.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(settled);
+        s.send_to(s.parent, 2, serde_json::json!({"content": "今天开心吗"}))
+            .await;
+
+        let systems: Vec<String> = companion_requests(&s.mock)
+            .await
+            .iter()
+            .map(system_prompt_of)
+            .collect();
+        assert_eq!(systems.len(), 2);
+        assert!(
+            systems[0].contains("- 刚才：你们刚约会回来（海边，看海）"),
+            "{}",
+            systems[0]
+        );
+        assert!(!systems[1].contains("约会回来"), "{}", systems[1]);
+
+        let judges: Vec<String> = s
+            .mock
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .filter(|b| b.contains("pde/judge"))
+            .collect();
+        assert_eq!(judges.len(), 2);
+        assert!(
+            judges[0].contains("[近期事件] 和对方约会（不到 1 小时前结束）\\n"),
+            "{}",
+            judges[0]
+        );
+        assert!(!judges[1].contains("和对方约会（"), "{}", judges[1]);
     }
 }

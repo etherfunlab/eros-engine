@@ -4,7 +4,7 @@
 use chrono::NaiveDate;
 use chrono_tz::Tz;
 use eros_engine_store::episode::{one_line, ScanRow};
-use eros_engine_store::journal::JournalInsert;
+use eros_engine_store::journal::{JournalInsert, JOURNAL_SUMMARY_MAX_CHARS};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -17,11 +17,10 @@ pub(crate) const ARC_MAX_CHARS: usize = 900;
 pub(crate) const ARC_SHRINK_FLOOR: f64 = 0.7;
 /// Shrink is only judged against a previous arc longer than this.
 pub(crate) const ARC_SHRINK_MIN_PREVIOUS: usize = 300;
-pub(crate) const JOURNAL_SUMMARY_MAX_CHARS: usize = 200;
 
 /// The journal kinds the model may write. `first_meet` and `tier_reached` are
 /// the engine's own.
-const LLM_KINDS: [&str; 8] = [
+pub(crate) const LLM_KINDS: [&str; 8] = [
     "confession",
     "first_intimacy",
     "conflict",

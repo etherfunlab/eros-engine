@@ -44,6 +44,7 @@ use eros_engine_core::types::{
     ActionPlan, ActionType, DecisionInput, Event, ImageRef, PromptTrait, QuotedMessage, ReplyStyle,
 };
 use eros_engine_llm::model_config::StyleKey;
+use eros_engine_store::activity::ActivityStatus;
 use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::{AssistantInsert, ChatRepo};
 use eros_engine_store::image_events::ImageComposeEventInsert;
@@ -344,14 +345,17 @@ fn edit_turn_plan(action: ActionType) -> ActionPlan {
 /// the image row lands, so this is the only way it sees either side of the
 /// revision. `tier` and `prompt_traits` reach the prompt builder the way a
 /// chat request's do: the tier picks the companion model and gates the
-/// traits. Fail-open everywhere: any failure (affinity load, request build,
-/// LLM error, blank reply) returns a text-less outcome and the turn degrades
-/// to `reply_image` — the picture is the turn's substance.
+/// traits. `relationship` is where the affinity lives: the parent of a
+/// date's session, else `session_id` itself. Fail-open everywhere: any
+/// failure (affinity load, request build, LLM error, blank reply) returns a
+/// text-less outcome and the turn degrades to `reply_image` — the picture is
+/// the turn's substance.
 #[allow(clippy::too_many_arguments)]
 async fn generate_reply_text(
     state: &AppState,
     persona: &CompanionPersona,
     session_id: Uuid,
+    relationship: Uuid,
     user_id: Uuid,
     instance_id: Uuid,
     instruction_row_id: Uuid,
@@ -365,7 +369,7 @@ async fn generate_reply_text(
     // Decayed in memory as the chat turn does, so the prompt (recall gate
     // included) reads the same tiers a text turn would.
     let affinity = match (AffinityRepo { pool: &state.pool })
-        .load_or_create(session_id, user_id, instance_id)
+        .load_or_create(relationship, user_id, instance_id)
         .await
     {
         Ok(mut a) => {
@@ -625,7 +629,7 @@ mod payload_tests {
         (status = 401, description = "missing or invalid bearer"),
         (status = 403, description = "not your session; or `byoc_forbidden` (the caller secret is missing or wrong) / `byoc_card_rejected` (the card does not open under the instance's key)"),
         (status = 404, description = "session or message not found"),
-        (status = 409, description = "the message is not an image turn"),
+        (status = 409, description = "the message is not an image turn; or `activity_ended` (the session is a date that has ended)"),
         (status = 422, description = "blank instruction or unsupported aspect_ratio"),
         (status = 429, description = "per-user in-flight cap reached"),
         (status = 501, description = "no image composer configured on this deployment"),
@@ -702,6 +706,21 @@ async fn edit_image(
         .await?
         .ok_or_else(|| AppError::NotFound("no such instance".into()))?
         .into_persona(req.character.as_deref())?;
+    // A picture from a date: the relationship's state is the parent's (spec
+    // 2026-11-12-activity-sub-session-design.md §5.1), and its turns are not
+    // judged one by one. Messages stay in `session_id`.
+    let turn = crate::pipeline::activity::turn_session(&state.pool, session_id).await?;
+    // A date's own session takes no more turns once its clock is out, an edit
+    // included: it answers as a send does, before anything is written.
+    if session.channel == "activity"
+        && !turn
+            .activity
+            .as_ref()
+            .is_some_and(|a| a.status_at(chrono::Utc::now()) == ActivityStatus::Ongoing)
+    {
+        return Err(crate::pipeline::activity::ended());
+    }
+    let (relationship, on_date) = (turn.relationship, turn.activity.is_some());
 
     // Same per-user in-flight pool as chat, voice and the compose endpoint:
     // this is one more user-triggered LLM call.
@@ -871,6 +890,7 @@ async fn edit_image(
             &state,
             &persona,
             session_id,
+            relationship,
             user_id,
             instance_id,
             umid,
@@ -978,7 +998,7 @@ async fn edit_image(
                 "UPDATE engine.companion_affinity SET ghost_streak = 0, updated_at = now() \
                  WHERE session_id = $1 AND ghost_streak <> 0",
             )
-            .bind(session_id)
+            .bind(relationship)
             .execute(&state_bg.pool)
             .await
             {
@@ -1005,7 +1025,8 @@ async fn edit_image(
         // detached like post_process — the response never waits on the judge.
         // Zero rule deltas (no PDE ran) and a zero-axis scope (this request
         // injects no affinity, so no feeling-clause rewrite). Unreachable in
-        // full-turn mode, whose pipeline already includes the judge.
+        // full-turn mode, whose pipeline already includes the judge. On a
+        // date the turn is recorded unjudged, as every date turn is.
         let eval_text = crate::pipeline::post_process::affinity_eval_text(
             ActionType::ReplyImage,
             "",
@@ -1017,7 +1038,7 @@ async fn edit_image(
         tokio::spawn(async move {
             crate::pipeline::post_process::run_affinity_turn(
                 &task_state,
-                session_id,
+                relationship,
                 user_id,
                 instance_id,
                 &persona,
@@ -1031,6 +1052,7 @@ async fn edit_image(
                 false,
                 None,
                 user_locale.timezone,
+                on_date,
             )
             .await;
         });
@@ -2015,6 +2037,177 @@ mod tests {
             event_umid,
             Some(instruction_id),
             "the event anchors to the instruction row when one exists"
+        );
+    }
+
+    /// A picture from a date, edited: the relationship's state is the
+    /// parent's (spec 2026-11-12-activity-sub-session-design.md §5.1). Both
+    /// the judged slice and a full turn land their event on the parent's row
+    /// as unjudged date turns, the full turn resets the parent's ghost
+    /// streak, and the sub-session never gets an affinity row.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_edit_on_a_date_keeps_the_relationship_on_the_parent(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let parent = seed_session(&pool, user_id, instance_id).await;
+        seed_affinity(&pool, parent, user_id, instance_id).await;
+        sqlx::query("UPDATE engine.companion_affinity SET ghost_streak = 2 WHERE session_id = $1")
+            .bind(parent)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let date = crate::routes::companion::testutil::seed_date(
+            &pool,
+            parent,
+            user_id,
+            instance_id,
+            chrono::Utc::now() - chrono::Duration::minutes(10),
+        )
+        .await;
+        let sub = date.sub_session_id;
+        let (_, mid) = seed_image_turn(&pool, sub).await;
+
+        let mock = MockServer::start().await;
+        mount_editor_and_judge(&mock).await;
+        mount_companion(&mock).await;
+        Mock::given(wm_path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"embedding": vec![0.1_f32; 512]}]
+            })))
+            .mount(&mock)
+            .await;
+        let mut state = with_composer(test_state(pool.clone()), &mock.uri(), FULL_TURN_TOML);
+        state.embed = Arc::new(
+            eros_engine_llm::embedding::EmbeddingRouter::from_config_with(
+                &eros_engine_llm::model_config::ModelConfig::from_toml_str(&format!(
+                    "[providers.mockembed]\nembeddings = \"{}/v1/embeddings\"\n\
+                     [tasks.embedding]\nmodel = \"mock-embed@mockembed\"\n",
+                    mock.uri()
+                ))
+                .unwrap(),
+                |k| (k == "MOCKEMBED_API_KEY").then(|| "test-key".to_string()),
+            )
+            .unwrap(),
+        );
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        for body in [
+            json!({"instruction": "换套衣服", "evaluate_affinity": true}),
+            json!({"instruction": "再换一套", "persist_instruction": true,
+                   "reply_with_text": 1.0}),
+        ] {
+            let (status, resp) =
+                send_request(&mut app, edit_req(sub, mid, &token, body.clone())).await;
+            assert_eq!(status, StatusCode::OK, "{body}: {resp}");
+        }
+
+        let mut contexts: Vec<serde_json::Value> = Vec::new();
+        for _ in 0..100 {
+            contexts = sqlx::query_scalar(
+                "SELECT e.context FROM engine.companion_affinity_events e \
+                   JOIN engine.companion_affinity a ON a.id = e.affinity_id \
+                  WHERE a.session_id = $1 AND e.event_type = 'message'",
+            )
+            .bind(parent)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            if contexts.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(contexts.len(), 2, "{contexts:?}");
+        for c in &contexts {
+            assert_eq!(c["eval_skip_reason"], json!("activity"), "{c}");
+        }
+        let sub_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.companion_affinity WHERE session_id = $1",
+        )
+        .bind(sub)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(sub_rows, 0);
+        let ghost_streak: i32 = sqlx::query_scalar(
+            "SELECT ghost_streak FROM engine.companion_affinity WHERE session_id = $1",
+        )
+        .bind(parent)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(ghost_streak, 0);
+    }
+
+    /// A picture from a date that has ended is not edited: the answer is the
+    /// one a send to that sub-session gets, and nothing is written, so no
+    /// unjudged date turn lands on the parent.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_edit_on_a_date_that_has_ended_is_refused(pool: PgPool) {
+        use crate::routes::companion::testutil::{seed_date, session_footprint};
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let parent = seed_session(&pool, user_id, instance_id).await;
+        let date = seed_date(
+            &pool,
+            parent,
+            user_id,
+            instance_id,
+            chrono::Utc::now() - chrono::Duration::hours(2),
+        )
+        .await;
+        let sub = date.sub_session_id;
+        let (_, mid) = seed_image_turn(&pool, sub).await;
+
+        let mock = MockServer::start().await;
+        mount_editor(&mock).await;
+        let state = with_composer(test_state(pool.clone()), &mock.uri(), EDIT_TASK_TOML);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+        let images = |session_id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM engine.chat_images_events WHERE session_id = $1",
+                )
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let before = (
+            session_footprint(&pool, sub).await,
+            session_footprint(&pool, parent).await,
+            images(sub).await,
+        );
+
+        for body in [
+            json!({"instruction": "换套衣服"}),
+            json!({"instruction": "再换一套", "persist_instruction": true}),
+        ] {
+            let (status, resp) =
+                send_request(&mut app, edit_req(sub, mid, &token, body.clone())).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}: {resp}");
+            assert_eq!(resp["code"], "activity_ended", "{resp}");
+            assert_eq!(resp["user_message"], "这次约会已经结束", "{resp}");
+        }
+
+        assert_eq!(
+            before,
+            (
+                session_footprint(&pool, sub).await,
+                session_footprint(&pool, parent).await,
+                images(sub).await,
+            ),
+            "a refused edit writes nothing"
+        );
+        assert!(
+            mock.received_requests().await.unwrap().is_empty(),
+            "and calls no model"
         );
     }
 

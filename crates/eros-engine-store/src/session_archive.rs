@@ -19,7 +19,7 @@ use uuid::Uuid;
 /// `tx` to commit and its deletes then take the new row with the rest; and a
 /// lock requested once the archive has updated the row waits for it and then
 /// finds the session archived. An unknown id reads back as not live too.
-pub(crate) async fn lock_live_session(
+pub async fn lock_live_session(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     session_id: Uuid,
 ) -> Result<bool, sqlx::Error> {
@@ -86,6 +86,9 @@ impl<'a> SessionArchiveRepo<'a> {
     /// later finds no row and writes nothing. `relationship_scan_events` stays,
     /// counts and ids only.
     ///
+    /// A date under way ends now: its `on_a_date` event is cut at the
+    /// archive's clock, or at its own start when that is stamped later.
+    ///
     /// `persona_instances.status` is deliberately not written: the user still
     /// owns the persona, and ownership is the client's business.
     pub async fn archive_relationship(
@@ -95,7 +98,7 @@ impl<'a> SessionArchiveRepo<'a> {
     ) -> Result<u64, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
 
-        let archived = sqlx::query(
+        let mut archived = sqlx::query(
             "UPDATE engine.chat_sessions SET archived = true \
              WHERE user_id = $1 AND instance_id = $2 AND NOT archived",
         )
@@ -104,6 +107,39 @@ impl<'a> SessionArchiveRepo<'a> {
         .execute(&mut *tx)
         .await?
         .rows_affected();
+
+        // A date's sub-session can be committed while the statement above
+        // waits on its parent's row: `accept` holds that row `FOR SHARE` and
+        // inserts the sub-session, and the update, on its older snapshot, never
+        // sees the new row. This statement takes a new snapshot and archives
+        // the sub-sessions of archived parents the first one missed.
+        archived += sqlx::query(
+            "UPDATE engine.chat_sessions s SET archived = true \
+               FROM engine.activities a \
+               JOIN engine.chat_sessions p ON p.id = a.session_id \
+              WHERE s.id = a.sub_session_id AND NOT s.archived \
+                AND p.user_id = $1 AND p.instance_id = $2 AND p.archived",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        // A date under way ends with the relationship it was a part of, so a
+        // new session of the instance finds her out on none (spec 2026-11-12-
+        // activity-sub-session-design.md). One stamped to start after this
+        // clock (her reply's `sent_at`) is cut to its start, the least the
+        // CHECK allows, so it holds no new session either.
+        sqlx::query(
+            "UPDATE engine.persona_events \
+                SET ends_at = GREATEST(now(), started_at + interval '1 microsecond') \
+              WHERE instance_id = $1 AND kind = $2 AND ends_at > now()",
+        )
+        .bind(instance_id)
+        .bind(eros_engine_core::events::EventKind::OnADate.as_str())
+        .execute(&mut *tx)
+        .await?;
 
         // The persona leaves every group with the relationship (spec §7.3).
         sqlx::query(
@@ -529,6 +565,186 @@ mod tests {
             1,
             "the scan events audit trail must survive"
         );
+    }
+
+    /// A date under way ends with the relationship: a new session of the
+    /// instance finds her out on no date, and a new invitation is not held
+    /// back by it. Any other event runs on.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn archive_ends_a_date_under_way(pool: PgPool) {
+        use crate::activity::ActivityRepo;
+        use crate::events::EventRepo;
+
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session = ChatRepo { pool: &pool }
+            .create_session(user_id, instance_id)
+            .await
+            .unwrap()
+            .id;
+        for (key, kind) in [("date", "on_a_date"), ("trip", "traveling_together")] {
+            sqlx::query(
+                "INSERT INTO engine.persona_events \
+                   (instance_id, session_id, event_key, kind, started_at, ends_at) \
+                 VALUES ($1, $2, $3, $4, now() - interval '10 minutes', \
+                         now() + interval '50 minutes')",
+            )
+            .bind(instance_id)
+            .bind(session)
+            .bind(key)
+            .bind(kind)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let now = chrono::Utc::now();
+        let activities = ActivityRepo { pool: &pool };
+        assert!(activities.date_on(instance_id, None, now).await.unwrap());
+
+        SessionArchiveRepo { pool: &pool }
+            .archive_relationship(user_id, instance_id)
+            .await
+            .unwrap();
+
+        let later = chrono::Utc::now();
+        let current = EventRepo { pool: &pool }
+            .current(instance_id, None, later)
+            .await
+            .unwrap();
+        assert!(current.foreground.is_none(), "{:?}", current.foreground);
+        assert!(current.background.is_some(), "the trip runs on");
+        assert!(!activities.date_on(instance_id, None, later).await.unwrap());
+    }
+
+    /// A date whose start is stamped after the archive's clock (it is her
+    /// reply's `sent_at`, which can be later than the caller's `now`) still
+    /// ends with the relationship: cut to its start, the least the CHECK allows.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn archive_ends_a_date_that_starts_after_its_clock(pool: PgPool) {
+        use crate::activity::ActivityRepo;
+
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session = ChatRepo { pool: &pool }
+            .create_session(user_id, instance_id)
+            .await
+            .unwrap()
+            .id;
+        let started_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+            "INSERT INTO engine.persona_events \
+               (instance_id, session_id, event_key, kind, started_at, ends_at) \
+             VALUES ($1, $2, 'date', 'on_a_date', \
+                     date_trunc('milliseconds', now()) + interval '30 seconds', \
+                     now() + interval '1 hour') \
+             RETURNING started_at",
+        )
+        .bind(instance_id)
+        .bind(session)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        SessionArchiveRepo { pool: &pool }
+            .archive_relationship(user_id, instance_id)
+            .await
+            .unwrap();
+
+        let ends_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+            "SELECT ends_at FROM engine.persona_events \
+              WHERE instance_id = $1 AND event_key = 'date'",
+        )
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            ends_at <= started_at + chrono::Duration::microseconds(1),
+            "cut to its start, not left to run: {ends_at} vs {started_at}"
+        );
+        assert!(
+            !ActivityRepo { pool: &pool }
+                .date_on(instance_id, None, started_at + chrono::Duration::seconds(2))
+                .await
+                .unwrap(),
+            "no date holds the instance once it would have begun"
+        );
+    }
+
+    /// The race `accept` leaves open: it holds the parent row `FOR SHARE` and
+    /// has inserted the sub-session when the archive starts, so the archive's
+    /// first statement queues on the parent and, on its older snapshot, never
+    /// sees the sub-session that commits meanwhile. The second statement does.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn archive_takes_a_sub_session_committed_while_it_waited(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let parent = ChatRepo { pool: &pool }
+            .create_session(user_id, instance_id)
+            .await
+            .unwrap()
+            .id;
+
+        let mut tx = pool.begin().await.unwrap();
+        assert!(lock_live_session(&mut tx, parent).await.unwrap());
+        let sub: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id, channel) \
+             VALUES ($1, $2, 'activity') RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.activities \
+               (session_id, sub_session_id, duration, place, content) \
+             VALUES ($1, $2, 'short', '海边', '散步')",
+        )
+        .bind(parent)
+        .bind(sub)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+        let archive_pool = pool.clone();
+        let archive = tokio::spawn(async move {
+            SessionArchiveRepo {
+                pool: &archive_pool,
+            }
+            .archive_relationship(user_id, instance_id)
+            .await
+        });
+        let mut waiting = false;
+        for _ in 0..100 {
+            waiting = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+                 WHERE datname = current_database() AND wait_event_type = 'Lock' \
+                   AND query LIKE 'UPDATE engine.chat_sessions SET archived%')",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if waiting {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(waiting, "the archive must queue on the locked parent row");
+        tx.commit().await.unwrap();
+
+        assert_eq!(
+            archive.await.unwrap().unwrap(),
+            2,
+            "the parent and the sub-session are both counted"
+        );
+        let archived: Vec<bool> = sqlx::query_scalar(
+            "SELECT archived FROM engine.chat_sessions WHERE id = ANY($1) ORDER BY id",
+        )
+        .bind(vec![parent, sub])
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(archived, vec![true, true], "the sub-session goes with it");
     }
 
     /// Every channel goes, and a second call is a no-op that still succeeds.

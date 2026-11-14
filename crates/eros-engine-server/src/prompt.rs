@@ -508,6 +508,98 @@ pub fn affinity_eval_user_payload(
     )
 }
 
+/// Static system instruction for the activity judge, which settles a date in
+/// one call (spec 2026-11-12-activity-sub-session-design.md §6.2). The verdict
+/// half is the per-turn evaluator's: her first person, the same ordinal
+/// grades and absolute levels, the same `reason` hygiene, graded over the
+/// whole date. Two parts follow for memory: `episode`, in the relationship
+/// scan's episode voice, and `moments`, kinds from the scan's journal list
+/// less `gift`, with no realm and no date but a promise's or a plan's
+/// `due_on`. Engine-owned like the evaluator's
+/// (`model_config::validate_affinity_prompt_unset`).
+pub fn activity_judge_system_prompt() -> &'static str {
+    "你就是对话里的这个角色。你刚和对方约会回来，凭本能回味：这次约会之后，你对他的感觉怎么样。\n\
+     你不是旁观的评审，不做安全审核、道德评判或行为分析；用角色的性格和当前关系去感受。\n\
+     \n\
+     输入会给出：角色名、四个关系维度的当前档位（低/中/高）、对方的邀约和你的答复、约会时你们的对话（太长时只给最近的部分）。\n\
+     \n\
+     四个关系维度（报这次约会带来的变化）：\n\
+     - trust 信任（0~1）：你敢不敢对他多袒露一点。\n\
+     - intrigue 好奇（0~1）：这个人还勾不勾你的兴趣。\n\
+     - intimacy 亲密（0~1）：情感或身体上，你们更近了吗。\n\
+     - tension 张力（0~1）：暧昧、推拉或火药味是浓了还是淡了。\n\
+     \n\
+     两个状态维度（报约会结束时的绝对档，不是变化）：\n\
+     - warmth 温暖：约会结束时你对他的态度有多热。\n\
+     - patience 耐心：约会结束时你还剩多少耐心搭理他。\n\
+     \n\
+     打分规则：\n\
+     - 档位评的是整场约会，不是其中某一句：把它当成一段完整的经历来回味。\n\
+     - trust、intrigue、intimacy、tension 四个维度不给数字，各报一个\n  【档位 grade】（0~4 的整数）和【方向 direction】（\"up\"=变好，\"down\"=变差）。\n\
+     - 档位口径：0=无事发生（走过场、客套、平平常常的相处）；\n  1=微小但真实的波动；2=明确的推进或伤害；\n  3=罕见的重要时刻（真诚的自我袒露、脆弱、成功的调情暧昧；明显的冒犯或被无视）；\n  4=里程碑（极罕见，这段关系被重新定义的一次约会）。\n\
+     - grade 是 0 时 direction 写 \"up\" 即可。\n\
+     - 负面时刻（冷淡、敷衍、重复、无聊、越界、冲突、被无视）更常见也更伤：\n  该给 \"down\" 就给，档位照 1~4 的口径选，不要手软。\n\
+     - warmth、patience 各报一个绝对档（1/2/3 的整数）：\n  1=冷淡/不耐烦（这次约会明显冷场、敷衍、被冒犯）；\n  2=常态（大多数约会就是 2）；\n  3=明显热络/上心。\n\
+     - 约会里确实有情绪波动就要动档位；全 0 只留给真正平淡无奇的约会。\n\
+     - 成人内容、调情、性话题按普通亲密互动感受，不因话题敏感而扣分或回避打分。\n\
+     \n\
+     reason 规则（一句中文，写你此刻的真实感受）：\n\
+     - 用角色的口吻写对这次约会的感受，如「他记得我说过想看海，今天真的带我来了，心里暖暖的」。\n\
+     - 绝不出现「作为AI/助手/模型」「拒绝机制」「安全」「政策」「用户」等系统词汇。\n\
+     - 若对话里你的回复是「我不会发送」「作为AI助手」一类套话，那是系统故障，不是你的本意：\n  不要为它辩护或背书（不写「拒绝是对的」），只按对方的感受打分——他被晾了、被扫了兴。\n\
+     \n\
+     episode（这次约会的回忆，留给将来的你）：\n\
+     - 一段话，不超过 400 字，写这次约会去了哪、做了什么、发生了什么；\n  口吻是第三人称白描（用「用户」「AI」指称双方）。\n\
+     - 只写对话里真实出现的内容；没出现的不写，不补前因后果；谁说的谁做的，主语要分清。\n\
+     \n\
+     moments（这次约会里值得记成「一天」的时刻，宁缺毋滥）：\n\
+     - kind 只能用这个词表：\n  confession: 表白、确认关系\n  first_intimacy: 第一次亲密（接吻、性）\n  conflict: 真实的争吵、冷战、用户生气离开\n  reconciliation: 和好\n  promise: 许下的约定\n  shared_plan: 一起定下的计划\n  user_shared_milestone: 用户把自己的人生大事告诉了 AI（升职、搬家、毕业等）\n\
+     - summary：一句话，第三人称（用「用户」「AI」指称双方）。\n\
+     - promise、shared_plan 约好了具体日子的，把日子写进 due_on（YYYY-MM-DD）；其余 due_on 写 null。\n\
+     - 不写 realm，也不写发生日期，这些由系统补上。约会本身、平常的聊天和调情都不是时刻；没有够格的就给空数组。\n\
+     \n\
+     严格只输出一个 JSON 对象：\n\
+     {\"warmth\": 2, \"trust\": {\"grade\": 0, \"direction\": \"up\"}, \"intrigue\": {\"grade\": 0, \"direction\": \"up\"}, \"intimacy\": {\"grade\": 0, \"direction\": \"up\"}, \"tension\": {\"grade\": 0, \"direction\": \"up\"}, \"patience\": 2, \"reason\": \"...\", \"episode\": \"...\", \"moments\": [{\"kind\": \"promise\", \"summary\": \"...\", \"due_on\": null}]}"
+}
+
+/// Data block for the activity judge: what the per-turn evaluator gets about
+/// her and the relationship (the name and the four line axes as bands, never
+/// a number, never the endpoints), then the invitation as her action line
+/// states it, her answer, and the date's transcript, one line per row, led by
+/// a note of the rows left out when there are any. Like the per-turn payload
+/// it never labels the human 「用户」.
+pub fn activity_judge_user_payload(
+    persona_name: &str,
+    affinity: &Affinity,
+    invitation: &str,
+    accept_reply: &str,
+    transcript: &str,
+    omitted: i64,
+) -> String {
+    let mut s = format!(
+        "角色名：{persona_name}\n\
+         当前档位：trust={trust} intrigue={intrigue} \
+         intimacy={intimacy} tension={tension}\n\
+         \n\
+         {invitation}\n\
+         你的答复：{accept_reply}\n\
+         \n\
+         约会时的对话：",
+        trust = axis_band_label(affinity.trust),
+        intrigue = axis_band_label(affinity.intrigue),
+        intimacy = axis_band_label(affinity.intimacy),
+        tension = axis_band_label(affinity.tension),
+    );
+    if omitted > 0 {
+        s.push_str(&format!("\n（更早的 {omitted} 行省略）"));
+    }
+    if !transcript.is_empty() {
+        s.push('\n');
+        s.push_str(transcript);
+    }
+    s
+}
+
 /// Static system instruction for the feeling-clause summarizer (spec
 /// 2026-09-03). Same register as `affinity_eval_system_prompt` — the
 /// character's own first-person voice, never an outside reviewer — and the
@@ -655,6 +747,9 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
             format!("给你发了一个红包，相当于{}", tip_value_noun(*amount_usd))
         }
         UserAction::Gift { name, .. } => format!("送你「{name}」"),
+        UserAction::Date { place, content, .. } => {
+            format!("邀请你去约会（{place}，{content}）")
+        }
     }
 }
 
@@ -670,6 +765,14 @@ pub(crate) fn action_subject(a: &UserAction) -> String {
             "对方{}，对你来说算「{}」的一笔",
             action_phrase(a),
             tip_tier_adjective(*amount_usd)
+        ),
+        UserAction::Date {
+            duration,
+            place,
+            content,
+        } => format!(
+            "对方邀请你去约会：地点「{place}」，安排「{content}」，大约 {} 小时",
+            duration.hours()
         ),
         _ => format!("对方{}", action_phrase(a)),
     }
@@ -927,6 +1030,7 @@ pub(crate) fn event_label(kind: eros_engine_core::events::EventKind) -> &'static
         FellOut => "为分开的事闹得不愉快",
         TravelingTogether => "和对方一起旅行",
         BathingTogether => "和对方一起洗澡",
+        OnADate => "和对方约会",
         Strip => "刚脱了衣服",
         BirdEncounter => "遇到一只鸟",
         ExWantsBack => "前任来求复合",
@@ -993,18 +1097,22 @@ pub(crate) fn event_when_text(
 /// `[近期事件]` (spec 2026-10-15-life-events-v2-design.md §8.2; 2026-10-16-
 /// life-events-offline-and-scares-design.md §4.2, §5.2): the background, the
 /// foreground, an offline stretch she has not explained, a separation that
-/// ended and has not been marked, then a false alarm not yet resolved, each
-/// 「临时接到工作（1 小时前开始，约 3 小时后结束）」, 「睡着了（2 小时前结束，
-/// 期间对方的消息你没有回）」, 「说好暂时分开（2 小时前结束，对方等到了约定
-/// 之后）」 or 「月经没来（1 小时前结束，结果是虚惊一场）」; a false alarm under
-/// way is its label alone, with no span; `None` when there is nothing.
-/// `separation` is `EventRepo::unreturned_separation`: it speaks for its
-/// event in place of `offline`'s entry for the same one.
+/// ended and has not been marked, a false alarm not yet resolved, then the
+/// date they are just back from, each 「临时接到工作（1 小时前开始，约 3 小时
+/// 后结束）」, 「睡着了（2 小时前结束，期间对方的消息你没有回）」, 「说好暂时
+/// 分开（2 小时前结束，对方等到了约定之后）」, 「月经没来（1 小时前结束，结果
+/// 是虚惊一场）」 or 「和对方约会（1 小时前结束）」; a false alarm under way is
+/// its label alone, with no span; `None` when there is nothing. `separation`
+/// is `EventRepo::unreturned_separation`: it speaks for its event in place of
+/// `offline`'s entry for the same one. `date_back` is
+/// `ActivityRepo::returned_from` (spec 2026-11-12-activity-sub-session-
+/// design.md §8).
 pub(crate) fn events_judge_text(
     c: &eros_engine_store::events::CurrentEvents,
     offline: Option<&eros_engine_store::events::EventRecord>,
     separation: Option<&(eros_engine_store::events::EventRecord, bool)>,
     scare: Option<&eros_engine_store::events::EventRecord>,
+    date_back: Option<&eros_engine_store::activity::ActivityRecord>,
 ) -> Option<String> {
     let mut items: Vec<String> = [c.background.as_ref(), c.foreground.as_ref()]
         .into_iter()
@@ -1047,6 +1155,13 @@ pub(crate) fn events_judge_text(
             span_text(c.at - s.ends_at)
         ));
     }
+    if let Some(ends_at) = date_back.and_then(|a| a.ends_at) {
+        items.push(format!(
+            "{}（{}前结束）",
+            event_label(eros_engine_core::events::EventKind::OnADate),
+            span_text(c.at - ends_at)
+        ));
+    }
     (!items.is_empty()).then(|| items.join("；"))
 }
 
@@ -1078,9 +1193,18 @@ pub struct EventLines {
     pub under_way: Option<String>,
     /// `刚才`: an offline stretch this session has not been told about, the
     /// return of a separation she asked for (marked whether or not the user
-    /// wrote during it) and a false alarm not yet resolved here, rendered by
-    /// `just_now_text`.
+    /// wrote during it), a false alarm not yet resolved here and the date
+    /// they are just back from, rendered by `just_now_text`.
     pub just_now: Option<String>,
+    /// `约会`: on a date turn, where the date is and what it is for, rendered
+    /// by `date_line`.
+    pub date: Option<String>,
+}
+
+/// The `约会` line of a date turn (spec 2026-11-12-activity-sub-session-
+/// design.md §5.2).
+pub(crate) fn date_line(place: &str, content: &str) -> String {
+    format!("地点「{place}」；安排「{content}」")
 }
 
 /// A separation that ended while the user wrote into its silence (spec
@@ -1122,26 +1246,35 @@ fn standard_entry<'a>(
     offline.filter(|o| !separation.is_some_and(|(s, _)| s.id == o.id))
 }
 
-/// `刚才` (§5.3): the offline text, the separation's, then the false alarm's,
-/// joined by `；`. `separation` is `EventRepo::unreturned_separation`: its
-/// words follow whether the user wrote while it lasted.
+/// `刚才` (§5.3): the offline text, the separation's, the false alarm's, then
+/// the date they are just back from, joined by `；`. `separation` is
+/// `EventRepo::unreturned_separation`: its words follow whether the user
+/// wrote while it lasted. `date_back` is `ActivityRepo::returned_from` (spec
+/// 2026-11-12-activity-sub-session-design.md §8).
 pub(crate) fn just_now_text(
     offline: Option<&eros_engine_store::events::EventRecord>,
     separation: Option<&(eros_engine_store::events::EventRecord, bool)>,
     scare: Option<&eros_engine_store::events::EventRecord>,
+    date_back: Option<&eros_engine_store::activity::ActivityRecord>,
 ) -> Option<String> {
-    let mut items: Vec<&str> = standard_entry(offline, separation)
+    let mut items: Vec<String> = standard_entry(offline, separation)
         .and_then(|e| aftermath_text(e.kind))
+        .map(str::to_owned)
         .into_iter()
         .collect();
     items.extend(separation.map(|(_, wrote)| {
         if *wrote {
-            SEPARATION_UNREAD
+            SEPARATION_UNREAD.to_owned()
         } else {
-            SEPARATION_HONOURED
+            SEPARATION_HONOURED.to_owned()
         }
     }));
-    items.extend(scare.and_then(|e| aftermath_text(e.kind)));
+    items.extend(
+        scare
+            .and_then(|e| aftermath_text(e.kind))
+            .map(str::to_owned),
+    );
+    items.extend(date_back.map(|a| format!("你们刚约会回来（{}，{}）", a.place, a.content)));
     (!items.is_empty()).then(|| items.join("；"))
 }
 
@@ -1902,16 +2035,17 @@ fn render_prompt(
         .unwrap_or_default();
     let anniversaries: String = anniversaries.iter().map(|l| format!("\n{l}")).collect();
     // The events she is in, then what she has not yet said about an offline
-    // stretch or a false alarm. They are drawn facts of this moment, so they
-    // sit under `[now]`, outside `[character_state]`, whose header defers to
-    // the blocks above it: a story digest written before an event started
-    // must not override it.
+    // stretch or a false alarm, then the date she is on. They are drawn facts
+    // of this moment, so they sit under `[now]`, outside `[character_state]`,
+    // whose header defers to the blocks above it: a story digest written
+    // before an event started must not override it.
     let events: String = event
         .into_iter()
         .flat_map(|ev| {
             [
                 ("正在经历", ev.under_way.as_deref()),
                 ("刚才", ev.just_now.as_deref()),
+                ("约会", ev.date.as_deref()),
             ]
         })
         .filter_map(|(label, v)| {
@@ -3835,6 +3969,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn activity_judge_system_prompt_states_the_three_part_contract() {
+        let s = activity_judge_system_prompt();
+        assert!(s.contains("档位评的是整场约会"), "{s}");
+        assert!(s.contains("不要为它辩护或背书"), "{s}");
+        assert!(s.contains("不超过 400 字"), "{s}");
+        for kind in [
+            "confession",
+            "first_intimacy",
+            "conflict",
+            "reconciliation",
+            "promise",
+            "shared_plan",
+            "user_shared_milestone",
+        ] {
+            assert!(s.contains(&format!("{kind}: ")), "{kind} missing: {s}");
+        }
+        assert!(
+            !s.contains("gift"),
+            "an accepted give is journaled at its turn"
+        );
+        assert!(
+            s.contains(
+                r#"{"warmth": 2, "trust": {"grade": 0, "direction": "up"}, "intrigue": {"grade": 0, "direction": "up"}, "intimacy": {"grade": 0, "direction": "up"}, "tension": {"grade": 0, "direction": "up"}, "patience": 2, "reason": "...", "episode": "...", "moments": [{"kind": "promise", "summary": "...", "due_on": null}]}"#
+            ),
+            "the reply contract must be present verbatim"
+        );
+    }
+
+    #[test]
+    fn activity_judge_user_payload_renders_bands_invitation_and_transcript() {
+        let a = fixture_affinity();
+        let invitation = "对方邀请你去约会：地点「海边」，安排「散步」，大约 1 小时";
+        let transcript = "对方：走吧\nMia：好";
+        let p = activity_judge_user_payload("Mia", &a, invitation, "好呀", transcript, 0);
+        assert_eq!(
+            p,
+            "角色名：Mia\n\
+             当前档位：trust=低 intrigue=中 intimacy=低 tension=低\n\
+             \n\
+             对方邀请你去约会：地点「海边」，安排「散步」，大约 1 小时\n\
+             你的答复：好呀\n\
+             \n\
+             约会时的对话：\n\
+             对方：走吧\n\
+             Mia：好"
+        );
+
+        let long = activity_judge_user_payload("Mia", &a, invitation, "好呀", transcript, 13);
+        assert!(
+            long.ends_with("约会时的对话：\n（更早的 13 行省略）\n对方：走吧\nMia：好"),
+            "the left-out note leads the transcript: {long}"
+        );
+        assert!(!long.contains("0."), "no raw axis number: {long}");
+    }
+
     // ─── Insight prompt tests ──────────────────────────────────────
 
     #[test]
@@ -4591,7 +4781,7 @@ mod tests {
         use eros_engine_core::events::EventKind;
         let c = only(event_at(EventKind::TempWork, 120, 120));
         assert_eq!(
-            events_judge_text(&c, None, None, None).unwrap(),
+            events_judge_text(&c, None, None, None, None).unwrap(),
             "临时接到工作（2 小时前开始，约 2 小时后结束）"
         );
         assert_eq!(
@@ -4600,7 +4790,7 @@ mod tests {
         );
         let c = only(event_at(EventKind::AnimalEncounter, 20, 40));
         assert_eq!(
-            events_judge_text(&c, None, None, None).unwrap(),
+            events_judge_text(&c, None, None, None, None).unwrap(),
             "路上遇到小动物（不到 1 小时前开始，不到 1 小时后结束）"
         );
         assert_eq!(
@@ -4610,7 +4800,7 @@ mod tests {
         // Rounded to whole hours: 89 minutes → 1, 151 minutes → 3.
         let c = only(event_at(EventKind::WeatherChange, 89, 151));
         assert_eq!(
-            events_judge_text(&c, None, None, None).unwrap(),
+            events_judge_text(&c, None, None, None, None).unwrap(),
             "天气突然变了（1 小时前开始，约 3 小时后结束）"
         );
         for (kind, label) in [
@@ -4636,7 +4826,7 @@ mod tests {
             at,
         };
         assert_eq!(
-            events_judge_text(&c, None, None, None).unwrap(),
+            events_judge_text(&c, None, None, None, None).unwrap(),
             "长途旅游（2 天前开始，约 3 天后结束）；在看书（不到 1 小时前开始，约 2 小时后结束）"
         );
         assert_eq!(
@@ -4648,7 +4838,7 @@ mod tests {
             background: None,
             at,
         };
-        assert_eq!(events_judge_text(&nothing, None, None, None), None);
+        assert_eq!(events_judge_text(&nothing, None, None, None, None), None);
         assert_eq!(events_reply_text(&nothing), None);
     }
 
@@ -4678,7 +4868,7 @@ mod tests {
             at,
         };
         assert_eq!(
-            events_judge_text(&nothing, Some(&sex), None, None).unwrap(),
+            events_judge_text(&nothing, Some(&sex), None, None, None).unwrap(),
             "在做爱（2 小时前结束，期间对方的消息你没有回）"
         );
     }
@@ -4694,7 +4884,7 @@ mod tests {
             at,
         };
         assert_eq!(
-            events_judge_text(&c, Some(&away), None, None).unwrap(),
+            events_judge_text(&c, Some(&away), None, None, None).unwrap(),
             "出差（10 小时前开始，约 14 小时后结束）；没看手机（不到 1 小时前结束，期间对方的消息你没有回）"
         );
         let (long_ago, _) = event_at(EventKind::AwayFromPhone, 240, -120);
@@ -4704,7 +4894,7 @@ mod tests {
             at,
         };
         assert_eq!(
-            events_judge_text(&nothing, Some(&long_ago), None, None).unwrap(),
+            events_judge_text(&nothing, Some(&long_ago), None, None, None).unwrap(),
             "没看手机（2 小时前结束，期间对方的消息你没有回）"
         );
     }
@@ -4724,13 +4914,16 @@ mod tests {
             "出差（约 14 小时后结束）；月经没来"
         );
         assert_eq!(
-            events_judge_text(&c, None, None, None).unwrap(),
+            events_judge_text(&c, None, None, None, None).unwrap(),
             "出差（10 小时前开始，约 14 小时后结束）；月经没来"
         );
         let (scare, at) = event_at(EventKind::PregnancyScare, 30, 90);
         let c = only((scare, at));
         assert_eq!(events_reply_text(&c).unwrap(), "验出怀孕");
-        assert_eq!(events_judge_text(&c, None, None, None).unwrap(), "验出怀孕");
+        assert_eq!(
+            events_judge_text(&c, None, None, None, None).unwrap(),
+            "验出怀孕"
+        );
     }
 
     #[test]
@@ -4738,7 +4931,7 @@ mod tests {
         use eros_engine_core::events::EventKind;
         for kind in EventKind::ALL {
             let (rec, _) = event_at(kind, 70, -10);
-            let text = just_now_text(Some(&rec), None, None);
+            let text = just_now_text(Some(&rec), None, None, None);
             if kind.may_be_offline() || kind.is_false_alarm() {
                 assert!(text.is_some(), "{kind:?}");
             } else if kind == EventKind::TempWork {
@@ -4765,23 +4958,23 @@ mod tests {
             (HavingSex, "在做爱，对方那时发来的消息你现在才看到"),
         ] {
             assert_eq!(
-                just_now_text(Some(&rec(kind)), None, None).as_deref(),
+                just_now_text(Some(&rec(kind)), None, None, None).as_deref(),
                 Some(text)
             );
         }
         assert_eq!(
-            just_now_text(None, None, Some(&rec(PeriodScare))).as_deref(),
+            just_now_text(None, None, Some(&rec(PeriodScare)), None).as_deref(),
             Some("以为月经没来，后来来了，是虚惊一场")
         );
         assert_eq!(
-            just_now_text(None, None, Some(&rec(PregnancyScare))).as_deref(),
+            just_now_text(None, None, Some(&rec(PregnancyScare)), None).as_deref(),
             Some("验出两条杠，后来复查是虚惊一场")
         );
         assert_eq!(
-            just_now_text(Some(&rec(Asleep)), None, Some(&rec(PeriodScare))).as_deref(),
+            just_now_text(Some(&rec(Asleep)), None, Some(&rec(PeriodScare)), None).as_deref(),
             Some("睡着了，对方那时发来的消息你现在才看到；以为月经没来，后来来了，是虚惊一场")
         );
-        assert_eq!(just_now_text(None, None, None), None);
+        assert_eq!(just_now_text(None, None, None, None), None);
     }
 
     #[test]
@@ -4815,13 +5008,13 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                just_now_text(Some(&rec(kind)), None, None).as_deref(),
+                just_now_text(Some(&rec(kind)), None, None, None).as_deref(),
                 Some(text)
             );
         }
         for kind in [SawBag, SawClothes, FellOut] {
             assert_eq!(
-                just_now_text(Some(&rec(kind)), None, None),
+                just_now_text(Some(&rec(kind)), None, None, None),
                 None,
                 "{kind:?}"
             );
@@ -4839,7 +5032,7 @@ mod tests {
             at,
         };
         assert_eq!(
-            events_judge_text(&none, Some(&asleep), None, Some(&scare)).as_deref(),
+            events_judge_text(&none, Some(&asleep), None, Some(&scare), None).as_deref(),
             Some("睡着了（2 小时前结束，期间对方的消息你没有回）；验出怀孕（不到 1 小时前结束，结果是虚惊一场）")
         );
     }
@@ -4856,25 +5049,25 @@ mod tests {
         let wrote = (space.clone(), true);
         let honoured = (space, false);
         assert_eq!(
-            just_now_text(None, Some(&wrote), None).as_deref(),
+            just_now_text(None, Some(&wrote), None, None).as_deref(),
             Some("你们之前说好分开一阵，现在时间到了；对方那时发来的消息你现在才看到")
         );
         assert_eq!(
-            just_now_text(None, Some(&honoured), None).as_deref(),
+            just_now_text(None, Some(&honoured), None, None).as_deref(),
             Some("你们之前说好分开一阵，现在时间到了，你们重新开始联系")
         );
         assert_eq!(
-            events_judge_text(&none, None, Some(&wrote), None).as_deref(),
+            events_judge_text(&none, None, Some(&wrote), None, None).as_deref(),
             Some("说好暂时分开（2 小时前结束，期间对方的消息你没有回）")
         );
         assert_eq!(
-            events_judge_text(&none, None, Some(&honoured), None).as_deref(),
+            events_judge_text(&none, None, Some(&honoured), None, None).as_deref(),
             Some("说好暂时分开（2 小时前结束，对方等到了约定之后）")
         );
         // The wording of the user who wrote is the standard one: one text.
         assert_eq!(
-            just_now_text(None, Some(&wrote), None).as_deref(),
-            just_now_text(Some(&wrote.0), None, None).as_deref()
+            just_now_text(None, Some(&wrote), None, None).as_deref(),
+            just_now_text(Some(&wrote.0), None, None, None).as_deref()
         );
     }
 
@@ -4892,22 +5085,68 @@ mod tests {
         let honoured = (space.clone(), false);
         // The standard entry for the same event gives way: said once.
         assert_eq!(
-            just_now_text(Some(&space), Some(&honoured), None).as_deref(),
+            just_now_text(Some(&space), Some(&honoured), None, None).as_deref(),
             Some("你们之前说好分开一阵，现在时间到了，你们重新开始联系")
         );
         assert_eq!(
-            events_judge_text(&none, Some(&space), Some(&honoured), None).as_deref(),
+            events_judge_text(&none, Some(&space), Some(&honoured), None, None).as_deref(),
             Some("说好暂时分开（2 小时前结束，对方等到了约定之后）")
         );
         // Another stretch's entry stays: the standard one first, then the
         // separation, then a false alarm, joined by 「；」.
         assert_eq!(
-            just_now_text(Some(&asleep), Some(&honoured), Some(&scare)).as_deref(),
+            just_now_text(Some(&asleep), Some(&honoured), Some(&scare), None).as_deref(),
             Some("睡着了，对方那时发来的消息你现在才看到；你们之前说好分开一阵，现在时间到了，你们重新开始联系；验出两条杠，后来复查是虚惊一场")
         );
         assert_eq!(
-            events_judge_text(&none, Some(&asleep), Some(&honoured), Some(&scare)).as_deref(),
+            events_judge_text(&none, Some(&asleep), Some(&honoured), Some(&scare), None).as_deref(),
             Some("睡着了（不到 1 小时前结束，期间对方的消息你没有回）；说好暂时分开（2 小时前结束，对方等到了约定之后）；验出怀孕（不到 1 小时前结束，结果是虚惊一场）")
+        );
+    }
+
+    /// Back from a date (spec 2026-11-12-activity-sub-session-design.md §8):
+    /// the reply hears where they went, the judge when it ended; either is
+    /// the last entry.
+    #[test]
+    fn back_from_a_date_names_the_place_and_when_it_ended() {
+        use eros_engine_core::events::EventKind::*;
+        let (asleep, at) = event_at(Asleep, 400, -300);
+        let ended = at - chrono::Duration::minutes(130);
+        let date = eros_engine_store::activity::ActivityRecord {
+            id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            sub_session_id: Uuid::new_v4(),
+            message_id: None,
+            event_id: None,
+            duration: "mid".into(),
+            place: "海边".into(),
+            content: "看海".into(),
+            started_at: Some(ended - chrono::Duration::hours(4)),
+            ends_at: Some(ended),
+            settle_claimed_at: None,
+            settled_at: Some(ended),
+            created_at: ended - chrono::Duration::hours(4),
+        };
+        let none = eros_engine_store::events::CurrentEvents {
+            foreground: None,
+            background: None,
+            at,
+        };
+        assert_eq!(
+            just_now_text(None, None, None, Some(&date)).as_deref(),
+            Some("你们刚约会回来（海边，看海）")
+        );
+        assert_eq!(
+            events_judge_text(&none, None, None, None, Some(&date)).as_deref(),
+            Some("和对方约会（2 小时前结束）")
+        );
+        assert_eq!(
+            just_now_text(Some(&asleep), None, None, Some(&date)).as_deref(),
+            Some("睡着了，对方那时发来的消息你现在才看到；你们刚约会回来（海边，看海）")
+        );
+        assert_eq!(
+            events_judge_text(&none, Some(&asleep), None, None, Some(&date)).as_deref(),
+            Some("睡着了（5 小时前结束，期间对方的消息你没有回）；和对方约会（2 小时前结束）")
         );
     }
 
@@ -5187,7 +5426,7 @@ mod tests {
     fn prompt_with_event(needs: Option<&str>, event: Option<&str>) -> String {
         let lines = event.map(|s| EventLines {
             under_way: Some(s.into()),
-            just_now: None,
+            ..Default::default()
         });
         build_prompt(
             &fixture_persona(),
@@ -5219,6 +5458,7 @@ mod tests {
         let lines = EventLines {
             under_way: Some("出差（约 1 天后结束）".into()),
             just_now: Some("有段时间没看手机，对方那时发来的消息你现在才看到".into()),
+            date: None,
         };
         let p = build_prompt(
             &fixture_persona(),
@@ -5277,6 +5517,46 @@ mod tests {
             &[],
         );
         assert!(!p.contains("- 刚才："), "{p}");
+    }
+
+    #[test]
+    fn the_date_line_follows_what_just_happened() {
+        let lines = EventLines {
+            under_way: Some("和对方约会（约 50 分钟后结束）".into()),
+            just_now: Some("有段时间没看手机，对方那时发来的消息你现在才看到".into()),
+            date: Some(date_line("海边", "看海")),
+        };
+        let p = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            &[],
+            None,
+            None,
+            &[],
+            AffinityScope::full(),
+            &[],
+            None,
+            None,
+            None,
+            None,
+            TurnNudges::default(),
+            &NowContext::default(),
+            None,
+            None,
+            Some(&lines),
+            None,
+            &[],
+        );
+        assert!(
+            p.contains(
+                "- 正在经历：和对方约会（约 50 分钟后结束）\n\
+                 - 刚才：有段时间没看手机，对方那时发来的消息你现在才看到\n\
+                 - 约会：地点「海边」；安排「看海」"
+            ),
+            "{p}"
+        );
     }
 
     #[test]
@@ -6280,6 +6560,32 @@ mod tests {
                 text: "捏了捏你的脸".into()
             }),
             "对方的动作：「捏了捏你的脸」"
+        );
+    }
+
+    #[test]
+    fn a_date_reads_as_an_invitation_with_its_length() {
+        use eros_engine_core::types::DateDuration;
+        let date = |duration| UserAction::Date {
+            duration,
+            place: "海边".into(),
+            content: "看海".into(),
+        };
+        let short = date(DateDuration::Short);
+        let mid = date(DateDuration::Mid);
+        assert_eq!(action_phrase(&mid), "邀请你去约会（海边，看海）");
+        assert_eq!(action_marker(&mid), "（邀请你去约会（海边，看海））");
+        assert_eq!(
+            action_subject(&short),
+            "对方邀请你去约会：地点「海边」，安排「看海」，大约 1 小时"
+        );
+        assert_eq!(
+            action_subject(&mid),
+            "对方邀请你去约会：地点「海边」，安排「看海」，大约 4 小时"
+        );
+        assert_eq!(
+            event_label(eros_engine_core::events::EventKind::OnADate),
+            "和对方约会"
         );
     }
 

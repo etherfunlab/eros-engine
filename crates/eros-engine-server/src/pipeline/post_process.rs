@@ -105,12 +105,24 @@ pub async fn run(
     if !session_still_live(&state, session_id).await {
         return;
     }
+    // A date turn's affinity is its parent's; the date leaves nothing in
+    // relationship memory while it runs, so it writes no verbatim row and the
+    // scan neither counts nor runs on it (spec 2026-11-12-activity-sub-
+    // session-design.md §5.1, §7).
+    let turn = match super::activity::turn_session(&state.pool, session_id).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(%session_id, "post-process: turn session read failed: {e}");
+            return;
+        }
+    };
+    let on_date = turn.activity.is_some();
 
     // A user turn counts toward the relationship's scan before anything else
     // runs, so a relationship's first turn places the scan cursor ahead of any
     // later turn of the same pair.
     let bumped = match &event {
-        Event::UserMessage { message_id, .. } => {
+        Event::UserMessage { message_id, .. } if !on_date => {
             super::dreaming::bump_relationship(
                 &state,
                 instance_id,
@@ -139,6 +151,17 @@ pub async fn run(
         _ => (String::new(), None, false),
     };
     let tier_drop = tier_drop_for(&event, &plan);
+    // A date turn, and the accepted invitation that opens a date, belong to
+    // the date: settlement reads them, the per-turn judge does not (spec
+    // 2026-11-12-activity-sub-session-design.md §4.6, §5.1).
+    let activity_turn = on_date
+        || (matches!(
+            &event,
+            Event::UserMessage {
+                action: Some(eros_engine_core::types::UserAction::Date { .. }),
+                ..
+            }
+        ) && plan.action_response == Some(eros_engine_core::types::ActionResponse::Accept));
     // As of 4.0 the request's affinity scope is read-side (prompt injection
     // gating) AND consumed here by the feeling-clause summarizer, which only
     // narrates axes the request actually asked for.
@@ -166,7 +189,7 @@ pub async fn run(
     };
 
     let fut_memory = async {
-        if should_write_user_turn(&user_msg, &produced) {
+        if !on_date && should_write_user_turn(&user_msg, &produced) {
             write_turn(&state, session_id, user_id, instance_id, &user_msg).await;
         }
     };
@@ -193,7 +216,7 @@ pub async fn run(
 
         run_affinity_turn(
             &state,
-            session_id,
+            turn.relationship,
             user_id,
             instance_id,
             &persona,
@@ -207,6 +230,7 @@ pub async fn run(
             action_turn,
             tier_drop,
             user_locale.timezone,
+            activity_turn,
         )
         .await;
     };
@@ -274,6 +298,10 @@ pub async fn run(
 /// persona (a blank name skips the eval) and the user's timezone, which dates
 /// the tier rows the persist journals. After the persist, a judged turn may
 /// make her put a life choice to the user (`life_choice::maybe_ask`).
+///
+/// An `activity_turn` belongs to a date, which settlement scores (spec
+/// 2026-11-12-activity-sub-session-design.md §4.6): it persists as a skipped
+/// evaluation (`activity`) with no rule nudges.
 #[allow(clippy::too_many_arguments)] // each arg is a distinct per-turn concern
 pub(crate) async fn run_affinity_turn(
     state: &AppState,
@@ -291,6 +319,7 @@ pub(crate) async fn run_affinity_turn(
     action_turn: bool,
     tier_drop: Option<eros_engine_core::affinity::AffinityLine>,
     journal_tz: Option<chrono_tz::Tz>,
+    activity_turn: bool,
 ) {
     // Semantic eval gate: Reply turns only, with a non-trivial user message
     // and a non-empty produced assistant message (or image_caption proxy for
@@ -298,12 +327,21 @@ pub(crate) async fn run_affinity_turn(
     // in v1. `pre_skip == None` ⇒ the gate passes and an eval call is
     // attempted; otherwise it carries the reason the trio will be NULL
     // (stamped into `context`).
-    let pre_skip = eval_skip_reason(
-        action,
-        user_msg.chars().count(),
-        eval_text.trim().is_empty(),
-        action_turn,
-    );
+    let pre_skip = if activity_turn {
+        Some("activity")
+    } else {
+        eval_skip_reason(
+            action,
+            user_msg.chars().count(),
+            eval_text.trim().is_empty(),
+            action_turn,
+        )
+    };
+    let rule_deltas = if activity_turn {
+        eros_engine_core::affinity::AffinityDeltas::default()
+    } else {
+        rule_deltas
+    };
 
     // The feeling clause gets the name only on a turn whose eval was
     // attempted; a skipped turn hands it an empty name, which it declines.
@@ -850,7 +888,7 @@ fn fold_level(v: &serde_json::Value) -> Result<Option<i16>, ()> {
 /// rejects the whole verdict: all-zero grades, no level reads, empty reason,
 /// so the rule deltas still persist and the affinity write never fails
 /// because the evaluator failed. Returns (grades, levels, reason).
-fn parse_affinity_eval(
+pub(crate) fn parse_affinity_eval(
     raw: &str,
 ) -> (
     eros_engine_core::affinity::AxisGrades,
@@ -4150,6 +4188,7 @@ mod tests {
             false,
             None,
             None,
+            false,
         )
         .await;
 

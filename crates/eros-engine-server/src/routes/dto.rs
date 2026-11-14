@@ -5,9 +5,12 @@
 //!   * `AffinitySnapshot` — point-in-time view of the affinity vector,
 //!     returned by `GET /bff/v1/comp/affinity/{sid}`.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use eros_engine_core::affinity::Affinity;
+use eros_engine_store::activity::ActivityRecord;
 
 /// Point-in-time projection of a session's `Affinity`.
 ///
@@ -90,6 +93,37 @@ pub struct TurnLabelChangesDto {
     pub bond: Option<LabelTransitionDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chemistry: Option<LabelTransitionDto>,
+}
+
+/// A date (spec 2026-11-12-activity-sub-session-design.md §4.6, §10): the
+/// sub-session it is played in and its span, `null` once its event row is gone.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct ActivityView {
+    pub id: Uuid,
+    pub sub_session_id: Uuid,
+    /// `short` (1 hour) | `mid` (4 hours).
+    pub duration: String,
+    pub place: String,
+    pub content: String,
+    /// `ongoing` | `ended` | `settled`, as of the response.
+    pub status: String,
+    pub started_at: Option<DateTime<Utc>>,
+    pub ends_at: Option<DateTime<Utc>>,
+}
+
+impl ActivityView {
+    pub fn from_record(r: &ActivityRecord, now: DateTime<Utc>) -> Self {
+        Self {
+            id: r.id,
+            sub_session_id: r.sub_session_id,
+            duration: r.duration.clone(),
+            place: r.place.clone(),
+            content: r.content.clone(),
+            status: r.status_at(now).as_str().to_string(),
+            started_at: r.started_at,
+            ends_at: r.ends_at,
+        }
+    }
 }
 
 #[cfg(test)]

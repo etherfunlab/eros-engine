@@ -17,6 +17,7 @@ use uuid::Uuid;
 use eros_engine_core::events::EventKind;
 use eros_engine_core::persona::CompanionPersona;
 use eros_engine_core::scope::romance_compatible;
+use eros_engine_store::activity::ActivityRepo;
 use eros_engine_store::affinity::{AffinityRepo, JudgedEndpoints};
 use eros_engine_store::chat::ChatRepo;
 use eros_engine_store::events::{EventRepo, NewEvent};
@@ -208,7 +209,7 @@ pub(crate) async fn maybe_ask(
 
 /// Whether she is free to put a choice to the user at all (spec 2026-10-19
 /// §3.1, spec 2026-10-30 §4.3): nothing pending on the instance, no
-/// separation under way, a 1:1 text session of a genome instance.
+/// separation or date under way, a 1:1 text session of a genome instance.
 async fn runway_clear(
     state: &AppState,
     session_id: Uuid,
@@ -216,7 +217,8 @@ async fn runway_clear(
     now: DateTime<Utc>,
 ) -> Result<bool, AppError> {
     // She has one life: one pending ask at a time across the instance's
-    // sessions, and none while she is apart from the user.
+    // sessions, and none while she is apart from the user, or out with them
+    // on a date (a main-chat turn sent before it opened can land during it).
     if (LifeChoiceRepo { pool: &state.pool })
         .pending_for_instance(instance_id, now)
         .await?
@@ -224,6 +226,12 @@ async fn runway_clear(
         return Ok(false);
     }
     if separated(&state.pool, instance_id, None, now).await? {
+        return Ok(false);
+    }
+    if (ActivityRepo { pool: &state.pool })
+        .date_on(instance_id, None, now)
+        .await?
+    {
         return Ok(false);
     }
 
@@ -796,6 +804,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .await;
         }
