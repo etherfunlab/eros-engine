@@ -1,4 +1,4 @@
-# Migrating to v2.6.7: activities, a date as a sub-session
+# Migrating to v2.7.0: activities, a date as a sub-session
 
 **Applies to:**
 - deployments (one migration, `0085`);

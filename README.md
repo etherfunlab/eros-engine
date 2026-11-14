@@ -60,9 +60,9 @@ cargo add eros-engine-core eros-engine-store eros-engine-llm
 
 ```toml
 [dependencies]
-eros-engine-core  = "2.6"
-eros-engine-store = "2.6"   # optional: Postgres + pgvector persistence
-eros-engine-llm   = "2.6"   # optional: model and embedding clients
+eros-engine-core  = "2.7"
+eros-engine-store = "2.7"   # optional: Postgres + pgvector persistence
+eros-engine-llm   = "2.7"   # optional: model and embedding clients
 ```
 
 `eros-engine-server` is not published to crates.io; run it as a Docker image instead.
@@ -72,14 +72,14 @@ eros-engine-llm   = "2.6"   # optional: model and embedding clients
 Multi-architecture images are published to GitHub Container Registry for every `v*` tag:
 
 ```bash
-docker pull ghcr.io/etherfunlab/eros-engine:2.6.6
+docker pull ghcr.io/etherfunlab/eros-engine:2.7.0
 # Or follow the latest tagged release
 docker pull ghcr.io/etherfunlab/eros-engine:latest
 ```
 
 ```bash
 docker run --rm -p 8080:8080 --env-file .env \
-  ghcr.io/etherfunlab/eros-engine:2.6.6 serve
+  ghcr.io/etherfunlab/eros-engine:2.7.0 serve
 ```
 
 Bring your own Postgres and `.env`; the same `docker/Dockerfile` can be deployed to any container host. See [Deploying](docs/deploying.md).

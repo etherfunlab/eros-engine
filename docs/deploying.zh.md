@@ -105,9 +105,9 @@ docker compose up -d engine
 
 ```toml
 [dependencies]
-eros-engine-core  = "2.6"
-eros-engine-llm   = "2.6"
-eros-engine-store = "2.6"
+eros-engine-core  = "2.7"
+eros-engine-llm   = "2.7"
+eros-engine-store = "2.7"
 ```
 
 （要跟未发布的开发进度，改用 `{ git = "https://github.com/etherfunlab/eros-engine", branch = "main" }`。）
