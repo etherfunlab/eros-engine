@@ -157,7 +157,7 @@ exclude `model LIKE '%@byok'` (see [byok.md](byok.md#what-is-recorded)).
 call now writes here: `chat_companion`, `chat_voice`, `chat_product_qa`,
 `chat_input_filter`, `chat_output_filter`, `chat_vision`,
 `chat_image_prompt_compose`, `chat_image_edit_compose`, `pde_decision`,
-`group_director`, `affinity_evaluation`, `affinity_summary`, `insight_extraction`,
+`group_director`, `affinity_evaluation`, `affinity_summary`, `activity_judge`, `insight_extraction`,
 `profile_rebuild`, `character_insight_extraction`,
 `character_insight_structuring`, `user_insight_extraction`,
 `user_insight_structuring`, `dreaming_scan`, `arc_rewrite`, `world_director`,
@@ -365,7 +365,8 @@ as shown above.
   OpenRouter `model` / `usage` / `generation_id` triple **is** persisted —
   `model` and `usage` in `engine.llm_generations`, and `generation_id` on the
   row that call produced: `chat_messages.generation_id` for the chat completion
-  (mirrored on `companion_affinity_events` for the affinity eval, on
+  (mirrored on `companion_affinity_events` for the affinity eval and the
+  activity judge, on
   `human_insights_events` for each `insight_extraction` and
   `profile_rebuild` call of the human chain, on
   `engine.character_insights_events` for each call of the experimental
@@ -407,7 +408,7 @@ including attempts a fallback recovered from, which leave no other trace:
 | `engine.chat_vision_events` | `chat_vision` describe |
 | `engine.chat_images_events` | image-prompt composer |
 | `engine.companion_decision_events` | PDE judge, group director |
-| `engine.companion_affinity_events` | affinity eval |
+| `engine.companion_affinity_events` | affinity eval, the activity judge |
 
 Identical shape on all five, so a fleet-wide error view is one `UNION ALL`.
 Additive, nullable, no backfill, no index. **`NULL` means "nothing to
@@ -568,6 +569,7 @@ strictly finer than one would have been: it separates `chat_companion` from
 | `pde_decision` | `companion_decision_events` | — |
 | `group_director` | `companion_decision_events` | — |
 | `affinity_evaluation` | `companion_affinity_events` | — |
+| `activity_judge` | `companion_affinity_events` | the date's `activity` row |
 
 The input filter is the one call site that had **no failure record of any
 kind** before v1.4.0. Its failures land on the `role='user'` row, beside the

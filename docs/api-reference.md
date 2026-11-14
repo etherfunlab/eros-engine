@@ -210,6 +210,25 @@ instead, and group turns to [`POST /v2/comp/group/{group_id}/message/stream`](#g
 The gate mirrors the voice endpoint's, so the two channels are
 symmetric: neither endpoint will write into the other's sessions.
 
+**Dates and the send routes.** This route and the async route also take a
+date's sub-session (`channel = 'activity'`) while the date runs: that is where
+the date's turns go. While a date of the persona runs, her 1:1 text sessions
+take nothing. These refusals come before anything is written:
+
+| Status | Code | When |
+|---|---|---|
+| 409 | `activity_in_progress` | a date of the persona is under way and the session is one of her 1:1 text sessions; or a `date` action is sent while a date runs, to its sub-session included |
+| 409 | `activity_ended` | the session is a date's sub-session and the date has ended |
+| 409 | `activity_settling` | a date of the persona has ended and another request is settling it; send again shortly |
+| 409 | `choice_pending` | a `date` action while any session of the persona holds a pending, unexpired life choice |
+| 400 | `byoc_unsupported` | a `date` action on a BYOC instance's session |
+
+A date that has ended and is not settled yet is settled by the next send to one
+of the persona's 1:1 text sessions, before that turn starts; the send waits for
+one judge call. A send under a `client_msg_id` the session already holds is a
+retry and is answered from what is stored, whatever the date's state. See
+[activities.md](activities.md).
+
 Once the first SSE byte has been written, terminal failures arrive as an
 in-band `error` frame and the stream closes; the HTTP response has already
 committed `200 OK`.
@@ -435,6 +454,7 @@ physical or custom action → chemistry), and a refused `tip`, `bluff`, `threate
 | `custom` | `text`: required, 1–100 chars |
 | `tip` | `amount_usd`: required, finite, `> 0` and `≤ 1_000_000_000` |
 | `gift` | `kind`: `item` \| `clothing` (required); `name`: required, 1–64 chars |
+| `date` | `duration`: `short` (1 h) \| `mid` (4 h), required; `place`: required, 1–40 chars; `content`: required, 1–120 chars; neither may hold a line break or a control character |
 
 **What `give` hands over.** Consumables linger on the persona (below). Valuables do not, and they do not join her items: `gift` is the action for something she keeps. `cash` is money handed over in person, counted in notes; `tip` is the action that carries an amount. `cuisine` is a proper dish or meal; `food` is something to eat.
 
@@ -454,7 +474,7 @@ physical or custom action → chemistry), and a refused `tip`, `bluff`, `threate
 | 5 | 3 3 2 2 1 | 1 2 2 3 3 | 1 2 3 2 1 |
 | quantity > 5 | 4 3 3 2 1 | 1 2 3 4 4 | 1 3 4 2 1 |
 
-A turn is a user message of the text session; product-QA messages and voice calls do not count, and there is no time limit. The state reaches the judge, the reply prompt and the image composer, and the caller through the `body_state` frame and [`GET /v2/comp/session/{session_id}/effects`](#get-v2compsessionsession_ideffects). A refused give has no effect. Design: [lingering effects spec](superpowers/specs/2026-10-12-given-item-lingering-effects-design.md), [give categories spec](superpowers/specs/2026-10-13-give-categories-design.md).
+A turn is a user message of the text session or of one of its dates' sub-sessions; product-QA messages and voice calls do not count, and there is no time limit. The state reaches the judge, the reply prompt and the image composer, and the caller through the `body_state` frame and [`GET /v2/comp/session/{session_id}/effects`](#get-v2compsessionsession_ideffects). A refused give has no effect. Design: [lingering effects spec](superpowers/specs/2026-10-12-given-item-lingering-effects-design.md), [give categories spec](superpowers/specs/2026-10-13-give-categories-design.md).
 
 **A give of something she does not use.** The persona's `art_metadata.smoking`, `alcoholic`, `drug`, `coffee` and `gluttony` say whether she smokes, drinks, uses weed, drinks coffee and loves good food (table [below](#post-v2compsessionsession_idevents)). A `give` of `cigarette`, `alcohol`, `herb`, `coffee` or `cuisine` whose key is `false` is rolled once before the judge runs. One time in three the turn goes on as usual. Otherwise the response is `refuse`, whatever the judge answers and with or without the LLM judge: the `action_response` frame and the `response` the history routes return say `refuse`, the give leaves no effect, and it costs the bond line a tier like any refused give. The judge is told the outcome (see [model-config.md](model-config.md#taskspde_decision--opt-in-llm-pde-judge)). A key that is `true` or absent never rolls, nor does any other item or action.
 
@@ -471,9 +491,21 @@ the `emotional` tone, accepted or refused: the reply is written from the persona
 her response, without the chat history, the user profile or the affinity conclusions. The
 response itself is decided as above. The reply's rows carry `metadata.tone = "emotional"`.
 
+**A date.** `date` asks her out. An engine gate runs first: none for `short`,
+bond at tier 2 for `mid`, and never while she is offline or on another date; a
+failed gate is a refusal whatever the judge answers. Refused, the turn is an
+ordinary one that costs nothing. Accepted, the turn's `final` frame carries
+`activity`: `id`, `sub_session_id`, `duration`, `place`, `content`, `status`,
+`started_at` and `ends_at`. The date runs in that sub-session for its
+`duration` from her reply, while her 1:1 text sessions pause; its turns are sent
+to `sub_session_id`, and it ends on the clock or through
+[the end route](#post-v2compsessionsession_idactivitiesactivity_idend). The
+invitation is text only: no picture, and `image.force` is ignored. The
+mechanism end to end is in [activities.md](activities.md).
+
 With an action, `content` may be empty, and it can be combined with
 `image_url` and `image`. Every value violation (bounds, missing
-`item`/`text`/`amount_usd`/`kind`/`name`) is a `422` with `code: "unprocessable"`; a body whose `type` or `item` is not one of the
+`item`/`text`/`amount_usd`/`kind`/`name`/`duration`/`place`/`content`) is a `422` with `code: "unprocessable"`; a body whose `type`, `item` or `duration` is not one of the
 listed values is rejected as unparseable JSON (also `422`). The action is stored on the user
 row and returned by both history routes as `action`, with `response` once the
 turn has taken effect.
@@ -628,6 +660,7 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 - reasoning: when the judge returned reasoning, `reasoning*` precedes every shape in this list, ahead of `action_response` and `body_state`: `reasoning* → meta(reply) → delta* → done → final`
 - action turn: the same shapes with `action_response` ahead of the first `meta` — `action_response → meta(reply) → delta* → done → final`; never `ghost` or `product_qa`
 - an accepted `photo` or `strip` with image capability: `action_response → meta(reply_text_image) → delta* → done → image_request → final`
+- an accepted `date`: `action_response → meta(reply) → delta* → done → final`, with `activity` on `final`
 - a turn with lingering effects or known needs: `body_state` sits ahead of the first `meta`, after `action_response` when both are sent — e.g. `action_response → body_state → meta(reply) → delta* → done → final`
 - `product_qa`: `meta(action_type=product_qa) → delta* → done → final` — same shape as a normal text reply, streamed by an independent model chain (`[tasks.chat_product_qa]`) instead of `chat_companion`; persisted with `channel='product_qa'` and reported as `product_qa` again on replay.
 
@@ -819,13 +852,18 @@ persisted instruction message. A life event's picture (`POST …/events`) answer
 no user message, so editing one needs `persist_instruction: true`; without it
 the call is a `409`.
 
+On a [date](activities.md)'s sub-session, while the date runs, the edit reads
+and writes the relationship on the date's parent session, and the affinity
+pass of `evaluate_affinity` or `reply_with_text` records the turn unjudged, as
+every date turn is.
+
 | Status | Meaning |
 |---|---|
 | 400 | malformed `prompt_traits`; `character` missing on a BYOC instance, present on any other, or not a valid sealed card (`invalid_payload`) |
 | 401 | missing or invalid bearer |
 | 403 | not your session; `byoc_forbidden` (the caller secret is missing or wrong); `byoc_card_rejected` (the card does not open under the instance's key) |
 | 404 | unknown session, or no such message in it |
-| **409** | the message exists but is not an image turn; or it answers no user message (a life event's picture) and `persist_instruction` is not set; or the session is a group session (`message` contains `wrong_channel`) |
+| **409** | the message exists but is not an image turn; or it answers no user message (a life event's picture) and `persist_instruction` is not set; or the session is a group session (`message` contains `wrong_channel`); or the session is a date's sub-session and the date is over (coded body, `code: "activity_ended"`) |
 | 422 | blank `instruction`, or unsupported `aspect_ratio` |
 | 501 | neither `[tasks.chat_image_edit_compose]` nor `[tasks.chat_image_prompt_compose]` is configured |
 | 429 | per-user in-flight cap reached (3, shared with chat/voice/compose) |
@@ -963,7 +1001,10 @@ for one of three reasons:
 Either way one assistant message is generated, persisted and returned.
 Otherwise `greeting` is `null`. It is also `null`, without generating, while
 an offline life event of the persona is under way (see
-[the events route](#post-v2compsessionsession_idevents)).
+[the events route](#post-v2compsessionsession_idevents)), and while a
+[date](activities.md) of the persona is under way. A date that has ended and is
+not settled yet is settled first, before the call decides anything; while
+another request settles it, `greeting` is `null`.
 
 ```json
 {
@@ -1029,7 +1070,7 @@ life-choice route below).
 - **Errors:** `400` with `code: "invalid_payload"` for `occasion` without
   `open_key`, `open_key` without `occasion`, or a malformed `open_key`; `422`
   for an unknown `occasion`. Session checks as on the stream endpoint (`403`,
-  `404`, `409` for a voice or group session), `429` at the per-user in-flight cap. A
+  `404`, `409` for a voice or group session or a date's sub-session), `429` at the per-user in-flight cap. A
   failed generation returns the upstream error the image endpoints return and
   persists nothing; the next open (with the same key) retries. A BYOC
   instance's session is `400 byoc_unsupported`: the route needs a character
@@ -1042,7 +1083,8 @@ ask; the engine decides whether and what. It draws one kind of event, or none,
 and the persona tells the user in one proactive message — except the offline
 kinds, which make her unreachable and are announced only in part (below). Nothing
 is drawn while she waits for the user's answer to one of her life choices (see
-[the life-choice route](#post-v2compsessionsession_idlife-choiceschoice_id)). While
+[the life-choice route](#post-v2compsessionsession_idlife-choiceschoice_id)), nor
+while a [date](activities.md) of hers is not settled yet. While
 an event lasts, the judge and the reply know she is in it (see
 [model-config.md](model-config.md#taskspde_decision--opt-in-llm-pde-judge)).
 How the draw works and how events and the persona's needs fit together is in
@@ -1060,7 +1102,7 @@ How the draw works and how events and the persona's needs fit together is in
 | Field | Rules |
 |---|---|
 | `event_key` | required: 1–128 characters of `[A-Za-z0-9_.:-]`, scoped to the session. The same key returns the same event |
-| `kinds` | optional. Absent or `null`: every kind. An array allows the listed kinds (`[]`: nothing is drawn). An object `{"allow": […], "disallow": […]}` allows what `allow` lists (absent or `null`: every kind; `[]`: none) minus what `disallow` lists; a kind in both is not drawn, and `{}` allows every kind. An unknown key in the object or an unknown kind is a `422`, and so is `taking_space`, `fell_out`, `traveling_together` or `bathing_together`: the engine places those itself and never draws them |
+| `kinds` | optional. Absent or `null`: every kind. An array allows the listed kinds (`[]`: nothing is drawn). An object `{"allow": […], "disallow": […]}` allows what `allow` lists (absent or `null`: every kind; `[]`: none) minus what `disallow` lists; a kind in both is not drawn, and `{}` allows every kind. An unknown key in the object or an unknown kind is a `422`, and so is `taking_space`, `fell_out`, `traveling_together`, `bathing_together` or `on_a_date`: the engine places those itself and never draws them |
 | `user_timezone`, `user_country`, `user_region`, `tier`, `prompt_traits`, `memory_scope`, `affinity_scope`, `audit` | as on `/open`, for generating the message |
 | `image` | optional: `{"style", "aspect_ratio", "prompt_variant"}`, each as on a chat turn's `image` (no `force`; an unsupported `aspect_ratio` is a `422`). The caller handles images: a `taking_selfie` or `strip` message then carries her picture, when `[tasks.chat_image_prompt_compose]` is configured (below). Absent, or no composer: words only. Every other kind ignores it |
 | `outfit` | optional: what she wears, as on a chat turn — typically one of her wardrobe entries, not checked against it; 1–64 characters after trim, blank reads as absent, longer is a `422`. Her words follow it, and so does her picture. On a `strip` she has just taken it off: 刚把「{outfit}」脱了, or 刚把衣服脱了 without one. Absent: no outfit in her prompt, and the composer dresses her from the scene |
@@ -1144,14 +1186,17 @@ Kinds fall into four categories. `short` and `mid` are incidents; `body` and
 A range is drawn when the event starts. That is 70 drawable kinds. Both genders
 draw both gatherings, at the same weight; that is deliberate.
 
-Four more kinds are never drawn: `taking_space` (a separation she asked for and
+Five more kinds are never drawn: `taking_space` (a separation she asked for and
 the user agreed to, 12–24 h, offline), `fell_out` (the falling-out when the
 user ignores her ask for space, 1 h), `traveling_together` (a trip she
-suggested and the user agreed to, 48–72 h, a `trip` background, not offline)
-and `bathing_together` (a bath she suggested and the user agreed to, 30 min, a
-`short` incident, not offline). The engine writes them for the
-[life-choice flow](#post-v2compsessionsession_idlife-choiceschoice_id). They
-show up as the `event` of `…/effects` and of the life-choice response, and
+suggested and the user agreed to, 48–72 h, a `trip` background, not offline),
+`bathing_together` (a bath she suggested and the user agreed to, 30 min, a
+`short` incident, not offline) and `on_a_date` (a date the user asked her on
+and she accepted, 1 or 4 h, a `short` incident, not offline). The engine writes
+the first four for the
+[life-choice flow](#post-v2compsessionsession_idlife-choiceschoice_id) and
+`on_a_date` for a [date](activities.md). They show up as the `event` of
+`…/effects`, the first four also as the `event` of the life-choice response, and
 cannot be listed in `kinds`.
 
 `sudden_desire`, `strip`, `streaking`, `having_sex`, `just_have_sex`, `masturbating` and `pregnancy_scare`, which implies sex, carry adult themes;
@@ -1187,6 +1232,10 @@ The draw:
   life choice) until it is answered or lapses (24 h), the draw returns `{"event": null,
   "message": null}` for every session of the persona. A repeat of an
   `event_key` that already drew still returns its event.
+- **While a date is not settled, nothing is drawn.** From the moment she accepts
+  a date until it is settled, past its end, the draw returns the same nulls for
+  every session of the persona ([activities.md](activities.md#settlement)). A
+  repeat of an `event_key` still returns its event.
 - **Cooldowns.** Each kind has a cooldown from when it started. A trip starts
   at most once a week, and a `body` state at most once a fortnight, whichever
   kind. Any offline kind starts at most once every 12 hours, whichever kind.
@@ -1340,8 +1389,8 @@ reply does not count. Her other sessions never carry it.
   with text; see
   [model-config.md](model-config.md#taskspde_decision--opt-in-llm-pde-judge)).
 - **Errors:** `400` with `code: "invalid_payload"` for a malformed
-  `event_key`; `422` for an unknown `kind`, or for `taking_space`, `fell_out`, `traveling_together` or `bathing_together`. Session checks as on `/open`
-  (`403`, `404`, `409` for a voice or group session), `429` at the per-user
+  `event_key`; `422` for an unknown `kind`, or for `taking_space`, `fell_out`, `traveling_together`, `bathing_together` or `on_a_date`. Session checks as on `/open`
+  (`403`, `404`, `409` for a voice or group session or a date's sub-session), `429` at the per-user
   in-flight cap. A BYOC instance's session is `400 byoc_unsupported`. A failed
   generation returns the upstream error the image endpoints return and
   persists nothing. A blank reply persists nothing and returns nulls.
@@ -1363,7 +1412,9 @@ The persona's lingering state from accepted gives, her needs and the events unde
  "changes_at": "2026-10-16T14:00:00Z"}
 ```
 
-`effects` is `[]` when nothing is at work. Errors as `/open`: `404 session_not_found`, `403 session_forbidden`, `409 wrong_channel` for a voice or group session.
+`activity` is the persona's [date](activities.md) while one is `ongoing`, or `ended` and not yet settled, on any of her 1:1 text sessions: the shape of the stream's `final.activity`, with `status` as of the response; its turns go to `sub_session_id`. It is omitted otherwise. While the date runs, `event` is its `on_a_date` incident.
+
+`effects` is `[]` when nothing is at work. Errors as `/open`: `404 session_not_found`, `403 session_forbidden`, `409 wrong_channel` for a voice or group session or a date's sub-session.
 
 ### `POST /v2/comp/session/{session_id}/life-choices/{choice_id}`
 
@@ -1382,7 +1433,8 @@ says nothing. There are five kinds:
 | `bathe_together` | the user to take a bath with her | the pair is romantically compatible, chemistry is at tier 2 or more for a persona whose `hygienic` is `true` and at tier 3 or more when it is absent (never when it is `false`), and at least 3 of the newest 7 judged turns have warmth 0.5 or more. It does not read patience |
 
 Only judged turns after the session's newest choice episode count, whatever its kind: her
-ask, its answer and any separation it started.
+ask, its answer and any separation it started. She asks nothing while a
+[date](activities.md) of hers is under way, and a date's own turns are never judged turns.
 `propose` wins when both `sleep_together` and `propose` qualify on one turn.
 `bathe_together` has a trigger of its own, independent of those two and of a
 trip under way. She has one ask pending at a time, so on a turn where several
@@ -1494,7 +1546,7 @@ Errors. These refusals carry the pre-stream body `{code, message, user_message}`
 | 403 | `session_forbidden` | the session is not the caller's |
 | 404 | `session_not_found` | unknown session |
 | 404 | `life_choice_not_found` | the choice is not a choice of this session |
-| 409 | `wrong_channel` | a voice or group session |
+| 409 | `wrong_channel` | a voice or group session, or a date's sub-session |
 | 409 | `life_choice_closed` | the choice is already resolved (by this route, or by the user's message), or lapsed |
 
 `422` for a `response` that is not `accept` or `decline`, or another malformed
@@ -1503,6 +1555,48 @@ the choice stays open.
 
 Streaming: the committed answer first, then her reply as it is generated. See
 [Streaming `/open`, `/events` and `/life-choices`](#streaming-open-events-and-life-choices).
+
+### `POST /v2/comp/session/{session_id}/activities/{activity_id}/end`
+
+End a [date](activities.md) and settle it. `session_id` is the session the
+invitation was sent in, not the date's sub-session, and `activity_id` is the
+`id` of the `activity` the client received. No body.
+
+A date still under way ends now: its `on_a_date` event ends at the request. One
+whose clock ran out keeps the end it had. Either way the date is then settled
+in this call: the activity judge reads it once, its verdict moves the
+relationship (each line by at most one tier), and the date goes into the
+relationship's memory ([activities.md → Settlement](activities.md#settlement)).
+A date already settled, by this route, a send or `/open`, answers with the
+result it stored, so a repeat call changes nothing and a client can call it
+whenever its own timer fires.
+
+```json
+{"activity": {"id": "…", "sub_session_id": "…", "duration": "short", "place": "海边的餐厅", "content": "吃一顿大餐", "status": "settled", "started_at": "2026-11-12T12:00:00Z", "ends_at": "2026-11-12T12:40:00Z"},
+ "affinity": {"bond_tier": 3, "chem_tier": 2, "bond_label": "close_friend", "chemistry_label": "flirtation", "…": "…"},
+ "effective_deltas": {"warmth": 0.02, "trust": 0.05, "intrigue": 0.01, "intimacy": 0.03, "patience": 0.0, "tension": 0.01}}
+```
+
+`activity` is the date, `status: "settled"`, with `ends_at` the moment it
+ended. `affinity` is the relationship after it, in the shape of
+[`GET /bff/v1/comp/affinity/{session_id}`](#get-bffv1compaffinitysession_id)'s
+`affinity`. `effective_deltas` is what the date moved, as its affinity event
+committed it, and `null` when no event was written: no turn of the date was
+answered, or the relationship was archived meanwhile.
+
+On a date nobody has settled yet, the call waits for the judge (at most 45
+seconds). The settlement runs in a task of its own: a client that disconnects
+does not stop it, and reads the result by calling again.
+
+Errors carry the pre-stream body `{code, message, user_message}`:
+
+| Status | Code | When |
+|---|---|---|
+| 403 | `session_forbidden` | the session is not the caller's |
+| 404 | `session_not_found` | unknown session |
+| 404 | `activity_not_found` | the activity is not a date of this session |
+| 409 | `wrong_channel` | a voice or group session, or a date's sub-session: send the parent's id |
+| 409 | `activity_settling` | another request is settling the date; call again shortly |
 
 ### `PUT /v2/comp/session/{session_id}/message/{message_id}/reaction`
 
@@ -1576,6 +1670,12 @@ session.
 
 `action` (user rows only, omitted otherwise) is the action the row was sent
 with, plus `response` (`"accept"` | `"refuse"`) once the turn took effect.
+
+`activity` (the user row of an accepted `date` invitation only, omitted on every
+other row, a refused invitation included) is the date that invitation opened, in
+the shape of the stream's `final.activity`, with `status` (`ongoing`, `ended` or
+`settled`) as of the response. Its `sub_session_id` is a session this route
+serves too: the date's own rows are read under that id.
 
 `reaction` (assistant rows only, omitted otherwise) is `{emoji, reacted_at}`.
 
@@ -2146,7 +2246,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 ### `GET /comp/chat/{user_id}/sessions`
 
-All chat sessions for `user_id`. The path's `user_id` MUST match the JWT's user_id; otherwise 403. Returns `{ "sessions": [...] }`, each entry carrying `session_id`, `instance_id`, `is_converted`, `last_active_at`, and `channel`. Group sessions are not listed; they come from `GET /v2/comp/groups`.
+All chat sessions for `user_id`. The path's `user_id` MUST match the JWT's user_id; otherwise 403. Returns `{ "sessions": [...] }`, each entry carrying `session_id`, `instance_id`, `is_converted`, `last_active_at`, and `channel`. Group sessions are not listed; they come from `GET /v2/comp/groups`. A date's sub-session is not listed either: it is reached through its parent's history and effects ([activities.md](activities.md)).
 
 ### `GET /comp/user/{user_id}/profile`
 
@@ -2360,7 +2460,7 @@ Soft-delete every session this user holds with one persona instance. The instanc
 }
 ```
 
-`archived_sessions` counts the sessions flipped by *this* call, so a repeat call returns `200` with `0`. Every channel is archived, voice included — the unit is the relationship, not one client's view of it.
+`archived_sessions` counts the sessions flipped by *this* call, so a repeat call returns `200` with `0`. Every channel is archived, voice and a date's sub-sessions included — the unit is the relationship, not one client's view of it. A date under way ends with it, and a date not settled yet is never settled.
 
 **What is deleted:** `companion_affinity` (and its events, by cascade), the relationship layer of `companion_memories`, `character_insights`, `user_insights`, the relationship scan's state, episodes, arc and journal (`relationship_scan_state`, `relationship_episodes`, `relationship_arcs`, `relationship_journal`), and the persona's seat in every [group](group-chat.md); the persona's story digest (`persona_story_insights.digest`) is cleared — the state that would otherwise carry into the next conversation. A turn still running when the archive request arrives writes none of it back: its affinity, relationship-memory and character and user insight writes find the session archived and write nothing, and a relationship scan in flight finds its scan state gone and writes nothing further. **What is not:** `chat_messages`. The transcript stays, so the audit tables that reference a session by id (`companion_decision_events`, `character_insights_events`, `chat_vision_events`, `chat_images_events`) still point at something readable. `relationship_scan_events` stays too (counts and ids only). The profile layer of `companion_memories` (`instance_id IS NULL`) also stays — those are cross-persona facts about the user. A conversation started on the same instance later begins a new scan state and a new first meeting, dated by its first non-archived row.
 
@@ -2479,7 +2579,8 @@ The body is the canonical start body plus one BFF-only field:
 `persona_name` is always present and is `null` for a BYOC instance, whose
 name only its card holds. `history` entries are the shape of the
 [BFF history route](#get-bffv1compchatsession_idhistorylimit50offset0)'s, so
-her ask row carries its `life_choice` receipt here too.
+her ask row carries its `life_choice` receipt here too, and an accepted date
+invitation its `activity` receipt.
 
 Affinity is intentionally **not** bundled here — the frontend reads it
 separately via the two affinity routes below, so a cold mount that does not
@@ -2509,7 +2610,7 @@ echoes the quote a `user` row was sent with (see the stream route's
 session; omitted on ordinary turns and on turns whose anchor failed to resolve,
 so a cold mount can re-render the quote without keeping local state.
 `action` (user rows only, omitted otherwise) is the action the row was sent
-with, plus `response` (`"accept"` | `"refuse"`) once the turn took effect. `reaction` (assistant rows only, omitted otherwise) is `{emoji, reacted_at}`. `occasion` (assistant rows the persona wrote on her own only, omitted otherwise) is the canonical route's field of the same name, `life_choice` included; the start bundle carries it too. `life_choice` (the assistant row of her ask only, omitted otherwise) is the canonical route's receipt of the same name, `{id, kind, status, resolved_at}`, with the same five statuses and the same `resolved_at` rule; the start bundle carries it too. Same auth, ownership check, and
+with, plus `response` (`"accept"` | `"refuse"`) once the turn took effect. `reaction` (assistant rows only, omitted otherwise) is `{emoji, reacted_at}`. `occasion` (assistant rows the persona wrote on her own only, omitted otherwise) is the canonical route's field of the same name, `life_choice` included; the start bundle carries it too. `life_choice` (the assistant row of her ask only, omitted otherwise) is the canonical route's receipt of the same name, `{id, kind, status, resolved_at}`, with the same five statuses and the same `resolved_at` rule; the start bundle carries it too. `activity` (the user row of an accepted date invitation only, omitted otherwise) is the canonical route's receipt of the same name, and a date's sub-session id is served here too; the start bundle carries the receipt as well. Same auth, ownership check, and
 `limit ∈ [1, 50]` clamp as the canonical history route. **Intentional
 divergence:** the default `limit` is 50 (the canonical route defaults to 20),
 because the BFF exists for a cold mount that wants a full backscroll in one
@@ -2612,7 +2713,14 @@ or only time-decay), or when the latest event predates affinity migration
 reports all-zero `effective_deltas`. The tier drop of a life choice is an
 affinity event of its own type, `life_choice`, which this route never returns,
 like `time_decay`: the new state comes back in the resolution response, and
-from the absolute route below on any other device.
+from the absolute route below on any other device. A settled date's `activity`
+event is never returned either: its result comes back from
+[the end route](#post-v2compsessionsession_idactivitiesactivity_idend).
+
+A date's sub-session id is accepted here and answers with the relationship's
+latest turn, which lives on the date's parent session. During a date, that is
+the date's last turn, which moves nothing (a refused action aside): a date is
+judged once, when it is settled.
 
 - `effective_deltas_computed` — exact floored per-turn line delta computed at
   persist time from the floored before/after bond/chemistry scores; read from
@@ -2665,7 +2773,8 @@ else's).
 ```
 
 `affinity` is `null` when the session has no affinity row yet — the row is
-created on the first turn, so a just-started session legitimately has none.
+created on the first turn, so a just-started session legitimately has none. A
+date's sub-session never has one: its relationship is read at the parent's id.
 
 - `bond` / `chemistry` — the real stored composite scores (0–1); no display
   curve (the pacing nonlinearity lives in the write-side tier decay — see
@@ -2966,7 +3075,7 @@ on whichever route it comes from, as does the caller-secret refusal
 | 401 | — | Missing / malformed / expired / wrong-secret JWT. The body is empty: the auth layer answers before any handler |
 | 403 | `forbidden` | Path-user vs JWT-user mismatch, or trying to read a session you don't own; or a `/svc/v1/*` secret header (`x-insights-export-secret`, `x-facts-export-secret`, `x-user-erase-secret`) missing or wrong |
 | 404 | `not_found` | Unknown session / persona / message id |
-| 409 | `conflict` | The resource's state does not permit the action. The reaction route and image edit return it for a group session, with a `message` containing `wrong_channel`. The 1:1 stream and async send routes, `/open`, `/events`, `/effects` and the life-choice route refuse a group session with the coded body instead (`code: wrong_channel`), as the group routes refuse a non-group session |
+| 409 | `conflict` | The resource's state does not permit the action. The reaction route and image edit return it for a group session, with a `message` containing `wrong_channel`. The 1:1 stream and async send routes, `/open`, `/events`, `/effects` and the life-choice route refuse a group session with the coded body instead (`code: wrong_channel`), as the group routes refuse a non-group session. A [date](activities.md)'s refusals use the coded body too, on whichever route they come from: `activity_in_progress`, `activity_ended`, `activity_settling`, `choice_pending`, and `activity_not_found` (a `404`) |
 | 422 | `unprocessable` | A well-formed request whose values are not acceptable |
 | 429 | `too_many_requests` | A per-user concurrency cap was reached |
 | 500 | `internal` | Anything else (DB error, LLM API error, etc.) |
@@ -2982,6 +3091,7 @@ on whichever route it comes from, as does the caller-secret refusal
 - `crates/eros-engine-server/src/routes/session_events.rs` — life events the persona tells: the draw, and the proactive message that tells it (none for an offline kind she does not announce) (`v2/comp/session/{session_id}/events`)
 - `crates/eros-engine-server/src/routes/session_effects.rs` — the persona's lingering state from accepted gives, her needs and the events under way (`v2/comp/session/{session_id}/effects`)
 - `crates/eros-engine-server/src/routes/life_choices.rs` — the user's answer to one of her life choices: accept or decline (`v2/comp/session/{session_id}/life-choices/{choice_id}`)
+- `crates/eros-engine-server/src/routes/activities.rs` — ending and settling a date (`v2/comp/session/{session_id}/activities/{activity_id}/end`); `crates/eros-engine-server/src/pipeline/activity.rs` holds who may send during a date and the settlement
 - `crates/eros-engine-server/src/routes/group.rs` — group management and the group send route (`v2/comp/group*`)
 - `crates/eros-engine-server/src/routes/reaction.rs` — message reactions: set, clear and the allowlist (`v2/comp/session/{session_id}/message/{message_id}/reaction`, `v2/comp/reactions`)
 - `crates/eros-engine-server/src/routes/insight.rs` — v2 relationship-scoped insight profiles (`v2/comp/instance/{instance_id}/insight/character`, `.../insight/user`)

@@ -209,6 +209,7 @@ crates/
 │       ├── events.rs         # EventRepo (persona_events: life events under way, history, offline stretches, false alarms)
 │       ├── group.rs          # GroupRepo (group sessions, membership)
 │       ├── life_choices.rs   # LifeChoiceRepo (the persona's life choices: rows, pending, resolve, slowdown window)
+│       ├── activity.rs       # ActivityRepo (dates: opening one, the settlement claim, the date's transcript)
 │       ├── affinity.rs       # AffinityRepo (persist_with_event, record_ghost, persist_life_choice_drop_in_tx)
 │       ├── memory.rs         # MemoryRepo (Profile/Relationship layers)
 │       ├── insight.rs        # InsightEventRepo (human_insights_events audit rows)
@@ -233,7 +234,7 @@ crates/
         ├── auth/             # AuthValidator trait + Supabase impl + middleware
         ├── pipeline/         # stream (run_stream) / group + group_director / reasoning_call / handlers / post_process / dreaming / …
         ├── prompt.rs         # system-prompt builder (affinity → directives)
-        ├── routes/           # health / companion / companion_stream / companion_async / insight / image_edit / voice / persona / session_open / session_events / session_effects / life_choices / persona_items / user_rows / reaction / group / world_town / svc (service-to-service export, `/svc/v1/*`) / bff / dto / mod
+        ├── routes/           # health / companion / companion_stream / companion_async / insight / image_edit / voice / persona / session_open / session_events / session_effects / life_choices / activities / persona_items / user_rows / reaction / group / world_town / svc (service-to-service export, `/svc/v1/*`) / bff / dto / mod
         └── openapi.rs        # utoipa ApiDoc spec metadata
 ```
 
@@ -243,6 +244,7 @@ crates/
 - [Ghost mechanics](ghost-mechanics.md) — score formula + protection rules + worked examples
 - [Group chat](group-chat.md) — one user, up to three personas, the director, the speaker relay
 - [Life events and needs](life-events-needs.md) — the persona's needs and their drift, the event draw, backgrounds, offline kinds, false alarms, the ask-for-space and romantic choices
+- [Activities](activities.md) — a date as a sub-session: the invitation and its gate, date turns, what pauses, settlement, the memory it leaves
 - [Memory layers](memory-layers.md) — profile vs relationship, Voyage, pgvector retrieval
 - [Deploying](deploying.md) — Docker, bring-your-own Postgres / IdP
 - [API reference](api-reference.md) — every `/comp/*` endpoint

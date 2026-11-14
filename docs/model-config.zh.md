@@ -582,6 +582,7 @@ post-process（记忆、insights、亲密度）照常跑；模型、采样、输
 | `chat_product_qa` | `pipeline::stream`，通过 `resolve_product_qa()`（PDE `product_qa` 动作的出戏产品问答执行器；任务块缺失或 `filter_prompt` 为空白时关闭；还需要 LLM PDE 已启用） | live（opt-in） |
 | `affinity_evaluation` | `pipeline::post_process`（每轮好感度裁决——四个档位线轴加 warmth/patience 两个 1..3 绝对档，由引擎侧换算；每个 Reply 轮次后以 fire-and-forget 方式运行；**不接受 `filter_prompt`** —— 该 prompt 由引擎持有，设置该键会拒绝启动——**任何写法都算，包括显式留空**。与这里其它任务不同，空白在这里不等于"关闭"，请直接不写这个键。见 issue #210） | live |
 | `affinity_summary` | `pipeline::post_process::summarize_feeling`（改写 `companion_affinity.feeling_clause`——即 `[feelings]` 块的第一人称叙述——依据档位标签与近期判官理由；仅在好感度写入之后、"移动回合"上运行（任意判官档位不为零、端点档位偏离基线，或动作被拒绝而降档；ghost 轮次不会进入 post-process），且仅当本次请求确实注入了好感度轴；按当轮请求计费给当前用户，不是 sweeper。**不接受 `filter_prompt`**——该 prompt 由引擎持有，与 `affinity_evaluation` 同样处理，设置该键会拒绝启动。块缺失 ⇒ `feeling_clause` 保持 `NULL`，`[feelings]` 永不渲染） | live（opt-in） |
+| `activity_judge` | `pipeline::activity`，通过 `resolve_activity_judge()`（结算一场[约会](activities.zh.md)：约会结束后调用一次，返回对整场约会的结论（和逐轮评估器同样的 ordinal 形状）、约会的片段和其中的纪事时刻。**只配参数，不接受 `filter_prompt`**——prompt 由引擎持有，设置该键会拒绝启动，**任何写法都一样，显式留空也算**——与 `affinity_evaluation` 同样处理。块缺失 ⇒ 判官用 `affinity_evaluation` 的模型和预算（那个块也缺失时才落到全局默认值）；不论哪种情况，`max_tokens` 都至少抬到 1200。见[下文](#tasksactivity_judge--约会判官)） | live |
 | `character_insight_extraction` | `pipeline::post_process`（角色链 stage 1 —— 实验特性 —— 针对 AI **角色**的逐轮事实挖掘，是 `insight_extraction` 人类侧挖掘的镜像。持有 prompt，与 `insight_extraction` / `dreaming_scan` 共用同一个必填-`filter_prompt` 闸门。这个块是整条链（两个 stage）的总开关——任务块缺失即关闭） | experimental（opt-in） |
 | `character_insight_structuring` | `pipeline::post_process`（角色链 stage 2 —— 实验特性 —— 把 stage 1 挖掘出的事实加上已有的 `character_insights` 行，转成类型化的十列对象。**仅参数，不接受 `filter_prompt`** —— 它的 prompt 写在 `prompt.rs` 里，必须与它要填的 `character_insights` 列保持同步，所以设置该键会拒绝启动，**任何写法都算，包括显式留空**——与 `affinity_evaluation` 同样处理。块缺失时 stage 2 会退回到 stage 1 的模型/预算，绝不退到全局默认） | experimental（opt-in） |
 | `user_insight_extraction` | `pipeline::post_process`（用户链 stage 1 —— 实验特性 —— 针对真人**用户**的逐轮事实挖掘，但按关系分开，而不是全局的 `insight_extraction`。持有 prompt，与 `insight_extraction` / `character_insight_extraction` / `dreaming_scan` 共用同一个必填-`filter_prompt` 闸门。这个块是整条链的总开关——任务块缺失即关闭） | experimental（opt-in） |
@@ -606,6 +607,7 @@ post-process（记忆、insights、亲密度）照常跑；模型、采样、输
 - `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision`，通过 `run_stream` 内的 `run_pde_decision`（仅当设置了 `filter_prompt`）；`chat_image_prompt_compose`，通过 `resolve_image_prompt_compose()`（出图 prompt 合成器，图片轮次必需，仅在图片轮次按需解析）；`chat_vision`，通过 `resolve_vision()`（视觉预处理阶段，opt-in）；`chat_product_qa`，通过 `resolve_product_qa()`（产品问答执行器，opt-in）；`chat_input_filter`，通过 `resolve_input_filter()`（输入改写，opt-in）；`chat_output_filter`，通过 `resolve_output_filter()`
 - `crates/eros-engine-server/src/routes/voice.rs` → `chat_voice`，通过 `resolve_voice()`
 - `crates/eros-engine-server/src/pipeline/world.rs`、`story.rs`、`world_town.rs` → `world_director`、`world_stories_director`、`world_comment`、`world_reply`（world 各 sweeper，opt-in）
+- `crates/eros-engine-server/src/pipeline/activity.rs` → `activity_judge`，通过 `resolve_activity_judge()`（约会的结算，来自结束路由、一次发送或 `/open`）
 - `crates/eros-engine-server/src/pipeline/dreaming/scan.rs` → `dreaming_scan`，通过 `resolve_dreaming_scan()`；`arc_rewrite`，通过 `resolve_arc_rewrite()`（关系扫描和它发起的弧线改写；入口有三个：待扫轮数到 20 时的 post-process、dreaming 清扫器、`backfill-dreaming` 子命令）
 - `crates/eros-engine-server/src/pipeline/proactive.rs` → `chat_image_prompt_compose`，通过 `build_delegated_image_prompt_for`（`taking_selfie` 事件的图，events 请求带 `image` 时；审计 `source = event`）
 - `crates/eros-engine-server/src/routes/image_edit.rs` → `chat_image_edit_compose`，通过 `resolve_image_edit_compose()`（图片-EDIT 合成器，编辑端点每次请求都会解析；编辑块缺失时回退到 `[tasks.chat_image_prompt_compose]` 的模型链——详见下文）
@@ -668,11 +670,11 @@ post-process（记忆、insights、亲密度）照常跑；模型、采样、输
 
 只要还有被接受的 give 在起作用，引擎还会在 `[用户动作]` 之前加一行 `[身体状态]`，写明角色身上带着的余效（例如 `[身体状态] 3 杯「威士忌」，微醺，还在往上走`；见[接口参考](api-reference.zh.md#post-compchatsession_idmessagestream)）；没有时这一行不出现。
 
-**give 时掷的那一次。** 一轮的 `give` 是 `cigarette`、`alcohol`、`herb`、`coffee` 或 `cuisine`，而角色对应的 `art_metadata` 键（`smoking`、`alcoholic`、`drug`、`coffee`、`gluttony`）为 `false` 时，引擎在判官运行之前掷一次。三次里有一次什么都不变。其余情况 `[用户动作]` 一行末尾加上 `，这次你不会收下`（例如 `[用户动作] 对方递给你 1 支烟，这次你不会收下`），判官就按拒收来写 `inner_state`，而不管它的 `action_response` 怎么填，生效的回应都是 `refuse`；规则引擎的接受同样变成 `refuse`。这一行只陈述结果，不给理由。审计 payload 留的是判官自己的回答。键为 `true` 或不写时从不掷。这一轮 `affinity_scope` 性向不相容的 `strip` 也这样处理，只是不掷：这一行末尾加上 `，这次你不会让对方这样做`，生效的回应是 `refuse`。判官的 `[角色人格]` 块不列这些键。见 [life-events-needs.zh.md](life-events-needs.zh.md#角色设置)。
+**give 时掷的那一次。** 一轮的 `give` 是 `cigarette`、`alcohol`、`herb`、`coffee` 或 `cuisine`，而角色对应的 `art_metadata` 键（`smoking`、`alcoholic`、`drug`、`coffee`、`gluttony`）为 `false` 时，引擎在判官运行之前掷一次。三次里有一次什么都不变。其余情况 `[用户动作]` 一行末尾加上 `，这次你不会收下`（例如 `[用户动作] 对方递给你 1 支烟，这次你不会收下`），判官就按拒收来写 `inner_state`，而不管它的 `action_response` 怎么填，生效的回应都是 `refuse`；规则引擎的接受同样变成 `refuse`。这一行只陈述结果，不给理由。审计 payload 留的是判官自己的回答。键为 `true` 或不写时从不掷。这一轮 `affinity_scope` 性向不相容的 `strip` 也这样处理，只是不掷：这一行末尾加上 `，这次你不会让对方这样做`，生效的回应是 `refuse`。[门槛](activities.zh.md#门槛)不通过的 `date`（bond 不到第 2 档的 `mid` 约会，或她离线、正在另一场约会里时的任何约会）同样如此：这一行末尾加上 `，这次你不会答应`，例如 `[用户动作] 对方邀请你去约会：地点「海边」，安排「看海」，大约 4 小时，这次你不会答应`。判官的 `[角色人格]` 块不列这些键。见 [life-events-needs.zh.md](life-events-needs.zh.md#角色设置)。
 
 **需求上下文行。** 每个有判官的回合，上下文里都有一行 `[需求]`，位于 `[身体状态]` 之前：`[需求] 饥饿=高 社交欲=低 体力=中 情感需求=中 外出=中`，即上一次判定推算到本回合的结果；第一次判定之前为 `[需求] 尚未判定`。`外出` 每次都在；只有 `indulgence` 为 `high` 时才在末尾加上 ` 享受=高`（`[需求] 饥饿=高 社交欲=低 体力=中 情感需求=中 外出=中 享受=高`），没有它就读作“不高”，参考 prompt 里也这样告诉判官。严格模式下的判官每个回合仍然要评 `indulgence`，却看不出它原来是 `low` 还是 `mid`，所以连续聊天时它每一轮都在重新猜这一项，按习惯数目的漂移只在两次评定之间起作用。
 
-**事件上下文行。** 通过 [events 路由](api-reference.zh.md#post-v2compsessionsession_idevents)抽到的事件进行期间，判官上下文带一行 `[近期事件]`，位于 `[需求]` 之后、`[身体状态]` 之前。先列背景、再列插曲，用 `；` 连接：`[近期事件] 长途旅游（2 天前开始，约 3 天后结束）；在看书（不到 1 小时前开始，约 2 小时后结束）`。不满 1 小时写作 `不到 1 小时`，不满 48 小时取整小时，满 48 小时取整天。一段离线类事件（`away_from_phone`、`busy`、`in_battle`、`asleep`、`bros_gathering`、`sis_gathering`、`having_sex`，以及女性角色的 `out_shopping`）结束之后，在被它 ghost 过消息的会话里、角色在那里写出一条带文字的消息之前，这一行末尾会多出 `{label}（{span}前结束，期间对方的消息你没有回）`。她提出的分开（`taking_space`）结束之后，在那次选择所在的 session 里、角色在那里写出一条带文字的消息之前，这一行末尾会多出：用户在分开期间发过消息时是 `说好暂时分开（{span}前结束，期间对方的消息你没有回）`，用户守约时是 `说好暂时分开（{span}前结束，对方等到了约定之后）`；回复里 `- 刚才：` 的文字也按同样的方式分两种（见下表 `taking_space` 的两行）。一场虚惊（`period_scare`、`pregnancy_scare`）结束之后，在讲出它的那个会话里、角色在那里写出一条带文字的消息之前，这一行末尾会多出 `{label}（{span}前结束，结果是虚惊一场）`。两者同时存在时，离线类那一项在前。`{label}` 与 `{text}` 按种类列在下面的表里。文字聊天回合的回复在 `[now]` 块里带 `- 正在经历：…`（背景和插曲），在这样一段或一场虚惊之后还带一行 `- 刚才：{text}`，有没有 LLM 判官都一样；`/open` 开场白和事件消息带同样的行。两者同时存在时，两段文字共用这一行，离线类在前，用 `；` 连接：`- 刚才：睡着了，对方那时发来的消息你现在才看到；以为月经没来，后来来了，是虚惊一场`。没有可说的内容时这些行不出现。事件不直接改任何已存的需求：判官读到这一行，自己评需求。
+**事件上下文行。** 通过 [events 路由](api-reference.zh.md#post-v2compsessionsession_idevents)抽到的事件进行期间，判官上下文带一行 `[近期事件]`，位于 `[需求]` 之后、`[身体状态]` 之前。先列背景、再列插曲，用 `；` 连接：`[近期事件] 长途旅游（2 天前开始，约 3 天后结束）；在看书（不到 1 小时前开始，约 2 小时后结束）`。不满 1 小时写作 `不到 1 小时`，不满 48 小时取整小时，满 48 小时取整天。一段离线类事件（`away_from_phone`、`busy`、`in_battle`、`asleep`、`bros_gathering`、`sis_gathering`、`having_sex`，以及女性角色的 `out_shopping`）结束之后，在被它 ghost 过消息的会话里、角色在那里写出一条带文字的消息之前，这一行末尾会多出 `{label}（{span}前结束，期间对方的消息你没有回）`。她提出的分开（`taking_space`）结束之后，在那次选择所在的 session 里、角色在那里写出一条带文字的消息之前，这一行末尾会多出：用户在分开期间发过消息时是 `说好暂时分开（{span}前结束，期间对方的消息你没有回）`，用户守约时是 `说好暂时分开（{span}前结束，对方等到了约定之后）`；回复里 `- 刚才：` 的文字也按同样的方式分两种（见下表 `taking_space` 的两行）。一场虚惊（`period_scare`、`pregnancy_scare`）结束之后，在讲出它的那个会话里、角色在那里写出一条带文字的消息之前，这一行末尾会多出 `{label}（{span}前结束，结果是虚惊一场）`。两者同时存在时，离线类那一项在前。一场[约会](activities.zh.md#回到主聊天)之后，在发出邀约的那个会话里、角色在那里写出一条带文字的消息之前，这一行末尾会多出 `和对方约会（{span}前结束）`，排在上面各项之后。`{label}` 与 `{text}` 按种类列在下面的表里。文字聊天回合的回复在 `[now]` 块里带 `- 正在经历：…`（背景和插曲），在这样一段或一场虚惊之后还带一行 `- 刚才：{text}`，有没有 LLM 判官都一样；`/open` 开场白和事件消息带同样的行。两者同时存在时，两段文字共用这一行，离线类在前，用 `；` 连接：`- 刚才：睡着了，对方那时发来的消息你现在才看到；以为月经没来，后来来了，是虚惊一场`。没有可说的内容时这些行不出现。约会自己的回合上，`- 正在经历：` 把约会当作插曲来读（`和对方约会（约 3 小时后结束）`），后面再跟一行 `- 约会：地点「{place}」；安排「{content}」`。事件不直接改任何已存的需求：判官读到这一行，自己评需求。
 
 | 种类 | `{label}` | `{text}` |
 |---|---|---|
@@ -688,6 +690,7 @@ post-process（记忆、insights、亲密度）照常跑；模型、采样、输
 | `taking_space`（用户守约） | `说好暂时分开` | `你们之前说好分开一阵，现在时间到了，你们重新开始联系` |
 | `period_scare` | `月经没来` | `以为月经没来，后来来了，是虚惊一场` |
 | `pregnancy_scare` | `验出怀孕` | `验出两条杠，后来复查是虚惊一场` |
+| `on_a_date`（约会之后，在发出邀约的那个会话里） | `和对方约会` | `你们刚约会回来（{place}，{content}）` |
 
 没有事后文字的种类不在上表里：`看中了一个包`（`saw_bag`）、`看中了一件衣服`（`saw_clothes`），以及 `为分开的事闹得不愉快`（`fell_out`，用户不理会她提出的分开时那场一小时的不愉快）。持续期间，它们的标签照常出现在 `[近期事件]` 和 `- 正在经历：` 两行里。
 
@@ -1068,6 +1071,20 @@ max_tokens = 1500
 
 引擎会拒绝超过 900 字的弧线、上一版超过 300 字而新版不到它 70% 的弧线，以及缺少开头或开头超过 150 字的第一版；被拒时上一版继续生效。`max_tokens` 要远高于 900 字的上限：上限卡得太紧会把 JSON 截断，这次改写算作解析失败。缺少这个块时跳过改写并警告一次，片段一直不折入；补上这个块之后的第一次改写会在一次调用里折入所有等待中的片段，所以要和 `dreaming_scan` 一起配置。
 
+### `[tasks.activity_judge]` — 约会判官
+
+一场[约会](activities.zh.md#判官调用)结束后，一次调用结算它：对整场约会的结论（和逐轮评估器同样的 ordinal 形状），加上约会的片段和其中的纪事时刻。prompt 由引擎持有（`prompt.rs`），这个块只带 `model`、`fallback`、`temperature`、`max_tokens` 和采样参数；任何写法的 `filter_prompt`（包括留空）都会拒绝启动。
+
+```toml
+[tasks.activity_judge]
+model = "anthropic/claude-haiku-4.5"
+fallback = ["deepseek/deepseek-v4-flash", "google/gemini-3.1-flash-lite"]
+temperature = 0.3
+max_tokens = 1200
+```
+
+这个块可选。缺少它时，调用用 `[tasks.affinity_evaluation]` 的模型链和参数（那个块也缺失时才落到全局默认值）。不论哪种情况，`max_tokens` 都至少是 1200：这里设得更小，或从逐轮评估器的预算继承来的更小，都会抬到 1200，因为回复在结论之外还要带片段和时刻，被截断的回复什么都解析不出来。每次调用有 45 秒；失败或超时的调用让约会按不挪动结算，不重试。调用以任务名 `activity_judge` 记进 `engine.llm_generations`，失败的尝试记在这场约会的 `activity` 好感度事件上（见 [LLM 审计](llm-audit.zh.md)）。
+
 ### 启用/禁用 extraction
 
 `insight_extraction`（人类链的事实抽取）、`dreaming_scan`
@@ -1082,7 +1099,7 @@ max_tokens = 1500
   跑；用户链两个 stage 都不会跑）。
 
 `profile_rebuild`、`character_insight_structuring`、
-`user_insight_structuring`——三条链各自的第二次调用——以及 `arc_rewrite` **故意都不在这个闸门
+`user_insight_structuring`——三条链各自的第二次调用——以及 `arc_rewrite` 和 `activity_judge` **故意都不在这个闸门
 里**：因为这个闸门要求必须有 prompt，而这几个块都必须没有。它们各自
 被反方向的闸门管着：prompt 写死在 `prompt.rs` 里，所以给它设置
 `filter_prompt` 会拒绝启动（见上面的 `affinity_evaluation`，同一条死配置

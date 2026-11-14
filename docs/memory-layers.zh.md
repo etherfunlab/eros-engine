@@ -8,14 +8,15 @@
 
 ## 整体结构
 
-四个写入方，各有各的节奏：
+五个写入方，各有各的节奏：
 
 | 写入方 | 什么时候跑 | 写什么 |
 |--------|------------|--------|
-| [逐轮原文写入](#逐轮原文写入) | 每个实质轮次，在 post-process 里 | 用户这一句，embed 后写进 `companion_memories` 的两层 |
+| [逐轮原文写入](#逐轮原文写入) | 约会之外的每个实质轮次，在 post-process 里 | 用户这一句，embed 后写进 `companion_memories` 的两层 |
 | [Dreaming](#dreaming)（`[tasks.dreaming_scan]`） | 按关系，待扫轮数到 20 或关系闲置之后 | 画像记忆、一个片段、若干纪事 |
 | [弧线改写](#关系弧线)（`[tasks.arc_rewrite]`） | 每第四个片段 | 这段关系的弧线 |
 | [引擎自己](#纪事) | 时刻发生的那一轮，不调用 LLM | 初识、首次达到某档、礼物和第一次亲吻的纪事行 |
+| [约会结算](activities.zh.md#记忆)（`[tasks.activity_judge]`） | 每场约会一次，在它结算时 | 一个片段、一条 `date` 纪事、若干纪事时刻 |
 
 进入 1:1 prompt 的部分：
 
@@ -70,7 +71,7 @@ CREATE INDEX idx_memories_session
 
 | 表 | 一行对应 | 存什么 |
 |----|----------|--------|
-| `relationship_episodes` | 扫过的一段对话 | 最多 400 字的摘要，`started_at` / `ended_at` 取自它覆盖的第一行和最后一行，以及弧线是否已经把它折入。只追加。 |
+| `relationship_episodes` | 扫过的一段对话，或结算过的一场约会 | 最多 400 字的摘要，`started_at` / `ended_at` 取自它覆盖的第一行和最后一行，以及弧线是否已经把它折入。只追加。 |
 | `relationship_arcs` | 一段关系 | `opening`（这段关系怎么开始的，最多 150 字，只写一次）、`arc`（到目前为止的故事，最多 900 字）和 `previous_arc`。 |
 | `relationship_journal` | 一个时刻 | `occurred_on`（用户当地的日期）、`kind`、`realm`（`real` 或 `roleplay`）、最多 200 字的一句话 `summary`、可选的 `due_on`，以及供语义召回的 embedding。 |
 | `relationship_scan_state` | 一段关系 | 扫描的账：游标、待扫轮数、认领、失败计数、用户最近一次已知的时区。 |
@@ -94,7 +95,7 @@ pub async fn embed_document(&self, text: &str) -> Result<Vec<f32>, LlmError>; //
 
 ## 逐轮原文写入
 
-`write_turn` 在 post-process 里对**每一个**实质轮次运行（用户话语非空，且至少有一条非空的助手消息）。它只把**用户这一句** embed 进两层，`category` 和 `metadata` 都是 NULL。关系层那一份带 `用户：` 前缀，召回出来仍能认出是用户的原话。助手的回复从不 embed：它经召回回到 prompt 里，会把回复往重复同一句话的方向拉。
+`write_turn` 在 post-process 里对**每一个**实质轮次运行（用户话语非空，且至少有一条非空的助手消息），只有[约会](activities.zh.md#记忆)里的轮次除外，它们在约会结算时一次性进入记忆。它只把**用户这一句** embed 进两层，`category` 和 `metadata` 都是 NULL。关系层那一份带 `用户：` 前缀，召回出来仍能认出是用户的原话。助手的回复从不 embed：它经召回回到 prompt 里，会把回复往重复同一句话的方向拉。
 
 **群聊轮次**走同一个写入方，用户消息只 embed 一次。画像层写一行；关系层为每一位入座成员各写一行，不论它有没有开口，因为每位成员都在场。角色实例未激活的成员这一轮不入座。群聊来源的行 `session_id` 是群，内容带 `（群聊）用户：` 前缀，之后的 1:1 召回因此知道这句话是在哪里说的。详见 [group-chat.zh.md](group-chat.zh.md#进入-11-的内容)。
 
@@ -108,13 +109,13 @@ Dreaming 读取一段关系——一个角色实例和它的主人——的对�
 
 Dreaming 就是关系扫描，`pipeline::dreaming`。它为每段关系保留一个游标，从游标往后读。
 
-- **计数。** 每个 1:1 文字轮次给它所在的关系加一个待扫轮数；语音轮次也算，除非设置了 `DREAMING_VOICE_DISABLED`。群聊轮次不算。一段关系第一个被计入的轮次创建它的扫描状态，游标就落在这一轮之前；更早的历史由[回填](#更早的历史)读取。
+- **计数。** 每个 1:1 文字轮次给它所在的关系加一个待扫轮数；语音轮次也算，除非设置了 `DREAMING_VOICE_DISABLED`。群聊轮次不算，[约会](activities.zh.md#记忆)里的轮次也不算。一段关系第一个被计入的轮次创建它的扫描状态，游标就落在这一轮之前；更早的历史由[回填](#更早的历史)读取。
 - **待扫轮数到 20** 时，这一文字轮次的 post-process 在本轮其它写入之后就地扫描，读到本轮自己最新的那一行为止。语音轮次从不就地扫描。
 - **闲置清扫。** dreaming 清扫器每 `DREAMING_TICK_SECS`（默认 300）秒醒一次，按等待时间从长到短，扫描最多 10 段待扫轮数至少 **3**、最后一次被计入的轮次早于 `DREAMING_IDLE_SECS`（默认 3600）的关系。不到 3 轮的关系要等攒到 3 轮；它的行会被最终轮到它的那次扫描读到。
 - **一次一个。** 两条路径扫描前都先认领这段关系，所以不会有两个 worker 同时扫同一段关系。
 - **开关。** 没有 `[tasks.dreaming_scan]` 时什么都不扫。`DREAMING_DISABLED=1`（或 `DREAMING_TICK_SECS=0`）同时停掉清扫器和就地扫描。两种情况下轮次照样计数，引擎自己的纪事行也照样写。
 
-一次扫描最多读游标之后的 **60** 行：这对组合未归档的文字与语音 session 里的用户行和助手行，按时间排序，产品问答行一律不读。它们作为一份对话记录发给模型，每行一句，带 `[#n YYYY-MM-DD HH:MM]` 戳，按用户时区记时（取这段关系的文字轮次最近带来的有效时区；没有就用 UTC）。语音助手行先剥掉 TTS 音频标签。带动作的用户行显示动作标记，角色回应之后再接上结果。
+一次扫描最多读游标之后的 **60** 行：这对组合未归档的文字与语音 session 里的用户行和助手行，按时间排序，产品问答行和约会子会话一律不读。它们作为一份对话记录发给模型，每行一句，带 `[#n YYYY-MM-DD HH:MM]` 戳，按用户时区记时（取这段关系的文字轮次最近带来的有效时区；没有就用 UTC）。语音助手行先剥掉 TTS 音频标签。带动作的用户行显示动作标记，角色回应之后再接上结果。
 
 一次 `dreaming_scan` 调用返回全部三样产物：画像记忆、一条片段摘要和若干纪事时刻。回复的契约见[模型配置](model-config.zh.md#tasksdreaming_scan--关系扫描opt-in)。画像记忆和纪事摘要在一次批量调用里 embed；随后先写片段，再写画像记忆（写进画像层，归到实例主人名下），最后写纪事，游标移到读过的最后一行。超出 60 行上限的部分等下一次扫描。一段对话里没有可读的内容时，游标直接前移，不发调用。
 
@@ -138,10 +139,11 @@ Dreaming 就是关系扫描，`pipeline::dreaming`。它为每段关系保留一
 | 第一次达到某个 bond 或 chemistry 标签，与好感度写入同一个事务 | `tier_reached` | 否 |
 | 被接受的 `give`、`gift` 或 `tip` 动作（打赏从不写金额） | `gift` | 否 |
 | 第一次被接受的 `kiss` 或 `french_kiss` 动作 | `first_intimacy` | 否 |
+| 一场[约会](activities.zh.md#记忆)，在它结算时写，日期是约会开始那天用户的当地日期：`约会：在{place}，{content}` | `date` | 否 |
 
 这段关系已经记过的标签不会再记，哪怕之后的 session 再次达到。某条线下降时，它掉到之下的那些标签的 `tier_reached` 行若不满 24 小时就一并撤回，不论下降来自判官评估的轮次、被拒绝的动作，还是生活抉择。`hug`、`touch`、`lick`、`hug_from_behind`、`tease` 和 `custom` 动作不记。
 
-其余由扫描的模型写入：`confession`、`first_intimacy`、`conflict`、`reconciliation`、`promise`、`gift`、`shared_plan` 和 `user_shared_milestone`，日期取自它所出自的那份对话记录里的时间戳。带到期日的 `promise` 或 `shared_plan` 会在那一天回归。只该有一行的地方由一个键保留先写入的那一行：一个 `first_meet`，每种 realm 一个 `first_intimacy`，每条消息一个 `gift`，每条线的每个标签一个 `tier_reached`。
+其余由扫描的模型写入：`confession`、`first_intimacy`、`conflict`、`reconciliation`、`promise`、`gift`、`shared_plan` 和 `user_shared_milestone`，日期取自它所出自的那份对话记录里的时间戳。结算约会的判官写同样几种时刻（`gift` 除外），全部是 `real`，日期是约会开始那天。带到期日的 `promise` 或 `shared_plan` 会在那一天回归。只该有一行的地方由一个键保留先写入的那一行：一个 `first_meet`，每种 realm 一个 `first_intimacy`，每条消息一个 `gift`，每条线的每个标签一个 `tier_reached`。
 
 引擎自己写的行不带向量，dreaming 清扫器在下一次醒来时为它们补上，每次最多 100 行、一次调用。在那之前，以及在清扫器不运行的部署上，它们不参与语义召回；纪念日行不需要向量。
 
@@ -253,6 +255,7 @@ LIMIT $3;
 - [2026-10-28-memory-2-dreaming-plus-design.md](superpowers/specs/2026-10-28-memory-2-dreaming-plus-design.md)——dreaming、弧线、纪事及它们在 prompt 里的位置
 - [2026-08-09-voice-memory-bootstrap-recall-design.md](superpowers/specs/2026-08-09-voice-memory-bootstrap-recall-design.md)——语音引导快照与逐轮召回
 - [2026-08-09-voice-dreaming-ingestion-design.md](superpowers/specs/2026-08-09-voice-dreaming-ingestion-design.md)——语音行进入 dreaming
+- [2026-11-12-activity-sub-session-design.md](superpowers/specs/2026-11-12-activity-sub-session-design.md)——约会留下的一个片段和几条纪事，以及约会回合不进逐轮原文和 dreaming
 
 ## 源码
 
@@ -264,6 +267,7 @@ LIMIT $3;
 - `crates/eros-engine-server/src/pipeline/post_process.rs`——逐轮原文写入；把每个文字轮次计入 dreaming
 - `crates/eros-engine-server/src/pipeline/dreaming/`——dreaming：触发与清扫器（`mod.rs`）、扫描与弧线改写（`scan.rs`）、回复解析与守卫（`parse.rs`）、对话记录（`render.rs`）
 - `crates/eros-engine-server/src/relationship_context.rs`——为一轮加载弧线、片段和纪事，渲染 `[shared_memories]` 的关系部分
+- `crates/eros-engine-server/src/pipeline/activity.rs`——约会的结算：它的片段和纪事行（[活动](activities.zh.md#记忆)）
 - `crates/eros-engine-server/src/anniversary.rs`——纪念日行
 - `crates/eros-engine-server/src/backfill.rs`——`backfill-dreaming` 子命令
 - `crates/eros-engine-server/src/pipeline/handlers.rs`——召回与 prompt 注入

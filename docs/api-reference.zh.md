@@ -186,6 +186,20 @@ data: {"type":"final","filtered":false,"prompt_injected":null,"tier":null,"retri
 群聊轮次请改用 [`POST /v2/comp/group/{group_id}/message/stream`](#群聊)。
 这道闸与语音端点自己的闸对称：两个端点都不会写进对方的 session。
 
+**约会与发送路由。** 本路由和异步路由在约会进行时还接受约会的子会话（`channel = 'activity'`）：约会的回合就发到那里。
+角色有约会在进行时，她的 1:1 文字会话什么都不接收。下面这些拒绝都发生在写入任何东西之前：
+
+| 状态码 | 代码 | 何时 |
+|---|---|---|
+| 409 | `activity_in_progress` | 角色有约会在进行，而这个会话是她的 1:1 文字会话之一；或者约会进行时又发来 `date` 动作，发到它的子会话也一样 |
+| 409 | `activity_ended` | 这个会话是约会的子会话，约会已经结束 |
+| 409 | `activity_settling` | 角色的约会已经结束，另一个请求正在结算它；稍后再发 |
+| 409 | `choice_pending` | 角色任一会话里有待回答、未过期的生活选择时发来 `date` 动作 |
+| 400 | `byoc_unsupported` | 在 BYOC 实例的会话上发 `date` 动作 |
+
+一场已经结束、还没结算的约会，由下一条发到角色 1:1 文字会话的消息在那一回合开始之前结算；这次发送要等一次判官调用。
+用会话里已有的 `client_msg_id` 发来的是重试，不管约会处在什么状态都按已存的结果回答。见 [activities.zh.md](activities.zh.md)。
+
 一旦第一个 SSE 字节写出，终端错误以带内 `error` 帧的形式到达并关闭流；
 此时 HTTP 响应已提交 `200 OK`。
 
@@ -382,6 +396,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 | `custom` | `text`：必填，1–100 字符 |
 | `tip` | `amount_usd`：必填，有限数值，`> 0` 且 `≤ 1_000_000_000` |
 | `gift` | `kind`：`item` \| `clothing`（必填）；`name`：必填，1–64 字 |
+| `date` | `duration`：`short`（1 小时）\| `mid`（4 小时），必填；`place`：必填，1–40 字；`content`：必填，1–120 字；两者都不能含换行或控制字符 |
 
 **`give` 能递什么。** 消耗品会在角色身上留下余效（见下）。贵重物没有余效，也不会进她的物品清单；想让她收着，用 `gift`。`cash` 是当面递过去的现金，按张数计；带金额的是 `tip`。`cuisine` 是一道正经的菜或一顿饭，`food` 是吃的东西。
 
@@ -401,7 +416,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 | 5 | 3 3 2 2 1 | 1 2 2 3 3 | 1 2 3 2 1 |
 | 数量 > 5 | 4 3 3 2 1 | 1 2 3 4 4 | 1 3 4 2 1 |
 
-一个回合指文字 session 里的一条用户消息；产品咨询消息和语音通话不计数，也没有时间上限。这份状态会进判官、回复 prompt 和画图 composer，并经 `body_state` 帧和 [`GET /v2/comp/session/{session_id}/effects`](#get-v2compsessionsession_ideffects) 给到调用方。被拒绝的 give 没有余效。设计文档：[余效 spec](superpowers/specs/2026-10-12-given-item-lingering-effects-design.md)、[give 品类 spec](superpowers/specs/2026-10-13-give-categories-design.md)。
+一个回合指文字 session 或它的约会子会话里的一条用户消息；产品咨询消息和语音通话不计数，也没有时间上限。这份状态会进判官、回复 prompt 和画图 composer，并经 `body_state` 帧和 [`GET /v2/comp/session/{session_id}/effects`](#get-v2compsessionsession_ideffects) 给到调用方。被拒绝的 give 没有余效。设计文档：[余效 spec](superpowers/specs/2026-10-12-given-item-lingering-effects-design.md)、[give 品类 spec](superpowers/specs/2026-10-13-give-categories-design.md)。
 
 **递来她不用的东西。** 角色的 `art_metadata.smoking`、`alcoholic`、`drug`、`coffee`、`gluttony` 表示她抽不抽烟、喝不喝酒、用不用大麻、喝不喝咖啡、贪不贪吃（表在[下文](#post-v2compsessionsession_idevents)）。递 `cigarette`、`alcohol`、`herb`、`coffee` 或 `cuisine` 而对应的键为 `false` 时，engine 在判官运行之前掷一次。三次里有一次，这一轮照常进行。其余情况回应就是 `refuse`，不管判官怎么答，也不管有没有 LLM 判官：`action_response` 帧和两套历史接口返回的 `response` 都是 `refuse`，这次 give 不留余效，并像任何被拒的 give 一样让 bond 线降一档。判官会被告知这个结果（见 [model-config.zh.md](model-config.zh.md#taskspde_decision--opt-in-llm-pde-判断器)）。键为 `true` 或不写时从不掷，其他物品和其他动作也不掷。
 
@@ -413,7 +428,13 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 **情绪化回复。** 部署打开 [`tones.emotional`](model-config.zh.md#tones--聊天语气仅限-chat-任务)（大于 0）时，带 `french_kiss`、`tease`、`hug_from_behind`、`touch`、`strip`、`threaten` 或 `tip` 的回合用 `emotional` 语气回复，接受、拒绝都一样：回复只凭人设、这个动作和她的决定来写，不看聊天历史、用户画像和亲密度结论。接受还是拒绝仍照上面的方式决定。回复的行带 `metadata.tone = "emotional"`。
 
-带动作时 `content` 可以为空，也可以和 `image_url`、`image` 同时出现。取值不合规（超出范围、缺少 `item`/`text`/`amount_usd`/`kind`/`name`）一律返回 `422`，`code: "unprocessable"`；`type` 或 `item` 不在上表取值内时，请求体按无法解析的 JSON 拒绝（同样是 `422`）。动作存在用户行上，两套历史接口都以 `action` 字段返回，该回合生效之后带 `response`。
+**约会。** `date` 是约她出去。先过 engine 的门槛：`short` 没有门槛，`mid` 要求 bond 达到第 2 档，她离线或正在另一场约会里时一律不通过；
+门槛不通过就是拒绝，不管判官怎么答。被拒时这一回合是没有代价的普通回合。被接受时，这一回合的 `final` 帧带 `activity`：
+`id`、`sub_session_id`、`duration`、`place`、`content`、`status`、`started_at` 和 `ends_at`。约会从她那条回复起，在这个子会话里持续
+`duration` 那么久，期间她的 1:1 文字会话暂停；约会的回合发到 `sub_session_id`，到点或经[结束路由](#post-v2compsessionsession_idactivitiesactivity_idend)结束。
+邀约这一回合只有文字：不出图，`image.force` 被忽略。整套机制见 [activities.zh.md](activities.zh.md)。
+
+带动作时 `content` 可以为空，也可以和 `image_url`、`image` 同时出现。取值不合规（超出范围、缺少 `item`/`text`/`amount_usd`/`kind`/`name`/`duration`/`place`/`content`）一律返回 `422`，`code: "unprocessable"`；`type`、`item` 或 `duration` 不在上表取值内时，请求体按无法解析的 JSON 拒绝（同样是 `422`）。动作存在用户行上，两套历史接口都以 `action` 字段返回，该回合生效之后带 `response`。
 
 ```bash
 curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
@@ -526,6 +547,7 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 - 带推理的回合：判官返回了推理时，`reasoning*` 排在这份列表里每种形状的最前面，在 `action_response` 和 `body_state` 之前：`reasoning* → meta(reply) → delta* → done → final`
 - 动作轮次：形状相同，只是 `action_response` 排在第一个 `meta` 之前——`action_response → meta(reply) → delta* → done → final`；不会是 `ghost` 或 `product_qa`
 - 有出图能力时被接受的 `photo` 或 `strip`：`action_response → meta(reply_text_image) → delta* → done → image_request → final`
+- 被接受的 `date`：`action_response → meta(reply) → delta* → done → final`，`final` 上带 `activity`
 - 带余效或已知需求的回合：`body_state` 位于第一个 `meta` 之前，两者都发时排在 `action_response` 之后——例如 `action_response → body_state → meta(reply) → delta* → done → final`
 - `product_qa`：`meta(action_type=product_qa) → delta* → done → final` — 形状与普通文本回复相同，由独立的模型链（`[tasks.chat_product_qa]`）流式生成，而非 `chat_companion`；落库时带 `channel='product_qa'`，重放时同样报告为 `product_qa`。
 
@@ -682,13 +704,16 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 就是落库的那条指令消息。生活事件的图（`POST …/events`）不回应任何用户消息，
 所以编辑它必须带 `persist_instruction: true`，不带就返回 `409`。
 
+在[约会](activities.zh.md)的子会话上、约会进行期间，改图在约会的父会话上读写这段关系；`evaluate_affinity` 或 `reply_with_text`
+的好感度那一步把这一回合记为不评判，和所有约会回合一样。
+
 | 状态码 | 含义 |
 |---|---|
 | 400 | `prompt_traits` 格式不对；BYOC 实例缺 `character`、其他实例带了 `character`，或不是合法的封装卡片（`invalid_payload`） |
 | 401 | bearer 缺失或无效 |
 | 403 | 不是你的 session；`byoc_forbidden`（caller secret 缺失或不对）；`byoc_card_rejected`（卡片无法在实例的 key 下打开） |
 | 404 | session 不存在，或该 session 里没有这条消息 |
-| **409** | 消息存在，但不是图片回合；或它不回应任何用户消息（生活事件的图）且没带 `persist_instruction`；或该 session 是群 session（`message` 里含 `wrong_channel`） |
+| **409** | 消息存在，但不是图片回合；或它不回应任何用户消息（生活事件的图）且没带 `persist_instruction`；或该 session 是群 session（`message` 里含 `wrong_channel`）；或该 session 是约会的子会话而约会已经结束（带代码的响应体，`code: "activity_ended"`） |
 | 422 | `instruction` 空白，或 `aspect_ratio` 不支持 |
 | 501 | `[tasks.chat_image_edit_compose]` 与 `[tasks.chat_image_prompt_compose]` 都没配 |
 | 429 | 达到每用户并发上限（3，与 chat/voice/compose 共用） |
@@ -785,7 +810,8 @@ key 下已有消息就重放它（见下），否则就是一次新的调用。`
   并且用户当地零点以来这个会话里还没有人说过话，角色就先开口。今天早些时候由 `occasion` 触发过的开口，或一条生活事件的消息，算作说过话。
 - **场合，由调用方决定。** 带 `occasion` 时，只要这个场合对当前会话属实，角色就先开口。
 
-两种情况都是生成一条 assistant 消息，落库后返回；否则 `greeting` 为 `null`。角色的离线类生活事件进行期间也返回 `null`，不生成（见 [events 路由](#post-v2compsessionsession_idevents)）。
+两种情况都是生成一条 assistant 消息，落库后返回；否则 `greeting` 为 `null`。角色的离线类生活事件进行期间也返回 `null`，不生成（见 [events 路由](#post-v2compsessionsession_idevents)）；
+角色的[约会](activities.zh.md)进行期间也一样。一场已经结束、还没结算的约会，在这次调用决定任何事之前先结算；另一个请求正在结算它时，`greeting` 为 `null`。
 
 ```json
 {
@@ -827,7 +853,7 @@ key 下已有消息就重放它（见下），否则就是一次新的调用。`
   没有 `user_message_id`），在调用 `POST /comp/chat/{session_id}/read` 之前都是未读。
   Realtime 和两个 history 路由都能看到。
 - **错误：** 带 `occasion` 没带 `open_key`、带 `open_key` 没带 `occasion`、`open_key` 格式不对，返回 `400`，
-  `code: "invalid_payload"`；未知的 `occasion` 返回 `422`。会话检查与 stream 端点相同（`403`、`404`，语音或群会话 `409`），
+  `code: "invalid_payload"`；未知的 `occasion` 返回 `422`。会话检查与 stream 端点相同（`403`、`404`，语音或群会话、约会子会话 `409`），
   达到单用户并发上限 `429`。生成失败时返回与图片接口相同的上游错误，不写入任何内容，下次打开（用同一个 key）会重试。
   BYOC 实例的会话返回 `400 byoc_unsupported`：该路由需要一个请求里并不携带的角色。
 
@@ -835,7 +861,7 @@ key 下已有消息就重放它（见下），否则就是一次新的调用。`
 
 让角色的一天里发生点什么。什么时候要，由调用方决定；发不发生、发生什么，由 engine 决定。
 engine 抽一种事件，或者什么都不抽，然后角色用一条主动消息告诉用户——离线类种类除外，它们让她联系不上，只讲出一部分（见下）。
-她在等用户回答自己提出的某次生活选择时什么都不抽（见[生活选择路由](#post-v2compsessionsession_idlife-choiceschoice_id)）。
+她在等用户回答自己提出的某次生活选择时什么都不抽（见[生活选择路由](#post-v2compsessionsession_idlife-choiceschoice_id)），她的[约会](activities.zh.md)还没结算时也不抽。
 事件持续期间，判官和回复都知道她正在经历它
 （见 [model-config.zh.md](model-config.zh.md#taskspde_decision--opt-in-llm-pde-判断器)）。
 抽取怎么运转、事件和角色的需求怎么配合，见 [life-events-needs.zh.md](life-events-needs.zh.md)。
@@ -852,7 +878,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | 字段 | 规则 |
 |---|---|
 | `event_key` | 必填：1–128 个 `[A-Za-z0-9_.:-]` 字符，只在本会话内有效。同一个 key 返回同一个事件 |
-| `kinds` | 选填。不带或 `null`：全部种类。数组：只抽列出的种类（`[]`：什么都不抽）。对象 `{"allow": […], "disallow": […]}`：`allow` 允许的种类（不带或 `null`：全部；`[]`：一种都没有）去掉 `disallow` 列出的种类；两边都列了的种类不抽，`{}` 等于全部种类。对象里出现未知的键，或出现未知种类，返回 `422`；写了 `taking_space`、`fell_out`、`traveling_together` 或 `bathing_together` 同样返回 `422`：它们由 engine 自己写入，从不抽取 |
+| `kinds` | 选填。不带或 `null`：全部种类。数组：只抽列出的种类（`[]`：什么都不抽）。对象 `{"allow": […], "disallow": […]}`：`allow` 允许的种类（不带或 `null`：全部；`[]`：一种都没有）去掉 `disallow` 列出的种类；两边都列了的种类不抽，`{}` 等于全部种类。对象里出现未知的键，或出现未知种类，返回 `422`；写了 `taking_space`、`fell_out`、`traveling_together`、`bathing_together` 或 `on_a_date` 同样返回 `422`：它们由 engine 自己写入，从不抽取 |
 | `user_timezone`、`user_country`、`user_region`、`tier`、`prompt_traits`、`memory_scope`、`affinity_scope`、`audit` | 与 `/open` 相同，用于生成这条消息 |
 | `image` | 选填：`{"style", "aspect_ratio", "prompt_variant"}`，各字段与聊天回合的 `image` 相同（没有 `force`；不支持的 `aspect_ratio` 返回 `422`）。表示调用方能处理图：部署配了 `[tasks.chat_image_prompt_compose]` 时，`taking_selfie` 或 `strip` 的消息会带上她的图（见下）。不带、或没配 composer：只有文字。其他种类忽略它 |
 | `outfit` | 选填：她穿什么，与聊天回合相同——通常是她衣橱里的一项，不做核对；去掉首尾空白后 1–64 个字符，空白等于不带，超长返回 `422`。她的话会跟着这身衣服，图也会。`strip` 时她刚把它脱了：刚把「{outfit}」脱了，不带时是刚把衣服脱了。不带：prompt 里没有穿着，composer 按场景给她穿 |
@@ -934,8 +960,8 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 
 时长写成区间的，在事件开始时从区间里抽定。以上共 70 种可抽取的种类。两种性别都会抽到两个聚会，权重相同，这是有意为之。
 
-另有四种永远不会被抽到：`taking_space`（她提出、用户同意的分开，12–24 小时，离线）、`fell_out`（用户不理会她提出的分开请求时的那场不愉快，1 小时）、`traveling_together`（她提议、用户同意的旅行，48–72 小时，`trip` 类背景，不离线）和 `bathing_together`（她提议、用户同意的一起洗澡，30 分钟，`short` 类插曲，不离线）。
-它们由 engine 为[生活选择流程](#post-v2compsessionsession_idlife-choiceschoice_id)写入，作为 `…/effects` 和生活选择响应里的 `event` 出现，
+另有五种永远不会被抽到：`taking_space`（她提出、用户同意的分开，12–24 小时，离线）、`fell_out`（用户不理会她提出的分开请求时的那场不愉快，1 小时）、`traveling_together`（她提议、用户同意的旅行，48–72 小时，`trip` 类背景，不离线）、`bathing_together`（她提议、用户同意的一起洗澡，30 分钟，`short` 类插曲，不离线）和 `on_a_date`（用户约她、她答应了的约会，1 或 4 小时，`short` 类插曲，不离线）。
+前四种由 engine 为[生活选择流程](#post-v2compsessionsession_idlife-choiceschoice_id)写入，`on_a_date` 为[约会](activities.zh.md)写入。它们作为 `…/effects` 里的 `event` 出现，前四种也作为生活选择响应里的 `event` 出现，
 不能写进 `kinds`。
 
 `sudden_desire`、`strip`、`streaking`、`having_sex`、`just_have_sex`、`masturbating` 与 `pregnancy_scare`（后者隐含性行为）带成人题材；只对部分用户提供这类内容的调用方，用
@@ -957,6 +983,8 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
   `traveling_together` 进行期间抽取；`missed_ride` 在这几种或 `business_trip` 进行期间抽取。
 - **她在等回答时什么都不抽。** 从她提出请求（不论哪一种生活选择）起，到它被回答或过期（24 小时）为止，角色任何一个 session 的抽取都返回
   `{"event": null, "message": null}`。带着已经抽过的 `event_key` 来重复调用，照样返回那个事件。
+- **约会没结算时什么都不抽。** 从她答应一场约会起，到它结算为止（约会结束之后也一样），角色任何一个 session 的抽取都返回同样的空值
+  （见 [activities.zh.md](activities.zh.md#结算)）。重复的 `event_key` 照样返回它的事件。
 - **冷却。** 每种事件从开始起有各自的冷却。trip 类每周最多开始一次，body 类每两周最多开始一次，不论具体是哪一种。
   任何离线类种类每 12 小时最多开始一次，不论具体是哪一种。
 - **她的需求给类别内的种类加权**，前提是部署配置了 LLM 判官，并且角色有一次判定：`high` 的 `outing` 偏向
@@ -1051,8 +1079,8 @@ composer 失败时退回普通的人物肖像 prompt，跟聊天回合一样。�
   各自列出正在进行的背景和插曲；`/open` 开场白同样带 `- 正在经历：…` 这一行。`GET …/effects` 两者都会列出。
   一段离线类事件结束之后（在被它 ghost 过消息的会话里），或一场虚惊结束之后（在讲出它的那个会话里），`[近期事件]` 行多出一项，回复多出一行 `- 刚才：…`，直到她在那里写过一次为止（一条带文字的消息；
   见 [model-config.zh.md](model-config.zh.md#taskspde_decision--opt-in-llm-pde-判断器)）。
-- **错误：** `event_key` 格式不对返回 `400`，`code: "invalid_payload"`；未知的 `kind`，或 `taking_space`、`fell_out`、`traveling_together`、`bathing_together`，返回 `422`。会话检查与 `/open` 相同
-  （`403`、`404`，语音或群会话 `409`），达到单用户并发上限 `429`。BYOC 实例的会话返回 `400 byoc_unsupported`。
+- **错误：** `event_key` 格式不对返回 `400`，`code: "invalid_payload"`；未知的 `kind`，或 `taking_space`、`fell_out`、`traveling_together`、`bathing_together`、`on_a_date`，返回 `422`。会话检查与 `/open` 相同
+  （`403`、`404`，语音或群会话、约会子会话 `409`），达到单用户并发上限 `429`。BYOC 实例的会话返回 `400 byoc_unsupported`。
   生成失败时返回与图片接口相同的上游错误，不写入任何内容。
   回复为空时不写入任何内容，返回空值。
 - **流式：** 先给事件，再边生成边给她的消息：见
@@ -1073,7 +1101,9 @@ composer 失败时退回普通的人物肖像 prompt，跟聊天回合一样。�
  "changes_at": "2026-10-16T14:00:00Z"}
 ```
 
-没有余效时 `effects` 为 `[]`。错误同 `/open`：`404 session_not_found`、`403 session_forbidden`，语音或群 session 为 `409 wrong_channel`。
+`activity` 是角色的[约会](activities.zh.md)，在约会 `ongoing`，或已 `ended` 而还没结算时出现，她的任一 1:1 文字会话上都有：形状与流里的 `final.activity` 相同，`status` 按响应时刻算；约会的回合发到 `sub_session_id`。其余时候省略。约会进行期间，`event` 就是它的 `on_a_date` 插曲。
+
+没有余效时 `effects` 为 `[]`。错误同 `/open`：`404 session_not_found`、`403 session_forbidden`，语音或群 session、约会子会话为 `409 wrong_channel`。
 
 ### `POST /v2/comp/session/{session_id}/life-choices/{choice_id}`
 
@@ -1089,7 +1119,7 @@ composer 失败时退回普通的人物肖像 prompt，跟聊天回合一样。�
 | `travel_together` | 提议一起去旅行 | bond 在第 3 档或以上，最新的 3 个被判官评过的回合 warmth 和 patience 都高于 0.7，且没有背景事件在进行。不读这一对的 scope |
 | `bathe_together` | 问用户愿不愿意和她一起洗澡 | 这一对在浪漫上相容；chemistry 在第 2 档或以上（`hygienic` 为 `true` 的角色）或第 3 档或以上（不写 `hygienic` 的角色），`hygienic` 为 `false` 时从不提出；且最新的 7 个被判官评过的回合里至少 3 个 warmth 达到 0.5。不读 patience |
 
-只有该 session 最新一段选择经过（她的请求、它的结算以及它开启的分开，不论哪一种选择）之后的、被判官评过的回合才计数。`sleep_together` 与 `propose` 同一轮都满足时，触发 `propose`。
+只有该 session 最新一段选择经过（她的请求、它的结算以及它开启的分开，不论哪一种选择）之后的、被判官评过的回合才计数。她的[约会](activities.zh.md)进行期间她什么都不提，约会自己的回合也从来不是被判官评过的回合。`sleep_together` 与 `propose` 同一轮都满足时，触发 `propose`。
 `bathe_together` 有自己的触发条件，和这两种无关，也不受进行中的旅行影响。她同一时间只有一个请求待回答，所以一轮里有几种同时满足时，
 先轮到 `sleep_together` 或 `propose`，再到 `bathe_together`，最后是 `travel_together`。
 在一个 session 里被用户接受或不理会过的 `sleep_together` 或 `propose`，在那里不会再次提出，`travel_together` 则 14 天内不再提出，`bathe_together` 7 天内不再提出；被拒绝或过期的，等出现新的连续后会再次提出。她怎么提出、什么时候提出、
@@ -1168,13 +1198,44 @@ engine 不接收也不保存用户的性别或性取向。
 | 403 | `session_forbidden` | session 不是调用方的 |
 | 404 | `session_not_found` | session 不存在 |
 | 404 | `life_choice_not_found` | 这次选择不属于这个 session |
-| 409 | `wrong_channel` | 语音或群 session |
+| 409 | `wrong_channel` | 语音或群 session，或约会的子会话 |
 | 409 | `life_choice_closed` | 选择已经结算（被这个路由，或被用户的消息），或已过期 |
 
 `response` 不是 `accept` 或 `decline`、或其他字段格式不对返回 `422`；达到单用户并发上限返回 `429`，这一步发生在写入任何东西之前，所以选择仍然开着。
 
 流式：先给已提交的回答，再边生成边给她的回话。见
 [`/open`、`/events`、`/life-choices` 的流式响应](#openeventslife-choices-的流式响应)。
+
+### `POST /v2/comp/session/{session_id}/activities/{activity_id}/end`
+
+结束一场[约会](activities.zh.md)并结算它。`session_id` 是发出邀约的那个会话，不是约会的子会话；`activity_id` 是客户端拿到的
+`activity` 的 `id`。没有请求体。
+
+还在进行的约会现在结束：它的 `on_a_date` 事件在这次请求时结束。已经到点的保留原有的结束时间。两种情况下，约会都在这次调用里结算：
+约会判官整场读一次，它的结论挪动这段关系（每条线最多一档），约会进入这段关系的记忆（见 [activities.zh.md → 结算](activities.zh.md#结算)）。
+已经结算过的约会（不论是由这个路由、一次发送还是 `/open` 结算的）返回它存下的结果，所以重复调用不改变任何东西，客户端可以在自己的计时器到点时随时调用。
+
+```json
+{"activity": {"id": "…", "sub_session_id": "…", "duration": "short", "place": "海边的餐厅", "content": "吃一顿大餐", "status": "settled", "started_at": "2026-11-12T12:00:00Z", "ends_at": "2026-11-12T12:40:00Z"},
+ "affinity": {"bond_tier": 3, "chem_tier": 2, "bond_label": "close_friend", "chemistry_label": "flirtation", "…": "…"},
+ "effective_deltas": {"warmth": 0.02, "trust": 0.05, "intrigue": 0.01, "intimacy": 0.03, "patience": 0.0, "tension": 0.01}}
+```
+
+`activity` 是这场约会，`status: "settled"`，`ends_at` 是它结束的时刻。`affinity` 是约会之后的这段关系，形状同
+[`GET /bff/v1/comp/affinity/{session_id}`](#get-bffv1compaffinitysession_id) 里的 `affinity`。`effective_deltas` 是约会挪动的量，
+即它的好感度事件提交的值；没有写事件时为 `null`：约会里没有一轮得到回复，或这期间这段关系被归档了。
+
+约会还没人结算时，这次调用要等判官（最多 45 秒）。结算在自己的任务里运行：客户端断开不会让它停下，再调用一次就能读到结果。
+
+错误带流前错误的响应体 `{code, message, user_message}`：
+
+| 状态码 | 代码 | 何时 |
+|---|---|---|
+| 403 | `session_forbidden` | 会话不是调用者的 |
+| 404 | `session_not_found` | 会话不存在 |
+| 404 | `activity_not_found` | 这个活动不是该会话的约会 |
+| 409 | `wrong_channel` | 语音或群会话，或约会的子会话：请用父会话的 id |
+| 409 | `activity_settling` | 另一个请求正在结算这场约会；稍后再调用 |
 
 ### `PUT /v2/comp/session/{session_id}/message/{message_id}/reaction`
 
@@ -1230,6 +1291,9 @@ SSE 帧是整轮最后一帧且只走线上——在它发出前断线，光看 
 它引用的那条消息的 id，一定在同一个 session 里。
 
 `action`（只出现在用户行上）是这一行发送时带的动作，该回合生效之后附 `response`（`"accept"` | `"refuse"`）。
+
+`activity`（只出现在被接受的 `date` 邀约那一行用户消息上，其余行都省略，被拒的邀约也省略）是这次邀约开启的约会，形状与流里的
+`final.activity` 相同，`status`（`ongoing`、`ended` 或 `settled`）按响应时刻算。它的 `sub_session_id` 也是这个路由能读的会话：约会自己的行用这个 id 读。
 
 `reaction`（只出现在 assistant 行上）为 `{emoji, reacted_at}`。
 
@@ -1713,7 +1777,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 ### `GET /comp/chat/{user_id}/sessions`
 
-該 `user_id` 名下的所有 chat sessions。路徑裡的 `user_id` **必須** 等於 JWT 裡的 user_id；否則 403。返回 `{ "sessions": [...] }`，每條帶 `session_id`、`instance_id`、`is_converted`、`last_active_at`、`channel`。群 session 不在此列，群由 `GET /v2/comp/groups` 返回。
+該 `user_id` 名下的所有 chat sessions。路徑裡的 `user_id` **必須** 等於 JWT 裡的 user_id；否則 403。返回 `{ "sessions": [...] }`，每條帶 `session_id`、`instance_id`、`is_converted`、`last_active_at`、`channel`。群 session 不在此列，群由 `GET /v2/comp/groups` 返回。约会的子会话也不在此列：它经由父会话的历史和 effects 找到（见 [activities.zh.md](activities.zh.md)）。
 
 ### `GET /comp/user/{user_id}/profile`
 
@@ -1911,7 +1975,7 @@ genome 预设（`art_metadata.possessions` / `art_metadata.wardrobe`）排最前
 }
 ```
 
-`archived_sessions` 只算**这一次调用**翻掉的 session 数，所以重复调用返回 `200` 加 `0`。所有 channel 一起归档，语音也在内 —— 单位是这段关系，不是某一个客户端看到的那部分。
+`archived_sessions` 只算**这一次调用**翻掉的 session 数，所以重复调用返回 `200` 加 `0`。所有 channel 一起归档，语音和约会的子会话也在内 —— 单位是这段关系，不是某一个客户端看到的那部分。进行中的约会随之结束，还没结算的约会从此不再结算。
 
 **会删掉的：** `companion_affinity`（连同它的 events，走 cascade）、`companion_memories` 的关系层、`character_insights`、`user_insights`、关系扫描的状态、片段、弧线和纪事（`relationship_scan_state`、`relationship_episodes`、`relationship_arcs`、`relationship_journal`），以及这位角色在每个[群](group-chat.zh.md)里的席位；角色的故事摘要（`persona_story_insights.digest`）会被清空 —— 这些留着会渗进下一段对话。归档请求到达时仍在运行的回合不会把它们写回去：它对好感度、关系层记忆以及 character 与 user insight 的写入发现 session 已归档，什么都不写；进行中的关系扫描发现扫描状态已不在，不再写入任何东西。**不会删的：** `chat_messages`。聊天记录留着，所以那些按 session id 引用的审计表（`companion_decision_events`、`character_insights_events`、`chat_vision_events`、`chat_images_events`）仍然指得到可读的东西。`relationship_scan_events` 也留着（只有计数和 id）。`companion_memories` 的画像层（`instance_id IS NULL`）也留着 —— 那是关于这个用户的跨角色事实。之后在同一个实例上开始的对话会从新的扫描状态和新的初识开始，初识日期取它第一行未归档的聊天。
 
@@ -2022,7 +2086,7 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
 ```
 
 `persona_name` 始终存在，BYOC 实例上为 `null`，因为名字只在它的卡片里。`history` 的条目与
-[BFF 历史路由](#get-bffv1compchatsession_idhistorylimit50offset0)的形状相同，所以她那条请求所在的行在这里同样带 `life_choice` 回执。
+[BFF 历史路由](#get-bffv1compchatsession_idhistorylimit50offset0)的形状相同，所以她那条请求所在的行在这里同样带 `life_choice` 回执，被接受的约会邀约那一行带 `activity` 回执。
 
 這裡 **不會** 打包 affinity——前端單獨讀取（见下面两条 affinity 路由），
 所以不需要关系数据的冷启动不必为它付代价。
@@ -2045,6 +2109,7 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
 `occasion`（只出现在角色主动写下的 assistant 行上，其余省略）与上面 canonical history 里的同名字段相同，包括 `life_choice`；
 `start` 打包的历史同样带它。`life_choice`（只出现在她提出请求的那条 assistant 行上，其余省略）是 canonical 路由里同名的回执，
 `{id, kind, status, resolved_at}`，五种状态和 `resolved_at` 的规则都一样；`start` 打包的历史同样带它。
+`activity`（只出现在被接受的约会邀约那一行用户消息上，其余省略）是 canonical 路由里同名的回执，约会的子会话 id 在这里同样能读；`start` 打包的历史同样带这个回执。
 `reply_to_message_id` 回显 `user` 行发送时带的引用（见 stream 路由的**可选：引用**
 一节）——它引用的那条消息的 id，一定在同一个 session 里；
 普通轮次、以及锚点没解析成功的轮次都省略该字段，这样冷启动不必自己存状态
@@ -2142,7 +2207,10 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
 time-decay），或最近一次事件早于 affinity migration `0014`。`event_type`
 ∈ `message | gift | proactive | ghost`；ghost 轮次的 `effective_deltas`
 全为零。生活选择的降档是它自己类型的好感度事件，`life_choice`，这条路由和 `time_decay` 一样从不返回它：
-新的状态在结算响应里带回，别的设备从下面的绝对值路由读。
+新的状态在结算响应里带回，别的设备从下面的绝对值路由读。结算后的约会写的 `activity` 事件同样从不返回：它的结果由[结束路由](#post-v2compsessionsession_idactivitiesactivity_idend)带回。
+
+这条路由接受约会的子会话 id，返回这段关系最新的回合，这些回合记在约会的父会话上。约会期间那就是约会的最后一轮，它什么都不挪动
+（被拒的动作除外）：约会在结算时整场评一次。
 
 - `effective_deltas_computed` —— 精确的每轮行增量，在持久化时从取下界前后的 bond/chemistry 分数计算得出，存储于事件行。单位为合成分增量——与快照的 `bond`/`chemistry` 同一 0..1 刻度——适合每轮 "+X bond / +Y chemistry" 脉冲显示。迁移前的旧行可能缺省。
 - `label_changes` —— 引擎权威的档位变化（本轮无档位跨越时为 `null` / 缺省）。前端无需自行计算变化。
@@ -2182,7 +2250,7 @@ session 403）。
 ```
 
 `affinity` 为 `null` 表示该 session 还没有好感度行——行是在第一轮对话时创建的，
-所以刚开的 session 没有是正常的。
+所以刚开的 session 没有是正常的。约会的子会话永远没有：它的关系要用父会话的 id 来读。
 
 - `bond` / `chemistry` —— 真实存储的合成分数（0–1）；不套任何显示曲线（节奏的
   非线性在写侧的分档衰减里——见 [affinity-model.zh.md](affinity-model.zh.md)）。
@@ -2445,7 +2513,7 @@ curl -X POST -H "x-user-erase-secret: $USER_ERASE_SECRET" \
 | 401 | — | JWT 缺失 / 格式错 / 过期 / 密钥不符。响应体为空：认证层在任何 handler 之前就作答 |
 | 403 | `forbidden` | 路徑 user 跟 JWT user 不匹配，或想讀別人的 session；或 `/svc/v1/*` 的某个 secret header（`x-insights-export-secret`、`x-facts-export-secret`、`x-user-erase-secret`）缺失或錯誤 |
 | 404 | `not_found` | session / 人格 / 消息 id 不存在 |
-| 409 | `conflict` | 资源当前的状态不允许这个操作。reaction 路由和改图在收到群 session 时返回它，`message` 里含 `wrong_channel`。1:1 的流式与异步发送、`/open`、`/events`、`/effects` 和生活选择路由拒绝群 session 时改用带代码的响应体（`code: wrong_channel`），群路由拒绝非群 session 时也一样 |
+| 409 | `conflict` | 资源当前的状态不允许这个操作。reaction 路由和改图在收到群 session 时返回它，`message` 里含 `wrong_channel`。1:1 的流式与异步发送、`/open`、`/events`、`/effects` 和生活选择路由拒绝群 session 时改用带代码的响应体（`code: wrong_channel`），群路由拒绝非群 session 时也一样。[约会](activities.zh.md)的拒绝不论来自哪条路由，同样用带代码的响应体：`activity_in_progress`、`activity_ended`、`activity_settling`、`choice_pending`，以及 `activity_not_found`（`404`） |
 | 422 | `unprocessable` | 格式正确、但取值不可接受的请求 |
 | 429 | `too_many_requests` | 达到了每用户并发上限 |
 | 500 | `internal` | 其餘一切（DB 錯、LLM API 錯等） |
@@ -2461,6 +2529,7 @@ curl -X POST -H "x-user-erase-secret: $USER_ERASE_SECRET" \
 - `crates/eros-engine-server/src/routes/session_events.rs`——角色讲述的生活事件：抽取，以及讲述它的那条主动消息（她不讲的离线类种类没有）（`v2/comp/session/{session_id}/events`）
 - `crates/eros-engine-server/src/routes/session_effects.rs`——角色因被接受的 give 而带着的余效、她的需求和正在经历的事件（`v2/comp/session/{session_id}/effects`）
 - `crates/eros-engine-server/src/routes/life_choices.rs`——用户对她提出的某次生活选择的回答：接受或拒绝（`v2/comp/session/{session_id}/life-choices/{choice_id}`）
+- `crates/eros-engine-server/src/routes/activities.rs`——结束并结算一场约会（`v2/comp/session/{session_id}/activities/{activity_id}/end`）；约会期间谁能发送，以及结算本身，在 `crates/eros-engine-server/src/pipeline/activity.rs`
 - `crates/eros-engine-server/src/routes/group.rs`——群管理与群发送路由（`v2/comp/group*`）
 - `crates/eros-engine-server/src/routes/reaction.rs`——消息 reaction：设置、撤销与允许列表（`v2/comp/session/{session_id}/message/{message_id}/reaction`、`v2/comp/reactions`）
 - `crates/eros-engine-server/src/routes/insight.rs`——按关系分开的 v2 画像端点（`v2/comp/instance/{instance_id}/insight/character`、`.../insight/user`）

@@ -17,14 +17,15 @@ the prompt. The model before v2.6.0 is documented as
 
 ## How it fits together
 
-Four writers, each on its own schedule:
+Five writers, each on its own schedule:
 
 | Writer | When it runs | What it writes |
 |--------|--------------|----------------|
-| [Raw-turn writer](#the-raw-turn-writer) | Every substantive turn, in post-processing | The user's line, embedded, into both layers of `companion_memories` |
+| [Raw-turn writer](#the-raw-turn-writer) | Every substantive turn outside a date, in post-processing | The user's line, embedded, into both layers of `companion_memories` |
 | [Dreaming](#dreaming) (`[tasks.dreaming_scan]`) | Per relationship, at 20 pending turns or once the relationship has gone idle | Profile memories, one episode, journal moments |
 | [Arc rewrite](#the-arc) (`[tasks.arc_rewrite]`) | Every fourth episode | The relationship's arc |
 | [The engine itself](#the-journal) | At the turn the moment happens, no LLM call | Journal rows for the first meeting, tiers reached, gifts and the first kiss |
+| [A date's settlement](activities.md#memory) (`[tasks.activity_judge]`) | Once per date, when it is settled | One episode, a `date` journal row, journal moments |
 
 And what reaches a 1:1 prompt:
 
@@ -87,7 +88,7 @@ owner.
 
 | Table | One row per | What it holds |
 |-------|-------------|---------------|
-| `relationship_episodes` | scanned stretch of conversation | A summary of at most 400 characters, with `started_at` / `ended_at` taken from the first and last row it covers, and whether the arc has folded it in yet. Append-only. |
+| `relationship_episodes` | scanned stretch of conversation, or settled date | A summary of at most 400 characters, with `started_at` / `ended_at` taken from the first and last row it covers, and whether the arc has folded it in yet. Append-only. |
 | `relationship_arcs` | relationship | `opening` (how it began, at most 150 characters, written once), `arc` (the story so far, at most 900 characters) and `previous_arc`. |
 | `relationship_journal` | moment | `occurred_on` (the user's local day), `kind`, `realm` (`real` or `roleplay`), a one-sentence `summary` of at most 200 characters, an optional `due_on`, and an embedding for semantic recall. |
 | `relationship_scan_state` | relationship | The scan's bookkeeping: cursor, pending-turn count, claim, failure counts, the user's last known timezone. |
@@ -127,7 +128,9 @@ checked on their own keys (`OPENROUTER_API_KEY` / `<NAME>_API_KEY`).
 ## The raw-turn writer
 
 `write_turn` runs in post-processing on **every** substantive turn (a
-non-empty user utterance and at least one non-empty assistant message). It
+non-empty user utterance and at least one non-empty assistant message) except
+the turns of a [date](activities.md#memory), which reach memory once, when the
+date is settled. It
 embeds **the user's utterance only**, into both layers, with
 `category = NULL` and `metadata = NULL`. The relationship-layer copy is
 prefixed `用户：`, so a recalled line reads as what the user said. The
@@ -168,7 +171,8 @@ per relationship and reads forward from it.
 
 - **Counting.** Every 1:1 text turn adds one pending turn to its
   relationship, and so does a voice turn unless `DREAMING_VOICE_DISABLED` is
-  set. Group turns do not count. A relationship's first counted turn creates
+  set. Group turns do not count, nor do the turns of a
+  [date](activities.md#memory). A relationship's first counted turn creates
   its scan state, with the cursor just before that turn; earlier history is
   read by the [backfill](#earlier-history).
 - **At 20 pending turns** the text turn's post-processing scans inline, after
@@ -188,7 +192,7 @@ per relationship and reads forward from it.
 
 A scan reads at most **60** rows after the cursor: the user and assistant rows
 of the pair's non-archived text and voice sessions, in time order, never
-product-QA rows. They go to the model as one transcript, a line per row
+product-QA rows and never a date's sub-session. They go to the model as one transcript, a line per row
 stamped `[#n YYYY-MM-DD HH:MM]` in the user's timezone (the last valid one a
 text turn of the relationship carried; UTC without one). Voice assistant rows
 lose their TTS audio tags first. A user row that carried an action shows its
@@ -247,6 +251,7 @@ The engine writes some rows itself, with no LLM call and `realm = real`:
 | A bond or chemistry label reached for the first time, in the affinity write's transaction | `tier_reached` | no |
 | An accepted `give`, `gift` or `tip` action (a tip never states its amount) | `gift` | no |
 | The first accepted `kiss` or `french_kiss` action | `first_intimacy` | no |
+| A [date](activities.md#memory), at its settlement, dated the user's local day it started: `约会：在{place}，{content}` | `date` | no |
 
 A label already journaled for the relationship is not journaled again, even
 when a later session reaches it anew. When a line falls, its `tier_reached`
@@ -258,7 +263,9 @@ actions are not journaled.
 The scan's model writes the rest: `confession`, `first_intimacy`, `conflict`,
 `reconciliation`, `promise`, `gift`, `shared_plan` and
 `user_shared_milestone`, each dated by a stamp of the transcript it came
-from. A `promise` or `shared_plan` with a due date comes back on that day.
+from. A settled date's judge writes moments of the same kinds but `gift`, all
+`real` and dated the day the date started. A `promise` or `shared_plan` with a
+due date comes back on that day.
 Where only one row makes sense, a key keeps the first writer: one
 `first_meet`, one `first_intimacy` per realm, one `gift` per message, one
 `tier_reached` per line and label.
@@ -496,6 +503,7 @@ the request and [model-config.md](model-config.md) for `[tasks.chat_voice]`.
 - [2026-10-28-memory-2-dreaming-plus-design.md](superpowers/specs/2026-10-28-memory-2-dreaming-plus-design.md) — dreaming, the arc, the journal and their place in the prompt
 - [2026-08-09-voice-memory-bootstrap-recall-design.md](superpowers/specs/2026-08-09-voice-memory-bootstrap-recall-design.md) — the voice bootstrap and per-turn recall
 - [2026-08-09-voice-dreaming-ingestion-design.md](superpowers/specs/2026-08-09-voice-dreaming-ingestion-design.md) — voice rows in dreaming
+- [2026-11-12-activity-sub-session-design.md](superpowers/specs/2026-11-12-activity-sub-session-design.md) — a date's one episode and journal rows, and date turns kept out of raw-turn memory and dreaming
 
 ## Source
 
@@ -507,6 +515,7 @@ the request and [model-config.md](model-config.md) for `[tasks.chat_voice]`.
 - `crates/eros-engine-server/src/pipeline/post_process.rs` — the raw-turn writer; counts each text turn toward dreaming
 - `crates/eros-engine-server/src/pipeline/dreaming/` — dreaming: triggers and sweeper (`mod.rs`), the scan and the arc rewrite (`scan.rs`), reply parsing and guards (`parse.rs`), the transcript (`render.rs`)
 - `crates/eros-engine-server/src/relationship_context.rs` — loads the arc, episodes and journal for a turn and renders the relationship part of `[shared_memories]`
+- `crates/eros-engine-server/src/pipeline/activity.rs` — a date's settlement: its episode and journal rows ([Activities](activities.md#memory))
 - `crates/eros-engine-server/src/anniversary.rs` — the anniversary lines
 - `crates/eros-engine-server/src/backfill.rs` — the `backfill-dreaming` subcommand
 - `crates/eros-engine-server/src/pipeline/handlers.rs` — recall and prompt injection

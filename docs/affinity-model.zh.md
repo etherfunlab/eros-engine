@@ -6,8 +6,8 @@
 
 好感度是每个关系（即每个 session）一份的六轴向量，每轴限定在 `[0, 1]`，每次更新都
 clamp。它只在文本通道、非 `product_qa` 的聊天回合上移动。语音回合与 `product_qa`
-回合从不写好感度事件，群聊回合也不写（群只读取各成员的好感度，从不写入）。唯一不属于回合的变动，
-是被回答的生活选择带来的降档（见[生活选择的降档与放缓](#生活选择的降档与放缓)）。判官（LLM 评估器）在任何地方都只输出 ordinal 的档位或等级；
+回合从不写好感度事件，群聊回合也不写（群只读取各成员的好感度，从不写入）。不属于回合的变动有两种：
+被回答的生活选择带来的降档（见[生活选择的降档与放缓](#生活选择的降档与放缓)），以及一场约会结算时的那一次结论（见[约会](#约会)）。判官（LLM 评估器）在任何地方都只输出 ordinal 的档位或等级；
 引擎拥有每一个数字、每一个标签、每一次档位迁移，是唯一权威来源。
 
 六轴分三组，全文都围绕这三组组织：**基础对**（`warmth`、`patience`）、**Bond**
@@ -182,7 +182,8 @@ penalty = κ_line × ((y − y₀)⁺ / (1 − y₀))² × (|g| / 4)
 
 跳过的评估（`eval_skip_reason`）与失败的评估（非空 `llm_attempts` /
 `gateway_errors`）保持存储档位不变，端点仅按当前线值与衰减重新派生。旧的规则
-delta 回退已退役。
+delta 回退已退役。[约会](#约会)的回合，以及开启约会的那一次邀约回合，都是
+`eval_skip_reason = "activity"` 的跳过评估，规则微调也一并归零。
 
 PDE 判定的 ghost 回合从不进入 `persist_with_event`：只有 `ghost_streak` / `total_ghosts` /
 `last_ghost_at` 和 `updated_at` 移动；`record_ghost` 写全零 `effective_deltas`，没有任何轴移动，
@@ -199,6 +200,7 @@ PDE 判定的 ghost 回合从不进入 `persist_with_event`：只有 `ghost_stre
 - **社交动作：** 被拒的 `bluff`、`threaten`、`trick` 表示她识破了，同样不降档；这一轮按常规打分。
 - **脱衣服：** `affinity_scope` 性向不相容的一对发来的 `strip`，不管判官怎么说都判为拒绝，并像任何被拒的身体动作一样让 Chemistry 降一档。
 - **礼物：** 被接受时还会进入角色的持有物品或衣柜；被拒时什么也不进，并像被拒的 `give` 一样让 Bond 掉一档。
+- **约会：** 被拒的 `date` 邀约不降档，这一轮按常规打分。被接受的根本不打分：它开启约会，约会在结算时整场评一次（见[下文](#约会)）。
 
 例：chemistry `0.80`（第 4 档内 64% 处）落到第 3 档内 64% 处，约 `0.524`。
 
@@ -233,6 +235,28 @@ PDE 判定的 ghost 回合从不进入 `persist_with_event`：只有 `ghost_stre
   session；窗口是推算出来的，没有新状态：选择的 `event_id` 指向分开那一行的 `ends_at`，窗口是 `ends_at` 到
   `ends_at` 加 72 小时，按墙钟算。被放缓的回合，事件行带 `context.growth_scale`（`0.5`），全速时没有这个键，
   它的 `effective_deltas` 显示的是减半后的值。被接受的浪漫选择从不放缓增长。
+
+### 约会
+
+一场[约会](activities.zh.md)在结算时只评一次，它的结论以一次写入落到发出邀约的那个 session 上。约会回合也写在那个
+session 的行上，记为跳过的评估（见[上文](#不移动的回合)）；约会中被拒的动作照样让对应的线降档。
+
+- **加权的结论。** 约会判官返回一个逐轮形状的结论：每个线轴一个档位，每个端点一个等级。它只走一次写入管线
+  （`grade_weighted`），从时间衰减之后的存储状态开始，没有规则微调，抵 `weight` 个回合：
+
+  ```
+  weight = min(turns, cap) × AFFINITY_ACTIVITY_TURN_SHARE
+  ```
+
+  `turns` 是约会里有效回合的数目，`cap` 按约会时长取 `AFFINITY_ACTIVITY_TURN_CAP_SHORT` 或
+  `AFFINITY_ACTIVITY_TURN_CAP_MID`（见[调参旋钮](#调参旋钮)）。每个轴的原始分、真实分和评估出的跨线惩罚都在阈值门之前乘 `weight`；
+  档位衰减、`AFFINITY_NEG_FACTOR`、demo 加成、clamp 和分开之后的放缓都和回合上一样。结论解析成功时，等级覆写存储的等级，两个端点重新派生。
+- **一档上限。** 之后每条线相对写入前的位置最多挪一档：往上最多到上一档内的相同相对位置（被拒动作落点规则的镜像），
+  往下最多到下一档内的相同相对位置。越过上限的线，两个轴沿各自的增量按同一个比例拉回，让这条线正好落在上限上。
+  第 1 档的线可以掉到 `0`，第 5 档的线由 clamp 限住。被上限削掉的部分就没了：被限住的线的 `pending_deltas` 清零。
+- **它的事件行。** 一行非回合类型的事件，`event_type = 'activity'`，没有 `user_message_id`。`context` 带 `activity_id`、`turns`、
+  `weight`、判官的 `reason` 和 `capped`（被上限限住的线，没有时不带），旁边是常规的审计键。delta 路由从不返回它，它不算生活选择触发里
+  被判官评过的回合，它的 `reason` 也不进 `[emotional_context]`。
 
 ## 基础对派生细节
 
@@ -377,7 +401,7 @@ PDE 判定的 ghost 回合从不进入 `persist_with_event`：只有 `ghost_stre
 
 每个增量回合向 `companion_affinity_events` 追加一行：
 
-- `deltas`：本轮线轴的原始分（档位换算加规则微调，衰减前）；这里的
+- `deltas`：本轮线轴的原始分（档位换算加规则微调，衰减前），`activity` 行上再乘它的 `weight`；这里的
   `warmth`/`patience` 恒为 `0.0`，`life_choice` 行除外，它的 `deltas` 与
   `effective_deltas` 相同（见[上文](#生活选择的降档与放缓)）。
 - `effective_deltas`：实际应用的逐轴变化，`after − before`；基础对上它
@@ -388,16 +412,17 @@ PDE 判定的 ghost 回合从不进入 `persist_with_event`：只有 `ghost_stre
   `decay_factor`、`units`）；被收税的回合另有 `cross_penalty_assessed`；动作被拒绝而降档的回合另有
   `tier_drop`（`bond` | `chemistry`），标明被降的那条线；分开之后的放缓减半了为正的增长时，另有 `growth_scale`（`0.5`）。
   生活选择自己的 `life_choice` 行，`context` 是 `life_choice` 与 `choice_id`（见[上文](#生活选择的降档与放缓)）。
+  约会的 `activity` 行另有 `activity_id`、`turns`、`weight`、判官的 `reason`，上限限住某条线时还有 `capped`（见[上文](#约会)）。
 - `user_message_id`：对 `chat_messages` 的真外键，
-  `ON DELETE SET NULL`；`proactive`/`time_decay` 行与迁移前写入的行为
+  `ON DELETE SET NULL`；`proactive`/`time_decay`/`life_choice`/`activity` 行与迁移前写入的行为
   `NULL`，不回填。
 - `label_changes`（见「档位与标签」）、`effective_line_deltas`（本轮精确的
   bond/chemistry delta，API 上服务为 `effective_deltas_computed`）、
   `state_after`（本轮结束时的整个向量）。`state_before`
   列存在但不对外服务，要重放请直接查表。
 
-`event_type` 取值为 `message`、`ghost`、`gift`、`proactive`、`time_decay` 或 `life_choice`。
-后两个不是回合：逐轮 delta 路由只读 `message`、`gift`、`proactive` 和 `ghost`。
+`event_type` 取值为 `message`、`ghost`、`gift`、`proactive`、`time_decay`、`life_choice` 或 `activity`。
+后三个不是回合：逐轮 delta 路由只读 `message`、`gift`、`proactive` 和 `ghost`。
 
 ### API 表面
 
@@ -478,6 +503,9 @@ PDE 判定的 ghost 回合从不进入 `persist_with_event`：只有 `ghost_stre
 | `AFFINITY_FLOOR_RATIO` | `0.2` | 端点托底 φ；域上限 `0.24`，永远压不过非冷淡裁定 |
 | `AFFINITY_TIME_DECAY_RATE` | `0.02` | 端点缺席衰减（每天） |
 | `AFFINITY_TIME_DECAY_FLOOR` | `0.5` | 端点缺席衰减下限 |
+| `AFFINITY_ACTIVITY_TURN_SHARE` | `0.25` | 约会里每个有效回合的权重（见[约会](#约会)）；`0` 或以上 |
+| `AFFINITY_ACTIVITY_TURN_CAP_SHORT` | `12` | `short` 约会最多计入的回合数；非负整数，`0` = 约会什么都不挪动 |
+| `AFFINITY_ACTIVITY_TURN_CAP_MID` | `32` | `mid` 约会最多计入的回合数；取值范围同上 |
 
 启动时逐个标量做域检查，非有限或越域的值保持默认并打警告；环境变量打错字
 只会退回默认，不会进入管线。`0.35` 枢轴与 `B_MAX = 1.5` 是代码常量而非旋钮。
@@ -485,11 +513,14 @@ PDE 判定的 ghost 回合从不进入 `persist_with_event`：只有 `ghost_stre
 ## 源码
 
 - `crates/eros-engine-core/src/affinity.rs`：类型、`grade_turn` 写入管线、
-  端点派生、时间衰减、bond/chemistry 分数、档位、标签、`diff_labels`
+  端点派生、时间衰减、bond/chemistry 分数、档位、标签、`diff_labels`；约会用的
+  `grade_weighted`、`cap_line_shift` 和 `AffinityTuning::activity_weight`
 - `crates/eros-engine-core/src/scope.rs`：`AffinityScope` / `MemoryScope`、
   `length_score`、`romance_compatible`（见「`affinity.rs` 与 `scope.rs`」）
 - `crates/eros-engine-store/src/affinity.rs`：`AffinityRepo`
-  （`persist_with_event`、`record_ghost`、`persist_life_choice_drop_in_tx`、`last_judged_endpoints`）；表在 `migrations/0000_baseline.sql`
+  （`persist_with_event`、`record_ghost`、`persist_life_choice_drop_in_tx`、`persist_activity_in_tx`、`last_judged_endpoints`）；表在 `migrations/0000_baseline.sql`，
+  `activity` 事件类型在 `migrations/0085_activities.sql`
+- `crates/eros-engine-server/src/pipeline/activity.rs`：约会的结算和约会判官调用
 - `crates/eros-engine-store/src/life_choices.rs`：`LifeChoiceRepo`
   （选择行；`growth_slowed` 推算放缓窗口）
 - `crates/eros-engine-server/src/pipeline/post_process.rs`：LLM 评估、
@@ -505,3 +536,4 @@ PDE 判定的 ghost 回合从不进入 `persist_with_event`：只有 `ghost_stre
   档位列落库、事件状态快照、绝对值端点
 - 设计 spec：`docs/superpowers/specs/2026-10-05-chat-user-actions-design.md` —— 用户动作、判官的接受与拒绝、降档
 - 设计 spec：`docs/superpowers/specs/2026-10-19-life-events-shopping-gatherings-and-ask-for-space-design.md` —— 提出分开的选择、双线降档、增长放缓
+- 设计 spec：`docs/superpowers/specs/2026-11-12-activity-sub-session-design.md` —— 约会作为子会话、加权的结论和一档上限

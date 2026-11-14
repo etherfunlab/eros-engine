@@ -33,6 +33,7 @@ BYOC 实例上接受卡片的路由：
 - `POST /comp/voice/{session_id}/turn/stream`
 - `POST /v2/comp/session/{session_id}/events`（生活事件）
 - `POST /v2/comp/session/{session_id}/life-choices/{choice_id}`（对她提出的某次生活选择的回答；BYOC session 从不触发这类请求）
+- stream 路由上的 `date` 动作（见[约会](activities.zh.md)）：stream 轮次的其余部分照常可用，但不能约 BYOC 实例出去。
 - 群聊：创建含 BYOC 成员的群，或向群里添加 BYOC 成员。
 
 World Memories、World Town 和 World Stories 从不包含 BYOC 实例。

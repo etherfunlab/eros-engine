@@ -195,6 +195,7 @@ crates/
 │       ├── events.rs         # EventRepo（persona_events：进行中的事件、历史、离线时段、虚惊）
 │       ├── group.rs          # GroupRepo（群聊会话、成员关系）
 │       ├── life_choices.rs   # LifeChoiceRepo（角色的生活选择：选择行、待回答、结算、放缓窗口）
+│       ├── activity.rs       # ActivityRepo（约会：开启、结算的认领、约会的对话记录）
 │       ├── affinity.rs       # AffinityRepo（persist_with_event、record_ghost、persist_life_choice_drop_in_tx）
 │       ├── memory.rs         # MemoryRepo（Profile / Relationship 兩層）
 │       ├── insight.rs        # InsightEventRepo（human_insights_events 审计行）
@@ -219,7 +220,7 @@ crates/
         ├── auth/             # AuthValidator trait + Supabase 實現 + 中間件
         ├── pipeline/         # stream（run_stream）/ group + group_director / reasoning_call / handlers / post_process / dreaming / …
         ├── prompt.rs         # system prompt 構造（affinity → 行為指令）
-        ├── routes/           # health / companion / companion_stream / companion_async / insight / image_edit / voice / persona / session_open / session_events / session_effects / life_choices / persona_items / user_rows / reaction / group / world_town / svc（服务间导出，`/svc/v1/*`）/ bff / dto / mod
+        ├── routes/           # health / companion / companion_stream / companion_async / insight / image_edit / voice / persona / session_open / session_events / session_effects / life_choices / activities / persona_items / user_rows / reaction / group / world_town / svc（服务间导出，`/svc/v1/*`）/ bff / dto / mod
         └── openapi.rs        # utoipa ApiDoc 元數據
 ```
 
@@ -229,6 +230,7 @@ crates/
 - [Ghost 機制](ghost-mechanics.zh.md)——評分公式 + 保護規則 + 實例計算
 - [群聊](group-chat.zh.md)——一位用户加至多三位角色、导演、发言者接力
 - [生活事件与需求](life-events-needs.zh.md)——角色的需求及其漂移、事件抽取、背景事件、离线类、虚惊、提出分开与浪漫选择
+- [活动：约会](activities.zh.md)——作为子会话的约会：邀约与门槛、约会回合、暂停的东西、结算、留下的记忆
 - [記憶層](memory-layers.zh.md)——profile vs relationship、Voyage、pgvector 檢索
 - [部署](deploying.zh.md)——Docker、自带 Postgres / IdP
 - [API 參考](api-reference.zh.md)——每個 `/comp/*` 端點
