@@ -319,7 +319,9 @@ impl<'a> StoryRepo<'a> {
     /// latest before pairing with the next assistant reply; a lone assistant
     /// with no preceding user row is dropped. Proactive rows (event and choice
     /// messages, openers, greetings) are not evidence: life events and choices
-    /// reach the director through their own reads.
+    /// reach the director through their own reads. Neither are a date's turns
+    /// (its `activity` sub-session): dates stay out of World Stories (spec
+    /// 2026-11-12-activity-sub-session-design.md §2).
     pub async fn chat_evidence(
         &self,
         owner_uid: Uuid,
@@ -333,6 +335,7 @@ impl<'a> StoryRepo<'a> {
              FROM engine.chat_messages cm \
              JOIN engine.chat_sessions cs ON cs.id = cm.session_id AND NOT cs.archived \
              WHERE cs.user_id = $1 AND cs.instance_id = $2 \
+               AND cs.channel <> 'activity' \
                AND cm.sent_at > now() - make_interval(days => $3) \
                AND cm.truncated = FALSE \
                AND cm.channel IS NULL \
@@ -1184,6 +1187,48 @@ mod tests {
         assert!(
             !pairs.iter().any(|(u, a)| u == "S1问题" && a == "S2回答"),
             "must not pair across sessions"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn chat_evidence_leaves_out_a_dates_turns(pool: PgPool) {
+        let repo = StoryRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        let inst = seed_instance(&pool, owner, "A", "active").await;
+        let mut sessions = Vec::new();
+        for channel in ["text", "activity"] {
+            let id: Uuid = sqlx::query_scalar(
+                "INSERT INTO engine.chat_sessions (user_id, instance_id, channel) \
+                 VALUES ($1, $2, $3) RETURNING id",
+            )
+            .bind(owner)
+            .bind(inst)
+            .bind(channel)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            sessions.push(id);
+        }
+        for (session, u, a) in [
+            (sessions[0], "周末去哪", "想去海边"),
+            (sessions[1], "海风好大", "抓紧我"),
+        ] {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+                 VALUES ($1, 'user', $2, now() - interval '2 minutes'), \
+                        ($1, 'assistant', $3, now() - interval '1 minute')",
+            )
+            .bind(session)
+            .bind(u)
+            .bind(a)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let pairs = repo.chat_evidence(owner, inst, 7, 60).await.unwrap();
+        assert_eq!(
+            pairs,
+            vec![("周末去哪".to_string(), "想去海边".to_string())]
         );
     }
 

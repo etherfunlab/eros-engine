@@ -227,7 +227,7 @@ takes no roster slot from an instance that has a genome.
 | Current insight + digest | `persona_story_insights` row (`last_run_at IS NULL` ⇒ first-round init) |
 | Recent events (12) | `persona_story_events`, chronological — continuity + repetition guard |
 | Affinity snapshot | latest session's six axes + bond + chemistry + both tier labels — advisory only |
-| Chat evidence | user→reply pairs of this (owner, instance), last `context_days` (default 7), capped by turn count; messages the persona sent on her own (event and life-choice messages, greetings) are not evidence |
+| Chat evidence | user→reply pairs of this (owner, instance), last `context_days` (default 7), capped by turn count; messages the persona sent on her own (event and life-choice messages, greetings) are not evidence, nor are the turns of a [date](activities.md) |
 | Life events (30) | `persona_events` of the instance started in the same window, plus any under way: label, category, relative time (`3 天前开始，持续 2 小时`), and the message she told it in, if any. `taking_space` / `fell_out` only from unarchived sessions; the narration of an event told in an archived session is left out; a false alarm only once it has ended, with its outcome; never a `bathing_together` or an `on_a_date`, which live in the conversation only |
 | Background under way | the one of those life events that is a background under way, repeated on its own |
 | Ask-for-space choices (10) | `life_choices` of the pair's unarchived sessions in the window: her ask and its outcome (accepted with the separation's length, declined, ignored, unanswered, still waiting) |

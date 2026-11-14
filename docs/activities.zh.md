@@ -128,6 +128,7 @@ chat session（`channel = 'activity'`），隶属于发出邀约的那条 1:1 �
   约会中再带 `date` 动作返回 `409 activity_in_progress`。
 - **不写逐轮原文。** 用户这句话不 embed 进任何一层记忆。
 - **不进 dreaming。** 这一回合不计入关系扫描，扫描也从不读子会话的行（见[记忆](#记忆)）。
+- **不当故事证据。** World Stories 的故事导演从不读子会话的行。
 
 需求照常评定（有 LLM 判官时），洞察提取照常运行，和任何文字回合一样：用户在约会里说起自己的事，照样进画像。
 
@@ -373,6 +374,7 @@ weight = min(turns, cap(duration)) × AFFINITY_ACTIVITY_TURN_SHARE
 - `crates/eros-engine-store/src/affinity.rs::AffinityRepo::persist_activity_in_tx`：加权、限档的写入和它的事件行。
 - `crates/eros-engine-store/src/journal.rs`：`date`、`date_moment`；`episode.rs::EpisodeRepo::insert_in_tx`。
 - `crates/eros-engine-store/src/session_archive.rs`：归档结束约会并归档它的子会话。
+- `crates/eros-engine-store/src/story.rs`：`life_events` 与 `chat_evidence` 把约会排除在外。
 - `crates/eros-engine-llm/src/model_config.rs`：`resolve_activity_judge`、`ACTIVITY_JUDGE_MIN_TOKENS`。
 - `crates/eros-engine-server/src/state.rs`：三个 `AFFINITY_ACTIVITY_*` 旋钮。
 - `crates/eros-engine-store/migrations/0085_activities.sql`。

@@ -161,6 +161,7 @@ date is `ongoing`. A date turn is a text turn with these differences:
 - **No verbatim memory.** The user's line is not embedded into either memory layer.
 - **No dreaming.** The turn does not count toward the relationship scan, and the scan never
   reads the sub-session's rows ([Memory](#memory)).
+- **Not story evidence.** The World Stories director never reads the sub-session's rows.
 
 Needs are rated (with the LLM judge) and insight extraction runs, as on any text turn: what the
 user says about themselves on a date still reaches the profile.
@@ -484,6 +485,7 @@ row are chat data, which neither touches.
   `episode.rs::EpisodeRepo::insert_in_tx`.
 - `crates/eros-engine-store/src/session_archive.rs`: the archive ends a date and archives its
   sub-session.
+- `crates/eros-engine-store/src/story.rs`: `life_events` and `chat_evidence` leave dates out.
 - `crates/eros-engine-llm/src/model_config.rs`: `resolve_activity_judge`,
   `ACTIVITY_JUDGE_MIN_TOKENS`.
 - `crates/eros-engine-server/src/state.rs`: the three `AFFINITY_ACTIVITY_*` knobs.
