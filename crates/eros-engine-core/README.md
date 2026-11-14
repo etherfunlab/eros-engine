@@ -21,7 +21,7 @@ Pure-domain types and rules for the [`eros-engine`](https://github.com/etherfunl
 
 ```toml
 [dependencies]
-eros-engine-core = "2.6"
+eros-engine-core = "2.7"
 ```
 
 This crate is the foundation for the rest of the workspace:
