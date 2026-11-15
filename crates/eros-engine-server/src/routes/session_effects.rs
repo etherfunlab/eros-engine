@@ -88,9 +88,9 @@ impl From<eros_engine_core::needs::NeedLevel> for NeedLevelDto {
 /// `needs` shape of the `body_state` stream frame.
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct NeedsView {
-    pub hunger: NeedLevelDto,
+    /// `high` wants company, `low` wants to be left alone.
     pub social: NeedLevelDto,
-    pub stamina: NeedLevelDto,
+    /// `high` wants to be cared about, `low` feels content.
     pub emotional: NeedLevelDto,
     /// `high` wants to go out, `low` wants to stay in.
     pub outing: NeedLevelDto,
@@ -101,9 +101,7 @@ pub struct NeedsView {
 impl From<&eros_engine_core::needs::Needs> for NeedsView {
     fn from(n: &eros_engine_core::needs::Needs) -> Self {
         Self {
-            hunger: n.hunger.into(),
             social: n.social.into(),
-            stamina: n.stamina.into(),
             emotional: n.emotional.into(),
             outing: n.outing.into(),
             indulgence: n.indulgence.into(),
@@ -583,8 +581,8 @@ mod tests {
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn effects_carry_indulgence_by_habit_count(pool: sqlx::PgPool) {
-        // The original four at rest, so only `indulgence` can move.
-        let rated = || json!({"needs": {"hunger": "high", "social": "high", "stamina": "mid", "emotional": "mid"}});
+        // Social and emotional at rest, so only `indulgence` can move.
+        let rated = || json!({"needs": {"social": "high", "emotional": "mid"}});
         let run = |art: serde_json::Value, mins_ago: i32| {
             let pool = pool.clone();
             async move {
@@ -610,8 +608,7 @@ mod tests {
         let (_, body) = run(two.clone(), 9 * 60).await;
         assert_eq!(
             body["needs"],
-            json!({"hunger": "high", "social": "high", "stamina": "mid", "emotional": "mid",
-                "outing": "mid", "indulgence": "high"})
+            json!({"social": "high", "emotional": "mid", "outing": "mid", "indulgence": "high"})
         );
         assert_eq!(body["changes_at"], serde_json::Value::Null);
         let (rated_at, body) = run(two, 3 * 60).await;
@@ -630,20 +627,24 @@ mod tests {
         let owner = Uuid::new_v4();
         let instance_id = seed_persona_instance(&pool, owner).await;
         let session_id = seed_session(&pool, owner, instance_id).await;
-        // Rated 5 hours ago: hunger low → mid (4h period); the rest unchanged.
-        let rated_at = user_row(&pool, session_id, 300,
-            json!({"needs": {"hunger": "low", "social": "mid", "stamina": "high", "emotional": "mid"}})).await;
+        // Rated 13 hours ago: social low → mid (12h period); the rest unchanged.
+        let rated_at = user_row(
+            &pool,
+            session_id,
+            780,
+            json!({"needs": {"social": "low", "emotional": "mid"}}),
+        )
+        .await;
         let (s, body) = get_judged(pool, session_id, owner).await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(
             body["needs"],
-            json!({"hunger": "mid", "social": "mid", "stamina": "high", "emotional": "mid",
-                "outing": "mid", "indulgence": "mid"})
+            json!({"social": "mid", "emotional": "mid", "outing": "mid", "indulgence": "mid"})
         );
-        // Hunger reaches high and stamina mid 8 hours after the rating.
+        // Social reaches high 24 hours after the rating.
         assert_eq!(
             body["changes_at"],
-            json!(rated_at + chrono::Duration::hours(8))
+            json!(rated_at + chrono::Duration::hours(24))
         );
     }
 
@@ -664,9 +665,14 @@ mod tests {
         let owner = Uuid::new_v4();
         let instance_id = seed_persona_instance(&pool, owner).await;
         let session_id = seed_session(&pool, owner, instance_id).await;
-        // Hunger steps 4 hours after the rating, 10 minutes from now.
-        user_row(&pool, session_id, 230,
-            json!({"needs": {"hunger": "low", "social": "high", "stamina": "mid", "emotional": "mid"}})).await;
+        // Social steps 12 hours after the rating, 10 minutes from now.
+        user_row(
+            &pool,
+            session_id,
+            710,
+            json!({"needs": {"social": "low", "emotional": "mid"}}),
+        )
+        .await;
         let (s, body) = get_judged(pool, session_id, owner).await;
         assert_eq!(s, StatusCode::OK);
         let as_of: chrono::DateTime<chrono::Utc> =
@@ -685,9 +691,14 @@ mod tests {
         let owner = Uuid::new_v4();
         let instance_id = seed_persona_instance(&pool, owner).await;
         let session_id = seed_session(&pool, owner, instance_id).await;
-        // Hunger steps 4 hours after the rating, 10 minutes from now.
-        let rated_at = user_row(&pool, session_id, 230,
-            json!({"needs": {"hunger": "low", "social": "high", "stamina": "mid", "emotional": "mid"}})).await;
+        // Social steps 12 hours after the rating, 10 minutes from now.
+        let rated_at = user_row(
+            &pool,
+            session_id,
+            710,
+            json!({"needs": {"social": "low", "emotional": "mid"}}),
+        )
+        .await;
         let now = chrono::Utc::now();
         eros_engine_store::events::EventRepo { pool: &pool }
             .insert(
@@ -709,7 +720,7 @@ mod tests {
         assert_eq!(body["event"]["kind"], json!("reading"));
         assert_eq!(
             body["changes_at"],
-            json!(rated_at + chrono::Duration::hours(4))
+            json!(rated_at + chrono::Duration::hours(12))
         );
     }
 
@@ -718,8 +729,13 @@ mod tests {
         let owner = Uuid::new_v4();
         let instance_id = seed_persona_instance(&pool, owner).await;
         let session_id = seed_session(&pool, owner, instance_id).await;
-        user_row(&pool, session_id, 10,
-            json!({"needs": {"hunger": "high", "social": "high", "stamina": "mid", "emotional": "mid"}})).await;
+        user_row(
+            &pool,
+            session_id,
+            10,
+            json!({"needs": {"social": "high", "emotional": "mid"}}),
+        )
+        .await;
         let (s, body) = get_judged(pool, session_id, owner).await;
         assert_eq!(s, StatusCode::OK);
         assert!(body["needs"].is_object(), "{body}");
@@ -738,8 +754,13 @@ mod tests {
         let (s, body) = get_judged(pool.clone(), session_id, owner).await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(body.get("needs"), Some(&serde_json::Value::Null), "{body}");
-        user_row(&pool, session_id, 10,
-            json!({"needs": {"hunger": "high", "social": "mid", "stamina": "mid", "emotional": "mid"}})).await;
+        user_row(
+            &pool,
+            session_id,
+            10,
+            json!({"needs": {"social": "mid", "emotional": "mid"}}),
+        )
+        .await;
         let (s, body) = get(pool, session_id, owner).await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(
@@ -753,10 +774,8 @@ mod tests {
     fn needs_view_matches_the_frame_shape() {
         use eros_engine_core::needs::{NeedLevel, Needs};
         let n = Needs {
-            hunger: NeedLevel::High,
             social: NeedLevel::Low,
-            stamina: NeedLevel::Mid,
-            emotional: NeedLevel::Mid,
+            emotional: NeedLevel::High,
             outing: NeedLevel::Mid,
             indulgence: NeedLevel::Mid,
         };

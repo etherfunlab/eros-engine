@@ -1425,13 +1425,11 @@ mod tests {
         assert!(b.effects.is_empty());
     }
 
-    fn hungry() -> eros_engine_core::needs::Needs {
+    fn wanting() -> eros_engine_core::needs::Needs {
         use eros_engine_core::needs::{NeedLevel, Needs};
         Needs {
-            hunger: NeedLevel::High,
-            social: NeedLevel::Mid,
-            stamina: NeedLevel::Low,
-            emotional: NeedLevel::Mid,
+            social: NeedLevel::High,
+            emotional: NeedLevel::High,
             outing: NeedLevel::Mid,
             indulgence: NeedLevel::Mid,
         }
@@ -1441,16 +1439,16 @@ mod tests {
     fn bootstrap_block_renders_the_needs_after_the_effects() {
         let mut s = snapshot(&[], None);
         s.effects = vec![cigarette()];
-        s.needs = Some(hungry());
+        s.needs = Some(wanting());
         assert_eq!(
             render_bootstrap(&s, OPEN_GATE, Habits::default()).as_deref(),
-            Some("[身体状态]\n1 支烟，烟劲很足，正在劲头上\n此刻的需要：饿了；很累")
+            Some("[身体状态]\n1 支烟，烟劲很足，正在劲头上\n此刻的需要：想找人说说话；很想被在乎")
         );
         let mut alone = snapshot(&[], None);
-        alone.needs = Some(hungry());
+        alone.needs = Some(wanting());
         assert_eq!(
             render_bootstrap(&alone, OPEN_GATE, Habits::default()).as_deref(),
-            Some("[身体状态]\n此刻的需要：饿了；很累")
+            Some("[身体状态]\n此刻的需要：想找人说说话；很想被在乎")
         );
     }
 
@@ -1467,9 +1465,7 @@ mod tests {
         let at_micros = |micros: i64| {
             let mut s = snapshot(&[], None);
             s.needs = Some(eros_engine_core::needs::Needs {
-                hunger: NeedLevel::Mid,
                 social: NeedLevel::Mid,
-                stamina: NeedLevel::Mid,
                 emotional: NeedLevel::Mid,
                 outing: NeedLevel::Mid,
                 indulgence: NeedLevel::High,
@@ -1492,7 +1488,7 @@ mod tests {
     fn an_old_snapshot_renders_as_before() {
         let b: VoiceBootstrap = serde_json::from_value(serde_json::json!({
             "insights": [], "created_at": "2026-10-01T00:00:00Z",
-            "needs": {"hunger": "high", "social": "mid", "stamina": "low", "emotional": "mid"}
+            "needs": {"hunger": "high", "social": "high", "stamina": "low", "emotional": "high"}
         }))
         .unwrap();
         let all = Habits {
@@ -1504,7 +1500,7 @@ mod tests {
         };
         assert_eq!(
             render_bootstrap(&b, OPEN_GATE, all).as_deref(),
-            Some("[身体状态]\n此刻的需要：饿了；很累")
+            Some("[身体状态]\n此刻的需要：想找人说说话；很想被在乎")
         );
     }
 
@@ -3690,7 +3686,7 @@ data: [DONE]\n\n";
              VALUES ($1, 'user', '', $2, now() - make_interval(mins => 5))",
         )
         .bind(text)
-        .bind(serde_json::json!({"needs": {"hunger": "high", "social": "mid", "stamina": "low", "emotional": "mid"}}))
+        .bind(serde_json::json!({"needs": {"hunger": "high", "social": "high", "stamina": "low", "emotional": "high"}}))
         .execute(&pool)
         .await
         .unwrap();
@@ -3706,7 +3702,7 @@ data: [DONE]\n\n";
         )
         .await;
         assert!(complete);
-        assert_eq!(on.needs, Some(hungry()));
+        assert_eq!(on.needs, Some(wanting()));
         let (off, _) = assemble_bootstrap(
             &pool,
             user_id,
