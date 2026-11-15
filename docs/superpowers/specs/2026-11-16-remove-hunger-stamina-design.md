@@ -100,7 +100,7 @@ turns and can raise the base. Nothing in code compensates.
 
 ### 4.7 API
 
-`NeedsDto` (the effects endpoint and the `body_state` SSE frame) has four
+`NeedsView` (the effects endpoint and the `body_state` SSE frame) has four
 keys; `openapi.json` is regenerated.
 
 ### 4.8 Docs
@@ -121,7 +121,10 @@ guide under `docs/migrating/`. Older specs stay as written.
   for them.
 - **Rollback:** the previous image. It requires the two keys, so ratings
   the new engine wrote read as no rating, and the judge rates again on the
-  next judged turn.
+  next judged turn. A voice call whose snapshot the new engine froze with
+  needs reads as malformed on the previous image, so that call starts with
+  no injected context; the snapshot is written once, so rolling forward
+  again is what restores it.
 
 ## 6. Left to the builder
 
