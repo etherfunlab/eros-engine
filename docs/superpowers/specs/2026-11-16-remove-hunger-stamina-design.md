@@ -29,7 +29,11 @@ The needs become four: `social`, `emotional`, `outing`, `indulgence`.
   the reply prompt, event weights, the tone draw, the API and the docs.
 - **Non-goals:** no replacement need; no rewrite of stored rows; no change
   to food's body effect; no compensation for the lower emotional-tone rate
-  (§4.6).
+  (§4.6). The persona keys stay as they are: the five habit keys
+  (`smoking`, `alcoholic`, `drug`, `coffee`, `gluttony`) keep driving
+  `indulgence`, the craving named in the reply, the give roll and the habit
+  events; `health` keeps scaling the `body` category. Neither reads
+  `hunger` or `stamina`.
 - **Anti-goal:** keeping `hunger` / `stamina` in the API as placeholders.
 
 ## 3. Approaches
