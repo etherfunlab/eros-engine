@@ -6767,8 +6767,10 @@ mod tests {
             .is_empty());
     }
 
-    fn rated(hunger: &str) -> serde_json::Value {
-        serde_json::json!({"needs": {"hunger": hunger, "social": "mid", "stamina": "mid", "emotional": "mid"}})
+    /// A rating in the shape stored before `hunger` and `stamina` were
+    /// removed, so reads cover rows written then.
+    fn rated(social: &str) -> serde_json::Value {
+        serde_json::json!({"needs": {"hunger": "mid", "social": social, "stamina": "mid", "emotional": "mid"}})
     }
 
     fn at(s: &str) -> DateTime<Utc> {
@@ -6790,9 +6792,7 @@ mod tests {
         .await;
         let repo = ChatRepo { pool: &pool };
         let n = Needs {
-            hunger: NeedLevel::High,
             social: NeedLevel::Low,
-            stamina: NeedLevel::Mid,
             emotional: NeedLevel::Mid,
             outing: NeedLevel::Mid,
             indulgence: NeedLevel::Mid,
@@ -6807,26 +6807,25 @@ mod tests {
         assert_eq!(meta["action"], json!({"type": "hug"}));
         assert_eq!(
             meta["needs"],
-            json!({"hunger": "high", "social": "low", "stamina": "mid", "emotional": "mid",
-                "outing": "mid", "indulgence": "mid"})
+            json!({"social": "low", "emotional": "mid", "outing": "mid", "indulgence": "mid"})
         );
         repo.set_needs(
             id,
             &Needs {
-                hunger: NeedLevel::Low,
+                social: NeedLevel::High,
                 ..n
             },
         )
         .await
         .unwrap();
-        let hunger: String = sqlx::query_scalar(
-            "SELECT metadata->'needs'->>'hunger' FROM engine.chat_messages WHERE id = $1",
+        let social: String = sqlx::query_scalar(
+            "SELECT metadata->'needs'->>'social' FROM engine.chat_messages WHERE id = $1",
         )
         .bind(id)
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(hunger, "low", "a second rating overwrites the first");
+        assert_eq!(social, "high", "a second rating overwrites the first");
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -6842,22 +6841,20 @@ mod tests {
         .await
         .unwrap();
         let n = Needs {
-            hunger: NeedLevel::Mid,
             social: NeedLevel::Mid,
-            stamina: NeedLevel::Low,
-            emotional: NeedLevel::Mid,
+            emotional: NeedLevel::Low,
             outing: NeedLevel::Mid,
             indulgence: NeedLevel::Mid,
         };
         ChatRepo { pool: &pool }.set_needs(id, &n).await.unwrap();
-        let stamina: Option<String> = sqlx::query_scalar(
-            "SELECT metadata->'needs'->>'stamina' FROM engine.chat_messages WHERE id = $1",
+        let emotional: Option<String> = sqlx::query_scalar(
+            "SELECT metadata->'needs'->>'emotional' FROM engine.chat_messages WHERE id = $1",
         )
         .bind(id)
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(stamina.as_deref(), Some("low"));
+        assert_eq!(emotional.as_deref(), Some("low"));
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -6878,7 +6875,7 @@ mod tests {
         insert_user_row(&pool, other.id, "2026-10-01T12:00:00Z", rated("mid"), None).await;
 
         let got = repo.latest_needs(instance, None).await.unwrap().unwrap();
-        assert_eq!(got.needs.hunger, NeedLevel::High);
+        assert_eq!(got.needs.social, NeedLevel::High);
         assert_eq!(got.rated_at, at("2026-10-01T10:00:00Z"));
         assert_eq!(got.anchor_at, None);
         assert!(repo
@@ -6906,7 +6903,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            got.needs.hunger,
+            got.needs.social,
             NeedLevel::Low,
             "the anchor's own rating is excluded"
         );
@@ -6931,7 +6928,7 @@ mod tests {
             &pool,
             s.id,
             "2026-10-01T10:00:00Z",
-            json!({"needs": {"hunger": "starving"}}),
+            json!({"needs": {"social": "starving"}}),
             None,
         )
         .await;
