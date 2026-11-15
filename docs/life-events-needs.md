@@ -2,8 +2,8 @@
 
 [English](life-events-needs.md) · [中文](life-events-needs.zh.md)
 
-A persona has a day of her own, and two kinds of state follow it. **Needs** are six
-basic levels (hunger, social, stamina, emotional, outing, indulgence) that the PDE judge
+A persona has a day of her own, and two kinds of state follow it. **Needs** are four
+basic levels (social, emotional, outing, indulgence) that the PDE judge
 rates, the engine carries forward in time, and an accepted give moves. **Life events** are
 things that happen to her, drawn when a caller asks: a trip, an illness, a stray cat, an
 hour away from her phone. Both reach the judge and the reply as plain facts in the present
@@ -22,7 +22,7 @@ about how the pieces work and how they fit together.
 
 | | Needs | Life events |
 |---|---|---|
-| What it is | six levels: `hunger`, `social`, `stamina`, `emotional`, `outing`, `indulgence`, each `low` / `mid` / `high` | things that happen in her day, in four categories |
+| What it is | four levels: `social`, `emotional`, `outing`, `indulgence`, each `low` / `mid` / `high` | things that happen in her day, in four categories |
 | Written by | the PDE judge, on a judged text turn; the engine too, on an accepted give ([Gives move needs](#gives-move-needs)) | a caller's `POST /v2/comp/session/{session_id}/events`; the engine picks the kind |
 | Stored in | `metadata.needs` of the rated user row | `engine.persona_events`, plus the message that tells it (none for an offline kind she does not announce) |
 | Scope | one state per persona instance, across all its sessions | the same |
@@ -36,13 +36,11 @@ Voice calls read needs and no events. Group turns read neither. Details follow.
 
 ## Needs
 
-### The six needs
+### The four needs
 
 | need | `low` | `high` | reply wording, `low` / `high` |
 |---|---|---|---|
-| `hunger` | not hungry | very hungry | 不饿 / 饿了 |
 | `social` | wants no company | wants someone to talk to | 不想跟人打交道 / 想找人说说话 |
-| `stamina` | worn out | full of energy | 很累 / 精神很好 |
 | `emotional` | content | badly wants to be cared about | 心里挺满足 / 很想被在乎 |
 | `outing` | wants to stay in | wants to go out | 只想待在屋里 / 想出门走走 |
 | `indulgence` | no urge | craves what she's hooked on: a smoke, a drink, weed, a coffee, a good meal | — / 很想抽根烟, 很想喝一杯, 很想抽口大麻, 很想喝杯咖啡, 很想吃顿好的 or 很想放纵一下 ([below](#where-needs-show-up)) |
@@ -56,13 +54,14 @@ Needs belong to the opt-in LLM judge (`[tasks.pde_decision].filter_prompt` set).
 there are no needs: no `[需求]` line, no reply line, `needs: null` on the frame and the
 effects route, no needs factor in the event draw, nothing in a voice call.
 
-- **The verdict.** The judge's JSON may carry `needs`: an object with all six keys, or `null`
+- **The verdict.** The judge's JSON may carry `needs`: an object with all four keys, or `null`
   for "no change, keep the previous rating". A value that does not parse reads as `null` and
-  never fails the verdict. The strict `response_format` requires all six keys inside a
-  non-null object. An object that has the first four but lacks `outing` or `indulgence` (a
-  judge prompt that does not ask for them, or a non-strict judge) keeps, for each missing
-  key, the level the judge was shown (`mid` before the first rating); one that lacks any of
-  the first four does not parse.
+  never fails the verdict. The strict `response_format` requires all four keys inside a
+  non-null object. An object that has `social` and `emotional` but lacks `outing` or
+  `indulgence` (a judge prompt that does not ask for them, or a non-strict judge) keeps, for
+  each missing key, the level the judge was shown (`mid` before the first rating); one that
+  lacks `social` or `emotional` does not parse. Keys the engine does not rate, such as
+  `hunger` or `stamina` from an older judge prompt, are ignored.
 - **What it rates.** The persona alone, never the relationship; the affinity evaluator rates
   that.
 - **Where it is stored.** On the user row of the turn the judge rated, as `metadata.needs`,
@@ -78,7 +77,7 @@ effects route, no needs factor in the event draw, nothing in a voice call.
   rating precedes it. A deployment without the judge reads no baseline, so a give there writes
   nothing.
 - **Whose state.** The persona instance's. The newest rated row is read across all the
-  instance's sessions, so a second session does not reset her hunger.
+  instance's sessions, so a second session does not reset her needs.
 
 The judge's `needs` and the levels it was shown are audited with the rest of the verdict; see
 [llm-audit.md](llm-audit.md#pde-judge-payload).
@@ -86,14 +85,13 @@ The judge's `needs` and the levels it was shown are audited with the rest of the
 ### Gives move needs
 
 In a deployment that runs the judge, on a 1:1 text turn whose `give` is accepted, the engine
-moves up to three needs by one level each:
+moves two needs by one level each:
 
-| `give` item | `hunger` | `social` | `indulgence` |
-|---|---|---|---|
-| `food` | −1 | | |
-| `cigarette`, `alcohol`, `herb`, `cuisine` | −1 | +1 | +1 |
-| `medicine`, `coffee` | −1 | −1 | −1 |
-| any other item | | | |
+| `give` item | `social` | `indulgence` |
+|---|---|---|
+| `cigarette`, `alcohol`, `herb`, `cuisine` | +1 | +1 |
+| `medicine`, `coffee` | −1 | −1 |
+| any other item, `food` included | | |
 
 −1 is one level toward `low` and +1 one level toward `high`, stopping at the ends. The
 quantity is ignored: one give moves one level.
@@ -109,8 +107,8 @@ What gets written:
   carried to its `sent_at`.
 - **The moved needs.** For each need the item moves, the stored level is the baseline moved by
   one. The judge's rating of that need this turn is discarded: it sees the give in
-  `[用户动作]` and often lowers hunger itself, and shifting on top of its rating would count the
-  meal twice.
+  `[用户动作]` and often moves those needs itself, and shifting on top of its rating would count
+  the give twice.
 - **The other needs.** The judge's rating, resolved against the baseline as on any turn. If the
   judge abstained or failed, they keep the baseline.
 - **No baseline.** With no rating yet, the judge's rating is written unshifted; with no judge
@@ -132,9 +130,7 @@ the rating, and stops there:
 
 | need | settles at | one step every |
 |---|---|---|
-| `hunger` | `high` | 4 h |
 | `social` | `high` | 12 h |
-| `stamina` | `mid` | 8 h |
 | `emotional` | `mid` | 12 h |
 | `outing` | `mid` | 8 h |
 | `indulgence`, no habit `true` | `mid` | 8 h |
@@ -142,12 +138,13 @@ the rating, and stops there:
 | `indulgence`, two habits `true` | `high` | 8 h |
 | `indulgence`, three or more habits `true` | `high` | 4 h |
 
-Time away makes her hungry and wanting company; tiredness, emotional need and the wish to go
-out or stay in settle toward the middle. A `low` hunger rated at noon reads `mid` at 16:00 and
-`high` from 20:00. The habits are the persona's `smoking`, `alcoholic`, `drug`, `coffee` and `gluttony` keys
+Time away makes her want company; emotional need and the wish to go out or stay in settle
+toward the middle. A `low` social rated at noon reads `mid` at midnight and `high` from noon
+the next day. The habits are the persona's `smoking`, `alcoholic`, `drug`, `coffee` and `gluttony` keys
 ([Persona settings](#persona-settings)); `false` and absent count alike. The more of them are
 `true`, the sooner the craving comes back after the judge rated it down. A rating
-stored without `outing` and `indulgence` reads both as `mid`. A BYOC persona's keys live on
+stored without `outing` and `indulgence` reads both as `mid`; one that still carries `hunger`
+or `stamina` reads with those keys ignored. A BYOC persona's keys live on
 her card, which the engine opens only on a turn: outside a turn (`GET …/effects`, a replay that
 falls back to the carried levels) her `indulgence` drifts as for a persona with no habit. The
 constants are in `crates/eros-engine-core/src/needs.rs`.
@@ -169,8 +166,8 @@ again shows the judge the same line.
   `[身体状态]`:
 
   ```
-  [需求] 饥饿=高 社交欲=低 体力=中 情感需求=中 外出=中
-  [需求] 饥饿=高 社交欲=低 体力=中 情感需求=中 外出=中 享受=高
+  [需求] 社交欲=低 情感需求=高 外出=中
+  [需求] 社交欲=低 情感需求=高 外出=中 享受=高
   ```
 
   `外出` is always on the line; `享受=高` is there only when `indulgence` is `high`, and its
@@ -184,7 +181,7 @@ again shows the judge the same line.
 
   ```
   [character_state]（这段关系里目前的状况，不是人设；与上面冲突时以上面为准）
-  - 此刻的需要：饿了；很累
+  - 此刻的需要：想找人说说话；很想被在乎
   ```
 
   `indulgence` shows only at `high`. It names one thing she uses, picked at random each turn
@@ -212,8 +209,8 @@ again shows the judge the same line.
 - **Not shown to:** `/open` greetings, event messages, image edit and group turns.
 
 The engine acts on needs in one place: the weights of the event draw (below). No ghost rule
-and no image rule reads them. A tired persona is not ghosting-prone by rule; the judge sees
-the levels and decides.
+and no image rule reads them. A persona who wants no company is not ghosting-prone by rule;
+the judge sees the levels and decides.
 
 ## Life events
 
@@ -839,10 +836,9 @@ picture, and all fit both worlds ([below](#her-world)):
 | `want_sauna` | 想去洗桑拿 | `short` | 1 | 72 h | 1 h | none | `（你现在很想去洗桑拿。）` |
 
 The cue states the fact and the details are hers: which bird, what the ex said, what she does
-about the job. A high `outing` weighs `want_to_see_sea` twice, and a low `stamina` weighs
-`want_hot_spring` and `want_sauna` twice, as it does `bathing`
-([below](#1-needs-weight-the-kind-pick)); `hygienic` scales those two with the shower and the
-bath ([persona settings](#persona-settings)). One thing leads to another: her ex texting or a
+about the job. A high `outing` weighs `want_to_see_sea` twice
+([below](#1-needs-weight-the-kind-pick)); `hygienic` scales `want_hot_spring` and `want_sauna`
+with the shower and the bath ([persona settings](#persona-settings)). One thing leads to another: her ex texting or a
 breakup makes the ex likelier to want her back, a scolding or a work call makes her want to
 quit, a breakup, a quarrel or the wish to quit sets her thinking about her life, and that makes
 her want to see the sea ([follow-on factors](#follow-on-factors)). In hospital or after surgery
@@ -979,9 +975,6 @@ steers which kind comes up, never whether a category does. The factors, from
 
 | need level | kinds | factor |
 |---|---|---|
-| `stamina` is `low` | `temp_work`, `working_out` | ×0.5 |
-| `stamina` is `low` | `unwell`, `sick`, `bathing`, `asleep`, `want_hot_spring`, `want_sauna` | ×2 |
-| `hunger` is `high` | `grocery_shopping` | ×2 |
 | `emotional` is `high` | `ex_message` | ×3 |
 | `emotional` is `high` | `animal_encounter`, `irritable`, `quarrel` | ×2 |
 | `outing` is `high` | `want_to_go_out` | ×3 |
@@ -1004,18 +997,18 @@ Nothing writes a need from an event. The judge reads the `[近期事件]` line, 
 reference judge prompt in `examples/model_config.toml` tells it to start from `[需求]` and to
 take the conversation, `[近期事件]`, `[身体状态]` and the elapsed time into account. If the
 judge abstains (`needs: null`), the previous rating keeps drifting whatever happened. The one
-write that is not the judge's is an accepted give's move of up to three needs
+write that is not the judge's is an accepted give's move of two needs
 ([Gives move needs](#gives-move-needs)), and it replaces the judge's rating of just those.
 
 ### 3. An offline stretch writes no rating
 
 A turn silenced by an offline kind runs no judge, so it rates nothing. The last rating keeps
 drifting through the stretch, and the first judged turn afterwards is shown it carried across
-all of it: after a long stretch she reads hungrier and lonelier than before.
+all of it: after a long stretch she reads lonelier than before.
 
-Put together, the two form a loop with the judge in the middle: a hungry persona is likelier
-to be out buying groceries; the event reaches the judge's context; the judge rates hunger
-again.
+Put together, the two form a loop with the judge in the middle: a persona who wants to go out
+is likelier to draw `want_to_go_out`; the event reaches the judge's context; the judge rates
+`outing` again.
 
 ## The ask-for-space choice
 

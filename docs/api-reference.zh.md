@@ -120,7 +120,7 @@ data: {"type":"final","filtered":false,"prompt_injected":null,"tier":null,"retri
 - **`cast`**、**`speaker_error`** —— 仅群聊轮次，见 [group-chat.zh.md](group-chat.zh.md#一轮)。1:1 流不会发这两种帧。
 - **`reasoning`** —— `content`：PDE 判断器推理文本的一段（`{"type":"reasoning","content":"…"}`）。零条或多条，最先发出，排在 `action_response`、`body_state` 和第一个 `meta` 之前。只要判断器的模型返回了推理就会出现；body 规则可以打开推理，`reasoning = { enabled = false }` 或 `{ exclude = true }` 可以关闭（见 [model-config.zh.md](model-config.zh.md)）。判断器没有返回推理时，1:1 的帧序列不变。内容仅供展示，不决定任何事；完整显示、折叠还是做成“思考中”提示，由客户端自行决定。判断器回退到别的模型时，那个模型的推理接着往后追加，不发重置帧。群聊轮次的导演在 `cast` 之前发同样的帧。
 - **`action_response`** —— 只在带 `action` 的回合出现：`user_message_id` 和 `response`（`"accept"` | `"refuse"`）。在第一个 `meta` 之前发一次，幂等重放时会重发（`reasoning` 帧不落库，重放时不重发）。客户端必须容忍不认识的帧类型。之后若该回合以 `error` 结束，这一轮就没有生效，历史里也不带它的 `response`。
-- **`body_state`** —— 这一回合回复写成时角色的状态：`user_message_id`；`effects`，仍在起作用的被接受的 give，新的在前，每项 `{item, name?, quantity, level, phase, step, steps}`（`level` 1–4，`phase` 为 `rising` | `peak` | `fading`，`steps` 中的第 `step` 步），没有时为 `[]`；`needs`，`{hunger, social, stamina, emotional, outing, indulgence}`，各为 `low` | `mid` | `high`，没有判定时为 `null`（只有配置了 LLM 判官才有需求，见 [model-config.zh.md](model-config.zh.md)）。有余效或已知需求时发，只发一次，在 `action_response`（若有）之后、第一个 `meta` 之前，幂等重放时重发。
+- **`body_state`** —— 这一回合回复写成时角色的状态：`user_message_id`；`effects`，仍在起作用的被接受的 give，新的在前，每项 `{item, name?, quantity, level, phase, step, steps}`（`level` 1–4，`phase` 为 `rising` | `peak` | `fading`，`steps` 中的第 `step` 步），没有时为 `[]`；`needs`，`{social, emotional, outing, indulgence}`，各为 `low` | `mid` | `high`，没有判定时为 `null`（只有配置了 LLM 判官才有需求，见 [model-config.zh.md](model-config.zh.md)）。有余效或已知需求时发，只发一次，在 `action_response`（若有）之后、第一个 `meta` 之前，幂等重放时重发。
 
 **失败轮次在历史里的样子。** 以 `error` 结束的轮次没有生效：亲密度没有变化，动作轮次的用户行不带 `response`。通常还会留下一条 `system_error` 通知，它的 `user_message_id` 指向那条用户行。如果轮次失败之前已经有失败的回复尝试落库，就不留通知：回复链用尽时没有兜底话术可发（没有配置，或者整条链都是 BYOK，见 [byok.zh.md](byok.zh.md)），或者某一跳失败之后整轮超时。这时队列行按 `done` 结算，历史里保留每次失败尝试的 assistant 行，内容为空，或是它流出过的半截文本。async 端点的轮次走同一条管线，但最多可以尝试 `CHAT_QUEUE_MAX_ATTEMPTS` 次：还没有任何回复尝试落库就失败的会重试，只有最后一次尝试按上面的方式结算；已经有回复尝试落库之后才失败的不再重试。
 
@@ -1094,7 +1094,7 @@ composer 失败时退回普通的人物肖像 prompt，跟聊天回合一样。�
 
 ```json
 {"effects": [{"item": "alcohol", "name": "威士忌", "quantity": 3, "level": 2, "phase": "rising", "step": 2, "steps": 3}],
- "needs": {"hunger": "high", "social": "mid", "stamina": "low", "emotional": "mid", "outing": "high", "indulgence": "mid"},
+ "needs": {"social": "high", "emotional": "mid", "outing": "high", "indulgence": "mid"},
  "event": null,
  "background_event": {"kind": "short_trip", "category": "trip", "offline": false, "started_at": "2026-10-15T08:00:00Z", "ends_at": "2026-10-17T08:00:00Z", "message_id": "…"},
  "as_of": "2026-10-16T13:00:00Z",
