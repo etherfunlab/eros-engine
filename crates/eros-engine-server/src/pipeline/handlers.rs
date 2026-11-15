@@ -5210,13 +5210,13 @@ mod tests {
         assert_eq!(reaction_quote_source("  ", true), "");
     }
 
-    async fn rated_row(pool: &PgPool, session_id: Uuid, at: &str, hunger: &str) -> Uuid {
+    async fn rated_row(pool: &PgPool, session_id: Uuid, at: &str, social: &str) -> Uuid {
         sqlx::query_scalar(
             "INSERT INTO engine.chat_messages (session_id, role, content, metadata, sent_at) \
              VALUES ($1, 'user', '', $2, $3::timestamptz) RETURNING id",
         )
         .bind(session_id)
-        .bind(serde_json::json!({"needs": {"hunger": hunger, "social": "mid", "stamina": "mid", "emotional": "mid"}}))
+        .bind(serde_json::json!({"needs": {"social": social, "emotional": "mid"}}))
         .bind(at)
         .fetch_one(pool)
         .await
@@ -5239,13 +5239,13 @@ mod tests {
         let session_id =
             crate::routes::companion::testutil::seed_session(&pool, owner, instance_id).await;
         rated_row(&pool, session_id, "2026-10-01T00:00:00Z", "low").await;
-        let now: chrono::DateTime<chrono::Utc> = "2026-10-01T08:30:00Z".parse().unwrap();
+        let now: chrono::DateTime<chrono::Utc> = "2026-10-02T00:30:00Z".parse().unwrap();
         let got = load_needs(&pool, instance_id, None, now, Default::default())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(got.hunger, NeedLevel::High, "low + 8.5h → two steps up");
-        assert_eq!(got.social, NeedLevel::Mid);
+        assert_eq!(got.social, NeedLevel::High, "low + 24.5h → two steps up");
+        assert_eq!(got.emotional, NeedLevel::Mid);
         assert!(
             load_needs(&pool, Uuid::new_v4(), None, now, Default::default())
                 .await
@@ -5262,16 +5262,16 @@ mod tests {
         let session_id =
             crate::routes::companion::testutil::seed_session(&pool, owner, instance_id).await;
         rated_row(&pool, session_id, "2026-10-01T00:00:00Z", "low").await;
-        let anchor = rated_row(&pool, session_id, "2026-10-01T04:30:00Z", "high").await;
+        let anchor = rated_row(&pool, session_id, "2026-10-01T12:30:00Z", "high").await;
         let far: chrono::DateTime<chrono::Utc> = "2026-10-05T00:00:00Z".parse().unwrap();
         let got = load_needs(&pool, instance_id, Some(anchor), far, Default::default())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(
-            got.hunger,
+            got.social,
             NeedLevel::Mid,
-            "low + 4.5h to the anchor → one step"
+            "low + 12.5h to the anchor → one step"
         );
     }
 

@@ -2812,9 +2812,7 @@ data: [DONE]\n\n";
             .set_needs(
                 user_msg_id,
                 &eros_engine_core::needs::Needs {
-                    hunger: eros_engine_core::needs::NeedLevel::High,
-                    social: eros_engine_core::needs::NeedLevel::Mid,
-                    stamina: eros_engine_core::needs::NeedLevel::Mid,
+                    social: eros_engine_core::needs::NeedLevel::High,
                     emotional: eros_engine_core::needs::NeedLevel::Mid,
                     outing: eros_engine_core::needs::NeedLevel::Mid,
                     indulgence: eros_engine_core::needs::NeedLevel::Mid,
@@ -2890,7 +2888,7 @@ data: [DONE]\n\n";
         assert!(bs < meta, "body: {body_text}");
         assert!(
             body_text.contains(
-                "\"needs\":{\"hunger\":\"high\",\"social\":\"mid\",\"stamina\":\"mid\",\"emotional\":\"mid\",\"outing\":\"mid\",\"indulgence\":\"mid\"}"
+                "\"needs\":{\"social\":\"high\",\"emotional\":\"mid\",\"outing\":\"mid\",\"indulgence\":\"mid\"}"
             ),
             "{body_text}"
         );

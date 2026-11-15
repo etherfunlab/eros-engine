@@ -7046,19 +7046,15 @@
         "type": "object",
         "description": "The persona's needs (spec 2026-10-13-persona-needs-design.md §3,\n2026-10-28-outing-indulgence-needs-and-habits-design.md §2). Also the\n`needs` shape of the `body_state` stream frame.",
         "required": [
-          "hunger",
           "social",
-          "stamina",
           "emotional",
           "outing",
           "indulgence"
         ],
         "properties": {
           "emotional": {
-            "$ref": "#/components/schemas/NeedLevelDto"
-          },
-          "hunger": {
-            "$ref": "#/components/schemas/NeedLevelDto"
+            "$ref": "#/components/schemas/NeedLevelDto",
+            "description": "`high` wants to be cared about, `low` feels content."
           },
           "indulgence": {
             "$ref": "#/components/schemas/NeedLevelDto",
@@ -7069,10 +7065,8 @@
             "description": "`high` wants to go out, `low` wants to stay in."
           },
           "social": {
-            "$ref": "#/components/schemas/NeedLevelDto"
-          },
-          "stamina": {
-            "$ref": "#/components/schemas/NeedLevelDto"
+            "$ref": "#/components/schemas/NeedLevelDto",
+            "description": "`high` wants company, `low` wants to be left alone."
           }
         }
       },

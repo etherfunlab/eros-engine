@@ -923,7 +923,7 @@ pub(crate) fn body_state(effects: &[ActiveEffect]) -> Option<String> {
 /// The persona's needs as the reply reads them (spec
 /// 2026-10-13-persona-needs-design.md §6.2, 2026-10-28-outing-indulgence-
 /// needs-and-habits-design.md §4.2): the levels that are not `mid`, in the
-/// order hunger, social, stamina, emotional, outing, indulgence, joined by
+/// order social, emotional, outing, indulgence, joined by
 /// 「；」. `None` when nothing is said.
 ///
 /// `indulgence` speaks only when high. It names one habit that is `true`,
@@ -952,9 +952,7 @@ pub(crate) fn needs_line(
         uses[i.min(uses.len() - 1)]
     };
     let words: Vec<&str> = [
-        (n.hunger, Some("不饿"), "饿了"),
         (n.social, Some("不想跟人打交道"), "想找人说说话"),
-        (n.stamina, Some("很累"), "精神很好"),
         (n.emotional, Some("心里挺满足"), "很想被在乎"),
         (n.outing, Some("只想待在屋里"), "想出门走走"),
         (n.indulgence, None, craving),
@@ -4546,9 +4544,7 @@ mod tests {
     fn needs_line_words_and_order() {
         use eros_engine_core::needs::{Habits, NeedLevel::*, Needs};
         let all = |l| Needs {
-            hunger: l,
             social: l,
-            stamina: l,
             emotional: l,
             outing: Mid,
             indulgence: Mid,
@@ -4556,23 +4552,21 @@ mod tests {
         assert_eq!(needs_line(&all(Mid), Habits::default(), 0.0), None);
         assert_eq!(
             needs_line(&all(Low), Habits::default(), 0.0).as_deref(),
-            Some("不饿；不想跟人打交道；很累；心里挺满足")
+            Some("不想跟人打交道；心里挺满足")
         );
         assert_eq!(
             needs_line(&all(High), Habits::default(), 0.0).as_deref(),
-            Some("饿了；想找人说说话；精神很好；很想被在乎")
+            Some("想找人说说话；很想被在乎")
         );
         let mixed = Needs {
-            hunger: High,
-            social: Mid,
-            stamina: Low,
-            emotional: Mid,
+            social: High,
+            emotional: Low,
             outing: Mid,
             indulgence: Mid,
         };
         assert_eq!(
             needs_line(&mixed, Habits::default(), 0.0).as_deref(),
-            Some("饿了；很累")
+            Some("想找人说说话；心里挺满足")
         );
     }
 
@@ -4580,9 +4574,7 @@ mod tests {
     fn needs_line_outing_and_indulgence() {
         use eros_engine_core::needs::{Habits, NeedLevel::*, Needs};
         let with = |outing, indulgence| Needs {
-            hunger: High,
-            social: Mid,
-            stamina: Mid,
+            social: High,
             emotional: Mid,
             outing,
             indulgence,
@@ -4600,13 +4592,13 @@ mod tests {
             ..unset
         };
         let cases = [
-            (with(Low, Mid), unset, "饿了；只想待在屋里"),
-            (with(High, Mid), unset, "饿了；想出门走走"),
-            (with(Mid, Low), unset, "饿了"),
-            (with(Mid, Low), drinker, "饿了"),
-            (with(Mid, High), unset, "饿了；很想放纵一下"),
-            (with(Mid, High), all_false, "饿了；很想放纵一下"),
-            (with(Mid, High), drinker, "饿了；很想喝一杯"),
+            (with(Low, Mid), unset, "想找人说说话；只想待在屋里"),
+            (with(High, Mid), unset, "想找人说说话；想出门走走"),
+            (with(Mid, Low), unset, "想找人说说话"),
+            (with(Mid, Low), drinker, "想找人说说话"),
+            (with(Mid, High), unset, "想找人说说话；很想放纵一下"),
+            (with(Mid, High), all_false, "想找人说说话；很想放纵一下"),
+            (with(Mid, High), drinker, "想找人说说话；很想喝一杯"),
         ];
         for (n, h, want) in cases {
             for pick in [0.0, 0.5, 0.999, 1.0] {
@@ -4625,9 +4617,7 @@ mod tests {
     fn a_craving_names_one_habit() {
         use eros_engine_core::needs::{Habits, NeedLevel::*, Needs};
         let n = Needs {
-            hunger: Mid,
             social: Mid,
-            stamina: Mid,
             emotional: Mid,
             outing: Mid,
             indulgence: High,
@@ -4676,9 +4666,7 @@ mod tests {
     fn a_craving_can_be_for_good_food() {
         use eros_engine_core::needs::{Habits, NeedLevel::*, Needs};
         let n = Needs {
-            hunger: Mid,
             social: Mid,
-            stamina: Mid,
             emotional: Mid,
             outing: Mid,
             indulgence: High,
@@ -4712,19 +4700,22 @@ mod tests {
 
     #[test]
     fn character_state_lists_the_needs_after_the_body_state() {
-        let p = prompt_with_needs(Some("1 支烟，烟劲很足，正在劲头上"), Some("饿了；很累"));
+        let p = prompt_with_needs(
+            Some("1 支烟，烟劲很足，正在劲头上"),
+            Some("想找人说说话；很想被在乎"),
+        );
         let body = p
             .find("- 身上还带着：1 支烟，烟劲很足，正在劲头上")
             .expect(&p);
-        let needs = p.find("- 此刻的需要：饿了；很累").expect(&p);
+        let needs = p.find("- 此刻的需要：想找人说说话；很想被在乎").expect(&p);
         assert!(body < needs, "{p}");
     }
 
     #[test]
     fn the_needs_alone_render_the_block() {
-        let p = prompt_with_needs(None, Some("饿了"));
+        let p = prompt_with_needs(None, Some("想找人说说话"));
         assert!(
-            p.contains("[character_state]（这段关系里目前的状况，不是人设；与上面冲突时以上面为准）\n- 此刻的需要：饿了"),
+            p.contains("[character_state]（这段关系里目前的状况，不是人设；与上面冲突时以上面为准）\n- 此刻的需要：想找人说说话"),
             "{p}"
         );
     }
@@ -5561,7 +5552,10 @@ mod tests {
 
     #[test]
     fn the_events_render_under_now_not_in_character_state() {
-        let p = prompt_with_event(Some("饿了"), Some("临时接到工作（约 2 小时后结束）"));
+        let p = prompt_with_event(
+            Some("想找人说说话"),
+            Some("临时接到工作（约 2 小时后结束）"),
+        );
         let now = p.find("[now]").expect(&p);
         let time = p.find("现在你当地时间是").expect(&p);
         let event = p
@@ -5570,7 +5564,7 @@ mod tests {
         let iron = p.find("[iron_rules").expect(&p);
         assert!(now < time && time < event && event < iron, "{p}");
         let state = p.find("[character_state]").expect(&p);
-        let needs = p.find("- 此刻的需要：饿了").expect(&p);
+        let needs = p.find("- 此刻的需要：想找人说说话").expect(&p);
         assert!(state < needs && needs < now, "{p}");
         let alone = prompt_with_event(None, Some("天气突然变了（约 3 小时后结束）"));
         assert!(!alone.contains("[character_state]"), "{alone}");
@@ -7447,7 +7441,7 @@ mod tests {
             None,
             &NowContext::default(),
             Some("微醺"),
-            Some("饿了"),
+            Some("想找人说说话"),
             None,
             shared,
         )
@@ -7483,7 +7477,7 @@ mod tests {
             "STORY-DIGEST",
             "- 此刻的穿着：白衬衫",
             "- 身上还带着：微醺",
-            "- 此刻的需要：饿了",
+            "- 此刻的需要：想找人说说话",
             "[now]",
             "[iron_rules",
             "[output]",
