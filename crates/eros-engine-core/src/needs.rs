@@ -19,12 +19,12 @@ pub enum NeedLevel {
 /// The needs at one moment. Stored as a user row's `metadata.needs` and in a
 /// voice call's snapshot, so the serde shape is a persisted contract. A value
 /// stored before `outing` and `indulgence` existed reads them as `mid` (spec
-/// 2026-10-28-outing-indulgence-needs-and-habits-design.md §2.1).
+/// 2026-10-28-outing-indulgence-needs-and-habits-design.md §2.1); one that
+/// still carries `hunger` and `stamina` reads with the two keys ignored (spec
+/// 2026-11-16-remove-hunger-stamina-design.md §4.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Needs {
-    pub hunger: NeedLevel,
     pub social: NeedLevel,
-    pub stamina: NeedLevel,
     pub emotional: NeedLevel,
     /// `high` wants to go out, `low` wants to stay in.
     #[serde(default)]
@@ -77,9 +77,7 @@ impl Habits {
 }
 
 /// Where each need settles with time, and the hours one step takes (§3.2).
-const HUNGER_DRIFT: (NeedLevel, f64) = (NeedLevel::High, 4.0);
 const SOCIAL_DRIFT: (NeedLevel, f64) = (NeedLevel::High, 12.0);
-const STAMINA_DRIFT: (NeedLevel, f64) = (NeedLevel::Mid, 8.0);
 const EMOTIONAL_DRIFT: (NeedLevel, f64) = (NeedLevel::Mid, 12.0);
 const OUTING_DRIFT: (NeedLevel, f64) = (NeedLevel::Mid, 8.0);
 
@@ -132,9 +130,7 @@ fn drift(level: NeedLevel, (rest, period): (NeedLevel, f64), hours: f64) -> Need
 /// Levels rated `hours` ago, carried forward to now (§3.2).
 pub fn carried(rated: Needs, hours: f64, habits: Habits) -> Needs {
     Needs {
-        hunger: drift(rated.hunger, HUNGER_DRIFT, hours),
         social: drift(rated.social, SOCIAL_DRIFT, hours),
-        stamina: drift(rated.stamina, STAMINA_DRIFT, hours),
         emotional: drift(rated.emotional, EMOTIONAL_DRIFT, hours),
         outing: drift(rated.outing, OUTING_DRIFT, hours),
         indulgence: drift(rated.indulgence, indulgence_drift(habits), hours),
@@ -155,9 +151,7 @@ fn next_step(level: NeedLevel, (rest, period): (NeedLevel, f64), hours: f64) -> 
 /// `carried`, or `None` when every need is at rest.
 pub fn next_change(rated: Needs, hours: f64, habits: Habits) -> Option<f64> {
     [
-        next_step(rated.hunger, HUNGER_DRIFT, hours),
         next_step(rated.social, SOCIAL_DRIFT, hours),
-        next_step(rated.stamina, STAMINA_DRIFT, hours),
         next_step(rated.emotional, EMOTIONAL_DRIFT, hours),
         next_step(rated.outing, OUTING_DRIFT, hours),
         next_step(rated.indulgence, indulgence_drift(habits), hours),
@@ -167,17 +161,15 @@ pub fn next_change(rated: Needs, hours: f64, habits: Habits) -> Option<f64> {
     .min_by(f64::total_cmp)
 }
 
-/// What an accepted give of `item` does to (hunger, social, indulgence), in
-/// levels (spec 2026-10-30 §2.1, 2026-11-08 §3): food fills her; tobacco,
-/// drink and weed loosen her up, and a dish fills her and loosens her up the
-/// same way; medicine and coffee do the opposite. `None` for an item that
-/// moves nothing.
-fn give_move(item: GivenItem) -> Option<(i8, i8, i8)> {
+/// What an accepted give of `item` does to (social, indulgence), in levels
+/// (spec 2026-10-30 §2.1, 2026-11-08 §3, 2026-11-16 §4.2): tobacco, drink,
+/// weed and a dish loosen her up; medicine and coffee do the opposite. `None`
+/// for an item that moves nothing, plain food included.
+fn give_move(item: GivenItem) -> Option<(i8, i8)> {
     use GivenItem::*;
     Some(match item {
-        Food => (-1, 0, 0),
-        Cigarette | Alcohol | Herb | Cuisine => (-1, 1, 1),
-        Medicine | Coffee => (-1, -1, -1),
+        Cigarette | Alcohol | Herb | Cuisine => (1, 1),
+        Medicine | Coffee => (-1, -1),
         _ => return None,
     })
 }
@@ -202,12 +194,11 @@ pub fn after_give(
     judged: Option<Needs>,
     item: GivenItem,
 ) -> Option<Needs> {
-    let (Some(base), Some((h, s, i))) = (baseline, give_move(item)) else {
+    let (Some(base), Some((s, i))) = (baseline, give_move(item)) else {
         return judged;
     };
     let rest = judged.unwrap_or(base);
     Some(Needs {
-        hunger: step(base.hunger, rest.hunger, h),
         social: step(base.social, rest.social, s),
         indulgence: step(base.indulgence, rest.indulgence, i),
         ..rest
@@ -218,13 +209,12 @@ pub fn after_give(
 mod tests {
     use super::*;
     use crate::types::GivenItem;
+    use serde_json::json;
     use NeedLevel::{High, Low, Mid};
 
     fn all(level: NeedLevel) -> Needs {
         Needs {
-            hunger: level,
             social: level,
-            stamina: level,
             emotional: level,
             outing: Mid,
             indulgence: Mid,
@@ -254,24 +244,12 @@ mod tests {
     #[test]
     fn each_need_drifts_toward_its_resting_level() {
         type Pick = fn(&Needs) -> NeedLevel;
-        let hunger: Pick = |n| n.hunger;
         let social: Pick = |n| n.social;
-        let stamina: Pick = |n| n.stamina;
         let emotional: Pick = |n| n.emotional;
-        let cases: [(&str, Pick, NeedLevel, f64, NeedLevel); 16] = [
-            ("hunger", hunger, Low, 3.9, Low),
-            ("hunger", hunger, Low, 4.0, Mid),
-            ("hunger", hunger, Low, 8.0, High),
-            ("hunger", hunger, Low, 1000.0, High),
-            ("hunger", hunger, High, 1000.0, High),
+        let cases: [(&str, Pick, NeedLevel, f64, NeedLevel); 6] = [
             ("social", social, Low, 11.9, Low),
             ("social", social, Low, 12.0, Mid),
             ("social", social, Low, 24.0, High),
-            ("stamina", stamina, Low, 7.9, Low),
-            ("stamina", stamina, Low, 8.0, Mid),
-            ("stamina", stamina, Low, 80.0, Mid),
-            ("stamina", stamina, High, 8.0, Mid),
-            ("stamina", stamina, High, 80.0, Mid),
             ("emotional", emotional, High, 11.9, High),
             ("emotional", emotional, High, 12.0, Mid),
             ("emotional", emotional, Low, 1000.0, Mid),
@@ -285,19 +263,20 @@ mod tests {
         }
     }
 
-    #[test]
-    fn next_change_is_none_when_every_need_is_at_rest() {
-        let rest = Needs {
-            hunger: High,
+    fn at_rest() -> Needs {
+        Needs {
             social: High,
-            stamina: Mid,
             emotional: Mid,
             outing: Mid,
             indulgence: Mid,
-        };
+        }
+    }
+
+    #[test]
+    fn next_change_is_none_when_every_need_is_at_rest() {
         for hours in [0.0, 5.0, 1000.0] {
             assert_eq!(
-                next_change(rest, hours, Habits::default()),
+                next_change(at_rest(), hours, Habits::default()),
                 None,
                 "+{hours}h"
             );
@@ -307,37 +286,29 @@ mod tests {
     /// (rated, hours since the rating, expected hours of the next change).
     #[test]
     fn next_change_is_the_earliest_pending_step() {
-        let at_rest = Needs {
-            hunger: High,
-            social: High,
-            stamina: Mid,
-            emotional: Mid,
-            outing: Mid,
-            indulgence: Mid,
-        };
-        let hunger_low = Needs {
-            hunger: Low,
-            ..at_rest
-        };
-        let stamina_high = Needs {
-            stamina: High,
-            ..at_rest
-        };
-        let hunger_and_social_low = Needs {
-            hunger: Low,
+        let social_low = Needs {
             social: Low,
-            ..at_rest
+            ..at_rest()
+        };
+        let emotional_high = Needs {
+            emotional: High,
+            ..at_rest()
+        };
+        let social_low_outing_high = Needs {
+            social: Low,
+            outing: High,
+            ..at_rest()
         };
         let cases = [
-            (hunger_low, 0.0, Some(4.0)),
-            (hunger_low, -2.0, Some(4.0)),
-            (hunger_low, 5.0, Some(8.0)),
-            (hunger_low, 8.0, None),
-            (stamina_high, 3.0, Some(8.0)),
-            (stamina_high, 8.0, None),
-            (hunger_and_social_low, 1.0, Some(4.0)),
-            (hunger_and_social_low, 9.0, Some(12.0)),
-            (hunger_and_social_low, 13.0, Some(24.0)),
+            (social_low, 0.0, Some(12.0)),
+            (social_low, -2.0, Some(12.0)),
+            (social_low, 13.0, Some(24.0)),
+            (social_low, 24.0, None),
+            (emotional_high, 3.0, Some(12.0)),
+            (emotional_high, 12.0, None),
+            (social_low_outing_high, 1.0, Some(8.0)),
+            (social_low_outing_high, 9.0, Some(12.0)),
+            (social_low_outing_high, 13.0, Some(24.0)),
         ];
         for (rated, hours, want) in cases {
             assert_eq!(
@@ -353,9 +324,7 @@ mod tests {
     #[test]
     fn next_change_agrees_with_carried() {
         let rated = Needs {
-            hunger: Low,
             social: Mid,
-            stamina: High,
             emotional: Low,
             outing: High,
             indulgence: Low,
@@ -381,9 +350,7 @@ mod tests {
     #[test]
     fn needs_serde_shape() {
         let n = Needs {
-            hunger: High,
             social: Low,
-            stamina: Mid,
             emotional: Mid,
             outing: High,
             indulgence: Low,
@@ -391,18 +358,45 @@ mod tests {
         let v = serde_json::to_value(n).unwrap();
         assert_eq!(
             v,
-            serde_json::json!({"hunger": "high", "social": "low", "stamina": "mid", "emotional": "mid",
-                "outing": "high", "indulgence": "low"})
+            json!({"social": "low", "emotional": "mid", "outing": "high", "indulgence": "low"})
         );
         assert_eq!(serde_json::from_value::<Needs>(v).unwrap(), n);
-        assert!(serde_json::from_value::<Needs>(
-            serde_json::json!({"hunger": "high", "social": "low", "stamina": "mid"})
-        )
-        .is_err());
-        assert!(serde_json::from_value::<Needs>(
-            serde_json::json!({"hunger": "medium", "social": "low", "stamina": "mid", "emotional": "mid"})
-        )
-        .is_err());
+        assert!(serde_json::from_value::<Needs>(json!({"social": "low"})).is_err());
+        assert!(
+            serde_json::from_value::<Needs>(json!({"social": "medium", "emotional": "mid"}))
+                .is_err()
+        );
+    }
+
+    /// Rows written before `hunger` and `stamina` were removed keep reading;
+    /// the two keys are ignored.
+    #[test]
+    fn a_rating_stored_with_hunger_and_stamina_still_reads() {
+        let four =
+            json!({"hunger": "high", "social": "low", "stamina": "mid", "emotional": "high"});
+        assert_eq!(
+            serde_json::from_value::<Needs>(four).unwrap(),
+            Needs {
+                social: Low,
+                emotional: High,
+                outing: Mid,
+                indulgence: Mid,
+            }
+        );
+        let six = json!({"hunger": "high", "social": "low", "stamina": "mid", "emotional": "high",
+            "outing": "low", "indulgence": "high"});
+        assert_eq!(
+            serde_json::from_value::<Needs>(six).unwrap(),
+            Needs {
+                social: Low,
+                emotional: High,
+                outing: Low,
+                indulgence: High,
+            }
+        );
+        assert!(
+            serde_json::from_value::<Needs>(json!({"hunger": "high", "stamina": "mid"})).is_err()
+        );
     }
 
     fn only(outing: NeedLevel, indulgence: NeedLevel) -> Needs {
@@ -462,7 +456,6 @@ mod tests {
     #[test]
     fn next_change_follows_the_habit_count() {
         let rested = Needs {
-            hunger: High,
             social: High,
             ..only(Mid, Low)
         };
@@ -472,75 +465,53 @@ mod tests {
         assert_eq!(next_change(rested, 8.0, habits(3)), None);
     }
 
-    #[test]
-    fn a_rating_stored_before_outing_and_indulgence_reads_them_as_mid() {
-        let old = serde_json::json!({"hunger": "high", "social": "low", "stamina": "mid", "emotional": "high"});
-        assert_eq!(
-            serde_json::from_value::<Needs>(old).unwrap(),
-            Needs {
-                hunger: High,
-                social: Low,
-                stamina: Mid,
-                emotional: High,
-                outing: Mid,
-                indulgence: Mid,
-            }
-        );
-        assert!(serde_json::from_value::<Needs>(serde_json::json!({
-            "hunger": "high", "social": "low", "stamina": "mid", "outing": "low", "indulgence": "low"
-        }))
-        .is_err());
-    }
-
-    /// (item, expected hunger / social / indulgence after the move), the judge
-    /// abstaining.
+    /// (item, expected social / indulgence after the move), the judge
+    /// abstaining. A dish loosens her up like what she is hooked on (spec
+    /// 2026-11-08 §3); jewelry moves nothing.
     #[test]
     fn each_item_moves_its_needs_one_level_from_the_baseline() {
         use GivenItem::*;
         let base = all(Mid);
         let cases = [
-            (Food, (Low, Mid, Mid)),
-            (Cigarette, (Low, High, High)),
-            (Alcohol, (Low, High, High)),
-            (Herb, (Low, High, High)),
-            (Medicine, (Low, Low, Low)),
-            (Coffee, (Low, Low, Low)),
+            (Cigarette, (High, High)),
+            (Alcohol, (High, High)),
+            (Herb, (High, High)),
+            (Cuisine, (High, High)),
+            (Medicine, (Low, Low)),
+            (Coffee, (Low, Low)),
         ];
-        for (item, (h, s, i)) in cases {
+        for (item, (s, i)) in cases {
             let got = after_give(Some(base), None, item).unwrap();
+            assert_eq!((got.social, got.indulgence), (s, i), "{item:?}");
             assert_eq!(
-                (got.hunger, got.social, got.indulgence),
-                (h, s, i),
-                "{item:?}"
-            );
-            assert_eq!(
-                (got.stamina, got.emotional, got.outing),
-                (Mid, Mid, Mid),
+                (got.emotional, got.outing),
+                (Mid, Mid),
                 "{item:?} leaves the rest"
             );
         }
+        assert_eq!(after_give(Some(base), None, Jewelry), None);
     }
 
-    /// A dish fills her and loosens her up, like what she is hooked on
-    /// (spec 2026-11-08 §3); jewelry moves nothing.
+    /// Plain food moves no need: the judge's rating passes through, and
+    /// without one there is nothing to write.
     #[test]
-    fn a_cuisine_fills_her_and_loosens_her_up() {
-        let got = after_give(Some(all(Mid)), None, GivenItem::Cuisine).unwrap();
-        assert_eq!((got.hunger, got.social, got.indulgence), (Low, High, High));
-        assert_eq!((got.stamina, got.emotional, got.outing), (Mid, Mid, Mid));
-        assert_eq!(after_give(Some(all(Mid)), None, GivenItem::Jewelry), None);
+    fn food_moves_no_need() {
+        assert_eq!(after_give(Some(all(Mid)), None, GivenItem::Food), None);
+        assert_eq!(
+            after_give(Some(all(Mid)), Some(all(High)), GivenItem::Food),
+            Some(all(High))
+        );
     }
 
     #[test]
     fn moves_clamp_at_the_ends() {
         let floor = Needs {
-            hunger: Low,
             social: Low,
             indulgence: Low,
             ..all(Mid)
         };
         let got = after_give(Some(floor), None, GivenItem::Medicine).unwrap();
-        assert_eq!((got.hunger, got.social, got.indulgence), (Low, Low, Low));
+        assert_eq!((got.social, got.indulgence), (Low, Low));
         let ceiling = Needs {
             social: High,
             indulgence: High,
@@ -552,27 +523,24 @@ mod tests {
 
     #[test]
     fn the_judge_is_overridden_on_moved_needs_and_kept_on_the_rest() {
-        // The judge saw the meal and already lowered hunger high → mid.
+        // The judge saw the drink and already raised social low → high.
         let baseline = Needs {
-            hunger: High,
+            social: Low,
             ..all(Mid)
         };
         let judged = Needs {
-            hunger: Mid,
             social: High,
-            stamina: High,
             emotional: Low,
             outing: High,
-            indulgence: High,
+            indulgence: Low,
         };
-        let got = after_give(Some(baseline), Some(judged), GivenItem::Food).unwrap();
+        let got = after_give(Some(baseline), Some(judged), GivenItem::Alcohol).unwrap();
         assert_eq!(
-            got.hunger, Mid,
-            "baseline high −1; the judge's mid −1 would count the meal twice"
+            got.social, Mid,
+            "baseline low +1; the judge's high would count the drink twice"
         );
-        assert_eq!(got.social, High, "the judge's");
-        assert_eq!(got.indulgence, High, "the judge's");
-        assert_eq!((got.stamina, got.emotional, got.outing), (High, Low, High));
+        assert_eq!(got.indulgence, High, "baseline mid +1");
+        assert_eq!((got.emotional, got.outing), (Low, High), "the judge's");
     }
 
     #[test]
@@ -593,10 +561,10 @@ mod tests {
     fn without_a_baseline_the_judge_is_written_unshifted_or_nothing() {
         let judged = all(High);
         assert_eq!(
-            after_give(None, Some(judged), GivenItem::Food),
+            after_give(None, Some(judged), GivenItem::Alcohol),
             Some(judged)
         );
-        assert_eq!(after_give(None, None, GivenItem::Food), None);
+        assert_eq!(after_give(None, None, GivenItem::Alcohol), None);
     }
 
     #[test]

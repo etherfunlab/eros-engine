@@ -742,13 +742,6 @@ fn needs_factor(kind: EventKind, needs: Option<&Needs>) -> f64 {
         return 1.0;
     };
     match kind {
-        TempWork | WorkingOut if n.stamina == NeedLevel::Low => 0.5,
-        Unwell | Sick | Bathing | Asleep | WantHotSpring | WantSauna
-            if n.stamina == NeedLevel::Low =>
-        {
-            2.0
-        }
-        GroceryShopping if n.hunger == NeedLevel::High => 2.0,
         ExMessage if n.emotional == NeedLevel::High => 3.0,
         AnimalEncounter | Irritable | Quarrel if n.emotional == NeedLevel::High => 2.0,
         WantToGoOut if n.outing == NeedLevel::High => 3.0,
@@ -1266,23 +1259,10 @@ mod tests {
         }
     }
 
-    fn needs(stamina: NeedLevel, emotional: NeedLevel) -> Option<Needs> {
+    fn needs(emotional: NeedLevel) -> Option<Needs> {
         Some(Needs {
-            hunger: NeedLevel::Mid,
             social: NeedLevel::Mid,
-            stamina,
             emotional,
-            outing: NeedLevel::Mid,
-            indulgence: NeedLevel::Mid,
-        })
-    }
-
-    fn hungry() -> Option<Needs> {
-        Some(Needs {
-            hunger: NeedLevel::High,
-            social: NeedLevel::Mid,
-            stamina: NeedLevel::Mid,
-            emotional: NeedLevel::Mid,
             outing: NeedLevel::Mid,
             indulgence: NeedLevel::Mid,
         })
@@ -1598,26 +1578,12 @@ mod tests {
 
     #[test]
     fn needs_scale_kinds_within_their_category() {
-        use NeedLevel::{High, Low, Mid};
-        let cases: [(&[EventKind], Option<Needs>, f64, EventKind); 18] = [
-            // temp_work 3 : weather 4 — 0.3 → 2.1 → temp_work.
-            (&[TempWork, WeatherChange], None, 0.3, TempWork),
-            // stamina low: 1.5 : 4 — 0.3 → 1.65 → weather.
-            (
-                &[TempWork, WeatherChange],
-                needs(Low, Mid),
-                0.3,
-                WeatherChange,
-            ),
+        use NeedLevel::High;
+        let cases: [(&[EventKind], Option<Needs>, f64, EventKind); 12] = [
             // ex 1 : weather 4 — 0.3 → 1.5 → weather.
             (&[ExMessage, WeatherChange], None, 0.3, WeatherChange),
             // emotional high: 3 : 4 — 0.3 → 2.1 → ex.
-            (
-                &[ExMessage, WeatherChange],
-                needs(Mid, High),
-                0.3,
-                ExMessage,
-            ),
+            (&[ExMessage, WeatherChange], needs(High), 0.3, ExMessage),
             // police 1 : animal 3 — 0.2 → 0.8 → police.
             (
                 &[PoliceEncounter, AnimalEncounter],
@@ -1628,39 +1594,26 @@ mod tests {
             // emotional high: 1 : 6 — 0.2 → 1.4 → animal.
             (
                 &[PoliceEncounter, AnimalEncounter],
-                needs(Mid, High),
+                needs(High),
                 0.2,
                 AnimalEncounter,
             ),
-            // working_out 2 : reading 2 — 0.4 → 1.6 → working_out.
-            (&[WorkingOut, Reading], None, 0.4, WorkingOut),
-            // stamina low: 1 : 2 — 0.4 → 1.2 → reading.
-            (&[WorkingOut, Reading], needs(Low, Mid), 0.4, Reading),
             // unwell 1 : irritable 1 — 0.6 → 1.2 → irritable.
             (&[Unwell, Irritable], None, 0.6, Irritable),
-            // stamina low: 2 : 1 — 0.6 → 1.8 → unwell.
-            (&[Unwell, Irritable], needs(Low, Mid), 0.6, Unwell),
             // 1 : 1 — 0.4 → 0.8 → unwell.
             (&[Unwell, Irritable], None, 0.4, Unwell),
             // emotional high: 1 : 2 — 0.4 → 1.2 → irritable.
-            (&[Unwell, Irritable], needs(Mid, High), 0.4, Irritable),
+            (&[Unwell, Irritable], needs(High), 0.4, Irritable),
+            // temp_work 3 : weather 4 — 0.3 → 2.1 → temp_work.
+            (&[TempWork, WeatherChange], None, 0.3, TempWork),
+            // working_out 2 : reading 2 — 0.4 → 1.6 → working_out.
+            (&[WorkingOut, Reading], None, 0.4, WorkingOut),
             // sick 3 : hospitalized 0.5 — 0.9 → 3.15 → hospitalized.
             (&[Sick, Hospitalized], None, 0.9, Hospitalized),
-            // stamina low: 6 : 0.5 — 0.9 → 5.85 → sick.
-            (&[Sick, Hospitalized], needs(Low, Mid), 0.9, Sick),
             // grocery 2 : showering 2 — 0.6 → 2.4 → showering.
             (&[GroceryShopping, Showering], None, 0.6, Showering),
-            // hunger high: 4 : 2 — 0.6 → 3.6 → grocery.
-            (
-                &[GroceryShopping, Showering],
-                hungry(),
-                0.6,
-                GroceryShopping,
-            ),
             // bathing 1 : in_class 1 — 0.6 → 1.2 → in_class.
             (&[Bathing, InClass], None, 0.6, InClass),
-            // stamina low: 2 : 1 — 0.6 → 1.8 → bathing.
-            (&[Bathing, InClass], needs(Low, Mid), 0.6, Bathing),
         ];
         for (allowed, n, roll, want) in cases {
             assert_eq!(
@@ -1927,16 +1880,6 @@ mod tests {
     }
 
     #[test]
-    fn asleep_weighs_double_when_she_is_worn_out() {
-        // Reading 2 then Asleep 2 within `mid`: 0.4 × 4 = 1.6 lands on Reading;
-        // worn out, Asleep weighs 4: 0.4 × 6 = 2.4 lands on Asleep.
-        let r = rolls(0.0, 0.4);
-        let at = |n| pick_with(&female(), n, 3, &[], &[Reading, Asleep], r);
-        assert_eq!(at(None), Some(Reading));
-        assert_eq!(at(needs(NeedLevel::Low, NeedLevel::Mid)), Some(Asleep));
-    }
-
-    #[test]
     fn offline_false_alarm_and_told() {
         let none = PersonaTraits::default();
         for k in EventKind::ALL {
@@ -2048,7 +1991,7 @@ mod tests {
         let r = rolls(0.0, 0.4);
         let at = |n| pick_with(&female(), n, 3, &[], &[PoliceEncounter, Quarrel], r);
         assert_eq!(at(None), Some(PoliceEncounter));
-        assert_eq!(at(needs(NeedLevel::Mid, NeedLevel::High)), Some(Quarrel));
+        assert_eq!(at(needs(NeedLevel::High)), Some(Quarrel));
     }
 
     #[test]
@@ -2714,9 +2657,7 @@ mod tests {
 
     fn rated(outing: NeedLevel, indulgence: NeedLevel, emotional: NeedLevel) -> Option<Needs> {
         Some(Needs {
-            hunger: NeedLevel::Mid,
             social: NeedLevel::Mid,
-            stamina: NeedLevel::Mid,
             emotional,
             outing,
             indulgence,
@@ -2999,11 +2940,34 @@ mod tests {
     }
 
     #[test]
+    fn the_former_stamina_and_hunger_kinds_do_not_scale() {
+        for level in [NeedLevel::Low, NeedLevel::High] {
+            let n = Needs {
+                social: level,
+                emotional: level,
+                outing: level,
+                indulgence: level,
+            };
+            for k in [
+                TempWork,
+                WorkingOut,
+                Unwell,
+                Sick,
+                Bathing,
+                Asleep,
+                WantHotSpring,
+                WantSauna,
+                GroceryShopping,
+            ] {
+                assert_eq!(needs_factor(k, Some(&n)), 1.0, "{k:?} {level:?}");
+            }
+        }
+    }
+
+    #[test]
     fn the_eight_factors_follows_and_rule_outs() {
         let mid = Needs {
-            hunger: NeedLevel::Mid,
             social: NeedLevel::Mid,
-            stamina: NeedLevel::Mid,
             emotional: NeedLevel::Mid,
             outing: NeedLevel::Mid,
             indulgence: NeedLevel::Mid,
@@ -3012,14 +2976,8 @@ mod tests {
             outing: NeedLevel::High,
             ..mid
         };
-        let stamina_low = Needs {
-            stamina: NeedLevel::Low,
-            ..mid
-        };
         assert_eq!(needs_factor(WantToSeeSea, Some(&outing_high)), 2.0);
         assert_eq!(needs_factor(WantToSeeSea, Some(&mid)), 1.0);
-        assert_eq!(needs_factor(WantHotSpring, Some(&stamina_low)), 2.0);
-        assert_eq!(needs_factor(WantSauna, Some(&stamina_low)), 2.0);
         let addict = |sex_addict| PersonaTraits {
             sex_addict,
             ..Default::default()
@@ -3317,9 +3275,7 @@ mod tests {
             assert!(!passes_gate(k, 5, &with(off), true), "{k:?}");
         }
         let high = Needs {
-            hunger: NeedLevel::Mid,
             social: NeedLevel::Mid,
-            stamina: NeedLevel::Mid,
             emotional: NeedLevel::Mid,
             outing: NeedLevel::Mid,
             indulgence: NeedLevel::High,

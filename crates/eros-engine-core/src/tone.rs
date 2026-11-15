@@ -28,8 +28,8 @@ impl Tone {
 /// A persona whose `moody` key is `true` draws `emotional` this many times
 /// as often; `false`, this many times less.
 const MOODY_FACTOR: f64 = 3.0;
-/// Applied once when she is hungry, tired, craving or wants to be cared
-/// about, however many of the four hold.
+/// Applied once when she is craving or wants to be cared about, whichever
+/// of the two holds.
 const NEEDS_FACTOR: f64 = 3.0;
 /// Applied when the pair is romantically compatible.
 const COMPATIBLE_FACTOR: f64 = 2.0;
@@ -47,12 +47,8 @@ pub fn emotional_probability(
         Some(false) => 1.0 / MOODY_FACTOR,
         None => 1.0,
     };
-    let in_need = needs.is_some_and(|n| {
-        n.emotional == NeedLevel::High
-            || n.stamina == NeedLevel::Low
-            || n.hunger == NeedLevel::High
-            || n.indulgence == NeedLevel::High
-    });
+    let in_need =
+        needs.is_some_and(|n| n.emotional == NeedLevel::High || n.indulgence == NeedLevel::High);
     let needs = if in_need { NEEDS_FACTOR } else { 1.0 };
     let compatible = if compatible { COMPATIBLE_FACTOR } else { 1.0 };
     (base * moody * needs * compatible).min(1.0)
@@ -72,16 +68,9 @@ mod tests {
     use super::*;
     use NeedLevel::{High, Low, Mid};
 
-    fn needs(
-        emotional: NeedLevel,
-        stamina: NeedLevel,
-        hunger: NeedLevel,
-        indulgence: NeedLevel,
-    ) -> Needs {
+    fn needs(emotional: NeedLevel, indulgence: NeedLevel) -> Needs {
         Needs {
-            hunger,
             social: Mid,
-            stamina,
             emotional,
             outing: Mid,
             indulgence,
@@ -94,8 +83,8 @@ mod tests {
 
     #[test]
     fn the_spec_table_at_base_005() {
-        let calm = needs(Mid, Mid, Mid, Mid);
-        let hungry = needs(Mid, Mid, High, Mid);
+        let calm = needs(Mid, Mid);
+        let craving = needs(Mid, High);
         assert!(close(
             emotional_probability(0.05, None, Some(&calm), false),
             0.05
@@ -105,28 +94,22 @@ mod tests {
             0.10
         ));
         assert!(close(
-            emotional_probability(0.05, None, Some(&hungry), true),
+            emotional_probability(0.05, None, Some(&craving), true),
             0.30
         ));
         assert!(close(
-            emotional_probability(0.05, Some(true), Some(&hungry), true),
+            emotional_probability(0.05, Some(true), Some(&craving), true),
             0.90
         ));
         assert!(close(
-            emotional_probability(0.05, Some(false), Some(&hungry), true),
+            emotional_probability(0.05, Some(false), Some(&craving), true),
             0.10
         ));
     }
 
     #[test]
-    fn each_of_the_four_needs_counts_and_they_do_not_stack() {
-        for n in [
-            needs(High, Mid, Mid, Mid),
-            needs(Mid, Low, Mid, Mid),
-            needs(Mid, Mid, High, Mid),
-            needs(Mid, Mid, Mid, High),
-            needs(High, Low, High, High),
-        ] {
+    fn each_of_the_two_needs_counts_and_they_do_not_stack() {
+        for n in [needs(High, Mid), needs(Mid, High), needs(High, High)] {
             assert!(
                 close(emotional_probability(0.1, None, Some(&n), false), 0.3),
                 "{n:?}"
@@ -136,7 +119,7 @@ mod tests {
 
     #[test]
     fn the_other_levels_and_needs_do_not_count() {
-        let mut n = needs(Low, High, Low, Low);
+        let mut n = needs(Low, Low);
         n.social = High;
         n.outing = Low;
         assert!(close(
@@ -151,13 +134,13 @@ mod tests {
 
     #[test]
     fn capped_at_one_and_zero_stays_zero() {
-        let hungry = needs(Mid, Mid, High, Mid);
+        let craving = needs(Mid, High);
         assert_eq!(
-            emotional_probability(1.0, Some(true), Some(&hungry), true),
+            emotional_probability(1.0, Some(true), Some(&craving), true),
             1.0
         );
         assert_eq!(
-            emotional_probability(0.0, Some(true), Some(&hungry), true),
+            emotional_probability(0.0, Some(true), Some(&craving), true),
             0.0
         );
     }
