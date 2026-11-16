@@ -154,6 +154,13 @@ impl EventRepo<'_> {
             .into_iter()
             .map(|k| k.as_str().to_string())
             .collect();
+        // A row of a kind this build does not know reads as no event (see
+        // `record`), so it does not block a write either.
+        let known: Vec<String> = EventKind::ALL
+            .into_iter()
+            .chain(EventKind::SPECIAL)
+            .map(|k| k.as_str().to_string())
+            .collect();
         let row: Option<EventColumns> = sqlx::query_as(
             "INSERT INTO engine.persona_events \
                (instance_id, session_id, event_key, kind, started_at, ends_at, message_id) \
@@ -163,6 +170,7 @@ impl EventRepo<'_> {
                   WHERE p.instance_id = $1 \
                     AND p.started_at > $5 - make_interval(hours => $8) \
                     AND p.ends_at > $5 \
+                    AND p.kind = ANY($11) \
                     AND ($9 OR NOT (p.kind = ANY($10))) \
              ) \
              ON CONFLICT (session_id, event_key) DO NOTHING \
@@ -178,6 +186,7 @@ impl EventRepo<'_> {
         .bind(lookback_hours())
         .bind(e.kind.is_background())
         .bind(&background)
+        .bind(&known)
         .fetch_optional(&mut *tx)
         .await?;
         let Some(event) = row.and_then(record) else {
@@ -784,7 +793,7 @@ mod tests {
                         i,
                         s,
                         "rain",
-                        WeatherChange,
+                        TempWork,
                         "2026-10-01T12:00:00Z",
                         "2026-10-01T16:00:00Z"
                     ),
@@ -801,7 +810,7 @@ mod tests {
                     i,
                     s,
                     "rain2",
-                    WeatherChange,
+                    TempWork,
                     "2026-10-01T15:00:00Z",
                     "2026-10-01T19:00:00Z"
                 ),
@@ -959,7 +968,7 @@ mod tests {
                     i,
                     s,
                     "rain",
-                    WeatherChange,
+                    TempWork,
                     "2026-10-01T11:00:00Z",
                     "2026-10-01T15:00:00Z"
                 ),
@@ -1118,6 +1127,58 @@ mod tests {
             repo.recent(i, t("2026-10-01T00:00:00Z")).await.unwrap(),
             vec![e2, e1]
         );
+    }
+
+    /// Spec 2026-11-16-prune-life-events-design.md §4.1: a row of a deleted
+    /// kind under way at the upgrade reads as no event.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn current_skips_a_row_of_a_deleted_kind(pool: PgPool) {
+        let (_, i, s) = instance_and_session(&pool).await;
+        sqlx::query(
+            "INSERT INTO engine.persona_events (instance_id, session_id, event_key, kind, started_at, ends_at) \
+             VALUES ($1, $2, 'w', 'weather_change', '2026-10-01T08:00:00Z', '2026-10-01T12:00:00Z')",
+        )
+        .bind(i)
+        .bind(s)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let now = EventRepo { pool: &pool }
+            .current(i, None, t("2026-10-01T09:00:00Z"))
+            .await
+            .unwrap();
+        assert!(now.foreground.is_none() && now.background.is_none());
+    }
+
+    /// The draw does not see a row of a deleted kind, so the write's guard
+    /// must not count it either: the drawn event lands.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn insert_ignores_a_row_of_a_deleted_kind_under_way(pool: PgPool) {
+        let (_, i, s) = instance_and_session(&pool).await;
+        sqlx::query(
+            "INSERT INTO engine.persona_events (instance_id, session_id, event_key, kind, started_at, ends_at) \
+             VALUES ($1, $2, 'w', 'weather_change', '2026-10-01T08:00:00Z', '2026-10-01T12:00:00Z')",
+        )
+        .bind(i)
+        .bind(s)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let written = EventRepo { pool: &pool }
+            .insert(
+                &ev(
+                    i,
+                    s,
+                    "r",
+                    Reading,
+                    "2026-10-01T09:00:00Z",
+                    "2026-10-01T10:00:00Z",
+                ),
+                Some(&message("在看书")),
+            )
+            .await
+            .unwrap();
+        assert!(written.is_some());
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -2145,7 +2206,7 @@ mod tests {
                 i,
                 s,
                 "w",
-                WeatherChange,
+                TempWork,
                 "2026-10-01T10:00:00Z",
                 "2026-10-01T11:00:00Z",
             ),

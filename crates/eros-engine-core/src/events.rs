@@ -63,15 +63,12 @@ pub enum EventKind {
     AnimalEncounter,
     HitSomeone,
     SuddenDesire,
-    GroceryShopping,
     Showering,
     Bathing,
-    InClass,
     OnTheWay,
     PeriodScare,
     PregnancyScare,
     GotBumped,
-    BumpedSomeone,
     Quarrel,
     ScoldedBySuperior,
     ScoldedSuperior,
@@ -82,7 +79,6 @@ pub enum EventKind {
     TakingSelfie,
     TempWork,
     ExMessage,
-    WeatherChange,
     GotHit,
     Breakup,
     WorkingOut,
@@ -98,7 +94,6 @@ pub enum EventKind {
     BrosGathering,
     SisGathering,
     OnTheRoad,
-    WatchingMatch,
     WatchingShow,
     HavingSex,
     WantToGoOut,
@@ -127,8 +122,6 @@ pub enum EventKind {
     WantToSeeSea,
     WantHotSpring,
     WantSauna,
-    WatchingStocks,
-    Trading,
     GotLost,
     Drinking,
     Smoking,
@@ -147,20 +140,17 @@ pub enum EventKind {
 
 impl EventKind {
     /// Every drawable kind, in draw order.
-    pub const ALL: [EventKind; 70] = [
+    pub const ALL: [EventKind; 63] = [
         EventKind::PoliceEncounter,
         EventKind::AnimalEncounter,
         EventKind::HitSomeone,
         EventKind::SuddenDesire,
-        EventKind::GroceryShopping,
         EventKind::Showering,
         EventKind::Bathing,
-        EventKind::InClass,
         EventKind::OnTheWay,
         EventKind::PeriodScare,
         EventKind::PregnancyScare,
         EventKind::GotBumped,
-        EventKind::BumpedSomeone,
         EventKind::Quarrel,
         EventKind::ScoldedBySuperior,
         EventKind::ScoldedSuperior,
@@ -171,7 +161,6 @@ impl EventKind {
         EventKind::TakingSelfie,
         EventKind::TempWork,
         EventKind::ExMessage,
-        EventKind::WeatherChange,
         EventKind::GotHit,
         EventKind::Breakup,
         EventKind::WorkingOut,
@@ -187,7 +176,6 @@ impl EventKind {
         EventKind::BrosGathering,
         EventKind::SisGathering,
         EventKind::OnTheRoad,
-        EventKind::WatchingMatch,
         EventKind::WatchingShow,
         EventKind::HavingSex,
         EventKind::WantToGoOut,
@@ -209,8 +197,6 @@ impl EventKind {
         EventKind::WantToSeeSea,
         EventKind::WantHotSpring,
         EventKind::WantSauna,
-        EventKind::WatchingStocks,
-        EventKind::Trading,
         EventKind::GotLost,
         EventKind::Drinking,
         EventKind::Smoking,
@@ -236,15 +222,12 @@ impl EventKind {
             EventKind::AnimalEncounter => "animal_encounter",
             EventKind::HitSomeone => "hit_someone",
             EventKind::SuddenDesire => "sudden_desire",
-            EventKind::GroceryShopping => "grocery_shopping",
             EventKind::Showering => "showering",
             EventKind::Bathing => "bathing",
-            EventKind::InClass => "in_class",
             EventKind::OnTheWay => "on_the_way",
             EventKind::PeriodScare => "period_scare",
             EventKind::PregnancyScare => "pregnancy_scare",
             EventKind::GotBumped => "got_bumped",
-            EventKind::BumpedSomeone => "bumped_someone",
             EventKind::Quarrel => "quarrel",
             EventKind::ScoldedBySuperior => "scolded_by_superior",
             EventKind::ScoldedSuperior => "scolded_superior",
@@ -252,7 +235,6 @@ impl EventKind {
             EventKind::SawClothes => "saw_clothes",
             EventKind::TempWork => "temp_work",
             EventKind::ExMessage => "ex_message",
-            EventKind::WeatherChange => "weather_change",
             EventKind::GotHit => "got_hit",
             EventKind::Breakup => "breakup",
             EventKind::WorkingOut => "working_out",
@@ -268,7 +250,6 @@ impl EventKind {
             EventKind::BrosGathering => "bros_gathering",
             EventKind::SisGathering => "sis_gathering",
             EventKind::OnTheRoad => "on_the_road",
-            EventKind::WatchingMatch => "watching_match",
             EventKind::WatchingShow => "watching_show",
             EventKind::HavingSex => "having_sex",
             EventKind::WantToGoOut => "want_to_go_out",
@@ -298,8 +279,6 @@ impl EventKind {
             EventKind::WantSauna => "want_sauna",
             EventKind::BathingTogether => "bathing_together",
             EventKind::OnADate => "on_a_date",
-            EventKind::WatchingStocks => "watching_stocks",
-            EventKind::Trading => "trading",
             EventKind::GotLost => "got_lost",
             EventKind::Drinking => "drinking",
             EventKind::Smoking => "smoking",
@@ -320,20 +299,17 @@ impl EventKind {
     pub fn category(self) -> EventCategory {
         use EventKind::*;
         match self {
-            PoliceEncounter | AnimalEncounter | HitSomeone | SuddenDesire | GroceryShopping
-            | Showering | Bathing | InClass | OnTheWay | PeriodScare | PregnancyScare
-            | GotBumped | BumpedSomeone | Quarrel | ScoldedBySuperior | ScoldedSuperior
-            | SawBag | SawClothes | AdmiringScenery | AdmiringArt | TakingSelfie | Strip
-            | BirdEncounter | ExWantsBack | WantToQuitJob | PonderingLife | Streaking
-            | WantToSeeSea | WantHotSpring | WantSauna | BathingTogether | OnADate
-            | WatchingStocks | Trading | GotLost | Drinking | Smoking | SmokingWeed
+            PoliceEncounter | AnimalEncounter | HitSomeone | SuddenDesire | Showering | Bathing
+            | OnTheWay | PeriodScare | PregnancyScare | GotBumped | Quarrel | ScoldedBySuperior
+            | ScoldedSuperior | SawBag | SawClothes | AdmiringScenery | AdmiringArt
+            | TakingSelfie | Strip | BirdEncounter | ExWantsBack | WantToQuitJob
+            | PonderingLife | Streaking | WantToSeeSea | WantHotSpring | WantSauna
+            | BathingTogether | OnADate | GotLost | Drinking | Smoking | SmokingWeed
             | JustHaveSex | Masturbating | MissedRide => EventCategory::Short,
-            TempWork | ExMessage | WeatherChange | GotHit | Breakup | WorkingOut | Reading
-            | Gaming | AwayFromPhone | Unwell | Irritable | Busy | InBattle | Asleep
-            | OutShopping | BrosGathering | SisGathering | OnTheRoad | WatchingMatch
-            | WatchingShow | HavingSex | WantToGoOut | WantToGoHome | TakingSpace | FellOut => {
-                EventCategory::Mid
-            }
+            TempWork | ExMessage | GotHit | Breakup | WorkingOut | Reading | Gaming
+            | AwayFromPhone | Unwell | Irritable | Busy | InBattle | Asleep | OutShopping
+            | BrosGathering | SisGathering | OnTheRoad | WatchingShow | HavingSex | WantToGoOut
+            | WantToGoHome | TakingSpace | FellOut => EventCategory::Mid,
             Sick | Period | Hospitalized | PostSurgery => EventCategory::Body,
             BusinessTrip | ShortTrip | LongTrip | HometownVisit | TravelingTogether => {
                 EventCategory::Trip
@@ -353,11 +329,11 @@ impl EventKind {
     pub fn place(self) -> Place {
         use EventKind::*;
         match self {
-            PoliceEncounter | AnimalEncounter | OnTheWay | GotBumped | BumpedSomeone
-            | AdmiringScenery | BirdEncounter | WantToSeeSea | WantHotSpring | GotLost
-            | MissedRide | OnTheRoad | WantToGoOut => Place::Outdoor,
-            Showering | Bathing | InClass | ScoldedBySuperior | ScoldedSuperior | AdmiringArt
-            | WantSauna | WatchingStocks | Reading | Gaming | WantToGoHome => Place::Indoor,
+            PoliceEncounter | AnimalEncounter | OnTheWay | GotBumped | AdmiringScenery
+            | BirdEncounter | WantToSeeSea | WantHotSpring | GotLost | MissedRide | OnTheRoad
+            | WantToGoOut => Place::Outdoor,
+            Showering | Bathing | ScoldedBySuperior | ScoldedSuperior | AdmiringArt | WantSauna
+            | Reading | Gaming | WantToGoHome => Place::Indoor,
             _ => Place::Neutral,
         }
     }
@@ -435,12 +411,12 @@ impl EventKind {
                 | Showering
                 | TakingSelfie
                 | Gaming
-                | WatchingMatch
                 | WatchingShow
                 | BusinessTrip
                 | Hospitalized
                 | PostSurgery
-                | WatchingStocks
+                | TempWork
+                | ScoldedSuperior
         );
         !modern_only || setting == Setting::Modern
     }
@@ -476,15 +452,12 @@ fn rule(kind: EventKind) -> Rule {
         AnimalEncounter => (3.0, 12, Lasts::Hours(1, 1)),
         HitSomeone => (0.5, 14 * DAY, Lasts::Hours(1, 1)),
         SuddenDesire => (2.0, 24, Lasts::Hours(1, 1)),
-        GroceryShopping => (2.0, 24, Lasts::Hours(1, 1)),
         Showering => (2.0, 12, Lasts::Minutes(30)),
         Bathing => (1.0, 48, Lasts::Hours(1, 1)),
-        InClass => (1.0, 24, Lasts::Hours(1, 1)),
         OnTheWay => (2.0, 12, Lasts::Minutes(30)),
         PeriodScare => (0.5, 28 * DAY, Lasts::Hours(1, 1)),
         PregnancyScare => (0.5, 60 * DAY, Lasts::Hours(1, 1)),
         GotBumped => (1.0, 72, Lasts::Minutes(30)),
-        BumpedSomeone => (0.5, 7 * DAY, Lasts::Minutes(30)),
         Quarrel => (1.0, 48, Lasts::Hours(1, 1)),
         ScoldedBySuperior => (1.0, 72, Lasts::Hours(1, 1)),
         ScoldedSuperior => (0.5, 14 * DAY, Lasts::Hours(1, 1)),
@@ -495,7 +468,6 @@ fn rule(kind: EventKind) -> Rule {
         TakingSelfie => (2.0, 24, Lasts::Minutes(30)),
         TempWork => (3.0, 24, Lasts::Hours(4, 4)),
         ExMessage => (1.0, 72, Lasts::Hours(3, 3)),
-        WeatherChange => (4.0, 8, Lasts::Hours(4, 4)),
         GotHit => (0.5, 14 * DAY, Lasts::Hours(4, 4)),
         Breakup => (0.5, 30 * DAY, Lasts::Hours(4, 4)),
         WorkingOut => (2.0, 24, Lasts::Hours(1, 2)),
@@ -511,7 +483,6 @@ fn rule(kind: EventKind) -> Rule {
         BrosGathering => (1.0, 72, Lasts::Hours(2, 4)),
         SisGathering => (1.0, 72, Lasts::Hours(2, 4)),
         OnTheRoad => (2.0, 24, Lasts::Hours(2, 4)),
-        WatchingMatch => (2.0, 24, Lasts::Hours(2, 3)),
         WatchingShow => (1.0, 72, Lasts::Hours(2, 3)),
         HavingSex => (1.0, 48, Lasts::Hours(1, 2)),
         WantToGoOut => (1.0, 24, Lasts::Hours(1, 3)),
@@ -539,8 +510,6 @@ fn rule(kind: EventKind) -> Rule {
         BathingTogether => (0.0, 0, Lasts::Minutes(30)),
         // Never drawn: the activity sets its own end.
         OnADate => (0.0, 0, Lasts::Hours(1, 4)),
-        WatchingStocks => (2.0, 24, Lasts::Minutes(30)),
-        Trading => (1.0, 24, Lasts::Hours(1, 1)),
         GotLost => (3.0, 48, Lasts::Hours(1, 1)),
         Drinking => (2.0, 12, Lasts::Minutes(30)),
         Smoking => (2.0, 12, Lasts::Minutes(30)),
@@ -811,7 +780,7 @@ fn follows(prior: EventKind, kind: EventKind) -> bool {
             | (Hospitalized | PostSurgery, Reading | Gaming)
             | (Period, Irritable | Unwell)
             | (Breakup | Quarrel | ScoldedBySuperior | InBattle, Irritable)
-            | (GotHit | GotBumped | WeatherChange, Unwell)
+            | (GotHit | GotBumped, Unwell)
             | (WorkingOut, Showering | Bathing)
             | (ExMessage | Breakup, ExWantsBack)
             | (ScoldedBySuperior | TempWork, WantToQuitJob)
@@ -928,12 +897,13 @@ fn outdoorsy_factor(kind: EventKind, persona: &PersonaTraits) -> f64 {
 /// that needs none (spec 2026-11-11-stocks-lost-habit-events-and-just-have-
 /// sex-design.md §2.1): she gets lost only on a trip; she misses a ride on
 /// any trip, a business trip included (spec 2026-11-11-outdoorsy-missed-
-/// ride-and-accept-ends-incident-design.md §3).
+/// ride-and-accept-ends-incident-design.md §3), and is on her way or on the
+/// road only then (spec 2026-11-16-prune-life-events-design.md §4.2).
 fn needs_background(kind: EventKind) -> Option<&'static [EventKind]> {
     use EventKind::*;
     match kind {
         GotLost => Some(&[ShortTrip, LongTrip, HometownVisit, TravelingTogether]),
-        MissedRide => Some(&[
+        MissedRide | OnTheWay | OnTheRoad => Some(&[
             BusinessTrip,
             ShortTrip,
             LongTrip,
@@ -961,12 +931,9 @@ fn rules_out(background: EventKind, kind: EventKind) -> bool {
                 | HitSomeone
                 | GotHit
                 | WorkingOut
-                | GroceryShopping
-                | InClass
                 | OnTheWay
                 | InBattle
                 | GotBumped
-                | BumpedSomeone
                 | SawBag
                 | SawClothes
                 | OutShopping
@@ -980,7 +947,6 @@ fn rules_out(background: EventKind, kind: EventKind) -> bool {
                 | BirdEncounter
                 | Streaking
                 | GotLost
-                | Trading
                 | Drinking
                 | Smoking
                 | SmokingWeed
@@ -1317,7 +1283,7 @@ mod tests {
 
     #[test]
     fn nothing_is_drawn_while_a_foreground_event_is_under_way() {
-        let h = [past(WeatherChange, 1, 4)];
+        let h = [past(TempWork, 1, 4)];
         assert_eq!(pick(&h, &EventKind::ALL, rolls(0.99, 0.5)), None);
         assert_eq!(pick(&h, &EventKind::ALL, rolls(0.0, 0.0)), None);
     }
@@ -1342,11 +1308,7 @@ mod tests {
             HitSomeone,
             GotHit,
             WorkingOut,
-            GroceryShopping,
-            InClass,
-            OnTheWay,
             GotBumped,
-            BumpedSomeone,
         ];
         for bg in [Hospitalized, PostSurgery] {
             let h = [past(bg, 1, 72)];
@@ -1382,14 +1344,14 @@ mod tests {
 
     #[test]
     fn a_kind_is_eligible_again_exactly_one_cooldown_after_it_started() {
-        let only = [WeatherChange];
+        let only = [Reading];
         let cooling = [PastEvent {
-            started_at: now() - Duration::hours(8) + Duration::seconds(1),
-            ..past(WeatherChange, 8, 4)
+            started_at: now() - Duration::hours(12) + Duration::seconds(1),
+            ..past(Reading, 12, 2)
         }];
         assert_eq!(pick(&cooling, &only, rolls(0.0, 0.0)), None);
-        let ready = [past(WeatherChange, 8, 4)];
-        assert_eq!(pick(&ready, &only, rolls(0.0, 0.0)), Some(WeatherChange));
+        let ready = [past(Reading, 12, 2)];
+        assert_eq!(pick(&ready, &only, rolls(0.0, 0.0)), Some(Reading));
     }
 
     #[test]
@@ -1580,10 +1542,10 @@ mod tests {
     fn needs_scale_kinds_within_their_category() {
         use NeedLevel::High;
         let cases: [(&[EventKind], Option<Needs>, f64, EventKind); 12] = [
-            // ex 1 : weather 4 — 0.3 → 1.5 → weather.
-            (&[ExMessage, WeatherChange], None, 0.3, WeatherChange),
-            // emotional high: 3 : 4 — 0.3 → 2.1 → ex.
-            (&[ExMessage, WeatherChange], needs(High), 0.3, ExMessage),
+            // temp_work 3 : ex 1 — 0.6 → 2.4 → temp_work.
+            (&[ExMessage, TempWork], None, 0.6, TempWork),
+            // emotional high: 3 : 3 — 0.6 → 3.6 → ex.
+            (&[ExMessage, TempWork], needs(High), 0.6, ExMessage),
             // police 1 : animal 3 — 0.2 → 0.8 → police.
             (
                 &[PoliceEncounter, AnimalEncounter],
@@ -1604,16 +1566,16 @@ mod tests {
             (&[Unwell, Irritable], None, 0.4, Unwell),
             // emotional high: 1 : 2 — 0.4 → 1.2 → irritable.
             (&[Unwell, Irritable], needs(High), 0.4, Irritable),
-            // temp_work 3 : weather 4 — 0.3 → 2.1 → temp_work.
-            (&[TempWork, WeatherChange], None, 0.3, TempWork),
+            // temp_work 3 : reading 2 — 0.3 → 1.5 → temp_work.
+            (&[TempWork, Reading], None, 0.3, TempWork),
             // working_out 2 : reading 2 — 0.4 → 1.6 → working_out.
             (&[WorkingOut, Reading], None, 0.4, WorkingOut),
             // sick 3 : hospitalized 0.5 — 0.9 → 3.15 → hospitalized.
             (&[Sick, Hospitalized], None, 0.9, Hospitalized),
-            // grocery 2 : showering 2 — 0.6 → 2.4 → showering.
-            (&[GroceryShopping, Showering], None, 0.6, Showering),
-            // bathing 1 : in_class 1 — 0.6 → 1.2 → in_class.
-            (&[Bathing, InClass], None, 0.6, InClass),
+            // showering 2 : selfie 2 — 0.6 → 2.4 → selfie.
+            (&[Showering, TakingSelfie], None, 0.6, TakingSelfie),
+            // police 1 : bathing 1 — 0.6 → 1.2 → bathing.
+            (&[PoliceEncounter, Bathing], None, 0.6, Bathing),
         ];
         for (allowed, n, roll, want) in cases {
             assert_eq!(
@@ -1626,8 +1588,8 @@ mod tests {
 
     /// Every kind in `earlier()`, rung 3, a female persona, no needs:
     /// categories short 5, mid 4, body 0.5, trip 0.5 (10); within short
-    /// police 1, animal 3, hit 0.5, desire 2, grocery 2, showering 2,
-    /// bathing 1, in_class 1, on_the_way 2 (14.5).
+    /// police 1, animal 3, hit 0.5, desire 2, showering 2, bathing 1 (9.5);
+    /// on_the_way needs a trip.
     #[test]
     fn the_stages_pick_by_cumulative_weight() {
         let allowed = earlier();
@@ -1640,7 +1602,7 @@ mod tests {
         assert_eq!(at(0.95 - E, 0.0).category(), EventCategory::Body);
         assert_eq!(at(0.95 + E, 0.0), BusinessTrip);
         assert_eq!(at(1.0, 1.0), HometownVisit);
-        let b = |w: f64| w / 14.5;
+        let b = |w: f64| w / 9.5;
         assert_eq!(at(0.0, b(1.0) - E), PoliceEncounter);
         assert_eq!(at(0.0, b(1.0) + E), AnimalEncounter);
         assert_eq!(at(0.0, b(4.0) - E), AnimalEncounter);
@@ -1648,12 +1610,9 @@ mod tests {
         assert_eq!(at(0.0, b(4.5) - E), HitSomeone);
         assert_eq!(at(0.0, b(4.5) + E), SuddenDesire);
         assert_eq!(at(0.0, b(6.5) - E), SuddenDesire);
-        assert_eq!(at(0.0, b(6.5) + E), GroceryShopping);
-        assert_eq!(at(0.0, b(8.5) + E), Showering);
-        assert_eq!(at(0.0, b(10.5) + E), Bathing);
-        assert_eq!(at(0.0, b(11.5) + E), InClass);
-        assert_eq!(at(0.0, b(12.5) + E), OnTheWay);
-        assert_eq!(at(0.0, 1.0), OnTheWay);
+        assert_eq!(at(0.0, b(6.5) + E), Showering);
+        assert_eq!(at(0.0, b(8.5) + E), Bathing);
+        assert_eq!(at(0.0, 1.0), Bathing);
     }
 
     #[test]
@@ -1689,8 +1648,6 @@ mod tests {
         assert_eq!(lasts(LongTrip, 1.0 - E), Duration::hours(168));
         assert_eq!(lasts(LongTrip, 1.0), Duration::hours(168));
         assert_eq!(lasts(Showering, 0.9), Duration::minutes(30));
-        assert_eq!(lasts(OnTheWay, 0.0), Duration::minutes(30));
-        assert_eq!(lasts(GroceryShopping, 0.5), Duration::hours(1));
     }
 
     #[test]
@@ -1717,7 +1674,7 @@ mod tests {
         let count = |c| EventKind::ALL.iter().filter(|k| k.category() == c).count();
         assert_eq!(
             EventCategory::ALL.map(count),
-            [39, 23, 4, 4],
+            [34, 21, 4, 4],
             "short, mid, body, trip"
         );
         assert!(!EventCategory::Short.is_background());
@@ -1744,12 +1701,10 @@ mod tests {
         assert_eq!(Health::default(), Health::Normal);
     }
 
-    /// The kinds added after the 28 v2 kinds; tests pinned to the weights of
-    /// those 28 draw from `earlier()`.
-    const ADDED: [EventKind; 41] = [
+    /// The kinds added after the v2 kinds; tests pinned to the weights of
+    /// those draw from `earlier()`.
+    const ADDED: [EventKind; 37] = [
         MissedRide,
-        WatchingStocks,
-        Trading,
         GotLost,
         Drinking,
         Smoking,
@@ -1770,7 +1725,6 @@ mod tests {
         InBattle,
         Asleep,
         GotBumped,
-        BumpedSomeone,
         Quarrel,
         ScoldedBySuperior,
         ScoldedSuperior,
@@ -1783,7 +1737,6 @@ mod tests {
         AdmiringArt,
         TakingSelfie,
         OnTheRoad,
-        WatchingMatch,
         WatchingShow,
         HavingSex,
         WantToGoOut,
@@ -1912,13 +1865,7 @@ mod tests {
         assert!(!is_told(AwayFromPhone, 3, &none));
         assert!(is_told(Reading, 1, &none));
         assert!(is_told(PeriodScare, 2, &none));
-        for k in [
-            GotBumped,
-            BumpedSomeone,
-            Quarrel,
-            ScoldedBySuperior,
-            ScoldedSuperior,
-        ] {
+        for k in [GotBumped, Quarrel, ScoldedBySuperior, ScoldedSuperior] {
             assert!(is_told(k, 0, &none), "{k:?}");
         }
     }
@@ -1956,7 +1903,6 @@ mod tests {
         assert_eq!(lasts(Asleep, 1.0), Duration::hours(4));
         for (k, want) in [
             (GotBumped, Duration::minutes(30)),
-            (BumpedSomeone, Duration::minutes(30)),
             (Quarrel, Duration::hours(1)),
             (ScoldedBySuperior, Duration::hours(1)),
             (ScoldedSuperior, Duration::hours(1)),
@@ -1969,13 +1915,7 @@ mod tests {
     #[test]
     fn the_run_ins_have_no_gate() {
         let none = PersonaTraits::default();
-        for k in [
-            GotBumped,
-            BumpedSomeone,
-            Quarrel,
-            ScoldedBySuperior,
-            ScoldedSuperior,
-        ] {
+        for k in [GotBumped, Quarrel, ScoldedBySuperior, ScoldedSuperior] {
             assert_eq!(
                 pick_with(&none, None, 0, &[], &[k], rolls(0.0, 0.0)),
                 Some(k),
@@ -2007,7 +1947,7 @@ mod tests {
             assert_eq!(EventKind::parse(s), Some(k));
             assert!(EventKind::ALL.contains(&k), "{k:?}");
         }
-        assert_eq!(EventKind::ALL.len(), 70);
+        assert_eq!(EventKind::ALL.len(), 63);
     }
 
     #[test]
@@ -2016,7 +1956,7 @@ mod tests {
         assert_eq!(EventKind::parse("fell_out"), Some(FellOut));
         assert!(!EventKind::ALL.contains(&TakingSpace));
         assert!(!EventKind::ALL.contains(&FellOut));
-        assert_eq!(EventKind::ALL.len(), 70);
+        assert_eq!(EventKind::ALL.len(), 63);
         assert_eq!(EventKind::SPECIAL.len(), 5);
         for k in EventKind::SPECIAL {
             assert_eq!(serde_json::to_value(k).unwrap(), k.as_str());
@@ -2328,7 +2268,6 @@ mod tests {
             (AdmiringArt, "admiring_art", EventCategory::Short),
             (TakingSelfie, "taking_selfie", EventCategory::Short),
             (OnTheRoad, "on_the_road", EventCategory::Mid),
-            (WatchingMatch, "watching_match", EventCategory::Mid),
             (WatchingShow, "watching_show", EventCategory::Mid),
             (HavingSex, "having_sex", EventCategory::Mid),
         ] {
@@ -2350,7 +2289,6 @@ mod tests {
             AdmiringArt,
             TakingSelfie,
             OnTheRoad,
-            WatchingMatch,
             WatchingShow,
         ] {
             assert!(!k.is_offline(&none), "{k:?}");
@@ -2368,17 +2306,13 @@ mod tests {
             OnTheRoad,
             HavingSex,
             TakingSelfie,
-            WatchingMatch,
         ];
         for bg in [Hospitalized, PostSurgery] {
             let h = [past(bg, 24, 72)];
             for c in [0.0, 0.99] {
                 for k in [0.0, 0.25, 0.5, 0.75, 0.99] {
                     let got = pick(&h, &allowed, rolls(c, k));
-                    assert!(
-                        matches!(got, Some(TakingSelfie) | Some(WatchingMatch)),
-                        "{bg:?} {c} {k} {got:?}"
-                    );
+                    assert!(matches!(got, Some(TakingSelfie)), "{bg:?} {c} {k} {got:?}");
                 }
             }
         }
@@ -2390,7 +2324,6 @@ mod tests {
             (AdmiringScenery, 2.0, 24, 1, 1),
             (AdmiringArt, 1.0, 48, 1, 1),
             (OnTheRoad, 2.0, 24, 2, 4),
-            (WatchingMatch, 2.0, 24, 2, 3),
             (WatchingShow, 1.0, 72, 2, 3),
             (HavingSex, 1.0, 48, 1, 2),
         ] {
@@ -2536,7 +2469,6 @@ mod tests {
             (InBattle, Irritable),
             (GotHit, Unwell),
             (GotBumped, Unwell),
-            (WeatherChange, Unwell),
             (WorkingOut, Showering),
             (WorkingOut, Bathing),
         ] {
@@ -2629,25 +2561,25 @@ mod tests {
 
     #[test]
     fn sex_addict_scales_sudden_desire() {
-        let both = [SuddenDesire, GroceryShopping];
+        let both = [SuddenDesire, Showering];
         let with = |sex_addict| PersonaTraits {
             sex_addict,
             ..Default::default()
         };
         let at = |p: &PersonaTraits, k| pick_ever(p, false, &both, rolls(0.0, k));
-        // Draw order is `ALL` order: SuddenDesire, GroceryShopping.
+        // Draw order is `ALL` order: SuddenDesire, Showering.
         // true: 6, 2 (8) — spans [0, .75), [.75, 1].
         let addict = with(Some(true));
         assert_eq!(at(&addict, 0.7), Some(SuddenDesire));
-        assert_eq!(at(&addict, 0.8), Some(GroceryShopping));
+        assert_eq!(at(&addict, 0.8), Some(Showering));
         // false: 2/3, 2 (8/3) — spans [0, .25), [.25, 1].
         let not = with(Some(false));
         assert_eq!(at(&not, 0.2), Some(SuddenDesire));
-        assert_eq!(at(&not, 0.3), Some(GroceryShopping));
+        assert_eq!(at(&not, 0.3), Some(Showering));
         // absent: 2, 2 (4) — spans [0, .5), [.5, 1].
         let none = with(None);
         assert_eq!(at(&none, 0.45), Some(SuddenDesire));
-        assert_eq!(at(&none, 0.55), Some(GroceryShopping));
+        assert_eq!(at(&none, 0.55), Some(Showering));
         // The rung gate holds for an addict.
         assert_eq!(
             pick_with(&addict, None, 2, &[], &[SuddenDesire], rolls(0.0, 0.0)),
@@ -2810,18 +2742,19 @@ mod tests {
         assert_eq!(Setting::parse("space"), None);
     }
 
-    /// Spec 2026-11-08-strip-and-world-setting-design.md §4.
+    /// Spec 2026-11-08-strip-and-world-setting-design.md §4; spec
+    /// 2026-11-16-prune-life-events-design.md §4.3.
     const MODERN_ONLY: [EventKind; 10] = [
-        WatchingStocks,
         PoliceEncounter,
         Showering,
         TakingSelfie,
         Gaming,
-        WatchingMatch,
         WatchingShow,
         BusinessTrip,
         Hospitalized,
         PostSurgery,
+        TempWork,
+        ScoldedSuperior,
     ];
 
     #[test]
@@ -2847,12 +2780,23 @@ mod tests {
             Some(TakingSelfie)
         );
         let fan = PersonaTraits {
-            prefer_events: vec![WatchingMatch],
+            prefer_events: vec![Gaming],
             ..fantasy
         };
         for r in [0.0, 0.5, 0.99] {
             assert_eq!(
-                pick_with(&fan, None, 3, &[], &[WatchingMatch, Reading], rolls(r, r)),
+                pick_with(&fan, None, 3, &[], &[Gaming, Reading], rolls(r, r)),
+                Some(Reading),
+                "{r}"
+            );
+        }
+        let worker = PersonaTraits {
+            prefer_events: vec![TempWork],
+            ..fan
+        };
+        for r in [0.0, 0.5, 0.99] {
+            assert_eq!(
+                pick_with(&worker, None, 3, &[], &[TempWork, Reading], rolls(r, r)),
                 Some(Reading),
                 "{r}"
             );
@@ -2957,7 +2901,6 @@ mod tests {
                 Asleep,
                 WantHotSpring,
                 WantSauna,
-                GroceryShopping,
             ] {
                 assert_eq!(needs_factor(k, Some(&n)), 1.0, "{k:?} {level:?}");
             }
@@ -3028,7 +2971,6 @@ mod tests {
             AnimalEncounter,
             OnTheWay,
             GotBumped,
-            BumpedSomeone,
             AdmiringScenery,
             BirdEncounter,
             WantToSeeSea,
@@ -3041,12 +2983,10 @@ mod tests {
         let indoor = [
             Showering,
             Bathing,
-            InClass,
             ScoldedBySuperior,
             ScoldedSuperior,
             AdmiringArt,
             WantSauna,
-            WatchingStocks,
             Reading,
             Gaming,
             WantToGoHome,
@@ -3101,7 +3041,7 @@ mod tests {
     /// factor reaches the draw.
     #[test]
     fn an_outdoor_persona_leans_outdoors() {
-        let only = [Reading, OnTheRoad];
+        let only = [Reading, WantToGoOut];
         let roll = rolls(0.0, 0.45);
         let at = |p: &PersonaTraits| pick_with(p, None, 1, &[], &only, roll);
         assert_eq!(at(&PersonaTraits::default()), Some(Reading));
@@ -3109,7 +3049,7 @@ mod tests {
             outdoorsy: Outdoorsy::Outdoor,
             ..Default::default()
         };
-        assert_eq!(at(&out), Some(OnTheRoad));
+        assert_eq!(at(&out), Some(WantToGoOut));
     }
 
     fn with_employed(employed: Employment) -> PersonaTraits {
@@ -3127,21 +3067,21 @@ mod tests {
             assert_eq!(hygienic_factor(k, &with_hygienic(None)), 1.0);
         }
         assert_eq!(
-            hygienic_factor(GroceryShopping, &with_hygienic(Some(true))),
+            hygienic_factor(PonderingLife, &with_hygienic(Some(true))),
             1.0
         );
-        // Draw order is `ALL` order: GroceryShopping, Showering, both 2.
-        let both = [GroceryShopping, Showering];
+        // Draw order is `ALL` order: Showering, PonderingLife, both 2.
+        let both = [Showering, PonderingLife];
         let at = |p: &PersonaTraits, k| pick_ever(p, false, &both, rolls(0.0, k));
-        // true: 2, 6 — GroceryShopping below .25.
-        assert_eq!(at(&with_hygienic(Some(true)), 0.2), Some(GroceryShopping));
-        assert_eq!(at(&with_hygienic(Some(true)), 0.3), Some(Showering));
-        // false: 2, 2/3 — GroceryShopping below .75.
-        assert_eq!(at(&with_hygienic(Some(false)), 0.7), Some(GroceryShopping));
-        assert_eq!(at(&with_hygienic(Some(false)), 0.8), Some(Showering));
-        // unset: 2, 2 — GroceryShopping below .5.
-        assert_eq!(at(&with_hygienic(None), 0.45), Some(GroceryShopping));
-        assert_eq!(at(&with_hygienic(None), 0.55), Some(Showering));
+        // true: 6, 2 — Showering below .75.
+        assert_eq!(at(&with_hygienic(Some(true)), 0.7), Some(Showering));
+        assert_eq!(at(&with_hygienic(Some(true)), 0.8), Some(PonderingLife));
+        // false: 2/3, 2 — Showering below .25.
+        assert_eq!(at(&with_hygienic(Some(false)), 0.2), Some(Showering));
+        assert_eq!(at(&with_hygienic(Some(false)), 0.3), Some(PonderingLife));
+        // unset: 2, 2 — Showering below .5.
+        assert_eq!(at(&with_hygienic(None), 0.45), Some(Showering));
+        assert_eq!(at(&with_hygienic(None), 0.55), Some(PonderingLife));
     }
 
     #[test]
@@ -3161,7 +3101,7 @@ mod tests {
             );
         }
         assert_eq!(
-            employed_factor(InClass, &with_employed(Employment::Free)),
+            employed_factor(Reading, &with_employed(Employment::Free)),
             1.0
         );
         // Draw order is `ALL` order: Quarrel, ScoldedBySuperior; both weigh 1.
@@ -3205,14 +3145,6 @@ mod tests {
     #[test]
     fn the_stock_lost_habit_and_sex_kinds() {
         for (k, wire, w, cd, want) in [
-            (
-                WatchingStocks,
-                "watching_stocks",
-                2.0,
-                24,
-                Duration::minutes(30),
-            ),
-            (Trading, "trading", 1.0, 24, Duration::hours(1)),
             (GotLost, "got_lost", 3.0, 48, Duration::hours(1)),
             (Drinking, "drinking", 2.0, 12, Duration::minutes(30)),
             (Smoking, "smoking", 2.0, 12, Duration::minutes(30)),
@@ -3230,7 +3162,7 @@ mod tests {
             assert_eq!(lasts(k, 0.5), want, "{k:?}");
             assert!(!k.may_be_offline() && !k.is_photo(), "{k:?}");
             assert!(is_told(k, 3, &PersonaTraits::default()), "{k:?}");
-            assert_eq!(k.fits(Setting::Fantasy), k != WatchingStocks, "{k:?}");
+            assert!(k.fits(Setting::Fantasy), "{k:?}");
         }
     }
 
@@ -3324,22 +3256,58 @@ mod tests {
     #[test]
     fn the_rule_outs_of_the_new_kinds() {
         for bg in [Hospitalized, PostSurgery] {
-            for k in [
-                GotLost,
-                Trading,
-                Drinking,
-                Smoking,
-                SmokingWeed,
-                JustHaveSex,
-            ] {
+            for k in [GotLost, Drinking, Smoking, SmokingWeed, JustHaveSex] {
                 assert!(rules_out(bg, k), "{bg:?} {k:?}");
             }
-            for k in [WatchingStocks, Masturbating] {
-                assert!(!rules_out(bg, k), "{bg:?} {k:?}");
-            }
+            assert!(!rules_out(bg, Masturbating), "{bg:?}");
         }
         assert!(rules_out(TravelingTogether, JustHaveSex));
         assert!(!rules_out(TravelingTogether, GotLost));
+    }
+
+    /// Spec 2026-11-16-prune-life-events-design.md §4.1.
+    const DELETED: [&str; 7] = [
+        "grocery_shopping",
+        "in_class",
+        "watching_stocks",
+        "trading",
+        "bumped_someone",
+        "weather_change",
+        "watching_match",
+    ];
+
+    #[test]
+    fn the_deleted_kinds_are_gone() {
+        for name in DELETED {
+            assert_eq!(EventKind::parse(name), None, "{name}");
+        }
+        assert_eq!(EventKind::ALL.len(), 63);
+    }
+
+    /// Spec 2026-11-16-prune-life-events-design.md §4.2.
+    #[test]
+    fn the_commute_kinds_come_up_only_on_a_trip() {
+        let p = PersonaTraits::default();
+        for k in [OnTheWay, OnTheRoad] {
+            let at = |history: &[PastEvent]| pick_with(&p, None, 1, history, &[k], rolls(0.0, 0.0));
+            assert_eq!(at(&[]), None, "{k:?} no background");
+            for bg in [
+                BusinessTrip,
+                ShortTrip,
+                LongTrip,
+                HometownVisit,
+                TravelingTogether,
+            ] {
+                assert_eq!(at(&[past(bg, 1, 48)]), Some(k), "{k:?} {bg:?}");
+            }
+            assert_eq!(at(&[past(Sick, 1, 48)]), None, "{k:?} not a trip");
+            // Ended an hour ago: inside the follow window, still not drawn.
+            assert_eq!(
+                at(&[past(BusinessTrip, 25, 24)]),
+                None,
+                "{k:?} the trip is over"
+            );
+        }
     }
 
     #[test]

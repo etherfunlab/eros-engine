@@ -6961,7 +6961,7 @@ mod tests {
                     instance_id: s.instance_id.unwrap(),
                     session_id: s.id,
                     event_key: "k1",
-                    kind: eros_engine_core::events::EventKind::WeatherChange,
+                    kind: eros_engine_core::events::EventKind::TempWork,
                     started_at: t("2026-10-01T10:00:00Z"),
                     ends_at: t("2026-10-01T14:00:00Z"),
                 },

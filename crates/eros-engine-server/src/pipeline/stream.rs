@@ -23857,7 +23857,7 @@ data: [DONE]\n\n"
         let t = run_event_turn(
             &pool,
             &[],
-            &[ev("weather_change", -5, 240)],
+            &[ev("temp_work", -5, 240)],
             &[],
             Some(serde_json::json!({"action": "reply_text", "inner_state": ""})),
             0,
@@ -23872,15 +23872,12 @@ data: [DONE]\n\n"
     async fn the_event_is_read_at_the_turns_own_row(pool: PgPool) {
         // The turn was sent 30 minutes ago. The police stop began 30 minutes
         // before it and ended 25 minutes after it: under way at the turn.
-        // The weather change began after the turn and is still going now:
-        // not yet there when the turn was sent.
+        // The temp job began after the turn and is still going now: not yet
+        // there when the turn was sent.
         let t = run_event_turn(
             &pool,
             &[],
-            &[
-                ev("police_encounter", 60, -5),
-                ev("weather_change", 10, 230),
-            ],
+            &[ev("police_encounter", 60, -5), ev("temp_work", 10, 230)],
             &[],
             Some(serde_json::json!({"action": "reply_text", "inner_state": ""})),
             30,
@@ -23891,7 +23888,7 @@ data: [DONE]\n\n"
             judge.contains("[近期事件] 被警察拦下问话（不到 1 小时前开始，不到 1 小时后结束）\\n"),
             "{judge}"
         );
-        assert!(!judge.contains("天气突然变了"), "{judge}");
+        assert!(!judge.contains("临时接到工作"), "{judge}");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
