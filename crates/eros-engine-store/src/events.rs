@@ -154,6 +154,13 @@ impl EventRepo<'_> {
             .into_iter()
             .map(|k| k.as_str().to_string())
             .collect();
+        // A row of a kind this build does not know reads as no event (see
+        // `record`), so it does not block a write either.
+        let known: Vec<String> = EventKind::ALL
+            .into_iter()
+            .chain(EventKind::SPECIAL)
+            .map(|k| k.as_str().to_string())
+            .collect();
         let row: Option<EventColumns> = sqlx::query_as(
             "INSERT INTO engine.persona_events \
                (instance_id, session_id, event_key, kind, started_at, ends_at, message_id) \
@@ -163,6 +170,7 @@ impl EventRepo<'_> {
                   WHERE p.instance_id = $1 \
                     AND p.started_at > $5 - make_interval(hours => $8) \
                     AND p.ends_at > $5 \
+                    AND p.kind = ANY($11) \
                     AND ($9 OR NOT (p.kind = ANY($10))) \
              ) \
              ON CONFLICT (session_id, event_key) DO NOTHING \
@@ -178,6 +186,7 @@ impl EventRepo<'_> {
         .bind(lookback_hours())
         .bind(e.kind.is_background())
         .bind(&background)
+        .bind(&known)
         .fetch_optional(&mut *tx)
         .await?;
         let Some(event) = row.and_then(record) else {
@@ -1139,6 +1148,37 @@ mod tests {
             .await
             .unwrap();
         assert!(now.foreground.is_none() && now.background.is_none());
+    }
+
+    /// The draw does not see a row of a deleted kind, so the write's guard
+    /// must not count it either: the drawn event lands.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn insert_ignores_a_row_of_a_deleted_kind_under_way(pool: PgPool) {
+        let (_, i, s) = instance_and_session(&pool).await;
+        sqlx::query(
+            "INSERT INTO engine.persona_events (instance_id, session_id, event_key, kind, started_at, ends_at) \
+             VALUES ($1, $2, 'w', 'weather_change', '2026-10-01T08:00:00Z', '2026-10-01T12:00:00Z')",
+        )
+        .bind(i)
+        .bind(s)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let written = EventRepo { pool: &pool }
+            .insert(
+                &ev(
+                    i,
+                    s,
+                    "r",
+                    Reading,
+                    "2026-10-01T09:00:00Z",
+                    "2026-10-01T10:00:00Z",
+                ),
+                Some(&message("在看书")),
+            )
+            .await
+            .unwrap();
+        assert!(written.is_some());
     }
 
     #[sqlx::test(migrations = "./migrations")]
