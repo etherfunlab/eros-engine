@@ -910,7 +910,7 @@ frame.
 Any of these can end early in a terminal `error`.
 
 ```text
-data: {"type":"event","event":{"kind":"weather_change","category":"mid","offline":false,"started_at":"2026-11-10T08:00:00Z","ends_at":"2026-11-10T12:00:00Z","message_id":"019a6c1e-7f3a-7c0e-9d51-2b8f4f0f6a11"}}
+data: {"type":"event","event":{"kind":"temp_work","category":"mid","offline":false,"started_at":"2026-11-10T08:00:00Z","ends_at":"2026-11-10T12:00:00Z","message_id":"019a6c1e-7f3a-7c0e-9d51-2b8f4f0f6a11"}}
 
 data: {"type":"meta","message_id":"01KA...","action_type":"proactive"}
 
@@ -1093,7 +1093,7 @@ How the draw works and how events and the persona's needs fit together is in
 ```json
 {
   "event_key": "day-01J9ZK3",
-  "kinds": ["weather_change", "animal_encounter", "business_trip"],
+  "kinds": ["temp_work", "animal_encounter", "business_trip"],
   "user_timezone": "Asia/Taipei",
   "tier": "gold"
 }
@@ -1116,15 +1116,12 @@ Kinds fall into four categories. `short` and `mid` are incidents; `body` and
 | `short` | `animal_encounter` | 1 h | she meets a stray animal |
 | `short` | `hit_someone` | 1 h | she hit someone |
 | `short` | `sudden_desire` | 1 h | she suddenly wants it |
-| `short` | `grocery_shopping` | 1 h | she is out buying groceries |
 | `short` | `showering` | 30 min | she is about to shower |
 | `short` | `bathing` | 1 h | she is in the bath |
-| `short` | `in_class` | 1 h | she is in class |
-| `short` | `on_the_way` | 30 min | she is on her way somewhere |
+| `short` | `on_the_way` | 30 min | she is on her way somewhere (only on a trip, a business trip included) |
 | `short` | `period_scare` | 1 h | she thinks her period is late — a false alarm |
 | `short` | `pregnancy_scare` | 1 h | a pregnancy test comes up positive — a false alarm |
 | `short` | `got_bumped` | 30 min | someone or a vehicle brushes into her on foot |
-| `short` | `bumped_someone` | 30 min | she knocks into someone, on foot or in whatever she rides or drives — a car, a horse, a flight, by her world |
 | `short` | `quarrel` | 1 h | she had a row with someone |
 | `short` | `scolded_by_superior` | 1 h | someone above her told her off — a boss, a manager, a master, a sovereign, by her world |
 | `short` | `scolded_superior` | 1 h | she told off someone above her |
@@ -1142,8 +1139,6 @@ Kinds fall into four categories. `short` and `mid` are incidents; `body` and
 | `short` | `want_to_see_sea` | 1 h | she badly wants to see the sea |
 | `short` | `want_hot_spring` | 1 h | she badly wants a hot spring |
 | `short` | `want_sauna` | 1 h | she badly wants a sauna |
-| `short` | `watching_stocks` | 30 min | she is watching the market |
-| `short` | `trading` | 1 h | she is making a deal with someone |
 | `short` | `got_lost` | 1 h | she has lost her way (only on a trip, her own or one with the user) |
 | `short` | `drinking` | 30 min | she is drinking (a persona whose `alcoholic` is `true`) |
 | `short` | `smoking` | 30 min | she is smoking (a persona whose `smoking` is `true`) |
@@ -1153,7 +1148,6 @@ Kinds fall into four categories. `short` and `mid` are incidents; `body` and
 | `short` | `missed_ride` | 1 h | she has missed her ride (only on a trip, a business trip included) |
 | `mid` | `temp_work` | 4 h | she is called in to work |
 | `mid` | `ex_message` | 3 h | her ex texts her |
-| `mid` | `weather_change` | 4 h | the weather turns |
 | `mid` | `got_hit` | 4 h | someone hit her |
 | `mid` | `breakup` | 4 h | she just broke up |
 | `mid` | `working_out` | 1–2 h | she is working out |
@@ -1168,8 +1162,7 @@ Kinds fall into four categories. `short` and `mid` are incidents; `body` and
 | `mid` | `out_shopping` | 2–4 h | she is out shopping (offline for a female persona) |
 | `mid` | `bros_gathering` | 2–4 h | she is at a gathering of brothers (offline) |
 | `mid` | `sis_gathering` | 2–4 h | she is at a gathering of sisters (offline) |
-| `mid` | `on_the_road` | 2–4 h | she is on a long stretch of travel: a commute, a coach, a train, a flight |
-| `mid` | `watching_match` | 2–3 h | she is watching a match |
+| `mid` | `on_the_road` | 2–4 h | she is on a long stretch of travel: a commute, a coach, a train, a flight (only on a trip, a business trip included) |
 | `mid` | `watching_show` | 2–3 h | she is at a show |
 | `mid` | `having_sex` | 1–2 h | she is having sex (a sex addict; offline, never announced) |
 | `mid` | `want_to_go_out` | 1–3 h | she badly wants to get out |
@@ -1183,7 +1176,7 @@ Kinds fall into four categories. `short` and `mid` are incidents; `body` and
 | `trip` | `long_trip` | 3–7 d | a long trip |
 | `trip` | `hometown_visit` | 72 h | a visit home |
 
-A range is drawn when the event starts. That is 70 drawable kinds. Both genders
+A range is drawn when the event starts. That is 63 drawable kinds. Both genders
 draw both gatherings, at the same weight; that is deliberate.
 
 Five more kinds are never drawn: `taking_space` (a separation she asked for and
@@ -1217,17 +1210,17 @@ The draw:
   under way, only incidents are drawn; in hospital or after surgery, not the
   ones that need her out and about (`temp_work`, `police_encounter`,
   `animal_encounter`, `hit_someone`, `got_hit`, `working_out`,
-  `grocery_shopping`, `in_class`, `on_the_way`, `in_battle`, `got_bumped`,
-  `bumped_someone`, `saw_bag`, `saw_clothes`, `out_shopping`,
-  `bros_gathering`, `sis_gathering`, `admiring_scenery`, `admiring_art`,
-  `watching_show`, `on_the_road`, `having_sex`, `bird_encounter`,
-  `streaking`, `got_lost`, `trading`, `drinking`, `smoking`, `smoking_weed`,
-  `just_have_sex`); during `period`,
+  `on_the_way`, `in_battle`, `got_bumped`, `saw_bag`, `saw_clothes`,
+  `out_shopping`, `bros_gathering`, `sis_gathering`, `admiring_scenery`,
+  `admiring_art`, `watching_show`, `on_the_road`, `having_sex`,
+  `bird_encounter`, `streaking`, `got_lost`, `drinking`, `smoking`,
+  `smoking_weed`, `just_have_sex`); during `period`,
   neither `period_scare` nor `pregnancy_scare`; during `traveling_together`,
   no kind that can take her offline and not `just_have_sex`, since she is with
   the user. `got_lost` is drawn only while a `short_trip`, `long_trip`,
-  `hometown_visit` or `traveling_together` is under way; `missed_ride` only
-  while one of those or a `business_trip` is.
+  `hometown_visit` or `traveling_together` is under way; `missed_ride`,
+  `on_the_way` and `on_the_road` only while one of those or a `business_trip`
+  is.
 - **While she waits for an answer, nothing is drawn.** From her ask (of any
   life choice) until it is answered or lapses (24 h), the draw returns `{"event": null,
   "message": null}` for every session of the persona. A repeat of an
@@ -1270,7 +1263,7 @@ The draw:
   | `hygienic` | `true` / `false` / absent | `showering`, `bathing`, `want_hot_spring` and `want_sauna` come up three times / a third as often within `short`; it also sets when she asks for a bath together ([below](#post-v2compsessionsession_idlife-choiceschoice_id)) |
   | `employed` | `"free"`, `"part_time"` (default), `"full_time"` | how much of her day is work: `temp_work`, `scolded_by_superior`, `scolded_superior` and `business_trip` come up a third as often / as they are / three times as often within their categories, and a `free` persona never draws `want_to_quit_job`; any other value reads as `part_time` |
   | `outdoorsy` | `"outdoor"`, `"neutral"` (default), `"indoor"` | `outdoor`: the outdoor kinds come up three times as often and the indoor kinds a third as often within their categories; `indoor` the reverse. Kinds that can take her offline are neutral and untouched; the place of each kind is listed in [life-events-needs.md](life-events-needs.md#outdoors-or-in); any other value reads as `neutral` |
-  | `setting` | `"modern"` (default), `"fantasy"` | the world she lives in: a `fantasy` persona never draws `police_encounter`, `showering`, `taking_selfie`, `gaming`, `watching_match`, `watching_show`, `business_trip`, `hospitalized`, `post_surgery` or `watching_stocks`, whatever `kinds` or `prefer_events` say; any other value reads as `modern` |
+  | `setting` | `"modern"` (default), `"fantasy"` | the world she lives in: a `fantasy` persona never draws `police_encounter`, `showering`, `taking_selfie`, `gaming`, `watching_show`, `business_trip`, `hospitalized`, `post_surgery`, `temp_work` or `scolded_superior`, whatever `kinds` or `prefer_events` say; any other value reads as `modern` |
   | `smoking`, `alcoholic`, `drug`, `coffee`, `gluttony` | each `true` / `false` / absent | whether she smokes, drinks, uses weed, drinks coffee, loves good food: the more are `true`, the sooner her `indulgence` comes back to `high` and weighs the pick; a `false` key can make her refuse a `give` of that thing ([above](#post-compchatsession_idmessagestream)); `smoking`, `alcoholic` and `drug` set to `true` let her draw `smoking`, `drinking` and `smoking_weed` |
 
   A value of the wrong shape, an unknown kind or a kind outside `mid` is

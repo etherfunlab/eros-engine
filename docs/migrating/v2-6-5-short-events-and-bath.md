@@ -9,7 +9,7 @@ No migration and no breaking wire change: the event and life-choice kind enums g
 
 **Before you upgrade:** if you keep adult kinds from some users with a `disallow` list, add `streaking`, `just_have_sex` and `masturbating` to it first ([Clients, step 4](#clients)). Otherwise those users start seeing them as soon as the new version serves them.
 
-**Design:** [small things in her day](../life-events-needs.md#small-things-in-her-day), [the market, getting lost, her habits and sex](../life-events-needs.md#the-market-getting-lost-her-habits-and-sex), [missing her ride](../life-events-needs.md#missing-her-ride), [outdoors or in](../life-events-needs.md#outdoors-or-in), [a bath together](../life-events-needs.md#a-bath-together) and [the life-choice route](../api-reference.md#post-v2compsessionsession_idlife-choiceschoice_id).
+**Design:** [small things in her day](../life-events-needs.md#small-things-in-her-day), [the market, getting lost, her habits and sex](../life-events-needs.md#getting-lost-her-habits-and-sex), [missing her ride](../life-events-needs.md#missing-her-ride), [outdoors or in](../life-events-needs.md#outdoors-or-in), [a bath together](../life-events-needs.md#a-bath-together) and [the life-choice route](../api-reference.md#post-v2compsessionsession_idlife-choiceschoice_id).
 
 ## What users will notice
 

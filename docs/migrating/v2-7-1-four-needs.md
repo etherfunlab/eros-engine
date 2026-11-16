@@ -13,7 +13,7 @@ The persona's needs are four: `social`, `emotional`, `outing` and `indulgence`. 
 
 - **She stops talking about being hungry or tired.** The reply's `此刻的需要` line no longer says 饿了, 不饿, 很累 or 精神很好. Before, hunger rested at `high`, so outside the hours right after a meal nearly every reply carried 饿了.
 - **Food gives move no need.** An accepted `food` still leaves its 吃饱 body effect. A cigarette, alcohol, herb or a dish still raises `social` and `indulgence`; medicine and coffee still lower them.
-- **Some events come up at their plain weight.** Three needs factors are gone: low stamina halving `temp_work` and `working_out`, low stamina doubling `unwell`, `sick`, `bathing`, `asleep`, `want_hot_spring` and `want_sauna`, and high hunger doubling `grocery_shopping`.
+- **Some events come up at their plain weight.** Two needs factors are gone: low stamina halving `temp_work` and `working_out`, and low stamina doubling `unwell`, `sick`, `bathing`, `asleep`, `want_hot_spring` and `want_sauna`. (`grocery_shopping`, which high hunger doubled, is deleted in the same release: see [v2-7-1-fewer-events.md](v2-7-1-fewer-events.md).)
 
 ## What to change
 

@@ -170,7 +170,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 
 ### 类别
 
-可抽取的事件共 70 种，每一种属于一个类别，类别决定它的形态：
+可抽取的事件共 63 种，每一种属于一个类别，类别决定它的形态：
 
 | `category` | 形态 | 持续 | 类别权重 | 类别冷却 |
 |---|---|---|---|---|
@@ -199,7 +199,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 抽取是输入加三个随机数（两段各一个，时长一个）的纯函数。
 
 1. **资格。** 一个种类同时满足下面几条才有资格：
-   - 调用方的 `kinds` 允许它（[见下](#调用方的-kinds)；不带表示全部 70 种）；
+   - 调用方的 `kinds` 允许它（[见下](#调用方的-kinds)；不带表示全部 63 种）；
    - 过了它的门槛（见下）；
    - 它自己的冷却已过；
    - 它所属类别的冷却已过；
@@ -223,14 +223,13 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 - 有插曲在进行时，完全不抽，连背景也不抽。
 - 有背景在进行时，不会抽第二个背景，插曲照抽；只是住院（`hospitalized`）和术后（`post_surgery`）期间，
   需要她出门活动的那几种不抽：`temp_work`、`police_encounter`、`animal_encounter`、`hit_someone`、
-  `got_hit`、`working_out`、`grocery_shopping`、`in_class`、`on_the_way`、`in_battle`、`got_bumped`、
-  `bumped_someone`、`saw_bag`、`saw_clothes`、`out_shopping`、`bros_gathering`、`sis_gathering`、
-  `admiring_scenery`、`admiring_art`、`watching_show`、`on_the_road`、`having_sex`、`bird_encounter`、`streaking`、
-  `got_lost`、`trading`、`drinking`、`smoking`、`smoking_weed`、`just_have_sex`。
+  `got_hit`、`working_out`、`on_the_way`、`in_battle`、`got_bumped`、`saw_bag`、`saw_clothes`、`out_shopping`、
+  `bros_gathering`、`sis_gathering`、`admiring_scenery`、`admiring_art`、`watching_show`、`on_the_road`、`having_sex`、
+  `bird_encounter`、`streaking`、`got_lost`、`drinking`、`smoking`、`smoking_weed`、`just_have_sex`。
   `period` 期间，
   不抽 `period_scare` 与 `pregnancy_scare`。`traveling_together` 期间，不抽任何可能让她离线的种类，也不抽 `just_have_sex`：她和用户在一起。
-- 有两种是需要背景，而不是被背景排除。`got_lost` 只在 `short_trip`、`long_trip`、`hometown_visit` 或 `traveling_together`
-  进行期间抽取，出差时和不在旅途中都不抽。`missed_ride` 在这几种或 `business_trip` 进行期间抽取。
+- 有四种是需要背景，而不是被背景排除。`got_lost` 只在 `short_trip`、`long_trip`、`hometown_visit` 或 `traveling_together`
+  进行期间抽取，出差时和不在旅途中都不抽。`missed_ride`、`on_the_way` 和 `on_the_road` 在这几种或 `business_trip` 进行期间抽取。
 - 她在等用户回答自己提出的某次生活选择时，同样完全不抽，角色的任何一个 session 都一样：这个请求本身就是前台戏，
   也免得一段离线时段在问话中间开始。带着已经抽过的 `event_key` 来重复调用，照样返回那个事件。
 - 她有一场还没结算的约会时，不论正在进行还是已经结束，同样完全不抽，角色的任何一个 session 都一样：她正和用户在外面，
@@ -242,8 +241,8 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 
 ### 冷却与上限
 
-- **按种类。** 一个种类要等它最新一次事件*开始*后过了冷却才能再开始，不是结束后。冷却最短 8 小时
-  （`weather_change`），重的种类很长（`hit_someone` 14 天、`breakup` 30 天、`hospitalized` 60 天、
+- **按种类。** 一个种类要等它最新一次事件*开始*后过了冷却才能再开始，不是结束后。冷却最短 12 小时
+  （`showering`、`reading` 等），重的种类很长（`hit_someone` 14 天、`breakup` 30 天、`hospitalized` 60 天、
   `post_surgery` 90 天）。四个 `trip` 种类自己没有冷却，由类别冷却管。
 - **按类别。**`body` 每两周最多开始一次，`trip` 每周最多开始一次，不论具体是哪个种类。`short` 与 `mid` 没有。
 - **离线类共享。** 任何一个离线类种类开始后的 12 小时里，所有离线类种类都没有资格，不论刚才是哪一个；
@@ -307,7 +306,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 prompt；她是什么样的人由写角色的人写进人设，和其他人设事实一样。`sex_addict` 同样不进任何 prompt。
 
 `hygienic`、`employed` 和 `outdoorsy` 也不进任何 prompt，而且不算习惯：它们不影响 `indulgence`。`hygienic` 是单独的一个系数，
-和同一种类上的需求系数相乘。`employed` 不动 `in_class`、`busy` 和 `in_battle`，也不改任何冷却或时长。
+和同一种类上的需求系数相乘。`employed` 不动 `busy` 和 `in_battle`，也不改任何冷却或时长。
 
 #### 户外还是室内
 
@@ -315,8 +314,8 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 
 | 场所 | `short` | `mid` |
 |---|---|---|
-| 户外 | `police_encounter`、`animal_encounter`、`on_the_way`、`got_bumped`、`bumped_someone`、`admiring_scenery`、`bird_encounter`、`want_to_see_sea`、`want_hot_spring`、`got_lost`、`missed_ride` | `on_the_road`、`want_to_go_out` |
-| 室内 | `showering`、`bathing`、`in_class`、`scolded_by_superior`、`scolded_superior`、`admiring_art`、`want_sauna`、`watching_stocks` | `reading`、`gaming`、`want_to_go_home` |
+| 户外 | `police_encounter`、`animal_encounter`、`on_the_way`、`got_bumped`、`admiring_scenery`、`bird_encounter`、`want_to_see_sea`、`want_hot_spring`、`got_lost`、`missed_ride` | `on_the_road`、`want_to_go_out` |
+| 室内 | `showering`、`bathing`、`scolded_by_superior`、`scolded_superior`、`admiring_art`、`want_sauna` | `reading`、`gaming`、`want_to_go_home` |
 | 中性 | 其余 `short` 种类，性相关的种类与 `streaking` 都在其中 | 其余 `mid` 种类 |
 
 可能让她离线的种类（`asleep`、`in_battle`、`busy`、`away_from_phone`、`out_shopping`、两个聚会、`having_sex`）一律中性，
@@ -326,7 +325,7 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 `health` 缩放整个 `body` 类别，`period` 也在内，`period` 自己 28 天的冷却让它不管怎样都大约每月一次。
 `prefer_trip` 提高的是出行的概率，不是频率：每周一次的类别冷却对它同样适用。
 
-五个习惯键通过 `indulgence` 的漂移影响抽取，其中三个（`smoking`、`alcoholic`、`drug`）还是习惯类事件的门槛（见[下文](#股票迷路习惯与性)）。判官的角色块（`[角色人格]`）不列它们，所以她不会每一轮都提烟、酒、大麻、咖啡或吃的；
+五个习惯键通过 `indulgence` 的漂移影响抽取，其中三个（`smoking`、`alcoholic`、`drug`）还是习惯类事件的门槛（见[下文](#迷路习惯与性)）。判官的角色块（`[角色人格]`）不列它们，所以她不会每一轮都提烟、酒、大麻、咖啡或吃的；
 希望这些习惯带进她说话的角色，要在人设里自己写明。engine 从不写这五个键。
 
 **递来她不用的东西。** 一轮的动作是 `give`，递的是 `cigarette`、`alcohol`、`herb`、`coffee` 或 `cuisine`，而对应的键（`smoking`、`alcoholic`、`drug`、`coffee`、`gluttony`）
@@ -357,7 +356,7 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 | `hospitalized`、`post_surgery` | `reading`、`gaming` |
 | `period` | `irritable`、`unwell` |
 | `breakup`、`quarrel`、`scolded_by_superior`、`in_battle` | `irritable` |
-| `got_hit`、`got_bumped`、`weather_change` | `unwell` |
+| `got_hit`、`got_bumped` | `unwell` |
 | `working_out` | `showering`、`bathing` |
 | `ex_message`、`breakup` | `ex_wants_back` |
 | `scolded_by_superior`、`temp_work` | `want_to_quit_job` |
@@ -374,7 +373,7 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 
 | `kinds` | 可以抽的种类 |
 |---|---|
-| 不带或 `null` | 全部 70 种 |
+| 不带或 `null` | 全部 63 种 |
 | `[]` | 一种都不抽：响应是 `{"event": null, "message": null}` |
 | `["reading", "quarrel"]` | 只抽列出的 |
 | `{"allow": […], "disallow": […]}` | `allow` 允许的，去掉 `disallow` 列出的 |
@@ -623,11 +622,11 @@ ghosting 开关关闭时，已经在进行的一段不会让任何轮次沉默�
 
 ### 风景、演出与自拍
 
-六种会讲出来的插曲，给她一个用户听得到的下午：`admiring_scenery`、`admiring_art`（`short`，1 小时）、`taking_selfie`
-（`short`，30 分钟）、`on_the_road`（`mid`，2 到 4 小时：长途通勤、坐车、坐火车、坐飞机；`on_the_way` 仍是那 30 分钟的赶路）、
-`watching_match` 与 `watching_show`（`mid`，2 到 3 小时）。期间她照常回复。提示只陈述事实，细节由她填：看的什么风景、
-哪件作品、什么比赛、坐的什么。请求带 `image`、部署配了 composer 时，`taking_selfie` 的消息带上这张自拍：先写她的话，
-composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2compsessionsession_idevents)）；否则只有文字。`watching_match` 和 `taking_selfie`
+五种会讲出来的插曲，给她一个用户听得到的下午：`admiring_scenery`、`admiring_art`（`short`，1 小时）、`taking_selfie`
+（`short`，30 分钟）、`on_the_road`（`mid`，2 到 4 小时：长途通勤、坐车、坐火车、坐飞机；`on_the_way` 仍是那 30 分钟的赶路；
+两者都只在旅行中）与 `watching_show`（`mid`，2 到 3 小时）。期间她照常回复。提示只陈述事实，细节由她填：看的什么风景、
+哪件作品、什么表演、坐的什么。请求带 `image`、部署配了 composer 时，`taking_selfie` 的消息带上这张自拍：先写她的话，
+composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2compsessionsession_idevents)）；否则只有文字。`taking_selfie`
 住院也抽；其余四种要她出门。
 
 ### 脱给你看
@@ -660,14 +659,12 @@ composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2com
 
 `streaking` 和 `strip` 一样带成人题材：`sex_addict` 对它的缩放与 `sudden_desire` 相同，只对部分用户提供这类内容的调用方把它排除。
 
-### 股票、迷路、习惯与性
+### 迷路、习惯与性
 
-另外八种会讲出来的插曲。它们都是 `short`，都不让她离线，也都不带图；除了 `watching_stocks`，两种世界都适用（见[下文](#她的世界)）：
+另外六种会讲出来的插曲。它们都是 `short`，都不让她离线，也都不带图，两种世界都适用（见[下文](#她的世界)）：
 
 | 种类 | 标签 | 类别 | 权重 | 冷却 | 持续 | 门槛 | 提示 |
 |---|---|---|---|---|---|---|---|
-| `watching_stocks` | 在看股票 | `short` | 2 | 24 小时 | 30 分钟 | 无（只限 `modern`） | `（你正在看股票行情。）` |
-| `trading` | 在交易 | `short` | 1 | 24 小时 | 1 小时 | 无 | `（你正在和人谈一笔买卖。）` |
 | `got_lost` | 迷路了 | `short` | 3 | 48 小时 | 1 小时 | 有 `short_trip`、`long_trip`、`hometown_visit` 或 `traveling_together` 正在进行 | `（你刚迷了路，找不到要去的地方。）`；`traveling_together` 期间是 `（你们一起出来玩，刚迷了路。）` |
 | `drinking` | 在喝酒 | `short` | 2 | 12 小时 | 30 分钟 | `alcoholic` 为 `true` | `（你正在喝酒。）` |
 | `smoking` | 在抽烟 | `short` | 2 | 12 小时 | 30 分钟 | `smoking` 为 `true` | `（你正在抽烟。）` |
@@ -675,7 +672,7 @@ composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2com
 | `just_have_sex` | 刚做完爱 | `short` | 1 | 48 小时 | 30 分钟 | 亲密度档 3 | `（你刚和人做完爱。）` |
 | `masturbating` | 自慰中 | `short` | 1 | 24 小时 | 30 分钟 | `sex_addict` 为 `true`，并且亲密度档 3 | `（你正在自慰。）` |
 
-`trading` 是和人谈一笔买卖，不是炒股，所以奇幻世界也适用。`got_lost` 是唯一一种需要背景的种类（见[上文](#同一时间一件插曲一个背景)）：
+`got_lost` 需要背景（见[上文](#同一时间一件插曲一个背景)）：
 在她自己的旅行里，提示像背景里抽到的任何插曲一样，先说旅行的状态（`（你正在短途旅行。你刚迷了路，找不到要去的地方。）`）；
 和用户一起旅行时，迷路的是他们两个人。
 
@@ -688,7 +685,7 @@ composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2com
 （见[角色设置](#角色设置)）。前任发来消息、突然很想要、脱给对方看，都会让它更容易出现；它又和 `having_sex` 一样让验孕虚惊更容易出现；
 突然很想要也会让 `masturbating` 更容易出现（见[关联系数](#关联系数)）。
 
-住院和术后期间，她不谈买卖、不喝酒、不抽烟、不抽大麻、不做爱，也不在旅途中，所以不会迷路；看股票和自慰照样会有。
+住院和术后期间，她不喝酒、不抽烟、不抽大麻、不做爱，也不在旅途中，所以不会迷路；自慰照样会有。
 和用户一起旅行期间不抽 `just_have_sex`：她和用户在一起。
 
 `just_have_sex` 和 `masturbating` 带成人题材，只对部分用户提供这类内容的调用方把它们排除。
@@ -708,7 +705,7 @@ composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2com
 
 | 适用 | 种类 |
 |---|---|
-| 只限 `modern` | `police_encounter`、`showering`、`taking_selfie`、`gaming`、`watching_match`、`watching_show`、`business_trip`、`hospitalized`、`post_surgery`、`watching_stocks` |
+| 只限 `modern` | `police_encounter`、`showering`、`taking_selfie`、`gaming`、`watching_show`、`business_trip`、`hospitalized`、`post_surgery`、`temp_work`、`scolded_superior` |
 | 两者都可 | 其余所有种类 |
 
 目前还没有只限 `fantasy` 的种类，所以 `fantasy` 的角色从更小的集合里抽，没有 `setting` 的角色抽取和以前完全一样。
