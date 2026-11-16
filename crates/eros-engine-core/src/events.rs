@@ -415,6 +415,8 @@ impl EventKind {
                 | BusinessTrip
                 | Hospitalized
                 | PostSurgery
+                | TempWork
+                | ScoldedSuperior
         );
         !modern_only || setting == Setting::Modern
     }
@@ -895,12 +897,13 @@ fn outdoorsy_factor(kind: EventKind, persona: &PersonaTraits) -> f64 {
 /// that needs none (spec 2026-11-11-stocks-lost-habit-events-and-just-have-
 /// sex-design.md §2.1): she gets lost only on a trip; she misses a ride on
 /// any trip, a business trip included (spec 2026-11-11-outdoorsy-missed-
-/// ride-and-accept-ends-incident-design.md §3).
+/// ride-and-accept-ends-incident-design.md §3), and is on her way or on the
+/// road only then (spec 2026-11-16-prune-life-events-design.md §4.2).
 fn needs_background(kind: EventKind) -> Option<&'static [EventKind]> {
     use EventKind::*;
     match kind {
         GotLost => Some(&[ShortTrip, LongTrip, HometownVisit, TravelingTogether]),
-        MissedRide => Some(&[
+        MissedRide | OnTheWay | OnTheRoad => Some(&[
             BusinessTrip,
             ShortTrip,
             LongTrip,
@@ -1305,7 +1308,6 @@ mod tests {
             HitSomeone,
             GotHit,
             WorkingOut,
-            OnTheWay,
             GotBumped,
         ];
         for bg in [Hospitalized, PostSurgery] {
@@ -1586,8 +1588,8 @@ mod tests {
 
     /// Every kind in `earlier()`, rung 3, a female persona, no needs:
     /// categories short 5, mid 4, body 0.5, trip 0.5 (10); within short
-    /// police 1, animal 3, hit 0.5, desire 2, showering 2, bathing 1,
-    /// on_the_way 2 (11.5).
+    /// police 1, animal 3, hit 0.5, desire 2, showering 2, bathing 1 (9.5);
+    /// on_the_way needs a trip.
     #[test]
     fn the_stages_pick_by_cumulative_weight() {
         let allowed = earlier();
@@ -1600,7 +1602,7 @@ mod tests {
         assert_eq!(at(0.95 - E, 0.0).category(), EventCategory::Body);
         assert_eq!(at(0.95 + E, 0.0), BusinessTrip);
         assert_eq!(at(1.0, 1.0), HometownVisit);
-        let b = |w: f64| w / 11.5;
+        let b = |w: f64| w / 9.5;
         assert_eq!(at(0.0, b(1.0) - E), PoliceEncounter);
         assert_eq!(at(0.0, b(1.0) + E), AnimalEncounter);
         assert_eq!(at(0.0, b(4.0) - E), AnimalEncounter);
@@ -1610,8 +1612,7 @@ mod tests {
         assert_eq!(at(0.0, b(6.5) - E), SuddenDesire);
         assert_eq!(at(0.0, b(6.5) + E), Showering);
         assert_eq!(at(0.0, b(8.5) + E), Bathing);
-        assert_eq!(at(0.0, b(9.5) + E), OnTheWay);
-        assert_eq!(at(0.0, 1.0), OnTheWay);
+        assert_eq!(at(0.0, 1.0), Bathing);
     }
 
     #[test]
@@ -1647,7 +1648,6 @@ mod tests {
         assert_eq!(lasts(LongTrip, 1.0 - E), Duration::hours(168));
         assert_eq!(lasts(LongTrip, 1.0), Duration::hours(168));
         assert_eq!(lasts(Showering, 0.9), Duration::minutes(30));
-        assert_eq!(lasts(OnTheWay, 0.0), Duration::minutes(30));
     }
 
     #[test]
@@ -2742,8 +2742,9 @@ mod tests {
         assert_eq!(Setting::parse("space"), None);
     }
 
-    /// Spec 2026-11-08-strip-and-world-setting-design.md §4.
-    const MODERN_ONLY: [EventKind; 8] = [
+    /// Spec 2026-11-08-strip-and-world-setting-design.md §4; spec
+    /// 2026-11-16-prune-life-events-design.md §4.3.
+    const MODERN_ONLY: [EventKind; 10] = [
         PoliceEncounter,
         Showering,
         TakingSelfie,
@@ -2752,6 +2753,8 @@ mod tests {
         BusinessTrip,
         Hospitalized,
         PostSurgery,
+        TempWork,
+        ScoldedSuperior,
     ];
 
     #[test]
@@ -2783,6 +2786,17 @@ mod tests {
         for r in [0.0, 0.5, 0.99] {
             assert_eq!(
                 pick_with(&fan, None, 3, &[], &[Gaming, Reading], rolls(r, r)),
+                Some(Reading),
+                "{r}"
+            );
+        }
+        let worker = PersonaTraits {
+            prefer_events: vec![TempWork],
+            ..fan
+        };
+        for r in [0.0, 0.5, 0.99] {
+            assert_eq!(
+                pick_with(&worker, None, 3, &[], &[TempWork, Reading], rolls(r, r)),
                 Some(Reading),
                 "{r}"
             );
@@ -3027,7 +3041,7 @@ mod tests {
     /// factor reaches the draw.
     #[test]
     fn an_outdoor_persona_leans_outdoors() {
-        let only = [Reading, OnTheRoad];
+        let only = [Reading, WantToGoOut];
         let roll = rolls(0.0, 0.45);
         let at = |p: &PersonaTraits| pick_with(p, None, 1, &[], &only, roll);
         assert_eq!(at(&PersonaTraits::default()), Some(Reading));
@@ -3035,7 +3049,7 @@ mod tests {
             outdoorsy: Outdoorsy::Outdoor,
             ..Default::default()
         };
-        assert_eq!(at(&out), Some(OnTheRoad));
+        assert_eq!(at(&out), Some(WantToGoOut));
     }
 
     fn with_employed(employed: Employment) -> PersonaTraits {
@@ -3268,6 +3282,32 @@ mod tests {
             assert_eq!(EventKind::parse(name), None, "{name}");
         }
         assert_eq!(EventKind::ALL.len(), 63);
+    }
+
+    /// Spec 2026-11-16-prune-life-events-design.md §4.2.
+    #[test]
+    fn the_commute_kinds_come_up_only_on_a_trip() {
+        let p = PersonaTraits::default();
+        for k in [OnTheWay, OnTheRoad] {
+            let at = |history: &[PastEvent]| pick_with(&p, None, 1, history, &[k], rolls(0.0, 0.0));
+            assert_eq!(at(&[]), None, "{k:?} no background");
+            for bg in [
+                BusinessTrip,
+                ShortTrip,
+                LongTrip,
+                HometownVisit,
+                TravelingTogether,
+            ] {
+                assert_eq!(at(&[past(bg, 1, 48)]), Some(k), "{k:?} {bg:?}");
+            }
+            assert_eq!(at(&[past(Sick, 1, 48)]), None, "{k:?} not a trip");
+            // Ended an hour ago: inside the follow window, still not drawn.
+            assert_eq!(
+                at(&[past(BusinessTrip, 25, 24)]),
+                None,
+                "{k:?} the trip is over"
+            );
+        }
     }
 
     #[test]
