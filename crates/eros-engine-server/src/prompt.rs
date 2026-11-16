@@ -976,15 +976,12 @@ pub(crate) fn event_label(kind: eros_engine_core::events::EventKind) -> &'static
         AnimalEncounter => "路上遇到小动物",
         HitSomeone => "打人了",
         SuddenDesire => "突然很想要",
-        GroceryShopping => "买菜",
         Showering => "洗澡中",
         Bathing => "泡澡中",
-        InClass => "上课中",
         OnTheWay => "赶路中",
         PeriodScare => "月经没来",
         PregnancyScare => "验出怀孕",
         GotBumped => "被撞了",
-        BumpedSomeone => "撞人了",
         Quarrel => "吵架了",
         ScoldedBySuperior => "被上级骂了",
         ScoldedSuperior => "骂上级了",
@@ -995,7 +992,6 @@ pub(crate) fn event_label(kind: eros_engine_core::events::EventKind) -> &'static
         TakingSelfie => "刚拍了张自拍",
         TempWork => "临时接到工作",
         ExMessage => "前任发来消息",
-        WeatherChange => "天气突然变了",
         GotHit => "被打了",
         Breakup => "刚分手",
         WorkingOut => "在健身",
@@ -1011,7 +1007,6 @@ pub(crate) fn event_label(kind: eros_engine_core::events::EventKind) -> &'static
         BrosGathering => "兄弟聚会",
         SisGathering => "姐妹聚会",
         OnTheRoad => "在路上",
-        WatchingMatch => "在看比赛",
         WatchingShow => "在看表演",
         HavingSex => "在做爱",
         WantToGoOut => "想出门",
@@ -1038,8 +1033,6 @@ pub(crate) fn event_label(kind: eros_engine_core::events::EventKind) -> &'static
         WantToSeeSea => "想去看海",
         WantHotSpring => "想去泡温泉",
         WantSauna => "想去洗桑拿",
-        WatchingStocks => "在看股票",
-        Trading => "在交易",
         GotLost => "迷路了",
         Drinking => "在喝酒",
         Smoking => "在抽烟",
@@ -4789,10 +4782,10 @@ mod tests {
             "路上遇到小动物（不到 1 小时后结束）"
         );
         // Rounded to whole hours: 89 minutes → 1, 151 minutes → 3.
-        let c = only(event_at(EventKind::WeatherChange, 89, 151));
+        let c = only(event_at(EventKind::TempWork, 89, 151));
         assert_eq!(
             events_judge_text(&c, None, None, None, None).unwrap(),
-            "天气突然变了（1 小时前开始，约 3 小时后结束）"
+            "临时接到工作（1 小时前开始，约 3 小时后结束）"
         );
         for (kind, label) in [
             (EventKind::ExMessage, "前任发来消息"),
@@ -4841,7 +4834,6 @@ mod tests {
             (AdmiringArt, "在看展"),
             (TakingSelfie, "刚拍了张自拍"),
             (OnTheRoad, "在路上"),
-            (WatchingMatch, "在看比赛"),
             (WatchingShow, "在看表演"),
             (HavingSex, "在做爱"),
         ] {
@@ -5188,15 +5180,12 @@ mod tests {
                 "路上遇到小动物",
                 "打人了",
                 "突然很想要",
-                "买菜",
                 "洗澡中",
                 "泡澡中",
-                "上课中",
                 "赶路中",
                 "月经没来",
                 "验出怀孕",
                 "被撞了",
-                "撞人了",
                 "吵架了",
                 "被上级骂了",
                 "骂上级了",
@@ -5207,7 +5196,6 @@ mod tests {
                 "刚拍了张自拍",
                 "临时接到工作",
                 "前任发来消息",
-                "天气突然变了",
                 "被打了",
                 "刚分手",
                 "在健身",
@@ -5223,7 +5211,6 @@ mod tests {
                 "兄弟聚会",
                 "姐妹聚会",
                 "在路上",
-                "在看比赛",
                 "在看表演",
                 "在做爱",
                 "想出门",
@@ -5245,8 +5232,6 @@ mod tests {
                 "想去看海",
                 "想去泡温泉",
                 "想去洗桑拿",
-                "在看股票",
-                "在交易",
                 "迷路了",
                 "在喝酒",
                 "在抽烟",
@@ -5414,6 +5399,16 @@ mod tests {
         assert_eq!(persona_traits(&p), PersonaTraits::default());
     }
 
+    #[test]
+    fn persona_traits_drop_a_deleted_kind_from_prefer_events() {
+        use eros_engine_core::events::EventKind;
+        let mut p = fixture_persona();
+        p.genome.art_metadata = serde_json::json!({
+            "prefer_events": ["watching_match", "reading", "weather_change"]
+        });
+        assert_eq!(persona_traits(&p).prefer_events, vec![EventKind::Reading]);
+    }
+
     fn prompt_with_event(needs: Option<&str>, event: Option<&str>) -> String {
         let lines = event.map(|s| EventLines {
             under_way: Some(s.into()),
@@ -5566,9 +5561,9 @@ mod tests {
         let state = p.find("[character_state]").expect(&p);
         let needs = p.find("- 此刻的需要：想找人说说话").expect(&p);
         assert!(state < needs && needs < now, "{p}");
-        let alone = prompt_with_event(None, Some("天气突然变了（约 3 小时后结束）"));
+        let alone = prompt_with_event(None, Some("在看书（约 3 小时后结束）"));
         assert!(!alone.contains("[character_state]"), "{alone}");
-        assert!(alone.contains("- 正在经历：天气突然变了"), "{alone}");
+        assert!(alone.contains("- 正在经历：在看书"), "{alone}");
         assert_eq!(
             prompt_with_event(None, Some(" ")),
             prompt_with_event(None, None)

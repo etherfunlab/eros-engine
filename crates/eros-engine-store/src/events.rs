@@ -784,7 +784,7 @@ mod tests {
                         i,
                         s,
                         "rain",
-                        WeatherChange,
+                        TempWork,
                         "2026-10-01T12:00:00Z",
                         "2026-10-01T16:00:00Z"
                     ),
@@ -801,7 +801,7 @@ mod tests {
                     i,
                     s,
                     "rain2",
-                    WeatherChange,
+                    TempWork,
                     "2026-10-01T15:00:00Z",
                     "2026-10-01T19:00:00Z"
                 ),
@@ -959,7 +959,7 @@ mod tests {
                     i,
                     s,
                     "rain",
-                    WeatherChange,
+                    TempWork,
                     "2026-10-01T11:00:00Z",
                     "2026-10-01T15:00:00Z"
                 ),
@@ -1118,6 +1118,27 @@ mod tests {
             repo.recent(i, t("2026-10-01T00:00:00Z")).await.unwrap(),
             vec![e2, e1]
         );
+    }
+
+    /// Spec 2026-11-16-prune-life-events-design.md §4.1: a row of a deleted
+    /// kind under way at the upgrade reads as no event.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn current_skips_a_row_of_a_deleted_kind(pool: PgPool) {
+        let (_, i, s) = instance_and_session(&pool).await;
+        sqlx::query(
+            "INSERT INTO engine.persona_events (instance_id, session_id, event_key, kind, started_at, ends_at) \
+             VALUES ($1, $2, 'w', 'weather_change', '2026-10-01T08:00:00Z', '2026-10-01T12:00:00Z')",
+        )
+        .bind(i)
+        .bind(s)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let now = EventRepo { pool: &pool }
+            .current(i, None, t("2026-10-01T09:00:00Z"))
+            .await
+            .unwrap();
+        assert!(now.foreground.is_none() && now.background.is_none());
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -2145,7 +2166,7 @@ mod tests {
                 i,
                 s,
                 "w",
-                WeatherChange,
+                TempWork,
                 "2026-10-01T10:00:00Z",
                 "2026-10-01T11:00:00Z",
             ),

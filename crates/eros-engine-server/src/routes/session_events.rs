@@ -60,15 +60,12 @@ pub enum EventKindDto {
     AnimalEncounter,
     HitSomeone,
     SuddenDesire,
-    GroceryShopping,
     Showering,
     Bathing,
-    InClass,
     OnTheWay,
     PeriodScare,
     PregnancyScare,
     GotBumped,
-    BumpedSomeone,
     Quarrel,
     ScoldedBySuperior,
     ScoldedSuperior,
@@ -79,7 +76,6 @@ pub enum EventKindDto {
     TakingSelfie,
     TempWork,
     ExMessage,
-    WeatherChange,
     GotHit,
     Breakup,
     WorkingOut,
@@ -95,7 +91,6 @@ pub enum EventKindDto {
     BrosGathering,
     SisGathering,
     OnTheRoad,
-    WatchingMatch,
     WatchingShow,
     HavingSex,
     WantToGoOut,
@@ -122,8 +117,6 @@ pub enum EventKindDto {
     WantSauna,
     BathingTogether,
     OnADate,
-    WatchingStocks,
-    Trading,
     GotLost,
     Drinking,
     Smoking,
@@ -156,15 +149,12 @@ impl From<EventKindDto> for EventKind {
             EventKindDto::AnimalEncounter => EventKind::AnimalEncounter,
             EventKindDto::HitSomeone => EventKind::HitSomeone,
             EventKindDto::SuddenDesire => EventKind::SuddenDesire,
-            EventKindDto::GroceryShopping => EventKind::GroceryShopping,
             EventKindDto::Showering => EventKind::Showering,
             EventKindDto::Bathing => EventKind::Bathing,
-            EventKindDto::InClass => EventKind::InClass,
             EventKindDto::OnTheWay => EventKind::OnTheWay,
             EventKindDto::PeriodScare => EventKind::PeriodScare,
             EventKindDto::PregnancyScare => EventKind::PregnancyScare,
             EventKindDto::GotBumped => EventKind::GotBumped,
-            EventKindDto::BumpedSomeone => EventKind::BumpedSomeone,
             EventKindDto::Quarrel => EventKind::Quarrel,
             EventKindDto::ScoldedBySuperior => EventKind::ScoldedBySuperior,
             EventKindDto::ScoldedSuperior => EventKind::ScoldedSuperior,
@@ -172,7 +162,6 @@ impl From<EventKindDto> for EventKind {
             EventKindDto::SawClothes => EventKind::SawClothes,
             EventKindDto::TempWork => EventKind::TempWork,
             EventKindDto::ExMessage => EventKind::ExMessage,
-            EventKindDto::WeatherChange => EventKind::WeatherChange,
             EventKindDto::GotHit => EventKind::GotHit,
             EventKindDto::Breakup => EventKind::Breakup,
             EventKindDto::WorkingOut => EventKind::WorkingOut,
@@ -191,7 +180,6 @@ impl From<EventKindDto> for EventKind {
             EventKindDto::AdmiringArt => EventKind::AdmiringArt,
             EventKindDto::TakingSelfie => EventKind::TakingSelfie,
             EventKindDto::OnTheRoad => EventKind::OnTheRoad,
-            EventKindDto::WatchingMatch => EventKind::WatchingMatch,
             EventKindDto::WatchingShow => EventKind::WatchingShow,
             EventKindDto::HavingSex => EventKind::HavingSex,
             EventKindDto::WantToGoOut => EventKind::WantToGoOut,
@@ -218,8 +206,6 @@ impl From<EventKindDto> for EventKind {
             EventKindDto::WantSauna => EventKind::WantSauna,
             EventKindDto::BathingTogether => EventKind::BathingTogether,
             EventKindDto::OnADate => EventKind::OnADate,
-            EventKindDto::WatchingStocks => EventKind::WatchingStocks,
-            EventKindDto::Trading => EventKind::Trading,
             EventKindDto::GotLost => EventKind::GotLost,
             EventKindDto::Drinking => EventKind::Drinking,
             EventKindDto::Smoking => EventKind::Smoking,
@@ -238,15 +224,12 @@ impl From<EventKind> for EventKindDto {
             EventKind::AnimalEncounter => EventKindDto::AnimalEncounter,
             EventKind::HitSomeone => EventKindDto::HitSomeone,
             EventKind::SuddenDesire => EventKindDto::SuddenDesire,
-            EventKind::GroceryShopping => EventKindDto::GroceryShopping,
             EventKind::Showering => EventKindDto::Showering,
             EventKind::Bathing => EventKindDto::Bathing,
-            EventKind::InClass => EventKindDto::InClass,
             EventKind::OnTheWay => EventKindDto::OnTheWay,
             EventKind::PeriodScare => EventKindDto::PeriodScare,
             EventKind::PregnancyScare => EventKindDto::PregnancyScare,
             EventKind::GotBumped => EventKindDto::GotBumped,
-            EventKind::BumpedSomeone => EventKindDto::BumpedSomeone,
             EventKind::Quarrel => EventKindDto::Quarrel,
             EventKind::ScoldedBySuperior => EventKindDto::ScoldedBySuperior,
             EventKind::ScoldedSuperior => EventKindDto::ScoldedSuperior,
@@ -254,7 +237,6 @@ impl From<EventKind> for EventKindDto {
             EventKind::SawClothes => EventKindDto::SawClothes,
             EventKind::TempWork => EventKindDto::TempWork,
             EventKind::ExMessage => EventKindDto::ExMessage,
-            EventKind::WeatherChange => EventKindDto::WeatherChange,
             EventKind::GotHit => EventKindDto::GotHit,
             EventKind::Breakup => EventKindDto::Breakup,
             EventKind::WorkingOut => EventKindDto::WorkingOut,
@@ -273,7 +255,6 @@ impl From<EventKind> for EventKindDto {
             EventKind::AdmiringArt => EventKindDto::AdmiringArt,
             EventKind::TakingSelfie => EventKindDto::TakingSelfie,
             EventKind::OnTheRoad => EventKindDto::OnTheRoad,
-            EventKind::WatchingMatch => EventKindDto::WatchingMatch,
             EventKind::WatchingShow => EventKindDto::WatchingShow,
             EventKind::HavingSex => EventKindDto::HavingSex,
             EventKind::WantToGoOut => EventKindDto::WantToGoOut,
@@ -300,8 +281,6 @@ impl From<EventKind> for EventKindDto {
             EventKind::WantSauna => EventKindDto::WantSauna,
             EventKind::BathingTogether => EventKindDto::BathingTogether,
             EventKind::OnADate => EventKindDto::OnADate,
-            EventKind::WatchingStocks => EventKindDto::WatchingStocks,
-            EventKind::Trading => EventKindDto::Trading,
             EventKind::GotLost => EventKindDto::GotLost,
             EventKind::Drinking => EventKindDto::Drinking,
             EventKind::Smoking => EventKindDto::Smoking,
@@ -1167,8 +1146,8 @@ mod tests {
         read_sse(resp).await
     }
 
-    fn weather(key: &str) -> DrawEventRequest {
-        req(key, Some(vec![EventKindDto::WeatherChange]))
+    fn temp_work(key: &str) -> DrawEventRequest {
+        req(key, Some(vec![EventKindDto::TempWork]))
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -1179,13 +1158,13 @@ mod tests {
         mount_streamed(&mock, &["外面突然", "下大雨了"]).await;
         let state = with_companion(test_state(pool.clone()), &mock.uri());
 
-        let frames = stream_frames(&state, session_id, user_id, weather("k1"), 0.1).await;
+        let frames = stream_frames(&state, session_id, user_id, temp_work("k1"), 0.1).await;
         assert_eq!(
             frame_types(&frames),
             ["event", "meta", "delta", "delta", "done", "final"]
         );
         let event = &frames[0]["event"];
-        assert_eq!(event["kind"], "weather_change");
+        assert_eq!(event["kind"], "temp_work");
         let announced: Uuid = event["message_id"].as_str().unwrap().parse().unwrap();
         assert_eq!(
             frames[1]["message_id"],
@@ -1248,7 +1227,7 @@ mod tests {
         .unwrap();
         let state = test_state(pool.clone());
 
-        let frames = stream_frames(&state, session_id, user_id, weather("k1"), 0.5).await;
+        let frames = stream_frames(&state, session_id, user_id, temp_work("k1"), 0.5).await;
         assert_eq!(frame_types(&frames), ["event", "final"]);
         assert!(frames[0]["event"].is_null());
     }
@@ -1261,8 +1240,8 @@ mod tests {
         mount_streamed(&mock, &["外面突然", "下大雨了"]).await;
         let state = with_companion(test_state(pool.clone()), &mock.uri());
 
-        let first = stream_frames(&state, session_id, user_id, weather("same"), 0.1).await;
-        let again = stream_frames(&state, session_id, user_id, weather("same"), 0.9).await;
+        let first = stream_frames(&state, session_id, user_id, temp_work("same"), 0.1).await;
+        let again = stream_frames(&state, session_id, user_id, temp_work("same"), 0.9).await;
         assert_eq!(
             frame_types(&again),
             ["event", "meta", "delta", "done", "final"]
@@ -1321,7 +1300,7 @@ mod tests {
             .await;
         let state = with_companion(test_state(pool.clone()), &mock.uri());
 
-        let frames = stream_frames(&state, session_id, user_id, weather("k1"), 0.1).await;
+        let frames = stream_frames(&state, session_id, user_id, temp_work("k1"), 0.1).await;
         assert_eq!(frame_types(&frames), ["event", "meta", "delta", "error"]);
         assert!(frames[0]["event"]["message_id"].is_string());
         assert_eq!(event_count(&pool, session_id).await, 0);
@@ -1336,7 +1315,7 @@ mod tests {
         mount_streamed(&mock, &["  "]).await;
         let state = with_companion(test_state(pool.clone()), &mock.uri());
 
-        let frames = stream_frames(&state, session_id, user_id, weather("k1"), 0.1).await;
+        let frames = stream_frames(&state, session_id, user_id, temp_work("k1"), 0.1).await;
         assert_eq!(frame_types(&frames), ["event", "final"]);
         assert!(
             frames[0]["event"]["message_id"].is_string(),
@@ -1433,7 +1412,7 @@ mod tests {
         let mock = MockServer::start().await;
         mount_companion(&mock, "外面突然下大雨了").await;
         let state = with_companion(test_state(pool.clone()), &mock.uri());
-        let kinds = Some(vec![EventKindDto::WeatherChange]);
+        let kinds = Some(vec![EventKindDto::TempWork]);
         let first = draw_event_at(
             &state,
             session_id,
@@ -1534,8 +1513,8 @@ mod tests {
     async fn a_kind_in_cooldown_is_not_drawn(pool: PgPool) {
         let user_id = Uuid::new_v4();
         let (instance_id, session_id) = setup(&pool, user_id).await;
-        // A weather change that started 5 hours ago and ended an hour ago:
-        // over, but still inside its 8-hour cooldown.
+        // A temp job that started 5 hours ago and ended an hour ago: over,
+        // but still inside its 24-hour cooldown.
         let started = Utc::now() - chrono::Duration::hours(5);
         eros_engine_store::events::EventRepo { pool: &pool }
             .insert(
@@ -1543,7 +1522,7 @@ mod tests {
                     instance_id,
                     session_id,
                     event_key: "old",
-                    kind: EventKind::WeatherChange,
+                    kind: EventKind::TempWork,
                     started_at: started,
                     ends_at: started + chrono::Duration::hours(4),
                 },
@@ -1559,7 +1538,7 @@ mod tests {
             &state,
             session_id,
             user_id,
-            req("k1", Some(vec![EventKindDto::WeatherChange])),
+            req("k1", Some(vec![EventKindDto::TempWork])),
             Utc::now(),
             rolls(0.1),
         )
@@ -2022,7 +2001,7 @@ mod tests {
             &state,
             session_id,
             user_id,
-            req("k1", Some(vec![EventKindDto::WeatherChange])),
+            req("k1", Some(vec![EventKindDto::TempWork])),
             Utc::now(),
             rolls(0.5),
         )
@@ -2030,7 +2009,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             out.event.map(|e| e.kind),
-            Some(EventKindDto::WeatherChange),
+            Some(EventKindDto::TempWork),
             "a fresh session still draws the kinds that tell a message"
         );
     }
@@ -2493,6 +2472,25 @@ mod tests {
                 .is_err(),
                 "{kinds}"
             );
+        }
+    }
+
+    #[test]
+    fn a_deleted_kind_in_kinds_is_unknown() {
+        for name in ["grocery_shopping", "weather_change", "watching_match"] {
+            for kinds in [
+                json!([name]),
+                json!({"allow": [name]}),
+                json!({"disallow": [name]}),
+            ] {
+                assert!(
+                    serde_json::from_value::<DrawEventRequest>(
+                        json!({"event_key": "k", "kinds": kinds})
+                    )
+                    .is_err(),
+                    "{kinds}"
+                );
+            }
         }
     }
 
@@ -3479,7 +3477,7 @@ mod tests {
         let mock = MockServer::start().await;
         mount_companion(&mock, "下雨了").await;
         let state = with_tones(with_companion(test_state(pool.clone()), &mock.uri()));
-        draw_one(&state, session_id, user_id, EventKindDto::WeatherChange).await;
+        draw_one(&state, session_id, user_id, EventKindDto::TempWork).await;
 
         assert!(companion_messages(&mock).await.len() > 2);
         assert_eq!(event_tone(&pool, session_id).await, None);
