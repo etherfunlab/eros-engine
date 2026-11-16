@@ -216,7 +216,7 @@ the judge sees the levels and decides.
 
 ### Categories
 
-An event is one of 70 drawable kinds. Each kind belongs to a category, and the category sets its
+An event is one of 63 drawable kinds. Each kind belongs to a category, and the category sets its
 shape:
 
 | `category` | shape | lasts | category weight | category cooldown |
@@ -255,7 +255,7 @@ The draw is a pure function of the inputs plus three random numbers (one per sta
 the length).
 
 1. **Eligibility.** A kind is eligible when all of these hold:
-   - the caller's `kinds` allows it ([below](#the-callers-kinds); absent means all 70);
+   - the caller's `kinds` allows it ([below](#the-callers-kinds); absent means all 63);
    - it passes its gate (below);
    - its own cooldown has elapsed;
    - its category's cooldown has elapsed;
@@ -289,17 +289,16 @@ eligible kind drops out of the first stage and the others share its weight.
 - While a background is under way, no second background is drawn. Incidents still are, except
   that during `hospitalized` and `post_surgery` the ones that need her out and about are not:
   `temp_work`, `police_encounter`, `animal_encounter`, `hit_someone`, `got_hit`,
-  `working_out`, `grocery_shopping`, `in_class`, `on_the_way`, `in_battle`, `got_bumped`,
-  `bumped_someone`, `saw_bag`, `saw_clothes`, `out_shopping`, `bros_gathering`,
-  `sis_gathering`, `admiring_scenery`, `admiring_art`, `watching_show`, `on_the_road`,
-  `having_sex`, `bird_encounter`, `streaking`, `got_lost`, `trading`, `drinking`, `smoking`,
-  `smoking_weed`, `just_have_sex`. During `period`,
+  `working_out`, `on_the_way`, `in_battle`, `got_bumped`, `saw_bag`, `saw_clothes`,
+  `out_shopping`, `bros_gathering`, `sis_gathering`, `admiring_scenery`, `admiring_art`,
+  `watching_show`, `on_the_road`, `having_sex`, `bird_encounter`, `streaking`, `got_lost`,
+  `drinking`, `smoking`, `smoking_weed`, `just_have_sex`. During `period`,
   `period_scare` and `pregnancy_scare` are not drawn. During `traveling_together` no kind that
   can take her offline is drawn, nor `just_have_sex`: she is with the user.
-- Two kinds need a background rather than being ruled out by one. `got_lost` is drawn only while
+- Four kinds need a background rather than being ruled out by one. `got_lost` is drawn only while
   a `short_trip`, `long_trip`, `hometown_visit` or `traveling_together` is under way, never on a
-  `business_trip` or outside a trip. `missed_ride` is drawn only while one of those or a
-  `business_trip` is under way.
+  `business_trip` or outside a trip. `missed_ride`, `on_the_way` and `on_the_road` are drawn only
+  while one of those or a `business_trip` is under way.
 - One incident and one background can run together. An incident drawn inside a background is
   told from inside it.
 - While she waits for the user's answer to one of her life choices, no draw happens either, in any
@@ -318,7 +317,7 @@ is under way, and a background is not written while any event is.
 ### Cooldowns and caps
 
 - **Per kind.** A kind cannot start again until its cooldown has elapsed since its newest event
-  started, not ended. Cooldowns run from 8 hours (`weather_change`) up; the heavy kinds are
+  started, not ended. Cooldowns run from 12 hours (`showering`, `reading` and others) up; the heavy kinds are
   long (`hit_someone` 14 days, `breakup` 30, `hospitalized` 60, `post_surgery` 90). The four
   `trip` kinds have none of their own; the category cooldown covers them.
 - **Per category.** `body` cannot start more than once a fortnight and `trip` more than once
@@ -394,7 +393,7 @@ persona by its author, as every other persona fact. `sex_addict` reaches no prom
 
 `hygienic`, `employed` and `outdoorsy` reach no prompt and are not habits: they do not move `indulgence`.
 `hygienic` is its own factor, so it multiplies with a needs factor on the same kind. `employed`
-leaves `in_class`, `busy` and `in_battle` alone, and changes no cooldown or length.
+leaves `busy` and `in_battle` alone, and changes no cooldown or length.
 
 #### Outdoors or in
 
@@ -403,8 +402,8 @@ means out in the open air: a shop, a class, an office or a gallery is not outdoo
 
 | place | `short` | `mid` |
 |---|---|---|
-| outdoor | `police_encounter`, `animal_encounter`, `on_the_way`, `got_bumped`, `bumped_someone`, `admiring_scenery`, `bird_encounter`, `want_to_see_sea`, `want_hot_spring`, `got_lost`, `missed_ride` | `on_the_road`, `want_to_go_out` |
-| indoor | `showering`, `bathing`, `in_class`, `scolded_by_superior`, `scolded_superior`, `admiring_art`, `want_sauna`, `watching_stocks` | `reading`, `gaming`, `want_to_go_home` |
+| outdoor | `police_encounter`, `animal_encounter`, `on_the_way`, `got_bumped`, `admiring_scenery`, `bird_encounter`, `want_to_see_sea`, `want_hot_spring`, `got_lost`, `missed_ride` | `on_the_road`, `want_to_go_out` |
+| indoor | `showering`, `bathing`, `scolded_by_superior`, `scolded_superior`, `admiring_art`, `want_sauna` | `reading`, `gaming`, `want_to_go_home` |
 | neutral | every other `short` kind, the sex kinds and `streaking` among them | every other `mid` kind |
 
 Every kind that can take her offline (`asleep`, `in_battle`, `busy`, `away_from_phone`,
@@ -420,7 +419,7 @@ holds.
 
 The five habit keys reach the draw through the drift of `indulgence`, and three of them
 (`smoking`, `alcoholic`, `drug`) also gate the habit kinds
-([below](#the-market-getting-lost-her-habits-and-sex)). The judge's
+([below](#getting-lost-her-habits-and-sex)). The judge's
 persona block (`[角色人格]`) does not list them, so she does not bring up tobacco, alcohol,
 weed, coffee or food at every turn; a persona whose habits should colour her talk says so in her persona text. The engine
 never writes them.
@@ -462,7 +461,7 @@ the first stage, and does not shorten a cooldown.
 | `hospitalized`, `post_surgery` | `reading`, `gaming` |
 | `period` | `irritable`, `unwell` |
 | `breakup`, `quarrel`, `scolded_by_superior`, `in_battle` | `irritable` |
-| `got_hit`, `got_bumped`, `weather_change` | `unwell` |
+| `got_hit`, `got_bumped` | `unwell` |
 | `working_out` | `showering`, `bathing` |
 | `ex_message`, `breakup` | `ex_wants_back` |
 | `scolded_by_superior`, `temp_work` | `want_to_quit_job` |
@@ -483,7 +482,7 @@ policy, rules a kind out without the engine losing it.
 
 | `kinds` | kinds that may be drawn |
 |---|---|
-| absent or `null` | all 70 |
+| absent or `null` | all 63 |
 | `[]` | none: the response is `{"event": null, "message": null}` |
 | `["reading", "quarrel"]` | the listed ones |
 | `{"allow": […], "disallow": […]}` | what `allow` allows, minus what `disallow` lists |
@@ -797,16 +796,16 @@ character.
 
 ### Sights, shows and a selfie
 
-Six told incidents give her an afternoon the user hears about: `admiring_scenery` and
+Five told incidents give her an afternoon the user hears about: `admiring_scenery` and
 `admiring_art` (`short`, 1 h), `taking_selfie` (`short`, 30 min), `on_the_road` (`mid`, 2 to
-4 h: a long commute, a coach, a train, a flight; `on_the_way` stays the 30-minute errand),
-`watching_match` and `watching_show` (`mid`, 2 to 3 h). She keeps replying through all of
+4 h: a long commute, a coach, a train, a flight; `on_the_way` stays the 30-minute errand; both
+only on a trip) and `watching_show` (`mid`, 2 to 3 h). She keeps replying through all of
 them. The cue states the fact and the details are hers: which view, which piece, which
-sport, which vehicle. When the request carries `image` and the deployment configures the
+show, which vehicle. When the request carries `image` and the deployment configures the
 composer, a `taking_selfie` message carries the selfie: her words come first and the composer
 draws from them (see [api-reference](api-reference.md#post-v2compsessionsession_idevents));
-otherwise it is words only. `watching_match` and `taking_selfie` are drawn in hospital; the other
-four need her out and about.
+otherwise it is words only. `taking_selfie` is drawn in hospital; the other four need her out
+and about.
 
 ### She undresses for you
 
@@ -847,15 +846,13 @@ she meets no bird and does not streak; the wants and the thoughts come there too
 `streaking` carries adult themes, like `strip`: `sex_addict` scales it as it scales
 `sudden_desire`, and a caller that serves those only to some users disallows it.
 
-### The market, getting lost, her habits and sex
+### Getting lost, her habits and sex
 
-Eight more told incidents. All are `short`; none takes her offline or carries a picture, and
-all but `watching_stocks` fit both worlds ([below](#her-world)):
+Six more told incidents. All are `short`; none takes her offline or carries a picture, and all
+fit both worlds ([below](#her-world)):
 
 | kind | label | category | weight | cooldown | lasts | gate | cue |
 |---|---|---|---|---|---|---|---|
-| `watching_stocks` | 在看股票 | `short` | 2 | 24 h | 30 min | none (`modern` only) | `（你正在看股票行情。）` |
-| `trading` | 在交易 | `short` | 1 | 24 h | 1 h | none | `（你正在和人谈一笔买卖。）` |
 | `got_lost` | 迷路了 | `short` | 3 | 48 h | 1 h | a `short_trip`, `long_trip`, `hometown_visit` or `traveling_together` under way | `（你刚迷了路，找不到要去的地方。）`; during `traveling_together`, `（你们一起出来玩，刚迷了路。）` |
 | `drinking` | 在喝酒 | `short` | 2 | 12 h | 30 min | `alcoholic` is `true` | `（你正在喝酒。）` |
 | `smoking` | 在抽烟 | `short` | 2 | 12 h | 30 min | `smoking` is `true` | `（你正在抽烟。）` |
@@ -863,8 +860,7 @@ all but `watching_stocks` fit both worlds ([below](#her-world)):
 | `just_have_sex` | 刚做完爱 | `short` | 1 | 48 h | 30 min | intimacy rung 3 | `（你刚和人做完爱。）` |
 | `masturbating` | 自慰中 | `short` | 1 | 24 h | 30 min | `sex_addict` is `true`, and intimacy rung 3 | `（你正在自慰。）` |
 
-`trading` is making a deal with someone, not trading shares, so it fits a fantasy world too.
-`got_lost` is the one kind that needs a background ([above](#one-incident-and-one-background-at-a-time)):
+`got_lost` needs a background ([above](#one-incident-and-one-background-at-a-time)):
 on her own trips its cue opens with the trip's state, as any incident drawn during a background
 does (`（你正在短途旅行。你刚迷了路，找不到要去的地方。）`); on the trip with the user it is the
 two of them who are lost.
@@ -882,8 +878,8 @@ first row of either kind ends her virginity ([persona settings](#persona-setting
 pregnancy scare likelier, as `having_sex` does; sudden desire makes `masturbating` likelier
 too ([follow-on factors](#follow-on-factors)).
 
-In hospital or after surgery she does not trade, drink, smoke, smoke weed or have sex, and she
-is on no trip to get lost on; she can still watch the market and masturbate. On the trip with
+In hospital or after surgery she does not drink, smoke, smoke weed or have sex, and she is on
+no trip to get lost on; she can still masturbate. On the trip with
 the user she does not draw `just_have_sex`: she is away with the user.
 
 `just_have_sex` and `masturbating` carry adult themes; a caller that serves those only to some
@@ -906,7 +902,7 @@ persona, whatever the request's `kinds` or her `prefer_events` say:
 
 | fits | kinds |
 |---|---|
-| `modern` only | `police_encounter`, `showering`, `taking_selfie`, `gaming`, `watching_match`, `watching_show`, `business_trip`, `hospitalized`, `post_surgery`, `watching_stocks` |
+| `modern` only | `police_encounter`, `showering`, `taking_selfie`, `gaming`, `watching_show`, `business_trip`, `hospitalized`, `post_surgery`, `temp_work`, `scolded_superior` |
 | both | every other kind |
 
 No kind is `fantasy` only yet, so a `fantasy` persona draws from a smaller set and a persona with

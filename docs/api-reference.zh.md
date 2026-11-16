@@ -752,7 +752,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 任何一种都可能提前以终止帧 `error` 结束。
 
 ```text
-data: {"type":"event","event":{"kind":"weather_change","category":"mid","offline":false,"started_at":"2026-11-10T08:00:00Z","ends_at":"2026-11-10T12:00:00Z","message_id":"019a6c1e-7f3a-7c0e-9d51-2b8f4f0f6a11"}}
+data: {"type":"event","event":{"kind":"temp_work","category":"mid","offline":false,"started_at":"2026-11-10T08:00:00Z","ends_at":"2026-11-10T12:00:00Z","message_id":"019a6c1e-7f3a-7c0e-9d51-2b8f4f0f6a11"}}
 
 data: {"type":"meta","message_id":"01KA...","action_type":"proactive"}
 
@@ -869,7 +869,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 ```json
 {
   "event_key": "day-01J9ZK3",
-  "kinds": ["weather_change", "animal_encounter", "business_trip"],
+  "kinds": ["temp_work", "animal_encounter", "business_trip"],
   "user_timezone": "Asia/Taipei",
   "tier": "gold"
 }
@@ -891,15 +891,12 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | `short` | `animal_encounter` | 1 小时 | 路上遇到小动物 |
 | `short` | `hit_someone` | 1 小时 | 打人了 |
 | `short` | `sudden_desire` | 1 小时 | 突然很想要 |
-| `short` | `grocery_shopping` | 1 小时 | 买菜 |
 | `short` | `showering` | 30 分钟 | 洗澡中 |
 | `short` | `bathing` | 1 小时 | 泡澡中 |
-| `short` | `in_class` | 1 小时 | 上课中 |
-| `short` | `on_the_way` | 30 分钟 | 赶路中 |
+| `short` | `on_the_way` | 30 分钟 | 赶路中（只在旅行中，出差也算） |
 | `short` | `period_scare` | 1 小时 | 月经没来——虚惊一场 |
 | `short` | `pregnancy_scare` | 1 小时 | 验出怀孕——虚惊一场 |
 | `short` | `got_bumped` | 30 分钟 | 走路时被人或车擦撞到 |
-| `short` | `bumped_someone` | 30 分钟 | 不小心撞到人：走路时，或驾着她的交通工具——车、马、飞行，由她的世界决定 |
 | `short` | `quarrel` | 1 小时 | 跟人吵架了 |
 | `short` | `scolded_by_superior` | 1 小时 | 被上级骂了——老板、上司、领导、主人或君主，由她的世界决定 |
 | `short` | `scolded_superior` | 1 小时 | 骂了上级 |
@@ -917,8 +914,6 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | `short` | `want_to_see_sea` | 1 小时 | 想去看海 |
 | `short` | `want_hot_spring` | 1 小时 | 想去泡温泉 |
 | `short` | `want_sauna` | 1 小时 | 想去洗桑拿 |
-| `short` | `watching_stocks` | 30 分钟 | 在看股票 |
-| `short` | `trading` | 1 小时 | 在和人谈一笔买卖 |
 | `short` | `got_lost` | 1 小时 | 迷路了（只在旅行中，她自己的或和用户一起的） |
 | `short` | `drinking` | 30 分钟 | 在喝酒（`alcoholic` 为 `true` 的角色） |
 | `short` | `smoking` | 30 分钟 | 在抽烟（`smoking` 为 `true` 的角色） |
@@ -928,7 +923,6 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | `short` | `missed_ride` | 1 小时 | 没赶上车（只在旅行中，出差也算） |
 | `mid` | `temp_work` | 4 小时 | 临时接到工作 |
 | `mid` | `ex_message` | 3 小时 | 前任发来消息 |
-| `mid` | `weather_change` | 4 小时 | 天气突然变了 |
 | `mid` | `got_hit` | 4 小时 | 被打了 |
 | `mid` | `breakup` | 4 小时 | 刚分手 |
 | `mid` | `working_out` | 1–2 小时 | 在健身 |
@@ -943,8 +937,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | `mid` | `out_shopping` | 2–4 小时 | 在逛街（女性角色离线） |
 | `mid` | `bros_gathering` | 2–4 小时 | 兄弟聚会（离线） |
 | `mid` | `sis_gathering` | 2–4 小时 | 姐妹聚会（离线） |
-| `mid` | `on_the_road` | 2–4 小时 | 在路上：长途通勤、坐车、坐火车、坐飞机 |
-| `mid` | `watching_match` | 2–3 小时 | 在看比赛 |
+| `mid` | `on_the_road` | 2–4 小时 | 在路上：长途通勤、坐车、坐火车、坐飞机（只在旅行中，出差也算） |
 | `mid` | `watching_show` | 2–3 小时 | 在看表演 |
 | `mid` | `having_sex` | 1–2 小时 | 在做爱（性瘾角色；离线，从不讲出来） |
 | `mid` | `want_to_go_out` | 1–3 小时 | 很想出门 |
@@ -958,7 +951,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | `trip` | `long_trip` | 3–7 天 | 长途旅游 |
 | `trip` | `hometown_visit` | 72 小时 | 回老家 |
 
-时长写成区间的，在事件开始时从区间里抽定。以上共 70 种可抽取的种类。两种性别都会抽到两个聚会，权重相同，这是有意为之。
+时长写成区间的，在事件开始时从区间里抽定。以上共 63 种可抽取的种类。两种性别都会抽到两个聚会，权重相同，这是有意为之。
 
 另有五种永远不会被抽到：`taking_space`（她提出、用户同意的分开，12–24 小时，离线）、`fell_out`（用户不理会她提出的分开请求时的那场不愉快，1 小时）、`traveling_together`（她提议、用户同意的旅行，48–72 小时，`trip` 类背景，不离线）、`bathing_together`（她提议、用户同意的一起洗澡，30 分钟，`short` 类插曲，不离线）和 `on_a_date`（用户约她、她答应了的约会，1 或 4 小时，`short` 类插曲，不离线）。
 前四种由 engine 为[生活选择流程](#post-v2compsessionsession_idlife-choiceschoice_id)写入，`on_a_date` 为[约会](activities.zh.md)写入。它们作为 `…/effects` 里的 `event` 出现，前四种也作为生活选择响应里的 `event` 出现，
@@ -973,14 +966,14 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 
 - **两段抽取。** engine 先按权重抽类别，再在类别内按权重抽种类。往一个类别里加种类，不会改变其他类别的占比。
 - **一次一件插曲，一个背景。** 角色的任何一个 session 里有插曲在进行时，不再抽取。背景进行期间只抽插曲；
-  住院和术后期间，不抽需要她出门活动的那三十种（`temp_work`、`police_encounter`、`animal_encounter`、
-  `hit_someone`、`got_hit`、`working_out`、`grocery_shopping`、`in_class`、`on_the_way`、`in_battle`、
-  `got_bumped`、`bumped_someone`、`saw_bag`、`saw_clothes`、`out_shopping`、`bros_gathering`、`sis_gathering`、
-  `admiring_scenery`、`admiring_art`、`watching_show`、`on_the_road`、`having_sex`、`bird_encounter`、`streaking`、
-  `got_lost`、`trading`、`drinking`、`smoking`、`smoking_weed`、`just_have_sex`）；
+  住院和术后期间，不抽需要她出门活动的那二十六种（`temp_work`、`police_encounter`、`animal_encounter`、
+  `hit_someone`、`got_hit`、`working_out`、`on_the_way`、`in_battle`、`got_bumped`、`saw_bag`、`saw_clothes`、
+  `out_shopping`、`bros_gathering`、`sis_gathering`、`admiring_scenery`、`admiring_art`、`watching_show`、
+  `on_the_road`、`having_sex`、`bird_encounter`、`streaking`、`got_lost`、`drinking`、`smoking`、`smoking_weed`、
+  `just_have_sex`）；
   `period` 期间，`period_scare` 与 `pregnancy_scare` 都不抽；`traveling_together` 期间，不抽任何可能让她离线的种类，
   也不抽 `just_have_sex`：她和用户在一起。`got_lost` 只在 `short_trip`、`long_trip`、`hometown_visit` 或
-  `traveling_together` 进行期间抽取；`missed_ride` 在这几种或 `business_trip` 进行期间抽取。
+  `traveling_together` 进行期间抽取；`missed_ride`、`on_the_way` 和 `on_the_road` 在这几种或 `business_trip` 进行期间抽取。
 - **她在等回答时什么都不抽。** 从她提出请求（不论哪一种生活选择）起，到它被回答或过期（24 小时）为止，角色任何一个 session 的抽取都返回
   `{"event": null, "message": null}`。带着已经抽过的 `event_key` 来重复调用，照样返回那个事件。
 - **约会没结算时什么都不抽。** 从她答应一场约会起，到它结算为止（约会结束之后也一样），角色任何一个 session 的抽取都返回同样的空值
@@ -1009,7 +1002,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
   | `hygienic` | `true` / `false` / 不写 | `showering`、`bathing`、`want_hot_spring` 与 `want_sauna` 在 `short` 内被抽到的概率是原来的三倍 / 三分之一；也决定她什么时候提出一起洗澡（见[下文](#post-v2compsessionsession_idlife-choiceschoice_id)） |
   | `employed` | `"free"`、`"part_time"`（默认）、`"full_time"` | 她的一天有多少是工作：`temp_work`、`scolded_by_superior`、`scolded_superior` 与 `business_trip` 在各自类别内被抽到的概率分别是原来的三分之一 / 一倍 / 三倍，`free` 的角色不会抽到 `want_to_quit_job`；其他值按 `part_time` 读 |
   | `outdoorsy` | `"outdoor"`、`"neutral"`（默认）、`"indoor"` | `outdoor`：户外种类在各自类别内被抽到的概率是原来的 3 倍，室内种类是三分之一；`indoor` 反过来。可能让她离线的种类算中性，不受影响；每种的场所见 [life-events-needs.zh.md](life-events-needs.zh.md#户外还是室内)；其他值按 `neutral` 读 |
-  | `setting` | `"modern"`（默认）、`"fantasy"` | 她生活的世界：`fantasy` 的角色不会抽到 `police_encounter`、`showering`、`taking_selfie`、`gaming`、`watching_match`、`watching_show`、`business_trip`、`hospitalized`、`post_surgery`、`watching_stocks`，不管 `kinds` 或 `prefer_events` 怎么写；其他值按 `modern` 读 |
+  | `setting` | `"modern"`（默认）、`"fantasy"` | 她生活的世界：`fantasy` 的角色不会抽到 `police_encounter`、`showering`、`taking_selfie`、`gaming`、`watching_show`、`business_trip`、`hospitalized`、`post_surgery`、`temp_work`、`scolded_superior`，不管 `kinds` 或 `prefer_events` 怎么写；其他值按 `modern` 读 |
   | `smoking`、`alcoholic`、`drug`、`coffee`、`gluttony` | 各为 `true` / `false` / 不写 | 她抽不抽烟、喝不喝酒、用不用大麻、喝不喝咖啡、贪不贪吃：为 `true` 的越多，她的 `indulgence` 回到 `high` 越快，进而给抽取加权；为 `false` 的键可能让她拒收递来的这样东西（见[上文](#post-compchatsession_idmessagestream)）；`smoking`、`alcoholic`、`drug` 为 `true` 时她才会抽到 `smoking`、`drinking`、`smoking_weed` |
 
   取值形状不对、种类未知，或种类不在 `mid` 里，一律忽略。偏好不会绕过任何门槛。
