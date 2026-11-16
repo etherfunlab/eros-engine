@@ -1,7 +1,7 @@
 # Prune the life-event catalog — Design
 
 - **Date:** 2026-11-16
-- **Status:** Draft
+- **Status:** Approved
 - **Type:** Engine change. No migration. Breaking for a caller that names a
   deleted kind in `kinds`: the draw answers `422`.
 - **Owner:** enriquephl (sole dev)
