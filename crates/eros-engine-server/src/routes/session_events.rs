@@ -124,6 +124,12 @@ pub enum EventKindDto {
     JustHaveSex,
     Masturbating,
     MissedRide,
+    OnABoat,
+    OnACruise,
+    OnABus,
+    OnATrain,
+    OnAPlane,
+    Driving,
 }
 
 /// Reads the drawable kinds only: a request names kinds to draw, and the
@@ -213,6 +219,12 @@ impl From<EventKindDto> for EventKind {
             EventKindDto::JustHaveSex => EventKind::JustHaveSex,
             EventKindDto::Masturbating => EventKind::Masturbating,
             EventKindDto::MissedRide => EventKind::MissedRide,
+            EventKindDto::OnABoat => EventKind::OnABoat,
+            EventKindDto::OnACruise => EventKind::OnACruise,
+            EventKindDto::OnABus => EventKind::OnABus,
+            EventKindDto::OnATrain => EventKind::OnATrain,
+            EventKindDto::OnAPlane => EventKind::OnAPlane,
+            EventKindDto::Driving => EventKind::Driving,
         }
     }
 }
@@ -288,6 +300,12 @@ impl From<EventKind> for EventKindDto {
             EventKind::JustHaveSex => EventKindDto::JustHaveSex,
             EventKind::Masturbating => EventKindDto::Masturbating,
             EventKind::MissedRide => EventKindDto::MissedRide,
+            EventKind::OnABoat => EventKindDto::OnABoat,
+            EventKind::OnACruise => EventKindDto::OnACruise,
+            EventKind::OnABus => EventKindDto::OnABus,
+            EventKind::OnATrain => EventKindDto::OnATrain,
+            EventKind::OnAPlane => EventKindDto::OnAPlane,
+            EventKind::Driving => EventKindDto::Driving,
         }
     }
 }
@@ -2491,6 +2509,27 @@ mod tests {
                     "{kinds}"
                 );
             }
+        }
+    }
+
+    /// Spec 2026-11-19-vehicles-actions-species-design.md §2.
+    #[test]
+    fn the_vehicle_kinds_cross_the_wire() {
+        for (name, kind) in [
+            ("on_a_boat", EventKind::OnABoat),
+            ("on_a_cruise", EventKind::OnACruise),
+            ("on_a_bus", EventKind::OnABus),
+            ("on_a_train", EventKind::OnATrain),
+            ("on_a_plane", EventKind::OnAPlane),
+            ("driving", EventKind::Driving),
+        ] {
+            let dto: EventKindDto =
+                serde_json::from_value(json!(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(EventKind::from(dto), kind, "{name}");
+            assert_eq!(
+                serde_json::to_value(EventKindDto::from(kind)).unwrap(),
+                json!(name)
+            );
         }
     }
 
