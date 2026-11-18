@@ -51,8 +51,9 @@ Common to all six:
   way it moved `on_the_road`;
 - no row in `follows`: they are drawn only during a trip already. Six kinds
   at weight 1.0 weigh what `on_the_road` weighed during a trip (2.0 × the
-  follow factor 3), so a `modern` persona's trip carries as much travel as
-  before;
+  follow factor 3), so a `modern` persona's leisure trip carries as much
+  travel as before; a business trip, without the cruise, carries five
+  sixths of it;
 - being `mid`, they can be named in a persona's `prefer_events`.
 
 Cues and labels:
