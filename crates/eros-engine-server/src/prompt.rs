@@ -5245,6 +5245,12 @@ mod tests {
                 "刚做完爱",
                 "自慰中",
                 "没赶上车",
+                "在船上",
+                "在游轮上",
+                "在坐大巴",
+                "在坐火车",
+                "在飞机上",
+                "在开车",
             ]
         );
     }
@@ -6808,22 +6814,6 @@ mod tests {
             action_from_metadata(Some(&ok)),
             Some(UserAction::Tip { amount_usd: 20.0 })
         );
-    }
-
-    /// Spec 2026-11-19-vehicles-actions-species-design.md §2.
-    #[test]
-    fn the_vehicle_labels() {
-        use eros_engine_core::events::EventKind::*;
-        for (k, label) in [
-            (OnABoat, "在船上"),
-            (OnACruise, "在游轮上"),
-            (OnABus, "在坐大巴"),
-            (OnATrain, "在坐火车"),
-            (OnAPlane, "在飞机上"),
-            (Driving, "在开车"),
-        ] {
-            assert_eq!(event_label(k), label, "{k:?}");
-        }
     }
 
     #[test]
