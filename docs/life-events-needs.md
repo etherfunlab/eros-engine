@@ -216,7 +216,7 @@ the judge sees the levels and decides.
 
 ### Categories
 
-An event is one of 63 drawable kinds. Each kind belongs to a category, and the category sets its
+An event is one of 69 drawable kinds. Each kind belongs to a category, and the category sets its
 shape:
 
 | `category` | shape | lasts | category weight | category cooldown |
@@ -255,14 +255,15 @@ The draw is a pure function of the inputs plus three random numbers (one per sta
 the length).
 
 1. **Eligibility.** A kind is eligible when all of these hold:
-   - the caller's `kinds` allows it ([below](#the-callers-kinds); absent means all 63);
+   - the caller's `kinds` allows it ([below](#the-callers-kinds); absent means all 69);
+   - it fits her world ([below](#her-world));
    - it passes its gate (below);
    - its own cooldown has elapsed;
    - its category's cooldown has elapsed;
    - for an offline kind, the shared offline cooldown has elapsed (below);
    - the background rules allow it (below);
-   - for `got_lost` and `missed_ride`, the two kinds that need a background, one of their
-     backgrounds is under way (below).
+   - for a kind that needs a background (`got_lost`, `missed_ride`, the commute kinds and the
+     vehicles), one of its backgrounds is under way (below).
 2. **Category.** Each category with at least one eligible kind weighs its category weight
    times its persona factor. A roll picks one by cumulative weight.
 3. **Kind.** Each eligible kind in that category weighs its base weight times its
@@ -295,10 +296,11 @@ eligible kind drops out of the first stage and the others share its weight.
   `drinking`, `smoking`, `smoking_weed`, `just_have_sex`. During `period`,
   `period_scare` and `pregnancy_scare` are not drawn. During `traveling_together` no kind that
   can take her offline is drawn, nor `just_have_sex`: she is with the user.
-- Four kinds need a background rather than being ruled out by one. `got_lost` is drawn only while
-  a `short_trip`, `long_trip`, `hometown_visit` or `traveling_together` is under way, never on a
-  `business_trip` or outside a trip. `missed_ride`, `on_the_way` and `on_the_road` are drawn only
-  while one of those or a `business_trip` is under way.
+- Ten kinds need a background rather than being ruled out by one. `got_lost` and `on_a_cruise`
+  are drawn only while a `short_trip`, `long_trip`, `hometown_visit` or `traveling_together` is
+  under way, never on a `business_trip` or outside a trip. `missed_ride`, `on_the_way`,
+  `on_the_road`, `on_a_boat`, `on_a_bus`, `on_a_train`, `on_a_plane` and `driving` are drawn
+  only while one of those or a `business_trip` is under way.
 - One incident and one background can run together. An incident drawn inside a background is
   told from inside it.
 - While she waits for the user's answer to one of her life choices, no draw happens either, in any
@@ -344,13 +346,14 @@ weight and never lifts a gate.
 | `sudden_desire`, `just_have_sex` | intimacy rung 3 |
 | `masturbating` | the persona's `art_metadata.sex_addict` is `true`, and intimacy rung 3 |
 | `drinking`, `smoking`, `smoking_weed` | the persona's `art_metadata.alcoholic`, `smoking`, `drug` respectively is `true` |
-| `got_lost` | a `short_trip`, `long_trip`, `hometown_visit` or `traveling_together` under way ([above](#one-incident-and-one-background-at-a-time)) |
-| `missed_ride` | a `business_trip`, `short_trip`, `long_trip`, `hometown_visit` or `traveling_together` under way |
+| `got_lost`, `on_a_cruise` | a `short_trip`, `long_trip`, `hometown_visit` or `traveling_together` under way ([above](#one-incident-and-one-background-at-a-time)) |
+| `missed_ride`, `on_the_way`, `on_the_road`, `on_a_boat`, `on_a_bus`, `on_a_train`, `on_a_plane`, `driving` | a `business_trip`, `short_trip`, `long_trip`, `hometown_visit` or `traveling_together` under way |
 | `strip`, `streaking` | intimacy rung 3, and the session's newest recorded `affinity_scope` is romance-compatible (a chemistry axis in scope); none recorded is not compatible |
-| `period`, `saw_bag`, `saw_clothes` | the persona's `art_metadata.gender` is `"female"` |
+| `saw_bag`, `saw_clothes` | the persona's `art_metadata.gender` is `"female"` |
+| `period` | the persona's `art_metadata.gender` is `"female"`, and she is not a machine (`art_metadata.species` `"robot"` or `"android"`) |
 | `want_to_quit_job` | the persona's `art_metadata.employed` is not `"free"` |
-| `period_scare` | the persona's `art_metadata.gender` is `"female"`, and intimacy rung 2 or higher |
-| `pregnancy_scare` | the persona's `art_metadata.gender` is `"female"`, and intimacy rung 3 |
+| `period_scare` | the persona's `art_metadata.gender` is `"female"`, she is not a machine, and intimacy rung 2 or higher |
+| `pregnancy_scare` | the persona's `art_metadata.gender` is `"female"`, she is not a machine, and intimacy rung 3 |
 | `having_sex` | the persona's `art_metadata.sex_addict` is `true` |
 | `away_from_phone`, `busy`, `in_battle`, `asleep`, `bros_gathering`, `sis_gathering`, `having_sex`, and `out_shopping` for a female persona | the ghost protections allow it (see [below](#offline-kinds)) |
 
@@ -365,7 +368,7 @@ The rung (1 to 3) is read from the session's affinity, time-decayed as in a chat
 
 ### Persona settings
 
-Thirteen keys in the persona genome's `art_metadata`, read by the engine and written by whoever
+Sixteen keys in the persona genome's `art_metadata`, read by the engine and written by whoever
 authors the persona, sit beside `gender`, `birthday` and `timezone`:
 
 | key | value | effect |
@@ -380,6 +383,7 @@ authors the persona, sit beside `gender`, `birthday` and `timezone`:
 | `employed` | `"free"`, `"part_time"` (default), `"full_time"` | how much of her day is work: `temp_work`, `scolded_by_superior`, `scolded_superior` and `business_trip` weigh a third, 1 time, 3 times within their categories; a `free` persona never draws `want_to_quit_job`; any other value reads as `part_time` |
 | `outdoorsy` | `"outdoor"`, `"neutral"` (default), `"indoor"` | within each category, `outdoor` weighs the outdoor kinds 3 times and the indoor kinds a third, `indoor` the reverse; neutral kinds are untouched ([below](#outdoors-or-in)); any other value reads as `neutral` |
 | `setting` | `"modern"` (default), `"fantasy"` | the world she lives in ([below](#her-world)); any other value reads as `modern` |
+| `species` | any word | `"robot"` and `"android"` are machines: she never draws `period`, `period_scare` or `pregnancy_scare`; every other word leaves the draw alone. What the word does to the prompt is in [eros-character-v1.1.md](eros-character-v1.1.md) |
 | `smoking`, `alcoholic`, `drug`, `coffee`, `gluttony` | each `true`, `false`, absent (default) | whether she smokes, drinks, uses weed, drinks coffee, loves good food (`false`: she keeps off rich food): how fast `indulgence` comes back ([drift](#drift-between-ratings)), what a high `indulgence` names in the reply, and how she takes a give of that thing (below); `smoking`, `alcoholic` and `drug` set to `true` also let her draw `smoking`, `drinking` and `smoking_weed` |
 
 `prefer_trip` says whether she moves at all; `homesick` says where she goes when she does. A
@@ -402,7 +406,7 @@ means out in the open air: a shop, a class, an office or a gallery is not outdoo
 
 | place | `short` | `mid` |
 |---|---|---|
-| outdoor | `police_encounter`, `animal_encounter`, `on_the_way`, `got_bumped`, `admiring_scenery`, `bird_encounter`, `want_to_see_sea`, `want_hot_spring`, `got_lost`, `missed_ride` | `on_the_road`, `want_to_go_out` |
+| outdoor | `police_encounter`, `animal_encounter`, `on_the_way`, `got_bumped`, `admiring_scenery`, `bird_encounter`, `want_to_see_sea`, `want_hot_spring`, `got_lost`, `missed_ride` | `on_the_road`, `on_a_boat`, `on_a_cruise`, `on_a_bus`, `on_a_train`, `on_a_plane`, `driving`, `want_to_go_out` |
 | indoor | `showering`, `bathing`, `scolded_by_superior`, `scolded_superior`, `admiring_art`, `want_sauna` | `reading`, `gaming`, `want_to_go_home` |
 | neutral | every other `short` kind, the sex kinds and `streaking` among them | every other `mid` kind |
 
@@ -455,7 +459,7 @@ the first stage, and does not shorten a cooldown.
 | `sudden_desire` | `strip`, `masturbating` |
 | `sick` | `period_scare` |
 | `having_sex`, `just_have_sex` | `pregnancy_scare` |
-| `business_trip` | `on_the_road`, `on_the_way`, `busy`, `temp_work` |
+| `business_trip` | `on_the_way`, `busy`, `temp_work` |
 | `short_trip`, `long_trip`, `hometown_visit`, `traveling_together` | `on_the_road`, `admiring_scenery`, `taking_selfie` |
 | `hometown_visit` | `bros_gathering`, `sis_gathering` |
 | `hospitalized`, `post_surgery` | `reading`, `gaming` |
@@ -482,7 +486,7 @@ policy, rules a kind out without the engine losing it.
 
 | `kinds` | kinds that may be drawn |
 |---|---|
-| absent or `null` | all 63 |
+| absent or `null` | all 69 |
 | `[]` | none: the response is `{"event": null, "message": null}` |
 | `["reading", "quarrel"]` | the listed ones |
 | `{"allow": […], "disallow": […]}` | what `allow` allows, minus what `disallow` lists |
@@ -798,7 +802,8 @@ character.
 
 Five told incidents give her an afternoon the user hears about: `admiring_scenery` and
 `admiring_art` (`short`, 1 h), `taking_selfie` (`short`, 30 min), `on_the_road` (`mid`, 2 to
-4 h: a long commute, a coach, a train, a flight; `on_the_way` stays the 30-minute errand; both
+4 h: a long stretch of travel; only on a trip, and only in a `fantasy` world, where a modern
+persona has [the vehicles](#on-the-move) instead; `on_the_way` stays the 30-minute errand, also
 only on a trip) and `watching_show` (`mid`, 2 to 3 h). She keeps replying through all of
 them. The cue states the fact and the details are hers: which view, which piece, which
 show, which vehicle. When the request carries `image` and the deployment configures the
@@ -894,19 +899,43 @@ users disallows them.
 Told, never offline, no picture, both worlds (a carriage is a ride too). Unlike `got_lost`, a
 business trip counts.
 
+### On the move
+
+Six `mid` kinds say how she is travelling. Each is drawn only while a trip is under way:
+
+| kind | label | weight | cooldown | lasts | world | cue | during `traveling_together` |
+|---|---|---|---|---|---|---|---|
+| `on_a_boat` | 在船上 | 1 | 48 h | 1–2 h | both | `（你正在坐船。）` | `（你们一起出来玩，正在坐船。）` |
+| `on_a_cruise` | 在游轮上 | 1 | 48 h | 2–4 h | `modern` | `（你正在游轮上。）` | `（你们一起出来玩，正在游轮上。）` |
+| `on_a_bus` | 在坐大巴 | 1 | 48 h | 2–4 h | `modern` | `（你正在坐大巴。）` | `（你们一起出来玩，正在坐大巴。）` |
+| `on_a_train` | 在坐火车 | 1 | 48 h | 2–4 h | `modern` | `（你正在坐火车。）` | `（你们一起出来玩，正在坐火车。）` |
+| `on_a_plane` | 在飞机上 | 1 | 48 h | 2–4 h | `modern` | `（你正在飞机上。）` | `（你们一起出来玩，正在飞机上。）` |
+| `driving` | 在开车 | 1 | 48 h | 1–3 h | `modern` | `（你正在开车。）` | `（你们一起出来玩，正开车在路上。）` |
+
+Any trip counts, a `business_trip` included, except for `on_a_cruise`, which comes up only on a
+`short_trip`, `long_trip`, `hometown_visit` or `traveling_together`. During her own trip the cue
+opens with the trip: `（你正在短途旅行。你正在坐火车。）`. All six are told, never offline, carry
+no picture and are outdoor; none has a gate beyond the trip, and each keeps its own cooldown, so
+a train can follow a plane on one trip. Being `mid`, each can be named in `prefer_events`.
+
+They take the place of `on_the_road` for a `modern` persona: the six together weigh what
+`on_the_road` weighed on a leisure trip, and five sixths of it on a business trip. A `fantasy`
+persona draws `on_the_road` and `on_a_boat`.
+
 ### Her world
 
 `art_metadata.setting` says which world she lives in: `modern` (the default, and what any other
-value reads as) or `fantasy`. A kind that needs modern life is never drawn for a `fantasy`
-persona, whatever the request's `kinds` or her `prefer_events` say:
+value reads as) or `fantasy`. A kind that does not fit her world is never drawn for her,
+whatever the request's `kinds` or her `prefer_events` say:
 
 | fits | kinds |
 |---|---|
-| `modern` only | `police_encounter`, `showering`, `taking_selfie`, `gaming`, `watching_show`, `business_trip`, `hospitalized`, `post_surgery`, `temp_work`, `scolded_superior` |
+| `modern` only | `police_encounter`, `showering`, `taking_selfie`, `gaming`, `watching_show`, `business_trip`, `hospitalized`, `post_surgery`, `temp_work`, `scolded_superior`, `on_a_cruise`, `on_a_bus`, `on_a_train`, `on_a_plane`, `driving` |
+| `fantasy` only | `on_the_road` |
 | both | every other kind |
 
-No kind is `fantasy` only yet, so a `fantasy` persona draws from a smaller set and a persona with
-no `setting` draws exactly as before.
+`on_the_road` is the one `fantasy`-only kind: a modern persona travels by [vehicle](#on-the-move)
+instead. A modern persona whose `prefer_events` lists it keeps a value that does nothing.
 
 ### Going out and going home
 
@@ -1300,8 +1329,9 @@ category, lasting 48 to 72 hours, drawn uniformly in whole hours when the user a
 it ends an incident under way. She does not tell it as an event, since her reply to the yes
 already does, and she keeps replying throughout: it is not offline. `正在经历` and the judge read
 it like any background. While it lasts no second background and no kind that can take her offline
-is drawn, and `on_the_road`, `admiring_scenery` and `taking_selfie` follow it as they follow her
-own trips. It is instance-scoped like every event.
+is drawn, `on_the_road`, `admiring_scenery` and `taking_selfie` follow it as they follow her
+own trips, and [the vehicles](#on-the-move) come up with the cue that she is travelling with the
+user. It is instance-scoped like every event.
 
 **Other asks during the trip.** Only the separation of an ask for space holds the streak until
 its event ends. An accepted trip anchors the streak at the answer, so a romantic ask or a bath

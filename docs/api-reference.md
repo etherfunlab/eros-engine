@@ -449,7 +449,7 @@ physical or custom action → chemistry), and a refused `tip`, `bluff`, `threate
 | `type` | fields |
 |---|---|
 | `give` | `item`: one of the categories below (required); `name`: optional, 1–32 chars; `quantity`: optional, 1–99, default 1 |
-| `kiss`, `hug`, `touch`, `lick`, `french_kiss`, `hug_from_behind`, `tease`, `pat`, `photo`, `strip` | none |
+| `kiss`, `hug`, `touch`, `lick`, `french_kiss`, `hug_from_behind`, `tease`, `pat`, `wink`, `blink`, `ask_for_dance`, `ask_dancing`, `photo`, `strip` | none |
 | `bluff`, `threaten`, `trick` | none |
 | `custom` | `text`: required, 1–100 chars |
 | `tip` | `amount_usd`: required, finite, `> 0` and `≤ 1_000_000_000` |
@@ -482,7 +482,7 @@ A turn is a user message of the text session or of one of its dates' sub-session
 
 **Strip.** `strip` is the user undressing her, and only a romance-compatible pair can have it accepted: a chemistry axis in `affinity_scope` on this turn, whatever `memory_scope` says. Any other pair's `strip` is refused before the judge runs, whatever it answers and with or without the LLM judge, and drops the chemistry line a tier like any refused physical action. An accepted `strip` undresses her this turn: her clothing reads 衣服被对方脱掉了, or 「{outfit}」被对方脱掉了 over a named `outfit`, in her reply and in the picture. With image capability it comes back as her picture, like a photo (below).
 
-**A photo she lets you take.** An accepted `photo` on a turn whose request carries `image`, in a deployment with `[tasks.chat_image_prompt_compose]` configured, is answered as `reply_text_image`: her words, then one `image_request` built on her face reference, composed from the scene. This holds with or without the LLM judge. An accepted `strip` is answered the same way. A refused `photo` or `strip`, or one without that image capability, is a text reply, even when the judge proposed a picture. `image.force = true` still makes the turn `reply_image`, and on a refusal the picture follows the refusal.
+**A photo she lets you take.** An accepted `photo` on a turn whose request carries `image`, in a deployment with `[tasks.chat_image_prompt_compose]` configured, is answered as `reply_text_image`: her words, then one `image_request` built on her face reference, composed from the scene. This holds with or without the LLM judge. An accepted `strip` is answered the same way, and so is an accepted `ask_dancing` (the user asks her to dance for them; the picture is of her dancing). A refused `photo`, `strip` or `ask_dancing`, or one without that image capability, is a text reply, even when the judge proposed a picture. `image.force = true` still makes the turn `reply_image`, and on a refusal the picture follows the refusal.
 
 **Emotional replies.** While the deployment has
 [`tones.emotional`](model-config.md#tones--chat-tones-chat-task-only) above 0, a turn carrying
@@ -659,7 +659,7 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 - `ghost`: `meta(action_type=ghost) → done → final` — no `delta`, no `model` in `meta`, `usage` and `generation_id` are `null` in `done`. The companion stayed silent this turn; no chat model was called.
 - reasoning: when the judge returned reasoning, `reasoning*` precedes every shape in this list, ahead of `action_response` and `body_state`: `reasoning* → meta(reply) → delta* → done → final`
 - action turn: the same shapes with `action_response` ahead of the first `meta` — `action_response → meta(reply) → delta* → done → final`; never `ghost` or `product_qa`
-- an accepted `photo` or `strip` with image capability: `action_response → meta(reply_text_image) → delta* → done → image_request → final`
+- an accepted `photo`, `strip` or `ask_dancing` with image capability: `action_response → meta(reply_text_image) → delta* → done → image_request → final`
 - an accepted `date`: `action_response → meta(reply) → delta* → done → final`, with `activity` on `final`
 - a turn with lingering effects or known needs: `body_state` sits ahead of the first `meta`, after `action_response` when both are sent — e.g. `action_response → body_state → meta(reply) → delta* → done → final`
 - `product_qa`: `meta(action_type=product_qa) → delta* → done → final` — same shape as a normal text reply, streamed by an independent model chain (`[tasks.chat_product_qa]`) instead of `chat_companion`; persisted with `channel='product_qa'` and reported as `product_qa` again on replay.
@@ -1162,11 +1162,17 @@ Kinds fall into four categories. `short` and `mid` are incidents; `body` and
 | `mid` | `out_shopping` | 2–4 h | she is out shopping (offline for a female persona) |
 | `mid` | `bros_gathering` | 2–4 h | she is at a gathering of brothers (offline) |
 | `mid` | `sis_gathering` | 2–4 h | she is at a gathering of sisters (offline) |
-| `mid` | `on_the_road` | 2–4 h | she is on a long stretch of travel: a commute, a coach, a train, a flight (only on a trip, a business trip included) |
+| `mid` | `on_the_road` | 2–4 h | she is on a long stretch of travel (only on a trip, a business trip included; only for a `fantasy` persona) |
 | `mid` | `watching_show` | 2–3 h | she is at a show |
 | `mid` | `having_sex` | 1–2 h | she is having sex (a sex addict; offline, never announced) |
 | `mid` | `want_to_go_out` | 1–3 h | she badly wants to get out |
 | `mid` | `want_to_go_home` | 1–3 h | she badly wants to go home |
+| `mid` | `on_a_boat` | 1–2 h | she is on a boat (only on a trip, a business trip included) |
+| `mid` | `on_a_cruise` | 2–4 h | she is on a cruise ship (only on a trip that is not a business trip; modern only) |
+| `mid` | `on_a_bus` | 2–4 h | she is on a coach (only on a trip, a business trip included; modern only) |
+| `mid` | `on_a_train` | 2–4 h | she is on a train (only on a trip, a business trip included; modern only) |
+| `mid` | `on_a_plane` | 2–4 h | she is on a plane (only on a trip, a business trip included; modern only) |
+| `mid` | `driving` | 1–3 h | she is driving (only on a trip, a business trip included; modern only) |
 | `body` | `sick` | 1–3 d | she is ill |
 | `body` | `period` | 3–7 d | her period |
 | `body` | `hospitalized` | 2–5 d | she is in hospital |
@@ -1176,7 +1182,7 @@ Kinds fall into four categories. `short` and `mid` are incidents; `body` and
 | `trip` | `long_trip` | 3–7 d | a long trip |
 | `trip` | `hometown_visit` | 72 h | a visit home |
 
-A range is drawn when the event starts. That is 63 drawable kinds. Both genders
+A range is drawn when the event starts. That is 69 drawable kinds. Both genders
 draw both gatherings, at the same weight; that is deliberate.
 
 Five more kinds are never drawn: `taking_space` (a separation she asked for and
@@ -1217,10 +1223,12 @@ The draw:
   `smoking_weed`, `just_have_sex`); during `period`,
   neither `period_scare` nor `pregnancy_scare`; during `traveling_together`,
   no kind that can take her offline and not `just_have_sex`, since she is with
-  the user. `got_lost` is drawn only while a `short_trip`, `long_trip`,
-  `hometown_visit` or `traveling_together` is under way; `missed_ride`,
-  `on_the_way` and `on_the_road` only while one of those or a `business_trip`
-  is.
+  the user. `got_lost` and `on_a_cruise` are drawn only while a `short_trip`,
+  `long_trip`, `hometown_visit` or `traveling_together` is under way;
+  `missed_ride`, `on_the_way`, `on_the_road`, `on_a_boat`, `on_a_bus`,
+  `on_a_train`, `on_a_plane` and `driving` only while one of those or a
+  `business_trip` is. `on_the_road` fits only a `fantasy` persona, the five
+  vehicles other than `on_a_boat` only a `modern` one.
 - **While she waits for an answer, nothing is drawn.** From her ask (of any
   life choice) until it is answered or lapses (24 h), the draw returns `{"event": null,
   "message": null}` for every session of the persona. A repeat of an
@@ -1248,8 +1256,9 @@ The draw:
   `"female"`. `period_scare` (rung 2 and up) and `pregnancy_scare` (rung 3) are
   also drawn only for such a persona, and so are `saw_bag` and `saw_clothes`;
   from rung 2 she says she wants what she found, in her `tip_personality`'s
-  register when she has one. The offline kinds follow the two ghost gates
-  (below).
+  register when she has one. `period` and the two scares are never drawn for a machine
+  (`art_metadata.species` `"robot"` or `"android"`). The offline kinds follow the two ghost
+  gates (below).
 - **Persona settings** in the genome's `art_metadata` shape the draw:
 
   | Key | Value | Effect |
@@ -1327,7 +1336,7 @@ While one lasts, every text turn in any session of the persona ghosts, without
 the judge and without counting towards the ghost streak, and `/open` returns
 `null`. An announced `busy`, `in_battle` or `out_shopping` still ghosts. A turn that carries a
 user `action` (any `type`: `give`, `gift`, `tip`, `kiss`, `hug`, `touch`,
-`lick`, `french_kiss`, `hug_from_behind`, `tease`, `pat`, `photo`, `strip`, `bluff`, `threaten`, `trick`, `custom`) or `image.force = true` is the exception: it takes the normal
+`lick`, `french_kiss`, `hug_from_behind`, `tease`, `pat`, `wink`, `blink`, `ask_for_dance`, `ask_dancing`, `photo`, `strip`, `bluff`, `threaten`, `trick`, `custom`) or `image.force = true` is the exception: it takes the normal
 path and is answered, because an action is interaction in person, which needs
 no phone, and a forced image turn is always `reply_image`. The persona goes
 silent this way only where the ghost protection allows it, so with the

@@ -170,7 +170,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 
 ### 类别
 
-可抽取的事件共 63 种，每一种属于一个类别，类别决定它的形态：
+可抽取的事件共 69 种，每一种属于一个类别，类别决定它的形态：
 
 | `category` | 形态 | 持续 | 类别权重 | 类别冷却 |
 |---|---|---|---|---|
@@ -199,13 +199,14 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 抽取是输入加三个随机数（两段各一个，时长一个）的纯函数。
 
 1. **资格。** 一个种类同时满足下面几条才有资格：
-   - 调用方的 `kinds` 允许它（[见下](#调用方的-kinds)；不带表示全部 63 种）；
+   - 调用方的 `kinds` 允许它（[见下](#调用方的-kinds)；不带表示全部 69 种）；
+   - 它属于她的世界（见[下文](#她的世界)）；
    - 过了它的门槛（见下）；
    - 它自己的冷却已过；
    - 它所属类别的冷却已过；
    - 离线类种类还要过了共享的离线冷却（见下）；
    - 背景规则允许它（见下）；
-   - 对 `got_lost` 和 `missed_ride` 这两种需要背景的种类，它们的某个背景正在进行（见下）。
+   - 需要背景的种类（`got_lost`、`missed_ride`、两种赶路和交通工具），它的某个背景正在进行（见下）。
 2. **类别。** 每个至少有一个合格种类的类别，权重是类别权重乘以角色系数。掷一次随机数，按累计权重选一个。
 3. **种类。** 该类别里每个合格种类的权重是基础权重乘以它的各项[需求系数](#1-需求给种类加权)、
    `prefer_events` 系数、[关联系数](#关联系数)，少数种类再乘一个角色系数（[`is_virgin`](#角色设置)、
@@ -228,8 +229,9 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
   `bird_encounter`、`streaking`、`got_lost`、`drinking`、`smoking`、`smoking_weed`、`just_have_sex`。
   `period` 期间，
   不抽 `period_scare` 与 `pregnancy_scare`。`traveling_together` 期间，不抽任何可能让她离线的种类，也不抽 `just_have_sex`：她和用户在一起。
-- 有四种是需要背景，而不是被背景排除。`got_lost` 只在 `short_trip`、`long_trip`、`hometown_visit` 或 `traveling_together`
-  进行期间抽取，出差时和不在旅途中都不抽。`missed_ride`、`on_the_way` 和 `on_the_road` 在这几种或 `business_trip` 进行期间抽取。
+- 有十种是需要背景，而不是被背景排除。`got_lost` 和 `on_a_cruise` 只在 `short_trip`、`long_trip`、`hometown_visit` 或
+  `traveling_together` 进行期间抽取，出差时和不在旅途中都不抽。`missed_ride`、`on_the_way`、`on_the_road`、`on_a_boat`、
+  `on_a_bus`、`on_a_train`、`on_a_plane` 和 `driving` 在这几种或 `business_trip` 进行期间抽取。
 - 她在等用户回答自己提出的某次生活选择时，同样完全不抽，角色的任何一个 session 都一样：这个请求本身就是前台戏，
   也免得一段离线时段在问话中间开始。带着已经抽过的 `event_key` 来重复调用，照样返回那个事件。
 - 她有一场还没结算的约会时，不论正在进行还是已经结束，同样完全不抽，角色的任何一个 session 都一样：她正和用户在外面，
@@ -262,13 +264,14 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 | `sudden_desire`、`just_have_sex` | 亲密度档 3 |
 | `masturbating` | 角色的 `art_metadata.sex_addict` 为 `true`，并且亲密度档 3 |
 | `drinking`、`smoking`、`smoking_weed` | 角色的 `art_metadata.alcoholic`、`smoking`、`drug` 分别为 `true` |
-| `got_lost` | 有 `short_trip`、`long_trip`、`hometown_visit` 或 `traveling_together` 正在进行（见[上文](#同一时间一件插曲一个背景)） |
-| `missed_ride` | 有 `business_trip`、`short_trip`、`long_trip`、`hometown_visit` 或 `traveling_together` 正在进行 |
+| `got_lost`、`on_a_cruise` | 有 `short_trip`、`long_trip`、`hometown_visit` 或 `traveling_together` 正在进行（见[上文](#同一时间一件插曲一个背景)） |
+| `missed_ride`、`on_the_way`、`on_the_road`、`on_a_boat`、`on_a_bus`、`on_a_train`、`on_a_plane`、`driving` | 有 `business_trip`、`short_trip`、`long_trip`、`hometown_visit` 或 `traveling_together` 正在进行 |
 | `strip`、`streaking` | 亲密度档 3，且会话最新记录的 `affinity_scope` 性向相容（scope 里有暧昧感轴）；没有记录算不相容 |
-| `period`、`saw_bag`、`saw_clothes` | 角色的 `art_metadata.gender` 为 `"female"` |
+| `saw_bag`、`saw_clothes` | 角色的 `art_metadata.gender` 为 `"female"` |
+| `period` | 角色的 `art_metadata.gender` 为 `"female"`，并且她不是机器（`art_metadata.species` 为 `"robot"` 或 `"android"`） |
 | `want_to_quit_job` | 角色的 `art_metadata.employed` 不为 `"free"` |
-| `period_scare` | 角色的 `art_metadata.gender` 为 `"female"`，并且亲密度档 2 及以上 |
-| `pregnancy_scare` | 角色的 `art_metadata.gender` 为 `"female"`，并且亲密度档 3 |
+| `period_scare` | 角色的 `art_metadata.gender` 为 `"female"`，她不是机器，并且亲密度档 2 及以上 |
+| `pregnancy_scare` | 角色的 `art_metadata.gender` 为 `"female"`，她不是机器，并且亲密度档 3 |
 | `having_sex` | 角色的 `art_metadata.sex_addict` 为 `true` |
 | `away_from_phone`、`busy`、`in_battle`、`asleep`、`bros_gathering`、`sis_gathering`、`having_sex`，以及女性角色的 `out_shopping` | ghost 保护允许（见[下文](#离线类)） |
 
@@ -281,7 +284,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 
 ### 角色设置
 
-角色 genome 的 `art_metadata` 里有十三个键，由 engine 读取，由写角色的人填写，和 `gender`、`birthday`、
+角色 genome 的 `art_metadata` 里有十六个键，由 engine 读取，由写角色的人填写，和 `gender`、`birthday`、
 `timezone` 放在一起：
 
 | 键 | 取值 | 效果 |
@@ -296,6 +299,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 | `employed` | `"free"`、`"part_time"`（默认）、`"full_time"` | 她的一天有多少是工作：`temp_work`、`scolded_by_superior`、`scolded_superior` 与 `business_trip` 在各自类别内分别为三分之一、1 倍、3 倍；`free` 的角色不会抽到 `want_to_quit_job`；其他值按 `part_time` 读 |
 | `outdoorsy` | `"outdoor"`、`"neutral"`（默认）、`"indoor"` | 每个类别内部：`outdoor` 时户外种类 3 倍、室内种类三分之一，`indoor` 反过来；中性种类不动（见[下文](#户外还是室内)）；其他值按 `neutral` 读 |
 | `setting` | `"modern"`（默认）、`"fantasy"` | 她生活的世界（见[下文](#她的世界)）；其他值按 `modern` 读 |
+| `species` | 任意词 | `"robot"` 和 `"android"` 是机器：她不会抽到 `period`、`period_scare`、`pregnancy_scare`；其他词不影响抽取。这个词对 prompt 的作用见 [eros-character-v1.1.md](eros-character-v1.1.md) |
 | `smoking`、`alcoholic`、`drug`、`coffee`、`gluttony` | 各为 `true`、`false`、不写（默认） | 她抽不抽烟、喝不喝酒、用不用大麻、喝不喝咖啡、贪不贪吃（`false` 表示她忌口、节食）：决定 `indulgence` 回来得多快（见[漂移](#两次评定之间的漂移)）、`high` 的 `indulgence` 在回复里点名什么，以及她怎么对待递来的这样东西（见下）；`smoking`、`alcoholic`、`drug` 为 `true` 时，她才会抽到 `smoking`、`drinking`、`smoking_weed` |
 
 `prefer_trip` 管她动不动，`homesick` 管她动起来往哪去。两者都为 `true` 的空姐角色经常出行、照常出差，
@@ -314,7 +318,7 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 
 | 场所 | `short` | `mid` |
 |---|---|---|
-| 户外 | `police_encounter`、`animal_encounter`、`on_the_way`、`got_bumped`、`admiring_scenery`、`bird_encounter`、`want_to_see_sea`、`want_hot_spring`、`got_lost`、`missed_ride` | `on_the_road`、`want_to_go_out` |
+| 户外 | `police_encounter`、`animal_encounter`、`on_the_way`、`got_bumped`、`admiring_scenery`、`bird_encounter`、`want_to_see_sea`、`want_hot_spring`、`got_lost`、`missed_ride` | `on_the_road`、`on_a_boat`、`on_a_cruise`、`on_a_bus`、`on_a_train`、`on_a_plane`、`driving`、`want_to_go_out` |
 | 室内 | `showering`、`bathing`、`scolded_by_superior`、`scolded_superior`、`admiring_art`、`want_sauna` | `reading`、`gaming`、`want_to_go_home` |
 | 中性 | 其余 `short` 种类，性相关的种类与 `streaking` 都在其中 | 其余 `mid` 种类 |
 
@@ -350,7 +354,7 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 | `sudden_desire` | `strip`、`masturbating` |
 | `sick` | `period_scare` |
 | `having_sex`、`just_have_sex` | `pregnancy_scare` |
-| `business_trip` | `on_the_road`、`on_the_way`、`busy`、`temp_work` |
+| `business_trip` | `on_the_way`、`busy`、`temp_work` |
 | `short_trip`、`long_trip`、`hometown_visit`、`traveling_together` | `on_the_road`、`admiring_scenery`、`taking_selfie` |
 | `hometown_visit` | `bros_gathering`、`sis_gathering` |
 | `hospitalized`、`post_surgery` | `reading`、`gaming` |
@@ -373,7 +377,7 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 
 | `kinds` | 可以抽的种类 |
 |---|---|
-| 不带或 `null` | 全部 63 种 |
+| 不带或 `null` | 全部 69 种 |
 | `[]` | 一种都不抽：响应是 `{"event": null, "message": null}` |
 | `["reading", "quarrel"]` | 只抽列出的 |
 | `{"allow": […], "disallow": […]}` | `allow` 允许的，去掉 `disallow` 列出的 |
@@ -623,8 +627,8 @@ ghosting 开关关闭时，已经在进行的一段不会让任何轮次沉默�
 ### 风景、演出与自拍
 
 五种会讲出来的插曲，给她一个用户听得到的下午：`admiring_scenery`、`admiring_art`（`short`，1 小时）、`taking_selfie`
-（`short`，30 分钟）、`on_the_road`（`mid`，2 到 4 小时：长途通勤、坐车、坐火车、坐飞机；`on_the_way` 仍是那 30 分钟的赶路；
-两者都只在旅行中）与 `watching_show`（`mid`，2 到 3 小时）。期间她照常回复。提示只陈述事实，细节由她填：看的什么风景、
+（`short`，30 分钟）、`on_the_road`（`mid`，2 到 4 小时：一段长路；只在旅行中，也只在 `fantasy` 的世界里，现代角色改抽
+[交通工具](#交通工具)；`on_the_way` 仍是那 30 分钟的赶路，同样只在旅行中）与 `watching_show`（`mid`，2 到 3 小时）。期间她照常回复。提示只陈述事实，细节由她填：看的什么风景、
 哪件作品、什么表演、坐的什么。请求带 `image`、部署配了 composer 时，`taking_selfie` 的消息带上这张自拍：先写她的话，
 composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2compsessionsession_idevents)）；否则只有文字。`taking_selfie`
 住院也抽；其余四种要她出门。
@@ -698,17 +702,38 @@ composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2com
 
 会讲出来，不离线，不带图，两种世界都有（马车也是车）。和 `got_lost` 不同，出差也算。
 
+### 交通工具
+
+六种 `mid` 种类说她正坐什么走，都只在旅行进行期间抽取：
+
+| 种类 | 标签 | 权重 | 冷却 | 时长 | 世界 | 提示 | `traveling_together` 期间 |
+|---|---|---|---|---|---|---|---|
+| `on_a_boat` | 在船上 | 1 | 48 小时 | 1–2 小时 | 两者都可 | `（你正在坐船。）` | `（你们一起出来玩，正在坐船。）` |
+| `on_a_cruise` | 在游轮上 | 1 | 48 小时 | 2–4 小时 | `modern` | `（你正在游轮上。）` | `（你们一起出来玩，正在游轮上。）` |
+| `on_a_bus` | 在坐大巴 | 1 | 48 小时 | 2–4 小时 | `modern` | `（你正在坐大巴。）` | `（你们一起出来玩，正在坐大巴。）` |
+| `on_a_train` | 在坐火车 | 1 | 48 小时 | 2–4 小时 | `modern` | `（你正在坐火车。）` | `（你们一起出来玩，正在坐火车。）` |
+| `on_a_plane` | 在飞机上 | 1 | 48 小时 | 2–4 小时 | `modern` | `（你正在飞机上。）` | `（你们一起出来玩，正在飞机上。）` |
+| `driving` | 在开车 | 1 | 48 小时 | 1–3 小时 | `modern` | `（你正在开车。）` | `（你们一起出来玩，正开车在路上。）` |
+
+任何旅行都算，出差也在内；只有 `on_a_cruise` 例外，它只在 `short_trip`、`long_trip`、`hometown_visit` 或 `traveling_together`
+期间出现。她自己的旅行中，提示先说旅行：`（你正在短途旅行。你正在坐火车。）`。六种都会讲出来，不离线，不带图，算户外；
+除了要在旅行中，没有别的门槛，各自有自己的冷却，所以同一趟旅行里可以先坐飞机再坐火车。它们是 `mid`，都可以写进 `prefer_events`。
+
+对 `modern` 的角色，它们取代了 `on_the_road`：六种加起来的权重等于 `on_the_road` 在休闲旅行里的权重，出差时是它的六分之五。
+`fantasy` 的角色抽 `on_the_road` 和 `on_a_boat`。
+
 ### 她的世界
 
-`art_metadata.setting` 说她生活在哪个世界：`modern`（默认，其他值也按它读）或 `fantasy`。需要现代生活的种类不会对
-`fantasy` 的角色抽出，不管请求的 `kinds` 或她的 `prefer_events` 怎么写：
+`art_metadata.setting` 说她生活在哪个世界：`modern`（默认，其他值也按它读）或 `fantasy`。不属于她那个世界的种类不会对她抽出，
+不管请求的 `kinds` 或她的 `prefer_events` 怎么写：
 
 | 适用 | 种类 |
 |---|---|
-| 只限 `modern` | `police_encounter`、`showering`、`taking_selfie`、`gaming`、`watching_show`、`business_trip`、`hospitalized`、`post_surgery`、`temp_work`、`scolded_superior` |
+| 只限 `modern` | `police_encounter`、`showering`、`taking_selfie`、`gaming`、`watching_show`、`business_trip`、`hospitalized`、`post_surgery`、`temp_work`、`scolded_superior`、`on_a_cruise`、`on_a_bus`、`on_a_train`、`on_a_plane`、`driving` |
+| 只限 `fantasy` | `on_the_road` |
 | 两者都可 | 其余所有种类 |
 
-目前还没有只限 `fantasy` 的种类，所以 `fantasy` 的角色从更小的集合里抽，没有 `setting` 的角色抽取和以前完全一样。
+`on_the_road` 是唯一只限 `fantasy` 的种类：现代角色改坐[交通工具](#交通工具)。现代角色的 `prefer_events` 里写了它，这一项不起作用。
 
 ### 想出门与想回家
 
@@ -1002,7 +1027,8 @@ affinity delta 上也是同一个 `life_choice` 字段。她的请求用 engine 
 
 **这趟旅行。** `traveling_together`（和对方一起旅行）是 `trip` 类、不可抽取的背景，持续 48 到 72 小时，在用户接受时按整小时均匀抽取。
 开始时结束正在进行的插曲。它不作为事件讲述，因为她对“好”的回应已经说了；全程她照常回复，不算离线。`正在经历` 和判官像读其他背景一样读它。
-期间不抽第二个背景，也不抽任何可能让她离线的种类；`on_the_road`、`admiring_scenery` 和 `taking_selfie` 像跟随她自己的旅行一样跟随它。和所有事件一样，它以角色实例为单位。
+期间不抽第二个背景，也不抽任何可能让她离线的种类；`on_the_road`、`admiring_scenery` 和 `taking_selfie` 像跟随她自己的旅行一样跟随它，
+[交通工具](#交通工具)出现时提示说她和对方一起在路上。和所有事件一样，它以角色实例为单位。
 
 **旅行中的其他请求。** 只有提出分开的那段分开，才把连续的起算点推到事件结束。被接受的旅行以结算时刻为起算点，所以旅途中她也可能提出浪漫选择或一起洗澡。旅行期间她不会提出分开。
 
