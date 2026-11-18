@@ -430,7 +430,9 @@ impl EventKind {
 
     /// Whether the kind belongs in a persona's world (spec
     /// 2026-11-08-strip-and-world-setting-design.md §4): the kinds that need
-    /// modern life fit only `modern`; every other kind fits both.
+    /// modern life fit only `modern`; `on_the_road` fits only `fantasy`,
+    /// where the vehicles do not exist (spec 2026-11-19-vehicles-actions-
+    /// species-design.md §3); every other kind fits both.
     pub fn fits(self, setting: Setting) -> bool {
         use EventKind::*;
         let modern_only = matches!(
@@ -451,7 +453,13 @@ impl EventKind {
                 | OnAPlane
                 | Driving
         );
-        !modern_only || setting == Setting::Modern
+        if modern_only {
+            setting == Setting::Modern
+        } else if self == OnTheRoad {
+            setting == Setting::Fantasy
+        } else {
+            true
+        }
     }
 
     /// A scare that turns out to be nothing once it ends (spec
@@ -810,7 +818,7 @@ fn follows(prior: EventKind, kind: EventKind) -> bool {
             | (SuddenDesire, Strip | Masturbating)
             | (Sick, PeriodScare)
             | (HavingSex | JustHaveSex, PregnancyScare)
-            | (BusinessTrip, OnTheRoad | OnTheWay | Busy | TempWork)
+            | (BusinessTrip, OnTheWay | Busy | TempWork)
             | (
                 ShortTrip | LongTrip | HometownVisit | TravelingTogether,
                 OnTheRoad | AdmiringScenery | TakingSelfie
@@ -2436,11 +2444,14 @@ mod tests {
 
     #[test]
     fn a_background_under_way_is_live() {
-        let none = PersonaTraits::default();
-        let trip = [past(BusinessTrip, 2, 24)];
+        let fantasy = PersonaTraits {
+            setting: Setting::Fantasy,
+            ..Default::default()
+        };
+        let trip = [past(ShortTrip, 2, 48)];
         assert_eq!(
             pick_with(
-                &none,
+                &fantasy,
                 None,
                 3,
                 &trip,
@@ -2496,7 +2507,6 @@ mod tests {
             (SuddenDesire, HavingSex),
             (Sick, PeriodScare),
             (HavingSex, PregnancyScare),
-            (BusinessTrip, OnTheRoad),
             (BusinessTrip, OnTheWay),
             (BusinessTrip, Busy),
             (BusinessTrip, TempWork),
@@ -2811,10 +2821,13 @@ mod tests {
         ScoldedSuperior,
     ];
 
+    /// Spec 2026-11-19-vehicles-actions-species-design.md §3.
+    const FANTASY_ONLY: [EventKind; 1] = [OnTheRoad];
+
     #[test]
     fn modern_only_kinds_never_fit_fantasy() {
         for k in EventKind::ALL.into_iter().chain(EventKind::SPECIAL) {
-            assert!(k.fits(Setting::Modern), "{k:?}");
+            assert_eq!(k.fits(Setting::Modern), !FANTASY_ONLY.contains(&k), "{k:?}");
             assert_eq!(k.fits(Setting::Fantasy), !MODERN_ONLY.contains(&k), "{k:?}");
         }
     }
@@ -3347,9 +3360,13 @@ mod tests {
     /// Spec 2026-11-16-prune-life-events-design.md §4.2.
     #[test]
     fn the_commute_kinds_come_up_only_on_a_trip() {
-        let p = PersonaTraits::default();
-        for k in [OnTheWay, OnTheRoad] {
-            let at = |history: &[PastEvent]| pick_with(&p, None, 1, history, &[k], rolls(0.0, 0.0));
+        let modern = PersonaTraits::default();
+        let fantasy = PersonaTraits {
+            setting: Setting::Fantasy,
+            ..Default::default()
+        };
+        for (k, p) in [(OnTheWay, &modern), (OnTheRoad, &fantasy)] {
+            let at = |history: &[PastEvent]| pick_with(p, None, 1, history, &[k], rolls(0.0, 0.0));
             assert_eq!(at(&[]), None, "{k:?} no background");
             for bg in [
                 BusinessTrip,
@@ -3473,5 +3490,30 @@ mod tests {
             );
             assert_eq!(got, (k == OnABoat).then_some(k), "{k:?}");
         }
+    }
+
+    /// Spec 2026-11-19-vehicles-actions-species-design.md §3.
+    #[test]
+    fn on_the_road_is_drawn_only_in_a_fantasy_world() {
+        let trip = [past(ShortTrip, 1, 48)];
+        let modern = PersonaTraits {
+            prefer_events: vec![OnTheRoad],
+            ..Default::default()
+        };
+        let fantasy = PersonaTraits {
+            setting: Setting::Fantasy,
+            ..Default::default()
+        };
+        assert_eq!(
+            pick_with(&modern, None, 1, &trip, &[OnTheRoad], rolls(0.0, 0.0)),
+            None
+        );
+        assert_eq!(
+            pick_with(&fantasy, None, 1, &trip, &[OnTheRoad], rolls(0.0, 0.0)),
+            Some(OnTheRoad)
+        );
+        assert_eq!(EventKind::parse("on_the_road"), Some(OnTheRoad));
+        assert!(!follows(BusinessTrip, OnTheRoad));
+        assert!(follows(ShortTrip, OnTheRoad));
     }
 }
