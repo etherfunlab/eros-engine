@@ -391,7 +391,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 | `type` | 字段 |
 |---|---|
 | `give` | `item`：下表中的一类，必填；`name`：可选，1–32 字符；`quantity`：可选，1–99，默认 1 |
-| `kiss`、`hug`、`touch`、`lick`、`french_kiss`、`hug_from_behind`、`tease`、`pat`、`photo`、`strip` | 无 |
+| `kiss`、`hug`、`touch`、`lick`、`french_kiss`、`hug_from_behind`、`tease`、`pat`、`wink`、`blink`、`ask_for_dance`、`ask_dancing`、`photo`、`strip` | 无 |
 | `bluff`、`threaten`、`trick` | 无 |
 | `custom` | `text`：必填，1–100 字符 |
 | `tip` | `amount_usd`：必填，有限数值，`> 0` 且 `≤ 1_000_000_000` |
@@ -424,7 +424,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 **脱衣服。** `strip` 是用户脱她的衣服，只有性向相容的一对才可能被接受：这一轮的 `affinity_scope` 含暧昧感轴，`memory_scope` 是什么都不影响。其余的 `strip` 在判官运行之前就判为拒绝，不管判官怎么答，也不管有没有 LLM 判官，并像任何被拒的身体动作一样让 chemistry 线降一档。被接受的 `strip` 让她这一轮没穿衣服：穿着写成衣服被对方脱掉了，有指定 `outfit` 时写成「{outfit}」被对方脱掉了，进回复也进图。有出图能力时它像拍照一样回她的图（见下）。
 
-**让你拍照。** 请求带 `image`、部署配置了 `[tasks.chat_image_prompt_compose]` 时，被接受的 `photo` 以 `reply_text_image` 回复：先是她的话，再是一条以她的脸部参考为基础、按当前场景组出来的 `image_request`。有没有 LLM 判官都一样。被接受的 `strip` 也这样回复。被拒的 `photo` 或 `strip`，或没有这项出图能力的，只回文字，即使判官提议了出图。`image.force = true` 仍让这一轮是 `reply_image`，被拒时图按拒绝的结果来画。
+**让你拍照。** 请求带 `image`、部署配置了 `[tasks.chat_image_prompt_compose]` 时，被接受的 `photo` 以 `reply_text_image` 回复：先是她的话，再是一条以她的脸部参考为基础、按当前场景组出来的 `image_request`。有没有 LLM 判官都一样。被接受的 `strip` 也这样回复，被接受的 `ask_dancing`（用户想看她跳支舞，图是她在跳舞）也一样。被拒的 `photo`、`strip` 或 `ask_dancing`，或没有这项出图能力的，只回文字，即使判官提议了出图。`image.force = true` 仍让这一轮是 `reply_image`，被拒时图按拒绝的结果来画。
 
 **情绪化回复。** 部署打开 [`tones.emotional`](model-config.zh.md#tones--聊天语气仅限-chat-任务)（大于 0）时，带 `french_kiss`、`tease`、`hug_from_behind`、`touch`、`strip`、`threaten` 或 `tip` 的回合用 `emotional` 语气回复，接受、拒绝都一样：回复只凭人设、这个动作和她的决定来写，不看聊天历史、用户画像和亲密度结论。接受还是拒绝仍照上面的方式决定。回复的行带 `metadata.tone = "emotional"`。
 
@@ -546,7 +546,7 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 - `ghost`：`meta(action_type=ghost) → done → final` — 无 `delta`，`meta` 中无 `model`，`done` 的 `usage` 和 `generation_id` 均为 `null`。该轮伴侣保持沉默，未调用聊天模型。
 - 带推理的回合：判官返回了推理时，`reasoning*` 排在这份列表里每种形状的最前面，在 `action_response` 和 `body_state` 之前：`reasoning* → meta(reply) → delta* → done → final`
 - 动作轮次：形状相同，只是 `action_response` 排在第一个 `meta` 之前——`action_response → meta(reply) → delta* → done → final`；不会是 `ghost` 或 `product_qa`
-- 有出图能力时被接受的 `photo` 或 `strip`：`action_response → meta(reply_text_image) → delta* → done → image_request → final`
+- 有出图能力时被接受的 `photo`、`strip` 或 `ask_dancing`：`action_response → meta(reply_text_image) → delta* → done → image_request → final`
 - 被接受的 `date`：`action_response → meta(reply) → delta* → done → final`，`final` 上带 `activity`
 - 带余效或已知需求的回合：`body_state` 位于第一个 `meta` 之前，两者都发时排在 `action_response` 之后——例如 `action_response → body_state → meta(reply) → delta* → done → final`
 - `product_qa`：`meta(action_type=product_qa) → delta* → done → final` — 形状与普通文本回复相同，由独立的模型链（`[tasks.chat_product_qa]`）流式生成，而非 `chat_companion`；落库时带 `channel='product_qa'`，重放时同样报告为 `product_qa`。
@@ -937,11 +937,17 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | `mid` | `out_shopping` | 2–4 小时 | 在逛街（女性角色离线） |
 | `mid` | `bros_gathering` | 2–4 小时 | 兄弟聚会（离线） |
 | `mid` | `sis_gathering` | 2–4 小时 | 姐妹聚会（离线） |
-| `mid` | `on_the_road` | 2–4 小时 | 在路上：长途通勤、坐车、坐火车、坐飞机（只在旅行中，出差也算） |
+| `mid` | `on_the_road` | 2–4 小时 | 在路上，走一段长路（只在旅行中，出差也算；只限 `fantasy` 的角色） |
 | `mid` | `watching_show` | 2–3 小时 | 在看表演 |
 | `mid` | `having_sex` | 1–2 小时 | 在做爱（性瘾角色；离线，从不讲出来） |
 | `mid` | `want_to_go_out` | 1–3 小时 | 很想出门 |
 | `mid` | `want_to_go_home` | 1–3 小时 | 很想回家 |
+| `mid` | `on_a_boat` | 1–2 小时 | 在坐船（只在旅行中，出差也算） |
+| `mid` | `on_a_cruise` | 2–4 小时 | 在游轮上（只在出差以外的旅行中；只限现代） |
+| `mid` | `on_a_bus` | 2–4 小时 | 在坐大巴（只在旅行中，出差也算；只限现代） |
+| `mid` | `on_a_train` | 2–4 小时 | 在坐火车（只在旅行中，出差也算；只限现代） |
+| `mid` | `on_a_plane` | 2–4 小时 | 在飞机上（只在旅行中，出差也算；只限现代） |
+| `mid` | `driving` | 1–3 小时 | 在开车（只在旅行中，出差也算；只限现代） |
 | `body` | `sick` | 1–3 天 | 生病中 |
 | `body` | `period` | 3–7 天 | 月经中 |
 | `body` | `hospitalized` | 2–5 天 | 住院 |
@@ -951,7 +957,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | `trip` | `long_trip` | 3–7 天 | 长途旅游 |
 | `trip` | `hometown_visit` | 72 小时 | 回老家 |
 
-时长写成区间的，在事件开始时从区间里抽定。以上共 63 种可抽取的种类。两种性别都会抽到两个聚会，权重相同，这是有意为之。
+时长写成区间的，在事件开始时从区间里抽定。以上共 69 种可抽取的种类。两种性别都会抽到两个聚会，权重相同，这是有意为之。
 
 另有五种永远不会被抽到：`taking_space`（她提出、用户同意的分开，12–24 小时，离线）、`fell_out`（用户不理会她提出的分开请求时的那场不愉快，1 小时）、`traveling_together`（她提议、用户同意的旅行，48–72 小时，`trip` 类背景，不离线）、`bathing_together`（她提议、用户同意的一起洗澡，30 分钟，`short` 类插曲，不离线）和 `on_a_date`（用户约她、她答应了的约会，1 或 4 小时，`short` 类插曲，不离线）。
 前四种由 engine 为[生活选择流程](#post-v2compsessionsession_idlife-choiceschoice_id)写入，`on_a_date` 为[约会](activities.zh.md)写入。它们作为 `…/effects` 里的 `event` 出现，前四种也作为生活选择响应里的 `event` 出现，
@@ -972,8 +978,10 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
   `on_the_road`、`having_sex`、`bird_encounter`、`streaking`、`got_lost`、`drinking`、`smoking`、`smoking_weed`、
   `just_have_sex`）；
   `period` 期间，`period_scare` 与 `pregnancy_scare` 都不抽；`traveling_together` 期间，不抽任何可能让她离线的种类，
-  也不抽 `just_have_sex`：她和用户在一起。`got_lost` 只在 `short_trip`、`long_trip`、`hometown_visit` 或
-  `traveling_together` 进行期间抽取；`missed_ride`、`on_the_way` 和 `on_the_road` 在这几种或 `business_trip` 进行期间抽取。
+  也不抽 `just_have_sex`：她和用户在一起。`got_lost` 和 `on_a_cruise` 只在 `short_trip`、`long_trip`、`hometown_visit` 或
+  `traveling_together` 进行期间抽取；`missed_ride`、`on_the_way`、`on_the_road`、`on_a_boat`、`on_a_bus`、`on_a_train`、
+  `on_a_plane` 和 `driving` 在这几种或 `business_trip` 进行期间抽取。`on_the_road` 只属于 `fantasy` 的角色，除 `on_a_boat`
+  外的五种交通工具只属于 `modern` 的角色。
 - **她在等回答时什么都不抽。** 从她提出请求（不论哪一种生活选择）起，到它被回答或过期（24 小时）为止，角色任何一个 session 的抽取都返回
   `{"event": null, "message": null}`。带着已经抽过的 `event_key` 来重复调用，照样返回那个事件。
 - **约会没结算时什么都不抽。** 从她答应一场约会起，到它结算为止（约会结束之后也一样），角色任何一个 session 的抽取都返回同样的空值
@@ -988,7 +996,8 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
   `having_sex` 只对 `art_metadata.sex_addict` 为 `true` 的角色抽取，`masturbating` 只对这样的角色在档 3 抽取。
   `drinking`、`smoking`、`smoking_weed` 分别只对 `alcoholic`、`smoking`、`drug` 为 `true` 的角色抽取。`period` 只对 `art_metadata.gender` 为 `"female"` 的角色抽取；
   `period_scare`（档 2 及以上）与 `pregnancy_scare`（档 3）同样只对这样的角色抽取，`saw_bag` 和 `saw_clothes` 也是；
-  从档 2 起，她会说自己想要看中的东西，有 `tip_personality` 的角色用那份人格的口吻说。离线类种类遵循两道 ghost 门槛（见下）。
+  从档 2 起，她会说自己想要看中的东西，有 `tip_personality` 的角色用那份人格的口吻说。`period` 和两种惊吓都不对机器（`art_metadata.species` 为 `"robot"`
+  或 `"android"`）抽取。离线类种类遵循两道 ghost 门槛（见下）。
 - **角色设置**，写在 genome 的 `art_metadata` 里，影响抽取：
 
   | 键 | 取值 | 效果 |
@@ -1047,7 +1056,7 @@ composer 失败时退回普通的人物肖像 prompt，跟聊天回合一样。�
 
 它们持续期间，角色任何一个 session 里的每一轮文字消息都会被 ghost，不经过判官，也不计入 ghost 连续次数，
 `/open` 返回 `null`。已经讲出来的 `busy`、`in_battle` 或 `out_shopping` 同样让轮次沉默。
-带用户 `action` 的轮次（任何 `type`：`give`、`gift`、`tip`、`kiss`、`hug`、`touch`、`lick`、`french_kiss`、`hug_from_behind`、`tease`、`pat`、`photo`、`strip`、`bluff`、`threaten`、`trick`、`custom`）或 `image.force = true` 是例外：
+带用户 `action` 的轮次（任何 `type`：`give`、`gift`、`tip`、`kiss`、`hug`、`touch`、`lick`、`french_kiss`、`hug_from_behind`、`tease`、`pat`、`wink`、`blink`、`ask_for_dance`、`ask_dancing`、`photo`、`strip`、`bluff`、`threaten`、`trick`、`custom`）或 `image.force = true` 是例外：
 它走正常路径并得到回复，因为动作在语义上是线下互动，用不着手机，强制出图的轮次永远是 `reply_image`。
 角色只在 ghost 保护允许的地方才会这样沉默：部署的 ghosting 开关关闭（`ghosting = false`）时不会抽到任何离线类种类，已经在进行的一段也不再让轮次沉默，
 用户消息不足 10 条的会话里也不会抽到；调用方完全不想要它们，就在 `kinds` 里不写。这样被 ghost 的消息没有回执（没有判官读过它），

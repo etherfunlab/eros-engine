@@ -52,7 +52,7 @@ value of the wrong shape reads as absent.
 |---|---|---|
 | `gender` | string | `male` or `female`; any other word is rendered as written. |
 | `age` | integer, or a string holding one | Her age. |
-| `species` | string | `human`, `alien`, `beastkin`, `elf`, `deity`, or any other word. Absent means human. |
+| `species` | string | `human`, `alien`, `beastkin`, `elf`, `deity`, `cyborg`, `robot`, `android`, `zombie`, or any other word. Absent means human. `robot` and `android` are machines: the prompt calls her no AI assistant rather than no AI, and life events never give her a period ([life-events-needs.md](life-events-needs.md#gates)). |
 | `planet` | string | Free text. `earth` or absent renders no planet. |
 | `hometown` | string | Free text. |
 | `timezone` | string | IANA zone of her clock. Absent: the request's `user_timezone`, else `Asia/Singapore`. |

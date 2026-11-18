@@ -257,8 +257,7 @@ A label already journaled for the relationship is not journaled again, even
 when a later session reaches it anew. When a line falls, its `tier_reached`
 rows for the labels it fell below are taken back while they are under 24
 hours old, whether the drop came from a judged turn, a refused action or a
-life choice. `hug`, `touch`, `lick`, `hug_from_behind`, `tease` and `custom`
-actions are not journaled.
+life choice. No other action is journaled.
 
 The scan's model writes the rest: `confession`, `first_intimacy`, `conflict`,
 `reconciliation`, `promise`, `gift`, `shared_plan` and
