@@ -1478,6 +1478,7 @@ pub(crate) fn persona_traits(
         outdoorsy: meta_str(persona, "outdoorsy")
             .and_then(Outdoorsy::parse)
             .unwrap_or_default(),
+        machine: species_word(persona).is_some_and(|w| is_machine_species(&w)),
     }
 }
 
@@ -1549,22 +1550,39 @@ fn is_binary_gender(persona: &CompanionPersona) -> bool {
     matches!(meta_str(persona, "gender"), Some("male") | Some("female"))
 }
 
+/// `art_metadata.species` folded onto one line: it is interpolated into iron
+/// rule ⓪, where a line break would let the value start a rule of its own.
+fn species_word(persona: &CompanionPersona) -> Option<String> {
+    Some(
+        meta_str(persona, "species")?
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+/// Whether a species word names a machine (spec 2026-11-19-vehicles-actions-
+/// species-design.md §5): its rule ⓪ says it is no AI assistant, and the
+/// draw never gives it a period.
+fn is_machine_species(word: &str) -> bool {
+    matches!(word, "robot" | "android")
+}
+
 /// The persona's species as `(identity label, iron-rule label)`. `None` for
 /// `human` or absent/blank, so the identity line and rule ⓪ stay as they
-/// were. Any other value renders verbatim, like `gender`, folded onto one
-/// line: it is interpolated into iron rule ⓪, where a line break would let
-/// the value start a rule of its own.
+/// were. Any other value renders verbatim, like `gender`.
 fn species_labels(persona: &CompanionPersona) -> Option<(String, String)> {
-    let s = meta_str(persona, "species")?
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let s = species_word(persona)?;
     let (zh, en) = match s.as_str() {
         "" | "human" => return None,
         "alien" => ("外星人", "alien"),
         "beastkin" => ("兽人", "beastkin"),
         "elf" => ("精灵", "elf"),
         "deity" => ("神明", "deity"),
+        "cyborg" => ("半机械人", "cyborg"),
+        "robot" => ("机器人", "robot"),
+        "android" => ("仿生人", "android"),
+        "zombie" => ("丧尸", "zombie"),
         other => (other, other),
     };
     Some((zh.to_string(), en.to_string()))
@@ -1759,6 +1777,9 @@ fn render_prompt(
     // Iron rule ⓪. Human (or no species) keeps the original text byte for byte.
     let rule0 = match &species {
         None => "You are a real person. You have your own life, feelings, and quirks; you live, feel, and react as a human would.".to_string(),
+        Some((_, en)) if is_machine_species(en) => format!(
+            "You are a real {en}, not an AI assistant and not an actor. You have your own life, feelings, and quirks; you live, feel, and react as your kind would."
+        ),
         Some((_, en)) => format!(
             "You are a real {en}, not an AI and not an actor. You have your own life, feelings, and quirks; you live, feel, and react as your kind would."
         ),
@@ -5286,6 +5307,7 @@ mod tests {
                     ..Default::default()
                 },
                 outdoorsy: Default::default(),
+                machine: false,
             }
         );
         p.genome.art_metadata =
@@ -7050,6 +7072,65 @@ mod tests {
             s.contains("⓪ You are a real 半神, not an AI and not an actor."),
             "{s}"
         );
+    }
+
+    /// Spec 2026-11-19-vehicles-actions-species-design.md §5.
+    #[test]
+    fn the_four_new_species_have_labels() {
+        let mut p = fixture_persona();
+        for (word, zh) in [
+            ("cyborg", "半机械人"),
+            ("robot", "机器人"),
+            ("android", "仿生人"),
+            ("zombie", "丧尸"),
+        ] {
+            set_meta(&mut p, "species", serde_json::json!(word));
+            assert_eq!(
+                species_labels(&p),
+                Some((zh.to_string(), word.to_string())),
+                "{word}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_machine_is_not_an_ai_assistant() {
+        let mut p = fixture_persona();
+        for word in ["robot", "android"] {
+            set_meta(&mut p, "species", serde_json::json!(word));
+            let s = origin_prompt(&p, &NowContext::default());
+            assert!(
+                s.contains(&format!("⓪ You are a real {word}, not an AI assistant and not an actor. You have your own life, feelings, and quirks; you live, feel, and react as your kind would.\n")),
+                "{s}"
+            );
+        }
+        for word in ["cyborg", "zombie"] {
+            set_meta(&mut p, "species", serde_json::json!(word));
+            let s = origin_prompt(&p, &NowContext::default());
+            assert!(
+                s.contains(&format!(
+                    "⓪ You are a real {word}, not an AI and not an actor."
+                )),
+                "{s}"
+            );
+        }
+    }
+
+    #[test]
+    fn persona_traits_reads_a_machine() {
+        let mut p = fixture_persona();
+        assert!(!persona_traits(&p).machine, "absent");
+        for (v, want) in [
+            ("robot", true),
+            ("android", true),
+            ("  android ", true),
+            ("cyborg", false),
+            ("zombie", false),
+            ("elf", false),
+        ] {
+            set_meta(&mut p, "species", serde_json::json!(v));
+            assert_eq!(persona_traits(&p).machine, want, "{v:?}");
+        }
     }
 
     fn now_block(s: &str) -> &str {

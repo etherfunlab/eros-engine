@@ -723,6 +723,10 @@ pub struct PersonaTraits {
     pub habits: Habits,
     /// `art_metadata.outdoorsy`: scales the outdoor and indoor kinds.
     pub outdoorsy: Outdoorsy,
+    /// `art_metadata.species` is `robot` or `android`: never draws `period`,
+    /// `period_scare` or `pregnancy_scare` (spec 2026-11-19-vehicles-actions-
+    /// species-design.md §5).
+    pub machine: bool,
 }
 
 fn passes_gate(
@@ -743,9 +747,10 @@ fn passes_gate(
         EventKind::Smoking => persona.habits.smoking == Some(true),
         EventKind::SmokingWeed => persona.habits.drug == Some(true),
         EventKind::WantToQuitJob => persona.employed != Employment::Free,
-        EventKind::Period | EventKind::SawBag | EventKind::SawClothes => persona.female,
-        EventKind::PeriodScare => persona.female && rung >= CONFIDE_MIN_RUNG,
-        EventKind::PregnancyScare => persona.female && rung >= DESIRE_MIN_RUNG,
+        EventKind::SawBag | EventKind::SawClothes => persona.female,
+        EventKind::Period => persona.female && !persona.machine,
+        EventKind::PeriodScare => persona.female && !persona.machine && rung >= CONFIDE_MIN_RUNG,
+        EventKind::PregnancyScare => persona.female && !persona.machine && rung >= DESIRE_MIN_RUNG,
         _ => true,
     }
 }
@@ -3515,5 +3520,33 @@ mod tests {
         assert_eq!(EventKind::parse("on_the_road"), Some(OnTheRoad));
         assert!(!follows(BusinessTrip, OnTheRoad));
         assert!(follows(ShortTrip, OnTheRoad));
+    }
+
+    /// Spec 2026-11-19-vehicles-actions-species-design.md §5.
+    #[test]
+    fn a_machine_never_draws_the_period_kinds() {
+        let machine = PersonaTraits {
+            machine: true,
+            ..female()
+        };
+        for k in [Period, PeriodScare, PregnancyScare] {
+            assert_eq!(
+                pick_with(&machine, None, 3, &[], &[k], rolls(0.0, 0.0)),
+                None,
+                "{k:?}"
+            );
+            assert_eq!(
+                pick_with(&female(), None, 3, &[], &[k], rolls(0.0, 0.0)),
+                Some(k),
+                "{k:?}"
+            );
+        }
+        for k in [Sick, SawBag] {
+            assert_eq!(
+                pick_with(&machine, None, 3, &[], &[k], rolls(0.0, 0.0)),
+                Some(k),
+                "{k:?}"
+            );
+        }
     }
 }
