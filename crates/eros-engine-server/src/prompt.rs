@@ -737,6 +737,10 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
         UserAction::HugFromBehind => "悄悄走到你身后，想抱住你".into(),
         UserAction::Tease => "伸手想挑逗你".into(),
         UserAction::Pat => "伸手想拍拍你".into(),
+        UserAction::Wink => "冲你抛了个媚眼".into(),
+        UserAction::Blink => "冲你眨巴眨巴眼睛".into(),
+        UserAction::AskForDance => "伸出手，想请你跳支舞".into(),
+        UserAction::AskDancing => "想看你跳支舞".into(),
         UserAction::Photo => "举起手机想给你拍张照".into(),
         UserAction::Bluff => "在你面前虚张声势，想唬住你".into(),
         UserAction::Threaten => "威胁你".into(),
@@ -1040,6 +1044,12 @@ pub(crate) fn event_label(kind: eros_engine_core::events::EventKind) -> &'static
         JustHaveSex => "刚做完爱",
         Masturbating => "自慰中",
         MissedRide => "没赶上车",
+        OnABoat => "在船上",
+        OnACruise => "在游轮上",
+        OnABus => "在坐大巴",
+        OnATrain => "在坐火车",
+        OnAPlane => "在飞机上",
+        Driving => "在开车",
     }
 }
 
@@ -1468,6 +1478,7 @@ pub(crate) fn persona_traits(
         outdoorsy: meta_str(persona, "outdoorsy")
             .and_then(Outdoorsy::parse)
             .unwrap_or_default(),
+        machine: species_word(persona).is_some_and(|w| is_machine_species(&w)),
     }
 }
 
@@ -1539,22 +1550,39 @@ fn is_binary_gender(persona: &CompanionPersona) -> bool {
     matches!(meta_str(persona, "gender"), Some("male") | Some("female"))
 }
 
+/// `art_metadata.species` folded onto one line: it is interpolated into iron
+/// rule ⓪, where a line break would let the value start a rule of its own.
+fn species_word(persona: &CompanionPersona) -> Option<String> {
+    Some(
+        meta_str(persona, "species")?
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+/// Whether a species word names a machine (spec 2026-11-19-vehicles-actions-
+/// species-design.md §5): its rule ⓪ says it is no AI assistant, and the
+/// draw never gives it a period.
+fn is_machine_species(word: &str) -> bool {
+    matches!(word, "robot" | "android")
+}
+
 /// The persona's species as `(identity label, iron-rule label)`. `None` for
 /// `human` or absent/blank, so the identity line and rule ⓪ stay as they
-/// were. Any other value renders verbatim, like `gender`, folded onto one
-/// line: it is interpolated into iron rule ⓪, where a line break would let
-/// the value start a rule of its own.
+/// were. Any other value renders verbatim, like `gender`.
 fn species_labels(persona: &CompanionPersona) -> Option<(String, String)> {
-    let s = meta_str(persona, "species")?
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let s = species_word(persona)?;
     let (zh, en) = match s.as_str() {
         "" | "human" => return None,
         "alien" => ("外星人", "alien"),
         "beastkin" => ("兽人", "beastkin"),
         "elf" => ("精灵", "elf"),
         "deity" => ("神明", "deity"),
+        "cyborg" => ("半机械人", "cyborg"),
+        "robot" => ("机器人", "robot"),
+        "android" => ("仿生人", "android"),
+        "zombie" => ("丧尸", "zombie"),
         other => (other, other),
     };
     Some((zh.to_string(), en.to_string()))
@@ -1749,6 +1777,9 @@ fn render_prompt(
     // Iron rule ⓪. Human (or no species) keeps the original text byte for byte.
     let rule0 = match &species {
         None => "You are a real person. You have your own life, feelings, and quirks; you live, feel, and react as a human would.".to_string(),
+        Some((_, en)) if is_machine_species(en) => format!(
+            "You are a real {en}, not an AI assistant and not an actor. You have your own life, feelings, and quirks; you live, feel, and react as your kind would."
+        ),
         Some((_, en)) => format!(
             "You are a real {en}, not an AI and not an actor. You have your own life, feelings, and quirks; you live, feel, and react as your kind would."
         ),
@@ -5239,6 +5270,12 @@ mod tests {
                 "刚做完爱",
                 "自慰中",
                 "没赶上车",
+                "在船上",
+                "在游轮上",
+                "在坐大巴",
+                "在坐火车",
+                "在飞机上",
+                "在开车",
             ]
         );
     }
@@ -5270,6 +5307,7 @@ mod tests {
                     ..Default::default()
                 },
                 outdoorsy: Default::default(),
+                machine: false,
             }
         );
         p.genome.art_metadata =
@@ -6458,6 +6496,10 @@ mod tests {
             UserAction::HugFromBehind,
             UserAction::Tease,
             UserAction::Pat,
+            UserAction::Wink,
+            UserAction::Blink,
+            UserAction::AskForDance,
+            UserAction::AskDancing,
             UserAction::Photo,
             UserAction::Bluff,
             UserAction::Threaten,
@@ -6486,6 +6528,10 @@ mod tests {
                 "悄悄走到你身后，想抱住你",
                 "伸手想挑逗你",
                 "伸手想拍拍你",
+                "冲你抛了个媚眼",
+                "冲你眨巴眨巴眼睛",
+                "伸出手，想请你跳支舞",
+                "想看你跳支舞",
                 "举起手机想给你拍张照",
                 "在你面前虚张声势，想唬住你",
                 "威胁你",
@@ -6823,6 +6869,10 @@ mod tests {
             ),
             "对方的动作：「捏了捏你的脸」，你没有接受。"
         );
+        assert_eq!(
+            action_outcome(&UserAction::AskDancing, ActionResponse::Accept),
+            "对方想看你跳支舞，你接受了。"
+        );
     }
 
     #[test]
@@ -7022,6 +7072,65 @@ mod tests {
             s.contains("⓪ You are a real 半神, not an AI and not an actor."),
             "{s}"
         );
+    }
+
+    /// Spec 2026-11-19-vehicles-actions-species-design.md §5.
+    #[test]
+    fn the_four_new_species_have_labels() {
+        let mut p = fixture_persona();
+        for (word, zh) in [
+            ("cyborg", "半机械人"),
+            ("robot", "机器人"),
+            ("android", "仿生人"),
+            ("zombie", "丧尸"),
+        ] {
+            set_meta(&mut p, "species", serde_json::json!(word));
+            assert_eq!(
+                species_labels(&p),
+                Some((zh.to_string(), word.to_string())),
+                "{word}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_machine_is_not_an_ai_assistant() {
+        let mut p = fixture_persona();
+        for word in ["robot", "android"] {
+            set_meta(&mut p, "species", serde_json::json!(word));
+            let s = origin_prompt(&p, &NowContext::default());
+            assert!(
+                s.contains(&format!("⓪ You are a real {word}, not an AI assistant and not an actor. You have your own life, feelings, and quirks; you live, feel, and react as your kind would.\n")),
+                "{s}"
+            );
+        }
+        for word in ["cyborg", "zombie"] {
+            set_meta(&mut p, "species", serde_json::json!(word));
+            let s = origin_prompt(&p, &NowContext::default());
+            assert!(
+                s.contains(&format!(
+                    "⓪ You are a real {word}, not an AI and not an actor."
+                )),
+                "{s}"
+            );
+        }
+    }
+
+    #[test]
+    fn persona_traits_reads_a_machine() {
+        let mut p = fixture_persona();
+        assert!(!persona_traits(&p).machine, "absent");
+        for (v, want) in [
+            ("robot", true),
+            ("android", true),
+            ("  android ", true),
+            ("cyborg", false),
+            ("zombie", false),
+            ("elf", false),
+        ] {
+            set_meta(&mut p, "species", serde_json::json!(v));
+            assert_eq!(persona_traits(&p).machine, want, "{v:?}");
+        }
     }
 
     fn now_block(s: &str) -> &str {

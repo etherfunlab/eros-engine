@@ -159,6 +159,10 @@ pub enum UserActionKind {
     HugFromBehind,
     Tease,
     Pat,
+    Wink,
+    Blink,
+    AskForDance,
+    AskDancing,
     Photo,
     Bluff,
     Threaten,
@@ -391,6 +395,10 @@ impl UserActionDto {
             UserActionKind::HugFromBehind => UserAction::HugFromBehind,
             UserActionKind::Tease => UserAction::Tease,
             UserActionKind::Pat => UserAction::Pat,
+            UserActionKind::Wink => UserAction::Wink,
+            UserActionKind::Blink => UserAction::Blink,
+            UserActionKind::AskForDance => UserAction::AskForDance,
+            UserActionKind::AskDancing => UserAction::AskDancing,
             UserActionKind::Photo => UserAction::Photo,
             UserActionKind::Bluff => UserAction::Bluff,
             UserActionKind::Threaten => UserAction::Threaten,
@@ -4853,6 +4861,27 @@ mod validate_payload_tests {
         .expect("history parses a stored threaten");
         assert_eq!(view.response, Some(ActionResponseDto::Refuse));
         assert_eq!(view.action.kind, UserActionKind::Threaten);
+    }
+
+    /// Spec 2026-11-19-vehicles-actions-species-design.md §4.
+    #[test]
+    fn the_eye_and_dance_actions_map_one_to_one() {
+        for (wire, want) in [
+            ("wink", UserAction::Wink),
+            ("blink", UserAction::Blink),
+            ("ask_for_dance", UserAction::AskForDance),
+            ("ask_dancing", UserAction::AskDancing),
+        ] {
+            let dto: UserActionDto = serde_json::from_value(serde_json::json!({"type": wire}))
+                .unwrap_or_else(|e| panic!("{wire}: {e}"));
+            assert_eq!(dto.to_core().unwrap(), want, "{wire}");
+        }
+        let view = UserActionView::from_metadata_action(
+            &serde_json::json!({"type": "ask_dancing", "response": "accept"}),
+        )
+        .expect("history parses a stored ask_dancing");
+        assert_eq!(view.response, Some(ActionResponseDto::Accept));
+        assert_eq!(view.action.kind, UserActionKind::AskDancing);
     }
 
     #[test]

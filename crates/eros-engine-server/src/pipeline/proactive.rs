@@ -341,6 +341,12 @@ fn kind_cue(
         JustHaveSex => "（你刚和人做完爱。）".into(),
         Masturbating => "（你正在自慰。）".into(),
         MissedRide => "（你刚没赶上车。）".into(),
+        OnABoat => "（你正在坐船。）".into(),
+        OnACruise => "（你正在游轮上。）".into(),
+        OnABus => "（你正在坐大巴。）".into(),
+        OnATrain => "（你正在坐火车。）".into(),
+        OnAPlane => "（你正在飞机上。）".into(),
+        Driving => "（你正在开车。）".into(),
         WantToGoOut => "（你现在很想出门走走。）".into(),
         WantToGoHome => "（你现在很想回家。）".into(),
         TempWork => "（你刚临时接到一份工作，得马上去处理。）".into(),
@@ -405,6 +411,12 @@ fn event_cue(
         match kind {
             EventKind::GotLost => return "（你们一起出来玩，刚迷了路。）".into(),
             EventKind::MissedRide => return "（你们一起出来玩，刚没赶上车。）".into(),
+            EventKind::OnABoat => return "（你们一起出来玩，正在坐船。）".into(),
+            EventKind::OnACruise => return "（你们一起出来玩，正在游轮上。）".into(),
+            EventKind::OnABus => return "（你们一起出来玩，正在坐大巴。）".into(),
+            EventKind::OnATrain => return "（你们一起出来玩，正在坐火车。）".into(),
+            EventKind::OnAPlane => return "（你们一起出来玩，正在飞机上。）".into(),
+            EventKind::Driving => return "（你们一起出来玩，正开车在路上。）".into(),
             _ => {}
         }
     }
@@ -1150,6 +1162,72 @@ mod tests {
         assert_eq!(
             cue(Some(EventKind::TravelingTogether)),
             "（你们一起出来玩，刚没赶上车。）"
+        );
+    }
+
+    /// Spec 2026-11-19-vehicles-actions-species-design.md §2.
+    #[test]
+    fn the_vehicle_cues_alone_and_together() {
+        let h = Duration::hours(2);
+        let p = PersonaTraits::default();
+        for (kind, alone, together) in [
+            (
+                EventKind::OnABoat,
+                "（你正在坐船。）",
+                "（你们一起出来玩，正在坐船。）",
+            ),
+            (
+                EventKind::OnACruise,
+                "（你正在游轮上。）",
+                "（你们一起出来玩，正在游轮上。）",
+            ),
+            (
+                EventKind::OnABus,
+                "（你正在坐大巴。）",
+                "（你们一起出来玩，正在坐大巴。）",
+            ),
+            (
+                EventKind::OnATrain,
+                "（你正在坐火车。）",
+                "（你们一起出来玩，正在坐火车。）",
+            ),
+            (
+                EventKind::OnAPlane,
+                "（你正在飞机上。）",
+                "（你们一起出来玩，正在飞机上。）",
+            ),
+            (
+                EventKind::Driving,
+                "（你正在开车。）",
+                "（你们一起出来玩，正开车在路上。）",
+            ),
+        ] {
+            assert_eq!(kind_cue(kind, h, 1, &p, None, false), alone, "{kind:?}");
+            assert_eq!(
+                event_cue(
+                    kind,
+                    h,
+                    Some(EventKind::TravelingTogether),
+                    1,
+                    &p,
+                    None,
+                    false
+                ),
+                together,
+                "{kind:?}"
+            );
+        }
+        assert_eq!(
+            event_cue(
+                EventKind::OnATrain,
+                h,
+                Some(EventKind::ShortTrip),
+                1,
+                &p,
+                None,
+                false
+            ),
+            "（你正在短途旅行。你正在坐火车。）"
         );
     }
 

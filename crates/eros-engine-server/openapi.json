@@ -5603,7 +5603,13 @@
           "smoking_weed",
           "just_have_sex",
           "masturbating",
-          "missed_ride"
+          "missed_ride",
+          "on_a_boat",
+          "on_a_cruise",
+          "on_a_bus",
+          "on_a_train",
+          "on_a_plane",
+          "driving"
         ]
       },
       "EventView": {
@@ -8127,6 +8133,10 @@
           "hug_from_behind",
           "tease",
           "pat",
+          "wink",
+          "blink",
+          "ask_for_dance",
+          "ask_dancing",
           "photo",
           "bluff",
           "threaten",

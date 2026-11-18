@@ -2828,9 +2828,10 @@ fn render_product_qa_pairs(pairs: &[(String, String)]) -> String {
         .join("\n")
 }
 
-/// The action type a `photo` or `strip` turn changes to, or `None` when the
-/// plan stands (spec 2026-11-08-five-actions-two-items-gluttony-card-1-1-
-/// design.md §2.3, 2026-11-08-strip-and-world-setting-design.md §2.2): an
+/// The action type a `photo`, `strip` or `ask_dancing` turn changes to, or
+/// `None` when the plan stands (spec 2026-11-08-five-actions-two-items-
+/// gluttony-card-1-1-design.md §2.3, 2026-11-08-strip-and-world-setting-
+/// design.md §2.2, 2026-11-19-vehicles-actions-species-design.md §4): an
 /// accepted one with an image executor shows her picture after her words,
 /// always of her face; any other is text only, even when the judge proposed a
 /// picture. A `date` turn is always text only, whatever her answer (spec
@@ -2853,7 +2854,7 @@ fn picture_action(
         && !matches!(
             event,
             Event::UserMessage {
-                action: Some(UserAction::Photo | UserAction::Strip),
+                action: Some(UserAction::Photo | UserAction::Strip | UserAction::AskDancing),
                 ..
             }
         )
@@ -5102,8 +5103,9 @@ pub(crate) fn run_stream_with(
         // forced image turn. The composer generates from the recent scene now
         // that no seed exists, so a forced image with the judge disabled must
         // not lose that context; rule-based `pde::decide` never picks image
-        // actions, so `force_image` and a photo turn's picture (spec
-        // 2026-11-08 §2.3) are the judge-less image paths.
+        // actions, so `force_image` and the picture of a photo, strip or
+        // ask_dancing turn (spec 2026-11-08 §2.3) are the judge-less image
+        // paths.
         let picture_turn = image_executor_available
             && matches!(
                 &input.event,
@@ -5111,6 +5113,7 @@ pub(crate) fn run_stream_with(
                     action: Some(
                         eros_engine_core::types::UserAction::Photo
                             | eros_engine_core::types::UserAction::Strip
+                            | eros_engine_core::types::UserAction::AskDancing
                     ),
                     ..
                 }
@@ -11036,6 +11039,42 @@ data: [DONE]\n\n";
             composer_body.contains("举起手机想给你拍张照"),
             "the composer reads the photo turn: {composer_body}"
         );
+    }
+
+    /// An accepted `ask_dancing` shows her picture after her words, as a
+    /// photo does (spec 2026-11-19-vehicles-actions-species-design.md §4).
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_accepted_ask_dancing_shows_her_dancing(pool: PgPool) {
+        let (frames, composer_body) = run_picture_turn(
+            &pool,
+            eros_engine_core::types::UserAction::AskDancing,
+            Default::default(),
+            Default::default(),
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        assert_eq!(meta_action_type(&frames), FrameActionType::ReplyTextImage);
+        let types = frame_type_names(&frames);
+        assert_eq!(types.iter().filter(|t| *t == "image_request").count(), 1);
+        assert!(composer_body.contains("想看你跳支舞"), "{composer_body}");
+    }
+
+    /// `image.force` still wins on an `ask_dancing` turn: image only.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_forced_image_still_wins_on_ask_dancing(pool: PgPool) {
+        let (frames, _) = run_picture_turn(
+            &pool,
+            eros_engine_core::types::UserAction::AskDancing,
+            Default::default(),
+            Default::default(),
+            None,
+            true,
+        )
+        .await;
+        assert_eq!(meta_action_type(&frames), FrameActionType::ReplyImage);
+        assert!(!frame_type_names(&frames).iter().any(|t| t == "delta"));
     }
 
     /// `image.force` still wins on a photo turn: image only.
@@ -19991,7 +20030,7 @@ data: [DONE]\n\n";
         use eros_engine_core::types::ActionResponse::{Accept, Refuse};
         use eros_engine_core::types::ActionType::{ReplyImage, ReplyText, ReplyTextImage};
         use eros_engine_core::types::DateDuration;
-        use eros_engine_core::types::UserAction::{Kiss, Photo, Strip};
+        use eros_engine_core::types::UserAction::{AskDancing, Kiss, Photo, Strip};
         let cases = [
             (Kiss, Accept, ReplyText, true, None),
             (Photo, Accept, ReplyText, true, Some(ReplyTextImage)),
@@ -20005,6 +20044,10 @@ data: [DONE]\n\n";
             (Strip, Accept, ReplyText, false, None),
             (Strip, Refuse, ReplyTextImage, true, Some(ReplyText)),
             (Strip, Refuse, ReplyText, true, None),
+            (AskDancing, Accept, ReplyText, true, Some(ReplyTextImage)),
+            (AskDancing, Accept, ReplyText, false, None),
+            (AskDancing, Refuse, ReplyTextImage, true, Some(ReplyText)),
+            (AskDancing, Refuse, ReplyText, true, None),
             (
                 date_of(DateDuration::Short),
                 Accept,

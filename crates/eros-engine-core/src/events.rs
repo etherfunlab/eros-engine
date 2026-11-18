@@ -130,6 +130,19 @@ pub enum EventKind {
     Masturbating,
     /// She missed her ride: only on a trip.
     MissedRide,
+    /// She is on a boat: only on a trip (spec 2026-11-19-vehicles-actions-
+    /// species-design.md §2).
+    OnABoat,
+    /// She is on a cruise ship: only on a leisure trip.
+    OnACruise,
+    /// She is on a coach: only on a trip.
+    OnABus,
+    /// She is on a train: only on a trip.
+    OnATrain,
+    /// She is on a plane: only on a trip.
+    OnAPlane,
+    /// She is driving: only on a trip.
+    Driving,
     /// She and the user take a bath together: written when the user accepts
     /// her `bathe_together` ask.
     BathingTogether,
@@ -140,7 +153,7 @@ pub enum EventKind {
 
 impl EventKind {
     /// Every drawable kind, in draw order.
-    pub const ALL: [EventKind; 63] = [
+    pub const ALL: [EventKind; 69] = [
         EventKind::PoliceEncounter,
         EventKind::AnimalEncounter,
         EventKind::HitSomeone,
@@ -204,6 +217,12 @@ impl EventKind {
         EventKind::JustHaveSex,
         EventKind::Masturbating,
         EventKind::MissedRide,
+        EventKind::OnABoat,
+        EventKind::OnACruise,
+        EventKind::OnABus,
+        EventKind::OnATrain,
+        EventKind::OnAPlane,
+        EventKind::Driving,
     ];
 
     /// Kinds the writers place directly, never drawn: parsed and stored, not in `ALL`.
@@ -286,6 +305,12 @@ impl EventKind {
             EventKind::JustHaveSex => "just_have_sex",
             EventKind::Masturbating => "masturbating",
             EventKind::MissedRide => "missed_ride",
+            EventKind::OnABoat => "on_a_boat",
+            EventKind::OnACruise => "on_a_cruise",
+            EventKind::OnABus => "on_a_bus",
+            EventKind::OnATrain => "on_a_train",
+            EventKind::OnAPlane => "on_a_plane",
+            EventKind::Driving => "driving",
         }
     }
 
@@ -309,7 +334,8 @@ impl EventKind {
             TempWork | ExMessage | GotHit | Breakup | WorkingOut | Reading | Gaming
             | AwayFromPhone | Unwell | Irritable | Busy | InBattle | Asleep | OutShopping
             | BrosGathering | SisGathering | OnTheRoad | WatchingShow | HavingSex | WantToGoOut
-            | WantToGoHome | TakingSpace | FellOut => EventCategory::Mid,
+            | WantToGoHome | TakingSpace | FellOut | OnABoat | OnACruise | OnABus | OnATrain
+            | OnAPlane | Driving => EventCategory::Mid,
             Sick | Period | Hospitalized | PostSurgery => EventCategory::Body,
             BusinessTrip | ShortTrip | LongTrip | HometownVisit | TravelingTogether => {
                 EventCategory::Trip
@@ -331,7 +357,9 @@ impl EventKind {
         match self {
             PoliceEncounter | AnimalEncounter | OnTheWay | GotBumped | AdmiringScenery
             | BirdEncounter | WantToSeeSea | WantHotSpring | GotLost | MissedRide | OnTheRoad
-            | WantToGoOut => Place::Outdoor,
+            | WantToGoOut | OnABoat | OnACruise | OnABus | OnATrain | OnAPlane | Driving => {
+                Place::Outdoor
+            }
             Showering | Bathing | ScoldedBySuperior | ScoldedSuperior | AdmiringArt | WantSauna
             | Reading | Gaming | WantToGoHome => Place::Indoor,
             _ => Place::Neutral,
@@ -402,7 +430,9 @@ impl EventKind {
 
     /// Whether the kind belongs in a persona's world (spec
     /// 2026-11-08-strip-and-world-setting-design.md §4): the kinds that need
-    /// modern life fit only `modern`; every other kind fits both.
+    /// modern life fit only `modern`; `on_the_road` fits only `fantasy`,
+    /// where the vehicles do not exist (spec 2026-11-19-vehicles-actions-
+    /// species-design.md §3); every other kind fits both.
     pub fn fits(self, setting: Setting) -> bool {
         use EventKind::*;
         let modern_only = matches!(
@@ -417,8 +447,19 @@ impl EventKind {
                 | PostSurgery
                 | TempWork
                 | ScoldedSuperior
+                | OnACruise
+                | OnABus
+                | OnATrain
+                | OnAPlane
+                | Driving
         );
-        !modern_only || setting == Setting::Modern
+        if modern_only {
+            setting == Setting::Modern
+        } else if self == OnTheRoad {
+            setting == Setting::Fantasy
+        } else {
+            true
+        }
     }
 
     /// A scare that turns out to be nothing once it ends (spec
@@ -517,6 +558,12 @@ fn rule(kind: EventKind) -> Rule {
         JustHaveSex => (1.0, 48, Lasts::Minutes(30)),
         Masturbating => (1.0, 24, Lasts::Minutes(30)),
         MissedRide => (3.0, 48, Lasts::Hours(1, 1)),
+        OnABoat => (1.0, 48, Lasts::Hours(1, 2)),
+        OnACruise => (1.0, 48, Lasts::Hours(2, 4)),
+        OnABus => (1.0, 48, Lasts::Hours(2, 4)),
+        OnATrain => (1.0, 48, Lasts::Hours(2, 4)),
+        OnAPlane => (1.0, 48, Lasts::Hours(2, 4)),
+        Driving => (1.0, 48, Lasts::Hours(1, 3)),
     };
     Rule {
         weight,
@@ -676,6 +723,10 @@ pub struct PersonaTraits {
     pub habits: Habits,
     /// `art_metadata.outdoorsy`: scales the outdoor and indoor kinds.
     pub outdoorsy: Outdoorsy,
+    /// `art_metadata.species` is `robot` or `android`: never draws `period`,
+    /// `period_scare` or `pregnancy_scare` (spec 2026-11-19-vehicles-actions-
+    /// species-design.md §5).
+    pub machine: bool,
 }
 
 fn passes_gate(
@@ -696,9 +747,10 @@ fn passes_gate(
         EventKind::Smoking => persona.habits.smoking == Some(true),
         EventKind::SmokingWeed => persona.habits.drug == Some(true),
         EventKind::WantToQuitJob => persona.employed != Employment::Free,
-        EventKind::Period | EventKind::SawBag | EventKind::SawClothes => persona.female,
-        EventKind::PeriodScare => persona.female && rung >= CONFIDE_MIN_RUNG,
-        EventKind::PregnancyScare => persona.female && rung >= DESIRE_MIN_RUNG,
+        EventKind::SawBag | EventKind::SawClothes => persona.female,
+        EventKind::Period => persona.female && !persona.machine,
+        EventKind::PeriodScare => persona.female && !persona.machine && rung >= CONFIDE_MIN_RUNG,
+        EventKind::PregnancyScare => persona.female && !persona.machine && rung >= DESIRE_MIN_RUNG,
         _ => true,
     }
 }
@@ -771,7 +823,7 @@ fn follows(prior: EventKind, kind: EventKind) -> bool {
             | (SuddenDesire, Strip | Masturbating)
             | (Sick, PeriodScare)
             | (HavingSex | JustHaveSex, PregnancyScare)
-            | (BusinessTrip, OnTheRoad | OnTheWay | Busy | TempWork)
+            | (BusinessTrip, OnTheWay | Busy | TempWork)
             | (
                 ShortTrip | LongTrip | HometownVisit | TravelingTogether,
                 OnTheRoad | AdmiringScenery | TakingSelfie
@@ -898,18 +950,22 @@ fn outdoorsy_factor(kind: EventKind, persona: &PersonaTraits) -> f64 {
 /// sex-design.md §2.1): she gets lost only on a trip; she misses a ride on
 /// any trip, a business trip included (spec 2026-11-11-outdoorsy-missed-
 /// ride-and-accept-ends-incident-design.md §3), and is on her way or on the
-/// road only then (spec 2026-11-16-prune-life-events-design.md §4.2).
+/// road only then (spec 2026-11-16-prune-life-events-design.md §4.2). The
+/// vehicles ride on any trip, except a cruise, which is never business (spec
+/// 2026-11-19-vehicles-actions-species-design.md §2).
 fn needs_background(kind: EventKind) -> Option<&'static [EventKind]> {
     use EventKind::*;
     match kind {
-        GotLost => Some(&[ShortTrip, LongTrip, HometownVisit, TravelingTogether]),
-        MissedRide | OnTheWay | OnTheRoad => Some(&[
-            BusinessTrip,
-            ShortTrip,
-            LongTrip,
-            HometownVisit,
-            TravelingTogether,
-        ]),
+        GotLost | OnACruise => Some(&[ShortTrip, LongTrip, HometownVisit, TravelingTogether]),
+        MissedRide | OnTheWay | OnTheRoad | OnABoat | OnABus | OnATrain | OnAPlane | Driving => {
+            Some(&[
+                BusinessTrip,
+                ShortTrip,
+                LongTrip,
+                HometownVisit,
+                TravelingTogether,
+            ])
+        }
         _ => None,
     }
 }
@@ -1674,7 +1730,7 @@ mod tests {
         let count = |c| EventKind::ALL.iter().filter(|k| k.category() == c).count();
         assert_eq!(
             EventCategory::ALL.map(count),
-            [34, 21, 4, 4],
+            [34, 27, 4, 4],
             "short, mid, body, trip"
         );
         assert!(!EventCategory::Short.is_background());
@@ -1703,7 +1759,13 @@ mod tests {
 
     /// The kinds added after the v2 kinds; tests pinned to the weights of
     /// those draw from `earlier()`.
-    const ADDED: [EventKind; 37] = [
+    const ADDED: [EventKind; 43] = [
+        OnABoat,
+        OnACruise,
+        OnABus,
+        OnATrain,
+        OnAPlane,
+        Driving,
         MissedRide,
         GotLost,
         Drinking,
@@ -1947,7 +2009,7 @@ mod tests {
             assert_eq!(EventKind::parse(s), Some(k));
             assert!(EventKind::ALL.contains(&k), "{k:?}");
         }
-        assert_eq!(EventKind::ALL.len(), 63);
+        assert_eq!(EventKind::ALL.len(), 69);
     }
 
     #[test]
@@ -1956,7 +2018,7 @@ mod tests {
         assert_eq!(EventKind::parse("fell_out"), Some(FellOut));
         assert!(!EventKind::ALL.contains(&TakingSpace));
         assert!(!EventKind::ALL.contains(&FellOut));
-        assert_eq!(EventKind::ALL.len(), 63);
+        assert_eq!(EventKind::ALL.len(), 69);
         assert_eq!(EventKind::SPECIAL.len(), 5);
         for k in EventKind::SPECIAL {
             assert_eq!(serde_json::to_value(k).unwrap(), k.as_str());
@@ -2387,11 +2449,14 @@ mod tests {
 
     #[test]
     fn a_background_under_way_is_live() {
-        let none = PersonaTraits::default();
-        let trip = [past(BusinessTrip, 2, 24)];
+        let fantasy = PersonaTraits {
+            setting: Setting::Fantasy,
+            ..Default::default()
+        };
+        let trip = [past(ShortTrip, 2, 48)];
         assert_eq!(
             pick_with(
-                &none,
+                &fantasy,
                 None,
                 3,
                 &trip,
@@ -2447,7 +2512,6 @@ mod tests {
             (SuddenDesire, HavingSex),
             (Sick, PeriodScare),
             (HavingSex, PregnancyScare),
-            (BusinessTrip, OnTheRoad),
             (BusinessTrip, OnTheWay),
             (BusinessTrip, Busy),
             (BusinessTrip, TempWork),
@@ -2744,7 +2808,12 @@ mod tests {
 
     /// Spec 2026-11-08-strip-and-world-setting-design.md §4; spec
     /// 2026-11-16-prune-life-events-design.md §4.3.
-    const MODERN_ONLY: [EventKind; 10] = [
+    const MODERN_ONLY: [EventKind; 15] = [
+        OnACruise,
+        OnABus,
+        OnATrain,
+        OnAPlane,
+        Driving,
         PoliceEncounter,
         Showering,
         TakingSelfie,
@@ -2757,10 +2826,13 @@ mod tests {
         ScoldedSuperior,
     ];
 
+    /// Spec 2026-11-19-vehicles-actions-species-design.md §3.
+    const FANTASY_ONLY: [EventKind; 1] = [OnTheRoad];
+
     #[test]
     fn modern_only_kinds_never_fit_fantasy() {
         for k in EventKind::ALL.into_iter().chain(EventKind::SPECIAL) {
-            assert!(k.fits(Setting::Modern), "{k:?}");
+            assert_eq!(k.fits(Setting::Modern), !FANTASY_ONLY.contains(&k), "{k:?}");
             assert_eq!(k.fits(Setting::Fantasy), !MODERN_ONLY.contains(&k), "{k:?}");
         }
     }
@@ -2979,6 +3051,12 @@ mod tests {
             MissedRide,
             OnTheRoad,
             WantToGoOut,
+            OnABoat,
+            OnACruise,
+            OnABus,
+            OnATrain,
+            OnAPlane,
+            Driving,
         ];
         let indoor = [
             Showering,
@@ -3281,15 +3359,19 @@ mod tests {
         for name in DELETED {
             assert_eq!(EventKind::parse(name), None, "{name}");
         }
-        assert_eq!(EventKind::ALL.len(), 63);
+        assert_eq!(EventKind::ALL.len(), 69);
     }
 
     /// Spec 2026-11-16-prune-life-events-design.md §4.2.
     #[test]
     fn the_commute_kinds_come_up_only_on_a_trip() {
-        let p = PersonaTraits::default();
-        for k in [OnTheWay, OnTheRoad] {
-            let at = |history: &[PastEvent]| pick_with(&p, None, 1, history, &[k], rolls(0.0, 0.0));
+        let modern = PersonaTraits::default();
+        let fantasy = PersonaTraits {
+            setting: Setting::Fantasy,
+            ..Default::default()
+        };
+        for (k, p) in [(OnTheWay, &modern), (OnTheRoad, &fantasy)] {
+            let at = |history: &[PastEvent]| pick_with(p, None, 1, history, &[k], rolls(0.0, 0.0));
             assert_eq!(at(&[]), None, "{k:?} no background");
             for bg in [
                 BusinessTrip,
@@ -3342,5 +3424,129 @@ mod tests {
         }
         assert_eq!(at(&[past(Sick, 1, 48)]), None, "not a trip");
         assert_eq!(at(&[past(BusinessTrip, 72, 48)]), None, "the trip is over");
+    }
+
+    /// Spec 2026-11-19-vehicles-actions-species-design.md §2.
+    const VEHICLES: [(EventKind, &str, i64, i64); 6] = [
+        (OnABoat, "on_a_boat", 1, 2),
+        (OnACruise, "on_a_cruise", 2, 4),
+        (OnABus, "on_a_bus", 2, 4),
+        (OnATrain, "on_a_train", 2, 4),
+        (OnAPlane, "on_a_plane", 2, 4),
+        (Driving, "driving", 1, 3),
+    ];
+
+    #[test]
+    fn six_vehicle_kinds_parse_and_rule() {
+        for (k, s, lo, hi) in VEHICLES {
+            assert_eq!(k.as_str(), s);
+            assert_eq!(EventKind::parse(s), Some(k));
+            assert!(EventKind::ALL.contains(&k), "{k:?}");
+            assert_eq!(k.category(), EventCategory::Mid, "{k:?}");
+            assert_eq!(k.place(), Place::Outdoor, "{k:?}");
+            let r = rule(k);
+            assert!((r.weight - 1.0).abs() < E, "{k:?}");
+            assert_eq!(r.cooldown_hours, 48, "{k:?}");
+            assert_eq!(lasts(k, 0.0), Duration::hours(lo), "{k:?}");
+            assert_eq!(lasts(k, 0.999), Duration::hours(hi), "{k:?}");
+            assert!(
+                !k.may_be_offline() && !k.is_photo() && !k.speaks_emotionally(),
+                "{k:?}"
+            );
+            assert!(is_told(k, 1, &PersonaTraits::default()), "{k:?}");
+            assert!(k.fits(Setting::Modern), "{k:?}");
+            assert_eq!(k.fits(Setting::Fantasy), k == OnABoat, "{k:?}");
+        }
+    }
+
+    #[test]
+    fn the_vehicles_come_up_only_on_a_trip() {
+        let p = PersonaTraits::default();
+        for (k, ..) in VEHICLES {
+            let at = |h: &[PastEvent]| pick_with(&p, None, 1, h, &[k], rolls(0.0, 0.0));
+            assert_eq!(at(&[]), None, "{k:?} no background");
+            for bg in [ShortTrip, LongTrip, HometownVisit, TravelingTogether] {
+                assert_eq!(at(&[past(bg, 1, 48)]), Some(k), "{k:?} {bg:?}");
+            }
+            assert_eq!(
+                at(&[past(BusinessTrip, 1, 48)]),
+                (k != OnACruise).then_some(k),
+                "{k:?}"
+            );
+            assert_eq!(at(&[past(Sick, 1, 48)]), None, "{k:?} not a trip");
+            assert_eq!(
+                at(&[past(ShortTrip, 72, 48)]),
+                None,
+                "{k:?} the trip is over"
+            );
+        }
+        let fantasy = PersonaTraits {
+            setting: Setting::Fantasy,
+            ..Default::default()
+        };
+        for (k, ..) in VEHICLES {
+            let got = pick_with(
+                &fantasy,
+                None,
+                1,
+                &[past(ShortTrip, 1, 48)],
+                &[k],
+                rolls(0.0, 0.0),
+            );
+            assert_eq!(got, (k == OnABoat).then_some(k), "{k:?}");
+        }
+    }
+
+    /// Spec 2026-11-19-vehicles-actions-species-design.md §3.
+    #[test]
+    fn on_the_road_is_drawn_only_in_a_fantasy_world() {
+        let trip = [past(ShortTrip, 1, 48)];
+        let modern = PersonaTraits {
+            prefer_events: vec![OnTheRoad],
+            ..Default::default()
+        };
+        let fantasy = PersonaTraits {
+            setting: Setting::Fantasy,
+            ..Default::default()
+        };
+        assert_eq!(
+            pick_with(&modern, None, 1, &trip, &[OnTheRoad], rolls(0.0, 0.0)),
+            None
+        );
+        assert_eq!(
+            pick_with(&fantasy, None, 1, &trip, &[OnTheRoad], rolls(0.0, 0.0)),
+            Some(OnTheRoad)
+        );
+        assert_eq!(EventKind::parse("on_the_road"), Some(OnTheRoad));
+        assert!(!follows(BusinessTrip, OnTheRoad));
+        assert!(follows(ShortTrip, OnTheRoad));
+    }
+
+    /// Spec 2026-11-19-vehicles-actions-species-design.md §5.
+    #[test]
+    fn a_machine_never_draws_the_period_kinds() {
+        let machine = PersonaTraits {
+            machine: true,
+            ..female()
+        };
+        for k in [Period, PeriodScare, PregnancyScare] {
+            assert_eq!(
+                pick_with(&machine, None, 3, &[], &[k], rolls(0.0, 0.0)),
+                None,
+                "{k:?}"
+            );
+            assert_eq!(
+                pick_with(&female(), None, 3, &[], &[k], rolls(0.0, 0.0)),
+                Some(k),
+                "{k:?}"
+            );
+        }
+        for k in [Sick, SawBag] {
+            assert_eq!(
+                pick_with(&machine, None, 3, &[], &[k], rolls(0.0, 0.0)),
+                Some(k),
+                "{k:?}"
+            );
+        }
     }
 }
