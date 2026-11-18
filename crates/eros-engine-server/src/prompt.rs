@@ -737,6 +737,10 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
         UserAction::HugFromBehind => "悄悄走到你身后，想抱住你".into(),
         UserAction::Tease => "伸手想挑逗你".into(),
         UserAction::Pat => "伸手想拍拍你".into(),
+        UserAction::Wink => "冲你抛了个媚眼".into(),
+        UserAction::Blink => "冲你眨巴眨巴眼睛".into(),
+        UserAction::AskForDance => "伸出手，想请你跳支舞".into(),
+        UserAction::AskDancing => "想看你跳支舞".into(),
         UserAction::Photo => "举起手机想给你拍张照".into(),
         UserAction::Bluff => "在你面前虚张声势，想唬住你".into(),
         UserAction::Threaten => "威胁你".into(),
@@ -6470,6 +6474,10 @@ mod tests {
             UserAction::HugFromBehind,
             UserAction::Tease,
             UserAction::Pat,
+            UserAction::Wink,
+            UserAction::Blink,
+            UserAction::AskForDance,
+            UserAction::AskDancing,
             UserAction::Photo,
             UserAction::Bluff,
             UserAction::Threaten,
@@ -6498,6 +6506,10 @@ mod tests {
                 "悄悄走到你身后，想抱住你",
                 "伸手想挑逗你",
                 "伸手想拍拍你",
+                "冲你抛了个媚眼",
+                "冲你眨巴眨巴眼睛",
+                "伸出手，想请你跳支舞",
+                "想看你跳支舞",
                 "举起手机想给你拍张照",
                 "在你面前虚张声势，想唬住你",
                 "威胁你",
@@ -6834,6 +6846,10 @@ mod tests {
                 ActionResponse::Refuse
             ),
             "对方的动作：「捏了捏你的脸」，你没有接受。"
+        );
+        assert_eq!(
+            action_outcome(&UserAction::AskDancing, ActionResponse::Accept),
+            "对方想看你跳支舞，你接受了。"
         );
     }
 

@@ -126,6 +126,13 @@ pub enum UserAction {
     HugFromBehind,
     Tease,
     Pat,
+    Wink,
+    Blink,
+    /// The user asks her to dance with them.
+    AskForDance,
+    /// The user asks her to dance for them; accepted, the turn shows her
+    /// picture (spec 2026-11-19-vehicles-actions-species-design.md §4).
+    AskDancing,
     /// The user takes her picture; accepted, the turn shows it (spec
     /// 2026-11-08-five-actions-two-items-gluttony-card-1-1-design.md §2.3).
     Photo,
@@ -492,6 +499,10 @@ mod tests {
             UserAction::HugFromBehind,
             UserAction::Tease,
             UserAction::Pat,
+            UserAction::Wink,
+            UserAction::Blink,
+            UserAction::AskForDance,
+            UserAction::AskDancing,
             UserAction::Photo,
             UserAction::Bluff,
             UserAction::Threaten,
@@ -727,6 +738,10 @@ mod tests {
             (UserAction::HugFromBehind, "hug_from_behind"),
             (UserAction::Tease, "tease"),
             (UserAction::Pat, "pat"),
+            (UserAction::Wink, "wink"),
+            (UserAction::Blink, "blink"),
+            (UserAction::AskForDance, "ask_for_dance"),
+            (UserAction::AskDancing, "ask_dancing"),
             (UserAction::Photo, "photo"),
             (UserAction::Bluff, "bluff"),
             (UserAction::Threaten, "threaten"),
@@ -757,6 +772,10 @@ mod tests {
             UserAction::HugFromBehind,
             UserAction::Tease,
             UserAction::Pat,
+            UserAction::Wink,
+            UserAction::Blink,
+            UserAction::AskForDance,
+            UserAction::AskDancing,
             UserAction::Photo,
             UserAction::Strip,
             UserAction::Custom { text: "x".into() },
