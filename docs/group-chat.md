@@ -55,7 +55,8 @@ Group DTO:
  "members": [{"member_session_id": "…", "instance_id": "…", "joined_at": "…"}],
  "created_at": "…", "last_active_at": "…",
  "last_message": {"message_id": "…", "role": "assistant", "speaker_session_id": "…",
-                  "preview": "山顶的风好大", "is_image": false, "sent_at": "…"}}
+                  "preview": "山顶的风好大", "is_image": false, "sent_at": "…"},
+ "unread_count": 3}
 ```
 
 `last_message` is the group's newest visible row, or `null`: a `user` or
@@ -64,6 +65,14 @@ Group DTO:
 row; `preview` is the content trimmed and cut to its first 120 characters
 (empty for an image-only row, with `is_image` true). A client lists groups
 without fetching each one's history.
+
+`unread_count` is how many rows
+[`POST /comp/chat/{session_id}/read`](api-reference.md#post-compchatsession_idread)
+would stamp, made now on the group's id, among the rows `last_message` treats
+as visible: the group's visible assistant rows with no `read_at`. It is always
+present, `0` when nothing is unread, and comes on every response that carries
+the group DTO. A client badges its group list from it and clears a group by
+calling the read route when the group is open.
 
 Create and add-member refusals:
 

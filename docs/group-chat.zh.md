@@ -46,12 +46,17 @@
  "members": [{"member_session_id": "…", "instance_id": "…", "joined_at": "…"}],
  "created_at": "…", "last_active_at": "…",
  "last_message": {"message_id": "…", "role": "assistant", "speaker_session_id": "…",
-                  "preview": "山顶的风好大", "is_image": false, "sent_at": "…"}}
+                  "preview": "山顶的风好大", "is_image": false, "sent_at": "…"},
+ "unread_count": 3}
 ```
 
 `last_message` 是群里最新一条可见的行，没有则为 `null`：`user` 或 `assistant` 行，不是产品问答，
 且有文字或有图。`speaker_session_id` 在 assistant 行上是发言人、在用户行上为 `null`；`preview` 是
 去掉首尾空白后的前 120 个字符（只有图的行为空串，`is_image` 为 true）。客户端列群时不用再逐个拉 history。
+
+`unread_count` 是此刻用群的 id 调用 [`POST /comp/chat/{session_id}/read`](api-reference.zh.md#post-compchatsession_idread)
+会盖章的行里、`last_message` 算作可见的那些：群里可见且没有 `read_at` 的 assistant 行。它总会出现，没有未读时为 `0`，
+凡是带群 DTO 的响应都有。客户端用它给群列表打角标，群打开时调用已读路由来清零。
 
 创建与加人时的拒绝情形：
 

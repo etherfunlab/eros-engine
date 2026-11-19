@@ -1758,9 +1758,11 @@ ownership check and 404-on-archived behaviour as the history route above.
 }
 ```
 
-Write-only: the engine records a timestamp and stops there. It does not count
-unread messages, does not notify, and does not decide what "read" looks like —
-a client reads `read_at` off the history entries and renders whatever it wants.
+Write-only: the engine records a timestamp and stops there. It does not notify
+and does not decide what "read" looks like. A group's DTO carries
+[`unread_count`](group-chat.md#management), the rows this call would stamp that a
+client shows; for a 1:1 session a client reads `read_at` off the history entries
+and renders whatever it wants.
 
 `marked` counts the rows *this* call stamped, so a repeat call returns `200`
 with `0` and an existing stamp is never pushed forward. Call it on every mount
@@ -1802,9 +1804,12 @@ requires the JWT user to own the group; any other group id is
 | `POST` | `/v2/comp/group/{group_id}/message/stream` | SSE turn, see [group-chat.md](group-chat.md#send) |
 
 Group DTO: `group_id`, `title` (nullable), `members[]` (`member_session_id`,
-`instance_id`, `joined_at`), `created_at`, `last_active_at`, and `last_message`
+`instance_id`, `joined_at`), `created_at`, `last_active_at`, `last_message`
 (`null` until the group has a visible message: `message_id`, `role`,
-`speaker_session_id`, `preview` cut to 120 characters, `is_image`, `sent_at`).
+`speaker_session_id`, `preview` cut to 120 characters, `is_image`, `sent_at`),
+and `unread_count` (the visible assistant rows with no `read_at`, the ones
+[`POST /comp/chat/{session_id}/read`](#post-compchatsession_idread) would stamp
+that `last_message` treats as visible; `0` when none).
 
 A title is trimmed and must be 1 to 64 characters with no control character;
 otherwise `422 invalid_title`.
