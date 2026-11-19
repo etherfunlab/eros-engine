@@ -1566,6 +1566,10 @@ mod tests {
             sent.contains("[修改要求]"),
             "the edit payload must be sent: {sent}"
         );
+        assert!(
+            !sent.contains("[此刻状态]"),
+            "the edit payload carries no state section: {sent}"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

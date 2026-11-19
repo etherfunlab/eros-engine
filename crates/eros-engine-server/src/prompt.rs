@@ -1070,7 +1070,6 @@ pub(crate) fn event_label(kind: eros_engine_core::events::EventKind) -> &'static
 /// What she is doing, as the image composer reads it: the labels of what is
 /// live, the background first, then the foreground incident, joined by `；`.
 /// `None` when neither is.
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn current_state(
     background: Option<eros_engine_core::events::EventKind>,
     foreground: Option<eros_engine_core::events::EventKind>,

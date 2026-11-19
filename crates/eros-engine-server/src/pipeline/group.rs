@@ -33,8 +33,8 @@ use crate::pipeline::stream::{
     build_delegated_image_marker_with, build_delegated_image_prompt_with, build_final_frame,
     build_image_request_frame_with, delegated_image_only_frames_with, drive_chat_burst_for,
     frame_action_for, image_capability_available, sanitize_inner_state, split_failures_typed,
-    ulid_string, AbortOnDrop, BurstOutcome, CastEntry, ImageCompanion, ImageCompanionContext,
-    PdeStatus, ProtocolFrame, StreamErrorCode,
+    state_for_picture, ulid_string, AbortOnDrop, BurstOutcome, CastEntry, ImageCompanion,
+    ImageCompanionContext, PdeStatus, ProtocolFrame, StreamErrorCode,
 };
 use crate::repetition::Injected;
 use crate::routes::companion_stream::ImageReplyParams;
@@ -492,6 +492,23 @@ pub(crate) fn run_group_turn(
                 member_session_id: c.member_session_id,
                 instance_id: c.instance_id,
             });
+            // What the speaker is doing, for the composer's `[此刻状态]`; read
+            // only for a turn that draws.
+            let picture_state = if matches!(
+                plan.action_type,
+                ActionType::ReplyImage | ActionType::ReplyTextImage
+            ) {
+                state_for_picture(
+                    &state.pool,
+                    seat.instance_id,
+                    Some(turn.user_message_id),
+                    chrono::Utc::now(),
+                    None,
+                )
+                .await
+            } else {
+                None
+            };
 
             // Image only: compose, persist an image row, emit meta/done/image_request.
             if plan.action_type == ActionType::ReplyImage {
@@ -505,6 +522,7 @@ pub(crate) fn run_group_turn(
                     turn.user_id,
                     turn.group_session_id,
                     None,
+                    picture_state.as_deref(),
                     companion_ctx.as_ref(),
                 )
                 .await;
@@ -585,13 +603,14 @@ pub(crate) fn run_group_turn(
 
             // Text, or text + image: the composer starts before the chat call.
             let mut compose = if plan.action_type == ActionType::ReplyTextImage {
-                let (st, persona, plan_c, image_c, scene, latest_c, ctx_c) = (
+                let (st, persona, plan_c, image_c, scene, latest_c, state_c, ctx_c) = (
                     (*state).clone(),
                     seat.persona.clone(),
                     plan.clone(),
                     turn.image.clone(),
                     transcript.clone(),
                     latest.clone(),
+                    picture_state.clone(),
                     companion_ctx.clone(),
                 );
                 let (uid, gid) = (turn.user_id, turn.group_session_id);
@@ -606,6 +625,7 @@ pub(crate) fn run_group_turn(
                         uid,
                         gid,
                         None,
+                        state_c.as_deref(),
                         ctx_c.as_ref(),
                     )
                     .await
@@ -757,6 +777,7 @@ pub(crate) fn run_group_turn(
                                 turn.user_id,
                                 turn.group_session_id,
                                 None,
+                                picture_state.as_deref(),
                                 companion_ctx.as_ref(),
                             )
                             .await

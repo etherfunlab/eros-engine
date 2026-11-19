@@ -2319,6 +2319,60 @@ mod tests {
         .await;
     }
 
+    /// What the composer is told she is doing is the speaker's own state: the
+    /// second person's is not in it.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_group_picture_names_the_speakers_state(pool: PgPool) {
+        let verdict = r#"{"speakers":[{"member":"m1","action":"reply_image","inner_state":null,"reply_mode":null,"clothing":null,"with":"m2"}],"reason":null}"#;
+        let mut f = fixture_with(
+            pool,
+            Some(director_sse(verdict)),
+            200,
+            None,
+            COMPOSE_TASK,
+            |_| {},
+        )
+        .await;
+        mount_composer(&f._server).await;
+        for (member, kind) in [(f.a, "on_a_train"), (f.b, "showering")] {
+            sqlx::query(
+                "INSERT INTO engine.persona_events \
+                   (instance_id, session_id, event_key, kind, started_at, ends_at) \
+                 VALUES ($1, $2, 'seed', $3, now() - interval '30 minutes', \
+                         now() + interval '60 minutes')",
+            )
+            .bind(instance_of(&f.pool, member).await)
+            .bind(member)
+            .bind(kind)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        }
+        let (s, body) = send(
+            &mut f,
+            json!({"content":"拍张合照","client_msg_id":"01JGROUPSTATEIMAGEONLYSSSG","image":{}}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+
+        let reqs = f._server.received_requests().await.unwrap();
+        let composer: Value = reqs
+            .iter()
+            .filter_map(|r| serde_json::from_slice::<Value>(&r.body).ok())
+            .find(|b| b["model"] == "composer-model")
+            .expect("the composer ran");
+        let payload = composer["messages"]
+            .as_array()
+            .and_then(|m| m.last())
+            .and_then(|m| m["content"].as_str())
+            .expect("the composer's user message");
+        assert!(
+            payload.contains("[身体状态]\n（无）\n\n[此刻状态]\n在坐火车\n\n[最近场景]"),
+            "{payload}"
+        );
+        assert!(!payload.contains("洗澡中"), "{payload}");
+    }
+
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn an_exhausted_composer_drops_the_companion_from_the_frame(pool: PgPool) {
         let verdict = r#"{"speakers":[{"member":"m1","action":"reply_image","inner_state":null,"reply_mode":null,"clothing":null,"with":"m2"}],"reason":null}"#;

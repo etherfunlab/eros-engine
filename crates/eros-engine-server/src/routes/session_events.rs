@@ -2930,6 +2930,38 @@ mod tests {
         assert_eq!((source.as_str(), status.as_str()), ("event", "ok"));
     }
 
+    /// The event being drawn is not stored when the composer runs; her picture
+    /// still names it, as it names a trip she is already on.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_event_picture_names_the_event_it_starts(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_, session_id) = setup(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "刚拍的，好看吗").await;
+        mount_composer(&mock, "对着镜头笑", "自拍").await;
+        let state = with_companion_and_composer(test_state(pool.clone()), &mock.uri());
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            selfie_req("k1", true),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        let c = calls(&mock).await;
+        let payload = last_content(&c[1]);
+        assert!(
+            payload.contains("[身体状态]\n（无）\n\n[此刻状态]\n刚拍了张自拍\n\n[最近场景]"),
+            "{payload}"
+        );
+        let m = out.message.expect("a message");
+        let marker = row_meta(&pool, m.message_id).await["image"].clone();
+        let (_, _, inputs) = compose_row(&pool, &marker).await;
+        assert_eq!(inputs["current_state"], json!("刚拍了张自拍"));
+    }
+
     /// A lingering accepted give reaches her picture's `[身体状态]` and the
     /// audit `inputs.body_state`.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -3012,6 +3044,11 @@ mod tests {
         assert_eq!(
             last_content(&c[0]),
             "（你正在短途旅行。你刚拍了一张自拍，发给了对方。）"
+        );
+        assert!(
+            last_content(&c[1]).contains("[此刻状态]\n短途旅游；刚拍了张自拍\n\n[最近场景]"),
+            "the trip first, then the selfie she is taking: {}",
+            last_content(&c[1])
         );
     }
 

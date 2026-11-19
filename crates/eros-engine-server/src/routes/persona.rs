@@ -362,7 +362,7 @@ pub async fn compose_image(
     )
     .await;
 
-    // Audit snapshot of the seven composer slots — same shape whichever arm
+    // Audit snapshot of the composer slots — same shape whichever arm
     // below fires.
     let inputs = compose_inputs_json(
         &persona,
@@ -501,7 +501,7 @@ async fn compose_stream(
         ar,
         "（无）",
     );
-    // Audit snapshot of the seven composer slots, captured before `persona` is
+    // Audit snapshot of the composer slots, captured before `persona` is
     // moved into the stream generator below; `variant_key` is likewise cloned
     // out now so the generator doesn't need to borrow `resolved`.
     let inputs = compose_inputs_json(
@@ -1512,6 +1512,10 @@ mod tests {
         assert!(
             first.contains("[对方最新消息]\n在海边，黄昏"),
             "content lands in its slot: {first}"
+        );
+        assert!(
+            !first.contains("[此刻状态]"),
+            "the standalone endpoint has no state to send: {first}"
         );
         let second = payload_of(1);
         assert!(

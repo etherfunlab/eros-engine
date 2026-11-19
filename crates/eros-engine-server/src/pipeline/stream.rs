@@ -3758,10 +3758,12 @@ pub(crate) fn compose_user_payload_with(
     )
 }
 
-/// The seven composer slots as an audit snapshot. Deliberately built from the
-/// RAW values: `run_image_prompt_compose` substitutes `（无）` for empty slots
-/// when it renders the prompt, and that placeholder is a rendering detail — the
-/// audit records an absent slot as the empty string. Pure.
+/// The composer's slots as an audit snapshot: appearance, clothing, body
+/// state, current state, recent scene, latest user message, style and aspect
+/// ratio. Deliberately built from the RAW values: `run_image_prompt_compose`
+/// substitutes `（无）` for empty slots when it renders the prompt, and that
+/// placeholder is a rendering detail — the audit records an absent slot as the
+/// empty string. Pure.
 pub(crate) fn compose_inputs_json(
     persona: &eros_engine_core::persona::CompanionPersona,
     clothing: Option<&str>,
@@ -3917,7 +3919,7 @@ pub(crate) struct ComposeRun {
     pub(crate) failures: Vec<eros_engine_llm::failure::AttemptFailure>,
 }
 
-/// Render the chat composer's seven-slot payload, substituting the placeholders
+/// Render the chat composer's payload, substituting the placeholders
 /// the prompt expects for empty slots. Extracted from `run_image_prompt_compose`
 /// so that function is only the chain walk and can serve a second composer
 /// (the image-edit endpoint) with a different payload. Pure.
@@ -4230,6 +4232,47 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
+/// What the composer's `[此刻状态]` says of the events `current` holds, with
+/// the kind being started this moment (`starting`, not stored yet) counted as
+/// live: a background kind stands in for the background, any other for the
+/// foreground. Pure.
+pub(crate) fn picture_state_of(
+    current: &eros_engine_store::events::CurrentEvents,
+    starting: Option<eros_engine_core::events::EventKind>,
+) -> Option<String> {
+    let mut background = current.background.as_ref().map(|e| e.kind);
+    let mut foreground = current.foreground.as_ref().map(|e| e.kind);
+    match starting {
+        Some(kind) if kind.is_background() => background = Some(kind),
+        Some(kind) => foreground = Some(kind),
+        None => {}
+    }
+    crate::prompt::current_state(background, foreground)
+}
+
+/// What she is doing at a picture's moment, as the composer reads it: the
+/// events under way for `instance_id` at `at_message` (or at `now` without
+/// one), plus `starting`. Fail-open: a failed read is warned and reads as
+/// nothing, never blocks the picture.
+pub(crate) async fn state_for_picture(
+    pool: &sqlx::PgPool,
+    instance_id: Uuid,
+    at_message: Option<Uuid>,
+    now: chrono::DateTime<chrono::Utc>,
+    starting: Option<eros_engine_core::events::EventKind>,
+) -> Option<String> {
+    match (eros_engine_store::events::EventRepo { pool })
+        .current(instance_id, at_message, now)
+        .await
+    {
+        Ok(current) => picture_state_of(&current, starting),
+        Err(e) => {
+            tracing::warn!(%instance_id, "image-compose: event read failed: {e}");
+            None
+        }
+    }
+}
+
 /// Resolve the per-turn image inputs, generate the subject via the composer
 /// LLM, and wrap the result into the final wire prompt.
 ///
@@ -4249,6 +4292,7 @@ pub(crate) async fn build_delegated_image_prompt(
     user_id: Uuid,
     session_id: Uuid,
     body_state: Option<&str>,
+    current_state: Option<&str>,
 ) -> DelegatedImagePrompt {
     build_delegated_image_prompt_with(
         state,
@@ -4260,6 +4304,7 @@ pub(crate) async fn build_delegated_image_prompt(
         user_id,
         session_id,
         body_state,
+        current_state,
         None,
     )
     .await
@@ -4279,6 +4324,7 @@ pub(crate) async fn build_delegated_image_prompt_with(
     user_id: Uuid,
     session_id: Uuid,
     body_state: Option<&str>,
+    current_state: Option<&str>,
     companion: Option<&ImageCompanionContext>,
 ) -> DelegatedImagePrompt {
     build_delegated_image_prompt_for(
@@ -4291,7 +4337,7 @@ pub(crate) async fn build_delegated_image_prompt_with(
         user_id,
         session_id,
         body_state,
-        None,
+        current_state,
         companion,
         compose_source(plan.action_type),
     )
@@ -4314,10 +4360,10 @@ pub(crate) fn compose_source(a: ActionType) -> &'static str {
     }
 }
 
-/// [`build_delegated_image_prompt_with`] with what she is doing
-/// (`current_state`, the `[此刻状态]` section) and the audit `source` named by
-/// the caller: `event` for a life event's picture (spec 2026-10-26-event-
-/// message-image-design.md §6).
+/// [`build_delegated_image_prompt_with`] with the audit `source` named by the
+/// caller: `event` for a life event's picture (spec 2026-10-26-event-message-
+/// image-design.md §6). `current_state` is what she is doing, the composer's
+/// `[此刻状态]` section.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_delegated_image_prompt_for(
     state: &AppState,
@@ -5945,6 +5991,9 @@ pub(crate) fn run_stream_with(
                 // single `image_request` is appended after the text `done`. Persona
                 // comes from `input.persona` (the local `persona` binding was moved
                 // into `input` above).
+                //
+                // What she is doing at this turn, for the composer's `[此刻状态]`.
+                let picture_state = picture_state_of(&current, None);
                 let mut image_only_done = false;
                 let mut image_only_produced: Vec<crate::pipeline::post_process::ProducedMessage> =
                     Vec::new();
@@ -5971,6 +6020,7 @@ pub(crate) fn run_stream_with(
                         user_msg.user_id,
                         user_msg.session_id,
                         body_state.as_deref(),
+                        picture_state.as_deref(),
                     )
                     .await;
                     let subject = img.subject;
@@ -6335,6 +6385,7 @@ pub(crate) fn run_stream_with(
                         let user_id_c = user_msg.user_id;
                         let session_id_c = user_msg.session_id;
                         let body_state_c = body_state.clone();
+                        let picture_state_c = picture_state.clone();
                         AbortOnDrop(Some(tokio::spawn(async move {
                             build_delegated_image_prompt(
                                 &state_c,
@@ -6346,6 +6397,7 @@ pub(crate) fn run_stream_with(
                                 user_id_c,
                                 session_id_c,
                                 body_state_c.as_deref(),
+                                picture_state_c.as_deref(),
                             )
                             .await
                         })))
@@ -6537,6 +6589,7 @@ pub(crate) fn run_stream_with(
                                     user_msg.user_id,
                                     user_msg.session_id,
                                     body_state.as_deref(),
+                                    picture_state.as_deref(),
                                 )
                                 .await
                             }
@@ -6551,6 +6604,7 @@ pub(crate) fn run_stream_with(
                                     user_msg.user_id,
                                     user_msg.session_id,
                                     body_state.as_deref(),
+                                    picture_state.as_deref(),
                                 )
                                 .await
                             }
@@ -9715,6 +9769,16 @@ data: [DONE]\n\n";
         prompt_variant: Option<&str>,
         composer_response: wiremock::ResponseTemplate,
     ) -> (Vec<wiremock::Request>, Vec<ProtocolFrame>) {
+        run_variant_turn_with_events(pool, &[], prompt_variant, composer_response).await
+    }
+
+    /// [`run_variant_turn`] with `events` seeded for the persona.
+    async fn run_variant_turn_with_events(
+        pool: &PgPool,
+        events: &[EventSeed],
+        prompt_variant: Option<&str>,
+        composer_response: wiremock::ResponseTemplate,
+    ) -> (Vec<wiremock::Request>, Vec<ProtocolFrame>) {
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
         use futures_util::StreamExt;
         use wiremock::matchers::path as wm_path;
@@ -9728,6 +9792,9 @@ data: [DONE]\n\n";
 
         let user_id = Uuid::new_v4();
         let (_g, instance_id, session_id) = seed_persona_and_session(pool, user_id).await;
+        if !events.is_empty() {
+            seed_events(pool, user_id, instance_id, session_id, events).await;
+        }
 
         let mut state = crate::routes::companion::test_state(pool.clone());
         state.model_config = std::sync::Arc::new(
@@ -10431,6 +10498,67 @@ data: [DONE]\n\n";
         assert_eq!(img["compose_variant"], "b");
         assert_eq!(img["compose_model"], "served/model");
         assert_eq!(img["compose_generation_id"], "gen-xyz");
+    }
+
+    /// The composer's user message: the last message of its request.
+    fn composer_payload(req: &wiremock::Request) -> String {
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        body["messages"]
+            .as_array()
+            .and_then(|m| m.last())
+            .and_then(|m| m["content"].as_str())
+            .expect("the composer's user message")
+            .to_string()
+    }
+
+    fn composer_ok() -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "gen-state",
+            "model": "served/model",
+            "choices": [{"message": {"content": "SUBJECT"}}],
+        }))
+    }
+
+    /// Spec 2026-11-20 §7: what she is doing reaches the composer, the
+    /// background first and the incident after it, right after her body state.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_chat_picture_during_an_event_names_it(pool: PgPool) {
+        let (reqs, _frames) = run_variant_turn_with_events(
+            &pool,
+            &[ev("short_trip", 120, 2880), ev("on_a_train", 30, 60)],
+            None,
+            composer_ok(),
+        )
+        .await;
+        assert_eq!(reqs.len(), 1, "composer is the only provider call");
+        let payload = composer_payload(&reqs[0]);
+        assert!(
+            payload.contains("[身体状态]\n（无）\n\n[此刻状态]\n短途旅游；在坐火车\n\n[最近场景]"),
+            "{payload}"
+        );
+        let inputs: serde_json::Value =
+            sqlx::query_scalar("SELECT inputs FROM engine.chat_images_events")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(inputs["current_state"], "短途旅游；在坐火车", "{inputs}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_chat_picture_with_nothing_live_has_no_state_section(pool: PgPool) {
+        // An event that already ended is not live.
+        let (reqs, _frames) =
+            run_variant_turn_with_events(&pool, &[ev("on_a_train", 120, -60)], None, composer_ok())
+                .await;
+        assert_eq!(reqs.len(), 1, "composer is the only provider call");
+        let payload = composer_payload(&reqs[0]);
+        assert!(!payload.contains("[此刻状态]"), "{payload}");
+        let inputs: serde_json::Value =
+            sqlx::query_scalar("SELECT inputs FROM engine.chat_images_events")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(inputs["current_state"], "", "{inputs}");
     }
 
     /// Sibling of `compose_success_persists_audit_trio`, but the mock composer
@@ -11433,6 +11561,14 @@ data: [DONE]\n\n";
 
         let user_id = Uuid::new_v4();
         let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        seed_events(
+            &pool,
+            user_id,
+            instance_id,
+            session_id,
+            &[ev("short_trip", 60, 600)],
+        )
+        .await;
 
         let mut state = crate::routes::companion::test_state(pool.clone());
         state.model_config = std::sync::Arc::new(
@@ -11523,6 +11659,14 @@ data: [DONE]\n\n";
             n, 1,
             "no duplicate row from a retried or double-counted write"
         );
+
+        // The picture ran beside the text: what she is doing still reached it.
+        let inputs: serde_json::Value =
+            sqlx::query_scalar("SELECT inputs FROM engine.chat_images_events")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(inputs["current_state"], "短途旅游", "{inputs}");
     }
 
     /// An image-promising turn whose TEXT half comes back empty is an
@@ -22528,6 +22672,78 @@ data: [DONE]\n\n"
             "{with}"
         );
         assert_eq!(with.matches("[此刻状态]").count(), 1, "{with}");
+    }
+
+    #[test]
+    fn the_companion_and_the_state_sit_around_the_body_state() {
+        let ctx = ImageCompanionContext {
+            name: "阿哲".into(),
+            appearance: Some("短发，高个".into()),
+            personality: None,
+            speaker_name: "小美".into(),
+        };
+        let with = compose_user_payload_with(
+            "freckled",
+            "（无）",
+            "（无）",
+            "（无）",
+            "realistic",
+            "3:4",
+            "（无）",
+            Some("洗澡中"),
+            Some(&ctx),
+        );
+        assert_eq!(
+            with,
+            "[人物外观]\nfreckled\n\n[此刻穿着]\n（无）\n\n[同框人物]\n阿哲：短发，高个；（无）\n这张图里有两个人：小美 和 阿哲。\n\n[身体状态]\n（无）\n\n[此刻状态]\n洗澡中\n\n[最近场景]\n（无）\n\n[对方最新消息]\n（无）\n\n[风格]\nrealistic\n\n[画幅]\n3:4"
+        );
+    }
+
+    fn live_event(
+        kind: eros_engine_core::events::EventKind,
+    ) -> eros_engine_store::events::EventRecord {
+        eros_engine_store::events::EventRecord {
+            id: Uuid::nil(),
+            kind,
+            session_id: None,
+            started_at: chrono::DateTime::UNIX_EPOCH,
+            ends_at: chrono::DateTime::UNIX_EPOCH,
+            message_id: None,
+        }
+    }
+
+    #[test]
+    fn a_starting_event_counts_as_live() {
+        use eros_engine_core::events::EventKind::*;
+        let under_way = eros_engine_store::events::CurrentEvents {
+            foreground: Some(live_event(OnATrain)),
+            background: Some(live_event(ShortTrip)),
+            at: chrono::DateTime::UNIX_EPOCH,
+        };
+        let nothing = eros_engine_store::events::CurrentEvents {
+            foreground: None,
+            background: None,
+            at: chrono::DateTime::UNIX_EPOCH,
+        };
+        assert_eq!(
+            picture_state_of(&under_way, None).as_deref(),
+            Some("短途旅游；在坐火车")
+        );
+        assert_eq!(picture_state_of(&nothing, None), None);
+        // An incident takes the foreground's place, a background the
+        // background's; the other one stays.
+        assert_eq!(
+            picture_state_of(&under_way, Some(TakingSelfie)).as_deref(),
+            Some("短途旅游；刚拍了张自拍")
+        );
+        assert_eq!(
+            picture_state_of(&nothing, Some(TakingSelfie)).as_deref(),
+            Some("刚拍了张自拍")
+        );
+        assert_eq!(
+            picture_state_of(&nothing, Some(ShortTrip)).as_deref(),
+            Some("短途旅游")
+        );
     }
 
     #[test]
