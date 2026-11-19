@@ -337,8 +337,9 @@ choice's streak, and its `reason` never reaches `[emotional_context]`. A label f
 settlement writes its `tier_reached` journal row in the same transaction, as on a turn. A parent
 with no affinity row gets no event.
 
-The end route returns the date (`status: "settled"`), the relationship after it, and the deltas
-its event committed, `null` when no event was written.
+The end route returns the date (`status: "settled"`), the relationship after it, and what its
+event committed: the six-axis deltas, each line's movement and the tiers it crossed, each `null`
+when no event was written.
 
 ## Memory
 
@@ -433,7 +434,10 @@ Everything is additive except the new `409`s on the send routes.
 
 `activity` has one shape wherever it appears: `id`, `sub_session_id`, `duration`, `place`,
 `content`, `status` (`ongoing`, `ended` or `settled`, as of the response), `started_at` and
-`ends_at` (both `null` once the event row is gone).
+`ends_at` (both `null` once the event row is gone). Once the date is settled and its
+settlement wrote an event, it also carries `effective_deltas_computed` (each line's movement)
+and, when a tier moved, `label_changes`, in the shape of the per-turn delta route; the end
+route returns the same two at the top level too.
 
 ## Archive and erasure
 

@@ -1574,9 +1574,13 @@ result it stored, so a repeat call changes nothing and a client can call it
 whenever its own timer fires.
 
 ```json
-{"activity": {"id": "…", "sub_session_id": "…", "duration": "short", "place": "海边的餐厅", "content": "吃一顿大餐", "status": "settled", "started_at": "2026-11-12T12:00:00Z", "ends_at": "2026-11-12T12:40:00Z"},
+{"activity": {"id": "…", "sub_session_id": "…", "duration": "short", "place": "海边的餐厅", "content": "吃一顿大餐", "status": "settled", "started_at": "2026-11-12T12:00:00Z", "ends_at": "2026-11-12T12:40:00Z",
+              "effective_deltas_computed": {"bond": 0.03, "chemistry": 0.02},
+              "label_changes": {"bond": {"from": "friend", "to": "close_friend"}}},
  "affinity": {"bond_tier": 3, "chem_tier": 2, "bond_label": "close_friend", "chemistry_label": "flirtation", "…": "…"},
- "effective_deltas": {"warmth": 0.02, "trust": 0.05, "intrigue": 0.01, "intimacy": 0.03, "patience": 0.0, "tension": 0.01}}
+ "effective_deltas": {"warmth": 0.02, "trust": 0.05, "intrigue": 0.01, "intimacy": 0.03, "patience": 0.0, "tension": 0.01},
+ "effective_deltas_computed": {"bond": 0.03, "chemistry": 0.02},
+ "label_changes": {"bond": {"from": "friend", "to": "close_friend"}}}
 ```
 
 `activity` is the date, `status: "settled"`, with `ends_at` the moment it
@@ -1585,6 +1589,17 @@ ended. `affinity` is the relationship after it, in the shape of
 `affinity`. `effective_deltas` is what the date moved, as its affinity event
 committed it, and `null` when no event was written: no turn of the date was
 answered, or the relationship was archived meanwhile.
+
+`effective_deltas_computed` and `label_changes` are what the same event
+recorded per line, in the shape the
+[per-turn delta route](#get-bffv1compaffinitysession_idevent) uses: each line's
+movement, and the tiers it crossed. Both keys are always present here:
+`effective_deltas_computed` is `null` when no event was written, and
+`label_changes` is `null` then and also when no tier moved. Inside `activity`
+the two keys appear once the date is settled with an event (`label_changes`
+only when a tier moved) and are omitted otherwise, so the `activity` of a
+settled date is the same object here and on the invitation's
+[history receipt](#get-compchatsession_idhistorylimit20offset0).
 
 On a date nobody has settled yet, the call waits for the judge (at most 45
 seconds). The settlement runs in a task of its own: a client that disconnects
@@ -1677,7 +1692,11 @@ with, plus `response` (`"accept"` | `"refuse"`) once the turn took effect.
 other row, a refused invitation included) is the date that invitation opened, in
 the shape of the stream's `final.activity`, with `status` (`ongoing`, `ended` or
 `settled`) as of the response. Its `sub_session_id` is a session this route
-serves too: the date's own rows are read under that id.
+serves too: the date's own rows are read under that id. Once the date is
+settled with an event, the receipt also carries `effective_deltas_computed` and
+`label_changes` (the latter only when a tier moved), the same object the
+[end route](#post-v2compsessionsession_idactivitiesactivity_idend) returns as
+`activity`.
 
 `reaction` (assistant rows only, omitted otherwise) is `{emoji, reacted_at}`.
 
