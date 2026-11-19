@@ -70,6 +70,10 @@ pub struct GroupDto {
     pub last_active_at: DateTime<Utc>,
     /// `null` for a group with no visible message yet.
     pub last_message: Option<GroupLastMessageDto>,
+    /// Rows a `POST /comp/chat/{session_id}/read` call would stamp that a
+    /// client shows: the group's visible assistant rows with no `read_at`.
+    /// `0` when none.
+    pub unread_count: i64,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -100,6 +104,7 @@ pub(crate) fn group_dto(g: &Group) -> GroupDto {
             is_image: m.is_image,
             sent_at: m.sent_at,
         }),
+        unread_count: g.unread_count,
     }
 }
 
@@ -1388,7 +1393,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn group_dto_carries_last_message(pool: PgPool) {
+    async fn group_dto_carries_last_message_and_unread_count(pool: PgPool) {
         use tower::Service;
         let verdict = r#"{"speakers":[{"member":"m1","action":"reply_text","inner_state":null,"reply_mode":null,"clothing":null}],"reason":null}"#;
         let mut f = fixture(pool, Some(director_sse(verdict)), 200, None).await;
@@ -1398,11 +1403,13 @@ mod tests {
         )
         .await;
         assert_eq!(s, StatusCode::OK, "{body}");
-        for uri in [
+        let uris = [
             "/v2/comp/groups".to_string(),
             format!("/v2/comp/group/{}", f.group),
-        ] {
-            let r = f.app.call(req("GET", &uri, f.user, None)).await.unwrap();
+        ];
+        let mut counts = Vec::new();
+        for uri in &uris {
+            let r = f.app.call(req("GET", uri, f.user, None)).await.unwrap();
             assert_eq!(r.status(), StatusCode::OK);
             let bytes = axum::body::to_bytes(r.into_body(), usize::MAX)
                 .await
@@ -1417,6 +1424,36 @@ mod tests {
             assert_eq!(dto["last_message"]["speaker_session_id"], json!(f.a));
             assert_eq!(dto["last_message"]["is_image"], false);
             assert!(!dto["last_message"]["preview"].as_str().unwrap().is_empty());
+            let n = dto["unread_count"].as_i64().expect("a count");
+            assert!(n > 0, "{uri}: {dto}");
+            counts.push(n);
+        }
+        assert_eq!(counts[0], counts[1], "both routes count alike");
+
+        // Reading the group clears the count on both routes.
+        let r = f
+            .app
+            .call(req(
+                "POST",
+                &format!("/comp/chat/{}/read", f.group),
+                f.user,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        for uri in &uris {
+            let r = f.app.call(req("GET", uri, f.user, None)).await.unwrap();
+            let bytes = axum::body::to_bytes(r.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_slice(&bytes).unwrap();
+            let dto = if uri.ends_with("groups") {
+                v["groups"][0].clone()
+            } else {
+                v
+            };
+            assert_eq!(dto["unread_count"], json!(0), "{uri}: {dto}");
         }
     }
 

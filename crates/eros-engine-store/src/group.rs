@@ -50,6 +50,9 @@ pub struct Group {
     pub last_active_at: DateTime<Utc>,
     pub members: Vec<GroupMember>,
     pub last_message: Option<GroupLastMessage>,
+    /// Rows a read call would stamp that a client shows: the group's visible
+    /// assistant rows with no `read_at`.
+    pub unread_count: i64,
 }
 
 /// Why a session cannot join a group. `NotFound` covers "not yours" too, so a
@@ -74,6 +77,7 @@ struct GroupRow {
     last_active_at: DateTime<Utc>,
     #[sqlx(flatten)]
     last_message: LastMessageColumns,
+    unread_count: i64,
 }
 
 /// The lateral join's columns, all NULL for a group with no visible row.
@@ -100,24 +104,40 @@ impl LastMessageColumns {
     }
 }
 
-/// A group row with its newest visible message, for `get` and `list`.
-const GROUP_SQL: &str = "SELECT s.id, s.user_id, s.title, s.created_at, s.last_active_at, \
+/// A row a client shows, on the `chat_messages` alias `m`: a user or
+/// assistant row that is not a product answer and has text or an image. The
+/// one rule behind both `last_message` and `unread_count`.
+macro_rules! visible_row {
+    () => {
+        "m.role IN ('user', 'assistant') \
+         AND m.channel IS DISTINCT FROM 'product_qa' \
+         AND (btrim(m.content, E' \\t\\r\\n\\f\\013') <> '' OR m.metadata ? 'image')"
+    };
+}
+
+/// A group row with its newest visible message and its unread count, for
+/// `get` and `list`.
+const GROUP_SQL: &str = concat!(
+    "SELECT s.id, s.user_id, s.title, s.created_at, s.last_active_at, \
             lm.id AS lm_message_id, lm.role AS lm_role, \
             lm.speaker_session_id AS lm_speaker_session_id, \
             left(btrim(lm.content, E' \\t\\r\\n\\f\\013'), 120) AS lm_preview, \
             COALESCE(lm.metadata ? 'image', false) AS lm_is_image, \
-            lm.sent_at AS lm_sent_at \
+            lm.sent_at AS lm_sent_at, \
+            (SELECT count(*) FROM engine.chat_messages m \
+              WHERE m.session_id = s.id AND m.role <> 'user' AND m.read_at IS NULL AND ",
+    visible_row!(),
+    ") AS unread_count \
      FROM engine.chat_sessions s \
      LEFT JOIN LATERAL ( \
          SELECT m.id, m.role, m.speaker_session_id, m.content, m.metadata, m.sent_at \
            FROM engine.chat_messages m \
-          WHERE m.session_id = s.id \
-            AND m.role IN ('user', 'assistant') \
-            AND m.channel IS DISTINCT FROM 'product_qa' \
-            AND (btrim(m.content, E' \\t\\r\\n\\f\\013') <> '' OR m.metadata ? 'image') \
-          ORDER BY m.sent_at DESC, m.id DESC \
+          WHERE m.session_id = s.id AND ",
+    visible_row!(),
+    " ORDER BY m.sent_at DESC, m.id DESC \
           LIMIT 1 \
-     ) lm ON true";
+     ) lm ON true"
+);
 
 const MEMBERS_SQL: &str = "SELECT gm.member_session_id, s.instance_id, gm.joined_at \
      FROM engine.chat_session_members gm \
@@ -296,6 +316,7 @@ impl<'a> GroupRepo<'a> {
             created_at: r.created_at,
             last_active_at: r.last_active_at,
             last_message: r.last_message.into_message(),
+            unread_count: r.unread_count,
         })
     }
 }
@@ -865,5 +886,154 @@ mod tests {
             got.preview, "v嗨v",
             "a literal v is content, not whitespace"
         );
+    }
+
+    /// The unread count is the rows a read call would stamp that a client
+    /// shows: visible assistant rows with no `read_at`.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn unread_count_counts_visible_unread_assistant_rows(pool: PgPool) {
+        let repo = GroupRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let a = text_session(&pool, user_id).await;
+        let b = text_session(&pool, user_id).await;
+        let g = repo
+            .create(user_id, Some("未读"), &[a, b])
+            .await
+            .unwrap()
+            .unwrap();
+        let empty = repo
+            .create(user_id, Some("空"), &[a])
+            .await
+            .unwrap()
+            .unwrap();
+        let none = serde_json::json!({});
+        let image = serde_json::json!({"image": {"caption": "x"}});
+        row(
+            &pool,
+            g.id,
+            "assistant",
+            "嗨",
+            Some(a),
+            None,
+            none.clone(),
+            60,
+        )
+        .await;
+        row(
+            &pool,
+            g.id,
+            "assistant",
+            "在吗",
+            Some(a),
+            None,
+            none.clone(),
+            55,
+        )
+        .await;
+        sqlx::query(
+            "UPDATE engine.chat_messages SET read_at = now() \
+              WHERE session_id = $1 AND content = '在吗'",
+        )
+        .bind(g.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        row(&pool, g.id, "assistant", "", Some(b), None, image, 50).await;
+        row(
+            &pool,
+            g.id,
+            "assistant",
+            "",
+            Some(b),
+            None,
+            none.clone(),
+            45,
+        )
+        .await;
+        row(
+            &pool,
+            g.id,
+            "assistant",
+            "product",
+            None,
+            Some("product_qa"),
+            none.clone(),
+            40,
+        )
+        .await;
+        row(
+            &pool,
+            g.id,
+            "system_error",
+            "boom",
+            None,
+            None,
+            none.clone(),
+            35,
+        )
+        .await;
+        row(
+            &pool,
+            g.id,
+            "assistant",
+            "回你",
+            Some(b),
+            None,
+            none.clone(),
+            30,
+        )
+        .await;
+        // Whitespace only: not visible. A voice-channel reply: visible.
+        row(
+            &pool,
+            g.id,
+            "assistant",
+            "\n\t ",
+            Some(b),
+            None,
+            none.clone(),
+            28,
+        )
+        .await;
+        row(
+            &pool,
+            g.id,
+            "assistant",
+            "语音回你",
+            Some(b),
+            Some("voice"),
+            none.clone(),
+            25,
+        )
+        .await;
+        row(&pool, g.id, "user", "你好", None, None, none.clone(), 20).await;
+
+        let count = |id: Uuid| {
+            let repo = GroupRepo { pool: &pool };
+            async move { repo.get(id, user_id).await.unwrap().unwrap().unread_count }
+        };
+        // 嗨, the image, 回你 and 语音回你; the newest visible row is the user's.
+        assert_eq!(count(g.id).await, 4);
+        let listed = repo.list(user_id).await.unwrap();
+        let in_list = |id: Uuid| listed.iter().find(|x| x.id == id).unwrap().unread_count;
+        assert_eq!((in_list(g.id), in_list(empty.id)), (4, 0));
+        let last = repo.get(g.id, user_id).await.unwrap().unwrap().last_message;
+        assert_eq!(last.unwrap().role, "user");
+        assert_eq!(count(empty.id).await, 0);
+
+        assert!(repo.remove_member(g.id, user_id, b).await.unwrap());
+        assert_eq!(
+            count(g.id).await,
+            4,
+            "a removed member's reply still counts"
+        );
+
+        ChatRepo { pool: &pool }
+            .mark_session_read(g.id)
+            .await
+            .unwrap();
+        assert_eq!(count(g.id).await, 0);
+        row(&pool, g.id, "assistant", "又来了", Some(a), None, none, 1).await;
+        assert_eq!(count(g.id).await, 1);
     }
 }
