@@ -167,6 +167,19 @@ mod tests {
             .unwrap()
     }
 
+    /// Put the parent's bond at 0.12, under the first tier cut (0.15), so the
+    /// fixture date's verdict crosses it.
+    async fn near_a_tier(pool: &PgPool, session_id: Uuid) {
+        sqlx::query(
+            "UPDATE engine.companion_affinity SET trust = 0.12, intrigue = 0.12 \
+              WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     /// The parent's `activity` affinity events.
     async fn activity_events(pool: &PgPool, session_id: Uuid) -> i64 {
         count(
@@ -215,6 +228,7 @@ mod tests {
     async fn end_early_settles_and_returns_the_result(pool: PgPool) {
         let mock = judge_mock(judged(JUDGE_REPLY), 1).await;
         let s = scene(with_judge(test_state(pool.clone()), &mock), 2).await;
+        near_a_tier(&pool, s.session_id).await;
         let now = t("2026-11-12T17:50:00Z");
 
         let out = end_at(&s.state, s.session_id, s.activity.id, s.user_id, now)
@@ -245,9 +259,11 @@ mod tests {
             serde_json::to_value(&out.activity.effective_deltas_computed).unwrap(),
             serde_json::to_value(&out.effective_deltas_computed).unwrap()
         );
+        let labels = serde_json::to_value(&out.label_changes).unwrap();
+        assert!(labels["bond"]["to"].is_string(), "a tier crossed: {labels}");
         assert_eq!(
             serde_json::to_value(&out.activity.label_changes).unwrap(),
-            serde_json::to_value(&out.label_changes).unwrap()
+            labels
         );
 
         let again = end_at(
@@ -311,6 +327,7 @@ mod tests {
     async fn end_after_the_clock_settles(pool: PgPool) {
         let mock = judge_mock(judged(JUDGE_REPLY), 1).await;
         let s = scene(with_judge(test_state(pool.clone()), &mock), 2).await;
+        near_a_tier(&pool, s.session_id).await;
         let mut app = build_router(s.state.clone());
 
         let (status, body) = send_request(
@@ -337,15 +354,15 @@ mod tests {
             body["effective_deltas_computed"]["bond"].is_number(),
             "{body}"
         );
-        assert!(
-            body.as_object().unwrap().contains_key("label_changes"),
-            "{body}"
+        assert!(body["label_changes"]["bond"]["to"].is_string(), "{body}");
+        assert_eq!(
+            body["activity"].get("effective_deltas_computed"),
+            Some(&body["effective_deltas_computed"])
         );
         assert_eq!(
-            body["activity"]["effective_deltas_computed"],
-            body["effective_deltas_computed"]
+            body["activity"].get("label_changes"),
+            Some(&body["label_changes"])
         );
-        assert_eq!(body["activity"]["label_changes"], body["label_changes"]);
         assert!(body["affinity"]["bond_tier"].is_number(), "{body}");
         assert!(settled_at(&pool, s.activity.id).await.is_some());
         assert_eq!(activity_events(&pool, s.session_id).await, 1);
@@ -518,6 +535,7 @@ mod tests {
         let s = scene(with_judge(test_state(pool.clone()), &mock), 2).await;
         let invitation = s.activity.message_id.expect("the invitation");
         let instance_id = instance_of(&pool, s.session_id).await;
+        near_a_tier(&pool, s.session_id).await;
         end_at(
             &s.state,
             s.session_id,
@@ -540,6 +558,10 @@ mod tests {
         let expected = serde_json::to_value(&again.activity).unwrap();
         assert!(
             expected["effective_deltas_computed"].is_object(),
+            "{expected}"
+        );
+        assert!(
+            expected["label_changes"]["bond"]["to"].is_string(),
             "{expected}"
         );
         let mut app = build_router(s.state.clone());

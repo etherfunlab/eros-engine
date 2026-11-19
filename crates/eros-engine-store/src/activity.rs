@@ -307,7 +307,8 @@ impl ActivityRepo<'_> {
     /// The dates whose invitation is one of `ids`, oldest first, each with
     /// what its settlement event committed (`None` before settlement or when
     /// it wrote none). The event is the parent's `activity` event naming the
-    /// date, found through the parent's affinity row.
+    /// date, found through the parent's affinity row and looked for only once
+    /// the date is stamped settled.
     pub async fn by_message_ids(
         &self,
         ids: &[Uuid],
@@ -319,7 +320,8 @@ impl ActivityRepo<'_> {
                     SELECT x.effective_deltas, x.effective_line_deltas, x.label_changes \
                       FROM engine.companion_affinity c \
                       JOIN engine.companion_affinity_events x ON x.affinity_id = c.id \
-                     WHERE c.session_id = a.session_id AND x.event_type = 'activity' \
+                     WHERE a.settled_at IS NOT NULL \
+                       AND c.session_id = a.session_id AND x.event_type = 'activity' \
                        AND x.context->>'activity_id' = a.id::text \
                      LIMIT 1) ev ON true \
               WHERE a.message_id = ANY($1) ORDER BY a.created_at, a.id"
@@ -1017,7 +1019,7 @@ mod tests {
         };
         let tuning = AffinityTuning::default();
         let mut tx = pool.begin().await.unwrap();
-        AffinityRepo::persist_activity_in_tx(
+        let (_, other) = AffinityRepo::persist_activity_in_tx(
             &mut tx,
             s.session,
             &verdict(Uuid::new_v4(), 2, 4.0),
@@ -1036,11 +1038,22 @@ mod tests {
         .unwrap()
         .expect("this date's event");
         tx.commit().await.unwrap();
+        assert_ne!(other.lines, mine.lines, "the two dates tell apart");
 
-        let got = ActivityRepo { pool: &pool }
-            .by_message_ids(&[s.invite])
+        // The date is not stamped settled: its receipt carries nothing yet.
+        let repo = ActivityRepo { pool: &pool };
+        assert_eq!(
+            repo.by_message_ids(&[s.invite]).await.unwrap(),
+            vec![(a.clone(), None)]
+        );
+
+        let mut tx = pool.begin().await.unwrap();
+        ActivityRepo::mark_settled_in_tx(&mut tx, a.id, t(NOW))
             .await
             .unwrap();
+        tx.commit().await.unwrap();
+        let a = repo.get(a.id).await.unwrap().expect("the date");
+        let got = repo.by_message_ids(&[s.invite]).await.unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].0, a);
         let d = got[0].1.as_ref().expect("the date's own event");
