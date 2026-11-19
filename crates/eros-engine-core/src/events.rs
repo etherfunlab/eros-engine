@@ -144,13 +144,19 @@ pub enum EventKind {
     /// She is driving: only on a trip.
     Driving,
     /// She and the user take a bath together: written when the user accepts
-    /// her `bathe_together` ask.
+    /// her `bathe_together` ask, or she accepts the user's `bath_together`.
     BathingTogether,
     /// She is out on a date with the user: written when the user's `date`
     /// invitation is accepted, and ended when the activity does.
     OnADate,
     /// She is in the bathroom for a few minutes: any world, not a machine.
     UsingToilet,
+    /// She and the user shower together: written when she accepts the user's
+    /// `shower_together`.
+    ShoweringTogether,
+    /// She and the user take a sauna together: written when she accepts the
+    /// user's `sauna_together`.
+    SaunaTogether,
 }
 
 impl EventKind {
@@ -229,12 +235,14 @@ impl EventKind {
     ];
 
     /// Kinds the writers place directly, never drawn: parsed and stored, not in `ALL`.
-    pub const SPECIAL: [EventKind; 5] = [
+    pub const SPECIAL: [EventKind; 7] = [
         EventKind::TakingSpace,
         EventKind::FellOut,
         EventKind::TravelingTogether,
         EventKind::BathingTogether,
         EventKind::OnADate,
+        EventKind::ShoweringTogether,
+        EventKind::SaunaTogether,
     ];
 
     /// The stored and wire value.
@@ -315,6 +323,8 @@ impl EventKind {
             EventKind::OnAPlane => "on_a_plane",
             EventKind::Driving => "driving",
             EventKind::UsingToilet => "using_toilet",
+            EventKind::ShoweringTogether => "showering_together",
+            EventKind::SaunaTogether => "sauna_together",
         }
     }
 
@@ -334,7 +344,8 @@ impl EventKind {
             | TakingSelfie | Strip | BirdEncounter | ExWantsBack | WantToQuitJob
             | PonderingLife | Streaking | WantToSeeSea | WantHotSpring | WantSauna
             | BathingTogether | OnADate | GotLost | Drinking | Smoking | SmokingWeed
-            | JustHaveSex | Masturbating | MissedRide | UsingToilet => EventCategory::Short,
+            | JustHaveSex | Masturbating | MissedRide | UsingToilet | ShoweringTogether
+            | SaunaTogether => EventCategory::Short,
             TempWork | ExMessage | GotHit | Breakup | WorkingOut | Reading | Gaming
             | AwayFromPhone | Unwell | Irritable | Busy | InBattle | Asleep | OutShopping
             | BrosGathering | SisGathering | OnTheRoad | WatchingShow | HavingSex | WantToGoOut
@@ -569,6 +580,8 @@ fn rule(kind: EventKind) -> Rule {
         OnAPlane => (1.0, 48, Lasts::Hours(2, 4)),
         Driving => (1.0, 48, Lasts::Hours(1, 3)),
         UsingToilet => (1.0, 12, Lasts::Minutes(30)),
+        ShoweringTogether => (0.0, 0, Lasts::Minutes(30)),
+        SaunaTogether => (0.0, 0, Lasts::Hours(1, 1)),
     };
     Rule {
         weight,
@@ -1238,14 +1251,16 @@ pub fn offline_kinds(persona: &PersonaTraits) -> Vec<EventKind> {
 /// away only to someone she is close to, and so does a female persona's
 /// `out_shopping` (spec 2026-10-19-life-events-shopping-gatherings-and-ask-for-
 /// space-design.md §2.1); never `asleep`, `away_from_phone`, a gathering, or
-/// the storage-only `taking_space`, `fell_out` and `traveling_together`.
+/// the placed kinds (`EventKind::SPECIAL`).
 pub fn is_told(kind: EventKind, rung: u8, persona: &PersonaTraits) -> bool {
     match kind {
         EventKind::TakingSpace
         | EventKind::FellOut
         | EventKind::TravelingTogether
         | EventKind::BathingTogether
-        | EventKind::OnADate => false,
+        | EventKind::OnADate
+        | EventKind::ShoweringTogether
+        | EventKind::SaunaTogether => false,
         EventKind::Busy | EventKind::InBattle => rung >= CONFIDE_MIN_RUNG,
         EventKind::OutShopping if persona.female => rung >= CONFIDE_MIN_RUNG,
         k => !k.is_offline(persona),
@@ -2027,7 +2042,7 @@ mod tests {
         assert!(!EventKind::ALL.contains(&TakingSpace));
         assert!(!EventKind::ALL.contains(&FellOut));
         assert_eq!(EventKind::ALL.len(), 70);
-        assert_eq!(EventKind::SPECIAL.len(), 5);
+        assert_eq!(EventKind::SPECIAL.len(), 7);
         for k in EventKind::SPECIAL {
             assert_eq!(serde_json::to_value(k).unwrap(), k.as_str());
             assert_eq!(EventKind::parse(k.as_str()), Some(k));
@@ -2715,6 +2730,41 @@ mod tests {
         assert_eq!(lasts(b, 0.5), Duration::minutes(30));
         for rung in 1..=5 {
             assert!(!is_told(b, rung, &PersonaTraits::default()), "rung {rung}");
+        }
+    }
+
+    /// Spec 2026-11-20-together-actions-state-in-picture-and-genome-routes-
+    /// design.md §5.
+    #[test]
+    fn the_together_kinds_are_placed_incidents_she_does_not_tell() {
+        for (k, wire, length) in [
+            (
+                ShoweringTogether,
+                "showering_together",
+                Duration::minutes(30),
+            ),
+            (SaunaTogether, "sauna_together", Duration::hours(1)),
+        ] {
+            assert!(
+                EventKind::SPECIAL.contains(&k) && !EventKind::ALL.contains(&k),
+                "{k:?}"
+            );
+            assert_eq!(k.as_str(), wire);
+            assert_eq!(EventKind::parse(wire), Some(k));
+            assert_eq!(serde_json::to_value(k).unwrap(), wire);
+            assert_eq!(k.category(), EventCategory::Short);
+            assert_eq!(k.place(), Place::Neutral);
+            assert!(k.fits(Setting::Modern) && k.fits(Setting::Fantasy), "{k:?}");
+            assert!(!k.may_be_offline(), "{k:?}");
+            assert!(!k.is_offline(&female()), "{k:?}");
+            let r = rule(k);
+            assert_eq!((r.weight, r.cooldown_hours), (0.0, 0), "{k:?}");
+            for roll in [0.0, 0.5, 0.99] {
+                assert_eq!(lasts(k, roll), length, "{k:?}");
+            }
+            for rung in 0..=5 {
+                assert!(!is_told(k, rung, &PersonaTraits::default()), "rung {rung}");
+            }
         }
     }
 

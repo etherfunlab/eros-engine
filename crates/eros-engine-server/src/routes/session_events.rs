@@ -50,9 +50,9 @@ const CONCURRENT_STREAMS_PER_USER: u32 = 3;
 const MAX_EVENT_KEY_CHARS: usize = 128;
 
 /// A kind of life event. `taking_space`, `fell_out`, `traveling_together`,
-/// `bathing_together` and `on_a_date` are placed by the engine, never drawn:
-/// they appear in responses only, and a `kinds` filter that lists one is
-/// rejected.
+/// `bathing_together`, `on_a_date`, `showering_together` and
+/// `sauna_together` are placed by the engine, never drawn: they appear in
+/// responses only, and a `kinds` filter that lists one is rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKindDto {
@@ -131,6 +131,8 @@ pub enum EventKindDto {
     OnAPlane,
     Driving,
     UsingToilet,
+    ShoweringTogether,
+    SaunaTogether,
 }
 
 /// Reads the drawable kinds only: a request names kinds to draw, and the
@@ -227,6 +229,8 @@ impl From<EventKindDto> for EventKind {
             EventKindDto::OnAPlane => EventKind::OnAPlane,
             EventKindDto::Driving => EventKind::Driving,
             EventKindDto::UsingToilet => EventKind::UsingToilet,
+            EventKindDto::ShoweringTogether => EventKind::ShoweringTogether,
+            EventKindDto::SaunaTogether => EventKind::SaunaTogether,
         }
     }
 }
@@ -309,6 +313,8 @@ impl From<EventKind> for EventKindDto {
             EventKind::OnAPlane => EventKindDto::OnAPlane,
             EventKind::Driving => EventKindDto::Driving,
             EventKind::UsingToilet => EventKindDto::UsingToilet,
+            EventKind::ShoweringTogether => EventKindDto::ShoweringTogether,
+            EventKind::SaunaTogether => EventKindDto::SaunaTogether,
         }
     }
 }
@@ -2586,6 +2592,8 @@ mod tests {
             json!({"disallow": ["fell_out"]}),
             json!(["bathing_together"]),
             json!(["on_a_date"]),
+            json!(["showering_together"]),
+            json!({"allow": ["sauna_together"]}),
         ] {
             assert!(
                 serde_json::from_value::<DrawEventRequest>(
@@ -2604,6 +2612,14 @@ mod tests {
             serde_json::to_value(EventKindDto::FellOut).unwrap(),
             json!("fell_out")
         );
+        for (kind, wire) in [
+            (EventKind::ShoweringTogether, "showering_together"),
+            (EventKind::SaunaTogether, "sauna_together"),
+        ] {
+            let dto = EventKindDto::from(kind);
+            assert_eq!(serde_json::to_value(dto).unwrap(), json!(wire));
+            assert_eq!(EventKind::from(dto), kind);
+        }
     }
 
     /// Draw `kind` for a fresh persona (`art_metadata` `art`, `tip_personality`

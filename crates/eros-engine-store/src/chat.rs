@@ -1170,15 +1170,27 @@ impl<'a> ChatRepo<'a> {
     /// An accepted `give`, `gift`, `tip`, `kiss` or `french_kiss` also leaves a moment in the
     /// relationship journal of `instance_id`, in the same transaction, dated in
     /// `journal_tz` (UTC when absent); a repeat of the same message adds none.
+    ///
+    /// `place` is the event an accepted together action puts her in (spec
+    /// 2026-11-20-together-actions-state-in-picture-and-genome-routes-
+    /// design.md §5), written in the same transaction by
+    /// [`crate::events::EventRepo::place_together_in_tx`]: once per
+    /// `event_key`, and never while a date of the instance is on. A refusal
+    /// places nothing.
     pub async fn set_action_response(
         &self,
         user_message_id: Uuid,
         response: eros_engine_core::types::ActionResponse,
         instance_id: Uuid,
         journal_tz: Option<chrono_tz::Tz>,
+        place: Option<&crate::events::NewEvent<'_>>,
     ) -> Result<(), sqlx::Error> {
         use eros_engine_core::types::ActionResponse;
         let mut tx = self.pool.begin().await?;
+        // First, as it takes the instance's lock.
+        if let (ActionResponse::Accept, Some(e)) = (response, place) {
+            crate::events::EventRepo::place_together_in_tx(&mut tx, e).await?;
+        }
         sqlx::query(
             "WITH upd AS ( \
                  UPDATE engine.chat_messages \
@@ -3923,12 +3935,24 @@ mod tests {
         .await;
         let repo = ChatRepo { pool: &pool };
 
-        repo.set_action_response(id, ActionResponse::Accept, s.instance_id.unwrap(), None)
-            .await
-            .unwrap();
-        repo.set_action_response(id, ActionResponse::Accept, s.instance_id.unwrap(), None)
-            .await
-            .unwrap();
+        repo.set_action_response(
+            id,
+            ActionResponse::Accept,
+            s.instance_id.unwrap(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        repo.set_action_response(
+            id,
+            ActionResponse::Accept,
+            s.instance_id.unwrap(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             items_of(&pool).await,
             vec![(
@@ -3948,9 +3972,15 @@ mod tests {
         assert_eq!(meta["action"]["response"], "accept");
         assert_eq!(meta["tier"], "gold", "other metadata keys survive");
 
-        repo.set_action_response(id, ActionResponse::Refuse, s.instance_id.unwrap(), None)
-            .await
-            .unwrap();
+        repo.set_action_response(
+            id,
+            ActionResponse::Refuse,
+            s.instance_id.unwrap(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(
             items_of(&pool).await.is_empty(),
             "a flip to refuse removes it"
@@ -3963,10 +3993,170 @@ mod tests {
         let s = throwaway_session(&pool).await;
         let id = gift_row(&pool, s.id, serde_json::json!({"type": "kiss"})).await;
         ChatRepo { pool: &pool }
-            .set_action_response(id, ActionResponse::Accept, s.instance_id.unwrap(), None)
+            .set_action_response(
+                id,
+                ActionResponse::Accept,
+                s.instance_id.unwrap(),
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert!(items_of(&pool).await.is_empty());
+    }
+
+    /// A together action's turn at a fixed, microsecond-aligned instant.
+    fn together_at() -> DateTime<Utc> {
+        use chrono::TimeZone;
+        Utc.with_ymd_and_hms(2026, 11, 20, 12, 0, 0).unwrap()
+    }
+
+    /// An event of `kind` from `from` to `to`, written directly.
+    async fn put_event(
+        pool: &PgPool,
+        s: &ChatSession,
+        kind: &str,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO engine.persona_events \
+               (instance_id, session_id, event_key, kind, started_at, ends_at) \
+             VALUES ($1, $2, $3, $3, $4, $5) RETURNING id",
+        )
+        .bind(s.instance_id.unwrap())
+        .bind(s.id)
+        .bind(kind)
+        .bind(from)
+        .bind(to)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn event_span(pool: &PgPool, id: Uuid) -> (DateTime<Utc>, DateTime<Utc>) {
+        sqlx::query_as("SELECT started_at, ends_at FROM engine.persona_events WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// `(event_key, started_at, ends_at)` of every event of `kind`.
+    async fn events_of(pool: &PgPool, kind: &str) -> Vec<(String, DateTime<Utc>, DateTime<Utc>)> {
+        sqlx::query_as(
+            "SELECT event_key, started_at, ends_at FROM engine.persona_events WHERE kind = $1",
+        )
+        .bind(kind)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// An accepted together action places its event with her answer: the
+    /// incident under way ends there, a background keeps going, and a second
+    /// write of the same turn places nothing (spec 2026-11-20-together-
+    /// actions-state-in-picture-and-genome-routes-design.md §5).
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_accepted_together_action_places_its_event_once(pool: PgPool) {
+        use crate::events::NewEvent;
+        use eros_engine_core::events::EventKind;
+        use eros_engine_core::types::ActionResponse;
+        let s = throwaway_session(&pool).await;
+        let instance = s.instance_id.unwrap();
+        let t = together_at();
+        let m = chrono::Duration::minutes;
+        let incident = put_event(&pool, &s, "reading", t - m(10), t + m(50)).await;
+        let trip = put_event(&pool, &s, "short_trip", t - m(600), t + m(2000)).await;
+        let id = gift_row(&pool, s.id, serde_json::json!({"type": "shower_together"})).await;
+        let key = format!("action:{id}:showering_together");
+        let repo = ChatRepo { pool: &pool };
+
+        for (at, retry) in [(t, false), (t + m(1), true)] {
+            let place = NewEvent {
+                instance_id: instance,
+                session_id: s.id,
+                event_key: &key,
+                kind: EventKind::ShoweringTogether,
+                started_at: at,
+                ends_at: at + m(30),
+            };
+            repo.set_action_response(id, ActionResponse::Accept, instance, None, Some(&place))
+                .await
+                .unwrap_or_else(|e| panic!("retry={retry}: {e}"));
+        }
+
+        assert_eq!(
+            events_of(&pool, "showering_together").await,
+            vec![(key, t, t + m(30))],
+            "one row, uncut by the second write"
+        );
+        assert_eq!(event_span(&pool, incident).await, (t - m(10), t));
+        assert_eq!(event_span(&pool, trip).await, (t - m(600), t + m(2000)));
+        let response: String = sqlx::query_scalar(
+            "SELECT metadata->'action'->>'response' FROM engine.chat_messages WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(response, "accept");
+    }
+
+    /// A refusal places nothing, and neither does an accept while a date of
+    /// the instance has not ended: its `on_a_date` is left as it is.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_refused_or_dated_together_action_places_nothing(pool: PgPool) {
+        use crate::events::NewEvent;
+        use eros_engine_core::events::EventKind;
+        use eros_engine_core::types::ActionResponse;
+        let s = throwaway_session(&pool).await;
+        let instance = s.instance_id.unwrap();
+        let t = together_at();
+        let m = chrono::Duration::minutes;
+        let repo = ChatRepo { pool: &pool };
+        let place = |key: &'static str| NewEvent {
+            instance_id: instance,
+            session_id: s.id,
+            event_key: key,
+            kind: EventKind::SaunaTogether,
+            started_at: t,
+            ends_at: t + m(60),
+        };
+
+        let refused = gift_row(&pool, s.id, serde_json::json!({"type": "sauna_together"})).await;
+        repo.set_action_response(
+            refused,
+            ActionResponse::Refuse,
+            instance,
+            None,
+            Some(&place("refused")),
+        )
+        .await
+        .unwrap();
+        assert!(events_of(&pool, "sauna_together").await.is_empty());
+
+        let date = put_event(&pool, &s, "on_a_date", t - m(10), t + m(50)).await;
+        let dated = gift_row(&pool, s.id, serde_json::json!({"type": "sauna_together"})).await;
+        repo.set_action_response(
+            dated,
+            ActionResponse::Accept,
+            instance,
+            None,
+            Some(&place("dated")),
+        )
+        .await
+        .unwrap();
+        assert!(events_of(&pool, "sauna_together").await.is_empty());
+        assert_eq!(event_span(&pool, date).await, (t - m(10), t + m(50)));
+        let response: String = sqlx::query_scalar(
+            "SELECT metadata->'action'->>'response' FROM engine.chat_messages WHERE id = $1",
+        )
+        .bind(dated)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(response, "accept", "her answer is stored all the same");
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -4046,7 +4236,7 @@ mod tests {
             (malformed, Accept),
             (no_action, Accept),
         ] {
-            repo.set_action_response(id, response, instance, None)
+            repo.set_action_response(id, response, instance, None, None)
                 .await
                 .unwrap();
         }
@@ -4054,26 +4244,26 @@ mod tests {
 
         // A re-driven turn accepts the same give twice: one row.
         for _ in 0..2 {
-            repo.set_action_response(named_give, Accept, instance, None)
+            repo.set_action_response(named_give, Accept, instance, None, None)
                 .await
                 .unwrap();
         }
-        repo.set_action_response(plain_give, Accept, instance, None)
+        repo.set_action_response(plain_give, Accept, instance, None, None)
             .await
             .unwrap();
-        repo.set_action_response(dress, Accept, instance, None)
+        repo.set_action_response(dress, Accept, instance, None, None)
             .await
             .unwrap();
-        repo.set_action_response(tip, Accept, instance, None)
+        repo.set_action_response(tip, Accept, instance, None, None)
             .await
             .unwrap();
         let day_before = crate::journal::local_date(Utc::now(), Some(Tokyo));
-        repo.set_action_response(kiss, Accept, instance, Some(Tokyo))
+        repo.set_action_response(kiss, Accept, instance, Some(Tokyo), None)
             .await
             .unwrap();
         let day_after = crate::journal::local_date(Utc::now(), Some(Tokyo));
         // Only the first accepted kiss counts.
-        repo.set_action_response(later_kiss, Accept, instance, None)
+        repo.set_action_response(later_kiss, Accept, instance, None, None)
             .await
             .unwrap();
 
@@ -4130,9 +4320,15 @@ mod tests {
             serde_json::json!({"type": "gift", "kind": "item"}),
         ] {
             let id = gift_row(&pool, s.id, action).await;
-            repo.set_action_response(id, ActionResponse::Accept, s.instance_id.unwrap(), None)
-                .await
-                .expect("a malformed gift must not fail the write");
+            repo.set_action_response(
+                id,
+                ActionResponse::Accept,
+                s.instance_id.unwrap(),
+                None,
+                None,
+            )
+            .await
+            .expect("a malformed gift must not fail the write");
             let r: Option<String> = sqlx::query_scalar(
                 "SELECT metadata #>> '{action,response}' FROM engine.chat_messages WHERE id = $1",
             )
@@ -4156,7 +4352,13 @@ mod tests {
         )
         .await;
         ChatRepo { pool: &pool }
-            .set_action_response(id, ActionResponse::Accept, s.instance_id.unwrap(), None)
+            .set_action_response(
+                id,
+                ActionResponse::Accept,
+                s.instance_id.unwrap(),
+                None,
+                None,
+            )
             .await
             .unwrap();
         sqlx::query("DELETE FROM engine.chat_messages WHERE id = $1")
@@ -6249,9 +6451,15 @@ mod tests {
         .await
         .unwrap();
         let repo = ChatRepo { pool: &pool };
-        repo.set_action_response(id, ActionResponse::Refuse, s.instance_id.unwrap(), None)
-            .await
-            .unwrap();
+        repo.set_action_response(
+            id,
+            ActionResponse::Refuse,
+            s.instance_id.unwrap(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let meta: serde_json::Value =
             sqlx::query_scalar("SELECT metadata FROM engine.chat_messages WHERE id = $1")
                 .bind(id)
@@ -6277,7 +6485,13 @@ mod tests {
         .await
         .unwrap();
         ChatRepo { pool: &pool }
-            .set_action_response(id, ActionResponse::Accept, s.instance_id.unwrap(), None)
+            .set_action_response(
+                id,
+                ActionResponse::Accept,
+                s.instance_id.unwrap(),
+                None,
+                None,
+            )
             .await
             .unwrap();
         let meta: serde_json::Value =

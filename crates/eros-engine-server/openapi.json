@@ -5578,7 +5578,7 @@
       },
       "EventKindDto": {
         "type": "string",
-        "description": "A kind of life event. `taking_space`, `fell_out`, `traveling_together`,\n`bathing_together` and `on_a_date` are placed by the engine, never drawn:\nthey appear in responses only, and a `kinds` filter that lists one is\nrejected.",
+        "description": "A kind of life event. `taking_space`, `fell_out`, `traveling_together`,\n`bathing_together`, `on_a_date`, `showering_together` and\n`sauna_together` are placed by the engine, never drawn: they appear in\nresponses only, and a `kinds` filter that lists one is rejected.",
         "enum": [
           "police_encounter",
           "animal_encounter",
@@ -5654,7 +5654,9 @@
           "on_a_train",
           "on_a_plane",
           "driving",
-          "using_toilet"
+          "using_toilet",
+          "showering_together",
+          "sauna_together"
         ]
       },
       "EventView": {
@@ -8082,7 +8084,7 @@
       },
       "UserActionDto": {
         "type": "object",
-        "description": "An action the user does to the persona this turn, besides talking. The\npersona accepts or does not; a refusal costs the relationship one tier on\nthe line the action touches (`give` and `gift` → bond, every physical or custom action →\nchemistry); a refused `tip`, `bluff`, `threaten` or `trick` costs nothing.\nAn accepted `gift` joins the persona's items or wardrobe. A `date` asks her\nout; accepted, it runs in a session of its own for its `duration`, and\nnothing else is sent to the persona's text sessions meanwhile.",
+        "description": "An action the user does to the persona this turn, besides talking. The\npersona accepts or does not; a refusal costs the relationship one tier on\nthe line the action touches (`give` and `gift` → bond, every physical or custom action →\nchemistry); a refused `tip`, `bluff`, `threaten` or `trick` costs nothing.\nAn accepted `gift` joins the persona's items or wardrobe. A `date` asks her\nout; accepted, it runs in a session of its own for its `duration`, and\nnothing else is sent to the persona's text sessions meanwhile. An accepted\n`shower_together`, `bath_together` or `sauna_together` starts a\n`showering_together` (30 minutes), `bathing_together` (30 minutes) or\n`sauna_together` (one hour) event, ending the incident under way; on a\ndate it starts none.",
         "required": [
           "type"
         ],
@@ -8197,6 +8199,9 @@
           "threaten",
           "trick",
           "strip",
+          "shower_together",
+          "bath_together",
+          "sauna_together",
           "custom",
           "tip",
           "gift",

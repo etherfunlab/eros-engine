@@ -168,6 +168,9 @@ pub enum UserActionKind {
     Threaten,
     Trick,
     Strip,
+    ShowerTogether,
+    BathTogether,
+    SaunaTogether,
     Custom,
     Tip,
     Gift,
@@ -320,7 +323,11 @@ impl From<DateDurationDto> for eros_engine_core::types::DateDuration {
 /// chemistry); a refused `tip`, `bluff`, `threaten` or `trick` costs nothing.
 /// An accepted `gift` joins the persona's items or wardrobe. A `date` asks her
 /// out; accepted, it runs in a session of its own for its `duration`, and
-/// nothing else is sent to the persona's text sessions meanwhile.
+/// nothing else is sent to the persona's text sessions meanwhile. An accepted
+/// `shower_together`, `bath_together` or `sauna_together` starts a
+/// `showering_together` (30 minutes), `bathing_together` (30 minutes) or
+/// `sauna_together` (one hour) event, ending the incident under way; on a
+/// date it starts none.
 #[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct UserActionDto {
     #[serde(rename = "type")]
@@ -416,6 +423,9 @@ impl UserActionDto {
             UserActionKind::Threaten => UserAction::Threaten,
             UserActionKind::Trick => UserAction::Trick,
             UserActionKind::Strip => UserAction::Strip,
+            UserActionKind::ShowerTogether => UserAction::ShowerTogether,
+            UserActionKind::BathTogether => UserAction::BathTogether,
+            UserActionKind::SaunaTogether => UserAction::SaunaTogether,
             UserActionKind::Custom => UserAction::Custom {
                 text: free_text(self.text.as_deref(), "text", MAX_ACTION_TEXT_CHARS)?
                     .ok_or("action.text is required for custom")?,
@@ -4898,6 +4908,39 @@ mod validate_payload_tests {
         .expect("history parses a stored ask_dancing");
         assert_eq!(view.response, Some(ActionResponseDto::Accept));
         assert_eq!(view.action.kind, UserActionKind::AskDancing);
+    }
+
+    /// Spec 2026-11-20-together-actions-state-in-picture-and-genome-routes-
+    /// design.md §5.
+    #[test]
+    fn the_together_actions_map_one_to_one() {
+        for (wire, kind, want) in [
+            (
+                "shower_together",
+                UserActionKind::ShowerTogether,
+                UserAction::ShowerTogether,
+            ),
+            (
+                "bath_together",
+                UserActionKind::BathTogether,
+                UserAction::BathTogether,
+            ),
+            (
+                "sauna_together",
+                UserActionKind::SaunaTogether,
+                UserAction::SaunaTogether,
+            ),
+        ] {
+            let dto: UserActionDto = serde_json::from_value(serde_json::json!({"type": wire}))
+                .unwrap_or_else(|e| panic!("{wire}: {e}"));
+            assert_eq!(dto.to_core().unwrap(), want, "{wire}");
+            let view = UserActionView::from_metadata_action(
+                &serde_json::json!({"type": wire, "response": "accept"}),
+            )
+            .unwrap_or_else(|| panic!("history parses a stored {wire}"));
+            assert_eq!(view.response, Some(ActionResponseDto::Accept));
+            assert_eq!(view.action.kind, kind);
+        }
     }
 
     #[test]

@@ -126,9 +126,9 @@ pub struct ActivityRepo<'a> {
     pub pool: &'a PgPool,
 }
 
-/// [`ActivityRepo::date_on`] on any executor, so `accept` reads it under the
+/// [`ActivityRepo::date_on`] on any executor, so a writer reads it under the
 /// instance's lock.
-async fn date_on<'e>(
+pub(crate) async fn date_on<'e>(
     executor: impl sqlx::PgExecutor<'e>,
     instance_id: Uuid,
     invitation: Option<Uuid>,

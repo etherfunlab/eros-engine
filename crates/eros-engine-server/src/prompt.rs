@@ -760,6 +760,9 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
         UserAction::Threaten => "威胁你".into(),
         UserAction::Trick => "想捉弄你".into(),
         UserAction::Strip => "伸手想脱你的衣服".into(),
+        UserAction::ShowerTogether => "想和你一起淋浴".into(),
+        UserAction::BathTogether => "想和你一起泡澡".into(),
+        UserAction::SaunaTogether => "想和你一起蒸桑拿".into(),
         UserAction::Custom { text } => text.clone(),
         UserAction::Tip { amount_usd } => {
             format!("给你发了一个红包，相当于{}", tip_value_noun(*amount_usd))
@@ -1073,6 +1076,8 @@ pub(crate) fn event_label(kind: eros_engine_core::events::EventKind) -> &'static
         OnAPlane => "在飞机上",
         Driving => "在开车",
         UsingToilet => "上厕所中",
+        ShoweringTogether => "和对方一起淋浴",
+        SaunaTogether => "和对方一起蒸桑拿",
     }
 }
 
@@ -6571,6 +6576,9 @@ mod tests {
             UserAction::Threaten,
             UserAction::Trick,
             UserAction::Strip,
+            UserAction::ShowerTogether,
+            UserAction::BathTogether,
+            UserAction::SaunaTogether,
             UserAction::Custom {
                 text: "捏了捏你的脸".into(),
             },
@@ -6603,8 +6611,33 @@ mod tests {
                 "威胁你",
                 "想捉弄你",
                 "伸手想脱你的衣服",
+                "想和你一起淋浴",
+                "想和你一起泡澡",
+                "想和你一起蒸桑拿",
                 "捏了捏你的脸",
             ]
+        );
+    }
+
+    /// Spec 2026-11-20-together-actions-state-in-picture-and-genome-routes-
+    /// design.md §5.
+    #[test]
+    fn a_together_action_reads_as_an_ask_and_its_event_as_her_state() {
+        use eros_engine_core::events::EventKind;
+        assert_eq!(
+            action_outcome(&UserAction::ShowerTogether, ActionResponse::Accept),
+            "对方想和你一起淋浴，你接受了。"
+        );
+        for (a, label) in [
+            (UserAction::ShowerTogether, "和对方一起淋浴"),
+            (UserAction::BathTogether, "和对方一起洗澡"),
+            (UserAction::SaunaTogether, "和对方一起蒸桑拿"),
+        ] {
+            assert_eq!(event_label(a.together_kind().unwrap()), label, "{a:?}");
+        }
+        assert_eq!(
+            current_state(Some(EventKind::ShortTrip), Some(EventKind::SaunaTogether)).as_deref(),
+            Some("短途旅游；和对方一起蒸桑拿")
         );
     }
 

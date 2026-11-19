@@ -379,10 +379,11 @@ impl<'a> StoryRepo<'a> {
     /// `cap` newest, and a row under way survives it. Left out: a
     /// `taking_space` / `fell_out` whose session is gone or archived (it
     /// belongs to that relationship), a false alarm still under way (she
-    /// does not know yet), and every `bathing_together` and `on_a_date`: a
-    /// romantic choice's outcome lives in the conversation only (spec
-    /// 2026-10-30 §4.7), and a date in its own sub-session. The narration is
-    /// dropped when its session is archived; the event stays, as her own life.
+    /// does not know yet), and every `bathing_together`, `showering_together`
+    /// and `on_a_date`: a romantic choice's or action's outcome lives in the
+    /// conversation only (spec 2026-10-30 §4.7), and a date in its own
+    /// sub-session. The narration is dropped when its session is archived; the
+    /// event stays, as her own life.
     pub async fn life_events(
         &self,
         instance_id: Uuid,
@@ -399,10 +400,14 @@ impl<'a> StoryRepo<'a> {
             .filter(|k| k.is_false_alarm())
             .map(EventKind::as_str)
             .collect();
-        let kept_out: Vec<&str> = [EventKind::BathingTogether, EventKind::OnADate]
-            .into_iter()
-            .map(EventKind::as_str)
-            .collect();
+        let kept_out: Vec<&str> = [
+            EventKind::BathingTogether,
+            EventKind::ShoweringTogether,
+            EventKind::OnADate,
+        ]
+        .into_iter()
+        .map(EventKind::as_str)
+        .collect();
         #[allow(clippy::type_complexity)] // sqlx tuple query — type alias would add noise
         let rows: Vec<(
             Uuid,
@@ -1505,8 +1510,9 @@ mod tests {
         assert!(got.is_empty(), "no false alarm under way reaches the story");
     }
 
-    /// A bath together is a romantic choice's outcome: it lives in the
-    /// conversation only, never in her story (spec 2026-10-30 §4.7).
+    /// A bath or a shower together is a romantic choice's or action's
+    /// outcome: it lives in the conversation only, never in her story (spec
+    /// 2026-10-30 §4.7). A sauna together is not romantic and reaches it.
     #[sqlx::test(migrations = "./migrations")]
     async fn life_events_leave_out_a_bath_together(pool: PgPool) {
         let repo = StoryRepo { pool: &pool };
@@ -1518,6 +1524,8 @@ mod tests {
         for (key, kind, from, to) in [
             ("over", "bathing_together", now - m(90), now - m(60)),
             ("now", "bathing_together", now - m(10), now + m(20)),
+            ("shower", "showering_together", now - m(150), now - m(120)),
+            ("sauna", "sauna_together", now - m(260), now - m(200)),
             ("read", "reading", now - m(200), now - m(100)),
         ] {
             seed_event(&pool, inst, Some(s), key, kind, from, to, None).await;
@@ -1527,7 +1535,7 @@ mod tests {
             .await
             .unwrap();
         let kinds: Vec<EventKind> = got.iter().map(|e| e.event.kind).collect();
-        assert_eq!(kinds, vec![EventKind::Reading]);
+        assert_eq!(kinds, vec![EventKind::Reading, EventKind::SaunaTogether]);
     }
 
     /// A date is its own sub-session's affair: it never reaches her story,
