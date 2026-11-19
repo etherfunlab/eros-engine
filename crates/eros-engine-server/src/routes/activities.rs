@@ -107,9 +107,9 @@ pub(crate) async fn end_at(
         activity: ActivityView::from_record(&settled.activity, now),
         affinity: AffinitySnapshot::from(settled.affinity.unwrap_or_else(Affinity::unrecorded)),
         effective_deltas: settled
-            .effective_deltas
+            .deltas
             .as_ref()
-            .map(AffinityDeltasDto::from),
+            .map(|d| AffinityDeltasDto::from(&d.effective)),
     })
 }
 

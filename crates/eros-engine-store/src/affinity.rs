@@ -7,7 +7,7 @@
 use chrono::{DateTime, Utc};
 use eros_engine_core::affinity::{
     grade_turn, grade_weighted, Affinity, AffinityDeltas, AffinityLine, AffinityTuning, AxisGrades,
-    EndpointLevelReads, PendingDeltas,
+    EndpointLevelReads, PendingDeltas, TurnLabelChanges,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -184,6 +184,41 @@ pub struct ActivityVerdict<'a> {
     pub journal_tz: Option<chrono_tz::Tz>,
 }
 
+/// One event's exact per-line delta, from the floored before/after scores:
+/// the `effective_line_deltas` column.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct LineDeltas {
+    pub bond: f64,
+    pub chemistry: f64,
+}
+
+/// What one affinity event committed: its six-axis effective deltas, the
+/// exact per-line deltas, and the tiers it moved (`None` when none moved).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventDeltas {
+    pub effective: AffinityDeltas,
+    pub lines: LineDeltas,
+    pub label_changes: Option<TurnLabelChanges>,
+}
+
+impl EventDeltas {
+    /// From an event's `effective_deltas`, `effective_line_deltas` and
+    /// `label_changes` columns. `None` when either of the first two is
+    /// missing or unreadable; an unreadable `label_changes` reads as no tier
+    /// moved.
+    pub(crate) fn from_columns(
+        effective: Option<serde_json::Value>,
+        lines: Option<serde_json::Value>,
+        label_changes: Option<serde_json::Value>,
+    ) -> Option<Self> {
+        Some(Self {
+            effective: serde_json::from_value(effective?).ok()?,
+            lines: serde_json::from_value(lines?).ok()?,
+            label_changes: label_changes.and_then(|v| serde_json::from_value(v).ok()),
+        })
+    }
+}
+
 pub struct AffinityRepo<'a> {
     pub pool: &'a PgPool,
 }
@@ -288,13 +323,13 @@ struct GradedWrite<'a> {
 /// [`AffinityRepo::persist_activity_in_tx`], on the row the caller locked:
 /// time decay, the grade pipeline, the row UPDATE, the event INSERT and the
 /// journal's label moves, all on `conn`; nothing here commits. Returns the
-/// persisted state and the effective deltas.
+/// persisted state and what the event committed.
 async fn write_graded(
     conn: &mut sqlx::PgConnection,
     locked: AffinityRow,
     w: GradedWrite<'_>,
     tuning: &AffinityTuning,
-) -> Result<(Affinity, AffinityDeltas), sqlx::Error> {
+) -> Result<(Affinity, EventDeltas), sqlx::Error> {
     let pending: PendingDeltas = locked
         .pending_deltas
         .as_ref()
@@ -377,16 +412,15 @@ async fn write_graded(
     }
     current.refresh_endpoints(tuning);
 
-    let label_changes = eros_engine_core::affinity::diff_labels(&before_affinity, &current)
-        .and_then(|c| serde_json::to_value(&c).ok());
+    let label_changes = eros_engine_core::affinity::diff_labels(&before_affinity, &current);
 
     // Exact per-turn line delta from the floored before/after scores
     // (the absolute bond/chemistry formulas use max(warmth,0), so a raw axis
     // fold would misreport when warmth < 0). Always written for delta events.
-    let effective_line_deltas = serde_json::json!({
-        "bond": current.bond_score() - before_affinity.bond_score(),
-        "chemistry": current.chemistry_score() - before_affinity.chemistry_score(),
-    });
+    let lines = LineDeltas {
+        bond: current.bond_score() - before_affinity.bond_score(),
+        chemistry: current.chemistry_score() - before_affinity.chemistry_score(),
+    };
 
     // Effective change = after − before (captures gating + clamping).
     let effective = AffinityDeltas {
@@ -532,8 +566,12 @@ async fn write_graded(
     .bind(w.event_type)
     .bind(deltas_json)
     .bind(effective_json)
-    .bind(label_changes)
-    .bind(effective_line_deltas)
+    .bind(
+        label_changes
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+    )
+    .bind(serde_json::to_value(lines).unwrap_or_default())
     .bind(context)
     .bind(state_snapshot(&before_affinity))
     .bind(state_snapshot(&current))
@@ -555,7 +593,14 @@ async fn write_graded(
     )
     .await?;
 
-    Ok((current, effective))
+    Ok((
+        current,
+        EventDeltas {
+            effective,
+            lines,
+            label_changes,
+        },
+    ))
 }
 
 impl<'a> AffinityRepo<'a> {
@@ -1214,13 +1259,13 @@ impl<'a> AffinityRepo<'a> {
     /// `activity_id`, `turns`, `weight`, `reason`, and `capped` naming the
     /// lines the cap held (absent when none). A label first reached becomes a
     /// `tier_reached` journal row in the same transaction. Returns the state
-    /// after and the effective deltas.
+    /// after and what the event committed.
     pub async fn persist_activity_in_tx(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         session_id: Uuid,
         v: &ActivityVerdict<'_>,
         tuning: &AffinityTuning,
-    ) -> Result<Option<(Affinity, AffinityDeltas)>, sqlx::Error> {
+    ) -> Result<Option<(Affinity, EventDeltas)>, sqlx::Error> {
         let Some(locked) = sqlx::query_as::<_, AffinityRow>(
             "SELECT * FROM engine.companion_affinity WHERE session_id = $1 FOR UPDATE",
         )
@@ -1259,16 +1304,20 @@ impl<'a> AffinityRepo<'a> {
         .map(Some)
     }
 
-    /// The effective deltas a settled date wrote: the `effective_deltas` of
-    /// the session's `activity` event for `activity_id`. `None` when there is
-    /// no such event.
+    /// What a settled date's event committed: the session's `activity` event
+    /// for `activity_id`. `None` when there is no such event.
     pub async fn activity_event_deltas(
         &self,
         session_id: Uuid,
         activity_id: Uuid,
-    ) -> Result<Option<AffinityDeltas>, sqlx::Error> {
-        let deltas: Option<Option<serde_json::Value>> = sqlx::query_scalar(
-            "SELECT e.effective_deltas \
+    ) -> Result<Option<EventDeltas>, sqlx::Error> {
+        type Columns = (
+            Option<serde_json::Value>,
+            Option<serde_json::Value>,
+            Option<serde_json::Value>,
+        );
+        let row: Option<Columns> = sqlx::query_as(
+            "SELECT e.effective_deltas, e.effective_line_deltas, e.label_changes \
              FROM engine.companion_affinity_events e \
              JOIN engine.companion_affinity a ON a.id = e.affinity_id \
              WHERE a.session_id = $1 \
@@ -1280,9 +1329,9 @@ impl<'a> AffinityRepo<'a> {
         .bind(activity_id)
         .fetch_optional(self.pool)
         .await?;
-        Ok(deltas
-            .flatten()
-            .and_then(|v| serde_json::from_value(v).ok()))
+        Ok(row.and_then(|(effective, lines, labels)| {
+            EventDeltas::from_columns(effective, lines, labels)
+        }))
     }
 }
 
@@ -4635,7 +4684,7 @@ mod tests {
         session: Uuid,
         v: &ActivityVerdict<'_>,
         tuning: &AffinityTuning,
-    ) -> Option<(Affinity, AffinityDeltas)> {
+    ) -> Option<(Affinity, EventDeltas)> {
         let mut tx = pool.begin().await.unwrap();
         let out = AffinityRepo::persist_activity_in_tx(&mut tx, session, v, tuning)
             .await
@@ -4713,9 +4762,10 @@ mod tests {
                 1.5,
             )
         };
-        let (after, effective) = settle(&pool, session, &v, &tuning)
+        let (after, out) = settle(&pool, session, &v, &tuning)
             .await
             .expect("a row to settle");
+        let effective = out.effective.clone();
 
         // jsonb keeps numbers as `numeric`, so the last bit of an f64 may not
         // survive the round trip.
@@ -4750,13 +4800,27 @@ mod tests {
         assert_eq!(context["grades"]["trust"], 1);
         assert!(context.get("capped").is_none(), "no line reached its cap");
 
+        // The line deltas and tier changes returned are the ones stored.
+        let lines = e.effective_line_deltas.as_ref().expect("line deltas");
+        assert!((lines["bond"].as_f64().unwrap() - out.lines.bond).abs() < 1e-12);
+        assert!((lines["chemistry"].as_f64().unwrap() - out.lines.chemistry).abs() < 1e-12);
+        assert!(out.lines.bond > 0.0, "{:?}", out.lines);
+        let stored_labels = e
+            .label_changes
+            .clone()
+            .map(|v| serde_json::from_value::<TurnLabelChanges>(v).unwrap());
+        assert_eq!(stored_labels, out.label_changes);
+
         // The stored deltas are found by the activity; another one has none.
         let found = repo
             .activity_event_deltas(session, v.activity_id)
             .await
             .unwrap()
             .expect("the activity's deltas");
-        same(&serde_json::to_value(&found).unwrap());
+        same(&serde_json::to_value(&found.effective).unwrap());
+        assert!((found.lines.bond - out.lines.bond).abs() < 1e-12);
+        assert!((found.lines.chemistry - out.lines.chemistry).abs() < 1e-12);
+        assert_eq!(found.label_changes, out.label_changes);
         assert!(repo
             .activity_event_deltas(session, Uuid::new_v4())
             .await
@@ -4782,7 +4846,7 @@ mod tests {
         let (session, before) = seed_axes(&pool, 0.25, 0.25, 0.0, 0.0).await;
         assert_eq!(before.bond_tier(), 2);
 
-        let (after, _) = settle(
+        let (after, out) = settle(
             &pool,
             session,
             &verdict(
@@ -4797,6 +4861,12 @@ mod tests {
         )
         .await
         .unwrap();
+        let changes = out.label_changes.expect("bond crossed a tier");
+        assert_eq!(
+            changes.bond.expect("bond moved").to,
+            after.bond_label().as_key()
+        );
+        assert!(changes.chemistry.is_none());
 
         let target = tier_raise_target(before.bond_score());
         assert!(
@@ -5010,7 +5080,7 @@ mod tests {
         .unwrap();
         let attempts = serde_json::json!([{ "model": "m", "error": "parse" }]);
 
-        let (after, effective) = settle(
+        let (after, out) = settle(
             &pool,
             session,
             &ActivityVerdict {
@@ -5021,6 +5091,7 @@ mod tests {
         )
         .await
         .unwrap();
+        let effective = out.effective;
 
         // Trust and intimacy do not decay; intrigue and tension only decay.
         assert_eq!((after.trust, after.intimacy), (0.3, 0.2));
