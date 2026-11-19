@@ -140,7 +140,8 @@ pub(crate) async fn turn_session(
 }
 
 /// `invitation message_id → receipt` for the rows of one history page, one
-/// lookup: the date each accepted invitation opened (spec §10).
+/// lookup: the date each accepted invitation opened (spec §10), with what its
+/// settlement event committed once it is settled.
 pub(crate) async fn receipts_for(
     pool: &sqlx::PgPool,
     message_ids: &[Uuid],
@@ -150,7 +151,10 @@ pub(crate) async fn receipts_for(
         .by_message_ids(message_ids)
         .await?
         .iter()
-        .filter_map(|(a, _deltas)| Some((a.message_id?, ActivityView::from_record(a, now))))
+        .filter_map(|(a, deltas)| {
+            let view = ActivityView::from_record(a, now).with_deltas(deltas.as_ref());
+            Some((a.message_id?, view))
+        })
         .collect())
 }
 

@@ -9,8 +9,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use eros_engine_core::affinity::Affinity;
+use eros_engine_core::affinity::{Affinity, LabelTransition, TurnLabelChanges};
 use eros_engine_store::activity::ActivityRecord;
+use eros_engine_store::affinity::{EventDeltas, LineDeltas};
 
 /// Point-in-time projection of a session's `Affinity`.
 ///
@@ -77,6 +78,15 @@ pub struct BondChemistryDeltas {
     pub chemistry: f64,
 }
 
+impl From<LineDeltas> for BondChemistryDeltas {
+    fn from(d: LineDeltas) -> Self {
+        Self {
+            bond: d.bond,
+            chemistry: d.chemistry,
+        }
+    }
+}
+
 /// One line's tier transition (serialised keys). Read-side mirror of
 /// `eros_engine_core::affinity::LabelTransition`.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
@@ -95,6 +105,19 @@ pub struct TurnLabelChangesDto {
     pub chemistry: Option<LabelTransitionDto>,
 }
 
+impl From<TurnLabelChanges> for TurnLabelChangesDto {
+    fn from(c: TurnLabelChanges) -> Self {
+        let dto = |t: LabelTransition| LabelTransitionDto {
+            from: t.from,
+            to: t.to,
+        };
+        Self {
+            bond: c.bond.map(dto),
+            chemistry: c.chemistry.map(dto),
+        }
+    }
+}
+
 /// A date (spec 2026-11-12-activity-sub-session-design.md §4.6, §10): the
 /// sub-session it is played in and its span, `null` once its event row is gone.
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
@@ -109,6 +132,14 @@ pub struct ActivityView {
     pub status: String,
     pub started_at: Option<DateTime<Utc>>,
     pub ends_at: Option<DateTime<Utc>>,
+    /// Each line's delta, once the date is settled and its settlement wrote
+    /// an event, as the per-turn delta route reports a turn. Omitted
+    /// otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_deltas_computed: Option<BondChemistryDeltas>,
+    /// The tiers the date moved; omitted when none moved or before that.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label_changes: Option<TurnLabelChangesDto>,
 }
 
 impl ActivityView {
@@ -122,6 +153,17 @@ impl ActivityView {
             status: r.status_at(now).as_str().to_string(),
             started_at: r.started_at,
             ends_at: r.ends_at,
+            effective_deltas_computed: None,
+            label_changes: None,
+        }
+    }
+
+    /// The view with what the date's settlement event committed, if any.
+    pub fn with_deltas(self, deltas: Option<&EventDeltas>) -> Self {
+        Self {
+            effective_deltas_computed: deltas.map(|d| d.lines.into()),
+            label_changes: deltas.and_then(|d| d.label_changes.clone().map(Into::into)),
+            ..self
         }
     }
 }

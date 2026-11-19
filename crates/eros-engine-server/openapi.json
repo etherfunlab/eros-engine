@@ -3779,6 +3779,28 @@
                 "description": "What the date moved, as its settlement's affinity event committed it.\n`null` when the settlement wrote no event: no turn of the date was\nanswered, or the relationship was archived meanwhile."
               }
             ]
+          },
+          "effective_deltas_computed": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BondChemistryDeltas",
+                "description": "Each line's delta the settlement's event committed, as the per-turn\ndelta route reports a turn. `null` when the settlement wrote no event."
+              }
+            ]
+          },
+          "label_changes": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TurnLabelChangesDto",
+                "description": "The tiers the date moved. `null` when none moved or the settlement\nwrote no event."
+              }
+            ]
           }
         }
       },
@@ -3801,6 +3823,17 @@
             "type": "string",
             "description": "`short` (1 hour) | `mid` (4 hours)."
           },
+          "effective_deltas_computed": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BondChemistryDeltas",
+                "description": "Each line's delta, once the date is settled and its settlement wrote\nan event, as the per-turn delta route reports a turn. Omitted\notherwise."
+              }
+            ]
+          },
           "ends_at": {
             "type": [
               "string",
@@ -3811,6 +3844,17 @@
           "id": {
             "type": "string",
             "format": "uuid"
+          },
+          "label_changes": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TurnLabelChangesDto",
+                "description": "The tiers the date moved; omitted when none moved or before that."
+              }
+            ]
           },
           "place": {
             "type": "string"

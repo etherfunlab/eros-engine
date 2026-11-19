@@ -20,7 +20,9 @@ use crate::error::{AppError, StreamPreError};
 use crate::pipeline::activity::settle;
 use crate::routes::companion::AffinityDeltasDto;
 use crate::routes::companion_stream::{resolve_text_session, StreamPreErrorBody};
-use crate::routes::dto::{ActivityView, AffinitySnapshot};
+use crate::routes::dto::{
+    ActivityView, AffinitySnapshot, BondChemistryDeltas, TurnLabelChangesDto,
+};
 use crate::state::AppState;
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -33,6 +35,12 @@ pub struct ActivityEndResponse {
     /// `null` when the settlement wrote no event: no turn of the date was
     /// answered, or the relationship was archived meanwhile.
     pub effective_deltas: Option<AffinityDeltasDto>,
+    /// Each line's delta the settlement's event committed, as the per-turn
+    /// delta route reports a turn. `null` when the settlement wrote no event.
+    pub effective_deltas_computed: Option<BondChemistryDeltas>,
+    /// The tiers the date moved. `null` when none moved or the settlement
+    /// wrote no event.
+    pub label_changes: Option<TurnLabelChangesDto>,
 }
 
 fn not_found() -> AppError {
@@ -103,13 +111,13 @@ pub(crate) async fn end_at(
         activities.end_early(activity.id, now).await?;
     }
     let settled = settle(state, activity.id, now).await?;
+    let deltas = settled.deltas.as_ref();
     Ok(ActivityEndResponse {
-        activity: ActivityView::from_record(&settled.activity, now),
+        activity: ActivityView::from_record(&settled.activity, now).with_deltas(deltas),
         affinity: AffinitySnapshot::from(settled.affinity.unwrap_or_else(Affinity::unrecorded)),
-        effective_deltas: settled
-            .deltas
-            .as_ref()
-            .map(|d| AffinityDeltasDto::from(&d.effective)),
+        effective_deltas: deltas.map(|d| AffinityDeltasDto::from(&d.effective)),
+        effective_deltas_computed: deltas.map(|d| d.lines.into()),
+        label_changes: deltas.and_then(|d| d.label_changes.clone().map(Into::into)),
     })
 }
 
@@ -226,6 +234,21 @@ mod tests {
         assert!(first.trust > 0.0, "{first:?}");
         assert!(out.affinity.trust > 0.0, "{:?}", out.affinity);
         assert_eq!(settled_at(&pool, s.activity.id).await, Some(now));
+        // The line deltas and tier changes ride at the top level and on the
+        // activity alike.
+        let lines = out
+            .effective_deltas_computed
+            .clone()
+            .expect("the date's line deltas");
+        assert!(lines.bond > 0.0, "{lines:?}");
+        assert_eq!(
+            serde_json::to_value(&out.activity.effective_deltas_computed).unwrap(),
+            serde_json::to_value(&out.effective_deltas_computed).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&out.activity.label_changes).unwrap(),
+            serde_json::to_value(&out.label_changes).unwrap()
+        );
 
         let again = end_at(
             &s.state,
@@ -240,7 +263,48 @@ mod tests {
         assert_eq!(again.activity.ends_at, Some(now));
         let stored = again.effective_deltas.expect("the stored deltas");
         assert!(same_deltas(&stored, &first), "{stored:?} vs {first:?}");
+        let again_lines = again
+            .effective_deltas_computed
+            .clone()
+            .expect("the stored line deltas");
+        assert!((again_lines.bond - lines.bond).abs() < 1e-12);
+        assert!((again_lines.chemistry - lines.chemistry).abs() < 1e-12);
+        assert_eq!(
+            serde_json::to_value(&again.label_changes).unwrap(),
+            serde_json::to_value(&out.label_changes).unwrap()
+        );
         assert_eq!(activity_events(&pool, s.session_id).await, 1);
+    }
+
+    /// A date ended with no answered turn writes no event: both top-level
+    /// fields are `null`, and the activity leaves them out.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn end_with_no_answered_turn_reports_null_line_deltas(pool: PgPool) {
+        let mock = judge_mock(judged(JUDGE_REPLY), 0).await;
+        let s = scene(with_judge(test_state(pool), &mock), 0).await;
+
+        let out = end_at(
+            &s.state,
+            s.session_id,
+            s.activity.id,
+            s.user_id,
+            t("2026-11-12T17:50:00Z"),
+        )
+        .await
+        .unwrap();
+        let body = serde_json::to_value(&out).unwrap();
+        for key in [
+            "effective_deltas",
+            "effective_deltas_computed",
+            "label_changes",
+        ] {
+            assert!(body.get(key).is_some_and(Value::is_null), "{key}: {body}");
+        }
+        assert!(
+            body["activity"].get("effective_deltas_computed").is_none(),
+            "{body}"
+        );
+        assert!(body["activity"].get("label_changes").is_none(), "{body}");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -269,6 +333,19 @@ mod tests {
             serde_json::from_value(body["activity"]["ends_at"].clone()).unwrap();
         assert_eq!(ends_at, t("2026-11-12T18:30:00Z"), "the clock's end");
         assert!(body["effective_deltas"].is_object(), "{body}");
+        assert!(
+            body["effective_deltas_computed"]["bond"].is_number(),
+            "{body}"
+        );
+        assert!(
+            body.as_object().unwrap().contains_key("label_changes"),
+            "{body}"
+        );
+        assert_eq!(
+            body["activity"]["effective_deltas_computed"],
+            body["effective_deltas_computed"]
+        );
+        assert_eq!(body["activity"]["label_changes"], body["label_changes"]);
         assert!(body["affinity"]["bond_tier"].is_number(), "{body}");
         assert!(settled_at(&pool, s.activity.id).await.is_some());
         assert_eq!(activity_events(&pool, s.session_id).await, 1);
@@ -360,6 +437,9 @@ mod tests {
             assert_eq!(r["sub_session_id"], json!(s.activity.sub_session_id));
             assert_eq!(r["status"], json!("ended"));
             assert_eq!(r["place"], json!("海边"));
+            // Not settled yet: no result to carry.
+            assert!(r.get("effective_deltas_computed").is_none(), "{r}");
+            assert!(r.get("label_changes").is_none(), "{r}");
             assert_eq!(receipt(messages, refused), Value::Null);
             let with_receipt = messages
                 .as_array()
@@ -428,6 +508,67 @@ mod tests {
             .map(|m| m["content"].as_str().unwrap())
             .collect();
         assert_eq!(contents, ["第0句", "回你第0句", "第1句", "回你第1句"]);
+    }
+
+    /// Once the date is settled, its receipt on both history routes and the
+    /// BFF start is the end route's `activity`, result included.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn history_receipts_carry_a_settled_dates_result(pool: PgPool) {
+        let mock = judge_mock(judged(JUDGE_REPLY), 1).await;
+        let s = scene(with_judge(test_state(pool.clone()), &mock), 2).await;
+        let invitation = s.activity.message_id.expect("the invitation");
+        let instance_id = instance_of(&pool, s.session_id).await;
+        end_at(
+            &s.state,
+            s.session_id,
+            s.activity.id,
+            s.user_id,
+            t("2026-11-12T17:50:00Z"),
+        )
+        .await
+        .unwrap();
+        // The repeat call reads the stored event, as history does.
+        let again = end_at(
+            &s.state,
+            s.session_id,
+            s.activity.id,
+            s.user_id,
+            t("2026-11-12T17:55:00Z"),
+        )
+        .await
+        .unwrap();
+        let expected = serde_json::to_value(&again.activity).unwrap();
+        assert!(
+            expected["effective_deltas_computed"].is_object(),
+            "{expected}"
+        );
+        let mut app = build_router(s.state.clone());
+
+        for (method, uri, body, rows) in [
+            (
+                "GET",
+                format!("/comp/chat/{}/history?limit=50", s.session_id),
+                None,
+                "messages",
+            ),
+            (
+                "GET",
+                format!("/bff/v1/comp/chat/{}/history", s.session_id),
+                None,
+                "messages",
+            ),
+            (
+                "POST",
+                "/bff/v1/comp/chat/start".to_string(),
+                Some(json!({"instance_id": instance_id})),
+                "history",
+            ),
+        ] {
+            let (status, got) =
+                send_request(&mut app, req(method, uri.clone(), s.user_id, body)).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {got}");
+            assert_eq!(receipt(&got[rows], invitation), expected, "{uri}");
+        }
     }
 
     /// A date turn's event lives on the parent's affinity; asked by the
