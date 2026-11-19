@@ -492,6 +492,24 @@ mod tests {
         assert_eq!(after_give(Some(base), None, Jewelry), None);
     }
 
+    /// A vehicle or a horse is a valuable: it moves no need and no habit
+    /// reads it, whatever the judge rated.
+    #[test]
+    fn a_vehicle_or_a_horse_moves_nothing() {
+        use GivenItem::*;
+        let judged = all(High);
+        for item in [Car, Motorcycle, Boat, Horse] {
+            assert_eq!(after_give(Some(all(Mid)), None, item), None, "{item:?}");
+            assert_eq!(
+                after_give(Some(all(Mid)), Some(judged), item),
+                Some(judged),
+                "{item:?}"
+            );
+            assert_eq!(after_give(None, None, item), None, "{item:?}");
+            assert_eq!(habits(5).uses(item), None, "{item:?}");
+        }
+    }
+
     /// Plain food moves no need: the judge's rating passes through, and
     /// without one there is nothing to write.
     #[test]

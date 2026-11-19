@@ -51,7 +51,11 @@ fn shape(item: GivenItem) -> Option<Shape> {
         | GivenItem::Handmade
         | GivenItem::CreditCard
         | GivenItem::Flower
-        | GivenItem::Jewelry => None,
+        | GivenItem::Jewelry
+        | GivenItem::Car
+        | GivenItem::Motorcycle
+        | GivenItem::Boat
+        | GivenItem::Horse => None,
     }
 }
 
@@ -308,7 +312,7 @@ mod tests {
     }
 
     /// Every valuable (spec 2026-10-13-give-categories-design.md §2).
-    const VALUABLES: [GivenItem; 11] = [
+    const VALUABLES: [GivenItem; 15] = [
         GivenItem::Watch,
         GivenItem::Gem,
         GivenItem::Gold,
@@ -320,6 +324,10 @@ mod tests {
         GivenItem::CreditCard,
         GivenItem::Flower,
         GivenItem::Jewelry,
+        GivenItem::Car,
+        GivenItem::Motorcycle,
+        GivenItem::Boat,
+        GivenItem::Horse,
     ];
 
     /// Each new consumable takes the rows of the existing item that has its

@@ -175,7 +175,7 @@ pub enum UserActionKind {
 }
 
 /// What a `give` action hands over. Consumables (`cigarette` through
-/// `cuisine`) linger on the persona; valuables (`watch` through `jewelry`) do
+/// `cuisine`) linger on the persona; valuables (`watch` through `horse`) do
 /// not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -200,6 +200,10 @@ pub enum GivenItemDto {
     CreditCard,
     Flower,
     Jewelry,
+    Car,
+    Motorcycle,
+    Boat,
+    Horse,
 }
 
 impl From<GivenItemDto> for eros_engine_core::types::GivenItem {
@@ -226,6 +230,10 @@ impl From<GivenItemDto> for eros_engine_core::types::GivenItem {
             GivenItemDto::CreditCard => GivenItem::CreditCard,
             GivenItemDto::Flower => GivenItem::Flower,
             GivenItemDto::Jewelry => GivenItem::Jewelry,
+            GivenItemDto::Car => GivenItem::Car,
+            GivenItemDto::Motorcycle => GivenItem::Motorcycle,
+            GivenItemDto::Boat => GivenItem::Boat,
+            GivenItemDto::Horse => GivenItem::Horse,
         }
     }
 }
@@ -254,6 +262,10 @@ impl From<eros_engine_core::types::GivenItem> for GivenItemDto {
             GivenItem::CreditCard => GivenItemDto::CreditCard,
             GivenItem::Flower => GivenItemDto::Flower,
             GivenItem::Jewelry => GivenItemDto::Jewelry,
+            GivenItem::Car => GivenItemDto::Car,
+            GivenItem::Motorcycle => GivenItemDto::Motorcycle,
+            GivenItem::Boat => GivenItemDto::Boat,
+            GivenItem::Horse => GivenItemDto::Horse,
         }
     }
 }
@@ -4801,6 +4813,10 @@ mod validate_payload_tests {
             ("flower", GivenItem::Flower),
             ("cuisine", GivenItem::Cuisine),
             ("jewelry", GivenItem::Jewelry),
+            ("car", GivenItem::Car),
+            ("motorcycle", GivenItem::Motorcycle),
+            ("boat", GivenItem::Boat),
+            ("horse", GivenItem::Horse),
         ] {
             let dto: UserActionDto =
                 serde_json::from_value(serde_json::json!({"type": "give", "item": wire}))
