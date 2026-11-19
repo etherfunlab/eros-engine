@@ -46,8 +46,8 @@ use crate::pipeline::handlers::{
 use crate::pipeline::stream::{
     build_delegated_image_marker, build_delegated_image_prompt_for, build_final_frame,
     build_image_request_frame, error_frame_fields_from_last, hop_display, recent_transcript,
-    split_failures, split_failures_typed, ulid_string, FrameActionType, ProtocolFrame,
-    StreamErrorCode, STREAM_OPEN_TIMEOUT, STREAM_TOTAL_TIMEOUT,
+    split_failures, split_failures_typed, state_for_picture, ulid_string, FrameActionType,
+    ProtocolFrame, StreamErrorCode, STREAM_OPEN_TIMEOUT, STREAM_TOTAL_TIMEOUT,
 };
 use crate::pipeline::{compute_signals_for_session, record_generation, GenerationRecord};
 use crate::prompt::NowContext;
@@ -636,7 +636,9 @@ async fn store(
     // message-image-design.md §4): the recent scene ends with her message, and
     // no user message asked for it. Fail-open, as on a chat turn.
     if let Occasion::Event {
-        image: Some(image), ..
+        kind,
+        image: Some(image),
+        ..
     } = &g.occasion
     {
         let effects = load_effects(&state.pool, g.session_id, None)
@@ -653,6 +655,10 @@ async fn store(
         } else {
             format!("{transcript}\n{her_line}")
         };
+        // The events at the instant the reply prompt read them; the event
+        // itself is not stored yet, so the kind it starts counts as live.
+        let current_state =
+            state_for_picture(&state.pool, g.instance_id, None, g.now.now, Some(*kind)).await;
         let img = build_delegated_image_prompt_for(
             state,
             &g.persona,
@@ -663,6 +669,7 @@ async fn store(
             g.user_id,
             g.session_id,
             body_state.as_deref(),
+            current_state.as_deref(),
             None,
             "event",
         )
