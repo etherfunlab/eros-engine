@@ -655,9 +655,10 @@ async fn store(
         } else {
             format!("{transcript}\n{her_line}")
         };
-        // The event is not stored yet: the kind it starts counts as live.
+        // The events at the instant the reply prompt read them; the event
+        // itself is not stored yet, so the kind it starts counts as live.
         let current_state =
-            state_for_picture(&state.pool, g.instance_id, None, Utc::now(), Some(*kind)).await;
+            state_for_picture(&state.pool, g.instance_id, None, g.now.now, Some(*kind)).await;
         let img = build_delegated_image_prompt_for(
             state,
             &g.persona,

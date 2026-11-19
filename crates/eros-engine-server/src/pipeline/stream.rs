@@ -22746,6 +22746,29 @@ data: [DONE]\n\n"
             picture_state_of(&nothing, Some(ShortTrip)).as_deref(),
             Some("短途旅游")
         );
+        // The slot it does not take stays as it is.
+        let incident_only = eros_engine_store::events::CurrentEvents {
+            foreground: Some(live_event(OnATrain)),
+            background: None,
+            at: chrono::DateTime::UNIX_EPOCH,
+        };
+        assert_eq!(
+            picture_state_of(&incident_only, Some(LongTrip)).as_deref(),
+            Some("长途旅游；在坐火车")
+        );
+        assert_eq!(
+            picture_state_of(&under_way, Some(LongTrip)).as_deref(),
+            Some("长途旅游；在坐火车")
+        );
+        let background_only = eros_engine_store::events::CurrentEvents {
+            foreground: None,
+            background: Some(live_event(ShortTrip)),
+            at: chrono::DateTime::UNIX_EPOCH,
+        };
+        assert_eq!(
+            picture_state_of(&background_only, Some(TakingSelfie)).as_deref(),
+            Some("短途旅游；刚拍了张自拍")
+        );
     }
 
     #[test]
