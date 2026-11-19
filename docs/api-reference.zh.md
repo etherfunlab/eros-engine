@@ -1360,8 +1360,9 @@ session 返回 404 的行为，与上面的 history 路由完全一致。
 }
 ```
 
-只写不判：engine 落一个时间戳就到此为止。它不算未读数、不推送、也不定义已读该
-长什么样 —— 客户端从 history 记录里读 `read_at`，自己决定怎么渲染。
+只写不判：engine 落一个时间戳就到此为止。它不推送，也不定义已读该长什么样。群 DTO
+带 [`unread_count`](group-chat.zh.md#管理)，即这次调用会盖章、且客户端会显示的行数；1:1 会话则由客户端从
+history 记录里读 `read_at`，自己决定怎么渲染。
 
 `marked` 只算**这一次调用**打上的行数，所以重复调用返回 `200` 加 `0`，已有的时
 间戳不会被往后推。每次挂载都调一次也不会造出假事件。
@@ -1397,8 +1398,10 @@ session 返回 404 的行为，与上面的 history 路由完全一致。
 | `POST` | `/v2/comp/group/{group_id}/message/stream` | SSE 轮次，见 [group-chat.zh.md](group-chat.zh.md#发送) |
 
 群 DTO：`group_id`、`title`（可空）、`members[]`（`member_session_id`、
-`instance_id`、`joined_at`）、`created_at`、`last_active_at`，以及 `last_message`
-（群里还没有可见消息时为 `null`：`message_id`、`role`、`speaker_session_id`、截到 120 字的 `preview`、`is_image`、`sent_at`）。
+`instance_id`、`joined_at`）、`created_at`、`last_active_at`、`last_message`
+（群里还没有可见消息时为 `null`：`message_id`、`role`、`speaker_session_id`、截到 120 字的 `preview`、`is_image`、`sent_at`），
+以及 `unread_count`（可见且没有 `read_at` 的 assistant 行，即 [`POST /comp/chat/{session_id}/read`](#post-compchatsession_idread)
+会盖章、且 `last_message` 算作可见的那些；没有时为 `0`）。
 
 标题会先去掉首尾空白，长度须为 1 到 64 个字符且不含控制字符，否则 `422 invalid_title`。
 
