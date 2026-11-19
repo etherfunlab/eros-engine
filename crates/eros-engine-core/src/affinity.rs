@@ -34,7 +34,7 @@ pub struct Affinity {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AffinityDeltas {
     pub warmth: f64,
     pub trust: f64,

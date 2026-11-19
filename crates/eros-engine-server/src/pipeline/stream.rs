@@ -62,6 +62,8 @@ pub enum FrameActionType {
 }
 
 /// One wire frame in the SSE protocol.
+// Built once per frame and serialised at once: not worth a box.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProtocolFrame {

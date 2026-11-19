@@ -11,13 +11,13 @@ use chrono::{DateTime, Duration, NaiveDate, Utc};
 use chrono_tz::Tz;
 use uuid::Uuid;
 
-use eros_engine_core::affinity::{Affinity, AffinityDeltas, AxisGrades, EndpointLevelReads};
+use eros_engine_core::affinity::{Affinity, AxisGrades, EndpointLevelReads};
 use eros_engine_core::types::UserAction;
 use eros_engine_llm::failure::{AttemptFailure, GatewayError, GatewayKind};
 use eros_engine_llm::model_config::ACTIVITY_JUDGE_TASK;
 use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
 use eros_engine_store::activity::{ActivityRecord, ActivityRepo, ActivityStatus, SettleClaim};
-use eros_engine_store::affinity::{ActivityVerdict, AffinityRepo};
+use eros_engine_store::affinity::{ActivityVerdict, AffinityRepo, EventDeltas};
 use eros_engine_store::chat::{self, ChatRepo, ChatSession};
 use eros_engine_store::episode::{one_line, EpisodeInsert, EpisodeRepo, EPISODE_MAX_CHARS};
 use eros_engine_store::journal::{self, JOURNAL_SUMMARY_MAX_CHARS};
@@ -140,7 +140,8 @@ pub(crate) async fn turn_session(
 }
 
 /// `invitation message_id → receipt` for the rows of one history page, one
-/// lookup: the date each accepted invitation opened (spec §10).
+/// lookup: the date each accepted invitation opened (spec §10), with what its
+/// settlement event committed once it is settled.
 pub(crate) async fn receipts_for(
     pool: &sqlx::PgPool,
     message_ids: &[Uuid],
@@ -150,7 +151,10 @@ pub(crate) async fn receipts_for(
         .by_message_ids(message_ids)
         .await?
         .iter()
-        .filter_map(|a| Some((a.message_id?, ActivityView::from_record(a, now))))
+        .filter_map(|(a, deltas)| {
+            let view = ActivityView::from_record(a, now).with_deltas(deltas.as_ref());
+            Some((a.message_id?, view))
+        })
         .collect())
 }
 
@@ -252,13 +256,13 @@ fn choice_pending() -> AppError {
 }
 
 /// A settled date: the activity as stored, the parent's affinity after it
-/// (`None` when the parent has no row) and the deltas its event committed
-/// (`None` when it wrote none).
+/// (`None` when the parent has no row) and what its event committed (`None`
+/// when it wrote none).
 #[derive(Debug)]
 pub(crate) struct Settlement {
     pub activity: ActivityRecord,
     pub affinity: Option<Affinity>,
-    pub effective_deltas: Option<AffinityDeltas>,
+    pub deltas: Option<EventDeltas>,
 }
 
 /// Settle the date `activity_id` once, at `now` (spec §6.1–6.2, §7).
@@ -459,11 +463,11 @@ async fn settle_claimed(
     tx.commit().await?;
 
     activity.settled_at = Some(now);
-    let (affinity, effective_deltas) = moved.unzip();
+    let (affinity, deltas) = moved.unzip();
     Ok(Settlement {
         activity,
         affinity,
-        effective_deltas,
+        deltas,
     })
 }
 
@@ -479,15 +483,15 @@ fn settling() -> AppError {
 }
 
 /// A settled date's stored result: the activity as stored, the affinity as it
-/// stands, and the deltas its event wrote.
+/// stands, and what its event committed.
 async fn stored_result(state: &AppState, activity: ActivityRecord) -> Result<Settlement, AppError> {
-    let effective_deltas = AffinityRepo { pool: &state.pool }
+    let deltas = AffinityRepo { pool: &state.pool }
         .activity_event_deltas(activity.session_id, activity.id)
         .await?;
     Ok(Settlement {
         affinity: current_affinity(state, activity.session_id).await?,
         activity,
-        effective_deltas,
+        deltas,
     })
 }
 
@@ -504,7 +508,7 @@ async fn settle_quietly(
     Ok(Settlement {
         affinity: current_affinity(state, activity.session_id).await?,
         activity,
-        effective_deltas: None,
+        deltas: None,
     })
 }
 
@@ -1151,7 +1155,8 @@ pub(crate) mod tests {
         assert_eq!(out.activity.id, s.activity.id);
         assert_eq!(out.activity.settled_at, Some(t(NOW)));
         assert_eq!(s.settled_at().await, Some(t(NOW)));
-        let deltas = out.effective_deltas.expect("the date's deltas");
+        let event = out.deltas.expect("the date's deltas");
+        let deltas = &event.effective;
         assert!(deltas.trust > 0.0 && deltas.intimacy > 0.0, "{deltas:?}");
         let after = out.affinity.expect("the parent's affinity");
         let stored = AffinityRepo { pool: &s.pool }
@@ -1163,12 +1168,15 @@ pub(crate) mod tests {
 
         // One `activity` event, worth a quarter of each of the three turns.
         assert_eq!(s.activity_events().await, 1);
-        let (context, generation_id, user_message_id): (
+        let (context, generation_id, user_message_id, lines, labels): (
             serde_json::Value,
             Option<String>,
             Option<Uuid>,
+            serde_json::Value,
+            Option<serde_json::Value>,
         ) = sqlx::query_as(
-            "SELECT e.context, e.generation_id, e.user_message_id \
+            "SELECT e.context, e.generation_id, e.user_message_id, \
+                    e.effective_line_deltas, e.label_changes \
                FROM engine.companion_affinity_events e \
                JOIN engine.companion_affinity a ON a.id = e.affinity_id \
               WHERE a.session_id = $1 AND e.event_type = 'activity'",
@@ -1177,6 +1185,13 @@ pub(crate) mod tests {
         .fetch_one(&s.pool)
         .await
         .unwrap();
+        // The line deltas and tier changes returned are the event's.
+        assert!((lines["bond"].as_f64().unwrap() - event.lines.bond).abs() < 1e-12);
+        assert!((lines["chemistry"].as_f64().unwrap() - event.lines.chemistry).abs() < 1e-12);
+        assert_eq!(
+            labels.map(|v| serde_json::from_value(v).unwrap()),
+            event.label_changes
+        );
         assert_eq!(context["activity_id"], s.activity.id.to_string());
         assert_eq!(context["turns"], 3);
         assert_eq!(context["weight"], 0.75);
@@ -1342,7 +1357,7 @@ pub(crate) mod tests {
         let out = settle(&s.state, s.activity.id, t(NOW)).await.unwrap();
         assert_eq!(out.activity.settled_at, Some(t(NOW)));
         assert!(out.affinity.is_some(), "the parent's row, as it stands");
-        assert!(out.effective_deltas.is_none());
+        assert!(out.deltas.is_none());
         assert_eq!(s.settled_at().await, Some(t(NOW)));
         assert_eq!(s.activity_events().await, 0);
         assert_eq!(s.episodes().await, 0);
@@ -1360,7 +1375,13 @@ pub(crate) mod tests {
 
         let out = settle(&s.state, s.activity.id, t(NOW)).await.unwrap();
         assert_eq!(s.settled_at().await, Some(t(NOW)));
-        assert_no_movement(&out.effective_deltas.expect("the event's deltas"));
+        let d = out.deltas.expect("the event's deltas");
+        assert_no_movement(&d.effective);
+        assert!(
+            d.lines.bond.abs() < 1e-9 && d.lines.chemistry.abs() < 1e-9,
+            "{d:?}"
+        );
+        assert!(d.label_changes.is_none(), "{d:?}");
 
         assert_eq!(s.activity_events().await, 1);
         let (effective, llm_attempts, generation_id): (
@@ -1418,14 +1439,20 @@ pub(crate) mod tests {
             ),
             "{held:?}"
         );
-        let won_deltas = won.effective_deltas.expect("the winner's deltas");
+        let won_deltas = won
+            .deltas
+            .map(|d| d.effective)
+            .expect("the winner's deltas");
 
         let again = settle(&s.state, s.activity.id, t(NOW) + Duration::minutes(5))
             .await
             .unwrap();
         assert_eq!(again.activity.settled_at, Some(t(NOW)));
         assert!(again.affinity.is_some());
-        let stored = again.effective_deltas.expect("the stored deltas");
+        let stored = again
+            .deltas
+            .map(|d| d.effective)
+            .expect("the stored deltas");
         assert!(
             same_deltas(&stored, &won_deltas),
             "{stored:?} vs {won_deltas:?}"
@@ -1462,8 +1489,14 @@ pub(crate) mod tests {
             "a takeover"
         );
 
-        let a = first.effective_deltas.expect("the first caller's deltas");
-        let b = second.effective_deltas.expect("the second caller's deltas");
+        let a = first
+            .deltas
+            .map(|d| d.effective)
+            .expect("the first caller's deltas");
+        let b = second
+            .deltas
+            .map(|d| d.effective)
+            .expect("the second caller's deltas");
         assert!(same_deltas(&a, &b), "{a:?} vs {b:?}");
         assert!(first.activity.settled_at.is_some());
         assert_eq!(first.activity.settled_at, second.activity.settled_at);
@@ -1567,7 +1600,7 @@ pub(crate) mod tests {
             .unwrap();
 
         let out = settle(&s.state, s.activity.id, t(NOW)).await.unwrap();
-        assert!(out.affinity.is_none() && out.effective_deltas.is_none());
+        assert!(out.affinity.is_none() && out.deltas.is_none());
         assert_eq!(s.settled_at().await, Some(t(NOW)));
         assert_eq!(
             s.count("SELECT count(*) FROM engine.companion_affinity WHERE instance_id = $1")
@@ -1599,7 +1632,7 @@ pub(crate) mod tests {
         });
 
         let out = out.unwrap();
-        assert!(out.affinity.is_none() && out.effective_deltas.is_none());
+        assert!(out.affinity.is_none() && out.deltas.is_none());
         assert_eq!(s.settled_at().await, Some(t(NOW)));
         assert_eq!(s.activity_events().await, 0);
         assert_eq!(s.episodes().await, 0);

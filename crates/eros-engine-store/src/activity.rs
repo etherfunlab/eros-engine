@@ -11,6 +11,7 @@ use eros_engine_core::types::DateDuration;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::affinity::EventDeltas;
 use crate::chat::ChatMessage;
 use crate::events::{lock_instance, EventRepo, NewEvent};
 use crate::session_archive::lock_live_session;
@@ -47,6 +48,17 @@ pub struct ActivityRecord {
     pub settle_claimed_at: Option<DateTime<Utc>>,
     pub settled_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+}
+
+/// A date and its settlement event's columns, as [`ActivityRepo::by_message_ids`]
+/// reads them.
+#[derive(sqlx::FromRow)]
+struct ReceiptRow {
+    #[sqlx(flatten)]
+    activity: ActivityRecord,
+    effective_deltas: Option<serde_json::Value>,
+    effective_line_deltas: Option<serde_json::Value>,
+    label_changes: Option<serde_json::Value>,
 }
 
 /// Where a date stands; derived, never stored.
@@ -292,14 +304,42 @@ impl ActivityRepo<'_> {
         .await
     }
 
-    /// The dates whose invitation is one of `ids`, oldest first.
-    pub async fn by_message_ids(&self, ids: &[Uuid]) -> Result<Vec<ActivityRecord>, sqlx::Error> {
-        sqlx::query_as(&select(
-            "WHERE a.message_id = ANY($1) ORDER BY a.created_at, a.id",
+    /// The dates whose invitation is one of `ids`, oldest first, each with
+    /// what its settlement event committed (`None` before settlement or when
+    /// it wrote none). The event is the parent's `activity` event naming the
+    /// date, found through the parent's affinity row and looked for only once
+    /// the date is stamped settled.
+    pub async fn by_message_ids(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<Vec<(ActivityRecord, Option<EventDeltas>)>, sqlx::Error> {
+        let rows: Vec<ReceiptRow> = sqlx::query_as(&format!(
+            "SELECT {COLUMNS}, ev.effective_deltas, ev.effective_line_deltas, ev.label_changes \
+               FROM {FROM} \
+               LEFT JOIN LATERAL ( \
+                    SELECT x.effective_deltas, x.effective_line_deltas, x.label_changes \
+                      FROM engine.companion_affinity c \
+                      JOIN engine.companion_affinity_events x ON x.affinity_id = c.id \
+                     WHERE a.settled_at IS NOT NULL \
+                       AND c.session_id = a.session_id AND x.event_type = 'activity' \
+                       AND x.context->>'activity_id' = a.id::text \
+                     LIMIT 1) ev ON true \
+              WHERE a.message_id = ANY($1) ORDER BY a.created_at, a.id"
         ))
         .bind(ids)
         .fetch_all(self.pool)
-        .await
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let deltas = EventDeltas::from_columns(
+                    r.effective_deltas,
+                    r.effective_line_deltas,
+                    r.label_changes,
+                );
+                (r.activity, deltas)
+            })
+            .collect())
     }
 
     /// The date the persona is back from in `session_id` (the parent) at `at`:
@@ -942,9 +982,84 @@ mod tests {
             repo.by_message_ids(&[Uuid::new_v4(), s.invite])
                 .await
                 .unwrap(),
-            vec![a.clone()]
+            vec![(a.clone(), None)]
         );
         assert!(repo.by_message_ids(&[]).await.unwrap().is_empty());
+    }
+
+    /// A settled date's receipt carries what its own settlement event
+    /// committed, not another date's event on the same relationship.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn by_message_ids_carries_each_dates_settlement_event(pool: PgPool) {
+        use crate::affinity::{ActivityVerdict, AffinityRepo};
+        use eros_engine_core::affinity::{AffinityTuning, AxisGrades, EndpointLevelReads};
+
+        let s = scene(&pool).await;
+        let a = open(&pool, &s, DateDuration::Mid).await;
+        AffinityRepo { pool: &pool }
+            .load_or_create(s.session, s.owner, s.instance)
+            .await
+            .unwrap();
+        let verdict = |activity_id: Uuid, trust: i8, weight: f64| ActivityVerdict {
+            activity_id,
+            grades: AxisGrades {
+                trust,
+                ..Default::default()
+            },
+            levels: EndpointLevelReads::default(),
+            weight,
+            turns: 2,
+            reason: "",
+            boost: 1.0,
+            growth_scale: 1.0,
+            generation_id: None,
+            llm_attempts: None,
+            gateway_errors: None,
+            journal_tz: None,
+        };
+        let tuning = AffinityTuning::default();
+        let mut tx = pool.begin().await.unwrap();
+        let (_, other) = AffinityRepo::persist_activity_in_tx(
+            &mut tx,
+            s.session,
+            &verdict(Uuid::new_v4(), 2, 4.0),
+            &tuning,
+        )
+        .await
+        .unwrap()
+        .expect("another date's event");
+        let (_, mine) = AffinityRepo::persist_activity_in_tx(
+            &mut tx,
+            s.session,
+            &verdict(a.id, 1, 1.0),
+            &tuning,
+        )
+        .await
+        .unwrap()
+        .expect("this date's event");
+        tx.commit().await.unwrap();
+        assert_ne!(other.lines, mine.lines, "the two dates tell apart");
+
+        // The date is not stamped settled: its receipt carries nothing yet.
+        let repo = ActivityRepo { pool: &pool };
+        assert_eq!(
+            repo.by_message_ids(&[s.invite]).await.unwrap(),
+            vec![(a.clone(), None)]
+        );
+
+        let mut tx = pool.begin().await.unwrap();
+        ActivityRepo::mark_settled_in_tx(&mut tx, a.id, t(NOW))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let a = repo.get(a.id).await.unwrap().expect("the date");
+        let got = repo.by_message_ids(&[s.invite]).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, a);
+        let d = got[0].1.as_ref().expect("the date's own event");
+        assert!((d.lines.bond - mine.lines.bond).abs() < 1e-12);
+        assert!((d.lines.chemistry - mine.lines.chemistry).abs() < 1e-12);
+        assert_eq!(d.label_changes, mine.label_changes);
     }
 
     #[sqlx::test(migrations = "./migrations")]
