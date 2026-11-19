@@ -664,6 +664,7 @@ async fn store(
             g.session_id,
             body_state.as_deref(),
             None,
+            None,
             "event",
         )
         .await;

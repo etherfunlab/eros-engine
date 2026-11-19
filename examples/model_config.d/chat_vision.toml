@@ -40,7 +40,11 @@
 # + current outfit + body state + recent scene + the partner's latest message + chosen aspect ratio + style to
 # this model and uses the result as the image subject. On a group image turn
 # with a companion, one more labeled section ([同框人物]) names the second
-# person in the picture; a custom prompt should depict both when it is present. Omit the block entirely
+# person in the picture; a custom prompt should depict both when it is present.
+# While an event is live, one more labeled section ([此刻状态]) says what she is
+# doing (the background, then the incident, joined by "；"); a custom prompt
+# should show it, and let it win over [此刻穿着] where the two disagree. The
+# section is absent when nothing is live. Omit the block entirely
 # and image turns stay unavailable. Fail-open: on failure / timeout / empty
 # reply it falls back to an empty subject (a plain persona-appearance
 # portrait), so it never blocks the image turn (and never advances any

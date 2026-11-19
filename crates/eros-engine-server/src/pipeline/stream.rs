@@ -3709,12 +3709,15 @@ pub(crate) fn compose_user_payload(
         aspect_ratio,
         body_state,
         None,
+        None,
     )
 }
 
 /// [`compose_user_payload`] with the `[同框人物]` section after `[此刻穿着]`
 /// when a second person is in the picture (spec 2026-10-26-group-two-person-
-/// image-design.md §3); byte-identical without.
+/// image-design.md §3), and the `[此刻状态]` section after `[身体状态]` when
+/// `current_state` names what she is doing (spec 2026-11-20-together-actions-
+/// state-in-picture-and-genome-routes-design.md §7); byte-identical without.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compose_user_payload_with(
     appearance: &str,
@@ -3724,8 +3727,14 @@ pub(crate) fn compose_user_payload_with(
     style: &str,
     aspect_ratio: &str,
     body_state: &str,
+    current_state: Option<&str>,
     companion: Option<&ImageCompanionContext>,
 ) -> String {
+    let state = current_state
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("[此刻状态]\n{s}\n\n"))
+        .unwrap_or_default();
     let companion = companion
         .map(|c| {
             let blank = |s: Option<&str>| {
@@ -3745,7 +3754,7 @@ pub(crate) fn compose_user_payload_with(
         })
         .unwrap_or_default();
     format!(
-        "[人物外观]\n{appearance}\n\n[此刻穿着]\n{clothing}\n\n{companion}[身体状态]\n{body_state}\n\n[最近场景]\n{recent_scene}\n\n[对方最新消息]\n{latest_user_msg}\n\n[风格]\n{style}\n\n[画幅]\n{aspect_ratio}"
+        "[人物外观]\n{appearance}\n\n[此刻穿着]\n{clothing}\n\n{companion}[身体状态]\n{body_state}\n\n{state}[最近场景]\n{recent_scene}\n\n[对方最新消息]\n{latest_user_msg}\n\n[风格]\n{style}\n\n[画幅]\n{aspect_ratio}"
     )
 }
 
@@ -3771,10 +3780,12 @@ pub(crate) fn compose_inputs_json(
         aspect_ratio,
         body_state,
         None,
+        None,
     )
 }
 
-/// [`compose_inputs_json`] with the second person the composer was shown.
+/// [`compose_inputs_json`] with the state she was shown in (`current_state`,
+/// the empty string when none) and the second person the composer was shown.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compose_inputs_json_with(
     persona: &eros_engine_core::persona::CompanionPersona,
@@ -3784,6 +3795,7 @@ pub(crate) fn compose_inputs_json_with(
     style: &str,
     aspect_ratio: Option<&str>,
     body_state: Option<&str>,
+    current_state: Option<&str>,
     companion: Option<&ImageCompanionContext>,
 ) -> serde_json::Value {
     let mut v = serde_json::json!({
@@ -3792,6 +3804,7 @@ pub(crate) fn compose_inputs_json_with(
             .unwrap_or(""),
         "clothing": clothing.map(str::trim).unwrap_or(""),
         "body_state": body_state.map(str::trim).unwrap_or(""),
+        "current_state": current_state.map(str::trim).unwrap_or(""),
         "recent_scene": recent_scene.trim(),
         "latest_user_msg": latest_user_msg.trim(),
         "style": style,
@@ -3926,10 +3939,12 @@ pub(crate) fn render_compose_payload(
         style,
         body_state,
         None,
+        None,
     )
 }
 
-/// [`render_compose_payload`] with the second person of a group picture.
+/// [`render_compose_payload`] with what she is doing and the second person of
+/// a group picture.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_compose_payload_with(
     persona: &eros_engine_core::persona::CompanionPersona,
@@ -3939,6 +3954,7 @@ pub(crate) fn render_compose_payload_with(
     aspect_ratio: Option<&str>,
     style: &str,
     body_state: Option<&str>,
+    current_state: Option<&str>,
     companion: Option<&ImageCompanionContext>,
 ) -> String {
     let appearance = crate::prompt::meta_str(persona, "appearance")
@@ -3965,7 +3981,15 @@ pub(crate) fn render_compose_payload_with(
     };
     let ar = aspect_ratio.unwrap_or("（未指定）");
     compose_user_payload_with(
-        appearance, clothing, scene, latest, style, ar, body_state, companion,
+        appearance,
+        clothing,
+        scene,
+        latest,
+        style,
+        ar,
+        body_state,
+        current_state,
+        companion,
     )
 }
 
@@ -4267,6 +4291,7 @@ pub(crate) async fn build_delegated_image_prompt_with(
         user_id,
         session_id,
         body_state,
+        None,
         companion,
         compose_source(plan.action_type),
     )
@@ -4289,9 +4314,10 @@ pub(crate) fn compose_source(a: ActionType) -> &'static str {
     }
 }
 
-/// [`build_delegated_image_prompt_with`] with the audit `source` named by the
-/// caller: `event` for a life event's picture (spec 2026-10-26-event-message-
-/// image-design.md §6).
+/// [`build_delegated_image_prompt_with`] with what she is doing
+/// (`current_state`, the `[此刻状态]` section) and the audit `source` named by
+/// the caller: `event` for a life event's picture (spec 2026-10-26-event-
+/// message-image-design.md §6).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_delegated_image_prompt_for(
     state: &AppState,
@@ -4303,6 +4329,7 @@ pub(crate) async fn build_delegated_image_prompt_for(
     user_id: Uuid,
     session_id: Uuid,
     body_state: Option<&str>,
+    current_state: Option<&str>,
     companion: Option<&ImageCompanionContext>,
     source: &'static str,
 ) -> DelegatedImagePrompt {
@@ -4328,6 +4355,7 @@ pub(crate) async fn build_delegated_image_prompt_for(
                     inputs.aspect_ratio.as_deref(),
                     &style_str,
                     body_state,
+                    current_state,
                     companion,
                 ),
                 "chat_image_prompt_compose",
@@ -4426,6 +4454,7 @@ pub(crate) async fn build_delegated_image_prompt_for(
                 &style_str,
                 inputs.aspect_ratio.as_deref(),
                 body_state,
+                current_state,
                 companion,
             ),
             subject: (!final_subject.is_empty()).then_some(final_subject.as_str()),
@@ -22407,6 +22436,7 @@ data: [DONE]\n\n"
                 "realistic",
                 "3:4",
                 "（无）",
+                None,
                 None
             ),
             base
@@ -22425,12 +22455,125 @@ data: [DONE]\n\n"
             "realistic",
             "3:4",
             "（无）",
+            None,
             Some(&ctx),
         );
         assert_eq!(
             with,
             "[人物外观]\nfreckled\n\n[此刻穿着]\n（无）\n\n[同框人物]\n阿哲：短发，高个；（无）\n这张图里有两个人：小美 和 阿哲。\n\n[身体状态]\n（无）\n\n[最近场景]\n（无）\n\n[对方最新消息]\n（无）\n\n[风格]\nrealistic\n\n[画幅]\n3:4"
         );
+    }
+
+    #[test]
+    fn compose_user_payload_without_a_state_is_unchanged() {
+        let base = compose_user_payload(
+            "freckled",
+            "（无）",
+            "（无）",
+            "（无）",
+            "realistic",
+            "3:4",
+            "（无）",
+        );
+        assert_eq!(
+            compose_user_payload_with(
+                "freckled",
+                "（无）",
+                "（无）",
+                "（无）",
+                "realistic",
+                "3:4",
+                "（无）",
+                None,
+                None
+            ),
+            base
+        );
+        assert_eq!(
+            base,
+            "[人物外观]\nfreckled\n\n[此刻穿着]\n（无）\n\n[身体状态]\n（无）\n\n[最近场景]\n（无）\n\n[对方最新消息]\n（无）\n\n[风格]\nrealistic\n\n[画幅]\n3:4"
+        );
+        // A blank state is no state.
+        assert_eq!(
+            compose_user_payload_with(
+                "freckled",
+                "（无）",
+                "（无）",
+                "（无）",
+                "realistic",
+                "3:4",
+                "（无）",
+                Some("  "),
+                None
+            ),
+            base
+        );
+    }
+
+    #[test]
+    fn compose_user_payload_with_a_state_adds_one_section() {
+        let with = compose_user_payload_with(
+            "freckled",
+            "（无）",
+            "（无）",
+            "（无）",
+            "realistic",
+            "3:4",
+            "（无）",
+            Some("洗澡中"),
+            None,
+        );
+        assert!(
+            with.contains("[身体状态]\n（无）\n\n[此刻状态]\n洗澡中\n\n[最近场景]"),
+            "{with}"
+        );
+        assert_eq!(with.matches("[此刻状态]").count(), 1, "{with}");
+    }
+
+    #[test]
+    fn render_compose_payload_with_carries_the_state() {
+        let persona = test_persona_with_appearance("freckled");
+        let out = render_compose_payload_with(
+            &persona,
+            None,
+            "在天台",
+            "拍张照",
+            None,
+            "anime",
+            None,
+            Some("短途旅游；在坐火车"),
+            None,
+        );
+        assert!(
+            out.contains(
+                "[身体状态]\n（无）\n\n[此刻状态]\n短途旅游；在坐火车\n\n[最近场景]\n在天台"
+            ),
+            "{out}"
+        );
+        let bare = render_compose_payload(&persona, None, "在天台", "拍张照", None, "anime", None);
+        assert!(!bare.contains("[此刻状态]"), "{bare}");
+    }
+
+    #[test]
+    fn compose_inputs_record_the_current_state() {
+        let persona = test_persona_with_appearance("freckled");
+        let with = compose_inputs_json_with(
+            &persona,
+            None,
+            "s",
+            "m",
+            "anime",
+            None,
+            None,
+            Some("洗澡中"),
+            None,
+        );
+        assert_eq!(with["current_state"], "洗澡中");
+        let without =
+            compose_inputs_json_with(&persona, None, "s", "m", "anime", None, None, None, None);
+        assert_eq!(without["current_state"], "");
+        let wrapper = compose_inputs_json(&persona, None, "s", "m", "anime", None, None);
+        assert_eq!(wrapper["current_state"], "");
     }
 
     /// Design §5: a text turn stamps its driving user row at the judge

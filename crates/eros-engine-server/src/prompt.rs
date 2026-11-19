@@ -1067,6 +1067,22 @@ pub(crate) fn event_label(kind: eros_engine_core::events::EventKind) -> &'static
     }
 }
 
+/// What she is doing, as the image composer reads it: the labels of what is
+/// live, the background first, then the foreground incident, joined by `；`.
+/// `None` when neither is.
+#[cfg_attr(not(test), expect(dead_code))]
+pub(crate) fn current_state(
+    background: Option<eros_engine_core::events::EventKind>,
+    foreground: Option<eros_engine_core::events::EventKind>,
+) -> Option<String> {
+    let labels: Vec<&str> = [background, foreground]
+        .into_iter()
+        .flatten()
+        .map(event_label)
+        .collect();
+    (!labels.is_empty()).then(|| labels.join("；"))
+}
+
 /// A span as the prompt reads it (spec §8.1): under an hour; whole hours,
 /// rounded, under 48; whole days, rounded, from 48.
 pub(crate) fn span_text(d: chrono::Duration) -> String {
@@ -5221,6 +5237,24 @@ mod tests {
             event_when_text(now - h(5), now - h(5) + m(40), now),
             "5 小时前开始，持续不到 1 小时"
         );
+    }
+
+    #[test]
+    fn current_state_lists_background_then_foreground() {
+        use eros_engine_core::events::EventKind::{OnATrain, ShortTrip};
+        assert_eq!(
+            current_state(Some(ShortTrip), Some(OnATrain)).as_deref(),
+            Some("短途旅游；在坐火车")
+        );
+        assert_eq!(
+            current_state(Some(ShortTrip), None).as_deref(),
+            Some("短途旅游")
+        );
+        assert_eq!(
+            current_state(None, Some(OnATrain)).as_deref(),
+            Some("在坐火车")
+        );
+        assert_eq!(current_state(None, None), None);
     }
 
     #[test]
