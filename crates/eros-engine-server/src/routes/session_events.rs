@@ -130,6 +130,7 @@ pub enum EventKindDto {
     OnATrain,
     OnAPlane,
     Driving,
+    UsingToilet,
 }
 
 /// Reads the drawable kinds only: a request names kinds to draw, and the
@@ -225,6 +226,7 @@ impl From<EventKindDto> for EventKind {
             EventKindDto::OnATrain => EventKind::OnATrain,
             EventKindDto::OnAPlane => EventKind::OnAPlane,
             EventKindDto::Driving => EventKind::Driving,
+            EventKindDto::UsingToilet => EventKind::UsingToilet,
         }
     }
 }
@@ -306,6 +308,7 @@ impl From<EventKind> for EventKindDto {
             EventKind::OnATrain => EventKindDto::OnATrain,
             EventKind::OnAPlane => EventKindDto::OnAPlane,
             EventKind::Driving => EventKindDto::Driving,
+            EventKind::UsingToilet => EventKindDto::UsingToilet,
         }
     }
 }
@@ -2529,6 +2532,31 @@ mod tests {
             assert_eq!(
                 serde_json::to_value(EventKindDto::from(kind)).unwrap(),
                 json!(name)
+            );
+        }
+    }
+
+    /// Spec 2026-11-20-together-actions-state-in-picture-and-genome-routes-
+    /// design.md §4.
+    #[test]
+    fn using_toilet_crosses_the_wire() {
+        let dto: EventKindDto = serde_json::from_value(json!("using_toilet")).unwrap();
+        assert_eq!(EventKind::from(dto), EventKind::UsingToilet);
+        assert_eq!(
+            serde_json::to_value(EventKindDto::from(EventKind::UsingToilet)).unwrap(),
+            json!("using_toilet")
+        );
+        for kinds in [
+            json!(["using_toilet"]),
+            json!({"allow": ["using_toilet"]}),
+            json!({"disallow": ["using_toilet"]}),
+        ] {
+            assert!(
+                serde_json::from_value::<DrawEventRequest>(
+                    json!({"event_key": "k", "kinds": kinds})
+                )
+                .is_ok(),
+                "{kinds}"
             );
         }
     }

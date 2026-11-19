@@ -5653,7 +5653,8 @@
           "on_a_bus",
           "on_a_train",
           "on_a_plane",
-          "driving"
+          "driving",
+          "using_toilet"
         ]
       },
       "EventView": {

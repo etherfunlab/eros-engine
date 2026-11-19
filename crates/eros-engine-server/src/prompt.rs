@@ -1064,6 +1064,7 @@ pub(crate) fn event_label(kind: eros_engine_core::events::EventKind) -> &'static
         OnATrain => "在坐火车",
         OnAPlane => "在飞机上",
         Driving => "在开车",
+        UsingToilet => "上厕所中",
     }
 }
 
@@ -5332,6 +5333,7 @@ mod tests {
                 "在坐火车",
                 "在飞机上",
                 "在开车",
+                "上厕所中",
             ]
         );
     }

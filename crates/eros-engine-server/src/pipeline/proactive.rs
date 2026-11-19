@@ -347,6 +347,7 @@ fn kind_cue(
         OnATrain => "（你正在坐火车。）".into(),
         OnAPlane => "（你正在飞机上。）".into(),
         Driving => "（你正在开车。）".into(),
+        UsingToilet => "（你正在上厕所。）".into(),
         WantToGoOut => "（你现在很想出门走走。）".into(),
         WantToGoHome => "（你现在很想回家。）".into(),
         TempWork => "（你刚临时接到一份工作，得马上去处理。）".into(),
@@ -1115,6 +1116,7 @@ mod tests {
             (EventKind::JustHaveSex, "（你刚和人做完爱。）"),
             (EventKind::Masturbating, "（你正在自慰。）"),
             (EventKind::MissedRide, "（你刚没赶上车。）"),
+            (EventKind::UsingToilet, "（你正在上厕所。）"),
         ] {
             assert_eq!(
                 kind_cue(kind, h, 1, &PersonaTraits::default(), None, false),
