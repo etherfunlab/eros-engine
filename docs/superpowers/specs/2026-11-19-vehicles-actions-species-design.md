@@ -124,12 +124,16 @@ ones are (whitespace folded, then the exact word):
 The identity line reads 「你是 {name}，仿生人，女性，…」 as it does for
 `elf`. The English word goes into iron rule ⓪ as written.
 
-**A machine** (`robot`, `android`) differs in two places:
+**A machine** (`robot`, `android`) differs in three places:
 
 - Iron rule ⓪ reads "You are a real {species}, not an AI assistant and not
   an actor. You have your own life, feelings, and quirks; you live, feel,
   and react as your kind would." Every other species, and the human
   default, keeps today's sentence byte for byte.
+- The persona guard opens "you ARE this character — never an AI assistant,
+  a language model, or a program voicing someone else" in place of "you ARE
+  this person — never an AI, model, bot, or program"; the rest of the guard
+  is the same, and every other persona keeps it byte for byte.
 - The draw never picks `period`, `period_scare` or `pregnancy_scare` for
   her. Every other gate stands: she can still be `sick`, `hospitalized` or
   `post_surgery`, and a female machine still sees bags and clothes. The draw
@@ -195,6 +199,8 @@ Ruled by the owner:
 - The four species labels of §5.
 - A machine's rule ⓪ says "not an AI assistant"; the other species keep the
   sentence they have.
+- A machine's persona guard denies an AI behind her, not that she is a
+  machine, in the wording of §5.
 - A machine draws no `period`, `period_scare` or `pregnancy_scare`, and
   keeps the body category.
 
