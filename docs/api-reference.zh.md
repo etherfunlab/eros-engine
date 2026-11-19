@@ -1218,14 +1218,23 @@ engine 不接收也不保存用户的性别或性取向。
 已经结算过的约会（不论是由这个路由、一次发送还是 `/open` 结算的）返回它存下的结果，所以重复调用不改变任何东西，客户端可以在自己的计时器到点时随时调用。
 
 ```json
-{"activity": {"id": "…", "sub_session_id": "…", "duration": "short", "place": "海边的餐厅", "content": "吃一顿大餐", "status": "settled", "started_at": "2026-11-12T12:00:00Z", "ends_at": "2026-11-12T12:40:00Z"},
+{"activity": {"id": "…", "sub_session_id": "…", "duration": "short", "place": "海边的餐厅", "content": "吃一顿大餐", "status": "settled", "started_at": "2026-11-12T12:00:00Z", "ends_at": "2026-11-12T12:40:00Z",
+              "effective_deltas_computed": {"bond": 0.03, "chemistry": 0.02},
+              "label_changes": {"bond": {"from": "friend", "to": "close_friend"}}},
  "affinity": {"bond_tier": 3, "chem_tier": 2, "bond_label": "close_friend", "chemistry_label": "flirtation", "…": "…"},
- "effective_deltas": {"warmth": 0.02, "trust": 0.05, "intrigue": 0.01, "intimacy": 0.03, "patience": 0.0, "tension": 0.01}}
+ "effective_deltas": {"warmth": 0.02, "trust": 0.05, "intrigue": 0.01, "intimacy": 0.03, "patience": 0.0, "tension": 0.01},
+ "effective_deltas_computed": {"bond": 0.03, "chemistry": 0.02},
+ "label_changes": {"bond": {"from": "friend", "to": "close_friend"}}}
 ```
 
 `activity` 是这场约会，`status: "settled"`，`ends_at` 是它结束的时刻。`affinity` 是约会之后的这段关系，形状同
 [`GET /bff/v1/comp/affinity/{session_id}`](#get-bffv1compaffinitysession_id) 里的 `affinity`。`effective_deltas` 是约会挪动的量，
 即它的好感度事件提交的值；没有写事件时为 `null`：约会里没有一轮得到回复，或这期间这段关系被归档了。
+
+`effective_deltas_computed` 和 `label_changes` 是同一条事件按线记下的结果，形状同[每回合 delta 路由](#get-bffv1compaffinitysession_idevent)：
+每条线挪了多少，跨过了哪些档。这两个键在顶层总会出现：没有写事件时 `effective_deltas_computed` 为 `null`；`label_changes` 这时为 `null`，
+没有档位变化时也为 `null`。`activity` 里的这两个键在约会结算并写了事件之后才出现（`label_changes` 只在有档位变化时出现），其余情况下省略，
+所以已结算约会的 `activity` 在这里和邀约那一行的[历史回执](#get-compchatsession_idhistorylimit20offset0)里是同一个对象。
 
 约会还没人结算时，这次调用要等判官（最多 45 秒）。结算在自己的任务里运行：客户端断开不会让它停下，再调用一次就能读到结果。
 
@@ -1296,6 +1305,8 @@ SSE 帧是整轮最后一帧且只走线上——在它发出前断线，光看 
 
 `activity`（只出现在被接受的 `date` 邀约那一行用户消息上，其余行都省略，被拒的邀约也省略）是这次邀约开启的约会，形状与流里的
 `final.activity` 相同，`status`（`ongoing`、`ended` 或 `settled`）按响应时刻算。它的 `sub_session_id` 也是这个路由能读的会话：约会自己的行用这个 id 读。
+约会结算并写了事件之后，回执还带 `effective_deltas_computed` 和 `label_changes`（后者只在有档位变化时出现），与
+[结束路由](#post-v2compsessionsession_idactivitiesactivity_idend)返回的 `activity` 是同一个对象。
 
 `reaction`（只出现在 assistant 行上）为 `{emoji, reacted_at}`。
 

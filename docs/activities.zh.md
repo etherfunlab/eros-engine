@@ -256,7 +256,7 @@ weight = min(turns, cap(duration)) × AFFINITY_ACTIVITY_TURN_SHARE
 被判官评过的回合，它的 `reason` 也从不进 `[emotional_context]`。结算时第一次达到的标签，在同一个事务里写一条 `tier_reached` 纪事，
 和回合上一样。父会话还没有好感度行时不写事件。
 
-结束路由返回这场约会（`status: "settled"`）、约会之后的这段关系，以及它的事件提交的增量；没有写事件时为 `null`。
+结束路由返回这场约会（`status: "settled"`）、约会之后的这段关系，以及它的事件提交的内容：六轴增量、每条线挪了多少、跨过了哪些档；没有写事件时各项为 `null`。
 
 ## 记忆
 
@@ -334,7 +334,8 @@ weight = min(turns, cap(duration)) × AFFINITY_ACTIVITY_TURN_SHARE
 | `/open`、`/events`、`/effects`、生活选择路由 | 在子会话上返回 `409 wrong_channel` |
 
 `activity` 在哪里出现都是同一个形状：`id`、`sub_session_id`、`duration`、`place`、`content`、`status`（`ongoing`、`ended` 或
-`settled`，按响应时刻算）、`started_at` 和 `ends_at`（事件行没了之后两者都是 `null`）。
+`settled`，按响应时刻算）、`started_at` 和 `ends_at`（事件行没了之后两者都是 `null`）。约会结算并写了事件之后，它还带
+`effective_deltas_computed`（每条线挪了多少），有档位变化时再带 `label_changes`，形状同每回合 delta 路由；结束路由在顶层也返回这两项。
 
 ## 归档与抹除
 
