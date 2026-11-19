@@ -2603,7 +2603,7 @@ mod tests {
                 "{kinds}"
             );
         }
-        // Both still serialize in a response.
+        // Placed kinds still serialize in a response.
         assert_eq!(
             serde_json::to_value(EventKindDto::TakingSpace).unwrap(),
             json!("taking_space")

@@ -2914,8 +2914,9 @@ fn accepted_together(
 /// Store the turn's decided `response` on its user row. An accepted together
 /// action outside a date's sub-session also places its event, keyed on the
 /// user row and starting now, in the same write (spec 2026-11-20-together-
-/// actions-state-in-picture-and-genome-routes-design.md §5). A failed write
-/// only loses the stored copy.
+/// actions-state-in-picture-and-genome-routes-design.md §5). The two share one
+/// transaction: a failed write loses both the stored answer and the event,
+/// never the reply already sent.
 async fn store_action_response(
     chat_repo: &ChatRepo<'_>,
     user_msg: &PersistedUserMessage,
@@ -11631,6 +11632,28 @@ data: [DONE]\n\n";
         let (key, _, started, ends) = placed[0].clone();
         assert_eq!(key, format!("action:{umid}:sauna_together"));
         assert_eq!(ends - started, chrono::Duration::hours(1));
+    }
+
+    /// An accepted bath places a 30-minute `bathing_together`, the kind her
+    /// own `bathe_together` ask places, keyed on the user row.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_accepted_bath_places_bathing_together(pool: PgPool) {
+        let (frames, _, umid) = run_together_turn(
+            &pool,
+            eros_engine_core::types::UserAction::BathTogether,
+            None,
+            true,
+            &[],
+            true,
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        let placed = events_of_kind(&pool, "bathing_together").await;
+        assert_eq!(placed.len(), 1, "{placed:?}");
+        let (key, session, started, ends) = placed[0].clone();
+        assert_eq!(key, format!("action:{umid}:bathing_together"));
+        assert_eq!(session, Some(session_of(&pool, umid).await));
+        assert_eq!(ends - started, chrono::Duration::minutes(30));
     }
 
     /// The judge's refusal drops chemistry like any physical gesture, shows
