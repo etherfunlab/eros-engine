@@ -5977,7 +5977,8 @@
           "group_id",
           "members",
           "created_at",
-          "last_active_at"
+          "last_active_at",
+          "unread_count"
         ],
         "properties": {
           "created_at": {
@@ -6014,6 +6015,11 @@
               "string",
               "null"
             ]
+          },
+          "unread_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Rows a `POST /comp/chat/{session_id}/read` call would stamp that a\nclient shows: the group's visible assistant rows with no `read_at`.\n`0` when none."
           }
         }
       },
