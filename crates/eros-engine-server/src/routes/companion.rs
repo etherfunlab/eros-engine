@@ -1117,8 +1117,9 @@ async fn archive_instance_sessions(
 /// Mark every message in the session the user did not author as read.
 ///
 /// Write-only. The engine records the timestamp and stops there: it does not
-/// count unread messages, does not notify, and does not decide what "read"
-/// looks like. A consumer reads `read_at` off the history entries and renders
+/// notify and does not decide what "read" looks like. A group's DTO carries
+/// `unread_count`, the rows this call would stamp that a client shows; for a
+/// 1:1 session a consumer reads `read_at` off the history entries and renders
 /// whatever it wants.
 ///
 /// Whole-session, no body, no `up_to` watermark. A chat screen that rendered a

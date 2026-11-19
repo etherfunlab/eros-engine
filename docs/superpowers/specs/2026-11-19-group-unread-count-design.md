@@ -18,7 +18,9 @@ added to remove.
   an image). Together: visible `assistant` rows with no `read_at`.
 - Every route that returns `GroupDto` carries it: `POST /v2/comp/group`,
   `GET /v2/comp/groups`, `GET`/`PATCH /v2/comp/group/{group_id}`, and the
-  member add/remove routes, since all build it through `group_dto`.
+  add-member route, since all build it through `group_dto`.
+- The read route's description stops saying the engine does not count: a
+  group's DTO now does; 1:1 sessions still read `read_at` off history.
 
 ## Non-goals
 
