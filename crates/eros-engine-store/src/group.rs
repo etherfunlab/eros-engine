@@ -983,17 +983,40 @@ mod tests {
             30,
         )
         .await;
+        // Whitespace only: not visible. A voice-channel reply: visible.
+        row(
+            &pool,
+            g.id,
+            "assistant",
+            "\n\t ",
+            Some(b),
+            None,
+            none.clone(),
+            28,
+        )
+        .await;
+        row(
+            &pool,
+            g.id,
+            "assistant",
+            "语音回你",
+            Some(b),
+            Some("voice"),
+            none.clone(),
+            25,
+        )
+        .await;
         row(&pool, g.id, "user", "你好", None, None, none.clone(), 20).await;
 
         let count = |id: Uuid| {
             let repo = GroupRepo { pool: &pool };
             async move { repo.get(id, user_id).await.unwrap().unwrap().unread_count }
         };
-        // 嗨, the image and 回你; the newest visible row is the user's.
-        assert_eq!(count(g.id).await, 3);
+        // 嗨, the image, 回你 and 语音回你; the newest visible row is the user's.
+        assert_eq!(count(g.id).await, 4);
         let listed = repo.list(user_id).await.unwrap();
         let in_list = |id: Uuid| listed.iter().find(|x| x.id == id).unwrap().unread_count;
-        assert_eq!((in_list(g.id), in_list(empty.id)), (3, 0));
+        assert_eq!((in_list(g.id), in_list(empty.id)), (4, 0));
         let last = repo.get(g.id, user_id).await.unwrap().unwrap().last_message;
         assert_eq!(last.unwrap().role, "user");
         assert_eq!(count(empty.id).await, 0);
@@ -1001,7 +1024,7 @@ mod tests {
         assert!(repo.remove_member(g.id, user_id, b).await.unwrap());
         assert_eq!(
             count(g.id).await,
-            3,
+            4,
             "a removed member's reply still counts"
         );
 
