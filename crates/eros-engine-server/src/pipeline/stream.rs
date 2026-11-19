@@ -4252,8 +4252,8 @@ pub(crate) fn picture_state_of(
 
 /// What she is doing at a picture's moment, as the composer reads it: the
 /// events under way for `instance_id` at `at_message` (or at `now` without
-/// one), plus `starting`. Fail-open: a failed read is warned and reads as
-/// nothing, never blocks the picture.
+/// one), plus `starting`. Fail-open: a failed read is warned and reads as no
+/// events under way (`starting` still counts), never blocks the picture.
 pub(crate) async fn state_for_picture(
     pool: &sqlx::PgPool,
     instance_id: Uuid,
@@ -4261,16 +4261,18 @@ pub(crate) async fn state_for_picture(
     now: chrono::DateTime<chrono::Utc>,
     starting: Option<eros_engine_core::events::EventKind>,
 ) -> Option<String> {
-    match (eros_engine_store::events::EventRepo { pool })
+    let current = (eros_engine_store::events::EventRepo { pool })
         .current(instance_id, at_message, now)
         .await
-    {
-        Ok(current) => picture_state_of(&current, starting),
-        Err(e) => {
+        .unwrap_or_else(|e| {
             tracing::warn!(%instance_id, "image-compose: event read failed: {e}");
-            None
-        }
-    }
+            eros_engine_store::events::CurrentEvents {
+                foreground: None,
+                background: None,
+                at: now,
+            }
+        });
+    picture_state_of(&current, starting)
 }
 
 /// Resolve the per-turn image inputs, generate the subject via the composer
