@@ -1378,6 +1378,110 @@
         ]
       }
     },
+    "/svc/v1/genomes": {
+      "post": {
+        "tags": [
+          "svc"
+        ],
+        "summary": "Create a persona genome from an `eros-character` card.",
+        "description": "Retry-safe: with a caller-supplied `id` that already exists, answers `200`\nwith the id and writes nothing, so the stored genome keeps its first\ncolumns even when the retried card differs. Without `id` the engine mints\none. A rejected card is `400` with a fixed message; card text is never\nechoed.",
+        "operationId": "create_genome",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateGenomeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "A genome with this id already exists; nothing was written",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenomeIdResponse"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "A genome was created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenomeIdResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed body, or a card that is oversize or invalid"
+          },
+          "403": {
+            "description": "x-genome-write-secret missing or wrong"
+          }
+        },
+        "security": [
+          {
+            "genome_write_secret": []
+          }
+        ]
+      }
+    },
+    "/svc/v1/genomes/{id}": {
+      "put": {
+        "tags": [
+          "svc"
+        ],
+        "summary": "Overwrite a persona genome from an `eros-character` card.",
+        "description": "Replaces `name`, `system_prompt`, `tip_personality` and `art_metadata` in\nplace; `created_at` is kept. A rejected card is `400` with a fixed message;\ncard text is never echoed.",
+        "operationId": "update_genome",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The genome to overwrite",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateGenomeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "The genome was overwritten"
+          },
+          "400": {
+            "description": "Malformed body, or a card that is oversize or invalid"
+          },
+          "403": {
+            "description": "x-genome-write-secret missing or wrong"
+          },
+          "404": {
+            "description": "No genome has this id"
+          }
+        },
+        "security": [
+          {
+            "genome_write_secret": []
+          }
+        ]
+      }
+    },
     "/svc/v1/insights/changes": {
       "get": {
         "tags": [
@@ -5131,6 +5235,27 @@
           }
         }
       },
+      "CreateGenomeRequest": {
+        "type": "object",
+        "required": [
+          "card"
+        ],
+        "properties": {
+          "card": {
+            "type": "object",
+            "description": "An `eros-character` card (`spec`, `spec_version` `\"1\"` or `\"1.1\"`,\n`data`), at most 64 KiB once serialised."
+          },
+          "id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "The id to create the genome under. When a genome already has it, the\nrequest writes nothing and answers `200`, so a retried create leaves\none row. Omitted: the engine mints one."
+          }
+        },
+        "additionalProperties": false
+      },
       "CreateGroupRequest": {
         "type": "object",
         "required": [
@@ -5904,6 +6029,18 @@
             }
           },
           "user_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "GenomeIdResponse": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
             "type": "string",
             "format": "uuid"
           }
@@ -8082,6 +8219,19 @@
           }
         }
       },
+      "UpdateGenomeRequest": {
+        "type": "object",
+        "required": [
+          "card"
+        ],
+        "properties": {
+          "card": {
+            "type": "object",
+            "description": "An `eros-character` card (`spec`, `spec_version` `\"1\"` or `\"1.1\"`,\n`data`), at most 64 KiB once serialised."
+          }
+        },
+        "additionalProperties": false
+      },
       "UserActionDto": {
         "type": "object",
         "description": "An action the user does to the persona this turn, besides talking. The\npersona accepts or does not; a refusal costs the relationship one tier on\nthe line the action touches (`give` and `gift` → bond, every physical or custom action →\nchemistry); a refused `tip`, `bluff`, `threaten` or `trick` costs nothing.\nAn accepted `gift` joins the persona's items or wardrobe. A `date` asks her\nout; accepted, it runs in a session of its own for its `duration`, and\nnothing else is sent to the persona's text sessions meanwhile. An accepted\n`shower_together`, `bath_together` or `sauna_together` starts a\n`showering_together` (30 minutes), `bathing_together` (30 minutes) or\n`sauna_together` (one hour) event, ending the incident under way; on a\ndate it starts none.",
@@ -8395,6 +8545,12 @@
         "in": "header",
         "name": "x-facts-export-secret",
         "description": "Shared secret for the facts export sub-tree; FACTS_EXPORT_SECRET on the deployment"
+      },
+      "genome_write_secret": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-genome-write-secret",
+        "description": "Shared secret for the genome-write sub-tree; GENOME_WRITE_SECRET on the deployment"
       },
       "insights_export_secret": {
         "type": "apiKey",

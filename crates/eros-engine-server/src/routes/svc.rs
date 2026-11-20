@@ -2,13 +2,15 @@
 //! Service-to-service routes (`/svc/v1/*`).
 //!
 //! A third auth class next to the public and bearer-JWT sub-trees: admitted by
-//! a shared secret header, never by a user token. The class is split into three
+//! a shared secret header, never by a user token. The class is split into
 //! sub-trees, each behind its own secret so a consumer holds only the
 //! credential for the streams it reads:
 //!   * insights: `insights/changes`, `memories/changes`, `insights/deletions`
 //!     (`x-insights-export-secret`)
 //!   * facts: `facts/changes`, `facts/deletions` (`x-facts-export-secret`)
 //!   * user erase: `users/{user_id}/erase` (`x-user-erase-secret`)
+//!   * genome write: `genomes`, `genomes/{id}` (`x-genome-write-secret`),
+//!     in `routes::genomes`
 //!
 //! A sub-tree is left unmounted when the deployment did not configure its
 //! secret (see `routes::router`), so an unconfigured deployment answers on
@@ -129,7 +131,7 @@ fn clamp_limit(requested: Option<i64>) -> i64 {
 /// 403 unless `header` carries `secret`. A sub-tree is only mounted when its
 /// secret is set, so `None` here is unreachable in practice; it still fails
 /// closed. `what` names the sub-tree in the error text.
-fn admit_with(
+pub(crate) fn admit_with(
     headers: &HeaderMap,
     secret: Option<&str>,
     header: &str,

@@ -4,9 +4,9 @@
 //! The HTTP surface is split into three independently-authed sub-trees:
 //!   * Public:        `/healthz` — no auth
 //!   * Bearer JWT:    `/comp/*`, `/bff/v1/*`, `/world/*`, `/persona/*` — Supabase JWT (see auth::middleware)
-//!   * Service secrets: `/svc/v1/*` — three sub-trees, each behind its own secret header
-//!     (`x-insights-export-secret`, `x-facts-export-secret`, `x-user-erase-secret`); a sub-tree is
-//!     mounted only when its secret is configured
+//!   * Service secrets: `/svc/v1/*` — four sub-trees, each behind its own secret header
+//!     (`x-insights-export-secret`, `x-facts-export-secret`, `x-user-erase-secret`,
+//!     `x-genome-write-secret`); a sub-tree is mounted only when its secret is configured
 //!   * Caller secret: when `CALLER_SECRET` is set, the Bearer-JWT tree also needs
 //!     `x-caller-secret`, checked before the JWT
 //!
@@ -27,6 +27,7 @@ pub mod companion;
 pub mod companion_async;
 pub mod companion_stream;
 pub mod dto;
+pub mod genomes;
 pub mod group;
 pub mod health;
 pub mod image_edit;
@@ -77,7 +78,7 @@ pub fn router(state: AppState) -> OpenApiRouter<AppState> {
     let mut app = OpenApiRouter::new().merge(health::router()).merge(comp);
     // Service sub-trees: secret-admitted, each mounted only when the
     // deployment set its own secret (INSIGHTS_EXPORT_SECRET,
-    // FACTS_EXPORT_SECRET, USER_ERASE_SECRET). Separate secrets keep a
+    // FACTS_EXPORT_SECRET, USER_ERASE_SECRET, GENOME_WRITE_SECRET). Separate secrets keep a
     // consumer of one stream from reaching another's routes. An unconfigured
     // sub-tree answers exactly as any unknown path does, so it does not
     // confirm the feature exists.
@@ -89,6 +90,9 @@ pub fn router(state: AppState) -> OpenApiRouter<AppState> {
     }
     if state.config.user_erase.secret.is_some() {
         app = app.merge(svc::erase_router());
+    }
+    if state.config.genome_write.secret.is_some() {
+        app = app.merge(genomes::router());
     }
     // Tombstones carry ids only: either read secret opens them.
     if state.config.insights_export.secret.is_some() || state.config.facts_export.secret.is_some() {
@@ -127,6 +131,7 @@ pub fn router_for_openapi() -> OpenApiRouter<AppState> {
         .merge(svc::facts_router())
         .merge(svc::erase_router())
         .merge(svc::rows_router())
+        .merge(genomes::router())
 }
 
 /// The generated OpenAPI document as JSON, for tests that assert on the wire
