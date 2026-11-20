@@ -69,14 +69,31 @@ fn malformed_body() -> AppError {
     AppError::BadRequest("body must be a JSON object of the documented fields".into())
 }
 
-/// A card that is over the size limit or that `parse_card_v1` refuses; the
-/// message is one of that function's fixed strings.
-fn open_card(card: &serde_json::Value) -> Result<Card, AppError> {
+/// Whether any string in `v`, an object key included, holds U+0000, which
+/// Postgres refuses in both `text` and `jsonb`.
+fn contains_nul(v: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match v {
+        Value::String(s) => s.contains('\0'),
+        Value::Array(items) => items.iter().any(contains_nul),
+        Value::Object(map) => map.iter().any(|(k, v)| k.contains('\0') || contains_nul(v)),
+        _ => false,
+    }
+}
+
+/// A card that is over the size limit, that `parse_card_v1` refuses, or that
+/// holds a NUL character the database would refuse; the message is one of
+/// `parse_card_v1`'s fixed strings or one of this function's.
+fn checked_card(card: &serde_json::Value) -> Result<Card, AppError> {
     let bytes = serde_json::to_vec(card)?;
     if bytes.len() > MAX_PLAINTEXT_LEN {
         return Err(AppError::BadRequest("card exceeds 64 KiB".into()));
     }
-    parse_card_v1(&bytes).map_err(AppError::BadRequest)
+    let parsed = parse_card_v1(&bytes).map_err(AppError::BadRequest)?;
+    if contains_nul(card) {
+        return Err(AppError::BadRequest("card contains a NUL character".into()));
+    }
+    Ok(parsed)
 }
 
 fn new_genome(card: &Card) -> NewGenome<'_> {
@@ -113,10 +130,11 @@ async fn create_genome(
     headers: HeaderMap,
     body: Result<Json<CreateGenomeRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<GenomeIdResponse>), AppError> {
-    // Admission comes before the body is looked at, and before any DB access.
+    // The body is already read by the extractor; its error is not reported
+    // before admission, and nothing touches the DB before it.
     admit_genomes(&state, &headers)?;
     let Json(req) = body.map_err(|_| malformed_body())?;
-    let card = open_card(&req.card)?;
+    let card = checked_card(&req.card)?;
 
     let (id, created) = PersonaRepo { pool: &state.pool }
         .create_genome(req.id, &new_genome(&card))
@@ -157,7 +175,7 @@ async fn update_genome(
     admit_genomes(&state, &headers)?;
     let Path(id) = id.map_err(|e| AppError::BadRequest(e.body_text()))?;
     let Json(req) = body.map_err(|_| malformed_body())?;
-    let card = open_card(&req.card)?;
+    let card = checked_card(&req.card)?;
 
     let updated = PersonaRepo { pool: &state.pool }
         .update_genome(id, &new_genome(&card))
@@ -309,7 +327,7 @@ mod tests {
         let app = app(pool.clone(), Some(SECRET));
         let id = Uuid::new_v4();
         let ok_body = json!({ "card": card("Nova", "sp") }).to_string();
-        // The body is not looked at before admission.
+        // A bad body is not reported before admission.
         for body in [ok_body.as_str(), "not json at all"] {
             for secret in [None, Some("wrong-secret"), Some("")] {
                 let (status, _, text) = call(&app, "POST", "/svc/v1/genomes", secret, body).await;
@@ -491,6 +509,53 @@ mod tests {
         let (status, _, text) = call(&app, "PUT", &uri, Some(SECRET), &bodies[4]).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(!text.contains(MARKER));
+        assert_eq!(genome_count(&pool).await, 0);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_card_with_a_nul_character_is_400_and_never_quoted(pool: sqlx::PgPool) {
+        let app = app(pool.clone(), Some(SECRET));
+        let (_, body, _) = create(&app, None, card("Kept", "kept prompt")).await;
+        let id: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+        let kept = columns(&pool, id).await.unwrap();
+        let nul = format!("{MARKER}\u{0}{MARKER}");
+
+        let in_name = card(&nul, "sp");
+        let in_prompt = card("Nova", &nul);
+        let mut in_tip = card("Nova", "sp");
+        in_tip["data"]["tip_personality"] = json!(nul);
+        let mut in_art_value = card("Nova", "sp");
+        in_art_value["data"]["art_metadata"] = json!({ "look": { "tags": ["ok", nul] } });
+        let mut in_art_key = card("Nova", "sp");
+        in_art_key["data"]["art_metadata"] = json!({ "look": { nul.clone(): "ok" } });
+        let cards = [
+            ("name", in_name),
+            ("system_prompt", in_prompt),
+            ("tip_personality", in_tip),
+            ("art_metadata value", in_art_value),
+            ("art_metadata key", in_art_key),
+        ];
+        for (what, bad) in cards {
+            let (status, _, text) = create(&app, None, bad.clone()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "create: NUL in {what}");
+            assert!(!text.contains(MARKER), "create: {what} quoted the card");
+            let (status, _, text) = update(&app, id, bad).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "update: NUL in {what}");
+            assert!(!text.contains(MARKER), "update: {what} quoted the card");
+        }
+        assert_eq!(columns(&pool, id).await.unwrap(), kept);
+        assert_eq!(genome_count(&pool).await, 1);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_path_that_is_not_a_uuid_is_403_then_400(pool: sqlx::PgPool) {
+        let app = app(pool.clone(), Some(SECRET));
+        let uri = "/svc/v1/genomes/not-a-uuid";
+        let body = json!({ "card": card("Nova", "sp") }).to_string();
+        let (status, _, _) = call(&app, "PUT", uri, None, &body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _, _) = call(&app, "PUT", uri, Some(SECRET), &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(genome_count(&pool).await, 0);
     }
 
