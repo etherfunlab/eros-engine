@@ -209,6 +209,13 @@ One migration, `0086`, plain `CREATE INDEX IF NOT EXISTS` on:
 | `world_memories` | `instance_id` |
 | `world_post_comments` | `author_instance_id` |
 | `world_posts` | `instance_id` |
+| `chat_turn_queue` | `session_id` |
+| `companion_memories` | `session_id` |
+
+The last two have an index that leads with the column but is partial on
+something else (`status`; `instance_id IS NOT NULL`), so it does not serve
+every delete of the parent row. A partial index whose only predicate is
+`<column> IS NOT NULL` does serve it, and counts as covering.
 
 `world_memories` and `persona_story_memories` have `(owner_uid,
 instance_id)` today, which does not cover a delete from

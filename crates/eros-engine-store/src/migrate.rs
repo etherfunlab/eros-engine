@@ -207,7 +207,7 @@ mod tests {
         let versions: Vec<i64> = rows.iter().map(|r| r.0).collect();
         assert_eq!(
             versions,
-            [0, 78, 79, 80, 81, 82, 83, 84, 85],
+            [0, 78, 79, 80, 81, 82, 83, 84, 85, 86],
             "collapsed + increments"
         );
         let baseline = MIGRATOR.iter().find(|m| m.version == 0).unwrap();
@@ -238,7 +238,7 @@ mod tests {
     async fn fresh_database_applies_baseline_and_increments(pool: PgPool) {
         migrate(&pool).await.unwrap();
         let versions: Vec<i64> = bookkeeping(&pool).await.iter().map(|r| r.0).collect();
-        assert_eq!(versions, [0, 78, 79, 80, 81, 82, 83, 84, 85]);
+        assert_eq!(versions, [0, 78, 79, 80, 81, 82, 83, 84, 85, 86]);
         let phrases: i32 = sqlx::query_scalar(
             "SELECT jsonb_array_length(payload) FROM engine.error_handling_config \
               WHERE kind = 'chat_stream_failure_fallback_phrases'",
@@ -304,6 +304,49 @@ mod tests {
         assert!(
             err.to_string().contains("eros-engine migrate"),
             "the guard names the supported entry: {err}"
+        );
+    }
+
+    /// Every foreign key in `engine` has a valid index whose leading columns
+    /// are the key's columns, in order, so deleting the referenced row finds
+    /// its dependents by index instead of scanning. A partial index counts
+    /// only for a single-column key and only when its predicate is exactly
+    /// `<that column> IS NOT NULL`, which the delete's equality lookup implies.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn every_engine_foreign_key_has_a_leading_index(pool: PgPool) {
+        let unindexed: Vec<String> = sqlx::query_scalar(
+            "SELECT t.relname || '.' || c.conname \
+               FROM pg_constraint c \
+               JOIN pg_class t ON t.oid = c.conrelid \
+               JOIN pg_namespace n ON n.oid = t.relnamespace \
+              WHERE c.contype = 'f' \
+                AND n.nspname = 'engine' \
+                AND NOT EXISTS ( \
+                    SELECT 1 \
+                      FROM pg_index i \
+                     WHERE i.indrelid = c.conrelid \
+                       AND i.indisvalid \
+                       AND (i.indpred IS NULL \
+                            OR (cardinality(c.conkey) = 1 \
+                                AND pg_get_expr(i.indpred, i.indrelid) = \
+                                    '(' || (SELECT quote_ident(attname) \
+                                              FROM pg_attribute \
+                                             WHERE attrelid = c.conrelid \
+                                               AND attnum = c.conkey[1]) \
+                                        || ' IS NOT NULL)')) \
+                       AND i.indnkeyatts >= cardinality(c.conkey) \
+                       AND NOT EXISTS ( \
+                           SELECT 1 \
+                             FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, pos) \
+                            WHERE i.indkey[k.pos - 1] IS DISTINCT FROM k.attnum)) \
+              ORDER BY 1",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(
+            unindexed.is_empty(),
+            "foreign keys with no leading index: {unindexed:?}"
         );
     }
 }
