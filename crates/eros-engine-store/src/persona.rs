@@ -131,6 +131,14 @@ pub struct InstanceItemRow {
     pub created_at: DateTime<Utc>,
 }
 
+/// The four card columns of a genome, as a write takes them.
+pub struct NewGenome<'a> {
+    pub name: &'a str,
+    pub system_prompt: &'a str,
+    pub tip_personality: Option<&'a str>,
+    pub art_metadata: &'a serde_json::Value,
+}
+
 pub struct PersonaRepo<'a> {
     pub pool: &'a PgPool,
 }
@@ -342,6 +350,58 @@ impl<'a> PersonaRepo<'a> {
         .fetch_one(self.pool)
         .await?;
         Ok((id, true))
+    }
+
+    /// Insert a genome. `id` of `None` lets the database mint one. When `id`
+    /// is given and a genome already has it, nothing is written and the
+    /// result is `(id, false)`; otherwise `(id, true)`.
+    pub async fn create_genome(
+        &self,
+        id: Option<Uuid>,
+        card: &NewGenome<'_>,
+    ) -> Result<(Uuid, bool), sqlx::Error> {
+        let row = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.persona_genomes \
+                (id, name, system_prompt, tip_personality, art_metadata) \
+             VALUES (COALESCE($1, gen_random_uuid()), $2, $3, $4, $5) \
+             ON CONFLICT (id) DO NOTHING \
+             RETURNING id",
+        )
+        .bind(id)
+        .bind(card.name)
+        .bind(card.system_prompt)
+        .bind(card.tip_personality)
+        .bind(card.art_metadata)
+        .fetch_optional(self.pool)
+        .await?;
+        match (row, id) {
+            (Some(id), _) => Ok((id, true)),
+            (None, Some(id)) => Ok((id, false)),
+            // A minted id cannot collide, so an insert that returned nothing
+            // without a supplied id has no row to name.
+            (None, None) => Err(sqlx::Error::RowNotFound),
+        }
+    }
+
+    /// Overwrite the four card columns of a genome in place. `false` when no
+    /// genome has `id`.
+    pub async fn update_genome(&self, id: Uuid, card: &NewGenome<'_>) -> Result<bool, sqlx::Error> {
+        let r = sqlx::query(
+            "UPDATE engine.persona_genomes SET \
+                name = $2, \
+                system_prompt = $3, \
+                tip_personality = $4, \
+                art_metadata = $5 \
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(card.name)
+        .bind(card.system_prompt)
+        .bind(card.tip_personality)
+        .bind(card.art_metadata)
+        .execute(self.pool)
+        .await?;
+        Ok(r.rows_affected() == 1)
     }
 
     /// Create a new persona instance for `(genome_id, owner_uid)`.
@@ -936,5 +996,174 @@ mod tests {
             .await
             .unwrap();
         assert!(repo.load_instance_gate(id).await.unwrap().is_none());
+    }
+
+    /// `(name, system_prompt, tip_personality, art_metadata, created_at)`.
+    type GenomeColumns = (
+        String,
+        String,
+        Option<String>,
+        serde_json::Value,
+        DateTime<Utc>,
+    );
+
+    async fn genome_columns(pool: &PgPool, id: Uuid) -> GenomeColumns {
+        sqlx::query_as(
+            "SELECT name, system_prompt, tip_personality, art_metadata, created_at \
+             FROM engine.persona_genomes WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn create_genome_mints_an_id_when_none_is_given(pool: PgPool) {
+        let repo = PersonaRepo { pool: &pool };
+        let art = serde_json::json!({ "mbti": "INFP" });
+        let (id, created) = repo
+            .create_genome(
+                None,
+                &NewGenome {
+                    name: "Nova",
+                    system_prompt: "you are Nova",
+                    tip_personality: Some("shy"),
+                    art_metadata: &art,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(created);
+
+        let (name, system_prompt, tip, art_back, _) = genome_columns(&pool, id).await;
+        assert_eq!(name, "Nova");
+        assert_eq!(system_prompt, "you are Nova");
+        assert_eq!(tip.as_deref(), Some("shy"));
+        assert_eq!(art_back, art);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn create_genome_uses_a_supplied_id(pool: PgPool) {
+        let repo = PersonaRepo { pool: &pool };
+        let wanted = Uuid::new_v4();
+        let art = serde_json::json!({});
+        let (id, created) = repo
+            .create_genome(
+                Some(wanted),
+                &NewGenome {
+                    name: "Echo",
+                    system_prompt: "sp",
+                    tip_personality: None,
+                    art_metadata: &art,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!((id, created), (wanted, true));
+        assert_eq!(genome_columns(&pool, wanted).await.2, None);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn create_genome_with_a_taken_id_writes_nothing(pool: PgPool) {
+        let repo = PersonaRepo { pool: &pool };
+        let first_art = serde_json::json!({ "age": 27 });
+        let (id, _) = repo
+            .create_genome(
+                None,
+                &NewGenome {
+                    name: "First",
+                    system_prompt: "first prompt",
+                    tip_personality: Some("first tip"),
+                    art_metadata: &first_art,
+                },
+            )
+            .await
+            .unwrap();
+        let before = genome_columns(&pool, id).await;
+
+        let other_art = serde_json::json!({ "age": 99 });
+        let (again, created) = repo
+            .create_genome(
+                Some(id),
+                &NewGenome {
+                    name: "Second",
+                    system_prompt: "second prompt",
+                    tip_personality: None,
+                    art_metadata: &other_art,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!((again, created), (id, false));
+        assert_eq!(genome_columns(&pool, id).await, before);
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM engine.persona_genomes")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn update_genome_overwrites_all_four_columns(pool: PgPool) {
+        let repo = PersonaRepo { pool: &pool };
+        let old_art = serde_json::json!({ "age": 27 });
+        let (id, _) = repo
+            .create_genome(
+                None,
+                &NewGenome {
+                    name: "Old",
+                    system_prompt: "old prompt",
+                    tip_personality: Some("old tip"),
+                    art_metadata: &old_art,
+                },
+            )
+            .await
+            .unwrap();
+        let (_, _, _, _, created_at) = genome_columns(&pool, id).await;
+
+        let new_art = serde_json::json!({ "age": 31, "hair": "red" });
+        let updated = repo
+            .update_genome(
+                id,
+                &NewGenome {
+                    name: "New",
+                    system_prompt: "new prompt",
+                    tip_personality: None,
+                    art_metadata: &new_art,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(updated);
+        assert_eq!(
+            genome_columns(&pool, id).await,
+            (
+                "New".to_string(),
+                "new prompt".to_string(),
+                None,
+                new_art,
+                created_at
+            )
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn update_genome_of_a_missing_id_is_false(pool: PgPool) {
+        let repo = PersonaRepo { pool: &pool };
+        let art = serde_json::json!({});
+        let updated = repo
+            .update_genome(
+                Uuid::new_v4(),
+                &NewGenome {
+                    name: "Nobody",
+                    system_prompt: "sp",
+                    tip_personality: None,
+                    art_metadata: &art,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!updated);
     }
 }

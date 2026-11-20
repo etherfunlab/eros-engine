@@ -32,7 +32,7 @@ pub(crate) const CALLER_SECRET_HEADER: &str = "x-byoc-caller-secret";
 /// Longest sealed string accepted (96 KiB).
 const MAX_SEALED_LEN: usize = 98_304;
 /// Longest card plaintext accepted (64 KiB).
-const MAX_PLAINTEXT_LEN: usize = 65_536;
+pub(crate) const MAX_PLAINTEXT_LEN: usize = 65_536;
 const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
 /// Domain separator of the init ticket (spec §5.1).

@@ -6,6 +6,7 @@ use utoipa::openapi::security::{ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder
 use utoipa::{Modify, OpenApi};
 
 use crate::auth::middleware::CALLER_SECRET_HEADER;
+use crate::routes::genomes::GENOME_SECRET_HEADER;
 use crate::routes::svc::{ERASE_SECRET_HEADER, EXPORT_SECRET_HEADER, FACTS_SECRET_HEADER};
 
 /// Registers the security schemes used by handlers:
@@ -15,6 +16,7 @@ use crate::routes::svc::{ERASE_SECRET_HEADER, EXPORT_SECRET_HEADER, FACTS_SECRET
 ///   - `insights_export_secret` — `x-insights-export-secret` header, the insights /svc/v1/* routes
 ///   - `facts_export_secret` — `x-facts-export-secret` header, the facts /svc/v1/* routes
 ///   - `user_erase_secret` — `x-user-erase-secret` header, the user-erase /svc/v1/* routes
+///   - `genome_write_secret` — `x-genome-write-secret` header, the genome-write /svc/v1/* routes
 ///
 /// Without this declaration the generated spec has dangling
 /// `security(...)` references and fails standard OpenAPI validators.
@@ -62,6 +64,13 @@ impl Modify for SecurityAddon {
             SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::with_description(
                 ERASE_SECRET_HEADER,
                 "Shared secret for the user-erase sub-tree; USER_ERASE_SECRET on the deployment",
+            ))),
+        );
+        components.add_security_scheme(
+            "genome_write_secret",
+            SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::with_description(
+                GENOME_SECRET_HEADER,
+                "Shared secret for the genome-write sub-tree; GENOME_WRITE_SECRET on the deployment",
             ))),
         );
     }
