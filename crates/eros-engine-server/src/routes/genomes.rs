@@ -69,6 +69,12 @@ fn malformed_body() -> AppError {
     AppError::BadRequest("body must be a JSON object of the documented fields".into())
 }
 
+/// The path segment is not a uuid. The path extractor's own text quotes it,
+/// so none of it is surfaced.
+fn malformed_id() -> AppError {
+    AppError::BadRequest("id must be a uuid".into())
+}
+
 /// Whether any string in `v`, an object key included, holds U+0000, which
 /// Postgres refuses in both `text` and `jsonb`.
 fn contains_nul(v: &serde_json::Value) -> bool {
@@ -173,7 +179,7 @@ async fn update_genome(
     body: Result<Json<UpdateGenomeRequest>, JsonRejection>,
 ) -> Result<StatusCode, AppError> {
     admit_genomes(&state, &headers)?;
-    let Path(id) = id.map_err(|e| AppError::BadRequest(e.body_text()))?;
+    let Path(id) = id.map_err(|_| malformed_id())?;
     let Json(req) = body.map_err(|_| malformed_body())?;
     let card = checked_card(&req.card)?;
 
@@ -550,12 +556,14 @@ mod tests {
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn a_path_that_is_not_a_uuid_is_403_then_400(pool: sqlx::PgPool) {
         let app = app(pool.clone(), Some(SECRET));
-        let uri = "/svc/v1/genomes/not-a-uuid";
+        let uri = format!("/svc/v1/genomes/{MARKER}");
         let body = json!({ "card": card("Nova", "sp") }).to_string();
-        let (status, _, _) = call(&app, "PUT", uri, None, &body).await;
+        let (status, _, text) = call(&app, "PUT", &uri, None, &body).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
-        let (status, _, _) = call(&app, "PUT", uri, Some(SECRET), &body).await;
+        assert!(!text.contains(MARKER));
+        let (status, _, text) = call(&app, "PUT", &uri, Some(SECRET), &body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!text.contains(MARKER), "the rejected segment was quoted");
         assert_eq!(genome_count(&pool).await, 0);
     }
 
