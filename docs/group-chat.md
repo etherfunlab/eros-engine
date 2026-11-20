@@ -429,7 +429,7 @@ none.
 
 - Async send, voice, and user image upload (vision).
 - User actions, gifts and tips.
-- The persona's lingering effects, needs and life events: a speaker's prompt and the director's context carry none of them.
+- The persona's lingering effects, needs and life events: a speaker's prompt and the director's context carry none of them. Only a speaker's picture reads her own events, for the composer's `[此刻状态]`.
 - Reactions and image edit.
 - BYOK on the group route.
 - Proactive group messages: the director only answers the user.

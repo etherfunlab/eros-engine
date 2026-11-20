@@ -33,7 +33,7 @@ about how the pieces work and how they fit together.
 | Picture composer sees | — | the `[此刻状态]` section |
 | Caller gets | `needs` on the `body_state` frame and on `GET …/effects` | the events route response; `event` and `background_event` on `GET …/effects` |
 
-Voice calls read needs and no events. Group turns read neither. Details follow.
+Voice calls read needs and no events. Group turns read neither in the reply; only a group picture's composer reads the speaker's events. Details follow.
 
 ## Needs
 
@@ -598,7 +598,7 @@ on, the story and world directors read them too ([Beyond the chat](#beyond-the-c
   ```
 
   This works with or without the LLM judge. `/open` greetings and event messages carry the same
-  line. Voice, group and image-edit requests read no events.
+  line. The reply prompts of voice calls, group turns and image edits read no events.
 - **The image composer** gets one `[此刻状态]` section, after `[身体状态]`, with the labels of the
   background and then the incident, joined by `；`:
 
@@ -608,8 +608,8 @@ on, the story and world directors read them too ([Beyond the chat](#beyond-the-c
   ```
 
   Every picture the chat pipeline draws carries it: a chat turn's, an event message's own, and a
-  group turn's, which names its speaker's state. The section is absent when nothing is under way,
-  and the payload is then what it was without it. The event being started counts as under way
+  group turn's, which names its speaker's state. With nothing under way the payload has no such
+  section. The event being started counts as under way
   though it is not stored yet: an event message's picture shows the event it tells, and the
   picture of an accepted [together action](#showering-bathing-and-the-sauna-together) shows the
   event it places. The standalone compose endpoint and image edit send no such section. See

@@ -54,7 +54,7 @@ No new setting.
 
 ### Migration `0086`
 
-`0086_fk_indexes` creates nine indexes with `CREATE INDEX IF NOT EXISTS` and does nothing else. It adds no column and rewrites no row. Each covers a foreign key that no index led with, so that deleting a persona instance, a story event or a chat session finds its dependents by index instead of scanning the table:
+`0086_fk_indexes` creates nine indexes with `CREATE INDEX IF NOT EXISTS` and does nothing else. It adds no column and rewrites no row. Each covers a foreign key that no index serves (none leads with the column, or the one that does is partial on something else), so that deleting a persona instance, a story event or a chat session finds its dependents by index instead of scanning the table:
 
 | table | column |
 |---|---|

@@ -211,7 +211,7 @@ crates/
 │       ├── arc.rs            # ArcRepo（关系弧线）
 │       ├── journal.rs        # JournalRepo（带日期的时刻；引擎自己写的行）
 │       ├── scan_event.rs     # ScanEventRepo（relationship_scan_events 读数）
-│       └── persona.rs        # PersonaRepo（upsert_genome 給 seed 用；create_genome / update_genome 給 genome 路由用）
+│       └── persona.rs        # PersonaRepo（upsert_genome 給 seed 用；create_genome / update_genome 给 genome 路由用）
 └── eros-engine-server/
     └── src/
         ├── main.rs           # serve | migrate | seed-personas | print-openapi | backfill-dreaming 子命令
