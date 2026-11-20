@@ -626,6 +626,29 @@ pub fn parse_user_erase_config(secret: Option<&str>) -> Result<UserEraseConfig, 
     })
 }
 
+/// Admission for the genome-write sub-tree.
+#[derive(Clone, Default)]
+pub struct GenomeWriteConfig {
+    /// `GENOME_WRITE_SECRET`. `None` leaves the routes unmounted.
+    pub secret: Option<String>,
+}
+
+impl std::fmt::Debug for GenomeWriteConfig {
+    /// The secret never reaches a log line through `ServerConfig`'s `{:?}`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GenomeWriteConfig")
+            .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// A blank secret means off; a short one refuses boot.
+pub fn parse_genome_write_config(secret: Option<&str>) -> Result<GenomeWriteConfig, String> {
+    Ok(GenomeWriteConfig {
+        secret: parse_svc_secret("GENOME_WRITE_SECRET", secret)?,
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     /// Affinity 3.0 pipeline knobs (`AFFINITY_*` env vars). Defaults reproduce
@@ -704,6 +727,8 @@ pub struct ServerConfig {
     pub facts_export: FactsExportConfig,
     /// User-erase admission (`USER_ERASE_SECRET`).
     pub user_erase: UserEraseConfig,
+    /// Genome-write admission (`GENOME_WRITE_SECRET`).
+    pub genome_write: GenomeWriteConfig,
     /// Profile-rebuild idle-flush sweeper (`PROFILE_REBUILD_*` env vars).
     pub profile_rebuild: ProfileRebuildConfig,
 }
@@ -802,6 +827,9 @@ impl ServerConfig {
             )?,
             user_erase: parse_user_erase_config(
                 std::env::var("USER_ERASE_SECRET").ok().as_deref(),
+            )?,
+            genome_write: parse_genome_write_config(
+                std::env::var("GENOME_WRITE_SECRET").ok().as_deref(),
             )?,
             profile_rebuild: parse_profile_rebuild_config(
                 std::env::var("PROFILE_REBUILD_DISABLED").ok().as_deref(),
@@ -1344,6 +1372,34 @@ mod tests {
             assert!(shown.contains("<redacted>"));
             assert!(!shown.contains(secret));
         }
+    }
+
+    #[test]
+    fn genome_write_secret_too_short_refuses_boot() {
+        let err = parse_genome_write_config(Some("too-short")).unwrap_err();
+        assert!(err.contains("GENOME_WRITE_SECRET"));
+        assert!(parse_genome_write_config(Some(&"s".repeat(31))).is_err());
+        assert!(parse_genome_write_config(Some(&"s".repeat(32)))
+            .unwrap()
+            .secret
+            .is_some());
+    }
+
+    #[test]
+    fn genome_write_secret_blank_is_off() {
+        assert!(parse_genome_write_config(None).unwrap().secret.is_none());
+        assert!(parse_genome_write_config(Some("   "))
+            .unwrap()
+            .secret
+            .is_none());
+    }
+
+    #[test]
+    fn genome_write_config_debug_hides_the_secret() {
+        let secret = "THE-GENOME-SECRET-0123456789-abcdef";
+        let shown = format!("{:?}", parse_genome_write_config(Some(secret)).unwrap());
+        assert!(shown.contains("<redacted>"));
+        assert!(!shown.contains(secret));
     }
 
     const KEY_A: &str = "0123456789abcdef0123456789abcdef";
