@@ -628,8 +628,9 @@ only a reply that bears text has one:
 
   With `emotional = 0.05`, a compatible pair and one of the needs give 0.30,
   and a `moody` persona then 0.90.
-- **A 1:1 turn carrying one of seven user actions** (`french_kiss`, `tease`,
-  `hug_from_behind`, `touch`, `strip`, `threaten`, `tip`) is always
+- **A 1:1 turn carrying one of nine user actions** (`french_kiss`, `tease`,
+  `hug_from_behind`, `touch`, `strip`, `shower_together`, `bath_together`,
+  `threaten`, `tip`) is always
   `emotional`, accepted or refused. Any other action turn is never `emotional`.
 - **The message a life event sends when it starts** is `emotional` for sixteen
   kinds ([life-events-needs.md](life-events-needs.md#how-she-tells-it)).
@@ -776,7 +777,7 @@ By default the engine uses the built-in rule engine (`eros-engine-core/src/pde.r
 
 When any accepted `give` is still at work, the engine also adds a `[身体状态]` line with the persona's lingering state (e.g. `[身体状态] 3 杯「威士忌」，微醺，还在往上走`; see [API reference](api-reference.md#post-compchatsession_idmessagestream)), before `[用户动作]`; the line is absent otherwise.
 
-**The habit roll on a give.** When a turn's `give` is `cigarette`, `alcohol`, `herb`, `coffee` or `cuisine` and the persona's matching `art_metadata` key (`smoking`, `alcoholic`, `drug`, `coffee`, `gluttony`) is `false`, the engine rolls once before the judge runs. One time in three nothing changes. Otherwise the `[用户动作]` line ends with `，这次你不会收下` (e.g. `[用户动作] 对方递给你 1 支烟，这次你不会收下`), so the judge writes its `inner_state` for a refusal, and the response in effect is `refuse` whatever its `action_response` says; the rule engine's accept becomes `refuse` too. The line states the outcome, not a reason. The audit payload keeps the judge's own answer. A key that is `true` or absent never rolls. A `strip` whose turn `affinity_scope` is not romance-compatible is decided the same way, without a roll: the line ends with `，这次你不会让对方这样做` and the response in effect is `refuse`. So is a `date` the [gate](activities.md#the-gate) turns down (a `mid` date below bond tier 2, or any date while she is offline or on another date): the line ends with `，这次你不会答应`, as in `[用户动作] 对方邀请你去约会：地点「海边」，安排「看海」，大约 4 小时，这次你不会答应`. The judge's `[角色人格]` block does not list these keys. See [life-events-needs.md](life-events-needs.md#persona-settings).
+**The habit roll on a give.** When a turn's `give` is `cigarette`, `alcohol`, `herb`, `coffee` or `cuisine` and the persona's matching `art_metadata` key (`smoking`, `alcoholic`, `drug`, `coffee`, `gluttony`) is `false`, the engine rolls once before the judge runs. One time in three nothing changes. Otherwise the `[用户动作]` line ends with `，这次你不会收下` (e.g. `[用户动作] 对方递给你 1 支烟，这次你不会收下`), so the judge writes its `inner_state` for a refusal, and the response in effect is `refuse` whatever its `action_response` says; the rule engine's accept becomes `refuse` too. The line states the outcome, not a reason. The audit payload keeps the judge's own answer. A key that is `true` or absent never rolls. A `strip` whose turn `affinity_scope` is not romance-compatible is decided the same way, without a roll: the line ends with `，这次你不会让对方这样做` and the response in effect is `refuse`. So is a `shower_together` or `bath_together` under the same condition, with the line ending `，这次你不会答应`, as in `[用户动作] 对方想和你一起淋浴，这次你不会答应`. So is a `date` the [gate](activities.md#the-gate) turns down (a `mid` date below bond tier 2, or any date while she is offline or on another date): the line ends with `，这次你不会答应`, as in `[用户动作] 对方邀请你去约会：地点「海边」，安排「看海」，大约 4 小时，这次你不会答应`. The judge's `[角色人格]` block does not list these keys. See [life-events-needs.md](life-events-needs.md#persona-settings).
 
 **Needs context line.** On every judged turn the context carries one `[需求]` line, before `[身体状态]`: `[需求] 社交欲=低 情感需求=高 外出=中`, the previous rating carried to this turn, or `[需求] 尚未判定` before the first rating. `外出` is always on it; ` 享受=高` is appended only when `indulgence` is `high` (`[需求] 社交欲=低 情感需求=高 外出=中 享受=高`), and its absence reads as "not high", as the reference prompt tells the judge. A strict judge still rates `indulgence` on every judged turn without seeing whether it was `low` or `mid`, so in continuous chat it re-guesses that level each turn, and the habit-count drift acts in the gaps between ratings.
 
@@ -854,7 +855,7 @@ action, `inner_state`, and (on an image action) the reference/aspect-ratio
 inputs. Producing the actual image prompt is entirely this task's job: when an
 image action is decided, the engine runs the composer **after** the decision
 and **before** generation, feeding it the persona appearance, the current
-outfit, the bodily state, the recent scene, the partner's latest message, the chosen style, and
+outfit, the bodily state, what she is doing while an event is live, the recent scene, the partner's latest message, the chosen style, and
 the target aspect ratio. The composer **generates** the prompt from that context — it does not
 expand a seed, because none exists anymore.
 
@@ -908,6 +909,8 @@ as the composer's test surface, so it reports failure instead of masking it).
 
 `[此刻穿着]` is the turn's outfit, from the request's `outfit` or the judge's `clothing`; `（无）` when neither. The compose endpoint always sends `（无）`. `[身体状态]` is the persona's lingering state from accepted gives (see [API reference](api-reference.md#post-compchatsession_idmessagestream)), `（无）` when none; the compose endpoint always sends `（无）`.
 
+`[此刻状态]` is what she is doing while an event is live: the labels (a fixed Chinese name per kind) of the background and then the incident under way, joined by `；`, such as `短途旅游；在坐火车`. It sits after `[身体状态]` and before `[最近场景]`, on every picture the chat pipeline draws: a chat turn's (chosen by the judge, forced, or the picture of an accepted `photo`, `strip`, `ask_dancing` or together action), an event message's own, and a group turn's, which names its speaker's state. An event being started counts as live though it is not stored yet, so an event message's picture and the picture of an accepted `shower_together`, `bath_together` or `sauna_together` show the event they start. With nothing live the section is absent and the payload is what it was without it. The standalone compose endpoint and the image-edit endpoint send none. The engine overrides nothing in `[此刻穿着]`: the built-in prompt names the section, says the picture must show it, and says that where the state and what she is wearing disagree the state wins. A custom `filter_prompt` should carry a line for it; without one the model still reads the section but is told nothing about it. The audit row's `inputs` carry it as `current_state` ([LLM audit → Image-path event tables](llm-audit.md#image-path-event-tables)).
+
 ```toml
 [tasks.chat_image_prompt_compose]
 model        = "x-ai/grok-4"                       # any text model; pick one comfortable with your content range
@@ -935,7 +938,7 @@ max_tokens   = 700
 **Built-in default prompt.** Unlike every other task (whose prompt must come from
 config), the composer ships a generic, **product-identity-free** built-in
 default. It **generates** the prompt and caption straight from context —
-persona appearance, current outfit, bodily state, recent scene, the partner's latest message,
+persona appearance, current outfit, bodily state, what she is doing, recent scene, the partner's latest message,
 style, aspect ratio — and does **not** soften, downgrade, censor, or refuse, and adds no
 content-moderation layer of its own — moderation is delegated to the
 image-model provider and the downstream deployment, not this step. A
@@ -1017,7 +1020,7 @@ trio above rides alongside.
 recorded in `engine.chat_images_events`** (migration 0045): the full usage
 block, the assembled wire prompt (`composed_prompt` — style preset + persona
 appearance + subject, exactly what an image vendor would receive), the
-chain-walk facts (`attempts` / `last_failure`), and the seven raw inputs the
+chain-walk facts (`attempts` / `last_failure`), and the raw inputs the
 composer saw. `metadata.image.compose_event_id` points at that row — reverse
 lookup runs assistant row → `compose_event_id` → `chat_images_events`, never
 the other way. Usage/cost and the composed wire prompt are *not* duplicated

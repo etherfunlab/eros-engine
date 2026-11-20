@@ -10,6 +10,9 @@ v1.1 has exactly the fields of a persona genome, so a persona seed file
 for field: the top-level keys go into `data`, the `[art_metadata]` table into
 `data.art_metadata`.
 
+The same card is the body of the service routes that create and overwrite a persona genome
+([`POST /svc/v1/genomes`](api-reference.md#post-svcv1genomes)).
+
 ## Document
 
 ```json
@@ -52,7 +55,7 @@ value of the wrong shape reads as absent.
 |---|---|---|
 | `gender` | string | `male` or `female`; any other word is rendered as written. |
 | `age` | integer, or a string holding one | Her age. |
-| `species` | string | `human`, `alien`, `beastkin`, `elf`, `deity`, `cyborg`, `robot`, `android`, `zombie`, or any other word. Absent means human. `robot` and `android` are machines: the prompt calls her no AI assistant rather than no AI, and life events never give her a period ([life-events-needs.md](life-events-needs.md#gates)). |
+| `species` | string | `human`, `alien`, `beastkin`, `elf`, `deity`, `cyborg`, `robot`, `android`, `zombie`, or any other word. Absent means human. `robot` and `android` are machines: the prompt calls her no AI assistant rather than no AI, and life events never give her a period or a visit to the toilet ([life-events-needs.md](life-events-needs.md#gates)). |
 | `planet` | string | Free text. `earth` or absent renders no planet. |
 | `hometown` | string | Free text. |
 | `timezone` | string | IANA zone of her clock. Absent: the request's `user_timezone`, else `Asia/Singapore`. |

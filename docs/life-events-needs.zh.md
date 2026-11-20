@@ -24,6 +24,7 @@
 | 需要 LLM 判官 | 需要 | 不需要 |
 | 判官看到 | `[需求]` 行 | `[近期事件]` 行 |
 | 回复看到 | `- 此刻的需要：…` | `- 正在经历：…` 与 `- 刚才：…` |
+| 画图合成器看到 | — | `[此刻状态]` 段 |
 | 调用方拿到 | `body_state` 帧和 `GET …/effects` 上的 `needs` | events 路由的响应；`GET …/effects` 上的 `event` 与 `background_event` |
 
 语音通话读需求、不读事件。群聊轮次两者都不读。细节见下文。
@@ -170,7 +171,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 
 ### 类别
 
-可抽取的事件共 69 种，每一种属于一个类别，类别决定它的形态：
+可抽取的事件共 70 种，每一种属于一个类别，类别决定它的形态：
 
 | `category` | 形态 | 持续 | 类别权重 | 类别冷却 |
 |---|---|---|---|---|
@@ -186,20 +187,21 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 
 时长写成区间的，在事件开始时按整小时均匀抽定。
 
-另有五种永远不会被抽到：`taking_space`（说好暂时分开）、`fell_out`（为分开的事闹得不愉快）、`traveling_together`（和对方一起旅行）、`bathing_together`（和对方一起洗澡）和 `on_a_date`（和对方约会）。
+另有七种永远不会被抽到：`taking_space`（说好暂时分开）、`fell_out`（为分开的事闹得不愉快）、`traveling_together`（和对方一起旅行）、`bathing_together`（和对方一起洗澡）、`on_a_date`（和对方约会）、`showering_together`（和对方一起淋浴）和 `sauna_together`（和对方一起蒸桑拿）。
 前两种在她提出先分开一阵、用户作答或不作答时，由 engine 自己写入（见[提出分开的选择](#提出分开的选择)）。
 它们按形态是 `mid` 插曲，其中 `taking_space` 超出了这个类别的 4 小时：它持续 12 到 24 小时。
 `traveling_together` 是 `trip` 类的背景，用户接受她的提议时由 engine 写入（见[一起去旅行](#一起去旅行)）；
-`bathing_together` 是 30 分钟的 `short` 插曲，用户答应和她一起洗澡时由 engine 写入（见[一起洗澡](#一起洗澡)）；
+`bathing_together` 是 30 分钟的 `short` 插曲，用户答应和她一起洗澡时，或她答应用户的 `bath_together` 时，由 engine 写入（见[一起洗澡](#一起洗澡)）；
+`showering_together`（30 分钟）和 `sauna_together`（1 小时）是 `short` 插曲，她答应用户的 `shower_together` 或 `sauna_together` 时由 engine 写入（见[一起淋浴、泡澡和蒸桑拿](#一起淋浴泡澡和蒸桑拿)）；
 `on_a_date` 是 1 或 4 小时的 `short` 插曲，她答应用户的约会邀约时由 engine 写入（见 [activities.zh.md](activities.zh.md#事件)）。
-这五种都没有抽取规则，调用方的 `kinds` 也拒绝它们。
+这七种都没有抽取规则，调用方的 `kinds` 也拒绝它们。
 
 ### 抽取
 
 抽取是输入加三个随机数（两段各一个，时长一个）的纯函数。
 
 1. **资格。** 一个种类同时满足下面几条才有资格：
-   - 调用方的 `kinds` 允许它（[见下](#调用方的-kinds)；不带表示全部 69 种）；
+   - 调用方的 `kinds` 允许它（[见下](#调用方的-kinds)；不带表示全部 70 种）；
    - 它属于她的世界（见[下文](#她的世界)）；
    - 过了它的门槛（见下）；
    - 它自己的冷却已过；
@@ -272,6 +274,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 | `want_to_quit_job` | 角色的 `art_metadata.employed` 不为 `"free"` |
 | `period_scare` | 角色的 `art_metadata.gender` 为 `"female"`，她不是机器，并且亲密度档 2 及以上 |
 | `pregnancy_scare` | 角色的 `art_metadata.gender` 为 `"female"`，她不是机器，并且亲密度档 3 |
+| `using_toilet` | 她不是机器 |
 | `having_sex` | 角色的 `art_metadata.sex_addict` 为 `true` |
 | `away_from_phone`、`busy`、`in_battle`、`asleep`、`bros_gathering`、`sis_gathering`、`having_sex`，以及女性角色的 `out_shopping` | ghost 保护允许（见[下文](#离线类)） |
 
@@ -299,7 +302,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 | `employed` | `"free"`、`"part_time"`（默认）、`"full_time"` | 她的一天有多少是工作：`temp_work`、`scolded_by_superior`、`scolded_superior` 与 `business_trip` 在各自类别内分别为三分之一、1 倍、3 倍；`free` 的角色不会抽到 `want_to_quit_job`；其他值按 `part_time` 读 |
 | `outdoorsy` | `"outdoor"`、`"neutral"`（默认）、`"indoor"` | 每个类别内部：`outdoor` 时户外种类 3 倍、室内种类三分之一，`indoor` 反过来；中性种类不动（见[下文](#户外还是室内)）；其他值按 `neutral` 读 |
 | `setting` | `"modern"`（默认）、`"fantasy"` | 她生活的世界（见[下文](#她的世界)）；其他值按 `modern` 读 |
-| `species` | 任意词 | `"robot"` 和 `"android"` 是机器：她不会抽到 `period`、`period_scare`、`pregnancy_scare`；其他词不影响抽取。这个词对 prompt 的作用见 [eros-character-v1.1.md](eros-character-v1.1.md) |
+| `species` | 任意词 | `"robot"` 和 `"android"` 是机器：她不会抽到 `period`、`period_scare`、`pregnancy_scare`、`using_toilet`；其他词不影响抽取。这个词对 prompt 的作用见 [eros-character-v1.1.md](eros-character-v1.1.md) |
 | `smoking`、`alcoholic`、`drug`、`coffee`、`gluttony` | 各为 `true`、`false`、不写（默认） | 她抽不抽烟、喝不喝酒、用不用大麻、喝不喝咖啡、贪不贪吃（`false` 表示她忌口、节食）：决定 `indulgence` 回来得多快（见[漂移](#两次评定之间的漂移)）、`high` 的 `indulgence` 在回复里点名什么，以及她怎么对待递来的这样东西（见下）；`smoking`、`alcoholic`、`drug` 为 `true` 时，她才会抽到 `smoking`、`drinking`、`smoking_weed` |
 
 `prefer_trip` 管她动不动，`homesick` 管她动起来往哪去。两者都为 `true` 的空姐角色经常出行、照常出差，
@@ -319,7 +322,7 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 | 场所 | `short` | `mid` |
 |---|---|---|
 | 户外 | `police_encounter`、`animal_encounter`、`on_the_way`、`got_bumped`、`admiring_scenery`、`bird_encounter`、`want_to_see_sea`、`want_hot_spring`、`got_lost`、`missed_ride` | `on_the_road`、`on_a_boat`、`on_a_cruise`、`on_a_bus`、`on_a_train`、`on_a_plane`、`driving`、`want_to_go_out` |
-| 室内 | `showering`、`bathing`、`scolded_by_superior`、`scolded_superior`、`admiring_art`、`want_sauna` | `reading`、`gaming`、`want_to_go_home` |
+| 室内 | `showering`、`bathing`、`scolded_by_superior`、`scolded_superior`、`admiring_art`、`want_sauna`、`using_toilet` | `reading`、`gaming`、`want_to_go_home` |
 | 中性 | 其余 `short` 种类，性相关的种类与 `streaking` 都在其中 | 其余 `mid` 种类 |
 
 可能让她离线的种类（`asleep`、`in_battle`、`busy`、`away_from_phone`、`out_shopping`、两个聚会、`having_sex`）一律中性，
@@ -377,7 +380,7 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 
 | `kinds` | 可以抽的种类 |
 |---|---|
-| 不带或 `null` | 全部 69 种 |
+| 不带或 `null` | 全部 70 种 |
 | `[]` | 一种都不抽：响应是 `{"event": null, "message": null}` |
 | `["reading", "quarrel"]` | 只抽列出的 |
 | `{"allow": […], "disallow": […]}` | `allow` 允许的，去掉 `disallow` 列出的 |
@@ -385,7 +388,7 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 对象里，`allow` 不带或为 `null` 表示全部允许，`[]` 表示一种都不允许；`disallow` 不带、为 `null` 或 `[]` 都不去掉任何种类；
 两边都列了的种类不抽。只写 `{"disallow": […]}` 就能排除种类而不冻结其余种类，engine 以后新增的种类也会照常抽取。
 对象里出现未知的键，或任何地方出现未知种类，请求都会被拒绝，所以拼错的 `disallow` 不会悄悄放出本想排除的种类；
-代价是调用方要等 engine 认识某个新种类之后才能列它。`taking_space`、`fell_out`、`traveling_together`、`bathing_together` 和 `on_a_date` 永远不会被抽到，
+代价是调用方要等 engine 认识某个新种类之后才能列它。`taking_space`、`fell_out`、`traveling_together`、`bathing_together`、`on_a_date`、`showering_together` 和 `sauna_together` 永远不会被抽到，
 所以在 `kinds` 的任何位置写它们，都按同样的方式被拒绝。
 
 有七种带成人题材：`sudden_desire`、`strip`、`streaking`、`having_sex`、`just_have_sex`、`masturbating`，以及隐含性行为的 `pregnancy_scare`。engine 不内建这类分组；只对部分用户提供这类内容的调用方，
@@ -436,7 +439,7 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 
 ### 持续期间
 
-某一时刻正在进行的事件，是满足 `started_at <= 该时刻 < ends_at` 的那个背景和那件插曲。在聊天里它们到达三个读取方；
+某一时刻正在进行的事件，是满足 `started_at <= 该时刻 < ends_at` 的那个背景和那件插曲。在聊天里它们到达四个读取方；
 开启世界系统时，故事导演和世界导演也会读到（见[聊天之外](#聊天之外)）。
 
 - **判官**得到一行 `[近期事件]`，排在 `[需求]` 之后、`[身体状态]` 之前。先列背景，再列插曲，用 `；` 连接，
@@ -458,6 +461,17 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
   ```
 
   有没有 LLM 判官都一样。`/open` 开场白和事件消息带同一行。语音、群聊和改图请求不读事件。
+- **画图合成器**得到一段 `[此刻状态]`，排在 `[身体状态]` 之后，先列背景、再列插曲的标签，用 `；` 连接：
+
+  ```
+  [此刻状态]
+  短途旅游；在坐火车
+  ```
+
+  聊天流水线画的每一张图都带它：聊天回合的图、事件消息自己的图，以及群聊回合的图（写发言人自己的状态）。没有进行中的事件时
+  这一段不出现，载荷与没有这一段时一样。正在开始的事件即使还没落库也算进行中：事件消息的图画的是它讲述的事件，被接受的
+  [一起做的动作](#一起淋浴泡澡和蒸桑拿)所出的图画的是它写入的事件。独立的 compose 端点和改图不发这一段。见
+  [合成器](model-config.zh.md#taskschat_image_prompt_compose--出图-prompt-合成器图片轮次必需)。
 - **调用方**从 `GET …/effects` 拿到：`event` 是进行中的插曲，`background_event` 是进行中的背景。
   进行中的离线类事件和其他插曲一样作为 `event` 返回，带 `"offline": true`；客户端怎么展示由它自己决定。
 
@@ -641,6 +655,31 @@ composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2com
 消息里的穿着写成刚把衣服脱了，请求带 `outfit` 时写成刚把「{outfit}」脱了，所以图里不会是穿着衣服的她。它和 `sudden_desire`
 一样带成人题材，只对部分用户提供这类内容的调用方把它排除。
 
+### 一起淋浴、泡澡和蒸桑拿
+
+用户可以请她一起淋浴、泡澡或蒸桑拿：`shower_together`、`bath_together`、`sauna_together` 三种动作，都不带字段
+（见[发送路由](api-reference.zh.md#post-compchatsession_idmessagestream)）。和任何动作一样，由判官决定。在判官之前，
+性向不相容的一对发来的淋浴或泡澡，和 `strip` 一样被判为拒绝：不管判官怎么答，也不管有没有 LLM 判官，她都拒绝。蒸桑拿没有这条规则。
+被拒时 chemistry 线降一档，什么都不写；她自己提出的 `bathe_together`（[一起洗澡](#一起洗澡)）及其冷却，不读这些动作，这些动作也不读它们。
+
+被接受的动作让她进入一个事件，与存下的回答在同一个事务里写入：
+
+| 动作 | 事件 | 标签 | 持续 |
+|---|---|---|---|
+| `shower_together` | `showering_together` | 和对方一起淋浴 | 30 分钟 |
+| `bath_together` | `bathing_together` | 和对方一起洗澡 | 30 分钟 |
+| `sauna_together` | `sauna_together` | 和对方一起蒸桑拿 | 1 小时 |
+
+开始时结束正在进行的插曲，在途的背景照常继续，和她提出的洗澡一样。事件以用户那条消息为键，所以被重新驱动的回合只写一次。
+她的约会进行期间什么都不写：约会的 `on_a_date` 保持原样，约会继续。她不把这个事件当作事件来讲，因为她对这个动作的回复已经说了；
+它不离线，三种都不会被抽到。期间它就是正在进行的插曲，所以 `正在经历`、判官和画图合成器像读其他插曲一样读它。
+`showering_together` 和 `bathing_together` 不进故事导演读的事件，和浪漫选择的结果一样；`sauna_together` 会进。
+
+被接受的一起做的动作，在请求带 `image`、部署配了 composer 时是一个出图回合，和被接受的 `photo`、`strip`、`ask_dancing` 一样：先是她的话，
+再是一条 `image_request`。合成器会被告知这个事件是她此刻的状态，所以图里画的就是它；在约会里什么都不写时，这个动作的种类只作为这一回合她的状态。
+被拒的只回文字。部署的 [`tones.emotional`](model-config.zh.md#tones--聊天语气仅限-chat-任务) 大于 0 时，对淋浴和泡澡的回复用 `emotional` 语气，接受、拒绝都一样；
+蒸桑拿的不用。
+
 ### 日常里的小事
 
 八种会讲出来的插曲，填进她的一天。它们都是 `short`，都不让她离线，也都不带图，两种世界都适用（见[下文](#她的世界)）：
@@ -701,6 +740,15 @@ composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2com
 | `missed_ride` | 没赶上车 | `short` | 3 | 48 小时 | 1 小时 | 有 `business_trip`、`short_trip`、`long_trip`、`hometown_visit` 或 `traveling_together` 正在进行 | `（你刚没赶上车。）`；`traveling_together` 期间为 `（你们一起出来玩，刚没赶上车。）` |
 
 会讲出来，不离线，不带图，两种世界都有（马车也是车）。和 `got_lost` 不同，出差也算。
+
+### 上厕所
+
+| 种类 | 标签 | 类别 | 权重 | 冷却 | 时长 | 门槛 | 提示 |
+|---|---|---|---|---|---|---|---|
+| `using_toilet` | 上厕所中 | `short` | 1 | 12 小时 | 30 分钟 | 她不是机器（见[角色设置](#角色设置)） | `（你正在上厕所。）` |
+
+会讲出来，不离线，不带图，两种世界都有，没有亲密度门槛。她照常回复。它是室内种类，所以 `outdoorsy` 会缩放它（见[下文](#户外还是室内)）；
+没有任何背景会排除它，没有事件让它更容易出现，也没有需求系数作用于它。
 
 ### 交通工具
 
@@ -770,7 +818,7 @@ composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2com
 ### 聊天之外
 
 开启 [World Stories](world-system.zh.md#world-stories人生故事) 时，故事导演直接读该实例的事件，每件带标签、相对时间和她讲述时的那条
-消息，另外还读在途背景，以及这对关系里的分开请求和结果，并把它们当作既成事实。一起洗澡和约会不在其中：和浪漫选择的结果一样，它们只留在对话里。她主动发的消息不进它的聊天证据，所以一件事
+消息，另外还读在途背景，以及这对关系里的分开请求和结果，并把它们当作既成事实。一起洗澡、一起淋浴和约会不在其中：和浪漫选择的结果一样，它们只留在对话里。她主动发的消息不进它的聊天证据，所以一件事
 不会被读成她对一句不相干的话的回答。World Memories 导演对名单里的每个角色读在途背景，不论开没开 stories，住院中的角色
 就不会被写进聚会。两位导演都不写事件，也不改上面的角色设置。需求不进其中任何一个。
 

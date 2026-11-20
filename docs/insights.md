@@ -245,7 +245,7 @@ On a voice session's first turn the bootstrap snapshot renders the same bullets 
 
 ## Exports and deletions
 
-Three sub-trees of `/svc/v1/*`, each mounted only when its own secret is set, so a consumer holds only the credential for the streams it reads. Admission compares the header with the secret in constant time; missing or wrong is 403, decided before the query string is validated. A sub-tree whose secret is unset answers like any unknown path (never 403, never 200). A secret is trimmed, blank counts as unset, and fewer than 32 bytes refuses to boot.
+Four sub-trees of `/svc/v1/*`, each mounted only when its own secret is set, so a consumer holds only the credential for the routes it calls. Admission compares the header with the secret in constant time; missing or wrong is 403, decided before the query string is validated. A sub-tree whose secret is unset answers like any unknown path (never 403, never 200). A secret is trimmed, blank counts as unset, and fewer than 32 bytes refuses to boot.
 
 | Secret | Header | Routes |
 |--------|--------|--------|
@@ -253,6 +253,9 @@ Three sub-trees of `/svc/v1/*`, each mounted only when its own secret is set, so
 | `FACTS_EXPORT_SECRET` | `x-facts-export-secret` | `GET /svc/v1/facts/changes`, `GET /svc/v1/facts/deletions` |
 | either of the two above | either header | `GET /svc/v1/rows/deletions` |
 | `USER_ERASE_SECRET` | `x-user-erase-secret` | `POST /svc/v1/users/{user_id}/erase` |
+| `GENOME_WRITE_SECRET` | `x-genome-write-secret` | `POST /svc/v1/genomes`, `PUT /svc/v1/genomes/{id}` ([API reference](api-reference.md#post-svcv1genomes)) |
+
+The genome-write sub-tree creates and overwrites persona genomes and exports nothing; the rest of this section is about the other three.
 
 `rows/deletions` carries ids only, so either read secret opens it. It is mounted when at least one of the two is set, and each header is compared only with its own secret.
 
@@ -378,7 +381,7 @@ See [llm-audit.md](llm-audit.md#llm-generations-ledger). Payloads hold extracted
 | `PROFILE_REBUILD_TICK_SECS` | `300` | Sweeper interval. `0` also stops the sweeper; an unparseable value keeps the default. |
 | `PROFILE_REBUILD_IDLE_SECS` | `3600` | How long a user's last new fact must have sat before the sweeper rebuilds. |
 | `PROFILE_REBUILD_BATCH` | `20` | Users rebuilt per tick, at least 1. |
-| `INSIGHTS_EXPORT_SECRET`, `FACTS_EXPORT_SECRET`, `USER_ERASE_SECRET` | unset | Mount their sub-trees, [above](#exports-and-deletions). |
+| `INSIGHTS_EXPORT_SECRET`, `FACTS_EXPORT_SECRET`, `USER_ERASE_SECRET`, `GENOME_WRITE_SECRET` | unset | Mount their sub-trees, [above](#exports-and-deletions). |
 | `SNAPSHOT_DISABLED`, `SNAPSHOT_CRON`, `SNAPSHOT_TZ` | | The daily snapshot. |
 
 The count (20) and the 600-second claim staleness are constants, not settings. See [model-config.md](model-config.md#task-names) and [deploying.md](deploying.md#operational-notes).

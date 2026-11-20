@@ -449,7 +449,7 @@ physical or custom action → chemistry), and a refused `tip`, `bluff`, `threate
 | `type` | fields |
 |---|---|
 | `give` | `item`: one of the categories below (required); `name`: optional, 1–32 chars; `quantity`: optional, 1–99, default 1 |
-| `kiss`, `hug`, `touch`, `lick`, `french_kiss`, `hug_from_behind`, `tease`, `pat`, `wink`, `blink`, `ask_for_dance`, `ask_dancing`, `photo`, `strip` | none |
+| `kiss`, `hug`, `touch`, `lick`, `french_kiss`, `hug_from_behind`, `tease`, `pat`, `wink`, `blink`, `ask_for_dance`, `ask_dancing`, `photo`, `strip`, `shower_together`, `bath_together`, `sauna_together` | none |
 | `bluff`, `threaten`, `trick` | none |
 | `custom` | `text`: required, 1–100 chars |
 | `tip` | `amount_usd`: required, finite, `> 0` and `≤ 1_000_000_000` |
@@ -461,7 +461,7 @@ physical or custom action → chemistry), and a refused `tip`, `bluff`, `threate
 | group | `item` (unit) |
 |---|---|
 | consumable | `cigarette` (支), `alcohol` (杯), `medicine` (片), `food` (份), `soft_drink` (瓶), `tea` (杯), `coffee` (杯), `herb` (包), `cuisine` (道) |
-| valuable | `watch` (块), `gem` (颗), `gold` (块), `camera` (台), `cash` (张), `antique` (件), `artwork` (件), `handmade` (份), `credit_card` (张), `flower` (朵), `jewelry` (件) |
+| valuable | `watch` (块), `gem` (颗), `gold` (块), `camera` (台), `cash` (张), `antique` (件), `artwork` (件), `handmade` (份), `credit_card` (张), `flower` (朵), `jewelry` (件), `car` (辆), `motorcycle` (辆), `boat` (艘), `horse` (匹) |
 
 **Lingering effects of a `give`.** An accepted consumable keeps affecting the persona on the next `min(quantity, 5)` text turns of the session; the turn that accepts it is not one of them. Each turn the persona is at one step of a curve, at a level from 1 to 4:
 
@@ -482,11 +482,14 @@ A turn is a user message of the text session or of one of its dates' sub-session
 
 **Strip.** `strip` is the user undressing her, and only a romance-compatible pair can have it accepted: a chemistry axis in `affinity_scope` on this turn, whatever `memory_scope` says. Any other pair's `strip` is refused before the judge runs, whatever it answers and with or without the LLM judge, and drops the chemistry line a tier like any refused physical action. An accepted `strip` undresses her this turn: her clothing reads 衣服被对方脱掉了, or 「{outfit}」被对方脱掉了 over a named `outfit`, in her reply and in the picture. With image capability it comes back as her picture, like a photo (below).
 
-**A photo she lets you take.** An accepted `photo` on a turn whose request carries `image`, in a deployment with `[tasks.chat_image_prompt_compose]` configured, is answered as `reply_text_image`: her words, then one `image_request` built on her face reference, composed from the scene. This holds with or without the LLM judge. An accepted `strip` is answered the same way, and so is an accepted `ask_dancing` (the user asks her to dance for them; the picture is of her dancing). A refused `photo`, `strip` or `ask_dancing`, or one without that image capability, is a text reply, even when the judge proposed a picture. `image.force = true` still makes the turn `reply_image`, and on a refusal the picture follows the refusal.
+**Together actions.** `shower_together`, `bath_together` and `sauna_together` ask her to shower, bathe or take a sauna with the user. The judge decides, and a refusal drops the chemistry line a tier like any refused physical action. A `shower_together` or `bath_together` from a pair that is not romance-compatible, as for `strip`, is refused before the judge runs, whatever it answers and with or without the LLM judge; `sauna_together` has no such rule. An accepted one puts her in an event, written with her stored answer in one transaction and keyed on the user's message, so a re-driven turn places it once: `showering_together` (30 minutes), `bathing_together` (30 minutes) or `sauna_together` (1 hour). Starting it ends an incident under way and leaves a background going. Accepted inside a date, it places nothing: the date's `on_a_date` is left alone and the date goes on. The event shows as `event` on [`GET …/effects`](#get-v2compsessionsession_ideffects) while it lasts. With image capability the accepted turn comes back as her picture (below), and the picture shows the event. The rules are in [life-events-needs.md](life-events-needs.md#showering-bathing-and-the-sauna-together).
+
+**A photo she lets you take.** An accepted `photo` on a turn whose request carries `image`, in a deployment with `[tasks.chat_image_prompt_compose]` configured, is answered as `reply_text_image`: her words, then one `image_request` built on her face reference, composed from the scene. This holds with or without the LLM judge. An accepted `strip` is answered the same way, and so is an accepted `ask_dancing` (the user asks her to dance for them; the picture is of her dancing) and an accepted `shower_together`, `bath_together` or `sauna_together`. A refused `photo`, `strip`, `ask_dancing` or together action, or one without that image capability, is a text reply, even when the judge proposed a picture. `image.force = true` still makes the turn `reply_image`, and on a refusal the picture follows the refusal.
 
 **Emotional replies.** While the deployment has
 [`tones.emotional`](model-config.md#tones--chat-tones-chat-task-only) above 0, a turn carrying
-`french_kiss`, `tease`, `hug_from_behind`, `touch`, `strip`, `threaten` or `tip` is answered in
+`french_kiss`, `tease`, `hug_from_behind`, `touch`, `strip`, `shower_together`, `bath_together`,
+`threaten` or `tip` is answered in
 the `emotional` tone, accepted or refused: the reply is written from the persona, the action and
 her response, without the chat history, the user profile or the affinity conclusions. The
 response itself is decided as above. The reply's rows carry `metadata.tone = "emotional"`.
@@ -593,7 +596,8 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 An `image` block signals the consumer handles image drawing this turn; the
 engine composes the prompt and emits a single `image_request` frame (it never
-draws on the chat stream).
+draws on the chat stream). The composer is told what she is doing while an event
+is live, so the picture agrees with it ([model-config.md](model-config.md#taskschat_image_prompt_compose--image-prompt-composer-required-for-image-turns)).
 
 `ImageReplyParams` fields (all optional):
 
@@ -659,7 +663,7 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 - `ghost`: `meta(action_type=ghost) → done → final` — no `delta`, no `model` in `meta`, `usage` and `generation_id` are `null` in `done`. The companion stayed silent this turn; no chat model was called.
 - reasoning: when the judge returned reasoning, `reasoning*` precedes every shape in this list, ahead of `action_response` and `body_state`: `reasoning* → meta(reply) → delta* → done → final`
 - action turn: the same shapes with `action_response` ahead of the first `meta` — `action_response → meta(reply) → delta* → done → final`; never `ghost` or `product_qa`
-- an accepted `photo`, `strip` or `ask_dancing` with image capability: `action_response → meta(reply_text_image) → delta* → done → image_request → final`
+- an accepted `photo`, `strip`, `ask_dancing`, `shower_together`, `bath_together` or `sauna_together` with image capability: `action_response → meta(reply_text_image) → delta* → done → image_request → final`
 - an accepted `date`: `action_response → meta(reply) → delta* → done → final`, with `activity` on `final`
 - a turn with lingering effects or known needs: `body_state` sits ahead of the first `meta`, after `action_response` when both are sent — e.g. `action_response → body_state → meta(reply) → delta* → done → final`
 - `product_qa`: `meta(action_type=product_qa) → delta* → done → final` — same shape as a normal text reply, streamed by an independent model chain (`[tasks.chat_product_qa]`) instead of `chat_companion`; persisted with `channel='product_qa'` and reported as `product_qa` again on replay.
@@ -1102,7 +1106,7 @@ How the draw works and how events and the persona's needs fit together is in
 | Field | Rules |
 |---|---|
 | `event_key` | required: 1–128 characters of `[A-Za-z0-9_.:-]`, scoped to the session. The same key returns the same event |
-| `kinds` | optional. Absent or `null`: every kind. An array allows the listed kinds (`[]`: nothing is drawn). An object `{"allow": […], "disallow": […]}` allows what `allow` lists (absent or `null`: every kind; `[]`: none) minus what `disallow` lists; a kind in both is not drawn, and `{}` allows every kind. An unknown key in the object or an unknown kind is a `422`, and so is `taking_space`, `fell_out`, `traveling_together`, `bathing_together` or `on_a_date`: the engine places those itself and never draws them |
+| `kinds` | optional. Absent or `null`: every kind. An array allows the listed kinds (`[]`: nothing is drawn). An object `{"allow": […], "disallow": […]}` allows what `allow` lists (absent or `null`: every kind; `[]`: none) minus what `disallow` lists; a kind in both is not drawn, and `{}` allows every kind. An unknown key in the object or an unknown kind is a `422`, and so is `taking_space`, `fell_out`, `traveling_together`, `bathing_together`, `on_a_date`, `showering_together` or `sauna_together`: the engine places those itself and never draws them |
 | `user_timezone`, `user_country`, `user_region`, `tier`, `prompt_traits`, `memory_scope`, `affinity_scope`, `audit` | as on `/open`, for generating the message |
 | `image` | optional: `{"style", "aspect_ratio", "prompt_variant"}`, each as on a chat turn's `image` (no `force`; an unsupported `aspect_ratio` is a `422`). The caller handles images: a `taking_selfie` or `strip` message then carries her picture, when `[tasks.chat_image_prompt_compose]` is configured (below). Absent, or no composer: words only. Every other kind ignores it |
 | `outfit` | optional: what she wears, as on a chat turn — typically one of her wardrobe entries, not checked against it; 1–64 characters after trim, blank reads as absent, longer is a `422`. Her words follow it, and so does her picture. On a `strip` she has just taken it off: 刚把「{outfit}」脱了, or 刚把衣服脱了 without one. Absent: no outfit in her prompt, and the composer dresses her from the scene |
@@ -1146,6 +1150,7 @@ Kinds fall into four categories. `short` and `mid` are incidents; `body` and
 | `short` | `just_have_sex` | 30 min | she has just had sex, and tells the user (rung 3) |
 | `short` | `masturbating` | 30 min | she is masturbating (a sex addict, rung 3) |
 | `short` | `missed_ride` | 1 h | she has missed her ride (only on a trip, a business trip included) |
+| `short` | `using_toilet` | 30 min | she is in the bathroom (never a machine persona) |
 | `mid` | `temp_work` | 4 h | she is called in to work |
 | `mid` | `ex_message` | 3 h | her ex texts her |
 | `mid` | `got_hit` | 4 h | someone hit her |
@@ -1182,21 +1187,25 @@ Kinds fall into four categories. `short` and `mid` are incidents; `body` and
 | `trip` | `long_trip` | 3–7 d | a long trip |
 | `trip` | `hometown_visit` | 72 h | a visit home |
 
-A range is drawn when the event starts. That is 69 drawable kinds. Both genders
+A range is drawn when the event starts. That is 70 drawable kinds. Both genders
 draw both gatherings, at the same weight; that is deliberate.
 
-Five more kinds are never drawn: `taking_space` (a separation she asked for and
+Seven more kinds are never drawn: `taking_space` (a separation she asked for and
 the user agreed to, 12–24 h, offline), `fell_out` (the falling-out when the
 user ignores her ask for space, 1 h), `traveling_together` (a trip she
 suggested and the user agreed to, 48–72 h, a `trip` background, not offline),
-`bathing_together` (a bath she suggested and the user agreed to, 30 min, a
-`short` incident, not offline) and `on_a_date` (a date the user asked her on
-and she accepted, 1 or 4 h, a `short` incident, not offline). The engine writes
-the first four for the
-[life-choice flow](#post-v2compsessionsession_idlife-choiceschoice_id) and
-`on_a_date` for a [date](activities.md). They show up as the `event` of
-`…/effects`, the first four also as the `event` of the life-choice response, and
-cannot be listed in `kinds`.
+`bathing_together` (a bath she suggested and the user agreed to, or a
+`bath_together` she accepted, 30 min, a `short` incident, not offline),
+`on_a_date` (a date the user asked her on and she accepted, 1 or 4 h, a `short`
+incident, not offline), `showering_together` (a `shower_together` she accepted,
+30 min, a `short` incident, not offline) and `sauna_together` (a
+`sauna_together` she accepted, 1 h, a `short` incident, not offline). The engine
+writes the first four for the
+[life-choice flow](#post-v2compsessionsession_idlife-choiceschoice_id) (the
+fourth also for the action), `on_a_date` for a [date](activities.md), and the
+last two for the [together actions](#post-compchatsession_idmessagestream). They
+show up as the `event` of `…/effects`, the first four also as the `event` of the
+life-choice response, and cannot be listed in `kinds`.
 
 `sudden_desire`, `strip`, `streaking`, `having_sex`, `just_have_sex`, `masturbating` and `pregnancy_scare`, which implies sex, carry adult themes;
 a caller that serves them only to some users leaves them out with
@@ -1256,7 +1265,7 @@ The draw:
   `"female"`. `period_scare` (rung 2 and up) and `pregnancy_scare` (rung 3) are
   also drawn only for such a persona, and so are `saw_bag` and `saw_clothes`;
   from rung 2 she says she wants what she found, in her `tip_personality`'s
-  register when she has one. `period` and the two scares are never drawn for a machine
+  register when she has one. `period`, the two scares and `using_toilet` are never drawn for a machine
   (`art_metadata.species` `"robot"` or `"android"`). The offline kinds follow the two ghost
   gates (below).
 - **Persona settings** in the genome's `art_metadata` shape the draw:
@@ -1300,8 +1309,9 @@ deployment that configures `[tasks.chat_image_prompt_compose]`, is told in
 words plus one delegated picture, like a chat turn's `reply_text_image`. Her
 message is written first; the composer then reads it as the end of the recent
 scene, so the picture shows what she says. No user message asked for it, so
-the composer's latest-message slot is empty. A failed composer degrades to a
-plain portrait prompt, as on a chat turn. The response gains `image_request`,
+the composer's latest-message slot is empty. It is told the event as her state
+(`[此刻状态]`), the one being drawn included, beside what else is live. A failed
+composer degrades to a plain portrait prompt, as on a chat turn. The response gains `image_request`,
 the payload of [`GET …/image-request`](#get-compchatsession_idmessagesmessage_idimage-request)
 (base64 `composed_prompt`, `image_ref: "face"`, `aspect_ratio`); render it as
 a turn's `image_request` frame. The same `event_key` returns it again. It is
@@ -1336,7 +1346,7 @@ While one lasts, every text turn in any session of the persona ghosts, without
 the judge and without counting towards the ghost streak, and `/open` returns
 `null`. An announced `busy`, `in_battle` or `out_shopping` still ghosts. A turn that carries a
 user `action` (any `type`: `give`, `gift`, `tip`, `kiss`, `hug`, `touch`,
-`lick`, `french_kiss`, `hug_from_behind`, `tease`, `pat`, `wink`, `blink`, `ask_for_dance`, `ask_dancing`, `photo`, `strip`, `bluff`, `threaten`, `trick`, `custom`) or `image.force = true` is the exception: it takes the normal
+`lick`, `french_kiss`, `hug_from_behind`, `tease`, `pat`, `wink`, `blink`, `ask_for_dance`, `ask_dancing`, `photo`, `strip`, `shower_together`, `bath_together`, `sauna_together`, `bluff`, `threaten`, `trick`, `date`, `custom`) or `image.force = true` is the exception: it takes the normal
 path and is answered, because an action is interaction in person, which needs
 no phone, and a forced image turn is always `reply_image`. The persona goes
 silent this way only where the ghost protection allows it, so with the
@@ -1391,7 +1401,7 @@ reply does not count. Her other sessions never carry it.
   with text; see
   [model-config.md](model-config.md#taskspde_decision--opt-in-llm-pde-judge)).
 - **Errors:** `400` with `code: "invalid_payload"` for a malformed
-  `event_key`; `422` for an unknown `kind`, or for `taking_space`, `fell_out`, `traveling_together`, `bathing_together` or `on_a_date`. Session checks as on `/open`
+  `event_key`; `422` for an unknown `kind`, or for `taking_space`, `fell_out`, `traveling_together`, `bathing_together`, `on_a_date`, `showering_together` or `sauna_together`. Session checks as on `/open`
   (`403`, `404`, `409` for a voice or group session or a date's sub-session), `429` at the per-user
   in-flight cap. A BYOC instance's session is `400 byoc_unsupported`. A failed
   generation returns the upstream error the image endpoints return and
@@ -2159,8 +2169,9 @@ Body fields:
 | `stream` | `bool` | no | Default `true`. |
 | `character` | `String` | BYOC only | A sealed character card. Required when the instance is a BYOC instance, refused (`400 invalid_payload`) on any other. Needs `X-Byoc-Caller-Secret`. The composer reads the card's `appearance`. See [byoc.md](byoc.md). |
 
-The composer payload is identical to the chat path's seven slots, so one
-`filter_prompt` contract serves both callers (see
+The composer payload is the chat path's seven slots, without the `[此刻状态]`
+section a chat-path picture carries while an event is live (this endpoint has no
+events to read), so one `filter_prompt` contract serves both callers (see
 [model-config.md](model-config.md)).
 
 Every call — success or failure — is recorded in `engine.chat_images_events`
@@ -2866,7 +2877,7 @@ form of the route above, for a client rendering one row per companion. The
 
 ## Service endpoints
 
-Service-to-service routes under `/svc/v1/*`. They are admitted by a shared secret header, not a user JWT. The routes form three sub-trees, each behind its own secret so a consumer holds only the credential for the streams it reads, and each **not mounted** unless the deployment configured its secret — an unconfigured sub-tree answers exactly as it does for any unknown path: never `403`, never `200`. A secret is trimmed, blank counts as unset, and fewer than 32 bytes refuses to boot.
+Service-to-service routes under `/svc/v1/*`. They are admitted by a shared secret header, not a user JWT. The routes form four sub-trees, each behind its own secret so a consumer holds only the credential for the routes it calls, and each **not mounted** unless the deployment configured its secret — an unconfigured sub-tree answers exactly as it does for any unknown path: never `403`, never `200`. A secret is trimmed, blank counts as unset, and fewer than 32 bytes refuses to boot.
 
 | Secret | Header | Routes |
 |---|---|---|
@@ -2874,6 +2885,7 @@ Service-to-service routes under `/svc/v1/*`. They are admitted by a shared secre
 | `FACTS_EXPORT_SECRET` | `x-facts-export-secret` | [`facts/changes`](#get-svcv1factschanges), [`facts/deletions`](#get-svcv1factsdeletions) |
 | either of the two above | either header | [`rows/deletions`](#get-svcv1rowsdeletions) |
 | `USER_ERASE_SECRET` | `x-user-erase-secret` | [`POST users/{user_id}/erase`](#post-svcv1usersuser_iderase) |
+| `GENOME_WRITE_SECRET` | `x-genome-write-secret` | [`POST genomes`](#post-svcv1genomes), [`PUT genomes/{id}`](#put-svcv1genomesid) |
 
 All the streams are keyset-paged the same way; the pipeline behind them is in [Insights](insights.md#exports-and-deletions).
 
@@ -3078,6 +3090,53 @@ curl -X POST -H "x-user-erase-secret: $USER_ERASE_SECRET" \
 - **Call it before deleting the user's sessions or persona instances.** The per-relationship insight tables and the relationship scan's tables key on the instance alone and are reachable only while the instance row exists.
 - **Stop the user's traffic first.** A stage-1 extraction already in flight can write facts after the erase commits; call again to clean up. (A rebuild in flight cannot write a profile back.)
 
+### `POST /svc/v1/genomes`
+
+Create a persona genome from an [eros-character](eros-character-v1.1.md) card, for a downstream server that authors personas, so that it need not write `engine.persona_genomes` itself. Requires `x-genome-write-secret: <GENOME_WRITE_SECRET>` (403 when missing or wrong). No user is on the request and the engine checks no ownership: the caller does its own.
+
+```bash
+curl -X POST -H "x-genome-write-secret: $GENOME_WRITE_SECRET" -H "Content-Type: application/json" \
+  -d '{
+        "id": "5b7e0c1a-3d2f-4a6b-9c8d-1e2f3a4b5c6d",
+        "card": {
+          "spec": "eros-character",
+          "spec_version": "1.1",
+          "data": { "name": "Aria", "system_prompt": "You are Aria …", "tip_personality": null, "art_metadata": {} }
+        }
+      }' \
+  "http://localhost:8080/svc/v1/genomes"
+```
+
+`id` is optional. Without it the engine mints one; with it the genome is created under that id. `card` is the whole document, validated by the same function that opens a BYOC card, so `spec` is `"eros-character"`, `spec_version` is `"1"` or `"1.1"`, and `data` holds only `name`, `system_prompt`, `tip_personality` and `art_metadata`. Serialised, it is at most 64 KiB. Any other field in the body is a `400`.
+
+| Status | Body | When |
+|---|---|---|
+| `201` | `{"id": "…"}` | the genome was created |
+| `200` | `{"id": "…"}` | a genome with the supplied `id` already exists. Nothing is written, and the stored genome keeps its columns even if the card differs |
+| `400` | `bad_request` | a malformed body, a `card` over the limit or one the validator refuses, or a card with a NUL character in it. The message is fixed and names the rule broken; card text is never quoted back |
+| `403` | `forbidden` | the header is missing or wrong |
+
+**A retried create is safe** when the caller supplies the `id`: the second call answers `200` with the same id and the table holds one row.
+
+### `PUT /svc/v1/genomes/{id}`
+
+Overwrite a persona genome from a card. Requires `x-genome-write-secret: <GENOME_WRITE_SECRET>`. The body is `{"card": {…}}`, the card as above. `name`, `system_prompt`, `tip_personality` and `art_metadata` are replaced in place; the id and `created_at` stay.
+
+```bash
+curl -X PUT -H "x-genome-write-secret: $GENOME_WRITE_SECRET" -H "Content-Type: application/json" \
+  -d '{ "card": { "spec": "eros-character", "spec_version": "1.1", "data": { "name": "Aria", "system_prompt": "You are Aria …" } } }' \
+  "http://localhost:8080/svc/v1/genomes/5b7e0c1a-3d2f-4a6b-9c8d-1e2f3a4b5c6d"
+```
+
+| Status | When |
+|---|---|
+| `204` | the genome was overwritten |
+| `400` | the `id` in the path is not a UUID, or the body or card is refused, as for create |
+| `403` | the header is missing or wrong; it is checked before anything else |
+| `404` | no genome has this `id` |
+
+Neither route reads, lists or deletes a genome.
+
 ## Error responses
 
 Most errors are JSON with `{"error": "<code>", "message": "<human-readable>"}`.
@@ -3099,7 +3158,7 @@ on whichever route it comes from, as does the caller-secret refusal
 |--------|------|------|
 | 400 | `bad_request` | A value the handler checks and rejects (a bad cursor, bad `prompt_traits`, …). A body or path that fails to parse gets the framework's plain-text rejection instead |
 | 401 | — | Missing / malformed / expired / wrong-secret JWT. The body is empty: the auth layer answers before any handler |
-| 403 | `forbidden` | Path-user vs JWT-user mismatch, or trying to read a session you don't own; or a `/svc/v1/*` secret header (`x-insights-export-secret`, `x-facts-export-secret`, `x-user-erase-secret`) missing or wrong |
+| 403 | `forbidden` | Path-user vs JWT-user mismatch, or trying to read a session you don't own; or a `/svc/v1/*` secret header (`x-insights-export-secret`, `x-facts-export-secret`, `x-user-erase-secret`, `x-genome-write-secret`) missing or wrong |
 | 404 | `not_found` | Unknown session / persona / message id |
 | 409 | `conflict` | The resource's state does not permit the action. The reaction route and image edit return it for a group session, with a `message` containing `wrong_channel`. The 1:1 stream and async send routes, `/open`, `/events`, `/effects` and the life-choice route refuse a group session with the coded body instead (`code: wrong_channel`), as the group routes refuse a non-group session. A [date](activities.md)'s refusals use the coded body too, on whichever route they come from: `activity_in_progress`, `activity_ended`, `activity_settling`, `choice_pending`, and `activity_not_found` (a `404`) |
 | 422 | `unprocessable` | A well-formed request whose values are not acceptable |
@@ -3129,6 +3188,7 @@ on whichever route it comes from, as does the caller-secret refusal
 - `crates/eros-engine-server/src/routes/bff/companion.rs` — BFF `/bff/v1/comp/chat/*`
 - `crates/eros-engine-server/src/routes/bff/affinity.rs` — BFF `/bff/v1/comp/affinity/*`
 - `crates/eros-engine-server/src/routes/svc.rs` — service-to-service export (`/svc/v1/*`)
+- `crates/eros-engine-server/src/routes/genomes.rs` — genome create and update (`/svc/v1/genomes`)
 - `crates/eros-engine-server/src/routes/user_rows.rs` — the owner's fact and memory lists and deletes
 - `crates/eros-engine-server/src/routes/health.rs` — `/healthz`
 - `crates/eros-engine-server/src/openapi.rs` — Scalar UI spec metadata

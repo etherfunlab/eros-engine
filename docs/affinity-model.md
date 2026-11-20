@@ -270,7 +270,8 @@ roll can refuse whatever the judge says
   through it, and drops no line either; the turn is graded like any other.
 - **Strip:** a `strip` from a pair whose `affinity_scope` is not romance-compatible is
   refused whatever the judge says, and drops Chemistry like any refused
-  physical action.
+  physical action. So is a `shower_together` or `bath_together` from such a pair;
+  `sauna_together` has no such rule.
 - **Gift:** accepted, the gift also joins the persona's items or wardrobe;
   refused, it joins nothing and drops Bond like a refused `give`.
 - **Date:** a refused `date` invitation drops no line; the turn is graded like

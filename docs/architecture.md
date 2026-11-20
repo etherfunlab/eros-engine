@@ -101,7 +101,7 @@ gates.
 
 ## Auth
 
-Middleware (`auth::middleware::require_auth`) protects everything except `/healthz` (merged outside the layer), `/docs` (merged in `main.rs`), and `/svc/v1/*` (three sub-trees, each admitted by its own shared secret header and mounted only when that secret is set) — today that means `/comp/*`, `/v2/comp/*`, `/bff/v1/*`, `/world/*`, and `/persona/*`. The layer attaches to the merged sub-router in `routes/mod.rs`, not to a path prefix, which is why a new namespace (e.g. `/persona/*`) needs no extra auth wiring. It pulls the `Authorization: Bearer …` header, calls `state.auth.validate(token)`, and inserts an `AuthUser(user_id)` extension into the request. Every protected handler reads `Extension(AuthUser(user_id))`; `user_id` from request bodies is never trusted. A second layer on the same sub-router, `auth::middleware::require_caller_secret`, runs before it: when `CALLER_SECRET` is set, a request without a matching `x-caller-secret` header is refused with `403 caller_forbidden` and its JWT is never looked at; unset, the layer passes everything through.
+Middleware (`auth::middleware::require_auth`) protects everything except `/healthz` (merged outside the layer), `/docs` (merged in `main.rs`), and `/svc/v1/*` (four sub-trees, each admitted by its own shared secret header and mounted only when that secret is set) — today that means `/comp/*`, `/v2/comp/*`, `/bff/v1/*`, `/world/*`, and `/persona/*`. The layer attaches to the merged sub-router in `routes/mod.rs`, not to a path prefix, which is why a new namespace (e.g. `/persona/*`) needs no extra auth wiring. It pulls the `Authorization: Bearer …` header, calls `state.auth.validate(token)`, and inserts an `AuthUser(user_id)` extension into the request. Every protected handler reads `Extension(AuthUser(user_id))`; `user_id` from request bodies is never trusted. A second layer on the same sub-router, `auth::middleware::require_caller_secret`, runs before it: when `CALLER_SECRET` is set, a request without a matching `x-caller-secret` header is refused with `403 caller_forbidden` and its JWT is never looked at; unset, the layer passes everything through.
 
 The default validator is `SupabaseJwtValidator`; it dispatches per-token on the JWT `alg` header, preferring JWKS-based asymmetric verification (ES256/RS256/EdDSA) — the default since Supabase's 2025 JWT Signing Keys rollout — sourced from `SUPABASE_JWKS_URL` or derived from `SUPABASE_URL`, and falling back to legacy HS256 against `SUPABASE_JWT_SECRET` for projects that haven't migrated. Self-hosters with a different IdP implement the `AuthValidator` trait and inject their impl into `AppState.auth`.
 
@@ -225,7 +225,7 @@ crates/
 │       ├── arc.rs            # ArcRepo (the relationship arc)
 │       ├── journal.rs        # JournalRepo (dated moments; the engine-written rows)
 │       ├── scan_event.rs     # ScanEventRepo (relationship_scan_events readout)
-│       └── persona.rs        # PersonaRepo (upsert_genome for seeding)
+│       └── persona.rs        # PersonaRepo (upsert_genome for seeding; create_genome / update_genome for the genome routes)
 └── eros-engine-server/
     └── src/
         ├── main.rs           # serve | migrate | seed-personas | print-openapi | backfill-dreaming subcommands
@@ -234,7 +234,7 @@ crates/
         ├── auth/             # AuthValidator trait + Supabase impl + middleware
         ├── pipeline/         # stream (run_stream) / group + group_director / reasoning_call / handlers / post_process / dreaming / …
         ├── prompt.rs         # system-prompt builder (affinity → directives)
-        ├── routes/           # health / companion / companion_stream / companion_async / insight / image_edit / voice / persona / session_open / session_events / session_effects / life_choices / activities / persona_items / user_rows / reaction / group / world_town / svc (service-to-service export, `/svc/v1/*`) / bff / dto / mod
+        ├── routes/           # health / companion / companion_stream / companion_async / insight / image_edit / voice / persona / session_open / session_events / session_effects / life_choices / activities / persona_items / user_rows / reaction / group / world_town / svc (service-to-service export, `/svc/v1/*`) / genomes (genome write, `/svc/v1/genomes`) / bff / dto / mod
         └── openapi.rs        # utoipa ApiDoc spec metadata
 ```
 
