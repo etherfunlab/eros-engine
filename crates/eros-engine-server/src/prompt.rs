@@ -760,6 +760,9 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
         UserAction::Threaten => "威胁你".into(),
         UserAction::Trick => "想捉弄你".into(),
         UserAction::Strip => "伸手想脱你的衣服".into(),
+        UserAction::ShowerTogether => "想和你一起淋浴".into(),
+        UserAction::BathTogether => "想和你一起泡澡".into(),
+        UserAction::SaunaTogether => "想和你一起蒸桑拿".into(),
         UserAction::Custom { text } => text.clone(),
         UserAction::Tip { amount_usd } => {
             format!("给你发了一个红包，相当于{}", tip_value_noun(*amount_usd))
@@ -862,6 +865,10 @@ pub(crate) fn given_phrase(item: GivenItem, name: Option<&str>, quantity: u8) ->
         GivenItem::CreditCard => ("张", "信用卡"),
         GivenItem::Flower => ("朵", "花"),
         GivenItem::Jewelry => ("件", "首饰"),
+        GivenItem::Car => ("辆", "汽车"),
+        GivenItem::Motorcycle => ("辆", "摩托车"),
+        GivenItem::Boat => ("艘", "船"),
+        GivenItem::Horse => ("匹", "马"),
     };
     match name {
         Some(name) => format!("{quantity} {unit}「{name}」"),
@@ -904,7 +911,11 @@ fn effect_word(item: GivenItem, level: u8) -> &'static str {
         | GivenItem::Handmade
         | GivenItem::CreditCard
         | GivenItem::Flower
-        | GivenItem::Jewelry => return "",
+        | GivenItem::Jewelry
+        | GivenItem::Car
+        | GivenItem::Motorcycle
+        | GivenItem::Boat
+        | GivenItem::Horse => return "",
     };
     words[usize::from(level.clamp(1, 4)) - 1]
 }
@@ -1064,6 +1075,9 @@ pub(crate) fn event_label(kind: eros_engine_core::events::EventKind) -> &'static
         OnATrain => "在坐火车",
         OnAPlane => "在飞机上",
         Driving => "在开车",
+        UsingToilet => "上厕所中",
+        ShoweringTogether => "和对方一起淋浴",
+        SaunaTogether => "和对方一起蒸桑拿",
     }
 }
 
@@ -5332,6 +5346,7 @@ mod tests {
                 "在坐火车",
                 "在飞机上",
                 "在开车",
+                "上厕所中",
             ]
         );
     }
@@ -6561,6 +6576,9 @@ mod tests {
             UserAction::Threaten,
             UserAction::Trick,
             UserAction::Strip,
+            UserAction::ShowerTogether,
+            UserAction::BathTogether,
+            UserAction::SaunaTogether,
             UserAction::Custom {
                 text: "捏了捏你的脸".into(),
             },
@@ -6593,8 +6611,33 @@ mod tests {
                 "威胁你",
                 "想捉弄你",
                 "伸手想脱你的衣服",
+                "想和你一起淋浴",
+                "想和你一起泡澡",
+                "想和你一起蒸桑拿",
                 "捏了捏你的脸",
             ]
+        );
+    }
+
+    /// Spec 2026-11-20-together-actions-state-in-picture-and-genome-routes-
+    /// design.md §5.
+    #[test]
+    fn a_together_action_reads_as_an_ask_and_its_event_as_her_state() {
+        use eros_engine_core::events::EventKind;
+        assert_eq!(
+            action_outcome(&UserAction::ShowerTogether, ActionResponse::Accept),
+            "对方想和你一起淋浴，你接受了。"
+        );
+        for (a, label) in [
+            (UserAction::ShowerTogether, "和对方一起淋浴"),
+            (UserAction::BathTogether, "和对方一起洗澡"),
+            (UserAction::SaunaTogether, "和对方一起蒸桑拿"),
+        ] {
+            assert_eq!(event_label(a.together_kind().unwrap()), label, "{a:?}");
+        }
+        assert_eq!(
+            current_state(Some(EventKind::ShortTrip), Some(EventKind::SaunaTogether)).as_deref(),
+            Some("短途旅游；和对方一起蒸桑拿")
         );
     }
 
@@ -7408,6 +7451,20 @@ mod tests {
     }
 
     #[test]
+    fn a_vehicle_or_a_horse_has_no_effect_word() {
+        for item in [
+            GivenItem::Car,
+            GivenItem::Motorcycle,
+            GivenItem::Boat,
+            GivenItem::Horse,
+        ] {
+            for level in 1..=4 {
+                assert_eq!(effect_word(item, level), "", "{item:?} level {level}");
+            }
+        }
+    }
+
+    #[test]
     fn given_phrase_covers_the_new_categories() {
         for (item, unit, word) in [
             (GivenItem::Food, "份", "吃的"),
@@ -7427,6 +7484,10 @@ mod tests {
             (GivenItem::Flower, "朵", "花"),
             (GivenItem::Cuisine, "道", "菜"),
             (GivenItem::Jewelry, "件", "首饰"),
+            (GivenItem::Car, "辆", "汽车"),
+            (GivenItem::Motorcycle, "辆", "摩托车"),
+            (GivenItem::Boat, "艘", "船"),
+            (GivenItem::Horse, "匹", "马"),
         ] {
             assert_eq!(given_phrase(item, None, 2), format!("2 {unit}{word}"));
             assert_eq!(

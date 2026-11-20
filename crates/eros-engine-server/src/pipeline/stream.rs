@@ -2830,15 +2830,16 @@ fn render_product_qa_pairs(pairs: &[(String, String)]) -> String {
         .join("\n")
 }
 
-/// The action type a `photo`, `strip` or `ask_dancing` turn changes to, or
-/// `None` when the plan stands (spec 2026-11-08-five-actions-two-items-
-/// gluttony-card-1-1-design.md §2.3, 2026-11-08-strip-and-world-setting-
-/// design.md §2.2, 2026-11-19-vehicles-actions-species-design.md §4): an
-/// accepted one with an image executor shows her picture after her words,
-/// always of her face; any other is text only, even when the judge proposed a
-/// picture. A `date` turn is always text only, whatever her answer (spec
-/// 2026-11-12-activity-sub-session-design.md §4.6), so an accepted one reaches
-/// the text reply, where the date opens.
+/// The action type a `photo`, `strip`, `ask_dancing` or together action turn
+/// changes to, or `None` when the plan stands (spec 2026-11-08-five-actions-
+/// two-items-gluttony-card-1-1-design.md §2.3, 2026-11-08-strip-and-world-
+/// setting-design.md §2.2, 2026-11-19-vehicles-actions-species-design.md §4,
+/// 2026-11-20-together-actions-state-in-picture-and-genome-routes-design.md
+/// §5): an accepted one with an image executor shows her picture after her
+/// words, always of her face; any other is text only, even when the judge
+/// proposed a picture. A `date` turn is always text only, whatever her answer
+/// (spec 2026-11-12-activity-sub-session-design.md §4.6), so an accepted one
+/// reaches the text reply, where the date opens.
 fn picture_action(
     event: &eros_engine_core::types::Event,
     plan: &eros_engine_core::types::ActionPlan,
@@ -2856,7 +2857,14 @@ fn picture_action(
         && !matches!(
             event,
             Event::UserMessage {
-                action: Some(UserAction::Photo | UserAction::Strip | UserAction::AskDancing),
+                action: Some(
+                    UserAction::Photo
+                        | UserAction::Strip
+                        | UserAction::AskDancing
+                        | UserAction::ShowerTogether
+                        | UserAction::BathTogether
+                        | UserAction::SaunaTogether
+                ),
                 ..
             }
         )
@@ -2881,12 +2889,65 @@ fn picture_action(
     (!stands).then_some(target)
 }
 
-/// An action refused before the judge (a give the habit roll refused, a strip
-/// an incompatible pair cannot have, a date the gate turns down) is refused,
-/// whatever the judge or the rule engine settled on.
+/// An action refused before the judge (a give the habit roll refused, a strip,
+/// shower or bath together an incompatible pair cannot have, a date the gate
+/// turns down) is refused, whatever the judge or the rule engine settled on.
 fn apply_forced_refusal(plan: &mut eros_engine_core::types::ActionPlan, refused: bool) {
     if refused && plan.action_response.is_some() {
         plan.action_response = Some(eros_engine_core::types::ActionResponse::Refuse);
+    }
+}
+
+/// The event an accepted together action puts her in (spec 2026-11-20-
+/// together-actions-state-in-picture-and-genome-routes-design.md §5); `None`
+/// on any other turn.
+fn accepted_together(
+    action: Option<&eros_engine_core::types::UserAction>,
+    response: Option<eros_engine_core::types::ActionResponse>,
+) -> Option<eros_engine_core::events::EventKind> {
+    match response {
+        Some(eros_engine_core::types::ActionResponse::Accept) => action?.together_kind(),
+        _ => None,
+    }
+}
+
+/// Store the turn's decided `response` on its user row. An accepted together
+/// action outside a date's sub-session also places its event, keyed on the
+/// user row and starting now, in the same write (spec 2026-11-20-together-
+/// actions-state-in-picture-and-genome-routes-design.md §5). The two share one
+/// transaction: a failed write loses both the stored answer and the event,
+/// never the reply already sent.
+async fn store_action_response(
+    chat_repo: &ChatRepo<'_>,
+    user_msg: &PersistedUserMessage,
+    response: eros_engine_core::types::ActionResponse,
+    on_date: bool,
+) {
+    let kind = accepted_together(user_msg.action.as_ref(), Some(response)).filter(|_| !on_date);
+    let event_key = kind.map(|k| format!("action:{}:{}", user_msg.user_message_id, k.as_str()));
+    let roll: f64 = rand::thread_rng().gen();
+    let now = chrono::Utc::now();
+    let place = kind.zip(event_key.as_deref()).map(|(kind, event_key)| {
+        eros_engine_store::events::NewEvent {
+            instance_id: user_msg.instance_id,
+            session_id: user_msg.session_id,
+            event_key,
+            kind,
+            started_at: now,
+            ends_at: now + eros_engine_core::events::lasts(kind, roll),
+        }
+    });
+    if let Err(e) = chat_repo
+        .set_action_response(
+            user_msg.user_message_id,
+            response,
+            user_msg.instance_id,
+            user_msg.user_locale.timezone,
+            place.as_ref(),
+        )
+        .await
+    {
+        tracing::warn!("stream: action response write failed: {e}");
     }
 }
 
@@ -2997,8 +3058,10 @@ fn build_pde_ctx(
     // action refused before the judge (a give the habit roll refused, spec
     // 2026-10-28-outing-indulgence-needs-and-habits-design.md §3.1; a strip an
     // incompatible pair cannot have, spec 2026-11-08-strip-and-world-setting-
-    // design.md §2.1; a date the gate turns down, spec 2026-11-12-activity-sub-
-    // session-design.md §4.3) states the outcome, not the reason.
+    // design.md §2.1, and so is a shower or bath together, spec 2026-11-20-
+    // together-actions-state-in-picture-and-genome-routes-design.md §5; a
+    // date the gate turns down, spec 2026-11-12-activity-sub-session-
+    // design.md §4.3) states the outcome, not the reason.
     let action_line = match &input.event {
         eros_engine_core::types::Event::UserMessage {
             action: Some(a), ..
@@ -3011,7 +3074,12 @@ fn build_pde_ctx(
             match (refused_before_judge, a) {
                 (false, _) => "",
                 (true, eros_engine_core::types::UserAction::Strip) => "，这次你不会让对方这样做",
-                (true, eros_engine_core::types::UserAction::Date { .. }) => "，这次你不会答应",
+                (
+                    true,
+                    eros_engine_core::types::UserAction::Date { .. }
+                    | eros_engine_core::types::UserAction::ShowerTogether
+                    | eros_engine_core::types::UserAction::BathTogether,
+                ) => "，这次你不会答应",
                 (true, _) => "，这次你不会收下",
             }
         ),
@@ -5182,9 +5250,9 @@ pub(crate) fn run_stream_with(
         // forced image turn. The composer generates from the recent scene now
         // that no seed exists, so a forced image with the judge disabled must
         // not lose that context; rule-based `pde::decide` never picks image
-        // actions, so `force_image` and the picture of a photo, strip or
-        // ask_dancing turn (spec 2026-11-08 §2.3) are the judge-less image
-        // paths.
+        // actions, so `force_image` and the picture of a photo, strip,
+        // ask_dancing or together action turn (spec 2026-11-08 §2.3) are the
+        // judge-less image paths.
         let picture_turn = image_executor_available
             && matches!(
                 &input.event,
@@ -5193,6 +5261,9 @@ pub(crate) fn run_stream_with(
                         eros_engine_core::types::UserAction::Photo
                             | eros_engine_core::types::UserAction::Strip
                             | eros_engine_core::types::UserAction::AskDancing
+                            | eros_engine_core::types::UserAction::ShowerTogether
+                            | eros_engine_core::types::UserAction::BathTogether
+                            | eros_engine_core::types::UserAction::SaunaTogether
                     ),
                     ..
                 }
@@ -5217,6 +5288,9 @@ pub(crate) fn run_stream_with(
         // world-setting-design.md §2.1): decided here too, so the judge writes
         // for the outcome.
         let strip_refused = pde::strip_ruled_out(&input.event);
+        // So is a shower or bath together (spec 2026-11-20-together-actions-
+        // state-in-picture-and-genome-routes-design.md §5).
+        let together_refused = pde::together_ruled_out(&input.event);
         // A date she cannot go on (spec 2026-11-12-activity-sub-session-
         // design.md §4.3): she is offline, or a `mid` one is asked below bond
         // tier 2. On the decayed affinity this turn reads. Another date of
@@ -5244,7 +5318,7 @@ pub(crate) fn run_stream_with(
             affinity.bond_tier(),
             offline_now || other_date_on,
         );
-        let refused_before_judge = give_refused || strip_refused || date_refused;
+        let refused_before_judge = give_refused || strip_refused || together_refused || date_refused;
         let (mut plan, pde_run): (eros_engine_core::types::ActionPlan, Option<PdeDecisionRun>) =
             match resolved_pde.as_ref() {
                 Some(p) => {
@@ -5353,9 +5427,9 @@ pub(crate) fn run_stream_with(
         // the response.
         apply_forced_refusal(&mut plan, refused_before_judge);
 
-        // A photo she let the user take, or a strip she let happen, comes back
-        // as her picture after her words; a refused one is text only (spec
-        // 2026-11-08 §2.3, 2026-11-08-strip-and-world-setting-design.md §2.2).
+        // A photo she let the user take, a strip she let happen, a dance or a
+        // together action she accepted comes back as her picture after her
+        // words; a refused one is text only (`picture_action`).
         // Before the forced-image override, which still wins, except on a
         // date turn: that one never produces a picture (spec 2026-11-12-
         // activity-sub-session-design.md §4.6).
@@ -5994,8 +6068,15 @@ pub(crate) fn run_stream_with(
                 // comes from `input.persona` (the local `persona` binding was moved
                 // into `input` above).
                 //
-                // What she is doing at this turn, for the composer's `[此刻状态]`.
-                let picture_state = picture_state_of(&current, None);
+                // What she is doing at this turn, for the composer's `[此刻状态]`:
+                // an accepted together action's event counts as live, though it
+                // is stored only with her answer, and never on a date (spec
+                // 2026-11-20-together-actions-state-in-picture-and-genome-
+                // routes-design.md §5).
+                let picture_state = picture_state_of(
+                    &current,
+                    accepted_together(user_msg.action.as_ref(), plan.action_response),
+                );
                 let mut image_only_done = false;
                 let mut image_only_produced: Vec<crate::pipeline::post_process::ProducedMessage> =
                     Vec::new();
@@ -6119,19 +6200,9 @@ pub(crate) fn run_stream_with(
                     yield final_frame;
 
                     // Stored right before post-process is spawned, with no other
-                    // await between them. A failed write only loses the stored copy.
+                    // await between them.
                     if let Some(response) = plan.action_response {
-                        if let Err(e) = chat_repo
-                            .set_action_response(
-                                user_msg.user_message_id,
-                                response,
-                                user_msg.instance_id,
-                                user_msg.user_locale.timezone,
-                            )
-                            .await
-                        {
-                            tracing::warn!("stream: action response write failed: {e}");
-                        }
+                        store_action_response(&chat_repo, &user_msg, response, on_date).await;
                     }
                     let state_bg = (*state).clone();
                     let mut plan_bg = plan.clone();
@@ -6710,19 +6781,9 @@ pub(crate) fn run_stream_with(
                 yield final_frame;
 
                 // Stored right before post-process is spawned, with no other
-                // await between them. A failed write only loses the stored copy.
+                // await between them.
                 if let Some(response) = plan.action_response.filter(|_| !answer_stored) {
-                    if let Err(e) = chat_repo
-                        .set_action_response(
-                            user_msg.user_message_id,
-                            response,
-                            user_msg.instance_id,
-                            user_msg.user_locale.timezone,
-                        )
-                        .await
-                    {
-                        tracing::warn!("stream: action response write failed: {e}");
-                    }
+                    store_action_response(&chat_repo, &user_msg, response, on_date).await;
                 }
                 // Spawn post-process; do not await.
                 let state_bg = (*state).clone();
@@ -11319,6 +11380,325 @@ data: [DONE]\n\n";
         .await;
         assert_eq!(action_response_of(&frames), "refuse");
         assert_eq!(meta_action_type(&frames), FrameActionType::ReplyImage);
+    }
+
+    // ─── Together actions (spec 2026-11-20-together-actions-state-in-picture-
+    // and-genome-routes-design.md §5) ───
+
+    /// One together action in a fresh main chat with `events` under way, on
+    /// scopes that are romance-compatible when `compatible`. The judge
+    /// answers `response` with a text reply; `None` configures no judge, so
+    /// the rule engine accepts. With `image` pictures are available: a
+    /// composer is configured and fails. Returns the frames, every body sent
+    /// to the composer, and the user row.
+    async fn run_together_turn(
+        pool: &PgPool,
+        action: eros_engine_core::types::UserAction,
+        response: Option<&str>,
+        compatible: bool,
+        events: &[EventSeed],
+        image: bool,
+    ) -> (Vec<ProtocolFrame>, String, Uuid) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"composer\""))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+        if let Some(response) = response {
+            let verdict = serde_json::json!({
+                "action": "reply_text", "inner_state": "", "action_response": response
+            });
+            let judge_body = serde_json::json!({
+                "id": "gj", "model": "pde/judge",
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "choices": [{"message": {"content": verdict.to_string()}}],
+            });
+            Mock::given(wm_path("/api/v1/chat/completions"))
+                .and(body_string_contains("pde/judge"))
+                .respond_with(
+                    crate::pipeline::reasoning_call::test_support::sse_completion(judge_body),
+                )
+                .mount(&mock)
+                .await;
+        }
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"REPLY\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"deepseek/x\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_genome_id, instance_id, session_id) = seed_persona_and_session(pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(&format!(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n{}{}",
+                if response.is_some() {
+                    "[tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide.\"\n"
+                } else {
+                    ""
+                },
+                if image {
+                    "[tasks.chat_image_prompt_compose]\nmodel=\"composer\"\n"
+                } else {
+                    ""
+                },
+            ))
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        // Embeddings go to the mock too, which mounts none: recall and the
+        // memory write fail at once instead of reaching a real endpoint.
+        state.embed = std::sync::Arc::new(
+            eros_engine_llm::embedding::EmbeddingRouter::from_config_with(
+                &eros_engine_llm::model_config::ModelConfig::from_toml_str(&format!(
+                    "[providers.mockembed]\nembeddings = \"{}/v1/embeddings\"\n\
+                     [tasks.embedding]\nmodel = \"mock-embed@mockembed\"\n",
+                    mock.uri()
+                ))
+                .unwrap(),
+                |k| (k == "MOCKEMBED_API_KEY").then(|| "test-key".to_string()),
+            )
+            .unwrap(),
+        );
+        seed_events(pool, user_id, instance_id, session_id, events).await;
+        let meta = serde_json::json!({"action": serde_json::to_value(&action).unwrap()});
+        let umid = match (ChatRepo { pool })
+            .upsert_user_message_idempotent(
+                session_id,
+                "",
+                "01JTOGETHER000000000000000",
+                "user",
+                Some(&meta),
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+        let (memory_scope, affinity_scope) = if compatible {
+            (
+                eros_engine_core::scope::MemoryScope::Full,
+                eros_engine_core::scope::AffinityScope::full(),
+            )
+        } else {
+            Default::default()
+        };
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: String::new(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope,
+                affinity_scope,
+                image_url: None,
+                image: image.then(Default::default),
+                quote: Default::default(),
+                user_locale: Default::default(),
+                action: Some(action),
+                outfit: None,
+            },
+            None,
+        )
+        .collect()
+        .await;
+        let composer = mock
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .filter(|b| b.contains("\"model\":\"composer\""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (frames, composer, umid)
+    }
+
+    /// `(event_key, session_id, started_at, ends_at)` of every event of `kind`.
+    async fn events_of_kind(
+        pool: &PgPool,
+        kind: &str,
+    ) -> Vec<(
+        String,
+        Option<Uuid>,
+        chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
+    )> {
+        sqlx::query_as(
+            "SELECT event_key, session_id, started_at, ends_at \
+               FROM engine.persona_events WHERE kind = $1",
+        )
+        .bind(kind)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn session_of(pool: &PgPool, message: Uuid) -> Uuid {
+        sqlx::query_scalar("SELECT session_id FROM engine.chat_messages WHERE id = $1")
+            .bind(message)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    fn image_requests(frames: &[ProtocolFrame]) -> usize {
+        frame_type_names(frames)
+            .iter()
+            .filter(|t| *t == "image_request")
+            .count()
+    }
+
+    /// An accepted shower places a 30-minute `showering_together` with her
+    /// answer: the incident under way ends where it starts, the trip keeps
+    /// going, and the picture is told she is in it.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_accepted_shower_places_the_event_and_shows_it(pool: PgPool) {
+        let (frames, composer, umid) = run_together_turn(
+            &pool,
+            eros_engine_core::types::UserAction::ShowerTogether,
+            None,
+            true,
+            &[ev("working_out", 10, 50), ev("short_trip", 600, 2000)],
+            true,
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        assert_eq!(meta_action_type(&frames), FrameActionType::ReplyTextImage);
+        assert_eq!(image_requests(&frames), 1);
+        assert!(
+            composer.contains("[此刻状态]\\n短途旅游；和对方一起淋浴\\n"),
+            "{composer}"
+        );
+
+        let placed = events_of_kind(&pool, "showering_together").await;
+        assert_eq!(placed.len(), 1, "{placed:?}");
+        let (key, session, started, ends) = placed[0].clone();
+        assert_eq!(key, format!("action:{umid}:showering_together"));
+        assert_eq!(session, Some(session_of(&pool, umid).await));
+        assert_eq!(ends - started, chrono::Duration::minutes(30));
+        let (_, _, _, incident_ends) = events_of_kind(&pool, "working_out").await[0].clone();
+        assert_eq!(incident_ends, started, "the incident under way ends");
+        let (_, _, trip_start, trip_end) = events_of_kind(&pool, "short_trip").await[0].clone();
+        assert_eq!(
+            trip_end - trip_start,
+            chrono::Duration::minutes(2600),
+            "the trip keeps going"
+        );
+    }
+
+    /// Without an image executor the reply is text only, and the event is
+    /// placed all the same.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_accepted_sauna_without_an_executor_still_places_the_event(pool: PgPool) {
+        let (frames, composer, umid) = run_together_turn(
+            &pool,
+            eros_engine_core::types::UserAction::SaunaTogether,
+            None,
+            false,
+            &[],
+            false,
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        assert_eq!(meta_action_type(&frames), FrameActionType::Reply);
+        assert_eq!(image_requests(&frames), 0);
+        assert!(composer.is_empty(), "{composer}");
+        let placed = events_of_kind(&pool, "sauna_together").await;
+        assert_eq!(placed.len(), 1, "{placed:?}");
+        let (key, _, started, ends) = placed[0].clone();
+        assert_eq!(key, format!("action:{umid}:sauna_together"));
+        assert_eq!(ends - started, chrono::Duration::hours(1));
+    }
+
+    /// An accepted bath places a 30-minute `bathing_together`, the kind her
+    /// own `bathe_together` ask places, keyed on the user row.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_accepted_bath_places_bathing_together(pool: PgPool) {
+        let (frames, _, umid) = run_together_turn(
+            &pool,
+            eros_engine_core::types::UserAction::BathTogether,
+            None,
+            true,
+            &[],
+            true,
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        let placed = events_of_kind(&pool, "bathing_together").await;
+        assert_eq!(placed.len(), 1, "{placed:?}");
+        let (key, session, started, ends) = placed[0].clone();
+        assert_eq!(key, format!("action:{umid}:bathing_together"));
+        assert_eq!(session, Some(session_of(&pool, umid).await));
+        assert_eq!(ends - started, chrono::Duration::minutes(30));
+    }
+
+    /// The judge's refusal drops chemistry like any physical gesture, shows
+    /// no picture, and places nothing: the incident under way runs on.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_refused_bath_drops_chemistry_and_places_nothing(pool: PgPool) {
+        let (frames, _, umid) = run_together_turn(
+            &pool,
+            eros_engine_core::types::UserAction::BathTogether,
+            Some("refuse"),
+            true,
+            &[ev("working_out", 10, 50)],
+            true,
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "refuse");
+        assert_eq!(meta_action_type(&frames), FrameActionType::Reply);
+        assert_eq!(image_requests(&frames), 0);
+        assert!(events_of_kind(&pool, "bathing_together").await.is_empty());
+        let (_, _, start, end) = events_of_kind(&pool, "working_out").await[0].clone();
+        assert_eq!(end - start, chrono::Duration::minutes(60));
+        let (context, _) = turn_affinity_row(&pool, umid).await;
+        assert_eq!(context["tier_drop"], "chemistry", "{context}");
+    }
+
+    /// An incompatible pair's shower is refused before the judge: with no
+    /// judge the rule engine would accept it. It drops chemistry, shows no
+    /// picture and places nothing.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_incompatible_pair_never_showers_together(pool: PgPool) {
+        let (frames, _, umid) = run_together_turn(
+            &pool,
+            eros_engine_core::types::UserAction::ShowerTogether,
+            None,
+            false,
+            &[],
+            true,
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "refuse");
+        assert_eq!(meta_action_type(&frames), FrameActionType::Reply);
+        assert_eq!(image_requests(&frames), 0);
+        assert!(events_of_kind(&pool, "showering_together").await.is_empty());
+        let (context, _) = turn_affinity_row(&pool, umid).await;
+        assert_eq!(context["tier_drop"], "chemistry", "{context}");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -20207,8 +20587,10 @@ data: [DONE]\n\n";
         use eros_engine_core::types::ActionResponse::{Accept, Refuse};
         use eros_engine_core::types::ActionType::{ReplyImage, ReplyText, ReplyTextImage};
         use eros_engine_core::types::DateDuration;
-        use eros_engine_core::types::UserAction::{AskDancing, Kiss, Photo, Strip};
-        let cases = [
+        use eros_engine_core::types::UserAction::{
+            AskDancing, BathTogether, Kiss, Photo, SaunaTogether, ShowerTogether, Strip,
+        };
+        let mut cases = vec![
             (Kiss, Accept, ReplyText, true, None),
             (Photo, Accept, ReplyText, true, Some(ReplyTextImage)),
             (Photo, Accept, ReplyImage, true, Some(ReplyTextImage)),
@@ -20248,6 +20630,18 @@ data: [DONE]\n\n";
                 Some(ReplyText),
             ),
         ];
+        // A together action is a picture turn when accepted (spec
+        // 2026-11-20-together-actions-state-in-picture-and-genome-routes-
+        // design.md §5).
+        for a in [ShowerTogether, BathTogether, SaunaTogether] {
+            cases.extend([
+                (a.clone(), Accept, ReplyText, true, Some(ReplyTextImage)),
+                (a.clone(), Accept, ReplyImage, true, Some(ReplyTextImage)),
+                (a.clone(), Accept, ReplyText, false, None),
+                (a.clone(), Refuse, ReplyTextImage, true, Some(ReplyText)),
+                (a, Refuse, ReplyText, true, None),
+            ]);
+        }
         for (a, response, ty, available, want) in cases {
             let mut input = fixture_decision_input();
             if let Event::UserMessage { action, .. } = &mut input.event {
@@ -20329,6 +20723,16 @@ data: [DONE]\n\n";
         assert!(
             strip.contains("[用户动作] 对方伸手想脱你的衣服，这次你不会让对方这样做\n"),
             "{strip}"
+        );
+        let shower = ctx_for(UserAction::ShowerTogether);
+        assert!(
+            shower.contains("[用户动作] 对方想和你一起淋浴，这次你不会答应\n"),
+            "{shower}"
+        );
+        let bath = ctx_for(UserAction::BathTogether);
+        assert!(
+            bath.contains("[用户动作] 对方想和你一起泡澡，这次你不会答应\n"),
+            "{bath}"
         );
         let give = ctx_for(UserAction::Give {
             item: GivenItem::Cigarette,
@@ -22768,6 +23172,41 @@ data: [DONE]\n\n"
         assert_eq!(
             picture_state_of(&background_only, Some(TakingSelfie)).as_deref(),
             Some("短途旅游；刚拍了张自拍")
+        );
+    }
+
+    /// Only an accepted together action names a kind for the picture; on a
+    /// date it takes `on_a_date`'s place there (spec 2026-11-20-together-
+    /// actions-state-in-picture-and-genome-routes-design.md §5).
+    #[test]
+    fn an_accepted_together_action_is_her_state_for_the_turn() {
+        use eros_engine_core::events::EventKind;
+        use eros_engine_core::types::ActionResponse::{Accept, Refuse};
+        use eros_engine_core::types::UserAction;
+        let shower = Some(&UserAction::ShowerTogether);
+        assert_eq!(
+            accepted_together(shower, Some(Accept)),
+            Some(EventKind::ShoweringTogether)
+        );
+        assert_eq!(accepted_together(shower, Some(Refuse)), None);
+        assert_eq!(accepted_together(shower, None), None);
+        assert_eq!(
+            accepted_together(Some(&UserAction::Strip), Some(Accept)),
+            None
+        );
+        assert_eq!(accepted_together(None, None), None);
+        let on_a_date = eros_engine_store::events::CurrentEvents {
+            foreground: Some(live_event(EventKind::OnADate)),
+            background: None,
+            at: chrono::DateTime::UNIX_EPOCH,
+        };
+        assert_eq!(
+            picture_state_of(
+                &on_a_date,
+                accepted_together(Some(&UserAction::SaunaTogether), Some(Accept))
+            )
+            .as_deref(),
+            Some("和对方一起蒸桑拿")
         );
     }
 
@@ -27169,6 +27608,64 @@ data: [DONE]\n\n"
         .unwrap();
         assert_eq!(bond_tier, 2);
         assert_eq!(s.sub_affinity_rows().await, 0);
+    }
+
+    /// A together action accepted on a date places nothing: the date goes on.
+    /// The picture is still drawn, told she is in the action's event for
+    /// this turn (spec 2026-11-20-together-actions-state-in-picture-and-
+    /// genome-routes-design.md §5).
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_together_action_on_a_date_places_nothing(pool: PgPool) {
+        let s = date_scene(
+            &pool,
+            serde_json::json!({"action": "reply_text", "inner_state": "", "action_response": "accept"}),
+            "[tasks.chat_image_prompt_compose]\nmodel=\"composer\"\n",
+        )
+        .await;
+
+        let (frames, _) = s
+            .send(
+                1,
+                serde_json::json!({
+                    "content": "",
+                    "action": {"type": "sauna_together"},
+                    "image": {},
+                }),
+            )
+            .await;
+        assert!(
+            frames
+                .iter()
+                .any(|f| f["type"] == "action_response" && f["response"] == "accept"),
+            "{frames:?}"
+        );
+        assert!(
+            frames.iter().any(|f| f["type"] == "image_request"),
+            "{frames:?}"
+        );
+        let composer = s
+            .mock
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .filter(|b| b.contains("\"model\":\"composer\""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            composer.contains("[此刻状态]\\n和对方一起蒸桑拿\\n"),
+            "{composer}"
+        );
+
+        assert!(events_of_kind(&pool, "sauna_together").await.is_empty());
+        let date_ends: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT ends_at FROM engine.persona_events WHERE id = $1")
+                .bind(s.activity.event_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(Some(date_ends), s.activity.ends_at, "the date goes on");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::affinity::{Affinity, AffinityDeltas, AffinityLine};
+use crate::events::EventKind;
 use crate::persona::CompanionPersona;
 use crate::scope::{AffinityScope, MemoryScope};
 
@@ -144,6 +145,14 @@ pub enum UserAction {
     /// The user undresses her; only a romance-compatible pair can have it
     /// accepted (spec 2026-11-08-strip-and-world-setting-design.md §2).
     Strip,
+    /// The user asks to shower, take a bath or take a sauna with her (spec
+    /// 2026-11-20-together-actions-state-in-picture-and-genome-routes-
+    /// design.md §5). Accepted, she is in the event `together_kind` names,
+    /// and the turn shows her picture when pictures are available; only a
+    /// romance-compatible pair can have a shower or a bath accepted.
+    ShowerTogether,
+    BathTogether,
+    SaunaTogether,
     Custom {
         text: String,
     },
@@ -212,9 +221,22 @@ impl UserAction {
                 | UserAction::HugFromBehind
                 | UserAction::Touch
                 | UserAction::Strip
+                | UserAction::ShowerTogether
+                | UserAction::BathTogether
                 | UserAction::Threaten
                 | UserAction::Tip { .. }
         )
+    }
+
+    /// The event an accepted together action puts her in: `None` for every
+    /// other action.
+    pub fn together_kind(&self) -> Option<EventKind> {
+        match self {
+            UserAction::ShowerTogether => Some(EventKind::ShoweringTogether),
+            UserAction::BathTogether => Some(EventKind::BathingTogether),
+            UserAction::SaunaTogether => Some(EventKind::SaunaTogether),
+            _ => None,
+        }
     }
 
     /// The line a refusal of this action drops: handing something over or
@@ -263,6 +285,10 @@ pub enum GivenItem {
     CreditCard,
     Flower,
     Jewelry,
+    Car,
+    Motorcycle,
+    Boat,
+    Horse,
 }
 
 /// Which of the persona's lists an item belongs to (spec
@@ -484,7 +510,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn seven_actions_speak_emotionally() {
+    fn nine_actions_speak_emotionally() {
         let every = [
             UserAction::Give {
                 item: GivenItem::Food,
@@ -508,6 +534,9 @@ mod tests {
             UserAction::Threaten,
             UserAction::Trick,
             UserAction::Strip,
+            UserAction::ShowerTogether,
+            UserAction::BathTogether,
+            UserAction::SaunaTogether,
             UserAction::Custom { text: "x".into() },
             UserAction::Tip { amount_usd: 5.0 },
             UserAction::Gift {
@@ -525,9 +554,54 @@ mod tests {
                 &UserAction::Tease,
                 &UserAction::Threaten,
                 &UserAction::Strip,
+                &UserAction::ShowerTogether,
+                &UserAction::BathTogether,
                 &UserAction::Tip { amount_usd: 5.0 },
             ]
         );
+    }
+
+    /// Spec 2026-11-20-together-actions-state-in-picture-and-genome-routes-
+    /// design.md §5.
+    #[test]
+    fn the_together_actions_name_their_events() {
+        for (a, wire, kind) in [
+            (
+                UserAction::ShowerTogether,
+                "shower_together",
+                EventKind::ShoweringTogether,
+            ),
+            (
+                UserAction::BathTogether,
+                "bath_together",
+                EventKind::BathingTogether,
+            ),
+            (
+                UserAction::SaunaTogether,
+                "sauna_together",
+                EventKind::SaunaTogether,
+            ),
+        ] {
+            let v = serde_json::json!({ "type": wire });
+            assert_eq!(serde_json::to_value(&a).unwrap(), v);
+            assert_eq!(serde_json::from_value::<UserAction>(v).unwrap(), a);
+            assert_eq!(a.together_kind(), Some(kind), "{a:?}");
+            assert_eq!(a.refusal_line(), Some(AffinityLine::Chemistry), "{a:?}");
+        }
+        for a in [
+            UserAction::Kiss,
+            UserAction::Strip,
+            UserAction::AskDancing,
+            UserAction::Photo,
+            UserAction::Custom { text: "x".into() },
+            UserAction::Date {
+                duration: DateDuration::Short,
+                place: "海边".into(),
+                content: "看海".into(),
+            },
+        ] {
+            assert_eq!(a.together_kind(), None, "{a:?}");
+        }
     }
 
     #[test]
@@ -778,6 +852,9 @@ mod tests {
             UserAction::AskDancing,
             UserAction::Photo,
             UserAction::Strip,
+            UserAction::ShowerTogether,
+            UserAction::BathTogether,
+            UserAction::SaunaTogether,
             UserAction::Custom { text: "x".into() },
         ] {
             assert_eq!(a.refusal_line().unwrap(), AffinityLine::Chemistry, "{a:?}");
@@ -862,6 +939,10 @@ mod tests {
             (GivenItem::Flower, "flower"),
             (GivenItem::Cuisine, "cuisine"),
             (GivenItem::Jewelry, "jewelry"),
+            (GivenItem::Car, "car"),
+            (GivenItem::Motorcycle, "motorcycle"),
+            (GivenItem::Boat, "boat"),
+            (GivenItem::Horse, "horse"),
         ] {
             assert_eq!(serde_json::to_value(item).unwrap(), wire);
             assert_eq!(

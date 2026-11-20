@@ -282,6 +282,35 @@ impl EventRepo<'_> {
         })
     }
 
+    /// [`Self::insert_preempting_in_tx`] for the event an accepted together
+    /// action puts her in (spec 2026-11-20-together-actions-state-in-picture-
+    /// and-genome-routes-design.md §5), unless `event_key` is already written
+    /// in the session, as by an earlier drive of the same turn, or a date of
+    /// the instance has not ended at `started_at`, whose `on_a_date` stays as
+    /// it is. Takes the instance's lock first, so a second driver of the turn,
+    /// or a date being opened, is waited for and then seen. Nothing here
+    /// commits.
+    pub async fn place_together_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        e: &NewEvent<'_>,
+    ) -> Result<(), sqlx::Error> {
+        lock_instance(tx, e.instance_id).await?;
+        let written: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM engine.persona_events \
+                             WHERE session_id = $1 AND event_key = $2)",
+        )
+        .bind(e.session_id)
+        .bind(e.event_key)
+        .fetch_one(&mut **tx)
+        .await?;
+        if written || crate::activity::date_on(&mut **tx, e.instance_id, None, e.started_at).await?
+        {
+            return Ok(());
+        }
+        Self::insert_preempting_in_tx(tx, e).await?;
+        Ok(())
+    }
+
     /// The event written in this session under `event_key`.
     pub async fn by_key(
         &self,

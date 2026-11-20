@@ -74,6 +74,21 @@ pub fn strip_ruled_out(event: &Event) -> bool {
     }
 }
 
+/// Whether this turn's `shower_together` or `bath_together` is ruled out
+/// before the judge (spec 2026-11-20-together-actions-state-in-picture-and-
+/// genome-routes-design.md §5): the turn's scopes are not romance-compatible,
+/// as for `strip`. A `sauna_together` never is.
+pub fn together_ruled_out(event: &Event) -> bool {
+    match event {
+        Event::UserMessage {
+            action: Some(UserAction::ShowerTogether | UserAction::BathTogether),
+            affinity_scope,
+            ..
+        } => !crate::scope::romance_compatible(*affinity_scope),
+        _ => false,
+    }
+}
+
 /// Whether this turn's `date` is ruled out before the judge (spec
 /// 2026-11-12-activity-sub-session-design.md): she is out of reach, or the
 /// date is a `mid` one and the bond is below tier 2. Not a roll: such an
@@ -1003,6 +1018,51 @@ mod tests {
         assert!(!strip_ruled_out(&neutral_fallback));
         assert!(!strip_ruled_out(&action_msg(UserAction::Kiss)));
         assert!(!strip_ruled_out(&user_msg("hi")));
+    }
+
+    /// A shower or a bath together is ruled out before the judge exactly as a
+    /// strip is; a sauna never is (spec 2026-11-20-together-actions-state-in-
+    /// picture-and-genome-routes-design.md §5).
+    #[test]
+    fn a_shower_or_a_bath_together_needs_a_compatible_pair() {
+        use crate::scope::{AffinityScope, MemoryScope};
+        let scoped = |a: UserAction, memory: MemoryScope, affinity: AffinityScope| {
+            let mut e = action_msg(a);
+            if let Event::UserMessage {
+                memory_scope,
+                affinity_scope,
+                ..
+            } = &mut e
+            {
+                *memory_scope = memory;
+                *affinity_scope = affinity;
+            }
+            e
+        };
+        let scopes = [
+            (MemoryScope::default(), AffinityScope::default(), false),
+            (MemoryScope::Full, AffinityScope::full(), true),
+            (MemoryScope::NeutralOnly, AffinityScope::full(), true),
+        ];
+        for a in [UserAction::ShowerTogether, UserAction::BathTogether] {
+            for (memory, affinity, compatible) in scopes {
+                assert_eq!(
+                    together_ruled_out(&scoped(a.clone(), memory, affinity)),
+                    !compatible,
+                    "{a:?} {memory:?} {affinity:?}"
+                );
+            }
+        }
+        for (memory, affinity, _) in scopes {
+            assert!(!together_ruled_out(&scoped(
+                UserAction::SaunaTogether,
+                memory,
+                affinity
+            )));
+        }
+        assert!(!together_ruled_out(&action_msg(UserAction::Strip)));
+        assert!(!together_ruled_out(&action_msg(UserAction::Kiss)));
+        assert!(!together_ruled_out(&user_msg("hi")));
     }
 
     #[test]
