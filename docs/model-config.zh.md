@@ -541,8 +541,8 @@ tones = { emotional = 0.05 }
   | `compatible` | 这一轮的 `affinity_scope` 含暧昧感轴时 ×2 |
 
   `emotional = 0.05` 时，性向相容、又有一项需求成立，是 0.30；角色再是 `moody`，就是 0.90。
-- **带七种用户动作之一的 1:1 回合**（`french_kiss`、`tease`、`hug_from_behind`、`touch`、`strip`、
-  `threaten`、`tip`）一律用 `emotional`，接受、拒绝都一样。其余带动作的回合从不用 `emotional`。
+- **带九种用户动作之一的 1:1 回合**（`french_kiss`、`tease`、`hug_from_behind`、`touch`、`strip`、
+  `shower_together`、`bath_together`、`threaten`、`tip`）一律用 `emotional`，接受、拒绝都一样。其余带动作的回合从不用 `emotional`。
 - **生活事件开始时发的那条消息**，有十六种事件用 `emotional`（[life-events-needs.zh.md](life-events-needs.zh.md#她怎么讲出来)）。
 
 群聊回合、`/open` 和其他主动消息、编辑与改图回合、语音通话从不带语气。
@@ -670,7 +670,7 @@ post-process（记忆、insights、亲密度）照常跑；模型、采样、输
 
 只要还有被接受的 give 在起作用，引擎还会在 `[用户动作]` 之前加一行 `[身体状态]`，写明角色身上带着的余效（例如 `[身体状态] 3 杯「威士忌」，微醺，还在往上走`；见[接口参考](api-reference.zh.md#post-compchatsession_idmessagestream)）；没有时这一行不出现。
 
-**give 时掷的那一次。** 一轮的 `give` 是 `cigarette`、`alcohol`、`herb`、`coffee` 或 `cuisine`，而角色对应的 `art_metadata` 键（`smoking`、`alcoholic`、`drug`、`coffee`、`gluttony`）为 `false` 时，引擎在判官运行之前掷一次。三次里有一次什么都不变。其余情况 `[用户动作]` 一行末尾加上 `，这次你不会收下`（例如 `[用户动作] 对方递给你 1 支烟，这次你不会收下`），判官就按拒收来写 `inner_state`，而不管它的 `action_response` 怎么填，生效的回应都是 `refuse`；规则引擎的接受同样变成 `refuse`。这一行只陈述结果，不给理由。审计 payload 留的是判官自己的回答。键为 `true` 或不写时从不掷。这一轮 `affinity_scope` 性向不相容的 `strip` 也这样处理，只是不掷：这一行末尾加上 `，这次你不会让对方这样做`，生效的回应是 `refuse`。[门槛](activities.zh.md#门槛)不通过的 `date`（bond 不到第 2 档的 `mid` 约会，或她离线、正在另一场约会里时的任何约会）同样如此：这一行末尾加上 `，这次你不会答应`，例如 `[用户动作] 对方邀请你去约会：地点「海边」，安排「看海」，大约 4 小时，这次你不会答应`。判官的 `[角色人格]` 块不列这些键。见 [life-events-needs.zh.md](life-events-needs.zh.md#角色设置)。
+**give 时掷的那一次。** 一轮的 `give` 是 `cigarette`、`alcohol`、`herb`、`coffee` 或 `cuisine`，而角色对应的 `art_metadata` 键（`smoking`、`alcoholic`、`drug`、`coffee`、`gluttony`）为 `false` 时，引擎在判官运行之前掷一次。三次里有一次什么都不变。其余情况 `[用户动作]` 一行末尾加上 `，这次你不会收下`（例如 `[用户动作] 对方递给你 1 支烟，这次你不会收下`），判官就按拒收来写 `inner_state`，而不管它的 `action_response` 怎么填，生效的回应都是 `refuse`；规则引擎的接受同样变成 `refuse`。这一行只陈述结果，不给理由。审计 payload 留的是判官自己的回答。键为 `true` 或不写时从不掷。这一轮 `affinity_scope` 性向不相容的 `strip` 也这样处理，只是不掷：这一行末尾加上 `，这次你不会让对方这样做`，生效的回应是 `refuse`。同一条件下的 `shower_together` 和 `bath_together` 也一样，这一行末尾是 `，这次你不会答应`，例如 `[用户动作] 对方想和你一起淋浴，这次你不会答应`。[门槛](activities.zh.md#门槛)不通过的 `date`（bond 不到第 2 档的 `mid` 约会，或她离线、正在另一场约会里时的任何约会）同样如此：这一行末尾加上 `，这次你不会答应`，例如 `[用户动作] 对方邀请你去约会：地点「海边」，安排「看海」，大约 4 小时，这次你不会答应`。判官的 `[角色人格]` 块不列这些键。见 [life-events-needs.zh.md](life-events-needs.zh.md#角色设置)。
 
 **需求上下文行。** 每个有判官的回合，上下文里都有一行 `[需求]`，位于 `[身体状态]` 之前：`[需求] 社交欲=低 情感需求=高 外出=中`，即上一次判定推算到本回合的结果；第一次判定之前为 `[需求] 尚未判定`。`外出` 每次都在；只有 `indulgence` 为 `high` 时才在末尾加上 ` 享受=高`（`[需求] 社交欲=低 情感需求=高 外出=中 享受=高`），没有它就读作“不高”，参考 prompt 里也这样告诉判官。严格模式下的判官每个回合仍然要评 `indulgence`，却看不出它原来是 `low` 还是 `mid`，所以连续聊天时它每一轮都在重新猜这一项，按习惯数目的漂移只在两次评定之间起作用。
 
@@ -740,7 +740,7 @@ post-process（记忆、insights、亲密度）照常跑；模型、采样、输
 
 ### `[tasks.chat_image_prompt_compose]` — 出图 prompt 合成器（图片轮次必需）
 
-PDE judge 不再写图片 prompt 种子——它只负责决定动作、`inner_state`，以及（图片动作时）参考图/宽高比这类输入。真正产出图片 prompt 完全是这个任务的工作：图片动作一旦决定，引擎会在**决定之后、生成之前**跑一次合成器，把人格外观、此刻穿着、身体状态、最近场景、对方最新消息、所选 style、目标宽高比交给它。合成器**从这份上下文生成** prompt——它不再扩写种子，因为种子已经不存在了。
+PDE judge 不再写图片 prompt 种子——它只负责决定动作、`inner_state`，以及（图片动作时）参考图/宽高比这类输入。真正产出图片 prompt 完全是这个任务的工作：图片动作一旦决定，引擎会在**决定之后、生成之前**跑一次合成器，把人格外观、此刻穿着、身体状态、有事件进行时她此刻在做什么、最近场景、对方最新消息、所选 style、目标宽高比交给它。合成器**从这份上下文生成** prompt——它不再扩写种子，因为种子已经不存在了。
 
 **这个任务现在是图片轮次的必需项。** 不配置 `[tasks.chat_image_prompt_compose]`，引擎就没有任何办法产出图片 prompt：它会向判断器报告 `本轮可发图=否`（图片能力为假），并把任何 `reply_image` / `reply_text_image` 提案降级为 `reply_text`。要让图片轮次可用，必须配置这个块。
 
@@ -756,7 +756,7 @@ PDE judge 不再写图片 prompt 种子——它只负责决定动作、`inner_s
 
 **两个消费方，一份契约。** 除聊天流的图片轮次外，独立端点
 `POST /persona/{instance_id}/image/compose`（见
-[api-reference.zh.md](api-reference.zh.md)）跑的也是这个任务：同样的七槽位载荷
+[api-reference.zh.md](api-reference.zh.md)）跑的也是这个任务：同样的七个基础槽位
 （`[人物外观] / [此刻穿着] / [身体状态] / [最近场景] / [对方最新消息] / [风格] / [画幅]`）、同样的
 `filter_prompt` 契约——部署自定义的提示词无需任何改动即可同时服务两者。[群聊](group-chat.zh.md#导演)图片轮里导演
 安排了同框成员时，载荷在 `[此刻穿着]` 之后多一段 `[同框人物]`：那位角色的名字、外貌与性格，以及一句
@@ -767,6 +767,8 @@ PDE judge 不再写图片 prompt 种子——它只负责决定动作、`inner_s
 （该端点兼作合成器的调试面，报告失败而不是掩盖失败）。
 
 `[此刻穿着]` 是本轮穿着，取自请求的 `outfit` 或判官的 `clothing`，都没有时为 `（无）`；compose 端点固定发 `（无）`。`[身体状态]` 是角色因被接受的 give 而带着的余效（见[接口参考](api-reference.zh.md#post-compchatsession_idmessagestream)），没有时为 `（无）`；compose 端点固定发 `（无）`。
+
+`[此刻状态]` 是有事件进行时她此刻在做什么：先是背景、再是进行中的插曲的标签（每种事件一个固定的中文名），用 `；` 连接，如 `短途旅游；在坐火车`。它排在 `[身体状态]` 之后、`[最近场景]` 之前，出现在聊天流水线画的每一张图里：聊天回合的图（判官选的、强制的，或被接受的 `photo`、`strip`、`ask_dancing`、一起做的动作所出的图）、事件消息自己的图，以及群聊回合的图（写发言人自己的状态）。正在开始的事件即使还没落库也算进行中，所以事件消息的图，以及被接受的 `shower_together`、`bath_together`、`sauna_together` 的图，画的就是它们开始的那个事件。没有进行中的事件时载荷里没有这一段。独立的 compose 端点和改图端点不发这一段。引擎不改写 `[此刻穿着]`：内置提示词点出这一段，要求图里必须画出它，并说明状态与她的穿着冲突时以状态为准。自定义的 `filter_prompt` 应补一句相应的话；不补的话，模型仍会读到这一段，却没人告诉它怎么用。审计行的 `inputs` 以 `current_state` 记录它（[LLM audit → 图片链路事件表](llm-audit.zh.md#图片链路事件表)）。
 
 ```toml
 [tasks.chat_image_prompt_compose]
@@ -792,7 +794,7 @@ max_tokens   = 700
 | `repetition_penalty` | `f32` | 缺失 | 重复惩罚，`(0.0, 2.0]`（`1.0` 为恒等值）。未设置时省略。 |
 | `filter_prompt` | `String` \| `Array<String>` \| `Table<String, String>` | **内置默认** | **可选**（不同于其他任务）。空白/缺失 ⇒ 引擎内置的 `DEFAULT_COMPOSE_PROMPT`。数组/表两种形态见下方"变体"。 |
 
-**内置默认提示词。** 不同于其他每个任务（提示词必须来自配置），合成器自带一个通用、**不含产品身份**的内置默认。它**从上下文生成** prompt 和 caption——人格外观、此刻穿着、身体状态、最近场景、对方最新消息、style、宽高比——**不**软化、不降级、不审查、不拒绝，也不自带内容审核层——审核交给画图模型供应商和下游部署，不在这一步。非空 `filter_prompt` 覆盖它（且必须遵守上面的 JSON 契约）；空白/缺失则回退到它。
+**内置默认提示词。** 不同于其他每个任务（提示词必须来自配置），合成器自带一个通用、**不含产品身份**的内置默认。它**从上下文生成** prompt 和 caption——人格外观、此刻穿着、身体状态、此刻状态、最近场景、对方最新消息、style、宽高比——**不**软化、不降级、不审查、不拒绝，也不自带内容审核层——审核交给画图模型供应商和下游部署，不在这一步。非空 `filter_prompt` 覆盖它（且必须遵守上面的 JSON 契约）；空白/缺失则回退到它。
 
 **变体（variants）。** 这个任务的 `filter_prompt` 接受纯字符串以外的形态（`[tasks.chat_image_edit_compose]` 的也接受，见下文）。前端在每个 chat 轮次通过发消息请求体上的 `image.prompt_variant` 挑一个。三种形态：
 
@@ -825,7 +827,7 @@ b = """
 
 **审计。** 一次成功的合成器调用——包括上面提到的"非 JSON 回退路径"，它同样算作成功——会向图片轮次的 `chat_messages.metadata.image` 写入三个键：`compose_variant`（命中了 `filter_prompt` 的哪个 key/下标；纯字符串或内置提示词时缺失；按调用方传入的值记录（已 trim），不做归一化——例如索引形态里 `"01"` 命中下标 1，审计时仍记为 `"01"`）、`compose_model`（实际应答的模型），以及 `compose_generation_id`。只有当合成器调用本身失败（fail-open 降级）或该任务未配置时，三者才会缺失——语义与 affinity 审计三元组的 NULL 语义一致（`raw` 已不带特殊含义，因此不再是这里的独立情形）。合成器的 `caption` 单独持久化为 `metadata.image.caption`：只要回复解析为带非空 `caption` 字段的 JSON 就会被设置，否则为 `None`——包括"成功但非 JSON"的回复，此时整段回复变成 `prompt`，没有 caption。`metadata.image.prompt`——合成器的 `prompt` 字段，也就是真正的出图主体——**会**持久化在每个图片轮次上；它正是 `build_delegated_image_marker` 写入、与上面审计三元组同行的那个字段。
 
-**每一次合成器调用——不论成功失败、不论来自哪个调用方——都会另外落一行到 `engine.chat_images_events`**（迁移 0045）：完整的 usage 块、拼装出的 wire prompt（`composed_prompt`——style 预设 + 人格外观 + subject，也就是图像供应商实际会收到的那个字符串）、链路遍历的事实（`attempts` / `last_failure`），以及合成器当时看到的七个原始输入。`metadata.image.compose_event_id` 指向那一行——反向查找走 assistant 行 → `compose_event_id` → `chat_images_events`，绝不是反过来。用量/费用和拼装出的 wire prompt **不会**重复写进 `chat_messages.metadata.image` 本身；要对账，要么 join `compose_event_id` 去查审计表，要么拿 generation id 去供应商日志里对。详见 [LLM audit → 图片链路事件表](llm-audit.zh.md#图片链路事件表)。设计文档：`docs/superpowers/specs/2026-08-02-image-compose-audit-design.md`（上面 `metadata.image` 的键）与 `docs/superpowers/specs/2026-08-14-image-audit-events-design.md`（`chat_images_events`）。
+**每一次合成器调用——不论成功失败、不论来自哪个调用方——都会另外落一行到 `engine.chat_images_events`**（迁移 0045）：完整的 usage 块、拼装出的 wire prompt（`composed_prompt`——style 预设 + 人格外观 + subject，也就是图像供应商实际会收到的那个字符串）、链路遍历的事实（`attempts` / `last_failure`），以及合成器当时看到的原始输入。`metadata.image.compose_event_id` 指向那一行——反向查找走 assistant 行 → `compose_event_id` → `chat_images_events`，绝不是反过来。用量/费用和拼装出的 wire prompt **不会**重复写进 `chat_messages.metadata.image` 本身；要对账，要么 join `compose_event_id` 去查审计表，要么拿 generation id 去供应商日志里对。详见 [LLM audit → 图片链路事件表](llm-audit.zh.md#图片链路事件表)。设计文档：`docs/superpowers/specs/2026-08-02-image-compose-audit-design.md`（上面 `metadata.image` 的键）与 `docs/superpowers/specs/2026-08-14-image-audit-events-design.md`（`chat_images_events`）。
 
 ### `[tasks.chat_image_edit_compose]` — 图片-EDIT 合成器（可选）
 

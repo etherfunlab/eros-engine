@@ -156,8 +156,12 @@ date is `ongoing`. A date turn is a text turn with these differences:
 - **No life choice.** A date turn neither triggers one nor answers one. Skipped turns neither
   count toward nor break a choice's streak.
 - **Actions keep their own rules.** A refused `give`, `gift` or physical action still drops its
-  line a tier on the parent, and `strip` still needs a romance-compatible pair. A `date` action
-  inside a date is `409 activity_in_progress`.
+  line a tier on the parent, and `strip`, `shower_together` and `bath_together` still need a
+  romance-compatible pair. A together action she accepts inside a date places no event: the date's
+  `on_a_date` stays as it is and the date goes on, and the picture of the turn is drawn with the
+  action as her state for that turn only
+  ([life-events-needs.md](life-events-needs.md#showering-bathing-and-the-sauna-together)). A `date`
+  action inside a date is `409 activity_in_progress`.
 - **No verbatim memory.** The user's line is not embedded into either memory layer.
 - **No dreaming.** The turn does not count toward the relationship scan, and the scan never
   reads the sub-session's rows ([Memory](#memory)).

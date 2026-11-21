@@ -30,9 +30,10 @@ about how the pieces work and how they fit together.
 | Needs the LLM judge | yes | no |
 | Judge sees | the `[需求]` line | the `[近期事件]` line |
 | Reply sees | `- 此刻的需要：…` | `- 正在经历：…` and `- 刚才：…` |
+| Picture composer sees | — | the `[此刻状态]` section |
 | Caller gets | `needs` on the `body_state` frame and on `GET …/effects` | the events route response; `event` and `background_event` on `GET …/effects` |
 
-Voice calls read needs and no events. Group turns read neither. Details follow.
+Voice calls read needs and no events. Group turns read neither in the reply; only a group picture's composer reads the speaker's events. Details follow.
 
 ## Needs
 
@@ -216,7 +217,7 @@ the judge sees the levels and decides.
 
 ### Categories
 
-An event is one of 69 drawable kinds. Each kind belongs to a category, and the category sets its
+An event is one of 70 drawable kinds. Each kind belongs to a category, and the category sets its
 shape:
 
 | `category` | shape | lasts | category weight | category cooldown |
@@ -236,18 +237,23 @@ cooldowns and ranges are in `rule`, and the category values in `category_rule`, 
 
 A duration written as a range is drawn uniformly in whole hours when the event starts.
 
-Five more kinds are never drawn: `taking_space` (说好暂时分开), `fell_out`
+Seven more kinds are never drawn: `taking_space` (说好暂时分开), `fell_out`
 (为分开的事闹得不愉快), `traveling_together` (和对方一起旅行), `bathing_together`
-(和对方一起洗澡) and `on_a_date` (和对方约会). The engine writes the first
+(和对方一起洗澡), `on_a_date` (和对方约会), `showering_together` (和对方一起淋浴) and
+`sauna_together` (和对方一起蒸桑拿). The engine writes the first
 two itself when she asks for space and the
 user answers or ignores her ([the ask-for-space choice](#the-ask-for-space-choice)). They are
 `mid` incidents by shape, and `taking_space` is the one that outlasts the category's four
 hours: it lasts 12 to 24. `traveling_together` is a `trip` background the engine writes when the
 user accepts her suggestion ([going away together](#going-away-together)),
 `bathing_together` a 30-minute `short` incident it writes when the user accepts her ask for a
-bath ([a bath together](#a-bath-together)), and `on_a_date` a `short` incident of 1 or 4 hours it
-writes when she accepts the user's date invitation ([activities.md](activities.md#the-event)).
-None of the five has a draw rule, and the caller's `kinds` rejects them.
+bath ([a bath together](#a-bath-together)) or she accepts the user's `bath_together`,
+`showering_together` (30 minutes) and `sauna_together` (1 hour) `short` incidents it writes when
+she accepts the user's `shower_together` or `sauna_together`
+([together actions](#showering-bathing-and-the-sauna-together)), and `on_a_date` a `short`
+incident of 1 or 4 hours it writes when she accepts the user's date invitation
+([activities.md](activities.md#the-event)).
+None of the seven has a draw rule, and the caller's `kinds` rejects them.
 
 ### The draw
 
@@ -255,7 +261,7 @@ The draw is a pure function of the inputs plus three random numbers (one per sta
 the length).
 
 1. **Eligibility.** A kind is eligible when all of these hold:
-   - the caller's `kinds` allows it ([below](#the-callers-kinds); absent means all 69);
+   - the caller's `kinds` allows it ([below](#the-callers-kinds); absent means all 70);
    - it fits her world ([below](#her-world));
    - it passes its gate (below);
    - its own cooldown has elapsed;
@@ -354,6 +360,7 @@ weight and never lifts a gate.
 | `want_to_quit_job` | the persona's `art_metadata.employed` is not `"free"` |
 | `period_scare` | the persona's `art_metadata.gender` is `"female"`, she is not a machine, and intimacy rung 2 or higher |
 | `pregnancy_scare` | the persona's `art_metadata.gender` is `"female"`, she is not a machine, and intimacy rung 3 |
+| `using_toilet` | she is not a machine |
 | `having_sex` | the persona's `art_metadata.sex_addict` is `true` |
 | `away_from_phone`, `busy`, `in_battle`, `asleep`, `bros_gathering`, `sis_gathering`, `having_sex`, and `out_shopping` for a female persona | the ghost protections allow it (see [below](#offline-kinds)) |
 
@@ -383,7 +390,7 @@ authors the persona, sit beside `gender`, `birthday` and `timezone`:
 | `employed` | `"free"`, `"part_time"` (default), `"full_time"` | how much of her day is work: `temp_work`, `scolded_by_superior`, `scolded_superior` and `business_trip` weigh a third, 1 time, 3 times within their categories; a `free` persona never draws `want_to_quit_job`; any other value reads as `part_time` |
 | `outdoorsy` | `"outdoor"`, `"neutral"` (default), `"indoor"` | within each category, `outdoor` weighs the outdoor kinds 3 times and the indoor kinds a third, `indoor` the reverse; neutral kinds are untouched ([below](#outdoors-or-in)); any other value reads as `neutral` |
 | `setting` | `"modern"` (default), `"fantasy"` | the world she lives in ([below](#her-world)); any other value reads as `modern` |
-| `species` | any word | `"robot"` and `"android"` are machines: she never draws `period`, `period_scare` or `pregnancy_scare`; every other word leaves the draw alone. What the word does to the prompt is in [eros-character-v1.1.md](eros-character-v1.1.md) |
+| `species` | any word | `"robot"` and `"android"` are machines: she never draws `period`, `period_scare`, `pregnancy_scare` or `using_toilet`; every other word leaves the draw alone. What the word does to the prompt is in [eros-character-v1.1.md](eros-character-v1.1.md) |
 | `smoking`, `alcoholic`, `drug`, `coffee`, `gluttony` | each `true`, `false`, absent (default) | whether she smokes, drinks, uses weed, drinks coffee, loves good food (`false`: she keeps off rich food): how fast `indulgence` comes back ([drift](#drift-between-ratings)), what a high `indulgence` names in the reply, and how she takes a give of that thing (below); `smoking`, `alcoholic` and `drug` set to `true` also let her draw `smoking`, `drinking` and `smoking_weed` |
 
 `prefer_trip` says whether she moves at all; `homesick` says where she goes when she does. A
@@ -407,7 +414,7 @@ means out in the open air: a shop, a class, an office or a gallery is not outdoo
 | place | `short` | `mid` |
 |---|---|---|
 | outdoor | `police_encounter`, `animal_encounter`, `on_the_way`, `got_bumped`, `admiring_scenery`, `bird_encounter`, `want_to_see_sea`, `want_hot_spring`, `got_lost`, `missed_ride` | `on_the_road`, `on_a_boat`, `on_a_cruise`, `on_a_bus`, `on_a_train`, `on_a_plane`, `driving`, `want_to_go_out` |
-| indoor | `showering`, `bathing`, `scolded_by_superior`, `scolded_superior`, `admiring_art`, `want_sauna` | `reading`, `gaming`, `want_to_go_home` |
+| indoor | `showering`, `bathing`, `scolded_by_superior`, `scolded_superior`, `admiring_art`, `want_sauna`, `using_toilet` | `reading`, `gaming`, `want_to_go_home` |
 | neutral | every other `short` kind, the sex kinds and `streaking` among them | every other `mid` kind |
 
 Every kind that can take her offline (`asleep`, `in_battle`, `busy`, `away_from_phone`,
@@ -486,7 +493,7 @@ policy, rules a kind out without the engine losing it.
 
 | `kinds` | kinds that may be drawn |
 |---|---|
-| absent or `null` | all 69 |
+| absent or `null` | all 70 |
 | `[]` | none: the response is `{"event": null, "message": null}` |
 | `["reading", "quarrel"]` | the listed ones |
 | `{"allow": […], "disallow": […]}` | what `allow` allows, minus what `disallow` lists |
@@ -496,7 +503,7 @@ In the object, `allow` absent or `null` allows every kind and `[]` none; `disall
 kinds out without freezing the rest, so a kind the engine adds later is drawn too. An unknown
 key in the object or an unknown kind anywhere rejects the request, so a misspelt `disallow`
 cannot quietly serve a kind it meant to exclude; a caller lists a new kind only once the
-engine knows it. `taking_space`, `fell_out`, `traveling_together`, `bathing_together` and `on_a_date` are never drawn, so naming one anywhere in
+engine knows it. `taking_space`, `fell_out`, `traveling_together`, `bathing_together`, `on_a_date`, `showering_together` and `sauna_together` are never drawn, so naming one anywhere in
 `kinds` is rejected the same way.
 
 Seven kinds carry adult themes: `sudden_desire`, `strip`, `streaking`, `having_sex`, `just_have_sex`, `masturbating`, and `pregnancy_scare`, which implies sex. The
@@ -565,7 +572,7 @@ Then:
 ### While it lasts
 
 The events under way at a moment are the background and the incident whose
-`started_at <= moment < ends_at`. They reach three readers in the chat; with the world system
+`started_at <= moment < ends_at`. They reach four readers in the chat; with the world system
 on, the story and world directors read them too ([Beyond the chat](#beyond-the-chat)).
 
 - **The judge** gets one `[近期事件]` line, after `[需求]` and before `[身体状态]`. It lists the
@@ -591,7 +598,22 @@ on, the story and world directors read them too ([Beyond the chat](#beyond-the-c
   ```
 
   This works with or without the LLM judge. `/open` greetings and event messages carry the same
-  line. Voice, group and image-edit requests read no events.
+  line. The reply prompts of voice calls, group turns and image edits read no events.
+- **The image composer** gets one `[此刻状态]` section, after `[身体状态]`, with the labels of the
+  background and then the incident, joined by `；`:
+
+  ```
+  [此刻状态]
+  短途旅游；在坐火车
+  ```
+
+  Every picture the chat pipeline draws carries it: a chat turn's, an event message's own, and a
+  group turn's, which names its speaker's state. With nothing under way the payload has no such
+  section. The event being started counts as under way
+  though it is not stored yet: an event message's picture shows the event it tells, and the
+  picture of an accepted [together action](#showering-bathing-and-the-sauna-together) shows the
+  event it places. The standalone compose endpoint and image edit send no such section. See
+  [the composer](model-config.md#taskschat_image_prompt_compose--image-prompt-composer-required-for-image-turns).
 - **The caller** gets them from `GET …/effects`: `event` is the incident under way, and
   `background_event` the background. An offline kind under way is reported as `event`
   like any incident, with `"offline": true`; how a client shows it is its call.
@@ -823,6 +845,42 @@ see. Her clothing in the message is 刚把衣服脱了, or 刚把「{outfit}」�
 `outfit`, so the picture never shows her dressed. It carries adult themes, like
 `sudden_desire`; a caller that serves those only to some users disallows it.
 
+### Showering, bathing and the sauna together
+
+The user can ask to take a shower, a bath or a sauna with her: the `shower_together`,
+`bath_together` and `sauna_together` actions, none of which carries a field
+([the send route](api-reference.md#post-compchatsession_idmessagestream)). The judge decides, as
+for any action. Before it, a shower or a bath is ruled out for a pair whose `affinity_scope` is
+not romance-compatible, as `strip` is: she refuses whatever the judge answers, with or without
+the LLM judge. A sauna has no such rule. A refusal drops the chemistry line a tier and places
+nothing; her own `bathe_together` ask ([a bath together](#a-bath-together)) and its cooldown
+neither read these actions nor are read by them.
+
+An accepted one puts her in an event, written in the same transaction as the stored answer:
+
+| action | event | label | lasts |
+|---|---|---|---|
+| `shower_together` | `showering_together` | 和对方一起淋浴 | 30 min |
+| `bath_together` | `bathing_together` | 和对方一起洗澡 | 30 min |
+| `sauna_together` | `sauna_together` | 和对方一起蒸桑拿 | 1 h |
+
+Starting it ends an incident under way and leaves a background going, as the bath she asks for
+does. The event is keyed on the user's message, so a re-driven turn places it once. While a date
+of hers is on, nothing is placed: the date's `on_a_date` stays as it is and the date goes on.
+She does not tell the event, since her reply to the action already does; it is not offline, and
+none of the three is drawn. While it lasts it is the incident under way, so `正在经历`, the
+judge and the picture composer read it like any incident. `showering_together` and
+`bathing_together` stay out of the story director's events, as a romantic choice's outcome does;
+`sauna_together` does not.
+
+An accepted together action is a picture turn when the request carries `image` and the
+deployment has the composer, like an accepted `photo`, `strip` or `ask_dancing`: her words, then
+one `image_request`. The composer is told the event as her state, so the picture shows it; inside
+a date, where nothing is placed, the action's kind is her state for that turn only. A refused one
+is text. While the deployment has [`tones.emotional`](model-config.md#tones--chat-tones-chat-task-only)
+above 0, the reply to a shower or a bath is in the `emotional` tone, accepted or refused; a
+sauna's is not.
+
 ### Small things in her day
 
 Eight told incidents fill in her day. All are `short`; none takes her offline or carries a
@@ -898,6 +956,16 @@ users disallows them.
 
 Told, never offline, no picture, both worlds (a carriage is a ride too). Unlike `got_lost`, a
 business trip counts.
+
+### Using the toilet
+
+| kind | label | category | weight | cooldown | lasts | gate | cue |
+|---|---|---|---|---|---|---|---|
+| `using_toilet` | 上厕所中 | `short` | 1 | 12 h | 30 min | she is not a machine ([persona settings](#persona-settings)) | `（你正在上厕所。）` |
+
+Told, never offline, no picture, both worlds, no intimacy gate. She keeps replying. It is an
+indoor kind, so `outdoorsy` scales it ([below](#outdoors-or-in)); no background rules it out, no
+event makes it likelier and no needs factor touches it.
 
 ### On the move
 
@@ -980,7 +1048,7 @@ offline kind or a date is under way.
 With [World Stories](world-system.md#world-stories) enabled, the story director reads the
 instance's events directly, each with its label, a relative time and the message she told it
 in, plus the background under way and the pair's asks for space with their outcome. It takes
-them as settled fact. A bath together and a date are left out: like a romantic choice's outcome,
+them as settled fact. A bath together, a shower together and a date are left out: like a romantic choice's outcome,
 they live in the conversation only. The messages she sends on her own are not part of its chat evidence, so
 an event is never read as her answer to an unrelated line. The World Memories director reads a
 background under way for every persona in the roster, stories or not, so a persona in hospital

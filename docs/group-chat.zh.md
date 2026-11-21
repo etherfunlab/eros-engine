@@ -301,7 +301,8 @@ params = { reasoning = { effort = "medium" } }
 
 **双人图。** 有同框成员时，发言人的 composer payload 在 `[此刻穿着]` 之后多一段 `[同框人物]`：
 同框成员的名字、外貌与性格，以及一句 `这张图里有两个人：{发言人} 和 {同框成员}。`；内建的 composer
-提示词认得这一段。随后 `image_request` 帧和
+提示词认得这一段。发言人有事件在进行时，图的 payload 还在 `[身体状态]` 之后带一段 `[此刻状态]`：写的是发言人自己的状态，
+从不写同框成员的（见 [life-events-needs.zh.md](life-events-needs.zh.md#持续期间)）。随后 `image_request` 帧和
 [`GET …/image-request`](api-reference.zh.md#get-compchatsession_idmessagesmessage_idimage-request)
 都带 `companion: {member_session_id, instance_id}`，客户端据此再取一张脸的参考图，两张一起画。
 composer 链路耗尽、wire prompt 退回发言人单人肖像时，不发 `companion`；compose 审计行仍记录当时要的是谁。
@@ -341,7 +342,7 @@ post-process 在 `final` 之后启动一次，从不阻塞流。没有走到 `fi
 
 - 异步发送、语音，以及用户上传图片（vision）。
 - 用户动作、礼物和打赏。
-- 角色的余效、需求和生活事件：发言者的 prompt 和导演的上下文都不带这些。
+- 角色的余效、需求和生活事件：发言者的 prompt 和导演的上下文都不带这些。只有发言者的图会读她自己的事件，用于合成器的 `[此刻状态]`。
 - Reaction 和改图。
 - 群路由上的 BYOK。
 - 群里的主动消息：导演只回应用户。

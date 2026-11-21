@@ -375,7 +375,9 @@ own seat, or rides an action that carries no picture after that downgrade.
 one section after `[此刻穿着]`: `[同框人物]` with the companion's name,
 appearance and personality, and the line
 `这张图里有两个人：{speaker} 和 {companion}。`; the built-in composer prompt
-knows the section. The `image_request` frame and
+knows the section. A picture also carries `[此刻状态]` after `[身体状态]` while the
+speaker has an event live: the speaker's own state, never the companion's
+([life-events-needs.md](life-events-needs.md#while-it-lasts)). The `image_request` frame and
 [`GET …/image-request`](api-reference.md#get-compchatsession_idmessagesmessage_idimage-request)
 then carry `companion: {member_session_id, instance_id}`, so the client
 fetches a second face reference and draws with both. When the composer chain
@@ -427,7 +429,7 @@ none.
 
 - Async send, voice, and user image upload (vision).
 - User actions, gifts and tips.
-- The persona's lingering effects, needs and life events: a speaker's prompt and the director's context carry none of them.
+- The persona's lingering effects, needs and life events: a speaker's prompt and the director's context carry none of them. Only a speaker's picture reads her own events, for the composer's `[此刻状态]`.
 - Reactions and image edit.
 - BYOK on the group route.
 - Proactive group messages: the director only answers the user.

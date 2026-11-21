@@ -391,7 +391,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 | `type` | 字段 |
 |---|---|
 | `give` | `item`：下表中的一类，必填；`name`：可选，1–32 字符；`quantity`：可选，1–99，默认 1 |
-| `kiss`、`hug`、`touch`、`lick`、`french_kiss`、`hug_from_behind`、`tease`、`pat`、`wink`、`blink`、`ask_for_dance`、`ask_dancing`、`photo`、`strip` | 无 |
+| `kiss`、`hug`、`touch`、`lick`、`french_kiss`、`hug_from_behind`、`tease`、`pat`、`wink`、`blink`、`ask_for_dance`、`ask_dancing`、`photo`、`strip`、`shower_together`、`bath_together`、`sauna_together` | 无 |
 | `bluff`、`threaten`、`trick` | 无 |
 | `custom` | `text`：必填，1–100 字符 |
 | `tip` | `amount_usd`：必填，有限数值，`> 0` 且 `≤ 1_000_000_000` |
@@ -403,7 +403,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 | 分组 | `item`（单位） |
 |---|---|
 | 消耗品 | `cigarette`（支）、`alcohol`（杯）、`medicine`（片）、`food`（份）、`soft_drink`（瓶）、`tea`（杯）、`coffee`（杯）、`herb`（包）、`cuisine`（道） |
-| 贵重物 | `watch`（块）、`gem`（颗）、`gold`（块）、`camera`（台）、`cash`（张）、`antique`（件）、`artwork`（件）、`handmade`（份）、`credit_card`（张）、`flower`（朵）、`jewelry`（件） |
+| 贵重物 | `watch`（块）、`gem`（颗）、`gold`（块）、`camera`（台）、`cash`（张）、`antique`（件）、`artwork`（件）、`handmade`（份）、`credit_card`（张）、`flower`（朵）、`jewelry`（件）、`car`（辆）、`motorcycle`（辆）、`boat`（艘）、`horse`（匹） |
 
 **`give` 的余效。** 被接受的消耗品会在这个 session 之后的 `min(quantity, 5)` 个文字回合里继续影响角色；接受它的那一回合不算在内。每个回合角色处在曲线上的某一步，档位 1–4：
 
@@ -424,9 +424,11 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 **脱衣服。** `strip` 是用户脱她的衣服，只有性向相容的一对才可能被接受：这一轮的 `affinity_scope` 含暧昧感轴，`memory_scope` 是什么都不影响。其余的 `strip` 在判官运行之前就判为拒绝，不管判官怎么答，也不管有没有 LLM 判官，并像任何被拒的身体动作一样让 chemistry 线降一档。被接受的 `strip` 让她这一轮没穿衣服：穿着写成衣服被对方脱掉了，有指定 `outfit` 时写成「{outfit}」被对方脱掉了，进回复也进图。有出图能力时它像拍照一样回她的图（见下）。
 
-**让你拍照。** 请求带 `image`、部署配置了 `[tasks.chat_image_prompt_compose]` 时，被接受的 `photo` 以 `reply_text_image` 回复：先是她的话，再是一条以她的脸部参考为基础、按当前场景组出来的 `image_request`。有没有 LLM 判官都一样。被接受的 `strip` 也这样回复，被接受的 `ask_dancing`（用户想看她跳支舞，图是她在跳舞）也一样。被拒的 `photo`、`strip` 或 `ask_dancing`，或没有这项出图能力的，只回文字，即使判官提议了出图。`image.force = true` 仍让这一轮是 `reply_image`，被拒时图按拒绝的结果来画。
+**一起洗澡、淋浴、蒸桑拿。** `shower_together`、`bath_together`、`sauna_together` 是请她和用户一起淋浴、泡澡、蒸桑拿。由判官决定，被拒时 chemistry 线降一档，和任何被拒的身体动作一样。性向不相容的一对发来的 `shower_together` 或 `bath_together`，和 `strip` 一样，在判官运行之前就判为拒绝，不管判官怎么答，也不管有没有 LLM 判官；`sauna_together` 没有这条规则。被接受的动作让她进入一个事件，与她存下的回答在同一个事务里写入，以用户那条消息为键，所以重新驱动的回合只写一次：`showering_together`（30 分钟）、`bathing_together`（30 分钟）或 `sauna_together`（1 小时）。它开始时，正在进行的插曲结束，背景继续。在约会里被接受时什么都不写：约会的 `on_a_date` 保持原样，约会继续。事件持续期间在 [`GET …/effects`](#get-v2compsessionsession_ideffects) 里以 `event` 出现。有出图能力时，被接受的这一回合回她的图（见下），图里画的就是这个事件。规则见 [life-events-needs.zh.md](life-events-needs.zh.md#一起淋浴泡澡和蒸桑拿)。
 
-**情绪化回复。** 部署打开 [`tones.emotional`](model-config.zh.md#tones--聊天语气仅限-chat-任务)（大于 0）时，带 `french_kiss`、`tease`、`hug_from_behind`、`touch`、`strip`、`threaten` 或 `tip` 的回合用 `emotional` 语气回复，接受、拒绝都一样：回复只凭人设、这个动作和她的决定来写，不看聊天历史、用户画像和亲密度结论。接受还是拒绝仍照上面的方式决定。回复的行带 `metadata.tone = "emotional"`。
+**让你拍照。** 请求带 `image`、部署配置了 `[tasks.chat_image_prompt_compose]` 时，被接受的 `photo` 以 `reply_text_image` 回复：先是她的话，再是一条以她的脸部参考为基础、按当前场景组出来的 `image_request`。有没有 LLM 判官都一样。被接受的 `strip` 也这样回复，被接受的 `ask_dancing`（用户想看她跳支舞，图是她在跳舞）和被接受的 `shower_together`、`bath_together`、`sauna_together` 也一样。被拒的 `photo`、`strip`、`ask_dancing` 或一起做的动作，或没有这项出图能力的，只回文字，即使判官提议了出图。`image.force = true` 仍让这一轮是 `reply_image`，被拒时图按拒绝的结果来画。
+
+**情绪化回复。** 部署打开 [`tones.emotional`](model-config.zh.md#tones--聊天语气仅限-chat-任务)（大于 0）时，带 `french_kiss`、`tease`、`hug_from_behind`、`touch`、`strip`、`shower_together`、`bath_together`、`threaten` 或 `tip` 的回合用 `emotional` 语气回复，接受、拒绝都一样：回复只凭人设、这个动作和她的决定来写，不看聊天历史、用户画像和亲密度结论。接受还是拒绝仍照上面的方式决定。回复的行带 `metadata.tone = "emotional"`。
 
 **约会。** `date` 是约她出去。先过 engine 的门槛：`short` 没有门槛，`mid` 要求 bond 达到第 2 档，她离线或正在另一场约会里时一律不通过；
 门槛不通过就是拒绝，不管判官怎么答。被拒时这一回合是没有代价的普通回合。被接受时，这一回合的 `final` 帧带 `activity`：
@@ -505,7 +507,8 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 ```
 
 出现 `image` 块表示消费方负责本轮的画图动作；引擎只组装提示词并发送单个
-`image_request` 帧（绝不在聊天流上绘图）。
+`image_request` 帧（绝不在聊天流上绘图）。有事件在进行时，合成器会被告知她此刻在做什么，
+所以图和她的状态一致（见 [model-config.zh.md](model-config.zh.md#taskschat_image_prompt_compose--出图-prompt-合成器图片轮次必需)）。
 
 `ImageReplyParams` 字段（全部可选）：
 
@@ -546,7 +549,7 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 - `ghost`：`meta(action_type=ghost) → done → final` — 无 `delta`，`meta` 中无 `model`，`done` 的 `usage` 和 `generation_id` 均为 `null`。该轮伴侣保持沉默，未调用聊天模型。
 - 带推理的回合：判官返回了推理时，`reasoning*` 排在这份列表里每种形状的最前面，在 `action_response` 和 `body_state` 之前：`reasoning* → meta(reply) → delta* → done → final`
 - 动作轮次：形状相同，只是 `action_response` 排在第一个 `meta` 之前——`action_response → meta(reply) → delta* → done → final`；不会是 `ghost` 或 `product_qa`
-- 有出图能力时被接受的 `photo`、`strip` 或 `ask_dancing`：`action_response → meta(reply_text_image) → delta* → done → image_request → final`
+- 有出图能力时被接受的 `photo`、`strip`、`ask_dancing`、`shower_together`、`bath_together` 或 `sauna_together`：`action_response → meta(reply_text_image) → delta* → done → image_request → final`
 - 被接受的 `date`：`action_response → meta(reply) → delta* → done → final`，`final` 上带 `activity`
 - 带余效或已知需求的回合：`body_state` 位于第一个 `meta` 之前，两者都发时排在 `action_response` 之后——例如 `action_response → body_state → meta(reply) → delta* → done → final`
 - `product_qa`：`meta(action_type=product_qa) → delta* → done → final` — 形状与普通文本回复相同，由独立的模型链（`[tasks.chat_product_qa]`）流式生成，而非 `chat_companion`；落库时带 `channel='product_qa'`，重放时同样报告为 `product_qa`。
@@ -878,7 +881,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | 字段 | 规则 |
 |---|---|
 | `event_key` | 必填：1–128 个 `[A-Za-z0-9_.:-]` 字符，只在本会话内有效。同一个 key 返回同一个事件 |
-| `kinds` | 选填。不带或 `null`：全部种类。数组：只抽列出的种类（`[]`：什么都不抽）。对象 `{"allow": […], "disallow": […]}`：`allow` 允许的种类（不带或 `null`：全部；`[]`：一种都没有）去掉 `disallow` 列出的种类；两边都列了的种类不抽，`{}` 等于全部种类。对象里出现未知的键，或出现未知种类，返回 `422`；写了 `taking_space`、`fell_out`、`traveling_together`、`bathing_together` 或 `on_a_date` 同样返回 `422`：它们由 engine 自己写入，从不抽取 |
+| `kinds` | 选填。不带或 `null`：全部种类。数组：只抽列出的种类（`[]`：什么都不抽）。对象 `{"allow": […], "disallow": […]}`：`allow` 允许的种类（不带或 `null`：全部；`[]`：一种都没有）去掉 `disallow` 列出的种类；两边都列了的种类不抽，`{}` 等于全部种类。对象里出现未知的键，或出现未知种类，返回 `422`；写了 `taking_space`、`fell_out`、`traveling_together`、`bathing_together`、`on_a_date`、`showering_together` 或 `sauna_together` 同样返回 `422`：它们由 engine 自己写入，从不抽取 |
 | `user_timezone`、`user_country`、`user_region`、`tier`、`prompt_traits`、`memory_scope`、`affinity_scope`、`audit` | 与 `/open` 相同，用于生成这条消息 |
 | `image` | 选填：`{"style", "aspect_ratio", "prompt_variant"}`，各字段与聊天回合的 `image` 相同（没有 `force`；不支持的 `aspect_ratio` 返回 `422`）。表示调用方能处理图：部署配了 `[tasks.chat_image_prompt_compose]` 时，`taking_selfie` 或 `strip` 的消息会带上她的图（见下）。不带、或没配 composer：只有文字。其他种类忽略它 |
 | `outfit` | 选填：她穿什么，与聊天回合相同——通常是她衣橱里的一项，不做核对；去掉首尾空白后 1–64 个字符，空白等于不带，超长返回 `422`。她的话会跟着这身衣服，图也会。`strip` 时她刚把它脱了：刚把「{outfit}」脱了，不带时是刚把衣服脱了。不带：prompt 里没有穿着，composer 按场景给她穿 |
@@ -921,6 +924,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | `short` | `just_have_sex` | 30 分钟 | 刚做完爱，讲给对方听（档 3） |
 | `short` | `masturbating` | 30 分钟 | 自慰中（性瘾角色，档 3） |
 | `short` | `missed_ride` | 1 小时 | 没赶上车（只在旅行中，出差也算） |
+| `short` | `using_toilet` | 30 分钟 | 在上厕所（机器角色从不抽到） |
 | `mid` | `temp_work` | 4 小时 | 临时接到工作 |
 | `mid` | `ex_message` | 3 小时 | 前任发来消息 |
 | `mid` | `got_hit` | 4 小时 | 被打了 |
@@ -957,10 +961,10 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | `trip` | `long_trip` | 3–7 天 | 长途旅游 |
 | `trip` | `hometown_visit` | 72 小时 | 回老家 |
 
-时长写成区间的，在事件开始时从区间里抽定。以上共 69 种可抽取的种类。两种性别都会抽到两个聚会，权重相同，这是有意为之。
+时长写成区间的，在事件开始时从区间里抽定。以上共 70 种可抽取的种类。两种性别都会抽到两个聚会，权重相同，这是有意为之。
 
-另有五种永远不会被抽到：`taking_space`（她提出、用户同意的分开，12–24 小时，离线）、`fell_out`（用户不理会她提出的分开请求时的那场不愉快，1 小时）、`traveling_together`（她提议、用户同意的旅行，48–72 小时，`trip` 类背景，不离线）、`bathing_together`（她提议、用户同意的一起洗澡，30 分钟，`short` 类插曲，不离线）和 `on_a_date`（用户约她、她答应了的约会，1 或 4 小时，`short` 类插曲，不离线）。
-前四种由 engine 为[生活选择流程](#post-v2compsessionsession_idlife-choiceschoice_id)写入，`on_a_date` 为[约会](activities.zh.md)写入。它们作为 `…/effects` 里的 `event` 出现，前四种也作为生活选择响应里的 `event` 出现，
+另有七种永远不会被抽到：`taking_space`（她提出、用户同意的分开，12–24 小时，离线）、`fell_out`（用户不理会她提出的分开请求时的那场不愉快，1 小时）、`traveling_together`（她提议、用户同意的旅行，48–72 小时，`trip` 类背景，不离线）、`bathing_together`（她提议、用户同意的一起洗澡，或她答应的 `bath_together`，30 分钟，`short` 类插曲，不离线）、`on_a_date`（用户约她、她答应了的约会，1 或 4 小时，`short` 类插曲，不离线）、`showering_together`（她答应的 `shower_together`，30 分钟，`short` 类插曲，不离线）和 `sauna_together`（她答应的 `sauna_together`，1 小时，`short` 类插曲，不离线）。
+前四种由 engine 为[生活选择流程](#post-v2compsessionsession_idlife-choiceschoice_id)写入（第四种也为那个动作写入），`on_a_date` 为[约会](activities.zh.md)写入，后两种为[一起做的动作](#post-compchatsession_idmessagestream)写入。它们作为 `…/effects` 里的 `event` 出现，前四种也作为生活选择响应里的 `event` 出现，
 不能写进 `kinds`。
 
 `sudden_desire`、`strip`、`streaking`、`having_sex`、`just_have_sex`、`masturbating` 与 `pregnancy_scare`（后者隐含性行为）带成人题材；只对部分用户提供这类内容的调用方，用
@@ -996,7 +1000,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
   `having_sex` 只对 `art_metadata.sex_addict` 为 `true` 的角色抽取，`masturbating` 只对这样的角色在档 3 抽取。
   `drinking`、`smoking`、`smoking_weed` 分别只对 `alcoholic`、`smoking`、`drug` 为 `true` 的角色抽取。`period` 只对 `art_metadata.gender` 为 `"female"` 的角色抽取；
   `period_scare`（档 2 及以上）与 `pregnancy_scare`（档 3）同样只对这样的角色抽取，`saw_bag` 和 `saw_clothes` 也是；
-  从档 2 起，她会说自己想要看中的东西，有 `tip_personality` 的角色用那份人格的口吻说。`period` 和两种惊吓都不对机器（`art_metadata.species` 为 `"robot"`
+  从档 2 起，她会说自己想要看中的东西，有 `tip_personality` 的角色用那份人格的口吻说。`period`、两种惊吓和 `using_toilet` 都不对机器（`art_metadata.species` 为 `"robot"`
   或 `"android"`）抽取。离线类种类遵循两道 ghost 门槛（见下）。
 - **角色设置**，写在 genome 的 `art_metadata` 里，影响抽取：
 
@@ -1031,7 +1035,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 **她的图。** 请求带 `image`、部署配了 `[tasks.chat_image_prompt_compose]` 时，抽到的 `taking_selfie` 或 `strip`
 用一段文字加一张委托出去的图讲出来，跟聊天回合的 `reply_text_image` 一样。先写她的话；composer 再把这句话当作
 最近场景的最后一行来读，所以图里画的就是她说的。没有用户消息要这张图，所以 composer 的「对方最新消息」槽位为空。
-composer 失败时退回普通的人物肖像 prompt，跟聊天回合一样。响应多出 `image_request`，内容与
+composer 会被告知这个事件是她此刻的状态（`[此刻状态]`），正在抽的这个也算，连同其他还在进行的事件一起。composer 失败时退回普通的人物肖像 prompt，跟聊天回合一样。响应多出 `image_request`，内容与
 [`GET …/image-request`](#get-compchatsession_idmessagesmessage_idimage-request) 相同（base64 的 `composed_prompt`、
 `image_ref: "face"`、`aspect_ratio`），按聊天回合的 `image_request` 帧去渲染。同一个 `event_key` 会再次返回它。
 消息不带图、或它的合成 prompt 没有记录下来（审计写入是 fail-open 的）时，响应里没有这个字段。存下来的消息就是一条普通的
@@ -1056,7 +1060,7 @@ composer 失败时退回普通的人物肖像 prompt，跟聊天回合一样。�
 
 它们持续期间，角色任何一个 session 里的每一轮文字消息都会被 ghost，不经过判官，也不计入 ghost 连续次数，
 `/open` 返回 `null`。已经讲出来的 `busy`、`in_battle` 或 `out_shopping` 同样让轮次沉默。
-带用户 `action` 的轮次（任何 `type`：`give`、`gift`、`tip`、`kiss`、`hug`、`touch`、`lick`、`french_kiss`、`hug_from_behind`、`tease`、`pat`、`wink`、`blink`、`ask_for_dance`、`ask_dancing`、`photo`、`strip`、`bluff`、`threaten`、`trick`、`custom`）或 `image.force = true` 是例外：
+带用户 `action` 的轮次（任何 `type`：`give`、`gift`、`tip`、`kiss`、`hug`、`touch`、`lick`、`french_kiss`、`hug_from_behind`、`tease`、`pat`、`wink`、`blink`、`ask_for_dance`、`ask_dancing`、`photo`、`strip`、`shower_together`、`bath_together`、`sauna_together`、`bluff`、`threaten`、`trick`、`date`、`custom`）或 `image.force = true` 是例外：
 它走正常路径并得到回复，因为动作在语义上是线下互动，用不着手机，强制出图的轮次永远是 `reply_image`。
 角色只在 ghost 保护允许的地方才会这样沉默：部署的 ghosting 开关关闭（`ghosting = false`）时不会抽到任何离线类种类，已经在进行的一段也不再让轮次沉默，
 用户消息不足 10 条的会话里也不会抽到；调用方完全不想要它们，就在 `kinds` 里不写。这样被 ghost 的消息没有回执（没有判官读过它），
@@ -1081,7 +1085,7 @@ composer 失败时退回普通的人物肖像 prompt，跟聊天回合一样。�
   各自列出正在进行的背景和插曲；`/open` 开场白同样带 `- 正在经历：…` 这一行。`GET …/effects` 两者都会列出。
   一段离线类事件结束之后（在被它 ghost 过消息的会话里），或一场虚惊结束之后（在讲出它的那个会话里），`[近期事件]` 行多出一项，回复多出一行 `- 刚才：…`，直到她在那里写过一次为止（一条带文字的消息；
   见 [model-config.zh.md](model-config.zh.md#taskspde_decision--opt-in-llm-pde-判断器)）。
-- **错误：** `event_key` 格式不对返回 `400`，`code: "invalid_payload"`；未知的 `kind`，或 `taking_space`、`fell_out`、`traveling_together`、`bathing_together`、`on_a_date`，返回 `422`。会话检查与 `/open` 相同
+- **错误：** `event_key` 格式不对返回 `400`，`code: "invalid_payload"`；未知的 `kind`，或 `taking_space`、`fell_out`、`traveling_together`、`bathing_together`、`on_a_date`、`showering_together`、`sauna_together`，返回 `422`。会话检查与 `/open` 相同
   （`403`、`404`，语音或群会话、约会子会话 `409`），达到单用户并发上限 `429`。BYOC 实例的会话返回 `400 byoc_unsupported`。
   生成失败时返回与图片接口相同的上游错误，不写入任何内容。
   回复为空时不写入任何内容，返回空值。
@@ -1692,7 +1696,8 @@ Body 字段：
 | `stream` | `bool` | 否 | 默认 `true`。 |
 | `character` | `String` | 仅 BYOC | 封装好的角色卡。实例是 BYOC 实例时必填，其他实例上拒绝（`400 invalid_payload`）。需要 `X-Byoc-Caller-Secret`。合成器读取卡片的 `appearance`。见 [byoc.zh.md](byoc.zh.md)。 |
 
-合成器载荷与聊天路径的七个槽位完全一致，同一份 `filter_prompt` 契约同时服务两个
+合成器载荷是聊天路径的七个槽位，不含聊天路径的图在有事件进行时多带的 `[此刻状态]` 段
+（这个端点没有事件可读），所以同一份 `filter_prompt` 契约同时服务两个
 调用方（见 [model-config.zh.md](model-config.zh.md)）。
 
 每一次调用——不管成功失败——都会记录进 `engine.chat_images_events`
@@ -2323,7 +2328,7 @@ session 403）。
 
 ## 服務端點
 
-`/svc/v1/*` 下是服务间路由。以共享 secret header 放行而非用户 JWT。这些路由分成三棵子树，各自由自己的 secret 把守，消费方只持有它所读取的流对应的凭据；某棵子树的 secret 没有配置时，它**不会挂载**——未配置的子树对其路径的响应与任何未知路径一致：不会是 `403`，也不会是 `200`。secret 会 trim，空白视为未设置，少于 32 字节则拒绝启动。
+`/svc/v1/*` 下是服务间路由。以共享 secret header 放行而非用户 JWT。这些路由分成四棵子树，各自由自己的 secret 把守，消费方只持有它所调用的路由对应的凭据；某棵子树的 secret 没有配置时，它**不会挂载**——未配置的子树对其路径的响应与任何未知路径一致：不会是 `403`，也不会是 `200`。secret 会 trim，空白视为未设置，少于 32 字节则拒绝启动。
 
 | Secret | Header | 路由 |
 |---|---|---|
@@ -2331,6 +2336,7 @@ session 403）。
 | `FACTS_EXPORT_SECRET` | `x-facts-export-secret` | [`facts/changes`](#get-svcv1factschanges)、[`facts/deletions`](#get-svcv1factsdeletions) |
 | 以上两者任一 | 任一对应 header | [`rows/deletions`](#get-svcv1rowsdeletions) |
 | `USER_ERASE_SECRET` | `x-user-erase-secret` | [`POST users/{user_id}/erase`](#post-svcv1usersuser_iderase) |
+| `GENOME_WRITE_SECRET` | `x-genome-write-secret` | [`POST genomes`](#post-svcv1genomes)、[`PUT genomes/{id}`](#put-svcv1genomesid) |
 
 所有的流都用同样的方式 keyset 分页；它们背后的流水线见[洞察](insights.zh.md#导出与删除)。
 
@@ -2511,6 +2517,53 @@ curl -X POST -H "x-user-erase-secret: $USER_ERASE_SECRET" \
 - **请在删除该用户的 session 或角色实例之前调用。** 按关系分开的 insight 表和关系扫描的表只以实例为键，只有实例行还在时才够得着它们。
 - **先停掉该用户的流量。** 已经在进行中的第一段抽取可能在抹除提交之后写入事实；再调用一次清理。（进行中的重建写不回画像。）
 
+### `POST /svc/v1/genomes`
+
+用一张 [eros-character](eros-character-v1.1.md) 卡片创建一个角色 genome，供自己编写角色的下游服务器使用，这样它不必直接写 `engine.persona_genomes`。需要 `x-genome-write-secret: <GENOME_WRITE_SECRET>`（缺失或错误回 403）。请求里没有用户，engine 不做归属检查：归属由调用方自己负责。
+
+```bash
+curl -X POST -H "x-genome-write-secret: $GENOME_WRITE_SECRET" -H "Content-Type: application/json" \
+  -d '{
+        "id": "5b7e0c1a-3d2f-4a6b-9c8d-1e2f3a4b5c6d",
+        "card": {
+          "spec": "eros-character",
+          "spec_version": "1.1",
+          "data": { "name": "Aria", "system_prompt": "You are Aria …", "tip_personality": null, "art_metadata": {} }
+        }
+      }' \
+  "http://localhost:8080/svc/v1/genomes"
+```
+
+`id` 可选。不带时由 engine 生成；带上时用这个 id 创建。`card` 是整份文档，由打开 BYOC 卡片的同一个函数校验：`spec` 为 `"eros-character"`，`spec_version` 为 `"1"` 或 `"1.1"`，`data` 里只有 `name`、`system_prompt`、`tip_personality`、`art_metadata`。序列化后至多 64 KiB。请求体里的其他字段一律回 `400`。
+
+| 状态码 | 响应体 | 何时 |
+|---|---|---|
+| `201` | `{"id": "…"}` | genome 已创建 |
+| `200` | `{"id": "…"}` | 带上的 `id` 已经有 genome。什么都不写，存着的 genome 保持原样，即使这次的卡片不同 |
+| `400` | `bad_request` | 请求体无法解析、`card` 超限或被校验器拒绝，或卡片文本里含 NUL 字符。消息是固定的，只说明违反了哪条规则，卡片文本从不回显 |
+| `403` | `forbidden` | header 缺失或错误 |
+
+**重试创建是安全的**，前提是调用方自己带 `id`：第二次调用回 `200` 和同一个 id，表里仍只有一行。
+
+### `PUT /svc/v1/genomes/{id}`
+
+用一张卡片覆盖一个角色 genome。需要 `x-genome-write-secret: <GENOME_WRITE_SECRET>`。请求体是 `{"card": {…}}`，卡片同上。`name`、`system_prompt`、`tip_personality`、`art_metadata` 原地替换；id 和 `created_at` 不变。
+
+```bash
+curl -X PUT -H "x-genome-write-secret: $GENOME_WRITE_SECRET" -H "Content-Type: application/json" \
+  -d '{ "card": { "spec": "eros-character", "spec_version": "1.1", "data": { "name": "Aria", "system_prompt": "You are Aria …" } } }' \
+  "http://localhost:8080/svc/v1/genomes/5b7e0c1a-3d2f-4a6b-9c8d-1e2f3a4b5c6d"
+```
+
+| 状态码 | 何时 |
+|---|---|
+| `204` | genome 已被覆盖 |
+| `400` | 路径里的 `id` 不是 UUID，或请求体、卡片被拒绝，同创建 |
+| `403` | header 缺失或错误；它先于其他一切检查 |
+| `404` | 没有 genome 用这个 `id` |
+
+两条路由都不读取、不列出、不删除 genome。
+
 ## 錯誤響應
 
 大多数错误是 JSON 形状 `{"error": "<code>", "message": "<人类可读>"}`。
@@ -2527,7 +2580,7 @@ curl -X POST -H "x-user-erase-secret: $USER_ERASE_SECRET" \
 |--------|------|------|
 | 400 | `bad_request` | handler 检查后拒绝的值（游标不对、`prompt_traits` 不对……）。无法解析的请求体或路径得到的是框架的纯文本拒绝 |
 | 401 | — | JWT 缺失 / 格式错 / 过期 / 密钥不符。响应体为空：认证层在任何 handler 之前就作答 |
-| 403 | `forbidden` | 路徑 user 跟 JWT user 不匹配，或想讀別人的 session；或 `/svc/v1/*` 的某个 secret header（`x-insights-export-secret`、`x-facts-export-secret`、`x-user-erase-secret`）缺失或錯誤 |
+| 403 | `forbidden` | 路徑 user 跟 JWT user 不匹配，或想讀別人的 session；或 `/svc/v1/*` 的某个 secret header（`x-insights-export-secret`、`x-facts-export-secret`、`x-user-erase-secret`、`x-genome-write-secret`）缺失或錯誤 |
 | 404 | `not_found` | session / 人格 / 消息 id 不存在 |
 | 409 | `conflict` | 资源当前的状态不允许这个操作。reaction 路由和改图在收到群 session 时返回它，`message` 里含 `wrong_channel`。1:1 的流式与异步发送、`/open`、`/events`、`/effects` 和生活选择路由拒绝群 session 时改用带代码的响应体（`code: wrong_channel`），群路由拒绝非群 session 时也一样。[约会](activities.zh.md)的拒绝不论来自哪条路由，同样用带代码的响应体：`activity_in_progress`、`activity_ended`、`activity_settling`、`choice_pending`，以及 `activity_not_found`（`404`） |
 | 422 | `unprocessable` | 格式正确、但取值不可接受的请求 |
@@ -2557,6 +2610,7 @@ curl -X POST -H "x-user-erase-secret: $USER_ERASE_SECRET" \
 - `crates/eros-engine-server/src/routes/bff/companion.rs`——BFF `/bff/v1/comp/chat/*`
 - `crates/eros-engine-server/src/routes/bff/affinity.rs`——BFF `/bff/v1/comp/affinity/*`
 - `crates/eros-engine-server/src/routes/svc.rs`——服務間導出（`/svc/v1/*`）
+- `crates/eros-engine-server/src/routes/genomes.rs`——genome 创建与更新（`/svc/v1/genomes`）
 - `crates/eros-engine-server/src/routes/user_rows.rs`——用户本人的事实与记忆列表和删除
 - `crates/eros-engine-server/src/routes/health.rs`——`/healthz`
 - `crates/eros-engine-server/src/openapi.rs`——Scalar UI spec 元数据

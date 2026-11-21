@@ -245,7 +245,7 @@ Off 什么都不读。渲染器只对非空白的值输出 bullet：
 
 ## 导出与删除
 
-`/svc/v1/*` 下的三棵子树，每棵只在自己的 secret 设置后才挂载，所以消费方只持有它所读取的流对应的凭据。准入用常量时间比较请求头与 secret；缺失或错误是 403，且先于查询串校验。secret 未设置的子树，响应与任何未知路径一致（既不是 403，也不是 200）。secret 会 trim，空白视为未设置，少于 32 字节则拒绝启动。
+`/svc/v1/*` 下的四棵子树，每棵只在自己的 secret 设置后才挂载，所以消费方只持有它所调用的路由对应的凭据。准入用常量时间比较请求头与 secret；缺失或错误是 403，且先于查询串校验。secret 未设置的子树，响应与任何未知路径一致（既不是 403，也不是 200）。secret 会 trim，空白视为未设置，少于 32 字节则拒绝启动。
 
 | Secret | 请求头 | 路由 |
 |--------|--------|------|
@@ -253,6 +253,9 @@ Off 什么都不读。渲染器只对非空白的值输出 bullet：
 | `FACTS_EXPORT_SECRET` | `x-facts-export-secret` | `GET /svc/v1/facts/changes`、`GET /svc/v1/facts/deletions` |
 | 以上两者任一 | 任一对应请求头 | `GET /svc/v1/rows/deletions` |
 | `USER_ERASE_SECRET` | `x-user-erase-secret` | `POST /svc/v1/users/{user_id}/erase` |
+| `GENOME_WRITE_SECRET` | `x-genome-write-secret` | `POST /svc/v1/genomes`、`PUT /svc/v1/genomes/{id}`（[API 参考](api-reference.zh.md#post-svcv1genomes)） |
+
+genome 写入子树创建、覆盖角色 genome，不导出任何东西；本节其余部分讲的是另外三棵。
 
 `rows/deletions` 只带 id，所以两个读取 secret 任一都能打开它。两者至少设置一个时挂载，每个请求头只与它自己的 secret 比较。
 
@@ -378,7 +381,7 @@ ORDER BY e.created_at DESC, e.stage;
 | `PROFILE_REBUILD_TICK_SECS` | `300` | 清扫间隔。`0` 同样停掉清扫器；无法解析的值保持默认。 |
 | `PROFILE_REBUILD_IDLE_SECS` | `3600` | 用户最后一条新事实要放多久，清扫器才重建。 |
 | `PROFILE_REBUILD_BATCH` | `20` | 每个 tick 重建的用户数，至少为 1。 |
-| `INSIGHTS_EXPORT_SECRET`、`FACTS_EXPORT_SECRET`、`USER_ERASE_SECRET` | 未设置 | 挂载各自的子树，见[上文](#导出与删除)。 |
+| `INSIGHTS_EXPORT_SECRET`、`FACTS_EXPORT_SECRET`、`USER_ERASE_SECRET`、`GENOME_WRITE_SECRET` | 未设置 | 挂载各自的子树，见[上文](#导出与删除)。 |
 | `SNAPSHOT_DISABLED`、`SNAPSHOT_CRON`、`SNAPSHOT_TZ` | | 每日快照。 |
 
 计数阈值（20）和 600 秒的认领过期时间是常量，不是设置。见 [model-config.zh.md](model-config.zh.md#任务名) 与 [deploying.zh.md](deploying.zh.md#運維注意事項)。

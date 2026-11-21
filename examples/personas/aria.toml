@@ -24,7 +24,7 @@ timezone = "America/Chicago"
 age = 27
 # Optional. human | alien | beastkin | elf | deity | cyborg | robot | android |
 # zombie, or any other word, rendered as written. Absent ⇒ human. robot and
-# android are machines: no period events.
+# android are machines: no period or toilet events.
 # species = "elf"
 # Optional, free text. "earth" or absent renders no planet.
 # planet = "earth"

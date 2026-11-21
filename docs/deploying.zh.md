@@ -286,11 +286,12 @@ World Stories 按实例生活模拟）默认完全关闭：模型配置里没有
   - `CALLER_SECRET` 开启该功能：一个或多个 secret，逗号分隔，每个至少 32 字节（有一个更短、值里没有任何 secret、或不是合法 UTF-8，都会导致启动失败），保存在下游的服务器上，在每个需要 bearer 鉴权的路由（`/comp/*`、`/v2/comp/*`、`/bff/v1/*`、`/world/*`、`/persona/*`）请求上以 `X-Caller-Secret` 发送。任意一个 secret 都能放行。没带对的请求在检查 JWT 之前就返回 `403 caller_forbidden`。`/healthz`、`/docs` 和 `/svc/v1/*` 不受闸门限制。BYOK 和 BYOC 请求仍要另带各自的 header。未设置 ⇒ 没有闸门。
   - 开启顺序：先部署会发这个 header 的下游（引擎未设置时会忽略它），再在引擎上设置 `CALLER_SECRET`。
   - 轮换：先在引擎上把新 secret 加在旧的旁边（`CALLER_SECRET=old,new`），再把下游切到新的，最后从引擎上删掉旧的。每一步都改了引擎的环境变量，都需要重启。
-- **服务端点（可选）：**`/svc/v1/*` 是三棵子树，各自只在设置了自己的 secret 时才挂载。每个 secret 至少 32 字节（更短会导致启动失败），保存在下游的服务器上，以下面列出的 header 发送。未设置 ⇒ 对应子树不挂载，这些路径与任何未知路径表现一致。契约见 [API 参考 → 服務端點](api-reference.zh.md#服務端點)。
+- **服务端点（可选）：**`/svc/v1/*` 是四棵子树，各自只在设置了自己的 secret 时才挂载。每个 secret 至少 32 字节（更短会导致启动失败），保存在下游的服务器上，以下面列出的 header 发送。未设置 ⇒ 对应子树不挂载，这些路径与任何未知路径表现一致。契约见 [API 参考 → 服務端點](api-reference.zh.md#服務端點)。
   - `INSIGHTS_EXPORT_SECRET`（`x-insights-export-secret`）挂载 `GET /svc/v1/insights/changes`，把自某个 keyset 游标以来有变动的 `human_insights` 行交给下游服务，让它不碰数据库就能维护一份对话推导画像的只读镜像；挂载 `GET /svc/v1/memories/changes`，以同样的方式交出画像层的抽取记忆；还挂载 `GET /svc/v1/insights/deletions`，即这两种镜像都必须读取的已抹除用户流。
   - `FACTS_EXPORT_SECRET`（`x-facts-export-secret`）挂载 `GET /svc/v1/facts/changes`，即以 keyset 流形式交出的事实账本，以及 `GET /svc/v1/facts/deletions`，供事实镜像使用的同一条已抹除用户流。
   - 两个导出 secret 任设一个，还会挂载 `GET /svc/v1/rows/deletions`：用户本人逐条删除的记忆与事实，这两种镜像也都必须读取。任一 header 都能打开它。
   - `USER_ERASE_SECRET`（`x-user-erase-secret`）挂载 `POST /svc/v1/users/{user_id}/erase`，删除引擎关于某个用户派生出的一切。即使部署没有启用任何导出，它也能用。请在删除该用户的 session 之前、并先停掉该用户的流量再调用（[洞察 → 抹除](insights.zh.md#抹除)）。
+  - `GENOME_WRITE_SECRET`（`x-genome-write-secret`）挂载 `POST /svc/v1/genomes` 与 `PUT /svc/v1/genomes/{id}`，用一张 [eros-character](eros-character-v1.1.md) 卡片创建、覆盖一个角色 genome，这样自己编写角色的下游服务器就不必直接写 `engine.persona_genomes`。这两条路由不做归属检查：请求里没有用户，归属由调用方自己负责。即使部署没有启用任何导出和抹除，它们也能用。
 - **健康探針：** `GET /healthz` 返 200，響應 `{ status: "ok", service, version, timestamp }`。把這個接到平台的健康檢查上。
 - **OpenAPI / Scalar：** `GET /docs` 提供實時的 Scalar 參考。原始 OpenAPI JSON 不走 HTTP——用 `print-openapi` 子命令导出。
 - **给前端的好感度：** `GET /bff/v1/comp/affinity/{session_id}` 返回读时刷新过的绝对向量，`.../event` 返回逐轮 delta 加该轮结束时的状态；`GET /bff/v1/comp/affinities/{user_id}` 是第一条的列表形态 —— 一次分页往返拿到该用户所有伴侣刷新后的值，给渲染会话列表的客户端用。三条都做 JWT + ownership 检查、都常驻——`v1.3.1` 起 `EXPOSE_AFFINITY_DEBUG` 开关和它挡着的 debug 路由都已删除。见 [migrating/v1-3-1-affinity-4-0.md](migrating/v1-3-1-affinity-4-0.md)。
