@@ -244,6 +244,9 @@ impl UserAction {
                 | UserAction::Strip
                 | UserAction::ShowerTogether
                 | UserAction::BathTogether
+                | UserAction::SexTogether
+                | UserAction::StreakTogether
+                | UserAction::Propose
                 | UserAction::Threaten
                 | UserAction::Tip { .. }
         )
@@ -276,7 +279,7 @@ impl UserAction {
     /// giving something to keep is friendship, every physical gesture is
     /// romance. A refused tip drops nothing (spec 2026-10-11 §6), nor does
     /// seeing through a bluff, a threat or a trick (spec 2026-11-08 §2.2), nor
-    /// does turning down a date.
+    /// does turning down a date or a proposal.
     pub fn refusal_line(&self) -> Option<AffinityLine> {
         match self {
             UserAction::Give { .. } | UserAction::Gift { .. } => Some(AffinityLine::Bond),
@@ -284,6 +287,7 @@ impl UserAction {
             | UserAction::Bluff
             | UserAction::Threaten
             | UserAction::Trick
+            | UserAction::Propose
             | UserAction::Date { .. } => None,
             _ => Some(AffinityLine::Chemistry),
         }
@@ -696,6 +700,39 @@ mod tests {
         ] {
             assert_eq!(a.together_kind(), None, "{a:?}");
         }
+    }
+
+    /// Spec 2026-11-23-twelve-together-actions-and-propose-design.md §4.2,
+    /// §7: of the thirteen, bed, streaking and a proposal are charged.
+    #[test]
+    fn sex_streaking_and_a_proposal_speak_emotionally() {
+        for a in [
+            UserAction::SexTogether,
+            UserAction::StreakTogether,
+            UserAction::Propose,
+        ] {
+            assert!(a.speaks_emotionally(), "{a:?}");
+        }
+        for a in [
+            UserAction::ToiletTogether,
+            UserAction::SmokeTogether,
+            UserAction::FallAsleepTogether,
+            UserAction::WalkTogether,
+            UserAction::SmokeWeedTogether,
+            UserAction::JogTogether,
+            UserAction::YogaTogether,
+            UserAction::StargazeTogether,
+            UserAction::RideHorseTogether,
+            UserAction::DrinkTogether,
+        ] {
+            assert!(!a.speaks_emotionally(), "{a:?}");
+        }
+    }
+
+    /// Spec 2026-11-23 §7: turning a proposal down costs nothing.
+    #[test]
+    fn a_refused_proposal_drops_no_line() {
+        assert_eq!(UserAction::Propose.refusal_line(), None);
     }
 
     /// Spec 2026-11-23-twelve-together-actions-and-propose-design.md §7.

@@ -74,17 +74,29 @@ pub fn strip_ruled_out(event: &Event) -> bool {
     }
 }
 
-/// Whether this turn's `shower_together` or `bath_together` is ruled out
-/// before the judge (spec 2026-11-20-together-actions-state-in-picture-and-
-/// genome-routes-design.md §5): the turn's scopes are not romance-compatible,
-/// as for `strip`. A `sauna_together` never is.
-pub fn together_ruled_out(event: &Event) -> bool {
+/// Whether this turn's together action is ruled out before the judge (spec
+/// 2026-11-20-together-actions-state-in-picture-and-genome-routes-design.md
+/// §5, 2026-11-23-twelve-together-actions-and-propose-design.md §4.1): a
+/// `shower_together`, `bath_together`, `sex_together` or `streak_together`
+/// when the turn's scopes are not romance-compatible, as for `strip`; a
+/// `toilet_together` when the persona is a `machine`. No other action is.
+pub fn together_ruled_out(event: &Event, machine: bool) -> bool {
     match event {
         Event::UserMessage {
-            action: Some(UserAction::ShowerTogether | UserAction::BathTogether),
+            action:
+                Some(
+                    UserAction::ShowerTogether
+                    | UserAction::BathTogether
+                    | UserAction::SexTogether
+                    | UserAction::StreakTogether,
+                ),
             affinity_scope,
             ..
         } => !crate::scope::romance_compatible(*affinity_scope),
+        Event::UserMessage {
+            action: Some(UserAction::ToiletTogether),
+            ..
+        } => machine,
         _ => false,
     }
 }
@@ -1047,22 +1059,84 @@ mod tests {
         for a in [UserAction::ShowerTogether, UserAction::BathTogether] {
             for (memory, affinity, compatible) in scopes {
                 assert_eq!(
-                    together_ruled_out(&scoped(a.clone(), memory, affinity)),
+                    together_ruled_out(&scoped(a.clone(), memory, affinity), false),
                     !compatible,
                     "{a:?} {memory:?} {affinity:?}"
                 );
             }
         }
         for (memory, affinity, _) in scopes {
-            assert!(!together_ruled_out(&scoped(
-                UserAction::SaunaTogether,
-                memory,
-                affinity
-            )));
+            assert!(!together_ruled_out(
+                &scoped(UserAction::SaunaTogether, memory, affinity),
+                false
+            ));
         }
-        assert!(!together_ruled_out(&action_msg(UserAction::Strip)));
-        assert!(!together_ruled_out(&action_msg(UserAction::Kiss)));
-        assert!(!together_ruled_out(&user_msg("hi")));
+        assert!(!together_ruled_out(&action_msg(UserAction::Strip), false));
+        assert!(!together_ruled_out(&action_msg(UserAction::Kiss), false));
+        assert!(!together_ruled_out(&user_msg("hi"), false));
+    }
+
+    /// Spec 2026-11-23-twelve-together-actions-and-propose-design.md §4.1:
+    /// bed and streaking need a compatible pair, a machine never goes to the
+    /// toilet, and nothing else is ruled out here.
+    #[test]
+    fn the_new_together_actions_are_ruled_out_by_scopes_or_species_only() {
+        use crate::scope::{AffinityScope, MemoryScope};
+        let scoped = |a: UserAction, compatible: bool| {
+            let mut e = action_msg(a);
+            if let Event::UserMessage {
+                memory_scope,
+                affinity_scope,
+                ..
+            } = &mut e
+            {
+                if compatible {
+                    *memory_scope = MemoryScope::Full;
+                    *affinity_scope = AffinityScope::full();
+                } else {
+                    *memory_scope = MemoryScope::default();
+                    *affinity_scope = AffinityScope::default();
+                }
+            }
+            e
+        };
+        for a in [UserAction::SexTogether, UserAction::StreakTogether] {
+            for machine in [false, true] {
+                assert!(
+                    together_ruled_out(&scoped(a.clone(), false), machine),
+                    "{a:?}"
+                );
+                assert!(
+                    !together_ruled_out(&scoped(a.clone(), true), machine),
+                    "{a:?}"
+                );
+            }
+        }
+        for compatible in [false, true] {
+            let toilet = scoped(UserAction::ToiletTogether, compatible);
+            assert!(together_ruled_out(&toilet, true));
+            assert!(!together_ruled_out(&toilet, false));
+        }
+        for a in [
+            UserAction::SaunaTogether,
+            UserAction::FallAsleepTogether,
+            UserAction::WalkTogether,
+            UserAction::JogTogether,
+            UserAction::YogaTogether,
+            UserAction::StargazeTogether,
+            UserAction::RideHorseTogether,
+            UserAction::SmokeTogether,
+            UserAction::SmokeWeedTogether,
+            UserAction::DrinkTogether,
+            UserAction::Propose,
+        ] {
+            for compatible in [false, true] {
+                assert!(
+                    !together_ruled_out(&scoped(a.clone(), compatible), true),
+                    "{a:?}"
+                );
+            }
+        }
     }
 
     #[test]

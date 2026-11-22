@@ -5288,9 +5288,14 @@ pub(crate) fn run_stream_with(
         // world-setting-design.md §2.1): decided here too, so the judge writes
         // for the outcome.
         let strip_refused = pde::strip_ruled_out(&input.event);
-        // So is a shower or bath together (spec 2026-11-20-together-actions-
-        // state-in-picture-and-genome-routes-design.md §5).
-        let together_refused = pde::together_ruled_out(&input.event);
+        // So is a together action the pair or the persona cannot have (spec
+        // 2026-11-20-together-actions-state-in-picture-and-genome-routes-
+        // design.md §5, 2026-11-23-twelve-together-actions-and-propose-
+        // design.md §4.1).
+        let together_refused = pde::together_ruled_out(
+            &input.event,
+            crate::prompt::persona_traits(&input.persona).machine,
+        );
         // A date she cannot go on (spec 2026-11-12-activity-sub-session-
         // design.md §4.3): she is offline, or a `mid` one is asked below bond
         // tier 2. On the decayed affinity this turn reads. Another date of
