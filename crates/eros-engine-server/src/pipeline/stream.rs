@@ -2830,6 +2830,18 @@ fn render_product_qa_pairs(pairs: &[(String, String)]) -> String {
         .join("\n")
 }
 
+/// Whether an accepted `action` shows her picture: a `photo`, a `strip`, an
+/// `ask_dancing`, or a together action (spec 2026-11-20-together-actions-
+/// state-in-picture-and-genome-routes-design.md §5, 2026-11-23-twelve-
+/// together-actions-and-propose-design.md §4).
+fn is_picture_action(action: &eros_engine_core::types::UserAction) -> bool {
+    use eros_engine_core::types::UserAction;
+    matches!(
+        action,
+        UserAction::Photo | UserAction::Strip | UserAction::AskDancing
+    ) || action.together_kind().is_some()
+}
+
 /// The action type a `photo`, `strip`, `ask_dancing` or together action turn
 /// changes to, or `None` when the plan stands (spec 2026-11-08-five-actions-
 /// two-items-gluttony-card-1-1-design.md §2.3, 2026-11-08-strip-and-world-
@@ -2857,16 +2869,9 @@ fn picture_action(
         && !matches!(
             event,
             Event::UserMessage {
-                action: Some(
-                    UserAction::Photo
-                        | UserAction::Strip
-                        | UserAction::AskDancing
-                        | UserAction::ShowerTogether
-                        | UserAction::BathTogether
-                        | UserAction::SaunaTogether
-                ),
+                action: Some(a),
                 ..
-            }
+            } if is_picture_action(a)
         )
     {
         return None;
@@ -5273,16 +5278,9 @@ pub(crate) fn run_stream_with(
             && matches!(
                 &input.event,
                 Event::UserMessage {
-                    action: Some(
-                        eros_engine_core::types::UserAction::Photo
-                            | eros_engine_core::types::UserAction::Strip
-                            | eros_engine_core::types::UserAction::AskDancing
-                            | eros_engine_core::types::UserAction::ShowerTogether
-                            | eros_engine_core::types::UserAction::BathTogether
-                            | eros_engine_core::types::UserAction::SaunaTogether
-                    ),
+                    action: Some(a),
                     ..
-                }
+                } if is_picture_action(a)
             );
         let pde_transcript: JudgeTranscript = if resolved_pde.is_some()
             || force_image
@@ -20682,6 +20680,67 @@ data: [DONE]\n\n";
             picture_action(&input.event, &plan, true),
             Some(ReplyTextImage)
         );
+    }
+
+    /// Spec 2026-11-23-twelve-together-actions-and-propose-design.md §4, §7:
+    /// each of the twelve is a picture turn when accepted; a proposal leaves
+    /// the plan as the judge made it.
+    #[test]
+    fn the_new_together_actions_are_picture_turns_and_a_proposal_is_not() {
+        use eros_engine_core::types::ActionResponse::{Accept, Refuse};
+        use eros_engine_core::types::ActionType::{ReplyImage, ReplyText, ReplyTextImage};
+        use eros_engine_core::types::UserAction::{
+            DrinkTogether, FallAsleepTogether, JogTogether, Kiss, Propose, RideHorseTogether,
+            SexTogether, SmokeTogether, SmokeWeedTogether, StargazeTogether, StreakTogether,
+            ToiletTogether, WalkTogether, YogaTogether,
+        };
+        let mut cases = Vec::new();
+        for a in [
+            ToiletTogether,
+            SmokeTogether,
+            FallAsleepTogether,
+            SexTogether,
+            WalkTogether,
+            SmokeWeedTogether,
+            JogTogether,
+            YogaTogether,
+            StargazeTogether,
+            RideHorseTogether,
+            StreakTogether,
+            DrinkTogether,
+        ] {
+            assert!(is_picture_action(&a), "{a:?}");
+            cases.extend([
+                (a.clone(), Accept, ReplyText, true, Some(ReplyTextImage)),
+                (a.clone(), Accept, ReplyImage, true, Some(ReplyTextImage)),
+                (a.clone(), Accept, ReplyText, false, None),
+                (a.clone(), Refuse, ReplyTextImage, true, Some(ReplyText)),
+                (a, Refuse, ReplyText, true, None),
+            ]);
+        }
+        for a in [Propose, Kiss] {
+            assert!(!is_picture_action(&a), "{a:?}");
+            cases.extend([
+                (a.clone(), Accept, ReplyText, true, None),
+                (a.clone(), Accept, ReplyTextImage, true, None),
+                (a.clone(), Refuse, ReplyTextImage, true, None),
+                (a, Refuse, ReplyText, true, None),
+            ]);
+        }
+        for (a, response, ty, available, want) in cases {
+            let mut input = fixture_decision_input();
+            if let Event::UserMessage { action, .. } = &mut input.event {
+                *action = Some(a.clone());
+            }
+            let mut plan = pde::decide(&input);
+            plan.action_response = Some(response);
+            plan.action_type = ty;
+            assert_eq!(
+                picture_action(&input.event, &plan, available),
+                want,
+                "{a:?} {response:?} {ty:?} {available}"
+            );
+        }
     }
 
     #[test]
