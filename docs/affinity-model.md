@@ -249,7 +249,8 @@ during an offline stretch moves none of them (see
 A chat turn can carry a user action (see the `action` field in
 [api-reference.md](api-reference.md)). The PDE judge decides before the reply
 whether the persona accepts it; without a definite refusal the engine accepts,
-except for a give of tobacco, alcohol, weed, coffee or a dish her persona does not take, which a
+except for a give of tobacco, alcohol, weed, coffee or a dish her persona does not take, or the
+user's ask to smoke, smoke weed or drink with her when she does not, which a
 roll can refuse whatever the judge says
 ([persona settings](life-events-needs.md#persona-settings)).
 
@@ -270,8 +271,11 @@ roll can refuse whatever the judge says
   through it, and drops no line either; the turn is graded like any other.
 - **Strip:** a `strip` from a pair whose `affinity_scope` is not romance-compatible is
   refused whatever the judge says, and drops Chemistry like any refused
-  physical action. So is a `shower_together` or `bath_together` from such a pair;
-  `sauna_together` has no such rule.
+  physical action. So is a `shower_together`, `bath_together`, `sex_together` or
+  `streak_together` from such a pair, and a `toilet_together` to a machine persona; the other
+  together actions have no such rule. A `smoke_together`, `smoke_weed_together` or
+  `drink_together` the roll refuses drops Chemistry too, not Bond.
+- **Proposal:** a refused `propose` drops no line; the turn is graded like any other.
 - **Gift:** accepted, the gift also joins the persona's items or wardrobe;
   refused, it joins nothing and drops Bond like a refused `give`.
 - **Date:** a refused `date` invitation drops no line; the turn is graded like

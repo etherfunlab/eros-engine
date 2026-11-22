@@ -173,7 +173,8 @@ model_name_display_override = true
 #   be cared about, times 2 when the pair is romantically compatible, capped
 #   at 1;
 # - a reply to french_kiss, tease, hug_from_behind, touch, strip,
-#   shower_together, bath_together, threaten or tip, accepted or refused, and
+#   shower_together, bath_together, sex_together, streak_together, propose,
+#   threaten or tip, accepted or refused, and
 #   the start message of sixteen life-event kinds, are ALWAYS emotional,
 #   whatever the value (see docs/model-config.md, "tones").
 # An emotional reply is written without the chat history, the user profile or

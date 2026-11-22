@@ -55,7 +55,7 @@ value of the wrong shape reads as absent.
 |---|---|---|
 | `gender` | string | `male` or `female`; any other word is rendered as written. |
 | `age` | integer, or a string holding one | Her age. |
-| `species` | string | `human`, `alien`, `beastkin`, `elf`, `deity`, `cyborg`, `robot`, `android`, `zombie`, or any other word. Absent means human. `robot` and `android` are machines: the prompt calls her no AI assistant rather than no AI, and life events never give her a period or a visit to the toilet ([life-events-needs.md](life-events-needs.md#gates)). |
+| `species` | string | `human`, `alien`, `beastkin`, `elf`, `deity`, `cyborg`, `robot`, `android`, `zombie`, or any other word. Absent means human. `robot` and `android` are machines: the prompt calls her no AI assistant rather than no AI, and life events never give her a period or a visit to the toilet ([life-events-needs.md](life-events-needs.md#gates)), nor does she accept the user's `toilet_together`. |
 | `planet` | string | Free text. `earth` or absent renders no planet. |
 | `hometown` | string | Free text. |
 | `timezone` | string | IANA zone of her clock. Absent: the request's `user_timezone`, else `Asia/Singapore`. |
@@ -69,7 +69,7 @@ value of the wrong shape reads as absent.
 | `possessions` | array of strings | Things she owns, merged with the instance's item rows. |
 | `wardrobe` | array of strings | Clothes she can wear, merged with the instance's item rows. |
 | `moody` | boolean | Whether her moods run high: `true` makes an emotional reply three times as likely, `false` a third as likely. Read only by the chat tone draw ([model-config.md](model-config.md#tones--chat-tones-chat-task-only)); it reaches no prompt. |
-| `smoking`, `alcoholic`, `drug`, `coffee`, `gluttony` | boolean | Whether she smokes, drinks, uses weed, drinks coffee, loves good food: how she takes a `give` of each, how fast her craving for what she's hooked on builds, and what it names. `smoking`, `alcoholic` and `drug` set to `true` also let life events draw her smoking, drinking and smoking weed. See [life-events-needs.md](life-events-needs.md#persona-settings). |
+| `smoking`, `alcoholic`, `drug`, `coffee`, `gluttony` | boolean | Whether she smokes, drinks, uses weed, drinks coffee, loves good food: how she takes a `give` of each (and the user's ask to smoke, smoke weed or drink with her), how fast her craving for what she's hooked on builds, and what it names. `smoking`, `alcoholic` and `drug` set to `true` also let life events draw her smoking, drinking and smoking weed. See [life-events-needs.md](life-events-needs.md#persona-settings). |
 | `health` | string | `weak`, `normal` or `strong`. Read by life events. |
 | `prefer_trip` | boolean | Read by life events. |
 | `prefer_events` | array of strings | Read by life events. |
