@@ -119,26 +119,25 @@ fn phase(row: &[u8], i: usize) -> EffectPhase {
 
 /// `prior` holds the turns before the current one, newest first: the action
 /// each turn carried if it was accepted, else `None`. Returns the active
-/// effects, newest first (§3).
+/// effects, newest first (§3). A habit action counts as a give of one of its
+/// item (spec 2026-11-23-twelve-together-actions-and-propose-design.md §5).
 pub fn active_effects(prior: &[Option<UserAction>]) -> Vec<ActiveEffect> {
     prior
         .iter()
         .enumerate()
         .filter_map(|(i, action)| {
-            let UserAction::Give {
+            let action = action.as_ref()?;
+            let (item, quantity) = action.consumed()?;
+            let name = match action {
+                UserAction::Give { name, .. } => name.clone(),
+                _ => None,
+            };
+            let row = curve(item, quantity);
+            let level = *row.get(i)?;
+            Some(ActiveEffect {
                 item,
                 name,
                 quantity,
-            } = action.as_ref()?
-            else {
-                return None;
-            };
-            let row = curve(*item, *quantity);
-            let level = *row.get(i)?;
-            Some(ActiveEffect {
-                item: *item,
-                name: name.clone(),
-                quantity: *quantity,
                 level,
                 phase: phase(row, i),
                 step: (i + 1) as u8,
@@ -159,6 +158,30 @@ mod tests {
             name: None,
             quantity,
         })
+    }
+
+    /// Spec 2026-11-23-twelve-together-actions-and-propose-design.md §5.
+    #[test]
+    fn a_habit_action_lingers_as_one_of_its_item() {
+        for (a, item) in [
+            (UserAction::SmokeTogether, GivenItem::Cigarette),
+            (UserAction::SmokeWeedTogether, GivenItem::Herb),
+            (UserAction::DrinkTogether, GivenItem::Alcohol),
+        ] {
+            let got = active_effects(&[Some(a.clone())]);
+            assert_eq!(got.len(), 1, "{a:?}");
+            assert_eq!(got, active_effects(&[give(item, 1)]), "{a:?}");
+            assert_eq!((got[0].item, got[0].quantity), (item, 1));
+            assert_eq!(got[0].name, None);
+        }
+        for a in [
+            UserAction::WalkTogether,
+            UserAction::SexTogether,
+            UserAction::FallAsleepTogether,
+            UserAction::Propose,
+        ] {
+            assert!(active_effects(&[Some(a.clone())]).is_empty(), "{a:?}");
+        }
     }
 
     /// The spec's §4.1 rows for quantities 1–5 and above 5, with the §4.2

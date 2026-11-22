@@ -275,6 +275,21 @@ impl UserAction {
         }
     }
 
+    /// What this action has her take, and how many: a `give` its item and
+    /// quantity, a habit action one cigarette, herb or drink (spec
+    /// 2026-11-23-twelve-together-actions-and-propose-design.md §5). The habit
+    /// roll, the need move and the lingering effect all read it. `None` for
+    /// every other action.
+    pub fn consumed(&self) -> Option<(GivenItem, u8)> {
+        match self {
+            UserAction::Give { item, quantity, .. } => Some((*item, *quantity)),
+            UserAction::SmokeTogether => Some((GivenItem::Cigarette, 1)),
+            UserAction::SmokeWeedTogether => Some((GivenItem::Herb, 1)),
+            UserAction::DrinkTogether => Some((GivenItem::Alcohol, 1)),
+            _ => None,
+        }
+    }
+
     /// The line a refusal of this action drops: handing something over or
     /// giving something to keep is friendship, every physical gesture is
     /// romance. A refused tip drops nothing (spec 2026-10-11 §6), nor does
@@ -726,6 +741,29 @@ mod tests {
             UserAction::DrinkTogether,
         ] {
             assert!(!a.speaks_emotionally(), "{a:?}");
+        }
+    }
+
+    /// Spec 2026-11-23-twelve-together-actions-and-propose-design.md §5.
+    #[test]
+    fn a_habit_action_has_her_take_one_of_the_item() {
+        use GivenItem::*;
+        assert_eq!(UserAction::SmokeTogether.consumed(), Some((Cigarette, 1)));
+        assert_eq!(UserAction::SmokeWeedTogether.consumed(), Some((Herb, 1)));
+        assert_eq!(UserAction::DrinkTogether.consumed(), Some((Alcohol, 1)));
+        let give = UserAction::Give {
+            item: Coffee,
+            name: None,
+            quantity: 3,
+        };
+        assert_eq!(give.consumed(), Some((Coffee, 3)));
+        for a in [
+            UserAction::WalkTogether,
+            UserAction::SexTogether,
+            UserAction::Kiss,
+            UserAction::Propose,
+        ] {
+            assert_eq!(a.consumed(), None, "{a:?}");
         }
     }
 

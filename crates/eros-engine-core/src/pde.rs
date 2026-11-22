@@ -49,13 +49,17 @@ pub const UNUSED_SUBSTANCE_ACCEPT: f64 = 1.0 / 3.0;
 /// Whether the habit roll refuses this turn's give: a `give` of tobacco,
 /// alcohol, weed, coffee or cuisine whose key is explicitly `false`, with `roll` (uniform in
 /// [0, 1)) at or above `UNUSED_SUBSTANCE_ACCEPT`. Rolled before the judge,
-/// so the judge can be told.
+/// so the judge can be told. A `smoke_together`, `smoke_weed_together` or
+/// `drink_together` is rolled as a give of its item is (spec 2026-11-23-
+/// twelve-together-actions-and-propose-design.md §5).
 pub fn refuses_give(event: &Event, habits: Habits, roll: f64) -> bool {
     match event {
         Event::UserMessage {
-            action: Some(UserAction::Give { item, .. }),
+            action: Some(action),
             ..
-        } => habits.uses(*item) == Some(false) && roll >= UNUSED_SUBSTANCE_ACCEPT,
+        } => action.consumed().is_some_and(|(item, _)| {
+            habits.uses(item) == Some(false) && roll >= UNUSED_SUBSTANCE_ACCEPT
+        }),
         _ => false,
     }
 }
@@ -1163,6 +1167,81 @@ mod tests {
             }
         }
         assert!(!date_ruled_out(&user_msg("hi"), 1, true));
+    }
+
+    /// Spec 2026-11-23-twelve-together-actions-and-propose-design.md §5: a
+    /// habit action is rolled as a give of its item is, and only when the
+    /// persona's key is explicitly `false`.
+    #[test]
+    fn a_habit_action_is_rolled_as_a_give_of_its_item() {
+        use crate::needs::Habits;
+        for (a, habits) in [
+            (
+                UserAction::SmokeTogether,
+                Habits {
+                    smoking: Some(false),
+                    ..Default::default()
+                },
+            ),
+            (
+                UserAction::SmokeWeedTogether,
+                Habits {
+                    drug: Some(false),
+                    ..Default::default()
+                },
+            ),
+            (
+                UserAction::DrinkTogether,
+                Habits {
+                    alcoholic: Some(false),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let e = action_msg(a.clone());
+            assert!(
+                !refuses_give(&e, habits, UNUSED_SUBSTANCE_ACCEPT - 1e-9),
+                "{a:?}"
+            );
+            assert!(refuses_give(&e, habits, UNUSED_SUBSTANCE_ACCEPT), "{a:?}");
+            assert!(refuses_give(&e, habits, 0.99), "{a:?}");
+            // An unset key never rolls.
+            assert!(!refuses_give(&e, Habits::default(), 0.99), "{a:?}");
+        }
+        let all_true = Habits {
+            smoking: Some(true),
+            alcoholic: Some(true),
+            drug: Some(true),
+            ..Default::default()
+        };
+        let all_false = Habits {
+            smoking: Some(false),
+            alcoholic: Some(false),
+            drug: Some(false),
+            coffee: Some(false),
+            gluttony: Some(false),
+        };
+        for a in [
+            UserAction::SmokeTogether,
+            UserAction::SmokeWeedTogether,
+            UserAction::DrinkTogether,
+        ] {
+            assert!(
+                !refuses_give(&action_msg(a.clone()), all_true, 0.99),
+                "{a:?}"
+            );
+        }
+        // Not a habit action: never rolled, whatever she does not use.
+        for a in [
+            UserAction::WalkTogether,
+            UserAction::SexTogether,
+            UserAction::Propose,
+        ] {
+            assert!(
+                !refuses_give(&action_msg(a.clone()), all_false, 0.99),
+                "{a:?}"
+            );
+        }
     }
 
     #[test]
