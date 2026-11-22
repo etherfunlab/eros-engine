@@ -367,7 +367,10 @@ fn kind_cue(
         OutShopping => "（你正在外面逛街。）".into(),
         AwayFromPhone | Asleep | BrosGathering | SisGathering | HavingSex | TakingSpace
         | FellOut | TravelingTogether | BathingTogether | OnADate | ShoweringTogether
-        | SaunaTogether => {
+        | SaunaTogether | UsingToiletTogether | SmokingTogether | AsleepTogether
+        | HavingSexTogether | WalkingTogether | SmokingWeedTogether | JoggingTogether
+        | YogaTogether | StargazingTogether | HorseRidingTogether | StreakingTogether
+        | DrinkingTogether => {
             unreachable!("{kind:?} is never told")
         }
         Sick => format!("（你生病了，大概要 {span}才会好。）"),
