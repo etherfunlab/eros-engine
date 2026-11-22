@@ -153,6 +153,27 @@ pub enum UserAction {
     ShowerTogether,
     BathTogether,
     SaunaTogether,
+    /// Twelve more things the user asks to do with her (spec
+    /// 2026-11-23-twelve-together-actions-and-propose-design.md §4): each
+    /// behaves as `sauna_together` does, placing the event `together_kind`
+    /// names. `fall_asleep_together` is the literal sleep; `sex_together` is
+    /// her `sleep_together` ask the other way round (§6). The three habit
+    /// actions count as a give of one (§5).
+    ToiletTogether,
+    SmokeTogether,
+    FallAsleepTogether,
+    SexTogether,
+    WalkTogether,
+    SmokeWeedTogether,
+    JogTogether,
+    YogaTogether,
+    StargazeTogether,
+    RideHorseTogether,
+    StreakTogether,
+    DrinkTogether,
+    /// The user asks her to marry them (spec 2026-11-23 §7): the judge
+    /// decides, a refusal drops nothing, and no event is placed.
+    Propose,
     Custom {
         text: String,
     },
@@ -223,6 +244,9 @@ impl UserAction {
                 | UserAction::Strip
                 | UserAction::ShowerTogether
                 | UserAction::BathTogether
+                | UserAction::SexTogether
+                | UserAction::StreakTogether
+                | UserAction::Propose
                 | UserAction::Threaten
                 | UserAction::Tip { .. }
         )
@@ -235,6 +259,33 @@ impl UserAction {
             UserAction::ShowerTogether => Some(EventKind::ShoweringTogether),
             UserAction::BathTogether => Some(EventKind::BathingTogether),
             UserAction::SaunaTogether => Some(EventKind::SaunaTogether),
+            UserAction::ToiletTogether => Some(EventKind::UsingToiletTogether),
+            UserAction::SmokeTogether => Some(EventKind::SmokingTogether),
+            UserAction::FallAsleepTogether => Some(EventKind::AsleepTogether),
+            UserAction::SexTogether => Some(EventKind::HavingSexTogether),
+            UserAction::WalkTogether => Some(EventKind::WalkingTogether),
+            UserAction::SmokeWeedTogether => Some(EventKind::SmokingWeedTogether),
+            UserAction::JogTogether => Some(EventKind::JoggingTogether),
+            UserAction::YogaTogether => Some(EventKind::YogaTogether),
+            UserAction::StargazeTogether => Some(EventKind::StargazingTogether),
+            UserAction::RideHorseTogether => Some(EventKind::HorseRidingTogether),
+            UserAction::StreakTogether => Some(EventKind::StreakingTogether),
+            UserAction::DrinkTogether => Some(EventKind::DrinkingTogether),
+            _ => None,
+        }
+    }
+
+    /// What this action has her take, and how many: a `give` its item and
+    /// quantity, a habit action one cigarette, herb or drink (spec
+    /// 2026-11-23-twelve-together-actions-and-propose-design.md §5). The habit
+    /// roll, the need move and the lingering effect all read it. `None` for
+    /// every other action.
+    pub fn consumed(&self) -> Option<(GivenItem, u8)> {
+        match self {
+            UserAction::Give { item, quantity, .. } => Some((*item, *quantity)),
+            UserAction::SmokeTogether => Some((GivenItem::Cigarette, 1)),
+            UserAction::SmokeWeedTogether => Some((GivenItem::Herb, 1)),
+            UserAction::DrinkTogether => Some((GivenItem::Alcohol, 1)),
             _ => None,
         }
     }
@@ -243,7 +294,7 @@ impl UserAction {
     /// giving something to keep is friendship, every physical gesture is
     /// romance. A refused tip drops nothing (spec 2026-10-11 §6), nor does
     /// seeing through a bluff, a threat or a trick (spec 2026-11-08 §2.2), nor
-    /// does turning down a date.
+    /// does turning down a date or a proposal.
     pub fn refusal_line(&self) -> Option<AffinityLine> {
         match self {
             UserAction::Give { .. } | UserAction::Gift { .. } => Some(AffinityLine::Bond),
@@ -251,6 +302,7 @@ impl UserAction {
             | UserAction::Bluff
             | UserAction::Threaten
             | UserAction::Trick
+            | UserAction::Propose
             | UserAction::Date { .. } => None,
             _ => Some(AffinityLine::Chemistry),
         }
@@ -581,6 +633,67 @@ mod tests {
                 "sauna_together",
                 EventKind::SaunaTogether,
             ),
+            // Spec 2026-11-23-twelve-together-actions-and-propose-design.md §4.
+            (
+                UserAction::ToiletTogether,
+                "toilet_together",
+                EventKind::UsingToiletTogether,
+            ),
+            (
+                UserAction::SmokeTogether,
+                "smoke_together",
+                EventKind::SmokingTogether,
+            ),
+            (
+                UserAction::FallAsleepTogether,
+                "fall_asleep_together",
+                EventKind::AsleepTogether,
+            ),
+            (
+                UserAction::SexTogether,
+                "sex_together",
+                EventKind::HavingSexTogether,
+            ),
+            (
+                UserAction::WalkTogether,
+                "walk_together",
+                EventKind::WalkingTogether,
+            ),
+            (
+                UserAction::SmokeWeedTogether,
+                "smoke_weed_together",
+                EventKind::SmokingWeedTogether,
+            ),
+            (
+                UserAction::JogTogether,
+                "jog_together",
+                EventKind::JoggingTogether,
+            ),
+            (
+                UserAction::YogaTogether,
+                "yoga_together",
+                EventKind::YogaTogether,
+            ),
+            (
+                UserAction::StargazeTogether,
+                "stargaze_together",
+                EventKind::StargazingTogether,
+            ),
+            (
+                UserAction::RideHorseTogether,
+                "ride_horse_together",
+                EventKind::HorseRidingTogether,
+            ),
+            (
+                UserAction::StreakTogether,
+                "streak_together",
+                EventKind::StreakingTogether,
+            ),
+            (
+                UserAction::DrinkTogether,
+                "drink_together",
+                EventKind::DrinkingTogether,
+            ),
         ] {
             let v = serde_json::json!({ "type": wire });
             assert_eq!(serde_json::to_value(&a).unwrap(), v);
@@ -602,6 +715,74 @@ mod tests {
         ] {
             assert_eq!(a.together_kind(), None, "{a:?}");
         }
+    }
+
+    /// Spec 2026-11-23-twelve-together-actions-and-propose-design.md §4.2,
+    /// §7: of the thirteen, bed, streaking and a proposal are charged.
+    #[test]
+    fn sex_streaking_and_a_proposal_speak_emotionally() {
+        for a in [
+            UserAction::SexTogether,
+            UserAction::StreakTogether,
+            UserAction::Propose,
+        ] {
+            assert!(a.speaks_emotionally(), "{a:?}");
+        }
+        for a in [
+            UserAction::ToiletTogether,
+            UserAction::SmokeTogether,
+            UserAction::FallAsleepTogether,
+            UserAction::WalkTogether,
+            UserAction::SmokeWeedTogether,
+            UserAction::JogTogether,
+            UserAction::YogaTogether,
+            UserAction::StargazeTogether,
+            UserAction::RideHorseTogether,
+            UserAction::DrinkTogether,
+        ] {
+            assert!(!a.speaks_emotionally(), "{a:?}");
+        }
+    }
+
+    /// Spec 2026-11-23-twelve-together-actions-and-propose-design.md §5.
+    #[test]
+    fn a_habit_action_has_her_take_one_of_the_item() {
+        use GivenItem::*;
+        assert_eq!(UserAction::SmokeTogether.consumed(), Some((Cigarette, 1)));
+        assert_eq!(UserAction::SmokeWeedTogether.consumed(), Some((Herb, 1)));
+        assert_eq!(UserAction::DrinkTogether.consumed(), Some((Alcohol, 1)));
+        let give = UserAction::Give {
+            item: Coffee,
+            name: None,
+            quantity: 3,
+        };
+        assert_eq!(give.consumed(), Some((Coffee, 3)));
+        for a in [
+            UserAction::WalkTogether,
+            UserAction::SexTogether,
+            UserAction::Kiss,
+            UserAction::Propose,
+        ] {
+            assert_eq!(a.consumed(), None, "{a:?}");
+        }
+    }
+
+    /// Spec 2026-11-23 §7: turning a proposal down costs nothing.
+    #[test]
+    fn a_refused_proposal_drops_no_line() {
+        assert_eq!(UserAction::Propose.refusal_line(), None);
+    }
+
+    /// Spec 2026-11-23-twelve-together-actions-and-propose-design.md §7.
+    #[test]
+    fn propose_is_a_plain_action() {
+        let v = serde_json::json!({ "type": "propose" });
+        assert_eq!(serde_json::to_value(UserAction::Propose).unwrap(), v);
+        assert_eq!(
+            serde_json::from_value::<UserAction>(v).unwrap(),
+            UserAction::Propose
+        );
+        assert_eq!(UserAction::Propose.together_kind(), None);
     }
 
     #[test]

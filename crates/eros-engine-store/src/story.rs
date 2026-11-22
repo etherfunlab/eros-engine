@@ -379,10 +379,11 @@ impl<'a> StoryRepo<'a> {
     /// `cap` newest, and a row under way survives it. Left out: a
     /// `taking_space` / `fell_out` whose session is gone or archived (it
     /// belongs to that relationship), a false alarm still under way (she
-    /// does not know yet), and every `bathing_together`, `showering_together`
-    /// and `on_a_date`: a romantic choice's or action's outcome lives in the
-    /// conversation only (spec 2026-10-30 §4.7), and a date in its own
-    /// sub-session. The narration is dropped when its session is archived; the
+    /// does not know yet), and every `bathing_together`, `showering_together`,
+    /// `having_sex_together`, `streaking_together`, `using_toilet_together`,
+    /// `asleep_together` and `on_a_date`: a romantic choice's or action's
+    /// outcome lives in the conversation only (spec 2026-10-30 §4.7,
+    /// 2026-11-23 §4.3), and a date in its own sub-session. The narration is dropped when its session is archived; the
     /// event stays, as her own life.
     pub async fn life_events(
         &self,
@@ -400,10 +401,17 @@ impl<'a> StoryRepo<'a> {
             .filter(|k| k.is_false_alarm())
             .map(EventKind::as_str)
             .collect();
+        // Romantic outcomes and the private together kinds stay in the
+        // conversation (spec 2026-11-23-twelve-together-actions-and-propose-
+        // design.md §4.3).
         let kept_out: Vec<&str> = [
             EventKind::BathingTogether,
             EventKind::ShoweringTogether,
             EventKind::OnADate,
+            EventKind::HavingSexTogether,
+            EventKind::StreakingTogether,
+            EventKind::UsingToiletTogether,
+            EventKind::AsleepTogether,
         ]
         .into_iter()
         .map(EventKind::as_str)
@@ -1536,6 +1544,65 @@ mod tests {
             .unwrap();
         let kinds: Vec<EventKind> = got.iter().map(|e| e.event.kind).collect();
         assert_eq!(kinds, vec![EventKind::Reading, EventKind::SaunaTogether]);
+    }
+
+    /// Spec 2026-11-23-twelve-together-actions-and-propose-design.md §4.3:
+    /// bed, streaking, the toilet and sleeping together stay out of her
+    /// story; the other eight together kinds reach it.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn life_events_take_eight_of_the_twelve_together_kinds(pool: PgPool) {
+        let repo = StoryRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        let inst = seed_instance(&pool, owner, "A", "active").await;
+        let s = seed_session(&pool, owner, inst).await;
+        let now = Utc::now();
+        let kinds = [
+            EventKind::UsingToiletTogether,
+            EventKind::SmokingTogether,
+            EventKind::AsleepTogether,
+            EventKind::HavingSexTogether,
+            EventKind::WalkingTogether,
+            EventKind::SmokingWeedTogether,
+            EventKind::JoggingTogether,
+            EventKind::YogaTogether,
+            EventKind::StargazingTogether,
+            EventKind::HorseRidingTogether,
+            EventKind::StreakingTogether,
+            EventKind::DrinkingTogether,
+        ];
+        for (i, k) in kinds.iter().enumerate() {
+            let from = now - chrono::Duration::hours(2 * (i as i64 + 1));
+            seed_event(
+                &pool,
+                inst,
+                Some(s),
+                k.as_str(),
+                k.as_str(),
+                from,
+                from + chrono::Duration::minutes(30),
+                None,
+            )
+            .await;
+        }
+        let got = repo
+            .life_events(inst, now - chrono::Duration::days(7), now, 30)
+            .await
+            .unwrap();
+        let mut got: Vec<&str> = got.iter().map(|e| e.event.kind.as_str()).collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![
+                "drinking_together",
+                "horse_riding_together",
+                "jogging_together",
+                "smoking_together",
+                "smoking_weed_together",
+                "stargazing_together",
+                "walking_together",
+                "yoga_together",
+            ]
+        );
     }
 
     /// A date is its own sub-session's affair: it never reaches her story,

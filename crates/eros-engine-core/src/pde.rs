@@ -49,13 +49,17 @@ pub const UNUSED_SUBSTANCE_ACCEPT: f64 = 1.0 / 3.0;
 /// Whether the habit roll refuses this turn's give: a `give` of tobacco,
 /// alcohol, weed, coffee or cuisine whose key is explicitly `false`, with `roll` (uniform in
 /// [0, 1)) at or above `UNUSED_SUBSTANCE_ACCEPT`. Rolled before the judge,
-/// so the judge can be told.
+/// so the judge can be told. A `smoke_together`, `smoke_weed_together` or
+/// `drink_together` is rolled as a give of its item is (spec 2026-11-23-
+/// twelve-together-actions-and-propose-design.md §5).
 pub fn refuses_give(event: &Event, habits: Habits, roll: f64) -> bool {
     match event {
         Event::UserMessage {
-            action: Some(UserAction::Give { item, .. }),
+            action: Some(action),
             ..
-        } => habits.uses(*item) == Some(false) && roll >= UNUSED_SUBSTANCE_ACCEPT,
+        } => action.consumed().is_some_and(|(item, _)| {
+            habits.uses(item) == Some(false) && roll >= UNUSED_SUBSTANCE_ACCEPT
+        }),
         _ => false,
     }
 }
@@ -74,17 +78,29 @@ pub fn strip_ruled_out(event: &Event) -> bool {
     }
 }
 
-/// Whether this turn's `shower_together` or `bath_together` is ruled out
-/// before the judge (spec 2026-11-20-together-actions-state-in-picture-and-
-/// genome-routes-design.md §5): the turn's scopes are not romance-compatible,
-/// as for `strip`. A `sauna_together` never is.
-pub fn together_ruled_out(event: &Event) -> bool {
+/// Whether this turn's together action is ruled out before the judge (spec
+/// 2026-11-20-together-actions-state-in-picture-and-genome-routes-design.md
+/// §5, 2026-11-23-twelve-together-actions-and-propose-design.md §4.1): a
+/// `shower_together`, `bath_together`, `sex_together` or `streak_together`
+/// when the turn's scopes are not romance-compatible, as for `strip`; a
+/// `toilet_together` when the persona is a `machine`. No other action is.
+pub fn together_ruled_out(event: &Event, machine: bool) -> bool {
     match event {
         Event::UserMessage {
-            action: Some(UserAction::ShowerTogether | UserAction::BathTogether),
+            action:
+                Some(
+                    UserAction::ShowerTogether
+                    | UserAction::BathTogether
+                    | UserAction::SexTogether
+                    | UserAction::StreakTogether,
+                ),
             affinity_scope,
             ..
         } => !crate::scope::romance_compatible(*affinity_scope),
+        Event::UserMessage {
+            action: Some(UserAction::ToiletTogether),
+            ..
+        } => machine,
         _ => false,
     }
 }
@@ -1047,22 +1063,84 @@ mod tests {
         for a in [UserAction::ShowerTogether, UserAction::BathTogether] {
             for (memory, affinity, compatible) in scopes {
                 assert_eq!(
-                    together_ruled_out(&scoped(a.clone(), memory, affinity)),
+                    together_ruled_out(&scoped(a.clone(), memory, affinity), false),
                     !compatible,
                     "{a:?} {memory:?} {affinity:?}"
                 );
             }
         }
         for (memory, affinity, _) in scopes {
-            assert!(!together_ruled_out(&scoped(
-                UserAction::SaunaTogether,
-                memory,
-                affinity
-            )));
+            assert!(!together_ruled_out(
+                &scoped(UserAction::SaunaTogether, memory, affinity),
+                false
+            ));
         }
-        assert!(!together_ruled_out(&action_msg(UserAction::Strip)));
-        assert!(!together_ruled_out(&action_msg(UserAction::Kiss)));
-        assert!(!together_ruled_out(&user_msg("hi")));
+        assert!(!together_ruled_out(&action_msg(UserAction::Strip), false));
+        assert!(!together_ruled_out(&action_msg(UserAction::Kiss), false));
+        assert!(!together_ruled_out(&user_msg("hi"), false));
+    }
+
+    /// Spec 2026-11-23-twelve-together-actions-and-propose-design.md §4.1:
+    /// bed and streaking need a compatible pair, a machine never goes to the
+    /// toilet, and nothing else is ruled out here.
+    #[test]
+    fn the_new_together_actions_are_ruled_out_by_scopes_or_species_only() {
+        use crate::scope::{AffinityScope, MemoryScope};
+        let scoped = |a: UserAction, compatible: bool| {
+            let mut e = action_msg(a);
+            if let Event::UserMessage {
+                memory_scope,
+                affinity_scope,
+                ..
+            } = &mut e
+            {
+                if compatible {
+                    *memory_scope = MemoryScope::Full;
+                    *affinity_scope = AffinityScope::full();
+                } else {
+                    *memory_scope = MemoryScope::default();
+                    *affinity_scope = AffinityScope::default();
+                }
+            }
+            e
+        };
+        for a in [UserAction::SexTogether, UserAction::StreakTogether] {
+            for machine in [false, true] {
+                assert!(
+                    together_ruled_out(&scoped(a.clone(), false), machine),
+                    "{a:?}"
+                );
+                assert!(
+                    !together_ruled_out(&scoped(a.clone(), true), machine),
+                    "{a:?}"
+                );
+            }
+        }
+        for compatible in [false, true] {
+            let toilet = scoped(UserAction::ToiletTogether, compatible);
+            assert!(together_ruled_out(&toilet, true));
+            assert!(!together_ruled_out(&toilet, false));
+        }
+        for a in [
+            UserAction::SaunaTogether,
+            UserAction::FallAsleepTogether,
+            UserAction::WalkTogether,
+            UserAction::JogTogether,
+            UserAction::YogaTogether,
+            UserAction::StargazeTogether,
+            UserAction::RideHorseTogether,
+            UserAction::SmokeTogether,
+            UserAction::SmokeWeedTogether,
+            UserAction::DrinkTogether,
+            UserAction::Propose,
+        ] {
+            for compatible in [false, true] {
+                assert!(
+                    !together_ruled_out(&scoped(a.clone(), compatible), true),
+                    "{a:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1089,6 +1167,81 @@ mod tests {
             }
         }
         assert!(!date_ruled_out(&user_msg("hi"), 1, true));
+    }
+
+    /// Spec 2026-11-23-twelve-together-actions-and-propose-design.md §5: a
+    /// habit action is rolled as a give of its item is, and only when the
+    /// persona's key is explicitly `false`.
+    #[test]
+    fn a_habit_action_is_rolled_as_a_give_of_its_item() {
+        use crate::needs::Habits;
+        for (a, habits) in [
+            (
+                UserAction::SmokeTogether,
+                Habits {
+                    smoking: Some(false),
+                    ..Default::default()
+                },
+            ),
+            (
+                UserAction::SmokeWeedTogether,
+                Habits {
+                    drug: Some(false),
+                    ..Default::default()
+                },
+            ),
+            (
+                UserAction::DrinkTogether,
+                Habits {
+                    alcoholic: Some(false),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let e = action_msg(a.clone());
+            assert!(
+                !refuses_give(&e, habits, UNUSED_SUBSTANCE_ACCEPT - 1e-9),
+                "{a:?}"
+            );
+            assert!(refuses_give(&e, habits, UNUSED_SUBSTANCE_ACCEPT), "{a:?}");
+            assert!(refuses_give(&e, habits, 0.99), "{a:?}");
+            // An unset key never rolls.
+            assert!(!refuses_give(&e, Habits::default(), 0.99), "{a:?}");
+        }
+        let all_true = Habits {
+            smoking: Some(true),
+            alcoholic: Some(true),
+            drug: Some(true),
+            ..Default::default()
+        };
+        let all_false = Habits {
+            smoking: Some(false),
+            alcoholic: Some(false),
+            drug: Some(false),
+            coffee: Some(false),
+            gluttony: Some(false),
+        };
+        for a in [
+            UserAction::SmokeTogether,
+            UserAction::SmokeWeedTogether,
+            UserAction::DrinkTogether,
+        ] {
+            assert!(
+                !refuses_give(&action_msg(a.clone()), all_true, 0.99),
+                "{a:?}"
+            );
+        }
+        // Not a habit action: never rolled, whatever she does not use.
+        for a in [
+            UserAction::WalkTogether,
+            UserAction::SexTogether,
+            UserAction::Propose,
+        ] {
+            assert!(
+                !refuses_give(&action_msg(a.clone()), all_false, 0.99),
+                "{a:?}"
+            );
+        }
     }
 
     #[test]

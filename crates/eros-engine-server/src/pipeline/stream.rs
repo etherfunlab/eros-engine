@@ -2830,6 +2830,18 @@ fn render_product_qa_pairs(pairs: &[(String, String)]) -> String {
         .join("\n")
 }
 
+/// Whether an accepted `action` shows her picture: a `photo`, a `strip`, an
+/// `ask_dancing`, or a together action (spec 2026-11-20-together-actions-
+/// state-in-picture-and-genome-routes-design.md §5, 2026-11-23-twelve-
+/// together-actions-and-propose-design.md §4).
+fn is_picture_action(action: &eros_engine_core::types::UserAction) -> bool {
+    use eros_engine_core::types::UserAction;
+    matches!(
+        action,
+        UserAction::Photo | UserAction::Strip | UserAction::AskDancing
+    ) || action.together_kind().is_some()
+}
+
 /// The action type a `photo`, `strip`, `ask_dancing` or together action turn
 /// changes to, or `None` when the plan stands (spec 2026-11-08-five-actions-
 /// two-items-gluttony-card-1-1-design.md §2.3, 2026-11-08-strip-and-world-
@@ -2857,16 +2869,9 @@ fn picture_action(
         && !matches!(
             event,
             Event::UserMessage {
-                action: Some(
-                    UserAction::Photo
-                        | UserAction::Strip
-                        | UserAction::AskDancing
-                        | UserAction::ShowerTogether
-                        | UserAction::BathTogether
-                        | UserAction::SaunaTogether
-                ),
+                action: Some(a),
                 ..
-            }
+            } if is_picture_action(a)
         )
     {
         return None;
@@ -2895,6 +2900,25 @@ fn picture_action(
 fn apply_forced_refusal(plan: &mut eros_engine_core::types::ActionPlan, refused: bool) {
     if refused && plan.action_response.is_some() {
         plan.action_response = Some(eros_engine_core::types::ActionResponse::Refuse);
+    }
+}
+
+/// What an accepted turn has her take: the item of a `give`, or of a habit
+/// action (spec 2026-11-23-twelve-together-actions-and-propose-design.md §5);
+/// `None` on a refusal and on any other turn.
+fn taken_on_accept(
+    event: &eros_engine_core::types::Event,
+    response: Option<eros_engine_core::types::ActionResponse>,
+) -> Option<eros_engine_core::types::GivenItem> {
+    match (event, response) {
+        (
+            eros_engine_core::types::Event::UserMessage {
+                action: Some(action),
+                ..
+            },
+            Some(eros_engine_core::types::ActionResponse::Accept),
+        ) => action.consumed().map(|(item, _)| item),
+        _ => None,
     }
 }
 
@@ -3058,8 +3082,9 @@ fn build_pde_ctx(
     // action refused before the judge (a give the habit roll refused, spec
     // 2026-10-28-outing-indulgence-needs-and-habits-design.md §3.1; a strip an
     // incompatible pair cannot have, spec 2026-11-08-strip-and-world-setting-
-    // design.md §2.1, and so is a shower or bath together, spec 2026-11-20-
-    // together-actions-state-in-picture-and-genome-routes-design.md §5; a
+    // design.md §2.1, and so is a together action, spec 2026-11-20-
+    // together-actions-state-in-picture-and-genome-routes-design.md §5 and
+    // 2026-11-23-twelve-together-actions-and-propose-design.md §4.1, §5; a
     // date the gate turns down, spec 2026-11-12-activity-sub-session-
     // design.md §4.3) states the outcome, not the reason.
     let action_line = match &input.event {
@@ -3074,12 +3099,8 @@ fn build_pde_ctx(
             match (refused_before_judge, a) {
                 (false, _) => "",
                 (true, eros_engine_core::types::UserAction::Strip) => "，这次你不会让对方这样做",
-                (
-                    true,
-                    eros_engine_core::types::UserAction::Date { .. }
-                    | eros_engine_core::types::UserAction::ShowerTogether
-                    | eros_engine_core::types::UserAction::BathTogether,
-                ) => "，这次你不会答应",
+                (true, eros_engine_core::types::UserAction::Date { .. }) => "，这次你不会答应",
+                (true, a) if a.together_kind().is_some() => "，这次你不会答应",
                 (true, _) => "，这次你不会收下",
             }
         ),
@@ -5257,16 +5278,9 @@ pub(crate) fn run_stream_with(
             && matches!(
                 &input.event,
                 Event::UserMessage {
-                    action: Some(
-                        eros_engine_core::types::UserAction::Photo
-                            | eros_engine_core::types::UserAction::Strip
-                            | eros_engine_core::types::UserAction::AskDancing
-                            | eros_engine_core::types::UserAction::ShowerTogether
-                            | eros_engine_core::types::UserAction::BathTogether
-                            | eros_engine_core::types::UserAction::SaunaTogether
-                    ),
+                    action: Some(a),
                     ..
-                }
+                } if is_picture_action(a)
             );
         let pde_transcript: JudgeTranscript = if resolved_pde.is_some()
             || force_image
@@ -5288,9 +5302,14 @@ pub(crate) fn run_stream_with(
         // world-setting-design.md §2.1): decided here too, so the judge writes
         // for the outcome.
         let strip_refused = pde::strip_ruled_out(&input.event);
-        // So is a shower or bath together (spec 2026-11-20-together-actions-
-        // state-in-picture-and-genome-routes-design.md §5).
-        let together_refused = pde::together_ruled_out(&input.event);
+        // So is a together action the pair or the persona cannot have (spec
+        // 2026-11-20-together-actions-state-in-picture-and-genome-routes-
+        // design.md §5, 2026-11-23-twelve-together-actions-and-propose-
+        // design.md §4.1).
+        let together_refused = pde::together_ruled_out(
+            &input.event,
+            crate::prompt::persona_traits(&input.persona).machine,
+        );
         // A date she cannot go on (spec 2026-11-12-activity-sub-session-
         // design.md §4.3): she is offline, or a `mid` one is asked below bond
         // tier 2. On the decayed affinity this turn reads. Another date of
@@ -5488,20 +5507,11 @@ pub(crate) fn run_stream_with(
         }
 
         // The needs stored on this row (spec 2026-10-13 §5.1, 2026-10-30
-        // §2.2): the judge's rating, or, once a give is accepted for good,
-        // the baseline moved by what she took. The rating describes the
+        // §2.2): the judge's rating, or, once a give or a habit action is
+        // accepted for good, the baseline moved by what she took. The rating describes the
         // persona, not the reply, so it is written whatever the turn's
         // outcome, before any frame.
-        let accepted_give = match (&input.event, plan.action_response) {
-            (
-                eros_engine_core::types::Event::UserMessage {
-                    action: Some(eros_engine_core::types::UserAction::Give { item, .. }),
-                    ..
-                },
-                Some(eros_engine_core::types::ActionResponse::Accept),
-            ) => Some(*item),
-            _ => None,
-        };
+        let accepted_give = taken_on_accept(&input.event, plan.action_response);
         let written_needs = match accepted_give {
             Some(item) => eros_engine_core::needs::after_give(prior_needs, judged_needs, item),
             None => judged_needs,
@@ -20672,6 +20682,67 @@ data: [DONE]\n\n";
         );
     }
 
+    /// Spec 2026-11-23-twelve-together-actions-and-propose-design.md §4, §7:
+    /// each of the twelve is a picture turn when accepted; a proposal leaves
+    /// the plan as the judge made it.
+    #[test]
+    fn the_new_together_actions_are_picture_turns_and_a_proposal_is_not() {
+        use eros_engine_core::types::ActionResponse::{Accept, Refuse};
+        use eros_engine_core::types::ActionType::{ReplyImage, ReplyText, ReplyTextImage};
+        use eros_engine_core::types::UserAction::{
+            DrinkTogether, FallAsleepTogether, JogTogether, Kiss, Propose, RideHorseTogether,
+            SexTogether, SmokeTogether, SmokeWeedTogether, StargazeTogether, StreakTogether,
+            ToiletTogether, WalkTogether, YogaTogether,
+        };
+        let mut cases = Vec::new();
+        for a in [
+            ToiletTogether,
+            SmokeTogether,
+            FallAsleepTogether,
+            SexTogether,
+            WalkTogether,
+            SmokeWeedTogether,
+            JogTogether,
+            YogaTogether,
+            StargazeTogether,
+            RideHorseTogether,
+            StreakTogether,
+            DrinkTogether,
+        ] {
+            assert!(is_picture_action(&a), "{a:?}");
+            cases.extend([
+                (a.clone(), Accept, ReplyText, true, Some(ReplyTextImage)),
+                (a.clone(), Accept, ReplyImage, true, Some(ReplyTextImage)),
+                (a.clone(), Accept, ReplyText, false, None),
+                (a.clone(), Refuse, ReplyTextImage, true, Some(ReplyText)),
+                (a, Refuse, ReplyText, true, None),
+            ]);
+        }
+        for a in [Propose, Kiss] {
+            assert!(!is_picture_action(&a), "{a:?}");
+            cases.extend([
+                (a.clone(), Accept, ReplyText, true, None),
+                (a.clone(), Accept, ReplyTextImage, true, None),
+                (a.clone(), Refuse, ReplyTextImage, true, None),
+                (a, Refuse, ReplyText, true, None),
+            ]);
+        }
+        for (a, response, ty, available, want) in cases {
+            let mut input = fixture_decision_input();
+            if let Event::UserMessage { action, .. } = &mut input.event {
+                *action = Some(a.clone());
+            }
+            let mut plan = pde::decide(&input);
+            plan.action_response = Some(response);
+            plan.action_type = ty;
+            assert_eq!(
+                picture_action(&input.event, &plan, available),
+                want,
+                "{a:?} {response:?} {ty:?} {available}"
+            );
+        }
+    }
+
     #[test]
     fn apply_forced_refusal_turns_only_an_accept() {
         use eros_engine_core::types::ActionResponse::{Accept, Refuse};
@@ -20743,6 +20814,39 @@ data: [DONE]\n\n";
             give.contains("[用户动作] 对方递给你 1 支烟，这次你不会收下\n"),
             "{give}"
         );
+    }
+
+    /// A together action ruled out before the judge (the romance gate, a
+    /// machine, the habit roll) is something she will not agree to, never
+    /// something she will not take (spec 2026-11-23-twelve-together-actions-
+    /// and-propose-design.md §4.1, §5).
+    #[test]
+    fn build_pde_ctx_states_a_together_refusal_as_not_agreeing() {
+        use eros_engine_core::types::UserAction;
+        let t = JudgeTranscript::default();
+        let mut input = fixture_decision_input();
+        for (a, marker) in [
+            (UserAction::SexTogether, "想和你上床"),
+            (UserAction::StreakTogether, "想和你一起裸奔"),
+            (UserAction::ToiletTogether, "想和你一起去上厕所"),
+            (UserAction::SmokeTogether, "想和你一起去抽根烟"),
+            (UserAction::SmokeWeedTogether, "想和你一起抽大麻"),
+            (UserAction::DrinkTogether, "想和你一起喝酒"),
+        ] {
+            if let Event::UserMessage { action, .. } = &mut input.event {
+                *action = Some(a.clone());
+            }
+            let ctx = build_pde_ctx(&t, &input, false, None, None, None, None, true);
+            assert!(
+                ctx.contains(&format!("[用户动作] 对方{marker}，这次你不会答应\n")),
+                "{a:?}: {ctx}"
+            );
+            let open = build_pde_ctx(&t, &input, false, None, None, None, None, false);
+            assert!(
+                open.contains(&format!("[用户动作] 对方{marker}\n")),
+                "{a:?}: {open}"
+            );
+        }
     }
 
     /// A social action's `[用户动作]` line says what each answer means (spec
@@ -24020,6 +24124,102 @@ data: [DONE]\n\n"
             (stored.social, stored.indulgence, stored.emotional),
             (High, High, Mid)
         );
+    }
+
+    /// Spec 2026-11-23-twelve-together-actions-and-propose-design.md §5: what
+    /// the turn has her take, for the need move.
+    #[test]
+    fn only_an_accepted_give_or_habit_action_has_her_take_something() {
+        use eros_engine_core::types::ActionResponse::{Accept, Refuse};
+        use eros_engine_core::types::{Event, GivenItem, UserAction};
+        let turn = |a: UserAction| Event::UserMessage {
+            content: String::new(),
+            message_id: Uuid::new_v4(),
+            prompt_traits: Vec::new(),
+            audit: None,
+            tier: None,
+            memory_scope: Default::default(),
+            affinity_scope: Default::default(),
+            quote: None,
+            action: Some(a),
+            outfit: None,
+        };
+        for (a, item) in [
+            (give_of(GivenItem::Coffee), GivenItem::Coffee),
+            (UserAction::SmokeTogether, GivenItem::Cigarette),
+            (UserAction::SmokeWeedTogether, GivenItem::Herb),
+            (UserAction::DrinkTogether, GivenItem::Alcohol),
+        ] {
+            let e = turn(a.clone());
+            assert_eq!(taken_on_accept(&e, Some(Accept)), Some(item), "{a:?}");
+            assert_eq!(taken_on_accept(&e, Some(Refuse)), None, "{a:?}");
+            assert_eq!(taken_on_accept(&e, None), None, "{a:?}");
+        }
+        for a in [
+            UserAction::WalkTogether,
+            UserAction::SexTogether,
+            UserAction::Kiss,
+            UserAction::Propose,
+        ] {
+            assert_eq!(
+                taken_on_accept(&turn(a.clone()), Some(Accept)),
+                None,
+                "{a:?}"
+            );
+        }
+        assert_eq!(
+            taken_on_accept(&Event::ProactiveTrigger, Some(Accept)),
+            None
+        );
+    }
+
+    /// Spec 2026-11-23 §5: drinking together moves her needs as an accepted
+    /// give of one drink does, from the baseline.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_accepted_habit_action_moves_needs_as_a_give_of_one(pool: PgPool) {
+        use eros_engine_core::needs::NeedLevel::{High, Mid};
+        let (_, _, umid) = run_action_turn_in(
+            &pool,
+            eros_engine_core::types::UserAction::DrinkTogether,
+            None,
+            &[rated_mid()],
+            &[],
+            Some(serde_json::json!({"alcoholic": true})),
+            serde_json::json!({"action": "reply_text", "inner_state": "", "action_response": "accept",
+                "needs": null}),
+            200,
+        )
+        .await;
+        let stored = stored_levels(&pool, umid)
+            .await
+            .expect("written from the baseline");
+        assert_eq!(
+            (stored.social, stored.indulgence, stored.emotional),
+            (High, High, Mid)
+        );
+    }
+
+    /// Spec 2026-11-23 §5: a together action that is not a habit action moves
+    /// no need: the judge's rating is stored as rated.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_accepted_outing_moves_no_need(pool: PgPool) {
+        use eros_engine_core::needs::NeedLevel::{High, Mid};
+        let (_, _, umid) = run_action_turn_in(
+            &pool,
+            eros_engine_core::types::UserAction::WalkTogether,
+            None,
+            &[rated_mid()],
+            &[],
+            None,
+            serde_json::json!({"action": "reply_text", "inner_state": "", "action_response": "accept",
+                "needs": {"social": "high", "emotional": "mid", "outing": "mid", "indulgence": "mid"}}),
+            200,
+        )
+        .await;
+        let stored = stored_levels(&pool, umid)
+            .await
+            .expect("the judge's rating");
+        assert_eq!((stored.social, stored.indulgence), (High, Mid));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

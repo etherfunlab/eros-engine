@@ -348,15 +348,16 @@ impl EventRepo<'_> {
         Ok(rows.into_iter().filter_map(record).collect())
     }
 
-    /// Whether the instance has ever had an event of `kind`, however long
-    /// ago: not bounded by `lookback()`.
-    pub async fn ever(&self, instance_id: Uuid, kind: EventKind) -> Result<bool, sqlx::Error> {
+    /// Whether the instance has ever had an event of any of `kinds`, however
+    /// long ago: not bounded by `lookback()`.
+    pub async fn ever(&self, instance_id: Uuid, kinds: &[EventKind]) -> Result<bool, sqlx::Error> {
+        let kinds: Vec<&str> = kinds.iter().map(|k| k.as_str()).collect();
         sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM engine.persona_events \
-                             WHERE instance_id = $1 AND kind = $2)",
+                             WHERE instance_id = $1 AND kind = ANY($2))",
         )
         .bind(instance_id)
-        .bind(kind.as_str())
+        .bind(kinds)
         .fetch_one(self.pool)
         .await
     }
@@ -2268,9 +2269,32 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(repo.ever(a, HavingSex).await.unwrap());
-        assert!(!repo.ever(a, Reading).await.unwrap());
-        assert!(!repo.ever(b, HavingSex).await.unwrap());
+        assert!(repo.ever(a, &[HavingSex]).await.unwrap());
+        assert!(!repo.ever(a, &[Reading]).await.unwrap());
+        assert!(!repo.ever(b, &[HavingSex]).await.unwrap());
+    }
+
+    /// Spec 2026-11-23-twelve-together-actions-and-propose-design.md §6.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn ever_reads_any_of_the_kinds(pool: PgPool) {
+        let repo = EventRepo { pool: &pool };
+        let (_, a, sa) = instance_and_session(&pool).await;
+        let (_, b, _) = instance_and_session(&pool).await;
+        assert!(!repo.ever(a, &EventKind::SEX).await.unwrap());
+        let then = Utc::now() - chrono::Duration::days(3);
+        repo.insert_preempting(&NewEvent {
+            instance_id: a,
+            session_id: sa,
+            event_key: "bed",
+            kind: HavingSexTogether,
+            started_at: then,
+            ends_at: then + chrono::Duration::hours(1),
+        })
+        .await
+        .unwrap();
+        assert!(repo.ever(a, &EventKind::SEX).await.unwrap());
+        assert!(!repo.ever(a, &[HavingSex, JustHaveSex]).await.unwrap());
+        assert!(!repo.ever(b, &EventKind::SEX).await.unwrap());
     }
 
     #[sqlx::test(migrations = "./migrations")]

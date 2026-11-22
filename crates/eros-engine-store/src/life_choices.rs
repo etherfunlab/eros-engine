@@ -57,6 +57,18 @@ impl LifeChoiceKind {
         }
     }
 
+    /// The wire `type` of the user's action that asks her the same thing the
+    /// other way round (spec 2026-11-23-twelve-together-actions-and-propose-
+    /// design.md §6, §7): `sex_together` for `sleep_together`, `propose` for
+    /// `propose`. `None` for every other kind.
+    pub fn user_ask(self) -> Option<&'static str> {
+        match self {
+            Self::SleepTogether => Some("sex_together"),
+            Self::Propose => Some("propose"),
+            _ => None,
+        }
+    }
+
     /// `sleep_together`, `propose` or `bathe_together`.
     pub fn is_romantic(self) -> bool {
         matches!(
@@ -330,7 +342,10 @@ impl LifeChoiceRepo<'_> {
 
     /// Whether `kind` was ever `accepted` or `ignored` in the session: it has
     /// had its answer, and is not asked again (spec 2026-10-30 §4.6). A decline
-    /// or a pending ask does not settle it.
+    /// or a pending ask does not settle it. Nor is it asked once she accepted
+    /// the user's own ask of it ([`LifeChoiceKind::user_ask`]), in the session
+    /// or in a date's sub-session of it (spec 2026-11-23-twelve-together-
+    /// actions-and-propose-design.md §6, §7).
     pub async fn settled(
         &self,
         session_id: Uuid,
@@ -339,10 +354,18 @@ impl LifeChoiceRepo<'_> {
         sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM engine.life_choices \
                              WHERE session_id = $1 AND kind = $2 \
-                               AND status IN ('accepted', 'ignored'))",
+                               AND status IN ('accepted', 'ignored')) \
+                 OR EXISTS (SELECT 1 FROM engine.chat_messages m \
+                             WHERE m.session_id IN (SELECT $1::uuid UNION ALL \
+                                       SELECT d.sub_session_id FROM engine.activities d \
+                                        WHERE d.session_id = $1) \
+                               AND m.role = 'user' \
+                               AND m.metadata -> 'action' ->> 'type' = $3 \
+                               AND m.metadata -> 'action' ->> 'response' = 'accept')",
         )
         .bind(session_id)
         .bind(kind.as_str())
+        .bind(kind.user_ask())
         .fetch_one(self.pool)
         .await
     }
@@ -505,6 +528,29 @@ mod tests {
             record("ignored", Duration::hours(25)).status_at(now),
             "ignored"
         );
+    }
+
+    /// Spec 2026-11-23-twelve-together-actions-and-propose-design.md §6, §7:
+    /// the user's action that asks the same thing is named by its wire type.
+    #[test]
+    fn the_users_ask_mirrors_hers() {
+        use eros_engine_core::types::UserAction;
+        let wire = |a: UserAction| serde_json::to_value(a).unwrap()["type"].clone();
+        assert_eq!(
+            LifeChoiceKind::SleepTogether.user_ask(),
+            wire(UserAction::SexTogether).as_str()
+        );
+        assert_eq!(
+            LifeChoiceKind::Propose.user_ask(),
+            wire(UserAction::Propose).as_str()
+        );
+        for k in [
+            LifeChoiceKind::AskForSpace,
+            LifeChoiceKind::TravelTogether,
+            LifeChoiceKind::BatheTogether,
+        ] {
+            assert_eq!(k.user_ask(), None, "{k:?}");
+        }
     }
 
     #[test]
@@ -705,6 +751,120 @@ mod tests {
             !settled(other, LifeChoiceKind::Propose).await.unwrap(),
             "and its own kinds"
         );
+    }
+
+    /// A user row in `session` carrying `action`.
+    async fn seed_user_action(pool: &PgPool, session: Uuid, action: serde_json::Value) {
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata) \
+             VALUES ($1, 'user', '', jsonb_build_object('action', $2::jsonb))",
+        )
+        .bind(session)
+        .bind(action)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Spec 2026-11-23-twelve-together-actions-and-propose-design.md §6, §7:
+    /// the user's accepted `sex_together` or `propose` settles her own ask;
+    /// a refused or unanswered one does not.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_users_accepted_ask_settles_hers(pool: PgPool) {
+        let (_, _, session) = instance_and_session(&pool).await;
+        let (_, _, other) = instance_and_session(&pool).await;
+        let repo = LifeChoiceRepo { pool: &pool };
+        let sleep = LifeChoiceKind::SleepTogether;
+        let propose = LifeChoiceKind::Propose;
+
+        assert!(!repo.settled(session, sleep).await.unwrap());
+        seed_user_action(
+            &pool,
+            session,
+            json!({"type": "sex_together", "response": "refuse"}),
+        )
+        .await;
+        seed_user_action(&pool, session, json!({"type": "sex_together"})).await;
+        seed_user_action(
+            &pool,
+            session,
+            json!({"type": "propose", "response": "refuse"}),
+        )
+        .await;
+        seed_user_action(
+            &pool,
+            session,
+            json!({"type": "bath_together", "response": "accept"}),
+        )
+        .await;
+        assert!(
+            !repo.settled(session, sleep).await.unwrap(),
+            "refused or unanswered"
+        );
+        assert!(!repo.settled(session, propose).await.unwrap(), "refused");
+        assert!(
+            !repo
+                .settled(session, LifeChoiceKind::BatheTogether)
+                .await
+                .unwrap(),
+            "a bath together has no mirror"
+        );
+
+        seed_user_action(
+            &pool,
+            session,
+            json!({"type": "sex_together", "response": "accept"}),
+        )
+        .await;
+        assert!(repo.settled(session, sleep).await.unwrap());
+        assert!(!repo.settled(session, propose).await.unwrap());
+        seed_user_action(
+            &pool,
+            session,
+            json!({"type": "propose", "response": "accept"}),
+        )
+        .await;
+        assert!(repo.settled(session, propose).await.unwrap());
+        assert!(
+            !repo.settled(other, sleep).await.unwrap(),
+            "another session has its own"
+        );
+    }
+
+    /// Spec 2026-11-23 §6: an accept inside a date's sub-session settles the
+    /// parent session's ask.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_accept_inside_a_date_settles_hers(pool: PgPool) {
+        let (owner, instance, session) = instance_and_session(&pool).await;
+        let sub = ChatRepo { pool: &pool }
+            .create_session(owner, instance)
+            .await
+            .unwrap()
+            .id;
+        sqlx::query(
+            "INSERT INTO engine.activities (session_id, sub_session_id, duration, place, content) \
+             VALUES ($1, $2, 'short', '海边', '看海')",
+        )
+        .bind(session)
+        .bind(sub)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let repo = LifeChoiceRepo { pool: &pool };
+        seed_user_action(
+            &pool,
+            sub,
+            json!({"type": "sex_together", "response": "accept"}),
+        )
+        .await;
+        assert!(repo
+            .settled(session, LifeChoiceKind::SleepTogether)
+            .await
+            .unwrap());
+        assert!(!repo
+            .settled(session, LifeChoiceKind::Propose)
+            .await
+            .unwrap());
     }
 
     #[sqlx::test(migrations = "./migrations")]

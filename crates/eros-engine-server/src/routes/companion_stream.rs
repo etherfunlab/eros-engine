@@ -171,6 +171,19 @@ pub enum UserActionKind {
     ShowerTogether,
     BathTogether,
     SaunaTogether,
+    ToiletTogether,
+    SmokeTogether,
+    FallAsleepTogether,
+    SexTogether,
+    WalkTogether,
+    SmokeWeedTogether,
+    JogTogether,
+    YogaTogether,
+    StargazeTogether,
+    RideHorseTogether,
+    StreakTogether,
+    DrinkTogether,
+    Propose,
     Custom,
     Tip,
     Gift,
@@ -320,14 +333,26 @@ impl From<DateDurationDto> for eros_engine_core::types::DateDuration {
 /// An action the user does to the persona this turn, besides talking. The
 /// persona accepts or does not; a refusal costs the relationship one tier on
 /// the line the action touches (`give` and `gift` → bond, every physical or custom action →
-/// chemistry); a refused `tip`, `bluff`, `threaten` or `trick` costs nothing.
+/// chemistry); a refused `tip`, `bluff`, `threaten`, `trick` or `propose` costs nothing.
 /// An accepted `gift` joins the persona's items or wardrobe. A `date` asks her
 /// out; accepted, it runs in a session of its own for its `duration`, and
 /// nothing else is sent to the persona's text sessions meanwhile. An accepted
 /// `shower_together`, `bath_together` or `sauna_together` starts a
 /// `showering_together` (30 minutes), `bathing_together` (30 minutes) or
 /// `sauna_together` (one hour) event, ending the incident under way; on a
-/// date it starts none.
+/// date it starts none. Twelve more together actions do the same:
+/// `toilet_together` → `using_toilet_together`, `smoke_together` →
+/// `smoking_together`, `smoke_weed_together` → `smoking_weed_together` and
+/// `streak_together` → `streaking_together` (30 minutes each);
+/// `sex_together` → `having_sex_together`, `walk_together` →
+/// `walking_together`, `jog_together` → `jogging_together`, `yoga_together`
+/// → `yoga_together`, `stargaze_together` → `stargazing_together`,
+/// `ride_horse_together` → `horse_riding_together` and `drink_together` →
+/// `drinking_together` (one hour each); `fall_asleep_together` →
+/// `asleep_together` (one to four hours, and she still answers). An accepted
+/// `smoke_together`, `smoke_weed_together` or `drink_together` also counts as
+/// a `give` of one cigarette, herb or alcohol. `propose` asks her to marry
+/// the user and starts no event.
 #[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct UserActionDto {
     #[serde(rename = "type")]
@@ -426,6 +451,19 @@ impl UserActionDto {
             UserActionKind::ShowerTogether => UserAction::ShowerTogether,
             UserActionKind::BathTogether => UserAction::BathTogether,
             UserActionKind::SaunaTogether => UserAction::SaunaTogether,
+            UserActionKind::ToiletTogether => UserAction::ToiletTogether,
+            UserActionKind::SmokeTogether => UserAction::SmokeTogether,
+            UserActionKind::FallAsleepTogether => UserAction::FallAsleepTogether,
+            UserActionKind::SexTogether => UserAction::SexTogether,
+            UserActionKind::WalkTogether => UserAction::WalkTogether,
+            UserActionKind::SmokeWeedTogether => UserAction::SmokeWeedTogether,
+            UserActionKind::JogTogether => UserAction::JogTogether,
+            UserActionKind::YogaTogether => UserAction::YogaTogether,
+            UserActionKind::StargazeTogether => UserAction::StargazeTogether,
+            UserActionKind::RideHorseTogether => UserAction::RideHorseTogether,
+            UserActionKind::StreakTogether => UserAction::StreakTogether,
+            UserActionKind::DrinkTogether => UserAction::DrinkTogether,
+            UserActionKind::Propose => UserAction::Propose,
             UserActionKind::Custom => UserAction::Custom {
                 text: free_text(self.text.as_deref(), "text", MAX_ACTION_TEXT_CHARS)?
                     .ok_or("action.text is required for custom")?,
@@ -4930,6 +4968,68 @@ mod validate_payload_tests {
                 UserActionKind::SaunaTogether,
                 UserAction::SaunaTogether,
             ),
+            // Spec 2026-11-23-twelve-together-actions-and-propose-design.md.
+            (
+                "toilet_together",
+                UserActionKind::ToiletTogether,
+                UserAction::ToiletTogether,
+            ),
+            (
+                "smoke_together",
+                UserActionKind::SmokeTogether,
+                UserAction::SmokeTogether,
+            ),
+            (
+                "fall_asleep_together",
+                UserActionKind::FallAsleepTogether,
+                UserAction::FallAsleepTogether,
+            ),
+            (
+                "sex_together",
+                UserActionKind::SexTogether,
+                UserAction::SexTogether,
+            ),
+            (
+                "walk_together",
+                UserActionKind::WalkTogether,
+                UserAction::WalkTogether,
+            ),
+            (
+                "smoke_weed_together",
+                UserActionKind::SmokeWeedTogether,
+                UserAction::SmokeWeedTogether,
+            ),
+            (
+                "jog_together",
+                UserActionKind::JogTogether,
+                UserAction::JogTogether,
+            ),
+            (
+                "yoga_together",
+                UserActionKind::YogaTogether,
+                UserAction::YogaTogether,
+            ),
+            (
+                "stargaze_together",
+                UserActionKind::StargazeTogether,
+                UserAction::StargazeTogether,
+            ),
+            (
+                "ride_horse_together",
+                UserActionKind::RideHorseTogether,
+                UserAction::RideHorseTogether,
+            ),
+            (
+                "streak_together",
+                UserActionKind::StreakTogether,
+                UserAction::StreakTogether,
+            ),
+            (
+                "drink_together",
+                UserActionKind::DrinkTogether,
+                UserAction::DrinkTogether,
+            ),
+            ("propose", UserActionKind::Propose, UserAction::Propose),
         ] {
             let dto: UserActionDto = serde_json::from_value(serde_json::json!({"type": wire}))
                 .unwrap_or_else(|e| panic!("{wire}: {e}"));

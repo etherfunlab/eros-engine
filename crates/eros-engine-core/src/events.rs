@@ -157,6 +157,42 @@ pub enum EventKind {
     /// She and the user take a sauna together: written when she accepts the
     /// user's `sauna_together`.
     SaunaTogether,
+    /// She and the user use the toilet together: written when she accepts the user's
+    /// `toilet_together`.
+    UsingToiletTogether,
+    /// She and the user smoke together: written when she accepts the user's
+    /// `smoke_together`.
+    SmokingTogether,
+    /// She and the user sleep side by side; she still answers: written when she accepts the user's
+    /// `fall_asleep_together`.
+    AsleepTogether,
+    /// She and the user are in bed together: written when she accepts the user's
+    /// `sex_together`.
+    HavingSexTogether,
+    /// She and the user take a walk together: written when she accepts the user's
+    /// `walk_together`.
+    WalkingTogether,
+    /// She and the user smoke weed together: written when she accepts the user's
+    /// `smoke_weed_together`.
+    SmokingWeedTogether,
+    /// She and the user jog together: written when she accepts the user's
+    /// `jog_together`.
+    JoggingTogether,
+    /// She and the user do yoga together: written when she accepts the user's
+    /// `yoga_together`.
+    YogaTogether,
+    /// She and the user watch the stars together: written when she accepts the user's
+    /// `stargaze_together`.
+    StargazingTogether,
+    /// She and the user ride horses together: written when she accepts the user's
+    /// `ride_horse_together`.
+    HorseRidingTogether,
+    /// She and the user streak together: written when she accepts the user's
+    /// `streak_together`.
+    StreakingTogether,
+    /// She and the user drink together: written when she accepts the user's
+    /// `drink_together`.
+    DrinkingTogether,
 }
 
 impl EventKind {
@@ -235,7 +271,7 @@ impl EventKind {
     ];
 
     /// Kinds the writers place directly, never drawn: parsed and stored, not in `ALL`.
-    pub const SPECIAL: [EventKind; 7] = [
+    pub const SPECIAL: [EventKind; 19] = [
         EventKind::TakingSpace,
         EventKind::FellOut,
         EventKind::TravelingTogether,
@@ -243,6 +279,27 @@ impl EventKind {
         EventKind::OnADate,
         EventKind::ShoweringTogether,
         EventKind::SaunaTogether,
+        EventKind::UsingToiletTogether,
+        EventKind::SmokingTogether,
+        EventKind::AsleepTogether,
+        EventKind::HavingSexTogether,
+        EventKind::WalkingTogether,
+        EventKind::SmokingWeedTogether,
+        EventKind::JoggingTogether,
+        EventKind::YogaTogether,
+        EventKind::StargazingTogether,
+        EventKind::HorseRidingTogether,
+        EventKind::StreakingTogether,
+        EventKind::DrinkingTogether,
+    ];
+
+    /// The kinds that are sex: any row of one, ever, ends her virginity
+    /// (spec 2026-11-11-stocks-lost-habit-events-and-just-have-sex-design.md
+    /// §4, 2026-11-23-twelve-together-actions-and-propose-design.md §6).
+    pub const SEX: [EventKind; 3] = [
+        EventKind::HavingSex,
+        EventKind::JustHaveSex,
+        EventKind::HavingSexTogether,
     ];
 
     /// The stored and wire value.
@@ -325,6 +382,18 @@ impl EventKind {
             EventKind::UsingToilet => "using_toilet",
             EventKind::ShoweringTogether => "showering_together",
             EventKind::SaunaTogether => "sauna_together",
+            EventKind::UsingToiletTogether => "using_toilet_together",
+            EventKind::SmokingTogether => "smoking_together",
+            EventKind::AsleepTogether => "asleep_together",
+            EventKind::HavingSexTogether => "having_sex_together",
+            EventKind::WalkingTogether => "walking_together",
+            EventKind::SmokingWeedTogether => "smoking_weed_together",
+            EventKind::JoggingTogether => "jogging_together",
+            EventKind::YogaTogether => "yoga_together",
+            EventKind::StargazingTogether => "stargazing_together",
+            EventKind::HorseRidingTogether => "horse_riding_together",
+            EventKind::StreakingTogether => "streaking_together",
+            EventKind::DrinkingTogether => "drinking_together",
         }
     }
 
@@ -345,12 +414,16 @@ impl EventKind {
             | PonderingLife | Streaking | WantToSeeSea | WantHotSpring | WantSauna
             | BathingTogether | OnADate | GotLost | Drinking | Smoking | SmokingWeed
             | JustHaveSex | Masturbating | MissedRide | UsingToilet | ShoweringTogether
-            | SaunaTogether => EventCategory::Short,
-            TempWork | ExMessage | GotHit | Breakup | WorkingOut | Reading | Gaming
-            | AwayFromPhone | Unwell | Irritable | Busy | InBattle | Asleep | OutShopping
-            | BrosGathering | SisGathering | OnTheRoad | WatchingShow | HavingSex | WantToGoOut
-            | WantToGoHome | TakingSpace | FellOut | OnABoat | OnACruise | OnABus | OnATrain
-            | OnAPlane | Driving => EventCategory::Mid,
+            | SaunaTogether | UsingToiletTogether | SmokingTogether | HavingSexTogether
+            | WalkingTogether | SmokingWeedTogether | JoggingTogether | YogaTogether
+            | StargazingTogether | HorseRidingTogether | StreakingTogether | DrinkingTogether => {
+                EventCategory::Short
+            }
+            AsleepTogether | TempWork | ExMessage | GotHit | Breakup | WorkingOut | Reading
+            | Gaming | AwayFromPhone | Unwell | Irritable | Busy | InBattle | Asleep
+            | OutShopping | BrosGathering | SisGathering | OnTheRoad | WatchingShow | HavingSex
+            | WantToGoOut | WantToGoHome | TakingSpace | FellOut | OnABoat | OnACruise | OnABus
+            | OnATrain | OnAPlane | Driving => EventCategory::Mid,
             Sick | Period | Hospitalized | PostSurgery => EventCategory::Body,
             BusinessTrip | ShortTrip | LongTrip | HometownVisit | TravelingTogether => {
                 EventCategory::Trip
@@ -582,6 +655,18 @@ fn rule(kind: EventKind) -> Rule {
         UsingToilet => (1.0, 12, Lasts::Minutes(30)),
         ShoweringTogether => (0.0, 0, Lasts::Minutes(30)),
         SaunaTogether => (0.0, 0, Lasts::Hours(1, 1)),
+        UsingToiletTogether => (0.0, 0, Lasts::Minutes(30)),
+        SmokingTogether => (0.0, 0, Lasts::Minutes(30)),
+        AsleepTogether => (0.0, 0, Lasts::Hours(1, 4)),
+        HavingSexTogether => (0.0, 0, Lasts::Hours(1, 1)),
+        WalkingTogether => (0.0, 0, Lasts::Hours(1, 1)),
+        SmokingWeedTogether => (0.0, 0, Lasts::Minutes(30)),
+        JoggingTogether => (0.0, 0, Lasts::Hours(1, 1)),
+        YogaTogether => (0.0, 0, Lasts::Hours(1, 1)),
+        StargazingTogether => (0.0, 0, Lasts::Hours(1, 1)),
+        HorseRidingTogether => (0.0, 0, Lasts::Hours(1, 1)),
+        StreakingTogether => (0.0, 0, Lasts::Minutes(30)),
+        DrinkingTogether => (0.0, 0, Lasts::Hours(1, 1)),
     };
     Rule {
         weight,
@@ -842,7 +927,7 @@ fn follows(prior: EventKind, kind: EventKind) -> bool {
         (ExMessage | SuddenDesire | Strip, HavingSex | JustHaveSex)
             | (SuddenDesire, Strip | Masturbating)
             | (Sick, PeriodScare)
-            | (HavingSex | JustHaveSex, PregnancyScare)
+            | (HavingSex | JustHaveSex | HavingSexTogether, PregnancyScare)
             | (BusinessTrip, OnTheWay | Busy | TempWork)
             | (
                 ShortTrip | LongTrip | HometownVisit | TravelingTogether,
@@ -1054,7 +1139,7 @@ pub struct DrawInput<'a> {
     pub history: &'a [PastEvent],
     /// The kinds the caller allows.
     pub allowed: &'a [EventKind],
-    /// Whether the instance has a `having_sex` or `just_have_sex` row, ever
+    /// Whether the instance has a row of any kind in [`EventKind::SEX`], ever
     /// (not bounded by `lookback()`).
     pub ever_had_sex: bool,
     /// Whether the session's scopes are romance-compatible
@@ -1254,13 +1339,7 @@ pub fn offline_kinds(persona: &PersonaTraits) -> Vec<EventKind> {
 /// the placed kinds (`EventKind::SPECIAL`).
 pub fn is_told(kind: EventKind, rung: u8, persona: &PersonaTraits) -> bool {
     match kind {
-        EventKind::TakingSpace
-        | EventKind::FellOut
-        | EventKind::TravelingTogether
-        | EventKind::BathingTogether
-        | EventKind::OnADate
-        | EventKind::ShoweringTogether
-        | EventKind::SaunaTogether => false,
+        k if EventKind::SPECIAL.contains(&k) => false,
         EventKind::Busy | EventKind::InBattle => rung >= CONFIDE_MIN_RUNG,
         EventKind::OutShopping if persona.female => rung >= CONFIDE_MIN_RUNG,
         k => !k.is_offline(persona),
@@ -2042,7 +2121,7 @@ mod tests {
         assert!(!EventKind::ALL.contains(&TakingSpace));
         assert!(!EventKind::ALL.contains(&FellOut));
         assert_eq!(EventKind::ALL.len(), 70);
-        assert_eq!(EventKind::SPECIAL.len(), 7);
+        assert_eq!(EventKind::SPECIAL.len(), 19);
         for k in EventKind::SPECIAL {
             assert_eq!(serde_json::to_value(k).unwrap(), k.as_str());
             assert_eq!(EventKind::parse(k.as_str()), Some(k));
@@ -2565,6 +2644,17 @@ mod tests {
         assert!(!follows(HavingSex, HavingSex));
     }
 
+    /// Spec 2026-11-23-twelve-together-actions-and-propose-design.md §6: bed
+    /// with the user leads to a scare as her own sex does, and ends her
+    /// virginity.
+    #[test]
+    fn sex_together_counts_as_sex() {
+        assert!(follows(HavingSexTogether, PregnancyScare));
+        assert!(!follows(HavingSexTogether, HavingSex));
+        assert!(!follows(AsleepTogether, PregnancyScare));
+        assert_eq!(EventKind::SEX, [HavingSex, JustHaveSex, HavingSexTogether]);
+    }
+
     /// A draw with no history for `persona`, with or without a `having_sex`
     /// row ever.
     fn pick_ever(
@@ -2744,6 +2834,38 @@ mod tests {
                 Duration::minutes(30),
             ),
             (SaunaTogether, "sauna_together", Duration::hours(1)),
+            // Spec 2026-11-23-twelve-together-actions-and-propose-design.md §4.
+            (
+                UsingToiletTogether,
+                "using_toilet_together",
+                Duration::minutes(30),
+            ),
+            (SmokingTogether, "smoking_together", Duration::minutes(30)),
+            (HavingSexTogether, "having_sex_together", Duration::hours(1)),
+            (WalkingTogether, "walking_together", Duration::hours(1)),
+            (
+                SmokingWeedTogether,
+                "smoking_weed_together",
+                Duration::minutes(30),
+            ),
+            (JoggingTogether, "jogging_together", Duration::hours(1)),
+            (YogaTogether, "yoga_together", Duration::hours(1)),
+            (
+                StargazingTogether,
+                "stargazing_together",
+                Duration::hours(1),
+            ),
+            (
+                HorseRidingTogether,
+                "horse_riding_together",
+                Duration::hours(1),
+            ),
+            (
+                StreakingTogether,
+                "streaking_together",
+                Duration::minutes(30),
+            ),
+            (DrinkingTogether, "drinking_together", Duration::hours(1)),
         ] {
             assert!(
                 EventKind::SPECIAL.contains(&k) && !EventKind::ALL.contains(&k),
@@ -2765,6 +2887,29 @@ mod tests {
             for rung in 0..=5 {
                 assert!(!is_told(k, rung, &PersonaTraits::default()), "rung {rung}");
             }
+        }
+    }
+
+    /// Spec 2026-11-23-twelve-together-actions-and-propose-design.md §4: the
+    /// one together kind that is `mid`, and she still answers during it.
+    #[test]
+    fn asleep_together_is_a_mid_kind_of_one_to_four_hours() {
+        let a = AsleepTogether;
+        assert!(EventKind::SPECIAL.contains(&a) && !EventKind::ALL.contains(&a));
+        assert_eq!(a.as_str(), "asleep_together");
+        assert_eq!(EventKind::parse("asleep_together"), Some(a));
+        assert_eq!(a.category(), EventCategory::Mid);
+        assert_eq!(a.place(), Place::Neutral);
+        assert!(a.fits(Setting::Modern) && a.fits(Setting::Fantasy));
+        assert!(!a.may_be_offline());
+        assert!(!a.is_offline(&female()));
+        let r = rule(a);
+        assert_eq!((r.weight, r.cooldown_hours), (0.0, 0));
+        assert_eq!(lasts(a, 0.0), Duration::hours(1));
+        assert_eq!(lasts(a, 0.999_999), Duration::hours(4));
+        assert_eq!(lasts(a, 1.0), Duration::hours(4));
+        for rung in 0..=5 {
+            assert!(!is_told(a, rung, &PersonaTraits::default()), "rung {rung}");
         }
     }
 

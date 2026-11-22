@@ -50,9 +50,10 @@ const CONCURRENT_STREAMS_PER_USER: u32 = 3;
 const MAX_EVENT_KEY_CHARS: usize = 128;
 
 /// A kind of life event. `taking_space`, `fell_out`, `traveling_together`,
-/// `bathing_together`, `on_a_date`, `showering_together` and
-/// `sauna_together` are placed by the engine, never drawn: they appear in
-/// responses only, and a `kinds` filter that lists one is rejected.
+/// `bathing_together`, `on_a_date`, `showering_together`, `sauna_together`
+/// and the twelve kinds from `using_toilet_together` to `drinking_together`
+/// are placed by the engine, never drawn: they appear in responses only, and
+/// a `kinds` filter that lists one is rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKindDto {
@@ -133,6 +134,18 @@ pub enum EventKindDto {
     UsingToilet,
     ShoweringTogether,
     SaunaTogether,
+    UsingToiletTogether,
+    SmokingTogether,
+    AsleepTogether,
+    HavingSexTogether,
+    WalkingTogether,
+    SmokingWeedTogether,
+    JoggingTogether,
+    YogaTogether,
+    StargazingTogether,
+    HorseRidingTogether,
+    StreakingTogether,
+    DrinkingTogether,
 }
 
 /// Reads the drawable kinds only: a request names kinds to draw, and the
@@ -231,6 +244,18 @@ impl From<EventKindDto> for EventKind {
             EventKindDto::UsingToilet => EventKind::UsingToilet,
             EventKindDto::ShoweringTogether => EventKind::ShoweringTogether,
             EventKindDto::SaunaTogether => EventKind::SaunaTogether,
+            EventKindDto::UsingToiletTogether => EventKind::UsingToiletTogether,
+            EventKindDto::SmokingTogether => EventKind::SmokingTogether,
+            EventKindDto::AsleepTogether => EventKind::AsleepTogether,
+            EventKindDto::HavingSexTogether => EventKind::HavingSexTogether,
+            EventKindDto::WalkingTogether => EventKind::WalkingTogether,
+            EventKindDto::SmokingWeedTogether => EventKind::SmokingWeedTogether,
+            EventKindDto::JoggingTogether => EventKind::JoggingTogether,
+            EventKindDto::YogaTogether => EventKind::YogaTogether,
+            EventKindDto::StargazingTogether => EventKind::StargazingTogether,
+            EventKindDto::HorseRidingTogether => EventKind::HorseRidingTogether,
+            EventKindDto::StreakingTogether => EventKind::StreakingTogether,
+            EventKindDto::DrinkingTogether => EventKind::DrinkingTogether,
         }
     }
 }
@@ -315,6 +340,18 @@ impl From<EventKind> for EventKindDto {
             EventKind::UsingToilet => EventKindDto::UsingToilet,
             EventKind::ShoweringTogether => EventKindDto::ShoweringTogether,
             EventKind::SaunaTogether => EventKindDto::SaunaTogether,
+            EventKind::UsingToiletTogether => EventKindDto::UsingToiletTogether,
+            EventKind::SmokingTogether => EventKindDto::SmokingTogether,
+            EventKind::AsleepTogether => EventKindDto::AsleepTogether,
+            EventKind::HavingSexTogether => EventKindDto::HavingSexTogether,
+            EventKind::WalkingTogether => EventKindDto::WalkingTogether,
+            EventKind::SmokingWeedTogether => EventKindDto::SmokingWeedTogether,
+            EventKind::JoggingTogether => EventKindDto::JoggingTogether,
+            EventKind::YogaTogether => EventKindDto::YogaTogether,
+            EventKind::StargazingTogether => EventKindDto::StargazingTogether,
+            EventKind::HorseRidingTogether => EventKindDto::HorseRidingTogether,
+            EventKind::StreakingTogether => EventKindDto::StreakingTogether,
+            EventKind::DrinkingTogether => EventKindDto::DrinkingTogether,
         }
     }
 }
@@ -886,14 +923,12 @@ async fn plan_event(
         (ChatRepo { pool: &state.pool }).latest_scopes(session_id).await?,
         Some((_, scope)) if eros_engine_core::scope::romance_compatible(scope)
     );
-    // Either kind of sex ends her virginity (spec 2026-11-11-stocks-lost-
-    // habit-events-and-just-have-sex-design.md §4).
+    // Any kind of sex ends her virginity (spec 2026-11-11-stocks-lost-
+    // habit-events-and-just-have-sex-design.md §4, 2026-11-23-twelve-
+    // together-actions-and-propose-design.md §6).
     let ever_had_sex = event_repo
-        .ever(instance_id, events::EventKind::HavingSex)
-        .await?
-        || event_repo
-            .ever(instance_id, events::EventKind::JustHaveSex)
-            .await?;
+        .ever(instance_id, &events::EventKind::SEX)
+        .await?;
     let Some(drawn) = events::draw(
         &DrawInput {
             now,
@@ -2594,6 +2629,8 @@ mod tests {
             json!(["on_a_date"]),
             json!(["showering_together"]),
             json!({"allow": ["sauna_together"]}),
+            json!(["asleep_together"]),
+            json!({"allow": ["having_sex_together"]}),
         ] {
             assert!(
                 serde_json::from_value::<DrawEventRequest>(
@@ -2615,6 +2652,18 @@ mod tests {
         for (kind, wire) in [
             (EventKind::ShoweringTogether, "showering_together"),
             (EventKind::SaunaTogether, "sauna_together"),
+            (EventKind::UsingToiletTogether, "using_toilet_together"),
+            (EventKind::SmokingTogether, "smoking_together"),
+            (EventKind::AsleepTogether, "asleep_together"),
+            (EventKind::HavingSexTogether, "having_sex_together"),
+            (EventKind::WalkingTogether, "walking_together"),
+            (EventKind::SmokingWeedTogether, "smoking_weed_together"),
+            (EventKind::JoggingTogether, "jogging_together"),
+            (EventKind::YogaTogether, "yoga_together"),
+            (EventKind::StargazingTogether, "stargazing_together"),
+            (EventKind::HorseRidingTogether, "horse_riding_together"),
+            (EventKind::StreakingTogether, "streaking_together"),
+            (EventKind::DrinkingTogether, "drinking_together"),
         ] {
             let dto = EventKindDto::from(kind);
             assert_eq!(serde_json::to_value(dto).unwrap(), json!(wire));
