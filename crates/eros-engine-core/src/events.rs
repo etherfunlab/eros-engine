@@ -293,6 +293,15 @@ impl EventKind {
         EventKind::DrinkingTogether,
     ];
 
+    /// The kinds that are sex: any row of one, ever, ends her virginity
+    /// (spec 2026-11-11-stocks-lost-habit-events-and-just-have-sex-design.md
+    /// §4, 2026-11-23-twelve-together-actions-and-propose-design.md §6).
+    pub const SEX: [EventKind; 3] = [
+        EventKind::HavingSex,
+        EventKind::JustHaveSex,
+        EventKind::HavingSexTogether,
+    ];
+
     /// The stored and wire value.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -918,7 +927,7 @@ fn follows(prior: EventKind, kind: EventKind) -> bool {
         (ExMessage | SuddenDesire | Strip, HavingSex | JustHaveSex)
             | (SuddenDesire, Strip | Masturbating)
             | (Sick, PeriodScare)
-            | (HavingSex | JustHaveSex, PregnancyScare)
+            | (HavingSex | JustHaveSex | HavingSexTogether, PregnancyScare)
             | (BusinessTrip, OnTheWay | Busy | TempWork)
             | (
                 ShortTrip | LongTrip | HometownVisit | TravelingTogether,
@@ -1130,7 +1139,7 @@ pub struct DrawInput<'a> {
     pub history: &'a [PastEvent],
     /// The kinds the caller allows.
     pub allowed: &'a [EventKind],
-    /// Whether the instance has a `having_sex` or `just_have_sex` row, ever
+    /// Whether the instance has a row of any kind in [`EventKind::SEX`], ever
     /// (not bounded by `lookback()`).
     pub ever_had_sex: bool,
     /// Whether the session's scopes are romance-compatible
@@ -2633,6 +2642,17 @@ mod tests {
         }
         assert!(!follows(Reading, HavingSex));
         assert!(!follows(HavingSex, HavingSex));
+    }
+
+    /// Spec 2026-11-23-twelve-together-actions-and-propose-design.md §6: bed
+    /// with the user leads to a scare as her own sex does, and ends her
+    /// virginity.
+    #[test]
+    fn sex_together_counts_as_sex() {
+        assert!(follows(HavingSexTogether, PregnancyScare));
+        assert!(!follows(HavingSexTogether, HavingSex));
+        assert!(!follows(AsleepTogether, PregnancyScare));
+        assert_eq!(EventKind::SEX, [HavingSex, JustHaveSex, HavingSexTogether]);
     }
 
     /// A draw with no history for `persona`, with or without a `having_sex`

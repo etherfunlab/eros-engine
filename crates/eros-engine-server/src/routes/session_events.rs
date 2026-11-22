@@ -923,14 +923,12 @@ async fn plan_event(
         (ChatRepo { pool: &state.pool }).latest_scopes(session_id).await?,
         Some((_, scope)) if eros_engine_core::scope::romance_compatible(scope)
     );
-    // Either kind of sex ends her virginity (spec 2026-11-11-stocks-lost-
-    // habit-events-and-just-have-sex-design.md §4).
+    // Any kind of sex ends her virginity (spec 2026-11-11-stocks-lost-
+    // habit-events-and-just-have-sex-design.md §4, 2026-11-23-twelve-
+    // together-actions-and-propose-design.md §6).
     let ever_had_sex = event_repo
-        .ever(instance_id, events::EventKind::HavingSex)
-        .await?
-        || event_repo
-            .ever(instance_id, events::EventKind::JustHaveSex)
-            .await?;
+        .ever(instance_id, &events::EventKind::SEX)
+        .await?;
     let Some(drawn) = events::draw(
         &DrawInput {
             now,
