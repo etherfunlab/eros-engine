@@ -8569,31 +8569,31 @@
         "type": "apiKey",
         "in": "header",
         "name": "x-caller-secret",
-        "description": "Deployment-wide caller secret; required on every bearer-authenticated route when the deployment sets CALLER_SECRET"
+        "description": "Deployment-wide caller secret; required on every bearer-authenticated route when the deployment sets CALLER_SECRET. SUPER_SECRET or ADMIN_SECRET is accepted in its place"
       },
       "facts_export_secret": {
         "type": "apiKey",
         "in": "header",
         "name": "x-facts-export-secret",
-        "description": "Shared secret for the facts export sub-tree; FACTS_EXPORT_SECRET on the deployment"
+        "description": "Shared secret for the facts export sub-tree; FACTS_EXPORT_SECRET on the deployment. SUPER_SECRET or ADMIN_SECRET is accepted in its place"
       },
       "genome_write_secret": {
         "type": "apiKey",
         "in": "header",
         "name": "x-genome-write-secret",
-        "description": "Shared secret for the genome-write sub-tree; GENOME_WRITE_SECRET on the deployment"
+        "description": "Shared secret for the genome-write sub-tree; GENOME_WRITE_SECRET on the deployment. SUPER_SECRET or ADMIN_SECRET is accepted in its place"
       },
       "insights_export_secret": {
         "type": "apiKey",
         "in": "header",
         "name": "x-insights-export-secret",
-        "description": "Shared secret for the service sub-tree; INSIGHTS_EXPORT_SECRET on the deployment"
+        "description": "Shared secret for the service sub-tree; INSIGHTS_EXPORT_SECRET on the deployment. SUPER_SECRET or ADMIN_SECRET is accepted in its place"
       },
       "user_erase_secret": {
         "type": "apiKey",
         "in": "header",
         "name": "x-user-erase-secret",
-        "description": "Shared secret for the user-erase sub-tree; USER_ERASE_SECRET on the deployment"
+        "description": "Shared secret for the user-erase sub-tree; USER_ERASE_SECRET on the deployment. SUPER_SECRET is accepted in its place; ADMIN_SECRET is not"
       }
     }
   },

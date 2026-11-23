@@ -38,9 +38,9 @@ use eros_engine_store::human_insight::{HumanInsightRepo, HumanInsightsRow};
 use eros_engine_store::memory::{MemoryRepo, ProfileMemoryChange};
 use eros_engine_store::row_deletion::RowDeletionRepo;
 
-use crate::byok::constant_time_eq;
+use crate::byok::admitted_key;
 use crate::error::AppError;
-use crate::state::AppState;
+use crate::state::{AppState, Gate};
 
 pub(crate) const EXPORT_SECRET_HEADER: &str = "x-insights-export-secret";
 pub(crate) const FACTS_SECRET_HEADER: &str = "x-facts-export-secret";
@@ -128,35 +128,35 @@ fn clamp_limit(requested: Option<i64>) -> i64 {
     requested.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT)
 }
 
-/// 403 unless `header` carries `secret`. A sub-tree is only mounted when its
-/// secret is set, so `None` here is unreachable in practice; it still fails
-/// closed. `what` names the sub-tree in the error text.
+/// 403 unless `header` carries one of `keys` (`ServerConfig::keys`). A
+/// sub-tree is only mounted when it has a key, so an empty list is
+/// unreachable in practice; it still fails closed. `what` names the sub-tree
+/// in the error text.
 pub(crate) fn admit_with(
     headers: &HeaderMap,
-    secret: Option<&str>,
+    keys: &[&str],
     header: &str,
     what: &str,
 ) -> Result<(), AppError> {
-    let Some(secret) = secret else {
+    if keys.is_empty() {
         return Err(AppError::Forbidden(format!("{what} is not enabled")));
-    };
+    }
     let sent = headers
         .get(header)
         .map(|v| v.as_bytes())
         .unwrap_or_default();
-    if constant_time_eq(sent, secret.as_bytes()) {
-        Ok(())
-    } else {
-        Err(AppError::Forbidden(format!(
+    match admitted_key(keys, sent) {
+        Some(_) => Ok(()),
+        None => Err(AppError::Forbidden(format!(
             "{what} secret missing or wrong"
-        )))
+        ))),
     }
 }
 
 fn admit(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
     admit_with(
         headers,
-        state.config.insights_export.secret.as_deref(),
+        &state.config.keys(Gate::InsightsExport),
         EXPORT_SECRET_HEADER,
         "insights export",
     )
@@ -165,7 +165,7 @@ fn admit(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
 fn admit_facts(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
     admit_with(
         headers,
-        state.config.facts_export.secret.as_deref(),
+        &state.config.keys(Gate::FactsExport),
         FACTS_SECRET_HEADER,
         "facts export",
     )
@@ -180,7 +180,7 @@ fn admit_either_read(state: &AppState, headers: &HeaderMap) -> Result<(), AppErr
 fn admit_erase(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
     admit_with(
         headers,
-        state.config.user_erase.secret.as_deref(),
+        &state.config.keys(Gate::UserErase),
         ERASE_SECRET_HEADER,
         "user erase",
     )

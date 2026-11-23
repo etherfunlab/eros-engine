@@ -402,7 +402,7 @@ impl Drop for StreamSlotGuard {
 /// Bring-your-own-key settings (spec 2026-10-08-byok-chat §5, §7.2).
 #[derive(Clone, Default)]
 pub struct ByokConfig {
-    /// `BYOK_CALLER_SECRET`. `None` turns the feature off.
+    /// `BYOK_CALLER_SECRET`. `None` leaves the feature to the master keys: off when neither is set.
     pub caller_secret: Option<String>,
     /// `BYOK_ALLOW_PRIVATE_NETWORK`: lifts the address guard and allows
     /// `http` endpoints, for self-hosted networks and tests.
@@ -449,7 +449,7 @@ pub fn parse_byok_config(
 /// Bring-your-own-character settings (spec 2026-10-16-byoc-design §4).
 #[derive(Clone, Default)]
 pub struct ByocConfig {
-    /// `BYOC_CALLER_SECRET`. `None` turns the feature off.
+    /// `BYOC_CALLER_SECRET`. `None` leaves the feature to the master keys: off when neither is set.
     pub caller_secret: Option<String>,
 }
 
@@ -559,7 +559,7 @@ pub fn parse_caller_secret_config(raw: Option<&str>) -> Result<CallerSecretConfi
 /// `memories/changes`, `insights/deletions`).
 #[derive(Clone, Default)]
 pub struct InsightsExportConfig {
-    /// `INSIGHTS_EXPORT_SECRET`. `None` leaves the routes unmounted.
+    /// `INSIGHTS_EXPORT_SECRET`. `None` leaves the routes to the master keys: unmounted when none covers them.
     pub secret: Option<String>,
 }
 
@@ -583,7 +583,7 @@ pub fn parse_insights_export_config(secret: Option<&str>) -> Result<InsightsExpo
 /// `facts/deletions`).
 #[derive(Clone, Default)]
 pub struct FactsExportConfig {
-    /// `FACTS_EXPORT_SECRET`. `None` leaves the routes unmounted.
+    /// `FACTS_EXPORT_SECRET`. `None` leaves the routes to the master keys: unmounted when none covers them.
     pub secret: Option<String>,
 }
 
@@ -606,7 +606,7 @@ pub fn parse_facts_export_config(secret: Option<&str>) -> Result<FactsExportConf
 /// Admission for the user-erase sub-tree.
 #[derive(Clone, Default)]
 pub struct UserEraseConfig {
-    /// `USER_ERASE_SECRET`. `None` leaves the routes unmounted.
+    /// `USER_ERASE_SECRET`. `None` leaves the routes to the master keys: unmounted when none covers them.
     pub secret: Option<String>,
 }
 
@@ -629,7 +629,7 @@ pub fn parse_user_erase_config(secret: Option<&str>) -> Result<UserEraseConfig, 
 /// Admission for the genome-write sub-tree.
 #[derive(Clone, Default)]
 pub struct GenomeWriteConfig {
-    /// `GENOME_WRITE_SECRET`. `None` leaves the routes unmounted.
+    /// `GENOME_WRITE_SECRET`. `None` leaves the routes to the master keys: unmounted when none covers them.
     pub secret: Option<String>,
 }
 

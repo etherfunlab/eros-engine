@@ -23,7 +23,7 @@ use eros_engine_store::persona::{NewGenome, PersonaRepo};
 use crate::byoc::{parse_card_v1, Card, MAX_PLAINTEXT_LEN};
 use crate::error::AppError;
 use crate::routes::svc::admit_with;
-use crate::state::AppState;
+use crate::state::{AppState, Gate};
 
 pub(crate) const GENOME_SECRET_HEADER: &str = "x-genome-write-secret";
 
@@ -57,7 +57,7 @@ pub struct GenomeIdResponse {
 fn admit_genomes(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
     admit_with(
         headers,
-        state.config.genome_write.secret.as_deref(),
+        &state.config.keys(Gate::GenomeWrite),
         GENOME_SECRET_HEADER,
         "genome write",
     )
@@ -326,6 +326,21 @@ mod tests {
         let (status, _, _) = call(&app, "PUT", &uri, Some(SECRET), &body).await;
         assert_eq!(status, unknown);
         assert_eq!(genome_count(&pool).await, 0);
+    }
+
+    /// A master key mounts the routes and is accepted in the feature's header.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_master_key_writes_a_genome(pool: sqlx::PgPool) {
+        const ADMIN: &str = "admin-0123456789abcdef0123456789abcdef";
+        let mut state = test_state(pool.clone());
+        state.config.masters.admin_secret = Some(ADMIN.into());
+        let app = build_router(state);
+        let body = json!({ "card": card("Nova", "sp") }).to_string();
+        let (status, _, _) = call(&app, "POST", "/svc/v1/genomes", Some(ADMIN), &body).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, _, _) = call(&app, "POST", "/svc/v1/genomes", Some("wrong"), &body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(genome_count(&pool).await, 1);
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

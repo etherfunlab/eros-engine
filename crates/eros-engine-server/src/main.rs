@@ -187,6 +187,13 @@ async fn run_server() -> Result<()> {
             "caller secret gate ENABLED on the authenticated tree"
         );
     }
+    if cfg.masters.super_secret.is_some() || cfg.masters.admin_secret.is_some() {
+        tracing::info!(
+            super_secret = cfg.masters.super_secret.is_some(),
+            admin_secret = cfg.masters.admin_secret.is_some(),
+            "master secrets set: every secret-gated feature they cover is ON"
+        );
+    }
 
     if let Some(dir) = cfg.prompt_log_dir.as_ref() {
         if let Err(e) = std::fs::create_dir_all(dir) {
