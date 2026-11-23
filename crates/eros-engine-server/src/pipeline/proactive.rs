@@ -130,6 +130,9 @@ pub(crate) enum LifeChoiceCue {
     Hurt,
     /// `travel_together` accepted: they are away together for `hours`.
     TravelAgreed { hours: i64 },
+    /// `bathe_together` accepted, and it turned out a shower; a bath is
+    /// `Answered`.
+    ShowerAgreed,
     /// A romantic kind answered, or `travel_together` declined.
     Answered {
         kind: LifeChoiceKind,
@@ -165,6 +168,9 @@ impl LifeChoiceCue {
                 "（对方答应了和你一起去旅行，你们接下来要一起玩 {}。）",
                 crate::prompt::span_text(chrono::Duration::hours(hours))
             ),
+            Self::ShowerAgreed => {
+                "（对方答应了和你一起洗澡，你们现在一起站在花洒下。）".into()
+            }
             Self::Goodbye { hours } => format!(
                 "（对方同意了你提出的分开请求，接下来 {hours} 小时你们不联系。你跟对方道别。）"
             ),
@@ -813,6 +819,7 @@ async fn store(
             LifeChoiceCue::Goodbye { .. }
             | LifeChoiceCue::Hurt
             | LifeChoiceCue::TravelAgreed { .. }
+            | LifeChoiceCue::ShowerAgreed
             | LifeChoiceCue::Answered { .. },
         ) => {
             chat_repo
@@ -1444,6 +1451,10 @@ mod tests {
         assert_eq!(
             cue(answered(LifeChoiceKind::BatheTogether, true)),
             "（对方答应了和你一起洗澡，你们现在一起泡在浴缸里。）"
+        );
+        assert_eq!(
+            cue(LifeChoiceCue::ShowerAgreed),
+            "（对方答应了和你一起洗澡，你们现在一起站在花洒下。）"
         );
         assert_eq!(
             cue(answered(LifeChoiceKind::BatheTogether, false)),
