@@ -3966,6 +3966,7 @@ mod tests {
             feeling_clause_at: None,
             created_at: now,
             updated_at: now,
+            relationship: Default::default(),
         }
     }
 
@@ -4306,6 +4307,7 @@ mod tests {
             feeling_clause_at: None,
             created_at: now,
             updated_at: now,
+            relationship: Default::default(),
         }
     }
 

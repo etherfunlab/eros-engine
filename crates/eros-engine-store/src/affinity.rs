@@ -71,6 +71,7 @@ impl AffinityRow {
             feeling_clause_at: self.feeling_clause_at,
             created_at: self.created_at,
             updated_at: self.updated_at,
+            relationship: Default::default(),
         }
     }
 }
