@@ -79,7 +79,7 @@ value of the wrong shape reads as absent.
 | `hygienic` | boolean | Whether she loves being clean. Read by life events, and by when she asks the user to take a bath together. |
 | `employed` | string | `free`, `part_time` or `full_time`: how much of her day is work. Absent or any other value reads as `part_time`. Read by life events. |
 | `outdoorsy` | string | `outdoor`, `neutral` or `indoor`: whether she leans outdoors or stays in. Absent or any other value reads as `neutral`. Read by life events. |
-| `setting` | string | `modern` or `fantasy`: the world she lives in, which decides the life events that fit her. Absent or any other value reads as `modern`. Read by life events. |
+| `setting` | string | `modern` or `fantasy`: the world she lives in, which decides the life events that fit her. Absent or any other value reads as `modern`. Read by life events, and by the user's `fight_together`, which only a `fantasy` persona accepts. |
 
 The last ten are accepted and have no effect on a BYOC instance, since
 BYOC does not serve life events yet.
