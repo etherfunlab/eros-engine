@@ -268,12 +268,14 @@ roll can refuse whatever the judge says
 - **Refused tip:** a `tip` drops no line. The persona's reply follows the
   verdict; the turn is graded like any other.
 - **Social actions:** a refused `bluff`, `threaten` or `trick` means she saw
-  through it, and drops no line either; the turn is graded like any other.
+  through it, and a refused `challenge` or `bet` that she turned it down. Neither
+  drops a line; the turn is graded like any other.
 - **Strip:** a `strip` from a pair whose `affinity_scope` is not romance-compatible is
   refused whatever the judge says, and drops Chemistry like any refused
   physical action. So is a `shower_together`, `bath_together`, `sex_together` or
-  `streak_together` from such a pair, and a `toilet_together` to a machine persona; the other
-  together actions have no such rule. A `smoke_together`, `smoke_weed_together` or
+  `streak_together` from such a pair, and a `toilet_together` to a machine persona. A
+  `fight_together` to a persona whose `setting` is not `fantasy` is refused the same way and drops
+  no line. The other together actions have no such rule. A `smoke_together`, `smoke_weed_together` or
   `drink_together` the roll refuses drops Chemistry too, not Bond.
 - **Proposal:** a refused `propose` drops no line; the turn is graded like any other.
 - **Gift:** accepted, the gift also joins the persona's items or wardrobe;

@@ -1,4 +1,4 @@
-# Migrating to v2.8.1: twelve together actions and a proposal from the user
+# Migrating to v2.8.1: fourteen together actions, a proposal, a challenge and a bet
 
 **Applies to:**
 - clients that keep their own catalog of action types or event kinds, or that match one of them exhaustively;
@@ -7,30 +7,31 @@
 - crate users who call `EventRepo::ever` or `pde::together_ruled_out`, match on `EventKind` or `UserAction`, or rely on the length of `EventKind::SPECIAL`.
 
 No migration and no new setting. Every HTTP change is additive: new values in enums a client may match exhaustively, and a picture on an accepted together action, as in v2.8.0.
-**Design:** [`2026-11-23-twelve-together-actions-and-propose-design.md`](../superpowers/specs/2026-11-23-twelve-together-actions-and-propose-design.md)
+**Design:** [`2026-11-23-twelve-together-actions-and-propose-design.md`](../superpowers/specs/2026-11-23-twelve-together-actions-and-propose-design.md), [`2026-11-23-hot-spring-fight-challenge-bet-design.md`](../superpowers/specs/2026-11-23-hot-spring-fight-challenge-bet-design.md)
 
 The rules are in [together actions](../life-events-needs.md#showering-bathing-and-the-sauna-together), [the romantic choices](../life-events-needs.md#the-romantic-choices) and [the send route](../api-reference.md#post-compchatsession_idmessagestream).
 
 ## What users will notice
 
-- **The user can ask her to do twelve more things together**: go to the toilet, smoke, fall asleep, go to bed, walk, smoke weed, jog, do yoga, watch the stars, ride horses, streak or drink with the user. Each behaves as `sauna_together` does:
+- **The user can ask her to do fourteen more things together**: go to the toilet, smoke, fall asleep, go to bed, walk, smoke weed, jog, do yoga, watch the stars, ride horses, streak, drink, soak in a hot spring or fight with the user. Each behaves as `sauna_together` does:
   - The judge decides. A refusal drops chemistry one tier and places nothing.
-  - `sex_together` and `streak_together` are refused before the judge when the pair is not romance-compatible, as `strip` is. `toilet_together` is refused before the judge for a robot or android persona. The other ten have no such rule.
+  - `sex_together` and `streak_together` are refused before the judge when the pair is not romance-compatible, as `strip` is. `toilet_together` is refused before the judge for a robot or android persona. `fight_together` is refused before the judge for a persona whose `art_metadata.setting` is not `fantasy` (absent reads `modern`), and that refusal drops nothing. The other ten have no such rule.
   - An accepted one puts her in an event (table below). The incident under way ends; a background keeps going. Inside a date nothing is placed and the date goes on.
   - None of the events takes her offline: during `asleep_together` she still answers.
   - An accepted one comes with her picture when the turn carries `image` and the deployment has the composer. The picture shows the event.
-  - Her reply to `sex_together` and `streak_together` is in the `emotional` tone when the deployment has [`tones.emotional`](../model-config.md#tones--chat-tones-chat-task-only) above 0; the other ten's is not.
+  - Her reply to `sex_together` and `streak_together` is in the `emotional` tone when the deployment has [`tones.emotional`](../model-config.md#tones--chat-tones-chat-task-only) above 0; the other twelve's is not.
 - **Smoking, smoking weed and drinking together count as a give of one** `cigarette`, `herb` or `alcohol` for three things: the habit roll (a persona whose `smoking`, `drug` or `alcoholic` key is `false` refuses unless a one-in-three roll lets it through), the needs an accepted one moves (`social` and `indulgence` up one level), and the lingering effect it leaves. A refusal drops chemistry, not bond, and no journal moment is written.
 - **The user can propose to her** (`propose`). The judge decides; a refusal drops nothing. It places no event and is not a picture action. Her reply is in the `emotional` tone when the tone is on.
+- **The user can challenge her or propose a bet** (`challenge`, `bet`). They are social actions, as `bluff`, `threaten` and `trick` are: the answer says whether she takes the user up on it (应战了 / 没应战, 答应打这个赌 / 没答应), and a refusal drops nothing. No winner is decided; what the challenge or the bet is, the user says in the message. Neither places an event or is a picture action, and the reply is never in the `emotional` tone.
 - **She does not ask what she has already accepted.** Once she has accepted the user's `sex_together` in a session, or in a date of it, she never asks `sleep_together` herself in that session; once she has accepted the user's `propose`, she never asks `propose`. A refused one changes nothing, and an ask of hers already pending stays as it is.
 - **Bed with the user counts as sex.** A `having_sex_together` row ends her virginity as the draw sees it and lifts `pregnancy_scare` out of its fifth weight, as `having_sex` and `just_have_sex` do, and makes a pregnancy scare likelier while it is recent. An accept inside a date places no row and so changes none of these.
-- **The story director** does not see `having_sex_together`, `streaking_together`, `using_toilet_together` or `asleep_together`; the other eight reach it, as `sauna_together` does.
+- **The story director** does not see `having_sex_together`, `streaking_together`, `using_toilet_together` or `asleep_together`; the other ten reach it, as `sauna_together` does.
 
 ## Deployments
 
 Nothing to run: no migration, no new setting. Deploy the image as for any release.
 
-- **A custom judge prompt.** The judge's `[用户动作]` line carries the new markers, such as `[用户动作] 对方想和你上床` and `[用户动作] 对方向你求婚`. A new together action refused before the judge ends the line with `，这次你不会答应`, whatever the reason: the romance gate, a machine persona, or the habit roll on a smoke, weed or drink together. A prompt that treats actions generically needs nothing; one that lists actions by marker can add the thirteen.
+- **A custom judge prompt.** The judge's `[用户动作]` line carries the new markers, such as `[用户动作] 对方想和你上床`, `[用户动作] 对方向你求婚` and `[用户动作] 对方想和你一起去战斗`; a challenge or a bet spells out both answers, as `[用户动作] 对方向你发起挑战（accept：你应战了；refuse：你没应战）`. A new together action refused before the judge ends the line with `，这次你不会答应`, whatever the reason: the romance gate, a machine persona, a persona whose world is not `fantasy`, or the habit roll on a smoke, weed or drink together. A prompt that treats actions generically needs nothing; one that lists actions by marker can add the seventeen.
 
 ### Rollback
 
@@ -41,9 +42,9 @@ Roll back the image; there is no database change to undo. On the `v2.8.0` image:
 
 ## Clients
 
-1. **Add the thirteen action types** if your client offers them. None carries a field. The answer arrives as for any action: the `action_response` frame, then `response` on the stored row in both history routes.
-2. **Expect a picture on an accepted together action**, as in v2.8.0: with `image` in the request and the composer configured, the frames run `action_response → meta(reply_text_image) → delta* → done → image_request → final`. A refusal, and a deployment without the composer, are text only. `propose` is not a together action: it follows whatever the judge chose, as any other action turn does.
-3. **Add the twelve event kinds to your catalog** before or with the upgrade. Each is placed by the accepted action and never drawn:
+1. **Add the seventeen action types** if your client offers them. None carries a field: what a `challenge` or a `bet` is goes in the message text. The answer arrives as for any action: the `action_response` frame, then `response` on the stored row in both history routes. A `fight_together` to a persona whose `setting` is not `fantasy` is always `refuse` and costs nothing; a client may offer it to `fantasy` personas only.
+2. **Expect a picture on an accepted together action**, as in v2.8.0: with `image` in the request and the composer configured, the frames run `action_response → meta(reply_text_image) → delta* → done → image_request → final`. A refusal, and a deployment without the composer, are text only. `propose`, `challenge` and `bet` are not together actions: they follow whatever the judge chose, as any other action turn does.
+3. **Add the fourteen event kinds to your catalog** before or with the upgrade. Each is placed by the accepted action and never drawn:
 
    | action | kind | label | category | lasts |
    |---|---|---|---|---|
@@ -59,18 +60,21 @@ Roll back the image; there is no database change to undo. On the `v2.8.0` image:
    | `ride_horse_together` | `horse_riding_together` | 和对方一起骑马 | `short` | 1 h |
    | `streak_together` | `streaking_together` | 和对方一起裸奔 | `short` | 30 min |
    | `drink_together` | `drinking_together` | 和对方一起喝酒 | `short` | 1 h |
+   | `hot_spring_together` | `hot_spring_together` | 和对方一起泡温泉 | `short` | 1 h |
+   | `fight_together` | `fighting_together` | 和对方并肩作战 | `mid` | 1–2 h |
 
    They appear as `event` on `GET /v2/comp/session/{session_id}/effects` while they last, with `"offline": false`, and `changes_at` counts their end. A client that drops kinds it does not know shows nothing for them. Do not show `asleep_together` as her being out of reach: she answers throughout.
 4. **Keep the new kinds out of `kinds`.** Naming one in a `kinds` filter is a `422`, as for `sauna_together`. A `disallow` list needs nothing: no draw yields them.
 5. **Adult themes.** `having_sex_together` and `streaking_together` carry them, and only an accepted `sex_together` or `streak_together` places them. A caller that serves adult themes only to some users does not offer those two actions to the others.
 6. **Expect a lingering effect from a habit action.** After an accepted `smoke_together`, `smoke_weed_together` or `drink_together`, the `body_state` frame and `…/effects` list a `cigarette`, `herb` or `alcohol` effect of quantity 1, with no `name`.
-7. **Match enums leniently.** `action.type` gains thirteen values and an event's `kind` twelve.
+7. **Match enums leniently.** `action.type` gains seventeen values and an event's `kind` fourteen.
 
 ## Crate users
 
-- `EventKind` gains `UsingToiletTogether`, `SmokingTogether`, `AsleepTogether`, `HavingSexTogether`, `WalkingTogether`, `SmokingWeedTogether`, `JoggingTogether`, `YogaTogether`, `StargazingTogether`, `HorseRidingTogether`, `StreakingTogether` and `DrinkingTogether`. `EventKind::SPECIAL` is now `[EventKind; 19]`: a signature or a constant that spells the length changes, and an exhaustive `match` adds the arms. The new `EventKind::SEX` lists the kinds that end her virginity.
-- `UserAction` gains `ToiletTogether`, `SmokeTogether`, `FallAsleepTogether`, `SexTogether`, `WalkTogether`, `SmokeWeedTogether`, `JogTogether`, `YogaTogether`, `StargazeTogether`, `RideHorseTogether`, `StreakTogether`, `DrinkTogether` and `Propose`. `together_kind()` names the event each of the first twelve places, and `None` for `Propose`. The new `consumed()` returns what an action has her take: a `give`'s item and quantity, one `Cigarette`, `Herb` or `Alcohol` for the three habit actions, `None` otherwise. `pde::refuses_give` and `effects::active_effects` read it, so they now also cover the habit actions.
+- `EventKind` gains `UsingToiletTogether`, `SmokingTogether`, `AsleepTogether`, `HavingSexTogether`, `WalkingTogether`, `SmokingWeedTogether`, `JoggingTogether`, `YogaTogether`, `StargazingTogether`, `HorseRidingTogether`, `StreakingTogether`, `DrinkingTogether`, `HotSpringTogether` and `FightingTogether`. `EventKind::SPECIAL` is now `[EventKind; 21]`: a signature or a constant that spells the length changes, and an exhaustive `match` adds the arms. The new `EventKind::SEX` lists the kinds that end her virginity. `EventKind::FightingTogether.fits(setting)` is `true` only for `Setting::Fantasy`.
+- `UserAction` gains `ToiletTogether`, `SmokeTogether`, `FallAsleepTogether`, `SexTogether`, `WalkTogether`, `SmokeWeedTogether`, `JogTogether`, `YogaTogether`, `StargazeTogether`, `RideHorseTogether`, `StreakTogether`, `DrinkTogether`, `HotSpringTogether`, `FightTogether`, `Propose`, `Challenge` and `Bet`. `together_kind()` names the event each together action places, and `None` for `Propose`, `Challenge` and `Bet`; `refusal_line()` is `None` for those three. The new `consumed()` returns what an action has her take: a `give`'s item and quantity, one `Cigarette`, `Herb` or `Alcohol` for the three habit actions, `None` otherwise. `pde::refuses_give` and `effects::active_effects` read it, so they now also cover the habit actions.
 - `eros_engine_core::pde::together_ruled_out` takes a second parameter, `machine: bool`: whether the persona is a robot or android. Pass `false` for a persona that is not.
+- The new `eros_engine_core::pde::world_ruled_out(event, setting) -> bool` answers whether the turn's action is one the persona's world lacks: a `fight_together` when `setting` is not `Setting::Fantasy`. Such a refusal drops no line.
 - `eros_engine_store::events::EventRepo::ever` takes `&[EventKind]` instead of one `EventKind` and answers whether the instance has a row of any of them. Pass `&[kind]` for the old behaviour.
 - `LifeChoiceRepo::settled` also answers `true` once the session, or a date's sub-session of it, holds a user row whose action is the kind's mirror with the answer `accept`; `LifeChoiceKind::user_ask()` names that mirror (`sex_together` for `SleepTogether`, `propose` for `Propose`).
 - `StoryRepo::life_events` leaves out `having_sex_together`, `streaking_together`, `using_toilet_together` and `asleep_together`.
