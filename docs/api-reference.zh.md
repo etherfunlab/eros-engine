@@ -988,8 +988,8 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 
 时长写成区间的，在事件开始时从区间里抽定。以上共 70 种可抽取的种类。两种性别都会抽到两个聚会，权重相同，这是有意为之。
 
-另有二十一种永远不会被抽到：`taking_space`（她提出、用户同意的分开，12–24 小时，离线）、`fell_out`（用户不理会她提出的分开请求时的那场不愉快，1 小时）、`traveling_together`（她提议、用户同意的旅行，48–72 小时，`trip` 类背景，不离线）、`bathing_together`（她提议、用户同意的一起洗澡，或她答应的 `bath_together`，30 分钟，`short` 类插曲，不离线）、`on_a_date`（用户约她、她答应了的约会，1 或 4 小时，`short` 类插曲，不离线）、`showering_together`（她答应的 `shower_together`，30 分钟，`short` 类插曲，不离线）、`sauna_together`（她答应的 `sauna_together`，1 小时，`short` 类插曲，不离线），以及其余一起做的动作写入的十四种，从 `using_toilet_together` 到 `fighting_together`（她答应的对应动作，除 `mid` 的 `asleep_together` 和 `fighting_together` 外都是 `short` 类插曲，都不离线；时长见[一起做的动作](#post-compchatsession_idmessagestream)的表）。
-前四种由 engine 为[生活选择流程](#post-v2compsessionsession_idlife-choiceschoice_id)写入（第四种也为那个动作写入），`on_a_date` 为[约会](activities.zh.md)写入，其余为[一起做的动作](#post-compchatsession_idmessagestream)写入。它们作为 `…/effects` 里的 `event` 出现，前四种也作为生活选择响应里的 `event` 出现，
+另有二十一种永远不会被抽到：`taking_space`（她提出、用户同意的分开，12–24 小时，离线）、`fell_out`（用户不理会她提出的分开请求时的那场不愉快，1 小时）、`traveling_together`（她提议、用户同意的旅行，48–72 小时，`trip` 类背景，不离线）、`bathing_together`（她提议、用户同意的一起洗澡，或她答应的 `bath_together`，30 分钟，`short` 类插曲，不离线）、`on_a_date`（用户约她、她答应了的约会，1 或 4 小时，`short` 类插曲，不离线）、`showering_together`（她答应的 `shower_together`，或她提议的一起洗澡落成淋浴，30 分钟，`short` 类插曲，不离线）、`sauna_together`（她答应的 `sauna_together`，1 小时，`short` 类插曲，不离线），以及其余一起做的动作写入的十四种，从 `using_toilet_together` 到 `fighting_together`（她答应的对应动作，除 `mid` 的 `asleep_together` 和 `fighting_together` 外都是 `short` 类插曲，都不离线；时长见[一起做的动作](#post-compchatsession_idmessagestream)的表）。
+前四种由 engine 为[生活选择流程](#post-v2compsessionsession_idlife-choiceschoice_id)写入（第四种也为那个动作写入），`on_a_date` 为[约会](activities.zh.md)写入，其余为[一起做的动作](#post-compchatsession_idmessagestream)写入；`showering_together` 和 `having_sex_together` 也会为生活选择流程写入。它们作为 `…/effects` 里的 `event` 出现，由生活选择流程写入的那些也作为生活选择响应里的 `event` 出现，
 不能写进 `kinds`。
 
 `sudden_desire`、`strip`、`streaking`、`having_sex`、`just_have_sex`、`masturbating` 与 `pregnancy_scare`（后者隐含性行为）带成人题材；只对部分用户提供这类内容的调用方，用
@@ -1189,7 +1189,7 @@ engine 不接收也不保存用户的性别或性取向。
 
 | | `ask_for_space` | `sleep_together` | `propose` | `travel_together` | `bathe_together` |
 |---|---|---|---|---|---|
-| **`accept`** | 状态 `accepted`。一段 `taking_space` 分开从此刻开始，持续时长是她提出时的档位差距每一档 6 小时（差距 2、3、4 对应 12、18、24 小时）；期间她在所有 session 里都离线，正在进行的插曲在这一刻结束。bond 和 chemistry 各降一档，分开结束后的 72 小时内，这个 session 里为正的增长减半 | 状态 `accepted`；正在进行的插曲在这一刻结束，背景照旧；别的都不变 | 状态 `accepted`；正在进行的插曲在这一刻结束，背景照旧；别的都不变 | 状态 `accepted`。一段 `traveling_together` 背景从此刻开始，持续 48 到 72 小时；她照常回复，正在进行的插曲在这一刻结束。别的都不变 | 状态 `accepted`。一段 `bathing_together` 插曲从此刻开始，持续 30 分钟；她照常回复，正在进行的插曲在这一刻结束。别的都不变 |
+| **`accept`** | 状态 `accepted`。一段 `taking_space` 分开从此刻开始，持续时长是她提出时的档位差距每一档 6 小时（差距 2、3、4 对应 12、18、24 小时）；期间她在所有 session 里都离线，正在进行的插曲在这一刻结束。bond 和 chemistry 各降一档，分开结束后的 72 小时内，这个 session 里为正的增长减半 | 状态 `accepted`。一段 `having_sex_together` 插曲从此刻开始，持续 1 小时，和用户的 `sex_together` 被接受时一样；她照常回复，正在进行的插曲在这一刻结束，背景照旧。别的都不变 | 状态 `accepted`；正在进行的插曲在这一刻结束，背景照旧；别的都不变 | 状态 `accepted`。一段 `traveling_together` 背景从此刻开始，持续 48 到 72 小时；她照常回复，正在进行的插曲在这一刻结束。别的都不变 | 状态 `accepted`。一段 `showering_together` 或 `bathing_together` 插曲（两者机会均等）从此刻开始，持续 30 分钟；她照常回复，正在进行的插曲在这一刻结束。别的都不变 |
 | **`decline`** | 状态 `declined`。同样的降档；没有分开，也没有放缓 | 状态 `declined`；chemistry 降一档 | 状态 `declined`；bond 和 chemistry 各降一档 | 状态 `declined`；别的都不变 | 状态 `declined`；chemistry 降一档 |
 | **不理会**（用户改为打字） | 状态 `ignored`；一场一小时的 `fell_out` 插曲；不改任何档位 | 状态 `ignored`；没有代价，没有 `fell_out` | 状态 `ignored`；没有代价，没有 `fell_out` | 状态 `ignored`；没有代价，没有 `fell_out` | 状态 `ignored`；没有代价，没有 `fell_out` |
 | **过期**（24 小时） | 没有代价 | 没有代价 | 没有代价 | 没有代价 | 没有代价 |
@@ -1206,8 +1206,8 @@ engine 不接收也不保存用户的性别或性取向。
 
 `status` 为 `accepted` 或 `declined`。`affinity` 是回答之后的关系：`ask_for_space` 的接受以及除 `travel_together` 外任何种类的拒绝之后是降档后的，
 其他情况保持原样；形状同
-[`GET /bff/v1/comp/affinity/{session_id}`](#get-bffv1compaffinitysession_id) 里的 `affinity`。`event` 是 `ask_for_space` 接受时开始的分开、`travel_together` 接受时开始的旅行，或 `bathe_together` 接受时开始的一起洗澡，
-任何拒绝以及 `sleep_together`、`propose` 的所有回答都为 `null`。
+[`GET /bff/v1/comp/affinity/{session_id}`](#get-bffv1compaffinitysession_id) 里的 `affinity`。`event` 是 `ask_for_space` 接受时开始的分开、`travel_together` 接受时开始的旅行、`bathe_together` 接受时开始的淋浴或泡澡，或 `sleep_together` 接受时开始的 `having_sex_together`，
+任何拒绝以及 `propose` 的所有回答都为 `null`。
 她的生成失败、回复为空，或用户有更新的消息先落库时，`message` 为 `null`：回答、分开和降档照样生效。
 
 用户不调用这个路由时，还有两件事会让选择结算：

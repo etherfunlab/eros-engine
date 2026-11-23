@@ -1223,7 +1223,7 @@ suggested and the user agreed to, 48–72 h, a `trip` background, not offline),
 `bath_together` she accepted, 30 min, a `short` incident, not offline),
 `on_a_date` (a date the user asked her on and she accepted, 1 or 4 h, a `short`
 incident, not offline), `showering_together` (a `shower_together` she accepted,
-30 min, a `short` incident, not offline), `sauna_together` (a
+or her suggested bath turned out a shower, 30 min, a `short` incident, not offline), `sauna_together` (a
 `sauna_together` she accepted, 1 h, a `short` incident, not offline) and the
 fourteen kinds of the other together actions, from `using_toilet_together` to
 `fighting_together` (each one she accepted, `short` incidents but the `mid`
@@ -1232,9 +1232,11 @@ fourteen kinds of the other together actions, from `using_toilet_together` to
 writes the first four for the
 [life-choice flow](#post-v2compsessionsession_idlife-choiceschoice_id) (the
 fourth also for the action), `on_a_date` for a [date](activities.md), and the
-rest for the [together actions](#post-compchatsession_idmessagestream). They
-show up as the `event` of `…/effects`, the first four also as the `event` of the
-life-choice response, and cannot be listed in `kinds`.
+rest for the [together actions](#post-compchatsession_idmessagestream);
+`showering_together` and `having_sex_together` are written for the life-choice
+flow too. They show up as the `event` of `…/effects`, those the life-choice
+flow writes also as the `event` of the life-choice response, and cannot be
+listed in `kinds`.
 
 `sudden_desire`, `strip`, `streaking`, `having_sex`, `just_have_sex`, `masturbating` and `pregnancy_scare`, which implies sex, carry adult themes;
 a caller that serves them only to some users leaves them out with
@@ -1538,7 +1540,7 @@ What an answer does depends on `kind`:
 
 | | `ask_for_space` | `sleep_together` | `propose` | `travel_together` | `bathe_together` |
 |---|---|---|---|---|---|
-| **`accept`** | status `accepted`. A `taking_space` separation starts now and lasts 6 hours per tier of the gap she asked at (gap 2, 3, 4: 12, 18, 24 hours); she is offline for all her sessions while it lasts, and an incident under way ends. Bond and chemistry each drop one tier, and for 72 hours after the separation ends positive growth in this session is halved | status `accepted`; an incident under way ends, a background keeps running; nothing else changes | status `accepted`; an incident under way ends, a background keeps running; nothing else changes | status `accepted`. A `traveling_together` background starts now and lasts 48 to 72 hours; she keeps replying, and an incident under way ends. Nothing else changes | status `accepted`. A `bathing_together` incident starts now and lasts 30 minutes; she keeps replying, and an incident under way ends. Nothing else changes |
+| **`accept`** | status `accepted`. A `taking_space` separation starts now and lasts 6 hours per tier of the gap she asked at (gap 2, 3, 4: 12, 18, 24 hours); she is offline for all her sessions while it lasts, and an incident under way ends. Bond and chemistry each drop one tier, and for 72 hours after the separation ends positive growth in this session is halved | status `accepted`. A `having_sex_together` incident starts now and lasts 1 hour, as for the user's accepted `sex_together`; she keeps replying, an incident under way ends, a background keeps running. Nothing else changes | status `accepted`; an incident under way ends, a background keeps running; nothing else changes | status `accepted`. A `traveling_together` background starts now and lasts 48 to 72 hours; she keeps replying, and an incident under way ends. Nothing else changes | status `accepted`. A `showering_together` or `bathing_together` incident, one or the other at even odds, starts now and lasts 30 minutes; she keeps replying, and an incident under way ends. Nothing else changes |
 | **`decline`** | status `declined`. The same tier drop; no separation and no slowdown | status `declined`; chemistry drops one tier | status `declined`; bond and chemistry each drop one tier | status `declined`; nothing else changes | status `declined`; chemistry drops one tier |
 | **ignore** (the user types instead) | status `ignored`; a one-hour `fell_out` incident; no tier change | status `ignored`; no cost, no `fell_out` | status `ignored`; no cost, no `fell_out` | status `ignored`; no cost, no `fell_out` | status `ignored`; no cost, no `fell_out` |
 | **expiry** (24 h) | no cost | no cost | no cost | no cost | no cost |
@@ -1560,9 +1562,9 @@ answer: dropped for an `ask_for_space` accept and for a decline of any kind but
 `travel_together`, as it stands otherwise, in the shape of
 [`GET /bff/v1/comp/affinity/{session_id}`](#get-bffv1compaffinitysession_id)'s
 `affinity`. `event` is the separation an `ask_for_space` accept started, the
-trip a `travel_together` accept started or the bath a `bathe_together` accept
-started, and `null` after any decline and for every `sleep_together` and
-`propose` answer. `message` is `null`
+trip a `travel_together` accept started, the shower or bath a `bathe_together`
+accept started or the `having_sex_together` a `sleep_together` accept started,
+and `null` after any decline and for every `propose` answer. `message` is `null`
 when her generation failed, came back blank, or a newer message of the user's
 landed first: the answer, the separation and the drop stand either way.
 
