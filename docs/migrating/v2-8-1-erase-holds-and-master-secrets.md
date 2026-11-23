@@ -33,6 +33,7 @@ What to check:
 2. **If you erased a user as a reset and let them keep chatting:** that user now gets replies and nothing else — no facts, profile, memories, insights or affinity. To readmit one, delete their row from `engine.user_erasures`. Every user erased before the upgrade is affected from the moment the new image starts.
 3. **A turn sent after the erase** still writes its own audit rows (`companion_decision_events`, the image and vision events). Call the erase again to blank them.
 4. **Call the erase before deleting the user's sessions or persona instances**, as before.
+5. **A write in flight at the instant of the erase** can still land: one whose check began just before the tombstone committed. Stopping the user's traffic first avoids it, and a repeat call removes such a row.
 
 ### Two master secrets
 

@@ -3123,9 +3123,9 @@ curl -X POST -H "x-user-erase-secret: $USER_ERASE_SECRET" \
 
 `deleted` counts rows removed and `blanked` counts rows kept with their content cleared (ids and timestamps stay), each by table name. Every covered table is listed (the example abbreviates), with `0` when it had nothing to do; `blanked` counts only rows that still carried content. The tables are listed in [Insights → Erasure](insights.md#erasure). Chat sessions and messages belong to the caller and are not touched.
 
-- **Idempotent.** A repeat finds nothing left, reports `0` everywhere, and moves `erased_at` forward.
+- **Idempotent.** A repeat reports what it still found, `0` everywhere when nothing is left, and moves `erased_at` forward.
 - **Call it before deleting the user's sessions or persona instances.** The per-relationship insight tables and the relationship scan's tables key on the instance alone and are reachable only while the instance row exists.
-- **Permanent, and it holds.** From the first call on, the engine derives nothing more about the user: no fact, profile, memory, insight or relationship scan is written, and the dreaming backfill skips the chat history the caller kept. A turn the user still sends is answered; its audit rows carry content until a repeat call blanks them. No route undoes an erasure ([Insights → Erasure](insights.md#erasure)).
+- **Permanent, and it holds.** From the first call on, the engine derives nothing more about the user: no fact, profile, memory, insight or relationship scan is written, and the dreaming backfill skips the chat history the caller kept. A turn the user still sends is answered; its audit rows carry content until a repeat call blanks them. A write already in flight at the instant of the erase can still land, and a repeat call removes it. No route undoes an erasure ([Insights → Erasure](insights.md#erasure)).
 
 ### `POST /svc/v1/genomes`
 

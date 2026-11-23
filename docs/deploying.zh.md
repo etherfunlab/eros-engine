@@ -292,7 +292,7 @@ World Stories 按实例生活模拟）默认完全关闭：模型配置里没有
   - 两者各是一个至少 32 字节的值（更短会导致启动失败）。`ADMIN_SECRET` 与 `SUPER_SECRET` 或 `USER_ERASE_SECRET` 相同时拒绝启动。
   - caller secret 闸门仍然只由 `CALLER_SECRET` 决定：万能 secret 不会把它打开，闸门开着时万能 secret 可以通过。
   - BYOC 用调用方出示的那把钥匙给 init ticket 签名，所以创建实例时要用领取 ticket 的同一把钥匙。
-- **服务端点（可选）：**`/svc/v1/*` 是四棵子树，各自只在设置了自己的 secret 时才挂载。每个 secret 至少 32 字节（更短会导致启动失败），保存在下游的服务器上，以下面列出的 header 发送。未设置 ⇒ 对应子树不挂载，这些路径与任何未知路径表现一致。契约见 [API 参考 → 服務端點](api-reference.zh.md#服務端點)。
+- **服务端点（可选）：**`/svc/v1/*` 是四棵子树，各自只在设置了自己的 secret、或设置了覆盖它的万能 secret 时才挂载。每个 secret 至少 32 字节（更短会导致启动失败），保存在下游的服务器上，以下面列出的 header 发送。两者都没有 ⇒ 对应子树不挂载，这些路径与任何未知路径表现一致。契约见 [API 参考 → 服務端點](api-reference.zh.md#服務端點)。
   - `INSIGHTS_EXPORT_SECRET`（`x-insights-export-secret`）挂载 `GET /svc/v1/insights/changes`，把自某个 keyset 游标以来有变动的 `human_insights` 行交给下游服务，让它不碰数据库就能维护一份对话推导画像的只读镜像；挂载 `GET /svc/v1/memories/changes`，以同样的方式交出画像层的抽取记忆；还挂载 `GET /svc/v1/insights/deletions`，即这两种镜像都必须读取的已抹除用户流。
   - `FACTS_EXPORT_SECRET`（`x-facts-export-secret`）挂载 `GET /svc/v1/facts/changes`，即以 keyset 流形式交出的事实账本，以及 `GET /svc/v1/facts/deletions`，供事实镜像使用的同一条已抹除用户流。
   - 两个导出 secret 任设一个，还会挂载 `GET /svc/v1/rows/deletions`：用户本人逐条删除的记忆与事实，这两种镜像也都必须读取。任一 header 都能打开它。
