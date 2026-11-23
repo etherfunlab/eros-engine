@@ -370,7 +370,7 @@ Up to three lines, each present only when it has something to say:
 
 - **Status line**, when the status is not `none`: `你是用户的{noun}`. Nouns:
   `dating` 女朋友 / 男朋友, `engaged` 未婚妻 / 未婚夫, by the persona's
-  `gender` (伴侣 / 未婚伴侣 for any other value); `partner` 伙伴; `peer`
+  `gender` (伴侣 / 订婚对象 for any other value); `partner` 伙伴; `peer`
   同事; `ex` 前任. `fwb` and `situationship` have no settled Chinese wording
   yet; working copy 伙伴，也是情人 and 同事，私下在交往.
 - **Composed line**, when there is a composed relation (for an incompatible
@@ -388,8 +388,11 @@ is `none()` *(my call)*.
 ### 9.2 PDE judge
 
 The judge's context gains one line with the status noun and whether a cold
-war is on, so its accept or refuse decisions agree with the relationship.
-It does not get the composed relation.
+war is on, so its accept or refuse decisions agree with the relationship:
+`[关系] 状态={zh}；冷战中={是|否}`, `engaged` reading 已订婚. At `none` the
+line is `[关系] 冷战中=是` during a cold war and absent otherwise, since
+`none` is every session at deploy and says nothing about the pair. It does
+not get the composed relation.
 
 ### 9.3 API
 
