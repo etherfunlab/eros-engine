@@ -266,6 +266,14 @@ mod tests {
         let (bad_ticket, _) = call("/v2/comp/byoc/create", BYOC_SECRET, Some(forged)).await;
         assert!(bad_ticket.is_client_error(), "{bad_ticket}");
 
+        // A ticket minted with the feature secret: the master key does not
+        // redeem it, the feature secret does.
+        let (status, _) = call("/v2/comp/byoc/create", SUPER, Some(own_issue.clone())).await;
+        assert_eq!(status, bad_ticket, "the master key does not redeem it");
+        let (status, body) = call("/v2/comp/byoc/create", BYOC_SECRET, Some(own_issue)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        // And the other way round.
         let (status, issued) = call("/v2/comp/byoc/init", SUPER, None).await;
         assert_eq!(status, StatusCode::OK, "{issued}");
         let before = count_instances(&pool).await;

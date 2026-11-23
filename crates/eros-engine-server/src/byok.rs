@@ -278,8 +278,8 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// The key in `keys` that `sent` equals, if any: the one comparison behind
-/// every secret gate (see `ServerConfig::keys`). Every key is compared, so the
-/// time taken does not tell which one matched.
+/// every secret gate (see `ServerConfig::keys`). Every key is compared, with
+/// no early exit on a match.
 pub(crate) fn admitted_key<'a>(keys: &[&'a str], sent: &[u8]) -> Option<&'a str> {
     keys.iter().fold(None, |found, key| {
         if constant_time_eq(sent, key.as_bytes()) {
