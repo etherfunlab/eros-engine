@@ -528,8 +528,8 @@ async fn persist_affinity(
             };
             let (llm_attempts, gateway_errors) =
                 crate::pipeline::stream::split_failures(eval_failures);
-            // The 72 hours after a separation she asked for: positive growth
-            // is halved in that session (spec 2026-10-19 §3.5).
+            // While the session's cold war is on, positive growth is halved
+            // (spec 2026-11-23-affinity-50 §6.3).
             let growth_scale =
                 super::life_choice::growth_scale_for(state, session_id, chrono::Utc::now()).await;
             match repo

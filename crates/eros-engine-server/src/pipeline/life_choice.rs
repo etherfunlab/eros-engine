@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The life choices on the pipeline side: when a judged turn makes her ask
 //! for space, to sleep together, to marry or to go away together, her
-//! generated request, and the slowdown after an accepted separation. The
-//! answer, its costs and the ignore path live in the resolution route and the
-//! turn entry.
+//! generated request, and the growth scale of a cold war. The answer, its
+//! costs and the ignore path live in the resolution route and the turn entry.
 //!
 //! Spec: docs/superpowers/specs/2026-10-19-life-events-shopping-gatherings-and-ask-for-space-design.md
-//! §3.1 (trigger), §3.2 (the ask), §3.5 (the slowdown); the romantic kinds:
+//! §3.1 (trigger), §3.2 (the ask); the romantic kinds:
 //! docs/superpowers/specs/2026-10-30-give-needs-romantic-choices-and-answer-receipts-design.md
-//! §4.3 (triggers), §4.4 (the ask).
+//! §4.3 (triggers), §4.4 (the ask); the growth scale:
+//! docs/superpowers/specs/2026-11-23-affinity-50-design.md §6.3.
 
 use chrono::{DateTime, Duration, Utc};
 use sqlx::PgPool;
@@ -37,7 +37,7 @@ const MIN_TIER_GAP: i16 = 2;
 const STREAK: i64 = 3;
 /// A rule threshold of the engine, not a judge band.
 const LOW_PATIENCE: f64 = 0.5;
-/// Positive line growth while the slowdown lasts.
+/// Positive line growth while a cold war lasts.
 const SLOWED_GROWTH: f64 = 0.5;
 /// A judged turn counts toward a romantic choice when its warmth and its
 /// patience are both above this. A rule threshold of the engine, not a judge
@@ -65,22 +65,20 @@ const PROPOSE_WINDOW: i64 = 8;
 /// `propose`: the warm turns the window must hold (spec 2026-10-30 §4.3).
 const PROPOSE_HITS: usize = 5;
 
-/// The scale on every positive line delta of a commit in `session_id` at
-/// `now`: [`SLOWED_GROWTH`] in the 72 hours after a separation she asked for
-/// ended, 1.0 otherwise. A read that fails commits at full speed.
+/// The scale on every positive line delta of a commit in `session_id`:
+/// [`SLOWED_GROWTH`] while the session's cold war is on, 1.0 otherwise. A
+/// read that fails commits at full speed. `_now` keeps the call sites' shape;
+/// the flag is read as stored.
 pub(crate) async fn growth_scale_for(
     state: &AppState,
     session_id: Uuid,
-    now: DateTime<Utc>,
+    _now: DateTime<Utc>,
 ) -> f64 {
-    match (LifeChoiceRepo { pool: &state.pool })
-        .growth_slowed(session_id, now)
-        .await
-    {
-        Ok(true) => SLOWED_GROWTH,
-        Ok(false) => 1.0,
+    match (AffinityRepo { pool: &state.pool }).load(session_id).await {
+        Ok(Some(a)) if a.relationship.cold_war() => SLOWED_GROWTH,
+        Ok(_) => 1.0,
         Err(e) => {
-            tracing::warn!(%session_id, "growth slowdown read failed: {e}");
+            tracing::warn!(%session_id, "cold war read failed: {e}");
             1.0
         }
     }
@@ -1219,47 +1217,50 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn growth_scale_is_half_inside_the_window_in_the_choice_session_only(pool: PgPool) {
+    async fn growth_scale_is_half_in_a_cold_war_in_that_session_only(pool: PgPool) {
         let s = scene(&pool).await;
         let sibling = seed_session(&pool, s.user_id, s.instance_id).await;
         let state = test_state(pool.clone());
-        let ends = Utc.with_ymd_and_hms(2026, 3, 1, 12, 0, 0).unwrap();
-        let micro = Duration::microseconds(1);
-        accepted_separation(&s, s.session_id, ends).await;
+        let affinity = AffinityRepo { pool: &pool };
+        let at = Utc.with_ymd_and_hms(2026, 3, 1, 12, 0, 0).unwrap();
+        // A sibling session's own row, so its flag could be read.
+        affinity
+            .load_or_create(sibling, s.user_id, s.instance_id)
+            .await
+            .unwrap();
 
-        let scale = |session, at| {
+        let scale = |session| {
             let state = state.clone();
             async move { growth_scale_for(&state, session, at).await }
         };
-        assert_eq!(scale(s.session_id, ends - micro).await, 1.0, "still apart");
-        assert_eq!(
-            scale(s.session_id, ends).await,
-            0.5,
-            "back: the window opens"
-        );
-        assert_eq!(
-            scale(s.session_id, ends + Duration::hours(72) - micro).await,
-            0.5
-        );
-        assert_eq!(
-            scale(s.session_id, ends + Duration::hours(72)).await,
-            1.0,
-            "72 hours on, full speed"
-        );
+        assert_eq!(scale(s.session_id).await, 1.0, "no cold war");
+
+        affinity.set_cold_war(s.session_id, true, at).await.unwrap();
+        assert_eq!(scale(s.session_id).await, 0.5, "the cold war is on");
         // The cost is that relationship's, not the instance's.
-        assert_eq!(scale(sibling, ends).await, 1.0);
-        assert_eq!(scale(sibling, ends + Duration::hours(1)).await, 1.0);
+        assert_eq!(scale(sibling).await, 1.0);
+
+        affinity
+            .set_cold_war(s.session_id, false, at)
+            .await
+            .unwrap();
+        assert_eq!(scale(s.session_id).await, 1.0, "it ended: full speed");
+        // A session with no affinity row grows at full speed too.
+        assert_eq!(scale(Uuid::new_v4()).await, 1.0);
     }
 
-    /// The window is wired into the turn's commit: the same verdict lands
-    /// half as much inside it, and only in the session that asked.
+    /// The cold war is wired into the turn's commit: the same verdict lands
+    /// half as much inside it, and only in the session that is in one.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn growth_inside_the_window_lands_halved_through_the_turn(pool: PgPool) {
+    async fn growth_in_a_cold_war_lands_halved_through_the_turn(pool: PgPool) {
         let s = scene(&pool).await;
         let mock = mock_llm(TRUST_UP, Some(ASK_TEXT)).await;
         let state = with_models(test_state(pool.clone()), &mock.uri());
         let twin = lopsided_session(&pool, s.user_id, s.instance_id).await;
-        accepted_separation(&s, s.session_id, Utc::now() - Duration::hours(1)).await;
+        (AffinityRepo { pool: &pool })
+            .set_cold_war(s.session_id, true, Utc::now() - Duration::hours(1))
+            .await
+            .unwrap();
 
         s.turn_in(&state, s.session_id, SEEN).await;
         s.turn_in(&state, twin, SEEN).await;
@@ -2160,7 +2161,8 @@ mod tests {
             vec![
                 JudgedEndpoints {
                     warmth: 0.8,
-                    patience: 0.8
+                    patience: 0.8,
+                    patience_grade: 2,
                 };
                 n
             ]
@@ -2220,6 +2222,7 @@ mod tests {
         let e = |warmth| JudgedEndpoints {
             warmth,
             patience: 0.1,
+            patience_grade: 2,
         };
         // Newest first; three of five reach 0.5.
         let three = [e(0.5), e(0.2), e(0.6), e(0.1), e(0.9)];
@@ -2535,7 +2538,8 @@ mod tests {
             vec![
                 JudgedEndpoints {
                     warmth: 0.8,
-                    patience: 0.8
+                    patience: 0.8,
+                    patience_grade: 2,
                 };
                 n
             ]
