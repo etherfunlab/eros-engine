@@ -639,8 +639,8 @@ async fn stored(
 /// Ask for something to happen in the persona's day.
 ///
 /// The engine draws one kind of event, or none (a short or mid-length
-/// incident is under way, every allowed kind is cooling down, she has asked
-/// the user for space and waits for the answer, in any session of the persona,
+/// incident is under way, every allowed kind is cooling down, she has put a
+/// choice to the user and waits for the answer, in any session of the persona,
 /// until it is answered or lapses, or a date of the persona has not been
 /// settled yet). During a background event (a trip or a
 /// body state) only incidents are drawn. The
@@ -2808,9 +2808,9 @@ mod tests {
         }
     }
 
-    /// She has asked for space and waits for an answer: the ask is the
-    /// foreground drama, so nothing is drawn for the instance, from any of
-    /// its sessions, until it is answered or lapses.
+    /// She has put a choice to the user and waits for an answer, whatever
+    /// its kind: the ask is the foreground drama, so nothing is drawn for the
+    /// instance, from any of its sessions, until it is answered or lapses.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn no_draw_while_a_choice_is_pending(pool: PgPool) {
         let user_id = Uuid::new_v4();

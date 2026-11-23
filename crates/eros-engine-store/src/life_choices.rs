@@ -309,11 +309,12 @@ impl LifeChoiceRepo<'_> {
     }
 
     /// [`Self::resolve`] inside the caller's transaction, so the resolution
-    /// commits or rolls back together with what it is paired with (the
-    /// falling-out, the separation, the tier drop); nothing here commits. A
-    /// caller that gets `None` has lost and drops the transaction: nothing of
-    /// the rest of its work may land. A concurrent resolve of the same row
-    /// waits on its lock here and then finds the choice no longer pending.
+    /// commits or rolls back together with what it is paired with (the event
+    /// an accept places, the status move, the tier drop); nothing here
+    /// commits. A caller that gets `None` has lost and drops the transaction:
+    /// nothing of the rest of its work may land. A concurrent resolve of the
+    /// same row waits on its lock here and then finds the choice no longer
+    /// pending.
     pub async fn resolve_in_tx(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         choice_id: Uuid,
@@ -1813,9 +1814,10 @@ mod tests {
         assert_eq!(event_id(pool.clone()).await, Some(written));
     }
 
-    /// The ignore conversion's shape: resolve first, the falling-out second,
-    /// in the caller's one transaction. `None` when the resolve lost; the
-    /// transaction is dropped uncommitted then, as on any error.
+    /// A resolve paired with an event in the caller's one transaction, as the
+    /// answer route pairs an accept with the event it places: resolve first,
+    /// the event second. `None` when the resolve lost; the transaction is
+    /// dropped uncommitted then, as on any error.
     async fn convert_in_tx(
         pool: &PgPool,
         choice: &LifeChoiceRecord,

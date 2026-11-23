@@ -825,8 +825,9 @@ async fn try_travel(
 /// spec 2026-11-23-affinity-50 §7.4), generated with the engine's default
 /// scopes: an ask is written with its choice row beside it, the cold-war
 /// message on its own. `true` when it was written. A reply that is blank,
-/// strips to nothing or fails writes nothing, so a later qualifying turn asks
-/// again.
+/// strips to nothing or fails writes nothing: an ask is made again on a later
+/// qualifying turn; the cold-war message is not retried, its flag already
+/// committed.
 async fn speak(
     state: &AppState,
     session_id: Uuid,
@@ -1506,8 +1507,9 @@ mod tests {
         assert!(companion_calls(&mock).await.is_empty());
     }
 
-    /// A judged turn above the lowest level is in the newest three, so it
-    /// holds the cold war back until three lowest ones have come after it.
+    /// A judged turn above the lowest level is in the newest three, so the
+    /// streak rule waits for three lowest ones after it; with fewer than five
+    /// lowest among the newest seven, the other rule does not start it either.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn a_turn_above_the_lowest_breaks_the_streak(pool: PgPool) {
         let s = scene(&pool).await;
