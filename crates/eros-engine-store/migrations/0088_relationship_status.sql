@@ -1,5 +1,12 @@
+-- SPDX-License-Identifier: AGPL-3.0-only
+--
 -- Affinity 5.0: the pair's relationship status and its cold war, on the
 -- session's affinity row. Every change also writes a 'relationship' event.
+--
+-- A lock_timeout fails a blocked migration before the new image serves.
+
+SET LOCAL lock_timeout = '3s';
+
 ALTER TABLE engine.companion_affinity
     ADD COLUMN relationship_status text NOT NULL DEFAULT 'none'
         CONSTRAINT companion_affinity_relationship_status_check
