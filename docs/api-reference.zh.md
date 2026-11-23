@@ -447,7 +447,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 它开始时，正在进行的插曲结束，背景继续。这些事件都不让她离线：`asleep_together` 期间她也照常回复。在约会里被接受时什么都不写：约会的 `on_a_date` 保持原样，约会继续。事件持续期间在 [`GET …/effects`](#get-v2compsessionsession_ideffects) 里以 `event` 出现。有出图能力时，被接受的这一回合回她的图（见下），图里画的就是这个事件。被接受的 `smoke_together`、`smoke_weed_together` 或 `drink_together` 在习惯掷骰（见上）、挪动的需求和余效（见上）这三件事上算作给了 1 份 `cigarette`、`herb` 或 `alcohol` 的 `give`，此外都不算：被拒时降 chemistry，不降 bond。规则见 [life-events-needs.zh.md](life-events-needs.zh.md#一起淋浴泡澡和蒸桑拿)。
 
-**上床与求婚。** `sex_together` 和 `propose` 是请她上床、向她求婚：她自己提出的 `sleep_together` 和 `propose`（见[生活选择](#post-v2compsessionsession_idlife-choiceschoice_id)）由用户反过来提。她在一个 session 或它的约会里答应过用户的 `sex_together` 或 `propose` 之后，在这个 session 里不会再自己提出 `sleep_together` 或 `propose`；被拒的不算，她已经提出、还在等回答的请求保持原样。约会之外被接受的 `sex_together` 写入 `having_sex_together`，在抽取看来结束她的处女身份（见[事件](#post-v2compsessionsession_idevents)）。`propose` 不是一起做的动作：不写事件，本身也不是出图回合（判官选了出图时照常出图），判官之前没有任何规则，被拒时哪条线都不降。两者用户都可以再提，每次都由判官决定。
+**上床与求婚。** `sex_together` 和 `propose` 是请她上床、向她求婚：她自己提出的 `sleep_together` 和 `propose`（见[生活选择](#post-v2compsessionsession_idlife-choiceschoice_id)）由用户反过来提。她在一个 session 或它的约会里答应过用户的 `sex_together` 之后，在这个 session 里不会再自己提出 `sleep_together`，答应过用户的 `propose` 之后不会再自己提出 `propose`；被拒的不算，她已经提出、还在等回答的请求保持原样。约会之外被接受的 `sex_together` 写入 `having_sex_together`，在抽取看来结束她的处女身份（见[事件](#post-v2compsessionsession_idevents)）。`propose` 不是一起做的动作：不写事件，本身也不是出图回合（判官选了出图时照常出图），判官之前没有任何规则，被拒时哪条线都不降。两者用户都可以再提，每次都由判官决定。
 
 **让你拍照。** 请求带 `image`、部署配置了 `[tasks.chat_image_prompt_compose]` 时，被接受的 `photo` 以 `reply_text_image` 回复：先是她的话，再是一条以她的脸部参考为基础、按当前场景组出来的 `image_request`。有没有 LLM 判官都一样。被接受的 `strip` 也这样回复，被接受的 `ask_dancing`（用户想看她跳支舞，图是她在跳舞）和任何被接受的一起做的动作也一样。被拒的 `photo`、`strip`、`ask_dancing` 或一起做的动作，或没有这项出图能力的，只回文字，即使判官提议了出图。`image.force = true` 仍让这一轮是 `reply_image`，被拒时图按拒绝的结果来画。
 
@@ -1039,7 +1039,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
   | `employed` | `"free"`、`"part_time"`（默认）、`"full_time"` | 她的一天有多少是工作：`temp_work`、`scolded_by_superior`、`scolded_superior` 与 `business_trip` 在各自类别内被抽到的概率分别是原来的三分之一 / 一倍 / 三倍，`free` 的角色不会抽到 `want_to_quit_job`；其他值按 `part_time` 读 |
   | `outdoorsy` | `"outdoor"`、`"neutral"`（默认）、`"indoor"` | `outdoor`：户外种类在各自类别内被抽到的概率是原来的 3 倍，室内种类是三分之一；`indoor` 反过来。可能让她离线的种类算中性，不受影响；每种的场所见 [life-events-needs.zh.md](life-events-needs.zh.md#户外还是室内)；其他值按 `neutral` 读 |
   | `setting` | `"modern"`（默认）、`"fantasy"` | 她生活的世界：`fantasy` 的角色不会抽到 `police_encounter`、`showering`、`taking_selfie`、`gaming`、`watching_show`、`business_trip`、`hospitalized`、`post_surgery`、`temp_work`、`scolded_superior`，不管 `kinds` 或 `prefer_events` 怎么写；其他值按 `modern` 读 |
-  | `smoking`、`alcoholic`、`drug`、`coffee`、`gluttony` | 各为 `true` / `false` / 不写 | 她抽不抽烟、喝不喝酒、用不用大麻、喝不喝咖啡、贪不贪吃：为 `true` 的越多，她的 `indulgence` 回到 `high` 越快，进而给抽取加权；为 `false` 的键可能让她拒收递来的这样东西，或拒绝 `smoke_together`、`smoke_weed_together`、`drink_together`（见[上文](#post-compchatsession_idmessagestream)）；`smoking`、`alcoholic`、`drug` 为 `true` 时她才会抽到 `smoking`、`drinking`、`smoking_weed` |
+  | `smoking`、`alcoholic`、`drug`、`coffee`、`gluttony` | 各为 `true` / `false` / 不写 | 她抽不抽烟、喝不喝酒、用不用大麻、喝不喝咖啡、贪不贪吃：为 `true` 的越多，她的 `indulgence` 回到 `high` 越快，进而给抽取加权；为 `false` 的键可能让她拒收递来的这样东西，或拒绝对应的一起做的动作（`smoking` 对应 `smoke_together`、`drug` 对应 `smoke_weed_together`、`alcoholic` 对应 `drink_together`）（见[上文](#post-compchatsession_idmessagestream)）；`smoking`、`alcoholic`、`drug` 为 `true` 时她才会抽到 `smoking`、`drinking`、`smoking_weed` |
 
   取值形状不对、种类未知，或种类不在 `mid` 里，一律忽略。偏好不会绕过任何门槛。
 - **只要有符合条件的种类，抽取就一定得到一个事件。** 她的一天有多热闹，取决于调用方什么时候来要。
@@ -1151,7 +1151,7 @@ composer 会被告知这个事件是她此刻的状态（`[此刻状态]`），�
 只有该 session 最新一段选择经过（她的请求、它的结算以及它开启的分开，不论哪一种选择）之后的、被判官评过的回合才计数。她的[约会](activities.zh.md)进行期间她什么都不提，约会自己的回合也从来不是被判官评过的回合。`sleep_together` 与 `propose` 同一轮都满足时，触发 `propose`。
 `bathe_together` 有自己的触发条件，和这两种无关，也不受进行中的旅行影响。她同一时间只有一个请求待回答，所以一轮里有几种同时满足时，
 先轮到 `sleep_together` 或 `propose`，再到 `bathe_together`，最后是 `travel_together`。
-在一个 session 里被用户接受或不理会过的 `sleep_together` 或 `propose`，在那里不会再次提出；她在那里或它的约会里答应过用户自己的 `sex_together` 或 `propose` 之后也不会（见[上床与求婚](#post-compchatsession_idmessagestream)）；`travel_together` 则 14 天内不再提出，`bathe_together` 7 天内不再提出；被拒绝或过期的，等出现新的连续后会再次提出。她怎么提出、什么时候提出、
+在一个 session 里被用户接受或不理会过的 `sleep_together` 或 `propose`，在那里不会再次提出；她在那里或它的约会里答应过用户自己的 `sex_together`（对应 `sleep_together`）或 `propose`（对应 `propose`）之后也不会（见[上床与求婚](#post-compchatsession_idmessagestream)）；`travel_together` 则 14 天内不再提出，`bathe_together` 7 天内不再提出；被拒绝或过期、又没有按上面的方式了结的，等出现新的连续后会再次提出。她怎么提出、什么时候提出、
 每条路各付什么代价，见 [life-events-needs.zh.md](life-events-needs.zh.md#提出分开的选择)、
 [浪漫选择](life-events-needs.zh.md#浪漫选择)、[一起去旅行](life-events-needs.zh.md#一起去旅行)和[一起洗澡](life-events-needs.zh.md#一起洗澡)。
 

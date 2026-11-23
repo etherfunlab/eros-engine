@@ -493,7 +493,7 @@ the first stage, and does not shorten a cooldown.
 
 One kind is weighed down rather than ruled out while what leads to it has never happened:
 `pregnancy_scare` weighs a fifth while the instance has no `having_sex`, `just_have_sex` or
-`having_sex_together` event, ever. There is no hard "only after" gate and no state machine: a deployment that draws neither
+`having_sex_together` event, ever. There is no hard "only after" gate and no state machine: a deployment where none of them ever happens
 keeps the scare at a fifth of its weight rather than losing it. The table and the constants
 (`FOLLOW_FACTOR`, `FOLLOW_WINDOW_HOURS`, `UNLIKELY_FACTOR`) are in
 `crates/eros-engine-core/src/events.rs`.
@@ -1388,7 +1388,7 @@ own ask of it in the session or in a date of it: `sex_together` for `sleep_toget
 ([together actions](#showering-bathing-and-the-sauna-together)), and `propose`, the user
 proposing to her, for `propose`. A refused one settles nothing, and her ask already pending
 stays as it is, to be answered or to lapse. After a decline or a lapse the kind fires again
-once the session has a fresh streak.
+once the session has a fresh streak, unless it is settled as above.
 
 The user's `propose` carries no field and is not a together action: it places no event and is
 not a picture turn of its own. The judge decides it with no rule before it, a refusal drops

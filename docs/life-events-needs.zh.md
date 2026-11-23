@@ -377,7 +377,7 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 | `pondering_life` | `want_to_see_sea` |
 
 有一种是压低而不是排除：实例从来没有过 `having_sex`、`just_have_sex` 或 `having_sex_together` 事件时，`pregnancy_scare` 权重为五分之一。没有硬性的
-「只能在之后」门槛，也没有状态机：两种都从不抽的部署里，这个虚惊只是降到五分之一，不会消失。
+「只能在之后」门槛，也没有状态机：三种都从未发生的部署里，这个虚惊只是降到五分之一，不会消失。
 表和常量（`FOLLOW_FACTOR`、`FOLLOW_WINDOW_HOURS`、`UNLIKELY_FACTOR`）在 `crates/eros-engine-core/src/events.rs`。
 
 ### 调用方的 `kinds`
@@ -1066,7 +1066,7 @@ engine 不接收性别或性取向，也不判断谁会被谁吸引。
 在一个 session 里被接受或被不理会过的种类，在那里不会再触发：用户已经被问过一次，用文字打出的回答也是回答。
 她在这个 session 或它的约会里答应过用户反过来提的同一件事之后，也不会再触发：`sex_together` 对应 `sleep_together`
 （见[一起做的动作](#一起淋浴泡澡和蒸桑拿)），用户向她求婚的 `propose` 对应 `propose`。被拒的不算；她已经提出、还在等回答的请求保持原样，照常被回答或过期。
-被拒绝或过期之后，等该 session 出现新的连续，这个种类才会再次触发。
+被拒绝或过期之后，只要还没按上面的方式了结，等该 session 出现新的连续，这个种类就会再次触发。
 
 用户的 `propose` 不带字段，也不是一起做的动作：不写事件，本身也不是出图回合。由判官决定，判官之前没有任何规则；被拒什么都不降，
 用户可以再求婚，每次都由判官决定。部署的 [`tones.emotional`](model-config.zh.md#tones--聊天语气仅限-chat-任务) 大于 0 时，
