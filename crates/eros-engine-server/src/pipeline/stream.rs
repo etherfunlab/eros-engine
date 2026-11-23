@@ -5094,10 +5094,10 @@ pub(crate) fn run_stream_with(
         };
         // An ordinary message that arrives while a choice of hers is pending
         // answers it, before the read below, so this very turn already sees
-        // the result. Only an ask for space that goes unanswered starts a
-        // falling-out, at this row; `sleep_together` and `propose` settle at
-        // no cost (spec 2026-10-30 §4.5). A give, a tip or a kiss does not
-        // answer her, and neither does a date turn.
+        // the result: the choice settles as `ignored`, at no cost and with no
+        // event, whatever its kind (spec 2026-11-23-affinity-50 §7.2, §7.5).
+        // A give, a tip or a kiss does not answer her, and neither does a
+        // date turn.
         if user_msg.action.is_none() && !on_date {
             if let Err(e) = crate::pipeline::life_choice::convert_ignored_ask(
                 &state,

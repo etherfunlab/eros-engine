@@ -136,6 +136,9 @@ pub enum GreetingOccasion {
     /// retired `ask_for_space` on older rows): her ask, and her reply after
     /// the answer (`POST …/life-choices/{id}`).
     LifeChoice,
+    /// A cold war just started: she says she does not want to talk nicely
+    /// now. No choice goes with it.
+    ColdWar,
 }
 
 impl GreetingOccasion {
@@ -2847,6 +2850,14 @@ mod tests {
             })
             .collect();
         assert_eq!(all.len() as u32, CONCURRENT_STREAMS_PER_USER);
+    }
+
+    #[test]
+    fn a_cold_war_row_names_its_occasion() {
+        assert_eq!(
+            GreetingOccasion::from_name("cold_war"),
+            Some(GreetingOccasion::ColdWar)
+        );
     }
 
     #[test]

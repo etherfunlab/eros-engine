@@ -62,6 +62,8 @@ const FIRST_MEET_CUE: &str = "（你们还没聊过。对方刚打开和你的�
 const RETURNING_SAME_DAY_CUE: &str = "（对方隔了不到一天又打开和你的聊天，还没说话。）";
 pub(crate) const CHECK_IN_CUE: &str =
     "（你还记挂着对方上次聊到的事，想关心一下后来怎么样了。对方刚打开和你的聊天，还没说话。）";
+const COLD_WAR_CUE: &str =
+    "（你对对方的耐心被磨光了。你决定不再给对方好脸色，告诉对方你现在不想好好说话。）";
 
 /// Why the persona speaks first. The holiday and the birthday are the
 /// engine's own call; the other occasions are named by the caller and carry
@@ -111,15 +113,20 @@ pub(crate) enum Occasion {
     /// 2026-10-30-give-needs-romantic-choices-and-answer-receipts-design.md §4.4;
     /// status kinds: spec 2026-11-23-affinity-50-design.md §7.2, §7.3).
     LifeChoice(LifeChoiceCue),
+    /// A streak of the judge's lowest patience level just started a cold war
+    /// (spec 2026-11-23-affinity-50-design.md §7.4): she tells the user she
+    /// does not want to talk nicely now. A plain proactive row, no choice.
+    ColdWar,
 }
 
 /// One thing she says about a life choice. The ask is written with its choice
 /// row; every other cue is a plain proactive row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LifeChoiceCue {
-    /// She asks. `tier_gap` is the gap at this moment, stored with the choice
-    /// (`Some` for `AskForSpace` only); `anchor_seen` is the session's streak
-    /// anchor the trigger judged by, which the write checks is still current.
+    /// She asks. `tier_gap` is stored with the choice (`None` for every kind
+    /// she still asks; only the retired `AskForSpace` carried one);
+    /// `anchor_seen` is the session's streak anchor the trigger judged by,
+    /// which the write checks is still current.
     Ask {
         kind: LifeChoiceKind,
         tier_gap: Option<i16>,
@@ -145,7 +152,7 @@ impl LifeChoiceCue {
             Self::Ask {
                 kind: LifeChoiceKind::AskForSpace,
                 ..
-            } => "（这段关系最近让你很累：心动还在，但交情和耐心都被磨薄了。你决定郑重地告诉对方：你想先分开一阵子，希望对方给你一个答复。）".into(),
+            } => unreachable!("a retired ask_for_space is never asked"),
             Self::Ask {
                 kind: LifeChoiceKind::SleepTogether,
                 ..
@@ -269,6 +276,7 @@ impl Occasion {
             Self::CheckIn { .. } => "check_in",
             Self::Event { .. } => "event",
             Self::LifeChoice(_) => "life_choice",
+            Self::ColdWar => "cold_war",
         }
     }
 
@@ -302,6 +310,7 @@ impl Occasion {
                 image.is_some(),
             ),
             Self::LifeChoice(cue) => cue.cue(),
+            Self::ColdWar => COLD_WAR_CUE.into(),
         }
     }
 }
@@ -527,7 +536,8 @@ struct Prepared {
 /// greeting or opener, to a message that landed first or a concurrent call
 /// for the same local date or `open_key`; for an event, to another event
 /// under way for the persona or a concurrent call with the same `event_key`;
-/// for the ask, to a pending choice the session already held.
+/// for the ask, to a pending choice the session already held; for her reply
+/// to an answer or the cold-war message, to a message that landed first.
 struct Stored {
     row: Option<ChatMessage>,
     /// Her picture's composed prompt and aspect ratio, on an event that
@@ -772,7 +782,7 @@ async fn store(
                 metadata.insert("outfit".into(), o.as_str().into());
             }
         }
-        Occasion::LifeChoice(_) => {}
+        Occasion::LifeChoice(_) | Occasion::ColdWar => {}
     }
     metadata.insert(
         "prompt_traits".into(),
@@ -861,7 +871,8 @@ async fn store(
             LifeChoiceCue::TravelAgreed { .. }
             | LifeChoiceCue::ShowerAgreed
             | LifeChoiceCue::Answered { .. },
-        ) => {
+        )
+        | Occasion::ColdWar => {
             chat_repo
                 .insert_open_message(g.session_id, g.since, &row)
                 .await?
@@ -940,7 +951,7 @@ pub(crate) async fn greet(state: &AppState, g: Greeting) -> Result<Option<ChatMe
         | Occasion::Returning { open_key, .. }
         | Occasion::JustOpened { open_key }
         | Occasion::CheckIn { open_key } => Winner::OpenKey(open_key.clone()),
-        Occasion::Event { .. } | Occasion::LifeChoice(_) => Winner::Nowhere,
+        Occasion::Event { .. } | Occasion::LifeChoice(_) | Occasion::ColdWar => Winner::Nowhere,
     };
     let session_id = g.session_id;
     let stored = store(
@@ -1418,17 +1429,31 @@ mod tests {
         );
     }
 
+    /// Spec 2026-11-23-affinity-50 §7.4.
+    #[test]
+    fn the_cold_war_cue_is_exact() {
+        assert_eq!(
+            Occasion::ColdWar.cue(1, &PersonaTraits::default(), None),
+            "（你对对方的耐心被磨光了。你决定不再给对方好脸色，告诉对方你现在不想好好说话。）"
+        );
+        assert_eq!(Occasion::ColdWar.name(), "cold_war");
+    }
+
+    /// A retired `ask_for_space` is never asked again (spec
+    /// 2026-11-23-affinity-50 §7.5).
+    #[test]
+    #[should_panic(expected = "ask_for_space")]
+    fn a_retired_ask_for_space_has_no_cue() {
+        Occasion::LifeChoice(LifeChoiceCue::Ask {
+            kind: LifeChoiceKind::AskForSpace,
+            tier_gap: Some(3),
+            anchor_seen: None,
+        })
+        .cue(1, &PersonaTraits::default(), None);
+    }
+
     #[test]
     fn the_life_choice_cues_are_exact() {
-        let cue = |c| Occasion::LifeChoice(c).cue(1, &PersonaTraits::default(), None);
-        assert_eq!(
-            cue(LifeChoiceCue::Ask {
-                kind: LifeChoiceKind::AskForSpace,
-                tier_gap: Some(3),
-                anchor_seen: None
-            }),
-            "（这段关系最近让你很累：心动还在，但交情和耐心都被磨薄了。你决定郑重地告诉对方：你想先分开一阵子，希望对方给你一个答复。）"
-        );
         for c in [
             LifeChoiceCue::Ask {
                 kind: LifeChoiceKind::AskForSpace,

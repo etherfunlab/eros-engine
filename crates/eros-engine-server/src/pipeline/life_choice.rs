@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The life choices on the pipeline side: when a judged turn makes her ask
-//! for space, to sleep together, to marry or to go away together, her
-//! generated request, and the growth scale of a cold war. The answer, its
-//! costs and the ignore path live in the resolution route and the turn entry.
+//! The life choices on the pipeline side: when a judged turn starts or ends a
+//! cold war, or makes her ask to sleep together, to marry, to bathe or to go
+//! away together; her generated words; and the growth scale of a cold war.
+//! The answer, its costs and the ignore path live in the resolution route and
+//! the turn entry.
 //!
-//! Spec: docs/superpowers/specs/2026-10-19-life-events-shopping-gatherings-and-ask-for-space-design.md
-//! §3.1 (trigger), §3.2 (the ask); the romantic kinds:
+//! Spec: docs/superpowers/specs/2026-11-23-affinity-50-design.md §6.3 (the
+//! cold war and its growth scale), §7.4 (her cold-war message), §7.5
+//! (`ask_for_space`, retired); the romantic kinds:
 //! docs/superpowers/specs/2026-10-30-give-needs-romantic-choices-and-answer-receipts-design.md
-//! §4.3 (triggers), §4.4 (the ask); the growth scale:
-//! docs/superpowers/specs/2026-11-23-affinity-50-design.md §6.3.
+//! §4.3 (triggers), §4.4 (the ask).
 
 use chrono::{DateTime, Duration, Utc};
 use sqlx::PgPool;
@@ -16,11 +17,12 @@ use uuid::Uuid;
 
 use eros_engine_core::events::EventKind;
 use eros_engine_core::persona::CompanionPersona;
+use eros_engine_core::relationship::{cold_war_ends, cold_war_starts};
 use eros_engine_core::scope::romance_compatible;
 use eros_engine_store::activity::ActivityRepo;
 use eros_engine_store::affinity::{AffinityRepo, JudgedEndpoints};
 use eros_engine_store::chat::ChatRepo;
-use eros_engine_store::events::{EventRepo, NewEvent};
+use eros_engine_store::events::EventRepo;
 use eros_engine_store::life_choices::{LifeChoiceKind, LifeChoiceRepo};
 
 use crate::byoc::LoadedInstance;
@@ -31,12 +33,9 @@ use crate::pipeline::proactive::{greet, Greeting, LifeChoiceCue, Occasion};
 use crate::prompt::NowContext;
 use crate::state::AppState;
 
-/// The ask needs the tier lines this far apart, chemistry above bond.
-const MIN_TIER_GAP: i16 = 2;
-/// Judged turns in a row that must all be below [`LOW_PATIENCE`].
-const STREAK: i64 = 3;
-/// A rule threshold of the engine, not a judge band.
-const LOW_PATIENCE: f64 = 0.5;
+/// The newest judged turns the cold-war rules read: the widest of their
+/// windows (five of the newest seven).
+const COLD_WAR_WINDOW: i64 = 7;
 /// Positive line growth while a cold war lasts.
 const SLOWED_GROWTH: f64 = 0.5;
 /// A judged turn counts toward a romantic choice when its warmth and its
@@ -84,17 +83,12 @@ pub(crate) async fn growth_scale_for(
     }
 }
 
-/// How long the falling-out lasts, from the message that caused it.
-const FELL_OUT_HOURS: i64 = 1;
-
-/// The ignore path (spec §3.4c): an ordinary text turn that arrives while she
-/// waits for an answer is the answer. The choice becomes `ignored`. For
-/// `ask_for_space` a `fell_out` event starts at the user's row in the same
-/// transaction, so the turn that ignored her reads the falling-out in its
-/// events; an incident under way ends there, a background keeps running. A
-/// romantic ask settles at no cost and writes no event: the judge reads the
-/// user's words like any other turn's (spec 2026-10-30 §4.5). No tier
-/// changes: the judge rates the turn itself.
+/// The ignore path (spec 2026-10-19 §3.4c): an ordinary text turn that
+/// arrives while she waits for an answer is the answer. The choice becomes
+/// `ignored`, whatever its kind, at no cost and with no event: the judge reads
+/// the user's words like any other turn's (spec 2026-10-30 §4.5, spec
+/// 2026-11-23-affinity-50 §7.2, §7.5). No tier changes: the judge rates the
+/// turn itself.
 ///
 /// The clock is the user row's `sent_at`: whether the message arrived while
 /// the choice was pending is a fact about the message, so a turn that waited
@@ -120,48 +114,29 @@ pub(crate) async fn convert_ignored_ask(
     else {
         return Ok(false);
     };
-    let Some(choice) = (LifeChoiceRepo { pool: &state.pool })
+    let choices = LifeChoiceRepo { pool: &state.pool };
+    let Some(choice) = choices
         .pending(session_id, sent_at)
         .await?
         .filter(|c| c.asked_at <= sent_at)
     else {
         return Ok(false);
     };
-    // A message during an agreed separation only ghosts: converting would cap
-    // the separation at the message.
+    // A message during an agreed separation (one from before `ask_for_space`
+    // was retired, running out) only ghosts, and answers nothing.
     if separated(&state.pool, instance_id, Some(user_message_id), sent_at).await? {
         return Ok(false);
     }
-
-    let mut tx = state.pool.begin().await?;
-    // First, the race guard: the resolution route may have answered between
-    // the read and here, and the loser writes nothing.
-    let Some(choice) =
-        LifeChoiceRepo::resolve_in_tx(&mut tx, choice.id, "ignored", sent_at).await?
-    else {
+    // The resolution route may have answered between the read and here; the
+    // loser writes nothing.
+    if choices
+        .resolve(choice.id, "ignored", sent_at)
+        .await?
+        .is_none()
+    {
         return Ok(false);
-    };
-    let falls_out = LifeChoiceKind::parse(&choice.kind) == Some(LifeChoiceKind::AskForSpace);
-    if falls_out {
-        EventRepo::insert_preempting_in_tx(
-            &mut tx,
-            &NewEvent {
-                instance_id,
-                session_id: choice.session_id,
-                event_key: &format!("life_choice:{}:fell_out", choice.id),
-                kind: EventKind::FellOut,
-                started_at: sent_at,
-                ends_at: sent_at + Duration::hours(FELL_OUT_HOURS),
-            },
-        )
-        .await?;
     }
-    tx.commit().await?;
-    if falls_out {
-        tracing::info!(%session_id, choice_id = %choice.id, "her ask went unanswered: fell out");
-    } else {
-        tracing::info!(%session_id, choice_id = %choice.id, "her romantic ask was answered in words");
-    }
+    tracing::info!(%session_id, choice_id = %choice.id, "her ask was answered in words");
     Ok(true)
 }
 
@@ -180,9 +155,10 @@ async fn separated(
         .is_some_and(|e| e.kind == EventKind::TakingSpace))
 }
 
-/// After a judged turn's affinity committed: ask for space, or a romantic
-/// choice, whichever the relationship calls for. Every failure is logged and
-/// swallowed; the turn is already answered and its affinity written.
+/// After a judged turn's affinity committed: start or end a cold war, then
+/// put a warm choice to the user when the relationship calls for one. Every
+/// failure is logged and swallowed; the turn is already answered and its
+/// affinity written.
 pub(crate) async fn maybe_ask(
     state: &AppState,
     session_id: Uuid,
@@ -190,10 +166,11 @@ pub(crate) async fn maybe_ask(
     instance_id: Uuid,
     persona: &CompanionPersona,
 ) {
-    if let Err(e) = try_ask(state, session_id, user_id, instance_id, persona).await {
-        tracing::warn!(%session_id, "ask for space failed: {e}");
+    if let Err(e) = try_cold_war(state, session_id, user_id, instance_id, persona).await {
+        tracing::warn!(%session_id, "cold war check failed: {e}");
     }
-    // An ask written just now is pending, which closes the runway here.
+    // An ask written by one check is pending, which closes the runway for
+    // the next.
     if let Err(e) = try_romance(state, session_id, user_id, instance_id, persona).await {
         tracing::warn!(%session_id, "romantic choice failed: {e}");
     }
@@ -207,7 +184,7 @@ pub(crate) async fn maybe_ask(
 
 /// Whether she is free to put a choice to the user at all (spec 2026-10-19
 /// §3.1, spec 2026-10-30 §4.3): nothing pending on the instance, no
-/// separation or date under way, a 1:1 text session of a genome instance.
+/// separation or date under way, and [`session_eligible`].
 async fn runway_clear(
     state: &AppState,
     session_id: Uuid,
@@ -232,7 +209,16 @@ async fn runway_clear(
     {
         return Ok(false);
     }
+    session_eligible(state, session_id, instance_id).await
+}
 
+/// Whether the session takes part in her choices and the cold war at all: a
+/// 1:1 text session of a genome instance (spec 2026-11-23-affinity-50 §6.5).
+async fn session_eligible(
+    state: &AppState,
+    session_id: Uuid,
+    instance_id: Uuid,
+) -> Result<bool, AppError> {
     // 1:1 text only: the image-edit route also runs the affinity pass, and it
     // serves a voice session too.
     match (ChatRepo { pool: &state.pool })
@@ -244,74 +230,76 @@ async fn runway_clear(
     }
 
     // A genome instance only: the resolution route refuses BYOC, so an ask to
-    // a BYOC session could never be answered.
+    // a BYOC session could never be answered, and a BYOC session stays outside
+    // the status system.
     Ok(matches!(
         crate::byoc::load_instance(state, instance_id).await?,
         Some(LoadedInstance::Genome(_))
     ))
 }
 
-/// The trigger (spec §3.1), then her ask (§3.2): her words first, then the
-/// choice row beside them. A reply that is blank, strips to nothing or fails
-/// writes neither, so a later qualifying turn asks again.
-async fn try_ask(
+/// The cold war (spec 2026-11-23-affinity-50 §6.3, §7.4), read from the
+/// judge's patience levels since the streak anchor. Off, it starts on the
+/// newest three at the lowest level or five of the newest seven, and she says
+/// so in one message; on, it ends on the newest three above the lowest, in
+/// silence. The flag is committed before she speaks, so a failed or blank
+/// message leaves it on. A pending choice or a date does not hold it back.
+async fn try_cold_war(
     state: &AppState,
     session_id: Uuid,
     user_id: Uuid,
     instance_id: Uuid,
     persona: &CompanionPersona,
 ) -> Result<(), AppError> {
+    if !session_eligible(state, session_id, instance_id).await? {
+        return Ok(());
+    }
     let now = Utc::now();
     let affinity_repo = AffinityRepo { pool: &state.pool };
-    let Some(mut affinity) = affinity_repo.load(session_id).await? else {
+    let Some(affinity) = affinity_repo.load(session_id).await? else {
         return Ok(());
     };
-    affinity.apply_time_decay();
-    affinity.refresh_endpoints(&state.config.affinity_tuning);
-    let tier_gap = i16::from(affinity.chem_tier()) - i16::from(affinity.bond_tier());
-    if tier_gap < MIN_TIER_GAP {
-        return Ok(());
-    }
-    // While they are away together she does not ask to be apart.
-    let away_together = (EventRepo { pool: &state.pool })
-        .current(instance_id, None, now)
-        .await?
-        .background
-        .is_some_and(|e| e.kind == EventKind::TravelingTogether);
-    if away_together {
-        return Ok(());
-    }
-    if !runway_clear(state, session_id, instance_id, now).await? {
-        return Ok(());
-    }
-
-    // Three judged turns, this one included, all after the last episode: the
-    // ask, its answer and any separation it started.
     let since = (LifeChoiceRepo { pool: &state.pool })
         .streak_anchor(session_id)
         .await?;
-    let judged = affinity_repo
-        .last_judged_endpoints(session_id, since, STREAK)
-        .await?;
-    if judged.len() < STREAK as usize || judged.iter().any(|j| j.patience >= LOW_PATIENCE) {
+    let levels: Vec<i16> = affinity_repo
+        .last_judged_endpoints(session_id, since, COLD_WAR_WINDOW)
+        .await?
+        .iter()
+        .map(|j| j.patience_grade)
+        .collect();
+
+    if affinity.relationship.cold_war() {
+        if cold_war_ends(&levels) && affinity_repo.set_cold_war(session_id, false, now).await? {
+            tracing::info!(%session_id, "the cold war ended");
+        }
         return Ok(());
     }
-
-    let cue = LifeChoiceCue::Ask {
-        kind: LifeChoiceKind::AskForSpace,
-        tier_gap: Some(tier_gap),
-        anchor_seen: since,
-    };
-    if ask(state, session_id, user_id, instance_id, persona, now, cue).await? {
-        tracing::info!(%session_id, tier_gap, "she asked for space");
+    if !cold_war_starts(&levels) || !affinity_repo.set_cold_war(session_id, true, now).await? {
+        return Ok(());
+    }
+    tracing::info!(%session_id, "a cold war started");
+    match speak(
+        state,
+        session_id,
+        user_id,
+        instance_id,
+        persona,
+        now,
+        Occasion::ColdWar,
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(%session_id, "the cold war started with nothing said"),
+        Err(e) => tracing::warn!(%session_id, "the cold war started, its message failed: {e}"),
     }
     Ok(())
 }
 
-/// The romantic trigger (spec 2026-10-30 §4.3), then her ask (§4.4), written
-/// as [`try_ask`] writes hers. Only a pair the caller's recorded scopes mark
-/// as romantic qualifies; the ask itself is generated with the engine's
-/// default scopes.
+/// The romantic trigger (spec 2026-10-30 §4.3), then her ask (§4.4) through
+/// [`speak`]. Only a pair the caller's recorded scopes mark as romantic
+/// qualifies; the ask itself is generated with the engine's default scopes.
 async fn try_romance(
     state: &AppState,
     session_id: Uuid,
@@ -324,6 +312,10 @@ async fn try_romance(
     let Some(mut affinity) = affinity_repo.load(session_id).await? else {
         return Ok(());
     };
+    // No warm ask while a cold war is on (spec 2026-11-23-affinity-50 §7.3).
+    if affinity.relationship.cold_war() {
+        return Ok(());
+    }
     affinity.apply_time_decay();
     affinity.refresh_endpoints(&state.config.affinity_tuning);
 
@@ -363,7 +355,17 @@ async fn try_romance(
         tier_gap: None,
         anchor_seen: since,
     };
-    if ask(state, session_id, user_id, instance_id, persona, now, cue).await? {
+    if speak(
+        state,
+        session_id,
+        user_id,
+        instance_id,
+        persona,
+        now,
+        Occasion::LifeChoice(cue),
+    )
+    .await?
+    {
         tracing::info!(%session_id, kind = kind.as_str(), "she made a romantic choice");
     }
     Ok(())
@@ -441,6 +443,9 @@ async fn try_bathe(
     let Some(mut affinity) = affinity_repo.load(session_id).await? else {
         return Ok(());
     };
+    if affinity.relationship.cold_war() {
+        return Ok(());
+    }
     affinity.apply_time_decay();
     affinity.refresh_endpoints(&state.config.affinity_tuning);
 
@@ -475,7 +480,17 @@ async fn try_bathe(
         tier_gap: None,
         anchor_seen: since,
     };
-    if ask(state, session_id, user_id, instance_id, persona, now, cue).await? {
+    if speak(
+        state,
+        session_id,
+        user_id,
+        instance_id,
+        persona,
+        now,
+        Occasion::LifeChoice(cue),
+    )
+    .await?
+    {
         tracing::info!(%session_id, "she asked for a bath together");
     }
     Ok(())
@@ -501,6 +516,9 @@ async fn try_travel(
     let Some(mut affinity) = affinity_repo.load(session_id).await? else {
         return Ok(());
     };
+    if affinity.relationship.cold_war() {
+        return Ok(());
+    }
     affinity.apply_time_decay();
     affinity.refresh_endpoints(&state.config.affinity_tuning);
 
@@ -532,23 +550,36 @@ async fn try_travel(
         tier_gap: None,
         anchor_seen: since,
     };
-    if ask(state, session_id, user_id, instance_id, persona, now, cue).await? {
+    if speak(
+        state,
+        session_id,
+        user_id,
+        instance_id,
+        persona,
+        now,
+        Occasion::LifeChoice(cue),
+    )
+    .await?
+    {
         tracing::info!(%session_id, "she suggested going away together");
     }
     Ok(())
 }
 
-/// Her ask (spec 2026-10-19 §3.2, spec 2026-10-30 §4.4) through the
-/// proactive path, generated with the engine's default scopes; the choice
-/// row is written beside her words. `true` when both were written.
-async fn ask(
+/// Her words on `occasion` through the proactive path (spec 2026-10-30 §4.4,
+/// spec 2026-11-23-affinity-50 §7.4), generated with the engine's default
+/// scopes: an ask is written with its choice row beside it, the cold-war
+/// message on its own. `true` when it was written. A reply that is blank,
+/// strips to nothing or fails writes nothing, so a later qualifying turn asks
+/// again.
+async fn speak(
     state: &AppState,
     session_id: Uuid,
     user_id: Uuid,
     instance_id: Uuid,
     persona: &CompanionPersona,
     now: DateTime<Utc>,
-    cue: LifeChoiceCue,
+    occasion: Occasion,
 ) -> Result<bool, AppError> {
     // The turn's own request fields are not carried here; the locale and the
     // tier are read back from the user row that recorded them.
@@ -573,7 +604,7 @@ async fn ask(
     let tier = raw("tier").map(String::from);
     let recall_query = latest.as_ref().map(recall_query_text).unwrap_or_default();
 
-    let asked = greet(
+    let spoken = greet(
         state,
         Greeting {
             session_id,
@@ -581,7 +612,7 @@ async fn ask(
             instance_id,
             persona: persona.clone(),
             now: NowContext::for_user(&locale, now),
-            occasion: Occasion::LifeChoice(cue),
+            occasion,
             recall_query,
             since: now,
             tier,
@@ -594,7 +625,7 @@ async fn ask(
         },
     )
     .await?;
-    Ok(asked.is_some())
+    Ok(spoken.is_some())
 }
 
 #[cfg(test)]
@@ -619,9 +650,11 @@ mod tests {
         seed_byoc_instance_with_key, seed_genome, seed_instance, seed_session,
     };
 
-    /// Her ask, the cue that is the request's last `user` turn.
-    const ASK_CUE: &str = "（这段关系最近让你很累：心动还在，但交情和耐心都被磨薄了。你决定郑重地告诉对方：你想先分开一阵子，希望对方给你一个答复。）";
     const ASK_TEXT: &str = "我想先分开一阵子，你能给我一个答复吗。";
+    /// Her cold-war message, the cue that is the request's last `user` turn.
+    const COLD_WAR_CUE: &str =
+        "（你对对方的耐心被磨光了。你决定不再给对方好脸色，告诉对方你现在不想好好说话。）";
+    const COLD_TEXT: &str = "我现在不想好好说话。";
     const SEEN: &str = "今天过得怎么样呀";
 
     /// The judge's verdict: nothing moved, patience at the bottom level.
@@ -856,56 +889,95 @@ mod tests {
             .await
             .unwrap();
         }
+
+        /// The status and the cold-war flag, written directly: no
+        /// `relationship` event, so the streak anchor stays where it was.
+        async fn set_status(&self, status: &str, cold_war: bool) {
+            sqlx::query(
+                "UPDATE engine.companion_affinity \
+                    SET relationship_status = $2, \
+                        cold_war_since = CASE WHEN $3 THEN now() END \
+                  WHERE session_id = $1",
+            )
+            .bind(self.session_id)
+            .bind(status)
+            .bind(cold_war)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        }
+
+        /// Whether the session's cold war is on.
+        async fn cold_war(&self) -> bool {
+            sqlx::query_scalar(
+                "SELECT cold_war_since IS NOT NULL FROM engine.companion_affinity \
+                  WHERE session_id = $1",
+            )
+            .bind(self.session_id)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+        }
+
+        /// The `cold_war` field of the session's `relationship` events,
+        /// oldest first.
+        async fn cold_war_events(&self) -> Vec<Option<String>> {
+            sqlx::query_scalar(
+                "SELECT e.context->>'cold_war' FROM engine.companion_affinity_events e \
+                   JOIN engine.companion_affinity a ON a.id = e.affinity_id \
+                  WHERE a.session_id = $1 AND e.event_type = 'relationship' \
+                  ORDER BY e.created_at, e.id",
+            )
+            .bind(self.session_id)
+            .fetch_all(&self.pool)
+            .await
+            .unwrap()
+        }
+
+        /// (content, assistant_action_type) of her cold-war messages.
+        async fn cold_war_rows(&self) -> Vec<(String, Option<String>)> {
+            sqlx::query_as(
+                "SELECT content, assistant_action_type FROM engine.chat_messages \
+                  WHERE session_id = $1 AND role = 'assistant' \
+                    AND metadata->>'proactive' = 'cold_war'",
+            )
+            .bind(self.session_id)
+            .fetch_all(&self.pool)
+            .await
+            .unwrap()
+        }
     }
 
+    fn proactive(content: &str) -> (String, Option<String>) {
+        (content.into(), Some("proactive".into()))
+    }
+
+    // ---- The cold war (spec 2026-11-23-affinity-50 §6.3, §7.4) ----
+
+    /// Three judged turns at the judge's lowest patience level start a cold
+    /// war at any tiers: the flag, its `relationship` event, and her one
+    /// message about it, with no choice row.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn three_low_patience_turns_with_a_gap_ask_for_space(pool: PgPool) {
-        let s = scene(&pool).await;
-        let mock = mock_llm(LOW_PATIENCE, Some(ASK_TEXT)).await;
+    async fn three_lowest_patience_turns_start_a_cold_war_and_she_says_so(pool: PgPool) {
+        // Equal tiers: no gap is needed.
+        let s = scene_with_lines(&pool, 0.45, 0.45).await;
+        let mock = mock_llm(LOW_PATIENCE, Some(COLD_TEXT)).await;
         let state = with_models(test_state(pool.clone()), &mock.uri());
 
         s.turn(&state, SEEN).await;
         s.turn(&state, SEEN).await;
-        assert!(
-            s.choices().await.is_empty(),
-            "two judged turns are not three"
-        );
+        assert!(!s.cold_war().await, "two judged turns are not three");
+        assert!(s.cold_war_events().await.is_empty());
         assert!(companion_calls(&mock).await.is_empty(), "and cost nothing");
 
         s.turn(&state, SEEN).await;
-        let choices = s.choices().await;
-        assert_eq!(choices.len(), 1, "{choices:?}");
-        let (status, tier_gap, message_id) = choices[0].clone();
-        assert_eq!(status, "pending");
-        let (bond, chem): (i16, i16) = sqlx::query_as(
-            "SELECT bond_tier, chem_tier FROM engine.companion_affinity WHERE session_id = $1",
-        )
-        .bind(s.session_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(tier_gap, Some(chem - bond), "the gap at ask time");
-        assert_eq!(tier_gap, Some(3));
-
-        // Her words: an ordinary assistant row, proactive, written as the
-        // choice's message.
-        let rows = s.ask_rows().await;
-        assert_eq!(rows.len(), 1, "{rows:?}");
-        assert_eq!(message_id, Some(rows[0].0));
-        assert_eq!(rows[0].1, ASK_TEXT);
-        assert_eq!(rows[0].2.as_deref(), Some("proactive"));
-
-        // The stage cue is the request's final user turn.
-        let calls = companion_calls(&mock).await;
-        assert_eq!(calls.len(), 1);
-        let last = calls[0]["messages"]
-            .as_array()
-            .unwrap()
-            .last()
-            .unwrap()
-            .clone();
-        assert_eq!(last["role"], json!("user"));
-        assert_eq!(last["content"], json!(ASK_CUE));
+        let (bond, chem) = s.tiers().await;
+        assert_eq!(bond, chem, "equal tiers");
+        assert!(s.cold_war().await);
+        assert_eq!(s.cold_war_events().await, vec![Some("entered".into())]);
+        assert!(s.choices().await.is_empty(), "no choice row");
+        assert_eq!(s.cold_war_rows().await, vec![proactive(COLD_TEXT)]);
+        assert_eq!(only_cue(&mock).await, json!(COLD_WAR_CUE));
 
         // The turns' own affinity events are untouched: three judged turns.
         let events: i64 = sqlx::query_scalar(
@@ -918,20 +990,169 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(events, 3);
+
+        // A fourth lowest turn: the cold war is already on, nothing more.
+        s.turn(&state, SEEN).await;
+        assert_eq!(s.cold_war_events().await.len(), 1);
+        assert_eq!(companion_calls(&mock).await.len(), 1);
+    }
+
+    /// A failed or blank message leaves the cold war on, and she does not try
+    /// again on the next turn.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_blank_cold_war_message_keeps_the_cold_war(pool: PgPool) {
+        let blank = mock_llm(LOW_PATIENCE, Some("  ")).await;
+        let failing = mock_llm(LOW_PATIENCE, None).await;
+        for mock in [&blank, &failing] {
+            let s = scene(&pool).await;
+            let state = with_models(test_state(pool.clone()), &mock.uri());
+            for _ in 0..4 {
+                s.turn(&state, SEEN).await;
+            }
+            assert!(s.cold_war().await);
+            assert_eq!(s.cold_war_events().await, vec![Some("entered".into())]);
+            assert!(s.cold_war_rows().await.is_empty(), "no message");
+            assert_eq!(companion_calls(mock).await.len(), 1, "one try");
+        }
+    }
+
+    /// Three judged turns above the lowest level end the cold war, in
+    /// silence.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn three_turns_above_the_lowest_end_the_cold_war(pool: PgPool) {
+        let s = scene(&pool).await;
+        s.set_status("none", true).await;
+        let mock = mock_llm(PATIENT, Some(COLD_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+
+        s.turn(&state, SEEN).await;
+        s.turn(&state, SEEN).await;
+        assert!(s.cold_war().await, "two turns are not three");
+
+        s.turn(&state, SEEN).await;
+        assert!(!s.cold_war().await);
+        assert_eq!(s.cold_war_events().await, vec![Some("ended".into())]);
+        assert!(s.cold_war_rows().await.is_empty(), "no message");
+        assert!(companion_calls(&mock).await.is_empty());
+    }
+
+    /// A cold war is not a choice: a pending one, or a date under way, does
+    /// not hold it back.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_pending_choice_or_a_date_does_not_hold_a_cold_war_back(pool: PgPool) {
+        use crate::routes::companion::testutil::seed_date;
+
+        let mock = mock_llm(LOW_PATIENCE, Some(COLD_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+
+        let waiting = scene(&pool).await;
+        waiting.seed_choice("pending", Duration::hours(1)).await;
+        let dating = scene(&pool).await;
+        seed_date(
+            &pool,
+            dating.session_id,
+            dating.user_id,
+            dating.instance_id,
+            Utc::now(),
+        )
+        .await;
+
+        for s in [&waiting, &dating] {
+            for _ in 0..3 {
+                s.turn(&state, SEEN).await;
+            }
+            assert!(s.cold_war().await);
+            assert_eq!(s.cold_war_rows().await, vec![proactive(COLD_TEXT)]);
+        }
+        assert_eq!(
+            waiting.choices().await[0].0,
+            "pending",
+            "the choice still waits"
+        );
+        assert_eq!(companion_calls(&mock).await.len(), 2);
+    }
+
+    /// No warm ask while a cold war is on (spec 2026-11-23-affinity-50
+    /// §7.3). A warm turn is above the lowest patience level, so three of
+    /// them end a cold war: the turns run while a sibling session's pending
+    /// ask closes the runway, and each check is then called on its own.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn no_warm_ask_during_a_cold_war(pool: PgPool) {
+        let mock = mock_llm(WARM, Some(SLEEP_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+
+        for kind in [
+            LifeChoiceKind::SleepTogether,
+            LifeChoiceKind::BatheTogether,
+            LifeChoiceKind::TravelTogether,
+        ] {
+            // A compatible warm couple at tiers 3/3: each of the three would ask.
+            let s = scene_with_lines(&pool, 0.5, 0.5).await;
+            s.record_scopes("full", AffinityScope::chemistry()).await;
+            s.set_status("dating", false).await;
+            let sibling = seed_session(&pool, s.user_id, s.instance_id).await;
+            s.pending_in(sibling, Utc::now() - Duration::minutes(1))
+                .await;
+            for _ in 0..3 {
+                s.turn(&state, SEEN).await;
+            }
+            assert!(s.kinds().await.is_empty(), "the runway was closed");
+            sqlx::query(
+                "UPDATE engine.life_choices SET status = 'declined', resolved_at = now() \
+                  WHERE session_id = $1",
+            )
+            .bind(sibling)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+            let check = |s: &Scene| {
+                let (state, persona) = (&state, s.persona.clone());
+                let (session_id, user_id, instance_id) = (s.session_id, s.user_id, s.instance_id);
+                async move {
+                    match kind {
+                        LifeChoiceKind::SleepTogether => {
+                            try_romance(state, session_id, user_id, instance_id, &persona).await
+                        }
+                        LifeChoiceKind::BatheTogether => {
+                            try_bathe(state, session_id, user_id, instance_id, &persona).await
+                        }
+                        _ => try_travel(state, session_id, user_id, instance_id, &persona).await,
+                    }
+                    .unwrap()
+                }
+            };
+            s.set_status("dating", true).await;
+            check(&s).await;
+            assert!(s.kinds().await.is_empty(), "{kind:?} during a cold war");
+
+            s.set_status("dating", false).await;
+            check(&s).await;
+            assert_eq!(
+                s.kinds().await,
+                vec![pending(kind.as_str())],
+                "{kind:?} once it is over"
+            );
+        }
+        assert_eq!(
+            companion_calls(&mock).await.len(),
+            3,
+            "the three asks after it, none during"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn an_unjudged_turn_neither_counts_nor_breaks(pool: PgPool) {
         let s = scene(&pool).await;
-        let mock = mock_llm(LOW_PATIENCE, Some(ASK_TEXT)).await;
+        let mock = mock_llm(LOW_PATIENCE, Some(COLD_TEXT)).await;
         let state = with_models(test_state(pool.clone()), &mock.uri());
 
         s.turn(&state, SEEN).await;
         s.turn(&state, "hi").await; // too short to judge
         s.turn(&state, SEEN).await;
         assert!(
-            s.choices().await.is_empty(),
-            "the skipped turn is not the third low turn"
+            !s.cold_war().await,
+            "the skipped turn is not the third lowest turn"
         );
         let skipped: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM engine.companion_affinity_events e \
@@ -945,18 +1166,21 @@ mod tests {
         assert_eq!(skipped, 1);
 
         s.turn(&state, SEEN).await;
-        assert_eq!(s.choices().await.len(), 1, "low, skipped, low, low fires");
+        assert!(
+            s.cold_war().await,
+            "lowest, skipped, lowest, lowest starts it"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn turns_before_the_last_ask_do_not_count(pool: PgPool) {
         let s = scene(&pool).await;
-        let mock = mock_llm(LOW_PATIENCE, Some(ASK_TEXT)).await;
+        let mock = mock_llm(LOW_PATIENCE, Some(COLD_TEXT)).await;
         let state = with_models(test_state(pool.clone()), &mock.uri());
 
         s.turn(&state, SEEN).await;
         s.turn(&state, SEEN).await;
-        // The ask they led to came and went: both turns are older than it.
+        // An ask came and went after them: both turns are older than it.
         sqlx::query(
             "UPDATE engine.companion_affinity_events \
                 SET created_at = created_at - interval '2 hours'",
@@ -967,81 +1191,14 @@ mod tests {
         s.seed_choice("declined", Duration::hours(1)).await;
 
         s.turn(&state, SEEN).await;
-        assert_eq!(s.choices().await.len(), 1, "one fresh turn is not a streak");
+        assert!(!s.cold_war().await, "one fresh turn is not a streak");
         assert!(companion_calls(&mock).await.is_empty());
 
         s.turn(&state, SEEN).await;
-        assert_eq!(s.choices().await.len(), 1, "two fresh turns are not either");
+        assert!(!s.cold_war().await, "two fresh turns are not either");
         s.turn(&state, SEEN).await;
-        assert_eq!(s.choices().await.len(), 2, "three fresh turns ask again");
+        assert!(s.cold_war().await, "three fresh turns start it");
         assert_eq!(companion_calls(&mock).await.len(), 1);
-    }
-
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn no_ask_while_one_is_pending_or_separated(pool: PgPool) {
-        let mock = mock_llm(LOW_PATIENCE, Some(ASK_TEXT)).await;
-        let state = with_models(test_state(pool.clone()), &mock.uri());
-
-        // A pending, un-expired choice holds the next ask back, however low
-        // her patience runs; answering it lets the same streak through.
-        let s = scene(&pool).await;
-        s.seed_choice("pending", Duration::hours(1)).await;
-        for _ in 0..3 {
-            s.turn(&state, SEEN).await;
-        }
-        assert_eq!(
-            s.choices().await.len(),
-            1,
-            "no second ask beside a pending one"
-        );
-        assert!(
-            companion_calls(&mock).await.is_empty(),
-            "and no generation spent"
-        );
-        sqlx::query("UPDATE engine.life_choices SET status = 'ignored' WHERE session_id = $1")
-            .bind(s.session_id)
-            .execute(&pool)
-            .await
-            .unwrap();
-        s.turn(&state, SEEN).await;
-        assert_eq!(s.choices().await.len(), 2);
-
-        // A pending choice that lapsed does not hold anything back.
-        let lapsed = scene(&pool).await;
-        lapsed.seed_choice("pending", Duration::hours(25)).await;
-        for _ in 0..3 {
-            lapsed.turn(&state, SEEN).await;
-        }
-        assert_eq!(
-            lapsed.choices().await.len(),
-            2,
-            "the lapsed one and the new ask"
-        );
-
-        // While she is separated from the user, she does not ask.
-        let apart = scene(&pool).await;
-        let now = Utc::now();
-        EventRepo { pool: &pool }
-            .insert_preempting(&NewEvent {
-                instance_id: apart.instance_id,
-                session_id: apart.session_id,
-                event_key: "apart",
-                kind: EventKind::TakingSpace,
-                started_at: now - Duration::hours(1),
-                ends_at: now + Duration::hours(10),
-            })
-            .await
-            .unwrap();
-        for _ in 0..3 {
-            apart.turn(&state, SEEN).await;
-        }
-        assert!(apart.choices().await.is_empty(), "a separation under way");
-        sqlx::query("UPDATE engine.persona_events SET ends_at = now() - interval '1 minute'")
-            .execute(&pool)
-            .await
-            .unwrap();
-        apart.turn(&state, SEEN).await;
-        assert_eq!(apart.choices().await.len(), 1, "back, the same streak asks");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -1058,13 +1215,15 @@ mod tests {
             s.turn(&state, SEEN).await;
         }
         assert!(s.choices().await.is_empty());
+        assert!(!s.cold_war().await, "nor a cold war");
         assert!(companion_calls(&mock).await.is_empty());
     }
 
-    /// A BYOC session meeting every other condition never asks: the resolution
-    /// route refuses BYOC, so the ask could only be ignored or left to lapse.
+    /// A BYOC session stays outside the status system (spec
+    /// 2026-11-23-affinity-50 §6.5): the turns that would start a cold war
+    /// anywhere else start none, and she says nothing.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn a_byoc_session_never_asks(pool: PgPool) {
+    async fn a_byoc_session_never_enters_a_cold_war(pool: PgPool) {
         let mut s = scene(&pool).await;
         let (instance_id, session_id) = {
             let (instance_id, _) = seed_byoc_instance_with_key(&pool, s.user_id).await;
@@ -1079,54 +1238,26 @@ mod tests {
         s.instance_id = instance_id;
         s.session_id = session_id;
 
-        let mock = mock_llm(LOW_PATIENCE, Some(ASK_TEXT)).await;
+        let mock = mock_llm(LOW_PATIENCE, Some(COLD_TEXT)).await;
         let state = with_models(test_state(pool.clone()), &mock.uri());
         for _ in 0..4 {
             s.turn(&state, SEEN).await;
         }
+        assert!(!s.cold_war().await);
+        assert!(s.cold_war_events().await.is_empty());
+        assert!(s.cold_war_rows().await.is_empty());
         assert!(s.choices().await.is_empty());
         assert!(s.ask_rows().await.is_empty());
         assert!(companion_calls(&mock).await.is_empty());
     }
 
-    /// The ask needs chemistry two tiers or more above bond; a smaller gap, or
-    /// a bond ahead of chemistry, never asks, however many turns run.
+    /// A judged turn above the lowest level is in the newest three, so it
+    /// holds the cold war back until three lowest ones have come after it.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn no_ask_without_a_wide_enough_gap(pool: PgPool) {
+    async fn a_turn_above_the_lowest_breaks_the_streak(pool: PgPool) {
         let s = scene(&pool).await;
-        let mock = mock_llm(LOW_PATIENCE, Some(ASK_TEXT)).await;
-        let state = with_models(test_state(pool.clone()), &mock.uri());
-
-        // (bond line, chemistry line, tiers): equal; chemistry one tier ahead
-        // (bond tier 3, chemistry tier 4); bond ahead; then a gap of exactly 2
-        // (bond tier 2, chemistry tier 4), which asks.
-        for (bond, chem, asks) in [
-            (0.45, 0.45, false),
-            (0.45, 0.70, false),
-            (0.70, 0.0, false),
-            (0.20, 0.70, true),
-        ] {
-            let session = session_with_lines(&pool, s.user_id, s.instance_id, bond, chem).await;
-            for _ in 0..4 {
-                s.turn_in(&state, session, SEEN).await;
-            }
-            let asked = s.choices_in(session).await;
-            assert_eq!(!asked.is_empty(), asks, "bond {bond}, chemistry {chem}");
-            if asks {
-                assert_eq!(asked[0].1, Some(2), "the gap stored is the gap at ask time");
-            }
-        }
-    }
-
-    /// A judged turn that is not low (patience level 3 at the lowest bond
-    /// still reads above 0.5) is in the newest three, so it holds the ask back
-    /// until three low ones have come after it.
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn a_turn_with_patience_to_spare_breaks_the_streak(pool: PgPool) {
-        // Bond 0.14 is tier 1, where a level-3 verdict reads 0.56.
-        let s = scene_with_lines(&pool, 0.14, 0.7).await;
-        let low = mock_llm(LOW_PATIENCE, Some(ASK_TEXT)).await;
-        let high = mock_llm(PATIENT, Some(ASK_TEXT)).await;
+        let low = mock_llm(LOW_PATIENCE, Some(COLD_TEXT)).await;
+        let high = mock_llm(PATIENT, Some(COLD_TEXT)).await;
         let low_state = with_models(test_state(pool.clone()), &low.uri());
         let high_state = with_models(test_state(pool.clone()), &high.uri());
 
@@ -1134,20 +1265,27 @@ mod tests {
         s.turn(&high_state, SEEN).await;
         s.turn(&low_state, SEEN).await;
         s.turn(&low_state, SEEN).await;
-        assert!(s.choices().await.is_empty(), "low, high, low, low");
+        assert!(!s.cold_war().await, "low, high, low, low");
         s.turn(&low_state, SEEN).await;
-        assert_eq!(s.choices().await.len(), 1, "high, low, low, low asks");
+        assert!(s.cold_war().await, "high, low, low, low starts it");
     }
 
+    /// A blank, empty or failed ask writes neither her words nor the choice
+    /// row, so the next qualifying turn asks again.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn a_blank_ask_writes_nothing(pool: PgPool) {
-        let s = scene(&pool).await;
+        // A couple at tiers 3/3 asked to sleep together: not hygienic, so no
+        // bath, and away on a trip of her own, so no trip together.
+        let mut s = scene_with_lines(&pool, 0.5, 0.5).await;
+        s.set_art(json!({"hygienic": false})).await;
+        s.record_scopes("full", AffinityScope::chemistry()).await;
+        s.event_under_way(EventKind::ShortTrip).await;
         // A reply the model leaves blank, an empty one, and one the provider
         // fails.
-        let blank = mock_llm(LOW_PATIENCE, Some("  ")).await;
-        let empty = mock_llm(LOW_PATIENCE, Some("")).await;
-        let failing = mock_llm(LOW_PATIENCE, None).await;
-        let spoken = mock_llm(LOW_PATIENCE, Some(ASK_TEXT)).await;
+        let blank = mock_llm(WARM, Some("  ")).await;
+        let empty = mock_llm(WARM, Some("")).await;
+        let failing = mock_llm(WARM, None).await;
+        let spoken = mock_llm(WARM, Some(SLEEP_TEXT)).await;
         let blank_state = with_models(test_state(pool.clone()), &blank.uri());
         let empty_state = with_models(test_state(pool.clone()), &empty.uri());
         let failing_state = with_models(test_state(pool.clone()), &failing.uri());
@@ -1533,60 +1671,47 @@ mod tests {
     }
 
     /// The first ordinary text message after she asked is the user's answer:
-    /// the choice is `ignored`, the falling-out starts at that message, and
-    /// the very turn that ignored her is answered with it.
+    /// the choice is `ignored` at that message, and that is all. A stored
+    /// `ask_for_space` is converted like any other kind (spec
+    /// 2026-11-23-affinity-50 §7.5): no falling-out, and the incident she is
+    /// in keeps running.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn the_first_ordinary_message_converts_to_fell_out(pool: PgPool) {
+    async fn an_ignored_ask_writes_no_falling_out(pool: PgPool) {
         let s = scene(&pool).await;
         let (state, mock) = turn_env(&pool).await;
         let sent = recent(10);
         let choice = s.pending_at(sent - Duration::hours(2)).await;
+        // She was reading.
+        s.seed_running(
+            "reading",
+            "r",
+            sent - Duration::minutes(20),
+            sent + Duration::minutes(100),
+        )
+        .await;
+        let events = s.instance_events().await;
 
-        let umid = s.stream_turn(&state, sent, None).await;
+        s.stream_turn(&state, sent, None).await;
 
         assert_eq!(
             s.status_of(choice).await,
             ("ignored".into(), Some(sent)),
             "resolved at the message that ignored her"
         );
-        let events = s.instance_events().await;
         assert_eq!(
+            s.instance_events().await,
             events,
-            vec![(
-                "fell_out".to_string(),
-                format!("life_choice:{choice}:fell_out"),
-                Some(s.session_id),
-                sent,
-                sent + Duration::hours(1),
-                None,
-            )],
-            "an hour from the message, in the choice's session, with no message of its own"
-        );
-        let current = EventRepo { pool: &pool }
-            .current(s.instance_id, Some(umid), Utc::now())
-            .await
-            .unwrap();
-        assert_eq!(
-            current.foreground.map(|e| e.kind),
-            Some(EventKind::FellOut),
-            "under way"
+            "no falling-out, and the incident keeps its end"
         );
 
-        // The same turn's judge and reply see it.
+        // The same turn's judge and reply hear of no falling-out.
         let judge = request_to(&mock, "pde/judge").await;
         assert_eq!(judge.len(), 1);
-        assert!(
-            judge[0].contains(&format!("[近期事件] {FELL_OUT_LABEL}（")),
-            "{}",
-            judge[0]
-        );
+        assert!(!judge[0].contains(FELL_OUT_LABEL), "{}", judge[0]);
+        assert!(judge[0].contains("在看书"), "still reading: {}", judge[0]);
         let reply = request_to(&mock, "deepseek/x").await;
         assert_eq!(reply.len(), 1);
-        assert!(
-            reply[0].contains(&format!("- 正在经历：{FELL_OUT_LABEL}（")),
-            "{}",
-            reply[0]
-        );
+        assert!(!reply[0].contains(FELL_OUT_LABEL), "{}", reply[0]);
 
         // No tier change, and no drop event: the judge rates the turn itself.
         // The scene's lines (bond 0.0, chemistry 0.7: tiers 1 and 4) stand.
@@ -1595,7 +1720,7 @@ mod tests {
             (vec![0.0, 0.0, 0.7, 0.7], 0)
         );
 
-        // The next message finds nothing pending: no second row, no new resolve.
+        // The next message finds nothing pending: no new resolve.
         s.stream_turn(&state, sent + Duration::minutes(5), None)
             .await;
         assert_eq!(s.instance_events().await, events);
@@ -1673,13 +1798,15 @@ mod tests {
         let word = sent + Duration::minutes(2);
         s.stream_turn(&state, word, None).await;
         assert_eq!(s.status_of(choice).await, ("ignored".into(), Some(word)));
-        assert_eq!(s.instance_events().await.len(), 1);
+        assert!(
+            s.instance_events().await.is_empty(),
+            "an ignore writes no falling-out"
+        );
     }
 
     /// A choice that lapsed (24 hours past its ask, the instant itself
-    /// included) converts nothing: it stays `pending`, there is no falling-out
-    /// and the turn goes on as any other. One microsecond earlier it was
-    /// still waiting.
+    /// included) converts nothing: it stays `pending` and the turn goes on as
+    /// any other. One microsecond earlier it was still waiting.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn an_expired_ask_converts_nothing(pool: PgPool) {
         let (state, mock) = turn_env(&pool).await;
@@ -1698,22 +1825,17 @@ mod tests {
             let (status, resolved) = s.status_of(choice).await;
             if converts {
                 assert_eq!((status.as_str(), resolved), ("ignored", Some(sent)));
-                assert_eq!(s.instance_events().await.len(), 1);
             } else {
                 assert_eq!((status.as_str(), resolved), ("pending", None), "at {sent}");
-                assert!(s.instance_events().await.is_empty(), "at {sent}");
             }
+            assert!(s.instance_events().await.is_empty(), "at {sent}");
         }
         // The lapsed turns were answered all the same, with nothing said of it.
         let replies = request_to(&mock, "deepseek/x").await;
         assert_eq!(replies.len(), 3);
-        assert_eq!(
-            replies
-                .iter()
-                .filter(|r| r.contains(FELL_OUT_LABEL))
-                .count(),
-            1,
-            "only the turn that converted hears of the falling-out"
+        assert!(
+            replies.iter().all(|r| !r.contains(FELL_OUT_LABEL)),
+            "no turn hears of a falling-out"
         );
     }
 
@@ -1736,150 +1858,45 @@ mod tests {
         assert_eq!(s.status_of(choice).await.0, "ignored");
     }
 
-    /// The falling-out displaces the incident she was in: it ends where the
-    /// falling-out starts, so the one-incident invariant holds. A background
-    /// (a trip) keeps running underneath, and the turn hears of both.
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn a_running_incident_is_capped_by_the_conversion(pool: PgPool) {
-        let s = scene(&pool).await;
-        let (state, mock) = turn_env(&pool).await;
-        let sent = recent(10);
-        s.pending_at(sent - Duration::hours(2)).await;
-        // She was reading, and she is on a business trip.
-        s.seed_running(
-            "reading",
-            "r",
-            sent - Duration::minutes(20),
-            sent + Duration::minutes(100),
-        )
-        .await;
-        s.seed_running(
-            "business_trip",
-            "t",
-            sent - Duration::hours(5),
-            sent + Duration::hours(10),
-        )
-        .await;
-
-        s.stream_turn(&state, sent, None).await;
-
-        let events = s.instance_events().await;
-        let by_kind = |k: &str| events.iter().find(|e| e.0 == k).unwrap().clone();
-        assert_eq!(events.len(), 3, "{events:?}");
-        assert_eq!(
-            by_kind("reading").4,
-            sent,
-            "the incident ends at the message"
-        );
-        assert_eq!(
-            by_kind("business_trip").4,
-            sent + Duration::hours(10),
-            "a background is not displaced"
-        );
-        assert_eq!(
-            (by_kind("fell_out").3, by_kind("fell_out").4),
-            (sent, sent + Duration::hours(1))
-        );
-
-        let judge = request_to(&mock, "pde/judge").await;
-        assert!(judge[0].contains(FELL_OUT_LABEL), "{}", judge[0]);
-        assert!(judge[0].contains("出差"), "{}", judge[0]);
-        assert!(
-            !judge[0].contains("看书"),
-            "she is no longer reading: {}",
-            judge[0]
-        );
-    }
-
-    /// The conversion is all or nothing, and a failure of it never costs the
-    /// user their reply. A falling-out already sits under the key the
-    /// conversion is about to write (the incident cap runs first, then the
-    /// insert hits the unique key and fails), so the production function's
-    /// own transaction must undo the resolve and the cap together: the ask
-    /// stays pending, the seeded row is untouched, and the turn is answered.
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn a_failed_conversion_insert_leaves_the_ask_pending_and_the_turn_alive(pool: PgPool) {
-        let s = scene(&pool).await;
-        let (state, mock) = turn_env(&pool).await;
-        let sent = recent(10);
-        let choice = s.pending_at(sent - Duration::hours(2)).await;
-        // Running at the message, in the choice's own session: the cap would
-        // end it at `sent`, and its key is the one the insert is about to take.
-        let (started, ends) = (sent - Duration::minutes(20), sent + Duration::minutes(40));
-        sqlx::query(
-            "INSERT INTO engine.persona_events \
-               (instance_id, session_id, event_key, kind, started_at, ends_at) \
-             VALUES ($1, $2, $3, 'fell_out', $4, $5)",
-        )
-        .bind(s.instance_id)
-        .bind(s.session_id)
-        .bind(format!("life_choice:{choice}:fell_out"))
-        .bind(started)
-        .bind(ends)
-        .execute(&pool)
-        .await
-        .unwrap();
-        let seeded = vec![(
-            "fell_out".to_string(),
-            format!("life_choice:{choice}:fell_out"),
-            Some(s.session_id),
-            started,
-            ends,
-            None,
-        )];
-        assert_eq!(s.instance_events().await, seeded);
-
-        s.stream_turn(&state, sent, None).await;
-
-        assert_eq!(
-            s.status_of(choice).await,
-            ("pending".into(), None),
-            "the resolve went down with the failed insert"
-        );
-        assert_eq!(
-            s.instance_events().await,
-            seeded,
-            "no second row, and the cap went down with the insert (ends_at not cut to the message)"
-        );
-        assert_eq!(
-            request_to(&mock, "deepseek/x").await.len(),
-            1,
-            "the error was logged and swallowed: the turn was still answered"
-        );
-    }
-
     // ---- One pending ask per instance; the conversion never runs apart ----
 
     /// She has one life: while any session of the instance waits for an answer
-    /// the others do not ask, however thin her patience runs there. Answering
-    /// it lets the same streak through.
+    /// the others do not ask, however warm it runs there. Answering it lets
+    /// the same streak through.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn a_sibling_sessions_pending_ask_holds_the_trigger_back(pool: PgPool) {
-        let a = scene(&pool).await;
-        let b = lopsided_session(&pool, a.user_id, a.instance_id).await;
-        let mock = mock_llm(LOW_PATIENCE, Some(ASK_TEXT)).await;
+        let mut b = scene_with_lines(&pool, 0.5, 0.5).await;
+        b.set_art(json!({"hygienic": false})).await;
+        b.record_scopes("full", AffinityScope::chemistry()).await;
+        b.event_under_way(EventKind::ShortTrip).await;
+        let a = seed_session(&pool, b.user_id, b.instance_id).await;
+        let mock = mock_llm(WARM, Some(SLEEP_TEXT)).await;
         let state = with_models(test_state(pool.clone()), &mock.uri());
-        a.seed_choice("pending", Duration::hours(1)).await;
+        b.pending_in(a, Utc::now() - Duration::hours(1)).await;
 
-        // B meets every other condition: the gap, three low judged turns, a
-        // text session of a genome instance, nothing under way.
+        // B meets every other condition of the bed: compatible scopes, three
+        // warm judged turns, a text session of a genome instance.
         for _ in 0..3 {
-            a.turn_in(&state, b, SEEN).await;
+            b.turn(&state, SEEN).await;
         }
-        assert!(a.choices_in(b).await.is_empty(), "A's ask holds B back");
+        assert!(b.choices().await.is_empty(), "A's ask holds B back");
         assert!(
             companion_calls(&mock).await.is_empty(),
             "and no generation spent"
         );
-        assert_eq!(a.choices().await.len(), 1, "A's ask is untouched");
+        assert_eq!(b.choices_in(a).await.len(), 1, "A's ask is untouched");
 
         sqlx::query("UPDATE engine.life_choices SET status = 'ignored' WHERE session_id = $1")
-            .bind(a.session_id)
+            .bind(a)
             .execute(&pool)
             .await
             .unwrap();
-        a.turn_in(&state, b, SEEN).await;
-        assert_eq!(a.choices_in(b).await.len(), 1, "answered, B asks");
+        b.turn(&state, SEEN).await;
+        assert_eq!(
+            b.kinds().await,
+            vec![pending("sleep_together")],
+            "answered, B asks"
+        );
         assert_eq!(companion_calls(&mock).await.len(), 1);
     }
 
@@ -1980,19 +1997,24 @@ mod tests {
     /// itself.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn a_give_then_an_ignore_does_not_ask_again_on_the_converting_turn(pool: PgPool) {
-        let s = scene(&pool).await;
-        let mock = mock_llm(LOW_PATIENCE, Some(ASK_TEXT)).await;
+        // A couple at tiers 3/3 the bed would be asked of: not hygienic, so no
+        // bath, and away on a trip of her own, so no trip together.
+        let mut s = scene_with_lines(&pool, 0.5, 0.5).await;
+        s.set_art(json!({"hygienic": false})).await;
+        s.record_scopes("full", AffinityScope::chemistry()).await;
+        s.event_under_way(EventKind::ShortTrip).await;
+        let mock = mock_llm(WARM, Some(SLEEP_TEXT)).await;
         let state = with_models(test_state(pool.clone()), &mock.uri());
         s.pending_at(Utc::now() - Duration::hours(2)).await;
 
-        // Three low judged turns, all after the ask, none of them an answer.
+        // Three warm judged turns, all after the ask, none of them an answer.
         for _ in 0..3 {
             s.turn(&state, SEEN).await;
         }
         assert_eq!(s.choices().await.len(), 1, "held back while she waits");
 
-        // An ordinary message: the ask is ignored. Its own judge reading is low,
-        // and it is turn one of the new streak.
+        // An ordinary message: the ask is ignored. Its own judge reading is
+        // warm, and it is turn one of the new streak.
         s.converting_turn(&state, SEEN).await;
         let choices = s.choices().await;
         assert_eq!(choices.len(), 1, "{choices:?}");
@@ -2009,20 +2031,21 @@ mod tests {
         assert_eq!(companion_calls(&mock).await.len(), 1);
     }
 
-    /// Action turns inside a separation are judged like any other, but they
-    /// are part of the episode: once she is back the streak counts only the
-    /// turns after the separation ended.
+    /// Action turns inside a separation (one agreed before `ask_for_space`
+    /// was retired) are judged like any other, but they are part of the
+    /// episode: once she is back the streak counts only the turns after the
+    /// separation ended.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn action_turns_during_a_separation_do_not_pre_load_the_return_streak(pool: PgPool) {
         let s = scene(&pool).await;
-        let mock = mock_llm(LOW_PATIENCE, Some(ASK_TEXT)).await;
+        let mock = mock_llm(LOW_PATIENCE, Some(COLD_TEXT)).await;
         let state = with_models(test_state(pool.clone()), &mock.uri());
 
         // Two judged action turns, 20 hours ago. The separation they fell in
         // ran from 29 to 11 hours ago, and the ask was put 30 hours ago.
         s.turn(&state, SEEN).await;
         s.turn(&state, SEEN).await;
-        assert!(s.choices().await.is_empty(), "two turns are not three");
+        assert!(!s.cold_war().await, "two turns are not three");
         s.age_events(Duration::hours(20)).await;
         s.seed_accepted_choice(
             Duration::hours(30),
@@ -2032,16 +2055,12 @@ mod tests {
         .await;
 
         s.turn(&state, SEEN).await;
-        assert_eq!(s.choices().await.len(), 1, "one turn since she came back");
+        assert!(!s.cold_war().await, "one turn since she came back");
         assert!(companion_calls(&mock).await.is_empty());
         s.turn(&state, SEEN).await;
-        assert_eq!(s.choices().await.len(), 1, "two");
+        assert!(!s.cold_war().await, "two");
         s.turn(&state, SEEN).await;
-        assert_eq!(
-            s.choices().await.len(),
-            2,
-            "three since the return ask again"
-        );
+        assert!(s.cold_war().await, "three since the return start it");
         assert_eq!(companion_calls(&mock).await.len(), 1);
     }
 
@@ -2640,19 +2659,5 @@ mod tests {
             s.turn(&state, SEEN).await;
         }
         assert_eq!(s.kinds().await, vec![pending("sleep_together")]);
-    }
-
-    /// She does not ask for space while they are away together.
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn she_does_not_ask_for_space_on_a_trip_together(pool: PgPool) {
-        let s = scene(&pool).await;
-        s.event_under_way(EventKind::TravelingTogether).await;
-        let mock = mock_llm(LOW_PATIENCE, Some(ASK_TEXT)).await;
-        let state = with_models(test_state(pool.clone()), &mock.uri());
-
-        for _ in 0..3 {
-            s.turn(&state, SEEN).await;
-        }
-        assert!(s.choices().await.is_empty());
     }
 }

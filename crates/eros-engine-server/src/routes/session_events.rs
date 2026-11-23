@@ -868,8 +868,8 @@ async fn plan_event(
     if event_repo.by_key(session_id, &key).await?.is_some() {
         return Ok((EventPlan::Stored, traits));
     }
-    // She has asked for space and waits for an answer: the ask is the
-    // foreground drama, and it keeps an offline stretch from starting
+    // She has put a choice to the user and waits for an answer: the ask is
+    // the foreground drama, and it keeps an offline stretch from starting
     // mid-question (spec 2026-10-19 §3.1). Any session of the instance.
     let waiting = LifeChoiceRepo { pool: &state.pool }
         .pending_for_instance(instance_id, now)
