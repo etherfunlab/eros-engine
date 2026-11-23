@@ -25,9 +25,12 @@ const LIVE_SESSION: &str = "FROM engine.chat_sessions s \
 /// `archive_relationship`'s first statement updates this row, so it waits for
 /// `tx` to commit and its deletes then take the new row with the rest; and a
 /// lock requested once the archive has updated the row waits for it and then
-/// finds the session archived. An erasure serializes the same way: it commits
-/// its tombstone, then locks the user's session rows before it deletes. An
-/// unknown id reads back as not live too.
+/// finds the session archived. An erasure commits its tombstone, then locks
+/// the user's session rows before it deletes: a writer holding this lock
+/// finishes first, and one that asks later sees the tombstone. (It does not
+/// update the row, so a statement that began before the tombstone committed
+/// and waited on that lock still reads the session as live; see
+/// `ErasureRepo::erase_user`.) An unknown id reads back as not live too.
 pub async fn lock_live_session(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     session_id: Uuid,

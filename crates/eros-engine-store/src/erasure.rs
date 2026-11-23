@@ -166,11 +166,20 @@ impl ErasureRepo<'_> {
     /// starts from here on sees it and writes nothing. The second locks the
     /// user's session rows, then deletes, blanks and moves `erased_at`
     /// forward. The lock conflicts with the `FOR SHARE` a guarded write holds
-    /// (`lock_live_session`), so a write that passed its check before the
-    /// tombstone committed finishes first and the deletes take what it left;
-    /// it does not conflict with a message insert's key-share lock. If the
-    /// second transaction fails, the tombstone stays, writes stay blocked,
-    /// and a repeat call completes the erasure.
+    /// (`lock_live_session`), so a write holding that lock finishes first and
+    /// the deletes take what it left; it does not conflict with a message
+    /// insert's key-share lock.
+    ///
+    /// What is left open is one statement wide: a write whose checking
+    /// statement took its snapshot before the tombstone committed and reaches
+    /// its row after the matching delete (under READ COMMITTED that statement
+    /// does not see the tombstone). A repeat call removes such a row, and
+    /// nothing can write another.
+    ///
+    /// If the second transaction fails, the tombstone stays and a repeat call
+    /// completes the erasure. Until then no new state is opened for the user,
+    /// while the sweepers may still work on the state rows the failed call
+    /// left.
     ///
     /// Idempotent. The second transaction's upsert moves `erased_at` forward
     /// on every call, so a repeat re-announces the erasure on the deletion
