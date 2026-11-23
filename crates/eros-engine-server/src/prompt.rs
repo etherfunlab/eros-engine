@@ -836,6 +836,7 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
         UserAction::StreakTogether => "想和你一起裸奔".into(),
         UserAction::DrinkTogether => "想和你一起喝酒".into(),
         UserAction::Propose => "向你求婚".into(),
+        UserAction::BreakUp => "向你提出分手".into(),
         UserAction::HotSpringTogether => "想和你一起泡温泉".into(),
         UserAction::FightTogether => "想和你一起去战斗".into(),
         UserAction::Challenge => "向你发起挑战".into(),
@@ -1500,8 +1501,9 @@ pub(crate) fn reactions_context(lines: &[ReactionLine<'_>]) -> String {
 }
 
 /// What `accept` and `refuse` mean on a social action (spec 2026-11-08
-/// §2.2): whether she fell for it. `None` on every other action, whose
-/// answers are 你接受了 / 你没有接受.
+/// §2.2): whether she fell for it; on a break-up, whether she agreed to it
+/// (spec 2026-11-23-affinity-50-design.md §8). `None` on every other action,
+/// whose answers are 你接受了 / 你没有接受.
 pub(crate) fn social_outcomes(a: &UserAction) -> Option<(&'static str, &'static str)> {
     match a {
         UserAction::Bluff => Some(("你信了", "你没信")),
@@ -1509,6 +1511,7 @@ pub(crate) fn social_outcomes(a: &UserAction) -> Option<(&'static str, &'static 
         UserAction::Trick => Some(("你上当了", "你识破了")),
         UserAction::Challenge => Some(("你应战了", "你没应战")),
         UserAction::Bet => Some(("你答应打这个赌", "你没答应")),
+        UserAction::BreakUp => Some(("你同意分手", "你不同意分手")),
         _ => None,
     }
 }
@@ -6881,6 +6884,25 @@ mod tests {
             action_outcome(&UserAction::Challenge, ActionResponse::Refuse),
             "对方向你发起挑战，你没应战。"
         );
+    }
+
+    /// Spec 2026-11-23-affinity-50-design.md §8.
+    #[test]
+    fn a_break_up_reads_as_the_spec_says() {
+        assert_eq!(action_phrase(&UserAction::BreakUp), "向你提出分手");
+        assert_eq!(action_marker(&UserAction::BreakUp), "（向你提出分手）");
+        assert_eq!(
+            social_outcomes(&UserAction::BreakUp),
+            Some(("你同意分手", "你不同意分手"))
+        );
+        assert_eq!(
+            action_outcome(&UserAction::BreakUp, ActionResponse::Refuse),
+            "对方向你提出分手，你不同意分手。"
+        );
+        for r in [ActionResponse::Accept, ActionResponse::Refuse] {
+            let s = user_action_context(&UserAction::BreakUp, r, None);
+            assert!(!s.contains("拒绝"), "{s}");
+        }
     }
 
     /// Spec 2026-11-20-together-actions-state-in-picture-and-genome-routes-

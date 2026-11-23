@@ -2941,11 +2941,18 @@ fn accepted_together(
 /// actions-state-in-picture-and-genome-routes-design.md §5). The two share one
 /// transaction: a failed write loses both the stored answer and the event,
 /// never the reply already sent.
+///
+/// On a genome instance, a `propose` or `break_up` also settles the status of
+/// `relationship`, the turn's affinity session (the inviting one on a date),
+/// in that same transaction (spec 2026-11-23-affinity-50-design.md §8). A
+/// BYOC instance's status never moves (§6.5).
 async fn store_action_response(
     chat_repo: &ChatRepo<'_>,
     user_msg: &PersistedUserMessage,
     response: eros_engine_core::types::ActionResponse,
     on_date: bool,
+    relationship: Uuid,
+    genome: bool,
 ) {
     let kind = accepted_together(user_msg.action.as_ref(), Some(response)).filter(|_| !on_date);
     let event_key = kind.map(|k| format!("action:{}:{}", user_msg.user_message_id, k.as_str()));
@@ -2961,6 +2968,12 @@ async fn store_action_response(
             ends_at: now + eros_engine_core::events::lasts(kind, roll),
         }
     });
+    let status_ask = user_msg
+        .action
+        .as_ref()
+        .and_then(|a| a.status_ask())
+        .filter(|_| genome)
+        .map(|ask| (relationship, ask));
     if let Err(e) = chat_repo
         .set_action_response(
             user_msg.user_message_id,
@@ -2968,6 +2981,7 @@ async fn store_action_response(
             user_msg.instance_id,
             user_msg.user_locale.timezone,
             place.as_ref(),
+            status_ask,
         )
         .await
     {
@@ -3095,7 +3109,8 @@ fn build_pde_ctx(
     // together-actions-state-in-picture-and-genome-routes-design.md §5 and
     // 2026-11-23-twelve-together-actions-and-propose-design.md §4.1, §5; a
     // date the gate turns down, spec 2026-11-12-activity-sub-session-
-    // design.md §4.3) states the outcome, not the reason.
+    // design.md §4.3; a proposal or break-up the status does not allow, spec
+    // 2026-11-23-affinity-50-design.md §8) states the outcome, not the reason.
     let action_line = match &input.event {
         eros_engine_core::types::Event::UserMessage {
             action: Some(a), ..
@@ -3109,6 +3124,11 @@ fn build_pde_ctx(
                 (false, _) => "",
                 (true, eros_engine_core::types::UserAction::Strip) => "，这次你不会让对方这样做",
                 (true, eros_engine_core::types::UserAction::Date { .. }) => "，这次你不会答应",
+                (
+                    true,
+                    eros_engine_core::types::UserAction::Propose
+                    | eros_engine_core::types::UserAction::BreakUp,
+                ) => "，这次你不会答应",
                 (true, a) if a.together_kind().is_some() => "，这次你不会答应",
                 (true, _) => "，这次你不会收下",
             }
@@ -5350,8 +5370,20 @@ pub(crate) fn run_stream_with(
             affinity.bond_tier(),
             offline_now || other_date_on,
         );
-        let refused_before_judge =
-            give_refused || strip_refused || together_refused || world_refused || date_refused;
+        // A proposal or break-up the status does not allow, and any BYOC
+        // break-up (spec 2026-11-23-affinity-50-design.md §6.5, §8): refused,
+        // and free. On a date, the inviting session's status.
+        let status_refused = pde::status_ruled_out(
+            &input.event,
+            affinity.relationship.status,
+            input.persona.instance.genome_id.is_some(),
+        );
+        let refused_before_judge = give_refused
+            || strip_refused
+            || together_refused
+            || world_refused
+            || date_refused
+            || status_refused;
         let (mut plan, pde_run): (eros_engine_core::types::ActionPlan, Option<PdeDecisionRun>) =
             match resolved_pde.as_ref() {
                 Some(p) => {
@@ -6226,7 +6258,15 @@ pub(crate) fn run_stream_with(
                     // Stored right before post-process is spawned, with no other
                     // await between them.
                     if let Some(response) = plan.action_response {
-                        store_action_response(&chat_repo, &user_msg, response, on_date).await;
+                        store_action_response(
+                            &chat_repo,
+                            &user_msg,
+                            response,
+                            on_date,
+                            turn.relationship,
+                            input.persona.instance.genome_id.is_some(),
+                        )
+                        .await;
                     }
                     let state_bg = (*state).clone();
                     let mut plan_bg = plan.clone();
@@ -6807,7 +6847,15 @@ pub(crate) fn run_stream_with(
                 // Stored right before post-process is spawned, with no other
                 // await between them.
                 if let Some(response) = plan.action_response.filter(|_| !answer_stored) {
-                    store_action_response(&chat_repo, &user_msg, response, on_date).await;
+                    store_action_response(
+                        &chat_repo,
+                        &user_msg,
+                        response,
+                        on_date,
+                        turn.relationship,
+                        input.persona.instance.genome_id.is_some(),
+                    )
+                    .await;
                 }
                 // Spawn post-process; do not await.
                 let state_bg = (*state).clone();
@@ -28193,5 +28241,403 @@ data: [DONE]\n\n"
             judges[0]
         );
         assert!(!judges[1].contains("和对方约会（"), "{}", judges[1]);
+    }
+
+    // ─── The user's status asks (spec 2026-11-23-affinity-50-design.md §8) ───
+
+    /// One `action` in a fresh main chat whose affinity row stands at
+    /// `status`, a cold war under way when `cold_war`. The judge answers
+    /// `response`, the companion streams `REPLY`. `byoc` runs it on a BYOC
+    /// instance, with the card such a turn carries. Returns the frames, the
+    /// mock, the user row and the session.
+    async fn run_status_turn(
+        pool: &PgPool,
+        action: eros_engine_core::types::UserAction,
+        status: &str,
+        cold_war: bool,
+        byoc: bool,
+        response: &str,
+    ) -> (Vec<ProtocolFrame>, wiremock::MockServer, Uuid, Uuid) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let verdict = serde_json::json!({
+            "action": "reply_text", "inner_state": "", "action_response": response
+        });
+        let judge_body = serde_json::json!({
+            "id": "gj", "model": "pde/judge",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": verdict.to_string()}}],
+        });
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("pde/judge"))
+            .respond_with(crate::pipeline::reasoning_call::test_support::sse_completion(judge_body))
+            .mount(&mock)
+            .await;
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"REPLY\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"deepseek/x\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (instance_id, session_id, card) = if byoc {
+            let (instance_id, session_id) =
+                crate::routes::companion::testutil::seed_byoc_session(pool, user_id).await;
+            let card = eros_engine_core::persona::CompanionPersona {
+                instance_id,
+                genome: eros_engine_core::persona::PersonaGenome {
+                    id: None,
+                    name: "Card".into(),
+                    system_prompt: "sp".into(),
+                    tip_personality: None,
+                    art_metadata: serde_json::json!({}),
+                },
+                instance: eros_engine_core::persona::PersonaInstance {
+                    id: instance_id,
+                    genome_id: None,
+                    owner_uid: user_id,
+                    status: "active".into(),
+                },
+                items: vec![],
+            };
+            (instance_id, session_id, Some(card))
+        } else {
+            let (_, instance_id, session_id) = seed_persona_and_session(pool, user_id).await;
+            (instance_id, session_id, None)
+        };
+        AffinityRepo { pool }
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE engine.companion_affinity \
+                SET relationship_status = $2, \
+                    cold_war_since = CASE WHEN $3 THEN now() - interval '1 hour' END \
+              WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .bind(status)
+        .bind(cold_war)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide.\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        // Embeddings go to the mock too, which mounts none: recall and the
+        // memory write fail at once instead of reaching a real endpoint.
+        state.embed = Arc::new(
+            eros_engine_llm::embedding::EmbeddingRouter::from_config_with(
+                &eros_engine_llm::model_config::ModelConfig::from_toml_str(&format!(
+                    "[providers.mockembed]\nembeddings = \"{}/v1/embeddings\"\n\
+                     [tasks.embedding]\nmodel = \"mock-embed@mockembed\"\n",
+                    mock.uri()
+                ))
+                .unwrap(),
+                |k| (k == "MOCKEMBED_API_KEY").then(|| "test-key".to_string()),
+            )
+            .unwrap(),
+        );
+        let meta = serde_json::json!({"action": serde_json::to_value(&action).unwrap()});
+        let umid = match (ChatRepo { pool })
+            .upsert_user_message_idempotent(
+                session_id,
+                "",
+                "01JSTATUS00000000000000000",
+                "user",
+                Some(&meta),
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+        let frames: Vec<ProtocolFrame> = run_stream(
+            Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: String::new(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                image_url: None,
+                image: None,
+                quote: Default::default(),
+                user_locale: Default::default(),
+                action: Some(action),
+                outfit: None,
+            },
+            card,
+        )
+        .collect()
+        .await;
+        (frames, mock, umid, session_id)
+    }
+
+    /// The session's stored status, and whether a cold war is on.
+    async fn status_row(pool: &PgPool, session: Uuid) -> (String, bool) {
+        sqlx::query_as(
+            "SELECT relationship_status, cold_war_since IS NOT NULL \
+               FROM engine.companion_affinity WHERE session_id = $1",
+        )
+        .bind(session)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// `(context, user_message_id)` of every `relationship` event on the
+    /// session's affinity row, oldest first.
+    async fn relationship_events(
+        pool: &PgPool,
+        session: Uuid,
+    ) -> Vec<(serde_json::Value, Option<Uuid>)> {
+        sqlx::query_as(
+            "SELECT e.context, e.user_message_id \
+               FROM engine.companion_affinity_events e \
+               JOIN engine.companion_affinity a ON a.id = e.affinity_id \
+              WHERE a.session_id = $1 AND e.event_type = 'relationship' \
+              ORDER BY e.created_at",
+        )
+        .bind(session)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// The `context` of the turn's own affinity event (not a `relationship`
+    /// one), once the spawned post-process has written it.
+    async fn judged_turn_context(pool: &PgPool, umid: Uuid) -> serde_json::Value {
+        for _ in 0..200 {
+            let context: Option<serde_json::Value> = sqlx::query_scalar(
+                "SELECT context FROM engine.companion_affinity_events \
+                  WHERE user_message_id = $1 AND event_type <> 'relationship'",
+            )
+            .bind(umid)
+            .fetch_optional(pool)
+            .await
+            .unwrap();
+            if let Some(context) = context {
+                return context;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("the turn's affinity event never landed");
+    }
+
+    /// Outside `dating`, `fwb` and `situationship` a proposal is refused
+    /// before the judge, which writes for that outcome; nothing drops and
+    /// nothing moves.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_proposal_outside_a_couple_is_refused_before_the_judge(pool: PgPool) {
+        let (frames, mock, umid, session) = run_status_turn(
+            &pool,
+            eros_engine_core::types::UserAction::Propose,
+            "none",
+            false,
+            false,
+            "accept",
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "refuse");
+        let judge = judge_request(&mock.received_requests().await.unwrap());
+        assert!(
+            judge.contains("[用户动作] 对方向你求婚，这次你不会答应\\n"),
+            "{judge}"
+        );
+        let context = judged_turn_context(&pool, umid).await;
+        assert!(context.get("tier_drop").is_none(), "{context}");
+        assert_eq!(status_row(&pool, session).await, ("none".into(), false));
+        assert!(relationship_events(&pool, session).await.is_empty());
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_accepted_proposal_makes_them_engaged(pool: PgPool) {
+        let (frames, mock, umid, session) = run_status_turn(
+            &pool,
+            eros_engine_core::types::UserAction::Propose,
+            "dating",
+            false,
+            false,
+            "accept",
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        let judge = judge_request(&mock.received_requests().await.unwrap());
+        assert!(judge.contains("[用户动作] 对方向你求婚\\n"), "{judge}");
+        assert_eq!(status_row(&pool, session).await, ("engaged".into(), false));
+        assert_eq!(
+            relationship_events(&pool, session).await,
+            vec![(
+                serde_json::json!({"from": "dating", "to": "engaged"}),
+                Some(umid)
+            )]
+        );
+    }
+
+    /// An accepted break-up ends the relationship and the cold war under
+    /// way with it.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_accepted_break_up_makes_an_ex(pool: PgPool) {
+        let (frames, mock, umid, session) = run_status_turn(
+            &pool,
+            eros_engine_core::types::UserAction::BreakUp,
+            "engaged",
+            true,
+            false,
+            "accept",
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        let judge = judge_request(&mock.received_requests().await.unwrap());
+        assert!(
+            judge.contains(
+                "[用户动作] 对方向你提出分手（accept：你同意分手；refuse：你不同意分手）\\n"
+            ),
+            "{judge}"
+        );
+        assert_eq!(status_row(&pool, session).await, ("ex".into(), false));
+        assert_eq!(
+            relationship_events(&pool, session).await,
+            vec![(
+                serde_json::json!({"from": "engaged", "to": "ex", "cold_war": "ended"}),
+                Some(umid)
+            )]
+        );
+    }
+
+    /// A refused break-up keeps the status, starts a cold war and drops
+    /// nothing.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_refused_break_up_starts_a_cold_war(pool: PgPool) {
+        let (frames, _, umid, session) = run_status_turn(
+            &pool,
+            eros_engine_core::types::UserAction::BreakUp,
+            "dating",
+            false,
+            false,
+            "refuse",
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "refuse");
+        assert_eq!(status_row(&pool, session).await, ("dating".into(), true));
+        assert_eq!(
+            relationship_events(&pool, session).await,
+            vec![(
+                serde_json::json!({"from": "dating", "to": "dating", "cold_war": "entered"}),
+                Some(umid)
+            )]
+        );
+        let context = judged_turn_context(&pool, umid).await;
+        assert!(context.get("tier_drop").is_none(), "{context}");
+    }
+
+    /// A break-up with nothing to break is refused before the judge: no
+    /// cold war starts and nothing moves.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_break_up_without_a_breakable_status_is_refused_before_the_judge(pool: PgPool) {
+        let (frames, mock, umid, session) = run_status_turn(
+            &pool,
+            eros_engine_core::types::UserAction::BreakUp,
+            "ex",
+            false,
+            false,
+            "accept",
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "refuse");
+        let judge = judge_request(&mock.received_requests().await.unwrap());
+        assert!(
+            judge.contains(
+                "[用户动作] 对方向你提出分手（accept：你同意分手；refuse：你不同意分手），这次你不会答应\\n"
+            ),
+            "{judge}"
+        );
+        assert_eq!(status_row(&pool, session).await, ("ex".into(), false));
+        assert!(relationship_events(&pool, session).await.is_empty());
+        let context = judged_turn_context(&pool, umid).await;
+        assert!(context.get("tier_drop").is_none(), "{context}");
+    }
+
+    /// A BYOC session stays outside the status system (spec §6.5): its
+    /// proposal goes to the judge as before and moves nothing.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_byoc_proposal_is_judged_and_moves_nothing(pool: PgPool) {
+        let (frames, mock, _, session) = run_status_turn(
+            &pool,
+            eros_engine_core::types::UserAction::Propose,
+            "none",
+            false,
+            true,
+            "accept",
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        let judge = judge_request(&mock.received_requests().await.unwrap());
+        assert!(judge.contains("[用户动作] 对方向你求婚\\n"), "{judge}");
+        assert_eq!(status_row(&pool, session).await, ("none".into(), false));
+        assert!(relationship_events(&pool, session).await.is_empty());
+    }
+
+    /// Inside a date the break-up acts on the inviting session's row, where
+    /// date turns already write; the date's own session gets none.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_break_up_inside_a_date_moves_the_inviting_session(pool: PgPool) {
+        let s = date_scene(
+            &pool,
+            serde_json::json!({"action": "reply_text", "inner_state": "", "action_response": "accept"}),
+            "",
+        )
+        .await;
+        s.set_status("dating").await;
+
+        let (frames, umid) = s
+            .send(
+                1,
+                serde_json::json!({"content": "", "action": {"type": "break_up"}}),
+            )
+            .await;
+        assert!(
+            frames
+                .iter()
+                .any(|f| f["type"] == "action_response" && f["response"] == "accept"),
+            "{frames:?}"
+        );
+        assert_eq!(status_row(&pool, s.parent).await, ("ex".into(), false));
+        assert_eq!(
+            relationship_events(&pool, s.parent).await,
+            vec![(
+                serde_json::json!({"from": "dating", "to": "ex"}),
+                Some(umid)
+            )]
+        );
+        assert_eq!(s.sub_affinity_rows().await, 0);
     }
 }

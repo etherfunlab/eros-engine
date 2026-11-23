@@ -8,6 +8,7 @@ use uuid::Uuid;
 use crate::affinity::{Affinity, AffinityDeltas, AffinityLine};
 use crate::events::EventKind;
 use crate::persona::CompanionPersona;
+use crate::relationship::StatusAsk;
 use crate::scope::{AffinityScope, MemoryScope};
 
 /// A caller-supplied system-prompt fragment. The engine treats `text` as
@@ -172,8 +173,15 @@ pub enum UserAction {
     StreakTogether,
     DrinkTogether,
     /// The user asks her to marry them (spec 2026-11-23 §7): the judge
-    /// decides, a refusal drops nothing, and no event is placed.
+    /// decides, a refusal drops nothing, and no event is placed. Put only
+    /// from `dating`, `fwb` or `situationship`; accepted, the pair is
+    /// `engaged` (spec 2026-11-23-affinity-50-design.md §8).
     Propose,
+    /// The user breaks up with her (spec 2026-11-23-affinity-50-design.md
+    /// §8): put only from a breakable status. Accepted, the pair is `ex`;
+    /// refused, a cold war starts. A refusal drops nothing, and no event is
+    /// placed.
+    BreakUp,
     /// The user asks her into a hot spring with them; a together action, as
     /// `sauna_together` (spec 2026-11-23-hot-spring-fight-challenge-bet-
     /// design.md §4).
@@ -259,9 +267,21 @@ impl UserAction {
                 | UserAction::SexTogether
                 | UserAction::StreakTogether
                 | UserAction::Propose
+                | UserAction::BreakUp
                 | UserAction::Threaten
                 | UserAction::Tip { .. }
         )
+    }
+
+    /// The status ask this action puts to her (spec 2026-11-23-affinity-50-
+    /// design.md §8): `propose` and `break_up`. `None` for every other
+    /// action.
+    pub fn status_ask(&self) -> Option<StatusAsk> {
+        match self {
+            UserAction::Propose => Some(StatusAsk::Propose),
+            UserAction::BreakUp => Some(StatusAsk::BreakUp),
+            _ => None,
+        }
     }
 
     /// The event an accepted together action puts her in: `None` for every
@@ -308,7 +328,7 @@ impl UserAction {
     /// giving something to keep is friendship, every physical gesture is
     /// romance. A refused tip drops nothing (spec 2026-10-11 §6), nor does
     /// seeing through a bluff, a threat or a trick (spec 2026-11-08 §2.2), nor
-    /// does turning down a date, a proposal, a challenge or a bet.
+    /// does turning down a date, a proposal, a break-up, a challenge or a bet.
     pub fn refusal_line(&self) -> Option<AffinityLine> {
         match self {
             UserAction::Give { .. } | UserAction::Gift { .. } => Some(AffinityLine::Bond),
@@ -317,6 +337,7 @@ impl UserAction {
             | UserAction::Threaten
             | UserAction::Trick
             | UserAction::Propose
+            | UserAction::BreakUp
             | UserAction::Challenge
             | UserAction::Bet
             | UserAction::Date { .. } => None,
@@ -840,6 +861,44 @@ mod tests {
             UserAction::Propose
         );
         assert_eq!(UserAction::Propose.together_kind(), None);
+    }
+
+    /// Spec 2026-11-23-affinity-50-design.md §8: a break-up is answered in
+    /// the `emotional` tone, places no event and drops nothing when refused.
+    #[test]
+    fn break_up_is_a_plain_charged_action() {
+        let v = serde_json::json!({ "type": "break_up" });
+        assert_eq!(serde_json::to_value(UserAction::BreakUp).unwrap(), v);
+        assert_eq!(
+            serde_json::from_value::<UserAction>(v).unwrap(),
+            UserAction::BreakUp
+        );
+        assert!(UserAction::BreakUp.speaks_emotionally());
+        assert_eq!(UserAction::BreakUp.refusal_line(), None);
+        assert_eq!(UserAction::BreakUp.together_kind(), None);
+        assert_eq!(UserAction::BreakUp.consumed(), None);
+    }
+
+    /// Spec 2026-11-23-affinity-50-design.md §8: the two user actions whose
+    /// answer can move the status.
+    #[test]
+    fn propose_and_break_up_are_the_status_asks() {
+        assert_eq!(UserAction::Propose.status_ask(), Some(StatusAsk::Propose));
+        assert_eq!(UserAction::BreakUp.status_ask(), Some(StatusAsk::BreakUp));
+        for a in [
+            UserAction::Kiss,
+            UserAction::SexTogether,
+            UserAction::FallAsleepTogether,
+            UserAction::Challenge,
+            UserAction::Custom { text: "x".into() },
+            UserAction::Date {
+                duration: DateDuration::Short,
+                place: "海边".into(),
+                content: "看海".into(),
+            },
+        ] {
+            assert_eq!(a.status_ask(), None, "{a:?}");
+        }
     }
 
     #[test]
