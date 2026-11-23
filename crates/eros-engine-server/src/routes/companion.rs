@@ -1190,6 +1190,48 @@ pub fn router() -> OpenApiRouter<AppState> {
 #[cfg(test)]
 pub(crate) const TEST_SECRET: &str = "test-secret-companion-routes";
 
+/// The config `test_state` runs with: every secret unset, sweepers off.
+#[cfg(test)]
+pub(crate) fn test_config() -> crate::state::ServerConfig {
+    crate::state::ServerConfig {
+        // Default tuning: at a fresh seed (tier 1, no counterpart penalty)
+        // rule deltas land 1:1.
+        affinity_tuning: eros_engine_core::affinity::AffinityTuning::default(),
+        bind_addr: "127.0.0.1:0".into(),
+        // Sweeper disabled in tests — unit tests don't spawn it
+        // and the fields are just for AppState completeness.
+        dreaming_tick: std::time::Duration::ZERO,
+        dreaming_idle_threshold: std::time::Duration::from_secs(3600),
+        dreaming_claim_stale_threshold: std::time::Duration::from_secs(600),
+        // Voice ingestion ON in tests — matches the production default.
+        dreaming_voice_disabled: false,
+        openrouter_usage_hidden_keys: std::collections::HashSet::new(),
+        // Snapshot sweeper disabled in tests — same rationale as dreaming.
+        snapshot: crate::state::SnapshotConfig {
+            disabled: true,
+            cron: "0 0 23 * * *".into(),
+            tz: chrono_tz::Asia::Singapore,
+        },
+        prompt_log_dir: None,
+        // Echo cancellation ON in tests — matches the production default.
+        chat_echo_cancellation_disabled: false,
+        // Noise cancellation ON in tests — matches the production default.
+        chat_noise_cancellation_disabled: false,
+        world: crate::state::parse_world_config(None, None, None, None, None, None),
+        chat_queue: crate::state::parse_chat_queue_config(None, None, None, None, None, None, None),
+        reaction_emoji: None,
+        byok: crate::state::ByokConfig::default(),
+        byoc: crate::state::ByocConfig::default(),
+        caller_secret: crate::state::CallerSecretConfig::default(),
+        insights_export: crate::state::InsightsExportConfig::default(),
+        facts_export: crate::state::FactsExportConfig::default(),
+        user_erase: crate::state::UserEraseConfig::default(),
+        genome_write: crate::state::GenomeWriteConfig::default(),
+        masters: crate::state::MasterSecrets::default(),
+        profile_rebuild: crate::state::parse_profile_rebuild_config(None, None, None, None),
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
     use crate::auth::supabase::SupabaseJwtValidator;
@@ -1201,44 +1243,7 @@ pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
     AppState {
         pool,
         auth,
-        config: crate::state::ServerConfig {
-            // Default tuning: at a fresh seed (tier 1, no counterpart penalty)
-            // rule deltas land 1:1.
-            affinity_tuning: eros_engine_core::affinity::AffinityTuning::default(),
-            bind_addr: "127.0.0.1:0".into(),
-            // Sweeper disabled in tests — unit tests don't spawn it
-            // and the fields are just for AppState completeness.
-            dreaming_tick: std::time::Duration::ZERO,
-            dreaming_idle_threshold: std::time::Duration::from_secs(3600),
-            dreaming_claim_stale_threshold: std::time::Duration::from_secs(600),
-            // Voice ingestion ON in tests — matches the production default.
-            dreaming_voice_disabled: false,
-            openrouter_usage_hidden_keys: std::collections::HashSet::new(),
-            // Snapshot sweeper disabled in tests — same rationale as dreaming.
-            snapshot: crate::state::SnapshotConfig {
-                disabled: true,
-                cron: "0 0 23 * * *".into(),
-                tz: chrono_tz::Asia::Singapore,
-            },
-            prompt_log_dir: None,
-            // Echo cancellation ON in tests — matches the production default.
-            chat_echo_cancellation_disabled: false,
-            // Noise cancellation ON in tests — matches the production default.
-            chat_noise_cancellation_disabled: false,
-            world: crate::state::parse_world_config(None, None, None, None, None, None),
-            chat_queue: crate::state::parse_chat_queue_config(
-                None, None, None, None, None, None, None,
-            ),
-            reaction_emoji: None,
-            byok: crate::state::ByokConfig::default(),
-            byoc: crate::state::ByocConfig::default(),
-            caller_secret: crate::state::CallerSecretConfig::default(),
-            insights_export: crate::state::InsightsExportConfig::default(),
-            facts_export: crate::state::FactsExportConfig::default(),
-            user_erase: crate::state::UserEraseConfig::default(),
-            genome_write: crate::state::GenomeWriteConfig::default(),
-            profile_rebuild: crate::state::parse_profile_rebuild_config(None, None, None, None),
-        },
+        config: test_config(),
         openrouter: Arc::new(eros_engine_llm::openrouter::OpenRouterClient::new(
             "stub".into(),
         )),

@@ -649,6 +649,76 @@ pub fn parse_genome_write_config(secret: Option<&str>) -> Result<GenomeWriteConf
     })
 }
 
+/// The two keys that stand in for the feature secrets. A master key is sent
+/// in the feature's own header, in place of its secret, and turns the feature
+/// on by itself.
+#[derive(Clone, Default)]
+pub struct MasterSecrets {
+    /// `SUPER_SECRET`: accepted at every [`Gate`].
+    pub super_secret: Option<String>,
+    /// `ADMIN_SECRET`: accepted at every gate except [`Gate::UserErase`].
+    pub admin_secret: Option<String>,
+}
+
+impl std::fmt::Debug for MasterSecrets {
+    /// The secrets never reach a log line through `ServerConfig`'s `{:?}`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MasterSecrets")
+            .field(
+                "super_secret",
+                &self.super_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "admin_secret",
+                &self.admin_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+/// A blank value means unset; a short one refuses boot. `ADMIN_SECRET` must
+/// not open the erase route by another name, so it refuses boot when it
+/// equals `SUPER_SECRET` or `user_erase_secret` (the raw `USER_ERASE_SECRET`).
+pub fn parse_master_secrets(
+    super_secret: Option<&str>,
+    admin_secret: Option<&str>,
+    user_erase_secret: Option<&str>,
+) -> Result<MasterSecrets, String> {
+    let super_secret = parse_svc_secret("SUPER_SECRET", super_secret)?;
+    let admin_secret = parse_svc_secret("ADMIN_SECRET", admin_secret)?;
+    if let Some(admin) = admin_secret.as_deref() {
+        if super_secret.as_deref() == Some(admin) {
+            return Err("ADMIN_SECRET must differ from SUPER_SECRET".into());
+        }
+        if user_erase_secret.map(str::trim) == Some(admin) {
+            return Err("ADMIN_SECRET must differ from USER_ERASE_SECRET".into());
+        }
+    }
+    Ok(MasterSecrets {
+        super_secret,
+        admin_secret,
+    })
+}
+
+/// A place a secret admits a caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gate {
+    /// The caller-secret gate on the authenticated tree (`CALLER_SECRET`).
+    Caller,
+    /// `BYOK_CALLER_SECRET`.
+    Byok,
+    /// `BYOC_CALLER_SECRET`.
+    Byoc,
+    /// `INSIGHTS_EXPORT_SECRET`.
+    InsightsExport,
+    /// `FACTS_EXPORT_SECRET`.
+    FactsExport,
+    /// `USER_ERASE_SECRET`.
+    UserErase,
+    /// `GENOME_WRITE_SECRET`.
+    GenomeWrite,
+}
+
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     /// Affinity 3.0 pipeline knobs (`AFFINITY_*` env vars). Defaults reproduce
@@ -729,11 +799,43 @@ pub struct ServerConfig {
     pub user_erase: UserEraseConfig,
     /// Genome-write admission (`GENOME_WRITE_SECRET`).
     pub genome_write: GenomeWriteConfig,
+    /// `SUPER_SECRET` and `ADMIN_SECRET`.
+    pub masters: MasterSecrets,
     /// Profile-rebuild idle-flush sweeper (`PROFILE_REBUILD_*` env vars).
     pub profile_rebuild: ProfileRebuildConfig,
 }
 
 impl ServerConfig {
+    /// The keys `gate` admits: its own secret first, then the master keys that
+    /// cover it. Empty means the feature is off.
+    ///
+    /// The caller gate is the exception: it restricts, so it is on only when
+    /// `CALLER_SECRET` is set, and a master key passes it once it is.
+    pub fn keys(&self, gate: Gate) -> Vec<&str> {
+        let mut keys: Vec<&str> = match gate {
+            Gate::Caller => self
+                .caller_secret
+                .secrets
+                .iter()
+                .map(String::as_str)
+                .collect(),
+            Gate::Byok => self.byok.caller_secret.as_deref().into_iter().collect(),
+            Gate::Byoc => self.byoc.caller_secret.as_deref().into_iter().collect(),
+            Gate::InsightsExport => self.insights_export.secret.as_deref().into_iter().collect(),
+            Gate::FactsExport => self.facts_export.secret.as_deref().into_iter().collect(),
+            Gate::UserErase => self.user_erase.secret.as_deref().into_iter().collect(),
+            Gate::GenomeWrite => self.genome_write.secret.as_deref().into_iter().collect(),
+        };
+        if gate == Gate::Caller && keys.is_empty() {
+            return keys;
+        }
+        keys.extend(self.masters.super_secret.as_deref());
+        if gate != Gate::UserErase {
+            keys.extend(self.masters.admin_secret.as_deref());
+        }
+        keys
+    }
+
     pub fn from_env() -> Result<Self, String> {
         let dreaming_disabled = parse_bool_flag(std::env::var("DREAMING_DISABLED").ok().as_deref());
         let dreaming_voice_disabled =
@@ -830,6 +932,11 @@ impl ServerConfig {
             )?,
             genome_write: parse_genome_write_config(
                 std::env::var("GENOME_WRITE_SECRET").ok().as_deref(),
+            )?,
+            masters: parse_master_secrets(
+                std::env::var("SUPER_SECRET").ok().as_deref(),
+                std::env::var("ADMIN_SECRET").ok().as_deref(),
+                std::env::var("USER_ERASE_SECRET").ok().as_deref(),
             )?,
             profile_rebuild: parse_profile_rebuild_config(
                 std::env::var("PROFILE_REBUILD_DISABLED").ok().as_deref(),
@@ -1457,5 +1564,106 @@ mod tests {
         let cfg = parse_caller_secret_config(Some(&format!("{KEY_A},{KEY_B}"))).unwrap();
         let dbg = format!("{cfg:?}");
         assert!(!dbg.contains(KEY_A) && !dbg.contains(KEY_B), "{dbg}");
+    }
+
+    // ── SUPER_SECRET / ADMIN_SECRET ──
+
+    #[test]
+    fn master_secrets_blank_is_unset_and_short_refuses_boot() {
+        let m = parse_master_secrets(Some("   "), None, None).unwrap();
+        assert!(m.super_secret.is_none() && m.admin_secret.is_none());
+        let err = parse_master_secrets(Some("short"), None, None).unwrap_err();
+        assert!(err.contains("SUPER_SECRET") && err.contains("32"), "{err}");
+        let err = parse_master_secrets(None, Some("short"), None).unwrap_err();
+        assert!(err.contains("ADMIN_SECRET") && err.contains("32"), "{err}");
+    }
+
+    #[test]
+    fn admin_secret_must_differ_from_super_and_from_user_erase() {
+        let (a, b) = ("a".repeat(32), "b".repeat(32));
+        let err = parse_master_secrets(Some(&a), Some(&a), None).unwrap_err();
+        assert!(
+            err.contains("ADMIN_SECRET") && err.contains("SUPER_SECRET"),
+            "{err}"
+        );
+        let err = parse_master_secrets(None, Some(&a), Some(&a)).unwrap_err();
+        assert!(
+            err.contains("ADMIN_SECRET") && err.contains("USER_ERASE_SECRET"),
+            "{err}"
+        );
+        // The erase secret is compared as it is stored: trimmed.
+        let padded = format!("  {a} ");
+        assert!(parse_master_secrets(None, Some(&a), Some(&padded)).is_err());
+        let m = parse_master_secrets(Some(&a), Some(&b), None).unwrap();
+        assert_eq!(m.super_secret.as_deref(), Some(a.as_str()));
+        assert_eq!(m.admin_secret.as_deref(), Some(b.as_str()));
+    }
+
+    #[test]
+    fn keys_resolve_own_secret_then_covering_masters() {
+        use Gate::*;
+        let (sup, adm, own) = ("s".repeat(32), "a".repeat(32), "o".repeat(32));
+        let mut c = crate::routes::companion::test_config();
+        let all = [
+            Caller,
+            Byok,
+            Byoc,
+            InsightsExport,
+            FactsExport,
+            UserErase,
+            GenomeWrite,
+        ];
+        for g in all {
+            assert!(c.keys(g).is_empty(), "{g:?} is off with nothing set");
+        }
+        c.masters.super_secret = Some(sup.clone());
+        c.masters.admin_secret = Some(adm.clone());
+        for g in [Byok, Byoc, InsightsExport, FactsExport, GenomeWrite] {
+            assert_eq!(c.keys(g), vec![sup.as_str(), adm.as_str()], "{g:?}");
+        }
+        assert_eq!(c.keys(UserErase), vec![sup.as_str()]);
+        assert!(
+            c.keys(Caller).is_empty(),
+            "a master never switches the caller gate on"
+        );
+        c.caller_secret.secrets = vec![own.clone()];
+        assert_eq!(
+            c.keys(Caller),
+            vec![own.as_str(), sup.as_str(), adm.as_str()]
+        );
+        c.user_erase.secret = Some(own.clone());
+        assert_eq!(c.keys(UserErase), vec![own.as_str(), sup.as_str()]);
+        // Each feature's own secret leads its own gate and no other.
+        c.byok.caller_secret = Some("k".repeat(32));
+        c.byoc.caller_secret = Some("c".repeat(32));
+        c.insights_export.secret = Some("i".repeat(32));
+        c.facts_export.secret = Some("f".repeat(32));
+        c.genome_write.secret = Some("g".repeat(32));
+        for (g, first) in [
+            (Byok, "k"),
+            (Byoc, "c"),
+            (InsightsExport, "i"),
+            (FactsExport, "f"),
+            (GenomeWrite, "g"),
+        ] {
+            assert_eq!(
+                c.keys(g),
+                vec![first.repeat(32).as_str(), sup.as_str(), adm.as_str()],
+                "{g:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn master_secrets_debug_is_redacted() {
+        let m = MasterSecrets {
+            super_secret: Some("s".repeat(32)),
+            admin_secret: Some("a".repeat(32)),
+        };
+        let dbg = format!("{m:?}");
+        assert!(
+            !dbg.contains(&"s".repeat(32)) && !dbg.contains(&"a".repeat(32)),
+            "{dbg}"
+        );
     }
 }
