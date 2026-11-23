@@ -130,9 +130,11 @@ pub enum GreetingOccasion {
     CheckIn,
     /// A life event the persona tells about (`POST …/events`).
     Event,
-    /// What she says about a life choice, of any kind (`ask_for_space`,
-    /// `sleep_together`, `propose`, `travel_together`, `bathe_together`): her ask, and her reply after the answer
-    /// (`POST …/life-choices/{id}`).
+    /// What she says about a life choice, of any kind (`confess`,
+    /// `partner_up`, `propose`, `break_up`, `sleep_together`,
+    /// `fall_asleep_together`, `travel_together`, `bathe_together`, and the
+    /// retired `ask_for_space` on older rows): her ask, and her reply after
+    /// the answer (`POST …/life-choices/{id}`).
     LifeChoice,
 }
 

@@ -2902,7 +2902,7 @@
           "companion"
         ],
         "summary": "Answer what she asked.",
-        "description": "One transaction answers the choice and pays for it; what an answer does\ndepends on the choice's `kind`.\n\n`ask_for_space`: an accept makes the choice `accepted`, starts a\n`taking_space` separation now that lasts 6 hours per tier of the gap she\nasked at (12, 18 or 24 hours; she is offline for it, and an incident under\nway ends), and drops bond and chemistry one tier each. A decline makes it\n`declined` and drops the same two lines, with no separation.\n\n`sleep_together`: an accept makes the choice `accepted` and starts a\n`having_sex_together` incident of one hour now, costing nothing; an\nincident under way ends. A decline makes it `declined` and drops chemistry\none tier.\n\n`propose`: an accept makes the choice `accepted` and costs nothing; an\nincident under way ends. A decline makes it `declined` and drops bond and chemistry one tier each.\n\n`travel_together`: an accept makes the choice `accepted` and starts a\n`traveling_together` background of two to three days now; she keeps\nreplying, and an incident under way ends. A decline makes it `declined`.\nNeither costs anything.\n\n`bathe_together`: an accept makes the choice `accepted` and starts a\n`showering_together` or `bathing_together` incident of 30 minutes now, one\nor the other at even odds, costing nothing; an incident under way ends. A\ndecline makes it `declined` and drops chemistry one tier.\n\nEither way she then answers in one proactive message, persisted like any\nreply and returned; if that generation fails the call still succeeds with\n`message: null`. `event` is `null` for every answer but an `ask_for_space`,\n`travel_together`, `bathe_together` or `sleep_together` accept.\n\n`409` when the choice is no longer pending: answered already (an ordinary\nmessage from the user counts, and the first writer wins), or lapsed 24\nhours after she asked. `404` when the choice is not in this session.",
+        "description": "One transaction answers the choice and pays for it; what an answer does\ndepends on the choice's `kind`. An accept makes the choice `accepted`, a\ndecline `declined`.\n\n`confess`: an accept moves the relationship status by where it stands:\n`none` or `ex` to `dating`, `partner` to `fwb`, `peer` to `situationship`;\nan incident under way ends, and it costs nothing. A decline keeps the\nstatus and drops chemistry one tier.\n\n`partner_up`: an accept makes the status `partner` and a decline `peer`;\nan accept ends an incident under way. Neither costs anything.\n\n`propose`: an accept makes the status `engaged` and costs nothing; an\nincident under way ends. A decline keeps the status and drops bond and\nchemistry one tier each.\n\n`break_up`: an accept makes the status `ex` and ends the cold war. A\ndecline keeps the status and the cold war, starting one now if none was\non. Neither costs anything.\n\n`sleep_together`: an accept starts a `having_sex_together` incident of one\nhour now, costing nothing; an incident under way ends. A decline drops\nchemistry one tier.\n\n`fall_asleep_together`: an accept starts an `asleep_together` incident of\none to four hours now, costing nothing; she keeps replying, and an incident\nunder way ends. A decline drops chemistry one tier.\n\n`travel_together`: an accept starts a `traveling_together` background of\ntwo to three days now; she keeps replying, and an incident under way ends.\nNeither answer costs anything.\n\n`bathe_together`: an accept starts a `showering_together` or\n`bathing_together` incident of 30 minutes now, one or the other at even\nodds, costing nothing; an incident under way ends. A decline drops\nchemistry one tier.\n\nEither way she then answers in one proactive message, persisted like any\nreply and returned; if that generation fails the call still succeeds with\n`message: null`. `event` is `null` for every answer but a\n`travel_together`, `bathe_together`, `sleep_together` or\n`fall_asleep_together` accept.\n\n`409` when the choice is no longer pending: answered already (an ordinary\nmessage from the user counts, and the first writer wins), or lapsed 24\nhours after she asked; when the status has moved to one the kind is not\nasked from (`confess`, `partner_up`, `propose`, `break_up`), with nothing\nwritten; and for the retired `ask_for_space`. `404` when the choice is not\nin this session.",
         "operationId": "respond_to_life_choice",
         "parameters": [
           {
@@ -6922,7 +6922,7 @@
           },
           "kind": {
             "type": "string",
-            "description": "`ask_for_space`, `sleep_together`, `propose`, `travel_together` or\n`bathe_together`."
+            "description": "`confess`, `partner_up`, `propose`, `break_up`, `sleep_together`,\n`fall_asleep_together`, `travel_together` or `bathe_together`; on\nolder rows, the retired `ask_for_space`."
           },
           "message_id": {
             "type": [
@@ -6956,7 +6956,7 @@
           },
           "kind": {
             "type": "string",
-            "description": "`ask_for_space`, `sleep_together`, `propose`, `travel_together` or\n`bathe_together`."
+            "description": "`confess`, `partner_up`, `propose`, `break_up`, `sleep_together`,\n`fall_asleep_together`, `travel_together` or `bathe_together`; on\nolder rows, the retired `ask_for_space`."
           },
           "resolved_at": {
             "type": [
@@ -7056,7 +7056,7 @@
         "properties": {
           "affinity": {
             "$ref": "#/components/schemas/AffinitySnapshot",
-            "description": "The relationship after the answer: dropped for an `ask_for_space`\naccept and for a decline of any kind but `travel_together`, as it\nstands otherwise."
+            "description": "The relationship after the answer: a decline of `confess`,\n`sleep_together`, `fall_asleep_together` or `bathe_together` drops\nchemistry one tier and a declined `propose` both lines;\n`relationship_status` and `cold_war` carry what a `confess`,\n`partner_up`, `propose` or `break_up` answer moved."
           },
           "event": {
             "oneOf": [
@@ -7065,7 +7065,7 @@
               },
               {
                 "$ref": "#/components/schemas/EventView",
-                "description": "The separation an `ask_for_space` accept started, the trip a\n`travel_together` accept started, the shower or bath a `bathe_together`\naccept started, or the `having_sex_together` a `sleep_together` accept\nstarted. `null` after any decline and for every `propose` answer."
+                "description": "The trip a `travel_together` accept started, the shower or bath a\n`bathe_together` accept started, the `having_sex_together` a\n`sleep_together` accept started, or the `asleep_together` a\n`fall_asleep_together` accept started. `null` after any decline and\nfor every `confess`, `partner_up`, `propose` or `break_up` answer."
               }
             ]
           },
@@ -7076,7 +7076,7 @@
               },
               {
                 "$ref": "#/components/schemas/GreetingDto",
-                "description": "What she says back: for `ask_for_space`, the goodbye after an accept\nand the hurt reply after a decline; for the other kinds, her answer to\nthe user's yes or no. `null` when the generation failed,\ncame back blank or a newer message landed first; the answer and its\ncosts stand either way."
+                "description": "What she says back: her answer to the user's yes or no. `null` when\nthe generation failed, came back blank or a newer message landed\nfirst; the answer and its costs stand either way."
               }
             ]
           },

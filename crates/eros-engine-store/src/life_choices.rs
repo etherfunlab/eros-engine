@@ -7,6 +7,8 @@ use chrono::{DateTime, Duration, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use eros_engine_core::relationship::StatusAsk;
+
 use crate::chat::ProactiveInsert;
 use crate::events::lock_instance;
 
@@ -17,12 +19,21 @@ const PENDING_HOURS: i32 = 24;
 /// What a choice asks of the user (spec 2026-10-30 §4.2): the stored `kind`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifeChoiceKind {
-    /// She asks for a separation; the only kind that carries a `tier_gap`.
+    /// She asked for a separation; retired (spec 2026-11-23-affinity-50
+    /// §7.5), read from stored rows. The only kind that carries a `tier_gap`.
     AskForSpace,
-    /// She asks to spend the night together.
+    /// She asks to spend the night together, for sex.
     SleepTogether,
+    /// She asks to fall asleep side by side, and no more.
+    FallAsleepTogether,
     /// She proposes.
     Propose,
+    /// She confesses her feelings and asks to be together.
+    Confess,
+    /// She offers to partner up.
+    PartnerUp,
+    /// She asks to break up.
+    BreakUp,
     /// She suggests going away together.
     TravelTogether,
     /// She asks the user to take a bath with her.
@@ -35,7 +46,11 @@ impl LifeChoiceKind {
         match self {
             Self::AskForSpace => "ask_for_space",
             Self::SleepTogether => "sleep_together",
+            Self::FallAsleepTogether => "fall_asleep_together",
             Self::Propose => "propose",
+            Self::Confess => "confess",
+            Self::PartnerUp => "partner_up",
+            Self::BreakUp => "break_up",
             Self::TravelTogether => "travel_together",
             Self::BatheTogether => "bathe_together",
         }
@@ -45,7 +60,11 @@ impl LifeChoiceKind {
         match s {
             "ask_for_space" => Some(Self::AskForSpace),
             "sleep_together" => Some(Self::SleepTogether),
+            "fall_asleep_together" => Some(Self::FallAsleepTogether),
             "propose" => Some(Self::Propose),
+            "confess" => Some(Self::Confess),
+            "partner_up" => Some(Self::PartnerUp),
+            "break_up" => Some(Self::BreakUp),
             "travel_together" => Some(Self::TravelTogether),
             "bathe_together" => Some(Self::BatheTogether),
             _ => None,
@@ -55,20 +74,41 @@ impl LifeChoiceKind {
     /// The wire `type` of the user's action that asks her the same thing the
     /// other way round (spec 2026-11-23-twelve-together-actions-and-propose-
     /// design.md §6, §7): `sex_together` for `sleep_together`, `propose` for
-    /// `propose`. `None` for every other kind.
+    /// `propose`, `fall_asleep_together` for `fall_asleep_together`. `None`
+    /// for every other kind.
     pub fn user_ask(self) -> Option<&'static str> {
         match self {
             Self::SleepTogether => Some("sex_together"),
+            Self::FallAsleepTogether => Some("fall_asleep_together"),
             Self::Propose => Some("propose"),
             _ => None,
         }
     }
 
-    /// `sleep_together`, `propose` or `bathe_together`.
+    /// The status ask an answer to this kind settles (spec
+    /// 2026-11-23-affinity-50 §7.2): `confess`, `partner_up`, `propose` and
+    /// `break_up`. `None` for the kinds that never move the status.
+    pub fn status_ask(self) -> Option<StatusAsk> {
+        match self {
+            Self::Confess => Some(StatusAsk::Confess),
+            Self::PartnerUp => Some(StatusAsk::PartnerUp),
+            Self::Propose => Some(StatusAsk::Propose),
+            Self::BreakUp => Some(StatusAsk::BreakUp),
+            _ => None,
+        }
+    }
+
+    /// The kinds put only to a romantically compatible pair:
+    /// `sleep_together`, `fall_asleep_together`, `propose`, `confess` or
+    /// `bathe_together`.
     pub fn is_romantic(self) -> bool {
         matches!(
             self,
-            Self::SleepTogether | Self::Propose | Self::BatheTogether
+            Self::SleepTogether
+                | Self::FallAsleepTogether
+                | Self::Propose
+                | Self::Confess
+                | Self::BatheTogether
         )
     }
 }
@@ -78,9 +118,10 @@ const COLUMNS: &str = "id, session_id, kind, status, tier_gap, asked_at, resolve
                        message_id, event_id";
 
 /// One choice. `message_id` is the message that asked it, `event_id` the event
-/// an accept placed (a separation, a trip, a shower or a bath, or sex); either
-/// is `None` once its row is gone, and `event_id` on every path but an accept
-/// that placed one (a `propose` accept places none).
+/// an accept placed (a separation, a trip, a shower or a bath, sex, or falling
+/// asleep together); either is `None` once its row is gone, and `event_id` on
+/// every path but an accept that placed one (an accept of a kind that moves
+/// the status places none).
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct LifeChoiceRecord {
     pub id: Uuid,
@@ -540,12 +581,38 @@ mod tests {
             LifeChoiceKind::Propose.user_ask(),
             wire(UserAction::Propose).as_str()
         );
+        assert_eq!(
+            LifeChoiceKind::FallAsleepTogether.user_ask(),
+            wire(UserAction::FallAsleepTogether).as_str()
+        );
         for k in [
             LifeChoiceKind::AskForSpace,
             LifeChoiceKind::TravelTogether,
             LifeChoiceKind::BatheTogether,
+            LifeChoiceKind::Confess,
+            LifeChoiceKind::PartnerUp,
+            LifeChoiceKind::BreakUp,
         ] {
             assert_eq!(k.user_ask(), None, "{k:?}");
+        }
+    }
+
+    /// Spec 2026-11-23-affinity-50 §7.2: the four kinds whose answer moves the
+    /// status, and no other.
+    #[test]
+    fn status_ask_maps_the_four_status_kinds() {
+        for (kind, ask) in [
+            (LifeChoiceKind::Confess, Some(StatusAsk::Confess)),
+            (LifeChoiceKind::PartnerUp, Some(StatusAsk::PartnerUp)),
+            (LifeChoiceKind::Propose, Some(StatusAsk::Propose)),
+            (LifeChoiceKind::BreakUp, Some(StatusAsk::BreakUp)),
+            (LifeChoiceKind::AskForSpace, None),
+            (LifeChoiceKind::SleepTogether, None),
+            (LifeChoiceKind::FallAsleepTogether, None),
+            (LifeChoiceKind::TravelTogether, None),
+            (LifeChoiceKind::BatheTogether, None),
+        ] {
+            assert_eq!(kind.status_ask(), ask, "{kind:?}");
         }
     }
 
@@ -557,6 +624,14 @@ mod tests {
             (LifeChoiceKind::Propose, "propose", true),
             (LifeChoiceKind::TravelTogether, "travel_together", false),
             (LifeChoiceKind::BatheTogether, "bathe_together", true),
+            (LifeChoiceKind::Confess, "confess", true),
+            (LifeChoiceKind::PartnerUp, "partner_up", false),
+            (LifeChoiceKind::BreakUp, "break_up", false),
+            (
+                LifeChoiceKind::FallAsleepTogether,
+                "fall_asleep_together",
+                true,
+            ),
         ] {
             assert_eq!(kind.as_str(), wire);
             assert_eq!(LifeChoiceKind::parse(wire), Some(kind));

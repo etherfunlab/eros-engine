@@ -107,8 +107,9 @@ pub(crate) enum Occasion {
     },
     /// What she says about a life choice (spec
     /// 2026-10-19-life-events-shopping-gatherings-and-ask-for-space-design.md
-    /// §3.2, §3.4; romantic kinds: spec
-    /// 2026-10-30-give-needs-romantic-choices-and-answer-receipts-design.md §4.4).
+    /// §3.2; romantic kinds: spec
+    /// 2026-10-30-give-needs-romantic-choices-and-answer-receipts-design.md §4.4;
+    /// status kinds: spec 2026-11-23-affinity-50-design.md §7.2, §7.3).
     LifeChoice(LifeChoiceCue),
 }
 
@@ -124,16 +125,13 @@ pub(crate) enum LifeChoiceCue {
         tier_gap: Option<i16>,
         anchor_seen: Option<DateTime<Utc>>,
     },
-    /// Ask-for-space accepted: they do not talk for `hours`.
-    Goodbye { hours: i64 },
-    /// Ask-for-space declined.
-    Hurt,
     /// `travel_together` accepted: they are away together for `hours`.
     TravelAgreed { hours: i64 },
     /// `bathe_together` accepted, and it turned out a shower; a bath is
     /// `Answered`.
     ShowerAgreed,
-    /// A romantic kind answered, or `travel_together` declined.
+    /// Any other answer: every kind but a retired `ask_for_space`, which is
+    /// never answered.
     Answered {
         kind: LifeChoiceKind,
         accepted: bool,
@@ -164,6 +162,22 @@ impl LifeChoiceCue {
                 kind: LifeChoiceKind::TravelTogether,
                 ..
             } => "（你们最近相处得很舒服，你很想和对方一起出去走走。你决定主动开口，提议一起去旅行，希望对方给你一个答复。）".into(),
+            Self::Ask {
+                kind: LifeChoiceKind::Confess,
+                ..
+            } => "（你发现自己喜欢上对方了。你决定郑重地向对方告白，问对方愿不愿意和你在一起，希望对方给你一个答复。）".into(),
+            Self::Ask {
+                kind: LifeChoiceKind::PartnerUp,
+                ..
+            } => "（你越来越觉得对方是值得托付的人。你决定郑重地提出和对方结成伙伴，希望对方给你一个答复。）".into(),
+            Self::Ask {
+                kind: LifeChoiceKind::BreakUp,
+                ..
+            } => "（这段冷战让你心灰意冷。你决定郑重地向对方提出分手，希望对方给你一个答复。）".into(),
+            Self::Ask {
+                kind: LifeChoiceKind::FallAsleepTogether,
+                ..
+            } => "（你们最近越来越亲近，你很想今晚和对方睡在一起，只是躺在一起睡觉。你决定主动开口，问对方愿不愿意，希望对方给你一个答复。）".into(),
             Self::TravelAgreed { hours } => format!(
                 "（对方答应了和你一起去旅行，你们接下来要一起玩 {}。）",
                 crate::prompt::span_text(chrono::Duration::hours(hours))
@@ -171,10 +185,6 @@ impl LifeChoiceCue {
             Self::ShowerAgreed => {
                 "（对方答应了和你一起洗澡，你们现在一起站在花洒下。）".into()
             }
-            Self::Goodbye { hours } => format!(
-                "（对方同意了你提出的分开请求，接下来 {hours} 小时你们不联系。你跟对方道别。）"
-            ),
-            Self::Hurt => "（对方不同意你提出的分开请求，你心里不好受。）".into(),
             Self::Answered {
                 kind: LifeChoiceKind::SleepTogether,
                 accepted: true,
@@ -208,9 +218,41 @@ impl LifeChoiceCue {
                 accepted: false,
             } => "（对方没有答应和你一起去旅行，你有点失落。）".into(),
             Self::Answered {
+                kind: LifeChoiceKind::Confess,
+                accepted: true,
+            } => "（对方答应了你的告白。）".into(),
+            Self::Answered {
+                kind: LifeChoiceKind::Confess,
+                accepted: false,
+            } => "（对方拒绝了你的告白，你心里很难受。）".into(),
+            Self::Answered {
+                kind: LifeChoiceKind::PartnerUp,
+                accepted: true,
+            } => "（对方答应了和你结成伙伴。）".into(),
+            Self::Answered {
+                kind: LifeChoiceKind::PartnerUp,
+                accepted: false,
+            } => "（对方没有答应和你结成伙伴，你有点失落。）".into(),
+            Self::Answered {
+                kind: LifeChoiceKind::BreakUp,
+                accepted: true,
+            } => "（对方同意了分手。）".into(),
+            Self::Answered {
+                kind: LifeChoiceKind::BreakUp,
+                accepted: false,
+            } => "（对方不同意分手，你们还在冷战。）".into(),
+            Self::Answered {
+                kind: LifeChoiceKind::FallAsleepTogether,
+                accepted: true,
+            } => "（对方答应了，你们现在一起躺下睡觉。）".into(),
+            Self::Answered {
+                kind: LifeChoiceKind::FallAsleepTogether,
+                accepted: false,
+            } => "（对方拒绝了你的邀请，你有点失落。）".into(),
+            Self::Answered {
                 kind: LifeChoiceKind::AskForSpace,
                 ..
-            } => unreachable!("ask_for_space answers are Goodbye / Hurt"),
+            } => unreachable!("a retired ask_for_space is never answered"),
         }
     }
 }
@@ -816,9 +858,7 @@ async fn store(
         // No key to dedupe on: the row yields only to a message that landed
         // at or after `since`.
         Occasion::LifeChoice(
-            LifeChoiceCue::Goodbye { .. }
-            | LifeChoiceCue::Hurt
-            | LifeChoiceCue::TravelAgreed { .. }
+            LifeChoiceCue::TravelAgreed { .. }
             | LifeChoiceCue::ShowerAgreed
             | LifeChoiceCue::Answered { .. },
         ) => {
@@ -1389,22 +1429,12 @@ mod tests {
             }),
             "（这段关系最近让你很累：心动还在，但交情和耐心都被磨薄了。你决定郑重地告诉对方：你想先分开一阵子，希望对方给你一个答复。）"
         );
-        assert_eq!(
-            cue(LifeChoiceCue::Goodbye { hours: 18 }),
-            "（对方同意了你提出的分开请求，接下来 18 小时你们不联系。你跟对方道别。）"
-        );
-        assert_eq!(
-            cue(LifeChoiceCue::Hurt),
-            "（对方不同意你提出的分开请求，你心里不好受。）"
-        );
         for c in [
             LifeChoiceCue::Ask {
                 kind: LifeChoiceKind::AskForSpace,
                 tier_gap: Some(2),
                 anchor_seen: None,
             },
-            LifeChoiceCue::Goodbye { hours: 12 },
-            LifeChoiceCue::Hurt,
             LifeChoiceCue::Ask {
                 kind: LifeChoiceKind::Propose,
                 tier_gap: None,
@@ -1468,6 +1498,50 @@ mod tests {
             cue(answered(LifeChoiceKind::Propose, false)),
             "（对方拒绝了你的求婚，你心里很难受。）"
         );
+    }
+
+    /// Spec 2026-11-23-affinity-50 §7.2, §7.3: the four new asks and their
+    /// answers state the fact only.
+    #[test]
+    fn the_status_life_choice_cues_are_exact() {
+        let cue = |c| Occasion::LifeChoice(c).cue(1, &PersonaTraits::default(), None);
+        let ask = |kind| LifeChoiceCue::Ask {
+            kind,
+            tier_gap: None,
+            anchor_seen: None,
+        };
+        let answered = |kind, accepted| LifeChoiceCue::Answered { kind, accepted };
+        for (kind, asked, yes, no) in [
+            (
+                LifeChoiceKind::Confess,
+                "（你发现自己喜欢上对方了。你决定郑重地向对方告白，问对方愿不愿意和你在一起，希望对方给你一个答复。）",
+                "（对方答应了你的告白。）",
+                "（对方拒绝了你的告白，你心里很难受。）",
+            ),
+            (
+                LifeChoiceKind::PartnerUp,
+                "（你越来越觉得对方是值得托付的人。你决定郑重地提出和对方结成伙伴，希望对方给你一个答复。）",
+                "（对方答应了和你结成伙伴。）",
+                "（对方没有答应和你结成伙伴，你有点失落。）",
+            ),
+            (
+                LifeChoiceKind::BreakUp,
+                "（这段冷战让你心灰意冷。你决定郑重地向对方提出分手，希望对方给你一个答复。）",
+                "（对方同意了分手。）",
+                "（对方不同意分手，你们还在冷战。）",
+            ),
+            (
+                LifeChoiceKind::FallAsleepTogether,
+                "（你们最近越来越亲近，你很想今晚和对方睡在一起，只是躺在一起睡觉。你决定主动开口，问对方愿不愿意，希望对方给你一个答复。）",
+                "（对方答应了，你们现在一起躺下睡觉。）",
+                "（对方拒绝了你的邀请，你有点失落。）",
+            ),
+        ] {
+            assert_eq!(cue(ask(kind)), asked, "{kind:?}");
+            assert_eq!(cue(answered(kind, true)), yes, "{kind:?}");
+            assert_eq!(cue(answered(kind, false)), no, "{kind:?}");
+            assert_eq!(Occasion::LifeChoice(ask(kind)).name(), "life_choice");
+        }
     }
 
     #[test]
