@@ -2922,6 +2922,8 @@ Service-to-service routes under `/svc/v1/*`. They are admitted by a shared secre
 | `USER_ERASE_SECRET` | `x-user-erase-secret` | [`POST users/{user_id}/erase`](#post-svcv1usersuser_iderase) |
 | `GENOME_WRITE_SECRET` | `x-genome-write-secret` | [`POST genomes`](#post-svcv1genomes), [`PUT genomes/{id}`](#put-svcv1genomesid) |
 
+`SUPER_SECRET` is accepted in place of any of these secrets, in the same header, and mounts every sub-tree by itself. `ADMIN_SECRET` does the same for every sub-tree except user erase ([Deploying](deploying.md#operational-notes)).
+
 All the streams are keyset-paged the same way; the pipeline behind them is in [Insights](insights.md#exports-and-deletions).
 
 ### `GET /svc/v1/insights/changes`
@@ -3123,7 +3125,7 @@ curl -X POST -H "x-user-erase-secret: $USER_ERASE_SECRET" \
 
 - **Idempotent.** A repeat finds nothing left, reports `0` everywhere, and moves `erased_at` forward.
 - **Call it before deleting the user's sessions or persona instances.** The per-relationship insight tables and the relationship scan's tables key on the instance alone and are reachable only while the instance row exists.
-- **Stop the user's traffic first.** A stage-1 extraction already in flight can write facts after the erase commits; call again to clean up. (A rebuild in flight cannot write a profile back.)
+- **Permanent, and it holds.** From the first call on, the engine derives nothing more about the user: no fact, profile, memory, insight or relationship scan is written, and the dreaming backfill skips the chat history the caller kept. A turn the user still sends is answered; its audit rows carry content until a repeat call blanks them. No route undoes an erasure ([Insights → Erasure](insights.md#erasure)).
 
 ### `POST /svc/v1/genomes`
 

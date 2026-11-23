@@ -291,7 +291,7 @@ What a deletion does not reach:
 
 ## Erasure
 
-`POST /svc/v1/users/{user_id}/erase`, mounted only under `USER_ERASE_SECRET`, removes everything in `engine.*` the engine derived about the user. It is separate from the export secrets so that erasure works on a deployment that never enables an export. One call runs in one transaction: the deletes, then the blanks, then the tombstone.
+`POST /svc/v1/users/{user_id}/erase`, mounted only under `USER_ERASE_SECRET`, removes everything in `engine.*` the engine derived about the user. It is separate from the export secrets so that erasure works on a deployment that never enables an export. One call runs in two transactions: the tombstone first, committed on its own, then the deletes, the blanks, and the move of `erased_at`.
 
 **Deleted** (rows removed):
 
@@ -315,13 +315,16 @@ What a deletion does not reach:
 | `companion_affinity` | `feeling_clause`, `feeling_clause_at`; the numbers are the relationship, not the person |
 | `companion_affinity_events` | `context` |
 
-**Written:** an upsert into `engine.user_erasures (user_id, erased_at)`, which feeds both deletion streams.
+**Written:** an upsert into `engine.user_erasures (user_id, erased_at)`, which feeds both deletion streams and marks the user as gone (below).
 
 The response is `{user_id, erased_at, deleted: {table: n}, blanked: {table: n}}`; every table above is listed, with 0 when it had nothing to do. `blanked` counts only rows that still carried content.
 
 - **Idempotent.** A repeat finds nothing left, reports 0 everywhere, and moves `erased_at` forward, which re-announces the erasure on the deletion streams for a mirror that missed the first.
 - **Order.** Call it **before** deleting the user's sessions or persona instances. The insight chains and the relationship scan's tables key on the instance alone, so they are reachable only while the instance row exists.
-- **Quiesce first.** A stage-1 extraction already in flight can write facts after the erase commits; stop the user's traffic before calling, and call again to clean up if one slipped through. A rebuild in flight cannot write a profile back: it writes under the state row's lock, which the erase takes first, and then finds the user gone.
+- **The erasure holds.** A user in `engine.user_erasures` is gone. From the first call on, the engine writes no fact, profile, memory, per-relationship insight or relationship scan for that user and creates no affinity row, and the dreaming backfill leaves their chat history unread. A deployment that keeps the chat history therefore does not get the erased data back, whenever the backfill or a sweeper next runs. A turn the user still sends is answered; its post-processing derives nothing and makes no model call. That turn's audit rows (`companion_decision_events`, the image and vision events) are written as for any turn, and a repeat call blanks them.
+- **Permanent.** No route undoes an erasure. Readmitting a user is an operator deleting their row from `engine.user_erasures`.
+- **Writes in flight.** A guarded write that holds its session lock finishes before the deletes, which then take what it left. A rebuild in flight cannot write a profile back: it writes under the state row's lock, which the erase takes first, and then finds the user gone. What stays open is one statement wide: a write whose check began just before the tombstone committed. Stopping the user's traffic first avoids it, and a repeat call removes such a row; nothing can write another.
+- **A failed call.** If a call fails after its first transaction, the tombstone is already in place: repeat the call to complete the erasure.
 - **Not touched.** Chat history (`chat_messages`, sessions, instances) belongs to the caller's own deletion flow. `relationship_scan_events` holds counts and ids only and is left as it is.
 
 A table added later that carries a user attribution joins the erase in the change that adds it.
