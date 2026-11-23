@@ -69,8 +69,8 @@ fn candidate_metadata(cand: &MemoryCandidate) -> Option<serde_json::Value> {
 /// dated by the pair's earliest chat row, else by this row, in `user_timezone`
 /// (UTC when none). The first live turn after a backfill opened the row is
 /// such a turn, so the meeting is dated in the user's timezone; the key keeps
-/// the first row written. `None` when nothing was counted; failures are
-/// logged, never raised.
+/// the first row written. `None` when nothing was counted, which includes a
+/// relationship whose owner is erased; failures are logged, never raised.
 pub(crate) async fn bump_relationship(
     state: &AppState,
     instance_id: Uuid,
@@ -98,7 +98,9 @@ pub(crate) async fn bump_relationship(
         .bump(instance_id, sent_at, user_timezone.map(|tz| tz.name()))
         .await
     {
-        Ok(bumped) => bumped,
+        Ok(Some(bumped)) => bumped,
+        // The owner is erased: nothing is counted and nothing journaled.
+        Ok(None) => return None,
         Err(e) => {
             tracing::warn!(%instance_id, "dreaming: turn count failed: {e}");
             return None;

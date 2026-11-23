@@ -49,11 +49,14 @@ const COLUMNS: &str =
 /// The rows a scan reads (live text and voice sessions, voice only while `$1`,
 /// user and assistant rows) that the backfill has not covered: after
 /// `backfilled_through_at`, up to `live_from_at`, where live scanning took
-/// over. A relationship without a state row has its whole history here.
+/// over. A relationship without a state row has its whole history here,
+/// unless its owner is erased (`engine.user_erasures`): an erasure deletes the
+/// state row, and the history it leaves behind is not read again.
 const BACKFILL_ROWS: &str = "FROM engine.chat_messages m \
      JOIN engine.chat_sessions s ON s.id = m.session_id \
      LEFT JOIN engine.relationship_scan_state st ON st.instance_id = s.instance_id \
      WHERE s.instance_id IS NOT NULL AND NOT s.archived \
+       AND NOT EXISTS (SELECT 1 FROM engine.user_erasures e WHERE e.user_id = s.user_id) \
        AND s.channel IN ('text', 'voice') AND ($1 OR s.channel = 'text') \
        AND m.role IN ('user', 'assistant') \
        AND (m.channel IS NULL OR m.channel = 'voice') \
@@ -89,13 +92,16 @@ impl ScanStateRepo<'_> {
     /// than `user_row_sent_at`, or one microsecond before that row when there
     /// is none; earlier history is the backfill's job. Restarts the idle
     /// window and, when given, replaces the stored timezone.
+    ///
+    /// `None` = the instance's owner is erased (`engine.user_erasures`): no
+    /// row is created, and one that outlived the erasure is not counted on.
     pub async fn bump(
         &self,
         instance_id: Uuid,
         user_row_sent_at: DateTime<Utc>,
         user_timezone: Option<&str>,
-    ) -> Result<Bumped, sqlx::Error> {
-        let (pending_turns, created): (i32, bool) = sqlx::query_as(
+    ) -> Result<Option<Bumped>, sqlx::Error> {
+        let bumped: Option<(i32, bool)> = sqlx::query_as(
             "INSERT INTO engine.relationship_scan_state \
                  (instance_id, scanned_through_at, live_from_at, pending_turns, last_turn_at, \
                   user_timezone) \
@@ -105,6 +111,9 @@ impl ScanStateRepo<'_> {
                         JOIN engine.chat_sessions s ON s.id = m.session_id \
                         WHERE s.instance_id = $1 AND m.sent_at < $2::timestamptz), \
                        $2::timestamptz - interval '1 microsecond') AS at) c \
+             WHERE NOT EXISTS (SELECT 1 FROM engine.user_erasures e \
+                               JOIN engine.persona_instances i ON i.owner_uid = e.user_id \
+                               WHERE i.id = $1) \
              ON CONFLICT (instance_id) DO UPDATE SET \
                 pending_turns = relationship_scan_state.pending_turns + 1, \
                 last_turn_at  = now(), \
@@ -115,12 +124,12 @@ impl ScanStateRepo<'_> {
         .bind(instance_id)
         .bind(user_row_sent_at)
         .bind(user_timezone)
-        .fetch_one(self.pool)
+        .fetch_optional(self.pool)
         .await?;
-        Ok(Bumped {
+        Ok(bumped.map(|(pending_turns, created)| Bumped {
             pending_turns,
             created,
-        })
+        }))
     }
 
     /// Take the scan for one relationship. `true` only for the caller that sets
@@ -376,8 +385,8 @@ impl ScanStateRepo<'_> {
     /// Open the scan state of a relationship that has history but has not
     /// chatted since the scanner shipped: the cursor sits at its newest row,
     /// so everything it said so far is the backfill's and nothing is pending.
-    /// `true` when this call created the row; `false` when one exists or the
-    /// relationship has no rows.
+    /// `true` when this call created the row; `false` when one exists, the
+    /// relationship has no rows, or its owner is erased.
     pub async fn ensure_for_backfill(&self, instance_id: Uuid) -> Result<bool, sqlx::Error> {
         let created: Option<Uuid> = sqlx::query_scalar(
             "INSERT INTO engine.relationship_scan_state \
@@ -385,6 +394,8 @@ impl ScanStateRepo<'_> {
              SELECT $1, max(m.sent_at), max(m.sent_at) FROM engine.chat_messages m \
              JOIN engine.chat_sessions s ON s.id = m.session_id \
              WHERE s.instance_id = $1 AND NOT s.archived \
+               AND NOT EXISTS (SELECT 1 FROM engine.user_erasures e \
+                               WHERE e.user_id = s.user_id) \
                AND s.channel IN ('text', 'voice') \
                AND m.role IN ('user', 'assistant') \
                AND (m.channel IS NULL OR m.channel = 'voice') \
@@ -509,6 +520,89 @@ mod tests {
         .unwrap();
     }
 
+    async fn erase_owner(pool: &PgPool, instance_id: Uuid) {
+        let owner: Uuid =
+            sqlx::query_scalar("SELECT owner_uid FROM engine.persona_instances WHERE id = $1")
+                .bind(instance_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        crate::testutil::seed_erasure(pool, owner).await;
+    }
+
+    /// An erased owner's relationship is not counted: no row is created, and a
+    /// row that outlived the tombstone (the erasure commits its tombstone
+    /// before its deletes) keeps its count. Another owner is untouched.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn bump_counts_nothing_for_an_erased_owner(pool: PgPool) {
+        let repo = ScanStateRepo { pool: &pool };
+
+        let (gone, _) = seed_relationship(&pool).await;
+        erase_owner(&pool, gone).await;
+        assert_eq!(repo.bump(gone, at(1_000), None).await.unwrap(), None);
+        assert!(repo.load(gone).await.unwrap().is_none(), "no row created");
+
+        let (lingering, _) = seed_relationship(&pool).await;
+        let first = repo.bump(lingering, at(1_000), Some("Asia/Taipei")).await;
+        assert_eq!(first.unwrap().map(|b| b.pending_turns), Some(1));
+        erase_owner(&pool, lingering).await;
+        assert_eq!(repo.bump(lingering, at(2_000), None).await.unwrap(), None);
+        let s = repo
+            .load(lingering)
+            .await
+            .unwrap()
+            .expect("row still there");
+        assert_eq!(s.pending_turns, 1, "the surviving row is not counted on");
+
+        let (kept, _) = seed_relationship(&pool).await;
+        assert_eq!(
+            repo.bump(kept, at(1_000), None).await.unwrap(),
+            Some(Bumped {
+                pending_turns: 1,
+                created: true
+            })
+        );
+    }
+
+    /// The history an erasure leaves behind is not the backfill's: the
+    /// relationship is not listed, its window is empty and no state is opened
+    /// for it. Another owner's history is still all there.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_backfill_does_not_see_an_erased_owners_history(pool: PgPool) {
+        let repo = ScanStateRepo { pool: &pool };
+        let (gone, gone_session) = seed_relationship(&pool).await;
+        let (kept, kept_session) = seed_relationship(&pool).await;
+        for t in 1..=4 {
+            seed_row(&pool, gone_session, "user", at(t * 1_000)).await;
+        }
+        for t in 1..=3 {
+            seed_row(&pool, kept_session, "user", at(t * 1_000)).await;
+        }
+        let listed = || async {
+            repo.instances_with_history(1, None, None, true)
+                .await
+                .unwrap()
+        };
+        assert_eq!(listed().await, vec![(gone, 4), (kept, 3)]);
+        assert_eq!(repo.backfill_window(gone, true).await.unwrap().len(), 4);
+
+        erase_owner(&pool, gone).await;
+        assert_eq!(listed().await, vec![(kept, 3)]);
+        assert_eq!(
+            repo.instances_with_history(1, None, Some(gone), true)
+                .await
+                .unwrap(),
+            vec![],
+            "not even when asked for by id"
+        );
+        assert!(repo.backfill_window(gone, true).await.unwrap().is_empty());
+        assert!(!repo.ensure_for_backfill(gone).await.unwrap());
+        assert!(repo.load(gone).await.unwrap().is_none());
+
+        assert!(repo.ensure_for_backfill(kept).await.unwrap());
+        assert_eq!(repo.backfill_window(kept, true).await.unwrap().len(), 3);
+    }
+
     /// Bump `n` times at `at(1_000)`, the cursor wherever the first bump put it.
     async fn bump_n(repo: &ScanStateRepo<'_>, instance_id: Uuid, n: i32) {
         for _ in 0..n {
@@ -528,10 +622,10 @@ mod tests {
         let first = repo.bump(instance, t1, None).await.unwrap();
         assert_eq!(
             first,
-            Bumped {
+            Some(Bumped {
                 pending_turns: 1,
                 created: true
-            }
+            })
         );
         let s = repo.load(instance).await.unwrap().expect("row exists");
         assert_eq!(s.scanned_through_at, t0);
@@ -548,10 +642,10 @@ mod tests {
         let second = repo.bump(instance, at(3_000), None).await.unwrap();
         assert_eq!(
             second,
-            Bumped {
+            Some(Bumped {
                 pending_turns: 2,
                 created: false
-            }
+            })
         );
         let s = repo.load(instance).await.unwrap().unwrap();
         assert_eq!(
