@@ -10,8 +10,8 @@
 //! - `propose`: an accept ends the incident under way and costs nothing; a
 //!   decline drops both lines one tier.
 //! - `travel_together`: an accept starts a trip; a decline changes nothing.
-//! - `bathe_together`: an accept starts a 30-minute bath together; a decline
-//!   drops chemistry one tier.
+//! - `bathe_together`: an accept starts a 30-minute shower or bath together,
+//!   one or the other at even odds; a decline drops chemistry one tier.
 //!
 //! The persona answers in one proactive message, and the cost is applied with
 //! the answer, not with the message (spec
@@ -116,8 +116,8 @@ pub struct LifeChoiceRespondResponse {
     /// stands otherwise.
     pub affinity: AffinitySnapshot,
     /// The separation an `ask_for_space` accept started, the trip a
-    /// `travel_together` accept started, the bath a `bathe_together` accept
-    /// started, or the `having_sex_together` a `sleep_together` accept
+    /// `travel_together` accept started, the shower or bath a `bathe_together`
+    /// accept started, or the `having_sex_together` a `sleep_together` accept
     /// started. `null` after any decline and for every `propose` answer.
     pub event: Option<EventView>,
 }
@@ -220,8 +220,8 @@ fn invalid_payload(message: String) -> AppError {
 /// Neither costs anything.
 ///
 /// `bathe_together`: an accept makes the choice `accepted` and starts a
-/// `bathing_together` incident of 30 minutes now, costing nothing; an
-/// incident under way ends. A decline makes it `declined` and drops
+/// `showering_together` or `bathing_together` incident of 30 minutes now, one
+/// or the other at even odds, costing nothing; an incident under way ends. A decline makes it `declined` and drops
 /// chemistry one tier.
 ///
 /// Either way she then answers in one proactive message, persisted like any
@@ -408,7 +408,7 @@ async fn resolve_choice(
         return Err(closed());
     };
     // The event an accept starts: a separation, whose length is the gap she
-    // asked at, a trip, a bath or sex. A running incident ends; a background
+    // asked at, a trip, a shower or a bath, or sex. A running incident ends; a background
     // keeps going.
     let placed = match (kind, req.response) {
         (LifeChoiceKind::AskForSpace, LifeChoiceAnswer::Accept) => Some((
@@ -422,10 +422,15 @@ async fn resolve_choice(
             EventKind::TravelingTogether,
             events::lasts(EventKind::TravelingTogether, rand::random()),
         )),
-        (LifeChoiceKind::BatheTogether, LifeChoiceAnswer::Accept) => Some((
-            EventKind::BathingTogether,
-            events::lasts(EventKind::BathingTogether, rand::random()),
-        )),
+        (LifeChoiceKind::BatheTogether, LifeChoiceAnswer::Accept) => {
+            // A shower or a bath, at even odds.
+            let washing = if rand::random::<bool>() {
+                EventKind::ShoweringTogether
+            } else {
+                EventKind::BathingTogether
+            };
+            Some((washing, events::lasts(washing, rand::random())))
+        }
         (LifeChoiceKind::SleepTogether, LifeChoiceAnswer::Accept) => Some((
             EventKind::HavingSexTogether,
             events::lasts(EventKind::HavingSexTogether, rand::random()),
@@ -510,6 +515,9 @@ async fn resolve_choice(
         (LifeChoiceKind::TravelTogether, Some((_, lasts))) => LifeChoiceCue::TravelAgreed {
             hours: lasts.num_hours(),
         },
+        (LifeChoiceKind::BatheTogether, Some((e, _))) if e.kind == EventKind::ShoweringTogether => {
+            LifeChoiceCue::ShowerAgreed
+        }
         (kind, _) => LifeChoiceCue::Answered {
             kind,
             accepted: req.response == LifeChoiceAnswer::Accept,
@@ -1305,43 +1313,55 @@ mod tests {
         assert_eq!(out.message.expect("a reply").content, "好吧。");
     }
 
-    /// An accepted bath places a 30-minute `bathing_together` and costs
-    /// nothing.
+    /// An accepted bath places a 30-minute shower or bath together, one or
+    /// the other at even odds, and costs nothing; her reply's cue names the
+    /// one placed.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn accepting_a_bath_places_bathing_together(pool: PgPool) {
+    async fn accepting_a_bath_places_a_shower_or_a_bath(pool: PgPool) {
         let mock = companion_mock(Some("来吧。")).await;
         let state = with_companion(test_state(pool.clone()), &mock.uri());
-        let s = scene(&pool).await;
-        let choice = s.ask_kind("bathe_together", recent(30)).await;
-        let axes = s.axes().await;
-        let now = recent(0);
+        let mut seen = std::collections::BTreeSet::new();
+        // Both kinds turn up within 64 accepts but for a 2^-63 chance.
+        for _ in 0..64 {
+            let s = scene(&pool).await;
+            let choice = s.ask_kind("bathe_together", recent(30)).await;
+            let axes = s.axes().await;
+            let now = recent(0);
 
-        let out = s
-            .respond(&state, choice, LifeChoiceAnswer::Accept, now)
-            .await
-            .unwrap();
+            let out = s
+                .respond(&state, choice, LifeChoiceAnswer::Accept, now)
+                .await
+                .unwrap();
 
-        assert_eq!(out.status, "accepted");
-        let event = serde_json::to_value(out.event.expect("the bath")).unwrap();
-        assert_eq!(event["kind"], json!("bathing_together"));
-        assert_eq!(event["offline"], json!(false));
-        let events = s.events().await;
-        assert_eq!(events.len(), 1);
-        let (id, kind, key, _, started_at, ends_at, _) = events[0].clone();
-        assert_eq!(kind, "bathing_together");
-        assert_eq!(key, format!("life_choice:{choice}:bathing_together"));
-        assert_eq!(started_at, now);
-        assert_eq!(ends_at - started_at, Duration::minutes(30));
-        assert_eq!(
-            s.row(choice).await,
-            ("accepted".into(), Some(now), Some(id))
-        );
-        assert_eq!(s.axes().await, axes);
-        assert!(s.drops().await.is_empty());
-        assert_eq!(
-            last_user_turn(&calls(&mock).await[0]),
-            json!("（对方答应了和你一起洗澡，你们现在一起泡在浴缸里。）")
-        );
+            assert_eq!(out.status, "accepted");
+            let event = serde_json::to_value(out.event.expect("the event")).unwrap();
+            assert_eq!(event["offline"], json!(false));
+            let events = s.events().await;
+            assert_eq!(events.len(), 1);
+            let (id, kind, key, _, started_at, ends_at, _) = events[0].clone();
+            assert_eq!(event["kind"], json!(kind));
+            assert_eq!(key, format!("life_choice:{choice}:{kind}"));
+            assert_eq!(started_at, now);
+            assert_eq!(ends_at - started_at, Duration::minutes(30));
+            assert_eq!(
+                s.row(choice).await,
+                ("accepted".into(), Some(now), Some(id))
+            );
+            assert_eq!(s.axes().await, axes);
+            assert!(s.drops().await.is_empty());
+            let cue = match kind.as_str() {
+                "bathing_together" => "（对方答应了和你一起洗澡，你们现在一起泡在浴缸里。）",
+                "showering_together" => "（对方答应了和你一起洗澡，你们现在一起站在花洒下。）",
+                other => panic!("a bath accept placed {other}"),
+            };
+            let c = calls(&mock).await;
+            assert_eq!(last_user_turn(c.last().unwrap()), json!(cue), "{kind}");
+            seen.insert(kind);
+            if seen.len() == 2 {
+                break;
+            }
+        }
+        assert_eq!(seen.len(), 2, "both a shower and a bath: {seen:?}");
     }
 
     /// An accepted invitation to bed places `having_sex_together`, as the

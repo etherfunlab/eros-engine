@@ -18,13 +18,16 @@
 When the user accepts one of her asks, the outcome matches what happens when
 the user asks her for the same thing and she accepts. An accepted
 `sex_together` places `having_sex_together`, so an accepted `sleep_together`
-places it too.
+places it too. Her ask to wash together can likewise turn out as either of the
+user's two asks: `shower_together` or `bath_together`.
 
 ## 2. How it stands
 
 - **`travel_together`** already does this. An accept places
   `traveling_together`, and every accepted one in production has its event. No
   change.
+- **`bathe_together`** places an event on every accept, but always
+  `bathing_together`, never a shower.
 - **`sleep_together`** does not. An accept ends the incident under way and
   places nothing. No accepted one in production has an event, so the
   virginity read and the `pregnancy_scare` follow-on never see her own
@@ -35,7 +38,9 @@ places it too.
 **Goals.** Accepting her `sleep_together` places `having_sex_together` (one
 hour) in the transaction that resolves the choice. The choice's `event_id`
 points to the new event, and both the JSON response and the `resolved` frame
-carry it as `event`.
+carry it as `event`. Accepting her `bathe_together` places
+`showering_together` or `bathing_together`, one or the other at even odds
+*(owner's ruling)*.
 
 **Non-goals.**
 - Backfilling the accepted `sleep_together` rows already stored. *(Owner's
@@ -82,9 +87,23 @@ a second source for "the pair has been to bed".
   `LifeChoiceRespondResponse.event` say that a `sleep_together` accept
   places an event.
 
+### 5.1 Her bath ask
+
+- **The pick.** A `bathe_together` accept places `showering_together` or
+  `bathing_together` at even odds. Both last 30 minutes, take the key
+  `life_choice:{choice_id}:{kind}`, and are returned as `event`.
+- **Her reply.** A bath keeps today's cue,
+  `（对方答应了和你一起洗澡，你们现在一起泡在浴缸里。）`. A shower gets
+  `（对方答应了和你一起洗澡，你们现在一起站在花洒下。）` *(engine's wording,
+  overridable)*.
+- **Nothing else changes.** The ask, its gates, its 7-day cooldown and the
+  decline's cost do not read the event kind. Both kinds already stay out of
+  the story director's events. Stored accepts keep their `bathing_together`.
+
 ## 6. Rollback
 
-There is no schema change. v2.8.1 already knows `having_sex_together`, and
+There is no schema change. v2.8.1 already knows `having_sex_together` and
+`showering_together`, and
 nothing there reads `event_id` by kind. Rolling back the image only stops new
 placements; the rows already placed stay valid.
 
@@ -97,15 +116,18 @@ One pull request at a time, each into `dev`:
      the response carries it;
    - a decline places nothing;
    - an accept during a bath together ends the bath and starts the event
-     (the test exists today; its expectation changes).
+     (the test exists today; its expectation changes);
+   - a bath accept places a shower or a bath, with the cue that matches it.
 2. **Docs**:
    - `api-reference` (en, zh): the `event` line of the life-choice answer;
    - `life-events-needs` (en, zh): her accepted `sleep_together` places
-     `having_sex_together`;
+     `having_sex_together`, and her accepted `bathe_together` places a
+     shower or a bath;
    - a migrating note for the release.
 
 A web-side issue says that the answer to `sleep_together` now carries
-`event`.
+`event`, and that the answer to `bathe_together` may carry
+`showering_together`.
 
 ## 8. Left to the builder
 
