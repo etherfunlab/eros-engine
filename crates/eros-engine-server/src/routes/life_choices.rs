@@ -221,8 +221,8 @@ fn invalid_payload(message: String) -> AppError {
 ///
 /// `bathe_together`: an accept makes the choice `accepted` and starts a
 /// `showering_together` or `bathing_together` incident of 30 minutes now, one
-/// or the other at even odds, costing nothing; an incident under way ends. A decline makes it `declined` and drops
-/// chemistry one tier.
+/// or the other at even odds, costing nothing; an incident under way ends. A
+/// decline makes it `declined` and drops chemistry one tier.
 ///
 /// Either way she then answers in one proactive message, persisted like any
 /// reply and returned; if that generation fails the call still succeeds with
@@ -408,8 +408,8 @@ async fn resolve_choice(
         return Err(closed());
     };
     // The event an accept starts: a separation, whose length is the gap she
-    // asked at, a trip, a shower or a bath, or sex. A running incident ends; a background
-    // keeps going.
+    // asked at, a trip, a shower or a bath, or sex. A running incident ends; a
+    // background keeps going.
     let placed = match (kind, req.response) {
         (LifeChoiceKind::AskForSpace, LifeChoiceAnswer::Accept) => Some((
             EventKind::TakingSpace,

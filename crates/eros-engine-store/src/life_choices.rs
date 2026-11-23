@@ -82,9 +82,10 @@ impl LifeChoiceKind {
 const COLUMNS: &str = "id, session_id, kind, status, tier_gap, asked_at, resolved_at, \
                        message_id, event_id";
 
-/// One choice. `message_id` is the message that asked it, `event_id` the
-/// separation or trip an accept wrote; either is `None` once its row is gone, and
-/// `event_id` on every path but accept.
+/// One choice. `message_id` is the message that asked it, `event_id` the event
+/// an accept placed (a separation, a trip, a shower or a bath, or sex); either
+/// is `None` once its row is gone, and `event_id` on every path but an accept
+/// that placed one (a `propose` accept places none).
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct LifeChoiceRecord {
     pub id: Uuid,
@@ -390,7 +391,7 @@ impl LifeChoiceRepo<'_> {
         .await
     }
 
-    /// Record the separation an accept wrote. See [`Self::set_event_in_tx`].
+    /// Record the event an accept placed. See [`Self::set_event_in_tx`].
     pub async fn set_event(&self, choice_id: Uuid, event_id: Uuid) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         Self::set_event_in_tx(&mut tx, choice_id, event_id).await?;
@@ -399,7 +400,7 @@ impl LifeChoiceRepo<'_> {
     }
 
     /// [`Self::set_event`] inside the caller's transaction, so the link
-    /// commits or rolls back together with the separation it names and the
+    /// commits or rolls back together with the event it names and the
     /// resolution it belongs to; nothing here commits.
     pub async fn set_event_in_tx(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
