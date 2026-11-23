@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use eros_engine_llm::model_config::ResolvedWorldStories;
 use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
+use eros_engine_store::life_choices::LifeChoiceKind;
 use eros_engine_store::story::{
     StoryAffinity, StoryEventInsert, StoryInsight, StoryInsightRow, StoryLifeChoice,
     StoryLifeEvent, StoryPersona, StoryRepo,
@@ -32,7 +33,7 @@ const STORY_RECENT_EVENTS: i64 = 12;
 const STORY_CHAT_TURNS_CAP: u8 = 60;
 /// Max life events fed per round; events under way are kept beyond it.
 const STORY_LIFE_EVENTS_CAP: i64 = 30;
-/// Max ask-for-space choices fed per round.
+/// Max status choices fed per round.
 const STORY_LIFE_CHOICES_CAP: i64 = 10;
 
 /// Fixed engine-owned rules (spec §3.3). The operator filter_prompt carries
@@ -53,7 +54,10 @@ backstory 是 canon，不可与之冲突。每轮输出更新后的完整 insigh
 也不得与 told / asked 的讲述原文矛盾；可以作为 events 与 insight 的素材展开\
 （例：刚分手之后更新 romance_history；分开请求之后更新 user_relationship）。\
 current_background 是角色此刻所处的状态，会按 when 结束：digest 与 insight 不得与它矛盾；\
-写到它时写成有终点的事（这几天在外地出差），不要写成长期状态。";
+写到它时写成有终点的事（这几天在外地出差），不要写成长期状态。\
+9) affinity.relationship_status 是引擎记录的关系状态（none=未确定，dating=交往中，partner=伙伴，\
+peer=同事，fwb=伙伴也是情人，situationship=同事私下交往，engaged=已订婚，ex=前任），\
+cold_war=true 表示两人正在冷战：user_relationship 不得与之矛盾。";
 
 /// Persona-side life-base schema: flat profile-style fields (city, hometown,
 /// occupation, interests, ...) written to describe the persona, plus the four
@@ -135,25 +139,61 @@ fn life_event_value(e: &StoryLifeEvent, now: chrono::DateTime<chrono::Utc>) -> s
     v
 }
 
-/// One `life_choices` entry (spec §3.3); `None` for a status the engine does
-/// not write.
+/// One `life_choices` entry (spec §3.3): the label and outcome each kind the
+/// director reads has for the user's answer; `None` for a kind or a status the
+/// director does not read.
 fn life_choice_value(
     c: &StoryLifeChoice,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<serde_json::Value> {
+    // (label, accepted, declined, ignored)
+    let (label, accepted, declined, ignored): (&str, String, &str, &str) =
+        match LifeChoiceKind::parse(&c.choice.kind)? {
+            LifeChoiceKind::AskForSpace => (
+                "角色提出想先分开一阵子",
+                match c.separation_hours {
+                    Some(n) => format!("用户同意了，两人说好暂时分开 {n} 小时"),
+                    None => "用户同意了，两人说好暂时分开".to_string(),
+                },
+                "用户不同意分开",
+                "用户没有回应这个请求，接着说了别的，两人为此闹得不愉快",
+            ),
+            LifeChoiceKind::Confess => (
+                "角色向用户告白",
+                "用户答应了告白".to_string(),
+                "用户拒绝了告白",
+                "用户没有正面回应告白，接着说了别的",
+            ),
+            LifeChoiceKind::PartnerUp => (
+                "角色提出和用户结成伙伴",
+                "用户答应了，两人成了伙伴".to_string(),
+                "用户没有答应，两人只是同事",
+                "用户没有正面回应，接着说了别的",
+            ),
+            LifeChoiceKind::Propose => (
+                "角色向用户求婚",
+                "用户答应了，两人订婚了".to_string(),
+                "用户拒绝了求婚",
+                "用户没有正面回应求婚，接着说了别的",
+            ),
+            LifeChoiceKind::BreakUp => (
+                "角色提出分手",
+                "用户同意了，两人分手了".to_string(),
+                "用户不同意分手，两人还在冷战",
+                "用户没有正面回应，接着说了别的",
+            ),
+            _ => return None,
+        };
     let outcome = match c.choice.status.as_str() {
         "pending" if c.choice.is_pending(now) => "还在等用户答复".to_string(),
         "pending" => "用户一直没有答复，这件事不了了之".to_string(),
-        "accepted" => match c.separation_hours {
-            Some(n) => format!("用户同意了，两人说好暂时分开 {n} 小时"),
-            None => "用户同意了，两人说好暂时分开".to_string(),
-        },
-        "declined" => "用户不同意分开".to_string(),
-        "ignored" => "用户没有回应这个请求，接着说了别的，两人为此闹得不愉快".to_string(),
+        "accepted" => accepted,
+        "declined" => declined.to_string(),
+        "ignored" => ignored.to_string(),
         _ => return None,
     };
     let mut v = serde_json::json!({
-        "label": "角色提出想先分开一阵子",
+        "label": label,
         "when": format!("{}前", crate::prompt::span_text(now - c.choice.asked_at)),
         "outcome": outcome,
     });
@@ -191,6 +231,8 @@ fn story_user_payload(
             "bond": a.bond, "chemistry": a.chemistry,
             "bond_label": BondLabel::from_score(a.bond).as_key(),
             "chemistry_label": ChemistryLabel::from_score(a.chemistry).as_key(),
+            "relationship_status": a.relationship_status,
+            "cold_war": a.cold_war,
         })
     });
     let chat: Vec<serde_json::Value> = chat_pairs
@@ -768,6 +810,106 @@ mod tests {
         );
         assert!(d["life_choices"][4].get("asked").is_none());
         assert_eq!(d["life_choices"][0]["label"], "角色提出想先分开一阵子");
+    }
+
+    /// One life choice of `kind` asked `now - 2h` ago.
+    fn choice_of(kind: &str, status: &str) -> StoryLifeChoice {
+        let mut c = choice(status, fixed_now() - chrono::Duration::hours(2), None, None);
+        c.choice.kind = kind.into();
+        c
+    }
+
+    #[test]
+    fn status_choices_read_as_their_own_kind() {
+        // (kind, label, accepted, declined, ignored)
+        let table = [
+            (
+                "confess",
+                "角色向用户告白",
+                "用户答应了告白",
+                "用户拒绝了告白",
+                "用户没有正面回应告白，接着说了别的",
+            ),
+            (
+                "partner_up",
+                "角色提出和用户结成伙伴",
+                "用户答应了，两人成了伙伴",
+                "用户没有答应，两人只是同事",
+                "用户没有正面回应，接着说了别的",
+            ),
+            (
+                "propose",
+                "角色向用户求婚",
+                "用户答应了，两人订婚了",
+                "用户拒绝了求婚",
+                "用户没有正面回应求婚，接着说了别的",
+            ),
+            (
+                "break_up",
+                "角色提出分手",
+                "用户同意了，两人分手了",
+                "用户不同意分手，两人还在冷战",
+                "用户没有正面回应，接着说了别的",
+            ),
+        ];
+        for (kind, label, accepted, declined, ignored) in table {
+            for (status, want) in [
+                ("accepted", accepted),
+                ("declined", declined),
+                ("ignored", ignored),
+                ("pending", "还在等用户答复"),
+            ] {
+                let v = life_choice_value(&choice_of(kind, status), fixed_now()).unwrap();
+                assert_eq!(v["label"], label, "{kind} label");
+                assert_eq!(v["outcome"], want, "{kind} {status}");
+            }
+            let mut expired = choice_of(kind, "pending");
+            expired.choice.asked_at = fixed_now() - chrono::Duration::hours(30);
+            let v = life_choice_value(&expired, fixed_now()).unwrap();
+            assert_eq!(
+                v["outcome"], "用户一直没有答复，这件事不了了之",
+                "{kind} expired"
+            );
+        }
+    }
+
+    #[test]
+    fn a_kind_the_director_does_not_read_gets_no_entry() {
+        assert!(life_choice_value(&choice_of("sleep_together", "declined"), fixed_now()).is_none());
+    }
+
+    #[test]
+    fn payload_affinity_carries_the_status_and_cold_war() {
+        let affinity = |status: &str, cold_war: bool| StoryAffinity {
+            warmth: 0.5,
+            trust: 0.5,
+            intrigue: 0.5,
+            intimacy: 0.5,
+            patience: 0.5,
+            tension: 0.5,
+            bond: 0.5,
+            chemistry: 0.5,
+            relationship_status: status.into(),
+            cold_war,
+        };
+        let d = data(&payload_with(&StoryEvidence {
+            affinity: Some(affinity("dating", true)),
+            ..Default::default()
+        }));
+        assert_eq!(d["affinity_reference"]["relationship_status"], "dating");
+        assert_eq!(d["affinity_reference"]["cold_war"], true);
+        let d = data(&payload_with(&StoryEvidence {
+            affinity: Some(affinity("none", false)),
+            ..Default::default()
+        }));
+        assert_eq!(d["affinity_reference"]["relationship_status"], "none");
+        assert_eq!(d["affinity_reference"]["cold_war"], false);
+    }
+
+    #[test]
+    fn rule_9_ties_user_relationship_to_the_status() {
+        let p = payload_with(&StoryEvidence::default());
+        assert!(p.contains("user_relationship 不得与之矛盾"), "rule 9");
     }
 
     fn proactive(content: &str, occasion: &str) -> eros_engine_store::chat::ProactiveInsert {
