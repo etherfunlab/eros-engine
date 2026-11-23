@@ -3029,13 +3029,20 @@ fn build_pde_ctx(
         eros_engine_core::affinity::PatienceBand::Low => "低",
     };
     // The settled status and the cold-war flag, so accept/refuse decisions
-    // agree with the relationship. The composed relation is not shown: it
-    // follows from the two lines the judge already reads as buckets.
-    let relationship_status = a.relationship.status.zh();
-    let cold_war = if a.relationship.cold_war() {
-        "是"
-    } else {
-        "否"
+    // agree with the relationship (spec 2026-11-23-affinity-50 §9.2); the
+    // composed relation is not shown. Only when there is something to say:
+    // at `none` the judge reads the relationship from the chat, so the line
+    // names a cold war alone, and is absent without one.
+    let relationship_line = match (a.relationship.status, a.relationship.cold_war()) {
+        (eros_engine_core::relationship::RelationshipStatus::None, false) => String::new(),
+        (eros_engine_core::relationship::RelationshipStatus::None, true) => {
+            "[关系] 冷战中=是\n".to_string()
+        }
+        (status, cold_war) => format!(
+            "[关系] 状态={}；冷战中={}\n",
+            status.zh(),
+            if cold_war { "是" } else { "否" }
+        ),
     };
     // Always emit the image-capability line — the negative is a signal too, so
     // the judge gets a clear "no images this turn" rather than a missing line.
@@ -3161,7 +3168,7 @@ fn build_pde_ctx(
         "{persona_block}{items_block}[最近对话]\n{transcript}\n\n\
          [亲密度] 当前档位=第 {rung} 档\n\
          [耐心] 当前档位={patience_band}\n\
-         [关系] 状态={relationship_status}；冷战中={cold_war}\n\
+         {relationship_line}\
          [信号] message_count={} hours_since_last_message={:.1} ghost_streak={} hours_since_last_ghost={}\n\
          [图片能力] 本轮可发图={image_flag}\n\
          [近期图片] 最近{INPUT_FILTER_CONTEXT_TURNS}条消息内已发图={img_count} 张；上一条 AI 消息是图片={last_img}（以本行计数为准，对话记录里的图片标记仅供参考）\n\
@@ -20384,7 +20391,58 @@ data: [DONE]\n\n";
 
         input.affinity.relationship = Default::default();
         let fresh = ctx(&input);
-        assert!(fresh.contains("[关系] 状态=未确定；冷战中=否\n"), "{fresh}");
+        assert!(!fresh.contains("[关系]"), "{fresh}");
+    }
+
+    fn pde_ctx_at(
+        status: eros_engine_core::relationship::RelationshipStatus,
+        cold_war: bool,
+    ) -> String {
+        let mut input = fixture_decision_input();
+        input.affinity.relationship.status = status;
+        input.affinity.relationship.cold_war_since = cold_war.then(chrono::Utc::now);
+        build_pde_ctx(
+            &JudgeTranscript::default(),
+            &input,
+            true,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+    }
+
+    /// A status other than `none` is named with its cold-war flag.
+    #[test]
+    fn pde_ctx_names_a_status_with_its_cold_war_flag() {
+        use eros_engine_core::relationship::RelationshipStatus;
+        let ctx = pde_ctx_at(RelationshipStatus::Engaged, false);
+        assert!(ctx.contains("[关系] 状态=已订婚；冷战中=否\n"), "{ctx}");
+        let ctx = pde_ctx_at(RelationshipStatus::Dating, true);
+        assert!(ctx.contains("[关系] 状态=伴侣；冷战中=是\n"), "{ctx}");
+    }
+
+    /// At `none` a cold war is the whole line: no status is named.
+    #[test]
+    fn pde_ctx_states_a_cold_war_without_a_status() {
+        use eros_engine_core::relationship::RelationshipStatus;
+        let ctx = pde_ctx_at(RelationshipStatus::None, true);
+        assert!(ctx.contains("[耐心] 当前档位="), "{ctx}");
+        assert!(ctx.contains("\n[关系] 冷战中=是\n[信号] "), "{ctx}");
+        assert!(!ctx.contains("状态="), "{ctx}");
+    }
+
+    /// At `none` without a cold war there is no line: the patience bucket
+    /// is followed directly by the signals.
+    #[test]
+    fn pde_ctx_has_no_relationship_line_at_none_without_a_cold_war() {
+        use eros_engine_core::relationship::RelationshipStatus;
+        let ctx = pde_ctx_at(RelationshipStatus::None, false);
+        assert!(!ctx.contains("[关系]"), "{ctx}");
+        let patience_at = ctx.find("[耐心]").expect("patience line present");
+        let next_line = ctx[patience_at..].split_once('\n').unwrap().1;
+        assert!(next_line.starts_with("[信号] "), "{ctx}");
     }
 
     #[test]

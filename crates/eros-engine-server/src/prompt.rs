@@ -474,7 +474,7 @@ fn status_noun(status: RelationshipStatus, persona: &CompanionPersona) -> &'stat
         RelationshipStatus::Engaged => match gender {
             Some("female") => "未婚妻",
             Some("male") => "未婚夫",
-            _ => "未婚伴侣",
+            _ => "订婚对象",
         },
         other => other.zh(),
     }
@@ -4534,7 +4534,7 @@ mod tests {
         };
         assert!(g("female").ends_with("你是用户的未婚妻"));
         assert!(g("male").ends_with("你是用户的未婚夫"));
-        assert!(g("non-binary").ends_with("你是用户的未婚伴侣"));
+        assert!(g("non-binary").ends_with("你是用户的订婚对象"));
     }
 
     #[test]

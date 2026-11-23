@@ -73,7 +73,7 @@ impl RelationshipStatus {
             Self::Peer => "同事",
             Self::Fwb => "伙伴，也是情人",
             Self::Situationship => "同事，私下在交往",
-            Self::Engaged => "未婚",
+            Self::Engaged => "已订婚",
             Self::Ex => "前任",
         }
     }
