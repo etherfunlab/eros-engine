@@ -27488,6 +27488,19 @@ data: [DONE]\n\n"
             .unwrap();
         }
 
+        /// The parent's relationship status, written directly.
+        async fn set_status(&self, status: &str) {
+            sqlx::query(
+                "UPDATE engine.companion_affinity SET relationship_status = $2 \
+                  WHERE session_id = $1",
+            )
+            .bind(self.parent)
+            .bind(status)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        }
+
         /// The affinity event of the turn whose user row is `umid`, once
         /// post-process wrote it: the session its affinity row belongs to,
         /// its type, `context` and `effective_deltas`.
@@ -28032,6 +28045,7 @@ data: [DONE]\n\n"
         )
         .await;
         s.set_lines(0.5, 0.5).await;
+        s.set_status("dating").await;
         let warm = r#"{"warmth":3,"trust":{"grade":0,"direction":"up"},"intimacy":{"grade":0,"direction":"up"},"intrigue":{"grade":0,"direction":"up"},"tension":{"grade":0,"direction":"up"},"patience":3,"reason":"很好"}"#;
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("aff/judge"))
@@ -28092,6 +28106,7 @@ data: [DONE]\n\n"
         )
         .await;
         s.set_lines(0.5, 0.5).await;
+        s.set_status("partner").await;
         let warm = r#"{"warmth":3,"trust":{"grade":0,"direction":"up"},"intimacy":{"grade":0,"direction":"up"},"intrigue":{"grade":0,"direction":"up"},"tension":{"grade":0,"direction":"up"},"patience":3,"reason":"很好"}"#;
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("aff/judge"))

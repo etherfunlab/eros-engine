@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The life choices on the pipeline side: when a judged turn starts or ends a
-//! cold war, or makes her ask to sleep together, to marry, to bathe or to go
+//! cold war, or makes her ask to break up, to confess, to become partners,
+//! to marry, to sleep together or fall asleep together, to bathe or to go
 //! away together; her generated words; and the growth scale of a cold war.
 //! The answer, its costs and the ignore path live in the resolution route and
 //! the turn entry.
 //!
 //! Spec: docs/superpowers/specs/2026-11-23-affinity-50-design.md §6.3 (the
-//! cold war and its growth scale), §7.4 (her cold-war message), §7.5
-//! (`ask_for_space`, retired); the romantic kinds:
+//! cold war and its growth scale), §7.1–§7.3 (her status asks and her sleep
+//! ask), §7.4 (her cold-war message), §7.5 (`ask_for_space`, retired); the
+//! romantic kinds:
 //! docs/superpowers/specs/2026-10-30-give-needs-romantic-choices-and-answer-receipts-design.md
 //! §4.3 (triggers), §4.4 (the ask).
 
@@ -15,9 +17,13 @@ use chrono::{DateTime, Duration, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use eros_engine_core::affinity::AffinityLine;
 use eros_engine_core::events::EventKind;
 use eros_engine_core::persona::CompanionPersona;
-use eros_engine_core::relationship::{cold_war_ends, cold_war_starts};
+use eros_engine_core::relationship::{
+    cold_war_ends, cold_war_starts, leading_line, sleep_ask_is_sex, wants_break_up,
+    RelationshipStatus, StatusAsk,
+};
 use eros_engine_core::scope::romance_compatible;
 use eros_engine_store::activity::ActivityRepo;
 use eros_engine_store::affinity::{AffinityRepo, JudgedEndpoints};
@@ -39,12 +45,22 @@ const COLD_WAR_WINDOW: i64 = 7;
 /// Positive line growth while a cold war lasts.
 const SLOWED_GROWTH: f64 = 0.5;
 /// A judged turn counts toward a romantic choice when its warmth and its
-/// patience are both above this. A rule threshold of the engine, not a judge
-/// band (spec 2026-10-30 §4.3).
+/// patience are both above this; `confess` reads its warmth alone and
+/// `partner_up` its patience alone. A rule threshold of the engine, not a
+/// judge band (spec 2026-10-30 §4.3, spec 2026-11-23-affinity-50 §7.2).
 const WARM: f64 = 0.7;
-/// `sleep_together` and `travel_together`: the newest judged turns that must
-/// all be warm.
+/// Her sleep ask, `travel_together`, `confess` and `partner_up`: the newest
+/// judged turns that must all clear their threshold.
 const WARM_STREAK: usize = 3;
+/// `confess`: the chemistry tier it needs.
+const CONFESS_MIN_CHEM_TIER: u8 = 3;
+/// `partner_up`: the bond tier it needs.
+const PARTNER_MIN_BOND_TIER: u8 = 3;
+/// `confess` and `partner_up`: days she waits after the session's latest
+/// status change, and after the kind's last answer of any sort.
+const STATUS_COOLDOWN_DAYS: i64 = 14;
+/// `propose`: days after an ignore before she asks again.
+const PROPOSE_COOLDOWN_DAYS: i64 = 14;
 /// `travel_together`: the bond tier it needs.
 const TRAVEL_MIN_BOND_TIER: u8 = 3;
 /// `travel_together`: days after an accept or an ignore before she asks again.
@@ -156,9 +172,10 @@ async fn separated(
 }
 
 /// After a judged turn's affinity committed: start or end a cold war, then
-/// put a warm choice to the user when the relationship calls for one. Every
-/// failure is logged and swallowed; the turn is already answered and its
-/// affinity written.
+/// put a choice to the user when the relationship calls for one: a break-up
+/// in a cold war, a confession or a partnership, then the warm asks (spec
+/// 2026-11-23-affinity-50 §7.2). Every failure is logged and swallowed; the
+/// turn is already answered and its affinity written.
 pub(crate) async fn maybe_ask(
     state: &AppState,
     session_id: Uuid,
@@ -171,6 +188,15 @@ pub(crate) async fn maybe_ask(
     }
     // An ask written by one check is pending, which closes the runway for
     // the next.
+    if let Err(e) = try_break_up(state, session_id, user_id, instance_id, persona).await {
+        tracing::warn!(%session_id, "break-up ask failed: {e}");
+    }
+    if let Err(e) = try_confess(state, session_id, user_id, instance_id, persona).await {
+        tracing::warn!(%session_id, "confession failed: {e}");
+    }
+    if let Err(e) = try_partner_up(state, session_id, user_id, instance_id, persona).await {
+        tracing::warn!(%session_id, "partnership ask failed: {e}");
+    }
     if let Err(e) = try_romance(state, session_id, user_id, instance_id, persona).await {
         tracing::warn!(%session_id, "romantic choice failed: {e}");
     }
@@ -297,9 +323,217 @@ async fn try_cold_war(
     Ok(())
 }
 
-/// The romantic trigger (spec 2026-10-30 §4.3), then her ask (§4.4) through
-/// [`speak`]. Only a pair the caller's recorded scopes mark as romantic
-/// qualifies; the ask itself is generated with the engine's default scopes.
+/// Her break-up ask (spec 2026-11-23-affinity-50 §7.2): a breakable status
+/// in a cold war, and the newest three judged turns since the streak anchor
+/// all at the judge's lowest patience level. The turn that starts a cold war
+/// writes a `relationship` event, which moves the anchor, so it never asks
+/// too: three more lowest turns must follow.
+async fn try_break_up(
+    state: &AppState,
+    session_id: Uuid,
+    user_id: Uuid,
+    instance_id: Uuid,
+    persona: &CompanionPersona,
+) -> Result<(), AppError> {
+    let now = Utc::now();
+    let affinity_repo = AffinityRepo { pool: &state.pool };
+    let Some(affinity) = affinity_repo.load(session_id).await? else {
+        return Ok(());
+    };
+    let relationship = affinity.relationship;
+    if !relationship.cold_war() || !relationship.status.is_breakable() {
+        return Ok(());
+    }
+    let since = (LifeChoiceRepo { pool: &state.pool })
+        .streak_anchor(session_id)
+        .await?;
+    let levels: Vec<i16> = affinity_repo
+        .last_judged_endpoints(session_id, since, COLD_WAR_WINDOW)
+        .await?
+        .iter()
+        .map(|j| j.patience_grade)
+        .collect();
+    if !wants_break_up(&levels) || !runway_clear(state, session_id, instance_id, now).await? {
+        return Ok(());
+    }
+
+    let cue = LifeChoiceCue::Ask {
+        kind: LifeChoiceKind::BreakUp,
+        tier_gap: None,
+        anchor_seen: since,
+    };
+    if speak(
+        state,
+        session_id,
+        user_id,
+        instance_id,
+        persona,
+        now,
+        Occasion::LifeChoice(cue),
+    )
+    .await?
+    {
+        tracing::info!(%session_id, "she asked to break up");
+    }
+    Ok(())
+}
+
+/// Her confession (spec 2026-11-23-affinity-50 §7.2): from a status it can
+/// be asked from, a compatible pair whose chemistry leads at tier
+/// [`CONFESS_MIN_CHEM_TIER`] or more, the newest [`WARM_STREAK`] judged
+/// turns all with warmth above [`WARM`], and [`status_ask_waits`] over.
+async fn try_confess(
+    state: &AppState,
+    session_id: Uuid,
+    user_id: Uuid,
+    instance_id: Uuid,
+    persona: &CompanionPersona,
+) -> Result<(), AppError> {
+    let now = Utc::now();
+    let affinity_repo = AffinityRepo { pool: &state.pool };
+    let Some(mut affinity) = affinity_repo.load(session_id).await? else {
+        return Ok(());
+    };
+    let relationship = affinity.relationship;
+    if relationship.cold_war() || !StatusAsk::Confess.asked_from(relationship.status) {
+        return Ok(());
+    }
+    affinity.apply_time_decay();
+    affinity.refresh_endpoints(&state.config.affinity_tuning);
+    if leading_line(&affinity) != AffinityLine::Chemistry
+        || affinity.chem_tier() < CONFESS_MIN_CHEM_TIER
+    {
+        return Ok(());
+    }
+
+    match (ChatRepo { pool: &state.pool })
+        .latest_scopes(session_id)
+        .await?
+    {
+        Some((_, scope)) if romance_compatible(scope) => {}
+        _ => return Ok(()),
+    }
+
+    let since = (LifeChoiceRepo { pool: &state.pool })
+        .streak_anchor(session_id)
+        .await?;
+    let judged = affinity_repo
+        .last_judged_endpoints(session_id, since, WARM_STREAK as i64)
+        .await?;
+    if !newest_streak(&judged, |e| e.warmth > WARM)
+        || status_ask_waits(state, session_id, LifeChoiceKind::Confess, now).await?
+        || !runway_clear(state, session_id, instance_id, now).await?
+    {
+        return Ok(());
+    }
+
+    let cue = LifeChoiceCue::Ask {
+        kind: LifeChoiceKind::Confess,
+        tier_gap: None,
+        anchor_seen: since,
+    };
+    if speak(
+        state,
+        session_id,
+        user_id,
+        instance_id,
+        persona,
+        now,
+        Occasion::LifeChoice(cue),
+    )
+    .await?
+    {
+        tracing::info!(%session_id, "she confessed");
+    }
+    Ok(())
+}
+
+/// Her offer of a partnership (spec 2026-11-23-affinity-50 §7.2): from a
+/// status it can be asked from, bond leading at tier
+/// [`PARTNER_MIN_BOND_TIER`] or more, the newest [`WARM_STREAK`] judged turns
+/// all with patience above [`WARM`], and [`status_ask_waits`] over. The
+/// pair's scopes are not read.
+async fn try_partner_up(
+    state: &AppState,
+    session_id: Uuid,
+    user_id: Uuid,
+    instance_id: Uuid,
+    persona: &CompanionPersona,
+) -> Result<(), AppError> {
+    let now = Utc::now();
+    let affinity_repo = AffinityRepo { pool: &state.pool };
+    let Some(mut affinity) = affinity_repo.load(session_id).await? else {
+        return Ok(());
+    };
+    let relationship = affinity.relationship;
+    if relationship.cold_war() || !StatusAsk::PartnerUp.asked_from(relationship.status) {
+        return Ok(());
+    }
+    affinity.apply_time_decay();
+    affinity.refresh_endpoints(&state.config.affinity_tuning);
+    if leading_line(&affinity) != AffinityLine::Bond || affinity.bond_tier() < PARTNER_MIN_BOND_TIER
+    {
+        return Ok(());
+    }
+
+    let since = (LifeChoiceRepo { pool: &state.pool })
+        .streak_anchor(session_id)
+        .await?;
+    let judged = affinity_repo
+        .last_judged_endpoints(session_id, since, WARM_STREAK as i64)
+        .await?;
+    if !newest_streak(&judged, |e| e.patience > WARM)
+        || status_ask_waits(state, session_id, LifeChoiceKind::PartnerUp, now).await?
+        || !runway_clear(state, session_id, instance_id, now).await?
+    {
+        return Ok(());
+    }
+
+    let cue = LifeChoiceCue::Ask {
+        kind: LifeChoiceKind::PartnerUp,
+        tier_gap: None,
+        anchor_seen: since,
+    };
+    if speak(
+        state,
+        session_id,
+        user_id,
+        instance_id,
+        persona,
+        now,
+        Occasion::LifeChoice(cue),
+    )
+    .await?
+    {
+        tracing::info!(%session_id, "she offered a partnership");
+    }
+    Ok(())
+}
+
+/// Whether `kind` (`confess` or `partner_up`) still waits at `now` (spec
+/// 2026-11-23-affinity-50 §7.1): the session's status changed, or `kind`
+/// was answered in any way, within the last [`STATUS_COOLDOWN_DAYS`].
+async fn status_ask_waits(
+    state: &AppState,
+    session_id: Uuid,
+    kind: LifeChoiceKind,
+    now: DateTime<Utc>,
+) -> Result<bool, AppError> {
+    let cooled = now - Duration::days(STATUS_COOLDOWN_DAYS);
+    let changed = (AffinityRepo { pool: &state.pool })
+        .latest_status_change(session_id)
+        .await?;
+    Ok(changed.is_some_and(|at| at > cooled)
+        || (LifeChoiceRepo { pool: &state.pool })
+            .answered_since(session_id, kind, cooled)
+            .await?)
+}
+
+/// The romantic trigger (spec 2026-10-30 §4.3, spec 2026-11-23-affinity-50
+/// §7.2, §7.3), then her ask (§4.4) through [`speak`]: a proposal, or her
+/// sleep ask in the form the status gives it. Only a pair the caller's
+/// recorded scopes mark as romantic qualifies; the ask itself is generated
+/// with the engine's default scopes.
 async fn try_romance(
     state: &AppState,
     session_id: Uuid,
@@ -338,11 +572,21 @@ async fn try_romance(
     let Some(kind) = romantic_kind(
         affinity.chem_tier(),
         affinity.bond_tier(),
+        affinity.relationship.status,
         &judged,
         choices
             .settled(session_id, LifeChoiceKind::SleepTogether)
             .await?,
-        choices.settled(session_id, LifeChoiceKind::Propose).await?,
+        choices
+            .settled(session_id, LifeChoiceKind::FallAsleepTogether)
+            .await?,
+        choices
+            .settled_since(
+                session_id,
+                LifeChoiceKind::Propose,
+                now - Duration::days(PROPOSE_COOLDOWN_DAYS),
+            )
+            .await?,
     ) else {
         return Ok(());
     };
@@ -372,41 +616,52 @@ async fn try_romance(
 }
 
 /// The kind the window qualifies for, `propose` first (spec 2026-10-30
-/// §4.3). `endpoints` newest first: the judged turns after the streak anchor,
-/// at most [`PROPOSE_WINDOW`]. A turn is warm when its warmth and its
-/// patience are both above [`WARM`]. `propose` needs both tiers at 4 or more
-/// and [`PROPOSE_HITS`] warm turns in the window; `sleep_together` needs
-/// chemistry tier 3 or more and the newest [`WARM_STREAK`] all warm. A
-/// settled kind is never chosen.
+/// §4.3, spec 2026-11-23-affinity-50 §7.1–§7.3). `endpoints` newest first:
+/// the judged turns after the streak anchor, at most [`PROPOSE_WINDOW`]. A
+/// turn is warm when its warmth and its patience are both above [`WARM`].
+/// `propose` is asked of a couple only, not while `propose_cooling` (an
+/// ignore within [`PROPOSE_COOLDOWN_DAYS`]), and needs both tiers at 4 or
+/// more and [`PROPOSE_HITS`] warm turns in the window. Her sleep ask needs
+/// chemistry tier 3 or more and the newest [`WARM_STREAK`] all warm; it is
+/// `sleep_together` where [`sleep_ask_is_sex`] says so and
+/// `fall_asleep_together` otherwise, and is not chosen once that kind is
+/// settled.
 fn romantic_kind(
     chem_tier: u8,
     bond_tier: u8,
+    status: RelationshipStatus,
     endpoints: &[JudgedEndpoints],
     settled_sleep: bool,
-    settled_propose: bool,
+    settled_fall_asleep: bool,
+    propose_cooling: bool,
 ) -> Option<LifeChoiceKind> {
-    if !settled_propose
+    if StatusAsk::Propose.asked_from(status)
+        && !propose_cooling
         && chem_tier >= 4
         && bond_tier >= 4
         && endpoints.iter().filter(|e| is_warm(e)).count() >= PROPOSE_HITS
     {
         return Some(LifeChoiceKind::Propose);
     }
-    if !settled_sleep && chem_tier >= 3 && newest_streak_warm(endpoints) {
-        return Some(LifeChoiceKind::SleepTogether);
+    if chem_tier < 3 || !newest_streak(endpoints, is_warm) {
+        return None;
     }
-    None
+    if sleep_ask_is_sex(status, chem_tier) {
+        (!settled_sleep).then_some(LifeChoiceKind::SleepTogether)
+    } else {
+        (!settled_fall_asleep).then_some(LifeChoiceKind::FallAsleepTogether)
+    }
 }
 
 fn is_warm(e: &JudgedEndpoints) -> bool {
     e.warmth > WARM && e.patience > WARM
 }
 
-/// `endpoints` newest first: the newest [`WARM_STREAK`] are all warm.
-fn newest_streak_warm(endpoints: &[JudgedEndpoints]) -> bool {
+/// `endpoints` newest first: the newest [`WARM_STREAK`] all pass `pred`.
+fn newest_streak(endpoints: &[JudgedEndpoints], pred: impl Fn(&JudgedEndpoints) -> bool) -> bool {
     endpoints
         .get(..WARM_STREAK)
-        .is_some_and(|newest| newest.iter().all(is_warm))
+        .is_some_and(|newest| newest.iter().all(pred))
 }
 
 /// Whether the pair qualifies for a bath together: chemistry tier 2 or more
@@ -497,7 +752,7 @@ async fn try_bathe(
 }
 
 fn travel_qualifies(bond_tier: u8, endpoints: &[JudgedEndpoints]) -> bool {
-    bond_tier >= TRAVEL_MIN_BOND_TIER && newest_streak_warm(endpoints)
+    bond_tier >= TRAVEL_MIN_BOND_TIER && newest_streak(endpoints, is_warm)
 }
 
 /// She suggests going away together: a close, warm stretch, whatever the
@@ -1279,6 +1534,7 @@ mod tests {
         let mut s = scene_with_lines(&pool, 0.5, 0.5).await;
         s.set_art(json!({"hygienic": false})).await;
         s.record_scopes("full", AffinityScope::chemistry()).await;
+        s.set_status("dating", false).await;
         s.event_under_way(EventKind::ShortTrip).await;
         // A reply the model leaves blank, an empty one, and one the provider
         // fails.
@@ -1868,6 +2124,7 @@ mod tests {
         let mut b = scene_with_lines(&pool, 0.5, 0.5).await;
         b.set_art(json!({"hygienic": false})).await;
         b.record_scopes("full", AffinityScope::chemistry()).await;
+        b.set_status("dating", false).await;
         b.event_under_way(EventKind::ShortTrip).await;
         let a = seed_session(&pool, b.user_id, b.instance_id).await;
         let mock = mock_llm(WARM, Some(SLEEP_TEXT)).await;
@@ -2002,6 +2259,7 @@ mod tests {
         let mut s = scene_with_lines(&pool, 0.5, 0.5).await;
         s.set_art(json!({"hygienic": false})).await;
         s.record_scopes("full", AffinityScope::chemistry()).await;
+        s.set_status("dating", false).await;
         s.event_under_way(EventKind::ShortTrip).await;
         let mock = mock_llm(WARM, Some(SLEEP_TEXT)).await;
         let state = with_models(test_state(pool.clone()), &mock.uri());
@@ -2190,49 +2448,99 @@ mod tests {
         mixed[1].patience = 0.5;
         mixed[4].warmth = 0.1;
         mixed[7].warmth = 0.1; // 5 hits of 8
+        let dating = RelationshipStatus::Dating;
         assert_eq!(
-            romantic_kind(3, 3, &hot(3), false, false),
+            romantic_kind(3, 3, dating, &hot(3), false, false, false),
             Some(LifeChoiceKind::SleepTogether)
         );
         assert_eq!(
-            romantic_kind(3, 3, &hot(2), false, false),
+            romantic_kind(3, 3, dating, &hot(2), false, false, false),
             None,
             "two is not three"
         );
         assert_eq!(
-            romantic_kind(2, 5, &hot(3), false, false),
+            romantic_kind(2, 5, dating, &hot(3), false, false, false),
             None,
             "chem below 3"
         );
         assert_eq!(
-            romantic_kind(4, 4, &hot(8), false, false),
+            romantic_kind(4, 4, dating, &hot(8), false, false, false),
             Some(LifeChoiceKind::Propose),
             "propose wins the tie"
         );
         assert_eq!(
-            romantic_kind(4, 4, &hot(8), false, true),
+            romantic_kind(4, 4, dating, &hot(8), false, false, true),
             Some(LifeChoiceKind::SleepTogether),
             "propose settled"
         );
         assert_eq!(
-            romantic_kind(4, 4, &mixed, true, false),
+            romantic_kind(4, 4, dating, &mixed, true, false, false),
             Some(LifeChoiceKind::Propose),
             "5 of 8"
         );
         {
             let mut four = mixed.clone();
             four[0].patience = 0.69;
-            assert_eq!(romantic_kind(4, 4, &four, true, false), None, "4 of 8");
+            assert_eq!(
+                romantic_kind(4, 4, dating, &four, true, false, false),
+                None,
+                "4 of 8"
+            );
         }
         assert_eq!(
-            romantic_kind(4, 3, &hot(8), true, false),
+            romantic_kind(4, 3, dating, &hot(8), true, false, false),
             None,
             "bond below 4"
         );
         assert_eq!(
-            romantic_kind(5, 5, &hot(8), true, true),
+            romantic_kind(5, 5, dating, &hot(8), true, false, true),
             None,
             "both settled"
+        );
+
+        // Only a couple is proposed to; `none` never is.
+        for status in RelationshipStatus::ALL {
+            let proposes = matches!(
+                status,
+                RelationshipStatus::Dating
+                    | RelationshipStatus::Fwb
+                    | RelationshipStatus::Situationship
+            );
+            assert_eq!(
+                romantic_kind(5, 5, status, &hot(8), true, true, false),
+                proposes.then_some(LifeChoiceKind::Propose),
+                "{status:?}"
+            );
+        }
+        // A bare partnership asks to fall asleep at chemistry 3, for sex at 4.
+        let partner = RelationshipStatus::Partner;
+        assert_eq!(
+            romantic_kind(3, 3, partner, &hot(3), false, false, false),
+            Some(LifeChoiceKind::FallAsleepTogether)
+        );
+        assert_eq!(
+            romantic_kind(4, 4, partner, &hot(8), false, false, false),
+            Some(LifeChoiceKind::SleepTogether)
+        );
+        assert_eq!(
+            romantic_kind(4, 4, RelationshipStatus::None, &hot(8), false, false, false),
+            Some(LifeChoiceKind::FallAsleepTogether)
+        );
+        // Each sleep ask is settled on its own.
+        assert_eq!(
+            romantic_kind(3, 3, partner, &hot(3), false, true, false),
+            None,
+            "falling asleep settled"
+        );
+        assert_eq!(
+            romantic_kind(3, 3, dating, &hot(3), false, true, false),
+            Some(LifeChoiceKind::SleepTogether),
+            "falling asleep settled leaves the bed open"
+        );
+        assert_eq!(
+            romantic_kind(4, 4, partner, &hot(8), true, false, false),
+            None,
+            "the bed settled leaves no ask at chemistry 4"
         );
     }
 
@@ -2265,6 +2573,7 @@ mod tests {
         let mut s = scene_with_lines(&pool, 0.5, 0.25).await;
         s.set_art(json!({"hygienic": true})).await;
         s.record_scopes("full", AffinityScope::chemistry()).await;
+        s.set_status("dating", false).await;
         let mock = mock_llm(WARM, Some(BATHE_TEXT)).await;
         let state = with_models(test_state(pool.clone()), &mock.uri());
 
@@ -2285,6 +2594,7 @@ mod tests {
     async fn a_neutral_persona_waits_for_chemistry_3(pool: PgPool) {
         let s = scene_with_lines(&pool, 0.5, 0.25).await;
         s.record_scopes("full", AffinityScope::chemistry()).await;
+        s.set_status("dating", false).await;
         let mock = mock_llm(WARM, Some(BATHE_TEXT)).await;
         let state = with_models(test_state(pool.clone()), &mock.uri());
         for _ in 0..4 {
@@ -2303,6 +2613,7 @@ mod tests {
             let mut s = scene_with_lines(&pool, 0.5, 0.25).await;
             s.set_art(json!({"hygienic": true})).await;
             s.record_scopes("full", AffinityScope::chemistry()).await;
+            s.set_status("dating", false).await;
             s.seed_romantic(
                 LifeChoiceKind::BatheTogether,
                 "ignored",
@@ -2326,6 +2637,7 @@ mod tests {
     async fn three_warm_turns_on_a_compatible_pair_ask_to_sleep_together(pool: PgPool) {
         let s = scene_with_lines(&pool, 0.5, 0.5).await;
         s.record_scopes("full", AffinityScope::chemistry()).await;
+        s.set_status("dating", false).await;
         let mock = mock_llm(WARM, Some(SLEEP_TEXT)).await;
         let state = with_models(test_state(pool.clone()), &mock.uri());
 
@@ -2354,6 +2666,7 @@ mod tests {
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn without_compatible_scopes_nothing_fires(pool: PgPool) {
         let s = scene_with_lines(&pool, 0.5, 0.5).await;
+        s.set_status("dating", false).await;
         // A background keeps the trip ask, which needs no scopes, out of it.
         s.event_under_way(EventKind::ShortTrip).await;
         let mock = mock_llm(WARM, Some(SLEEP_TEXT)).await;
@@ -2390,6 +2703,7 @@ mod tests {
         let mut s = scene_with_lines(&pool, 0.7, 0.7).await;
         s.set_art(json!({"hygienic": false})).await;
         s.record_scopes("full", AffinityScope::chemistry()).await;
+        s.set_status("dating", false).await;
         for (i, is_warm) in [false, true, true, false, true, true, false, true]
             .into_iter()
             .enumerate()
@@ -2405,6 +2719,7 @@ mod tests {
         let mut four = scene_with_lines(&pool, 0.7, 0.7).await;
         four.set_art(json!({"hygienic": false})).await;
         four.record_scopes("full", AffinityScope::chemistry()).await;
+        four.set_status("dating", false).await;
         for is_warm in [true, false, true, true, false, true, false, false] {
             four.turn(state(is_warm), SEEN).await;
         }
@@ -2418,6 +2733,7 @@ mod tests {
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn propose_wins_when_both_qualify(pool: PgPool) {
         let s = scene_with_lines(&pool, 0.7, 0.7).await;
+        s.set_status("dating", false).await;
         // A background keeps the trip ask, which needs no scopes, out of it.
         s.event_under_way(EventKind::ShortTrip).await;
         let mock = mock_llm(WARM, Some(PROPOSE_TEXT)).await;
@@ -2442,6 +2758,7 @@ mod tests {
         for status in ["ignored", "accepted"] {
             let s = scene_with_lines(&pool, 0.5, 0.5).await;
             s.record_scopes("full", AffinityScope::chemistry()).await;
+            s.set_status("dating", false).await;
             // A background keeps the trip ask out of it.
             s.event_under_way(EventKind::ShortTrip).await;
             // A bath taken yesterday keeps the bath ask out of it.
@@ -2463,6 +2780,7 @@ mod tests {
     async fn a_pending_ask_for_space_blocks_a_romantic_ask(pool: PgPool) {
         let s = scene_with_lines(&pool, 0.5, 0.5).await;
         s.record_scopes("full", AffinityScope::chemistry()).await;
+        s.set_status("dating", false).await;
         let mock = mock_llm(WARM, Some(SLEEP_TEXT)).await;
         let state = with_models(test_state(pool.clone()), &mock.uri());
         s.seed_choice("pending", Duration::minutes(1)).await;
@@ -2495,6 +2813,7 @@ mod tests {
     async fn a_declined_kind_re_arms_after_a_fresh_streak(pool: PgPool) {
         let s = scene_with_lines(&pool, 0.5, 0.5).await;
         s.record_scopes("full", AffinityScope::chemistry()).await;
+        s.set_status("dating", false).await;
         let mock = mock_llm(WARM, Some(SLEEP_TEXT)).await;
         let state = with_models(test_state(pool.clone()), &mock.uri());
 
@@ -2578,6 +2897,7 @@ mod tests {
     async fn three_warm_turns_ask_a_bond_only_pair_to_travel(pool: PgPool) {
         let s = scene_with_lines(&pool, 0.5, 0.5).await;
         s.record_bond_only().await;
+        s.set_status("partner", false).await;
         let mock = mock_llm(WARM, Some(TRAVEL_TEXT)).await;
         let state = with_models(test_state(pool.clone()), &mock.uri());
 
@@ -2596,6 +2916,7 @@ mod tests {
     async fn a_romantic_ask_goes_before_a_trip(pool: PgPool) {
         let s = scene_with_lines(&pool, 0.5, 0.5).await;
         s.record_scopes("full", AffinityScope::chemistry()).await;
+        s.set_status("dating", false).await;
         let mock = mock_llm(WARM, Some(SLEEP_TEXT)).await;
         let state = with_models(test_state(pool.clone()), &mock.uri());
 
@@ -2619,6 +2940,7 @@ mod tests {
         ] {
             let s = scene_with_lines(&pool, 0.5, 0.5).await;
             s.record_bond_only().await;
+            s.set_status("partner", false).await;
             s.seed_romantic(LifeChoiceKind::TravelTogether, status, Duration::days(days))
                 .await;
             for _ in 0..3 {
@@ -2636,6 +2958,7 @@ mod tests {
     async fn she_does_not_ask_to_travel_during_a_background(pool: PgPool) {
         let s = scene_with_lines(&pool, 0.5, 0.5).await;
         s.record_bond_only().await;
+        s.set_status("partner", false).await;
         s.event_under_way(EventKind::ShortTrip).await;
         let mock = mock_llm(WARM, Some(TRAVEL_TEXT)).await;
         let state = with_models(test_state(pool.clone()), &mock.uri());
@@ -2651,6 +2974,7 @@ mod tests {
     async fn a_trip_together_leaves_a_romantic_ask_open(pool: PgPool) {
         let s = scene_with_lines(&pool, 0.5, 0.5).await;
         s.record_scopes("full", AffinityScope::chemistry()).await;
+        s.set_status("dating", false).await;
         s.event_under_way(EventKind::TravelingTogether).await;
         let mock = mock_llm(WARM, Some(SLEEP_TEXT)).await;
         let state = with_models(test_state(pool.clone()), &mock.uri());
@@ -2659,5 +2983,353 @@ mod tests {
             s.turn(&state, SEEN).await;
         }
         assert_eq!(s.kinds().await, vec![pending("sleep_together")]);
+    }
+
+    // ---- Her status asks (spec 2026-11-23-affinity-50 §7.1–§7.3) ----
+
+    const CONFESS_CUE: &str = "（你发现自己喜欢上对方了。你决定郑重地向对方告白，问对方愿不愿意和你在一起，希望对方给你一个答复。）";
+    const PARTNER_CUE: &str =
+        "（你越来越觉得对方是值得托付的人。你决定郑重地提出和对方结成伙伴，希望对方给你一个答复。）";
+    const BREAK_UP_CUE: &str =
+        "（这段冷战让你心灰意冷。你决定郑重地向对方提出分手，希望对方给你一个答复。）";
+    const CONFESS_TEXT: &str = "我好像喜欢上你了，你愿意和我在一起吗？";
+    const PARTNER_TEXT: &str = "我们结成伙伴吧，好吗？";
+    const BREAK_UP_TEXT: &str = "我们分手吧。";
+    /// The newest judged turns of a proposal scene: five warm among eight,
+    /// never three warm in a row.
+    const FIVE_OF_EIGHT: [bool; 8] = [false, true, true, false, true, true, false, true];
+
+    impl Scene {
+        /// A status change `ago` ago: the `relationship` event it wrote, from
+        /// `from` to `to`. The row's own status is [`Self::set_status`]'s.
+        async fn seed_status_change(&self, from: &str, to: &str, ago: Duration) {
+            sqlx::query(
+                "INSERT INTO engine.companion_affinity_events \
+                   (affinity_id, event_type, context, created_at) \
+                 SELECT id, 'relationship', \
+                        jsonb_build_object('from', $2::text, 'to', $3::text), \
+                        now() - make_interval(secs => $4) \
+                   FROM engine.companion_affinity WHERE session_id = $1",
+            )
+            .bind(self.session_id)
+            .bind(from)
+            .bind(to)
+            .bind(ago.num_seconds() as f64)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    /// A compatible pair in `status` whose chemistry leads: bond 0.2 (tier
+    /// 2), chemistry 0.5 (tier 3). A level-3 verdict reads warmth about 0.74
+    /// and patience about 0.59, so no turn is warm enough for the bed. Not
+    /// hygienic, so no bath.
+    async fn chemistry_led(pool: &PgPool, status: &str) -> Scene {
+        let mut s = scene_with_lines(pool, 0.2, 0.5).await;
+        s.set_art(json!({"hygienic": false})).await;
+        s.record_scopes("full", AffinityScope::chemistry()).await;
+        s.set_status(status, false).await;
+        s
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_compatible_chemistry_led_warm_pair_is_confessed_to(pool: PgPool) {
+        let s = chemistry_led(&pool, "none").await;
+        let mock = mock_llm(WARM, Some(CONFESS_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+
+        s.turn(&state, SEEN).await;
+        s.turn(&state, SEEN).await;
+        assert!(s.kinds().await.is_empty(), "two warm turns are not three");
+
+        s.turn(&state, SEEN).await;
+        assert_eq!(s.tiers().await, (2, 3));
+        assert_eq!(s.kinds().await, vec![pending("confess")]);
+        assert_eq!(s.ask_rows().await[0].1, CONFESS_TEXT);
+        assert_eq!(only_cue(&mock).await, json!(CONFESS_CUE));
+    }
+
+    /// The same lines on bond-only scopes: not compatible, so no confession;
+    /// bond neither leads nor reaches tier 3, so no partnership or trip.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_incompatible_chemistry_led_pair_is_asked_nothing(pool: PgPool) {
+        let s = scene_with_lines(&pool, 0.2, 0.5).await;
+        s.record_bond_only().await;
+        let mock = mock_llm(WARM, Some(CONFESS_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+
+        for _ in 0..4 {
+            s.turn(&state, SEEN).await;
+        }
+        assert_eq!(s.tiers().await, (2, 3));
+        assert!(s.kinds().await.is_empty());
+        assert!(companion_calls(&mock).await.is_empty());
+    }
+
+    /// Bond leads at tier 3 (0.5 over chemistry 0.2) and three judged turns
+    /// have the top patience level, which reads about 0.74: she offers a
+    /// partnership, whatever the scopes. Their warmth stays low, so no trip.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_bond_led_patient_pair_is_offered_a_partnership(pool: PgPool) {
+        let s = scene_with_lines(&pool, 0.5, 0.2).await;
+        s.record_bond_only().await;
+        let mock = mock_llm(PATIENT, Some(PARTNER_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+
+        s.turn(&state, SEEN).await;
+        s.turn(&state, SEEN).await;
+        assert!(
+            s.kinds().await.is_empty(),
+            "two patient turns are not three"
+        );
+
+        s.turn(&state, SEEN).await;
+        assert_eq!(s.tiers().await, (3, 2));
+        assert_eq!(s.kinds().await, vec![pending("partner_up")]);
+        assert_eq!(only_cue(&mock).await, json!(PARTNER_CUE));
+    }
+
+    /// A bare partnership: her sleep ask is to fall asleep side by side at
+    /// chemistry tier 3, and for sex at tier 4. Bond leads, so she does not
+    /// confess.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_partner_is_asked_to_fall_asleep_at_chemistry_three_and_for_sex_at_four(
+        pool: PgPool,
+    ) {
+        let mock = mock_llm(WARM, Some(SLEEP_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+        for (bond, chem, tiers, kind) in [
+            (0.55, 0.5, (3, 3), "fall_asleep_together"),
+            (0.75, 0.7, (4, 4), "sleep_together"),
+        ] {
+            let s = scene_with_lines(&pool, bond, chem).await;
+            s.record_scopes("full", AffinityScope::chemistry()).await;
+            s.set_status("partner", false).await;
+            for _ in 0..3 {
+                s.turn(&state, SEEN).await;
+            }
+            assert_eq!(s.tiers().await, tiers);
+            assert_eq!(s.kinds().await, vec![pending(kind)], "{tiers:?}");
+        }
+        assert_eq!(companion_calls(&mock).await.len(), 2);
+    }
+
+    /// Her confession waits fourteen days after its last answer of any sort,
+    /// a decline included, and fourteen days after the status last changed.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_confession_waits_fourteen_days(pool: PgPool) {
+        let mock = mock_llm(WARM, Some(CONFESS_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+        for (days, asks) in [(1, false), (15, true)] {
+            let s = chemistry_led(&pool, "none").await;
+            s.seed_romantic(LifeChoiceKind::Confess, "declined", Duration::days(days))
+                .await;
+            for _ in 0..3 {
+                s.turn(&state, SEEN).await;
+            }
+            let mut kinds = vec![("confess".into(), "declined".into(), None)];
+            if asks {
+                kinds.push(pending("confess"));
+            }
+            assert_eq!(s.kinds().await, kinds, "declined {days} days ago");
+        }
+
+        // They broke up a day ago.
+        let s = chemistry_led(&pool, "ex").await;
+        s.seed_status_change("dating", "ex", Duration::days(1))
+            .await;
+        for _ in 0..3 {
+            s.turn(&state, SEEN).await;
+        }
+        assert!(s.kinds().await.is_empty(), "the status changed a day ago");
+        assert_eq!(companion_calls(&mock).await.len(), 1, "fifteen days only");
+    }
+
+    /// A second lap: she was accepted once, they broke up, and both lie
+    /// twenty days back. The once-only rule does not hold a confession; only
+    /// its waits do, and they are over.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_second_lap_after_a_break_up(pool: PgPool) {
+        let s = chemistry_led(&pool, "ex").await;
+        s.seed_romantic(LifeChoiceKind::Confess, "accepted", Duration::days(20))
+            .await;
+        s.seed_status_change("dating", "ex", Duration::days(20))
+            .await;
+        let mock = mock_llm(WARM, Some(CONFESS_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+
+        for _ in 0..3 {
+            s.turn(&state, SEEN).await;
+        }
+        assert_eq!(
+            s.kinds().await,
+            vec![
+                ("confess".into(), "accepted".into(), None),
+                pending("confess"),
+            ]
+        );
+    }
+
+    /// In a cold war over a breakable status, three judged turns at the
+    /// judge's lowest patience level make her ask to break up. Over `none`
+    /// there is nothing to end.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn she_asks_to_break_up_after_three_more_lowest_turns(pool: PgPool) {
+        let mock = mock_llm(LOW_PATIENCE, Some(BREAK_UP_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+        for (status, asks) in [("dating", true), ("none", false)] {
+            let s = scene(&pool).await;
+            s.set_status(status, true).await;
+
+            s.turn(&state, SEEN).await;
+            s.turn(&state, SEEN).await;
+            assert!(s.kinds().await.is_empty(), "{status}: two are not three");
+
+            s.turn(&state, SEEN).await;
+            let kinds = if asks {
+                vec![pending("break_up")]
+            } else {
+                vec![]
+            };
+            assert_eq!(s.kinds().await, kinds, "{status}");
+            assert!(s.cold_war().await, "{status}: the cold war goes on");
+        }
+        assert_eq!(only_cue(&mock).await, json!(BREAK_UP_CUE));
+    }
+
+    /// The turn that starts a cold war writes a `relationship` event, which
+    /// moves the streak anchor: the turns that started it do not also make
+    /// her ask to break up. Three more at the lowest level do.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_turn_that_starts_a_cold_war_does_not_ask_to_break_up(pool: PgPool) {
+        let s = scene(&pool).await;
+        s.set_status("dating", false).await;
+        let mock = mock_llm(LOW_PATIENCE, Some(COLD_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+
+        for _ in 0..3 {
+            s.turn(&state, SEEN).await;
+        }
+        assert!(s.cold_war().await);
+        assert_eq!(s.cold_war_rows().await, vec![proactive(COLD_TEXT)]);
+        assert!(s.choices().await.is_empty(), "no choice row");
+
+        s.turn(&state, SEEN).await;
+        s.turn(&state, SEEN).await;
+        assert!(s.choices().await.is_empty(), "two turns since it started");
+        s.turn(&state, SEEN).await;
+        assert_eq!(s.kinds().await, vec![pending("break_up")]);
+        assert_eq!(companion_calls(&mock).await.len(), 2);
+    }
+
+    /// Only a couple is proposed to: the turns that propose at `dating`
+    /// (`five_of_eight_warm_turns_at_tier_four_propose`) ask nothing of a
+    /// partner, and once three warm turns run in a row she asks for the bed.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_proposal_needs_a_couple(pool: PgPool) {
+        let warm = mock_llm(WARM, Some(SLEEP_TEXT)).await;
+        let cold = mock_llm(PATIENT, Some(SLEEP_TEXT)).await;
+        let warm_state = with_models(test_state(pool.clone()), &warm.uri());
+        let cold_state = with_models(test_state(pool.clone()), &cold.uri());
+
+        let mut s = scene_with_lines(&pool, 0.7, 0.7).await;
+        s.set_art(json!({"hygienic": false})).await;
+        s.record_scopes("full", AffinityScope::chemistry()).await;
+        s.set_status("partner", false).await;
+        for is_warm in FIVE_OF_EIGHT {
+            s.turn(if is_warm { &warm_state } else { &cold_state }, SEEN)
+                .await;
+        }
+        assert_eq!(s.tiers().await, (4, 4));
+        assert!(s.kinds().await.is_empty(), "no proposal");
+
+        s.turn(&warm_state, SEEN).await;
+        s.turn(&warm_state, SEEN).await;
+        assert_eq!(s.kinds().await, vec![pending("sleep_together")]);
+    }
+
+    /// An ignored proposal waits fourteen days; it is not settled for good.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_ignored_proposal_waits_fourteen_days(pool: PgPool) {
+        let warm = mock_llm(WARM, Some(PROPOSE_TEXT)).await;
+        let cold = mock_llm(PATIENT, Some(PROPOSE_TEXT)).await;
+        let warm_state = with_models(test_state(pool.clone()), &warm.uri());
+        let cold_state = with_models(test_state(pool.clone()), &cold.uri());
+
+        for (days, asks) in [(1, false), (15, true)] {
+            let mut s = scene_with_lines(&pool, 0.7, 0.7).await;
+            s.set_art(json!({"hygienic": false})).await;
+            s.record_scopes("full", AffinityScope::chemistry()).await;
+            s.set_status("dating", false).await;
+            s.seed_romantic(LifeChoiceKind::Propose, "ignored", Duration::days(days))
+                .await;
+            for is_warm in FIVE_OF_EIGHT {
+                s.turn(if is_warm { &warm_state } else { &cold_state }, SEEN)
+                    .await;
+            }
+            let mut kinds = vec![("propose".into(), "ignored".into(), None)];
+            if asks {
+                kinds.push(pending("propose"));
+            }
+            assert_eq!(s.kinds().await, kinds, "ignored {days} days ago");
+        }
+    }
+
+    /// Neither status ask is made while a cold war is on (spec
+    /// 2026-11-23-affinity-50 §7.3). As in `no_warm_ask_during_a_cold_war`,
+    /// the turns run while a sibling session's pending ask closes the runway,
+    /// and the check is then called on its own.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn no_confession_or_partnership_during_a_cold_war(pool: PgPool) {
+        for (kind, bond, chem, verdict) in [
+            (LifeChoiceKind::Confess, 0.2, 0.5, WARM),
+            (LifeChoiceKind::PartnerUp, 0.5, 0.2, PATIENT),
+        ] {
+            let mock = mock_llm(verdict, Some(CONFESS_TEXT)).await;
+            let state = with_models(test_state(pool.clone()), &mock.uri());
+            let s = scene_with_lines(&pool, bond, chem).await;
+            s.record_scopes("full", AffinityScope::chemistry()).await;
+            let sibling = seed_session(&pool, s.user_id, s.instance_id).await;
+            s.pending_in(sibling, Utc::now() - Duration::minutes(1))
+                .await;
+            for _ in 0..3 {
+                s.turn(&state, SEEN).await;
+            }
+            assert!(s.kinds().await.is_empty(), "the runway was closed");
+            sqlx::query(
+                "UPDATE engine.life_choices SET status = 'declined', resolved_at = now() \
+                  WHERE session_id = $1",
+            )
+            .bind(sibling)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+            let check = || async {
+                let (persona, session_id) = (&s.persona, s.session_id);
+                match kind {
+                    LifeChoiceKind::Confess => {
+                        try_confess(&state, session_id, s.user_id, s.instance_id, persona).await
+                    }
+                    _ => {
+                        try_partner_up(&state, session_id, s.user_id, s.instance_id, persona).await
+                    }
+                }
+                .unwrap()
+            };
+            s.set_status("none", true).await;
+            check().await;
+            assert!(s.kinds().await.is_empty(), "{kind:?} during a cold war");
+
+            s.set_status("none", false).await;
+            check().await;
+            assert_eq!(
+                s.kinds().await,
+                vec![pending(kind.as_str())],
+                "{kind:?} once it is over"
+            );
+            assert_eq!(companion_calls(&mock).await.len(), 1, "{kind:?}");
+        }
     }
 }
