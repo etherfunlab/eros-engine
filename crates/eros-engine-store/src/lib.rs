@@ -1197,6 +1197,23 @@ mod migration_tests {
         );
     }
 
+    /// 0087. Neither function runs with the caller's `search_path`.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn migration_0087_pins_function_search_path(pool: PgPool) {
+        for name in ["touch_world_worldviews", "fact_norm"] {
+            let cfg: Option<Vec<String>> = sqlx::query_scalar(
+                "SELECT p.proconfig FROM pg_proc p \
+                 JOIN pg_namespace n ON n.oid = p.pronamespace \
+                 WHERE n.nspname = 'engine' AND p.proname = $1",
+            )
+            .bind(name)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(cfg, Some(vec!["search_path=\"\"".to_string()]), "{name}");
+        }
+    }
+
     /// 0085. The `activity` channel and affinity-event type, and the
     /// `engine.activities` table: its CHECK, its three foreign keys and their
     /// actions, and the lockdown.
