@@ -193,6 +193,12 @@ pub enum EventKind {
     /// She and the user drink together: written when she accepts the user's
     /// `drink_together`.
     DrinkingTogether,
+    /// She and the user soak in a hot spring: written when she accepts the
+    /// user's `hot_spring_together`.
+    HotSpringTogether,
+    /// She and the user fight side by side: written when she accepts the
+    /// user's `fight_together`; only in a `fantasy` world.
+    FightingTogether,
 }
 
 impl EventKind {
@@ -271,7 +277,7 @@ impl EventKind {
     ];
 
     /// Kinds the writers place directly, never drawn: parsed and stored, not in `ALL`.
-    pub const SPECIAL: [EventKind; 19] = [
+    pub const SPECIAL: [EventKind; 21] = [
         EventKind::TakingSpace,
         EventKind::FellOut,
         EventKind::TravelingTogether,
@@ -291,6 +297,8 @@ impl EventKind {
         EventKind::HorseRidingTogether,
         EventKind::StreakingTogether,
         EventKind::DrinkingTogether,
+        EventKind::HotSpringTogether,
+        EventKind::FightingTogether,
     ];
 
     /// The kinds that are sex: any row of one, ever, ends her virginity
@@ -394,6 +402,8 @@ impl EventKind {
             EventKind::HorseRidingTogether => "horse_riding_together",
             EventKind::StreakingTogether => "streaking_together",
             EventKind::DrinkingTogether => "drinking_together",
+            EventKind::HotSpringTogether => "hot_spring_together",
+            EventKind::FightingTogether => "fighting_together",
         }
     }
 
@@ -416,14 +426,13 @@ impl EventKind {
             | JustHaveSex | Masturbating | MissedRide | UsingToilet | ShoweringTogether
             | SaunaTogether | UsingToiletTogether | SmokingTogether | HavingSexTogether
             | WalkingTogether | SmokingWeedTogether | JoggingTogether | YogaTogether
-            | StargazingTogether | HorseRidingTogether | StreakingTogether | DrinkingTogether => {
-                EventCategory::Short
-            }
-            AsleepTogether | TempWork | ExMessage | GotHit | Breakup | WorkingOut | Reading
-            | Gaming | AwayFromPhone | Unwell | Irritable | Busy | InBattle | Asleep
-            | OutShopping | BrosGathering | SisGathering | OnTheRoad | WatchingShow | HavingSex
-            | WantToGoOut | WantToGoHome | TakingSpace | FellOut | OnABoat | OnACruise | OnABus
-            | OnATrain | OnAPlane | Driving => EventCategory::Mid,
+            | StargazingTogether | HorseRidingTogether | StreakingTogether | DrinkingTogether
+            | HotSpringTogether => EventCategory::Short,
+            AsleepTogether | FightingTogether | TempWork | ExMessage | GotHit | Breakup
+            | WorkingOut | Reading | Gaming | AwayFromPhone | Unwell | Irritable | Busy
+            | InBattle | Asleep | OutShopping | BrosGathering | SisGathering | OnTheRoad
+            | WatchingShow | HavingSex | WantToGoOut | WantToGoHome | TakingSpace | FellOut
+            | OnABoat | OnACruise | OnABus | OnATrain | OnAPlane | Driving => EventCategory::Mid,
             Sick | Period | Hospitalized | PostSurgery => EventCategory::Body,
             BusinessTrip | ShortTrip | LongTrip | HometownVisit | TravelingTogether => {
                 EventCategory::Trip
@@ -520,7 +529,9 @@ impl EventKind {
     /// 2026-11-08-strip-and-world-setting-design.md §4): the kinds that need
     /// modern life fit only `modern`; `on_the_road` fits only `fantasy`,
     /// where the vehicles do not exist (spec 2026-11-19-vehicles-actions-
-    /// species-design.md §3); every other kind fits both.
+    /// species-design.md §3), and so does `fighting_together` (spec
+    /// 2026-11-23-hot-spring-fight-challenge-bet-design.md §5); every other
+    /// kind fits both.
     pub fn fits(self, setting: Setting) -> bool {
         use EventKind::*;
         let modern_only = matches!(
@@ -543,7 +554,7 @@ impl EventKind {
         );
         if modern_only {
             setting == Setting::Modern
-        } else if self == OnTheRoad {
+        } else if matches!(self, OnTheRoad | FightingTogether) {
             setting == Setting::Fantasy
         } else {
             true
@@ -667,6 +678,8 @@ fn rule(kind: EventKind) -> Rule {
         HorseRidingTogether => (0.0, 0, Lasts::Hours(1, 1)),
         StreakingTogether => (0.0, 0, Lasts::Minutes(30)),
         DrinkingTogether => (0.0, 0, Lasts::Hours(1, 1)),
+        HotSpringTogether => (0.0, 0, Lasts::Hours(1, 1)),
+        FightingTogether => (0.0, 0, Lasts::Hours(1, 2)),
     };
     Rule {
         weight,
@@ -2121,7 +2134,7 @@ mod tests {
         assert!(!EventKind::ALL.contains(&TakingSpace));
         assert!(!EventKind::ALL.contains(&FellOut));
         assert_eq!(EventKind::ALL.len(), 70);
-        assert_eq!(EventKind::SPECIAL.len(), 19);
+        assert_eq!(EventKind::SPECIAL.len(), 21);
         for k in EventKind::SPECIAL {
             assert_eq!(serde_json::to_value(k).unwrap(), k.as_str());
             assert_eq!(EventKind::parse(k.as_str()), Some(k));
@@ -2890,6 +2903,40 @@ mod tests {
         }
     }
 
+    /// Spec 2026-11-23-hot-spring-fight-challenge-bet-design.md §5.
+    #[test]
+    fn the_hot_spring_and_the_fight_are_placed_kinds() {
+        let h = HotSpringTogether;
+        assert_eq!(h.as_str(), "hot_spring_together");
+        assert_eq!(h.category(), EventCategory::Short);
+        assert_eq!(lasts(h, 0.0), Duration::hours(1));
+        assert_eq!(lasts(h, 0.99), Duration::hours(1));
+        assert!(h.fits(Setting::Modern) && h.fits(Setting::Fantasy));
+        let f = FightingTogether;
+        assert_eq!(f.as_str(), "fighting_together");
+        assert_eq!(f.category(), EventCategory::Mid);
+        assert_eq!(lasts(f, 0.0), Duration::hours(1));
+        assert_eq!(lasts(f, 0.999_999), Duration::hours(2));
+        assert!(f.fits(Setting::Fantasy) && !f.fits(Setting::Modern));
+        for k in [h, f] {
+            assert!(
+                EventKind::SPECIAL.contains(&k) && !EventKind::ALL.contains(&k),
+                "{k:?}"
+            );
+            assert_eq!(EventKind::parse(k.as_str()), Some(k));
+            let r = rule(k);
+            assert_eq!((r.weight, r.cooldown_hours), (0.0, 0), "{k:?}");
+            assert_eq!(k.place(), Place::Neutral, "{k:?}");
+            assert!(!k.may_be_offline() && !k.is_offline(&female()), "{k:?}");
+            for rung in 0..=5 {
+                assert!(
+                    !is_told(k, rung, &PersonaTraits::default()),
+                    "{k:?} rung {rung}"
+                );
+            }
+        }
+    }
+
     /// Spec 2026-11-23-twelve-together-actions-and-propose-design.md §4: the
     /// one together kind that is `mid`, and she still answers during it.
     #[test]
@@ -3030,7 +3077,7 @@ mod tests {
     ];
 
     /// Spec 2026-11-19-vehicles-actions-species-design.md §3.
-    const FANTASY_ONLY: [EventKind; 1] = [OnTheRoad];
+    const FANTASY_ONLY: [EventKind; 2] = [OnTheRoad, FightingTogether];
 
     #[test]
     fn modern_only_kinds_never_fit_fantasy() {

@@ -105,6 +105,20 @@ pub fn together_ruled_out(event: &Event, machine: bool) -> bool {
     }
 }
 
+/// Whether this turn's action is one the persona's world does not have,
+/// ruled out before the judge (spec 2026-11-23-hot-spring-fight-challenge-
+/// bet-design.md §4): a `fight_together` when `setting` is not `fantasy`.
+/// Such a refusal drops no line.
+pub fn world_ruled_out(event: &Event, setting: crate::events::Setting) -> bool {
+    matches!(
+        event,
+        Event::UserMessage {
+            action: Some(UserAction::FightTogether),
+            ..
+        }
+    ) && setting != crate::events::Setting::Fantasy
+}
+
 /// Whether this turn's `date` is ruled out before the judge (spec
 /// 2026-11-12-activity-sub-session-design.md): she is out of reach, or the
 /// date is a `mid` one and the bond is below tier 2. Not a roll: such an
@@ -1242,6 +1256,28 @@ mod tests {
                 "{a:?}"
             );
         }
+    }
+
+    /// Spec 2026-11-23-hot-spring-fight-challenge-bet-design.md §4.
+    #[test]
+    fn a_fight_together_needs_a_fantasy_world() {
+        use crate::events::Setting;
+        let fight = action_msg(UserAction::FightTogether);
+        assert!(world_ruled_out(&fight, Setting::Modern));
+        assert!(world_ruled_out(&fight, Setting::default()));
+        assert!(!world_ruled_out(&fight, Setting::Fantasy));
+        for a in [
+            UserAction::HotSpringTogether,
+            UserAction::Challenge,
+            UserAction::Bet,
+            UserAction::SaunaTogether,
+        ] {
+            assert!(
+                !world_ruled_out(&action_msg(a.clone()), Setting::Modern),
+                "{a:?}"
+            );
+        }
+        assert!(!world_ruled_out(&user_msg("hi"), Setting::Modern));
     }
 
     #[test]

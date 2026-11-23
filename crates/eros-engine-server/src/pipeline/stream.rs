@@ -5306,10 +5306,11 @@ pub(crate) fn run_stream_with(
         // 2026-11-20-together-actions-state-in-picture-and-genome-routes-
         // design.md §5, 2026-11-23-twelve-together-actions-and-propose-
         // design.md §4.1).
-        let together_refused = pde::together_ruled_out(
-            &input.event,
-            crate::prompt::persona_traits(&input.persona).machine,
-        );
+        let traits = crate::prompt::persona_traits(&input.persona);
+        let together_refused = pde::together_ruled_out(&input.event, traits.machine);
+        // A fight a modern persona's world does not have (spec 2026-11-23-
+        // hot-spring-fight-challenge-bet-design.md §4): refused, and free.
+        let world_refused = pde::world_ruled_out(&input.event, traits.setting);
         // A date she cannot go on (spec 2026-11-12-activity-sub-session-
         // design.md §4.3): she is offline, or a `mid` one is asked below bond
         // tier 2. On the decayed affinity this turn reads. Another date of
@@ -5337,7 +5338,8 @@ pub(crate) fn run_stream_with(
             affinity.bond_tier(),
             offline_now || other_date_on,
         );
-        let refused_before_judge = give_refused || strip_refused || together_refused || date_refused;
+        let refused_before_judge =
+            give_refused || strip_refused || together_refused || world_refused || date_refused;
         let (mut plan, pde_run): (eros_engine_core::types::ActionPlan, Option<PdeDecisionRun>) =
             match resolved_pde.as_ref() {
                 Some(p) => {
@@ -20724,6 +20726,48 @@ data: [DONE]\n\n";
                 (a.clone(), Accept, ReplyText, true, None),
                 (a.clone(), Accept, ReplyTextImage, true, None),
                 (a.clone(), Refuse, ReplyTextImage, true, None),
+                (a, Refuse, ReplyText, true, None),
+            ]);
+        }
+        for (a, response, ty, available, want) in cases {
+            let mut input = fixture_decision_input();
+            if let Event::UserMessage { action, .. } = &mut input.event {
+                *action = Some(a.clone());
+            }
+            let mut plan = pde::decide(&input);
+            plan.action_response = Some(response);
+            plan.action_type = ty;
+            assert_eq!(
+                picture_action(&input.event, &plan, available),
+                want,
+                "{a:?} {response:?} {ty:?} {available}"
+            );
+        }
+    }
+
+    /// Spec 2026-11-23-hot-spring-fight-challenge-bet-design.md §4.
+    #[test]
+    fn hot_spring_and_fight_are_picture_turns_and_a_challenge_or_bet_is_not() {
+        use eros_engine_core::types::ActionResponse::{Accept, Refuse};
+        use eros_engine_core::types::ActionType::{ReplyImage, ReplyText, ReplyTextImage};
+        use eros_engine_core::types::UserAction::{
+            Bet, Challenge, FightTogether, HotSpringTogether,
+        };
+        let mut cases = Vec::new();
+        for a in [HotSpringTogether, FightTogether] {
+            cases.extend([
+                (a.clone(), Accept, ReplyText, true, Some(ReplyTextImage)),
+                (a.clone(), Accept, ReplyImage, true, Some(ReplyTextImage)),
+                (a.clone(), Accept, ReplyText, false, None),
+                (a.clone(), Refuse, ReplyTextImage, true, Some(ReplyText)),
+                (a, Refuse, ReplyText, true, None),
+            ]);
+        }
+        for a in [Challenge, Bet] {
+            assert!(!is_picture_action(&a), "{a:?}");
+            cases.extend([
+                (a.clone(), Accept, ReplyText, true, None),
+                (a.clone(), Accept, ReplyTextImage, true, None),
                 (a, Refuse, ReplyText, true, None),
             ]);
         }

@@ -776,6 +776,10 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
         UserAction::StreakTogether => "想和你一起裸奔".into(),
         UserAction::DrinkTogether => "想和你一起喝酒".into(),
         UserAction::Propose => "向你求婚".into(),
+        UserAction::HotSpringTogether => "想和你一起泡温泉".into(),
+        UserAction::FightTogether => "想和你一起去战斗".into(),
+        UserAction::Challenge => "向你发起挑战".into(),
+        UserAction::Bet => "想和你打个赌".into(),
         UserAction::Custom { text } => text.clone(),
         UserAction::Tip { amount_usd } => {
             format!("给你发了一个红包，相当于{}", tip_value_noun(*amount_usd))
@@ -1103,6 +1107,8 @@ pub(crate) fn event_label(kind: eros_engine_core::events::EventKind) -> &'static
         HorseRidingTogether => "和对方一起骑马",
         StreakingTogether => "和对方一起裸奔",
         DrinkingTogether => "和对方一起喝酒",
+        HotSpringTogether => "和对方一起泡温泉",
+        FightingTogether => "和对方并肩作战",
     }
 }
 
@@ -1441,6 +1447,8 @@ pub(crate) fn social_outcomes(a: &UserAction) -> Option<(&'static str, &'static 
         UserAction::Bluff => Some(("你信了", "你没信")),
         UserAction::Threaten => Some(("你被吓到了", "你没吃这一套")),
         UserAction::Trick => Some(("你上当了", "你识破了")),
+        UserAction::Challenge => Some(("你应战了", "你没应战")),
+        UserAction::Bet => Some(("你答应打这个赌", "你没答应")),
         _ => None,
     }
 }
@@ -6667,6 +6675,38 @@ mod tests {
                 "向你求婚",
                 "捏了捏你的脸",
             ]
+        );
+    }
+
+    /// Spec 2026-11-23-hot-spring-fight-challenge-bet-design.md §4, §5.
+    #[test]
+    fn hot_spring_fight_challenge_and_bet_read_as_the_spec_says() {
+        use eros_engine_core::events::EventKind;
+        for (a, marker) in [
+            (UserAction::HotSpringTogether, "想和你一起泡温泉"),
+            (UserAction::FightTogether, "想和你一起去战斗"),
+            (UserAction::Challenge, "向你发起挑战"),
+            (UserAction::Bet, "想和你打个赌"),
+        ] {
+            assert_eq!(action_phrase(&a), marker, "{a:?}");
+        }
+        assert_eq!(
+            event_label(EventKind::HotSpringTogether),
+            "和对方一起泡温泉"
+        );
+        assert_eq!(event_label(EventKind::FightingTogether), "和对方并肩作战");
+        assert_eq!(
+            social_outcomes(&UserAction::Challenge),
+            Some(("你应战了", "你没应战"))
+        );
+        assert_eq!(
+            social_outcomes(&UserAction::Bet),
+            Some(("你答应打这个赌", "你没答应"))
+        );
+        assert_eq!(social_outcomes(&UserAction::HotSpringTogether), None);
+        assert_eq!(
+            action_outcome(&UserAction::Challenge, ActionResponse::Refuse),
+            "对方向你发起挑战，你没应战。"
         );
     }
 
