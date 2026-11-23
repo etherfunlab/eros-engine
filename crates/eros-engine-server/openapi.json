@@ -4080,7 +4080,9 @@
           "bond_tier",
           "chem_tier",
           "bond_label",
-          "chemistry_label"
+          "chemistry_label",
+          "relationship_status",
+          "cold_war"
         ],
         "properties": {
           "bond": {
@@ -4113,6 +4115,17 @@
             "type": "string",
             "description": "Romance tier key (`spark`/`flirtation`/`crush`/`lover`/`beloved`)."
           },
+          "cold_war": {
+            "type": "boolean",
+            "description": "Whether a cold war is on."
+          },
+          "composed_relation": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Key of what the two real tiers add up to (`good_friend`,\n`more_than_friends`, ...), or `null` at `(1, 1)`. The pair's\ncompatibility is not applied here."
+          },
           "ghost_streak": {
             "type": "integer",
             "format": "int32"
@@ -4128,6 +4141,10 @@
           "patience": {
             "type": "number",
             "format": "double"
+          },
+          "relationship_status": {
+            "type": "string",
+            "description": "The session's relationship status: `none`, `dating`, `partner`,\n`peer`, `fwb`, `situationship`, `engaged` or `ex`."
           },
           "tension": {
             "type": "number",

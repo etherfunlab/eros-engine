@@ -3018,6 +3018,15 @@ fn build_pde_ctx(
         eros_engine_core::affinity::PatienceBand::Mid => "中",
         eros_engine_core::affinity::PatienceBand::Low => "低",
     };
+    // The settled status and the cold-war flag, so accept/refuse decisions
+    // agree with the relationship. The composed relation is not shown: it
+    // follows from the two lines the judge already reads as buckets.
+    let relationship_status = a.relationship.status.zh();
+    let cold_war = if a.relationship.cold_war() {
+        "是"
+    } else {
+        "否"
+    };
     // Always emit the image-capability line — the negative is a signal too, so
     // the judge gets a clear "no images this turn" rather than a missing line.
     let image_flag = if image_available { "是" } else { "否" };
@@ -3136,6 +3145,7 @@ fn build_pde_ctx(
         "{persona_block}{items_block}[最近对话]\n{transcript}\n\n\
          [亲密度] 当前档位=第 {rung} 档\n\
          [耐心] 当前档位={patience_band}\n\
+         [关系] 状态={relationship_status}；冷战中={cold_war}\n\
          [信号] message_count={} hours_since_last_message={:.1} ghost_streak={} hours_since_last_ghost={}\n\
          [图片能力] 本轮可发图={image_flag}\n\
          [近期图片] 最近{INPUT_FILTER_CONTEXT_TURNS}条消息内已发图={img_count} 张；上一条 AI 消息是图片={last_img}（以本行计数为准，对话记录里的图片标记仅供参考）\n\
@@ -3151,8 +3161,8 @@ fn build_pde_ctx(
 }
 
 /// Engine-computed relationship state as shown to the judge this run (issue
-/// #254): the two discrete labels the prompt carries, plus the line scores and
-/// raw axes they were cut from — the prompt itself no longer carries any
+/// #254): the two discrete labels the prompt carries and the status and
+/// cold-war flag, plus the line scores and raw axes the labels were cut from — the prompt itself no longer carries any
 /// number, so this snapshot is the only place the gate's inputs survive.
 /// Written to `companion_decision_events.inputs`; fail-open at the call site.
 fn pde_inputs_snapshot(
@@ -3168,6 +3178,8 @@ fn pde_inputs_snapshot(
         "v": 1,
         "intimacy_rung": a.intimacy_rung(),
         "patience_band": band,
+        "relationship_status": a.relationship.status.as_str(),
+        "cold_war": a.relationship.cold_war(),
         "bond": a.bond_score(),
         "chemistry": a.chemistry_score(),
         "axes": {
@@ -20298,6 +20310,51 @@ data: [DONE]\n\n";
             rung_at < patience_at && patience_at < signal_at,
             "buckets sit before [信号]: {ctx}"
         );
+    }
+
+    #[test]
+    fn pde_ctx_states_the_relationship_status_and_cold_war() {
+        use eros_engine_core::relationship::RelationshipStatus;
+        let mut input = fixture_decision_input();
+        input.affinity.relationship.status = RelationshipStatus::Dating;
+        input.affinity.relationship.cold_war_since = Some(chrono::Utc::now());
+        let ctx = |input: &eros_engine_core::types::DecisionInput| {
+            build_pde_ctx(
+                &JudgeTranscript::default(),
+                input,
+                true,
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
+        };
+        let cold = ctx(&input);
+        assert!(cold.contains("[关系] 状态=伴侣；冷战中=是\n"), "{cold}");
+        assert!(
+            cold.find("[耐心]").unwrap() < cold.find("[关系]").unwrap()
+                && cold.find("[关系]").unwrap() < cold.find("[信号]").unwrap(),
+            "the line sits between [耐心] and [信号]: {cold}"
+        );
+
+        input.affinity.relationship = Default::default();
+        let fresh = ctx(&input);
+        assert!(fresh.contains("[关系] 状态=未确定；冷战中=否\n"), "{fresh}");
+    }
+
+    #[test]
+    fn pde_inputs_snapshot_records_the_status_and_cold_war() {
+        use eros_engine_core::relationship::RelationshipStatus;
+        let mut a = pde_test_affinity();
+        a.relationship.status = RelationshipStatus::Engaged;
+        a.relationship.cold_war_since = Some(chrono::Utc::now());
+        let v = pde_inputs_snapshot(&a, None);
+        assert_eq!(v["relationship_status"], "engaged");
+        assert_eq!(v["cold_war"], true);
+        let v = pde_inputs_snapshot(&pde_test_affinity(), None);
+        assert_eq!(v["relationship_status"], "none");
+        assert_eq!(v["cold_war"], false);
     }
 
     /// The rendered buckets follow the affinity, rather than being pinned to one
