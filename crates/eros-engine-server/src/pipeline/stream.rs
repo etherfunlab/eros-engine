@@ -2942,17 +2942,18 @@ fn accepted_together(
 /// transaction: a failed write loses both the stored answer and the event,
 /// never the reply already sent.
 ///
-/// On a genome instance, a `propose` or `break_up` also settles the status of
-/// `relationship`, the turn's affinity session (the inviting one on a date),
-/// in that same transaction (spec 2026-11-23-affinity-50-design.md §8). A
-/// BYOC instance's status never moves (§6.5).
+/// A `propose` or `break_up` also settles the status of `relationship`, the
+/// turn's affinity session (the inviting one on a date), in that same
+/// transaction (spec 2026-11-23-affinity-50-design.md §8). `None` moves no
+/// status: on a BYOC instance (§6.5), and on an action the status gate
+/// refused before the judge, which has no effect whatever the row holds by
+/// the time the answer is stored.
 async fn store_action_response(
     chat_repo: &ChatRepo<'_>,
     user_msg: &PersistedUserMessage,
     response: eros_engine_core::types::ActionResponse,
     on_date: bool,
-    relationship: Uuid,
-    genome: bool,
+    relationship: Option<Uuid>,
 ) {
     let kind = accepted_together(user_msg.action.as_ref(), Some(response)).filter(|_| !on_date);
     let event_key = kind.map(|k| format!("action:{}:{}", user_msg.user_message_id, k.as_str()));
@@ -2968,12 +2969,7 @@ async fn store_action_response(
             ends_at: now + eros_engine_core::events::lasts(kind, roll),
         }
     });
-    let status_ask = user_msg
-        .action
-        .as_ref()
-        .and_then(|a| a.status_ask())
-        .filter(|_| genome)
-        .map(|ask| (relationship, ask));
+    let status_ask = relationship.zip(user_msg.action.as_ref().and_then(|a| a.status_ask()));
     if let Err(e) = chat_repo
         .set_action_response(
             user_msg.user_message_id,
@@ -5373,11 +5369,13 @@ pub(crate) fn run_stream_with(
         // A proposal or break-up the status does not allow, and any BYOC
         // break-up (spec 2026-11-23-affinity-50-design.md §6.5, §8): refused,
         // and free. On a date, the inviting session's status.
-        let status_refused = pde::status_ruled_out(
-            &input.event,
-            affinity.relationship.status,
-            input.persona.instance.genome_id.is_some(),
-        );
+        let genome = input.persona.instance.genome_id.is_some();
+        let status_refused =
+            pde::status_ruled_out(&input.event, affinity.relationship.status, genome);
+        // The session whose status the stored answer may settle: none on a
+        // BYOC instance, nor when the gate refused, so a status that moved
+        // after this read cannot turn that refusal into a cold war.
+        let status_session = (genome && !status_refused).then_some(turn.relationship);
         let refused_before_judge = give_refused
             || strip_refused
             || together_refused
@@ -6263,8 +6261,7 @@ pub(crate) fn run_stream_with(
                             &user_msg,
                             response,
                             on_date,
-                            turn.relationship,
-                            input.persona.instance.genome_id.is_some(),
+                            status_session,
                         )
                         .await;
                     }
@@ -6852,8 +6849,7 @@ pub(crate) fn run_stream_with(
                         &user_msg,
                         response,
                         on_date,
-                        turn.relationship,
-                        input.persona.instance.genome_id.is_some(),
+                        status_session,
                     )
                     .await;
                 }
@@ -28584,6 +28580,53 @@ data: [DONE]\n\n"
         assert!(relationship_events(&pool, session).await.is_empty());
         let context = judged_turn_context(&pool, umid).await;
         assert!(context.get("tier_drop").is_none(), "{context}");
+    }
+
+    /// A refusal the status gate made stays free even when the status moves
+    /// before the answer is stored. Here her reply's row turns the pair
+    /// `dating`, as her accepted confession landing mid-turn would: the
+    /// refused break-up still starts no cold war and writes no event.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_break_up_the_gate_refused_stays_free_when_the_status_moves_mid_turn(pool: PgPool) {
+        // Fires after the gate read the status, before the answer is stored.
+        sqlx::query(
+            "CREATE FUNCTION engine.test_status_moves() RETURNS trigger \
+             LANGUAGE plpgsql AS $$ BEGIN \
+                 UPDATE engine.companion_affinity SET relationship_status = 'dating' \
+                  WHERE session_id = NEW.session_id; \
+                 RETURN NEW; \
+             END $$",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER test_status_moves AFTER INSERT ON engine.chat_messages \
+             FOR EACH ROW WHEN (NEW.role = 'assistant') \
+             EXECUTE FUNCTION engine.test_status_moves()",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (frames, mock, _, session) = run_status_turn(
+            &pool,
+            eros_engine_core::types::UserAction::BreakUp,
+            "none",
+            false,
+            false,
+            "accept",
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "refuse");
+        let judge = judge_request(&mock.received_requests().await.unwrap());
+        assert!(judge.contains("，这次你不会答应\\n"), "{judge}");
+        assert_eq!(
+            status_row(&pool, session).await,
+            ("dating".into(), false),
+            "the status moved mid-turn, and no cold war started"
+        );
+        assert!(relationship_events(&pool, session).await.is_empty());
     }
 
     /// A BYOC session stays outside the status system (spec §6.5): its
