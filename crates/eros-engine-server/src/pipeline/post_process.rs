@@ -4894,6 +4894,152 @@ mod tests {
         );
     }
 
+    /// The same entry check, for an erased user: the session is live, only
+    /// the owner's tombstone exists. `run` must spend no model or embedding
+    /// call (the `expect(0)` mock, as in the test above) and derive nothing.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_is_a_noop_for_an_erased_user(pool: sqlx::PgPool) {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // The tombstone alone, as the erase's first transaction leaves it:
+        // the session row is untouched and nothing has been deleted.
+        sqlx::query("INSERT INTO engine.user_erasures (user_id, erased_at) VALUES ($1, now())")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // One server, one catch-all mock, zero allowed hits — backs BOTH
+        // clients so a call from any of `run`'s four futures (the affinity
+        // evaluator, the two insight chains, or the memory embed) is caught
+        // the same way.
+        let mock = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let embed_cfg = eros_engine_llm::model_config::ModelConfig::from_toml_str(&format!(
+            "[providers.mockembed]\nembeddings = \"{}/v1/embeddings\"\n\
+             [tasks.embedding]\nmodel = \"mock-embed@mockembed\"\n",
+            mock.uri()
+        ))
+        .expect("embedding provider config parses");
+        state.embed = std::sync::Arc::new(
+            eros_engine_llm::embedding::EmbeddingRouter::from_config_with(&embed_cfg, |k| {
+                (k == "MOCKEMBED_API_KEY").then(|| "test-key".to_string())
+            })
+            .expect("mock embedding router builds"),
+        );
+
+        let event = Event::UserMessage {
+            content: "还记得我们上次聊到的事吗".into(),
+            message_id: Uuid::new_v4(),
+            prompt_traits: Vec::new(),
+            audit: None,
+            tier: None,
+            memory_scope: Default::default(),
+            affinity_scope: Default::default(),
+            quote: Default::default(),
+            action: None,
+            outfit: None,
+        };
+        let plan = ActionPlan {
+            action_type: ActionType::ReplyText,
+            reply_style: eros_engine_core::types::ReplyStyle::Neutral,
+            affinity_deltas: Default::default(),
+            energy_cost: 0.0,
+            context_hints: Vec::new(),
+            reply_mode: None,
+            nudges: Default::default(),
+            clothing: None,
+            image_caption: None,
+            image_ref: eros_engine_core::types::ImageRef::Face,
+            aspect_ratio: None,
+            action_response: None,
+        };
+        let produced = vec![ProducedMessage {
+            message_id: Uuid::new_v4(),
+            full_text: "记得呀".into(),
+            action: ActionType::ReplyText,
+        }];
+
+        run(
+            state,
+            session_id,
+            user_id,
+            instance_id,
+            persona_named("Aria"),
+            event,
+            plan,
+            produced,
+            Default::default(),
+        )
+        .await;
+
+        let affinity: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM engine.companion_affinity WHERE instance_id = $1",
+        )
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(affinity, 0, "an erased user gets no affinity row");
+
+        for table in ["companion_memories", "human_facts", "human_profile_state"] {
+            let rows: i64 = sqlx::query_scalar(&format!(
+                "SELECT COUNT(*) FROM engine.{table} WHERE user_id = $1"
+            ))
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(rows, 0, "{table}: nothing is derived for an erased user");
+        }
+        for table in ["relationship_scan_state", "user_insights"] {
+            let rows: i64 = sqlx::query_scalar(&format!(
+                "SELECT COUNT(*) FROM engine.{table} WHERE instance_id = $1"
+            ))
+            .bind(instance_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(rows, 0, "{table}: nothing is derived for an erased user");
+        }
+
+        let insights: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM engine.character_insights WHERE instance_id = $1",
+        )
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            insights, 0,
+            "an erased user's relationship gets no character insights"
+        );
+    }
+
     // ─── The write-time recheck ─────────────────────────────────────
     //
     // The three tests below call `persist_affinity` / `write_turn` /
