@@ -183,16 +183,22 @@ them.
    and blanks as today, then move `erased_at` forward. That lock mode
    conflicts with the guard's `FOR SHARE` and leaves message inserts alone.
 
-The lock waits for a guarded write that passed its check before step 1
-committed, so the deletes after it take what that write left. A failure in
-step 2 leaves the tombstone in place: writes stay blocked, the caller sees an
-error and repeats the call, which is idempotent as before. A mirror that
-reads the tombstone between the two steps drops its copy early and is told
-again when `erased_at` moves.
+The lock waits for a guarded write that holds its `FOR SHARE`, so the deletes
+after it take what that write left. A mirror that reads the tombstone between
+the two steps drops its copy early and is told again when `erased_at` moves.
 
-Not closed: a fact insert is one statement outside any session lock. To
-survive, it would have to start before step 1 commits and still be running
-when step 2 reaches `human_facts`. A repeat erase removes such a row.
+A failure in step 2 leaves the tombstone in place. The caller sees an error
+and repeats the call, which is idempotent as before. Until then no new state
+is opened for the user; the sweepers may still work on the state rows the
+failed call left.
+
+Not closed, one statement wide: a write whose checking statement took its
+snapshot before step 1 committed and reaches its row after the matching
+delete. Under READ COMMITTED that statement does not see the tombstone, even
+when it waited on the step 2 lock; the fact insert can also wait on a row
+step 2 deleted and then insert. Closing it needs a second statement in every
+guarded write, on every turn of every user, which this design does not add. A
+repeat erase removes such a row, and nothing can write another.
 
 ### 6.4 Proof
 

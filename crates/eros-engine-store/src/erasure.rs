@@ -2,6 +2,13 @@
 //! User-level erasure: `erase_user` removes what the engine derived about one
 //! user and records a tombstone (`engine.user_erasures`, one row per erased
 //! user), which is the deletion stream downstream mirrors read.
+//!
+//! The tombstone also means the user is gone: every write that derives
+//! something about a user checks it and writes nothing for an erased one
+//! (`session_archive::lock_live_session`, `HumanFactRepo::upsert_run`,
+//! `ProfileStateRepo::bump`, `ScanStateRepo::bump` and the backfill's row
+//! selection). Chat history the caller keeps is therefore never derived from
+//! again. Readmitting a user is an operator deleting the tombstone row.
 
 use std::collections::BTreeMap;
 
@@ -153,14 +160,45 @@ const BLANKS: &[Blank] = &[
 
 impl ErasureRepo<'_> {
     /// Remove everything the engine derived about `user_id` and record the
-    /// tombstone, in one transaction: deletes, then blanks, then the tombstone.
+    /// tombstone, in two transactions.
     ///
-    /// Idempotent. The tombstone is an upsert that moves `erased_at` forward on
-    /// every call, so a repeat re-announces the erasure on the deletion streams
-    /// for a mirror that missed the first; nothing else is left to touch, so the
-    /// repeat's counts are all 0.
+    /// The first commits the tombstone alone, so every deriving write that
+    /// starts from here on sees it and writes nothing. The second locks the
+    /// user's session rows, then deletes, blanks and moves `erased_at`
+    /// forward. The lock conflicts with the `FOR SHARE` a guarded write holds
+    /// (`lock_live_session`), so a write holding that lock finishes first and
+    /// the deletes take what it left; it does not conflict with a message
+    /// insert's key-share lock.
+    ///
+    /// What is left open is one statement wide: a write whose checking
+    /// statement took its snapshot before the tombstone committed and reaches
+    /// its row after the matching delete (under READ COMMITTED that statement
+    /// does not see the tombstone). A repeat call removes such a row, and
+    /// nothing can write another.
+    ///
+    /// If the second transaction fails, the tombstone stays and a repeat call
+    /// completes the erasure. Until then no new state is opened for the user,
+    /// while the sweepers may still work on the state rows the failed call
+    /// left.
+    ///
+    /// Idempotent. The second transaction's upsert moves `erased_at` forward
+    /// on every call, so a repeat re-announces the erasure on the deletion
+    /// streams for a mirror that missed the first; nothing else is left to
+    /// touch, so the repeat's counts are all 0.
     pub async fn erase_user(&self, user_id: Uuid) -> Result<EraseReport, sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO engine.user_erasures (user_id, erased_at) VALUES ($1, now()) \
+             ON CONFLICT (user_id) DO NOTHING",
+        )
+        .bind(user_id)
+        .execute(self.pool)
+        .await?;
+
         let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT 1 FROM engine.chat_sessions WHERE user_id = $1 FOR NO KEY UPDATE")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
 
         let mut deleted = BTreeMap::new();
         for (table, scope) in DERIVED {
@@ -451,6 +489,95 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    /// A tombstone whose deletes never ran (the erase's second transaction
+    /// failed) is completed by a repeat: the rows go, and the tombstone moves
+    /// forward.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn erase_completes_a_tombstone_left_without_its_deletes(pool: PgPool) {
+        let user = Uuid::new_v4();
+        seed_footprint(&pool, user).await;
+        let stale = Utc.with_ymd_and_hms(2026, 11, 1, 0, 0, 0).unwrap();
+        sqlx::query("INSERT INTO engine.user_erasures (user_id, erased_at) VALUES ($1, $2)")
+            .bind(user)
+            .bind(stale)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let before = footprint(&pool, user).await;
+
+        let report = ErasureRepo { pool: &pool }.erase_user(user).await.unwrap();
+
+        for (table, _) in ERASED_TABLES {
+            assert_eq!(report.deleted[table], before[*table].0, "deleted {table}");
+        }
+        let after = footprint(&pool, user).await;
+        for (table, _) in ERASED_TABLES {
+            assert_eq!(after[*table].0, 0, "{table} emptied");
+        }
+        for (table, _, _) in KEPT_TABLES {
+            assert_eq!(after[*table], (before[*table].0, 0), "{table} blanked");
+        }
+        assert!(report.erased_at > stale);
+        assert_eq!(tombstones(&pool, user).await, vec![report.erased_at]);
+    }
+
+    /// A guarded write that passed its live-session check before the erase
+    /// began is not lost to it: the tombstone is already committed while the
+    /// erase waits on the session row, and the deletes then take the row the
+    /// write committed.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn erase_waits_for_a_guarded_write_and_removes_what_it_wrote(pool: PgPool) {
+        let user = Uuid::new_v4();
+        let session = seed_chat_session(&pool, user).await;
+
+        let mut write = pool.begin().await.unwrap();
+        assert!(
+            crate::session_archive::lock_live_session(&mut write, session)
+                .await
+                .unwrap(),
+            "live before the erase"
+        );
+
+        let erase = tokio::spawn({
+            let pool = pool.clone();
+            async move { ErasureRepo { pool: &pool }.erase_user(user).await }
+        });
+        crate::testutil::wait_for_lock_wait(&pool).await;
+        assert!(!erase.is_finished(), "the erase waits for the write");
+        assert_eq!(
+            tombstones(&pool, user).await.len(),
+            1,
+            "the tombstone is committed before the deletes"
+        );
+
+        sqlx::query(
+            "INSERT INTO engine.companion_memories (user_id, session_id, content, embedding) \
+             SELECT $1, $2, 'user lives in shanghai', \
+                    ('[' || array_to_string(array_fill(0::real, ARRAY[512]), ',') || ']')::vector",
+        )
+        .bind(user)
+        .bind(session)
+        .execute(&mut *write)
+        .await
+        .unwrap();
+        write.commit().await.unwrap();
+
+        let report = erase.await.unwrap().unwrap();
+        assert_eq!(report.deleted["companion_memories"], 1);
+        assert_eq!(
+            count(&pool, "companion_memories", "user_id = $1", user).await,
+            0
+        );
+
+        // From here the same check reads the session as not live.
+        let mut later = pool.begin().await.unwrap();
+        assert!(
+            !crate::session_archive::lock_live_session(&mut later, session)
+                .await
+                .unwrap()
+        );
     }
 
     /// One row of everything for `user`: the repo-written tables through their
