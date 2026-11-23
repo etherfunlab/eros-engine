@@ -716,6 +716,39 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn upsert_if_live_writes_nothing_for_an_erased_user(pool: PgPool) {
+        let repo = MemoryRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id, false).await;
+        crate::testutil::seed_erasure(&pool, user_id).await;
+
+        let written = repo
+            .upsert_if_live(
+                session_id,
+                MemoryLayer::Profile,
+                session_id,
+                user_id,
+                None,
+                "user lives in shanghai",
+                &unit_embedding(7),
+                Some("fact"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(written, None, "an erased user's session is not live");
+
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM engine.companion_memories WHERE user_id = $1")
+                .bind(user_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 0, "nothing is written for an erased user");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn upsert_if_live_writes_what_upsert_writes_on_a_live_session(pool: PgPool) {
         let repo = MemoryRepo { pool: &pool };
         let user_id = Uuid::new_v4();

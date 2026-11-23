@@ -43,10 +43,13 @@ pub struct ProfileStateRepo<'a> {
 impl ProfileStateRepo<'_> {
     /// Add `n` newly ledgered facts to the user's counter, creating the row on
     /// first use, and return the new `pending_facts`. Restarts the idle window.
-    pub async fn bump(&self, user_id: Uuid, n: i32) -> Result<i32, sqlx::Error> {
+    /// `None` = the user is erased (`engine.user_erasures`): no row is created
+    /// and one that outlived the erasure is not counted on.
+    pub async fn bump(&self, user_id: Uuid, n: i32) -> Result<Option<i32>, sqlx::Error> {
         sqlx::query_scalar(
             "INSERT INTO engine.human_profile_state (user_id, pending_facts, last_fact_at) \
-             VALUES ($1, $2, now()) \
+             SELECT $1, $2, now() \
+             WHERE NOT EXISTS (SELECT 1 FROM engine.user_erasures WHERE user_id = $1) \
              ON CONFLICT (user_id) DO UPDATE SET \
                 pending_facts = human_profile_state.pending_facts + EXCLUDED.pending_facts, \
                 last_fact_at  = now() \
@@ -54,7 +57,7 @@ impl ProfileStateRepo<'_> {
         )
         .bind(user_id)
         .bind(n)
-        .fetch_one(self.pool)
+        .fetch_optional(self.pool)
         .await
     }
 
@@ -209,14 +212,39 @@ mod tests {
         let user = Uuid::new_v4();
         assert!(repo.load(user).await.unwrap().is_none());
 
-        assert_eq!(repo.bump(user, 3).await.unwrap(), 3);
-        assert_eq!(repo.bump(user, 18).await.unwrap(), 21);
+        assert_eq!(repo.bump(user, 3).await.unwrap(), Some(3));
+        assert_eq!(repo.bump(user, 18).await.unwrap(), Some(21));
 
         let s = repo.load(user).await.unwrap().expect("row exists");
         assert_eq!(s.pending_facts, 21);
         assert!(s.last_fact_at.is_some());
         assert!(s.last_rebuilt_at.is_none());
         assert_eq!((s.rebuild_failures, s.claimed_at), (0, None));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn bump_creates_nothing_for_an_erased_user(pool: PgPool) {
+        let repo = ProfileStateRepo { pool: &pool };
+        let (erased, other) = (Uuid::new_v4(), Uuid::new_v4());
+        crate::testutil::seed_erasure(&pool, erased).await;
+
+        assert_eq!(repo.bump(erased, 3).await.unwrap(), None);
+        assert!(repo.load(erased).await.unwrap().is_none(), "no state row");
+
+        assert_eq!(repo.bump(other, 3).await.unwrap(), Some(3));
+    }
+
+    /// A state row that outlived its user's tombstone is not counted on.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn bump_leaves_an_erased_users_surviving_row_alone(pool: PgPool) {
+        let repo = ProfileStateRepo { pool: &pool };
+        let user = Uuid::new_v4();
+        assert_eq!(repo.bump(user, 2).await.unwrap(), Some(2));
+        crate::testutil::seed_erasure(&pool, user).await;
+
+        assert_eq!(repo.bump(user, 5).await.unwrap(), None);
+        let s = repo.load(user).await.unwrap().expect("row still there");
+        assert_eq!(s.pending_facts, 2);
     }
 
     #[sqlx::test(migrations = "./migrations")]

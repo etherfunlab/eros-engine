@@ -192,6 +192,9 @@ impl HumanFactRepo<'_> {
     /// disagree. One statement means a failed run changes nothing, so a retry
     /// cannot count a fact twice.
     ///
+    /// An erased user (`engine.user_erasures`) gets no fact: the statement
+    /// writes nothing and the count is 0.
+    ///
     /// `first_seen_at` / `last_seen_at` are the database clock at the write, not
     /// the time the run started: the export keyset orders on `last_seen_at`, so a
     /// stamp older than the commit would let a consumer that already advanced
@@ -234,6 +237,7 @@ impl HumanFactRepo<'_> {
                  ORDER BY (evidence_type = 'roleplay_expression'), \
                           md5(engine.fact_norm(content)), ord \
              ) AS batch \
+             WHERE NOT EXISTS (SELECT 1 FROM engine.user_erasures WHERE user_id = $1) \
              ON CONFLICT (user_id, roleplay, content_hash) DO UPDATE SET \
                 occurrences     = human_facts.occurrences + 1, \
                 session_count   = human_facts.session_count + CASE \
@@ -492,6 +496,21 @@ mod tests {
             Recurrence::RepeatedAcrossSessions.as_str(),
             "repeated_across_sessions"
         );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn upsert_run_writes_nothing_for_an_erased_user(pool: PgPool) {
+        let repo = HumanFactRepo { pool: &pool };
+        let (erased, other) = (Uuid::new_v4(), Uuid::new_v4());
+        crate::testutil::seed_erasure(&pool, erased).await;
+        let facts = [fact("用户喜欢爬山", "explicit_statement", "stable")];
+        let none = src(None, None, None);
+
+        assert_eq!(repo.upsert_run(erased, &facts, &none).await.unwrap(), 0);
+        assert!(repo.list_for_user(erased).await.unwrap().is_empty());
+
+        assert_eq!(repo.upsert_run(other, &facts, &none).await.unwrap(), 1);
+        assert_eq!(repo.list_for_user(other).await.unwrap().len(), 1);
     }
 
     #[sqlx::test(migrations = "./migrations")]

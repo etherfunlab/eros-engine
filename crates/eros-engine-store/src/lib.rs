@@ -164,6 +164,16 @@ pub(crate) mod testutil {
         .unwrap()
     }
 
+    /// A tombstone for `user_id`, stamped now: what `ErasureRepo::erase_user`
+    /// leaves, without the deletes.
+    pub(crate) async fn seed_erasure(pool: &PgPool, user_id: Uuid) {
+        sqlx::query("INSERT INTO engine.user_erasures (user_id, erased_at) VALUES ($1, now())")
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
     /// Persist one `role='user'` message in `session_id` and return its id, for
     /// the six event tables and `chat_messages.user_message_id` itself, all of
     /// which FK-reference `chat_messages.id` since 0058.

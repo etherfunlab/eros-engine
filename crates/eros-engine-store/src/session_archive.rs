@@ -12,24 +12,40 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
+/// A live session: known, not archived, and its owner not erased. A user in
+/// `engine.user_erasures` is gone, so nothing more is derived from any of
+/// their sessions (see `ErasureRepo::erase_user`).
+const LIVE_SESSION: &str = "FROM engine.chat_sessions s \
+     WHERE s.id = $1 AND NOT s.archived \
+       AND NOT EXISTS (SELECT 1 FROM engine.user_erasures e WHERE e.user_id = s.user_id)";
+
 /// Whether `session_id` is live, holding its row `FOR SHARE` for the rest of
 /// `tx` when it is. The `_if_live` writers call this first and write in the
 /// same transaction, which leaves no gap for an archive to land in:
 /// `archive_relationship`'s first statement updates this row, so it waits for
 /// `tx` to commit and its deletes then take the new row with the rest; and a
 /// lock requested once the archive has updated the row waits for it and then
-/// finds the session archived. An unknown id reads back as not live too.
+/// finds the session archived. An erasure serializes the same way: it commits
+/// its tombstone, then locks the user's session rows before it deletes. An
+/// unknown id reads back as not live too.
 pub async fn lock_live_session(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     session_id: Uuid,
 ) -> Result<bool, sqlx::Error> {
-    let live: Option<i32> = sqlx::query_scalar(
-        "SELECT 1 FROM engine.chat_sessions WHERE id = $1 AND NOT archived FOR SHARE",
-    )
-    .bind(session_id)
-    .fetch_optional(&mut **tx)
-    .await?;
+    let live: Option<i32> = sqlx::query_scalar(&format!("SELECT 1 {LIVE_SESSION} FOR SHARE OF s"))
+        .bind(session_id)
+        .fetch_optional(&mut **tx)
+        .await?;
     Ok(live.is_some())
+}
+
+/// [`lock_live_session`]'s answer without the lock: for an entry check that
+/// decides whether work is worth starting, not for guarding a write.
+pub async fn is_live(pool: &PgPool, session_id: Uuid) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(&format!("SELECT EXISTS (SELECT 1 {LIVE_SESSION})"))
+        .bind(session_id)
+        .fetch_one(pool)
+        .await
 }
 
 pub struct SessionArchiveRepo<'a> {
@@ -223,12 +239,51 @@ impl<'a> SessionArchiveRepo<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{lock_live_session, SessionArchiveRepo};
+    use super::{is_live, lock_live_session, SessionArchiveRepo};
     use crate::chat::ChatRepo;
-    use crate::testutil::seed_persona_instance;
+    use crate::testutil::{seed_erasure, seed_persona_instance, seed_session};
     use crate::user_insight::{UserInsightEventInsert, UserInsightEventRepo, UserInsightRepo};
     use sqlx::PgPool;
     use uuid::Uuid;
+
+    /// An erased owner's sessions read as not live, whatever their channel: a
+    /// group session carries no instance, so the owner is reached through the
+    /// session's own `user_id`. Another user's session is untouched.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_erased_owners_sessions_are_not_live(pool: PgPool) {
+        let (erased, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let instance = seed_persona_instance(&pool, erased).await;
+        let text = seed_session(&pool, erased, instance, false).await;
+        let group: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, channel) VALUES ($1, 'group') RETURNING id",
+        )
+        .bind(erased)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let other_instance = seed_persona_instance(&pool, other).await;
+        let others = seed_session(&pool, other, other_instance, false).await;
+
+        async fn locked(pool: &PgPool, session: Uuid) -> bool {
+            let mut tx = pool.begin().await.unwrap();
+            lock_live_session(&mut tx, session).await.unwrap()
+        }
+        for session in [text, group, others] {
+            assert!(locked(&pool, session).await, "live before the erasure");
+            assert!(is_live(&pool, session).await.unwrap());
+        }
+
+        seed_erasure(&pool, erased).await;
+        for (session, live, what) in [
+            (text, false, "the erased owner's text session"),
+            (group, false, "the erased owner's group session"),
+            (others, true, "another user's session"),
+        ] {
+            assert_eq!(locked(&pool, session).await, live, "{what}");
+            assert_eq!(is_live(&pool, session).await.unwrap(), live, "{what}");
+        }
+        assert!(!is_live(&pool, Uuid::new_v4()).await.unwrap(), "unknown id");
+    }
 
     #[sqlx::test(migrations = "./migrations")]
     async fn archive_relationship_drops_memberships(pool: PgPool) {

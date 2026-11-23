@@ -64,23 +64,22 @@ fn client_id_from_event(event: &Event) -> Option<String> {
     super::handlers::audit_from_event(event).and_then(|a| a.user.clone())
 }
 
-/// True when the session is still live. `get_session` filters `NOT archived`
-/// (migration 0052), so an archived session — or a read that errors, or an id
-/// that never existed — reads back as "not live" here; all three fail closed.
+/// True when the session is still live: not archived, and its owner not
+/// erased (`session_archive::is_live`). An archived session, an erased user's
+/// session, a read that errors and an id that never existed all read back as
+/// "not live" here; all four fail closed.
 ///
 /// The entry check of `run` and `run_group`: it skips the model and embedding
-/// calls for a session that is already archived when the task starts. It does
-/// not guard the writes. An archive can still commit while those calls run, so
-/// each write checks for itself — the `_if_live` store methods lock the session
-/// row in the write's own transaction, which leaves no window for an archive to
-/// land between the check and the write.
+/// calls for a session that is already archived, or whose owner is already
+/// erased, when the task starts. It does not guard the writes. An archive or
+/// an erasure can still commit while those calls run, so each write checks for
+/// itself — the `_if_live` store methods lock the session row in the write's
+/// own transaction, which leaves no window for either to land between the
+/// check and the write.
 async fn session_still_live(state: &AppState, session_id: Uuid) -> bool {
-    ChatRepo { pool: &state.pool }
-        .get_session(session_id)
+    eros_engine_store::session_archive::is_live(&state.pool, session_id)
         .await
-        .ok()
-        .flatten()
-        .is_some()
+        .unwrap_or(false)
 }
 
 /// Spawned by `pipeline::run`. Owned `state` so the future is `'static`.
@@ -1472,6 +1471,7 @@ async fn extract_insights(
 /// counter. Returns the counter after the bump, or `None` when either write
 /// fails: a ledger failure must not move the counter, and a counter failure
 /// leaves the idle sweeper without a count to act on until the next fact.
+/// `None` too for an erased user, for whom neither write happens.
 async fn record_facts(
     state: &AppState,
     user_id: Uuid,
@@ -1499,7 +1499,7 @@ async fn record_facts(
         .bump(user_id, written as i32)
         .await
     {
-        Ok(pending) => Some(pending),
+        Ok(pending) => pending,
         Err(e) => {
             tracing::warn!(%user_id, "profile rebuild counter bump failed: {e}");
             None
