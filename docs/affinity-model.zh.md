@@ -192,13 +192,14 @@ PDE 判定的 ghost 回合从不进入 `persist_with_event`：只有 `ghost_stre
 
 ### 被拒绝的动作
 
-聊天回合可以带用户动作（见 [api-reference.zh.md](api-reference.zh.md) 的 `action` 字段）。PDE 判官在生成回复之前决定角色接不接受；没有明确拒绝时，engine 按接受处理。例外是递来角色不用的烟、酒、大麻、咖啡或一道菜：掷一次可能就拒收，不管判官怎么说（见[角色设置](life-events-needs.zh.md#角色设置)）。
+聊天回合可以带用户动作（见 [api-reference.zh.md](api-reference.zh.md) 的 `action` 字段）。PDE 判官在生成回复之前决定角色接不接受；没有明确拒绝时，engine 按接受处理。例外是递来角色不用的烟、酒、大麻、咖啡或一道菜，或者在她不碰这些时请她一起抽烟、抽大麻、喝酒：掷一次可能就拒收，不管判官怎么说（见[角色设置](life-events-needs.zh.md#角色设置)）。
 
 - **接受：** 没有额外机制。affinity 判官从用户文本里看到这个动作，照常给这一轮打分。
 - **拒绝：** 动作对应的那条线（`give` 与 `gift` 动 Bond，身体动作动 Chemistry）降一档，落在下一档内的相同相对位置；第 1 档的线直接归 `0`。这条线的两个轴按同一比例缩放，比例保持不变。落点在行锁内按本轮之前的快照计算，取代判官本轮对这条线的打分；另一条线和 warmth / patience 档照判官走。这条线的 `pending_deltas` 清零，事件行的 `context.tier_drop` 记下是哪条线。affinity 判官被跳过或调用失败时照样降档。
 - **被拒的打赏：** `tip` 不降档。回复照判官的结论写，这一轮按常规打分。
 - **社交动作：** 被拒的 `bluff`、`threaten`、`trick` 表示她识破了，同样不降档；这一轮按常规打分。
-- **脱衣服：** `affinity_scope` 性向不相容的一对发来的 `strip`，不管判官怎么说都判为拒绝，并像任何被拒的身体动作一样让 Chemistry 降一档。这样的一对发来的 `shower_together` 或 `bath_together` 同样如此；`sauna_together` 没有这条规则。
+- **脱衣服：** `affinity_scope` 性向不相容的一对发来的 `strip`，不管判官怎么说都判为拒绝，并像任何被拒的身体动作一样让 Chemistry 降一档。这样的一对发来的 `shower_together`、`bath_together`、`sex_together` 或 `streak_together` 同样如此，机器角色收到的 `toilet_together` 也一样；其余一起做的动作没有这条规则。掷骰拒掉的 `smoke_together`、`smoke_weed_together` 或 `drink_together` 同样降 Chemistry，不降 Bond。
+- **求婚：** 被拒的 `propose` 不降档，这一轮按常规打分。
 - **礼物：** 被接受时还会进入角色的持有物品或衣柜；被拒时什么也不进，并像被拒的 `give` 一样让 Bond 掉一档。
 - **约会：** 被拒的 `date` 邀约不降档，这一轮按常规打分。被接受的根本不打分：它开启约会，约会在结算时整场评一次（见[下文](#约会)）。
 

@@ -386,13 +386,14 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 ≤ 16 个 key，key 满足 `[A-Za-z0-9_.-]{1,64}`，value 必须是 string
 且 ≤ 512 字符。违反作为 pre-stream 错误返回 `400 BadRequest`。
 
-**可选：动作。** 请求体可以带 `action`，表示用户在说话之外对角色做的事。角色可能接受，也可能不接受；不接受时，这段关系在动作对应的那条线上降一档（`give` 和 `gift` 动 bond，身体动作和自定义动作动 chemistry），被拒的 `tip`、`bluff`、`threaten`、`trick` 不降档（见 [affinity-model.zh.md](affinity-model.zh.md)）。
+**可选：动作。** 请求体可以带 `action`，表示用户在说话之外对角色做的事。角色可能接受，也可能不接受；不接受时，这段关系在动作对应的那条线上降一档（`give` 和 `gift` 动 bond，身体动作和自定义动作动 chemistry），被拒的 `tip`、`bluff`、`threaten`、`trick`、`propose` 不降档（见 [affinity-model.zh.md](affinity-model.zh.md)）。
 
 | `type` | 字段 |
 |---|---|
 | `give` | `item`：下表中的一类，必填；`name`：可选，1–32 字符；`quantity`：可选，1–99，默认 1 |
-| `kiss`、`hug`、`touch`、`lick`、`french_kiss`、`hug_from_behind`、`tease`、`pat`、`wink`、`blink`、`ask_for_dance`、`ask_dancing`、`photo`、`strip`、`shower_together`、`bath_together`、`sauna_together` | 无 |
+| `kiss`、`hug`、`touch`、`lick`、`french_kiss`、`hug_from_behind`、`tease`、`pat`、`wink`、`blink`、`ask_for_dance`、`ask_dancing`、`photo`、`strip`、`shower_together`、`bath_together`、`sauna_together`、`toilet_together`、`smoke_together`、`fall_asleep_together`、`sex_together`、`walk_together`、`smoke_weed_together`、`jog_together`、`yoga_together`、`stargaze_together`、`ride_horse_together`、`streak_together`、`drink_together` | 无 |
 | `bluff`、`threaten`、`trick` | 无 |
+| `propose` | 无 |
 | `custom` | `text`：必填，1–100 字符 |
 | `tip` | `amount_usd`：必填，有限数值，`> 0` 且 `≤ 1_000_000_000` |
 | `gift` | `kind`：`item` \| `clothing`（必填）；`name`：必填，1–64 字 |
@@ -416,19 +417,41 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 | 5 | 3 3 2 2 1 | 1 2 2 3 3 | 1 2 3 2 1 |
 | 数量 > 5 | 4 3 3 2 1 | 1 2 3 4 4 | 1 3 4 2 1 |
 
-一个回合指文字 session 或它的约会子会话里的一条用户消息；产品咨询消息和语音通话不计数，也没有时间上限。这份状态会进判官、回复 prompt 和画图 composer，并经 `body_state` 帧和 [`GET /v2/comp/session/{session_id}/effects`](#get-v2compsessionsession_ideffects) 给到调用方。被拒绝的 give 没有余效。设计文档：[余效 spec](superpowers/specs/2026-10-12-given-item-lingering-effects-design.md)、[give 品类 spec](superpowers/specs/2026-10-13-give-categories-design.md)。
+一个回合指文字 session 或它的约会子会话里的一条用户消息；产品咨询消息和语音通话不计数，也没有时间上限。这份状态会进判官、回复 prompt 和画图 composer，并经 `body_state` 帧和 [`GET /v2/comp/session/{session_id}/effects`](#get-v2compsessionsession_ideffects) 给到调用方。被拒绝的 give 没有余效。被接受的 `smoke_together`、`smoke_weed_together` 或 `drink_together` 按一次给 1 份 `cigarette`、`herb` 或 `alcohol`、不带 `name` 的 give 留下余效。设计文档：[余效 spec](superpowers/specs/2026-10-12-given-item-lingering-effects-design.md)、[give 品类 spec](superpowers/specs/2026-10-13-give-categories-design.md)。
 
-**递来她不用的东西。** 角色的 `art_metadata.smoking`、`alcoholic`、`drug`、`coffee`、`gluttony` 表示她抽不抽烟、喝不喝酒、用不用大麻、喝不喝咖啡、贪不贪吃（表在[下文](#post-v2compsessionsession_idevents)）。递 `cigarette`、`alcohol`、`herb`、`coffee` 或 `cuisine` 而对应的键为 `false` 时，engine 在判官运行之前掷一次。三次里有一次，这一轮照常进行。其余情况回应就是 `refuse`，不管判官怎么答，也不管有没有 LLM 判官：`action_response` 帧和两套历史接口返回的 `response` 都是 `refuse`，这次 give 不留余效，并像任何被拒的 give 一样让 bond 线降一档。判官会被告知这个结果（见 [model-config.zh.md](model-config.zh.md#taskspde_decision--opt-in-llm-pde-判断器)）。键为 `true` 或不写时从不掷，其他物品和其他动作也不掷。
+**递来她不用的东西。** 角色的 `art_metadata.smoking`、`alcoholic`、`drug`、`coffee`、`gluttony` 表示她抽不抽烟、喝不喝酒、用不用大麻、喝不喝咖啡、贪不贪吃（表在[下文](#post-v2compsessionsession_idevents)）。递 `cigarette`、`alcohol`、`herb`、`coffee` 或 `cuisine` 而对应的键为 `false` 时，engine 在判官运行之前掷一次。三次里有一次，这一轮照常进行。其余情况回应就是 `refuse`，不管判官怎么答，也不管有没有 LLM 判官：`action_response` 帧和两套历史接口返回的 `response` 都是 `refuse`，这次 give 不留余效，并像任何被拒的 give 一样让 bond 线降一档。判官会被告知这个结果（见 [model-config.zh.md](model-config.zh.md#taskspde_decision--opt-in-llm-pde-判断器)）。`smoke_together`、`smoke_weed_together` 或 `drink_together` 也这样掷，按一次给 1 份 `cigarette`、`herb` 或 `alcohol` 的 give；被拒时降的是 chemistry 线，不是 bond。键为 `true` 或不写时从不掷，其他物品和其他动作也不掷。
 
 **社交动作。** `bluff`、`threaten`、`trick` 的回应表示她有没有中招：`accept` 是信了、被吓到了、上当了，`refuse` 是没信、没吃这一套、识破了。和所有动作一样，没有判定时算 `accept`。识破不降档，这一轮由亲密度判官照常评。
 
 **脱衣服。** `strip` 是用户脱她的衣服，只有性向相容的一对才可能被接受：这一轮的 `affinity_scope` 含暧昧感轴，`memory_scope` 是什么都不影响。其余的 `strip` 在判官运行之前就判为拒绝，不管判官怎么答，也不管有没有 LLM 判官，并像任何被拒的身体动作一样让 chemistry 线降一档。被接受的 `strip` 让她这一轮没穿衣服：穿着写成衣服被对方脱掉了，有指定 `outfit` 时写成「{outfit}」被对方脱掉了，进回复也进图。有出图能力时它像拍照一样回她的图（见下）。
 
-**一起洗澡、淋浴、蒸桑拿。** `shower_together`、`bath_together`、`sauna_together` 是请她和用户一起淋浴、泡澡、蒸桑拿。由判官决定，被拒时 chemistry 线降一档，和任何被拒的身体动作一样。性向不相容的一对发来的 `shower_together` 或 `bath_together`，和 `strip` 一样，在判官运行之前就判为拒绝，不管判官怎么答，也不管有没有 LLM 判官；`sauna_together` 没有这条规则。被接受的动作让她进入一个事件，与她存下的回答在同一个事务里写入，以用户那条消息为键，所以重新驱动的回合只写一次：`showering_together`（30 分钟）、`bathing_together`（30 分钟）或 `sauna_together`（1 小时）。它开始时，正在进行的插曲结束，背景继续。在约会里被接受时什么都不写：约会的 `on_a_date` 保持原样，约会继续。事件持续期间在 [`GET …/effects`](#get-v2compsessionsession_ideffects) 里以 `event` 出现。有出图能力时，被接受的这一回合回她的图（见下），图里画的就是这个事件。规则见 [life-events-needs.zh.md](life-events-needs.zh.md#一起淋浴泡澡和蒸桑拿)。
+**一起做的动作。** `shower_together`、`bath_together`、`sauna_together` 是请她和用户一起淋浴、泡澡、蒸桑拿；另有十二种请她和用户一起做别的事（见下表）。由判官决定，被拒时 chemistry 线降一档，和任何被拒的身体动作一样。性向不相容的一对发来的 `shower_together`、`bath_together`、`sex_together` 或 `streak_together`，和 `strip` 一样，以及机器角色（`art_metadata.species` 为 `"robot"` 或 `"android"`）收到的 `toilet_together`，在判官运行之前就判为拒绝，不管判官怎么答，也不管有没有 LLM 判官；其余的没有这类规则。被接受的动作让她进入一个事件，与她存下的回答在同一个事务里写入，以用户那条消息为键，所以重新驱动的回合只写一次：
 
-**让你拍照。** 请求带 `image`、部署配置了 `[tasks.chat_image_prompt_compose]` 时，被接受的 `photo` 以 `reply_text_image` 回复：先是她的话，再是一条以她的脸部参考为基础、按当前场景组出来的 `image_request`。有没有 LLM 判官都一样。被接受的 `strip` 也这样回复，被接受的 `ask_dancing`（用户想看她跳支舞，图是她在跳舞）和被接受的 `shower_together`、`bath_together`、`sauna_together` 也一样。被拒的 `photo`、`strip`、`ask_dancing` 或一起做的动作，或没有这项出图能力的，只回文字，即使判官提议了出图。`image.force = true` 仍让这一轮是 `reply_image`，被拒时图按拒绝的结果来画。
+| 动作 | 事件 | 持续 |
+|---|---|---|
+| `shower_together` | `showering_together` | 30 分钟 |
+| `bath_together` | `bathing_together` | 30 分钟 |
+| `sauna_together` | `sauna_together` | 1 小时 |
+| `toilet_together` | `using_toilet_together` | 30 分钟 |
+| `smoke_together` | `smoking_together` | 30 分钟 |
+| `fall_asleep_together` | `asleep_together` | 1–4 小时 |
+| `sex_together` | `having_sex_together` | 1 小时 |
+| `walk_together` | `walking_together` | 1 小时 |
+| `smoke_weed_together` | `smoking_weed_together` | 30 分钟 |
+| `jog_together` | `jogging_together` | 1 小时 |
+| `yoga_together` | `yoga_together` | 1 小时 |
+| `stargaze_together` | `stargazing_together` | 1 小时 |
+| `ride_horse_together` | `horse_riding_together` | 1 小时 |
+| `streak_together` | `streaking_together` | 30 分钟 |
+| `drink_together` | `drinking_together` | 1 小时 |
 
-**情绪化回复。** 部署打开 [`tones.emotional`](model-config.zh.md#tones--聊天语气仅限-chat-任务)（大于 0）时，带 `french_kiss`、`tease`、`hug_from_behind`、`touch`、`strip`、`shower_together`、`bath_together`、`threaten` 或 `tip` 的回合用 `emotional` 语气回复，接受、拒绝都一样：回复只凭人设、这个动作和她的决定来写，不看聊天历史、用户画像和亲密度结论。接受还是拒绝仍照上面的方式决定。回复的行带 `metadata.tone = "emotional"`。
+它开始时，正在进行的插曲结束，背景继续。这些事件都不让她离线：`asleep_together` 期间她也照常回复。在约会里被接受时什么都不写：约会的 `on_a_date` 保持原样，约会继续。事件持续期间在 [`GET …/effects`](#get-v2compsessionsession_ideffects) 里以 `event` 出现。有出图能力时，被接受的这一回合回她的图（见下），图里画的就是这个事件。被接受的 `smoke_together`、`smoke_weed_together` 或 `drink_together` 在习惯掷骰（见上）、挪动的需求和余效（见上）这三件事上算作给了 1 份 `cigarette`、`herb` 或 `alcohol` 的 `give`，此外都不算：被拒时降 chemistry，不降 bond。规则见 [life-events-needs.zh.md](life-events-needs.zh.md#一起淋浴泡澡和蒸桑拿)。
+
+**上床与求婚。** `sex_together` 和 `propose` 是请她上床、向她求婚：她自己提出的 `sleep_together` 和 `propose`（见[生活选择](#post-v2compsessionsession_idlife-choiceschoice_id)）由用户反过来提。她在一个 session 或它的约会里答应过用户的 `sex_together` 之后，在这个 session 里不会再自己提出 `sleep_together`，答应过用户的 `propose` 之后不会再自己提出 `propose`；被拒的不算，她已经提出、还在等回答的请求保持原样。约会之外被接受的 `sex_together` 写入 `having_sex_together`，在抽取看来结束她的处女身份（见[事件](#post-v2compsessionsession_idevents)）。`propose` 不是一起做的动作：不写事件，本身也不是出图回合（判官选了出图时照常出图），判官之前没有任何规则，被拒时哪条线都不降。两者用户都可以再提，每次都由判官决定。
+
+**让你拍照。** 请求带 `image`、部署配置了 `[tasks.chat_image_prompt_compose]` 时，被接受的 `photo` 以 `reply_text_image` 回复：先是她的话，再是一条以她的脸部参考为基础、按当前场景组出来的 `image_request`。有没有 LLM 判官都一样。被接受的 `strip` 也这样回复，被接受的 `ask_dancing`（用户想看她跳支舞，图是她在跳舞）和任何被接受的一起做的动作也一样。被拒的 `photo`、`strip`、`ask_dancing` 或一起做的动作，或没有这项出图能力的，只回文字，即使判官提议了出图。`image.force = true` 仍让这一轮是 `reply_image`，被拒时图按拒绝的结果来画。
+
+**情绪化回复。** 部署打开 [`tones.emotional`](model-config.zh.md#tones--聊天语气仅限-chat-任务)（大于 0）时，带 `french_kiss`、`tease`、`hug_from_behind`、`touch`、`strip`、`shower_together`、`bath_together`、`sex_together`、`streak_together`、`propose`、`threaten` 或 `tip` 的回合用 `emotional` 语气回复，接受、拒绝都一样：回复只凭人设、这个动作和她的决定来写，不看聊天历史、用户画像和亲密度结论。接受还是拒绝仍照上面的方式决定。回复的行带 `metadata.tone = "emotional"`。
 
 **约会。** `date` 是约她出去。先过 engine 的门槛：`short` 没有门槛，`mid` 要求 bond 达到第 2 档，她离线或正在另一场约会里时一律不通过；
 门槛不通过就是拒绝，不管判官怎么答。被拒时这一回合是没有代价的普通回合。被接受时，这一回合的 `final` 帧带 `activity`：
@@ -549,7 +572,7 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 - `ghost`：`meta(action_type=ghost) → done → final` — 无 `delta`，`meta` 中无 `model`，`done` 的 `usage` 和 `generation_id` 均为 `null`。该轮伴侣保持沉默，未调用聊天模型。
 - 带推理的回合：判官返回了推理时，`reasoning*` 排在这份列表里每种形状的最前面，在 `action_response` 和 `body_state` 之前：`reasoning* → meta(reply) → delta* → done → final`
 - 动作轮次：形状相同，只是 `action_response` 排在第一个 `meta` 之前——`action_response → meta(reply) → delta* → done → final`；不会是 `ghost` 或 `product_qa`
-- 有出图能力时被接受的 `photo`、`strip`、`ask_dancing`、`shower_together`、`bath_together` 或 `sauna_together`：`action_response → meta(reply_text_image) → delta* → done → image_request → final`
+- 有出图能力时被接受的 `photo`、`strip`、`ask_dancing` 或一起做的动作：`action_response → meta(reply_text_image) → delta* → done → image_request → final`
 - 被接受的 `date`：`action_response → meta(reply) → delta* → done → final`，`final` 上带 `activity`
 - 带余效或已知需求的回合：`body_state` 位于第一个 `meta` 之前，两者都发时排在 `action_response` 之后——例如 `action_response → body_state → meta(reply) → delta* → done → final`
 - `product_qa`：`meta(action_type=product_qa) → delta* → done → final` — 形状与普通文本回复相同，由独立的模型链（`[tasks.chat_product_qa]`）流式生成，而非 `chat_companion`；落库时带 `channel='product_qa'`，重放时同样报告为 `product_qa`。
@@ -881,7 +904,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | 字段 | 规则 |
 |---|---|
 | `event_key` | 必填：1–128 个 `[A-Za-z0-9_.:-]` 字符，只在本会话内有效。同一个 key 返回同一个事件 |
-| `kinds` | 选填。不带或 `null`：全部种类。数组：只抽列出的种类（`[]`：什么都不抽）。对象 `{"allow": […], "disallow": […]}`：`allow` 允许的种类（不带或 `null`：全部；`[]`：一种都没有）去掉 `disallow` 列出的种类；两边都列了的种类不抽，`{}` 等于全部种类。对象里出现未知的键，或出现未知种类，返回 `422`；写了 `taking_space`、`fell_out`、`traveling_together`、`bathing_together`、`on_a_date`、`showering_together` 或 `sauna_together` 同样返回 `422`：它们由 engine 自己写入，从不抽取 |
+| `kinds` | 选填。不带或 `null`：全部种类。数组：只抽列出的种类（`[]`：什么都不抽）。对象 `{"allow": […], "disallow": […]}`：`allow` 允许的种类（不带或 `null`：全部；`[]`：一种都没有）去掉 `disallow` 列出的种类；两边都列了的种类不抽，`{}` 等于全部种类。对象里出现未知的键，或出现未知种类，返回 `422`；写了 `taking_space`、`fell_out`、`traveling_together`、`bathing_together`、`on_a_date`、`showering_together`、`sauna_together` 或其余一起做的动作写入的十二种之一，同样返回 `422`：它们由 engine 自己写入，从不抽取 |
 | `user_timezone`、`user_country`、`user_region`、`tier`、`prompt_traits`、`memory_scope`、`affinity_scope`、`audit` | 与 `/open` 相同，用于生成这条消息 |
 | `image` | 选填：`{"style", "aspect_ratio", "prompt_variant"}`，各字段与聊天回合的 `image` 相同（没有 `force`；不支持的 `aspect_ratio` 返回 `422`）。表示调用方能处理图：部署配了 `[tasks.chat_image_prompt_compose]` 时，`taking_selfie` 或 `strip` 的消息会带上她的图（见下）。不带、或没配 composer：只有文字。其他种类忽略它 |
 | `outfit` | 选填：她穿什么，与聊天回合相同——通常是她衣橱里的一项，不做核对；去掉首尾空白后 1–64 个字符，空白等于不带，超长返回 `422`。她的话会跟着这身衣服，图也会。`strip` 时她刚把它脱了：刚把「{outfit}」脱了，不带时是刚把衣服脱了。不带：prompt 里没有穿着，composer 按场景给她穿 |
@@ -963,12 +986,12 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 
 时长写成区间的，在事件开始时从区间里抽定。以上共 70 种可抽取的种类。两种性别都会抽到两个聚会，权重相同，这是有意为之。
 
-另有七种永远不会被抽到：`taking_space`（她提出、用户同意的分开，12–24 小时，离线）、`fell_out`（用户不理会她提出的分开请求时的那场不愉快，1 小时）、`traveling_together`（她提议、用户同意的旅行，48–72 小时，`trip` 类背景，不离线）、`bathing_together`（她提议、用户同意的一起洗澡，或她答应的 `bath_together`，30 分钟，`short` 类插曲，不离线）、`on_a_date`（用户约她、她答应了的约会，1 或 4 小时，`short` 类插曲，不离线）、`showering_together`（她答应的 `shower_together`，30 分钟，`short` 类插曲，不离线）和 `sauna_together`（她答应的 `sauna_together`，1 小时，`short` 类插曲，不离线）。
-前四种由 engine 为[生活选择流程](#post-v2compsessionsession_idlife-choiceschoice_id)写入（第四种也为那个动作写入），`on_a_date` 为[约会](activities.zh.md)写入，后两种为[一起做的动作](#post-compchatsession_idmessagestream)写入。它们作为 `…/effects` 里的 `event` 出现，前四种也作为生活选择响应里的 `event` 出现，
+另有十九种永远不会被抽到：`taking_space`（她提出、用户同意的分开，12–24 小时，离线）、`fell_out`（用户不理会她提出的分开请求时的那场不愉快，1 小时）、`traveling_together`（她提议、用户同意的旅行，48–72 小时，`trip` 类背景，不离线）、`bathing_together`（她提议、用户同意的一起洗澡，或她答应的 `bath_together`，30 分钟，`short` 类插曲，不离线）、`on_a_date`（用户约她、她答应了的约会，1 或 4 小时，`short` 类插曲，不离线）、`showering_together`（她答应的 `shower_together`，30 分钟，`short` 类插曲，不离线）、`sauna_together`（她答应的 `sauna_together`，1 小时，`short` 类插曲，不离线），以及其余一起做的动作写入的十二种，从 `using_toilet_together` 到 `drinking_together`（她答应的对应动作，除 `mid` 的 `asleep_together` 外都是 `short` 类插曲，都不离线；时长见[一起做的动作](#post-compchatsession_idmessagestream)的表）。
+前四种由 engine 为[生活选择流程](#post-v2compsessionsession_idlife-choiceschoice_id)写入（第四种也为那个动作写入），`on_a_date` 为[约会](activities.zh.md)写入，其余为[一起做的动作](#post-compchatsession_idmessagestream)写入。它们作为 `…/effects` 里的 `event` 出现，前四种也作为生活选择响应里的 `event` 出现，
 不能写进 `kinds`。
 
 `sudden_desire`、`strip`、`streaking`、`having_sex`、`just_have_sex`、`masturbating` 与 `pregnancy_scare`（后者隐含性行为）带成人题材；只对部分用户提供这类内容的调用方，用
-`{"disallow": ["sudden_desire", "strip", "streaking", "having_sex", "just_have_sex", "masturbating", "pregnancy_scare"]}` 把它们排除。`scolded_by_superior` 与 `scolded_superior`
+`{"disallow": ["sudden_desire", "strip", "streaking", "having_sex", "just_have_sex", "masturbating", "pregnancy_scare"]}` 把它们排除。`having_sex_together` 和 `streaking_together` 也带成人题材，但只有被接受的 `sex_together` 或 `streak_together` 会写入它们，所以这样的调用方不发这两种动作。`scolded_by_superior` 与 `scolded_superior`
 假定她有上级；角色没有上级时，由调用方排除。`disallow` 列表之外的种类都照常抽取，engine 以后新增的种类也一样。
 数组或 `allow` 列表只抽它点名的种类：用白名单的调用方要把 `want_to_go_out` 和 `want_to_go_home` 加进去才会抽到。
 
@@ -1010,13 +1033,13 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
   | `health` | `"weak"`、`"normal"`（默认）、`"strong"` | body 类被抽到的概率分别是原来的两倍 / 一倍 / 一半 |
   | `prefer_trip` | `true` / `false`（默认） | trip 类被抽到的概率是原来的三倍；仍然每周最多一次 |
   | `homesick` | `true` / `false` / 不写 | 出行往哪去：`true` 偏向 `hometown_visit`、压低游玩的两种；`false` 压低 `hometown_visit`；`business_trip` 不动 |
-  | `is_virgin` | `true` / `false`（默认） | 第一次 `having_sex` 或 `just_have_sex` 事件之前，`having_sex` 与 `just_have_sex` 的概率是五分之一；之后这个键不再起作用 |
+  | `is_virgin` | `true` / `false`（默认） | 第一次 `having_sex`、`just_have_sex` 或 `having_sex_together` 事件之前，`having_sex` 与 `just_have_sex` 的概率是五分之一；之后这个键不再起作用 |
   | `sex_addict` | `true` / `false` / 不写 | `sudden_desire`、`strip`、`streaking` 与 `just_have_sex` 在 `short` 内被抽到的概率是原来的三倍 / 三分之一；门槛照旧。只有 `true` 才会抽到 `having_sex` 和 `masturbating` |
   | `hygienic` | `true` / `false` / 不写 | `showering`、`bathing`、`want_hot_spring` 与 `want_sauna` 在 `short` 内被抽到的概率是原来的三倍 / 三分之一；也决定她什么时候提出一起洗澡（见[下文](#post-v2compsessionsession_idlife-choiceschoice_id)） |
   | `employed` | `"free"`、`"part_time"`（默认）、`"full_time"` | 她的一天有多少是工作：`temp_work`、`scolded_by_superior`、`scolded_superior` 与 `business_trip` 在各自类别内被抽到的概率分别是原来的三分之一 / 一倍 / 三倍，`free` 的角色不会抽到 `want_to_quit_job`；其他值按 `part_time` 读 |
   | `outdoorsy` | `"outdoor"`、`"neutral"`（默认）、`"indoor"` | `outdoor`：户外种类在各自类别内被抽到的概率是原来的 3 倍，室内种类是三分之一；`indoor` 反过来。可能让她离线的种类算中性，不受影响；每种的场所见 [life-events-needs.zh.md](life-events-needs.zh.md#户外还是室内)；其他值按 `neutral` 读 |
   | `setting` | `"modern"`（默认）、`"fantasy"` | 她生活的世界：`fantasy` 的角色不会抽到 `police_encounter`、`showering`、`taking_selfie`、`gaming`、`watching_show`、`business_trip`、`hospitalized`、`post_surgery`、`temp_work`、`scolded_superior`，不管 `kinds` 或 `prefer_events` 怎么写；其他值按 `modern` 读 |
-  | `smoking`、`alcoholic`、`drug`、`coffee`、`gluttony` | 各为 `true` / `false` / 不写 | 她抽不抽烟、喝不喝酒、用不用大麻、喝不喝咖啡、贪不贪吃：为 `true` 的越多，她的 `indulgence` 回到 `high` 越快，进而给抽取加权；为 `false` 的键可能让她拒收递来的这样东西（见[上文](#post-compchatsession_idmessagestream)）；`smoking`、`alcoholic`、`drug` 为 `true` 时她才会抽到 `smoking`、`drinking`、`smoking_weed` |
+  | `smoking`、`alcoholic`、`drug`、`coffee`、`gluttony` | 各为 `true` / `false` / 不写 | 她抽不抽烟、喝不喝酒、用不用大麻、喝不喝咖啡、贪不贪吃：为 `true` 的越多，她的 `indulgence` 回到 `high` 越快，进而给抽取加权；为 `false` 的键可能让她拒收递来的这样东西，或拒绝对应的一起做的动作（`smoking` 对应 `smoke_together`、`drug` 对应 `smoke_weed_together`、`alcoholic` 对应 `drink_together`）（见[上文](#post-compchatsession_idmessagestream)）；`smoking`、`alcoholic`、`drug` 为 `true` 时她才会抽到 `smoking`、`drinking`、`smoking_weed` |
 
   取值形状不对、种类未知，或种类不在 `mid` 里，一律忽略。偏好不会绕过任何门槛。
 - **只要有符合条件的种类，抽取就一定得到一个事件。** 她的一天有多热闹，取决于调用方什么时候来要。
@@ -1060,7 +1083,7 @@ composer 会被告知这个事件是她此刻的状态（`[此刻状态]`），�
 
 它们持续期间，角色任何一个 session 里的每一轮文字消息都会被 ghost，不经过判官，也不计入 ghost 连续次数，
 `/open` 返回 `null`。已经讲出来的 `busy`、`in_battle` 或 `out_shopping` 同样让轮次沉默。
-带用户 `action` 的轮次（任何 `type`：`give`、`gift`、`tip`、`kiss`、`hug`、`touch`、`lick`、`french_kiss`、`hug_from_behind`、`tease`、`pat`、`wink`、`blink`、`ask_for_dance`、`ask_dancing`、`photo`、`strip`、`shower_together`、`bath_together`、`sauna_together`、`bluff`、`threaten`、`trick`、`date`、`custom`）或 `image.force = true` 是例外：
+带用户 `action` 的轮次（任何 `type`：`give`、`gift`、`tip`、`kiss`、`hug`、`touch`、`lick`、`french_kiss`、`hug_from_behind`、`tease`、`pat`、`wink`、`blink`、`ask_for_dance`、`ask_dancing`、`photo`、`strip`、`shower_together`、`bath_together`、`sauna_together`、`toilet_together`、`smoke_together`、`fall_asleep_together`、`sex_together`、`walk_together`、`smoke_weed_together`、`jog_together`、`yoga_together`、`stargaze_together`、`ride_horse_together`、`streak_together`、`drink_together`、`propose`、`bluff`、`threaten`、`trick`、`date`、`custom`）或 `image.force = true` 是例外：
 它走正常路径并得到回复，因为动作在语义上是线下互动，用不着手机，强制出图的轮次永远是 `reply_image`。
 角色只在 ghost 保护允许的地方才会这样沉默：部署的 ghosting 开关关闭（`ghosting = false`）时不会抽到任何离线类种类，已经在进行的一段也不再让轮次沉默，
 用户消息不足 10 条的会话里也不会抽到；调用方完全不想要它们，就在 `kinds` 里不写。这样被 ghost 的消息没有回执（没有判官读过它），
@@ -1085,7 +1108,7 @@ composer 会被告知这个事件是她此刻的状态（`[此刻状态]`），�
   各自列出正在进行的背景和插曲；`/open` 开场白同样带 `- 正在经历：…` 这一行。`GET …/effects` 两者都会列出。
   一段离线类事件结束之后（在被它 ghost 过消息的会话里），或一场虚惊结束之后（在讲出它的那个会话里），`[近期事件]` 行多出一项，回复多出一行 `- 刚才：…`，直到她在那里写过一次为止（一条带文字的消息；
   见 [model-config.zh.md](model-config.zh.md#taskspde_decision--opt-in-llm-pde-判断器)）。
-- **错误：** `event_key` 格式不对返回 `400`，`code: "invalid_payload"`；未知的 `kind`，或 `taking_space`、`fell_out`、`traveling_together`、`bathing_together`、`on_a_date`、`showering_together`、`sauna_together`，返回 `422`。会话检查与 `/open` 相同
+- **错误：** `event_key` 格式不对返回 `400`，`code: "invalid_payload"`；未知的 `kind`，或 `taking_space`、`fell_out`、`traveling_together`、`bathing_together`、`on_a_date`、`showering_together`、`sauna_together` 或其余一起做的动作写入的种类，返回 `422`。会话检查与 `/open` 相同
   （`403`、`404`，语音或群会话、约会子会话 `409`），达到单用户并发上限 `429`。BYOC 实例的会话返回 `400 byoc_unsupported`。
   生成失败时返回与图片接口相同的上游错误，不写入任何内容。
   回复为空时不写入任何内容，返回空值。
@@ -1128,7 +1151,7 @@ composer 会被告知这个事件是她此刻的状态（`[此刻状态]`），�
 只有该 session 最新一段选择经过（她的请求、它的结算以及它开启的分开，不论哪一种选择）之后的、被判官评过的回合才计数。她的[约会](activities.zh.md)进行期间她什么都不提，约会自己的回合也从来不是被判官评过的回合。`sleep_together` 与 `propose` 同一轮都满足时，触发 `propose`。
 `bathe_together` 有自己的触发条件，和这两种无关，也不受进行中的旅行影响。她同一时间只有一个请求待回答，所以一轮里有几种同时满足时，
 先轮到 `sleep_together` 或 `propose`，再到 `bathe_together`，最后是 `travel_together`。
-在一个 session 里被用户接受或不理会过的 `sleep_together` 或 `propose`，在那里不会再次提出，`travel_together` 则 14 天内不再提出，`bathe_together` 7 天内不再提出；被拒绝或过期的，等出现新的连续后会再次提出。她怎么提出、什么时候提出、
+在一个 session 里被用户接受或不理会过的 `sleep_together` 或 `propose`，在那里不会再次提出；她在那里或它的约会里答应过用户自己的 `sex_together`（对应 `sleep_together`）或 `propose`（对应 `propose`）之后也不会（见[上床与求婚](#post-compchatsession_idmessagestream)）；`travel_together` 则 14 天内不再提出，`bathe_together` 7 天内不再提出；被拒绝或过期、又没有按上面的方式了结的，等出现新的连续后会再次提出。她怎么提出、什么时候提出、
 每条路各付什么代价，见 [life-events-needs.zh.md](life-events-needs.zh.md#提出分开的选择)、
 [浪漫选择](life-events-needs.zh.md#浪漫选择)、[一起去旅行](life-events-needs.zh.md#一起去旅行)和[一起洗澡](life-events-needs.zh.md#一起洗澡)。
 
