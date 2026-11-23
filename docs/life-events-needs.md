@@ -250,13 +250,14 @@ user answers or ignores her ([the ask-for-space choice](#the-ask-for-space-choic
 `mid` incidents by shape, and `taking_space` is the one that outlasts the category's four
 hours: it lasts 12 to 24. `traveling_together` is a `trip` background the engine writes when the
 user accepts her suggestion ([going away together](#going-away-together)),
-`bathing_together` a 30-minute `short` incident it writes when the user accepts her ask for a
-bath ([a bath together](#a-bath-together)) or she accepts the user's `bath_together`,
-`showering_together` (30 minutes) and `sauna_together` (1 hour) `short` incidents it writes when
-she accepts the user's `shower_together` or `sauna_together`
+`showering_together` and `bathing_together` 30-minute `short` incidents it writes when the user
+accepts her ask for a bath, one or the other at even odds ([a bath together](#a-bath-together)),
+or when she accepts the user's `shower_together` or `bath_together`, `sauna_together` a 1-hour
+`short` incident it writes when she accepts the user's `sauna_together`
 ([together actions](#showering-bathing-and-the-sauna-together)), the fourteen others the incidents
 it writes when she accepts the user's other together actions, all `short` but the `mid`
-`asleep_together` and `fighting_together`, and `on_a_date` a `short`
+`asleep_together` and `fighting_together` (`having_sex_together` is also written when the user
+accepts her `sleep_together`, [the romantic choices](#the-romantic-choices)), and `on_a_date` a `short`
 incident of 1 or 4 hours it writes when she accepts the user's date invitation
 ([activities.md](activities.md#the-event)).
 None of the twenty-one has a draw rule, and the caller's `kinds` rejects them.
@@ -917,7 +918,8 @@ romantic choice's outcome does; the other eleven reach it.
 chemistry, not bond, and no moment is written to [the journal](memory-layers.md#the-journal).
 
 `sex_together` is her own `sleep_together` ask made by the user. An accepted one settles her ask
-for the session ([the romantic choices](#the-romantic-choices)), and its event is sex: it ends
+for the session ([the romantic choices](#the-romantic-choices)), and her accepted
+`sleep_together` places the same event. That event is sex: it ends
 her virginity ([persona settings](#persona-settings)) and makes a pregnancy scare likelier
 ([follow-on factors](#follow-on-factors)). The user may ask again after an accept; the judge
 decides each time.
@@ -1411,11 +1413,11 @@ recorded scopes decide eligibility and nothing else. The stage cues are in
 [model-config.md](model-config.md#taskspde_decision--opt-in-llm-pde-judge).
 
 **The answer.** The same endpoint, the same `409` rules and the same response shape; `event` is
-always `null`.
+the `having_sex_together` a `sleep_together` accept starts, and `null` otherwise.
 
 | path | choice status | cost | her words |
 |---|---|---|---|
-| accept | `accepted` | none: no tier change, no slowdown, no new event; an incident under way ends there, a background keeps running | a generated reply to the yes |
+| accept | `accepted` | none: no tier change, no slowdown. `sleep_together` starts a one-hour `having_sex_together` now, returned as `event`, as the user's accepted `sex_together` does; `propose` starts no event. Either way an incident under way ends there and a background keeps running | a generated reply to the yes |
 | decline | `declined` | `sleep_together`: chemistry drops one tier. `propose`: bond and chemistry each drop one tier | a generated reply to the no |
 | ignore | `ignored` | none: no `fell_out`, no event | none of its own: the turn runs as any other and the judge reads the user's words |
 | lapse | stays `pending`, reads as expired | none | none |
@@ -1503,12 +1505,14 @@ her replies at resolution use the resolution request's own scopes.
 
 | path | choice status | cost | what happens | her words |
 |---|---|---|---|---|
-| accept | `accepted` | none | a `bathing_together` event starts now, returned as `event` | a generated reply on `（对方答应了和你一起洗澡，你们现在一起泡在浴缸里。）` |
+| accept | `accepted` | none | a `showering_together` or `bathing_together` event starts now, one or the other at even odds, returned as `event` | a generated reply on `（对方答应了和你一起洗澡，你们现在一起站在花洒下。）` for a shower, `（对方答应了和你一起洗澡，你们现在一起泡在浴缸里。）` for a bath |
 | decline | `declined` | chemistry drops one tier, as for `sleep_together` | nothing | a generated reply on `（对方没有答应和你一起洗澡，你有点失落。）` |
 | ignore | `ignored` | none: no `fell_out`, no event | nothing | none of its own: the turn runs as any other |
 | lapse | stays `pending`, reads as expired | none | nothing | none |
 
-**The bath.** `bathing_together` (和对方一起洗澡) is a non-drawable incident in the `short`
+**The bath.** The accept turns out a shower or a bath at even odds: `showering_together`
+(和对方一起淋浴) or `bathing_together` (和对方一起洗澡), the two kinds the user's
+`shower_together` and `bath_together` place. Either is a non-drawable incident in the `short`
 category, lasting 30 minutes from the accept. Starting it ends an incident under way; a
 background under way goes on. She does not tell it as an event, since her reply to the yes
 already does, and she is with the user: it is not offline. While it lasts it is the incident
@@ -1516,7 +1520,8 @@ under way, so no other incident is drawn, and `正在经历` and the judge read 
 It is instance-scoped like every event. No picture comes with the accept.
 
 The bath stays out of her world story: the story director's events leave out every
-`bathing_together`, so, as with the romantic choices, its outcome lives in the conversation only.
+`showering_together` and `bathing_together`, so, as with the romantic choices, its outcome lives
+in the conversation only.
 
 ### Where the choice is stored
 
@@ -1524,8 +1529,8 @@ The bath stays out of her world story: the story director's events leave out eve
 session), `kind` (`ask_for_space`, `sleep_together`, `propose`, `travel_together` or `bathe_together`), `status` (`pending`,
 `accepted`, `declined`, `ignored`), `tier_gap` (the gap at ask time; set for `ask_for_space`
 and NULL for the other kinds), `asked_at`, `resolved_at`, `message_id` (the ask; set to
-NULL if the message goes) and `event_id` (the `taking_space`, `traveling_together` or `bathing_together` row an accept wrote, NULL on every
-other path; set to NULL if the event goes). Expiry and the slowdown window are derived, never stored. The separation and
+NULL if the message goes) and `event_id` (the `taking_space`, `traveling_together`, `showering_together`, `bathing_together` or `having_sex_together` row an accept wrote, NULL on every
+other path, a `propose` accept included; set to NULL if the event goes). Expiry and the slowdown window are derived, never stored. The separation and
 falling-out rows live in `engine.persona_events` like any event.
 
 ## Without the LLM judge

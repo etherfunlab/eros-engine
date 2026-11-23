@@ -826,7 +826,8 @@ The kinds with no aftermath text have no row above: `看中了一个包` (`saw_b
 | her reply to the yes (`travel_together`) | the user accepted | `（对方答应了和你一起去旅行，你们接下来要一起玩 {span}。）`, `{span}` being the trip's length |
 | her reply to the no (`travel_together`) | the user declined | `（对方没有答应和你一起去旅行，你有点失落。）` |
 | her ask for a bath together | the `bathe_together` trigger fired | `（你们最近越来越亲密，你很想和对方一起洗个澡。你决定主动开口，问对方愿不愿意和你一起洗，希望对方给你一个答复。）` |
-| her reply to the yes (`bathe_together`) | the user accepted | `（对方答应了和你一起洗澡，你们现在一起泡在浴缸里。）` |
+| her reply to the yes (`bathe_together`) | the user accepted and it turned out a bath | `（对方答应了和你一起洗澡，你们现在一起泡在浴缸里。）` |
+| her reply to the yes (`bathe_together`) | the user accepted and it turned out a shower | `（对方答应了和你一起洗澡，你们现在一起站在花洒下。）` |
 | her reply to the no (`bathe_together`) | the user declined | `（对方没有答应和你一起洗澡，你有点失落。）` |
 
 **Recent-image context line.** The judge context also always carries exactly one

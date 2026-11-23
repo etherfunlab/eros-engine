@@ -192,9 +192,9 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 前两种在她提出先分开一阵、用户作答或不作答时，由 engine 自己写入（见[提出分开的选择](#提出分开的选择)）。
 它们按形态是 `mid` 插曲，其中 `taking_space` 超出了这个类别的 4 小时：它持续 12 到 24 小时。
 `traveling_together` 是 `trip` 类的背景，用户接受她的提议时由 engine 写入（见[一起去旅行](#一起去旅行)）；
-`bathing_together` 是 30 分钟的 `short` 插曲，用户答应和她一起洗澡时，或她答应用户的 `bath_together` 时，由 engine 写入（见[一起洗澡](#一起洗澡)）；
-`showering_together`（30 分钟）和 `sauna_together`（1 小时）是 `short` 插曲，她答应用户的 `shower_together` 或 `sauna_together` 时由 engine 写入（见[一起淋浴、泡澡和蒸桑拿](#一起淋浴泡澡和蒸桑拿)）；
-其余十四种是她答应用户其余一起做的动作时由 engine 写入的插曲，除 `asleep_together` 和 `fighting_together` 是 `mid` 外都是 `short`；
+`showering_together` 和 `bathing_together` 是 30 分钟的 `short` 插曲，用户答应和她一起洗澡时由 engine 写入其中之一，两者机会均等（见[一起洗澡](#一起洗澡)），她答应用户的 `shower_together` 或 `bath_together` 时也会写入；
+`sauna_together` 是 1 小时的 `short` 插曲，她答应用户的 `sauna_together` 时由 engine 写入（见[一起淋浴、泡澡和蒸桑拿](#一起淋浴泡澡和蒸桑拿)）；
+其余十四种是她答应用户其余一起做的动作时由 engine 写入的插曲，除 `asleep_together` 和 `fighting_together` 是 `mid` 外都是 `short`（`having_sex_together` 在用户答应她的 `sleep_together` 时也会写入，见[浪漫选择](#浪漫选择)）；
 `on_a_date` 是 1 或 4 小时的 `short` 插曲，她答应用户的约会邀约时由 engine 写入（见 [activities.zh.md](activities.zh.md#事件)）。
 这二十一种都没有抽取规则，调用方的 `kinds` 也拒绝它们。
 
@@ -708,7 +708,7 @@ composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2com
 也不往[纪事](memory-layers.zh.md#纪事)里写任何时刻。
 
 `sex_together` 是她自己提出的 `sleep_together` 由用户反过来提。被接受后，这个会话里她的这项请求就算有了结果（见[浪漫选择](#浪漫选择)）；
-它写入的事件算作性：结束她的处女身份（见[角色设置](#角色设置)），也让验孕虚惊更容易出现（见[关联系数](#关联系数)）。
+用户接受她的 `sleep_together` 时也写入同一个事件。这个事件算作性：结束她的处女身份（见[角色设置](#角色设置)），也让验孕虚惊更容易出现（见[关联系数](#关联系数)）。
 被接受之后用户还可以再提，每次都由判官决定。
 
 被接受的一起做的动作，在请求带 `image`、部署配了 composer 时是一个出图回合，和被接受的 `photo`、`strip`、`ask_dancing` 一样：先是她的话，
@@ -1082,11 +1082,11 @@ affinity delta 上也是同一个 `life_choice` 字段。她的请求用 engine 
 她在结算时的回复，用结算请求自己带的 scope。这一对记录下来的 scope 只决定有没有资格，别的什么都不决定。
 舞台提示见 [model-config.zh.md](model-config.zh.md#taskspde_decision--opt-in-llm-pde-判断器)。
 
-**回答。** 同一个端点，同样的 `409` 规则，同样的响应形状；`event` 永远是 `null`。
+**回答。** 同一个端点，同样的 `409` 规则，同样的响应形状；接受 `sleep_together` 时 `event` 是它开始的 `having_sex_together`，其他情况为 `null`。
 
 | 路径 | 选择的状态 | 代价 | 她说的话 |
 |---|---|---|---|
-| 接受 | `accepted` | 无：不降档，不放缓，不新增事件；正在进行的插曲就此结束，背景照旧 | 生成的、对这声“好”的回应 |
+| 接受 | `accepted` | 无：不降档，不放缓。`sleep_together` 从此刻开始一小时的 `having_sex_together`，作为 `event` 返回，和用户的 `sex_together` 被接受时一样；`propose` 不新增事件。两种情况下正在进行的插曲都就此结束，背景照旧 | 生成的、对这声“好”的回应 |
 | 拒绝 | `declined` | `sleep_together`：chemistry 降一档。`propose`：bond 和 chemistry 各降一档 | 生成的、对这声“不”的回应 |
 | 不理会 | `ignored` | 无：没有 `fell_out`，没有事件 | 没有专门的一条：这一轮照常运行，判官读用户写的话 |
 | 过期 | 仍为 `pending`，读作已过期 | 无 | 无 |
@@ -1147,23 +1147,23 @@ affinity delta 上也是同一个 `life_choice` 字段。她的请求用 engine 
 
 | 路径 | 选择状态 | 代价 | 发生什么 | 她说的话 |
 |---|---|---|---|---|
-| 接受 | `accepted` | 无 | `bathing_together` 事件从此刻开始，作为 `event` 返回 | 按 `（对方答应了和你一起洗澡，你们现在一起泡在浴缸里。）` 生成的回应 |
+| 接受 | `accepted` | 无 | `showering_together` 或 `bathing_together` 事件从此刻开始，两者机会均等，作为 `event` 返回 | 淋浴按 `（对方答应了和你一起洗澡，你们现在一起站在花洒下。）`、泡澡按 `（对方答应了和你一起洗澡，你们现在一起泡在浴缸里。）` 生成的回应 |
 | 拒绝 | `declined` | chemistry 降一档，和 `sleep_together` 一样 | 无 | 按 `（对方没有答应和你一起洗澡，你有点失落。）` 生成的回应 |
 | 不理会 | `ignored` | 无：没有 `fell_out`，没有事件 | 无 | 没有单独的话：这一轮照常运行 |
 | 过期 | 仍为 `pending`，读作已过期 | 无 | 无 | 无 |
 
-**这次洗澡。** `bathing_together`（和对方一起洗澡）是 `short` 类、不可抽取的插曲，从用户接受时起持续 30 分钟。
+**这次洗澡。** 接受后是淋浴还是泡澡，机会均等：`showering_together`（和对方一起淋浴）或 `bathing_together`（和对方一起洗澡），也就是用户的 `shower_together` 和 `bath_together` 写入的那两种。两者都是 `short` 类、不可抽取的插曲，从用户接受时起持续 30 分钟。
 开始时结束正在进行的插曲，在途的背景照常继续。它不作为事件讲述，因为她对“好”的回应已经说了；她和用户在一起，不算离线。
 期间它就是正在进行的插曲，所以不抽别的插曲；`正在经历` 和判官像读其他插曲一样读它。和所有事件一样，它以角色实例为单位。接受时不带图。
 
-一起洗澡不进她的世界故事：故事导演读的事件里没有任何 `bathing_together`，所以和浪漫选择一样，它的结果只留在对话里。
+一起洗澡不进她的世界故事：故事导演读的事件里没有任何 `showering_together` 或 `bathing_together`，所以和浪漫选择一样，它的结果只留在对话里。
 
 ### 选择存在哪
 
 `engine.life_choices` 每次选择一行：`session_id`（非空，随 session 级联删除）、`kind`（`ask_for_space`、`sleep_together`、`propose`、`travel_together` 或 `bathe_together`）、
 `status`（`pending`、`accepted`、`declined`、`ignored`）、`tier_gap`（提出时的档位差距；`ask_for_space` 有值，其他种类为 NULL）、
 `asked_at`、`resolved_at`、`message_id`（那条请求；消息没了就置为 NULL）和
-`event_id`（接受时写下的 `taking_space`、`traveling_together` 或 `bathing_together` 行，其他路径为 NULL；事件没了就置为 NULL）。过期和放缓的窗口都是推算出来的，不存。
+`event_id`（接受时写下的 `taking_space`、`traveling_together`、`showering_together`、`bathing_together` 或 `having_sex_together` 行，其他路径为 NULL，接受 `propose` 也是；事件没了就置为 NULL）。过期和放缓的窗口都是推算出来的，不存。
 分开和不愉快那两行和其他事件一样在 `engine.persona_events` 里。
 
 ## 没有 LLM 判官时
