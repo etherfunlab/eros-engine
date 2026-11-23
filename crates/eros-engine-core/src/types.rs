@@ -175,7 +175,9 @@ pub enum UserAction {
     /// The user asks her to marry them (spec 2026-11-23 §7): the judge
     /// decides, a refusal drops nothing, and no event is placed. Put only
     /// from `dating`, `fwb` or `situationship`; accepted, the pair is
-    /// `engaged` (spec 2026-11-23-affinity-50-design.md §8).
+    /// `engaged` (spec 2026-11-23-affinity-50-design.md §8). On a BYOC
+    /// instance it goes to the judge from any status and moves nothing
+    /// (§6.5).
     Propose,
     /// The user breaks up with her (spec 2026-11-23-affinity-50-design.md
     /// §8): put only from a breakable status. Accepted, the pair is `ex`;

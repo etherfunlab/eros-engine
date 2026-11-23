@@ -393,7 +393,7 @@ async fn settle_claimed(
     let on = journal::local_date(activity.started_at.unwrap_or(activity.created_at), tz);
     let tuning = &state.config.affinity_tuning;
     let (llm_attempts, gateway_errors) = super::stream::split_failures(&failures);
-    let growth_scale = super::life_choice::growth_scale_for(state, activity.session_id, now).await;
+    let growth_scale = super::life_choice::growth_scale_for(state, activity.session_id).await;
     let settled = ActivityVerdict {
         activity_id: activity.id,
         grades: verdict.grades,

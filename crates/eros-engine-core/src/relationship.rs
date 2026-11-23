@@ -231,9 +231,9 @@ pub const LOWEST_PATIENCE: i16 = 1;
 /// Streak length that starts and ends a cold war and grounds a her-side
 /// break-up.
 const STREAK: usize = 3;
-/// A cold war also starts on this many lowest levels among the newest
-/// `RECENT` judged turns.
-const RECENT: usize = 7;
+/// The newest judged turns the patience rules read, the widest of their
+/// windows: a cold war also starts on five lowest levels among this many.
+pub const COLD_WAR_WINDOW: usize = 7;
 const RECENT_LOWEST: usize = 5;
 
 fn newest_streak_all(levels: &[i16], pred: impl Fn(i16) -> bool) -> bool {
@@ -247,7 +247,7 @@ pub fn cold_war_starts(levels: &[i16]) -> bool {
     newest_streak_all(levels, |l| l == LOWEST_PATIENCE)
         || levels
             .iter()
-            .take(RECENT)
+            .take(COLD_WAR_WINDOW)
             .filter(|&&l| l == LOWEST_PATIENCE)
             .count()
             >= RECENT_LOWEST

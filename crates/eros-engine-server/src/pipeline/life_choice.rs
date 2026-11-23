@@ -17,12 +17,12 @@ use chrono::{DateTime, Duration, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use eros_engine_core::affinity::AffinityLine;
+use eros_engine_core::affinity::{Affinity, AffinityLine};
 use eros_engine_core::events::EventKind;
 use eros_engine_core::persona::CompanionPersona;
 use eros_engine_core::relationship::{
     cold_war_ends, cold_war_starts, leading_line, sleep_ask_is_sex, wants_break_up,
-    RelationshipStatus, StatusAsk,
+    RelationshipStatus, StatusAsk, COLD_WAR_WINDOW,
 };
 use eros_engine_core::scope::romance_compatible;
 use eros_engine_store::activity::ActivityRepo;
@@ -39,9 +39,6 @@ use crate::pipeline::proactive::{greet, Greeting, LifeChoiceCue, Occasion};
 use crate::prompt::NowContext;
 use crate::state::AppState;
 
-/// The newest judged turns the cold-war rules read: the widest of their
-/// windows (five of the newest seven).
-const COLD_WAR_WINDOW: i64 = 7;
 /// Positive line growth while a cold war lasts.
 const SLOWED_GROWTH: f64 = 0.5;
 /// A judged turn counts toward a romantic choice when its warmth and its
@@ -82,13 +79,8 @@ const PROPOSE_HITS: usize = 5;
 
 /// The scale on every positive line delta of a commit in `session_id`:
 /// [`SLOWED_GROWTH`] while the session's cold war is on, 1.0 otherwise. A
-/// read that fails commits at full speed. `_now` keeps the call sites' shape;
-/// the flag is read as stored.
-pub(crate) async fn growth_scale_for(
-    state: &AppState,
-    session_id: Uuid,
-    _now: DateTime<Utc>,
-) -> f64 {
+/// read that fails commits at full speed. The flag is read as stored.
+pub(crate) async fn growth_scale_for(state: &AppState, session_id: Uuid) -> f64 {
     match (AffinityRepo { pool: &state.pool }).load(session_id).await {
         Ok(Some(a)) if a.relationship.cold_war() => SLOWED_GROWTH,
         Ok(_) => 1.0,
@@ -174,7 +166,11 @@ async fn separated(
 /// After a judged turn's affinity committed: start or end a cold war, then
 /// put a choice to the user when the relationship calls for one: a break-up
 /// in a cold war, a confession or a partnership, then the warm asks (spec
-/// 2026-11-23-affinity-50 §7.2). Every failure is logged and swallowed; the
+/// 2026-11-23-affinity-50 §7.2). That is §7.2's order although `propose`
+/// runs inside [`try_romance`], after `confess` and `partner_up`: its
+/// `asked_from` set is disjoint from theirs, so no status lets it and either
+/// of them be asked. The affinity is loaded once for every check, and again
+/// only when the cold war moved. Every failure is logged and swallowed; the
 /// turn is already answered and its affinity written.
 pub(crate) async fn maybe_ask(
     state: &AppState,
@@ -183,29 +179,61 @@ pub(crate) async fn maybe_ask(
     instance_id: Uuid,
     persona: &CompanionPersona,
 ) {
-    if let Err(e) = try_cold_war(state, session_id, user_id, instance_id, persona).await {
-        tracing::warn!(%session_id, "cold war check failed: {e}");
+    let mut affinity = match load_decayed(state, session_id).await {
+        Ok(Some(a)) => a,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(%session_id, "life-choice affinity read failed: {e}");
+            return;
+        }
+    };
+    match try_cold_war(state, session_id, user_id, instance_id, persona, &affinity).await {
+        Ok(false) => {}
+        Ok(true) => match load_decayed(state, session_id).await {
+            Ok(Some(a)) => affinity = a,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(%session_id, "life-choice affinity read failed: {e}");
+                return;
+            }
+        },
+        Err(e) => tracing::warn!(%session_id, "cold war check failed: {e}"),
     }
+    let a = &affinity;
     // An ask written by one check is pending, which closes the runway for
     // the next.
-    if let Err(e) = try_break_up(state, session_id, user_id, instance_id, persona).await {
+    if let Err(e) = try_break_up(state, session_id, user_id, instance_id, persona, a).await {
         tracing::warn!(%session_id, "break-up ask failed: {e}");
     }
-    if let Err(e) = try_confess(state, session_id, user_id, instance_id, persona).await {
+    if let Err(e) = try_confess(state, session_id, user_id, instance_id, persona, a).await {
         tracing::warn!(%session_id, "confession failed: {e}");
     }
-    if let Err(e) = try_partner_up(state, session_id, user_id, instance_id, persona).await {
+    if let Err(e) = try_partner_up(state, session_id, user_id, instance_id, persona, a).await {
         tracing::warn!(%session_id, "partnership ask failed: {e}");
     }
-    if let Err(e) = try_romance(state, session_id, user_id, instance_id, persona).await {
+    if let Err(e) = try_romance(state, session_id, user_id, instance_id, persona, a).await {
         tracing::warn!(%session_id, "romantic choice failed: {e}");
     }
-    if let Err(e) = try_bathe(state, session_id, user_id, instance_id, persona).await {
+    if let Err(e) = try_bathe(state, session_id, user_id, instance_id, persona, a).await {
         tracing::warn!(%session_id, "bath choice failed: {e}");
     }
-    if let Err(e) = try_travel(state, session_id, user_id, instance_id, persona).await {
+    if let Err(e) = try_travel(state, session_id, user_id, instance_id, persona, a).await {
         tracing::warn!(%session_id, "travel choice failed: {e}");
     }
+}
+
+/// The session's affinity as the checks read it: time decay applied and the
+/// endpoints refreshed. `None` when the session has no row.
+async fn load_decayed(state: &AppState, session_id: Uuid) -> Result<Option<Affinity>, AppError> {
+    let Some(mut affinity) = (AffinityRepo { pool: &state.pool })
+        .load(session_id)
+        .await?
+    else {
+        return Ok(None);
+    };
+    affinity.apply_time_decay();
+    affinity.refresh_endpoints(&state.config.affinity_tuning);
+    Ok(Some(affinity))
 }
 
 /// Whether she is free to put a choice to the user at all (spec 2026-10-19
@@ -270,39 +298,44 @@ async fn session_eligible(
 /// so in one message; on, it ends on the newest three above the lowest, in
 /// silence. The flag is committed before she speaks, so a failed or blank
 /// message leaves it on. A pending choice or a date does not hold it back.
+/// The levels decide first; [`session_eligible`] is read only when the flag
+/// would move, and gates the write and the message. `Ok(true)` when the flag
+/// was written.
 async fn try_cold_war(
     state: &AppState,
     session_id: Uuid,
     user_id: Uuid,
     instance_id: Uuid,
     persona: &CompanionPersona,
-) -> Result<(), AppError> {
-    if !session_eligible(state, session_id, instance_id).await? {
-        return Ok(());
-    }
+    affinity: &Affinity,
+) -> Result<bool, AppError> {
     let now = Utc::now();
     let affinity_repo = AffinityRepo { pool: &state.pool };
-    let Some(affinity) = affinity_repo.load(session_id).await? else {
-        return Ok(());
-    };
     let since = (LifeChoiceRepo { pool: &state.pool })
         .streak_anchor(session_id)
         .await?;
     let levels: Vec<i16> = affinity_repo
-        .last_judged_endpoints(session_id, since, COLD_WAR_WINDOW)
+        .last_judged_endpoints(session_id, since, COLD_WAR_WINDOW as i64)
         .await?
         .iter()
         .map(|j| j.patience_grade)
         .collect();
 
-    if affinity.relationship.cold_war() {
-        if cold_war_ends(&levels) && affinity_repo.set_cold_war(session_id, false, now).await? {
-            tracing::info!(%session_id, "the cold war ended");
-        }
-        return Ok(());
+    let on = affinity.relationship.cold_war();
+    let moves = if on {
+        cold_war_ends(&levels)
+    } else {
+        cold_war_starts(&levels)
+    };
+    if !moves
+        || !session_eligible(state, session_id, instance_id).await?
+        || !affinity_repo.set_cold_war(session_id, !on, now).await?
+    {
+        return Ok(false);
     }
-    if !cold_war_starts(&levels) || !affinity_repo.set_cold_war(session_id, true, now).await? {
-        return Ok(());
+    if on {
+        tracing::info!(%session_id, "the cold war ended");
+        return Ok(true);
     }
     tracing::info!(%session_id, "a cold war started");
     match speak(
@@ -320,7 +353,7 @@ async fn try_cold_war(
         Ok(false) => tracing::warn!(%session_id, "the cold war started with nothing said"),
         Err(e) => tracing::warn!(%session_id, "the cold war started, its message failed: {e}"),
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Her break-up ask (spec 2026-11-23-affinity-50 §7.2): a breakable status
@@ -334,12 +367,9 @@ async fn try_break_up(
     user_id: Uuid,
     instance_id: Uuid,
     persona: &CompanionPersona,
+    affinity: &Affinity,
 ) -> Result<(), AppError> {
     let now = Utc::now();
-    let affinity_repo = AffinityRepo { pool: &state.pool };
-    let Some(affinity) = affinity_repo.load(session_id).await? else {
-        return Ok(());
-    };
     let relationship = affinity.relationship;
     if !relationship.cold_war() || !relationship.status.is_breakable() {
         return Ok(());
@@ -347,8 +377,8 @@ async fn try_break_up(
     let since = (LifeChoiceRepo { pool: &state.pool })
         .streak_anchor(session_id)
         .await?;
-    let levels: Vec<i16> = affinity_repo
-        .last_judged_endpoints(session_id, since, COLD_WAR_WINDOW)
+    let levels: Vec<i16> = (AffinityRepo { pool: &state.pool })
+        .last_judged_endpoints(session_id, since, COLD_WAR_WINDOW as i64)
         .await?
         .iter()
         .map(|j| j.patience_grade)
@@ -359,7 +389,6 @@ async fn try_break_up(
 
     let cue = LifeChoiceCue::Ask {
         kind: LifeChoiceKind::BreakUp,
-        tier_gap: None,
         anchor_seen: since,
     };
     if speak(
@@ -388,19 +417,14 @@ async fn try_confess(
     user_id: Uuid,
     instance_id: Uuid,
     persona: &CompanionPersona,
+    affinity: &Affinity,
 ) -> Result<(), AppError> {
     let now = Utc::now();
-    let affinity_repo = AffinityRepo { pool: &state.pool };
-    let Some(mut affinity) = affinity_repo.load(session_id).await? else {
-        return Ok(());
-    };
     let relationship = affinity.relationship;
     if relationship.cold_war() || !StatusAsk::Confess.asked_from(relationship.status) {
         return Ok(());
     }
-    affinity.apply_time_decay();
-    affinity.refresh_endpoints(&state.config.affinity_tuning);
-    if leading_line(&affinity) != AffinityLine::Chemistry
+    if leading_line(affinity) != AffinityLine::Chemistry
         || affinity.chem_tier() < CONFESS_MIN_CHEM_TIER
     {
         return Ok(());
@@ -417,7 +441,7 @@ async fn try_confess(
     let since = (LifeChoiceRepo { pool: &state.pool })
         .streak_anchor(session_id)
         .await?;
-    let judged = affinity_repo
+    let judged = (AffinityRepo { pool: &state.pool })
         .last_judged_endpoints(session_id, since, WARM_STREAK as i64)
         .await?;
     if !newest_streak(&judged, |e| e.warmth > WARM)
@@ -429,7 +453,6 @@ async fn try_confess(
 
     let cue = LifeChoiceCue::Ask {
         kind: LifeChoiceKind::Confess,
-        tier_gap: None,
         anchor_seen: since,
     };
     if speak(
@@ -459,19 +482,14 @@ async fn try_partner_up(
     user_id: Uuid,
     instance_id: Uuid,
     persona: &CompanionPersona,
+    affinity: &Affinity,
 ) -> Result<(), AppError> {
     let now = Utc::now();
-    let affinity_repo = AffinityRepo { pool: &state.pool };
-    let Some(mut affinity) = affinity_repo.load(session_id).await? else {
-        return Ok(());
-    };
     let relationship = affinity.relationship;
     if relationship.cold_war() || !StatusAsk::PartnerUp.asked_from(relationship.status) {
         return Ok(());
     }
-    affinity.apply_time_decay();
-    affinity.refresh_endpoints(&state.config.affinity_tuning);
-    if leading_line(&affinity) != AffinityLine::Bond || affinity.bond_tier() < PARTNER_MIN_BOND_TIER
+    if leading_line(affinity) != AffinityLine::Bond || affinity.bond_tier() < PARTNER_MIN_BOND_TIER
     {
         return Ok(());
     }
@@ -479,7 +497,7 @@ async fn try_partner_up(
     let since = (LifeChoiceRepo { pool: &state.pool })
         .streak_anchor(session_id)
         .await?;
-    let judged = affinity_repo
+    let judged = (AffinityRepo { pool: &state.pool })
         .last_judged_endpoints(session_id, since, WARM_STREAK as i64)
         .await?;
     if !newest_streak(&judged, |e| e.patience > WARM)
@@ -491,7 +509,6 @@ async fn try_partner_up(
 
     let cue = LifeChoiceCue::Ask {
         kind: LifeChoiceKind::PartnerUp,
-        tier_gap: None,
         anchor_seen: since,
     };
     if speak(
@@ -540,18 +557,13 @@ async fn try_romance(
     user_id: Uuid,
     instance_id: Uuid,
     persona: &CompanionPersona,
+    affinity: &Affinity,
 ) -> Result<(), AppError> {
     let now = Utc::now();
-    let affinity_repo = AffinityRepo { pool: &state.pool };
-    let Some(mut affinity) = affinity_repo.load(session_id).await? else {
-        return Ok(());
-    };
     // No warm ask while a cold war is on (spec 2026-11-23-affinity-50 §7.3).
     if affinity.relationship.cold_war() {
         return Ok(());
     }
-    affinity.apply_time_decay();
-    affinity.refresh_endpoints(&state.config.affinity_tuning);
 
     // The scopes the session's newest reply recorded; none reads as not
     // romantic.
@@ -566,7 +578,7 @@ async fn try_romance(
     // The judged turns after the last episode of any kind, newest first.
     let choices = LifeChoiceRepo { pool: &state.pool };
     let since = choices.streak_anchor(session_id).await?;
-    let judged = affinity_repo
+    let judged = (AffinityRepo { pool: &state.pool })
         .last_judged_endpoints(session_id, since, PROPOSE_WINDOW)
         .await?;
     let Some(kind) = romantic_kind(
@@ -596,7 +608,6 @@ async fn try_romance(
 
     let cue = LifeChoiceCue::Ask {
         kind,
-        tier_gap: None,
         anchor_seen: since,
     };
     if speak(
@@ -692,17 +703,12 @@ async fn try_bathe(
     user_id: Uuid,
     instance_id: Uuid,
     persona: &CompanionPersona,
+    affinity: &Affinity,
 ) -> Result<(), AppError> {
     let now = Utc::now();
-    let affinity_repo = AffinityRepo { pool: &state.pool };
-    let Some(mut affinity) = affinity_repo.load(session_id).await? else {
-        return Ok(());
-    };
     if affinity.relationship.cold_war() {
         return Ok(());
     }
-    affinity.apply_time_decay();
-    affinity.refresh_endpoints(&state.config.affinity_tuning);
 
     match (ChatRepo { pool: &state.pool })
         .latest_scopes(session_id)
@@ -714,7 +720,7 @@ async fn try_bathe(
 
     let choices = LifeChoiceRepo { pool: &state.pool };
     let since = choices.streak_anchor(session_id).await?;
-    let judged = affinity_repo
+    let judged = (AffinityRepo { pool: &state.pool })
         .last_judged_endpoints(session_id, since, BATHE_WINDOW)
         .await?;
     let hygienic = crate::prompt::persona_traits(persona).hygienic;
@@ -732,7 +738,6 @@ async fn try_bathe(
 
     let cue = LifeChoiceCue::Ask {
         kind: LifeChoiceKind::BatheTogether,
-        tier_gap: None,
         anchor_seen: since,
     };
     if speak(
@@ -765,21 +770,16 @@ async fn try_travel(
     user_id: Uuid,
     instance_id: Uuid,
     persona: &CompanionPersona,
+    affinity: &Affinity,
 ) -> Result<(), AppError> {
     let now = Utc::now();
-    let affinity_repo = AffinityRepo { pool: &state.pool };
-    let Some(mut affinity) = affinity_repo.load(session_id).await? else {
-        return Ok(());
-    };
     if affinity.relationship.cold_war() {
         return Ok(());
     }
-    affinity.apply_time_decay();
-    affinity.refresh_endpoints(&state.config.affinity_tuning);
 
     let choices = LifeChoiceRepo { pool: &state.pool };
     let since = choices.streak_anchor(session_id).await?;
-    let judged = affinity_repo
+    let judged = (AffinityRepo { pool: &state.pool })
         .last_judged_endpoints(session_id, since, WARM_STREAK as i64)
         .await?;
     if !travel_qualifies(affinity.bond_tier(), &judged) {
@@ -802,7 +802,6 @@ async fn try_travel(
 
     let cue = LifeChoiceCue::Ask {
         kind: LifeChoiceKind::TravelTogether,
-        tier_gap: None,
         anchor_seen: since,
     };
     if speak(
@@ -1366,14 +1365,15 @@ mod tests {
                 let (state, persona) = (&state, s.persona.clone());
                 let (session_id, user_id, instance_id) = (s.session_id, s.user_id, s.instance_id);
                 async move {
+                    let a = &load_decayed(state, session_id).await.unwrap().expect("row");
                     match kind {
                         LifeChoiceKind::SleepTogether => {
-                            try_romance(state, session_id, user_id, instance_id, &persona).await
+                            try_romance(state, session_id, user_id, instance_id, &persona, a).await
                         }
                         LifeChoiceKind::BatheTogether => {
-                            try_bathe(state, session_id, user_id, instance_id, &persona).await
+                            try_bathe(state, session_id, user_id, instance_id, &persona, a).await
                         }
-                        _ => try_travel(state, session_id, user_id, instance_id, &persona).await,
+                        _ => try_travel(state, session_id, user_id, instance_id, &persona, a).await,
                     }
                     .unwrap()
                 }
@@ -1627,7 +1627,7 @@ mod tests {
 
         let scale = |session| {
             let state = state.clone();
-            async move { growth_scale_for(&state, session, at).await }
+            async move { growth_scale_for(&state, session).await }
         };
         assert_eq!(scale(s.session_id).await, 1.0, "no cold war");
 
@@ -3310,12 +3310,17 @@ mod tests {
 
             let check = || async {
                 let (persona, session_id) = (&s.persona, s.session_id);
+                let a = &load_decayed(&state, session_id)
+                    .await
+                    .unwrap()
+                    .expect("row");
                 match kind {
                     LifeChoiceKind::Confess => {
-                        try_confess(&state, session_id, s.user_id, s.instance_id, persona).await
+                        try_confess(&state, session_id, s.user_id, s.instance_id, persona, a).await
                     }
                     _ => {
-                        try_partner_up(&state, session_id, s.user_id, s.instance_id, persona).await
+                        try_partner_up(&state, session_id, s.user_id, s.instance_id, persona, a)
+                            .await
                     }
                 }
                 .unwrap()

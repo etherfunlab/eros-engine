@@ -123,13 +123,11 @@ pub(crate) enum Occasion {
 /// row; every other cue is a plain proactive row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LifeChoiceCue {
-    /// She asks. `tier_gap` is stored with the choice (`None` for every kind
-    /// she still asks; only the retired `AskForSpace` carried one);
-    /// `anchor_seen` is the session's streak anchor the trigger judged by,
-    /// which the write checks is still current.
+    /// She asks. `anchor_seen` is the session's streak anchor the trigger
+    /// judged by, which the write checks is still current. No kind she still
+    /// asks carries a tier gap; only the retired `AskForSpace` stored one.
     Ask {
         kind: LifeChoiceKind,
-        tier_gap: Option<i16>,
         anchor_seen: Option<DateTime<Utc>>,
     },
     /// `travel_together` accepted: they are away together for `hours`.
@@ -848,13 +846,9 @@ async fn store(
         // The ask lands with its choice row, in one transaction; a pending
         // choice already in the instance (a concurrent ask won) or a streak
         // anchor that moved since the trigger read it leaves nothing.
-        Occasion::LifeChoice(LifeChoiceCue::Ask {
-            kind,
-            tier_gap,
-            anchor_seen,
-        }) => {
+        Occasion::LifeChoice(LifeChoiceCue::Ask { kind, anchor_seen }) => {
             let asked = LifeChoiceRepo { pool: &state.pool }
-                .insert_ask(g.session_id, *kind, *tier_gap, *anchor_seen, &row)
+                .insert_ask(g.session_id, *kind, None, *anchor_seen, &row)
                 .await?;
             match asked {
                 Some(_) => {
@@ -1446,23 +1440,20 @@ mod tests {
     fn a_retired_ask_for_space_has_no_cue() {
         Occasion::LifeChoice(LifeChoiceCue::Ask {
             kind: LifeChoiceKind::AskForSpace,
-            tier_gap: Some(3),
             anchor_seen: None,
         })
         .cue(1, &PersonaTraits::default(), None);
     }
 
     #[test]
-    fn the_life_choice_cues_are_exact() {
+    fn every_life_choice_cue_is_named_life_choice() {
         for c in [
             LifeChoiceCue::Ask {
                 kind: LifeChoiceKind::AskForSpace,
-                tier_gap: Some(2),
                 anchor_seen: None,
             },
             LifeChoiceCue::Ask {
                 kind: LifeChoiceKind::Propose,
-                tier_gap: None,
                 anchor_seen: None,
             },
             LifeChoiceCue::Answered {
@@ -1479,7 +1470,6 @@ mod tests {
         let cue = |c| Occasion::LifeChoice(c).cue(1, &PersonaTraits::default(), None);
         let ask = |kind| LifeChoiceCue::Ask {
             kind,
-            tier_gap: None,
             anchor_seen: None,
         };
         let answered = |kind, accepted| LifeChoiceCue::Answered { kind, accepted };
@@ -1532,7 +1522,6 @@ mod tests {
         let cue = |c| Occasion::LifeChoice(c).cue(1, &PersonaTraits::default(), None);
         let ask = |kind| LifeChoiceCue::Ask {
             kind,
-            tier_gap: None,
             anchor_seen: None,
         };
         let answered = |kind, accepted| LifeChoiceCue::Answered { kind, accepted };

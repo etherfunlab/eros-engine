@@ -530,8 +530,7 @@ async fn persist_affinity(
                 crate::pipeline::stream::split_failures(eval_failures);
             // While the session's cold war is on, positive growth is halved
             // (spec 2026-11-23-affinity-50 §6.3).
-            let growth_scale =
-                super::life_choice::growth_scale_for(state, session_id, chrono::Utc::now()).await;
+            let growth_scale = super::life_choice::growth_scale_for(state, session_id).await;
             match repo
                 .persist_with_event(
                     &mut affinity,

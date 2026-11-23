@@ -3126,10 +3126,10 @@ fn build_pde_ctx(
             match (refused_before_judge, a) {
                 (false, _) => "",
                 (true, eros_engine_core::types::UserAction::Strip) => "，这次你不会让对方这样做",
-                (true, eros_engine_core::types::UserAction::Date { .. }) => "，这次你不会答应",
                 (
                     true,
-                    eros_engine_core::types::UserAction::Propose
+                    eros_engine_core::types::UserAction::Date { .. }
+                    | eros_engine_core::types::UserAction::Propose
                     | eros_engine_core::types::UserAction::BreakUp,
                 ) => "，这次你不会答应",
                 (true, a) if a.together_kind().is_some() => "，这次你不会答应",
@@ -3185,8 +3185,9 @@ fn build_pde_ctx(
 
 /// Engine-computed relationship state as shown to the judge this run (issue
 /// #254): the two discrete labels the prompt carries and the status and
-/// cold-war flag, plus the line scores and raw axes the labels were cut from — the prompt itself no longer carries any
-/// number, so this snapshot is the only place the gate's inputs survive.
+/// cold-war flag, plus the line scores and raw axes the labels were cut from
+/// — the prompt itself no longer carries any number, so this snapshot is the
+/// only place the gate's inputs survive.
 /// Written to `companion_decision_events.inputs`; fail-open at the call site.
 fn pde_inputs_snapshot(
     a: &eros_engine_core::affinity::Affinity,
