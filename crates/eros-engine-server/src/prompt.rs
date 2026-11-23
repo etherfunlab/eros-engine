@@ -4557,6 +4557,43 @@ mod tests {
     }
 
     #[test]
+    fn partner_peer_and_ex_read_their_literal_wording() {
+        let mut a = lines(0.0, 0.0); // (1, 1): no composed line
+        let p = persona_with_gender("female");
+        for (status, noun) in [
+            (RelationshipStatus::Partner, "伙伴"),
+            (RelationshipStatus::Peer, "同事"),
+            (RelationshipStatus::Ex, "前任"),
+        ] {
+            a.relationship.status = status;
+            assert_eq!(
+                relationship_ground(Some(&a), AffinityScope::full(), &p),
+                format!("\n\n[relationship]\n你是用户的{noun}")
+            );
+        }
+    }
+
+    /// A cold war is a line of its own: alone at (1, 1) with no status, and
+    /// after the composed name, which then reads as who the user is.
+    #[test]
+    fn a_cold_war_without_a_status() {
+        let p = persona_with_gender("female");
+        let mut a = lines(0.0, 0.0); // (1, 1): no composed line
+        a.relationship.cold_war_since = Some(chrono::Utc::now());
+        assert_eq!(
+            relationship_ground(Some(&a), AffinityScope::full(), &p),
+            "\n\n[relationship]\n你们正在冷战"
+        );
+
+        let mut a = lines(0.70, 0.70); // (4, 4)
+        a.relationship.cold_war_since = Some(chrono::Utc::now());
+        assert_eq!(
+            relationship_ground(Some(&a), AffinityScope::full(), &p),
+            "\n\n[relationship]\n你是用户的知心爱人\n你们正在冷战"
+        );
+    }
+
+    #[test]
     fn an_incompatible_pair_takes_the_chemistry_one_name() {
         let p = persona_with_gender("female");
         let bond_only = AffinityScope::bond();

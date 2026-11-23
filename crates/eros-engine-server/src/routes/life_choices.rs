@@ -688,7 +688,7 @@ mod tests {
     };
     use crate::routes::session_open::GreetingOccasion;
 
-    const GOODBYE: &str = "好，那我们先各自安静一下。";
+    const REPLY: &str = "好，那我们先各自安静一下。";
     const HURT: &str = "你不愿意啊……我有点难过。";
     const SLEEP_ACCEPT_CUE: &str = "（对方答应了你的邀请。）";
     const SLEEP_DECLINE_CUE: &str = "（对方拒绝了你的邀请，你有点失落。）";
@@ -1511,6 +1511,45 @@ mod tests {
         }
     }
 
+    /// A confession accepted from `none` through the JSON handler while her
+    /// reply comes back as `reply` (`None`: the provider fails). Her reply is
+    /// the last step and cannot undo the answer: still a 200 with
+    /// `message: null`, and the status move stands with its one event.
+    async fn confession_kept_without_her_reply(pool: &PgPool, reply: Option<&str>) {
+        let mock = companion_mock(reply).await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let s = scene(pool).await;
+        let choice = s.ask_kind("confess", recent(30)).await;
+        let now = recent(0);
+
+        let out = s
+            .respond(&state, choice, LifeChoiceAnswer::Accept, now)
+            .await
+            .expect("still a success");
+
+        assert_eq!(out.status, "accepted");
+        assert!(out.message.is_none(), "she could not speak");
+        assert_eq!(calls(&mock).await.len(), 1, "she was asked");
+        assert_eq!(s.row(choice).await, ("accepted".into(), Some(now), None));
+        assert_eq!(s.relationship().await, ("dating".into(), None));
+        assert_eq!(
+            s.relationship_events().await,
+            vec![json!({"from": "none", "to": "dating", "choice_id": choice})]
+        );
+        assert_eq!(out.affinity.relationship_status, "dating");
+        assert!(s.life_choice_rows().await.is_empty(), "no message row");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_failed_reply_keeps_the_confession(pool: PgPool) {
+        confession_kept_without_her_reply(&pool, None).await;
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_blank_reply_keeps_the_confession(pool: PgPool) {
+        confession_kept_without_her_reply(&pool, Some("  ")).await;
+    }
+
     /// A declined confession keeps the status and costs chemistry one tier,
     /// as a declined night together does.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -1692,6 +1731,7 @@ mod tests {
             assert_eq!(out.affinity.relationship_status, "dating");
             assert!(out.affinity.cold_war, "{under_way:?}");
         }
+        assert_eq!(calls(&mock).await.len(), 2, "she spoke after each answer");
         for call in &calls(&mock).await {
             assert_eq!(
                 last_user_turn(call),
@@ -1892,7 +1932,7 @@ mod tests {
     /// answers 409, and nothing of the second answer lands.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn resolve_loses_to_a_faster_message(pool: PgPool) {
-        let mock = companion_mock(Some(GOODBYE)).await;
+        let mock = companion_mock(Some(REPLY)).await;
         let state = with_companion(test_state(pool.clone()), &mock.uri());
         let s = scene(&pool).await;
         let choice = s.ask_kind("travel_together", recent(30)).await;
@@ -1937,7 +1977,7 @@ mod tests {
     /// finds the choice converted and writes nothing.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn an_answer_that_waits_on_a_converting_message_loses(pool: PgPool) {
-        let mock = companion_mock(Some(GOODBYE)).await;
+        let mock = companion_mock(Some(REPLY)).await;
         let state = with_companion(test_state(pool.clone()), &mock.uri());
         let s = Arc::new(scene(&pool).await);
         let choice = s.ask_kind("travel_together", recent(30)).await;
@@ -2043,7 +2083,25 @@ mod tests {
         assert_eq!(s.row(choice).await.0, "accepted");
         let rows = s.life_choice_rows().await;
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].1, GOODBYE);
+        assert_eq!(rows[0].1, REPLY);
+
+        // `resolved` carries the relationship as committed: a confession
+        // accepted from `none` already reads `dating`.
+        let s = scene(&pool).await;
+        let choice = s.ask_kind("confess", recent(30)).await;
+        let resp = respond_stream_at(
+            &state,
+            s.session_id,
+            choice,
+            s.user_id,
+            answer(LifeChoiceAnswer::Accept),
+            recent(0),
+        )
+        .await
+        .unwrap();
+        let frames = read_sse(resp).await;
+        assert_eq!(frame_types(&frames)[0], "resolved");
+        assert_eq!(frames[0]["affinity"]["relationship_status"], "dating");
     }
 
     /// A decline starts no event: `resolved` has no `event` key.
@@ -2105,7 +2163,7 @@ mod tests {
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn life_choice_stream_closed_is_409(pool: PgPool) {
-        let mock = companion_mock(Some(GOODBYE)).await;
+        let mock = companion_mock(Some(REPLY)).await;
         let state = with_companion(test_state(pool.clone()), &mock.uri());
         let s = scene(&pool).await;
         let choice = s.ask_kind("travel_together", recent(30)).await;
@@ -2135,7 +2193,7 @@ mod tests {
     /// answered for nothing.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn a_failed_trip_undoes_the_whole_answer(pool: PgPool) {
-        let mock = companion_mock(Some(GOODBYE)).await;
+        let mock = companion_mock(Some(REPLY)).await;
         let state = with_companion(test_state(pool.clone()), &mock.uri());
         let s = scene(&pool).await;
         let choice = s.ask_kind("travel_together", recent(30)).await;
@@ -2173,7 +2231,7 @@ mod tests {
     /// wherever it lives; the other session's choice stays pending.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn a_choice_of_another_session_is_404(pool: PgPool) {
-        let mock = companion_mock(Some(GOODBYE)).await;
+        let mock = companion_mock(Some(REPLY)).await;
         let state = with_companion(test_state(pool.clone()), &mock.uri());
         let s = scene(&pool).await;
         let other = scene(&pool).await;

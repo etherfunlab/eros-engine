@@ -1527,6 +1527,30 @@ mod tests {
         assert!(s.cold_war().await, "high, low, low, low starts it");
     }
 
+    /// Five of the newest seven at the lowest level start a cold war with no
+    /// three in a row: low, low, high, low, low, high, low starts it on the
+    /// seventh judged turn and not before.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn five_lowest_of_seven_start_a_cold_war(pool: PgPool) {
+        let s = scene(&pool).await;
+        let low = mock_llm(LOW_PATIENCE, Some(COLD_TEXT)).await;
+        let high = mock_llm(PATIENT, Some(COLD_TEXT)).await;
+        let low_state = with_models(test_state(pool.clone()), &low.uri());
+        let high_state = with_models(test_state(pool.clone()), &high.uri());
+
+        let turns = [true, true, false, true, true, false, true]; // lowest?
+        for (i, lowest) in turns.into_iter().enumerate() {
+            let state = if lowest { &low_state } else { &high_state };
+            s.turn(state, SEEN).await;
+            if i < 6 {
+                assert!(!s.cold_war().await, "not after turn {}", i + 1);
+            }
+        }
+        assert!(s.cold_war().await, "the seventh starts it");
+        assert_eq!(s.cold_war_events().await, vec![Some("entered".into())]);
+        assert_eq!(s.cold_war_rows().await, vec![proactive(COLD_TEXT)]);
+    }
+
     /// A blank, empty or failed ask writes neither her words nor the choice
     /// row, so the next qualifying turn asks again.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

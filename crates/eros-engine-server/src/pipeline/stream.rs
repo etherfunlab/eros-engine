@@ -27078,8 +27078,9 @@ data: [DONE]\n\n"
             .unwrap()
     }
 
-    /// The turn's affinity row `(context, effective_deltas)`, once the
-    /// spawned post-process has written it.
+    /// The turn's `message` affinity event `(context, effective_deltas)`,
+    /// once the spawned post-process has written it; a status turn's
+    /// `relationship` event shares its `user_message_id`.
     async fn turn_affinity_row(
         pool: &PgPool,
         umid: Uuid,
@@ -27087,7 +27088,7 @@ data: [DONE]\n\n"
         for _ in 0..200 {
             let row: Option<(serde_json::Value, Option<serde_json::Value>)> = sqlx::query_as(
                 "SELECT context, effective_deltas FROM engine.companion_affinity_events \
-                 WHERE user_message_id = $1",
+                 WHERE user_message_id = $1 AND event_type = 'message'",
             )
             .bind(umid)
             .fetch_optional(pool)
@@ -27604,9 +27605,9 @@ data: [DONE]\n\n"
             .unwrap();
         }
 
-        /// The affinity event of the turn whose user row is `umid`, once
-        /// post-process wrote it: the session its affinity row belongs to,
-        /// its type, `context` and `effective_deltas`.
+        /// The `message` affinity event of the turn whose user row is `umid`,
+        /// once post-process wrote it: the session its affinity row belongs
+        /// to, its type, `context` and `effective_deltas`.
         async fn turn_event(
             &self,
             umid: Uuid,
@@ -27617,7 +27618,7 @@ data: [DONE]\n\n"
                         "SELECT a.session_id, e.event_type, e.context, e.effective_deltas \
                            FROM engine.companion_affinity_events e \
                            JOIN engine.companion_affinity a ON a.id = e.affinity_id \
-                          WHERE e.user_message_id = $1",
+                          WHERE e.user_message_id = $1 AND e.event_type = 'message'",
                     )
                     .bind(umid)
                     .fetch_optional(&self.pool)
@@ -28689,13 +28690,14 @@ data: [DONE]\n\n"
     }
 
     /// A BYOC session stays outside the status system (spec §6.5): its
-    /// proposal goes to the judge as before and moves nothing.
+    /// proposal goes to the judge as before and moves nothing, even from a
+    /// status a genome session's accepted proposal would move.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn a_byoc_proposal_is_judged_and_moves_nothing(pool: PgPool) {
         let (frames, mock, _, session) = run_status_turn(
             &pool,
             eros_engine_core::types::UserAction::Propose,
-            "none",
+            "dating",
             false,
             true,
             "accept",
@@ -28704,7 +28706,7 @@ data: [DONE]\n\n"
         assert_eq!(action_response_of(&frames), "accept");
         let judge = judge_request(&mock.received_requests().await.unwrap());
         assert!(judge.contains("[用户动作] 对方向你求婚\\n"), "{judge}");
-        assert_eq!(status_row(&pool, session).await, ("none".into(), false));
+        assert_eq!(status_row(&pool, session).await, ("dating".into(), false));
         assert!(relationship_events(&pool, session).await.is_empty());
     }
 

@@ -1534,6 +1534,32 @@ mod tests {
         assert!(body["event"].get("life_choice").is_none(), "body={body}");
     }
 
+    /// A status or cold-war change is on the log but never the route's event:
+    /// the newest `relationship` row is passed over for the turn before it.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_relationship_event_type_never_surfaces(pool: PgPool) {
+        let (user_id, session_id, _aid, turn) = session_with_turn(&pool).await;
+        assert!(AffinityRepo { pool: &pool }
+            .set_cold_war(session_id, true, Utc::now())
+            .await
+            .unwrap());
+        let moved: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.companion_affinity_events \
+              WHERE event_type = 'relationship'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(moved, 1, "the cold war is on the log");
+
+        let mut app = build_router(test_state(pool));
+        let token = mint_test_jwt(user_id);
+        let (status, body) = send_request(&mut app, req(&token, session_id)).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["event"]["event_id"], json!(turn.to_string()));
+        assert_eq!(body["event"]["event_type"], "message");
+    }
+
     /// The long-poll path composes the choice at response time, after the hold:
     /// one that lands while the request is held rides the release, and a held
     /// request that times out unchanged carries it too.
