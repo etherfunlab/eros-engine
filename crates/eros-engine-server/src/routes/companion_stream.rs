@@ -1073,7 +1073,7 @@ pub async fn send_message_stream(
     // A card is accepted only from the deployment's own server, checked
     // before anything else (spec 2026-10-16-byoc §4).
     if req.character.is_some() {
-        crate::byoc::admit(&state.config.byoc, &headers)?;
+        crate::byoc::admit(&state.config.keys(crate::state::Gate::Byoc), &headers)?;
     }
     // Validate payload first — before any DB call — so 422/400 never waste a roundtrip.
     validate_payload(&req)?;

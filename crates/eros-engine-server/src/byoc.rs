@@ -22,9 +22,9 @@ use uuid::Uuid;
 use eros_engine_core::persona::{merge_items, CompanionPersona, PersonaGenome, PersonaInstance};
 use eros_engine_store::persona::{ByocInstance, PersonaRepo};
 
-use crate::byok::{constant_time_eq, pre_error};
+use crate::byok::{admitted_key, pre_error};
 use crate::error::AppError;
-use crate::state::{AppState, ByocConfig};
+use crate::state::AppState;
 
 /// Request header carrying the deployment's caller secret (spec §4).
 pub(crate) const CALLER_SECRET_HEADER: &str = "x-byoc-caller-secret";
@@ -63,19 +63,17 @@ fn forbidden(message: &str) -> AppError {
 }
 
 /// Spec §4: BYOC is served only to a caller holding the deployment's secret.
-pub(crate) fn admit(cfg: &ByocConfig, headers: &HeaderMap) -> Result<(), AppError> {
-    let Some(secret) = cfg.caller_secret.as_deref() else {
+/// `keys` are the ones the deployment admits (`ServerConfig::keys`); the one
+/// the caller presented comes back, since the init ticket is signed with it.
+pub(crate) fn admit<'a>(keys: &[&'a str], headers: &HeaderMap) -> Result<&'a str, AppError> {
+    if keys.is_empty() {
         return Err(forbidden("byoc is not enabled on this deployment"));
-    };
+    }
     let sent = headers
         .get(CALLER_SECRET_HEADER)
         .map(|v| v.as_bytes())
         .unwrap_or_default();
-    if constant_time_eq(sent, secret.as_bytes()) {
-        Ok(())
-    } else {
-        Err(forbidden("byoc caller secret missing or wrong"))
-    }
+    admitted_key(keys, sent).ok_or_else(|| forbidden("byoc caller secret missing or wrong"))
 }
 
 /// A route that cannot serve a BYOC instance.
@@ -349,12 +347,11 @@ mod tests {
 
     #[test]
     fn admit_needs_the_secret() {
-        let on = ByocConfig {
-            caller_secret: Some("s".repeat(32)),
-        };
+        let secret = "s".repeat(32);
+        let on = [secret.as_str()];
         let mut h = HeaderMap::new();
         assert_eq!(
-            code_of(admit(&ByocConfig::default(), &h).unwrap_err()),
+            code_of(admit(&[], &h).unwrap_err()),
             (403, "byoc_forbidden")
         );
         assert_eq!(
@@ -368,6 +365,19 @@ mod tests {
         );
         h.insert(CALLER_SECRET_HEADER, "s".repeat(32).parse().unwrap());
         assert!(admit(&on, &h).is_ok());
+    }
+
+    #[test]
+    fn admit_returns_the_key_the_caller_presented() {
+        let (own, sup) = ("o".repeat(32), "s".repeat(32));
+        let keys = [own.as_str(), sup.as_str()];
+        let mut h = HeaderMap::new();
+        h.insert(CALLER_SECRET_HEADER, sup.parse().unwrap());
+        assert_eq!(admit(&keys, &h).unwrap(), sup);
+        h.insert(CALLER_SECRET_HEADER, own.parse().unwrap());
+        assert_eq!(admit(&keys, &h).unwrap(), own);
+        assert!(admit(&[], &h).is_err(), "no key set is off");
+        assert!(admit(&keys, &HeaderMap::new()).is_err());
     }
 
     #[test]

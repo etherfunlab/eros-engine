@@ -42,35 +42,40 @@ impl Modify for SecurityAddon {
             SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::with_description(
                 CALLER_SECRET_HEADER,
                 "Deployment-wide caller secret; required on every bearer-authenticated route \
-                 when the deployment sets CALLER_SECRET",
+                 when the deployment sets CALLER_SECRET. SUPER_SECRET or ADMIN_SECRET is \
+                 accepted in its place",
             ))),
         );
         components.add_security_scheme(
             "insights_export_secret",
             SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::with_description(
                 EXPORT_SECRET_HEADER,
-                "Shared secret for the service sub-tree; INSIGHTS_EXPORT_SECRET on the deployment",
+                "Shared secret for the service sub-tree; INSIGHTS_EXPORT_SECRET on the deployment. \
+                 SUPER_SECRET or ADMIN_SECRET is accepted in its place",
             ))),
         );
         components.add_security_scheme(
             "facts_export_secret",
             SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::with_description(
                 FACTS_SECRET_HEADER,
-                "Shared secret for the facts export sub-tree; FACTS_EXPORT_SECRET on the deployment",
+                "Shared secret for the facts export sub-tree; FACTS_EXPORT_SECRET on the \
+                 deployment. SUPER_SECRET or ADMIN_SECRET is accepted in its place",
             ))),
         );
         components.add_security_scheme(
             "user_erase_secret",
             SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::with_description(
                 ERASE_SECRET_HEADER,
-                "Shared secret for the user-erase sub-tree; USER_ERASE_SECRET on the deployment",
+                "Shared secret for the user-erase sub-tree; USER_ERASE_SECRET on the deployment. \
+                 SUPER_SECRET is accepted in its place; ADMIN_SECRET is not",
             ))),
         );
         components.add_security_scheme(
             "genome_write_secret",
             SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::with_description(
                 GENOME_SECRET_HEADER,
-                "Shared secret for the genome-write sub-tree; GENOME_WRITE_SECRET on the deployment",
+                "Shared secret for the genome-write sub-tree; GENOME_WRITE_SECRET on the \
+                 deployment. SUPER_SECRET or ADMIN_SECRET is accepted in its place",
             ))),
         );
     }

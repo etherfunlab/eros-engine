@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::{AppError, StreamPreError};
-use crate::state::{AppState, ByokConfig};
+use crate::state::{AppState, ByokConfig, Gate};
 
 /// Process-wide BYOK state: the guarded HTTP client (spec §7.2) and the
 /// per-user round-robin cursors (§6.1). Cursors live per process and reset
@@ -259,23 +259,35 @@ pub(crate) fn reply_chain(req: &ChatRequest, byok: Option<&Arc<ByokTurn>>) -> Ve
 
 /// Spec §5: `byok` is honoured only from a caller holding the deployment's
 /// secret. `Err` carries the 403 message.
-pub(crate) fn admit(cfg: &ByokConfig, headers: &HeaderMap) -> Result<(), &'static str> {
-    let Some(secret) = cfg.caller_secret.as_deref() else {
+pub(crate) fn admit(keys: &[&str], headers: &HeaderMap) -> Result<(), &'static str> {
+    if keys.is_empty() {
         return Err("byok is not enabled on this deployment");
-    };
+    }
     let sent = headers
         .get(CALLER_SECRET_HEADER)
         .map(|v| v.as_bytes())
         .unwrap_or_default();
-    if constant_time_eq(sent, secret.as_bytes()) {
-        Ok(())
-    } else {
-        Err("byok caller secret missing or wrong")
+    match admitted_key(keys, sent) {
+        Some(_) => Ok(()),
+        None => Err("byok caller secret missing or wrong"),
     }
 }
 
 pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// The key in `keys` that `sent` equals, if any: the one comparison behind
+/// every secret gate (see `ServerConfig::keys`). Every key is compared, with
+/// no early exit on a match.
+pub(crate) fn admitted_key<'a>(keys: &[&'a str], sent: &[u8]) -> Option<&'a str> {
+    keys.iter().fold(None, |found, key| {
+        if constant_time_eq(sent, key.as_bytes()) {
+            Some(*key)
+        } else {
+            found
+        }
+    })
 }
 
 /// The route-side entry: admission (403) then validation (400), both before
@@ -286,7 +298,7 @@ pub(crate) fn admit_and_prepare(
     req: &ByokRequest,
     user_id: Uuid,
 ) -> Result<ByokTurn, AppError> {
-    admit(&state.config.byok, headers)
+    admit(&state.config.keys(Gate::Byok), headers)
         .map_err(|m| pre_error(StatusCode::FORBIDDEN, "byok_forbidden", m.to_string()))?;
     prepare(req, &state.config.byok, &state.byok, user_id)
         .map_err(|m| pre_error(StatusCode::BAD_REQUEST, "invalid_payload", m))
@@ -609,14 +621,23 @@ mod tests {
     }
 
     #[test]
+    fn admitted_key_returns_the_matching_key_and_never_matches_an_empty_list() {
+        let (own, sup) = ("o".repeat(32), "s".repeat(32));
+        let keys = [own.as_str(), sup.as_str()];
+        assert_eq!(admitted_key(&keys, own.as_bytes()), Some(own.as_str()));
+        assert_eq!(admitted_key(&keys, sup.as_bytes()), Some(sup.as_str()));
+        assert_eq!(admitted_key(&keys, b"wrong"), None);
+        assert_eq!(admitted_key(&keys, b""), None, "an absent header");
+        assert_eq!(admitted_key(&[], b""), None, "no key set is off, not open");
+        assert_eq!(admitted_key(&[], own.as_bytes()), None);
+    }
+
+    #[test]
     fn admit_requires_the_secret() {
         let secret = "s".repeat(32);
-        let on = ByokConfig {
-            caller_secret: Some(secret.clone()),
-            allow_private_network: false,
-        };
+        let on = [secret.as_str()];
         let mut h = HeaderMap::new();
-        assert!(admit(&ByokConfig::default(), &h).is_err(), "feature off");
+        assert!(admit(&[], &h).is_err(), "feature off");
         assert!(admit(&on, &h).is_err(), "header missing");
         h.insert(CALLER_SECRET_HEADER, "wrong".parse().unwrap());
         assert!(admit(&on, &h).is_err(), "header wrong");

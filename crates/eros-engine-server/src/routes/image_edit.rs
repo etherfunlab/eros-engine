@@ -648,7 +648,7 @@ async fn edit_image(
     // A card is accepted only from the deployment's own server, checked
     // before anything else (spec 2026-10-16-byoc §4).
     if req.character.is_some() {
-        crate::byoc::admit(&state.config.byoc, &headers)?;
+        crate::byoc::admit(&state.config.keys(crate::state::Gate::Byoc), &headers)?;
     }
     // Ownership and state first, body second: a caller must not learn that
     // their aspect_ratio was invalid on a session they do not own.

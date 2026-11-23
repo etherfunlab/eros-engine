@@ -18,7 +18,7 @@ use axum::middleware::from_fn_with_state;
 use utoipa_axum::router::OpenApiRouter;
 
 use crate::auth::middleware::{require_auth, require_caller_secret};
-use crate::state::AppState;
+use crate::state::{AppState, Gate};
 
 pub mod activities;
 pub mod bff;
@@ -77,25 +77,26 @@ pub fn router(state: AppState) -> OpenApiRouter<AppState> {
 
     let mut app = OpenApiRouter::new().merge(health::router()).merge(comp);
     // Service sub-trees: secret-admitted, each mounted only when the
-    // deployment set its own secret (INSIGHTS_EXPORT_SECRET,
-    // FACTS_EXPORT_SECRET, USER_ERASE_SECRET, GENOME_WRITE_SECRET). Separate secrets keep a
-    // consumer of one stream from reaching another's routes. An unconfigured
-    // sub-tree answers exactly as any unknown path does, so it does not
-    // confirm the feature exists.
-    if state.config.insights_export.secret.is_some() {
+    // deployment set a key for it: its own secret (INSIGHTS_EXPORT_SECRET,
+    // FACTS_EXPORT_SECRET, USER_ERASE_SECRET, GENOME_WRITE_SECRET) or a master
+    // key that covers it. Separate secrets keep a consumer of one stream from
+    // reaching another's routes. An unconfigured sub-tree answers exactly as
+    // any unknown path does, so it does not confirm the feature exists.
+    let mounted = |gate| !state.config.keys(gate).is_empty();
+    if mounted(Gate::InsightsExport) {
         app = app.merge(svc::router());
     }
-    if state.config.facts_export.secret.is_some() {
+    if mounted(Gate::FactsExport) {
         app = app.merge(svc::facts_router());
     }
-    if state.config.user_erase.secret.is_some() {
+    if mounted(Gate::UserErase) {
         app = app.merge(svc::erase_router());
     }
-    if state.config.genome_write.secret.is_some() {
+    if mounted(Gate::GenomeWrite) {
         app = app.merge(genomes::router());
     }
     // Tombstones carry ids only: either read secret opens them.
-    if state.config.insights_export.secret.is_some() || state.config.facts_export.secret.is_some() {
+    if mounted(Gate::InsightsExport) || mounted(Gate::FactsExport) {
         app = app.merge(svc::rows_router());
     }
     app
@@ -262,6 +263,168 @@ mod caller_gate_tests {
         assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
         assert_eq!(body["code"], "caller_forbidden");
         let both = [("x-byoc-caller-secret", KEY_B), ("x-caller-secret", KEY_A)];
+        let (status, body) =
+            send_request(&mut app, req("POST", "/v2/comp/byoc/init", true, &both)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+}
+
+#[cfg(test)]
+mod master_secret_tests {
+    use axum::body::Body;
+    use axum::http::{header, Request, StatusCode};
+    use axum::Router;
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    use crate::routes::companion::test_state;
+    use crate::routes::companion::testutil::{build_router, mint_test_jwt, send_request};
+    use crate::state::AppState;
+
+    const SUPER: &str = "super-0123456789abcdef0123456789abcdef";
+    const ADMIN: &str = "admin-0123456789abcdef0123456789abcdef";
+    const OWN: &str = "own-0123456789abcdef0123456789abcdef01";
+    const KEY_A: &str = "0123456789abcdef0123456789abcdef";
+
+    fn app(pool: PgPool, configure: impl FnOnce(&mut AppState)) -> Router {
+        let mut state = test_state(pool);
+        configure(&mut state);
+        build_router(state)
+    }
+
+    fn req(method: &str, uri: &str, bearer: bool, headers: &[(&str, &str)]) -> Request<Body> {
+        let mut b = Request::builder().method(method).uri(uri);
+        if bearer {
+            b = b.header(
+                header::AUTHORIZATION,
+                format!("Bearer {}", mint_test_jwt(Uuid::new_v4())),
+            );
+        }
+        for (name, value) in headers {
+            b = b.header(*name, *value);
+        }
+        b.body(Body::empty()).unwrap()
+    }
+
+    fn erase_uri() -> String {
+        format!("/svc/v1/users/{}/erase", Uuid::new_v4())
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn super_alone_mounts_and_admits_every_sub_tree(pool: PgPool) {
+        let mut app = app(pool, |s| s.config.masters.super_secret = Some(SUPER.into()));
+        for (method, uri, header) in [
+            ("POST", erase_uri(), "x-user-erase-secret"),
+            (
+                "GET",
+                "/svc/v1/insights/changes".to_string(),
+                "x-insights-export-secret",
+            ),
+            (
+                "GET",
+                "/svc/v1/facts/changes".to_string(),
+                "x-facts-export-secret",
+            ),
+            (
+                "GET",
+                "/svc/v1/rows/deletions".to_string(),
+                "x-facts-export-secret",
+            ),
+        ] {
+            let (status, body) =
+                send_request(&mut app, req(method, &uri, false, &[(header, SUPER)])).await;
+            assert_eq!(status, StatusCode::OK, "{method} {uri}: {body}");
+            let (status, _) =
+                send_request(&mut app, req(method, &uri, false, &[(header, "wrong")])).await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{method} {uri} with a wrong key"
+            );
+        }
+        // A master key does not switch the caller gate on.
+        let (status, body) = send_request(&mut app, req("GET", "/v2/comp/groups", true, &[])).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn admin_alone_leaves_user_erase_unmounted(pool: PgPool) {
+        let mut app = app(pool, |s| s.config.masters.admin_secret = Some(ADMIN.into()));
+        let erase = [("x-user-erase-secret", ADMIN)];
+        let (unknown, _) = send_request(
+            &mut app,
+            req("POST", "/svc-does-not-exist/zzz", false, &erase),
+        )
+        .await;
+        let (status, _) = send_request(&mut app, req("POST", &erase_uri(), false, &erase)).await;
+        assert_eq!(
+            status, unknown,
+            "the erase route must look like an unknown path"
+        );
+
+        let (status, body) = send_request(
+            &mut app,
+            req(
+                "GET",
+                "/svc/v1/insights/changes",
+                false,
+                &[("x-insights-export-secret", ADMIN)],
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn admin_is_refused_on_a_mounted_erase_route(pool: PgPool) {
+        let mut app = app(pool, |s| {
+            s.config.user_erase.secret = Some(OWN.into());
+            s.config.masters.admin_secret = Some(ADMIN.into());
+        });
+        let uri = erase_uri();
+        let (status, _) = send_request(
+            &mut app,
+            req("POST", &uri, false, &[("x-user-erase-secret", ADMIN)]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, body) = send_request(
+            &mut app,
+            req("POST", &uri, false, &[("x-user-erase-secret", OWN)]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_master_passes_the_caller_gate_once_it_is_on(pool: PgPool) {
+        let mut app = app(pool, |s| {
+            s.config.caller_secret.secrets = vec![KEY_A.into()];
+            s.config.masters.super_secret = Some(SUPER.into());
+            s.config.masters.admin_secret = Some(ADMIN.into());
+        });
+        let (status, body) = send_request(&mut app, req("GET", "/v2/comp/groups", true, &[])).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["code"], "caller_forbidden");
+        for key in [KEY_A, SUPER, ADMIN] {
+            let (status, body) = send_request(
+                &mut app,
+                req("GET", "/v2/comp/groups", true, &[("x-caller-secret", key)]),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+    }
+
+    /// BYOC with no secret of its own: a master key turns it on, and passes
+    /// both gates of a deployment that also runs the caller gate.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_master_turns_byoc_on(pool: PgPool) {
+        let mut app = app(pool, |s| {
+            s.config.caller_secret.secrets = vec![KEY_A.into()];
+            s.config.masters.admin_secret = Some(ADMIN.into());
+        });
+        let both = [("x-byoc-caller-secret", ADMIN), ("x-caller-secret", ADMIN)];
         let (status, body) =
             send_request(&mut app, req("POST", "/v2/comp/byoc/init", true, &both)).await;
         assert_eq!(status, StatusCode::OK, "{body}");

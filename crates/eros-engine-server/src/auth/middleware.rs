@@ -7,9 +7,9 @@ use axum::{
 };
 use uuid::Uuid;
 
-use crate::byok::{constant_time_eq, pre_error};
+use crate::byok::{admitted_key, pre_error};
 use crate::error::AppError;
-use crate::state::AppState;
+use crate::state::{AppState, Gate};
 
 /// Request header carrying the deployment's caller secret (`CALLER_SECRET`).
 pub(crate) const CALLER_SECRET_HEADER: &str = "x-caller-secret";
@@ -38,14 +38,14 @@ pub async fn require_auth(
 }
 
 /// The caller-secret gate: with `CALLER_SECRET` set, only a caller sending
-/// one of its keys reaches the authenticated tree. Layered outside
+/// one of its keys, or a master key, reaches the authenticated tree. Layered outside
 /// [`require_auth`], so it decides before the JWT is looked at.
 pub async fn require_caller_secret(
     State(state): State<AppState>,
     req: Request,
     next: Next,
 ) -> Result<Response, AppError> {
-    let keys = &state.config.caller_secret.secrets;
+    let keys = state.config.keys(Gate::Caller);
     if keys.is_empty() {
         return Ok(next.run(req).await);
     }
@@ -54,10 +54,7 @@ pub async fn require_caller_secret(
         .get(CALLER_SECRET_HEADER)
         .map(|v| v.as_bytes())
         .unwrap_or_default();
-    let admitted = keys
-        .iter()
-        .fold(false, |ok, k| ok | constant_time_eq(sent, k.as_bytes()));
-    if !admitted {
+    if admitted_key(&keys, sent).is_none() {
         return Err(pre_error(
             StatusCode::FORBIDDEN,
             "caller_forbidden",

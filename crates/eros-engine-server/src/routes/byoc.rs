@@ -17,7 +17,7 @@ use crate::byoc::{self, b64_decode, b64_encode};
 use crate::byok::pre_error;
 use crate::error::AppError;
 use crate::routes::companion_stream::StreamPreErrorBody;
-use crate::state::AppState;
+use crate::state::{AppState, Gate};
 
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct ByocInitResponse {
@@ -43,15 +43,9 @@ pub struct ByocCreateResponse {
     pub instance_id: Uuid,
 }
 
-/// Admit the caller, and hand back the secret it proved it holds.
+/// Admit the caller, and hand back the key it proved it holds.
 fn admit<'a>(state: &'a AppState, headers: &HeaderMap) -> Result<&'a str, AppError> {
-    byoc::admit(&state.config.byoc, headers)?;
-    Ok(state
-        .config
-        .byoc
-        .caller_secret
-        .as_deref()
-        .expect("admit passes only when the secret is set"))
+    byoc::admit(&state.config.keys(Gate::Byoc), headers)
 }
 
 /// Draw a key for a new BYOC instance.
@@ -244,6 +238,55 @@ mod tests {
         assert_eq!(genome_id, None);
         assert_eq!(byoc_key, Some(key));
         assert_eq!(owner_uid, user);
+    }
+
+    /// The ticket is signed with the key the caller presented, so another
+    /// admitted key does not redeem it.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_ticket_is_redeemed_with_the_key_that_minted_it(pool: PgPool) {
+        const SUPER: &str = "super-0123456789abcdef0123456789abcdef";
+        let mut state = byoc_state(&pool);
+        state.config.masters.super_secret = Some(SUPER.into());
+        let user = Uuid::new_v4();
+        let call = |path: &'static str, secret: &'static str, body: Option<Value>| {
+            let state = state.clone();
+            async move {
+                send_request(
+                    &mut build_router(state),
+                    post(path, user, Some(secret), body),
+                )
+                .await
+            }
+        };
+
+        // The reference: a ticket the engine did not sign.
+        let (_, own_issue) = call("/v2/comp/byoc/init", BYOC_SECRET, None).await;
+        let mut forged = own_issue.clone();
+        forged["ticket"] = json!(b64_encode(&[0u8; 32]));
+        let (bad_ticket, _) = call("/v2/comp/byoc/create", BYOC_SECRET, Some(forged)).await;
+        assert!(bad_ticket.is_client_error(), "{bad_ticket}");
+
+        // A ticket minted with the feature secret: the master key does not
+        // redeem it, the feature secret does.
+        let (status, _) = call("/v2/comp/byoc/create", SUPER, Some(own_issue.clone())).await;
+        assert_eq!(status, bad_ticket, "the master key does not redeem it");
+        let (status, body) = call("/v2/comp/byoc/create", BYOC_SECRET, Some(own_issue)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        // And the other way round.
+        let (status, issued) = call("/v2/comp/byoc/init", SUPER, None).await;
+        assert_eq!(status, StatusCode::OK, "{issued}");
+        let before = count_instances(&pool).await;
+        let (status, _) = call("/v2/comp/byoc/create", BYOC_SECRET, Some(issued.clone())).await;
+        assert_eq!(
+            status, bad_ticket,
+            "another admitted key does not redeem it"
+        );
+        assert_eq!(count_instances(&pool).await, before);
+
+        let (status, body) = call("/v2/comp/byoc/create", SUPER, Some(issued)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(count_instances(&pool).await, before + 1);
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
