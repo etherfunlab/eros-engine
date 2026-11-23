@@ -386,7 +386,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 ≤ 16 个 key，key 满足 `[A-Za-z0-9_.-]{1,64}`，value 必须是 string
 且 ≤ 512 字符。违反作为 pre-stream 错误返回 `400 BadRequest`。
 
-**可选：动作。** 请求体可以带 `action`，表示用户在说话之外对角色做的事。角色可能接受，也可能不接受；不接受时，这段关系在动作对应的那条线上降一档（`give` 和 `gift` 动 bond，身体动作和自定义动作动 chemistry），被拒的 `tip`、`bluff`、`threaten`、`trick`、`challenge`、`bet`、`propose` 不降档（见 [affinity-model.zh.md](affinity-model.zh.md)）。
+**可选：动作。** 请求体可以带 `action`，表示用户在说话之外对角色做的事。角色可能接受，也可能不接受；不接受时，这段关系在动作对应的那条线上降一档（`give` 和 `gift` 动 bond，身体动作和自定义动作动 chemistry），被拒的 `tip`、`bluff`、`threaten`、`trick`、`challenge`、`bet`、`propose` 不降档，她的世界不允许的 `fight_together` 被拒也不降档（见 [affinity-model.zh.md](affinity-model.zh.md)）。
 
 | `type` | 字段 |
 |---|---|

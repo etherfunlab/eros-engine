@@ -443,7 +443,7 @@ chars. Violations return `400 BadRequest` as a pre-stream error.
 **Optional: action.** The body may include `action` — something the user does to
 the persona besides talking. The persona accepts it or not; a refusal costs the
 relationship one tier on the line the action touches (`give` and `gift` → bond, every
-physical or custom action → chemistry), and a refused `tip`, `bluff`, `threaten`, `trick`, `challenge`, `bet` or `propose` costs nothing (see
+physical or custom action → chemistry), and a refused `tip`, `bluff`, `threaten`, `trick`, `challenge`, `bet` or `propose` costs nothing, as does a `fight_together` her world rules out (see
 [affinity-model.md](affinity-model.md#refused-actions)).
 
 | `type` | fields |
