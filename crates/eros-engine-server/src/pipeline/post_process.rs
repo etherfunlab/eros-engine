@@ -150,7 +150,11 @@ pub async fn run(
         ),
         _ => (String::new(), None, false),
     };
-    let tier_drop = tier_drop_for(&event, &plan);
+    let tier_drop = tier_drop_for(
+        &event,
+        &plan,
+        crate::prompt::persona_traits(&persona).setting,
+    );
     // A date turn, and the accepted invitation that opens a date, belong to
     // the date: settlement reads them, the per-turn judge does not (spec
     // 2026-11-12-activity-sub-session-design.md §4.6, §5.1).
@@ -1017,12 +1021,17 @@ fn eval_skip_reason(
 }
 
 /// The line a refused action drops this turn (spec 2026-10-05 §6.3); `None`
-/// on every other turn, and on a refused tip, which drops nothing (spec
-/// 2026-10-11 §6).
+/// on every other turn, on a refused tip, which drops nothing (spec
+/// 2026-10-11 §6), and on an action the persona's `setting` rules out (spec
+/// 2026-11-23-hot-spring-fight-challenge-bet-design.md §4).
 fn tier_drop_for(
     event: &Event,
     plan: &ActionPlan,
+    setting: eros_engine_core::events::Setting,
 ) -> Option<eros_engine_core::affinity::AffinityLine> {
+    if eros_engine_core::pde::world_ruled_out(event, setting) {
+        return None;
+    }
     match (event, plan.action_response) {
         (
             Event::UserMessage {
@@ -2274,6 +2283,7 @@ async fn structure_user_insights(
 mod tests {
     use super::*;
     use crate::routes::companion::testutil::seed_persona_instance;
+    use eros_engine_core::events::Setting;
     use uuid::Uuid;
 
     // ─── Shared test seeding + mock-OpenRouter helpers ────────────────
@@ -2765,22 +2775,89 @@ mod tests {
         assert_eq!(
             tier_drop_for(
                 &event(Some(give.clone())),
-                &plan(Some(ActionResponse::Refuse))
+                &plan(Some(ActionResponse::Refuse)),
+                Setting::Modern
             ),
             Some(AffinityLine::Bond)
         );
         assert_eq!(
             tier_drop_for(
                 &event(Some(UserAction::Kiss)),
-                &plan(Some(ActionResponse::Refuse))
+                &plan(Some(ActionResponse::Refuse)),
+                Setting::Modern
             ),
             Some(AffinityLine::Chemistry)
         );
         assert_eq!(
-            tier_drop_for(&event(Some(give)), &plan(Some(ActionResponse::Accept))),
+            tier_drop_for(
+                &event(Some(give)),
+                &plan(Some(ActionResponse::Accept)),
+                Setting::Modern
+            ),
             None
         );
-        assert_eq!(tier_drop_for(&event(None), &plan(None)), None);
+        assert_eq!(
+            tier_drop_for(&event(None), &plan(None), Setting::Modern),
+            None
+        );
+    }
+
+    /// Spec 2026-11-23-hot-spring-fight-challenge-bet-design.md §4: a fight a
+    /// modern persona's world rules out costs nothing; the judge's refusal of
+    /// one a fantasy persona could have still drops chemistry.
+    #[test]
+    fn a_fight_the_world_rules_out_drops_nothing() {
+        use eros_engine_core::affinity::AffinityLine;
+        use eros_engine_core::types::{ActionResponse, UserAction};
+        let event = |a: UserAction| Event::UserMessage {
+            content: String::new(),
+            message_id: Uuid::nil(),
+            prompt_traits: vec![],
+            audit: None,
+            tier: None,
+            memory_scope: Default::default(),
+            affinity_scope: Default::default(),
+            quote: None,
+            action: Some(a),
+            outfit: None,
+        };
+        let refused = ActionPlan {
+            action_type: ActionType::ReplyText,
+            reply_style: eros_engine_core::types::ReplyStyle::Neutral,
+            affinity_deltas: Default::default(),
+            energy_cost: 0.0,
+            context_hints: Vec::new(),
+            reply_mode: None,
+            nudges: Default::default(),
+            clothing: None,
+            image_caption: None,
+            image_ref: eros_engine_core::types::ImageRef::Face,
+            aspect_ratio: None,
+            action_response: Some(ActionResponse::Refuse),
+        };
+        let fight = event(UserAction::FightTogether);
+        assert_eq!(tier_drop_for(&fight, &refused, Setting::Modern), None);
+        assert_eq!(
+            tier_drop_for(&fight, &refused, Setting::Fantasy),
+            Some(AffinityLine::Chemistry)
+        );
+        assert_eq!(
+            tier_drop_for(
+                &event(UserAction::HotSpringTogether),
+                &refused,
+                Setting::Modern
+            ),
+            Some(AffinityLine::Chemistry)
+        );
+        for a in [UserAction::Challenge, UserAction::Bet] {
+            for setting in [Setting::Modern, Setting::Fantasy] {
+                assert_eq!(
+                    tier_drop_for(&event(a.clone()), &refused, setting),
+                    None,
+                    "{a:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2812,7 +2889,7 @@ mod tests {
             aspect_ratio: None,
             action_response: Some(ActionResponse::Refuse),
         };
-        assert_eq!(tier_drop_for(&event, &plan), None);
+        assert_eq!(tier_drop_for(&event, &plan, Setting::Modern), None);
     }
 
     #[test]

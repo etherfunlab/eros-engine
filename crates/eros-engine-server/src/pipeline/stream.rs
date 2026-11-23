@@ -5306,10 +5306,11 @@ pub(crate) fn run_stream_with(
         // 2026-11-20-together-actions-state-in-picture-and-genome-routes-
         // design.md §5, 2026-11-23-twelve-together-actions-and-propose-
         // design.md §4.1).
-        let together_refused = pde::together_ruled_out(
-            &input.event,
-            crate::prompt::persona_traits(&input.persona).machine,
-        );
+        let traits = crate::prompt::persona_traits(&input.persona);
+        let together_refused = pde::together_ruled_out(&input.event, traits.machine);
+        // A fight a modern persona's world does not have (spec 2026-11-23-
+        // hot-spring-fight-challenge-bet-design.md §4): refused, and free.
+        let world_refused = pde::world_ruled_out(&input.event, traits.setting);
         // A date she cannot go on (spec 2026-11-12-activity-sub-session-
         // design.md §4.3): she is offline, or a `mid` one is asked below bond
         // tier 2. On the decayed affinity this turn reads. Another date of
@@ -5337,7 +5338,8 @@ pub(crate) fn run_stream_with(
             affinity.bond_tier(),
             offline_now || other_date_on,
         );
-        let refused_before_judge = give_refused || strip_refused || together_refused || date_refused;
+        let refused_before_judge =
+            give_refused || strip_refused || together_refused || world_refused || date_refused;
         let (mut plan, pde_run): (eros_engine_core::types::ActionPlan, Option<PdeDecisionRun>) =
             match resolved_pde.as_ref() {
                 Some(p) => {
