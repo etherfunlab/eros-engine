@@ -2363,6 +2363,8 @@ session 403）。
 | `USER_ERASE_SECRET` | `x-user-erase-secret` | [`POST users/{user_id}/erase`](#post-svcv1usersuser_iderase) |
 | `GENOME_WRITE_SECRET` | `x-genome-write-secret` | [`POST genomes`](#post-svcv1genomes)、[`PUT genomes/{id}`](#put-svcv1genomesid) |
 
+`SUPER_SECRET` 可以代替以上任何一个 secret，填在同一个 header 里，并且单独设置它就会挂载全部子树。`ADMIN_SECRET` 同样如此，但不包括用户抹除这棵子树（[部署](deploying.zh.md)）。
+
 所有的流都用同样的方式 keyset 分页；它们背后的流水线见[洞察](insights.zh.md#导出与删除)。
 
 ### `GET /svc/v1/insights/changes`
@@ -2538,9 +2540,9 @@ curl -X POST -H "x-user-erase-secret: $USER_ERASE_SECRET" \
 
 `deleted` 统计被移除的行，`blanked` 统计内容被清空但保留的行（id 与时间戳保留），都按表名列出。每张覆盖到的表都会列出（示例做了省略），没有可做的就是 `0`；`blanked` 只统计仍然带有内容的行。这些表列在[洞察 → 抹除](insights.zh.md#抹除)。聊天 session 与消息归调用方，不会被触碰。
 
-- **幂等。** 重复调用什么都找不到，各处报 `0`，并把 `erased_at` 往前移。
+- **幂等。** 重复调用报告它还找到的行，什么都不剩时各处报 `0`，并把 `erased_at` 往前移。
 - **请在删除该用户的 session 或角色实例之前调用。** 按关系分开的 insight 表和关系扫描的表只以实例为键，只有实例行还在时才够得着它们。
-- **先停掉该用户的流量。** 已经在进行中的第一段抽取可能在抹除提交之后写入事实；再调用一次清理。（进行中的重建写不回画像。）
+- **永久，而且守得住。** 从第一次调用起，引擎不再派生任何关于该用户的东西：不写事实、画像、记忆、insight 和关系扫描，dreaming 回填也跳过调用方保留下来的聊天历史。该用户之后发来的消息照常回复；那一轮的审计行带有内容，再调用一次抹除即可清空。抹除那一刻正在进行中的写入仍可能落库，再调用一次即可删掉。没有任何路由能撤销抹除（[洞察 → 抹除](insights.zh.md#抹除)）。
 
 ### `POST /svc/v1/genomes`
 
