@@ -7,6 +7,7 @@
 use crate::affinity::AffinityDeltas;
 use crate::ghost::{self, GhostDecision, GhostSignals};
 use crate::needs::Habits;
+use crate::relationship::{RelationshipStatus, StatusAsk};
 use crate::types::{
     ActionPlan, ActionResponse, ActionType, DateDuration, DecisionInput, Event, ImageRef,
     ReplyMode, ReplyStyle, TurnNudges, UserAction,
@@ -117,6 +118,26 @@ pub fn world_ruled_out(event: &Event, setting: crate::events::Setting) -> bool {
             ..
         }
     ) && setting != crate::events::Setting::Fantasy
+}
+
+/// Whether this turn's status ask is ruled out before the judge (spec
+/// 2026-11-23-affinity-50-design.md §6.5, §8): on a genome instance, a
+/// `propose` from a status it is not put from (only `dating`, `fwb` and
+/// `situationship` are); a `break_up` without a breakable status, and on a
+/// BYOC instance always. A BYOC `propose` goes to the judge as before. Such
+/// a refusal drops no line.
+pub fn status_ruled_out(event: &Event, status: RelationshipStatus, genome: bool) -> bool {
+    match event {
+        Event::UserMessage {
+            action: Some(UserAction::Propose),
+            ..
+        } => genome && !StatusAsk::Propose.asked_from(status),
+        Event::UserMessage {
+            action: Some(UserAction::BreakUp),
+            ..
+        } => !genome || !status.is_breakable(),
+        _ => false,
+    }
 }
 
 /// Whether this turn's `date` is ruled out before the judge (spec
@@ -412,6 +433,7 @@ mod tests {
             feeling_clause_at: None,
             created_at: now,
             updated_at: now,
+            relationship: Default::default(),
         }
     }
 
@@ -1278,6 +1300,49 @@ mod tests {
             );
         }
         assert!(!world_ruled_out(&user_msg("hi"), Setting::Modern));
+    }
+
+    /// Spec 2026-11-23-affinity-50-design.md §6.5, §8: a proposal is put
+    /// only from `dating`, `fwb` or `situationship`, a break-up only from a
+    /// breakable status; a BYOC proposal goes to the judge as before and a
+    /// BYOC break-up never does.
+    #[test]
+    fn a_status_ask_needs_a_status_it_is_put_from() {
+        use crate::relationship::RelationshipStatus as S;
+        let propose = action_msg(UserAction::Propose);
+        let break_up = action_msg(UserAction::BreakUp);
+        for s in [S::Dating, S::Fwb, S::Situationship] {
+            assert!(!status_ruled_out(&propose, s, true), "{s:?}");
+        }
+        for s in [S::None, S::Partner, S::Peer, S::Engaged, S::Ex] {
+            assert!(status_ruled_out(&propose, s, true), "{s:?}");
+        }
+        for s in [S::Dating, S::Partner, S::Fwb, S::Situationship, S::Engaged] {
+            assert!(!status_ruled_out(&break_up, s, true), "{s:?}");
+        }
+        for s in [S::None, S::Peer, S::Ex] {
+            assert!(status_ruled_out(&break_up, s, true), "{s:?}");
+        }
+        for s in S::ALL {
+            assert!(!status_ruled_out(&propose, s, false), "BYOC {s:?}");
+            assert!(status_ruled_out(&break_up, s, false), "BYOC {s:?}");
+        }
+        for a in [
+            UserAction::Kiss,
+            UserAction::SexTogether,
+            UserAction::Challenge,
+            UserAction::FightTogether,
+        ] {
+            for s in S::ALL {
+                for genome in [true, false] {
+                    assert!(
+                        !status_ruled_out(&action_msg(a.clone()), s, genome),
+                        "{a:?} {s:?}"
+                    );
+                }
+            }
+        }
+        assert!(!status_ruled_out(&user_msg("hi"), S::None, true));
     }
 
     #[test]

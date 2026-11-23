@@ -9,6 +9,7 @@ use eros_engine_core::affinity::{
     grade_turn, grade_weighted, Affinity, AffinityDeltas, AffinityLine, AffinityTuning, AxisGrades,
     EndpointLevelReads, PendingDeltas, TurnLabelChanges,
 };
+use eros_engine_core::relationship::{Relationship, RelationshipStatus};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -45,8 +46,22 @@ pub struct AffinityRow {
     // cannot call Rust.
     /// Threshold-gate balance (migration 0043). NULL = all-zero.
     pub pending_deltas: Option<serde_json::Value>,
+    /// The pair's relationship status, a wire key of `RelationshipStatus`
+    /// (migration 0088).
+    pub relationship_status: String,
+    /// When the cold war began; NULL = none is on (migration 0088).
+    pub cold_war_since: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// The two stored relationship columns as a [`Relationship`].
+fn relationship_of(status: &str, cold_war_since: Option<DateTime<Utc>>) -> Relationship {
+    Relationship {
+        status: RelationshipStatus::parse(status)
+            .expect("companion_affinity_relationship_status_check (0088)"),
+        cold_war_since,
+    }
 }
 
 impl AffinityRow {
@@ -71,6 +86,7 @@ impl AffinityRow {
             feeling_clause_at: self.feeling_clause_at,
             created_at: self.created_at,
             updated_at: self.updated_at,
+            relationship: relationship_of(&self.relationship_status, self.cold_war_since),
         }
     }
 }
@@ -150,11 +166,28 @@ pub struct AffinityEventRow {
 }
 
 /// The endpoints of one judged turn: the `warmth` and `patience` its
-/// affinity evaluation committed (spec 2026-10-30 §4.3).
+/// affinity evaluation committed (spec 2026-10-30 §4.3), and the judge's own
+/// patience level (`patience_grade`, 1..=3, spec 2026-11-23-affinity-50 §6.3).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct JudgedEndpoints {
     pub warmth: f64,
     pub patience: f64,
+    /// The level the judge read, not the derived `patience`. A turn written
+    /// before the snapshot carried it reads as the middle level, 2.
+    pub patience_grade: i16,
+}
+
+/// What moved a relationship, as the `relationship` event records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationshipCause {
+    /// Her life choice, answered by the user: its id goes in the event's
+    /// `context` as `choice_id`.
+    Choice(Uuid),
+    /// The user's own ask, judged on this message: the event's
+    /// `user_message_id`.
+    UserMessage(Uuid),
+    /// The judged-turn streak: nothing to point at.
+    Streak,
 }
 
 /// A date's one verdict, as settlement hands it to
@@ -175,7 +208,7 @@ pub struct ActivityVerdict<'a> {
     pub reason: &'a str,
     /// Demo boost on positive grades; 1.0 = none.
     pub boost: f64,
-    /// The post-separation slowdown on positive line deltas; 1.0 = none.
+    /// The cold-war scale on positive line deltas; 1.0 = none.
     pub growth_scale: f64,
     pub generation_id: Option<&'a str>,
     pub llm_attempts: Option<serde_json::Value>,
@@ -788,24 +821,26 @@ impl<'a> AffinityRepo<'a> {
         .await
     }
 
-    /// The post-turn `warmth` and `patience` of the session's judged turns,
-    /// newest first (spec 2026-10-19 §3.1, spec 2026-10-30 §4.3). A judged
-    /// turn is a `message` event whose eval committed: no `eval_skip_reason`,
-    /// and the judge's generation came back (a failed call leaves none).
-    /// Every other row — skipped or failed evals, gifts, ghosts, proactive,
-    /// `time_decay`, `life_choice`, a pre-4.1 row with no `state_after`, a row
-    /// whose `state_after` lacks either endpoint — is not one, so it neither
-    /// counts nor sits between two that do. `since` keeps only turns written
-    /// strictly after it.
+    /// The post-turn `warmth`, `patience` and patience level of the session's
+    /// judged turns, newest first (spec 2026-10-19 §3.1, spec 2026-10-30 §4.3,
+    /// spec 2026-11-23-affinity-50 §6.3). A judged turn is a `message` event
+    /// whose eval committed: no `eval_skip_reason`, and the judge's generation
+    /// came back (a failed call leaves none). Every other row — skipped or
+    /// failed evals, gifts, ghosts, proactive, `time_decay`, `life_choice`,
+    /// `relationship`, a pre-4.1 row with no `state_after`, a row whose
+    /// `state_after` lacks either endpoint — is not one, so it neither counts
+    /// nor sits between two that do. `since` keeps only turns written strictly
+    /// after it.
     pub async fn last_judged_endpoints(
         &self,
         session_id: Uuid,
         since: Option<DateTime<Utc>>,
         limit: i64,
     ) -> Result<Vec<JudgedEndpoints>, sqlx::Error> {
-        let rows: Vec<(f64, f64)> = sqlx::query_as(
+        let rows: Vec<(f64, f64, i16)> = sqlx::query_as(
             "SELECT (e.state_after->>'warmth')::float8, \
-                    (e.state_after->>'patience')::float8 \
+                    (e.state_after->>'patience')::float8, \
+                    COALESCE((e.state_after->>'patience_grade')::int2, 2::int2) \
                FROM engine.companion_affinity_events e \
                JOIN engine.companion_affinity a ON a.id = e.affinity_id \
               WHERE a.session_id = $1 \
@@ -825,8 +860,33 @@ impl<'a> AffinityRepo<'a> {
         .await?;
         Ok(rows
             .into_iter()
-            .map(|(warmth, patience)| JudgedEndpoints { warmth, patience })
+            .map(|(warmth, patience, patience_grade)| JudgedEndpoints {
+                warmth,
+                patience,
+                patience_grade,
+            })
             .collect())
+    }
+
+    /// When the session's status last changed: the newest `relationship`
+    /// event whose `from` and `to` differ. A cold war starting or ending
+    /// leaves the status where it was and is not one. `None` when the status
+    /// has never moved.
+    pub async fn latest_status_change(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT max(e.created_at) \
+               FROM engine.companion_affinity_events e \
+               JOIN engine.companion_affinity a ON a.id = e.affinity_id \
+              WHERE a.session_id = $1 \
+                AND e.event_type = 'relationship' \
+                AND e.context->>'from' <> e.context->>'to'",
+        )
+        .bind(session_id)
+        .fetch_one(self.pool)
+        .await
     }
 
     /// Most-recent `affinity_reason` strings (newest-first) from `message` /
@@ -980,7 +1040,7 @@ impl<'a> AffinityRepo<'a> {
         // §6.3); `None` on every other turn.
         tier_drop: Option<eros_engine_core::affinity::AffinityLine>,
         // Multiplier on every POSITIVE committed delta of the four line axes
-        // (the post-separation slowdown, spec 2026-10-19 §3.5); 1.0 = none.
+        // (the cold war's halving, spec 2026-11-23-affinity-50 §6.3); 1.0 = none.
         // Negatives and the two derived endpoints are never scaled.
         growth_scale: f64,
         // The user's timezone, for dating the tier moments the relationship
@@ -1240,6 +1300,122 @@ impl<'a> AffinityRepo<'a> {
         Ok(current)
     }
 
+    /// The session's status and cold war, row-locked until the caller's
+    /// transaction ends, so what it decides from is what it writes over.
+    /// `None` when the session has no affinity row.
+    pub async fn relationship_for_update_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        session_id: Uuid,
+    ) -> Result<Option<Relationship>, sqlx::Error> {
+        let row: Option<(String, Option<DateTime<Utc>>)> = sqlx::query_as(
+            "SELECT relationship_status, cold_war_since \
+               FROM engine.companion_affinity WHERE session_id = $1 FOR UPDATE",
+        )
+        .bind(session_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        Ok(row.map(|(status, cold_war_since)| relationship_of(&status, cold_war_since)))
+    }
+
+    /// Move the session's relationship from `from` to `to` and write the
+    /// `relationship` event that records it, inside the caller's transaction
+    /// (which holds the row lock, [`Self::relationship_for_update_in_tx`]);
+    /// nothing here commits. `false`, with nothing written, when the two are
+    /// equal or the session has no row.
+    ///
+    /// The event's `context` is `from` and `to` (status keys), plus
+    /// `cold_war` as `entered` or `ended` when the flag switched, plus
+    /// `choice_id` for [`RelationshipCause::Choice`]; a
+    /// [`RelationshipCause::UserMessage`] fills `user_message_id` instead.
+    /// `deltas` keeps its default and no state snapshot is taken: it is no
+    /// turn, so `latest_turn_event` and `last_judged_endpoints` skip it. The
+    /// row's `updated_at` is left alone, as that is the time-decay clock.
+    pub async fn write_relationship_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        session_id: Uuid,
+        from: Relationship,
+        to: Relationship,
+        cause: RelationshipCause,
+    ) -> Result<bool, sqlx::Error> {
+        if from == to {
+            return Ok(false);
+        }
+        let Some(affinity_id) = sqlx::query_scalar::<_, Uuid>(
+            "UPDATE engine.companion_affinity \
+                SET relationship_status = $2, cold_war_since = $3 \
+              WHERE session_id = $1 \
+              RETURNING id",
+        )
+        .bind(session_id)
+        .bind(to.status.as_str())
+        .bind(to.cold_war_since)
+        .fetch_optional(&mut **tx)
+        .await?
+        else {
+            return Ok(false);
+        };
+        let mut context = serde_json::json!({
+            "from": from.status.as_str(),
+            "to": to.status.as_str(),
+        });
+        if from.cold_war() != to.cold_war() {
+            context["cold_war"] = if to.cold_war() { "entered" } else { "ended" }.into();
+        }
+        let user_message_id = match cause {
+            RelationshipCause::Choice(choice_id) => {
+                context["choice_id"] = serde_json::json!(choice_id);
+                None
+            }
+            RelationshipCause::UserMessage(message_id) => Some(message_id),
+            RelationshipCause::Streak => None,
+        };
+        sqlx::query(
+            "INSERT INTO engine.companion_affinity_events \
+               (affinity_id, event_type, context, user_message_id) \
+             VALUES ($1, 'relationship', $2, $3)",
+        )
+        .bind(affinity_id)
+        .bind(context)
+        .bind(user_message_id)
+        .execute(&mut **tx)
+        .await?;
+        Ok(true)
+    }
+
+    /// Start (`on`) or end the session's cold war in its own transaction: the
+    /// row is locked and written only when the flag differs, so a repeat is a
+    /// no-op and the cold war keeps the instant it began. Starts at `now`;
+    /// the status stays. `true` when it wrote; `false` when the flag already
+    /// matched or the session has no row.
+    pub async fn set_cold_war(
+        &self,
+        session_id: Uuid,
+        on: bool,
+        now: DateTime<Utc>,
+    ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let Some(from) = Self::relationship_for_update_in_tx(&mut tx, session_id).await? else {
+            return Ok(false);
+        };
+        if from.cold_war() == on {
+            return Ok(false);
+        }
+        let to = Relationship {
+            status: from.status,
+            cold_war_since: on.then_some(now),
+        };
+        let wrote = Self::write_relationship_in_tx(
+            &mut tx,
+            session_id,
+            from,
+            to,
+            RelationshipCause::Streak,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(wrote)
+    }
+
     /// Fold a date's one verdict into the parent session's affinity (spec
     /// 2026-11-12-activity-sub-session-design.md §6.3–6.4), inside the
     /// caller's transaction; nothing here commits. `None` when the session has
@@ -1249,7 +1425,7 @@ impl<'a> AffinityRepo<'a> {
     /// [`Self::persist_with_event`]: time decay first, so the verdict starts
     /// from the stored state and a tier a refused action dropped during the
     /// date stays dropped; then the grades at `weight` turns with no rule
-    /// nudges, the post-separation slowdown and the clamp. Each line is then
+    /// nudges, the cold-war scale and the clamp. Each line is then
     /// held to a one-tier shift from where it stood, and a capped line keeps
     /// nothing buffered. The endpoint levels overwrite as on a turn.
     ///
@@ -4044,7 +4220,11 @@ mod tests {
             .unwrap();
         let t0 = Utc.with_ymd_and_hms(2026, 3, 1, 12, 0, 0).unwrap();
         let at = |mins: i64| t0 + chrono::Duration::minutes(mins);
-        let ends = |warmth: f64, patience: f64| JudgedEndpoints { warmth, patience };
+        let ends = |warmth: f64, patience: f64| JudgedEndpoints {
+            warmth,
+            patience,
+            patience_grade: 2,
+        };
 
         // Judged turns: (warmth, patience) 0.60/0.10 (t+1), 0.70/0.20 (t+3),
         // 0.80/0.30 (t+6), 0.90/0.40 (t+8).
@@ -4204,6 +4384,375 @@ mod tests {
                 .await
                 .unwrap(),
             Vec::<JudgedEndpoints>::new()
+        );
+    }
+
+    /// A fresh session and its affinity row.
+    async fn fresh_affinity(pool: &PgPool) -> (Uuid, Affinity) {
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(pool, user_id).await;
+        let session = make_session(pool, user_id, instance_id).await;
+        let a = AffinityRepo { pool }
+            .load_or_create(session, user_id, instance_id)
+            .await
+            .unwrap();
+        (session, a)
+    }
+
+    /// The session's `relationship` events, oldest first: their `context`,
+    /// `user_message_id` and `created_at`.
+    async fn relationship_events(
+        pool: &PgPool,
+        session: Uuid,
+    ) -> Vec<(serde_json::Value, Option<Uuid>, DateTime<Utc>)> {
+        sqlx::query_as(
+            "SELECT e.context, e.user_message_id, e.created_at \
+               FROM engine.companion_affinity_events e \
+               JOIN engine.companion_affinity a ON a.id = e.affinity_id \
+              WHERE a.session_id = $1 AND e.event_type = 'relationship' \
+              ORDER BY e.created_at, e.id",
+        )
+        .bind(session)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Move the session's status in one transaction, as a status caller does.
+    async fn move_status(
+        pool: &PgPool,
+        session: Uuid,
+        status: RelationshipStatus,
+        cause: RelationshipCause,
+    ) -> bool {
+        let mut tx = pool.begin().await.unwrap();
+        let from = AffinityRepo::relationship_for_update_in_tx(&mut tx, session)
+            .await
+            .unwrap()
+            .expect("row");
+        let to = Relationship {
+            status,
+            cold_war_since: from.cold_war_since,
+        };
+        let wrote = AffinityRepo::write_relationship_in_tx(&mut tx, session, from, to, cause)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        wrote
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_new_row_reads_none_without_a_cold_war(pool: PgPool) {
+        let (session, a) = fresh_affinity(&pool).await;
+        assert_eq!(a.relationship, Relationship::default());
+        assert!(!a.relationship.cold_war());
+        let loaded = AffinityRepo { pool: &pool }.load(session).await.unwrap();
+        assert_eq!(loaded.unwrap().relationship, Relationship::default());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn write_relationship_writes_the_row_and_one_event(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let (session, a) = fresh_affinity(&pool).await;
+        let choice_id = Uuid::new_v4();
+
+        let mut tx = pool.begin().await.unwrap();
+        let from = AffinityRepo::relationship_for_update_in_tx(&mut tx, session)
+            .await
+            .unwrap()
+            .expect("the session has a row");
+        assert_eq!(from, Relationship::default());
+        let dating = Relationship {
+            status: RelationshipStatus::Dating,
+            cold_war_since: None,
+        };
+        let wrote = AffinityRepo::write_relationship_in_tx(
+            &mut tx,
+            session,
+            from,
+            dating,
+            RelationshipCause::Choice(choice_id),
+        )
+        .await
+        .unwrap();
+        assert!(wrote);
+        // The same relationship again: nothing to write.
+        let again = AffinityRepo::write_relationship_in_tx(
+            &mut tx,
+            session,
+            dating,
+            dating,
+            RelationshipCause::Choice(choice_id),
+        )
+        .await
+        .unwrap();
+        assert!(!again);
+        tx.commit().await.unwrap();
+
+        let after = repo.load(session).await.unwrap().unwrap();
+        assert_eq!(after.relationship, dating);
+        assert_eq!(
+            after.updated_at, a.updated_at,
+            "a status change is not a turn: the decay clock stays put"
+        );
+        let events = relationship_events(&pool, session).await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(
+            events[0].0,
+            serde_json::json!({ "from": "none", "to": "dating", "choice_id": choice_id })
+        );
+        assert_eq!(events[0].1, None);
+        let deltas: serde_json::Value = sqlx::query_scalar(
+            "SELECT deltas FROM engine.companion_affinity_events \
+              WHERE affinity_id = $1 AND event_type = 'relationship'",
+        )
+        .bind(a.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(deltas, serde_json::json!({}));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_user_message_cause_fills_user_message_id(pool: PgPool) {
+        let (session, _) = fresh_affinity(&pool).await;
+        let message = insert_cutoff_msg(&pool, session).await;
+
+        assert!(
+            move_status(
+                &pool,
+                session,
+                RelationshipStatus::Engaged,
+                RelationshipCause::UserMessage(message),
+            )
+            .await
+        );
+
+        let events = relationship_events(&pool, session).await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].1, Some(message));
+        assert_eq!(
+            events[0].0,
+            serde_json::json!({ "from": "none", "to": "engaged" }),
+            "no choice_id for a user message"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn set_cold_war_is_idempotent(pool: PgPool) {
+        use chrono::TimeZone;
+        let repo = AffinityRepo { pool: &pool };
+        let (session, _) = fresh_affinity(&pool).await;
+        let t = Utc.with_ymd_and_hms(2026, 3, 1, 12, 0, 0).unwrap();
+        let (t2, t3) = (
+            t + chrono::Duration::hours(1),
+            t + chrono::Duration::hours(2),
+        );
+
+        assert!(repo.set_cold_war(session, true, t).await.unwrap());
+        let on = repo.load(session).await.unwrap().unwrap().relationship;
+        assert_eq!(on.cold_war_since, Some(t));
+        assert_eq!(on.status, RelationshipStatus::None);
+        let events = relationship_events(&pool, session).await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(
+            events[0].0,
+            serde_json::json!({ "from": "none", "to": "none", "cold_war": "entered" })
+        );
+        assert_eq!(events[0].1, None);
+
+        // Already on: nothing written, and the start stays the first one.
+        assert!(!repo.set_cold_war(session, true, t2).await.unwrap());
+        let still = repo.load(session).await.unwrap().unwrap().relationship;
+        assert_eq!(still.cold_war_since, Some(t));
+        assert_eq!(relationship_events(&pool, session).await.len(), 1);
+
+        assert!(repo.set_cold_war(session, false, t3).await.unwrap());
+        let off = repo.load(session).await.unwrap().unwrap().relationship;
+        assert_eq!(off, Relationship::default());
+        let events = relationship_events(&pool, session).await;
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(
+            events[1].0,
+            serde_json::json!({ "from": "none", "to": "none", "cold_war": "ended" })
+        );
+
+        // Already off.
+        assert!(!repo.set_cold_war(session, false, t3).await.unwrap());
+        assert_eq!(relationship_events(&pool, session).await.len(), 2);
+        // No row, nothing to write.
+        assert!(!repo.set_cold_war(Uuid::new_v4(), true, t).await.unwrap());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_status_change_keeps_the_cold_war_running(pool: PgPool) {
+        use chrono::TimeZone;
+        let repo = AffinityRepo { pool: &pool };
+        let (session, _) = fresh_affinity(&pool).await;
+        let t = Utc.with_ymd_and_hms(2026, 3, 1, 12, 0, 0).unwrap();
+        repo.set_cold_war(session, true, t).await.unwrap();
+
+        assert!(
+            move_status(
+                &pool,
+                session,
+                RelationshipStatus::Dating,
+                RelationshipCause::Streak,
+            )
+            .await
+        );
+
+        let r = repo.load(session).await.unwrap().unwrap().relationship;
+        assert_eq!(r.status, RelationshipStatus::Dating);
+        assert_eq!(r.cold_war_since, Some(t));
+        let events = relationship_events(&pool, session).await;
+        assert_eq!(
+            events[1].0,
+            serde_json::json!({ "from": "none", "to": "dating" }),
+            "the flag did not change, so the event does not name it"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn latest_status_change_skips_cold_war_only_events(pool: PgPool) {
+        use chrono::TimeZone;
+        let repo = AffinityRepo { pool: &pool };
+        let (session, _) = fresh_affinity(&pool).await;
+        let t = Utc.with_ymd_and_hms(2026, 3, 1, 12, 0, 0).unwrap();
+        assert_eq!(repo.latest_status_change(session).await.unwrap(), None);
+
+        repo.set_cold_war(session, true, t).await.unwrap();
+        assert_eq!(
+            repo.latest_status_change(session).await.unwrap(),
+            None,
+            "a cold war alone is not a status change"
+        );
+
+        move_status(
+            &pool,
+            session,
+            RelationshipStatus::Dating,
+            RelationshipCause::Choice(Uuid::new_v4()),
+        )
+        .await;
+        let events = relationship_events(&pool, session).await;
+        assert_eq!(
+            repo.latest_status_change(session).await.unwrap(),
+            Some(events[1].2)
+        );
+
+        // The cold war ending afterwards does not move it.
+        repo.set_cold_war(session, false, t).await.unwrap();
+        assert_eq!(
+            repo.latest_status_change(session).await.unwrap(),
+            Some(events[1].2)
+        );
+        // Another session has its own.
+        let (other, _) = fresh_affinity(&pool).await;
+        assert_eq!(repo.latest_status_change(other).await.unwrap(), None);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn judged_endpoints_carry_the_patience_level(pool: PgPool) {
+        use chrono::TimeZone;
+        let repo = AffinityRepo { pool: &pool };
+        let (session, a) = fresh_affinity(&pool).await;
+        let t0 = Utc.with_ymd_and_hms(2026, 3, 1, 12, 0, 0).unwrap();
+        let at = |mins: i64| t0 + chrono::Duration::minutes(mins);
+
+        // t+1 carries no level (a row older than the field); t+2 carries 1.
+        seed_patience_event(
+            &pool,
+            a.id,
+            "message",
+            Some(0.6),
+            Some(0.2),
+            Some("g1"),
+            None,
+            at(1),
+        )
+        .await;
+        seed_patience_event(
+            &pool,
+            a.id,
+            "message",
+            Some(0.7),
+            Some(0.1),
+            Some("g2"),
+            None,
+            at(2),
+        )
+        .await;
+        sqlx::query(
+            "UPDATE engine.companion_affinity_events \
+                SET state_after = state_after || jsonb_build_object('patience_grade', 1) \
+              WHERE affinity_id = $1 AND created_at = $2",
+        )
+        .bind(a.id)
+        .bind(at(2))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let got = repo.last_judged_endpoints(session, None, 10).await.unwrap();
+        assert_eq!(
+            got,
+            vec![
+                JudgedEndpoints {
+                    warmth: 0.7,
+                    patience: 0.1,
+                    patience_grade: 1
+                },
+                JudgedEndpoints {
+                    warmth: 0.6,
+                    patience: 0.2,
+                    patience_grade: 2
+                },
+            ],
+            "the judge's own level, and 2 where the row has none"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_relationship_event_is_not_a_judged_turn(pool: PgPool) {
+        use chrono::TimeZone;
+        let repo = AffinityRepo { pool: &pool };
+        let (session, a) = fresh_affinity(&pool).await;
+        let t0 = Utc.with_ymd_and_hms(2026, 3, 1, 12, 0, 0).unwrap();
+
+        seed_patience_event(
+            &pool,
+            a.id,
+            "message",
+            Some(0.6),
+            Some(0.2),
+            Some("g1"),
+            None,
+            t0,
+        )
+        .await;
+        // Even dressed as a judged turn, a relationship event is not one.
+        seed_patience_event(
+            &pool,
+            a.id,
+            "relationship",
+            Some(0.9),
+            Some(0.9),
+            Some("g-rel"),
+            None,
+            t0 + chrono::Duration::minutes(1),
+        )
+        .await;
+        repo.set_cold_war(session, true, t0).await.unwrap();
+
+        let got = repo.last_judged_endpoints(session, None, 10).await.unwrap();
+        assert_eq!(
+            got,
+            vec![JudgedEndpoints {
+                warmth: 0.6,
+                patience: 0.2,
+                patience_grade: 2
+            }]
         );
     }
 

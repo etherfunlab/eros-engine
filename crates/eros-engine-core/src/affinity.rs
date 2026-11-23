@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::relationship::Relationship;
 use crate::types::DateDuration;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -30,6 +31,10 @@ pub struct Affinity {
     /// `None` = never summarized ⇒ the prompt block is omitted.
     pub feeling_clause: Option<String>,
     pub feeling_clause_at: Option<DateTime<Utc>>,
+    /// The pair's settled status and cold-war flag (affinity 5.0). Independent
+    /// of the four axes: they move it only through asks, never by threshold.
+    #[serde(default)]
+    pub relationship: Relationship,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -115,6 +120,7 @@ impl Affinity {
             total_ghosts: 0,
             feeling_clause: None,
             feeling_clause_at: None,
+            relationship: Relationship::default(),
             created_at: now,
             updated_at: now,
         }
@@ -1011,7 +1017,21 @@ mod tests {
             feeling_clause_at: None,
             created_at: now,
             updated_at: now,
+            relationship: Default::default(),
         }
+    }
+
+    #[test]
+    fn an_unrecorded_affinity_has_the_default_relationship() {
+        assert_eq!(Affinity::unrecorded().relationship, Relationship::default());
+    }
+
+    #[test]
+    fn an_affinity_json_without_a_relationship_deserializes_to_the_default() {
+        let mut json = serde_json::to_value(fresh()).unwrap();
+        json.as_object_mut().unwrap().remove("relationship");
+        let a: Affinity = serde_json::from_value(json).unwrap();
+        assert_eq!(a.relationship, Relationship::default());
     }
 
     #[test]
@@ -1825,6 +1845,7 @@ mod tests {
             feeling_clause_at: None,
             created_at: now,
             updated_at: now,
+            relationship: Default::default(),
         }
     }
 

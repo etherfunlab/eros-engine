@@ -2796,7 +2796,7 @@
           "companion"
         ],
         "summary": "Ask for something to happen in the persona's day.",
-        "description": "The engine draws one kind of event, or none (a short or mid-length\nincident is under way, every allowed kind is cooling down, she has asked\nthe user for space and waits for the answer, in any session of the persona,\nuntil it is answered or lapses, or a date of the persona has not been\nsettled yet). During a background event (a trip or a\nbody state) only incidents are drawn. The\npersona then tells the user in one proactive message, persisted like any\nreply and returned with the event. The offline kinds (`away_from_phone`,\n`busy`, `in_battle`, `asleep`, `bros_gathering`, `sis_gathering`,\n`having_sex`, and `out_shopping` for a female persona) make her\nunreachable while they last.\n`busy`, `in_battle` and a female persona's `out_shopping` are announced in\na message at intimacy rung 2 and up; below that, and always for\n`away_from_phone`, `asleep`, `having_sex` and the gatherings, the event comes back with\n`message: null`. For any other persona `out_shopping` is not offline and\nis announced at every rung. The same `event_key` returns the same event.\n\nWith `image` in the request and `[tasks.chat_image_prompt_compose]`\nconfigured, a `taking_selfie` message also carries her picture: her words\nare written first, the composer draws from them, and the response's\n`image_request` is the `image-request` route's payload (absent without a\npicture). `outfit` dresses her as on a chat turn, in her words and in the\npicture.",
+        "description": "The engine draws one kind of event, or none (a short or mid-length\nincident is under way, every allowed kind is cooling down, she has put a\nchoice to the user and waits for the answer, in any session of the persona,\nuntil it is answered or lapses, or a date of the persona has not been\nsettled yet). During a background event (a trip or a\nbody state) only incidents are drawn. The\npersona then tells the user in one proactive message, persisted like any\nreply and returned with the event. The offline kinds (`away_from_phone`,\n`busy`, `in_battle`, `asleep`, `bros_gathering`, `sis_gathering`,\n`having_sex`, and `out_shopping` for a female persona) make her\nunreachable while they last.\n`busy`, `in_battle` and a female persona's `out_shopping` are announced in\na message at intimacy rung 2 and up; below that, and always for\n`away_from_phone`, `asleep`, `having_sex` and the gatherings, the event comes back with\n`message: null`. For any other persona `out_shopping` is not offline and\nis announced at every rung. The same `event_key` returns the same event.\n\nWith `image` in the request and `[tasks.chat_image_prompt_compose]`\nconfigured, a `taking_selfie` message also carries her picture: her words\nare written first, the composer draws from them, and the response's\n`image_request` is the `image-request` route's payload (absent without a\npicture). `outfit` dresses her as on a chat turn, in her words and in the\npicture.",
         "operationId": "draw_event",
         "parameters": [
           {
@@ -2902,7 +2902,7 @@
           "companion"
         ],
         "summary": "Answer what she asked.",
-        "description": "One transaction answers the choice and pays for it; what an answer does\ndepends on the choice's `kind`.\n\n`ask_for_space`: an accept makes the choice `accepted`, starts a\n`taking_space` separation now that lasts 6 hours per tier of the gap she\nasked at (12, 18 or 24 hours; she is offline for it, and an incident under\nway ends), and drops bond and chemistry one tier each. A decline makes it\n`declined` and drops the same two lines, with no separation.\n\n`sleep_together`: an accept makes the choice `accepted` and starts a\n`having_sex_together` incident of one hour now, costing nothing; an\nincident under way ends. A decline makes it `declined` and drops chemistry\none tier.\n\n`propose`: an accept makes the choice `accepted` and costs nothing; an\nincident under way ends. A decline makes it `declined` and drops bond and chemistry one tier each.\n\n`travel_together`: an accept makes the choice `accepted` and starts a\n`traveling_together` background of two to three days now; she keeps\nreplying, and an incident under way ends. A decline makes it `declined`.\nNeither costs anything.\n\n`bathe_together`: an accept makes the choice `accepted` and starts a\n`showering_together` or `bathing_together` incident of 30 minutes now, one\nor the other at even odds, costing nothing; an incident under way ends. A\ndecline makes it `declined` and drops chemistry one tier.\n\nEither way she then answers in one proactive message, persisted like any\nreply and returned; if that generation fails the call still succeeds with\n`message: null`. `event` is `null` for every answer but an `ask_for_space`,\n`travel_together`, `bathe_together` or `sleep_together` accept.\n\n`409` when the choice is no longer pending: answered already (an ordinary\nmessage from the user counts, and the first writer wins), or lapsed 24\nhours after she asked. `404` when the choice is not in this session.",
+        "description": "One transaction answers the choice and pays for it; what an answer does\ndepends on the choice's `kind`. An accept makes the choice `accepted`, a\ndecline `declined`.\n\n`confess`: an accept moves the relationship status by where it stands:\n`none` or `ex` to `dating`, `partner` to `fwb`, `peer` to `situationship`;\nan incident under way ends, and it costs nothing. A decline keeps the\nstatus and drops chemistry one tier.\n\n`partner_up`: an accept makes the status `partner` and a decline `peer`;\nan accept ends an incident under way. Neither costs anything.\n\n`propose`: an accept makes the status `engaged` and costs nothing; an\nincident under way ends. A decline keeps the status and drops bond and\nchemistry one tier each.\n\n`break_up`: an accept makes the status `ex` and ends the cold war. A\ndecline keeps the status and the cold war, starting one now if none was\non. Neither costs anything.\n\n`sleep_together`: an accept starts a `having_sex_together` incident of one\nhour now, costing nothing; an incident under way ends. A decline drops\nchemistry one tier.\n\n`fall_asleep_together`: an accept starts an `asleep_together` incident of\none to four hours now, costing nothing; she keeps replying, and an incident\nunder way ends. A decline drops chemistry one tier.\n\n`travel_together`: an accept starts a `traveling_together` background of\ntwo to three days now; she keeps replying, and an incident under way ends.\nNeither answer costs anything.\n\n`bathe_together`: an accept starts a `showering_together` or\n`bathing_together` incident of 30 minutes now, one or the other at even\nodds, costing nothing; an incident under way ends. A decline drops\nchemistry one tier.\n\nEither way she then answers in one proactive message, persisted like any\nreply and returned; if that generation fails the call still succeeds with\n`message: null`. `event` is `null` for every answer but a\n`travel_together`, `bathe_together`, `sleep_together` or\n`fall_asleep_together` accept.\n\n`409` when the choice is no longer pending: answered already (an ordinary\nmessage from the user counts, and the first writer wins), or lapsed 24\nhours after she asked; when the status has moved to one the kind is not\nasked from (`confess`, `partner_up`, `propose`, `break_up`), with nothing\nwritten; and for the retired `ask_for_space`. `404` when the choice is not\nin this session.",
         "operationId": "respond_to_life_choice",
         "parameters": [
           {
@@ -4080,7 +4080,9 @@
           "bond_tier",
           "chem_tier",
           "bond_label",
-          "chemistry_label"
+          "chemistry_label",
+          "relationship_status",
+          "cold_war"
         ],
         "properties": {
           "bond": {
@@ -4113,6 +4115,17 @@
             "type": "string",
             "description": "Romance tier key (`spark`/`flirtation`/`crush`/`lover`/`beloved`)."
           },
+          "cold_war": {
+            "type": "boolean",
+            "description": "Whether a cold war is on."
+          },
+          "composed_relation": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Key of what the two real tiers add up to (`good_friend`,\n`more_than_friends`, ...), or `null` at `(1, 1)`. The pair's\ncompatibility is not applied here."
+          },
           "ghost_streak": {
             "type": "integer",
             "format": "int32"
@@ -4128,6 +4141,10 @@
           "patience": {
             "type": "number",
             "format": "double"
+          },
+          "relationship_status": {
+            "type": "string",
+            "description": "The session's relationship status: `none`, `dating`, `partner`,\n`peer`, `fwb`, `situationship`, `engaged` or `ex`."
           },
           "tension": {
             "type": "number",
@@ -4434,7 +4451,7 @@
               },
               {
                 "$ref": "#/components/schemas/GreetingOccasion",
-                "description": "Why the persona spoke on her own — set on the assistant rows she wrote\nunprompted (the row's `metadata.proactive`): a greeting, a life event,\nor `life_choice` for her ask of a life choice (any kind) and what she\nsays about the answer. A client that has adapted to the choice\nre-fetches the affinity delta on reading `life_choice`. Omitted on\nevery other row; same key-presence contract as `read_at`."
+                "description": "Why the persona spoke on her own — set on the assistant rows she wrote\nunprompted (the row's `metadata.proactive`): a greeting, a life event,\n`life_choice` for her ask of a life choice (any kind) and what she\nsays about the answer, or `cold_war` when she says a cold war just\nstarted. A client that has adapted to the choice re-fetches the\naffinity delta on reading `life_choice`. Omitted on every other row;\nsame key-presence contract as `read_at`."
               }
             ]
           },
@@ -5080,7 +5097,7 @@
               },
               {
                 "$ref": "#/components/schemas/GreetingOccasion",
-                "description": "Why the persona spoke on her own — set on the assistant rows she wrote\nunprompted (the row's `metadata.proactive`): a greeting, a life event,\nor `life_choice` for her ask of a life choice (any kind) and what she\nsays about the answer. A client that has adapted to the choice\nre-fetches the affinity delta on reading `life_choice`. Omitted on\nevery other row; same key-presence contract as `read_at`. The BFF\nhistory entry carries the same field."
+                "description": "Why the persona spoke on her own — set on the assistant rows she wrote\nunprompted (the row's `metadata.proactive`): a greeting, a life event,\n`life_choice` for her ask of a life choice (any kind) and what she\nsays about the answer, or `cold_war` when she says a cold war just\nstarted. A client that has adapted to the choice re-fetches the\naffinity delta on reading `life_choice`. Omitted on every other row;\nsame key-presence contract as `read_at`. The BFF history entry carries\nthe same field."
               }
             ]
           },
@@ -6126,7 +6143,8 @@
           "just_opened",
           "check_in",
           "event",
-          "life_choice"
+          "life_choice",
+          "cold_war"
         ]
       },
       "GroupDto": {
@@ -6905,7 +6923,7 @@
           },
           "kind": {
             "type": "string",
-            "description": "`ask_for_space`, `sleep_together`, `propose`, `travel_together` or\n`bathe_together`."
+            "description": "`confess`, `partner_up`, `propose`, `break_up`, `sleep_together`,\n`fall_asleep_together`, `travel_together` or `bathe_together`; on\nolder rows, the retired `ask_for_space`."
           },
           "message_id": {
             "type": [
@@ -6939,7 +6957,7 @@
           },
           "kind": {
             "type": "string",
-            "description": "`ask_for_space`, `sleep_together`, `propose`, `travel_together` or\n`bathe_together`."
+            "description": "`confess`, `partner_up`, `propose`, `break_up`, `sleep_together`,\n`fall_asleep_together`, `travel_together` or `bathe_together`; on\nolder rows, the retired `ask_for_space`."
           },
           "resolved_at": {
             "type": [
@@ -7039,7 +7057,7 @@
         "properties": {
           "affinity": {
             "$ref": "#/components/schemas/AffinitySnapshot",
-            "description": "The relationship after the answer: dropped for an `ask_for_space`\naccept and for a decline of any kind but `travel_together`, as it\nstands otherwise."
+            "description": "The relationship after the answer: a decline of `confess`,\n`sleep_together`, `fall_asleep_together` or `bathe_together` drops\nchemistry one tier and a declined `propose` both lines;\n`relationship_status` and `cold_war` carry what a `confess`,\n`partner_up`, `propose` or `break_up` answer moved."
           },
           "event": {
             "oneOf": [
@@ -7048,7 +7066,7 @@
               },
               {
                 "$ref": "#/components/schemas/EventView",
-                "description": "The separation an `ask_for_space` accept started, the trip a\n`travel_together` accept started, the shower or bath a `bathe_together`\naccept started, or the `having_sex_together` a `sleep_together` accept\nstarted. `null` after any decline and for every `propose` answer."
+                "description": "The trip a `travel_together` accept started, the shower or bath a\n`bathe_together` accept started, the `having_sex_together` a\n`sleep_together` accept started, or the `asleep_together` a\n`fall_asleep_together` accept started. `null` after any decline and\nfor every `confess`, `partner_up`, `propose` or `break_up` answer."
               }
             ]
           },
@@ -7059,7 +7077,7 @@
               },
               {
                 "$ref": "#/components/schemas/GreetingDto",
-                "description": "What she says back: for `ask_for_space`, the goodbye after an accept\nand the hurt reply after a decline; for the other kinds, her answer to\nthe user's yes or no. `null` when the generation failed,\ncame back blank or a newer message landed first; the answer and its\ncosts stand either way."
+                "description": "What she says back: her answer to the user's yes or no. `null` when\nthe generation failed, came back blank or a newer message landed\nfirst; the answer and its costs stand either way."
               }
             ]
           },
@@ -8248,7 +8266,7 @@
       },
       "UserActionDto": {
         "type": "object",
-        "description": "An action the user does to the persona this turn, besides talking. The\npersona accepts or does not; a refusal costs the relationship one tier on\nthe line the action touches (`give` and `gift` → bond, every physical or custom action →\nchemistry); a refused `tip`, `bluff`, `threaten`, `trick`, `propose`, `challenge` or\n`bet` costs nothing.\nAn accepted `gift` joins the persona's items or wardrobe. A `date` asks her\nout; accepted, it runs in a session of its own for its `duration`, and\nnothing else is sent to the persona's text sessions meanwhile. An accepted\n`shower_together`, `bath_together` or `sauna_together` starts a\n`showering_together` (30 minutes), `bathing_together` (30 minutes) or\n`sauna_together` (one hour) event, ending the incident under way; on a\ndate it starts none. Twelve more together actions do the same:\n`toilet_together` → `using_toilet_together`, `smoke_together` →\n`smoking_together`, `smoke_weed_together` → `smoking_weed_together` and\n`streak_together` → `streaking_together` (30 minutes each);\n`sex_together` → `having_sex_together`, `walk_together` →\n`walking_together`, `jog_together` → `jogging_together`, `yoga_together`\n→ `yoga_together`, `stargaze_together` → `stargazing_together`,\n`ride_horse_together` → `horse_riding_together` and `drink_together` →\n`drinking_together` (one hour each); `fall_asleep_together` →\n`asleep_together` (one to four hours, and she still answers). An accepted\n`smoke_together`, `smoke_weed_together` or `drink_together` also counts as\na `give` of one cigarette, herb or alcohol. `hot_spring_together` starts\n`hot_spring_together` (one hour) and `fight_together` starts\n`fighting_together` (one to two hours); a `fight_together` to a persona\nwhose `setting` is not `fantasy` is refused and costs nothing. `propose`\nasks her to marry the user and starts no event. `challenge` and `bet`\nask whether she takes the user up on it; no winner is decided and a\nrefusal costs nothing.",
+        "description": "An action the user does to the persona this turn, besides talking. The\npersona accepts or does not; a refusal costs the relationship one tier on\nthe line the action touches (`give` and `gift` → bond, every physical or custom action →\nchemistry); a refused `tip`, `bluff`, `threaten`, `trick`, `propose`, `break_up`,\n`challenge` or `bet` costs nothing.\nAn accepted `gift` joins the persona's items or wardrobe. A `date` asks her\nout; accepted, it runs in a session of its own for its `duration`, and\nnothing else is sent to the persona's text sessions meanwhile. An accepted\n`shower_together`, `bath_together` or `sauna_together` starts a\n`showering_together` (30 minutes), `bathing_together` (30 minutes) or\n`sauna_together` (one hour) event, ending the incident under way; on a\ndate it starts none. Twelve more together actions do the same:\n`toilet_together` → `using_toilet_together`, `smoke_together` →\n`smoking_together`, `smoke_weed_together` → `smoking_weed_together` and\n`streak_together` → `streaking_together` (30 minutes each);\n`sex_together` → `having_sex_together`, `walk_together` →\n`walking_together`, `jog_together` → `jogging_together`, `yoga_together`\n→ `yoga_together`, `stargaze_together` → `stargazing_together`,\n`ride_horse_together` → `horse_riding_together` and `drink_together` →\n`drinking_together` (one hour each); `fall_asleep_together` →\n`asleep_together` (one to four hours, and she still answers). An accepted\n`smoke_together`, `smoke_weed_together` or `drink_together` also counts as\na `give` of one cigarette, herb or alcohol. `hot_spring_together` starts\n`hot_spring_together` (one hour) and `fight_together` starts\n`fighting_together` (one to two hours); a `fight_together` to a persona\nwhose `setting` is not `fantasy` is refused and costs nothing. `propose`\nasks her to marry the user and starts no event: it is refused unless the\npair is `dating`, `fwb` or `situationship`, and accepted, the pair is\n`engaged`. `break_up` ends the relationship and starts no event: it is\nrefused unless the pair's status is breakable (`dating`, `partner`, `fwb`,\n`situationship`, `engaged`); accepted, the pair is `ex`, and refused, a\ncold war starts. On a BYOC instance no status moves: `propose` is hers to\nanswer and `break_up` is always refused. On a date both act on the\ninviting session's relationship. `challenge` and `bet`\nask whether she takes the user up on it; no winner is decided and a\nrefusal costs nothing.",
         "required": [
           "type"
         ],
@@ -8379,6 +8397,7 @@
           "streak_together",
           "drink_together",
           "propose",
+          "break_up",
           "hot_spring_together",
           "fight_together",
           "challenge",

@@ -46,6 +46,16 @@ pub const STORY_INSIGHT_FIELDS: &[&str] = &[
     "user_relationship",
 ];
 
+/// The life choices the story director reads: the status asks (hers and the
+/// user's answer) and her retired ask for space, still in stored rows.
+const STORY_CHOICE_KINDS: [LifeChoiceKind; 5] = [
+    LifeChoiceKind::AskForSpace,
+    LifeChoiceKind::Confess,
+    LifeChoiceKind::PartnerUp,
+    LifeChoiceKind::Propose,
+    LifeChoiceKind::BreakUp,
+];
+
 /// Flat typed life base. Serde derives serve the director's structured output
 /// (unknown keys are ignored by serde; the server warns on them separately).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, sqlx::FromRow)]
@@ -105,6 +115,10 @@ pub struct StoryAffinity {
     pub tension: f64,
     pub bond: f64,
     pub chemistry: f64,
+    /// The pair's relationship status wire key (`none`, `dating`, ...).
+    pub relationship_status: String,
+    /// A cold war is on.
+    pub cold_war: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -123,13 +137,14 @@ pub struct StoryLifeEvent {
     pub told: Option<String>,
 }
 
-/// One ask-for-space choice as the story director reads it (spec §3.3).
+/// One status choice (or her retired ask for space) as the story director reads it (spec §3.3).
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoryLifeChoice {
     pub choice: LifeChoiceRecord,
     /// The ask's text; `None` when the message is gone.
     pub asked: Option<String>,
-    /// The linked `taking_space` row's length in whole hours (rounded); `None` without one.
+    /// The linked `taking_space` row's length in whole hours (rounded); `None` without one;
+    /// only an ask for space's wording uses it.
     pub separation_hours: Option<i64>,
 }
 
@@ -474,10 +489,12 @@ impl<'a> StoryRepo<'a> {
             .collect())
     }
 
-    /// The pair's ask-for-space choices for a story round (spec §3.3), newest
-    /// first, asked at or after `since`, from the pair's unarchived sessions:
-    /// a choice belongs to one relationship. Each carries the ask's text and,
-    /// for an accept, the length of the separation it wrote.
+    /// The pair's status choices for a story round (spec §3.3): her
+    /// ask-for-space, confession, partnership offer, proposal and break-up,
+    /// newest first, asked at or after `since`, from the pair's unarchived
+    /// sessions: a choice belongs to one relationship. Each carries the ask's
+    /// text and, for an accepted ask-for-space, the length of the separation
+    /// it wrote.
     pub async fn life_choices(
         &self,
         owner_uid: Uuid,
@@ -507,13 +524,13 @@ impl<'a> StoryRepo<'a> {
                LEFT JOIN engine.chat_messages m ON m.id = lc.message_id \
                LEFT JOIN engine.persona_events e ON e.id = lc.event_id \
               WHERE cs.user_id = $1 AND cs.instance_id = $2 \
-                AND lc.kind = $3 AND lc.asked_at >= $4 \
+                AND lc.kind = ANY($3) AND lc.asked_at >= $4 \
               ORDER BY lc.asked_at DESC, lc.id DESC \
               LIMIT $5",
         )
         .bind(owner_uid)
         .bind(instance_id)
-        .bind(LifeChoiceKind::AskForSpace.as_str())
+        .bind(STORY_CHOICE_KINDS.map(LifeChoiceKind::as_str).to_vec())
         .bind(since)
         .bind(cap)
         .fetch_all(self.pool)
@@ -561,7 +578,8 @@ impl<'a> StoryRepo<'a> {
     ) -> Result<Option<StoryAffinity>, sqlx::Error> {
         sqlx::query_as(
             "SELECT ca.warmth, ca.trust, ca.intrigue, ca.intimacy, ca.patience, ca.tension, \
-                    ca.bond, ca.chemistry \
+                    ca.bond, ca.chemistry, ca.relationship_status, \
+                    ca.cold_war_since IS NOT NULL AS cold_war \
              FROM engine.companion_affinity ca \
              JOIN engine.chat_sessions cs ON cs.id = ca.session_id AND NOT cs.archived \
              WHERE ca.user_id = $1 AND ca.instance_id = $2 \
@@ -1778,6 +1796,84 @@ mod tests {
         assert_eq!(got[1].choice.status, "declined");
         assert_eq!(got[1].asked, None);
         assert_eq!(got[1].separation_hours, None);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn life_choices_read_the_status_kinds_and_nothing_else(pool: PgPool) {
+        let repo = StoryRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        let inst = seed_instance(&pool, owner, "A", "active").await;
+        let s = seed_session(&pool, owner, inst).await;
+        let now = Utc::now();
+        let h = chrono::Duration::hours;
+        for (kind, ago) in [
+            ("ask_for_space", 5),
+            ("confess", 4),
+            ("partner_up", 3),
+            ("propose", 2),
+            ("break_up", 1),
+            ("sleep_together", 6),
+            ("fall_asleep_together", 7),
+        ] {
+            seed_choice(&pool, s, kind, "declined", now - h(ago), None, None).await;
+        }
+        let got = repo
+            .life_choices(owner, inst, now - chrono::Duration::days(7), 10)
+            .await
+            .unwrap();
+        let kinds: Vec<_> = got.iter().map(|c| c.choice.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "break_up",
+                "propose",
+                "partner_up",
+                "confess",
+                "ask_for_space"
+            ]
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn affinity_snapshot_reads_status_and_cold_war(pool: PgPool) {
+        let repo = StoryRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        let inst = seed_instance(&pool, owner, "A", "active").await;
+        let s = seed_session(&pool, owner, inst).await;
+        sqlx::query(
+            "INSERT INTO engine.companion_affinity (session_id, user_id, instance_id) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(s)
+        .bind(owner)
+        .bind(inst)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let snap = repo
+            .affinity_snapshot(owner, inst)
+            .await
+            .unwrap()
+            .expect("snapshot");
+        assert_eq!(snap.relationship_status, "none");
+        assert!(!snap.cold_war);
+
+        sqlx::query(
+            "UPDATE engine.companion_affinity \
+                SET relationship_status = 'dating', cold_war_since = now() \
+              WHERE session_id = $1",
+        )
+        .bind(s)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let snap = repo
+            .affinity_snapshot(owner, inst)
+            .await
+            .unwrap()
+            .expect("snapshot");
+        assert_eq!(snap.relationship_status, "dating");
+        assert!(snap.cold_war);
     }
 
     #[sqlx::test(migrations = "./migrations")]

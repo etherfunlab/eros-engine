@@ -3,28 +3,40 @@
 //! answers what the persona asked: accept or decline. What an answer does
 //! depends on the choice's kind.
 //!
-//! - `ask_for_space`: either answer drops the relationship one tier on both
-//!   lines; an accept also starts a separation.
+//! - `confess`: an accept moves the status (`none` and `ex` to `dating`,
+//!   `partner` to `fwb`, `peer` to `situationship`) and ends the incident
+//!   under way; a decline keeps the status and drops chemistry one tier.
+//! - `partner_up`: an accept makes them `partner` and ends the incident under
+//!   way; a decline makes them `peer`. Neither drops anything.
+//! - `propose`: an accept makes them `engaged` and ends the incident under
+//!   way; a decline keeps the status and drops both lines one tier.
+//! - `break_up`: an accept makes them `ex` and ends the cold war; a decline
+//!   keeps the status and the cold war, starting one if none was on. Neither
+//!   drops anything.
 //! - `sleep_together`: an accept starts an hour of sex together and costs
 //!   nothing; a decline drops chemistry one tier.
-//! - `propose`: an accept ends the incident under way and costs nothing; a
-//!   decline drops both lines one tier.
+//! - `fall_asleep_together`: an accept starts one to four hours asleep
+//!   together and costs nothing; a decline drops chemistry one tier.
 //! - `travel_together`: an accept starts a trip; a decline changes nothing.
 //! - `bathe_together`: an accept starts a 30-minute shower or bath together,
 //!   one or the other at even odds; a decline drops chemistry one tier.
+//! - `ask_for_space`: retired; a stored one is not answered (`409`).
 //!
-//! The persona answers in one proactive message, and the cost is applied with
-//! the answer, not with the message (spec
+//! A status kind answered once the status is no longer one it is asked from
+//! is closed (`409`) and writes nothing. The persona answers in one proactive
+//! message, and the cost is applied with the answer, not with the message
+//! (spec
 //! docs/superpowers/specs/2026-10-19-life-events-shopping-gatherings-and-ask-for-space-design.md
-//! §3.4a, §3.4b, §3.5; romantic kinds:
+//! §3.4; romantic kinds:
 //! docs/superpowers/specs/2026-10-30-give-needs-romantic-choices-and-answer-receipts-design.md
-//! §4.5).
+//! §4.5; status kinds: docs/superpowers/specs/2026-11-23-affinity-50-design.md
+//! §6.2, §7.2, §7.3).
 
 use axum::extract::{Extension, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse as _, Response};
 use axum::Json;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
@@ -32,8 +44,9 @@ use uuid::Uuid;
 use eros_engine_core::affinity::{Affinity, AffinityLine};
 use eros_engine_core::events::{self, EventKind};
 use eros_engine_core::persona::CompanionPersona;
+use eros_engine_core::relationship::settle;
 use eros_engine_core::scope::MemoryScope;
-use eros_engine_store::affinity::AffinityRepo;
+use eros_engine_store::affinity::{AffinityRepo, RelationshipCause};
 use eros_engine_store::chat::ChatRepo;
 use eros_engine_store::events::{EventRepo, NewEvent};
 use eros_engine_store::life_choices::{LifeChoiceKind, LifeChoiceRecord, LifeChoiceRepo};
@@ -59,10 +72,6 @@ use crate::state::AppState;
 
 /// Same per-user in-flight cap as every other LLM entry point.
 const CONCURRENT_STREAMS_PER_USER: u32 = 3;
-
-/// The separation lasts this many hours for each tier of the gap stored when
-/// she asked: a gap of 2, 3 or 4 is 12, 18 or 24 hours.
-const SEPARATION_HOURS_PER_TIER: i64 = 6;
 
 /// The user's answer to the ask.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, utoipa::ToSchema)]
@@ -105,20 +114,21 @@ pub struct LifeChoiceRespondRequest {
 pub struct LifeChoiceRespondResponse {
     /// The choice's new status: `accepted` or `declined`.
     pub status: String,
-    /// What she says back: for `ask_for_space`, the goodbye after an accept
-    /// and the hurt reply after a decline; for the other kinds, her answer to
-    /// the user's yes or no. `null` when the generation failed,
-    /// came back blank or a newer message landed first; the answer and its
-    /// costs stand either way.
+    /// What she says back: her answer to the user's yes or no. `null` when
+    /// the generation failed, came back blank or a newer message landed
+    /// first; the answer and its costs stand either way.
     pub message: Option<GreetingDto>,
-    /// The relationship after the answer: dropped for an `ask_for_space`
-    /// accept and for a decline of any kind but `travel_together`, as it
-    /// stands otherwise.
+    /// The relationship after the answer: a decline of `confess`,
+    /// `sleep_together`, `fall_asleep_together` or `bathe_together` drops
+    /// chemistry one tier and a declined `propose` both lines;
+    /// `relationship_status` and `cold_war` carry what a `confess`,
+    /// `partner_up`, `propose` or `break_up` answer moved.
     pub affinity: AffinitySnapshot,
-    /// The separation an `ask_for_space` accept started, the trip a
-    /// `travel_together` accept started, the shower or bath a `bathe_together`
-    /// accept started, or the `having_sex_together` a `sleep_together` accept
-    /// started. `null` after any decline and for every `propose` answer.
+    /// The trip a `travel_together` accept started, the shower or bath a
+    /// `bathe_together` accept started, the `having_sex_together` a
+    /// `sleep_together` accept started, or the `asleep_together` a
+    /// `fall_asleep_together` accept started. `null` after any decline and
+    /// for every `confess`, `partner_up`, `propose` or `break_up` answer.
     pub event: Option<EventView>,
 }
 
@@ -128,8 +138,9 @@ pub struct LifeChoiceRespondResponse {
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct LifeChoiceReceiptDto {
     pub id: Uuid,
-    /// `ask_for_space`, `sleep_together`, `propose`, `travel_together` or
-    /// `bathe_together`.
+    /// `confess`, `partner_up`, `propose`, `break_up`, `sleep_together`,
+    /// `fall_asleep_together`, `travel_together` or `bathe_together`; on
+    /// older rows, the retired `ask_for_space`.
     pub kind: String,
     /// `pending`, `accepted`, `declined`, `ignored`, or `expired` for a
     /// `pending` choice past its 24 hours.
@@ -198,40 +209,54 @@ fn invalid_payload(message: String) -> AppError {
 /// Answer what she asked.
 ///
 /// One transaction answers the choice and pays for it; what an answer does
-/// depends on the choice's `kind`.
+/// depends on the choice's `kind`. An accept makes the choice `accepted`, a
+/// decline `declined`.
 ///
-/// `ask_for_space`: an accept makes the choice `accepted`, starts a
-/// `taking_space` separation now that lasts 6 hours per tier of the gap she
-/// asked at (12, 18 or 24 hours; she is offline for it, and an incident under
-/// way ends), and drops bond and chemistry one tier each. A decline makes it
-/// `declined` and drops the same two lines, with no separation.
+/// `confess`: an accept moves the relationship status by where it stands:
+/// `none` or `ex` to `dating`, `partner` to `fwb`, `peer` to `situationship`;
+/// an incident under way ends, and it costs nothing. A decline keeps the
+/// status and drops chemistry one tier.
 ///
-/// `sleep_together`: an accept makes the choice `accepted` and starts a
-/// `having_sex_together` incident of one hour now, costing nothing; an
-/// incident under way ends. A decline makes it `declined` and drops chemistry
-/// one tier.
+/// `partner_up`: an accept makes the status `partner` and a decline `peer`;
+/// an accept ends an incident under way. Neither costs anything.
 ///
-/// `propose`: an accept makes the choice `accepted` and costs nothing; an
-/// incident under way ends. A decline makes it `declined` and drops bond and chemistry one tier each.
+/// `propose`: an accept makes the status `engaged` and costs nothing; an
+/// incident under way ends. A decline keeps the status and drops bond and
+/// chemistry one tier each.
 ///
-/// `travel_together`: an accept makes the choice `accepted` and starts a
-/// `traveling_together` background of two to three days now; she keeps
-/// replying, and an incident under way ends. A decline makes it `declined`.
-/// Neither costs anything.
+/// `break_up`: an accept makes the status `ex` and ends the cold war. A
+/// decline keeps the status and the cold war, starting one now if none was
+/// on. Neither costs anything.
 ///
-/// `bathe_together`: an accept makes the choice `accepted` and starts a
-/// `showering_together` or `bathing_together` incident of 30 minutes now, one
-/// or the other at even odds, costing nothing; an incident under way ends. A
-/// decline makes it `declined` and drops chemistry one tier.
+/// `sleep_together`: an accept starts a `having_sex_together` incident of one
+/// hour now, costing nothing; an incident under way ends. A decline drops
+/// chemistry one tier.
+///
+/// `fall_asleep_together`: an accept starts an `asleep_together` incident of
+/// one to four hours now, costing nothing; she keeps replying, and an incident
+/// under way ends. A decline drops chemistry one tier.
+///
+/// `travel_together`: an accept starts a `traveling_together` background of
+/// two to three days now; she keeps replying, and an incident under way ends.
+/// Neither answer costs anything.
+///
+/// `bathe_together`: an accept starts a `showering_together` or
+/// `bathing_together` incident of 30 minutes now, one or the other at even
+/// odds, costing nothing; an incident under way ends. A decline drops
+/// chemistry one tier.
 ///
 /// Either way she then answers in one proactive message, persisted like any
 /// reply and returned; if that generation fails the call still succeeds with
-/// `message: null`. `event` is `null` for every answer but an `ask_for_space`,
-/// `travel_together`, `bathe_together` or `sleep_together` accept.
+/// `message: null`. `event` is `null` for every answer but a
+/// `travel_together`, `bathe_together`, `sleep_together` or
+/// `fall_asleep_together` accept.
 ///
 /// `409` when the choice is no longer pending: answered already (an ordinary
 /// message from the user counts, and the first writer wins), or lapsed 24
-/// hours after she asked. `404` when the choice is not in this session.
+/// hours after she asked; when the status has moved to one the kind is not
+/// asked from (`confess`, `partner_up`, `propose`, `break_up`), with nothing
+/// written; and for the retired `ask_for_space`. `404` when the choice is not
+/// in this session.
 #[utoipa::path(
     post,
     path = "/v2/comp/session/{session_id}/life-choices/{choice_id}",
@@ -302,7 +327,8 @@ pub(crate) async fn respond_at(
     let _guard = r.guard;
     // Her reply is the last step and cannot undo the answer: whatever goes
     // wrong here (the provider, a blank reply, a newer message) leaves the
-    // resolution, the separation and the drop in place, and she says nothing.
+    // resolution, the event, the status and the drop in place, and she says
+    // nothing.
     let message = match r.greeting {
         Some(g) => match greet(state, g).await {
             Ok(m) => m.map(GreetingDto::from),
@@ -389,6 +415,11 @@ async fn resolve_choice(
     let kind = LifeChoiceKind::parse(&asked.kind)
         .ok_or_else(|| AppError::Internal("stored life choice kind unreadable".into()))?;
 
+    // A retired ask is not answered: a row still pending lapses on its own.
+    if kind == LifeChoiceKind::AskForSpace {
+        return Err(closed());
+    }
+
     // Taken before anything is written: a call over the cap is refused with
     // the choice still open, not answered and then left without her reply.
     let guard = state
@@ -398,7 +429,10 @@ async fn resolve_choice(
 
     // The answer and its costs are one transaction. The resolve goes first:
     // it is the race guard, and a loser (answered, converted by a message or
-    // lapsed) writes nothing. The separation comes before the drop.
+    // lapsed) writes nothing. Then the event, which takes the instance's lock,
+    // then the status and the drop, under the affinity row's lock, in the
+    // order every writer of the two takes them.
+    let accepted = req.response == LifeChoiceAnswer::Accept;
     let (status, resolution) = match req.response {
         LifeChoiceAnswer::Accept => ("accepted", "accept"),
         LifeChoiceAnswer::Decline => ("declined", "decline"),
@@ -407,17 +441,9 @@ async fn resolve_choice(
     let Some(choice) = LifeChoiceRepo::resolve_in_tx(&mut tx, choice_id, status, now).await? else {
         return Err(closed());
     };
-    // The event an accept starts: a separation, whose length is the gap she
-    // asked at, a trip, a shower or a bath, or sex. A running incident ends; a
-    // background keeps going.
+    // The event an accept starts: a trip, a shower or a bath, sex, or falling
+    // asleep together. A running incident ends; a background keeps going.
     let placed = match (kind, req.response) {
-        (LifeChoiceKind::AskForSpace, LifeChoiceAnswer::Accept) => Some((
-            EventKind::TakingSpace,
-            Duration::hours(
-                SEPARATION_HOURS_PER_TIER
-                    * i64::from(choice.tier_gap.expect("ask_for_space carries a gap (0083)")),
-            ),
-        )),
         (LifeChoiceKind::TravelTogether, LifeChoiceAnswer::Accept) => Some((
             EventKind::TravelingTogether,
             events::lasts(EventKind::TravelingTogether, rand::random()),
@@ -434,6 +460,10 @@ async fn resolve_choice(
         (LifeChoiceKind::SleepTogether, LifeChoiceAnswer::Accept) => Some((
             EventKind::HavingSexTogether,
             events::lasts(EventKind::HavingSexTogether, rand::random()),
+        )),
+        (LifeChoiceKind::FallAsleepTogether, LifeChoiceAnswer::Accept) => Some((
+            EventKind::AsleepTogether,
+            events::lasts(EventKind::AsleepTogether, rand::random()),
         )),
         _ => None,
     };
@@ -456,23 +486,55 @@ async fn resolve_choice(
         }
         None => None,
     };
-    // An accept that places nothing still ends what she was doing.
-    if let (LifeChoiceKind::Propose, LifeChoiceAnswer::Accept) = (kind, req.response) {
+    // An accept that places nothing still ends what she was doing; an
+    // accepted break-up leaves it.
+    if accepted
+        && matches!(
+            kind,
+            LifeChoiceKind::Confess | LifeChoiceKind::PartnerUp | LifeChoiceKind::Propose
+        )
+    {
         EventRepo::end_foreground_in_tx(&mut tx, instance_id, now).await?;
     }
-    // The lines a decline costs; a romantic accept costs none and drops nothing.
+    // The status the answer moves, settled from where it stands under the
+    // row's lock. A status the kind is no longer asked from (it moved while
+    // the ask waited) closes the answer: the dropped transaction writes
+    // nothing. Before the drop, so the drop's read already holds the move.
+    if let Some(ask) = kind.status_ask() {
+        let from = AffinityRepo::relationship_for_update_in_tx(&mut tx, session_id)
+            .await?
+            .ok_or_else(|| AppError::Internal("life choice without an affinity row".into()))?;
+        let Some(to) = settle(ask, from, accepted, now) else {
+            return Err(closed());
+        };
+        AffinityRepo::write_relationship_in_tx(
+            &mut tx,
+            session_id,
+            from,
+            to,
+            RelationshipCause::Choice(choice.id),
+        )
+        .await?;
+    }
+    // The lines a decline costs; an accept costs none.
     let lines: Option<&[AffinityLine]> = match (kind, req.response) {
+        (_, LifeChoiceAnswer::Accept) => None,
         (
-            LifeChoiceKind::SleepTogether | LifeChoiceKind::Propose | LifeChoiceKind::BatheTogether,
-            LifeChoiceAnswer::Accept,
-        ) => None,
-        (LifeChoiceKind::TravelTogether, _) => None,
-        (
-            LifeChoiceKind::SleepTogether | LifeChoiceKind::BatheTogether,
+            LifeChoiceKind::SleepTogether
+            | LifeChoiceKind::FallAsleepTogether
+            | LifeChoiceKind::Confess
+            | LifeChoiceKind::BatheTogether,
             LifeChoiceAnswer::Decline,
         ) => Some(&[AffinityLine::Chemistry]),
-        (LifeChoiceKind::AskForSpace | LifeChoiceKind::Propose, _) => {
+        (LifeChoiceKind::Propose, LifeChoiceAnswer::Decline) => {
             Some(&[AffinityLine::Bond, AffinityLine::Chemistry])
+        }
+        (
+            LifeChoiceKind::TravelTogether | LifeChoiceKind::PartnerUp | LifeChoiceKind::BreakUp,
+            LifeChoiceAnswer::Decline,
+        ) => None,
+        (LifeChoiceKind::AskForSpace, LifeChoiceAnswer::Decline) => {
+            unreachable!("a retired ask_for_space is refused before the answer")
         }
     };
     let dropped = match lines {
@@ -508,20 +570,13 @@ async fn resolve_choice(
     };
 
     let cue = match (kind, &started) {
-        (LifeChoiceKind::AskForSpace, Some((_, lasts))) => LifeChoiceCue::Goodbye {
-            hours: lasts.num_hours(),
-        },
-        (LifeChoiceKind::AskForSpace, None) => LifeChoiceCue::Hurt,
         (LifeChoiceKind::TravelTogether, Some((_, lasts))) => LifeChoiceCue::TravelAgreed {
             hours: lasts.num_hours(),
         },
         (LifeChoiceKind::BatheTogether, Some((e, _))) if e.kind == EventKind::ShoweringTogether => {
             LifeChoiceCue::ShowerAgreed
         }
-        (kind, _) => LifeChoiceCue::Answered {
-            kind,
-            accepted: req.response == LifeChoiceAnswer::Accept,
-        },
+        (kind, _) => LifeChoiceCue::Answered { kind, accepted },
     };
     let greeting = match say(
         state,
@@ -618,7 +673,8 @@ pub fn router() -> OpenApiRouter<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::SubsecRound;
+    use chrono::{Duration, SubsecRound};
+    use eros_engine_core::relationship::RelationshipStatus;
     use serde_json::json;
     use sqlx::PgPool;
     use std::sync::Arc;
@@ -630,14 +686,10 @@ mod tests {
         frame_types, read_sse, seed_byoc_session, seed_genome, seed_group_session, seed_instance,
         seed_session, session_footprint, upstream_sse,
     };
-    use crate::routes::session_events::EventKindDto;
     use crate::routes::session_open::GreetingOccasion;
 
-    const GOODBYE: &str = "好，那我们先各自安静一下。";
+    const REPLY: &str = "好，那我们先各自安静一下。";
     const HURT: &str = "你不愿意啊……我有点难过。";
-    const GOODBYE_CUE_18: &str =
-        "（对方同意了你提出的分开请求，接下来 18 小时你们不联系。你跟对方道别。）";
-    const HURT_CUE: &str = "（对方不同意你提出的分开请求，你心里不好受。）";
     const SLEEP_ACCEPT_CUE: &str = "（对方答应了你的邀请。）";
     const SLEEP_DECLINE_CUE: &str = "（对方拒绝了你的邀请，你有点失落。）";
     const PROPOSE_ACCEPT_CUE: &str = "（对方答应了你的求婚。）";
@@ -746,7 +798,8 @@ mod tests {
     }
 
     impl Scene {
-        /// A pending choice asked at `asked_at` with `tier_gap`; returns its id.
+        /// A pending `ask_for_space` asked at `asked_at` with `tier_gap`;
+        /// returns its id.
         async fn ask(&self, tier_gap: i16, asked_at: DateTime<Utc>) -> Uuid {
             sqlx::query_scalar(
                 "INSERT INTO engine.life_choices (session_id, kind, tier_gap, asked_at) \
@@ -840,6 +893,47 @@ mod tests {
             .unwrap()
         }
 
+        /// Set the session's relationship status and cold war directly.
+        async fn set_status(&self, status: &str, cold_war_since: Option<DateTime<Utc>>) {
+            sqlx::query(
+                "UPDATE engine.companion_affinity \
+                    SET relationship_status = $2, cold_war_since = $3 \
+                  WHERE session_id = $1",
+            )
+            .bind(self.session_id)
+            .bind(status)
+            .bind(cold_war_since)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        }
+
+        /// (relationship_status, cold_war_since) as stored.
+        async fn relationship(&self) -> (String, Option<DateTime<Utc>>) {
+            sqlx::query_as(
+                "SELECT relationship_status, cold_war_since \
+                   FROM engine.companion_affinity WHERE session_id = $1",
+            )
+            .bind(self.session_id)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+        }
+
+        /// The `context` of every `relationship` affinity event of the session.
+        async fn relationship_events(&self) -> Vec<serde_json::Value> {
+            sqlx::query_scalar(
+                "SELECT e.context FROM engine.companion_affinity_events e \
+                   JOIN engine.companion_affinity a ON a.id = e.affinity_id \
+                  WHERE a.session_id = $1 AND e.event_type = 'relationship' \
+                  ORDER BY e.created_at",
+            )
+            .bind(self.session_id)
+            .fetch_all(&self.pool)
+            .await
+            .unwrap()
+        }
+
         /// The `context` of every `life_choice` affinity event of the session.
         async fn drops(&self) -> Vec<serde_json::Value> {
             sqlx::query_scalar(
@@ -919,170 +1013,6 @@ mod tests {
         }
     }
 
-    /// Accept: the choice is answered, the separation starts now and lasts
-    /// 6 hours per tier of the gap stored at ask time, both lines drop a tier
-    /// in the same transaction, and she says goodbye.
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn accept_writes_separation_drop_and_goodbye(pool: PgPool) {
-        let mock = companion_mock(Some(GOODBYE)).await;
-        let state = with_companion(test_state(pool.clone()), &mock.uri());
-
-        for (gap, hours) in [(2_i16, 12_i64), (4, 24)] {
-            let s = scene(&pool).await;
-            let asked = recent(30);
-            let choice = s.ask(gap, asked).await;
-            assert_eq!(s.tiers().await, (3, 4));
-            let now = recent(0);
-
-            let out = s
-                .respond(&state, choice, LifeChoiceAnswer::Accept, now)
-                .await
-                .unwrap();
-
-            assert_eq!(out.status, "accepted");
-            // The separation: now, 6 h per tier of the gap, no message of its
-            // own, in the choice's session.
-            let events = s.events().await;
-            assert_eq!(events.len(), 1, "{events:?}");
-            let (event_id, kind, key, session, started, ends, message) = events[0].clone();
-            assert_eq!(kind, "taking_space");
-            assert_eq!(key, format!("life_choice:{choice}:taking_space"));
-            assert_eq!(session, Some(s.session_id));
-            assert_eq!(started, now, "wall-clock: the user acted now");
-            assert_eq!(ends - started, Duration::hours(6 * i64::from(gap)));
-            assert_eq!(ends - started, Duration::hours(hours));
-            assert_eq!(message, None);
-            let view = out.event.expect("the separation is returned");
-            assert_eq!(view.kind, EventKindDto::TakingSpace);
-            assert_eq!((view.started_at, view.ends_at), (started, ends));
-            assert!(view.offline, "she is unreachable while it lasts");
-            assert_eq!(view.message_id, None);
-
-            // The choice: answered at `now`, linked to the event.
-            assert_eq!(
-                s.row(choice).await,
-                ("accepted".into(), Some(now), Some(event_id))
-            );
-
-            // The cost: one tier on both lines, one `life_choice` event.
-            assert_eq!(s.tiers().await, (2, 3));
-            assert_eq!(
-                (out.affinity.bond_tier, out.affinity.chem_tier),
-                (2, 3),
-                "the response carries the post-drop state"
-            );
-            assert_eq!(
-                s.drops().await,
-                vec![json!({"life_choice": "accept", "choice_id": choice})]
-            );
-
-            // Her goodbye: a proactive row, the choice's occasion.
-            let said = out.message.expect("a goodbye");
-            assert_eq!(said.content, GOODBYE);
-            assert_eq!(said.occasion, GreetingOccasion::LifeChoice);
-            let rows = s.life_choice_rows().await;
-            assert_eq!(rows.len(), 1, "{rows:?}");
-            assert_eq!(rows[0].0, said.message_id);
-            assert_eq!(rows[0].2["proactive"], json!("life_choice"));
-            assert_eq!(rows[0].2["user_timezone"], json!("Asia/Taipei"));
-        }
-
-        // The cue is a stage line that states the length of the separation.
-        let c = calls(&mock).await;
-        assert_eq!(c.len(), 2);
-        for (call, hours) in c.iter().zip([12, 24]) {
-            let last = call["messages"].as_array().unwrap().last().unwrap().clone();
-            assert_eq!(last["role"], json!("user"));
-            assert_eq!(
-                last["content"],
-                json!(format!(
-                    "（对方同意了你提出的分开请求，接下来 {hours} 小时你们不联系。你跟对方道别。）"
-                ))
-            );
-        }
-    }
-
-    /// A gap of 3 is 18 hours, and an incident under way ends where the
-    /// separation starts.
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn accept_caps_a_running_incident_and_names_18_hours_for_a_gap_of_3(pool: PgPool) {
-        let mock = companion_mock(Some(GOODBYE)).await;
-        let state = with_companion(test_state(pool.clone()), &mock.uri());
-        let s = scene(&pool).await;
-        let choice = s.ask(3, recent(30)).await;
-        let now = recent(0);
-        sqlx::query(
-            "INSERT INTO engine.persona_events \
-               (instance_id, session_id, event_key, kind, started_at, ends_at) \
-             VALUES ($1, $2, 'reading', 'reading', $3, $4)",
-        )
-        .bind(s.instance_id)
-        .bind(s.session_id)
-        .bind(now - Duration::minutes(20))
-        .bind(now + Duration::minutes(100))
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let out = s
-            .respond(&state, choice, LifeChoiceAnswer::Accept, now)
-            .await
-            .unwrap();
-
-        let ev = out.event.expect("separation");
-        assert_eq!(ev.ends_at - ev.started_at, Duration::hours(18));
-        let events = s.events().await;
-        let reading = events.iter().find(|e| e.1 == "reading").unwrap();
-        assert_eq!(
-            reading.5, now,
-            "the incident ends where the separation starts"
-        );
-        let last = calls(&mock).await[0]["messages"]
-            .as_array()
-            .unwrap()
-            .last()
-            .unwrap()
-            .clone();
-        assert_eq!(last["content"], json!(GOODBYE_CUE_18));
-    }
-
-    /// Decline: the lines drop, nothing is separated, and she is hurt.
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn decline_drops_without_an_event(pool: PgPool) {
-        let mock = companion_mock(Some(HURT)).await;
-        let state = with_companion(test_state(pool.clone()), &mock.uri());
-        let s = scene(&pool).await;
-        let choice = s.ask(3, recent(30)).await;
-        let now = recent(0);
-
-        let out = s
-            .respond(&state, choice, LifeChoiceAnswer::Decline, now)
-            .await
-            .unwrap();
-
-        assert_eq!(out.status, "declined");
-        assert!(out.event.is_none());
-        assert!(s.events().await.is_empty(), "no separation");
-        assert_eq!(s.row(choice).await, ("declined".into(), Some(now), None));
-        assert_eq!(s.tiers().await, (2, 3));
-        assert_eq!((out.affinity.bond_tier, out.affinity.chem_tier), (2, 3));
-        assert_eq!(
-            s.drops().await,
-            vec![json!({"life_choice": "decline", "choice_id": choice})]
-        );
-
-        let said = out.message.expect("a hurt reply");
-        assert_eq!(said.content, HURT);
-        assert_eq!(said.occasion, GreetingOccasion::LifeChoice);
-        let rows = s.life_choice_rows().await;
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].2["proactive"], json!("life_choice"));
-        let c = calls(&mock).await;
-        assert_eq!(c.len(), 1);
-        let last = c[0]["messages"].as_array().unwrap().last().unwrap().clone();
-        assert_eq!(last["content"], json!(HURT_CUE));
-    }
-
     /// The last `user` turn of the companion request: the stage cue.
     fn last_user_turn(call: &serde_json::Value) -> serde_json::Value {
         let last = call["messages"].as_array().unwrap().last().unwrap().clone();
@@ -1091,9 +1021,10 @@ mod tests {
     }
 
     /// A romantic accept costs nothing: no tier change, nothing written to the
-    /// affinity row or its log. She says yes-cue back and the response
-    /// carries the relationship as it stands. Only `propose` places no event;
-    /// `sleep_together`'s has its own test.
+    /// lines or the drop log; an accepted `propose` moves the status alone,
+    /// with its one `relationship` event. She says yes-cue back and the
+    /// response carries the relationship as it stands. Only `propose` places
+    /// no event; `sleep_together`'s has its own test.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn a_romantic_accept_costs_nothing(pool: PgPool) {
         let mock = companion_mock(Some("好呀。")).await;
@@ -1102,6 +1033,7 @@ mod tests {
 
         for kind in ["sleep_together", "propose"] {
             let s = scene(&pool).await;
+            s.set_status("dating", None).await;
             let choice = s.ask_kind(kind, recent(30)).await;
             let stored = repo.load(s.session_id).await.unwrap().expect("row");
             let events_before = s.affinity_event_count().await;
@@ -1121,18 +1053,28 @@ mod tests {
                 let (status, resolved_at, _) = s.row(choice).await;
                 assert_eq!((status.as_str(), resolved_at), ("accepted", Some(now)));
             }
-            assert_eq!(s.affinity_event_count().await, events_before, "{kind}");
+            // An accepted proposal's `relationship` event is the one row it adds.
+            let moved = i64::from(kind == "propose");
+            assert_eq!(
+                s.affinity_event_count().await,
+                events_before + moved,
+                "{kind}"
+            );
             assert!(s.drops().await.is_empty(), "{kind}");
 
-            // The row is untouched, `updated_at` included.
+            // The lines are untouched, `updated_at` included.
             let after = repo.load(s.session_id).await.unwrap().expect("row");
             assert_eq!(s.tiers().await, (3, 4), "{kind}");
             assert_eq!(s.axes().await, (0.45, 0.45, 0.70, 0.70), "{kind}");
             assert_eq!(after.updated_at, stored.updated_at, "{kind}");
 
             // The response is the relationship as it was, read the way every
-            // snapshot is: decayed, endpoints refreshed.
+            // snapshot is: decayed, endpoints refreshed; engaged after a
+            // proposal.
             let mut expected = stored.clone();
+            if kind == "propose" {
+                expected.relationship.status = RelationshipStatus::Engaged;
+            }
             expected.apply_time_decay();
             expected.refresh_endpoints(&state.config.affinity_tuning);
             assert_eq!(
@@ -1162,6 +1104,7 @@ mod tests {
         let state = with_companion(test_state(pool.clone()), &mock.uri());
         for kind in ["sleep_together", "propose"] {
             let s = scene(&pool).await;
+            s.set_status("dating", None).await;
             let choice = s.ask_kind(kind, recent(30)).await;
             let now = recent(0);
             let trip_ends = now + Duration::days(1);
@@ -1488,6 +1431,7 @@ mod tests {
         let mock = companion_mock(Some(HURT)).await;
         let state = with_companion(test_state(pool.clone()), &mock.uri());
         let s = scene(&pool).await;
+        s.set_status("dating", None).await;
         let choice = s.ask_kind("propose", recent(30)).await;
         let now = recent(0);
 
@@ -1510,6 +1454,455 @@ mod tests {
         let c = calls(&mock).await;
         assert_eq!(c.len(), 1);
         assert_eq!(last_user_turn(&c[0]), json!(PROPOSE_DECLINE_CUE));
+    }
+
+    /// Spec 2026-11-23-affinity-50 §6.2: an accepted confession moves the
+    /// status by where it stood, ends the incident under way and costs
+    /// nothing; the move is one `relationship` event naming the choice.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn accepting_a_confession_moves_the_status(pool: PgPool) {
+        let mock = companion_mock(Some("好呀。")).await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        for (from, to) in [
+            ("none", "dating"),
+            ("ex", "dating"),
+            ("partner", "fwb"),
+            ("peer", "situationship"),
+        ] {
+            let s = scene(&pool).await;
+            s.set_status(from, None).await;
+            let choice = s.ask_kind("confess", recent(30)).await;
+            let now = recent(0);
+            s.put(
+                "reading",
+                now - Duration::minutes(20),
+                now + Duration::minutes(100),
+            )
+            .await;
+
+            let out = s
+                .respond(&state, choice, LifeChoiceAnswer::Accept, now)
+                .await
+                .unwrap();
+
+            assert_eq!(out.status, "accepted", "{from}");
+            assert!(out.event.is_none(), "{from}: nothing placed");
+            assert_eq!(
+                s.row(choice).await,
+                ("accepted".into(), Some(now), None),
+                "{from}"
+            );
+            assert_eq!(s.relationship().await, (to.to_string(), None), "{from}");
+            assert_eq!(
+                s.relationship_events().await,
+                vec![json!({"from": from, "to": to, "choice_id": choice})],
+                "{from}"
+            );
+            assert!(s.drops().await.is_empty(), "{from}: nothing drops");
+            assert_eq!(s.tiers().await, (3, 4), "{from}");
+            assert_eq!(s.ends_at("reading").await, now, "{from}: the incident ends");
+            assert_eq!(out.affinity.relationship_status, to, "{from}");
+            assert!(!out.affinity.cold_war, "{from}");
+        }
+        let c = calls(&mock).await;
+        assert_eq!(c.len(), 4);
+        for call in &c {
+            assert_eq!(last_user_turn(call), json!("（对方答应了你的告白。）"));
+        }
+    }
+
+    /// A confession accepted from `none` through the JSON handler while her
+    /// reply comes back as `reply` (`None`: the provider fails). Her reply is
+    /// the last step and cannot undo the answer: still a 200 with
+    /// `message: null`, and the status move stands with its one event.
+    async fn confession_kept_without_her_reply(pool: &PgPool, reply: Option<&str>) {
+        let mock = companion_mock(reply).await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let s = scene(pool).await;
+        let choice = s.ask_kind("confess", recent(30)).await;
+        let now = recent(0);
+
+        let out = s
+            .respond(&state, choice, LifeChoiceAnswer::Accept, now)
+            .await
+            .expect("still a success");
+
+        assert_eq!(out.status, "accepted");
+        assert!(out.message.is_none(), "she could not speak");
+        assert_eq!(calls(&mock).await.len(), 1, "she was asked");
+        assert_eq!(s.row(choice).await, ("accepted".into(), Some(now), None));
+        assert_eq!(s.relationship().await, ("dating".into(), None));
+        assert_eq!(
+            s.relationship_events().await,
+            vec![json!({"from": "none", "to": "dating", "choice_id": choice})]
+        );
+        assert_eq!(out.affinity.relationship_status, "dating");
+        assert!(s.life_choice_rows().await.is_empty(), "no message row");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_failed_reply_keeps_the_confession(pool: PgPool) {
+        confession_kept_without_her_reply(&pool, None).await;
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_blank_reply_keeps_the_confession(pool: PgPool) {
+        confession_kept_without_her_reply(&pool, Some("  ")).await;
+    }
+
+    /// A declined confession keeps the status and costs chemistry one tier,
+    /// as a declined night together does.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn declining_a_confession_keeps_the_status_and_drops_chemistry(pool: PgPool) {
+        let mock = companion_mock(Some(HURT)).await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let s = scene(&pool).await;
+        s.set_status("peer", None).await;
+        let choice = s.ask_kind("confess", recent(30)).await;
+        let (trust, intrigue, _, _) = s.axes().await;
+        let now = recent(0);
+
+        let out = s
+            .respond(&state, choice, LifeChoiceAnswer::Decline, now)
+            .await
+            .unwrap();
+
+        assert_eq!(out.status, "declined");
+        assert!(out.event.is_none());
+        assert_eq!(s.row(choice).await, ("declined".into(), Some(now), None));
+        let (t, i, _, _) = s.axes().await;
+        assert_eq!((t, i), (trust, intrigue), "the bond axes did not move");
+        assert_eq!(s.tiers().await, (3, 3), "chemistry one tier lower");
+        assert_eq!(
+            s.drops().await,
+            vec![json!({"life_choice": "decline", "choice_id": choice})]
+        );
+        assert_eq!(s.relationship().await, ("peer".into(), None));
+        assert!(s.relationship_events().await.is_empty());
+        assert_eq!(out.affinity.relationship_status, "peer");
+        assert_eq!(
+            last_user_turn(&calls(&mock).await[0]),
+            json!("（对方拒绝了你的告白，你心里很难受。）")
+        );
+    }
+
+    /// An accepted partnership makes them partners, ends the incident under
+    /// way and costs nothing.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn accepting_a_partnership_makes_them_partners(pool: PgPool) {
+        let mock = companion_mock(Some("好呀。")).await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let s = scene(&pool).await;
+        let choice = s.ask_kind("partner_up", recent(30)).await;
+        let axes = s.axes().await;
+        let now = recent(0);
+        s.put(
+            "reading",
+            now - Duration::minutes(20),
+            now + Duration::minutes(100),
+        )
+        .await;
+
+        let out = s
+            .respond(&state, choice, LifeChoiceAnswer::Accept, now)
+            .await
+            .unwrap();
+
+        assert_eq!(out.status, "accepted");
+        assert!(out.event.is_none());
+        assert_eq!(s.relationship().await, ("partner".into(), None));
+        assert_eq!(
+            s.relationship_events().await,
+            vec![json!({"from": "none", "to": "partner", "choice_id": choice})]
+        );
+        assert_eq!(s.axes().await, axes);
+        assert!(s.drops().await.is_empty());
+        assert_eq!(s.ends_at("reading").await, now, "the incident ends");
+        assert_eq!(out.affinity.relationship_status, "partner");
+        assert_eq!(
+            last_user_turn(&calls(&mock).await[0]),
+            json!("（对方答应了和你结成伙伴。）")
+        );
+    }
+
+    /// A declined partnership makes them peers and drops nothing.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn declining_a_partnership_makes_them_peers_without_a_drop(pool: PgPool) {
+        let mock = companion_mock(Some(HURT)).await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let s = scene(&pool).await;
+        let choice = s.ask_kind("partner_up", recent(30)).await;
+        let axes = s.axes().await;
+        let now = recent(0);
+
+        let out = s
+            .respond(&state, choice, LifeChoiceAnswer::Decline, now)
+            .await
+            .unwrap();
+
+        assert_eq!(out.status, "declined");
+        assert!(out.event.is_none());
+        assert_eq!(s.row(choice).await, ("declined".into(), Some(now), None));
+        assert_eq!(s.axes().await, axes);
+        assert_eq!(s.tiers().await, (3, 4), "both lines kept");
+        assert!(s.drops().await.is_empty());
+        assert_eq!(s.relationship().await, ("peer".into(), None));
+        assert_eq!(
+            s.relationship_events().await,
+            vec![json!({"from": "none", "to": "peer", "choice_id": choice})]
+        );
+        assert_eq!(out.affinity.relationship_status, "peer");
+        assert_eq!(
+            last_user_turn(&calls(&mock).await[0]),
+            json!("（对方没有答应和你结成伙伴，你有点失落。）")
+        );
+    }
+
+    /// An accepted break-up makes an ex and ends the cold war; it costs
+    /// nothing and leaves what she was doing alone.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn accepting_a_break_up_makes_an_ex_and_ends_the_cold_war(pool: PgPool) {
+        let mock = companion_mock(Some("好。")).await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let s = scene(&pool).await;
+        s.set_status("dating", Some(recent(60))).await;
+        let choice = s.ask_kind("break_up", recent(30)).await;
+        let now = recent(0);
+        let reading_ends = now + Duration::minutes(100);
+        s.put("reading", now - Duration::minutes(20), reading_ends)
+            .await;
+
+        let out = s
+            .respond(&state, choice, LifeChoiceAnswer::Accept, now)
+            .await
+            .unwrap();
+
+        assert_eq!(out.status, "accepted");
+        assert!(out.event.is_none());
+        assert_eq!(s.row(choice).await, ("accepted".into(), Some(now), None));
+        assert_eq!(s.relationship().await, ("ex".into(), None));
+        assert_eq!(
+            s.relationship_events().await,
+            vec![json!({"from": "dating", "to": "ex", "cold_war": "ended", "choice_id": choice})]
+        );
+        assert_eq!(s.tiers().await, (3, 4));
+        assert!(s.drops().await.is_empty());
+        assert_eq!(s.ends_at("reading").await, reading_ends);
+        assert_eq!(out.affinity.relationship_status, "ex");
+        assert!(!out.affinity.cold_war);
+        assert_eq!(
+            last_user_turn(&calls(&mock).await[0]),
+            json!("（对方同意了分手。）")
+        );
+    }
+
+    /// A refused break-up keeps the status and the cold war: one starts now
+    /// when none was on, one under way keeps its start. Nothing drops.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn declining_a_break_up_starts_a_cold_war(pool: PgPool) {
+        let mock = companion_mock(Some(HURT)).await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let earlier = recent(60);
+        for under_way in [None, Some(earlier)] {
+            let s = scene(&pool).await;
+            s.set_status("dating", under_way).await;
+            let choice = s.ask_kind("break_up", recent(30)).await;
+            let now = recent(0);
+
+            let out = s
+                .respond(&state, choice, LifeChoiceAnswer::Decline, now)
+                .await
+                .unwrap();
+
+            assert_eq!(out.status, "declined", "{under_way:?}");
+            assert!(out.event.is_none());
+            assert_eq!(s.row(choice).await, ("declined".into(), Some(now), None));
+            let since = under_way.unwrap_or(now);
+            assert_eq!(s.relationship().await, ("dating".into(), Some(since)));
+            let events = match under_way {
+                None => vec![json!({
+                    "from": "dating", "to": "dating", "cold_war": "entered", "choice_id": choice
+                })],
+                Some(_) => vec![],
+            };
+            assert_eq!(s.relationship_events().await, events, "{under_way:?}");
+            assert_eq!(s.tiers().await, (3, 4), "{under_way:?}");
+            assert!(s.drops().await.is_empty(), "{under_way:?}");
+            assert_eq!(out.affinity.relationship_status, "dating");
+            assert!(out.affinity.cold_war, "{under_way:?}");
+        }
+        assert_eq!(calls(&mock).await.len(), 2, "she spoke after each answer");
+        for call in &calls(&mock).await {
+            assert_eq!(
+                last_user_turn(call),
+                json!("（对方不同意分手，你们还在冷战。）")
+            );
+        }
+    }
+
+    /// An accepted proposal makes a couple engaged and costs nothing.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_accepted_proposal_makes_them_engaged(pool: PgPool) {
+        let mock = companion_mock(Some("好呀。")).await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        for from in ["dating", "fwb", "situationship"] {
+            let s = scene(&pool).await;
+            s.set_status(from, None).await;
+            let choice = s.ask_kind("propose", recent(30)).await;
+            let now = recent(0);
+
+            let out = s
+                .respond(&state, choice, LifeChoiceAnswer::Accept, now)
+                .await
+                .unwrap();
+
+            assert_eq!(out.status, "accepted", "{from}");
+            assert_eq!(s.relationship().await, ("engaged".into(), None), "{from}");
+            assert_eq!(
+                s.relationship_events().await,
+                vec![json!({"from": from, "to": "engaged", "choice_id": choice})],
+                "{from}"
+            );
+            assert_eq!(s.tiers().await, (3, 4), "{from}");
+            assert!(s.drops().await.is_empty(), "{from}");
+            assert_eq!(out.affinity.relationship_status, "engaged", "{from}");
+        }
+    }
+
+    /// Spec 2026-11-23-affinity-50 §7.2: an answer that arrives once the
+    /// status is no longer one the kind is asked from is closed, and the
+    /// whole answer is undone, the cap on the incident under way included.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_answer_after_the_status_moved_is_409(pool: PgPool) {
+        let mock = companion_mock(Some("好呀。")).await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let s = scene(&pool).await;
+        s.set_status("dating", None).await;
+        let choice = s.ask_kind("propose", recent(30)).await;
+        s.set_status("ex", None).await;
+        let now = recent(0);
+        let reading_ends = now + Duration::minutes(100);
+        s.put("reading", now - Duration::minutes(20), reading_ends)
+            .await;
+
+        for response in [LifeChoiceAnswer::Accept, LifeChoiceAnswer::Decline] {
+            let AppError::StreamPre(e) = s
+                .respond(&state, choice, response, now)
+                .await
+                .expect_err("the status moved")
+            else {
+                panic!("expected a coded error")
+            };
+            assert_eq!(
+                (e.status, e.code),
+                (StatusCode::CONFLICT, "life_choice_closed")
+            );
+        }
+        assert_eq!(s.row(choice).await, ("pending".into(), None, None));
+        assert_eq!(s.relationship().await, ("ex".into(), None));
+        assert_eq!(s.affinity_event_count().await, 0, "no affinity event");
+        assert_eq!(s.tiers().await, (3, 4));
+        let events = s.events().await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].5, reading_ends, "the cap went down with it");
+        assert!(s.life_choice_rows().await.is_empty());
+        assert!(calls(&mock).await.is_empty());
+    }
+
+    /// Spec 2026-11-23-affinity-50 §7.3: an accepted ask to fall asleep
+    /// together places `asleep_together`, as the user's own ask does; a
+    /// decline costs chemistry one tier. Neither moves the status.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn accepting_fall_asleep_together_places_asleep_together(pool: PgPool) {
+        let mock = companion_mock(Some("好呀。")).await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+
+        let s = scene(&pool).await;
+        let choice = s.ask_kind("fall_asleep_together", recent(30)).await;
+        let axes = s.axes().await;
+        let now = recent(0);
+        let out = s
+            .respond(&state, choice, LifeChoiceAnswer::Accept, now)
+            .await
+            .unwrap();
+
+        assert_eq!(out.status, "accepted");
+        let event = serde_json::to_value(out.event.expect("the event")).unwrap();
+        assert_eq!(event["kind"], json!("asleep_together"));
+        let events = s.events().await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        let (id, kind, key, _, started_at, ends_at, _) = events[0].clone();
+        assert_eq!(kind, "asleep_together");
+        assert_eq!(key, format!("life_choice:{choice}:asleep_together"));
+        assert_eq!(started_at, now);
+        let hours = (ends_at - started_at).num_hours();
+        assert!((1..=4).contains(&hours), "{hours} hours");
+        assert_eq!(
+            s.row(choice).await,
+            ("accepted".into(), Some(now), Some(id))
+        );
+        assert_eq!(s.axes().await, axes);
+        assert!(s.drops().await.is_empty());
+        assert_eq!(s.relationship().await, ("none".into(), None));
+        assert!(s.relationship_events().await.is_empty());
+        assert_eq!(
+            last_user_turn(&calls(&mock).await[0]),
+            json!("（对方答应了，你们现在一起躺下睡觉。）")
+        );
+
+        let s = scene(&pool).await;
+        let choice = s.ask_kind("fall_asleep_together", recent(30)).await;
+        let (trust, intrigue, _, _) = s.axes().await;
+        let now = recent(0);
+        let out = s
+            .respond(&state, choice, LifeChoiceAnswer::Decline, now)
+            .await
+            .unwrap();
+
+        assert_eq!(out.status, "declined");
+        assert!(out.event.is_none());
+        assert!(s.events().await.is_empty());
+        let (t, i, _, _) = s.axes().await;
+        assert_eq!((t, i), (trust, intrigue), "the bond axes did not move");
+        assert_eq!(s.tiers().await, (3, 3), "chemistry one tier lower");
+        assert_eq!(
+            s.drops().await,
+            vec![json!({"life_choice": "decline", "choice_id": choice})]
+        );
+        assert_eq!(
+            last_user_turn(calls(&mock).await.last().unwrap()),
+            json!("（对方拒绝了你的邀请，你有点失落。）")
+        );
+    }
+
+    /// Spec 2026-11-23-affinity-50 §7.5: `ask_for_space` is retired, and a
+    /// stored one still pending is not answered: 409, nothing written.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_ask_for_space_answer_is_409(pool: PgPool) {
+        let mock = companion_mock(Some(HURT)).await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let s = scene(&pool).await;
+        let choice = s.ask(3, recent(30)).await;
+
+        for response in [LifeChoiceAnswer::Accept, LifeChoiceAnswer::Decline] {
+            let AppError::StreamPre(e) = s
+                .respond(&state, choice, response, recent(0))
+                .await
+                .expect_err("retired")
+            else {
+                panic!("expected a coded error")
+            };
+            assert_eq!(
+                (e.status, e.code),
+                (StatusCode::CONFLICT, "life_choice_closed")
+            );
+        }
+        assert_eq!(s.row(choice).await, ("pending".into(), None, None));
+        assert_eq!(s.tiers().await, (3, 4));
+        assert_eq!(s.affinity_event_count().await, 0);
+        assert!(s.events().await.is_empty());
+        assert!(s.life_choice_rows().await.is_empty());
+        assert!(calls(&mock).await.is_empty());
     }
 
     /// A stored kind this build does not know is refused as a server fault
@@ -1539,10 +1932,10 @@ mod tests {
     /// answers 409, and nothing of the second answer lands.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn resolve_loses_to_a_faster_message(pool: PgPool) {
-        let mock = companion_mock(Some(GOODBYE)).await;
+        let mock = companion_mock(Some(REPLY)).await;
         let state = with_companion(test_state(pool.clone()), &mock.uri());
         let s = scene(&pool).await;
-        let choice = s.ask(3, recent(30)).await;
+        let choice = s.ask_kind("travel_together", recent(30)).await;
         let flipped = recent(1);
         sqlx::query(
             "UPDATE engine.life_choices SET status = 'ignored', resolved_at = $2 WHERE id = $1",
@@ -1584,10 +1977,10 @@ mod tests {
     /// finds the choice converted and writes nothing.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn an_answer_that_waits_on_a_converting_message_loses(pool: PgPool) {
-        let mock = companion_mock(Some(GOODBYE)).await;
+        let mock = companion_mock(Some(REPLY)).await;
         let state = with_companion(test_state(pool.clone()), &mock.uri());
         let s = Arc::new(scene(&pool).await);
-        let choice = s.ask(3, recent(30)).await;
+        let choice = s.ask_kind("travel_together", recent(30)).await;
         let now = recent(0);
 
         let mut converting = pool.begin().await.unwrap();
@@ -1634,7 +2027,7 @@ mod tests {
             (expiry - micro, true),
         ] {
             let s = scene(&pool).await;
-            let choice = s.ask(3, asked).await;
+            let choice = s.ask_kind("travel_together", asked).await;
             let out = s
                 .respond(&state, choice, LifeChoiceAnswer::Decline, at)
                 .await;
@@ -1653,8 +2046,8 @@ mod tests {
         assert_eq!(calls(&mock).await.len(), 1, "only the open one spoke");
     }
 
-    /// A failed goodbye does not undo the answer: the resolution, the
-    /// separation and the drop are committed before she speaks.
+    /// The stream leads with `resolved`, the answer and what it placed as
+    /// committed before she speaks, then her reply.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn life_choice_stream_leads_with_resolved(pool: PgPool) {
         let mock = MockServer::start().await;
@@ -1665,7 +2058,7 @@ mod tests {
             .await;
         let state = with_companion(test_state(pool.clone()), &mock.uri());
         let s = scene(&pool).await;
-        let choice = s.ask(3, recent(30)).await;
+        let choice = s.ask_kind("travel_together", recent(30)).await;
         let now = recent(0);
 
         let resp = respond_stream_at(
@@ -1685,16 +2078,30 @@ mod tests {
         );
         let resolved = &frames[0];
         assert_eq!(resolved["status"], "accepted");
-        assert_eq!(resolved["event"]["kind"], "taking_space");
-        assert_eq!(
-            resolved["affinity"]["bond_tier"], 2,
-            "the drop is in the frame"
-        );
+        assert_eq!(resolved["event"]["kind"], "traveling_together");
         assert_eq!(frames[4]["occasion"], "life_choice");
         assert_eq!(s.row(choice).await.0, "accepted");
         let rows = s.life_choice_rows().await;
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].1, GOODBYE);
+        assert_eq!(rows[0].1, REPLY);
+
+        // `resolved` carries the relationship as committed: a confession
+        // accepted from `none` already reads `dating`.
+        let s = scene(&pool).await;
+        let choice = s.ask_kind("confess", recent(30)).await;
+        let resp = respond_stream_at(
+            &state,
+            s.session_id,
+            choice,
+            s.user_id,
+            answer(LifeChoiceAnswer::Accept),
+            recent(0),
+        )
+        .await
+        .unwrap();
+        let frames = read_sse(resp).await;
+        assert_eq!(frame_types(&frames)[0], "resolved");
+        assert_eq!(frames[0]["affinity"]["relationship_status"], "dating");
     }
 
     /// A decline starts no event: `resolved` has no `event` key.
@@ -1707,7 +2114,7 @@ mod tests {
             .await;
         let state = with_companion(test_state(pool.clone()), &mock.uri());
         let s = scene(&pool).await;
-        let choice = s.ask(3, recent(30)).await;
+        let choice = s.ask_kind("travel_together", recent(30)).await;
 
         let resp = respond_stream_at(
             &state,
@@ -1735,7 +2142,7 @@ mod tests {
         let failing = companion_mock(None).await;
         let state = with_companion(test_state(pool.clone()), &failing.uri());
         let s = scene(&pool).await;
-        let choice = s.ask(3, recent(30)).await;
+        let choice = s.ask_kind("travel_together", recent(30)).await;
 
         let resp = respond_stream_at(
             &state,
@@ -1751,16 +2158,15 @@ mod tests {
         assert_eq!(frame_types(&frames), ["resolved", "error"]);
         assert_eq!(frames[1]["retryable"], false);
         assert_eq!(s.row(choice).await.0, "accepted");
-        assert_eq!(s.tiers().await, (2, 3));
         assert!(s.life_choice_rows().await.is_empty(), "no message row");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn life_choice_stream_closed_is_409(pool: PgPool) {
-        let mock = companion_mock(Some(GOODBYE)).await;
+        let mock = companion_mock(Some(REPLY)).await;
         let state = with_companion(test_state(pool.clone()), &mock.uri());
         let s = scene(&pool).await;
-        let choice = s.ask(3, recent(30)).await;
+        let choice = s.ask_kind("travel_together", recent(30)).await;
         s.respond(&state, choice, LifeChoiceAnswer::Accept, recent(0))
             .await
             .unwrap();
@@ -1781,74 +2187,26 @@ mod tests {
         );
     }
 
+    /// The answer and what it places are one transaction: a trip that cannot
+    /// be written (its key is taken, here by an incident under way) undoes the
+    /// resolution and the incident's cap, and the user is told so rather than
+    /// answered for nothing.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn a_failed_goodbye_keeps_the_resolution(pool: PgPool) {
-        let failing = companion_mock(None).await;
-        let state = with_companion(test_state(pool.clone()), &failing.uri());
-        let s = scene(&pool).await;
-        let choice = s.ask(3, recent(30)).await;
-        let now = recent(0);
-
-        let out = s
-            .respond(&state, choice, LifeChoiceAnswer::Accept, now)
-            .await
-            .expect("still a success");
-
-        assert_eq!(out.status, "accepted");
-        assert!(out.message.is_none(), "she could not speak");
-        assert!(out.event.is_some());
-        assert_eq!(calls(&failing).await.len(), 1, "she was asked");
-        let events = s.events().await;
-        assert_eq!(events.len(), 1);
-        assert_eq!(
-            s.row(choice).await,
-            ("accepted".into(), Some(now), Some(events[0].0))
-        );
-        assert_eq!(s.tiers().await, (2, 3));
-        assert_eq!(s.drops().await.len(), 1);
-        assert!(s.life_choice_rows().await.is_empty(), "no message row");
-    }
-
-    /// A blank hurt reply is the same: 200, `message: null`, the drop stands.
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn a_blank_hurt_reply_keeps_the_resolution(pool: PgPool) {
-        let blank = companion_mock(Some("  ")).await;
-        let state = with_companion(test_state(pool.clone()), &blank.uri());
-        let s = scene(&pool).await;
-        let choice = s.ask(3, recent(30)).await;
-        let now = recent(0);
-
-        let out = s
-            .respond(&state, choice, LifeChoiceAnswer::Decline, now)
-            .await
-            .expect("still a success");
-
-        assert_eq!(out.status, "declined");
-        assert!(out.message.is_none());
-        assert_eq!(s.row(choice).await, ("declined".into(), Some(now), None));
-        assert_eq!(s.tiers().await, (2, 3));
-        assert!(s.life_choice_rows().await.is_empty());
-    }
-
-    /// The answer and its costs are one transaction: a separation that cannot
-    /// be written (its key is taken) undoes the resolution and the drop, and
-    /// the user is told so rather than charged for nothing.
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn a_failed_separation_undoes_the_whole_answer(pool: PgPool) {
-        let mock = companion_mock(Some(GOODBYE)).await;
+    async fn a_failed_trip_undoes_the_whole_answer(pool: PgPool) {
+        let mock = companion_mock(Some(REPLY)).await;
         let state = with_companion(test_state(pool.clone()), &mock.uri());
         let s = scene(&pool).await;
-        let choice = s.ask(3, recent(30)).await;
+        let choice = s.ask_kind("travel_together", recent(30)).await;
         let now = recent(0);
         let (started, ends) = (now - Duration::minutes(20), now + Duration::minutes(40));
         sqlx::query(
             "INSERT INTO engine.persona_events \
                (instance_id, session_id, event_key, kind, started_at, ends_at) \
-             VALUES ($1, $2, $3, 'taking_space', $4, $5)",
+             VALUES ($1, $2, $3, 'reading', $4, $5)",
         )
         .bind(s.instance_id)
         .bind(s.session_id)
-        .bind(format!("life_choice:{choice}:taking_space"))
+        .bind(format!("life_choice:{choice}:traveling_together"))
         .bind(started)
         .bind(ends)
         .execute(&pool)
@@ -1873,11 +2231,11 @@ mod tests {
     /// wherever it lives; the other session's choice stays pending.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn a_choice_of_another_session_is_404(pool: PgPool) {
-        let mock = companion_mock(Some(GOODBYE)).await;
+        let mock = companion_mock(Some(REPLY)).await;
         let state = with_companion(test_state(pool.clone()), &mock.uri());
         let s = scene(&pool).await;
         let other = scene(&pool).await;
-        let theirs = other.ask(3, recent(30)).await;
+        let theirs = other.ask_kind("travel_together", recent(30)).await;
         let status = |e: AppError| match e {
             AppError::StreamPre(p) => (p.status, p.code),
             other => panic!("{other:?}"),
@@ -1906,7 +2264,7 @@ mod tests {
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn the_session_gate_applies(pool: PgPool) {
         let s = scene(&pool).await;
-        let choice = s.ask(3, recent(30)).await;
+        let choice = s.ask_kind("travel_together", recent(30)).await;
         let state = test_state(pool.clone());
         let status = |e: AppError| match e {
             AppError::StreamPre(p) => p.status,
@@ -1995,7 +2353,8 @@ mod tests {
         async fn the_route_is_wired_authed_and_reads_only_two_answers(pool: PgPool) {
             let mock = companion_mock(Some(HURT)).await;
             let s = scene(&pool).await;
-            let choice = s.ask(3, recent(30)).await;
+            s.set_status("dating", None).await;
+            let choice = s.ask_kind("propose", recent(30)).await;
             let mut app = build_router(with_companion(test_state(pool.clone()), &mock.uri()));
             let jwt = mint_test_jwt(s.user_id);
 
@@ -2062,7 +2421,7 @@ mod tests {
         #[sqlx::test(migrations = "../eros-engine-store/migrations")]
         async fn voice_and_group_sessions_are_wrong_channel(pool: PgPool) {
             let s = scene(&pool).await;
-            let choice = s.ask(3, recent(30)).await;
+            let choice = s.ask_kind("travel_together", recent(30)).await;
             let mut app = build_router(test_state(pool.clone()));
             let jwt = mint_test_jwt(s.user_id);
 

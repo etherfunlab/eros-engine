@@ -9,6 +9,7 @@ pub mod group;
 pub mod needs;
 pub mod pde;
 pub mod persona;
+pub mod relationship;
 pub mod scope;
 pub mod tone;
 pub mod types;

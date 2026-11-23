@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use eros_engine_core::affinity::{Affinity, LabelTransition, TurnLabelChanges};
+use eros_engine_core::relationship::composed_relation;
 use eros_engine_store::activity::ActivityRecord;
 use eros_engine_store::affinity::{EventDeltas, LineDeltas};
 
@@ -46,6 +47,15 @@ pub struct AffinitySnapshot {
     pub bond_label: String,
     /// Romance tier key (`spark`/`flirtation`/`crush`/`lover`/`beloved`).
     pub chemistry_label: String,
+    /// The session's relationship status: `none`, `dating`, `partner`,
+    /// `peer`, `fwb`, `situationship`, `engaged` or `ex`.
+    pub relationship_status: String,
+    /// Whether a cold war is on.
+    pub cold_war: bool,
+    /// Key of what the two real tiers add up to (`good_friend`,
+    /// `more_than_friends`, ...), or `null` at `(1, 1)`. The pair's
+    /// compatibility is not applied here.
+    pub composed_relation: Option<String>,
 }
 
 impl From<Affinity> for AffinitySnapshot {
@@ -66,6 +76,10 @@ impl From<Affinity> for AffinitySnapshot {
             chem_tier: a.chem_tier(),
             bond_label: a.bond_label().as_key().to_string(),
             chemistry_label: a.chemistry_label().as_key().to_string(),
+            relationship_status: a.relationship.status.as_str().to_string(),
+            cold_war: a.relationship.cold_war(),
+            composed_relation: composed_relation(a.bond_tier(), a.chem_tier())
+                .map(|c| c.key.to_string()),
         }
     }
 }
@@ -196,6 +210,7 @@ mod tests {
             feeling_clause_at: None,
             created_at: now,
             updated_at: now,
+            relationship: Default::default(),
         }
     }
 
@@ -219,6 +234,29 @@ mod tests {
         assert_eq!(snap.bond_label, "close_friend");
         assert_eq!(snap.chem_tier, 1);
         assert_eq!(snap.chemistry_label, "spark");
+    }
+
+    #[test]
+    fn snapshot_carries_the_status_cold_war_and_composed_relation() {
+        use eros_engine_core::relationship::RelationshipStatus;
+        // (3, 2): bond 0.40 -> tier 3, chemistry 0.20 -> tier 2.
+        let mut a = affinity(0.0, 0.40, 0.40, 0.20, 0.20);
+        a.relationship.status = RelationshipStatus::Peer;
+        a.relationship.cold_war_since = Some(chrono::Utc::now());
+        let json = serde_json::to_value(AffinitySnapshot::from(a)).unwrap();
+        assert_eq!(json["relationship_status"], "peer");
+        assert_eq!(json["cold_war"], true);
+        assert_eq!(json["composed_relation"], "more_than_friends");
+    }
+
+    #[test]
+    fn snapshot_composed_relation_is_null_at_the_bottom_pair() {
+        let json = serde_json::to_value(AffinitySnapshot::from(affinity(0.0, 0.0, 0.0, 0.0, 0.0)))
+            .unwrap();
+        assert_eq!(json["relationship_status"], "none");
+        assert_eq!(json["cold_war"], false);
+        assert!(json["composed_relation"].is_null());
+        assert!(json.as_object().unwrap().contains_key("composed_relation"));
     }
 
     #[test]

@@ -184,6 +184,7 @@ pub enum UserActionKind {
     StreakTogether,
     DrinkTogether,
     Propose,
+    BreakUp,
     HotSpringTogether,
     FightTogether,
     Challenge,
@@ -337,8 +338,8 @@ impl From<DateDurationDto> for eros_engine_core::types::DateDuration {
 /// An action the user does to the persona this turn, besides talking. The
 /// persona accepts or does not; a refusal costs the relationship one tier on
 /// the line the action touches (`give` and `gift` → bond, every physical or custom action →
-/// chemistry); a refused `tip`, `bluff`, `threaten`, `trick`, `propose`, `challenge` or
-/// `bet` costs nothing.
+/// chemistry); a refused `tip`, `bluff`, `threaten`, `trick`, `propose`, `break_up`,
+/// `challenge` or `bet` costs nothing.
 /// An accepted `gift` joins the persona's items or wardrobe. A `date` asks her
 /// out; accepted, it runs in a session of its own for its `duration`, and
 /// nothing else is sent to the persona's text sessions meanwhile. An accepted
@@ -360,7 +361,14 @@ impl From<DateDurationDto> for eros_engine_core::types::DateDuration {
 /// `hot_spring_together` (one hour) and `fight_together` starts
 /// `fighting_together` (one to two hours); a `fight_together` to a persona
 /// whose `setting` is not `fantasy` is refused and costs nothing. `propose`
-/// asks her to marry the user and starts no event. `challenge` and `bet`
+/// asks her to marry the user and starts no event: it is refused unless the
+/// pair is `dating`, `fwb` or `situationship`, and accepted, the pair is
+/// `engaged`. `break_up` ends the relationship and starts no event: it is
+/// refused unless the pair's status is breakable (`dating`, `partner`, `fwb`,
+/// `situationship`, `engaged`); accepted, the pair is `ex`, and refused, a
+/// cold war starts. On a BYOC instance no status moves: `propose` is hers to
+/// answer and `break_up` is always refused. On a date both act on the
+/// inviting session's relationship. `challenge` and `bet`
 /// ask whether she takes the user up on it; no winner is decided and a
 /// refusal costs nothing.
 #[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
@@ -474,6 +482,7 @@ impl UserActionDto {
             UserActionKind::StreakTogether => UserAction::StreakTogether,
             UserActionKind::DrinkTogether => UserAction::DrinkTogether,
             UserActionKind::Propose => UserAction::Propose,
+            UserActionKind::BreakUp => UserAction::BreakUp,
             UserActionKind::HotSpringTogether => UserAction::HotSpringTogether,
             UserActionKind::FightTogether => UserAction::FightTogether,
             UserActionKind::Challenge => UserAction::Challenge,
@@ -5077,6 +5086,8 @@ mod validate_payload_tests {
                 UserAction::DrinkTogether,
             ),
             ("propose", UserActionKind::Propose, UserAction::Propose),
+            // Spec 2026-11-23-affinity-50-design.md §8.
+            ("break_up", UserActionKind::BreakUp, UserAction::BreakUp),
         ] {
             let dto: UserActionDto = serde_json::from_value(serde_json::json!({"type": wire}))
                 .unwrap_or_else(|e| panic!("{wire}: {e}"));

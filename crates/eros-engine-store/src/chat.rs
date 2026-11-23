@@ -1177,6 +1177,13 @@ impl<'a> ChatRepo<'a> {
     /// [`crate::events::EventRepo::place_together_in_tx`]: once per
     /// `event_key`, and never while a date of the instance is on. A refusal
     /// places nothing.
+    ///
+    /// `relationship` is the affinity session and the status ask the action
+    /// puts (spec 2026-11-23-affinity-50-design.md §8): the answer settles
+    /// that session's relationship under its row lock, in the same
+    /// transaction, and the `relationship` event records this message. An
+    /// ask the status is no longer put from, or a session without an
+    /// affinity row, writes nothing.
     pub async fn set_action_response(
         &self,
         user_message_id: Uuid,
@@ -1184,12 +1191,34 @@ impl<'a> ChatRepo<'a> {
         instance_id: Uuid,
         journal_tz: Option<chrono_tz::Tz>,
         place: Option<&crate::events::NewEvent<'_>>,
+        relationship: Option<(Uuid, eros_engine_core::relationship::StatusAsk)>,
     ) -> Result<(), sqlx::Error> {
+        use crate::affinity::{AffinityRepo, RelationshipCause};
         use eros_engine_core::types::ActionResponse;
         let mut tx = self.pool.begin().await?;
         // First, as it takes the instance's lock.
         if let (ActionResponse::Accept, Some(e)) = (response, place) {
             crate::events::EventRepo::place_together_in_tx(&mut tx, e).await?;
+        }
+        // After the instance's lock, as everywhere: then the affinity row's.
+        if let Some((session_id, ask)) = relationship {
+            if let Some(from) =
+                AffinityRepo::relationship_for_update_in_tx(&mut tx, session_id).await?
+            {
+                let accepted = response == ActionResponse::Accept;
+                if let Some(to) =
+                    eros_engine_core::relationship::settle(ask, from, accepted, Utc::now())
+                {
+                    AffinityRepo::write_relationship_in_tx(
+                        &mut tx,
+                        session_id,
+                        from,
+                        to,
+                        RelationshipCause::UserMessage(user_message_id),
+                    )
+                    .await?;
+                }
+            }
         }
         sqlx::query(
             "WITH upd AS ( \
@@ -3941,6 +3970,7 @@ mod tests {
             s.instance_id.unwrap(),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3948,6 +3978,7 @@ mod tests {
             id,
             ActionResponse::Accept,
             s.instance_id.unwrap(),
+            None,
             None,
             None,
         )
@@ -3978,6 +4009,7 @@ mod tests {
             s.instance_id.unwrap(),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3997,6 +4029,7 @@ mod tests {
                 id,
                 ActionResponse::Accept,
                 s.instance_id.unwrap(),
+                None,
                 None,
                 None,
             )
@@ -4081,9 +4114,16 @@ mod tests {
                 started_at: at,
                 ends_at: at + m(30),
             };
-            repo.set_action_response(id, ActionResponse::Accept, instance, None, Some(&place))
-                .await
-                .unwrap_or_else(|e| panic!("retry={retry}: {e}"));
+            repo.set_action_response(
+                id,
+                ActionResponse::Accept,
+                instance,
+                None,
+                Some(&place),
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("retry={retry}: {e}"));
         }
 
         assert_eq!(
@@ -4131,6 +4171,7 @@ mod tests {
             instance,
             None,
             Some(&place("refused")),
+            None,
         )
         .await
         .unwrap();
@@ -4144,6 +4185,7 @@ mod tests {
             instance,
             None,
             Some(&place("dated")),
+            None,
         )
         .await
         .unwrap();
@@ -4236,7 +4278,7 @@ mod tests {
             (malformed, Accept),
             (no_action, Accept),
         ] {
-            repo.set_action_response(id, response, instance, None, None)
+            repo.set_action_response(id, response, instance, None, None, None)
                 .await
                 .unwrap();
         }
@@ -4244,26 +4286,26 @@ mod tests {
 
         // A re-driven turn accepts the same give twice: one row.
         for _ in 0..2 {
-            repo.set_action_response(named_give, Accept, instance, None, None)
+            repo.set_action_response(named_give, Accept, instance, None, None, None)
                 .await
                 .unwrap();
         }
-        repo.set_action_response(plain_give, Accept, instance, None, None)
+        repo.set_action_response(plain_give, Accept, instance, None, None, None)
             .await
             .unwrap();
-        repo.set_action_response(dress, Accept, instance, None, None)
+        repo.set_action_response(dress, Accept, instance, None, None, None)
             .await
             .unwrap();
-        repo.set_action_response(tip, Accept, instance, None, None)
+        repo.set_action_response(tip, Accept, instance, None, None, None)
             .await
             .unwrap();
         let day_before = crate::journal::local_date(Utc::now(), Some(Tokyo));
-        repo.set_action_response(kiss, Accept, instance, Some(Tokyo), None)
+        repo.set_action_response(kiss, Accept, instance, Some(Tokyo), None, None)
             .await
             .unwrap();
         let day_after = crate::journal::local_date(Utc::now(), Some(Tokyo));
         // Only the first accepted kiss counts.
-        repo.set_action_response(later_kiss, Accept, instance, None, None)
+        repo.set_action_response(later_kiss, Accept, instance, None, None, None)
             .await
             .unwrap();
 
@@ -4326,6 +4368,7 @@ mod tests {
                 s.instance_id.unwrap(),
                 None,
                 None,
+                None,
             )
             .await
             .expect("a malformed gift must not fail the write");
@@ -4356,6 +4399,7 @@ mod tests {
                 id,
                 ActionResponse::Accept,
                 s.instance_id.unwrap(),
+                None,
                 None,
                 None,
             )
@@ -6457,6 +6501,7 @@ mod tests {
             s.instance_id.unwrap(),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -6489,6 +6534,7 @@ mod tests {
                 id,
                 ActionResponse::Accept,
                 s.instance_id.unwrap(),
+                None,
                 None,
                 None,
             )

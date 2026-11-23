@@ -28,7 +28,8 @@ use chrono::{DateTime, Datelike, Timelike, Utc, Weekday};
 use eros_engine_core::affinity::Affinity;
 use eros_engine_core::effects::{ActiveEffect, EffectPhase};
 use eros_engine_core::persona::CompanionPersona;
-use eros_engine_core::scope::AffinityScope;
+use eros_engine_core::relationship::{composed_relation, RelationshipStatus};
+use eros_engine_core::scope::{romance_compatible, AffinityScope};
 use eros_engine_core::types::PromptTrait;
 use eros_engine_core::types::QuotedMessage;
 use eros_engine_core::types::ReplyMode;
@@ -399,25 +400,84 @@ pub fn affinity_to_attitude_prompt(a: &Affinity, scope: AffinityScope) -> String
     )
 }
 
-/// One-sentence relationship ground (spec 2026-09-13 §3.3): who the user
-/// currently is to the persona, from a warmth × patience quadrant split at
-/// 0.5. Identity only — no behaviour; how she acts on it stays [mood]'s and
-/// [feelings]'s job. Omitted with no affinity or when either axis is out of
-/// scope (the same rule [mood] applies to a missing axis).
-fn relationship_ground(affinity: Option<&Affinity>, scope: AffinityScope) -> String {
-    if !(scope.warmth && scope.patience) {
-        return String::new();
-    }
+/// The `[relationship]` block: who the user is to the persona, in up to three
+/// lines, each present only when it has something to say. Identity only; how
+/// she acts on it stays [mood]'s and [feelings]'s job.
+///
+/// - the status line (`你是用户的{noun}`), when the status is not `none`;
+/// - the composed relation of the pair's two tiers, `论感情，你们现在是{名}`
+///   after a status line and `你是用户的{名}` without one. A pair that is not
+///   romantically compatible reads chemistry tier 1;
+/// - `你们正在冷战` while a cold war is on.
+///
+/// With none of the three the block falls back to the warmth × patience
+/// quadrant split at 0.5, under the same scope gate [mood] applies to a
+/// missing axis. The three settled lines are conclusions about the pair, not
+/// an axis steering the reply, so no single axis gates them: only a missing
+/// affinity or an empty scope omits the block.
+fn relationship_ground(
+    affinity: Option<&Affinity>,
+    scope: AffinityScope,
+    persona: &CompanionPersona,
+) -> String {
     let Some(a) = affinity else {
         return String::new();
     };
-    let noun = match (a.warmth >= 0.5, a.patience >= 0.5) {
-        (true, true) => "好朋友",
-        (true, false) => "快被磨光耐心的朋友",
-        (false, true) => "没什么交情的人",
-        (false, false) => "死对头",
+    if scope.active_count() == 0 {
+        return String::new();
+    }
+    let status = (a.relationship.status != RelationshipStatus::None)
+        .then(|| format!("你是用户的{}", status_noun(a.relationship.status, persona)));
+    let chem_tier = if romance_compatible(scope) {
+        a.chem_tier()
+    } else {
+        1
     };
-    format!("\n\n[relationship]\n你是用户的{noun}")
+    let composed = composed_relation(a.bond_tier(), chem_tier).map(|c| {
+        if status.is_some() {
+            format!("论感情，你们现在是{}", c.zh)
+        } else {
+            format!("你是用户的{}", c.zh)
+        }
+    });
+    let cold_war = a
+        .relationship
+        .cold_war()
+        .then(|| "你们正在冷战".to_string());
+    let mut lines: Vec<String> = [status, composed, cold_war].into_iter().flatten().collect();
+    if lines.is_empty() {
+        if !(scope.warmth && scope.patience) {
+            return String::new();
+        }
+        let noun = match (a.warmth >= 0.5, a.patience >= 0.5) {
+            (true, true) => "好朋友",
+            (true, false) => "快被磨光耐心的朋友",
+            (false, true) => "没什么交情的人",
+            (false, false) => "死对头",
+        };
+        lines.push(format!("你是用户的{noun}"));
+    }
+    format!("\n\n[relationship]\n{}", lines.join("\n"))
+}
+
+/// What the persona is to the user at `status`. `dating` and `engaged` follow
+/// the persona's `gender` (`female` / `male`, anything else gets the neutral
+/// noun); every other status uses its plain wording.
+fn status_noun(status: RelationshipStatus, persona: &CompanionPersona) -> &'static str {
+    let gender = meta_str(persona, "gender");
+    match status {
+        RelationshipStatus::Dating => match gender {
+            Some("female") => "女朋友",
+            Some("male") => "男朋友",
+            _ => "伴侣",
+        },
+        RelationshipStatus::Engaged => match gender {
+            Some("female") => "未婚妻",
+            Some("male") => "未婚夫",
+            _ => "订婚对象",
+        },
+        other => other.zh(),
+    }
 }
 
 /// Static system instruction for the per-turn affinity evaluator. Written in
@@ -776,6 +836,7 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
         UserAction::StreakTogether => "想和你一起裸奔".into(),
         UserAction::DrinkTogether => "想和你一起喝酒".into(),
         UserAction::Propose => "向你求婚".into(),
+        UserAction::BreakUp => "向你提出分手".into(),
         UserAction::HotSpringTogether => "想和你一起泡温泉".into(),
         UserAction::FightTogether => "想和你一起去战斗".into(),
         UserAction::Challenge => "向你发起挑战".into(),
@@ -1440,8 +1501,9 @@ pub(crate) fn reactions_context(lines: &[ReactionLine<'_>]) -> String {
 }
 
 /// What `accept` and `refuse` mean on a social action (spec 2026-11-08
-/// §2.2): whether she fell for it. `None` on every other action, whose
-/// answers are 你接受了 / 你没有接受.
+/// §2.2): whether she fell for it; on a break-up, whether she agreed to it
+/// (spec 2026-11-23-affinity-50-design.md §8). `None` on every other action,
+/// whose answers are 你接受了 / 你没有接受.
 pub(crate) fn social_outcomes(a: &UserAction) -> Option<(&'static str, &'static str)> {
     match a {
         UserAction::Bluff => Some(("你信了", "你没信")),
@@ -1449,6 +1511,7 @@ pub(crate) fn social_outcomes(a: &UserAction) -> Option<(&'static str, &'static 
         UserAction::Trick => Some(("你上当了", "你识破了")),
         UserAction::Challenge => Some(("你应战了", "你没应战")),
         UserAction::Bet => Some(("你答应打这个赌", "你没答应")),
+        UserAction::BreakUp => Some(("你同意分手", "你不同意分手")),
         _ => None,
     }
 }
@@ -1892,7 +1955,7 @@ fn render_prompt(
         None => rel_sec.unwrap_or_else(|| "（还没有专属记忆，慢慢来）".to_string()),
     };
 
-    let relationship = relationship_ground(affinity, affinity_scope);
+    let relationship = relationship_ground(affinity, affinity_scope, persona);
     let attitude = affinity
         .map(|a| affinity_to_attitude_prompt(a, affinity_scope))
         .unwrap_or_default();
@@ -2551,6 +2614,7 @@ pub fn extract_user_insights_prompt(
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use eros_engine_core::relationship::Relationship;
     use uuid::Uuid;
 
     fn set_meta(p: &mut CompanionPersona, key: &str, val: serde_json::Value) {
@@ -3966,6 +4030,7 @@ mod tests {
             feeling_clause_at: None,
             created_at: now,
             updated_at: now,
+            relationship: Default::default(),
         }
     }
 
@@ -4306,6 +4371,7 @@ mod tests {
             feeling_clause_at: None,
             created_at: now,
             updated_at: now,
+            relationship: Default::default(),
         }
     }
 
@@ -4377,34 +4443,181 @@ mod tests {
         );
     }
 
+    /// The four line axes set so the tiers land on `trust` (bond) and
+    /// `intimacy` (chemistry).
+    fn lines(trust: f64, intimacy: f64) -> Affinity {
+        let mut a = fixture_affinity();
+        (a.trust, a.intrigue, a.intimacy, a.tension) = (trust, trust, intimacy, intimacy);
+        a
+    }
+
+    fn persona_with_gender(gender: &str) -> CompanionPersona {
+        let mut p = fixture_persona();
+        set_meta(&mut p, "gender", serde_json::json!(gender));
+        p
+    }
+
     #[test]
     fn relationship_ground_quadrants_split_at_half() {
         let mut a = fixture_affinity();
+        // (1, 1): no composed relation, so the quadrant noun is the block.
+        (a.trust, a.intrigue, a.intimacy, a.tension) = (0.0, 0.0, 0.0, 0.0);
+        let p = fixture_persona();
         let scope = AffinityScope::full();
         a.warmth = 0.5;
         a.patience = 0.5;
         assert!(
-            relationship_ground(Some(&a), scope).contains("你是用户的好朋友"),
+            relationship_ground(Some(&a), scope, &p).contains("你是用户的好朋友"),
             "0.5 lands warm/patient"
         );
         a.patience = 0.49;
-        assert!(relationship_ground(Some(&a), scope).contains("快被磨光耐心的朋友"));
+        assert!(relationship_ground(Some(&a), scope, &p).contains("快被磨光耐心的朋友"));
         a.warmth = 0.49;
-        assert!(relationship_ground(Some(&a), scope).contains("死对头"));
+        assert!(relationship_ground(Some(&a), scope, &p).contains("死对头"));
         a.patience = 0.5;
-        assert!(relationship_ground(Some(&a), scope).contains("没什么交情的人"));
+        assert!(relationship_ground(Some(&a), scope, &p).contains("没什么交情的人"));
     }
 
     #[test]
     fn relationship_ground_omitted_without_affinity_or_axis() {
-        let a = fixture_affinity();
-        assert_eq!(relationship_ground(None, AffinityScope::full()), "");
+        let mut a = fixture_affinity();
+        (a.trust, a.intrigue, a.intimacy, a.tension) = (0.0, 0.0, 0.0, 0.0);
+        let p = fixture_persona();
+        assert_eq!(relationship_ground(None, AffinityScope::full(), &p), "");
         let mut no_warmth = AffinityScope::full();
         no_warmth.warmth = false;
-        assert_eq!(relationship_ground(Some(&a), no_warmth), "");
+        assert_eq!(relationship_ground(Some(&a), no_warmth, &p), "");
         let mut no_patience = AffinityScope::full();
         no_patience.patience = false;
-        assert_eq!(relationship_ground(Some(&a), no_patience), "");
+        assert_eq!(relationship_ground(Some(&a), no_patience, &p), "");
+    }
+
+    #[test]
+    fn relationship_block_names_status_composed_and_cold_war() {
+        let female = persona_with_gender("female");
+        let mut a = lines(0.70, 0.70); // (4, 4)
+        a.relationship.status = RelationshipStatus::Engaged;
+        a.relationship.cold_war_since = Some(chrono::Utc::now());
+        assert_eq!(
+            relationship_ground(Some(&a), AffinityScope::full(), &female),
+            "\n\n[relationship]\n你是用户的未婚妻\n论感情，你们现在是知心爱人\n你们正在冷战"
+        );
+        a.relationship = Relationship::default();
+        assert_eq!(
+            relationship_ground(Some(&a), AffinityScope::full(), &female),
+            "\n\n[relationship]\n你是用户的知心爱人"
+        );
+    }
+
+    #[test]
+    fn status_nouns_follow_the_persona_gender() {
+        let mut a = lines(0.0, 0.0); // (1, 1): no composed line
+        a.relationship.status = RelationshipStatus::Dating;
+        let g = |gender| {
+            relationship_ground(
+                Some(&a),
+                AffinityScope::full(),
+                &persona_with_gender(gender),
+            )
+        };
+        assert!(g("female").ends_with("你是用户的女朋友"));
+        assert!(g("male").ends_with("你是用户的男朋友"));
+        assert!(g("non-binary").ends_with("你是用户的伴侣"));
+
+        a.relationship.status = RelationshipStatus::Engaged;
+        let g = |gender| {
+            relationship_ground(
+                Some(&a),
+                AffinityScope::full(),
+                &persona_with_gender(gender),
+            )
+        };
+        assert!(g("female").ends_with("你是用户的未婚妻"));
+        assert!(g("male").ends_with("你是用户的未婚夫"));
+        assert!(g("non-binary").ends_with("你是用户的订婚对象"));
+    }
+
+    #[test]
+    fn a_status_without_a_gendered_noun_uses_its_plain_wording() {
+        let mut a = lines(0.0, 0.0);
+        let p = persona_with_gender("female");
+        for status in [
+            RelationshipStatus::Partner,
+            RelationshipStatus::Peer,
+            RelationshipStatus::Fwb,
+            RelationshipStatus::Situationship,
+            RelationshipStatus::Ex,
+        ] {
+            a.relationship.status = status;
+            assert_eq!(
+                relationship_ground(Some(&a), AffinityScope::full(), &p),
+                format!("\n\n[relationship]\n你是用户的{}", status.zh())
+            );
+        }
+    }
+
+    #[test]
+    fn partner_peer_and_ex_read_their_literal_wording() {
+        let mut a = lines(0.0, 0.0); // (1, 1): no composed line
+        let p = persona_with_gender("female");
+        for (status, noun) in [
+            (RelationshipStatus::Partner, "伙伴"),
+            (RelationshipStatus::Peer, "同事"),
+            (RelationshipStatus::Ex, "前任"),
+        ] {
+            a.relationship.status = status;
+            assert_eq!(
+                relationship_ground(Some(&a), AffinityScope::full(), &p),
+                format!("\n\n[relationship]\n你是用户的{noun}")
+            );
+        }
+    }
+
+    /// A cold war is a line of its own: alone at (1, 1) with no status, and
+    /// after the composed name, which then reads as who the user is.
+    #[test]
+    fn a_cold_war_without_a_status() {
+        let p = persona_with_gender("female");
+        let mut a = lines(0.0, 0.0); // (1, 1): no composed line
+        a.relationship.cold_war_since = Some(chrono::Utc::now());
+        assert_eq!(
+            relationship_ground(Some(&a), AffinityScope::full(), &p),
+            "\n\n[relationship]\n你们正在冷战"
+        );
+
+        let mut a = lines(0.70, 0.70); // (4, 4)
+        a.relationship.cold_war_since = Some(chrono::Utc::now());
+        assert_eq!(
+            relationship_ground(Some(&a), AffinityScope::full(), &p),
+            "\n\n[relationship]\n你是用户的知心爱人\n你们正在冷战"
+        );
+    }
+
+    #[test]
+    fn an_incompatible_pair_takes_the_chemistry_one_name() {
+        let p = persona_with_gender("female");
+        let bond_only = AffinityScope::bond();
+        // (3, 5) reads as (3, 1).
+        assert!(relationship_ground(Some(&lines(0.40, 0.95)), bond_only, &p)
+            .ends_with("你是用户的好朋友"));
+        // (1, 5) reads as (1, 1): no composed line, and a bond-only scope has
+        // no patience axis, so the quadrant fallback's gate fails too.
+        let quadrant = relationship_ground(Some(&lines(0.0, 0.95)), bond_only, &p);
+        assert_eq!(quadrant, "");
+    }
+
+    #[test]
+    fn the_block_is_omitted_without_affinity_or_any_axis() {
+        let p = persona_with_gender("female");
+        let a = lines(0.70, 0.70);
+        assert_eq!(relationship_ground(None, AffinityScope::full(), &p), "");
+        assert_eq!(relationship_ground(Some(&a), AffinityScope::none(), &p), "");
+        let mut no_warmth = AffinityScope::full();
+        no_warmth.warmth = false;
+        assert!(
+            relationship_ground(Some(&a), no_warmth, &p).contains("知心爱人"),
+            "not gated by single axes"
+        );
     }
 
     #[test]
@@ -6708,6 +6921,25 @@ mod tests {
             action_outcome(&UserAction::Challenge, ActionResponse::Refuse),
             "对方向你发起挑战，你没应战。"
         );
+    }
+
+    /// Spec 2026-11-23-affinity-50-design.md §8.
+    #[test]
+    fn a_break_up_reads_as_the_spec_says() {
+        assert_eq!(action_phrase(&UserAction::BreakUp), "向你提出分手");
+        assert_eq!(action_marker(&UserAction::BreakUp), "（向你提出分手）");
+        assert_eq!(
+            social_outcomes(&UserAction::BreakUp),
+            Some(("你同意分手", "你不同意分手"))
+        );
+        assert_eq!(
+            action_outcome(&UserAction::BreakUp, ActionResponse::Refuse),
+            "对方向你提出分手，你不同意分手。"
+        );
+        for r in [ActionResponse::Accept, ActionResponse::Refuse] {
+            let s = user_action_context(&UserAction::BreakUp, r, None);
+            assert!(!s.contains("拒绝"), "{s}");
+        }
     }
 
     /// Spec 2026-11-20-together-actions-state-in-picture-and-genome-routes-

@@ -7,6 +7,8 @@ use chrono::{DateTime, Duration, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use eros_engine_core::relationship::StatusAsk;
+
 use crate::chat::ProactiveInsert;
 use crate::events::lock_instance;
 
@@ -14,20 +16,24 @@ use crate::events::lock_instance;
 /// A choice never stores its expiry: it is `asked_at` plus this.
 const PENDING_HOURS: i32 = 24;
 
-/// How long after an accepted separation ends her growth stays slowed
-/// (spec 2026-10-19 §3.5); the only place it is written down. The window is
-/// derived: `ends_at` of the separation the accepted choice wrote, plus this.
-const SLOWDOWN_HOURS: i32 = 72;
-
 /// What a choice asks of the user (spec 2026-10-30 §4.2): the stored `kind`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifeChoiceKind {
-    /// She asks for a separation; the only kind that carries a `tier_gap`.
+    /// She asked for a separation; retired (spec 2026-11-23-affinity-50
+    /// §7.5), read from stored rows. The only kind that carries a `tier_gap`.
     AskForSpace,
-    /// She asks to spend the night together.
+    /// She asks to spend the night together, for sex.
     SleepTogether,
+    /// She asks to fall asleep side by side, and no more.
+    FallAsleepTogether,
     /// She proposes.
     Propose,
+    /// She confesses her feelings and asks to be together.
+    Confess,
+    /// She offers to partner up.
+    PartnerUp,
+    /// She asks to break up.
+    BreakUp,
     /// She suggests going away together.
     TravelTogether,
     /// She asks the user to take a bath with her.
@@ -40,7 +46,11 @@ impl LifeChoiceKind {
         match self {
             Self::AskForSpace => "ask_for_space",
             Self::SleepTogether => "sleep_together",
+            Self::FallAsleepTogether => "fall_asleep_together",
             Self::Propose => "propose",
+            Self::Confess => "confess",
+            Self::PartnerUp => "partner_up",
+            Self::BreakUp => "break_up",
             Self::TravelTogether => "travel_together",
             Self::BatheTogether => "bathe_together",
         }
@@ -50,7 +60,11 @@ impl LifeChoiceKind {
         match s {
             "ask_for_space" => Some(Self::AskForSpace),
             "sleep_together" => Some(Self::SleepTogether),
+            "fall_asleep_together" => Some(Self::FallAsleepTogether),
             "propose" => Some(Self::Propose),
+            "confess" => Some(Self::Confess),
+            "partner_up" => Some(Self::PartnerUp),
+            "break_up" => Some(Self::BreakUp),
             "travel_together" => Some(Self::TravelTogether),
             "bathe_together" => Some(Self::BatheTogether),
             _ => None,
@@ -60,20 +74,41 @@ impl LifeChoiceKind {
     /// The wire `type` of the user's action that asks her the same thing the
     /// other way round (spec 2026-11-23-twelve-together-actions-and-propose-
     /// design.md §6, §7): `sex_together` for `sleep_together`, `propose` for
-    /// `propose`. `None` for every other kind.
+    /// `propose`, `fall_asleep_together` for `fall_asleep_together`. `None`
+    /// for every other kind.
     pub fn user_ask(self) -> Option<&'static str> {
         match self {
             Self::SleepTogether => Some("sex_together"),
+            Self::FallAsleepTogether => Some("fall_asleep_together"),
             Self::Propose => Some("propose"),
             _ => None,
         }
     }
 
-    /// `sleep_together`, `propose` or `bathe_together`.
+    /// The status ask an answer to this kind settles (spec
+    /// 2026-11-23-affinity-50 §7.2): `confess`, `partner_up`, `propose` and
+    /// `break_up`. `None` for the kinds that never move the status.
+    pub fn status_ask(self) -> Option<StatusAsk> {
+        match self {
+            Self::Confess => Some(StatusAsk::Confess),
+            Self::PartnerUp => Some(StatusAsk::PartnerUp),
+            Self::Propose => Some(StatusAsk::Propose),
+            Self::BreakUp => Some(StatusAsk::BreakUp),
+            _ => None,
+        }
+    }
+
+    /// The kinds put only to a romantically compatible pair:
+    /// `sleep_together`, `fall_asleep_together`, `propose`, `confess` or
+    /// `bathe_together`.
     pub fn is_romantic(self) -> bool {
         matches!(
             self,
-            Self::SleepTogether | Self::Propose | Self::BatheTogether
+            Self::SleepTogether
+                | Self::FallAsleepTogether
+                | Self::Propose
+                | Self::Confess
+                | Self::BatheTogether
         )
     }
 }
@@ -83,9 +118,10 @@ const COLUMNS: &str = "id, session_id, kind, status, tier_gap, asked_at, resolve
                        message_id, event_id";
 
 /// One choice. `message_id` is the message that asked it, `event_id` the event
-/// an accept placed (a separation, a trip, a shower or a bath, or sex); either
-/// is `None` once its row is gone, and `event_id` on every path but an accept
-/// that placed one (a `propose` accept places none).
+/// an accept placed (a separation, a trip, a shower or a bath, sex, or falling
+/// asleep together); either is `None` once its row is gone, and `event_id` on
+/// every path but an accept that placed one (an accept of a kind that moves
+/// the status places none).
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct LifeChoiceRecord {
     pub id: Uuid,
@@ -273,11 +309,12 @@ impl LifeChoiceRepo<'_> {
     }
 
     /// [`Self::resolve`] inside the caller's transaction, so the resolution
-    /// commits or rolls back together with what it is paired with (the
-    /// falling-out, the separation, the tier drop); nothing here commits. A
-    /// caller that gets `None` has lost and drops the transaction: nothing of
-    /// the rest of its work may land. A concurrent resolve of the same row
-    /// waits on its lock here and then finds the choice no longer pending.
+    /// commits or rolls back together with what it is paired with (the event
+    /// an accept places, the status move, the tier drop); nothing here
+    /// commits. A caller that gets `None` has lost and drops the transaction:
+    /// nothing of the rest of its work may land. A concurrent resolve of the
+    /// same row waits on its lock here and then finds the choice no longer
+    /// pending.
     pub async fn resolve_in_tx(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         choice_id: Uuid,
@@ -301,44 +338,18 @@ impl LifeChoiceRepo<'_> {
     /// Where the session's next streak of judged turns starts: the latest of
     /// its newest choice's `asked_at`, its `resolved_at` and, for an accepted
     /// `ask_for_space`, the end of the separation it wrote
-    /// (`persona_events.ends_at`, through `event_id`). An accepted trip anchors
-    /// at its answer, so a new streak can build while they are away. Turns up
-    /// to that instant belong to the episode,
-    /// not to the streak. `None` when the session was never asked; a choice
-    /// whose separation row is gone anchors at its answer.
+    /// (`persona_events.ends_at`, through `event_id`), and of the session's
+    /// newest `relationship` event (a status or cold-war change, spec
+    /// 2026-11-23-affinity-50 §7.1). An accepted trip anchors at its answer,
+    /// so a new streak can build while they are away. Turns up to that
+    /// instant belong to the episode, not to the streak. `None` when the
+    /// session was never asked and nothing changed; a choice whose separation
+    /// row is gone anchors at its answer.
     pub async fn streak_anchor(
         &self,
         session_id: Uuid,
     ) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
         streak_anchor_on(self.pool, session_id).await
-    }
-
-    /// Whether `now` falls in the slowdown window of the session's newest
-    /// accepted `ask_for_space`: from the end of its separation (`persona_events.
-    /// ends_at`, through `event_id`) for 72 hours. Older accepted choices,
-    /// accepted romantic choices and every other session of the instance have
-    /// no say, and a choice whose separation row is gone carries no window.
-    pub async fn growth_slowed(
-        &self,
-        session_id: Uuid,
-        now: DateTime<Utc>,
-    ) -> Result<bool, sqlx::Error> {
-        sqlx::query_scalar(
-            "SELECT EXISTS ( \
-               SELECT 1 \
-                 FROM (SELECT event_id FROM engine.life_choices \
-                        WHERE session_id = $1 AND status = 'accepted' \
-                          AND kind = 'ask_for_space' \
-                        ORDER BY asked_at DESC LIMIT 1) c \
-                 JOIN engine.persona_events e ON e.id = c.event_id \
-                WHERE e.ends_at <= $2 \
-                  AND $2 < e.ends_at + make_interval(hours => $3))",
-        )
-        .bind(session_id)
-        .bind(now)
-        .bind(SLOWDOWN_HOURS)
-        .fetch_one(self.pool)
-        .await
     }
 
     /// Whether `kind` was ever `accepted` or `ignored` in the session: it has
@@ -382,6 +393,27 @@ impl LifeChoiceRepo<'_> {
             "SELECT EXISTS (SELECT 1 FROM engine.life_choices \
                              WHERE session_id = $1 AND kind = $2 \
                                AND status IN ('accepted', 'ignored') \
+                               AND resolved_at > $3)",
+        )
+        .bind(session_id)
+        .bind(kind.as_str())
+        .bind(since)
+        .fetch_one(self.pool)
+        .await
+    }
+
+    /// Whether `kind` was answered in the session after `since`, with any of
+    /// `accepted`, `declined` or `ignored`. A pending ask is not an answer.
+    pub async fn answered_since(
+        &self,
+        session_id: Uuid,
+        kind: LifeChoiceKind,
+        since: DateTime<Utc>,
+    ) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM engine.life_choices \
+                             WHERE session_id = $1 AND kind = $2 \
+                               AND status IN ('accepted', 'declined', 'ignored') \
                                AND resolved_at > $3)",
         )
         .bind(session_id)
@@ -442,15 +474,20 @@ async fn streak_anchor_on<'e, E: sqlx::PgExecutor<'e>>(
     session_id: Uuid,
 ) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
     sqlx::query_scalar(
-        "SELECT GREATEST(c.asked_at, c.resolved_at, e.ends_at) \
-           FROM engine.life_choices c \
-           LEFT JOIN engine.persona_events e \
-                  ON e.id = c.event_id AND c.kind = 'ask_for_space' \
-          WHERE c.session_id = $1 \
-          ORDER BY c.asked_at DESC LIMIT 1",
+        "SELECT GREATEST( \
+                  (SELECT GREATEST(c.asked_at, c.resolved_at, e.ends_at) \
+                     FROM engine.life_choices c \
+                     LEFT JOIN engine.persona_events e \
+                            ON e.id = c.event_id AND c.kind = 'ask_for_space' \
+                    WHERE c.session_id = $1 \
+                    ORDER BY c.asked_at DESC LIMIT 1), \
+                  (SELECT max(r.created_at) \
+                     FROM engine.companion_affinity_events r \
+                     JOIN engine.companion_affinity a ON a.id = r.affinity_id \
+                    WHERE a.session_id = $1 AND r.event_type = 'relationship'))",
     )
     .bind(session_id)
-    .fetch_optional(ex)
+    .fetch_one(ex)
     .await
 }
 
@@ -545,12 +582,38 @@ mod tests {
             LifeChoiceKind::Propose.user_ask(),
             wire(UserAction::Propose).as_str()
         );
+        assert_eq!(
+            LifeChoiceKind::FallAsleepTogether.user_ask(),
+            wire(UserAction::FallAsleepTogether).as_str()
+        );
         for k in [
             LifeChoiceKind::AskForSpace,
             LifeChoiceKind::TravelTogether,
             LifeChoiceKind::BatheTogether,
+            LifeChoiceKind::Confess,
+            LifeChoiceKind::PartnerUp,
+            LifeChoiceKind::BreakUp,
         ] {
             assert_eq!(k.user_ask(), None, "{k:?}");
+        }
+    }
+
+    /// Spec 2026-11-23-affinity-50 §7.2: the four kinds whose answer moves the
+    /// status, and no other.
+    #[test]
+    fn status_ask_maps_the_four_status_kinds() {
+        for (kind, ask) in [
+            (LifeChoiceKind::Confess, Some(StatusAsk::Confess)),
+            (LifeChoiceKind::PartnerUp, Some(StatusAsk::PartnerUp)),
+            (LifeChoiceKind::Propose, Some(StatusAsk::Propose)),
+            (LifeChoiceKind::BreakUp, Some(StatusAsk::BreakUp)),
+            (LifeChoiceKind::AskForSpace, None),
+            (LifeChoiceKind::SleepTogether, None),
+            (LifeChoiceKind::FallAsleepTogether, None),
+            (LifeChoiceKind::TravelTogether, None),
+            (LifeChoiceKind::BatheTogether, None),
+        ] {
+            assert_eq!(kind.status_ask(), ask, "{kind:?}");
         }
     }
 
@@ -562,6 +625,14 @@ mod tests {
             (LifeChoiceKind::Propose, "propose", true),
             (LifeChoiceKind::TravelTogether, "travel_together", false),
             (LifeChoiceKind::BatheTogether, "bathe_together", true),
+            (LifeChoiceKind::Confess, "confess", true),
+            (LifeChoiceKind::PartnerUp, "partner_up", false),
+            (LifeChoiceKind::BreakUp, "break_up", false),
+            (
+                LifeChoiceKind::FallAsleepTogether,
+                "fall_asleep_together",
+                true,
+            ),
         ] {
             assert_eq!(kind.as_str(), wire);
             assert_eq!(LifeChoiceKind::parse(wire), Some(kind));
@@ -866,31 +937,6 @@ mod tests {
             .settled(session, LifeChoiceKind::Propose)
             .await
             .unwrap());
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    async fn growth_slowed_ignores_an_accepted_romantic_choice(pool: PgPool) {
-        let (_, instance, session) = instance_and_session(&pool).await;
-        let repo = LifeChoiceRepo { pool: &pool };
-        let now = Utc::now();
-        let starts = now - Duration::hours(19);
-        let ends = now - Duration::hours(1);
-        accepted_with_separation(
-            &pool,
-            instance,
-            session,
-            Duration::hours(20),
-            starts,
-            ends,
-            "k1",
-        )
-        .await;
-        assert!(repo.growth_slowed(session, now).await.unwrap());
-
-        // A newer accepted proposal carries no separation; it does not take the
-        // window over from the separation behind it.
-        seed_choice(&pool, session, LifeChoiceKind::Propose, "accepted").await;
-        assert!(repo.growth_slowed(session, now).await.unwrap());
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -1535,6 +1581,146 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn the_streak_anchor_moves_with_a_relationship_event(pool: PgPool) {
+        use crate::affinity::AffinityRepo;
+
+        let (owner, instance, session) = instance_and_session(&pool).await;
+        let affinity = AffinityRepo { pool: &pool };
+        affinity
+            .load_or_create(session, owner, instance)
+            .await
+            .unwrap();
+        let repo = LifeChoiceRepo { pool: &pool };
+        let newest_relationship_event = || async {
+            sqlx::query_scalar::<_, DateTime<Utc>>(
+                "SELECT max(e.created_at) FROM engine.companion_affinity_events e \
+                   JOIN engine.companion_affinity a ON a.id = e.affinity_id \
+                  WHERE a.session_id = $1 AND e.event_type = 'relationship'",
+            )
+            .bind(session)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+        assert_eq!(
+            repo.streak_anchor(session).await.unwrap(),
+            None,
+            "no choice and no event"
+        );
+
+        // A cold war starting is an event, and the anchor follows it.
+        assert!(affinity
+            .set_cold_war(session, true, Utc::now())
+            .await
+            .unwrap());
+        let entered = newest_relationship_event().await;
+        assert_eq!(repo.streak_anchor(session).await.unwrap(), Some(entered));
+
+        // A choice asked after it takes the anchor over; the ask is written
+        // against the anchor the trigger saw.
+        let choice = repo
+            .insert_ask(
+                session,
+                LifeChoiceKind::AskForSpace,
+                Some(3),
+                Some(entered),
+                &ask_message("想先分开"),
+            )
+            .await
+            .unwrap()
+            .expect("written");
+        assert_eq!(
+            repo.streak_anchor(session).await.unwrap(),
+            Some(choice.asked_at)
+        );
+
+        // A relationship event after the choice moves it again.
+        assert!(affinity
+            .set_cold_war(session, false, Utc::now())
+            .await
+            .unwrap());
+        let ended = newest_relationship_event().await;
+        assert!(ended > choice.asked_at);
+        assert_eq!(repo.streak_anchor(session).await.unwrap(), Some(ended));
+
+        // A sibling session of the instance has its own.
+        let sibling = ChatRepo { pool: &pool }
+            .create_session(owner, instance)
+            .await
+            .unwrap()
+            .id;
+        assert_eq!(repo.streak_anchor(sibling).await.unwrap(), None);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn answered_since_counts_every_answer(pool: PgPool) {
+        let repo = LifeChoiceRepo { pool: &pool };
+        let since = Utc::now() - Duration::hours(2);
+        // One choice in a session of its own; `resolved_at` is None for a
+        // pending one.
+        let seed = |kind: LifeChoiceKind, status: &'static str, resolved: Option<Duration>| {
+            let pool = &pool;
+            async move {
+                let (_, _, session) = instance_and_session(pool).await;
+                sqlx::query(
+                    "INSERT INTO engine.life_choices \
+                       (session_id, kind, status, tier_gap, asked_at, resolved_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6)",
+                )
+                .bind(session)
+                .bind(kind.as_str())
+                .bind(status)
+                .bind((kind == LifeChoiceKind::AskForSpace).then_some(3_i16))
+                .bind(since - Duration::hours(3))
+                .bind(resolved.map(|d| since + d))
+                .execute(pool)
+                .await
+                .unwrap();
+                session
+            }
+        };
+        let hour = Duration::hours(1);
+
+        for status in ["accepted", "declined", "ignored"] {
+            let session = seed(LifeChoiceKind::Propose, status, Some(hour)).await;
+            assert!(
+                repo.answered_since(session, LifeChoiceKind::Propose, since)
+                    .await
+                    .unwrap(),
+                "{status} after since"
+            );
+        }
+
+        let before = seed(LifeChoiceKind::Propose, "declined", Some(-hour)).await;
+        assert!(!repo
+            .answered_since(before, LifeChoiceKind::Propose, since)
+            .await
+            .unwrap());
+        let at_since = seed(LifeChoiceKind::Propose, "declined", Some(Duration::zero())).await;
+        assert!(
+            !repo
+                .answered_since(at_since, LifeChoiceKind::Propose, since)
+                .await
+                .unwrap(),
+            "since is exclusive"
+        );
+        let pending = seed(LifeChoiceKind::Propose, "pending", None).await;
+        assert!(!repo
+            .answered_since(pending, LifeChoiceKind::Propose, since)
+            .await
+            .unwrap());
+        let other_kind = seed(LifeChoiceKind::TravelTogether, "declined", Some(hour)).await;
+        assert!(!repo
+            .answered_since(other_kind, LifeChoiceKind::Propose, since)
+            .await
+            .unwrap());
+        assert!(repo
+            .answered_since(other_kind, LifeChoiceKind::TravelTogether, since)
+            .await
+            .unwrap());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn get_reads_a_choice_by_id_whatever_its_state(pool: PgPool) {
         let (_, _, session) = instance_and_session(&pool).await;
         let repo = LifeChoiceRepo { pool: &pool };
@@ -1628,9 +1814,10 @@ mod tests {
         assert_eq!(event_id(pool.clone()).await, Some(written));
     }
 
-    /// The ignore conversion's shape: resolve first, the falling-out second,
-    /// in the caller's one transaction. `None` when the resolve lost; the
-    /// transaction is dropped uncommitted then, as on any error.
+    /// A resolve paired with an event in the caller's one transaction, as the
+    /// answer route pairs an accept with the event it places: resolve first,
+    /// the event second. `None` when the resolve lost; the transaction is
+    /// dropped uncommitted then, as on any error.
     async fn convert_in_tx(
         pool: &PgPool,
         choice: &LifeChoiceRecord,
@@ -1919,141 +2106,5 @@ mod tests {
             status_of(&pool, choice.id).await,
             ("declined".into(), Some(at))
         );
-    }
-
-    /// An accepted choice for `session` whose separation runs `[starts, ends)`.
-    async fn accepted_with_separation(
-        pool: &PgPool,
-        instance: Uuid,
-        session: Uuid,
-        asked_ago: Duration,
-        starts: DateTime<Utc>,
-        ends: DateTime<Utc>,
-        key: &str,
-    ) -> LifeChoiceRecord {
-        use crate::events::{EventRepo, NewEvent};
-        use eros_engine_core::events::EventKind;
-
-        let repo = LifeChoiceRepo { pool };
-        let anchor = repo.streak_anchor(session).await.unwrap();
-        let choice = repo
-            .insert_ask(
-                session,
-                LifeChoiceKind::AskForSpace,
-                Some(3),
-                anchor,
-                &ask_message("想先分开"),
-            )
-            .await
-            .unwrap()
-            .expect("written");
-        repo.resolve(choice.id, "accepted", choice.asked_at)
-            .await
-            .unwrap()
-            .expect("resolved");
-        sqlx::query(
-            "UPDATE engine.life_choices SET asked_at = asked_at - make_interval(secs => $2) \
-              WHERE id = $1",
-        )
-        .bind(choice.id)
-        .bind(asked_ago.num_seconds() as f64)
-        .execute(pool)
-        .await
-        .unwrap();
-        let event = EventRepo { pool }
-            .insert_preempting(&NewEvent {
-                instance_id: instance,
-                session_id: session,
-                event_key: key,
-                kind: EventKind::TakingSpace,
-                started_at: starts,
-                ends_at: ends,
-            })
-            .await
-            .unwrap();
-        repo.set_event(choice.id, event.id).await.unwrap();
-        choice
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    async fn growth_slowed_is_the_72_hours_after_the_newest_accepted_separation(pool: PgPool) {
-        use chrono::TimeZone;
-
-        let (owner, instance, session) = instance_and_session(&pool).await;
-        let sibling = ChatRepo { pool: &pool }
-            .create_session(owner, instance)
-            .await
-            .unwrap()
-            .id;
-        let repo = LifeChoiceRepo { pool: &pool };
-        let micro = Duration::microseconds(1);
-        let starts = Utc.with_ymd_and_hms(2026, 3, 1, 12, 0, 0).unwrap();
-        let ends = starts + Duration::hours(18);
-        let window_end = ends + Duration::hours(72);
-
-        // Nothing asked, nothing slowed.
-        assert!(!repo.growth_slowed(session, ends).await.unwrap());
-
-        let choice = accepted_with_separation(
-            &pool,
-            instance,
-            session,
-            Duration::hours(30),
-            starts,
-            ends,
-            "k1",
-        )
-        .await;
-        // The separation itself is not the window; it opens when it ends.
-        assert!(!repo.growth_slowed(session, starts).await.unwrap());
-        assert!(!repo.growth_slowed(session, ends - micro).await.unwrap());
-        assert!(repo.growth_slowed(session, ends).await.unwrap());
-        assert!(repo
-            .growth_slowed(session, window_end - micro)
-            .await
-            .unwrap());
-        assert!(!repo.growth_slowed(session, window_end).await.unwrap());
-        // The choice's session only: a sibling of the same instance pays nothing.
-        assert!(!repo.growth_slowed(sibling, ends).await.unwrap());
-
-        // A choice that was not accepted opens no window, even with an event.
-        sqlx::query("UPDATE engine.life_choices SET status = 'declined' WHERE id = $1")
-            .bind(choice.id)
-            .execute(&pool)
-            .await
-            .unwrap();
-        assert!(!repo.growth_slowed(session, ends).await.unwrap());
-        sqlx::query("UPDATE engine.life_choices SET status = 'accepted' WHERE id = $1")
-            .bind(choice.id)
-            .execute(&pool)
-            .await
-            .unwrap();
-        assert!(repo.growth_slowed(session, ends).await.unwrap());
-
-        // The newest accepted choice owns the window, not an older one.
-        let later_starts = window_end + Duration::hours(10);
-        let later_ends = later_starts + Duration::hours(12);
-        accepted_with_separation(
-            &pool,
-            instance,
-            session,
-            Duration::hours(1),
-            later_starts,
-            later_ends,
-            "k2",
-        )
-        .await;
-        assert!(
-            !repo.growth_slowed(session, ends).await.unwrap(),
-            "the older window no longer applies"
-        );
-        assert!(repo.growth_slowed(session, later_ends).await.unwrap());
-
-        // Once the separation row is gone the choice carries no window.
-        sqlx::query("DELETE FROM engine.persona_events WHERE kind = 'taking_space'")
-            .execute(&pool)
-            .await
-            .unwrap();
-        assert!(!repo.growth_slowed(session, later_ends).await.unwrap());
     }
 }
