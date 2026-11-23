@@ -63,8 +63,9 @@ impl RelationshipStatus {
         )
     }
 
-    /// Gender-neutral Chinese wording, read by the judge line and by the
-    /// prompt's fallback.
+    /// Gender-neutral Chinese wording, read by the judge line for every
+    /// status but `none` and by the prompt's status line for every status
+    /// but `dating` and `engaged`, which take gendered nouns.
     pub fn zh(self) -> &'static str {
         match self {
             Self::None => "未确定",

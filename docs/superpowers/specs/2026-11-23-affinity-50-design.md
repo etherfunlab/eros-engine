@@ -142,7 +142,7 @@ compatible.
 ### 6.1 States
 
 Eight statuses, one per session: `none`, `dating` (伴侣), `partner` (伙伴),
-`peer` (同事), `fwb`, `situationship`, `engaged` (未婚), `ex` (前任). The
+`peer` (同事), `fwb`, `situationship`, `engaged` (已订婚), `ex` (前任). The
 cold war is a separate flag over any of them, so ending it uncovers the
 status underneath unchanged.
 
