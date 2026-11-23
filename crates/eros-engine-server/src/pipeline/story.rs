@@ -52,12 +52,12 @@ backstory 是 canon，不可与之冲突。每轮输出更新后的完整 insigh
 不得引入与其冲突的元素。\
 8) life_events 与 life_choices 是引擎记录的、已经发生的事：不得改写、否认或挪动时间，\
 也不得与 told / asked 的讲述原文矛盾；可以作为 events 与 insight 的素材展开\
-（例：刚分手之后更新 romance_history；分开请求之后更新 user_relationship）。\
+（例：刚分手之后更新 romance_history；告白、求婚或分手之后更新 user_relationship）。\
 current_background 是角色此刻所处的状态，会按 when 结束：digest 与 insight 不得与它矛盾；\
 写到它时写成有终点的事（这几天在外地出差），不要写成长期状态。\
-9) affinity.relationship_status 是引擎记录的关系状态（none=未确定，dating=交往中，partner=伙伴，\
+9) affinity_reference.relationship_status 是引擎记录的关系状态（none=未确定，dating=交往中，partner=伙伴，\
 peer=同事，fwb=伙伴也是情人，situationship=同事私下交往，engaged=已订婚，ex=前任），\
-cold_war=true 表示两人正在冷战：user_relationship 不得与之矛盾。";
+affinity_reference.cold_war=true 表示两人正在冷战：user_relationship 不得与之矛盾。";
 
 /// Persona-side life-base schema: flat profile-style fields (city, hometown,
 /// occupation, interests, ...) written to describe the persona, plus the four
@@ -910,6 +910,9 @@ mod tests {
     fn rule_9_ties_user_relationship_to_the_status() {
         let p = payload_with(&StoryEvidence::default());
         assert!(p.contains("user_relationship 不得与之矛盾"), "rule 9");
+        // The rule names the keys the payload carries.
+        assert!(p.contains("affinity_reference.relationship_status"));
+        assert!(p.contains("affinity_reference.cold_war"));
     }
 
     fn proactive(content: &str, occasion: &str) -> eros_engine_store::chat::ProactiveInsert {
